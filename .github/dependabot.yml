@@ -1,0 +1,14 @@
+version: 2
+updates:
+  # Dependabot handles flake.lock (Renovate's nix manager is disabled).
+  - package-ecosystem: "nix"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "02:00"
+      timezone: "UTC"
+    groups:
+      nix-flake-inputs:
+        patterns:
+          - "*"
