@@ -86,14 +86,45 @@
             ];
           };
 
+          pre-commit.check.enable = true;
           pre-commit.settings.hooks = {
             treefmt = {
               enable = true;
               package = config.treefmt.build.wrapper;
             };
+            check-executables-have-shebangs.enable = true;
+            check-shebang-scripts-are-executable.enable = true;
+            check-case-conflicts.enable = true;
+            check-symlinks.enable = true;
             check-merge-conflicts.enable = true;
             check-added-large-files.enable = true;
             commitizen.enable = true;
+            actionlint.enable = true;
+            pinact = {
+              enable = true;
+              name = "pinact";
+              description = "Check GitHub Action refs are SHA-pinned and resolvable";
+              entry = "${pkgs.writeShellScript "pinact-check" ''
+                token="''${GITHUB_TOKEN:-$(${pkgs.gh}/bin/gh auth token 2>/dev/null || true)}"
+                if [ -z "$token" ]; then
+                  echo "pinact: skipping — no GITHUB_TOKEN and gh not authenticated" >&2
+                  exit 0
+                fi
+                export GITHUB_TOKEN="$token"
+                exec ${pkgs.pinact}/bin/pinact run --check
+              ''}";
+              files = "^\\.github/workflows/.*\\.ya?ml$";
+              language = "system";
+              pass_filenames = false;
+            };
+            dependabot-validator = {
+              enable = true;
+              name = "Dependabot config validator";
+              entry = "${pkgs.check-jsonschema}/bin/check-jsonschema --builtin-schema vendor.dependabot";
+              files = "\\.github/dependabot\\.yml$";
+              language = "system";
+              pass_filenames = true;
+            };
           };
 
           packages = sandyPackages // {
