@@ -6,40 +6,20 @@ labels: "bug, status:new"
 assignees: ""
 ---
 
-<!--- Provide a general summary of the issue in the Title -->
+## Description
 
-## Current Behavior
+<!-- What happened, and what did you expect instead? -->
 
-<!--- Tell us what happens instead of the expected behavior -->
-
-(Write your answer here.)
-
-## Expected Behavior
-
-<!--- Tell us what should happen -->
-
-(Write your answer here.)
-
-## (Optional) Possible Solution
-
-<!--- Not obligatory, but suggest a fix/reason for the bug -->
-
-(Write your answer here.)
-
-## Steps to Reproduce
-
-<!--- Provide an unambiguous set of steps to reproduce this bug -->
+## Steps to reproduce
 
 1.
 2.
 3.
 
-## Context (Environment)
+## Environment
 
-<!--- How has this issue affected you? What are you trying to accomplish? -->
-
-(Write your answer here.)
+<!-- OS, versions, anything relevant -->
 
 ## Logs
 
-(Write your answer here.)
+<!-- Relevant logs, if any -->

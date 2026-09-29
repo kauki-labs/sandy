@@ -1,12 +1,4 @@
 # CODEOWNERS for sandy
 # Code owners are automatically requested for review when someone opens a pull request.
 
-# Default owners for everything
 * @Teebor-Choka
-
-# Build and configuration
-*.nix @Teebor-Choka
-flake.lock @Teebor-Choka
-
-# GitHub Actions and CI/CD
-/.github/ @Teebor-Choka

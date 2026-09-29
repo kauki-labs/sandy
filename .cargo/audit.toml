@@ -17,7 +17,7 @@ show_tree = true
 
 [target]
 arch = ["x86_64", "aarch64"]
-os = ["linux", "windows", "macos"]
+os = ["linux", "macos"]
 
 [yanked]
 enabled = true

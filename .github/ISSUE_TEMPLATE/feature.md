@@ -6,38 +6,18 @@ labels: "feature, status:new"
 assignees: ""
 ---
 
-<!--- Provide a general summary of the issue in the Title above -->
+## Problem
 
-### Is your feature related to a problem?
+<!-- What problem does this solve? -->
 
-<!--
-  Provide a clear and concise description of what the problem is.
-  For example, "I'm always frustrated when..."
--->
+## Proposed solution
 
-(Write your answer here.)
+<!-- What would you like to happen? -->
 
-### Describe the feature you'd like
+## Alternatives
 
-<!--
-  Provide a clear and concise description of what you want to happen.
--->
+<!-- Other approaches you considered -->
 
-(Write your answer here.)
+## Additional context
 
-### Describe alternatives you've considered
-
-<!--
-  Let us know about other solutions you've tried or researched.
--->
-
-(Write your answer here.)
-
-### Additional context
-
-<!--
-  Is there anything else you can add about the feature?
-  You might want to link to related issues here, if you haven't already.
--->
-
-(Write your answer here.)
+<!-- Anything else, e.g. links to related issues -->
