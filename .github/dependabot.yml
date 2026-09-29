@@ -1,6 +1,41 @@
 version: 2
 updates:
-  # Dependabot handles flake.lock (Renovate's nix manager is disabled).
+  # Rust dependencies: weekly, batched into separate patch / minor / major PRs.
+  # Security fixes are handled by Dependabot security updates (enabled in repo
+  # settings), which open immediately and outside this schedule.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "02:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 10
+    groups:
+      cargo-patch:
+        applies-to: version-updates
+        update-types:
+          - "patch"
+      cargo-minor:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+      cargo-major:
+        applies-to: version-updates
+        update-types:
+          - "major"
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "02:00"
+      timezone: "UTC"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+  # flake.lock (Renovate's nix manager can't compute narHash without a nix binary).
   - package-ecosystem: "nix"
     directory: "/"
     schedule:
