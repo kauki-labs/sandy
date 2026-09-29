@@ -24,6 +24,15 @@ updates:
         applies-to: version-updates
         update-types:
           - "major"
+  # Rust toolchain channel in rust-toolchain.toml. The channel is pinned to a
+  # minor version (e.g. "1.98"), so this only ever proposes minor bumps.
+  - package-ecosystem: "rust-toolchain"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "02:00"
+      timezone: "UTC"
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
