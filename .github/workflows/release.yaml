@@ -1,0 +1,56 @@
+name: Close release
+on:
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: Version bump for this release
+        required: true
+        type: choice
+        default: "patch"
+        options:
+          - patch
+          - minor
+          - major
+concurrency:
+  group: release
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  release:
+    name: Close release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          # Installing Nix (multi-user daemon) needs sudo, so sudo stays enabled here.
+          egress-policy: audit
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: Verify
+        run: nix flake check -L
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - name: Bump, tag, and push
+        run: nix develop -c cargo release "${RELEASE_TYPE}" --execute --no-confirm
+        env:
+          RELEASE_TYPE: ${{ inputs.release_type }}
+      - name: Create GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="$(git describe --tags --abbrev=0)"
+          gh release create "$tag" --title "$tag" --generate-notes
