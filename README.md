@@ -13,9 +13,13 @@ but the Nix build is self-contained (crane directly, no external Nix library).
 crates/sandy-core/   starter library crate
 nix/packages/        crane build definitions (build, clippy, docs, tests)
 flake.nix            dev shell, formatter, checks
-.claude/             canonical agent instructions (mirrored to Copilot)
+AGENTS.md            canonical agent instructions (read natively by Claude Code and Copilot)
 .github/             CI, CODEOWNERS, labeler, dependabot
 ```
+
+Agent instructions live once in [`AGENTS.md`](AGENTS.md). Claude Code reads it
+natively (there is no `CLAUDE.md`), and GitHub Copilot reads it as `AGENTS.md`,
+so there is nothing to keep in sync.
 
 ## Getting started
 

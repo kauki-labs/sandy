@@ -94,14 +94,6 @@
             check-merge-conflicts.enable = true;
             check-added-large-files.enable = true;
             commitizen.enable = true;
-            sync-copilot-instructions = {
-              enable = true;
-              name = "Sync .claude/ instructions to Copilot files";
-              entry = "bash .github/scripts/sync-copilot-instructions.sh";
-              files = "(\\.claude/INSTRUCTIONS\\.md|\\.claude/rust\\.md)";
-              language = "system";
-              pass_filenames = false;
-            };
           };
 
           packages = sandyPackages // {
