@@ -6,7 +6,7 @@ members = ["crates/*"]
 # with `version.workspace = true`, `thiserror.workspace = true`, and so on.
 [workspace.package]
 version = "0.1.0"
-authors = ["Tibor Csóka <tibor.csoka@hoprnet.org>"]
+authors = ["Tibor Csóka <tibor.csoka@kauki.xyz>"]
 homepage = "https://kauki.xyz/"
 repository = "https://github.com/kauki-labs/sandy"
 license = "MIT"
@@ -30,6 +30,15 @@ missing_docs = "warn"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# cargo-release drives the release workflow (.github/workflows/release.yaml).
+# One shared version across the workspace; tag as vX.Y.Z; never publish to crates.io.
+[workspace.metadata.release]
+shared-version = true
+publish = false
+push = true
+tag = true
+tag-name = "v{{version}}"
 
 [profile.dev]
 opt-level = 0

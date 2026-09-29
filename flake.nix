@@ -117,6 +117,7 @@
               nightlyRustfmt
               pkgs.cargo-audit
               pkgs.cargo-nextest
+              pkgs.cargo-release
               pkgs.cargo-shear
               pkgs.cargo-insta
               pkgs.gh
