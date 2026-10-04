@@ -10,6 +10,13 @@
     flake-root.url = "github:srid/flake-root";
     pre-commit.url = "github:cachix/git-hooks.nix";
 
+    # The E1–E3 integration seam (Blocks 1–3, 5). nix-vm lives here; after an
+    # E-block merges upstream, bump with `nix flake update nix-modules` so Block
+    # 5's LauncherBackend builds against the new machine contract. Pinned via
+    # flake.lock (origin/main at scaffold time = 69e5878); not wired into the
+    # Rust build or devShell — the Rust blocks don't evaluate it.
+    nix-modules.url = "github:Teebor-Choka/nix-modules";
+
     flake-parts.inputs.nixpkgs-lib.follows = "nixpkgs";
     rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
     treefmt-nix.inputs.nixpkgs.follows = "nixpkgs";

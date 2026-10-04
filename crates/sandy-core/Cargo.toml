@@ -1,6 +1,6 @@
 [package]
 name = "sandy-core"
-description = "Core library for the sandy workspace"
+description = "Core library for the sandy workspace: journal, data plane, reconcile, result, VmBackend"
 version.workspace = true
 authors.workspace = true
 homepage.workspace = true
@@ -18,7 +18,14 @@ workspace = true
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+fs2.workspace = true
+libc.workspace = true
+uuid = { workspace = true }
 
 [dev-dependencies]
 anyhow.workspace = true
 rstest.workspace = true
+tempfile.workspace = true
+insta.workspace = true

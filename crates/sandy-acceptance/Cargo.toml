@@ -1,0 +1,21 @@
+[package]
+name = "sandy-acceptance"
+description = "Phase A acceptance harness: tier-2 (sandbox) and tier-3 (host) suites"
+version.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+anyhow.workspace = true
