@@ -592,6 +592,13 @@ version = "0.1.1"
 [[package]]
 name = "sandy-egress"
 version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "rstest",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "sandy-provider"
