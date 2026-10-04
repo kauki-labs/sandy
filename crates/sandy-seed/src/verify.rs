@@ -3,9 +3,17 @@
 //! per-artifact hash match (C-REQ-2, INV-P5). Any single mismatch refuses, naming
 //! the field; presence alone never qualifies.
 
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
-use crate::manifest::{Requirements, SeedManifest};
+use minisign_verify::{PublicKey, Signature};
+
+use crate::{
+    hash::sha256_hex,
+    manifest::{ALLOWED_IMAGE_FORMATS, MANIFEST_FILE, Requirements, SeedManifest},
+};
 
 /// Verifies a detached signature over a message against a trusted public key.
 ///
@@ -37,8 +45,22 @@ impl MinisignVerifier {
 
 impl SignatureVerifier for MinisignVerifier {
     fn verify(&self, message: &[u8], signature: &[u8]) -> bool {
-        let _ = (&self.public_key, message, signature);
-        todo!("real minisign verification against the KeePassXC public key (host/integration tier, S9)")
+        // The public key is stored as text; `.pub` carries a comment line plus the
+        // base64 body, while a bare base64 string has only the body. Accept either.
+        let public_key = match PublicKey::decode(&self.public_key) {
+            Ok(key) => key,
+            Err(_) => match PublicKey::from_base64(self.public_key.trim()) {
+                Ok(key) => key,
+                Err(_) => return false,
+            },
+        };
+        let Ok(signature_text) = std::str::from_utf8(signature) else {
+            return false;
+        };
+        let Ok(signature) = Signature::decode(signature_text) else {
+            return false;
+        };
+        public_key.verify(message, &signature, false).is_ok()
     }
 }
 
@@ -140,6 +162,59 @@ pub fn acquire(
     required: &Requirements,
     verifier: &impl SignatureVerifier,
 ) -> Result<VerifiedSeed, SeedRefusal> {
-    let _ = (seed_root, manifest_sig, required, verifier);
-    todo!("C-REQ-2: verify seed by identity (arch + rev + format + signature + per-artifact hash)")
+    // 1. Read and parse the manifest. I/O and parse failures refuse by their variant.
+    let manifest_bytes = fs::read(seed_root.join(MANIFEST_FILE))?;
+    let manifest: SeedManifest = serde_json::from_slice(&manifest_bytes)?;
+
+    // 2. The manifest bytes as read are what the detached signature covers.
+    if !verifier.verify(&manifest_bytes, manifest_sig) {
+        return Err(SeedRefusal::Signature);
+    }
+
+    // 3. Architecture must be exactly the one required.
+    if manifest.arch != required.arch {
+        return Err(SeedRefusal::Arch {
+            expected: required.arch.clone(),
+            found: manifest.arch,
+        });
+    }
+
+    // 4. nixpkgs revision must match; any other rev is stale or wrong.
+    if manifest.nixpkgs_rev != required.rev {
+        return Err(SeedRefusal::Rev {
+            expected: required.rev.clone(),
+            found: manifest.nixpkgs_rev,
+        });
+    }
+
+    // 5. Image format must be one the boot path accepts.
+    if !ALLOWED_IMAGE_FORMATS.contains(&manifest.image_format.as_str()) {
+        return Err(SeedRefusal::Format {
+            found: manifest.image_format,
+        });
+    }
+
+    // 6. Every artifact must be present and hash to its pinned entry.
+    for entry in &manifest.artifacts {
+        let path = seed_root.join(&entry.name);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(SeedRefusal::Missing {
+                    artifact: entry.name.clone(),
+                });
+            }
+            Err(err) => return Err(SeedRefusal::Io(err)),
+        };
+        if !sha256_hex(&bytes).eq_ignore_ascii_case(&entry.sha256) {
+            return Err(SeedRefusal::Hash {
+                artifact: entry.name.clone(),
+            });
+        }
+    }
+
+    Ok(VerifiedSeed {
+        manifest,
+        root: seed_root.to_path_buf(),
+    })
 }
