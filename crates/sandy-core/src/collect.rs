@@ -126,6 +126,9 @@ fn stage_outputs(
     let mut collected = Vec::new();
     let mut total: u64 = 0;
 
+    // Resolve the RW area once so each output can be checked for containment.
+    let canonical_root = source_dir.canonicalize()?;
+
     for spec in declared {
         let src = source_dir.join(&spec.guest_path);
         // O_NOFOLLOW: a symlink final component fails with ELOOP, so the target
@@ -151,6 +154,14 @@ fn stage_outputs(
         let metadata = file.metadata()?;
         if !metadata.file_type().is_file() {
             return Err(CollectError::NotRegularFile(src));
+        }
+
+        // O_NOFOLLOW guards only the final component, so an intermediate symlink
+        // (a parent the guest turned into a link out of the RW area) would still
+        // let the open reach host bytes. Confirm the resolved path stays within
+        // the RW area before reading it (INV-2).
+        if !src.canonicalize()?.starts_with(&canonical_root) {
+            return Err(CollectError::Symlink(src));
         }
 
         // Enforce the cap before copying; the source is only read, never

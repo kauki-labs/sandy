@@ -10,8 +10,8 @@ use std::time::SystemTime;
 
 use anyhow::Context;
 use sandy_core::{
-    CollectionConfig, FakeBackend, JobRecord, JobState, Journal, Outcome, OutputSpec, RESULT_SCHEMA_VERSION,
-    ResultEnvelope, Status, collect, reconcile_job,
+    BackendError, BoxState, CollectionConfig, FakeBackend, JobRecord, JobState, Journal, Outcome, OutputSpec,
+    RESULT_SCHEMA_VERSION, ResultEnvelope, RunSpec, Status, VmBackend, collect, reconcile_job,
     result::{Logs, OutputRef, Provenance},
 };
 
@@ -195,6 +195,41 @@ fn symlink_output_is_refused() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Adversarial: intermediate symlink — an output reachable only through a parent
+/// the guest turned into a symlink out of the RW area is refused; host bytes
+/// outside the RW area are never collected (INV-2).
+#[test]
+fn intermediate_symlink_output_is_refused() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let source = tmp.path().join("rw");
+    let job = tmp.path().join("job");
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(&source).context("create rw dir")?;
+    std::fs::create_dir_all(&job).context("create job dir")?;
+    std::fs::create_dir_all(&outside).context("create outside dir")?;
+    std::fs::write(outside.join("host-secret"), b"TOP-SECRET").context("write host secret")?;
+    // The guest replaces a parent directory with a link pointing out of the RW area.
+    std::os::unix::fs::symlink(&outside, source.join("link")).context("make parent symlink")?;
+    let declared = [OutputSpec {
+        guest_path: "link/host-secret".to_string(),
+        name: "host-secret".to_string(),
+        required: true,
+    }];
+    let config = CollectionConfig { per_job_cap_bytes: CAP };
+
+    let result = collect(&exit_zero(), &source, &job, &declared, &config);
+    assert!(
+        result.is_err(),
+        "an output behind an escaping parent symlink must be refused"
+    );
+    let collected = job.join("out").join("host-secret");
+    if collected.exists() {
+        let bytes = std::fs::read(&collected).context("read collected")?;
+        assert_ne!(bytes, b"TOP-SECRET", "host bytes outside the RW area must not leak");
+    }
+    Ok(())
+}
+
 /// Adversarial: over-quota — an output beyond the per-job cap fails; the file is
 /// not truncated.
 #[test]
@@ -268,5 +303,62 @@ fn reconcile_reaps_a_dead_job() -> anyhow::Result<()> {
     let reconciled = reconcile_job(&journal, &backend, "job-1").context("reconcile dead job")?;
     assert_eq!(reconciled.state, JobState::Crashed);
     assert_eq!(backend.killed(), vec!["box-1".to_string()]);
+    Ok(())
+}
+
+/// A backend that writes a terminal record the moment reconcile queries it,
+/// standing in for the real owner finishing between reconcile's first read and
+/// its lock acquisition.
+struct FinishesDuringQuery<'a> {
+    journal: &'a Journal,
+    job_id: String,
+}
+
+impl VmBackend for FinishesDuringQuery<'_> {
+    fn run(&self, _spec: &RunSpec) -> Result<Outcome, BackendError> {
+        unreachable!("reconcile never runs a box")
+    }
+
+    fn kill(&self, _box_id: &str) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    fn boxes(&self) -> Result<Vec<BoxState>, BackendError> {
+        let mut record = self
+            .journal
+            .read_record(&self.job_id)
+            .map_err(|e| BackendError::Protocol(e.to_string()))?;
+        record.state = JobState::Succeeded;
+        record.result = Some(succeeded_envelope(&self.job_id));
+        self.journal
+            .write_record(&record)
+            .map_err(|e| BackendError::Protocol(e.to_string()))?;
+        Ok(vec![])
+    }
+}
+
+/// Regression: a terminal result written after reconcile's first read but before
+/// it takes the lock must not be clobbered by a stale `crashed` (INV-3/INV-6).
+#[test]
+fn reconcile_does_not_clobber_a_result_won_in_the_race() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let journal = Journal::new(tmp.path());
+    journal.ensure_dirs().context("ensure journal dirs")?;
+    journal
+        .write_record(&running_record("job-1", "box-1", 4242))
+        .context("write running record")?;
+
+    let backend = FinishesDuringQuery {
+        journal: &journal,
+        job_id: "job-1".to_string(),
+    };
+
+    let reconciled = reconcile_job(&journal, &backend, "job-1").context("reconcile racing job")?;
+    assert_eq!(
+        reconciled.state,
+        JobState::Succeeded,
+        "a result won in the race must survive reconcile"
+    );
+    assert!(reconciled.result.is_some(), "the terminal result must be preserved");
     Ok(())
 }

@@ -50,6 +50,15 @@ pub fn reconcile_job<B: VmBackend>(journal: &Journal, backend: &B, job_id: &str)
         return Ok(record);
     };
 
+    // The first read happened before the lock; the owner may have written a
+    // terminal record (and released the lock) in that window. Re-read under the
+    // lock and bail unless it is still `running`, so a completed result is never
+    // clobbered by a stale `crashed` (INV-3/INV-6).
+    let record = journal.read_record(job_id)?;
+    if record.state != JobState::Running {
+        return Ok(record);
+    }
+
     // Owner confirmed gone: flip running → crashed and tear the box down, all
     // under the held lock (TOCTOU-safe).
     let mut crashed = record;
