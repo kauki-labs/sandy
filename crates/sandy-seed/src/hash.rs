@@ -1,7 +1,7 @@
-//! Deterministic SHA-256 hex digest — the primitive the manifest's per-artifact
-//! hashes are expressed in (lowercase hex). It is pure and side-effect free, so
-//! it is unit-tested directly rather than mocked, and may be implemented here (it
-//! is not the behavior under test for C-REQ-2).
+//! Deterministic lowercase-hex SHA-256 — the encoding the manifest's per-artifact
+//! hashes are expressed in.
+
+use std::{fs::File, io, path::Path};
 
 use sha2::{Digest, Sha256};
 
@@ -11,6 +11,19 @@ use sha2::{Digest, Sha256};
 /// stores, so a per-artifact hash check is `sha256_hex(file_bytes) == entry.sha256`.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+/// Lowercase-hex SHA-256 digest of a file, streamed rather than buffered.
+///
+/// Seed artifacts (the erofs store image) can be multi-gigabyte, so the bytes are
+/// fed through the hasher with [`io::copy`] instead of being read whole into memory;
+/// the digest is identical to [`sha256_hex`] over the same bytes. Used by
+/// [`acquire`](crate::acquire) to verify artifacts without an RSS spike per file.
+pub(crate) fn sha256_hex_file(path: &Path) -> io::Result<String> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    io::copy(&mut file, &mut hasher)?;
+    Ok(hex::encode(hasher.finalize()))
 }
 
 #[cfg(test)]

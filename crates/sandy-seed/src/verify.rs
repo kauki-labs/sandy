@@ -11,7 +11,7 @@ use std::{
 use minisign_verify::{PublicKey, Signature};
 
 use crate::{
-    hash::sha256_hex,
+    hash::sha256_hex_file,
     manifest::{ALLOWED_IMAGE_FORMATS, MANIFEST_FILE, Requirements, SeedManifest},
 };
 
@@ -27,9 +27,10 @@ pub trait SignatureVerifier {
 
 /// Production [`SignatureVerifier`] over a minisign public key (the KeePassXC-held key).
 ///
-/// Real signature checking runs on the host/integration tier, not in the sandbox
-/// unit suite (S9), so [`verify`](MinisignVerifier::verify) is left for the
-/// implementer to wire over `minisign-verify`.
+/// [`verify`](MinisignVerifier::verify) checks a detached signature with
+/// `minisign-verify`. It is the live crypto path: the sandbox unit suite exercises
+/// [`acquire`] through a mock verifier, while this type is driven over a real key at
+/// the host/integration tier (S9).
 pub struct MinisignVerifier {
     public_key: String,
 }
@@ -47,12 +48,10 @@ impl SignatureVerifier for MinisignVerifier {
     fn verify(&self, message: &[u8], signature: &[u8]) -> bool {
         // The public key is stored as text; `.pub` carries a comment line plus the
         // base64 body, while a bare base64 string has only the body. Accept either.
-        let public_key = match PublicKey::decode(&self.public_key) {
-            Ok(key) => key,
-            Err(_) => match PublicKey::from_base64(self.public_key.trim()) {
-                Ok(key) => key,
-                Err(_) => return false,
-            },
+        let Ok(public_key) =
+            PublicKey::decode(&self.public_key).or_else(|_| PublicKey::from_base64(self.public_key.trim()))
+        else {
+            return false;
         };
         let Ok(signature_text) = std::str::from_utf8(signature) else {
             return false;
@@ -194,11 +193,12 @@ pub fn acquire(
         });
     }
 
-    // 6. Every artifact must be present and hash to its pinned entry.
+    // 6. Every artifact must be present and hash to its pinned entry. The digest is streamed (see `sha256_hex_file`) so
+    //    a multi-GB store image is not buffered.
     for entry in &manifest.artifacts {
         let path = seed_root.join(&entry.name);
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
+        let digest = match sha256_hex_file(&path) {
+            Ok(digest) => digest,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 return Err(SeedRefusal::Missing {
                     artifact: entry.name.clone(),
@@ -206,7 +206,7 @@ pub fn acquire(
             }
             Err(err) => return Err(SeedRefusal::Io(err)),
         };
-        if !sha256_hex(&bytes).eq_ignore_ascii_case(&entry.sha256) {
+        if !digest.eq_ignore_ascii_case(&entry.sha256) {
             return Err(SeedRefusal::Hash {
                 artifact: entry.name.clone(),
             });
@@ -217,4 +217,22 @@ pub fn acquire(
         manifest,
         root: seed_root.to_path_buf(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MinisignVerifier, SignatureVerifier};
+
+    #[test]
+    fn minisign_verify_refuses_malformed_inputs_without_panicking() {
+        // An undecodable public key refuses (both decode paths fail) rather than panics.
+        let bad_key = MinisignVerifier::new("not-a-minisign-key");
+        assert!(!bad_key.verify(b"message", b"RWRunusable-signature"));
+
+        // A non-UTF-8 signature, and well-formed-looking but undecodable signature
+        // text, both refuse — the error branches return false, never unwrap.
+        let verifier = MinisignVerifier::new("untrusted comment: sandy\nRWTooShortToDecode\n");
+        assert!(!verifier.verify(b"message", &[0xff, 0xfe, 0xfd]));
+        assert!(!verifier.verify(b"message", b"untrusted comment: x\nnope\n"));
+    }
 }

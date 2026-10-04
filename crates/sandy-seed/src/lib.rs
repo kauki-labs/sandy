@@ -15,8 +15,9 @@
 //!   the [`VerifiedSeed`] handle, and [`acquire`], which produces one only on full identity match.
 //!
 //! This crate is the sandbox-provable slice (tier-1/2): verification logic over
-//! fixture manifests and a mock verifier. Real minisign checking and the VM boot
-//! are host/integration-tier (S9) and live elsewhere.
+//! fixture manifests and a mock verifier. [`MinisignVerifier`] carries the live
+//! minisign check, but it is driven with a real key — and the VM boot runs — only
+//! at the host/integration tier (S9).
 
 pub mod hash;
 pub mod manifest;

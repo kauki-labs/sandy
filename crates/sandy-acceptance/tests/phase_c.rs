@@ -42,9 +42,7 @@ fn phase_c_suite_is_host_gated() {
         eprintln!("phase_c: skipped (set SANDY_HOST_TESTS=1 on a Nix-free M2 to run the tier-3 hinge)");
         return;
     }
-    // The C-accept host author replaces this with the enumerated scenarios above,
-    // each on the real builder-VM boot + real erofs handoff + a real sandbox.
-    // Fail closed until then: a green `phase_c` must mean the scenarios ran, never
+    // Fail closed: a green `phase_c` must mean the enumerated scenarios ran, never
     // that the host tier was enabled over an empty gate (S9 — no false-green).
     panic!("phase_c: SANDY_HOST_TESTS=1 but no host scenarios authored yet (C-accept, tier-3)");
 }

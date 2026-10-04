@@ -3,7 +3,7 @@
 //! Each case builds a seed in a `TempDir` (`manifest.json` + artifact files) and a
 //! mock [`SignatureVerifier`], then asserts [`acquire`] accepts a matching, signed
 //! seed and refuses each single-field mismatch **by name** — never "present →
-//! proceed". Red until the implementer fills `acquire` (the `todo!` panics).
+//! proceed".
 
 use std::fs;
 
