@@ -7,6 +7,11 @@ The starter crate is [`sandy-core`](crates/sandy-core).
 The tooling is modelled on [`hoprnet/hopr-api`](https://github.com/hoprnet/hopr-api),
 but the Nix build is self-contained (crane directly, no external Nix library).
 
+## Status
+
+Early development. Current milestone: Phase A — the runner, a `sandy` CLI that
+runs a job in an ephemeral NixOS microVM.
+
 ## Layout
 
 ```text
