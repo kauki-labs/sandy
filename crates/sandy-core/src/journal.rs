@@ -265,7 +265,8 @@ pub fn ensure_local_posix_fs(path: &Path) -> Result<(), CoreError> {
 
 /// Return the filesystem type backing `path`, by matching it against the host's
 /// mount table. `None` when it cannot be determined (then the caller accepts).
-fn detect_fs_type(path: &Path) -> Option<String> {
+#[must_use]
+pub fn detect_fs_type(path: &Path) -> Option<String> {
     let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     mount_table()
         .into_iter()
@@ -312,7 +313,8 @@ fn mount_table() -> Vec<(PathBuf, String)> {
 
 /// Whether `fstype` names a networked / shared filesystem where flock cannot be
 /// trusted (INV-5).
-fn is_networked_fs(fstype: &str) -> bool {
+#[must_use]
+pub fn is_networked_fs(fstype: &str) -> bool {
     const DENY: &[&str] = &[
         "nfs",
         "nfs4",

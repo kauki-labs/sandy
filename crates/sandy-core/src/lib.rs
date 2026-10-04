@@ -25,7 +25,10 @@ pub use backend::{
     VmBackend, validate_no_secret_leak,
 };
 pub use collect::{CollectError, CollectionConfig, OutputSpec, collect};
-pub use journal::{JOURNAL_SCHEMA_VERSION, JobLock, JobRecord, JobState, Journal, ensure_local_posix_fs, new_job_id};
+pub use journal::{
+    JOURNAL_SCHEMA_VERSION, JobLock, JobRecord, JobState, Journal, detect_fs_type, ensure_local_posix_fs,
+    is_networked_fs, new_job_id,
+};
 pub use reconcile::reconcile_job;
 pub use result::{
     Classification, Logs, OutputRef, OutputStatus, ProcessExit, Provenance, RESULT_SCHEMA_VERSION, Receipt,

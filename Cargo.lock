@@ -504,6 +504,7 @@ dependencies = [
  "anyhow",
  "clap",
  "rstest",
+ "sandy-core",
  "tempfile",
 ]
 

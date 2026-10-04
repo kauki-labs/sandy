@@ -4,11 +4,7 @@
 //! is not a local POSIX filesystem. A networked/share mount (NFS, SMB, virtiofs, 9p, ...)
 //! makes `flock` unreliable, which breaks the journal's single-writer guarantee (INV-5).
 
-use std::{
-    io,
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::path::PathBuf;
 
 /// Verdict for whether a filesystem type is acceptable for `$SANDY_HOME`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,21 +20,18 @@ pub enum FsVerdict {
     },
 }
 
-/// Classifies a filesystem type name (as reported by `stat`/`mount`) into an [`FsVerdict`].
+/// Classifies a filesystem type name into an [`FsVerdict`], using the same
+/// networked-filesystem policy as the journal's INV-5 gate
+/// ([`sandy_core::is_networked_fs`]) so doctor and the runtime agree.
 ///
 /// Pure, no I/O — this is the seam the adversarial tests exercise directly, without a real
 /// network mount.
 pub fn classify_fs(fstype: &str) -> FsVerdict {
-    const LOCAL: &[&str] = &["apfs", "hfs", "ext4", "ext3", "ext2", "xfs", "btrfs", "zfs", "tmpfs"];
-
     let normalized = fstype.trim().to_ascii_lowercase();
-    if LOCAL.contains(&normalized.as_str()) {
-        FsVerdict::Local
-    } else {
-        // Covers known networked/share types (nfs, smbfs, cifs, virtiofs, 9p, fuse.*) and,
-        // deliberately, anything unrecognized: an unknown fstype can't be vouched for as
-        // flock-safe, so INV-5 means refuse rather than silently continue.
+    if sandy_core::is_networked_fs(&normalized) {
         FsVerdict::NonLocal { fstype: normalized }
+    } else {
+        FsVerdict::Local
     }
 }
 
@@ -72,53 +65,6 @@ pub fn doctor_result_for(verdict: FsVerdict) -> DoctorResult {
     }
 }
 
-/// Whether the `stat` binary found on `$PATH` is GNU coreutils' (vs. BSD/macOS stat).
-///
-/// `cfg!(target_os = "macos")` alone isn't enough: a nix dev shell commonly puts GNU
-/// coreutils ahead of `/usr/bin/stat` on `$PATH` even when compiled for macOS, so the two
-/// stat flavors have to be told apart at run time, not compile time. GNU stat accepts
-/// `--version` (exit 0); BSD stat rejects it as an unknown option (nonzero exit).
-fn stat_is_gnu() -> bool {
-    Command::new("stat")
-        .arg("--version")
-        .output()
-        .is_ok_and(|output| output.status.success())
-}
-
-/// Probes the filesystem type backing `path` via `stat`: GNU's `-f -c %T`, or BSD/macOS's
-/// `-f %T` (see [`stat_is_gnu`] for how the flavor is chosen).
-///
-/// Shells out rather than calling libc directly, since `unsafe_code` is forbidden
-/// workspace-wide. Not unit-tested in the sandbox (that would require a real network
-/// mount) — covered instead by [`classify_fs`] / [`doctor_result_for`] unit tests and the
-/// local-filesystem integration test.
-///
-/// # Errors
-/// Returns an error if the probe command cannot be run or its output cannot be parsed.
-pub fn fstype_of(path: &Path) -> std::io::Result<String> {
-    let output = if stat_is_gnu() {
-        Command::new("stat").args(["-f", "-c", "%T"]).arg(path).output()?
-    } else {
-        Command::new("stat").args(["-f", "%T"]).arg(path).output()?
-    };
-
-    if !output.status.success() {
-        return Err(io::Error::other(format!(
-            "stat -f probe for {path:?} exited with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-
-    let fstype = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if fstype.is_empty() {
-        return Err(io::Error::other(format!(
-            "stat -f probe for {path:?} returned no fstype"
-        )));
-    }
-    Ok(fstype)
-}
-
 /// Resolves `$SANDY_HOME`: the `SANDY_HOME` environment variable, defaulting to
 /// `$HOME/.sandy`.
 pub fn sandy_home() -> PathBuf {
@@ -145,14 +91,14 @@ pub fn run_doctor() -> DoctorResult {
         };
     }
 
-    match fstype_of(&home) {
-        Ok(fstype) => doctor_result_for(classify_fs(&fstype)),
-        Err(err) => DoctorResult {
-            exit_code: 2,
-            message: format!(
-                "sandy doctor: refusing to start — could not verify the filesystem backing $SANDY_HOME at {}: {err}",
-                home.display()
-            ),
+    // Reuse sandy-core's mount-table detector — the same seam the journal's INV-5
+    // gate uses — so doctor and the runtime agree. An undetectable fstype is
+    // accepted (like the journal), so the common local case never false-refuses.
+    match sandy_core::detect_fs_type(&home) {
+        Some(fstype) => doctor_result_for(classify_fs(&fstype)),
+        None => DoctorResult {
+            exit_code: 0,
+            message: "sandy doctor: $SANDY_HOME filesystem type is undetectable; proceeding — OK".to_string(),
         },
     }
 }
