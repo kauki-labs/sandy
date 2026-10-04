@@ -59,8 +59,21 @@ pub enum ProvisionOutcome {
 /// store, so parent invariants (INV-1) are preserved.
 #[must_use]
 pub fn provision(strategy: ProvisioningStrategy, job: &Job, backend: &impl HostNixProvisioner) -> ProvisionOutcome {
-    let _ = (strategy, job, backend);
-    todo!("B-REQ-5,7: route HostNix -> backend; BuilderVM/RemoteBuild -> refuse stage C/D; Refuse -> propagate")
+    match strategy {
+        // HostNix runs via Phase A's backend; the job is forwarded unchanged so
+        // nothing enters argv / env / the store (INV-1, B-REQ-5).
+        ProvisioningStrategy::HostNix { arch } => ProvisionOutcome::Provisioned(backend.provision_host_nix(job, &arch)),
+        // Deferred paths refuse with a stage pointer, never touching the backend
+        // (B-REQ-7).
+        ProvisioningStrategy::BuilderVM { .. } => ProvisionOutcome::Refused {
+            reason: "builder-VM provisioning requires stage C".to_string(),
+        },
+        ProvisioningStrategy::RemoteBuild { .. } => ProvisionOutcome::Refused {
+            reason: "remote-build provisioning requires stage D".to_string(),
+        },
+        // A classify-time refusal propagates its reason verbatim (B-REQ-2).
+        ProvisioningStrategy::Refuse { reason } => ProvisionOutcome::Refused { reason },
+    }
 }
 
 #[cfg(test)]

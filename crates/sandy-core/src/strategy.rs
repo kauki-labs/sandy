@@ -124,8 +124,69 @@ pub struct HostFacts {
 /// Refuse reasons MUST contain the lowercase axis token(s) above so a caller (or
 /// an operator) can tell which axis blocked the run.
 #[must_use]
-pub fn classify(_facts: &HostFacts) -> ProvisioningStrategy {
-    todo!("B-REQ-1..4,7: classify host facts into a provisioning strategy")
+pub fn classify(facts: &HostFacts) -> ProvisioningStrategy {
+    // Boot is a prerequisite and takes precedence over every build/arch decision
+    // (B-REQ-2, B-REQ-3): a failed boot refuses, naming `boot` alongside any other
+    // missing axis.
+    if !matches!(facts.boot, BootAxis::Ok) {
+        return ProvisioningStrategy::Refuse {
+            reason: missing_axes_reason(facts),
+        };
+    }
+
+    // Boot is ok. A producing build axis that cannot target the requested arch
+    // refuses naming `arch`, with no build attempted (B-REQ-4).
+    if matches!(facts.build, BuildAxis::HostNix | BuildAxis::NixFreeInstallable) {
+        if facts.build_can_produce_target {
+            return ProvisioningStrategy::HostNix {
+                arch: facts.target_arch.clone(),
+            };
+        }
+        return ProvisioningStrategy::Refuse {
+            reason: format!(
+                "build axis cannot produce the target arch `{}` (no build attempted)",
+                facts.target_arch
+            ),
+        };
+    }
+
+    // No host-nix build. A seed implies stage C, a remote builder stage D; the
+    // router refuses both with a stage pointer (B-REQ-7).
+    if let Some(seed_id) = &facts.seed {
+        return ProvisioningStrategy::BuilderVM {
+            seed_id: seed_id.clone(),
+        };
+    }
+    if let Some(host) = &facts.remote_builder {
+        return ProvisioningStrategy::RemoteBuild {
+            host: host.clone(),
+            arch: facts.target_arch.clone(),
+        };
+    }
+
+    // Nothing fits: refuse naming each missing axis (B-REQ-2).
+    ProvisioningStrategy::Refuse {
+        reason: missing_axes_reason(facts),
+    }
+}
+
+/// Build a refuse reason naming every unsatisfied axis (`boot`, `build`, `seed`,
+/// `remote`) so a caller can tell which axes blocked the run (B-REQ-2).
+fn missing_axes_reason(facts: &HostFacts) -> String {
+    let mut missing = Vec::new();
+    if !matches!(facts.boot, BootAxis::Ok) {
+        missing.push("boot (no bootable hypervisor observed)");
+    }
+    if matches!(facts.build, BuildAxis::None) {
+        missing.push("build (no Nix and no viable install path)");
+    }
+    if facts.seed.is_none() {
+        missing.push("seed (no builder-VM seed available)");
+    }
+    if facts.remote_builder.is_none() {
+        missing.push("remote (no remote builder available)");
+    }
+    format!("no viable provisioning strategy; missing axes: {}", missing.join(", "))
 }
 
 #[cfg(test)]
