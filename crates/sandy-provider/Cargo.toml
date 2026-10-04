@@ -17,8 +17,3 @@ workspace = true
 
 [dependencies]
 sandy-core = { path = "../sandy-core" }
-thiserror.workspace = true
-
-[dev-dependencies]
-anyhow.workspace = true
-rstest.workspace = true

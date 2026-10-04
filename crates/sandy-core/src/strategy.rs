@@ -4,9 +4,6 @@
 //! OS-aware [`HostFacts`] onto a [`ProvisioningStrategy`]. The live boot/build
 //! observations that *produce* those facts are the integration-layer part
 //! (tier-3); this module is provable in a sandbox over injected facts (tier-1).
-//!
-//! The function body is `todo!()`: this is the API skeleton plus its red test
-//! suite. A separate implementer fills in the matrix the doc and tests pin.
 
 /// The provisioning strategy `sandy doctor` selects for a host.
 ///
@@ -172,6 +169,10 @@ pub fn classify(facts: &HostFacts) -> ProvisioningStrategy {
 
 /// Build a refuse reason naming every unsatisfied axis (`boot`, `build`, `seed`,
 /// `remote`) so a caller can tell which axes blocked the run (B-REQ-2).
+///
+/// `seed` and `remote` are fallback build paths, so they are only named when the
+/// host has no build of its own (`build == None`); otherwise listing them would
+/// point the operator at a seed / remote builder that the host never needed.
 fn missing_axes_reason(facts: &HostFacts) -> String {
     let mut missing = Vec::new();
     if !matches!(facts.boot, BootAxis::Ok) {
@@ -179,12 +180,12 @@ fn missing_axes_reason(facts: &HostFacts) -> String {
     }
     if matches!(facts.build, BuildAxis::None) {
         missing.push("build (no Nix and no viable install path)");
-    }
-    if facts.seed.is_none() {
-        missing.push("seed (no builder-VM seed available)");
-    }
-    if facts.remote_builder.is_none() {
-        missing.push("remote (no remote builder available)");
+        if facts.seed.is_none() {
+            missing.push("seed (no builder-VM seed available)");
+        }
+        if facts.remote_builder.is_none() {
+            missing.push("remote (no remote builder available)");
+        }
     }
     format!("no viable provisioning strategy; missing axes: {}", missing.join(", "))
 }

@@ -39,5 +39,7 @@ fn phase_b_suite_is_host_gated() {
     }
     // The B-accept host author replaces this with the enumerated scenarios above
     // (NixOS · non-NixOS Linux · install · Mac), each on the real router + backend.
-    eprintln!("phase_b: host tier enabled — no scenarios authored yet (B-accept, tier-3)");
+    // Fail closed until then: a green `phase_b` must mean the scenarios ran, never
+    // that the host tier was enabled over an empty gate (S9 — no false-green).
+    panic!("phase_b: SANDY_HOST_TESTS=1 but no host scenarios authored yet (B-accept, tier-3)");
 }
