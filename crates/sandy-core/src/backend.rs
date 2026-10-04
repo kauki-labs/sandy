@@ -151,10 +151,6 @@ pub trait VmBackend {
 /// [`FakeBackend::killed`]. The trait methods are left for the implementer to
 /// wire against these fields.
 #[derive(Debug, Default)]
-#[allow(
-    dead_code,
-    reason = "injection fields are read by the VmBackend impl the implementer fills (todo!())"
-)]
 pub struct FakeBackend {
     /// The scripted result of the next [`VmBackend::run`] call.
     run_result: Mutex<Option<Result<Outcome, BackendError>>>,
@@ -201,15 +197,23 @@ impl FakeBackend {
 
 impl VmBackend for FakeBackend {
     fn run(&self, _spec: &RunSpec) -> Result<Outcome, BackendError> {
-        todo!("return the scripted run_result")
+        self.run_result
+            .lock()
+            .expect("run_result lock poisoned")
+            .clone()
+            .unwrap_or_else(|| Err(BackendError::Protocol("no scripted run outcome".to_string())))
     }
 
-    fn kill(&self, _box_id: &str) -> Result<(), BackendError> {
-        todo!("record box_id in `killed` and return Ok")
+    fn kill(&self, box_id: &str) -> Result<(), BackendError> {
+        self.killed
+            .lock()
+            .expect("killed lock poisoned")
+            .push(box_id.to_string());
+        Ok(())
     }
 
     fn boxes(&self) -> Result<Vec<BoxState>, BackendError> {
-        todo!("return a clone of the scripted `boxes`")
+        Ok(self.boxes.lock().expect("boxes lock poisoned").clone())
     }
 }
 
@@ -231,8 +235,22 @@ pub enum PlanError {
 /// # Errors
 ///
 /// Returns [`PlanError::SecretLeak`] when a secret would reach the data plane.
-pub fn validate_no_secret_leak(_spec: &RunSpec) -> Result<(), PlanError> {
-    todo!("reject secrets that also appear as a mount host or in env")
+pub fn validate_no_secret_leak(spec: &RunSpec) -> Result<(), PlanError> {
+    for secret in spec.secrets {
+        // A file-sourced secret must not also be exposed as a bind mount — that
+        // would route its bytes through the data/store plane (INV-1).
+        if let SecretSource::File(path) = &secret.source
+            && spec.mounts.iter().any(|mount| &mount.host == path)
+        {
+            return Err(PlanError::SecretLeak(secret.name.clone()));
+        }
+        // The secret's name must not be set as a plain env var — env is not the
+        // secret channel and travels host argv/environ (INV-1).
+        if spec.env.iter().any(|(key, _)| key == &secret.name) {
+            return Err(PlanError::SecretLeak(secret.name.clone()));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

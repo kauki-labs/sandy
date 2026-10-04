@@ -7,6 +7,9 @@
 //! because flock is unreliable on virtiofs/networked FS (INV-5).
 
 use std::{
+    fs::{File, OpenOptions},
+    io::Write,
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     time::SystemTime,
 };
@@ -114,7 +117,8 @@ impl Journal {
     ///
     /// Returns [`CoreError::Io`] if the directories cannot be created.
     pub fn ensure_dirs(&self) -> Result<(), CoreError> {
-        todo!("create $SANDY_HOME/jobs")
+        std::fs::create_dir_all(self.jobs_dir())?;
+        Ok(())
     }
 
     /// Write `record` atomically (tmp + fsync + rename).
@@ -122,8 +126,25 @@ impl Journal {
     /// # Errors
     ///
     /// Returns [`CoreError::Io`] / [`CoreError::Serde`] on failure.
-    pub fn write_record(&self, _record: &JobRecord) -> Result<(), CoreError> {
-        todo!("serialize to <id>.json.tmp, fsync, rename over <id>.json")
+    pub fn write_record(&self, record: &JobRecord) -> Result<(), CoreError> {
+        let dir = self.jobs_dir();
+        let final_path = self.record_path(&record.job_id);
+        let json = serde_json::to_vec_pretty(record)?;
+
+        // Write into a same-directory temp file so the rename is atomic on one
+        // filesystem; a unique suffix keeps concurrent writers from colliding.
+        let tmp_path = dir.join(format!("{}.json.tmp.{}", record.job_id, uuid::Uuid::new_v4()));
+        {
+            let mut tmp = File::create(&tmp_path)?;
+            tmp.write_all(&json)?;
+            tmp.sync_all()?;
+        }
+        std::fs::rename(&tmp_path, &final_path)?;
+
+        // fsync the directory so the rename itself survives a crash (INV-6).
+        let dir_handle = File::open(&dir)?;
+        dir_handle.sync_all()?;
+        Ok(())
     }
 
     /// Read the record for `job_id`.
@@ -131,8 +152,17 @@ impl Journal {
     /// # Errors
     ///
     /// Returns [`CoreError::NotFound`] when no record exists.
-    pub fn read_record(&self, _job_id: &str) -> Result<JobRecord, CoreError> {
-        todo!("read and deserialize <id>.json")
+    pub fn read_record(&self, job_id: &str) -> Result<JobRecord, CoreError> {
+        let path = self.record_path(job_id);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(CoreError::NotFound(job_id.to_string()));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let record = serde_json::from_slice(&bytes)?;
+        Ok(record)
     }
 
     /// List every job record.
@@ -141,7 +171,23 @@ impl Journal {
     ///
     /// Returns [`CoreError::Io`] / [`CoreError::Serde`] on failure.
     pub fn list(&self) -> Result<Vec<JobRecord>, CoreError> {
-        todo!("read every <id>.json under jobs/")
+        let dir = self.jobs_dir();
+        let mut records = Vec::new();
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(records),
+            Err(e) => return Err(e.into()),
+        };
+        for entry in entries {
+            let path = entry?.path();
+            // Only committed records; skip `.lock` files and `.json.tmp.*` temps.
+            if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+                let bytes = std::fs::read(&path)?;
+                let record: JobRecord = serde_json::from_slice(&bytes)?;
+                records.push(record);
+            }
+        }
+        Ok(records)
     }
 
     /// Block until the per-job flock is acquired (`O_CLOEXEC`).
@@ -149,8 +195,13 @@ impl Journal {
     /// # Errors
     ///
     /// Returns [`CoreError::Io`] if the lockfile cannot be opened.
-    pub fn lock_job(&self, _job_id: &str) -> Result<JobLock, CoreError> {
-        todo!("open <id>.lock O_CLOEXEC and flock-exclusive (blocking)")
+    pub fn lock_job(&self, job_id: &str) -> Result<JobLock, CoreError> {
+        let file = self.open_lockfile(job_id)?;
+        fs2::FileExt::lock_exclusive(&file)?;
+        Ok(JobLock {
+            job_id: job_id.to_string(),
+            file,
+        })
     }
 
     /// Try to acquire the per-job flock without blocking; `Ok(None)` if another
@@ -159,15 +210,37 @@ impl Journal {
     /// # Errors
     ///
     /// Returns [`CoreError::Io`] if the lockfile cannot be opened.
-    pub fn try_lock_job(&self, _job_id: &str) -> Result<Option<JobLock>, CoreError> {
-        todo!("open <id>.lock O_CLOEXEC and try_lock_exclusive")
+    pub fn try_lock_job(&self, job_id: &str) -> Result<Option<JobLock>, CoreError> {
+        let file = self.open_lockfile(job_id)?;
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => Ok(Some(JobLock {
+                job_id: job_id.to_string(),
+                file,
+            })),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Open (creating if absent) a job's lockfile with `O_CLOEXEC` so only the
+    /// supervisor holds it — forked children must not inherit it, or reconcile
+    /// would never fire (INV-3, D3).
+    fn open_lockfile(&self, job_id: &str) -> Result<File, CoreError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .custom_flags(libc::O_CLOEXEC)
+            .open(self.lock_path(job_id))?;
+        Ok(file)
     }
 }
 
 /// Generate a fresh job id (UUID v4).
 #[must_use]
 pub fn new_job_id() -> String {
-    todo!("uuid::Uuid::new_v4()")
+    uuid::Uuid::new_v4().to_string()
 }
 
 /// Verify that `path` lives on a local POSIX filesystem, not virtiofs/NFS,
@@ -176,8 +249,90 @@ pub fn new_job_id() -> String {
 /// # Errors
 ///
 /// Returns [`CoreError::NonLocalFs`] when `path` is on a non-local filesystem.
-pub fn ensure_local_posix_fs(_path: &Path) -> Result<(), CoreError> {
-    todo!("reject virtiofs / networked filesystems")
+pub fn ensure_local_posix_fs(path: &Path) -> Result<(), CoreError> {
+    // A known-networked backing store is refused; anything else (local disk, or
+    // an undetectable mount) is accepted, so the common local case never fails.
+    if let Some(fstype) = detect_fs_type(path)
+        && is_networked_fs(&fstype)
+    {
+        return Err(CoreError::NonLocalFs(format!(
+            "{} is on a {fstype} filesystem; flock is unreliable there",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Return the filesystem type backing `path`, by matching it against the host's
+/// mount table. `None` when it cannot be determined (then the caller accepts).
+fn detect_fs_type(path: &Path) -> Option<String> {
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    mount_table()
+        .into_iter()
+        .filter(|(mount_point, _)| target.starts_with(mount_point))
+        .max_by_key(|(mount_point, _)| mount_point.as_os_str().len())
+        .map(|(_, fstype)| fstype)
+}
+
+/// Mount points and their filesystem types, read from `/proc/mounts` on Linux.
+#[cfg(target_os = "linux")]
+fn mount_table() -> Vec<(PathBuf, String)> {
+    let content = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+    content
+        .lines()
+        .filter_map(|line| {
+            // `<device> <mount-point> <fstype> <opts> <freq> <passno>`
+            let mut fields = line.split_whitespace();
+            let _device = fields.next()?;
+            let mount_point = fields.next()?;
+            let fstype = fields.next()?;
+            Some((PathBuf::from(mount_point), fstype.to_string()))
+        })
+        .collect()
+}
+
+/// Mount points and their filesystem types, parsed from `mount(8)` elsewhere
+/// (macOS and other BSDs have no `/proc/mounts`).
+#[cfg(not(target_os = "linux"))]
+fn mount_table() -> Vec<(PathBuf, String)> {
+    let Ok(output) = std::process::Command::new("mount").output() else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines()
+        .filter_map(|line| {
+            // `<device> on <mount-point> (<fstype>, <opts>...)`
+            let (_device, rest) = line.split_once(" on ")?;
+            let (mount_point, paren) = rest.rsplit_once(" (")?;
+            let fstype = paren.trim_end_matches(')').split(',').next()?.trim();
+            Some((PathBuf::from(mount_point), fstype.to_string()))
+        })
+        .collect()
+}
+
+/// Whether `fstype` names a networked / shared filesystem where flock cannot be
+/// trusted (INV-5).
+fn is_networked_fs(fstype: &str) -> bool {
+    const DENY: &[&str] = &[
+        "nfs",
+        "nfs4",
+        "cifs",
+        "smbfs",
+        "smb",
+        "afpfs",
+        "webdav",
+        "sshfs",
+        "virtiofs",
+        "9p",
+        "ncpfs",
+        "glusterfs",
+        "lustre",
+        "ceph",
+        "fuse.sshfs",
+        "fuse.glusterfs",
+    ];
+    let lower = fstype.to_ascii_lowercase();
+    DENY.contains(&lower.as_str())
 }
 
 #[cfg(test)]

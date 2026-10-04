@@ -8,7 +8,12 @@
 //! is never observable. Exceeding the per-job cap fails the job (it is never
 //! truncated).
 
-use std::path::{Path, PathBuf};
+use std::{
+    fs::{File, OpenOptions},
+    io::{Read, Write},
+    os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
+};
 
 use crate::{backend::Outcome, result::OutputRef};
 
@@ -68,13 +73,114 @@ pub enum CollectError {
 /// Returns [`CollectError`] on a missing required output, a symlink / non-regular
 /// source, an over-quota total, or an I/O error.
 pub fn collect(
-    _outcome: &Outcome,
-    _source_dir: &Path,
-    _job_dir: &Path,
-    _declared: &[OutputSpec],
-    _config: &CollectionConfig,
+    outcome: &Outcome,
+    source_dir: &Path,
+    job_dir: &Path,
+    declared: &[OutputSpec],
+    config: &CollectionConfig,
 ) -> Result<Vec<OutputRef>, CollectError> {
-    todo!("exit-0-gated, O_NOFOLLOW read, atomic out.tmp -> out, cap-enforced")
+    // INV-2: collect only on a clean guest `exit 0`. A nonzero exit, a timeout,
+    // or a guest that never booted collects nothing and leaves no `out/`.
+    let clean_exit = outcome.booted && !outcome.timed_out && outcome.guest_exit == Some(0);
+    if !clean_exit {
+        return Ok(Vec::new());
+    }
+
+    let out_tmp = job_dir.join("out.tmp");
+    let out = job_dir.join("out");
+
+    // Start from a clean staging dir: a torn `out.tmp/` left by a killed run must
+    // never be promoted, so its contents are discarded before we stage (INV-4).
+    if out_tmp.exists() {
+        std::fs::remove_dir_all(&out_tmp)?;
+    }
+    std::fs::create_dir_all(&out_tmp)?;
+
+    match stage_outputs(source_dir, &out_tmp, declared, config) {
+        Ok(collected) => {
+            // Promote atomically: fsync the staging dir, rename it to `out/`, then
+            // fsync the parent so the rename survives a crash (INV-4).
+            fsync_dir(&out_tmp)?;
+            std::fs::rename(&out_tmp, &out)?;
+            fsync_dir(job_dir)?;
+            Ok(collected)
+        }
+        Err(e) => {
+            // On any failure `out/` is never created and the partial staging is
+            // discarded (INV-2/INV-4).
+            let _ = std::fs::remove_dir_all(&out_tmp);
+            Err(e)
+        }
+    }
+}
+
+/// Stage every declared output into `out_tmp`, enforcing `O_NOFOLLOW`,
+/// regular-file-only, and the per-job cap (INV-2). Returns the collected refs;
+/// the caller promotes `out_tmp` to `out/` only on success.
+fn stage_outputs(
+    source_dir: &Path,
+    out_tmp: &Path,
+    declared: &[OutputSpec],
+    config: &CollectionConfig,
+) -> Result<Vec<OutputRef>, CollectError> {
+    let mut collected = Vec::new();
+    let mut total: u64 = 0;
+
+    for spec in declared {
+        let src = source_dir.join(&spec.guest_path);
+        // O_NOFOLLOW: a symlink final component fails with ELOOP, so the target
+        // bytes are never read (INV-2). O_CLOEXEC keeps the fd off forked children.
+        let open = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&src);
+        let mut file = match open {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if spec.required {
+                    return Err(CollectError::RequiredMissing(spec.name.clone()));
+                }
+                continue;
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+                return Err(CollectError::Symlink(src));
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        let metadata = file.metadata()?;
+        if !metadata.file_type().is_file() {
+            return Err(CollectError::NotRegularFile(src));
+        }
+
+        // Enforce the cap before copying; the source is only read, never
+        // truncated — over-quota fails the job (INV), it does not shrink output.
+        total = total.saturating_add(metadata.len());
+        if total > config.per_job_cap_bytes {
+            return Err(CollectError::OverQuota {
+                cap: config.per_job_cap_bytes,
+                actual: total,
+            });
+        }
+
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let dest = out_tmp.join(&spec.name);
+        let mut dest_file = File::create(&dest)?;
+        dest_file.write_all(&bytes)?;
+        dest_file.sync_all()?;
+
+        collected.push(OutputRef {
+            path: spec.name.clone(),
+        });
+    }
+
+    Ok(collected)
+}
+
+/// fsync a directory so a preceding create/rename within it is durable.
+fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    File::open(dir)?.sync_all()
 }
 
 #[cfg(test)]

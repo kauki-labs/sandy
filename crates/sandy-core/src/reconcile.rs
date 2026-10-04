@@ -10,7 +10,7 @@
 use crate::{
     CoreError,
     backend::VmBackend,
-    journal::{JobRecord, Journal},
+    journal::{JobRecord, JobState, Journal},
 };
 
 /// Reconcile a single job's record against live backend state.
@@ -24,6 +24,42 @@ use crate::{
 ///
 /// Returns [`CoreError`] on journal I/O failure or if liveness cannot be
 /// determined; backend errors surface as [`CoreError`].
-pub fn reconcile_job<B: VmBackend>(_journal: &Journal, _backend: &B, _job_id: &str) -> Result<JobRecord, CoreError> {
-    todo!("read record; if running and box absent, lock then flip to crashed + kill")
+pub fn reconcile_job<B: VmBackend>(journal: &Journal, backend: &B, job_id: &str) -> Result<JobRecord, CoreError> {
+    let record = journal.read_record(job_id)?;
+    if record.state != JobState::Running {
+        return Ok(record);
+    }
+
+    // Liveness via the backend's running-box set — never a direct registry read
+    // (INV-3). A box still listed means the owner is alive; leave it untouched.
+    let boxes = backend
+        .boxes()
+        .map_err(|e| CoreError::State(format!("backend box query failed: {e}")))?;
+    let box_still_listed = record
+        .box_id
+        .as_deref()
+        .is_some_and(|id| boxes.iter().any(|b| b.box_id == id));
+    if box_still_listed {
+        return Ok(record);
+    }
+
+    // The box is gone from the backend, but the pid may have been reused — so the
+    // flock, not the pid, is the liveness authority (INV-3). Only acquiring it
+    // proves the owner is gone; if another writer holds it, the job is live.
+    let Some(_lock) = journal.try_lock_job(job_id)? else {
+        return Ok(record);
+    };
+
+    // Owner confirmed gone: flip running → crashed and tear the box down, all
+    // under the held lock (TOCTOU-safe).
+    let mut crashed = record;
+    crashed.state = JobState::Crashed;
+    crashed.writer_pid = std::process::id();
+    journal.write_record(&crashed)?;
+    if let Some(box_id) = &crashed.box_id {
+        backend
+            .kill(box_id)
+            .map_err(|e| CoreError::State(format!("teardown of box {box_id} failed: {e}")))?;
+    }
+    Ok(crashed)
 }
