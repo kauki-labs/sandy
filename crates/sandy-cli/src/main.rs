@@ -24,6 +24,16 @@ enum Command {
 }
 
 fn main() {
-    let _cli = Cli::parse();
-    todo!("dispatch Command::Doctor to doctor::run_doctor(), print the message, std::process::exit(result.exit_code)")
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Doctor => {
+            let result = doctor::run_doctor();
+            if result.exit_code == 0 {
+                println!("{}", result.message);
+            } else {
+                eprintln!("{}", result.message);
+            }
+            std::process::exit(result.exit_code);
+        }
+    }
 }
