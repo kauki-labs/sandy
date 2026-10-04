@@ -148,8 +148,7 @@ pub trait VmBackend {
 /// Script a run outcome with [`FakeBackend::with_outcome`] /
 /// [`FakeBackend::with_error`], the running-box set with
 /// [`FakeBackend::with_boxes`], and inspect teardown calls with
-/// [`FakeBackend::killed`]. The trait methods are left for the implementer to
-/// wire against these fields.
+/// [`FakeBackend::killed`].
 #[derive(Debug, Default)]
 pub struct FakeBackend {
     /// The scripted result of the next [`VmBackend::run`] call. Set once by the

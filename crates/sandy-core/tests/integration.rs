@@ -2,9 +2,7 @@
 //! collection flows against fixtures on a generic POSIX FS. No hypervisor —
 //! the backend is [`FakeBackend`], `$SANDY_HOME` is a `TempDir`.
 //!
-//! These cover the Block 4 verification and adversarial rows. Every test is
-//! currently RED (the exercised functions are `todo!()`); the implementer turns
-//! them green.
+//! These cover the Block 4 verification and adversarial rows.
 
 use std::time::SystemTime;
 

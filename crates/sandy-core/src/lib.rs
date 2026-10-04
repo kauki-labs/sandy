@@ -10,9 +10,6 @@
 //!   (INV-3, INV-5, INV-6).
 //! - [`collect`] — exit-0-only, atomic, `O_NOFOLLOW` output collection (INV-2, INV-4).
 //! - [`reconcile`] — reconcile-on-read, acting only under the job's flock (INV-3).
-//!
-//! Function bodies throughout are `todo!()`: this crate currently ships the API
-//! skeleton and its red test suite. A separate implementer fills the behaviour.
 
 pub mod backend;
 pub mod collect;
