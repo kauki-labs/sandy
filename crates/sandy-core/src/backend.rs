@@ -152,11 +152,13 @@ pub trait VmBackend {
 /// wire against these fields.
 #[derive(Debug, Default)]
 pub struct FakeBackend {
-    /// The scripted result of the next [`VmBackend::run`] call.
-    run_result: Mutex<Option<Result<Outcome, BackendError>>>,
+    /// The scripted result of the next [`VmBackend::run`] call. Set once by the
+    /// by-value builders, then only read, so it needs no interior mutability.
+    run_result: Option<Result<Outcome, BackendError>>,
     /// The boxes [`VmBackend::boxes`] should report.
-    boxes: Mutex<Vec<BoxState>>,
-    /// Box ids passed to [`VmBackend::kill`], in call order.
+    boxes: Vec<BoxState>,
+    /// Box ids passed to [`VmBackend::kill`], in call order — the one field
+    /// mutated through `&self`, so the only one behind a lock.
     killed: Mutex<Vec<String>>,
 }
 
@@ -169,22 +171,22 @@ impl FakeBackend {
 
     /// Script the [`Outcome`] the next [`VmBackend::run`] returns.
     #[must_use]
-    pub fn with_outcome(self, outcome: Outcome) -> Self {
-        *self.run_result.lock().expect("run_result lock poisoned") = Some(Ok(outcome));
+    pub fn with_outcome(mut self, outcome: Outcome) -> Self {
+        self.run_result = Some(Ok(outcome));
         self
     }
 
     /// Script a [`BackendError`] for the next [`VmBackend::run`] call.
     #[must_use]
-    pub fn with_error(self, error: BackendError) -> Self {
-        *self.run_result.lock().expect("run_result lock poisoned") = Some(Err(error));
+    pub fn with_error(mut self, error: BackendError) -> Self {
+        self.run_result = Some(Err(error));
         self
     }
 
     /// Script the boxes [`VmBackend::boxes`] reports.
     #[must_use]
-    pub fn with_boxes(self, boxes: Vec<BoxState>) -> Self {
-        *self.boxes.lock().expect("boxes lock poisoned") = boxes;
+    pub fn with_boxes(mut self, boxes: Vec<BoxState>) -> Self {
+        self.boxes = boxes;
         self
     }
 
@@ -198,8 +200,6 @@ impl FakeBackend {
 impl VmBackend for FakeBackend {
     fn run(&self, _spec: &RunSpec) -> Result<Outcome, BackendError> {
         self.run_result
-            .lock()
-            .expect("run_result lock poisoned")
             .clone()
             .unwrap_or_else(|| Err(BackendError::Protocol("no scripted run outcome".to_string())))
     }
@@ -213,7 +213,7 @@ impl VmBackend for FakeBackend {
     }
 
     fn boxes(&self) -> Result<Vec<BoxState>, BackendError> {
-        Ok(self.boxes.lock().expect("boxes lock poisoned").clone())
+        Ok(self.boxes.clone())
     }
 }
 

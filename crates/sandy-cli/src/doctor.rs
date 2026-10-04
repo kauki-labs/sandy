@@ -6,6 +6,8 @@
 
 use std::path::PathBuf;
 
+use sandy_core::ProcessExit;
+
 /// Verdict for whether a filesystem type is acceptable for `$SANDY_HOME`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FsVerdict {
@@ -51,11 +53,11 @@ pub struct DoctorResult {
 pub fn doctor_result_for(verdict: FsVerdict) -> DoctorResult {
     match verdict {
         FsVerdict::Local => DoctorResult {
-            exit_code: 0,
+            exit_code: ProcessExit::Succeeded.code(),
             message: "sandy doctor: $SANDY_HOME is on a local POSIX filesystem — OK".to_string(),
         },
         FsVerdict::NonLocal { fstype } => DoctorResult {
-            exit_code: 2,
+            exit_code: ProcessExit::InvalidPlan.code(),
             message: format!(
                 "sandy doctor: refusing to start — $SANDY_HOME is on '{fstype}', a networked or share filesystem; \
                  this violates INV-5 (flock is unreliable there). Point $SANDY_HOME at a local POSIX filesystem \
@@ -83,7 +85,7 @@ pub fn run_doctor() -> DoctorResult {
     // A fresh install has no $SANDY_HOME yet; create it so there is something to probe.
     if let Err(err) = std::fs::create_dir_all(&home) {
         return DoctorResult {
-            exit_code: 2,
+            exit_code: ProcessExit::InvalidPlan.code(),
             message: format!(
                 "sandy doctor: refusing to start — could not create $SANDY_HOME at {}: {err}",
                 home.display()
@@ -97,7 +99,7 @@ pub fn run_doctor() -> DoctorResult {
     match sandy_core::detect_fs_type(&home) {
         Some(fstype) => doctor_result_for(classify_fs(&fstype)),
         None => DoctorResult {
-            exit_code: 0,
+            exit_code: ProcessExit::Succeeded.code(),
             message: "sandy doctor: $SANDY_HOME filesystem type is undetectable; proceeding — OK".to_string(),
         },
     }

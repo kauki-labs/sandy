@@ -10,7 +10,6 @@
 
 use std::{
     fs::{File, OpenOptions},
-    io::{Read, Write},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
@@ -100,9 +99,9 @@ pub fn collect(
         Ok(collected) => {
             // Promote atomically: fsync the staging dir, rename it to `out/`, then
             // fsync the parent so the rename survives a crash (INV-4).
-            fsync_dir(&out_tmp)?;
+            crate::fsync_dir(&out_tmp)?;
             std::fs::rename(&out_tmp, &out)?;
-            fsync_dir(job_dir)?;
+            crate::fsync_dir(job_dir)?;
             Ok(collected)
         }
         Err(e) => {
@@ -174,11 +173,9 @@ fn stage_outputs(
             });
         }
 
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
         let dest = out_tmp.join(&spec.name);
         let mut dest_file = File::create(&dest)?;
-        dest_file.write_all(&bytes)?;
+        std::io::copy(&mut file, &mut dest_file)?;
         dest_file.sync_all()?;
 
         collected.push(OutputRef {
@@ -187,11 +184,6 @@ fn stage_outputs(
     }
 
     Ok(collected)
-}
-
-/// fsync a directory so a preceding create/rename within it is durable.
-fn fsync_dir(dir: &Path) -> std::io::Result<()> {
-    File::open(dir)?.sync_all()
 }
 
 #[cfg(test)]

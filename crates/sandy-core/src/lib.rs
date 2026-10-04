@@ -57,3 +57,9 @@ pub enum CoreError {
     #[error("invalid journal state: {0}")]
     State(String),
 }
+
+/// fsync a directory so a preceding create/rename within it is durable across a
+/// crash (INV-4/INV-6).
+pub(crate) fn fsync_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}

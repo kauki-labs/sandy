@@ -78,6 +78,44 @@ pub struct Classification {
     pub process_exit: ProcessExit,
 }
 
+impl Classification {
+    /// Clean guest success (band 0).
+    const fn succeeded() -> Self {
+        Self {
+            status: Status::Succeeded,
+            retryable: false,
+            process_exit: ProcessExit::Succeeded,
+        }
+    }
+
+    /// Task/contract fault (band 1, never retryable).
+    const fn task_failure() -> Self {
+        Self {
+            status: Status::Failed,
+            retryable: false,
+            process_exit: ProcessExit::TaskFailure,
+        }
+    }
+
+    /// Invalid plan / usage (band 2, never retryable).
+    const fn invalid_plan() -> Self {
+        Self {
+            status: Status::Failed,
+            retryable: false,
+            process_exit: ProcessExit::InvalidPlan,
+        }
+    }
+
+    /// Infra fault (band 3) — the only retryable band (INV-7).
+    const fn infra_fault() -> Self {
+        Self {
+            status: Status::Failed,
+            retryable: true,
+            process_exit: ProcessExit::InfraFault,
+        }
+    }
+}
+
 /// Classify a completed backend [`Outcome`] plus its output resolution into the
 /// terminal [`Classification`] (INV-7/INV-11): exit-0 + complete → succeeded /
 /// band 0; guest-nonzero / timeout / required-missing / over-quota → failed /
@@ -89,65 +127,33 @@ pub fn classify_outcome(outcome: &Outcome, outputs: OutputStatus) -> Classificat
     // fault — the only retryable band (INV-7). A booted-but-silent guest
     // (no exit, no timeout) is also transport (D8).
     if !outcome.booted || outcome.transport_error.is_some() {
-        return Classification {
-            status: Status::Failed,
-            retryable: true,
-            process_exit: ProcessExit::InfraFault,
-        };
+        return Classification::infra_fault();
     }
     // A timeout is a task/contract fault, never retryable by the platform.
     if outcome.timed_out {
-        return Classification {
-            status: Status::Failed,
-            retryable: false,
-            process_exit: ProcessExit::TaskFailure,
-        };
+        return Classification::task_failure();
     }
     match outcome.guest_exit {
         Some(0) => match outputs {
-            OutputStatus::Complete => Classification {
-                status: Status::Succeeded,
-                retryable: false,
-                process_exit: ProcessExit::Succeeded,
-            },
-            OutputStatus::RequiredMissing | OutputStatus::OverQuota => Classification {
-                status: Status::Failed,
-                retryable: false,
-                process_exit: ProcessExit::TaskFailure,
-            },
+            OutputStatus::Complete => Classification::succeeded(),
+            OutputStatus::RequiredMissing | OutputStatus::OverQuota => Classification::task_failure(),
         },
-        Some(_) => Classification {
-            status: Status::Failed,
-            retryable: false,
-            process_exit: ProcessExit::TaskFailure,
-        },
-        None => Classification {
-            status: Status::Failed,
-            retryable: true,
-            process_exit: ProcessExit::InfraFault,
-        },
+        Some(_) => Classification::task_failure(),
+        None => Classification::infra_fault(),
     }
 }
 
 /// Classify a [`BackendError`] as an infra fault (band 3, `retryable: true`).
 #[must_use]
 pub fn classify_backend_error(_error: &BackendError) -> Classification {
-    Classification {
-        status: Status::Failed,
-        retryable: true,
-        process_exit: ProcessExit::InfraFault,
-    }
+    Classification::infra_fault()
 }
 
 /// Classify a [`PlanError`] as an invalid plan (band 2, `retryable: false`, no
 /// boot).
 #[must_use]
 pub fn classify_invalid_plan(_error: &PlanError) -> Classification {
-    Classification {
-        status: Status::Failed,
-        retryable: false,
-        process_exit: ProcessExit::InvalidPlan,
-    }
+    Classification::invalid_plan()
 }
 
 /// One collected output.

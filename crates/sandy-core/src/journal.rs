@@ -142,8 +142,7 @@ impl Journal {
         std::fs::rename(&tmp_path, &final_path)?;
 
         // fsync the directory so the rename itself survives a crash (INV-6).
-        let dir_handle = File::open(&dir)?;
-        dir_handle.sync_all()?;
+        crate::fsync_dir(&dir)?;
         Ok(())
     }
 
