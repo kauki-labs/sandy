@@ -551,32 +551,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
-name = "sandy-acceptance"
-version = "0.1.1"
-dependencies = [
- "anyhow",
- "rstest",
- "sandy-core",
- "sandy-egress",
- "sandy-provider",
- "sandy-seed",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "sandy-cli"
-version = "0.1.1"
-dependencies = [
- "anyhow",
- "clap",
- "rstest",
- "sandy-core",
- "tempfile",
-]
-
-[[package]]
-name = "sandy-core"
+name = "sandy"
 version = "0.1.1"
 dependencies = [
  "anyhow",
@@ -593,22 +568,38 @@ dependencies = [
 ]
 
 [[package]]
-name = "sandy-cred"
-version = "0.1.1"
-
-[[package]]
-name = "sandy-egress"
+name = "sandy-acceptance"
 version = "0.1.1"
 dependencies = [
- "serde",
- "tracing",
+ "anyhow",
+ "rstest",
+ "sandy",
+ "sandy-provider",
+ "sandy-seed",
+ "serde_json",
+ "tempfile",
 ]
+
+[[package]]
+name = "sandy-cli"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "rstest",
+ "sandy",
+ "tempfile",
+]
+
+[[package]]
+name = "sandy-cred"
+version = "0.1.1"
 
 [[package]]
 name = "sandy-provider"
 version = "0.1.1"
 dependencies = [
- "sandy-core",
+ "sandy",
 ]
 
 [[package]]

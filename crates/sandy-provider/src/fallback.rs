@@ -6,7 +6,7 @@
 //! or refuse naming the blocker. The decision is pure and sandbox-provable; the
 //! actual boots are host-tier.
 
-use sandy_core::{HostFacts, ProvisioningStrategy};
+use sandy::{HostFacts, ProvisioningStrategy};
 
 /// Decide the provisioning fallback for a locked-down, Nix-free Linux host where a
 /// local Nix install is impossible (D-REQ-2 / D14).
@@ -43,7 +43,7 @@ pub fn decide_fallback(facts: &HostFacts, seed_available: bool, remote_available
 
 #[cfg(test)]
 mod tests {
-    use sandy_core::{BootAxis, BuildAxis, HostFacts, ProvisioningStrategy};
+    use sandy::{BootAxis, BuildAxis, HostFacts, ProvisioningStrategy};
 
     use super::decide_fallback;
 

@@ -14,6 +14,7 @@
 pub mod backend;
 pub mod collect;
 pub mod config;
+pub mod egress;
 pub mod error;
 pub mod gc;
 pub mod journal;
@@ -29,6 +30,7 @@ pub use backend::{
 };
 pub use collect::{CollectError, OutputSpec, collect};
 pub use config::CollectionConfig;
+pub use egress::{AllowList, EgressRule, macos_egress_statement, to_nftables};
 pub use error::CoreError;
 pub use gc::{StagedImage, plan_eviction};
 pub use journal::{JobLock, Journal, detect_fs_type, ensure_local_posix_fs, is_networked_fs, new_job_id};

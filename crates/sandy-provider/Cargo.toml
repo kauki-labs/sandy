@@ -1,6 +1,6 @@
 [package]
 name = "sandy-provider"
-description = "VmBackend implementations wiring sandy-core to nix-vm (Block 5)"
+description = "VmBackend implementations wiring sandy to nix-vm (Block 5)"
 version.workspace = true
 authors.workspace = true
 homepage.workspace = true
@@ -16,4 +16,4 @@ crate-type = ["rlib"]
 workspace = true
 
 [dependencies]
-sandy-core = { path = "../sandy-core" }
+sandy = { path = "../sandy" }

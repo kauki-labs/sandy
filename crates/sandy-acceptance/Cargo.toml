@@ -18,8 +18,7 @@ workspace = true
 [dependencies]
 
 [dev-dependencies]
-sandy-core = { path = "../sandy-core" }
-sandy-egress = { path = "../sandy-egress" }
+sandy = { path = "../sandy" }
 sandy-provider = { path = "../sandy-provider" }
 sandy-seed = { path = "../sandy-seed" }
 anyhow.workspace = true

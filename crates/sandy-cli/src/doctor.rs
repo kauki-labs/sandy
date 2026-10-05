@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use sandy_core::ProcessExit;
+use sandy::ProcessExit;
 
 /// Verdict for whether a filesystem type is acceptable for `$SANDY_HOME`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,13 +24,13 @@ pub enum FsVerdict {
 
 /// Classifies a filesystem type name into an [`FsVerdict`], using the same
 /// networked-filesystem policy as the journal's INV-5 gate
-/// ([`sandy_core::is_networked_fs`]) so doctor and the runtime agree.
+/// ([`sandy::is_networked_fs`]) so doctor and the runtime agree.
 ///
 /// Pure, no I/O — this is the seam the adversarial tests exercise directly, without a real
 /// network mount.
 pub fn classify_fs(fstype: &str) -> FsVerdict {
     let normalized = fstype.trim().to_ascii_lowercase();
-    if sandy_core::is_networked_fs(&normalized) {
+    if sandy::is_networked_fs(&normalized) {
         FsVerdict::NonLocal { fstype: normalized }
     } else {
         FsVerdict::Local
@@ -93,10 +93,10 @@ pub fn run_doctor() -> DoctorResult {
         };
     }
 
-    // Reuse sandy-core's mount-table detector — the same seam the journal's INV-5
+    // Reuse sandy's mount-table detector — the same seam the journal's INV-5
     // gate uses — so doctor and the runtime agree. An undetectable fstype is
     // accepted (like the journal), so the common local case never false-refuses.
-    match sandy_core::detect_fs_type(&home) {
+    match sandy::detect_fs_type(&home) {
         Some(fstype) => doctor_result_for(classify_fs(&fstype)),
         None => DoctorResult {
             exit_code: ProcessExit::Succeeded.code(),

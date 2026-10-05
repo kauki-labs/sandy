@@ -15,7 +15,7 @@ use std::{
 
 use crate::CoreError;
 // Re-exported so the serialized schema types resolve at `crate::journal::*` and
-// `sandy_core::*` exactly as before; the definitions live in `crate::schema::v1`.
+// `sandy::*` exactly as before; the definitions live in `crate::schema::v1`.
 pub use crate::schema::v1::{JOURNAL_SCHEMA_VERSION, JobRecord, JobState};
 
 /// A held per-job flock. The lock is released when this value is dropped.

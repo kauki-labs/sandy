@@ -1,5 +1,5 @@
 [package]
-name = "sandy-core"
+name = "sandy"
 description = "Core library for the sandy workspace: journal, data plane, reconcile, result, VmBackend"
 version.workspace = true
 authors.workspace = true
