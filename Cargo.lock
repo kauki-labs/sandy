@@ -555,6 +555,13 @@ name = "sandy-acceptance"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "rstest",
+ "sandy-core",
+ "sandy-egress",
+ "sandy-provider",
+ "sandy-seed",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
