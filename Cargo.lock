@@ -492,14 +492,14 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "sandy-acceptance"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
 ]
 
 [[package]]
 name = "sandy-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -527,19 +527,19 @@ dependencies = [
 
 [[package]]
 name = "sandy-cred"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "sandy-egress"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "sandy-provider"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "sandy-seed"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "semver"
