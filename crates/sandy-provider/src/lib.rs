@@ -5,5 +5,11 @@
 //!
 //! [`router`] is the Phase B HostNix router (block 6a): it routes a
 //! `ProvisioningStrategy` to Phase A's backend or refuses with a stage pointer.
+//!
+//! Phase D adds [`remote`] (the `RemoteBuild` eval-local / build-remote
+//! orchestration, D.1) and [`fallback`] (the locked-down-Linux fallback decision,
+//! D.2).
 
+pub mod fallback;
+pub mod remote;
 pub mod router;

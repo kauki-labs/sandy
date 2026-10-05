@@ -15,7 +15,9 @@ pub mod backend;
 pub mod collect;
 pub mod config;
 pub mod error;
+pub mod gc;
 pub mod journal;
+pub mod metrics;
 pub mod reconcile;
 pub mod result;
 pub mod schema;
@@ -28,7 +30,9 @@ pub use backend::{
 pub use collect::{CollectError, OutputSpec, collect};
 pub use config::CollectionConfig;
 pub use error::CoreError;
+pub use gc::{StagedImage, plan_eviction};
 pub use journal::{JobLock, Journal, detect_fs_type, ensure_local_posix_fs, is_networked_fs, new_job_id};
+pub use metrics::{RunMetrics, RunPhase};
 pub use reconcile::reconcile_job;
 pub use result::{
     Classification, Logs, OutputRef, OutputStatus, ProcessExit, Provenance, RESULT_SCHEMA_VERSION, Receipt,

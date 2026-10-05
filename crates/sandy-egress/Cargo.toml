@@ -1,6 +1,6 @@
 [package]
 name = "sandy-egress"
-description = "Egress allow-list wiring for sandy (Block 7b)"
+description = "Egress allow-list → nftables translation and macOS honesty (Phase D)"
 version.workspace = true
 authors.workspace = true
 homepage.workspace = true
@@ -16,3 +16,5 @@ crate-type = ["rlib"]
 workspace = true
 
 [dependencies]
+serde = { workspace = true }
+tracing.workspace = true
