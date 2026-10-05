@@ -53,7 +53,10 @@ impl RunMetrics {
         let leaving_running = matches!(from, RunPhase::Running) && !matches!(to, RunPhase::Running);
         if entering_running {
             self.running += 1;
-        } else if leaving_running {
+        } else if leaving_running && self.running > 0 {
+            // A count of in-flight runs is never negative: an unpaired leave (a
+            // Running→terminal with no matching enter) holds at zero rather than
+            // underflowing the gauge.
             self.running -= 1;
         }
 
@@ -137,5 +140,19 @@ mod tests {
         m.on_transition(RunPhase::Pending, RunPhase::Running);
         let after = m.transitions_total();
         assert_ne!(before, after, "a transitions counter that never moves is a dead metric");
+    }
+
+    /// An unpaired leave (a `Running` → terminal with no matching enter) must not
+    /// drive the in-flight gauge negative — a count of running runs is never below
+    /// zero. Regression: the leave branch used to decrement unconditionally.
+    #[test]
+    fn unbalanced_leave_does_not_underflow_gauge() {
+        let mut m = RunMetrics::new();
+        m.on_transition(RunPhase::Running, RunPhase::Succeeded);
+        assert_eq!(
+            m.running_gauge(),
+            0,
+            "an unpaired leave must hold the gauge at zero, not -1"
+        );
     }
 }

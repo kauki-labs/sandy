@@ -44,6 +44,13 @@ pub fn to_nftables(allow: &AllowList) -> String {
         // simply stays denied (CLAUDE.md: validate and sanitize inputs). The port
         // is a `u16`, so it is always a safe numeric token.
         if !is_emittable_host(&rule.host) {
+            // ...but not silently: a dropped entry means enforcement diverged from
+            // config, so name it rather than hiding the no-op.
+            tracing::warn!(
+                host = ?rule.host,
+                port = rule.port,
+                "egress allow-list entry dropped: host is not a bare name/address/CIDR; it stays denied"
+            );
             continue;
         }
         ruleset.push_str(&format!(
