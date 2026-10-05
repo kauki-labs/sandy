@@ -35,15 +35,19 @@ nix develop -c cargo shear --fix              # Prune unused dependencies
 
 ## Workflow
 
-1. Before modifying code, understand the surrounding context and existing patterns.
-2. For multi-step features, plan before implementing.
-3. After changes, run `nix develop -c cargo check` to verify.
-4. When a cycle is finished, run `cargo shear --fix` followed by `cargo check` for
-   dependency hygiene.
-5. Format with `nix fmt`.
-6. Run `nix develop -c cargo clippy --all-targets` and `nix develop -c cargo nextest run`.
-7. Before opening a PR, run `nix flake check -L`.
-8. Commit with a descriptive title using Conventional Commits notation.
+Before coding, understand the surrounding context and existing patterns; for multi-step
+features, plan first. Match the check to the change rather than running the full gate every
+time (the reasoning lives in the `rust-engineer` skill). Concrete commands:
+
+| Change                             | Checks                                                                                                      |
+| ---------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| Rust code                          | `nix develop -c cargo check`, `clippy --all-targets`, and `nextest run -p <crate>` for the touched crate    |
+| Tests only                         | `nix develop -c cargo nextest run -p <crate>`                                                               |
+| Docs, comments, `///`              | `nix fmt`; no tests unless a doctest changed                                                                |
+| `Cargo.toml`, deps, or `flake.nix` | `cargo shear --fix`, then `nix develop -c cargo check`                                                      |
+| Before opening a PR                | `nix fmt`, then `nix flake check -L` (full gate: build, clippy with deny-warnings, docs, tests, formatting) |
+
+Commit with a Conventional Commits title.
 
 ## Architecture
 
@@ -95,9 +99,15 @@ Add a crate by dropping it under `crates/`; the workspace glob picks it up.
 - Use TDD to drive the design of new modules and features; when unsure, ask.
 - Once a cycle is finished, run `cargo shear --fix` followed by `cargo check` for dependency hygiene and correctness.
 
+## Never
+
+- **Bulk-update `Cargo.lock`.** It pulls unrelated upgrades into the diff. Use
+  `cargo update --precise <crate>@<version>` for a targeted bump.
+- **`.unwrap()` / `.expect()` in library code.** A panic becomes the caller's crash.
+  Propagate with `?`; in tests return `anyhow::Result<()>` and add `.context()`.
+- **Drop the `tracing::` prefix** on log macros — write `tracing::info!`, not `info!`.
+
 ## Common mistakes to avoid
 
-1. `.unwrap()` in library code → propagate with `?`
-2. Missing `tracing::` prefix on log macros
-3. Leaving compiler or clippy warnings → fix, or `#[allow(reason = "…")]` with a justification
-4. Hardcoding config values instead of threading them through
+1. Leaving compiler or clippy warnings → fix, or `#[allow(reason = "…")]` with a justification
+2. Hardcoding config values instead of threading them through
