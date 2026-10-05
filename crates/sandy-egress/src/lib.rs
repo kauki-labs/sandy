@@ -32,8 +32,20 @@ pub struct AllowList {
 /// in the list.
 #[must_use]
 pub fn to_nftables(allow: &AllowList) -> String {
-    let _ = allow;
-    todo!("D.3: emit a default-deny (policy drop) nft ruleset with one accept per host:port, deterministic order")
+    // A base chain with a `drop` policy is the default-deny floor; one accept per
+    // rule, in the allow-list's own order, keeps the output deterministic. Host
+    // names are emitted verbatim — the real resolution to addresses is host-tier.
+    let mut ruleset = String::from("table inet sandy_egress {\n\tchain output {\n");
+    ruleset.push_str("\t\ttype filter hook output priority filter; policy drop;\n");
+    for rule in &allow.rules {
+        ruleset.push_str(&format!(
+            "\t\tip daddr {host} tcp dport {port} accept comment \"allow {host}:{port}\"\n",
+            host = rule.host,
+            port = rule.port,
+        ));
+    }
+    ruleset.push_str("\t}\n}\n");
+    ruleset
 }
 
 /// The honest macOS egress statement (D-REQ-3 macOS honesty).
@@ -43,7 +55,8 @@ pub fn to_nftables(allow: &AllowList) -> String {
 /// than pretending to filter.
 #[must_use]
 pub fn macos_egress_statement() -> &'static str {
-    todo!("D.3: a static message naming trusted-tasks-only and that NO per-VM egress boundary exists on macOS")
+    "sandy runs trusted tasks only on macOS: there is NO per-VM egress boundary. vmnet cannot enforce one, so guest \
+     egress is unfiltered and sandy does not pretend to filter it."
 }
 
 #[cfg(test)]

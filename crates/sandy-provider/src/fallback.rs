@@ -21,8 +21,25 @@ use sandy_core::{HostFacts, ProvisioningStrategy};
 /// and remote host are read from [`HostFacts::seed`] / [`HostFacts::remote_builder`].
 #[must_use]
 pub fn decide_fallback(facts: &HostFacts, seed_available: bool, remote_available: bool) -> ProvisioningStrategy {
-    let _ = (facts, seed_available, remote_available);
-    todo!("D.2: install-impossible Linux -> BuilderVM (seed) | RemoteBuild (remote) | Refuse naming the blocker")
+    // A reachable seed reuses C's seed/builder machinery; prefer it over a remote.
+    if let (true, Some(seed_id)) = (seed_available, &facts.seed) {
+        return ProvisioningStrategy::BuilderVM {
+            seed_id: seed_id.clone(),
+        };
+    }
+    // Else a reachable remote builder evaluates locally and builds remotely.
+    if let (true, Some(host)) = (remote_available, &facts.remote_builder) {
+        return ProvisioningStrategy::RemoteBuild {
+            host: host.clone(),
+            arch: facts.target_arch.clone(),
+        };
+    }
+    // Neither path is reachable: refuse naming both blockers, never a silent hang.
+    ProvisioningStrategy::Refuse {
+        reason: "locked-down Linux has no fallback: no seed (no reachable builder-VM seed) and no remote (no \
+                 reachable remote builder)"
+            .to_string(),
+    }
 }
 
 #[cfg(test)]

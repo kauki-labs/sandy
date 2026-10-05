@@ -46,8 +46,21 @@ impl RunMetrics {
     /// lowers the gauge; a terminal `to` bumps its counter; every call bumps the
     /// transitions total.
     pub fn on_transition(&mut self, from: RunPhase, to: RunPhase) {
-        let _ = (from, to);
-        todo!("D.4: move the running gauge on enter/leave Running; bump the terminal + transitions counters")
+        self.transitions_total += 1;
+
+        let entering_running = matches!(to, RunPhase::Running) && !matches!(from, RunPhase::Running);
+        let leaving_running = matches!(from, RunPhase::Running) && !matches!(to, RunPhase::Running);
+        if entering_running {
+            self.running += 1;
+        } else if leaving_running {
+            self.running -= 1;
+        }
+
+        match to {
+            RunPhase::Succeeded => self.succeeded_total += 1,
+            RunPhase::Failed => self.failed_total += 1,
+            _ => {}
+        }
     }
 
     /// Current number of runs in [`RunPhase::Running`] (a gauge).

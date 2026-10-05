@@ -23,8 +23,16 @@ pub struct StagedImage {
 /// result, even when it falls outside the newest N.
 #[must_use]
 pub fn plan_eviction(images: &[StagedImage], keep_last_n: usize, referenced: &HashSet<String>) -> Vec<String> {
-    let _ = (images, keep_last_n, referenced);
-    todo!("D.4: sort newest-first, keep the first keep_last_n, never evict a referenced id, return the rest")
+    let mut newest_first: Vec<&StagedImage> = images.iter().collect();
+    newest_first.sort_by_key(|image| std::cmp::Reverse(image.staged_at));
+    newest_first
+        .into_iter()
+        // The newest `keep_last_n` survive unconditionally...
+        .skip(keep_last_n)
+        // ...and a referenced id is never evicted, even when it falls past the window.
+        .filter(|image| !referenced.contains(&image.id))
+        .map(|image| image.id.clone())
+        .collect()
 }
 
 #[cfg(test)]

@@ -14,6 +14,8 @@
 
 use std::fmt;
 
+use sandy_core::{Logs, Provenance, RESULT_SCHEMA_VERSION, ResultEnvelope, Status};
+
 use crate::router::{Job, ProvisionOutcome};
 
 /// The store artifacts a remote NixOS builder produced and copied back.
@@ -96,11 +98,78 @@ pub trait RemoteBuilder {
 /// or argv/env (INV-1 / D-REQ-6); the live secret-boundary proof is host-tier.
 #[must_use]
 pub fn provision_remote_build(job: &Job, host: &str, arch: &str, remote: &impl RemoteBuilder) -> ProvisionOutcome {
-    let _ = (job, host, arch, remote);
-    todo!(
-        "D.1: probe arch (refuse naming arch on mismatch, no build), eval-local, build-remote, copy-back; map \
-         Unreachable/Build to a failed retryable envelope (INV-7); secrets never cross to the remote (INV-1/D-REQ-6)"
-    )
+    // Confirm the remote's arch before delegating a build (D-REQ-1). A mismatch
+    // refuses naming `arch` with no build attempted; an unreachable probe is an
+    // infra fault (INV-7).
+    match remote.probe_arch(host) {
+        Ok(found) if found != arch => {
+            return ProvisionOutcome::Refused {
+                reason: format!(
+                    "remote builder `{host}` cannot build arch `{arch}` (advertises `{found}`); no build attempted"
+                ),
+            };
+        }
+        Ok(_) => {}
+        Err(err) => return ProvisionOutcome::Provisioned(infra_fault_envelope(job, &err.to_string())),
+    }
+
+    // Eval stays on the controller: the derivation is produced locally and only the
+    // build is delegated, so a secret never enters the remote store plane or the
+    // remote host's argv/env (INV-1 / D-REQ-6). Real eval + `nix copy` back are
+    // host-tier.
+    let derivation = eval_locally(job);
+    match remote.build_remote(&derivation, host, arch) {
+        Ok(artifacts) => ProvisionOutcome::Provisioned(succeeded_envelope(job, &artifacts)),
+        // Unreachable / Build are infra faults → failed, retryable (INV-7), never
+        // confused with a guest exit.
+        Err(err) => ProvisionOutcome::Provisioned(infra_fault_envelope(job, &err.to_string())),
+    }
+}
+
+/// Evaluate the job's template on the controller, yielding the derivation path to
+/// build remotely. The real Nix eval is host-tier; this seam keeps eval local so
+/// secrets never cross to the remote (INV-1 / D-REQ-6).
+fn eval_locally(job: &Job) -> String {
+    format!("{}.drv", job.template)
+}
+
+/// A succeeded envelope for a remote build that ran the job to exit 0.
+fn succeeded_envelope(job: &Job, artifacts: &RemoteArtifacts) -> ResultEnvelope {
+    ResultEnvelope {
+        result_schema_version: RESULT_SCHEMA_VERSION,
+        job_id: job.template.clone(),
+        box_id: None,
+        status: Status::Succeeded,
+        retryable: false,
+        message: "remote build provisioned; job ran to completion".to_string(),
+        exit_code: Some(0),
+        outputs: Vec::new(),
+        receipts: Vec::new(),
+        provenance: Provenance {
+            template_store_path: artifacts.output_store_path.clone(),
+        },
+        logs: Logs { tail: String::new() },
+    }
+}
+
+/// A failed, retryable envelope for a remote infra fault (INV-7): the build was
+/// attempted but the remote was unreachable or the build itself failed.
+fn infra_fault_envelope(job: &Job, message: &str) -> ResultEnvelope {
+    ResultEnvelope {
+        result_schema_version: RESULT_SCHEMA_VERSION,
+        job_id: job.template.clone(),
+        box_id: None,
+        status: Status::Failed,
+        retryable: true,
+        message: message.to_string(),
+        exit_code: None,
+        outputs: Vec::new(),
+        receipts: Vec::new(),
+        provenance: Provenance {
+            template_store_path: String::new(),
+        },
+        logs: Logs { tail: String::new() },
+    }
 }
 
 #[cfg(test)]
