@@ -1,0 +1,26 @@
+[package]
+name = "sandy-cli"
+description = "The sandy command-line interface (Blocks 0 doctor, 6 run/ls/status/...)"
+version.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "sandy"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+clap.workspace = true
+sandy-core.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+rstest.workspace = true
+tempfile.workspace = true

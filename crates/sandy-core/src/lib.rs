@@ -1,52 +1,42 @@
-//! Core library for the `sandy` workspace.
+//! Core library for the `sandy` workspace: the pure, testable heart.
 //!
-//! This is a starting point. Replace [`greet`] and [`Error`] with real
-//! functionality as the crate grows; they exist so the workspace builds, tests,
-//! and lints cleanly from the first commit.
+//! This crate holds everything provable without a hypervisor:
+//!
+//! - [`backend`] — the pinned [`VmBackend`](backend::VmBackend) seam plus the `snake_case` data types (INV-8) and a
+//!   [`FakeBackend`](backend::FakeBackend) test double.
+//! - [`result`] — the LOCKED result envelope (INV-11) and the mapping from a backend [`Outcome`](backend::Outcome) to
+//!   `status` / `retryable` / the process-exit band.
+//! - [`journal`] — one JSON record per job under `$SANDY_HOME/jobs/`, written atomically and guarded by a per-job flock
+//!   (INV-3, INV-5, INV-6).
+//! - [`collect`] — exit-0-only, atomic, `O_NOFOLLOW` output collection (INV-2, INV-4).
+//! - [`reconcile`] — reconcile-on-read, acting only under the job's flock (INV-3).
 
-/// Errors returned by [`greet`].
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    /// The provided name was empty.
-    #[error("name must not be empty")]
-    EmptyName,
-}
+pub mod backend;
+pub mod collect;
+pub mod config;
+pub mod error;
+pub mod journal;
+pub mod reconcile;
+pub mod result;
+pub mod schema;
 
-/// Build a greeting for `name`.
-///
-/// # Errors
-///
-/// Returns [`Error::EmptyName`] when `name` is empty.
-///
-/// # Examples
-///
-/// ```
-/// assert_eq!(sandy_core::greet("world")?, "Hello, world!");
-/// # Ok::<(), sandy_core::Error>(())
-/// ```
-pub fn greet(name: &str) -> Result<String, Error> {
-    if name.is_empty() {
-        return Err(Error::EmptyName);
-    }
-    Ok(format!("Hello, {name}!"))
-}
+pub use backend::{
+    BackendError, BoxState, FakeBackend, Grants, Mount, Outcome, PlanError, RunSpec, SecretRef, SecretSource,
+    VmBackend, validate_no_secret_leak,
+};
+pub use collect::{CollectError, OutputSpec, collect};
+pub use config::CollectionConfig;
+pub use error::CoreError;
+pub use journal::{JobLock, Journal, detect_fs_type, ensure_local_posix_fs, is_networked_fs, new_job_id};
+pub use reconcile::reconcile_job;
+pub use result::{
+    Classification, Logs, OutputRef, OutputStatus, ProcessExit, Provenance, RESULT_SCHEMA_VERSION, Receipt,
+    ResultEnvelope, Status, classify_backend_error, classify_invalid_plan, classify_outcome,
+};
+pub use schema::v1::{JOURNAL_SCHEMA_VERSION, JobRecord, JobState};
 
-#[cfg(test)]
-mod tests {
-    use rstest::rstest;
-
-    use super::*;
-
-    #[rstest]
-    #[case("sandy", "Hello, sandy!")]
-    #[case("world", "Hello, world!")]
-    fn greets_a_name(#[case] input: &str, #[case] expected: &str) -> anyhow::Result<()> {
-        assert_eq!(greet(input)?, expected);
-        Ok(())
-    }
-
-    #[test]
-    fn rejects_an_empty_name() {
-        assert!(matches!(greet(""), Err(Error::EmptyName)));
-    }
+/// fsync a directory so a preceding create/rename within it is durable across a
+/// crash (INV-4/INV-6).
+pub(crate) fn fsync_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
 }
