@@ -1,6 +1,6 @@
 [package]
 name = "sandy-acceptance"
-description = "Phase A acceptance harness: tier-2 (sandbox) and tier-3 (host) suites"
+description = "Integration tests wiring the sandy crates over their public APIs and trait seams"
 version.workspace = true
 authors.workspace = true
 homepage.workspace = true
@@ -18,4 +18,11 @@ workspace = true
 [dependencies]
 
 [dev-dependencies]
+sandy-core = { path = "../sandy-core" }
+sandy-egress = { path = "../sandy-egress" }
+sandy-provider = { path = "../sandy-provider" }
+sandy-seed = { path = "../sandy-seed" }
 anyhow.workspace = true
+rstest.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
