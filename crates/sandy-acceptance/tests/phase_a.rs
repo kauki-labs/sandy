@@ -6,6 +6,7 @@
 //! here against the real `LauncherBackend` + hypervisor on the M2.
 
 /// True only when the operator opted into the host tier on a real hypervisor.
+#[inline]
 fn host_tests_enabled() -> bool {
     std::env::var("SANDY_HOST_TESTS").as_deref() == Ok("1")
 }

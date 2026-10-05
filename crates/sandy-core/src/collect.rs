@@ -14,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{backend::Outcome, result::OutputRef};
+use crate::{backend::Outcome, config::CollectionConfig, result::OutputRef};
 
 /// A declared output to collect from the guest RW area.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,13 +25,6 @@ pub struct OutputSpec {
     pub name: String,
     /// Whether the job fails if this output is absent.
     pub required: bool,
-}
-
-/// Collection limits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CollectionConfig {
-    /// The per-job output byte cap; exceeding it fails the job.
-    pub per_job_cap_bytes: u64,
 }
 
 /// A collection failure.
