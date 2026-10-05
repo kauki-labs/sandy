@@ -1,7 +1,7 @@
-# Minor-only pin: rust-overlay resolves "1.98" to the latest 1.98.x in the
+# Minor-only pin: rust-overlay resolves "1.99" to the latest 1.99.x in the
 # locked flake input, so patch bumps arrive via flake.lock (Dependabot's nix
 # ecosystem) and Dependabot's rust-toolchain ecosystem proposes only minor bumps.
 [toolchain]
-channel = "1.98"
+channel = "1.99"
 profile = "default"
 components = ["cargo", "clippy", "rust-src"]
