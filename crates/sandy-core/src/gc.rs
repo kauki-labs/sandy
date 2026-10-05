@@ -27,9 +27,8 @@ pub fn plan_eviction(images: &[StagedImage], keep_last_n: usize, referenced: &Ha
     newest_first.sort_by_key(|image| std::cmp::Reverse(image.staged_at));
     newest_first
         .into_iter()
-        // The newest `keep_last_n` survive unconditionally...
         .skip(keep_last_n)
-        // ...and a referenced id is never evicted, even when it falls past the window.
+        // A referenced id survives even when it falls past the keep-last-n window.
         .filter(|image| !referenced.contains(&image.id))
         .map(|image| image.id.clone())
         .collect()

@@ -34,7 +34,6 @@ pub fn decide_fallback(facts: &HostFacts, seed_available: bool, remote_available
             arch: facts.target_arch.clone(),
         };
     }
-    // Neither path is reachable: refuse naming both blockers, never a silent hang.
     ProvisioningStrategy::Refuse {
         reason: "locked-down Linux has no fallback: no seed (no reachable builder-VM seed) and no remote (no \
                  reachable remote builder)"

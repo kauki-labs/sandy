@@ -31,6 +31,7 @@ pub struct RunMetrics {
     transitions_total: u64,
     succeeded_total: u64,
     failed_total: u64,
+    cancelled_total: u64,
 }
 
 impl RunMetrics {
@@ -59,6 +60,7 @@ impl RunMetrics {
         match to {
             RunPhase::Succeeded => self.succeeded_total += 1,
             RunPhase::Failed => self.failed_total += 1,
+            RunPhase::Cancelled => self.cancelled_total += 1,
             _ => {}
         }
     }
@@ -86,6 +88,12 @@ impl RunMetrics {
     pub fn failed_total(&self) -> u64 {
         self.failed_total
     }
+
+    /// Total runs that reached [`RunPhase::Cancelled`].
+    #[must_use]
+    pub fn cancelled_total(&self) -> u64 {
+        self.cancelled_total
+    }
 }
 
 #[cfg(test)]
@@ -103,6 +111,20 @@ mod tests {
         m.on_transition(RunPhase::Running, RunPhase::Succeeded);
         assert_eq!(m.running_gauge(), 0, "running gauge must fall on finish");
         assert_eq!(m.succeeded_total(), 1, "succeeded counter must rise on success");
+    }
+
+    /// D-REQ-5: a cancellation is observable on its own counter — a terminal
+    /// `Cancelled` lowers the running gauge and moves `cancelled_total`, distinct
+    /// from succeeded/failed.
+    #[test]
+    fn cancellation_moves_its_own_counter() {
+        let mut m = RunMetrics::new();
+        m.on_transition(RunPhase::Pending, RunPhase::Running);
+        m.on_transition(RunPhase::Running, RunPhase::Cancelled);
+        assert_eq!(m.running_gauge(), 0, "running gauge must fall on cancellation");
+        assert_eq!(m.cancelled_total(), 1, "cancelled counter must rise on cancellation");
+        assert_eq!(m.succeeded_total(), 0, "a cancellation is not a success");
+        assert_eq!(m.failed_total(), 0, "a cancellation is not a failure");
     }
 
     /// D-REQ-5 (adversarial): a metric that exists but never moves is dead. The

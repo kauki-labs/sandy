@@ -27,8 +27,10 @@ pub struct RemoteArtifacts {
 
 /// A fault from the remote build path.
 ///
-/// `Unreachable` and `Build` are infra faults (INV-7 → `retryable: true`);
-/// `ArchMismatch` is a refusal with no build attempted (D-REQ-1 adversarial).
+/// Both variants are infra faults (INV-7 → `retryable: true`). An arch mismatch is
+/// not modelled here: the orchestration confirms the remote's arch via
+/// [`RemoteBuilder::probe_arch`] *before* delegating a build and refuses directly,
+/// so `build_remote` only ever reports unreachable / build faults.
 ///
 /// Implemented by hand rather than via `thiserror`: `sandy-provider` depends only
 /// on `sandy-core`, so the derive macro is not in scope. See the crate's
@@ -37,13 +39,6 @@ pub struct RemoteArtifacts {
 pub enum RemoteError {
     /// The remote builder host could not be reached (infra fault, INV-7).
     Unreachable(String),
-    /// The remote builder cannot build the requested target arch.
-    ArchMismatch {
-        /// The arch the job requires.
-        expected: String,
-        /// The arch the remote builder advertises.
-        found: String,
-    },
     /// The remote build itself failed (infra fault, INV-7).
     Build(String),
 }
@@ -52,12 +47,6 @@ impl fmt::Display for RemoteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             RemoteError::Unreachable(host) => write!(f, "remote builder `{host}` is unreachable"),
-            RemoteError::ArchMismatch { expected, found } => {
-                write!(
-                    f,
-                    "remote builder cannot build arch `{expected}` (advertises `{found}`)"
-                )
-            }
             RemoteError::Build(msg) => write!(f, "remote build failed: {msg}"),
         }
     }
@@ -88,8 +77,8 @@ pub trait RemoteBuilder {
 /// the remote, copy artifacts back, run the job.
 ///
 /// Contract the implementer satisfies (pinned by the tests):
-/// - a [`RemoteError::ArchMismatch`] (the probe arch ≠ `arch`) → [`ProvisionOutcome::Refused`] naming `arch`, with **no
-///   build attempted** (`build_remote` is never called);
+/// - the probe arch ≠ `arch` → [`ProvisionOutcome::Refused`] naming `arch`, with **no build attempted** (`build_remote`
+///   is never called);
 /// - a [`RemoteError::Unreachable`] / [`RemoteError::Build`] → [`ProvisionOutcome::Provisioned`] carrying a failed,
 ///   `retryable: true` envelope (infra fault, INV-7);
 /// - success → [`ProvisionOutcome::Provisioned`] with a succeeded envelope.
@@ -113,15 +102,9 @@ pub fn provision_remote_build(job: &Job, host: &str, arch: &str, remote: &impl R
         Err(err) => return ProvisionOutcome::Provisioned(infra_fault_envelope(job, &err.to_string())),
     }
 
-    // Eval stays on the controller: the derivation is produced locally and only the
-    // build is delegated, so a secret never enters the remote store plane or the
-    // remote host's argv/env (INV-1 / D-REQ-6). Real eval + `nix copy` back are
-    // host-tier.
     let derivation = eval_locally(job);
     match remote.build_remote(&derivation, host, arch) {
         Ok(artifacts) => ProvisionOutcome::Provisioned(succeeded_envelope(job, &artifacts)),
-        // Unreachable / Build are infra faults → failed, retryable (INV-7), never
-        // confused with a guest exit.
         Err(err) => ProvisionOutcome::Provisioned(infra_fault_envelope(job, &err.to_string())),
     }
 }
@@ -133,7 +116,8 @@ fn eval_locally(job: &Job) -> String {
     format!("{}.drv", job.template)
 }
 
-/// A succeeded envelope for a remote build that ran the job to exit 0.
+/// A succeeded envelope for a remote build whose artifacts were copied back. The
+/// guest run itself is host-tier; this seam models the terminal success envelope.
 fn succeeded_envelope(job: &Job, artifacts: &RemoteArtifacts) -> ResultEnvelope {
     ResultEnvelope {
         result_schema_version: RESULT_SCHEMA_VERSION,
@@ -141,7 +125,7 @@ fn succeeded_envelope(job: &Job, artifacts: &RemoteArtifacts) -> ResultEnvelope 
         box_id: None,
         status: Status::Succeeded,
         retryable: false,
-        message: "remote build provisioned; job ran to completion".to_string(),
+        message: "remote build provisioned; artifacts copied back from the remote builder".to_string(),
         exit_code: Some(0),
         outputs: Vec::new(),
         receipts: Vec::new(),
@@ -152,8 +136,8 @@ fn succeeded_envelope(job: &Job, artifacts: &RemoteArtifacts) -> ResultEnvelope 
     }
 }
 
-/// A failed, retryable envelope for a remote infra fault (INV-7): the build was
-/// attempted but the remote was unreachable or the build itself failed.
+/// A failed, retryable envelope for a remote infra fault (INV-7): the remote was
+/// unreachable or the build itself failed.
 fn infra_fault_envelope(job: &Job, message: &str) -> ResultEnvelope {
     ResultEnvelope {
         result_schema_version: RESULT_SCHEMA_VERSION,

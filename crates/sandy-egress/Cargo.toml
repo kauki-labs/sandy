@@ -16,10 +16,4 @@ crate-type = ["rlib"]
 workspace = true
 
 [dependencies]
-thiserror.workspace = true
 serde = { workspace = true }
-serde_json.workspace = true
-
-[dev-dependencies]
-anyhow.workspace = true
-rstest.workspace = true

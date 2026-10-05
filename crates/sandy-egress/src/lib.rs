@@ -38,6 +38,14 @@ pub fn to_nftables(allow: &AllowList) -> String {
     let mut ruleset = String::from("table inet sandy_egress {\n\tchain output {\n");
     ruleset.push_str("\t\ttype filter hook output priority filter; policy drop;\n");
     for rule in &allow.rules {
+        // Fail closed: a host that isn't a bare name/address/CIDR can't be safely
+        // interpolated into the chain, so drop its accept rule rather than risk
+        // injecting a directive that defeats the default-deny floor. A dropped host
+        // simply stays denied (CLAUDE.md: validate and sanitize inputs). The port
+        // is a `u16`, so it is always a safe numeric token.
+        if !is_emittable_host(&rule.host) {
+            continue;
+        }
         ruleset.push_str(&format!(
             "\t\tip daddr {host} tcp dport {port} accept comment \"allow {host}:{port}\"\n",
             host = rule.host,
@@ -46,6 +54,17 @@ pub fn to_nftables(allow: &AllowList) -> String {
     }
     ruleset.push_str("\t}\n}\n");
     ruleset
+}
+
+/// Whether `host` is safe to interpolate into the nftables ruleset: a non-empty
+/// bare DNS name, address, or CIDR of ASCII alphanumerics and `.:/-_` only —
+/// nothing (whitespace, quotes, braces, newlines) that could close a rule or
+/// inject a chain directive.
+fn is_emittable_host(host: &str) -> bool {
+    !host.is_empty()
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | ':' | '-' | '_' | '/'))
 }
 
 /// The honest macOS egress statement (D-REQ-3 macOS honesty).
@@ -86,6 +105,32 @@ mod tests {
         assert!(
             !ruleset.contains("evil.example"),
             "an unlisted host must be absent from the ruleset"
+        );
+    }
+
+    /// D-REQ-3 (adversarial): a host carrying nftables syntax (newline + an
+    /// `accept` directive) is dropped, never interpolated — the default-deny floor
+    /// stays intact and no injected accept rule appears.
+    #[test]
+    fn injection_host_is_dropped_not_interpolated() {
+        let allow = AllowList {
+            rules: vec![EgressRule {
+                host: "x\n\t\tip daddr 0.0.0.0/0 accept comment \"pwn".to_string(),
+                port: 1,
+            }],
+        };
+        let ruleset = to_nftables(&allow);
+        assert!(
+            ruleset.contains("policy drop"),
+            "the default-deny floor must remain: {ruleset}"
+        );
+        assert!(
+            !ruleset.contains("accept"),
+            "an injection host must not produce any accept rule: {ruleset}"
+        );
+        assert!(
+            !ruleset.contains("0.0.0.0/0"),
+            "the injected payload must not reach the ruleset: {ruleset}"
         );
     }
 
