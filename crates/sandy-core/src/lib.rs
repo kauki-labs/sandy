@@ -19,6 +19,7 @@ pub mod journal;
 pub mod reconcile;
 pub mod result;
 pub mod schema;
+pub mod strategy;
 
 pub use backend::{
     BackendError, BoxState, FakeBackend, Grants, Mount, Outcome, PlanError, RunSpec, SecretRef, SecretSource,
@@ -34,6 +35,7 @@ pub use result::{
     ResultEnvelope, Status, classify_backend_error, classify_invalid_plan, classify_outcome,
 };
 pub use schema::v1::{JOURNAL_SCHEMA_VERSION, JobRecord, JobState};
+pub use strategy::{BootAxis, BuildAxis, HostFacts, ProvisioningStrategy, classify};
 
 /// fsync a directory so a preceding create/rename within it is durable across a
 /// crash (INV-4/INV-6).

@@ -16,3 +16,4 @@ crate-type = ["rlib"]
 workspace = true
 
 [dependencies]
+sandy-core = { path = "../sandy-core" }
