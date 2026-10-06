@@ -14,14 +14,17 @@
 pub mod backend;
 pub mod collect;
 pub mod config;
+pub mod cred;
 pub mod egress;
 pub mod error;
 pub mod gc;
 pub mod journal;
 pub mod metrics;
+pub mod provision;
 pub mod reconcile;
 pub mod result;
 pub mod schema;
+pub mod seed;
 pub mod strategy;
 
 pub use backend::{
@@ -35,12 +38,20 @@ pub use error::CoreError;
 pub use gc::{StagedImage, plan_eviction};
 pub use journal::{JobLock, Journal, detect_fs_type, ensure_local_posix_fs, is_networked_fs, new_job_id};
 pub use metrics::{RunMetrics, RunPhase};
+pub use provision::{
+    HostNixProvisioner, Job, ProvisionOutcome, RemoteArtifacts, RemoteBuilder, RemoteError, decide_fallback, provision,
+    provision_remote_build,
+};
 pub use reconcile::reconcile_job;
 pub use result::{
     Classification, Logs, OutputRef, OutputStatus, ProcessExit, Provenance, RESULT_SCHEMA_VERSION, Receipt,
     ResultEnvelope, Status, classify_backend_error, classify_invalid_plan, classify_outcome,
 };
 pub use schema::v1::{JOURNAL_SCHEMA_VERSION, JobRecord, JobState};
+pub use seed::{
+    ALLOWED_IMAGE_FORMATS, ArtifactEntry, MinisignVerifier, Requirements, SeedManifest, SeedRefusal, SignatureVerifier,
+    VerifiedSeed, acquire, sha256_hex,
+};
 pub use strategy::{BootAxis, BuildAxis, HostFacts, ProvisioningStrategy, classify};
 
 /// fsync a directory so a preceding create/rename within it is durable across a

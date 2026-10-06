@@ -7,7 +7,7 @@
 //! preserved: the router forwards the job unchanged and adds nothing to argv /
 //! env / the Nix store, so a secret never leaves its channel (INV-1).
 
-use sandy::{ProvisioningStrategy, ResultEnvelope};
+use crate::{ProvisioningStrategy, ResultEnvelope};
 
 /// A minimal stand-in for Phase A's fully-desugared run request (`RunSpec`),
 /// kept tiny for Phase B routing. The implementer expands or replaces this when
@@ -80,9 +80,8 @@ pub fn provision(strategy: ProvisioningStrategy, job: &Job, backend: &impl HostN
 mod tests {
     use std::cell::RefCell;
 
-    use sandy::{Logs, Provenance, ProvisioningStrategy, RESULT_SCHEMA_VERSION, ResultEnvelope, Status};
-
     use super::{HostNixProvisioner, Job, ProvisionOutcome, provision};
+    use crate::{Logs, Provenance, ProvisioningStrategy, RESULT_SCHEMA_VERSION, ResultEnvelope, Status};
 
     /// A fake Phase A provisioner: records the jobs it was handed (to prove the
     /// router forwards them unchanged) and returns a scripted envelope.

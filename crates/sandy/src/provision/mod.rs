@@ -13,3 +13,7 @@
 pub mod fallback;
 pub mod remote;
 pub mod router;
+
+pub use fallback::decide_fallback;
+pub use remote::{RemoteArtifacts, RemoteBuilder, RemoteError, provision_remote_build};
+pub use router::{HostNixProvisioner, Job, ProvisionOutcome, provision};
