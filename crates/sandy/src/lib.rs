@@ -37,6 +37,7 @@ mod reconcile;
 mod result;
 mod schema;
 mod seed;
+mod stage;
 mod strategy;
 
 pub use backend::{
@@ -68,6 +69,7 @@ pub use seed::{
     ALLOWED_IMAGE_FORMATS, ArtifactEntry, MinisignVerifier, Requirements, SeedManifest, SeedRefusal, SignatureVerifier,
     VerifiedSeed, acquire, sha256_hex,
 };
+pub use stage::{StagedSecret, TagPool, mount_args, stage_secrets, wipe};
 pub use strategy::{BootAxis, BuildAxis, HostFacts, ProvisioningStrategy, classify};
 
 /// fsync a directory so a preceding create/rename within it is durable across a
