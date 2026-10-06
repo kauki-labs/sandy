@@ -12,6 +12,8 @@
 //!   [`provision_remote_build`] / [`decide_fallback`] over the [`HostNixProvisioner`] and [`RemoteBuilder`] seams.
 //! - **Seed identity** — [`acquire`] a [`VerifiedSeed`] via a [`SignatureVerifier`].
 //! - **Egress** — [`to_nftables`] translation and [`macos_egress_statement`].
+//! - **Nix topology** — a typed [`Topology`] read from a guest flake attr via [`topology`] / [`parse_topology`]
+//!   (INV-TOPOLOGY).
 //! - **Operability** — [`RunMetrics`] and staging [`plan_eviction`].
 
 // Deep crate: the module tree is private. The curated `pub use` facade below is
@@ -26,6 +28,7 @@ mod error;
 mod gc;
 mod journal;
 mod metrics;
+mod nix;
 mod provision;
 mod reconcile;
 mod result;
@@ -44,6 +47,7 @@ pub use error::CoreError;
 pub use gc::{StagedImage, plan_eviction};
 pub use journal::{JobLock, Journal, detect_fs_type, ensure_local_posix_fs, is_networked_fs, new_job_id};
 pub use metrics::{RunMetrics, RunPhase};
+pub use nix::{Hypervisor, Share, StoreBacking, Topology, parse_topology, topology};
 pub use provision::{
     HostNixProvisioner, Job, ProvisionOutcome, RemoteArtifacts, RemoteBuilder, RemoteError, decide_fallback, provision,
     provision_remote_build,
