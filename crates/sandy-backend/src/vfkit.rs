@@ -22,12 +22,11 @@ use std::{
     time::SystemTime,
 };
 
-use uuid::Uuid;
-
-use crate::{
+use sandy::{
     BackendError, BoxState, Hypervisor, Markers, Outcome, PtyTransport, RunSpec, StoreBacking, TagPool, Topology,
     VmBackend, mount_args, run_console, stage_secrets, topology, wipe,
 };
+use uuid::Uuid;
 
 /// The guest boot-ready marker the console protocol scans for before injecting
 /// the command (the guest's login banner). The real banner is pinned by the host
@@ -44,7 +43,7 @@ const BOOT_READY_MARKER: &str = "sandy login:";
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StagedArgs {
     /// virtio-fs share descriptors for the caller's bind mounts, as emitted by
-    /// [`mount_args`](crate::mount_args) (`sharedDir=…,mountTag=…[,ro]`).
+    /// [`mount_args`](sandy::mount_args) (`sharedDir=…,mountTag=…[,ro]`).
     pub mount_shares: Vec<String>,
     /// virtio-fs share descriptor(s) for the staged-secret directory
     /// (`sharedDir=<inst_dir>,mountTag=…,ro`). The secret channel is a read-only
@@ -75,9 +74,9 @@ impl StagedArgs {
 /// - `--bootloader linux,kernel=<kernel>,initrd=<initrd>,cmdline=<kernel_cmdline>` — the guest boot. The kernel path is
 ///   passed verbatim (vfkit on aarch64 needs an *uncompressed* `Image`; sandy never transforms it) along with the
 ///   initrd and the full [`Topology::kernel_cmdline`].
-/// - the read-only Nix store, from [`Topology::store`](crate::Topology): an
-///   [`ErofsImage`](crate::StoreBacking::ErofsImage) becomes `--device virtio-blk,path=<img>,readOnly` (a read-only
-///   block device); a [`Virtiofs`](crate::StoreBacking::Virtiofs) tag becomes `--device
+/// - the read-only Nix store, from [`Topology::store`](sandy::Topology): an
+///   [`ErofsImage`](sandy::StoreBacking::ErofsImage) becomes `--device virtio-blk,path=<img>,readOnly` (a read-only
+///   block device); a [`Virtiofs`](sandy::StoreBacking::Virtiofs) tag becomes `--device
 ///   virtio-fs,sharedDir=/nix/store,mountTag=<tag>` (the guest mounts it read-only via the `ro-store` tag).
 /// - `--device virtio-serial,stdio` — the guest `hvc0` console. `stdio` is backed by the PTY master the backend spawns
 ///   `vfkit` under (#33), which is why a real TTY is required.
@@ -89,7 +88,7 @@ impl StagedArgs {
 /// # Errors
 ///
 /// Returns [`BackendError::Spawn`] when [`Topology::hypervisor`] is not
-/// [`Vfkit`](crate::Hypervisor::Vfkit): this backend is vfkit-only and refuses a
+/// [`Vfkit`](sandy::Hypervisor::Vfkit): this backend is vfkit-only and refuses a
 /// qemu topology rather than emitting a wrong-hypervisor argv.
 pub fn vfkit_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> Result<Vec<String>, BackendError> {
     if topology.hypervisor != Hypervisor::Vfkit {
@@ -303,9 +302,9 @@ mod tests {
     use std::path::PathBuf;
 
     use anyhow::Context;
+    use sandy::{Grants, Hypervisor, Mount, SecretRef, SecretSource, StoreBacking, parse_topology};
 
     use super::*;
-    use crate::{Grants, Hypervisor, Mount, SecretRef, SecretSource, StoreBacking, parse_topology};
 
     /// A complete topology JSON (aarch64, vfkit, virtiofs store, no `vsock_cid`).
     const AARCH64_FIXTURE: &[u8] = include_bytes!("../tests/fixtures/topology-aarch64.json");

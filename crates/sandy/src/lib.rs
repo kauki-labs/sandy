@@ -16,10 +16,6 @@
 //!   (INV-TOPOLOGY).
 //! - **Console driver** — the sentinel [`Protocol`] (boot → inject → capture → exit) over a platform [`Transport`],
 //!   wired by [`run_console`] into the pinned snake_case [`Outcome`] (INV-8/INV-OUTCOME).
-//! - **vfkit backend** — the macOS [`VfkitBackend`]: assemble the `vfkit` argv from a [`Topology`], launch it under the
-//!   PTY console transport, and return the pinned [`Outcome`] (host-tier boot; the argv assembly is sandbox-provable).
-//! - **qemu backend** — [`QemuBackend`] (the Linux/KVM [`VmBackend`]) with its pure argv assembler [`qemu_args`] over
-//!   the pre-staged virtiofs shares (INV-8/INV-TOPOLOGY).
 //! - **Operability** — [`RunMetrics`] and staging [`plan_eviction`].
 
 // Deep crate: the module tree is private. The curated `pub use` facade below is
@@ -37,14 +33,12 @@ mod journal;
 mod metrics;
 mod nix;
 mod provision;
-mod qemu;
 mod reconcile;
 mod result;
 mod schema;
 mod seed;
 mod stage;
 mod strategy;
-mod vfkit;
 
 pub use backend::{
     BackendError, BoxState, FakeBackend, Grants, Mount, Outcome, PlanError, RunSpec, SecretRef, SecretSource,
@@ -65,7 +59,6 @@ pub use provision::{
     HostNixProvisioner, Job, ProvisionOutcome, RemoteArtifacts, RemoteBuilder, RemoteError, decide_fallback, provision,
     provision_remote_build,
 };
-pub use qemu::{QemuBackend, StagedArgs as QemuStagedArgs, qemu_args};
 pub use reconcile::reconcile_job;
 pub use result::{
     Classification, Logs, OutputRef, OutputStatus, ProcessExit, Provenance, RESULT_SCHEMA_VERSION, Receipt,
@@ -78,7 +71,6 @@ pub use seed::{
 };
 pub use stage::{StagedSecret, TagPool, mount_args, stage_secrets, wipe};
 pub use strategy::{BootAxis, BuildAxis, HostFacts, ProvisioningStrategy, classify};
-pub use vfkit::{StagedArgs as VfkitStagedArgs, VfkitBackend, vfkit_args};
 
 /// fsync a directory so a preceding create/rename within it is durable across a
 /// crash (INV-4/INV-6).

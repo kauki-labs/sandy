@@ -5,15 +5,14 @@
 //! the argv assembly stays pure and tier-1 testable:
 //!
 //! - [`qemu_args`] — the pure assembler. Given a [`Topology`], a [`RunSpec`], and the already-[`StagedArgs`] (secret
-//!   share + [`mount_args`](crate::stage::mount_args) output), it builds the `qemu-system-<arch>` command vector with
-//!   no IO. Proven on ws01 (x86_64, `/dev/kvm` world-rw): the microvm.nix runner booted → result → poweroff in ~8s with
+//!   share + [`mount_args`](sandy::mount_args) output), it builds the `qemu-system-<arch>` command vector with no IO.
+//!   Proven on ws01 (x86_64, `/dev/kvm` world-rw): the microvm.nix runner booted → result → poweroff in ~8s with
 //!   `-nographic -serial chardev:stdio console=ttyS0` and sentinels on stdout.
 //! - [`QemuBackend`] — the [`VmBackend`] seam. `run` stages secrets/mounts (#34), calls [`qemu_args`], spawns qemu with
-//!   serial on the #33 [`PipeTransport`](crate::console::PipeTransport), drives
-//!   [`run_console`](crate::console::run_console), and populates the pinned [`Outcome`]. The spawn/boot is host-tier
-//!   (tier-3, ws01), not unit-tested in the sandbox.
+//!   serial on the #33 [`PipeTransport`](sandy::PipeTransport), drives [`run_console`](sandy::run_console), and
+//!   populates the pinned [`Outcome`]. The spawn/boot is host-tier (tier-3, ws01), not unit-tested in the sandbox.
 //!
-//! The module is private (INV-FACADE); `lib.rs` re-exports only
+//! The module is private; `sandy-backend`'s `lib.rs` re-exports only
 //! [`QemuBackend`], [`qemu_args`], and [`StagedArgs`].
 
 use std::{
@@ -22,14 +21,11 @@ use std::{
     time::SystemTime,
 };
 
-use uuid::Uuid;
-
-use crate::{
-    backend::{BackendError, BoxState, Outcome, RunSpec, VmBackend},
-    console::{Markers, PipeTransport, run_console},
-    nix::{Hypervisor, StoreBacking, Topology, topology as eval_topology},
-    stage::{TagPool, mount_args, stage_secrets, wipe},
+use sandy::{
+    BackendError, BoxState, Hypervisor, Markers, Outcome, PipeTransport, RunSpec, StoreBacking, TagPool, Topology,
+    VmBackend, mount_args, run_console, stage_secrets, topology as eval_topology, wipe,
 };
+use uuid::Uuid;
 
 /// The chardev id the guest serial console binds to. `qemu_args` emits
 /// `-serial chardev:<SERIAL_CHARDEV_ID>`; `run` wires the matching
@@ -43,8 +39,8 @@ const READY_MARKER: &str = "sandy login:";
 /// The already-staged inputs [`qemu_args`] needs, kept out of the pure assembler
 /// so argv assembly does no IO and stays tier-1 testable.
 ///
-/// `run` produces this from [`stage_secrets`](crate::stage::stage_secrets) and
-/// [`mount_args`](crate::stage::mount_args) before calling [`qemu_args`]:
+/// `run` produces this from [`stage_secrets`](sandy::stage_secrets) and
+/// [`mount_args`](sandy::mount_args) before calling [`qemu_args`]:
 /// `mounts` is the `mount_args` output (one `sharedDir=…,mountTag=…[,ro]` string
 /// per [`RunSpec`] mount), `secret_share` is the read-only share for the staged
 /// secrets directory, and `kvm` records whether `/dev/kvm` was usable (probed by
@@ -52,7 +48,7 @@ const READY_MARKER: &str = "sandy login:";
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct StagedArgs {
     /// The virtiofs/9p share spec for each [`RunSpec`] mount, as produced by
-    /// [`mount_args`](crate::stage::mount_args).
+    /// [`mount_args`](sandy::mount_args).
     pub mounts: Vec<String>,
     /// The read-only share spec for the staged-secrets directory, when the run
     /// carries secrets.
@@ -70,8 +66,8 @@ pub struct StagedArgs {
 ///
 /// - `-kernel <topology.kernel>` / `-initrd <topology.initrd>` — the direct boot pair.
 /// - `-append <topology.kernel_cmdline>` — the full guest command line (`console=ttyS0 …`).
-/// - the store ([`StoreBacking::ErofsImage`](crate::nix::StoreBacking::ErofsImage)) as a read-only virtio-blk drive,
-///   e.g. `-drive file=<image>,if=virtio,format=raw,readonly=on`.
+/// - the store ([`StoreBacking::ErofsImage`](sandy::StoreBacking::ErofsImage)) as a read-only virtio-blk drive, e.g.
+///   `-drive file=<image>,if=virtio,format=raw,readonly=on`.
 /// - `-smp <topology.cpu>` / `-m <topology.mem>` — vCPUs and memory in MiB (a [`RunSpec`] `cpu`/`mem` may narrow them).
 /// - `-nographic` and `-serial chardev:<id>` — the guest serial console; `run` adds the matching `-chardev pipe,…` that
 ///   binds `<id>` to the #33 pipe (the fifo path is a host-tier detail, so it is not emitted here).
@@ -82,7 +78,7 @@ pub struct StagedArgs {
 /// # Errors
 ///
 /// Returns a [`BackendError`] when `topology.hypervisor` is not
-/// [`Hypervisor::Qemu`](crate::nix::Hypervisor::Qemu) — this backend is
+/// [`Hypervisor::Qemu`](sandy::Hypervisor::Qemu) — this backend is
 /// qemu-only and refuses to emit argv for a vfkit topology rather than producing
 /// a wrong-hypervisor command — or when the store backing cannot be expressed as
 /// a qemu drive.
@@ -215,7 +211,7 @@ fn push_virtfs(args: &mut Vec<String>, share: &str) -> Result<(), BackendError> 
 ///
 /// Owns its running-instance registry so [`boxes`](VmBackend::boxes) reports live
 /// state without a direct supervisor read (INV-3), mirroring the seam contract in
-/// [`crate::backend`]. Construct with [`QemuBackend::new`].
+/// [`sandy::VmBackend`]. Construct with [`QemuBackend::new`].
 #[derive(Debug, Default)]
 pub struct QemuBackend {
     /// The boxes this backend has launched and not yet reaped, read by
@@ -321,13 +317,9 @@ mod tests {
     use std::path::PathBuf;
 
     use anyhow::Context;
+    use sandy::{Grants, Hypervisor, Mount, TagPool, mount_args, parse_topology};
 
     use super::*;
-    use crate::{
-        backend::{Grants, Mount},
-        nix::{Hypervisor, parse_topology},
-        stage::{TagPool, mount_args},
-    };
 
     /// A complete microvm.nix topology JSON (x86_64, qemu, erofs store).
     const X86_64_FIXTURE: &[u8] = include_bytes!("../tests/fixtures/topology-x86_64.json");
