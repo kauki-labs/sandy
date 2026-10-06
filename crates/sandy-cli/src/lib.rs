@@ -6,5 +6,6 @@
 //! real [`sandy::Journal`], without booting a hypervisor.
 
 pub mod doctor;
+pub mod output;
 pub mod plan;
 pub mod supervisor;

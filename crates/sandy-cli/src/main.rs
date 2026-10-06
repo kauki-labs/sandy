@@ -6,9 +6,10 @@
 //! maps results to process exit bands (INV-11).
 
 use clap::{Parser, Subcommand};
-use sandy::{CoreError, JobRecord, Journal, ProcessExit};
+use sandy::{CoreError, Journal, ProcessExit};
 use sandy_cli::{
     doctor,
+    output::{OutputFormat, format_doctor, format_envelope, format_gc, format_record, format_records},
     plan::{RunArgs, parse_run},
     supervisor,
 };
@@ -20,6 +21,9 @@ struct Cli {
     /// The subcommand to run.
     #[command(subcommand)]
     command: Command,
+    /// Output format: `text` (human, default) or `json` (for agents/automation).
+    #[arg(long = "output", short = 'o', value_enum, default_value = "text", global = true)]
+    output: OutputFormat,
 }
 
 /// Top-level `sandy` subcommands.
@@ -96,18 +100,26 @@ fn host_backend() -> sandy_backend::QemuBackend {
 
 fn main() {
     let cli = Cli::parse();
-    std::process::exit(dispatch(cli.command));
+    std::process::exit(dispatch(cli.command, cli.output));
 }
 
 /// Dispatch one parsed command and return the process exit band (INV-11).
-fn dispatch(command: Command) -> i32 {
+fn dispatch(command: Command, output: OutputFormat) -> i32 {
     // Doctor needs no journal; handle it before touching `$SANDY_HOME`.
     if let Command::Doctor = command {
         let result = doctor::run_doctor();
-        if result.exit_code == 0 {
-            println!("{}", result.message);
-        } else {
-            eprintln!("{}", result.message);
+        match output {
+            // Text keeps the stream convention (ok→stdout, refusal→stderr); JSON
+            // always goes to stdout so an agent reads the verdict from one channel.
+            OutputFormat::Text if result.exit_code != 0 => eprintln!("{}", result.message),
+            OutputFormat::Text => println!("{}", result.message),
+            OutputFormat::Json => match format_doctor(result.exit_code, &result.message, output) {
+                Ok(json) => println!("{json}"),
+                Err(e) => {
+                    eprintln!("sandy: could not serialize output: {e}");
+                    return ProcessExit::InfraFault.code();
+                }
+            },
         }
         return result.exit_code;
     }
@@ -155,70 +167,72 @@ fn dispatch(command: Command) -> i32 {
                     return ProcessExit::InfraFault.code();
                 }
             };
-            match serde_json::to_string_pretty(&report.envelope) {
-                Ok(json) => println!("{json}"),
-                Err(e) => {
-                    eprintln!("sandy: could not serialize the result envelope: {e}");
-                    return ProcessExit::InfraFault.code();
-                }
+            // The envelope is the result, not a diagnostic — print it (the band,
+            // not stdout, signals failure) and exit on the process band.
+            if let Err(code) = emit(format_envelope(&report.envelope, output)) {
+                return code;
             }
             report.process_exit.code()
         }
         Command::Ls => match supervisor::ls(&journal) {
-            Ok(records) => {
-                for record in &records {
-                    print_record(record);
-                }
-                ProcessExit::Succeeded.code()
-            }
+            Ok(records) => succeed_or(emit(format_records(&records, output))),
             Err(e) => report_error(&e),
         },
         Command::Status { job_id } => {
             let backend = host_backend();
             match supervisor::status(&journal, &backend, &job_id) {
-                Ok(record) => {
-                    print_record(&record);
-                    ProcessExit::Succeeded.code()
-                }
+                Ok(record) => succeed_or(emit(format_record(&record, output))),
                 Err(e) => report_error(&e),
             }
         }
         Command::Wait { job_id } => {
             let backend = host_backend();
             match supervisor::wait(&journal, &backend, &job_id) {
-                Ok(record) => {
-                    print_record(&record);
-                    ProcessExit::Succeeded.code()
-                }
+                Ok(record) => succeed_or(emit(format_record(&record, output))),
                 Err(e) => report_error(&e),
             }
         }
         Command::Kill { job_id } => {
             let backend = host_backend();
             match supervisor::kill(&journal, &backend, &job_id) {
-                Ok(record) => {
-                    print_record(&record);
-                    ProcessExit::Succeeded.code()
-                }
+                Ok(record) => succeed_or(emit(format_record(&record, output))),
                 Err(e) => report_error(&e),
             }
         }
         Command::Gc { keep_last } => match supervisor::gc(&journal, keep_last) {
-            Ok(evicted) => {
-                println!("gc: evicted {} record(s)", evicted.len());
-                for id in &evicted {
-                    println!("  {id}");
-                }
-                ProcessExit::Succeeded.code()
-            }
+            Ok(evicted) => succeed_or(emit(format_gc(&evicted, output))),
             Err(e) => report_error(&e),
         },
     }
 }
 
-/// Print one job record as a human-readable line.
-fn print_record(record: &JobRecord) {
-    println!("{:<36}  {:?}", record.job_id, record.state);
+/// Print a formatted result to stdout, or report a serialization failure.
+///
+/// An empty text rendering (e.g. `ls` with no jobs) prints nothing; JSON always
+/// prints (an empty list is a valid `[]`). On a `serde_json` failure, returns the
+/// infra-fault band so the caller can exit on it.
+fn emit(formatted: serde_json::Result<String>) -> Result<(), i32> {
+    match formatted {
+        Ok(out) => {
+            if !out.is_empty() {
+                println!("{out}");
+            }
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("sandy: could not serialize output: {e}");
+            Err(ProcessExit::InfraFault.code())
+        }
+    }
+}
+
+/// Map an [`emit`] result to a process band: success (band 0) or the serialization
+/// failure band it carries.
+fn succeed_or(emitted: Result<(), i32>) -> i32 {
+    match emitted {
+        Ok(()) => ProcessExit::Succeeded.code(),
+        Err(code) => code,
+    }
 }
 
 /// Print a management-op error and map it to an exit band: an unknown job id is a
