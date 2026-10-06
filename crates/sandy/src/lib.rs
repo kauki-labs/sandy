@@ -16,6 +16,8 @@
 //!   (INV-TOPOLOGY).
 //! - **Console driver** — the sentinel [`Protocol`] (boot → inject → capture → exit) over a platform [`Transport`],
 //!   wired by [`run_console`] into the pinned snake_case [`Outcome`] (INV-8/INV-OUTCOME).
+//! - **vfkit backend** — the macOS [`VfkitBackend`]: assemble the `vfkit` argv from a [`Topology`], launch it under the
+//!   PTY console transport, and return the pinned [`Outcome`] (host-tier boot; the argv assembly is sandbox-provable).
 //! - **Operability** — [`RunMetrics`] and staging [`plan_eviction`].
 
 // Deep crate: the module tree is private. The curated `pub use` facade below is
@@ -39,6 +41,7 @@ mod schema;
 mod seed;
 mod stage;
 mod strategy;
+mod vfkit;
 
 pub use backend::{
     BackendError, BoxState, FakeBackend, Grants, Mount, Outcome, PlanError, RunSpec, SecretRef, SecretSource,
@@ -71,6 +74,7 @@ pub use seed::{
 };
 pub use stage::{StagedSecret, TagPool, mount_args, stage_secrets, wipe};
 pub use strategy::{BootAxis, BuildAxis, HostFacts, ProvisioningStrategy, classify};
+pub use vfkit::{StagedArgs, VfkitBackend, vfkit_args};
 
 /// fsync a directory so a preceding create/rename within it is durable across a
 /// crash (INV-4/INV-6).
