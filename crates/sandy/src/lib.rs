@@ -1,7 +1,7 @@
 //! The `sandy` library: one deep crate behind a small, curated API.
 //!
-//! The implementation modules are private; the public surface (re-exported below,
-//! snapshotted in `PUBLIC_API.md`) is the operations, their contract types, and
+//! The implementation modules are private; the public surface is the curated
+//! `pub use` facade re-exported below — the operations, their contract types, and
 //! the injection trait seams. The capabilities, all provable without a hypervisor:
 //!
 //! - **Run plane** — the pinned [`VmBackend`] seam plus the `snake_case` data types (INV-8) and a [`FakeBackend`]
