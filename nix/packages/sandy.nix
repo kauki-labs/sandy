@@ -9,7 +9,14 @@
   craneLib,
 }:
 let
-  src = craneLib.cleanCargoSource ../..;
+  # cleanCargoSource keeps only Rust sources + manifests; the topology tests
+  # `include_str!` JSON fixtures at compile time, so keep `.json` too (else the
+  # crane clippy/test derivations fail to read them in the sandbox).
+  src = lib.cleanSourceWith {
+    src = ../..;
+    filter = path: type: (lib.hasSuffix ".json" path) || (craneLib.filterCargoSources path type);
+    name = "source";
+  };
 
   commonArgs = {
     inherit src;

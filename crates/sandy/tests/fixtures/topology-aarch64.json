@@ -1,0 +1,18 @@
+{
+  "kernel": "/nix/store/7h6g5f4d3s2a1z0xcvbnmlkjhgfdsq98-linux-6.6.52-aarch64/Image",
+  "initrd": "/nix/store/6g5f4d3s2a1z0xcvbnmlkjhgfdsq9876-initrd-linux-6.6.52-aarch64/initrd",
+  "store": {
+    "virtiofs": "ro-store"
+  },
+  "kernel_cmdline": "console=hvc0 reboot=t panic=-1 root=fstab init=/nix/store/5f6g7h8j9k0lmnbvcxzqwrsyp1234567-nixos-system-sandy-aarch64/init",
+  "cpu": 4,
+  "mem": 4096,
+  "shares": [
+    {
+      "host": "/var/lib/sandy/work",
+      "guest": "/work",
+      "tag": "sandy-work"
+    }
+  ],
+  "hypervisor": "vfkit"
+}

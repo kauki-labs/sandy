@@ -12,6 +12,10 @@
 //!   [`provision_remote_build`] / [`decide_fallback`] over the [`HostNixProvisioner`] and [`RemoteBuilder`] seams.
 //! - **Seed identity** — [`acquire`] a [`VerifiedSeed`] via a [`SignatureVerifier`].
 //! - **Egress** — [`to_nftables`] translation and [`macos_egress_statement`].
+//! - **Nix topology** — a typed [`Topology`] read from a guest flake attr via [`topology`] / [`parse_topology`]
+//!   (INV-TOPOLOGY).
+//! - **Console driver** — the sentinel [`Protocol`] (boot → inject → capture → exit) over a platform [`Transport`],
+//!   wired by [`run_console`] into the pinned snake_case [`Outcome`] (INV-8/INV-OUTCOME).
 //! - **Operability** — [`RunMetrics`] and staging [`plan_eviction`].
 
 // Deep crate: the module tree is private. The curated `pub use` facade below is
@@ -20,17 +24,20 @@
 mod backend;
 mod collect;
 mod config;
+mod console;
 mod cred;
 mod egress;
 mod error;
 mod gc;
 mod journal;
 mod metrics;
+mod nix;
 mod provision;
 mod reconcile;
 mod result;
 mod schema;
 mod seed;
+mod stage;
 mod strategy;
 
 pub use backend::{
@@ -39,11 +46,15 @@ pub use backend::{
 };
 pub use collect::{CollectError, OutputSpec, collect};
 pub use config::CollectionConfig;
+pub use console::{
+    Markers, PipeTransport, Protocol, ProtocolStep, PtyTransport, TimeoutPolicy, Transport, parse_exit, run_console,
+};
 pub use egress::{AllowList, EgressRule, macos_egress_statement, to_nftables};
 pub use error::CoreError;
 pub use gc::{StagedImage, plan_eviction};
 pub use journal::{JobLock, Journal, detect_fs_type, ensure_local_posix_fs, is_networked_fs, new_job_id};
 pub use metrics::{RunMetrics, RunPhase};
+pub use nix::{Hypervisor, Share, StoreBacking, Topology, parse_topology, topology};
 pub use provision::{
     HostNixProvisioner, Job, ProvisionOutcome, RemoteArtifacts, RemoteBuilder, RemoteError, decide_fallback, provision,
     provision_remote_build,
@@ -58,6 +69,7 @@ pub use seed::{
     ALLOWED_IMAGE_FORMATS, ArtifactEntry, MinisignVerifier, Requirements, SeedManifest, SeedRefusal, SignatureVerifier,
     VerifiedSeed, acquire, sha256_hex,
 };
+pub use stage::{StagedSecret, TagPool, mount_args, stage_secrets, wipe};
 pub use strategy::{BootAxis, BuildAxis, HostFacts, ProvisioningStrategy, classify};
 
 /// fsync a directory so a preceding create/rename within it is durable across a
