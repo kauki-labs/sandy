@@ -16,6 +16,8 @@
 //!   (INV-TOPOLOGY).
 //! - **Console driver** — the sentinel [`Protocol`] (boot → inject → capture → exit) over a platform [`Transport`],
 //!   wired by [`run_console`] into the pinned snake_case [`Outcome`] (INV-8/INV-OUTCOME).
+//! - **qemu backend** — [`QemuBackend`] (the Linux/KVM [`VmBackend`]) with its pure argv assembler [`qemu_args`] over
+//!   the [`StagedArgs`] shares (INV-8/INV-TOPOLOGY).
 //! - **Operability** — [`RunMetrics`] and staging [`plan_eviction`].
 
 // Deep crate: the module tree is private. The curated `pub use` facade below is
@@ -33,6 +35,7 @@ mod journal;
 mod metrics;
 mod nix;
 mod provision;
+mod qemu;
 mod reconcile;
 mod result;
 mod schema;
@@ -59,6 +62,7 @@ pub use provision::{
     HostNixProvisioner, Job, ProvisionOutcome, RemoteArtifacts, RemoteBuilder, RemoteError, decide_fallback, provision,
     provision_remote_build,
 };
+pub use qemu::{QemuBackend, StagedArgs, qemu_args};
 pub use reconcile::reconcile_job;
 pub use result::{
     Classification, Logs, OutputRef, OutputStatus, ProcessExit, Provenance, RESULT_SCHEMA_VERSION, Receipt,
