@@ -43,6 +43,19 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|window| window == needle)
 }
 
+/// Emit a `printf` that prints `sentinel` assembled from two split string
+/// literals (`printf '%s%s' 'head' 'tail'`), so the guest tty's echo of the
+/// injected frame never contains a contiguous copy of the sentinel — only the
+/// printf output does. Splitting on a char boundary keeps it correct for any
+/// UTF-8 marker; our sentinels are ASCII.
+fn emit_sentinel(sentinel: &str) -> String {
+    let chars: Vec<char> = sentinel.chars().collect();
+    let mid = chars.len() / 2;
+    let head: String = chars[..mid].iter().collect();
+    let tail: String = chars[mid..].iter().collect();
+    format!("printf '%s%s' '{head}' '{tail}'")
+}
+
 /// The per-run markers that delimit the console protocol.
 ///
 /// `ready` is the host-agnostic boot-ready marker (e.g. the guest's login
@@ -202,11 +215,21 @@ impl Protocol {
     /// reports the exit status the parser reads.
     fn build_frame(markers: &Markers, command: &[String]) -> Vec<u8> {
         let encoded = STANDARD.encode(command.join(" ").as_bytes());
+        // Two constraints a live boot imposes that the sandbox fixtures do not
+        // (they hand-build the console stream rather than calling this frame):
+        //
+        // 1. The guest serial is a tty with echo on, so the whole injected line is echoed back before any command runs.
+        //    Emit each sentinel from two split literals (`printf '%s%s' 'ab' 'cd'`) so the echoed *input* never carries
+        //    a contiguous sentinel — only the printf *output* assembles it. Otherwise the matcher locks onto the echoed
+        //    copy and captures the frame text instead of the guest output.
+        // 2. [`parse_exit`] reads `exit=` from the first line after END, so END must be immediately followed by
+        //    `exit=<n>` with no blank line.
+        //
+        // Both were found on a live ws01 boot (see `nix/guest/`).
         format!(
-            "printf '%s' '{start}'; printf '%s' '{encoded}' | base64 -d | sh; printf '%s\\nexit=%d\\n' '{end}' \
-             \"$?\"\n",
-            start = markers.start,
-            end = markers.end,
+            "{start}; printf '%s' '{encoded}' | base64 -d | sh; __rc=$?; {end}; printf 'exit=%d\\n' \"$__rc\"\n",
+            start = emit_sentinel(&markers.start),
+            end = emit_sentinel(&markers.end),
         )
         .into_bytes()
     }
@@ -498,6 +521,66 @@ mod tests {
         assert!(outcome.booted);
         assert_eq!(outcome.guest_exit, Some(7));
         Ok(())
+    }
+
+    /// Regression for the two live-boot bugs (found on a real ws01 boot, and
+    /// invisible to the hand-built `scripted` fixtures because they never call
+    /// [`Protocol::build_frame`]):
+    ///
+    /// 1. the guest serial tty echoes the whole injected frame back before the command runs, so a naive matcher would
+    ///    lock onto the echoed sentinels;
+    /// 2. `exit=` must sit on the first line after END.
+    ///
+    /// Feed the real echoed frame (split sentinels → no contiguous copy in the
+    /// echo) followed by the executed output; the matcher must skip the echo and
+    /// capture the real output, parsing `exit=0`.
+    #[test]
+    fn echoed_frame_does_not_poison_capture() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let markers = test_markers();
+        let command = [String::from("echo"), String::from("hi")];
+        let mut protocol = Protocol::new(markers.clone(), TimeoutPolicy::from_secs(30)).with_command(&command);
+
+        // The guest echoes the injected frame (tty echo), then prints the
+        // executed output: START, body, END immediately followed by `exit=0`.
+        let frame = Protocol::build_frame(&markers, &command);
+        let mut stream = Vec::new();
+        stream.extend_from_slice(b"boot...\n");
+        stream.extend_from_slice(markers.ready.as_bytes());
+        stream.extend_from_slice(b"\n");
+        stream.extend_from_slice(&frame);
+        stream.extend_from_slice(markers.start.as_bytes());
+        stream.extend_from_slice(b"hi\n");
+        stream.extend_from_slice(markers.end.as_bytes());
+        stream.extend_from_slice(b"exit=0\n");
+
+        let _ = protocol.feed(&stream);
+        let outcome = protocol
+            .outcome()
+            .context("terminal result")?
+            .context("Outcome, not a protocol error")?;
+        assert!(outcome.booted);
+        assert_eq!(outcome.guest_exit, Some(0), "must capture the real exit, not the echo");
+        Ok(())
+    }
+
+    /// The injected frame must not contain a contiguous copy of either sentinel
+    /// (the split-literal `printf` defeats the guest tty echo). A direct guard on
+    /// [`Protocol::build_frame`], independent of the state machine.
+    #[test]
+    fn build_frame_hides_contiguous_sentinels() {
+        let markers = test_markers();
+        let frame = Protocol::build_frame(&markers, &[String::from("true")]);
+        assert!(
+            !frame
+                .windows(markers.start.len())
+                .any(|w| w == markers.start.as_bytes()),
+            "frame must not carry a contiguous START sentinel"
+        );
+        assert!(
+            !frame.windows(markers.end.len()).any(|w| w == markers.end.as_bytes()),
+            "frame must not carry a contiguous END sentinel"
+        );
     }
 
     /// Tier-1 adversarial: the ready marker never arrives before the boot
