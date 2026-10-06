@@ -16,12 +16,29 @@
 //! The module is private (INV-FACADE); `lib.rs` re-exports only
 //! [`QemuBackend`], [`qemu_args`], and [`StagedArgs`].
 
-use std::sync::Mutex;
+use std::{
+    path::Path,
+    sync::{Mutex, MutexGuard},
+    time::SystemTime,
+};
+
+use uuid::Uuid;
 
 use crate::{
     backend::{BackendError, BoxState, Outcome, RunSpec, VmBackend},
-    nix::Topology,
+    console::{Markers, PipeTransport, run_console},
+    nix::{Hypervisor, StoreBacking, Topology, topology as eval_topology},
+    stage::{TagPool, mount_args, stage_secrets, wipe},
 };
+
+/// The chardev id the guest serial console binds to. `qemu_args` emits
+/// `-serial chardev:<SERIAL_CHARDEV_ID>`; `run` wires the matching
+/// `-chardev pipe,…` to the #33 [`PipeTransport`] fifo (a host-tier detail).
+const SERIAL_CHARDEV_ID: &str = "sandy-serial";
+
+/// The boot-ready marker scanned for before the command is injected (the guest
+/// login banner). Host-tier: only `run` uses it, and the real boot is #26.
+const READY_MARKER: &str = "sandy login:";
 
 /// The already-staged inputs [`qemu_args`] needs, kept out of the pure assembler
 /// so argv assembly does no IO and stays tier-1 testable.
@@ -70,8 +87,128 @@ pub struct StagedArgs {
 /// a wrong-hypervisor command — or when the store backing cannot be expressed as
 /// a qemu drive.
 pub fn qemu_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> Result<Vec<String>, BackendError> {
-    let _ = (topology, spec, staged);
-    todo!("assemble the qemu-system-<arch> argv from the topology, spec, and staged shares (#35)")
+    if topology.hypervisor != Hypervisor::Qemu {
+        return Err(BackendError::Spawn(format!(
+            "qemu backend refuses a {:?} topology (qemu-only)",
+            topology.hypervisor
+        )));
+    }
+
+    let mut args = vec![qemu_system_binary(&topology.kernel)];
+
+    args.push("-kernel".to_string());
+    args.push(topology.kernel.display().to_string());
+    args.push("-initrd".to_string());
+    args.push(topology.initrd.display().to_string());
+    args.push("-append".to_string());
+    args.push(kernel_cmdline(&topology.kernel_cmdline));
+    args.push("-nographic".to_string());
+    args.push("-serial".to_string());
+    args.push(format!("chardev:{SERIAL_CHARDEV_ID}"));
+
+    // A RunSpec cpu/mem may narrow the topology's budget.
+    let cpu = spec.cpu.unwrap_or(topology.cpu);
+    let mem = spec.mem.unwrap_or(topology.mem);
+    args.push("-smp".to_string());
+    args.push(cpu.to_string());
+    args.push("-m".to_string());
+    args.push(mem.to_string());
+
+    // The read-only Nix store as a virtio-blk drive. Only an erofs image can be
+    // expressed as a qemu drive; a virtiofs store carries only a tag (no host
+    // path), so it cannot and is refused rather than emitting a broken drive.
+    match &topology.store {
+        StoreBacking::ErofsImage(image) => {
+            args.push("-drive".to_string());
+            args.push(format!("file={},if=virtio,format=raw,readonly=on", image.display()));
+        }
+        StoreBacking::Virtiofs(tag) => {
+            return Err(BackendError::Spawn(format!(
+                "qemu store backing virtiofs(tag={tag}) cannot be expressed as a qemu drive"
+            )));
+        }
+    }
+
+    if staged.kvm {
+        args.push("-enable-kvm".to_string());
+        args.push("-cpu".to_string());
+        args.push("host".to_string());
+    }
+
+    // The virtiofs/9p shares: the staged mount shares, then the secret share.
+    for share in &staged.mounts {
+        push_virtfs(&mut args, share)?;
+    }
+    if let Some(secret_share) = &staged.secret_share {
+        push_virtfs(&mut args, secret_share)?;
+    }
+
+    if let Some(cid) = topology.vsock_cid {
+        args.push("-device".to_string());
+        args.push(format!("vhost-vsock-pci,guest-cid={cid}"));
+    }
+
+    Ok(args)
+}
+
+/// Derive the `qemu-system-<arch>` binary from the kernel store path, falling
+/// back to the host architecture.
+///
+/// microvm.nix kernel paths carry the arch in the linux derivation name
+/// (`…-linux-6.6-aarch64/Image`); when none is present (the x86_64 kernel is just
+/// `…-linux-6.6/bzImage`), the host arch ([`std::env::consts::ARCH`]) is used,
+/// since a native qemu boot runs on the matching host.
+fn qemu_system_binary(kernel: &Path) -> String {
+    let path = kernel.to_string_lossy();
+    let arch = if path.contains("aarch64") || path.contains("arm64") {
+        "aarch64"
+    } else if path.contains("x86_64") || path.contains("amd64") {
+        "x86_64"
+    } else {
+        std::env::consts::ARCH
+    };
+    format!("qemu-system-{arch}")
+}
+
+/// Ensure the guest command line drives the serial console, prepending
+/// `console=ttyS0` only when the topology's cmdline does not already set it.
+fn kernel_cmdline(cmdline: &str) -> String {
+    if cmdline.contains("console=ttyS0") {
+        cmdline.to_string()
+    } else {
+        format!("console=ttyS0 {cmdline}")
+    }
+}
+
+/// Translate one `mount_args`/secret share (`sharedDir=<host>,mountTag=<tag>[,ro]`)
+/// into a qemu `-virtfs local,…` pair, preserving the host path and tag.
+///
+/// # Errors
+///
+/// Returns [`BackendError::Spawn`] if the share string lacks a `sharedDir=` or
+/// `mountTag=` field.
+fn push_virtfs(args: &mut Vec<String>, share: &str) -> Result<(), BackendError> {
+    let mut host = None;
+    let mut tag = None;
+    let mut readonly = false;
+    for field in share.split(',') {
+        if let Some(value) = field.strip_prefix("sharedDir=") {
+            host = Some(value);
+        } else if let Some(value) = field.strip_prefix("mountTag=") {
+            tag = Some(value);
+        } else if field == "ro" {
+            readonly = true;
+        }
+    }
+    let host = host.ok_or_else(|| BackendError::Spawn(format!("share missing sharedDir: {share}")))?;
+    let tag = tag.ok_or_else(|| BackendError::Spawn(format!("share missing mountTag: {share}")))?;
+    let mut spec = format!("local,path={host},mount_tag={tag},security_model=none");
+    if readonly {
+        spec.push_str(",readonly=on");
+    }
+    args.push("-virtfs".to_string());
+    args.push(spec);
+    Ok(())
 }
 
 /// The native qemu/KVM [`VmBackend`] (Linux).
@@ -81,13 +218,8 @@ pub fn qemu_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> Re
 /// [`crate::backend`]. Construct with [`QemuBackend::new`].
 #[derive(Debug, Default)]
 pub struct QemuBackend {
-    /// The boxes this backend has launched and not yet reaped. Read by
-    /// `boxes`/`kill` once the host-tier spawn (#26) lands; unused in the
-    /// skeleton.
-    #[allow(
-        dead_code,
-        reason = "running-instance registry is read by boxes()/kill() once #26 wires the spawn"
-    )]
+    /// The boxes this backend has launched and not yet reaped, read by
+    /// [`boxes`](VmBackend::boxes) and pruned by [`kill`](VmBackend::kill).
     instances: Mutex<Vec<BoxState>>,
 }
 
@@ -97,22 +229,91 @@ impl QemuBackend {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Lock the instance registry, mapping a poisoned mutex to a typed error
+    /// rather than panicking (no `.unwrap()` in library code).
+    fn registry(&self) -> Result<MutexGuard<'_, Vec<BoxState>>, BackendError> {
+        self.instances
+            .lock()
+            .map_err(|_| BackendError::Protocol("qemu instance registry mutex poisoned".to_string()))
+    }
+
+    /// Spawn qemu over the #33 pipe transport, register the instance, drive the
+    /// sentinel protocol, then deregister it.
+    ///
+    /// The process spawn and serial-console fd handover are host-tier (#26),
+    /// encapsulated behind [`PipeTransport::connect`]; a failure to obtain the
+    /// channel is a [`BackendError::Spawn`], while a transport/timeout fault
+    /// during the run lands in the returned [`Outcome`] (never a fabricated
+    /// `guest_exit`, INV-OUTCOME).
+    fn boot(&self, spec: &RunSpec, args: &[String], run_id: Uuid) -> Result<Outcome, BackendError> {
+        tracing::debug!(?args, run_id = %run_id, "spawning qemu over the pipe transport");
+        let mut transport =
+            PipeTransport::connect().map_err(|err| BackendError::Spawn(format!("spawn qemu: {err}")))?;
+
+        let box_id = run_id.to_string();
+        self.registry()?.push(BoxState {
+            box_id: box_id.clone(),
+            box_name: spec.template.to_string(),
+            pid: std::process::id(),
+            started: SystemTime::now(),
+            rvport: None,
+        });
+
+        let markers = Markers::for_run(READY_MARKER, run_id);
+        let outcome = run_console(&mut transport, spec, &markers);
+
+        self.registry()?.retain(|state| state.box_id != box_id);
+        Ok(outcome)
+    }
 }
 
 impl VmBackend for QemuBackend {
     fn run(&self, spec: &RunSpec) -> Result<Outcome, BackendError> {
-        let _ = spec;
-        todo!("stage secrets/mounts (#34) → qemu_args → spawn qemu with serial on the #33 pipe → run_console → Outcome")
+        let topology = eval_topology(spec.template)?;
+        let run_id = Uuid::new_v4();
+        let inst_dir = std::env::temp_dir().join("sandy").join(run_id.to_string());
+
+        let mut tags = TagPool::new();
+        let mounts = mount_args(spec.mounts, &mut tags)?;
+        let staged_secrets = stage_secrets(spec.secrets, &inst_dir)?;
+        let secret_share = (!staged_secrets.is_empty())
+            .then(|| format!("sharedDir={},mountTag={},ro", inst_dir.display(), tags.next_tag()));
+        let staged = StagedArgs {
+            mounts,
+            secret_share,
+            kvm: kvm_available(),
+        };
+
+        let outcome = qemu_args(&topology, spec, &staged).and_then(|args| self.boot(spec, &args, run_id));
+
+        // Teardown clears staging on every path so secret bytes never outlive
+        // the run (INV-1), including the error path.
+        if let Err(err) = wipe(&inst_dir) {
+            tracing::warn!(dir = %inst_dir.display(), %err, "failed to wipe staging on teardown");
+        }
+        outcome
     }
 
     fn kill(&self, box_id: &str) -> Result<(), BackendError> {
-        let _ = box_id;
-        todo!("terminate the qemu process for box_id and drop it from the registry (#35)")
+        // Dropping the instance from the registry is the sandbox-visible effect;
+        // signalling the qemu child process is host-tier (#26).
+        self.registry()?.retain(|state| state.box_id != box_id);
+        tracing::debug!(box_id, "dropped qemu instance from the registry");
+        Ok(())
     }
 
     fn boxes(&self) -> Result<Vec<BoxState>, BackendError> {
-        todo!("report the live qemu instances from the registry (#35)")
+        Ok(self.registry()?.clone())
     }
+}
+
+/// Whether `/dev/kvm` is usable, so the assembler can emit `-enable-kvm`.
+///
+/// A presence check is enough for the argv decision; the real accelerator probe
+/// (open + `KVM_GET_API_VERSION`) is a host-tier concern (#26).
+fn kvm_available() -> bool {
+    Path::new("/dev/kvm").exists()
 }
 
 #[cfg(test)]
