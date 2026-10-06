@@ -2,9 +2,17 @@
 //! by atomic rename under a `0700` per-instance dir, shared read-only into the
 //! guest and wiped on teardown. The bytes never reach argv, env, or the store.
 
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    io::Write,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+};
 
-use crate::backend::{BackendError, SecretRef};
+use crate::backend::{BackendError, SecretRef, SecretSource};
+
+/// Mode bits that would let group or other read a secret source (INV-1).
+const GROUP_OTHER_READ: u32 = 0o044;
 
 /// A secret that has been staged to disk for sharing into the guest.
 ///
@@ -33,11 +41,64 @@ pub struct StagedSecret {
 /// world-readable (its mode grants group/other read, e.g. `0644`) — a
 /// world-readable source is rejected, not staged.
 pub fn stage_secrets(secrets: &[SecretRef], inst_dir: &Path) -> Result<Vec<StagedSecret>, BackendError> {
-    todo!(
-        "stage {} secret(s) into {} as 0600 files via atomic rename under a 0700 dir (E2, INV-1)",
-        secrets.len(),
-        inst_dir.display()
-    )
+    fs::create_dir_all(inst_dir).map_err(|e| spawn_err("create instance dir", inst_dir, &e))?;
+    fs::set_permissions(inst_dir, fs::Permissions::from_mode(0o700))
+        .map_err(|e| spawn_err("tighten instance dir to 0700", inst_dir, &e))?;
+
+    let mut staged = Vec::with_capacity(secrets.len());
+    for (i, secret) in secrets.iter().enumerate() {
+        let bytes = read_source(&secret.source)?;
+        let guest_path = inst_dir.join(format!("secret-{i}"));
+        write_secret_file(inst_dir, &guest_path, &bytes)?;
+        tracing::debug!(name = %secret.name, path = %guest_path.display(), "staged secret (0600)");
+        staged.push(StagedSecret {
+            name: secret.name.clone(),
+            guest_path,
+        });
+    }
+    Ok(staged)
+}
+
+/// Read a secret's bytes from its source, rejecting a world/group-readable file
+/// (INV-1). The `Fd` channel needs an `unsafe` `File::from_raw_fd`, which this
+/// crate forbids (`unsafe_code = forbid`), so it is rejected rather than read.
+fn read_source(source: &SecretSource) -> Result<Vec<u8>, BackendError> {
+    match source {
+        SecretSource::File(path) => {
+            let meta = fs::metadata(path).map_err(|e| spawn_err("stat secret source", path, &e))?;
+            let mode = meta.permissions().mode() & 0o777;
+            if mode & GROUP_OTHER_READ != 0 {
+                return Err(BackendError::Spawn(format!(
+                    "secret source {} is world/group-readable (mode {mode:#o}); refusing to stage (INV-1)",
+                    path.display()
+                )));
+            }
+            fs::read(path).map_err(|e| spawn_err("read secret source", path, &e))
+        }
+        SecretSource::Fd(fd) => Err(BackendError::Spawn(format!(
+            "fd-sourced secrets (fd {fd}) are not supported without unsafe fd reads (INV-SAFE)"
+        ))),
+    }
+}
+
+/// Write `bytes` to `dest` as a `0600` file via temp-in-dir → sync → rename, then
+/// fsync the directory so the rename is durable (INV-1).
+fn write_secret_file(inst_dir: &Path, dest: &Path, bytes: &[u8]) -> Result<(), BackendError> {
+    let tmp = dest.with_extension("tmp");
+    let mut file = fs::File::create(&tmp).map_err(|e| spawn_err("create secret temp", &tmp, &e))?;
+    file.write_all(bytes)
+        .map_err(|e| spawn_err("write secret temp", &tmp, &e))?;
+    file.sync_all().map_err(|e| spawn_err("sync secret temp", &tmp, &e))?;
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))
+        .map_err(|e| spawn_err("tighten secret to 0600", &tmp, &e))?;
+    fs::rename(&tmp, dest).map_err(|e| spawn_err("rename secret into place", dest, &e))?;
+    crate::fsync_dir(inst_dir).map_err(|e| spawn_err("fsync instance dir", inst_dir, &e))?;
+    Ok(())
+}
+
+/// Build a [`BackendError::Spawn`] for an IO failure without leaking secret bytes.
+fn spawn_err(action: &str, path: &Path, err: &std::io::Error) -> BackendError {
+    BackendError::Spawn(format!("{action} at {}: {err}", path.display()))
 }
 
 /// Remove the staging directory and every secret file under it.
@@ -50,7 +111,11 @@ pub fn stage_secrets(secrets: &[SecretRef], inst_dir: &Path) -> Result<Vec<Stage
 ///
 /// Returns the underlying [`std::io::Error`] if the directory cannot be removed.
 pub fn wipe(inst_dir: &Path) -> std::io::Result<()> {
-    todo!("recursively remove staging dir {} (E2 teardown)", inst_dir.display())
+    match fs::remove_dir_all(inst_dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]

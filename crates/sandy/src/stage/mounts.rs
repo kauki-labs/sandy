@@ -10,7 +10,6 @@ use crate::backend::{BackendError, Mount};
 #[derive(Debug, Default)]
 pub struct TagPool {
     /// The next tag ordinal to hand out.
-    #[allow(dead_code, reason = "read by next_tag, whose body is a red-first todo!()")]
     next: u32,
 }
 
@@ -23,7 +22,9 @@ impl TagPool {
 
     /// Hand out the next unique mount tag.
     pub fn next_tag(&mut self) -> String {
-        todo!("yield a unique mountTag from {self:?} (E3)")
+        let tag = format!("sandy{}", self.next);
+        self.next += 1;
+        tag
     }
 }
 
@@ -38,11 +39,22 @@ impl TagPool {
 ///
 /// Returns a named [`BackendError`] when a [`Mount::host`] path does not exist.
 pub fn mount_args(mounts: &[Mount], tags: &mut TagPool) -> Result<Vec<String>, BackendError> {
-    let _ = tags;
-    todo!(
-        "assemble virtiofs sharedDir/mountTag args for {} mount(s), missing host → error (E3)",
-        mounts.len()
-    )
+    let mut args = Vec::with_capacity(mounts.len());
+    for mount in mounts {
+        if !mount.host.exists() {
+            return Err(BackendError::Spawn(format!(
+                "mount host path does not exist: {}",
+                mount.host.display()
+            )));
+        }
+        let tag = tags.next_tag();
+        let mut arg = format!("sharedDir={},mountTag={tag}", mount.host.display());
+        if mount.ro {
+            arg.push_str(",ro");
+        }
+        args.push(arg);
+    }
+    Ok(args)
 }
 
 #[cfg(test)]
