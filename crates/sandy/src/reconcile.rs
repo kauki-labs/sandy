@@ -10,7 +10,8 @@
 use crate::{
     CoreError,
     backend::VmBackend,
-    journal::{JobRecord, JobState, Journal},
+    journal::Journal,
+    schema::v1::{JobRecord, JobState},
 };
 
 /// Reconcile a single job's record against live backend state.

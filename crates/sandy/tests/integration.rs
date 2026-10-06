@@ -8,9 +8,8 @@ use std::time::SystemTime;
 
 use anyhow::Context;
 use sandy::{
-    BackendError, BoxState, CollectionConfig, FakeBackend, JobRecord, JobState, Journal, Outcome, OutputSpec,
-    RESULT_SCHEMA_VERSION, ResultEnvelope, RunSpec, Status, VmBackend, collect, reconcile_job,
-    result::{Logs, OutputRef, Provenance},
+    BackendError, BoxState, CollectionConfig, FakeBackend, JobRecord, JobState, Journal, Logs, Outcome, OutputRef,
+    OutputSpec, Provenance, RESULT_SCHEMA_VERSION, ResultEnvelope, RunSpec, Status, VmBackend, collect, reconcile_job,
 };
 
 const CAP: u64 = 1 << 20;

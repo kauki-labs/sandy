@@ -1,6 +1,6 @@
 [package]
 name = "sandy"
-description = "Core library for the sandy workspace: journal, data plane, reconcile, result, VmBackend"
+description = "The sandy library: run plane, provisioning, seed verification, egress, and operability behind one curated API"
 version.workspace = true
 authors.workspace = true
 homepage.workspace = true

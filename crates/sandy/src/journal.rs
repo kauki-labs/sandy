@@ -14,9 +14,9 @@ use std::{
 };
 
 use crate::CoreError;
-// Re-exported so the serialized schema types resolve at `crate::journal::*` and
-// `sandy::*` exactly as before; the definitions live in `crate::schema::v1`.
-pub use crate::schema::v1::{JOURNAL_SCHEMA_VERSION, JobRecord, JobState};
+// `JobRecord` is defined in `crate::schema::v1`; the journal only needs it for
+// its own read/write signatures. The public facade re-exports it from `lib.rs`.
+use crate::schema::v1::JobRecord;
 
 /// A held per-job flock. The lock is released when this value is dropped.
 #[derive(Debug)]
@@ -301,7 +301,10 @@ mod tests {
     use std::time::SystemTime;
 
     use super::*;
-    use crate::result::{Logs, OutputRef, Provenance, RESULT_SCHEMA_VERSION, ResultEnvelope, Status};
+    use crate::{
+        result::{Logs, OutputRef, Provenance, RESULT_SCHEMA_VERSION, ResultEnvelope, Status},
+        schema::v1::{JOURNAL_SCHEMA_VERSION, JobState},
+    };
 
     fn terminal_record() -> JobRecord {
         JobRecord {

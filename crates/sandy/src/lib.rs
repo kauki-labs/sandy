@@ -1,31 +1,37 @@
-//! Core library for the `sandy` workspace: the pure, testable heart.
+//! The `sandy` library: one deep crate behind a small, curated API.
 //!
-//! This crate holds everything provable without a hypervisor:
+//! The implementation modules are private; the public surface (re-exported below,
+//! snapshotted in `PUBLIC_API.md`) is the operations, their contract types, and
+//! the injection trait seams. The capabilities, all provable without a hypervisor:
 //!
-//! - [`backend`] — the pinned [`VmBackend`](backend::VmBackend) seam plus the `snake_case` data types (INV-8) and a
-//!   [`FakeBackend`](backend::FakeBackend) test double.
-//! - [`result`] — the LOCKED result envelope (INV-11) and the mapping from a backend [`Outcome`](backend::Outcome) to
-//!   `status` / `retryable` / the process-exit band.
-//! - [`journal`] — one JSON record per job under `$SANDY_HOME/jobs/`, written atomically and guarded by a per-job flock
-//!   (INV-3, INV-5, INV-6).
-//! - [`collect`] — exit-0-only, atomic, `O_NOFOLLOW` output collection (INV-2, INV-4).
-//! - [`reconcile`] — reconcile-on-read, acting only under the job's flock (INV-3).
+//! - **Run plane** — the pinned [`VmBackend`] seam plus the `snake_case` data types (INV-8) and a [`FakeBackend`]
+//!   double; the LOCKED result envelope [`ResultEnvelope`] (INV-11); the [`Journal`] of one atomic, flock-guarded
+//!   record per job (INV-3/5/6); exit-0-only `O_NOFOLLOW` [`collect`]ion (INV-2/4); and [`reconcile_job`] under the
+//!   job's flock (INV-3).
+//! - **Provisioning** — [`classify`] host facts into a [`ProvisioningStrategy`], then [`provision`] /
+//!   [`provision_remote_build`] / [`decide_fallback`] over the [`HostNixProvisioner`] and [`RemoteBuilder`] seams.
+//! - **Seed identity** — [`acquire`] a [`VerifiedSeed`] via a [`SignatureVerifier`].
+//! - **Egress** — [`to_nftables`] translation and [`macos_egress_statement`].
+//! - **Operability** — [`RunMetrics`] and staging [`plan_eviction`].
 
-pub mod backend;
-pub mod collect;
-pub mod config;
-pub mod cred;
-pub mod egress;
-pub mod error;
-pub mod gc;
-pub mod journal;
-pub mod metrics;
-pub mod provision;
-pub mod reconcile;
-pub mod result;
-pub mod schema;
-pub mod seed;
-pub mod strategy;
+// Deep crate: the module tree is private. The curated `pub use` facade below is
+// the entire public surface — operations, their contract types, and the trait
+// seams — so callers cannot reach into an implementation module.
+mod backend;
+mod collect;
+mod config;
+mod cred;
+mod egress;
+mod error;
+mod gc;
+mod journal;
+mod metrics;
+mod provision;
+mod reconcile;
+mod result;
+mod schema;
+mod seed;
+mod strategy;
 
 pub use backend::{
     BackendError, BoxState, FakeBackend, Grants, Mount, Outcome, PlanError, RunSpec, SecretRef, SecretSource,

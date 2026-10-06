@@ -61,7 +61,3 @@ debug = true
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-
-# Snapshot diffing is slow in a debug build; compile insta with optimizations.
-[profile.dev.package]
-insta.opt-level = 3
