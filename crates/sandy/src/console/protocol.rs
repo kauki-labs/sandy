@@ -24,9 +24,24 @@
 
 use std::time::Duration;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use uuid::Uuid;
 
 use crate::backend::{BackendError, Outcome};
+
+/// Find the first offset of `needle` within `haystack` (byte-exact, binary-safe).
+///
+/// Used both to locate the per-run sentinels in the console stream and to find
+/// the `exit=` token in the trailing region. An empty needle matches at 0.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    if haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|window| window == needle)
+}
 
 /// The per-run markers that delimit the console protocol.
 ///
@@ -122,17 +137,14 @@ pub enum ProtocolStep {
 /// [`current_deadline`]: Protocol::current_deadline
 /// [`outcome`]: Protocol::outcome
 #[derive(Debug)]
-// The red skeleton's methods are `todo!()`, so these contract fields are not
-// yet read; they document the state the implementer must maintain.
-#[allow(
-    dead_code,
-    reason = "state fields are the implementer contract; methods are todo!() in the red skeleton"
-)]
 pub struct Protocol {
     /// The markers this run scans for and injects.
     markers: Markers,
     /// The per-phase timeout budgets.
     timeout: TimeoutPolicy,
+    /// The base64-wrapped command frame to inject once the ready marker is seen.
+    /// Empty when the machine is driven as a pure parser (no command bound).
+    command_frame: Vec<u8>,
     /// Raw bytes seen but not yet consumed by the marker scanner (a marker may
     /// straddle two reads).
     buffer: Vec<u8>,
@@ -142,23 +154,61 @@ pub struct Protocol {
     ready_seen: bool,
     /// Whether the command has been injected.
     injected: bool,
+    /// Whether the START sentinel has been seen (capture is in progress).
+    start_seen: bool,
+    /// Whether the END sentinel has been seen (capture is complete; the trailing
+    /// `exit=` line is awaited).
+    end_seen: bool,
     /// The terminal result, once reached. `None` while still running.
     terminal: Option<Result<Outcome, BackendError>>,
 }
 
 impl Protocol {
     /// Create a fresh protocol for one run.
+    ///
+    /// The returned machine carries no command frame, so it parses a console
+    /// stream (ready → capture → exit) but injects an empty frame. Bind a
+    /// command with [`Protocol::with_command`] before driving a real transport.
     #[must_use]
     pub fn new(markers: Markers, timeout: TimeoutPolicy) -> Self {
         Self {
             markers,
             timeout,
+            command_frame: Vec::new(),
             buffer: Vec::new(),
             captured: Vec::new(),
             ready_seen: false,
             injected: false,
+            start_seen: false,
+            end_seen: false,
             terminal: None,
         }
+    }
+
+    /// Bind the guest command this run injects once the ready marker is seen.
+    ///
+    /// The command is base64-wrapped (INV-SAFE: no shell-metacharacter leakage
+    /// from argv into the injected line) inside a frame that brackets the
+    /// guest's stdout with the per-run START/END sentinels and appends the
+    /// `exit=<n>` line the parser reads back.
+    #[must_use]
+    pub(crate) fn with_command(mut self, command: &[String]) -> Self {
+        self.command_frame = Self::build_frame(&self.markers, command);
+        self
+    }
+
+    /// Build the injected command frame: a shell line that decodes the
+    /// base64-wrapped command, runs it between the START/END sentinels, and
+    /// reports the exit status the parser reads.
+    fn build_frame(markers: &Markers, command: &[String]) -> Vec<u8> {
+        let encoded = STANDARD.encode(command.join(" ").as_bytes());
+        format!(
+            "printf '%s' '{start}'; printf '%s' '{encoded}' | base64 -d | sh; printf '%s\\nexit=%d\\n' '{end}' \
+             \"$?\"\n",
+            start = markers.start,
+            end = markers.end,
+        )
+        .into_bytes()
     }
 
     /// Feed one chunk of console bytes and advance the machine.
@@ -167,8 +217,133 @@ impl Protocol {
     /// (post-injection), captures the region between the sentinels verbatim, and
     /// parses the trailing `exit=<n>` once END is seen.
     pub fn feed(&mut self, bytes: &[u8]) -> ProtocolStep {
-        let _ = bytes;
-        todo!("scan for ready/sentinels, capture between START/END, parse trailing exit")
+        if self.terminal.is_some() {
+            return ProtocolStep::Done;
+        }
+        self.buffer.extend_from_slice(bytes);
+        self.advance()
+    }
+
+    /// Advance the machine over the currently buffered bytes as far as it can.
+    ///
+    /// Runs the phases in order — ready → START → capture-to-END → parse exit —
+    /// consuming the buffer as each boundary is crossed. Returns
+    /// [`ProtocolStep::Inject`] when this call crossed the ready boundary (the
+    /// driver must write the frame), [`ProtocolStep::Done`] when a terminal
+    /// result was reached without a fresh injection, and
+    /// [`ProtocolStep::NeedMore`] otherwise.
+    fn advance(&mut self) -> ProtocolStep {
+        let mut injected_now = false;
+
+        // Phase 1 — wait for the boot-ready marker, then inject the command.
+        if !self.ready_seen {
+            match find_subslice(&self.buffer, self.markers.ready.as_bytes()) {
+                Some(pos) => {
+                    self.ready_seen = true;
+                    self.injected = true;
+                    injected_now = true;
+                    self.drain_through(pos, self.markers.ready.len());
+                }
+                None => {
+                    self.trim_pending(self.markers.ready.len());
+                    return ProtocolStep::NeedMore;
+                }
+            }
+        }
+
+        // Phase 2 — discard the echo between the frame and the START sentinel.
+        if !self.start_seen {
+            match find_subslice(&self.buffer, self.markers.start.as_bytes()) {
+                Some(pos) => {
+                    self.start_seen = true;
+                    self.drain_through(pos, self.markers.start.len());
+                }
+                None => {
+                    self.trim_pending(self.markers.start.len());
+                    return self.pending_step(injected_now);
+                }
+            }
+        }
+
+        // Phase 3 — capture verbatim up to the END sentinel (binary-safe).
+        if !self.end_seen {
+            match find_subslice(&self.buffer, self.markers.end.as_bytes()) {
+                Some(pos) => {
+                    self.captured.extend_from_slice(&self.buffer[..pos]);
+                    self.end_seen = true;
+                    self.drain_through(pos, self.markers.end.len());
+                }
+                None => {
+                    // Flush all but a possible straddling END prefix into the
+                    // capture so the buffer stays bounded across reads.
+                    let keep = self.markers.end.len().saturating_sub(1);
+                    if self.buffer.len() > keep {
+                        let take = self.buffer.len() - keep;
+                        self.captured.extend_from_slice(&self.buffer[..take]);
+                        self.buffer.drain(..take);
+                    }
+                    return self.pending_step(injected_now);
+                }
+            }
+        }
+
+        // Phase 4 — parse the trailing `exit=<n>` line once it is complete.
+        if let Some(nl) = self.buffer.iter().position(|&byte| byte == b'\n') {
+            let line = self.buffer[..=nl].to_vec();
+            self.terminal = Some(self.finish(&line));
+        } else {
+            return self.pending_step(injected_now);
+        }
+
+        if injected_now {
+            ProtocolStep::Inject(self.command_frame.clone())
+        } else {
+            ProtocolStep::Done
+        }
+    }
+
+    /// Drop everything up to and including a marker found at `pos` of length
+    /// `marker_len`.
+    fn drain_through(&mut self, pos: usize, marker_len: usize) {
+        self.buffer.drain(..pos + marker_len);
+    }
+
+    /// While scanning for a marker that was not found, keep only the trailing
+    /// `marker_len - 1` bytes (the most a marker can straddle into the next
+    /// read), discarding the rest as noise.
+    fn trim_pending(&mut self, marker_len: usize) {
+        let keep = marker_len.saturating_sub(1);
+        if self.buffer.len() > keep {
+            let drop = self.buffer.len() - keep;
+            self.buffer.drain(..drop);
+        }
+    }
+
+    /// The step to return when no terminal state was reached this call: signal
+    /// the pending injection if it just happened, else ask for more bytes.
+    fn pending_step(&self, injected_now: bool) -> ProtocolStep {
+        if injected_now {
+            ProtocolStep::Inject(self.command_frame.clone())
+        } else {
+            ProtocolStep::NeedMore
+        }
+    }
+
+    /// Turn a complete `exit=<n>` line into the terminal [`Outcome`]; a garbled
+    /// line is a [`BackendError::Protocol`], never a defaulted exit (INV-OUTCOME).
+    fn finish(&self, exit_line: &[u8]) -> Result<Outcome, BackendError> {
+        let code = parse_exit(exit_line)?;
+        tracing::debug!(
+            captured_bytes = self.captured.len(),
+            guest_exit = code,
+            "console capture complete"
+        );
+        Ok(Outcome {
+            booted: true,
+            guest_exit: Some(code),
+            transport_error: None,
+            timed_out: false,
+        })
     }
 
     /// Signal that the budget reported by [`Protocol::current_deadline`] has
@@ -178,14 +353,40 @@ impl Protocol {
     /// fabricated exit); after injection, with the END sentinel unseen, it
     /// yields `timed_out: true` (INV-OUTCOME).
     pub fn on_timeout(&mut self) -> ProtocolStep {
-        todo!("resolve to booted:false pre-ready, or timed_out:true post-injection")
+        if self.terminal.is_some() {
+            return ProtocolStep::Done;
+        }
+        let outcome = if self.injected {
+            // Ready was seen and the command injected, but the END sentinel
+            // never arrived: the command hung (INV-OUTCOME — no fabricated exit).
+            Outcome {
+                booted: true,
+                guest_exit: None,
+                transport_error: None,
+                timed_out: true,
+            }
+        } else {
+            // The ready marker never arrived within the boot budget.
+            Outcome {
+                booted: false,
+                guest_exit: None,
+                transport_error: None,
+                timed_out: false,
+            }
+        };
+        self.terminal = Some(Ok(outcome));
+        ProtocolStep::Done
     }
 
     /// The remaining-phase budget the driver should wait under: the boot budget
     /// until the ready marker is seen, then the command budget.
     #[must_use]
     pub fn current_deadline(&self) -> Duration {
-        todo!("return the boot budget pre-ready, else the command budget")
+        if self.ready_seen {
+            self.timeout.command
+        } else {
+            self.timeout.boot
+        }
     }
 
     /// The terminal result, or `None` while the run is still in progress.
@@ -195,7 +396,7 @@ impl Protocol {
     /// the matching field set.
     #[must_use]
     pub fn outcome(&self) -> Option<Result<Outcome, BackendError>> {
-        todo!("expose the terminal Outcome / BackendError once reached")
+        self.terminal.clone()
     }
 }
 
@@ -210,8 +411,20 @@ impl Protocol {
 /// Returns [`BackendError::Protocol`] when the `exit=` token is absent or its
 /// value is not a valid integer — never a defaulted `0` (INV-OUTCOME).
 pub fn parse_exit(tail: &[u8]) -> Result<i32, BackendError> {
-    let _ = tail;
-    todo!("parse `exit=<n>` from the tail; Err(Protocol) on absent/garbled")
+    const KEY: &[u8] = b"exit=";
+    let start =
+        find_subslice(tail, KEY).ok_or_else(|| BackendError::Protocol("no `exit=` marker in tail".to_string()))?;
+    let rest = &tail[start + KEY.len()..];
+    let end = rest
+        .iter()
+        .position(|&byte| byte == b'\n' || byte == b'\r')
+        .unwrap_or(rest.len());
+    let value = std::str::from_utf8(&rest[..end])
+        .map_err(|_| BackendError::Protocol("non-utf8 exit value".to_string()))?
+        .trim();
+    value
+        .parse::<i32>()
+        .map_err(|err| BackendError::Protocol(format!("unparsable exit value {value:?}: {err}")))
 }
 
 #[cfg(test)]

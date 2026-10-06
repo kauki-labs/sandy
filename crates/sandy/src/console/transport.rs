@@ -14,6 +14,8 @@
 //! Only the [`Transport`] seam is pinned so [`run_console`](super::run_console)
 //! and the backends can be written against it now.
 
+use std::io::{Read, Write};
+
 use crate::backend::BackendError;
 
 /// A byte-level console channel to a guest.
@@ -41,59 +43,113 @@ pub trait Transport {
 }
 
 /// The Linux/qemu pipe transport: the guest serial console on a plain pipe.
-#[derive(Debug)]
-pub struct PipeTransport;
+///
+/// Holds the two halves of the guest's serial console as boxed byte streams.
+/// The host wiring that spawns qemu and hands over its console fds lands in #26;
+/// [`connect`](PipeTransport::connect) therefore reports host-deferral rather
+/// than fabricating a channel to a guest that has not been spawned.
+pub struct PipeTransport {
+    /// The readable half of the guest serial console.
+    reader: Box<dyn Read + Send>,
+    /// The writable half of the guest serial console.
+    writer: Box<dyn Write + Send>,
+}
+
+impl std::fmt::Debug for PipeTransport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("PipeTransport").finish_non_exhaustive()
+    }
+}
 
 impl PipeTransport {
     /// Open the pipe transport over an already-spawned guest's console fds.
     ///
     /// # Errors
     ///
-    /// Returns [`BackendError::Transport`] if the console fds cannot be set up.
+    /// Returns [`BackendError::Transport`]: the console fds are supplied by the
+    /// qemu-spawn host wiring (#26), which is not wired into the sandbox build.
     pub fn connect() -> Result<Self, BackendError> {
-        todo!("open the qemu serial pipe (tier-2/host)")
+        Err(BackendError::Transport(
+            "pipe transport requires the guest serial-console fds from the qemu spawn (host-wired in #26)".to_string(),
+        ))
     }
 }
 
 impl Transport for PipeTransport {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, BackendError> {
-        let _ = buf;
-        todo!("read from the serial pipe")
+        self.reader
+            .read(buf)
+            .map_err(|err| BackendError::Transport(format!("pipe read: {err}")))
     }
 
     fn write(&mut self, bytes: &[u8]) -> Result<(), BackendError> {
-        let _ = bytes;
-        todo!("write to the serial pipe")
+        self.writer
+            .write_all(bytes)
+            .and_then(|()| self.writer.flush())
+            .map_err(|err| BackendError::Transport(format!("pipe write: {err}")))
     }
 }
 
 /// The macOS/vfkit PTY transport: the guest console on a pseudo-terminal.
 ///
-/// The real build allocates the PTY through `portable-pty` (a safe wrapper), so
-/// the transport carries no `unsafe` block (INV-SAFE).
-#[derive(Debug)]
-pub struct PtyTransport;
+/// The PTY is allocated through `portable-pty` (a safe wrapper), so the
+/// transport carries no `unsafe` block (INV-SAFE). The vfkit guest is attached
+/// to the slave side by the host spawn wiring (#26); the master's reader/writer
+/// drive the sentinel protocol.
+pub struct PtyTransport {
+    /// Keeps the allocated PTY pair alive for the lifetime of the transport.
+    _pair: portable_pty::PtyPair,
+    /// Reader over the PTY master (guest stdout).
+    reader: Box<dyn Read + Send>,
+    /// Writer over the PTY master (guest stdin — the injected command frame).
+    writer: Box<dyn Write + Send>,
+}
+
+impl std::fmt::Debug for PtyTransport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("PtyTransport").finish_non_exhaustive()
+    }
+}
 
 impl PtyTransport {
     /// Allocate a PTY and attach it to the guest console.
     ///
     /// # Errors
     ///
-    /// Returns [`BackendError::Transport`] if the PTY cannot be allocated.
+    /// Returns [`BackendError::Transport`] if the PTY cannot be allocated or its
+    /// reader/writer handles cannot be cloned.
     pub fn open() -> Result<Self, BackendError> {
-        todo!("allocate a PTY via portable-pty and attach the guest console (tier-2/host)")
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize::default())
+            .map_err(|err| BackendError::Transport(format!("pty openpty: {err}")))?;
+        let reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(|err| BackendError::Transport(format!("pty reader: {err}")))?;
+        let writer = pair
+            .master
+            .take_writer()
+            .map_err(|err| BackendError::Transport(format!("pty writer: {err}")))?;
+        Ok(Self {
+            _pair: pair,
+            reader,
+            writer,
+        })
     }
 }
 
 impl Transport for PtyTransport {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, BackendError> {
-        let _ = buf;
-        todo!("read from the PTY master")
+        self.reader
+            .read(buf)
+            .map_err(|err| BackendError::Transport(format!("pty read: {err}")))
     }
 
     fn write(&mut self, bytes: &[u8]) -> Result<(), BackendError> {
-        let _ = bytes;
-        todo!("write to the PTY master")
+        self.writer
+            .write_all(bytes)
+            .and_then(|()| self.writer.flush())
+            .map_err(|err| BackendError::Transport(format!("pty write: {err}")))
     }
 }
 
