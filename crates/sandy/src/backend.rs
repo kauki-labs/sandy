@@ -1,9 +1,9 @@
 //! The backend seam (INV-8, pinned contract).
 //!
-//! [`VmBackend`] is the only way sandy-core reaches a hypervisor. It is defined
+//! [`VmBackend`] is the only way sandy reaches a hypervisor. It is defined
 //! here and implemented identically by `FakeBackend` (this crate) and
 //! `LauncherBackend` (Block 5). The backend returns the *physical* [`Outcome`]
-//! only; sandy-core maps that into the result envelope and the `retryable` /
+//! only; sandy maps that into the result envelope and the `retryable` /
 //! exit bands ([`crate::result`]). Every `BackendError` is an infra fault.
 //!
 //! All wire types are `snake_case` in Rust and in JSON, with no serde rename

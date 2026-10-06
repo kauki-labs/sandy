@@ -1,6 +1,6 @@
 //! End-to-end provisioning: host facts -> strategy -> routed outcome.
 //!
-//! Wires `sandy-core`'s capability classifier to `sandy-provider`'s router,
+//! Wires `sandy`'s capability classifier to `sandy-provider`'s router,
 //! remote-build orchestration, and locked-down-Linux fallback — the real public
 //! code — with the host-nix backend and the remote builder injected through
 //! their traits as fakes. No hypervisor and no network: this exercises the
@@ -8,14 +8,10 @@
 
 use std::cell::RefCell;
 
-use sandy_core::{
-    BootAxis, BuildAxis, HostFacts, Logs, Provenance, ProvisioningStrategy, RESULT_SCHEMA_VERSION, ResultEnvelope,
-    Status, classify,
-};
-use sandy_provider::{
-    fallback::decide_fallback,
-    remote::{RemoteArtifacts, RemoteBuilder, RemoteError, provision_remote_build},
-    router::{HostNixProvisioner, Job, ProvisionOutcome, provision},
+use sandy::{
+    BootAxis, BuildAxis, HostFacts, HostNixProvisioner, Job, Logs, Provenance, ProvisionOutcome, ProvisioningStrategy,
+    RESULT_SCHEMA_VERSION, RemoteArtifacts, RemoteBuilder, RemoteError, ResultEnvelope, Status, classify,
+    decide_fallback, provision, provision_remote_build,
 };
 
 const TARGET: &str = "x86_64-linux";

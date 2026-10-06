@@ -551,17 +551,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
-name = "sandy-acceptance"
+name = "sandy"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "fs2",
+ "hex",
+ "insta",
+ "libc",
+ "minisign-verify",
  "rstest",
- "sandy-core",
- "sandy-egress",
- "sandy-provider",
- "sandy-seed",
+ "serde",
  "serde_json",
+ "sha2",
  "tempfile",
+ "thiserror",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -571,59 +577,8 @@ dependencies = [
  "anyhow",
  "clap",
  "rstest",
- "sandy-core",
+ "sandy",
  "tempfile",
-]
-
-[[package]]
-name = "sandy-core"
-version = "0.1.1"
-dependencies = [
- "anyhow",
- "fs2",
- "insta",
- "libc",
- "rstest",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "sandy-cred"
-version = "0.1.1"
-
-[[package]]
-name = "sandy-egress"
-version = "0.1.1"
-dependencies = [
- "serde",
- "tracing",
-]
-
-[[package]]
-name = "sandy-provider"
-version = "0.1.1"
-dependencies = [
- "sandy-core",
-]
-
-[[package]]
-name = "sandy-seed"
-version = "0.1.1"
-dependencies = [
- "anyhow",
- "hex",
- "minisign-verify",
- "rstest",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror",
 ]
 
 [[package]]

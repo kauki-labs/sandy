@@ -10,7 +10,7 @@ use std::{
 
 use minisign_verify::{PublicKey, Signature};
 
-use crate::{
+use super::{
     hash::sha256_hex_file,
     manifest::{ALLOWED_IMAGE_FORMATS, MANIFEST_FILE, Requirements, SeedManifest},
 };

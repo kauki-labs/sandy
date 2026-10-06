@@ -14,9 +14,10 @@
 
 use std::fmt;
 
-use sandy_core::{Logs, Provenance, RESULT_SCHEMA_VERSION, ResultEnvelope, Status};
-
-use crate::router::{Job, ProvisionOutcome};
+use crate::{
+    Logs, Provenance, RESULT_SCHEMA_VERSION, ResultEnvelope, Status,
+    provision::router::{Job, ProvisionOutcome},
+};
 
 /// The store artifacts a remote NixOS builder produced and copied back.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,7 +34,7 @@ pub struct RemoteArtifacts {
 /// so `build_remote` only ever reports unreachable / build faults.
 ///
 /// Implemented by hand rather than via `thiserror`: `sandy-provider` depends only
-/// on `sandy-core`, so the derive macro is not in scope. See the crate's
+/// on `sandy`, so the derive macro is not in scope. See the crate's
 /// dependency set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteError {
@@ -160,10 +161,11 @@ fn infra_fault_envelope(job: &Job, message: &str) -> ResultEnvelope {
 mod tests {
     use std::cell::Cell;
 
-    use sandy_core::Status;
-
     use super::{RemoteArtifacts, RemoteBuilder, RemoteError, provision_remote_build};
-    use crate::router::{Job, ProvisionOutcome};
+    use crate::{
+        Status,
+        provision::router::{Job, ProvisionOutcome},
+    };
 
     /// What the fake remote's `build_remote` should yield once reached.
     enum BuildBehavior {

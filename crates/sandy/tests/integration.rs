@@ -7,17 +7,16 @@
 use std::time::SystemTime;
 
 use anyhow::Context;
-use sandy_core::{
-    BackendError, BoxState, CollectionConfig, FakeBackend, JobRecord, JobState, Journal, Outcome, OutputSpec,
-    RESULT_SCHEMA_VERSION, ResultEnvelope, RunSpec, Status, VmBackend, collect, reconcile_job,
-    result::{Logs, OutputRef, Provenance},
+use sandy::{
+    BackendError, BoxState, CollectionConfig, FakeBackend, JobRecord, JobState, Journal, Logs, Outcome, OutputRef,
+    OutputSpec, Provenance, RESULT_SCHEMA_VERSION, ResultEnvelope, RunSpec, Status, VmBackend, collect, reconcile_job,
 };
 
 const CAP: u64 = 1 << 20;
 
 fn running_record(job_id: &str, box_id: &str, pid: u32) -> JobRecord {
     JobRecord {
-        schema_version: sandy_core::JOURNAL_SCHEMA_VERSION,
+        schema_version: sandy::JOURNAL_SCHEMA_VERSION,
         job_id: job_id.to_string(),
         box_id: Some(box_id.to_string()),
         state: JobState::Running,
@@ -266,7 +265,7 @@ fn reconcile_leaves_a_live_job_alone() -> anyhow::Result<()> {
     journal.write_record(&record).context("write running record")?;
 
     // The backend still reports the box as live.
-    let live = sandy_core::BoxState {
+    let live = sandy::BoxState {
         box_id: "box-1".to_string(),
         box_name: "job-1".to_string(),
         pid: 4242,

@@ -18,7 +18,7 @@ workspace = true
 
 [dependencies]
 clap.workspace = true
-sandy-core.workspace = true
+sandy.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true

@@ -10,7 +10,7 @@ use std::fs;
 
 use anyhow::Context;
 use rstest::rstest;
-use sandy_seed::{ArtifactEntry, Requirements, SeedManifest, SeedRefusal, SignatureVerifier, acquire, sha256_hex};
+use sandy::{ArtifactEntry, Requirements, SeedManifest, SeedRefusal, SignatureVerifier, acquire, sha256_hex};
 use tempfile::TempDir;
 
 const ARCH: &str = "aarch64-linux";

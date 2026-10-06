@@ -1,6 +1,6 @@
 //! Operability signals: run-state metrics and staging GC retention.
 //!
-//! Exercises the two `sandy_core` operability surfaces from a consumer's view —
+//! Exercises the two `sandy` operability surfaces from a consumer's view —
 //! the run metrics must MOVE when a run changes state (presence alone is not
 //! observability), and the GC plan must evict beyond the keep-last-N window
 //! while never evicting a referenced image.
@@ -10,7 +10,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use sandy_core::{RunMetrics, RunPhase, StagedImage, plan_eviction};
+use sandy::{RunMetrics, RunPhase, StagedImage, plan_eviction};
 
 /// The running gauge rises on start and falls on finish, and a terminal
 /// transition moves its own counter and the transitions total.

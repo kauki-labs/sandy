@@ -5,7 +5,7 @@
 //! and nothing else, a host carrying nftables syntax is dropped rather than
 //! interpolated, and the macOS statement admits there is no per-VM boundary.
 
-use sandy_egress::{AllowList, EgressRule, macos_egress_statement, to_nftables};
+use sandy::{AllowList, EgressRule, macos_egress_statement, to_nftables};
 
 fn allow(host: &str, port: u16) -> AllowList {
     AllowList {
