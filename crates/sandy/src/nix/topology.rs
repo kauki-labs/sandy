@@ -7,7 +7,7 @@
 //! fully populated from a real eval or a typed [`BackendError`] — a missing
 //! required field is a hard error, never a silent default.
 
-use std::path::PathBuf;
+use std::{path::PathBuf, process::Command};
 
 use serde::Deserialize;
 
@@ -99,7 +99,7 @@ pub struct Topology {
 /// Returns [`BackendError::Protocol`] if `json` is not valid JSON or does not
 /// carry every required [`Topology`] field.
 pub fn parse_topology(json: &[u8]) -> Result<Topology, BackendError> {
-    todo!("deserialize {} bytes of topology JSON into Topology", json.len())
+    serde_json::from_slice::<Topology>(json).map_err(|e| BackendError::Protocol(e.to_string()))
 }
 
 /// Evaluate `flake_attr` with the Nix CLI and parse the resulting topology.
@@ -116,7 +116,22 @@ pub fn parse_topology(json: &[u8]) -> Result<Topology, BackendError> {
 /// transiently, or [`BackendError::Protocol`] if its output is not a complete
 /// topology.
 pub fn topology(flake_attr: &str) -> Result<Topology, BackendError> {
-    todo!("shell `nix … --json` for {flake_attr}, then parse_topology its output")
+    tracing::debug!(flake_attr, "evaluating guest topology via `nix eval --json`");
+    let output = Command::new("nix")
+        .args(["eval", "--json", flake_attr])
+        .output()
+        .map_err(|e| BackendError::Transport(format!("failed to spawn `nix eval {flake_attr}`: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(BackendError::Transport(format!(
+            "`nix eval {flake_attr}` failed ({}): {}",
+            output.status,
+            stderr.trim()
+        )));
+    }
+
+    parse_topology(&output.stdout)
 }
 
 #[cfg(test)]
