@@ -671,7 +671,10 @@ dependencies = [
  "clap",
  "rstest",
  "sandy",
+ "sandy-backend",
+ "serde_json",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]

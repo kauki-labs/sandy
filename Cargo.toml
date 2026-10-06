@@ -15,6 +15,7 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 sandy = { path = "crates/sandy" }
+sandy-backend = { path = "crates/sandy-backend" }
 thiserror = "2.0.20"
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 serde = { version = "1.0", features = ["derive"] }
