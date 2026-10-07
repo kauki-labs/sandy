@@ -18,6 +18,8 @@
 //!   (INV-TOPOLOGY).
 //! - **Console driver** — the sentinel [`Protocol`] (boot → inject → capture → exit) over a platform [`Transport`],
 //!   wired by [`run_console`] into the pinned snake_case [`Outcome`] (INV-8/INV-OUTCOME).
+//! - **Credentials** — [`mint_token`] clamps a TTL to [`MAX_TTL_SECS`] and stages a scoped GitHub token over the
+//!   [`InstallationTokenMinter`] seam (with a [`FakeMinter`] double), delivered as a `0600` [`SecretRef`] only (INV-1).
 //! - **Operability** — [`RunMetrics`] and staging [`plan_eviction`].
 
 // Deep crate: the module tree is private. The curated `pub use` facade below is
@@ -51,6 +53,7 @@ pub use config::CollectionConfig;
 pub use console::{
     Markers, PipeTransport, Protocol, ProtocolStep, PtyTransport, TimeoutPolicy, Transport, parse_exit, run_console,
 };
+pub use cred::{CredError, FakeMinter, InstallationTokenMinter, MAX_TTL_SECS, TokenScope, mint_token};
 pub use egress::{
     AllowList, EgressApplier, EgressOs, EgressOutcome, EgressPlan, EgressRule, FakeApplier, NftablesApplier, enforce,
     macos_egress_statement, plan_egress, to_nftables,
