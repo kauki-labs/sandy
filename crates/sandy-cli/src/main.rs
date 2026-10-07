@@ -208,7 +208,11 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
             } else {
                 sandy::EgressOs::Linux
             };
-            let report = match supervisor::run_job(&backend, &journal, &plan, &egress, egress_os) {
+            // The guest's tap (if any) comes from $SANDY_TAP — the same interface the
+            // backend attaches the NIC to. On Linux a bound tap selects the
+            // guest-scoped forward ruleset (safe), never the host-OUTPUT drop-all (#29).
+            let tap = std::env::var("SANDY_TAP").ok().filter(|t| !t.is_empty());
+            let report = match supervisor::run_job(&backend, &journal, &plan, &egress, egress_os, tap.as_deref()) {
                 Ok(report) => report,
                 Err(e) => {
                     eprintln!("sandy: run failed: {e}");

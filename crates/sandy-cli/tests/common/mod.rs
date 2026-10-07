@@ -107,6 +107,40 @@ pub fn emit_topology(topology_attr: &str, out: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether this process runs as root (euid 0). Shells `id -u` to avoid pulling a
+/// libc/`nix` dependency into the test crate just for one syscall.
+pub fn is_root() -> bool {
+    Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .is_some_and(|out| String::from_utf8_lossy(&out.stdout).trim() == "0")
+}
+
+/// Refuse unless this is a live host matrix node that can safely run the egress
+/// gate: Linux (host nftables), `SANDY_LIVE=1` with the qemu hypervisor on PATH
+/// (via [`require_live`]), running as root, and `nft` resolvable. Any gap bails —
+/// so phase_d is RED off-matrix, never skip-green (INV-S9). The whole gate loads
+/// real host nftables and boots a guest on a tap, which is why root is required
+/// and why the caller runs it under `sudo`.
+pub fn require_live_root() -> anyhow::Result<LiveTarget> {
+    if !cfg!(target_os = "linux") {
+        bail!("refusing: phase_d is a Linux-only egress gate (host nftables); this host is not Linux");
+    }
+    let target = require_live()?;
+    if !is_root() {
+        bail!(
+            "refusing: phase_d loads real host nftables and boots a guest on a tap — it must run as root (sudo); `id \
+             -u` is not 0"
+        );
+    }
+    if !on_path("nft") {
+        bail!("refusing: `nft` is not on PATH — run under `nix shell nixpkgs#nftables …`");
+    }
+    Ok(target)
+}
+
 /// Realise the guest closure (kernel/initrd/erofs) so the topology paths exist
 /// when the backend boots.
 pub fn build_guest(target: &LiveTarget) -> anyhow::Result<()> {

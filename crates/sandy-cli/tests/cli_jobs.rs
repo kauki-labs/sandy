@@ -9,7 +9,7 @@ use anyhow::Context;
 use sandy::{
     AllowList, BackendError, CoreError, EgressOs, EgressRule, FakeApplier, FakeBackend, FakeMinter, Grants,
     JOURNAL_SCHEMA_VERSION, JobRecord, JobState, Journal, Logs, Mount, Outcome, Provenance, RESULT_SCHEMA_VERSION,
-    ResultEnvelope, SecretRef, SecretSource, Status, TokenScope, to_nftables,
+    ResultEnvelope, SecretRef, SecretSource, Status, TokenScope, to_nftables_forward,
 };
 use sandy_cli::{
     plan::JobPlan,
@@ -134,6 +134,7 @@ fn run_positive_writes_a_succeeded_record_with_the_envelope() -> anyhow::Result<
         &booting_plan(),
         &FakeApplier::new(),
         EgressOs::Linux,
+        None,
     )
     .context("run_job (positive)")?;
 
@@ -162,6 +163,7 @@ fn run_guest_failure_is_band_one_not_retryable() -> anyhow::Result<()> {
         &booting_plan(),
         &FakeApplier::new(),
         EgressOs::Linux,
+        None,
     )
     .context("run_job (guest failure)")?;
 
@@ -182,6 +184,7 @@ fn run_infra_fault_is_band_three_and_retryable() -> anyhow::Result<()> {
         &booting_plan(),
         &FakeApplier::new(),
         EgressOs::Linux,
+        None,
     )
     .context("run_job (infra fault)")?;
 
@@ -205,6 +208,7 @@ fn run_invalid_plan_writes_no_record_and_never_boots() -> anyhow::Result<()> {
         &leaking_plan(),
         &FakeApplier::new(),
         EgressOs::Linux,
+        None,
     )
     .context("run_job (invalid plan)")?;
 
@@ -233,6 +237,7 @@ fn ls_lists_a_written_job() -> anyhow::Result<()> {
         &booting_plan(),
         &FakeApplier::new(),
         EgressOs::Linux,
+        None,
     )
     .context("run_job before ls")?;
 
@@ -252,6 +257,7 @@ fn status_returns_the_written_job() -> anyhow::Result<()> {
         &booting_plan(),
         &FakeApplier::new(),
         EgressOs::Linux,
+        None,
     )
     .context("run_job before status")?;
 
@@ -364,13 +370,14 @@ fn run_on_linux_applies_the_allow_list_ruleset_and_reverts_it() -> anyhow::Resul
     let applier = FakeApplier::new();
     let plan = allowing_plan();
 
-    let report = run_job(&backend, &journal, &plan, &applier, EgressOs::Linux).context("run_job (linux egress)")?;
+    let report = run_job(&backend, &journal, &plan, &applier, EgressOs::Linux, Some("sandytap0"))
+        .context("run_job (linux egress)")?;
 
     assert_eq!(report.envelope.status, Status::Succeeded);
     assert_eq!(
         applier.applied_rulesets(),
-        vec![to_nftables(&plan.allow)],
-        "the enforced boundary must be the allow-list's nftables translation"
+        vec![to_nftables_forward(&plan.allow, "sandytap0")],
+        "the enforced boundary must be the guest-scoped forward ruleset for the tap"
     );
     assert!(
         applier.was_reverted(),
@@ -400,8 +407,15 @@ fn egress_apply_failure_fails_closed_with_a_terminal_record() -> anyhow::Result<
     // A success is scripted on purpose: band 3 here proves the boot was skipped.
     let backend = FakeBackend::new().with_outcome(ok_outcome(0));
 
-    let report = run_job(&backend, &journal, &allowing_plan(), &FailingApplier, EgressOs::Linux)
-        .context("run_job (egress apply fails)")?;
+    let report = run_job(
+        &backend,
+        &journal,
+        &allowing_plan(),
+        &FailingApplier,
+        EgressOs::Linux,
+        Some("sandytap0"),
+    )
+    .context("run_job (egress apply fails)")?;
 
     assert_eq!(
         report.process_exit.code(),
@@ -435,7 +449,8 @@ fn run_on_macos_applies_no_boundary_but_still_succeeds() -> anyhow::Result<()> {
     let backend = FakeBackend::new().with_outcome(ok_outcome(0));
     let applier = FakeApplier::new();
 
-    let report = run_job(&backend, &journal, &allowing_plan(), &applier, EgressOs::MacOs).context("run_job (macos)")?;
+    let report =
+        run_job(&backend, &journal, &allowing_plan(), &applier, EgressOs::MacOs, None).context("run_job (macos)")?;
 
     assert_eq!(
         report.envelope.status,
@@ -461,8 +476,15 @@ fn egress_boundary_is_reverted_even_when_the_backend_run_fails() -> anyhow::Resu
     let backend = FakeBackend::new().with_error(BackendError::Spawn("no hypervisor".to_string()));
     let applier = FakeApplier::new();
 
-    let report =
-        run_job(&backend, &journal, &allowing_plan(), &applier, EgressOs::Linux).context("run_job (boot failure)")?;
+    let report = run_job(
+        &backend,
+        &journal,
+        &allowing_plan(),
+        &applier,
+        EgressOs::Linux,
+        Some("sandytap0"),
+    )
+    .context("run_job (boot failure)")?;
 
     assert_eq!(report.process_exit.code(), 3, "a boot failure is still band 3");
     assert!(
@@ -519,7 +541,8 @@ fn mint_run_token_stages_a_secret_and_the_token_travels_only_the_secret_channel(
         ..booting_plan()
     };
     let backend = FakeBackend::new().with_outcome(ok_outcome(0));
-    let report = run_job(&backend, &journal, &plan, &FakeApplier::new(), EgressOs::Linux).context("run_job (token)")?;
+    let report =
+        run_job(&backend, &journal, &plan, &FakeApplier::new(), EgressOs::Linux, None).context("run_job (token)")?;
     assert_eq!(report.envelope.status, Status::Succeeded);
 
     // INV-1: the token bytes are in the file, never in the guest argv or env.

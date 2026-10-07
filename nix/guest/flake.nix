@@ -57,11 +57,37 @@
           boot.initrd.systemd.enable = lib.mkForce false;
         };
 
+      # Guest networking for the #29 live egress gate. sandy's qemu backend adds
+      # the NIC itself (`-netdev tap,ifname=$SANDY_TAP` + virtio-net with the fixed
+      # `02:00:00:00:00:01` MAC) because it assembles its own qemu argv rather than
+      # using microvm's declaredRunner — so the guest only needs to bring up and
+      # DHCP whatever ethernet interface appears. `Type = "ether"` matches it
+      # without depending on a predictable name; the host side of the tap runs the
+      # DHCP server (the gate starts dnsmasq). The guest's own firewall is off: the
+      # host enforces egress (guest-scoped nftables on the tap), and the
+      # "bypass impossible" row flushes the guest's rules anyway.
+      networkingModule =
+        { pkgs, ... }:
+        {
+          networking.useNetworkd = true;
+          systemd.network.enable = true;
+          systemd.network.networks."10-ether" = {
+            matchConfig.Type = "ether";
+            networkConfig.DHCP = "yes";
+          };
+          networking.firewall.enable = false;
+          # `nft` in the guest so the #29 "bypass impossible" row can really flush
+          # the guest's own ruleset — otherwise that step is a silent no-op and the
+          # assertion is vacuous.
+          environment.systemPackages = [ pkgs.nftables ];
+        };
+
       mkGuest =
         {
           system,
           hypervisor,
           vmHostPackages ? null,
+          extraModules ? [ ],
         }:
         nixpkgs.lib.nixosSystem {
           inherit system;
@@ -77,13 +103,16 @@
                 microvm.vmHostPackages = lib.mkIf (vmHostPackages != null) vmHostPackages;
               }
             )
-          ];
+          ]
+          ++ extraModules;
         };
 
-      # qemu guest for the Linux node (x86_64-linux/KVM), console ttyS0.
+      # qemu guest for the Linux node (x86_64-linux/KVM), console ttyS0. Carries the
+      # networking module so the #29 egress gate has guest egress to filter.
       qemuGuest = mkGuest {
         system = "x86_64-linux";
         hypervisor = "qemu";
+        extraModules = [ networkingModule ];
       };
 
       # vfkit guest for an Apple-silicon host (aarch64-darwin host, aarch64-linux guest — vfkit

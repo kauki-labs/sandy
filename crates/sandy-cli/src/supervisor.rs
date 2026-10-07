@@ -13,8 +13,8 @@ use sandy::{
     BackendError, Classification, CoreError, EgressApplier, EgressOs, EgressOutcome, InstallationTokenMinter,
     JOURNAL_SCHEMA_VERSION, JobRecord, JobState, Journal, Logs, Outcome, OutputStatus, ProcessExit, Provenance,
     RESULT_SCHEMA_VERSION, ResultEnvelope, SecretRef, StagedImage, Status, TokenScope, VmBackend,
-    classify_backend_error, classify_invalid_plan, classify_outcome, enforce, mint_token, new_job_id, plan_egress,
-    plan_eviction, reconcile_job, validate_no_secret_leak,
+    classify_backend_error, classify_invalid_plan, classify_outcome, enforce, mint_token, new_job_id,
+    plan_egress_scoped, plan_eviction, reconcile_job, validate_no_secret_leak,
 };
 
 use crate::plan::JobPlan;
@@ -74,11 +74,17 @@ pub struct RunReport {
 ///
 /// Order (INV-6): validate the plan (an invalid plan returns band 2 with **no**
 /// journal record and **no** backend run); else write a `Running` record, apply
-/// the egress boundary (`plan_egress` + `enforce`), run the backend, revert the
-/// boundary if it was enforced (on both the ok and error paths, so a boot failure
-/// never leaves rules applied), classify the outcome, then write the terminal
-/// record carrying the envelope and return the band. A `NoBoundary`/`Unenforced`
-/// run (macOS) applies and reverts nothing.
+/// the egress boundary (`plan_egress_scoped` + `enforce`), run the backend, revert
+/// the boundary if it was enforced (on both the ok and error paths, so a boot
+/// failure never leaves rules applied), classify the outcome, then write the
+/// terminal record carrying the envelope and return the band. A
+/// `NoBoundary`/`Unenforced` run (macOS) applies and reverts nothing.
+///
+/// `tap` names the guest's host tap interface when networking is bound (the same
+/// `$SANDY_TAP` the backend attaches the NIC to). On Linux a bound tap selects the
+/// **guest-scoped** forward ruleset — the safe model that filters only the guest
+/// and can never lock the host off the network (#29); with no tap the Linux and
+/// macOS behaviour is unchanged.
 ///
 /// # Errors
 ///
@@ -91,6 +97,7 @@ pub fn run_job<B: VmBackend, E: EgressApplier>(
     plan: &JobPlan,
     egress: &E,
     egress_os: EgressOs,
+    tap: Option<&str>,
 ) -> Result<RunReport, CoreError> {
     let spec = plan.as_run_spec();
 
@@ -119,13 +126,13 @@ pub fn run_job<B: VmBackend, E: EgressApplier>(
     };
     journal.write_record(&running)?;
 
-    // 3. Apply the egress boundary around the boot. On Linux this loads the default-deny ruleset; on macOS
-    //    `plan_egress` yields `NoBoundary`, so `enforce` applies nothing and warns. If the boundary can't be applied we
-    //    fail CLOSED: do not boot, and treat it as an infra fault that lands a terminal record (band 3) rather than
-    //    leaving a dangling `Running` record.
+    // 3. Apply the egress boundary around the boot. On Linux with a tap this loads the guest-scoped forward ruleset
+    //    (the safe model, #29); on macOS `plan_egress_scoped` yields `NoBoundary`, so `enforce` applies nothing and
+    //    warns. If the boundary can't be applied we fail CLOSED: do not boot, and treat it as an infra fault that lands
+    //    a terminal record (band 3) rather than leaving a dangling `Running` record.
     // 4. On a successful apply, run the backend, then ALWAYS revert when the boundary was enforced — on both the ok and
     //    error paths, so a boot failure never leaves nftables rules up.
-    let eplan = plan_egress(&plan.allow, egress_os);
+    let eplan = plan_egress_scoped(&plan.allow, egress_os, tap);
     let run_result: Result<Outcome, BackendError> = match enforce(&eplan, egress) {
         Ok(eoutcome) => {
             let outcome = backend.run(&spec);
@@ -412,6 +419,7 @@ mod tests {
                 &booting_plan(),
                 &FakeApplier::new(),
                 EgressOs::Linux,
+                None,
             )
             .context("run_job (succeeded)")?;
             assert_eq!(report.process_exit.code(), ProcessExit::Succeeded.code());
@@ -432,6 +440,7 @@ mod tests {
                 &booting_plan(),
                 &FakeApplier::new(),
                 EgressOs::Linux,
+                None,
             )
             .context("run_job (task failure)")?;
             assert_eq!(report.process_exit.code(), ProcessExit::TaskFailure.code());
@@ -447,6 +456,7 @@ mod tests {
                 &booting_plan(),
                 &FakeApplier::new(),
                 EgressOs::Linux,
+                None,
             )
             .context("run_job (infra fault)")?;
             assert_eq!(report.process_exit.code(), ProcessExit::InfraFault.code());
@@ -467,6 +477,7 @@ mod tests {
                 &leaking_plan(),
                 &FakeApplier::new(),
                 EgressOs::Linux,
+                None,
             )
             .context("run_job (invalid plan)")?;
             assert_eq!(report.process_exit.code(), ProcessExit::InvalidPlan.code());
