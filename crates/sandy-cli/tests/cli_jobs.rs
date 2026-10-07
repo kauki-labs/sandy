@@ -9,7 +9,7 @@ use anyhow::Context;
 use sandy::{
     AllowList, BackendError, CoreError, EgressOs, EgressRule, FakeApplier, FakeBackend, FakeMinter, Grants,
     JOURNAL_SCHEMA_VERSION, JobRecord, JobState, Journal, Logs, Mount, Outcome, Provenance, RESULT_SCHEMA_VERSION,
-    ResultEnvelope, SecretRef, SecretSource, Status, TokenScope, to_nftables,
+    ResultEnvelope, SecretRef, SecretSource, Status, TokenScope, to_nftables_forward,
 };
 use sandy_cli::{
     plan::JobPlan,
@@ -370,14 +370,14 @@ fn run_on_linux_applies_the_allow_list_ruleset_and_reverts_it() -> anyhow::Resul
     let applier = FakeApplier::new();
     let plan = allowing_plan();
 
-    let report =
-        run_job(&backend, &journal, &plan, &applier, EgressOs::Linux, None).context("run_job (linux egress)")?;
+    let report = run_job(&backend, &journal, &plan, &applier, EgressOs::Linux, Some("sandytap0"))
+        .context("run_job (linux egress)")?;
 
     assert_eq!(report.envelope.status, Status::Succeeded);
     assert_eq!(
         applier.applied_rulesets(),
-        vec![to_nftables(&plan.allow)],
-        "the enforced boundary must be the allow-list's nftables translation"
+        vec![to_nftables_forward(&plan.allow, "sandytap0")],
+        "the enforced boundary must be the guest-scoped forward ruleset for the tap"
     );
     assert!(
         applier.was_reverted(),
@@ -413,7 +413,7 @@ fn egress_apply_failure_fails_closed_with_a_terminal_record() -> anyhow::Result<
         &allowing_plan(),
         &FailingApplier,
         EgressOs::Linux,
-        None,
+        Some("sandytap0"),
     )
     .context("run_job (egress apply fails)")?;
 
@@ -476,8 +476,15 @@ fn egress_boundary_is_reverted_even_when_the_backend_run_fails() -> anyhow::Resu
     let backend = FakeBackend::new().with_error(BackendError::Spawn("no hypervisor".to_string()));
     let applier = FakeApplier::new();
 
-    let report = run_job(&backend, &journal, &allowing_plan(), &applier, EgressOs::Linux, None)
-        .context("run_job (boot failure)")?;
+    let report = run_job(
+        &backend,
+        &journal,
+        &allowing_plan(),
+        &applier,
+        EgressOs::Linux,
+        Some("sandytap0"),
+    )
+    .context("run_job (boot failure)")?;
 
     assert_eq!(report.process_exit.code(), 3, "a boot failure is still band 3");
     assert!(

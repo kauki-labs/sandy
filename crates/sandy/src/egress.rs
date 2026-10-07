@@ -217,21 +217,31 @@ pub fn plan_egress(allow: &AllowList, target_os: EgressOs) -> EgressPlan {
 /// Resolve an [`AllowList`] into an [`EgressPlan`] scoped to the guest's tap
 /// interface when one is bound.
 ///
-/// This is the tap-aware planner the live run path uses. On Linux **with** a tap
+/// This is the tap-aware planner the run path uses. On Linux **with** a tap
 /// (`iface = Some`), it enforces the **guest-scoped** [`to_nftables_forward`]
 /// ruleset — the safe forward-hook model that filters only the guest and can
-/// never lock the host off the network (#29). On Linux **without** a tap, the
-/// guest has no NIC, so it falls back to [`plan_egress`] (the OUTPUT-hook model,
-/// unchanged). macOS is [`plan_egress`]'s honest [`EgressPlan::NoBoundary`]
-/// regardless. Delegating the non-tap arms keeps the existing Linux/macOS
-/// behaviour byte-for-byte identical.
+/// never lock the host off the network (#29). On Linux **without** a tap the
+/// guest has no NIC, so there is nothing to enforce and it applies no boundary —
+/// deliberately NOT the host-wide [`to_nftables`] OUTPUT drop, which would cut
+/// the host's own egress. macOS is honestly [`EgressPlan::NoBoundary`] (vmnet has
+/// no per-VM boundary). The host-wide [`plan_egress`] / [`to_nftables`] stay as
+/// the translation API (#23/#24); the run path never applies them.
 #[must_use]
 pub fn plan_egress_scoped(allow: &AllowList, target_os: EgressOs, iface: Option<&str>) -> EgressPlan {
     match (target_os, iface) {
+        // Linux with a guest tap: enforce the guest-scoped forward ruleset — the
+        // safe model that filters only the guest, never the host (#29).
         (EgressOs::Linux, Some(iface)) => EgressPlan::Enforce {
             ruleset: to_nftables_forward(allow, iface),
         },
-        (os, _) => plan_egress(allow, os),
+        // Linux without a tap: the guest has no NIC, so there is no egress to
+        // enforce. Apply NOTHING — never the host-wide OUTPUT-hook drop, which
+        // would lock the host off the network.
+        (EgressOs::Linux, None) => EgressPlan::NoBoundary {
+            reason: "no guest network interface; no egress boundary to enforce".to_string(),
+        },
+        // macOS (vmnet): no per-VM boundary — honestly unenforced.
+        (EgressOs::MacOs, _) => plan_egress(allow, EgressOs::MacOs),
     }
 }
 
@@ -627,10 +637,12 @@ mod tests {
             "a tap-bound Linux plan must enforce the guest-scoped forward ruleset"
         );
 
-        assert_eq!(
-            plan_egress_scoped(&allow, EgressOs::Linux, None),
-            plan_egress(&allow, EgressOs::Linux),
-            "Linux with no tap must match the unchanged plan_egress (OUTPUT) behaviour"
+        assert!(
+            matches!(
+                plan_egress_scoped(&allow, EgressOs::Linux, None),
+                EgressPlan::NoBoundary { .. }
+            ),
+            "Linux with no tap must apply NO boundary — never the host-wide OUTPUT drop"
         );
         assert_eq!(
             plan_egress_scoped(&allow, EgressOs::MacOs, Some("sandytap0")),
