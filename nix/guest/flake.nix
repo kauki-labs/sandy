@@ -87,6 +87,40 @@
         hypervisor = "vfkit";
         vmHostPackages = nixpkgs.legacyPackages.aarch64-darwin;
       };
+
+      # Emit sandy's `Topology` JSON from a built guest config: the kernel/initrd/
+      # erofs-store paths, the full kernel cmdline (console device per hypervisor),
+      # cpu/mem, extra virtiofs shares, and the hypervisor tag. sandy reads this
+      # via `nix eval --json <flake>#topologies.<system>.<hypervisor>` (INV-TOPOLOGY).
+      # Realise the paths first (build the guest/runner) so they exist at boot.
+      mkTopology =
+        cfg:
+        let
+          c = cfg.config;
+          consoleDev = if c.microvm.hypervisor == "vfkit" then "hvc0" else "ttyS0";
+        in
+        {
+          kernel = "${c.microvm.kernel}/${c.system.boot.loader.kernelFile}";
+          initrd = "${c.microvm.initrdPath}";
+          store.erofs_image = "${c.microvm.storeDisk}";
+          kernel_cmdline = builtins.concatStringsSep " " (
+            [
+              "console=${consoleDev}"
+              "reboot=t"
+              "panic=-1"
+            ]
+            ++ c.microvm.kernelParams
+          );
+          cpu = c.microvm.vcpu;
+          mem = c.microvm.mem;
+          # Only extra virtiofs shares (the store is the erofs image above).
+          shares = map (s: {
+            inherit (s) tag;
+            host = "${s.source}";
+            guest = s.mountPoint;
+          }) (builtins.filter (s: s.proto == "virtiofs") c.microvm.shares);
+          hypervisor = c.microvm.hypervisor;
+        };
     in
     {
       # microvm.nix's own runners — used to prove each guest boots and speaks the
@@ -94,9 +128,15 @@
       packages.x86_64-linux.guest-runner = qemuGuest.config.microvm.declaredRunner;
       packages.aarch64-darwin.guest-runner-vfkit = vfkitGuest.config.microvm.declaredRunner;
 
-      # The built guest configs, so the topology module can read kernel/initrd/
-      # store off them (added next).
+      # The built guest configs (the topology attrs read kernel/initrd/store off
+      # these).
       nixosConfigurations.sandy-guest-qemu = qemuGuest;
       nixosConfigurations.sandy-guest-vfkit = vfkitGuest;
+
+      # sandy's `Topology` per guest: `nix eval --json <flake>#topologies.<sys>.<hv>`.
+      topologies = {
+        x86_64-linux.qemu = mkTopology qemuGuest;
+        aarch64-linux.vfkit = mkTopology vfkitGuest;
+      };
     };
 }
