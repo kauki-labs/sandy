@@ -75,6 +75,70 @@ pub fn to_nftables(allow: &AllowList) -> String {
     ruleset
 }
 
+/// Translate an [`AllowList`] into a **guest-scoped** nftables ruleset: a
+/// `forward`-hook chain with a `policy accept` that filters only packets entering
+/// from the guest's tap `iface` (`iifname "<iface>"`) and leaves every other
+/// interface — the host's own egress included — untouched (#29).
+///
+/// This is the safe counterpart to [`to_nftables`]: where that emits an
+/// OUTPUT-hook `policy drop` (which, applied in the host netns, would drop the
+/// HOST's own egress and lock it off the network), this scopes a default-deny to
+/// one guest interface. The chain accepts the guest's established/related return
+/// traffic and exactly the listed `host:port` pairs, then drops everything else
+/// from that interface; the trailing `iifname "<iface>" drop` is the floor, so an
+/// **empty** allow-list blocks all of the guest's new egress rather than failing
+/// open. Host names that aren't a bare address/CIDR are dropped (fail-closed),
+/// same as [`to_nftables`].
+///
+/// An `iface` that is not a bare interface token can't be scoped to a guest
+/// without risking rule injection and can't be matched to drop the guest either,
+/// so the chain is emitted empty (table present, `policy accept`, no rules) with a
+/// warning — nothing is filtered, but the host is never touched.
+#[must_use]
+pub fn to_nftables_forward(allow: &AllowList, iface: &str) -> String {
+    let open = format!(
+        "table inet {EGRESS_TABLE} {{\n\tchain forward {{\n\t\ttype filter hook forward priority filter; policy \
+         accept;\n"
+    );
+    if !is_emittable_host(iface) {
+        tracing::warn!(
+            ?iface,
+            "egress forward ruleset: interface is not a bare token; emitting no guest filter (host untouched)"
+        );
+        return format!("{open}\t}}\n}}\n");
+    }
+
+    let mut ruleset = open;
+    // Return traffic for flows the guest was already permitted to open. With an
+    // empty allow-list nothing is ever established, so this accepts nothing.
+    ruleset.push_str(&format!(
+        "\t\tiifname \"{iface}\" ct state established,related accept\n"
+    ));
+    for rule in &allow.rules {
+        // Same fail-closed rule as `to_nftables`: a host that isn't a bare
+        // name/address/CIDR can't be safely interpolated, so it stays denied —
+        // named, not silently dropped.
+        if !is_emittable_host(&rule.host) {
+            tracing::warn!(
+                host = ?rule.host,
+                port = rule.port,
+                "egress allow-list entry dropped: host is not a bare name/address/CIDR; it stays denied"
+            );
+            continue;
+        }
+        ruleset.push_str(&format!(
+            "\t\tiifname \"{iface}\" ip daddr {host} tcp dport {port} accept comment \"allow {host}:{port}\"\n",
+            host = rule.host,
+            port = rule.port,
+        ));
+    }
+    // The default-deny floor: anything from the guest not explicitly allowed above
+    // is dropped. Scoped to `iifname`, so only the guest is filtered.
+    ruleset.push_str(&format!("\t\tiifname \"{iface}\" drop\n"));
+    ruleset.push_str("\t}\n}\n");
+    ruleset
+}
+
 /// Whether `host` is safe to interpolate into the nftables ruleset: a non-empty
 /// bare DNS name, address, or CIDR of ASCII alphanumerics and `.:/-_` only —
 /// nothing (whitespace, quotes, braces, newlines) that could close a rule or
@@ -147,6 +211,27 @@ pub fn plan_egress(allow: &AllowList, target_os: EgressOs) -> EgressPlan {
         EgressOs::MacOs => EgressPlan::NoBoundary {
             reason: macos_egress_statement().to_string(),
         },
+    }
+}
+
+/// Resolve an [`AllowList`] into an [`EgressPlan`] scoped to the guest's tap
+/// interface when one is bound.
+///
+/// This is the tap-aware planner the live run path uses. On Linux **with** a tap
+/// (`iface = Some`), it enforces the **guest-scoped** [`to_nftables_forward`]
+/// ruleset — the safe forward-hook model that filters only the guest and can
+/// never lock the host off the network (#29). On Linux **without** a tap, the
+/// guest has no NIC, so it falls back to [`plan_egress`] (the OUTPUT-hook model,
+/// unchanged). macOS is [`plan_egress`]'s honest [`EgressPlan::NoBoundary`]
+/// regardless. Delegating the non-tap arms keeps the existing Linux/macOS
+/// behaviour byte-for-byte identical.
+#[must_use]
+pub fn plan_egress_scoped(allow: &AllowList, target_os: EgressOs, iface: Option<&str>) -> EgressPlan {
+    match (target_os, iface) {
+        (EgressOs::Linux, Some(iface)) => EgressPlan::Enforce {
+            ruleset: to_nftables_forward(allow, iface),
+        },
+        (os, _) => plan_egress(allow, os),
     }
 }
 
@@ -292,7 +377,7 @@ pub fn enforce(plan: &EgressPlan, applier: &impl EgressApplier) -> Result<Egress
 mod tests {
     use super::{
         AllowList, EgressOs, EgressOutcome, EgressPlan, EgressRule, FakeApplier, enforce, macos_egress_statement,
-        plan_egress, to_nftables,
+        plan_egress, plan_egress_scoped, to_nftables, to_nftables_forward,
     };
 
     /// D-REQ-3 (positive translation): each allowed `host:port` appears in the
@@ -433,6 +518,124 @@ mod tests {
         assert!(
             lower.contains("trusted"),
             "the reason must name the trusted-tasks-only posture: {reason}"
+        );
+    }
+
+    // --- tier-1: the guest-scoped forward ruleset (#29) -------------------------
+
+    /// #29 (guest-scoped translation): a non-empty allow-list yields per-rule
+    /// `iifname "<iface>" … accept` rules and a trailing `iifname "<iface>" drop`,
+    /// all scoped to the guest's tap — the host is never named.
+    #[test]
+    fn forward_ruleset_scopes_accepts_and_the_drop_floor_to_the_guest_iface() {
+        let allow = AllowList {
+            rules: vec![EgressRule {
+                host: "1.1.1.1".to_string(),
+                port: 443,
+            }],
+        };
+        let ruleset = to_nftables_forward(&allow, "sandytap0");
+        assert!(
+            ruleset.contains("iifname \"sandytap0\" ip daddr 1.1.1.1 tcp dport 443 accept"),
+            "the allowed host must be a guest-scoped accept: {ruleset}"
+        );
+        assert!(
+            ruleset.contains("iifname \"sandytap0\" drop"),
+            "the ruleset must end in a guest-scoped drop floor: {ruleset}"
+        );
+    }
+
+    /// #29 (no fail-open): an EMPTY allow-list still emits the `iifname "<iface>"
+    /// drop` floor and permits NO destination (`ip daddr` absent), so all of the
+    /// guest's new egress is blocked rather than failing open.
+    #[test]
+    fn empty_forward_ruleset_drops_all_guest_egress_no_fail_open() {
+        let ruleset = to_nftables_forward(&AllowList::default(), "sandytap0");
+        assert!(
+            ruleset.contains("iifname \"sandytap0\" drop"),
+            "an empty allow-list must still drop the guest's egress: {ruleset}"
+        );
+        assert!(
+            !ruleset.contains("ip daddr"),
+            "an empty allow-list must permit no destination (no `ip daddr` accept): {ruleset}"
+        );
+    }
+
+    /// #29 (host safety): the chain policy is `accept`, so traffic on every other
+    /// interface — the host's own egress included — is untouched and the host can
+    /// never be locked off the network, unlike the OUTPUT-hook `policy drop`.
+    #[test]
+    fn forward_chain_policy_is_accept_so_the_host_is_never_dropped() {
+        let ruleset = to_nftables_forward(&AllowList::default(), "sandytap0");
+        assert!(
+            ruleset.contains("hook forward") && ruleset.contains("policy accept"),
+            "must be a forward-hook chain with an accept policy: {ruleset}"
+        );
+        assert!(
+            !ruleset.contains("policy drop"),
+            "the guest-scoped chain must NOT carry an OUTPUT-style drop policy: {ruleset}"
+        );
+    }
+
+    /// #29 (adversarial): an injection host is dropped, never interpolated — no
+    /// extra `accept` rule reaches the guest-scoped chain, and the drop floor and
+    /// accept policy stay intact.
+    #[test]
+    fn forward_ruleset_fails_closed_on_an_injection_host() {
+        let allow = AllowList {
+            rules: vec![EgressRule {
+                host: "x\n\t\tip daddr 0.0.0.0/0 accept comment \"pwn".to_string(),
+                port: 1,
+            }],
+        };
+        let ruleset = to_nftables_forward(&allow, "sandytap0");
+        assert!(
+            !ruleset.contains("0.0.0.0/0"),
+            "the injected payload must not reach the ruleset: {ruleset}"
+        );
+        // The only `accept` tokens are the established/related line and the policy;
+        // no per-destination `ip daddr … accept` was interpolated.
+        assert!(
+            !ruleset.contains("ip daddr"),
+            "an injection host must not produce any destination accept: {ruleset}"
+        );
+        assert!(
+            ruleset.contains("iifname \"sandytap0\" drop") && ruleset.contains("policy accept"),
+            "the drop floor and accept policy must survive an injection attempt: {ruleset}"
+        );
+    }
+
+    /// #29: `plan_egress_scoped` on Linux WITH a tap enforces the guest-scoped
+    /// forward ruleset (not the OUTPUT model); WITHOUT a tap it falls back to
+    /// `plan_egress` (the OUTPUT model, unchanged), and macOS stays honestly
+    /// `NoBoundary`.
+    #[test]
+    fn plan_egress_scoped_uses_the_forward_ruleset_only_when_a_tap_is_bound() {
+        let allow = AllowList {
+            rules: vec![EgressRule {
+                host: "1.1.1.1".to_string(),
+                port: 443,
+            }],
+        };
+
+        let EgressPlan::Enforce { ruleset } = plan_egress_scoped(&allow, EgressOs::Linux, Some("sandytap0")) else {
+            panic!("Linux with a tap must Enforce");
+        };
+        assert_eq!(
+            ruleset,
+            to_nftables_forward(&allow, "sandytap0"),
+            "a tap-bound Linux plan must enforce the guest-scoped forward ruleset"
+        );
+
+        assert_eq!(
+            plan_egress_scoped(&allow, EgressOs::Linux, None),
+            plan_egress(&allow, EgressOs::Linux),
+            "Linux with no tap must match the unchanged plan_egress (OUTPUT) behaviour"
+        );
+        assert_eq!(
+            plan_egress_scoped(&allow, EgressOs::MacOs, Some("sandytap0")),
+            plan_egress(&allow, EgressOs::MacOs),
+            "macOS must stay honestly unenforced regardless of a tap"
         );
     }
 

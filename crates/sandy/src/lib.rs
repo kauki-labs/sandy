@@ -11,9 +11,10 @@
 //! - **Provisioning** — [`classify`] host facts into a [`ProvisioningStrategy`], then [`provision`] /
 //!   [`provision_remote_build`] / [`decide_fallback`] over the [`HostNixProvisioner`] and [`RemoteBuilder`] seams.
 //! - **Seed identity** — [`acquire`] a [`VerifiedSeed`] via a [`SignatureVerifier`].
-//! - **Egress** — [`to_nftables`] translation and [`macos_egress_statement`]; [`plan_egress`] into a typed
-//!   [`EgressPlan`] (Linux enforces, macOS is honestly unenforced), driven by [`enforce`] over the [`EgressApplier`]
-//!   seam ([`FakeApplier`] / host-tier [`NftablesApplier`]).
+//! - **Egress** — [`to_nftables`] (host OUTPUT model) and the guest-scoped [`to_nftables_forward`] translation plus
+//!   [`macos_egress_statement`]; [`plan_egress`] / [`plan_egress_scoped`] into a typed [`EgressPlan`] (Linux enforces —
+//!   the tap-scoped forward ruleset when a tap is bound — macOS is honestly unenforced), driven by [`enforce`] over the
+//!   [`EgressApplier`] seam ([`FakeApplier`] / host-tier [`NftablesApplier`]).
 //! - **Nix topology** — a typed [`Topology`] read from a guest flake attr via [`topology`] / [`parse_topology`]
 //!   (INV-TOPOLOGY).
 //! - **Console driver** — the sentinel [`Protocol`] (boot → inject → capture → exit) over a platform [`Transport`],
@@ -56,7 +57,7 @@ pub use console::{
 pub use cred::{CredError, FakeMinter, InstallationTokenMinter, MAX_TTL_SECS, TokenScope, mint_token};
 pub use egress::{
     AllowList, EgressApplier, EgressOs, EgressOutcome, EgressPlan, EgressRule, FakeApplier, NftablesApplier, enforce,
-    macos_egress_statement, plan_egress, to_nftables,
+    macos_egress_statement, plan_egress, plan_egress_scoped, to_nftables, to_nftables_forward,
 };
 pub use error::CoreError;
 pub use gc::{StagedImage, plan_eviction};

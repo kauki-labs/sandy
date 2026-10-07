@@ -40,6 +40,18 @@ const SERIAL_CHARDEV_ID: &str = "sandy-serial";
 /// so the injected frame lands in a reading shell rather than the login handoff.
 const READY_MARKER: &str = "SANDY-READY";
 
+/// The fixed MAC for the guest's virtio NIC. It is a locally-administered,
+/// unicast address (the `02:` prefix), stable so the guest's network config can
+/// match it by MAC and DHCP the interface (the guest flake's
+/// `microvm.interfaces` uses this same address). Only ever one guest NIC, so a
+/// constant is enough.
+const GUEST_MAC: &str = "02:00:00:00:00:01";
+
+/// The environment variable naming the host tap the guest's NIC attaches to. Set
+/// by the operator (or the #29 live gate) after creating and configuring the tap;
+/// unset means the guest boots with no NIC (the default, isolated boot).
+const TAP_ENV: &str = "SANDY_TAP";
+
 /// The already-staged inputs [`qemu_args`] needs, kept out of the pure assembler
 /// so argv assembly does no IO and stays tier-1 testable.
 ///
@@ -59,6 +71,13 @@ pub struct StagedArgs {
     pub secret_share: Option<String>,
     /// Whether `/dev/kvm` is usable → emit `-enable-kvm -cpu host`.
     pub kvm: bool,
+    /// The host tap the guest's NIC attaches to, when networking is requested.
+    /// `Some(tap)` emits a `-netdev tap,…,ifname=<tap>` + `virtio-net-pci` pair so
+    /// the guest has egress to filter (#29); `None` emits no NIC (the default,
+    /// isolated boot). The tap itself (and any NAT / forwarding / egress rules
+    /// around it) is the host/operator's to set up — the assembler only wires the
+    /// guest onto it.
+    pub tap: Option<String>,
 }
 
 /// Assemble the `qemu-system-<arch>` command vector for `topology` + `spec`.
@@ -77,6 +96,8 @@ pub struct StagedArgs {
 ///   that binds `<id>` to the #33 [`PipeTransport`] (the socket path is a host detail, so it is not emitted here).
 /// - `-enable-kvm -cpu host` when `staged.kvm`.
 /// - the virtiofs/virtio-9p shares from `staged.mounts` and `staged.secret_share`.
+/// - a `-netdev tap,…,ifname=<tap> -device virtio-net-pci,…` NIC pair when `staged.tap` is set (so the guest has egress
+///   to filter, #29); nothing when it is `None` (the default isolated boot).
 /// - `-device vhost-vsock-pci,guest-cid=<cid>` when `topology.vsock_cid` is set.
 ///
 /// # Errors
@@ -133,6 +154,17 @@ pub fn qemu_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> Re
         args.push("-enable-kvm".to_string());
         args.push("-cpu".to_string());
         args.push("host".to_string());
+    }
+
+    // A tap NIC when one is bound, so the guest has network egress to filter (#29).
+    // `script=no,downscript=no`: qemu must not run its default ifup/ifdown — the
+    // tap is created and configured by the host/operator, not qemu. No tap → no
+    // NIC, so the default isolated boot is unchanged.
+    if let Some(tap) = &staged.tap {
+        args.push("-netdev".to_string());
+        args.push(format!("tap,id=net0,ifname={tap},script=no,downscript=no"));
+        args.push("-device".to_string());
+        args.push(format!("virtio-net-pci,netdev=net0,mac={GUEST_MAC}"));
     }
 
     // The virtiofs/9p shares: the staged mount shares, then the secret share.
@@ -352,6 +384,10 @@ impl VmBackend for QemuBackend {
             mounts,
             secret_share,
             kvm: kvm_available(),
+            // A tap is opt-in via $SANDY_TAP: the operator (or the #29 live gate)
+            // creates and firewalls the tap, then names it here so the guest's NIC
+            // attaches to it. Unset → no NIC, the default isolated boot.
+            tap: std::env::var(TAP_ENV).ok().filter(|t| !t.is_empty()),
         };
 
         let outcome = qemu_args(&topology, spec, &staged).and_then(|args| self.boot(spec, &args, run_id, &inst_dir));
@@ -482,6 +518,7 @@ mod tests {
                 tmp.path().display()
             )),
             kvm: true,
+            tap: None,
         };
         let command = ["true".to_string()];
         let grants = Grants {
@@ -549,6 +586,74 @@ mod tests {
         assert!(
             result.is_err(),
             "a vfkit topology must be rejected by the qemu-only backend, got {result:?}"
+        );
+        Ok(())
+    }
+
+    /// Tier-1 (#29): with a tap bound, `qemu_args` emits the `-netdev tap,…,
+    /// ifname=<tap>` + `virtio-net-pci` NIC pair so the guest has egress to filter.
+    #[test]
+    fn qemu_args_emits_a_tap_nic_when_a_tap_is_bound() -> anyhow::Result<()> {
+        let topology = parse_topology(X86_64_FIXTURE).context("parse x86_64 fixture")?;
+        let command = ["true".to_string()];
+        let spec = RunSpec {
+            template: "demo",
+            command: &command,
+            mounts: &[],
+            secrets: &[],
+            env: &[],
+            cpu: None,
+            mem: None,
+            timeout_secs: 60,
+            grants: &NO_GRANTS,
+            outcome_file: None,
+        };
+        let staged = StagedArgs {
+            tap: Some("sandytap0".to_string()),
+            ..StagedArgs::default()
+        };
+
+        let args = qemu_args(&topology, &spec, &staged).context("assemble qemu argv")?;
+
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-netdev" && w[1] == "tap,id=net0,ifname=sandytap0,script=no,downscript=no"),
+            "a bound tap must emit the `-netdev tap,…,ifname=<tap>` pair: {args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-device" && w[1].starts_with("virtio-net-pci,netdev=net0,mac=")),
+            "a bound tap must emit the virtio-net device: {args:?}"
+        );
+        Ok(())
+    }
+
+    /// Tier-1 (#29): with NO tap (the default), `qemu_args` emits no NIC — the
+    /// existing isolated boot is unchanged.
+    #[test]
+    fn qemu_args_emits_no_nic_without_a_tap() -> anyhow::Result<()> {
+        let topology = parse_topology(X86_64_FIXTURE).context("parse x86_64 fixture")?;
+        let command = ["true".to_string()];
+        let spec = RunSpec {
+            template: "demo",
+            command: &command,
+            mounts: &[],
+            secrets: &[],
+            env: &[],
+            cpu: None,
+            mem: None,
+            timeout_secs: 60,
+            grants: &NO_GRANTS,
+            outcome_file: None,
+        };
+        let staged = StagedArgs::default();
+
+        let args = qemu_args(&topology, &spec, &staged).context("assemble qemu argv")?;
+
+        let joined = args.join(" ");
+        assert!(
+            !joined.contains("-netdev") && !joined.contains("virtio-net"),
+            "no tap must emit no NIC: {joined}"
         );
         Ok(())
     }
