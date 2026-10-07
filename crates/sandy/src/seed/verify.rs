@@ -19,13 +19,13 @@ use super::{
 ///
 /// This is the seam that lets identity verification be unit-tested without a real
 /// key: tests supply an accept/reject double, while production uses
-/// [`MinisignVerifier`] over the KeePassXC-held minisign key (D12).
+/// [`MinisignVerifier`] over the operator-held minisign key (D12).
 pub trait SignatureVerifier {
     /// Return `true` iff `signature` is a valid detached signature over `message`.
     fn verify(&self, message: &[u8], signature: &[u8]) -> bool;
 }
 
-/// Production [`SignatureVerifier`] over a minisign public key (the KeePassXC-held key).
+/// Production [`SignatureVerifier`] over a minisign public key (the operator-held key).
 ///
 /// [`verify`](MinisignVerifier::verify) checks a detached signature with
 /// `minisign-verify`. It is the live crypto path: the sandbox unit suite exercises

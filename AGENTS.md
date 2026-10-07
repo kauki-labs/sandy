@@ -6,10 +6,20 @@ Everything an agent needs is here.
 
 ## Project overview
 
-sandy is a Rust workspace. Member crates live under `crates/*` and share version,
-metadata, dependency versions, and lints through the root `Cargo.toml`
-(`[workspace.package]`, `[workspace.dependencies]`, `[workspace.lints]`). The
-starter crate is `sandy-core`.
+sandy is a Rust workspace that runs a job in an ephemeral NixOS microVM and
+reports a locked result envelope. Member crates live under `crates/*` and share
+version, metadata, dependency versions, and lints through the root `Cargo.toml`
+(`[workspace.package]`, `[workspace.dependencies]`, `[workspace.lints]`):
+
+- **`sandy`** — the deep library. Private implementation modules behind a curated
+  `pub use` facade: the `VmBackend` seam + `FakeBackend`, the journal, reconcile,
+  the result envelope (INV-11), console protocol, nix topology, egress, seed,
+  secret staging, and gc.
+- **`sandy-backend`** — the native `VmBackend` implementations: `QemuBackend`
+  (Linux/KVM, serial on `ttyS0`) and `VfkitBackend` (macOS/Virtualization.framework,
+  console on `hvc0`).
+- **`sandy-cli`** — the `sandy` binary: `doctor` and `run`/`ls`/`status`/`wait`/
+  `kill`/`gc` (text or `-o json`).
 
 ## Build & test (run before committing)
 
@@ -53,13 +63,32 @@ Commit with a Conventional Commits title.
 
 ```text
 crates/
-  └─ sandy-core/   - starter library crate
+  ├─ sandy/          - deep library behind a curated facade (seam, journal, result, console, topology, …)
+  ├─ sandy-backend/  - native VmBackend impls: QemuBackend (Linux) + VfkitBackend (macOS)
+  └─ sandy-cli/      - the `sandy` binary (doctor, run/ls/status/wait/kill/gc)
+nix/
+  ├─ packages/       - crane build definitions
+  └─ guest/          - bootable microVM guests + the Topology seam (own flake)
 ```
 
 Add a crate by dropping it under `crates/`; the workspace glob picks it up.
 
-- **Shared config**: crates inherit metadata and dep versions from the root with
-  `version.workspace = true`, `thiserror.workspace = true`, and so on.
+- **Deep crate**: `sandy`'s module tree is private; the only public surface is
+  the `pub use` facade in `lib.rs`. Reach a type through the facade, never into a
+  module.
+- **The run plane**: sandy owns the hypervisor launch natively through the
+  `VmBackend` seam (qemu on Linux, vfkit on macOS). The VM shape comes from
+  evaluating a guest flake attr into a typed `Topology` (`nix eval --json`); Nix
+  still builds the artifacts. `FakeBackend` stands in for the sandbox tiers; a
+  real boot is tier-3 (host), never counted green from a fake (INV-S9).
+- **The guest** (`nix/guest/`, its own flake): a microVM named `sandy` (the
+  `sandy login:` READY_MARKER) with an erofs store. `#packages.x86_64-linux.guest-runner`
+  (qemu) and `#packages.aarch64-darwin.guest-runner-vfkit` build the runners;
+  `#topologies.<system>.<hypervisor>` emit the `Topology` JSON sandy reads.
+- **macOS needs a linux-builder**: vfkit requires a matching-arch guest, so an
+  aarch64-darwin host builds its aarch64-linux guest on a remote `aarch64-linux`
+  builder (nix-darwin's `nix.linux-builder`). `sandy doctor` refuses on macOS when
+  nix or that builder is missing, naming the fix.
 - **Shared lints**: `[lints] workspace = true` per crate applies the workspace
   lint table (`unsafe_code = forbid`, `missing_docs = warn`, clippy `all = warn`).
 - **Deny warnings in CI**: clippy runs with `--deny warnings`, so documentation

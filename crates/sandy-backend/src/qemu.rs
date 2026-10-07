@@ -1,24 +1,27 @@
 //! The native qemu/KVM backend (Block 35): assemble the hypervisor argv from a
-//! [`Topology`] and run it with its serial console on pipes (#33).
+//! [`Topology`] and run it with its serial console over a Unix socket (#33).
 //!
 //! This is the Linux/CI counterpart to the vfkit backend (#32). It is split so
 //! the argv assembly stays pure and tier-1 testable:
 //!
 //! - [`qemu_args`] — the pure assembler. Given a [`Topology`], a [`RunSpec`], and the already-[`StagedArgs`] (secret
 //!   share + [`mount_args`](sandy::mount_args) output), it builds the `qemu-system-<arch>` command vector with no IO.
-//!   Proven on ws01 (x86_64, `/dev/kvm` world-rw): the microvm.nix runner booted → result → poweroff in ~8s with
-//!   `-nographic -serial chardev:stdio console=ttyS0` and sentinels on stdout.
+//!   Proven live on an x86_64 Linux/KVM host (`/dev/kvm` world-rw): `sandy run` boots this argv to a `succeeded`/exit-0
+//!   result in ~10s with `-nographic -serial chardev:sandy-serial console=ttyS0` and the sentinels on the serial
+//!   socket.
 //! - [`QemuBackend`] — the [`VmBackend`] seam. `run` stages secrets/mounts (#34), calls [`qemu_args`], spawns qemu with
 //!   serial on the #33 [`PipeTransport`](sandy::PipeTransport), drives [`run_console`](sandy::run_console), and
-//!   populates the pinned [`Outcome`]. The spawn/boot is host-tier (tier-3, ws01), not unit-tested in the sandbox.
+//!   populates the pinned [`Outcome`]. The spawn/boot is host-tier (tier-3), not unit-tested in the sandbox.
 //!
 //! The module is private; `sandy-backend`'s `lib.rs` re-exports only
 //! [`QemuBackend`], [`qemu_args`], and [`StagedArgs`].
 
 use std::{
+    os::unix::net::UnixStream,
     path::Path,
+    process::{Command, Stdio},
     sync::{Mutex, MutexGuard},
-    time::SystemTime,
+    time::{Duration, Instant, SystemTime},
 };
 
 use sandy::{
@@ -28,13 +31,14 @@ use sandy::{
 use uuid::Uuid;
 
 /// The chardev id the guest serial console binds to. `qemu_args` emits
-/// `-serial chardev:<SERIAL_CHARDEV_ID>`; `run` wires the matching
-/// `-chardev pipe,…` to the #33 [`PipeTransport`] fifo (a host-tier detail).
+/// `-serial chardev:<SERIAL_CHARDEV_ID>`; `run` adds the matching
+/// `-chardev socket,…` and drives it over the #33 [`PipeTransport`].
 const SERIAL_CHARDEV_ID: &str = "sandy-serial";
 
-/// The boot-ready marker scanned for before the command is injected (the guest
-/// login banner). Host-tier: only `run` uses it, and the real boot is #26.
-const READY_MARKER: &str = "sandy login:";
+/// The boot-ready marker scanned for before the command is injected: the guest's
+/// login shell prints it once it is up and reading (the guest's `loginShellInit`),
+/// so the injected frame lands in a reading shell rather than the login handoff.
+const READY_MARKER: &str = "SANDY-READY";
 
 /// The already-staged inputs [`qemu_args`] needs, kept out of the pure assembler
 /// so argv assembly does no IO and stays tier-1 testable.
@@ -69,8 +73,8 @@ pub struct StagedArgs {
 /// - the store ([`StoreBacking::ErofsImage`](sandy::StoreBacking::ErofsImage)) as a read-only virtio-blk drive, e.g.
 ///   `-drive file=<image>,if=virtio,format=raw,readonly=on`.
 /// - `-smp <topology.cpu>` / `-m <topology.mem>` — vCPUs and memory in MiB (a [`RunSpec`] `cpu`/`mem` may narrow them).
-/// - `-nographic` and `-serial chardev:<id>` — the guest serial console; `run` adds the matching `-chardev pipe,…` that
-///   binds `<id>` to the #33 pipe (the fifo path is a host-tier detail, so it is not emitted here).
+/// - `-nographic` and `-serial chardev:<id>` — the guest serial console; `run` adds the matching `-chardev socket,…`
+///   that binds `<id>` to the #33 [`PipeTransport`] (the socket path is a host detail, so it is not emitted here).
 /// - `-enable-kvm -cpu host` when `staged.kvm`.
 /// - the virtiofs/virtio-9p shares from `staged.mounts` and `staged.secret_share`.
 /// - `-device vhost-vsock-pci,guest-cid=<cid>` when `topology.vsock_cid` is set.
@@ -234,34 +238,103 @@ impl QemuBackend {
             .map_err(|_| BackendError::Protocol("qemu instance registry mutex poisoned".to_string()))
     }
 
-    /// Spawn qemu over the #33 pipe transport, register the instance, drive the
-    /// sentinel protocol, then deregister it.
+    /// Spawn qemu with its serial console on a Unix-socket chardev, register the
+    /// instance, drive the sentinel protocol, then tear qemu down and deregister.
     ///
-    /// The process spawn and serial-console fd handover are host-tier (#26),
-    /// encapsulated behind [`PipeTransport::connect`]; a failure to obtain the
-    /// channel is a [`BackendError::Spawn`], while a transport/timeout fault
-    /// during the run lands in the returned [`Outcome`] (never a fabricated
-    /// `guest_exit`, INV-OUTCOME).
-    fn boot(&self, spec: &RunSpec, args: &[String], run_id: Uuid) -> Result<Outcome, BackendError> {
-        tracing::debug!(?args, run_id = %run_id, "spawning qemu over the pipe transport");
-        let mut transport =
-            PipeTransport::connect().map_err(|err| BackendError::Spawn(format!("spawn qemu: {err}")))?;
+    /// The run is synchronous: the box lives only for this call. A spawn/dir fault
+    /// is a [`BackendError::Spawn`]; a connect/transport/timeout fault during the
+    /// run lands in the returned [`Outcome`] (never a fabricated `guest_exit`,
+    /// INV-OUTCOME).
+    fn boot(&self, spec: &RunSpec, args: &[String], run_id: Uuid, inst_dir: &Path) -> Result<Outcome, BackendError> {
+        std::fs::create_dir_all(inst_dir)
+            .map_err(|err| BackendError::Spawn(format!("create instance dir {}: {err}", inst_dir.display())))?;
+        let sock = inst_dir.join("serial.sock");
+
+        // qemu_args emits `-serial chardev:<id>`; bind that id to a Unix-socket
+        // chardev qemu creates (server=on, wait=off so the spawn doesn't block).
+        let mut argv = args.to_vec();
+        argv.push("-chardev".to_string());
+        argv.push(format!(
+            "socket,id={SERIAL_CHARDEV_ID},path={},server=on,wait=off",
+            sock.display()
+        ));
+
+        tracing::debug!(?argv, run_id = %run_id, "spawning qemu");
+        let mut child = Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|err| BackendError::Spawn(format!("spawn qemu `{}`: {err}", argv[0])))?;
 
         let box_id = run_id.to_string();
         self.registry()?.push(BoxState {
             box_id: box_id.clone(),
             box_name: spec.template.to_string(),
-            pid: std::process::id(),
+            pid: child.id(),
             started: SystemTime::now(),
             rvport: None,
         });
 
-        let markers = Markers::for_run(READY_MARKER, run_id);
-        let outcome = run_console(&mut transport, spec, &markers);
+        let outcome = drive_console(spec, run_id, &sock);
 
+        // Teardown: stop qemu and deregister. Best-effort kill — the child may
+        // already have exited (e.g. a guest `poweroff`).
+        let _ = child.kill();
+        let _ = child.wait();
         self.registry()?.retain(|state| state.box_id != box_id);
         Ok(outcome)
     }
+}
+
+/// An infra transport fault as an [`Outcome`] (no fabricated exit, INV-OUTCOME).
+fn transport_outcome(err: &BackendError) -> Outcome {
+    Outcome {
+        booted: false,
+        guest_exit: None,
+        transport_error: Some(err.to_string()),
+        timed_out: false,
+    }
+}
+
+/// Connect to `sock`, retrying until it exists or the (bounded) budget elapses —
+/// qemu creates the socket asynchronously after spawn.
+fn connect_serial(sock: &Path, budget: Duration) -> Result<UnixStream, BackendError> {
+    let deadline = Instant::now() + budget.min(Duration::from_secs(10));
+    loop {
+        match UnixStream::connect(sock) {
+            Ok(stream) => return Ok(stream),
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            Err(err) => {
+                return Err(BackendError::Transport(format!(
+                    "connect qemu serial {}: {err}",
+                    sock.display()
+                )));
+            }
+        }
+    }
+}
+
+/// Connect the guest serial socket and drive the console protocol to an
+/// [`Outcome`]. The socket read timeout carries the run deadline, so a silent
+/// guest resolves through the protocol's timeout path rather than blocking.
+fn drive_console(spec: &RunSpec, run_id: Uuid, sock: &Path) -> Outcome {
+    let budget = Duration::from_secs(u64::from(spec.timeout_secs.max(1)));
+    let stream = match connect_serial(sock, budget) {
+        Ok(stream) => stream,
+        Err(err) => return transport_outcome(&err),
+    };
+    if let Err(err) = stream.set_read_timeout(Some(budget)) {
+        return transport_outcome(&BackendError::Transport(format!("set serial read timeout: {err}")));
+    }
+    let reader = match stream.try_clone() {
+        Ok(reader) => reader,
+        Err(err) => return transport_outcome(&BackendError::Transport(format!("clone serial socket: {err}"))),
+    };
+    let mut transport = PipeTransport::new(Box::new(reader), Box::new(stream));
+    let markers = Markers::for_run(READY_MARKER, run_id);
+    run_console(&mut transport, spec, &markers)
 }
 
 impl VmBackend for QemuBackend {
@@ -281,7 +354,7 @@ impl VmBackend for QemuBackend {
             kvm: kvm_available(),
         };
 
-        let outcome = qemu_args(&topology, spec, &staged).and_then(|args| self.boot(spec, &args, run_id));
+        let outcome = qemu_args(&topology, spec, &staged).and_then(|args| self.boot(spec, &args, run_id, &inst_dir));
 
         // Teardown clears staging on every path so secret bytes never outlive
         // the run (INV-1), including the error path.
@@ -480,13 +553,12 @@ mod tests {
         Ok(())
     }
 
-    /// Tier-3 (host-gated, ws01): a trivial job boots on a real Linux/KVM node
+    /// Tier-3 (host-gated, a Linux/KVM host): a trivial job boots on a real Linux/KVM node
     /// over the #33 pipe transport, returns a populated [`Outcome`], and
     /// `boxes`/`kill` work across the four distinct outcomes. Never run in the
     /// sandbox (INV-S9: no green from a fake); binds into #26/#27.
     #[test]
-    #[ignore = "tier-3: real qemu/KVM boot on a Linux node (ws01) over the pipe transport; host-gated, binds into \
-                #26/#27"]
+    #[ignore = "tier-3: real qemu/KVM boot on a Linux node over the pipe transport; host-gated, binds into #26/#27"]
     fn boots_a_trivial_job_on_kvm() -> anyhow::Result<()> {
         let backend = QemuBackend::new();
         let command = ["true".to_string()];

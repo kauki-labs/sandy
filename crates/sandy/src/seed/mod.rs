@@ -4,7 +4,7 @@
 //! boot, the seed is verified **by identity**, never by presence (INV-P5): its
 //! signed manifest must match the caller's required architecture and nixpkgs
 //! revision, declare an allowed image format, carry a valid signature over the
-//! KeePassXC-held key, and every artifact must hash to its manifest entry. A
+//! operator-held key, and every artifact must hash to its manifest entry. A
 //! stale, wrong-arch, unsigned, or tampered seed is refused, and the refusal
 //! names the field that failed.
 //!
