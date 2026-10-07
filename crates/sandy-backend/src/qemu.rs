@@ -36,7 +36,7 @@ const SERIAL_CHARDEV_ID: &str = "sandy-serial";
 
 /// The boot-ready marker scanned for before the command is injected (the guest
 /// login banner). Host-tier: only `run` uses it, and the real boot is #26.
-const READY_MARKER: &str = "sandy login:";
+const READY_MARKER: &str = "SANDY-READY";
 
 /// The already-staged inputs [`qemu_args`] needs, kept out of the pure assembler
 /// so argv assembly does no IO and stays tier-1 testable.

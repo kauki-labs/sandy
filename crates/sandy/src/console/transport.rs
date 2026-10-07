@@ -14,7 +14,10 @@
 //! Only the [`Transport`] seam is pinned so [`run_console`](super::run_console)
 //! and the backends can be written against it now.
 
-use std::io::{ErrorKind, Read, Write};
+use std::{
+    io::{ErrorKind, Read, Write},
+    path::Path,
+};
 
 use crate::backend::BackendError;
 
@@ -103,12 +106,19 @@ impl Transport for PipeTransport {
 /// to the slave side by the host spawn wiring (#26); the master's reader/writer
 /// drive the sentinel protocol.
 pub struct PtyTransport {
-    /// Keeps the allocated PTY pair alive for the lifetime of the transport.
-    _pair: portable_pty::PtyPair,
+    /// Keeps the PTY master alive for the transport's lifetime (the reader/writer
+    /// are clones of it).
+    _master: Box<dyn portable_pty::MasterPty + Send>,
+    /// The PTY slave, consumed by [`PtyTransport::spawn`] (which drops it so the
+    /// master sees EOF once the guest exits). `None` after a spawn.
+    slave: Option<Box<dyn portable_pty::SlavePty + Send>>,
     /// Reader over the PTY master (guest stdout).
     reader: Box<dyn Read + Send>,
     /// Writer over the PTY master (guest stdin — the injected command frame).
     writer: Box<dyn Write + Send>,
+    /// The guest process (e.g. `vfkit`) spawned onto the slave, owned so teardown
+    /// can signal it. `None` until [`PtyTransport::spawn`] is called.
+    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
 }
 
 impl std::fmt::Debug for PtyTransport {
@@ -137,10 +147,52 @@ impl PtyTransport {
             .take_writer()
             .map_err(|err| BackendError::Transport(format!("pty writer: {err}")))?;
         Ok(Self {
-            _pair: pair,
+            _master: pair.master,
+            slave: Some(pair.slave),
             reader,
             writer,
+            child: None,
         })
+    }
+
+    /// Spawn `program` with `args` attached to the PTY slave, so the guest console
+    /// (vfkit's `virtio-serial,stdio`) is bound to this PTY and the master drives
+    /// the sentinel protocol. Returns the child pid. The child is owned by the
+    /// transport and torn down by [`PtyTransport::shutdown`].
+    ///
+    /// The parent's slave handle is dropped once the child holds it, so the master
+    /// reader sees EOF when the guest exits (otherwise an open slave would keep the
+    /// master readable forever and a dead guest would hang the driver).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError::Spawn`] if the slave was already consumed or the
+    /// process cannot be launched on it.
+    pub fn spawn(&mut self, program: &Path, args: &[String]) -> Result<u32, BackendError> {
+        let slave = self
+            .slave
+            .take()
+            .ok_or_else(|| BackendError::Spawn("pty slave already consumed".to_string()))?;
+        let mut builder = portable_pty::CommandBuilder::new(program);
+        for arg in args {
+            builder.arg(arg);
+        }
+        let child = slave
+            .spawn_command(builder)
+            .map_err(|err| BackendError::Spawn(format!("spawn {} on pty: {err}", program.display())))?;
+        drop(slave);
+        let pid = child.process_id().unwrap_or(0);
+        self.child = Some(child);
+        Ok(pid)
+    }
+
+    /// Kill and reap the spawned child, if any. Best-effort — the child may have
+    /// already exited.
+    pub fn shutdown(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 

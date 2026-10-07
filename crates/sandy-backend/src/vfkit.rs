@@ -17,7 +17,6 @@
 
 use std::{
     path::{Path, PathBuf},
-    process::{Child, Command},
     sync::Mutex,
     time::SystemTime,
 };
@@ -31,7 +30,7 @@ use uuid::Uuid;
 /// The guest boot-ready marker the console protocol scans for before injecting
 /// the command (the guest's login banner). The real banner is pinned by the host
 /// boot wiring (#26); it matches the console protocol's own fixture.
-const BOOT_READY_MARKER: &str = "sandy login:";
+const BOOT_READY_MARKER: &str = "SANDY-READY";
 
 /// The staged virtio-fs share descriptors [`vfkit_args`] weaves into the argv.
 ///
@@ -75,7 +74,7 @@ impl StagedArgs {
 ///   passed verbatim (vfkit on aarch64 needs an *uncompressed* `Image`; sandy never transforms it) along with the
 ///   initrd and the full [`Topology::kernel_cmdline`].
 /// - the read-only Nix store, from [`Topology::store`](sandy::Topology): an
-///   [`ErofsImage`](sandy::StoreBacking::ErofsImage) becomes `--device virtio-blk,path=<img>,readOnly` (a read-only
+///   [`ErofsImage`](sandy::StoreBacking::ErofsImage) becomes `--device virtio-blk,path=<img>,readonly` (a read-only
 ///   block device); a [`Virtiofs`](sandy::StoreBacking::Virtiofs) tag becomes `--device
 ///   virtio-fs,sharedDir=/nix/store,mountTag=<tag>` (the guest mounts it read-only via the `ro-store` tag).
 /// - `--device virtio-serial,stdio` — the guest `hvc0` console. `stdio` is backed by the PTY master the backend spawns
@@ -110,9 +109,12 @@ pub fn vfkit_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> R
     args.push(mem.to_string());
 
     // The kernel is carried verbatim — vfkit on aarch64 needs an uncompressed `Image`, never transformed.
+    // The cmdline is wrapped in literal double-quotes: the `--bootloader` value is
+    // comma-separated, and the cmdline itself carries commas (e.g. `lsm=a,b,c`), so
+    // without quoting vfkit would split it into spurious bootloader options.
     args.push("--bootloader".to_string());
     args.push(format!(
-        "linux,kernel={},initrd={},cmdline={}",
+        "linux,kernel={},initrd={},cmdline=\"{}\"",
         topology.kernel.display(),
         topology.initrd.display(),
         topology.kernel_cmdline
@@ -121,7 +123,7 @@ pub fn vfkit_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> R
     // The read-only Nix store: an erofs image is a block device; a virtiofs tag is a share of the host store.
     args.push("--device".to_string());
     match &topology.store {
-        StoreBacking::ErofsImage(img) => args.push(format!("virtio-blk,path={},readOnly", img.display())),
+        StoreBacking::ErofsImage(img) => args.push(format!("virtio-blk,path={},readonly", img.display())),
         StoreBacking::Virtiofs(tag) => args.push(format!("virtio-fs,sharedDir=/nix/store,mountTag={tag}")),
     }
 
@@ -154,23 +156,8 @@ pub fn vfkit_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> R
 pub struct VfkitBackend {
     /// Path to the `vfkit` binary to launch.
     vfkit_bin: PathBuf,
-    /// The running instances this backend owns, keyed for [`kill`](VmBackend::kill) teardown.
-    instances: Mutex<Vec<Instance>>,
-}
-
-/// One live vfkit instance the backend owns.
-///
-/// Holds the public [`BoxState`] surfaced by [`boxes`](VmBackend::boxes) plus the
-/// private teardown handles [`kill`](VmBackend::kill) needs: the spawned child to
-/// signal and the staging dir to wipe (INV-1).
-#[derive(Debug)]
-struct Instance {
-    /// The public box state reported by [`boxes`](VmBackend::boxes).
-    state: BoxState,
-    /// The spawned `vfkit` child, signalled on teardown.
-    child: Child,
-    /// The per-instance staging dir, wiped on teardown.
-    inst_dir: PathBuf,
+    /// The boxes launched and not yet reaped, reported by [`boxes`](VmBackend::boxes).
+    instances: Mutex<Vec<BoxState>>,
 }
 
 impl VfkitBackend {
@@ -186,13 +173,14 @@ impl VfkitBackend {
 }
 
 impl VfkitBackend {
-    /// Stage the run, assemble the argv, spawn `vfkit` under a PTY, and drive the
-    /// console to a terminal [`Outcome`].
+    /// Stage the run, assemble the argv, spawn `vfkit` on a PTY, drive the console
+    /// to a terminal [`Outcome`], then tear vfkit down.
     ///
-    /// The vfkit child's stdio↔PTY-slave bridge is the host spawn wiring (#26);
-    /// here we launch the assembled argv and drive the sentinel protocol over the
-    /// master. The console never fabricates `guest_exit`: a transport/timeout
-    /// fault lands in the [`Outcome`], only staging/spawn faults are errors.
+    /// vfkit's `virtio-serial,stdio` needs a real TTY, so vfkit is spawned onto the
+    /// PTY slave and the master drives the sentinel protocol. The run is
+    /// synchronous: the box lives only for this call. The console never fabricates
+    /// `guest_exit`: a transport/timeout fault lands in the [`Outcome`], only
+    /// staging/spawn faults are errors.
     fn boot(
         &self,
         topology: &Topology,
@@ -200,7 +188,7 @@ impl VfkitBackend {
         run_id: Uuid,
         box_id: &str,
         inst_dir: &Path,
-    ) -> Result<(Outcome, Instance), BackendError> {
+    ) -> Result<Outcome, BackendError> {
         // Secrets travel a read-only virtio-fs share of the 0700 staging dir, never argv bytes (INV-1).
         let staged_secrets = stage_secrets(spec.secrets, inst_dir)?;
         let secret_shares = if staged_secrets.is_empty() {
@@ -211,40 +199,31 @@ impl VfkitBackend {
 
         let mut tags = TagPool::new();
         let mount_shares = mount_args(spec.mounts, &mut tags)?;
-
         let staged = StagedArgs::new(mount_shares, secret_shares);
         let args = vfkit_args(topology, spec, &staged)?;
 
         let mut transport = PtyTransport::open()?;
-        let child = Command::new(&self.vfkit_bin)
-            .args(&args)
-            .spawn()
-            .map_err(|err| BackendError::Spawn(format!("spawn vfkit `{}`: {err}", self.vfkit_bin.display())))?;
-        let pid = child.id();
+        let pid = transport.spawn(&self.vfkit_bin, &args)?;
         tracing::info!(box_id, pid, "spawned vfkit under PTY console");
-
-        let markers = Markers::for_run(BOOT_READY_MARKER, run_id);
-        let outcome = run_console(&mut transport, spec, &markers);
-
-        let state = BoxState {
+        self.lock_registry()?.push(BoxState {
             box_id: box_id.to_string(),
             box_name: spec.template.to_string(),
             pid,
             started: SystemTime::now(),
             rvport: None,
-        };
-        Ok((
-            outcome,
-            Instance {
-                state,
-                child,
-                inst_dir: inst_dir.to_path_buf(),
-            },
-        ))
+        });
+
+        let markers = Markers::for_run(BOOT_READY_MARKER, run_id);
+        let outcome = run_console(&mut transport, spec, &markers);
+
+        // Teardown: stop vfkit and deregister.
+        transport.shutdown();
+        self.lock_registry()?.retain(|state| state.box_id != box_id);
+        Ok(outcome)
     }
 
     /// Lock the instance registry, mapping a poisoned lock to an infra fault.
-    fn lock_registry(&self) -> Result<std::sync::MutexGuard<'_, Vec<Instance>>, BackendError> {
+    fn lock_registry(&self) -> Result<std::sync::MutexGuard<'_, Vec<BoxState>>, BackendError> {
         self.instances
             .lock()
             .map_err(|_| BackendError::Spawn("vfkit instance registry lock poisoned".to_string()))
@@ -256,44 +235,28 @@ impl VmBackend for VfkitBackend {
         let topology = topology(spec.template)?;
         let run_id = Uuid::new_v4();
         let box_id = format!("inst-{run_id}");
-        let inst_dir = PathBuf::from("/run/sandy").join(&box_id);
+        // Staging under the OS temp dir (works on macOS, where `/run` does not exist).
+        let inst_dir = std::env::temp_dir().join("sandy").join(&box_id);
 
-        match self.boot(&topology, spec, run_id, &box_id, &inst_dir) {
-            Ok((outcome, instance)) => {
-                self.lock_registry()?.push(instance);
-                Ok(outcome)
-            }
-            Err(err) => {
-                // Staging may already hold secret bytes; wipe before surfacing the fault (INV-1).
-                if let Err(werr) = wipe(&inst_dir) {
-                    tracing::warn!(dir = %inst_dir.display(), %werr, "failed to wipe staging after a failed boot");
-                }
-                Err(err)
-            }
+        let outcome = self.boot(&topology, spec, run_id, &box_id, &inst_dir);
+
+        // Wipe staging on every path so secret bytes never outlive the run (INV-1).
+        if let Err(err) = wipe(&inst_dir) {
+            tracing::warn!(dir = %inst_dir.display(), %err, "failed to wipe staging on teardown");
         }
+        outcome
     }
 
     fn kill(&self, box_id: &str) -> Result<(), BackendError> {
-        let mut registry = self.lock_registry()?;
-        let Some(pos) = registry.iter().position(|inst| inst.state.box_id == box_id) else {
-            return Err(BackendError::Spawn(format!("no such vfkit box: {box_id}")));
-        };
-        let mut instance = registry.remove(pos);
-        drop(registry);
-
-        if let Err(err) = instance.child.kill() {
-            tracing::warn!(box_id, %err, "vfkit child kill signal failed (already exited?)");
-        }
-        // Reap the child so it does not linger as a zombie.
-        let _ = instance.child.wait();
-        if let Err(err) = wipe(&instance.inst_dir) {
-            tracing::warn!(box_id, dir = %instance.inst_dir.display(), %err, "failed to wipe staging on teardown");
-        }
+        // The synchronous run already tore the vfkit child down in `boot`; a kill
+        // from another call just drops the box from the registry.
+        self.lock_registry()?.retain(|state| state.box_id != box_id);
+        tracing::debug!(box_id, "dropped vfkit instance from the registry");
         Ok(())
     }
 
     fn boxes(&self) -> Result<Vec<BoxState>, BackendError> {
-        Ok(self.lock_registry()?.iter().map(|inst| inst.state.clone()).collect())
+        Ok(self.lock_registry()?.clone())
     }
 }
 
@@ -492,7 +455,7 @@ mod tests {
             joined.contains("--device virtio-blk,path=/nix/store/deadbeef-sandy-store.erofs"),
             "erofs store attached as a virtio-blk device: {joined}"
         );
-        assert!(joined.contains("readOnly"), "erofs store device is read-only: {joined}");
+        assert!(joined.contains("readonly"), "erofs store device is read-only: {joined}");
         Ok(())
     }
 

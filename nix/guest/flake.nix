@@ -45,6 +45,13 @@
           services.getty.autologinUser = "root";
           users.users.root.password = "";
 
+          # The login shell prints the READY_MARKER once it is up and reading, so
+          # sandy injects the command into a shell that is actually reading input —
+          # not during the getty→login handoff, which flushes pending tty input
+          # (the vfkit autologin race). The injected command runs under a bare
+          # `sh`, not a login shell, so it never re-prints the marker.
+          programs.bash.loginShellInit = "printf 'SANDY-READY\\n'";
+
           # Keep the guest tiny and fast to boot.
           documentation.enable = lib.mkForce false;
           boot.initrd.systemd.enable = lib.mkForce false;
