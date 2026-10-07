@@ -11,6 +11,8 @@
 //! - `--secret NAME=@PATH` → a [`sandy::SecretRef`] whose bytes come from the host file `PATH`
 //!   ([`sandy::SecretSource::File`]). The leading `@` marks a file source and is required.
 //! - `--env KEY=VALUE` → a `(KEY, VALUE)` pair. Env is never a secret channel (INV-1).
+//! - `--allow HOST:PORT` → one [`sandy::EgressRule`] in the [`sandy::AllowList`]; the egress boundary, not part of
+//!   [`RunSpec`] (the supervisor applies it around the boot).
 //! - `--cpu N`, `--mem MiB`, `--timeout SECS` → resource knobs.
 //! - the trailing `-- CMD ARGS...` → the guest command.
 //!
@@ -22,7 +24,7 @@
 
 use std::path::PathBuf;
 
-use sandy::{Grants, Mount, PlanError, RunSpec, SecretRef, SecretSource};
+use sandy::{AllowList, EgressRule, Grants, Mount, PlanError, RunSpec, SecretRef, SecretSource};
 
 /// Default wall-clock timeout when `--timeout` is omitted (5 minutes). Picked as
 /// a sane bound for an interactive foreground `run`; override with `--timeout`.
@@ -42,6 +44,8 @@ pub struct RunArgs {
     pub secrets: Vec<String>,
     /// `--env KEY=VALUE` occurrences, verbatim.
     pub env: Vec<String>,
+    /// `--allow HOST:PORT` occurrences, verbatim.
+    pub allow: Vec<String>,
     /// `--cpu N`.
     pub cpu: Option<u32>,
     /// `--mem MiB`.
@@ -66,6 +70,8 @@ pub struct JobPlan {
     pub secrets: Vec<SecretRef>,
     /// Extra environment variables (never secrets — INV-1).
     pub env: Vec<(String, String)>,
+    /// The egress allow-list enforced around the boot (empty = deny-all on Linux).
+    pub allow: AllowList,
     /// Optional vCPU count.
     pub cpu: Option<u32>,
     /// Optional memory budget in MiB.
@@ -122,6 +128,11 @@ pub fn parse_run(args: RunArgs) -> Result<JobPlan, PlanError> {
         .iter()
         .map(|raw| parse_env(raw))
         .collect::<Result<Vec<_>, _>>()?;
+    let rules = args
+        .allow
+        .iter()
+        .map(|raw| parse_allow(raw))
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(JobPlan {
         template: args.template,
@@ -129,6 +140,7 @@ pub fn parse_run(args: RunArgs) -> Result<JobPlan, PlanError> {
         mounts,
         secrets,
         env,
+        allow: AllowList { rules },
         cpu: args.cpu,
         mem: args.mem,
         timeout_secs: args.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS),
@@ -185,11 +197,76 @@ fn parse_env(raw: &str) -> Result<(String, String), PlanError> {
     Ok((key.to_string(), value.to_string()))
 }
 
+/// Parse one `--allow HOST:PORT` token into an [`EgressRule`].
+///
+/// The port must be a decimal `u16` (1..=65535); host must be non-empty. A
+/// missing `:`, empty host, or non-numeric / out-of-range port yields
+/// [`PlanError::Invalid`] — the allow-list is never a partial plan.
+fn parse_allow(raw: &str) -> Result<EgressRule, PlanError> {
+    let invalid = || PlanError::Invalid(format!("--allow `{raw}` must be HOST:PORT"));
+    // `rsplit_once` keeps a colon-bearing host (e.g. an IPv6 literal) intact: only
+    // the final `:PORT` is split off, and the port must parse as a `u16`.
+    let (host, port) = raw.rsplit_once(':').ok_or_else(invalid)?;
+    if host.is_empty() {
+        return Err(invalid());
+    }
+    let port: u16 = port.parse().map_err(|_| invalid())?;
+    if port == 0 {
+        // Port 0 fits a u16 but is not a routable TCP dport — reject it rather
+        // than compile a dead `tcp dport 0 accept` rule that permits nothing.
+        return Err(invalid());
+    }
+    Ok(EgressRule {
+        host: host.to_string(),
+        port,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use sandy::{PlanError, SecretSource};
 
     use super::{RunArgs, parse_run};
+
+    /// `--allow github.com:443` desugars to one [`EgressRule`] in the allow-list.
+    #[test]
+    fn allow_host_port_parses_one_egress_rule() -> anyhow::Result<()> {
+        let args = RunArgs {
+            template: "demo".to_string(),
+            allow: vec!["github.com:443".to_string()],
+            ..RunArgs::default()
+        };
+        let plan = parse_run(args).map_err(|e| anyhow::anyhow!("parse_run: {e}"))?;
+        assert_eq!(plan.allow.rules.len(), 1, "one --allow token is one rule");
+        let rule = plan.allow.rules.first().expect("one rule parsed");
+        assert_eq!(rule.host, "github.com");
+        assert_eq!(rule.port, 443);
+        Ok(())
+    }
+
+    /// Each malformed `--allow` token is rejected as an invalid plan (band 2),
+    /// never folded into a partial allow-list.
+    #[test]
+    fn malformed_allow_is_invalid_plan() {
+        for token in [
+            "no-colon",
+            ":443",
+            "github.com:",
+            "github.com:nope",
+            "github.com:70000",
+            "host:0",
+        ] {
+            let args = RunArgs {
+                template: "demo".to_string(),
+                allow: vec![token.to_string()],
+                ..RunArgs::default()
+            };
+            assert!(
+                matches!(parse_run(args), Err(PlanError::Invalid(_))),
+                "a malformed --allow `{token}` must yield PlanError::Invalid"
+            );
+        }
+    }
 
     /// `--mount HOST:GUEST:ro` desugars to a read-only [`Mount`] with the split
     /// host and guest paths.

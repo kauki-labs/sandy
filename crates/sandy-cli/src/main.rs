@@ -44,6 +44,9 @@ enum Command {
         /// `--env KEY=VALUE` (repeatable).
         #[arg(long = "env")]
         env: Vec<String>,
+        /// `--allow HOST:PORT` egress allow-list entry (repeatable).
+        #[arg(long = "allow")]
+        allow: Vec<String>,
         /// Optional vCPU count.
         #[arg(long)]
         cpu: Option<u32>,
@@ -98,6 +101,37 @@ fn host_backend() -> sandy_backend::QemuBackend {
     sandy_backend::QemuBackend::new()
 }
 
+/// A no-op egress applier for platforms with no per-VM boundary. On macOS
+/// `plan_egress` yields `NoBoundary`, so `enforce` never calls these — they exist
+/// only to satisfy the `EgressApplier` bound off the Linux path.
+#[cfg(not(target_os = "linux"))]
+struct NoEgress;
+
+#[cfg(not(target_os = "linux"))]
+impl sandy::EgressApplier for NoEgress {
+    fn apply(&self, _ruleset: &str) -> Result<(), CoreError> {
+        Ok(())
+    }
+
+    fn revert(&self) -> Result<(), CoreError> {
+        Ok(())
+    }
+}
+
+/// The Linux egress applier: `nft`-backed default-deny enforcement. The live load
+/// whose boundary an in-guest root flush cannot bypass is tier-3 (#29).
+#[cfg(target_os = "linux")]
+fn egress_applier() -> sandy::NftablesApplier {
+    sandy::NftablesApplier
+}
+
+/// The non-Linux egress applier: a no-op, because `plan_egress` yields
+/// `NoBoundary` off Linux and nothing is applied.
+#[cfg(not(target_os = "linux"))]
+fn egress_applier() -> NoEgress {
+    NoEgress
+}
+
 fn main() {
     let cli = Cli::parse();
     std::process::exit(dispatch(cli.command, cli.output));
@@ -137,6 +171,7 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
             mounts,
             secrets,
             env,
+            allow,
             cpu,
             mem,
             timeout,
@@ -147,6 +182,7 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
                 mounts,
                 secrets,
                 env,
+                allow,
                 cpu,
                 mem,
                 timeout,
@@ -160,7 +196,19 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
                 }
             };
             let backend = host_backend();
-            let report = match supervisor::run_job(&backend, &journal, &plan) {
+            // Egress is bracketed around the boot per platform: Linux enforces the
+            // nftables boundary, macOS has none (`plan_egress` → NoBoundary, so the
+            // no-op applier is never called). Cred stays WALLED: the real
+            // GitHub-App `InstallationTokenMinter` and `mint_run_token` bind in once
+            // the App is registered (#25/#26); there is no `--github-token` flag
+            // because no live minter exists to honor it yet.
+            let egress = egress_applier();
+            let egress_os = if cfg!(target_os = "macos") {
+                sandy::EgressOs::MacOs
+            } else {
+                sandy::EgressOs::Linux
+            };
+            let report = match supervisor::run_job(&backend, &journal, &plan, &egress, egress_os) {
                 Ok(report) => report,
                 Err(e) => {
                     eprintln!("sandy: run failed: {e}");

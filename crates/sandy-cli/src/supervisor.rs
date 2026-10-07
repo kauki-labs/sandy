@@ -7,12 +7,14 @@
 //! management ops; all liveness goes through [`reconcile_job`], never a direct
 //! registry read (INV-3).
 
-use std::{collections::HashSet, time::SystemTime};
+use std::{collections::HashSet, path::Path, time::SystemTime};
 
 use sandy::{
-    Classification, CoreError, JOURNAL_SCHEMA_VERSION, JobRecord, JobState, Journal, Logs, OutputStatus, ProcessExit,
-    Provenance, RESULT_SCHEMA_VERSION, ResultEnvelope, StagedImage, Status, VmBackend, classify_backend_error,
-    classify_invalid_plan, classify_outcome, new_job_id, plan_eviction, reconcile_job, validate_no_secret_leak,
+    Classification, CoreError, EgressApplier, EgressOs, EgressOutcome, InstallationTokenMinter, JOURNAL_SCHEMA_VERSION,
+    JobRecord, JobState, Journal, Logs, OutputStatus, ProcessExit, Provenance, RESULT_SCHEMA_VERSION, ResultEnvelope,
+    SecretRef, StagedImage, Status, TokenScope, VmBackend, classify_backend_error, classify_invalid_plan,
+    classify_outcome, enforce, mint_token, new_job_id, plan_egress, plan_eviction, reconcile_job,
+    validate_no_secret_leak,
 };
 
 use crate::plan::JobPlan;
@@ -67,18 +69,29 @@ pub struct RunReport {
     pub process_exit: ProcessExit,
 }
 
-/// Run one job to completion in the foreground.
+/// Run one job to completion in the foreground, bracketing the boot with the
+/// egress boundary.
 ///
 /// Order (INV-6): validate the plan (an invalid plan returns band 2 with **no**
-/// journal record and **no** backend run); else write a `Running` record, run the
-/// backend, classify the outcome, then write the terminal record carrying the
-/// envelope and return the band.
+/// journal record and **no** backend run); else write a `Running` record, apply
+/// the egress boundary (`plan_egress` + `enforce`), run the backend, revert the
+/// boundary if it was enforced (on both the ok and error paths, so a boot failure
+/// never leaves rules applied), classify the outcome, then write the terminal
+/// record carrying the envelope and return the band. A `NoBoundary`/`Unenforced`
+/// run (macOS) applies and reverts nothing.
 ///
 /// # Errors
 ///
-/// Returns [`CoreError`] only on genuine journal I/O failure; every run-outcome or
-/// plan error is folded into the envelope and band, not the `Err` arm.
-pub fn run_job<B: VmBackend>(backend: &B, journal: &Journal, plan: &JobPlan) -> Result<RunReport, CoreError> {
+/// Returns [`CoreError`] on genuine journal I/O failure, or when applying the
+/// egress boundary fails (an infra fault before boot). Every run-outcome or plan
+/// error is folded into the envelope and band, not the `Err` arm.
+pub fn run_job<B: VmBackend, E: EgressApplier>(
+    backend: &B,
+    journal: &Journal,
+    plan: &JobPlan,
+    egress: &E,
+    egress_os: EgressOs,
+) -> Result<RunReport, CoreError> {
     let spec = plan.as_run_spec();
 
     // 1. Validate the plan. An invalid plan is band 2 with NO journal record and NO backend run — the running record is
@@ -106,8 +119,23 @@ pub fn run_job<B: VmBackend>(backend: &B, journal: &Journal, plan: &JobPlan) -> 
     };
     journal.write_record(&running)?;
 
-    // 3. Run the backend and classify the physical outcome.
-    let (classification, guest_exit, message) = match backend.run(&spec) {
+    // 3. Apply the egress boundary around the boot. On Linux this loads the default-deny ruleset; on macOS
+    //    `plan_egress` yields `NoBoundary`, so `enforce` applies nothing and warns. A failure to apply is an infra
+    //    fault before boot — surface it rather than boot with no boundary.
+    let eplan = plan_egress(&plan.allow, egress_os);
+    let eoutcome = enforce(&eplan, egress)?;
+
+    // 4. Run the backend, then ALWAYS revert if the boundary was enforced — on both the ok and error paths, so a boot
+    //    failure never leaves nftables rules up.
+    let run_result = backend.run(&spec);
+    if matches!(eoutcome, EgressOutcome::Enforced) {
+        if let Err(e) = egress.revert() {
+            tracing::warn!(%e, "egress revert failed");
+        }
+    }
+
+    // 5. Classify the physical outcome.
+    let (classification, guest_exit, message) = match run_result {
         Err(backend_error) => {
             tracing::warn!(%job_id, error = %backend_error, "backend run failed (infra fault)");
             (
@@ -127,7 +155,7 @@ pub fn run_job<B: VmBackend>(backend: &B, journal: &Journal, plan: &JobPlan) -> 
         }
     };
 
-    // 4. Write the terminal record carrying the envelope (INV-6).
+    // 6. Write the terminal record carrying the envelope (INV-6).
     let envelope = build_envelope(&job_id, None, classification, guest_exit, message);
     let terminal = JobRecord {
         schema_version: JOURNAL_SCHEMA_VERSION,
@@ -144,6 +172,27 @@ pub fn run_job<B: VmBackend>(backend: &B, journal: &Journal, plan: &JobPlan) -> 
         envelope,
         process_exit: classification.process_exit,
     })
+}
+
+/// Mint a scoped installation token and stage it as a `0600` [`SecretRef`] for a
+/// run — a host/pre-run step, kept separate from [`run_job`] (the token is minted
+/// before the plan is assembled, then threaded in as a secret).
+///
+/// Wraps [`sandy::mint_token`], mapping a [`sandy::CredError`] into
+/// [`CoreError::Cred`]: a mint failure is an infra fault the caller must fail on,
+/// never a run with no token (INV-7).
+///
+/// # Errors
+///
+/// Returns [`CoreError::Cred`] when minting or staging the token fails.
+pub fn mint_run_token<M: InstallationTokenMinter>(
+    minter: &M,
+    scope: &TokenScope,
+    secret_name: &str,
+    out_dir: &Path,
+    requested_ttl_secs: u32,
+) -> Result<SecretRef, CoreError> {
+    mint_token(minter, scope, requested_ttl_secs, secret_name, out_dir).map_err(|e| CoreError::Cred(e.to_string()))
 }
 
 /// List every job record (`journal.list()`).
@@ -268,7 +317,7 @@ pub fn gc(journal: &Journal, keep_last_n: usize) -> Result<Vec<String>, CoreErro
 #[cfg(test)]
 mod tests {
     use anyhow::Context;
-    use sandy::{BackendError, FakeBackend, Grants, Journal, Outcome, ProcessExit};
+    use sandy::{AllowList, BackendError, EgressOs, FakeApplier, FakeBackend, Grants, Journal, Outcome, ProcessExit};
 
     use super::run_job;
     use crate::plan::JobPlan;
@@ -289,6 +338,7 @@ mod tests {
             mounts: vec![],
             secrets: vec![],
             env: vec![],
+            allow: AllowList::default(),
             cpu: None,
             mem: None,
             timeout_secs: 60,
@@ -318,6 +368,7 @@ mod tests {
                 source: SecretSource::File(shared),
             }],
             env: vec![],
+            allow: AllowList::default(),
             cpu: None,
             mem: None,
             timeout_secs: 60,
@@ -345,7 +396,14 @@ mod tests {
                 transport_error: None,
                 timed_out: false,
             });
-            let report = run_job(&backend, &journal, &booting_plan()).context("run_job (succeeded)")?;
+            let report = run_job(
+                &backend,
+                &journal,
+                &booting_plan(),
+                &FakeApplier::new(),
+                EgressOs::Linux,
+            )
+            .context("run_job (succeeded)")?;
             assert_eq!(report.process_exit.code(), ProcessExit::Succeeded.code());
             assert!(!report.envelope.retryable, "band 0 must not be retryable");
         }
@@ -358,7 +416,14 @@ mod tests {
                 transport_error: None,
                 timed_out: false,
             });
-            let report = run_job(&backend, &journal, &booting_plan()).context("run_job (task failure)")?;
+            let report = run_job(
+                &backend,
+                &journal,
+                &booting_plan(),
+                &FakeApplier::new(),
+                EgressOs::Linux,
+            )
+            .context("run_job (task failure)")?;
             assert_eq!(report.process_exit.code(), ProcessExit::TaskFailure.code());
             assert!(!report.envelope.retryable, "band 1 must not be retryable");
         }
@@ -366,7 +431,14 @@ mod tests {
         {
             let (_tmp, journal) = fresh_journal()?;
             let backend = FakeBackend::new().with_error(BackendError::Spawn("boom".to_string()));
-            let report = run_job(&backend, &journal, &booting_plan()).context("run_job (infra fault)")?;
+            let report = run_job(
+                &backend,
+                &journal,
+                &booting_plan(),
+                &FakeApplier::new(),
+                EgressOs::Linux,
+            )
+            .context("run_job (infra fault)")?;
             assert_eq!(report.process_exit.code(), ProcessExit::InfraFault.code());
             assert!(report.envelope.retryable, "band 3 must be retryable");
         }
@@ -379,7 +451,14 @@ mod tests {
                 transport_error: None,
                 timed_out: false,
             });
-            let report = run_job(&backend, &journal, &leaking_plan()).context("run_job (invalid plan)")?;
+            let report = run_job(
+                &backend,
+                &journal,
+                &leaking_plan(),
+                &FakeApplier::new(),
+                EgressOs::Linux,
+            )
+            .context("run_job (invalid plan)")?;
             assert_eq!(report.process_exit.code(), ProcessExit::InvalidPlan.code());
             assert!(!report.envelope.retryable, "band 2 must not be retryable");
         }
