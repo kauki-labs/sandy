@@ -7,10 +7,10 @@
 //! `nix flake check` never run it), and [`common::require_live`] refuses
 //! off-matrix rather than skip-and-greening a live scenario.
 //!
-//! Run it on the live host (a hypervisor on PATH), e.g. on the M2:
+//! Run it on the live host (a hypervisor on PATH), e.g. on an Apple-silicon host:
 //!   nix shell nixpkgs#vfkit -c \
 //!     env SANDY_LIVE=1 cargo nextest run -p sandy-cli --features live --test live_boot
-//! or on ws01 (x86_64/KVM): `nix shell nixpkgs#qemu -c env SANDY_LIVE=1 …`.
+//! or on a Linux/KVM host: `nix shell nixpkgs#qemu -c env SANDY_LIVE=1 …`.
 //!
 //! The egress-mechanism and scoped-cred rows (#23/#25) bind in here once those
 //! blocks land.

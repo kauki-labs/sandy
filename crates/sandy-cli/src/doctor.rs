@@ -227,7 +227,7 @@ mod tests {
     /// the darwin linux-builder) parses to both systems.
     #[test]
     fn parse_builder_systems_reads_the_machines_table() {
-        let machines = "ssh://teebor@host x86_64-linux /key 8 2 big-parallel - -\nssh://builder@linux-builder \
+        let machines = "ssh://user@host x86_64-linux /key 8 2 big-parallel - -\nssh://builder@linux-builder \
                         aarch64-linux /key 4 1 benchmark - -\n";
         let systems = parse_builder_systems(machines);
         assert!(systems.contains("aarch64-linux"));

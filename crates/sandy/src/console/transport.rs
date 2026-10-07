@@ -272,7 +272,7 @@ mod tests {
     //! spawns a subprocess and touches real pipe fds — out of the sandbox's
     //! tier-1 budget, run on the host (#26).
     //!
-    //! Tier-3 — real boots, PTY on an M2 and a pipe on a Linux node, proving the
+    //! Tier-3 — real boots, PTY on an Apple-silicon host and a pipe on a Linux node, proving the
     //! four distinct outcomes reproduce on both transports — is host-gated and
     //! not expressed as a sandbox test at all (INV-S9: never counted green from
     //! a fake). It binds into `cargo test --test live_boot` (#26).

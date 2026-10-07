@@ -18,7 +18,7 @@ const REV: &str = "nixos-24.05.abcdef0";
 const FORMAT: &str = "erofs";
 const SIG: &[u8] = b"detached-signature-bytes";
 
-/// Accept-or-reject signature double standing in for the KeePassXC-held key.
+/// Accept-or-reject signature double standing in for the operator-held key.
 struct StubVerifier {
     accept: bool,
 }

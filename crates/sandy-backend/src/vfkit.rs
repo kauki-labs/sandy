@@ -463,7 +463,7 @@ mod tests {
         Ok(())
     }
 
-    /// Tier-3 / host: a trivial RunSpec boots a real vfkit guest on an M2 under a
+    /// Tier-3 / host: a trivial RunSpec boots a real vfkit guest on an Apple-silicon host under a
     /// real PTY, returns a populated [`Outcome`], [`boxes`](VmBackend::boxes)
     /// lists the instance, and [`kill`](VmBackend::kill) tears it down — with the
     /// four distinct outcomes (booted+exit, `!booted`, `timed_out`,
@@ -471,7 +471,7 @@ mod tests {
     /// spawns a hypervisor and must never be counted green from a fake (INV-S9);
     /// it binds into #26.
     #[test]
-    #[ignore = "tier-3/host: boots a real vfkit guest on an M2; binds into #26 (INV-S9)"]
+    #[ignore = "tier-3/host: boots a real vfkit guest on an Apple-silicon host; binds into #26 (INV-S9)"]
     fn real_vfkit_boot_populates_outcome_and_registry() -> anyhow::Result<()> {
         let backend = VfkitBackend::new("vfkit");
         let command = ["true".to_string()];

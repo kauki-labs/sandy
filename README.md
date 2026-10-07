@@ -12,7 +12,7 @@ tooling is modelled on [`hoprnet/hopr-api`](https://github.com/hoprnet/hopr-api)
 Early development, Phase A. The CLI (`doctor`, `run`/`ls`/`status`/`wait`/`kill`/
 `gc`), the journal + result envelope, the native backends, and the guest microVMs
 are in place; the guests boot and speak the console protocol on both legs (qemu on
-x86_64 Linux, vfkit on the Apple-silicon M2). Wiring the native spawn into a live
+x86_64 Linux, vfkit on an Apple-silicon host). Wiring the native spawn into a live
 `sandy run`, plus the `live_boot`/`host_matrix` acceptance gates, is in progress
 (#26/#27).
 

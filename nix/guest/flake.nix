@@ -20,8 +20,8 @@
       # that reads the injected command frame. coreutils (base64) and sh are in
       # the system path so the frame (`… | base64 -d | sh; printf 'exit=%d'`) runs.
       #
-      # `hypervisor` selects the backend: qemu (Linux/ws01, console ttyS0) or
-      # vfkit (macOS/M2, console hvc0). `vmHostPackages` is the host (darwin) pkgs
+      # `hypervisor` selects the backend: qemu (Linux, console ttyS0) or
+      # vfkit (macOS, console hvc0). `vmHostPackages` is the host (darwin) pkgs
       # the vfkit runner needs so its isDarwin check passes; null for qemu.
       commonModule =
         { lib, ... }:
@@ -80,13 +80,13 @@
           ];
         };
 
-      # qemu guest for the Linux node (ws01, x86_64-linux/KVM), console ttyS0.
+      # qemu guest for the Linux node (x86_64-linux/KVM), console ttyS0.
       qemuGuest = mkGuest {
         system = "x86_64-linux";
         hypervisor = "qemu";
       };
 
-      # vfkit guest for the M2 (aarch64-darwin host, aarch64-linux guest — vfkit
+      # vfkit guest for an Apple-silicon host (aarch64-darwin host, aarch64-linux guest — vfkit
       # requires matching arch), console hvc0. The kernel/initrd/erofs build on
       # the aarch64-linux linux-builder; the runner assembles on darwin.
       vfkitGuest = mkGuest {

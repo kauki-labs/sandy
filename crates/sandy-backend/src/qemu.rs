@@ -6,11 +6,12 @@
 //!
 //! - [`qemu_args`] — the pure assembler. Given a [`Topology`], a [`RunSpec`], and the already-[`StagedArgs`] (secret
 //!   share + [`mount_args`](sandy::mount_args) output), it builds the `qemu-system-<arch>` command vector with no IO.
-//!   Proven live on ws01 (x86_64, `/dev/kvm` world-rw): `sandy run` boots this argv to a `succeeded`/exit-0 result in
-//!   ~10s with `-nographic -serial chardev:sandy-serial console=ttyS0` and the sentinels on the serial socket.
+//!   Proven live on an x86_64 Linux/KVM host (`/dev/kvm` world-rw): `sandy run` boots this argv to a `succeeded`/exit-0
+//!   result in ~10s with `-nographic -serial chardev:sandy-serial console=ttyS0` and the sentinels on the serial
+//!   socket.
 //! - [`QemuBackend`] — the [`VmBackend`] seam. `run` stages secrets/mounts (#34), calls [`qemu_args`], spawns qemu with
 //!   serial on the #33 [`PipeTransport`](sandy::PipeTransport), drives [`run_console`](sandy::run_console), and
-//!   populates the pinned [`Outcome`]. The spawn/boot is host-tier (tier-3, ws01), not unit-tested in the sandbox.
+//!   populates the pinned [`Outcome`]. The spawn/boot is host-tier (tier-3), not unit-tested in the sandbox.
 //!
 //! The module is private; `sandy-backend`'s `lib.rs` re-exports only
 //! [`QemuBackend`], [`qemu_args`], and [`StagedArgs`].
@@ -552,13 +553,12 @@ mod tests {
         Ok(())
     }
 
-    /// Tier-3 (host-gated, ws01): a trivial job boots on a real Linux/KVM node
+    /// Tier-3 (host-gated, a Linux/KVM host): a trivial job boots on a real Linux/KVM node
     /// over the #33 pipe transport, returns a populated [`Outcome`], and
     /// `boxes`/`kill` work across the four distinct outcomes. Never run in the
     /// sandbox (INV-S9: no green from a fake); binds into #26/#27.
     #[test]
-    #[ignore = "tier-3: real qemu/KVM boot on a Linux node (ws01) over the pipe transport; host-gated, binds into \
-                #26/#27"]
+    #[ignore = "tier-3: real qemu/KVM boot on a Linux node over the pipe transport; host-gated, binds into #26/#27"]
     fn boots_a_trivial_job_on_kvm() -> anyhow::Result<()> {
         let backend = QemuBackend::new();
         let command = ["true".to_string()];

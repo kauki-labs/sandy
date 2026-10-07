@@ -6,16 +6,16 @@
 //! refusing off-matrix.
 //!
 //! Matrix coverage:
-//! - **NixOS / Nix-present host** (ws01 x86_64, and the M2 via the linux-builder): a real trivial boot → `classify` →
-//!   `HostNix` → a job runs. Covered live here.
+//! - **NixOS / Nix-present host** (x86_64, and an Apple-silicon host via the linux-builder): a real trivial boot →
+//!   `classify` → `HostNix` → a job runs. Covered live here.
 //! - **arch mismatch** → `Refuse` naming `arch`, no build: covered here via the real `classify`.
 //! - **BuilderVM / RemoteBuild selected at stage B → Refuse "requires stage C/D"**, and **Refuse propagation**: covered
 //!   tier-1 by the router's own tests (`sandy::provision` in `provision/router.rs`).
 //! - **non-NixOS Linux (+Nix / install→HostNix) and an unbootable host**: need host classes not available here; they
 //!   bind in when those nodes exist (the router logic for them is already classify-tested).
 //!
-//! Run (M2): `nix shell nixpkgs#vfkit -c env SANDY_LIVE=1 cargo nextest run -p sandy-cli --features live --test
-//! host_matrix` or ws01: `nix shell nixpkgs#qemu  -c env SANDY_LIVE=1 …`.
+//! Run (an Apple-silicon host): `nix shell nixpkgs#vfkit -c env SANDY_LIVE=1 cargo nextest run -p sandy-cli --features
+//! live --test host_matrix` or a Linux host: `nix shell nixpkgs#qemu  -c env SANDY_LIVE=1 …`.
 #![cfg(feature = "live")]
 
 use anyhow::Context;

@@ -225,7 +225,7 @@ impl Protocol {
         // 2. [`parse_exit`] reads `exit=` from the first line after END, so END must be immediately followed by
         //    `exit=<n>` with no blank line.
         //
-        // Both were found on a live ws01 boot (see `nix/guest/`).
+        // Both were found on a live boot (see `nix/guest/`).
         format!(
             "{start}; printf '%s' '{encoded}' | base64 -d | sh; __rc=$?; {end}; printf 'exit=%d\\n' \"$__rc\"\n",
             start = emit_sentinel(&markers.start),
@@ -523,7 +523,7 @@ mod tests {
         Ok(())
     }
 
-    /// Regression for the two live-boot bugs (found on a real ws01 boot, and
+    /// Regression for the two live-boot bugs (found on a real a Linux/KVM host boot, and
     /// invisible to the hand-built `scripted` fixtures because they never call
     /// [`Protocol::build_frame`]):
     ///
