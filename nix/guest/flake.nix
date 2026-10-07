@@ -14,59 +14,89 @@
       microvm,
     }:
     let
-      system = "x86_64-linux";
-      pkgs = nixpkgs.legacyPackages.${system};
-
       # A minimal microVM that speaks the sandy console protocol:
       # hostName "sandy" makes getty print the `sandy login:` banner that is the
-      # pinned READY_MARKER; autologin drops to a root shell on ttyS0 that reads
-      # the injected command frame. base64/coreutils/sh are in the system path so
-      # the frame (`… | base64 -d | sh; printf 'exit=%d' "$?"`) runs.
-      guest = nixpkgs.lib.nixosSystem {
-        inherit system;
-        modules = [
-          microvm.nixosModules.microvm
-          (
-            { lib, ... }:
-            {
-              networking.hostName = "sandy";
-              system.stateVersion = "24.11";
+      # pinned READY_MARKER; autologin drops to a root shell on the serial console
+      # that reads the injected command frame. coreutils (base64) and sh are in
+      # the system path so the frame (`… | base64 -d | sh; printf 'exit=%d'`) runs.
+      #
+      # `hypervisor` selects the backend: qemu (Linux/ws01, console ttyS0) or
+      # vfkit (macOS/M2, console hvc0). `vmHostPackages` is the host (darwin) pkgs
+      # the vfkit runner needs so its isDarwin check passes; null for qemu.
+      commonModule =
+        { lib, ... }:
+        {
+          networking.hostName = "sandy";
+          system.stateVersion = "24.11";
 
-              microvm = {
-                hypervisor = "qemu";
-                vcpu = 2;
-                mem = 512;
-                graphics.enable = false;
-                # Back the store as an on-disk erofs image (not the default
-                # host-store virtiofs share): sandy's qemu backend attaches the
-                # store as a read-only virtio-blk drive and refuses a virtiofs
-                # store, so the guest must carry its own store image.
-                storeOnDisk = true;
-              };
+          microvm = {
+            vcpu = 2;
+            mem = 512;
+            graphics.enable = false;
+            # Back the store as an on-disk erofs image (not the default
+            # host-store virtiofs share): sandy's backends attach the store as a
+            # read-only block device and refuse a virtiofs store.
+            storeOnDisk = true;
+          };
 
-              # Serial console on ttyS0 (sandy drives -serial/-nographic there).
-              boot.kernelParams = [ "console=ttyS0" ];
+          # Autologin root on the serial console so the injected frame lands in a
+          # shell, not a password prompt. microvm.nix points the guest console at
+          # the hypervisor's serial device (ttyS0 for qemu, hvc0 for vfkit).
+          services.getty.autologinUser = "root";
+          users.users.root.password = "";
 
-              # Autologin root on every console so the injected frame lands in a
-              # shell, not a password prompt.
-              services.getty.autologinUser = "root";
-              users.users.root.password = "";
+          # Keep the guest tiny and fast to boot.
+          documentation.enable = lib.mkForce false;
+          boot.initrd.systemd.enable = lib.mkForce false;
+        };
 
-              # Keep the guest tiny and fast to boot.
-              documentation.enable = lib.mkForce false;
-              boot.initrd.systemd.enable = lib.mkForce false;
-            }
-          )
-        ];
+      mkGuest =
+        {
+          system,
+          hypervisor,
+          vmHostPackages ? null,
+        }:
+        nixpkgs.lib.nixosSystem {
+          inherit system;
+          modules = [
+            microvm.nixosModules.microvm
+            commonModule
+            (
+              { lib, ... }:
+              {
+                microvm.hypervisor = hypervisor;
+                # The vfkit runner is a darwin script driving a Linux guest, so it
+                # needs the host (darwin) package set; qemu runs on the Linux host.
+                microvm.vmHostPackages = lib.mkIf (vmHostPackages != null) vmHostPackages;
+              }
+            )
+          ];
+        };
+
+      # qemu guest for the Linux node (ws01, x86_64-linux/KVM), console ttyS0.
+      qemuGuest = mkGuest {
+        system = "x86_64-linux";
+        hypervisor = "qemu";
+      };
+
+      # vfkit guest for the M2 (aarch64-darwin host, aarch64-linux guest — vfkit
+      # requires matching arch), console hvc0. The kernel/initrd/erofs build on
+      # the aarch64-linux linux-builder; the runner assembles on darwin.
+      vfkitGuest = mkGuest {
+        system = "aarch64-linux";
+        hypervisor = "vfkit";
+        vmHostPackages = nixpkgs.legacyPackages.aarch64-darwin;
       };
     in
     {
-      # microvm.nix's own runner — used to prove the guest boots and speaks the
+      # microvm.nix's own runners — used to prove each guest boots and speaks the
       # protocol before sandy's backend drives it.
-      packages.${system}.guest-runner = guest.config.microvm.declaredRunner;
+      packages.x86_64-linux.guest-runner = qemuGuest.config.microvm.declaredRunner;
+      packages.aarch64-darwin.guest-runner-vfkit = vfkitGuest.config.microvm.declaredRunner;
 
-      # The built guest config, so the topology module can read kernel/initrd/
-      # store off it (added next).
-      nixosConfigurations.sandy-guest = guest;
+      # The built guest configs, so the topology module can read kernel/initrd/
+      # store off them (added next).
+      nixosConfigurations.sandy-guest-qemu = qemuGuest;
+      nixosConfigurations.sandy-guest-vfkit = vfkitGuest;
     };
 }
