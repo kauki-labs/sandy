@@ -17,7 +17,7 @@ path = "src/main.rs"
 workspace = true
 
 [features]
-# The phase_a / phase_b live acceptance gates (tier-3, #26/#27). Off by default so
+# The live_boot / host_matrix live acceptance gates (tier-3, #26/#27). Off by default so
 # CI and `nix flake check` never try to boot a VM; enable on the live host.
 live = []
 

@@ -1,4 +1,4 @@
-//! Phase A — the live M2/ws01 acceptance gate (#26).
+//! Live boot — the native-boot acceptance gate (#26, formerly phase_a).
 //!
 //! Tier-3: instantiates the *physical* code — a real guest boots through the
 //! native backend, output is collected, the box is torn down, and the CLI job
@@ -9,7 +9,7 @@
 //!
 //! Run it on the live host (a hypervisor on PATH), e.g. on the M2:
 //!   nix shell nixpkgs#vfkit -c \
-//!     env SANDY_LIVE=1 cargo nextest run -p sandy-cli --features live --test phase_a
+//!     env SANDY_LIVE=1 cargo nextest run -p sandy-cli --features live --test live_boot
 //! or on ws01 (x86_64/KVM): `nix shell nixpkgs#qemu -c env SANDY_LIVE=1 …`.
 //!
 //! The egress-mechanism and scoped-cred rows (#23/#25) bind in here once those

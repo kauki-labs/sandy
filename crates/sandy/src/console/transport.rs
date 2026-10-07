@@ -224,7 +224,7 @@ mod tests {
     //! Tier-3 — real boots, PTY on an M2 and a pipe on a Linux node, proving the
     //! four distinct outcomes reproduce on both transports — is host-gated and
     //! not expressed as a sandbox test at all (INV-S9: never counted green from
-    //! a fake). It binds into `cargo test --test phase_a` (#26).
+    //! a fake). It binds into `cargo test --test live_boot` (#26).
     use super::*;
 
     /// The pipe transport drives the protocol over any byte channel; an in-memory

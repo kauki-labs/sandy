@@ -1,4 +1,4 @@
-//! Phase B — the host-matrix acceptance gate (#27).
+//! Host matrix — the provisioning-router acceptance gate (#27, formerly phase_b).
 //!
 //! Tier-3: the *real* router (`classify`) over a *real* boot observation decides
 //! the strategy, and the live legs run a job through the native backend (S9).
@@ -15,7 +15,7 @@
 //!   bind in when those nodes exist (the router logic for them is already classify-tested).
 //!
 //! Run (M2): `nix shell nixpkgs#vfkit -c env SANDY_LIVE=1 cargo nextest run -p sandy-cli --features live --test
-//! phase_b` or ws01: `nix shell nixpkgs#qemu  -c env SANDY_LIVE=1 …`.
+//! host_matrix` or ws01: `nix shell nixpkgs#qemu  -c env SANDY_LIVE=1 …`.
 #![cfg(feature = "live")]
 
 use anyhow::Context;

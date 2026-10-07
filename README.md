@@ -13,7 +13,7 @@ Early development, Phase A. The CLI (`doctor`, `run`/`ls`/`status`/`wait`/`kill`
 `gc`), the journal + result envelope, the native backends, and the guest microVMs
 are in place; the guests boot and speak the console protocol on both legs (qemu on
 x86_64 Linux, vfkit on the Apple-silicon M2). Wiring the native spawn into a live
-`sandy run`, plus the `phase_a`/`phase_b` acceptance gates, is in progress
+`sandy run`, plus the `live_boot`/`host_matrix` acceptance gates, is in progress
 (#26/#27).
 
 ## Layout

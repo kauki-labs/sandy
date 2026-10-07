@@ -1,4 +1,4 @@
-//! Shared helpers for the live acceptance gates (phase_a / phase_b).
+//! Shared helpers for the live acceptance gates (live_boot / host_matrix).
 //!
 //! Only compiled into a gate binary that is itself behind the `live` feature, so
 //! these never reach CI. `dead_code` is allowed because not every gate uses every
