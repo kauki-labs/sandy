@@ -121,18 +121,18 @@ pub fn is_root() -> bool {
 /// Refuse unless this is a live host matrix node that can safely run the egress
 /// gate: Linux (host nftables), `SANDY_LIVE=1` with the qemu hypervisor on PATH
 /// (via [`require_live`]), running as root, and `nft` resolvable. Any gap bails —
-/// so phase_d is RED off-matrix, never skip-green (INV-S9). The whole gate loads
+/// so live_egress is RED off-matrix, never skip-green (INV-S9). The whole gate loads
 /// real host nftables and boots a guest on a tap, which is why root is required
 /// and why the caller runs it under `sudo`.
 pub fn require_live_root() -> anyhow::Result<LiveTarget> {
     if !cfg!(target_os = "linux") {
-        bail!("refusing: phase_d is a Linux-only egress gate (host nftables); this host is not Linux");
+        bail!("refusing: live_egress is a Linux-only egress gate (host nftables); this host is not Linux");
     }
     let target = require_live()?;
     if !is_root() {
         bail!(
-            "refusing: phase_d loads real host nftables and boots a guest on a tap — it must run as root (sudo); `id \
-             -u` is not 0"
+            "refusing: live_egress loads real host nftables and boots a guest on a tap — it must run as root (sudo); \
+             `id -u` is not 0"
         );
     }
     if !on_path("nft") {

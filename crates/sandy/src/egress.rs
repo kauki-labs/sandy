@@ -11,7 +11,7 @@
 //! [`enforce`] drives that plan over the [`EgressApplier`] seam — [`FakeApplier`]
 //! in tests, [`NftablesApplier`] (shells `nft -f -`) on a real Linux host. The
 //! live Linux enforcement — the real `nft` load whose boundary an in-guest root
-//! flush cannot bypass — is tier-3 and is asserted by `cargo test --test phase_d`
+//! flush cannot bypass — is tier-3 and is asserted by `cargo test --test live_egress`
 //! (#29); it is not exercised here.
 
 use std::cell::{Cell, RefCell};
@@ -324,7 +324,7 @@ impl EgressApplier for FakeApplier {
 /// This is intentionally thin and is **not** unit-tested: the behaviour that
 /// matters — that the loaded boundary holds against an in-guest root flush — is a
 /// live, root-only, host-tier assertion that binds into `cargo test --test
-/// phase_d` (#29), not something a unit test can observe.
+/// live_egress` (#29), not something a unit test can observe.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NftablesApplier;
 
