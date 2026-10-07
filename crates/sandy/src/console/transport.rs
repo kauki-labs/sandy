@@ -14,7 +14,7 @@
 //! Only the [`Transport`] seam is pinned so [`run_console`](super::run_console)
 //! and the backends can be written against it now.
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 
 use crate::backend::BackendError;
 
@@ -42,12 +42,12 @@ pub trait Transport {
     fn write(&mut self, bytes: &[u8]) -> Result<(), BackendError>;
 }
 
-/// The Linux/qemu pipe transport: the guest serial console on a plain pipe.
+/// The Linux/qemu pipe transport: the guest serial console on a byte channel.
 ///
-/// Holds the two halves of the guest's serial console as boxed byte streams.
-/// The host wiring that spawns qemu and hands over its console fds lands in #26;
-/// [`connect`](PipeTransport::connect) therefore reports host-deferral rather
-/// than fabricating a channel to a guest that has not been spawned.
+/// Holds the two halves of the guest's serial console as boxed byte streams. The
+/// backend owns the process spawn and the channel (a Unix-domain socket to qemu's
+/// serial chardev) and builds the transport over it with [`PipeTransport::new`];
+/// the transport only drives the sentinel protocol.
 pub struct PipeTransport {
     /// The readable half of the guest serial console.
     reader: Box<dyn Read + Send>,
@@ -62,24 +62,30 @@ impl std::fmt::Debug for PipeTransport {
 }
 
 impl PipeTransport {
-    /// Open the pipe transport over an already-spawned guest's console fds.
+    /// Build a pipe transport over an already-connected byte channel — the
+    /// backend's socket to the spawned hypervisor's serial chardev. The backend
+    /// owns the process spawn and the channel; the transport only drives the
+    /// sentinel protocol over it.
     ///
-    /// # Errors
-    ///
-    /// Returns [`BackendError::Transport`]: the console fds are supplied by the
-    /// qemu-spawn host wiring (#26), which is not wired into the sandbox build.
-    pub fn connect() -> Result<Self, BackendError> {
-        Err(BackendError::Transport(
-            "pipe transport requires the guest serial-console fds from the qemu spawn (host-wired in #26)".to_string(),
-        ))
+    /// The `reader` should carry a read timeout matching the run's deadline: a
+    /// timed-out read is reported as `Ok(0)` (see [`Transport::read`]), which the
+    /// driver treats as the deadline elapsing rather than a fault.
+    #[must_use]
+    pub fn new(reader: Box<dyn Read + Send>, writer: Box<dyn Write + Send>) -> Self {
+        Self { reader, writer }
     }
 }
 
 impl Transport for PipeTransport {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, BackendError> {
-        self.reader
-            .read(buf)
-            .map_err(|err| BackendError::Transport(format!("pipe read: {err}")))
+        match self.reader.read(buf) {
+            Ok(read) => Ok(read),
+            // A read timeout (the channel carries the run deadline) or EOF is
+            // reported as `Ok(0)`: the driver resolves it through the protocol's
+            // own timeout path, never as a fabricated transport fault.
+            Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => Ok(0),
+            Err(err) => Err(BackendError::Transport(format!("pipe read: {err}"))),
+        }
     }
 
     fn write(&mut self, bytes: &[u8]) -> Result<(), BackendError> {
@@ -169,17 +175,19 @@ mod tests {
     //! a fake). It binds into `cargo test --test phase_a` (#26).
     use super::*;
 
-    /// Tier-2: a fake serial subprocess speaks the sentinel protocol over a
-    /// pipe; [`PipeTransport`] + [`run_console`](crate::console::run_console)
-    /// must produce a clean, parsed outcome. Ignored: host-gated (spawns a
-    /// subprocess, real fds). RED until the pipe transport is implemented.
+    /// The pipe transport drives the protocol over any byte channel; an in-memory
+    /// pair stands in for the hypervisor's serial socket. The real boot over a
+    /// Unix socket to qemu is tier-3 (host), proven by a live `sandy run` (#26).
     #[test]
-    #[ignore = "tier-2: spawns a fake-serial subprocess over real pipe fds; host-gated (#26)"]
-    fn pipe_transport_against_fake_serial() {
-        let mut transport = PipeTransport::connect().expect("connect pipe transport");
-        // The fake-serial fixture + run_console wiring is filled in at the host
-        // tier; constructing the transport already exercises the seam.
-        let mut sink = [0u8; 64];
-        let _ = transport.read(&mut sink);
+    fn pipe_transport_reads_and_writes_over_a_channel() -> Result<(), BackendError> {
+        let reader = Box::new(std::io::Cursor::new(b"guest-says-hi".to_vec()));
+        let writer: Box<dyn Write + Send> = Box::new(Vec::new());
+        let mut transport = PipeTransport::new(reader, writer);
+
+        let mut buf = [0u8; 32];
+        let read = transport.read(&mut buf)?;
+        assert_eq!(&buf[..read], b"guest-says-hi");
+        transport.write(b"cmd")?;
+        Ok(())
     }
 }

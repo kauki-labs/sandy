@@ -16,9 +16,11 @@
 //! [`QemuBackend`], [`qemu_args`], and [`StagedArgs`].
 
 use std::{
+    os::unix::net::UnixStream,
     path::Path,
+    process::{Command, Stdio},
     sync::{Mutex, MutexGuard},
-    time::SystemTime,
+    time::{Duration, Instant, SystemTime},
 };
 
 use sandy::{
@@ -234,34 +236,103 @@ impl QemuBackend {
             .map_err(|_| BackendError::Protocol("qemu instance registry mutex poisoned".to_string()))
     }
 
-    /// Spawn qemu over the #33 pipe transport, register the instance, drive the
-    /// sentinel protocol, then deregister it.
+    /// Spawn qemu with its serial console on a Unix-socket chardev, register the
+    /// instance, drive the sentinel protocol, then tear qemu down and deregister.
     ///
-    /// The process spawn and serial-console fd handover are host-tier (#26),
-    /// encapsulated behind [`PipeTransport::connect`]; a failure to obtain the
-    /// channel is a [`BackendError::Spawn`], while a transport/timeout fault
-    /// during the run lands in the returned [`Outcome`] (never a fabricated
-    /// `guest_exit`, INV-OUTCOME).
-    fn boot(&self, spec: &RunSpec, args: &[String], run_id: Uuid) -> Result<Outcome, BackendError> {
-        tracing::debug!(?args, run_id = %run_id, "spawning qemu over the pipe transport");
-        let mut transport =
-            PipeTransport::connect().map_err(|err| BackendError::Spawn(format!("spawn qemu: {err}")))?;
+    /// The run is synchronous: the box lives only for this call. A spawn/dir fault
+    /// is a [`BackendError::Spawn`]; a connect/transport/timeout fault during the
+    /// run lands in the returned [`Outcome`] (never a fabricated `guest_exit`,
+    /// INV-OUTCOME).
+    fn boot(&self, spec: &RunSpec, args: &[String], run_id: Uuid, inst_dir: &Path) -> Result<Outcome, BackendError> {
+        std::fs::create_dir_all(inst_dir)
+            .map_err(|err| BackendError::Spawn(format!("create instance dir {}: {err}", inst_dir.display())))?;
+        let sock = inst_dir.join("serial.sock");
+
+        // qemu_args emits `-serial chardev:<id>`; bind that id to a Unix-socket
+        // chardev qemu creates (server=on, wait=off so the spawn doesn't block).
+        let mut argv = args.to_vec();
+        argv.push("-chardev".to_string());
+        argv.push(format!(
+            "socket,id={SERIAL_CHARDEV_ID},path={},server=on,wait=off",
+            sock.display()
+        ));
+
+        tracing::debug!(?argv, run_id = %run_id, "spawning qemu");
+        let mut child = Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|err| BackendError::Spawn(format!("spawn qemu `{}`: {err}", argv[0])))?;
 
         let box_id = run_id.to_string();
         self.registry()?.push(BoxState {
             box_id: box_id.clone(),
             box_name: spec.template.to_string(),
-            pid: std::process::id(),
+            pid: child.id(),
             started: SystemTime::now(),
             rvport: None,
         });
 
-        let markers = Markers::for_run(READY_MARKER, run_id);
-        let outcome = run_console(&mut transport, spec, &markers);
+        let outcome = drive_console(spec, run_id, &sock);
 
+        // Teardown: stop qemu and deregister. Best-effort kill — the child may
+        // already have exited (e.g. a guest `poweroff`).
+        let _ = child.kill();
+        let _ = child.wait();
         self.registry()?.retain(|state| state.box_id != box_id);
         Ok(outcome)
     }
+}
+
+/// An infra transport fault as an [`Outcome`] (no fabricated exit, INV-OUTCOME).
+fn transport_outcome(err: &BackendError) -> Outcome {
+    Outcome {
+        booted: false,
+        guest_exit: None,
+        transport_error: Some(err.to_string()),
+        timed_out: false,
+    }
+}
+
+/// Connect to `sock`, retrying until it exists or the (bounded) budget elapses —
+/// qemu creates the socket asynchronously after spawn.
+fn connect_serial(sock: &Path, budget: Duration) -> Result<UnixStream, BackendError> {
+    let deadline = Instant::now() + budget.min(Duration::from_secs(10));
+    loop {
+        match UnixStream::connect(sock) {
+            Ok(stream) => return Ok(stream),
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            Err(err) => {
+                return Err(BackendError::Transport(format!(
+                    "connect qemu serial {}: {err}",
+                    sock.display()
+                )));
+            }
+        }
+    }
+}
+
+/// Connect the guest serial socket and drive the console protocol to an
+/// [`Outcome`]. The socket read timeout carries the run deadline, so a silent
+/// guest resolves through the protocol's timeout path rather than blocking.
+fn drive_console(spec: &RunSpec, run_id: Uuid, sock: &Path) -> Outcome {
+    let budget = Duration::from_secs(u64::from(spec.timeout_secs.max(1)));
+    let stream = match connect_serial(sock, budget) {
+        Ok(stream) => stream,
+        Err(err) => return transport_outcome(&err),
+    };
+    if let Err(err) = stream.set_read_timeout(Some(budget)) {
+        return transport_outcome(&BackendError::Transport(format!("set serial read timeout: {err}")));
+    }
+    let reader = match stream.try_clone() {
+        Ok(reader) => reader,
+        Err(err) => return transport_outcome(&BackendError::Transport(format!("clone serial socket: {err}"))),
+    };
+    let mut transport = PipeTransport::new(Box::new(reader), Box::new(stream));
+    let markers = Markers::for_run(READY_MARKER, run_id);
+    run_console(&mut transport, spec, &markers)
 }
 
 impl VmBackend for QemuBackend {
@@ -281,7 +352,7 @@ impl VmBackend for QemuBackend {
             kvm: kvm_available(),
         };
 
-        let outcome = qemu_args(&topology, spec, &staged).and_then(|args| self.boot(spec, &args, run_id));
+        let outcome = qemu_args(&topology, spec, &staged).and_then(|args| self.boot(spec, &args, run_id, &inst_dir));
 
         // Teardown clears staging on every path so secret bytes never outlive
         // the run (INV-1), including the error path.
