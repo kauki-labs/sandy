@@ -21,4 +21,7 @@ pub enum CoreError {
     /// A journal record is in an unexpected state for the requested transition.
     #[error("invalid journal state: {0}")]
     State(String),
+    /// Applying or reverting an egress ruleset on the host failed.
+    #[error("egress enforcement failed: {0}")]
+    Egress(String),
 }

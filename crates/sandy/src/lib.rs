@@ -11,7 +11,9 @@
 //! - **Provisioning** — [`classify`] host facts into a [`ProvisioningStrategy`], then [`provision`] /
 //!   [`provision_remote_build`] / [`decide_fallback`] over the [`HostNixProvisioner`] and [`RemoteBuilder`] seams.
 //! - **Seed identity** — [`acquire`] a [`VerifiedSeed`] via a [`SignatureVerifier`].
-//! - **Egress** — [`to_nftables`] translation and [`macos_egress_statement`].
+//! - **Egress** — [`to_nftables`] translation and [`macos_egress_statement`]; [`plan_egress`] into a typed
+//!   [`EgressPlan`] (Linux enforces, macOS is honestly unenforced), driven by [`enforce`] over the [`EgressApplier`]
+//!   seam ([`FakeApplier`] / host-tier [`NftablesApplier`]).
 //! - **Nix topology** — a typed [`Topology`] read from a guest flake attr via [`topology`] / [`parse_topology`]
 //!   (INV-TOPOLOGY).
 //! - **Console driver** — the sentinel [`Protocol`] (boot → inject → capture → exit) over a platform [`Transport`],
@@ -49,7 +51,10 @@ pub use config::CollectionConfig;
 pub use console::{
     Markers, PipeTransport, Protocol, ProtocolStep, PtyTransport, TimeoutPolicy, Transport, parse_exit, run_console,
 };
-pub use egress::{AllowList, EgressRule, macos_egress_statement, to_nftables};
+pub use egress::{
+    AllowList, EgressApplier, EgressOs, EgressOutcome, EgressPlan, EgressRule, FakeApplier, NftablesApplier, enforce,
+    macos_egress_statement, plan_egress, to_nftables,
+};
 pub use error::CoreError;
 pub use gc::{StagedImage, plan_eviction};
 pub use journal::{JobLock, Journal, detect_fs_type, ensure_local_posix_fs, is_networked_fs, new_job_id};
