@@ -7,7 +7,11 @@
 //! fully populated from a real eval or a typed [`BackendError`] — a missing
 //! required field is a hard error, never a silent default.
 
-use std::{path::PathBuf, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use serde::Deserialize;
 
@@ -102,30 +106,45 @@ pub fn parse_topology(json: &[u8]) -> Result<Topology, BackendError> {
     serde_json::from_slice::<Topology>(json).map_err(|e| BackendError::Protocol(e.to_string()))
 }
 
-/// Evaluate `flake_attr` with the Nix CLI and parse the resulting topology.
+/// Resolve `source` into a typed [`Topology`], Nix-free when it is a prebuilt
+/// JSON file.
 ///
-/// Shells `nix eval`/`nix build … --json` (ambient ssh builders from #37 carry
-/// x86_64), then hands the JSON to [`parse_topology`]. The Nix invocation is the
-/// tier-2/host concern and is not unit-tested in the sandbox; a transient eval
-/// failure maps to [`BackendError::Transport`] (retryable), a malformed result
-/// to [`BackendError::Protocol`].
+/// Two paths, chosen by whether `source` names an existing file:
+///
+/// - **Nix-free (#28)**: when `source` is an existing file, its bytes are read and handed straight to
+///   [`parse_topology`] — no `nix` process is spawned. This is the "erofs hinge": `sandy run /path/to/topology.json --
+///   …` boots with Nix entirely off `PATH`, provided the kernel/initrd/erofs-store paths the JSON names already exist
+///   in the store (prebuilt at build time).
+/// - **Nix eval**: otherwise `source` is treated as a flake attr and evaluated with `nix eval --json` (ambient ssh
+///   builders from #37 carry x86_64), then its JSON is parsed. This is the tier-2/host concern, not unit-tested in the
+///   sandbox.
+///
+/// A transient eval failure maps to [`BackendError::Transport`] (retryable), a
+/// malformed result (either path) to [`BackendError::Protocol`].
 ///
 /// # Errors
 ///
-/// Returns [`BackendError::Transport`] if the `nix` invocation fails
-/// transiently, or [`BackendError::Protocol`] if its output is not a complete
-/// topology.
-pub fn topology(flake_attr: &str) -> Result<Topology, BackendError> {
-    tracing::debug!(flake_attr, "evaluating guest topology via `nix eval --json`");
+/// Returns [`BackendError::Transport`] if a prebuilt file cannot be read or the
+/// `nix` invocation fails transiently, or [`BackendError::Protocol`] if the
+/// resulting JSON is not a complete topology.
+pub fn topology(source: &str) -> Result<Topology, BackendError> {
+    if Path::new(source).is_file() {
+        tracing::debug!(source, "reading prebuilt guest topology (Nix-free, #28)");
+        let json = fs::read(source)
+            .map_err(|e| BackendError::Transport(format!("failed to read topology file {source}: {e}")))?;
+        return parse_topology(&json);
+    }
+
+    tracing::debug!(source, "evaluating guest topology via `nix eval --json`");
     let output = Command::new("nix")
-        .args(["eval", "--json", flake_attr])
+        .args(["eval", "--json", source])
         .output()
-        .map_err(|e| BackendError::Transport(format!("failed to spawn `nix eval {flake_attr}`: {e}")))?;
+        .map_err(|e| BackendError::Transport(format!("failed to spawn `nix eval {source}`: {e}")))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(BackendError::Transport(format!(
-            "`nix eval {flake_attr}` failed ({}): {}",
+            "`nix eval {source}` failed ({}): {}",
             output.status,
             stderr.trim()
         )));
@@ -198,6 +217,54 @@ mod tests {
             parse_topology(b"not json at all {"),
             Err(BackendError::Protocol(_))
         ));
+    }
+
+    /// Tier-1 (#28): a prebuilt topology JSON file is read and parsed by
+    /// `topology` with no `nix` process — the Nix-free hinge. Writing the x86_64
+    /// fixture to a temp file and passing its path yields the same `Topology` the
+    /// pure parse seam produces, proving the file branch bypasses `nix eval`.
+    #[test]
+    fn prebuilt_file_boots_nix_free() -> anyhow::Result<()> {
+        use std::io::Write;
+
+        use anyhow::Context;
+
+        let mut file = tempfile::Builder::new()
+            .suffix(".json")
+            .tempfile()
+            .context("create temp topology file")?;
+        file.write_all(X86_64_FIXTURE).context("write fixture")?;
+        let path = file.path().to_str().context("temp path is utf-8")?;
+
+        let topology = topology(path).context("read prebuilt topology Nix-free")?;
+        assert_eq!(topology.hypervisor, Hypervisor::Qemu);
+        assert_eq!(
+            topology.store,
+            StoreBacking::ErofsImage(PathBuf::from(
+                "/nix/store/1q2w3r4y5a6s7d8f9g0hjklzxcvbnm12-sandy-store.erofs"
+            ))
+        );
+        Ok(())
+    }
+
+    /// Tier-1 adversarial (#28): a prebuilt file that exists but holds malformed
+    /// JSON is a `Protocol` error from the file branch — the Nix-free path still
+    /// never fabricates a `Topology` (INV-TOPOLOGY).
+    #[test]
+    fn prebuilt_file_with_garbage_is_a_protocol_error() -> anyhow::Result<()> {
+        use std::io::Write;
+
+        use anyhow::Context;
+
+        let mut file = tempfile::Builder::new()
+            .suffix(".json")
+            .tempfile()
+            .context("create temp topology file")?;
+        file.write_all(b"not json at all {").context("write garbage")?;
+        let path = file.path().to_str().context("temp path is utf-8")?;
+
+        assert!(matches!(topology(path), Err(BackendError::Protocol(_))));
+        Ok(())
     }
 
     /// Tier-2/host: a real `nix eval --json` of a dev-VM attr yields a complete

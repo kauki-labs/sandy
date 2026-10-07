@@ -69,6 +69,44 @@ pub fn on_path(program: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(program).is_file()))
 }
 
+/// Whether `program` resolves on the given `path` value (a `PATH`-shaped string).
+/// The adversarial check for the Nix-free gate: `is_on(path, "nix")` must be false
+/// before a "boot invoked no Nix" claim can be trusted.
+pub fn is_on(path: &std::ffi::OsStr, program: &str) -> bool {
+    std::env::split_paths(path).any(|dir| dir.join(program).is_file())
+}
+
+/// This process's `PATH` with every directory that contains a `nix` binary
+/// removed — the environment the Nix-free boot (#28) runs under. The hypervisor
+/// (vfkit) stays reachable; `nix` does not, so a green can't come from Nix
+/// sneaking back onto `PATH`.
+pub fn nix_free_path() -> std::ffi::OsString {
+    let current = std::env::var_os("PATH").unwrap_or_default();
+    let kept: Vec<PathBuf> = std::env::split_paths(&current)
+        .filter(|dir| !dir.join("nix").is_file())
+        .collect();
+    std::env::join_paths(kept).unwrap_or(current)
+}
+
+/// Evaluate `<guest-flake>#<topology_attr>` with `nix eval --json` and write the
+/// topology JSON to `out`. This is the one Nix step the Nix-free gate takes, at
+/// setup time; the boot that follows reads this file with no Nix on `PATH`.
+pub fn emit_topology(topology_attr: &str, out: &Path) -> anyhow::Result<()> {
+    let attr = format!("{}#{}", guest_flake().display(), topology_attr);
+    let output = Command::new("nix")
+        .args(["eval", "--json", &attr])
+        .output()
+        .context("spawn nix eval for the topology")?;
+    if !output.status.success() {
+        bail!(
+            "nix eval of {attr} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    std::fs::write(out, &output.stdout).with_context(|| format!("write topology JSON to {}", out.display()))?;
+    Ok(())
+}
+
 /// Realise the guest closure (kernel/initrd/erofs) so the topology paths exist
 /// when the backend boots.
 pub fn build_guest(target: &LiveTarget) -> anyhow::Result<()> {
