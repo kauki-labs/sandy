@@ -379,6 +379,54 @@ fn run_on_linux_applies_the_allow_list_ruleset_and_reverts_it() -> anyhow::Resul
     Ok(())
 }
 
+/// An egress applier whose `apply` always fails, to drive the fail-closed path.
+struct FailingApplier;
+impl sandy::EgressApplier for FailingApplier {
+    fn apply(&self, _ruleset: &str) -> Result<(), CoreError> {
+        Err(CoreError::Egress("nft apply refused".to_string()))
+    }
+
+    fn revert(&self) -> Result<(), CoreError> {
+        Ok(())
+    }
+}
+
+/// If the egress boundary cannot be applied, the run fails CLOSED: a terminal
+/// infra-fault (band 3) record is written naming the boundary, the backend is
+/// never booted, and no `Running` record is left dangling (INV-6).
+#[test]
+fn egress_apply_failure_fails_closed_with_a_terminal_record() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    // A success is scripted on purpose: band 3 here proves the boot was skipped.
+    let backend = FakeBackend::new().with_outcome(ok_outcome(0));
+
+    let report = run_job(&backend, &journal, &allowing_plan(), &FailingApplier, EgressOs::Linux)
+        .context("run_job (egress apply fails)")?;
+
+    assert_eq!(
+        report.process_exit.code(),
+        3,
+        "an unestablished boundary is an infra fault"
+    );
+    assert_eq!(report.envelope.status, Status::Failed);
+    assert!(report.envelope.retryable, "band 3 is retryable");
+    assert!(
+        report.envelope.message.contains("egress boundary"),
+        "the message must name the egress failure: {}",
+        report.envelope.message
+    );
+    // No dangling Running: the job's on-disk record is terminal, not Running.
+    let record = journal
+        .read_record(&report.envelope.job_id)
+        .context("terminal record on disk")?;
+    assert_eq!(
+        record.state,
+        JobState::Failed,
+        "an egress failure must write a terminal record, not leave Running"
+    );
+    Ok(())
+}
+
 /// #24: a macOS run applies no boundary (vmnet has none), yet the run still
 /// succeeds — the honest `NoBoundary` path, not a silent failure.
 #[test]

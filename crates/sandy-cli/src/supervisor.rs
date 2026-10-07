@@ -10,11 +10,11 @@
 use std::{collections::HashSet, path::Path, time::SystemTime};
 
 use sandy::{
-    Classification, CoreError, EgressApplier, EgressOs, EgressOutcome, InstallationTokenMinter, JOURNAL_SCHEMA_VERSION,
-    JobRecord, JobState, Journal, Logs, OutputStatus, ProcessExit, Provenance, RESULT_SCHEMA_VERSION, ResultEnvelope,
-    SecretRef, StagedImage, Status, TokenScope, VmBackend, classify_backend_error, classify_invalid_plan,
-    classify_outcome, enforce, mint_token, new_job_id, plan_egress, plan_eviction, reconcile_job,
-    validate_no_secret_leak,
+    BackendError, Classification, CoreError, EgressApplier, EgressOs, EgressOutcome, InstallationTokenMinter,
+    JOURNAL_SCHEMA_VERSION, JobRecord, JobState, Journal, Logs, Outcome, OutputStatus, ProcessExit, Provenance,
+    RESULT_SCHEMA_VERSION, ResultEnvelope, SecretRef, StagedImage, Status, TokenScope, VmBackend,
+    classify_backend_error, classify_invalid_plan, classify_outcome, enforce, mint_token, new_job_id, plan_egress,
+    plan_eviction, reconcile_job, validate_no_secret_leak,
 };
 
 use crate::plan::JobPlan;
@@ -82,9 +82,9 @@ pub struct RunReport {
 ///
 /// # Errors
 ///
-/// Returns [`CoreError`] on genuine journal I/O failure, or when applying the
-/// egress boundary fails (an infra fault before boot). Every run-outcome or plan
-/// error is folded into the envelope and band, not the `Err` arm.
+/// Returns [`CoreError`] only on genuine journal I/O failure. Every run-outcome,
+/// plan, and egress-apply error is folded into the envelope and band — a failed
+/// egress boundary fails closed as a band-3 infra fault — not the `Err` arm.
 pub fn run_job<B: VmBackend, E: EgressApplier>(
     backend: &B,
     journal: &Journal,
@@ -120,19 +120,29 @@ pub fn run_job<B: VmBackend, E: EgressApplier>(
     journal.write_record(&running)?;
 
     // 3. Apply the egress boundary around the boot. On Linux this loads the default-deny ruleset; on macOS
-    //    `plan_egress` yields `NoBoundary`, so `enforce` applies nothing and warns. A failure to apply is an infra
-    //    fault before boot — surface it rather than boot with no boundary.
+    //    `plan_egress` yields `NoBoundary`, so `enforce` applies nothing and warns. If the boundary can't be applied we
+    //    fail CLOSED: do not boot, and treat it as an infra fault that lands a terminal record (band 3) rather than
+    //    leaving a dangling `Running` record.
+    // 4. On a successful apply, run the backend, then ALWAYS revert when the boundary was enforced — on both the ok and
+    //    error paths, so a boot failure never leaves nftables rules up.
     let eplan = plan_egress(&plan.allow, egress_os);
-    let eoutcome = enforce(&eplan, egress)?;
-
-    // 4. Run the backend, then ALWAYS revert if the boundary was enforced — on both the ok and error paths, so a boot
-    //    failure never leaves nftables rules up.
-    let run_result = backend.run(&spec);
-    if matches!(eoutcome, EgressOutcome::Enforced) {
-        if let Err(e) = egress.revert() {
-            tracing::warn!(%e, "egress revert failed");
+    let run_result: Result<Outcome, BackendError> = match enforce(&eplan, egress) {
+        Ok(eoutcome) => {
+            let outcome = backend.run(&spec);
+            if matches!(eoutcome, EgressOutcome::Enforced) {
+                if let Err(e) = egress.revert() {
+                    tracing::warn!(%e, "egress revert failed");
+                }
+            }
+            outcome
         }
-    }
+        Err(egress_error) => {
+            tracing::warn!(%job_id, %egress_error, "egress apply failed; refusing to boot (fail-closed)");
+            Err(BackendError::Spawn(format!(
+                "egress boundary not established: {egress_error}"
+            )))
+        }
+    };
 
     // 5. Classify the physical outcome.
     let (classification, guest_exit, message) = match run_result {
