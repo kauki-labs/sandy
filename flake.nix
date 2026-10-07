@@ -51,6 +51,18 @@
           rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
           craneLib = (inputs.crane.mkLib pkgs).overrideToolchain rustToolchain;
 
+          # Dev-shell-only toolchain: the same pinned channel plus the
+          # llvm-tools-preview component that cargo-llvm-cov needs to find
+          # llvm-profdata/llvm-cov in the rustc sysroot. rust-toolchain.toml is
+          # dependabot-managed and shared with CI, so it stays untouched; this
+          # override adds the component for the shell alone. craneLib (the build)
+          # keeps the unmodified toolchain.
+          covToolchain = rustToolchain.override { extensions = [ "llvm-tools-preview" ]; };
+          covCraneLib = (inputs.crane.mkLib pkgs).overrideToolchain covToolchain;
+
+          # Code-quality tools absent from nixpkgs (see nix/quality.nix).
+          qualityPackages = import ./nix/quality.nix { inherit pkgs lib; };
+
           # rustfmt.toml uses nightly-only options; format with a nightly rustfmt.
           nightlyRustfmt = pkgs.rust-bin.selectLatestNightlyWith (
             toolchain: toolchain.minimal.override { extensions = [ "rustfmt" ]; }
@@ -147,7 +159,10 @@
               ;
           };
 
-          devShells.default = craneLib.devShell {
+          # Built with covCraneLib so the toolchain on PATH carries
+          # llvm-tools-preview (for cargo-llvm-cov); the project itself still
+          # builds against the unmodified craneLib toolchain.
+          devShells.default = covCraneLib.devShell {
             inputsFrom = [ sandyPackages.sandy ];
             shellHook = config.pre-commit.installationScript;
             packages = [
@@ -159,6 +174,19 @@
               pkgs.cargo-shear
               pkgs.cargo-insta
               pkgs.gh
+              # code-quality skill tools from nixpkgs
+              pkgs.cargo-llvm-cov
+              pkgs.cargo-mutants
+              pkgs.cargo-machete
+              pkgs.cargo-public-api
+              pkgs.cargo-modules
+              pkgs.jq
+              # code-quality skill tools not in nixpkgs (nix/quality.nix)
+              qualityPackages.cargo-crap
+              qualityPackages.cargo-iceberg4rust
+              qualityPackages.cargo-anatomy
+              qualityPackages.rust-code-analysis-cli
+              qualityPackages.jscpd
             ];
           };
 
