@@ -24,4 +24,9 @@ pub enum CoreError {
     /// Applying or reverting an egress ruleset on the host failed.
     #[error("egress enforcement failed: {0}")]
     Egress(String),
+    /// Minting or staging a scoped credential failed (maps a `CredError` into the
+    /// core error type). An infra fault: the caller fails rather than running the
+    /// job with no token (INV-7).
+    #[error("credential minting failed: {0}")]
+    Cred(String),
 }
