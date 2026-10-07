@@ -16,6 +16,11 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+# The phase_a / phase_b live acceptance gates (tier-3, #26/#27). Off by default so
+# CI and `nix flake check` never try to boot a VM; enable on the live host.
+live = []
+
 [dependencies]
 clap.workspace = true
 sandy.workspace = true
