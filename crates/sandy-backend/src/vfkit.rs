@@ -18,7 +18,7 @@
 use std::{
     path::{Path, PathBuf},
     sync::Mutex,
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 use sandy::{
@@ -28,8 +28,9 @@ use sandy::{
 use uuid::Uuid;
 
 /// The guest boot-ready marker the console protocol scans for before injecting
-/// the command (the guest's login banner). The real banner is pinned by the host
-/// boot wiring (#26); it matches the console protocol's own fixture.
+/// the command: the guest's login shell prints it once it is up and reading (the
+/// guest's `loginShellInit`), so the injected frame lands in a reading shell
+/// rather than the getty→login handoff, which flushes pending tty input.
 const BOOT_READY_MARKER: &str = "SANDY-READY";
 
 /// The staged virtio-fs share descriptors [`vfkit_args`] weaves into the argv.
@@ -203,6 +204,9 @@ impl VfkitBackend {
         let args = vfkit_args(topology, spec, &staged)?;
 
         let mut transport = PtyTransport::open()?;
+        // The PTY read deadline carries the run budget, so a silent guest resolves
+        // through the protocol's timeout path instead of blocking the driver.
+        transport.set_read_timeout(Duration::from_secs(u64::from(spec.timeout_secs.max(1))));
         let pid = transport.spawn(&self.vfkit_bin, &args)?;
         tracing::info!(box_id, pid, "spawned vfkit under PTY console");
         self.lock_registry()?.push(BoxState {

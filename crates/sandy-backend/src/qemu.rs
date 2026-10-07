@@ -1,13 +1,13 @@
 //! The native qemu/KVM backend (Block 35): assemble the hypervisor argv from a
-//! [`Topology`] and run it with its serial console on pipes (#33).
+//! [`Topology`] and run it with its serial console over a Unix socket (#33).
 //!
 //! This is the Linux/CI counterpart to the vfkit backend (#32). It is split so
 //! the argv assembly stays pure and tier-1 testable:
 //!
 //! - [`qemu_args`] — the pure assembler. Given a [`Topology`], a [`RunSpec`], and the already-[`StagedArgs`] (secret
 //!   share + [`mount_args`](sandy::mount_args) output), it builds the `qemu-system-<arch>` command vector with no IO.
-//!   Proven on ws01 (x86_64, `/dev/kvm` world-rw): the microvm.nix runner booted → result → poweroff in ~8s with
-//!   `-nographic -serial chardev:stdio console=ttyS0` and sentinels on stdout.
+//!   Proven live on ws01 (x86_64, `/dev/kvm` world-rw): `sandy run` boots this argv to a `succeeded`/exit-0 result in
+//!   ~10s with `-nographic -serial chardev:sandy-serial console=ttyS0` and the sentinels on the serial socket.
 //! - [`QemuBackend`] — the [`VmBackend`] seam. `run` stages secrets/mounts (#34), calls [`qemu_args`], spawns qemu with
 //!   serial on the #33 [`PipeTransport`](sandy::PipeTransport), drives [`run_console`](sandy::run_console), and
 //!   populates the pinned [`Outcome`]. The spawn/boot is host-tier (tier-3, ws01), not unit-tested in the sandbox.
@@ -30,12 +30,13 @@ use sandy::{
 use uuid::Uuid;
 
 /// The chardev id the guest serial console binds to. `qemu_args` emits
-/// `-serial chardev:<SERIAL_CHARDEV_ID>`; `run` wires the matching
-/// `-chardev pipe,…` to the #33 [`PipeTransport`] fifo (a host-tier detail).
+/// `-serial chardev:<SERIAL_CHARDEV_ID>`; `run` adds the matching
+/// `-chardev socket,…` and drives it over the #33 [`PipeTransport`].
 const SERIAL_CHARDEV_ID: &str = "sandy-serial";
 
-/// The boot-ready marker scanned for before the command is injected (the guest
-/// login banner). Host-tier: only `run` uses it, and the real boot is #26.
+/// The boot-ready marker scanned for before the command is injected: the guest's
+/// login shell prints it once it is up and reading (the guest's `loginShellInit`),
+/// so the injected frame lands in a reading shell rather than the login handoff.
 const READY_MARKER: &str = "SANDY-READY";
 
 /// The already-staged inputs [`qemu_args`] needs, kept out of the pure assembler
@@ -71,8 +72,8 @@ pub struct StagedArgs {
 /// - the store ([`StoreBacking::ErofsImage`](sandy::StoreBacking::ErofsImage)) as a read-only virtio-blk drive, e.g.
 ///   `-drive file=<image>,if=virtio,format=raw,readonly=on`.
 /// - `-smp <topology.cpu>` / `-m <topology.mem>` — vCPUs and memory in MiB (a [`RunSpec`] `cpu`/`mem` may narrow them).
-/// - `-nographic` and `-serial chardev:<id>` — the guest serial console; `run` adds the matching `-chardev pipe,…` that
-///   binds `<id>` to the #33 pipe (the fifo path is a host-tier detail, so it is not emitted here).
+/// - `-nographic` and `-serial chardev:<id>` — the guest serial console; `run` adds the matching `-chardev socket,…`
+///   that binds `<id>` to the #33 [`PipeTransport`] (the socket path is a host detail, so it is not emitted here).
 /// - `-enable-kvm -cpu host` when `staged.kvm`.
 /// - the virtiofs/virtio-9p shares from `staged.mounts` and `staged.secret_share`.
 /// - `-device vhost-vsock-pci,guest-cid=<cid>` when `topology.vsock_cid` is set.
