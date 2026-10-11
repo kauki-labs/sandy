@@ -57,7 +57,7 @@ pub use console::{
 };
 pub use cred::{
     Capability, CredError, CredentialHandle, CredentialProvider, FakeProvider, GitlabAccount, Lease, MAX_TTL_SECS,
-    Minted, Scope, Target, TrustRoot, mint_lease, render_github_permissions,
+    Minted, Scope, Target, TrustRoot, mint_lease, read_secret_0600, render_github_permissions,
 };
 pub use egress::{
     AllowList, EgressApplier, EgressOs, EgressOutcome, EgressPlan, EgressRule, FakeApplier, NftablesApplier, enforce,

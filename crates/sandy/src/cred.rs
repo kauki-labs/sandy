@@ -60,7 +60,9 @@ pub enum Capability {
 }
 
 /// A repository (GitHub) or project (GitLab) a credential is scoped to, as the
-/// provider's own path (e.g. `"owner/repo"`).
+/// provider's own path (e.g. `"owner/repo"`). The GitHub adapter renders this to a
+/// bare repo name for the installation token's `repositories` param (the owner is
+/// fixed by the installation), so it strips any `owner/` prefix.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Target(pub String);
 
@@ -426,6 +428,28 @@ impl TrustRoot {
     }
 }
 
+/// Read a secret file, refusing one that is group- or world-readable (the read
+/// side of INV-1). The single reader the forge adapters use for the App private key
+/// or service PAT, and the trust-root installer's verify uses for the same, so the
+/// mode check has one implementation.
+///
+/// # Errors
+///
+/// Returns [`CredError::Stage`] when the file grants group/other read (its mode has
+/// any `0o044` bit, e.g. `0644`) or cannot be read; a group/world-readable secret is
+/// refused, never read.
+pub fn read_secret_0600(path: &Path) -> Result<Vec<u8>, CredError> {
+    let meta = fs::metadata(path).map_err(|e| stage_err("stat secret", path, &e))?;
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o044 != 0 {
+        return Err(CredError::Stage(format!(
+            "secret {} is group/world-readable (mode {mode:#o}); refusing to read it (INV-1)",
+            path.display()
+        )));
+    }
+    fs::read(path).map_err(|e| stage_err("read secret", path, &e))
+}
+
 /// Write `bytes` to a `0600` file `<secret_name>.token` under `out_dir` via atomic
 /// temp → sync → rename, fsyncing the directory so the rename is durable (INV-1).
 /// The error message never carries the secret bytes.
@@ -591,6 +615,27 @@ mod tests {
             ],
             "read+write on contents must resolve to a single write, not drop or duplicate"
         );
+    }
+
+    /// [`read_secret_0600`] reads a `0600` secret and refuses a `0644` one with a
+    /// named error, the read side of INV-1 shared by adapters and the verify probe.
+    #[test]
+    fn read_secret_0600_reads_tight_refuses_loose() -> anyhow::Result<()> {
+        let tmp = tempfile::TempDir::new()?;
+        let tight = tmp.path().join("tight");
+        fs::write(&tight, b"key-bytes").context("write tight secret")?;
+        fs::set_permissions(&tight, fs::Permissions::from_mode(0o600)).context("chmod 600")?;
+        assert_eq!(read_secret_0600(&tight).context("read 0600")?, b"key-bytes");
+
+        let loose = tmp.path().join("loose");
+        fs::write(&loose, b"key-bytes").context("write loose secret")?;
+        fs::set_permissions(&loose, fs::Permissions::from_mode(0o644)).context("chmod 644")?;
+        let err = read_secret_0600(&loose).expect_err("a 0644 secret must be refused");
+        assert!(
+            matches!(err, CredError::Stage(_)),
+            "expected CredError::Stage, got {err:?}"
+        );
+        Ok(())
     }
 
     /// A GitHub [`TrustRoot`] round-trips through its `0600` JSON file, and the file
