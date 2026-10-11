@@ -7,9 +7,9 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
 use sandy::{
-    AllowList, BackendError, CoreError, EgressOs, EgressRule, FakeApplier, FakeBackend, FakeMinter, Grants,
-    JOURNAL_SCHEMA_VERSION, JobRecord, JobState, Journal, Logs, Mount, Outcome, Provenance, RESULT_SCHEMA_VERSION,
-    ResultEnvelope, SecretRef, SecretSource, Status, TokenScope, to_nftables_forward,
+    AllowList, BackendError, Capability, CoreError, EgressOs, EgressRule, FakeApplier, FakeBackend, FakeProvider,
+    Grants, JOURNAL_SCHEMA_VERSION, JobRecord, JobState, Journal, Logs, Mount, Outcome, Provenance,
+    RESULT_SCHEMA_VERSION, ResultEnvelope, Scope, SecretRef, SecretSource, Status, Target, to_nftables_forward,
 };
 use sandy_cli::{
     plan::JobPlan,
@@ -496,11 +496,11 @@ fn egress_boundary_is_reverted_even_when_the_backend_run_fails() -> anyhow::Resu
 
 // --- scoped credential minting (#25) ----------------------------------------
 
-/// A minimal `contents:read` scope on one repo.
-fn token_scope() -> TokenScope {
-    TokenScope {
-        repositories: vec!["acme/widgets".to_string()],
-        permissions: vec![("contents".to_string(), "read".to_string())],
+/// A minimal read-code scope on one repo.
+fn token_scope() -> Scope {
+    Scope {
+        targets: vec![Target("acme/widgets".to_string())],
+        capabilities: vec![Capability::ReadCode],
     }
 }
 
@@ -511,33 +511,33 @@ fn token_scope() -> TokenScope {
 fn mint_run_token_stages_a_secret_and_the_token_travels_only_the_secret_channel() -> anyhow::Result<()> {
     let (tmp, journal) = fresh_journal()?;
     let token = "ghs_scoped_marker_value";
-    let minter = FakeMinter::returning(token);
+    let provider = FakeProvider::returning(token);
 
-    let secret =
-        mint_run_token(&minter, &token_scope(), "GH_TOKEN", tmp.path(), 1_800).context("mint_run_token (success)")?;
+    let lease =
+        mint_run_token(&provider, &token_scope(), "GH_TOKEN", tmp.path(), 1_800).context("mint_run_token (success)")?;
 
-    // The handle is a File source whose 0600 file holds the token bytes. Capture
-    // the path and the handle render before the secret is moved into the plan
-    // (`SecretRef` is not `Clone`).
-    let SecretSource::File(path) = &secret.source else {
-        anyhow::bail!("expected a File-sourced secret, got {:?}", secret.source);
+    // The lease's secret_ref is a File source whose 0600 file holds the token
+    // bytes. Capture the path and the handle render before the secret_ref is moved
+    // into the plan (`SecretRef` is not `Clone`).
+    let SecretSource::File(path) = &lease.secret_ref.source else {
+        anyhow::bail!("expected a File-sourced secret, got {:?}", lease.secret_ref.source);
     };
     let staged_path = path.clone();
-    let rendered = format!("{secret:?}");
+    let rendered = format!("{lease:?}");
     assert_eq!(
         std::fs::read(&staged_path).context("read staged token")?,
         token.as_bytes(),
         "the staged file must hold the token bytes"
     );
-    // INV-1 leak plane: the token bytes must not appear in the SecretRef handle.
+    // INV-1 leak plane: the token bytes must not appear in the Lease handle.
     assert!(
         !rendered.contains(token),
-        "the token must not appear in the SecretRef handle"
+        "the token must not appear in the Lease handle"
     );
 
     // Thread the secret into a run and prove it still succeeds over the secret channel.
     let plan = JobPlan {
-        secrets: vec![secret],
+        secrets: vec![lease.secret_ref],
         ..booting_plan()
     };
     let backend = FakeBackend::new().with_outcome(ok_outcome(0));
@@ -562,9 +562,9 @@ fn mint_run_token_stages_a_secret_and_the_token_travels_only_the_secret_channel(
 #[test]
 fn mint_run_token_failure_surfaces_as_core_error_not_a_tokenless_run() -> anyhow::Result<()> {
     let (tmp, _journal) = fresh_journal()?;
-    let minter = FakeMinter::failing();
+    let provider = FakeProvider::failing();
 
-    let err = mint_run_token(&minter, &token_scope(), "GH_TOKEN", tmp.path(), 1_800)
+    let err = mint_run_token(&provider, &token_scope(), "GH_TOKEN", tmp.path(), 1_800)
         .expect_err("a failing mint must be an error, not a tokenless run");
 
     assert!(

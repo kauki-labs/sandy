@@ -19,8 +19,9 @@
 //!   (INV-TOPOLOGY).
 //! - **Console driver** — the sentinel [`Protocol`] (boot → inject → capture → exit) over a platform [`Transport`],
 //!   wired by [`run_console`] into the pinned snake_case [`Outcome`] (INV-8/INV-OUTCOME).
-//! - **Credentials** — [`mint_token`] clamps a TTL to [`MAX_TTL_SECS`] and stages a scoped GitHub token over the
-//!   [`InstallationTokenMinter`] seam (with a [`FakeMinter`] double), delivered as a `0600` [`SecretRef`] only (INV-1).
+//! - **Credentials** — the provider-agnostic [`CredentialProvider`] seam (with a [`FakeProvider`] double);
+//!   [`mint_lease`] clamps a TTL to [`MAX_TTL_SECS`] and stages a scoped credential as a `0600` [`SecretRef`] only
+//!   (INV-1).
 //! - **Operability** — [`RunMetrics`] and staging [`plan_eviction`].
 
 // Deep crate: the module tree is private. The curated `pub use` facade below is
@@ -54,7 +55,10 @@ pub use config::CollectionConfig;
 pub use console::{
     Markers, PipeTransport, Protocol, ProtocolStep, PtyTransport, TimeoutPolicy, Transport, parse_exit, run_console,
 };
-pub use cred::{CredError, FakeMinter, InstallationTokenMinter, MAX_TTL_SECS, TokenScope, mint_token};
+pub use cred::{
+    Capability, CredError, CredentialHandle, CredentialProvider, FakeProvider, GitlabAccount, Lease, MAX_TTL_SECS,
+    Minted, Scope, Target, TrustRoot, mint_lease, render_github_permissions,
+};
 pub use egress::{
     AllowList, EgressApplier, EgressOs, EgressOutcome, EgressPlan, EgressRule, FakeApplier, NftablesApplier, enforce,
     macos_egress_statement, plan_egress, plan_egress_scoped, to_nftables, to_nftables_forward,

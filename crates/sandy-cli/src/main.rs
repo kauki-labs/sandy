@@ -198,10 +198,10 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
             let backend = host_backend();
             // Egress is bracketed around the boot per platform: Linux enforces the
             // nftables boundary, macOS has none (`plan_egress` → NoBoundary, so the
-            // no-op applier is never called). Cred stays WALLED: the real
-            // GitHub-App `InstallationTokenMinter` and `mint_run_token` bind in once
-            // the App is registered (#25/#26); there is no `--github-token` flag
-            // because no live minter exists to honor it yet.
+            // no-op applier is never called). Cred stays WALLED: the live GitHub
+            // `CredentialProvider` adapter and `mint_run_token` bind in once the App
+            // is registered (#49); there is no `--github-token` flag because no live
+            // provider exists to honor it yet.
             let egress = egress_applier();
             let egress_os = if cfg!(target_os = "macos") {
                 sandy::EgressOs::MacOs
