@@ -14,6 +14,7 @@ the scope-rendering next to the mint it must match (the hinge).
 | 1   | Target model + `Provisioner` trait + installer pipeline + `FakeProvisioner` | host    | 0          | REQ-2, REQ-5, REQ-6, REQ-7, REQ-8 |
 | 2   | GitHub provisioner (manifest flow)                                          | host    | 1          | REQ-3, REQ-7                      |
 | 3   | GitLab provisioner (guided paste-back)                                      | host    | 1          | REQ-4, REQ-7                      |
+| 4   | Deregister / uninstall (forge revoke + local shred)                         | host    | 1, 2, 3    | REQ-9                             |
 
 ## Block 0: Preconditions + trust-root config schema
 
@@ -53,7 +54,8 @@ disclosure that makes the no-backdoor property auditable.
 
 **Architecture.** `Target { kind, base_url }` (base_url defaults to the public host). A
 `Provisioner` trait: `plan(target, caps) -> RegistrationPlan` (URL to open + step text + the
-manifest/scopes to show), `capture(plan) -> CapturedSecret`, `verify(trust_root, caps) -> ()`.
+manifest/scopes to show), `capture(plan) -> CapturedSecret`, `verify(trust_root, caps) -> ()`,
+and `revoke(trust_root) -> RevokeOutcome` (forge-side uninstall, used by Block 4).
 Pipeline: resolve target → print the disclosure (every host contacted = the target forge only;
 capture is local; write is `0600`; no key ships) → `plan` → hand-hold (open URL via `webbrowser`,
 print concise steps) → `capture` → `TrustRoot` via Block 0 → `verify` → report. `FakeProvisioner`
@@ -146,6 +148,50 @@ Adversarial (negative) tests:
 | -------------------------- | ---------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
 | over-broad token rejected  | paste a broad personal PAT instead of the scoped one | verify detects scopes beyond the request and refuses (assert refusal, not silent accept).                            |
 | service account on Free/CE | request `service-account` on a Free/CE instance      | named "unsupported tier" error that names the group/project-token fallback (REQ-8: don't require a missing feature). |
+
+## Block 4: Deregister / uninstall (forge revoke + local shred)
+
+**Purpose.** Tear a trust root down: stop sandy minting and remove the credential at the forge,
+leaving no usable key behind. The lifecycle counterpart of `register`.
+
+**Architecture.** `sandy app deregister {name}` loads the `TrustRoot` (Block 0), then runs an
+ordered two-layer teardown, **forge revoke before local shred**, because the GitHub revoke needs
+the pem to sign its JWT:
+
+1. `provisioner.revoke(trust_root)` — forge side.
+   - GitHub: sign a JWT with the pem, `DELETE <api-base>/app/installations/<installation_id>`
+     (uninstalls the App from that account). The App **registration** itself has no delete API,
+     so `RevokeOutcome` carries a `registration_residue` flag + the manual-deletion URL.
+   - GitLab: `DELETE <base>/projects|groups/:id/access_tokens/:id` (or delete the service
+     account); no registration residue.
+2. Local shred — overwrite + unlink the secret file, remove the `.toml` record.
+3. Report — on GitHub, name the manual "delete the App" step for the residue; on GitLab, done.
+
+Revoke is best-effort-but-loud: if the forge call fails (e.g. the install was already removed in
+the UI), it says so and still shreds locally, but it never reports a clean uninstall when the
+forge still holds a live credential it could reach.
+
+**Interfaces.** Input: `name` (the local handle). Output: a teardown report (revoked? shredded?
+registration residue + URL?). Config surface: `--keep-remote` (shred locally only, for when the
+user will remove the install in the UI) and `--yes` (skip the confirm).
+
+**Satisfies:** REQ-9.
+
+Verification (positive) tests:
+
+| Test                     | Setup / Inject                                      | Expected result                                                                                                             |
+| ------------------------ | --------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| github deregister        | a registered github trust root, `revoke` then shred | the installation is deleted at the forge; the `.pem` and `.toml` are gone; report names the App-registration residue + URL. |
+| gitlab deregister        | a registered gitlab trust root                      | the access token is revoked at the forge; secret + record gone; no residue reported.                                        |
+| revoke runs before shred | instrument the order over the fake                  | `revoke` is invoked while the secret still exists; shred runs only after.                                                   |
+
+Adversarial (negative) tests:
+
+| Test                               | Setup / Inject                                       | Expected result                                                                                                                                               |
+| ---------------------------------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| forge revoke fails, no false clean | `revoke` errors (install already gone / network)     | the command shreds locally but reports the forge step as **not confirmed**; it does NOT print a clean uninstall (assert the unconfirmed state is observable). |
+| no silent registration residue     | github deregister                                    | the lingering App registration is reported, not swallowed; a missing residue warning fails the test.                                                          |
+| mint after deregister              | deregister, then attempt to mint with the old handle | mint fails with a named "no such trust root" error; the shredded key is unusable.                                                                             |
 
 ## Escalation appendix
 

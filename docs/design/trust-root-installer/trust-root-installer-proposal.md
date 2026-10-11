@@ -62,6 +62,10 @@ On sandy `origin/main`:
   with a named error otherwise. (MUST)
 - REQ-8: The system SHALL NOT require a provider capability that does not exist (e.g. a GitLab
   manifest flow) and SHALL NOT report success when the verify probe fails. (MUST NOT)
+- REQ-9: When the user deregisters a trust root, the system SHALL revoke the credential at the
+  forge **before** destroying the local secret, then shred the local key and record; and where
+  the forge offers no API to delete the App registration itself, the system SHALL report that
+  residue and name the manual deletion step. (MUST)
 
 ## 4. Design
 
@@ -164,6 +168,9 @@ the record.
 4. GitLab provisioner → gate: a real gitlab.com registration produces a working project token.
 5. Self-hosted base-URL pass (GHES + self-managed GitLab) → gate: one self-hosted run each, or
    documented as untested when no instance is available.
+6. Deregister → gate: a registered trust root is revoked at the forge and shredded locally, after
+   which a mint attempt fails and the forge shows the installation gone (GitHub) or the token
+   revoked (GitLab).
 
 ## 10. Validation pass (self-adversarial)
 
@@ -183,6 +190,10 @@ What the chosen direction opened up:
 - The localhost redirect catcher is an open port another local process could hit → bind
   `127.0.0.1` on a random high port, carry a single-use nonce in `state`, and shut the listener
   down the moment the code arrives.
+- Deregister could shred the local key first and then be unable to revoke the live install (the
+  GitHub revoke needs the pem to sign its JWT) → fixed by ordering: revoke at the forge before
+  the local shred (REQ-9). And since no API deletes the App registration, deregister ends by
+  naming the manual deletion rather than silently leaving a powerless-but-present App shell.
 
 ## 11. Unresolved questions
 
@@ -200,3 +211,4 @@ What the chosen direction opened up:
 4. Group service accounts API — GitLab Docs: https://docs.gitlab.com/api/group_service_accounts (accessed 2026-10-11)
 5. GitLab token overview and scopes — GitLab Docs: https://docs.gitlab.com/security/tokens/ (accessed 2026-10-11)
 6. sandy credential-seam work package: `../credential-seam/` (repo path)
+7. Delete an installation for the authenticated app (`DELETE /app/installations/{installation_id}`) — GitHub REST API: https://docs.github.com/en/rest/apps/apps#delete-an-installation-for-the-authenticated-app (accessed 2026-10-12)

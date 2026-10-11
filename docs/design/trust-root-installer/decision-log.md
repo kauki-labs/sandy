@@ -4,14 +4,15 @@ The anti-re-litigation record. Each decision uses MADR fields (see `references/m
 
 ## Verified facts
 
-| Fact                                                                                                                                                                                                   | How verified                                                                        | Consequence                                                                               |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
-| GitHub's manifest flow returns `id` + `pem` + `webhook_secret` from `POST /app-manifests/{code}/conversions`, no auth (the one-time code is the credential), within a 1 h window.                      | GitHub Docs (sources 1, 2); used manually in sandy `docs/github-app.md` this cycle. | GitHub capture can be fully automated into the installer's own hands (REQ-3, REQ-6).      |
-| GitLab has no manifest/handshake that returns a secret. The trust root is a group/project access token or a service account; its secret shows once in the UI; API creation needs a pre-existing token. | GitLab Docs (sources 3, 4, 5).                                                      | GitLab register is guided paste-back, not auto-capture (REQ-4).                           |
-| A GitHub App has one private key, held by the App owner, and it mints tokens for **every** installation; there is no per-installation key.                                                             | GitHub Apps model (prior-cycle grounding, GitHub Docs).                             | Per-installer unique key ⇒ per-installer App. A shared App ⇒ author backdoor (drives D2). |
-| GHES and self-managed GitLab run the same flows at a different base host.                                                                                                                              | GitHub/GitLab docs (sources 1–5).                                                   | `target = { kind, base_url }`; no new adapter per host (D4).                              |
-| credential-seam Block 0 already defines the trust-root config surface (provider, trust-root location, target scope); Blocks 3/4 name the per-kind fields.                                              | `../credential-seam/credential-seam-spec.md` Blocks 0/3/4.                          | The installer's output **is** that contract; it is a front-end to Block 0 (D1, D6).       |
-| GitLab service accounts are Premium/Ultimate only.                                                                                                                                                     | GitLab Docs (source 4).                                                             | Free/CE installers fall back to a group or project access token (D3).                     |
+| Fact                                                                                                                                                                                                   | How verified                                                                        | Consequence                                                                                       |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| GitHub's manifest flow returns `id` + `pem` + `webhook_secret` from `POST /app-manifests/{code}/conversions`, no auth (the one-time code is the credential), within a 1 h window.                      | GitHub Docs (sources 1, 2); used manually in sandy `docs/github-app.md` this cycle. | GitHub capture can be fully automated into the installer's own hands (REQ-3, REQ-6).              |
+| GitLab has no manifest/handshake that returns a secret. The trust root is a group/project access token or a service account; its secret shows once in the UI; API creation needs a pre-existing token. | GitLab Docs (sources 3, 4, 5).                                                      | GitLab register is guided paste-back, not auto-capture (REQ-4).                                   |
+| A GitHub App has one private key, held by the App owner, and it mints tokens for **every** installation; there is no per-installation key.                                                             | GitHub Apps model (prior-cycle grounding, GitHub Docs).                             | Per-installer unique key ⇒ per-installer App. A shared App ⇒ author backdoor (drives D2).         |
+| GHES and self-managed GitLab run the same flows at a different base host.                                                                                                                              | GitHub/GitLab docs (sources 1–5).                                                   | `target = { kind, base_url }`; no new adapter per host (D4).                                      |
+| credential-seam Block 0 already defines the trust-root config surface (provider, trust-root location, target scope); Blocks 3/4 name the per-kind fields.                                              | `../credential-seam/credential-seam-spec.md` Blocks 0/3/4.                          | The installer's output **is** that contract; it is a front-end to Block 0 (D1, D6).               |
+| GitLab service accounts are Premium/Ultimate only.                                                                                                                                                     | GitLab Docs (source 4).                                                             | Free/CE installers fall back to a group or project access token (D3).                             |
+| `DELETE /app/installations/{installation_id}` uninstalls a GitHub App from an account (JWT auth); there is no API to delete the App registration itself.                                               | GitHub Docs (source 7).                                                             | sandy can self-revoke the install while it holds the pem, but App-shell deletion is UI-only (D7). |
 
 ## Decisions
 
@@ -68,6 +69,17 @@ The anti-re-litigation record. Each decision uses MADR fields (see `references/m
 - **Confirmation:** the credential-seam adapter loads a register-written config unmodified
   (integration test once Blocks 3/4 land).
 
+### D7: Deregister is a two-layer teardown, forge-revoke before local-shred; App-registration deletion is UI-only
+
+- **Status:** Accepted
+- **Why:** The GitHub revoke (`DELETE /app/installations/{id}`) needs the pem to sign its JWT, so
+  shredding the key first would strand the live install. No API deletes the App registration, so
+  deregister can remove the installation + local key but must report the lingering App shell.
+- **Grounding:** source 7 (verified fact); proposal §10, REQ-9.
+- **Confirmation:** an order-of-operations test shows `revoke` runs while the secret still exists;
+  a failed forge revoke is reported as unconfirmed, never as a clean uninstall; the App-registration
+  residue is surfaced, not swallowed.
+
 ## Considered and set aside
 
 Do not re-propose without new information.
@@ -78,6 +90,7 @@ Do not re-propose without new information.
 | Per-target bespoke commands               | Duplicates the identical pipeline; only initiation differs (D1).                                              |
 | GitLab via an OAuth application           | Needs a client secret held somewhere and acts as the user (broader, not scoped); no gain over a scoped token. |
 | Secret stored inline in the config record | Widens exposure; a `0600` side file is tighter and matches REQ-5 (D6).                                        |
+| Shred-only deregister (no forge revoke)   | Leaves a live installation the controller can still reach until the user notices; fails REQ-9 (D7).           |
 
 ## Open items
 

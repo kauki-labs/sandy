@@ -19,7 +19,7 @@ verified-facts table, and the four spec blocks are small enough to build without
 
 1. `trust-root-installer-proposal.md`: what and why (purpose, requirements, the design chain, the self-adversarial pass).
 2. `decision-log.md`: the verified facts and every load-bearing decision (D1–D6).
-3. `trust-root-installer-spec.md`: how, as four test-gated blocks with positive and adversarial tests.
+3. `trust-root-installer-spec.md`: how, as five test-gated blocks (config schema, pipeline, GitHub and GitLab provisioners, deregister) with positive and adversarial tests.
 
 ## Status
 
