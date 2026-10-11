@@ -93,6 +93,15 @@ workspace = true
 
 The `crates/*` glob in the root `Cargo.toml` picks it up automatically.
 
+## GitHub App
+
+sandy's GitHub adapter mints short-lived, least-privilege installation tokens for a
+job (the [credential seam](docs/design/credential-seam/)); the minting trust root is a
+GitHub App whose private key stays on the controller and never enters a guest (REQ-5).
+Standing it up is a one-time operator step — two Apps (personal + org), `contents` and
+`pull_requests` write, install scope managed as IaC in `kauki-labs/infra`. Full
+walkthrough: [docs/github-app.md](docs/github-app.md).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
