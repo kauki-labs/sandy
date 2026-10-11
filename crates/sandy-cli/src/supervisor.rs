@@ -10,11 +10,11 @@
 use std::{collections::HashSet, path::Path, time::SystemTime};
 
 use sandy::{
-    BackendError, Classification, CoreError, EgressApplier, EgressOs, EgressOutcome, InstallationTokenMinter,
-    JOURNAL_SCHEMA_VERSION, JobRecord, JobState, Journal, Logs, Outcome, OutputStatus, ProcessExit, Provenance,
-    RESULT_SCHEMA_VERSION, ResultEnvelope, SecretRef, StagedImage, Status, TokenScope, VmBackend,
-    classify_backend_error, classify_invalid_plan, classify_outcome, enforce, mint_token, new_job_id,
-    plan_egress_scoped, plan_eviction, reconcile_job, validate_no_secret_leak,
+    BackendError, Classification, CoreError, CredentialProvider, EgressApplier, EgressOs, EgressOutcome,
+    JOURNAL_SCHEMA_VERSION, JobRecord, JobState, Journal, Lease, Logs, Outcome, OutputStatus, ProcessExit, Provenance,
+    RESULT_SCHEMA_VERSION, ResultEnvelope, Scope, StagedImage, Status, VmBackend, classify_backend_error,
+    classify_invalid_plan, classify_outcome, enforce, mint_lease, new_job_id, plan_egress_scoped, plan_eviction,
+    reconcile_job, validate_no_secret_leak,
 };
 
 use crate::plan::JobPlan;
@@ -195,21 +195,23 @@ pub fn run_job<B: VmBackend, E: EgressApplier>(
 /// run — a host/pre-run step, kept separate from [`run_job`] (the token is minted
 /// before the plan is assembled, then threaded in as a secret).
 ///
-/// Wraps [`sandy::mint_token`], mapping a [`sandy::CredError`] into
+/// Wraps [`sandy::mint_lease`], mapping a [`sandy::CredError`] into
 /// [`CoreError::Cred`]: a mint failure is an infra fault the caller must fail on,
-/// never a run with no token (INV-7).
+/// never a run with no credential (INV-7). Returns the whole [`Lease`] so the
+/// caller can revoke it at teardown (the Block-2 bracket); today only its
+/// `secret_ref` is threaded into the plan.
 ///
 /// # Errors
 ///
-/// Returns [`CoreError::Cred`] when minting or staging the token fails.
-pub fn mint_run_token<M: InstallationTokenMinter>(
-    minter: &M,
-    scope: &TokenScope,
+/// Returns [`CoreError::Cred`] when minting or staging the credential fails.
+pub fn mint_run_token<P: CredentialProvider>(
+    provider: &P,
+    scope: &Scope,
     secret_name: &str,
     out_dir: &Path,
     requested_ttl_secs: u32,
-) -> Result<SecretRef, CoreError> {
-    mint_token(minter, scope, requested_ttl_secs, secret_name, out_dir).map_err(|e| CoreError::Cred(e.to_string()))
+) -> Result<Lease, CoreError> {
+    mint_lease(provider, scope, requested_ttl_secs, secret_name, out_dir).map_err(|e| CoreError::Cred(e.to_string()))
 }
 
 /// List every job record (`journal.list()`).
