@@ -458,12 +458,11 @@ mod tests {
         Ok((tmp, journal))
     }
 
-    /// A minimal plan that boots `demo` with no mounts, secrets, or env.
+    /// A minimal plan that boots `demo` with no secrets or env.
     fn booting_plan() -> JobPlan {
         JobPlan {
             template: "demo".to_string(),
             command: vec![],
-            mounts: vec![],
             secrets: vec![],
             env: vec![],
             allow: AllowList::default(),
@@ -478,24 +477,19 @@ mod tests {
         }
     }
 
-    /// A plan whose secret file path is also a mount host — `validate_no_secret_leak`
-    /// must reject it (INV-1), driving the invalid-plan band.
+    /// A plan whose secret name is also set as a plain env var —
+    /// `validate_no_secret_leak` must reject it (INV-1), driving the invalid-plan
+    /// band.
     fn leaking_plan() -> JobPlan {
-        use sandy::{Mount, SecretRef, SecretSource};
-        let shared = std::path::PathBuf::from("/run/leak-token");
+        use sandy::{SecretRef, SecretSource};
         JobPlan {
             template: "demo".to_string(),
             command: vec![],
-            mounts: vec![Mount {
-                host: shared.clone(),
-                guest: std::path::PathBuf::from("/in/token"),
-                ro: true,
-            }],
             secrets: vec![SecretRef {
                 name: "TOK".to_string(),
-                source: SecretSource::File(shared),
+                source: SecretSource::File(std::path::PathBuf::from("/run/leak-token")),
             }],
-            env: vec![],
+            env: vec![("TOK".to_string(), "leaked".to_string())],
             allow: AllowList::default(),
             cpu: None,
             mem: None,

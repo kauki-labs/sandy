@@ -18,17 +18,6 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-/// A host→guest bind mount. `ro` selects a read-only mount.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Mount {
-    /// Host path to expose.
-    pub host: PathBuf,
-    /// Guest path where it appears.
-    pub guest: PathBuf,
-    /// Whether the mount is read-only.
-    pub ro: bool,
-}
-
 /// Where a secret's bytes come from. Secrets travel this channel only — never
 /// argv, env, mounts, or the Nix store (INV-1).
 #[derive(Debug)]
@@ -66,8 +55,6 @@ pub struct RunSpec<'a> {
     pub template: &'a str,
     /// The guest command and its arguments.
     pub command: &'a [String],
-    /// Read-only inputs and the RW output area.
-    pub mounts: &'a [Mount],
     /// Secrets to inject over the secret channel.
     pub secrets: &'a [SecretRef],
     /// Extra environment variables (never secrets — INV-1).
@@ -234,21 +221,13 @@ pub enum PlanError {
 }
 
 /// Reject a spec that would route a secret's bytes through the data/store plane
-/// instead of the secret channel (INV-1): e.g. a [`SecretSource::File`] path
-/// that is also a [`Mount::host`], or a secret value echoed into `env`.
+/// instead of the secret channel (INV-1): a secret value echoed into `env`.
 ///
 /// # Errors
 ///
 /// Returns [`PlanError::SecretLeak`] when a secret would reach the data plane.
 pub fn validate_no_secret_leak(spec: &RunSpec) -> Result<(), PlanError> {
     for secret in spec.secrets {
-        // A file-sourced secret must not also be exposed as a bind mount — that
-        // would route its bytes through the data/store plane (INV-1).
-        if let SecretSource::File(path) = &secret.source
-            && spec.mounts.iter().any(|mount| &mount.host == path)
-        {
-            return Err(PlanError::SecretLeak(secret.name.clone()));
-        }
         // The secret's name must not be set as a plain env var — env is not the
         // secret channel and travels host argv/environ (INV-1).
         if spec.env.iter().any(|(key, _)| key == &secret.name) {
@@ -281,20 +260,15 @@ mod tests {
         Ok(())
     }
 
-    /// INV-1: a secret whose file source is also a mount host (so its bytes
-    /// would enter the data/store plane) must be rejected.
+    /// INV-1: a secret whose name is also set as a plain env var (so its value
+    /// would travel host argv/environ) must be rejected.
     #[test]
-    fn secret_routed_through_a_mount_is_rejected() {
-        let shared = PathBuf::from("/tmp/token");
-        let mounts = [Mount {
-            host: shared.clone(),
-            guest: PathBuf::from("/in/token"),
-            ro: true,
-        }];
+    fn secret_echoed_into_env_is_rejected() {
         let secrets = [SecretRef {
             name: "TOK".to_string(),
-            source: SecretSource::File(shared),
+            source: SecretSource::File(PathBuf::from("/run/token")),
         }];
+        let env = [("TOK".to_string(), "value".to_string())];
         let grants = Grants {
             secrets: true,
             agent: false,
@@ -304,9 +278,8 @@ mod tests {
         let spec = RunSpec {
             template: "demo",
             command: &command,
-            mounts: &mounts,
             secrets: &secrets,
-            env: &[],
+            env: &env,
             cpu: None,
             mem: None,
             timeout_secs: 60,

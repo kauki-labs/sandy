@@ -4,14 +4,13 @@
 //! This is the Linux/CI counterpart to the vfkit backend (#32). It is split so
 //! the argv assembly stays pure and tier-1 testable:
 //!
-//! - [`qemu_args`] — the pure assembler. Given a [`Topology`], a [`RunSpec`], and the already-[`StagedArgs`] (secret
-//!   share + [`mount_args`](sandy::mount_args) output), it builds the `qemu-system-<arch>` command vector with no IO.
-//!   Proven live on an x86_64 Linux/KVM host (`/dev/kvm` world-rw): `sandy run` boots this argv to a `succeeded`/exit-0
-//!   result in ~10s with `-nographic -serial chardev:sandy-serial console=ttyS0` and the sentinels on the serial
-//!   socket.
-//! - [`QemuBackend`] — the [`VmBackend`] seam. `run` stages secrets/mounts (#34), calls [`qemu_args`], spawns qemu with
-//!   serial on the #33 [`PipeTransport`](sandy::PipeTransport), drives [`run_console`](sandy::run_console), and
-//!   populates the pinned [`Outcome`]. The spawn/boot is host-tier (tier-3), not unit-tested in the sandbox.
+//! - [`qemu_args`] — the pure assembler. Given a [`Topology`], a [`RunSpec`], and the already-[`StagedArgs`] (the
+//!   secret share), it builds the `qemu-system-<arch>` command vector with no IO. Proven live on an x86_64 Linux/KVM
+//!   host (`/dev/kvm` world-rw): `sandy run` boots this argv to a `succeeded`/exit-0 result in ~10s with `-nographic
+//!   -serial chardev:sandy-serial console=ttyS0` and the sentinels on the serial socket.
+//! - [`QemuBackend`] — the [`VmBackend`] seam. `run` stages secrets, calls [`qemu_args`], spawns qemu with serial on
+//!   the #33 [`PipeTransport`](sandy::PipeTransport), drives [`run_console`](sandy::run_console), and populates the
+//!   pinned [`Outcome`]. The spawn/boot is host-tier (tier-3), not unit-tested in the sandbox.
 //!
 //! The module is private; `sandy-backend`'s `lib.rs` re-exports only
 //! [`QemuBackend`], [`qemu_args`], and [`StagedArgs`].
@@ -26,7 +25,7 @@ use std::{
 
 use sandy::{
     BackendError, BoxState, Hypervisor, Markers, Outcome, PipeTransport, RunSpec, SECRET_MOUNT_TAG, StoreBacking,
-    TagPool, Topology, VmBackend, mount_args, run_console, stage_secrets, topology as eval_topology, wipe,
+    Topology, VmBackend, run_console, stage_secrets, topology as eval_topology, wipe,
 };
 use uuid::Uuid;
 
@@ -55,17 +54,12 @@ const TAP_ENV: &str = "SANDY_TAP";
 /// The already-staged inputs [`qemu_args`] needs, kept out of the pure assembler
 /// so argv assembly does no IO and stays tier-1 testable.
 ///
-/// `run` produces this from [`stage_secrets`](sandy::stage_secrets) and
-/// [`mount_args`](sandy::mount_args) before calling [`qemu_args`]:
-/// `mounts` is the `mount_args` output (one `sharedDir=…,mountTag=…[,ro]` string
-/// per [`RunSpec`] mount), `secret_share` is the read-only share for the staged
+/// `run` produces this from [`stage_secrets`](sandy::stage_secrets) before
+/// calling [`qemu_args`]: `secret_share` is the read-only share for the staged
 /// secrets directory, and `kvm` records whether `/dev/kvm` was usable (probed by
 /// `run`, so the assembler itself touches no host state).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct StagedArgs {
-    /// The virtiofs/9p share spec for each [`RunSpec`] mount, as produced by
-    /// [`mount_args`](sandy::mount_args).
-    pub mounts: Vec<String>,
     /// The read-only share spec for the staged-secrets directory, when the run
     /// carries secrets.
     pub secret_share: Option<String>,
@@ -95,7 +89,7 @@ pub struct StagedArgs {
 /// - `-nographic` and `-serial chardev:<id>` — the guest serial console; `run` adds the matching `-chardev socket,…`
 ///   that binds `<id>` to the #33 [`PipeTransport`] (the socket path is a host detail, so it is not emitted here).
 /// - `-enable-kvm -cpu host` when `staged.kvm`.
-/// - the virtiofs/virtio-9p shares from `staged.mounts` and `staged.secret_share`.
+/// - the virtiofs/virtio-9p secret share from `staged.secret_share`.
 /// - a `-netdev tap,…,ifname=<tap> -device virtio-net-pci,…` NIC pair when `staged.tap` is set (so the guest has egress
 ///   to filter, #29); nothing when it is `None` (the default isolated boot).
 /// - `-device vhost-vsock-pci,guest-cid=<cid>` when `topology.vsock_cid` is set.
@@ -167,10 +161,7 @@ pub fn qemu_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> Re
         args.push(format!("virtio-net-pci,netdev=net0,mac={GUEST_MAC}"));
     }
 
-    // The virtiofs/9p shares: the staged mount shares, then the secret share.
-    for share in &staged.mounts {
-        push_virtfs(&mut args, share)?;
-    }
+    // The virtiofs/9p secret share, when the run carries secrets.
     if let Some(secret_share) = &staged.secret_share {
         push_virtfs(&mut args, secret_share)?;
     }
@@ -212,8 +203,8 @@ fn kernel_cmdline(cmdline: &str) -> String {
     }
 }
 
-/// Translate one `mount_args`/secret share (`sharedDir=<host>,mountTag=<tag>[,ro]`)
-/// into a qemu `-virtfs local,…` pair, preserving the host path and tag.
+/// Translate one secret share (`sharedDir=<host>,mountTag=<tag>[,ro]`) into a
+/// qemu `-virtfs local,…` pair, preserving the host path and tag.
 ///
 /// # Errors
 ///
@@ -376,15 +367,12 @@ impl VmBackend for QemuBackend {
         let run_id = Uuid::new_v4();
         let inst_dir = std::env::temp_dir().join("sandy").join(run_id.to_string());
 
-        let mut tags = TagPool::new();
-        let mounts = mount_args(spec.mounts, &mut tags)?;
         let staged_secrets = stage_secrets(spec.secrets, &inst_dir)?;
         // Attach the secret share only when the run carries secrets; the guest mounts
         // `/run/sandy/secrets` with `nofail`, so a run with no share still boots.
         let secret_share = (!staged_secrets.is_empty())
             .then(|| format!("sharedDir={},mountTag={SECRET_MOUNT_TAG},ro", inst_dir.display()));
         let staged = StagedArgs {
-            mounts,
             secret_share,
             kvm: kvm_available(),
             // A tap is opt-in via $SANDY_TAP: the operator (or the #29 live gate)
@@ -426,10 +414,8 @@ fn kvm_available() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use anyhow::Context;
-    use sandy::{Grants, Hypervisor, Mount, TagPool, mount_args, parse_topology};
+    use sandy::{Grants, Hypervisor, parse_topology};
 
     use super::*;
 
@@ -456,7 +442,6 @@ mod tests {
         let spec = RunSpec {
             template: "demo",
             command: &command,
-            mounts: &[],
             secrets: &[],
             env: &[],
             cpu: None,
@@ -497,29 +482,13 @@ mod tests {
         Ok(())
     }
 
-    /// Tier-1: with `/dev/kvm` usable and a mount, `qemu_args` emits
-    /// `-enable-kvm -cpu host` and threads the mount share and the secret share
-    /// into the argv. RED until implemented.
+    /// Tier-1: with `/dev/kvm` usable and a secret, `qemu_args` emits
+    /// `-enable-kvm -cpu host` and threads the secret share into the argv.
     #[test]
-    fn qemu_args_enables_kvm_and_mounts() -> anyhow::Result<()> {
+    fn qemu_args_enables_kvm_and_threads_secret_share() -> anyhow::Result<()> {
         let topology = parse_topology(X86_64_FIXTURE).context("parse x86_64 fixture")?;
-        let tmp = tempfile::TempDir::new()?;
-        let rw_host = tmp.path().join("rw");
-        std::fs::create_dir_all(&rw_host).context("create mount host dir")?;
-        let mounts = [Mount {
-            host: rw_host.clone(),
-            guest: PathBuf::from("/out"),
-            ro: false,
-        }];
-        let mut tags = TagPool::new();
-        let mount_shares = mount_args(&mounts, &mut tags).context("assemble mount shares")?;
-        let secret_tag = tags.next_tag();
         let staged = StagedArgs {
-            mounts: mount_shares,
-            secret_share: Some(format!(
-                "sharedDir={}/inst,mountTag={secret_tag},ro",
-                tmp.path().display()
-            )),
+            secret_share: Some(format!("sharedDir=/tmp/inst,mountTag={SECRET_MOUNT_TAG},ro")),
             kvm: true,
             tap: None,
         };
@@ -527,12 +496,11 @@ mod tests {
         let grants = Grants {
             secrets: true,
             agent: false,
-            shares: true,
+            shares: false,
         };
         let spec = RunSpec {
             template: "demo",
             command: &command,
-            mounts: &mounts,
             secrets: &[],
             env: &[],
             cpu: None,
@@ -552,11 +520,7 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "-cpu"), "-cpu flag present: {args:?}");
         assert!(joined.contains("host"), "-cpu host passthrough: {joined}");
         assert!(
-            joined.contains(&rw_host.display().to_string()),
-            "mount host path shared into the guest: {joined}"
-        );
-        assert!(
-            joined.contains(&secret_tag),
+            joined.contains(SECRET_MOUNT_TAG),
             "secret share threaded into argv: {joined}"
         );
         Ok(())
@@ -573,7 +537,6 @@ mod tests {
         let spec = RunSpec {
             template: "demo",
             command: &command,
-            mounts: &[],
             secrets: &[],
             env: &[],
             cpu: None,
@@ -602,7 +565,6 @@ mod tests {
         let spec = RunSpec {
             template: "demo",
             command: &command,
-            mounts: &[],
             secrets: &[],
             env: &[],
             cpu: None,
@@ -640,7 +602,6 @@ mod tests {
         let spec = RunSpec {
             template: "demo",
             command: &command,
-            mounts: &[],
             secrets: &[],
             env: &[],
             cpu: None,
@@ -673,7 +634,6 @@ mod tests {
         let spec = RunSpec {
             template: "demo",
             command: &command,
-            mounts: &[],
             secrets: &[],
             env: &[],
             cpu: None,

@@ -8,8 +8,8 @@ use std::time::{Duration, SystemTime};
 use anyhow::Context;
 use sandy::{
     AllowList, BackendError, Capability, CoreError, EgressOs, EgressRule, FakeApplier, FakeBackend, FakeProvider,
-    Grants, JOURNAL_SCHEMA_VERSION, JobRecord, JobState, Journal, Logs, Mount, Outcome, Provenance,
-    RESULT_SCHEMA_VERSION, ResultEnvelope, Scope, SecretRef, SecretSource, Status, Target, to_nftables_forward,
+    Grants, JOURNAL_SCHEMA_VERSION, JobRecord, JobState, Journal, Logs, Outcome, Provenance, RESULT_SCHEMA_VERSION,
+    ResultEnvelope, Scope, SecretRef, SecretSource, Status, Target, to_nftables_forward,
 };
 use sandy_cli::{
     plan::JobPlan,
@@ -35,12 +35,11 @@ fn ok_outcome(guest_exit: i32) -> Outcome {
     }
 }
 
-/// A minimal plan that boots `demo` with no mounts, secrets, or env.
+/// A minimal plan that boots `demo` with no secrets or env.
 fn booting_plan() -> JobPlan {
     JobPlan {
         template: "demo".to_string(),
         command: vec![],
-        mounts: vec![],
         secrets: vec![],
         env: vec![],
         allow: AllowList::default(),
@@ -55,23 +54,17 @@ fn booting_plan() -> JobPlan {
     }
 }
 
-/// A plan whose secret file path is also a mount host — rejected by
+/// A plan whose secret name is also set as a plain env var — rejected by
 /// `validate_no_secret_leak` (INV-1).
 fn leaking_plan() -> JobPlan {
-    let shared = std::path::PathBuf::from("/run/leak-token");
     JobPlan {
         template: "demo".to_string(),
         command: vec![],
-        mounts: vec![Mount {
-            host: shared.clone(),
-            guest: std::path::PathBuf::from("/in/token"),
-            ro: true,
-        }],
         secrets: vec![SecretRef {
             name: "TOK".to_string(),
-            source: SecretSource::File(shared),
+            source: SecretSource::File(std::path::PathBuf::from("/run/leak-token")),
         }],
-        env: vec![],
+        env: vec![("TOK".to_string(), "leaked".to_string())],
         allow: AllowList::default(),
         cpu: None,
         mem: None,

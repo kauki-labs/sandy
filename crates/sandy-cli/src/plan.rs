@@ -6,8 +6,6 @@
 //! lifetimes through clap.
 //!
 //! Grammar (each option may repeat):
-//! - `--mount HOST:GUEST[:ro]` → a [`sandy::Mount`]; the optional `:ro` suffix selects a read-only mount, otherwise
-//!   read-write.
 //! - `--secret NAME=@PATH` → a [`sandy::SecretRef`] whose bytes come from the host file `PATH`
 //!   ([`sandy::SecretSource::File`]). The leading `@` marks a file source and is required.
 //! - `--env KEY=VALUE` → a `(KEY, VALUE)` pair. Env is never a secret channel (INV-1).
@@ -24,7 +22,7 @@
 
 use std::path::PathBuf;
 
-use sandy::{AllowList, EgressRule, Grants, Mount, PlanError, RunSpec, SecretRef, SecretSource};
+use sandy::{AllowList, EgressRule, Grants, PlanError, RunSpec, SecretRef, SecretSource};
 
 /// Default wall-clock timeout when `--timeout` is omitted (5 minutes). Picked as
 /// a sane bound for an interactive foreground `run`; override with `--timeout`.
@@ -38,8 +36,6 @@ const DEFAULT_TIMEOUT_SECS: u32 = 300;
 pub struct RunArgs {
     /// The positional template name (flake attr / image).
     pub template: String,
-    /// `--mount HOST:GUEST[:ro]` occurrences, verbatim.
-    pub mounts: Vec<String>,
     /// `--secret NAME=@PATH` occurrences, verbatim.
     pub secrets: Vec<String>,
     /// `--env KEY=VALUE` occurrences, verbatim.
@@ -64,8 +60,6 @@ pub struct JobPlan {
     pub template: String,
     /// The guest command; empty means "boot the template's default".
     pub command: Vec<String>,
-    /// Host→guest bind mounts.
-    pub mounts: Vec<Mount>,
     /// Secrets injected over the secret channel.
     pub secrets: Vec<SecretRef>,
     /// Extra environment variables (never secrets — INV-1).
@@ -90,7 +84,6 @@ impl JobPlan {
         RunSpec {
             template: &self.template,
             command: &self.command,
-            mounts: &self.mounts,
             secrets: &self.secrets,
             env: &self.env,
             cpu: self.cpu,
@@ -103,21 +96,16 @@ impl JobPlan {
     }
 }
 
-/// Parse raw `run` arguments into a [`JobPlan`], desugaring the mount/secret/env
+/// Parse raw `run` arguments into a [`JobPlan`], desugaring the secret/env
 /// grammar and the trailing command.
 ///
 /// # Errors
 ///
-/// Returns [`PlanError::Invalid`] for any malformed token (bad `--mount`,
-/// `--secret`, or `--env`), never a partial plan.
+/// Returns [`PlanError::Invalid`] for any malformed token (bad `--secret` or
+/// `--env`), never a partial plan.
 pub fn parse_run(args: RunArgs) -> Result<JobPlan, PlanError> {
     // Each list is parsed in full before the plan is constructed, so a malformed
     // token short-circuits with `?` and never yields a partial plan.
-    let mounts = args
-        .mounts
-        .iter()
-        .map(|raw| parse_mount(raw))
-        .collect::<Result<Vec<_>, _>>()?;
     let secrets = args
         .secrets
         .iter()
@@ -137,7 +125,6 @@ pub fn parse_run(args: RunArgs) -> Result<JobPlan, PlanError> {
     Ok(JobPlan {
         template: args.template,
         command: args.command,
-        mounts,
         secrets,
         env,
         allow: AllowList { rules },
@@ -151,24 +138,6 @@ pub fn parse_run(args: RunArgs) -> Result<JobPlan, PlanError> {
             agent: false,
             shares: false,
         },
-    })
-}
-
-/// Parse one `--mount HOST:GUEST[:ro]` token into a [`Mount`].
-fn parse_mount(raw: &str) -> Result<Mount, PlanError> {
-    let invalid = || PlanError::Invalid(format!("--mount `{raw}` must be HOST:GUEST[:ro]"));
-    let mut parts = raw.split(':');
-    let host = parts.next().filter(|s| !s.is_empty()).ok_or_else(invalid)?;
-    let guest = parts.next().filter(|s| !s.is_empty()).ok_or_else(invalid)?;
-    let ro = match (parts.next(), parts.next()) {
-        (None, _) => false,
-        (Some("ro"), None) => true,
-        _ => return Err(invalid()),
-    };
-    Ok(Mount {
-        host: PathBuf::from(host),
-        guest: PathBuf::from(guest),
-        ro,
     })
 }
 
@@ -268,37 +237,6 @@ mod tests {
         }
     }
 
-    /// `--mount HOST:GUEST:ro` desugars to a read-only [`Mount`] with the split
-    /// host and guest paths.
-    #[test]
-    fn mount_with_ro_suffix_parses_read_only() -> anyhow::Result<()> {
-        let args = RunArgs {
-            template: "demo".to_string(),
-            mounts: vec!["/h:/g:ro".to_string()],
-            ..RunArgs::default()
-        };
-        let plan = parse_run(args).map_err(|e| anyhow::anyhow!("parse_run: {e}"))?;
-        let mount = plan.mounts.first().expect("one mount parsed");
-        assert_eq!(mount.host.to_string_lossy(), "/h");
-        assert_eq!(mount.guest.to_string_lossy(), "/g");
-        assert!(mount.ro, "the :ro suffix must select a read-only mount");
-        Ok(())
-    }
-
-    /// `--mount HOST:GUEST` without the suffix desugars to a read-write mount.
-    #[test]
-    fn mount_without_ro_suffix_parses_read_write() -> anyhow::Result<()> {
-        let args = RunArgs {
-            template: "demo".to_string(),
-            mounts: vec!["/h:/g".to_string()],
-            ..RunArgs::default()
-        };
-        let plan = parse_run(args).map_err(|e| anyhow::anyhow!("parse_run: {e}"))?;
-        let mount = plan.mounts.first().expect("one mount parsed");
-        assert!(!mount.ro, "no suffix must default to read-write");
-        Ok(())
-    }
-
     /// `--secret NAME=@PATH` desugars to a file-sourced [`SecretRef`].
     #[test]
     fn secret_file_source_parses() -> anyhow::Result<()> {
@@ -341,21 +279,6 @@ mod tests {
         let plan = parse_run(args).map_err(|e| anyhow::anyhow!("parse_run: {e}"))?;
         assert_eq!(plan.command, vec!["echo".to_string(), "hi".to_string()]);
         Ok(())
-    }
-
-    /// A `--mount` with no `HOST:GUEST` separator is rejected as an invalid plan
-    /// (band 2), never silently dropped into a partial plan.
-    #[test]
-    fn malformed_mount_is_invalid_plan() {
-        let args = RunArgs {
-            template: "demo".to_string(),
-            mounts: vec!["no-colon-here".to_string()],
-            ..RunArgs::default()
-        };
-        assert!(
-            matches!(parse_run(args), Err(PlanError::Invalid(_))),
-            "a malformed --mount must yield PlanError::Invalid"
-        );
     }
 
     /// A `--secret` missing the `=@` file marker is rejected as an invalid plan.

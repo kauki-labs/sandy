@@ -1,8 +1,8 @@
 //! The native vfkit backend (Block 32, macOS / Virtualization.framework).
 //!
 //! [`VfkitBackend`] is the [`VmBackend`] for the macOS path: it assembles a
-//! `vfkit` argv from a [`Topology`] (#31), stages the run's secrets and mounts
-//! (#34), launches `vfkit` under the PTY console transport (#33), and collapses
+//! `vfkit` argv from a [`Topology`] (#31), stages the run's secrets (#50),
+//! launches `vfkit` under the PTY console transport (#33), and collapses
 //! the console protocol into the pinned [`Outcome`] (INV-8). vfkit exposes its
 //! guest serial console as `virtio-serial,stdio`, which needs a real TTY — hence
 //! the PTY path rather than a plain pipe.
@@ -23,7 +23,7 @@ use std::{
 
 use sandy::{
     BackendError, BoxState, Hypervisor, Markers, Outcome, PtyTransport, RunSpec, SECRET_MOUNT_TAG, StoreBacking,
-    TagPool, Topology, VmBackend, mount_args, run_console, stage_secrets, topology, wipe,
+    Topology, VmBackend, run_console, stage_secrets, topology, wipe,
 };
 use uuid::Uuid;
 
@@ -36,15 +36,12 @@ const BOOT_READY_MARKER: &str = "SANDY-READY";
 /// The staged virtio-fs share descriptors [`vfkit_args`] weaves into the argv.
 ///
 /// Argv assembly is kept pure and testable without real staging: the backend
-/// stages secrets and mounts first (#34), reduces each to a virtio-fs share
-/// descriptor, and hands the strings here. Only share *descriptors* (host path
-/// plus mount tag) travel this struct — never secret bytes, which stay in their
-/// `0600` staging file (INV-1).
+/// stages secrets first, reduces each to a virtio-fs share descriptor, and hands
+/// the strings here. Only share *descriptors* (host path plus mount tag) travel
+/// this struct — never secret bytes, which stay in their `0600` staging file
+/// (INV-1).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StagedArgs {
-    /// virtio-fs share descriptors for the caller's bind mounts, as emitted by
-    /// [`mount_args`](sandy::mount_args) (`sharedDir=…,mountTag=…[,ro]`).
-    pub mount_shares: Vec<String>,
     /// virtio-fs share descriptor(s) for the staged-secret directory
     /// (`sharedDir=<inst_dir>,mountTag=…,ro`). The secret channel is a read-only
     /// share of the staging dir, never argv bytes (INV-1).
@@ -52,13 +49,10 @@ pub struct StagedArgs {
 }
 
 impl StagedArgs {
-    /// A [`StagedArgs`] carrying the given mount and secret share descriptors.
+    /// A [`StagedArgs`] carrying the given secret share descriptors.
     #[must_use]
-    pub fn new(mount_shares: Vec<String>, secret_shares: Vec<String>) -> Self {
-        Self {
-            mount_shares,
-            secret_shares,
-        }
+    pub fn new(secret_shares: Vec<String>) -> Self {
+        Self { secret_shares }
     }
 }
 
@@ -80,9 +74,8 @@ impl StagedArgs {
 ///   virtio-fs,sharedDir=/nix/store,mountTag=<tag>` (the guest mounts it read-only via the `ro-store` tag).
 /// - `--device virtio-serial,stdio` — the guest `hvc0` console. `stdio` is backed by the PTY master the backend spawns
 ///   `vfkit` under (#33), which is why a real TTY is required.
-/// - one `--device virtio-fs,<descriptor>` per entry in [`StagedArgs::mount_shares`] and [`StagedArgs::secret_shares`]
-///   — the caller's bind mounts and the staged-secret share. Each `--device` and its descriptor are separate argv
-///   tokens.
+/// - one `--device virtio-fs,<descriptor>` per entry in [`StagedArgs::secret_shares`] — the staged-secret share. Each
+///   `--device` and its descriptor are separate argv tokens.
 /// - `--device virtio-vsock,…` when [`Topology::vsock_cid`] is `Some` (absent in the aarch64 fixture).
 ///
 /// # Errors
@@ -132,10 +125,10 @@ pub fn vfkit_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> R
     args.push("--device".to_string());
     args.push("virtio-serial,stdio".to_string());
 
-    // The caller's bind mounts and the staged-secret share, each an already-assembled virtio-fs descriptor.
+    // The staged-secret share, an already-assembled virtio-fs descriptor.
     // vfkit's virtio-fs device rejects a `ro` option ("unknown option for virtio-fs devices: ro") — unlike the
-    // erofs store's virtio-blk `readonly` — so drop a trailing `,ro`; the guest mounts these shares read-only.
-    for descriptor in staged.mount_shares.iter().chain(&staged.secret_shares) {
+    // erofs store's virtio-blk `readonly` — so drop a trailing `,ro`; the guest mounts the share read-only.
+    for descriptor in &staged.secret_shares {
         let descriptor = descriptor.strip_suffix(",ro").unwrap_or(descriptor);
         args.push("--device".to_string());
         args.push(format!("virtio-fs,{descriptor}"));
@@ -206,9 +199,7 @@ impl VfkitBackend {
             )]
         };
 
-        let mut tags = TagPool::new();
-        let mount_shares = mount_args(spec.mounts, &mut tags)?;
-        let staged = StagedArgs::new(mount_shares, secret_shares);
+        let staged = StagedArgs::new(secret_shares);
         let args = vfkit_args(topology, spec, &staged)?;
 
         let mut transport = PtyTransport::open()?;
@@ -277,7 +268,7 @@ mod tests {
     use std::path::PathBuf;
 
     use anyhow::Context;
-    use sandy::{Grants, Hypervisor, Mount, SecretRef, SecretSource, StoreBacking, parse_topology};
+    use sandy::{Grants, Hypervisor, SecretRef, SecretSource, StoreBacking, parse_topology};
 
     use super::*;
 
@@ -315,7 +306,6 @@ mod tests {
         let spec = RunSpec {
             template: "demo",
             command: &command,
-            mounts: &[],
             secrets: &[],
             env: &[],
             cpu: None,
@@ -356,19 +346,14 @@ mod tests {
         Ok(())
     }
 
-    /// Tier-1: a run with a bind mount and a secret weaves both staged shares
-    /// into the argv as `virtio-fs` devices — carrying the share path+tag, never
-    /// the secret bytes (INV-1). RED until implemented.
+    /// Tier-1: a run with a secret weaves the staged secret share into the argv
+    /// as a `virtio-fs` device — carrying the share path+tag, never the secret
+    /// bytes (INV-1) — with the trailing `,ro` stripped (vfkit rejects it).
     #[test]
-    fn vfkit_args_includes_mounts_and_secret_share() -> anyhow::Result<()> {
+    fn vfkit_args_includes_secret_share() -> anyhow::Result<()> {
         let topology = parse_topology(AARCH64_FIXTURE).context("parse aarch64 fixture")?;
         let command = ["true".to_string()];
         let grants = grants();
-        let mounts = [Mount {
-            host: PathBuf::from("/host/in"),
-            guest: PathBuf::from("/in"),
-            ro: true,
-        }];
         let secrets = [SecretRef {
             name: "TOK".to_string(),
             source: SecretSource::File(PathBuf::from("/host/secret")),
@@ -376,7 +361,6 @@ mod tests {
         let spec = RunSpec {
             template: "demo",
             command: &command,
-            mounts: &mounts,
             secrets: &secrets,
             env: &[],
             cpu: None,
@@ -385,23 +369,22 @@ mod tests {
             grants: &grants,
             outcome_file: None,
         };
-        // The argv-safe staged descriptors: the secret bytes are already on disk
+        // The argv-safe staged descriptor: the secret bytes are already on disk
         // in a 0600 file; only the share path and tag reach argv (INV-1).
-        let staged = StagedArgs::new(
-            vec!["sharedDir=/host/in,mountTag=sandy0,ro".to_string()],
-            vec!["sharedDir=/run/sandy/inst-0,mountTag=sandy-secrets,ro".to_string()],
-        );
+        let staged = StagedArgs::new(vec![
+            "sharedDir=/run/sandy/inst-0,mountTag=sandy-secrets,ro".to_string(),
+        ]);
 
         let args = vfkit_args(&topology, &spec, &staged).context("assemble vfkit argv")?;
         let joined = args.join(" ");
 
         assert!(
-            joined.contains("--device virtio-fs,sharedDir=/host/in,mountTag=sandy0"),
-            "mount share woven into a virtio-fs device: {joined}"
-        );
-        assert!(
             joined.contains("--device virtio-fs,sharedDir=/run/sandy/inst-0,mountTag=sandy-secrets"),
             "secret share woven into a virtio-fs device: {joined}"
+        );
+        assert!(
+            !joined.contains("mountTag=sandy-secrets,ro"),
+            "vfkit's virtio-fs rejects `,ro`, so it must be stripped: {joined}"
         );
         Ok(())
     }
@@ -418,7 +401,6 @@ mod tests {
         let spec = RunSpec {
             template: "demo",
             command: &command,
-            mounts: &[],
             secrets: &[],
             env: &[],
             cpu: None,
@@ -449,7 +431,6 @@ mod tests {
         let spec = RunSpec {
             template: "demo",
             command: &command,
-            mounts: &[],
             secrets: &[],
             env: &[],
             cpu: None,
@@ -487,7 +468,6 @@ mod tests {
         let spec = RunSpec {
             template: "demo",
             command: &command,
-            mounts: &[],
             secrets: &[],
             env: &[],
             cpu: None,
