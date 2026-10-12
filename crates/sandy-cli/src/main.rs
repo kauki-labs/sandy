@@ -6,7 +6,7 @@
 //! maps results to process exit bands (INV-11).
 
 use clap::{Parser, Subcommand};
-use sandy::{CoreError, Journal, ProcessExit};
+use sandy::{Capability, CoreError, GithubAdapter, Journal, ProcessExit, Scope, TrustRoot};
 use sandy_cli::{
     app_register::{self, Owner},
     doctor,
@@ -57,6 +57,15 @@ enum Command {
         /// Optional wall-clock timeout in seconds.
         #[arg(long)]
         timeout: Option<u32>,
+        /// Mint a scoped forge token for the job from the named trust root (a
+        /// `sandy app` name); the token is injected as `GITHUB_TOKEN` and revoked
+        /// at teardown.
+        #[arg(long = "credential")]
+        credential: Option<String>,
+        /// Capability for the minted credential: `read-code` | `write-code` |
+        /// `read-pr` | `write-pr` (repeatable; default `read-code`).
+        #[arg(long = "cred-capability")]
+        cred_capability: Vec<String>,
         /// The trailing `-- CMD ARGS...` guest command.
         #[arg(last = true)]
         command: Vec<String>,
@@ -220,6 +229,36 @@ fn egress_applier() -> NoEgress {
     NoEgress
 }
 
+/// Load the named trust root from `dir` and build the live [`GithubAdapter`] plus
+/// the [`Scope`] to mint for: the trust root's own target repositories and the
+/// requested capabilities (default `read-code`). Returns a human-readable error for
+/// a missing/invalid trust root or an unknown capability (a config fault).
+fn credential_setup(
+    dir: &std::path::Path,
+    name: &str,
+    capabilities: &[String],
+) -> Result<(GithubAdapter, Scope), String> {
+    let cfg = dir.join(format!("{name}.json"));
+    let root = TrustRoot::load(&cfg).map_err(|e| format!("load trust root {name:?}: {e}"))?;
+    let targets = match &root {
+        TrustRoot::Github { targets, .. } => targets.clone(),
+        TrustRoot::Gitlab { .. } => return Err("GitLab trust roots are not supported yet".to_string()),
+    };
+    let mut caps = parse_caps(capabilities)
+        .map_err(|tok| format!("unknown --cred-capability {tok:?} (expected read-code|write-code|read-pr|write-pr)"))?;
+    if caps.is_empty() {
+        caps.push(Capability::ReadCode);
+    }
+    let adapter = GithubAdapter::from_trust_root(&root).map_err(|e| format!("build credential adapter: {e}"))?;
+    Ok((
+        adapter,
+        Scope {
+            targets,
+            capabilities: caps,
+        },
+    ))
+}
+
 fn main() {
     let cli = Cli::parse();
     std::process::exit(dispatch(cli.command, cli.output));
@@ -341,6 +380,8 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
             cpu,
             mem,
             timeout,
+            credential,
+            cred_capability,
             command,
         } => {
             let args = RunArgs {
@@ -364,10 +405,7 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
             let backend = host_backend();
             // Egress is bracketed around the boot per platform: Linux enforces the
             // nftables boundary, macOS has none (`plan_egress` → NoBoundary, so the
-            // no-op applier is never called). Cred stays WALLED: the live GitHub
-            // `CredentialProvider` adapter and `mint_run_token` bind in once the App
-            // is registered (#49); there is no `--github-token` flag because no live
-            // provider exists to honor it yet.
+            // no-op applier is never called).
             let egress = egress_applier();
             let egress_os = if cfg!(target_os = "macos") {
                 sandy::EgressOs::MacOs
@@ -378,11 +416,59 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
             // backend attaches the NIC to. On Linux a bound tap selects the
             // guest-scoped forward ruleset (safe), never the host-OUTPUT drop-all (#29).
             let tap = std::env::var("SANDY_TAP").ok().filter(|t| !t.is_empty());
-            let report = match supervisor::run_job(&backend, &journal, &plan, &egress, egress_os, tap.as_deref()) {
-                Ok(report) => report,
-                Err(e) => {
-                    eprintln!("sandy: run failed: {e}");
+
+            // With `--credential`, mint a scoped forge token from the named trust
+            // root and bracket the run with it (mint → inject → revoke at teardown);
+            // otherwise run with no credential. Setup errors (bad trust root or
+            // capability) are config faults (band 2), before any boot.
+            let report = if let Some(name) = credential {
+                let dir = match app_register::trust_roots_dir() {
+                    Ok(dir) => dir,
+                    Err(e) => {
+                        eprintln!("sandy: trust-roots dir: {e}");
+                        return ProcessExit::InfraFault.code();
+                    }
+                };
+                let (adapter, scope) = match credential_setup(&dir, &name, &cred_capability) {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        eprintln!("sandy: {e}");
+                        return ProcessExit::InvalidPlan.code();
+                    }
+                };
+                let cred_dir = std::env::temp_dir().join(format!("sandy-cred-{}", std::process::id()));
+                if let Err(e) = std::fs::create_dir_all(&cred_dir) {
+                    eprintln!("sandy: create credential staging dir: {e}");
                     return ProcessExit::InfraFault.code();
+                }
+                let result = supervisor::run_job_with_credential(
+                    &backend,
+                    &journal,
+                    plan,
+                    &egress,
+                    egress_os,
+                    tap.as_deref(),
+                    &adapter,
+                    &scope,
+                    "GITHUB_TOKEN",
+                    &cred_dir,
+                    sandy::MAX_TTL_SECS,
+                );
+                let _ = std::fs::remove_dir_all(&cred_dir);
+                match result {
+                    Ok(report) => report,
+                    Err(e) => {
+                        eprintln!("sandy: run failed: {e}");
+                        return ProcessExit::InfraFault.code();
+                    }
+                }
+            } else {
+                match supervisor::run_job(&backend, &journal, &plan, &egress, egress_os, tap.as_deref()) {
+                    Ok(report) => report,
+                    Err(e) => {
+                        eprintln!("sandy: run failed: {e}");
+                        return ProcessExit::InfraFault.code();
+                    }
                 }
             };
             // The envelope is the result, not a diagnostic — print it (the band,
@@ -460,5 +546,78 @@ fn report_error(error: &CoreError) -> i32 {
     match error {
         CoreError::NotFound(_) => ProcessExit::InvalidPlan.code(),
         _ => ProcessExit::InfraFault.code(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use anyhow::Context;
+    use sandy::Target;
+
+    use super::*;
+
+    /// Write a GitHub trust root (and a `0600` dummy key) under `dir`, so
+    /// `credential_setup` has something to load without a live forge.
+    fn write_trust_root(dir: &std::path::Path, name: &str, targets: &[&str]) -> anyhow::Result<()> {
+        std::fs::create_dir_all(dir).context("mkdir")?;
+        let pem = dir.join(format!("{name}.pem"));
+        std::fs::write(&pem, b"-----dummy-----").context("write pem")?;
+        std::fs::set_permissions(&pem, std::fs::Permissions::from_mode(0o600)).context("chmod pem")?;
+        let root = TrustRoot::Github {
+            base_url: None,
+            app_id: "123".to_string(),
+            private_key_path: pem,
+            installation_id: 7,
+            targets: targets.iter().map(|t| Target((*t).to_string())).collect(),
+        };
+        root.write(&dir.join(format!("{name}.json")))
+            .context("write trust root")?;
+        Ok(())
+    }
+
+    #[test]
+    fn credential_setup_scopes_to_the_trust_root_targets_and_capabilities() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        write_trust_root(tmp.path(), "runner", &["kauki-labs/sandy-pilot-test"])?;
+
+        let (_adapter, scope) = credential_setup(
+            tmp.path(),
+            "runner",
+            &["write-code".to_string(), "write-pr".to_string()],
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+        assert_eq!(scope.targets, vec![Target("kauki-labs/sandy-pilot-test".to_string())]);
+        assert_eq!(scope.capabilities, vec![Capability::WriteCode, Capability::WritePr]);
+        Ok(())
+    }
+
+    #[test]
+    fn credential_setup_defaults_to_read_code_when_no_capability_is_given() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        write_trust_root(tmp.path(), "runner", &["o/r"])?;
+
+        let (_adapter, scope) = credential_setup(tmp.path(), "runner", &[]).map_err(|e| anyhow::anyhow!(e))?;
+
+        assert_eq!(
+            scope.capabilities,
+            vec![Capability::ReadCode],
+            "no capability flag defaults to read-code"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn credential_setup_rejects_an_unknown_capability() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        write_trust_root(tmp.path(), "runner", &["o/r"])?;
+
+        let err = credential_setup(tmp.path(), "runner", &["admin".to_string()])
+            .map(|_| ())
+            .expect_err("an unknown capability must be rejected");
+        assert!(err.contains("unknown --cred-capability"), "got: {err}");
+        Ok(())
     }
 }
