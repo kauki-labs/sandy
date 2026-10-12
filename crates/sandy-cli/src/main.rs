@@ -98,8 +98,12 @@ enum AppCommand {
     /// Register a GitHub App trust root in-code (drives the Create + Install
     /// clicks, captures the key and ids, writes the config — no hand-copying).
     Register {
-        /// The App name (globally unique on GitHub).
+        /// The local handle (the `<name>.json` / `<name>.pem` file stem). By
+        /// default the GitHub App name is `<name>-<random>` to avoid clashes.
         name: String,
+        /// Use this exact GitHub App name instead of the default `<name>-<random>`.
+        #[arg(long)]
+        name_override: Option<String>,
         /// Register under this organization instead of your user account.
         #[arg(long)]
         org: Option<String>,
@@ -190,6 +194,7 @@ fn dispatch_app(app: AppCommand) -> i32 {
     let result = match app {
         AppCommand::Register {
             name,
+            name_override,
             org,
             base_url,
             homepage,
@@ -206,7 +211,17 @@ fn dispatch_app(app: AppCommand) -> i32 {
             };
             let owner = org.map_or(Owner::User, Owner::Org);
             let targets = repos.into_iter().map(sandy::Target).collect();
-            app_register::run_register(&name, &homepage, owner, &base_url, &caps, targets, skip_verify)
+            let github_name = app_register::github_app_name(&name, name_override.as_deref());
+            app_register::run_register(
+                &name,
+                &github_name,
+                &homepage,
+                owner,
+                &base_url,
+                &caps,
+                targets,
+                skip_verify,
+            )
         }
         AppCommand::Deregister { name, keep_remote } => app_register::run_deregister(&name, keep_remote),
     };

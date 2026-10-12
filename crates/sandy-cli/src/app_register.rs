@@ -161,7 +161,11 @@ fn html_attr_escape(raw: &str) -> String {
 
 /// The GitHub `Provisioner`: drives the manifest flow and captures the trust root.
 pub struct GithubProvisioner {
-    /// The App name (globally unique on GitHub).
+    /// The local handle: the stem of the `<handle>.json` / `<handle>.pem` files.
+    /// Stable and predictable, independent of the (possibly suffixed) App name.
+    pub handle: String,
+    /// The App name as registered on GitHub (globally unique; may carry a random
+    /// suffix). Used only in the manifest.
     pub app_name: String,
     /// The App homepage URL.
     pub homepage_url: String,
@@ -238,7 +242,7 @@ impl Provisioner for GithubProvisioner {
             .ok_or_else(|| InstallError::Capture("the create redirect carried no code".to_string()))?;
 
         let conversion = convert_manifest(self.api_base().as_deref(), code)?;
-        let key_path = write_pem(&self.app_name, &conversion.pem)?;
+        let key_path = write_pem(&self.handle, &conversion.pem)?;
 
         eprintln!(
             "App created. Open {}/apps/{}/installations/new, click \"Install\", and pick the repositories.",
@@ -269,12 +273,28 @@ impl Provisioner for GithubProvisioner {
         ))
     }
 
-    fn revoke(&self, _root: &TrustRoot) -> Result<RevokeOutcome, InstallError> {
-        Err(InstallError::Revoke(
-            "forge uninstall needs the App-authed client (not yet available); use --keep-remote to shred locally and \
-             uninstall in the GitHub UI"
-                .to_string(),
-        ))
+    fn revoke(&self, root: &TrustRoot) -> Result<RevokeOutcome, InstallError> {
+        // Forge uninstall (DELETE /app/installations/{id}) needs a fresh App JWT,
+        // which only the live .pem can sign — and App JWTs live <=10 min, so one
+        // can never be pre-made for a key that later disappears. Until the
+        // App-authed client lands (and whenever the key is gone), uninstall is a
+        // manual UI step: report where, and let the local teardown proceed rather
+        // than blocking it.
+        Ok(RevokeOutcome {
+            uninstalled: false,
+            registration_residue: Some(manual_uninstall_url(&self.web_base, root)),
+        })
+    }
+}
+
+/// The GitHub UI URL at which the user uninstalls the App by hand (no `.pem`
+/// needed — it uses their account login).
+fn manual_uninstall_url(web_base: &str, root: &TrustRoot) -> String {
+    match root {
+        TrustRoot::Github { installation_id, .. } => {
+            format!("{web_base}/settings/installations/{installation_id}")
+        }
+        TrustRoot::Gitlab { .. } => format!("{web_base}/-/profile/personal_access_tokens"),
     }
 }
 
@@ -304,7 +324,7 @@ fn convert_manifest(api_base: Option<&str>, code: &str) -> Result<Conversion, In
 
 /// Write the captured PEM to a `0600` file under the trust-roots dir, returning
 /// its path.
-fn write_pem(app_name: &str, pem: &str) -> Result<PathBuf, InstallError> {
+fn write_pem(stem: &str, pem: &str) -> Result<PathBuf, InstallError> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let dir = trust_roots_dir().map_err(|e| InstallError::Capture(e.to_string()))?;
@@ -313,7 +333,7 @@ fn write_pem(app_name: &str, pem: &str) -> Result<PathBuf, InstallError> {
         path: dir.clone(),
         source,
     })?;
-    let path = dir.join(format!("{app_name}.pem"));
+    let path = dir.join(format!("{stem}.pem"));
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -354,6 +374,18 @@ fn new_nonce() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }
 
+/// The GitHub App name to register. With `override_name` it is used verbatim;
+/// otherwise the handle gets a short random suffix, so re-using a handle never
+/// clashes in GitHub's global App namespace (the handle stays the local file
+/// stem regardless).
+#[must_use]
+pub fn github_app_name(handle: &str, override_name: Option<&str>) -> String {
+    match override_name {
+        Some(name) => name.to_string(),
+        None => format!("{handle}-{}", &new_nonce()[..6]),
+    }
+}
+
 /// `sandy app register`: register a GitHub App trust root in-code. Prints the
 /// one-line disclosure (contacts only the forge, captures locally, writes `0600`,
 /// ships no secret), drives the two browser clicks, and writes the trust root.
@@ -363,7 +395,8 @@ fn new_nonce() -> String {
 /// Any [`InstallError`] from capture, verify, or the config write.
 #[allow(clippy::too_many_arguments)]
 pub fn run_register(
-    name: &str,
+    handle: &str,
+    github_app_name: &str,
     homepage_url: &str,
     owner: Owner,
     web_base: &str,
@@ -372,9 +405,10 @@ pub fn run_register(
     skip_verify: bool,
 ) -> Result<(), InstallError> {
     let dir = trust_roots_dir().map_err(|e| InstallError::Capture(e.to_string()))?;
-    let cfg = config_path(&dir, name);
+    let cfg = config_path(&dir, handle);
     let provisioner = GithubProvisioner {
-        app_name: name.to_string(),
+        handle: handle.to_string(),
+        app_name: github_app_name.to_string(),
         homepage_url: homepage_url.to_string(),
         web_base: web_base.to_string(),
         owner,
@@ -400,7 +434,7 @@ pub fn run_register(
         ..
     } = &root
     {
-        println!("Registered GitHub App: app_id={app_id}, installation_id={installation_id}");
+        println!("Registered GitHub App \"{github_app_name}\": app_id={app_id}, installation_id={installation_id}");
         println!("Trust root: {}", cfg.display());
         println!("Private key: {} (0600)", private_key_path.display());
     }
@@ -422,9 +456,9 @@ pub fn run_deregister(name: &str, keep_remote: bool) -> Result<(), InstallError>
 
     if outcome.uninstalled {
         println!("Uninstalled the App at the forge.");
-    }
-    if let Some(url) = outcome.registration_residue {
-        println!("The App registration itself has no delete API; remove the now-powerless App at {url}");
+    } else if let Some(url) = &outcome.registration_residue {
+        println!("Did not uninstall at the forge (needs the App key, which only its live .pem can sign).");
+        println!("Uninstall it yourself in the GitHub UI (no key needed): {url}");
     }
     println!("Shredded the local key and removed {}", cfg.display());
     Ok(())
@@ -441,6 +475,7 @@ fn provisioner_for(root: &TrustRoot, name: &str) -> GithubProvisioner {
         _ => "https://github.com".to_string(),
     };
     GithubProvisioner {
+        handle: name.to_string(),
         app_name: name.to_string(),
         homepage_url: String::new(),
         web_base,
@@ -502,6 +537,20 @@ mod tests {
     #[test]
     fn an_html_attribute_value_is_escaped() {
         assert_eq!(html_attr_escape(r#"a"b&c<d"#), "a&quot;b&amp;c&lt;d");
+    }
+
+    #[test]
+    fn the_github_app_name_suffixes_by_default_and_honors_an_override() {
+        let suffixed = github_app_name("sandy-runner", None);
+        assert!(suffixed.starts_with("sandy-runner-"), "got {suffixed}");
+        assert_eq!(suffixed.len(), "sandy-runner-".len() + 6, "6-char random suffix");
+        assert_ne!(
+            github_app_name("sandy-runner", None),
+            suffixed,
+            "each default name is unique"
+        );
+
+        assert_eq!(github_app_name("sandy-runner", Some("exact-name")), "exact-name");
     }
 
     #[test]

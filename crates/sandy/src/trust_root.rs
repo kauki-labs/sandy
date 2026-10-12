@@ -103,6 +103,14 @@ pub enum InstallError {
     /// The forge-side revoke failed during deregister.
     #[error("forge revoke failed: {0}")]
     Revoke(String),
+    /// A trust root with this name already exists; register refuses to overwrite
+    /// it (which would orphan the existing App at the forge). Deregister it first,
+    /// or choose another name.
+    #[error("a trust root already exists at {path}; deregister it first or choose another name")]
+    AlreadyExists {
+        /// The existing config path.
+        path: PathBuf,
+    },
     /// A credential-seam error (e.g. reading/writing the trust-root config).
     #[error(transparent)]
     Cred(#[from] CredError),
@@ -159,6 +167,7 @@ pub fn register(
     capabilities: &[Capability],
     config_path: &Path,
 ) -> Result<TrustRoot, InstallError> {
+    reject_existing(config_path)?;
     let root = provisioner.capture(capabilities)?;
     if let Err(err) = provisioner.verify(&root, capabilities) {
         // Tear down what capture created; write no config. Revoke needs the secret,
@@ -185,9 +194,21 @@ pub fn register_skip_verify(
     capabilities: &[Capability],
     config_path: &Path,
 ) -> Result<TrustRoot, InstallError> {
+    reject_existing(config_path)?;
     let root = provisioner.capture(capabilities)?;
     root.write(config_path)?;
     Ok(root)
+}
+
+/// Refuse to register over an existing trust-root config. Checked before capture,
+/// so a re-run never creates a second (orphaned) App at the forge.
+fn reject_existing(config_path: &Path) -> Result<(), InstallError> {
+    if config_path.exists() {
+        return Err(InstallError::AlreadyExists {
+            path: config_path.to_path_buf(),
+        });
+    }
+    Ok(())
 }
 
 /// Deregister a trust root: revoke at the forge **before** shredding the local
@@ -404,6 +425,24 @@ mod tests {
         assert!(cfg.exists(), "config is written after a passing verify");
         assert!(key.exists(), "the secret stays staged on success");
         assert_eq!(TrustRoot::load(&cfg)?, root, "the written config round-trips");
+        Ok(())
+    }
+
+    #[test]
+    fn register_refuses_an_existing_name_before_creating_anything() -> anyhow::Result<()> {
+        let tmp = TempDir::new()?;
+        let key = tmp.path().join("key.pem");
+        let cfg = tmp.path().join("root.json");
+        std::fs::write(&cfg, "{}")?; // a trust root of this name already exists
+        let provisioner = FakeProvisioner::new(github_root(&key));
+
+        let err = register(&provisioner, &[Capability::WriteCode], &cfg).expect_err("must refuse");
+
+        assert!(matches!(err, InstallError::AlreadyExists { .. }), "got {err:?}");
+        assert!(
+            !key.exists(),
+            "capture must not run, so no App is created and no secret is staged"
+        );
         Ok(())
     }
 
