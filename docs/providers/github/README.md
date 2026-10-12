@@ -73,3 +73,18 @@ local teardown and points to the UI.
 grant is the ceiling; each minted token is scoped at or below it.
 
 GitHub Enterprise Server: pass `--base-url https://<host>` to `register` / `import`.
+
+## Regression check
+
+A live, host-gated end-to-end test guards the flow (it needs a real registered
+App, so it's off by default and never runs in CI):
+
+```sh
+SANDY_LIVE=1 cargo nextest run -p sandy-cli --features live --test cred_e2e
+```
+
+It runs `verify` against the configured trust root — build the adapter, read the
+installation's grant, mint a scoped token, revoke it — and fails if register,
+verify, or the adapter regressed. `SANDY_CRED_HANDLE` / `SANDY_CRED_CAPS` target a
+different root. (`sandy run --credential` into a live guest is a separate run-path
+gate, pending guest-side secret consumption.)
