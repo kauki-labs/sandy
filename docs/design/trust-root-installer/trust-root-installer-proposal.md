@@ -1,4 +1,4 @@
-# Trust-root installer (sandy app register): proposal
+# Trust-root installer (sandy cred github register): proposal
 
 ## 1. Purpose and non-goals
 
@@ -40,7 +40,7 @@ On sandy `origin/main`:
 
 ## 3. Requirements (fixed constraints)
 
-- REQ-1: When the user runs `sandy app register` for a target, the system SHALL write a
+- REQ-1: When the user runs `sandy cred github register` for a target, the system SHALL write a
   trust-root config the credential-seam adapter consumes (the Block 0 contract), needing no
   further hand configuration. (MUST)
 - REQ-2: The system SHALL support a `github` and a `gitlab` kind, each on its public host or a

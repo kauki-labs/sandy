@@ -1,4 +1,4 @@
-# Decision log: Trust-root installer (sandy app register)
+# Decision log: Trust-root installer (sandy cred github register)
 
 The anti-re-litigation record. Each decision uses MADR fields (see `references/methodology.md`).
 

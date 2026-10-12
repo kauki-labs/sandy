@@ -574,6 +574,9 @@ pub fn run_deregister(name: &str, keep_remote: bool) -> Result<(), InstallError>
 
     if outcome.uninstalled {
         println!("Uninstalled the App at the forge.");
+        if let Some(url) = &outcome.registration_residue {
+            println!("The App registration shell can't be deleted via API; remove it in the UI: {url}");
+        }
     } else if let Some(url) = &outcome.registration_residue {
         println!("Did not uninstall at the forge (needs the App key, which only its live .pem can sign).");
         println!("Uninstall it yourself in the GitHub UI (no key needed): {url}");

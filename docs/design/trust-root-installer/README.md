@@ -1,6 +1,6 @@
-# Trust-root installer (sandy app register) (trust-root-installer): START HERE
+# Trust-root installer (sandy cred github register) (trust-root-installer): START HERE
 
-`sandy app register` provisions the per-installer forge trust root the credential seam consumes
+`sandy cred github register` provisions the per-installer forge trust root the credential seam consumes
 (credential-seam Block 0), for a chosen target (github.com, GitHub Enterprise Server, gitlab.com,
 self-managed GitLab): it pre-fills the registration, hand-holds the few manual clicks, and
 captures the credential locally at `0600`. The credential is generated into the installer's own

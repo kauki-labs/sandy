@@ -1,4 +1,4 @@
-# Trust-root installer (sandy app register): spec
+# Trust-root installer (sandy cred github register): spec
 
 Design amendments (grounded deviations from the proposal) go here and supersede it. None yet.
 
@@ -154,7 +154,7 @@ Adversarial (negative) tests:
 **Purpose.** Tear a trust root down: stop sandy minting and remove the credential at the forge,
 leaving no usable key behind. The lifecycle counterpart of `register`.
 
-**Architecture.** `sandy app deregister {name}` loads the `TrustRoot` (Block 0), then runs an
+**Architecture.** `sandy cred github deregister {name}` loads the `TrustRoot` (Block 0), then runs an
 ordered two-layer teardown, **forge revoke before local shred**, because the GitHub revoke needs
 the pem to sign its JWT:
 
@@ -207,7 +207,7 @@ Never hand-build the HTTP listener or JWT signing.
 
 ## Acceptance criteria
 
-End to end, for each kind: `sandy app register` on a throwaway target writes a `0600` trust root
+End to end, for each kind: `sandy cred github register` on a throwaway target writes a `0600` trust root
 that a credential-seam adapter loads unmodified and mints a correctly scoped lease; `register`
 reports success only after the verify probe passes and asserts the scope is not broader than
 requested; the command contacts only the target forge host; and no shared secret ships in the
