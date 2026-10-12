@@ -14,10 +14,9 @@ use crate::backend::{BackendError, SecretRef, SecretSource};
 /// Mode bits that would let group or other read a secret source (INV-1).
 const GROUP_OTHER_READ: u32 = 0o044;
 
-/// The virtiofs `mountTag` for the secret share. Fixed (not pooled from
-/// [`TagPool`](crate::TagPool), which emits `sandy<N>`) so the guest can statically
-/// mount it at `/run/sandy/secrets`; it MUST match the guest flake's `fileSystems`
-/// device for that mount.
+/// The virtiofs `mountTag` for the secret share. Fixed, not per-run, so the
+/// guest can statically mount it at `/run/sandy/secrets`; it MUST match the
+/// guest flake's `fileSystems` device for that mount.
 pub const SECRET_MOUNT_TAG: &str = "sandy-secrets";
 
 /// A secret that has been staged to disk for sharing into the guest.

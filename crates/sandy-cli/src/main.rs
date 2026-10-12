@@ -36,9 +36,6 @@ enum Command {
     Run {
         /// The template (flake attr / image) to boot.
         template: String,
-        /// `--mount HOST:GUEST[:ro]` (repeatable).
-        #[arg(long = "mount")]
-        mounts: Vec<String>,
         /// `--secret NAME=@PATH` (repeatable).
         #[arg(long = "secret")]
         secrets: Vec<String>,
@@ -393,7 +390,6 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
         Command::Cred { .. } => unreachable!("cred handled above"),
         Command::Run {
             template,
-            mounts,
             secrets,
             env,
             allow,
@@ -406,7 +402,6 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
         } => {
             let args = RunArgs {
                 template,
-                mounts,
                 secrets,
                 env,
                 allow,
