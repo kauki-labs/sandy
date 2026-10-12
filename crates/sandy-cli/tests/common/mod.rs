@@ -175,6 +175,43 @@ pub fn sandy_run(home: &Path, target: &LiveTarget, cmd: &[&str]) -> anyhow::Resu
     Ok((code, envelope))
 }
 
+/// Like [`sandy_run`] but injects one `--secret NAME=@PATH` before the command, for
+/// the guest-side secret-consumption round-trip (#50).
+pub fn sandy_run_with_secret(
+    home: &Path,
+    target: &LiveTarget,
+    name: &str,
+    secret_path: &Path,
+    cmd: &[&str],
+) -> anyhow::Result<(i32, serde_json::Value)> {
+    let attr = format!("{}#{}", guest_flake().display(), target.topology_attr);
+    let secret_arg = format!("{name}=@{}", secret_path.display());
+    let output = Command::new(env!("CARGO_BIN_EXE_sandy"))
+        .env("SANDY_HOME", home)
+        .args([
+            "-o",
+            "json",
+            "run",
+            &attr,
+            "--timeout",
+            "120",
+            "--secret",
+            &secret_arg,
+            "--",
+        ])
+        .args(cmd)
+        .output()
+        .context("run sandy with a secret")?;
+    let code = output.status.code().unwrap_or(-1);
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).with_context(|| {
+        format!(
+            "parse sandy run envelope (exit {code}); stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })?;
+    Ok((code, envelope))
+}
+
 /// Run `sandy <args…>` (a management op) against `home`, returning exit + stdout.
 pub fn sandy(home: &Path, args: &[&str]) -> anyhow::Result<(i32, String)> {
     let output = Command::new(env!("CARGO_BIN_EXE_sandy"))

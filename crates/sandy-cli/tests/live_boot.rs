@@ -19,7 +19,7 @@
 use anyhow::Context;
 
 mod common;
-use common::{build_guest, require_live, sandy, sandy_run};
+use common::{build_guest, require_live, sandy, sandy_run, sandy_run_with_secret};
 
 /// A real guest boots, `echo hi` runs, output is collected: succeeded / exit 0 /
 /// process band 0 / not retryable.
@@ -34,6 +34,52 @@ fn real_boot_collect_succeeds() -> anyhow::Result<()> {
     assert_eq!(env["status"], "succeeded", "envelope: {env}");
     assert_eq!(env["exit_code"], 0);
     assert_eq!(env["retryable"], false);
+    Ok(())
+}
+
+/// #50: a staged secret is consumable in-guest as `$NAME` (the login-shell export
+/// of the mounted secret share), and matches the staged file. The guest exit code
+/// carries the result (the envelope does not surface guest stdout), and the secret
+/// value never appears in the guest argv.
+#[test]
+fn staged_secret_is_exported_to_the_job_env() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let target = require_live()?;
+    build_guest(&target)?;
+    let home = tempfile::tempdir().context("temp SANDY_HOME")?;
+
+    // A 0600 secret source (a world/group-readable one is refused by staging).
+    let secret_file = home.path().join("tok");
+    std::fs::write(&secret_file, "s3cr3t-marker-abc123").context("write secret")?;
+    std::fs::set_permissions(&secret_file, std::fs::Permissions::from_mode(0o600)).context("chmod secret")?;
+
+    // Exit 0 iff $TOK is exported, non-empty, and equals the mounted secret file.
+    // The comparison is in-guest so the secret value is never in the command argv,
+    // and an unmounted/empty share fails the `-n` guard rather than false-passing.
+    // sandy joins the command argv and runs it through `sh`, so the probe is a
+    // single element (wrapping in `sh -c` would double-nest and mangle the quoting).
+    let probe = r#"[ -n "$TOK" ] && [ "$TOK" = "$(cat /run/sandy/secrets/TOK)" ] && exit 0 || exit 7"#;
+    let (code, env) = sandy_run_with_secret(home.path(), &target, "TOK", &secret_file, &[probe])?;
+
+    assert_eq!(
+        env["status"], "succeeded",
+        "the job must see $TOK exported; envelope: {env}"
+    );
+    assert_eq!(
+        env["exit_code"], 0,
+        "exit 7 means $TOK was absent or did not match the file; envelope: {env}"
+    );
+    assert_eq!(code, 0, "process band 0; envelope: {env}");
+
+    // INV-1 leak plane: the secret value must not appear in the captured console
+    // (the injected argv + guest output surfaced into logs.tail). It travels the
+    // file→env channel only.
+    let tail = env["logs"]["tail"].as_str().unwrap_or_default();
+    assert!(
+        !tail.contains("s3cr3t-marker-abc123"),
+        "the secret value must not leak into the guest argv or console; tail: {tail}"
+    );
     Ok(())
 }
 

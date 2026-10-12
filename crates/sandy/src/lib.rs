@@ -85,7 +85,7 @@ pub use seed::{
     ALLOWED_IMAGE_FORMATS, ArtifactEntry, MinisignVerifier, Requirements, SeedManifest, SeedRefusal, SignatureVerifier,
     VerifiedSeed, acquire, sha256_hex,
 };
-pub use stage::{StagedSecret, TagPool, mount_args, stage_secrets, wipe};
+pub use stage::{SECRET_MOUNT_TAG, StagedSecret, TagPool, mount_args, stage_secrets, wipe};
 pub use strategy::{BootAxis, BuildAxis, HostFacts, ProvisioningStrategy, classify};
 pub use trust_root::{
     FakeProvisioner, InstallError, Provisioner, RegistrationPlan, RevokeOutcome, deregister, github_app_manifest,

@@ -14,6 +14,12 @@ use crate::backend::{BackendError, SecretRef, SecretSource};
 /// Mode bits that would let group or other read a secret source (INV-1).
 const GROUP_OTHER_READ: u32 = 0o044;
 
+/// The virtiofs `mountTag` for the secret share. Fixed (not pooled from
+/// [`TagPool`](crate::TagPool), which emits `sandy<N>`) so the guest can statically
+/// mount it at `/run/sandy/secrets`; it MUST match the guest flake's `fileSystems`
+/// device for that mount.
+pub const SECRET_MOUNT_TAG: &str = "sandy-secrets";
+
 /// A secret that has been staged to disk for sharing into the guest.
 ///
 /// Carries only the guest-visible name and the path the staged file is shared
@@ -30,25 +36,29 @@ pub struct StagedSecret {
 /// Stage each secret's bytes into `inst_dir` as a `0600` file written by atomic
 /// rename (temp → fsync → `rename`), under a freshly created `0700` directory.
 ///
-/// Files are named `secret-<i>` by the secret's index in `secrets`. The bytes
-/// travel this on-disk channel only — never argv, env, or the Nix store
-/// (INV-1); the returned [`StagedSecret`]s retain no bytes.
+/// Each file is named by the secret's own name (an environment-variable name), so
+/// the guest can export it as `$NAME`. The bytes travel this on-disk channel only —
+/// never argv, env, or the Nix store (INV-1); the returned [`StagedSecret`]s retain
+/// no bytes.
 ///
 /// # Errors
 ///
-/// Returns [`BackendError`] when `inst_dir` cannot be prepared, a secret source
-/// cannot be read, or a [`SecretSource::File`](crate::SecretSource::File) is
-/// world-readable (its mode grants group/other read, e.g. `0644`) — a
-/// world-readable source is rejected, not staged.
+/// Returns [`BackendError`] when `inst_dir` cannot be prepared, a secret name is not
+/// a valid environment-variable name, a secret source cannot be read, or a
+/// [`SecretSource::File`](crate::SecretSource::File) is world-readable (its mode
+/// grants group/other read, e.g. `0644`) — any of these is rejected, not staged.
 pub fn stage_secrets(secrets: &[SecretRef], inst_dir: &Path) -> Result<Vec<StagedSecret>, BackendError> {
     fs::create_dir_all(inst_dir).map_err(|e| spawn_err("create instance dir", inst_dir, &e))?;
     fs::set_permissions(inst_dir, fs::Permissions::from_mode(0o700))
         .map_err(|e| spawn_err("tighten instance dir to 0700", inst_dir, &e))?;
 
     let mut staged = Vec::with_capacity(secrets.len());
-    for (i, secret) in secrets.iter().enumerate() {
+    for secret in secrets {
+        validate_secret_name(&secret.name)?;
         let bytes = read_source(&secret.source)?;
-        let guest_path = inst_dir.join(format!("secret-{i}"));
+        // Stage each secret under its own name: the guest mounts this dir read-only
+        // and exports each file as `$NAME`, so the file name IS the env var name.
+        let guest_path = inst_dir.join(&secret.name);
         write_secret_file(inst_dir, &guest_path, &bytes)?;
         tracing::debug!(name = %secret.name, path = %guest_path.display(), "staged secret (0600)");
         staged.push(StagedSecret {
@@ -57,6 +67,22 @@ pub fn stage_secrets(secrets: &[SecretRef], inst_dir: &Path) -> Result<Vec<Stage
         });
     }
     Ok(staged)
+}
+
+/// A secret's name must be a POSIX environment-variable name
+/// (`[A-Za-z_][A-Za-z0-9_]*`): it is both the staged file name and the `$NAME` the
+/// guest exports, so a `/`, space, or shell metacharacter would be a path-traversal
+/// or shell-injection risk at consumption.
+fn validate_secret_name(name: &str) -> Result<(), BackendError> {
+    let mut chars = name.chars();
+    let valid = chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !valid {
+        return Err(BackendError::Spawn(format!(
+            "secret name {name:?} is not a valid environment-variable name ([A-Za-z_][A-Za-z0-9_]*)"
+        )));
+    }
+    Ok(())
 }
 
 /// Read a secret's bytes from its source, rejecting a world/group-readable file
@@ -135,6 +161,28 @@ mod tests {
         Ok(src)
     }
 
+    /// Adversarial: a secret name that is not a valid env-var name is refused and
+    /// nothing is staged, so no `/`, space, or shell metacharacter reaches the
+    /// guest's `export $NAME` or the staged file path.
+    #[test]
+    fn invalid_secret_name_is_rejected() -> anyhow::Result<()> {
+        let tmp = tempfile::TempDir::new()?;
+        let src = secret_source(tmp.path(), b"v")?;
+        let inst_dir = tmp.path().join("inst");
+        for bad in ["BAD-NAME", "a b", "../escape", "1LEADING", ""] {
+            let secrets = [SecretRef {
+                name: bad.to_string(),
+                source: SecretSource::File(src.clone()),
+            }];
+            let err = stage_secrets(&secrets, &inst_dir).expect_err("invalid name must be rejected");
+            assert!(
+                matches!(err, BackendError::Spawn(_)),
+                "expected Spawn for {bad:?}, got {err:?}"
+            );
+        }
+        Ok(())
+    }
+
     /// E2: a `File` secret is staged as a `0600` file, written via atomic rename,
     /// under a `0700` instance dir, with its contents intact.
     #[test]
@@ -153,7 +201,7 @@ mod tests {
         let dir_mode = std::fs::metadata(&inst_dir)?.permissions().mode() & 0o777;
         assert_eq!(dir_mode, 0o700, "instance dir must be 0700");
 
-        let staged_file = inst_dir.join("secret-0");
+        let staged_file = inst_dir.join("TOK");
         let file_mode = std::fs::metadata(&staged_file)?.permissions().mode() & 0o777;
         assert_eq!(file_mode, 0o600, "staged secret must be 0600");
         assert_eq!(
@@ -207,10 +255,7 @@ mod tests {
             matches!(err, BackendError::Spawn(_)),
             "expected a named Spawn error, got {err:?}"
         );
-        assert!(
-            !inst_dir.join("secret-0").exists(),
-            "a rejected source must not be staged"
-        );
+        assert!(!inst_dir.join("TOK").exists(), "a rejected source must not be staged");
         Ok(())
     }
 

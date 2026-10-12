@@ -25,8 +25,8 @@ use std::{
 };
 
 use sandy::{
-    BackendError, BoxState, Hypervisor, Markers, Outcome, PipeTransport, RunSpec, StoreBacking, TagPool, Topology,
-    VmBackend, mount_args, run_console, stage_secrets, topology as eval_topology, wipe,
+    BackendError, BoxState, Hypervisor, Markers, Outcome, PipeTransport, RunSpec, SECRET_MOUNT_TAG, StoreBacking,
+    TagPool, Topology, VmBackend, mount_args, run_console, stage_secrets, topology as eval_topology, wipe,
 };
 use uuid::Uuid;
 
@@ -379,8 +379,10 @@ impl VmBackend for QemuBackend {
         let mut tags = TagPool::new();
         let mounts = mount_args(spec.mounts, &mut tags)?;
         let staged_secrets = stage_secrets(spec.secrets, &inst_dir)?;
+        // Attach the secret share only when the run carries secrets; the guest mounts
+        // `/run/sandy/secrets` with `nofail`, so a run with no share still boots.
         let secret_share = (!staged_secrets.is_empty())
-            .then(|| format!("sharedDir={},mountTag={},ro", inst_dir.display(), tags.next_tag()));
+            .then(|| format!("sharedDir={},mountTag={SECRET_MOUNT_TAG},ro", inst_dir.display()));
         let staged = StagedArgs {
             mounts,
             secret_share,
