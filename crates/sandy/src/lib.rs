@@ -32,6 +32,7 @@ mod collect;
 mod config;
 mod console;
 mod cred;
+mod cred_github;
 mod egress;
 mod error;
 mod gc;
@@ -59,6 +60,7 @@ pub use cred::{
     Capability, CredError, CredentialHandle, CredentialProvider, FakeProvider, GitlabAccount, Lease, MAX_TTL_SECS,
     Minted, Scope, Target, TrustRoot, mint_lease, read_secret_0600, render_github_permissions,
 };
+pub use cred_github::GithubAdapter;
 pub use egress::{
     AllowList, EgressApplier, EgressOs, EgressOutcome, EgressPlan, EgressRule, FakeApplier, NftablesApplier, enforce,
     macos_egress_statement, plan_egress, plan_egress_scoped, to_nftables, to_nftables_forward,
