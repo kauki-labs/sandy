@@ -23,10 +23,15 @@ live = []
 
 [dependencies]
 clap.workspace = true
+octocrab.workspace = true
 sandy.workspace = true
 sandy-backend.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+tiny_http.workspace = true
+tokio.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true

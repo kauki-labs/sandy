@@ -8,6 +8,7 @@
 use clap::{Parser, Subcommand};
 use sandy::{CoreError, Journal, ProcessExit};
 use sandy_cli::{
+    app_register::{self, Owner},
     doctor,
     output::{OutputFormat, format_doctor, format_envelope, format_gc, format_record, format_records},
     plan::{RunArgs, parse_run},
@@ -83,6 +84,52 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         keep_last: usize,
     },
+    /// Manage the GitHub App trust root the credential seam mints from.
+    App {
+        /// The trust-root subcommand.
+        #[command(subcommand)]
+        app: AppCommand,
+    },
+}
+
+/// `sandy app` subcommands: register / deregister a forge trust root.
+#[derive(Debug, Subcommand)]
+enum AppCommand {
+    /// Register a GitHub App trust root in-code (drives the Create + Install
+    /// clicks, captures the key and ids, writes the config — no hand-copying).
+    Register {
+        /// The App name (globally unique on GitHub).
+        name: String,
+        /// Register under this organization instead of your user account.
+        #[arg(long)]
+        org: Option<String>,
+        /// Web base for GitHub Enterprise Server.
+        #[arg(long, default_value = "https://github.com")]
+        base_url: String,
+        /// The App homepage URL.
+        #[arg(long, default_value = "https://github.com/kauki-labs/sandy")]
+        homepage: String,
+        /// A capability a minted token may need: read-code | write-code | read-pr
+        /// | write-pr (repeatable, at least one).
+        #[arg(long = "capability", required = true)]
+        capabilities: Vec<String>,
+        /// A repository the credential may be scoped to, as owner/repo (repeatable).
+        #[arg(long = "repo")]
+        repos: Vec<String>,
+        /// Write the trust root WITHOUT the live scope-check probe. Explicit pilot
+        /// bootstrap only, until the credential adapter lands.
+        #[arg(long)]
+        skip_verify: bool,
+    },
+    /// Remove a trust root: revoke at the forge (pending the adapter), then shred
+    /// the local key and config.
+    Deregister {
+        /// The trust-root name (its config file stem).
+        name: String,
+        /// Shred locally only; uninstall the App yourself in the GitHub UI.
+        #[arg(long)]
+        keep_remote: bool,
+    },
 }
 
 /// The macOS host backend: vfkit. The live boot is the #26 seam — the sandbox
@@ -137,6 +184,47 @@ fn main() {
     std::process::exit(dispatch(cli.command, cli.output));
 }
 
+/// Dispatch a `sandy app` subcommand, mapping an [`InstallError`] to a nonzero
+/// exit. Registration/deregistration touch only the user config dir.
+fn dispatch_app(app: AppCommand) -> i32 {
+    let result = match app {
+        AppCommand::Register {
+            name,
+            org,
+            base_url,
+            homepage,
+            capabilities,
+            repos,
+            skip_verify,
+        } => {
+            let caps = match parse_caps(&capabilities) {
+                Ok(caps) => caps,
+                Err(bad) => {
+                    eprintln!("sandy: unknown capability '{bad}' (use read-code | write-code | read-pr | write-pr)");
+                    return ProcessExit::InvalidPlan.code();
+                }
+            };
+            let owner = org.map_or(Owner::User, Owner::Org);
+            let targets = repos.into_iter().map(sandy::Target).collect();
+            app_register::run_register(&name, &homepage, owner, &base_url, &caps, targets, skip_verify)
+        }
+        AppCommand::Deregister { name, keep_remote } => app_register::run_deregister(&name, keep_remote),
+    };
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("sandy: {e}");
+            ProcessExit::InvalidPlan.code()
+        }
+    }
+}
+
+/// Parse each `--capability` token into a [`sandy::Capability`], returning the
+/// first unrecognized token as the error.
+fn parse_caps(tokens: &[String]) -> Result<Vec<sandy::Capability>, String> {
+    tokens.iter().map(|t| sandy::parse_capability(t)).collect()
+}
+
 /// Dispatch one parsed command and return the process exit band (INV-11).
 fn dispatch(command: Command, output: OutputFormat) -> i32 {
     // Doctor needs no journal; handle it before touching `$SANDY_HOME`.
@@ -158,6 +246,11 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
         return result.exit_code;
     }
 
+    // App register/deregister need only the user config dir, not $SANDY_HOME.
+    if let Command::App { app } = command {
+        return dispatch_app(app);
+    }
+
     let journal = Journal::new(doctor::sandy_home());
     if let Err(e) = journal.ensure_dirs() {
         eprintln!("sandy: cannot initialize $SANDY_HOME: {e}");
@@ -166,6 +259,7 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
 
     match command {
         Command::Doctor => unreachable!("doctor handled above"),
+        Command::App { .. } => unreachable!("app handled above"),
         Command::Run {
             template,
             mounts,

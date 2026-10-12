@@ -171,6 +171,25 @@ pub fn register(
     Ok(root)
 }
 
+/// Register a trust root WITHOUT the verify probe: capture, then write the
+/// config. This exists only for the pilot bootstrap window before the live
+/// credential adapter (and thus the dry-run mint) exists, and is reached solely
+/// behind an explicit `--skip-verify` flag, never by default, so an unverified
+/// registration is a deliberate choice and never a silent no-op (REQ-7). Prefer
+/// [`register`], which proves the credential before it writes the config.
+///
+/// # Errors
+/// Propagates the provisioner's capture error, or a config write error.
+pub fn register_skip_verify(
+    provisioner: &dyn Provisioner,
+    capabilities: &[Capability],
+    config_path: &Path,
+) -> Result<TrustRoot, InstallError> {
+    let root = provisioner.capture(capabilities)?;
+    root.write(config_path)?;
+    Ok(root)
+}
+
 /// Deregister a trust root: revoke at the forge **before** shredding the local
 /// secret (a GitHub revoke needs the key to sign its JWT), then remove the secret
 /// file and the config record. `keep_remote` shreds locally only, for when the
@@ -385,6 +404,22 @@ mod tests {
         assert!(cfg.exists(), "config is written after a passing verify");
         assert!(key.exists(), "the secret stays staged on success");
         assert_eq!(TrustRoot::load(&cfg)?, root, "the written config round-trips");
+        Ok(())
+    }
+
+    #[test]
+    fn register_skip_verify_writes_the_config_without_running_verify() -> anyhow::Result<()> {
+        // A fake whose verify would FAIL; --skip-verify must still succeed, because
+        // it never calls verify. Proves the bypass is a real bypass, not a no-op verify.
+        let tmp = TempDir::new()?;
+        let key = tmp.path().join("key.pem");
+        let cfg = tmp.path().join("root.json");
+        let provisioner = FakeProvisioner::failing_verify(github_root(&key));
+
+        let root = register_skip_verify(&provisioner, &[Capability::WriteCode], &cfg)?;
+
+        assert!(cfg.exists(), "skip-verify still writes the config");
+        assert_eq!(TrustRoot::load(&cfg)?, root);
         Ok(())
     }
 

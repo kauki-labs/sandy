@@ -1,0 +1,512 @@
+//! `sandy app register` / `sandy app deregister`: the in-code trust-root
+//! installer (docs/design/trust-root-installer/).
+//!
+//! The provider-neutral pipeline and its invariants live in the `sandy` library
+//! (`register` / `deregister` / `Provisioner`); this module is the GitHub
+//! `Provisioner` and the thin CLI wiring. GitHub has no API to create or install
+//! an App, so two browser clicks (Create, Install) are irreducible in every path;
+//! everything around them is automated here: the manifest is pre-filled, the
+//! redirect is caught on a localhost listener, and the private key + ids are
+//! captured and written to the trust-root config with no hand-copying.
+//!
+//! The manifest conversion (`POST /app-manifests/{code}/conversions`) is
+//! unauthenticated, so registration needs no App-JWT and is not gated on the live
+//! credential adapter; only the verify probe (a dry-run mint) is, and it is wired
+//! through the adapter when that lands. Until then `--skip-verify` is the explicit
+//! (never default) bootstrap path.
+
+use std::{collections::HashMap, io, net::SocketAddr, path::PathBuf};
+
+use sandy::{Capability, InstallError, Provisioner, RegistrationPlan, RevokeOutcome, Target, TrustRoot};
+use tiny_http::{Header, Response, Server};
+
+/// Where the account the App is registered under lives.
+#[derive(Debug, Clone)]
+pub enum Owner {
+    /// The authenticated user's own account.
+    User,
+    /// An organization, by login.
+    Org(String),
+}
+
+/// A one-shot localhost catcher for the manifest-flow redirects. Binds
+/// `127.0.0.1` on a random port; serves the auto-submitting manifest form, then
+/// catches the redirect GitHub makes back to it, matching a single-use `state`
+/// nonce so another local process cannot complete the handshake.
+pub struct RedirectCatcher {
+    server: Server,
+    addr: SocketAddr,
+}
+
+impl RedirectCatcher {
+    /// Bind the catcher on a random loopback port.
+    ///
+    /// # Errors
+    /// [`io::Error`] if the listener cannot bind.
+    pub fn bind() -> io::Result<Self> {
+        let server = Server::http("127.0.0.1:0").map_err(|e| io::Error::other(e.to_string()))?;
+        let addr = server
+            .server_addr()
+            .to_ip()
+            .ok_or_else(|| io::Error::other("redirect catcher did not bind an IP address"))?;
+        Ok(Self { server, addr })
+    }
+
+    /// The `http://127.0.0.1:<port>/` URL GitHub redirects back to.
+    #[must_use]
+    pub fn redirect_url(&self) -> String {
+        format!("http://{}/", self.addr)
+    }
+
+    /// Serve the auto-submitting manifest form, then catch the create redirect and
+    /// return its query params (e.g. `code`). The first no-query GET is answered
+    /// with the form (which POSTs the manifest to GitHub); the matching
+    /// `?...&state=<state>` redirect that follows is captured.
+    ///
+    /// # Errors
+    /// [`io::Error`] if the listener closes before a matching redirect.
+    pub fn serve_and_catch(
+        &self,
+        new_app_url: &str,
+        manifest_json: &str,
+        state: &str,
+        params: &[&str],
+    ) -> io::Result<HashMap<String, String>> {
+        for request in self.server.incoming_requests() {
+            let query = parse_query(request.url());
+            if query.is_empty() {
+                let page = manifest_form_page(new_app_url, manifest_json, state);
+                let _ = request.respond(Response::from_string(page).with_header(html_header()));
+            } else if query.get("state").map(String::as_str) == Some(state) {
+                let picked = pick(&query, params);
+                let _ = request.respond(Response::from_string(CLOSE_PAGE).with_header(html_header()));
+                return Ok(picked);
+            } else {
+                let _ = request.respond(Response::from_string("unexpected state").with_status_code(400));
+            }
+        }
+        Err(io::Error::other("redirect catcher closed before the create redirect"))
+    }
+
+    /// Catch the post-install redirect GitHub makes to the App's `setup_url`,
+    /// returning its query params (e.g. `installation_id`). The install redirect
+    /// carries no `state`, so it is matched by the presence of `installation_id`.
+    ///
+    /// # Errors
+    /// [`io::Error`] if the listener closes before the install redirect.
+    pub fn catch_install(&self) -> io::Result<HashMap<String, String>> {
+        for request in self.server.incoming_requests() {
+            let query = parse_query(request.url());
+            if query.contains_key("installation_id") {
+                let picked = pick(&query, &["installation_id", "setup_action"]);
+                let _ = request.respond(Response::from_string(CLOSE_PAGE).with_header(html_header()));
+                return Ok(picked);
+            }
+            let _ = request.respond(Response::from_string("waiting for the installation").with_status_code(400));
+        }
+        Err(io::Error::other("redirect catcher closed before the install redirect"))
+    }
+}
+
+const CLOSE_PAGE: &str =
+    "<!doctype html><title>sandy</title><p>Captured. Return to the terminal; you can close this tab.</p>";
+
+fn html_header() -> Header {
+    // `text/html` is a valid header; the fallback keeps this total without an unwrap.
+    Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..])
+        .unwrap_or_else(|()| Header::from_bytes(&b"X-Content"[..], &b"html"[..]).expect("static header"))
+}
+
+/// Pick the named keys out of a parsed query, dropping absent ones.
+fn pick(query: &HashMap<String, String>, keys: &[&str]) -> HashMap<String, String> {
+    keys.iter()
+        .filter_map(|k| query.get(*k).map(|v| ((*k).to_string(), v.clone())))
+        .collect()
+}
+
+/// Parse a request target's query string into key/value pairs. The values we read
+/// (`code`, `state`, `installation_id`) are URL-safe, so no percent-decoding is
+/// applied.
+fn parse_query(url: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    if let Some((_, qs)) = url.split_once('?') {
+        for pair in qs.split('&') {
+            if let Some((key, value)) = pair.split_once('=') {
+                out.insert(key.to_string(), value.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// The local page that auto-POSTs the manifest to GitHub's new-App endpoint.
+fn manifest_form_page(new_app_url: &str, manifest_json: &str, state: &str) -> String {
+    let action = format!("{new_app_url}?state={state}");
+    let manifest_attr = html_attr_escape(manifest_json);
+    format!(
+        "<!doctype html><title>sandy</title><form id=\"f\" method=\"post\" action=\"{action}\"><input type=\"hidden\" \
+         name=\"manifest\" \
+         value=\"{manifest_attr}\"></form><script>document.getElementById('f').submit()</script><p>Submitting the \
+         GitHub App manifest…</p>"
+    )
+}
+
+/// Escape a string for an HTML double-quoted attribute value.
+fn html_attr_escape(raw: &str) -> String {
+    raw.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// The GitHub `Provisioner`: drives the manifest flow and captures the trust root.
+pub struct GithubProvisioner {
+    /// The App name (globally unique on GitHub).
+    pub app_name: String,
+    /// The App homepage URL.
+    pub homepage_url: String,
+    /// The web base, e.g. `https://github.com` or a GitHub Enterprise Server host.
+    pub web_base: String,
+    /// The owner the App is registered under.
+    pub owner: Owner,
+    /// Repositories the credential may be scoped to.
+    pub targets: Vec<Target>,
+}
+
+impl GithubProvisioner {
+    /// The `.../settings/apps/new` endpoint the manifest is POSTed to.
+    fn new_app_url(&self) -> String {
+        match &self.owner {
+            Owner::User => format!("{}/settings/apps/new", self.web_base),
+            Owner::Org(org) => format!("{}/organizations/{org}/settings/apps/new", self.web_base),
+        }
+    }
+
+    /// The API base for the manifest conversion: GitHub.com uses octocrab's
+    /// default; a GHES host uses `<web_base>/api/v3`.
+    fn api_base(&self) -> Option<String> {
+        if self.web_base == "https://github.com" {
+            None
+        } else {
+            Some(format!("{}/api/v3", self.web_base))
+        }
+    }
+
+    /// `base_url` stored in the trust root (`None` for github.com).
+    fn trust_root_base_url(&self) -> Option<String> {
+        self.api_base()
+    }
+}
+
+/// The subset of the manifest-conversion response the installer needs.
+#[derive(serde::Deserialize)]
+struct Conversion {
+    id: u64,
+    slug: String,
+    pem: String,
+}
+
+impl Provisioner for GithubProvisioner {
+    fn plan(&self, _capabilities: &[Capability]) -> RegistrationPlan {
+        RegistrationPlan {
+            open_url: String::new(), // filled with the live catcher URL at capture time
+            steps: vec![
+                "A browser tab opens pre-filled; click \"Create GitHub App\".".to_string(),
+                "Then click \"Install\" and pick the repositories the App may touch.".to_string(),
+                "The key and ids are captured here automatically; no copying.".to_string(),
+            ],
+        }
+    }
+
+    fn capture(&self, capabilities: &[Capability]) -> Result<TrustRoot, InstallError> {
+        let catcher = RedirectCatcher::bind().map_err(|e| InstallError::Capture(e.to_string()))?;
+        let state = new_nonce();
+        let mut manifest = sandy::github_app_manifest(&self.app_name, &self.homepage_url, capabilities);
+        inject(&mut manifest, "redirect_url", &catcher.redirect_url());
+        inject(&mut manifest, "setup_url", &catcher.redirect_url());
+        let manifest_json = manifest.to_string();
+
+        eprintln!(
+            "Open {} in your browser, then click \"Create GitHub App\".",
+            catcher.redirect_url()
+        );
+        let created = catcher
+            .serve_and_catch(&self.new_app_url(), &manifest_json, &state, &["code"])
+            .map_err(|e| InstallError::Capture(e.to_string()))?;
+        let code = created
+            .get("code")
+            .ok_or_else(|| InstallError::Capture("the create redirect carried no code".to_string()))?;
+
+        let conversion = convert_manifest(self.api_base().as_deref(), code)?;
+        let key_path = write_pem(&self.app_name, &conversion.pem)?;
+
+        eprintln!(
+            "App created. Open {}/apps/{}/installations/new, click \"Install\", and pick the repositories.",
+            self.web_base, conversion.slug
+        );
+        let installed = catcher
+            .catch_install()
+            .map_err(|e| InstallError::Capture(e.to_string()))?;
+        let installation_id = installed
+            .get("installation_id")
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or_else(|| InstallError::Capture("the install redirect carried no installation_id".to_string()))?;
+
+        Ok(TrustRoot::Github {
+            base_url: self.trust_root_base_url(),
+            app_id: conversion.id.to_string(),
+            private_key_path: key_path,
+            installation_id,
+            targets: self.targets.clone(),
+        })
+    }
+
+    fn verify(&self, _root: &TrustRoot, _capabilities: &[Capability]) -> Result<(), InstallError> {
+        Err(InstallError::Verify(
+            "live verification needs the GitHub credential adapter (not yet available); re-run with --skip-verify for \
+             the pilot bootstrap"
+                .to_string(),
+        ))
+    }
+
+    fn revoke(&self, _root: &TrustRoot) -> Result<RevokeOutcome, InstallError> {
+        Err(InstallError::Revoke(
+            "forge uninstall needs the App-authed client (not yet available); use --keep-remote to shred locally and \
+             uninstall in the GitHub UI"
+                .to_string(),
+        ))
+    }
+}
+
+/// Insert a string field into a manifest JSON object.
+fn inject(manifest: &mut serde_json::Value, key: &str, value: &str) {
+    if let Some(object) = manifest.as_object_mut() {
+        object.insert(key.to_string(), serde_json::Value::String(value.to_string()));
+    }
+}
+
+/// POST the manifest code to the conversion endpoint (unauthenticated) and return
+/// the App id, slug, and private key.
+fn convert_manifest(api_base: Option<&str>, code: &str) -> Result<Conversion, InstallError> {
+    let mut builder = octocrab::Octocrab::builder();
+    if let Some(base) = api_base {
+        builder = builder
+            .base_uri(base)
+            .map_err(|e| InstallError::Capture(format!("GHES base {base}: {e}")))?;
+    }
+    let octo = builder.build().map_err(|e| InstallError::Capture(e.to_string()))?;
+    let runtime = tokio::runtime::Runtime::new().map_err(|e| InstallError::Capture(e.to_string()))?;
+    let route = format!("/app-manifests/{code}/conversions");
+    runtime
+        .block_on(octo.post::<(), Conversion>(route, None))
+        .map_err(|e| InstallError::Capture(format!("manifest conversion: {e}")))
+}
+
+/// Write the captured PEM to a `0600` file under the trust-roots dir, returning
+/// its path.
+fn write_pem(app_name: &str, pem: &str) -> Result<PathBuf, InstallError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let dir = trust_roots_dir().map_err(|e| InstallError::Capture(e.to_string()))?;
+    std::fs::create_dir_all(&dir).map_err(|source| InstallError::Io {
+        action: "create trust-roots dir",
+        path: dir.clone(),
+        source,
+    })?;
+    let path = dir.join(format!("{app_name}.pem"));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|source| InstallError::Io {
+            action: "create private-key file",
+            path: path.clone(),
+            source,
+        })?;
+    use std::io::Write;
+    file.write_all(pem.as_bytes()).map_err(|source| InstallError::Io {
+        action: "write private key",
+        path: path.clone(),
+        source,
+    })?;
+    Ok(path)
+}
+
+/// The `<config>/sandy/trust-roots` directory (`XDG_CONFIG_HOME` or `~/.config`).
+pub fn trust_roots_dir() -> io::Result<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .ok_or_else(|| io::Error::other("neither XDG_CONFIG_HOME nor HOME is set"))?;
+    Ok(base.join("sandy").join("trust-roots"))
+}
+
+/// The config file path for a trust root of the given name.
+#[must_use]
+pub fn config_path(dir: &std::path::Path, name: &str) -> PathBuf {
+    dir.join(format!("{name}.json"))
+}
+
+/// A single-use state nonce for the redirect handshake.
+fn new_nonce() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// `sandy app register`: register a GitHub App trust root in-code. Prints the
+/// one-line disclosure (contacts only the forge, captures locally, writes `0600`,
+/// ships no secret), drives the two browser clicks, and writes the trust root.
+/// With `skip_verify`, the scope-check probe is skipped (explicit pilot bootstrap).
+///
+/// # Errors
+/// Any [`InstallError`] from capture, verify, or the config write.
+#[allow(clippy::too_many_arguments)]
+pub fn run_register(
+    name: &str,
+    homepage_url: &str,
+    owner: Owner,
+    web_base: &str,
+    capabilities: &[Capability],
+    targets: Vec<Target>,
+    skip_verify: bool,
+) -> Result<(), InstallError> {
+    let dir = trust_roots_dir().map_err(|e| InstallError::Capture(e.to_string()))?;
+    let cfg = config_path(&dir, name);
+    let provisioner = GithubProvisioner {
+        app_name: name.to_string(),
+        homepage_url: homepage_url.to_string(),
+        web_base: web_base.to_string(),
+        owner,
+        targets,
+    };
+
+    eprintln!(
+        "sandy app register: contacts only {web_base}; the key is captured on this machine and written 0600; no \
+         shared secret, no sandy server in the path."
+    );
+
+    let root = if skip_verify {
+        eprintln!("--skip-verify: writing the trust root WITHOUT the live scope-check probe (pilot bootstrap).");
+        sandy::register_skip_verify(&provisioner, capabilities, &cfg)?
+    } else {
+        sandy::register(&provisioner, capabilities, &cfg)?
+    };
+
+    if let TrustRoot::Github {
+        app_id,
+        installation_id,
+        private_key_path,
+        ..
+    } = &root
+    {
+        println!("Registered GitHub App: app_id={app_id}, installation_id={installation_id}");
+        println!("Trust root: {}", cfg.display());
+        println!("Private key: {} (0600)", private_key_path.display());
+    }
+    Ok(())
+}
+
+/// `sandy app deregister`: revoke at the forge (pending the adapter) then shred
+/// the local secret and remove the config. `keep_remote` shreds locally only.
+///
+/// # Errors
+/// Any [`InstallError`] from loading, the forge revoke, or the local removal.
+pub fn run_deregister(name: &str, keep_remote: bool) -> Result<(), InstallError> {
+    let dir = trust_roots_dir().map_err(|e| InstallError::Capture(e.to_string()))?;
+    let cfg = config_path(&dir, name);
+    let root = TrustRoot::load(&cfg)?;
+    let provisioner = provisioner_for(&root, name);
+
+    let outcome = sandy::deregister(&provisioner, &cfg, keep_remote)?;
+
+    if outcome.uninstalled {
+        println!("Uninstalled the App at the forge.");
+    }
+    if let Some(url) = outcome.registration_residue {
+        println!("The App registration itself has no delete API; remove the now-powerless App at {url}");
+    }
+    println!("Shredded the local key and removed {}", cfg.display());
+    Ok(())
+}
+
+/// Build a [`GithubProvisioner`] from a loaded trust root, for the deregister
+/// revoke. Only `revoke` is called on it, and that uses the root, not these
+/// registration fields, so the owner/homepage are placeholders.
+fn provisioner_for(root: &TrustRoot, name: &str) -> GithubProvisioner {
+    let web_base = match root {
+        TrustRoot::Github {
+            base_url: Some(api), ..
+        } => api.strip_suffix("/api/v3").unwrap_or(api).to_string(),
+        _ => "https://github.com".to_string(),
+    };
+    GithubProvisioner {
+        app_name: name.to_string(),
+        homepage_url: String::new(),
+        web_base,
+        owner: Owner::User,
+        targets: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{io::Write, net::TcpStream};
+
+    use super::*;
+
+    fn get(addr: &SocketAddr, target: &str) {
+        let mut stream = TcpStream::connect(addr).expect("connect to catcher");
+        write!(
+            stream,
+            "GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        )
+        .expect("send GET");
+    }
+
+    #[test]
+    fn the_catcher_returns_the_named_params_for_a_matching_state() {
+        let catcher = RedirectCatcher::bind().expect("bind");
+        let addr = catcher.addr;
+        let worker = std::thread::spawn(move || get(&addr, "/?code=abc123&state=nonce-xyz"));
+
+        let got = catcher
+            .serve_and_catch("https://github.com/settings/apps/new", "{}", "nonce-xyz", &["code"])
+            .expect("catch");
+
+        worker.join().expect("worker");
+        assert_eq!(got.get("code").map(String::as_str), Some("abc123"));
+    }
+
+    #[test]
+    fn the_catcher_rejects_a_foreign_state_and_waits_for_the_real_one() {
+        let catcher = RedirectCatcher::bind().expect("bind");
+        let addr = catcher.addr;
+        let worker = std::thread::spawn(move || {
+            get(&addr, "/?code=evil&state=wrong");
+            get(&addr, "/?code=good&state=right");
+        });
+
+        let got = catcher
+            .serve_and_catch("https://github.com/settings/apps/new", "{}", "right", &["code"])
+            .expect("catch");
+
+        worker.join().expect("worker");
+        assert_eq!(
+            got.get("code").map(String::as_str),
+            Some("good"),
+            "the foreign state is ignored"
+        );
+    }
+
+    #[test]
+    fn an_html_attribute_value_is_escaped() {
+        assert_eq!(html_attr_escape(r#"a"b&c<d"#), "a&quot;b&amp;c&lt;d");
+    }
+
+    #[test]
+    fn the_config_path_is_the_named_json_under_the_dir() {
+        let path = config_path(std::path::Path::new("/cfg/trust-roots"), "sandy-runner");
+        assert_eq!(path, PathBuf::from("/cfg/trust-roots/sandy-runner.json"));
+    }
+}
