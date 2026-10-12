@@ -45,12 +45,40 @@
           services.getty.autologinUser = "root";
           users.users.root.password = "";
 
-          # The login shell prints the READY_MARKER once it is up and reading, so
-          # sandy injects the command into a shell that is actually reading input —
-          # not during the getty→login handoff, which flushes pending tty input
-          # (the vfkit autologin race). The injected command runs under a bare
-          # `sh`, not a login shell, so it never re-prints the marker.
-          programs.bash.loginShellInit = "printf 'SANDY-READY\\n'";
+          # sandy stages each job secret as a read-only file named by its env-var
+          # name under a virtiofs share tagged `sandy-secrets` (sandy's
+          # SECRET_MOUNT_TAG). Mount it at /run/sandy/secrets; `nofail` so the
+          # microvm declaredRunner boot-proof (which attaches no such share) still
+          # boots. sandy's own backends always attach the share, so the device is
+          # present and the mount completes before login.
+          fileSystems."/run/sandy/secrets" = {
+            device = "sandy-secrets";
+            fsType = "virtiofs";
+            options = [
+              "ro"
+              "nofail"
+              "x-systemd.device-timeout=2s"
+            ];
+          };
+          # The store is an erofs block device, so nothing else pulls in the
+          # virtiofs driver; the secret share needs it. Load it in stage 2 (the
+          # mount is not in the initrd).
+          boot.kernelModules = [ "virtiofs" ];
+
+          # The login shell exports each staged secret as its `$NAME`, then prints
+          # the READY_MARKER once it is up and reading — so the injected command (a
+          # child `sh` of this login shell) inherits the secrets, and sandy injects
+          # into a shell actually reading input, not during the getty→login handoff
+          # that flushes pending tty input (the vfkit autologin race). The child
+          # `sh` is not a login shell, so it never re-prints the marker.
+          programs.bash.loginShellInit = ''
+            if [ -d /run/sandy/secrets ]; then
+              for f in /run/sandy/secrets/*; do
+                [ -f "$f" ] && export "''${f##*/}=$(cat "$f")"
+              done
+            fi
+            printf 'SANDY-READY\n'
+          '';
 
           # Keep the guest tiny and fast to boot.
           documentation.enable = lib.mkForce false;

@@ -22,8 +22,8 @@ use std::{
 };
 
 use sandy::{
-    BackendError, BoxState, Hypervisor, Markers, Outcome, PtyTransport, RunSpec, StoreBacking, TagPool, Topology,
-    VmBackend, mount_args, run_console, stage_secrets, topology, wipe,
+    BackendError, BoxState, Hypervisor, Markers, Outcome, PtyTransport, RunSpec, SECRET_MOUNT_TAG, StoreBacking,
+    TagPool, Topology, VmBackend, mount_args, run_console, stage_secrets, topology, wipe,
 };
 use uuid::Uuid;
 
@@ -133,7 +133,10 @@ pub fn vfkit_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> R
     args.push("virtio-serial,stdio".to_string());
 
     // The caller's bind mounts and the staged-secret share, each an already-assembled virtio-fs descriptor.
+    // vfkit's virtio-fs device rejects a `ro` option ("unknown option for virtio-fs devices: ro") — unlike the
+    // erofs store's virtio-blk `readonly` — so drop a trailing `,ro`; the guest mounts these shares read-only.
     for descriptor in staged.mount_shares.iter().chain(&staged.secret_shares) {
+        let descriptor = descriptor.strip_suffix(",ro").unwrap_or(descriptor);
         args.push("--device".to_string());
         args.push(format!("virtio-fs,{descriptor}"));
     }
@@ -191,11 +194,16 @@ impl VfkitBackend {
         inst_dir: &Path,
     ) -> Result<Outcome, BackendError> {
         // Secrets travel a read-only virtio-fs share of the 0700 staging dir, never argv bytes (INV-1).
+        // Attach it only when the run carries secrets; the guest mounts
+        // `/run/sandy/secrets` with `nofail`, so a run with no share still boots.
         let staged_secrets = stage_secrets(spec.secrets, inst_dir)?;
         let secret_shares = if staged_secrets.is_empty() {
             Vec::new()
         } else {
-            vec![format!("sharedDir={},mountTag=sandy-secrets,ro", inst_dir.display())]
+            vec![format!(
+                "sharedDir={},mountTag={SECRET_MOUNT_TAG},ro",
+                inst_dir.display()
+            )]
         };
 
         let mut tags = TagPool::new();
@@ -388,11 +396,11 @@ mod tests {
         let joined = args.join(" ");
 
         assert!(
-            joined.contains("--device virtio-fs,sharedDir=/host/in,mountTag=sandy0,ro"),
+            joined.contains("--device virtio-fs,sharedDir=/host/in,mountTag=sandy0"),
             "mount share woven into a virtio-fs device: {joined}"
         );
         assert!(
-            joined.contains("--device virtio-fs,sharedDir=/run/sandy/inst-0,mountTag=sandy-secrets,ro"),
+            joined.contains("--device virtio-fs,sharedDir=/run/sandy/inst-0,mountTag=sandy-secrets"),
             "secret share woven into a virtio-fs device: {joined}"
         );
         Ok(())

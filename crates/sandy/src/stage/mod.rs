@@ -19,4 +19,4 @@ mod mounts;
 mod secrets;
 
 pub use mounts::{TagPool, mount_args};
-pub use secrets::{StagedSecret, stage_secrets, wipe};
+pub use secrets::{SECRET_MOUNT_TAG, StagedSecret, stage_secrets, wipe};
