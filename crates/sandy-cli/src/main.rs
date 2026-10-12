@@ -99,7 +99,8 @@ enum AppCommand {
     /// clicks, captures the key and ids, writes the config — no hand-copying).
     Register {
         /// The local handle (the `<name>.json` / `<name>.pem` file stem). By
-        /// default the GitHub App name is `<name>-<random>` to avoid clashes.
+        /// default the GitHub App name is `<name>-<org>-<random>`, or
+        /// `<name>-<random>` for a user account, to avoid global clashes.
         name: String,
         /// Use this exact GitHub App name instead of the default `<name>-<random>`.
         #[arg(long)]
@@ -211,7 +212,7 @@ fn dispatch_app(app: AppCommand) -> i32 {
             };
             let owner = org.map_or(Owner::User, Owner::Org);
             let targets = repos.into_iter().map(sandy::Target).collect();
-            let github_name = app_register::github_app_name(&name, name_override.as_deref());
+            let github_name = app_register::github_app_name(&name, &owner, name_override.as_deref());
             app_register::run_register(
                 &name,
                 &github_name,

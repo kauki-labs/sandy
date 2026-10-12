@@ -375,14 +375,21 @@ fn new_nonce() -> String {
 }
 
 /// The GitHub App name to register. With `override_name` it is used verbatim;
-/// otherwise the handle gets a short random suffix, so re-using a handle never
-/// clashes in GitHub's global App namespace (the handle stays the local file
-/// stem regardless).
+/// otherwise it is `<handle>-<owner>-<random>` (the org is folded in so the name
+/// says whose App it is), and `<handle>-<random>` for a user account — the
+/// account login isn't known before the App is created, so it is omitted (pass
+/// `--name-override` to include it). The handle stays the local file stem
+/// regardless; the random suffix keeps the name unique in GitHub's global
+/// App namespace.
 #[must_use]
-pub fn github_app_name(handle: &str, override_name: Option<&str>) -> String {
-    match override_name {
-        Some(name) => name.to_string(),
-        None => format!("{handle}-{}", &new_nonce()[..6]),
+pub fn github_app_name(handle: &str, owner: &Owner, override_name: Option<&str>) -> String {
+    if let Some(name) = override_name {
+        return name.to_string();
+    }
+    let suffix = &new_nonce()[..6];
+    match owner {
+        Owner::Org(org) => format!("{handle}-{org}-{suffix}"),
+        Owner::User => format!("{handle}-{suffix}"),
     }
 }
 
@@ -540,17 +547,24 @@ mod tests {
     }
 
     #[test]
-    fn the_github_app_name_suffixes_by_default_and_honors_an_override() {
-        let suffixed = github_app_name("sandy-runner", None);
-        assert!(suffixed.starts_with("sandy-runner-"), "got {suffixed}");
-        assert_eq!(suffixed.len(), "sandy-runner-".len() + 6, "6-char random suffix");
+    fn the_github_app_name_folds_in_the_org_and_suffixes_by_default() {
+        let user = github_app_name("sandy-runner", &Owner::User, None);
+        assert!(user.starts_with("sandy-runner-"), "got {user}");
+        assert_eq!(user.len(), "sandy-runner-".len() + 6, "6-char random suffix");
         assert_ne!(
-            github_app_name("sandy-runner", None),
-            suffixed,
+            github_app_name("sandy-runner", &Owner::User, None),
+            user,
             "each default name is unique"
         );
 
-        assert_eq!(github_app_name("sandy-runner", Some("exact-name")), "exact-name");
+        let org = github_app_name("sandy-runner", &Owner::Org("kauki-labs".to_string()), None);
+        assert!(org.starts_with("sandy-runner-kauki-labs-"), "org folded in: {org}");
+        assert_eq!(org.len(), "sandy-runner-kauki-labs-".len() + 6);
+
+        assert_eq!(
+            github_app_name("sandy-runner", &Owner::User, Some("exact-name")),
+            "exact-name"
+        );
     }
 
     #[test]
