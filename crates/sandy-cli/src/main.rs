@@ -98,11 +98,12 @@ enum AppCommand {
     /// Register a GitHub App trust root in-code (drives the Create + Install
     /// clicks, captures the key and ids, writes the config — no hand-copying).
     Register {
-        /// The local handle (the `<name>.json` / `<name>.pem` file stem). By
-        /// default the GitHub App name is `<name>-<org>-<random>`, or
-        /// `<name>-<random>` for a user account, to avoid global clashes.
+        /// The local handle (the `<name>.json` / `<name>.pem` file stem). The
+        /// GitHub App name is deterministic — `<name>-<org>` (or `<name>` for a
+        /// user account) — so the whole org shares one App and the duplicate
+        /// check can find it.
         name: String,
-        /// Use this exact GitHub App name instead of the default `<name>-<random>`.
+        /// Use this exact GitHub App name instead of the default `<name>-<org>`.
         #[arg(long)]
         name_override: Option<String>,
         /// Register under this organization instead of your user account.
@@ -125,6 +126,31 @@ enum AppCommand {
         /// bootstrap only, until the credential adapter lands.
         #[arg(long)]
         skip_verify: bool,
+        /// Create the App even if one already exists on the owner (overrides the
+        /// one-shared-org-App duplicate check).
+        #[arg(long)]
+        force: bool,
+    },
+    /// Import an existing shared GitHub App trust root from its credentials (no
+    /// browser) — for members reusing the org's one shared App.
+    Import {
+        /// The local handle (the `<name>.json` / `<name>.pem` file stem).
+        name: String,
+        /// The GitHub App id.
+        #[arg(long)]
+        app_id: String,
+        /// The installation id the token is minted for.
+        #[arg(long)]
+        installation_id: u64,
+        /// Path to the shared App private key (obtained from the secret store).
+        #[arg(long)]
+        pem: std::path::PathBuf,
+        /// API base for GitHub Enterprise Server (default github.com).
+        #[arg(long)]
+        base_url: Option<String>,
+        /// A repository the credential may be scoped to, as owner/repo (repeatable).
+        #[arg(long = "repo")]
+        repos: Vec<String>,
     },
     /// Remove a trust root: revoke at the forge (pending the adapter), then shred
     /// the local key and config.
@@ -202,6 +228,7 @@ fn dispatch_app(app: AppCommand) -> i32 {
             capabilities,
             repos,
             skip_verify,
+            force,
         } => {
             let caps = match parse_caps(&capabilities) {
                 Ok(caps) => caps,
@@ -222,7 +249,19 @@ fn dispatch_app(app: AppCommand) -> i32 {
                 &caps,
                 targets,
                 skip_verify,
+                force,
             )
+        }
+        AppCommand::Import {
+            name,
+            app_id,
+            installation_id,
+            pem,
+            base_url,
+            repos,
+        } => {
+            let targets = repos.into_iter().map(sandy::Target).collect();
+            app_register::run_import(&name, &app_id, installation_id, &pem, base_url, targets)
         }
         AppCommand::Deregister { name, keep_remote } => app_register::run_deregister(&name, keep_remote),
     };
