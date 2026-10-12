@@ -58,8 +58,8 @@ enum Command {
         #[arg(long)]
         timeout: Option<u32>,
         /// Mint a scoped forge token for the job from the named trust root (a
-        /// `sandy app` name); the token is injected as `GITHUB_TOKEN` and revoked
-        /// at teardown.
+        /// `sandy cred github` name); the token is injected as `GITHUB_TOKEN` and
+        /// revoked at teardown.
         #[arg(long = "credential")]
         credential: Option<String>,
         /// Capability for the minted credential: `read-code` | `write-code` |
@@ -93,17 +93,30 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         keep_last: usize,
     },
-    /// Manage the GitHub App trust root the credential seam mints from.
-    App {
-        /// The trust-root subcommand.
+    /// Manage the forge credential trust roots the credential seam mints from.
+    Cred {
+        /// The forge provider the trust root belongs to.
         #[command(subcommand)]
-        app: AppCommand,
+        provider: CredProvider,
     },
 }
 
-/// `sandy app` subcommands: register / deregister a forge trust root.
+/// `sandy cred <provider>`: the forge a trust root belongs to. Operations are
+/// provider-specific, so each forge is its own subcommand group.
 #[derive(Debug, Subcommand)]
-enum AppCommand {
+enum CredProvider {
+    /// GitHub App trust roots.
+    Github {
+        /// The operation on a GitHub trust root.
+        #[command(subcommand)]
+        op: GithubOp,
+    },
+}
+
+/// `sandy cred github <op>`: register / verify / import / deregister a GitHub App
+/// trust root.
+#[derive(Debug, Subcommand)]
+enum GithubOp {
     /// Register a GitHub App trust root in-code (drives the Create + Install
     /// clicks, captures the key and ids, writes the config — no hand-copying).
     Register {
@@ -264,11 +277,18 @@ fn main() {
     std::process::exit(dispatch(cli.command, cli.output));
 }
 
-/// Dispatch a `sandy app` subcommand, mapping an [`InstallError`] to a nonzero
-/// exit. Registration/deregistration touch only the user config dir.
-fn dispatch_app(app: AppCommand) -> i32 {
-    let result = match app {
-        AppCommand::Register {
+/// Dispatch a `sandy cred <provider>` command to the provider's handler.
+fn dispatch_cred(provider: CredProvider) -> i32 {
+    match provider {
+        CredProvider::Github { op } => dispatch_github(op),
+    }
+}
+
+/// Dispatch a `sandy cred github <op>`, mapping an [`InstallError`] to a nonzero
+/// exit. These touch only the user config dir.
+fn dispatch_github(op: GithubOp) -> i32 {
+    let result = match op {
+        GithubOp::Register {
             name,
             name_override,
             org,
@@ -301,7 +321,7 @@ fn dispatch_app(app: AppCommand) -> i32 {
                 force,
             )
         }
-        AppCommand::Import {
+        GithubOp::Import {
             name,
             app_id,
             installation_id,
@@ -312,14 +332,14 @@ fn dispatch_app(app: AppCommand) -> i32 {
             let targets = repos.into_iter().map(sandy::Target).collect();
             app_register::run_import(&name, &app_id, installation_id, &pem, base_url, targets)
         }
-        AppCommand::Verify { name, capabilities } => match parse_caps(&capabilities) {
+        GithubOp::Verify { name, capabilities } => match parse_caps(&capabilities) {
             Ok(caps) => app_register::run_verify(&name, &caps),
             Err(bad) => {
                 eprintln!("sandy: unknown capability '{bad}' (use read-code | write-code | read-pr | write-pr)");
                 return ProcessExit::InvalidPlan.code();
             }
         },
-        AppCommand::Deregister { name, keep_remote } => app_register::run_deregister(&name, keep_remote),
+        GithubOp::Deregister { name, keep_remote } => app_register::run_deregister(&name, keep_remote),
     };
     match result {
         Ok(()) => 0,
@@ -357,9 +377,9 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
         return result.exit_code;
     }
 
-    // App register/deregister need only the user config dir, not $SANDY_HOME.
-    if let Command::App { app } = command {
-        return dispatch_app(app);
+    // `cred` ops need only the user config dir, not $SANDY_HOME.
+    if let Command::Cred { provider } = command {
+        return dispatch_cred(provider);
     }
 
     let journal = Journal::new(doctor::sandy_home());
@@ -370,7 +390,7 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
 
     match command {
         Command::Doctor => unreachable!("doctor handled above"),
-        Command::App { .. } => unreachable!("app handled above"),
+        Command::Cred { .. } => unreachable!("cred handled above"),
         Command::Run {
             template,
             mounts,

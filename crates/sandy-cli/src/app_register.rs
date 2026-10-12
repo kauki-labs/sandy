@@ -1,4 +1,4 @@
-//! `sandy app register` / `sandy app deregister`: the in-code trust-root
+//! `sandy cred github register` / `sandy cred github deregister`: the in-code trust-root
 //! installer (docs/design/trust-root-installer/).
 //!
 //! The provider-neutral pipeline and its invariants live in the `sandy` library
@@ -498,7 +498,7 @@ pub fn github_app_name(handle: &str, owner: &Owner, override_name: Option<&str>)
     }
 }
 
-/// `sandy app register`: register a GitHub App trust root in-code. Prints the
+/// `sandy cred github register`: register a GitHub App trust root in-code. Prints the
 /// one-line disclosure (contacts only the forge, captures locally, writes `0600`,
 /// ships no secret), drives the two browser clicks, and writes the trust root.
 /// With `skip_verify`, the scope-check probe is skipped (explicit pilot bootstrap).
@@ -521,7 +521,7 @@ pub fn run_register(
     let cfg = config_path(&dir, handle);
     if !force {
         // One-shared-org-App model: don't create a second sandy App. Reuse the
-        // existing one via `sandy app import` with the shared key instead.
+        // existing one via `sandy cred github import` with the shared key instead.
         check_no_existing_sandy_app(handle, web_base, &owner)?;
     }
     let provisioner = GithubProvisioner {
@@ -534,8 +534,8 @@ pub fn run_register(
     };
 
     eprintln!(
-        "sandy app register: contacts only {web_base}; the key is captured on this machine and written 0600; no \
-         shared secret, no sandy server in the path."
+        "sandy cred github register: contacts only {web_base}; the key is captured on this machine and written 0600; \
+         no shared secret, no sandy server in the path."
     );
 
     let root = if skip_verify {
@@ -559,7 +559,7 @@ pub fn run_register(
     Ok(())
 }
 
-/// `sandy app deregister`: revoke at the forge (pending the adapter) then shred
+/// `sandy cred github deregister`: uninstall the App at the forge, then shred
 /// the local secret and remove the config. `keep_remote` shreds locally only.
 ///
 /// # Errors
@@ -645,13 +645,13 @@ fn check_no_existing_sandy_app(handle: &str, web_base: &str, owner: &Owner) -> R
     } else {
         Err(InstallError::Capture(format!(
             "a sandy App is already installed on this owner: {}. This org shares one App, so don't create another: \
-             get its key from the shared store and run `sandy app import`, or pass --force to override.",
+             get its key from the shared store and run `sandy cred github import`, or pass --force to override.",
             existing.join(", ")
         )))
     }
 }
 
-/// `sandy app import`: set up this controller from an EXISTING shared App's
+/// `sandy cred github import`: set up this controller from an EXISTING shared App's
 /// credentials (the one-shared-org-App model), no registration, no browser.
 /// Members 2..N obtain the App's private key from the shared secret store and
 /// point sandy at it; this writes the trust root the credential adapter reads.
@@ -674,7 +674,7 @@ pub fn run_import(
     Ok(())
 }
 
-/// `sandy app verify`: re-run the verify probe against an existing trust root —
+/// `sandy cred github verify`: re-run the verify probe against an existing trust root —
 /// dry-run mint a token scoped to the given capabilities and confirm the
 /// installation grants them. Handy to re-check a shared App after an import.
 ///

@@ -1,5 +1,5 @@
 //! Trust-root installer: provisions the forge trust root the credential seam
-//! consumes (`sandy app register`), as specified in
+//! consumes (`sandy cred github register`), as specified in
 //! `docs/design/trust-root-installer/`.
 //!
 //! The pure, provider-neutral parts live here in the library; the network
