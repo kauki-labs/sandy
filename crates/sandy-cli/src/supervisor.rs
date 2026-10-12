@@ -7,11 +7,7 @@
 //! management ops; all liveness goes through [`reconcile_job`], never a direct
 //! registry read (INV-3).
 
-use std::{
-    collections::HashSet,
-    path::Path,
-    time::{Duration, SystemTime},
-};
+use std::{collections::HashSet, path::Path, time::SystemTime};
 
 use sandy::{
     BackendError, Classification, CoreError, CredentialProvider, EgressApplier, EgressOs, EgressOutcome,
@@ -244,9 +240,10 @@ pub fn mint_run_token<P: CredentialProvider>(
 ///
 /// `cred_dir` holds the minted token file; the plan is given a secret pointing at
 /// it, which the backend copies into the guest's secret share (INV-1). Live mid-run
-/// refresh (re-staging a rotated token into the running guest) is deferred to #50;
-/// [`should_refresh`] is the decision this bracket will drive once that channel
-/// exists.
+/// refresh ([`sandy::refresh_once`], gated by [`sandy::should_refresh`]) re-stages a
+/// rotated token into the running guest for jobs that outlive the provider's native
+/// token cap; wiring it into this bracket's run loop lands with the caller-owned
+/// secret-dir backend seam (#49).
 ///
 /// # Errors
 ///
@@ -307,19 +304,6 @@ pub fn run_job_with_credential<B: VmBackend, E: EgressApplier, P: CredentialProv
     }
 
     report
-}
-
-/// Whether a credential should be refreshed now: true once at most `margin` remains
-/// before `expires_at` (or it has already expired).
-///
-/// The decision the [`run_job_with_credential`] bracket will drive once the mid-run
-/// re-stage channel (#50) lands; today it gates nothing live and is unit-tested
-/// against explicit times.
-#[must_use]
-pub fn should_refresh(now: SystemTime, expires_at: SystemTime, margin: Duration) -> bool {
-    expires_at
-        .duration_since(now)
-        .map_or(true, |remaining| remaining <= margin)
 }
 
 /// List every job record (`journal.list()`).

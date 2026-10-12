@@ -305,6 +305,80 @@ pub fn mint_lease(
     })
 }
 
+/// Whether a credential should be refreshed now: true once at most `margin`
+/// remains before `expires_at`, or it has already expired.
+///
+/// Drives the mid-run refresh loop (#49): a job that outlives the provider's native
+/// token cap (GitHub fixes installation tokens at ~1h) is re-minted before the
+/// current token lapses, so `margin` must exceed one refresh's latency.
+#[must_use]
+pub fn should_refresh(now: SystemTime, expires_at: SystemTime, margin: Duration) -> bool {
+    expires_at
+        .duration_since(now)
+        .map_or(true, |remaining| remaining <= margin)
+}
+
+/// Re-mint the lease's credential when it is within `margin` of expiry and re-stage
+/// the fresh token over the lease's own secret file, then revoke the superseded
+/// token. Returns `true` when a refresh happened, `false` when the lease was not
+/// yet due (a no-op). This is the execution-bound half of #49: paired with the
+/// caller's teardown revoke, a long job holds a valid scoped token for its whole
+/// run and never one past it.
+///
+/// Order matters. The new token is written over the shared file **before** the old
+/// one is revoked, so a consumer reading the file (the guest, over the live secret
+/// share) never observes a revoked token; the brief overlap leaves two valid tokens,
+/// which is safe (more access, not less). The lease is advanced to the new handle
+/// and expiry so the caller's teardown revoke targets the live token. A failed
+/// revoke of the *superseded* token is logged, not fatal, its native TTL is the
+/// backstop; a failed re-mint or re-stage leaves the lease and file untouched (the
+/// current token stays in place) and surfaces as an error for the loop to retry.
+///
+/// Because the token is re-delivered by overwriting the file, only a consumer that
+/// re-reads `/run/sandy/secrets/<NAME>` at use-time sees the refresh; a job that
+/// captured `$NAME` into its environment at login holds the boot-time token (#49).
+///
+/// # Errors
+///
+/// Returns [`CredError`] when the re-mint or the re-stage fails, or when the lease
+/// is not file-sourced (a contract violation: [`mint_lease`] always stages a file).
+pub fn refresh_once<P: CredentialProvider>(
+    provider: &P,
+    lease: &mut Lease,
+    now: SystemTime,
+    margin: Duration,
+) -> Result<bool, CredError> {
+    if !should_refresh(now, lease.expires_at, margin) {
+        return Ok(false);
+    }
+    let SecretSource::File(dest) = &lease.secret_ref.source else {
+        return Err(CredError::Stage(
+            "lease credential is not a file-sourced secret; cannot re-stage".to_string(),
+        ));
+    };
+    let dest = dest.clone();
+    // Re-mint under the lease's retained scope (GitHub has no rotate: refresh is a
+    // fresh scoped mint keyed off the current handle). On failure the lease is
+    // untouched and the current token stays staged.
+    let minted = provider.refresh(lease)?;
+    // Stage the new token over the shared file BEFORE revoking the old one, so a
+    // consumer reading the file never observes a revoked token.
+    write_secret_0600(&dest, minted.secret.as_bytes())?;
+    // Revoke the superseded token while `lease` still names it, then advance the
+    // lease to the fresh handle/expiry. A revoke failure is logged, not fatal.
+    if let Err(e) = provider.revoke(lease) {
+        tracing::warn!(%e, handle = %lease.handle.id, "revoke of superseded credential failed; relying on native expiry");
+    }
+    lease.expires_at = minted.expires_at;
+    lease.handle = minted.handle;
+    tracing::info!(
+        name = %lease.secret_ref.name,
+        handle = %lease.handle.id,
+        "re-delivered a refreshed scoped credential"
+    );
+    Ok(true)
+}
+
 /// Render a capability set into GitHub App installation-token `permissions`
 /// `(name, level)` pairs, the single source of truth shared by the GitHub adapter's
 /// mint and the trust-root installer's verify probe, so "verified" cannot drift
@@ -450,11 +524,27 @@ pub fn read_secret_0600(path: &Path) -> Result<Vec<u8>, CredError> {
     fs::read(path).map_err(|e| stage_err("read secret", path, &e))
 }
 
-/// Write `bytes` to a `0600` file `<secret_name>.token` under `out_dir` via atomic
-/// temp → sync → rename, fsyncing the directory so the rename is durable (INV-1).
-/// The error message never carries the secret bytes.
+/// Write `bytes` to a `0600` file `<secret_name>.token` under `out_dir`, returning
+/// its path. See [`write_secret_0600`] for the atomicity contract.
 fn stage_token(out_dir: &Path, secret_name: &str, bytes: &[u8]) -> Result<PathBuf, CredError> {
     let dest = out_dir.join(format!("{secret_name}.token"));
+    write_secret_0600(&dest, bytes)?;
+    Ok(dest)
+}
+
+/// Write `bytes` over `dest` as a `0600` file via atomic temp → sync → rename,
+/// fsyncing the parent so the rename is durable (INV-1). The temp sibling and the
+/// rename keep `dest` a single consistent file at every instant, so a consumer
+/// reading it (including the guest over the live secret share) never sees a torn
+/// or partial write. The error message never carries the secret bytes.
+///
+/// Re-delivery (#49) reuses this to overwrite a lease's staged token in place with
+/// a freshly minted one; the rename makes that swap atomic for the reader.
+fn write_secret_0600(dest: &Path, bytes: &[u8]) -> Result<(), CredError> {
+    let dir = dest
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| CredError::Stage(format!("secret path {} has no parent dir", dest.display())))?;
     let tmp = dest.with_extension("tmp");
     let mut file = fs::File::create(&tmp).map_err(|e| stage_err("create token temp", &tmp, &e))?;
     file.write_all(bytes)
@@ -462,9 +552,9 @@ fn stage_token(out_dir: &Path, secret_name: &str, bytes: &[u8]) -> Result<PathBu
     file.sync_all().map_err(|e| stage_err("sync token temp", &tmp, &e))?;
     fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))
         .map_err(|e| stage_err("tighten token to 0600", &tmp, &e))?;
-    fs::rename(&tmp, &dest).map_err(|e| stage_err("rename token into place", &dest, &e))?;
-    crate::fsync_dir(out_dir).map_err(|e| stage_err("fsync out dir", out_dir, &e))?;
-    Ok(dest)
+    fs::rename(&tmp, dest).map_err(|e| stage_err("rename token into place", dest, &e))?;
+    crate::fsync_dir(dir).map_err(|e| stage_err("fsync out dir", dir, &e))?;
+    Ok(())
 }
 
 /// Build a [`CredError::Stage`] for an IO failure without leaking secret bytes.
@@ -664,5 +754,173 @@ mod tests {
             "config names the key path, not the key"
         );
         Ok(())
+    }
+
+    /// A provider whose every mint/refresh yields a fresh token and handle
+    /// (`token-N` / `h-N`) and that records each revoked handle, so a test can prove
+    /// re-delivery rewrote the file, advanced the lease, and revoked the *superseded*
+    /// token rather than the live one. `fail_refresh` makes `refresh` error while
+    /// `mint` still succeeds, to exercise the untouched-on-failure path.
+    struct RotatingProvider {
+        counter: Mutex<u32>,
+        revoked: Mutex<Vec<String>>,
+        fail_refresh: bool,
+    }
+
+    impl RotatingProvider {
+        fn new() -> Self {
+            Self {
+                counter: Mutex::new(0),
+                revoked: Mutex::new(Vec::new()),
+                fail_refresh: false,
+            }
+        }
+
+        fn failing_refresh() -> Self {
+            Self {
+                fail_refresh: true,
+                ..Self::new()
+            }
+        }
+
+        fn revoked(&self) -> Vec<String> {
+            self.revoked.lock().unwrap_or_else(PoisonError::into_inner).clone()
+        }
+
+        fn next_mint(&self) -> Minted {
+            let mut n = self.counter.lock().unwrap_or_else(PoisonError::into_inner);
+            *n += 1;
+            Minted::new(
+                format!("token-{n}"),
+                SystemTime::now() + Duration::from_secs(u64::from(MAX_TTL_SECS)),
+                CredentialHandle { id: format!("h-{n}") },
+            )
+        }
+    }
+
+    impl CredentialProvider for RotatingProvider {
+        fn mint(&self, _scope: &Scope, _ttl_hint: Duration) -> Result<Minted, CredError> {
+            Ok(self.next_mint())
+        }
+
+        fn revoke(&self, lease: &Lease) -> Result<(), CredError> {
+            self.revoked
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(lease.handle.id.clone());
+            Ok(())
+        }
+
+        fn refresh(&self, _lease: &Lease) -> Result<Minted, CredError> {
+            if self.fail_refresh {
+                return Err(CredError::Mint("rotating provider: refresh forced to fail".to_string()));
+            }
+            Ok(self.next_mint())
+        }
+    }
+
+    fn file_of(lease: &Lease) -> PathBuf {
+        match &lease.secret_ref.source {
+            SecretSource::File(p) => p.clone(),
+            other => panic!("expected a file-sourced secret, got {other:?}"),
+        }
+    }
+
+    /// Below the margin, `refresh_once` is a no-op: the staged file, the lease
+    /// handle, and the revoke ledger are all untouched.
+    #[test]
+    fn refresh_is_a_noop_before_the_margin() -> anyhow::Result<()> {
+        let tmp = tempfile::TempDir::new()?;
+        let provider = RotatingProvider::new();
+        let mut lease = mint_lease(&provider, &scope(), 3000, "GH_TOKEN", tmp.path()).context("mint")?;
+        let path = file_of(&lease);
+        assert_eq!(fs::read_to_string(&path)?, "token-1");
+
+        // Expiry is ~MAX_TTL ahead; a 60s margin is nowhere near it.
+        let refreshed =
+            refresh_once(&provider, &mut lease, SystemTime::now(), Duration::from_secs(60)).context("refresh_once")?;
+
+        assert!(!refreshed, "must not refresh while well outside the margin");
+        assert_eq!(fs::read_to_string(&path)?, "token-1", "file unchanged");
+        assert_eq!(lease.handle.id, "h-1", "lease unchanged");
+        assert!(provider.revoked().is_empty(), "nothing revoked");
+        Ok(())
+    }
+
+    /// Inside the margin, `refresh_once` re-stages the fresh token over the same
+    /// file (still 0600), advances the lease to the new handle, and revokes the
+    /// superseded handle, never the new one.
+    #[test]
+    fn refresh_restages_fresh_token_and_revokes_the_old() -> anyhow::Result<()> {
+        let tmp = tempfile::TempDir::new()?;
+        let provider = RotatingProvider::new();
+        let mut lease = mint_lease(&provider, &scope(), 3000, "GH_TOKEN", tmp.path()).context("mint")?;
+        let path = file_of(&lease);
+
+        // Pull "now" to 10s before expiry so a 60s margin fires.
+        let due = lease.expires_at - Duration::from_secs(10);
+        let refreshed = refresh_once(&provider, &mut lease, due, Duration::from_secs(60)).context("refresh_once")?;
+
+        assert!(refreshed, "must refresh inside the margin");
+        assert_eq!(
+            fs::read_to_string(&path)?,
+            "token-2",
+            "fresh token re-staged over the same file"
+        );
+        assert_eq!(lease.handle.id, "h-2", "lease advanced to the new handle");
+        assert_eq!(
+            provider.revoked(),
+            vec!["h-1".to_string()],
+            "the superseded token is revoked, not the new one"
+        );
+        let mode = fs::metadata(&path)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "re-staged token stays 0600");
+        Ok(())
+    }
+
+    /// A re-mint failure leaves everything in place: the old token stays staged and
+    /// valid, the lease is unchanged, and nothing is revoked (the loop retries).
+    #[test]
+    fn a_failed_refresh_leaves_the_current_token_in_place() -> anyhow::Result<()> {
+        let tmp = tempfile::TempDir::new()?;
+        let provider = RotatingProvider::failing_refresh();
+        let mut lease = mint_lease(&provider, &scope(), 3000, "GH_TOKEN", tmp.path()).context("mint")?;
+        let path = file_of(&lease);
+
+        let due = lease.expires_at - Duration::from_secs(10);
+        let err = refresh_once(&provider, &mut lease, due, Duration::from_secs(60)).unwrap_err();
+
+        assert!(
+            matches!(err, CredError::Mint(_)),
+            "re-mint failure surfaces as an error"
+        );
+        assert_eq!(
+            fs::read_to_string(&path)?,
+            "token-1",
+            "current token untouched on failure"
+        );
+        assert_eq!(lease.handle.id, "h-1", "lease untouched on failure");
+        assert!(provider.revoked().is_empty(), "nothing revoked on failure");
+        Ok(())
+    }
+
+    /// `should_refresh` fires only at or inside the margin, and on an already-lapsed
+    /// expiry.
+    #[test]
+    fn should_refresh_fires_within_margin_only() {
+        let now = SystemTime::now();
+        let margin = Duration::from_secs(300);
+        assert!(
+            !should_refresh(now, now + Duration::from_secs(1_800), margin),
+            "far from expiry: no"
+        );
+        assert!(
+            should_refresh(now, now + Duration::from_secs(120), margin),
+            "inside the margin: yes"
+        );
+        assert!(
+            should_refresh(now, now - Duration::from_secs(1), margin),
+            "already expired: yes"
+        );
     }
 }
