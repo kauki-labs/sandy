@@ -45,12 +45,15 @@ pub fn run_console<T: Transport + ?Sized>(transport: &mut T, spec: &RunSpec<'_>,
     // fault is reported with the boot state we actually observed rather than a
     // fabricated one.
     let mut booted = false;
+    // A bounded tail of everything read from the console, so a boot that never
+    // reaches the command is still diagnosable (the console is otherwise lost).
+    let mut console = ConsoleTail::new();
     // Start of the current phase's budget; reset when the command is injected.
     let mut phase_start = Instant::now();
 
     loop {
         if let Some(result) = protocol.outcome() {
-            return finalize(result, booted);
+            return finalize(result, booted, console.into_string());
         }
         if phase_start.elapsed() >= protocol.current_deadline() {
             protocol.on_timeout();
@@ -62,38 +65,98 @@ pub fn run_console<T: Transport + ?Sized>(transport: &mut T, spec: &RunSpec<'_>,
                 // path resolve it (booted:false, or timed_out:true post-inject).
                 protocol.on_timeout();
             }
-            Ok(read) => match protocol.feed(&buf[..read]) {
-                ProtocolStep::Inject(frame) => {
-                    booted = true;
-                    phase_start = Instant::now();
-                    if let Err(err) = transport.write(&frame) {
-                        return transport_fault(err, booted);
+            Ok(read) => {
+                console.push(&buf[..read]);
+                match protocol.feed(&buf[..read]) {
+                    ProtocolStep::Inject(frame) => {
+                        booted = true;
+                        phase_start = Instant::now();
+                        if let Err(err) = transport.write(&frame) {
+                            return transport_fault(err, booted, console.into_string());
+                        }
                     }
+                    ProtocolStep::NeedMore | ProtocolStep::Done => {}
                 }
-                ProtocolStep::NeedMore | ProtocolStep::Done => {}
-            },
-            Err(err) => return transport_fault(err, booted),
+            }
+            Err(err) => return transport_fault(err, booted, console.into_string()),
         }
     }
 }
 
-/// Collapse a terminal protocol result into the physical [`Outcome`]. A
-/// [`BackendError`] (a garbled frame) becomes `transport_error` with no
-/// fabricated `guest_exit` (INV-OUTCOME).
-fn finalize(result: Result<Outcome, BackendError>, booted: bool) -> Outcome {
+/// The last [`ConsoleTail::CAP`] bytes read from the console, as a rolling buffer:
+/// a long-running job can print more than fits, and only the tail is kept for
+/// diagnostics.
+struct ConsoleTail {
+    bytes: Vec<u8>,
+}
+
+impl ConsoleTail {
+    /// Keep up to 64 KiB of console tail.
+    const CAP: usize = 64 * 1024;
+
+    fn new() -> Self {
+        Self { bytes: Vec::new() }
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        self.bytes.extend_from_slice(chunk);
+        if self.bytes.len() > Self::CAP {
+            let excess = self.bytes.len() - Self::CAP;
+            self.bytes.drain(..excess);
+        }
+    }
+
+    fn into_string(self) -> String {
+        String::from_utf8_lossy(&self.bytes).into_owned()
+    }
+}
+
+/// Collapse a terminal protocol result into the physical [`Outcome`], attaching the
+/// captured `console`. A [`BackendError`] (a garbled frame) becomes
+/// `transport_error` with no fabricated `guest_exit` (INV-OUTCOME).
+fn finalize(result: Result<Outcome, BackendError>, booted: bool, console: String) -> Outcome {
     match result {
-        Ok(outcome) => outcome,
-        Err(err) => transport_fault(err, booted),
+        Ok(mut outcome) => {
+            outcome.console = console;
+            outcome
+        }
+        Err(err) => transport_fault(err, booted, console),
     }
 }
 
 /// Map an infra fault into the `transport_error` field, preserving the observed
-/// boot state and never inventing an exit code.
-fn transport_fault(err: BackendError, booted: bool) -> Outcome {
+/// boot state and the captured console, and never inventing an exit code.
+fn transport_fault(err: BackendError, booted: bool, console: String) -> Outcome {
     Outcome {
         booted,
         guest_exit: None,
         transport_error: Some(err.to_string()),
         timed_out: false,
+        console,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The console tail keeps only the last `CAP` bytes: an overlong stream is
+    /// bounded, and the retained text is the tail (the end of the boot/run).
+    #[test]
+    fn console_tail_keeps_the_last_cap_bytes() {
+        let mut tail = ConsoleTail::new();
+        tail.push(&vec![b'x'; ConsoleTail::CAP]);
+        tail.push(b"END");
+        let out = tail.into_string();
+        assert_eq!(out.len(), ConsoleTail::CAP, "the tail is bounded to CAP bytes");
+        assert!(out.ends_with("END"), "the retained bytes are the tail, not the head");
+    }
+
+    /// A short stream is kept whole and decoded lossily.
+    #[test]
+    fn console_tail_keeps_a_short_stream_whole() {
+        let mut tail = ConsoleTail::new();
+        tail.push(b"boot log\n");
+        assert_eq!(tail.into_string(), "boot log\n");
     }
 }

@@ -31,6 +31,7 @@ fn ok_outcome(guest_exit: i32) -> Outcome {
         guest_exit: Some(guest_exit),
         transport_error: None,
         timed_out: false,
+        console: String::new(),
     }
 }
 

@@ -302,6 +302,7 @@ mod tests {
             guest_exit: Some(0),
             transport_error: None,
             timed_out: false,
+            console: String::new(),
         };
         let c = classify_outcome(&outcome, OutputStatus::Complete);
         assert_eq!(c.status, Status::Succeeded);
@@ -318,6 +319,7 @@ mod tests {
             guest_exit: Some(7),
             transport_error: None,
             timed_out: false,
+            console: String::new(),
         };
         let c = classify_outcome(&outcome, OutputStatus::Complete);
         assert_eq!(c.status, Status::Failed);
@@ -333,6 +335,7 @@ mod tests {
             guest_exit: None,
             transport_error: None,
             timed_out: true,
+            console: String::new(),
         };
         let c = classify_outcome(&outcome, OutputStatus::Complete);
         assert_eq!(c.process_exit, ProcessExit::TaskFailure);
@@ -348,6 +351,7 @@ mod tests {
             guest_exit: None,
             transport_error: None,
             timed_out: false,
+            console: String::new(),
         };
         let c = classify_outcome(&outcome, OutputStatus::RequiredMissing);
         assert_eq!(c.process_exit, ProcessExit::InfraFault);

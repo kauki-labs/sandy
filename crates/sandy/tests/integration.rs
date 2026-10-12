@@ -52,6 +52,7 @@ fn exit_zero() -> Outcome {
         guest_exit: Some(0),
         transport_error: None,
         timed_out: false,
+        console: String::new(),
     }
 }
 
