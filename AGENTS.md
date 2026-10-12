@@ -18,8 +18,12 @@ version, metadata, dependency versions, and lints through the root `Cargo.toml`
 - **`sandy-backend`** — the native `VmBackend` implementations: `QemuBackend`
   (Linux/KVM, serial on `ttyS0`) and `VfkitBackend` (macOS/Virtualization.framework,
   console on `hvc0`).
-- **`sandy-cli`** — the `sandy` binary: `doctor` and `run`/`ls`/`status`/`wait`/
-  `kill`/`gc` (text or `-o json`).
+- **`sandy-cli`** — the `sandy` binary: `doctor`, `run`/`ls`/`status`/`wait`/
+  `kill`/`gc`, and `cred github register`/`verify`/`import`/`deregister` (manage
+  the forge trust root the credential seam mints from; `run --credential <name>`
+  mints a scoped token from it). Text or `-o json`. The trust-root installer is
+  provider-nested (`sandy cred <provider> <op>`); GitHub today, GitLab later. See
+  `docs/providers/`.
 
 ## Build & test (run before committing)
 
@@ -65,7 +69,7 @@ Commit with a Conventional Commits title.
 crates/
   ├─ sandy/          - deep library behind a curated facade (seam, journal, result, console, topology, …)
   ├─ sandy-backend/  - native VmBackend impls: QemuBackend (Linux) + VfkitBackend (macOS)
-  └─ sandy-cli/      - the `sandy` binary (doctor, run/ls/status/wait/kill/gc)
+  └─ sandy-cli/      - the `sandy` binary (doctor, run/ls/status/wait/kill/gc, cred github …)
 nix/
   ├─ packages/       - crane build definitions
   └─ guest/          - bootable microVM guests + the Topology seam (own flake)
