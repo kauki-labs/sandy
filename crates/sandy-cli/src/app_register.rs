@@ -10,10 +10,10 @@
 //! captured and written to the trust-root config with no hand-copying.
 //!
 //! The manifest conversion (`POST /app-manifests/{code}/conversions`) is
-//! unauthenticated, so registration needs no App-JWT and is not gated on the live
-//! credential adapter; only the verify probe (a dry-run mint) is, and it is wired
-//! through the adapter when that lands. Until then `--skip-verify` is the explicit
-//! (never default) bootstrap path.
+//! unauthenticated, so registration needs no App-JWT. `verify` (a dry-run mint +
+//! ceiling check) and `deregister`'s forge uninstall run through the credential
+//! seam's live [`sandy::GithubAdapter`]; `register` verifies by default, and
+//! `--skip-verify` is the explicit (never default) escape for a key-only bootstrap.
 
 use std::{
     collections::HashMap,
@@ -22,7 +22,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use sandy::{Capability, InstallError, Provisioner, RegistrationPlan, RevokeOutcome, Target, TrustRoot};
+use sandy::{
+    Capability, CredentialProvider, GithubAdapter, InstallError, Provisioner, RegistrationPlan, RevokeOutcome, Scope,
+    Target, TrustRoot, mint_lease, render_github_permissions,
+};
 use tiny_http::{Header, Response, Server};
 
 /// Where the account the App is registered under lives.
@@ -270,25 +273,110 @@ impl Provisioner for GithubProvisioner {
         })
     }
 
-    fn verify(&self, _root: &TrustRoot, _capabilities: &[Capability]) -> Result<(), InstallError> {
-        Err(InstallError::Verify(
-            "live verification needs the GitHub credential adapter (not yet available); re-run with --skip-verify for \
-             the pilot bootstrap"
-                .to_string(),
-        ))
+    fn verify(&self, root: &TrustRoot, capabilities: &[Capability]) -> Result<(), InstallError> {
+        let adapter =
+            GithubAdapter::from_trust_root(root).map_err(|e| InstallError::Verify(format!("build adapter: {e}")))?;
+
+        // Ceiling check: the installation must grant at least what the requested
+        // capabilities render to (an under-scoped install would mint too narrow a
+        // token). Compared through the SAME renderer the manifest used, so it can't
+        // drift.
+        let granted = adapter
+            .installation_permissions()
+            .map_err(|e| InstallError::Verify(format!("read installation permissions: {e}")))?;
+        for (perm, level) in render_github_permissions(capabilities) {
+            if !grant_satisfies(granted.get(&perm).map(String::as_str), &level) {
+                return Err(InstallError::Verify(format!(
+                    "installation grant is too narrow: `{perm}` needs `{level}`, installation has {:?}",
+                    granted.get(&perm)
+                )));
+            }
+        }
+
+        // Dry-run mint: prove the App mints a scoped token end-to-end, then revoke
+        // it. A successful scoped mint is GitHub confirming the App + installation +
+        // scope are all valid.
+        let scope = Scope {
+            targets: github_targets(root),
+            capabilities: capabilities.to_vec(),
+        };
+        let probe_dir = verify_tmp_dir()?;
+        let outcome = match mint_lease(&adapter, &scope, 60, "SANDY_VERIFY_PROBE", &probe_dir) {
+            Ok(lease) => adapter
+                .revoke(&lease)
+                .map_err(|e| InstallError::Verify(format!("revoke probe token: {e}"))),
+            Err(e) => Err(InstallError::Verify(format!("dry-run mint failed: {e}"))),
+        };
+        let _ = std::fs::remove_dir_all(&probe_dir);
+        outcome
     }
 
     fn revoke(&self, root: &TrustRoot) -> Result<RevokeOutcome, InstallError> {
-        // Forge uninstall (DELETE /app/installations/{id}) needs a fresh App JWT,
-        // which only the live .pem can sign — and App JWTs live <=10 min, so one
-        // can never be pre-made for a key that later disappears. Until the
-        // App-authed client lands (and whenever the key is gone), uninstall is a
-        // manual UI step: report where, and let the local teardown proceed rather
-        // than blocking it.
-        Ok(RevokeOutcome {
-            uninstalled: false,
-            registration_residue: Some(manual_uninstall_url(&self.web_base, root)),
-        })
+        // Uninstall needs an App JWT, which only the live `.pem` can sign (App JWTs
+        // live <=10 min, so none can be pre-made). With the key present, uninstall
+        // via the adapter; the App *registration* shell can't be deleted via API, so
+        // report where to remove it by hand. With the key gone, don't block the
+        // local teardown — point to the UI instead.
+        match GithubAdapter::from_trust_root(root) {
+            Ok(adapter) => {
+                adapter
+                    .uninstall()
+                    .map_err(|e| InstallError::Revoke(format!("uninstall: {e}")))?;
+                Ok(RevokeOutcome {
+                    uninstalled: true,
+                    registration_residue: Some(app_registration_url(&self.web_base, root)),
+                })
+            }
+            Err(e) => {
+                eprintln!("note: can't sign the App JWT to uninstall ({e}); do it in the GitHub UI.");
+                Ok(RevokeOutcome {
+                    uninstalled: false,
+                    registration_residue: Some(manual_uninstall_url(&self.web_base, root)),
+                })
+            }
+        }
+    }
+}
+
+/// Whether an installation's granted permission level satisfies a required one
+/// (`write` dominates `read`; absent satisfies nothing).
+fn grant_satisfies(have: Option<&str>, need: &str) -> bool {
+    matches!((have, need), (Some("write"), _) | (Some("read"), "read"))
+}
+
+/// The repositories a GitHub trust root is scoped to.
+fn github_targets(root: &TrustRoot) -> Vec<Target> {
+    match root {
+        TrustRoot::Github { targets, .. } => targets.clone(),
+        TrustRoot::Gitlab { .. } => Vec::new(),
+    }
+}
+
+/// A `0700` temp dir for the verify probe's short-lived staged token, removed
+/// after the probe.
+fn verify_tmp_dir() -> Result<PathBuf, InstallError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("sandy-verify-{}", new_nonce()));
+    std::fs::create_dir_all(&dir).map_err(|source| InstallError::Io {
+        action: "create verify temp dir",
+        path: dir.clone(),
+        source,
+    })?;
+    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    Ok(dir)
+}
+
+/// After uninstall the installation is gone, but the App *registration* shell
+/// remains (no delete API). Point to the owner's Developer-settings Apps page to
+/// remove it by hand; the org is read best-effort from the first target.
+fn app_registration_url(web_base: &str, root: &TrustRoot) -> String {
+    let org = github_targets(root)
+        .first()
+        .and_then(|target| target.0.split('/').next().map(str::to_string));
+    match org {
+        Some(org) => format!("{web_base}/organizations/{org}/settings/apps"),
+        None => format!("{web_base}/settings/apps"),
     }
 }
 
@@ -583,6 +671,21 @@ pub fn run_import(
     let cfg = import_into(&dir, handle, app_id, installation_id, pem_source, base_url, targets)?;
     println!("Imported shared GitHub App trust root: app_id={app_id}, installation_id={installation_id}");
     println!("Trust root: {}", cfg.display());
+    Ok(())
+}
+
+/// `sandy app verify`: re-run the verify probe against an existing trust root —
+/// dry-run mint a token scoped to the given capabilities and confirm the
+/// installation grants them. Handy to re-check a shared App after an import.
+///
+/// # Errors
+/// [`InstallError::Verify`] if the probe fails, or a config/load error.
+pub fn run_verify(handle: &str, capabilities: &[Capability]) -> Result<(), InstallError> {
+    let dir = trust_roots_dir().map_err(|e| InstallError::Capture(e.to_string()))?;
+    let cfg = config_path(&dir, handle);
+    let root = TrustRoot::load(&cfg)?;
+    provisioner_for(&root, handle).verify(&root, capabilities)?;
+    println!("Verified: mints a scoped token and the installation grants the requested capabilities.");
     Ok(())
 }
 

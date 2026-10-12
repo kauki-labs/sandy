@@ -122,8 +122,8 @@ enum AppCommand {
         /// A repository the credential may be scoped to, as owner/repo (repeatable).
         #[arg(long = "repo")]
         repos: Vec<String>,
-        /// Write the trust root WITHOUT the live scope-check probe. Explicit pilot
-        /// bootstrap only, until the credential adapter lands.
+        /// Write the trust root WITHOUT the live scope-check probe (register
+        /// verifies by default). An explicit key-only bootstrap escape.
         #[arg(long)]
         skip_verify: bool,
         /// Create the App even if one already exists on the owner (overrides the
@@ -152,8 +152,18 @@ enum AppCommand {
         #[arg(long = "repo")]
         repos: Vec<String>,
     },
-    /// Remove a trust root: revoke at the forge (pending the adapter), then shred
-    /// the local key and config.
+    /// Verify an existing trust root: dry-run mint a scoped token and check the
+    /// installation grants the requested capabilities.
+    Verify {
+        /// The trust-root name (its config file stem).
+        name: String,
+        /// A capability to verify the installation grants: read-code | write-code
+        /// | read-pr | write-pr (repeatable, at least one).
+        #[arg(long = "capability", required = true)]
+        capabilities: Vec<String>,
+    },
+    /// Remove a trust root: uninstall the App at the forge, then shred the local
+    /// key and config.
     Deregister {
         /// The trust-root name (its config file stem).
         name: String,
@@ -263,6 +273,13 @@ fn dispatch_app(app: AppCommand) -> i32 {
             let targets = repos.into_iter().map(sandy::Target).collect();
             app_register::run_import(&name, &app_id, installation_id, &pem, base_url, targets)
         }
+        AppCommand::Verify { name, capabilities } => match parse_caps(&capabilities) {
+            Ok(caps) => app_register::run_verify(&name, &caps),
+            Err(bad) => {
+                eprintln!("sandy: unknown capability '{bad}' (use read-code | write-code | read-pr | write-pr)");
+                return ProcessExit::InvalidPlan.code();
+            }
+        },
         AppCommand::Deregister { name, keep_remote } => app_register::run_deregister(&name, keep_remote),
     };
     match result {
