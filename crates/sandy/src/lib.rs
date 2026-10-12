@@ -87,7 +87,10 @@ pub use seed::{
 };
 pub use stage::{StagedSecret, TagPool, mount_args, stage_secrets, wipe};
 pub use strategy::{BootAxis, BuildAxis, HostFacts, ProvisioningStrategy, classify};
-pub use trust_root::{github_app_manifest, parse_capability};
+pub use trust_root::{
+    FakeProvisioner, InstallError, Provisioner, RegistrationPlan, RevokeOutcome, deregister, github_app_manifest,
+    parse_capability, register,
+};
 
 /// fsync a directory so a preceding create/rename within it is durable across a
 /// crash (INV-4/INV-6).
