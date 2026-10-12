@@ -308,18 +308,23 @@ fn inject(manifest: &mut serde_json::Value, key: &str, value: &str) {
 /// POST the manifest code to the conversion endpoint (unauthenticated) and return
 /// the App id, slug, and private key.
 fn convert_manifest(api_base: Option<&str>, code: &str) -> Result<Conversion, InstallError> {
-    let mut builder = octocrab::Octocrab::builder();
-    if let Some(base) = api_base {
-        builder = builder
-            .base_uri(base)
-            .map_err(|e| InstallError::Capture(format!("GHES base {base}: {e}")))?;
-    }
-    let octo = builder.build().map_err(|e| InstallError::Capture(e.to_string()))?;
-    let runtime = tokio::runtime::Runtime::new().map_err(|e| InstallError::Capture(e.to_string()))?;
+    let api_base = api_base.map(str::to_string);
     let route = format!("/app-manifests/{code}/conversions");
-    runtime
-        .block_on(octo.post::<(), Conversion>(route, None))
-        .map_err(|e| InstallError::Capture(format!("manifest conversion: {e}")))
+    let runtime = tokio::runtime::Runtime::new().map_err(|e| InstallError::Capture(e.to_string()))?;
+    // Build the client INSIDE the runtime: octocrab's tower service needs a live
+    // Tokio reactor, so a client built outside block_on panics ("no reactor running").
+    runtime.block_on(async move {
+        let mut builder = octocrab::Octocrab::builder();
+        if let Some(base) = &api_base {
+            builder = builder
+                .base_uri(base)
+                .map_err(|e| InstallError::Capture(format!("GHES base {base}: {e}")))?;
+        }
+        let octo = builder.build().map_err(|e| InstallError::Capture(e.to_string()))?;
+        octo.post::<(), Conversion>(route, None)
+            .await
+            .map_err(|e| InstallError::Capture(format!("manifest conversion: {e}")))
+    })
 }
 
 /// Write the captured PEM to a `0600` file under the trust-roots dir, returning

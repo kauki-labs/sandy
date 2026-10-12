@@ -46,9 +46,11 @@ pub fn parse_capability(token: &str) -> Result<Capability, String> {
 /// from the requested capabilities.
 ///
 /// Permissions come from [`render_github_permissions`] so the registered App's
-/// ceiling matches exactly what a minted token will later request. The webhook is
-/// disabled (`hook_attributes.active = false`, sandy receives none) and the App is
-/// private (`public = false`, "Only on this account"), per the spec's manifest.
+/// ceiling matches exactly what a minted token will later request. The App is
+/// private (`public = false`, "Only on this account"). The webhook is left off by
+/// omitting `hook_attributes` entirely: GitHub rejects the manifest ("url wasn't
+/// supplied") when `hook_attributes` is present without a hook URL, and an App
+/// created without it simply has no webhook.
 #[must_use]
 pub fn github_app_manifest(name: &str, url: &str, capabilities: &[Capability]) -> Value {
     let permissions: Map<String, Value> = render_github_permissions(capabilities)
@@ -56,14 +58,10 @@ pub fn github_app_manifest(name: &str, url: &str, capabilities: &[Capability]) -
         .map(|(key, level)| (key, Value::String(level)))
         .collect();
 
-    let mut hook = Map::new();
-    hook.insert("active".to_string(), Value::Bool(false));
-
     let mut manifest = Map::new();
     manifest.insert("name".to_string(), Value::String(name.to_string()));
     manifest.insert("url".to_string(), Value::String(url.to_string()));
     manifest.insert("public".to_string(), Value::Bool(false));
-    manifest.insert("hook_attributes".to_string(), Value::Object(hook));
     manifest.insert("default_events".to_string(), Value::Array(Vec::new()));
     manifest.insert("default_permissions".to_string(), Value::Object(permissions));
     Value::Object(manifest)
@@ -391,7 +389,11 @@ mod tests {
             &[Capability::WriteCode, Capability::WritePr],
         );
         assert_eq!(manifest["public"], json!(false));
-        assert_eq!(manifest["hook_attributes"]["active"], json!(false));
+        assert!(
+            manifest.get("hook_attributes").is_none(),
+            "hook_attributes is omitted (webhook off) so GitHub accepts the manifest"
+        );
+        assert_eq!(manifest["url"], json!("https://github.com/kauki-labs/sandy"));
         assert_eq!(manifest["default_events"], json!([]));
     }
 
