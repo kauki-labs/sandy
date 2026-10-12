@@ -205,6 +205,7 @@ mod tests {
             guest_exit: Some(1),
             transport_error: None,
             timed_out: false,
+            console: String::new(),
         };
         let collected = collect(&outcome, &source, &job, &declared, &config)?;
         assert!(collected.is_empty(), "nonzero exit must collect nothing");

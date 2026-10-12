@@ -35,6 +35,7 @@ fn build_envelope(
     classification: Classification,
     guest_exit: Option<i32>,
     message: String,
+    console: String,
 ) -> ResultEnvelope {
     ResultEnvelope {
         result_schema_version: RESULT_SCHEMA_VERSION,
@@ -49,7 +50,9 @@ fn build_envelope(
         provenance: Provenance {
             template_store_path: String::new(),
         },
-        logs: Logs { tail: String::new() },
+        // The captured guest console tail (boot log + command output), so a boot
+        // that never reached the command is diagnosable from the envelope alone.
+        logs: Logs { tail: console },
     }
 }
 
@@ -109,7 +112,14 @@ pub fn run_job<B: VmBackend, E: EgressApplier>(
     //    the first thing written, so an empty journal proves the backend was never reached (the silent-run guard).
     if let Err(plan_error) = validate_no_secret_leak(&spec) {
         let classification = classify_invalid_plan(&plan_error);
-        let envelope = build_envelope(&new_job_id(), None, classification, None, plan_error.to_string());
+        let envelope = build_envelope(
+            &new_job_id(),
+            None,
+            classification,
+            None,
+            plan_error.to_string(),
+            String::new(),
+        );
         return Ok(RunReport {
             envelope,
             process_exit: classification.process_exit,
@@ -155,14 +165,16 @@ pub fn run_job<B: VmBackend, E: EgressApplier>(
         }
     };
 
-    // 5. Classify the physical outcome.
-    let (classification, guest_exit, message) = match run_result {
+    // 5. Classify the physical outcome. The console tail is carried through to the envelope so a boot fault (which
+    //    never produced a guest exit) is still diagnosable from the record alone.
+    let (classification, guest_exit, message, console) = match run_result {
         Err(backend_error) => {
             tracing::warn!(%job_id, error = %backend_error, "backend run failed (infra fault)");
             (
                 classify_backend_error(&backend_error),
                 None,
                 format!("infra fault: {backend_error}"),
+                String::new(),
             )
         }
         Ok(outcome) => {
@@ -172,12 +184,13 @@ pub fn run_job<B: VmBackend, E: EgressApplier>(
                 classification,
                 outcome.guest_exit,
                 format!("run {:?}", classification.status),
+                outcome.console,
             )
         }
     };
 
     // 6. Write the terminal record carrying the envelope (INV-6).
-    let envelope = build_envelope(&job_id, None, classification, guest_exit, message);
+    let envelope = build_envelope(&job_id, None, classification, guest_exit, message, console);
     let terminal = JobRecord {
         schema_version: JOURNAL_SCHEMA_VERSION,
         job_id,
@@ -379,6 +392,7 @@ pub fn kill<B: VmBackend>(journal: &Journal, backend: &B, job_id: &str) -> Resul
         },
         None,
         "cancelled by kill".to_string(),
+        String::new(),
     );
     let cancelled = JobRecord {
         state: JobState::Cancelled,
@@ -509,6 +523,7 @@ mod tests {
                 guest_exit: Some(0),
                 transport_error: None,
                 timed_out: false,
+                console: String::new(),
             });
             let report = run_job(
                 &backend,
@@ -530,6 +545,7 @@ mod tests {
                 guest_exit: Some(1),
                 transport_error: None,
                 timed_out: false,
+                console: String::new(),
             });
             let report = run_job(
                 &backend,
@@ -567,6 +583,7 @@ mod tests {
                 guest_exit: Some(0),
                 transport_error: None,
                 timed_out: false,
+                console: String::new(),
             });
             let report = run_job(
                 &backend,

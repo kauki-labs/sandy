@@ -327,6 +327,7 @@ fn transport_outcome(err: &BackendError) -> Outcome {
         guest_exit: None,
         transport_error: Some(err.to_string()),
         timed_out: false,
+        console: String::new(),
     }
 }
 

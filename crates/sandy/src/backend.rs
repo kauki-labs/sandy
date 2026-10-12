@@ -98,6 +98,12 @@ pub struct Outcome {
     pub transport_error: Option<String>,
     /// Whether the run hit its timeout.
     pub timed_out: bool,
+    /// A bounded tail of the guest console (boot log + command output), for
+    /// diagnostics: it is the one place a boot that never reached the command is
+    /// visible. Empty when nothing was read. The supervisor surfaces it into the
+    /// result envelope's `logs.tail`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub console: String,
 }
 
 /// The state of one running box, as reported by [`VmBackend::boxes`].
@@ -265,6 +271,7 @@ mod tests {
             guest_exit: Some(0),
             transport_error: None,
             timed_out: false,
+            console: String::new(),
         };
         let value = serde_json::to_value(&outcome)?;
         let obj = value.as_object().expect("outcome serializes to an object");

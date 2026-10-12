@@ -366,6 +366,7 @@ impl Protocol {
             guest_exit: Some(code),
             transport_error: None,
             timed_out: false,
+            console: String::new(),
         })
     }
 
@@ -387,6 +388,7 @@ impl Protocol {
                 guest_exit: None,
                 transport_error: None,
                 timed_out: true,
+                console: String::new(),
             }
         } else {
             // The ready marker never arrived within the boot budget.
@@ -395,6 +397,7 @@ impl Protocol {
                 guest_exit: None,
                 transport_error: None,
                 timed_out: false,
+                console: String::new(),
             }
         };
         self.terminal = Some(Ok(outcome));
@@ -503,6 +506,7 @@ mod tests {
                 guest_exit: Some(0),
                 transport_error: None,
                 timed_out: false,
+                console: String::new(),
             }
         );
         Ok(())
