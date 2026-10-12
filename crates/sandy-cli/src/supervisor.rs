@@ -7,14 +7,18 @@
 //! management ops; all liveness goes through [`reconcile_job`], never a direct
 //! registry read (INV-3).
 
-use std::{collections::HashSet, path::Path, time::SystemTime};
+use std::{
+    collections::HashSet,
+    path::Path,
+    time::{Duration, SystemTime},
+};
 
 use sandy::{
     BackendError, Classification, CoreError, CredentialProvider, EgressApplier, EgressOs, EgressOutcome,
     JOURNAL_SCHEMA_VERSION, JobRecord, JobState, Journal, Lease, Logs, Outcome, OutputStatus, ProcessExit, Provenance,
-    RESULT_SCHEMA_VERSION, ResultEnvelope, Scope, StagedImage, Status, VmBackend, classify_backend_error,
-    classify_invalid_plan, classify_outcome, enforce, mint_lease, new_job_id, plan_egress_scoped, plan_eviction,
-    reconcile_job, validate_no_secret_leak,
+    RESULT_SCHEMA_VERSION, ResultEnvelope, Scope, SecretRef, SecretSource, StagedImage, Status, VmBackend,
+    classify_backend_error, classify_invalid_plan, classify_outcome, enforce, mint_lease, new_job_id,
+    plan_egress_scoped, plan_eviction, reconcile_job, validate_no_secret_leak,
 };
 
 use crate::plan::JobPlan;
@@ -212,6 +216,97 @@ pub fn mint_run_token<P: CredentialProvider>(
     requested_ttl_secs: u32,
 ) -> Result<Lease, CoreError> {
     mint_lease(provider, scope, requested_ttl_secs, secret_name, out_dir).map_err(|e| CoreError::Cred(e.to_string()))
+}
+
+/// Run a job with a forge credential bracketed around it: mint at boot, inject the
+/// staged secret into the plan, run, then **revoke on every path** (success,
+/// failure, fault) so the credential never outlives the job.
+///
+/// This is the credential sibling of [`run_job`]'s egress bracket, written as a
+/// wrapper rather than a parameter on `run_job` because a forge credential is
+/// opt-in while the egress boundary is universal. `requested_ttl_secs` is clamped to
+/// `MAX_TTL_SECS` by [`sandy::mint_lease`]; revoke-at-teardown is the real lifetime
+/// bound (the provider's native token TTL is too coarse, #49), so the token file is
+/// kept until after `revoke` (a GitHub revoke reads it) and then removed.
+///
+/// `cred_dir` holds the minted token file; the plan is given a secret pointing at
+/// it, which the backend copies into the guest's secret share (INV-1). Live mid-run
+/// refresh (re-staging a rotated token into the running guest) is deferred to #50;
+/// [`should_refresh`] is the decision this bracket will drive once that channel
+/// exists.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Cred`] when the mint fails, before the backend runs, so the
+/// caller fails rather than booting with no credential (INV-7); otherwise the run
+/// outcome is folded into the returned [`RunReport`] exactly as [`run_job`] does.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the bracket threads both the run and the credential inputs"
+)]
+pub fn run_job_with_credential<B: VmBackend, E: EgressApplier, P: CredentialProvider>(
+    backend: &B,
+    journal: &Journal,
+    plan: JobPlan,
+    egress: &E,
+    egress_os: EgressOs,
+    tap: Option<&str>,
+    provider: &P,
+    scope: &Scope,
+    secret_name: &str,
+    cred_dir: &Path,
+    requested_ttl_secs: u32,
+) -> Result<RunReport, CoreError> {
+    // Mint and stage the token before the guest boots. A mint failure is a fail-
+    // closed infra fault: return before any backend run (INV-7).
+    let lease = mint_lease(provider, scope, requested_ttl_secs, secret_name, cred_dir)
+        .map_err(|e| CoreError::Cred(e.to_string()))?;
+    let SecretSource::File(token_path) = &lease.secret_ref.source else {
+        // mint_lease always stages a File-sourced secret; a non-File source is a
+        // contract violation, not a run-with-no-credential.
+        return Err(CoreError::Cred(
+            "minted credential is not a file-sourced secret".to_string(),
+        ));
+    };
+
+    // Give the plan its own secret pointing at the staged token file (the backend
+    // copies it into the guest's secret share). The lease keeps its secret_ref so
+    // revoke can still read the token afterwards.
+    let mut plan = plan;
+    plan.secrets.push(SecretRef {
+        name: secret_name.to_string(),
+        source: SecretSource::File(token_path.clone()),
+    });
+
+    let report = run_job(backend, journal, &plan, egress, egress_os, tap);
+
+    // Revoke on EVERY path (before removing the token file a GitHub revoke reads),
+    // so the credential is invalid the moment the job ends rather than lingering to
+    // its native expiry (#49). A revoke failure is logged, not fatal: the native TTL
+    // is the backstop.
+    if let Err(e) = provider.revoke(&lease) {
+        tracing::warn!(%e, "credential revoke at teardown failed; relying on native expiry");
+    }
+    // Remove the minted token file so the secret never outlives the run (INV-1); the
+    // backend already wiped its own copy in the guest share.
+    if let Err(e) = std::fs::remove_file(token_path) {
+        tracing::warn!(path = %token_path.display(), %e, "failed to remove staged credential on teardown");
+    }
+
+    report
+}
+
+/// Whether a credential should be refreshed now: true once at most `margin` remains
+/// before `expires_at` (or it has already expired).
+///
+/// The decision the [`run_job_with_credential`] bracket will drive once the mid-run
+/// re-stage channel (#50) lands; today it gates nothing live and is unit-tested
+/// against explicit times.
+#[must_use]
+pub fn should_refresh(now: SystemTime, expires_at: SystemTime, margin: Duration) -> bool {
+    expires_at
+        .duration_since(now)
+        .map_or(true, |remaining| remaining <= margin)
 }
 
 /// List every job record (`journal.list()`).

@@ -13,7 +13,7 @@ use sandy::{
 };
 use sandy_cli::{
     plan::JobPlan,
-    supervisor::{gc, kill, ls, mint_run_token, run_job, status, wait},
+    supervisor::{gc, kill, ls, mint_run_token, run_job, run_job_with_credential, should_refresh, status, wait},
 };
 
 /// A journal on a fresh local temp `$SANDY_HOME`.
@@ -572,4 +572,135 @@ fn mint_run_token_failure_surfaces_as_core_error_not_a_tokenless_run() -> anyhow
         "expected CoreError::Cred, got {err:?}"
     );
     Ok(())
+}
+
+/// #49 Block 2: `run_job_with_credential` mints at boot, runs, revokes at teardown
+/// on the success path, and removes the staged token file afterwards (INV-1).
+#[test]
+fn credential_is_minted_run_revoked_and_cleaned() -> anyhow::Result<()> {
+    let (tmp, journal) = fresh_journal()?;
+    let provider = FakeProvider::returning("ghs_tok");
+    let backend = FakeBackend::new().with_outcome(ok_outcome(0));
+    let cred_dir = tmp.path().join("cred");
+    std::fs::create_dir_all(&cred_dir).context("create cred dir")?;
+
+    let report = run_job_with_credential(
+        &backend,
+        &journal,
+        booting_plan(),
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        None,
+        &provider,
+        &token_scope(),
+        "GH_TOKEN",
+        &cred_dir,
+        1_800,
+    )
+    .context("run_job_with_credential")?;
+
+    assert_eq!(report.envelope.status, Status::Succeeded);
+    assert_eq!(
+        provider.revoked().len(),
+        1,
+        "the credential must be revoked exactly once at teardown"
+    );
+    assert!(
+        !cred_dir.join("GH_TOKEN.token").exists(),
+        "the minted token file must be removed after the run (INV-1)"
+    );
+    Ok(())
+}
+
+/// #49 Block 2 (adversarial): the credential is revoked even when the backend run
+/// fails, so a failed boot never leaves a live credential behind.
+#[test]
+fn credential_is_revoked_even_when_the_run_fails() -> anyhow::Result<()> {
+    let (tmp, journal) = fresh_journal()?;
+    let provider = FakeProvider::returning("ghs_tok");
+    let backend = FakeBackend::new().with_error(BackendError::Spawn("no hypervisor".to_string()));
+    let cred_dir = tmp.path().join("cred");
+    std::fs::create_dir_all(&cred_dir).context("create cred dir")?;
+
+    let report = run_job_with_credential(
+        &backend,
+        &journal,
+        booting_plan(),
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        None,
+        &provider,
+        &token_scope(),
+        "GH_TOKEN",
+        &cred_dir,
+        1_800,
+    )
+    .context("run_job_with_credential (run fails)")?;
+
+    assert_eq!(report.process_exit.code(), 3, "a boot failure is band 3");
+    assert_eq!(
+        provider.revoked().len(),
+        1,
+        "a failed run must still revoke the credential"
+    );
+    Ok(())
+}
+
+/// #49 Block 2 (adversarial): a mint failure fails closed — no backend run, no
+/// journal record, and the error surfaces as `CoreError::Cred` (INV-7).
+#[test]
+fn credential_mint_failure_fails_closed_before_any_run() -> anyhow::Result<()> {
+    let (tmp, journal) = fresh_journal()?;
+    let provider = FakeProvider::failing();
+    // A success is scripted on purpose: if the backend ever ran the band would be 0,
+    // so a Cred error here proves the boot was skipped.
+    let backend = FakeBackend::new().with_outcome(ok_outcome(0));
+    let cred_dir = tmp.path().join("cred");
+    std::fs::create_dir_all(&cred_dir).context("create cred dir")?;
+
+    let err = run_job_with_credential(
+        &backend,
+        &journal,
+        booting_plan(),
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        None,
+        &provider,
+        &token_scope(),
+        "GH_TOKEN",
+        &cred_dir,
+        1_800,
+    )
+    .expect_err("a mint failure must fail closed");
+
+    assert!(
+        matches!(err, CoreError::Cred(_)),
+        "expected CoreError::Cred, got {err:?}"
+    );
+    assert!(
+        journal.list().context("list after mint failure")?.is_empty(),
+        "a mint failure must write no job record"
+    );
+    assert_eq!(provider.revoked().len(), 0, "nothing to revoke when the mint failed");
+    Ok(())
+}
+
+/// #49 Block 2: `should_refresh` fires only inside the margin before expiry (or once
+/// expired), not while ample time remains.
+#[test]
+fn should_refresh_fires_within_margin_only() {
+    let now = SystemTime::now();
+    let margin = Duration::from_secs(300);
+    assert!(
+        !should_refresh(now, now + Duration::from_secs(1_800), margin),
+        "ample time remaining: no refresh"
+    );
+    assert!(
+        should_refresh(now, now + Duration::from_secs(120), margin),
+        "within the margin: refresh"
+    );
+    assert!(
+        should_refresh(now, now - Duration::from_secs(1), margin),
+        "already expired: refresh"
+    );
 }
