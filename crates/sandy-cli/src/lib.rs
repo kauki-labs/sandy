@@ -5,6 +5,7 @@
 //! exercised directly from integration tests with a [`sandy::FakeBackend`] and a
 //! real [`sandy::Journal`], without booting a hypervisor.
 
+pub mod app_register;
 pub mod doctor;
 pub mod output;
 pub mod plan;

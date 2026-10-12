@@ -46,6 +46,7 @@ mod schema;
 mod seed;
 mod stage;
 mod strategy;
+mod trust_root;
 
 pub use backend::{
     BackendError, BoxState, FakeBackend, Grants, Mount, Outcome, PlanError, RunSpec, SecretRef, SecretSource,
@@ -86,6 +87,10 @@ pub use seed::{
 };
 pub use stage::{StagedSecret, TagPool, mount_args, stage_secrets, wipe};
 pub use strategy::{BootAxis, BuildAxis, HostFacts, ProvisioningStrategy, classify};
+pub use trust_root::{
+    FakeProvisioner, InstallError, Provisioner, RegistrationPlan, RevokeOutcome, deregister, github_app_manifest,
+    parse_capability, register, register_skip_verify,
+};
 
 /// fsync a directory so a preceding create/rename within it is durable across a
 /// crash (INV-4/INV-6).

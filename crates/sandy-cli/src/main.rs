@@ -8,6 +8,7 @@
 use clap::{Parser, Subcommand};
 use sandy::{CoreError, Journal, ProcessExit};
 use sandy_cli::{
+    app_register::{self, Owner},
     doctor,
     output::{OutputFormat, format_doctor, format_envelope, format_gc, format_record, format_records},
     plan::{RunArgs, parse_run},
@@ -83,6 +84,93 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         keep_last: usize,
     },
+    /// Manage the GitHub App trust root the credential seam mints from.
+    App {
+        /// The trust-root subcommand.
+        #[command(subcommand)]
+        app: AppCommand,
+    },
+}
+
+/// `sandy app` subcommands: register / deregister a forge trust root.
+#[derive(Debug, Subcommand)]
+enum AppCommand {
+    /// Register a GitHub App trust root in-code (drives the Create + Install
+    /// clicks, captures the key and ids, writes the config — no hand-copying).
+    Register {
+        /// The local handle (the `<name>.json` / `<name>.pem` file stem). The
+        /// GitHub App name is deterministic — `<name>-<org>` (or `<name>` for a
+        /// user account) — so the whole org shares one App and the duplicate
+        /// check can find it.
+        name: String,
+        /// Use this exact GitHub App name instead of the default `<name>-<org>`.
+        #[arg(long)]
+        name_override: Option<String>,
+        /// Register under this organization instead of your user account.
+        #[arg(long)]
+        org: Option<String>,
+        /// Web base for GitHub Enterprise Server.
+        #[arg(long, default_value = "https://github.com")]
+        base_url: String,
+        /// The App homepage URL.
+        #[arg(long, default_value = "https://github.com/kauki-labs/sandy")]
+        homepage: String,
+        /// A capability a minted token may need: read-code | write-code | read-pr
+        /// | write-pr (repeatable, at least one).
+        #[arg(long = "capability", required = true)]
+        capabilities: Vec<String>,
+        /// A repository the credential may be scoped to, as owner/repo (repeatable).
+        #[arg(long = "repo")]
+        repos: Vec<String>,
+        /// Write the trust root WITHOUT the live scope-check probe (register
+        /// verifies by default). An explicit key-only bootstrap escape.
+        #[arg(long)]
+        skip_verify: bool,
+        /// Create the App even if one already exists on the owner (overrides the
+        /// one-shared-org-App duplicate check).
+        #[arg(long)]
+        force: bool,
+    },
+    /// Import an existing shared GitHub App trust root from its credentials (no
+    /// browser) — for members reusing the org's one shared App.
+    Import {
+        /// The local handle (the `<name>.json` / `<name>.pem` file stem).
+        name: String,
+        /// The GitHub App id.
+        #[arg(long)]
+        app_id: String,
+        /// The installation id the token is minted for.
+        #[arg(long)]
+        installation_id: u64,
+        /// Path to the shared App private key (obtained from the secret store).
+        #[arg(long)]
+        pem: std::path::PathBuf,
+        /// API base for GitHub Enterprise Server (default github.com).
+        #[arg(long)]
+        base_url: Option<String>,
+        /// A repository the credential may be scoped to, as owner/repo (repeatable).
+        #[arg(long = "repo")]
+        repos: Vec<String>,
+    },
+    /// Verify an existing trust root: dry-run mint a scoped token and check the
+    /// installation grants the requested capabilities.
+    Verify {
+        /// The trust-root name (its config file stem).
+        name: String,
+        /// A capability to verify the installation grants: read-code | write-code
+        /// | read-pr | write-pr (repeatable, at least one).
+        #[arg(long = "capability", required = true)]
+        capabilities: Vec<String>,
+    },
+    /// Remove a trust root: uninstall the App at the forge, then shred the local
+    /// key and config.
+    Deregister {
+        /// The trust-root name (its config file stem).
+        name: String,
+        /// Shred locally only; uninstall the App yourself in the GitHub UI.
+        #[arg(long)]
+        keep_remote: bool,
+    },
 }
 
 /// The macOS host backend: vfkit. The live boot is the #26 seam — the sandbox
@@ -137,6 +225,78 @@ fn main() {
     std::process::exit(dispatch(cli.command, cli.output));
 }
 
+/// Dispatch a `sandy app` subcommand, mapping an [`InstallError`] to a nonzero
+/// exit. Registration/deregistration touch only the user config dir.
+fn dispatch_app(app: AppCommand) -> i32 {
+    let result = match app {
+        AppCommand::Register {
+            name,
+            name_override,
+            org,
+            base_url,
+            homepage,
+            capabilities,
+            repos,
+            skip_verify,
+            force,
+        } => {
+            let caps = match parse_caps(&capabilities) {
+                Ok(caps) => caps,
+                Err(bad) => {
+                    eprintln!("sandy: unknown capability '{bad}' (use read-code | write-code | read-pr | write-pr)");
+                    return ProcessExit::InvalidPlan.code();
+                }
+            };
+            let owner = org.map_or(Owner::User, Owner::Org);
+            let targets = repos.into_iter().map(sandy::Target).collect();
+            let github_name = app_register::github_app_name(&name, &owner, name_override.as_deref());
+            app_register::run_register(
+                &name,
+                &github_name,
+                &homepage,
+                owner,
+                &base_url,
+                &caps,
+                targets,
+                skip_verify,
+                force,
+            )
+        }
+        AppCommand::Import {
+            name,
+            app_id,
+            installation_id,
+            pem,
+            base_url,
+            repos,
+        } => {
+            let targets = repos.into_iter().map(sandy::Target).collect();
+            app_register::run_import(&name, &app_id, installation_id, &pem, base_url, targets)
+        }
+        AppCommand::Verify { name, capabilities } => match parse_caps(&capabilities) {
+            Ok(caps) => app_register::run_verify(&name, &caps),
+            Err(bad) => {
+                eprintln!("sandy: unknown capability '{bad}' (use read-code | write-code | read-pr | write-pr)");
+                return ProcessExit::InvalidPlan.code();
+            }
+        },
+        AppCommand::Deregister { name, keep_remote } => app_register::run_deregister(&name, keep_remote),
+    };
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("sandy: {e}");
+            ProcessExit::InvalidPlan.code()
+        }
+    }
+}
+
+/// Parse each `--capability` token into a [`sandy::Capability`], returning the
+/// first unrecognized token as the error.
+fn parse_caps(tokens: &[String]) -> Result<Vec<sandy::Capability>, String> {
+    tokens.iter().map(|t| sandy::parse_capability(t)).collect()
+}
+
 /// Dispatch one parsed command and return the process exit band (INV-11).
 fn dispatch(command: Command, output: OutputFormat) -> i32 {
     // Doctor needs no journal; handle it before touching `$SANDY_HOME`.
@@ -158,6 +318,11 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
         return result.exit_code;
     }
 
+    // App register/deregister need only the user config dir, not $SANDY_HOME.
+    if let Command::App { app } = command {
+        return dispatch_app(app);
+    }
+
     let journal = Journal::new(doctor::sandy_home());
     if let Err(e) = journal.ensure_dirs() {
         eprintln!("sandy: cannot initialize $SANDY_HOME: {e}");
@@ -166,6 +331,7 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
 
     match command {
         Command::Doctor => unreachable!("doctor handled above"),
+        Command::App { .. } => unreachable!("app handled above"),
         Command::Run {
             template,
             mounts,
