@@ -23,7 +23,7 @@ version, metadata, dependency versions, and lints through the root `Cargo.toml`
   the forge trust root the credential seam mints from; `run --credential <name>`
   mints a scoped token from it). Text or `-o json`. The trust-root installer is
   provider-nested (`sandy cred <provider> <op>`); GitHub today, GitLab later. See
-  `docs/design/trust-root-installer/`.
+  `docs/providers/`.
 
 ## Build & test (run before committing)
 

@@ -1,5 +1,5 @@
 //! `sandy cred github register` / `sandy cred github deregister`: the in-code trust-root
-//! installer (docs/design/trust-root-installer/).
+//! installer (docs/providers/github/).
 //!
 //! The provider-neutral pipeline and its invariants live in the `sandy` library
 //! (`register` / `deregister` / `Provisioner`); this module is the GitHub

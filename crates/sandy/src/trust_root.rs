@@ -1,6 +1,5 @@
 //! Trust-root installer: provisions the forge trust root the credential seam
-//! consumes (`sandy cred github register`), as specified in
-//! `docs/design/trust-root-installer/`.
+//! consumes (`sandy cred github register`); see `docs/providers/github/`.
 //!
 //! The pure, provider-neutral parts live here in the library; the network
 //! provisioners (the GitHub manifest flow, REST calls) live in `sandy-cli`, so
