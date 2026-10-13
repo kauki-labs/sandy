@@ -91,7 +91,7 @@ jobs:
     # One test run, instrumented: cargo-llvm-cov runs the whole CI suite and emits
     # the lcov report, so a separate plain `cargo nextest` job would just run the
     # same tests again. This job is the test gate.
-    name: Test (with cov)
+    name: Test
     needs: checks
     runs-on: ubuntu-latest
     permissions:
