@@ -1,0 +1,21 @@
+# release-plz configuration. The workflow (.github/workflows/release.yaml) runs
+# two commands on every push to main:
+#
+#   release-plz release-pr  opens/updates a PR that bumps the workspace version
+#                           and the changelogs. Merge it to cut a release.
+#   release-plz release     for each crate whose Cargo.toml version has no git
+#                           tag yet, creates the tag + GitHub release and
+#                           publishes to crates.io, in dependency order
+#                           (sandy-box -> sandy-backend -> sandy-cli).
+#
+# So a version bump reaching main is what triggers the tag + publish.
+
+[workspace]
+# A GitHub release per published crate, and a changelog kept in each crate.
+git_release_enable = true
+git_tag_enable = true
+# Don't open bump PRs just because a dependency updated; releases are driven by
+# an intentional version bump, not by lockfile churn.
+dependencies_update = false
+# The three crates inherit `version.workspace = true`, so they are always on one
+# shared number and publish together: a bump moves the single workspace version.

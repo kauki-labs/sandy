@@ -1,32 +1,29 @@
-name: Close release
+name: Release
+# A version bump reaching main drives the release. release-plz opens a bump PR
+# (release-pr) and, for any crate whose version has no tag yet, creates the tag +
+# GitHub release and publishes to crates.io in dependency order (release).
+# release-plz runs through the Nix dev shell so it uses the repo's pinned toolchain.
 on:
-  workflow_dispatch:
-    inputs:
-      release_type:
-        description: Version bump for this release
-        required: true
-        type: choice
-        default: "patch"
-        options:
-          - patch
-          - minor
-          - major
+  push:
+    branches: [main]
+# Never run two releases at once, and never cancel one mid-publish.
 concurrency:
   group: release
   cancel-in-progress: false
 permissions:
   contents: read
 jobs:
-  release:
-    name: Close release
+  release-plz:
+    name: release-plz
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write # create tags and GitHub releases
+      pull-requests: write # open/update the release PR
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
         with:
-          # Installing Nix (multi-user daemon) needs sudo, so sudo stays enabled here.
+          # release-plz reaches github.com and crates.io; installing Nix needs sudo.
           egress-policy: audit
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -38,19 +35,12 @@ jobs:
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
-      - name: Verify
-        run: nix flake check -L
-      - name: Configure git
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-      - name: Bump, tag, and push
-        run: nix develop -c cargo release "${RELEASE_TYPE}" --execute --no-confirm
-        env:
-          RELEASE_TYPE: ${{ inputs.release_type }}
-      - name: Create GitHub release
+      - name: Open release PR
+        run: nix develop -c release-plz release-pr --git-token "${GITHUB_TOKEN}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          tag="$(git describe --tags --abbrev=0)"
-          gh release create "$tag" --title "$tag" --generate-notes
+      - name: Tag, release, and publish
+        run: nix develop -c release-plz release --git-token "${GITHUB_TOKEN}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
