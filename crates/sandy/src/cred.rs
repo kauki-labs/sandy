@@ -28,7 +28,7 @@
 use std::{
     fmt, fs,
     io::Write,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{Mutex, PoisonError},
     time::{Duration, SystemTime},
@@ -293,7 +293,16 @@ pub fn mint_lease(
     // On a mint failure we return before any file is written, so the caller fails
     // exit-3 retryable rather than running the job with no credential (INV-7).
     let minted = provider.mint(scope, ttl)?;
-    let path = stage_token(out_dir, secret_name, minted.secret.as_bytes())?;
+    let path = match stage_token(out_dir, secret_name, minted.secret.as_bytes()) {
+        Ok(path) => path,
+        Err(e) => {
+            // The token was minted at the forge but could not be staged. Revoke it
+            // before returning so it does not leak to its native TTL with no lease
+            // to revoke it at teardown (the mint half of #49's revoke guarantee).
+            revoke_orphan(provider, secret_name, &minted);
+            return Err(e);
+        }
+    };
     tracing::debug!(name = secret_name, path = %path.display(), ?ttl, "staged scoped credential (0600)");
     Ok(Lease {
         secret_ref: SecretRef {
@@ -303,6 +312,26 @@ pub fn mint_lease(
         expires_at: minted.expires_at,
         handle: minted.handle,
     })
+}
+
+/// Revoke a token that was minted but never installed into a lease (its staging or
+/// re-staging failed), so it cannot outlive the run with nothing to revoke it. The
+/// [`Lease`] is a throwaway carrying only the minted handle, which is all [`revoke`]
+/// reads. A failed revoke is logged, not fatal: the native TTL is the backstop.
+///
+/// [`revoke`]: CredentialProvider::revoke
+fn revoke_orphan(provider: &impl CredentialProvider, secret_name: &str, minted: &Minted) {
+    let orphan = Lease {
+        secret_ref: SecretRef {
+            name: secret_name.to_string(),
+            source: SecretSource::File(PathBuf::new()),
+        },
+        expires_at: minted.expires_at,
+        handle: minted.handle.clone(),
+    };
+    if let Err(e) = provider.revoke(&orphan) {
+        tracing::warn!(%e, handle = %orphan.handle.id, "failed to revoke an unstaged credential; relying on native expiry");
+    }
 }
 
 /// Whether a credential should be refreshed now: true once at most `margin`
@@ -362,8 +391,14 @@ pub fn refresh_once<P: CredentialProvider>(
     // untouched and the current token stays staged.
     let minted = provider.refresh(lease)?;
     // Stage the new token over the shared file BEFORE revoking the old one, so a
-    // consumer reading the file never observes a revoked token.
-    write_secret_0600(&dest, minted.secret.as_bytes())?;
+    // consumer reading the file never observes a revoked token. If the re-stage
+    // fails, the new token was minted but never installed: revoke it so it does not
+    // leak (the lease still names the old token, which teardown revokes), then
+    // surface the error with the current token left in place.
+    if let Err(e) = write_secret_0600(&dest, minted.secret.as_bytes()) {
+        revoke_orphan(provider, &lease.secret_ref.name, &minted);
+        return Err(e);
+    }
     // Revoke the superseded token while `lease` still names it, then advance the
     // lease to the fresh handle/expiry. A revoke failure is logged, not fatal.
     if let Err(e) = provider.revoke(lease) {
@@ -541,6 +576,12 @@ fn stage_token(out_dir: &Path, secret_name: &str, bytes: &[u8]) -> Result<PathBu
 /// reading it (including the guest over the live secret share) never sees a torn
 /// or partial write. The error message never carries the secret bytes.
 ///
+/// The temp is created `0600` from birth (`O_CREAT | O_EXCL` + `mode`), not created
+/// loose and tightened afterwards, so the secret is never group/world-readable for
+/// an instant, even in the `cred_dir` shared into the guest (INV-1). On any failure
+/// after creation the temp is unlinked, so a partial or stray secret file never
+/// outlives the call (teardown only knows the final path).
+///
 /// Re-delivery (#49) reuses this to overwrite a lease's staged token in place with
 /// a freshly minted one; the rename makes that swap atomic for the reader.
 fn write_secret_0600(dest: &Path, bytes: &[u8]) -> Result<(), CredError> {
@@ -549,15 +590,29 @@ fn write_secret_0600(dest: &Path, bytes: &[u8]) -> Result<(), CredError> {
         .filter(|p| !p.as_os_str().is_empty())
         .ok_or_else(|| CredError::Stage(format!("secret path {} has no parent dir", dest.display())))?;
     let tmp = dest.with_extension("tmp");
-    let mut file = fs::File::create(&tmp).map_err(|e| stage_err("create token temp", &tmp, &e))?;
-    file.write_all(bytes)
-        .map_err(|e| stage_err("write token temp", &tmp, &e))?;
-    file.sync_all().map_err(|e| stage_err("sync token temp", &tmp, &e))?;
-    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))
-        .map_err(|e| stage_err("tighten token to 0600", &tmp, &e))?;
-    fs::rename(&tmp, dest).map_err(|e| stage_err("rename token into place", dest, &e))?;
-    crate::fsync_dir(dir).map_err(|e| stage_err("fsync out dir", dir, &e))?;
-    Ok(())
+    // A stale temp from a crashed earlier call would block O_EXCL; clear it first.
+    let _ = fs::remove_file(&tmp);
+    // Create at 0600 atomically: `mode` applies at creation and is not loosened by
+    // the umask (0600 has no group/other bits for the umask to clear), so there is
+    // no window where the token sits at a looser mode.
+    let staged = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .map_err(|e| stage_err("create token temp", &tmp, &e))
+        .and_then(|mut file| {
+            file.write_all(bytes)
+                .map_err(|e| stage_err("write token temp", &tmp, &e))?;
+            file.sync_all().map_err(|e| stage_err("sync token temp", &tmp, &e))?;
+            fs::rename(&tmp, dest).map_err(|e| stage_err("rename token into place", dest, &e))?;
+            crate::fsync_dir(dir).map_err(|e| stage_err("fsync out dir", dir, &e))
+        });
+    if staged.is_err() {
+        // Never leave the secret bytes behind in the temp sibling on a failed stage.
+        let _ = fs::remove_file(&tmp);
+    }
+    staged
 }
 
 /// Build a [`CredError::Stage`] for an IO failure without leaking secret bytes.
@@ -658,6 +713,95 @@ mod tests {
         );
         let staged: Vec<_> = fs::read_dir(tmp.path()).context("read out_dir")?.collect();
         assert!(staged.is_empty(), "no secret file may be written when minting fails");
+        Ok(())
+    }
+
+    /// Adversarial (no residual secret): a stage whose rename fails must leave no
+    /// temp sibling holding the secret bytes behind. Under the old create-then-chmod
+    /// path the `.tmp` survived the failure; teardown only knows the final path.
+    #[test]
+    fn write_secret_0600_leaves_no_temp_on_failure() -> anyhow::Result<()> {
+        let tmp = tempfile::TempDir::new()?;
+        // `dest` is an existing directory, so the final rename (file → dir) fails
+        // after the temp has been created and written.
+        let dest = tmp.path().join("adir");
+        fs::create_dir(&dest).context("mk dest dir")?;
+
+        let err = write_secret_0600(&dest, b"SECRET").expect_err("renaming a file onto a dir must fail");
+        assert!(
+            matches!(err, CredError::Stage(_)),
+            "expected a stage failure, got {err:?}"
+        );
+
+        let residue = dest.with_extension("tmp");
+        assert!(
+            !residue.exists(),
+            "the secret temp {} must be cleaned up on failure",
+            residue.display()
+        );
+        Ok(())
+    }
+
+    /// Adversarial (no orphaned token): when staging the minted token fails, the
+    /// token is revoked, not left valid to its native TTL with no lease to revoke it.
+    #[test]
+    fn mint_lease_revokes_the_token_when_staging_fails() -> anyhow::Result<()> {
+        let tmp = tempfile::TempDir::new()?;
+        // A non-existent out_dir makes the temp creation fail after a good mint.
+        let missing = tmp.path().join("no-such-dir");
+        let provider = FakeProvider::returning("tok");
+
+        let err = mint_lease(&provider, &scope(), 1_800, "GH_TOKEN", &missing)
+            .expect_err("staging into a missing dir must fail");
+        assert!(
+            matches!(err, CredError::Stage(_)),
+            "expected a stage failure, got {err:?}"
+        );
+        assert_eq!(
+            provider.revoked().len(),
+            1,
+            "a minted-but-unstaged token must be revoked, not orphaned"
+        );
+        Ok(())
+    }
+
+    /// Adversarial (no orphaned refreshed token): when re-staging a refreshed token
+    /// fails, the new token is revoked and the lease is left on the old one.
+    #[test]
+    fn refresh_once_revokes_the_new_token_when_restaging_fails() -> anyhow::Result<()> {
+        let tmp = tempfile::TempDir::new()?;
+        let provider = FakeProvider::returning("tok");
+        // A lease due for refresh whose staged file lives under a missing dir, so the
+        // re-stage fails after a good re-mint.
+        let past = SystemTime::now() - Duration::from_secs(3_600);
+        let mut lease = Lease {
+            secret_ref: SecretRef {
+                name: "GH_TOKEN".to_string(),
+                source: SecretSource::File(tmp.path().join("gone").join("GH_TOKEN")),
+            },
+            expires_at: past,
+            handle: CredentialHandle { id: "old".to_string() },
+        };
+
+        let err = refresh_once(&provider, &mut lease, SystemTime::now(), Duration::from_secs(300))
+            .expect_err("re-staging under a missing dir must fail");
+        assert!(
+            matches!(err, CredError::Stage(_)),
+            "expected a stage failure, got {err:?}"
+        );
+        assert_eq!(
+            provider.revoked().len(),
+            1,
+            "the re-minted-but-unstaged token must be revoked"
+        );
+        assert_eq!(
+            lease.handle.id, "old",
+            "the lease stays on the old token when re-staging fails"
+        );
+        assert_eq!(
+            lease.expires_at, past,
+            "the lease expiry is not advanced on a failed refresh"
+        );
         Ok(())
     }
 

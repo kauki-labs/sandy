@@ -9,7 +9,7 @@
 
 use std::{
     collections::HashSet,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Mutex, PoisonError, mpsc},
     time::{Duration, SystemTime},
 };
@@ -344,36 +344,59 @@ pub fn run_job_with_credential<B: VmBackend, E: EgressApplier, P: CredentialProv
 
     let margin = refresh_interval("SANDY_REFRESH_MARGIN_SECS", DEFAULT_REFRESH_MARGIN_SECS);
     let tick = refresh_interval("SANDY_REFRESH_TICK_SECS", DEFAULT_REFRESH_TICK_SECS);
-    let lease = Mutex::new(lease);
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
+
+    // Teardown is a Drop guard, not straight-line code after the scope: it revokes
+    // the live token and removes the staged file on EVERY exit from here, including
+    // a panic unwinding out of `run_job` through `thread::scope`. Straight-line
+    // teardown is skipped on a panic, which would leave a valid forge token and the
+    // 0600 secret on disk past the run (INV-1).
+    let teardown = CredTeardown {
+        provider,
+        lease: Mutex::new(lease),
+        token_path,
+    };
 
     // Run the job on this thread; refresh the credential on a second thread until the
     // run returns, then signal it to stop by dropping the sender. The refresh thread
-    // borrows the lease (a copied `&Mutex`, so the Mutex isn't moved) and owns the
-    // receiver; the scope joins it before we take the lease back.
-    let shared_lease = &lease;
-    let report = std::thread::scope(|s| {
+    // borrows the guard's lease (a `&Mutex`, so the guard isn't moved) and owns the
+    // receiver; the scope joins it before the guard's teardown can run.
+    let shared_lease = &teardown.lease;
+    std::thread::scope(|s| {
         s.spawn(move || refresh_loop(provider, shared_lease, margin, tick, &stop_rx));
         let report = run_job(backend, journal, &plan, egress, egress_os, tap);
         drop(stop_tx);
         report
-    });
+    })
+    // `teardown` drops here on return, or during unwind on a panic.
+}
 
-    // The refresh thread has joined; take back the lease, now naming the live token.
-    let lease = lease.into_inner().unwrap_or_else(PoisonError::into_inner);
+/// Revokes the live credential and removes its staged `0600` file on drop, so the
+/// Block-2 teardown runs on every exit from [`run_job_with_credential`]: a normal
+/// return, an early `?`, or a panic unwinding out of `run_job`. Straight-line
+/// teardown after the refresh scope is skipped on a panic, which would leave a
+/// valid forge token and the secret file on disk past the run (INV-1).
+struct CredTeardown<'a, P: CredentialProvider> {
+    provider: &'a P,
+    /// The live lease; the refresh thread advances it to the latest minted token,
+    /// so teardown revokes whatever token is current when the run ends.
+    lease: Mutex<Lease>,
+    token_path: PathBuf,
+}
 
-    // Revoke the live token on EVERY path (before removing the file a GitHub revoke
-    // reads) so it is invalid the moment the job ends, not at its native expiry (#49).
-    // A revoke failure is logged, not fatal: the native TTL is the backstop.
-    if let Err(e) = provider.revoke(&lease) {
-        tracing::warn!(%e, "credential revoke at teardown failed; relying on native expiry");
+impl<P: CredentialProvider> Drop for CredTeardown<'_, P> {
+    fn drop(&mut self) {
+        // The refresh thread has joined (the scope borrowing `lease` ended before
+        // this drop), so the lock is uncontended; map poison rather than panic in a
+        // Drop. Revoke before removing the file (the GitHub revoke path reads it).
+        let lease = self.lease.get_mut().unwrap_or_else(PoisonError::into_inner);
+        if let Err(e) = self.provider.revoke(lease) {
+            tracing::warn!(%e, "credential revoke at teardown failed; relying on native expiry");
+        }
+        if let Err(e) = std::fs::remove_file(&self.token_path) {
+            tracing::warn!(path = %self.token_path.display(), %e, "failed to remove staged credential on teardown");
+        }
     }
-    // Remove the staged token so the secret never outlives the run (INV-1).
-    if let Err(e) = std::fs::remove_file(&token_path) {
-        tracing::warn!(path = %token_path.display(), %e, "failed to remove staged credential on teardown");
-    }
-
-    report
 }
 
 /// Default margin before token expiry at which a mid-run refresh fires (5 min): it
@@ -729,6 +752,71 @@ mod tests {
         assert!(
             !provider.revoked().is_empty(),
             "refresh_loop must refresh and revoke a superseded token while the job runs"
+        );
+        Ok(())
+    }
+
+    /// A backend that panics inside `run`, to drive the teardown Drop guard down the
+    /// unwind path.
+    struct PanicBackend;
+    impl sandy::VmBackend for PanicBackend {
+        fn run(&self, _spec: &sandy::RunSpec) -> Result<Outcome, BackendError> {
+            panic!("backend panic during run")
+        }
+
+        fn kill(&self, _box_id: &str) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn boxes(&self) -> Result<Vec<sandy::BoxState>, BackendError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Adversarial (teardown runs on unwind): when the backend panics mid-run, the
+    /// credential is still revoked and the staged `0600` secret is still removed. The
+    /// Drop guard runs during unwind, where the old straight-line teardown after the
+    /// refresh scope was skipped, leaving a live token and the secret on disk (INV-1).
+    #[test]
+    fn a_panic_during_the_run_still_revokes_and_removes_the_token() -> anyhow::Result<()> {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        use sandy::{FakeProvider, MAX_TTL_SECS, Scope};
+
+        use super::run_job_with_credential;
+
+        let (_home, journal) = fresh_journal()?;
+        let cred_dir = tempfile::tempdir().context("cred dir")?;
+        let provider = FakeProvider::returning("tok");
+
+        // Suppress the deliberate panic's default backtrace print.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            run_job_with_credential(
+                &PanicBackend,
+                &journal,
+                booting_plan(),
+                &FakeApplier::new(),
+                EgressOs::Linux,
+                None,
+                &provider,
+                &Scope::default(),
+                "GITHUB_TOKEN",
+                cred_dir.path(),
+                MAX_TTL_SECS,
+            )
+        }));
+        std::panic::set_hook(prev);
+
+        assert!(result.is_err(), "the backend panic must propagate");
+        assert!(
+            !provider.revoked().is_empty(),
+            "the credential must be revoked even when the run panics"
+        );
+        assert!(
+            !cred_dir.path().join("GITHUB_TOKEN").exists(),
+            "the staged token must be removed even when the run panics"
         );
         Ok(())
     }
