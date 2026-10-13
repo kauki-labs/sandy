@@ -1759,7 +1759,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "sandy"
+name = "sandy-backend"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "sandy-box",
+ "tempfile",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "sandy-box"
 version = "0.1.1"
 dependencies = [
  "anyhow",
@@ -1784,17 +1795,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sandy-backend"
-version = "0.1.1"
-dependencies = [
- "anyhow",
- "sandy",
- "tempfile",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "sandy-cli"
 version = "0.1.1"
 dependencies = [
@@ -1802,8 +1802,8 @@ dependencies = [
  "clap",
  "octocrab",
  "rstest",
- "sandy",
  "sandy-backend",
+ "sandy-box",
  "serde",
  "serde_json",
  "tempfile",
