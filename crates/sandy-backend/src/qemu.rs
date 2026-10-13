@@ -110,8 +110,10 @@ pub struct StagedArgs {
 /// - `-nographic` and `-serial chardev:<id>` — the guest serial console; `run` adds the matching `-chardev socket,…`
 ///   that binds `<id>` to the #33 [`PipeTransport`] (the socket path is a host detail, so it is not emitted here).
 /// - `-enable-kvm -cpu host` when `staged.kvm`.
-/// - the virtiofs/virtio-9p read-only inputs share (`staged.input_share`), writable outputs share
-///   (`staged.output_share`), and secret share (`staged.secret_share`).
+/// - for each [`staged.shares`](StagedArgs::shares) entry, a client `-chardev socket` on the share's virtiofsd socket
+///   plus a `-device vhost-user-fs-pci,…,tag=<mount_tag>` the guest mounts as virtiofs; when any share is present, a
+///   one-time `-object memory-backend-memfd,…,share=on` + `-numa node,memdev=…` so virtio-fs has shareable guest RAM.
+///   The matching `virtiofsd` daemons are launched by [`QemuBackend::boot`] (new run dependency: `virtiofsd` on PATH).
 /// - a `-netdev tap,…,ifname=<tap> -device virtio-net-pci,…` NIC pair when `staged.tap` is set (so the guest has egress
 ///   to filter, #29); nothing when it is `None` (the default isolated boot).
 /// - `-device vhost-vsock-pci,guest-cid=<cid>` when `topology.vsock_cid` is set.

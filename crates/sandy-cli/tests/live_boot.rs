@@ -83,6 +83,40 @@ fn staged_secret_is_exported_to_the_job_env() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The secret share actually mounts as a read-only virtio-fs in the guest, not
+/// just that the token is readable. Guards the qemu 9p→virtiofs conversion: before
+/// it, qemu served `-virtfs` (9p) while the guest mounted virtiofs, so the share
+/// came up empty (`virtio-fs: tag not found`). Also asserts the read-only boundary
+/// (`virtiofsd --readonly`) by proving a guest write is denied — a silently writable
+/// secret share would be a real INV-1 regression.
+#[test]
+fn secret_share_mounts_read_only_virtiofs() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let target = require_live()?;
+    build_guest(&target)?;
+    let home = tempfile::tempdir().context("temp SANDY_HOME")?;
+    let secret_file = home.path().join("tok");
+    std::fs::write(&secret_file, "ro-probe-marker")?;
+    std::fs::set_permissions(&secret_file, std::fs::Permissions::from_mode(0o600))?;
+
+    // Exit 0 iff /run/sandy/secrets is a virtiofs mount AND a guest write is denied.
+    // Exit 8 = wrong fs type; exit 9 = the share was writable (RO not enforced).
+    let probe = r#"m=$(grep -m1 ' /run/sandy/secrets ' /proc/mounts); case "$m" in *virtiofs*) : ;; *) echo "BAD_FS:$m"; exit 8;; esac; if (echo x > /run/sandy/secrets/TOK) 2>/dev/null; then echo RW_VIOLATION; exit 9; fi; exit 0"#;
+    let (code, env) = sandy_run_with_secret(home.path(), &target, "TOK", &secret_file, &[probe])?;
+
+    assert_eq!(
+        env["status"], "succeeded",
+        "secret share must mount virtiofs and be read-only; envelope: {env}"
+    );
+    assert_eq!(
+        env["exit_code"], 0,
+        "exit 8 = not virtiofs; exit 9 = writable (RO not enforced); envelope: {env}"
+    );
+    assert_eq!(code, 0, "process band 0; envelope: {env}");
+    Ok(())
+}
+
 /// #49: the guest's git credential helper serves the staged GITHUB_TOKEN to a
 /// `git credential fill` for github.com, so a real `git push`/`fetch` authenticates
 /// from the file (not the env snapshot). The staged name is `GITHUB_TOKEN`, the name
