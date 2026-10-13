@@ -192,6 +192,9 @@
               pkgs.cargo-nextest
               pkgs.cargo-release
               pkgs.cargo-shear
+              # Drives the automated release workflow (.github/workflows/release.yaml):
+              # version-bump PRs, changelog, tag, GitHub release, crates.io publish.
+              pkgs.release-plz
               pkgs.cargo-insta
               pkgs.gh
               # code-quality skill tools from nixpkgs

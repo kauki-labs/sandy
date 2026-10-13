@@ -1,6 +1,9 @@
 [package]
-name = "sandy"
-description = "The sandy library: run plane, provisioning, seed verification, egress, and operability behind one curated API"
+# Published as `sandy-box` (the crates.io name `sandy` is taken); the crate still
+# compiles and imports as `sandy` via `[lib] name` below, so `use sandy::…` is
+# unchanged in-tree and for dependents (which alias it with `package = "sandy-box"`).
+name = "sandy-box"
+description = "The sandy sandbox library: run plane, provisioning, seed verification, egress, and operability behind one curated API"
 version.workspace = true
 authors.workspace = true
 homepage.workspace = true
@@ -8,8 +11,13 @@ repository.workspace = true
 license.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+readme = "../../README.md"
+documentation = "https://docs.rs/sandy-box"
+keywords = ["sandbox", "microvm", "isolation", "nixos", "vm"]
+categories = ["virtualization", "development-tools", "command-line-utilities"]
 
 [lib]
+name = "sandy"
 crate-type = ["rlib"]
 
 [lints]

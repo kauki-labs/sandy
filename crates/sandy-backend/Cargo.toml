@@ -8,6 +8,10 @@ repository.workspace = true
 license.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+readme = "../../README.md"
+documentation = "https://docs.rs/sandy-backend"
+keywords = ["sandbox", "microvm", "qemu", "vfkit", "hypervisor"]
+categories = ["virtualization", "development-tools"]
 
 [lib]
 crate-type = ["rlib"]
@@ -16,7 +20,7 @@ crate-type = ["rlib"]
 workspace = true
 
 [dependencies]
-sandy = { path = "../sandy" }
+sandy.workspace = true
 tracing.workspace = true
 uuid = { workspace = true }
 

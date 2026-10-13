@@ -14,8 +14,11 @@ edition = "2024"
 rust-version = "1.85"
 
 [workspace.dependencies]
-sandy = { path = "crates/sandy" }
-sandy-backend = { path = "crates/sandy-backend" }
+# The library publishes as `sandy-box`; the `package` alias keeps the in-tree and
+# dependent import path `sandy`. `version` is required for the path deps to be
+# publishable to crates.io (cargo drops the path and uses the version on publish).
+sandy = { path = "crates/sandy", package = "sandy-box", version = "0.1.1" }
+sandy-backend = { path = "crates/sandy-backend", version = "0.1.1" }
 thiserror = "2.0.20"
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -48,14 +51,9 @@ missing_docs = "warn"
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 
-# cargo-release drives the release workflow (.github/workflows/release.yaml).
-# One shared version across the workspace; tag as vX.Y.Z; never publish to crates.io.
-[workspace.metadata.release]
-shared-version = true
-publish = false
-push = true
-tag = true
-tag-name = "v{{version}}"
+# Releases are automated by release-plz (.github/workflows/release.yaml) and
+# configured in release-plz.toml: a version bump landing on main creates the tag,
+# the GitHub release, and publishes the crates to crates.io in dependency order.
 
 [profile.dev]
 opt-level = 0

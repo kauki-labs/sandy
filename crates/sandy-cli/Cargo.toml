@@ -1,6 +1,6 @@
 [package]
 name = "sandy-cli"
-description = "The sandy command-line interface (Blocks 0 doctor, 6 run/ls/status/...)"
+description = "The sandy command-line interface: run a job in an ephemeral NixOS microVM and get a locked result envelope"
 version.workspace = true
 authors.workspace = true
 homepage.workspace = true
@@ -8,6 +8,10 @@ repository.workspace = true
 license.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+readme = "../../README.md"
+documentation = "https://docs.rs/sandy-cli"
+keywords = ["sandbox", "microvm", "cli", "isolation", "nixos"]
+categories = ["command-line-utilities", "virtualization", "development-tools"]
 
 [[bin]]
 name = "sandy"
