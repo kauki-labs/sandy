@@ -22,8 +22,8 @@ struct Cli {
     /// The subcommand to run.
     #[command(subcommand)]
     command: Command,
-    /// Output format: `text` (human, default) or `json` (for agents/automation).
-    #[arg(long = "output", short = 'o', value_enum, default_value = "text", global = true)]
+    /// Output format: `plain` (human, default) or `json` (for agents/automation).
+    #[arg(long = "output", short = 'o', value_enum, default_value = "plain", global = true)]
     output: OutputFormat,
 }
 
@@ -366,10 +366,10 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
     if let Command::Doctor = command {
         let result = doctor::run_doctor();
         match output {
-            // Text keeps the stream convention (ok→stdout, refusal→stderr); JSON
+            // Plain keeps the stream convention (ok→stdout, refusal→stderr); JSON
             // always goes to stdout so an agent reads the verdict from one channel.
-            OutputFormat::Text if result.exit_code != 0 => eprintln!("{}", result.message),
-            OutputFormat::Text => println!("{}", result.message),
+            OutputFormat::Plain if result.exit_code != 0 => eprintln!("{}", result.message),
+            OutputFormat::Plain => println!("{}", result.message),
             OutputFormat::Json => match format_doctor(result.exit_code, &result.message, output) {
                 Ok(json) => println!("{json}"),
                 Err(e) => {
