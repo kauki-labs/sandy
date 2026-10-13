@@ -73,6 +73,18 @@
               "x-systemd.device-timeout=2s"
             ];
           };
+          # sandy shares a writable dir tagged `sandy-outputs` (OUTPUT_MOUNT_TAG)
+          # and collects it to the host at teardown; the job writes under
+          # /run/sandy/outputs/NAME. Writable (no `ro`); `nofail` so a run with no
+          # outputs still boots.
+          fileSystems."/run/sandy/outputs" = {
+            device = "sandy-outputs";
+            fsType = "virtiofs";
+            options = [
+              "nofail"
+              "x-systemd.device-timeout=2s"
+            ];
+          };
           # The store is an erofs block device, so nothing else pulls in the
           # virtiofs driver; the secret share needs it. Load it in stage 2 (the
           # mount is not in the initrd).

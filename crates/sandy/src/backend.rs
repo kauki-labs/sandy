@@ -31,6 +31,20 @@ pub struct Input {
     pub name: String,
 }
 
+/// A writable output collected from the guest at teardown.
+///
+/// The guest writes under `/run/sandy/outputs/<name>`; at teardown sandy copies
+/// that subtree to the host path [`dest`](Output::dest). The share is the one
+/// guest-writable, host-visible surface, so collection never follows a symlink
+/// out of the output root and is size/inode-capped (INV-1 on the way out).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Output {
+    /// The name the guest writes under at `/run/sandy/outputs/<name>`.
+    pub name: String,
+    /// The host path the subtree is collected to at teardown.
+    pub dest: PathBuf,
+}
+
 /// Where a secret's bytes come from. Secrets travel this channel only — never
 /// argv, env, mounts, or the Nix store (INV-1).
 #[derive(Debug)]
@@ -70,6 +84,9 @@ pub struct RunSpec<'a> {
     pub command: &'a [String],
     /// Read-only inputs staged into the guest at `/run/sandy/inputs/<name>`.
     pub inputs: &'a [Input],
+    /// Writable outputs the guest writes under `/run/sandy/outputs/<name>`,
+    /// collected to each [`Output::dest`] at teardown.
+    pub outputs: &'a [Output],
     /// Secrets to inject over the secret channel.
     pub secrets: &'a [SecretRef],
     /// Extra environment variables (never secrets — INV-1).
@@ -301,6 +318,7 @@ mod tests {
             template: "demo",
             command: &command,
             inputs: &[],
+            outputs: &[],
             secrets: &secrets,
             env: &env,
             cpu: None,

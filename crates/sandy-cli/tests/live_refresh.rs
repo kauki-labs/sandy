@@ -125,6 +125,7 @@ fn a_refreshed_token_reaches_the_running_guest() -> anyhow::Result<()> {
         template: format!("{}#{}", guest_flake().display(), target.topology_attr),
         command: vec![probe.to_string()],
         inputs: vec![],
+        outputs: vec![],
         secrets: vec![],
         env: vec![],
         allow: AllowList::default(),

@@ -22,8 +22,9 @@ use std::{
 };
 
 use sandy::{
-    BackendError, BoxState, Hypervisor, INPUT_MOUNT_TAG, Markers, Outcome, PtyTransport, RunSpec, SECRET_MOUNT_TAG,
-    StoreBacking, Topology, VmBackend, run_console, stage_inputs, stage_secrets, topology, wipe,
+    BackendError, BoxState, Hypervisor, INPUT_MOUNT_TAG, Markers, OUTPUT_MOUNT_TAG, Outcome, PtyTransport, RunSpec,
+    SECRET_MOUNT_TAG, StoreBacking, Topology, VmBackend, collect_outputs, prepare_outputs, run_console, stage_inputs,
+    stage_secrets, topology, wipe,
 };
 use uuid::Uuid;
 
@@ -49,15 +50,20 @@ pub struct StagedArgs {
     /// virtio-fs share descriptor(s) for the read-only staged-inputs directory
     /// (`sharedDir=<inputs_dir>,mountTag=sandy-inputs,ro`).
     pub input_shares: Vec<String>,
+    /// virtio-fs share descriptor(s) for the writable outputs directory
+    /// (`sharedDir=<outputs_dir>,mountTag=sandy-outputs`, no `ro`).
+    pub output_shares: Vec<String>,
 }
 
 impl StagedArgs {
-    /// A [`StagedArgs`] carrying the given secret and input share descriptors.
+    /// A [`StagedArgs`] carrying the given secret, input, and output share
+    /// descriptors.
     #[must_use]
-    pub fn new(secret_shares: Vec<String>, input_shares: Vec<String>) -> Self {
+    pub fn new(secret_shares: Vec<String>, input_shares: Vec<String>, output_shares: Vec<String>) -> Self {
         Self {
             secret_shares,
             input_shares,
+            output_shares,
         }
     }
 }
@@ -80,8 +86,9 @@ impl StagedArgs {
 ///   virtio-fs,sharedDir=/nix/store,mountTag=<tag>` (the guest mounts it read-only via the `ro-store` tag).
 /// - `--device virtio-serial,stdio` — the guest `hvc0` console. `stdio` is backed by the PTY master the backend spawns
 ///   `vfkit` under (#33), which is why a real TTY is required.
-/// - one `--device virtio-fs,<descriptor>` per entry in [`StagedArgs::input_shares`] (read-only inputs) and
-///   [`StagedArgs::secret_shares`] (the secret share). Each `--device` and its descriptor are separate argv tokens.
+/// - one `--device virtio-fs,<descriptor>` per entry in [`StagedArgs::input_shares`] (read-only inputs),
+///   [`StagedArgs::output_shares`] (writable outputs), and [`StagedArgs::secret_shares`] (the secret share). Each
+///   `--device` and its descriptor are separate argv tokens.
 /// - `--device virtio-vsock,…` when [`Topology::vsock_cid`] is `Some` (absent in the aarch64 fixture).
 ///
 /// # Errors
@@ -131,10 +138,16 @@ pub fn vfkit_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> R
     args.push("--device".to_string());
     args.push("virtio-serial,stdio".to_string());
 
-    // The read-only inputs shares then the staged-secret share, each an already-assembled virtio-fs descriptor.
-    // vfkit's virtio-fs device rejects a `ro` option ("unknown option for virtio-fs devices: ro") — unlike the
-    // erofs store's virtio-blk `readonly` — so drop a trailing `,ro`; the guest mounts these shares read-only.
-    for descriptor in staged.input_shares.iter().chain(&staged.secret_shares) {
+    // The read-only inputs shares, the writable outputs shares, then the staged-secret share, each an
+    // already-assembled virtio-fs descriptor. vfkit's virtio-fs device rejects a `ro` option ("unknown option for
+    // virtio-fs devices: ro") — unlike the erofs store's virtio-blk `readonly` — so drop a trailing `,ro`; the guest
+    // mounts the RO shares read-only itself (the outputs share carries no `,ro`, so it stays writable).
+    for descriptor in staged
+        .input_shares
+        .iter()
+        .chain(&staged.output_shares)
+        .chain(&staged.secret_shares)
+    {
         let descriptor = descriptor.strip_suffix(",ro").unwrap_or(descriptor);
         args.push("--device".to_string());
         args.push(format!("virtio-fs,{descriptor}"));
@@ -221,7 +234,19 @@ impl VfkitBackend {
             Vec::new()
         };
 
-        let staged = StagedArgs::new(secret_shares, input_shares);
+        // Outputs get their own per-run dir, shared writable (no `,ro`); `run`
+        // collects it to the host destinations after boot.
+        let outputs_dir = std::env::temp_dir().join("sandy").join(format!("{box_id}-outputs"));
+        let output_shares = if prepare_outputs(spec.outputs, &outputs_dir)? > 0 {
+            vec![format!(
+                "sharedDir={},mountTag={OUTPUT_MOUNT_TAG}",
+                outputs_dir.display()
+            )]
+        } else {
+            Vec::new()
+        };
+
+        let staged = StagedArgs::new(secret_shares, input_shares, output_shares);
         let args = vfkit_args(topology, spec, &staged)?;
 
         let mut transport = PtyTransport::open()?;
@@ -265,15 +290,25 @@ impl VmBackend for VfkitBackend {
 
         let outcome = self.boot(&topology, spec, run_id, &box_id, &inst_dir);
 
-        // Wipe staging on every path so secret bytes never outlive the run (INV-1).
-        // The inputs dir (a sibling of inst_dir, same derivation as in `boot`) too.
+        // The inputs/outputs dirs (siblings of inst_dir, same derivation as in `boot`).
         let inputs_dir = std::env::temp_dir().join("sandy").join(format!("{box_id}-inputs"));
-        for dir in [&inst_dir, &inputs_dir] {
+        let outputs_dir = std::env::temp_dir().join("sandy").join(format!("{box_id}-outputs"));
+
+        // Collect outputs before wiping, only if the guest booted; a collection
+        // failure surfaces as an infra fault rather than silently dropping output.
+        let collected = if outcome.as_ref().is_ok_and(|o| o.booted) {
+            collect_outputs(spec.outputs, &outputs_dir)
+        } else {
+            Ok(())
+        };
+
+        // Wipe staging on every path so secret bytes never outlive the run (INV-1).
+        for dir in [&inst_dir, &inputs_dir, &outputs_dir] {
             if let Err(err) = wipe(dir) {
                 tracing::warn!(dir = %dir.display(), %err, "failed to wipe staging on teardown");
             }
         }
-        outcome
+        collected.and(outcome)
     }
 
     fn kill(&self, box_id: &str) -> Result<(), BackendError> {
@@ -333,6 +368,7 @@ mod tests {
             template: "demo",
             command: &command,
             inputs: &[],
+            outputs: &[],
             secrets: &[],
             env: &[],
             cpu: None,
@@ -390,6 +426,7 @@ mod tests {
             template: "demo",
             command: &command,
             inputs: &[],
+            outputs: &[],
             secrets: &secrets,
             env: &[],
             cpu: None,
@@ -403,6 +440,7 @@ mod tests {
         // in a 0600 file; only the share path and tag reach argv (INV-1).
         let staged = StagedArgs::new(
             vec!["sharedDir=/run/sandy/inst-0,mountTag=sandy-secrets,ro".to_string()],
+            vec![],
             vec![],
         );
 
@@ -433,6 +471,7 @@ mod tests {
             template: "demo",
             command: &command,
             inputs: &[],
+            outputs: &[],
             secrets: &[],
             env: &[],
             cpu: None,
@@ -465,6 +504,7 @@ mod tests {
             template: "demo",
             command: &command,
             inputs: &[],
+            outputs: &[],
             secrets: &[],
             env: &[],
             cpu: None,
@@ -504,6 +544,7 @@ mod tests {
             template: "demo",
             command: &command,
             inputs: &[],
+            outputs: &[],
             secrets: &[],
             env: &[],
             cpu: None,

@@ -4,7 +4,9 @@
 //! atomic rename, and [`wipe`] clears the staging dir on teardown — the bytes
 //! travel this on-disk channel only, never argv, env, or the Nix store (INV-1).
 //! [`stage_inputs`] copies each read-only input into a separate `0700` share dir
-//! mounted at `/run/sandy/inputs`.
+//! mounted at `/run/sandy/inputs`. [`prepare_outputs`] / [`collect_outputs`] back
+//! the writable `/run/sandy/outputs` share and copy it to host destinations at
+//! teardown.
 //!
 //! The module is private (INV-FACADE); `lib.rs` re-exports only the items a
 //! backend (#32/#35) calls.
@@ -15,7 +17,9 @@
 //! `sandy-cli` live tests, not here.
 
 mod inputs;
+mod outputs;
 mod secrets;
 
 pub use inputs::{INPUT_MOUNT_TAG, stage_inputs};
+pub use outputs::{OUTPUT_MOUNT_TAG, collect_outputs, prepare_outputs};
 pub use secrets::{SECRET_MOUNT_TAG, StagedSecret, stage_secrets, wipe};

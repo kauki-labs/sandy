@@ -24,8 +24,9 @@ use std::{
 };
 
 use sandy::{
-    BackendError, BoxState, Hypervisor, INPUT_MOUNT_TAG, Markers, Outcome, PipeTransport, RunSpec, SECRET_MOUNT_TAG,
-    StoreBacking, Topology, VmBackend, run_console, stage_inputs, stage_secrets, topology as eval_topology, wipe,
+    BackendError, BoxState, Hypervisor, INPUT_MOUNT_TAG, Markers, OUTPUT_MOUNT_TAG, Outcome, PipeTransport, RunSpec,
+    SECRET_MOUNT_TAG, StoreBacking, Topology, VmBackend, collect_outputs, prepare_outputs, run_console, stage_inputs,
+    stage_secrets, topology as eval_topology, wipe,
 };
 use uuid::Uuid;
 
@@ -66,6 +67,9 @@ pub struct StagedArgs {
     /// The read-only share spec for the staged-inputs directory, when the run
     /// carries inputs.
     pub input_share: Option<String>,
+    /// The writable share spec for the outputs directory, when the run carries
+    /// outputs (no `,ro`, so the guest can write it).
+    pub output_share: Option<String>,
     /// Whether `/dev/kvm` is usable → emit `-enable-kvm -cpu host`.
     pub kvm: bool,
     /// The host tap the guest's NIC attaches to, when networking is requested.
@@ -92,7 +96,8 @@ pub struct StagedArgs {
 /// - `-nographic` and `-serial chardev:<id>` — the guest serial console; `run` adds the matching `-chardev socket,…`
 ///   that binds `<id>` to the #33 [`PipeTransport`] (the socket path is a host detail, so it is not emitted here).
 /// - `-enable-kvm -cpu host` when `staged.kvm`.
-/// - the virtiofs/virtio-9p read-only inputs share (`staged.input_share`) and secret share (`staged.secret_share`).
+/// - the virtiofs/virtio-9p read-only inputs share (`staged.input_share`), writable outputs share
+///   (`staged.output_share`), and secret share (`staged.secret_share`).
 /// - a `-netdev tap,…,ifname=<tap> -device virtio-net-pci,…` NIC pair when `staged.tap` is set (so the guest has egress
 ///   to filter, #29); nothing when it is `None` (the default isolated boot).
 /// - `-device vhost-vsock-pci,guest-cid=<cid>` when `topology.vsock_cid` is set.
@@ -164,9 +169,12 @@ pub fn qemu_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> Re
         args.push(format!("virtio-net-pci,netdev=net0,mac={GUEST_MAC}"));
     }
 
-    // The virtiofs/9p shares: the read-only inputs share, then the secret share.
+    // The virtiofs/9p shares: read-only inputs, writable outputs, then the secret share.
     if let Some(input_share) = &staged.input_share {
         push_virtfs(&mut args, input_share)?;
+    }
+    if let Some(output_share) = &staged.output_share {
+        push_virtfs(&mut args, output_share)?;
     }
     if let Some(secret_share) = &staged.secret_share {
         push_virtfs(&mut args, secret_share)?;
@@ -388,9 +396,15 @@ impl VmBackend for QemuBackend {
         let inputs_dir = std::env::temp_dir().join("sandy").join(format!("{run_id}-inputs"));
         let input_share = (stage_inputs(spec.inputs, &inputs_dir)? > 0)
             .then(|| format!("sharedDir={},mountTag={INPUT_MOUNT_TAG},ro", inputs_dir.display()));
+        // Outputs get their own per-run dir, shared writable (no `,ro`); the guest
+        // writes it and sandy collects it to the host destinations below.
+        let outputs_dir = std::env::temp_dir().join("sandy").join(format!("{run_id}-outputs"));
+        let output_share = (prepare_outputs(spec.outputs, &outputs_dir)? > 0)
+            .then(|| format!("sharedDir={},mountTag={OUTPUT_MOUNT_TAG}", outputs_dir.display()));
         let staged = StagedArgs {
             secret_share,
             input_share,
+            output_share,
             kvm: kvm_available(),
             // A tap is opt-in via $SANDY_TAP: the operator (or the #29 live gate)
             // creates and firewalls the tap, then names it here so the guest's NIC
@@ -400,14 +414,23 @@ impl VmBackend for QemuBackend {
 
         let outcome = qemu_args(&topology, spec, &staged).and_then(|args| self.boot(spec, &args, run_id, &inst_dir));
 
+        // Collect outputs before wiping, but only if the guest actually booted
+        // (nothing was produced otherwise). A collection failure surfaces as an
+        // infra fault rather than silently dropping the output.
+        let collected = if outcome.as_ref().is_ok_and(|o| o.booted) {
+            collect_outputs(spec.outputs, &outputs_dir)
+        } else {
+            Ok(())
+        };
+
         // Teardown clears staging on every path so secret bytes never outlive
-        // the run (INV-1), including the error path. The inputs dir is wiped too.
-        for dir in [&inst_dir, &inputs_dir] {
+        // the run (INV-1), including the error path. The inputs/outputs dirs too.
+        for dir in [&inst_dir, &inputs_dir, &outputs_dir] {
             if let Err(err) = wipe(dir) {
                 tracing::warn!(dir = %dir.display(), %err, "failed to wipe staging on teardown");
             }
         }
-        outcome
+        collected.and(outcome)
     }
 
     fn kill(&self, box_id: &str) -> Result<(), BackendError> {
@@ -462,6 +485,7 @@ mod tests {
             template: "demo",
             command: &command,
             inputs: &[],
+            outputs: &[],
             secrets: &[],
             env: &[],
             cpu: None,
@@ -511,6 +535,7 @@ mod tests {
         let staged = StagedArgs {
             secret_share: Some(format!("sharedDir=/tmp/inst,mountTag={SECRET_MOUNT_TAG},ro")),
             input_share: None,
+            output_share: None,
             kvm: true,
             tap: None,
         };
@@ -524,6 +549,7 @@ mod tests {
             template: "demo",
             command: &command,
             inputs: &[],
+            outputs: &[],
             secrets: &[],
             env: &[],
             cpu: None,
@@ -562,6 +588,7 @@ mod tests {
             template: "demo",
             command: &command,
             inputs: &[],
+            outputs: &[],
             secrets: &[],
             env: &[],
             cpu: None,
@@ -592,6 +619,7 @@ mod tests {
             template: "demo",
             command: &command,
             inputs: &[],
+            outputs: &[],
             secrets: &[],
             env: &[],
             cpu: None,
@@ -631,6 +659,7 @@ mod tests {
             template: "demo",
             command: &command,
             inputs: &[],
+            outputs: &[],
             secrets: &[],
             env: &[],
             cpu: None,
@@ -665,6 +694,7 @@ mod tests {
             template: "demo",
             command: &command,
             inputs: &[],
+            outputs: &[],
             secrets: &[],
             env: &[],
             cpu: None,
