@@ -108,8 +108,18 @@ impl GuestShareTransport for VirtiofsdTransport {
 }
 
 /// The vfkit virtio-fs transport: Virtualization.framework serves virtio-fs itself,
-/// so there is no daemon — one `--device virtio-fs,…` per share, and the guest mount
-/// enforces read-only (vfkit's virtio-fs device rejects a `,ro` option).
+/// so there is no daemon, just one `--device virtio-fs,…` per share.
+///
+/// Read-only is NOT enforced host-side here, unlike the qemu transport's
+/// `virtiofsd --readonly`: vfkit's `virtio-fs` device takes only `sharedDir` and
+/// `mountTag` (verified against vfkit v0.6.3), with no read-only option, so
+/// [`device_args`](GuestShareTransport::device_args) cannot pass the share's
+/// `readonly` flag through. On macOS a `readonly` share is enforced only by the guest's `ro` mount,
+/// which a guest-root `mount -o remount,rw` can defeat. This asymmetry is accepted:
+/// each share is a single per-run, sandy-owned dir wiped at teardown, so a guest
+/// that remounts rw can corrupt only its own run's staging, never escape the share
+/// or reach another run (the VM is the trust boundary). See
+/// `docs/decisions/guest-shares.md` §2.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct VirtioFsTransport;
 
@@ -142,10 +152,17 @@ pub fn kill_children(children: &mut Vec<Child>) {
 }
 
 /// The `virtiofsd` CLI args (after the binary) serving `share`: its socket, the
-/// shared dir, an unprivileged sandbox, and `--readonly` for a read-only share so
-/// guest writes are denied at the host boundary (INV-1), not only by the guest
-/// mount. Pure, so the read-only decision per share is unit-testable without
-/// launching the daemon.
+/// shared dir, `--sandbox=none`, and `--readonly` for a read-only share so guest
+/// writes are denied at the host boundary (INV-1), not only by the guest mount.
+///
+/// `--sandbox=none` disables virtiofsd's own namespace/chroot confinement (it is
+/// NOT a sandbox): the `namespace` and `chroot` modes need privileges sandy's
+/// unprivileged launch does not have. The daemon only ever serves a single
+/// per-run, sandy-owned dir that is wiped at teardown, and the guest is confined to
+/// the VM, so the daemon's own confinement is not the containment boundary here.
+///
+/// Pure, so the read-only decision per share is unit-testable without launching the
+/// daemon.
 #[must_use]
 pub fn virtiofsd_args(share: &ShareSpec) -> Vec<String> {
     let mut args = vec![
