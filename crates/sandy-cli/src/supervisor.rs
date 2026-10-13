@@ -16,20 +16,20 @@ use std::{
 
 use sandy::{
     BackendError, Classification, CoreError, CredentialProvider, EgressApplier, EgressOs, EgressOutcome,
-    JOURNAL_SCHEMA_VERSION, JobRecord, JobState, Journal, Lease, Logs, Outcome, OutputStatus, ProcessExit, Provenance,
-    RESULT_SCHEMA_VERSION, ResultEnvelope, Scope, SecretSource, StagedImage, Status, VmBackend, classify_backend_error,
-    classify_invalid_plan, classify_outcome, enforce, mint_lease, new_job_id, plan_egress_scoped, plan_eviction,
-    reconcile_job, refresh_once, validate_no_secret_leak,
+    JOURNAL_SCHEMA_VERSION, JobRecord, JobState, Journal, Lease, Logs, Outcome, OutputRef, OutputStatus, ProcessExit,
+    Provenance, RESULT_SCHEMA_VERSION, ResultEnvelope, Scope, SecretSource, StagedImage, Status, VmBackend,
+    classify_backend_error, classify_invalid_plan, classify_outcome, enforce, mint_lease, new_job_id,
+    plan_egress_scoped, plan_eviction, reconcile_job, refresh_once, validate_no_secret_leak,
 };
 
 use crate::plan::JobPlan;
 
 /// Build the LOCKED [`ResultEnvelope`] from a terminal [`Classification`].
 ///
-/// Outputs, receipts, provenance, and logs are placeholders: output collection
-/// and provenance capture are out of #22 scope (they land with the host boot,
-/// #26). The envelope still carries the authoritative `status` / `retryable` /
-/// `exit_code` triple so the on-disk terminal record is complete (INV-6/INV-11).
+/// `outputs` are the files the backend collected to the job's declared
+/// destinations (empty when the run never collected, e.g. an invalid plan or an
+/// infra fault). Receipts and provenance remain placeholders (provenance capture
+/// lands with #26).
 fn build_envelope(
     job_id: &str,
     box_id: Option<String>,
@@ -37,6 +37,7 @@ fn build_envelope(
     guest_exit: Option<i32>,
     message: String,
     console: String,
+    outputs: Vec<OutputRef>,
 ) -> ResultEnvelope {
     ResultEnvelope {
         result_schema_version: RESULT_SCHEMA_VERSION,
@@ -46,7 +47,7 @@ fn build_envelope(
         retryable: classification.retryable,
         message,
         exit_code: guest_exit,
-        outputs: vec![],
+        outputs,
         receipts: vec![],
         provenance: Provenance {
             template_store_path: String::new(),
@@ -54,6 +55,45 @@ fn build_envelope(
         // The captured guest console tail (boot log + command output), so a boot
         // that never reached the command is diagnosable from the envelope alone.
         logs: Logs { tail: console },
+    }
+}
+
+/// List the files the backend collected to each declared output's destination as
+/// [`OutputRef`]s. The path is logical, not a host path: `<name>/<relpath>` for a
+/// named output (`--out NAME:DEST`) and `<relpath>` for a catch-all (`--out DEST`),
+/// so it identifies what the job produced independent of where on the host the
+/// caller sent it. Sorted for a deterministic envelope. Best-effort: an unreadable
+/// destination contributes no refs.
+fn collect_output_refs(plan: &JobPlan) -> Vec<OutputRef> {
+    let mut refs = Vec::new();
+    for output in &plan.outputs {
+        walk_outputs(&output.dest, output.name.as_deref().unwrap_or(""), &mut refs);
+    }
+    refs.sort_by(|a, b| a.path.cmp(&b.path));
+    refs
+}
+
+/// Recurse `dir`, pushing one [`OutputRef`] per regular file with a
+/// `<prefix>/<name>` logical path (an empty `prefix` yields the bare relative
+/// path). Symlinks and special files are skipped — collection already dropped
+/// escaping symlinks, so none should remain, and a stray one is not an output.
+fn walk_outputs(dir: &Path, prefix: &str, refs: &mut Vec<OutputRef>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let rel = if prefix.is_empty() {
+            name.into_owned()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        match entry.file_type() {
+            Ok(ft) if ft.is_dir() => walk_outputs(&entry.path(), &rel, refs),
+            Ok(ft) if ft.is_file() => refs.push(OutputRef { path: rel }),
+            _ => {}
+        }
     }
 }
 
@@ -120,6 +160,7 @@ pub fn run_job<B: VmBackend, E: EgressApplier>(
             None,
             plan_error.to_string(),
             String::new(),
+            vec![],
         );
         return Ok(RunReport {
             envelope,
@@ -168,7 +209,7 @@ pub fn run_job<B: VmBackend, E: EgressApplier>(
 
     // 5. Classify the physical outcome. The console tail is carried through to the envelope so a boot fault (which
     //    never produced a guest exit) is still diagnosable from the record alone.
-    let (classification, guest_exit, message, console) = match run_result {
+    let (classification, guest_exit, message, console, outputs) = match run_result {
         Err(backend_error) => {
             tracing::warn!(%job_id, error = %backend_error, "backend run failed (infra fault)");
             (
@@ -176,22 +217,27 @@ pub fn run_job<B: VmBackend, E: EgressApplier>(
                 None,
                 format!("infra fault: {backend_error}"),
                 String::new(),
+                vec![],
             )
         }
         Ok(outcome) => {
-            // Output collection is out of #22 scope; treat outputs as Complete.
+            // The backend ran and collected to the declared destinations; list what
+            // landed. Classification still treats outputs as Complete — the
+            // required-missing/over-quota resolution is a follow-up (the hooks exist
+            // in `OutputStatus`), so an empty output does not fail a run today.
             let classification = classify_outcome(&outcome, OutputStatus::Complete);
             (
                 classification,
                 outcome.guest_exit,
                 format!("run {:?}", classification.status),
                 outcome.console,
+                collect_output_refs(plan),
             )
         }
     };
 
     // 6. Write the terminal record carrying the envelope (INV-6).
-    let envelope = build_envelope(&job_id, None, classification, guest_exit, message, console);
+    let envelope = build_envelope(&job_id, None, classification, guest_exit, message, console, outputs);
     let terminal = JobRecord {
         schema_version: JOURNAL_SCHEMA_VERSION,
         job_id,
@@ -442,6 +488,7 @@ pub fn kill<B: VmBackend>(journal: &Journal, backend: &B, job_id: &str) -> Resul
         None,
         "cancelled by kill".to_string(),
         String::new(),
+        vec![],
     );
     let cancelled = JobRecord {
         state: JobState::Cancelled,

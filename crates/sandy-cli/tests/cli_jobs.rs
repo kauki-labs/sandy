@@ -153,6 +153,35 @@ fn run_positive_writes_a_succeeded_record_with_the_envelope() -> anyhow::Result<
 }
 
 #[test]
+fn run_lists_collected_outputs_in_the_envelope() -> anyhow::Result<()> {
+    let (tmp, journal) = fresh_journal()?;
+    // The backend collects to each declared output's dest; FakeBackend doesn't
+    // boot, so seed the dest to stand in for what a real collection writes.
+    let dest = tmp.path().join("collected");
+    std::fs::create_dir_all(dest.join("sub")).context("mk output dest")?;
+    std::fs::write(dest.join("f"), b"x").context("write output")?;
+    std::fs::write(dest.join("sub").join("g"), b"y").context("write nested output")?;
+
+    let mut plan = booting_plan();
+    plan.outputs = vec![sandy::Output {
+        name: Some("result".to_string()),
+        dest,
+    }];
+
+    let backend = FakeBackend::new().with_outcome(ok_outcome(0));
+    let report = run_job(&backend, &journal, &plan, &FakeApplier::new(), EgressOs::Linux, None)
+        .context("run_job with outputs")?;
+
+    let paths: Vec<&str> = report.envelope.outputs.iter().map(|o| o.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        vec!["result/f", "result/sub/g"],
+        "envelope lists the collected outputs, sorted and name-prefixed"
+    );
+    Ok(())
+}
+
+#[test]
 fn run_guest_failure_is_band_one_not_retryable() -> anyhow::Result<()> {
     let (_tmp, journal) = fresh_journal()?;
     let backend = FakeBackend::new().with_outcome(ok_outcome(1));

@@ -76,6 +76,19 @@ fn a_named_output_is_collected_to_the_host() -> anyhow::Result<()> {
         b"deep",
         "a nested output file was collected too"
     );
+    // The envelope lists the collected outputs with their name-prefixed paths.
+    let outputs: Vec<String> = env["outputs"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|o| o["path"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        outputs.contains(&"result/f".to_string()) && outputs.contains(&"result/sub/g".to_string()),
+        "envelope.outputs lists the named output paths: {outputs:?}"
+    );
     Ok(())
 }
 
@@ -103,6 +116,19 @@ fn a_catch_all_output_collects_the_whole_dir() -> anyhow::Result<()> {
         std::fs::read(dest.path().join("d").join("n")).context("collected nested file")?,
         b"deep",
         "a nested file under the output root was collected too"
+    );
+    // Catch-all outputs appear in the envelope with bare (un-prefixed) paths.
+    let outputs: Vec<String> = env["outputs"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|o| o["path"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        outputs.contains(&"top".to_string()) && outputs.contains(&"d/n".to_string()),
+        "envelope.outputs lists the catch-all output paths: {outputs:?}"
     );
     Ok(())
 }
