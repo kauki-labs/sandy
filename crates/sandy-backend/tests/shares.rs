@@ -62,6 +62,14 @@ fn share_arg<'a>(args: &'a [String], needle: &str) -> &'a str {
 
 /// A share descriptor as the backend `run` builds it: read-only carries a trailing
 /// `,ro`, writable does not.
+// QEMU-VIRTIOFS SWAP POINT (#34 follow-up): the qemu share transport is being
+// converted from 9p (`-virtfs local,…,mount_tag=T[,readonly=on]`) to real virtiofs
+// (`virtiofsd` + `-device vhost-user-fs-pci,tag=T`), because the guest mounts
+// `fsType=virtiofs` and 9p tags never resolve on a real qemu boot. When that lands,
+// `StagedArgs` changes shape (per-share `{dir, tag, readonly}`), so this helper and
+// the three `qemu_*` tests below (the `mount_tag=` / `readonly=on` assertions) swap
+// to the vhost-user-fs form. The vfkit tests stay as-is. The guest mount config and
+// the live_inputs/live_outputs behaviour assertions do NOT change.
 fn descriptor(dir: &std::path::Path, tag: &str, ro: bool) -> String {
     let base = format!("sharedDir={},mountTag={tag}", dir.display());
     if ro { format!("{base},ro") } else { base }
@@ -70,7 +78,7 @@ fn descriptor(dir: &std::path::Path, tag: &str, ro: bool) -> String {
 // ---- inputs -------------------------------------------------------------------
 
 /// I1 — qemu: a staged input is woven into the argv as a read-only virtio share
-/// (`mount_tag=sandy-inputs` + `readonly=on`).
+/// (`mount_tag=sandy-inputs` + `readonly=on`). QEMU-VIRTIOFS swap point (see `descriptor`).
 #[test]
 fn qemu_input_share_is_read_only() -> Result<()> {
     let tmp = tempfile::tempdir()?;
@@ -143,7 +151,7 @@ fn missing_host_input_fails_closed() {
 // ---- outputs ------------------------------------------------------------------
 
 /// O1 — qemu: a prepared output is woven in writable (`mount_tag=sandy-outputs`,
-/// no `readonly=on`), unlike the inputs/secret shares.
+/// no `readonly=on`), unlike the inputs/secret shares. QEMU-VIRTIOFS swap point (see `descriptor`).
 #[test]
 fn qemu_output_share_is_writable() -> Result<()> {
     let tmp = tempfile::tempdir()?;
@@ -273,6 +281,7 @@ fn output_symlink_escape_is_skipped() -> Result<()> {
 /// X1 — with an input, an output, and a secret all set, the qemu argv carries three
 /// distinct shares with the right tags, and only the outputs share is writable
 /// (inputs and secret are read-only; outputs never lands under the secret mount).
+/// QEMU-VIRTIOFS swap point (see `descriptor`).
 #[test]
 fn three_shares_only_outputs_writable() -> Result<()> {
     let tmp = tempfile::tempdir()?;
