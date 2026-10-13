@@ -77,6 +77,35 @@ nix/
 
 Add a crate by dropping it under `crates/`; the workspace glob picks it up.
 
+### Architecture spec (dispatch)
+
+A two-level spec of the existing system lives under
+[`docs/architecture/`](docs/architecture). Dispatch to the right level for the task:
+
+- **Orientation / cross-cutting change** → read
+  [`docs/architecture/overview.md`](docs/architecture/overview.md): the run pipeline,
+  the four seams (`VmBackend`, `GuestShareTransport`, `CredentialProvider`,
+  `EgressApplier`), and the subsystem map, with mermaid diagrams.
+- **Deep work in one subsystem** → read that subsystem's section in
+  [`docs/architecture/spec.md`](docs/architecture/spec.md): run plane, guest shares,
+  secret channel, credential seam, egress, result + classification, journal. Each
+  section states the **decisions** (with rationale + the invariant it turns on) and
+  the **KPI** — the tests that verify it.
+- **Why is it this way / can I change decision X** → the full record for that
+  category in [`docs/decisions/`](docs/decisions) (one file per subsystem): context,
+  the decision, consequences, and the alternative **set aside** (do not re-propose
+  without new information).
+- **Writing or changing tests** → the spec's
+  [testing section](docs/architecture/spec.md#testing-integration-vs-end-to-end)
+  splits **integration** (tier-2, CI, no hypervisor, over `FakeBackend`) from
+  **end-to-end** (tier-3, `live` feature, a real boot). A live scenario is never
+  counted green from a fake (INV-S9). The live acceptance floor (what must pass
+  before shipping) is the matrix in
+  [`docs/architecture/kpi.md`](docs/architecture/kpi.md).
+
+Keep these current: a subsystem change updates its decisions + KPI in `spec.md`,
+its full record in `docs/decisions/`, and the live matrix in `kpi.md`.
+
 - **Deep crate**: `sandy`'s module tree is private; the only public surface is
   the `pub use` facade in `lib.rs`. Reach a type through the facade, never into a
   module.
