@@ -62,7 +62,12 @@
           );
 
           sandyPackages = import ./nix/packages/sandy.nix {
-            inherit pkgs lib craneLib;
+            inherit
+              pkgs
+              lib
+              craneLib
+              covCraneLib
+              ;
           };
         in
         {
@@ -150,6 +155,7 @@
               doc
               test
               shear
+              coverage
               ;
           };
 
