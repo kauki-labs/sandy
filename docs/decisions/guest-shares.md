@@ -1,3 +1,10 @@
+---
+title: "Decisions: guest shares (GuestShareTransport)"
+status: accepted
+project: sandy
+updated: 2026-10-14
+---
+
 # Decisions: guest shares (`GuestShareTransport`)
 
 Presenting host directories to the guest as virtio-fs mounts for inputs (RO),

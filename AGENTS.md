@@ -1,8 +1,10 @@
-# sandy — Agent Instructions
+# sandy Agent Instructions
 
 Single source of truth for every AI coding agent. Claude Code reads this file
 natively (there is no `CLAUDE.md`), and GitHub Copilot reads it as `AGENTS.md`.
-Everything an agent needs is here.
+Everything an agent needs is here. Start in [`docs/overview.md`](docs/overview.md)
+for orientation, the run pipeline, and the seams; see [`docs/decisions/`](docs/decisions/)
+for why it is built this way.
 
 ## Project overview
 

@@ -1,3 +1,10 @@
+---
+title: "Decisions: run plane (VmBackend)"
+status: accepted
+project: sandy
+updated: 2026-10-14
+---
+
 # Decisions: run plane (`VmBackend`)
 
 Launching the guest natively and driving it to a physical `Outcome`. Subsystem

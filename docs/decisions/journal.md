@@ -1,3 +1,10 @@
+---
+title: "Decisions: journal"
+status: accepted
+project: sandy
+updated: 2026-10-14
+---
+
 # Decisions: journal
 
 Persisting durable job records and reconciling liveness without racing the owner.
