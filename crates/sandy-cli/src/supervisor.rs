@@ -7,14 +7,19 @@
 //! management ops; all liveness goes through [`reconcile_job`], never a direct
 //! registry read (INV-3).
 
-use std::{collections::HashSet, path::Path, time::SystemTime};
+use std::{
+    collections::HashSet,
+    path::Path,
+    sync::{Mutex, PoisonError, mpsc},
+    time::{Duration, SystemTime},
+};
 
 use sandy::{
     BackendError, Classification, CoreError, CredentialProvider, EgressApplier, EgressOs, EgressOutcome,
     JOURNAL_SCHEMA_VERSION, JobRecord, JobState, Journal, Lease, Logs, Outcome, OutputStatus, ProcessExit, Provenance,
-    RESULT_SCHEMA_VERSION, ResultEnvelope, Scope, SecretRef, SecretSource, StagedImage, Status, VmBackend,
-    classify_backend_error, classify_invalid_plan, classify_outcome, enforce, mint_lease, new_job_id,
-    plan_egress_scoped, plan_eviction, reconcile_job, validate_no_secret_leak,
+    RESULT_SCHEMA_VERSION, ResultEnvelope, Scope, SecretSource, StagedImage, Status, VmBackend, classify_backend_error,
+    classify_invalid_plan, classify_outcome, enforce, mint_lease, new_job_id, plan_egress_scoped, plan_eviction,
+    reconcile_job, refresh_once, validate_no_secret_leak,
 };
 
 use crate::plan::JobPlan;
@@ -238,12 +243,17 @@ pub fn mint_run_token<P: CredentialProvider>(
 /// bound (the provider's native token TTL is too coarse, #49), so the token file is
 /// kept until after `revoke` (a GitHub revoke reads it) and then removed.
 ///
-/// `cred_dir` holds the minted token file; the plan is given a secret pointing at
-/// it, which the backend copies into the guest's secret share (INV-1). Live mid-run
-/// refresh ([`sandy::refresh_once`], gated by [`sandy::should_refresh`]) re-stages a
-/// rotated token into the running guest for jobs that outlive the provider's native
-/// token cap; wiring it into this bracket's run loop lands with the caller-owned
-/// secret-dir backend seam (#49).
+/// `cred_dir` is the caller-owned secret share: the token is staged there as its
+/// env name and the dir is shared read-only into the guest ([`RunSpec::secret_dir`]),
+/// so a refresh can rewrite the live file in place. While the job runs, a background
+/// thread drives [`sandy::refresh_once`] (gated by [`sandy::should_refresh`]) to
+/// re-mint and re-stage the token before it lapses, revoking each superseded one, so
+/// a job that outlives the provider's native token cap (GitHub ~1h) keeps a valid
+/// scoped token the whole run. The refresh margin and poll interval default to
+/// [`DEFAULT_REFRESH_MARGIN_SECS`] / [`DEFAULT_REFRESH_TICK_SECS`], overridable via
+/// `SANDY_REFRESH_MARGIN_SECS` / `SANDY_REFRESH_TICK_SECS`. Teardown revokes the
+/// live token (the latest handle after any refresh) on every path and removes the
+/// staged file (INV-1); `cred_dir` itself is the caller's to clean up.
 ///
 /// # Errors
 ///
@@ -254,7 +264,7 @@ pub fn mint_run_token<P: CredentialProvider>(
     clippy::too_many_arguments,
     reason = "the bracket threads both the run and the credential inputs"
 )]
-pub fn run_job_with_credential<B: VmBackend, E: EgressApplier, P: CredentialProvider>(
+pub fn run_job_with_credential<B: VmBackend, E: EgressApplier, P: CredentialProvider + Sync>(
     backend: &B,
     journal: &Journal,
     plan: JobPlan,
@@ -267,8 +277,9 @@ pub fn run_job_with_credential<B: VmBackend, E: EgressApplier, P: CredentialProv
     cred_dir: &Path,
     requested_ttl_secs: u32,
 ) -> Result<RunReport, CoreError> {
-    // Mint and stage the token before the guest boots. A mint failure is a fail-
-    // closed infra fault: return before any backend run (INV-7).
+    // Mint and stage the token before the guest boots, into the share dir itself so
+    // the staged file IS the live guest file (refresh rewrites it). A mint failure is
+    // a fail-closed infra fault: return before any backend run (INV-7).
     let lease = mint_lease(provider, scope, requested_ttl_secs, secret_name, cred_dir)
         .map_err(|e| CoreError::Cred(e.to_string()))?;
     let SecretSource::File(token_path) = &lease.secret_ref.source else {
@@ -278,32 +289,86 @@ pub fn run_job_with_credential<B: VmBackend, E: EgressApplier, P: CredentialProv
             "minted credential is not a file-sourced secret".to_string(),
         ));
     };
+    let token_path = token_path.clone();
 
-    // Give the plan its own secret pointing at the staged token file (the backend
-    // copies it into the guest's secret share). The lease keeps its secret_ref so
-    // revoke can still read the token afterwards.
+    // Share cred_dir directly instead of pushing a plan secret the backend copies:
+    // the caller owns the dir and the refresh thread rewrites the token in it live.
     let mut plan = plan;
-    plan.secrets.push(SecretRef {
-        name: secret_name.to_string(),
-        source: SecretSource::File(token_path.clone()),
+    plan.secret_dir = Some(cred_dir.to_path_buf());
+
+    let margin = refresh_interval("SANDY_REFRESH_MARGIN_SECS", DEFAULT_REFRESH_MARGIN_SECS);
+    let tick = refresh_interval("SANDY_REFRESH_TICK_SECS", DEFAULT_REFRESH_TICK_SECS);
+    let lease = Mutex::new(lease);
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+
+    // Run the job on this thread; refresh the credential on a second thread until the
+    // run returns, then signal it to stop by dropping the sender. The refresh thread
+    // borrows the lease (a copied `&Mutex`, so the Mutex isn't moved) and owns the
+    // receiver; the scope joins it before we take the lease back.
+    let shared_lease = &lease;
+    let report = std::thread::scope(|s| {
+        s.spawn(move || refresh_loop(provider, shared_lease, margin, tick, &stop_rx));
+        let report = run_job(backend, journal, &plan, egress, egress_os, tap);
+        drop(stop_tx);
+        report
     });
 
-    let report = run_job(backend, journal, &plan, egress, egress_os, tap);
+    // The refresh thread has joined; take back the lease, now naming the live token.
+    let lease = lease.into_inner().unwrap_or_else(PoisonError::into_inner);
 
-    // Revoke on EVERY path (before removing the token file a GitHub revoke reads),
-    // so the credential is invalid the moment the job ends rather than lingering to
-    // its native expiry (#49). A revoke failure is logged, not fatal: the native TTL
-    // is the backstop.
+    // Revoke the live token on EVERY path (before removing the file a GitHub revoke
+    // reads) so it is invalid the moment the job ends, not at its native expiry (#49).
+    // A revoke failure is logged, not fatal: the native TTL is the backstop.
     if let Err(e) = provider.revoke(&lease) {
         tracing::warn!(%e, "credential revoke at teardown failed; relying on native expiry");
     }
-    // Remove the minted token file so the secret never outlives the run (INV-1); the
-    // backend already wiped its own copy in the guest share.
-    if let Err(e) = std::fs::remove_file(token_path) {
+    // Remove the staged token so the secret never outlives the run (INV-1).
+    if let Err(e) = std::fs::remove_file(&token_path) {
         tracing::warn!(path = %token_path.display(), %e, "failed to remove staged credential on teardown");
     }
 
     report
+}
+
+/// Default margin before token expiry at which a mid-run refresh fires (5 min): it
+/// must exceed one refresh's latency so the token never lapses between polls.
+pub const DEFAULT_REFRESH_MARGIN_SECS: u64 = 300;
+/// Default interval between refresh checks while a credentialed job runs (60s).
+pub const DEFAULT_REFRESH_TICK_SECS: u64 = 60;
+
+/// Read a refresh interval (seconds) from `env_key`, falling back to `default`. The
+/// tick is floored at 1s so a misconfigured `0` can't spin the poll loop.
+fn refresh_interval(env_key: &str, default: u64) -> Duration {
+    let secs = std::env::var(env_key)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
+        .max(1);
+    Duration::from_secs(secs)
+}
+
+/// Poll `lease` every `tick` and refresh it when within `margin` of expiry, until
+/// the sender half of `stop` is dropped (the run finished). Each refresh re-stages
+/// the live token file and revokes the superseded token via [`refresh_once`]; a
+/// refresh error is logged and retried on the next tick, never fatal to the run.
+fn refresh_loop<P: CredentialProvider + Sync>(
+    provider: &P,
+    lease: &Mutex<Lease>,
+    margin: Duration,
+    tick: Duration,
+    stop: &mpsc::Receiver<()>,
+) {
+    loop {
+        match stop.recv_timeout(tick) {
+            // Sender dropped (run finished) or an explicit stop: leave.
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        let mut guard = lease.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Err(e) = refresh_once(provider, &mut guard, SystemTime::now(), margin) {
+            tracing::warn!(%e, "mid-run credential refresh failed; keeping the current token");
+        }
+    }
 }
 
 /// List every job record (`journal.list()`).
@@ -458,6 +523,7 @@ mod tests {
                 agent: false,
                 shares: false,
             },
+            secret_dir: None,
         }
     }
 
@@ -483,6 +549,7 @@ mod tests {
                 agent: false,
                 shares: false,
             },
+            secret_dir: None,
         }
     }
 
@@ -575,6 +642,43 @@ mod tests {
             assert_eq!(report.process_exit.code(), ProcessExit::InvalidPlan.code());
             assert!(!report.envelope.retryable, "band 2 must not be retryable");
         }
+        Ok(())
+    }
+
+    /// `refresh_loop` refreshes the credential on each tick while the job runs and
+    /// stops promptly when the sender is dropped. A margin past the token TTL makes
+    /// `should_refresh` fire every tick, so a superseded token is revoked each time.
+    #[test]
+    fn refresh_loop_refreshes_until_the_sender_drops() -> anyhow::Result<()> {
+        use std::{
+            sync::{Mutex, mpsc},
+            time::Duration,
+        };
+
+        use sandy::{FakeProvider, Scope, mint_lease};
+
+        let tmp = tempfile::tempdir().context("tmp")?;
+        let provider = FakeProvider::returning("tok");
+        let lease = mint_lease(&provider, &Scope::default(), 1_800, "GITHUB_TOKEN", tmp.path())
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("mint")?;
+        let lease = Mutex::new(lease);
+        let (tx, rx) = mpsc::channel::<()>();
+        let margin = Duration::from_secs(1_000_000);
+        let tick = Duration::from_millis(5);
+
+        std::thread::scope(|s| {
+            let pref = &provider;
+            let shared = &lease;
+            s.spawn(move || super::refresh_loop(pref, shared, margin, tick, &rx));
+            std::thread::sleep(Duration::from_millis(50));
+            drop(tx);
+        });
+
+        assert!(
+            !provider.revoked().is_empty(),
+            "refresh_loop must refresh and revoke a superseded token while the job runs"
+        );
         Ok(())
     }
 }

@@ -187,15 +187,19 @@ impl VfkitBackend {
         inst_dir: &Path,
     ) -> Result<Outcome, BackendError> {
         // Secrets travel a read-only virtio-fs share of the 0700 staging dir, never argv bytes (INV-1).
-        // Attach it only when the run carries secrets; the guest mounts
-        // `/run/sandy/secrets` with `nofail`, so a run with no share still boots.
-        let staged_secrets = stage_secrets(spec.secrets, inst_dir)?;
-        let secret_shares = if staged_secrets.is_empty() {
+        // With `secret_dir` (refresh re-delivery, #49) stage into and share the
+        // caller-owned dir so it can rewrite a staged secret mid-run; otherwise our
+        // own inst_dir. Attach the share when the run carries secrets or the caller
+        // provided a pre-staged dir; the guest mounts `/run/sandy/secrets` with
+        // `nofail`, so a run with no share still boots.
+        let share_dir = spec.secret_dir.unwrap_or(inst_dir);
+        let staged_secrets = stage_secrets(spec.secrets, share_dir)?;
+        let secret_shares = if staged_secrets.is_empty() && spec.secret_dir.is_none() {
             Vec::new()
         } else {
             vec![format!(
                 "sharedDir={},mountTag={SECRET_MOUNT_TAG},ro",
-                inst_dir.display()
+                share_dir.display()
             )]
         };
 
@@ -313,6 +317,7 @@ mod tests {
             timeout_secs: 60,
             grants: &grants,
             outcome_file: None,
+            secret_dir: None,
         };
         let staged = StagedArgs::default();
 
@@ -368,6 +373,7 @@ mod tests {
             timeout_secs: 60,
             grants: &grants,
             outcome_file: None,
+            secret_dir: None,
         };
         // The argv-safe staged descriptor: the secret bytes are already on disk
         // in a 0600 file; only the share path and tag reach argv (INV-1).
@@ -408,6 +414,7 @@ mod tests {
             timeout_secs: 60,
             grants: &grants,
             outcome_file: None,
+            secret_dir: None,
         };
         let staged = StagedArgs::default();
 
@@ -438,6 +445,7 @@ mod tests {
             timeout_secs: 60,
             grants: &grants,
             outcome_file: None,
+            secret_dir: None,
         };
         let staged = StagedArgs::default();
 
@@ -475,6 +483,7 @@ mod tests {
             timeout_secs: 60,
             grants: &grants,
             outcome_file: None,
+            secret_dir: None,
         };
 
         let outcome = backend.run(&spec).context("boot vfkit guest")?;

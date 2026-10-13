@@ -70,6 +70,13 @@ pub struct RunSpec<'a> {
     /// `Some(path)` writes the outcome record to a file (D2, ssh); `None` uses
     /// fd3 (local).
     pub outcome_file: Option<&'a Path>,
+    /// `Some(dir)` stages secrets into, and shares the guest secret mount from,
+    /// this caller-owned directory instead of a fresh per-run staging dir. It lets
+    /// the caller rewrite a staged secret while the guest runs (credential refresh
+    /// re-delivery, #49): the directory is the live virtiofs share, so a rewrite is
+    /// seen in-guest. `None` uses the backend's own staging dir (the default). The
+    /// caller owns the directory's lifetime, the backend never wipes it.
+    pub secret_dir: Option<&'a Path>,
 }
 
 /// The physical outcome of a run, mirroring nix-vm's `snake_case` record 1:1
@@ -285,6 +292,7 @@ mod tests {
             timeout_secs: 60,
             grants: &grants,
             outcome_file: None,
+            secret_dir: None,
         };
         assert!(matches!(validate_no_secret_leak(&spec), Err(PlanError::SecretLeak(_))));
     }

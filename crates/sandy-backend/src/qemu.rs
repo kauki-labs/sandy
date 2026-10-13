@@ -367,11 +367,16 @@ impl VmBackend for QemuBackend {
         let run_id = Uuid::new_v4();
         let inst_dir = std::env::temp_dir().join("sandy").join(run_id.to_string());
 
-        let staged_secrets = stage_secrets(spec.secrets, &inst_dir)?;
-        // Attach the secret share only when the run carries secrets; the guest mounts
-        // `/run/sandy/secrets` with `nofail`, so a run with no share still boots.
-        let secret_share = (!staged_secrets.is_empty())
-            .then(|| format!("sharedDir={},mountTag={SECRET_MOUNT_TAG},ro", inst_dir.display()));
+        // With `secret_dir` (refresh re-delivery, #49) stage into and share the
+        // caller-owned dir so it can rewrite a staged secret mid-run; otherwise our
+        // own per-run inst_dir. The caller owns its dir's lifetime; we never wipe it.
+        let share_dir = spec.secret_dir.unwrap_or(&inst_dir);
+        let staged_secrets = stage_secrets(spec.secrets, share_dir)?;
+        // Attach the secret share when the run carries secrets or the caller provided
+        // a pre-staged dir; the guest mounts `/run/sandy/secrets` with `nofail`, so a
+        // run with no share still boots.
+        let secret_share = (!staged_secrets.is_empty() || spec.secret_dir.is_some())
+            .then(|| format!("sharedDir={},mountTag={SECRET_MOUNT_TAG},ro", share_dir.display()));
         let staged = StagedArgs {
             secret_share,
             kvm: kvm_available(),
@@ -449,6 +454,7 @@ mod tests {
             timeout_secs: 60,
             grants: &NO_GRANTS,
             outcome_file: None,
+            secret_dir: None,
         };
         let staged = StagedArgs::default();
 
@@ -508,6 +514,7 @@ mod tests {
             timeout_secs: 60,
             grants: &grants,
             outcome_file: None,
+            secret_dir: None,
         };
 
         let args = qemu_args(&topology, &spec, &staged).context("assemble qemu argv")?;
@@ -544,6 +551,7 @@ mod tests {
             timeout_secs: 60,
             grants: &NO_GRANTS,
             outcome_file: None,
+            secret_dir: None,
         };
         let staged = StagedArgs::default();
 
@@ -572,6 +580,7 @@ mod tests {
             timeout_secs: 60,
             grants: &NO_GRANTS,
             outcome_file: None,
+            secret_dir: None,
         };
         let staged = StagedArgs {
             tap: Some("sandytap0".to_string()),
@@ -609,6 +618,7 @@ mod tests {
             timeout_secs: 60,
             grants: &NO_GRANTS,
             outcome_file: None,
+            secret_dir: None,
         };
         let staged = StagedArgs::default();
 
@@ -641,6 +651,7 @@ mod tests {
             timeout_secs: 60,
             grants: &NO_GRANTS,
             outcome_file: None,
+            secret_dir: None,
         };
 
         let outcome = backend.run(&spec).context("boot the trivial job on KVM")?;
