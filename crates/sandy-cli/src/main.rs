@@ -36,6 +36,9 @@ enum Command {
     Run {
         /// The template (flake attr / image) to boot.
         template: String,
+        /// `--input HOST:NAME` read-only input at `/run/sandy/inputs/NAME` (repeatable).
+        #[arg(long = "input")]
+        inputs: Vec<String>,
         /// `--secret NAME=@PATH` (repeatable).
         #[arg(long = "secret")]
         secrets: Vec<String>,
@@ -390,6 +393,7 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
         Command::Cred { .. } => unreachable!("cred handled above"),
         Command::Run {
             template,
+            inputs,
             secrets,
             env,
             allow,
@@ -402,6 +406,7 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
         } => {
             let args = RunArgs {
                 template,
+                inputs,
                 secrets,
                 env,
                 allow,

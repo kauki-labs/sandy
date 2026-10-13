@@ -60,6 +60,19 @@
               "x-systemd.device-timeout=2s"
             ];
           };
+          # sandy copies each `--input HOST:NAME` into a share tagged `sandy-inputs`
+          # (sandy's INPUT_MOUNT_TAG) and mounts it read-only here, so the job reads
+          # an input at /run/sandy/inputs/NAME. `nofail` so a run with no inputs (no
+          # such share attached) still boots.
+          fileSystems."/run/sandy/inputs" = {
+            device = "sandy-inputs";
+            fsType = "virtiofs";
+            options = [
+              "ro"
+              "nofail"
+              "x-systemd.device-timeout=2s"
+            ];
+          };
           # The store is an erofs block device, so nothing else pulls in the
           # virtiofs driver; the secret share needs it. Load it in stage 2 (the
           # mount is not in the initrd).

@@ -18,6 +18,19 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+/// A read-only input exposed to the guest under `/run/sandy/inputs/<name>`.
+///
+/// The host path (a file or a directory) is staged into the inputs share; the
+/// guest mounts that share read-only, so a write to the input fails with
+/// `EROFS`. Inputs are plain data, not a secret channel (INV-1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Input {
+    /// Host path to expose (a file or a directory tree).
+    pub host: PathBuf,
+    /// The name the input appears under at `/run/sandy/inputs/<name>` in-guest.
+    pub name: String,
+}
+
 /// Where a secret's bytes come from. Secrets travel this channel only — never
 /// argv, env, mounts, or the Nix store (INV-1).
 #[derive(Debug)]
@@ -55,6 +68,8 @@ pub struct RunSpec<'a> {
     pub template: &'a str,
     /// The guest command and its arguments.
     pub command: &'a [String],
+    /// Read-only inputs staged into the guest at `/run/sandy/inputs/<name>`.
+    pub inputs: &'a [Input],
     /// Secrets to inject over the secret channel.
     pub secrets: &'a [SecretRef],
     /// Extra environment variables (never secrets — INV-1).
@@ -285,6 +300,7 @@ mod tests {
         let spec = RunSpec {
             template: "demo",
             command: &command,
+            inputs: &[],
             secrets: &secrets,
             env: &env,
             cpu: None,

@@ -512,6 +512,7 @@ mod tests {
         JobPlan {
             template: "demo".to_string(),
             command: vec![],
+            inputs: vec![],
             secrets: vec![],
             env: vec![],
             allow: AllowList::default(),
@@ -535,6 +536,7 @@ mod tests {
         JobPlan {
             template: "demo".to_string(),
             command: vec![],
+            inputs: vec![],
             secrets: vec![SecretRef {
                 name: "TOK".to_string(),
                 source: SecretSource::File(std::path::PathBuf::from("/run/leak-token")),
