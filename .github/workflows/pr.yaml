@@ -87,31 +87,11 @@ jobs:
         run: nix build -L .#checks.x86_64-linux.shear
       - name: Build and docs
         run: nix build -L .#checks.x86_64-linux.sandy .#checks.x86_64-linux.doc .#checks.x86_64-linux.pre-commit
-  tests:
-    name: Test
-    needs: checks
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Harden Runner
-        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
-        with:
-          # Installing Nix (multi-user daemon) needs sudo, so sudo stays enabled here.
-          egress-policy: audit
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Install Nix
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
-        with:
-          extra_nix_config: |
-            experimental-features = nix-command flakes
-      - name: Test
-        run: nix build -L .#checks.x86_64-linux.test
   coverage:
-    name: Coverage
+    # One test run, instrumented: cargo-llvm-cov runs the whole CI suite and emits
+    # the lcov report, so a separate plain `cargo nextest` job would just run the
+    # same tests again. This job is the test gate.
+    name: Test (with cov)
     needs: checks
     runs-on: ubuntu-latest
     permissions:
@@ -189,7 +169,6 @@ jobs:
       - validate-pr-title
       - label
       - checks
-      - tests
       - coverage
       - package
     runs-on: ubuntu-latest
