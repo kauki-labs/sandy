@@ -51,6 +51,7 @@ fn booting_plan() -> JobPlan {
             agent: false,
             shares: false,
         },
+        secret_dir: None,
     }
 }
 
@@ -74,6 +75,7 @@ fn leaking_plan() -> JobPlan {
             agent: false,
             shares: false,
         },
+        secret_dir: None,
     }
 }
 
@@ -600,7 +602,7 @@ fn credential_is_minted_run_revoked_and_cleaned() -> anyhow::Result<()> {
         "the credential must be revoked exactly once at teardown"
     );
     assert!(
-        !cred_dir.join("GH_TOKEN.token").exists(),
+        !cred_dir.join("GH_TOKEN").exists(),
         "the minted token file must be removed after the run (INV-1)"
     );
     Ok(())

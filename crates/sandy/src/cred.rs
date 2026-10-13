@@ -524,10 +524,13 @@ pub fn read_secret_0600(path: &Path) -> Result<Vec<u8>, CredError> {
     fs::read(path).map_err(|e| stage_err("read secret", path, &e))
 }
 
-/// Write `bytes` to a `0600` file `<secret_name>.token` under `out_dir`, returning
-/// its path. See [`write_secret_0600`] for the atomicity contract.
+/// Write `bytes` to a `0600` file named exactly `<secret_name>` under `out_dir`,
+/// returning its path. The file name IS the secret's env name, matching how the
+/// guest's secret share names it, so `out_dir` can be shared into the guest
+/// directly (the refresh seam, #49) without a rename. See [`write_secret_0600`]
+/// for the atomicity contract.
 fn stage_token(out_dir: &Path, secret_name: &str, bytes: &[u8]) -> Result<PathBuf, CredError> {
-    let dest = out_dir.join(format!("{secret_name}.token"));
+    let dest = out_dir.join(secret_name);
     write_secret_0600(&dest, bytes)?;
     Ok(dest)
 }

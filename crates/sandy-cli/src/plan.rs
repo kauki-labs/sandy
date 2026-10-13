@@ -74,6 +74,11 @@ pub struct JobPlan {
     pub timeout_secs: u32,
     /// The trust tokens the run is granted.
     pub grants: Grants,
+    /// `Some(dir)` makes the backend stage secrets into, and share the guest
+    /// secret mount from, this caller-owned directory (see [`RunSpec::secret_dir`]).
+    /// Set by the credential bracket for refresh re-delivery (#49); `None` for an
+    /// ordinary run. Not a CLI option, the supervisor fills it.
+    pub secret_dir: Option<PathBuf>,
 }
 
 impl JobPlan {
@@ -92,6 +97,7 @@ impl JobPlan {
             grants: &self.grants,
             // Foreground local run uses fd3 for the outcome, not a file (D2/ssh only).
             outcome_file: None,
+            secret_dir: self.secret_dir.as_deref(),
         }
     }
 }
@@ -138,6 +144,7 @@ pub fn parse_run(args: RunArgs) -> Result<JobPlan, PlanError> {
             agent: false,
             shares: false,
         },
+        secret_dir: None,
     })
 }
 
