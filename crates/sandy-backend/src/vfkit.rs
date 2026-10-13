@@ -22,8 +22,8 @@ use std::{
 };
 
 use sandy::{
-    BackendError, BoxState, Hypervisor, Markers, Outcome, PtyTransport, RunSpec, SECRET_MOUNT_TAG, StoreBacking,
-    Topology, VmBackend, run_console, stage_secrets, topology, wipe,
+    BackendError, BoxState, Hypervisor, INPUT_MOUNT_TAG, Markers, Outcome, PtyTransport, RunSpec, SECRET_MOUNT_TAG,
+    StoreBacking, Topology, VmBackend, run_console, stage_inputs, stage_secrets, topology, wipe,
 };
 use uuid::Uuid;
 
@@ -46,13 +46,19 @@ pub struct StagedArgs {
     /// (`sharedDir=<inst_dir>,mountTag=…,ro`). The secret channel is a read-only
     /// share of the staging dir, never argv bytes (INV-1).
     pub secret_shares: Vec<String>,
+    /// virtio-fs share descriptor(s) for the read-only staged-inputs directory
+    /// (`sharedDir=<inputs_dir>,mountTag=sandy-inputs,ro`).
+    pub input_shares: Vec<String>,
 }
 
 impl StagedArgs {
-    /// A [`StagedArgs`] carrying the given secret share descriptors.
+    /// A [`StagedArgs`] carrying the given secret and input share descriptors.
     #[must_use]
-    pub fn new(secret_shares: Vec<String>) -> Self {
-        Self { secret_shares }
+    pub fn new(secret_shares: Vec<String>, input_shares: Vec<String>) -> Self {
+        Self {
+            secret_shares,
+            input_shares,
+        }
     }
 }
 
@@ -74,8 +80,8 @@ impl StagedArgs {
 ///   virtio-fs,sharedDir=/nix/store,mountTag=<tag>` (the guest mounts it read-only via the `ro-store` tag).
 /// - `--device virtio-serial,stdio` — the guest `hvc0` console. `stdio` is backed by the PTY master the backend spawns
 ///   `vfkit` under (#33), which is why a real TTY is required.
-/// - one `--device virtio-fs,<descriptor>` per entry in [`StagedArgs::secret_shares`] — the staged-secret share. Each
-///   `--device` and its descriptor are separate argv tokens.
+/// - one `--device virtio-fs,<descriptor>` per entry in [`StagedArgs::input_shares`] (read-only inputs) and
+///   [`StagedArgs::secret_shares`] (the secret share). Each `--device` and its descriptor are separate argv tokens.
 /// - `--device virtio-vsock,…` when [`Topology::vsock_cid`] is `Some` (absent in the aarch64 fixture).
 ///
 /// # Errors
@@ -125,10 +131,10 @@ pub fn vfkit_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> R
     args.push("--device".to_string());
     args.push("virtio-serial,stdio".to_string());
 
-    // The staged-secret share, an already-assembled virtio-fs descriptor.
+    // The read-only inputs shares then the staged-secret share, each an already-assembled virtio-fs descriptor.
     // vfkit's virtio-fs device rejects a `ro` option ("unknown option for virtio-fs devices: ro") — unlike the
-    // erofs store's virtio-blk `readonly` — so drop a trailing `,ro`; the guest mounts the share read-only.
-    for descriptor in &staged.secret_shares {
+    // erofs store's virtio-blk `readonly` — so drop a trailing `,ro`; the guest mounts these shares read-only.
+    for descriptor in staged.input_shares.iter().chain(&staged.secret_shares) {
         let descriptor = descriptor.strip_suffix(",ro").unwrap_or(descriptor);
         args.push("--device".to_string());
         args.push(format!("virtio-fs,{descriptor}"));
@@ -203,7 +209,19 @@ impl VfkitBackend {
             )]
         };
 
-        let staged = StagedArgs::new(secret_shares);
+        // Inputs are copied into their own per-run dir (kept out of the secret share,
+        // so they never appear under /run/sandy/secrets) and shared read-only.
+        let inputs_dir = std::env::temp_dir().join("sandy").join(format!("{box_id}-inputs"));
+        let input_shares = if stage_inputs(spec.inputs, &inputs_dir)? > 0 {
+            vec![format!(
+                "sharedDir={},mountTag={INPUT_MOUNT_TAG},ro",
+                inputs_dir.display()
+            )]
+        } else {
+            Vec::new()
+        };
+
+        let staged = StagedArgs::new(secret_shares, input_shares);
         let args = vfkit_args(topology, spec, &staged)?;
 
         let mut transport = PtyTransport::open()?;
@@ -248,8 +266,12 @@ impl VmBackend for VfkitBackend {
         let outcome = self.boot(&topology, spec, run_id, &box_id, &inst_dir);
 
         // Wipe staging on every path so secret bytes never outlive the run (INV-1).
-        if let Err(err) = wipe(&inst_dir) {
-            tracing::warn!(dir = %inst_dir.display(), %err, "failed to wipe staging on teardown");
+        // The inputs dir (a sibling of inst_dir, same derivation as in `boot`) too.
+        let inputs_dir = std::env::temp_dir().join("sandy").join(format!("{box_id}-inputs"));
+        for dir in [&inst_dir, &inputs_dir] {
+            if let Err(err) = wipe(dir) {
+                tracing::warn!(dir = %dir.display(), %err, "failed to wipe staging on teardown");
+            }
         }
         outcome
     }
@@ -310,6 +332,7 @@ mod tests {
         let spec = RunSpec {
             template: "demo",
             command: &command,
+            inputs: &[],
             secrets: &[],
             env: &[],
             cpu: None,
@@ -366,6 +389,7 @@ mod tests {
         let spec = RunSpec {
             template: "demo",
             command: &command,
+            inputs: &[],
             secrets: &secrets,
             env: &[],
             cpu: None,
@@ -377,9 +401,10 @@ mod tests {
         };
         // The argv-safe staged descriptor: the secret bytes are already on disk
         // in a 0600 file; only the share path and tag reach argv (INV-1).
-        let staged = StagedArgs::new(vec![
-            "sharedDir=/run/sandy/inst-0,mountTag=sandy-secrets,ro".to_string(),
-        ]);
+        let staged = StagedArgs::new(
+            vec!["sharedDir=/run/sandy/inst-0,mountTag=sandy-secrets,ro".to_string()],
+            vec![],
+        );
 
         let args = vfkit_args(&topology, &spec, &staged).context("assemble vfkit argv")?;
         let joined = args.join(" ");
@@ -407,6 +432,7 @@ mod tests {
         let spec = RunSpec {
             template: "demo",
             command: &command,
+            inputs: &[],
             secrets: &[],
             env: &[],
             cpu: None,
@@ -438,6 +464,7 @@ mod tests {
         let spec = RunSpec {
             template: "demo",
             command: &command,
+            inputs: &[],
             secrets: &[],
             env: &[],
             cpu: None,
@@ -476,6 +503,7 @@ mod tests {
         let spec = RunSpec {
             template: "demo",
             command: &command,
+            inputs: &[],
             secrets: &[],
             env: &[],
             cpu: None,

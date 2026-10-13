@@ -124,6 +124,7 @@ fn a_refreshed_token_reaches_the_running_guest() -> anyhow::Result<()> {
     let plan = JobPlan {
         template: format!("{}#{}", guest_flake().display(), target.topology_attr),
         command: vec![probe.to_string()],
+        inputs: vec![],
         secrets: vec![],
         env: vec![],
         allow: AllowList::default(),
