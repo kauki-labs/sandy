@@ -203,6 +203,40 @@ fn run_guest_failure_is_band_one_not_retryable() -> anyhow::Result<()> {
 }
 
 #[test]
+fn run_timeout_is_band_one_not_retryable() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    // A booted guest that hit its wall-clock timeout: no exit code, `timed_out`.
+    let timed_out = Outcome {
+        booted: true,
+        guest_exit: None,
+        transport_error: None,
+        timed_out: true,
+        console: String::new(),
+    };
+    let backend = FakeBackend::new().with_outcome(timed_out);
+
+    let report = run_job(
+        &backend,
+        &journal,
+        &booting_plan(),
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        None,
+    )
+    .context("run_job (timeout)")?;
+
+    // A timeout is a task/contract fault (band 1), never retryable by the platform.
+    assert_eq!(report.envelope.status, Status::Failed);
+    assert_eq!(report.process_exit.code(), 1, "timeout is band 1, not an infra fault");
+    assert!(!report.envelope.retryable, "a timeout must not be retryable");
+    assert_eq!(
+        report.envelope.exit_code, None,
+        "a timed-out guest produced no exit code"
+    );
+    Ok(())
+}
+
+#[test]
 fn run_infra_fault_is_band_three_and_retryable() -> anyhow::Result<()> {
     let (_tmp, journal) = fresh_journal()?;
     let backend = FakeBackend::new().with_error(BackendError::Spawn("no hypervisor".to_string()));
