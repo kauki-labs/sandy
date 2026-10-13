@@ -149,6 +149,7 @@
               clippy
               doc
               test
+              shear
               ;
           };
 
