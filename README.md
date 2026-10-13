@@ -1,20 +1,58 @@
 # sandy
 
+[![PR](https://github.com/kauki-labs/sandy/actions/workflows/pr.yaml/badge.svg)](https://github.com/kauki-labs/sandy/actions/workflows/pr.yaml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust edition 2024](https://img.shields.io/badge/rust-edition%202024-orange.svg)](rust-toolchain.toml)
+
 sandy runs a job in an ephemeral NixOS microVM and reports a locked result
 envelope. It owns the hypervisor launch natively — qemu on Linux, vfkit on
-macOS — behind one `VmBackend` seam.
+macOS — behind one `VmBackend` seam, delivers inputs/outputs/secrets and a scoped
+forge credential over virtio-fs shares, and enforces an egress allow-list around
+the boot.
 
 The Nix build is self-contained (crane directly, no external Nix library); the
 tooling is modelled on [`hoprnet/hopr-api`](https://github.com/hoprnet/hopr-api).
 
 ## Status
 
-Early development, Phase A. The CLI (`doctor`, `run`/`ls`/`status`/`wait`/`kill`/
-`gc`), the journal + result envelope, the native backends, and the guest microVMs
-are in place; the guests boot and speak the console protocol on both legs (qemu on
-x86_64 Linux, vfkit on an Apple-silicon host). Wiring the native spawn into a live
-`sandy run`, plus the `live_boot`/`host_matrix` acceptance gates, is in progress
-(#26/#27).
+A job boots a real microVM and runs end to end on both backends (qemu/KVM and
+vfkit): `sandy run` mints and injects a scoped credential, mounts read-only inputs
+and a read-only secret share, collects writable outputs to the host, and classifies
+the outcome into the locked result envelope. Verified by host-gated live tests on
+Linux/KVM and Apple-silicon hosts. The architecture is specified in
+[`docs/architecture/`](docs/architecture/overview.md).
+
+## Usage
+
+```sh
+sandy doctor                       # verify host prerequisites
+sandy run <template> [flags] -- <cmd...>
+```
+
+`<template>` is a guest flake attr (e.g. `topologies.aarch64-linux.vfkit`). The
+job command runs inside the guest; its exit code and the guest console come back in
+the result envelope. Flags (repeatable where it makes sense):
+
+| Flag                                       | Effect                                                                                                           |
+| ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------- |
+| `--input HOST:NAME`                        | mount the host file/dir read-only at `/run/sandy/inputs/NAME` (write → `EROFS`)                                  |
+| `--out DEST` / `--out NAME:DEST`           | collect everything under `/run/sandy/outputs` (or just `/run/sandy/outputs/NAME`) to the host `DEST` at teardown |
+| `--secret NAME=@PATH`                      | inject the file's bytes as `$NAME` in-guest (never on argv/env)                                                  |
+| `--credential <name>`                      | mint a scoped token from a `sandy cred github` trust root, inject it as `$GITHUB_TOKEN`, revoke at teardown      |
+| `--allow HOST:PORT`                        | egress allow-list entry (enforced on Linux; macOS is unfiltered)                                                 |
+| `--cpu N` / `--mem MiB` / `--timeout SECS` | resource knobs                                                                                                   |
+| `-o plain` (default) / `-o json`           | human summary, or the full structured envelope for agents                                                        |
+
+Credential trust roots are managed with
+`sandy cred github register | import | verify | deregister` (see
+[`docs/providers/github`](docs/providers/github/README.md)).
+
+```sh
+# read an input, write a collected output, with a scoped GitHub token
+sandy run topologies.aarch64-linux.vfkit \
+  --input ./data:data --out result:./out --credential sandy-runner \
+  -- sh -c 'process /run/sandy/inputs/data > /run/sandy/outputs/result/report'
+```
 
 ## Layout
 
