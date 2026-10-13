@@ -101,6 +101,10 @@ in
       # `cargo llvm-cov nextest` matches the `test` check's runner, so add nextest.
       nativeBuildInputs = [ pkgs.cargo-nextest ];
       cargoLlvmCovCommand = "nextest";
+      # cargo-llvm-cov writes the report during the build phase, before crane's
+      # install creates $out, so `--output-path $out/lcov.info` hits a missing
+      # dir. Create it first.
+      preBuild = "mkdir -p \"$out\"";
       cargoLlvmCovExtraArgs = "--workspace --lcov --output-path $out/lcov.info";
     }
   );
