@@ -8,8 +8,8 @@
 //! Grammar (each option may repeat):
 //! - `--input HOST:NAME` → a [`sandy::Input`]; the host file/dir `HOST` appears read-only at `/run/sandy/inputs/NAME`
 //!   in-guest.
-//! - `--out NAME:DEST` → a [`sandy::Output`]; the guest writes under `/run/sandy/outputs/NAME`, collected to the host
-//!   path `DEST` at teardown.
+//! - `--out DEST` → a catch-all [`sandy::Output`]; everything under `/run/sandy/outputs` is collected to the host path
+//!   `DEST` at teardown. `--out NAME:DEST` collects just `/run/sandy/outputs/NAME`.
 //! - `--secret NAME=@PATH` → a [`sandy::SecretRef`] whose bytes come from the host file `PATH`
 //!   ([`sandy::SecretSource::File`]). The leading `@` marks a file source and is required.
 //! - `--env KEY=VALUE` → a `(KEY, VALUE)` pair. Env is never a secret channel (INV-1).
@@ -42,7 +42,7 @@ pub struct RunArgs {
     pub template: String,
     /// `--input HOST:NAME` occurrences, verbatim.
     pub inputs: Vec<String>,
-    /// `--out NAME:DEST` occurrences, verbatim.
+    /// `--out DEST` / `--out NAME:DEST` occurrences, verbatim.
     pub outputs: Vec<String>,
     /// `--secret NAME=@PATH` occurrences, verbatim.
     pub secrets: Vec<String>,
@@ -190,20 +190,36 @@ fn parse_input(raw: &str) -> Result<Input, PlanError> {
     })
 }
 
-/// Parse one `--out NAME:DEST` token into an [`Output`]: the guest writes under
-/// `/run/sandy/outputs/NAME` and sandy collects that subtree to the host path
-/// `DEST` at teardown. Split on the first `:`, so `NAME` is a single path element
-/// and `DEST` is the (possibly colon-free) host path.
+/// Parse one `--out` token into an [`Output`]. Two forms:
+/// - `--out NAME:DEST` (named) — when the part before the first `:` is a single path element (non-empty, no `/`, not
+///   `.`/`..`) and `DEST` is non-empty: the guest writes under `/run/sandy/outputs/NAME`, collected to `DEST`.
+/// - `--out DEST` (catch-all) — anything else: the whole `/run/sandy/outputs` tree is collected to the host path
+///   `DEST`. A `DEST` that itself contains a `:` must be path-like (contain `/`, e.g. `./out:dir`) so it is not read as
+///   a name.
 fn parse_output(raw: &str) -> Result<Output, PlanError> {
-    let invalid = || PlanError::Invalid(format!("--out `{raw}` must be NAME:DEST"));
-    let (name, dest) = raw.split_once(':').ok_or_else(invalid)?;
-    if name.is_empty() || dest.is_empty() || name.contains('/') || name == "." || name == ".." {
+    let invalid = || PlanError::Invalid(format!("--out `{raw}` must be DEST or NAME:DEST"));
+    if raw.is_empty() {
         return Err(invalid());
     }
+    if let Some((name, dest)) = raw.split_once(':')
+        && is_single_component(name)
+        && !dest.is_empty()
+    {
+        return Ok(Output {
+            name: Some(name.to_string()),
+            dest: PathBuf::from(dest),
+        });
+    }
+    // Catch-all: the whole token is the destination.
     Ok(Output {
-        name: name.to_string(),
-        dest: PathBuf::from(dest),
+        name: None,
+        dest: PathBuf::from(raw),
     })
+}
+
+/// Whether `s` is a single safe path component: non-empty, no `/`, not `.`/`..`.
+fn is_single_component(s: &str) -> bool {
+    !s.is_empty() && s != "." && s != ".." && !s.contains('/')
 }
 
 /// Parse one `--secret NAME=@PATH` token into a file-sourced [`SecretRef`].
@@ -353,36 +369,52 @@ mod tests {
         }
     }
 
-    /// `--out NAME:DEST` desugars to an [`Output`] with the name and host dest.
+    /// `--out NAME:DEST` desugars to a named [`Output`]; `--out DEST` (no name) to
+    /// a catch-all (`name = None`).
     #[test]
-    fn output_name_dest_parses() -> anyhow::Result<()> {
-        let args = RunArgs {
-            template: "demo".to_string(),
-            outputs: vec!["result:/host/out".to_string()],
-            ..RunArgs::default()
-        };
-        let plan = parse_run(args).map_err(|e| anyhow::anyhow!("parse_run: {e}"))?;
-        let output = plan.outputs.first().expect("one output parsed");
-        assert_eq!(output.name, "result");
-        assert_eq!(output.dest.to_string_lossy(), "/host/out");
-        Ok(())
-    }
-
-    /// Adversarial: an `--out` with no `:`, an empty side, or a name that is not
-    /// a single path component is rejected as an invalid plan (band 2).
-    #[test]
-    fn malformed_output_is_invalid_plan() {
-        for raw in ["no-colon", "name:", ":/dest", "a/b:/dest", "..:/dest", ".:/dest"] {
+    fn output_named_and_catch_all_parse() -> anyhow::Result<()> {
+        let parse_one = |raw: &str| -> anyhow::Result<sandy::Output> {
             let args = RunArgs {
                 template: "demo".to_string(),
                 outputs: vec![raw.to_string()],
                 ..RunArgs::default()
             };
-            assert!(
-                matches!(parse_run(args), Err(PlanError::Invalid(_))),
-                "a malformed --out {raw:?} must yield PlanError::Invalid"
-            );
-        }
+            let plan = parse_run(args).map_err(|e| anyhow::anyhow!("parse_run {raw:?}: {e}"))?;
+            Ok(plan.outputs.into_iter().next().expect("one output parsed"))
+        };
+
+        // Named: a simple name before the first colon.
+        let named = parse_one("result:/host/out")?;
+        assert_eq!(named.name.as_deref(), Some("result"));
+        assert_eq!(named.dest.to_string_lossy(), "/host/out");
+
+        // Catch-all: no colon.
+        let catch = parse_one("/host/out")?;
+        assert_eq!(catch.name, None);
+        assert_eq!(catch.dest.to_string_lossy(), "/host/out");
+
+        // Catch-all: a path-like dest with a colon (the left side has a `/`, so it
+        // is not a name).
+        let path_colon = parse_one("./out:dir")?;
+        assert_eq!(path_colon.name, None);
+        assert_eq!(path_colon.dest.to_string_lossy(), "./out:dir");
+
+        // A non-simple name before the colon falls back to catch-all, never named.
+        let not_a_name = parse_one("a/b:/dest")?;
+        assert_eq!(not_a_name.name, None);
+        assert_eq!(not_a_name.dest.to_string_lossy(), "a/b:/dest");
+        Ok(())
+    }
+
+    /// Adversarial: an empty `--out` is rejected as an invalid plan (band 2).
+    #[test]
+    fn empty_output_is_invalid_plan() {
+        let args = RunArgs {
+            template: "demo".to_string(),
+            outputs: vec![String::new()],
+            ..RunArgs::default()
+        };
+        assert!(matches!(parse_run(args), Err(PlanError::Invalid(_))));
     }
 
     /// `--env KEY=VALUE` desugars to a `(key, value)` pair.

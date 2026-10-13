@@ -39,7 +39,8 @@ enum Command {
         /// `--input HOST:NAME` read-only input at `/run/sandy/inputs/NAME` (repeatable).
         #[arg(long = "input")]
         inputs: Vec<String>,
-        /// `--out NAME:DEST` collect `/run/sandy/outputs/NAME` to host DEST at teardown (repeatable).
+        /// `--out DEST` collect everything under `/run/sandy/outputs` to host DEST, or `--out NAME:DEST` just
+        /// `/run/sandy/outputs/NAME`, at teardown (repeatable).
         #[arg(long = "out")]
         outputs: Vec<String>,
         /// `--secret NAME=@PATH` (repeatable).

@@ -1,11 +1,12 @@
 //! Output staging and collection: a writable share the guest writes into, copied
 //! to host destinations at teardown.
 //!
-//! [`prepare_outputs`] creates a `0700` dir with an empty `<name>` subdir per
-//! declared output; the backend shares it read-write at a fixed [`OUTPUT_MOUNT_TAG`]
-//! and the guest mounts it at `/run/sandy/outputs`, so the job writes under
-//! `/run/sandy/outputs/<name>`. [`collect_outputs`] copies each `<name>` subtree to
-//! its host [`Output::dest`] at teardown.
+//! [`prepare_outputs`] creates a `0700` dir (and a `<name>` subdir per *named*
+//! output); the backend shares it read-write at a fixed [`OUTPUT_MOUNT_TAG`] and
+//! the guest mounts it at `/run/sandy/outputs`, so the job writes under
+//! `/run/sandy/outputs` (catch-all) or `/run/sandy/outputs/<name>` (named).
+//! [`collect_outputs`] copies, per output, either the `<name>` subtree or the whole
+//! output dir (catch-all, `name = None`) to its host [`Output::dest`] at teardown.
 //!
 //! The output share is the one guest-writable, host-visible surface, so collection
 //! is adversarial-safe: it **skips symlinks** entirely (a job can drop
@@ -34,7 +35,8 @@ pub const OUTPUT_MOUNT_TAG: &str = "sandy-outputs";
 const MAX_OUTPUT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_OUTPUT_ENTRIES: u64 = 100_000;
 
-/// Create a `0700` outputs dir with an empty writable `<name>` subdir per output.
+/// Create a `0700` outputs dir, with an empty writable `<name>` subdir per *named*
+/// output (a catch-all needs no subdir; the guest writes the dir root).
 ///
 /// Returns the number of outputs prepared; `0` means the backend attaches no
 /// share (the guest mount is `nofail`, so a run with no outputs still boots).
@@ -51,9 +53,11 @@ pub fn prepare_outputs(outputs: &[Output], outputs_dir: &Path) -> Result<usize, 
     fs::set_permissions(outputs_dir, fs::Permissions::from_mode(0o700))
         .map_err(|e| err("tighten outputs dir to 0700", outputs_dir, &e))?;
     for output in outputs {
-        validate_output_name(&output.name)?;
-        let sub = outputs_dir.join(&output.name);
-        fs::create_dir_all(&sub).map_err(|e| err("create output subdir", &sub, &e))?;
+        if let Some(name) = &output.name {
+            validate_output_name(name)?;
+            let sub = outputs_dir.join(name);
+            fs::create_dir_all(&sub).map_err(|e| err("create output subdir", &sub, &e))?;
+        }
     }
     Ok(outputs.len())
 }
@@ -61,8 +65,8 @@ pub fn prepare_outputs(outputs: &[Output], outputs_dir: &Path) -> Result<usize, 
 /// Copy each output's `<name>` subtree from `outputs_dir` to its host destination.
 ///
 /// Best-effort per output (a failure is returned, not silently dropped); the
-/// caller runs this before wiping the share. Symlinks are copied as symlinks
-/// (never followed), and the run-wide byte/entry ceiling is enforced.
+/// caller runs this before wiping the share. Symlinks are skipped (never followed
+/// or recreated), and the run-wide byte/entry ceiling is enforced.
 ///
 /// # Errors
 ///
@@ -73,13 +77,18 @@ pub fn collect_outputs(outputs: &[Output], outputs_dir: &Path) -> Result<(), Bac
         entries: MAX_OUTPUT_ENTRIES,
     };
     for output in outputs {
-        let src = outputs_dir.join(&output.name);
+        // A named output collects its subtree; a catch-all (`name = None`) collects
+        // the whole output dir root.
+        let src = match &output.name {
+            Some(name) => outputs_dir.join(name),
+            None => outputs_dir.to_path_buf(),
+        };
         if !src.exists() {
             // The guest declared but never wrote the output: nothing to collect.
             continue;
         }
         copy_tree(&src, &output.dest, &mut budget)?;
-        tracing::debug!(name = %output.name, dest = %output.dest.display(), "collected output");
+        tracing::debug!(name = ?output.name, dest = %output.dest.display(), "collected output");
     }
     Ok(())
 }
@@ -185,7 +194,7 @@ mod tests {
         let outputs_dir = run.path().join("outputs");
         let dest = run.path().join("collected");
         let outputs = [Output {
-            name: "result".to_string(),
+            name: Some("result".to_string()),
             dest: dest.clone(),
         }];
 
@@ -215,7 +224,7 @@ mod tests {
         let secret = run.path().join("host-secret");
         fs::write(&secret, b"TOP-SECRET")?;
         let outputs = [Output {
-            name: "o".to_string(),
+            name: Some("o".to_string()),
             dest: dest.clone(),
         }];
         prepare_outputs(&outputs, &outputs_dir)?;
@@ -243,13 +252,39 @@ mod tests {
         Ok(())
     }
 
+    /// A catch-all output (`name = None`) collects everything the "guest" wrote
+    /// under the output dir root — named subdirs and loose files alike.
+    #[test]
+    fn catch_all_collects_the_whole_output_dir() -> anyhow::Result<()> {
+        let run = tempfile::TempDir::new()?;
+        let outputs_dir = run.path().join("outputs");
+        let dest = run.path().join("collected");
+        let outputs = [Output {
+            name: None,
+            dest: dest.clone(),
+        }];
+
+        let n = prepare_outputs(&outputs, &outputs_dir)?;
+        assert_eq!(n, 1);
+        // The "guest" writes loose into the share root (no declared name).
+        fs::write(outputs_dir.join("top"), b"root")?;
+        fs::create_dir(outputs_dir.join("d"))?;
+        fs::write(outputs_dir.join("d").join("nested"), b"deep")?;
+
+        collect_outputs(&outputs, &outputs_dir)?;
+
+        assert_eq!(fs::read(dest.join("top"))?, b"root");
+        assert_eq!(fs::read(dest.join("d").join("nested"))?, b"deep");
+        Ok(())
+    }
+
     /// Adversarial: an output name with a separator or `..` is rejected.
     #[test]
     fn rejects_a_name_that_escapes_the_share() {
         let run = tempfile::TempDir::new().expect("tempdir");
         for bad in ["../escape", "a/b", "..", "."] {
             let outputs = [Output {
-                name: bad.to_string(),
+                name: Some(bad.to_string()),
                 dest: run.path().join("d"),
             }];
             assert!(

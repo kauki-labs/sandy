@@ -33,14 +33,16 @@ pub struct Input {
 
 /// A writable output collected from the guest at teardown.
 ///
-/// The guest writes under `/run/sandy/outputs/<name>`; at teardown sandy copies
-/// that subtree to the host path [`dest`](Output::dest). The share is the one
-/// guest-writable, host-visible surface, so collection never follows a symlink
-/// out of the output root and is size/inode-capped (INV-1 on the way out).
+/// `name = Some(n)` collects the subtree `/run/sandy/outputs/<n>` to
+/// [`dest`](Output::dest); `name = None` is a catch-all that collects everything
+/// the guest wrote under `/run/sandy/outputs`. The share is the one guest-writable,
+/// host-visible surface, so collection never follows a symlink out of the output
+/// root and is size/entry-capped (INV-1 on the way out).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Output {
-    /// The name the guest writes under at `/run/sandy/outputs/<name>`.
-    pub name: String,
+    /// The named subtree under `/run/sandy/outputs/<name>`, or `None` for the
+    /// whole output dir (catch-all).
+    pub name: Option<String>,
     /// The host path the subtree is collected to at teardown.
     pub dest: PathBuf,
 }
