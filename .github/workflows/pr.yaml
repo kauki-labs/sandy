@@ -83,6 +83,8 @@ jobs:
         run: nix build -L .#checks.x86_64-linux.treefmt
       - name: Lint
         run: nix build -L .#checks.x86_64-linux.clippy
+      - name: Dependency hygiene
+        run: nix build -L .#checks.x86_64-linux.shear
       - name: Build and docs
         run: nix build -L .#checks.x86_64-linux.sandy .#checks.x86_64-linux.doc .#checks.x86_64-linux.pre-commit
   tests:

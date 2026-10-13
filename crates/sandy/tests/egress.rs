@@ -44,6 +44,36 @@ fn an_injection_host_is_dropped_not_interpolated() {
     );
 }
 
+/// The whole generated ruleset for a representative multi-destination allow-list,
+/// pinned as a snapshot. The `contains` tests above prove individual properties;
+/// this locks the complete nftables text so any change to the default-deny floor,
+/// chain structure, or rule shape (all security-relevant) surfaces in the diff for
+/// review rather than slipping through a partial assertion.
+#[test]
+fn the_ruleset_for_a_multi_destination_allow_list_is_stable() {
+    let allow = AllowList {
+        rules: vec![
+            EgressRule {
+                host: "github.com".to_string(),
+                port: 443,
+            },
+            EgressRule {
+                host: "objects.githubusercontent.com".to_string(),
+                port: 443,
+            },
+        ],
+    };
+    insta::assert_snapshot!(to_nftables(&allow), @r#"
+    table inet sandy_egress {
+    	chain output {
+    		type filter hook output priority filter; policy drop;
+    		ip daddr github.com tcp dport 443 accept comment "allow github.com:443"
+    		ip daddr objects.githubusercontent.com tcp dport 443 accept comment "allow objects.githubusercontent.com:443"
+    	}
+    }
+    "#);
+}
+
 /// The macOS statement names the trusted-only posture and claims no per-VM
 /// egress boundary rather than pretending to filter.
 #[test]

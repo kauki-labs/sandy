@@ -67,4 +67,20 @@ in
       partitionType = "count";
     }
   );
+
+  # Dependency hygiene gate: fail the build on any declared-but-unused workspace
+  # dependency. cargo-shear is a static manifest + source scan (no compile, no
+  # network), so it runs in the crane sandbox and exits non-zero on a finding.
+  # AGENTS.md already prescribes `cargo shear --fix` in the dev loop; this makes
+  # the same check a CI gate so an unused dep can't land. Reuses the shared
+  # cargoArtifacts dep layer that clippy/test already build.
+  shear = craneLib.mkCargoDerivation (
+    commonArgs
+    // {
+      inherit cargoArtifacts;
+      pnameSuffix = "-shear";
+      buildPhaseCargoCommand = "cargo shear";
+      nativeBuildInputs = [ pkgs.cargo-shear ];
+    }
+  );
 }
