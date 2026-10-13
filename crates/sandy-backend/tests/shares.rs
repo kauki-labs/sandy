@@ -14,7 +14,7 @@ use sandy::{
     Grants, INPUT_MOUNT_TAG, Input, OUTPUT_MOUNT_TAG, Output, RunSpec, SECRET_MOUNT_TAG, Topology, collect_outputs,
     parse_topology, prepare_outputs, stage_inputs,
 };
-use sandy_backend::{QemuStagedArgs, VfkitStagedArgs, qemu_args, vfkit_args};
+use sandy_backend::{QemuStagedArgs, ShareSpec, VfkitStagedArgs, qemu_args, vfkit_args, virtiofsd_args};
 
 const QEMU_FIXTURE: &[u8] = include_bytes!("fixtures/topology-x86_64.json");
 const VFKIT_FIXTURE: &[u8] = include_bytes!("fixtures/topology-aarch64.json");
@@ -60,25 +60,29 @@ fn share_arg<'a>(args: &'a [String], needle: &str) -> &'a str {
         .unwrap_or_else(|| panic!("no argv token contains {needle:?} in {args:?}"))
 }
 
-/// A share descriptor as the backend `run` builds it: read-only carries a trailing
-/// `,ro`, writable does not.
-// QEMU-VIRTIOFS SWAP POINT (#34 follow-up): the qemu share transport is being
-// converted from 9p (`-virtfs local,…,mount_tag=T[,readonly=on]`) to real virtiofs
-// (`virtiofsd` + `-device vhost-user-fs-pci,tag=T`), because the guest mounts
-// `fsType=virtiofs` and 9p tags never resolve on a real qemu boot. When that lands,
-// `StagedArgs` changes shape (per-share `{dir, tag, readonly}`), so this helper and
-// the three `qemu_*` tests below (the `mount_tag=` / `readonly=on` assertions) swap
-// to the vhost-user-fs form. The vfkit tests stay as-is. The guest mount config and
-// the live_inputs/live_outputs behaviour assertions do NOT change.
+/// A vfkit share descriptor as the backend `run` builds it: read-only carries a
+/// trailing `,ro`, writable does not. (vfkit still uses virtio-fs descriptor
+/// strings; only qemu converted to virtiofsd + [`ShareSpec`].)
 fn descriptor(dir: &std::path::Path, tag: &str, ro: bool) -> String {
     let base = format!("sharedDir={},mountTag={tag}", dir.display());
     if ro { format!("{base},ro") } else { base }
 }
 
+/// A qemu [`ShareSpec`] as the backend `run` builds it: the virtiofsd socket lives
+/// beside the shared dir, and `ro` drives the `--readonly` boundary.
+fn qshare(dir: &std::path::Path, tag: &str, ro: bool) -> ShareSpec {
+    ShareSpec {
+        host_dir: dir.to_path_buf(),
+        tag: tag.to_string(),
+        readonly: ro,
+        socket: dir.join(format!("vfsd-{tag}.sock")),
+    }
+}
+
 // ---- inputs -------------------------------------------------------------------
 
 /// I1 — qemu: a staged input is woven into the argv as a read-only virtio share
-/// (`mount_tag=sandy-inputs` + `readonly=on`). QEMU-VIRTIOFS swap point (see `descriptor`).
+/// (`mount_tag=sandy-inputs` + `readonly=on`).
 #[test]
 fn qemu_input_share_is_read_only() -> Result<()> {
     let tmp = tempfile::tempdir()?;
@@ -98,14 +102,24 @@ fn qemu_input_share_is_read_only() -> Result<()> {
         "input staged under its name"
     );
 
+    let share = qshare(&inputs_dir, INPUT_MOUNT_TAG, true);
     let staged = QemuStagedArgs {
-        input_share: Some(descriptor(&inputs_dir, INPUT_MOUNT_TAG, true)),
+        shares: vec![share.clone()],
         ..Default::default()
     };
     let args = qemu_args(&qemu_topo(), &spec(&["true".to_string()]), &staged).context("qemu_args")?;
 
-    let arg = share_arg(&args, &format!("mount_tag={INPUT_MOUNT_TAG}"));
-    assert!(arg.contains("readonly=on"), "qemu input share must be read-only: {arg}");
+    // The share is a virtio-fs device carrying the mount tag the guest keys on.
+    let arg = share_arg(&args, &format!("tag={INPUT_MOUNT_TAG}"));
+    assert!(
+        arg.contains("vhost-user-fs-pci"),
+        "qemu input share is a virtio-fs device: {arg}"
+    );
+    // Read-only is enforced at the virtiofsd boundary, not the argv (INV-1).
+    assert!(
+        virtiofsd_args(&share).iter().any(|a| a == "--readonly"),
+        "qemu input share must be read-only (virtiofsd --readonly)"
+    );
     Ok(())
 }
 
@@ -151,7 +165,7 @@ fn missing_host_input_fails_closed() {
 // ---- outputs ------------------------------------------------------------------
 
 /// O1 — qemu: a prepared output is woven in writable (`mount_tag=sandy-outputs`,
-/// no `readonly=on`), unlike the inputs/secret shares. QEMU-VIRTIOFS swap point (see `descriptor`).
+/// no `readonly=on`), unlike the inputs/secret shares.
 #[test]
 fn qemu_output_share_is_writable() -> Result<()> {
     let tmp = tempfile::tempdir()?;
@@ -164,16 +178,22 @@ fn qemu_output_share_is_writable() -> Result<()> {
         &outputs_dir,
     )?;
 
+    let share = qshare(&outputs_dir, OUTPUT_MOUNT_TAG, false);
     let staged = QemuStagedArgs {
-        output_share: Some(descriptor(&outputs_dir, OUTPUT_MOUNT_TAG, false)),
+        shares: vec![share.clone()],
         ..Default::default()
     };
     let args = qemu_args(&qemu_topo(), &spec(&["true".to_string()]), &staged).context("qemu_args")?;
 
-    let arg = share_arg(&args, &format!("mount_tag={OUTPUT_MOUNT_TAG}"));
+    let arg = share_arg(&args, &format!("tag={OUTPUT_MOUNT_TAG}"));
     assert!(
-        !arg.contains("readonly=on"),
-        "qemu output share must be writable: {arg}"
+        arg.contains("vhost-user-fs-pci"),
+        "qemu output share is a virtio-fs device: {arg}"
+    );
+    // Writable: no --readonly at the virtiofsd boundary, so the guest can write it.
+    assert!(
+        !virtiofsd_args(&share).iter().any(|a| a == "--readonly"),
+        "qemu output share must be writable (no virtiofsd --readonly)"
     );
     Ok(())
 }
@@ -281,7 +301,6 @@ fn output_symlink_escape_is_skipped() -> Result<()> {
 /// X1 — with an input, an output, and a secret all set, the qemu argv carries three
 /// distinct shares with the right tags, and only the outputs share is writable
 /// (inputs and secret are read-only; outputs never lands under the secret mount).
-/// QEMU-VIRTIOFS swap point (see `descriptor`).
 #[test]
 fn three_shares_only_outputs_writable() -> Result<()> {
     let tmp = tempfile::tempdir()?;
@@ -305,24 +324,32 @@ fn three_shares_only_outputs_writable() -> Result<()> {
         &outputs_dir,
     )?;
 
+    let shares = vec![
+        qshare(&inputs_dir, INPUT_MOUNT_TAG, true),
+        qshare(&outputs_dir, OUTPUT_MOUNT_TAG, false),
+        qshare(&secret_dir, SECRET_MOUNT_TAG, true),
+    ];
     let staged = QemuStagedArgs {
-        input_share: Some(descriptor(&inputs_dir, INPUT_MOUNT_TAG, true)),
-        output_share: Some(descriptor(&outputs_dir, OUTPUT_MOUNT_TAG, false)),
-        secret_share: Some(descriptor(&secret_dir, SECRET_MOUNT_TAG, true)),
+        shares: shares.clone(),
         ..Default::default()
     };
     let args = qemu_args(&qemu_topo(), &spec(&["true".to_string()]), &staged).context("qemu_args")?;
 
-    for (tag, writable) in [
-        (INPUT_MOUNT_TAG, false),
-        (OUTPUT_MOUNT_TAG, true),
-        (SECRET_MOUNT_TAG, false),
-    ] {
-        let arg = share_arg(&args, &format!("mount_tag={tag}"));
+    for share in &shares {
+        // Each share is wired as a virtio-fs device keyed on its tag...
+        let arg = share_arg(&args, &format!("tag={}", share.tag));
+        assert!(
+            arg.contains("vhost-user-fs-pci"),
+            "share {} is a virtio-fs device: {arg}",
+            share.tag
+        );
+        // ...and only outputs are writable (no --readonly); inputs/secret are RO.
+        let writable = !share.readonly;
         assert_eq!(
-            !arg.contains("readonly=on"),
+            !virtiofsd_args(share).iter().any(|a| a == "--readonly"),
             writable,
-            "share {tag} writable={writable}, got arg {arg}"
+            "share {} writable={writable}",
+            share.tag
         );
     }
     Ok(())

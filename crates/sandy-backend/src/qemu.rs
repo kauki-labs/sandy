@@ -35,6 +35,10 @@ use uuid::Uuid;
 /// `-chardev socket,…` and drives it over the #33 [`PipeTransport`].
 const SERIAL_CHARDEV_ID: &str = "sandy-serial";
 
+/// The id of the shared memfd memory backend that virtio-fs shares map through.
+/// virtio-fs needs the guest RAM to be a shareable object (`share=on`).
+const VIRTIOFS_MEM_ID: &str = "sandy-mem";
+
 /// The boot-ready marker scanned for before the command is injected: the guest's
 /// login shell prints it once it is up and reading (the guest's `loginShellInit`),
 /// so the injected frame lands in a reading shell rather than the login handoff.
@@ -52,24 +56,34 @@ const GUEST_MAC: &str = "02:00:00:00:00:01";
 /// unset means the guest boots with no NIC (the default, isolated boot).
 const TAP_ENV: &str = "SANDY_TAP";
 
-/// The already-staged inputs [`qemu_args`] needs, kept out of the pure assembler
-/// so argv assembly does no IO and stays tier-1 testable.
-///
-/// `run` produces this from [`stage_secrets`](sandy::stage_secrets) before
-/// calling [`qemu_args`]: `secret_share` is the read-only share for the staged
-/// secrets directory, and `kvm` records whether `/dev/kvm` was usable (probed by
-/// `run`, so the assembler itself touches no host state).
+/// One guest filesystem share, served to qemu as virtiofs (a `virtiofsd` daemon
+/// plus a `vhost-user-fs-pci` device), so the guest mounts it with the same
+/// `fsType = "virtiofs"` it uses under vfkit. The guest matches it by [`tag`]; the
+/// host serves [`host_dir`] over [`socket`]; `readonly` is enforced at the virtiofsd
+/// boundary (not only the guest mount) so a guest-root remount cannot write back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareSpec {
+    /// The host directory shared into the guest.
+    pub host_dir: std::path::PathBuf,
+    /// The virtio-fs mount tag the guest keys its mount on (e.g. `sandy-secrets`).
+    pub tag: String,
+    /// Deny guest writes at the virtiofsd boundary (secrets, inputs); outputs are
+    /// writable.
+    pub readonly: bool,
+    /// The `virtiofsd` vhost-user socket `run` launches it on and qemu connects to.
+    pub socket: std::path::PathBuf,
+}
+
+/// The already-staged inputs [`qemu_args`] needs, kept out of the pure assembler so
+/// argv assembly does no IO and stays tier-1 testable. `run` produces it before
+/// calling [`qemu_args`]; the backend launches a virtiofsd per [`shares`](Self::shares)
+/// entry and `kvm` records whether `/dev/kvm` was usable (probed by `run`, so the
+/// assembler itself touches no host state).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct StagedArgs {
-    /// The read-only share spec for the staged-secrets directory, when the run
-    /// carries secrets.
-    pub secret_share: Option<String>,
-    /// The read-only share spec for the staged-inputs directory, when the run
-    /// carries inputs.
-    pub input_share: Option<String>,
-    /// The writable share spec for the outputs directory, when the run carries
-    /// outputs (no `,ro`, so the guest can write it).
-    pub output_share: Option<String>,
+    /// The guest filesystem shares (secrets, inputs, outputs), each served as
+    /// virtiofs. Empty when the run carries none.
+    pub shares: Vec<ShareSpec>,
     /// Whether `/dev/kvm` is usable → emit `-enable-kvm -cpu host`.
     pub kvm: bool,
     /// The host tap the guest's NIC attaches to, when networking is requested.
@@ -137,6 +151,19 @@ pub fn qemu_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> Re
     args.push("-m".to_string());
     args.push(mem.to_string());
 
+    // virtio-fs requires the guest RAM to be a shareable memory object so virtiofsd
+    // and the guest can map the same pages. Back the single NUMA node with a memfd
+    // object (`share=on`) whenever the run carries any share; without a share this is
+    // omitted and the plain `-m` stands.
+    if !staged.shares.is_empty() {
+        args.push("-object".to_string());
+        args.push(format!(
+            "memory-backend-memfd,id={VIRTIOFS_MEM_ID},size={mem}M,share=on"
+        ));
+        args.push("-numa".to_string());
+        args.push(format!("node,memdev={VIRTIOFS_MEM_ID}"));
+    }
+
     // The read-only Nix store as a virtio-blk drive. Only an erofs image can be
     // expressed as a qemu drive; a virtiofs store carries only a tag (no host
     // path), so it cannot and is refused rather than emitting a broken drive.
@@ -169,15 +196,15 @@ pub fn qemu_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> Re
         args.push(format!("virtio-net-pci,netdev=net0,mac={GUEST_MAC}"));
     }
 
-    // The virtiofs/9p shares: read-only inputs, writable outputs, then the secret share.
-    if let Some(input_share) = &staged.input_share {
-        push_virtfs(&mut args, input_share)?;
-    }
-    if let Some(output_share) = &staged.output_share {
-        push_virtfs(&mut args, output_share)?;
-    }
-    if let Some(secret_share) = &staged.secret_share {
-        push_virtfs(&mut args, secret_share)?;
+    // The virtio-fs shares. Each is served by a `virtiofsd` the backend launches on
+    // `share.socket` (see [`QemuBackend::boot`]); here we only wire qemu to it: a
+    // client chardev on that socket plus the `vhost-user-fs-pci` device the guest
+    // matches by `tag`. readonly is enforced by virtiofsd, so it is not a qemu arg.
+    for (i, share) in staged.shares.iter().enumerate() {
+        args.push("-chardev".to_string());
+        args.push(format!("socket,id=vfs{i},path={}", share.socket.display()));
+        args.push("-device".to_string());
+        args.push(format!("vhost-user-fs-pci,chardev=vfs{i},tag={}", share.tag));
     }
 
     if let Some(cid) = topology.vsock_cid {
@@ -217,34 +244,76 @@ fn kernel_cmdline(cmdline: &str) -> String {
     }
 }
 
-/// Translate one secret share (`sharedDir=<host>,mountTag=<tag>[,ro]`) into a
-/// qemu `-virtfs local,…` pair, preserving the host path and tag.
+/// Kill and reap a set of child processes, best-effort (the virtiofsd daemons at
+/// teardown, or any already up when a later launch fails).
+fn kill_children(children: &mut Vec<std::process::Child>) {
+    for mut child in children.drain(..) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+/// Launch a `virtiofsd` serving `share.host_dir` on `share.socket`. Its stdio is
+/// discarded; a failure to come up surfaces as the socket never appearing (see
+/// [`wait_for_socket`]), which the caller turns into a boot fault.
+///
+/// `--sandbox=none` so an unprivileged sandy can launch it (the namespace sandbox
+/// needs `CAP_SYS_ADMIN`); the shared dir is already a sandy-owned staging dir.
+/// `--readonly` on a read-only share denies guest writes at the host boundary
+/// (INV-1), so a guest-root remount-rw still cannot write the host dir — the host
+/// rewrites that dir directly, not via virtiofsd, so refresh re-delivery (#49) is
+/// unaffected.
 ///
 /// # Errors
+/// [`BackendError::Spawn`] if the `virtiofsd` process cannot be spawned.
+fn spawn_virtiofsd(share: &ShareSpec) -> Result<std::process::Child, BackendError> {
+    let bin = std::env::var("SANDY_VIRTIOFSD_BIN").unwrap_or_else(|_| "virtiofsd".to_string());
+    // Clear any stale socket so wait_for_socket can't observe a previous run's.
+    let _ = std::fs::remove_file(&share.socket);
+    Command::new(&bin)
+        .args(virtiofsd_args(share))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|err| BackendError::Spawn(format!("spawn virtiofsd `{bin}` for share {}: {err}", share.tag)))
+}
+
+/// The `virtiofsd` CLI args (after the binary) serving `share`: its socket, the
+/// shared dir, an unprivileged sandbox, and `--readonly` for a read-only share so
+/// guest writes are denied at the host boundary (INV-1), not only by the guest
+/// mount. Pure, so the read-only decision per share is unit-testable without
+/// launching the daemon.
+#[must_use]
+pub fn virtiofsd_args(share: &ShareSpec) -> Vec<String> {
+    let mut args = vec![
+        format!("--socket-path={}", share.socket.display()),
+        format!("--shared-dir={}", share.host_dir.display()),
+        "--sandbox=none".to_string(),
+    ];
+    if share.readonly {
+        args.push("--readonly".to_string());
+    }
+    args
+}
+
+/// Wait for `socket` to appear, bounded by `budget`: virtiofsd creates its socket
+/// asynchronously after launch, and qemu connects to it as a client. A socket still
+/// missing at the deadline means virtiofsd failed to start.
 ///
-/// Returns [`BackendError::Spawn`] if the share string lacks a `sharedDir=` or
-/// `mountTag=` field.
-fn push_virtfs(args: &mut Vec<String>, share: &str) -> Result<(), BackendError> {
-    let mut host = None;
-    let mut tag = None;
-    let mut readonly = false;
-    for field in share.split(',') {
-        if let Some(value) = field.strip_prefix("sharedDir=") {
-            host = Some(value);
-        } else if let Some(value) = field.strip_prefix("mountTag=") {
-            tag = Some(value);
-        } else if field == "ro" {
-            readonly = true;
+/// # Errors
+/// [`BackendError::Spawn`] when the socket does not appear within `budget`.
+fn wait_for_socket(socket: &Path, budget: Duration) -> Result<(), BackendError> {
+    let deadline = Instant::now() + budget;
+    while !socket.exists() {
+        if Instant::now() >= deadline {
+            return Err(BackendError::Spawn(format!(
+                "virtiofsd socket {} did not appear within {budget:?}",
+                socket.display()
+            )));
         }
+        std::thread::sleep(Duration::from_millis(50));
     }
-    let host = host.ok_or_else(|| BackendError::Spawn(format!("share missing sharedDir: {share}")))?;
-    let tag = tag.ok_or_else(|| BackendError::Spawn(format!("share missing mountTag: {share}")))?;
-    let mut spec = format!("local,path={host},mount_tag={tag},security_model=none");
-    if readonly {
-        spec.push_str(",readonly=on");
-    }
-    args.push("-virtfs".to_string());
-    args.push(spec);
     Ok(())
 }
 
@@ -282,10 +351,32 @@ impl QemuBackend {
     /// is a [`BackendError::Spawn`]; a connect/transport/timeout fault during the
     /// run lands in the returned [`Outcome`] (never a fabricated `guest_exit`,
     /// INV-OUTCOME).
-    fn boot(&self, spec: &RunSpec, args: &[String], run_id: Uuid, inst_dir: &Path) -> Result<Outcome, BackendError> {
+    fn boot(
+        &self,
+        spec: &RunSpec,
+        args: &[String],
+        shares: &[ShareSpec],
+        run_id: Uuid,
+        inst_dir: &Path,
+    ) -> Result<Outcome, BackendError> {
         std::fs::create_dir_all(inst_dir)
             .map_err(|err| BackendError::Spawn(format!("create instance dir {}: {err}", inst_dir.display())))?;
         let sock = inst_dir.join("serial.sock");
+
+        // Launch a virtiofsd per share and wait for its socket before qemu starts:
+        // qemu connects to each as a client chardev, so the socket must exist first.
+        // A launch or socket fault kills any daemon already up and fails the boot.
+        let mut virtiofsds: Vec<std::process::Child> = Vec::with_capacity(shares.len());
+        for share in shares {
+            let launched = spawn_virtiofsd(share).and_then(|child| {
+                virtiofsds.push(child);
+                wait_for_socket(&share.socket, Duration::from_secs(5))
+            });
+            if let Err(err) = launched {
+                kill_children(&mut virtiofsds);
+                return Err(err);
+            }
+        }
 
         // qemu_args emits `-serial chardev:<id>`; bind that id to a Unix-socket
         // chardev qemu creates (server=on, wait=off so the spawn doesn't block).
@@ -297,13 +388,19 @@ impl QemuBackend {
         ));
 
         tracing::debug!(?argv, run_id = %run_id, "spawning qemu");
-        let mut child = Command::new(&argv[0])
+        let spawned = Command::new(&argv[0])
             .args(&argv[1..])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|err| BackendError::Spawn(format!("spawn qemu `{}`: {err}", argv[0])))?;
+            .spawn();
+        let mut child = match spawned {
+            Ok(child) => child,
+            Err(err) => {
+                kill_children(&mut virtiofsds);
+                return Err(BackendError::Spawn(format!("spawn qemu `{}`: {err}", argv[0])));
+            }
+        };
 
         // Drain qemu's stderr on a thread. An un-read `piped` stderr deadlocks the
         // boot: once qemu writes past the pipe buffer it blocks, never opens the
@@ -322,10 +419,11 @@ impl QemuBackend {
 
         let mut outcome = drive_console(spec, run_id, &sock);
 
-        // Teardown: stop qemu and deregister. Best-effort kill — the child may
-        // already have exited (e.g. a guest `poweroff`).
+        // Teardown: stop qemu, then the virtiofsd daemons, and deregister. Best-effort
+        // kills — qemu may already have exited (e.g. a guest `poweroff`).
         let _ = child.kill();
         let _ = child.wait();
+        kill_children(&mut virtiofsds);
         self.registry()?.retain(|state| state.box_id != box_id);
 
         // When the guest never booted (e.g. qemu exited before opening the serial),
@@ -422,30 +520,50 @@ impl VmBackend for QemuBackend {
         let run_id = Uuid::new_v4();
         let inst_dir = std::env::temp_dir().join("sandy").join(run_id.to_string());
 
-        // With `secret_dir` (refresh re-delivery, #49) stage into and share the
-        // caller-owned dir so it can rewrite a staged secret mid-run; otherwise our
-        // own per-run inst_dir. The caller owns its dir's lifetime; we never wipe it.
-        let share_dir = spec.secret_dir.unwrap_or(&inst_dir);
-        let staged_secrets = stage_secrets(spec.secrets, share_dir)?;
+        // Build the virtio-fs shares. Each virtiofsd socket lives in inst_dir
+        // (sandy-owned, created in `boot`); the host dir is the caller's for secrets
+        // (refresh re-delivery, #49, stages into spec.secret_dir so it can rewrite
+        // mid-run), else a per-run dir. Secrets/inputs are read-only, outputs
+        // writable — enforced at the virtiofsd boundary.
+        let mut shares: Vec<ShareSpec> = Vec::new();
+
+        let secret_dir = spec.secret_dir.unwrap_or(&inst_dir);
+        let staged_secrets = stage_secrets(spec.secrets, secret_dir)?;
         // Attach the secret share when the run carries secrets or the caller provided
         // a pre-staged dir; the guest mounts `/run/sandy/secrets` with `nofail`, so a
         // run with no share still boots.
-        let secret_share = (!staged_secrets.is_empty() || spec.secret_dir.is_some())
-            .then(|| format!("sharedDir={},mountTag={SECRET_MOUNT_TAG},ro", share_dir.display()));
-        // Inputs are copied into their own per-run dir (not the secret share dir, so
-        // they never appear under /run/sandy/secrets) and shared read-only.
+        if !staged_secrets.is_empty() || spec.secret_dir.is_some() {
+            shares.push(ShareSpec {
+                host_dir: secret_dir.to_path_buf(),
+                tag: SECRET_MOUNT_TAG.to_string(),
+                readonly: true,
+                socket: inst_dir.join(format!("vfsd-{SECRET_MOUNT_TAG}.sock")),
+            });
+        }
+        // Inputs go in their own per-run dir (never under the secret share) read-only.
         let inputs_dir = std::env::temp_dir().join("sandy").join(format!("{run_id}-inputs"));
-        let input_share = (stage_inputs(spec.inputs, &inputs_dir)? > 0)
-            .then(|| format!("sharedDir={},mountTag={INPUT_MOUNT_TAG},ro", inputs_dir.display()));
-        // Outputs get their own per-run dir, shared writable (no `,ro`); the guest
-        // writes it and sandy collects it to the host destinations below.
+        if stage_inputs(spec.inputs, &inputs_dir)? > 0 {
+            shares.push(ShareSpec {
+                host_dir: inputs_dir.clone(),
+                tag: INPUT_MOUNT_TAG.to_string(),
+                readonly: true,
+                socket: inst_dir.join(format!("vfsd-{INPUT_MOUNT_TAG}.sock")),
+            });
+        }
+        // Outputs get their own per-run dir, writable; the guest writes it and sandy
+        // collects it to the host destinations below.
         let outputs_dir = std::env::temp_dir().join("sandy").join(format!("{run_id}-outputs"));
-        let output_share = (prepare_outputs(spec.outputs, &outputs_dir)? > 0)
-            .then(|| format!("sharedDir={},mountTag={OUTPUT_MOUNT_TAG}", outputs_dir.display()));
+        if prepare_outputs(spec.outputs, &outputs_dir)? > 0 {
+            shares.push(ShareSpec {
+                host_dir: outputs_dir.clone(),
+                tag: OUTPUT_MOUNT_TAG.to_string(),
+                readonly: false,
+                socket: inst_dir.join(format!("vfsd-{OUTPUT_MOUNT_TAG}.sock")),
+            });
+        }
+
         let staged = StagedArgs {
-            secret_share,
-            input_share,
-            output_share,
+            shares,
             kvm: kvm_available(),
             // A tap is opt-in via $SANDY_TAP: the operator (or the #29 live gate)
             // creates and firewalls the tap, then names it here so the guest's NIC
@@ -453,7 +571,8 @@ impl VmBackend for QemuBackend {
             tap: std::env::var(TAP_ENV).ok().filter(|t| !t.is_empty()),
         };
 
-        let outcome = qemu_args(&topology, spec, &staged).and_then(|args| self.boot(spec, &args, run_id, &inst_dir));
+        let outcome = qemu_args(&topology, spec, &staged)
+            .and_then(|args| self.boot(spec, &args, &staged.shares, run_id, &inst_dir));
 
         // Collect outputs before wiping, but only if the guest actually booted
         // (nothing was produced otherwise). A collection failure surfaces as an
@@ -574,9 +693,12 @@ mod tests {
     fn qemu_args_enables_kvm_and_threads_secret_share() -> anyhow::Result<()> {
         let topology = parse_topology(X86_64_FIXTURE).context("parse x86_64 fixture")?;
         let staged = StagedArgs {
-            secret_share: Some(format!("sharedDir=/tmp/inst,mountTag={SECRET_MOUNT_TAG},ro")),
-            input_share: None,
-            output_share: None,
+            shares: vec![ShareSpec {
+                host_dir: "/tmp/inst".into(),
+                tag: SECRET_MOUNT_TAG.to_string(),
+                readonly: true,
+                socket: "/tmp/inst/vfsd-secrets.sock".into(),
+            }],
             kvm: true,
             tap: None,
         };
