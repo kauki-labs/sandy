@@ -110,3 +110,34 @@ jobs:
             experimental-features = nix-command flakes
       - name: Test
         run: nix build -L .#checks.x86_64-linux.test
+  coverage:
+    name: Coverage
+    needs: checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          # Installing Nix (multi-user daemon) needs sudo, so sudo stays enabled here.
+          egress-policy: audit
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      # Line coverage over the CI-runnable suite (tier-1/2); the `live` tier-3 tests
+      # need a hypervisor and never run in CI, so they are excluded by design.
+      - name: Coverage
+        run: nix build -L .#checks.x86_64-linux.coverage
+      - name: Upload lcov report
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: coverage-lcov
+          path: result/lcov.info
+          if-no-files-found: error

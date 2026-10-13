@@ -7,6 +7,10 @@
   pkgs,
   lib,
   craneLib,
+  # A crane lib on the same pinned channel plus `llvm-tools-preview`, which
+  # `cargo llvm-cov` needs to find `llvm-profdata`/`llvm-cov` in the rustc sysroot.
+  # Used only for the `coverage` derivation; every other build keeps `craneLib`.
+  covCraneLib,
 }:
 let
   # cleanCargoSource keeps only Rust sources + manifests; the topology tests
@@ -81,6 +85,23 @@ in
       pnameSuffix = "-shear";
       buildPhaseCargoCommand = "cargo shear";
       nativeBuildInputs = [ pkgs.cargo-shear ];
+    }
+  );
+
+  # Line coverage over the CI-runnable suite (tier-1/2), via `cargo llvm-cov
+  # nextest`. Built with the coverage toolchain (llvm-tools-preview) and its own
+  # instrumented dep layer. Only the default features are measured: the `live`
+  # feature's tier-3 tests need a hypervisor + network and never run in CI, so
+  # measuring them would understate real coverage. Writes an `lcov.info` the CI
+  # job uploads; the per-crate summary prints in the build log.
+  coverage = covCraneLib.cargoLlvmCov (
+    commonArgs
+    // {
+      cargoArtifacts = covCraneLib.buildDepsOnly commonArgs;
+      # `cargo llvm-cov nextest` matches the `test` check's runner, so add nextest.
+      nativeBuildInputs = [ pkgs.cargo-nextest ];
+      cargoLlvmCovCommand = "nextest";
+      cargoLlvmCovExtraArgs = "--workspace --lcov --output-path $out/lcov.info";
     }
   );
 }
