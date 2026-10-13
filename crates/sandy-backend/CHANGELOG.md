@@ -1,0 +1,36 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.1.1](https://github.com/kauki-labs/sandy/releases/tag/sandy-backend-v0.1.1) - 2026-10-13
+
+### Added
+
+- *(run)* writable outputs (catch-all + named) collected from the guest ([#34](https://github.com/kauki-labs/sandy/pull/34)) ([#76](https://github.com/kauki-labs/sandy/pull/76))
+- *(run)* read-only inputs staged into the guest ([#34](https://github.com/kauki-labs/sandy/pull/34)) ([#74](https://github.com/kauki-labs/sandy/pull/74))
+- *(cred)* drive mid-run credential refresh into the live guest share (#49, part 2) ([#71](https://github.com/kauki-labs/sandy/pull/71))
+- *(cred)* guest-side secret consumption — $NAME in the job ([#50](https://github.com/kauki-labs/sandy/pull/50)) ([#66](https://github.com/kauki-labs/sandy/pull/66))
+- *(run)* capture the guest console into the result envelope ([#64](https://github.com/kauki-labs/sandy/pull/64))
+- *(egress)* guest-scoped forward nftables + phase_d live egress gate ([#47](https://github.com/kauki-labs/sandy/pull/47))
+- native boot + live acceptance gates (live_boot #26, host_matrix #27) ([#41](https://github.com/kauki-labs/sandy/pull/41))
+- native VmBackend implementations — VfkitBackend + QemuBackend (#32 #35) ([#39](https://github.com/kauki-labs/sandy/pull/39))
+- Phase A — the runner ([#6](https://github.com/kauki-labs/sandy/pull/6))
+- rust workspace skeleton ([#1](https://github.com/kauki-labs/sandy/pull/1))
+
+### Fixed
+
+- *(qemu)* serve guest shares as virtiofs, not 9p ([#79](https://github.com/kauki-labs/sandy/pull/79))
+- *(qemu)* drain qemu stderr so a chatty boot cannot deadlock ([#77](https://github.com/kauki-labs/sandy/pull/77))
+
+### Other
+
+- FOSS scaffolding and automated crates.io publishing ([#89](https://github.com/kauki-labs/sandy/pull/89))
+- two-level architecture spec with per-subsystem KPIs ([#86](https://github.com/kauki-labs/sandy/pull/86))
+- *(backend)* extract a GuestShareTransport trait (qemu virtiofsd + vfkit virtio-fs) ([#80](https://github.com/kauki-labs/sandy/pull/80))
+- *(shares)* mark the qemu assertions for the virtiofs transport swap ([#78](https://github.com/kauki-labs/sandy/pull/78))
+- *(run)* remove the obsolete --mount bind-mount path ([#68](https://github.com/kauki-labs/sandy/pull/68))
