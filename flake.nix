@@ -69,6 +69,25 @@
               covCraneLib
               ;
           };
+
+          # CLI end-to-end suite (tests/e2e), non-live subset: drive the built
+          # binary at the process boundary (argv, exit bands, `-o json` shape,
+          # error paths). The live boot tests (tests/e2e/live) need a hypervisor
+          # and skip off-matrix, so only the basic/ suite runs in the sandbox.
+          testsE2eCli =
+            pkgs.runCommand "sandy-tests-e2e-cli"
+              {
+                nativeBuildInputs = [
+                  pkgs.bats
+                  pkgs.jq
+                ];
+              }
+              ''
+                export SANDY_BIN=${sandyPackages.sandy}/bin/sandy
+                cp -r ${./tests/e2e} e2e && chmod -R +w e2e
+                bats e2e/basic/
+                touch "$out"
+              '';
         in
         {
           treefmt = {
@@ -157,6 +176,7 @@
               shear
               coverage
               ;
+            tests-e2e-cli = testsE2eCli;
           };
 
           # Built with covCraneLib so the toolchain on PATH carries
@@ -181,6 +201,9 @@
               pkgs.cargo-public-api
               pkgs.cargo-modules
               pkgs.jq
+              # CLI end-to-end suite (tests/e2e): bats drives the built binary,
+              # jq (above) asserts the `-o json` envelope shape.
+              pkgs.bats
               # code-quality skill tools not in nixpkgs (nix/quality.nix)
               qualityPackages.cargo-crap
               qualityPackages.cargo-iceberg4rust
