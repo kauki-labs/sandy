@@ -23,21 +23,53 @@ by fixed tag.
 guest mounted `virtiofs`, so the tag never resolved. Fixed to virtiofs on the
 qemu side; 9p is not used.
 
-## 2. Read-only at the host boundary
+## 2. Read-only shares, enforced per platform
 
 **Status:** accepted. **Upholds:** INV-1.
 
-**Context.** An input marked RO must stay unwritable even against a guest that
-remounts its own root read-write.
+**Context.** An input or secret share marked RO should stay unwritable to the
+guest, ideally even against a guest-root `mount -o remount,rw`.
 
 **Decision.** On qemu, `--readonly` is passed to `virtiofsd`, so the host dir is
-unwritable below the guest. On vfkit the guest mount's `ro` enforces it (its
-virtio-fs device rejects a `,ro` arg). A write to an input fails `EROFS`.
+unwritable below the guest at the host boundary. On vfkit there is no host-side
+option: its `virtio-fs` device takes only `sharedDir` and `mountTag` (verified
+against vfkit v0.6.3), so RO is enforced only by the guest's `ro` mount, which a
+guest-root remount can defeat. A write to a read-only input fails `EROFS` on both
+in the cooperative case.
 
-**Consequences.** RO is enforced at the host boundary, not merely by guest
-cooperation; proven live by K5 (`live_inputs.rs`).
+**Consequences.** RO enforcement is asymmetric: host-boundary on qemu,
+guest-cooperative on vfkit. This is accepted rather than closed, because each share
+is a single per-run, sandy-owned dir wiped at teardown — a guest that remounts rw
+can corrupt only its own run's staging, never escape the share (virtio-fs confines
+to `sharedDir`) or reach another run, and the VM is the trust boundary. K5
+(`live_inputs.rs`) proves host-boundary RO on qemu and guest-mount RO on vfkit.
 
-## 3. Inputs copied, outputs collected
+**Set aside (do not re-propose without new information).** Host-side RO on vfkit:
+unavailable in the vfkit CLI as of v0.6.3 (its virtio-fs device has no read-only
+option, though other vfkit devices do). Revisit if vfkit adds one.
+
+## 3. virtiofsd runs `--sandbox=none`
+
+**Status:** accepted.
+
+**Context.** `virtiofsd` offers `--sandbox=namespace` (the default) and
+`--sandbox=chroot` to confine the daemon itself, but both need privileges
+(user-namespace setup or `CAP_SYS_CHROOT`) that sandy's unprivileged launch does
+not hold.
+
+**Decision.** The qemu transport launches each `virtiofsd` with `--sandbox=none`,
+so the daemon has no namespace/chroot confinement of its own.
+
+**Consequences.** The daemon's own sandbox is not a containment layer; the VM
+boundary plus the fact that each daemon serves only one per-run, sandy-owned dir
+(wiped at teardown) bound the blast radius. Dropping `--sandbox=none` for a
+privileged mode would make the unprivileged launch fail, so it stays.
+
+**Set aside.** A privileged `namespace`/`chroot` sandbox: rejected — it would
+require sandy to run virtiofsd with elevated privileges, a larger attack surface
+than the confinement it buys given the VM boundary.
+
+## 4. Inputs copied, outputs collected
 
 **Status:** accepted.
 
@@ -52,7 +84,7 @@ in `envelope.outputs`. Collection **skips symlinks** and caps bytes/entries.
 bytes nor plants a host-escaping link. Copying inputs is fine for typical sizes;
 a no-copy / arbitrary-path variant is deferred (#82).
 
-## 4. Fixed tags, not pooled
+## 5. Fixed tags, not pooled
 
 **Status:** accepted.
 

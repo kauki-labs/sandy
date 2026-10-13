@@ -196,6 +196,16 @@ fn credential_flows_through_git_helper_and_refreshes_midrun() -> anyhow::Result<
     );
 
     // INV-1: no token value in the captured console (the probe compares in-guest).
+    // `logs.tail` is a bounded rolling buffer (the last ConsoleTail::CAP = 64 KiB),
+    // so a leak early in a long console could be evicted before this check. Assert
+    // the tail holds the complete console first (this short probe's output is far
+    // under the cap), so the no-leak check sees everything rather than passing by
+    // truncation.
+    assert!(
+        env.logs.tail.len() < 64 * 1024,
+        "console tail is at the 64 KiB cap, so the no-leak check may be incomplete; tail len {}",
+        env.logs.tail.len()
+    );
     assert!(
         !env.logs.tail.contains("live-e2e-tok-"),
         "a token value leaked into the console; tail: {}",
@@ -295,6 +305,13 @@ fn credential_secret_input_output_all_compose() -> anyhow::Result<()> {
         env.outputs.iter().any(|o| o.path == "result/out"),
         "the collected output must be recorded in the envelope; outputs: {:?}",
         env.outputs
+    );
+    // The leak check sees the complete console only while the tail is under its
+    // 64 KiB cap (ConsoleTail::CAP); assert that before trusting the no-leak scan.
+    assert!(
+        env.logs.tail.len() < 64 * 1024,
+        "console tail is at the 64 KiB cap, so the no-leak check may be incomplete; tail len {}",
+        env.logs.tail.len()
     );
     assert!(
         !env.logs.tail.contains("SECRET-VALUE") && !env.logs.tail.contains("e2e-everything-token"),
