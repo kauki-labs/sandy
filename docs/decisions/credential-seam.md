@@ -1,3 +1,10 @@
+---
+title: "Decisions: credential seam (CredentialProvider)"
+status: accepted
+project: sandy
+updated: 2026-10-14
+---
+
 # Decisions: credential seam (`CredentialProvider`)
 
 Minting a short-lived, least-privilege forge token for a job, delivering it

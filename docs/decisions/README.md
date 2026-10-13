@@ -1,3 +1,10 @@
+---
+title: sandy decision records
+kind: decisions-index
+project: sandy
+updated: 2026-10-14
+---
+
 # Decision records
 
 Why sandy is built the way it is, one file per subsystem category. Each record

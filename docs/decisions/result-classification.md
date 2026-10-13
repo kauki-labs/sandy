@@ -1,3 +1,10 @@
+---
+title: "Decisions: result envelope + classification"
+status: accepted
+project: sandy
+updated: 2026-10-14
+---
+
 # Decisions: result envelope + classification
 
 Turning a physical `Outcome` into the locked `ResultEnvelope` and a process exit

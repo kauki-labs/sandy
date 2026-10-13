@@ -1,3 +1,10 @@
+---
+title: "Decisions: secret channel"
+status: accepted
+project: sandy
+updated: 2026-10-14
+---
+
 # Decisions: secret channel
 
 Delivering a named secret to the job as `$NAME` without it touching argv, env, or

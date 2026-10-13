@@ -1,3 +1,10 @@
+---
+title: "Decisions: egress"
+status: accepted
+project: sandy
+updated: 2026-10-14
+---
+
 # Decisions: egress
 
 Bracketing the boot with an allow-list so the guest's network is filtered, never
