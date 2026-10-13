@@ -39,6 +39,9 @@ enum Command {
         /// `--input HOST:NAME` read-only input at `/run/sandy/inputs/NAME` (repeatable).
         #[arg(long = "input")]
         inputs: Vec<String>,
+        /// `--out NAME:DEST` collect `/run/sandy/outputs/NAME` to host DEST at teardown (repeatable).
+        #[arg(long = "out")]
+        outputs: Vec<String>,
         /// `--secret NAME=@PATH` (repeatable).
         #[arg(long = "secret")]
         secrets: Vec<String>,
@@ -394,6 +397,7 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
         Command::Run {
             template,
             inputs,
+            outputs,
             secrets,
             env,
             allow,
@@ -407,6 +411,7 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
             let args = RunArgs {
                 template,
                 inputs,
+                outputs,
                 secrets,
                 env,
                 allow,

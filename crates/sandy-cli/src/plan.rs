@@ -8,6 +8,8 @@
 //! Grammar (each option may repeat):
 //! - `--input HOST:NAME` → a [`sandy::Input`]; the host file/dir `HOST` appears read-only at `/run/sandy/inputs/NAME`
 //!   in-guest.
+//! - `--out NAME:DEST` → a [`sandy::Output`]; the guest writes under `/run/sandy/outputs/NAME`, collected to the host
+//!   path `DEST` at teardown.
 //! - `--secret NAME=@PATH` → a [`sandy::SecretRef`] whose bytes come from the host file `PATH`
 //!   ([`sandy::SecretSource::File`]). The leading `@` marks a file source and is required.
 //! - `--env KEY=VALUE` → a `(KEY, VALUE)` pair. Env is never a secret channel (INV-1).
@@ -24,7 +26,7 @@
 
 use std::path::PathBuf;
 
-use sandy::{AllowList, EgressRule, Grants, Input, PlanError, RunSpec, SecretRef, SecretSource};
+use sandy::{AllowList, EgressRule, Grants, Input, Output, PlanError, RunSpec, SecretRef, SecretSource};
 
 /// Default wall-clock timeout when `--timeout` is omitted (5 minutes). Picked as
 /// a sane bound for an interactive foreground `run`; override with `--timeout`.
@@ -40,6 +42,8 @@ pub struct RunArgs {
     pub template: String,
     /// `--input HOST:NAME` occurrences, verbatim.
     pub inputs: Vec<String>,
+    /// `--out NAME:DEST` occurrences, verbatim.
+    pub outputs: Vec<String>,
     /// `--secret NAME=@PATH` occurrences, verbatim.
     pub secrets: Vec<String>,
     /// `--env KEY=VALUE` occurrences, verbatim.
@@ -66,6 +70,8 @@ pub struct JobPlan {
     pub command: Vec<String>,
     /// Read-only inputs staged at `/run/sandy/inputs/<name>` in-guest.
     pub inputs: Vec<Input>,
+    /// Writable outputs collected from `/run/sandy/outputs/<name>` at teardown.
+    pub outputs: Vec<Output>,
     /// Secrets injected over the secret channel.
     pub secrets: Vec<SecretRef>,
     /// Extra environment variables (never secrets — INV-1).
@@ -96,6 +102,7 @@ impl JobPlan {
             template: &self.template,
             command: &self.command,
             inputs: &self.inputs,
+            outputs: &self.outputs,
             secrets: &self.secrets,
             env: &self.env,
             cpu: self.cpu,
@@ -114,7 +121,7 @@ impl JobPlan {
 ///
 /// # Errors
 ///
-/// Returns [`PlanError::Invalid`] for any malformed token (bad `--input`,
+/// Returns [`PlanError::Invalid`] for any malformed token (bad `--input`, `--out`,
 /// `--secret`, or `--env`), never a partial plan.
 pub fn parse_run(args: RunArgs) -> Result<JobPlan, PlanError> {
     // Each list is parsed in full before the plan is constructed, so a malformed
@@ -123,6 +130,11 @@ pub fn parse_run(args: RunArgs) -> Result<JobPlan, PlanError> {
         .inputs
         .iter()
         .map(|raw| parse_input(raw))
+        .collect::<Result<Vec<_>, _>>()?;
+    let outputs = args
+        .outputs
+        .iter()
+        .map(|raw| parse_output(raw))
         .collect::<Result<Vec<_>, _>>()?;
     let secrets = args
         .secrets
@@ -144,6 +156,7 @@ pub fn parse_run(args: RunArgs) -> Result<JobPlan, PlanError> {
         template: args.template,
         command: args.command,
         inputs,
+        outputs,
         secrets,
         env,
         allow: AllowList { rules },
@@ -174,6 +187,22 @@ fn parse_input(raw: &str) -> Result<Input, PlanError> {
     Ok(Input {
         host: PathBuf::from(host),
         name: name.to_string(),
+    })
+}
+
+/// Parse one `--out NAME:DEST` token into an [`Output`]: the guest writes under
+/// `/run/sandy/outputs/NAME` and sandy collects that subtree to the host path
+/// `DEST` at teardown. Split on the first `:`, so `NAME` is a single path element
+/// and `DEST` is the (possibly colon-free) host path.
+fn parse_output(raw: &str) -> Result<Output, PlanError> {
+    let invalid = || PlanError::Invalid(format!("--out `{raw}` must be NAME:DEST"));
+    let (name, dest) = raw.split_once(':').ok_or_else(invalid)?;
+    if name.is_empty() || dest.is_empty() || name.contains('/') || name == "." || name == ".." {
+        return Err(invalid());
+    }
+    Ok(Output {
+        name: name.to_string(),
+        dest: PathBuf::from(dest),
     })
 }
 
@@ -320,6 +349,38 @@ mod tests {
             assert!(
                 matches!(parse_run(args), Err(PlanError::Invalid(_))),
                 "a malformed --input {raw:?} must yield PlanError::Invalid"
+            );
+        }
+    }
+
+    /// `--out NAME:DEST` desugars to an [`Output`] with the name and host dest.
+    #[test]
+    fn output_name_dest_parses() -> anyhow::Result<()> {
+        let args = RunArgs {
+            template: "demo".to_string(),
+            outputs: vec!["result:/host/out".to_string()],
+            ..RunArgs::default()
+        };
+        let plan = parse_run(args).map_err(|e| anyhow::anyhow!("parse_run: {e}"))?;
+        let output = plan.outputs.first().expect("one output parsed");
+        assert_eq!(output.name, "result");
+        assert_eq!(output.dest.to_string_lossy(), "/host/out");
+        Ok(())
+    }
+
+    /// Adversarial: an `--out` with no `:`, an empty side, or a name that is not
+    /// a single path component is rejected as an invalid plan (band 2).
+    #[test]
+    fn malformed_output_is_invalid_plan() {
+        for raw in ["no-colon", "name:", ":/dest", "a/b:/dest", "..:/dest", ".:/dest"] {
+            let args = RunArgs {
+                template: "demo".to_string(),
+                outputs: vec![raw.to_string()],
+                ..RunArgs::default()
+            };
+            assert!(
+                matches!(parse_run(args), Err(PlanError::Invalid(_))),
+                "a malformed --out {raw:?} must yield PlanError::Invalid"
             );
         }
     }
