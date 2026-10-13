@@ -3,7 +3,10 @@
 Per subsystem: its **purpose**, the **decisions** that shape it (with the rationale
 and invariant each turns on), and its **KPI**, the tests that prove it, split into
 integration (tier-2, CI) and end-to-end (tier-3, live). Read
-[`overview.md`](overview.md) first for the pipeline and the seam map.
+[`overview.md`](overview.md) first for the pipeline and the seam map. The
+**decisions** below are stated tersely; the full record per category (context,
+consequences, the alternative set aside) is in [`../decisions/`](../decisions).
+The live **KPIs** are consolidated as an acceptance matrix in [`kpi.md`](kpi.md).
 
 Invariants referenced here: **INV-1** secrets never reach argv/env/the store;
 **INV-3** liveness only through `VmBackend::boxes` + the job flock, never a direct

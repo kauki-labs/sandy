@@ -91,13 +91,20 @@ A two-level spec of the existing system lives under
   secret channel, credential seam, egress, result + classification, journal. Each
   section states the **decisions** (with rationale + the invariant it turns on) and
   the **KPI** — the tests that verify it.
+- **Why is it this way / can I change decision X** → the full record for that
+  category in [`docs/decisions/`](docs/decisions) (one file per subsystem): context,
+  the decision, consequences, and the alternative **set aside** (do not re-propose
+  without new information).
 - **Writing or changing tests** → the spec's
   [testing section](docs/architecture/spec.md#testing-integration-vs-end-to-end)
   splits **integration** (tier-2, CI, no hypervisor, over `FakeBackend`) from
   **end-to-end** (tier-3, `live` feature, a real boot). A live scenario is never
-  counted green from a fake (INV-S9).
+  counted green from a fake (INV-S9). The live acceptance floor (what must pass
+  before shipping) is the matrix in
+  [`docs/architecture/kpi.md`](docs/architecture/kpi.md).
 
-Keep the spec current: a subsystem change updates its decisions + KPI there.
+Keep these current: a subsystem change updates its decisions + KPI in `spec.md`,
+its full record in `docs/decisions/`, and the live matrix in `kpi.md`.
 
 - **Deep crate**: `sandy`'s module tree is private; the only public surface is
   the `pub use` facade in `lib.rs`. Reach a type through the facade, never into a

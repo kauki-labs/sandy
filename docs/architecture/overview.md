@@ -3,6 +3,8 @@
 The orientation map: what sandy does, the seams it is built on, and how one
 `sandy run` flows through them. For a subsystem's decisions and its KPI (the
 tests that verify it), read [`spec.md`](spec.md). This page is the index into it.
+The full decision records are in [`../decisions/`](../decisions); the live
+acceptance matrix (what must pass to ship) is in [`kpi.md`](kpi.md).
 
 ## What sandy is
 
