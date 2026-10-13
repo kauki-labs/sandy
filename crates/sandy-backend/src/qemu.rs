@@ -30,14 +30,12 @@ use sandy::{
 };
 use uuid::Uuid;
 
+use crate::share::{GuestShareTransport, ShareSpec, VirtiofsdTransport, kill_children};
+
 /// The chardev id the guest serial console binds to. `qemu_args` emits
 /// `-serial chardev:<SERIAL_CHARDEV_ID>`; `run` adds the matching
 /// `-chardev socket,…` and drives it over the #33 [`PipeTransport`].
 const SERIAL_CHARDEV_ID: &str = "sandy-serial";
-
-/// The id of the shared memfd memory backend that virtio-fs shares map through.
-/// virtio-fs needs the guest RAM to be a shareable object (`share=on`).
-const VIRTIOFS_MEM_ID: &str = "sandy-mem";
 
 /// The boot-ready marker scanned for before the command is injected: the guest's
 /// login shell prints it once it is up and reading (the guest's `loginShellInit`),
@@ -55,24 +53,6 @@ const GUEST_MAC: &str = "02:00:00:00:00:01";
 /// by the operator (or the #29 live gate) after creating and configuring the tap;
 /// unset means the guest boots with no NIC (the default, isolated boot).
 const TAP_ENV: &str = "SANDY_TAP";
-
-/// One guest filesystem share, served to qemu as virtiofs (a `virtiofsd` daemon
-/// plus a `vhost-user-fs-pci` device), so the guest mounts it with the same
-/// `fsType = "virtiofs"` it uses under vfkit. The guest matches it by [`tag`]; the
-/// host serves [`host_dir`] over [`socket`]; `readonly` is enforced at the virtiofsd
-/// boundary (not only the guest mount) so a guest-root remount cannot write back.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShareSpec {
-    /// The host directory shared into the guest.
-    pub host_dir: std::path::PathBuf,
-    /// The virtio-fs mount tag the guest keys its mount on (e.g. `sandy-secrets`).
-    pub tag: String,
-    /// Deny guest writes at the virtiofsd boundary (secrets, inputs); outputs are
-    /// writable.
-    pub readonly: bool,
-    /// The `virtiofsd` vhost-user socket `run` launches it on and qemu connects to.
-    pub socket: std::path::PathBuf,
-}
 
 /// The already-staged inputs [`qemu_args`] needs, kept out of the pure assembler so
 /// argv assembly does no IO and stays tier-1 testable. `run` produces it before
@@ -153,19 +133,6 @@ pub fn qemu_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> Re
     args.push("-m".to_string());
     args.push(mem.to_string());
 
-    // virtio-fs requires the guest RAM to be a shareable memory object so virtiofsd
-    // and the guest can map the same pages. Back the single NUMA node with a memfd
-    // object (`share=on`) whenever the run carries any share; without a share this is
-    // omitted and the plain `-m` stands.
-    if !staged.shares.is_empty() {
-        args.push("-object".to_string());
-        args.push(format!(
-            "memory-backend-memfd,id={VIRTIOFS_MEM_ID},size={mem}M,share=on"
-        ));
-        args.push("-numa".to_string());
-        args.push(format!("node,memdev={VIRTIOFS_MEM_ID}"));
-    }
-
     // The read-only Nix store as a virtio-blk drive. Only an erofs image can be
     // expressed as a qemu drive; a virtiofs store carries only a tag (no host
     // path), so it cannot and is refused rather than emitting a broken drive.
@@ -198,16 +165,10 @@ pub fn qemu_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> Re
         args.push(format!("virtio-net-pci,netdev=net0,mac={GUEST_MAC}"));
     }
 
-    // The virtio-fs shares. Each is served by a `virtiofsd` the backend launches on
-    // `share.socket` (see [`QemuBackend::boot`]); here we only wire qemu to it: a
-    // client chardev on that socket plus the `vhost-user-fs-pci` device the guest
-    // matches by `tag`. readonly is enforced by virtiofsd, so it is not a qemu arg.
-    for (i, share) in staged.shares.iter().enumerate() {
-        args.push("-chardev".to_string());
-        args.push(format!("socket,id=vfs{i},path={}", share.socket.display()));
-        args.push("-device".to_string());
-        args.push(format!("vhost-user-fs-pci,chardev=vfs{i},tag={}", share.tag));
-    }
+    // The virtio-fs shares: a shared memfd memory backend plus a client chardev +
+    // `vhost-user-fs-pci` device per share. The matching virtiofsd daemons are
+    // launched by [`QemuBackend::boot`]. readonly is a virtiofsd flag, not a qemu arg.
+    args.extend(VirtiofsdTransport.device_args(&staged.shares, mem));
 
     if let Some(cid) = topology.vsock_cid {
         args.push("-device".to_string());
@@ -244,79 +205,6 @@ fn kernel_cmdline(cmdline: &str) -> String {
     } else {
         format!("console=ttyS0 {cmdline}")
     }
-}
-
-/// Kill and reap a set of child processes, best-effort (the virtiofsd daemons at
-/// teardown, or any already up when a later launch fails).
-fn kill_children(children: &mut Vec<std::process::Child>) {
-    for mut child in children.drain(..) {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-}
-
-/// Launch a `virtiofsd` serving `share.host_dir` on `share.socket`. Its stdio is
-/// discarded; a failure to come up surfaces as the socket never appearing (see
-/// [`wait_for_socket`]), which the caller turns into a boot fault.
-///
-/// `--sandbox=none` so an unprivileged sandy can launch it (the namespace sandbox
-/// needs `CAP_SYS_ADMIN`); the shared dir is already a sandy-owned staging dir.
-/// `--readonly` on a read-only share denies guest writes at the host boundary
-/// (INV-1), so a guest-root remount-rw still cannot write the host dir — the host
-/// rewrites that dir directly, not via virtiofsd, so refresh re-delivery (#49) is
-/// unaffected.
-///
-/// # Errors
-/// [`BackendError::Spawn`] if the `virtiofsd` process cannot be spawned.
-fn spawn_virtiofsd(share: &ShareSpec) -> Result<std::process::Child, BackendError> {
-    let bin = std::env::var("SANDY_VIRTIOFSD_BIN").unwrap_or_else(|_| "virtiofsd".to_string());
-    // Clear any stale socket so wait_for_socket can't observe a previous run's.
-    let _ = std::fs::remove_file(&share.socket);
-    Command::new(&bin)
-        .args(virtiofsd_args(share))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|err| BackendError::Spawn(format!("spawn virtiofsd `{bin}` for share {}: {err}", share.tag)))
-}
-
-/// The `virtiofsd` CLI args (after the binary) serving `share`: its socket, the
-/// shared dir, an unprivileged sandbox, and `--readonly` for a read-only share so
-/// guest writes are denied at the host boundary (INV-1), not only by the guest
-/// mount. Pure, so the read-only decision per share is unit-testable without
-/// launching the daemon.
-#[must_use]
-pub fn virtiofsd_args(share: &ShareSpec) -> Vec<String> {
-    let mut args = vec![
-        format!("--socket-path={}", share.socket.display()),
-        format!("--shared-dir={}", share.host_dir.display()),
-        "--sandbox=none".to_string(),
-    ];
-    if share.readonly {
-        args.push("--readonly".to_string());
-    }
-    args
-}
-
-/// Wait for `socket` to appear, bounded by `budget`: virtiofsd creates its socket
-/// asynchronously after launch, and qemu connects to it as a client. A socket still
-/// missing at the deadline means virtiofsd failed to start.
-///
-/// # Errors
-/// [`BackendError::Spawn`] when the socket does not appear within `budget`.
-fn wait_for_socket(socket: &Path, budget: Duration) -> Result<(), BackendError> {
-    let deadline = Instant::now() + budget;
-    while !socket.exists() {
-        if Instant::now() >= deadline {
-            return Err(BackendError::Spawn(format!(
-                "virtiofsd socket {} did not appear within {budget:?}",
-                socket.display()
-            )));
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    Ok(())
 }
 
 /// The native qemu/KVM [`VmBackend`] (Linux).
@@ -368,17 +256,7 @@ impl QemuBackend {
         // Launch a virtiofsd per share and wait for its socket before qemu starts:
         // qemu connects to each as a client chardev, so the socket must exist first.
         // A launch or socket fault kills any daemon already up and fails the boot.
-        let mut virtiofsds: Vec<std::process::Child> = Vec::with_capacity(shares.len());
-        for share in shares {
-            let launched = spawn_virtiofsd(share).and_then(|child| {
-                virtiofsds.push(child);
-                wait_for_socket(&share.socket, Duration::from_secs(5))
-            });
-            if let Err(err) = launched {
-                kill_children(&mut virtiofsds);
-                return Err(err);
-            }
-        }
+        let mut virtiofsds = VirtiofsdTransport.launch(shares)?;
 
         // qemu_args emits `-serial chardev:<id>`; bind that id to a Unix-socket
         // chardev qemu creates (server=on, wait=off so the spawn doesn't block).

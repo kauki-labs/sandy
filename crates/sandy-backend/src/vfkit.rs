@@ -28,43 +28,33 @@ use sandy::{
 };
 use uuid::Uuid;
 
+use crate::share::{GuestShareTransport, ShareSpec, VirtioFsTransport};
+
 /// The guest boot-ready marker the console protocol scans for before injecting
 /// the command: the guest's login shell prints it once it is up and reading (the
 /// guest's `loginShellInit`), so the injected frame lands in a reading shell
 /// rather than the getty→login handoff, which flushes pending tty input.
 const BOOT_READY_MARKER: &str = "SANDY-READY";
 
-/// The staged virtio-fs share descriptors [`vfkit_args`] weaves into the argv.
+/// The staged virtio-fs [`ShareSpec`]s [`vfkit_args`] weaves into the argv.
 ///
-/// Argv assembly is kept pure and testable without real staging: the backend
-/// stages secrets first, reduces each to a virtio-fs share descriptor, and hands
-/// the strings here. Only share *descriptors* (host path plus mount tag) travel
-/// this struct — never secret bytes, which stay in their `0600` staging file
-/// (INV-1).
+/// Argv assembly is kept pure and testable without real staging: the backend stages
+/// each directory and hands the share metadata here. Only share metadata (host path
+/// plus mount tag) travels this struct — never secret bytes, which stay in their
+/// `0600` staging file (INV-1). The [`VirtioFsTransport`] reduces each to a
+/// `--device virtio-fs,…`; vfkit needs no daemon (Virtualization.framework serves
+/// virtio-fs itself).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StagedArgs {
-    /// virtio-fs share descriptor(s) for the staged-secret directory
-    /// (`sharedDir=<inst_dir>,mountTag=…,ro`). The secret channel is a read-only
-    /// share of the staging dir, never argv bytes (INV-1).
-    pub secret_shares: Vec<String>,
-    /// virtio-fs share descriptor(s) for the read-only staged-inputs directory
-    /// (`sharedDir=<inputs_dir>,mountTag=sandy-inputs,ro`).
-    pub input_shares: Vec<String>,
-    /// virtio-fs share descriptor(s) for the writable outputs directory
-    /// (`sharedDir=<outputs_dir>,mountTag=sandy-outputs`, no `ro`).
-    pub output_shares: Vec<String>,
+    /// The guest virtio-fs shares, in argv order (inputs, outputs, then the secret).
+    pub shares: Vec<ShareSpec>,
 }
 
 impl StagedArgs {
-    /// A [`StagedArgs`] carrying the given secret, input, and output share
-    /// descriptors.
+    /// A [`StagedArgs`] carrying the given virtio-fs shares.
     #[must_use]
-    pub fn new(secret_shares: Vec<String>, input_shares: Vec<String>, output_shares: Vec<String>) -> Self {
-        Self {
-            secret_shares,
-            input_shares,
-            output_shares,
-        }
+    pub fn new(shares: Vec<ShareSpec>) -> Self {
+        Self { shares }
     }
 }
 
@@ -86,9 +76,9 @@ impl StagedArgs {
 ///   virtio-fs,sharedDir=/nix/store,mountTag=<tag>` (the guest mounts it read-only via the `ro-store` tag).
 /// - `--device virtio-serial,stdio` — the guest `hvc0` console. `stdio` is backed by the PTY master the backend spawns
 ///   `vfkit` under (#33), which is why a real TTY is required.
-/// - one `--device virtio-fs,<descriptor>` per entry in [`StagedArgs::input_shares`] (read-only inputs),
-///   [`StagedArgs::output_shares`] (writable outputs), and [`StagedArgs::secret_shares`] (the secret share). Each
-///   `--device` and its descriptor are separate argv tokens.
+/// - one `--device virtio-fs,sharedDir=<host>,mountTag=<tag>` per [`StagedArgs::shares`] entry (inputs, outputs, then
+///   the secret share), via the [`VirtioFsTransport`]. Each `--device` and its descriptor are separate argv tokens;
+///   read-only is enforced by the guest mount (vfkit's virtio-fs device rejects a `,ro` option).
 /// - `--device virtio-vsock,…` when [`Topology::vsock_cid`] is `Some` (absent in the aarch64 fixture).
 ///
 /// # Errors
@@ -142,16 +132,7 @@ pub fn vfkit_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> R
     // already-assembled virtio-fs descriptor. vfkit's virtio-fs device rejects a `ro` option ("unknown option for
     // virtio-fs devices: ro") — unlike the erofs store's virtio-blk `readonly` — so drop a trailing `,ro`; the guest
     // mounts the RO shares read-only itself (the outputs share carries no `,ro`, so it stays writable).
-    for descriptor in staged
-        .input_shares
-        .iter()
-        .chain(&staged.output_shares)
-        .chain(&staged.secret_shares)
-    {
-        let descriptor = descriptor.strip_suffix(",ro").unwrap_or(descriptor);
-        args.push("--device".to_string());
-        args.push(format!("virtio-fs,{descriptor}"));
-    }
+    args.extend(VirtioFsTransport.device_args(&staged.shares, 0));
 
     // The vsock channel, only when the topology assigns a context id (absent in the aarch64 fixture). The guest-side
     // socket wiring is the host concern (#26); here we carry the assigned cid.
@@ -205,48 +186,40 @@ impl VfkitBackend {
         box_id: &str,
         inst_dir: &Path,
     ) -> Result<Outcome, BackendError> {
-        // Secrets travel a read-only virtio-fs share of the 0700 staging dir, never argv bytes (INV-1).
-        // With `secret_dir` (refresh re-delivery, #49) stage into and share the
-        // caller-owned dir so it can rewrite a staged secret mid-run; otherwise our
-        // own inst_dir. Attach the share when the run carries secrets or the caller
-        // provided a pre-staged dir; the guest mounts `/run/sandy/secrets` with
-        // `nofail`, so a run with no share still boots.
-        let share_dir = spec.secret_dir.unwrap_or(inst_dir);
-        let staged_secrets = stage_secrets(spec.secrets, share_dir)?;
-        let secret_shares = if staged_secrets.is_empty() && spec.secret_dir.is_none() {
-            Vec::new()
-        } else {
-            vec![format!(
-                "sharedDir={},mountTag={SECRET_MOUNT_TAG},ro",
-                share_dir.display()
-            )]
+        // Build the virtio-fs shares in argv order (inputs, outputs, then secret).
+        // The guest mounts each with `nofail`, so a run with no share still boots.
+        // The `socket` field is unused by vfkit (no daemon); it is set for the
+        // ShareSpec contract. INV-1: only share metadata travels here, never bytes.
+        let mut shares: Vec<ShareSpec> = Vec::new();
+        let vfkit_share = |dir: PathBuf, tag: &str, readonly: bool| ShareSpec {
+            host_dir: dir,
+            tag: tag.to_string(),
+            readonly,
+            socket: inst_dir.join(format!("vfsd-{tag}.sock")),
         };
 
         // Inputs are copied into their own per-run dir (kept out of the secret share,
         // so they never appear under /run/sandy/secrets) and shared read-only.
         let inputs_dir = std::env::temp_dir().join("sandy").join(format!("{box_id}-inputs"));
-        let input_shares = if stage_inputs(spec.inputs, &inputs_dir)? > 0 {
-            vec![format!(
-                "sharedDir={},mountTag={INPUT_MOUNT_TAG},ro",
-                inputs_dir.display()
-            )]
-        } else {
-            Vec::new()
-        };
-
-        // Outputs get their own per-run dir, shared writable (no `,ro`); `run`
-        // collects it to the host destinations after boot.
+        if stage_inputs(spec.inputs, &inputs_dir)? > 0 {
+            shares.push(vfkit_share(inputs_dir.clone(), INPUT_MOUNT_TAG, true));
+        }
+        // Outputs get their own per-run dir, shared writable; `run` collects it to
+        // the host destinations after boot.
         let outputs_dir = std::env::temp_dir().join("sandy").join(format!("{box_id}-outputs"));
-        let output_shares = if prepare_outputs(spec.outputs, &outputs_dir)? > 0 {
-            vec![format!(
-                "sharedDir={},mountTag={OUTPUT_MOUNT_TAG}",
-                outputs_dir.display()
-            )]
-        } else {
-            Vec::new()
-        };
+        if prepare_outputs(spec.outputs, &outputs_dir)? > 0 {
+            shares.push(vfkit_share(outputs_dir.clone(), OUTPUT_MOUNT_TAG, false));
+        }
+        // Secrets: with `secret_dir` (refresh re-delivery, #49) stage into and share
+        // the caller-owned dir so it can rewrite a staged secret mid-run; otherwise
+        // our own inst_dir. Attach when the run carries secrets or a pre-staged dir.
+        let secret_dir = spec.secret_dir.unwrap_or(inst_dir);
+        let staged_secrets = stage_secrets(spec.secrets, secret_dir)?;
+        if !staged_secrets.is_empty() || spec.secret_dir.is_some() {
+            shares.push(vfkit_share(secret_dir.to_path_buf(), SECRET_MOUNT_TAG, true));
+        }
 
-        let staged = StagedArgs::new(secret_shares, input_shares, output_shares);
+        let staged = StagedArgs::new(shares);
         let args = vfkit_args(topology, spec, &staged)?;
 
         let mut transport = PtyTransport::open()?;
@@ -436,13 +409,14 @@ mod tests {
             outcome_file: None,
             secret_dir: None,
         };
-        // The argv-safe staged descriptor: the secret bytes are already on disk
-        // in a 0600 file; only the share path and tag reach argv (INV-1).
-        let staged = StagedArgs::new(
-            vec!["sharedDir=/run/sandy/inst-0,mountTag=sandy-secrets,ro".to_string()],
-            vec![],
-            vec![],
-        );
+        // The argv-safe staged share: the secret bytes are already on disk in a 0600
+        // file; only the share path and tag reach argv (INV-1).
+        let staged = StagedArgs::new(vec![ShareSpec {
+            host_dir: "/run/sandy/inst-0".into(),
+            tag: "sandy-secrets".to_string(),
+            readonly: true,
+            socket: "/run/sandy/inst-0/vfsd-sandy-secrets.sock".into(),
+        }]);
 
         let args = vfkit_args(&topology, &spec, &staged).context("assemble vfkit argv")?;
         let joined = args.join(" ");
