@@ -149,3 +149,30 @@ jobs:
           files: result/lcov.info
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
+  package:
+    name: Package
+    needs: checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          # Installing Nix (multi-user daemon) needs sudo, so sudo stays enabled here.
+          egress-policy: audit
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      # Publish dry-run: package and verify every crate the way `cargo publish`
+      # will, in dependency order, so a crates.io-publishability break (bad
+      # metadata, a missing include, a version mismatch) fails the PR instead of
+      # the release. Does not upload.
+      - name: Package (publish dry-run)
+        run: nix develop -c cargo package --workspace --all-features
