@@ -10,7 +10,7 @@
 //!     env SANDY_LIVE=1 cargo nextest run -p sandy-cli --features live --test live_outputs
 #![cfg(feature = "live")]
 
-use std::{path::Path, process::Command};
+use std::process::Command;
 
 use anyhow::Context;
 
