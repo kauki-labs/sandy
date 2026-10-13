@@ -83,6 +83,49 @@ fn staged_secret_is_exported_to_the_job_env() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// #49: the guest's git credential helper serves the staged GITHUB_TOKEN to a
+/// `git credential fill` for github.com, so a real `git push`/`fetch` authenticates
+/// from the file (not the env snapshot). The staged name is `GITHUB_TOKEN`, the name
+/// `sandy run --credential` uses and the helper's hardcoded path.
+#[test]
+fn github_credential_helper_serves_the_staged_token() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let target = require_live()?;
+    build_guest(&target)?;
+    let home = tempfile::tempdir().context("temp SANDY_HOME")?;
+
+    let secret_file = home.path().join("tok");
+    std::fs::write(&secret_file, "ghs_marker_tok_xyz789").context("write secret")?;
+    std::fs::set_permissions(&secret_file, std::fs::Permissions::from_mode(0o600)).context("chmod secret")?;
+
+    // Exit 0 iff `git credential fill` for github.com returns the staged token. The
+    // comparison is in-guest, so the token value never reaches argv or stdout; only
+    // the password line is extracted and matched against the mounted file. A helper
+    // that fired for the wrong host (or not at all) yields an empty `got` and exit 7.
+    let probe = r#"got=$(printf 'protocol=https\nhost=github.com\n\n' | git credential fill | sed -n 's/^password=//p'); [ -n "$got" ] && [ "$got" = "$(cat /run/sandy/secrets/GITHUB_TOKEN)" ] && exit 0 || exit 7"#;
+    let (code, env) = sandy_run_with_secret(home.path(), &target, "GITHUB_TOKEN", &secret_file, &[probe])?;
+
+    assert_eq!(
+        env["status"], "succeeded",
+        "git credential fill must serve the staged token for github.com; envelope: {env}"
+    );
+    assert_eq!(
+        env["exit_code"], 0,
+        "exit 7 means the helper returned no/!matching password; envelope: {env}"
+    );
+    assert_eq!(code, 0, "process band 0; envelope: {env}");
+
+    // INV-1: the token value must not appear in the captured console. git prints
+    // only the compared result, never the password, so the tail stays clean.
+    let tail = env["logs"]["tail"].as_str().unwrap_or_default();
+    assert!(
+        !tail.contains("ghs_marker_tok_xyz789"),
+        "the token must not leak into argv or console; tail: {tail}"
+    );
+    Ok(())
+}
+
 /// A guest command that exits non-zero is a task fault: failed / guest exit 1 /
 /// process band 1 / NOT retryable (INV-11 — never conflated with an infra fault).
 #[test]

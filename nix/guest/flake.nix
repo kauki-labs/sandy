@@ -110,6 +110,50 @@
           environment.systemPackages = [ pkgs.nftables ];
         };
 
+      # GitHub credential consumption for a `sandy run --credential` job. The scoped
+      # token is staged read-only at /run/sandy/secrets/GITHUB_TOKEN (sandy fixes
+      # that name). Both consumers read the FILE at use-time, not the boot-time
+      # `$GITHUB_TOKEN` env snapshot, so a mid-run refresh (#49) is picked up: the
+      # env export happens once at login and can never update a running process.
+      #   - git over HTTPS: a named credential helper on PATH returns the current
+      #     token per operation as `x-access-token:<token>`, scoped to github.com so
+      #     the token never travels to another remote.
+      #   - the gh CLI: a PATH wrapper re-reads the file into GH_TOKEN and execs the
+      #     real gh, so `gh api`/`gh pr` see the current token per call.
+      # Both are shell-independent on purpose: a helper binary and a wrapper binary
+      # are found by non-interactive shells, scripts, and anything that execs the
+      # tool, which a shell alias is not.
+      credentialModule =
+        { pkgs, ... }:
+        let
+          tokenFile = "/run/sandy/secrets/GITHUB_TOKEN";
+          # git invokes `git credential-sandy-gh <op>`; only `get` returns anything.
+          gitHelper = pkgs.writeShellScriptBin "git-credential-sandy-gh" ''
+            [ "$1" = get ] || exit 0
+            [ -r ${tokenFile} ] || exit 0
+            printf 'username=x-access-token\npassword=%s\n' "$(cat ${tokenFile})"
+          '';
+          # The only `gh` on PATH: refresh-safe GH_TOKEN, re-read each invocation,
+          # then exec the real gh by store path.
+          ghWrapper = pkgs.writeShellScriptBin "gh" ''
+            if [ -r ${tokenFile} ]; then
+              GH_TOKEN="$(cat ${tokenFile})"
+              export GH_TOKEN
+            fi
+            exec ${pkgs.gh}/bin/gh "$@"
+          '';
+        in
+        {
+          programs.git = {
+            enable = true;
+            config.credential."https://github.com".helper = "sandy-gh";
+          };
+          environment.systemPackages = [
+            gitHelper
+            ghWrapper
+          ];
+        };
+
       mkGuest =
         {
           system,
@@ -140,7 +184,10 @@
       qemuGuest = mkGuest {
         system = "x86_64-linux";
         hypervisor = "qemu";
-        extraModules = [ networkingModule ];
+        extraModules = [
+          networkingModule
+          credentialModule
+        ];
       };
 
       # vfkit guest for an Apple-silicon host (aarch64-darwin host, aarch64-linux guest — vfkit
@@ -150,6 +197,7 @@
         system = "aarch64-linux";
         hypervisor = "vfkit";
         vmHostPackages = nixpkgs.legacyPackages.aarch64-darwin;
+        extraModules = [ credentialModule ];
       };
 
       # Emit sandy's `Topology` JSON from a built guest config: the kernel/initrd/
