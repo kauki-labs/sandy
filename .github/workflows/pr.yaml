@@ -176,3 +176,29 @@ jobs:
       # the release. Does not upload.
       - name: Package (publish dry-run)
         run: nix develop -c cargo package --workspace --all-features
+  # Single aggregate merge gate: green only if every other job in this run
+  # succeeded. Mark THIS one as the required check in branch protection, so
+  # adding, renaming, or removing a job never needs a branch-protection change.
+  # `if: always()` runs it even when a dependency fails; alls-green then reds the
+  # gate on any non-success (a job that failed, or that skipped without being
+  # allowed to).
+  merge-gate:
+    name: Merge gate
+    if: always()
+    needs:
+      - validate-pr-title
+      - label
+      - checks
+      - tests
+      - coverage
+      - package
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Require all jobs to pass
+        uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # v1.3.0
+        with:
+          jobs: ${{ toJSON(needs) }}
+          # validate-pr-title and label only run on pull_request, so they skip on
+          # merge_group; that skip is allowed and must not red the gate.
+          allowed-skips: validate-pr-title, label
