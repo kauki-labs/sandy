@@ -16,19 +16,18 @@
 //!   green from the sandbox; its real-boot coverage binds into #26.
 
 use std::{
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Mutex,
     time::{Duration, SystemTime},
 };
 
 use sandy::{
-    BackendError, BoxState, Hypervisor, INPUT_MOUNT_TAG, Markers, OUTPUT_MOUNT_TAG, Outcome, PtyTransport, RunSpec,
-    SECRET_MOUNT_TAG, StoreBacking, Topology, VmBackend, collect_outputs, prepare_outputs, run_console, stage_inputs,
-    stage_secrets, topology, wipe,
+    BackendError, BoxState, Hypervisor, Markers, Outcome, PtyTransport, RunSpec, StoreBacking, Topology, VmBackend,
+    collect_outputs, run_console, topology, wipe,
 };
 use uuid::Uuid;
 
-use crate::share::{GuestShareTransport, ShareSpec, VirtioFsTransport};
+use crate::share::{GuestShareTransport, ShareDirs, ShareSpec, VirtioFsTransport, plan_shares};
 
 /// The guest boot-ready marker the console protocol scans for before injecting
 /// the command: the guest's login shell prints it once it is up and reading (the
@@ -184,41 +183,13 @@ impl VfkitBackend {
         spec: &RunSpec,
         run_id: Uuid,
         box_id: &str,
-        inst_dir: &Path,
+        shares: Vec<ShareSpec>,
     ) -> Result<Outcome, BackendError> {
-        // Build the virtio-fs shares in argv order (inputs, outputs, then secret).
-        // The guest mounts each with `nofail`, so a run with no share still boots.
-        // The `socket` field is unused by vfkit (no daemon); it is set for the
-        // ShareSpec contract. INV-1: only share metadata travels here, never bytes.
-        let mut shares: Vec<ShareSpec> = Vec::new();
-        let vfkit_share = |dir: PathBuf, tag: &str, readonly: bool| ShareSpec {
-            host_dir: dir,
-            tag: tag.to_string(),
-            readonly,
-            socket: inst_dir.join(format!("vfsd-{tag}.sock")),
-        };
-
-        // Inputs are copied into their own per-run dir (kept out of the secret share,
-        // so they never appear under /run/sandy/secrets) and shared read-only.
-        let inputs_dir = std::env::temp_dir().join("sandy").join(format!("{box_id}-inputs"));
-        if stage_inputs(spec.inputs, &inputs_dir)? > 0 {
-            shares.push(vfkit_share(inputs_dir.clone(), INPUT_MOUNT_TAG, true));
-        }
-        // Outputs get their own per-run dir, shared writable; `run` collects it to
-        // the host destinations after boot.
-        let outputs_dir = std::env::temp_dir().join("sandy").join(format!("{box_id}-outputs"));
-        if prepare_outputs(spec.outputs, &outputs_dir)? > 0 {
-            shares.push(vfkit_share(outputs_dir.clone(), OUTPUT_MOUNT_TAG, false));
-        }
-        // Secrets: with `secret_dir` (refresh re-delivery, #49) stage into and share
-        // the caller-owned dir so it can rewrite a staged secret mid-run; otherwise
-        // our own inst_dir. Attach when the run carries secrets or a pre-staged dir.
-        let secret_dir = spec.secret_dir.unwrap_or(inst_dir);
-        let staged_secrets = stage_secrets(spec.secrets, secret_dir)?;
-        if !staged_secrets.is_empty() || spec.secret_dir.is_some() {
-            shares.push(vfkit_share(secret_dir.to_path_buf(), SECRET_MOUNT_TAG, true));
-        }
-
+        // The shares (secret/input/output, their read-only flags, the #49 secret_dir
+        // rule) are staged by `plan_shares` in `run`; here they only become argv. The
+        // guest mounts each by tag with `nofail`, so order is irrelevant. The
+        // `socket` field is unused by vfkit (no daemon). INV-1: only share metadata
+        // travels here, never secret bytes.
         let staged = StagedArgs::new(shares);
         let args = vfkit_args(topology, spec, &staged)?;
 
@@ -259,13 +230,22 @@ impl VmBackend for VfkitBackend {
         let run_id = Uuid::new_v4();
         let box_id = format!("inst-{run_id}");
         // Staging under the OS temp dir (works on macOS, where `/run` does not exist).
-        let inst_dir = std::env::temp_dir().join("sandy").join(&box_id);
+        let base = std::env::temp_dir().join("sandy");
+        let inst_dir = base.join(&box_id);
+        let inputs_dir = base.join(format!("{box_id}-inputs"));
+        let outputs_dir = base.join(format!("{box_id}-outputs"));
 
-        let outcome = self.boot(&topology, spec, run_id, &box_id, &inst_dir);
-
-        // The inputs/outputs dirs (siblings of inst_dir, same derivation as in `boot`).
-        let inputs_dir = std::env::temp_dir().join("sandy").join(format!("{box_id}-inputs"));
-        let outputs_dir = std::env::temp_dir().join("sandy").join(format!("{box_id}-outputs"));
+        // Stage the shares via the shared policy, then boot on them. A staging
+        // failure skips the boot but still wipes below (INV-1).
+        let outcome = plan_shares(
+            spec,
+            &ShareDirs {
+                inst_dir: &inst_dir,
+                inputs_dir: &inputs_dir,
+                outputs_dir: &outputs_dir,
+            },
+        )
+        .and_then(|shares| self.boot(&topology, spec, run_id, &box_id, shares));
 
         // Collect outputs before wiping, only if the guest booted; a collection
         // failure surfaces as an infra fault rather than silently dropping output.
