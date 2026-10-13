@@ -17,7 +17,7 @@ jobs:
   validate-pr-title:
     name: Validate title
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       pull-requests: read
     steps:
@@ -42,7 +42,7 @@ jobs:
   label:
     name: Add labels
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       pull-requests: write
@@ -61,7 +61,7 @@ jobs:
           sync-labels: true
   checks:
     name: Check
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -79,6 +79,19 @@ jobs:
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
+      # Persist the Nix store across runs, keyed on the lockfiles + nix files, so a
+      # rerun restores the built Rust deps and crates instead of rebuilding them
+      # cold. Per-job key; the store is GC'd to a budget before it is saved.
+      - name: Cache Nix store
+        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
+        with:
+          primary-key: nix-${{ runner.os }}-${{ github.job }}-${{ hashFiles('flake.lock', 'rust-toolchain.toml', '**/Cargo.lock', '**/*.nix') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-${{ github.job }}-
+          gc-max-store-size-linux: 4G
+          purge: true
+          purge-prefixes: nix-${{ runner.os }}-${{ github.job }}-
+          purge-created: 0
+          purge-primary-key: never
       - name: Format
         run: nix build -L .#checks.x86_64-linux.treefmt
       - name: Lint
@@ -87,10 +100,13 @@ jobs:
         run: nix build -L .#checks.x86_64-linux.shear
       - name: Build and docs
         run: nix build -L .#checks.x86_64-linux.sandy .#checks.x86_64-linux.doc .#checks.x86_64-linux.pre-commit
-  tests:
+  coverage:
+    # One test run, instrumented: cargo-llvm-cov runs the whole CI suite and emits
+    # the lcov report, so a separate plain `cargo nextest` job would just run the
+    # same tests again. This job is the test gate.
     name: Test
     needs: checks
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -108,29 +124,16 @@ jobs:
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
-      - name: Test
-        run: nix build -L .#checks.x86_64-linux.test
-  coverage:
-    name: Coverage
-    needs: checks
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Harden Runner
-        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+      - name: Cache Nix store
+        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
         with:
-          # Installing Nix (multi-user daemon) needs sudo, so sudo stays enabled here.
-          egress-policy: audit
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Install Nix
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
-        with:
-          extra_nix_config: |
-            experimental-features = nix-command flakes
+          primary-key: nix-${{ runner.os }}-${{ github.job }}-${{ hashFiles('flake.lock', 'rust-toolchain.toml', '**/Cargo.lock', '**/*.nix') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-${{ github.job }}-
+          gc-max-store-size-linux: 4G
+          purge: true
+          purge-prefixes: nix-${{ runner.os }}-${{ github.job }}-
+          purge-created: 0
+          purge-primary-key: never
       # Line coverage over the CI-runnable suite (tier-1/2); the `live` tier-3 tests
       # need a hypervisor and never run in CI, so they are excluded by design.
       - name: Coverage
@@ -149,3 +152,65 @@ jobs:
           files: result/lcov.info
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
+  package:
+    name: Package
+    needs: checks
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          # Installing Nix (multi-user daemon) needs sudo, so sudo stays enabled here.
+          egress-policy: audit
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: Cache Nix store
+        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
+        with:
+          primary-key: nix-${{ runner.os }}-${{ github.job }}-${{ hashFiles('flake.lock', 'rust-toolchain.toml', '**/Cargo.lock', '**/*.nix') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-${{ github.job }}-
+          gc-max-store-size-linux: 4G
+          purge: true
+          purge-prefixes: nix-${{ runner.os }}-${{ github.job }}-
+          purge-created: 0
+          purge-primary-key: never
+      # Publish dry-run: package and verify every crate the way `cargo publish`
+      # will, in dependency order, so a crates.io-publishability break (bad
+      # metadata, a missing include, a version mismatch) fails the PR instead of
+      # the release. Does not upload.
+      - name: Package (publish dry-run)
+        run: nix develop -c cargo package --workspace --all-features
+  # Single aggregate merge gate: green only if every other job in this run
+  # succeeded. Mark THIS one as the required check in branch protection, so
+  # adding, renaming, or removing a job never needs a branch-protection change.
+  # `if: always()` runs it even when a dependency fails; alls-green then reds the
+  # gate on any non-success (a job that failed, or that skipped without being
+  # allowed to).
+  merge-gate:
+    name: Merge gate
+    if: always()
+    needs:
+      - validate-pr-title
+      - label
+      - checks
+      - coverage
+      - package
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+      - name: Require all jobs to pass
+        uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # v1.3.0
+        with:
+          jobs: ${{ toJSON(needs) }}
+          # validate-pr-title and label only run on pull_request, so they skip on
+          # merge_group; that skip is allowed and must not red the gate.
+          allowed-skips: validate-pr-title, label
