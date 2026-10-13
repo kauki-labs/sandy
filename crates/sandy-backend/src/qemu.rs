@@ -305,6 +305,12 @@ impl QemuBackend {
             .spawn()
             .map_err(|err| BackendError::Spawn(format!("spawn qemu `{}`: {err}", argv[0])))?;
 
+        // Drain qemu's stderr on a thread. An un-read `piped` stderr deadlocks the
+        // boot: once qemu writes past the pipe buffer it blocks, never opens the
+        // serial socket, and the run times out with an empty console. Draining also
+        // captures the reason a boot that never reached the serial failed.
+        let stderr_drain = child.stderr.take().map(drain_stderr);
+
         let box_id = run_id.to_string();
         self.registry()?.push(BoxState {
             box_id: box_id.clone(),
@@ -314,15 +320,50 @@ impl QemuBackend {
             rvport: None,
         });
 
-        let outcome = drive_console(spec, run_id, &sock);
+        let mut outcome = drive_console(spec, run_id, &sock);
 
         // Teardown: stop qemu and deregister. Best-effort kill — the child may
         // already have exited (e.g. a guest `poweroff`).
         let _ = child.kill();
         let _ = child.wait();
         self.registry()?.retain(|state| state.box_id != box_id);
+
+        // When the guest never booted (e.g. qemu exited before opening the serial),
+        // the console is empty; surface qemu's own stderr there so the fault is
+        // diagnosable from the result envelope rather than silent.
+        let qemu_stderr = stderr_drain.and_then(|h| h.join().ok()).unwrap_or_default();
+        if !outcome.booted && outcome.console.is_empty() {
+            let tail = qemu_stderr.trim();
+            if !tail.is_empty() {
+                outcome.console = format!("[qemu stderr]\n{tail}");
+            }
+        }
         Ok(outcome)
     }
+}
+
+/// The most recent bytes of a child's stderr to retain for diagnostics (64 KiB).
+const QEMU_STDERR_CAP: usize = 64 * 1024;
+
+/// Drain `stderr` on a thread so a chatty qemu never blocks on a full, un-read pipe
+/// (the classic deadlock: an un-read [`Stdio::piped`] stalls the writer). Keeps only
+/// the last [`QEMU_STDERR_CAP`] bytes, returned lossily for the failure diagnostic.
+fn drain_stderr(mut stderr: std::process::ChildStderr) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        while let Ok(n) = stderr.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.len() > QEMU_STDERR_CAP {
+                buf.drain(..buf.len() - QEMU_STDERR_CAP);
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    })
 }
 
 /// An infra transport fault as an [`Outcome`] (no fabricated exit, INV-OUTCOME).
@@ -714,6 +755,39 @@ mod tests {
         if let Some(state) = boxes.first() {
             backend.kill(&state.box_id).context("tear the box down")?;
         }
+        Ok(())
+    }
+
+    /// Regression: an un-drained `piped` stderr deadlocks a chatty child once it
+    /// writes past the pipe buffer (the bug behind qemu booting to an empty console
+    /// and a band-3 fault). `drain_stderr` consumes it so the child always finishes,
+    /// and keeps the last `QEMU_STDERR_CAP` bytes for the fault diagnostic.
+    #[test]
+    fn drain_stderr_consumes_a_flood_without_blocking() -> anyhow::Result<()> {
+        use std::process::{Command, Stdio};
+
+        // ~200 KiB to stderr, far past the ~64 KiB pipe buffer: an un-drained pipe
+        // would block this child indefinitely.
+        let mut child = Command::new("sh")
+            .args(["-c", "head -c 200000 /dev/zero | tr '\\0' x 1>&2"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("spawn flood child")?;
+        let drain = super::drain_stderr(child.stderr.take().context("stderr was piped")?);
+        let status = child.wait().context("wait flood child")?;
+        let captured = drain.join().map_err(|_| anyhow::anyhow!("drain thread panicked"))?;
+
+        assert!(
+            status.success(),
+            "a drained child must finish, not block on a full pipe"
+        );
+        assert_eq!(captured.len(), super::QEMU_STDERR_CAP, "retain exactly the last 64 KiB");
+        assert!(
+            captured.bytes().all(|b| b == b'x'),
+            "the captured bytes are the stderr flood"
+        );
         Ok(())
     }
 }
