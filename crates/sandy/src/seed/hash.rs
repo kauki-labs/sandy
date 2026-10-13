@@ -1,7 +1,11 @@
 //! Deterministic lowercase-hex SHA-256 — the encoding the manifest's per-artifact
 //! hashes are expressed in.
 
-use std::{fs::File, io, path::Path};
+use std::{
+    fs::File,
+    io::{self, Read},
+    path::Path,
+};
 
 use sha2::{Digest, Sha256};
 
@@ -16,13 +20,20 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// Lowercase-hex SHA-256 digest of a file, streamed rather than buffered.
 ///
 /// Seed artifacts (the erofs store image) can be multi-gigabyte, so the bytes are
-/// fed through the hasher with [`io::copy`] instead of being read whole into memory;
+/// fed through the hasher a block at a time instead of being read whole into memory;
 /// the digest is identical to [`sha256_hex`] over the same bytes. Used by
 /// [`acquire`](crate::acquire) to verify artifacts without an RSS spike per file.
 pub(crate) fn sha256_hex_file(path: &Path) -> io::Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
-    io::copy(&mut file, &mut hasher)?;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
     Ok(hex::encode(hasher.finalize()))
 }
 
