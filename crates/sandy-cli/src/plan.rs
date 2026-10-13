@@ -8,6 +8,8 @@
 //! Grammar (each option may repeat):
 //! - `--input HOST:NAME` → a [`sandy::Input`]; the host file/dir `HOST` appears read-only at `/run/sandy/inputs/NAME`
 //!   in-guest.
+//! - `--out DEST` → a catch-all [`sandy::Output`]; everything under `/run/sandy/outputs` is collected to the host path
+//!   `DEST` at teardown. `--out NAME:DEST` collects just `/run/sandy/outputs/NAME`.
 //! - `--secret NAME=@PATH` → a [`sandy::SecretRef`] whose bytes come from the host file `PATH`
 //!   ([`sandy::SecretSource::File`]). The leading `@` marks a file source and is required.
 //! - `--env KEY=VALUE` → a `(KEY, VALUE)` pair. Env is never a secret channel (INV-1).
@@ -24,7 +26,7 @@
 
 use std::path::PathBuf;
 
-use sandy::{AllowList, EgressRule, Grants, Input, PlanError, RunSpec, SecretRef, SecretSource};
+use sandy::{AllowList, EgressRule, Grants, Input, Output, PlanError, RunSpec, SecretRef, SecretSource};
 
 /// Default wall-clock timeout when `--timeout` is omitted (5 minutes). Picked as
 /// a sane bound for an interactive foreground `run`; override with `--timeout`.
@@ -40,6 +42,8 @@ pub struct RunArgs {
     pub template: String,
     /// `--input HOST:NAME` occurrences, verbatim.
     pub inputs: Vec<String>,
+    /// `--out DEST` / `--out NAME:DEST` occurrences, verbatim.
+    pub outputs: Vec<String>,
     /// `--secret NAME=@PATH` occurrences, verbatim.
     pub secrets: Vec<String>,
     /// `--env KEY=VALUE` occurrences, verbatim.
@@ -66,6 +70,8 @@ pub struct JobPlan {
     pub command: Vec<String>,
     /// Read-only inputs staged at `/run/sandy/inputs/<name>` in-guest.
     pub inputs: Vec<Input>,
+    /// Writable outputs collected from `/run/sandy/outputs/<name>` at teardown.
+    pub outputs: Vec<Output>,
     /// Secrets injected over the secret channel.
     pub secrets: Vec<SecretRef>,
     /// Extra environment variables (never secrets — INV-1).
@@ -96,6 +102,7 @@ impl JobPlan {
             template: &self.template,
             command: &self.command,
             inputs: &self.inputs,
+            outputs: &self.outputs,
             secrets: &self.secrets,
             env: &self.env,
             cpu: self.cpu,
@@ -114,7 +121,7 @@ impl JobPlan {
 ///
 /// # Errors
 ///
-/// Returns [`PlanError::Invalid`] for any malformed token (bad `--input`,
+/// Returns [`PlanError::Invalid`] for any malformed token (bad `--input`, `--out`,
 /// `--secret`, or `--env`), never a partial plan.
 pub fn parse_run(args: RunArgs) -> Result<JobPlan, PlanError> {
     // Each list is parsed in full before the plan is constructed, so a malformed
@@ -123,6 +130,11 @@ pub fn parse_run(args: RunArgs) -> Result<JobPlan, PlanError> {
         .inputs
         .iter()
         .map(|raw| parse_input(raw))
+        .collect::<Result<Vec<_>, _>>()?;
+    let outputs = args
+        .outputs
+        .iter()
+        .map(|raw| parse_output(raw))
         .collect::<Result<Vec<_>, _>>()?;
     let secrets = args
         .secrets
@@ -144,6 +156,7 @@ pub fn parse_run(args: RunArgs) -> Result<JobPlan, PlanError> {
         template: args.template,
         command: args.command,
         inputs,
+        outputs,
         secrets,
         env,
         allow: AllowList { rules },
@@ -175,6 +188,38 @@ fn parse_input(raw: &str) -> Result<Input, PlanError> {
         host: PathBuf::from(host),
         name: name.to_string(),
     })
+}
+
+/// Parse one `--out` token into an [`Output`]. Two forms:
+/// - `--out NAME:DEST` (named) — when the part before the first `:` is a single path element (non-empty, no `/`, not
+///   `.`/`..`) and `DEST` is non-empty: the guest writes under `/run/sandy/outputs/NAME`, collected to `DEST`.
+/// - `--out DEST` (catch-all) — anything else: the whole `/run/sandy/outputs` tree is collected to the host path
+///   `DEST`. A `DEST` that itself contains a `:` must be path-like (contain `/`, e.g. `./out:dir`) so it is not read as
+///   a name.
+fn parse_output(raw: &str) -> Result<Output, PlanError> {
+    let invalid = || PlanError::Invalid(format!("--out `{raw}` must be DEST or NAME:DEST"));
+    if raw.is_empty() {
+        return Err(invalid());
+    }
+    if let Some((name, dest)) = raw.split_once(':')
+        && is_single_component(name)
+        && !dest.is_empty()
+    {
+        return Ok(Output {
+            name: Some(name.to_string()),
+            dest: PathBuf::from(dest),
+        });
+    }
+    // Catch-all: the whole token is the destination.
+    Ok(Output {
+        name: None,
+        dest: PathBuf::from(raw),
+    })
+}
+
+/// Whether `s` is a single safe path component: non-empty, no `/`, not `.`/`..`.
+fn is_single_component(s: &str) -> bool {
+    !s.is_empty() && s != "." && s != ".." && !s.contains('/')
 }
 
 /// Parse one `--secret NAME=@PATH` token into a file-sourced [`SecretRef`].
@@ -322,6 +367,54 @@ mod tests {
                 "a malformed --input {raw:?} must yield PlanError::Invalid"
             );
         }
+    }
+
+    /// `--out NAME:DEST` desugars to a named [`Output`]; `--out DEST` (no name) to
+    /// a catch-all (`name = None`).
+    #[test]
+    fn output_named_and_catch_all_parse() -> anyhow::Result<()> {
+        let parse_one = |raw: &str| -> anyhow::Result<sandy::Output> {
+            let args = RunArgs {
+                template: "demo".to_string(),
+                outputs: vec![raw.to_string()],
+                ..RunArgs::default()
+            };
+            let plan = parse_run(args).map_err(|e| anyhow::anyhow!("parse_run {raw:?}: {e}"))?;
+            Ok(plan.outputs.into_iter().next().expect("one output parsed"))
+        };
+
+        // Named: a simple name before the first colon.
+        let named = parse_one("result:/host/out")?;
+        assert_eq!(named.name.as_deref(), Some("result"));
+        assert_eq!(named.dest.to_string_lossy(), "/host/out");
+
+        // Catch-all: no colon.
+        let catch = parse_one("/host/out")?;
+        assert_eq!(catch.name, None);
+        assert_eq!(catch.dest.to_string_lossy(), "/host/out");
+
+        // Catch-all: a path-like dest with a colon (the left side has a `/`, so it
+        // is not a name).
+        let path_colon = parse_one("./out:dir")?;
+        assert_eq!(path_colon.name, None);
+        assert_eq!(path_colon.dest.to_string_lossy(), "./out:dir");
+
+        // A non-simple name before the colon falls back to catch-all, never named.
+        let not_a_name = parse_one("a/b:/dest")?;
+        assert_eq!(not_a_name.name, None);
+        assert_eq!(not_a_name.dest.to_string_lossy(), "a/b:/dest");
+        Ok(())
+    }
+
+    /// Adversarial: an empty `--out` is rejected as an invalid plan (band 2).
+    #[test]
+    fn empty_output_is_invalid_plan() {
+        let args = RunArgs {
+            template: "demo".to_string(),
+            outputs: vec![String::new()],
+            ..RunArgs::default()
+        };
+        assert!(matches!(parse_run(args), Err(PlanError::Invalid(_))));
     }
 
     /// `--env KEY=VALUE` desugars to a `(key, value)` pair.

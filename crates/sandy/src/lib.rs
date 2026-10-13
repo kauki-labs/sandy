@@ -49,7 +49,7 @@ mod strategy;
 mod trust_root;
 
 pub use backend::{
-    BackendError, BoxState, FakeBackend, Grants, Input, Outcome, PlanError, RunSpec, SecretRef, SecretSource,
+    BackendError, BoxState, FakeBackend, Grants, Input, Outcome, Output, PlanError, RunSpec, SecretRef, SecretSource,
     VmBackend, validate_no_secret_leak,
 };
 pub use collect::{CollectError, OutputSpec, collect};
@@ -86,7 +86,10 @@ pub use seed::{
     ALLOWED_IMAGE_FORMATS, ArtifactEntry, MinisignVerifier, Requirements, SeedManifest, SeedRefusal, SignatureVerifier,
     VerifiedSeed, acquire, sha256_hex,
 };
-pub use stage::{INPUT_MOUNT_TAG, SECRET_MOUNT_TAG, StagedSecret, stage_inputs, stage_secrets, wipe};
+pub use stage::{
+    INPUT_MOUNT_TAG, OUTPUT_MOUNT_TAG, SECRET_MOUNT_TAG, StagedSecret, collect_outputs, prepare_outputs, stage_inputs,
+    stage_secrets, wipe,
+};
 pub use strategy::{BootAxis, BuildAxis, HostFacts, ProvisioningStrategy, classify};
 pub use trust_root::{
     FakeProvisioner, InstallError, Provisioner, RegistrationPlan, RevokeOutcome, deregister, github_app_manifest,
