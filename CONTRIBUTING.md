@@ -49,6 +49,12 @@ of `sandy-box` / `sandy-backend` / `sandy-cli` in dependency order); you do not
 tag or publish by hand. release-plz also keeps a prepared bump PR open with the
 changelog.
 
+Publishing uses crates.io [trusted publishing](https://crates.io/docs/trusted-publishing):
+the release job mints a short-lived token from GitHub's OIDC identity, so there
+is no long-lived `CARGO_REGISTRY_TOKEN` in the repo. Before the first publish,
+register this repo and the `Release` workflow as a Trusted Publisher for each
+crate on crates.io; until that is set up the publish step fails closed.
+
 ## Conduct
 
 By participating you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
