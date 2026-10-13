@@ -347,3 +347,131 @@ fn three_shares_only_outputs_writable() -> Result<()> {
     }
     Ok(())
 }
+
+/// `plan_shares` is the single home for the share-staging policy both backends use.
+/// Given a secret, an input, and an output it stages each and returns the shares in
+/// secret → input → output order, with the right tags, the read-only flags (secret
+/// and input read-only, output writable), and the virtiofsd socket beside inst_dir.
+/// This is the policy qemu and vfkit previously open-coded in lockstep.
+#[test]
+fn plan_shares_stages_secret_input_output_with_the_right_flags() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    use sandy::{SecretRef, SecretSource};
+    use sandy_backend::{ShareDirs, plan_shares};
+
+    let tmp = tempfile::tempdir().context("tmp")?;
+    let secret_src = tmp.path().join("tok");
+    std::fs::write(&secret_src, b"S").context("write secret src")?;
+    // Secret sources must be 0600 (INV-1); stage_secrets refuses a loose one.
+    std::fs::set_permissions(&secret_src, std::fs::Permissions::from_mode(0o600)).context("chmod secret src")?;
+    let in_src = tmp.path().join("in");
+    std::fs::create_dir_all(&in_src).context("mk input src")?;
+    std::fs::write(in_src.join("f"), b"I").context("write input")?;
+
+    let inst = tmp.path().join("inst");
+    let inputs = tmp.path().join("inputs");
+    let outputs = tmp.path().join("outputs");
+
+    let secrets = [SecretRef {
+        name: "TOK".to_string(),
+        source: SecretSource::File(secret_src),
+    }];
+    let in_specs = [Input {
+        host: in_src,
+        name: "data".to_string(),
+    }];
+    let out_specs = [Output {
+        name: Some("r".to_string()),
+        dest: tmp.path().join("dest"),
+    }];
+    let spec = RunSpec {
+        template: "demo",
+        command: &[],
+        inputs: &in_specs,
+        outputs: &out_specs,
+        secrets: &secrets,
+        env: &[],
+        cpu: None,
+        mem: None,
+        timeout_secs: 60,
+        grants: &GRANTS,
+        outcome_file: None,
+        secret_dir: None,
+    };
+
+    let shares = plan_shares(
+        &spec,
+        &ShareDirs {
+            inst_dir: &inst,
+            inputs_dir: &inputs,
+            outputs_dir: &outputs,
+        },
+    )
+    .context("plan_shares")?;
+
+    let tags: Vec<&str> = shares.iter().map(|s| s.tag.as_str()).collect();
+    assert_eq!(
+        tags,
+        [SECRET_MOUNT_TAG, INPUT_MOUNT_TAG, OUTPUT_MOUNT_TAG],
+        "shares come back in secret → input → output order"
+    );
+    let by_tag = |t: &str| shares.iter().find(|s| s.tag == t).expect("share present");
+    assert!(by_tag(SECRET_MOUNT_TAG).readonly, "the secret share is read-only");
+    assert!(by_tag(INPUT_MOUNT_TAG).readonly, "the input share is read-only");
+    assert!(!by_tag(OUTPUT_MOUNT_TAG).readonly, "the output share is writable");
+    assert_eq!(
+        by_tag(SECRET_MOUNT_TAG).socket,
+        inst.join(format!("vfsd-{SECRET_MOUNT_TAG}.sock")),
+        "the virtiofsd socket lives beside inst_dir"
+    );
+    Ok(())
+}
+
+/// The #49 secret_dir rule: with a caller-owned `secret_dir` and no plan secrets,
+/// the secret share is still attached (so a mid-run refresh into that dir reaches
+/// the guest) and points at the caller's dir, not inst_dir.
+#[test]
+fn plan_shares_attaches_an_empty_secret_dir_for_refresh() -> Result<()> {
+    use sandy_backend::{ShareDirs, plan_shares};
+
+    let tmp = tempfile::tempdir().context("tmp")?;
+    let inst = tmp.path().join("inst");
+    let cred = tmp.path().join("cred");
+    std::fs::create_dir_all(&cred).context("mk cred dir")?;
+    let inputs = tmp.path().join("i");
+    let outputs = tmp.path().join("o");
+
+    let spec = RunSpec {
+        template: "demo",
+        command: &[],
+        inputs: &[],
+        outputs: &[],
+        secrets: &[],
+        env: &[],
+        cpu: None,
+        mem: None,
+        timeout_secs: 60,
+        grants: &GRANTS,
+        outcome_file: None,
+        secret_dir: Some(&cred),
+    };
+
+    let shares = plan_shares(
+        &spec,
+        &ShareDirs {
+            inst_dir: &inst,
+            inputs_dir: &inputs,
+            outputs_dir: &outputs,
+        },
+    )
+    .context("plan_shares")?;
+
+    assert_eq!(shares.len(), 1, "only the secret share attaches");
+    assert_eq!(shares[0].tag, SECRET_MOUNT_TAG);
+    assert_eq!(
+        shares[0].host_dir, cred,
+        "the secret share points at the caller's cred_dir for refresh re-delivery"
+    );
+    Ok(())
+}

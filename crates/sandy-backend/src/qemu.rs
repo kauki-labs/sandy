@@ -24,13 +24,12 @@ use std::{
 };
 
 use sandy::{
-    BackendError, BoxState, Hypervisor, INPUT_MOUNT_TAG, Markers, OUTPUT_MOUNT_TAG, Outcome, PipeTransport, RunSpec,
-    SECRET_MOUNT_TAG, StoreBacking, Topology, VmBackend, collect_outputs, prepare_outputs, run_console, stage_inputs,
-    stage_secrets, topology as eval_topology, wipe,
+    BackendError, BoxState, Hypervisor, Markers, Outcome, PipeTransport, RunSpec, StoreBacking, Topology, VmBackend,
+    collect_outputs, run_console, topology as eval_topology, wipe,
 };
 use uuid::Uuid;
 
-use crate::share::{GuestShareTransport, ShareSpec, VirtiofsdTransport, kill_children};
+use crate::share::{GuestShareTransport, ShareDirs, ShareSpec, VirtiofsdTransport, kill_children, plan_shares};
 
 /// The chardev id the guest serial console binds to. `qemu_args` emits
 /// `-serial chardev:<SERIAL_CHARDEV_ID>`; `run` adds the matching
@@ -398,49 +397,23 @@ impl VmBackend for QemuBackend {
     fn run(&self, spec: &RunSpec) -> Result<Outcome, BackendError> {
         let topology = eval_topology(spec.template)?;
         let run_id = Uuid::new_v4();
-        let inst_dir = std::env::temp_dir().join("sandy").join(run_id.to_string());
+        let base = std::env::temp_dir().join("sandy");
+        let inst_dir = base.join(run_id.to_string());
+        let inputs_dir = base.join(format!("{run_id}-inputs"));
+        let outputs_dir = base.join(format!("{run_id}-outputs"));
 
-        // Build the virtio-fs shares. Each virtiofsd socket lives in inst_dir
-        // (sandy-owned, created in `boot`); the host dir is the caller's for secrets
-        // (refresh re-delivery, #49, stages into spec.secret_dir so it can rewrite
-        // mid-run), else a per-run dir. Secrets/inputs are read-only, outputs
-        // writable — enforced at the virtiofsd boundary.
-        let mut shares: Vec<ShareSpec> = Vec::new();
-
-        let secret_dir = spec.secret_dir.unwrap_or(&inst_dir);
-        let staged_secrets = stage_secrets(spec.secrets, secret_dir)?;
-        // Attach the secret share when the run carries secrets or the caller provided
-        // a pre-staged dir; the guest mounts `/run/sandy/secrets` with `nofail`, so a
-        // run with no share still boots.
-        if !staged_secrets.is_empty() || spec.secret_dir.is_some() {
-            shares.push(ShareSpec {
-                host_dir: secret_dir.to_path_buf(),
-                tag: SECRET_MOUNT_TAG.to_string(),
-                readonly: true,
-                socket: inst_dir.join(format!("vfsd-{SECRET_MOUNT_TAG}.sock")),
-            });
-        }
-        // Inputs go in their own per-run dir (never under the secret share) read-only.
-        let inputs_dir = std::env::temp_dir().join("sandy").join(format!("{run_id}-inputs"));
-        if stage_inputs(spec.inputs, &inputs_dir)? > 0 {
-            shares.push(ShareSpec {
-                host_dir: inputs_dir.clone(),
-                tag: INPUT_MOUNT_TAG.to_string(),
-                readonly: true,
-                socket: inst_dir.join(format!("vfsd-{INPUT_MOUNT_TAG}.sock")),
-            });
-        }
-        // Outputs get their own per-run dir, writable; the guest writes it and sandy
-        // collects it to the host destinations below.
-        let outputs_dir = std::env::temp_dir().join("sandy").join(format!("{run_id}-outputs"));
-        if prepare_outputs(spec.outputs, &outputs_dir)? > 0 {
-            shares.push(ShareSpec {
-                host_dir: outputs_dir.clone(),
-                tag: OUTPUT_MOUNT_TAG.to_string(),
-                readonly: false,
-                socket: inst_dir.join(format!("vfsd-{OUTPUT_MOUNT_TAG}.sock")),
-            });
-        }
+        // Stage the shares via the shared policy (secret/input/output, read-only
+        // flags, the #49 secret_dir rule). Each virtiofsd socket lives in inst_dir
+        // (sandy-owned, created in `boot`); the read-only flag is enforced at the
+        // virtiofsd boundary below.
+        let shares = plan_shares(
+            spec,
+            &ShareDirs {
+                inst_dir: &inst_dir,
+                inputs_dir: &inputs_dir,
+                outputs_dir: &outputs_dir,
+            },
+        )?;
 
         let staged = StagedArgs {
             shares,
@@ -497,7 +470,7 @@ fn kvm_available() -> bool {
 #[cfg(test)]
 mod tests {
     use anyhow::Context;
-    use sandy::{Grants, Hypervisor, parse_topology};
+    use sandy::{Grants, Hypervisor, SECRET_MOUNT_TAG, parse_topology};
 
     use super::*;
 
