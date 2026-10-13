@@ -60,16 +60,9 @@ fn share_arg<'a>(args: &'a [String], needle: &str) -> &'a str {
         .unwrap_or_else(|| panic!("no argv token contains {needle:?} in {args:?}"))
 }
 
-/// A vfkit share descriptor as the backend `run` builds it: read-only carries a
-/// trailing `,ro`, writable does not. (vfkit still uses virtio-fs descriptor
-/// strings; only qemu converted to virtiofsd + [`ShareSpec`].)
-fn descriptor(dir: &std::path::Path, tag: &str, ro: bool) -> String {
-    let base = format!("sharedDir={},mountTag={tag}", dir.display());
-    if ro { format!("{base},ro") } else { base }
-}
-
-/// A qemu [`ShareSpec`] as the backend `run` builds it: the virtiofsd socket lives
-/// beside the shared dir, and `ro` drives the `--readonly` boundary.
+/// A [`ShareSpec`] as the backend `run` builds it: the virtiofsd socket lives beside
+/// the shared dir (qemu uses it; vfkit ignores it), and `ro` drives the read-only
+/// boundary (`--readonly` on qemu, the guest mount on vfkit).
 fn qshare(dir: &std::path::Path, tag: &str, ro: bool) -> ShareSpec {
     ShareSpec {
         host_dir: dir.to_path_buf(),
@@ -138,7 +131,7 @@ fn vfkit_input_share_strips_ro() -> Result<()> {
         &inputs_dir,
     )?;
 
-    let staged = VfkitStagedArgs::new(vec![], vec![descriptor(&inputs_dir, INPUT_MOUNT_TAG, true)], vec![]);
+    let staged = VfkitStagedArgs::new(vec![qshare(&inputs_dir, INPUT_MOUNT_TAG, true)]);
     let args = vfkit_args(&vfkit_topo(), &spec(&["true".to_string()]), &staged).context("vfkit_args")?;
 
     let arg = share_arg(&args, &format!("mountTag={INPUT_MOUNT_TAG}"));
@@ -212,7 +205,7 @@ fn vfkit_output_share_is_writable() -> Result<()> {
         &outputs_dir,
     )?;
 
-    let staged = VfkitStagedArgs::new(vec![], vec![], vec![descriptor(&outputs_dir, OUTPUT_MOUNT_TAG, false)]);
+    let staged = VfkitStagedArgs::new(vec![qshare(&outputs_dir, OUTPUT_MOUNT_TAG, false)]);
     let args = vfkit_args(&vfkit_topo(), &spec(&["true".to_string()]), &staged).context("vfkit_args")?;
 
     let arg = share_arg(&args, &format!("mountTag={OUTPUT_MOUNT_TAG}"));

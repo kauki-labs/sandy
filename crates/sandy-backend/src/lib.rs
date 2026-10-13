@@ -12,7 +12,9 @@
 //!   pre-staged virtiofs shares (INV-8/INV-TOPOLOGY).
 
 mod qemu;
+mod share;
 mod vfkit;
 
-pub use qemu::{QemuBackend, ShareSpec, StagedArgs as QemuStagedArgs, qemu_args, virtiofsd_args};
+pub use qemu::{QemuBackend, StagedArgs as QemuStagedArgs, qemu_args};
+pub use share::{GuestShareTransport, ShareSpec, VirtioFsTransport, VirtiofsdTransport, virtiofsd_args};
 pub use vfkit::{StagedArgs as VfkitStagedArgs, VfkitBackend, vfkit_args};
