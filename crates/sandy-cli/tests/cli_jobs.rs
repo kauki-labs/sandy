@@ -13,7 +13,7 @@ use sandy::{
 };
 use sandy_cli::{
     plan::JobPlan,
-    supervisor::{gc, kill, ls, mint_run_token, run_job, run_job_with_credential, should_refresh, status, wait},
+    supervisor::{gc, kill, ls, mint_run_token, run_job, run_job_with_credential, status, wait},
 };
 
 /// A journal on a fresh local temp `$SANDY_HOME`.
@@ -679,22 +679,5 @@ fn credential_mint_failure_fails_closed_before_any_run() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// #49 Block 2: `should_refresh` fires only inside the margin before expiry (or once
-/// expired), not while ample time remains.
-#[test]
-fn should_refresh_fires_within_margin_only() {
-    let now = SystemTime::now();
-    let margin = Duration::from_secs(300);
-    assert!(
-        !should_refresh(now, now + Duration::from_secs(1_800), margin),
-        "ample time remaining: no refresh"
-    );
-    assert!(
-        should_refresh(now, now + Duration::from_secs(120), margin),
-        "within the margin: refresh"
-    );
-    assert!(
-        should_refresh(now, now - Duration::from_secs(1), margin),
-        "already expired: refresh"
-    );
-}
+// `should_refresh` and its refresh sibling now live in `sandy::cred`, unit-tested
+// there (cred.rs) with the rest of the refresh-re-delivery logic (#49).
