@@ -85,6 +85,7 @@ fn qemu_input_share_is_read_only() -> Result<()> {
         &[Input {
             host: tmp.path().join("f"),
             name: "data".to_string(),
+            guest_path: None,
         }],
         &inputs_dir,
     )?;
@@ -127,6 +128,7 @@ fn vfkit_input_share_strips_ro() -> Result<()> {
         &[Input {
             host: tmp.path().join("f"),
             name: "data".to_string(),
+            guest_path: None,
         }],
         &inputs_dir,
     )?;
@@ -149,6 +151,7 @@ fn missing_host_input_fails_closed() {
         &[Input {
             host: tmp.path().join("does-not-exist"),
             name: "data".to_string(),
+            guest_path: None,
         }],
         &tmp.path().join("inputs"),
     );
@@ -306,6 +309,7 @@ fn three_shares_only_outputs_writable() -> Result<()> {
         &[Input {
             host: tmp.path().join("f"),
             name: "data".to_string(),
+            guest_path: None,
         }],
         &inputs_dir,
     )?;
@@ -380,6 +384,7 @@ fn plan_shares_stages_secret_input_output_with_the_right_flags() -> Result<()> {
     let in_specs = [Input {
         host: in_src,
         name: "data".to_string(),
+        guest_path: None,
     }];
     let out_specs = [Output {
         name: Some("r".to_string()),
