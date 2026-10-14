@@ -134,6 +134,11 @@ jobs:
           purge-prefixes: nix-${{ runner.os }}-${{ github.job }}-
           purge-created: 0
           purge-primary-key: never
+      # End-to-end CLI suite (tests/e2e/basic): drive the built binary at the
+      # process boundary (argv, exit bands, `-o json`, error paths). No hypervisor;
+      # `--no-link` leaves the coverage `result` symlink below untouched.
+      - name: End-to-end CLI
+        run: nix build -L --no-link .#checks.x86_64-linux.tests-e2e-cli
       # Line coverage over the CI-runnable suite (tier-1/2); the `live` tier-3 tests
       # need a hypervisor and never run in CI, so they are excluded by design.
       - name: Coverage
