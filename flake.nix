@@ -88,6 +88,18 @@
                 bats e2e/basic/
                 touch "$out"
               '';
+
+          # The project-docs structure gate: the vendored validator
+          # (scripts/validate_docs.py) checks the docs/ tree, frontmatter, ADR
+          # sections, the decisions index (both directions), the AGENTS.md pointer,
+          # and the mandatory mermaid blocks. Structure only, never content. Pure
+          # Python stdlib, so it runs in the sandbox.
+          projectDocs = pkgs.runCommand "sandy-project-docs" { nativeBuildInputs = [ pkgs.python3 ]; } ''
+            cp -r ${./docs} docs
+            cp ${./AGENTS.md} AGENTS.md
+            python3 ${./scripts/validate_docs.py} .
+            touch "$out"
+          '';
         in
         {
           treefmt = {
@@ -161,6 +173,15 @@
               language = "system";
               pass_filenames = true;
             };
+            project-docs = {
+              enable = true;
+              name = "project-docs structure";
+              description = "Validate the docs/ tree, frontmatter, ADRs, the decisions index, and the AGENTS.md pointer";
+              entry = "${pkgs.python3}/bin/python3 scripts/validate_docs.py .";
+              files = "^(docs/.*|AGENTS\\.md|scripts/validate_docs\\.py)$";
+              language = "system";
+              pass_filenames = false;
+            };
           };
 
           packages = sandyPackages // {
@@ -177,6 +198,7 @@
               coverage
               ;
             tests-e2e-cli = testsE2eCli;
+            project-docs = projectDocs;
           };
 
           # Built with covCraneLib so the toolchain on PATH carries
