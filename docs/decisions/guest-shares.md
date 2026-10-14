@@ -88,8 +88,9 @@ Outputs are a writable share collected to the host `DEST` at teardown and listed
 in `envelope.outputs`. Collection **skips symlinks** and caps bytes/entries.
 
 **Consequences.** A job dropping `out/x → /etc/shadow` neither leaks the target's
-bytes nor plants a host-escaping link. Copying inputs is fine for typical sizes;
-a no-copy / arbitrary-path variant is deferred (#82).
+bytes nor plants a host-escaping link. Copying inputs is fine for typical sizes.
+Arbitrary guest paths landed on the retained copy (§6); a no-copy direct-share
+variant is the local optimization in §7 (#82).
 
 ## 5. Fixed tags, not pooled
 
@@ -105,3 +106,105 @@ dynamic-mount machinery is unnecessary and was removed.
 
 **Set aside.** Pooled `sandy<N>` dynamic tags: dropped once fixed tags proved
 sufficient for the one-job-per-VM model.
+
+## 6. Arbitrary guest paths via a manifest
+
+**Status:** accepted.
+
+**Context.** A job often expects an input at a specific path (e.g. `/workspace`),
+not only under `/run/sandy/inputs/<name>`. Forcing the fixed mount point makes the
+caller rewrite the job or symlink by hand.
+
+**Decision.** `--input HOST:/guest/path` surfaces an input at an absolute guest
+path; `HOST:NAME` is unchanged. The host writes a tab-separated manifest
+(`.sandy-inputs`: `name / guest_path / source / hash` per input) into the inputs
+share, and a guest boot step symlinks each `guest_path` to the staged entry before
+READY. The input is staged under an internal `in<index>` name.
+
+**Consequences.** Placement is decoupled from the source: identical whether the
+bytes came from a copy (today), a direct share (§7), or an object store later. The
+manifest's `source`/`hash` columns are the forward slot for those. Proven by the
+live test `an_input_appears_at_an_absolute_guest_path`.
+
+## 7. No-copy direct share is a local-only, placement-aware optimization
+
+**Status:** accepted (design); implementation deferred (#82, separate session).
+
+**Context.** Copying a multi-GB input into staging is wasteful when the input
+already lives on the machine that runs the job. A no-copy virtio-fs share of the
+host dir avoids the copy, but only exists when the job runs on that host.
+
+**Decision.** Direct-share is taken **only** when the job's target host is the
+machine holding the input (placement-aware). Mechanism: the input gets its own
+read-only `ShareSpec`/virtio-fs tag instead of a staging copy, and the manifest
+records `source = "direct"`. The staging seam carries placement so it chooses
+direct-share vs copy; when the orchestrator (#36) schedules elsewhere, it falls
+back to copy/transport. In today's single-host world the target is always local,
+so direct-share always applies.
+
+**Consequences.** The "no-copy" win is local; it does not generalize to a fleet
+(the input is not on the chosen host). A direct-shared read-only input stays RO at
+the host boundary, same as a copied input (§2). Handoff for the implementer:
+extend `source` to `direct`, add a per-input RO `ShareSpec`, gate on
+`target == current machine`, keep the copy path as the fleet/remote fallback.
+Acceptance: a large local input mounts without a staging copy and is read-only
+in-guest; a non-local target falls back to copy.
+
+**Set aside (do not re-propose without new information).** Unconditional (global)
+direct-share: impossible once an orchestrator picks the host — the input is not
+there, so the no-copy share cannot exist.
+
+## 8. Content-addressed inputs (hashing)
+
+**Status:** proposed.
+
+**Context.** A fleet orchestrator (#36) wants to dedupe inputs and schedule a job
+onto an agent that already has the input cached (cache-affinity), and the result
+envelope wants input integrity/provenance (a placeholder today).
+
+**Decision.** Inputs carry a content hash — the manifest's reserved `hash` column.
+Empty today; the direction is to populate it so an input is addressed by content,
+enabling dedup, a warm-cache scheduling hint, and integrity in the envelope.
+
+**Consequences.** Hashing is the key that makes orchestrator-guided placement and
+provenance tractable. Not wired yet; the slot exists so it lands without a manifest
+format change.
+
+**Set aside.** Mutable path/URL addressing: loses safe cache reuse and integrity.
+
+## 9. Object stores are reached via tools, not a mount
+
+**Status:** accepted.
+
+**Context.** A native `--mount s3://` would make sandy an object-store client,
+pushing cloud credentials and network into the guest and widening INV-1's surface.
+Most of the time a job, or another sandbox, owns what it transports.
+
+**Decision.** sandy does not mount object stores. A job reaches S3/object storage
+from inside the guest via its own tools (`aws`, `rclone`, …) with a scoped
+credential (the credential seam) and an egress allow. This reframes #67 from
+"reintroduce `--mount` as an S3 mount" to this stance.
+
+**Consequences.** The guest's object-store access is an explicit credential + egress
+grant, auditable like the forge token, not a hidden sandy mount. #67 should be
+closed or repurposed to record this.
+
+**Set aside.** Native `--mount s3://`: rejected — credential + network surface in
+the guest for no gain over a scoped tool grant.
+
+## 10. Sandbox-to-sandbox data pipeline (direction)
+
+**Status:** proposed.
+
+**Context.** The common case is not "sandy owns the input" but "another sandbox
+produced it": a job's output feeds another job's input. A content-addressed handoff
+between sandboxes is the real shape behind the object-store question.
+
+**Decision.** Capture this as a **future direction**, not a committed design: a
+pipeline where sandbox outputs (content-hashed, §8) become other sandboxes' inputs,
+placement-optimized by the orchestrator (#36) and the agent daemon (#65). Not built
+in the input seam.
+
+**Consequences.** Keeps the input model focused (copy + manifest + local
+direct-share) while naming where it grows. It belongs with the agent-model epic
+(#36/#65), not here.
