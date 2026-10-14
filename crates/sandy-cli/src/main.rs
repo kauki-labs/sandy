@@ -11,7 +11,7 @@ use sandy_cli::{
     app_register::{self, Owner},
     doctor,
     output::{OutputFormat, format_doctor, format_envelope, format_gc, format_record, format_records},
-    plan::{RunArgs, parse_run},
+    plan::{JobPlan, RunArgs, parse_run},
     supervisor,
 };
 
@@ -360,25 +360,147 @@ fn parse_caps(tokens: &[String]) -> Result<Vec<sandy::Capability>, String> {
     tokens.iter().map(|t| sandy::parse_capability(t)).collect()
 }
 
+/// Dispatch `sandy doctor`: print the host-prerequisite verdict and return its
+/// exit band. Needs no journal, so it runs before `$SANDY_HOME` is touched.
+fn dispatch_doctor(output: OutputFormat) -> i32 {
+    let result = doctor::run_doctor();
+    match output {
+        // Plain keeps the stream convention (ok→stdout, refusal→stderr); JSON
+        // always goes to stdout so an agent reads the verdict from one channel.
+        OutputFormat::Plain if result.exit_code != 0 => eprintln!("{}", result.message),
+        OutputFormat::Plain => println!("{}", result.message),
+        OutputFormat::Json => match format_doctor(result.exit_code, &result.message, output) {
+            Ok(json) => println!("{json}"),
+            Err(e) => {
+                eprintln!("sandy: could not serialize output: {e}");
+                return ProcessExit::InfraFault.code();
+            }
+        },
+    }
+    result.exit_code
+}
+
+/// Mint a scoped forge token from the named trust root, stage it under a
+/// per-process dir, and run the job bracketed by it (mint → inject → revoke at
+/// teardown). Setup faults (bad trust-roots dir, unknown capability) map to an
+/// exit band before any boot; the staging dir is always removed. The error arm
+/// carries the process band so the caller returns it directly.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "forwards the run and credential inputs to run_job_with_credential"
+)]
+fn run_credentialed<B: sandy::VmBackend, E: sandy::EgressApplier>(
+    backend: &B,
+    journal: &Journal,
+    plan: JobPlan,
+    egress: &E,
+    egress_os: sandy::EgressOs,
+    tap: Option<&str>,
+    name: &str,
+    cred_capability: &[String],
+) -> Result<supervisor::RunReport, i32> {
+    let dir = app_register::trust_roots_dir().map_err(|e| {
+        eprintln!("sandy: trust-roots dir: {e}");
+        ProcessExit::InfraFault.code()
+    })?;
+    let (adapter, scope) = credential_setup(&dir, name, cred_capability).map_err(|e| {
+        eprintln!("sandy: {e}");
+        ProcessExit::InvalidPlan.code()
+    })?;
+    let cred_dir = std::env::temp_dir().join(format!("sandy-cred-{}", std::process::id()));
+    std::fs::create_dir_all(&cred_dir).map_err(|e| {
+        eprintln!("sandy: create credential staging dir: {e}");
+        ProcessExit::InfraFault.code()
+    })?;
+    let result = supervisor::run_job_with_credential(
+        backend,
+        journal,
+        plan,
+        egress,
+        egress_os,
+        tap,
+        &adapter,
+        &scope,
+        "GITHUB_TOKEN",
+        &cred_dir,
+        sandy::MAX_TTL_SECS,
+    );
+    let _ = std::fs::remove_dir_all(&cred_dir);
+    result.map_err(|e| {
+        eprintln!("sandy: run failed: {e}");
+        ProcessExit::InfraFault.code()
+    })
+}
+
+/// Dispatch `sandy run`: parse the plan, bracket the boot with egress and an
+/// optional credential, print the result envelope, and return the process exit
+/// band (INV-11).
+fn dispatch_run(
+    args: RunArgs,
+    credential: Option<String>,
+    cred_capability: &[String],
+    journal: &Journal,
+    output: OutputFormat,
+) -> i32 {
+    let plan = match parse_run(args) {
+        Ok(plan) => plan,
+        Err(e) => {
+            eprintln!("sandy: {e}");
+            return ProcessExit::InvalidPlan.code();
+        }
+    };
+    let backend = host_backend();
+    // Egress is bracketed around the boot per platform: Linux enforces the
+    // nftables boundary, macOS has none (`plan_egress` → NoBoundary, so the
+    // no-op applier is never called).
+    let egress = egress_applier();
+    let egress_os = if cfg!(target_os = "macos") {
+        sandy::EgressOs::MacOs
+    } else {
+        sandy::EgressOs::Linux
+    };
+    // The guest's tap (if any) comes from $SANDY_TAP — the same interface the
+    // backend attaches the NIC to. On Linux a bound tap selects the guest-scoped
+    // forward ruleset (safe), never the host-OUTPUT drop-all (#29).
+    let tap = std::env::var("SANDY_TAP").ok().filter(|t| !t.is_empty());
+
+    // With `--credential`, mint a scoped forge token and bracket the run with it;
+    // otherwise run with no credential.
+    let report = match credential {
+        Some(name) => match run_credentialed(
+            &backend,
+            journal,
+            plan,
+            &egress,
+            egress_os,
+            tap.as_deref(),
+            &name,
+            cred_capability,
+        ) {
+            Ok(report) => report,
+            Err(code) => return code,
+        },
+        None => match supervisor::run_job(&backend, journal, &plan, &egress, egress_os, tap.as_deref()) {
+            Ok(report) => report,
+            Err(e) => {
+                eprintln!("sandy: run failed: {e}");
+                return ProcessExit::InfraFault.code();
+            }
+        },
+    };
+    // The envelope is the result, not a diagnostic — print it (the band, not
+    // stdout, signals failure) and exit on the process band.
+    if let Err(code) = emit(format_envelope(&report.envelope, output)) {
+        return code;
+    }
+    report.process_exit.code()
+}
+
 /// Dispatch one parsed command and return the process exit band (INV-11).
 fn dispatch(command: Command, output: OutputFormat) -> i32 {
     // Doctor needs no journal; handle it before touching `$SANDY_HOME`.
     if let Command::Doctor = command {
-        let result = doctor::run_doctor();
-        match output {
-            // Plain keeps the stream convention (ok→stdout, refusal→stderr); JSON
-            // always goes to stdout so an agent reads the verdict from one channel.
-            OutputFormat::Plain if result.exit_code != 0 => eprintln!("{}", result.message),
-            OutputFormat::Plain => println!("{}", result.message),
-            OutputFormat::Json => match format_doctor(result.exit_code, &result.message, output) {
-                Ok(json) => println!("{json}"),
-                Err(e) => {
-                    eprintln!("sandy: could not serialize output: {e}");
-                    return ProcessExit::InfraFault.code();
-                }
-            },
-        }
-        return result.exit_code;
+        return dispatch_doctor(output);
     }
 
     // `cred` ops need only the user config dir, not $SANDY_HOME.
@@ -421,88 +543,7 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
                 timeout,
                 command,
             };
-            let plan = match parse_run(args) {
-                Ok(plan) => plan,
-                Err(e) => {
-                    eprintln!("sandy: {e}");
-                    return ProcessExit::InvalidPlan.code();
-                }
-            };
-            let backend = host_backend();
-            // Egress is bracketed around the boot per platform: Linux enforces the
-            // nftables boundary, macOS has none (`plan_egress` → NoBoundary, so the
-            // no-op applier is never called).
-            let egress = egress_applier();
-            let egress_os = if cfg!(target_os = "macos") {
-                sandy::EgressOs::MacOs
-            } else {
-                sandy::EgressOs::Linux
-            };
-            // The guest's tap (if any) comes from $SANDY_TAP — the same interface the
-            // backend attaches the NIC to. On Linux a bound tap selects the
-            // guest-scoped forward ruleset (safe), never the host-OUTPUT drop-all (#29).
-            let tap = std::env::var("SANDY_TAP").ok().filter(|t| !t.is_empty());
-
-            // With `--credential`, mint a scoped forge token from the named trust
-            // root and bracket the run with it (mint → inject → revoke at teardown);
-            // otherwise run with no credential. Setup errors (bad trust root or
-            // capability) are config faults (band 2), before any boot.
-            let report = if let Some(name) = credential {
-                let dir = match app_register::trust_roots_dir() {
-                    Ok(dir) => dir,
-                    Err(e) => {
-                        eprintln!("sandy: trust-roots dir: {e}");
-                        return ProcessExit::InfraFault.code();
-                    }
-                };
-                let (adapter, scope) = match credential_setup(&dir, &name, &cred_capability) {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        eprintln!("sandy: {e}");
-                        return ProcessExit::InvalidPlan.code();
-                    }
-                };
-                let cred_dir = std::env::temp_dir().join(format!("sandy-cred-{}", std::process::id()));
-                if let Err(e) = std::fs::create_dir_all(&cred_dir) {
-                    eprintln!("sandy: create credential staging dir: {e}");
-                    return ProcessExit::InfraFault.code();
-                }
-                let result = supervisor::run_job_with_credential(
-                    &backend,
-                    &journal,
-                    plan,
-                    &egress,
-                    egress_os,
-                    tap.as_deref(),
-                    &adapter,
-                    &scope,
-                    "GITHUB_TOKEN",
-                    &cred_dir,
-                    sandy::MAX_TTL_SECS,
-                );
-                let _ = std::fs::remove_dir_all(&cred_dir);
-                match result {
-                    Ok(report) => report,
-                    Err(e) => {
-                        eprintln!("sandy: run failed: {e}");
-                        return ProcessExit::InfraFault.code();
-                    }
-                }
-            } else {
-                match supervisor::run_job(&backend, &journal, &plan, &egress, egress_os, tap.as_deref()) {
-                    Ok(report) => report,
-                    Err(e) => {
-                        eprintln!("sandy: run failed: {e}");
-                        return ProcessExit::InfraFault.code();
-                    }
-                }
-            };
-            // The envelope is the result, not a diagnostic — print it (the band,
-            // not stdout, signals failure) and exit on the process band.
-            if let Err(code) = emit(format_envelope(&report.envelope, output)) {
-                return code;
-            }
-            report.process_exit.code()
+            dispatch_run(args, credential, &cred_capability, &journal, output)
         }
         Command::Ls => match supervisor::ls(&journal) {
             Ok(records) => succeed_or(emit(format_records(&records, output))),
