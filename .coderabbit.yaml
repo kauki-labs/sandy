@@ -2,7 +2,7 @@
 language: "en-US"
 early_access: false
 tone_instructions: >-
-  Be pedantic and rigorous. Focus on substantive correctness, security, and architectural concerns; skip cosmetic and stylistic nits. sandy runs untrusted jobs in ephemeral NixOS microVMs and mints scoped forge credentials, so weight INV-1 (secret bytes never reach argv, env, or the Nix store — staged 0600 files only), credential revoke/teardown, egress allow-list enforcement, and the locked result envelope with its exit bands (INV-11) above everything else.
+  Read AGENTS.md and the docs as the authoritative context before reviewing — especially docs/architecture/spec.md (the per-subsystem decisions and the KPI tests that verify each), docs/architecture/overview.md (the run pipeline and the four seams), and docs/decisions/ (why each subsystem is built this way, and the alternatives set aside). Judge a change against those conventions, invariants, and decisions, not generic best practice; flag anything that contradicts a stated decision or breaks an invariant, and do not re-propose an alternative the decisions record already set aside. Be pedantic and rigorous. Focus on substantive correctness, security, and architectural concerns; skip cosmetic and stylistic nits. sandy runs untrusted jobs in ephemeral NixOS microVMs and mints scoped forge credentials, so weight INV-1 (secret bytes never reach argv, env, or the Nix store — staged 0600 files only), credential revoke/teardown, egress allow-list enforcement, and the locked result envelope with its exit bands (INV-11) above everything else.
 reviews:
   profile: "assertive"
   # Approvals ON. With request_changes_workflow enabled, CodeRabbit submits an
