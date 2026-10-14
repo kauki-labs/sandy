@@ -99,7 +99,7 @@ jobs:
       - name: Dependency hygiene
         run: nix build -L .#checks.x86_64-linux.shear
       - name: Build and docs
-        run: nix build -L .#checks.x86_64-linux.sandy .#checks.x86_64-linux.doc .#checks.x86_64-linux.pre-commit
+        run: nix build -L .#checks.x86_64-linux.sandy .#checks.x86_64-linux.doc .#checks.x86_64-linux.pre-commit .#checks.x86_64-linux.project-docs
   coverage:
     # One test run, instrumented: cargo-llvm-cov runs the whole CI suite and emits
     # the lcov report, so a separate plain `cargo nextest` job would just run the
