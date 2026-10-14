@@ -102,6 +102,18 @@
                 [ -f "$f" ] && export "''${f##*/}=$(cat "$f")"
               done
             fi
+            # Arbitrary guest paths: sandy writes a tab-separated manifest
+            # (sandy's INPUT_MANIFEST_NAME) listing each input that asked to appear
+            # at an absolute path; symlink each one to its staged entry. Line 1 is
+            # the version; columns are name, guest_path, source, hash (last two
+            # reserved). Runs before the READY marker so the job sees the links.
+            if [ -f /run/sandy/inputs/.sandy-inputs ]; then
+              tail -n +2 /run/sandy/inputs/.sandy-inputs | while IFS="$(printf '\t')" read -r name path _; do
+                [ -n "$name" ] && [ -n "$path" ] || continue
+                mkdir -p "$(dirname "$path")"
+                ln -sfn "/run/sandy/inputs/$name" "$path"
+              done
+            fi
             printf 'SANDY-READY\n'
           '';
 

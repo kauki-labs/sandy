@@ -254,6 +254,7 @@ fn credential_secret_input_output_all_compose() -> anyhow::Result<()> {
         inputs: vec![Input {
             host: staging.path().join("in"),
             name: "data".to_string(),
+            guest_path: None,
         }],
         outputs: vec![Output {
             name: Some("result".to_string()),

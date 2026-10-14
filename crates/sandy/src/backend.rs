@@ -23,12 +23,20 @@ use serde::{Deserialize, Serialize};
 /// The host path (a file or a directory) is staged into the inputs share; the
 /// guest mounts that share read-only, so a write to the input fails with
 /// `EROFS`. Inputs are plain data, not a secret channel (INV-1).
+///
+/// With [`guest_path`](Input::guest_path) set, a guest boot step additionally
+/// symlinks that path to the staged entry, so the job reads the input where it
+/// expects it (e.g. `/workspace`) rather than only under `/run/sandy/inputs`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Input {
     /// Host path to expose (a file or a directory tree).
     pub host: PathBuf,
-    /// The name the input appears under at `/run/sandy/inputs/<name>` in-guest.
+    /// The name the input is staged under at `/run/sandy/inputs/<name>` in-guest.
     pub name: String,
+    /// Optional absolute guest path to also surface this input at, via a
+    /// guest-side symlink to the staged entry. `None` leaves it only at
+    /// `/run/sandy/inputs/<name>`.
+    pub guest_path: Option<PathBuf>,
 }
 
 /// A writable output collected from the guest at teardown.

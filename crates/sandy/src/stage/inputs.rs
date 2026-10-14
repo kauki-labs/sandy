@@ -8,8 +8,12 @@
 //!
 //! Inputs are copied (not bind-mounted) so multiple arbitrary host paths share
 //! one fixed tag — the same single-share shape the secret channel uses, which
-//! keeps the guest mount static. A no-copy / arbitrary-guest-path variant is a
-//! follow-up (#34).
+//! keeps the guest mount static.
+//!
+//! An input may also declare an absolute guest path; [`stage_inputs`] then writes
+//! an [`INPUT_MANIFEST_NAME`] manifest into the share and a guest boot step
+//! symlinks each path to the staged entry. A no-copy direct-share variant (for
+//! large inputs) is still a follow-up (#82).
 
 use std::{fs, os::unix::fs::PermissionsExt, path::Path};
 
@@ -19,6 +23,17 @@ use crate::backend::{BackendError, Input};
 /// can statically mount it at `/run/sandy/inputs`; it MUST match the guest flake's
 /// `fileSystems` device for that mount.
 pub const INPUT_MOUNT_TAG: &str = "sandy-inputs";
+
+/// The manifest file the host writes into the inputs share when any input declares
+/// a guest path. A guest boot step reads it and symlinks each `guest_path` to the
+/// staged entry. Reserved: a user input may not take this name. It MUST match the
+/// path the guest flake's symlink step reads.
+///
+/// Format: a version line (`1`), then one tab-separated record per guest-path
+/// input, `name<TAB>guest_path<TAB>source<TAB>hash`. `source`/`hash` are reserved
+/// for the direct-share (#82) and content-addressing work (`copy` / empty today).
+/// Tab-separated, not JSON, so the tiny guest parses it with coreutils, no `jq`.
+pub const INPUT_MANIFEST_NAME: &str = ".sandy-inputs";
 
 /// Stage each input under `inputs_dir/<name>` in a freshly created `0700` dir,
 /// copying the host file or directory tree.
@@ -44,13 +59,39 @@ pub fn stage_inputs(inputs: &[Input], inputs_dir: &Path) -> Result<usize, Backen
         copy_path(&input.host, &inputs_dir.join(&input.name))?;
         tracing::debug!(name = %input.name, host = %input.host.display(), "staged input (ro)");
     }
+    write_manifest(inputs, inputs_dir)?;
     Ok(inputs.len())
+}
+
+/// Write the inputs manifest ([`INPUT_MANIFEST_NAME`]) for every input that
+/// declares a guest path, so the guest can symlink it into place. Writes nothing
+/// when no input declares a path, keeping the no-guest-path run byte-for-byte as
+/// before.
+fn write_manifest(inputs: &[Input], inputs_dir: &Path) -> Result<(), BackendError> {
+    let mut records = String::new();
+    for input in inputs {
+        if let Some(path) = &input.guest_path {
+            // source=copy, hash empty: both reserved for #82 / content-addressing.
+            records.push_str(&format!("{}\t{}\tcopy\t\n", input.name, path.to_string_lossy()));
+        }
+    }
+    if records.is_empty() {
+        return Ok(());
+    }
+    let body = format!("1\n{records}");
+    let path = inputs_dir.join(INPUT_MANIFEST_NAME);
+    fs::write(&path, body).map_err(|e| err("write input manifest", &path, &e))
 }
 
 /// An input name is a single safe path component: non-empty, no `/`, and not `.`
 /// or `..`. It becomes a directory entry under the inputs share, so a separator or
 /// `..` would be a path-traversal out of the staging dir.
 fn validate_input_name(name: &str) -> Result<(), BackendError> {
+    if name == INPUT_MANIFEST_NAME {
+        return Err(BackendError::Spawn(format!(
+            "input name {name:?} is reserved for the inputs manifest"
+        )));
+    }
     let safe = !name.is_empty() && name != "." && name != ".." && !name.contains('/');
     if !safe {
         return Err(BackendError::Spawn(format!(
@@ -103,10 +144,12 @@ mod tests {
             Input {
                 host: src.path().join("f.txt"),
                 name: "file".to_string(),
+                guest_path: None,
             },
             Input {
                 host: src.path().join("tree"),
                 name: "dir".to_string(),
+                guest_path: None,
             },
         ];
 
@@ -117,6 +160,64 @@ mod tests {
         assert_eq!(fs::read(inputs_dir.join("dir").join("nested"))?, b"deep");
         let mode = fs::metadata(&inputs_dir)?.permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "inputs dir is 0700, got {mode:#o}");
+        // No input declared a guest path, so no manifest is written (unchanged shape).
+        assert!(
+            !inputs_dir.join(INPUT_MANIFEST_NAME).exists(),
+            "no manifest without a guest path"
+        );
+        Ok(())
+    }
+
+    /// An input with a guest path is staged under its internal name and recorded
+    /// in the manifest with the reserved `source`/`hash` slots, so the guest step
+    /// can symlink the path to the staged entry.
+    #[test]
+    fn writes_a_manifest_for_guest_path_inputs() -> anyhow::Result<()> {
+        let src = tempfile::TempDir::new()?;
+        fs::write(src.path().join("d"), b"data")?;
+        let out = tempfile::TempDir::new()?;
+        let inputs_dir = out.path().join("inputs");
+        let inputs = [
+            Input {
+                host: src.path().join("d"),
+                name: "in0".to_string(),
+                guest_path: Some(std::path::PathBuf::from("/workspace/data")),
+            },
+            Input {
+                host: src.path().join("d"),
+                name: "plain".to_string(),
+                guest_path: None,
+            },
+        ];
+
+        stage_inputs(&inputs, &inputs_dir)?;
+
+        let raw = fs::read_to_string(inputs_dir.join(INPUT_MANIFEST_NAME))?;
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(lines[0], "1", "version line");
+        let records: Vec<&str> = lines[1..].to_vec();
+        assert_eq!(records.len(), 1, "only the guest-path input is recorded");
+        let cols: Vec<&str> = records[0].split('\t').collect();
+        assert_eq!(cols[0], "in0", "name");
+        assert_eq!(cols[1], "/workspace/data", "guest path");
+        assert_eq!(cols[2], "copy", "source slot");
+        assert_eq!(cols[3], "", "hash slot reserved, empty today");
+        Ok(())
+    }
+
+    /// Adversarial: an input may not take the reserved manifest name.
+    #[test]
+    fn rejects_the_reserved_manifest_name() -> anyhow::Result<()> {
+        let src = tempfile::TempDir::new()?;
+        let host = src.path().join("f");
+        fs::write(&host, b"x")?;
+        let out = tempfile::TempDir::new()?;
+        let inputs = [Input {
+            host,
+            name: INPUT_MANIFEST_NAME.to_string(),
+            guest_path: None,
+        }];
+        assert!(stage_inputs(&inputs, &out.path().join("inputs")).is_err());
         Ok(())
     }
 
@@ -143,6 +244,7 @@ mod tests {
             let inputs = [Input {
                 host: host.clone(),
                 name: bad.to_string(),
+                guest_path: None,
             }];
             assert!(
                 stage_inputs(&inputs, &out.path().join("inputs")).is_err(),

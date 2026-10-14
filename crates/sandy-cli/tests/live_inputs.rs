@@ -11,7 +11,7 @@
 //!     env SANDY_LIVE=1 cargo nextest run -p sandy-cli --features live --test live_inputs
 #![cfg(feature = "live")]
 
-use std::{path::Path, process::Command};
+use std::process::Command;
 
 use anyhow::Context;
 
@@ -23,10 +23,9 @@ use common::{LiveTarget, build_guest, guest_flake, require_live};
 /// envelope. The guest runner space-joins the trailing argv and pipes it to `sh`,
 /// so the command is passed as one shell string (not `sh -c`, whose quoting the
 /// join would flatten).
-fn run_with_input(target: &LiveTarget, host: &Path, sh_command: &str) -> anyhow::Result<(i32, serde_json::Value)> {
+fn run_with_input(target: &LiveTarget, input_arg: &str, sh_command: &str) -> anyhow::Result<(i32, serde_json::Value)> {
     let home = tempfile::tempdir().context("temp SANDY_HOME")?;
     let attr = format!("{}#{}", guest_flake().display(), target.topology_attr);
-    let input_arg = format!("{}:data", host.display());
     let output = Command::new(env!("CARGO_BIN_EXE_sandy"))
         .env("SANDY_HOME", home.path())
         .args([
@@ -37,7 +36,7 @@ fn run_with_input(target: &LiveTarget, host: &Path, sh_command: &str) -> anyhow:
             "--timeout",
             "120",
             "--input",
-            &input_arg,
+            input_arg,
             "--",
             sh_command,
         ])
@@ -62,9 +61,10 @@ fn an_input_is_readable_in_guest() -> anyhow::Result<()> {
     let src = tempfile::tempdir().context("input source dir")?;
     std::fs::write(src.path().join("file"), b"sandy-input-ok")?;
 
+    let input_arg = format!("{}:data", src.path().display());
     let (_, env) = run_with_input(
         &target,
-        src.path(),
+        &input_arg,
         "grep -q sandy-input-ok /run/sandy/inputs/data/file",
     )?;
 
@@ -86,12 +86,31 @@ fn an_input_is_read_only_erofs() -> anyhow::Result<()> {
     // read must succeed, then a write must fail; exit 0 only when both hold.
     let probe = "cat /run/sandy/inputs/data/file >/dev/null && { touch /run/sandy/inputs/data/x 2>/dev/null && exit \
                  10; exit 0; }";
-    let (_, env) = run_with_input(&target, src.path(), probe)?;
+    let input_arg = format!("{}:data", src.path().display());
+    let (_, env) = run_with_input(&target, &input_arg, probe)?;
 
     assert_eq!(env["status"], "succeeded", "ro-input run envelope: {env}");
     assert_eq!(
         env["exit_code"], 0,
         "input is readable and a write is rejected (EROFS): {env}"
     );
+    Ok(())
+}
+
+/// An input given an absolute guest path (`HOST:/workspace`) is symlinked there by
+/// the guest manifest step, so the job reads it at that path, not only under
+/// `/run/sandy/inputs`. (Item-1 of #82.)
+#[test]
+fn an_input_appears_at_an_absolute_guest_path() -> anyhow::Result<()> {
+    let target = require_live()?;
+    build_guest(&target)?;
+    let src = tempfile::tempdir().context("input source dir")?;
+    std::fs::write(src.path().join("file"), b"sandy-guest-path-ok")?;
+
+    let input_arg = format!("{}:/workspace", src.path().display());
+    let (_, env) = run_with_input(&target, &input_arg, "grep -q sandy-guest-path-ok /workspace/file")?;
+
+    assert_eq!(env["status"], "succeeded", "guest-path input envelope: {env}");
+    assert_eq!(env["exit_code"], 0, "input readable at the absolute guest path: {env}");
     Ok(())
 }

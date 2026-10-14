@@ -129,8 +129,10 @@ pub fn parse_run(args: RunArgs) -> Result<JobPlan, PlanError> {
     let inputs = args
         .inputs
         .iter()
-        .map(|raw| parse_input(raw))
+        .enumerate()
+        .map(|(i, raw)| parse_input(raw, i))
         .collect::<Result<Vec<_>, _>>()?;
+    reject_duplicate_input_names(&inputs)?;
     let outputs = args
         .outputs
         .iter()
@@ -174,20 +176,75 @@ pub fn parse_run(args: RunArgs) -> Result<JobPlan, PlanError> {
     })
 }
 
-/// Parse one `--input HOST:NAME` token into an [`Input`]: the host path `HOST`
-/// (a file or directory) appears read-only at `/run/sandy/inputs/NAME` in-guest.
-/// Split on the last `:`, so the host path is unrestricted and `NAME` is the
-/// trailing component; `NAME` must be a single path element.
-fn parse_input(raw: &str) -> Result<Input, PlanError> {
-    let invalid = || PlanError::Invalid(format!("--input `{raw}` must be HOST:NAME"));
-    let (host, name) = raw.rsplit_once(':').ok_or_else(invalid)?;
-    if host.is_empty() || name.is_empty() || name.contains('/') || name == "." || name == ".." {
+/// Parse one `--input` token into an [`Input`]. Split on the last `:`, so the host
+/// path is unrestricted; the trailing field is either:
+///
+/// - `NAME` (a single path element) — the input appears read-only at `/run/sandy/inputs/NAME` in-guest, as before.
+/// - `/guest/path` (leading `/`) — the input is surfaced at that absolute guest path via a guest-side symlink; it is
+///   staged under an internal name `in<index>` the job never needs to know.
+///
+/// `index` disambiguates the auto-assigned staging name across inputs.
+fn parse_input(raw: &str, index: usize) -> Result<Input, PlanError> {
+    let invalid = || PlanError::Invalid(format!("--input `{raw}` must be HOST:NAME or HOST:/guest/path"));
+    let (host, spec) = raw.rsplit_once(':').ok_or_else(invalid)?;
+    if host.is_empty() || spec.is_empty() {
+        return Err(invalid());
+    }
+    if spec.starts_with('/') {
+        validate_guest_path(spec).ok_or_else(|| {
+            PlanError::Invalid(format!(
+                "--input `{raw}`: guest path `{spec}` must be absolute with no `.`/`..` component"
+            ))
+        })?;
+        return Ok(Input {
+            host: PathBuf::from(host),
+            name: format!("in{index}"),
+            guest_path: Some(PathBuf::from(spec)),
+        });
+    }
+    if spec.contains('/') || spec == "." || spec == ".." {
         return Err(invalid());
     }
     Ok(Input {
         host: PathBuf::from(host),
-        name: name.to_string(),
+        name: spec.to_string(),
+        guest_path: None,
     })
+}
+
+/// An input guest path is absolute and has no `.`/`..`/empty component (so the
+/// guest symlink target is well-defined and cannot climb out). Returns `None`
+/// when it is not usable.
+fn validate_guest_path(path: &str) -> Option<()> {
+    // Tab/newline would corrupt the tab-separated inputs manifest the guest reads.
+    if path.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    let rest = path.strip_prefix('/')?;
+    if rest.is_empty() {
+        return None; // bare `/`
+    }
+    for part in rest.split('/') {
+        if part.is_empty() || part == "." || part == ".." {
+            return None;
+        }
+    }
+    Some(())
+}
+
+/// Reject two inputs resolving to the same staging name (a user `NAME` colliding
+/// with an auto-assigned `in<index>`), which would overwrite one in the share.
+fn reject_duplicate_input_names(inputs: &[Input]) -> Result<(), PlanError> {
+    let mut seen = std::collections::HashSet::new();
+    for input in inputs {
+        if !seen.insert(input.name.as_str()) {
+            return Err(PlanError::Invalid(format!(
+                "two inputs resolve to the same name `{}` in the inputs share",
+                input.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Parse one `--out` token into an [`Output`]. Two forms:
@@ -365,6 +422,60 @@ mod tests {
             assert!(
                 matches!(parse_run(args), Err(PlanError::Invalid(_))),
                 "a malformed --input {raw:?} must yield PlanError::Invalid"
+            );
+        }
+    }
+
+    /// `--input HOST:/guest/path` parses to an input staged under an internal
+    /// `in<index>` name and carrying the absolute guest path.
+    #[test]
+    fn input_guest_path_parses() -> anyhow::Result<()> {
+        let args = RunArgs {
+            template: "demo".to_string(),
+            inputs: vec!["/host/data:/workspace".to_string()],
+            ..RunArgs::default()
+        };
+        let plan = parse_run(args).map_err(|e| anyhow::anyhow!("parse_run: {e}"))?;
+        let input = plan.inputs.first().expect("one input parsed");
+        assert_eq!(input.host.to_string_lossy(), "/host/data");
+        assert_eq!(input.name, "in0");
+        assert_eq!(input.guest_path.as_deref(), Some(std::path::Path::new("/workspace")));
+        Ok(())
+    }
+
+    /// Adversarial: a guest path that is bare `/` or has a `.`/`..`/empty component
+    /// is rejected (the symlink target must be well-defined and cannot climb out).
+    #[test]
+    fn bad_guest_path_is_invalid_plan() {
+        for raw in ["/h:/", "/h:/a/../b", "/h://x", "/h:/a/."] {
+            let args = RunArgs {
+                template: "demo".to_string(),
+                inputs: vec![raw.to_string()],
+                ..RunArgs::default()
+            };
+            assert!(
+                matches!(parse_run(args), Err(PlanError::Invalid(_))),
+                "a bad --input guest path {raw:?} must be rejected"
+            );
+        }
+    }
+
+    /// Adversarial: two inputs resolving to the same staging name are rejected,
+    /// including a user name colliding with an auto-assigned `in<index>`.
+    #[test]
+    fn duplicate_input_names_are_invalid_plan() {
+        for inputs in [
+            vec!["/a:data".to_string(), "/b:data".to_string()],
+            vec!["/a:/p".to_string(), "/b:in0".to_string()],
+        ] {
+            let args = RunArgs {
+                template: "demo".to_string(),
+                inputs,
+                ..RunArgs::default()
+            };
+            assert!(
+                matches!(parse_run(args), Err(PlanError::Invalid(_))),
+                "colliding input names must be rejected"
             );
         }
     }
