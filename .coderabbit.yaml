@@ -1,0 +1,55 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: "en-US"
+early_access: false
+tone_instructions: >-
+  Be pedantic and rigorous. Focus on substantive correctness, security, and architectural concerns; skip cosmetic and stylistic nits. sandy runs untrusted jobs in ephemeral NixOS microVMs and mints scoped forge credentials, so weight INV-1 (secret bytes never reach argv, env, or the Nix store — staged 0600 files only), credential revoke/teardown, egress allow-list enforcement, and the locked result envelope with its exit bands (INV-11) above everything else.
+reviews:
+  profile: "assertive"
+  # Approvals ON. With request_changes_workflow enabled, CodeRabbit submits an
+  # APPROVE review on a clean PR and REQUEST_CHANGES when it finds actionable
+  # issues — a real second reviewer with an identity distinct from the author.
+  # The repo pushes as one GitHub account, so human cross-approval is impossible;
+  # this is the review gate.
+  request_changes_workflow: true
+  high_level_summary: false
+  review_status: false
+  commit_status: false
+  changed_files_summary: false
+  sequence_diagrams: false
+  poem: false
+  collapse_walkthrough: true
+  assess_linked_issues: true
+  suggested_labels: false
+  suggested_reviewers: false
+  path_filters:
+    - "!target/**"
+    - "!result"
+    - "!**/*.snap"
+    - "!flake.lock"
+    - "!Cargo.lock"
+  path_instructions:
+    - path: "crates/**/*.rs"
+      instructions: >-
+        Rust, edition 2024. Enforce the house rules: no `.unwrap()` / `.expect()` in library code (propagate with `?`; tests return `anyhow::Result<()>` with `.context()`); the `tracing::` prefix on log macros; `thiserror` for typed errors. Hunt behavioural defects at boundaries and error paths — a silent no-op, an off-by-one retry, a staging/production assumption — not style.
+    - path: "crates/sandy/src/cred*.rs"
+      instructions: >-
+        Credential seam (INV-1 / INV-7). A minted token must never outlive the run: check revoke-on-every-path (including the panic/teardown path), the mint→stage→revoke bracket, and that a stage failure revokes the orphaned token. A mint failure must fail exit-3 retryable, never run with no credential. Secret bytes reach only 0600 files, never argv/env/Nix store.
+    - path: "crates/sandy/src/egress.rs"
+      instructions: >-
+        Egress allow-list. A host carrying nftables syntax must be dropped, not interpolated; the default-deny floor must stay intact; a failed apply must fail closed (band-3 infra fault), never open.
+    - path: "crates/sandy-backend/**/*.rs"
+      instructions: >-
+        Native Vm backends (qemu/vfkit) and the virtio-fs share transport. Check the read-only vs read-write share distinction, that secrets never land in a writable or input share, and that teardown wipes staging on every path (INV-1).
+    - path: "**/*.nix"
+      instructions: >-
+        Nix/crane flake. A new check must be wired into `checks` and the CI gate; clippy deny-warnings and formatting stay enforced.
+  auto_review:
+    enabled: true
+    ignore_title_keywords:
+      - "WIP"
+      - "DO NOT MERGE"
+    drafts: false
+    base_branches:
+      - "main"
+chat:
+  auto_reply: true
