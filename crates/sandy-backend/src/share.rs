@@ -276,12 +276,17 @@ impl LocalDirTransport {
 
 impl GuestShareTransport for LocalDirTransport {
     fn plan(&self, shares: &[ShareSpec], _mem_mib: u32) -> Presentation {
-        // STUB (slice-2 red): empty placements, so the mapping test fails on
-        // behaviour before the real map lands.
-        let _ = shares;
+        let placements = shares
+            .iter()
+            .map(|share| Placement {
+                tag: share.tag.clone(),
+                dir: share.host_dir.clone(),
+                readonly: share.readonly,
+            })
+            .collect();
         Presentation::LocalDir {
             root: self.root.clone(),
-            placements: Vec::new(),
+            placements,
         }
     }
 
