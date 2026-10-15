@@ -33,6 +33,7 @@ mod config;
 mod console;
 mod cred;
 mod cred_github;
+mod discovery;
 mod egress;
 mod error;
 mod gc;
@@ -64,6 +65,7 @@ pub use cred::{
     should_refresh,
 };
 pub use cred_github::GithubAdapter;
+pub use discovery::{Discovery, Placement, StaticRegistry, parse_builder_systems};
 pub use egress::{
     AllowList, EgressApplier, EgressOs, EgressOutcome, EgressPlan, EgressRule, FakeApplier, NftablesApplier, enforce,
     macos_egress_statement, plan_egress, plan_egress_scoped, to_nftables, to_nftables_forward,
