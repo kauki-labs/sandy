@@ -11,10 +11,12 @@
 //! - **qemu backend** — [`QemuBackend`] (the Linux/KVM backend) with its pure argv assembler [`qemu_args`] over the
 //!   pre-staged virtiofs shares (INV-8/INV-TOPOLOGY).
 
+mod process;
 mod qemu;
 mod share;
 mod vfkit;
 
+pub use process::ProcessBackend;
 pub use qemu::{QemuBackend, StagedArgs as QemuStagedArgs, qemu_args};
 pub use share::{
     GuestShareTransport, ShareDirs, ShareSpec, VirtioFsTransport, VirtiofsdTransport, plan_shares, virtiofsd_args,

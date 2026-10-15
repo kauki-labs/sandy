@@ -1,0 +1,469 @@
+//! The process backend: a [`VmBackend`] that runs the sandbox as a raw OS
+//! process on the host, with no VM. This is the trivial-local executor of the
+//! fabric's Executor seam (#131 / #103): it advertises [`SandboxKind::Process`]
+//! so a job that needs a real VM is refused (via `sandy::backend_accepts`),
+//! captures the process's stdout and stderr as the [`Outcome::console`] tail and
+//! its exit code as [`Outcome::guest_exit`], and honours the wall-clock timeout.
+//!
+//! INV-11: a non-zero exit is a real result (`guest_exit`), never a
+//! `transport_error`; only an actual spawn/IO fault is an infra fault. A spawn
+//! failure is [`BackendError::Spawn`] (the supervisor maps it to band 3,
+//! retryable); a process that merely exits non-zero returns an [`Outcome`].
+//!
+//! INV-1: secrets are never placed on argv or env here. The process reads a
+//! secret from the local-dir secret share (T4), the same 0600-file channel the
+//! VM uses. The host environment is cleared and only `PATH` (so commands resolve)
+//! plus `spec.env` reach the child, so the ambient operator env (AWS_*,
+//! GITHUB_TOKEN, …) never leaks into an untrusted job; anything else a job needs
+//! (HOME/TERM) is passed explicitly in `spec.env`. The child is spawned as the
+//! leader of its own process group, so a timeout or teardown reaps the whole
+//! group: a backgrounded descendant in the group is killed, no host orphan.
+//! `run()` is always bounded — the console drains are read under a grace deadline,
+//! never joined — so even a descendant that escapes the group via `setsid`/
+//! `setpgid` cannot hang the run past its budget, though such an escaped process
+//! may survive as a host orphan until cgroup/jail-level containment (#135, which
+//! gates this backend from running real untrusted jobs). That residual is the
+//! process backend's weak-isolation limit; the VM backend is the real boundary,
+//! and the containment story is the sandbox kind. Until the local-dir
+//! shares land (T4) a RunSpec that carries secrets, inputs, or outputs is refused
+//! outright, never silently run.
+
+use std::{
+    io::Read,
+    os::unix::process::ExitStatusExt,
+    process::{Command, Stdio},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant, SystemTime},
+};
+
+use command_group::CommandGroup;
+use sandy::{BackendError, BoxState, Outcome, RunSpec, SandboxKind, VmBackend};
+use uuid::Uuid;
+
+/// Cap the captured console so a chatty job cannot grow the outcome without
+/// bound; the last bytes are kept, matching the VM console's bounded-tail intent.
+const CONSOLE_TAIL_CAP: usize = 64 * 1024;
+
+/// Poll interval while waiting for the child, so the wall-clock timeout can
+/// interrupt a hung job (a blocking `wait()` cannot).
+const POLL: Duration = Duration::from_millis(10);
+
+/// After the child's process group is reaped, how long to let the console-drain
+/// threads flush before taking whatever they captured. A descendant that escaped
+/// the group (`setsid`/`setpgid`) can hold the pipe open forever, so the drains
+/// are NEVER joined unconditionally — `run()` stays bounded regardless of the job.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// A [`VmBackend`] that runs the job as a raw OS process (no VM).
+///
+/// Owns its running-instance registry so [`boxes`](VmBackend::boxes) reports live
+/// state. The run is synchronous: a box is present only while its
+/// [`run`](VmBackend::run) call is in flight.
+#[derive(Debug, Default)]
+pub struct ProcessBackend {
+    instances: Mutex<Vec<BoxState>>,
+}
+
+impl ProcessBackend {
+    /// A backend with an empty instance registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Lock the instance registry, mapping a poisoned mutex to a typed error
+    /// rather than panicking (no `.unwrap()` in library code).
+    fn registry(&self) -> Result<MutexGuard<'_, Vec<BoxState>>, BackendError> {
+        self.instances
+            .lock()
+            .map_err(|_| BackendError::Protocol("process instance registry mutex poisoned".to_string()))
+    }
+}
+
+impl VmBackend for ProcessBackend {
+    fn run(&self, spec: &RunSpec) -> Result<Outcome, BackendError> {
+        let Some((program, args)) = spec.command.split_first() else {
+            return Err(BackendError::Spawn("empty command".to_string()));
+        };
+
+        // Fail closed: the process backend cannot yet deliver secrets or stage
+        // inputs/outputs (the local-dir shares land in T4). Refusing is mandatory,
+        // not cosmetic — silently ignoring outputs would let an output-bearing job
+        // exit 0 and classify Succeeded while producing nothing, an INV-7/INV-11
+        // mis-success. T4 lifts these as it wires the shares; T5 dispatch also
+        // refuses them (defence in depth).
+        if !spec.secrets.is_empty() {
+            return Err(BackendError::Spawn(
+                "process backend cannot deliver secrets yet (local-dir secret share lands in T4)".to_string(),
+            ));
+        }
+        if !spec.inputs.is_empty() {
+            return Err(BackendError::Spawn(
+                "process backend cannot stage inputs yet (local-dir input share lands in T4)".to_string(),
+            ));
+        }
+        if !spec.outputs.is_empty() {
+            return Err(BackendError::Spawn(
+                "process backend cannot collect outputs yet (local-dir output share lands in T4)".to_string(),
+            ));
+        }
+
+        // INV-1 + isolation: clear the host env so the ambient operator env never
+        // reaches an untrusted job, preserve only PATH so commands resolve, then
+        // overlay spec.env (which the plan guarantees carries no secret,
+        // validate_no_secret_leak). Secret bytes ride the secret share, never env.
+        let mut command = Command::new(program);
+        command
+            .args(args)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .envs(spec.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        // Spawn the child as the leader of a NEW process group so a timeout or
+        // teardown can reap the whole group. command-group encapsulates the
+        // setpgid/killpg; sandy's crates stay forbid(unsafe_code).
+        let mut child = match command.group_spawn() {
+            Ok(child) => child,
+            // A spawn fault is infra (band 3, retryable), not a run result.
+            Err(err) => return Err(BackendError::Spawn(format!("spawn `{program}`: {err}"))),
+        };
+
+        let box_id = Uuid::new_v4().to_string();
+        self.registry()?.push(BoxState {
+            box_id: box_id.clone(),
+            box_name: spec.template.to_string(),
+            pid: child.id(),
+            started: SystemTime::now(),
+            rvport: None,
+        });
+
+        // Drain both pipes on threads: an un-read piped stdout/stderr deadlocks a
+        // chatty child once it fills the pipe buffer.
+        let out_drain = child.inner().stdout.take().map(drain);
+        let err_drain = child.inner().stderr.take().map(drain);
+
+        // Wait for the group leader against the wall-clock budget, polling so a
+        // timeout can interrupt a hung job rather than block forever.
+        let deadline = Instant::now() + Duration::from_secs(u64::from(spec.timeout_secs));
+        let mut timed_out = false;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        timed_out = true;
+                        break None;
+                    }
+                    std::thread::sleep(POLL);
+                }
+                Err(err) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    self.registry()?.retain(|state| state.box_id != box_id);
+                    return Err(BackendError::Transport(format!("wait on child `{program}`: {err}")));
+                }
+            }
+        };
+
+        // Reap the whole group on every path, exit or timeout, so a backgrounded
+        // descendant in the group is killed (no host orphan) and its pipe ends
+        // close. A descendant that escaped the group (setsid/setpgid) survives
+        // this, so the console drains are read under a deadline below, never
+        // joined — run() stays bounded regardless of what the job spawned.
+        let _ = child.kill();
+        let _ = child.wait();
+        self.registry()?.retain(|state| state.box_id != box_id);
+
+        let drain_deadline = Instant::now() + DRAIN_GRACE;
+        let stdout = take_bounded(out_drain, drain_deadline);
+        let stderr = take_bounded(err_drain, drain_deadline);
+        let console = merged_console(&stdout, &stderr);
+
+        // INV-11: the process ran (booted), so its exit is a task result on
+        // guest_exit, never a transport fault. A signal death maps to 128+signal
+        // (shell convention) so it stays a task failure, not infra. A timeout
+        // leaves guest_exit None; classification keys off timed_out first.
+        let guest_exit = if timed_out {
+            None
+        } else {
+            status.and_then(|s| s.code().or_else(|| s.signal().map(|sig| 128 + sig)))
+        };
+
+        Ok(Outcome {
+            booted: true,
+            guest_exit,
+            transport_error: None,
+            timed_out,
+            console,
+        })
+    }
+
+    fn kill(&self, box_id: &str) -> Result<(), BackendError> {
+        // Deregisters only, mirroring `QemuBackend::kill` (the sandbox-visible
+        // effect is dropping the registry entry). Real termination of the process
+        // group — including a `setsid`/`setpgid`-escaped descendant, which a
+        // `killpg` here would miss exactly as the group-reap does — is gated to
+        // #135 (cgroup/jail teardown), the one mechanism that reaps every case.
+        //
+        // INV-3 honesty: until #135, a kill() on a LIVE process box would leave
+        // that group running and hidden from `boxes()`. This is acceptable only
+        // because the gated MVP runs no untrusted jobs and does not exercise
+        // kill() on a live process box: run() is synchronous and tears down its
+        // own group on every path, so a box is registered only for its run().
+        self.registry()?.retain(|state| state.box_id != box_id);
+        Ok(())
+    }
+
+    fn boxes(&self) -> Result<Vec<BoxState>, BackendError> {
+        Ok(self.registry()?.clone())
+    }
+
+    fn kind(&self) -> SandboxKind {
+        SandboxKind::Process
+    }
+}
+
+/// A console pipe being drained on a background thread into a shared, bounded
+/// buffer. The buffer is readable at any time ([`take_bounded`]) without joining
+/// the thread, so a descendant that keeps the pipe open can never block `run()`.
+struct Drain {
+    /// The last [`CONSOLE_TAIL_CAP`] bytes read so far.
+    buf: Arc<Mutex<Vec<u8>>>,
+    /// Set once the reader hits EOF (the pipe's write ends all closed).
+    done: Arc<AtomicBool>,
+}
+
+/// Drain a child pipe on a detached thread into a shared bounded buffer. The
+/// thread is never joined: a group-escaped descendant can hold the pipe open
+/// forever, so the caller reads the buffer under a deadline instead
+/// ([`take_bounded`]). Keeps only the last [`CONSOLE_TAIL_CAP`] bytes.
+fn drain<R: Read + Send + 'static>(mut reader: R) -> Drain {
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let done = Arc::new(AtomicBool::new(false));
+    let (tbuf, tdone) = (Arc::clone(&buf), Arc::clone(&done));
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        while let Ok(n) = reader.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            if let Ok(mut held) = tbuf.lock() {
+                held.extend_from_slice(&chunk[..n]);
+                if held.len() > CONSOLE_TAIL_CAP {
+                    let excess = held.len() - CONSOLE_TAIL_CAP;
+                    held.drain(..excess);
+                }
+            }
+        }
+        tdone.store(true, Ordering::SeqCst);
+    });
+    Drain { buf, done }
+}
+
+/// Take a drain's captured bytes, waiting at most until `deadline` for a natural
+/// EOF, then returning whatever was captured. Never joins the thread, so a
+/// descendant holding the pipe open cannot make this block past `deadline`.
+fn take_bounded(drain: Option<Drain>, deadline: Instant) -> Vec<u8> {
+    let Some(drain) = drain else {
+        return Vec::new();
+    };
+    while !drain.done.load(Ordering::SeqCst) && Instant::now() < deadline {
+        std::thread::sleep(POLL);
+    }
+    drain.buf.lock().map(|held| held.clone()).unwrap_or_default()
+}
+
+/// Combine the child's stdout and stderr into one bounded console string, stdout
+/// then stderr, capped to the last [`CONSOLE_TAIL_CAP`] bytes.
+fn merged_console(stdout: &[u8], stderr: &[u8]) -> String {
+    let mut buf = Vec::with_capacity(stdout.len() + stderr.len());
+    buf.extend_from_slice(stdout);
+    buf.extend_from_slice(stderr);
+    if buf.len() > CONSOLE_TAIL_CAP {
+        buf.drain(..buf.len() - CONSOLE_TAIL_CAP);
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use sandy::Grants;
+
+    use super::*;
+
+    fn run_spec<'a>(command: &'a [String], grants: &'a Grants, timeout_secs: u32) -> RunSpec<'a> {
+        RunSpec {
+            template: "process",
+            command,
+            inputs: &[],
+            outputs: &[],
+            secrets: &[],
+            env: &[],
+            cpu: None,
+            mem: None,
+            timeout_secs,
+            grants,
+            outcome_file: None,
+            secret_dir: None,
+        }
+    }
+
+    fn no_grants() -> Grants {
+        Grants {
+            secrets: false,
+            agent: false,
+            shares: false,
+        }
+    }
+
+    /// A non-zero exit is a real result: the process ran (booted), its exit code
+    /// is carried on `guest_exit`, its output is on the console, and it is NOT a
+    /// transport fault (INV-11 — a clean non-zero exit must not collapse to infra).
+    #[test]
+    fn runs_a_command_and_captures_a_nonzero_exit() -> anyhow::Result<()> {
+        let grants = no_grants();
+        let command = ["sh".to_string(), "-c".to_string(), "printf hi; exit 7".to_string()];
+        let spec = run_spec(&command, &grants, 30);
+
+        let outcome = ProcessBackend::new().run(&spec)?;
+
+        assert!(outcome.booted, "a spawned process booted");
+        assert_eq!(outcome.guest_exit, Some(7), "the real exit code is carried");
+        assert!(
+            outcome.console.contains("hi"),
+            "stdout is captured, got {:?}",
+            outcome.console
+        );
+        assert!(
+            outcome.transport_error.is_none(),
+            "a non-zero exit is not a transport fault"
+        );
+        assert!(!outcome.timed_out, "the job completed, it did not time out");
+        Ok(())
+    }
+
+    /// A clean success is exit 0, booted, no transport error.
+    #[test]
+    fn a_successful_command_exits_zero() -> anyhow::Result<()> {
+        let grants = no_grants();
+        let command = ["true".to_string()];
+        let spec = run_spec(&command, &grants, 30);
+
+        let outcome = ProcessBackend::new().run(&spec)?;
+
+        assert!(outcome.booted);
+        assert_eq!(outcome.guest_exit, Some(0));
+        assert!(outcome.transport_error.is_none());
+        Ok(())
+    }
+
+    /// A job that outlives its wall-clock budget is killed near the deadline and
+    /// reported `timed_out`, not run to completion.
+    #[test]
+    fn a_job_over_its_timeout_is_killed_and_marked_timed_out() -> anyhow::Result<()> {
+        let grants = no_grants();
+        let command = ["sh".to_string(), "-c".to_string(), "sleep 30".to_string()];
+        let spec = run_spec(&command, &grants, 1);
+
+        let start = Instant::now();
+        let outcome = ProcessBackend::new().run(&spec)?;
+
+        assert!(outcome.timed_out, "the job exceeded its 1s budget");
+        assert!(outcome.booted, "it did spawn");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "it was killed near the deadline, not after the full sleep"
+        );
+        Ok(())
+    }
+
+    /// Adversarial: a job that backgrounds a process holding the console pipe open
+    /// must be bounded by the timeout AND its backgrounded child must be reaped by
+    /// the group-kill, not left a host orphan. Without the process group this
+    /// run() would block past the budget and the child would survive.
+    #[test]
+    fn a_backgrounding_job_is_bounded_and_the_group_is_reaped() -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let grants = no_grants();
+        // Background a child that inherits stdout and print its pid; the leader
+        // then blocks on `wait`, so neither finishes before the 1s budget.
+        let command = [
+            "sh".to_string(),
+            "-c".to_string(),
+            "sleep 30 & echo pid=$!; wait".to_string(),
+        ];
+        let spec = run_spec(&command, &grants, 1);
+
+        let start = Instant::now();
+        let outcome = ProcessBackend::new().run(&spec)?;
+
+        assert!(outcome.timed_out, "the job exceeded its 1s budget");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "run() stayed bounded despite a backgrounded child holding the pipe open"
+        );
+
+        let pid = outcome
+            .console
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("pid="))
+            .map(str::trim)
+            .context("the job should have printed its background child's pid")?;
+
+        // The group-kill must have reaped the backgrounded child. Poll `kill -0`
+        // (which fails once the pid is gone) briefly, to absorb the reparent-reap
+        // race rather than flake on it.
+        let gone = (0..50).any(|_| {
+            let alive = std::process::Command::new("kill")
+                .args(["-0", pid])
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false);
+            if alive {
+                std::thread::sleep(Duration::from_millis(40));
+                false
+            } else {
+                true
+            }
+        });
+        assert!(
+            gone,
+            "the backgrounded child (pid {pid}) must be reaped by the group-kill, not orphaned"
+        );
+        Ok(())
+    }
+
+    /// Fail closed: a spec carrying outputs the backend cannot collect yet (T4) is
+    /// refused outright, never run to a silent mis-success (exit 0, no outputs).
+    #[test]
+    fn refuses_a_spec_with_outputs_it_cannot_honor_yet() {
+        let grants = no_grants();
+        let command = ["true".to_string()];
+        let outputs = [sandy::Output {
+            name: None,
+            dest: std::path::PathBuf::from("/tmp/out"),
+        }];
+        let spec = RunSpec {
+            outputs: &outputs,
+            ..run_spec(&command, &grants, 30)
+        };
+        assert!(
+            ProcessBackend::new().run(&spec).is_err(),
+            "an output-bearing job must be refused, not silently mis-succeed"
+        );
+    }
+
+    /// The backend advertises `Process`, so `backend_accepts` refuses a VM job.
+    #[test]
+    fn kind_is_process_and_refuses_a_vm_job() {
+        assert_eq!(ProcessBackend::new().kind(), SandboxKind::Process);
+        assert!(!sandy::backend_accepts(ProcessBackend::new().kind(), SandboxKind::Vm));
+    }
+}

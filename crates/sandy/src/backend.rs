@@ -173,6 +173,32 @@ pub enum BackendError {
     Protocol(String),
 }
 
+/// What kind of sandbox a backend provides, so a job that requires a particular
+/// kind can be matched to (or refused by) a backend — a VM-only job must not land
+/// on the raw-process backend. The executor seam advertises its kind via
+/// [`VmBackend::kind`]; a dispatcher compares it against the job's requirement
+/// with [`backend_accepts`]. A closed set for now (richer capabilities — arch,
+/// attestation — come later per the fabric spec's self-registration).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxKind {
+    /// A raw OS process on the host: no VM, isolation only what the OS gives.
+    Process,
+    /// A virtual machine (qemu/vfkit/…): the full hypervisor isolation boundary.
+    Vm,
+}
+
+/// Whether a backend providing `provided` can run a job requiring `required`.
+///
+/// Exact-match while the kind set is closed: a VM-required job matches only a VM
+/// backend, a process-required job only a process backend. When kinds grow a
+/// subsumption rule (a VM can host a process job) can replace this without
+/// touching callers.
+#[must_use]
+pub fn backend_accepts(provided: SandboxKind, required: SandboxKind) -> bool {
+    provided == required
+}
+
 /// The hypervisor seam. `FakeBackend` and `LauncherBackend` implement this
 /// identically; reconcile reaches running state through [`VmBackend::boxes`],
 /// never a direct registry read, so the seam stays backend-agnostic.
@@ -183,6 +209,13 @@ pub trait VmBackend {
     fn kill(&self, box_id: &str) -> Result<(), BackendError>;
     /// Report the currently running boxes.
     fn boxes(&self) -> Result<Vec<BoxState>, BackendError>;
+    /// The kind of sandbox this backend provides. Defaults to [`SandboxKind::Vm`]
+    /// — the hypervisor backends — so only a non-VM backend (the process backend)
+    /// overrides it; adding the method leaves `FakeBackend`/`QemuBackend`/
+    /// `VfkitBackend` untouched.
+    fn kind(&self) -> SandboxKind {
+        SandboxKind::Vm
+    }
 }
 
 /// An in-memory [`VmBackend`] test double.
@@ -339,5 +372,34 @@ mod tests {
             secret_dir: None,
         };
         assert!(matches!(validate_no_secret_leak(&spec), Err(PlanError::SecretLeak(_))));
+    }
+
+    /// A job requiring a VM must not match the raw-process backend, and a kind
+    /// matches only itself (exact-match while the kind set is closed).
+    #[test]
+    fn backend_accepts_matches_kind_exactly() {
+        assert!(
+            backend_accepts(SandboxKind::Vm, SandboxKind::Vm),
+            "a vm backend runs a vm-required job"
+        );
+        assert!(
+            backend_accepts(SandboxKind::Process, SandboxKind::Process),
+            "a process backend runs a process-required job"
+        );
+        assert!(
+            !backend_accepts(SandboxKind::Process, SandboxKind::Vm),
+            "a vm-required job must not match the process backend"
+        );
+        assert!(
+            !backend_accepts(SandboxKind::Vm, SandboxKind::Process),
+            "a process-required job must not match a vm backend"
+        );
+    }
+
+    /// The seam defaults to a VM: the existing hypervisor backends report `Vm`
+    /// without overriding, so adding `kind()` leaves them untouched.
+    #[test]
+    fn vmbackend_kind_defaults_to_vm() {
+        assert_eq!(FakeBackend::new().kind(), SandboxKind::Vm);
     }
 }

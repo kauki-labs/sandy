@@ -49,8 +49,8 @@ mod strategy;
 mod trust_root;
 
 pub use backend::{
-    BackendError, BoxState, FakeBackend, Grants, Input, Outcome, Output, PlanError, RunSpec, SecretRef, SecretSource,
-    VmBackend, validate_no_secret_leak,
+    BackendError, BoxState, FakeBackend, Grants, Input, Outcome, Output, PlanError, RunSpec, SandboxKind, SecretRef,
+    SecretSource, VmBackend, backend_accepts, validate_no_secret_leak,
 };
 pub use collect::{CollectError, OutputSpec, collect};
 pub use config::CollectionConfig;
