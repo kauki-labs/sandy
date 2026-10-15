@@ -4,7 +4,7 @@
 //! (`QemuBackend`/`VfkitBackend`) satisfy the same contract but need a hypervisor,
 //! so they are proven in the live tier, not here.
 
-use sandy::{FakeBackend, Grants, Outcome, RunSpec, VmBackend};
+use sandy::{FakeBackend, Grants, Outcome, OutputStatus, ProcessExit, RunSpec, Status, VmBackend, classify_outcome};
 use sandy_backend::ProcessBackend;
 
 /// Build a `RunSpec` that runs `command` with no inputs/outputs/secrets.
@@ -79,4 +79,29 @@ fn fake_backend_satisfies_the_contract() -> anyhow::Result<()> {
 #[test]
 fn process_backend_satisfies_the_contract() -> anyhow::Result<()> {
     vmbackend_contract("process", ProcessBackend::new)
+}
+
+/// INV-11 guard: a non-zero process exit classifies as a task failure (band 1,
+/// not retryable), never an infra fault. The process backend must not collapse a
+/// clean non-zero exit into a transport/infra fault.
+#[test]
+fn process_nonzero_exit_classifies_as_task_failure_not_infra() -> anyhow::Result<()> {
+    let grants = Grants {
+        secrets: false,
+        agent: false,
+        shares: false,
+    };
+    let command = ["sh".to_string(), "-c".to_string(), "exit 3".to_string()];
+    let outcome = ProcessBackend::new().run(&spec(&command, &grants))?;
+
+    assert_eq!(outcome.guest_exit, Some(3), "the real exit is carried");
+    let classification = classify_outcome(&outcome, OutputStatus::Complete);
+    assert_eq!(classification.status, Status::Failed, "a non-zero exit failed");
+    assert_eq!(
+        classification.process_exit,
+        ProcessExit::TaskFailure,
+        "band 1 (task), not an infra fault"
+    );
+    assert!(!classification.retryable, "a task failure is not platform-retryable");
+    Ok(())
 }
