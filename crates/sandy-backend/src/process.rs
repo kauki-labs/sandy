@@ -21,9 +21,10 @@
 //! `run()` is always bounded — the console drains are read under a grace deadline,
 //! never joined — so even a descendant that escapes the group via `setsid`/
 //! `setpgid` cannot hang the run past its budget, though such an escaped process
-//! may survive as a host orphan until cgroup/jail-level containment. That residual
-//! is the process backend's weak-isolation limit; the VM backend is the real
-//! boundary, and the containment story is the sandbox kind. Until the local-dir
+//! may survive as a host orphan until cgroup/jail-level containment (#135, which
+//! gates this backend from running real untrusted jobs). That residual is the
+//! process backend's weak-isolation limit; the VM backend is the real boundary,
+//! and the containment story is the sandbox kind. Until the local-dir
 //! shares land (T4) a RunSpec that carries secrets, inputs, or outputs is refused
 //! outright, never silently run.
 
