@@ -16,24 +16,20 @@
 
 use std::cell::{Cell, RefCell};
 
-use serde::{Deserialize, Serialize};
+pub use sandy_api::egress::{AllowList, EgressApplier, EgressError, EgressOs, EgressOutcome, EgressPlan, EgressRule};
 
 use crate::error::CoreError;
 
-/// One permitted egress destination.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EgressRule {
-    /// The destination host (DNS name or address) to permit.
-    pub host: String,
-    /// The destination TCP port to permit.
-    pub port: u16,
-}
-
-/// A bundle's egress allow-list: the only destinations a guest may reach.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AllowList {
-    /// The permitted destinations; everything else is denied.
-    pub rules: Vec<EgressRule>,
+/// Map the seam's narrow [`EgressError`] into the core's broad [`CoreError`] so a
+/// run's error channel stays `CoreError` while the egress seam keeps a tight,
+/// contract-crate error (INV-7: an egress failure is an infra fault).
+impl From<EgressError> for CoreError {
+    fn from(err: EgressError) -> Self {
+        match err {
+            EgressError::Apply(msg) => CoreError::Egress(msg),
+            EgressError::Io(io) => CoreError::Io(io),
+        }
+    }
 }
 
 /// Translate an [`AllowList`] into a **default-deny** nftables ruleset that
@@ -165,36 +161,6 @@ pub fn macos_egress_statement() -> &'static str {
 /// tears down on revert; the two must agree.
 const EGRESS_TABLE: &str = "sandy_egress";
 
-/// The target OS an egress plan is computed for — injected so [`plan_egress`] is
-/// a pure function unit-testable without a real host.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EgressOs {
-    /// Linux: nftables enforces a default-deny per-VM egress boundary.
-    Linux,
-    /// macOS (vmnet): no per-VM egress boundary can be enforced.
-    MacOs,
-}
-
-/// A typed, OS-resolved egress enforcement plan.
-///
-/// Keeping the plan a value (not an action) makes the Linux/macOS decision
-/// testable without touching the host, and makes macOS honesty explicit: a
-/// platform with no boundary yields [`EgressPlan::NoBoundary`], never an empty
-/// [`EgressPlan::Enforce`] that would read as "filtered" while permitting all.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EgressPlan {
-    /// Apply this nftables ruleset as the per-VM boundary (Linux).
-    Enforce {
-        /// The default-deny ruleset to load; see [`to_nftables`].
-        ruleset: String,
-    },
-    /// No boundary is enforced; `reason` states why, honestly (macOS).
-    NoBoundary {
-        /// Why no boundary exists — surfaced to the operator, never swallowed.
-        reason: String,
-    },
-}
-
 /// Resolve an [`AllowList`] and target [`EgressOs`] into an [`EgressPlan`].
 ///
 /// Linux always [`EgressPlan::Enforce`]s — including an **empty** allow-list,
@@ -245,39 +211,6 @@ pub fn plan_egress_scoped(allow: &AllowList, target_os: EgressOs, iface: Option<
     }
 }
 
-/// The result of driving an [`EgressPlan`] through [`enforce`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EgressOutcome {
-    /// The ruleset was applied as the per-VM boundary (Linux).
-    Enforced,
-    /// No boundary was applied; `reason` carries the honest explanation (macOS).
-    Unenforced {
-        /// Why egress is unenforced — mirrors [`EgressPlan::NoBoundary`]'s reason.
-        reason: String,
-    },
-}
-
-/// A seam that applies and reverts a compiled egress ruleset on the host.
-///
-/// Abstracting the host away lets [`enforce`] be wired and tested with
-/// [`FakeApplier`] (no root, no `nft`); the real host-tier impl is
-/// [`NftablesApplier`]. Egress rules are destinations, not secrets (INV-1), so
-/// the ruleset is passed and logged in the clear.
-pub trait EgressApplier {
-    /// Load `ruleset` as the active egress boundary.
-    ///
-    /// # Errors
-    /// Returns [`CoreError::Egress`] (or an underlying [`CoreError::Io`]) if the
-    /// ruleset cannot be applied on the host.
-    fn apply(&self, ruleset: &str) -> Result<(), CoreError>;
-
-    /// Tear the applied boundary back down.
-    ///
-    /// # Errors
-    /// Returns [`CoreError::Egress`] (or [`CoreError::Io`]) if the teardown fails.
-    fn revert(&self) -> Result<(), CoreError>;
-}
-
 /// A test double that records what it was asked to apply and whether it was
 /// reverted, instead of touching the host.
 #[derive(Debug, Default)]
@@ -307,12 +240,12 @@ impl FakeApplier {
 }
 
 impl EgressApplier for FakeApplier {
-    fn apply(&self, ruleset: &str) -> Result<(), CoreError> {
+    fn apply(&self, ruleset: &str) -> Result<(), EgressError> {
         self.applied.borrow_mut().push(ruleset.to_string());
         Ok(())
     }
 
-    fn revert(&self) -> Result<(), CoreError> {
+    fn revert(&self) -> Result<(), EgressError> {
         self.reverted.set(true);
         Ok(())
     }
@@ -329,7 +262,7 @@ impl EgressApplier for FakeApplier {
 pub struct NftablesApplier;
 
 impl EgressApplier for NftablesApplier {
-    fn apply(&self, ruleset: &str) -> Result<(), CoreError> {
+    fn apply(&self, ruleset: &str) -> Result<(), EgressError> {
         use std::{
             io::Write,
             process::{Command, Stdio},
@@ -339,21 +272,21 @@ impl EgressApplier for NftablesApplier {
         child
             .stdin
             .as_mut()
-            .ok_or_else(|| CoreError::Egress("nft stdin was not captured".to_string()))?
+            .ok_or_else(|| EgressError::Apply("nft stdin was not captured".to_string()))?
             .write_all(ruleset.as_bytes())?;
         let status = child.wait()?;
         if !status.success() {
-            return Err(CoreError::Egress(format!("`nft -f -` exited with {status}")));
+            return Err(EgressError::Apply(format!("`nft -f -` exited with {status}")));
         }
         Ok(())
     }
 
-    fn revert(&self) -> Result<(), CoreError> {
+    fn revert(&self) -> Result<(), EgressError> {
         let status = std::process::Command::new("nft")
             .args(["delete", "table", "inet", EGRESS_TABLE])
             .status()?;
         if !status.success() {
-            return Err(CoreError::Egress(format!(
+            return Err(EgressError::Apply(format!(
                 "`nft delete table inet {EGRESS_TABLE}` exited with {status}"
             )));
         }
@@ -369,8 +302,8 @@ impl EgressApplier for NftablesApplier {
 /// boundary is surfaced, never silently treated as enforced (#24).
 ///
 /// # Errors
-/// Propagates any [`CoreError`] from [`EgressApplier::apply`].
-pub fn enforce<A: EgressApplier + ?Sized>(plan: &EgressPlan, applier: &A) -> Result<EgressOutcome, CoreError> {
+/// Propagates any [`EgressError`] from [`EgressApplier::apply`].
+pub fn enforce<A: EgressApplier + ?Sized>(plan: &EgressPlan, applier: &A) -> Result<EgressOutcome, EgressError> {
     match plan {
         EgressPlan::Enforce { ruleset } => {
             applier.apply(ruleset)?;

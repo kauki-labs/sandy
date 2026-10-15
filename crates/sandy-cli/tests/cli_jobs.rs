@@ -452,11 +452,11 @@ fn run_on_linux_applies_the_allow_list_ruleset_and_reverts_it() -> anyhow::Resul
 /// An egress applier whose `apply` always fails, to drive the fail-closed path.
 struct FailingApplier;
 impl sandy::EgressApplier for FailingApplier {
-    fn apply(&self, _ruleset: &str) -> Result<(), CoreError> {
-        Err(CoreError::Egress("nft apply refused".to_string()))
+    fn apply(&self, _ruleset: &str) -> Result<(), sandy::EgressError> {
+        Err(sandy::EgressError::Apply("nft apply refused".to_string()))
     }
 
-    fn revert(&self) -> Result<(), CoreError> {
+    fn revert(&self) -> Result<(), sandy::EgressError> {
         Ok(())
     }
 }

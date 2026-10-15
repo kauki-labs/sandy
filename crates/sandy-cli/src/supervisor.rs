@@ -601,8 +601,8 @@ mod tests {
 
     use anyhow::Context;
     use sandy::{
-        AllowList, BackendError, CoreError, CredentialProvider, CredentialSource, EgressApplier, EgressOs, FakeApplier,
-        FakeBackend, Grants, Journal, Outcome, ProcessExit, Profile, Scope,
+        AllowList, BackendError, CredentialProvider, CredentialSource, EgressApplier, EgressError, EgressOs,
+        FakeApplier, FakeBackend, Grants, Journal, Outcome, ProcessExit, Profile, Scope,
     };
 
     use super::run_job;
@@ -631,12 +631,12 @@ mod tests {
         reverted: Arc<AtomicBool>,
     }
     impl EgressApplier for SpyApplier {
-        fn apply(&self, _ruleset: &str) -> Result<(), CoreError> {
+        fn apply(&self, _ruleset: &str) -> Result<(), EgressError> {
             self.applied.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
-        fn revert(&self) -> Result<(), CoreError> {
+        fn revert(&self) -> Result<(), EgressError> {
             self.reverted.store(true, Ordering::SeqCst);
             Ok(())
         }
