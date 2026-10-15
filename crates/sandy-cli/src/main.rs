@@ -687,10 +687,10 @@ mod tests {
     /// not `host_backend()`. A regression where `dispatch_run` bypassed the profile
     /// and reached a real host backend could not produce a band-0 success here.
     #[test]
-    fn dispatch_run_threads_the_injected_profile() {
-        let tmp = tempfile::tempdir().expect("temp SANDY_HOME");
+    fn dispatch_run_threads_the_injected_profile() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir().context("temp SANDY_HOME")?;
         let journal = Journal::new(tmp.path());
-        journal.ensure_dirs().expect("ensure_dirs");
+        journal.ensure_dirs().context("ensure_dirs")?;
         let backend = FakeBackend::new().with_outcome(Outcome {
             booted: true,
             guest_exit: Some(0),
@@ -710,6 +710,7 @@ mod tests {
             ProcessExit::Succeeded.code(),
             "dispatch_run must run the injected FakeBackend's clean-success outcome (band 0)"
         );
+        Ok(())
     }
 
     /// Write a GitHub trust root (and a `0600` dummy key) under `dir`, so

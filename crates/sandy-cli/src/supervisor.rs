@@ -594,10 +594,15 @@ pub fn gc(journal: &Journal, keep_last_n: usize) -> Result<Vec<String>, CoreErro
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
     use anyhow::Context;
     use sandy::{
-        AllowList, BackendError, CredentialProvider, CredentialSource, EgressOs, FakeApplier, FakeBackend, Grants,
-        Journal, Outcome, ProcessExit, Profile, Scope,
+        AllowList, BackendError, CoreError, CredentialProvider, CredentialSource, EgressApplier, EgressOs, FakeApplier,
+        FakeBackend, Grants, Journal, Outcome, ProcessExit, Profile, Scope,
     };
 
     use super::run_job;
@@ -618,13 +623,34 @@ mod tests {
         }
     }
 
+    /// An egress applier that records apply/revert through shared handles, so a test
+    /// can observe the applier a [`Profile`] has taken ownership of (by value behind a
+    /// `Box<dyn>`), proving the injected egress seam was exercised.
+    struct SpyApplier {
+        applied: Arc<AtomicUsize>,
+        reverted: Arc<AtomicBool>,
+    }
+    impl EgressApplier for SpyApplier {
+        fn apply(&self, _ruleset: &str) -> Result<(), CoreError> {
+            self.applied.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn revert(&self) -> Result<(), CoreError> {
+            self.reverted.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
     /// The injection contract (T1): a run driven from a [`Profile`] uses the
-    /// profile's injected backend, not a hardcoded one. A `FakeBackend` scripted to
-    /// a clean success is bundled into the profile; `run_with_profile` must surface
-    /// that outcome (band 0), proving the dispatch composition routed through the
-    /// injected seam rather than reaching for `host_backend()`.
+    /// profile's injected backend AND egress applier, not hardcoded ones. A
+    /// `FakeBackend` scripted to a clean success and a shared-handle [`SpyApplier`]
+    /// are bundled into the profile; with a bound tap on Linux the boot is bracketed
+    /// by an enforced ruleset, so `run_with_profile` must surface band 0 AND the spy
+    /// must have applied then reverted — proving both seams routed through the
+    /// injected profile rather than reaching for `host_backend()`/`egress_applier()`.
     #[test]
-    fn run_with_profile_uses_the_injected_backend() -> anyhow::Result<()> {
+    fn run_with_profile_uses_the_injected_backend_and_egress() -> anyhow::Result<()> {
         let (_tmp, journal) = fresh_journal()?;
         let backend = FakeBackend::new().with_outcome(Outcome {
             booted: true,
@@ -633,19 +659,36 @@ mod tests {
             timed_out: false,
             console: String::new(),
         });
+        let applied = Arc::new(AtomicUsize::new(0));
+        let reverted = Arc::new(AtomicBool::new(false));
+        let egress = SpyApplier {
+            applied: Arc::clone(&applied),
+            reverted: Arc::clone(&reverted),
+        };
         let profile = Profile::new(
             Box::new(backend),
-            Box::new(FakeApplier::new()),
+            Box::new(egress),
             EgressOs::Linux,
             Box::new(UnusedCred),
         );
-        let report = super::run_with_profile(&profile, &journal, &booting_plan(), None).context("run_with_profile")?;
+        // A bound tap on Linux selects an enforced guest-scoped forward ruleset, so the
+        // boot is bracketed by the injected egress applier (apply then revert).
+        let report =
+            super::run_with_profile(&profile, &journal, &booting_plan(), Some("tap0")).context("run_with_profile")?;
         assert_eq!(
             report.process_exit.code(),
             ProcessExit::Succeeded.code(),
             "the injected FakeBackend's clean-success outcome must surface (band 0)"
         );
         assert!(!report.envelope.retryable, "a clean success is not retryable");
+        assert!(
+            applied.load(Ordering::SeqCst) >= 1,
+            "the injected egress applier must have applied the enforced ruleset"
+        );
+        assert!(
+            reverted.load(Ordering::SeqCst),
+            "the injected egress applier must have reverted the boundary after the boot"
+        );
         Ok(())
     }
 
