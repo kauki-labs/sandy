@@ -276,6 +276,44 @@ fn credential_setup(
     ))
 }
 
+/// The host credential source: load the named trust root and build the live GitHub
+/// adapter ([`credential_setup`]), boxed behind the [`sandy::CredentialSource`] seam
+/// so the credentialed run path composes through the profile like the backend and
+/// egress seams. The provider is built per run (it needs `--credential` + the trust
+/// root), so the profile carries the construction, not a prebuilt provider.
+struct HostCredentialSource;
+
+impl sandy::CredentialSource for HostCredentialSource {
+    fn provider(
+        &self,
+        dir: &std::path::Path,
+        name: &str,
+        capabilities: &[String],
+    ) -> Result<(Box<dyn sandy::CredentialProvider + Sync>, sandy::Scope), String> {
+        let (adapter, scope) = credential_setup(dir, name, capabilities)?;
+        Ok((Box::new(adapter), scope))
+    }
+}
+
+/// The host run profile: today's sandbox backend, egress applier, and GitHub
+/// credential source, bundled as the composition root `dispatch_run` threads. The
+/// egress OS model is the platform's (Linux enforces the nftables boundary, macOS
+/// is honestly unenforced). This is the one concrete profile today; a different
+/// profile (all-local) swaps the impls without touching dispatch.
+fn host_profile() -> sandy::Profile {
+    let egress_os = if cfg!(target_os = "macos") {
+        sandy::EgressOs::MacOs
+    } else {
+        sandy::EgressOs::Linux
+    };
+    sandy::Profile::new(
+        Box::new(host_backend()),
+        Box::new(egress_applier()),
+        egress_os,
+        Box::new(HostCredentialSource),
+    )
+}
+
 fn main() {
     let cli = Cli::parse();
     std::process::exit(dispatch(cli.command, cli.output));
@@ -389,12 +427,10 @@ fn dispatch_doctor(output: OutputFormat) -> i32 {
     clippy::too_many_arguments,
     reason = "forwards the run and credential inputs to run_job_with_credential"
 )]
-fn run_credentialed<B: sandy::VmBackend, E: sandy::EgressApplier>(
-    backend: &B,
+fn run_credentialed(
+    profile: &sandy::Profile,
     journal: &Journal,
     plan: JobPlan,
-    egress: &E,
-    egress_os: sandy::EgressOs,
     tap: Option<&str>,
     name: &str,
     cred_capability: &[String],
@@ -403,7 +439,7 @@ fn run_credentialed<B: sandy::VmBackend, E: sandy::EgressApplier>(
         eprintln!("sandy: trust-roots dir: {e}");
         ProcessExit::InfraFault.code()
     })?;
-    let (adapter, scope) = credential_setup(&dir, name, cred_capability).map_err(|e| {
+    let (provider, scope) = profile.cred().provider(&dir, name, cred_capability).map_err(|e| {
         eprintln!("sandy: {e}");
         ProcessExit::InvalidPlan.code()
     })?;
@@ -413,13 +449,13 @@ fn run_credentialed<B: sandy::VmBackend, E: sandy::EgressApplier>(
         ProcessExit::InfraFault.code()
     })?;
     let result = supervisor::run_job_with_credential(
-        backend,
+        profile.backend(),
         journal,
         plan,
-        egress,
-        egress_os,
+        profile.egress(),
+        profile.egress_os(),
         tap,
-        &adapter,
+        provider.as_ref(),
         &scope,
         "GITHUB_TOKEN",
         &cred_dir,
@@ -449,38 +485,25 @@ fn dispatch_run(
             return ProcessExit::InvalidPlan.code();
         }
     };
-    let backend = host_backend();
-    // Egress is bracketed around the boot per platform: Linux enforces the
-    // nftables boundary, macOS has none (`plan_egress` → NoBoundary, so the
-    // no-op applier is never called).
-    let egress = egress_applier();
-    let egress_os = if cfg!(target_os = "macos") {
-        sandy::EgressOs::MacOs
-    } else {
-        sandy::EgressOs::Linux
-    };
+    // The composition root: one profile selects the run seams — the sandbox
+    // backend, the egress applier (Linux enforces the nftables boundary, macOS has
+    // none), and the credential source. Dispatch threads the profile rather than
+    // reaching for the `host_backend()`/`egress_applier()` factories directly, so a
+    // different profile swaps the impls without touching this code.
+    let profile = host_profile();
     // The guest's tap (if any) comes from $SANDY_TAP — the same interface the
     // backend attaches the NIC to. On Linux a bound tap selects the guest-scoped
     // forward ruleset (safe), never the host-OUTPUT drop-all (#29).
     let tap = std::env::var("SANDY_TAP").ok().filter(|t| !t.is_empty());
 
     // With `--credential`, mint a scoped forge token and bracket the run with it;
-    // otherwise run with no credential.
+    // otherwise run with no credential. Both paths compose through the profile.
     let report = match credential {
-        Some(name) => match run_credentialed(
-            &backend,
-            journal,
-            plan,
-            &egress,
-            egress_os,
-            tap.as_deref(),
-            &name,
-            cred_capability,
-        ) {
+        Some(name) => match run_credentialed(&profile, journal, plan, tap.as_deref(), &name, cred_capability) {
             Ok(report) => report,
             Err(code) => return code,
         },
-        None => match supervisor::run_job(&backend, journal, &plan, &egress, egress_os, tap.as_deref()) {
+        None => match supervisor::run_with_profile(&profile, journal, &plan, tap.as_deref()) {
             Ok(report) => report,
             Err(e) => {
                 eprintln!("sandy: run failed: {e}");

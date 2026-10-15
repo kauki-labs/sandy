@@ -295,7 +295,7 @@ pub fn run_with_profile(
 /// # Errors
 ///
 /// Returns [`CoreError::Cred`] when minting or staging the credential fails.
-pub fn mint_run_token<P: CredentialProvider>(
+pub fn mint_run_token<P: CredentialProvider + ?Sized>(
     provider: &P,
     scope: &Scope,
     secret_name: &str,
@@ -337,7 +337,11 @@ pub fn mint_run_token<P: CredentialProvider>(
     clippy::too_many_arguments,
     reason = "the bracket threads both the run and the credential inputs"
 )]
-pub fn run_job_with_credential<B: VmBackend, E: EgressApplier, P: CredentialProvider + Sync>(
+pub fn run_job_with_credential<
+    B: VmBackend + ?Sized,
+    E: EgressApplier + ?Sized,
+    P: CredentialProvider + Sync + ?Sized,
+>(
     backend: &B,
     journal: &Journal,
     plan: JobPlan,
@@ -403,7 +407,7 @@ pub fn run_job_with_credential<B: VmBackend, E: EgressApplier, P: CredentialProv
 /// return, an early `?`, or a panic unwinding out of `run_job`. Straight-line
 /// teardown after the refresh scope is skipped on a panic, which would leave a
 /// valid forge token and the secret file on disk past the run (INV-1).
-struct CredTeardown<'a, P: CredentialProvider> {
+struct CredTeardown<'a, P: CredentialProvider + ?Sized> {
     provider: &'a P,
     /// The live lease; the refresh thread advances it to the latest minted token,
     /// so teardown revokes whatever token is current when the run ends.
@@ -411,7 +415,7 @@ struct CredTeardown<'a, P: CredentialProvider> {
     token_path: PathBuf,
 }
 
-impl<P: CredentialProvider> Drop for CredTeardown<'_, P> {
+impl<P: CredentialProvider + ?Sized> Drop for CredTeardown<'_, P> {
     fn drop(&mut self) {
         // The refresh thread has joined (the scope borrowing `lease` ended before
         // this drop), so the lock is uncontended; map poison rather than panic in a
@@ -447,7 +451,7 @@ fn refresh_interval(env_key: &str, default: u64) -> Duration {
 /// the sender half of `stop` is dropped (the run finished). Each refresh re-stages
 /// the live token file and revokes the superseded token via [`refresh_once`]; a
 /// refresh error is logged and retried on the next tick, never fatal to the run.
-fn refresh_loop<P: CredentialProvider + Sync>(
+fn refresh_loop<P: CredentialProvider + Sync + ?Sized>(
     provider: &P,
     lease: &Mutex<Lease>,
     margin: Duration,
