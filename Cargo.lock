@@ -1785,6 +1785,7 @@ version = "0.1.1"
 dependencies = [
  "anyhow",
  "command-group",
+ "rustix",
  "sandy-box",
  "tempfile",
  "tracing",

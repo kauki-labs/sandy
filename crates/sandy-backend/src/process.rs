@@ -52,7 +52,10 @@ use command_group::CommandGroup;
 use sandy::{BackendError, BoxState, Outcome, RunSpec, SandboxKind, VmBackend, collect_outputs, wipe};
 use uuid::Uuid;
 
-use crate::share::{GuestShareTransport, LocalDirTransport, Presentation, ShareDirs, plan_shares};
+use crate::{
+    share::{GuestShareTransport, LocalDirTransport, Presentation, ShareDirs, plan_shares},
+    staging::ensure_sandy_staging_base,
+};
 
 /// Cap the captured console so a chatty job cannot grow the outcome without
 /// bound; the last bytes are kept, matching the VM console's bounded-tail intent.
@@ -245,7 +248,7 @@ impl VmBackend for ProcessBackend {
         // Per-run, sandy-owned staging dirs, mirroring the VM backends' lifecycle
         // (same shape, so gc/reconcile/wipe and the registry behave identically).
         let run_id = Uuid::new_v4();
-        let base = std::env::temp_dir().join("sandy");
+        let base = ensure_sandy_staging_base()?;
         let inst_dir = base.join(run_id.to_string());
         let inputs_dir = base.join(format!("{run_id}-inputs"));
         let outputs_dir = base.join(format!("{run_id}-outputs"));

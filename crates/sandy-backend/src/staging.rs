@@ -11,9 +11,13 @@
 
 use std::path::{Path, PathBuf};
 
+use rustix::fs::{Mode, OFlags, fstat, mkdirat, open, openat};
 use sandy::BackendError;
 
 const STAGING_DIR_NAME: &str = "sandy";
+
+/// Mode bits that would let group or other write into the staging base.
+const GROUP_OTHER_WRITE: u32 = 0o022;
 
 /// Validate (or create) the sandy-owned staging base under the OS temp dir and
 /// return its path.
@@ -31,24 +35,63 @@ pub fn ensure_sandy_staging_base() -> Result<PathBuf, BackendError> {
 /// isolated from the real `/tmp/sandy`, without the `unsafe` `env::set_var`
 /// edition-2024 forbids under this workspace's `unsafe_code = "forbid"` lint.
 ///
-/// # Placeholder (pre-fix)
-///
-/// This currently reproduces the vulnerable behaviour the three backends had
-/// inline: it joins the path and creates it with the process default mode,
-/// without checking ownership, write bits, or following symlinks. The
-/// adversarial tests in this module are written against the fixed contract
-/// above and are expected to fail against this placeholder.
+/// `parent` itself is opened following symlinks (macOS's `/tmp` legitimately
+/// is one, pointing at `/private/tmp`); only the staging dir name underneath
+/// it is opened with `O_NOFOLLOW`, so a symlink planted at that name — before
+/// `mkdirat` or racing right after it — is rejected rather than followed,
+/// whether the base was just created or already existed.
 fn ensure_staging_base_in(parent: &Path) -> Result<PathBuf, BackendError> {
     let base = parent.join(STAGING_DIR_NAME);
-    std::fs::create_dir_all(&base)
-        .map_err(|e| BackendError::Spawn(format!("create staging base {}: {e}", base.display())))?;
+    let parent_fd = open(
+        parent,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| staging_err("open staging parent", parent, &e))?;
+
+    match mkdirat(&parent_fd, STAGING_DIR_NAME, Mode::RWXU) {
+        Ok(()) => {}
+        Err(rustix::io::Errno::EXIST) => {} // already exists — validated below
+        Err(e) => return Err(staging_err("create sandy staging base", &base, &e)),
+    }
+
+    let base_fd = openat(
+        &parent_fd,
+        STAGING_DIR_NAME,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| staging_err("open sandy staging base (symlinked base?)", &base, &e))?;
+
+    let stat = fstat(&base_fd).map_err(|e| staging_err("stat sandy staging base", &base, &e))?;
+    let current_uid = rustix::process::getuid().as_raw();
+    validate_owner_and_mode(stat.st_uid, current_uid, u32::from(stat.st_mode))
+        .map_err(|e| BackendError::Spawn(format!("{e} (base: {})", base.display())))?;
+
     Ok(base)
 }
 
-/// Placeholder (pre-fix): always accepts, matching the inline sites' total
-/// absence of an owner/mode check. Replaced by the real comparison next.
-fn validate_owner_and_mode(_uid: u32, _current_uid: u32, _mode: u32) -> Result<(), BackendError> {
+/// Pure check, isolated from the filesystem so the owner-mismatch and
+/// bad-mode paths are unit-testable without needing a second uid or root:
+/// `uid` must match `current_uid`, and `mode` must carry no group/world write
+/// bit. A failure here is fail-closed and final — the base is never
+/// chmod'd/chowned back into shape (CWE-732, INV-1).
+fn validate_owner_and_mode(uid: u32, current_uid: u32, mode: u32) -> Result<(), BackendError> {
+    if uid != current_uid {
+        return Err(BackendError::Spawn(format!(
+            "sandy staging base is owned by uid {uid}, not the current uid {current_uid}; refusing to stage"
+        )));
+    }
+    if mode & GROUP_OTHER_WRITE != 0 {
+        return Err(BackendError::Spawn(format!(
+            "sandy staging base is group/world-writable (mode {mode:#o}); refusing to stage"
+        )));
+    }
     Ok(())
+}
+
+fn staging_err(action: &str, path: &Path, err: &rustix::io::Errno) -> BackendError {
+    BackendError::Spawn(format!("{action} at {}: {err}", path.display()))
 }
 
 #[cfg(test)]

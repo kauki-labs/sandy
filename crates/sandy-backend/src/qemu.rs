@@ -29,7 +29,10 @@ use sandy::{
 };
 use uuid::Uuid;
 
-use crate::share::{GuestShareTransport, ShareDirs, ShareSpec, VirtiofsdTransport, kill_children, plan_shares};
+use crate::{
+    share::{GuestShareTransport, ShareDirs, ShareSpec, VirtiofsdTransport, kill_children, plan_shares},
+    staging::ensure_sandy_staging_base,
+};
 
 /// The chardev id the guest serial console binds to. `qemu_args` emits
 /// `-serial chardev:<SERIAL_CHARDEV_ID>`; `run` adds the matching
@@ -397,7 +400,7 @@ impl VmBackend for QemuBackend {
     fn run(&self, spec: &RunSpec) -> Result<Outcome, BackendError> {
         let topology = eval_topology(spec.template)?;
         let run_id = Uuid::new_v4();
-        let base = std::env::temp_dir().join("sandy");
+        let base = ensure_sandy_staging_base()?;
         let inst_dir = base.join(run_id.to_string());
         let inputs_dir = base.join(format!("{run_id}-inputs"));
         let outputs_dir = base.join(format!("{run_id}-outputs"));
