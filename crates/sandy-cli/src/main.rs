@@ -472,6 +472,7 @@ fn run_credentialed(
 /// optional credential, print the result envelope, and return the process exit
 /// band (INV-11).
 fn dispatch_run(
+    profile: &sandy::Profile,
     args: RunArgs,
     credential: Option<String>,
     cred_capability: &[String],
@@ -485,12 +486,11 @@ fn dispatch_run(
             return ProcessExit::InvalidPlan.code();
         }
     };
-    // The composition root: one profile selects the run seams — the sandbox
-    // backend, the egress applier (Linux enforces the nftables boundary, macOS has
-    // none), and the credential source. Dispatch threads the profile rather than
-    // reaching for the `host_backend()`/`egress_applier()` factories directly, so a
-    // different profile swaps the impls without touching this code.
-    let profile = host_profile();
+    // The run seams come from the injected `profile` — the sandbox backend, the
+    // egress applier (Linux enforces the nftables boundary, macOS has none), and the
+    // credential source. The composition root selects the profile at the top
+    // (`dispatch`) and threads it here, so this code never names a concrete impl and
+    // a different profile swaps them without touching dispatch.
     // The guest's tap (if any) comes from $SANDY_TAP — the same interface the
     // backend attaches the NIC to. On Linux a bound tap selects the guest-scoped
     // forward ruleset (safe), never the host-OUTPUT drop-all (#29).
@@ -499,11 +499,11 @@ fn dispatch_run(
     // With `--credential`, mint a scoped forge token and bracket the run with it;
     // otherwise run with no credential. Both paths compose through the profile.
     let report = match credential {
-        Some(name) => match run_credentialed(&profile, journal, plan, tap.as_deref(), &name, cred_capability) {
+        Some(name) => match run_credentialed(profile, journal, plan, tap.as_deref(), &name, cred_capability) {
             Ok(report) => report,
             Err(code) => return code,
         },
-        None => match supervisor::run_with_profile(&profile, journal, &plan, tap.as_deref()) {
+        None => match supervisor::run_with_profile(profile, journal, &plan, tap.as_deref()) {
             Ok(report) => report,
             Err(e) => {
                 eprintln!("sandy: run failed: {e}");
@@ -566,7 +566,10 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
                 timeout,
                 command,
             };
-            dispatch_run(args, credential, &cred_capability, &journal, output)
+            // The composition root: select the run profile here and inject it. Today
+            // only the host profile exists; a different profile (all-local) is a swap
+            // at this one call site, not a change to dispatch_run.
+            dispatch_run(&host_profile(), args, credential, &cred_capability, &journal, output)
         }
         Command::Ls => match supervisor::ls(&journal) {
             Ok(records) => succeed_or(emit(format_records(&records, output))),
@@ -644,9 +647,70 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use anyhow::Context;
-    use sandy::Target;
+    use sandy::{CredentialProvider, CredentialSource, EgressOs, FakeApplier, FakeBackend, Outcome, Profile, Target};
 
     use super::*;
+
+    /// The non-credentialed dispatch path builds no provider, so a test profile
+    /// carries this to satisfy the credential seam without a live backend.
+    struct NoCred;
+    impl CredentialSource for NoCred {
+        fn provider(
+            &self,
+            _dir: &std::path::Path,
+            _name: &str,
+            _capabilities: &[String],
+        ) -> Result<(Box<dyn CredentialProvider + Sync>, Scope), String> {
+            unreachable!("the non-credentialed dispatch path never builds a credential provider")
+        }
+    }
+
+    /// A minimal `run demo` request with no inputs, secrets, or command.
+    fn demo_run_args() -> RunArgs {
+        RunArgs {
+            template: "demo".to_string(),
+            inputs: vec![],
+            outputs: vec![],
+            secrets: vec![],
+            env: vec![],
+            allow: vec![],
+            cpu: None,
+            mem: None,
+            timeout: None,
+            command: vec![],
+        }
+    }
+
+    /// The composition root threads the INJECTED profile (#131 T1): `dispatch_run`,
+    /// given a `Profile` whose `FakeBackend` is scripted to a clean success, exits on
+    /// the band-0 success code — proving the dispatch SITE runs the injected backend,
+    /// not `host_backend()`. A regression where `dispatch_run` bypassed the profile
+    /// and reached a real host backend could not produce a band-0 success here.
+    #[test]
+    fn dispatch_run_threads_the_injected_profile() {
+        let tmp = tempfile::tempdir().expect("temp SANDY_HOME");
+        let journal = Journal::new(tmp.path());
+        journal.ensure_dirs().expect("ensure_dirs");
+        let backend = FakeBackend::new().with_outcome(Outcome {
+            booted: true,
+            guest_exit: Some(0),
+            transport_error: None,
+            timed_out: false,
+            console: String::new(),
+        });
+        let profile = Profile::new(
+            Box::new(backend),
+            Box::new(FakeApplier::new()),
+            EgressOs::Linux,
+            Box::new(NoCred),
+        );
+        let code = dispatch_run(&profile, demo_run_args(), None, &[], &journal, OutputFormat::Plain);
+        assert_eq!(
+            code,
+            ProcessExit::Succeeded.code(),
+            "dispatch_run must run the injected FakeBackend's clean-success outcome (band 0)"
+        );
+    }
 
     /// Write a GitHub trust root (and a `0600` dummy key) under `dir`, so
     /// `credential_setup` has something to load without a live forge.
