@@ -24,15 +24,14 @@ use std::{
 };
 
 use sandy::{
-    BackendError, BoxState, Hypervisor, Markers, Outcome, PipeTransport, RunSpec, StoreBacking, Topology, VmBackend,
-    collect_outputs, run_console, topology as eval_topology, wipe,
+    BackendError, BoxState, Hypervisor, Markers, Outcome, PipeTransport, RunSpec, ShareDirs, StoreBacking, Topology,
+    VmBackend, collect_outputs, ensure_sandy_staging_base, kill_children, plan_shares, run_console,
+    topology as eval_topology, wipe,
 };
+use sandy_api::share::{GuestShareTransport, ShareSpec};
 use uuid::Uuid;
 
-use crate::{
-    share::{GuestShareTransport, ShareDirs, ShareSpec, VirtiofsdTransport, kill_children, plan_shares},
-    staging::ensure_sandy_staging_base,
-};
+use crate::share::VirtiofsdTransport;
 
 /// The chardev id the guest serial console binds to. `qemu_args` emits
 /// `-serial chardev:<SERIAL_CHARDEV_ID>`; `run` adds the matching

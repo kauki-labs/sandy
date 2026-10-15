@@ -60,14 +60,12 @@ use std::{
 use command_group::CommandGroup;
 use sandy::{
     BackendError, BoxState, Containment, ContainmentStatus, NoContainment, Outcome, ResourceLimits, RunSpec,
-    SandboxKind, VmBackend, collect_outputs, wipe,
+    SandboxKind, ShareDirs, VmBackend, collect_outputs, ensure_sandy_staging_base, plan_shares, wipe,
 };
+use sandy_api::share::{GuestShareTransport, Presentation};
 use uuid::Uuid;
 
-use crate::{
-    share::{GuestShareTransport, LocalDirTransport, Presentation, ShareDirs, plan_shares},
-    staging::ensure_sandy_staging_base,
-};
+use crate::share::LocalDirTransport;
 
 /// Cap the captured console so a chatty job cannot grow the outcome without
 /// bound; the last bytes are kept, matching the VM console's bounded-tail intent.

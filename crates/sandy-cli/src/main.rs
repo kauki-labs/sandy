@@ -215,23 +215,6 @@ fn host_backend() -> sandy_backend::QemuBackend {
     sandy_backend::QemuBackend::new()
 }
 
-/// A no-op egress applier for platforms with no per-VM boundary. On macOS
-/// `plan_egress` yields `NoBoundary`, so `enforce` never calls these — they exist
-/// only to satisfy the `EgressApplier` bound off the Linux path.
-#[cfg(not(target_os = "linux"))]
-struct NoEgress;
-
-#[cfg(not(target_os = "linux"))]
-impl sandy::EgressApplier for NoEgress {
-    fn apply(&self, _ruleset: &str) -> Result<(), CoreError> {
-        Ok(())
-    }
-
-    fn revert(&self) -> Result<(), CoreError> {
-        Ok(())
-    }
-}
-
 /// The Linux egress applier: `nft`-backed default-deny enforcement. The live load
 /// whose boundary an in-guest root flush cannot bypass is tier-3 (#29).
 #[cfg(target_os = "linux")]
@@ -239,11 +222,11 @@ fn egress_applier() -> sandy::NftablesApplier {
     sandy::NftablesApplier
 }
 
-/// The non-Linux egress applier: a no-op, because `plan_egress` yields
-/// `NoBoundary` off Linux and nothing is applied.
+/// The non-Linux egress applier: the local no-op ([`sandy_backend::NoEgress`]),
+/// because `plan_egress` yields `NoBoundary` off Linux and nothing is applied.
 #[cfg(not(target_os = "linux"))]
-fn egress_applier() -> NoEgress {
-    NoEgress
+fn egress_applier() -> sandy_backend::NoEgress {
+    sandy_backend::NoEgress
 }
 
 /// Load the named trust root from `dir` and build the live [`GithubAdapter`] plus

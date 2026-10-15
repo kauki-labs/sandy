@@ -14,9 +14,10 @@ use sandy::{
     Grants, INPUT_MOUNT_TAG, Input, OUTPUT_MOUNT_TAG, Output, RunSpec, SECRET_MOUNT_TAG, Topology, collect_outputs,
     parse_topology, prepare_outputs, stage_inputs,
 };
-use sandy_backend::{
-    GuestShareTransport, LocalDirTransport, Placement, Presentation, QemuStagedArgs, ShareSpec, VfkitStagedArgs,
-    VirtioFsTransport, VirtiofsdTransport, qemu_args, vfkit_args, virtiofsd_args,
+use sandy_backend::{GuestShareTransport, Placement, Presentation, ShareSpec};
+use sandy_impls_local::LocalDirTransport;
+use sandy_impls_vm::{
+    QemuStagedArgs, VfkitStagedArgs, VirtioFsTransport, VirtiofsdTransport, qemu_args, vfkit_args, virtiofsd_args,
 };
 
 const QEMU_FIXTURE: &[u8] = include_bytes!("fixtures/topology-x86_64.json");

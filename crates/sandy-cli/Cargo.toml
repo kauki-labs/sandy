@@ -29,7 +29,9 @@ live = []
 clap.workspace = true
 octocrab.workspace = true
 sandy.workspace = true
-sandy-backend.workspace = true
+# The CLI runs real VMs, so it pulls the VM backend impls in (impl-local stays on
+# by default); a local-only consumer of sandy-backend would omit impl-vm.
+sandy-backend = { workspace = true, features = ["impl-vm"] }
 serde.workspace = true
 serde_json.workspace = true
 tiny_http.workspace = true

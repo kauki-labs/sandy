@@ -25,6 +25,7 @@ workspace = true
 
 [dependencies]
 sandy-api.workspace = true
+rustix.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 serde = { workspace = true }
