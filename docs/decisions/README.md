@@ -2,7 +2,7 @@
 title: sandy decision records
 kind: decisions-index
 project: sandy
-updated: 2026-10-14
+updated: 2026-10-15
 ---
 
 # Decision records
@@ -20,6 +20,7 @@ acceptance matrix, [`../architecture/kpi.md`](../architecture/kpi.md).
 | Category                                          | Covers                                     |
 | ------------------------------------------------- | ------------------------------------------ |
 | [run-plane](run-plane.md)                         | native hypervisor launch, console protocol |
+| [process-containment](process-containment.md)     | non-VM executor cgroup reaping + the gate  |
 | [guest-shares](guest-shares.md)                   | inputs/outputs/secrets as virtio-fs        |
 | [secret-channel](secret-channel.md)               | `$NAME` delivery off argv/env/store        |
 | [credential-seam](credential-seam.md)             | mint → stage → refresh → revoke            |

@@ -7,7 +7,8 @@
 //! - **Run plane** — the pinned [`VmBackend`] seam plus the `snake_case` data types (INV-8) and a [`FakeBackend`]
 //!   double; the LOCKED result envelope [`ResultEnvelope`] (INV-11); the [`Journal`] of one atomic, flock-guarded
 //!   record per job (INV-3/5/6); exit-0-only `O_NOFOLLOW` [`collect`]ion (INV-2/4); and [`reconcile_job`] under the
-//!   job's flock (INV-3).
+//!   job's flock (INV-3). The [`Containment`] seam confines a non-VM executor's job so its whole process tree is reaped
+//!   (the process backend's isolation story, #135); [`admits_untrusted`] is the fail-closed gate.
 //! - **Provisioning** — [`classify`] host facts into a [`ProvisioningStrategy`], then [`provision`] /
 //!   [`provision_remote_build`] / [`decide_fallback`] over the [`HostNixProvisioner`] and [`RemoteBuilder`] seams.
 //! - **Seed identity** — [`acquire`] a [`VerifiedSeed`] via a [`SignatureVerifier`].
@@ -31,6 +32,7 @@ mod backend;
 mod collect;
 mod config;
 mod console;
+mod containment;
 mod cred;
 mod cred_github;
 mod discovery;
@@ -58,6 +60,9 @@ pub use collect::{CollectError, OutputSpec, collect};
 pub use config::CollectionConfig;
 pub use console::{
     Markers, PipeTransport, Protocol, ProtocolStep, PtyTransport, TimeoutPolicy, Transport, parse_exit, run_console,
+};
+pub use containment::{
+    Containment, ContainmentStatus, FakeContainment, NoContainment, ResourceLimits, admits_untrusted,
 };
 pub use cred::{
     Capability, CredError, CredentialHandle, CredentialProvider, FakeProvider, GitlabAccount, Lease, MAX_TTL_SECS,

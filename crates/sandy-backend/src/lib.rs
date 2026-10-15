@@ -11,12 +11,14 @@
 //! - **qemu backend** — [`QemuBackend`] (the Linux/KVM backend) with its pure argv assembler [`qemu_args`] over the
 //!   pre-staged virtiofs shares (INV-8/INV-TOPOLOGY).
 
+mod containment;
 mod process;
 mod qemu;
 mod share;
 mod staging;
 mod vfkit;
 
+pub use containment::SystemdRunContainment;
 pub use process::ProcessBackend;
 pub use qemu::{QemuBackend, StagedArgs as QemuStagedArgs, qemu_args};
 pub use share::{

@@ -16,6 +16,12 @@ categories = ["virtualization", "development-tools"]
 [lib]
 crate-type = ["rlib"]
 
+# The live containment gate (tier-3, #135, Linux only). Off by default so CI and
+# `nix flake check` never run it; enable on a Linux host with a user systemd
+# instance + cgroup v2. See tests/live_containment.rs.
+[features]
+live = []
+
 [lints]
 workspace = true
 

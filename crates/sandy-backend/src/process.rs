@@ -24,16 +24,25 @@
 //! environment is cleared and only `PATH` (so commands resolve)
 //! plus `spec.env` reach the child, so the ambient operator env (AWS_*,
 //! GITHUB_TOKEN, …) never leaks into an untrusted job; anything else a job needs
-//! (HOME/TERM) is passed explicitly in `spec.env`. The child is spawned as the
-//! leader of its own process group, so a timeout or teardown reaps the whole
+//! (HOME/TERM) is passed explicitly in `spec.env`. When a containment wrapper is
+//! active it also passes through its own non-secret plumbing env (e.g. systemd-run's
+//! `XDG_RUNTIME_DIR`), named by [`Containment::passthrough_env`](sandy::Containment::passthrough_env). The child is
+//! spawned as the leader of its own process group, so a timeout or teardown reaps the whole
 //! group: a backgrounded descendant in the group is killed, no host orphan.
 //! `run()` is always bounded — the console drains are read under a grace deadline,
 //! never joined — so even a descendant that escapes the group via `setsid`/
-//! `setpgid` cannot hang the run past its budget, though such an escaped process
-//! may survive as a host orphan until cgroup/jail-level containment (#135, which
-//! gates this backend from running real untrusted jobs). That residual is the
-//! process backend's weak-isolation limit; the VM backend is the real boundary,
-//! and the containment story is the sandbox kind.
+//! `setpgid` cannot hang the run past its budget.
+//!
+//! Reaping such an escapee needs cgroup-level containment, which the backend reaches
+//! through the injected [`Containment`](sandy::Containment) seam (#135): when it
+//! reports [`Available`](sandy::ContainmentStatus::Available) the job is launched
+//! inside a delegated cgroup scope and [`reap`](sandy::Containment::reap) destroys
+//! the whole tree on exit/timeout/kill, escapees included. The default is
+//! [`NoContainment`](sandy::NoContainment) (no cgroup), under which the backend
+//! keeps its best-effort process-group reap and an escapee can still survive as a
+//! host orphan — so the fail-closed gate ([`sandy::admits_untrusted`]) refuses an
+//! UNTRUSTED job on an uncontained process backend. The VM backend remains the
+//! strong boundary.
 
 use std::{
     fs,
@@ -49,7 +58,10 @@ use std::{
 };
 
 use command_group::CommandGroup;
-use sandy::{BackendError, BoxState, Outcome, RunSpec, SandboxKind, VmBackend, collect_outputs, wipe};
+use sandy::{
+    BackendError, BoxState, Containment, ContainmentStatus, NoContainment, Outcome, ResourceLimits, RunSpec,
+    SandboxKind, VmBackend, collect_outputs, wipe,
+};
 use uuid::Uuid;
 
 use crate::{
@@ -76,16 +88,44 @@ const DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// Owns its running-instance registry so [`boxes`](VmBackend::boxes) reports live
 /// state. The run is synchronous: a box is present only while its
 /// [`run`](VmBackend::run) call is in flight.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ProcessBackend {
     instances: Mutex<Vec<BoxState>>,
+    /// How a job is confined (#135). The default [`NoContainment`] keeps the backend
+    /// hermetic and uncontained (best-effort group reap only); the composition root
+    /// injects the host [`SystemdRunContainment`](crate::SystemdRunContainment).
+    containment: Box<dyn Containment>,
+}
+
+impl Default for ProcessBackend {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ProcessBackend {
-    /// A backend with an empty instance registry.
+    /// A backend with an empty instance registry and no containment (the uncontained
+    /// MVP: best-effort process-group reap, refused for untrusted jobs by the gate).
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self::with_containment(Box::new(NoContainment))
+    }
+
+    /// A backend confined by `containment` (the host `SystemdRunContainment`, or a
+    /// test double). The backend reaps each run's container on exit/timeout/kill.
+    #[must_use]
+    pub fn with_containment(containment: Box<dyn Containment>) -> Self {
+        Self {
+            instances: Mutex::new(Vec::new()),
+            containment,
+        }
+    }
+
+    /// The containment's current [`ContainmentStatus`], for the fail-closed gate
+    /// ([`sandy::admits_untrusted`]) and `sandy doctor`.
+    #[must_use]
+    pub fn containment_status(&self) -> ContainmentStatus {
+        self.containment.status()
     }
 
     /// Lock the instance registry, mapping a poisoned mutex to a typed error
@@ -110,10 +150,13 @@ impl ProcessBackend {
         inputs_dir: &Path,
         outputs_dir: &Path,
     ) -> Result<Outcome, BackendError> {
-        let (program, args) = spec
+        // The job's own program, kept for diagnostics: the launch program below may
+        // be the containment wrapper (e.g. `systemd-run`), not the job.
+        let (job_program, _) = spec
             .command
             .split_first()
             .ok_or_else(|| BackendError::Spawn("empty command".to_string()))?;
+        let box_id = run_id.to_string();
 
         // inst_dir holds the default secret share; create it before staging.
         fs::create_dir_all(inst_dir)
@@ -143,15 +186,43 @@ impl ProcessBackend {
         };
         transport.activate(&shares)?;
 
+        // Confine the job (#135): an Available containment prepends a launch prefix
+        // (a delegated cgroup scope) so its whole tree — setsid escapees included —
+        // is reaped by reap(box_id) at teardown; NoContainment / an unavailable host
+        // prepends nothing and the job runs directly under the best-effort group reap.
+        let limits = ResourceLimits {
+            cpu: spec.cpu,
+            mem_mib: spec.mem,
+        };
+        let launch: Vec<String> = self
+            .containment
+            .wrap(&box_id, limits)
+            .into_iter()
+            .chain(spec.command.iter().cloned())
+            .collect();
+        let (program, args) = launch
+            .split_first()
+            .ok_or_else(|| BackendError::Spawn("empty command".to_string()))?;
+
         // INV-1 + isolation: clear the host env, keep only PATH, overlay spec.env,
         // then point SANDY_<TAG>_DIR at each staged share dir — the dir PATH, never
-        // the secret bytes (those stay 0600 files in the secret dir).
+        // the secret bytes (those stay 0600 files in the secret dir). The env is set
+        // on the launch command; `systemd-run --scope` runs the job as its own child
+        // inheriting this env, so it reaches the job across the wrapper.
         let mut command = Command::new(program);
         command
             .args(args)
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .envs(spec.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        // Plumbing the containment wrapper needs from the host (e.g. systemd-run's
+        // XDG_RUNTIME_DIR to reach the user bus). Non-secret and empty for an
+        // uncontained run, so the clean-env property holds unless a wrapper is active.
+        for key in self.containment.passthrough_env() {
+            if let Some(val) = std::env::var_os(&key) {
+                command.env(&key, val);
+            }
+        }
         for placement in &placements {
             command.env(share_env_key(&placement.tag), &placement.dir);
         }
@@ -166,10 +237,9 @@ impl ProcessBackend {
         let mut child = match command.group_spawn() {
             Ok(child) => child,
             // A spawn fault is infra (band 3, retryable), not a run result.
-            Err(err) => return Err(BackendError::Spawn(format!("spawn `{program}`: {err}"))),
+            Err(err) => return Err(BackendError::Spawn(format!("spawn `{job_program}`: {err}"))),
         };
 
-        let box_id = run_id.to_string();
         self.registry()?.push(BoxState {
             box_id: box_id.clone(),
             box_name: spec.template.to_string(),
@@ -199,17 +269,25 @@ impl ProcessBackend {
                 Err(err) => {
                     let _ = child.kill();
                     let _ = child.wait();
+                    let _ = self.containment.reap(&box_id);
                     self.registry()?.retain(|state| state.box_id != box_id);
-                    return Err(BackendError::Transport(format!("wait on child `{program}`: {err}")));
+                    return Err(BackendError::Transport(format!("wait on child `{job_program}`: {err}")));
                 }
             }
         };
 
-        // Reap the whole group on every path, exit or timeout, so a backgrounded
-        // descendant in the group is killed (no host orphan) and its pipe ends
-        // close. A descendant that escaped the group (setsid/setpgid) survives
-        // this, so the console drains are read under a deadline below, never
-        // joined — run() stays bounded regardless of what the job spawned.
+        // Reap on every path, exit or timeout. First destroy the containment scope:
+        // when containment is Available this kills the whole cgroup, including a
+        // setsid/setpgid escapee the group-kill below would miss (#135). Best-effort
+        // — a reap-mechanism failure is warn-logged, not fatal, and the group-kill
+        // still runs. NoContainment makes this a no-op.
+        if let Err(err) = self.containment.reap(&box_id) {
+            tracing::warn!(box_id = %box_id, %err, "containment reap failed; falling back to process-group kill");
+        }
+        // Then reap the group leader so a backgrounded in-group descendant is killed
+        // (no host orphan) and its pipe ends close. A group-escaped descendant
+        // survives this when uncontained, so the console drains are read under a
+        // deadline below, never joined — run() stays bounded regardless.
         let _ = child.kill();
         let _ = child.wait();
         self.registry()?.retain(|state| state.box_id != box_id);
@@ -274,17 +352,16 @@ impl VmBackend for ProcessBackend {
     }
 
     fn kill(&self, box_id: &str) -> Result<(), BackendError> {
-        // Deregisters only, mirroring `QemuBackend::kill` (the sandbox-visible
-        // effect is dropping the registry entry). Real termination of the process
-        // group — including a `setsid`/`setpgid`-escaped descendant, which a
-        // `killpg` here would miss exactly as the group-reap does — is gated to
-        // #135 (cgroup/jail teardown), the one mechanism that reaps every case.
-        //
-        // INV-3 honesty: until #135, a kill() on a LIVE process box would leave
-        // that group running and hidden from `boxes()`. This is acceptable only
-        // because the gated MVP runs no untrusted jobs and does not exercise
-        // kill() on a live process box: run() is synchronous and tears down its
-        // own group on every path, so a box is registered only for its run().
+        // Real termination (#135): reap the run's containment scope, destroying its
+        // cgroup and the whole process tree — including a `setsid`/`setpgid`-escaped
+        // descendant a `killpg` would miss. Best-effort: a reap-mechanism failure is
+        // warn-logged, not fatal, and the registry entry is still dropped so `boxes()`
+        // stops reporting the box (INV-3). An uncontained backend (NoContainment)
+        // reaps nothing here — its box is only ever live for its synchronous run(),
+        // and the fail-closed gate keeps untrusted jobs off it.
+        if let Err(err) = self.containment.reap(box_id) {
+            tracing::warn!(box_id, %err, "containment reap failed on kill");
+        }
         self.registry()?.retain(|state| state.box_id != box_id);
         Ok(())
     }
@@ -675,5 +752,99 @@ mod tests {
     fn kind_is_process_and_refuses_a_vm_job() {
         assert_eq!(ProcessBackend::new().kind(), SandboxKind::Process);
         assert!(!sandy::backend_accepts(ProcessBackend::new().kind(), SandboxKind::Vm));
+    }
+
+    /// The default backend is uncontained, so the fail-closed gate refuses an
+    /// untrusted job on it; an injected available containment admits one. Asserts
+    /// the BAD path (refusal), not only the happy path.
+    #[test]
+    fn containment_status_drives_the_fail_closed_gate() {
+        let uncontained = ProcessBackend::new();
+        assert!(
+            !sandy::admits_untrusted(uncontained.kind(), &uncontained.containment_status()),
+            "an uncontained (NoContainment) process backend must refuse an untrusted job"
+        );
+
+        let contained = ProcessBackend::with_containment(Box::new(sandy::FakeContainment::available()));
+        assert!(
+            sandy::admits_untrusted(contained.kind(), &contained.containment_status()),
+            "an available containment admits an untrusted job"
+        );
+    }
+
+    /// Every run reaps its container exactly once (on the exit path), keyed by the
+    /// run's box id. This is the escapee-reaping wiring: a real cgroup reap would
+    /// kill a setsid descendant the group-kill misses.
+    #[test]
+    fn a_run_reaps_its_container() -> anyhow::Result<()> {
+        let fake = Arc::new(sandy::FakeContainment::available());
+        let backend = ProcessBackend::with_containment(Box::new(Arc::clone(&fake)));
+        let grants = no_grants();
+        let command = ["true".to_string()];
+        let spec = run_spec(&command, &grants, 30);
+
+        backend.run(&spec)?;
+
+        assert_eq!(fake.reaped().len(), 1, "exactly one container reaped per run");
+        Ok(())
+    }
+
+    /// A job over its timeout still reaps its container (the escapee path: a real
+    /// cgroup reap kills what the group-kill cannot). Asserts reap fires on the
+    /// timeout path, not only a clean exit.
+    #[test]
+    fn a_timed_out_run_reaps_its_container() -> anyhow::Result<()> {
+        let fake = Arc::new(sandy::FakeContainment::available());
+        let backend = ProcessBackend::with_containment(Box::new(Arc::clone(&fake)));
+        let grants = no_grants();
+        let command = ["sh".to_string(), "-c".to_string(), "sleep 30".to_string()];
+        let spec = run_spec(&command, &grants, 1);
+
+        let outcome = backend.run(&spec)?;
+
+        assert!(outcome.timed_out, "the job exceeded its 1s budget");
+        assert_eq!(fake.reaped().len(), 1, "the timed-out run reaped its container");
+        Ok(())
+    }
+
+    /// `kill()` now really terminates: it reaps the box's container (the #135 fix for
+    /// the deregister-only kill) and drops the registry entry so `boxes()` stops
+    /// reporting it (INV-3).
+    #[test]
+    fn kill_reaps_the_container_and_deregisters() -> anyhow::Result<()> {
+        let fake = Arc::new(sandy::FakeContainment::available());
+        let backend = ProcessBackend::with_containment(Box::new(Arc::clone(&fake)));
+
+        backend.kill("box-42")?;
+
+        assert_eq!(
+            fake.reaped(),
+            vec!["box-42".to_string()],
+            "kill() reaps the named box's container"
+        );
+        assert!(backend.boxes()?.is_empty(), "the box is deregistered");
+        Ok(())
+    }
+
+    /// The backend prepends the containment's wrap prefix to the launch command: an
+    /// available containment whose wrap is `["env"]` runs the job via `env`, and the
+    /// job still executes (proving the prefix wraps rather than replaces).
+    #[test]
+    fn the_wrap_prefix_is_prepended_to_the_launch() -> anyhow::Result<()> {
+        let fake = sandy::FakeContainment::available_wrapping(vec!["env".to_string()]);
+        let backend = ProcessBackend::with_containment(Box::new(fake));
+        let grants = no_grants();
+        let command = ["sh".to_string(), "-c".to_string(), "printf wrapped-ok".to_string()];
+        let spec = run_spec(&command, &grants, 30);
+
+        let outcome = backend.run(&spec)?;
+
+        assert_eq!(outcome.guest_exit, Some(0), "the wrapped job ran");
+        assert!(
+            outcome.console.contains("wrapped-ok"),
+            "the job ran through the wrap prefix, got {:?}",
+            outcome.console
+        );
+        Ok(())
     }
 }
