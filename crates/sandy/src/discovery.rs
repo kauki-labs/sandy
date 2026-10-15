@@ -52,7 +52,15 @@ impl StaticRegistry {
 
 impl Discovery for StaticRegistry {
     fn resolve(&self, _target: &str) -> Placement {
-        todo!("T2: resolve the static placement from the host matrix (machines-table only)")
+        // A literal extraction of today's placement: the matrix builder systems as-is,
+        // with no remote builder or seed resolved (stage C/D), and no host system
+        // added — doctor never unioned one. `target` does not steer the result for a
+        // single static registry; richer discovery will use it.
+        Placement {
+            systems: self.builder_systems.clone(),
+            remote_builder: None,
+            seed: None,
+        }
     }
 }
 
