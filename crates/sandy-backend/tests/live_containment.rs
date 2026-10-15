@@ -49,11 +49,13 @@ fn live_contained_backend() -> ProcessBackend {
 fn a_setsid_escaped_descendant_is_reaped_by_the_cgroup() -> anyhow::Result<()> {
     let backend = live_contained_backend();
     let grants = no_grants();
-    // A unique marker so pgrep finds only this test's sleeper. The job spawns it in
-    // a NEW session (setsid → escapes the process group), then blocks past the 1s
-    // budget so the run tears down via timeout → reap(scope).
-    let marker = format!("sandy-live-135-{}", std::process::id());
-    let script = format!("setsid sleep 3141 & echo {marker}; sleep 300");
+    // A unique sleep duration so pgrep matches ONLY this test's sleeper, never a
+    // stale orphan from an earlier/concurrent run. The job spawns it in a NEW session
+    // (setsid → escapes the process group), then blocks past the 1s budget so the run
+    // tears down via timeout → reap(scope). `sleep <int>.<pid>` is a valid float
+    // duration and a unique marker at once.
+    let marker = format!("3141.{}", std::process::id());
+    let script = format!("setsid sleep {marker} & echo spawned; sleep 300");
     let command = ["sh".to_string(), "-c".to_string(), script];
     let spec = RunSpec {
         template: "process",
@@ -74,10 +76,10 @@ fn a_setsid_escaped_descendant_is_reaped_by_the_cgroup() -> anyhow::Result<()> {
     assert!(outcome.timed_out, "the job exceeded its 1s budget");
 
     // Poll pgrep briefly to absorb the reap race; the escaped sleeper must be gone.
-    let pattern = "sleep 3141";
+    let pattern = format!("sleep {marker}");
     let gone = (0..50).any(|_| {
         let found = Command::new("pgrep")
-            .args(["-f", pattern])
+            .args(["-f", &pattern])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);

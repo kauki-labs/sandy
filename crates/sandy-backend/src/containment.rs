@@ -149,7 +149,9 @@ fn systemd_run_prefix(id: &str, limits: ResourceLimits) -> Vec<String> {
     }
     if let Some(cpu) = limits.cpu {
         // CPUQuota is a percentage of one core, so N whole cores is N*100%.
-        prefix.push(format!("--property=CPUQuota={}%", cpu * 100));
+        // Saturating: `cpu` is an unvalidated request, and a panic/wrap in library
+        // code on an absurd value is worse than a clamped quota.
+        prefix.push(format!("--property=CPUQuota={}%", cpu.saturating_mul(100)));
     }
     prefix.push("--".to_string());
     // Strip the wrapper's user-bus env from the JOB (defence in depth, CWE-269): the
