@@ -15,6 +15,7 @@ pub mod console;
 pub mod containment;
 pub mod cred;
 pub mod discovery;
+pub mod egress;
 pub mod provision;
 pub mod result;
 pub mod seed;

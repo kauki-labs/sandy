@@ -74,8 +74,9 @@ pub use cred::{
 pub use cred_github::GithubAdapter;
 pub use discovery::{Discovery, Placement, StaticRegistry, parse_builder_systems};
 pub use egress::{
-    AllowList, EgressApplier, EgressOs, EgressOutcome, EgressPlan, EgressRule, FakeApplier, NftablesApplier, enforce,
-    macos_egress_statement, plan_egress, plan_egress_scoped, to_nftables, to_nftables_forward,
+    AllowList, EgressApplier, EgressError, EgressOs, EgressOutcome, EgressPlan, EgressRule, FakeApplier,
+    NftablesApplier, enforce, macos_egress_statement, plan_egress, plan_egress_scoped, to_nftables,
+    to_nftables_forward,
 };
 pub use error::CoreError;
 pub use gc::{StagedImage, plan_eviction};
