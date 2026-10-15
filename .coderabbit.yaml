@@ -2,7 +2,7 @@
 language: "en-US"
 early_access: false
 tone_instructions: >-
-  Read AGENTS.md and the docs as the authoritative context before reviewing — especially docs/architecture/spec.md (the per-subsystem decisions and the KPI tests that verify each), docs/architecture/overview.md (the run pipeline and the four seams), and docs/decisions/ (why each subsystem is built this way, and the alternatives set aside). Judge a change against those conventions, invariants, and decisions, not generic best practice; flag anything that contradicts a stated decision or breaks an invariant, and do not re-propose an alternative the decisions record already set aside. Be pedantic and rigorous. Focus on substantive correctness, security, and architectural concerns; skip cosmetic and stylistic nits. sandy runs untrusted jobs in ephemeral NixOS microVMs and mints scoped forge credentials, so weight INV-1 (secret bytes never reach argv, env, or the Nix store — staged 0600 files only), credential revoke/teardown, egress allow-list enforcement, and the locked result envelope with its exit bands (INV-11) above everything else.
+  Review against sandy's AGENTS.md, architecture spec, and docs/decisions/ as authority, not generic best practice. Be rigorous on correctness, security, architecture; skip style nits. Weight INV-1, credential teardown, egress, INV-11 bands highest.
 reviews:
   profile: "assertive"
   # Approvals ON. With request_changes_workflow enabled, CodeRabbit submits an
@@ -28,6 +28,12 @@ reviews:
     - "!flake.lock"
     - "!Cargo.lock"
   path_instructions:
+    # The authoritative-context rule (moved off tone_instructions, which caps at
+    # 250 chars). path_instructions have no such cap, and "**" applies it to every
+    # file CodeRabbit reviews.
+    - path: "**"
+      instructions: >-
+        Treat AGENTS.md, docs/architecture/spec.md (per-subsystem decisions + the KPI tests that verify each), docs/architecture/overview.md (the run pipeline and the four seams), and docs/decisions/ (why each subsystem is built this way, and the alternatives set aside) as authoritative. Judge a change against those decisions and invariants, not generic best practice; flag anything that contradicts a stated decision or breaks an invariant, and do not re-propose an alternative the record already set aside. sandy runs untrusted jobs in ephemeral NixOS microVMs and mints scoped forge credentials, so weight INV-1 (secret bytes never reach argv, env, or the Nix store — staged 0600 files only), credential revoke/teardown, egress allow-list enforcement, and the locked result envelope with its exit bands (INV-11) above everything else.
     - path: "crates/**/*.rs"
       instructions: >-
         Rust, edition 2024. Enforce the house rules: no `.unwrap()` / `.expect()` in library code (propagate with `?`; tests return `anyhow::Result<()>` with `.context()`); the `tracing::` prefix on log macros; `thiserror` for typed errors. Hunt behavioural defects at boundaries and error paths — a silent no-op, an off-by-one retry, a staging/production assumption — not style.
