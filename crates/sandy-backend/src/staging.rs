@@ -40,6 +40,12 @@ pub fn ensure_sandy_staging_base() -> Result<PathBuf, BackendError> {
 /// it is opened with `O_NOFOLLOW`, so a symlink planted at that name — before
 /// `mkdirat` or racing right after it — is rejected rather than followed,
 /// whether the base was just created or already existed.
+///
+/// This assumes `parent` itself is not attacker-writable (true for a
+/// sticky-bit `/tmp` or a per-user `$TMPDIR`): once the base passes
+/// validation below, nothing can be swapped underneath it only while
+/// `parent` stays out of attacker control. A world-writable, non-sticky
+/// `TMPDIR` is out of scope for this check.
 fn ensure_staging_base_in(parent: &Path) -> Result<PathBuf, BackendError> {
     let base = parent.join(STAGING_DIR_NAME);
     let parent_fd = open(
@@ -121,29 +127,35 @@ mod tests {
         std::fs::create_dir(&base).expect("pre-create base");
         std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o777)).expect("widen perms");
 
-        let result = ensure_staging_base_in(tmp.path());
+        let err = ensure_staging_base_in(tmp.path()).expect_err("a world-writable base must be rejected");
 
         assert!(
-            result.is_err(),
-            "a world-writable base must be rejected, not returned as usable: {result:?}"
+            err.to_string().contains("group/world-writable"),
+            "expected a group/world-writable rejection, got {err}"
         );
     }
 
     /// Adversarial (CWE-732): a base that is a symlink to an attacker-chosen
-    /// directory must be rejected, not followed.
+    /// directory must be rejected, not followed. `attacker_dir` is pinned to
+    /// `0700` so this fails only via the `O_NOFOLLOW` symlink rejection —
+    /// without the pin, a lenient create-dir umask (e.g. `0002` on
+    /// user-private-group distros) could make `attacker_dir` group-writable
+    /// and the test would pass for the wrong reason (the mode check, not the
+    /// symlink check) if `O_NOFOLLOW` were ever dropped.
     #[test]
     fn symlinked_base_is_rejected() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let attacker_dir = tmp.path().join("attacker-controlled");
         std::fs::create_dir(&attacker_dir).expect("create attacker dir");
+        std::fs::set_permissions(&attacker_dir, std::fs::Permissions::from_mode(0o700)).expect("pin attacker perms");
         let base = tmp.path().join("sandy");
         symlink(&attacker_dir, &base).expect("symlink base");
 
-        let result = ensure_staging_base_in(tmp.path());
+        let err = ensure_staging_base_in(tmp.path()).expect_err("a symlinked base must be rejected");
 
         assert!(
-            result.is_err(),
-            "a symlinked base must be rejected, not followed: {result:?}"
+            err.to_string().contains("symlinked base?"),
+            "expected the symlink-rejection open to fail, got {err}"
         );
     }
 
