@@ -129,7 +129,14 @@ impl ProcessBackend {
         let transport = LocalDirTransport::new(inst_dir.to_path_buf());
         let placements = match transport.plan(&shares, 0) {
             Presentation::LocalDir { placements, .. } => placements,
-            Presentation::Vm { .. } => Vec::new(),
+            // LocalDirTransport always yields a LocalDir; a Vm here is a seam-
+            // invariant bug. Fail loud (infra) rather than silently run the job
+            // with no SANDY_*_DIR env (inputs/secrets invisible).
+            Presentation::Vm { .. } => {
+                return Err(BackendError::Protocol(
+                    "LocalDirTransport yielded a Vm presentation (share-seam invariant broken)".to_string(),
+                ));
+            }
         };
         transport.activate(&shares)?;
 
@@ -613,6 +620,48 @@ mod tests {
         assert!(
             outcome.console.contains("s3cr3t"),
             "the job read the secret via SANDY_SECRETS_DIR, got {:?}",
+            outcome.console
+        );
+        Ok(())
+    }
+
+    /// Adversarial INV-1: the secret's BYTES never reach the job's environment —
+    /// only the `SANDY_SECRETS_DIR` path does. The job dumps its env; the value is
+    /// absent, the dir path present.
+    #[test]
+    fn a_secret_value_is_absent_from_the_process_env() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let src = tempfile::TempDir::new()?;
+        let secret_file = src.path().join("tok");
+        std::fs::write(&secret_file, b"s3cr3t-value")?;
+        std::fs::set_permissions(&secret_file, std::fs::Permissions::from_mode(0o600))?;
+        let secrets = [sandy::SecretRef {
+            name: "TOKEN".to_string(),
+            source: sandy::SecretSource::File(secret_file),
+        }];
+        let grants = Grants {
+            secrets: true,
+            agent: false,
+            shares: false,
+        };
+        let command = ["sh".to_string(), "-c".to_string(), "env".to_string()];
+        let spec = RunSpec {
+            secrets: &secrets,
+            grants: &grants,
+            ..run_spec(&command, &grants, 30)
+        };
+
+        let outcome = ProcessBackend::new().run(&spec)?;
+
+        assert_eq!(outcome.guest_exit, Some(0), "the job ran");
+        assert!(
+            outcome.console.contains("SANDY_SECRETS_DIR="),
+            "the dir PATH is exposed via env"
+        );
+        assert!(
+            !outcome.console.contains("s3cr3t-value"),
+            "INV-1: the secret BYTES must never reach the job env, got {:?}",
             outcome.console
         );
         Ok(())
