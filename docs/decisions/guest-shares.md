@@ -90,7 +90,7 @@ in `envelope.outputs`. Collection **skips symlinks** and caps bytes/entries.
 **Consequences.** A job dropping `out/x → /etc/shadow` neither leaks the target's
 bytes nor plants a host-escaping link. Copying inputs is fine for typical sizes.
 Arbitrary guest paths landed on the retained copy (§6); a no-copy direct-share
-variant is the local optimization in §7 (#82).
+variant was considered (§7) and withdrawn (#82).
 
 ## 5. Fixed tags, not pooled
 
@@ -122,13 +122,20 @@ share, and a guest boot step symlinks each `guest_path` to the staged entry befo
 READY. The input is staged under an internal `in<index>` name.
 
 **Consequences.** Placement is decoupled from the source: identical whether the
-bytes came from a copy (today), a direct share (§7), or an object store later. The
-manifest's `source`/`hash` columns are the forward slot for those. Proven by the
+bytes came from a copy (today), a direct share (§7, withdrawn), or an object store
+later. The manifest's `source`/`hash` columns are the forward slot for those. Proven by the
 live test `an_input_appears_at_an_absolute_guest_path`.
 
 ## 7. No-copy direct share is a local-only, placement-aware optimization
 
-**Status:** accepted (design); implementation deferred (#82, separate session).
+**Status:** withdrawn (2026-10-15; #82 closed not-planned).
+
+**Withdrawn.** The spec check found direct-share incompatible with the current guest model, not
+merely unscheduled. It would reverse two accepted decisions: §4 (inputs are copied by default)
+and §5 (fixed static tags, which deliberately removed per-run/per-input dynamic mounting). A
+per-input read-only `ShareSpec`/virtio-fs tag reintroduces exactly the dynamic mounting §5
+retired, and flips §4's copy default, for a local-only win that does not generalize to a fleet.
+The design below is kept as the record of what was considered.
 
 **Context.** Copying a multi-GB input into staging is wasteful when the input
 already lives on the machine that runs the job. A no-copy virtio-fs share of the
@@ -152,7 +159,9 @@ in-guest; a non-local target falls back to copy.
 
 **Set aside (do not re-propose without new information).** Unconditional (global)
 direct-share: impossible once an orchestrator picks the host — the input is not
-there, so the no-copy share cannot exist.
+there, so the no-copy share cannot exist. The no-copy local variant is set aside too:
+re-propose only if the guest model stops depending on fixed static tags (§5 revisited), since
+that dependency is what makes direct-share's per-input dynamic tags incompatible today.
 
 ## 8. Content-addressed inputs (hashing)
 
@@ -205,6 +214,6 @@ pipeline where sandbox outputs (content-hashed, §8) become other sandboxes' inp
 placement-optimized by the orchestrator (#36) and the agent daemon (#65). Not built
 in the input seam.
 
-**Consequences.** Keeps the input model focused (copy + manifest + local
-direct-share) while naming where it grows. It belongs with the agent-model epic
+**Consequences.** Keeps the input model focused (copy + manifest; direct-share
+withdrawn, §7) while naming where it grows. It belongs with the agent-model epic
 (#36/#65), not here.
