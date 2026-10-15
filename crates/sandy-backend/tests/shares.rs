@@ -14,7 +14,10 @@ use sandy::{
     Grants, INPUT_MOUNT_TAG, Input, OUTPUT_MOUNT_TAG, Output, RunSpec, SECRET_MOUNT_TAG, Topology, collect_outputs,
     parse_topology, prepare_outputs, stage_inputs,
 };
-use sandy_backend::{QemuStagedArgs, ShareSpec, VfkitStagedArgs, qemu_args, vfkit_args, virtiofsd_args};
+use sandy_backend::{
+    GuestShareTransport, LocalDirTransport, Placement, Presentation, QemuStagedArgs, ShareSpec, VfkitStagedArgs,
+    qemu_args, vfkit_args, virtiofsd_args,
+};
 
 const QEMU_FIXTURE: &[u8] = include_bytes!("fixtures/topology-x86_64.json");
 const VFKIT_FIXTURE: &[u8] = include_bytes!("fixtures/topology-aarch64.json");
@@ -477,6 +480,75 @@ fn plan_shares_attaches_an_empty_secret_dir_for_refresh() -> Result<()> {
     assert_eq!(
         shares[0].host_dir, cred,
         "the secret share points at the caller's cred_dir for refresh re-delivery"
+    );
+    Ok(())
+}
+
+/// The process profile's transport maps each staged share to a placement
+/// (tag, dir, readonly) under the per-run root, which ProcessBackend exposes as
+/// `SANDY_<TAG>_DIR` env. (Red first: the plan stub returns no placements.)
+#[test]
+fn local_dir_plan_maps_each_share_to_a_placement() {
+    use std::path::PathBuf;
+
+    let transport = LocalDirTransport::new(PathBuf::from("/run/inst"));
+    let shares = [
+        qshare(std::path::Path::new("/s/in"), "sandy-inputs", true),
+        qshare(std::path::Path::new("/s/out"), "sandy-outputs", false),
+    ];
+
+    let Presentation::LocalDir { root, placements } = transport.plan(&shares, 0) else {
+        panic!("the process transport yields a LocalDir presentation");
+    };
+
+    assert_eq!(root, PathBuf::from("/run/inst"), "root is the per-run inst dir");
+    assert_eq!(placements.len(), 2, "one placement per share");
+    assert_eq!(
+        placements[0],
+        Placement {
+            tag: "sandy-inputs".to_string(),
+            dir: PathBuf::from("/s/in"),
+            readonly: true,
+        }
+    );
+    assert_eq!(
+        placements[1],
+        Placement {
+            tag: "sandy-outputs".to_string(),
+            dir: PathBuf::from("/s/out"),
+            readonly: false,
+        }
+    );
+}
+
+/// activate() strips write from a read-only share (cooperative RO) and leaves a
+/// writable share alone. No daemons are returned.
+#[test]
+fn local_dir_activate_makes_readonly_shares_unwritable() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::TempDir::new()?;
+    let inputs = tmp.path().join("inputs");
+    std::fs::create_dir(&inputs)?;
+    std::fs::write(inputs.join("f"), b"x")?;
+    let outputs = tmp.path().join("outputs");
+    std::fs::create_dir(&outputs)?;
+
+    let shares = [
+        qshare(&inputs, "sandy-inputs", true),
+        qshare(&outputs, "sandy-outputs", false),
+    ];
+    let children = LocalDirTransport::new(tmp.path().to_path_buf()).activate(&shares)?;
+
+    assert!(children.is_empty(), "the process transport launches no daemons");
+    let write_bits =
+        |p: &std::path::Path| -> Result<u32> { Ok(std::fs::metadata(p).context("stat")?.permissions().mode() & 0o222) };
+    assert_eq!(write_bits(&inputs)?, 0, "read-only input dir loses write");
+    assert_eq!(write_bits(&inputs.join("f"))?, 0, "read-only input file loses write");
+    assert_ne!(
+        write_bits(&outputs)? & 0o200,
+        0,
+        "writable output dir keeps owner write"
     );
     Ok(())
 }

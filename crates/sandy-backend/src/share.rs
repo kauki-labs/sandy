@@ -14,6 +14,8 @@
 //! consume.
 
 use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
@@ -253,6 +255,68 @@ impl GuestShareTransport for VirtioFsTransport {
         }
         Presentation::Vm { args }
     }
+}
+
+/// The process profile's share transport: no virtio-fs, no daemon. Presents each
+/// staged share dir to the host job via a `SANDY_<TAG>_DIR` env var (see
+/// [`Presentation::LocalDir`]) and enforces read-only cooperatively (`chmod a-w`)
+/// on inputs/secrets. Constructed per run with the backend's inst dir as the root.
+#[derive(Debug, Clone)]
+pub struct LocalDirTransport {
+    root: PathBuf,
+}
+
+impl LocalDirTransport {
+    /// A transport rooting the staged share dirs at `root` (the per-run inst dir).
+    #[must_use]
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+}
+
+impl GuestShareTransport for LocalDirTransport {
+    fn plan(&self, shares: &[ShareSpec], _mem_mib: u32) -> Presentation {
+        // STUB (slice-2 red): empty placements, so the mapping test fails on
+        // behaviour before the real map lands.
+        let _ = shares;
+        Presentation::LocalDir {
+            root: self.root.clone(),
+            placements: Vec::new(),
+        }
+    }
+
+    fn activate(&self, shares: &[ShareSpec]) -> Result<Vec<Child>, BackendError> {
+        // Cooperative read-only: strip write from each read-only share dir so a job
+        // cannot write into inputs/secrets. A same-user job can undo it (weak, like
+        // the vfkit RO asymmetry in guest-shares §2); the VM backend is the real
+        // boundary. No daemons, so the live-children set is empty.
+        for share in shares {
+            if share.readonly {
+                set_dir_readonly(&share.host_dir)?;
+            }
+        }
+        Ok(Vec::new())
+    }
+}
+
+/// Strip write (`chmod a-w`) from `dir` and its direct entries, so a same-user job
+/// cannot modify a read-only share's staged contents. Best-effort cooperative RO
+/// (not a hard boundary): the dir loses write so entries cannot be added or
+/// removed, and each staged entry loses write so its bytes cannot be changed.
+fn set_dir_readonly(dir: &Path) -> Result<(), BackendError> {
+    let strip_write = |path: &Path| -> Result<(), BackendError> {
+        let meta =
+            fs::symlink_metadata(path).map_err(|e| BackendError::Spawn(format!("stat {}: {e}", path.display())))?;
+        let mut perms = meta.permissions();
+        perms.set_mode(perms.mode() & !0o222);
+        fs::set_permissions(path, perms).map_err(|e| BackendError::Spawn(format!("chmod ro {}: {e}", path.display())))
+    };
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            strip_write(&entry.path())?;
+        }
+    }
+    strip_write(dir)
 }
 
 /// Kill and reap a set of child processes, best-effort (the virtiofsd daemons at

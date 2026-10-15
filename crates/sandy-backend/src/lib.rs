@@ -19,7 +19,7 @@ mod vfkit;
 pub use process::ProcessBackend;
 pub use qemu::{QemuBackend, StagedArgs as QemuStagedArgs, qemu_args};
 pub use share::{
-    GuestShareTransport, Placement, Presentation, ShareDirs, ShareSpec, VirtioFsTransport, VirtiofsdTransport,
-    plan_shares, virtiofsd_args,
+    GuestShareTransport, LocalDirTransport, Placement, Presentation, ShareDirs, ShareSpec, VirtioFsTransport,
+    VirtiofsdTransport, plan_shares, virtiofsd_args,
 };
 pub use vfkit::{StagedArgs as VfkitStagedArgs, VfkitBackend, vfkit_args};
