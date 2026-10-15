@@ -196,10 +196,7 @@ pub enum SandboxKind {
 /// touching callers.
 #[must_use]
 pub fn backend_accepts(provided: SandboxKind, required: SandboxKind) -> bool {
-    // TODO(slice-A red): stubbed permissive on purpose — the test below drives
-    // this to the real exact-match rule.
-    let _ = (provided, required);
-    true
+    provided == required
 }
 
 /// The hypervisor seam. `FakeBackend` and `LauncherBackend` implement this
