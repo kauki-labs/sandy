@@ -320,22 +320,28 @@ impl GuestShareTransport for LocalDirTransport {
 fn set_dir_readonly(dir: &Path) -> Result<(), BackendError> {
     let mut stack = vec![dir.to_path_buf()];
     while let Some(current) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&current) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(meta) = fs::symlink_metadata(&path) else {
-                continue;
-            };
+        // Fatal: if we cannot even enumerate the share dir, the RO step would be a
+        // silent no-op — surface it rather than ship a silent gate.
+        let entries = fs::read_dir(&current)
+            .map_err(|e| BackendError::Spawn(format!("read share dir {}: {e}", current.display())))?;
+        for entry in entries {
+            let path = entry
+                .map_err(|e| BackendError::Spawn(format!("read share entry in {}: {e}", current.display())))?
+                .path();
+            let meta = fs::symlink_metadata(&path)
+                .map_err(|e| BackendError::Spawn(format!("stat {}: {e}", path.display())))?;
             if meta.is_dir() {
                 stack.push(path);
             } else {
                 let mut perms = meta.permissions();
                 perms.set_mode(perms.mode() & !0o222);
-                // Best-effort cooperative RO: a failure to chmod one staged file
-                // does not fail the run (the VM boundary is the real guarantee).
-                let _ = fs::set_permissions(&path, perms);
+                // Non-fatal but OBSERVABLE: cooperative RO is defence-in-depth (the
+                // VM is the real boundary), so one stubborn file does not fail the
+                // run — but a swallowed partial failure is the silent-gate smell, so
+                // it is warn-logged with the path rather than dropped.
+                if let Err(err) = fs::set_permissions(&path, perms) {
+                    tracing::warn!(path = %path.display(), %err, "failed to strip write from a read-only share file");
+                }
             }
         }
     }
