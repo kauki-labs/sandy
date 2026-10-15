@@ -12,6 +12,7 @@
 
 pub mod backend;
 pub mod console;
+pub mod containment;
 pub mod cred;
 pub mod discovery;
 pub mod provision;

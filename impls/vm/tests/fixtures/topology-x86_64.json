@@ -1,0 +1,19 @@
+{
+  "kernel": "/nix/store/9m8k7j6h5g4f3d2s1a0zxcvbnmlkjhg7-linux-6.6.52/bzImage",
+  "initrd": "/nix/store/8k7j6h5g4f3d2s1a0zxcvbnmlkjhg7f6-initrd-linux-6.6.52/initrd",
+  "store": {
+    "erofs_image": "/nix/store/1q2w3r4y5a6s7d8f9g0hjklzxcvbnm12-sandy-store.erofs"
+  },
+  "kernel_cmdline": "console=ttyS0 reboot=t panic=-1 root=/dev/vda loglevel=4 init=/nix/store/3d4f5g6h7j8k9l0mnbvcxzqwrsyp12345-nixos-system-sandy/init",
+  "cpu": 2,
+  "mem": 2048,
+  "vsock_cid": 3,
+  "shares": [
+    {
+      "host": "/var/lib/sandy/work",
+      "guest": "/work",
+      "tag": "sandy-work"
+    }
+  ],
+  "hypervisor": "qemu"
+}

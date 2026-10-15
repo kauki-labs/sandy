@@ -1,0 +1,29 @@
+[package]
+name = "sandy-impls-vm"
+description = "VM sandy seam implementations: the Linux/KVM qemu and macOS vfkit backends and their virtio-fs share transports"
+version.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+documentation = "https://docs.rs/sandy-impls-vm"
+keywords = ["sandbox", "microvm", "qemu", "vfkit", "hypervisor"]
+categories = ["virtualization", "development-tools"]
+
+[lib]
+crate-type = ["rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+sandy.workspace = true
+sandy-api.workspace = true
+tracing.workspace = true
+uuid = { workspace = true }
+
+[dev-dependencies]
+anyhow.workspace = true

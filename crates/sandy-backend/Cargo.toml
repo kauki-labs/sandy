@@ -16,23 +16,29 @@ categories = ["virtualization", "development-tools"]
 [lib]
 crate-type = ["rlib"]
 
-# The live containment gate (tier-3, #135, Linux only). Off by default so CI and
-# `nix flake check` never run it; enable on a Linux host with a user systemd
-# instance + cgroup v2. See tests/live_containment.rs.
-[features]
-live = []
-
 [lints]
 workspace = true
 
+# The backend hub selects which impl crates are compiled in. `impl-local` (the
+# raw-process backend) is on by default; `impl-vm` (the qemu/vfkit stack) is
+# opt-in, so a local-only build never compiles the VM backends. `live` is the
+# tier-3 containment gate (#135, Linux only; see tests/live_containment.rs).
+[features]
+default = ["impl-local"]
+impl-local = ["dep:sandy-impls-local"]
+impl-vm = ["dep:sandy-impls-vm"]
+live = []
+
 [dependencies]
-command-group = "5.0.1"
-rustix.workspace = true
 sandy.workspace = true
 sandy-api.workspace = true
-tracing.workspace = true
-uuid = { workspace = true }
+sandy-impls-local = { workspace = true, optional = true }
+sandy-impls-vm = { workspace = true, optional = true }
 
+# The hub's own tests exercise every impl directly (not through the feature-gated
+# re-exports), so the impl crates are unconditional dev-deps.
 [dev-dependencies]
 anyhow.workspace = true
+sandy-impls-local.workspace = true
+sandy-impls-vm.workspace = true
 tempfile.workspace = true

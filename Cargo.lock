@@ -1792,13 +1792,11 @@ name = "sandy-backend"
 version = "0.1.1"
 dependencies = [
  "anyhow",
- "command-group",
- "rustix",
  "sandy-api",
  "sandy-box",
+ "sandy-impls-local",
+ "sandy-impls-vm",
  "tempfile",
- "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -1816,6 +1814,7 @@ dependencies = [
  "octocrab",
  "portable-pty",
  "rstest",
+ "rustix",
  "sandy-api",
  "serde",
  "serde_json",
@@ -1842,6 +1841,30 @@ dependencies = [
  "tempfile",
  "tiny_http",
  "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "sandy-impls-local"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "command-group",
+ "sandy-api",
+ "sandy-box",
+ "tempfile",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "sandy-impls-vm"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "sandy-api",
+ "sandy-box",
  "tracing",
  "uuid",
 ]

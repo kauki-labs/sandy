@@ -22,15 +22,13 @@ use std::{
 };
 
 use sandy::{
-    BackendError, BoxState, Hypervisor, Markers, Outcome, PtyTransport, RunSpec, StoreBacking, Topology, VmBackend,
-    collect_outputs, run_console, topology, wipe,
+    BackendError, BoxState, Hypervisor, Markers, Outcome, PtyTransport, RunSpec, ShareDirs, StoreBacking, Topology,
+    VmBackend, collect_outputs, ensure_sandy_staging_base, plan_shares, run_console, topology, wipe,
 };
+use sandy_api::share::{GuestShareTransport, ShareSpec};
 use uuid::Uuid;
 
-use crate::{
-    share::{GuestShareTransport, ShareDirs, ShareSpec, VirtioFsTransport, plan_shares},
-    staging::ensure_sandy_staging_base,
-};
+use crate::share::VirtioFsTransport;
 
 /// The guest boot-ready marker the console protocol scans for before injecting
 /// the command: the guest's login shell prints it once it is up and reading (the

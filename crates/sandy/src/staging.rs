@@ -12,7 +12,8 @@
 use std::path::{Path, PathBuf};
 
 use rustix::fs::{Mode, OFlags, fstat, mkdirat, open, openat};
-use sandy::BackendError;
+
+use crate::BackendError;
 
 const STAGING_DIR_NAME: &str = "sandy";
 
