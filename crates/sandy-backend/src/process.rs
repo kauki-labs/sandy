@@ -17,18 +17,24 @@
 //! GITHUB_TOKEN, …) never leaks into an untrusted job; anything else a job needs
 //! (HOME/TERM) is passed explicitly in `spec.env`. The child is spawned as the
 //! leader of its own process group, so a timeout or teardown reaps the whole
-//! group — no host orphan, and no backgrounded descendant can hold the console
-//! pipes open and hang the run past its budget. The process backend is still
-//! weak-isolation (the VM backend is the real boundary); the containment story is
-//! the sandbox kind. Until the local-dir shares land (T4) a RunSpec that carries
-//! secrets, inputs, or outputs is refused outright, never silently run.
+//! group: a backgrounded descendant in the group is killed, no host orphan.
+//! `run()` is always bounded — the console drains are read under a grace deadline,
+//! never joined — so even a descendant that escapes the group via `setsid`/
+//! `setpgid` cannot hang the run past its budget, though such an escaped process
+//! may survive as a host orphan until cgroup/jail-level containment. That residual
+//! is the process backend's weak-isolation limit; the VM backend is the real
+//! boundary, and the containment story is the sandbox kind. Until the local-dir
+//! shares land (T4) a RunSpec that carries secrets, inputs, or outputs is refused
+//! outright, never silently run.
 
 use std::{
     io::Read,
     os::unix::process::ExitStatusExt,
     process::{Command, Stdio},
-    sync::{Mutex, MutexGuard},
-    thread::JoinHandle,
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime},
 };
 
@@ -43,6 +49,12 @@ const CONSOLE_TAIL_CAP: usize = 64 * 1024;
 /// Poll interval while waiting for the child, so the wall-clock timeout can
 /// interrupt a hung job (a blocking `wait()` cannot).
 const POLL: Duration = Duration::from_millis(10);
+
+/// After the child's process group is reaped, how long to let the console-drain
+/// threads flush before taking whatever they captured. A descendant that escaped
+/// the group (`setsid`/`setpgid`) can hold the pipe open forever, so the drains
+/// are NEVER joined unconditionally — `run()` stays bounded regardless of the job.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// A [`VmBackend`] that runs the job as a raw OS process (no VM).
 ///
@@ -151,22 +163,25 @@ impl VmBackend for ProcessBackend {
                 }
                 Err(err) => {
                     let _ = child.kill();
+                    let _ = child.wait();
                     self.registry()?.retain(|state| state.box_id != box_id);
                     return Err(BackendError::Transport(format!("wait on child `{program}`: {err}")));
                 }
             }
         };
 
-        // Reap the WHOLE group on every path, exit or timeout, so a backgrounded
-        // descendant is killed (no host orphan) and the console pipes close —
-        // which is what lets the drain join below return instead of hanging on a
-        // pipe a lingering group member is still holding open.
+        // Reap the whole group on every path, exit or timeout, so a backgrounded
+        // descendant in the group is killed (no host orphan) and its pipe ends
+        // close. A descendant that escaped the group (setsid/setpgid) survives
+        // this, so the console drains are read under a deadline below, never
+        // joined — run() stays bounded regardless of what the job spawned.
         let _ = child.kill();
         let _ = child.wait();
         self.registry()?.retain(|state| state.box_id != box_id);
 
-        let stdout = out_drain.and_then(|h| h.join().ok()).unwrap_or_default();
-        let stderr = err_drain.and_then(|h| h.join().ok()).unwrap_or_default();
+        let drain_deadline = Instant::now() + DRAIN_GRACE;
+        let stdout = take_bounded(out_drain, drain_deadline);
+        let stderr = take_bounded(err_drain, drain_deadline);
         let console = merged_console(&stdout, &stderr);
 
         // INV-11: the process ran (booted), so its exit is a task result on
@@ -189,6 +204,11 @@ impl VmBackend for ProcessBackend {
     }
 
     fn kill(&self, box_id: &str) -> Result<(), BackendError> {
+        // Dropping the instance from the registry is the sandbox-visible effect,
+        // matching `QemuBackend::kill`; signalling the live process is host-tier
+        // (#26). The run is synchronous, so a box is registered only while its
+        // run() call owns the child — a tracked box here is a registry entry to
+        // reap, and run() itself tears down the process group on every path.
         self.registry()?.retain(|state| state.box_id != box_id);
         Ok(())
     }
@@ -202,24 +222,54 @@ impl VmBackend for ProcessBackend {
     }
 }
 
-/// Drain a child pipe on its own thread, keeping only the last
-/// [`CONSOLE_TAIL_CAP`] bytes, so a chatty child never blocks on a full pipe and
-/// the console stays bounded. Returns the retained bytes when the thread joins.
-fn drain<R: Read + Send + 'static>(mut reader: R) -> JoinHandle<Vec<u8>> {
+/// A console pipe being drained on a background thread into a shared, bounded
+/// buffer. The buffer is readable at any time ([`take_bounded`]) without joining
+/// the thread, so a descendant that keeps the pipe open can never block `run()`.
+struct Drain {
+    /// The last [`CONSOLE_TAIL_CAP`] bytes read so far.
+    buf: Arc<Mutex<Vec<u8>>>,
+    /// Set once the reader hits EOF (the pipe's write ends all closed).
+    done: Arc<AtomicBool>,
+}
+
+/// Drain a child pipe on a detached thread into a shared bounded buffer. The
+/// thread is never joined: a group-escaped descendant can hold the pipe open
+/// forever, so the caller reads the buffer under a deadline instead
+/// ([`take_bounded`]). Keeps only the last [`CONSOLE_TAIL_CAP`] bytes.
+fn drain<R: Read + Send + 'static>(mut reader: R) -> Drain {
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let done = Arc::new(AtomicBool::new(false));
+    let (tbuf, tdone) = (Arc::clone(&buf), Arc::clone(&done));
     std::thread::spawn(move || {
-        let mut buf = Vec::new();
         let mut chunk = [0u8; 8192];
         while let Ok(n) = reader.read(&mut chunk) {
             if n == 0 {
                 break;
             }
-            buf.extend_from_slice(&chunk[..n]);
-            if buf.len() > CONSOLE_TAIL_CAP {
-                buf.drain(..buf.len() - CONSOLE_TAIL_CAP);
+            if let Ok(mut held) = tbuf.lock() {
+                held.extend_from_slice(&chunk[..n]);
+                if held.len() > CONSOLE_TAIL_CAP {
+                    let excess = held.len() - CONSOLE_TAIL_CAP;
+                    held.drain(..excess);
+                }
             }
         }
-        buf
-    })
+        tdone.store(true, Ordering::SeqCst);
+    });
+    Drain { buf, done }
+}
+
+/// Take a drain's captured bytes, waiting at most until `deadline` for a natural
+/// EOF, then returning whatever was captured. Never joins the thread, so a
+/// descendant holding the pipe open cannot make this block past `deadline`.
+fn take_bounded(drain: Option<Drain>, deadline: Instant) -> Vec<u8> {
+    let Some(drain) = drain else {
+        return Vec::new();
+    };
+    while !drain.done.load(Ordering::SeqCst) && Instant::now() < deadline {
+        std::thread::sleep(POLL);
+    }
+    drain.buf.lock().map(|held| held.clone()).unwrap_or_default()
 }
 
 /// Combine the child's stdout and stderr into one bounded console string, stdout
@@ -327,18 +377,20 @@ mod tests {
     }
 
     /// Adversarial: a job that backgrounds a process holding the console pipe open
-    /// must still be bounded by the timeout. The whole group is reaped, so the
-    /// drain join cannot hang on a lingering descendant's pipe. Without the
-    /// group-kill this run() would block well past the 1s budget.
+    /// must be bounded by the timeout AND its backgrounded child must be reaped by
+    /// the group-kill, not left a host orphan. Without the process group this
+    /// run() would block past the budget and the child would survive.
     #[test]
-    fn a_backgrounding_job_over_its_timeout_stays_bounded() -> anyhow::Result<()> {
+    fn a_backgrounding_job_is_bounded_and_the_group_is_reaped() -> anyhow::Result<()> {
+        use anyhow::Context;
+
         let grants = no_grants();
-        // `sleep 30 &` backgrounds a child that inherits stdout; the leader then
-        // blocks on `wait`, so neither finishes before the budget.
+        // Background a child that inherits stdout and print its pid; the leader
+        // then blocks on `wait`, so neither finishes before the 1s budget.
         let command = [
             "sh".to_string(),
             "-c".to_string(),
-            "sleep 30 & echo started; wait".to_string(),
+            "sleep 30 & echo pid=$!; wait".to_string(),
         ];
         let spec = run_spec(&command, &grants, 1);
 
@@ -349,6 +401,34 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_secs(10),
             "run() stayed bounded despite a backgrounded child holding the pipe open"
+        );
+
+        let pid = outcome
+            .console
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("pid="))
+            .map(str::trim)
+            .context("the job should have printed its background child's pid")?;
+
+        // The group-kill must have reaped the backgrounded child. Poll `kill -0`
+        // (which fails once the pid is gone) briefly, to absorb the reparent-reap
+        // race rather than flake on it.
+        let gone = (0..50).any(|_| {
+            let alive = std::process::Command::new("kill")
+                .args(["-0", pid])
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false);
+            if alive {
+                std::thread::sleep(Duration::from_millis(40));
+                false
+            } else {
+                true
+            }
+        });
+        assert!(
+            gone,
+            "the backgrounded child (pid {pid}) must be reaped by the group-kill, not orphaned"
         );
         Ok(())
     }
