@@ -291,8 +291,9 @@ impl GuestShareTransport for LocalDirTransport {
     }
 
     fn activate(&self, shares: &[ShareSpec]) -> Result<Vec<Child>, BackendError> {
-        // Cooperative read-only: strip write from each read-only share dir so a job
-        // cannot write into inputs/secrets. A same-user job can undo it (weak, like
+        // Cooperative read-only: strip write from the FILES in each read-only share
+        // dir so a job cannot modify the staged input/secret bytes (the dir stays
+        // writable so teardown can wipe it). A same-user job can undo it (weak, like
         // the vfkit RO asymmetry in guest-shares §2); the VM backend is the real
         // boundary. No daemons, so the live-children set is empty.
         for share in shares {
@@ -304,24 +305,36 @@ impl GuestShareTransport for LocalDirTransport {
     }
 }
 
-/// Strip write (`chmod a-w`) from `dir` and its direct entries, so a same-user job
-/// cannot modify a read-only share's staged contents. Best-effort cooperative RO
-/// (not a hard boundary): the dir loses write so entries cannot be added or
-/// removed, and each staged entry loses write so its bytes cannot be changed.
+/// Strip write (`chmod a-w`) from the FILES under `dir` (recursively), so a
+/// same-user job cannot modify a read-only share's staged bytes. Best-effort
+/// cooperative RO, not a hard boundary (the VM backend is the real boundary): only
+/// files are stripped, never the dirs, so teardown's `remove_dir_all` can still
+/// unlink entries (unlinking needs write on the parent dir, not the file). A
+/// same-user job can add or remove entries, or chmod the files back; what this
+/// protects is the integrity of the given input/secret bytes.
 fn set_dir_readonly(dir: &Path) -> Result<(), BackendError> {
-    let strip_write = |path: &Path| -> Result<(), BackendError> {
-        let meta =
-            fs::symlink_metadata(path).map_err(|e| BackendError::Spawn(format!("stat {}: {e}", path.display())))?;
-        let mut perms = meta.permissions();
-        perms.set_mode(perms.mode() & !0o222);
-        fs::set_permissions(path, perms).map_err(|e| BackendError::Spawn(format!("chmod ro {}: {e}", path.display())))
-    };
-    if let Ok(entries) = fs::read_dir(dir) {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&current) else {
+            continue;
+        };
         for entry in entries.flatten() {
-            strip_write(&entry.path())?;
+            let path = entry.path();
+            let Ok(meta) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(path);
+            } else {
+                let mut perms = meta.permissions();
+                perms.set_mode(perms.mode() & !0o222);
+                // Best-effort cooperative RO: a failure to chmod one staged file
+                // does not fail the run (the VM boundary is the real guarantee).
+                let _ = fs::set_permissions(&path, perms);
+            }
         }
     }
-    strip_write(dir)
+    Ok(())
 }
 
 /// Kill and reap a set of child processes, best-effort (the virtiofsd daemons at

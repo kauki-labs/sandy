@@ -543,8 +543,16 @@ fn local_dir_activate_makes_readonly_shares_unwritable() -> Result<()> {
     assert!(children.is_empty(), "the process transport launches no daemons");
     let write_bits =
         |p: &std::path::Path| -> Result<u32> { Ok(std::fs::metadata(p).context("stat")?.permissions().mode() & 0o222) };
-    assert_eq!(write_bits(&inputs)?, 0, "read-only input dir loses write");
-    assert_eq!(write_bits(&inputs.join("f"))?, 0, "read-only input file loses write");
+    assert_eq!(
+        write_bits(&inputs.join("f"))?,
+        0,
+        "read-only input FILE loses write (its bytes are protected)"
+    );
+    assert_ne!(
+        write_bits(&inputs)? & 0o200,
+        0,
+        "the read-only input DIR keeps write, so teardown's remove_dir_all can unlink its entries"
+    );
     assert_ne!(
         write_bits(&outputs)? & 0o200,
         0,

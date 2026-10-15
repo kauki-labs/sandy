@@ -10,9 +10,18 @@
 //! failure is [`BackendError::Spawn`] (the supervisor maps it to band 3,
 //! retryable); a process that merely exits non-zero returns an [`Outcome`].
 //!
+//! Shares (inputs, outputs, secret) are staged by the shared `plan_shares` policy
+//! into per-run dirs and presented via [`LocalDirTransport`]: the job reads each
+//! at `SANDY_<TAG>_DIR` (e.g. `SANDY_INPUTS_DIR`), read-only shares made
+//! unwritable cooperatively (`chmod a-w`). This diverges from the VM's fixed
+//! `/run/sandy/...` mount paths (a weak-isolation divergence; namespace-faithful
+//! paths are deferred to #135). Outputs are collected to each `Output::dest` at
+//! teardown and the staging is wiped on every path.
+//!
 //! INV-1: secrets are never placed on argv or env here. The process reads a
-//! secret from the local-dir secret share (T4), the same 0600-file channel the
-//! VM uses. The host environment is cleared and only `PATH` (so commands resolve)
+//! secret from the local-dir secret share's 0600 files, the same channel the VM
+//! uses; `SANDY_SECRETS_DIR` carries the dir PATH, never the bytes. The host
+//! environment is cleared and only `PATH` (so commands resolve)
 //! plus `spec.env` reach the child, so the ambient operator env (AWS_*,
 //! GITHUB_TOKEN, …) never leaks into an untrusted job; anything else a job needs
 //! (HOME/TERM) is passed explicitly in `spec.env`. The child is spawned as the
@@ -24,13 +33,13 @@
 //! may survive as a host orphan until cgroup/jail-level containment (#135, which
 //! gates this backend from running real untrusted jobs). That residual is the
 //! process backend's weak-isolation limit; the VM backend is the real boundary,
-//! and the containment story is the sandbox kind. Until the local-dir
-//! shares land (T4) a RunSpec that carries secrets, inputs, or outputs is refused
-//! outright, never silently run.
+//! and the containment story is the sandbox kind.
 
 use std::{
+    fs,
     io::Read,
     os::unix::process::ExitStatusExt,
+    path::Path,
     process::{Command, Stdio},
     sync::{
         Arc, Mutex, MutexGuard,
@@ -40,8 +49,10 @@ use std::{
 };
 
 use command_group::CommandGroup;
-use sandy::{BackendError, BoxState, Outcome, RunSpec, SandboxKind, VmBackend};
+use sandy::{BackendError, BoxState, Outcome, RunSpec, SandboxKind, VmBackend, collect_outputs, wipe};
 use uuid::Uuid;
+
+use crate::share::{GuestShareTransport, LocalDirTransport, Presentation, ShareDirs, plan_shares};
 
 /// Cap the captured console so a chatty job cannot grow the outcome without
 /// bound; the last bytes are kept, matching the VM console's bounded-tail intent.
@@ -81,52 +92,66 @@ impl ProcessBackend {
             .lock()
             .map_err(|_| BackendError::Protocol("process instance registry mutex poisoned".to_string()))
     }
-}
 
-impl VmBackend for ProcessBackend {
-    fn run(&self, spec: &RunSpec) -> Result<Outcome, BackendError> {
-        let Some((program, args)) = spec.command.split_first() else {
-            return Err(BackendError::Spawn("empty command".to_string()));
+    /// Stage the run's shares into the per-run dirs, present them as local dirs
+    /// (`SANDY_<TAG>_DIR` env, cooperative read-only), and run the job to
+    /// completion or the timeout as a reaped process group. The caller
+    /// ([`run`](VmBackend::run)) owns output collection and the wipe, so this
+    /// returns the raw [`Outcome`] (or an infra [`BackendError`]) and never leaves
+    /// a box registered on a returning path.
+    fn run_staged(
+        &self,
+        spec: &RunSpec,
+        run_id: Uuid,
+        inst_dir: &Path,
+        inputs_dir: &Path,
+        outputs_dir: &Path,
+    ) -> Result<Outcome, BackendError> {
+        let (program, args) = spec
+            .command
+            .split_first()
+            .ok_or_else(|| BackendError::Spawn("empty command".to_string()))?;
+
+        // inst_dir holds the default secret share; create it before staging.
+        fs::create_dir_all(inst_dir)
+            .map_err(|err| BackendError::Spawn(format!("create inst dir {}: {err}", inst_dir.display())))?;
+
+        // Stage secret/input/output per the shared policy, then present them as
+        // local dirs and enforce cooperative read-only on inputs/secrets.
+        let shares = plan_shares(
+            spec,
+            &ShareDirs {
+                inst_dir,
+                inputs_dir,
+                outputs_dir,
+            },
+        )?;
+        let transport = LocalDirTransport::new(inst_dir.to_path_buf());
+        let placements = match transport.plan(&shares, 0) {
+            Presentation::LocalDir { placements, .. } => placements,
+            Presentation::Vm { .. } => Vec::new(),
         };
+        transport.activate(&shares)?;
 
-        // Fail closed: the process backend cannot yet deliver secrets or stage
-        // inputs/outputs (the local-dir shares land in T4). Refusing is mandatory,
-        // not cosmetic — silently ignoring outputs would let an output-bearing job
-        // exit 0 and classify Succeeded while producing nothing, an INV-7/INV-11
-        // mis-success. T4 lifts these as it wires the shares; T5 dispatch also
-        // refuses them (defence in depth).
-        if !spec.secrets.is_empty() {
-            return Err(BackendError::Spawn(
-                "process backend cannot deliver secrets yet (local-dir secret share lands in T4)".to_string(),
-            ));
-        }
-        if !spec.inputs.is_empty() {
-            return Err(BackendError::Spawn(
-                "process backend cannot stage inputs yet (local-dir input share lands in T4)".to_string(),
-            ));
-        }
-        if !spec.outputs.is_empty() {
-            return Err(BackendError::Spawn(
-                "process backend cannot collect outputs yet (local-dir output share lands in T4)".to_string(),
-            ));
-        }
-
-        // INV-1 + isolation: clear the host env so the ambient operator env never
-        // reaches an untrusted job, preserve only PATH so commands resolve, then
-        // overlay spec.env (which the plan guarantees carries no secret,
-        // validate_no_secret_leak). Secret bytes ride the secret share, never env.
+        // INV-1 + isolation: clear the host env, keep only PATH, overlay spec.env,
+        // then point SANDY_<TAG>_DIR at each staged share dir — the dir PATH, never
+        // the secret bytes (those stay 0600 files in the secret dir).
         let mut command = Command::new(program);
         command
             .args(args)
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-            .envs(spec.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .envs(spec.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        for placement in &placements {
+            command.env(share_env_key(&placement.tag), &placement.dir);
+        }
+        command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
         // Spawn the child as the leader of a NEW process group so a timeout or
-        // teardown can reap the whole group. command-group encapsulates the
+        // teardown reaps the whole group. command-group encapsulates the
         // setpgid/killpg; sandy's crates stay forbid(unsafe_code).
         let mut child = match command.group_spawn() {
             Ok(child) => child,
@@ -134,7 +159,7 @@ impl VmBackend for ProcessBackend {
             Err(err) => return Err(BackendError::Spawn(format!("spawn `{program}`: {err}"))),
         };
 
-        let box_id = Uuid::new_v4().to_string();
+        let box_id = run_id.to_string();
         self.registry()?.push(BoxState {
             box_id: box_id.clone(),
             box_name: spec.template.to_string(),
@@ -143,8 +168,7 @@ impl VmBackend for ProcessBackend {
             rvport: None,
         });
 
-        // Drain both pipes on threads: an un-read piped stdout/stderr deadlocks a
-        // chatty child once it fills the pipe buffer.
+        // Drain both pipes on threads so a chatty child never blocks on a full pipe.
         let out_drain = child.inner().stdout.take().map(drain);
         let err_drain = child.inner().stderr.take().map(drain);
 
@@ -202,6 +226,41 @@ impl VmBackend for ProcessBackend {
             timed_out,
             console,
         })
+    }
+}
+
+impl VmBackend for ProcessBackend {
+    fn run(&self, spec: &RunSpec) -> Result<Outcome, BackendError> {
+        if spec.command.is_empty() {
+            return Err(BackendError::Spawn("empty command".to_string()));
+        }
+
+        // Per-run, sandy-owned staging dirs, mirroring the VM backends' lifecycle
+        // (same shape, so gc/reconcile/wipe and the registry behave identically).
+        let run_id = Uuid::new_v4();
+        let base = std::env::temp_dir().join("sandy");
+        let inst_dir = base.join(run_id.to_string());
+        let inputs_dir = base.join(format!("{run_id}-inputs"));
+        let outputs_dir = base.join(format!("{run_id}-outputs"));
+
+        // Run the staged job, capturing the result so outputs are collected and
+        // staging is wiped on EVERY path (INV-1 — secret bytes never outlive the run).
+        let result = self.run_staged(spec, run_id, &inst_dir, &inputs_dir, &outputs_dir);
+
+        // Collect the chosen outputs to the host before wiping, but only if the job
+        // ran (nothing is produced otherwise). A collection failure is an infra
+        // fault, never a silent drop.
+        let collected = if result.as_ref().is_ok_and(|outcome| outcome.booted) {
+            collect_outputs(spec.outputs, &outputs_dir)
+        } else {
+            Ok(())
+        };
+        for dir in [&inst_dir, &inputs_dir, &outputs_dir] {
+            if let Err(err) = wipe(dir) {
+                tracing::warn!(dir = %dir.display(), %err, "failed to wipe process staging on teardown");
+            }
+        }
+        collected.and(result)
     }
 
     fn kill(&self, box_id: &str) -> Result<(), BackendError> {
@@ -289,6 +348,18 @@ fn merged_console(stdout: &[u8], stderr: &[u8]) -> String {
         buf.drain(..buf.len() - CONSOLE_TAIL_CAP);
     }
     String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// The `SANDY_<TAG>_DIR` env key a process job reads a share dir from, derived
+/// from the share's mount tag: `sandy-inputs` → `SANDY_INPUTS_DIR`, `sandy-secrets`
+/// → `SANDY_SECRETS_DIR`. The dir PATH is exposed, never the bytes (INV-1).
+fn share_env_key(tag: &str) -> String {
+    let stem = tag
+        .strip_prefix("sandy-")
+        .unwrap_or(tag)
+        .replace('-', "_")
+        .to_uppercase();
+    format!("SANDY_{stem}_DIR")
 }
 
 #[cfg(test)]
@@ -440,24 +511,111 @@ mod tests {
         Ok(())
     }
 
-    /// Fail closed: a spec carrying outputs the backend cannot collect yet (T4) is
-    /// refused outright, never run to a silent mis-success (exit 0, no outputs).
+    /// A process job reads a staged input via `SANDY_INPUTS_DIR` (the T3 input
+    /// fail-closed is lifted — the share is now staged and presented).
     #[test]
-    fn refuses_a_spec_with_outputs_it_cannot_honor_yet() {
-        let grants = no_grants();
-        let command = ["true".to_string()];
-        let outputs = [sandy::Output {
-            name: None,
-            dest: std::path::PathBuf::from("/tmp/out"),
+    fn a_process_job_reads_an_input_via_sandy_inputs_dir() -> anyhow::Result<()> {
+        let src = tempfile::TempDir::new()?;
+        std::fs::write(src.path().join("data"), b"hello-input")?;
+        let inputs = [sandy::Input {
+            host: src.path().join("data"),
+            name: "data".to_string(),
+            guest_path: None,
         }];
+        let grants = no_grants();
+        let command = [
+            "sh".to_string(),
+            "-c".to_string(),
+            "cat \"$SANDY_INPUTS_DIR/data\"".to_string(),
+        ];
+        let spec = RunSpec {
+            inputs: &inputs,
+            ..run_spec(&command, &grants, 30)
+        };
+
+        let outcome = ProcessBackend::new().run(&spec)?;
+
+        assert_eq!(outcome.guest_exit, Some(0), "the job ran");
+        assert!(
+            outcome.console.contains("hello-input"),
+            "the job read the input via SANDY_INPUTS_DIR, got {:?}",
+            outcome.console
+        );
+        Ok(())
+    }
+
+    /// A process job writes under `SANDY_OUTPUTS_DIR`; the named output is collected
+    /// to its dest at teardown (outputs fail-closed lifted — full parity).
+    #[test]
+    fn a_process_job_output_is_collected_to_dest() -> anyhow::Result<()> {
+        let dest = tempfile::TempDir::new()?;
+        let out_dest = dest.path().join("result");
+        let outputs = [sandy::Output {
+            name: Some("result".to_string()),
+            dest: out_dest.clone(),
+        }];
+        let grants = no_grants();
+        let command = [
+            "sh".to_string(),
+            "-c".to_string(),
+            "mkdir -p \"$SANDY_OUTPUTS_DIR/result\"; printf done > \"$SANDY_OUTPUTS_DIR/result/f\"".to_string(),
+        ];
         let spec = RunSpec {
             outputs: &outputs,
             ..run_spec(&command, &grants, 30)
         };
-        assert!(
-            ProcessBackend::new().run(&spec).is_err(),
-            "an output-bearing job must be refused, not silently mis-succeed"
+
+        let outcome = ProcessBackend::new().run(&spec)?;
+
+        assert_eq!(outcome.guest_exit, Some(0), "the job ran");
+        assert_eq!(
+            std::fs::read(out_dest.join("f"))?,
+            b"done",
+            "the named output was collected to its dest"
         );
+        Ok(())
+    }
+
+    /// A process job reads a secret via `SANDY_SECRETS_DIR`. INV-1: the bytes arrive
+    /// as a 0600 file (named by the SecretRef), never on argv or env.
+    #[test]
+    fn a_process_job_reads_a_secret_via_sandy_secrets_dir() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let src = tempfile::TempDir::new()?;
+        let secret_file = src.path().join("tok");
+        std::fs::write(&secret_file, b"s3cr3t")?;
+        // INV-1: the host secret source must be 0600, or stage_secrets refuses it.
+        std::fs::set_permissions(&secret_file, std::fs::Permissions::from_mode(0o600))?;
+        let secrets = [sandy::SecretRef {
+            name: "TOKEN".to_string(),
+            source: sandy::SecretSource::File(secret_file),
+        }];
+        let grants = Grants {
+            secrets: true,
+            agent: false,
+            shares: false,
+        };
+        let command = [
+            "sh".to_string(),
+            "-c".to_string(),
+            "cat \"$SANDY_SECRETS_DIR/TOKEN\"".to_string(),
+        ];
+        let spec = RunSpec {
+            secrets: &secrets,
+            grants: &grants,
+            ..run_spec(&command, &grants, 30)
+        };
+
+        let outcome = ProcessBackend::new().run(&spec)?;
+
+        assert_eq!(outcome.guest_exit, Some(0), "the job ran");
+        assert!(
+            outcome.console.contains("s3cr3t"),
+            "the job read the secret via SANDY_SECRETS_DIR, got {:?}",
+            outcome.console
+        );
+        Ok(())
     }
 
     /// The backend advertises `Process`, so `backend_accepts` refuses a VM job.
