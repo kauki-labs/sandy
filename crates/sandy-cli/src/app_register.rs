@@ -24,7 +24,7 @@ use std::{
 
 use sandy::{
     Capability, CredentialProvider, GithubAdapter, InstallError, Provisioner, RegistrationPlan, RevokeOutcome, Scope,
-    Target, TrustRoot, mint_lease, render_github_permissions,
+    Target, TrustRoot, TrustRootIo, mint_lease, render_github_permissions,
 };
 use tiny_http::{Header, Response, Server};
 

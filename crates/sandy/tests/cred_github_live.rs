@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use sandy::{
-    Capability, CredentialProvider, GithubAdapter, Scope, SecretSource, Target, TrustRoot, mint_lease,
+    Capability, CredentialProvider, GithubAdapter, Scope, SecretSource, Target, TrustRoot, TrustRootIo, mint_lease,
     render_github_permissions,
 };
 

@@ -1780,12 +1780,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandy-api"
+version = "0.1.1"
+dependencies = [
+ "serde",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "sandy-backend"
 version = "0.1.1"
 dependencies = [
  "anyhow",
  "command-group",
  "rustix",
+ "sandy-api",
  "sandy-box",
  "tempfile",
  "tracing",
@@ -1807,6 +1816,7 @@ dependencies = [
  "octocrab",
  "portable-pty",
  "rstest",
+ "sandy-api",
  "serde",
  "serde_json",
  "sha2 0.11.0",

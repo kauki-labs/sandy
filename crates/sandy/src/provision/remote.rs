@@ -12,66 +12,12 @@
 //! - **INV-7:** a remote fault (unreachable, build) is an *infra* fault → the result is `retryable: true`, never
 //!   confused with a guest exit.
 
-use std::fmt;
+pub use sandy_api::provision::{RemoteArtifacts, RemoteBuilder, RemoteError};
 
 use crate::{
     Logs, Provenance, RESULT_SCHEMA_VERSION, ResultEnvelope, Status,
     provision::router::{Job, ProvisionOutcome},
 };
-
-/// The store artifacts a remote NixOS builder produced and copied back.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RemoteArtifacts {
-    /// The Nix store path of the built output, now present in the local store.
-    pub output_store_path: String,
-}
-
-/// A fault from the remote build path.
-///
-/// Both variants are infra faults (INV-7 → `retryable: true`). An arch mismatch is
-/// not modelled here: the orchestration confirms the remote's arch via
-/// [`RemoteBuilder::probe_arch`] *before* delegating a build and refuses directly,
-/// so `build_remote` only ever reports unreachable / build faults.
-///
-/// Implemented by hand rather than via `thiserror`: `sandy-provider` depends only
-/// on `sandy`, so the derive macro is not in scope. See the crate's
-/// dependency set.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RemoteError {
-    /// The remote builder host could not be reached (infra fault, INV-7).
-    Unreachable(String),
-    /// The remote build itself failed (infra fault, INV-7).
-    Build(String),
-}
-
-impl fmt::Display for RemoteError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            RemoteError::Unreachable(host) => write!(f, "remote builder `{host}` is unreachable"),
-            RemoteError::Build(msg) => write!(f, "remote build failed: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for RemoteError {}
-
-/// A faked-remote seam over the eval-local / build-remote / copy-back path.
-///
-/// Two operations so the orchestration can confirm the remote's arch *before*
-/// delegating a build (D-REQ-1: "confirm the remote builder's arch/reachability").
-/// An arch mismatch must refuse with **no build attempted**, which a single
-/// build-only method could not express — hence [`probe_arch`](RemoteBuilder::probe_arch).
-/// The real seam drives `nix build --builders ssh://…` + `nix copy`; tests inject
-/// a fake.
-pub trait RemoteBuilder {
-    /// Probe the remote builder's advertised system arch (cheap; no build).
-    ///
-    /// Returns [`RemoteError::Unreachable`] when the host cannot be reached.
-    fn probe_arch(&self, host: &str) -> Result<String, RemoteError>;
-
-    /// Build `derivation` on `host` for `arch` and copy the artifacts back.
-    fn build_remote(&self, derivation: &str, host: &str, arch: &str) -> Result<RemoteArtifacts, RemoteError>;
-}
 
 /// Provision a host with no local build and no valid seed via a remote NixOS
 /// builder (D-REQ-1): eval on the controller, confirm the remote's arch, build on

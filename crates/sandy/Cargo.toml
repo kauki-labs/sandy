@@ -24,6 +24,7 @@ crate-type = ["rlib"]
 workspace = true
 
 [dependencies]
+sandy-api.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 serde = { workspace = true }
