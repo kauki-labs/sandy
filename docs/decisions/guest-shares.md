@@ -217,3 +217,40 @@ in the input seam.
 **Consequences.** Keeps the input model focused (copy + manifest; direct-share
 withdrawn, §7) while naming where it grows. It belongs with the agent-model epic
 (#36/#65), not here.
+
+## 11. The share seam generalizes to a `Presentation`; the process profile presents shares as `SANDY_*_DIR` env
+
+**Status:** accepted. **Upholds:** INV-1.
+
+**Context.** The fabric (#131 / #103) adds a non-VM executor — a process backend
+with no virtio-fs. The `GuestShareTransport` seam was VM-shaped (launch daemons +
+hypervisor argv), so a process profile could not present shares over it.
+
+**Decision.** Generalize the seam, preserving the pure/IO split of decision #1
+(the argv mapping stays a pure, tier-1-testable function): `plan(&[ShareSpec], mem)
+-> Presentation` (PURE) + `activate(&[ShareSpec]) -> Result<Vec<Child>>` (IO).
+`Presentation` is an enum — `Vm { args }` (the hypervisor argv) or `LocalDir { root,
+placements }` — so the shared contract test covers all three transports uniformly.
+`VirtiofsdTransport`/`VirtioFsTransport` relocate their argv/daemon bodies into
+`plan`/`activate` unchanged. The process profile's `LocalDirTransport` maps each
+staged `ShareSpec` to a placement and the backend exposes it to the job as
+`SANDY_<TAG>_DIR` (e.g. `SANDY_INPUTS_DIR`); read-only shares (inputs, secrets) are
+enforced **cooperatively** by `chmod a-w` on the staged files only (the dir stays
+writable so teardown's `remove_dir_all` can wipe). Staging (`plan_shares`), output
+collection, and the per-run wipe are shared with the VM backends.
+
+**Consequences.** One seam, three impls, one contract. INV-1 holds: `SANDY_*_DIR`
+carries the dir **path**, never the secret bytes (secrets stay 0600 files in the
+secret dir, the env-pointer-not-value model of the Minter decision). The access
+contract **diverges** by profile: a VM job reads fixed `/run/sandy/...` mount paths;
+a process job reads `SANDY_*_DIR` env — a weak-isolation difference (the process
+backend is not the real boundary; the VM is). The cooperative file-RO is defeatable
+by a same-user job (it mirrors the vfkit RO asymmetry, §2), and a process that
+escapes its group can leave a host orphan.
+
+**Set aside (do not re-propose without new information).** Namespace-faithful
+`/run/sandy/...` paths for the process profile (a mount-namespace bind-mount): it is
+Linux-only, needs privilege/namespace machinery, and is deferred to **#135** (the
+same cgroup/jail containment gate as full descendant reaping — the process backend
+must not run real untrusted jobs until #135 lands). Folding host-side RO into a hard
+boundary is likewise a #135 concern, not the cooperative MVP.
