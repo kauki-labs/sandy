@@ -71,7 +71,11 @@ fn ensure_staging_base_in(parent: &Path) -> Result<PathBuf, BackendError> {
 
     let stat = fstat(&base_fd).map_err(|e| staging_err("stat sandy staging base", &base, &e))?;
     let current_uid = rustix::process::getuid().as_raw();
-    validate_owner_and_mode(stat.st_uid, current_uid, u32::from(stat.st_mode))
+    // `st_mode` is `u16` on macOS and `u32` on Linux: the conversion is needed on
+    // macOS and a no-op clippy flags as `useless_conversion` on Linux.
+    #[allow(clippy::useless_conversion)]
+    let mode = u32::from(stat.st_mode);
+    validate_owner_and_mode(stat.st_uid, current_uid, mode)
         .map_err(|e| BackendError::Spawn(format!("{e} (base: {})", base.display())))?;
 
     Ok(base)
@@ -104,28 +108,31 @@ fn staging_err(action: &str, path: &Path, err: &rustix::io::Errno) -> BackendErr
 mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
+    use anyhow::Context;
+
     use super::*;
 
     /// Positive: a clean, self-owned base is created `0700` and the path is
     /// returned.
     #[test]
-    fn clean_self_owned_base_is_ok() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
+    fn clean_self_owned_base_is_ok() -> anyhow::Result<()> {
+        let tmp = tempfile::TempDir::new().context("tempdir")?;
 
         let base = ensure_staging_base_in(tmp.path()).expect("clean base must validate");
 
-        let mode = std::fs::metadata(&base).expect("stat base").permissions().mode() & 0o777;
+        let mode = std::fs::metadata(&base).context("stat base")?.permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "freshly created base must be 0700, got {mode:#o}");
+        Ok(())
     }
 
     /// Adversarial (CWE-732): a pre-created world-writable base must be
     /// rejected outright — fail closed, not a silent downgrade.
     #[test]
-    fn world_writable_existing_base_is_rejected() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
+    fn world_writable_existing_base_is_rejected() -> anyhow::Result<()> {
+        let tmp = tempfile::TempDir::new().context("tempdir")?;
         let base = tmp.path().join("sandy");
-        std::fs::create_dir(&base).expect("pre-create base");
-        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o777)).expect("widen perms");
+        std::fs::create_dir(&base).context("pre-create base")?;
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o777)).context("widen perms")?;
 
         let err = ensure_staging_base_in(tmp.path()).expect_err("a world-writable base must be rejected");
 
@@ -133,6 +140,7 @@ mod tests {
             err.to_string().contains("group/world-writable"),
             "expected a group/world-writable rejection, got {err}"
         );
+        Ok(())
     }
 
     /// Adversarial (CWE-732): a base that is a symlink to an attacker-chosen
@@ -143,13 +151,14 @@ mod tests {
     /// and the test would pass for the wrong reason (the mode check, not the
     /// symlink check) if `O_NOFOLLOW` were ever dropped.
     #[test]
-    fn symlinked_base_is_rejected() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
+    fn symlinked_base_is_rejected() -> anyhow::Result<()> {
+        let tmp = tempfile::TempDir::new().context("tempdir")?;
         let attacker_dir = tmp.path().join("attacker-controlled");
-        std::fs::create_dir(&attacker_dir).expect("create attacker dir");
-        std::fs::set_permissions(&attacker_dir, std::fs::Permissions::from_mode(0o700)).expect("pin attacker perms");
+        std::fs::create_dir(&attacker_dir).context("create attacker dir")?;
+        std::fs::set_permissions(&attacker_dir, std::fs::Permissions::from_mode(0o700))
+            .context("pin attacker perms")?;
         let base = tmp.path().join("sandy");
-        symlink(&attacker_dir, &base).expect("symlink base");
+        symlink(&attacker_dir, &base).context("symlink base")?;
 
         let err = ensure_staging_base_in(tmp.path()).expect_err("a symlinked base must be rejected");
 
@@ -157,6 +166,7 @@ mod tests {
             err.to_string().contains("symlinked base?"),
             "expected the symlink-rejection open to fail, got {err}"
         );
+        Ok(())
     }
 
     /// Pure unit coverage for the owner/mode check, independent of real
