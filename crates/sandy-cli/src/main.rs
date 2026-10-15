@@ -276,6 +276,44 @@ fn credential_setup(
     ))
 }
 
+/// The host credential source: load the named trust root and build the live GitHub
+/// adapter ([`credential_setup`]), boxed behind the [`sandy::CredentialSource`] seam
+/// so the credentialed run path composes through the profile like the backend and
+/// egress seams. The provider is built per run (it needs `--credential` + the trust
+/// root), so the profile carries the construction, not a prebuilt provider.
+struct HostCredentialSource;
+
+impl sandy::CredentialSource for HostCredentialSource {
+    fn provider(
+        &self,
+        dir: &std::path::Path,
+        name: &str,
+        capabilities: &[String],
+    ) -> Result<(Box<dyn sandy::CredentialProvider + Sync>, sandy::Scope), String> {
+        let (adapter, scope) = credential_setup(dir, name, capabilities)?;
+        Ok((Box::new(adapter), scope))
+    }
+}
+
+/// The host run profile: today's sandbox backend, egress applier, and GitHub
+/// credential source, bundled as the composition root `dispatch_run` threads. The
+/// egress OS model is the platform's (Linux enforces the nftables boundary, macOS
+/// is honestly unenforced). This is the one concrete profile today; a different
+/// profile (all-local) swaps the impls without touching dispatch.
+fn host_profile() -> sandy::Profile {
+    let egress_os = if cfg!(target_os = "macos") {
+        sandy::EgressOs::MacOs
+    } else {
+        sandy::EgressOs::Linux
+    };
+    sandy::Profile::new(
+        Box::new(host_backend()),
+        Box::new(egress_applier()),
+        egress_os,
+        Box::new(HostCredentialSource),
+    )
+}
+
 fn main() {
     let cli = Cli::parse();
     std::process::exit(dispatch(cli.command, cli.output));
@@ -389,12 +427,10 @@ fn dispatch_doctor(output: OutputFormat) -> i32 {
     clippy::too_many_arguments,
     reason = "forwards the run and credential inputs to run_job_with_credential"
 )]
-fn run_credentialed<B: sandy::VmBackend, E: sandy::EgressApplier>(
-    backend: &B,
+fn run_credentialed(
+    profile: &sandy::Profile,
     journal: &Journal,
     plan: JobPlan,
-    egress: &E,
-    egress_os: sandy::EgressOs,
     tap: Option<&str>,
     name: &str,
     cred_capability: &[String],
@@ -403,7 +439,7 @@ fn run_credentialed<B: sandy::VmBackend, E: sandy::EgressApplier>(
         eprintln!("sandy: trust-roots dir: {e}");
         ProcessExit::InfraFault.code()
     })?;
-    let (adapter, scope) = credential_setup(&dir, name, cred_capability).map_err(|e| {
+    let (provider, scope) = profile.cred().provider(&dir, name, cred_capability).map_err(|e| {
         eprintln!("sandy: {e}");
         ProcessExit::InvalidPlan.code()
     })?;
@@ -413,13 +449,13 @@ fn run_credentialed<B: sandy::VmBackend, E: sandy::EgressApplier>(
         ProcessExit::InfraFault.code()
     })?;
     let result = supervisor::run_job_with_credential(
-        backend,
+        profile.backend(),
         journal,
         plan,
-        egress,
-        egress_os,
+        profile.egress(),
+        profile.egress_os(),
         tap,
-        &adapter,
+        provider.as_ref(),
         &scope,
         "GITHUB_TOKEN",
         &cred_dir,
@@ -436,6 +472,7 @@ fn run_credentialed<B: sandy::VmBackend, E: sandy::EgressApplier>(
 /// optional credential, print the result envelope, and return the process exit
 /// band (INV-11).
 fn dispatch_run(
+    profile: &sandy::Profile,
     args: RunArgs,
     credential: Option<String>,
     cred_capability: &[String],
@@ -449,38 +486,24 @@ fn dispatch_run(
             return ProcessExit::InvalidPlan.code();
         }
     };
-    let backend = host_backend();
-    // Egress is bracketed around the boot per platform: Linux enforces the
-    // nftables boundary, macOS has none (`plan_egress` → NoBoundary, so the
-    // no-op applier is never called).
-    let egress = egress_applier();
-    let egress_os = if cfg!(target_os = "macos") {
-        sandy::EgressOs::MacOs
-    } else {
-        sandy::EgressOs::Linux
-    };
+    // The run seams come from the injected `profile` — the sandbox backend, the
+    // egress applier (Linux enforces the nftables boundary, macOS has none), and the
+    // credential source. The composition root selects the profile at the top
+    // (`dispatch`) and threads it here, so this code never names a concrete impl and
+    // a different profile swaps them without touching dispatch.
     // The guest's tap (if any) comes from $SANDY_TAP — the same interface the
     // backend attaches the NIC to. On Linux a bound tap selects the guest-scoped
     // forward ruleset (safe), never the host-OUTPUT drop-all (#29).
     let tap = std::env::var("SANDY_TAP").ok().filter(|t| !t.is_empty());
 
     // With `--credential`, mint a scoped forge token and bracket the run with it;
-    // otherwise run with no credential.
+    // otherwise run with no credential. Both paths compose through the profile.
     let report = match credential {
-        Some(name) => match run_credentialed(
-            &backend,
-            journal,
-            plan,
-            &egress,
-            egress_os,
-            tap.as_deref(),
-            &name,
-            cred_capability,
-        ) {
+        Some(name) => match run_credentialed(profile, journal, plan, tap.as_deref(), &name, cred_capability) {
             Ok(report) => report,
             Err(code) => return code,
         },
-        None => match supervisor::run_job(&backend, journal, &plan, &egress, egress_os, tap.as_deref()) {
+        None => match supervisor::run_with_profile(profile, journal, &plan, tap.as_deref()) {
             Ok(report) => report,
             Err(e) => {
                 eprintln!("sandy: run failed: {e}");
@@ -543,7 +566,10 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
                 timeout,
                 command,
             };
-            dispatch_run(args, credential, &cred_capability, &journal, output)
+            // The composition root: select the run profile here and inject it. Today
+            // only the host profile exists; a different profile (all-local) is a swap
+            // at this one call site, not a change to dispatch_run.
+            dispatch_run(&host_profile(), args, credential, &cred_capability, &journal, output)
         }
         Command::Ls => match supervisor::ls(&journal) {
             Ok(records) => succeed_or(emit(format_records(&records, output))),
@@ -621,9 +647,71 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use anyhow::Context;
-    use sandy::Target;
+    use sandy::{CredentialProvider, CredentialSource, EgressOs, FakeApplier, FakeBackend, Outcome, Profile, Target};
 
     use super::*;
+
+    /// The non-credentialed dispatch path builds no provider, so a test profile
+    /// carries this to satisfy the credential seam without a live backend.
+    struct NoCred;
+    impl CredentialSource for NoCred {
+        fn provider(
+            &self,
+            _dir: &std::path::Path,
+            _name: &str,
+            _capabilities: &[String],
+        ) -> Result<(Box<dyn CredentialProvider + Sync>, Scope), String> {
+            unreachable!("the non-credentialed dispatch path never builds a credential provider")
+        }
+    }
+
+    /// A minimal `run demo` request with no inputs, secrets, or command.
+    fn demo_run_args() -> RunArgs {
+        RunArgs {
+            template: "demo".to_string(),
+            inputs: vec![],
+            outputs: vec![],
+            secrets: vec![],
+            env: vec![],
+            allow: vec![],
+            cpu: None,
+            mem: None,
+            timeout: None,
+            command: vec![],
+        }
+    }
+
+    /// The composition root threads the INJECTED profile (#131 T1): `dispatch_run`,
+    /// given a `Profile` whose `FakeBackend` is scripted to a clean success, exits on
+    /// the band-0 success code — proving the dispatch SITE runs the injected backend,
+    /// not `host_backend()`. A regression where `dispatch_run` bypassed the profile
+    /// and reached a real host backend could not produce a band-0 success here.
+    #[test]
+    fn dispatch_run_threads_the_injected_profile() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir().context("temp SANDY_HOME")?;
+        let journal = Journal::new(tmp.path());
+        journal.ensure_dirs().context("ensure_dirs")?;
+        let backend = FakeBackend::new().with_outcome(Outcome {
+            booted: true,
+            guest_exit: Some(0),
+            transport_error: None,
+            timed_out: false,
+            console: String::new(),
+        });
+        let profile = Profile::new(
+            Box::new(backend),
+            Box::new(FakeApplier::new()),
+            EgressOs::Linux,
+            Box::new(NoCred),
+        );
+        let code = dispatch_run(&profile, demo_run_args(), None, &[], &journal, OutputFormat::Plain);
+        assert_eq!(
+            code,
+            ProcessExit::Succeeded.code(),
+            "dispatch_run must run the injected FakeBackend's clean-success outcome (band 0)"
+        );
+        Ok(())
+    }
 
     /// Write a GitHub trust root (and a `0600` dummy key) under `dir`, so
     /// `credential_setup` has something to load without a live forge.

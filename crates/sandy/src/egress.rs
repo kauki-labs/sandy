@@ -370,7 +370,7 @@ impl EgressApplier for NftablesApplier {
 ///
 /// # Errors
 /// Propagates any [`CoreError`] from [`EgressApplier::apply`].
-pub fn enforce(plan: &EgressPlan, applier: &impl EgressApplier) -> Result<EgressOutcome, CoreError> {
+pub fn enforce<A: EgressApplier + ?Sized>(plan: &EgressPlan, applier: &A) -> Result<EgressOutcome, CoreError> {
     match plan {
         EgressPlan::Enforce { ruleset } => {
             applier.apply(ruleset)?;

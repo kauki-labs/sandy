@@ -282,8 +282,8 @@ impl CredentialProvider for FakeProvider {
 /// Returns [`CredError::Mint`] when the mint fails, an infra fault, so the caller
 /// fails exit-3 retryable and no secret file is written (INV-7/INV-11), and
 /// [`CredError::Stage`] when the staged file cannot be written.
-pub fn mint_lease(
-    provider: &impl CredentialProvider,
+pub fn mint_lease<P: CredentialProvider + ?Sized>(
+    provider: &P,
     scope: &Scope,
     requested_ttl_secs: u32,
     secret_name: &str,
@@ -320,7 +320,7 @@ pub fn mint_lease(
 /// reads. A failed revoke is logged, not fatal: the native TTL is the backstop.
 ///
 /// [`revoke`]: CredentialProvider::revoke
-fn revoke_orphan(provider: &impl CredentialProvider, secret_name: &str, minted: &Minted) {
+fn revoke_orphan<P: CredentialProvider + ?Sized>(provider: &P, secret_name: &str, minted: &Minted) {
     let orphan = Lease {
         secret_ref: SecretRef {
             name: secret_name.to_string(),
@@ -371,7 +371,7 @@ pub fn should_refresh(now: SystemTime, expires_at: SystemTime, margin: Duration)
 ///
 /// Returns [`CredError`] when the re-mint or the re-stage fails, or when the lease
 /// is not file-sourced (a contract violation: [`mint_lease`] always stages a file).
-pub fn refresh_once<P: CredentialProvider>(
+pub fn refresh_once<P: CredentialProvider + ?Sized>(
     provider: &P,
     lease: &mut Lease,
     now: SystemTime,

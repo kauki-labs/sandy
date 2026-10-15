@@ -17,7 +17,7 @@ use std::{
 use sandy::{
     BackendError, Classification, CoreError, CredentialProvider, EgressApplier, EgressOs, EgressOutcome,
     JOURNAL_SCHEMA_VERSION, JobRecord, JobState, Journal, Lease, Logs, Outcome, OutputRef, OutputStatus, ProcessExit,
-    Provenance, RESULT_SCHEMA_VERSION, ResultEnvelope, Scope, SecretSource, StagedImage, Status, VmBackend,
+    Profile, Provenance, RESULT_SCHEMA_VERSION, ResultEnvelope, Scope, SecretSource, StagedImage, Status, VmBackend,
     classify_backend_error, classify_invalid_plan, classify_outcome, enforce, mint_lease, new_job_id,
     plan_egress_scoped, plan_eviction, reconcile_job, refresh_once, validate_no_secret_leak,
 };
@@ -139,7 +139,7 @@ pub struct RunReport {
 /// Returns [`CoreError`] only on genuine journal I/O failure. Every run-outcome,
 /// plan, and egress-apply error is folded into the envelope and band — a failed
 /// egress boundary fails closed as a band-3 infra fault — not the `Err` arm.
-pub fn run_job<B: VmBackend, E: EgressApplier>(
+pub fn run_job<B: VmBackend + ?Sized, E: EgressApplier + ?Sized>(
     backend: &B,
     journal: &Journal,
     plan: &JobPlan,
@@ -255,6 +255,33 @@ pub fn run_job<B: VmBackend, E: EgressApplier>(
     })
 }
 
+/// Run one job to completion from a composition [`Profile`]: the profile selects
+/// the sandbox backend and the egress applier (and the OS egress model), and this
+/// threads them into [`run_job`]. It is the injectable entry the composition root
+/// (`dispatch_run`) calls, so which backend/egress impl runs is a profile choice,
+/// not hardcoded in dispatch. The non-credentialed path; the credentialed bracket
+/// stays [`run_job_with_credential`].
+///
+/// # Errors
+///
+/// Returns [`CoreError`] exactly as [`run_job`] does — only on genuine journal I/O
+/// failure; every run-outcome is folded into the returned [`RunReport`].
+pub fn run_with_profile(
+    profile: &Profile,
+    journal: &Journal,
+    plan: &JobPlan,
+    tap: Option<&str>,
+) -> Result<RunReport, CoreError> {
+    run_job(
+        profile.backend(),
+        journal,
+        plan,
+        profile.egress(),
+        profile.egress_os(),
+        tap,
+    )
+}
+
 /// Mint a scoped installation token and stage it as a `0600` [`SecretRef`] for a
 /// run — a host/pre-run step, kept separate from [`run_job`] (the token is minted
 /// before the plan is assembled, then threaded in as a secret).
@@ -268,7 +295,7 @@ pub fn run_job<B: VmBackend, E: EgressApplier>(
 /// # Errors
 ///
 /// Returns [`CoreError::Cred`] when minting or staging the credential fails.
-pub fn mint_run_token<P: CredentialProvider>(
+pub fn mint_run_token<P: CredentialProvider + ?Sized>(
     provider: &P,
     scope: &Scope,
     secret_name: &str,
@@ -310,7 +337,11 @@ pub fn mint_run_token<P: CredentialProvider>(
     clippy::too_many_arguments,
     reason = "the bracket threads both the run and the credential inputs"
 )]
-pub fn run_job_with_credential<B: VmBackend, E: EgressApplier, P: CredentialProvider + Sync>(
+pub fn run_job_with_credential<
+    B: VmBackend + ?Sized,
+    E: EgressApplier + ?Sized,
+    P: CredentialProvider + Sync + ?Sized,
+>(
     backend: &B,
     journal: &Journal,
     plan: JobPlan,
@@ -376,7 +407,7 @@ pub fn run_job_with_credential<B: VmBackend, E: EgressApplier, P: CredentialProv
 /// return, an early `?`, or a panic unwinding out of `run_job`. Straight-line
 /// teardown after the refresh scope is skipped on a panic, which would leave a
 /// valid forge token and the secret file on disk past the run (INV-1).
-struct CredTeardown<'a, P: CredentialProvider> {
+struct CredTeardown<'a, P: CredentialProvider + ?Sized> {
     provider: &'a P,
     /// The live lease; the refresh thread advances it to the latest minted token,
     /// so teardown revokes whatever token is current when the run ends.
@@ -384,7 +415,7 @@ struct CredTeardown<'a, P: CredentialProvider> {
     token_path: PathBuf,
 }
 
-impl<P: CredentialProvider> Drop for CredTeardown<'_, P> {
+impl<P: CredentialProvider + ?Sized> Drop for CredTeardown<'_, P> {
     fn drop(&mut self) {
         // The refresh thread has joined (the scope borrowing `lease` ended before
         // this drop), so the lock is uncontended; map poison rather than panic in a
@@ -420,7 +451,7 @@ fn refresh_interval(env_key: &str, default: u64) -> Duration {
 /// the sender half of `stop` is dropped (the run finished). Each refresh re-stages
 /// the live token file and revokes the superseded token via [`refresh_once`]; a
 /// refresh error is logged and retried on the next tick, never fatal to the run.
-fn refresh_loop<P: CredentialProvider + Sync>(
+fn refresh_loop<P: CredentialProvider + Sync + ?Sized>(
     provider: &P,
     lease: &Mutex<Lease>,
     margin: Duration,
@@ -563,11 +594,103 @@ pub fn gc(journal: &Journal, keep_last_n: usize) -> Result<Vec<String>, CoreErro
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
     use anyhow::Context;
-    use sandy::{AllowList, BackendError, EgressOs, FakeApplier, FakeBackend, Grants, Journal, Outcome, ProcessExit};
+    use sandy::{
+        AllowList, BackendError, CoreError, CredentialProvider, CredentialSource, EgressApplier, EgressOs, FakeApplier,
+        FakeBackend, Grants, Journal, Outcome, ProcessExit, Profile, Scope,
+    };
 
     use super::run_job;
     use crate::plan::JobPlan;
+
+    /// A credential source that panics if asked for a provider — the non-credentialed
+    /// run path never builds one, so a [`Profile`] in these tests carries this to
+    /// satisfy the seam without a live cred backend.
+    struct UnusedCred;
+    impl CredentialSource for UnusedCred {
+        fn provider(
+            &self,
+            _dir: &std::path::Path,
+            _name: &str,
+            _capabilities: &[String],
+        ) -> Result<(Box<dyn CredentialProvider + Sync>, Scope), String> {
+            unreachable!("the non-credentialed run path never builds a credential provider")
+        }
+    }
+
+    /// An egress applier that records apply/revert through shared handles, so a test
+    /// can observe the applier a [`Profile`] has taken ownership of (by value behind a
+    /// `Box<dyn>`), proving the injected egress seam was exercised.
+    struct SpyApplier {
+        applied: Arc<AtomicUsize>,
+        reverted: Arc<AtomicBool>,
+    }
+    impl EgressApplier for SpyApplier {
+        fn apply(&self, _ruleset: &str) -> Result<(), CoreError> {
+            self.applied.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn revert(&self) -> Result<(), CoreError> {
+            self.reverted.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// The injection contract (T1): a run driven from a [`Profile`] uses the
+    /// profile's injected backend AND egress applier, not hardcoded ones. A
+    /// `FakeBackend` scripted to a clean success and a shared-handle [`SpyApplier`]
+    /// are bundled into the profile; with a bound tap on Linux the boot is bracketed
+    /// by an enforced ruleset, so `run_with_profile` must surface band 0 AND the spy
+    /// must have applied then reverted — proving both seams routed through the
+    /// injected profile rather than reaching for `host_backend()`/`egress_applier()`.
+    #[test]
+    fn run_with_profile_uses_the_injected_backend_and_egress() -> anyhow::Result<()> {
+        let (_tmp, journal) = fresh_journal()?;
+        let backend = FakeBackend::new().with_outcome(Outcome {
+            booted: true,
+            guest_exit: Some(0),
+            transport_error: None,
+            timed_out: false,
+            console: String::new(),
+        });
+        let applied = Arc::new(AtomicUsize::new(0));
+        let reverted = Arc::new(AtomicBool::new(false));
+        let egress = SpyApplier {
+            applied: Arc::clone(&applied),
+            reverted: Arc::clone(&reverted),
+        };
+        let profile = Profile::new(
+            Box::new(backend),
+            Box::new(egress),
+            EgressOs::Linux,
+            Box::new(UnusedCred),
+        );
+        // A bound tap on Linux selects an enforced guest-scoped forward ruleset, so the
+        // boot is bracketed by the injected egress applier (apply then revert).
+        let report =
+            super::run_with_profile(&profile, &journal, &booting_plan(), Some("tap0")).context("run_with_profile")?;
+        assert_eq!(
+            report.process_exit.code(),
+            ProcessExit::Succeeded.code(),
+            "the injected FakeBackend's clean-success outcome must surface (band 0)"
+        );
+        assert!(!report.envelope.retryable, "a clean success is not retryable");
+        assert!(
+            applied.load(Ordering::SeqCst) >= 1,
+            "the injected egress applier must have applied the enforced ruleset"
+        );
+        assert!(
+            reverted.load(Ordering::SeqCst),
+            "the injected egress applier must have reverted the boundary after the boot"
+        );
+        Ok(())
+    }
 
     /// A journal on a fresh local temp `$SANDY_HOME`.
     fn fresh_journal() -> anyhow::Result<(tempfile::TempDir, Journal)> {
