@@ -12,9 +12,16 @@
 //!
 //! INV-1: secrets are never placed on argv or env here. The process reads a
 //! secret from the local-dir secret share (T4), the same 0600-file channel the
-//! VM uses. The process backend provides no env isolation of its own (it is not
-//! a security boundary — the VM backend is); it runs with the parent environment
-//! plus `spec.env`, and the containment story is the sandbox kind, not this impl.
+//! VM uses. The host environment is cleared and only `PATH` (so commands resolve)
+//! plus `spec.env` reach the child, so the ambient operator env (AWS_*,
+//! GITHUB_TOKEN, …) never leaks into an untrusted job; anything else a job needs
+//! (HOME/TERM) is passed explicitly in `spec.env`. The child is spawned as the
+//! leader of its own process group, so a timeout or teardown reaps the whole
+//! group — no host orphan, and no backgrounded descendant can hold the console
+//! pipes open and hang the run past its budget. The process backend is still
+//! weak-isolation (the VM backend is the real boundary); the containment story is
+//! the sandbox kind. Until the local-dir shares land (T4) a RunSpec that carries
+//! secrets, inputs, or outputs is refused outright, never silently run.
 
 use std::{
     io::Read,
@@ -25,6 +32,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use command_group::CommandGroup;
 use sandy::{BackendError, BoxState, Outcome, RunSpec, SandboxKind, VmBackend};
 use uuid::Uuid;
 
@@ -68,17 +76,46 @@ impl VmBackend for ProcessBackend {
             return Err(BackendError::Spawn("empty command".to_string()));
         };
 
-        // INV-1: only spec.env reaches the child, and the plan guarantees it
-        // carries no secret (validate_no_secret_leak); secret bytes ride the
-        // secret share, never argv/env.
-        let spawned = Command::new(program)
+        // Fail closed: the process backend cannot yet deliver secrets or stage
+        // inputs/outputs (the local-dir shares land in T4). Refusing is mandatory,
+        // not cosmetic — silently ignoring outputs would let an output-bearing job
+        // exit 0 and classify Succeeded while producing nothing, an INV-7/INV-11
+        // mis-success. T4 lifts these as it wires the shares; T5 dispatch also
+        // refuses them (defence in depth).
+        if !spec.secrets.is_empty() {
+            return Err(BackendError::Spawn(
+                "process backend cannot deliver secrets yet (local-dir secret share lands in T4)".to_string(),
+            ));
+        }
+        if !spec.inputs.is_empty() {
+            return Err(BackendError::Spawn(
+                "process backend cannot stage inputs yet (local-dir input share lands in T4)".to_string(),
+            ));
+        }
+        if !spec.outputs.is_empty() {
+            return Err(BackendError::Spawn(
+                "process backend cannot collect outputs yet (local-dir output share lands in T4)".to_string(),
+            ));
+        }
+
+        // INV-1 + isolation: clear the host env so the ambient operator env never
+        // reaches an untrusted job, preserve only PATH so commands resolve, then
+        // overlay spec.env (which the plan guarantees carries no secret,
+        // validate_no_secret_leak). Secret bytes ride the secret share, never env.
+        let mut command = Command::new(program);
+        command
             .args(args)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .envs(spec.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn();
-        let mut child = match spawned {
+            .stderr(Stdio::piped());
+
+        // Spawn the child as the leader of a NEW process group so a timeout or
+        // teardown can reap the whole group. command-group encapsulates the
+        // setpgid/killpg; sandy's crates stay forbid(unsafe_code).
+        let mut child = match command.group_spawn() {
             Ok(child) => child,
             // A spawn fault is infra (band 3, retryable), not a run result.
             Err(err) => return Err(BackendError::Spawn(format!("spawn `{program}`: {err}"))),
@@ -95,11 +132,11 @@ impl VmBackend for ProcessBackend {
 
         // Drain both pipes on threads: an un-read piped stdout/stderr deadlocks a
         // chatty child once it fills the pipe buffer.
-        let out_drain = child.stdout.take().map(drain);
-        let err_drain = child.stderr.take().map(drain);
+        let out_drain = child.inner().stdout.take().map(drain);
+        let err_drain = child.inner().stderr.take().map(drain);
 
-        // Wait against the wall-clock budget, polling so a timeout can kill a hung
-        // child rather than block forever.
+        // Wait for the group leader against the wall-clock budget, polling so a
+        // timeout can interrupt a hung job rather than block forever.
         let deadline = Instant::now() + Duration::from_secs(u64::from(spec.timeout_secs));
         let mut timed_out = false;
         let status = loop {
@@ -107,8 +144,6 @@ impl VmBackend for ProcessBackend {
                 Ok(Some(status)) => break Some(status),
                 Ok(None) => {
                     if Instant::now() >= deadline {
-                        let _ = child.kill();
-                        let _ = child.wait();
                         timed_out = true;
                         break None;
                     }
@@ -116,13 +151,18 @@ impl VmBackend for ProcessBackend {
                 }
                 Err(err) => {
                     let _ = child.kill();
-                    let _ = child.wait();
                     self.registry()?.retain(|state| state.box_id != box_id);
                     return Err(BackendError::Transport(format!("wait on child `{program}`: {err}")));
                 }
             }
         };
 
+        // Reap the WHOLE group on every path, exit or timeout, so a backgrounded
+        // descendant is killed (no host orphan) and the console pipes close —
+        // which is what lets the drain join below return instead of hanging on a
+        // pipe a lingering group member is still holding open.
+        let _ = child.kill();
+        let _ = child.wait();
         self.registry()?.retain(|state| state.box_id != box_id);
 
         let stdout = out_drain.and_then(|h| h.join().ok()).unwrap_or_default();
@@ -284,6 +324,53 @@ mod tests {
             "it was killed near the deadline, not after the full sleep"
         );
         Ok(())
+    }
+
+    /// Adversarial: a job that backgrounds a process holding the console pipe open
+    /// must still be bounded by the timeout. The whole group is reaped, so the
+    /// drain join cannot hang on a lingering descendant's pipe. Without the
+    /// group-kill this run() would block well past the 1s budget.
+    #[test]
+    fn a_backgrounding_job_over_its_timeout_stays_bounded() -> anyhow::Result<()> {
+        let grants = no_grants();
+        // `sleep 30 &` backgrounds a child that inherits stdout; the leader then
+        // blocks on `wait`, so neither finishes before the budget.
+        let command = [
+            "sh".to_string(),
+            "-c".to_string(),
+            "sleep 30 & echo started; wait".to_string(),
+        ];
+        let spec = run_spec(&command, &grants, 1);
+
+        let start = Instant::now();
+        let outcome = ProcessBackend::new().run(&spec)?;
+
+        assert!(outcome.timed_out, "the job exceeded its 1s budget");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "run() stayed bounded despite a backgrounded child holding the pipe open"
+        );
+        Ok(())
+    }
+
+    /// Fail closed: a spec carrying outputs the backend cannot collect yet (T4) is
+    /// refused outright, never run to a silent mis-success (exit 0, no outputs).
+    #[test]
+    fn refuses_a_spec_with_outputs_it_cannot_honor_yet() {
+        let grants = no_grants();
+        let command = ["true".to_string()];
+        let outputs = [sandy::Output {
+            name: None,
+            dest: std::path::PathBuf::from("/tmp/out"),
+        }];
+        let spec = RunSpec {
+            outputs: &outputs,
+            ..run_spec(&command, &grants, 30)
+        };
+        assert!(
+            ProcessBackend::new().run(&spec).is_err(),
+            "an output-bearing job must be refused, not silently mis-succeed"
+        );
     }
 
     /// The backend advertises `Process`, so `backend_accepts` refuses a VM job.
