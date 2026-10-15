@@ -297,7 +297,12 @@ impl GuestShareTransport for LocalDirTransport {
         // the vfkit RO asymmetry in guest-shares §2); the VM backend is the real
         // boundary. No daemons, so the live-children set is empty.
         for share in shares {
-            if share.readonly {
+            // Cooperative RO applies to the INPUT share only. The secret share is
+            // never chmod'd: its files are already 0600 (INV-1), and a caller-owned
+            // secret_dir supports in-place token refresh (#49) — making it a-w would
+            // break the refresh and mutate caller-owned files. Outputs are writable
+            // (readonly=false), so they are skipped by the flag.
+            if share.readonly && share.tag != SECRET_MOUNT_TAG {
                 set_dir_readonly(&share.host_dir)?;
             }
         }

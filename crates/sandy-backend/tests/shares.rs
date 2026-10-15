@@ -561,6 +561,30 @@ fn local_dir_activate_makes_readonly_shares_unwritable() -> Result<()> {
     Ok(())
 }
 
+/// activate() does NOT chmod the secret share read-only: secret files are already
+/// 0600 (INV-1) and a caller-owned secret_dir supports in-place token refresh
+/// (#49), which a `chmod a-w` would break (and would mutate caller-owned files).
+#[test]
+fn local_dir_activate_leaves_the_secret_share_writable() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::TempDir::new()?;
+    let secret_dir = tmp.path().join("secrets");
+    std::fs::create_dir(&secret_dir)?;
+    let token = secret_dir.join("TOKEN");
+    std::fs::write(&token, b"t")?;
+    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600))?;
+
+    LocalDirTransport::new(tmp.path().to_path_buf()).activate(&[qshare(&secret_dir, SECRET_MOUNT_TAG, true)])?;
+
+    let mode = std::fs::metadata(&token)?.permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "the secret file keeps 0600 (owner rw) — refresh-capable, not chmod'd read-only"
+    );
+    Ok(())
+}
+
 // ---- the GuestShareTransport contract, over all three transports --------------
 
 /// The contract every [`GuestShareTransport`] upholds: `plan()` is PURE (no IO,
