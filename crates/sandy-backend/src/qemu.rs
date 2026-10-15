@@ -167,7 +167,7 @@ pub fn qemu_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> Re
     // The virtio-fs shares: a shared memfd memory backend plus a client chardev +
     // `vhost-user-fs-pci` device per share. The matching virtiofsd daemons are
     // launched by [`QemuBackend::boot`]. readonly is a virtiofsd flag, not a qemu arg.
-    args.extend(VirtiofsdTransport.device_args(&staged.shares, mem));
+    args.extend(VirtiofsdTransport.plan(&staged.shares, mem).into_vm_args());
 
     if let Some(cid) = topology.vsock_cid {
         args.push("-device".to_string());
@@ -255,7 +255,7 @@ impl QemuBackend {
         // Launch a virtiofsd per share and wait for its socket before qemu starts:
         // qemu connects to each as a client chardev, so the socket must exist first.
         // A launch or socket fault kills any daemon already up and fails the boot.
-        let mut virtiofsds = VirtiofsdTransport.launch(shares)?;
+        let mut virtiofsds = VirtiofsdTransport.activate(shares)?;
 
         // qemu_args emits `-serial chardev:<id>`; bind that id to a Unix-socket
         // chardev qemu creates (server=on, wait=off so the spawn doesn't block).

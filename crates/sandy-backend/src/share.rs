@@ -14,6 +14,8 @@
 //! consume.
 
 use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
@@ -104,25 +106,77 @@ pub fn plan_shares(spec: &RunSpec, dirs: &ShareDirs) -> Result<Vec<ShareSpec>, B
     Ok(shares)
 }
 
-/// How a hypervisor presents [`ShareSpec`]s to the guest as virtio-fs. One
-/// implementation per backend (qemu [`VirtiofsdTransport`], vfkit
-/// [`VirtioFsTransport`]); the backend owns which it uses.
+/// How presenting the shares wires the guest, the pure output of
+/// [`GuestShareTransport::plan`]. One enum so the seam has a single return type
+/// across every transport (the shared contract test covers all three uniformly).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Presentation {
+    /// A VM: the hypervisor argv fragment wiring the shares as virtio-fs.
+    Vm {
+        /// The per-share devices (and, for the daemon transport, the shared-memory
+        /// backend), as argv tokens.
+        args: Vec<String>,
+    },
+    /// A host process (no virtio-fs): the staged share dirs, each with its mount
+    /// tag and read-only flag, under a per-run `root`. The executor exposes them
+    /// to the job as `SANDY_<TAG>_DIR` env vars (the process profile's access
+    /// contract, distinct from the VM's fixed `/run/sandy/...` mount paths — a
+    /// weak-isolation divergence, faithful-path fidelity is deferred to #135).
+    LocalDir {
+        /// The per-run root the staged share dirs live under.
+        root: PathBuf,
+        /// One entry per share: its tag, the host dir holding the staged bytes,
+        /// and whether it is read-only.
+        placements: Vec<Placement>,
+    },
+}
+
+impl Presentation {
+    /// The hypervisor argv for a VM presentation, consumed owned so a VM backend
+    /// can splice it into its command; empty for any non-VM presentation.
+    #[must_use]
+    pub fn into_vm_args(self) -> Vec<String> {
+        match self {
+            Presentation::Vm { args } => args,
+            Presentation::LocalDir { .. } => Vec::new(),
+        }
+    }
+}
+
+/// One staged share a host process reads: its [`ShareSpec::tag`], the host dir
+/// holding the staged bytes, and whether it is read-only (enforced cooperatively,
+/// `chmod a-w`, for the process profile — a same-user job can undo it, matching
+/// the vfkit RO asymmetry in `docs/decisions/guest-shares.md` §2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Placement {
+    /// The share's mount tag, also the `SANDY_<TAG>_DIR` env key stem.
+    pub tag: String,
+    /// The host dir holding the staged bytes.
+    pub dir: PathBuf,
+    /// Deny the job writes (inputs, secrets); outputs are writable.
+    pub readonly: bool,
+}
+
+/// How a backend presents [`ShareSpec`]s to its guest. One implementation per
+/// profile: qemu [`VirtiofsdTransport`], vfkit [`VirtioFsTransport`], process
+/// [`LocalDirTransport`]. The pure/IO split is preserved (run-plane decision #1):
+/// [`plan`](GuestShareTransport::plan) computes the wiring with no IO, so it stays
+/// tier-1 testable; [`activate`](GuestShareTransport::activate) does the IO.
 pub trait GuestShareTransport {
-    /// Launch any helper daemons the shares need before the VM starts, returning
-    /// child handles to reap at teardown (with [`kill_children`]). Each share's
-    /// socket is ready when this returns `Ok`. A launch or socket fault kills any
-    /// daemon already up and returns the error (fail-closed).
+    /// Compute how the shares are presented. PURE, no IO. `mem_mib` is the guest
+    /// RAM in MiB (the qemu memory-backend size; the others ignore it).
+    fn plan(&self, shares: &[ShareSpec], mem_mib: u32) -> Presentation;
+
+    /// Bring the presentation live. IO. A VM transport launches its helper daemons
+    /// (returning children to reap at teardown with [`kill_children`]); a local-dir
+    /// transport prepares the staged dirs (enforces read-only). Sockets and paths
+    /// are derived deterministically from the [`ShareSpec`]s, so `activate` needs
+    /// no coordination with [`plan`](GuestShareTransport::plan).
     ///
     /// # Errors
     /// [`BackendError::Spawn`] if a daemon cannot be spawned or its socket never
-    /// appears.
-    fn launch(&self, shares: &[ShareSpec]) -> Result<Vec<Child>, BackendError>;
-
-    /// The hypervisor argv fragment wiring the shares into the guest: the per-share
-    /// devices, and for the daemon transport the shared-memory backend. Pure (no IO),
-    /// so it stays tier-1 testable. `mem_mib` is the guest RAM in MiB (the qemu
-    /// memory-backend size; the vfkit transport ignores it).
-    fn device_args(&self, shares: &[ShareSpec], mem_mib: u32) -> Vec<String>;
+    /// appears; [`BackendError`] if a local dir cannot be prepared.
+    fn activate(&self, shares: &[ShareSpec]) -> Result<Vec<Child>, BackendError>;
 }
 
 /// The qemu virtio-fs transport: a `virtiofsd` daemon per share + a
@@ -131,7 +185,7 @@ pub trait GuestShareTransport {
 pub struct VirtiofsdTransport;
 
 impl GuestShareTransport for VirtiofsdTransport {
-    fn launch(&self, shares: &[ShareSpec]) -> Result<Vec<Child>, BackendError> {
+    fn activate(&self, shares: &[ShareSpec]) -> Result<Vec<Child>, BackendError> {
         let mut children = Vec::with_capacity(shares.len());
         for share in shares {
             let launched = spawn_virtiofsd(share).and_then(|child| {
@@ -146,10 +200,10 @@ impl GuestShareTransport for VirtiofsdTransport {
         Ok(children)
     }
 
-    fn device_args(&self, shares: &[ShareSpec], mem_mib: u32) -> Vec<String> {
+    fn plan(&self, shares: &[ShareSpec], mem_mib: u32) -> Presentation {
         let mut args = Vec::new();
         if shares.is_empty() {
-            return args;
+            return Presentation::Vm { args };
         }
         // One shareable memfd NUMA node, mapped by every virtio-fs device.
         args.push("-object".to_string());
@@ -164,7 +218,7 @@ impl GuestShareTransport for VirtiofsdTransport {
             args.push("-device".to_string());
             args.push(format!("vhost-user-fs-pci,chardev=vfs{i},tag={}", share.tag));
         }
-        args
+        Presentation::Vm { args }
     }
 }
 
@@ -174,7 +228,7 @@ impl GuestShareTransport for VirtiofsdTransport {
 /// Read-only is NOT enforced host-side here, unlike the qemu transport's
 /// `virtiofsd --readonly`: vfkit's `virtio-fs` device takes only `sharedDir` and
 /// `mountTag` (verified against vfkit v0.6.3), with no read-only option, so
-/// [`device_args`](GuestShareTransport::device_args) cannot pass the share's
+/// [`plan`](GuestShareTransport::plan) emits no readonly flag for
 /// `readonly` flag through. On macOS a `readonly` share is enforced only by the guest's `ro` mount,
 /// which a guest-root `mount -o remount,rw` can defeat. This asymmetry is accepted:
 /// each share is a single per-run, sandy-owned dir wiped at teardown, so a guest
@@ -185,11 +239,11 @@ impl GuestShareTransport for VirtiofsdTransport {
 pub struct VirtioFsTransport;
 
 impl GuestShareTransport for VirtioFsTransport {
-    fn launch(&self, _shares: &[ShareSpec]) -> Result<Vec<Child>, BackendError> {
+    fn activate(&self, _shares: &[ShareSpec]) -> Result<Vec<Child>, BackendError> {
         Ok(Vec::new())
     }
 
-    fn device_args(&self, shares: &[ShareSpec], _mem_mib: u32) -> Vec<String> {
+    fn plan(&self, shares: &[ShareSpec], _mem_mib: u32) -> Presentation {
         let mut args = Vec::with_capacity(shares.len() * 2);
         for share in shares {
             args.push("--device".to_string());
@@ -199,8 +253,99 @@ impl GuestShareTransport for VirtioFsTransport {
                 share.tag
             ));
         }
-        args
+        Presentation::Vm { args }
     }
+}
+
+/// The process profile's share transport: no virtio-fs, no daemon. Presents each
+/// staged share dir to the host job via a `SANDY_<TAG>_DIR` env var (see
+/// [`Presentation::LocalDir`]) and enforces read-only cooperatively (`chmod a-w`)
+/// on inputs/secrets. Constructed per run with the backend's inst dir as the root.
+#[derive(Debug, Clone)]
+pub struct LocalDirTransport {
+    root: PathBuf,
+}
+
+impl LocalDirTransport {
+    /// A transport rooting the staged share dirs at `root` (the per-run inst dir).
+    #[must_use]
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+}
+
+impl GuestShareTransport for LocalDirTransport {
+    fn plan(&self, shares: &[ShareSpec], _mem_mib: u32) -> Presentation {
+        let placements = shares
+            .iter()
+            .map(|share| Placement {
+                tag: share.tag.clone(),
+                dir: share.host_dir.clone(),
+                readonly: share.readonly,
+            })
+            .collect();
+        Presentation::LocalDir {
+            root: self.root.clone(),
+            placements,
+        }
+    }
+
+    fn activate(&self, shares: &[ShareSpec]) -> Result<Vec<Child>, BackendError> {
+        // Cooperative read-only: strip write from the FILES in each read-only share
+        // dir so a job cannot modify the staged input/secret bytes (the dir stays
+        // writable so teardown can wipe it). A same-user job can undo it (weak, like
+        // the vfkit RO asymmetry in guest-shares §2); the VM backend is the real
+        // boundary. No daemons, so the live-children set is empty.
+        for share in shares {
+            // Cooperative RO applies to the INPUT share only. The secret share is
+            // never chmod'd: its files are already 0600 (INV-1), and a caller-owned
+            // secret_dir supports in-place token refresh (#49) — making it a-w would
+            // break the refresh and mutate caller-owned files. Outputs are writable
+            // (readonly=false), so they are skipped by the flag.
+            if share.readonly && share.tag != SECRET_MOUNT_TAG {
+                set_dir_readonly(&share.host_dir)?;
+            }
+        }
+        Ok(Vec::new())
+    }
+}
+
+/// Strip write (`chmod a-w`) from the FILES under `dir` (recursively), so a
+/// same-user job cannot modify a read-only share's staged bytes. Best-effort
+/// cooperative RO, not a hard boundary (the VM backend is the real boundary): only
+/// files are stripped, never the dirs, so teardown's `remove_dir_all` can still
+/// unlink entries (unlinking needs write on the parent dir, not the file). A
+/// same-user job can add or remove entries, or chmod the files back; what this
+/// protects is the integrity of the given input/secret bytes.
+fn set_dir_readonly(dir: &Path) -> Result<(), BackendError> {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        // Fatal: if we cannot even enumerate the share dir, the RO step would be a
+        // silent no-op — surface it rather than ship a silent gate.
+        let entries = fs::read_dir(&current)
+            .map_err(|e| BackendError::Spawn(format!("read share dir {}: {e}", current.display())))?;
+        for entry in entries {
+            let path = entry
+                .map_err(|e| BackendError::Spawn(format!("read share entry in {}: {e}", current.display())))?
+                .path();
+            let meta = fs::symlink_metadata(&path)
+                .map_err(|e| BackendError::Spawn(format!("stat {}: {e}", path.display())))?;
+            if meta.is_dir() {
+                stack.push(path);
+            } else {
+                let mut perms = meta.permissions();
+                perms.set_mode(perms.mode() & !0o222);
+                // Non-fatal but OBSERVABLE: cooperative RO is defence-in-depth (the
+                // VM is the real boundary), so one stubborn file does not fail the
+                // run — but a swallowed partial failure is the silent-gate smell, so
+                // it is warn-logged with the path rather than dropped.
+                if let Err(err) = fs::set_permissions(&path, perms) {
+                    tracing::warn!(path = %path.display(), %err, "failed to strip write from a read-only share file");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Kill and reap a set of child processes, best-effort (the virtiofsd daemons at
