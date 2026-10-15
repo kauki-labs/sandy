@@ -17,7 +17,7 @@ use std::{
 use sandy::{
     BackendError, Classification, CoreError, CredentialProvider, EgressApplier, EgressOs, EgressOutcome,
     JOURNAL_SCHEMA_VERSION, JobRecord, JobState, Journal, Lease, Logs, Outcome, OutputRef, OutputStatus, ProcessExit,
-    Provenance, RESULT_SCHEMA_VERSION, ResultEnvelope, Scope, SecretSource, StagedImage, Status, VmBackend,
+    Profile, Provenance, RESULT_SCHEMA_VERSION, ResultEnvelope, Scope, SecretSource, StagedImage, Status, VmBackend,
     classify_backend_error, classify_invalid_plan, classify_outcome, enforce, mint_lease, new_job_id,
     plan_egress_scoped, plan_eviction, reconcile_job, refresh_once, validate_no_secret_leak,
 };
@@ -253,6 +253,27 @@ pub fn run_job<B: VmBackend, E: EgressApplier>(
         envelope,
         process_exit: classification.process_exit,
     })
+}
+
+/// Run one job to completion from a composition [`Profile`]: the profile selects
+/// the sandbox backend and the egress applier (and the OS egress model), and this
+/// threads them into [`run_job`]. It is the injectable entry the composition root
+/// (`dispatch_run`) calls, so which backend/egress impl runs is a profile choice,
+/// not hardcoded in dispatch. The non-credentialed path; the credentialed bracket
+/// stays [`run_job_with_credential`].
+///
+/// # Errors
+///
+/// Returns [`CoreError`] exactly as [`run_job`] does — only on genuine journal I/O
+/// failure; every run-outcome is folded into the returned [`RunReport`].
+pub fn run_with_profile(
+    profile: &Profile,
+    journal: &Journal,
+    plan: &JobPlan,
+    tap: Option<&str>,
+) -> Result<RunReport, CoreError> {
+    let _ = (profile, journal, plan, tap);
+    todo!("T1: compose the run from the injected Profile's backend + egress seams")
 }
 
 /// Mint a scoped installation token and stage it as a `0600` [`SecretRef`] for a
@@ -564,10 +585,59 @@ pub fn gc(journal: &Journal, keep_last_n: usize) -> Result<Vec<String>, CoreErro
 #[cfg(test)]
 mod tests {
     use anyhow::Context;
-    use sandy::{AllowList, BackendError, EgressOs, FakeApplier, FakeBackend, Grants, Journal, Outcome, ProcessExit};
+    use sandy::{
+        AllowList, BackendError, CredentialProvider, CredentialSource, EgressOs, FakeApplier, FakeBackend, Grants,
+        Journal, Outcome, ProcessExit, Profile, Scope,
+    };
 
     use super::run_job;
     use crate::plan::JobPlan;
+
+    /// A credential source that panics if asked for a provider — the non-credentialed
+    /// run path never builds one, so a [`Profile`] in these tests carries this to
+    /// satisfy the seam without a live cred backend.
+    struct UnusedCred;
+    impl CredentialSource for UnusedCred {
+        fn provider(
+            &self,
+            _dir: &std::path::Path,
+            _name: &str,
+            _capabilities: &[String],
+        ) -> Result<(Box<dyn CredentialProvider + Sync>, Scope), String> {
+            unreachable!("the non-credentialed run path never builds a credential provider")
+        }
+    }
+
+    /// The injection contract (T1): a run driven from a [`Profile`] uses the
+    /// profile's injected backend, not a hardcoded one. A `FakeBackend` scripted to
+    /// a clean success is bundled into the profile; `run_with_profile` must surface
+    /// that outcome (band 0), proving the dispatch composition routed through the
+    /// injected seam rather than reaching for `host_backend()`.
+    #[test]
+    fn run_with_profile_uses_the_injected_backend() -> anyhow::Result<()> {
+        let (_tmp, journal) = fresh_journal()?;
+        let backend = FakeBackend::new().with_outcome(Outcome {
+            booted: true,
+            guest_exit: Some(0),
+            transport_error: None,
+            timed_out: false,
+            console: String::new(),
+        });
+        let profile = Profile::new(
+            Box::new(backend),
+            Box::new(FakeApplier::new()),
+            EgressOs::Linux,
+            Box::new(UnusedCred),
+        );
+        let report = super::run_with_profile(&profile, &journal, &booting_plan(), None).context("run_with_profile")?;
+        assert_eq!(
+            report.process_exit.code(),
+            ProcessExit::Succeeded.code(),
+            "the injected FakeBackend's clean-success outcome must surface (band 0)"
+        );
+        assert!(!report.envelope.retryable, "a clean success is not retryable");
+        Ok(())
+    }
 
     /// A journal on a fresh local temp `$SANDY_HOME`.
     fn fresh_journal() -> anyhow::Result<(tempfile::TempDir, Journal)> {

@@ -39,6 +39,7 @@ mod gc;
 mod journal;
 mod metrics;
 mod nix;
+mod profile;
 mod provision;
 mod reconcile;
 mod result;
@@ -72,6 +73,7 @@ pub use gc::{StagedImage, plan_eviction};
 pub use journal::{JobLock, Journal, detect_fs_type, ensure_local_posix_fs, is_networked_fs, new_job_id};
 pub use metrics::{RunMetrics, RunPhase};
 pub use nix::{Hypervisor, Share, StoreBacking, Topology, parse_topology, topology};
+pub use profile::{CredentialSource, Profile};
 pub use provision::{
     HostNixProvisioner, Job, ProvisionOutcome, RemoteArtifacts, RemoteBuilder, RemoteError, decide_fallback, provision,
     provision_remote_build,
