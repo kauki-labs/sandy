@@ -7,44 +7,9 @@
 //! preserved: the router forwards the job unchanged and adds nothing to argv /
 //! env / the Nix store, so a secret never leaves its channel (INV-1).
 
-use crate::{ProvisioningStrategy, ResultEnvelope};
+pub use sandy_api::provision::{HostNixProvisioner, Job, ProvisionOutcome};
 
-/// A minimal stand-in for Phase A's fully-desugared run request (`RunSpec`),
-/// kept tiny for Phase B routing. The implementer expands or replaces this when
-/// wiring the real `LauncherBackend` path; it exists so the router has a job to
-/// forward unchanged.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Job {
-    /// The template (flake attr / image) to boot.
-    pub template: String,
-    /// The guest command and its arguments.
-    pub command: Vec<String>,
-}
-
-/// The Phase A provisioning seam the router drives for a `HostNix` strategy.
-///
-/// The real path (`LauncherBackend` + the `vm run` CLI) is deferred, so the
-/// router depends only on this trait and tests inject a fake. An implementation
-/// runs `job` natively at `arch` and returns Phase A's result envelope
-/// unchanged.
-pub trait HostNixProvisioner {
-    /// Provision and run `job` at `arch`, returning the Phase A result envelope.
-    fn provision_host_nix(&self, job: &Job, arch: &str) -> ResultEnvelope;
-}
-
-/// The result of routing a [`ProvisioningStrategy`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProvisionOutcome {
-    /// `HostNix` ran via Phase A's backend; carries the result envelope unchanged.
-    Provisioned(ResultEnvelope),
-    /// The strategy could not run at stage B; `reason` names the blocker — an
-    /// axis propagated from [`ProvisioningStrategy::Refuse`], or a "requires
-    /// stage C/D" pointer (B-REQ-7).
-    Refused {
-        /// Why the run was refused.
-        reason: String,
-    },
-}
+use crate::ProvisioningStrategy;
 
 /// Route `strategy` to an action (B-REQ-5, B-REQ-7):
 ///

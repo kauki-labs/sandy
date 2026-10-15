@@ -11,4 +11,10 @@
 //! and classification types ([`result`]). Remaining seams move in later nodes.
 
 pub mod backend;
+pub mod console;
+pub mod discovery;
+pub mod provision;
 pub mod result;
+pub mod seed;
+pub mod share;
+pub mod strategy;

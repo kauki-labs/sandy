@@ -29,6 +29,7 @@ workspace = true
 command-group = "5.0.1"
 rustix.workspace = true
 sandy.workspace = true
+sandy-api.workspace = true
 tracing.workspace = true
 uuid = { workspace = true }
 

@@ -1794,6 +1794,7 @@ dependencies = [
  "anyhow",
  "command-group",
  "rustix",
+ "sandy-api",
  "sandy-box",
  "tempfile",
  "tracing",

@@ -9,21 +9,12 @@ use std::{
 };
 
 use minisign_verify::{PublicKey, Signature};
+pub use sandy_api::seed::SignatureVerifier;
 
 use super::{
     hash::sha256_hex_file,
     manifest::{ALLOWED_IMAGE_FORMATS, MANIFEST_FILE, Requirements, SeedManifest},
 };
-
-/// Verifies a detached signature over a message against a trusted public key.
-///
-/// This is the seam that lets identity verification be unit-tested without a real
-/// key: tests supply an accept/reject double, while production uses
-/// [`MinisignVerifier`] over the operator-held minisign key (D12).
-pub trait SignatureVerifier {
-    /// Return `true` iff `signature` is a valid detached signature over `message`.
-    fn verify(&self, message: &[u8], signature: &[u8]) -> bool;
-}
 
 /// Production [`SignatureVerifier`] over a minisign public key (the operator-held key).
 ///
