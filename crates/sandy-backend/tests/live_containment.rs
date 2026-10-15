@@ -35,8 +35,8 @@ fn live_contained_backend() -> ProcessBackend {
     );
     let containment = SystemdRunContainment::detect();
     assert!(
-        matches!(containment.status(), ContainmentStatus::Available),
-        "the live host must provide real containment (user systemd + cgroup v2); got {:?}",
+        matches!(containment.status(), ContainmentStatus::Available { .. }),
+        "the live host must provide cgroup reaping (user systemd + cgroup v2); got {:?}",
         containment.status()
     );
     ProcessBackend::with_containment(Box::new(containment))

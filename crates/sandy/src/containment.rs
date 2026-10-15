@@ -23,10 +23,27 @@ use std::sync::{Arc, Mutex};
 use crate::{BackendError, SandboxKind};
 
 /// Whether host containment is usable for a process-backend job right now.
+///
+/// Two capabilities are deliberately split (CWE-269 honesty): *tree-reaping*
+/// (`Available`) and *untrusted isolation* (`Available { isolates_untrusted: true }`).
+/// A cgroup scope reaps the whole process tree and bounds resources, but a job
+/// inside it can still reach the user session bus and spawn units OUTSIDE the scope
+/// that teardown never reaps — so tree-reaping alone is NOT a boundary for untrusted
+/// code. [`admits_untrusted`] keys off the stronger capability; reaping/teardown key
+/// off [`is_available`](ContainmentStatus::is_available).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContainmentStatus {
-    /// Real containment is available: the whole process tree is reaped on teardown.
-    Available,
+    /// Real containment is available: the whole process tree is reaped on teardown
+    /// and resources are bounded. `isolates_untrusted` is whether this host ALSO
+    /// isolates an adversary (reap + user-bus / mount-namespace isolation); a plain
+    /// `systemd-run` scope sets it `false` (it reaps but does not contain a job that
+    /// talks to the user bus). The untrusted boundary lands with the mount-namespace
+    /// work (#142).
+    Available {
+        /// Whether this containment is a safe boundary for UNTRUSTED code, not only
+        /// a reaper of cooperative trees.
+        isolates_untrusted: bool,
+    },
     /// Supported on this platform but not usable now (e.g. no user `systemd`
     /// instance or cgroup v2, common in headless/CI). The string is the diagnostic
     /// reason. An untrusted job is refused ([`admits_untrusted`]).
@@ -38,11 +55,25 @@ pub enum ContainmentStatus {
 }
 
 impl ContainmentStatus {
-    /// Whether real containment is available (the only state that admits an
-    /// untrusted job).
+    /// Whether containment can reap the job's process tree (and bound resources).
+    /// Drives teardown/`kill`/`wrap`; NOT sufficient on its own to admit an
+    /// untrusted job (see [`admits_untrusted`]).
     #[must_use]
     pub fn is_available(&self) -> bool {
-        matches!(self, ContainmentStatus::Available)
+        matches!(self, ContainmentStatus::Available { .. })
+    }
+
+    /// Whether this containment is a safe boundary for untrusted code (reap + bus /
+    /// namespace isolation). `false` for a plain reaper and for any unavailable or
+    /// unsupported status.
+    #[must_use]
+    pub fn is_untrusted_boundary(&self) -> bool {
+        matches!(
+            self,
+            ContainmentStatus::Available {
+                isolates_untrusted: true
+            }
+        )
     }
 }
 
@@ -98,17 +129,21 @@ pub trait Containment: std::fmt::Debug + Send + Sync {
 ///
 /// - a [`SandboxKind::Vm`] backend is the strong isolation boundary, so it always admits an untrusted job regardless of
 ///   process-level containment;
-/// - a [`SandboxKind::Process`] backend admits one only when its containment is [`ContainmentStatus::Available`] — an
-///   `Unavailable`/`Unsupported` process backend is REFUSED, never run uncontained.
+/// - a [`SandboxKind::Process`] backend admits one only when its containment is an untrusted boundary
+///   ([`ContainmentStatus::is_untrusted_boundary`]) — reap + user-bus/namespace isolation, NOT merely tree-reaping. A
+///   plain `systemd-run` scope (reaps but leaves the user bus reachable, CWE-269), and any `Unavailable`/`Unsupported`
+///   status, is REFUSED.
 ///
-/// This is a dispatch-time admission check (parallel to
+/// The untrusted-OK path therefore depends on the mount-namespace / bus-isolation
+/// work (#142); until it lands, a process backend refuses untrusted jobs even where
+/// cgroup reaping is Available. This is a dispatch-time admission check (parallel to
 /// [`backend_accepts`](crate::backend_accepts)); the process backend is
 /// library-only today, so the live enforcer is the fabric dispatcher.
 #[must_use]
 pub fn admits_untrusted(kind: SandboxKind, status: &ContainmentStatus) -> bool {
     match kind {
         SandboxKind::Vm => true,
-        SandboxKind::Process => status.is_available(),
+        SandboxKind::Process => status.is_untrusted_boundary(),
     }
 }
 
@@ -164,23 +199,42 @@ pub struct FakeContainment {
 }
 
 impl FakeContainment {
-    /// An available containment with no wrap prefix (the job runs directly, so the
-    /// double is spawnable in a unit test) that records every reaped id.
+    /// A reaping-only containment with no wrap prefix (the job runs directly, so the
+    /// double is spawnable in a unit test) that records every reaped id. Reaps trees
+    /// but is NOT an untrusted boundary, so the gate still refuses untrusted jobs on
+    /// it — the common state for exercising the reap/teardown wiring.
     #[must_use]
     pub fn available() -> Self {
+        Self::with_status(ContainmentStatus::Available {
+            isolates_untrusted: false,
+        })
+    }
+
+    /// An untrusted-safe containment (reap + isolation): the only state the gate
+    /// admits an untrusted process job on.
+    #[must_use]
+    pub fn isolating() -> Self {
+        Self::with_status(ContainmentStatus::Available {
+            isolates_untrusted: true,
+        })
+    }
+
+    fn with_status(status: ContainmentStatus) -> Self {
         Self {
-            status: ContainmentStatus::Available,
+            status,
             wrap_prefix: Vec::new(),
             reaped: Mutex::new(Vec::new()),
         }
     }
 
-    /// An available containment whose `wrap` returns `prefix` (to assert the backend
-    /// prepends it). `prefix` should still spawn the appended program.
+    /// A reaping-only containment whose `wrap` returns `prefix` (to assert the
+    /// backend prepends it). `prefix` should still spawn the appended program.
     #[must_use]
     pub fn available_wrapping(prefix: Vec<String>) -> Self {
         Self {
-            status: ContainmentStatus::Available,
+            status: ContainmentStatus::Available {
+                isolates_untrusted: false,
+            },
             wrap_prefix: prefix,
             reaped: Mutex::new(Vec::new()),
         }
@@ -224,12 +278,22 @@ impl Containment for FakeContainment {
 mod tests {
     use super::*;
 
-    /// The gate is fail-closed: a process backend admits an untrusted job only when
-    /// containment is Available; Unavailable and Unsupported are REFUSED. A VM
-    /// backend always admits (it is the strong boundary). This asserts the BAD path
-    /// — a disabled gate must be distinguishable from a working one.
+    /// The gate is fail-closed AND honest: a process backend admits an untrusted job
+    /// only when its containment is an untrusted BOUNDARY (reap + isolation).
+    /// Tree-reaping alone (`Available { isolates_untrusted: false }`, a plain
+    /// systemd-run scope with a reachable user bus, CWE-269), Unavailable, and
+    /// Unsupported are all REFUSED. A VM backend always admits. Asserts the BAD path.
     #[test]
-    fn the_gate_refuses_an_untrusted_process_job_without_available_containment() {
+    fn the_gate_refuses_an_untrusted_process_job_without_an_isolating_containment() {
+        assert!(
+            !admits_untrusted(
+                SandboxKind::Process,
+                &ContainmentStatus::Available {
+                    isolates_untrusted: false
+                }
+            ),
+            "tree-reaping alone is not an untrusted boundary (the user bus is reachable); refuse"
+        );
         assert!(
             !admits_untrusted(
                 SandboxKind::Process,
@@ -242,8 +306,13 @@ mod tests {
             "unsupported containment must refuse an untrusted process job"
         );
         assert!(
-            admits_untrusted(SandboxKind::Process, &ContainmentStatus::Available),
-            "available containment admits an untrusted process job"
+            admits_untrusted(
+                SandboxKind::Process,
+                &ContainmentStatus::Available {
+                    isolates_untrusted: true
+                }
+            ),
+            "an isolating containment admits an untrusted process job"
         );
         assert!(
             admits_untrusted(SandboxKind::Vm, &ContainmentStatus::Unavailable("irrelevant".into())),

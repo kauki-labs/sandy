@@ -754,9 +754,10 @@ mod tests {
         assert!(!sandy::backend_accepts(ProcessBackend::new().kind(), SandboxKind::Vm));
     }
 
-    /// The default backend is uncontained, so the fail-closed gate refuses an
-    /// untrusted job on it; an injected available containment admits one. Asserts
-    /// the BAD path (refusal), not only the happy path.
+    /// The fail-closed gate keys off the untrusted-BOUNDARY capability, not mere
+    /// reaping: an uncontained backend AND a reaping-only one both refuse an untrusted
+    /// job; only an isolating containment admits one. Asserts the BAD paths (refusal),
+    /// not only the happy path.
     #[test]
     fn containment_status_drives_the_fail_closed_gate() {
         let uncontained = ProcessBackend::new();
@@ -765,10 +766,16 @@ mod tests {
             "an uncontained (NoContainment) process backend must refuse an untrusted job"
         );
 
-        let contained = ProcessBackend::with_containment(Box::new(sandy::FakeContainment::available()));
+        let reaping_only = ProcessBackend::with_containment(Box::new(sandy::FakeContainment::available()));
         assert!(
-            sandy::admits_untrusted(contained.kind(), &contained.containment_status()),
-            "an available containment admits an untrusted job"
+            !sandy::admits_untrusted(reaping_only.kind(), &reaping_only.containment_status()),
+            "a reaping-only containment (no untrusted isolation) must still refuse an untrusted job"
+        );
+
+        let isolating = ProcessBackend::with_containment(Box::new(sandy::FakeContainment::isolating()));
+        assert!(
+            sandy::admits_untrusted(isolating.kind(), &isolating.containment_status()),
+            "an isolating containment admits an untrusted job"
         );
     }
 

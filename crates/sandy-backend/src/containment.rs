@@ -72,11 +72,11 @@ impl Containment for SystemdRunContainment {
         // `systemd-run --user` reaches the user systemd instance over the session
         // bus, found via these; without them the wrapped launch fails to connect.
         // They are paths/addresses, not secrets (INV-1), and only pass through when
-        // containment actually wraps.
+        // containment actually wraps. `wrap` strips them from the inner job again.
         if !self.status.is_available() {
             return Vec::new();
         }
-        vec!["XDG_RUNTIME_DIR".to_string(), "DBUS_SESSION_BUS_ADDRESS".to_string()]
+        WRAPPER_BUS_ENV.iter().map(|s| (*s).to_string()).collect()
     }
 
     fn reap(&self, id: &str) -> Result<(), BackendError> {
@@ -87,23 +87,41 @@ impl Containment for SystemdRunContainment {
         }
         let unit = scope_unit(id);
         // Destroying the scope reaps its whole cgroup (setsid escapees included).
-        // Best-effort: a unit that already exited (the common success path, auto-
-        // collected) makes `stop` report "not loaded" — not a failure to reap.
-        match Command::new("systemctl")
+        let out = Command::new("systemctl")
             .args(["--user", "stop", &unit])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-        {
-            Ok(_) => Ok(()),
-            // The reap MECHANISM could not run (systemctl absent). Surface it so the
-            // backend warn-logs rather than silently dropping the reap; the backend
-            // still falls back to its process-group kill.
-            Err(err) => Err(BackendError::Transport(format!("reap scope {unit}: systemctl: {err}"))),
+            .stderr(Stdio::piped())
+            // The reap MECHANISM could not run (systemctl absent) — surface it.
+            .output()
+            .map_err(|err| BackendError::Transport(format!("reap scope {unit}: systemctl: {err}")))?;
+        if out.status.success() {
+            return Ok(());
         }
+        // Exit 5 is systemd's "unit not loaded": the scope already exited and was
+        // auto-collected (the common success path), so there is nothing left to reap.
+        if out.status.code() == Some(5) {
+            return Ok(());
+        }
+        // Any OTHER non-zero is a real reap failure — do not swallow it (the
+        // silent-gate smell): the backend warn-logs and falls back to the group-kill.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        Err(BackendError::Transport(format!(
+            "reap scope {unit}: systemctl --user stop exited {:?}: {}",
+            out.status.code(),
+            stderr.trim()
+        )))
     }
 }
+
+/// The host env vars `systemd-run --user` needs to reach the user session bus. The
+/// backend passes them to the WRAPPER (so it can connect), and [`SystemdRunContainment::wrap`]
+/// strips them from the inner JOB's env (`env -u`) so an untrusted job cannot read the
+/// bus address from its own environment. Defence in depth only: it is NOT a full
+/// boundary (the socket still exists at its default path), which is why this
+/// containment reports `isolates_untrusted: false` and the real boundary is the
+/// mount-namespace work (#142).
+const WRAPPER_BUS_ENV: [&str; 2] = ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"];
 
 /// The transient scope unit name for container `id`. Derived deterministically so
 /// `wrap` and `reap` agree with no shared state (mirroring the share transport's
@@ -134,6 +152,15 @@ fn systemd_run_prefix(id: &str, limits: ResourceLimits) -> Vec<String> {
         prefix.push(format!("--property=CPUQuota={}%", cpu * 100));
     }
     prefix.push("--".to_string());
+    // Strip the wrapper's user-bus env from the JOB (defence in depth, CWE-269): the
+    // scope inherits systemd-run's env, so without this the job could read the bus
+    // address and spawn units outside the scope. `env -u` unsets them before exec'ing
+    // the job; `env` resolves via the PATH the backend keeps.
+    prefix.push("env".to_string());
+    for key in WRAPPER_BUS_ENV {
+        prefix.push("-u".to_string());
+        prefix.push(key.to_string());
+    }
     prefix
 }
 
@@ -163,7 +190,14 @@ fn detect_status() -> ContainmentStatus {
         .stderr(Stdio::piped())
         .output()
     {
-        Ok(out) if out.status.success() => ContainmentStatus::Available,
+        // Available for REAPING, but isolates_untrusted: false — a plain systemd-run
+        // scope reaps the tree and bounds resources, yet a job in it can reach the
+        // user bus and spawn units outside the scope (CWE-269). The untrusted boundary
+        // (mount namespace hiding the bus socket) is #142; until then the gate refuses
+        // untrusted jobs even here.
+        Ok(out) if out.status.success() => ContainmentStatus::Available {
+            isolates_untrusted: false,
+        },
         Ok(out) => {
             let reason = String::from_utf8_lossy(&out.stderr);
             let reason = reason.trim();
@@ -182,7 +216,8 @@ mod tests {
     use super::*;
 
     /// The wrap prefix (pure) is the exact `systemd-run --user --scope` invocation,
-    /// ends in `--`, and names the deterministic scope unit.
+    /// names the deterministic scope unit, and ends by stripping the wrapper's bus env
+    /// from the inner job (`env -u …`).
     #[test]
     fn wrap_prefix_is_the_systemd_run_scope_invocation() {
         let prefix = systemd_run_prefix("run-abc", ResourceLimits::default());
@@ -197,6 +232,11 @@ mod tests {
                 "--unit=sandy-run-abc.scope",
                 "--property=Delegate=yes",
                 "--",
+                "env",
+                "-u",
+                "XDG_RUNTIME_DIR",
+                "-u",
+                "DBUS_SESSION_BUS_ADDRESS",
             ]
         );
     }
@@ -235,7 +275,9 @@ mod tests {
     /// an unavailable one passes nothing (it wraps nothing).
     #[test]
     fn available_containment_passes_through_the_user_bus_env() {
-        let available = SystemdRunContainment::from_status(ContainmentStatus::Available);
+        let available = SystemdRunContainment::from_status(ContainmentStatus::Available {
+            isolates_untrusted: false,
+        });
         assert!(
             available.passthrough_env().contains(&"XDG_RUNTIME_DIR".to_string()),
             "systemd-run needs XDG_RUNTIME_DIR to reach the user bus"
@@ -247,13 +289,24 @@ mod tests {
         );
     }
 
-    /// An available containment wraps with the scope prefix.
+    /// An available containment wraps with the scope prefix and scrubs the bus env
+    /// from the inner job, but reports itself as NOT an untrusted boundary (the user
+    /// bus is still reachable; CWE-269) so the gate refuses untrusted jobs on it.
     #[test]
-    fn available_containment_wraps() {
-        let c = SystemdRunContainment::from_status(ContainmentStatus::Available);
+    fn available_containment_wraps_but_is_not_an_untrusted_boundary() {
+        let c = SystemdRunContainment::from_status(ContainmentStatus::Available {
+            isolates_untrusted: false,
+        });
         let prefix = c.wrap("run-1", ResourceLimits::default());
         assert_eq!(prefix.first().map(String::as_str), Some("systemd-run"));
-        assert_eq!(prefix.last().map(String::as_str), Some("--"));
+        assert!(
+            prefix.contains(&"XDG_RUNTIME_DIR".to_string()) && prefix.contains(&"-u".to_string()),
+            "wrap strips the wrapper bus env from the job, got {prefix:?}"
+        );
+        assert!(
+            !c.status().is_untrusted_boundary(),
+            "a plain systemd-run scope is not an untrusted boundary"
+        );
     }
 
     /// macOS (and any non-Linux host) reports Unsupported — honest, mirroring the
