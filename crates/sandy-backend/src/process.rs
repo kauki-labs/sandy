@@ -205,11 +205,17 @@ impl VmBackend for ProcessBackend {
     }
 
     fn kill(&self, box_id: &str) -> Result<(), BackendError> {
-        // Dropping the instance from the registry is the sandbox-visible effect,
-        // matching `QemuBackend::kill`; signalling the live process is host-tier
-        // (#26). The run is synchronous, so a box is registered only while its
-        // run() call owns the child — a tracked box here is a registry entry to
-        // reap, and run() itself tears down the process group on every path.
+        // Deregisters only, mirroring `QemuBackend::kill` (the sandbox-visible
+        // effect is dropping the registry entry). Real termination of the process
+        // group — including a `setsid`/`setpgid`-escaped descendant, which a
+        // `killpg` here would miss exactly as the group-reap does — is gated to
+        // #135 (cgroup/jail teardown), the one mechanism that reaps every case.
+        //
+        // INV-3 honesty: until #135, a kill() on a LIVE process box would leave
+        // that group running and hidden from `boxes()`. This is acceptable only
+        // because the gated MVP runs no untrusted jobs and does not exercise
+        // kill() on a live process box: run() is synchronous and tears down its
+        // own group on every path, so a box is registered only for its run().
         self.registry()?.retain(|state| state.box_id != box_id);
         Ok(())
     }
