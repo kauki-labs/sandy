@@ -131,7 +131,7 @@ pub fn vfkit_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> R
     // already-assembled virtio-fs descriptor. vfkit's virtio-fs device rejects a `ro` option ("unknown option for
     // virtio-fs devices: ro") — unlike the erofs store's virtio-blk `readonly` — so drop a trailing `,ro`; the guest
     // mounts the RO shares read-only itself (the outputs share carries no `,ro`, so it stays writable).
-    args.extend(VirtioFsTransport.device_args(&staged.shares, 0));
+    args.extend(VirtioFsTransport.plan(&staged.shares, 0).into_vm_args());
 
     // The vsock channel, only when the topology assigns a context id (absent in the aarch64 fixture). The guest-side
     // socket wiring is the host concern (#26); here we carry the assigned cid.
