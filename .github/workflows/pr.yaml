@@ -13,6 +13,8 @@ permissions:
 concurrency:
   group: ${{ github.event.pull_request.head.ref || github.ref_name }}-pr
   cancel-in-progress: true
+env:
+  CACHIX_CACHE_NAME: sandy
 jobs:
   validate-pr-title:
     name: Validate title
@@ -79,6 +81,16 @@ jobs:
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
+      # Network binary cache: substitutes store paths from the sandy Cachix cache
+      # and pushes what this job builds. Fork PRs don't get CACHIX_AUTH_TOKEN
+      # (secrets are withheld from fork-triggered pull_request runs), so push is
+      # skipped there; the pull/substituter side still works unauthenticated.
+      - name: Cachix (sandy)
+        uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
+        with:
+          name: ${{ env.CACHIX_CACHE_NAME }}
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          skipPush: ${{ github.event.pull_request.head.repo.fork == true }}
       # Persist the Nix store across runs, keyed on the lockfiles + nix files, so a
       # rerun restores the built Rust deps and crates instead of rebuilding them
       # cold. Per-job key; the store is GC'd to a budget before it is saved.
@@ -124,6 +136,12 @@ jobs:
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
+      - name: Cachix (sandy)
+        uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
+        with:
+          name: ${{ env.CACHIX_CACHE_NAME }}
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          skipPush: ${{ github.event.pull_request.head.repo.fork == true }}
       - name: Cache Nix store
         uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
         with:
@@ -178,6 +196,12 @@ jobs:
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
+      - name: Cachix (sandy)
+        uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
+        with:
+          name: ${{ env.CACHIX_CACHE_NAME }}
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          skipPush: ${{ github.event.pull_request.head.repo.fork == true }}
       - name: Cache Nix store
         uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
         with:
