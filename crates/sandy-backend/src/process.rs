@@ -269,7 +269,11 @@ impl ProcessBackend {
                 Err(err) => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    let _ = self.containment.reap(&box_id);
+                    // Warn-log the reap failure like the exit/timeout paths — a silent
+                    // no-op here would hide an escapee that survived a failed reap.
+                    if let Err(reap_err) = self.containment.reap(&box_id) {
+                        tracing::warn!(box_id = %box_id, err = %reap_err, "containment reap failed after wait error");
+                    }
                     self.registry()?.retain(|state| state.box_id != box_id);
                     return Err(BackendError::Transport(format!("wait on child `{job_program}`: {err}")));
                 }
