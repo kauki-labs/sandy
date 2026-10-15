@@ -2,7 +2,7 @@
 title: "Decisions: guest shares (GuestShareTransport)"
 status: accepted
 project: sandy
-updated: 2026-10-14
+updated: 2026-10-15
 ---
 
 # Decisions: guest shares (`GuestShareTransport`)
@@ -254,3 +254,36 @@ Linux-only, needs privilege/namespace machinery, and is deferred to **#135** (th
 same cgroup/jail containment gate as full descendant reaping — the process backend
 must not run real untrusted jobs until #135 lands). Folding host-side RO into a hard
 boundary is likewise a #135 concern, not the cooperative MVP.
+
+## 12. Host staging base validated before use (CWE-732)
+
+**Status:** accepted. **Upholds:** INV-1.
+
+**Context.** All three backends derived their per-run staging dirs from
+`temp_dir().join("sandy")` with no check on it: a local attacker who pre-creates
+a world-writable `/tmp/sandy`, or symlinks it, can redirect staged secrets/inputs
+to a path they control (#138).
+
+**Decision.** `ensure_sandy_staging_base` gates all three backends. It creates
+the base `0700`, exclusive; if the base already exists it opens it by name with
+`O_NOFOLLOW` (rejecting a symlink rather than following it) and fstats the
+opened fd, rejecting anything not owned by the current uid or carrying a
+group/world write bit. A bad base is **not repaired** — it fails closed with a
+named error.
+
+**Consequences.** Once the base passes validation it is `0700` and owned by the
+current uid, so no other uid can create or replace entries under it afterward;
+the per-run child dirs the backends join onto it (still plain path joins, not
+their own `openat` traversal) inherit that guarantee. This assumes the base's
+_parent_ (`temp_dir()`) is itself not attacker-writable — true for a sticky-bit
+`/tmp` or a per-user `$TMPDIR`, the only configurations sandy runs under today;
+a world-writable, non-sticky `TMPDIR` is out of scope. Uses `rustix` for the
+`openat`/`mkdirat`/`fstat`/`getuid` calls, staying inside this crate's
+`unsafe_code = "forbid"` lint.
+
+**Set aside.** Repairing a bad base (chmod/chown back to safe): rejected — a
+base an attacker got to first is not trustworthy even after a cosmetic fix, and
+silent repair is exactly the kind of downgrade CWE-732 flags. Validating the
+parent directory's own permissions: deferred — it would need to recurse
+indefinitely up the tree, and sandy's supported `TMPDIR` configurations don't
+need it (see consequences above); revisit if that assumption stops holding.

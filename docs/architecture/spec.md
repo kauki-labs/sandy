@@ -100,6 +100,12 @@ flowchart LR
   link) and caps bytes/entries.
 - **Fixed tags, not pooled.** A single fixed tag per channel lets the guest mount
   statically; it is what made the pooled-`sandy<N>` dynamic-mount model unnecessary.
+- **Host staging base validated before use (CWE-732).** All three backends derive
+  their per-run dirs from one host staging base
+  (`temp_dir()/sandy`); `ensure_sandy_staging_base` creates it `0700`, or, if it
+  already exists, opens it with `O_NOFOLLOW` and rejects it unless it is owned by
+  the current uid with no group/world write bit. A bad base fails closed, never
+  gets chmod'd/chowned back into shape.
 
 **KPI.**
 
@@ -111,6 +117,8 @@ flowchart LR
   and catch-all collected, listed in the envelope); and
   `live_boot.rs::secret_share_mounts_read_only_virtiofs` (virtiofs fstype, guest
   write denied).
+- Unit: `sandy-backend/src/staging.rs`, a world-writable or symlinked base is
+  rejected, an owner/mode mismatch is rejected, a clean self-owned base validates.
 
 ---
 

@@ -14,6 +14,7 @@
 mod process;
 mod qemu;
 mod share;
+mod staging;
 mod vfkit;
 
 pub use process::ProcessBackend;

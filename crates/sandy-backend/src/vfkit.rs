@@ -27,7 +27,10 @@ use sandy::{
 };
 use uuid::Uuid;
 
-use crate::share::{GuestShareTransport, ShareDirs, ShareSpec, VirtioFsTransport, plan_shares};
+use crate::{
+    share::{GuestShareTransport, ShareDirs, ShareSpec, VirtioFsTransport, plan_shares},
+    staging::ensure_sandy_staging_base,
+};
 
 /// The guest boot-ready marker the console protocol scans for before injecting
 /// the command: the guest's login shell prints it once it is up and reading (the
@@ -230,7 +233,7 @@ impl VmBackend for VfkitBackend {
         let run_id = Uuid::new_v4();
         let box_id = format!("inst-{run_id}");
         // Staging under the OS temp dir (works on macOS, where `/run` does not exist).
-        let base = std::env::temp_dir().join("sandy");
+        let base = ensure_sandy_staging_base()?;
         let inst_dir = base.join(&box_id);
         let inputs_dir = base.join(format!("{box_id}-inputs"));
         let outputs_dir = base.join(format!("{box_id}-outputs"));
