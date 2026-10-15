@@ -6,7 +6,7 @@
 //! maps results to process exit bands (INV-11).
 
 use clap::{Parser, Subcommand};
-use sandy::{Capability, CoreError, GithubAdapter, Journal, ProcessExit, Scope, TrustRoot};
+use sandy::{Capability, CoreError, GithubAdapter, Journal, ProcessExit, Scope, TrustRoot, TrustRootIo};
 use sandy_cli::{
     app_register::{self, Owner},
     doctor,

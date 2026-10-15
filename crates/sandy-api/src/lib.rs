@@ -12,9 +12,11 @@
 
 pub mod backend;
 pub mod console;
+pub mod cred;
 pub mod discovery;
 pub mod provision;
 pub mod result;
 pub mod seed;
 pub mod share;
 pub mod strategy;
+pub mod trust_root;
