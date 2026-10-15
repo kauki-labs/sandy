@@ -14,6 +14,8 @@ concurrency:
   cancel-in-progress: false
 permissions:
   contents: read
+env:
+  CACHIX_CACHE_NAME: sandy
 jobs:
   release-plz:
     name: release-plz
@@ -38,6 +40,15 @@ jobs:
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
+      # Network binary cache: substitutes store paths from the sandy Cachix cache
+      # and pushes what this job builds. This workflow only runs on push to main
+      # (never a fork PR), so push always has CACHIX_AUTH_TOKEN available.
+      - name: Cachix (sandy)
+        uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
+        with:
+          name: ${{ env.CACHIX_CACHE_NAME }}
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          skipPush: ${{ github.event.pull_request.head.repo.fork == true }}
       - name: Open release PR
         run: nix develop -c release-plz release-pr --git-token "${GITHUB_TOKEN}"
         env:
