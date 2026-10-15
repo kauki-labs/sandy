@@ -139,7 +139,7 @@ pub struct RunReport {
 /// Returns [`CoreError`] only on genuine journal I/O failure. Every run-outcome,
 /// plan, and egress-apply error is folded into the envelope and band — a failed
 /// egress boundary fails closed as a band-3 infra fault — not the `Err` arm.
-pub fn run_job<B: VmBackend, E: EgressApplier>(
+pub fn run_job<B: VmBackend + ?Sized, E: EgressApplier + ?Sized>(
     backend: &B,
     journal: &Journal,
     plan: &JobPlan,
@@ -272,8 +272,14 @@ pub fn run_with_profile(
     plan: &JobPlan,
     tap: Option<&str>,
 ) -> Result<RunReport, CoreError> {
-    let _ = (profile, journal, plan, tap);
-    todo!("T1: compose the run from the injected Profile's backend + egress seams")
+    run_job(
+        profile.backend(),
+        journal,
+        plan,
+        profile.egress(),
+        profile.egress_os(),
+        tap,
+    )
 }
 
 /// Mint a scoped installation token and stage it as a `0600` [`SecretRef`] for a
