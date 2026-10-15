@@ -6,7 +6,7 @@
 
 use std::{collections::BTreeSet, path::PathBuf};
 
-use sandy::ProcessExit;
+use sandy::{Discovery, ProcessExit, StaticRegistry, parse_builder_systems};
 
 /// Verdict for whether a filesystem type is acceptable for `$SANDY_HOME`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,26 +120,6 @@ pub fn run_doctor() -> DoctorResult {
     fs_result
 }
 
-/// Parse the systems a remote builder is configured for from the
-/// `/etc/nix/machines` table. Each non-comment line's second whitespace field is
-/// a comma-separated systems list (`aarch64-linux`, `x86_64-linux,i686-linux`).
-#[must_use]
-pub fn parse_builder_systems(machines: &str) -> BTreeSet<String> {
-    let mut systems = BTreeSet::new();
-    for line in machines.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some(field) = line.split_whitespace().nth(1) {
-            for system in field.split(',').filter(|system| !system.is_empty()) {
-                systems.insert(system.to_string());
-            }
-        }
-    }
-    systems
-}
-
 /// The macOS native-boot (vfkit) prerequisite verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MacPrereq {
@@ -206,7 +186,10 @@ fn mac_guest_system() -> String {
 /// guest system in `/etc/nix/machines` (missing file → no builders).
 fn detect_mac_prereq() -> MacPrereq {
     let machines = std::fs::read_to_string("/etc/nix/machines").unwrap_or_default();
-    mac_prereq_verdict(nix_on_path(), &parse_builder_systems(&machines), &mac_guest_system())
+    // Resolve placement through the Discovery seam — a static registry over the host
+    // matrix. The buildable-systems check is the matrix systems, exactly as before.
+    let placement = StaticRegistry::new(parse_builder_systems(&machines)).resolve(&mac_guest_system());
+    mac_prereq_verdict(nix_on_path(), &placement.systems, &mac_guest_system())
 }
 
 /// Whether a `nix` executable resolves on `PATH`.
@@ -218,30 +201,7 @@ fn nix_on_path() -> bool {
 mod tests {
     use rstest::rstest;
 
-    use super::{
-        FsVerdict, MacPrereq, classify_fs, doctor_result_for, mac_prereq_result, mac_prereq_verdict,
-        parse_builder_systems,
-    };
-
-    /// The real two-builder `/etc/nix/machines` shape (a remote x86_64 node plus
-    /// the darwin linux-builder) parses to both systems.
-    #[test]
-    fn parse_builder_systems_reads_the_machines_table() {
-        let machines = "ssh://user@host x86_64-linux /key 8 2 big-parallel - -\nssh://builder@linux-builder \
-                        aarch64-linux /key 4 1 benchmark - -\n";
-        let systems = parse_builder_systems(machines);
-        assert!(systems.contains("aarch64-linux"));
-        assert!(systems.contains("x86_64-linux"));
-    }
-
-    /// Comments, blank lines, and comma-separated system lists are handled.
-    #[test]
-    fn parse_builder_systems_ignores_comments_and_splits_lists() {
-        let machines = "# a comment\n\n  ssh://b x86_64-linux,i686-linux /k 2 1 - - -\n";
-        let systems = parse_builder_systems(machines);
-        assert!(systems.contains("x86_64-linux"));
-        assert!(systems.contains("i686-linux"));
-    }
+    use super::{FsVerdict, MacPrereq, classify_fs, doctor_result_for, mac_prereq_result, mac_prereq_verdict};
 
     /// Missing nix wins over the builder check.
     #[test]
