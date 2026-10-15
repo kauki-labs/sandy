@@ -186,10 +186,11 @@ fn mac_guest_system() -> String {
 /// guest system in `/etc/nix/machines` (missing file → no builders).
 fn detect_mac_prereq() -> MacPrereq {
     let machines = std::fs::read_to_string("/etc/nix/machines").unwrap_or_default();
+    let guest = mac_guest_system();
     // Resolve placement through the Discovery seam — a static registry over the host
     // matrix. The buildable-systems check is the matrix systems, exactly as before.
-    let placement = StaticRegistry::new(parse_builder_systems(&machines)).resolve(&mac_guest_system());
-    mac_prereq_verdict(nix_on_path(), &placement.systems, &mac_guest_system())
+    let placement = StaticRegistry::new(parse_builder_systems(&machines)).resolve(&guest);
+    mac_prereq_verdict(nix_on_path(), &placement.systems, &guest)
 }
 
 /// Whether a `nix` executable resolves on `PATH`.
