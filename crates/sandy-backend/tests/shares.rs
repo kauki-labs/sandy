@@ -16,7 +16,7 @@ use sandy::{
 };
 use sandy_backend::{
     GuestShareTransport, LocalDirTransport, Placement, Presentation, QemuStagedArgs, ShareSpec, VfkitStagedArgs,
-    qemu_args, vfkit_args, virtiofsd_args,
+    VirtioFsTransport, VirtiofsdTransport, qemu_args, vfkit_args, virtiofsd_args,
 };
 
 const QEMU_FIXTURE: &[u8] = include_bytes!("fixtures/topology-x86_64.json");
@@ -559,4 +559,52 @@ fn local_dir_activate_makes_readonly_shares_unwritable() -> Result<()> {
         "writable output dir keeps owner write"
     );
     Ok(())
+}
+
+// ---- the GuestShareTransport contract, over all three transports --------------
+
+/// The contract every [`GuestShareTransport`] upholds: `plan()` is PURE (no IO,
+/// same shares yield the same `Presentation`) and an empty share set yields an
+/// empty presentation (no argv / no placements). Run against all three impls;
+/// `activate()` conformance is per-impl (virtiofsd spawns daemons, a live concern;
+/// virtio-fs and local-dir are exercised directly elsewhere in this file).
+fn share_transport_contract<T: GuestShareTransport>(label: &str, transport: &T) {
+    let shares = [
+        qshare(std::path::Path::new("/s/in"), "sandy-inputs", true),
+        qshare(std::path::Path::new("/s/out"), "sandy-outputs", false),
+    ];
+
+    // Pure: no IO, and deterministic — the same shares yield the same Presentation.
+    let first = transport.plan(&shares, 128);
+    let second = transport.plan(&shares, 128);
+    assert_eq!(
+        first, second,
+        "{label}: plan() is pure (same shares -> same Presentation)"
+    );
+
+    // An empty share set yields an empty presentation.
+    match transport.plan(&[], 128) {
+        Presentation::Vm { args } => assert!(args.is_empty(), "{label}: no shares -> no argv"),
+        Presentation::LocalDir { placements, .. } => {
+            assert!(placements.is_empty(), "{label}: no shares -> no placements");
+        }
+    }
+}
+
+#[test]
+fn virtiofsd_transport_satisfies_the_share_contract() {
+    share_transport_contract("virtiofsd", &VirtiofsdTransport);
+}
+
+#[test]
+fn virtiofs_transport_satisfies_the_share_contract() {
+    share_transport_contract("virtiofs", &VirtioFsTransport);
+}
+
+#[test]
+fn local_dir_transport_satisfies_the_share_contract() {
+    share_transport_contract(
+        "local-dir",
+        &LocalDirTransport::new(std::path::PathBuf::from("/run/inst")),
+    );
 }
