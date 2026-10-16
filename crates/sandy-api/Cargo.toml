@@ -16,9 +16,22 @@ categories = ["virtualization", "development-tools"]
 [lib]
 crate-type = ["rlib"]
 
+[features]
+# Exposes the generic, fake-free seam contract-test harness (the `contract`
+# module): one suite per run-plane seam (VmBackend, GuestShareTransport,
+# EgressApplier) that any impl, trivial or real, runs itself against (#131 R4b).
+# Off by default: the contract crate ships no test surface unless a caller asks.
+# Also compiled under `cfg(test)` for this crate's own reference checks, so
+# `cargo test -p sandy-api` needs no feature flag — mirrors sandy-fabric's
+# `contract-tests` feature for the agent-fabric seams.
+acceptance = []
+
 [lints]
 workspace = true
 
 [dependencies]
 serde = { workspace = true }
 thiserror.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true

@@ -3,8 +3,13 @@
 //! `FakeBackend` (sandy-test-support) and the real `ProcessBackend` (this crate). The VM impls
 //! (`QemuBackend`/`VfkitBackend`) satisfy the same contract but need a hypervisor,
 //! so they are proven in the live tier, not here.
+//!
+//! The suite itself lives in `sandy_api::contract::vmbackend_suite` (the
+//! `acceptance` feature), shared with `sandy-cli`'s acceptance binaries (#131 R4b)
+//! so the real impl and the fake run the identical checks the capstone binaries do.
 
 use sandy::{Grants, Outcome, OutputStatus, ProcessExit, RunSpec, Status, VmBackend, classify_outcome};
+use sandy_api::contract::vmbackend_suite;
 use sandy_backend::ProcessBackend;
 use sandy_test_support::FakeBackend;
 
@@ -26,45 +31,6 @@ fn spec<'a>(command: &'a [String], grants: &'a Grants) -> RunSpec<'a> {
     }
 }
 
-/// The behaviours every `VmBackend` must uphold, regardless of impl. `make`
-/// yields a backend configured so a trivially-successful job returns exit 0 (the
-/// scripted outcome for the fake, running `true` for a real backend).
-fn vmbackend_contract<B: VmBackend>(label: &str, make: impl Fn() -> B) -> anyhow::Result<()> {
-    // A fresh backend reports no running boxes.
-    let backend = make();
-    assert!(backend.boxes()?.is_empty(), "{label}: a fresh backend has no boxes");
-
-    // kill() of an unknown box is defined (no panic) and leaves the registry empty.
-    backend.kill("does-not-exist")?;
-    assert!(
-        backend.boxes()?.is_empty(),
-        "{label}: killing an unknown box leaves no boxes"
-    );
-
-    // A trivially-successful run returns a well-formed Outcome, and leaves no
-    // lingering box (the run is synchronous — the box lives only for the call).
-    let backend = make();
-    let grants = Grants {
-        secrets: false,
-        agent: false,
-        shares: false,
-    };
-    let command = ["true".to_string()];
-    let outcome = backend.run(&spec(&command, &grants))?;
-    assert!(outcome.booted, "{label}: a successful run booted");
-    assert_eq!(outcome.guest_exit, Some(0), "{label}: a successful run exits 0");
-    assert!(
-        outcome.transport_error.is_none(),
-        "{label}: success is not a transport fault"
-    );
-    assert!(!outcome.timed_out, "{label}: a completed run did not time out");
-    assert!(
-        backend.boxes()?.is_empty(),
-        "{label}: no box lingers after a synchronous run"
-    );
-    Ok(())
-}
-
 #[test]
 fn fake_backend_satisfies_the_contract() -> anyhow::Result<()> {
     let success = Outcome {
@@ -74,12 +40,12 @@ fn fake_backend_satisfies_the_contract() -> anyhow::Result<()> {
         timed_out: false,
         console: String::new(),
     };
-    vmbackend_contract("fake", || FakeBackend::new().with_outcome(success.clone()))
+    vmbackend_suite("contract", || FakeBackend::new().with_outcome(success.clone())).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 #[test]
 fn process_backend_satisfies_the_contract() -> anyhow::Result<()> {
-    vmbackend_contract("process", ProcessBackend::new)
+    vmbackend_suite("contract", ProcessBackend::new).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// INV-11 guard: a non-zero process exit classifies as a task failure (band 1,

@@ -1,10 +1,12 @@
 //! Reusable run [`Profile`]s — concrete compositions of the run seams that
 //! `dispatch_run` threads.
 //!
-//! The host profile (VM backend + nftables egress + GitHub credentials) is wired
-//! in the binary (`main.rs`) because it pulls the live forge setup. This module
-//! holds the profiles that need no host forge setup, so they can be reused by the
-//! acceptance binaries as well as the CLI: today, [`all_local`].
+//! The CREDENTIALED host profile (VM backend + nftables egress + GitHub
+//! credentials) is wired in the binary (`main.rs`) because it pulls the live forge
+//! setup. This module holds the profiles that need no host forge setup, so they
+//! can be reused by the acceptance binaries as well as the CLI: [`all_local`] (no
+//! hypervisor) and [`host_no_cred`] (a real hypervisor, no forge credential — the
+//! `acceptance-vm` binary's profile, #131 R4b).
 
 use std::path::Path;
 
@@ -34,9 +36,53 @@ pub fn all_local() -> Profile {
     )
 }
 
+/// The real hypervisor run profile, with no forge credential: a VM backend
+/// (qemu/vfkit, platform-selected) and the platform's real egress applier
+/// (nftables on Linux, the local no-op off Linux where `plan_egress` yields
+/// `NoBoundary`). This is the `acceptance-vm` binary's profile — the live
+/// hypervisor run plane proven end to end without pulling in the GitHub App
+/// trust-root setup the credentialed host profile needs.
+#[must_use]
+pub fn host_no_cred() -> Profile {
+    Profile::new(
+        Box::new(host_backend()),
+        Box::new(egress_applier()),
+        egress_os(),
+        Box::new(NoForgeCred),
+    )
+}
+
+/// The macOS hypervisor backend: vfkit. Mirrors `main.rs`'s `host_backend` (kept
+/// separate since that one is binary-private and pulls the live forge wiring).
+#[cfg(target_os = "macos")]
+fn host_backend() -> sandy_backend::VfkitBackend {
+    let vfkit_bin = std::env::var("SANDY_VFKIT_BIN").unwrap_or_else(|_| "vfkit".to_string());
+    sandy_backend::VfkitBackend::new(vfkit_bin)
+}
+
+/// The Linux hypervisor backend: qemu/KVM. See [`host_backend`] above.
+#[cfg(not(target_os = "macos"))]
+fn host_backend() -> sandy_backend::QemuBackend {
+    sandy_backend::QemuBackend::new()
+}
+
+/// The Linux egress applier: real `nft`-backed default-deny enforcement.
+#[cfg(target_os = "linux")]
+fn egress_applier() -> sandy::NftablesApplier {
+    sandy::NftablesApplier
+}
+
+/// The non-Linux egress applier: the local no-op, since `plan_egress` yields
+/// `NoBoundary` off Linux and nothing is applied.
+#[cfg(not(target_os = "linux"))]
+fn egress_applier() -> sandy_backend::NoEgress {
+    sandy_backend::NoEgress
+}
+
 /// The platform's egress OS model. Cosmetic for the all-local profile (a process
 /// backend has no NIC to scope, so its plan is always `NoBoundary`), but kept
-/// honest to the host rather than hard-coded.
+/// honest to the host rather than hard-coded; real for [`host_no_cred`] (Linux
+/// enforces, macOS is honestly unenforced).
 fn egress_os() -> EgressOs {
     if cfg!(target_os = "macos") {
         EgressOs::MacOs
@@ -90,5 +136,32 @@ mod tests {
             .cred()
             .provider(Path::new("/nonexistent"), "any", &["read-code".to_string()]);
         assert!(result.is_err(), "all-local mints no forge credential");
+    }
+
+    /// `host_no_cred` selects a VM backend (the real hypervisor, not the raw
+    /// process), runs a VM-required job, and refuses a process-required one.
+    #[test]
+    fn host_no_cred_selects_a_vm_backend() {
+        let profile = host_no_cred();
+        assert_eq!(profile.backend().kind(), SandboxKind::Vm);
+        assert!(
+            backend_accepts(profile.backend().kind(), SandboxKind::Vm),
+            "the host-no-cred backend runs a VM-required job"
+        );
+        assert!(
+            !backend_accepts(profile.backend().kind(), SandboxKind::Process),
+            "the host-no-cred backend must not claim to run a process-required job"
+        );
+    }
+
+    /// `host_no_cred` refuses a forge credential (no trust root) — only the
+    /// credentialed host profile in `main.rs` mints one.
+    #[test]
+    fn host_no_cred_refuses_a_forge_credential() {
+        let profile = host_no_cred();
+        let result = profile
+            .cred()
+            .provider(Path::new("/nonexistent"), "any", &["read-code".to_string()]);
+        assert!(result.is_err(), "host-no-cred mints no forge credential");
     }
 }

@@ -7,6 +7,8 @@
 
 pub mod app_register;
 pub mod doctor;
+#[cfg(feature = "live")]
+pub mod live_target;
 pub mod output;
 pub mod plan;
 pub mod profiles;

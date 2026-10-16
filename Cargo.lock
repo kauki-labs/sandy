@@ -1996,6 +1996,7 @@ dependencies = [
 name = "sandy-api"
 version = "0.1.1"
 dependencies = [
+ "anyhow",
  "serde",
  "thiserror 2.0.21",
 ]
@@ -2021,6 +2022,7 @@ dependencies = [
  "clap",
  "octocrab",
  "rstest",
+ "sandy-api",
  "sandy-backend",
  "sandy-lib",
  "sandy-test-support",

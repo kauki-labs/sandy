@@ -36,9 +36,12 @@ sandy-impls-local = { workspace = true, optional = true }
 sandy-impls-vm = { workspace = true, optional = true }
 
 # The hub's own tests exercise every impl directly (not through the feature-gated
-# re-exports), so the impl crates are unconditional dev-deps.
+# re-exports), so the impl crates are unconditional dev-deps. sandy-api's
+# `acceptance` feature exposes the shared VmBackend contract suite
+# (vmbackend_contract.rs), test-only.
 [dev-dependencies]
 anyhow.workspace = true
+sandy-api = { workspace = true, features = ["acceptance"] }
 sandy-impls-local.workspace = true
 sandy-impls-vm.workspace = true
 sandy-test-support.workspace = true
