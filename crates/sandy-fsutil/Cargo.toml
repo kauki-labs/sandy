@@ -1,0 +1,29 @@
+[package]
+name = "sandy-fsutil"
+description = "Security-sensitive filesystem primitives shared by sandy crates: the owned staging base and the 0600 secret writer"
+version.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+documentation = "https://docs.rs/sandy-fsutil"
+keywords = ["sandbox", "security", "filesystem"]
+categories = ["filesystem"]
+
+[lib]
+crate-type = ["rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+getrandom.workspace = true
+rustix.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+tempfile.workspace = true
