@@ -26,6 +26,11 @@ version, metadata, dependency versions, and lints through the root `Cargo.toml`
   mints a scoped token from it). Text or `-o json`. The trust-root installer is
   provider-nested (`sandy cred <provider> <op>`); GitHub today, GitLab later. See
   `docs/providers/`.
+- **`sandy-fabric`** — the agent-fabric contract: seam traits (`Executor`,
+  `ChannelBackend`, `Transport`, `Discovery`, `Capacity`, `Lifecycle`,
+  `CapAuthority`, `Minter`, `TelemetrySink`), the logical channel `Envelope`, and
+  the shared contract-test harness (feature `contract-tests`) every impl passes.
+  No impls. See `docs/decisions/agent-fabric.md`.
 
 ## Build & test (run before committing)
 
@@ -71,6 +76,7 @@ Commit with a Conventional Commits title.
 crates/
   ├─ sandy/          - deep library behind a curated facade (seam, journal, result, topology, …)
   ├─ sandy-backend/  - native VmBackend impls: QemuBackend (Linux) + VfkitBackend (macOS)
+  ├─ sandy-fabric/   - agent-fabric seam traits + shared contract-test harness (no impls)
   └─ sandy-cli/      - the `sandy` binary (doctor, run/ls/status/wait/kill/gc, cred github …)
 nix/
   ├─ packages/       - crane build definitions
