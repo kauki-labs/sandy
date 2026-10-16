@@ -106,7 +106,7 @@ async fn the_all_local_profile_passes_its_own_gate() -> anyhow::Result<()> {
 /// fails the gate. `SnapshotBackend` is a `stream_from` that ends instead of
 /// following live appends.
 #[tokio::test(flavor = "multi_thread")]
-async fn gate_rejects_a_broken_channel_backend_even_though_its_slot_is_real() {
+async fn gate_rejects_a_broken_channel_backend_even_though_its_slot_is_real() -> anyhow::Result<()> {
     let result = validate_profile(
         FakeAuthority::new,
         FakeMinter::new,
@@ -124,12 +124,15 @@ async fn gate_rejects_a_broken_channel_backend_even_though_its_slot_is_real() {
         FakeSink::captured,
     )
     .await;
-    let violation = result.expect_err("a stream that ends instead of following must fail the gate");
+    let violation = result
+        .err()
+        .context("a stream that ends instead of following must fail the gate")?;
     assert!(
         violation.rule.contains("the stream ended"),
         "violated `{}`, expected the live-follow rule",
         violation.rule
     );
+    Ok(())
 }
 
 /// Adversarial: swapping a still-PLACEHOLDER seam (`CapAuthority`) for a
@@ -138,7 +141,7 @@ async fn gate_rejects_a_broken_channel_backend_even_though_its_slot_is_real() {
 /// yet. `NonAttenuatingAuthority` hands back the parent cap unchanged instead
 /// of narrowing it.
 #[tokio::test(flavor = "multi_thread")]
-async fn gate_rejects_a_broken_cap_authority_even_though_its_slot_is_a_placeholder() {
+async fn gate_rejects_a_broken_cap_authority_even_though_its_slot_is_a_placeholder() -> anyhow::Result<()> {
     let result = validate_profile(
         || NonAttenuatingAuthority(FakeAuthority::new()),
         FakeMinter::new,
@@ -156,12 +159,15 @@ async fn gate_rejects_a_broken_cap_authority_even_though_its_slot_is_a_placehold
         FakeSink::captured,
     )
     .await;
-    let violation = result.expect_err("attenuation that doesn't narrow rights must fail the gate");
+    let violation = result
+        .err()
+        .context("attenuation that doesn't narrow rights must fail the gate")?;
     assert!(
         violation.rule.contains("narrowed rights"),
         "violated `{}`, expected the narrowed-rights rule",
         violation.rule
     );
+    Ok(())
 }
 
 /// INV-1 holds through the real Executor dispatch path: a secret referenced by
@@ -197,12 +203,18 @@ async fn inv1_holds_through_the_real_executor_dispatch_path() -> anyhow::Result<
         agent: false,
         shares: false,
     };
-    // Compares the secret in-shell and echoes only a pass/fail marker, never the
-    // raw value, then dumps env: proves the secret channel actually delivers the
-    // right bytes (not just that nothing happens to leak) alongside the INV-1
-    // no-leak check below.
-    let script = format!(r#"if [ "$(cat "$SANDY_SECRETS_DIR/TOKEN")" = "{MARKER}" ]; then echo SECRET_MATCH; fi; env"#);
-    let command = ["sh".to_owned(), "-c".to_owned(), script];
+    // Prints the staged file's byte length (never its content) plus an env
+    // dump: the length, checked against MARKER.len() in Rust below, confirms
+    // the secret channel actually delivers the right bytes (not just that
+    // nothing happens to leak), while the comparison value itself never
+    // appears in the script — embedding MARKER in the command string would put
+    // it on this process's own argv, the exact leak INV-1 rules out, in the
+    // test meant to prove INV-1 holds.
+    let command = [
+        "sh".to_owned(),
+        "-c".to_owned(),
+        r#"echo "SECRET_LEN=$(wc -c < "$SANDY_SECRETS_DIR/TOKEN")"; env"#.to_owned(),
+    ];
     let spec = RunSpec {
         template: "contract",
         command: &command,
@@ -221,8 +233,8 @@ async fn inv1_holds_through_the_real_executor_dispatch_path() -> anyhow::Result<
     let outcome = executor.run(&spec).await.context("dispatch through the real adapter")?;
     assert_eq!(outcome.guest_exit, Some(0), "the job ran: {:?}", outcome.console);
     assert!(
-        outcome.console.contains("SECRET_MATCH"),
-        "the job must read the correct secret value via SANDY_SECRETS_DIR, got {:?}",
+        outcome.console.contains(&format!("SECRET_LEN={}", MARKER.len())),
+        "the job must read exactly the staged secret's byte length via SANDY_SECRETS_DIR, got {:?}",
         outcome.console
     );
     assert!(
