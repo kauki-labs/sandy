@@ -2021,6 +2021,7 @@ dependencies = [
  "clap",
  "octocrab",
  "rstest",
+ "sandy-api",
  "sandy-backend",
  "sandy-lib",
  "sandy-test-support",

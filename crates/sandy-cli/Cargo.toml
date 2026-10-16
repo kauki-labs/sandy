@@ -17,21 +17,41 @@ categories = ["command-line-utilities", "virtualization", "development-tools"]
 name = "sandy"
 path = "src/main.rs"
 
+# The no-hypervisor acceptance capstone (#131 R4b): ungated, builds and runs in
+# every default CI run.
+[[bin]]
+name = "acceptance-local"
+path = "src/bin/acceptance_local.rs"
+
+# The VM acceptance capstone: needs a real hypervisor, so it is feature-gated off
+# by default — `required-features` means cargo skips building it unless `--features
+# live` is passed, matching the `live`-gated test suites.
+[[bin]]
+name = "acceptance-vm"
+path = "src/bin/acceptance_vm.rs"
+required-features = ["live"]
+
 [lints]
 workspace = true
 
 [features]
-# The live_boot / host_matrix live acceptance gates (tier-3, #26/#27). Off by default so
-# CI and `nix flake check` never try to boot a VM; enable on the live host.
-live = []
+# The live_boot / host_matrix live acceptance gates (tier-3, #26/#27), and the
+# acceptance-vm binary above. Off by default so CI and `nix flake check` never try
+# to boot a VM; enable on the live host. Pulls in `anyhow` for `live_target`'s
+# error type, kept optional so a non-live build carries no new dependency.
+live = ["dep:anyhow"]
 
 [dependencies]
+anyhow = { workspace = true, optional = true }
 clap.workspace = true
 octocrab.workspace = true
 sandy.workspace = true
 # The CLI runs real VMs, so it pulls the VM backend impls in (impl-local stays on
 # by default); a local-only consumer of sandy-backend would omit impl-vm.
 sandy-backend = { workspace = true, features = ["impl-vm"] }
+# The generic seam contract-test harness the acceptance binaries run the real
+# impls against (#131 R4b).
+sandy-api = { workspace = true, features = ["acceptance"] }
 serde.workspace = true
 serde_json.workspace = true
 tiny_http.workspace = true

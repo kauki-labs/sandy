@@ -9,10 +9,19 @@
 //!
 //! R0 floor: the run-plane contract ([`backend`]) and the LOCKED result envelope
 //! and classification types ([`result`]). Remaining seams move in later nodes.
+//!
+//! With the `acceptance` feature, [`contract`] exposes one `*_suite` per
+//! run-plane seam (`VmBackend`, `GuestShareTransport`, `EgressApplier`) that any
+//! impl, trivial or real, runs itself against — the fake-free capstone harness
+//! (#131 R4b). This is a different contract crate/feature from `sandy-fabric`'s
+//! `contract-tests`: that one covers the agent-fabric seams over `sandy-proto`
+//! (a separate epic, #103/#104); this one covers the current sandbox run plane.
 
 pub mod backend;
 pub mod console;
 pub mod containment;
+#[cfg(any(test, feature = "acceptance"))]
+pub mod contract;
 pub mod cred;
 pub mod discovery;
 pub mod egress;
