@@ -8,12 +8,13 @@
 //! the guest. Nothing travels on argv, in the environment, or through the store.
 
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{self, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
 
+use rustix::fs::{AtFlags, Mode, OFlags};
 use sandy_api::backend::{SecretRef, SecretSource};
 use sandy_fabric::{
     capauth::{Cap, encode_cap},
@@ -73,6 +74,10 @@ pub enum StageError {
 /// not be group- or world-writable; otherwise another principal could replace the
 /// staged file with a symlink to one of this user's files. It must not be inside
 /// the Nix store.
+///
+/// `dir` is opened once and everything after is relative to that handle: the
+/// owner and mode check, the create, the rename and the sync. A path swapped
+/// after the check cannot redirect the write.
 pub fn stage_secret(dir: &Path, name: &str, bytes: &[u8]) -> Result<SecretRef, StageError> {
     let mut chars = name.chars();
     let valid = chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
@@ -94,25 +99,44 @@ pub fn stage_secret(dir: &Path, name: &str, bytes: &[u8]) -> Result<SecretRef, S
     if dir.starts_with(store) {
         return Err(StageError::InStore(dir));
     }
-    let meta = fs::metadata(&dir).map_err(io_err(&dir))?;
+    let handle: File = rustix::fs::open(
+        &dir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|e| StageError::Io {
+        path: dir.clone(),
+        source: e.into(),
+    })?;
+    let meta = handle.metadata().map_err(io_err(&dir))?;
     if meta.uid() != rustix::process::getuid().as_raw() || meta.mode() & 0o022 != 0 {
         return Err(StageError::UnsafeDir(dir));
     }
 
     let dest = dir.join(name);
-    let tmp = dir.join(format!(".{name}.{}.staging", unique_suffix().map_err(io_err(&dir))?));
-    if let Err(source) = write_0600(&tmp, bytes) {
+    let tmp = format!(".{name}.{}.staging", unique_suffix().map_err(io_err(&dir))?);
+    let discard_tmp = || {
         // Best effort: the original error is the one worth reporting.
-        let _ = fs::remove_file(&tmp);
-        return Err(StageError::Io { path: tmp, source });
+        let _ = rustix::fs::unlinkat(&handle, tmp.as_str(), AtFlags::empty());
+    };
+    if let Err(source) = write_0600_at(&handle, &tmp, bytes) {
+        discard_tmp();
+        return Err(StageError::Io {
+            path: dir.join(&tmp),
+            source,
+        });
     }
-    if let Err(source) = fs::rename(&tmp, &dest) {
-        let _ = fs::remove_file(&tmp);
-        return Err(StageError::Io { path: dest, source });
+    if let Err(e) = rustix::fs::renameat(&handle, tmp.as_str(), &handle, name) {
+        discard_tmp();
+        return Err(StageError::Io {
+            path: dest,
+            source: e.into(),
+        });
     }
-    if let Err(source) = File::open(&dir).and_then(|d| d.sync_all()) {
+    if let Err(source) = handle.sync_all() {
         // Not durable, and the caller gets no SecretRef to clean up with: remove it.
-        let _ = fs::remove_file(&dest);
+        let _ = rustix::fs::unlinkat(&handle, name, AtFlags::empty());
         return Err(StageError::Io { path: dir, source });
     }
     Ok(SecretRef {
@@ -150,12 +174,19 @@ fn unique_suffix() -> io::Result<String> {
     Ok(raw.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Create `path` as a new `0600` file holding `bytes`, synced to disk. `create_new`
-/// refuses anything already at `path`, including a planted symlink.
+/// Create `name` in the directory `dir` as a new `0600` file holding `bytes`,
+/// synced to disk. `O_EXCL` with `O_NOFOLLOW` refuses anything already there,
+/// including a planted symlink.
 // SECURITY: keep in sync with `sandy::cred::write_secret_0600`; both move to one
 // shared writer in #174.
-fn write_0600(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
+fn write_0600_at(dir: &File, name: &str, bytes: &[u8]) -> io::Result<()> {
+    let fd = rustix::fs::openat(
+        dir,
+        name,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )?;
+    let mut file = File::from(fd);
     file.write_all(bytes)?;
     file.sync_all()
 }
