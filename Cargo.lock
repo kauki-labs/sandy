@@ -2009,7 +2009,34 @@ dependencies = [
  "sandy-impls-local",
  "sandy-impls-vm",
  "sandy-lib",
+ "sandy-test-support",
  "tempfile",
+]
+
+[[package]]
+name = "sandy-lib"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "fs2",
+ "hex",
+ "insta",
+ "jsonwebtoken",
+ "libc",
+ "minisign-verify",
+ "octocrab",
+ "rstest",
+ "rustix",
+ "sandy-api",
+ "sandy-test-support",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -2022,6 +2049,7 @@ dependencies = [
  "rstest",
  "sandy-backend",
  "sandy-lib",
+ "sandy-test-support",
  "serde",
  "serde_json",
  "tempfile",
@@ -2053,6 +2081,7 @@ dependencies = [
  "command-group",
  "sandy-api",
  "sandy-lib",
+ "sandy-test-support",
  "tempfile",
  "tracing",
  "uuid",
@@ -2106,6 +2135,13 @@ dependencies = [
  "protox",
  "rstest",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "sandy-test-support"
+version = "0.1.1"
+dependencies = [
+ "sandy-api",
 ]
 
 [[package]]

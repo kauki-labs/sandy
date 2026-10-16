@@ -601,9 +601,10 @@ mod tests {
 
     use anyhow::Context;
     use sandy::{
-        AllowList, BackendError, CredentialProvider, CredentialSource, EgressApplier, EgressError, EgressOs,
-        FakeApplier, FakeBackend, Grants, Journal, Outcome, ProcessExit, Profile, Scope,
+        AllowList, BackendError, CredentialProvider, CredentialSource, EgressApplier, EgressError, EgressOs, Grants,
+        Journal, Outcome, ProcessExit, Profile, Scope,
     };
+    use sandy_test_support::{FakeApplier, FakeBackend};
 
     use super::run_job;
     use crate::plan::JobPlan;
@@ -852,7 +853,8 @@ mod tests {
             time::Duration,
         };
 
-        use sandy::{FakeProvider, Scope, mint_lease};
+        use sandy::{Scope, mint_lease};
+        use sandy_test_support::FakeProvider;
 
         let tmp = tempfile::tempdir().context("tmp")?;
         let provider = FakeProvider::returning("tok");
@@ -904,7 +906,8 @@ mod tests {
     fn a_panic_during_the_run_still_revokes_and_removes_the_token() -> anyhow::Result<()> {
         use std::panic::{AssertUnwindSafe, catch_unwind};
 
-        use sandy::{FakeProvider, MAX_TTL_SECS, Scope};
+        use sandy::{MAX_TTL_SECS, Scope};
+        use sandy_test_support::FakeProvider;
 
         use super::run_job_with_credential;
 

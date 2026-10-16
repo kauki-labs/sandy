@@ -1,6 +1,6 @@
 //! Tier-2 integration tests (sandbox-runnable): journal / reconcile /
 //! collection flows against fixtures on a generic POSIX FS. No hypervisor —
-//! the backend is [`FakeBackend`], `$SANDY_HOME` is a `TempDir`.
+//! the backend is `FakeBackend`, `$SANDY_HOME` is a `TempDir`.
 //!
 //! These cover the Block 4 verification and adversarial rows.
 
@@ -8,9 +8,10 @@ use std::time::SystemTime;
 
 use anyhow::Context;
 use sandy::{
-    BackendError, BoxState, CollectionConfig, FakeBackend, JobRecord, JobState, Journal, Logs, Outcome, OutputRef,
-    OutputSpec, Provenance, RESULT_SCHEMA_VERSION, ResultEnvelope, RunSpec, Status, VmBackend, collect, reconcile_job,
+    BackendError, BoxState, CollectionConfig, JobRecord, JobState, Journal, Logs, Outcome, OutputRef, OutputSpec,
+    Provenance, RESULT_SCHEMA_VERSION, ResultEnvelope, RunSpec, Status, VmBackend, collect, reconcile_job,
 };
+use sandy_test_support::FakeBackend;
 
 const CAP: u64 = 1 << 20;
 

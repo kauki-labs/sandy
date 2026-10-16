@@ -630,7 +630,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use anyhow::Context;
-    use sandy::{CredentialProvider, CredentialSource, EgressOs, FakeApplier, FakeBackend, Outcome, Profile, Target};
+    use sandy::{CredentialProvider, CredentialSource, EgressOs, Outcome, Profile, Target};
+    use sandy_test_support::{FakeApplier, FakeBackend};
 
     use super::*;
 

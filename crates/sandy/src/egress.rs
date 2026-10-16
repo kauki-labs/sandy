@@ -8,13 +8,11 @@
 //!
 //! [`plan_egress`] turns an [`AllowList`] plus a target [`EgressOs`] into a typed
 //! [`EgressPlan`] (pure, OS injected, so it unit-tests without a real OS), and
-//! [`enforce`] drives that plan over the [`EgressApplier`] seam — [`FakeApplier`]
-//! in tests, [`NftablesApplier`] (shells `nft -f -`) on a real Linux host. The
-//! live Linux enforcement — the real `nft` load whose boundary an in-guest root
-//! flush cannot bypass — is tier-3 and is asserted by `cargo test --test live_egress`
-//! (#29); it is not exercised here.
-
-use std::cell::{Cell, RefCell};
+//! [`enforce`] drives that plan over the [`EgressApplier`] seam — `FakeApplier`
+//! (now in `sandy-test-support`) in tests, [`NftablesApplier`] (shells `nft -f -`)
+//! on a real Linux host. The live Linux enforcement — the real `nft` load whose
+//! boundary an in-guest root flush cannot bypass — is tier-3 and is asserted by
+//! `cargo test --test live_egress` (#29); it is not exercised here.
 
 pub use sandy_api::egress::{AllowList, EgressApplier, EgressError, EgressOs, EgressOutcome, EgressPlan, EgressRule};
 
@@ -211,46 +209,6 @@ pub fn plan_egress_scoped(allow: &AllowList, target_os: EgressOs, iface: Option<
     }
 }
 
-/// A test double that records what it was asked to apply and whether it was
-/// reverted, instead of touching the host.
-#[derive(Debug, Default)]
-pub struct FakeApplier {
-    applied: RefCell<Vec<String>>,
-    reverted: Cell<bool>,
-}
-
-impl FakeApplier {
-    /// A fresh double that has applied nothing and not been reverted.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// The rulesets passed to [`EgressApplier::apply`], in call order.
-    #[must_use]
-    pub fn applied_rulesets(&self) -> Vec<String> {
-        self.applied.borrow().clone()
-    }
-
-    /// Whether [`EgressApplier::revert`] has been called.
-    #[must_use]
-    pub fn was_reverted(&self) -> bool {
-        self.reverted.get()
-    }
-}
-
-impl EgressApplier for FakeApplier {
-    fn apply(&self, ruleset: &str) -> Result<(), EgressError> {
-        self.applied.borrow_mut().push(ruleset.to_string());
-        Ok(())
-    }
-
-    fn revert(&self) -> Result<(), EgressError> {
-        self.reverted.set(true);
-        Ok(())
-    }
-}
-
 /// Host-tier applier that loads the ruleset into the Linux kernel via `nft -f -`
 /// and reverts by deleting the [`EGRESS_TABLE`].
 ///
@@ -318,9 +276,11 @@ pub fn enforce<A: EgressApplier + ?Sized>(plan: &EgressPlan, applier: &A) -> Res
 
 #[cfg(test)]
 mod tests {
+    use sandy_test_support::FakeApplier;
+
     use super::{
-        AllowList, EgressOs, EgressOutcome, EgressPlan, EgressRule, FakeApplier, enforce, macos_egress_statement,
-        plan_egress, plan_egress_scoped, to_nftables, to_nftables_forward,
+        AllowList, EgressOs, EgressOutcome, EgressPlan, EgressRule, enforce, macos_egress_statement, plan_egress,
+        plan_egress_scoped, to_nftables, to_nftables_forward,
     };
 
     /// D-REQ-3 (positive translation): each allowed `host:port` appears in the

@@ -28,10 +28,11 @@ use std::{
 use anyhow::{Context, bail};
 use common::{build_guest, guest_flake, require_live};
 use sandy::{
-    AllowList, CredError, CredentialHandle, CredentialProvider, EgressOs, FakeApplier, Grants, Journal, Lease,
-    MAX_TTL_SECS, Minted, Scope, Status,
+    AllowList, CredError, CredentialHandle, CredentialProvider, EgressOs, Grants, Journal, Lease, MAX_TTL_SECS, Minted,
+    Scope, Status,
 };
 use sandy_cli::{plan::JobPlan, supervisor::run_job_with_credential};
+use sandy_test_support::FakeApplier;
 
 /// A provider whose every mint and refresh yields a fresh, distinct token, so the
 /// guest can observe the staged file change across a refresh without a real forge.

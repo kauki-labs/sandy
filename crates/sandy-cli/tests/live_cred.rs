@@ -32,10 +32,11 @@ use std::{
 use anyhow::{Context, bail};
 use common::{build_guest, guest_flake, require_live};
 use sandy::{
-    AllowList, CredError, CredentialHandle, CredentialProvider, EgressOs, FakeApplier, FakeProvider, Grants, Input,
-    Journal, Lease, MAX_TTL_SECS, Minted, Output, Scope, SecretRef, SecretSource, Status,
+    AllowList, CredError, CredentialHandle, CredentialProvider, EgressOs, Grants, Input, Journal, Lease, MAX_TTL_SECS,
+    Minted, Output, Scope, SecretRef, SecretSource, Status,
 };
 use sandy_cli::{plan::JobPlan, supervisor::run_job_with_credential};
+use sandy_test_support::{FakeApplier, FakeProvider};
 
 /// A provider whose every mint/refresh yields a fresh, distinct token, and that
 /// records every revoked handle, so the e2e can assert the guest saw the token

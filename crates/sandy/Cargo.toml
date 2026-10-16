@@ -44,6 +44,7 @@ jsonwebtoken.workspace = true
 anyhow.workspace = true
 insta.workspace = true
 rstest.workspace = true
+sandy-test-support.workspace = true
 tempfile.workspace = true
 octocrab.workspace = true
 tokio.workspace = true
