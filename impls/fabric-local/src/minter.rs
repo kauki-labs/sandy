@@ -111,8 +111,8 @@ pub fn stage_secret(dir: &Path, name: &str, bytes: &[u8]) -> Result<SecretRef, S
 /// reaches the guest. The cap is staged on its own, as JSON; a work-secret is a
 /// separate staged secret, never bundled into the cap.
 pub fn stage_cap(dir: &Path, name: &str, cap: &Cap) -> Result<SecretRef, StageError> {
-    let _ = (dir, name, cap);
-    Err(StageError::Encode("not implemented".to_owned()))
+    let encoded = serde_json::to_vec(cap).map_err(|e| StageError::Encode(e.to_string()))?;
+    stage_secret(dir, name, &encoded)
 }
 
 /// Create `path` as a fresh `0600` file holding `bytes`, synced to disk. A stale
