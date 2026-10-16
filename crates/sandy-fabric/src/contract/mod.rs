@@ -43,8 +43,13 @@ use crate::{
     types::{HostId, PeerId},
 };
 
-#[cfg(test)]
-mod fakes;
+/// Reference and deliberately-broken seam impls. Proves the harness itself (the
+/// crate's own tests) and, under `contract-tests`, gives a downstream impl crate
+/// reference fixtures to compose placeholders against while a real impl for
+/// that seam hasn't landed yet — never a dependency of this crate's own
+/// production code, only of a caller that explicitly opts into the feature.
+#[cfg(any(test, feature = "contract-tests"))]
+pub mod fakes;
 #[cfg(test)]
 mod verify;
 

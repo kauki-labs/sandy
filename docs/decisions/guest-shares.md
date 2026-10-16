@@ -249,11 +249,12 @@ by a same-user job (it mirrors the vfkit RO asymmetry, §2), and a process that
 escapes its group can leave a host orphan.
 
 **Set aside (do not re-propose without new information).** Namespace-faithful
-`/run/sandy/...` paths for the process profile (a mount-namespace bind-mount): it is
-Linux-only, needs privilege/namespace machinery, and is deferred to **#135** (the
-same cgroup/jail containment gate as full descendant reaping — the process backend
-must not run real untrusted jobs until #135 lands). Folding host-side RO into a hard
-boundary is likewise a #135 concern, not the cooperative MVP.
+`/run/sandy/...` paths for the process profile (a mount-namespace bind-mount) and a
+hard (non-cooperative) read-only boundary: **delivered in #142** via a `bwrap` mount
+namespace when it is available (see `process-containment.md` §5). The cooperative RO
+and `SANDY_*_DIR` host paths described above remain the fallback when bwrap/userns are
+absent. The process backend still must not run untrusted jobs: #142 is confinement
+hardening, not the untrusted gate-flip (tracked in #150).
 
 ## 12. Host staging base validated before use (CWE-732)
 

@@ -22,34 +22,52 @@
 
 use std::process::{Command, Stdio};
 
-use sandy::{BackendError, Containment, ContainmentStatus, ResourceLimits};
+use sandy::{BackendError, Containment, ContainmentStatus, Mount, ResourceLimits};
 
-/// Host containment via `systemd-run --user --scope` over cgroup v2. Its
-/// [`status`](Containment::status) is probed once at [`detect`](SystemdRunContainment::detect)
-/// and cached, so per-run calls do no IO.
+/// Host containment via `systemd-run --user --scope` over cgroup v2, optionally
+/// composed with a `bwrap` mount namespace for path-faithful shares, hard read-only,
+/// and user-bus hiding (#142). Both capabilities are probed once at
+/// [`detect`](SystemdRunContainment::detect) and cached, so per-run calls do no IO.
+///
+/// `confines` (the bwrap layer) is a confinement-feature flag only: it does NOT make
+/// the status an untrusted boundary (`isolates_untrusted` stays false — the job can
+/// still read the host rootfs under the A1 `--ro-bind / /` and the net namespace is
+/// shared). The untrusted gate-flip decision is tracked in #150.
 #[derive(Debug, Clone)]
 pub struct SystemdRunContainment {
     status: ContainmentStatus,
+    confines: bool,
 }
 
 impl SystemdRunContainment {
-    /// Probe host containment once and cache the verdict. On a non-Linux host this
-    /// is [`ContainmentStatus::Unsupported`] without probing; on Linux it runs a
-    /// throwaway `systemd-run --user --scope -- true` (cleaned up by `--collect`) —
-    /// the honest capability test — and reports [`ContainmentStatus::Available`] on
-    /// success, else [`ContainmentStatus::Unavailable`] with the reason.
+    /// Probe host containment once and cache the verdict. On a non-Linux host the
+    /// status is [`ContainmentStatus::Unsupported`] without probing; on Linux it runs
+    /// a throwaway `systemd-run --user --scope -- true` (cleaned up by `--collect`)
+    /// for reaping, and a throwaway `bwrap … -- true` for the mount-namespace layer
+    /// (unprivileged user namespaces may be disabled by sysctl/AppArmor). `confines`
+    /// is set only when both pass.
     #[must_use]
     pub fn detect() -> Self {
+        let status = detect_status();
+        let confines = status.is_available() && detect_bwrap_confinement();
+        Self { status, confines }
+    }
+
+    /// Build a containment from an already-known status, reaping-only (no bwrap).
+    /// For `sandy doctor` and tests.
+    #[must_use]
+    pub fn from_status(status: ContainmentStatus) -> Self {
         Self {
-            status: detect_status(),
+            status,
+            confines: false,
         }
     }
 
-    /// Build a containment from an already-known status (for `sandy doctor`, which
-    /// probes once and reuses the verdict).
+    /// Build a containment with both the status and the bwrap-confinement flag set
+    /// explicitly (tests exercise the confining `wrap` path without a real bwrap).
     #[must_use]
-    pub fn from_status(status: ContainmentStatus) -> Self {
-        Self { status }
+    pub fn from_parts(status: ContainmentStatus, confines: bool) -> Self {
+        Self { status, confines }
     }
 }
 
@@ -58,14 +76,33 @@ impl Containment for SystemdRunContainment {
         self.status.clone()
     }
 
-    fn wrap(&self, id: &str, limits: ResourceLimits) -> Vec<String> {
+    fn wrap(&self, id: &str, limits: ResourceLimits, mounts: &[Mount]) -> Vec<String> {
         // Only wrap when containment is actually available; otherwise run directly
         // (the backend's existing best-effort group-reap still applies, and an
         // untrusted job never reaches here — the gate refused it upstream).
         if !self.status.is_available() {
             return Vec::new();
         }
-        systemd_run_prefix(id, limits)
+        let mut cmd = scope_prefix(id, limits);
+        if self.confines {
+            // bwrap inside the scope: path-faithful shares, hard RO, user-bus hidden
+            // (#142). bwrap's `--unsetenv` handles the bus-env strip the non-confining
+            // path does with `env -u`.
+            cmd.extend(bwrap_segment(mounts));
+        } else {
+            // No mount namespace: strip the wrapper's bus env from the job (the #135
+            // defence-in-depth), then exec the job directly in the scope.
+            cmd.push("env".to_string());
+            for key in WRAPPER_BUS_ENV {
+                cmd.push("-u".to_string());
+                cmd.push(key.to_string());
+            }
+        }
+        cmd
+    }
+
+    fn confines_filesystem(&self) -> bool {
+        self.confines
     }
 
     fn passthrough_env(&self) -> Vec<String> {
@@ -130,11 +167,23 @@ fn scope_unit(id: &str) -> String {
     format!("sandy-{id}.scope")
 }
 
-/// The `systemd-run --user --scope` launch prefix (pure). The caller appends the
-/// real program and args after the trailing `--`. `Delegate=yes` gives the scope a
-/// delegated cgroup subtree so the whole tree is reaped on `stop`; the optional
-/// `MemoryMax`/`CPUQuota` bound the run's resources.
-fn systemd_run_prefix(id: &str, limits: ResourceLimits) -> Vec<String> {
+/// The faithful in-namespace root the shares are bound under, matching the VM's
+/// fixed mount paths (`/run/sandy/{inputs,outputs,secrets}`).
+const SANDY_RUN_DIR: &str = "/run/sandy";
+
+/// The namespaces the confined job runs in (net is deliberately NOT unshared —
+/// egress is a separate seam). Shared by [`bwrap_segment`] and the capability probe
+/// [`detect_bwrap_confinement`] so the probe tests the EXACT set the real wrapper
+/// uses: a host that accepts the probe cannot then reject the wrapper's namespaces
+/// (which would surface a setup failure as a task exit, violating INV-11).
+const UNSHARE_FLAGS: [&str; 4] = ["--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup"];
+
+/// The `systemd-run --user --scope` launch prefix through the trailing `--` (pure).
+/// `Delegate=yes` gives the scope a delegated cgroup subtree so the whole tree is
+/// reaped on `stop`; the optional `MemoryMax`/`CPUQuota` bound the run's resources.
+/// What follows the `--` (a `bwrap` segment, or a bus-env strip + the job) is chosen
+/// by [`SystemdRunContainment::wrap`].
+fn scope_prefix(id: &str, limits: ResourceLimits) -> Vec<String> {
     let mut prefix = vec![
         "systemd-run".to_string(),
         "--user".to_string(),
@@ -154,16 +203,74 @@ fn systemd_run_prefix(id: &str, limits: ResourceLimits) -> Vec<String> {
         prefix.push(format!("--property=CPUQuota={}%", cpu.saturating_mul(100)));
     }
     prefix.push("--".to_string());
-    // Strip the wrapper's user-bus env from the JOB (defence in depth, CWE-269): the
-    // scope inherits systemd-run's env, so without this the job could read the bus
-    // address and spawn units outside the scope. `env -u` unsets them before exec'ing
-    // the job; `env` resolves via the PATH the backend keeps.
-    prefix.push("env".to_string());
-    for key in WRAPPER_BUS_ENV {
-        prefix.push("-u".to_string());
-        prefix.push(key.to_string());
-    }
     prefix
+}
+
+/// The `bwrap` segment (through its trailing `--`) that confines the job in a mount
+/// namespace (#142): the host rootfs read-only (A1, so host binaries resolve), fresh
+/// `/dev` + `/proc`, the user-session bus hidden (a fresh tmpfs over the whole `/run`
+/// plus unsetting the bus env, so the job cannot reach the user systemd manager), and
+/// each share bound at its faithful `/run/sandy/<tag>` path — read-only for
+/// inputs/secrets, writable for outputs. Non-net namespaces are unshared (net stays
+/// shared; egress is a separate concern). Pure, so the exact argv is unit-testable.
+///
+/// `/run` itself, not just `/run/user`, must be the tmpfs: under `--ro-bind / /` the
+/// whole host tree (including `/run`) is read-only, so bwrap cannot `mkdir` the
+/// `/run/sandy` mountpoint it needs to create — every confined job died in under a
+/// second with `Can't mkdir /run/sandy: Read-only file system` until this fix (caught
+/// by the ws01 live run). A writable `/run` gives it somewhere to mkdir into, and
+/// /run/user is then simply absent, so the bus-hide falls out for free (no separate
+/// `/run/user` tmpfs needed).
+///
+/// NOTE: A1 `--ro-bind / /` leaves the host filesystem READABLE to the job, so this
+/// is write-confinement + reaping + bus-hide, not read-confidentiality — hence
+/// `isolates_untrusted` stays false (#150).
+fn bwrap_segment(mounts: &[Mount]) -> Vec<String> {
+    let mut seg = vec![
+        "bwrap".to_string(),
+        "--ro-bind".to_string(),
+        "/".to_string(),
+        "/".to_string(),
+        "--dev".to_string(),
+        "/dev".to_string(),
+        "--proc".to_string(),
+        "/proc".to_string(),
+        // Ephemeral writable /tmp: `--ro-bind / /` makes the host /tmp read-only, so a
+        // job using the default temp dir would fail without this (it ran on the
+        // non-confined path). Fresh tmpfs, not the host staging.
+        "--tmpfs".to_string(),
+        "/tmp".to_string(),
+        // A clean writable /run: gives bwrap a writable parent to mkdir /run/sandy
+        // under (the read-only rootfs otherwise blocks it), and hides the user
+        // session bus for free (/run/user no longer exists under a fresh /run).
+        "--tmpfs".to_string(),
+        "/run".to_string(),
+        "--unsetenv".to_string(),
+        "XDG_RUNTIME_DIR".to_string(),
+        "--unsetenv".to_string(),
+        "DBUS_SESSION_BUS_ADDRESS".to_string(),
+        // A clean writable mountpoint for the faithful share paths, independent of
+        // the read-only host /run.
+        "--tmpfs".to_string(),
+        SANDY_RUN_DIR.to_string(),
+    ];
+    for m in mounts {
+        seg.push(if m.readonly {
+            "--ro-bind".to_string()
+        } else {
+            "--bind".to_string()
+        });
+        seg.push(m.host.display().to_string());
+        seg.push(m.guest.display().to_string());
+    }
+    seg.extend(UNSHARE_FLAGS.iter().map(|s| (*s).to_string()));
+    seg.extend([
+        "--die-with-parent".to_string(),
+        "--chdir".to_string(),
+        "/".to_string(),
+        "--".to_string(),
+    ]);
+    seg
 }
 
 /// Probe the host containment capability (see [`SystemdRunContainment::detect`]).
@@ -213,16 +320,59 @@ fn detect_status() -> ContainmentStatus {
     }
 }
 
+/// Probe whether `bwrap` can open an unprivileged mount namespace here (#142). Runs
+/// the EXACT [`bwrap_segment`] argv a real job would get (no shares — `&[]` needs no
+/// live host dirs), so the capability verdict matches precisely what `wrap()` will
+/// attempt: every mount (`--proc`, the three `--tmpfs`s), every `--unsetenv`, and the
+/// full [`UNSHARE_FLAGS`] set. Probe/wrapper divergence here is the dangerous case —
+/// a host that passes a narrower probe but rejects one of these (an LSM/seccomp
+/// policy blocking a `--tmpfs` or the `/proc` remount, say) would make
+/// `confines_filesystem()` report `true` while every subsequently wrapped job's
+/// `bwrap` fails before `exec`, which `run_staged` cannot distinguish from an
+/// ordinary nonzero guest exit (the INV-11 misclassification this probe exists to
+/// prevent; see also the #153 sentinel for the complementary run-time case). Sharing
+/// the literal argv-builder, not just a namespace-flag constant, closes the whole
+/// class by construction — any future change to `bwrap_segment` changes the probe
+/// too. Unprivileged user namespaces can also be disabled wholesale
+/// (`kernel.unprivileged_userns_clone=0`); on any failure the confinement features
+/// stay off and the backend keeps its `SANDY_*_DIR` + cooperative read-only fallback.
+/// Non-Linux never confines.
+fn detect_bwrap_confinement() -> bool {
+    if !cfg!(target_os = "linux") {
+        return false;
+    }
+    Command::new("bwrap")
+        .args(bwrap_probe_args())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// The argv [`detect_bwrap_confinement`] runs (pure, so the probe/wrapper parity is
+/// unit-testable without a real `bwrap`): [`bwrap_segment`]'s flags with no shares
+/// (`&[]` needs no live host dirs) minus its leading literal `"bwrap"` token (spliced
+/// after `systemd-run`'s `--`; `Command::new("bwrap")` already names the binary),
+/// plus the probe's trivial `true` target command.
+fn bwrap_probe_args() -> Vec<String> {
+    let mut args = bwrap_segment(&[]);
+    args.remove(0);
+    args.push("true".to_string());
+    args
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The wrap prefix (pure) is the exact `systemd-run --user --scope` invocation,
-    /// names the deterministic scope unit, and ends by stripping the wrapper's bus env
-    /// from the inner job (`env -u …`).
+    /// The scope prefix (pure) is the exact `systemd-run --user --scope` invocation
+    /// through the trailing `--`, naming the deterministic scope unit. What follows
+    /// the `--` is chosen by `wrap` (bwrap, or a bus-env strip).
     #[test]
-    fn wrap_prefix_is_the_systemd_run_scope_invocation() {
-        let prefix = systemd_run_prefix("run-abc", ResourceLimits::default());
+    fn scope_prefix_is_the_systemd_run_scope_invocation() {
+        let prefix = scope_prefix("run-abc", ResourceLimits::default());
         assert_eq!(
             prefix,
             vec![
@@ -234,11 +384,6 @@ mod tests {
                 "--unit=sandy-run-abc.scope",
                 "--property=Delegate=yes",
                 "--",
-                "env",
-                "-u",
-                "XDG_RUNTIME_DIR",
-                "-u",
-                "DBUS_SESSION_BUS_ADDRESS",
             ]
         );
     }
@@ -246,8 +391,8 @@ mod tests {
     /// Resource limits map to cgroup properties: MiB → MemoryMax, whole cores →
     /// CPUQuota as a percentage of one core.
     #[test]
-    fn wrap_prefix_includes_resource_limits() {
-        let prefix = systemd_run_prefix(
+    fn scope_prefix_includes_resource_limits() {
+        let prefix = scope_prefix(
             "run-1",
             ResourceLimits {
                 cpu: Some(2),
@@ -269,7 +414,8 @@ mod tests {
     #[test]
     fn unavailable_containment_does_not_wrap_or_fail_to_reap() {
         let c = SystemdRunContainment::from_status(ContainmentStatus::Unavailable("test".to_string()));
-        assert!(c.wrap("run-1", ResourceLimits::default()).is_empty());
+        assert!(c.wrap("run-1", ResourceLimits::default(), &[]).is_empty());
+        assert!(!c.confines_filesystem());
         assert!(c.reap("run-1").is_ok());
     }
 
@@ -291,24 +437,140 @@ mod tests {
         );
     }
 
-    /// An available containment wraps with the scope prefix and scrubs the bus env
-    /// from the inner job, but reports itself as NOT an untrusted boundary (the user
-    /// bus is still reachable; CWE-269) so the gate refuses untrusted jobs on it.
+    /// A reaping-only (non-confining) available containment wraps with the scope
+    /// prefix and scrubs the bus env from the inner job via `env -u`, does NOT
+    /// confine the filesystem, and is NOT an untrusted boundary (CWE-269).
     #[test]
-    fn available_containment_wraps_but_is_not_an_untrusted_boundary() {
+    fn non_confining_wrap_strips_bus_env_and_is_not_a_boundary() {
         let c = SystemdRunContainment::from_status(ContainmentStatus::Available {
             isolates_untrusted: false,
         });
-        let prefix = c.wrap("run-1", ResourceLimits::default());
+        let prefix = c.wrap("run-1", ResourceLimits::default(), &[]);
         assert_eq!(prefix.first().map(String::as_str), Some("systemd-run"));
         assert!(
-            prefix.contains(&"XDG_RUNTIME_DIR".to_string()) && prefix.contains(&"-u".to_string()),
-            "wrap strips the wrapper bus env from the job, got {prefix:?}"
+            prefix.windows(2).any(|w| w == ["-u", "XDG_RUNTIME_DIR"]),
+            "non-confining wrap strips the bus env with `env -u`, got {prefix:?}"
+        );
+        assert!(!prefix.iter().any(|a| a == "bwrap"), "no bwrap when not confining");
+        assert!(!c.confines_filesystem());
+        assert!(!c.status().is_untrusted_boundary());
+    }
+
+    /// A confining available containment composes bwrap inside the scope: host
+    /// rootfs read-only, the user bus hidden, and each share bound at its faithful
+    /// `/run/sandy/<tag>` path (read-only for inputs, writable for outputs). It
+    /// confines the filesystem but STILL is not an untrusted boundary (#150).
+    #[test]
+    fn confining_wrap_emits_bwrap_with_faithful_binds() {
+        let c = SystemdRunContainment::from_parts(
+            ContainmentStatus::Available {
+                isolates_untrusted: false,
+            },
+            true,
+        );
+        let mounts = [
+            Mount {
+                host: "/tmp/sandy/run-1-inputs".into(),
+                guest: "/run/sandy/inputs".into(),
+                readonly: true,
+            },
+            Mount {
+                host: "/tmp/sandy/run-1-outputs".into(),
+                guest: "/run/sandy/outputs".into(),
+                readonly: false,
+            },
+        ];
+        let cmd = c.wrap("run-1", ResourceLimits::default(), &mounts);
+
+        assert_eq!(cmd.first().map(String::as_str), Some("systemd-run"));
+        assert!(
+            cmd.iter().any(|a| a == "bwrap"),
+            "confining wrap composes bwrap, got {cmd:?}"
+        );
+        assert_eq!(cmd.last().map(String::as_str), Some("--"), "ends ready for the job");
+        // Host rootfs read-only, bus hidden.
+        assert!(
+            cmd.windows(3).any(|w| w == ["--ro-bind", "/", "/"]),
+            "host rootfs ro-bound"
         );
         assert!(
-            !c.status().is_untrusted_boundary(),
-            "a plain systemd-run scope is not an untrusted boundary"
+            cmd.windows(2).any(|w| w == ["--tmpfs", "/run"]),
+            "a writable /run (so bwrap can mkdir /run/sandy) hides the user-bus dir for free"
         );
+        assert!(
+            cmd.windows(2).any(|w| w == ["--unsetenv", "DBUS_SESSION_BUS_ADDRESS"]),
+            "bus env unset"
+        );
+        assert!(
+            cmd.windows(2).any(|w| w == ["--tmpfs", "/tmp"]),
+            "an ephemeral writable /tmp is provided under the read-only rootfs, got {cmd:?}"
+        );
+        assert!(
+            cmd.iter().any(|a| a == "--unshare-cgroup"),
+            "the full unshare set is applied, got {cmd:?}"
+        );
+        // Faithful binds: inputs read-only, outputs writable.
+        assert!(
+            cmd.windows(3)
+                .any(|w| w == ["--ro-bind", "/tmp/sandy/run-1-inputs", "/run/sandy/inputs"]),
+            "inputs bound read-only at the faithful path, got {cmd:?}"
+        );
+        assert!(
+            cmd.windows(3)
+                .any(|w| w == ["--bind", "/tmp/sandy/run-1-outputs", "/run/sandy/outputs"]),
+            "outputs bound writable at the faithful path, got {cmd:?}"
+        );
+        assert!(c.confines_filesystem(), "reports filesystem confinement");
+        assert!(
+            !c.status().is_untrusted_boundary(),
+            "confinement is hardening, not an untrusted-safety claim (#150)"
+        );
+    }
+
+    /// Probe/wrapper PARITY, by construction: the capability probe must exercise
+    /// every mount, env-unset, and namespace flag the real wrapper uses, not just the
+    /// namespace set. A host that passes a narrower probe but rejects (say) a
+    /// `--tmpfs` or the `/proc` remount under its LSM/seccomp policy would otherwise
+    /// make `confines_filesystem()` report `true` while every subsequently wrapped
+    /// job's `bwrap` dies before `exec` — a setup failure `run_staged` cannot
+    /// distinguish from an ordinary nonzero guest exit (INV-11 misclassification).
+    /// Asserts the probe args are EXACTLY `bwrap_segment(&[])` with `"bwrap"` dropped
+    /// and `"true"` appended, so any future edit to one cannot silently diverge from
+    /// the other.
+    #[test]
+    fn bwrap_probe_matches_the_real_wrapper_argv_exactly() {
+        let segment = bwrap_segment(&[]);
+        let probe = bwrap_probe_args();
+
+        assert_eq!(segment.first().map(String::as_str), Some("bwrap"));
+        let mut expected = segment[1..].to_vec();
+        expected.push("true".to_string());
+        assert_eq!(
+            probe, expected,
+            "the probe must run every flag the real wrapper does, plus its own trivial target; got probe={probe:?} \
+             segment={segment:?}"
+        );
+        // Every mount/env-hiding flag the finding called out must actually be present
+        // (guards against both the probe AND the wrapper silently losing one).
+        for needle in ["--proc", "--tmpfs", "--unsetenv", "--chdir"] {
+            assert!(
+                segment.iter().any(|a| a == needle),
+                "{needle} missing from bwrap_segment, got {segment:?}"
+            );
+        }
+        assert_eq!(
+            segment.iter().filter(|a| *a == "--tmpfs").count(),
+            3,
+            "exactly three tmpfs mounts (/tmp, /run, /run/sandy), got {segment:?}"
+        );
+        assert_eq!(
+            segment.iter().filter(|a| *a == "--unsetenv").count(),
+            2,
+            "exactly two unsetenv (the bus vars), got {segment:?}"
+        );
+        for flag in UNSHARE_FLAGS {
+            assert!(probe.iter().any(|a| a == flag), "{flag} missing from the probe");
+        }
     }
 
     /// macOS (and any non-Linux host) reports Unsupported — honest, mirroring the

@@ -7,7 +7,7 @@
 //! the trivial `NoContainment`, the fake), and the `admits_untrusted` gate, live in
 //! the crates that depend on this one.
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use crate::backend::BackendError;
 
@@ -77,6 +77,24 @@ pub struct ResourceLimits {
     pub mem_mib: Option<u32>,
 }
 
+/// One filesystem share to present inside the job's mount namespace: the host
+/// directory [`host`](Mount::host) bind-mounted at [`guest`](Mount::guest)
+/// (read-only for inputs/secrets, writable for outputs).
+///
+/// A containment that provides a mount namespace ([`confines_filesystem`](Containment::confines_filesystem))
+/// binds these at faithful paths (e.g. `/run/sandy/inputs`) with hard read-only;
+/// one that does not ignores them, and the backend exposes the host dirs directly
+/// (via `SANDY_*_DIR` pointers) with only cooperative read-only (#142).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mount {
+    /// Host directory holding the staged bytes.
+    pub host: PathBuf,
+    /// Path the job sees it at inside the namespace (e.g. `/run/sandy/inputs`).
+    pub guest: PathBuf,
+    /// Deny the job writes (inputs, secrets); outputs are writable.
+    pub readonly: bool,
+}
+
 /// How a non-VM executor confines a job. One implementation per mechanism: the
 /// trivial `NoContainment`, the host `SystemdRunContainment`, and the fake test
 /// double.
@@ -90,9 +108,24 @@ pub trait Containment: std::fmt::Debug + Send + Sync {
 
     /// The launch-command prefix that runs a job confined under container `id`
     /// (e.g. `["systemd-run", "--user", "--scope", …, "--"]`); the caller appends
-    /// the real program and args. Empty means run the job directly (no
-    /// containment). PURE: no IO, so the exact argv is unit-testable.
-    fn wrap(&self, id: &str, limits: ResourceLimits) -> Vec<String>;
+    /// the real program and args. `mounts` are the shares to present inside the
+    /// namespace — honoured only when [`confines_filesystem`](Containment::confines_filesystem)
+    /// is true (bound at their `guest` paths, hard read-only), ignored otherwise.
+    /// Empty return means run the job directly (no containment). PURE: no IO, so the
+    /// exact argv is unit-testable.
+    fn wrap(&self, id: &str, limits: ResourceLimits, mounts: &[Mount]) -> Vec<String>;
+
+    /// Whether [`wrap`](Containment::wrap) puts the job in a mount namespace that
+    /// binds `mounts` at their faithful `guest` paths with hard read-only and hides
+    /// the user-session bus. When true the backend advertises the faithful
+    /// `/run/sandy/<tag>` paths (and need not enforce cooperative read-only); when
+    /// false it exposes the host staging dirs and keeps the cooperative fallback.
+    /// This is a confinement-feature flag, NOT an untrusted-safety claim — it does
+    /// not imply [`ContainmentStatus::is_untrusted_boundary`] (#142; the untrusted
+    /// gate-flip is tracked separately in #150). Defaults to false.
+    fn confines_filesystem(&self) -> bool {
+        false
+    }
 
     /// Reap container `id`'s whole process tree, including a `setsid`/`setpgid`
     /// escapee a process-group kill would miss. Idempotent and best-effort:
@@ -121,8 +154,12 @@ impl<C: Containment + ?Sized> Containment for Arc<C> {
         (**self).status()
     }
 
-    fn wrap(&self, id: &str, limits: ResourceLimits) -> Vec<String> {
-        (**self).wrap(id, limits)
+    fn wrap(&self, id: &str, limits: ResourceLimits, mounts: &[Mount]) -> Vec<String> {
+        (**self).wrap(id, limits, mounts)
+    }
+
+    fn confines_filesystem(&self) -> bool {
+        (**self).confines_filesystem()
     }
 
     fn reap(&self, id: &str) -> Result<(), BackendError> {
