@@ -20,6 +20,15 @@ const STAGING_DIR_NAME: &str = "sandy";
 /// Mode bits that would let group or other write into the staging base.
 const GROUP_OTHER_WRITE: u32 = 0o022;
 
+/// Other-write bit (`S_IWOTH`): on the staging *parent*, it is only safe when the
+/// parent is also sticky (see [`validate_parent_sticky`]).
+const OTHER_WRITE: u32 = 0o002;
+
+/// Sticky bit (`S_ISVTX`): on a world-writable directory it restricts rename/unlink
+/// to the entry's owner, which is what makes a shared `/tmp` (`01777`) safe to stage
+/// under.
+const STICKY: u32 = 0o1000;
+
 /// Validate (or create) the sandy-owned staging base under the OS temp dir and
 /// return its path.
 ///
@@ -42,11 +51,11 @@ pub fn ensure_sandy_staging_base() -> Result<PathBuf, BackendError> {
 /// `mkdirat` or racing right after it — is rejected rather than followed,
 /// whether the base was just created or already existed.
 ///
-/// This assumes `parent` itself is not attacker-writable (true for a
-/// sticky-bit `/tmp` or a per-user `$TMPDIR`): once the base passes
-/// validation below, nothing can be swapped underneath it only while
-/// `parent` stays out of attacker control. A world-writable, non-sticky
-/// `TMPDIR` is out of scope for this check.
+/// The parent must not be attacker-writable: a world-writable `parent` without
+/// the sticky bit lets an attacker who controls it swap the base underneath our
+/// validation, so it is rejected (#141, [`validate_parent_sticky`]). A sticky
+/// `/tmp` (`01777`) or a private `$TMPDIR` (`0700`) passes. The check `fstat`s the
+/// same `parent_fd` the base is created/opened relative to, so it is TOCTOU-safe.
 fn ensure_staging_base_in(parent: &Path) -> Result<PathBuf, BackendError> {
     let base = parent.join(STAGING_DIR_NAME);
     let parent_fd = open(
@@ -55,6 +64,14 @@ fn ensure_staging_base_in(parent: &Path) -> Result<PathBuf, BackendError> {
         Mode::empty(),
     )
     .map_err(|e| staging_err("open staging parent", parent, &e))?;
+
+    // Defence in depth (#141): reject a world-writable, non-sticky parent before
+    // trusting anything created under it. fstat on the already-open fd, not a path.
+    let parent_stat = fstat(&parent_fd).map_err(|e| staging_err("stat staging parent", parent, &e))?;
+    #[allow(clippy::useless_conversion)]
+    let parent_mode = u32::from(parent_stat.st_mode);
+    validate_parent_sticky(parent_mode)
+        .map_err(|e| BackendError::Spawn(format!("{e} (parent: {})", parent.display())))?;
 
     match mkdirat(&parent_fd, STAGING_DIR_NAME, Mode::RWXU) {
         Ok(()) => {}
@@ -96,6 +113,21 @@ fn validate_owner_and_mode(uid: u32, current_uid: u32, mode: u32) -> Result<(), 
     if mode & GROUP_OTHER_WRITE != 0 {
         return Err(BackendError::Spawn(format!(
             "sandy staging base is group/world-writable (mode {mode:#o}); refusing to stage"
+        )));
+    }
+    Ok(())
+}
+
+/// A world-writable staging parent must carry the sticky bit (`S_ISVTX`), or an
+/// attacker who controls the parent could swap the validated base out underneath us
+/// (CWE-732, #141). A sticky `/tmp` (`01777`) or a private `$TMPDIR` (`0700`) passes;
+/// a world-writable non-sticky parent fails closed. Pure, so the reject path is
+/// unit-testable without a real world-writable directory.
+fn validate_parent_sticky(parent_mode: u32) -> Result<(), BackendError> {
+    if parent_mode & OTHER_WRITE != 0 && parent_mode & STICKY == 0 {
+        return Err(BackendError::Spawn(format!(
+            "staging parent is world-writable without the sticky bit (mode {parent_mode:#o}); an attacker controlling \
+             it could redirect staged bytes; refusing to stage"
         )));
     }
     Ok(())
@@ -196,5 +228,60 @@ mod tests {
     fn clean_owner_and_mode_is_ok() {
         let result = validate_owner_and_mode(1000, 1000, 0o700);
         assert!(result.is_ok(), "self-owned 0700 must validate: {result:?}");
+    }
+
+    /// Adversarial (#141): a world-writable, non-sticky parent must be rejected —
+    /// fail closed with a named reason, before trusting anything created under it.
+    #[test]
+    fn world_writable_nonsticky_parent_is_rejected() -> anyhow::Result<()> {
+        let tmp = tempfile::TempDir::new().context("tempdir")?;
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o777))
+            .context("make parent world-writable, non-sticky")?;
+
+        let err = ensure_staging_base_in(tmp.path()).expect_err("a world-writable non-sticky parent must be rejected");
+
+        assert!(
+            err.to_string().contains("sticky"),
+            "expected a sticky-bit rejection naming the parent, got {err}"
+        );
+        Ok(())
+    }
+
+    /// Positive (#141): a world-writable parent WITH the sticky bit (like `/tmp`,
+    /// `01777`) is trusted — the base is created and validated under it as usual.
+    #[test]
+    fn world_writable_sticky_parent_is_ok() -> anyhow::Result<()> {
+        let tmp = tempfile::TempDir::new().context("tempdir")?;
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o1777))
+            .context("make parent sticky world-writable")?;
+
+        let base = ensure_staging_base_in(tmp.path()).expect("a sticky world-writable parent must be trusted");
+
+        let mode = std::fs::metadata(&base).context("stat base")?.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "base under a sticky parent is still created 0700, got {mode:#o}"
+        );
+        Ok(())
+    }
+
+    /// Pure coverage for the parent sticky check, independent of a real
+    /// world-writable directory: world-writable without sticky fails; sticky,
+    /// non-world-writable, and private modes pass.
+    #[test]
+    fn parent_sticky_check_covers_the_boundaries() {
+        assert!(
+            validate_parent_sticky(0o777).is_err(),
+            "world-writable without sticky must be rejected"
+        );
+        assert!(
+            validate_parent_sticky(0o1777).is_ok(),
+            "world-writable WITH sticky (/tmp) must pass"
+        );
+        assert!(
+            validate_parent_sticky(0o755).is_ok(),
+            "a non-world-writable parent must pass"
+        );
+        assert!(validate_parent_sticky(0o700).is_ok(), "a private parent must pass");
     }
 }

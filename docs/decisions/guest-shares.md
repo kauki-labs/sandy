@@ -274,16 +274,18 @@ named error.
 **Consequences.** Once the base passes validation it is `0700` and owned by the
 current uid, so no other uid can create or replace entries under it afterward;
 the per-run child dirs the backends join onto it (still plain path joins, not
-their own `openat` traversal) inherit that guarantee. This assumes the base's
-_parent_ (`temp_dir()`) is itself not attacker-writable — true for a sticky-bit
-`/tmp` or a per-user `$TMPDIR`, the only configurations sandy runs under today;
-a world-writable, non-sticky `TMPDIR` is out of scope. Uses `rustix` for the
+their own `openat` traversal) inherit that guarantee. The base's _parent_
+(`temp_dir()`) is also checked (#141): a world-writable parent without the sticky
+bit is rejected via an `fstat` on the same `parent_fd`, since there an attacker
+controlling the parent could swap the validated base out from under us. A sticky
+`/tmp` (`01777`) or a per-user `$TMPDIR` (`0700`) passes. Uses `rustix` for the
 `openat`/`mkdirat`/`fstat`/`getuid` calls, staying inside this crate's
 `unsafe_code = "forbid"` lint.
 
 **Set aside.** Repairing a bad base (chmod/chown back to safe): rejected — a
 base an attacker got to first is not trustworthy even after a cosmetic fix, and
-silent repair is exactly the kind of downgrade CWE-732 flags. Validating the
-parent directory's own permissions: deferred — it would need to recurse
-indefinitely up the tree, and sandy's supported `TMPDIR` configurations don't
-need it (see consequences above); revisit if that assumption stops holding.
+silent repair is exactly the kind of downgrade CWE-732 flags. Recursing further up
+the tree than the immediate parent (grandparent and above): still out of scope —
+the immediate-parent sticky check (#141, above) closes the attacker-writable-`TMPDIR`
+gap, and walking the whole ancestry would recurse indefinitely for no gain on
+sandy's supported configurations.
