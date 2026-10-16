@@ -681,7 +681,7 @@ mod tests {
             ..run_spec(&command, &grants, 30)
         };
 
-        let backend = ProcessBackend::with_containment(Box::new(sandy::FakeContainment::confining()));
+        let backend = ProcessBackend::with_containment(Box::new(FakeContainment::confining()));
         let outcome = backend.run(&spec)?;
 
         assert_eq!(outcome.guest_exit, Some(0), "the job ran");
