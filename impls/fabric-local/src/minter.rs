@@ -10,7 +10,7 @@
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
 };
 
@@ -47,6 +47,10 @@ pub enum StageError {
     /// The staging directory is inside the Nix store, which is world-readable (INV-1).
     #[error("refusing to stage a secret under the nix store: {0}")]
     InStore(PathBuf),
+    /// The staging directory is not owned by this user, or is group- or
+    /// world-writable, so another principal could swap the staged file.
+    #[error("unsafe staging directory {0}: must be owned by this user and not group/world-writable")]
+    UnsafeDir(PathBuf),
     /// The capability could not be encoded.
     #[error("encoding the channel cap: {0}")]
     Encode(String),
@@ -63,9 +67,12 @@ pub enum StageError {
 /// Stage `bytes` as the secret `name` in `dir` and return the [`SecretRef`] that
 /// carries it into the guest.
 ///
-/// The file is created `0600` under a temporary name, synced, then renamed into
-/// place, so a reader never sees a partial or world-readable secret. `dir` must
-/// exist and be owned by the caller; it must not be inside the Nix store.
+/// The file is created `0600` (never wider, not even briefly) under a unique
+/// temporary name, synced, then renamed into place, so a reader never sees a
+/// partial or world-readable secret. `dir` must exist, be owned by this user, and
+/// not be group- or world-writable; otherwise another principal could replace the
+/// staged file with a symlink to one of this user's files. It must not be inside
+/// the Nix store.
 pub fn stage_secret(dir: &Path, name: &str, bytes: &[u8]) -> Result<SecretRef, StageError> {
     let mut chars = name.chars();
     let valid = chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
@@ -87,16 +94,27 @@ pub fn stage_secret(dir: &Path, name: &str, bytes: &[u8]) -> Result<SecretRef, S
     if dir.starts_with(store) {
         return Err(StageError::InStore(dir));
     }
+    let meta = fs::metadata(&dir).map_err(io_err(&dir))?;
+    if meta.uid() != rustix::process::getuid().as_raw() || meta.mode() & 0o022 != 0 {
+        return Err(StageError::UnsafeDir(dir));
+    }
 
     let dest = dir.join(name);
-    let tmp = dir.join(format!(".{name}.staging"));
-    let written = write_0600(&tmp, bytes).and_then(|()| fs::rename(&tmp, &dest));
-    if let Err(source) = written {
+    let tmp = dir.join(format!(".{name}.{}.staging", unique_suffix().map_err(io_err(&dir))?));
+    if let Err(source) = write_0600(&tmp, bytes) {
         // Best effort: the original error is the one worth reporting.
+        let _ = fs::remove_file(&tmp);
+        return Err(StageError::Io { path: tmp, source });
+    }
+    if let Err(source) = fs::rename(&tmp, &dest) {
         let _ = fs::remove_file(&tmp);
         return Err(StageError::Io { path: dest, source });
     }
-    File::open(&dir).and_then(|d| d.sync_all()).map_err(io_err(&dir))?;
+    if let Err(source) = File::open(&dir).and_then(|d| d.sync_all()) {
+        // Not durable, and the caller gets no SecretRef to clean up with: remove it.
+        let _ = fs::remove_file(&dest);
+        return Err(StageError::Io { path: dir, source });
+    }
     Ok(SecretRef {
         name: name.to_owned(),
         source: SecretSource::File(dest),
@@ -115,15 +133,18 @@ pub fn stage_cap(dir: &Path, name: &str, cap: &Cap) -> Result<SecretRef, StageEr
     stage_secret(dir, name, &encoded)
 }
 
-/// Create `path` as a fresh `0600` file holding `bytes`, synced to disk. A stale
-/// file at `path` (from an interrupted earlier staging) is replaced.
+/// A random suffix so concurrent stagings of one name never share a temp file.
+fn unique_suffix() -> io::Result<String> {
+    let mut raw = [0_u8; 8];
+    getrandom::fill(&mut raw).map_err(io::Error::other)?;
+    Ok(raw.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Create `path` as a new `0600` file holding `bytes`, synced to disk. `create_new`
+/// refuses anything already at `path`, including a planted symlink.
 // SECURITY: keep in sync with `sandy::cred::write_secret_0600`; both move to one
 // shared writer in #174.
 fn write_0600(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    match fs::remove_file(path) {
-        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
-        _ => {}
-    }
     let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
     file.write_all(bytes)?;
     file.sync_all()
@@ -176,27 +197,100 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn restaging_a_name_replaces_the_secret_and_leaves_no_temp_file() -> anyhow::Result<()> {
+    /// A 0700 temp dir: a safe staging dir (tempfile's default is already 0700).
+    fn staging_dir() -> anyhow::Result<tempfile::TempDir> {
         let dir = tempfile::tempdir()?;
-        stage_secret(dir.path(), "S", b"old")?;
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
+        Ok(dir)
+    }
+
+    #[test]
+    fn restaging_over_a_wide_file_leaves_a_0600_secret_and_no_temp_file() -> anyhow::Result<()> {
+        let dir = staging_dir()?;
+        let old = dir.path().join("S");
+        fs::write(&old, b"old")?;
+        fs::set_permissions(&old, fs::Permissions::from_mode(0o644))?;
         let staged = stage_secret(dir.path(), "S", b"new")?;
-        anyhow::ensure!(fs::read(staged_path(&staged)?)? == b"new", "secret not replaced");
+        let path = staged_path(&staged)?;
+        anyhow::ensure!(fs::read(path)? == b"new", "secret not replaced");
+        let mode = fs::metadata(path)?.permissions().mode() & 0o777;
+        anyhow::ensure!(mode == 0o600, "a pre-existing 0644 file kept its mode: {mode:o}");
         let entries = fs::read_dir(dir.path())?.count();
         anyhow::ensure!(entries == 1, "{entries} entries; a temp file was left behind");
         Ok(())
     }
 
     #[test]
-    fn a_secret_never_reaches_argv_or_the_environment() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
+    fn a_failed_rename_leaves_no_temp_file() -> anyhow::Result<()> {
+        let dir = staging_dir()?;
+        fs::create_dir(dir.path().join("S"))?;
+        fs::write(dir.path().join("S").join("keep"), b"x")?;
+        let res = stage_secret(dir.path(), "S", b"secret");
+        anyhow::ensure!(matches!(res, Err(StageError::Io { .. })), "got {res:?}");
+        let names: Vec<_> = fs::read_dir(dir.path())?
+            .map(|e| e.map(|e| e.file_name()))
+            .collect::<Result<_, _>>()?;
+        anyhow::ensure!(names == ["S"], "left behind: {names:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_symlink_planted_at_the_destination_never_touches_its_target() -> anyhow::Result<()> {
+        let dir = staging_dir()?;
+        let victim_dir = tempfile::tempdir()?;
+        let victim = victim_dir.path().join("id_ed25519");
+        fs::write(&victim, b"private key")?;
+        std::os::unix::fs::symlink(&victim, dir.path().join("S"))?;
+        let staged = stage_secret(dir.path(), "S", b"secret")?;
+        anyhow::ensure!(
+            fs::read(&victim)? == b"private key",
+            "the symlink target was overwritten"
+        );
+        let path = staged_path(&staged)?;
+        anyhow::ensure!(
+            !fs::symlink_metadata(path)?.is_symlink(),
+            "the staged secret is still a symlink"
+        );
+        anyhow::ensure!(fs::read(path)? == b"secret", "staged bytes differ");
+        Ok(())
+    }
+
+    #[test]
+    fn a_group_or_world_writable_staging_dir_is_refused() -> anyhow::Result<()> {
+        for mode in [0o770, 0o707, 0o777] {
+            let dir = staging_dir()?;
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(mode))?;
+            let res = stage_secret(dir.path(), "S", b"x");
+            anyhow::ensure!(
+                matches!(res, Err(StageError::UnsafeDir(_))),
+                "mode {mode:o} gave {res:?}"
+            );
+            anyhow::ensure!(fs::read_dir(dir.path())?.count() == 0, "staged into an unsafe dir");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_staging_dir_that_resolves_into_the_nix_store_is_refused() -> anyhow::Result<()> {
+        let store = Path::new("/nix/store");
+        if !store.is_dir() {
+            return Ok(()); // no store on this host to resolve into
+        }
+        let dir = staging_dir()?;
+        let link = dir.path().join("looks-local");
+        std::os::unix::fs::symlink(store, &link)?;
+        let res = stage_secret(&link, "S", b"x");
+        anyhow::ensure!(matches!(res, Err(StageError::InStore(_))), "got {res:?}");
+        Ok(())
+    }
+
+    /// INV-1: what reaches `RunSpec.secrets` is a path, never the bytes, so the
+    /// secret cannot ride argv or env through the run.
+    #[test]
+    fn a_staged_secret_ref_carries_a_path_not_the_secret() -> anyhow::Result<()> {
+        let dir = staging_dir()?;
         let marker = "sandy-inv1-marker-6f1e2d";
         let staged = stage_secret(dir.path(), "S", marker.as_bytes())?;
-        anyhow::ensure!(!std::env::args().any(|a| a.contains(marker)), "the secret is on argv");
-        anyhow::ensure!(
-            !std::env::vars().any(|(k, v)| k.contains(marker) || v.contains(marker)),
-            "the secret is in the environment"
-        );
         anyhow::ensure!(
             !format!("{staged:?}").contains(marker),
             "the SecretRef carries the secret bytes, not just a path"
