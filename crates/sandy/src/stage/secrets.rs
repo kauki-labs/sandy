@@ -84,22 +84,24 @@ fn validate_secret_name(name: &str) -> Result<(), BackendError> {
     Ok(())
 }
 
-/// Read a secret's bytes from its source, rejecting a symlink, a source not
-/// owned by this process's uid, or a world/group-readable file (INV-1,
-/// CWE-59/confused-deputy: a staged path swapped for a symlink to another host
-/// file — e.g. `~/.ssh/id_ed25519` — must not be followed and exfiltrated into
-/// the guest, #175). The `Fd` channel needs an `unsafe` `File::from_raw_fd`,
-/// which this crate forbids (`unsafe_code = forbid`), so it is rejected rather
-/// than read.
+/// Read a secret's bytes from its source, rejecting a symlink, a non-regular
+/// file (FIFO, device, directory), a source not owned by this process's uid,
+/// or a world/group-readable file (INV-1, CWE-59/confused-deputy: a staged
+/// path swapped for a symlink to another host file — e.g. `~/.ssh/id_ed25519`
+/// — must not be followed and exfiltrated into the guest, #175). The `Fd`
+/// channel needs an `unsafe` `File::from_raw_fd`, which this crate forbids
+/// (`unsafe_code = forbid`), so it is rejected rather than read.
 fn read_source(source: &SecretSource) -> Result<Vec<u8>, BackendError> {
     match source {
         SecretSource::File(path) => {
             // O_NOFOLLOW: a symlink final component fails with ELOOP, so a swapped
-            // path is refused before anything is read through it (#175). O_CLOEXEC
-            // keeps the fd off forked children.
+            // path is refused before anything is read through it (#175). O_NONBLOCK
+            // keeps a FIFO at the path from blocking this open waiting for a writer
+            // (the file-type check below then rejects it outright). O_CLOEXEC keeps
+            // the fd off forked children.
             let mut file = fs::OpenOptions::new()
                 .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
                 .open(path)
                 .map_err(|e| {
                     if e.raw_os_error() == Some(libc::ELOOP) {
@@ -112,10 +114,18 @@ fn read_source(source: &SecretSource) -> Result<Vec<u8>, BackendError> {
                     }
                 })?;
 
-            // Validate owner and mode on the OPENED fd, never the path: a path-based
-            // check races the open (TOCTOU), and following a symlink would check the
-            // wrong file's metadata entirely.
+            // Validate type, owner and mode on the OPENED fd, never the path: a
+            // path-based check races the open (TOCTOU), and following a symlink
+            // would check the wrong file's metadata entirely. A non-regular file
+            // (FIFO, device, directory) is refused outright, before any owner/mode
+            // check runs on it.
             let meta = file.metadata().map_err(|e| spawn_err("stat secret source", path, &e))?;
+            if !meta.file_type().is_file() {
+                return Err(BackendError::Spawn(format!(
+                    "secret source {} is not a regular file; refusing to stage (INV-1)",
+                    path.display()
+                )));
+            }
             let current_uid = rustix::process::getuid().as_raw();
             if meta.uid() != current_uid {
                 return Err(BackendError::Spawn(format!(
@@ -299,6 +309,33 @@ mod tests {
             "expected a named Spawn error, got {err:?}"
         );
         assert!(!inst_dir.join("TOK").exists(), "a rejected symlink must not be staged");
+        Ok(())
+    }
+
+    /// Adversarial (INV-1, #175): a secret source that is a FIFO, not a regular
+    /// file, is refused rather than opened (which would block on `O_NONBLOCK`'s
+    /// absence) or read past its type.
+    #[test]
+    fn a_fifo_source_is_rejected() -> anyhow::Result<()> {
+        let tmp = tempfile::TempDir::new()?;
+        let fifo = tmp.path().join("fifo-source");
+        // `mkfifo` has no safe std/rustix wrapper on macOS; shell out to the
+        // portable coreutil rather than an `unsafe` libc call (`unsafe_code = forbid`).
+        let status = std::process::Command::new("mkfifo").arg(&fifo).status()?;
+        anyhow::ensure!(status.success(), "mkfifo exited {status}");
+
+        let inst_dir = tmp.path().join("inst");
+        let secrets = [SecretRef {
+            name: "TOK".to_string(),
+            source: SecretSource::File(fifo),
+        }];
+
+        let err = stage_secrets(&secrets, &inst_dir).expect_err("a FIFO source must be rejected");
+        assert!(
+            matches!(err, BackendError::Spawn(_)),
+            "expected a named Spawn error, got {err:?}"
+        );
+        assert!(!inst_dir.join("TOK").exists(), "a rejected FIFO must not be staged");
         Ok(())
     }
 
