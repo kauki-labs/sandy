@@ -37,13 +37,9 @@ version, metadata, dependency versions, and lints through the root `Cargo.toml`
   the shared contract-test harness (feature `contract-tests`) every impl passes.
   No impls. See `docs/decisions/agent-fabric.md`.
 - **`sandy-fabric-local`** (`impls/fabric-local`) — the agent-fabric's trivial
-  local impls, one module per seam: the `Channel` abstraction over any
-  `ChannelBackend` (`channel`), the in-memory `ChannelBackend` (`inmem`), the
-  HMAC-SHA256 `LocalCapAuthority` (`capauth`), the agent-local `Minter` +
-  secret staging (`minter`), all-local placement — static registry, direct
-  probe, lease soft-state (`placement`), `VmBackendExecutor` adapting any
-  `VmBackend` into the `Executor` seam (`executor`), and local-first telemetry
-  (`telemetry`).
+  local impls, one module per seam. Under active development; see the crate's
+  `src/` for the current module set, or epic #103's sub-issues for which seams
+  have landed.
 
 ## Build & test (run before committing)
 
