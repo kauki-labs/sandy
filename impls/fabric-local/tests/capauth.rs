@@ -59,6 +59,19 @@ fn a_revoked_cap_is_refused_even_before_its_expiry() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn attenuating_a_revoked_parent_is_refused() -> anyhow::Result<()> {
+    let authority = LocalCapAuthority::new().context("authority")?;
+    let parent = authority.mint(scope(full_rights(), None)).context("mint")?;
+    authority.revoke(&parent);
+    let narrower = CapRights {
+        read: true,
+        ..CapRights::default()
+    };
+    assert!(matches!(authority.attenuate(&parent, narrower), Err(CapError::Revoked)));
+    Ok(())
+}
+
 /// Wraps a real authority but skips the proof check in `verify` — a signer that
 /// accepts a forged cap. The suite must fail against it, proving it is not vacuous
 /// for this crate's concrete type (mirrors #157's `NonAttenuatingAuthority`).
