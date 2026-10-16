@@ -11,5 +11,6 @@ pub mod channel;
 pub mod inmem;
 pub mod minter;
 pub mod placement;
+pub mod telemetry;
 
 pub use capauth::LocalCapAuthority;
