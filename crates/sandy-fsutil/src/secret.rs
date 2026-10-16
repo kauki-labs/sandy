@@ -376,6 +376,22 @@ mod tests {
         Ok(())
     }
 
+    /// A umask that clears the owner's read bit (0400 makes mkdir's 0700 into
+    /// 0300) must not leave a dir that cannot be opened: it is set to 0700 first.
+    /// The umask is process-wide; nextest runs each test in its own process.
+    #[test]
+    fn open_or_create_survives_a_umask_that_clears_owner_read() -> anyhow::Result<()> {
+        let root = staging_dir()?;
+        let path = root.path().join("d");
+        let previous = rustix::process::umask(Mode::from_raw_mode(0o400));
+        let opened = OwnedDir::open_or_create(&path);
+        rustix::process::umask(previous);
+        opened?;
+        let mode = fs::metadata(&path)?.permissions().mode() & 0o777;
+        anyhow::ensure!(mode == 0o700, "a created dir came out {mode:o}");
+        Ok(())
+    }
+
     #[test]
     fn open_or_create_accepts_an_existing_private_dir_and_refuses_a_wide_one() -> anyhow::Result<()> {
         let root = staging_dir()?;
