@@ -7,7 +7,12 @@
 //! returned as a [`SecretRef`] for `RunSpec.secrets`, which the backend stages into
 //! the guest. Nothing travels on argv, in the environment, or through the store.
 
-use std::path::{Path, PathBuf};
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{self, Write},
+    os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
+};
 
 use sandy_api::backend::{SecretRef, SecretSource};
 use sandy_fabric::minter::{MintedSecret, Minter, MinterError, SecretRequest};
@@ -22,8 +27,10 @@ pub struct LocalMinter;
 
 impl Minter for LocalMinter {
     async fn mint(&self, req: &SecretRequest) -> Result<MintedSecret, MinterError> {
-        let _ = req;
-        Ok(MintedSecret { bytes: Vec::new() })
+        let mut bytes = vec![0_u8; SECRET_LEN];
+        getrandom::fill(&mut bytes)
+            .map_err(|e| MinterError::Mint(format!("no OS entropy for job {:?}: {e}", req.job)))?;
+        Ok(MintedSecret { bytes })
     }
 }
 
@@ -54,11 +61,54 @@ pub enum StageError {
 /// place, so a reader never sees a partial or world-readable secret. `dir` must
 /// exist and be owned by the caller; it must not be inside the Nix store.
 pub fn stage_secret(dir: &Path, name: &str, bytes: &[u8]) -> Result<SecretRef, StageError> {
-    let _ = (dir, bytes);
+    let mut chars = name.chars();
+    let valid = chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !valid {
+        return Err(StageError::InvalidName(name.to_owned()));
+    }
+    // Check the path as given before resolving it, then the resolved path, so a
+    // symlink into the store is refused too.
+    let store = Path::new("/nix/store");
+    if dir.starts_with(store) {
+        return Err(StageError::InStore(dir.to_owned()));
+    }
+    let io_err = |path: &Path| {
+        let path = path.to_owned();
+        move |source| StageError::Io { path, source }
+    };
+    let dir = fs::canonicalize(dir).map_err(io_err(dir))?;
+    if dir.starts_with(store) {
+        return Err(StageError::InStore(dir));
+    }
+
+    let dest = dir.join(name);
+    let tmp = dir.join(format!(".{name}.staging"));
+    let written = write_0600(&tmp, bytes).and_then(|()| fs::rename(&tmp, &dest));
+    if let Err(source) = written {
+        // Best effort: the original error is the one worth reporting.
+        let _ = fs::remove_file(&tmp);
+        return Err(StageError::Io { path: dest, source });
+    }
+    File::open(&dir).and_then(|d| d.sync_all()).map_err(io_err(&dir))?;
     Ok(SecretRef {
         name: name.to_owned(),
-        source: SecretSource::File(PathBuf::new()),
+        source: SecretSource::File(dest),
     })
+}
+
+/// Create `path` as a fresh `0600` file holding `bytes`, synced to disk. A stale
+/// file at `path` (from an interrupted earlier staging) is replaced.
+// SECURITY: keep in sync with `sandy::cred::write_secret_0600`; both move to one
+// shared writer in #174.
+fn write_0600(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 #[cfg(test)]
@@ -98,7 +148,7 @@ mod tests {
         anyhow::ensure!(staged.name == "WORK_SECRET", "name {:?}", staged.name);
         let path = staged_path(&staged)?;
         anyhow::ensure!(
-            path.starts_with(dir.path()),
+            path.starts_with(fs::canonicalize(dir.path())?),
             "staged outside the dir: {}",
             path.display()
         );
