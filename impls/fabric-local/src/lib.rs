@@ -7,6 +7,7 @@
 
 mod capauth;
 
+pub mod agent;
 pub mod channel;
 pub mod executor;
 pub mod inmem;

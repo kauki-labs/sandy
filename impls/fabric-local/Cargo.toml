@@ -21,6 +21,7 @@ workspace = true
 
 [dependencies]
 futures-core.workspace = true
+futures-util.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 hmac.workspace = true
@@ -30,16 +31,15 @@ sandy-fabric.workspace = true
 sandy-proto.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "io-util"] }
 serde_json.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
-futures-util.workspace = true
 sandy-api.workspace = true
 sandy-backend.workspace = true
 sandy-fabric = { workspace = true, features = ["contract-tests"] }
 sandy-proto.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["time", "io-util"] }

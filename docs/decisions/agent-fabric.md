@@ -262,3 +262,52 @@ channel-routed sink plugs in as `LocalFirst<ChannelSink>` once the channel roles
 **Set aside.** Content-addressed records now: `TelemetryRecord` has no timestamp or
 sequence, so hashing would merge repeated identical events. Content-addressed pull
 of the log is spec §7 work.
+
+## 10. The sandbox agent: a separate process, TTY over the existing envelope, an honest break-glass stub
+
+**Status:** accepted.
+
+**Context.** The agent is "the only door": the sandbox boundary is the trust
+boundary, and a channel must never become a bypass of it (spec §4). The bootstrap
+orchestrator-channel cap in particular must never reach the job it supervises — a
+job holding it could post as the agent.
+
+**Decision.** In `sandy-fabric-local` (`agent.rs`, #109):
+
+- `SandboxAgent` is launched by the executor as the sandbox's own process (not
+  in-process with the executor), which then execs/supervises the job as ITS child.
+  This holds for the process backend today and needs no redesign once a VM-backed
+  agent exists: "agent is the only door" means the same thing in both topologies.
+- The bootstrap cap arrives over a consumed-once pipe from the executor
+  (`AGENT_CAP_FD`, sandy-fabric), never a staged file: the guest's login shell
+  blanket-exports every file under `/run/sandy/secrets` into the job's environment,
+  so a staged cap would reach the job and let it present it as the agent (#177
+  tracks replacing that blanket export with an agent-owned allowlist once this
+  lands). `bootstrap` reads the fd to EOF, decodes with `decode_cap`, and joins —
+  the fd is never read twice and never touches disk.
+- TTY traffic reuses the existing `Tty` envelope marker with no new wire type:
+  `content_type` (`TTY_STDIN`/`TTY_STDOUT`/`TTY_STDERR`) carries the direction,
+  raw bytes ride `payload`. Cap-scope enforcement (observe vs interact) is never
+  duplicated in the agent — `Channel::post` already refuses a non-`post` member
+  before an envelope is stored, so an eavesdropper's input never reaches the job.
+- `RawConsole` (sandy-fabric) is the break-glass seam; `UnavailableConsole` is the
+  process backend's impl, reporting `Unavailable` and refusing every read/write —
+  a bare process has no serial console, and a silent no-op there would be
+  indistinguishable from a working fallback until an operator actually needed it.
+  The real console wiring (`sandy_api::console::Transport`, already built for the
+  VM run path) lands with a VM-backed agent; not this PR's scope.
+
+**Consequences.** The executor-to-agent fd handoff and the `Channel`'s own rights
+enforcement are the only places INV-1/boundedness is enforced for this surface —
+no second copy of either check exists to drift out of sync. `UnavailableConsole`
+means #109's "break-glass works when the agent is down" positive case is honestly
+NOT demonstrated for the process backend (there is nothing to demonstrate); it is
+deferred to the VM-backed `RawConsole`, tracked separately.
+
+**Set aside.** Staging the cap under a reserved name or a separate agent-only
+subdirectory on the existing secrets mount: both still share the mount the job
+reads from and depend on the backend giving the agent and the job distinct
+identities, which the local process backend does not (ruled out in favor of the
+out-of-band fd handoff, superseding §7's "set aside" on this point). Wiring
+`sandy_api::console::Transport` into `RawConsole` now: no VM-backed agent exists
+yet to wire it to.
