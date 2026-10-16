@@ -733,7 +733,11 @@ mod tests {
 
     #[test]
     fn credential_setup_scopes_to_the_trust_root_targets_and_capabilities() -> anyhow::Result<()> {
-        let tmp = tempfile::tempdir()?;
+        let tmp = tempfile::Builder::new()
+            .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(
+                0o700,
+            ))
+            .tempdir()?;
         write_trust_root(tmp.path(), "runner", &["kauki-labs/sandy-pilot-test"])?;
 
         let (_adapter, scope) = credential_setup(
@@ -750,7 +754,11 @@ mod tests {
 
     #[test]
     fn credential_setup_defaults_to_read_code_when_no_capability_is_given() -> anyhow::Result<()> {
-        let tmp = tempfile::tempdir()?;
+        let tmp = tempfile::Builder::new()
+            .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(
+                0o700,
+            ))
+            .tempdir()?;
         write_trust_root(tmp.path(), "runner", &["o/r"])?;
 
         let (_adapter, scope) = credential_setup(tmp.path(), "runner", &[]).map_err(|e| anyhow::anyhow!(e))?;
@@ -765,7 +773,11 @@ mod tests {
 
     #[test]
     fn credential_setup_rejects_an_unknown_capability() -> anyhow::Result<()> {
-        let tmp = tempfile::tempdir()?;
+        let tmp = tempfile::Builder::new()
+            .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(
+                0o700,
+            ))
+            .tempdir()?;
         write_trust_root(tmp.path(), "runner", &["o/r"])?;
 
         let err = credential_setup(tmp.path(), "runner", &["admin".to_string()])

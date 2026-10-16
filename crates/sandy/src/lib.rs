@@ -62,7 +62,7 @@ pub use containment::{Containment, ContainmentStatus, Mount, NoContainment, Reso
 pub use cred::{
     Capability, CredError, CredentialHandle, CredentialProvider, GitlabAccount, Lease, MAX_TTL_SECS, Minted, Scope,
     Target, TrustRoot, TrustRootIo, mint_lease, read_secret_0600, refresh_once, render_github_permissions,
-    should_refresh,
+    should_refresh, write_trust_secret,
 };
 pub use cred_github::GithubAdapter;
 pub use discovery::{Discovery, Placement, StaticRegistry, parse_builder_systems};

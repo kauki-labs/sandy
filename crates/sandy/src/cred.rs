@@ -28,7 +28,6 @@
 
 use std::{
     fs,
-    io::Write,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
@@ -255,20 +254,42 @@ impl TrustRootIo for TrustRoot {
     fn write(&self, path: &Path) -> Result<(), CredError> {
         let text =
             serde_json::to_string_pretty(self).map_err(|e| CredError::Stage(format!("serialize trust root: {e}")))?;
-        let tmp = path.with_extension("tmp");
-        let mut file = fs::File::create(&tmp).map_err(|e| stage_err("create trust-root temp", &tmp, &e))?;
-        file.write_all(text.as_bytes())
-            .map_err(|e| stage_err("write trust-root temp", &tmp, &e))?;
-        file.sync_all()
-            .map_err(|e| stage_err("sync trust-root temp", &tmp, &e))?;
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))
-            .map_err(|e| stage_err("tighten trust root to 0600", &tmp, &e))?;
-        fs::rename(&tmp, path).map_err(|e| stage_err("rename trust root into place", path, &e))?;
-        if let Some(dir) = path.parent() {
-            crate::fsync_dir(dir).map_err(|e| stage_err("fsync trust-root dir", dir, &e))?;
-        }
-        Ok(())
+        let (Some(dir), Some(name)) = (
+            path.parent().filter(|p| !p.as_os_str().is_empty()),
+            path.file_name().and_then(|n| n.to_str()),
+        ) else {
+            return Err(CredError::Stage(format!(
+                "trust root path {} has no parent dir or file name",
+                path.display()
+            )));
+        };
+        write_trust_secret(dir, name, text.as_bytes()).map(drop)
     }
+}
+
+/// Write trust material (the App private key, a trust-root config) as the `0600`
+/// file `name` in the trust-roots `dir`, creating `dir` `0700` if it is missing.
+///
+/// An existing `dir` that is not this user's or is group- or world-writable is
+/// refused and left as it is: another user may already have changed the key or
+/// the config in it, so the error asks for a check before the mode is fixed.
+///
+/// # Errors
+///
+/// [`CredError::Stage`] when the dir is unsafe or a write step fails.
+pub fn write_trust_secret(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf, CredError> {
+    let owned = sandy_fsutil::OwnedDir::open_or_create(dir).map_err(|e| match e {
+        sandy_fsutil::FsError::Unsafe { path, reason } => CredError::Stage(format!(
+            "trust-roots dir {} is not private ({reason}); another user may have been able to modify your App key or \
+             trust config. Verify the files in it are intact, then run `chmod 700 {}` and retry",
+            path.display(),
+            path.display()
+        )),
+        other @ sandy_fsutil::FsError::Io { .. } => CredError::Stage(other.to_string()),
+    })?;
+    owned
+        .write_secret(name, bytes)
+        .map_err(|e| CredError::Stage(e.to_string()))
 }
 
 /// Read a secret file, refusing one that is group- or world-readable (the read

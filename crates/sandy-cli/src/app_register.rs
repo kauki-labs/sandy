@@ -422,32 +422,7 @@ fn write_pem(stem: &str, pem: &str) -> Result<PathBuf, InstallError> {
 /// Write the PEM to a `0600` `<dir>/<stem>.pem` file, returning its path. The dir
 /// is a parameter so this is testable without touching the real config dir.
 fn write_pem_in(dir: &Path, stem: &str, pem: &str) -> Result<PathBuf, InstallError> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    std::fs::create_dir_all(dir).map_err(|source| InstallError::Io {
-        action: "create trust-roots dir",
-        path: dir.to_path_buf(),
-        source,
-    })?;
-    let path = dir.join(format!("{stem}.pem"));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&path)
-        .map_err(|source| InstallError::Io {
-            action: "create private-key file",
-            path: path.clone(),
-            source,
-        })?;
-    use std::io::Write;
-    file.write_all(pem.as_bytes()).map_err(|source| InstallError::Io {
-        action: "write private key",
-        path: path.clone(),
-        source,
-    })?;
-    Ok(path)
+    Ok(sandy::write_trust_secret(dir, &format!("{stem}.pem"), pem.as_bytes())?)
 }
 
 /// The `<config>/sandy/trust-roots` directory (`XDG_CONFIG_HOME` or `~/.config`).

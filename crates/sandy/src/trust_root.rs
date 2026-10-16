@@ -178,9 +178,18 @@ fn remove_path(action: &'static str, path: &Path) -> Result<(), InstallError> {
 
 #[cfg(test)]
 mod tests {
+    /// A 0700 temp dir whatever the umask: trust material is only written into a
+    /// private dir (#194).
+    fn private_tempdir() -> std::io::Result<tempfile::TempDir> {
+        tempfile::Builder::new()
+            .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(
+                0o700,
+            ))
+            .tempdir()
+    }
+
     use sandy_test_support::FakeProvisioner;
     use serde_json::json;
-    use tempfile::TempDir;
 
     use super::*;
     use crate::cred::Target;
@@ -244,7 +253,7 @@ mod tests {
 
     #[test]
     fn register_writes_the_config_only_after_verify_passes() -> anyhow::Result<()> {
-        let tmp = TempDir::new()?;
+        let tmp = private_tempdir()?;
         let key = tmp.path().join("key.pem");
         let cfg = tmp.path().join("root.json");
         let provisioner = FakeProvisioner::new(github_root(&key));
@@ -259,7 +268,7 @@ mod tests {
 
     #[test]
     fn register_refuses_an_existing_name_before_creating_anything() -> anyhow::Result<()> {
-        let tmp = TempDir::new()?;
+        let tmp = private_tempdir()?;
         let key = tmp.path().join("key.pem");
         let cfg = tmp.path().join("root.json");
         std::fs::write(&cfg, "{}")?; // a trust root of this name already exists
@@ -279,7 +288,7 @@ mod tests {
     fn register_skip_verify_writes_the_config_without_running_verify() -> anyhow::Result<()> {
         // A fake whose verify would FAIL; --skip-verify must still succeed, because
         // it never calls verify. Proves the bypass is a real bypass, not a no-op verify.
-        let tmp = TempDir::new()?;
+        let tmp = private_tempdir()?;
         let key = tmp.path().join("key.pem");
         let cfg = tmp.path().join("root.json");
         let provisioner = FakeProvisioner::failing_verify(github_root(&key));
@@ -293,7 +302,7 @@ mod tests {
 
     #[test]
     fn a_failed_verify_writes_no_config_and_shreds_the_secret_and_revokes() -> anyhow::Result<()> {
-        let tmp = TempDir::new()?;
+        let tmp = private_tempdir()?;
         let key = tmp.path().join("key.pem");
         let cfg = tmp.path().join("root.json");
         let provisioner = FakeProvisioner::failing_verify(github_root(&key));
@@ -312,7 +321,7 @@ mod tests {
 
     #[test]
     fn deregister_revokes_before_it_shreds_then_removes_the_config() -> anyhow::Result<()> {
-        let tmp = TempDir::new()?;
+        let tmp = private_tempdir()?;
         let key = tmp.path().join("key.pem");
         let cfg = tmp.path().join("root.json");
         let root = github_root(&key);
@@ -339,7 +348,7 @@ mod tests {
 
     #[test]
     fn deregister_keep_remote_shreds_locally_without_a_forge_revoke() -> anyhow::Result<()> {
-        let tmp = TempDir::new()?;
+        let tmp = private_tempdir()?;
         let key = tmp.path().join("key.pem");
         let cfg = tmp.path().join("root.json");
         let root = github_root(&key);
