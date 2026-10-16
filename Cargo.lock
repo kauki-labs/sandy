@@ -2065,6 +2065,7 @@ dependencies = [
  "clap",
  "octocrab",
  "rstest",
+ "rustix",
  "sandy-api",
  "sandy-backend",
  "sandy-fsutil",

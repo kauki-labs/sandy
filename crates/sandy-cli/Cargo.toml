@@ -63,5 +63,6 @@ uuid.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
+rustix.workspace = true
 rstest.workspace = true
 sandy-test-support.workspace = true

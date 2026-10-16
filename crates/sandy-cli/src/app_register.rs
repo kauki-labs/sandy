@@ -729,6 +729,45 @@ mod tests {
 
     use super::*;
 
+    /// #193: the verify probe stages an installation token, so its dir must be
+    /// 0700 from creation under any umask, freshly named (never a pre-created
+    /// path), and under the validated staging base. The old dir was created at the
+    /// umask's mode and narrowed by a chmod whose failure was discarded.
+    /// The umask is process-wide; nextest runs each test in its own process.
+    #[test]
+    fn the_verify_probe_dir_is_private_from_creation() -> anyhow::Result<()> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let previous = rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o002));
+        let made = (verify_tmp_dir(), verify_tmp_dir());
+        rustix::process::umask(previous);
+        let (first, second) = (made.0?, made.1?);
+        let cleanup = || {
+            let _ = std::fs::remove_dir_all(&first);
+            let _ = std::fs::remove_dir_all(&second);
+        };
+
+        let meta = std::fs::metadata(&first)?;
+        let mode = meta.permissions().mode() & 0o777;
+        let checks = [
+            (mode == 0o700, format!("the probe dir came out {mode:o}, not 0700")),
+            (
+                meta.uid() == rustix::process::getuid().as_raw(),
+                "the probe dir is not this user's".to_owned(),
+            ),
+            (first != second, "two probes shared a dir name".to_owned()),
+            (
+                first.starts_with(sandy_fsutil::ensure_sandy_staging_base()?),
+                format!("{} is outside the staging base", first.display()),
+            ),
+        ];
+        cleanup();
+        for (ok, why) in checks {
+            anyhow::ensure!(ok, "{why}");
+        }
+        Ok(())
+    }
+
     fn get(addr: &SocketAddr, target: &str) {
         let mut stream = TcpStream::connect(addr).expect("connect to catcher");
         write!(
