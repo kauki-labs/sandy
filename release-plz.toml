@@ -6,7 +6,7 @@
 #   release-plz release     for each crate whose Cargo.toml version has no git
 #                           tag yet, creates the tag + GitHub release and
 #                           publishes to crates.io, in dependency order
-#                           (sandy-box -> sandy-backend -> sandy-cli).
+#                           (sandy-lib -> sandy-backend -> sandy-cli).
 #
 # So a version bump reaching main is what triggers the tag + publish.
 

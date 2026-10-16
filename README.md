@@ -1,8 +1,8 @@
 # sandy
 
 [![PR](https://github.com/kauki-labs/sandy/actions/workflows/pr.yaml/badge.svg)](https://github.com/kauki-labs/sandy/actions/workflows/pr.yaml)
-[![crates.io](https://img.shields.io/crates/v/sandy-box.svg)](https://crates.io/crates/sandy-box)
-[![docs.rs](https://img.shields.io/docsrs/sandy-box.svg)](https://docs.rs/sandy-box)
+[![crates.io](https://img.shields.io/crates/v/sandy-lib.svg)](https://crates.io/crates/sandy-lib)
+[![docs.rs](https://img.shields.io/docsrs/sandy-lib.svg)](https://docs.rs/sandy-lib)
 [![codecov](https://codecov.io/gh/kauki-labs/sandy/branch/main/graph/badge.svg)](https://codecov.io/gh/kauki-labs/sandy)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust edition 2024](https://img.shields.io/badge/rust-edition%202024-orange.svg)](rust-toolchain.toml)
