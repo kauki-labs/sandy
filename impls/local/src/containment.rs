@@ -311,30 +311,47 @@ fn detect_status() -> ContainmentStatus {
     }
 }
 
-/// Probe whether `bwrap` can open an unprivileged mount namespace here (#142). A
-/// throwaway `bwrap … -- true`: it succeeds only when the bubblewrap binary is
-/// present AND unprivileged user namespaces are permitted (they can be disabled by
-/// `kernel.unprivileged_userns_clone=0` or an AppArmor profile). On failure the
-/// confinement features stay off and the backend keeps its `SANDY_*_DIR` + cooperative
-/// read-only behaviour. Non-Linux never confines.
+/// Probe whether `bwrap` can open an unprivileged mount namespace here (#142). Runs
+/// the EXACT [`bwrap_segment`] argv a real job would get (no shares — `&[]` needs no
+/// live host dirs), so the capability verdict matches precisely what `wrap()` will
+/// attempt: every mount (`--proc`, the three `--tmpfs`s), every `--unsetenv`, and the
+/// full [`UNSHARE_FLAGS`] set. Probe/wrapper divergence here is the dangerous case —
+/// a host that passes a narrower probe but rejects one of these (an LSM/seccomp
+/// policy blocking a `--tmpfs` or the `/proc` remount, say) would make
+/// `confines_filesystem()` report `true` while every subsequently wrapped job's
+/// `bwrap` fails before `exec`, which `run_staged` cannot distinguish from an
+/// ordinary nonzero guest exit (the INV-11 misclassification this probe exists to
+/// prevent; see also the #153 sentinel for the complementary run-time case). Sharing
+/// the literal argv-builder, not just a namespace-flag constant, closes the whole
+/// class by construction — any future change to `bwrap_segment` changes the probe
+/// too. Unprivileged user namespaces can also be disabled wholesale
+/// (`kernel.unprivileged_userns_clone=0`); on any failure the confinement features
+/// stay off and the backend keeps its `SANDY_*_DIR` + cooperative read-only fallback.
+/// Non-Linux never confines.
 fn detect_bwrap_confinement() -> bool {
     if !cfg!(target_os = "linux") {
         return false;
     }
-    // Probe the EXACT namespace set bwrap_segment uses (UNSHARE_FLAGS), so the
-    // capability verdict matches what the real wrapper will attempt: a host that
-    // accepts this probe will accept the wrapper's namespaces too.
-    let mut args = vec!["--ro-bind", "/", "/", "--dev", "/dev"];
-    args.extend(UNSHARE_FLAGS);
-    args.extend(["--die-with-parent", "--", "true"]);
     Command::new("bwrap")
-        .args(&args)
+        .args(bwrap_probe_args())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// The argv [`detect_bwrap_confinement`] runs (pure, so the probe/wrapper parity is
+/// unit-testable without a real `bwrap`): [`bwrap_segment`]'s flags with no shares
+/// (`&[]` needs no live host dirs) minus its leading literal `"bwrap"` token (spliced
+/// after `systemd-run`'s `--`; `Command::new("bwrap")` already names the binary),
+/// plus the probe's trivial `true` target command.
+fn bwrap_probe_args() -> Vec<String> {
+    let mut args = bwrap_segment(&[]);
+    args.remove(0);
+    args.push("true".to_string());
+    args
 }
 
 #[cfg(test)]
@@ -481,7 +498,7 @@ mod tests {
         );
         assert!(
             cmd.iter().any(|a| a == "--unshare-cgroup"),
-            "the full unshare set is applied (matching the probe), got {cmd:?}"
+            "the full unshare set is applied, got {cmd:?}"
         );
         // Faithful binds: inputs read-only, outputs writable.
         assert!(
@@ -499,6 +516,52 @@ mod tests {
             !c.status().is_untrusted_boundary(),
             "confinement is hardening, not an untrusted-safety claim (#150)"
         );
+    }
+
+    /// Probe/wrapper PARITY, by construction: the capability probe must exercise
+    /// every mount, env-unset, and namespace flag the real wrapper uses, not just the
+    /// namespace set. A host that passes a narrower probe but rejects (say) a
+    /// `--tmpfs` or the `/proc` remount under its LSM/seccomp policy would otherwise
+    /// make `confines_filesystem()` report `true` while every subsequently wrapped
+    /// job's `bwrap` dies before `exec` — a setup failure `run_staged` cannot
+    /// distinguish from an ordinary nonzero guest exit (INV-11 misclassification).
+    /// Asserts the probe args are EXACTLY `bwrap_segment(&[])` with `"bwrap"` dropped
+    /// and `"true"` appended, so any future edit to one cannot silently diverge from
+    /// the other.
+    #[test]
+    fn bwrap_probe_matches_the_real_wrapper_argv_exactly() {
+        let segment = bwrap_segment(&[]);
+        let probe = bwrap_probe_args();
+
+        assert_eq!(segment.first().map(String::as_str), Some("bwrap"));
+        let mut expected = segment[1..].to_vec();
+        expected.push("true".to_string());
+        assert_eq!(
+            probe, expected,
+            "the probe must run every flag the real wrapper does, plus its own trivial target; got probe={probe:?} \
+             segment={segment:?}"
+        );
+        // Every mount/env-hiding flag the finding called out must actually be present
+        // (guards against both the probe AND the wrapper silently losing one).
+        for needle in ["--proc", "--tmpfs", "--unsetenv", "--chdir"] {
+            assert!(
+                segment.iter().any(|a| a == needle),
+                "{needle} missing from bwrap_segment, got {segment:?}"
+            );
+        }
+        assert_eq!(
+            segment.iter().filter(|a| *a == "--tmpfs").count(),
+            3,
+            "exactly three tmpfs mounts (/tmp, /run/user, /run/sandy), got {segment:?}"
+        );
+        assert_eq!(
+            segment.iter().filter(|a| *a == "--unsetenv").count(),
+            2,
+            "exactly two unsetenv (the bus vars), got {segment:?}"
+        );
+        for flag in UNSHARE_FLAGS {
+            assert!(probe.iter().any(|a| a == flag), "{flag} missing from the probe");
+        }
     }
 
     /// macOS (and any non-Linux host) reports Unsupported — honest, mirroring the

@@ -145,7 +145,15 @@ choice) so host binaries resolve. The feature is gated on a `confines_filesystem
 capability, detected (bwrap present AND unprivileged user namespaces permitted) and
 SEPARATE from `isolates_untrusted`. When absent, the backend keeps the `SANDY_*_DIR`
 host-path + cooperative-RO fallback. The seam carries the shares as a `Mount{host,
-guest, ro}` set passed to `wrap`.
+guest, ro}` set passed to `wrap`. The capability probe runs the EXACT
+`bwrap_segment` argv the real wrapper uses (every mount, `--unsetenv`, and
+`UNSHARE_FLAGS`), not a narrower hand-picked subset — a host that accepts a looser
+probe but rejects one of the wrapper's own mounts under its LSM/seccomp policy
+would otherwise set `confines_filesystem() == true` while every subsequent job's
+`bwrap` dies before `exec`, a setup failure indistinguishable from an ordinary
+nonzero guest exit (INV-11). Sharing the literal argv builder, not a duplicated
+flag list, closes the whole parity class by construction (caught by sandy-b6's
+adversarial pass).
 
 **Consequences.** Write-confinement (a job cannot alter a read-only share or the host
 fs), path fidelity (same `/run/sandy/...` as the VM), and bus isolation (no
