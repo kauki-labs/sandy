@@ -1,6 +1,6 @@
 //! [`FakeBackend`]: an in-memory [`VmBackend`] test double.
 
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 
 use sandy_api::backend::{BackendError, BoxState, Outcome, RunSpec, VmBackend};
 
@@ -53,7 +53,7 @@ impl FakeBackend {
     /// The box ids [`VmBackend::kill`] has been called with, in order.
     #[must_use]
     pub fn killed(&self) -> Vec<String> {
-        self.killed.lock().expect("killed lock poisoned").clone()
+        self.killed.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
 }
 
@@ -67,7 +67,7 @@ impl VmBackend for FakeBackend {
     fn kill(&self, box_id: &str) -> Result<(), BackendError> {
         self.killed
             .lock()
-            .expect("killed lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .push(box_id.to_string());
         Ok(())
     }
