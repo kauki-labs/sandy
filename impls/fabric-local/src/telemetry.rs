@@ -137,6 +137,10 @@ impl TelemetrySink for LocalLog {
         line.push(b'\n');
         let _serialized = self.write.lock().unwrap_or_else(PoisonError::into_inner);
         let (mut file, created) = Self::open_for_append(path).map_err(|e| sink_err(path, &e))?;
+        if created {
+            // A new file (first emit, or the log was removed): its entry is not durable yet.
+            self.dir_synced.store(false, Ordering::Release);
+        }
         // A crash mid-append leaves a line without its newline; close it off so
         // this record starts on a line of its own.
         let torn = !created && {
