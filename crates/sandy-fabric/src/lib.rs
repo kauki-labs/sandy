@@ -20,7 +20,7 @@
 //! [`ChannelBackend`](channel_backend::ChannelBackend), carrying `sandy-proto`'s
 //! [`Envelope`](channel_backend::Envelope).
 //!
-//! With the `contract-tests` feature, [`contract`] exposes one `*_suite` per seam
+//! With the `contract-tests` feature, the `contract` module exposes one `*_suite` per seam
 //! that an impl crate runs its implementation against.
 
 pub mod capauth;

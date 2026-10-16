@@ -16,7 +16,7 @@ use std::{
 
 use sandy_api::backend::{SecretRef, SecretSource};
 use sandy_fabric::{
-    capauth::Cap,
+    capauth::{Cap, encode_cap},
     minter::{MintedSecret, Minter, MinterError, SecretRequest},
 };
 
@@ -135,7 +135,7 @@ pub fn stage_secret(dir: &Path, name: &str, bytes: &[u8]) -> Result<SecretRef, S
 /// to the agent out of band over its launch channel (#108, #109). Use this only
 /// for a surface the job cannot read.
 pub fn stage_cap(dir: &Path, name: &str, cap: &Cap) -> Result<PathBuf, StageError> {
-    let encoded = serde_json::to_vec(cap).map_err(|e| StageError::Encode(e.to_string()))?;
+    let encoded = encode_cap(cap).map_err(|e| StageError::Encode(e.to_string()))?;
     match stage_secret(dir, name, &encoded)?.source {
         SecretSource::File(path) => Ok(path),
         // stage_secret only ever stages to a file.
@@ -332,7 +332,7 @@ mod tests {
         let path = path.as_path();
         let mode = fs::metadata(path)?.permissions().mode() & 0o777;
         anyhow::ensure!(mode == 0o600, "mode {mode:o}");
-        let read: Cap = serde_json::from_slice(&fs::read(path)?)?;
+        let read = sandy_fabric::capauth::decode_cap(&fs::read(path)?)?;
         anyhow::ensure!(read == cap(), "the staged cap differs: {read:?}");
         Ok(())
     }

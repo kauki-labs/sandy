@@ -95,8 +95,7 @@ pub struct CapCodecError(String);
 /// for example over the consume-once pipe that carries the bootstrap cap from the
 /// executor to the agent (#108, #109).
 pub fn encode_cap(cap: &Cap) -> Result<Vec<u8>, CapCodecError> {
-    let _ = cap;
-    Err(CapCodecError("not implemented".to_owned()))
+    serde_json::to_vec(cap).map_err(|e| CapCodecError(e.to_string()))
 }
 
 /// Decode bytes written by [`encode_cap`].
@@ -104,8 +103,7 @@ pub fn encode_cap(cap: &Cap) -> Result<Vec<u8>, CapCodecError> {
 /// This parses; it does not verify. A decoded cap is only a claim until
 /// [`CapAuthority::verify`] accepts it.
 pub fn decode_cap(bytes: &[u8]) -> Result<Cap, CapCodecError> {
-    let _ = bytes;
-    Err(CapCodecError("not implemented".to_owned()))
+    serde_json::from_slice(bytes).map_err(|e| CapCodecError(e.to_string()))
 }
 
 #[cfg(test)]
