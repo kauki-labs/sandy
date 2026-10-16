@@ -248,8 +248,10 @@ and stay off unless asked for (spec §3.5).
 
 - `LocalLog` appends one JSON record per line with `O_APPEND` to a `0600` file and
   syncs it, so a record is durable once `emit` returns. Disabled by default: it
-  records nothing and creates no file. On read, a torn last line is skipped and a
-  corrupt earlier line is an error.
+  records nothing and creates no file. On read, an unreadable line is skipped with
+  a warning. A crash mid-append leaves a torn line, and the next emit closes it off
+  with a newline, so it sits between whole records and every durable record stays
+  readable.
 - `LocalFirst<S>` writes the local log first and fails only if that fails, then
   forwards to `S` best effort. With telemetry off it neither logs nor forwards.
 

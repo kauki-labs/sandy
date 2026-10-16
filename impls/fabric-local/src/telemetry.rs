@@ -11,7 +11,10 @@ use std::{
     io::{self, Read, Seek, SeekFrom, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
-    sync::{Mutex, PoisonError},
+    sync::{
+        Mutex, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use sandy_fabric::telemetry::{TelemetryError, TelemetryRecord, TelemetrySink};
@@ -19,7 +22,8 @@ use sandy_fabric::telemetry::{TelemetryError, TelemetryRecord, TelemetrySink};
 /// A [`TelemetrySink`] appending one JSON record per line to a local file.
 ///
 /// Each `emit` appends a whole line with `O_APPEND` and syncs it, so a record is
-/// durable once `emit` returns (the directory too, when the emit created the file).
+/// durable once `emit` returns. The directory is synced until one sync succeeds,
+/// so the file's own entry is durable too.
 /// The write is a short blocking call; telemetry is low-volume, and the sink stays
 /// runtime-agnostic. Emits from one `LocalLog` are serialized. The log is not
 /// rotated or capped yet.
@@ -34,6 +38,9 @@ use sandy_fabric::telemetry::{TelemetryError, TelemetryRecord, TelemetrySink};
 pub struct LocalLog {
     path: Option<PathBuf>,
     write: Mutex<()>,
+    /// Whether the log's directory entry is known durable. Sticky, so an emit
+    /// that follows a failed directory sync retries it.
+    dir_synced: AtomicBool,
 }
 
 impl LocalLog {
@@ -50,6 +57,7 @@ impl LocalLog {
         Self {
             path: Some(std::path::absolute(&path).unwrap_or(path)),
             write: Mutex::new(()),
+            dir_synced: AtomicBool::new(false),
         }
     }
 
@@ -147,11 +155,12 @@ impl TelemetrySink for LocalLog {
         file.write_all(&line)
             .and_then(|()| file.sync_data())
             .map_err(|e| sink_err(path, &e))?;
-        if created {
+        if !self.dir_synced.load(Ordering::Acquire) {
             let dir = path.parent().unwrap_or(Path::new("."));
             File::open(dir)
                 .and_then(|d| d.sync_all())
                 .map_err(|e| sink_err(dir, &e))?;
+            self.dir_synced.store(true, Ordering::Release);
         }
         Ok(())
     }
