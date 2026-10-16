@@ -4,7 +4,7 @@
 
 use std::{
     fs,
-    io::{Read, Write},
+    io::Read,
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
@@ -50,6 +50,7 @@ pub fn stage_secrets(secrets: &[SecretRef], inst_dir: &Path) -> Result<Vec<Stage
     fs::create_dir_all(inst_dir).map_err(|e| spawn_err("create instance dir", inst_dir, &e))?;
     fs::set_permissions(inst_dir, fs::Permissions::from_mode(0o700))
         .map_err(|e| spawn_err("tighten instance dir to 0700", inst_dir, &e))?;
+    let dir = sandy_fsutil::OwnedDir::open(inst_dir).map_err(|e| BackendError::Spawn(e.to_string()))?;
 
     let mut staged = Vec::with_capacity(secrets.len());
     for secret in secrets {
@@ -57,8 +58,9 @@ pub fn stage_secrets(secrets: &[SecretRef], inst_dir: &Path) -> Result<Vec<Stage
         let bytes = read_source(&secret.source)?;
         // Stage each secret under its own name: the guest mounts this dir read-only
         // and exports each file as `$NAME`, so the file name IS the env var name.
-        let guest_path = inst_dir.join(&secret.name);
-        write_secret_file(inst_dir, &guest_path, &bytes)?;
+        let guest_path = dir
+            .write_secret(&secret.name, &bytes)
+            .map_err(|e| BackendError::Spawn(e.to_string()))?;
         tracing::debug!(name = %secret.name, path = %guest_path.display(), "staged secret (0600)");
         staged.push(StagedSecret {
             name: secret.name.clone(),
@@ -151,21 +153,6 @@ fn read_source(source: &SecretSource) -> Result<Vec<u8>, BackendError> {
             "fd-sourced secrets (fd {fd}) are not supported without unsafe fd reads (INV-SAFE)"
         ))),
     }
-}
-
-/// Write `bytes` to `dest` as a `0600` file via temp-in-dir → sync → rename, then
-/// fsync the directory so the rename is durable (INV-1).
-fn write_secret_file(inst_dir: &Path, dest: &Path, bytes: &[u8]) -> Result<(), BackendError> {
-    let tmp = dest.with_extension("tmp");
-    let mut file = fs::File::create(&tmp).map_err(|e| spawn_err("create secret temp", &tmp, &e))?;
-    file.write_all(bytes)
-        .map_err(|e| spawn_err("write secret temp", &tmp, &e))?;
-    file.sync_all().map_err(|e| spawn_err("sync secret temp", &tmp, &e))?;
-    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))
-        .map_err(|e| spawn_err("tighten secret to 0600", &tmp, &e))?;
-    fs::rename(&tmp, dest).map_err(|e| spawn_err("rename secret into place", dest, &e))?;
-    crate::fsync_dir(inst_dir).map_err(|e| spawn_err("fsync instance dir", inst_dir, &e))?;
-    Ok(())
 }
 
 /// Build a [`BackendError::Spawn`] for an IO failure without leaking secret bytes.
