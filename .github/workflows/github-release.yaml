@@ -1,0 +1,46 @@
+name: GitHub Release
+# Reacts to an operator-pushed tag by creating a GitHub Release at that tag with
+# auto-generated notes. Never creates a tag itself: the operator pushes the
+# milestone tags by hand (#158); release-plz (.github/workflows/release.yaml)
+# creates the per-crate version tags on a main-branch version bump. Either kind
+# of tag lands here, this workflow only reacts.
+#
+# GitHub releases only, for now — no crates.io publishing (release-plz.toml's
+# `publish = false`). `gh release create` needs nothing but the GitHub API, so
+# there is no checkout and no toolchain to install.
+on:
+  push:
+    tags:
+      - "v*" # a version release
+      - "m*" # a milestone marker
+# Never let two release-creation runs for the same tag race each other.
+concurrency:
+  group: github-release-${{ github.ref_name }}
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  release:
+    name: release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # create the GitHub release at the pushed tag
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          disable-sudo: true
+          egress-policy: audit
+      - name: Create GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          # A milestone tag (m*) marks an interim point, not a stable version —
+          # flag it a pre-release so it never displays as "Latest". A version
+          # tag (v*) is a real release.
+          if [[ "$REF_NAME" == m* ]]; then
+            gh release create "$REF_NAME" --generate-notes --prerelease
+          else
+            gh release create "$REF_NAME" --generate-notes
+          fi

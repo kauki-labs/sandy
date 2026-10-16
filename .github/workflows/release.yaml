@@ -1,10 +1,10 @@
 name: Release
 # A version bump reaching main drives the release. release-plz opens a bump PR
 # (release-pr) and, for any crate whose version has no tag yet, creates the tag +
-# GitHub release and publishes to crates.io in dependency order (release).
-# release-plz runs through the Nix dev shell so it uses the repo's pinned toolchain,
-# and publishes with a short-lived OIDC token (crates.io trusted publishing), so
-# there is no long-lived registry secret in the repo.
+# GitHub release in dependency order (release). release-plz runs through the Nix
+# dev shell so it uses the repo's pinned toolchain. crates.io publishing is off
+# (release-plz.toml's `publish = false`, operator decision #158) — GitHub
+# releases only for now.
 on:
   push:
     branches: [main]
@@ -23,12 +23,11 @@ jobs:
     permissions:
       contents: write # create tags and GitHub releases
       pull-requests: write # open/update the release PR
-      id-token: write # exchange GitHub OIDC for a short-lived crates.io token
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
         with:
-          # release-plz reaches github.com and crates.io; installing Nix needs sudo.
+          # release-plz reaches github.com; installing Nix needs sudo.
           egress-policy: audit
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -53,15 +52,7 @@ jobs:
         run: nix develop -c release-plz release-pr --git-token "${GITHUB_TOKEN}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      # Trusted publishing: mint a short-lived crates.io token from GitHub's OIDC
-      # identity, so there is no long-lived CARGO_REGISTRY_TOKEN secret to store or
-      # leak. Requires a Trusted Publisher for this repo + workflow configured on
-      # crates.io; until that exists the step fails, and so does the publish below.
-      - name: Authenticate with crates.io
-        id: auth
-        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
-      - name: Tag, release, and publish
+      - name: Tag and release
         run: nix develop -c release-plz release --git-token "${GITHUB_TOKEN}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
