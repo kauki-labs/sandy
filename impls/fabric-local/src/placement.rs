@@ -80,8 +80,11 @@ impl Discovery for StaticRegistry {
     }
 
     async fn find(&self, req: &Requirements) -> Result<Vec<HostDescriptor>, DiscoveryError> {
-        let _ = (req, capabilities_satisfy);
-        Ok(Vec::new())
+        Ok(lock(&self.hosts)
+            .values()
+            .filter(|h| capabilities_satisfy(&h.capabilities, req))
+            .cloned()
+            .collect())
     }
 }
 
@@ -113,8 +116,19 @@ impl<E: Executor> ExecutorCapacity<E> {
 
 impl<E: Executor> Capacity for ExecutorCapacity<E> {
     async fn probe(&self, host: &HostId) -> Result<Availability, CapacityError> {
-        let _ = (host, &self.hosts);
-        Ok(Availability { free_slots: 0 })
+        let (executor, max_slots) = self
+            .hosts
+            .get(host)
+            .ok_or_else(|| CapacityError::UnknownHost(host.clone()))?;
+        let running = executor
+            .observe()
+            .await
+            .map_err(|e| CapacityError::Probe(e.to_string()))?
+            .len();
+        let running = u32::try_from(running).unwrap_or(u32::MAX);
+        Ok(Availability {
+            free_slots: max_slots.saturating_sub(running),
+        })
     }
 }
 
@@ -187,18 +201,32 @@ impl<C: Clock> Lifecycle for LeaseTable<C> {
     }
 
     async fn heartbeat(&self, lease: &Lease) -> Result<(), LifecycleError> {
-        let _ = lease;
-        Ok(())
+        let renewed = self.clock.now() + self.ttl;
+        match self.live_leases().get_mut(&lease.id) {
+            Some((host, deadline)) if *host == lease.host => {
+                *deadline = renewed;
+                Ok(())
+            }
+            _ => Err(LifecycleError::UnknownLease),
+        }
     }
 
     async fn deregister(&self, lease: &Lease) -> Result<(), LifecycleError> {
-        let _ = lease;
-        Ok(())
+        let mut leases = self.live_leases();
+        match leases.get(&lease.id) {
+            Some((host, _)) if *host == lease.host => {
+                leases.remove(&lease.id);
+                Ok(())
+            }
+            _ => Err(LifecycleError::UnknownLease),
+        }
     }
 
     async fn live(&self) -> Result<Vec<HostId>, LifecycleError> {
-        drop(self.live_leases());
-        Ok(Vec::new())
+        let mut hosts: Vec<_> = self.live_leases().values().map(|(h, _)| h.clone()).collect();
+        hosts.sort();
+        hosts.dedup();
+        Ok(hosts)
     }
 }
 
@@ -229,7 +257,17 @@ where
     L: Lifecycle,
     C: Capacity,
 {
-    let _ = (discovery, lifecycle, capacity, req);
+    let live = lifecycle.live().await?;
+    for candidate in discovery.find(req).await? {
+        if !live.contains(&candidate.host) {
+            continue;
+        }
+        match capacity.probe(&candidate.host).await {
+            Ok(availability) if availability.can_accept() => return Ok(Some(candidate.host)),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(host = ?candidate.host, error = %e, "capacity probe failed; skipping host"),
+        }
+    }
     Ok(None)
 }
 
