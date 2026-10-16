@@ -58,7 +58,7 @@ pub use backend::{
 };
 pub use collect::{CollectError, OutputSpec, collect};
 pub use config::CollectionConfig;
-pub use containment::{Containment, ContainmentStatus, NoContainment, ResourceLimits, admits_untrusted};
+pub use containment::{Containment, ContainmentStatus, Mount, NoContainment, ResourceLimits, admits_untrusted};
 pub use cred::{
     Capability, CredError, CredentialHandle, CredentialProvider, GitlabAccount, Lease, MAX_TTL_SECS, Minted, Scope,
     Target, TrustRoot, TrustRootIo, mint_lease, read_secret_0600, refresh_once, render_github_permissions,

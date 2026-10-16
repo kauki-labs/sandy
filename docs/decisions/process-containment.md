@@ -70,12 +70,15 @@ and `Unsupported` are all refused. As defence in depth the wrapper's user-bus en
 stripped from the job (`env -u`), though that alone is not the boundary (the socket
 persists at its default path). The refusal is asserted directly (the bad path).
 
-**Consequences.** Until the user-bus/namespace isolation lands (#142), a process
-backend refuses untrusted jobs even where cgroup reaping is Available — the gate
-tells the truth. The backend is library-only today (no all-local CLI profile), so
-the gate is a latent capability the fabric dispatcher will enforce live; the backend
-exposes `containment_status()` for it and for `sandy doctor`. The untrusted-OK path
-depends on #142.
+**Consequences.** A process backend refuses untrusted jobs even where cgroup
+reaping is Available — the gate tells the truth. The backend is library-only today
+(no all-local CLI profile), so the gate is a latent capability the fabric dispatcher
+will enforce live; the backend exposes `containment_status()` for it and for `sandy
+doctor`. The untrusted-OK path is NOT delivered by the #142 confinement work (which
+is write-confinement hardening, decision #5): under its A1 `--ro-bind / /` the job
+can still READ the host filesystem and the net namespace is shared, so flipping
+`isolates_untrusted` would over-claim. The flip (A2 minimal-rootfs read-confinement
+vs VM-only-by-policy) is a separate platform threat-model decision tracked in **#150**.
 
 **Set aside.** Adding a trust flag to `RunSpec` and refusing inside `run()`: a
 cross-cutting change to the shared wire type with no live caller yet; the
@@ -90,18 +93,16 @@ dispatch-level gate matches the existing `backend_accepts` pattern.
 `chmod a-w` of the local-dir transport). A pending crate restructure will move the
 process backend into `impls/local/`, so changes should stay localized.
 
-**Decision.** This record covers the cgroup reaping + gate + real `kill()`. The
-mount-namespace work (via `bwrap`, Linux-only) is a stacked follow-up (#142) carrying
-three things: path-faithful `/run/sandy/...` mounts, hard RO, AND **user-bus
-isolation** (hiding the session-bus socket so decision #1's escape closes). It is
-reconciled with the staging-base permissions work (#138) and the T4 local-dir share
-RO so the hard-RO mount story is built once. `admits_untrusted`'s untrusted-OK path
-is gated on #142: no process backend reports `is_untrusted_boundary` until it lands.
+**Decision.** This record's §1-2 covered the cgroup reaping + gate + real `kill()`.
+The mount-namespace work (via `bwrap`, Linux-only) landed in **#142** as decision #5
+below: path-faithful `/run/sandy/...` mounts, hard RO, and user-bus hiding. It did
+NOT flip `admits_untrusted` — that gate-flip is a separate threat-model decision
+(#150), because the confinement leaves the host filesystem readable (decision #5).
 
 **Consequences.** The weak-isolation divergence from guest-shares §11 (a process
-job reads `SANDY_*_DIR`, not `/run/sandy/...`, and RO is cooperative) persists until
-the follow-up. The gate already refuses untrusted jobs, so no untrusted work runs on
-the cooperative RO in the meantime.
+job reads `SANDY_*_DIR`, not `/run/sandy/...`, and RO is cooperative) is closed when
+the bwrap confinement is active (decision #5), and remains the fallback when it is
+not. The gate still refuses untrusted jobs regardless, pending #150.
 
 **Set aside.** Doing all three in one change: larger and harder to relocate cleanly
 into `impls/local/`, with no isolation benefit over shipping the reaping first (the
@@ -125,3 +126,56 @@ uses the VM backend.
 
 **Set aside.** A best-effort `sandbox-exec` profile: deprecated, cannot reap
 escapees, and would blur the honest "unsupported" signal.
+
+## 5. bwrap confinement: path fidelity, hard RO, bus-hide — hardening, not a gate-flip (#142)
+
+**Status:** accepted. **Upholds:** INV-1, INV-7.
+
+**Context.** The process job read shares via `SANDY_*_DIR` host paths, not the VM's
+fixed `/run/sandy/...`; read-only was cooperative (`chmod a-w`, defeatable by a
+same-user job); and the user-session bus was reachable (the CWE-269 escape, §1-2).
+
+**Decision.** Compose `bwrap` INSIDE the `systemd-run --user --scope`
+(`systemd-run … -- bwrap … -- <job>`), both unprivileged and Nix-provided, so
+`forbid(unsafe_code)` holds. bwrap gives a mount namespace that: binds each share at
+its faithful `/run/sandy/<tag>` path (read-only for inputs/secrets via `--ro-bind`,
+writable outputs via `--bind`); hides the user bus (`--tmpfs /run` + `--unsetenv` of
+the bus vars — `/run` must be the WHOLE tmpfs, not just `/run/user`: under
+`--ro-bind / /` the host tree is read-only, so bwrap cannot `mkdir` the `/run/sandy`
+mountpoint under a merely-shadowed `/run/user`; a writable `/run` fixes the mkdir and
+drops `/run/user` for free, found by the ws01 live run — every job died in under a
+second until this landed); and exposes the host rootfs read-only (`--ro-bind / /`,
+the **A1** choice) so host binaries resolve. The feature is gated on a `confines_filesystem()`
+capability, detected (bwrap present AND unprivileged user namespaces permitted) and
+SEPARATE from `isolates_untrusted`. When absent, the backend keeps the `SANDY_*_DIR`
+host-path + cooperative-RO fallback. The seam carries the shares as a `Mount{host,
+guest, ro}` set passed to `wrap`. The capability probe runs the EXACT
+`bwrap_segment` argv the real wrapper uses (every mount, `--unsetenv`, and
+`UNSHARE_FLAGS`), not a narrower hand-picked subset — a host that accepts a looser
+probe but rejects one of the wrapper's own mounts under its LSM/seccomp policy
+would otherwise set `confines_filesystem() == true` while every subsequent job's
+`bwrap` dies before `exec`, a setup failure indistinguishable from an ordinary
+nonzero guest exit (INV-11). Sharing the literal argv builder, not a duplicated
+flag list, closes the whole parity class by construction (caught by sandy-b6's
+adversarial pass).
+
+**Consequences.** Write-confinement (a job cannot alter the read-only host-root bind
+or a read-only share; the designated writable output share stays writable, by
+design), path fidelity (same `/run/sandy/...` as the VM), and bus isolation (no
+`systemd-run --user` escape from inside the namespace) — real hardening for the
+semi-trusted/cooperative case. It does NOT make the backend untrusted-safe: under A1
+the job can still READ the whole host filesystem (`~/.ssh`, operator secrets) and the
+net namespace is shared, so it could exfiltrate. Therefore `isolates_untrusted` STAYS
+`false` and the gate keeps refusing untrusted jobs. RO reconcile, no duplication:
+bwrap `--ro-bind` is the guest-side enforcement; the staging-base validation
+(#138/#140/#141) is the host-side source-dir trust; the cooperative `set_dir_readonly`
+(guest-shares §11) is the no-bwrap fallback. The live leg (K16-K18) is Linux + bwrap
+
+- userns, operator-run.
+
+**Set aside.** Flipping `isolates_untrusted: true` on bwrap presence: rejected — A1's
+readable host fs + shared net is not untrusted-safe, and a caller seeing the flag
+would route untrusted work here and leak host secrets. Read-confidentiality (A2
+minimal rootfs) vs untrusted-is-VM-only is a load-bearing platform decision tracked
+in **#150**, not settled here. Unsharing the net namespace: out of scope (egress is a
+separate seam); bwrap keeps net shared.

@@ -5,7 +5,7 @@ use std::sync::Mutex;
 
 use sandy_api::{
     backend::BackendError,
-    containment::{Containment, ContainmentStatus, ResourceLimits},
+    containment::{Containment, ContainmentStatus, Mount, ResourceLimits},
 };
 
 /// A test double: a fixed [`ContainmentStatus`], an optional recorded `wrap` prefix,
@@ -15,6 +15,7 @@ use sandy_api::{
 pub struct FakeContainment {
     status: ContainmentStatus,
     wrap_prefix: Vec<String>,
+    confines: bool,
     reaped: Mutex<Vec<String>>,
 }
 
@@ -39,10 +40,27 @@ impl FakeContainment {
         })
     }
 
+    /// A reaping containment that also reports filesystem confinement
+    /// ([`confines_filesystem`](Containment::confines_filesystem) true) with an empty
+    /// wrap (still spawnable), so a test can assert the backend advertises the
+    /// faithful `/run/sandy/<tag>` paths. Still NOT an untrusted boundary.
+    #[must_use]
+    pub fn confining() -> Self {
+        Self {
+            status: ContainmentStatus::Available {
+                isolates_untrusted: false,
+            },
+            wrap_prefix: Vec::new(),
+            confines: true,
+            reaped: Mutex::new(Vec::new()),
+        }
+    }
+
     fn with_status(status: ContainmentStatus) -> Self {
         Self {
             status,
             wrap_prefix: Vec::new(),
+            confines: false,
             reaped: Mutex::new(Vec::new()),
         }
     }
@@ -56,6 +74,7 @@ impl FakeContainment {
                 isolates_untrusted: false,
             },
             wrap_prefix: prefix,
+            confines: false,
             reaped: Mutex::new(Vec::new()),
         }
     }
@@ -66,6 +85,7 @@ impl FakeContainment {
         Self {
             status: ContainmentStatus::Unavailable(reason.to_string()),
             wrap_prefix: Vec::new(),
+            confines: false,
             reaped: Mutex::new(Vec::new()),
         }
     }
@@ -82,8 +102,12 @@ impl Containment for FakeContainment {
         self.status.clone()
     }
 
-    fn wrap(&self, _id: &str, _limits: ResourceLimits) -> Vec<String> {
+    fn wrap(&self, _id: &str, _limits: ResourceLimits, _mounts: &[Mount]) -> Vec<String> {
         self.wrap_prefix.clone()
+    }
+
+    fn confines_filesystem(&self) -> bool {
+        self.confines
     }
 
     fn reap(&self, id: &str) -> Result<(), BackendError> {
