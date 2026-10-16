@@ -102,5 +102,5 @@ pub use staging::ensure_sandy_staging_base;
 pub use strategy::{BootAxis, BuildAxis, HostFacts, ProvisioningStrategy, classify};
 pub use trust_root::{
     InstallError, Provisioner, RegistrationPlan, RevokeOutcome, deregister, github_app_manifest, parse_capability,
-    register, register_skip_verify,
+    register, register_skip_verify, validate_trust_root_name,
 };

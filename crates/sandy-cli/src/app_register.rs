@@ -485,6 +485,7 @@ pub fn run_register(
     skip_verify: bool,
     force: bool,
 ) -> Result<(), InstallError> {
+    sandy::validate_trust_root_name(handle)?;
     let dir = trust_roots_dir().map_err(|e| InstallError::Capture(e.to_string()))?;
     let cfg = config_path(&dir, handle);
     if !force {
@@ -533,6 +534,7 @@ pub fn run_register(
 /// # Errors
 /// Any [`InstallError`] from loading, the forge revoke, or the local removal.
 pub fn run_deregister(name: &str, keep_remote: bool) -> Result<(), InstallError> {
+    sandy::validate_trust_root_name(name)?;
     let dir = trust_roots_dir().map_err(|e| InstallError::Capture(e.to_string()))?;
     let cfg = config_path(&dir, name);
     let root = TrustRoot::load(&cfg)?;
@@ -638,6 +640,7 @@ pub fn run_import(
     base_url: Option<String>,
     targets: Vec<Target>,
 ) -> Result<(), InstallError> {
+    sandy::validate_trust_root_name(handle)?;
     let dir = trust_roots_dir().map_err(|e| InstallError::Capture(e.to_string()))?;
     let cfg = import_into(&dir, handle, app_id, installation_id, pem_source, base_url, targets)?;
     println!("Imported shared GitHub App trust root: app_id={app_id}, installation_id={installation_id}");
@@ -652,6 +655,7 @@ pub fn run_import(
 /// # Errors
 /// [`InstallError::Verify`] if the probe fails, or a config/load error.
 pub fn run_verify(handle: &str, capabilities: &[Capability]) -> Result<(), InstallError> {
+    sandy::validate_trust_root_name(handle)?;
     let dir = trust_roots_dir().map_err(|e| InstallError::Capture(e.to_string()))?;
     let cfg = config_path(&dir, handle);
     let root = TrustRoot::load(&cfg)?;
@@ -733,10 +737,18 @@ mod tests {
         let victim = dir.path().join("victim");
         std::fs::write(&victim, "untouched")?;
         std::os::unix::fs::symlink(&victim, dir.path().join("acme.pem"))?;
-        write_pem_in(dir.path(), "acme", "-----BEGIN KEY-----")?;
+        let key = write_pem_in(dir.path(), "acme", "-----BEGIN KEY-----")?;
         anyhow::ensure!(
             std::fs::read_to_string(&victim)? == "untouched",
             "the key was written through a symlink"
+        );
+        anyhow::ensure!(
+            std::fs::symlink_metadata(&key)?.is_file(),
+            "the key path is still a symlink"
+        );
+        anyhow::ensure!(
+            std::fs::read_to_string(&key)? == "-----BEGIN KEY-----",
+            "the key was not written"
         );
         Ok(())
     }

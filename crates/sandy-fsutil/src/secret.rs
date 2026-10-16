@@ -165,7 +165,7 @@ impl OwnedDir {
     /// name, and writing again replaces it.
     ///
     /// `name` must be a single file name: empty, `.`, `..`, or a name containing
-    /// `/` is refused.
+    /// `/` or NUL is refused.
     ///
     /// # Errors
     ///
@@ -402,7 +402,7 @@ mod tests {
 
     /// The umask is process-wide; nextest runs each test in its own process.
     #[test]
-    fn open_or_create_makes_a_missing_dir_0700_under_a_group_writable_umask() -> anyhow::Result<()> {
+    fn open_or_create_makes_a_missing_dir_0700_where_create_dir_all_gives_0775() -> anyhow::Result<()> {
         let root = staging_dir()?;
         let path = root.path().join("config").join("trust-roots");
         let previous = rustix::process::umask(Mode::from_raw_mode(0o002));
@@ -475,7 +475,7 @@ mod tests {
         let owned = OwnedDir::open(dir.path())?;
         for bad in ["", ".", "..", "a/b", "../escape"] {
             let res = owned.write_secret(bad, b"x");
-            anyhow::ensure!(res.is_err(), "{bad:?} was written");
+            anyhow::ensure!(matches!(res, Err(FsError::Unsafe { .. })), "{bad:?} gave {res:?}");
         }
         anyhow::ensure!(fs::read_dir(dir.path())?.count() == 2, "a refused name left a file");
         anyhow::ensure!(

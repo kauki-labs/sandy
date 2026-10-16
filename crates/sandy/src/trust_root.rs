@@ -158,13 +158,40 @@ fn secret_path(root: &TrustRoot) -> &Path {
 /// Best-effort shred of a trust root's secret file: overwrite the bytes, then
 /// unlink. Media-level shredding isn't guaranteed on a modern filesystem; this
 /// clears the content at the path and removes the file. Absent file is a no-op.
+///
+/// The file is opened with `O_NOFOLLOW` and must be a regular file: a symlink
+/// planted at the key path is unlinked, never followed, so its target is not
+/// zeroed.
 fn shred_secret(root: &TrustRoot) {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+
     let path = secret_path(root);
-    if let Ok(meta) = fs::metadata(path) {
-        let len = usize::try_from(meta.len()).unwrap_or(0);
-        let _ = fs::write(path, vec![0u8; len]);
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        if let Some(meta) = file.metadata().ok().filter(fs::Metadata::is_file) {
+            let len = usize::try_from(meta.len()).unwrap_or(0);
+            let _ = file.write_all(&vec![0u8; len]).and_then(|()| file.sync_all());
+        }
     }
     let _ = fs::remove_file(path);
+}
+
+/// Check that `name` can name a trust root: a single file name, used as the stem
+/// of `<name>.json` and `<name>.pem` in the trust-roots dir. Run it before
+/// anything is created, so a bad name never orphans a forge App.
+///
+/// # Errors
+/// [`InstallError::Cred`] when `name` is empty, `.`, `..`, or contains `/` or NUL.
+pub fn validate_trust_root_name(name: &str) -> Result<(), InstallError> {
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
+        return Err(InstallError::Cred(crate::cred::CredError::Stage(format!(
+            "trust-root name {name:?} must be a single file name (no `/`, not `.` or `..`)"
+        ))));
+    }
+    Ok(())
 }
 
 /// Remove a file, mapping the error to a named [`InstallError::Io`].
@@ -343,6 +370,46 @@ mod tests {
         );
         assert!(!key.exists(), "the secret is shredded");
         assert!(!cfg.exists(), "the config is removed");
+        Ok(())
+    }
+
+    /// #194: a trust-root name must be a single file name, checked before
+    /// anything is created.
+    #[test]
+    fn a_trust_root_name_must_be_a_single_file_name() {
+        for bad in ["", ".", "..", "../escape", "a/b", "nul\0byte"] {
+            assert!(validate_trust_root_name(bad).is_err(), "{bad:?} was accepted");
+        }
+        for good in ["acme", "acme-widgets_2", "..dots.."] {
+            assert!(validate_trust_root_name(good).is_ok(), "{good:?} was refused");
+        }
+    }
+
+    /// #194: deregister's shred never zeroes a file through a symlink planted at
+    /// the key path; it unlinks the link and leaves the target alone.
+    #[test]
+    fn shredding_never_follows_a_symlink_at_the_key_path() -> anyhow::Result<()> {
+        let tmp = private_tempdir()?;
+        let victim = tmp.path().join("victim");
+        std::fs::write(&victim, b"precious")?;
+        let key = tmp.path().join("acme.pem");
+        std::os::unix::fs::symlink(&victim, &key)?;
+        let root = TrustRoot::Github {
+            base_url: None,
+            app_id: "1".to_string(),
+            private_key_path: key.clone(),
+            installation_id: 2,
+            targets: vec![],
+        };
+        shred_secret(&root);
+        anyhow::ensure!(
+            std::fs::read(&victim)? == b"precious",
+            "the shred zeroed a symlink's target"
+        );
+        anyhow::ensure!(
+            std::fs::symlink_metadata(&key).is_err(),
+            "the symlink at the key path was left in place"
+        );
         Ok(())
     }
 

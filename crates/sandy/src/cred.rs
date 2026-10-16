@@ -281,7 +281,8 @@ pub fn write_trust_secret(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBu
     let owned = sandy_fsutil::OwnedDir::open_or_create(dir).map_err(|e| match e {
         sandy_fsutil::FsError::Unsafe { path, reason } => CredError::Stage(format!(
             "trust-roots dir {} is not private ({reason}); another user may have been able to modify your App key or \
-             trust config. Verify the files in it are intact, then run `chmod 700 {}` and retry",
+             trust config. Verify the files in it are intact, then make sure the dir is yours (`chown`) and run \
+             `chmod 700 {}`, and retry",
             path.display(),
             path.display()
         )),
