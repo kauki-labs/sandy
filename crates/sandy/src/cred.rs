@@ -754,6 +754,63 @@ mod tests {
         Ok(())
     }
 
+    /// #200: a symlink at the leaf is refused even when it points at a file the
+    /// reader owns, so a link planted in a wide dir cannot pass the owner check.
+    #[test]
+    fn a_symlinked_secret_is_refused_even_when_its_target_is_owned() -> anyhow::Result<()> {
+        let tmp = private_tempdir()?;
+        let target = tmp.path().join("victim-owned.pem");
+        fs::write(&target, b"not-the-app-key")?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
+        let link = tmp.path().join("acme.pem");
+        std::os::unix::fs::symlink(&target, &link)?;
+        assert!(
+            read_secret_0600(&link).is_err(),
+            "a symlinked key must be refused, not followed"
+        );
+        let target_cfg = tmp.path().join("victim-owned.json");
+        sample_root().write(&target_cfg)?;
+        let link_cfg = tmp.path().join("acme.json");
+        std::os::unix::fs::symlink(&target_cfg, &link_cfg)?;
+        assert!(
+            TrustRoot::load(&link_cfg).is_err(),
+            "a symlinked trust-root config must be refused, not followed"
+        );
+        Ok(())
+    }
+
+    /// #200: the owner check runs on the opened file: a file the current uid does
+    /// not own is refused through the real read path.
+    #[test]
+    fn a_file_another_uid_owns_is_refused_on_the_fd_path() -> anyhow::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = private_tempdir()?;
+        let key = tmp.path().join("acme.pem");
+        fs::write(&key, b"key-bytes")?;
+        let other = fs::metadata(&key)?.uid().wrapping_add(1);
+        let err = open_trust_file_as("App key", &key, other).expect_err("a foreign-owned key must be refused");
+        assert!(err.to_string().contains("another user"), "unexpected: {err}");
+        Ok(())
+    }
+
+    /// #200: the fd path reports the tamper warning for a wide dir, and none for a
+    /// private one.
+    #[test]
+    fn the_fd_path_warns_for_a_wide_dir_only() -> anyhow::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = private_tempdir()?;
+        let key = tmp.path().join("acme.pem");
+        fs::write(&key, b"key-bytes")?;
+        let me = fs::metadata(&key)?.uid();
+        let (_, _, warning) = open_trust_file_as("App key", &key, me)?;
+        assert!(warning.is_none(), "a private dir warned: {warning:?}");
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o775))?;
+        let (_, _, warning) = open_trust_file_as("App key", &key, me)?;
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700))?;
+        assert!(warning.is_some(), "a 0775 dir drew no warning");
+        Ok(())
+    }
+
     /// #200: reading your own key in a group-writable dir warns but still works
     /// (refusing that read is the operator's decision, not made here).
     #[test]
