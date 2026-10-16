@@ -14,10 +14,10 @@ edition = "2024"
 rust-version = "1.85"
 
 [workspace.dependencies]
-# The library publishes as `sandy-box`; the `package` alias keeps the in-tree and
+# The library publishes as `sandy-lib`; the `package` alias keeps the in-tree and
 # dependent import path `sandy`. `version` is required for the path deps to be
 # publishable to crates.io (cargo drops the path and uses the version on publish).
-sandy = { path = "crates/sandy", package = "sandy-box", version = "0.1.1" }
+sandy = { path = "crates/sandy", package = "sandy-lib", version = "0.1.1" }
 sandy-api = { path = "crates/sandy-api", version = "0.1.1" }
 sandy-backend = { path = "crates/sandy-backend", version = "0.1.1" }
 sandy-proto = { path = "crates/sandy-proto", version = "0.1.1" }

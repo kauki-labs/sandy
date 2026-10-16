@@ -45,7 +45,7 @@ nix flake check -L               # the full gate: build, clippy, docs, tests, fo
 
 Releases are automated by [release-plz](https://release-plz.dev). A version bump
 reaching `main` opens the release (tag, GitHub release, and a crates.io publish
-of `sandy-box` / `sandy-backend` / `sandy-cli` in dependency order); you do not
+of `sandy-lib` / `sandy-backend` / `sandy-cli` in dependency order); you do not
 tag or publish by hand. release-plz also keeps a prepared bump PR open with the
 changelog.
 
