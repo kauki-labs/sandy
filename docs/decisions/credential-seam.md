@@ -59,3 +59,31 @@ token.
 **Consequences.** A long job keeps working across token expiry; the value is never
 exposed on argv/console. Proven live by K11 (`live_refresh.rs`), which refuses on
 default margins rather than skip-greening (INV-S9).
+
+## 4. Trust material is written only into a private trust-roots dir
+
+**Status:** accepted. **Upholds:** INV-1.
+
+**Context.** The GitHub App private key and the trust-root configs live in
+`$XDG_CONFIG_HOME/sandy/trust-roots` (or `~/.config/...`). The key was written with
+`truncate`, which kept an existing file's mode and followed a symlink at its path.
+The config was written through a fixed `<path>.tmp` that also followed a symlink.
+The dir itself was created at the umask's mode and never checked (#194).
+
+**Decision.** Both go through `sandy::write_trust_secret`, which uses
+`sandy_fsutil::OwnedDir`: the dir is created `0700` if missing, and an existing
+one must be this user's and not group- or world-writable. Each file is written
+`0600` from creation, with `O_EXCL | O_NOFOLLOW`, under a unique temp name, then
+renamed into place. An unsafe existing dir is refused, not repaired. The error
+says another user may have changed the key or config, asks for a check, and then
+names `chmod 700`.
+
+**Consequences.** Reads are unchanged (`read_secret_0600` checks the file). An
+existing install whose trust-roots dir is group-writable (for example, registered
+under umask `0002`, so `0775`) is refused on its next register, import, deregister
+or update until the user verifies the files and runs `chmod 700`. That is a
+deliberate, one-time break.
+
+**Set aside.** Tightening the dir to `0700` and continuing: if the dir was writable
+by others, the key or config in it may already have been swapped, and continuing
+would trust it silently.
