@@ -67,18 +67,26 @@ fn a_revoked_cap_is_refused_even_before_its_expiry() -> anyhow::Result<()> {
 
 #[test]
 fn minting_without_an_expiry_bakes_in_the_default_ttl() -> anyhow::Result<()> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .context("clock")?
-        .as_secs();
+    fn unix_now() -> anyhow::Result<u64> {
+        Ok(std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .context("clock")?
+            .as_secs())
+    }
+
+    let before = unix_now()?;
     let authority = LocalCapAuthority::new(TEST_DEFAULT_TTL).context("authority")?;
     let cap = authority.mint(scope(full_rights(), None)).context("mint")?;
+    let after = unix_now()?;
     let expires_at = cap
         .scope
         .expires_at
         .context("None was not resolved to a concrete expiry")?;
+    // Bracket by clock reads taken before and after mint, not a single `now`: the
+    // Unix second can tick over between this test's clock read and mint's own,
+    // which would otherwise make the upper bound flaky.
     assert!(
-        (now..=now + TEST_DEFAULT_TTL.as_secs()).contains(&expires_at),
+        (before + TEST_DEFAULT_TTL.as_secs()..=after + TEST_DEFAULT_TTL.as_secs()).contains(&expires_at),
         "expected an expiry within the default TTL window, got {expires_at}"
     );
     Ok(())
