@@ -290,8 +290,7 @@ impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
 /// dropped mid-`select!`) loses that envelope — at-most-once, not the
 /// at-least-once the spec wants for the offline/reconnect case. True
 /// at-least-once needs a consumer-ack'd or consumer-managed cursor instead of
-/// one the backend advances on delivery; tracked as a follow-up, not fixed
-/// here.
+/// one the backend advances on delivery; tracked as #186, not fixed here.
 ///
 /// Also doesn't re-check membership per yield: once created, it keeps polling
 /// the backend regardless of a later `leave()`/revocation/expiry — see
