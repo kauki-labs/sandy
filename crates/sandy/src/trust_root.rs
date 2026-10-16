@@ -75,7 +75,7 @@ pub fn register(
     capabilities: &[Capability],
     config_path: &Path,
 ) -> Result<TrustRoot, InstallError> {
-    reject_existing(config_path)?;
+    preflight(config_path)?;
     let root = provisioner.capture(capabilities)?;
     if let Err(err) = provisioner.verify(&root, capabilities) {
         // Tear down what capture created; write no config. Revoke needs the secret,
@@ -102,10 +102,21 @@ pub fn register_skip_verify(
     capabilities: &[Capability],
     config_path: &Path,
 ) -> Result<TrustRoot, InstallError> {
-    reject_existing(config_path)?;
+    preflight(config_path)?;
     let root = provisioner.capture(capabilities)?;
     root.write(config_path)?;
     Ok(root)
+}
+
+/// The checks that must pass before capture creates anything at the forge: no
+/// existing config of this name, and a private trust-roots dir, which the key and
+/// config writes would otherwise refuse only after the App exists.
+fn preflight(config_path: &Path) -> Result<(), InstallError> {
+    reject_existing(config_path)?;
+    if let Some(dir) = config_path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        crate::cred::open_trust_dir(dir)?;
+    }
+    Ok(())
 }
 
 /// Refuse to register over an existing trust-root config. Checked before capture,

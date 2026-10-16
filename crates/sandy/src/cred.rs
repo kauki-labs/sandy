@@ -278,7 +278,15 @@ impl TrustRootIo for TrustRoot {
 ///
 /// [`CredError::Stage`] when the dir is unsafe or a write step fails.
 pub fn write_trust_secret(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf, CredError> {
-    let owned = sandy_fsutil::OwnedDir::open_or_create(dir).map_err(|e| match e {
+    open_trust_dir(dir)?
+        .write_secret(name, bytes)
+        .map_err(|e| CredError::Stage(e.to_string()))
+}
+
+/// Open (creating `0700` if missing) the trust-roots dir, refusing one that is
+/// group/world-writable or another user owns, with the tamper warning.
+pub(crate) fn open_trust_dir(dir: &Path) -> Result<sandy_fsutil::OwnedDir, CredError> {
+    sandy_fsutil::OwnedDir::open_or_create(dir).map_err(|e| match e {
         sandy_fsutil::FsError::Unsafe { path, reason } => CredError::Stage(format!(
             "trust-roots dir {} is not private ({reason}); another user may have been able to modify your App key or \
              trust config. Verify the files in it are intact, then make sure the dir is yours (`chown`) and run \
@@ -287,10 +295,7 @@ pub fn write_trust_secret(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBu
             path.display()
         )),
         other @ sandy_fsutil::FsError::Io { .. } => CredError::Stage(other.to_string()),
-    })?;
-    owned
-        .write_secret(name, bytes)
-        .map_err(|e| CredError::Stage(e.to_string()))
+    })
 }
 
 /// Read a secret file, refusing one that is group- or world-readable (the read

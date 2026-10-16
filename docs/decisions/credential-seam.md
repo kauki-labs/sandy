@@ -83,8 +83,9 @@ existing install whose trust-roots dir is group-writable (for example, registere
 under umask `0002`, so `0775`) is refused on its next register or import until the
 user verifies the files and runs `chmod 700`; deregister writes no trust material
 and still works, and its shred never follows a symlink at the key path. That is a
-deliberate, one-time break. The trust-root name is checked to be a single file name
-before anything is created.
+deliberate, one-time break. Register checks the dir before capture, so the refusal
+never leaves a forge App behind whose key it could not save. The trust-root name is
+checked to be a single file name before anything is created.
 
 **Set aside.** Tightening the dir to `0700` and continuing: if the dir was writable
 by others, the key or config in it may already have been swapped, and continuing
