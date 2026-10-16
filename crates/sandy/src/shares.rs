@@ -60,8 +60,16 @@ pub fn plan_shares(spec: &RunSpec, dirs: &ShareDirs) -> Result<Vec<ShareSpec>, B
     // Secrets: stage into `spec.secret_dir` when the caller owns one (refresh
     // re-delivery, #49, rewrites the token in it mid-run), else our own inst_dir.
     // Attach when the run carries secrets or a pre-staged dir. Read-only.
+    // A caller's dir is opened as it is and refused if it is not private; sandy's
+    // own instance dir is created 0700 if missing, and refused, never repaired, if
+    // it exists but is not private.
     let secret_dir = spec.secret_dir.unwrap_or(dirs.inst_dir);
-    let staged_secrets = stage_secrets(spec.secrets, secret_dir)?;
+    let owned = match spec.secret_dir {
+        Some(dir) => sandy_fsutil::OwnedDir::open(dir),
+        None => sandy_fsutil::OwnedDir::open_or_create(dirs.inst_dir),
+    }
+    .map_err(|e| BackendError::Spawn(e.to_string()))?;
+    let staged_secrets = stage_secrets(spec.secrets, &owned)?;
     if !staged_secrets.is_empty() || spec.secret_dir.is_some() {
         shares.push(share(secret_dir.to_path_buf(), SECRET_MOUNT_TAG, true));
     }

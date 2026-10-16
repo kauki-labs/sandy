@@ -45,7 +45,6 @@
 //! strong boundary.
 
 use std::{
-    fs,
     io::Read,
     os::unix::process::ExitStatusExt,
     path::Path,
@@ -156,8 +155,8 @@ impl ProcessBackend {
             .ok_or_else(|| BackendError::Spawn("empty command".to_string()))?;
         let box_id = run_id.to_string();
 
-        // inst_dir holds the default secret share; create it before staging.
-        fs::create_dir_all(inst_dir)
+        // inst_dir holds the default secret share; create it 0700 before staging.
+        sandy_fsutil::OwnedDir::open_or_create(inst_dir)
             .map_err(|err| BackendError::Spawn(format!("create inst dir {}: {err}", inst_dir.display())))?;
 
         // Stage secret/input/output per the shared policy, then present them as

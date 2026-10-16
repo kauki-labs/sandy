@@ -448,6 +448,12 @@ fn plan_shares_attaches_an_empty_secret_dir_for_refresh() -> Result<()> {
     let inst = tmp.path().join("inst");
     let cred = tmp.path().join("cred");
     std::fs::create_dir_all(&cred).context("mk cred dir")?;
+    // A caller's secret dir must be private (#174): plan_shares refuses a wider one.
+    std::fs::set_permissions(
+        &cred,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+    )
+    .context("cred dir 0700")?;
     let inputs = tmp.path().join("i");
     let outputs = tmp.path().join("o");
 

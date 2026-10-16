@@ -86,17 +86,14 @@ impl OwnedDir {
                 Err(e) => return Err(FsError::io("create dir", path, e)),
             }
         }
+        let owned = Self::open(path)?;
         if created {
-            // The umask can only clear bits from 0700; set it exactly.
-            let fd = rustix::fs::open(
-                path,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .map_err(|e| FsError::io("open created dir", path, e))?;
-            rustix::fs::fchmod(&fd, Mode::RWXU).map_err(|e| FsError::io("set created dir to 0700", path, e))?;
+            // The umask can only clear bits from 0700; set it exactly, on the handle
+            // that was validated and is used for every write.
+            rustix::fs::fchmod(&owned.handle, Mode::RWXU)
+                .map_err(|e| FsError::io("set created dir to 0700", path, e))?;
         }
-        Self::open(path)
+        Ok(owned)
     }
 
     /// The path this directory was opened at.

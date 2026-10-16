@@ -23,6 +23,7 @@ workspace = true
 command-group.workspace = true
 sandy.workspace = true
 sandy-api.workspace = true
+sandy-fsutil.workspace = true
 tracing.workspace = true
 uuid = { workspace = true }
 

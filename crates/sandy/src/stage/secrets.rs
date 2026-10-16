@@ -32,8 +32,11 @@ pub struct StagedSecret {
     pub guest_path: PathBuf,
 }
 
-/// Stage each secret's bytes into `inst_dir` as a `0600` file written by atomic
-/// rename (temp → fsync → `rename`), under a freshly created `0700` directory.
+/// Stage each secret's bytes into `dir` as a `0600` file written by atomic rename
+/// (temp → fsync → `rename`). `dir` is an [`OwnedDir`](sandy_fsutil::OwnedDir), so
+/// it is already this user's and not group- or world-writable; this never creates
+/// or repairs a directory (the caller chooses: open a given dir as it is, or create
+/// its own `0700`).
 ///
 /// Each file is named by the secret's own name (an environment-variable name), so
 /// the guest can export it as `$NAME`. The bytes travel this on-disk channel only —
@@ -42,16 +45,11 @@ pub struct StagedSecret {
 ///
 /// # Errors
 ///
-/// Returns [`BackendError`] when `inst_dir` cannot be prepared, a secret name is not
+/// Returns [`BackendError`] when a secret cannot be written, a secret name is not
 /// a valid environment-variable name, a secret source cannot be read, or a
 /// [`SecretSource::File`](crate::SecretSource::File) is world-readable (its mode
 /// grants group/other read, e.g. `0644`) — any of these is rejected, not staged.
-pub fn stage_secrets(secrets: &[SecretRef], inst_dir: &Path) -> Result<Vec<StagedSecret>, BackendError> {
-    fs::create_dir_all(inst_dir).map_err(|e| spawn_err("create instance dir", inst_dir, &e))?;
-    fs::set_permissions(inst_dir, fs::Permissions::from_mode(0o700))
-        .map_err(|e| spawn_err("tighten instance dir to 0700", inst_dir, &e))?;
-    let dir = sandy_fsutil::OwnedDir::open(inst_dir).map_err(|e| BackendError::Spawn(e.to_string()))?;
-
+pub fn stage_secrets(secrets: &[SecretRef], dir: &sandy_fsutil::OwnedDir) -> Result<Vec<StagedSecret>, BackendError> {
     let mut staged = Vec::with_capacity(secrets.len());
     for secret in secrets {
         validate_secret_name(&secret.name)?;
@@ -179,6 +177,11 @@ pub fn wipe(inst_dir: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// The instance dir as `stage_secrets` takes it: created `0700` if missing.
+    fn owned(dir: &Path) -> anyhow::Result<sandy_fsutil::OwnedDir> {
+        Ok(sandy_fsutil::OwnedDir::open_or_create(dir)?)
+    }
+
     use std::os::unix::fs::PermissionsExt;
 
     use anyhow::Context;
@@ -207,7 +210,7 @@ mod tests {
                 name: bad.to_string(),
                 source: SecretSource::File(src.clone()),
             }];
-            let err = stage_secrets(&secrets, &inst_dir).expect_err("invalid name must be rejected");
+            let err = stage_secrets(&secrets, &owned(&inst_dir)?).expect_err("invalid name must be rejected");
             assert!(
                 matches!(err, BackendError::Spawn(_)),
                 "expected Spawn for {bad:?}, got {err:?}"
@@ -228,7 +231,7 @@ mod tests {
             source: SecretSource::File(src),
         }];
 
-        let staged = stage_secrets(&secrets, &inst_dir)?;
+        let staged = stage_secrets(&secrets, &owned(&inst_dir)?)?;
 
         assert_eq!(staged.len(), 1);
         let dir_mode = std::fs::metadata(&inst_dir)?.permissions().mode() & 0o777;
@@ -263,7 +266,7 @@ mod tests {
             source: SecretSource::File(src),
         }];
 
-        stage_secrets(&secrets, &inst_dir)?;
+        stage_secrets(&secrets, &owned(&inst_dir)?)?;
 
         assert_eq!(
             std::fs::read(&victim)?,
@@ -289,7 +292,7 @@ mod tests {
             source: SecretSource::File(src),
         }];
 
-        let staged = stage_secrets(&secrets, &inst_dir)?;
+        let staged = stage_secrets(&secrets, &owned(&inst_dir)?)?;
 
         let rendered = format!("{staged:?}");
         assert!(
@@ -321,7 +324,7 @@ mod tests {
             source: SecretSource::File(link),
         }];
 
-        let err = stage_secrets(&secrets, &inst_dir).expect_err("a symlinked source must be rejected");
+        let err = stage_secrets(&secrets, &owned(&inst_dir)?).expect_err("a symlinked source must be rejected");
         assert!(
             matches!(err, BackendError::Spawn(_)),
             "expected a named Spawn error, got {err:?}"
@@ -348,7 +351,7 @@ mod tests {
             source: SecretSource::File(fifo),
         }];
 
-        let err = stage_secrets(&secrets, &inst_dir).expect_err("a FIFO source must be rejected");
+        let err = stage_secrets(&secrets, &owned(&inst_dir)?).expect_err("a FIFO source must be rejected");
         assert!(
             matches!(err, BackendError::Spawn(_)),
             "expected a named Spawn error, got {err:?}"
@@ -371,7 +374,7 @@ mod tests {
             source: SecretSource::File(src),
         }];
 
-        let err = stage_secrets(&secrets, &inst_dir).expect_err("0644 source must be rejected");
+        let err = stage_secrets(&secrets, &owned(&inst_dir)?).expect_err("0644 source must be rejected");
 
         assert!(
             matches!(err, BackendError::Spawn(_)),
@@ -392,7 +395,7 @@ mod tests {
             source: SecretSource::File(src),
         }];
 
-        stage_secrets(&secrets, &inst_dir)?;
+        stage_secrets(&secrets, &owned(&inst_dir)?)?;
         wipe(&inst_dir)?;
 
         assert!(!inst_dir.exists(), "wipe must remove the staging dir");
