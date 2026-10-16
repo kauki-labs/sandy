@@ -100,6 +100,8 @@ impl OwnedDir {
         // which would make the dir unopenable. Set 0700 relative to the parent
         // handle before opening it; a swapped-in link can only be narrowed here, and
         // the open below validates whatever is there.
+        // create_private_dir, the staging base and write_0600_at do not follow
+        // this pattern yet; #204 aligns them.
         let secured = rustix::fs::chmodat(&parent_fd, name, Mode::RWXU, AtFlags::SYMLINK_NOFOLLOW)
             .or_else(|e| match e {
                 // Linux before fchmodat2 cannot honour NOFOLLOW here.
