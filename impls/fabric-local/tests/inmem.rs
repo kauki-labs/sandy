@@ -94,12 +94,23 @@ async fn independent_stream_subscribers_do_not_cross_cursors() -> anyhow::Result
         "from_zero's second read is unaffected by from_two"
     );
 
+    // Both subscribers are caught up with nothing left to read. Spawn their next
+    // poll so each genuinely parks (registers a waker, returns Pending) before
+    // the append that should wake it, rather than polling only after the data
+    // already exists — that would pass even with a broken waker, since a fresh
+    // scan finds the new entry regardless of whether anything woke the task.
+    let zero_task = tokio::spawn(async move { next_seq(&mut from_zero).await });
+    let two_task = tokio::spawn(async move { next_seq(&mut from_two).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
     backend.append(envelope(3, "c")).await.context("append 3")?;
-    assert_eq!(next_seq(&mut from_zero).await?, 3, "from_zero follows the live append");
+
+    let zero_seq = zero_task.await.context("join from_zero")??;
+    let two_seq = two_task.await.context("join from_two")??;
     assert_eq!(
-        next_seq(&mut from_two).await?,
-        3,
-        "from_two follows the live append independently"
+        zero_seq, 3,
+        "from_zero follows the live append it was genuinely parked on"
     );
+    assert_eq!(two_seq, 3, "from_two follows the live append independently");
     Ok(())
 }
