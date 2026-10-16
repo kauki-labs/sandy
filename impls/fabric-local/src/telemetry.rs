@@ -6,11 +6,20 @@
 //! best effort on top and can never lose a record the log accepted.
 //! Content-addressed pull of the log is deferred (spec §7).
 
-use std::path::{Path, PathBuf};
+use std::{
+    fs::{self, OpenOptions},
+    io::{self, Write},
+    os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
+};
 
 use sandy_fabric::telemetry::{TelemetryError, TelemetryRecord, TelemetrySink};
 
 /// A [`TelemetrySink`] appending one JSON record per line to a local file.
+///
+/// Each `emit` appends a whole line with `O_APPEND` and syncs it, so a record is
+/// durable once `emit` returns. The write is a short blocking call; telemetry is
+/// low-volume, and the sink stays runtime-agnostic.
 ///
 /// [`LocalLog::disabled`] (also the [`Default`]) is the off-by-default sink:
 /// `emit` is a no-op and no file is created. [`LocalLog::open`] enables it.
@@ -40,19 +49,53 @@ impl LocalLog {
     /// The records in the log, in emit order. A torn last line (a crash mid-write)
     /// is skipped. A disabled sink, or one that has not emitted yet, has none.
     pub fn records(&self) -> Result<Vec<TelemetryRecord>, TelemetryError> {
-        Ok(Vec::new())
+        let Some(path) = &self.path else {
+            return Ok(Vec::new());
+        };
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(sink_err(path, &e)),
+        };
+        // Only the last line can be torn (a crash mid-append); it lacks the newline.
+        let complete = text.rfind('\n').map_or("", |end| &text[..end]);
+        complete
+            .lines()
+            .enumerate()
+            .map(|(i, line)| {
+                serde_json::from_str(line)
+                    .map_err(|e| TelemetryError::Sink(format!("{}: line {} is corrupt: {e}", path.display(), i + 1)))
+            })
+            .collect()
     }
 }
 
 impl TelemetrySink for LocalLog {
     fn enabled(&self) -> bool {
-        false
+        self.path.is_some()
     }
 
     async fn emit(&self, record: &TelemetryRecord) -> Result<(), TelemetryError> {
-        let _ = record;
-        Ok(())
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        let mut line = serde_json::to_vec(record).map_err(|e| TelemetryError::Sink(e.to_string()))?;
+        line.push(b'\n');
+        OpenOptions::new()
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .open(path)
+            .and_then(|mut file| {
+                file.write_all(&line)?;
+                file.sync_data()
+            })
+            .map_err(|e| sink_err(path, &e))
     }
+}
+
+fn sink_err(path: &Path, e: &io::Error) -> TelemetryError {
+    TelemetryError::Sink(format!("{}: {e}", path.display()))
 }
 
 /// Local-first delivery: every record goes to the local log, then to `forward`.
@@ -79,12 +122,20 @@ impl<S: TelemetrySink> LocalFirst<S> {
 }
 
 impl<S: TelemetrySink> TelemetrySink for LocalFirst<S> {
+    /// On exactly when the local log is: with telemetry off, nothing is logged
+    /// and nothing leaves the host.
     fn enabled(&self) -> bool {
-        false
+        self.local.enabled()
     }
 
     async fn emit(&self, record: &TelemetryRecord) -> Result<(), TelemetryError> {
-        let _ = (record, &self.forward);
+        if !self.local.enabled() {
+            return Ok(());
+        }
+        self.local.emit(record).await?;
+        if let Err(e) = self.forward.emit(record).await {
+            tracing::warn!(kind = %record.kind, error = %e, "telemetry forward failed; record kept locally");
+        }
         Ok(())
     }
 }
