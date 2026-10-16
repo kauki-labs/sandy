@@ -1,0 +1,119 @@
+syntax = "proto3";
+
+package sandy.control.v1;
+
+// sandyd's control-plane RPC: Submit/Cancel/Attach/Status/List (epic #205,
+// B0 #211). Pure request/response — never streaming. Job output, telemetry,
+// and escalation ride the fabric's channels (ChannelBackend/Channel), not
+// this RPC; Attach hands back the channel identity + cap for that, it does
+// not stream the output itself.
+//
+// One request, one matching response, per connection, in order: a client
+// sends a ControlRequest and waits for exactly one ControlResponse with the
+// same request_id before sending the next. No pipelining in v1; request_id
+// exists for forward-compat and for correlating logs, not for reordering.
+
+// A client-to-daemon call.
+message ControlRequest {
+  // Caller-chosen, unique per connection. Echoed on the matching response.
+  uint64 request_id = 1;
+
+  oneof op {
+    SubmitRequest submit = 10;
+    CancelRequest cancel = 11;
+    AttachRequest attach = 12;
+    StatusRequest status = 13;
+    ListRequest list = 14;
+  }
+}
+
+// A daemon-to-client reply.
+message ControlResponse {
+  // Matches the ControlRequest.request_id this answers.
+  uint64 request_id = 1;
+
+  oneof result {
+    SubmitResponse submit = 10;
+    CancelResponse cancel = 11;
+    AttachResponse attach = 12;
+    StatusResponse status = 13;
+    ListResponse list = 14;
+    ControlError error = 15;
+  }
+}
+
+// A job's lifecycle state.
+enum JobStatus {
+  JOB_STATUS_UNSPECIFIED = 0;
+  JOB_STATUS_PENDING = 1;
+  JOB_STATUS_RUNNING = 2;
+  JOB_STATUS_SUCCEEDED = 3;
+  JOB_STATUS_FAILED = 4;
+  JOB_STATUS_CANCELLED = 5;
+}
+
+// Submit a job. `manifest` is opaque here: the typed, submitter-bounded
+// JobManifest (capped at the submitter's own attenuation, decision C) is
+// B3's job (#205) — B0 only defines the envelope it travels in, not its
+// shape. A later version of this message replaces `bytes` with the real
+// typed field; `manifest_encoding` exists so that transition can be
+// detected on the wire instead of guessed at.
+message SubmitRequest {
+  bytes manifest = 1;
+  // Names the encoding of `manifest` (e.g. "sandy.orchestrator.v1.JobManifest"
+  // once B3 defines it). Empty/unset means "undefined, reject" — never a
+  // silent default interpretation of unknown bytes.
+  string manifest_encoding = 2;
+}
+
+message SubmitResponse {
+  string job_id = 1;
+}
+
+message CancelRequest {
+  string job_id = 1;
+}
+
+message CancelResponse {}
+
+// Attach to a running (or recently finished) job's output. Does not stream
+// output itself: the daemon mints an attenuated cap scoped to that job's
+// orchestrator channel (the attenuation is B3's job) and hands back enough
+// for the client to `join`/`subscribe` on the data plane directly.
+message AttachRequest {
+  string job_id = 1;
+}
+
+message AttachResponse {
+  string channel_id = 1;
+  // The encoded, attenuated channel-join Cap (sandy_fabric::capauth::Cap via
+  // encode_cap) scoped to this job's orchestrator channel.
+  bytes cap = 2;
+}
+
+message StatusRequest {
+  string job_id = 1;
+}
+
+message StatusResponse {
+  string job_id = 1;
+  JobStatus status = 2;
+}
+
+message ListRequest {}
+
+message JobSummary {
+  string job_id = 1;
+  JobStatus status = 2;
+}
+
+message ListResponse {
+  repeated JobSummary jobs = 1;
+}
+
+// A control-plane failure: the request was understood but could not be
+// honoured (unknown job id, already-cancelled job, not-yet-dispatchable,
+// …). Never silently folded into a success response with default fields.
+message ControlError {
+  string message = 1;
+}
