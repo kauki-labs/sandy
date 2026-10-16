@@ -14,11 +14,16 @@
 }:
 let
   # cleanCargoSource keeps only Rust sources + manifests; the topology tests
-  # `include_str!` JSON fixtures at compile time, so keep `.json` too (else the
-  # crane clippy/test derivations fail to read them in the sandbox).
+  # `include_str!` JSON fixtures at compile time, so keep `.json` too, and
+  # sandy-proto's build.rs compiles `.proto` files at build time, so keep those
+  # too (else the crane clippy/test derivations fail to read them in the sandbox).
   src = lib.cleanSourceWith {
     src = ../..;
-    filter = path: type: (lib.hasSuffix ".json" path) || (craneLib.filterCargoSources path type);
+    filter =
+      path: type:
+      (lib.hasSuffix ".json" path)
+      || (lib.hasSuffix ".proto" path)
+      || (craneLib.filterCargoSources path type);
     name = "source";
   };
 
