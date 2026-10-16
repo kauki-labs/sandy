@@ -15,7 +15,10 @@ use std::{
 };
 
 use sandy_api::backend::{SecretRef, SecretSource};
-use sandy_fabric::minter::{MintedSecret, Minter, MinterError, SecretRequest};
+use sandy_fabric::{
+    capauth::Cap,
+    minter::{MintedSecret, Minter, MinterError, SecretRequest},
+};
 
 /// Bytes in a work-secret: 256 bits.
 pub const SECRET_LEN: usize = 32;
@@ -44,6 +47,9 @@ pub enum StageError {
     /// The staging directory is inside the Nix store, which is world-readable (INV-1).
     #[error("refusing to stage a secret under the nix store: {0}")]
     InStore(PathBuf),
+    /// The capability could not be encoded.
+    #[error("encoding the channel cap: {0}")]
+    Encode(String),
     /// The file could not be written.
     #[error("staging {path}: {source}")]
     Io {
@@ -95,6 +101,18 @@ pub fn stage_secret(dir: &Path, name: &str, bytes: &[u8]) -> Result<SecretRef, S
         name: name.to_owned(),
         source: SecretSource::File(dest),
     })
+}
+
+/// Stage a channel join capability as the secret `name` in `dir` (spec §3.8).
+///
+/// The cap is minted outside the sandbox by the orchestrator's
+/// [`CapAuthority`](sandy_fabric::capauth::CapAuthority) and only ever delivered in:
+/// this takes a minted [`Cap`], never an authority, so nothing that can mint a cap
+/// reaches the guest. The cap is staged on its own, as JSON; a work-secret is a
+/// separate staged secret, never bundled into the cap.
+pub fn stage_cap(dir: &Path, name: &str, cap: &Cap) -> Result<SecretRef, StageError> {
+    let _ = (dir, name, cap);
+    Err(StageError::Encode("not implemented".to_owned()))
 }
 
 /// Create `path` as a fresh `0600` file holding `bytes`, synced to disk. A stale
@@ -182,6 +200,51 @@ mod tests {
         anyhow::ensure!(
             !format!("{staged:?}").contains(marker),
             "the SecretRef carries the secret bytes, not just a path"
+        );
+        Ok(())
+    }
+
+    fn cap() -> Cap {
+        use sandy_fabric::capauth::{CapRights, CapScope};
+        Cap {
+            scope: CapScope {
+                peer: "agent".into(),
+                channel: "orchestrator".into(),
+                rights: CapRights {
+                    post: true,
+                    read: true,
+                    invite: false,
+                },
+                expires_at: Some(4_102_444_800),
+            },
+            proof: vec![0xc0, 0xff, 0xee],
+        }
+    }
+
+    #[test]
+    fn a_channel_cap_is_staged_0600_and_reads_back_as_the_same_cap() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let staged = stage_cap(dir.path(), "CHANNEL_CAP", &cap())?;
+        let path = staged_path(&staged)?;
+        let mode = fs::metadata(path)?.permissions().mode() & 0o777;
+        anyhow::ensure!(mode == 0o600, "mode {mode:o}");
+        let read: Cap = serde_json::from_slice(&fs::read(path)?)?;
+        anyhow::ensure!(read == cap(), "the staged cap differs: {read:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_work_secret_is_staged_apart_from_the_join_cap() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let secret = LocalMinter.mint(&SecretRequest { job: "j".to_owned() }).await?;
+        let cap_ref = stage_cap(dir.path(), "CHANNEL_CAP", &cap())?;
+        let secret_ref = stage_secret(dir.path(), "WORK_SECRET", &secret.bytes)?;
+        let (cap_path, secret_path) = (staged_path(&cap_ref)?, staged_path(&secret_ref)?);
+        anyhow::ensure!(cap_path != secret_path, "the cap and the work-secret share a file");
+        let cap_bytes = fs::read(cap_path)?;
+        anyhow::ensure!(
+            !cap_bytes.windows(secret.bytes.len()).any(|w| w == secret.bytes),
+            "the work-secret was bundled into the join cap"
         );
         Ok(())
     }
