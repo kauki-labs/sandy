@@ -33,25 +33,25 @@ inputs: the executor's true `Capabilities` and a telemetry `captured` count.
 **Set aside.** Per-impl ad-hoc tests: they drift apart, and a trivial impl
 passing its own tests says nothing about a real one.
 
-## 2. The logical `Envelope` lives here; protobuf is a codec
+## 2. The envelope is `sandy-proto`'s; the fabric depends on it
 
 **Status:** accepted.
 
-**Context.** The channel envelope is "a logical contract; protobuf is its default
-codec; a text/chat backend re-encodes the same envelope" (spec §3.3).
-`ChannelBackend` needs the envelope type.
+**Context.** The spec calls the channel envelope "a logical contract; protobuf is
+its default codec; a text/chat backend re-encodes the same envelope" (§3.3). The
+only codec today is protobuf; the text/chat backend is deferred (§7).
 
-**Decision.** `Envelope { seq, msg_type, content_type, payload, metadata }` is
-defined in `sandy-fabric`. `sandy-proto` (#105) depends on `sandy-fabric` and maps
-it to and from the protobuf wire type. `msg_type` is a `String` (the `oneof` tag)
-because the per-role message types are still open (spec §8). The content id rides
-in `metadata` under `MSG_ID_KEY`.
+**Decision.** `ChannelBackend` carries `sandy_proto::Envelope` (#105: `sequence`,
+`oneof message_type`, `content_type`, `payload`, `metadata`), re-exported from
+`channel_backend`. `sandy-fabric` depends on `sandy-proto`. The content id rides in
+`metadata` under `MSG_ID_KEY`, read with `msg_id()`.
 
-**Consequences.** #104 and #105 stay independent Wave-0 blocks; any backend can
-re-encode the envelope without a protobuf dependency.
+**Consequences.** One envelope type across the fabric, and #104 builds on #105. A
+second codec, when it lands, maps to and from this type.
 
-**Set aside.** Using #105's generated type as the envelope: it makes the contract
-crate depend on its codec and blocks the Wave-1 barrier on #105.
+**Set aside.** A separate logical envelope in `sandy-fabric` with protobuf as one
+codec of several: it builds a split for a codec that is not planned yet. Reopen it
+when the text/chat backend lands.
 
 ## 3. The channel is not a seam; `ChannelBackend` is
 

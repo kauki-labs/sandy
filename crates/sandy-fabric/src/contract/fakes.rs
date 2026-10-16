@@ -17,8 +17,7 @@ use sandy_api::backend::{BoxState, Outcome, RunSpec};
 
 use crate::{
     capauth::{Cap, CapAuthority, CapError, CapRights, CapScope},
-    channel_backend::{ChannelBackend, ChannelBackendError},
-    envelope::Envelope,
+    channel_backend::{ChannelBackend, ChannelBackendError, Envelope, msg_id},
     executor::{Capabilities, Executor, ExecutorError, capabilities_satisfy},
     minter::{MintedSecret, Minter, MinterError, SecretRequest},
     placement::{
@@ -132,7 +131,7 @@ struct LogInner {
     wakers: Vec<Waker>,
 }
 
-/// An in-memory log, sorted by seq, deduped on msg_id, waking followers on append.
+/// An in-memory log, sorted by sequence, deduped on msg_id, waking followers on append.
 #[derive(Default, Clone)]
 pub struct FakeBackend {
     inner: Arc<Mutex<LogInner>>,
@@ -146,12 +145,12 @@ impl FakeBackend {
 
 impl ChannelBackend for FakeBackend {
     async fn append(&self, env: Envelope) -> Result<(), ChannelBackendError> {
-        let id = env.msg_id().ok_or(ChannelBackendError::MissingMsgId)?.to_owned();
+        let id = msg_id(&env).ok_or(ChannelBackendError::MissingMsgId)?.to_owned();
         let mut inner = self.lock();
-        if inner.log.iter().any(|e| e.msg_id() == Some(id.as_str())) {
+        if inner.log.iter().any(|e| msg_id(e) == Some(id.as_str())) {
             return Ok(());
         }
-        let at = inner.log.partition_point(|e| e.seq <= env.seq);
+        let at = inner.log.partition_point(|e| e.sequence <= env.sequence);
         inner.log.insert(at, env);
         for waker in inner.wakers.drain(..) {
             waker.wake();
@@ -160,7 +159,13 @@ impl ChannelBackend for FakeBackend {
     }
 
     async fn fetch(&self, from_seq: u64) -> Result<Vec<Envelope>, ChannelBackendError> {
-        Ok(self.lock().log.iter().filter(|e| e.seq >= from_seq).cloned().collect())
+        Ok(self
+            .lock()
+            .log
+            .iter()
+            .filter(|e| e.sequence >= from_seq)
+            .cloned()
+            .collect())
     }
 
     fn stream_from(&self, from_seq: u64) -> impl Stream<Item = Result<Envelope, ChannelBackendError>> + Send {
@@ -182,9 +187,9 @@ impl Stream for FollowStream {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         let mut inner = this.backend.lock();
-        match inner.log.iter().find(|e| e.seq >= this.next_seq).cloned() {
+        match inner.log.iter().find(|e| e.sequence >= this.next_seq).cloned() {
             Some(env) => {
-                this.next_seq = env.seq + 1;
+                this.next_seq = env.sequence + 1;
                 Poll::Ready(Some(Ok(env)))
             }
             None => {
@@ -214,7 +219,7 @@ impl ChannelBackend for SnapshotBackend {
             .lock()
             .log
             .iter()
-            .filter(|e| e.seq >= from_seq)
+            .filter(|e| e.sequence >= from_seq)
             .cloned()
             .map(Ok)
             .collect();

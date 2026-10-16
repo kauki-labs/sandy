@@ -14,15 +14,14 @@
 //! [`CapAuthority`](capauth::CapAuthority) and [`Minter`](minter::Minter).
 //!
 //! The channel itself is not a seam: it is one concrete abstraction layered over
-//! [`ChannelBackend`](channel_backend::ChannelBackend), carrying the logical
-//! [`Envelope`](envelope::Envelope).
+//! [`ChannelBackend`](channel_backend::ChannelBackend), carrying `sandy-proto`'s
+//! [`Envelope`](channel_backend::Envelope).
 //!
 //! With the `contract-tests` feature, [`contract`] exposes one `*_suite` per seam
 //! that an impl crate runs its implementation against.
 
 pub mod capauth;
 pub mod channel_backend;
-pub mod envelope;
 pub mod executor;
 pub mod minter;
 pub mod placement;

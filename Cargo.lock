@@ -2064,6 +2064,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "sandy-api",
+ "sandy-proto",
  "serde",
  "thiserror 2.0.21",
  "tokio",

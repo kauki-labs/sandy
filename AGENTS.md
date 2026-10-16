@@ -28,7 +28,7 @@ version, metadata, dependency versions, and lints through the root `Cargo.toml`
   `docs/providers/`.
 - **`sandy-fabric`** — the agent-fabric contract: seam traits (`Executor`,
   `ChannelBackend`, `Transport`, `Discovery`, `Capacity`, `Lifecycle`,
-  `CapAuthority`, `Minter`, `TelemetrySink`), the logical channel `Envelope`, and
+  `CapAuthority`, `Minter`, `TelemetrySink`) over `sandy-proto`'s `Envelope`, and
   the shared contract-test harness (feature `contract-tests`) every impl passes.
   No impls. See `docs/decisions/agent-fabric.md`.
 

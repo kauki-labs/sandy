@@ -9,15 +9,19 @@
 //! caller drives them on its own runtime, and a stream read never waits on an
 //! envelope that is not already stored, so a broken stream fails instead of hanging.
 
-use std::{collections::BTreeMap, fmt::Display, pin::pin};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt::Display,
+    pin::pin,
+};
 
 use futures_util::{FutureExt, StreamExt};
 use sandy_api::backend::{Grants, RunSpec};
+use sandy_proto::{MessageType, PeerMsg};
 
 use crate::{
     capauth::{CapAuthority, CapError, CapRights, CapScope},
-    channel_backend::{ChannelBackend, ChannelBackendError},
-    envelope::{Envelope, MSG_ID_KEY},
+    channel_backend::{ChannelBackend, ChannelBackendError, Envelope, MSG_ID_KEY},
     executor::{Arch, Capabilities, Executor, Requirements, SandboxKind},
     minter::{Minter, SecretRequest},
     placement::{Capacity, CapacityError, Discovery, HostDescriptor, Lease, Lifecycle},
@@ -133,19 +137,19 @@ pub fn minter_suite<M: Minter>(make: impl Fn() -> M) -> Result<(), ContractViola
     require(SEAM, a1 != b && a2 != b, "mints for different jobs differ")
 }
 
-/// Run the [`ChannelBackend`] contract: seq-ordered and `>= from_seq` fetches,
+/// Run the [`ChannelBackend`] contract: sequence-ordered, `>= from_seq` fetches,
 /// dedup on the content id, rejection of an id-less envelope, and a stream that
 /// replays then follows live appends.
 pub async fn channel_backend_suite<B: ChannelBackend>(make: impl Fn() -> B) -> Result<(), ContractViolation> {
     const SEAM: &str = "ChannelBackend";
-    let env = |seq: u64, id: &str| Envelope {
-        seq,
-        msg_type: "text".to_owned(),
-        content_type: "text/plain".to_owned(),
+    let env = |sequence: u64, id: &str| Envelope {
+        sequence,
+        content_type: sandy_proto::CONTENT_TYPE_TEXT.to_owned(),
         payload: id.as_bytes().to_vec(),
-        metadata: BTreeMap::from([(MSG_ID_KEY.to_owned(), id.to_owned())]),
+        metadata: HashMap::from([(MSG_ID_KEY.to_owned(), id.to_owned())]),
+        message_type: Some(MessageType::PeerMsg(PeerMsg {})),
     };
-    let seqs = |envs: &[Envelope]| envs.iter().map(|e| e.seq).collect::<Vec<_>>();
+    let seqs = |envs: &[Envelope]| envs.iter().map(|e| e.sequence).collect::<Vec<_>>();
     let backend = make();
 
     require(
@@ -160,10 +164,10 @@ pub async fn channel_backend_suite<B: ChannelBackend>(make: impl Fn() -> B) -> R
     require(
         SEAM,
         seqs(&all) == [1, 2],
-        "fetch is in seq order regardless of arrival order",
+        "fetch is in sequence order regardless of arrival order",
     )?;
     let tail = expect_ok(SEAM, "fetch", backend.fetch(2).await)?;
-    require(SEAM, seqs(&tail) == [2], "fetch returns only seq >= from_seq")?;
+    require(SEAM, seqs(&tail) == [2], "fetch returns only sequence >= from_seq")?;
 
     expect_ok(SEAM, "append of a duplicate", backend.append(env(1, "a")).await)?;
     let all = expect_ok(SEAM, "fetch", backend.fetch(0).await)?;
@@ -184,14 +188,14 @@ pub async fn channel_backend_suite<B: ChannelBackend>(make: impl Fn() -> B) -> R
             .now_or_never()
             .flatten()
             .and_then(Result::ok)
-            .map(|e| e.seq)
+            .map(|e| e.sequence)
     };
     require(
         SEAM,
         next_seq() == Some(1),
         "stream_from replays the first stored envelope",
     )?;
-    require(SEAM, next_seq() == Some(2), "stream_from replays in seq order")?;
+    require(SEAM, next_seq() == Some(2), "stream_from replays in sequence order")?;
     expect_ok(SEAM, "append", backend.append(env(3, "c")).await)?;
     require(
         SEAM,
