@@ -60,6 +60,24 @@ impl OwnedDir {
         })
     }
 
+    /// Open `path` as a staging directory, creating it first if it is missing.
+    ///
+    /// A directory this creates is `0700`, whatever the umask; missing parents are
+    /// created normally. An existing directory is opened and validated as in
+    /// [`OwnedDir::open`], never repaired: a group- or world-writable one is
+    /// refused, because it may already have been tampered with.
+    ///
+    /// # Errors
+    ///
+    /// As [`OwnedDir::open`], plus [`FsError::Io`] when creation fails.
+    pub fn open_or_create(path: &Path) -> Result<Self, FsError> {
+        let _ = path;
+        Err(FsError::Unsafe {
+            path: PathBuf::new(),
+            reason: "not implemented".to_owned(),
+        })
+    }
+
     /// The path this directory was opened at.
     pub fn path(&self) -> &Path {
         &self.path
@@ -315,6 +333,75 @@ mod tests {
         for (ok, why) in checks {
             anyhow::ensure!(ok, "a private staging dir was {why}");
         }
+        Ok(())
+    }
+
+    /// The umask is process-wide; nextest runs each test in its own process.
+    #[test]
+    fn open_or_create_makes_a_missing_dir_0700_under_a_group_writable_umask() -> anyhow::Result<()> {
+        let root = staging_dir()?;
+        let path = root.path().join("config").join("trust-roots");
+        let previous = rustix::process::umask(Mode::from_raw_mode(0o002));
+        let opened = OwnedDir::open_or_create(&path);
+        rustix::process::umask(previous);
+        opened?;
+        let mode = fs::metadata(&path)?.permissions().mode() & 0o777;
+        anyhow::ensure!(mode == 0o700, "a created dir came out {mode:o}");
+        Ok(())
+    }
+
+    #[test]
+    fn open_or_create_accepts_an_existing_private_dir_and_refuses_a_wide_one() -> anyhow::Result<()> {
+        let root = staging_dir()?;
+        let private = root.path().join("private");
+        fs::create_dir(&private)?;
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700))?;
+        OwnedDir::open_or_create(&private)?;
+        let wide = root.path().join("wide");
+        fs::create_dir(&wide)?;
+        fs::set_permissions(&wide, fs::Permissions::from_mode(0o775))?;
+        let res = OwnedDir::open_or_create(&wide);
+        anyhow::ensure!(
+            matches!(res, Err(FsError::Unsafe { .. })),
+            "a 0775 dir was accepted: {res:?}"
+        );
+        let mode = fs::metadata(&wide)?.permissions().mode() & 0o777;
+        anyhow::ensure!(mode == 0o775, "a refused dir was silently repaired to {mode:o}");
+        Ok(())
+    }
+
+    #[test]
+    fn open_or_create_refuses_a_symlink_at_the_path() -> anyhow::Result<()> {
+        let root = staging_dir()?;
+        let real = root.path().join("real");
+        fs::create_dir(&real)?;
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o700))?;
+        let link = root.path().join("link");
+        symlink(&real, &link)?;
+        let res = OwnedDir::open_or_create(&link);
+        anyhow::ensure!(res.is_err(), "a symlink at the path was followed");
+        Ok(())
+    }
+
+    #[test]
+    fn a_name_that_is_not_one_path_component_is_refused() -> anyhow::Result<()> {
+        let dir = staging_dir()?;
+        // `a` and `.a` exist, so the temp file `.a/b.<hex>.staging` can be created
+        // and renamed to `a/b`: only a name check stops "a/b" landing in `a/`.
+        for sub in ["a", ".a"] {
+            fs::create_dir(dir.path().join(sub))?;
+            fs::set_permissions(dir.path().join(sub), fs::Permissions::from_mode(0o700))?;
+        }
+        let owned = OwnedDir::open(dir.path())?;
+        for bad in ["", ".", "..", "a/b", "../escape"] {
+            let res = owned.write_secret(bad, b"x");
+            anyhow::ensure!(res.is_err(), "{bad:?} was written");
+        }
+        anyhow::ensure!(fs::read_dir(dir.path())?.count() == 2, "a refused name left a file");
+        anyhow::ensure!(
+            fs::read_dir(dir.path().join("a"))?.count() == 0,
+            "a path-traversing name wrote into a/"
+        );
         Ok(())
     }
 
