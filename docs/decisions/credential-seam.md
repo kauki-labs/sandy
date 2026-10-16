@@ -78,7 +78,7 @@ renamed into place. An unsafe existing dir is refused, not repaired. The error
 says another user may have changed the key or config, asks for a check, and then
 names `chmod 700`.
 
-**Consequences.** Reads are unchanged (`read_secret_0600` checks the file). An
+**Consequences.** Reads of the App key and trust-root configs (#200) open the file and check it on the handle: it must be a regular file owned by the current user, or it is refused, since another user must have put it there. A dir that others can write to, or another user owns, logs the same tamper warning, but the read goes ahead; refusing those reads would break every credentialed run on an existing wide install, and is left to the operator. An
 existing install whose trust-roots dir is group-writable (for example, registered
 under umask `0002`, so `0775`) is refused on its next register or import until the
 user verifies the files and runs `chmod 700`; deregister writes no trust material

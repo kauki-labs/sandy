@@ -246,7 +246,9 @@ pub trait TrustRootIo: Sized {
 
 impl TrustRootIo for TrustRoot {
     fn load(path: &Path) -> Result<Self, CredError> {
-        let text = fs::read_to_string(path).map_err(|e| stage_err("read trust root", path, &e))?;
+        let (mut file, _) = open_trust_file("trust-root config", path)?;
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut file, &mut text).map_err(|e| stage_err("read trust root", path, &e))?;
         serde_json::from_str(&text)
             .map_err(|e| CredError::Stage(format!("parse trust root at {}: {e}", path.display())))
     }
@@ -309,7 +311,9 @@ pub(crate) fn open_trust_dir(dir: &Path) -> Result<sandy_fsutil::OwnedDir, CredE
 /// any `0o044` bit, e.g. `0644`) or cannot be read; a group/world-readable secret is
 /// refused, never read.
 pub fn read_secret_0600(path: &Path) -> Result<Vec<u8>, CredError> {
-    let meta = fs::metadata(path).map_err(|e| stage_err("stat secret", path, &e))?;
+    use std::io::Read;
+
+    let (mut file, meta) = open_trust_file("secret", path)?;
     let mode = meta.permissions().mode() & 0o777;
     if mode & 0o044 != 0 {
         return Err(CredError::Stage(format!(
@@ -317,7 +321,10 @@ pub fn read_secret_0600(path: &Path) -> Result<Vec<u8>, CredError> {
             path.display()
         )));
     }
-    fs::read(path).map_err(|e| stage_err("read secret", path, &e))
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|e| stage_err("read secret", path, &e))?;
+    Ok(bytes)
 }
 
 /// Write `bytes` to a `0600` file named exactly `<secret_name>` under `out_dir`,
@@ -365,15 +372,61 @@ fn write_secret_0600(dest: &Path, bytes: &[u8]) -> Result<(), CredError> {
 /// Refuse trust material owned by another user: sandy writes it as the current
 /// user, so a file owned by anyone else was put there by someone else (#200).
 fn refuse_foreign_owner(what: &str, path: &Path, uid: u32, current_uid: u32) -> Result<(), CredError> {
-    let _ = (what, path, uid, current_uid);
-    Ok(())
+    if uid == current_uid {
+        return Ok(());
+    }
+    Err(CredError::Stage(format!(
+        "{what} {} is owned by uid {uid}, not the current uid {current_uid}: another user put it there; refusing to \
+         use it",
+        path.display()
+    )))
 }
 
 /// The tamper warning for a trust-material dir that others can write to, or that
 /// another user owns: the read goes ahead, but the files may have been changed.
 fn wide_dir_warning(dir: &Path, dir_uid: u32, dir_mode: u32, current_uid: u32) -> Option<String> {
-    let _ = (dir, dir_uid, dir_mode, current_uid);
-    None
+    (dir_uid != current_uid || dir_mode & 0o022 != 0).then(|| {
+        format!(
+            "trust-material dir {} is not private (owner uid {dir_uid}, mode {dir_mode:o}); another user may have \
+             been able to modify your App key or trust config. Verify the files in it are intact, then make sure the \
+             dir is yours and run `chmod 700 {}`",
+            dir.display(),
+            dir.display()
+        )
+    })
+}
+
+/// Open trust material for reading: the checks run on the opened file, not the
+/// path. It must be a regular file (`O_NONBLOCK` keeps a FIFO from hanging the
+/// open) owned by the current user. A dir others can write to, or another user
+/// owns, logs a tamper warning and the read goes ahead.
+fn open_trust_file(what: &str, path: &Path) -> Result<(fs::File, fs::Metadata), CredError> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| stage_err(&format!("open {what}"), path, &e))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| stage_err(&format!("stat {what}"), path, &e))?;
+    if !meta.is_file() {
+        return Err(CredError::Stage(format!(
+            "{what} {} is not a regular file; refusing to read it",
+            path.display()
+        )));
+    }
+    let current_uid = rustix::process::getuid().as_raw();
+    refuse_foreign_owner(what, path, meta.uid(), current_uid)?;
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        if let Ok(dir_meta) = fs::metadata(dir) {
+            if let Some(warning) = wide_dir_warning(dir, dir_meta.uid(), dir_meta.mode() & 0o7777, current_uid) {
+                tracing::warn!("{warning}");
+            }
+        }
+    }
+    Ok((file, meta))
 }
 
 fn stage_err(action: &str, path: &Path, err: &std::io::Error) -> CredError {
