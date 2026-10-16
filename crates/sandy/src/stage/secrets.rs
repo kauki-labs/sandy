@@ -4,8 +4,8 @@
 
 use std::{
     fs,
-    io::Write,
-    os::unix::fs::PermissionsExt,
+    io::{Read, Write},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -84,13 +84,46 @@ fn validate_secret_name(name: &str) -> Result<(), BackendError> {
     Ok(())
 }
 
-/// Read a secret's bytes from its source, rejecting a world/group-readable file
-/// (INV-1). The `Fd` channel needs an `unsafe` `File::from_raw_fd`, which this
-/// crate forbids (`unsafe_code = forbid`), so it is rejected rather than read.
+/// Read a secret's bytes from its source, rejecting a symlink, a source not
+/// owned by this process's uid, or a world/group-readable file (INV-1,
+/// CWE-59/confused-deputy: a staged path swapped for a symlink to another host
+/// file — e.g. `~/.ssh/id_ed25519` — must not be followed and exfiltrated into
+/// the guest, #175). The `Fd` channel needs an `unsafe` `File::from_raw_fd`,
+/// which this crate forbids (`unsafe_code = forbid`), so it is rejected rather
+/// than read.
 fn read_source(source: &SecretSource) -> Result<Vec<u8>, BackendError> {
     match source {
         SecretSource::File(path) => {
-            let meta = fs::metadata(path).map_err(|e| spawn_err("stat secret source", path, &e))?;
+            // O_NOFOLLOW: a symlink final component fails with ELOOP, so a swapped
+            // path is refused before anything is read through it (#175). O_CLOEXEC
+            // keeps the fd off forked children.
+            let mut file = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(path)
+                .map_err(|e| {
+                    if e.raw_os_error() == Some(libc::ELOOP) {
+                        BackendError::Spawn(format!(
+                            "secret source {} is a symlink; refusing to follow it (INV-1)",
+                            path.display()
+                        ))
+                    } else {
+                        spawn_err("open secret source", path, &e)
+                    }
+                })?;
+
+            // Validate owner and mode on the OPENED fd, never the path: a path-based
+            // check races the open (TOCTOU), and following a symlink would check the
+            // wrong file's metadata entirely.
+            let meta = file.metadata().map_err(|e| spawn_err("stat secret source", path, &e))?;
+            let current_uid = rustix::process::getuid().as_raw();
+            if meta.uid() != current_uid {
+                return Err(BackendError::Spawn(format!(
+                    "secret source {} is owned by uid {} (expected {current_uid}); refusing to stage (INV-1)",
+                    path.display(),
+                    meta.uid()
+                )));
+            }
             let mode = meta.permissions().mode() & 0o777;
             if mode & GROUP_OTHER_READ != 0 {
                 return Err(BackendError::Spawn(format!(
@@ -98,7 +131,11 @@ fn read_source(source: &SecretSource) -> Result<Vec<u8>, BackendError> {
                     path.display()
                 )));
             }
-            fs::read(path).map_err(|e| spawn_err("read secret source", path, &e))
+
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
+                .map_err(|e| spawn_err("read secret source", path, &e))?;
+            Ok(bytes)
         }
         SecretSource::Fd(fd) => Err(BackendError::Spawn(format!(
             "fd-sourced secrets (fd {fd}) are not supported without unsafe fd reads (INV-SAFE)"
@@ -231,6 +268,37 @@ mod tests {
             !rendered.contains(marker),
             "secret bytes must not appear in the staged handle"
         );
+        Ok(())
+    }
+
+    /// Adversarial (INV-1, #175): a secret source swapped for a symlink to a host
+    /// file outside the staging dir must be REFUSED, not silently followed and
+    /// exfiltrated into the guest. A `0600` target (the attractive case — a key
+    /// that would otherwise pass the mode check) proves this is the symlink guard
+    /// doing the rejecting, not the mode check.
+    #[test]
+    fn a_symlinked_source_is_rejected_not_followed() -> anyhow::Result<()> {
+        let tmp = tempfile::TempDir::new()?;
+        let marker = "host-secret-outside-the-share";
+        let host_file = tmp.path().join("host-only");
+        std::fs::write(&host_file, marker)?;
+        std::fs::set_permissions(&host_file, std::fs::Permissions::from_mode(0o600))?;
+
+        let link = tmp.path().join("swapped-source");
+        std::os::unix::fs::symlink(&host_file, &link)?;
+
+        let inst_dir = tmp.path().join("inst");
+        let secrets = [SecretRef {
+            name: "TOK".to_string(),
+            source: SecretSource::File(link),
+        }];
+
+        let err = stage_secrets(&secrets, &inst_dir).expect_err("a symlinked source must be rejected");
+        assert!(
+            matches!(err, BackendError::Spawn(_)),
+            "expected a named Spawn error, got {err:?}"
+        );
+        assert!(!inst_dir.join("TOK").exists(), "a rejected symlink must not be staged");
         Ok(())
     }
 
