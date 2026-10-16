@@ -9,7 +9,7 @@
 //!   host (`/dev/kvm` world-rw): `sandy run` boots this argv to a `succeeded`/exit-0 result in ~10s with `-nographic
 //!   -serial chardev:sandy-serial console=ttyS0` and the sentinels on the serial socket.
 //! - [`QemuBackend`] — the [`VmBackend`] seam. `run` stages secrets, calls [`qemu_args`], spawns qemu with serial on
-//!   the #33 [`PipeTransport`](sandy::PipeTransport), drives [`run_console`](sandy::run_console), and populates the
+//!   the #33 [`PipeTransport`](crate::PipeTransport), drives [`run_console`](crate::run_console), and populates the
 //!   pinned [`Outcome`]. The spawn/boot is host-tier (tier-3), not unit-tested in the sandbox.
 //!
 //! The module is private; `sandy-backend`'s `lib.rs` re-exports only
@@ -24,14 +24,16 @@ use std::{
 };
 
 use sandy::{
-    BackendError, BoxState, Hypervisor, Markers, Outcome, PipeTransport, RunSpec, ShareDirs, StoreBacking, Topology,
-    VmBackend, collect_outputs, ensure_sandy_staging_base, kill_children, plan_shares, run_console,
-    topology as eval_topology, wipe,
+    BackendError, BoxState, Hypervisor, Outcome, RunSpec, ShareDirs, StoreBacking, Topology, VmBackend,
+    collect_outputs, ensure_sandy_staging_base, kill_children, plan_shares, topology as eval_topology, wipe,
 };
 use sandy_api::share::{GuestShareTransport, ShareSpec};
 use uuid::Uuid;
 
-use crate::share::VirtiofsdTransport;
+use crate::{
+    console::{Markers, PipeTransport, run_console},
+    share::VirtiofsdTransport,
+};
 
 /// The chardev id the guest serial console binds to. `qemu_args` emits
 /// `-serial chardev:<SERIAL_CHARDEV_ID>`; `run` adds the matching

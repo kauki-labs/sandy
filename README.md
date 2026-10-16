@@ -60,7 +60,7 @@ sandy run topologies.aarch64-linux.vfkit \
 ## Layout
 
 ```text
-crates/sandy/          deep library behind a curated facade (seam, journal, result, console, topology)
+crates/sandy/          deep library behind a curated facade (seam, journal, result, topology)
 crates/sandy-backend/  native VmBackend impls: QemuBackend (Linux) + VfkitBackend (macOS)
 crates/sandy-cli/      the `sandy` binary
 nix/packages/          crane build definitions (build, clippy, docs, tests)

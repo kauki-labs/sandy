@@ -54,7 +54,7 @@ they exist when the backend boots.
 ## The console protocol
 
 The guest side is a plain serial shell; sandy's state machine
-(`crates/sandy/src/console`) drives it: scan for `sandy login:`, inject a
+(`impls/vm/src/console`) drives it: scan for `sandy login:`, inject a
 base64-wrapped command bracketed by unique per-run `<<SANDY-<uuid>-START/END>>`
 sentinels, capture the bytes between them, parse the trailing `exit=<n>`.
 
