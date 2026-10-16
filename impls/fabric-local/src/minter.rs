@@ -78,6 +78,9 @@ pub enum StageError {
 /// `dir` is opened once and everything after is relative to that handle: the
 /// owner and mode check, the create, the rename and the sync. A path swapped
 /// after the check cannot redirect the write.
+///
+/// If the final directory sync fails, the error is returned and the secret stays
+/// in place, visible but possibly not durable; staging it again replaces it.
 pub fn stage_secret(dir: &Path, name: &str, bytes: &[u8]) -> Result<SecretRef, StageError> {
     let mut chars = name.chars();
     let valid = chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
@@ -135,8 +138,9 @@ pub fn stage_secret(dir: &Path, name: &str, bytes: &[u8]) -> Result<SecretRef, S
         });
     }
     if let Err(source) = handle.sync_all() {
-        // Not durable, and the caller gets no SecretRef to clean up with: remove it.
-        let _ = rustix::fs::unlinkat(&handle, name, AtFlags::empty());
+        // The secret is in place but may not survive a crash. Leave it: removing it
+        // by name could delete a concurrent staging of the same name. Staging again
+        // replaces it.
         return Err(StageError::Io { path: dir, source });
     }
     Ok(SecretRef {
