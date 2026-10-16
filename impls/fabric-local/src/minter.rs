@@ -170,7 +170,7 @@ pub fn stage_cap(dir: &Path, name: &str, cap: &Cap) -> Result<PathBuf, StageErro
 /// A random suffix so concurrent stagings of one name never share a temp file.
 fn unique_suffix() -> io::Result<String> {
     let mut raw = [0_u8; 8];
-    getrandom::fill(&mut raw).map_err(io::Error::other)?;
+    getrandom::fill(&mut raw).map_err(|e| io::Error::other(e.to_string()))?;
     Ok(raw.iter().map(|b| format!("{b:02x}")).collect())
 }
 

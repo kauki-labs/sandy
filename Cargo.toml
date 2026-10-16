@@ -27,7 +27,6 @@ sandy-impls-vm = { path = "impls/vm", version = "0.1.1" }
 sandy-test-support = { path = "crates/sandy-test-support", version = "0.1.1" }
 command-group = "5.0.1"
 futures-core = "0.3.34"
-getrandom = "0.4"
 futures-util = { version = "0.3.34", default-features = false, features = [
   "std",
 ] }
