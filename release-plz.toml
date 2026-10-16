@@ -4,16 +4,35 @@
 #   release-plz release-pr  opens/updates a PR that bumps the workspace version
 #                           and the changelogs. Merge it to cut a release.
 #   release-plz release     for each crate whose Cargo.toml version has no git
-#                           tag yet, creates the tag + GitHub release and
-#                           publishes to crates.io, in dependency order
-#                           (sandy-lib -> sandy-backend -> sandy-cli).
+#                           tag yet, creates the tag + GitHub release, in
+#                           dependency order (sandy-lib -> sandy-backend ->
+#                           sandy-cli -> ...). Does NOT publish to crates.io
+#                           (see `publish` below).
 #
-# So a version bump reaching main is what triggers the tag + publish.
+# So a version bump reaching main is what triggers the tag + release.
 
 [workspace]
 # A GitHub release per published crate, and a changelog kept in each crate.
 git_release_enable = true
 git_tag_enable = true
+# release-plz's own auto-created releases (one per crate, on a version bump)
+# have no generated notes without this — the new github-release.yaml workflow
+# only reacts to operator-pushed v*/m* tags, never to release-plz's own
+# per-crate tags, so it can't backfill notes here. CodeRabbit's catch.
+git_release_generate_notes = true
+# Operator decision (#158): GitHub releases only for now, no crates.io
+# publishing. release-plz's own publish step is the only thing in this repo
+# that would otherwise run `cargo publish`, so disabling it here is enough —
+# no per-crate Cargo.toml `publish = false` needed. Revisit once the operator
+# decides to publish.
+publish = false
+# Paired with `publish` above: without this, release-plz still asks the cargo
+# registry what the latest released version is to decide whether a bump is new
+# (per its own docs). Since nothing ever reaches crates.io now, that check would
+# never see a release and release-plz would keep proposing/re-tagging an
+# already-tagged version. `git_only` makes git tags the version source of truth
+# instead, which matches reality now that the registry never does.
+git_only = true
 # Don't open bump PRs just because a dependency updated; releases are driven by
 # an intentional version bump, not by lockfile churn.
 dependencies_update = false
