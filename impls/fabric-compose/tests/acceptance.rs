@@ -180,10 +180,11 @@ async fn gate_rejects_a_broken_cap_authority_even_though_its_slot_is_a_placehold
 /// but much thinner claim than "INV-1 end-to-end."
 #[tokio::test(flavor = "multi_thread")]
 async fn inv1_holds_through_the_real_executor_dispatch_path() -> anyhow::Result<()> {
+    const MARKER: &str = "s3cr3t-marker-v1";
+
     let secret_dir = tempfile::tempdir().context("secret_dir")?;
     let secret_file = secret_dir.path().join("tok");
-    let marker = b"s3cr3t-marker-v1";
-    std::fs::write(&secret_file, marker).context("write secret file")?;
+    std::fs::write(&secret_file, MARKER).context("write secret file")?;
     std::fs::set_permissions(&secret_file, std::fs::Permissions::from_mode(0o600)).context("secret file perms")?;
 
     let executor = VmBackendExecutor::new(ProcessBackend::new());
@@ -196,7 +197,12 @@ async fn inv1_holds_through_the_real_executor_dispatch_path() -> anyhow::Result<
         agent: false,
         shares: false,
     };
-    let command = ["sh".to_owned(), "-c".to_owned(), "env".to_owned()];
+    // Compares the secret in-shell and echoes only a pass/fail marker, never the
+    // raw value, then dumps env: proves the secret channel actually delivers the
+    // right bytes (not just that nothing happens to leak) alongside the INV-1
+    // no-leak check below.
+    let script = format!(r#"if [ "$(cat "$SANDY_SECRETS_DIR/TOKEN")" = "{MARKER}" ]; then echo SECRET_MATCH; fi; env"#);
+    let command = ["sh".to_owned(), "-c".to_owned(), script];
     let spec = RunSpec {
         template: "contract",
         command: &command,
@@ -214,9 +220,13 @@ async fn inv1_holds_through_the_real_executor_dispatch_path() -> anyhow::Result<
 
     let outcome = executor.run(&spec).await.context("dispatch through the real adapter")?;
     assert_eq!(outcome.guest_exit, Some(0), "the job ran: {:?}", outcome.console);
-    let marker = String::from_utf8_lossy(marker);
     assert!(
-        !outcome.console.contains(marker.as_ref()),
+        outcome.console.contains("SECRET_MATCH"),
+        "the job must read the correct secret value via SANDY_SECRETS_DIR, got {:?}",
+        outcome.console
+    );
+    assert!(
+        !outcome.console.contains(MARKER),
         "INV-1: the secret bytes must never reach the job's env, got {:?}",
         outcome.console
     );
