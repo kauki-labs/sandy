@@ -63,6 +63,9 @@ pub enum CapError {
     /// The capability is past its expiry.
     #[error("capability expired")]
     Expired,
+    /// The capability was revoked before its expiry (#129).
+    #[error("capability revoked")]
+    Revoked,
     /// An attenuation asked for rights the parent does not hold.
     #[error("attenuation would widen the parent's rights")]
     Widened,
