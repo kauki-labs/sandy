@@ -130,3 +130,43 @@ and the composition root needs a multi-thread runtime.
 migrate before the fabric needs it. An owned `RunSpec` for `spawn_blocking`: it
 would dup the `SecretSource::Fd` into a new fd lifetime, against the secret-channel
 discipline (INV-1), and make a deliberately borrowed, non-`Clone` type owned.
+
+## 6. `LocalCapAuthority`: HMAC-SHA256, attenuation through the authority
+
+**Status:** accepted.
+
+**Context.** Spec §3.8 calls the default `CapAuthority` "biscuit-style
+(placeholder)"; #110 is the step-1 local impl, landing in the shared
+`sandy-fabric-local` crate (`impls/fabric-local`) alongside the other local seam
+impls. #129 resolved revocation as a verify-time check against an issuer-owned
+set.
+
+**Decision.** `LocalCapAuthority` signs a length-prefixed canonical encoding of
+`CapScope` with HMAC-SHA256, keyed by a random 32-byte key generated per instance
+and held only by the process that mints and attenuates (a sandbox never holds it,
+so a self-minted cap fails `verify` as `Forged`, INV-1). The proof is also the
+cap's stable id for #129's revocation set (an in-process `HashSet`, checked in
+`verify` after expiry): no new field on `Cap`. `attenuate` verifies the parent
+first (a tampered or revoked parent can't be attenuated), narrows rights, and
+carries the parent's `expires_at` over unchanged, so a child can never widen scope
+or extend its TTL. Attenuation always goes through the authority; there is no
+holder-side offline attenuation. A scope minted with `expires_at: None` gets a
+concrete expiry (`now + default_ttl`, `default_ttl` injected at construction)
+resolved into the signed scope before signing, so "`None` means the authority's
+default TTL" is literal, not an unbounded cap (CWE-613).
+
+**Consequences.** "Biscuit-style" means narrowing-only delegation, not the
+`biscuit-auth` crate's datalog caveats — swapping in real biscuit tokens, or a
+blockchain-backed root, stays entirely behind the seam. Revocation distribution
+over the channel/transport (the content-addressed, eventually-delivered half of
+#129) is deferred to whichever issue wires it in; a verifier that hasn't seen a
+revocation still relies on TTL as the backstop, which now always holds since
+minting never leaves an unresolved expiry. Two caps minted for a byte-identical
+scope (same peer, channel, rights, and expiry) still share a proof, so revoking
+one revokes both; #181 tracks giving independently minted caps independent
+proofs without widening `Cap`.
+
+**Set aside.** The real `biscuit-auth` crate, for its offline holder-side
+attenuation: spec §3.4 has membership orchestrator-assigned in step 1, and the
+orchestrator can already reach the authority, so paying for offline attenuation
+now buys nothing yet; it is the deferred, richer impl behind the same seam.
