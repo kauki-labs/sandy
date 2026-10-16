@@ -150,14 +150,21 @@ cap's stable id for #129's revocation set (an in-process `HashSet`, checked in
 first (a tampered or revoked parent can't be attenuated), narrows rights, and
 carries the parent's `expires_at` over unchanged, so a child can never widen scope
 or extend its TTL. Attenuation always goes through the authority; there is no
-holder-side offline attenuation.
+holder-side offline attenuation. A scope minted with `expires_at: None` gets a
+concrete expiry (`now + default_ttl`, `default_ttl` injected at construction)
+resolved into the signed scope before signing, so "`None` means the authority's
+default TTL" is literal, not an unbounded cap (CWE-613).
 
 **Consequences.** "Biscuit-style" means narrowing-only delegation, not the
 `biscuit-auth` crate's datalog caveats — swapping in real biscuit tokens, or a
 blockchain-backed root, stays entirely behind the seam. Revocation distribution
 over the channel/transport (the content-addressed, eventually-delivered half of
 #129) is deferred to whichever issue wires it in; a verifier that hasn't seen a
-revocation still relies on TTL as the backstop.
+revocation still relies on TTL as the backstop, which now always holds since
+minting never leaves an unresolved expiry. Two caps minted for a byte-identical
+scope (same peer, channel, rights, and expiry) still share a proof, so revoking
+one revokes both; #181 tracks giving independently minted caps independent
+proofs without widening `Cap`.
 
 **Set aside.** The real `biscuit-auth` crate, for its offline holder-side
 attenuation: spec §3.4 has membership orchestrator-assigned in step 1, and the

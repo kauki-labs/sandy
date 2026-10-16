@@ -8,7 +8,7 @@
 
 use std::{
     sync::{Mutex, PoisonError},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use hmac::{Hmac, KeyInit, Mac};
@@ -24,6 +24,10 @@ type HmacSha256 = Hmac<Sha256>;
 /// [`verify`](CapAuthority::verify) as [`CapError::Forged`].
 pub struct LocalCapAuthority {
     key: [u8; 32],
+    /// Applied to a minted scope's `expires_at` when the caller leaves it `None`,
+    /// so "`None` means the authority's default TTL" is literally true: every
+    /// signed scope carries a concrete expiry (CWE-613, no unbounded cap).
+    default_ttl: Duration,
     /// Revoked caps' proof bytes (#129): the proof already uniquely identifies a
     /// minted cap, so it doubles as the stable id to revoke by with no new field
     /// on `Cap`. Distribution of this set over the transport is deferred; step 1
@@ -32,15 +36,17 @@ pub struct LocalCapAuthority {
 }
 
 impl LocalCapAuthority {
-    /// Create an authority with a fresh random key.
+    /// Create an authority with a fresh random key and `default_ttl` applied to
+    /// any scope minted without an explicit `expires_at`.
     ///
     /// # Errors
     /// [`CapError::Authority`] if the system RNG is unavailable.
-    pub fn new() -> Result<Self, CapError> {
+    pub fn new(default_ttl: Duration) -> Result<Self, CapError> {
         let mut key = [0u8; 32];
         getrandom::fill(&mut key).map_err(|e| CapError::Authority(format!("rng: {e}")))?;
         Ok(Self {
             key,
+            default_ttl,
             revoked: Mutex::new(std::collections::HashSet::new()),
         })
     }
@@ -72,7 +78,10 @@ impl LocalCapAuthority {
 }
 
 impl CapAuthority for LocalCapAuthority {
-    fn mint(&self, scope: CapScope) -> Result<Cap, CapError> {
+    fn mint(&self, mut scope: CapScope) -> Result<Cap, CapError> {
+        if scope.expires_at.is_none() {
+            scope.expires_at = Some(unix_now()?.saturating_add(self.default_ttl.as_secs()));
+        }
         let proof = self.mac(&scope)?.finalize().into_bytes().to_vec();
         Ok(Cap { scope, proof })
     }
