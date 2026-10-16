@@ -9,7 +9,7 @@
 use std::{
     fs::File,
     io::{self, Write},
-    os::unix::fs::MetadataExt,
+    os::unix::fs::{DirBuilderExt, MetadataExt},
     path::{Path, PathBuf},
 };
 
@@ -71,11 +71,32 @@ impl OwnedDir {
     ///
     /// As [`OwnedDir::open`], plus [`FsError::Io`] when creation fails.
     pub fn open_or_create(path: &Path) -> Result<Self, FsError> {
-        let _ = path;
-        Err(FsError::Unsafe {
-            path: PathBuf::new(),
-            reason: "not implemented".to_owned(),
-        })
+        let mut created = false;
+        if let Err(e) = std::fs::symlink_metadata(path) {
+            if e.kind() != io::ErrorKind::NotFound {
+                return Err(FsError::io("stat dir", path, e));
+            }
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent).map_err(|e| FsError::io("create parent dirs", parent, e))?;
+            }
+            match std::fs::DirBuilder::new().mode(0o700).create(path) {
+                Ok(()) => created = true,
+                // Created concurrently: validated below like any existing dir.
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(FsError::io("create dir", path, e)),
+            }
+        }
+        if created {
+            // The umask can only clear bits from 0700; set it exactly.
+            let fd = rustix::fs::open(
+                path,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|e| FsError::io("open created dir", path, e))?;
+            rustix::fs::fchmod(&fd, Mode::RWXU).map_err(|e| FsError::io("set created dir to 0700", path, e))?;
+        }
+        Self::open(path)
     }
 
     /// The path this directory was opened at.
@@ -131,12 +152,20 @@ impl OwnedDir {
     /// durable: removing it by name could delete a concurrent write of the same
     /// name, and writing again replaces it.
     ///
-    /// `name` is used as a single path component; the caller validates it.
+    /// `name` must be a single file name: empty, `.`, `..`, or a name containing
+    /// `/` is refused.
     ///
     /// # Errors
     ///
+    /// [`FsError::Unsafe`] for a name that is not a single file name;
     /// [`FsError::Io`] for any failed step.
     pub fn write_secret(&self, name: &str, bytes: &[u8]) -> Result<PathBuf, FsError> {
+        if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
+            return Err(FsError::Unsafe {
+                path: self.path.clone(),
+                reason: format!("{name:?} is not a single file name; refusing to write a secret under it"),
+            });
+        }
         let dest = self.path.join(name);
         let tmp = format!(
             ".{name}.{}.staging",
