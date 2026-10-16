@@ -236,3 +236,27 @@ the network. It stays the opt-in alternative behind the same `Minter` seam. For 
 cap: a reserved name the guest's export loop skips (the file stays readable on the
 job's mount), and an agent-only subdirectory (it holds only where the backend gives
 agent and job a real uid or mount boundary, which the local process backend may not).
+
+## 9. Local-first telemetry: an append log, off by default
+
+**Status:** accepted.
+
+**Context.** Telemetry must survive an unreachable orchestrator, need no network,
+and stay off unless asked for (spec §3.5).
+
+**Decision.** In `sandy-fabric-local` (`telemetry.rs`, #114):
+
+- `LocalLog` appends one JSON record per line with `O_APPEND` to a `0600` file and
+  syncs it, so a record is durable once `emit` returns. Disabled by default: it
+  records nothing and creates no file. On read, a torn last line is skipped and a
+  corrupt earlier line is an error.
+- `LocalFirst<S>` writes the local log first and fails only if that fails, then
+  forwards to `S` best effort. With telemetry off it neither logs nor forwards.
+
+**Consequences.** A dead orchestrator or channel loses no record. The
+channel-routed sink plugs in as `LocalFirst<ChannelSink>` once the channel roles
+(#113) land.
+
+**Set aside.** Content-addressed records now: `TelemetryRecord` has no timestamp or
+sequence, so hashing would merge repeated identical events. Content-addressed pull
+of the log is spec §7 work.
