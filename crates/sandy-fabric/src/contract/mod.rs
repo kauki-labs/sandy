@@ -35,6 +35,7 @@ use sandy_proto::{MessageType, PeerMsg};
 use crate::{
     capauth::{CapAuthority, CapError, CapRights, CapScope},
     channel_backend::{ChannelBackend, ChannelBackendError, Envelope, MSG_ID_KEY},
+    escalation::{EscalationMessage, EscalationSink},
     executor::{Arch, Capabilities, Executor, Requirements, SandboxKind},
     minter::{Minter, SecretRequest},
     placement::{Capacity, CapacityError, Discovery, HostDescriptor, Lease, Lifecycle},
@@ -588,6 +589,43 @@ pub async fn telemetry_suite<S: TelemetrySink>(
             captured(&sink) == kept,
             if enabled {
                 "an enabled sink keeps every record"
+            } else {
+                "a disabled sink keeps nothing"
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// Run the [`EscalationSink`] contract. `captured` observes how many messages a
+/// sink kept (for a fake human backend, its received count): an enabled sink
+/// notifies on every message by the time `notify` returns, a disabled one keeps
+/// none.
+pub async fn escalation_suite<S: EscalationSink>(
+    make_enabled: impl Fn() -> S,
+    make_disabled: impl Fn() -> S,
+    captured: impl Fn(&S) -> usize,
+) -> Result<(), ContractViolation> {
+    const SEAM: &str = "EscalationSink";
+    let message = EscalationMessage {
+        from: PeerId::from("sandbox-1"),
+        reason: "contract".to_owned(),
+    };
+
+    for (sink, enabled, kept) in [(make_enabled(), true, 3), (make_disabled(), false, 0)] {
+        require(
+            SEAM,
+            sink.enabled() == enabled && sink.enabled() == enabled,
+            "enabled() reflects the configuration and is stable",
+        )?;
+        for _ in 0..3 {
+            expect_ok(SEAM, "notify", sink.notify(&message).await)?;
+        }
+        require(
+            SEAM,
+            captured(&sink) == kept,
+            if enabled {
+                "an enabled sink is notified of every message"
             } else {
                 "a disabled sink keeps nothing"
             },

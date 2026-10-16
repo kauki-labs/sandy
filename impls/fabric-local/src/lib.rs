@@ -13,6 +13,7 @@ pub mod executor;
 pub mod inmem;
 pub mod minter;
 pub mod placement;
+pub mod roles;
 pub mod telemetry;
 
 pub use capauth::LocalCapAuthority;

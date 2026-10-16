@@ -7,8 +7,8 @@ use std::time::Duration;
 use anyhow::Context;
 
 use super::{
-    ContractViolation, capacity_suite, capauth_suite, channel_backend_suite, discovery_suite, executor_suite, fakes::*,
-    lifecycle_suite, minter_suite, telemetry_suite, transport_suite,
+    ContractViolation, capacity_suite, capauth_suite, channel_backend_suite, discovery_suite, escalation_suite,
+    executor_suite, fakes::*, lifecycle_suite, minter_suite, telemetry_suite, transport_suite,
 };
 use crate::{
     executor::{Arch, Capabilities, SandboxKind},
@@ -293,5 +293,42 @@ async fn telemetry_suite_rejects_dropping_records_while_enabled() {
     assert_violates(
         telemetry_suite(lossy, || FakeSink::new(false), FakeSink::captured).await,
         "an enabled sink keeps every record",
+    );
+}
+
+// ---- EscalationSink ----
+
+#[tokio::test]
+async fn escalation_reference_passes() -> anyhow::Result<()> {
+    escalation_suite(
+        || FakeHumanBackend::new(true),
+        || FakeHumanBackend::new(false),
+        FakeHumanBackend::captured,
+    )
+    .await
+    .context("reference sink")
+}
+
+#[tokio::test]
+async fn escalation_suite_rejects_notifying_while_disabled() {
+    let disabled = || FakeHumanBackend {
+        ignore_disabled: true,
+        ..FakeHumanBackend::new(false)
+    };
+    assert_violates(
+        escalation_suite(|| FakeHumanBackend::new(true), disabled, FakeHumanBackend::captured).await,
+        "a disabled sink keeps nothing",
+    );
+}
+
+#[tokio::test]
+async fn escalation_suite_rejects_dropping_messages_while_enabled() {
+    let lossy = || FakeHumanBackend {
+        lossy: true,
+        ..FakeHumanBackend::new(true)
+    };
+    assert_violates(
+        escalation_suite(lossy, || FakeHumanBackend::new(false), FakeHumanBackend::captured).await,
+        "an enabled sink is notified of every message",
     );
 }
