@@ -9,7 +9,7 @@
 use std::{
     fs::File,
     io::{self, Write},
-    os::unix::fs::{DirBuilderExt, MetadataExt},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
 
@@ -71,29 +71,50 @@ impl OwnedDir {
     ///
     /// As [`OwnedDir::open`], plus [`FsError::Io`] when creation fails.
     pub fn open_or_create(path: &Path) -> Result<Self, FsError> {
-        let mut created = false;
-        if let Err(e) = std::fs::symlink_metadata(path) {
-            if e.kind() != io::ErrorKind::NotFound {
-                return Err(FsError::io("stat dir", path, e));
-            }
-            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                std::fs::create_dir_all(parent).map_err(|e| FsError::io("create parent dirs", parent, e))?;
-            }
-            match std::fs::DirBuilder::new().mode(0o700).create(path) {
-                Ok(()) => created = true,
-                // Created concurrently: validated below like any existing dir.
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(FsError::io("create dir", path, e)),
-            }
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => return Self::open(path),
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(FsError::io("stat dir", path, e)),
+            Err(_) => {}
         }
-        let owned = Self::open(path)?;
-        if created {
-            // The umask can only clear bits from 0700; set it exactly, on the handle
-            // that was validated and is used for every write.
-            rustix::fs::fchmod(&owned.handle, Mode::RWXU)
-                .map_err(|e| FsError::io("set created dir to 0700", path, e))?;
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let name = path
+            .file_name()
+            .ok_or_else(|| FsError::io("create dir", path, io::Error::from(io::ErrorKind::InvalidInput)))?;
+        std::fs::create_dir_all(parent).map_err(|e| FsError::io("create parent dirs", parent, e))?;
+        let parent_fd = rustix::fs::open(
+            parent,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| FsError::io("open parent dir", parent, e))?;
+        match rustix::fs::mkdirat(&parent_fd, name, Mode::RWXU) {
+            Ok(()) => {}
+            // Created concurrently: validated like any existing dir.
+            Err(rustix::io::Errno::EXIST) => return Self::open(path),
+            Err(e) => return Err(FsError::io("create dir", path, e)),
         }
-        Ok(owned)
+        // The umask may have cleared bits from 0700, even the owner's read bit,
+        // which would make the dir unopenable. Set 0700 relative to the parent
+        // handle before opening it; a swapped-in link can only be narrowed here, and
+        // the open below validates whatever is there.
+        let secured = rustix::fs::chmodat(&parent_fd, name, Mode::RWXU, AtFlags::SYMLINK_NOFOLLOW)
+            .or_else(|e| match e {
+                // Linux before fchmodat2 cannot honour NOFOLLOW here.
+                rustix::io::Errno::NOTSUP | rustix::io::Errno::OPNOTSUPP => {
+                    rustix::fs::chmodat(&parent_fd, name, Mode::RWXU, AtFlags::empty())
+                }
+                other => Err(other),
+            })
+            .map_err(|e| FsError::io("set created dir to 0700", path, e))
+            .and_then(|()| Self::open(path));
+        if secured.is_err() {
+            // Best effort: never leave a half-set-up dir to block a retry.
+            let _ = rustix::fs::unlinkat(&parent_fd, name, AtFlags::REMOVEDIR);
+        }
+        secured
     }
 
     /// The path this directory was opened at.
