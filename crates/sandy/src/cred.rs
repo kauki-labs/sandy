@@ -368,7 +368,6 @@ fn write_secret_0600(dest: &Path, bytes: &[u8]) -> Result<(), CredError> {
         .map_err(|e| CredError::Stage(e.to_string()))
 }
 
-/// Build a [`CredError::Stage`] for an IO failure without leaking secret bytes.
 /// Refuse trust material owned by another user: sandy writes it as the current
 /// user, so a file owned by anyone else was put there by someone else (#200).
 fn refuse_foreign_owner(what: &str, path: &Path, uid: u32, current_uid: u32) -> Result<(), CredError> {
@@ -401,6 +400,20 @@ fn wide_dir_warning(dir: &Path, dir_uid: u32, dir_mode: u32, current_uid: u32) -
 /// open) owned by the current user. A dir others can write to, or another user
 /// owns, logs a tamper warning and the read goes ahead.
 fn open_trust_file(what: &str, path: &Path) -> Result<(fs::File, fs::Metadata), CredError> {
+    let (file, meta, warning) = open_trust_file_as(what, path, rustix::process::getuid().as_raw())?;
+    if let Some(warning) = warning {
+        tracing::warn!("{warning}");
+    }
+    Ok((file, meta))
+}
+
+/// [`open_trust_file`] for a given current uid, returning the tamper warning
+/// instead of logging it, so tests can drive the fd path as another user.
+fn open_trust_file_as(
+    what: &str,
+    path: &Path,
+    current_uid: u32,
+) -> Result<(fs::File, fs::Metadata, Option<String>), CredError> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
     let file = fs::OpenOptions::new()
@@ -417,18 +430,15 @@ fn open_trust_file(what: &str, path: &Path) -> Result<(fs::File, fs::Metadata), 
             path.display()
         )));
     }
-    let current_uid = rustix::process::getuid().as_raw();
     refuse_foreign_owner(what, path, meta.uid(), current_uid)?;
-    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        if let Ok(dir_meta) = fs::metadata(dir) {
-            if let Some(warning) = wide_dir_warning(dir, dir_meta.uid(), dir_meta.mode() & 0o7777, current_uid) {
-                tracing::warn!("{warning}");
-            }
-        }
-    }
-    Ok((file, meta))
+    let warning = path.parent().filter(|d| !d.as_os_str().is_empty()).and_then(|dir| {
+        let dir_meta = fs::metadata(dir).ok()?;
+        wide_dir_warning(dir, dir_meta.uid(), dir_meta.mode() & 0o7777, current_uid)
+    });
+    Ok((file, meta, warning))
 }
 
+/// Build a [`CredError::Stage`] for an IO failure without leaking secret bytes.
 fn stage_err(action: &str, path: &Path, err: &std::io::Error) -> CredError {
     CredError::Stage(format!("{action} at {}: {err}", path.display()))
 }
