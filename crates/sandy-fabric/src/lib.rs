@@ -1,4 +1,5 @@
-//! `sandy-fabric`: the agent-fabric contract (spec: sandy-agent-fabric §2, §5).
+//! `sandy-fabric`: the agent-fabric contract (spec: `docs/design/agent-fabric/spec.md`
+//! §2, §5; the `§` references in each module point into it).
 //!
 //! Traits and types only: the fabric's seams, their data and error types, and a
 //! shared contract-test harness. No concrete impls live here; each one (process

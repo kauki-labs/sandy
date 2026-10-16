@@ -9,7 +9,7 @@ updated: 2026-10-16
 
 The contract crate for the agent fabric (epic #103, block 0 / #104): the seam
 traits, their types, and the shared contract-test harness every impl passes. Spec:
-`~/Fun/specs/sandy/sandy-agent-fabric.md` §2, §3, §5.
+[`../design/agent-fabric/spec.md`](../design/agent-fabric/spec.md) §2, §3, §5.
 
 ## 1. One contract crate, one suite per seam
 
