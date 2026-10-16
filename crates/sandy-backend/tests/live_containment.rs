@@ -110,10 +110,15 @@ fn a_confined_job_reads_the_faithful_run_sandy_path() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// #142 hard read-only: a write to a read-only share fails at the kernel (EROFS/
-/// EACCES), not cooperatively, and the host source is unchanged.
+/// #142 hard read-only: a write to a read-only share fails at the KERNEL (a
+/// read-only mount), not merely because the staged file is `chmod a-w`. The job first
+/// tries to restore write permission and only then writes: under cooperative RO
+/// (writable mount + `a-w` file) the `chmod` would succeed and the write go through
+/// (WROTE); under a real `--ro-bind` the mount rejects both, so it stays DENIED and
+/// the host source is untouched. This is what distinguishes hard RO from the
+/// cooperative fallback.
 #[test]
-fn a_write_to_a_read_only_share_is_denied() -> anyhow::Result<()> {
+fn a_write_to_a_read_only_share_is_denied_by_the_mount() -> anyhow::Result<()> {
     let backend = live_confining_backend();
     let src = tempfile::TempDir::new()?;
     let data = src.path().join("data");
@@ -122,12 +127,13 @@ fn a_write_to_a_read_only_share_is_denied() -> anyhow::Result<()> {
     let outcome = run_with_input(
         &backend,
         &data,
-        "if echo tampered > /run/sandy/inputs/data 2>/dev/null; then echo WROTE; else echo DENIED; fi",
+        "chmod u+w /run/sandy/inputs/data 2>/dev/null; if echo tampered > /run/sandy/inputs/data 2>/dev/null; then \
+         echo WROTE; else echo DENIED; fi",
     )?;
 
     assert!(
         outcome.console.contains("DENIED") && !outcome.console.contains("WROTE"),
-        "a write to the read-only share must be denied, got {:?}",
+        "a read-only MOUNT must reject the write even after chmod u+w (not cooperative), got {:?}",
         outcome.console
     );
     assert_eq!(std::fs::read(&data)?, b"original", "the host source must be unchanged");

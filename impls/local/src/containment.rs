@@ -171,6 +171,13 @@ fn scope_unit(id: &str) -> String {
 /// fixed mount paths (`/run/sandy/{inputs,outputs,secrets}`).
 const SANDY_RUN_DIR: &str = "/run/sandy";
 
+/// The namespaces the confined job runs in (net is deliberately NOT unshared —
+/// egress is a separate seam). Shared by [`bwrap_segment`] and the capability probe
+/// [`detect_bwrap_confinement`] so the probe tests the EXACT set the real wrapper
+/// uses: a host that accepts the probe cannot then reject the wrapper's namespaces
+/// (which would surface a setup failure as a task exit, violating INV-11).
+const UNSHARE_FLAGS: [&str; 4] = ["--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup"];
+
 /// The `systemd-run --user --scope` launch prefix through the trailing `--` (pure).
 /// `Delegate=yes` gives the scope a delegated cgroup subtree so the whole tree is
 /// reaped on `stop`; the optional `MemoryMax`/`CPUQuota` bound the run's resources.
@@ -220,6 +227,11 @@ fn bwrap_segment(mounts: &[Mount]) -> Vec<String> {
         "/dev".to_string(),
         "--proc".to_string(),
         "/proc".to_string(),
+        // Ephemeral writable /tmp: `--ro-bind / /` makes the host /tmp read-only, so a
+        // job using the default temp dir would fail without this (it ran on the
+        // non-confined path). Fresh tmpfs, not the host staging.
+        "--tmpfs".to_string(),
+        "/tmp".to_string(),
         // Hide the user session bus: a tmpfs over /run/user drops the socket, and
         // unsetting the pointers removes the fallback address.
         "--tmpfs".to_string(),
@@ -242,11 +254,8 @@ fn bwrap_segment(mounts: &[Mount]) -> Vec<String> {
         seg.push(m.host.display().to_string());
         seg.push(m.guest.display().to_string());
     }
+    seg.extend(UNSHARE_FLAGS.iter().map(|s| (*s).to_string()));
     seg.extend([
-        "--unshare-pid".to_string(),
-        "--unshare-ipc".to_string(),
-        "--unshare-uts".to_string(),
-        "--unshare-cgroup".to_string(),
         "--die-with-parent".to_string(),
         "--chdir".to_string(),
         "/".to_string(),
@@ -312,18 +321,14 @@ fn detect_bwrap_confinement() -> bool {
     if !cfg!(target_os = "linux") {
         return false;
     }
+    // Probe the EXACT namespace set bwrap_segment uses (UNSHARE_FLAGS), so the
+    // capability verdict matches what the real wrapper will attempt: a host that
+    // accepts this probe will accept the wrapper's namespaces too.
+    let mut args = vec!["--ro-bind", "/", "/", "--dev", "/dev"];
+    args.extend(UNSHARE_FLAGS);
+    args.extend(["--die-with-parent", "--", "true"]);
     Command::new("bwrap")
-        .args([
-            "--ro-bind",
-            "/",
-            "/",
-            "--dev",
-            "/dev",
-            "--unshare-pid",
-            "--die-with-parent",
-            "--",
-            "true",
-        ])
+        .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -469,6 +474,14 @@ mod tests {
         assert!(
             cmd.windows(2).any(|w| w == ["--unsetenv", "DBUS_SESSION_BUS_ADDRESS"]),
             "bus env unset"
+        );
+        assert!(
+            cmd.windows(2).any(|w| w == ["--tmpfs", "/tmp"]),
+            "an ephemeral writable /tmp is provided under the read-only rootfs, got {cmd:?}"
+        );
+        assert!(
+            cmd.iter().any(|a| a == "--unshare-cgroup"),
+            "the full unshare set is applied (matching the probe), got {cmd:?}"
         );
         // Faithful binds: inputs read-only, outputs writable.
         assert!(
