@@ -373,20 +373,29 @@ impl Stream for CursorStream {
                 }
             }
             Poll::Pending => {
-                // Stash our own waker: the backend's own stream only wakes on
-                // its next append (see ChannelBackend::stream_from), which may
-                // never come. leave() wakes THIS one directly, so the stream
-                // re-polls and hits the generation check above even when
-                // nothing is ever posted again.
-                if let Some(state) = this
-                    .sessions
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .get_mut(&this.membership)
-                {
-                    state.waker = Some(cx.waker().clone());
+                // Check-and-store under ONE lock acquisition, not two: the
+                // generation check above already released its lock before
+                // polling the backend, so leave() (or a leave()+rejoin) can
+                // land in that gap. If we blindly stored a waker here without
+                // re-checking, two races follow: (a) leave() already ran,
+                // found no waker to wake yet, and will never run again — we'd
+                // park forever, unwoken until the backend's next append, which
+                // may never come (the exact hang this mechanism exists to
+                // remove); (b) a rejoin landed a NEWER generation at the same
+                // MembershipId, and we'd clobber the REJOINED stream's waker
+                // with our own stale one. Re-checking the generation in the
+                // same critical section as the store closes both: either
+                // we're still current and the store is safe, or we're not and
+                // we end immediately instead of parking a waker nothing will
+                // ever fire.
+                let mut sessions = this.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+                match sessions.get_mut(&this.membership) {
+                    Some(state) if state.generation == this.generation => {
+                        state.waker = Some(cx.waker().clone());
+                        Poll::Pending
+                    }
+                    _ => Poll::Ready(None),
                 }
-                Poll::Pending
             }
             other => other,
         }
