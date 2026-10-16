@@ -15,6 +15,8 @@
 //! whose controller-transit impl mints over the network.
 //! [`CapAuthority`](capauth::CapAuthority) is sync: verify sits on the hot path of
 //! every join, post and subscribe, and is pure crypto.
+//! [`RawConsole`](raw_console::RawConsole) is also sync: a byte-level break-glass
+//! fallback to a sandbox, independent of its agent.
 //!
 //! The channel itself is not a seam: it is one concrete abstraction layered over
 //! [`ChannelBackend`](channel_backend::ChannelBackend), carrying `sandy-proto`'s
@@ -28,6 +30,7 @@ pub mod channel_backend;
 pub mod executor;
 pub mod minter;
 pub mod placement;
+pub mod raw_console;
 pub mod telemetry;
 pub mod transport;
 pub mod types;

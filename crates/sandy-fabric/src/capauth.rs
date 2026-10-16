@@ -120,6 +120,21 @@ pub fn decode_cap(bytes: &[u8]) -> Result<Cap, CapCodecError> {
     serde_json::from_slice(bytes).map_err(|e| CapCodecError(e.to_string()))
 }
 
+/// The file descriptor a launched sandbox agent reads its bootstrap
+/// orchestrator-channel cap from (#109), on the local process backend.
+///
+/// NOT a staged file: the guest's login shell exports every file under
+/// `/run/sandy/secrets` into the job's environment, so a cap staged there would
+/// let the untrusted job present it and act as the agent (see `docs/decisions/`,
+/// #177). Instead the executor that launches the agent opens a pipe, writes the
+/// cap ([`encode_cap`]) to the write end, closes it, and passes the read end to
+/// the agent at this fixed descriptor — never `0`/`1`/`2`. The agent reads it to
+/// EOF exactly once ([`decode_cap`]), then closes it before spawning the job, so
+/// the job never inherits the descriptor or anything derived from it. A VM
+/// sandbox's equivalent handoff rides a reserved vsock port instead; this
+/// constant is for the local/process backend only.
+pub const AGENT_CAP_FD: std::os::unix::io::RawFd = 3;
+
 #[cfg(test)]
 mod tests {
     use super::*;
