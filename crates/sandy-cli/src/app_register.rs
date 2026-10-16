@@ -729,6 +729,43 @@ mod tests {
 
     use super::*;
 
+    /// #194: rewriting the App key over an existing 0644 file leaves it 0600. The
+    /// old writer opened with `truncate`, which kept the old mode.
+    #[test]
+    fn rewriting_the_app_key_over_a_wide_file_leaves_it_0600() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()?;
+        let key = dir.path().join("acme.pem");
+        std::fs::write(&key, "old")?;
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644))?;
+        let written = write_pem_in(dir.path(), "acme", "-----BEGIN KEY-----")?;
+        let mode = std::fs::metadata(&written)?.permissions().mode() & 0o777;
+        anyhow::ensure!(mode == 0o600, "the App key came out {mode:o}");
+        Ok(())
+    }
+
+    /// #194: a symlink at the App key path is replaced, never written through.
+    #[test]
+    fn the_app_key_is_never_written_through_a_symlink() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()?;
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "untouched")?;
+        std::os::unix::fs::symlink(&victim, dir.path().join("acme.pem"))?;
+        write_pem_in(dir.path(), "acme", "-----BEGIN KEY-----")?;
+        anyhow::ensure!(
+            std::fs::read_to_string(&victim)? == "untouched",
+            "the key was written through a symlink"
+        );
+        Ok(())
+    }
+
     /// #193: the verify probe stages an installation token, so its dir must be
     /// 0700 from creation under any umask, freshly named (never a pre-created
     /// path), and under the validated staging base. The old dir was created at the

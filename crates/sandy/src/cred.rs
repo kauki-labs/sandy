@@ -633,6 +633,65 @@ mod tests {
         Ok(())
     }
 
+    fn sample_root() -> TrustRoot {
+        TrustRoot::Github {
+            base_url: None,
+            app_id: "123456".to_string(),
+            private_key_path: PathBuf::from("/etc/sandy/app.pem"),
+            installation_id: 789,
+            targets: vec![Target("acme/widgets".to_string())],
+        }
+    }
+
+    /// #194: a symlink at the trust-root config path is replaced, never written
+    /// through. The old writer created a fixed `<path>.tmp` that followed a link.
+    #[test]
+    fn a_trust_root_write_never_follows_a_symlink_at_its_temp_path() -> anyhow::Result<()> {
+        let tmp = private_tempdir()?;
+        let path = tmp.path().join("acme.json");
+        let victim = tmp.path().join("victim");
+        fs::write(&victim, b"untouched")?;
+        std::os::unix::fs::symlink(&victim, path.with_extension("tmp"))?;
+        sample_root().write(&path).context("write trust root")?;
+        assert_eq!(
+            fs::read(&victim)?,
+            b"untouched",
+            "the config was written through a planted symlink"
+        );
+        assert_eq!(TrustRoot::load(&path)?, sample_root(), "trust root must round-trip");
+        Ok(())
+    }
+
+    /// #194: a group-writable trust-roots dir is refused, not repaired, with a
+    /// message that asks the user to check for tampering before fixing the mode.
+    #[test]
+    fn a_group_writable_trust_roots_dir_is_refused_with_a_tamper_warning() -> anyhow::Result<()> {
+        let tmp = private_tempdir()?;
+        let dir = tmp.path().join("trust-roots");
+        fs::create_dir(&dir)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o775))?;
+        let err = sample_root()
+            .write(&dir.join("acme.json"))
+            .expect_err("a 0775 trust-roots dir must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("may have been able to modify"), "no tamper warning: {msg}");
+        assert!(msg.contains("chmod 700"), "no fix named: {msg}");
+        let mode = fs::metadata(&dir)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o775, "a refused dir must not be silently repaired");
+        Ok(())
+    }
+
+    /// #194: a missing trust-roots dir is created 0700 with the config 0600.
+    #[test]
+    fn a_missing_trust_roots_dir_is_created_private() -> anyhow::Result<()> {
+        let tmp = private_tempdir()?;
+        let dir = tmp.path().join("sandy").join("trust-roots");
+        sample_root().write(&dir.join("acme.json"))?;
+        let mode = fs::metadata(&dir)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "a created trust-roots dir must be 0700");
+        Ok(())
+    }
+
     /// A provider whose every mint/refresh yields a fresh token and handle
     /// (`token-N` / `h-N`) and that records each revoked handle, so a test can prove
     /// re-delivery rewrote the file, advanced the lease, and revoked the *superseded*
