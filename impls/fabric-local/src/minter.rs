@@ -121,16 +121,26 @@ pub fn stage_secret(dir: &Path, name: &str, bytes: &[u8]) -> Result<SecretRef, S
     })
 }
 
-/// Stage a channel join capability as the secret `name` in `dir` (spec §3.8).
+/// Write a channel join capability as the `0600` file `name` in `dir`, as JSON,
+/// and return its path (spec §3.8).
 ///
 /// The cap is minted outside the sandbox by the orchestrator's
-/// [`CapAuthority`](sandy_fabric::capauth::CapAuthority) and only ever delivered in:
-/// this takes a minted [`Cap`], never an authority, so nothing that can mint a cap
-/// reaches the guest. The cap is staged on its own, as JSON; a work-secret is a
-/// separate staged secret, never bundled into the cap.
-pub fn stage_cap(dir: &Path, name: &str, cap: &Cap) -> Result<SecretRef, StageError> {
+/// [`CapAuthority`](sandy_fabric::capauth::CapAuthority): this takes a minted
+/// [`Cap`], never an authority, so nothing that can mint a cap is handed on. The
+/// cap is written on its own; a work-secret is a separate secret, never bundled in.
+///
+/// It returns a path, not a [`SecretRef`], on purpose. `RunSpec.secrets` reaches
+/// the job: the guest exports every staged secret into the job's environment. A
+/// cap is the agent's, and the job must never hold it, so the bootstrap cap goes
+/// to the agent out of band over its launch channel (#108, #109). Use this only
+/// for a surface the job cannot read.
+pub fn stage_cap(dir: &Path, name: &str, cap: &Cap) -> Result<PathBuf, StageError> {
     let encoded = serde_json::to_vec(cap).map_err(|e| StageError::Encode(e.to_string()))?;
-    stage_secret(dir, name, &encoded)
+    match stage_secret(dir, name, &encoded)?.source {
+        SecretSource::File(path) => Ok(path),
+        // stage_secret only ever stages to a file.
+        SecretSource::Fd(_) => Err(StageError::Encode("staged cap is not a file".to_owned())),
+    }
 }
 
 /// A random suffix so concurrent stagings of one name never share a temp file.
@@ -318,8 +328,8 @@ mod tests {
     #[test]
     fn a_channel_cap_is_staged_0600_and_reads_back_as_the_same_cap() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let staged = stage_cap(dir.path(), "CHANNEL_CAP", &cap())?;
-        let path = staged_path(&staged)?;
+        let path = stage_cap(dir.path(), "CHANNEL_CAP", &cap())?;
+        let path = path.as_path();
         let mode = fs::metadata(path)?.permissions().mode() & 0o777;
         anyhow::ensure!(mode == 0o600, "mode {mode:o}");
         let read: Cap = serde_json::from_slice(&fs::read(path)?)?;
@@ -331,9 +341,9 @@ mod tests {
     async fn a_work_secret_is_staged_apart_from_the_join_cap() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let secret = LocalMinter.mint(&SecretRequest { job: "j".to_owned() }).await?;
-        let cap_ref = stage_cap(dir.path(), "CHANNEL_CAP", &cap())?;
+        let cap_path = stage_cap(dir.path(), "CHANNEL_CAP", &cap())?;
         let secret_ref = stage_secret(dir.path(), "WORK_SECRET", &secret.bytes)?;
-        let (cap_path, secret_path) = (staged_path(&cap_ref)?, staged_path(&secret_ref)?);
+        let (cap_path, secret_path) = (cap_path.as_path(), staged_path(&secret_ref)?);
         anyhow::ensure!(cap_path != secret_path, "the cap and the work-secret share a file");
         let cap_bytes = fs::read(cap_path)?;
         anyhow::ensure!(
