@@ -11,3 +11,4 @@ pub mod inmem;
 pub mod placement;
 
 pub use capauth::LocalCapAuthority;
+pub mod minter;
