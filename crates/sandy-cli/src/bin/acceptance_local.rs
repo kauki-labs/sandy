@@ -16,7 +16,6 @@ use sandy::{Grants, Journal, Status};
 use sandy_api::contract::{egress_applier_suite, guest_share_transport_suite, vmbackend_suite};
 use sandy_backend::{LocalDirTransport, NoEgress, ProcessBackend};
 use sandy_cli::{plan::JobPlan, profiles, supervisor::run_with_profile};
-use uuid::Uuid;
 
 fn main() {
     match run() {
@@ -41,11 +40,14 @@ fn run() -> Result<(), String> {
 /// Drive one real job through the composed all-local profile: no hypervisor, no
 /// forge credential, the raw-process backend end to end.
 fn end_to_end() -> Result<(), String> {
-    let home = std::env::temp_dir().join(format!("sandy-acceptance-{}", Uuid::new_v4()));
-    let journal = Journal::new(&home);
+    let home = tempfile::Builder::new()
+        .prefix("sandy-acceptance-local-")
+        .tempdir()
+        .map_err(|e| format!("create temp SANDY_HOME: {e}"))?;
+    let journal = Journal::new(home.path());
     journal
         .ensure_dirs()
-        .map_err(|e| format!("journal ensure_dirs at {}: {e}", home.display()))?;
+        .map_err(|e| format!("journal ensure_dirs at {}: {e}", home.path().display()))?;
 
     let plan = JobPlan {
         template: "acceptance-local".to_string(),
@@ -68,18 +70,8 @@ fn end_to_end() -> Result<(), String> {
 
     let report = run_with_profile(&profiles::all_local(), &journal, &plan, None)
         .map_err(|e| format!("run_with_profile: {e}"))?;
-    let cleanup = std::fs::remove_dir_all(&home);
     if report.envelope.status != Status::Succeeded {
         return Err(format!("end-to-end job did not succeed: {:?}", report.envelope));
-    }
-    // Report the cleanup failure only after the real check passed — losing the
-    // temp SANDY_HOME is a hygiene issue, not an acceptance failure, but it must
-    // not be silently dropped either.
-    if let Err(e) = cleanup {
-        eprintln!(
-            "acceptance-local: warning: failed to remove temp SANDY_HOME {}: {e}",
-            home.display()
-        );
     }
     Ok(())
 }

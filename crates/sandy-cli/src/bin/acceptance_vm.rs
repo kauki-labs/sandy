@@ -31,7 +31,6 @@ use sandy_cli::{
     profiles,
     supervisor::run_with_profile,
 };
-use uuid::Uuid;
 
 fn main() {
     match run() {
@@ -73,11 +72,14 @@ fn run() -> Result<(), String> {
 /// real hypervisor boot end to end (the same `run_with_profile` entry point
 /// `acceptance-local` exercises for the process backend).
 fn end_to_end(template: &str) -> Result<(), String> {
-    let home = std::env::temp_dir().join(format!("sandy-acceptance-vm-{}", Uuid::new_v4()));
-    let journal = Journal::new(&home);
+    let home = tempfile::Builder::new()
+        .prefix("sandy-acceptance-vm-")
+        .tempdir()
+        .map_err(|e| format!("create temp SANDY_HOME: {e}"))?;
+    let journal = Journal::new(home.path());
     journal
         .ensure_dirs()
-        .map_err(|e| format!("journal ensure_dirs at {}: {e}", home.display()))?;
+        .map_err(|e| format!("journal ensure_dirs at {}: {e}", home.path().display()))?;
 
     let plan = JobPlan {
         template: template.to_string(),
@@ -100,15 +102,8 @@ fn end_to_end(template: &str) -> Result<(), String> {
 
     let report = run_with_profile(&profiles::host_no_cred(), &journal, &plan, None)
         .map_err(|e| format!("run_with_profile: {e}"))?;
-    let cleanup = std::fs::remove_dir_all(&home);
     if report.envelope.status != Status::Succeeded {
         return Err(format!("end-to-end job did not succeed: {:?}", report.envelope));
-    }
-    if let Err(e) = cleanup {
-        eprintln!(
-            "acceptance-vm: warning: failed to remove temp SANDY_HOME {}: {e}",
-            home.display()
-        );
     }
     Ok(())
 }

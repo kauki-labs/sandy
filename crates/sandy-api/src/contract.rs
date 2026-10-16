@@ -289,7 +289,7 @@ mod tests {
     }
 
     #[test]
-    fn vmbackend_suite_rejects_a_lingering_box() {
+    fn vmbackend_suite_rejects_a_lingering_box() -> anyhow::Result<()> {
         let err = vmbackend_suite("contract", LingersBackend::default).expect_err("a lingering box must be caught");
         assert_eq!(err.seam, "VmBackend");
         assert!(
@@ -297,6 +297,7 @@ mod tests {
             "expected the post-run lingering-box rule, got: {}",
             err.rule
         );
+        Ok(())
     }
 
     /// A LocalDir transport whose placements correctly track the supplied shares.
@@ -349,10 +350,11 @@ mod tests {
     }
 
     #[test]
-    fn guest_share_transport_suite_rejects_a_dropped_readonly_flag() {
+    fn guest_share_transport_suite_rejects_a_dropped_readonly_flag() -> anyhow::Result<()> {
         let err =
             guest_share_transport_suite(|| DropsReadonlyTransport).expect_err("a dropped readonly flag must be caught");
         assert_eq!(err.seam, "GuestShareTransport");
+        Ok(())
     }
 
     struct TrivialApplier;
@@ -393,11 +395,12 @@ mod tests {
     }
 
     #[test]
-    fn egress_applier_suite_rejects_a_revert_that_fails_when_idempotent() {
+    fn egress_applier_suite_rejects_a_revert_that_fails_when_idempotent() -> anyhow::Result<()> {
         let err = egress_applier_suite(|| FailsOnSecondRevertApplier {
             reverted: std::cell::Cell::new(false),
         })
         .expect_err("a revert that fails the second time (idempotence) must be caught");
         assert_eq!(err.seam, "EgressApplier");
+        Ok(())
     }
 }

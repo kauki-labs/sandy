@@ -54,6 +54,7 @@ sandy-backend = { workspace = true, features = ["impl-vm"] }
 sandy-api = { workspace = true, features = ["acceptance"] }
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 tiny_http.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -63,4 +64,3 @@ uuid.workspace = true
 anyhow.workspace = true
 rstest.workspace = true
 sandy-test-support.workspace = true
-tempfile.workspace = true
