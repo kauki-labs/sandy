@@ -396,9 +396,10 @@ fn wide_dir_warning(dir: &Path, dir_uid: u32, dir_mode: u32, current_uid: u32) -
 }
 
 /// Open trust material for reading: the checks run on the opened file, not the
-/// path. It must be a regular file (`O_NONBLOCK` keeps a FIFO from hanging the
-/// open) owned by the current user. A dir others can write to, or another user
-/// owns, logs a tamper warning and the read goes ahead.
+/// path. A symlink at the leaf is refused (`O_NOFOLLOW`), so a link planted in a
+/// wide dir cannot borrow the owner of its target. It must be a regular file
+/// (`O_NONBLOCK` keeps a FIFO from hanging the open) owned by the current user. A dir others can write to, or another
+/// user owns, logs a tamper warning and the read goes ahead.
 fn open_trust_file(what: &str, path: &Path) -> Result<(fs::File, fs::Metadata), CredError> {
     let (file, meta, warning) = open_trust_file_as(what, path, rustix::process::getuid().as_raw())?;
     if let Some(warning) = warning {
@@ -418,9 +419,14 @@ fn open_trust_file_as(
 
     let file = fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NONBLOCK)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
-        .map_err(|e| stage_err(&format!("open {what}"), path, &e))?;
+        .map_err(|e| match e.raw_os_error() {
+            Some(libc::ELOOP) => {
+                CredError::Stage(format!("{what} {} is a symlink; refusing to follow it", path.display()))
+            }
+            _ => stage_err(&format!("open {what}"), path, &e),
+        })?;
     let meta = file
         .metadata()
         .map_err(|e| stage_err(&format!("stat {what}"), path, &e))?;
@@ -764,10 +770,8 @@ mod tests {
         fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
         let link = tmp.path().join("acme.pem");
         std::os::unix::fs::symlink(&target, &link)?;
-        assert!(
-            read_secret_0600(&link).is_err(),
-            "a symlinked key must be refused, not followed"
-        );
+        let err = read_secret_0600(&link).expect_err("a symlinked key must be refused, not followed");
+        assert!(err.to_string().contains("is a symlink"), "unexpected: {err}");
         let target_cfg = tmp.path().join("victim-owned.json");
         sample_root().write(&target_cfg)?;
         let link_cfg = tmp.path().join("acme.json");
