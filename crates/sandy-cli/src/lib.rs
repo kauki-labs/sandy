@@ -9,4 +9,5 @@ pub mod app_register;
 pub mod doctor;
 pub mod output;
 pub mod plan;
+pub mod profiles;
 pub mod supervisor;
