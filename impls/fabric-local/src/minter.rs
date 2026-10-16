@@ -8,18 +8,16 @@
 //! the guest. Nothing travels on argv, in the environment, or through the store.
 
 use std::{
-    fs::{self, File},
-    io::{self, Write},
-    os::unix::fs::MetadataExt,
+    fs,
     path::{Path, PathBuf},
 };
 
-use rustix::fs::{AtFlags, Mode, OFlags};
 use sandy_api::backend::{SecretRef, SecretSource};
 use sandy_fabric::{
     capauth::{Cap, encode_cap},
     minter::{MintedSecret, Minter, MinterError, SecretRequest},
 };
+use sandy_fsutil::{FsError, OwnedDir};
 
 /// Bytes in a work-secret: 256 bits.
 pub const SECRET_LEN: usize = 32;
@@ -102,47 +100,14 @@ pub fn stage_secret(dir: &Path, name: &str, bytes: &[u8]) -> Result<SecretRef, S
     if dir.starts_with(store) {
         return Err(StageError::InStore(dir));
     }
-    let handle: File = rustix::fs::open(
-        &dir,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map(File::from)
-    .map_err(|e| StageError::Io {
-        path: dir.clone(),
-        source: e.into(),
+    let staging = OwnedDir::open(&dir).map_err(|e| match e {
+        FsError::Unsafe { .. } => StageError::UnsafeDir(dir.clone()),
+        FsError::Io { path, source, .. } => StageError::Io { path, source },
     })?;
-    let meta = handle.metadata().map_err(io_err(&dir))?;
-    if meta.uid() != rustix::process::getuid().as_raw() || meta.mode() & 0o022 != 0 {
-        return Err(StageError::UnsafeDir(dir));
-    }
-
-    let dest = dir.join(name);
-    let tmp = format!(".{name}.{}.staging", unique_suffix().map_err(io_err(&dir))?);
-    let discard_tmp = || {
-        // Best effort: the original error is the one worth reporting.
-        let _ = rustix::fs::unlinkat(&handle, tmp.as_str(), AtFlags::empty());
-    };
-    if let Err(source) = write_0600_at(&handle, &tmp, bytes) {
-        discard_tmp();
-        return Err(StageError::Io {
-            path: dir.join(&tmp),
-            source,
-        });
-    }
-    if let Err(e) = rustix::fs::renameat(&handle, tmp.as_str(), &handle, name) {
-        discard_tmp();
-        return Err(StageError::Io {
-            path: dest,
-            source: e.into(),
-        });
-    }
-    if let Err(source) = handle.sync_all() {
-        // The secret is in place but may not survive a crash. Leave it: removing it
-        // by name could delete a concurrent staging of the same name. Staging again
-        // replaces it.
-        return Err(StageError::Io { path: dir, source });
-    }
+    let dest = staging.write_secret(name, bytes).map_err(|e| match e {
+        FsError::Io { path, source, .. } => StageError::Io { path, source },
+        FsError::Unsafe { path, .. } => StageError::UnsafeDir(path),
+    })?;
     Ok(SecretRef {
         name: name.to_owned(),
         source: SecretSource::File(dest),
@@ -169,30 +134,6 @@ pub fn stage_cap(dir: &Path, name: &str, cap: &Cap) -> Result<PathBuf, StageErro
         // stage_secret only ever stages to a file.
         SecretSource::Fd(_) => Err(StageError::Encode("staged cap is not a file".to_owned())),
     }
-}
-
-/// A random suffix so concurrent stagings of one name never share a temp file.
-fn unique_suffix() -> io::Result<String> {
-    let mut raw = [0_u8; 8];
-    getrandom::fill(&mut raw).map_err(|e| io::Error::other(e.to_string()))?;
-    Ok(raw.iter().map(|b| format!("{b:02x}")).collect())
-}
-
-/// Create `name` in the directory `dir` as a new `0600` file holding `bytes`,
-/// synced to disk. `O_EXCL` with `O_NOFOLLOW` refuses anything already there,
-/// including a planted symlink.
-// SECURITY: keep in sync with `sandy::cred::write_secret_0600`; both move to one
-// shared writer in #174.
-fn write_0600_at(dir: &File, name: &str, bytes: &[u8]) -> io::Result<()> {
-    let fd = rustix::fs::openat(
-        dir,
-        name,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::from_raw_mode(0o600),
-    )?;
-    let mut file = File::from(fd);
-    file.write_all(bytes)?;
-    file.sync_all()
 }
 
 #[cfg(test)]
@@ -225,7 +166,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_minted_secret_is_staged_0600_with_its_exact_bytes() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
+        let dir = staging_dir()?;
         let secret = LocalMinter.mint(&SecretRequest { job: "j".to_owned() }).await?;
         let staged = stage_secret(dir.path(), "WORK_SECRET", &secret.bytes)?;
 
@@ -242,11 +183,11 @@ mod tests {
         Ok(())
     }
 
-    /// A 0700 temp dir: a safe staging dir (tempfile's default is already 0700).
+    /// A 0700 temp dir whatever the umask: a safe staging dir.
     fn staging_dir() -> anyhow::Result<tempfile::TempDir> {
-        let dir = tempfile::tempdir()?;
-        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
-        Ok(dir)
+        Ok(tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()?)
     }
 
     #[test]
@@ -362,7 +303,7 @@ mod tests {
 
     #[test]
     fn a_channel_cap_is_staged_0600_and_reads_back_as_the_same_cap() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
+        let dir = staging_dir()?;
         let path = stage_cap(dir.path(), "CHANNEL_CAP", &cap())?;
         let path = path.as_path();
         let mode = fs::metadata(path)?.permissions().mode() & 0o777;
@@ -375,7 +316,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_work_secret_is_staged_apart_from_the_join_cap() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
+        let dir = staging_dir()?;
         let secret = LocalMinter.mint(&SecretRequest { job: "j".to_owned() }).await?;
         let cap_path = stage_cap(dir.path(), "CHANNEL_CAP", &cap())?;
         let secret_ref = stage_secret(dir.path(), "WORK_SECRET", &secret.bytes)?;
@@ -437,7 +378,7 @@ mod tests {
 
     #[test]
     fn a_name_that_is_not_an_env_var_is_refused() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
+        let dir = staging_dir()?;
         for bad in ["", "1ABC", "A-B", "A B", "../x", "A=B"] {
             let res = stage_secret(dir.path(), bad, b"x");
             anyhow::ensure!(matches!(res, Err(StageError::InvalidName(_))), "{bad:?} gave {res:?}");

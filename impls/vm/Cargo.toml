@@ -22,6 +22,7 @@ workspace = true
 [dependencies]
 sandy.workspace = true
 sandy-api.workspace = true
+sandy-fsutil.workspace = true
 tracing.workspace = true
 uuid = { workspace = true }
 # The console driver (moved from sandy, #147): the sentinel protocol's base64

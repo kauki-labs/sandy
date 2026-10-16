@@ -857,6 +857,8 @@ mod tests {
         use sandy_test_support::FakeProvider;
 
         let tmp = tempfile::tempdir().context("tmp")?;
+        std::fs::set_permissions(tmp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .context("tmp 0700")?;
         let provider = FakeProvider::returning("tok");
         let lease = mint_lease(&provider, &Scope::default(), 1_800, "GITHUB_TOKEN", tmp.path())
             .map_err(|e| anyhow::anyhow!("{e}"))
@@ -913,6 +915,8 @@ mod tests {
 
         let (_home, journal) = fresh_journal()?;
         let cred_dir = tempfile::tempdir().context("cred dir")?;
+        std::fs::set_permissions(cred_dir.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .context("cred dir 0700")?;
         let provider = FakeProvider::returning("tok");
 
         // Suppress the deliberate panic's default backtrace print.

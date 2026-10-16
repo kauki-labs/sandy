@@ -401,6 +401,16 @@ fn dispatch_doctor(output: OutputFormat) -> i32 {
     result.exit_code
 }
 
+/// Removes a directory when dropped: the credential staging dir must not
+/// outlive the run, including on a panic.
+struct RemoveDirOnDrop(std::path::PathBuf);
+
+impl Drop for RemoveDirOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Mint a scoped forge token from the named trust root, stage it under a
 /// per-process dir, and run the job bracketed by it (mint → inject → revoke at
 /// teardown). Setup faults (bad trust-roots dir, unknown capability) map to an
@@ -426,11 +436,17 @@ fn run_credentialed(
         eprintln!("sandy: {e}");
         ProcessExit::InvalidPlan.code()
     })?;
-    let cred_dir = std::env::temp_dir().join(format!("sandy-cred-{}", std::process::id()));
-    std::fs::create_dir_all(&cred_dir).map_err(|e| {
-        eprintln!("sandy: create credential staging dir: {e}");
-        ProcessExit::InfraFault.code()
-    })?;
+    // A fresh 0700 dir under the validated staging base, randomly named: a
+    // predictable /tmp path could be pre-created by another user (#192).
+    let cred_dir = sandy_fsutil::private_staging_dir("cred")
+        .map_err(|e| {
+            eprintln!("sandy: create credential staging dir: {e}");
+            ProcessExit::InfraFault.code()
+        })?
+        .path()
+        .to_path_buf();
+    // Removed on every exit from here, a panic included, not only a normal return.
+    let _cleanup = RemoveDirOnDrop(cred_dir.clone());
     let result = supervisor::run_job_with_credential(
         profile.backend(),
         journal,
@@ -444,7 +460,6 @@ fn run_credentialed(
         &cred_dir,
         sandy::MAX_TTL_SECS,
     );
-    let _ = std::fs::remove_dir_all(&cred_dir);
     result.map_err(|e| {
         eprintln!("sandy: run failed: {e}");
         ProcessExit::InfraFault.code()

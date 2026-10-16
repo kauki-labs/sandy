@@ -85,6 +85,9 @@ pub use result::{
     Classification, Logs, OutputRef, OutputStatus, ProcessExit, Provenance, RESULT_SCHEMA_VERSION, Receipt,
     ResultEnvelope, Status, classify_backend_error, classify_invalid_plan, classify_outcome,
 };
+/// fsync a directory so a preceding create/rename within it is durable across a
+/// crash (INV-4/INV-6).
+pub(crate) use sandy_fsutil::fsync_dir;
 pub use schema::v1::{JOURNAL_SCHEMA_VERSION, JobRecord, JobState};
 pub use seed::{
     ALLOWED_IMAGE_FORMATS, ArtifactEntry, MinisignVerifier, Requirements, SeedManifest, SeedRefusal, SignatureVerifier,
@@ -101,9 +104,3 @@ pub use trust_root::{
     InstallError, Provisioner, RegistrationPlan, RevokeOutcome, deregister, github_app_manifest, parse_capability,
     register, register_skip_verify,
 };
-
-/// fsync a directory so a preceding create/rename within it is durable across a
-/// crash (INV-4/INV-6).
-pub(crate) fn fsync_dir(dir: &std::path::Path) -> std::io::Result<()> {
-    std::fs::File::open(dir)?.sync_all()
-}

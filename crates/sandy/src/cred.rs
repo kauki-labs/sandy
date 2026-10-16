@@ -29,7 +29,7 @@
 use std::{
     fs,
     io::Write,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
@@ -319,34 +319,19 @@ fn stage_token(out_dir: &Path, secret_name: &str, bytes: &[u8]) -> Result<PathBu
 /// Re-delivery (#49) reuses this to overwrite a lease's staged token in place with
 /// a freshly minted one; the rename makes that swap atomic for the reader.
 fn write_secret_0600(dest: &Path, bytes: &[u8]) -> Result<(), CredError> {
-    let dir = dest
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .ok_or_else(|| CredError::Stage(format!("secret path {} has no parent dir", dest.display())))?;
-    let tmp = dest.with_extension("tmp");
-    // A stale temp from a crashed earlier call would block O_EXCL; clear it first.
-    let _ = fs::remove_file(&tmp);
-    // Create at 0600 atomically: `mode` applies at creation and is not loosened by
-    // the umask (0600 has no group/other bits for the umask to clear), so there is
-    // no window where the token sits at a looser mode.
-    let staged = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)
-        .map_err(|e| stage_err("create token temp", &tmp, &e))
-        .and_then(|mut file| {
-            file.write_all(bytes)
-                .map_err(|e| stage_err("write token temp", &tmp, &e))?;
-            file.sync_all().map_err(|e| stage_err("sync token temp", &tmp, &e))?;
-            fs::rename(&tmp, dest).map_err(|e| stage_err("rename token into place", dest, &e))?;
-            crate::fsync_dir(dir).map_err(|e| stage_err("fsync out dir", dir, &e))
-        });
-    if staged.is_err() {
-        // Never leave the secret bytes behind in the temp sibling on a failed stage.
-        let _ = fs::remove_file(&tmp);
-    }
-    staged
+    let (Some(dir), Some(name)) = (
+        dest.parent().filter(|p| !p.as_os_str().is_empty()),
+        dest.file_name().and_then(|n| n.to_str()),
+    ) else {
+        return Err(CredError::Stage(format!(
+            "secret path {} has no parent dir or file name",
+            dest.display()
+        )));
+    };
+    sandy_fsutil::OwnedDir::open(dir)
+        .and_then(|dir| dir.write_secret(name, bytes))
+        .map(drop)
+        .map_err(|e| CredError::Stage(e.to_string()))
 }
 
 /// Build a [`CredError::Stage`] for an IO failure without leaking secret bytes.
@@ -362,6 +347,14 @@ mod tests {
     };
 
     use anyhow::Context;
+
+    /// A 0700 temp dir whatever the umask: secrets are only staged into a dir
+    /// that is this user's and not group- or world-writable (#174).
+    fn private_tempdir() -> std::io::Result<tempfile::TempDir> {
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+    }
     use sandy_test_support::FakeProvider;
 
     use super::*;
@@ -377,7 +370,7 @@ mod tests {
     /// the bound, the provider is asked for 3000s, not the larger value.
     #[test]
     fn ttl_above_max_is_clamped() -> anyhow::Result<()> {
-        let tmp = tempfile::TempDir::new()?;
+        let tmp = private_tempdir()?;
         let provider = FakeProvider::returning("tok");
 
         mint_lease(&provider, &scope(), 7_200, "GH_TOKEN", tmp.path()).context("mint_lease")?;
@@ -396,7 +389,7 @@ mod tests {
     /// the provider verbatim.
     #[test]
     fn ttl_within_bound_and_scope_pass_through() -> anyhow::Result<()> {
-        let tmp = tempfile::TempDir::new()?;
+        let tmp = private_tempdir()?;
         let provider = FakeProvider::returning("tok");
         let scope = scope();
 
@@ -416,7 +409,7 @@ mod tests {
     /// only in that file, never in the [`Lease`] handle (INV-1 leak plane).
     #[test]
     fn successful_mint_stages_0600_file_with_token() -> anyhow::Result<()> {
-        let tmp = tempfile::TempDir::new()?;
+        let tmp = private_tempdir()?;
         let token = "ghs_scoped_marker_value";
         let provider = FakeProvider::returning(token);
 
@@ -439,7 +432,7 @@ mod tests {
     /// provider yields [`CredError::Mint`] and writes no secret file.
     #[test]
     fn mint_failure_writes_no_token_file() -> anyhow::Result<()> {
-        let tmp = tempfile::TempDir::new()?;
+        let tmp = private_tempdir()?;
         let provider = FakeProvider::failing();
 
         let err = mint_lease(&provider, &scope(), 1_800, "GH_TOKEN", tmp.path())
@@ -459,7 +452,7 @@ mod tests {
     /// path the `.tmp` survived the failure; teardown only knows the final path.
     #[test]
     fn write_secret_0600_leaves_no_temp_on_failure() -> anyhow::Result<()> {
-        let tmp = tempfile::TempDir::new()?;
+        let tmp = private_tempdir()?;
         // `dest` is an existing directory, so the final rename (file → dir) fails
         // after the temp has been created and written.
         let dest = tmp.path().join("adir");
@@ -471,12 +464,11 @@ mod tests {
             "expected a stage failure, got {err:?}"
         );
 
-        let residue = dest.with_extension("tmp");
-        assert!(
-            !residue.exists(),
-            "the secret temp {} must be cleaned up on failure",
-            residue.display()
-        );
+        // Only `adir` may remain: no temp file, whatever its name.
+        let left: Vec<_> = fs::read_dir(tmp.path())?
+            .map(|e| e.map(|e| e.file_name()))
+            .collect::<Result<_, _>>()?;
+        assert_eq!(left, ["adir"], "the secret temp must be cleaned up on failure");
         Ok(())
     }
 
@@ -484,7 +476,7 @@ mod tests {
     /// token is revoked, not left valid to its native TTL with no lease to revoke it.
     #[test]
     fn mint_lease_revokes_the_token_when_staging_fails() -> anyhow::Result<()> {
-        let tmp = tempfile::TempDir::new()?;
+        let tmp = private_tempdir()?;
         // A non-existent out_dir makes the temp creation fail after a good mint.
         let missing = tmp.path().join("no-such-dir");
         let provider = FakeProvider::returning("tok");
@@ -507,7 +499,7 @@ mod tests {
     /// fails, the new token is revoked and the lease is left on the old one.
     #[test]
     fn refresh_once_revokes_the_new_token_when_restaging_fails() -> anyhow::Result<()> {
-        let tmp = tempfile::TempDir::new()?;
+        let tmp = private_tempdir()?;
         let provider = FakeProvider::returning("tok");
         // A lease due for refresh whose staged file lives under a missing dir, so the
         // re-stage fails after a good re-mint.
@@ -547,7 +539,7 @@ mod tests {
     /// before the native expiry.
     #[test]
     fn revoke_records_the_lease_handle() -> anyhow::Result<()> {
-        let tmp = tempfile::TempDir::new()?;
+        let tmp = private_tempdir()?;
         let provider = FakeProvider::returning("tok");
         let lease = mint_lease(&provider, &scope(), 1_800, "GH_TOKEN", tmp.path()).context("mint_lease")?;
 
@@ -596,7 +588,7 @@ mod tests {
     /// named error, the read side of INV-1 shared by adapters and the verify probe.
     #[test]
     fn read_secret_0600_reads_tight_refuses_loose() -> anyhow::Result<()> {
-        let tmp = tempfile::TempDir::new()?;
+        let tmp = private_tempdir()?;
         let tight = tmp.path().join("tight");
         fs::write(&tight, b"key-bytes").context("write tight secret")?;
         fs::set_permissions(&tight, fs::Permissions::from_mode(0o600)).context("chmod 600")?;
@@ -617,7 +609,7 @@ mod tests {
     /// holds only config (a key path), never the key bytes (INV-1).
     #[test]
     fn github_trust_root_round_trips_0600_without_secret_bytes() -> anyhow::Result<()> {
-        let tmp = tempfile::TempDir::new()?;
+        let tmp = private_tempdir()?;
         let path = tmp.path().join("trust-root.json");
         let root = TrustRoot::Github {
             base_url: None,
@@ -715,7 +707,7 @@ mod tests {
     /// handle, and the revoke ledger are all untouched.
     #[test]
     fn refresh_is_a_noop_before_the_margin() -> anyhow::Result<()> {
-        let tmp = tempfile::TempDir::new()?;
+        let tmp = private_tempdir()?;
         let provider = RotatingProvider::new();
         let mut lease = mint_lease(&provider, &scope(), 3000, "GH_TOKEN", tmp.path()).context("mint")?;
         let path = file_of(&lease);
@@ -737,7 +729,7 @@ mod tests {
     /// superseded handle, never the new one.
     #[test]
     fn refresh_restages_fresh_token_and_revokes_the_old() -> anyhow::Result<()> {
-        let tmp = tempfile::TempDir::new()?;
+        let tmp = private_tempdir()?;
         let provider = RotatingProvider::new();
         let mut lease = mint_lease(&provider, &scope(), 3000, "GH_TOKEN", tmp.path()).context("mint")?;
         let path = file_of(&lease);
@@ -767,7 +759,7 @@ mod tests {
     /// valid, the lease is unchanged, and nothing is revoked (the loop retries).
     #[test]
     fn a_failed_refresh_leaves_the_current_token_in_place() -> anyhow::Result<()> {
-        let tmp = tempfile::TempDir::new()?;
+        let tmp = private_tempdir()?;
         let provider = RotatingProvider::failing_refresh();
         let mut lease = mint_lease(&provider, &scope(), 3000, "GH_TOKEN", tmp.path()).context("mint")?;
         let path = file_of(&lease);

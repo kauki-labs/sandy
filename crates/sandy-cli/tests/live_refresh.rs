@@ -115,7 +115,12 @@ fn a_refreshed_token_reaches_the_running_guest() -> anyhow::Result<()> {
     let home = tempfile::tempdir().context("temp SANDY_HOME")?;
     let journal = Journal::new(home.path());
     journal.ensure_dirs().context("ensure_dirs")?;
-    let cred_dir = tempfile::tempdir().context("temp cred dir")?;
+    let cred_dir = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(
+            0o700,
+        ))
+        .tempdir()
+        .context("temp cred dir")?;
 
     // Read the token file twice across a sleep longer than two ticks. The comparison
     // is in-guest, so neither token value reaches argv or the console. No refresh

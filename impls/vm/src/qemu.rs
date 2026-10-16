@@ -252,7 +252,7 @@ impl QemuBackend {
         run_id: Uuid,
         inst_dir: &Path,
     ) -> Result<Outcome, BackendError> {
-        std::fs::create_dir_all(inst_dir)
+        sandy_fsutil::OwnedDir::open_or_create(inst_dir)
             .map_err(|err| BackendError::Spawn(format!("create instance dir {}: {err}", inst_dir.display())))?;
         let sock = inst_dir.join("serial.sock");
 
