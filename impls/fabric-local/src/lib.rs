@@ -7,6 +7,7 @@
 
 mod capauth;
 
+pub mod channel;
 pub mod inmem;
 pub mod placement;
 
