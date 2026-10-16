@@ -25,6 +25,7 @@ getrandom.workspace = true
 hex.workspace = true
 hmac.workspace = true
 sandy-api.workspace = true
+rustix.workspace = true
 sandy-fabric.workspace = true
 sandy-fsutil.workspace = true
 sandy-proto.workspace = true
