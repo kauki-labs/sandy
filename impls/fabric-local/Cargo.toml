@@ -25,11 +25,13 @@ getrandom.workspace = true
 hmac.workspace = true
 sandy-fabric.workspace = true
 sha2.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
 futures-util.workspace = true
+sandy-api.workspace = true
 sandy-fabric = { workspace = true, features = ["contract-tests"] }
 sandy-proto.workspace = true
 tokio = { workspace = true, features = ["time"] }
