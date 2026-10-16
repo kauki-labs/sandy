@@ -202,3 +202,37 @@ belongs to the composition root (#115).
 **Set aside.** Seeding the registry from the nix machines table via
 `parse_builder_systems`: that table lists build systems, not hosts with a sandbox
 kind, and the parser lives in the heavy `sandy` core. It is M4 cross-machine work.
+
+## 8. Agent-local minting and delivery through the secret channel
+
+**Status:** accepted.
+
+**Context.** A job's work-secret and its channel join cap must reach the sandbox
+without touching argv, the environment, or the Nix store, and the sandbox must not
+be able to mint its own cap (spec §3.8, INV-1).
+
+**Decision.** In `sandy-fabric-local` (`minter.rs`, #111):
+
+- `LocalMinter` mints 32 bytes from the OS CSPRNG on the host.
+- `stage_secret` writes bytes to a `0600` file (unique temp file, sync, rename,
+  directory fsync) and returns a `SecretRef` for `RunSpec.secrets`; the backend's
+  existing secret channel carries the work-secret into the guest. The staging
+  directory must be this user's and not group- or world-writable; names must be
+  env-var names; store paths are refused, also after resolving symlinks.
+- The channel cap does not ride that channel. The guest exports every staged
+  secret into the job's environment from a mount the job can read, so a cap there
+  would let the untrusted job act as the agent. The bootstrap orchestrator cap goes
+  to the agent out of band over its launch channel: vsock for a VM, a consume-once
+  pipe from executor to agent for the local backend, never an env var (#108, #109).
+  `stage_cap` is a host-side writer for an agent-only surface. It returns a path,
+  not a `SecretRef`, so the cap cannot be put into `RunSpec.secrets` by accident.
+
+**Consequences.** The minter and staging reuse the one secret path every backend
+already supports. The `0600` writer duplicates `sandy::cred::write_secret_0600` to
+keep `sandy-fabric-local` free of the `sandy` core; #174 consolidates the two.
+
+**Set aside.** Controller-transit minting as the default: the secret would cross
+the network. It stays the opt-in alternative behind the same `Minter` seam. For the
+cap: a reserved name the guest's export loop skips (the file stays readable on the
+job's mount), and an agent-only subdirectory (it holds only where the backend gives
+agent and job a real uid or mount boundary, which the local process backend may not).

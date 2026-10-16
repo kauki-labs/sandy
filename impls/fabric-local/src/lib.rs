@@ -8,6 +8,7 @@
 mod capauth;
 
 pub mod inmem;
+pub mod minter;
 pub mod placement;
 
 pub use capauth::LocalCapAuthority;
