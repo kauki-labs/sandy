@@ -114,3 +114,31 @@ async fn independent_stream_subscribers_do_not_cross_cursors() -> anyhow::Result
     assert_eq!(two_seq, 3, "from_two follows the live append independently");
     Ok(())
 }
+
+/// Two distinct content ids colliding on the same `sequence` (a channel-layer
+/// invariant violation this backend should never see, but must not silently
+/// swallow) is rejected with a typed error, not a debug panic or a silent
+/// success, and the first envelope stored under that sequence is untouched.
+#[tokio::test]
+async fn sequence_collision_between_distinct_ids_is_rejected() -> anyhow::Result<()> {
+    let backend = InMem::default();
+    backend
+        .append(envelope(5, "a"))
+        .await
+        .context("append the first envelope at sequence 5")?;
+
+    let result = backend.append(envelope(5, "b")).await;
+    assert!(
+        matches!(result, Err(ChannelBackendError::Unavailable(_))),
+        "a colliding sequence must return an error, got {result:?}"
+    );
+
+    let all = backend.fetch(0).await.context("fetch")?;
+    assert_eq!(
+        all.len(),
+        1,
+        "the collision must not overwrite or duplicate the stored entry"
+    );
+    assert_eq!(all[0].payload, b"a", "the first envelope at the sequence stands");
+    Ok(())
+}

@@ -64,25 +64,27 @@ impl ChannelBackend for InMem {
                 for waker in log.wakers.drain(..) {
                     waker.wake();
                 }
+                Ok(())
             }
             Entry::Occupied(_) => {
                 // Two distinct content ids collided on `sequence`; the channel
-                // layer assigns it and should never produce this. Surface it
-                // loudly instead of a silent drop: a debug_assert catches it in
-                // dev/test, a tracing::error keeps it observable in release.
-                debug_assert!(
-                    false,
-                    "sequence {} already holds a different content id than {id:?}",
-                    env.sequence
-                );
+                // layer assigns it and should never produce this, but a silent
+                // drop (or a debug-only panic) would leave the caller unable to
+                // tell the envelope was never stored. Return a typed error
+                // instead: Unavailable is the closest existing fit (the backend
+                // cannot honor the write), without widening ChannelBackendError
+                // itself, which other fabric blocks already depend on as locked.
                 tracing::error!(
                     sequence = env.sequence,
                     msg_id = %id,
-                    "channel backend: sequence collision between distinct content ids, dropping the second envelope"
+                    "channel backend: sequence collision between distinct content ids, rejecting the second envelope"
                 );
+                Err(ChannelBackendError::Unavailable(format!(
+                    "sequence {} already holds a different content id than {id:?}",
+                    env.sequence
+                )))
             }
         }
-        Ok(())
     }
 
     async fn fetch(&self, from_seq: u64) -> Result<Vec<Envelope>, ChannelBackendError> {
