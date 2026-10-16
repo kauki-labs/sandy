@@ -13,3 +13,4 @@ pub mod minter;
 pub mod placement;
 
 pub use capauth::LocalCapAuthority;
+pub mod telemetry;
