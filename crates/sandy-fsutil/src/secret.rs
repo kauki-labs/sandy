@@ -97,20 +97,11 @@ impl OwnedDir {
             Err(e) => return Err(FsError::io("create dir", path, e)),
         }
         // The umask may have cleared bits from 0700, even the owner's read bit,
-        // which would make the dir unopenable. Set 0700 relative to the parent
-        // handle before opening it; a swapped-in link can only be narrowed here, and
-        // the open below validates whatever is there.
+        // which would make the dir unopenable. Set 0700 on the entry just made,
+        // never following a link swapped in since, then open and validate it.
         // create_private_dir, the staging base and write_0600_at do not follow
         // this pattern yet; #204 aligns them.
-        let secured = rustix::fs::chmodat(&parent_fd, name, Mode::RWXU, AtFlags::SYMLINK_NOFOLLOW)
-            .or_else(|e| match e {
-                // Linux before fchmodat2 cannot honour NOFOLLOW here.
-                // A guard, not a pattern: the two are one value on Linux, two on macOS.
-                e if e == rustix::io::Errno::NOTSUP || e == rustix::io::Errno::OPNOTSUPP => {
-                    rustix::fs::chmodat(&parent_fd, name, Mode::RWXU, AtFlags::empty())
-                }
-                other => Err(other),
-            })
+        let secured = chmod_new_dir_0700(&parent_fd, name)
             .map_err(|e| FsError::io("set created dir to 0700", path, e))
             .and_then(|()| Self::open(path));
         if secured.is_err() {
@@ -228,6 +219,29 @@ fn unique_suffix() -> io::Result<String> {
     let mut raw = [0_u8; 8];
     getrandom::fill(&mut raw).map_err(|e| io::Error::other(e.to_string()))?;
     Ok(raw.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Set the dir `name` under `parent` to `0700` without following a symlink at
+/// `name`. Linux has no no-follow `fchmodat`, so pin the entry with
+/// `O_PATH | O_NOFOLLOW` (which needs no read permission) and chmod that inode
+/// through `/proc/self/fd`, as glibc does.
+#[cfg(target_os = "linux")]
+fn chmod_new_dir_0700(parent: &std::os::fd::OwnedFd, name: &std::ffi::OsStr) -> rustix::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let pinned = rustix::fs::openat(
+        parent,
+        name,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    rustix::fs::chmod(format!("/proc/self/fd/{}", pinned.as_raw_fd()).as_str(), Mode::RWXU)
+}
+
+/// Set the dir `name` under `parent` to `0700` without following a symlink at
+/// `name`; fails closed where no-follow chmod is unsupported.
+#[cfg(not(target_os = "linux"))]
+fn chmod_new_dir_0700(parent: &std::os::fd::OwnedFd, name: &std::ffi::OsStr) -> rustix::io::Result<()> {
+    rustix::fs::chmodat(parent, name, Mode::RWXU, AtFlags::SYMLINK_NOFOLLOW)
 }
 
 /// Create `name` in `dir` as a new `0600` file holding `bytes`, synced to disk.
