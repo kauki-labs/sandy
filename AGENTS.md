@@ -81,6 +81,7 @@ crates/
   ├─ sandy-test-support/  - in-memory test doubles for the seam traits (FakeBackend, FakeApplier, …), api-only
   ├─ sandy-backend/       - the backend hub: feature-gated re-export of impls/local and impls/vm
   ├─ sandy-fabric/        - agent-fabric seam traits + shared contract-test harness (no impls)
+  ├─ sandy-fsutil/        - shared security fs primitives: staging base, owned dirs, the 0600 secret writer
   └─ sandy-cli/           - the `sandy` binary (doctor, run/ls/status/wait/kill/gc, cred github …)
 impls/
   ├─ local/          - raw-process backend, local-dir share transport, host containment
