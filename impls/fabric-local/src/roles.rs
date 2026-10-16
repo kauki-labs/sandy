@@ -18,7 +18,7 @@
 use sandy_fabric::{
     capauth::{Cap, CapAuthority, CapRights},
     channel_backend::ChannelBackend,
-    escalation::{EscalationMessage, EscalationSink},
+    escalation::{EscalationMessage, EscalationSink, EscalationSinkError},
     roles::{AssignmentCodecError, ChannelAssignment, encode_assignment},
     telemetry::{TelemetryError, TelemetryRecord, TelemetrySink},
 };
@@ -102,7 +102,7 @@ impl<B: ChannelBackend, A: CapAuthority> OrchestratorRole<B, A> {
 impl<B: ChannelBackend, A: CapAuthority> TelemetrySink for OrchestratorRole<B, A> {
     /// Always available once constructed: the orchestrator channel has no
     /// separate on/off switch of its own. The actual "telemetry off by default"
-    /// gate lives one layer up, in [`LocalFirst`](sandy_fabric_local::telemetry::LocalFirst)'s
+    /// gate lives one layer up, in [`LocalFirst`](crate::telemetry::LocalFirst)'s
     /// own `enabled()`, which never even calls this before posting.
     fn enabled(&self) -> bool {
         true
@@ -224,16 +224,26 @@ impl<B: ChannelBackend, A: CapAuthority, S: EscalationSink> EscalationRole<B, A,
     /// the sink notify succeeded.
     pub async fn escalate(&self, message: &EscalationMessage) -> Result<(), RoleError> {
         let payload = serde_json::to_vec(message).map_err(|e| RoleError::Codec(e.to_string()))?;
-        let channel_result = self
-            .channel
-            .post(
-                &self.membership,
-                Some(MessageType::Escalate(Escalate {})),
-                CONTENT_TYPE_JSON,
-                payload,
-            )
-            .await;
-        let sink_result = self.sink.notify(message).await;
+        let post = self.channel.post(
+            &self.membership,
+            Some(MessageType::Escalate(Escalate {})),
+            CONTENT_TYPE_JSON,
+            payload,
+        );
+        let notify = async {
+            if self.sink.enabled() {
+                self.sink.notify(message).await
+            } else {
+                Err(EscalationSinkError::Sink("sink disabled".to_owned()))
+            }
+        };
+        // Concurrent, not sequential: `ChannelBackend::append` carries no timeout
+        // contract, and a real transport (vsock/P2P) is far more likely to hang
+        // on an unreachable orchestrator than to error cleanly — exactly the
+        // scenario this redundant path exists for. Awaiting the post to
+        // completion before even starting the sink would let a hung channel
+        // block the sink forever, defeating the whole guarantee.
+        let (channel_result, sink_result) = tokio::join!(post, notify);
         match (channel_result, sink_result) {
             (Ok(_), Ok(())) => Ok(()),
             (Err(c), Ok(())) => {
@@ -468,8 +478,9 @@ mod tests {
     // ---- EscalationRole ----
 
     /// A fake human-facing backend: records every message it's notified of.
-    /// `sandy-fabric`'s own equivalent (`contract::fakes::FakeHumanBackend`) is
-    /// `#[cfg(test)]`-private to that crate, so this is its own small copy.
+    /// `sandy-fabric` also exposes `contract::fakes::FakeHumanBackend` when
+    /// the `contract-tests` feature is enabled. This local fake provides the
+    /// `Default` and `received()` helpers used by these tests.
     #[derive(Default)]
     struct FakeHumanBackend {
         received: Mutex<Vec<EscalationMessage>>,
@@ -519,6 +530,30 @@ mod tests {
         }
     }
 
+    /// `append` never resolves: stands in for the realistic failure mode of an
+    /// unreachable orchestrator over a real transport (vsock/P2P), which has no
+    /// timeout contract and hangs far more often than it cleanly errors —
+    /// `BrokenBackend` above (fast failure) does not exercise this path at all.
+    #[derive(Default, Clone)]
+    struct HangingBackend;
+
+    impl sandy_fabric::channel_backend::ChannelBackend for HangingBackend {
+        async fn append(&self, _env: Envelope) -> Result<(), ChannelBackendError> {
+            std::future::pending().await
+        }
+
+        async fn fetch(&self, _from_seq: u64) -> Result<Vec<Envelope>, ChannelBackendError> {
+            Ok(Vec::new())
+        }
+
+        fn stream_from(
+            &self,
+            _from_seq: u64,
+        ) -> impl Stream<Item = Result<Envelope, ChannelBackendError>> + Send + 'static {
+            futures_util::stream::empty()
+        }
+    }
+
     fn message() -> EscalationMessage {
         EscalationMessage {
             from: PeerId::from("sandbox-1"),
@@ -541,6 +576,23 @@ mod tests {
             Err(sandy_fabric::escalation::EscalationSinkError::Sink(
                 "sink is down".to_owned(),
             ))
+        }
+    }
+
+    /// `enabled() == false`, `notify` never called: stands in for a sink that
+    /// was never wired up (step-1's default, per spec §9).
+    struct DisabledSink;
+
+    impl EscalationSink for DisabledSink {
+        fn enabled(&self) -> bool {
+            false
+        }
+
+        async fn notify(
+            &self,
+            _message: &EscalationMessage,
+        ) -> Result<(), sandy_fabric::escalation::EscalationSinkError> {
+            panic!("a disabled sink's notify must never be called");
         }
     }
 
@@ -580,6 +632,38 @@ mod tests {
         Ok(())
     }
 
+    /// Regression for the sequential-await bug sandy-b6 caught in review: the
+    /// channel post and the sink notify must run concurrently, not one after
+    /// the other. `BrokenBackend` above fails fast, so it never exercised this
+    /// — a hang blocks a sequential `.await` on the post forever, so the sink's
+    /// `notify` would never even be polled. Proven by racing `escalate()`
+    /// against a short timeout: `escalate()` itself never returns (the channel
+    /// leg is stuck forever), but the sink must already be notified well
+    /// within that window because its future runs independently.
+    #[tokio::test]
+    async fn the_sink_is_notified_promptly_even_when_the_channel_post_hangs_forever() -> anyhow::Result<()> {
+        let authority = TestAuthority;
+        let id = ChannelId::from("escalation");
+        let cap = mint(&authority, "sandbox-1", &id, full());
+        let channel = Channel::new(id, HangingBackend, authority)
+            .await
+            .context("Channel::new")?;
+        let membership = channel.join(&cap).context("join")?;
+        let role = EscalationRole::new(channel, membership, FakeHumanBackend::default());
+
+        let msg = message();
+        let escalate = role.escalate(&msg);
+        tokio::select! {
+            _ = escalate => anyhow::bail!("escalate() must not return while the channel post is hung forever"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+        }
+        anyhow::ensure!(
+            role.sink().received() == [message()],
+            "the sink must be notified promptly, not blocked behind the hung channel post"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn escalation_fails_only_when_both_the_channel_and_the_sink_fail() -> anyhow::Result<()> {
         let authority = TestAuthority;
@@ -595,6 +679,28 @@ mod tests {
             .escalate(&message())
             .await
             .expect_err("escalate must fail when neither path delivers");
+        anyhow::ensure!(
+            matches!(err, RoleError::BothEscalationPathsFailed { .. }),
+            "expected BothEscalationPathsFailed, got {err:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_disabled_sink_does_not_mask_a_failed_channel_post() -> anyhow::Result<()> {
+        let authority = TestAuthority;
+        let id = ChannelId::from("escalation");
+        let cap = mint(&authority, "sandbox-1", &id, full());
+        let channel = Channel::new(id, BrokenBackend, authority)
+            .await
+            .context("Channel::new")?;
+        let membership = channel.join(&cap).context("join")?;
+        let role = EscalationRole::new(channel, membership, DisabledSink);
+
+        let err = role
+            .escalate(&message())
+            .await
+            .expect_err("a disabled sink must not count as a delivered path");
         anyhow::ensure!(
             matches!(err, RoleError::BothEscalationPathsFailed { .. }),
             "expected BothEscalationPathsFailed, got {err:?}"
