@@ -208,11 +208,19 @@ fn scope_prefix(id: &str, limits: ResourceLimits) -> Vec<String> {
 
 /// The `bwrap` segment (through its trailing `--`) that confines the job in a mount
 /// namespace (#142): the host rootfs read-only (A1, so host binaries resolve), fresh
-/// `/dev` + `/proc`, the user-session bus hidden (a tmpfs over `/run/user` plus
-/// unsetting the bus env, so the job cannot reach the user systemd manager), and each
-/// share bound at its faithful `/run/sandy/<tag>` path — read-only for inputs/secrets,
-/// writable for outputs. Non-net namespaces are unshared (net stays shared; egress is
-/// a separate concern). Pure, so the exact argv is unit-testable.
+/// `/dev` + `/proc`, the user-session bus hidden (a fresh tmpfs over the whole `/run`
+/// plus unsetting the bus env, so the job cannot reach the user systemd manager), and
+/// each share bound at its faithful `/run/sandy/<tag>` path — read-only for
+/// inputs/secrets, writable for outputs. Non-net namespaces are unshared (net stays
+/// shared; egress is a separate concern). Pure, so the exact argv is unit-testable.
+///
+/// `/run` itself, not just `/run/user`, must be the tmpfs: under `--ro-bind / /` the
+/// whole host tree (including `/run`) is read-only, so bwrap cannot `mkdir` the
+/// `/run/sandy` mountpoint it needs to create — every confined job died in under a
+/// second with `Can't mkdir /run/sandy: Read-only file system` until this fix (caught
+/// by the ws01 live run). A writable `/run` gives it somewhere to mkdir into, and
+/// /run/user is then simply absent, so the bus-hide falls out for free (no separate
+/// `/run/user` tmpfs needed).
 ///
 /// NOTE: A1 `--ro-bind / /` leaves the host filesystem READABLE to the job, so this
 /// is write-confinement + reaping + bus-hide, not read-confidentiality — hence
@@ -232,10 +240,11 @@ fn bwrap_segment(mounts: &[Mount]) -> Vec<String> {
         // non-confined path). Fresh tmpfs, not the host staging.
         "--tmpfs".to_string(),
         "/tmp".to_string(),
-        // Hide the user session bus: a tmpfs over /run/user drops the socket, and
-        // unsetting the pointers removes the fallback address.
+        // A clean writable /run: gives bwrap a writable parent to mkdir /run/sandy
+        // under (the read-only rootfs otherwise blocks it), and hides the user
+        // session bus for free (/run/user no longer exists under a fresh /run).
         "--tmpfs".to_string(),
-        "/run/user".to_string(),
+        "/run".to_string(),
         "--unsetenv".to_string(),
         "XDG_RUNTIME_DIR".to_string(),
         "--unsetenv".to_string(),
@@ -485,8 +494,8 @@ mod tests {
             "host rootfs ro-bound"
         );
         assert!(
-            cmd.windows(2).any(|w| w == ["--tmpfs", "/run/user"]),
-            "user-bus dir hidden"
+            cmd.windows(2).any(|w| w == ["--tmpfs", "/run"]),
+            "a writable /run (so bwrap can mkdir /run/sandy) hides the user-bus dir for free"
         );
         assert!(
             cmd.windows(2).any(|w| w == ["--unsetenv", "DBUS_SESSION_BUS_ADDRESS"]),
@@ -552,7 +561,7 @@ mod tests {
         assert_eq!(
             segment.iter().filter(|a| *a == "--tmpfs").count(),
             3,
-            "exactly three tmpfs mounts (/tmp, /run/user, /run/sandy), got {segment:?}"
+            "exactly three tmpfs mounts (/tmp, /run, /run/sandy), got {segment:?}"
         );
         assert_eq!(
             segment.iter().filter(|a| *a == "--unsetenv").count(),

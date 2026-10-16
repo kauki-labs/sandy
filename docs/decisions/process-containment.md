@@ -139,9 +139,13 @@ same-user job); and the user-session bus was reachable (the CWE-269 escape, §1-
 (`systemd-run … -- bwrap … -- <job>`), both unprivileged and Nix-provided, so
 `forbid(unsafe_code)` holds. bwrap gives a mount namespace that: binds each share at
 its faithful `/run/sandy/<tag>` path (read-only for inputs/secrets via `--ro-bind`,
-writable outputs via `--bind`); hides the user bus (`--tmpfs /run/user` + `--unsetenv`
-of the bus vars); and exposes the host rootfs read-only (`--ro-bind / /`, the **A1**
-choice) so host binaries resolve. The feature is gated on a `confines_filesystem()`
+writable outputs via `--bind`); hides the user bus (`--tmpfs /run` + `--unsetenv` of
+the bus vars — `/run` must be the WHOLE tmpfs, not just `/run/user`: under
+`--ro-bind / /` the host tree is read-only, so bwrap cannot `mkdir` the `/run/sandy`
+mountpoint under a merely-shadowed `/run/user`; a writable `/run` fixes the mkdir and
+drops `/run/user` for free, found by the ws01 live run — every job died in under a
+second until this landed); and exposes the host rootfs read-only (`--ro-bind / /`,
+the **A1** choice) so host binaries resolve. The feature is gated on a `confines_filesystem()`
 capability, detected (bwrap present AND unprivileged user namespaces permitted) and
 SEPARATE from `isolates_untrusted`. When absent, the backend keeps the `SANDY_*_DIR`
 host-path + cooperative-RO fallback. The seam carries the shares as a `Mount{host,
