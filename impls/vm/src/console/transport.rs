@@ -22,9 +22,8 @@ use std::{
     time::Duration,
 };
 
+use sandy::BackendError;
 pub use sandy_api::console::Transport;
-
-use crate::backend::BackendError;
 
 /// The Linux/qemu pipe transport: the guest serial console on a byte channel.
 ///
@@ -246,7 +245,7 @@ mod tests {
     //!
     //! Tier-2 drives [`PipeTransport`] against a fake serial subprocess that
     //! echoes the sentinel protocol, asserting a clean capture + parsed
-    //! [`Outcome`](crate::backend::Outcome). It is `#[ignore]`d because it
+    //! [`Outcome`](sandy::Outcome). It is `#[ignore]`d because it
     //! spawns a subprocess and touches real pipe fds — out of the sandbox's
     //! tier-1 budget, run on the host (#26).
     //!

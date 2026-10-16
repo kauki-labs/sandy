@@ -20,14 +20,13 @@
 //! marker is `booted: false`, a missing END sentinel is `timed_out: true`, and
 //! a garbled `exit=` line is a [`BackendError::Protocol`] — never a defaulted
 //! `guest_exit: 0`. The emitted [`Outcome`] is the pinned `snake_case` record
-//! reused from [`crate::backend`] (INV-8), never redefined here (INV-TRAIT).
+//! reused from [`sandy`] (INV-8), never redefined here (INV-TRAIT).
 
 use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use sandy::{BackendError, Outcome};
 use uuid::Uuid;
-
-use crate::backend::{BackendError, Outcome};
 
 /// Find the first offset of `needle` within `haystack` (byte-exact, binary-safe).
 ///
@@ -112,7 +111,7 @@ pub struct TimeoutPolicy {
 
 impl TimeoutPolicy {
     /// A policy that gives both phases the same whole-second budget — the common
-    /// case, derived from a [`crate::backend::RunSpec`]'s `timeout_secs`.
+    /// case, derived from a [`sandy::RunSpec`]'s `timeout_secs`.
     #[must_use]
     pub fn from_secs(secs: u32) -> Self {
         let budget = Duration::from_secs(u64::from(secs));

@@ -18,8 +18,6 @@
 //!   [`EgressApplier`] seam ([`FakeApplier`] / host-tier [`NftablesApplier`]).
 //! - **Nix topology** — a typed [`Topology`] read from a guest flake attr via [`topology`] / [`parse_topology`]
 //!   (INV-TOPOLOGY).
-//! - **Console driver** — the sentinel [`Protocol`] (boot → inject → capture → exit) over a platform [`Transport`],
-//!   wired by [`run_console`] into the pinned snake_case [`Outcome`] (INV-8/INV-OUTCOME).
 //! - **Credentials** — the provider-agnostic [`CredentialProvider`] seam (with a [`FakeProvider`] double);
 //!   [`mint_lease`] clamps a TTL to [`MAX_TTL_SECS`] and stages a scoped credential as a `0600` [`SecretRef`] only
 //!   (INV-1).
@@ -31,7 +29,6 @@
 mod backend;
 mod collect;
 mod config;
-mod console;
 mod containment;
 mod cred;
 mod cred_github;
@@ -60,9 +57,6 @@ pub use backend::{
 };
 pub use collect::{CollectError, OutputSpec, collect};
 pub use config::CollectionConfig;
-pub use console::{
-    Markers, PipeTransport, Protocol, ProtocolStep, PtyTransport, TimeoutPolicy, Transport, parse_exit, run_console,
-};
 pub use containment::{
     Containment, ContainmentStatus, FakeContainment, NoContainment, ResourceLimits, admits_untrusted,
 };

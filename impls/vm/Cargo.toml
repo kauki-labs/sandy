@@ -24,6 +24,10 @@ sandy.workspace = true
 sandy-api.workspace = true
 tracing.workspace = true
 uuid = { workspace = true }
+# The console driver (moved from sandy, #147): the sentinel protocol's base64
+# command frame and the vfkit PTY transport's safe pty allocation.
+base64.workspace = true
+portable-pty.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true

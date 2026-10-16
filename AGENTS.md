@@ -15,7 +15,7 @@ version, metadata, dependency versions, and lints through the root `Cargo.toml`
 
 - **`sandy`** — the deep library. Private implementation modules behind a curated
   `pub use` facade: the `VmBackend` seam + `FakeBackend`, the journal, reconcile,
-  the result envelope (INV-11), console protocol, nix topology, egress, seed,
+  the result envelope (INV-11), nix topology, egress, seed,
   secret staging, and gc.
 - **`sandy-backend`** — the native `VmBackend` implementations: `QemuBackend`
   (Linux/KVM, serial on `ttyS0`) and `VfkitBackend` (macOS/Virtualization.framework,
@@ -69,7 +69,7 @@ Commit with a Conventional Commits title.
 
 ```text
 crates/
-  ├─ sandy/          - deep library behind a curated facade (seam, journal, result, console, topology, …)
+  ├─ sandy/          - deep library behind a curated facade (seam, journal, result, topology, …)
   ├─ sandy-backend/  - native VmBackend impls: QemuBackend (Linux) + VfkitBackend (macOS)
   └─ sandy-cli/      - the `sandy` binary (doctor, run/ls/status/wait/kill/gc, cred github …)
 nix/

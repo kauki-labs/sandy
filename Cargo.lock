@@ -1804,7 +1804,6 @@ name = "sandy-box"
 version = "0.1.1"
 dependencies = [
  "anyhow",
- "base64 0.23.1",
  "fs2",
  "hex",
  "insta",
@@ -1812,7 +1811,6 @@ dependencies = [
  "libc",
  "minisign-verify",
  "octocrab",
- "portable-pty",
  "rstest",
  "rustix",
  "sandy-api",
@@ -1863,6 +1861,8 @@ name = "sandy-impls-vm"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "base64 0.23.1",
+ "portable-pty",
  "sandy-api",
  "sandy-box",
  "tracing",
