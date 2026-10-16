@@ -13,10 +13,7 @@
 use std::{
     collections::HashMap,
     pin::Pin,
-    sync::{
-        Arc, Mutex, PoisonError,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex, PoisonError},
     task::{Context, Poll},
 };
 
@@ -28,6 +25,7 @@ use sandy_fabric::{
 };
 use sandy_proto::MessageType;
 use sha2::{Digest, Sha256};
+use tokio::sync::Mutex as AsyncMutex;
 
 /// A [`Channel`] failure: membership, capability, or the backing [`ChannelBackend`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -70,11 +68,20 @@ impl std::fmt::Debug for MembershipId {
     }
 }
 
+/// Hex-encoded SHA-256 over the concatenation of `parts`, as distinct byte
+/// strings (the caller is responsible for framing each part unambiguously if
+/// the boundary between them matters — see `content_id`).
+fn hash_hex(parts: &[&[u8]]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part);
+    }
+    hex::encode(hasher.finalize())
+}
+
 /// The membership id for `cap`: a digest of its proof, not the proof itself.
 fn membership_id(cap: &Cap) -> MembershipId {
-    let mut hasher = Sha256::new();
-    hasher.update(&cap.proof);
-    MembershipId(hex::encode(hasher.finalize()))
+    MembershipId(hash_hex(&[&cap.proof]))
 }
 
 /// Bounded membership + delivery over a [`ChannelBackend`] (spec §3.3). Every
@@ -88,7 +95,17 @@ pub struct Channel<B, A> {
     authority: A,
     members: Mutex<HashMap<MembershipId, Cap>>,
     cursors: Arc<Mutex<HashMap<MembershipId, u64>>>,
-    next_seq: AtomicU64,
+    // An async mutex, not an AtomicU64: sequence assignment and the backend
+    // append it labels must land as one atomic unit (held across the .await),
+    // or two concurrent posts can make their appends visible out of sequence
+    // order. A live follower's cursor only ever advances to "next available
+    // sequence >= cursor" (see ChannelBackend::stream_from); if post N+1's
+    // append completes before post N's, a follower parked at or before N jumps
+    // straight to N+1 and N is never delivered live again, even though it's
+    // correctly stored (a later fetch/resubscribe-from-0 would still see it).
+    // Holding this across the append makes that ordering impossible: N+1
+    // cannot even be assigned until N's append has returned.
+    next_seq: AsyncMutex<u64>,
 }
 
 impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
@@ -100,22 +117,30 @@ impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
             authority,
             members: Mutex::new(HashMap::new()),
             cursors: Arc::new(Mutex::new(HashMap::new())),
-            next_seq: AtomicU64::new(0),
+            next_seq: AsyncMutex::new(0),
         }
     }
 
-    /// Checked once at the start of `post`/`subscribe`, not held across the call:
-    /// a `leave()` racing a just-started `post()` can still land it. Enforcing
-    /// revocation against an in-flight action is the open question spec §8 defers
-    /// ("capability revocation before TTL, and where that governance lives"), not
-    /// step-1 scope.
-    fn rights_of(&self, membership: &MembershipId) -> Result<CapRights, ChannelError> {
+    /// The stored cap for `membership`, cloned out from under the lock (so the
+    /// caller never holds `members`' mutex across anything slower than a clone
+    /// — see `invite`'s use of this). Checked fresh on every call, not cached:
+    /// still, nothing here re-verifies the cap against the authority after
+    /// `join`, so a `leave()` racing a just-started `post()`/`subscribe()` can
+    /// still land it, and an expired-since-join cap keeps its rights until an
+    /// explicit `leave()`. Enforcing revocation/TTL against an admitted member
+    /// is the open question spec §8 defers ("capability revocation before TTL,
+    /// and where that governance lives"), not step-1 scope.
+    fn member(&self, membership: &MembershipId) -> Result<Cap, ChannelError> {
         self.members
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(membership)
-            .map(|cap| cap.scope.rights)
+            .cloned()
             .ok_or(ChannelError::NotAMember)
+    }
+
+    fn rights_of(&self, membership: &MembershipId) -> Result<CapRights, ChannelError> {
+        Ok(self.member(membership)?.scope.rights)
     }
 
     /// Verify `cap` against this channel and admit it as a new membership.
@@ -151,12 +176,14 @@ impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
     /// itself admit anyone — the Channel is not a minting authority (INV-1); the
     /// returned cap travels out of band and its holder still calls `join`.
     pub fn invite(&self, inviter: &MembershipId, rights: CapRights) -> Result<Cap, ChannelError> {
-        let members = self.members.lock().unwrap_or_else(PoisonError::into_inner);
-        let parent = members.get(inviter).ok_or(ChannelError::NotAMember)?;
+        // `member()` already releases the lock before returning: `attenuate` is
+        // a signing operation, and a real backend's latency shouldn't serialize
+        // every other join/leave/post/subscribe behind this one mutex.
+        let parent = self.member(inviter)?;
         if !parent.scope.rights.invite {
             return Err(ChannelError::InsufficientRights("invite"));
         }
-        Ok(self.authority.attenuate(parent, rights)?)
+        Ok(self.authority.attenuate(&parent, rights)?)
     }
 
     /// Post `payload` as `membership`, which must hold `post` rights. Returns the
@@ -176,7 +203,10 @@ impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
         }
         let content_type = content_type.into();
         let id = content_id(&message_type, &content_type, &payload);
-        let sequence = self.next_seq.fetch_add(1, Ordering::SeqCst);
+        // Held across the append: see the field comment on `next_seq` for why
+        // assign-then-append must be one atomic unit, not two separate steps.
+        let mut next_seq = self.next_seq.lock().await;
+        let sequence = *next_seq;
         let env = Envelope {
             sequence,
             message_type,
@@ -185,6 +215,7 @@ impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
             metadata: HashMap::from([(MSG_ID_KEY.to_owned(), id.clone())]),
         };
         self.backend.append(env).await?;
+        *next_seq += 1;
         Ok(id)
     }
 
@@ -193,6 +224,12 @@ impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
     /// stream and subscribing again later — the "member goes offline, comes back"
     /// case — delivers what was missed, not just the live tail. The cursor
     /// advances as the stream is read.
+    ///
+    /// Two concurrent `subscribe()` calls on the same membership each read the
+    /// cursor independently and race on writing it back as they're polled; the
+    /// result is unspecified interleaving, not corruption. Not a step-1 concern:
+    /// one membership subscribing twice at once isn't the expected shape (a
+    /// membership is one agent's one session).
     pub fn subscribe(
         &self,
         membership: &MembershipId,
@@ -265,11 +302,13 @@ fn content_id(message_type: &Option<MessageType>, content_type: &str, payload: &
         Some(MessageType::Escalate(_)) => 5,
         Some(MessageType::PeerMsg(_)) => 6,
     };
-    let mut hasher = Sha256::new();
-    hasher.update([tag]);
-    hasher.update(content_type.as_bytes());
-    hasher.update(payload);
-    hex::encode(hasher.finalize())
+    // Length-prefix content_type: without it, ("ab","c") and ("a","bc") hash
+    // identically, so a genuinely different message would silently dedup away
+    // as a "duplicate" of an unrelated one. The length makes the boundary
+    // between content_type and payload unambiguous; nothing after payload
+    // needs its own prefix since it's always the last field.
+    let len_prefix = (content_type.len() as u64).to_be_bytes();
+    hash_hex(&[&[tag], &len_prefix, content_type.as_bytes(), payload])
 }
 
 #[cfg(test)]
@@ -279,6 +318,7 @@ mod tests {
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
+    use anyhow::Context;
     use futures_util::StreamExt;
     use sandy_fabric::{capauth::CapScope, types::PeerId};
 
@@ -382,18 +422,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn posting_then_subscribing_delivers_in_order() {
+    async fn posting_then_subscribing_delivers_in_order() -> anyhow::Result<()> {
         let (channel, _backend, id, authority) = new_channel();
-        let member = channel
-            .join(&mint(&authority, "p1", &id, full(), Some(later())))
-            .unwrap();
+        let member = channel.join(&mint(&authority, "p1", &id, full(), Some(later())))?;
 
-        channel.post(&member, None, "text/plain", b"a".to_vec()).await.unwrap();
-        channel.post(&member, None, "text/plain", b"b".to_vec()).await.unwrap();
+        channel
+            .post(&member, None, "text/plain", b"a".to_vec())
+            .await
+            .context("post a")?;
+        channel
+            .post(&member, None, "text/plain", b"b".to_vec())
+            .await
+            .context("post b")?;
 
-        let mut stream = Box::pin(channel.subscribe(&member).unwrap());
+        let mut stream = Box::pin(channel.subscribe(&member)?);
         assert_eq!(next(&mut stream).await.payload, b"a");
         assert_eq!(next(&mut stream).await.payload, b"b");
+        Ok(())
     }
 
     #[tokio::test]
@@ -430,11 +475,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn leaving_removes_membership_and_blocks_further_action() {
+    async fn leaving_removes_membership_and_blocks_further_action() -> anyhow::Result<()> {
         let (channel, _backend, id, authority) = new_channel();
-        let member = channel
-            .join(&mint(&authority, "p1", &id, full(), Some(later())))
-            .unwrap();
+        let member = channel.join(&mint(&authority, "p1", &id, full(), Some(later())))?;
 
         channel.leave(&member);
 
@@ -443,48 +486,55 @@ mod tests {
             Err(ChannelError::NotAMember)
         );
         assert_eq!(channel.subscribe(&member).err(), Some(ChannelError::NotAMember));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn a_duplicate_post_is_deduplicated_to_one_stored_entry() {
+    async fn a_duplicate_post_is_deduplicated_to_one_stored_entry() -> anyhow::Result<()> {
         let (channel, backend, id, authority) = new_channel();
-        let member = channel
-            .join(&mint(&authority, "p1", &id, full(), Some(later())))
-            .unwrap();
+        let member = channel.join(&mint(&authority, "p1", &id, full(), Some(later())))?;
 
         let first = channel
             .post(&member, None, "text/plain", b"same".to_vec())
             .await
-            .unwrap();
+            .context("post first")?;
         let second = channel
             .post(&member, None, "text/plain", b"same".to_vec())
             .await
-            .unwrap();
+            .context("post second")?;
 
         assert_eq!(first, second, "identical content addresses to the same id");
-        let stored = backend.fetch(0).await.unwrap();
+        let stored = backend.fetch(0).await.context("fetch")?;
         assert_eq!(stored.len(), 1, "a re-post of the same content is a no-op in the store");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn a_member_offline_then_resubscribing_gets_what_it_missed() {
+    async fn a_member_offline_then_resubscribing_gets_what_it_missed() -> anyhow::Result<()> {
         let (channel, _backend, id, authority) = new_channel();
-        let member = channel
-            .join(&mint(&authority, "p1", &id, full(), Some(later())))
-            .unwrap();
+        let member = channel.join(&mint(&authority, "p1", &id, full(), Some(later())))?;
 
-        channel.post(&member, None, "text/plain", b"a".to_vec()).await.unwrap();
+        channel
+            .post(&member, None, "text/plain", b"a".to_vec())
+            .await
+            .context("post a")?;
         {
-            let mut stream = Box::pin(channel.subscribe(&member).unwrap());
+            let mut stream = Box::pin(channel.subscribe(&member)?);
             assert_eq!(next(&mut stream).await.payload, b"a");
             // Dropped here: the member goes offline mid-stream, cursor already
             // advanced past "a".
         }
 
-        channel.post(&member, None, "text/plain", b"b".to_vec()).await.unwrap();
-        channel.post(&member, None, "text/plain", b"c".to_vec()).await.unwrap();
+        channel
+            .post(&member, None, "text/plain", b"b".to_vec())
+            .await
+            .context("post b")?;
+        channel
+            .post(&member, None, "text/plain", b"c".to_vec())
+            .await
+            .context("post c")?;
 
-        let mut resumed = Box::pin(channel.subscribe(&member).unwrap());
+        let mut resumed = Box::pin(channel.subscribe(&member)?);
         assert_eq!(
             next(&mut resumed).await.payload,
             b"b",
@@ -495,23 +545,22 @@ mod tests {
             b"c",
             "and delivers everything missed while offline"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn invite_grows_membership_as_a_distinct_representative_of_the_same_peer() {
+    async fn invite_grows_membership_as_a_distinct_representative_of_the_same_peer() -> anyhow::Result<()> {
         let (channel, _backend, id, authority) = new_channel();
-        let parent = channel
-            .join(&mint(&authority, "p1", &id, full(), Some(later())))
-            .unwrap();
+        let parent = channel.join(&mint(&authority, "p1", &id, full(), Some(later())))?;
 
-        let child_cap = channel.invite(&parent, read_only()).unwrap();
+        let child_cap = channel.invite(&parent, read_only())?;
         assert_eq!(
             child_cap.scope.peer,
             PeerId::from("p1"),
             "the representative shares the inviter's principal, per spec §3.8"
         );
 
-        let child = channel.join(&child_cap).unwrap();
+        let child = channel.join(&child_cap)?;
         assert_ne!(
             child, parent,
             "a distinct cap is a distinct membership even for the same peer"
@@ -528,36 +577,71 @@ mod tests {
         // they are distinct entries, not aliases of one peer-keyed slot.
         channel.leave(&parent);
         assert!(channel.subscribe(&child).is_ok());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn subscribing_without_the_read_right_is_rejected() {
+    async fn subscribing_without_the_read_right_is_rejected() -> anyhow::Result<()> {
         let post_only = CapRights {
             post: true,
             ..CapRights::default()
         };
         let (channel, _backend, id, authority) = new_channel();
-        let member = channel
-            .join(&mint(&authority, "p1", &id, post_only, Some(later())))
-            .unwrap();
+        let member = channel.join(&mint(&authority, "p1", &id, post_only, Some(later())))?;
 
         assert_eq!(
             channel.subscribe(&member).err(),
             Some(ChannelError::InsufficientRights("read"))
         );
+        Ok(())
+    }
+
+    /// A correctness-property test, not a reliable mutation-catching regression
+    /// test: it did NOT reproduce the pre-fix bug when checked against a
+    /// deliberately non-atomic `post()` (assign and append as two separate lock
+    /// acquisitions) — `tokio::join!` on the default test runtime doesn't force
+    /// genuine interleaving when `InMem::append` never actually yields. The fix
+    /// (holding one lock across assign-then-append) is justified by construction
+    /// — see the `next_seq` field comment — not by this test failing red first.
+    /// Kept as a positive assertion of the invariant for whoever changes this
+    /// later.
+    #[tokio::test]
+    async fn concurrent_posts_are_never_lost_to_a_live_subscriber() -> anyhow::Result<()> {
+        let (channel, _backend, id, authority) = new_channel();
+        let member = channel.join(&mint(&authority, "p1", &id, full(), Some(later())))?;
+        // Subscribed before either post, so this stream is exactly the "live
+        // follower" case the sequence-then-append race could starve: if one
+        // post's append became visible out of order, this stream would skip
+        // straight past the lower sequence and never deliver it.
+        let mut stream = Box::pin(channel.subscribe(&member)?);
+
+        let (a, b) = tokio::join!(
+            channel.post(&member, None, "text/plain", b"a".to_vec()),
+            channel.post(&member, None, "text/plain", b"b".to_vec()),
+        );
+        a.context("post a")?;
+        b.context("post b")?;
+
+        let mut got = vec![next(&mut stream).await.payload, next(&mut stream).await.payload];
+        got.sort();
+        assert_eq!(
+            got,
+            [b"a".to_vec(), b"b".to_vec()],
+            "both concurrent posts arrive, none lost"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn invite_requires_the_invite_right() {
+    async fn invite_requires_the_invite_right() -> anyhow::Result<()> {
         let (channel, _backend, id, authority) = new_channel();
-        let member = channel
-            .join(&mint(&authority, "p1", &id, read_only(), Some(later())))
-            .unwrap();
+        let member = channel.join(&mint(&authority, "p1", &id, read_only(), Some(later())))?;
 
         assert_eq!(
             channel.invite(&member, read_only()),
             Err(ChannelError::InsufficientRights("invite"))
         );
+        Ok(())
     }
 
     #[test]
@@ -576,5 +660,15 @@ mod tests {
         assert_ne!(a, different_payload);
         assert_ne!(a, different_content_type);
         assert_ne!(a, different_message_type);
+    }
+
+    /// Regression for a real collision: before length-prefixing content_type,
+    /// `("ab","c")` and `("a","bc")` hashed identically, so the second post
+    /// would have silently deduped away as a "duplicate" of the first.
+    #[test]
+    fn content_id_does_not_collide_across_the_content_type_payload_boundary() {
+        let a = content_id(&None, "ab", b"c");
+        let b = content_id(&None, "a", b"bc");
+        assert_ne!(a, b, "distinct (content_type, payload) splits must not collide");
     }
 }
