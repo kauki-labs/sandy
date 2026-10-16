@@ -5,4 +5,8 @@
 //! `sandy_fabric`'s shared contract-test harness. No impl here depends on a VM,
 //! a network, or another impl's module.
 
+mod capauth;
+
 pub mod inmem;
+
+pub use capauth::LocalCapAuthority;
