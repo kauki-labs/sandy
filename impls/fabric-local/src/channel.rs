@@ -109,16 +109,37 @@ pub struct Channel<B, A> {
 }
 
 impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
-    /// A fresh channel `id`, backed by `backend`, with no members.
-    pub fn new(id: ChannelId, backend: B, authority: A) -> Self {
-        Self {
+    /// A channel `id` backed by `backend`, with no members. Resumes sequence
+    /// assignment after `backend`'s highest stored entry rather than assuming
+    /// `backend` is empty: a fresh `InMem::default()` has nothing to find and
+    /// starts at 0 as before, but a reattached or otherwise pre-populated
+    /// backend (e.g. two `Channel`s constructed around one cloned handle) would
+    /// otherwise restart at 0 and collide with what's already stored — `InMem`
+    /// rejects that outright (#107's `sequence_collision_between_distinct_ids_is_rejected`),
+    /// so the very first post would fail. This does not make concurrent
+    /// multi-`Channel` writers against one backend safe in general — that's the
+    /// multi-writer ordering already deferred by the single-writer MVP decision
+    /// — it only fixes the construction-time starting point.
+    ///
+    /// # Errors
+    /// Whatever `backend.fetch` returns, propagated: the initial read this
+    /// needs to find the current high-water mark can fail like any other call.
+    pub async fn new(id: ChannelId, backend: B, authority: A) -> Result<Self, ChannelBackendError> {
+        let next = backend
+            .fetch(0)
+            .await?
+            .iter()
+            .map(|env| env.sequence + 1)
+            .max()
+            .unwrap_or(0);
+        Ok(Self {
             id,
             backend,
             authority,
             members: Mutex::new(HashMap::new()),
             cursors: Arc::new(Mutex::new(HashMap::new())),
-            next_seq: AsyncMutex::new(0),
-        }
+            next_seq: AsyncMutex::new(next),
+        })
     }
 
     /// The stored cap for `membership`, cloned out from under the lock (so the
@@ -435,15 +456,17 @@ mod tests {
             .expect("mint")
     }
 
-    fn new_channel() -> (Channel<InMem, TestAuthority>, InMem, ChannelId, TestAuthority) {
+    async fn new_channel() -> anyhow::Result<(Channel<InMem, TestAuthority>, InMem, ChannelId, TestAuthority)> {
         let id = ChannelId::from("c1");
         let backend = InMem::default();
         let authority = TestAuthority::default();
         // Clone, not a second `default()`: the returned `authority` must be the
         // SAME instance Channel holds (shared `revoked` set), so a test can call
         // `authority.revoke(&cap)` and have Channel's own `member()` see it.
-        let channel = Channel::new(id.clone(), backend.clone(), authority.clone());
-        (channel, backend, id, authority)
+        let channel = Channel::new(id.clone(), backend.clone(), authority.clone())
+            .await
+            .context("Channel::new")?;
+        Ok((channel, backend, id, authority))
     }
 
     async fn next(stream: &mut (impl Stream<Item = Result<Envelope, ChannelBackendError>> + Unpin)) -> Envelope {
@@ -456,7 +479,7 @@ mod tests {
 
     #[tokio::test]
     async fn posting_then_subscribing_delivers_in_order() -> anyhow::Result<()> {
-        let (channel, _backend, id, authority) = new_channel();
+        let (channel, _backend, id, authority) = new_channel().await?;
         let member = channel.join(&mint(&authority, "p1", &id, full(), Some(later())))?;
 
         channel
@@ -475,8 +498,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_non_member_cannot_post_or_subscribe() {
-        let (channel, _backend, _id, _authority) = new_channel();
+    async fn a_non_member_cannot_post_or_subscribe() -> anyhow::Result<()> {
+        let (channel, _backend, _id, _authority) = new_channel().await?;
         let ghost = MembershipId("never-joined".to_owned());
 
         assert_eq!(
@@ -484,32 +507,65 @@ mod tests {
             Err(ChannelError::NotAMember)
         );
         assert_eq!(channel.subscribe(&ghost).err(), Some(ChannelError::NotAMember));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn joining_with_a_cap_scoped_to_another_channel_is_rejected() {
-        let (channel, _backend, _id, authority) = new_channel();
+    async fn joining_with_a_cap_scoped_to_another_channel_is_rejected() -> anyhow::Result<()> {
+        let (channel, _backend, _id, authority) = new_channel().await?;
         let other = ChannelId::from("c2");
 
         assert_eq!(
             channel.join(&mint(&authority, "p1", &other, full(), Some(later()))),
             Err(ChannelError::WrongChannel)
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn joining_with_an_expired_cap_is_rejected() {
-        let (channel, _backend, id, authority) = new_channel();
+    async fn joining_with_an_expired_cap_is_rejected() -> anyhow::Result<()> {
+        let (channel, _backend, id, authority) = new_channel().await?;
 
         assert_eq!(
             channel.join(&mint(&authority, "p1", &id, full(), Some(1))),
             Err(ChannelError::Cap(CapError::Expired))
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn new_resumes_sequence_assignment_after_a_pre_populated_backend() -> anyhow::Result<()> {
+        let id = ChannelId::from("c1");
+        let authority = TestAuthority::default();
+        let backend = InMem::default();
+
+        // First Channel posts one entry, then is dropped — its handle on
+        // `backend` is the only thing that outlives it (InMem is a cheap clone
+        // over shared state).
+        let first = Channel::new(id.clone(), backend.clone(), authority.clone()).await?;
+        let m1 = first.join(&mint(&authority, "p1", &id, full(), Some(later())))?;
+        first
+            .post(&m1, None, "text/plain", b"a".to_vec())
+            .await
+            .context("post from first")?;
+
+        // A second Channel constructed around the SAME, now non-empty backend
+        // must not restart sequence assignment at 0 and collide with "a".
+        let second = Channel::new(id.clone(), backend.clone(), authority.clone()).await?;
+        let m2 = second.join(&mint(&authority, "p1", &id, full(), Some(later())))?;
+        second
+            .post(&m2, None, "text/plain", b"b".to_vec())
+            .await
+            .context("post from second, into a pre-populated backend")?;
+
+        let stored = backend.fetch(0).await.context("fetch")?;
+        assert_eq!(stored.len(), 2, "both entries survive, no sequence collision");
+        Ok(())
     }
 
     #[tokio::test]
     async fn a_post_after_revocation_is_rejected() -> anyhow::Result<()> {
-        let (channel, _backend, id, authority) = new_channel();
+        let (channel, _backend, id, authority) = new_channel().await?;
         let cap = mint(&authority, "p1", &id, full(), Some(later()));
         let member = channel.join(&cap)?;
         // Still admitted at this point — revocation hasn't happened yet.
@@ -535,7 +591,7 @@ mod tests {
 
     #[tokio::test]
     async fn leaving_removes_membership_and_blocks_further_action() -> anyhow::Result<()> {
-        let (channel, _backend, id, authority) = new_channel();
+        let (channel, _backend, id, authority) = new_channel().await?;
         let member = channel.join(&mint(&authority, "p1", &id, full(), Some(later())))?;
 
         channel.leave(&member);
@@ -550,7 +606,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_duplicate_post_is_deduplicated_to_one_stored_entry() -> anyhow::Result<()> {
-        let (channel, backend, id, authority) = new_channel();
+        let (channel, backend, id, authority) = new_channel().await?;
         let member = channel.join(&mint(&authority, "p1", &id, full(), Some(later())))?;
 
         let first = channel
@@ -570,7 +626,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_member_offline_then_resubscribing_gets_what_it_missed() -> anyhow::Result<()> {
-        let (channel, _backend, id, authority) = new_channel();
+        let (channel, _backend, id, authority) = new_channel().await?;
         let member = channel.join(&mint(&authority, "p1", &id, full(), Some(later())))?;
 
         channel
@@ -609,7 +665,7 @@ mod tests {
 
     #[tokio::test]
     async fn invite_grows_membership_as_a_distinct_representative_of_the_same_peer() -> anyhow::Result<()> {
-        let (channel, _backend, id, authority) = new_channel();
+        let (channel, _backend, id, authority) = new_channel().await?;
         let parent = channel.join(&mint(&authority, "p1", &id, full(), Some(later())))?;
 
         let child_cap = channel.invite(&parent, read_only())?;
@@ -645,7 +701,7 @@ mod tests {
             post: true,
             ..CapRights::default()
         };
-        let (channel, _backend, id, authority) = new_channel();
+        let (channel, _backend, id, authority) = new_channel().await?;
         let member = channel.join(&mint(&authority, "p1", &id, post_only, Some(later())))?;
 
         assert_eq!(
@@ -666,7 +722,7 @@ mod tests {
     /// later.
     #[tokio::test]
     async fn concurrent_posts_are_never_lost_to_a_live_subscriber() -> anyhow::Result<()> {
-        let (channel, _backend, id, authority) = new_channel();
+        let (channel, _backend, id, authority) = new_channel().await?;
         let member = channel.join(&mint(&authority, "p1", &id, full(), Some(later())))?;
         // Subscribed before either post, so this stream is exactly the "live
         // follower" case the sequence-then-append race could starve: if one
@@ -693,7 +749,7 @@ mod tests {
 
     #[tokio::test]
     async fn invite_requires_the_invite_right() -> anyhow::Result<()> {
-        let (channel, _backend, id, authority) = new_channel();
+        let (channel, _backend, id, authority) = new_channel().await?;
         let member = channel.join(&mint(&authority, "p1", &id, read_only(), Some(later())))?;
 
         assert_eq!(
