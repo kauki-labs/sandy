@@ -12,6 +12,19 @@ use crate::{
     types::HostId,
 };
 
+/// Assert `res` failed on the rule containing `fragment`, not on some other rule.
+#[track_caller]
+fn assert_violates(res: Result<(), super::ContractViolation>, fragment: &str) {
+    match res {
+        Err(v) => assert!(
+            v.rule.contains(fragment),
+            "violated `{}`, expected `{fragment}`",
+            v.rule
+        ),
+        Ok(()) => panic!("the suite passed a broken impl; expected `{fragment}`"),
+    }
+}
+
 const PROCESS: Capabilities = Capabilities {
     kind: SandboxKind::Process,
     arch: Arch::X86_64,
@@ -25,7 +38,10 @@ fn capauth_reference_passes() -> anyhow::Result<()> {
 
 #[test]
 fn capauth_suite_rejects_an_authority_that_does_not_attenuate() {
-    assert!(capauth_suite(|| NonAttenuatingAuthority(FakeAuthority::new())).is_err());
+    assert_violates(
+        capauth_suite(|| NonAttenuatingAuthority(FakeAuthority::new())),
+        "exactly the narrowed rights",
+    );
 }
 
 #[test]
@@ -35,7 +51,7 @@ fn minter_reference_passes() -> anyhow::Result<()> {
 
 #[test]
 fn minter_suite_rejects_a_constant_secret() {
-    assert!(minter_suite(|| ConstantMinter).is_err());
+    assert_violates(minter_suite(|| ConstantMinter), "two mints for one job differ");
 }
 
 #[tokio::test]
@@ -47,7 +63,10 @@ async fn channel_backend_reference_passes() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn channel_backend_suite_rejects_a_snapshot_stream() {
-    assert!(channel_backend_suite(SnapshotBackend::default).await.is_err());
+    assert_violates(
+        channel_backend_suite(SnapshotBackend::default).await,
+        "follows an append",
+    );
 }
 
 #[tokio::test]
@@ -59,7 +78,10 @@ async fn transport_reference_passes() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn transport_suite_rejects_dropping_frames_for_offline_peers() {
-    assert!(transport_suite(LiveOnlyTransport::default).await.is_err());
+    assert_violates(
+        transport_suite(LiveOnlyTransport::default).await,
+        "stored and delivered",
+    );
 }
 
 #[tokio::test]
@@ -80,7 +102,10 @@ async fn executor_suite_rejects_a_false_capability_claim() {
         },
         collapse_failures: false,
     };
-    assert!(executor_suite(PROCESS, make).await.is_err());
+    assert_violates(
+        executor_suite(PROCESS, make).await,
+        "reports what the executor provides",
+    );
 }
 
 #[tokio::test]
@@ -89,7 +114,7 @@ async fn executor_suite_rejects_a_task_failure_reported_as_an_infra_fault() {
         caps: PROCESS,
         collapse_failures: true,
     };
-    assert!(executor_suite(PROCESS, make).await.is_err());
+    assert_violates(executor_suite(PROCESS, make).await, "task failure, not an infra fault");
 }
 
 #[tokio::test]
@@ -105,7 +130,7 @@ async fn discovery_suite_rejects_ignoring_requirements() {
         ignore_requirements: true,
         ..FakeDiscovery::default()
     };
-    assert!(discovery_suite(make).await.is_err());
+    assert_violates(discovery_suite(make).await, "matches on kind");
 }
 
 #[tokio::test]
@@ -123,7 +148,7 @@ async fn capacity_suite_rejects_a_leaky_probe() {
         leaky: true,
         ..FakeCapacity::new(host.clone(), 2)
     };
-    assert!(capacity_suite(host.clone(), make).await.is_err());
+    assert_violates(capacity_suite(host.clone(), make).await, "reserves nothing");
 }
 
 #[tokio::test]
@@ -139,7 +164,7 @@ async fn lifecycle_suite_rejects_accepting_unknown_leases() {
         accept_any: true,
         ..FakeLifecycle::default()
     };
-    assert!(lifecycle_suite(make).await.is_err());
+    assert_violates(lifecycle_suite(make).await, "never issued");
 }
 
 #[tokio::test]
@@ -155,9 +180,8 @@ async fn telemetry_suite_rejects_recording_while_disabled() {
         ignore_disabled: true,
         ..FakeSink::new(false)
     };
-    assert!(
-        telemetry_suite(|| FakeSink::new(true), disabled, FakeSink::captured)
-            .await
-            .is_err()
+    assert_violates(
+        telemetry_suite(|| FakeSink::new(true), disabled, FakeSink::captured).await,
+        "a disabled sink keeps nothing",
     );
 }

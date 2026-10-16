@@ -80,3 +80,42 @@ pub trait Executor: Send + Sync {
     /// What this executor can run. Static per instance, so synchronous.
     fn capabilities(&self) -> Capabilities;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PROCESS_X86: Capabilities = Capabilities {
+        kind: SandboxKind::Process,
+        arch: Arch::X86_64,
+        attestation: None,
+    };
+
+    #[test]
+    fn a_vm_requirement_never_lands_on_a_process_executor() {
+        let vm = Requirements {
+            kind: SandboxKind::Vm,
+            arch: None,
+        };
+        assert!(!capabilities_satisfy(&PROCESS_X86, &vm));
+    }
+
+    #[test]
+    fn arch_matches_only_when_required() {
+        let any = Requirements {
+            kind: SandboxKind::Process,
+            arch: None,
+        };
+        let arm = Requirements {
+            arch: Some(Arch::Aarch64),
+            ..any
+        };
+        let x86 = Requirements {
+            arch: Some(Arch::X86_64),
+            ..any
+        };
+        assert!(capabilities_satisfy(&PROCESS_X86, &any));
+        assert!(capabilities_satisfy(&PROCESS_X86, &x86));
+        assert!(!capabilities_satisfy(&PROCESS_X86, &arm));
+    }
+}
