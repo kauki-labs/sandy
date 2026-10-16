@@ -41,6 +41,7 @@ pub struct FakeAuthority {
 }
 
 impl FakeAuthority {
+    /// A fresh, correctly-behaving authority.
     pub fn new() -> Self {
         Self::default()
     }
@@ -107,15 +108,23 @@ impl CapAuthority for NonAttenuatingAuthority {
 
 // ---- Minter ----
 
+/// Mints fresh bytes every call: `"{job}:{n}"` for an incrementing `n`.
 pub struct FakeMinter {
     counter: AtomicU64,
 }
 
 impl FakeMinter {
+    /// A fresh minter, counting from 1.
     pub fn new() -> Self {
         Self {
             counter: AtomicU64::new(1),
         }
+    }
+}
+
+impl Default for FakeMinter {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -141,6 +150,7 @@ impl Minter for ConstantMinter {
 
 // ---- ChannelBackend ----
 
+/// [`FakeBackend`]'s shared state: the stored log plus parked followers.
 #[derive(Default)]
 pub struct LogInner {
     log: Vec<Envelope>,
@@ -150,6 +160,7 @@ pub struct LogInner {
 /// An in-memory log, sorted by sequence, deduped on msg_id, waking followers on append.
 #[derive(Default, Clone)]
 pub struct FakeBackend {
+    /// The shared log, behind a lock so clones of this handle see one backend.
     pub inner: Arc<Mutex<LogInner>>,
     /// When set, dedup keys on `sequence` instead of the msg_id (broken).
     pub dedup_on_sequence: bool,
@@ -258,6 +269,7 @@ impl ChannelBackend for SnapshotBackend {
 
 // ---- Transport ----
 
+/// Store-and-forward: a frame to an offline peer waits in its queue.
 #[derive(Default)]
 pub struct FakeTransport {
     queues: Mutex<HashMap<PeerId, VecDeque<Frame>>>,
@@ -312,6 +324,7 @@ impl Transport for LiveOnlyTransport {
 
 /// Scripted by command: `true` exits 0, `sh -c "exit N"` exits N.
 pub struct FakeExecutor {
+    /// What `capabilities()` reports.
     pub caps: Capabilities,
     /// When set, a non-zero exit is misreported as a transport fault (broken).
     pub collapse_failures: bool,
@@ -352,8 +365,10 @@ impl Executor for FakeExecutor {
 
 // ---- Discovery ----
 
+/// A static registry: `register` upserts, `find` filters by capability match.
 #[derive(Default)]
 pub struct FakeDiscovery {
+    /// The registered hosts, keyed by id.
     pub hosts: Mutex<BTreeMap<HostId, HostDescriptor>>,
     /// When set, `find` ignores the requirements (broken).
     pub ignore_requirements: bool,
@@ -380,7 +395,9 @@ impl Discovery for FakeDiscovery {
 
 // ---- Capacity ----
 
+/// A direct probe over a fixed table of free slots per host.
 pub struct FakeCapacity {
+    /// Free slots per known host.
     pub slots: Mutex<HashMap<HostId, u32>>,
     /// When set, a probe reserves a slot (broken).
     pub reserving: bool,
@@ -389,6 +406,7 @@ pub struct FakeCapacity {
 }
 
 impl FakeCapacity {
+    /// A capacity table reporting `slots` free for `host`, no others known.
     pub fn new(host: HostId, slots: u32) -> Self {
         Self {
             slots: Mutex::new(HashMap::from([(host, slots)])),
@@ -417,9 +435,13 @@ impl Capacity for FakeCapacity {
 
 // ---- Lifecycle ----
 
+/// Lease soft-state: registration mints an id, heartbeat/deregister accept
+/// only the exact lease issued and still held.
 #[derive(Default)]
 pub struct FakeLifecycle {
+    /// Live leases by id.
     pub leases: Mutex<BTreeMap<u64, HostId>>,
+    /// The next lease id to issue.
     pub next: AtomicU64,
     /// When set, heartbeat accepts any lease (broken).
     pub accept_any: bool,
@@ -468,16 +490,20 @@ impl Lifecycle for FakeLifecycle {
 
 // ---- TelemetrySink ----
 
+/// Keeps every record while enabled, drops them while disabled.
 pub struct FakeSink {
+    /// What `enabled()` reports.
     pub enabled: bool,
     /// When set, records are kept even while disabled (broken).
     pub ignore_disabled: bool,
     /// When set, records are dropped even while enabled (broken).
     pub lossy: bool,
+    /// Every record kept so far.
     pub records: Mutex<Vec<TelemetryRecord>>,
 }
 
 impl FakeSink {
+    /// A fresh sink, `enabled` or not.
     pub fn new(enabled: bool) -> Self {
         Self {
             enabled,
@@ -487,6 +513,7 @@ impl FakeSink {
         }
     }
 
+    /// How many records are kept.
     pub fn captured(&self) -> usize {
         self.records
             .lock()
