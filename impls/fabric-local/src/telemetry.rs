@@ -26,8 +26,8 @@ use sandy_fabric::telemetry::{TelemetryError, TelemetryRecord, TelemetrySink};
 /// so the file's own entry is durable too.
 /// The write is a short blocking call; telemetry is low-volume, and the sink stays
 /// runtime-agnostic. Emits are serialized, within one `LocalLog` and, through an
-/// exclusive `flock`, across every writer of the same file. The log is not rotated
-/// or capped yet.
+/// exclusive `flock`, across every writer of the same file; an emit waits for as
+/// long as another process holds that lock. The log is not rotated or capped yet.
 ///
 /// The log must be this user's regular file with no group or other access: `emit`
 /// creates it `0600`, refuses to follow a symlink at the path, and refuses an
@@ -56,7 +56,10 @@ impl LocalLog {
     pub fn open(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
         Self {
-            path: Some(std::path::absolute(&path).unwrap_or(path)),
+            path: Some(std::path::absolute(&path).unwrap_or_else(|e| {
+                tracing::warn!(path = %path.display(), error = %e, "cannot absolutize the telemetry log path; it stays relative to the current directory");
+                path
+            })),
             write: Mutex::new(()),
             dir_synced: AtomicBool::new(false),
         }
@@ -136,6 +139,7 @@ impl TelemetrySink for LocalLog {
         };
         let mut line = serde_json::to_vec(record).map_err(|e| TelemetryError::Sink(e.to_string()))?;
         line.push(b'\n');
+        // A std mutex guard: this body must stay free of `.await` while it is held.
         let _serialized = self.write.lock().unwrap_or_else(PoisonError::into_inner);
         let (mut file, created) = Self::open_for_append(path).map_err(|e| sink_err(path, &e))?;
         // Serialize with every other writer of this file, not just this LocalLog:
