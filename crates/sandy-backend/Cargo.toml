@@ -41,4 +41,5 @@ sandy-impls-vm = { workspace = true, optional = true }
 anyhow.workspace = true
 sandy-impls-local.workspace = true
 sandy-impls-vm.workspace = true
+sandy-test-support.workspace = true
 tempfile.workspace = true

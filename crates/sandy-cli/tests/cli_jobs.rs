@@ -1,4 +1,4 @@
-//! Tier-2 integration tests for the `sandy` job ops over a [`FakeBackend`] and a
+//! Tier-2 integration tests for the `sandy` job ops over a `FakeBackend` and a
 //! real [`Journal`] on a `tempfile::TempDir` `$SANDY_HOME`. No hypervisor boots:
 //! the live-boot proof is tier-3 (#26). Every command has a positive and an
 //! adversarial case.
@@ -7,14 +7,15 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
 use sandy::{
-    AllowList, BackendError, Capability, CoreError, EgressOs, EgressRule, FakeApplier, FakeBackend, FakeProvider,
-    Grants, JOURNAL_SCHEMA_VERSION, JobRecord, JobState, Journal, Logs, Outcome, Provenance, RESULT_SCHEMA_VERSION,
-    ResultEnvelope, Scope, SecretRef, SecretSource, Status, Target, to_nftables_forward,
+    AllowList, BackendError, Capability, CoreError, EgressOs, EgressRule, Grants, JOURNAL_SCHEMA_VERSION, JobRecord,
+    JobState, Journal, Logs, Outcome, Provenance, RESULT_SCHEMA_VERSION, ResultEnvelope, Scope, SecretRef,
+    SecretSource, Status, Target, to_nftables_forward,
 };
 use sandy_cli::{
     plan::JobPlan,
     supervisor::{gc, kill, ls, mint_run_token, run_job, run_job_with_credential, status, wait},
 };
+use sandy_test_support::{FakeApplier, FakeBackend, FakeProvider};
 
 /// A journal on a fresh local temp `$SANDY_HOME`.
 fn fresh_journal() -> anyhow::Result<(tempfile::TempDir, Journal)> {

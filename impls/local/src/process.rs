@@ -454,6 +454,7 @@ fn share_env_key(tag: &str) -> String {
 #[cfg(test)]
 mod tests {
     use sandy::Grants;
+    use sandy_test_support::FakeContainment;
 
     use super::*;
 
@@ -768,13 +769,13 @@ mod tests {
             "an uncontained (NoContainment) process backend must refuse an untrusted job"
         );
 
-        let reaping_only = ProcessBackend::with_containment(Box::new(sandy::FakeContainment::available()));
+        let reaping_only = ProcessBackend::with_containment(Box::new(FakeContainment::available()));
         assert!(
             !sandy::admits_untrusted(reaping_only.kind(), &reaping_only.containment_status()),
             "a reaping-only containment (no untrusted isolation) must still refuse an untrusted job"
         );
 
-        let isolating = ProcessBackend::with_containment(Box::new(sandy::FakeContainment::isolating()));
+        let isolating = ProcessBackend::with_containment(Box::new(FakeContainment::isolating()));
         assert!(
             sandy::admits_untrusted(isolating.kind(), &isolating.containment_status()),
             "an isolating containment admits an untrusted job"
@@ -786,7 +787,7 @@ mod tests {
     /// kill a setsid descendant the group-kill misses.
     #[test]
     fn a_run_reaps_its_container() -> anyhow::Result<()> {
-        let fake = Arc::new(sandy::FakeContainment::available());
+        let fake = Arc::new(FakeContainment::available());
         let backend = ProcessBackend::with_containment(Box::new(Arc::clone(&fake)));
         let grants = no_grants();
         let command = ["true".to_string()];
@@ -803,7 +804,7 @@ mod tests {
     /// timeout path, not only a clean exit.
     #[test]
     fn a_timed_out_run_reaps_its_container() -> anyhow::Result<()> {
-        let fake = Arc::new(sandy::FakeContainment::available());
+        let fake = Arc::new(FakeContainment::available());
         let backend = ProcessBackend::with_containment(Box::new(Arc::clone(&fake)));
         let grants = no_grants();
         let command = ["sh".to_string(), "-c".to_string(), "sleep 30".to_string()];
@@ -821,7 +822,7 @@ mod tests {
     /// reporting it (INV-3).
     #[test]
     fn kill_reaps_the_container_and_deregisters() -> anyhow::Result<()> {
-        let fake = Arc::new(sandy::FakeContainment::available());
+        let fake = Arc::new(FakeContainment::available());
         let backend = ProcessBackend::with_containment(Box::new(Arc::clone(&fake)));
 
         backend.kill("box-42")?;
@@ -840,7 +841,7 @@ mod tests {
     /// job still executes (proving the prefix wraps rather than replaces).
     #[test]
     fn the_wrap_prefix_is_prepended_to_the_launch() -> anyhow::Result<()> {
-        let fake = sandy::FakeContainment::available_wrapping(vec!["env".to_string()]);
+        let fake = FakeContainment::available_wrapping(vec!["env".to_string()]);
         let backend = ProcessBackend::with_containment(Box::new(fake));
         let grants = no_grants();
         let command = ["sh".to_string(), "-c".to_string(), "printf wrapped-ok".to_string()];

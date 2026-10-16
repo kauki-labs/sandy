@@ -8,7 +8,8 @@
 //! a caller never branches on the provider.
 //!
 //! The hypervisor-free seam is [`CredentialProvider`]: the clamp-and-stage flow is
-//! tier-2 testable over [`FakeProvider`] without a real forge. A mint failure is an
+//! tier-2 testable over `FakeProvider` (in `sandy-test-support`) without a real
+//! forge. A mint failure is an
 //! infra fault, [`CredError::Mint`] maps to the exit-3 retryable band
 //! (INV-7/INV-11); the caller fails retryable, never runs the job with no
 //! credential.
@@ -21,7 +22,7 @@
 //!
 //! The live GitHub/GitLab clients (App JWT → installation token; service PAT →
 //! project token) are tier-3 and walled on the operator trust root; this module
-//! ships the seam, [`FakeProvider`], the shared [`render_github_permissions`]
+//! ships the seam, the shared [`render_github_permissions`]
 //! renderer (so the trust-root installer's verify probe renders identically to the
 //! adapter's mint), and the [`TrustRoot`] config both sides share.
 
@@ -30,7 +31,6 @@ use std::{
     io::Write,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::{Mutex, PoisonError},
     time::{Duration, SystemTime},
 };
 
@@ -39,97 +39,6 @@ pub use sandy_api::cred::{
 };
 
 use crate::backend::{SecretRef, SecretSource};
-
-/// An in-memory [`CredentialProvider`] test double.
-///
-/// Built with [`FakeProvider::returning`] to hand back a scripted secret, or
-/// [`FakeProvider::failing`] to fail every mint. Records the `(scope, ttl_hint)` of
-/// each mint and the handle of each revoke, inspectable via [`FakeProvider::mints`]
-/// and [`FakeProvider::revoked`].
-pub struct FakeProvider {
-    token: String,
-    fail: bool,
-    mints: Mutex<Vec<(Scope, Duration)>>,
-    revokes: Mutex<Vec<CredentialHandle>>,
-}
-
-impl FakeProvider {
-    /// A provider whose every mint/refresh returns `token`.
-    #[must_use]
-    pub fn returning(token: &str) -> Self {
-        Self {
-            token: token.to_string(),
-            fail: false,
-            mints: Mutex::new(Vec::new()),
-            revokes: Mutex::new(Vec::new()),
-        }
-    }
-
-    /// A provider whose every mint/refresh fails with [`CredError::Mint`].
-    #[must_use]
-    pub fn failing() -> Self {
-        Self {
-            token: String::new(),
-            fail: true,
-            mints: Mutex::new(Vec::new()),
-            revokes: Mutex::new(Vec::new()),
-        }
-    }
-
-    /// The `(scope, ttl_hint)` of every [`CredentialProvider::mint`] call.
-    #[must_use]
-    pub fn mints(&self) -> Vec<(Scope, Duration)> {
-        self.mints.lock().unwrap_or_else(PoisonError::into_inner).clone()
-    }
-
-    /// The handle of every [`CredentialProvider::revoke`] call.
-    #[must_use]
-    pub fn revoked(&self) -> Vec<CredentialHandle> {
-        self.revokes.lock().unwrap_or_else(PoisonError::into_inner).clone()
-    }
-
-    fn mint_inner(&self, scope: &Scope, ttl_hint: Duration) -> Result<Minted, CredError> {
-        if self.fail {
-            return Err(CredError::Mint("fake provider configured to fail".to_string()));
-        }
-        self.mints
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push((scope.clone(), ttl_hint));
-        Ok(Minted::new(
-            self.token.clone(),
-            SystemTime::now() + ttl_hint,
-            CredentialHandle {
-                id: "fake-installation".to_string(),
-            },
-        ))
-    }
-}
-
-impl CredentialProvider for FakeProvider {
-    fn mint(&self, scope: &Scope, ttl_hint: Duration) -> Result<Minted, CredError> {
-        self.mint_inner(scope, ttl_hint)
-    }
-
-    fn revoke(&self, lease: &Lease) -> Result<(), CredError> {
-        self.revokes
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(lease.handle.clone());
-        Ok(())
-    }
-
-    fn refresh(&self, lease: &Lease) -> Result<Minted, CredError> {
-        if self.fail {
-            return Err(CredError::Mint("fake provider configured to fail".to_string()));
-        }
-        Ok(Minted::new(
-            self.token.clone(),
-            SystemTime::now() + Duration::from_secs(MAX_TTL_SECS as u64),
-            lease.handle.clone(),
-        ))
-    }
-}
 
 /// Mint a scoped credential and stage it to a `0600` file under `out_dir`,
 /// returning the [`Lease`] that carries it.
@@ -447,9 +356,13 @@ fn stage_err(action: &str, path: &Path, err: &std::io::Error) -> CredError {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
+    use std::{
+        os::unix::fs::PermissionsExt,
+        sync::{Mutex, PoisonError},
+    };
 
     use anyhow::Context;
+    use sandy_test_support::FakeProvider;
 
     use super::*;
 

@@ -14,9 +14,11 @@ version, metadata, dependency versions, and lints through the root `Cargo.toml`
 (`[workspace.package]`, `[workspace.dependencies]`, `[workspace.lints]`):
 
 - **`sandy`** — the deep library. Private implementation modules behind a curated
-  `pub use` facade: the `VmBackend` seam + `FakeBackend`, the journal, reconcile,
-  the result envelope (INV-11), nix topology, egress, seed,
-  secret staging, and gc.
+  `pub use` facade: the `VmBackend` seam, the journal, reconcile, the result
+  envelope (INV-11), nix topology, egress, seed, secret staging, and gc. Seam
+  test doubles (`FakeBackend`, `FakeApplier`, `FakeProvider`,
+  `FakeProvisioner`, `FakeContainment`) live in `sandy-test-support`. The
+  VM-only console driver lives in `sandy-impls-vm`.
 - **`sandy-backend`** — the native `VmBackend` implementations: `QemuBackend`
   (Linux/KVM, serial on `ttyS0`) and `VfkitBackend` (macOS/Virtualization.framework,
   console on `hvc0`).
@@ -74,10 +76,15 @@ Commit with a Conventional Commits title.
 
 ```text
 crates/
-  ├─ sandy/          - deep library behind a curated facade (seam, journal, result, topology, …)
-  ├─ sandy-backend/  - native VmBackend impls: QemuBackend (Linux) + VfkitBackend (macOS)
-  ├─ sandy-fabric/   - agent-fabric seam traits + shared contract-test harness (no impls)
-  └─ sandy-cli/      - the `sandy` binary (doctor, run/ls/status/wait/kill/gc, cred github …)
+  ├─ sandy/               - deep library behind a curated facade (seam, journal, result, topology, …)
+  ├─ sandy-api/           - the pinned seam contract (traits + data/error types, no behavior)
+  ├─ sandy-test-support/  - in-memory test doubles for the seam traits (FakeBackend, FakeApplier, …), api-only
+  ├─ sandy-backend/       - the backend hub: feature-gated re-export of impls/local and impls/vm
+  ├─ sandy-fabric/        - agent-fabric seam traits + shared contract-test harness (no impls)
+  └─ sandy-cli/           - the `sandy` binary (doctor, run/ls/status/wait/kill/gc, cred github …)
+impls/
+  ├─ local/          - raw-process backend, local-dir share transport, host containment
+  └─ vm/             - QemuBackend (Linux) + VfkitBackend (macOS), virtio-fs transports, console driver
 nix/
   ├─ packages/       - crane build definitions
   └─ guest/          - bootable microVM guests + the Topology seam (own flake)

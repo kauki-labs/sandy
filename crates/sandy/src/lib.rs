@@ -4,23 +4,24 @@
 //! `pub use` facade re-exported below — the operations, their contract types, and
 //! the injection trait seams. The capabilities, all provable without a hypervisor:
 //!
-//! - **Run plane** — the pinned [`VmBackend`] seam plus the `snake_case` data types (INV-8) and a [`FakeBackend`]
-//!   double; the LOCKED result envelope [`ResultEnvelope`] (INV-11); the [`Journal`] of one atomic, flock-guarded
-//!   record per job (INV-3/5/6); exit-0-only `O_NOFOLLOW` [`collect`]ion (INV-2/4); and [`reconcile_job`] under the
-//!   job's flock (INV-3). The [`Containment`] seam confines a non-VM executor's job so its whole process tree is reaped
-//!   (the process backend's isolation story, #135); [`admits_untrusted`] is the fail-closed gate.
+//! - **Run plane** — the pinned [`VmBackend`] seam plus the `snake_case` data types (INV-8) (a `FakeBackend` double
+//!   lives in `sandy-test-support`); the LOCKED result envelope [`ResultEnvelope`] (INV-11); the [`Journal`] of one
+//!   atomic, flock-guarded record per job (INV-3/5/6); exit-0-only `O_NOFOLLOW` [`collect`]ion (INV-2/4); and
+//!   [`reconcile_job`] under the job's flock (INV-3). The [`Containment`] seam confines a non-VM executor's job so its
+//!   whole process tree is reaped (the process backend's isolation story, #135); [`admits_untrusted`] is the
+//!   fail-closed gate.
 //! - **Provisioning** — [`classify`] host facts into a [`ProvisioningStrategy`], then [`provision`] /
 //!   [`provision_remote_build`] / [`decide_fallback`] over the [`HostNixProvisioner`] and [`RemoteBuilder`] seams.
 //! - **Seed identity** — [`acquire`] a [`VerifiedSeed`] via a [`SignatureVerifier`].
 //! - **Egress** — [`to_nftables`] (host OUTPUT model) and the guest-scoped [`to_nftables_forward`] translation plus
 //!   [`macos_egress_statement`]; [`plan_egress`] / [`plan_egress_scoped`] into a typed [`EgressPlan`] (Linux enforces —
 //!   the tap-scoped forward ruleset when a tap is bound — macOS is honestly unenforced), driven by [`enforce`] over the
-//!   [`EgressApplier`] seam ([`FakeApplier`] / host-tier [`NftablesApplier`]).
+//!   [`EgressApplier`] seam (host-tier [`NftablesApplier`]; a `FakeApplier` double lives in `sandy-test-support`).
 //! - **Nix topology** — a typed [`Topology`] read from a guest flake attr via [`topology`] / [`parse_topology`]
 //!   (INV-TOPOLOGY).
-//! - **Credentials** — the provider-agnostic [`CredentialProvider`] seam (with a [`FakeProvider`] double);
-//!   [`mint_lease`] clamps a TTL to [`MAX_TTL_SECS`] and stages a scoped credential as a `0600` [`SecretRef`] only
-//!   (INV-1).
+//! - **Credentials** — the provider-agnostic [`CredentialProvider`] seam (a `FakeProvider` double lives in
+//!   `sandy-test-support`); [`mint_lease`] clamps a TTL to [`MAX_TTL_SECS`] and stages a scoped credential as a `0600`
+//!   [`SecretRef`] only (INV-1).
 //! - **Operability** — [`RunMetrics`] and staging [`plan_eviction`].
 
 // Deep crate: the module tree is private. The curated `pub use` facade below is
@@ -52,25 +53,22 @@ mod strategy;
 mod trust_root;
 
 pub use backend::{
-    BackendError, BoxState, FakeBackend, Grants, Input, Outcome, Output, PlanError, RunSpec, SandboxKind, SecretRef,
-    SecretSource, VmBackend, backend_accepts, validate_no_secret_leak,
+    BackendError, BoxState, Grants, Input, Outcome, Output, PlanError, RunSpec, SandboxKind, SecretRef, SecretSource,
+    VmBackend, backend_accepts, validate_no_secret_leak,
 };
 pub use collect::{CollectError, OutputSpec, collect};
 pub use config::CollectionConfig;
-pub use containment::{
-    Containment, ContainmentStatus, FakeContainment, NoContainment, ResourceLimits, admits_untrusted,
-};
+pub use containment::{Containment, ContainmentStatus, NoContainment, ResourceLimits, admits_untrusted};
 pub use cred::{
-    Capability, CredError, CredentialHandle, CredentialProvider, FakeProvider, GitlabAccount, Lease, MAX_TTL_SECS,
-    Minted, Scope, Target, TrustRoot, TrustRootIo, mint_lease, read_secret_0600, refresh_once,
-    render_github_permissions, should_refresh,
+    Capability, CredError, CredentialHandle, CredentialProvider, GitlabAccount, Lease, MAX_TTL_SECS, Minted, Scope,
+    Target, TrustRoot, TrustRootIo, mint_lease, read_secret_0600, refresh_once, render_github_permissions,
+    should_refresh,
 };
 pub use cred_github::GithubAdapter;
 pub use discovery::{Discovery, Placement, StaticRegistry, parse_builder_systems};
 pub use egress::{
-    AllowList, EgressApplier, EgressError, EgressOs, EgressOutcome, EgressPlan, EgressRule, FakeApplier,
-    NftablesApplier, enforce, macos_egress_statement, plan_egress, plan_egress_scoped, to_nftables,
-    to_nftables_forward,
+    AllowList, EgressApplier, EgressError, EgressOs, EgressOutcome, EgressPlan, EgressRule, NftablesApplier, enforce,
+    macos_egress_statement, plan_egress, plan_egress_scoped, to_nftables, to_nftables_forward,
 };
 pub use error::CoreError;
 pub use gc::{StagedImage, plan_eviction};
@@ -100,8 +98,8 @@ pub use stage::{
 pub use staging::ensure_sandy_staging_base;
 pub use strategy::{BootAxis, BuildAxis, HostFacts, ProvisioningStrategy, classify};
 pub use trust_root::{
-    FakeProvisioner, InstallError, Provisioner, RegistrationPlan, RevokeOutcome, deregister, github_app_manifest,
-    parse_capability, register, register_skip_verify,
+    InstallError, Provisioner, RegistrationPlan, RevokeOutcome, deregister, github_app_manifest, parse_capability,
+    register, register_skip_verify,
 };
 
 /// fsync a directory so a preceding create/rename within it is durable across a

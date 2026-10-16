@@ -1,11 +1,12 @@
 //! The shared `VmBackend` seam contract: one suite every implementation passes
 //! (#131 / #103 seam-first). Run here against the two CI-safe impls — the scripted
-//! `FakeBackend` (sandy) and the real `ProcessBackend` (this crate). The VM impls
+//! `FakeBackend` (sandy-test-support) and the real `ProcessBackend` (this crate). The VM impls
 //! (`QemuBackend`/`VfkitBackend`) satisfy the same contract but need a hypervisor,
 //! so they are proven in the live tier, not here.
 
-use sandy::{FakeBackend, Grants, Outcome, OutputStatus, ProcessExit, RunSpec, Status, VmBackend, classify_outcome};
+use sandy::{Grants, Outcome, OutputStatus, ProcessExit, RunSpec, Status, VmBackend, classify_outcome};
 use sandy_backend::ProcessBackend;
+use sandy_test_support::FakeBackend;
 
 /// Build a `RunSpec` that runs `command` with no inputs/outputs/secrets.
 fn spec<'a>(command: &'a [String], grants: &'a Grants) -> RunSpec<'a> {
