@@ -129,7 +129,8 @@ mod tests {
     #[test]
     fn a_cap_round_trips_through_its_encoding() -> Result<(), CapCodecError> {
         let encoded = encode_cap(&cap())?;
-        assert_eq!(decode_cap(&encoded)?, cap());
+        // Not assert_eq!: on failure it would print the proof through Cap's Debug.
+        assert!(decode_cap(&encoded)? == cap(), "the cap changed in the round trip");
         Ok(())
     }
 

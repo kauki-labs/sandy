@@ -333,7 +333,8 @@ mod tests {
         let mode = fs::metadata(path)?.permissions().mode() & 0o777;
         anyhow::ensure!(mode == 0o600, "mode {mode:o}");
         let read = sandy_fabric::capauth::decode_cap(&fs::read(path)?)?;
-        anyhow::ensure!(read == cap(), "the staged cap differs: {read:?}");
+        // No `{:?}` on a Cap: its Debug prints the proof.
+        anyhow::ensure!(read == cap(), "the staged cap differs from the minted one");
         Ok(())
     }
 
