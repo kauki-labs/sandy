@@ -426,11 +426,15 @@ fn run_credentialed(
         eprintln!("sandy: {e}");
         ProcessExit::InvalidPlan.code()
     })?;
-    let cred_dir = std::env::temp_dir().join(format!("sandy-cred-{}", std::process::id()));
-    std::fs::create_dir_all(&cred_dir).map_err(|e| {
-        eprintln!("sandy: create credential staging dir: {e}");
-        ProcessExit::InfraFault.code()
-    })?;
+    // A fresh 0700 dir under the validated staging base, randomly named: a
+    // predictable /tmp path could be pre-created by another user (#192).
+    let cred_dir = sandy_fsutil::private_staging_dir("cred")
+        .map_err(|e| {
+            eprintln!("sandy: create credential staging dir: {e}");
+            ProcessExit::InfraFault.code()
+        })?
+        .path()
+        .to_path_buf();
     let result = supervisor::run_job_with_credential(
         profile.backend(),
         journal,

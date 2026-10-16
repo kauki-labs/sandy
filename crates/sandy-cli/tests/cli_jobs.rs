@@ -3,7 +3,10 @@
 //! the live-boot proof is tier-3 (#26). Every command has a positive and an
 //! adversarial case.
 
-use std::time::{Duration, SystemTime};
+use std::{
+    os::unix::fs::PermissionsExt,
+    time::{Duration, SystemTime},
+};
 
 use anyhow::Context;
 use sandy::{
@@ -19,7 +22,11 @@ use sandy_test_support::{FakeApplier, FakeBackend, FakeProvider};
 
 /// A journal on a fresh local temp `$SANDY_HOME`.
 fn fresh_journal() -> anyhow::Result<(tempfile::TempDir, Journal)> {
-    let tmp = tempfile::tempdir().context("creating a temp SANDY_HOME")?;
+    // 0700 whatever the umask: credentials are staged under it (#174).
+    let tmp = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .context("creating a temp SANDY_HOME")?;
     let journal = Journal::new(tmp.path());
     journal.ensure_dirs().context("ensure_dirs")?;
     Ok((tmp, journal))
@@ -647,6 +654,8 @@ fn credential_is_minted_run_revoked_and_cleaned() -> anyhow::Result<()> {
     let backend = FakeBackend::new().with_outcome(ok_outcome(0));
     let cred_dir = tmp.path().join("cred");
     std::fs::create_dir_all(&cred_dir).context("create cred dir")?;
+    // 0700 like the production cred dir, whatever the umask (#192).
+    std::fs::set_permissions(&cred_dir, std::fs::Permissions::from_mode(0o700)).context("cred dir 0700")?;
 
     let report = run_job_with_credential(
         &backend,
@@ -685,6 +694,8 @@ fn credential_is_revoked_even_when_the_run_fails() -> anyhow::Result<()> {
     let backend = FakeBackend::new().with_error(BackendError::Spawn("no hypervisor".to_string()));
     let cred_dir = tmp.path().join("cred");
     std::fs::create_dir_all(&cred_dir).context("create cred dir")?;
+    // 0700 like the production cred dir, whatever the umask (#192).
+    std::fs::set_permissions(&cred_dir, std::fs::Permissions::from_mode(0o700)).context("cred dir 0700")?;
 
     let report = run_job_with_credential(
         &backend,
@@ -721,6 +732,8 @@ fn credential_mint_failure_fails_closed_before_any_run() -> anyhow::Result<()> {
     let backend = FakeBackend::new().with_outcome(ok_outcome(0));
     let cred_dir = tmp.path().join("cred");
     std::fs::create_dir_all(&cred_dir).context("create cred dir")?;
+    // 0700 like the production cred dir, whatever the umask (#192).
+    std::fs::set_permissions(&cred_dir, std::fs::Permissions::from_mode(0o700)).context("cred dir 0700")?;
 
     let err = run_job_with_credential(
         &backend,

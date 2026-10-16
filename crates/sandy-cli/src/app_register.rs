@@ -355,16 +355,9 @@ fn github_targets(root: &TrustRoot) -> Vec<Target> {
 /// A `0700` temp dir for the verify probe's short-lived staged token, removed
 /// after the probe.
 fn verify_tmp_dir() -> Result<PathBuf, InstallError> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let dir = std::env::temp_dir().join(format!("sandy-verify-{}", new_nonce()));
-    std::fs::create_dir_all(&dir).map_err(|source| InstallError::Io {
-        action: "create verify temp dir",
-        path: dir.clone(),
-        source,
-    })?;
-    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-    Ok(dir)
+    sandy_fsutil::private_staging_dir("verify")
+        .map(|dir| dir.path().to_path_buf())
+        .map_err(|e| InstallError::Verify(format!("create verify temp dir: {e}")))
 }
 
 /// After uninstall the installation is gone, but the App *registration* shell
