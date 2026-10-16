@@ -105,7 +105,8 @@ impl OwnedDir {
         let secured = rustix::fs::chmodat(&parent_fd, name, Mode::RWXU, AtFlags::SYMLINK_NOFOLLOW)
             .or_else(|e| match e {
                 // Linux before fchmodat2 cannot honour NOFOLLOW here.
-                rustix::io::Errno::NOTSUP | rustix::io::Errno::OPNOTSUPP => {
+                // A guard, not a pattern: the two are one value on Linux, two on macOS.
+                e if e == rustix::io::Errno::NOTSUP || e == rustix::io::Errno::OPNOTSUPP => {
                     rustix::fs::chmodat(&parent_fd, name, Mode::RWXU, AtFlags::empty())
                 }
                 other => Err(other),
