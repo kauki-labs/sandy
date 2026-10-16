@@ -34,6 +34,20 @@ pub use v1::{
     control_request, control_response,
 };
 
+/// `AttachResponse.cap` is a bearer credential (an encoded, attenuated
+/// channel-join `Cap`): a holder can present it as that scope, so it must
+/// never print in the clear. `build.rs` skips prost's derived `Debug` for this
+/// message; this redacts the cap the same way `sandy_fabric::capauth::Cap`
+/// redacts its own proof.
+impl std::fmt::Debug for AttachResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttachResponse")
+            .field("channel_id", &self.channel_id)
+            .field("cap", &format_args!("<redacted {} bytes>", self.cap.len()))
+            .finish()
+    }
+}
+
 /// The largest frame this codec accepts, guarding against a hostile or broken
 /// peer claiming an unbounded length prefix. Generous for a control message
 /// (job manifests are small compared to job output, which never rides this
@@ -120,6 +134,41 @@ mod tests {
                 job_id: "job-1".to_owned(),
             })),
         }
+    }
+
+    /// Adversarial (credential leak): `AttachResponse`'s `Debug` must never
+    /// print the raw cap bytes — it's a bearer credential a holder can present
+    /// as that scope. Mirrors `sandy_fabric::capauth::Cap`'s own redaction
+    /// test.
+    #[test]
+    fn attach_response_debug_redacts_the_cap() {
+        let marker = "sandy-cap-leak-marker-9f3c1a";
+        let cap = marker.as_bytes().to_vec();
+        let response = AttachResponse {
+            channel_id: "orchestrator".to_owned(),
+            cap: cap.clone(),
+        };
+        let rendered = format!("{response:?}");
+
+        // Check both leak shapes: prost's default-derived Debug on a bearer
+        // credential would print the bytes either as the decoded UTF-8 text
+        // (unlikely to render by chance, but cheap to also guard) or as its
+        // numeric byte array (`[115, 97, 110, ...]`, the actual shape a plain
+        // `#[derive(Debug)]` on `Vec<u8>` prints) — a marker-text-only check
+        // would miss the real leak shape entirely.
+        assert!(
+            !rendered.contains(marker),
+            "the cap's decoded text leaked into Debug output: {rendered}"
+        );
+        let numeric_repr = format!("{cap:?}");
+        assert!(
+            !rendered.contains(&numeric_repr),
+            "the cap's raw bytes leaked into Debug output: {rendered}"
+        );
+        assert!(
+            rendered.contains("redacted"),
+            "expected an explicit redaction marker, got: {rendered}"
+        );
     }
 
     #[tokio::test]

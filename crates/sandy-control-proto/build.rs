@@ -28,7 +28,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed={}", proto.display());
 
     let file_descriptors = protox::compile([&proto], [&proto_dir])?;
-    prost_build::Config::new().compile_fds(file_descriptors)?;
+    // AttachResponse.cap is a bearer credential (an encoded, attenuated
+    // channel-join Cap): prost's derived Debug would print its raw bytes.
+    // Skip it here; src/lib.rs hand-writes a redacting Debug instead,
+    // mirroring sandy-fabric's Cap.
+    prost_build::Config::new()
+        .skip_debug(["sandy.control.v1.AttachResponse"])
+        .compile_fds(file_descriptors)?;
 
     Ok(())
 }
