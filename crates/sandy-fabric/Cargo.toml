@@ -1,0 +1,40 @@
+[package]
+name = "sandy-fabric"
+description = "The sandy agent-fabric contract crate: seam traits, their types, and a shared contract-test harness"
+version.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+documentation = "https://docs.rs/sandy-fabric"
+keywords = ["sandbox", "agent", "fabric", "contract"]
+categories = ["development-tools"]
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+# Exposes the generic seam contract-test harness (the `contract` module) so a
+# downstream impl crate can run its implementation against the shared suite. Off
+# by default: the contract crate ships no test surface unless a caller asks. The
+# harness is also compiled under `cfg(test)` for this crate's own reference and
+# adversarial checks, so `cargo test -p sandy-fabric` needs no feature flag.
+contract-tests = ["dep:futures-util"]
+
+[lints]
+workspace = true
+
+[dependencies]
+futures-core.workspace = true
+futures-util = { workspace = true, optional = true }
+sandy-api.workspace = true
+serde = { workspace = true }
+thiserror.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+futures-util.workspace = true
+tokio.workspace = true

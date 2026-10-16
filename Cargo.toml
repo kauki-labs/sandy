@@ -20,9 +20,14 @@ rust-version = "1.85"
 sandy = { path = "crates/sandy", package = "sandy-box", version = "0.1.1" }
 sandy-api = { path = "crates/sandy-api", version = "0.1.1" }
 sandy-backend = { path = "crates/sandy-backend", version = "0.1.1" }
+sandy-fabric = { path = "crates/sandy-fabric", version = "0.1.1" }
 sandy-impls-local = { path = "impls/local", version = "0.1.1" }
 sandy-impls-vm = { path = "impls/vm", version = "0.1.1" }
 command-group = "5.0.1"
+futures-core = "0.3.34"
+futures-util = { version = "0.3.34", default-features = false, features = [
+  "std",
+] }
 thiserror = "2.0.20"
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 serde = { version = "1.0", features = ["derive"] }
