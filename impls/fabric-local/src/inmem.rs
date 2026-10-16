@@ -6,7 +6,7 @@
 //! replays the backlog from a cursor, then follows live appends with no gap.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashSet, btree_map::Entry},
     pin::Pin,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
     task::{Context, Poll, Waker},
@@ -50,16 +50,32 @@ impl ChannelBackend for InMem {
     async fn append(&self, env: Envelope) -> Result<(), ChannelBackendError> {
         let id = msg_id(&env).ok_or(ChannelBackendError::MissingMsgId)?.to_owned();
         let mut log = self.lock();
-        if !log.ids.insert(id) {
+        if !log.ids.insert(id.clone()) {
             // A re-post of a stored content id is a no-op; the first entry stands.
             return Ok(());
         }
-        // `or_insert` rather than a plain insert: two distinct ids should never
-        // collide on `sequence` (the channel layer assigns it), but if they did,
-        // keeping the first here matches the same "keep first" rule as dedup.
-        log.entries.entry(env.sequence).or_insert(env);
-        for waker in log.wakers.drain(..) {
-            waker.wake();
+        if let Entry::Vacant(slot) = log.entries.entry(env.sequence) {
+            slot.insert(env);
+            for waker in log.wakers.drain(..) {
+                waker.wake();
+            }
+        } else {
+            // Two distinct content ids collided on `sequence`; the channel layer
+            // assigns it and should never produce this. The id is already marked
+            // seen above, so a silent drop here would absorb the second envelope
+            // forever, even on a re-post. Surface it loudly instead: a
+            // debug_assert catches it in dev/test, a tracing::error keeps it
+            // observable in release.
+            debug_assert!(
+                false,
+                "sequence {} already holds a different content id than {id:?}",
+                env.sequence
+            );
+            tracing::error!(
+                sequence = env.sequence,
+                msg_id = %id,
+                "channel backend: sequence collision between distinct content ids, dropping the second envelope"
+            );
         }
         Ok(())
     }
