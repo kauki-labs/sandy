@@ -122,5 +122,11 @@ infra fault.
 **Consequences.** No caller migration now; unifying the two seams stays a
 separate, deliberate step.
 
+`run` borrows `&RunSpec<'_>`, so the `VmBackend` adapter runs the blocking call
+with `block_in_place`: one async worker is held per run (as on today's sync path),
+and the composition root needs a multi-thread runtime.
+
 **Set aside.** Renaming `VmBackend` to `Executor`: it forces every caller to
-migrate before the fabric needs it.
+migrate before the fabric needs it. An owned `RunSpec` for `spawn_blocking`: it
+would dup the `SecretSource::Fd` into a new fd lifetime, against the secret-channel
+discipline (INV-1), and make a deliberately borrowed, non-`Clone` type owned.
