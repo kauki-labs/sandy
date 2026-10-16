@@ -193,8 +193,8 @@ rather than reimplements.
   probe failed, `place` errors rather than returning `None`, so an unreadable
   capacity plane is not mistaken for a full fleet.
 
-**Consequences.** The crate depends only on `sandy-fabric` (and `sandy-api` in
-tests), so it builds without the Executor impls of #108. Any `Executor` plugs into
+**Consequences.** Placement needs only `sandy-fabric`'s traits, not #108's
+concrete executor, so it builds and tests (with a fake `Executor`) on its own. Any `Executor` plugs into
 `ExecutorCapacity`. A probe reserves nothing, so two concurrent placements can take
 the same last slot; the executor enforces its own limit, and in-flight accounting
 belongs to the composition root (#115).
