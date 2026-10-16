@@ -126,11 +126,20 @@ impl<B: ChannelBackend + 'static, A: CapAuthority + 'static> SandboxAgent<B, A> 
         let inbound_stream = self.channel.subscribe(&self.membership)?;
         let inbound = tokio::spawn(async move {
             let mut inbound_stream = std::pin::pin!(inbound_stream);
-            while let Some(Ok(env)) = inbound_stream.next().await {
+            loop {
+                let env = match inbound_stream.next().await {
+                    Some(Ok(env)) => env,
+                    Some(Err(e)) => {
+                        tracing::warn!(error = %e, "TTY inbound stream faulted; stdin bridge stopped");
+                        break;
+                    }
+                    None => break,
+                };
                 if !matches!(env.message_type, Some(MessageType::Tty(_))) || env.content_type != TTY_STDIN {
                     continue;
                 }
-                if job_stdin.write_all(&env.payload).await.is_err() {
+                if let Err(e) = job_stdin.write_all(&env.payload).await {
+                    tracing::warn!(error = %e, "writing to job stdin failed; stdin bridge stopped");
                     break;
                 }
             }
@@ -165,10 +174,20 @@ impl<B: ChannelBackend + 'static, A: CapAuthority + 'static> SandboxAgent<B, A> 
             }
         };
         inbound.abort();
-        stderr.abort();
+        // Let the stderr side flush what the job wrote before exiting (a job
+        // typically writes its crash/error message to stderr right before
+        // closing stdout) rather than dropping it immediately; bounded so a job
+        // that leaks stderr open cannot hang serve_tty.
+        let stderr_abort = stderr.abort_handle();
+        if tokio::time::timeout(STDERR_DRAIN, stderr).await.is_err() {
+            stderr_abort.abort();
+        }
         result
     }
 }
+
+/// Upper bound on draining the stderr bridge after `job_stdout` reaches EOF.
+const STDERR_DRAIN: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Forward `reader` to the channel as `content_type`-tagged Tty posts until EOF
 /// or a post fails. Used for the stderr side, which (unlike stdout) is not the
@@ -181,11 +200,17 @@ async fn forward_tty<B: ChannelBackend + 'static, A: CapAuthority + 'static>(
 ) {
     let mut buf = [0_u8; TTY_CHUNK];
     loop {
-        let Ok(n) = reader.read(&mut buf).await else { return };
+        let n = match reader.read(&mut buf).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(error = %e, content_type, "TTY forward read failed; bridge stopped");
+                return;
+            }
+        };
         if n == 0 {
             return;
         }
-        if channel
+        if let Err(e) = channel
             .post(
                 &membership,
                 Some(MessageType::Tty(Tty {})),
@@ -193,8 +218,8 @@ async fn forward_tty<B: ChannelBackend + 'static, A: CapAuthority + 'static>(
                 buf[..n].to_vec(),
             )
             .await
-            .is_err()
         {
+            tracing::warn!(error = %e, content_type, "TTY forward post failed; bridge stopped");
             return;
         }
     }
@@ -301,12 +326,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_rejects_undecodable_bytes() {
-        let (channel, ..) = new_channel_and_caps().await.expect("setup");
+    async fn bootstrap_rejects_undecodable_bytes() -> anyhow::Result<()> {
+        let (channel, ..) = new_channel_and_caps().await.context("setup")?;
         let result = SandboxAgent::bootstrap(channel, Cursor::new(b"not a cap".to_vec()));
         assert_bootstrap_fails(result, "garbage bytes must not bootstrap", |e| {
             matches!(e, AgentError::BootstrapDecode(_))
         });
+        Ok(())
     }
 
     #[tokio::test]
@@ -403,8 +429,10 @@ mod tests {
         };
         assert_eq!(env.payload, b"job-warned\n");
 
-        // EOF the job's stdout (the job exits): serve_tty must return.
+        // EOF both the job's stdout and stderr (the job exits): serve_tty must
+        // return promptly rather than sitting out the stderr-drain timeout.
         job_stdout_test.shutdown().await?;
+        job_stderr_test.shutdown().await?;
         timeout(TokioDuration::from_secs(5), serving).await???;
         Ok(())
     }

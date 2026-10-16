@@ -308,6 +308,6 @@ deferred to the VM-backed `RawConsole`, tracked separately.
 subdirectory on the existing secrets mount: both still share the mount the job
 reads from and depend on the backend giving the agent and the job distinct
 identities, which the local process backend does not (ruled out in favor of the
-out-of-band fd handoff, superseding §7's "set aside" on this point). Wiring
+out-of-band fd handoff, reaffirming §8's "set aside" on this point). Wiring
 `sandy_api::console::Transport` into `RawConsole` now: no VM-backed agent exists
 yet to wire it to.
