@@ -7,12 +7,12 @@
 //! (`aarch64-linux`), not hosts with a sandbox kind.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use sandy_fabric::{
@@ -107,7 +107,8 @@ impl<E: Executor> ExecutorCapacity<E> {
         Self::default()
     }
 
-    /// Add `host`, served by `executor`, accepting at most `max_slots` concurrent jobs.
+    /// Add `host`, served by `executor`, accepting at most `max_slots` concurrent
+    /// jobs; `0` keeps the host known but never selectable.
     pub fn with_host(mut self, host: HostId, executor: E, max_slots: u32) -> Self {
         self.hosts.insert(host, (executor, max_slots));
         self
@@ -155,8 +156,10 @@ impl<C: Clock + ?Sized> Clock for Arc<C> {
 }
 
 /// Lease soft-state [`Lifecycle`]: a registration lives for `ttl` and each
-/// heartbeat renews it for another `ttl`. A lease is live while `now < deadline`;
-/// at the deadline it has lapsed, after which it is unknown to every call.
+/// heartbeat renews it for another `ttl` from the time of the heartbeat. A lease is
+/// live while `now < deadline`; at the deadline it has lapsed, after which it is
+/// unknown to every call. A host holds at most one lease: registering again
+/// replaces the old one, so deregistering always ends the host's liveness.
 #[derive(Debug)]
 pub struct LeaseTable<C = SystemClock> {
     ttl: Duration,
@@ -174,13 +177,27 @@ impl LeaseTable<SystemClock> {
 
 impl<C: Clock> LeaseTable<C> {
     /// A lease table on `clock`.
+    ///
+    /// Lease ids start from the wall clock, so a lease issued before a restart
+    /// does not collide with one issued after it.
     pub fn with_clock(ttl: Duration, clock: C) -> Self {
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
         Self {
             ttl,
             clock,
             leases: Mutex::new(BTreeMap::new()),
-            next_id: AtomicU64::new(0),
+            next_id: AtomicU64::new(seed),
         }
+    }
+
+    /// The deadline of a lease taken or renewed now.
+    fn deadline(&self) -> Result<Instant, LifecycleError> {
+        self.clock
+            .now()
+            .checked_add(self.ttl)
+            .ok_or_else(|| LifecycleError::Store(format!("lease ttl {:?} overflows the clock", self.ttl)))
     }
 
     /// The live leases, with lapsed ones pruned first.
@@ -194,14 +211,16 @@ impl<C: Clock> LeaseTable<C> {
 
 impl<C: Clock> Lifecycle for LeaseTable<C> {
     async fn register(&self, host: HostId) -> Result<Lease, LifecycleError> {
+        let deadline = self.deadline()?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let deadline = self.clock.now() + self.ttl;
-        lock(&self.leases).insert(id, (host.clone(), deadline));
+        let mut leases = self.live_leases();
+        leases.retain(|_, (held, _)| *held != host);
+        leases.insert(id, (host.clone(), deadline));
         Ok(Lease { host, id })
     }
 
     async fn heartbeat(&self, lease: &Lease) -> Result<(), LifecycleError> {
-        let renewed = self.clock.now() + self.ttl;
+        let renewed = self.deadline()?;
         match self.live_leases().get_mut(&lease.id) {
             Some((host, deadline)) if *host == lease.host => {
                 *deadline = renewed;
@@ -223,14 +242,17 @@ impl<C: Clock> Lifecycle for LeaseTable<C> {
     }
 
     async fn live(&self) -> Result<Vec<HostId>, LifecycleError> {
-        let mut hosts: Vec<_> = self.live_leases().values().map(|(h, _)| h.clone()).collect();
-        hosts.sort();
-        hosts.dedup();
-        Ok(hosts)
+        Ok(self
+            .live_leases()
+            .values()
+            .map(|(h, _)| h.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect())
     }
 }
 
-/// A placement failure: the registry or lease store could not be read.
+/// A placement failure: a seam could not be read, so no answer is trustworthy.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PlacementError {
     /// Discovery failed.
@@ -239,13 +261,24 @@ pub enum PlacementError {
     /// The lease store failed.
     #[error(transparent)]
     Lifecycle(#[from] LifecycleError),
+    /// Every live candidate's capacity probe failed (the last error is kept), so
+    /// "no host has room" cannot be told apart from "capacity is unreadable".
+    #[error("no live candidate could be probed: {0}")]
+    Capacity(#[from] CapacityError),
 }
 
-/// Pick a host for a job needing `req`: the first host `discovery` finds that has
-/// a live lease and spare capacity, or `None` when no host qualifies.
+/// Pick a host for a job needing `req`: the first host, in `discovery`'s order,
+/// that has a live lease and a capacity probe that can accept.
 ///
-/// A host whose capacity probe fails is skipped, not fatal: one unreachable host
-/// must not stall placement on the others.
+/// Returns `Ok(None)` when no candidate is live, or every live candidate was
+/// probed and is full. A failed probe skips that host so one unreachable host does
+/// not stall the rest; if every live candidate's probe failed, the result is
+/// [`PlacementError::Capacity`] instead of `None`.
+///
+/// Liveness is read once, before the probes, and a probe reserves nothing: two
+/// concurrent placements can both pick the last free slot. The executor enforces
+/// its own limit; the composition root that calls `place` owns any in-flight
+/// accounting.
 pub async fn place<D, L, C>(
     discovery: &D,
     lifecycle: &L,
@@ -257,18 +290,26 @@ where
     L: Lifecycle,
     C: Capacity,
 {
-    let live = lifecycle.live().await?;
+    let live: BTreeSet<_> = lifecycle.live().await?.into_iter().collect();
+    let mut probed_any = false;
+    let mut last_error = None;
     for candidate in discovery.find(req).await? {
         if !live.contains(&candidate.host) {
             continue;
         }
         match capacity.probe(&candidate.host).await {
             Ok(availability) if availability.can_accept() => return Ok(Some(candidate.host)),
-            Ok(_) => {}
-            Err(e) => tracing::warn!(host = ?candidate.host, error = %e, "capacity probe failed; skipping host"),
+            Ok(_) => probed_any = true,
+            Err(e) => {
+                tracing::warn!(host = ?candidate.host, error = %e, "capacity probe failed; skipping host");
+                last_error = Some(e);
+            }
         }
     }
-    Ok(None)
+    match last_error {
+        Some(e) if !probed_any => Err(PlacementError::Capacity(e)),
+        _ => Ok(None),
+    }
 }
 
 #[cfg(test)]
@@ -286,9 +327,21 @@ mod tests {
 
     const TTL: Duration = Duration::from_secs(30);
 
-    /// An executor that reports `running` boxes.
+    /// An executor that reports `running` boxes, or whose `observe` fails.
     struct BusyExecutor {
         running: usize,
+        broken: bool,
+    }
+
+    fn busy(running: usize) -> BusyExecutor {
+        BusyExecutor { running, broken: false }
+    }
+
+    fn broken() -> BusyExecutor {
+        BusyExecutor {
+            running: 0,
+            broken: true,
+        }
     }
 
     impl Executor for BusyExecutor {
@@ -301,6 +354,9 @@ mod tests {
         }
 
         async fn observe(&self) -> Result<Vec<BoxState>, ExecutorError> {
+            if self.broken {
+                return Err(ExecutorError::Transport("unreachable".to_owned()));
+            }
             Ok((0..self.running)
                 .map(|i| BoxState {
                     box_id: format!("b{i}"),
@@ -368,7 +424,7 @@ mod tests {
     async fn executor_capacity_satisfies_the_capacity_contract() -> anyhow::Result<()> {
         let known = HostId::from("h1");
         capacity_suite(known.clone(), || {
-            ExecutorCapacity::new().with_host(known.clone(), BusyExecutor { running: 1 }, 4)
+            ExecutorCapacity::new().with_host(known.clone(), busy(1), 4)
         })
         .await
         .context("capacity")
@@ -416,8 +472,8 @@ mod tests {
     async fn a_probe_reports_free_slots_and_a_full_host_cannot_accept() -> anyhow::Result<()> {
         let (half, full) = (HostId::from("half"), HostId::from("full"));
         let capacity = ExecutorCapacity::new()
-            .with_host(half.clone(), BusyExecutor { running: 1 }, 2)
-            .with_host(full.clone(), BusyExecutor { running: 3 }, 2);
+            .with_host(half.clone(), busy(1), 2)
+            .with_host(full.clone(), busy(3), 2);
         let half = capacity.probe(&half).await?;
         anyhow::ensure!(half.free_slots == 1 && half.can_accept(), "half: {half:?}");
         let full = capacity.probe(&full).await?;
@@ -444,7 +500,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_heartbeat_before_the_deadline_renews_the_lease() -> anyhow::Result<()> {
+    async fn a_heartbeat_renews_the_lease_for_ttl_from_the_heartbeat() -> anyhow::Result<()> {
         let clock = ManualClock::new();
         let leases = LeaseTable::with_clock(TTL, clock.clone());
         let lease = leases.register(HostId::from("h1")).await?;
@@ -456,7 +512,46 @@ mod tests {
             leases.live().await? == [HostId::from("h1")],
             "a renewed lease lapsed on the original deadline"
         );
+        clock.advance(Duration::from_secs(1));
+        anyhow::ensure!(
+            leases.live().await?.is_empty(),
+            "a renewed lease outlived heartbeat time + ttl"
+        );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn re_registering_a_host_replaces_its_lease() -> anyhow::Result<()> {
+        let leases = LeaseTable::new(TTL);
+        let old = leases.register(HostId::from("h1")).await?;
+        let new = leases.register(HostId::from("h1")).await?;
+        anyhow::ensure!(
+            leases.heartbeat(&old).await == Err(LifecycleError::UnknownLease),
+            "the replaced lease is still renewable"
+        );
+        leases.deregister(&new).await?;
+        anyhow::ensure!(
+            leases.live().await?.is_empty(),
+            "a deregistered host stayed live on an older lease"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_ttl_that_overflows_the_clock_is_an_error_not_a_panic() -> anyhow::Result<()> {
+        let leases = LeaseTable::new(Duration::MAX);
+        anyhow::ensure!(
+            matches!(leases.register(HostId::from("h1")).await, Err(LifecycleError::Store(_))),
+            "an overflowing ttl did not fail cleanly"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn host_arch_knows_the_ci_architectures() {
+        if matches!(std::env::consts::ARCH, "x86_64" | "aarch64") {
+            assert!(host_arch().is_some());
+        }
     }
 
     // ---- place ----
@@ -478,9 +573,9 @@ mod tests {
 
     fn capacity() -> ExecutorCapacity<BusyExecutor> {
         ExecutorCapacity::new()
-            .with_host(HostId::from("a-stale"), BusyExecutor { running: 0 }, 4)
-            .with_host(HostId::from("b-full"), BusyExecutor { running: 4 }, 4)
-            .with_host(HostId::from("c-free"), BusyExecutor { running: 0 }, 4)
+            .with_host(HostId::from("a-stale"), busy(0), 4)
+            .with_host(HostId::from("b-full"), busy(4), 4)
+            .with_host(HostId::from("c-free"), busy(0), 4)
     }
 
     #[tokio::test]
@@ -502,12 +597,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn place_skips_a_live_host_with_no_capacity_source() -> anyhow::Result<()> {
-        let registry = StaticRegistry::new([host("ghost", SandboxKind::Process, Arch::X86_64)]);
+    async fn place_returns_none_when_every_live_host_is_full() -> anyhow::Result<()> {
+        let registry = StaticRegistry::new([host("b-full", SandboxKind::Process, Arch::X86_64)]);
         let leases = LeaseTable::new(TTL);
-        leases.register(HostId::from("ghost")).await?;
+        leases.register(HostId::from("b-full")).await?;
         let picked = place(&registry, &leases, &capacity(), &need(SandboxKind::Process, None)).await?;
-        anyhow::ensure!(picked.is_none(), "picked a host with no capacity source: {picked:?}");
+        anyhow::ensure!(picked.is_none(), "picked a full host: {picked:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn place_skips_a_failed_probe_and_picks_the_next_host() -> anyhow::Result<()> {
+        let registry = StaticRegistry::new(["a-down", "c-free"].map(|id| host(id, SandboxKind::Process, Arch::X86_64)));
+        let leases = LeaseTable::new(TTL);
+        leases.register(HostId::from("a-down")).await?;
+        leases.register(HostId::from("c-free")).await?;
+        let capacity = ExecutorCapacity::new()
+            .with_host(HostId::from("a-down"), broken(), 4)
+            .with_host(HostId::from("c-free"), busy(0), 4);
+        let picked = place(&registry, &leases, &capacity, &need(SandboxKind::Process, None)).await?;
+        anyhow::ensure!(picked == Some(HostId::from("c-free")), "picked {picked:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn place_reports_an_error_when_no_live_host_can_be_probed() -> anyhow::Result<()> {
+        let registry = StaticRegistry::new(["a-down", "ghost"].map(|id| host(id, SandboxKind::Process, Arch::X86_64)));
+        let leases = LeaseTable::new(TTL);
+        leases.register(HostId::from("a-down")).await?;
+        leases.register(HostId::from("ghost")).await?;
+        let capacity = ExecutorCapacity::new().with_host(HostId::from("a-down"), broken(), 4);
+        let result = place(&registry, &leases, &capacity, &need(SandboxKind::Process, None)).await;
+        anyhow::ensure!(
+            matches!(result, Err(PlacementError::Capacity(_))),
+            "an unprobeable fleet looked like a full one: {result:?}"
+        );
         Ok(())
     }
 }

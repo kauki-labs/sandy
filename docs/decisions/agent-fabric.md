@@ -170,3 +170,35 @@ proofs without widening `Cap`.
 attenuation: spec §3.4 has membership orchestrator-assigned in step 1, and the
 orchestrator can already reach the authority, so paying for offline attenuation
 now buys nothing yet; it is the deferred, richer impl behind the same seam.
+
+## 7. All-local placement: static registry, direct probe, leases, first fit
+
+**Status:** accepted.
+
+**Context.** Placement needs a default for each of its three seams (spec §3.6,
+§3.7) and one policy that combines them, which the composition root (#115) calls
+rather than reimplements.
+
+**Decision.** In `sandy-fabric-local` (`placement.rs`, #112):
+
+- `StaticRegistry` is a host list (`localhost` for the all-local profile) filtered
+  with `capabilities_satisfy`.
+- `ExecutorCapacity` probes an `Executor` directly: free slots are its limit minus
+  the boxes `observe()` reports.
+- `LeaseTable` is lease soft-state on an injected `Clock`. A lease is live while
+  `now < deadline`; at the deadline it lapses and is unknown to every call. A host
+  holds one lease: registering again replaces it, so deregistering ends liveness.
+- `place` returns the first host `find` yields that has a live lease and a probe
+  that `can_accept()`. A failed probe skips that host; if every live candidate's
+  probe failed, `place` errors rather than returning `None`, so an unreadable
+  capacity plane is not mistaken for a full fleet.
+
+**Consequences.** The crate depends only on `sandy-fabric` (and `sandy-api` in
+tests), so it builds without the Executor impls of #108. Any `Executor` plugs into
+`ExecutorCapacity`. A probe reserves nothing, so two concurrent placements can take
+the same last slot; the executor enforces its own limit, and in-flight accounting
+belongs to the composition root (#115).
+
+**Set aside.** Seeding the registry from the nix machines table via
+`parse_builder_systems`: that table lists build systems, not hosts with a sandbox
+kind, and the parser lives in the heavy `sandy` core. It is M4 cross-machine work.
