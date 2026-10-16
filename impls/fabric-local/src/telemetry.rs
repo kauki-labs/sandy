@@ -25,8 +25,9 @@ use sandy_fabric::telemetry::{TelemetryError, TelemetryRecord, TelemetrySink};
 /// durable once `emit` returns. The directory is synced until one sync succeeds,
 /// so the file's own entry is durable too.
 /// The write is a short blocking call; telemetry is low-volume, and the sink stays
-/// runtime-agnostic. Emits from one `LocalLog` are serialized. The log is not
-/// rotated or capped yet.
+/// runtime-agnostic. Emits are serialized, within one `LocalLog` and, through an
+/// exclusive `flock`, across every writer of the same file. The log is not rotated
+/// or capped yet.
 ///
 /// The log must be this user's regular file with no group or other access: `emit`
 /// creates it `0600`, refuses to follow a symlink at the path, and refuses an
@@ -137,6 +138,9 @@ impl TelemetrySink for LocalLog {
         line.push(b'\n');
         let _serialized = self.write.lock().unwrap_or_else(PoisonError::into_inner);
         let (mut file, created) = Self::open_for_append(path).map_err(|e| sink_err(path, &e))?;
+        // Serialize with every other writer of this file, not just this LocalLog:
+        // held from the tail check through the syncs, released when `file` drops.
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive).map_err(|e| sink_err(path, &e.into()))?;
         if created {
             // A new file (first emit, or the log was removed): its entry is not durable yet.
             self.dir_synced.store(false, Ordering::Release);
@@ -404,6 +408,35 @@ mod tests {
         let log = LocalLog::open(&path);
         anyhow::ensure!(log.emit(&record("a")).await.is_err(), "followed a symlink");
         anyhow::ensure!(fs::read(&victim)? == b"untouched", "the symlink target was written");
+        Ok(())
+    }
+
+    /// A smoke test: separate logs on one file keep every record. Small appends
+    /// are atomic on their own, so this passes without the file lock; the lock
+    /// covers a short write splitting a line, which a test cannot force.
+    #[tokio::test]
+    async fn two_logs_on_one_file_keep_every_record() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("t.jsonl");
+        let tasks: Vec<_> = (0..4)
+            .map(|t| {
+                // A separate LocalLog per task: only the file lock serializes them.
+                let log = LocalLog::open(&path);
+                tokio::spawn(async move {
+                    for i in 0..25 {
+                        log.emit(&record(&format!("t{t}-{i}"))).await?;
+                    }
+                    Ok::<_, TelemetryError>(())
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await??;
+        }
+        anyhow::ensure!(
+            LocalLog::open(&path).records()?.len() == 100,
+            "records were lost or merged"
+        );
         Ok(())
     }
 
