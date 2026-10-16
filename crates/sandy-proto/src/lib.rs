@@ -64,6 +64,11 @@ pub fn encode(envelope: &Envelope) -> Vec<u8> {
 /// default-empty [`Envelope`]. An unknown (future) field or `message_type`
 /// variant is skipped, leaving the known fields intact (forward compatibility).
 ///
+/// This crate places no upper bound on `bytes`: the `metadata` map and
+/// `payload` allocations scale with the input size. `bytes` crosses a trust
+/// boundary (a channel backend carrying sandbox traffic), so the caller is
+/// responsible for capping frame size before calling `decode` on untrusted input.
+///
 /// # Errors
 ///
 /// Returns [`ProtoError::Decode`] when `bytes` is not a valid envelope frame.
