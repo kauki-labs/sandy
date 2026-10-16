@@ -422,32 +422,7 @@ fn write_pem(stem: &str, pem: &str) -> Result<PathBuf, InstallError> {
 /// Write the PEM to a `0600` `<dir>/<stem>.pem` file, returning its path. The dir
 /// is a parameter so this is testable without touching the real config dir.
 fn write_pem_in(dir: &Path, stem: &str, pem: &str) -> Result<PathBuf, InstallError> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    std::fs::create_dir_all(dir).map_err(|source| InstallError::Io {
-        action: "create trust-roots dir",
-        path: dir.to_path_buf(),
-        source,
-    })?;
-    let path = dir.join(format!("{stem}.pem"));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&path)
-        .map_err(|source| InstallError::Io {
-            action: "create private-key file",
-            path: path.clone(),
-            source,
-        })?;
-    use std::io::Write;
-    file.write_all(pem.as_bytes()).map_err(|source| InstallError::Io {
-        action: "write private key",
-        path: path.clone(),
-        source,
-    })?;
-    Ok(path)
+    Ok(sandy::write_trust_secret(dir, &format!("{stem}.pem"), pem.as_bytes())?)
 }
 
 /// The `<config>/sandy/trust-roots` directory (`XDG_CONFIG_HOME` or `~/.config`).
@@ -510,6 +485,7 @@ pub fn run_register(
     skip_verify: bool,
     force: bool,
 ) -> Result<(), InstallError> {
+    sandy::validate_trust_root_name(handle)?;
     let dir = trust_roots_dir().map_err(|e| InstallError::Capture(e.to_string()))?;
     let cfg = config_path(&dir, handle);
     if !force {
@@ -558,6 +534,7 @@ pub fn run_register(
 /// # Errors
 /// Any [`InstallError`] from loading, the forge revoke, or the local removal.
 pub fn run_deregister(name: &str, keep_remote: bool) -> Result<(), InstallError> {
+    sandy::validate_trust_root_name(name)?;
     let dir = trust_roots_dir().map_err(|e| InstallError::Capture(e.to_string()))?;
     let cfg = config_path(&dir, name);
     let root = TrustRoot::load(&cfg)?;
@@ -663,6 +640,7 @@ pub fn run_import(
     base_url: Option<String>,
     targets: Vec<Target>,
 ) -> Result<(), InstallError> {
+    sandy::validate_trust_root_name(handle)?;
     let dir = trust_roots_dir().map_err(|e| InstallError::Capture(e.to_string()))?;
     let cfg = import_into(&dir, handle, app_id, installation_id, pem_source, base_url, targets)?;
     println!("Imported shared GitHub App trust root: app_id={app_id}, installation_id={installation_id}");
@@ -677,6 +655,7 @@ pub fn run_import(
 /// # Errors
 /// [`InstallError::Verify`] if the probe fails, or a config/load error.
 pub fn run_verify(handle: &str, capabilities: &[Capability]) -> Result<(), InstallError> {
+    sandy::validate_trust_root_name(handle)?;
     let dir = trust_roots_dir().map_err(|e| InstallError::Capture(e.to_string()))?;
     let cfg = config_path(&dir, handle);
     let root = TrustRoot::load(&cfg)?;
@@ -728,6 +707,51 @@ mod tests {
     use std::{io::Write, net::TcpStream};
 
     use super::*;
+
+    /// #194: rewriting the App key over an existing 0644 file leaves it 0600. The
+    /// old writer opened with `truncate`, which kept the old mode.
+    #[test]
+    fn rewriting_the_app_key_over_a_wide_file_leaves_it_0600() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()?;
+        let key = dir.path().join("acme.pem");
+        std::fs::write(&key, "old")?;
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644))?;
+        let written = write_pem_in(dir.path(), "acme", "-----BEGIN KEY-----")?;
+        let mode = std::fs::metadata(&written)?.permissions().mode() & 0o777;
+        anyhow::ensure!(mode == 0o600, "the App key came out {mode:o}");
+        Ok(())
+    }
+
+    /// #194: a symlink at the App key path is replaced, never written through.
+    #[test]
+    fn the_app_key_is_never_written_through_a_symlink() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()?;
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "untouched")?;
+        std::os::unix::fs::symlink(&victim, dir.path().join("acme.pem"))?;
+        let key = write_pem_in(dir.path(), "acme", "-----BEGIN KEY-----")?;
+        anyhow::ensure!(
+            std::fs::read_to_string(&victim)? == "untouched",
+            "the key was written through a symlink"
+        );
+        anyhow::ensure!(
+            std::fs::symlink_metadata(&key)?.is_file(),
+            "the key path is still a symlink"
+        );
+        anyhow::ensure!(
+            std::fs::read_to_string(&key)? == "-----BEGIN KEY-----",
+            "the key was not written"
+        );
+        Ok(())
+    }
 
     /// #193: the verify probe stages an installation token, so its dir must be
     /// 0700 from creation under any umask, freshly named (never a pre-created

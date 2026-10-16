@@ -28,7 +28,6 @@
 
 use std::{
     fs,
-    io::Write,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
@@ -255,20 +254,48 @@ impl TrustRootIo for TrustRoot {
     fn write(&self, path: &Path) -> Result<(), CredError> {
         let text =
             serde_json::to_string_pretty(self).map_err(|e| CredError::Stage(format!("serialize trust root: {e}")))?;
-        let tmp = path.with_extension("tmp");
-        let mut file = fs::File::create(&tmp).map_err(|e| stage_err("create trust-root temp", &tmp, &e))?;
-        file.write_all(text.as_bytes())
-            .map_err(|e| stage_err("write trust-root temp", &tmp, &e))?;
-        file.sync_all()
-            .map_err(|e| stage_err("sync trust-root temp", &tmp, &e))?;
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))
-            .map_err(|e| stage_err("tighten trust root to 0600", &tmp, &e))?;
-        fs::rename(&tmp, path).map_err(|e| stage_err("rename trust root into place", path, &e))?;
-        if let Some(dir) = path.parent() {
-            crate::fsync_dir(dir).map_err(|e| stage_err("fsync trust-root dir", dir, &e))?;
-        }
-        Ok(())
+        let (Some(dir), Some(name)) = (
+            path.parent().filter(|p| !p.as_os_str().is_empty()),
+            path.file_name().and_then(|n| n.to_str()),
+        ) else {
+            return Err(CredError::Stage(format!(
+                "trust root path {} has no parent dir or file name",
+                path.display()
+            )));
+        };
+        write_trust_secret(dir, name, text.as_bytes()).map(drop)
     }
+}
+
+/// Write trust material (the App private key, a trust-root config) as the `0600`
+/// file `name` in the trust-roots `dir`, creating `dir` `0700` if it is missing.
+///
+/// An existing `dir` that is not this user's or is group- or world-writable is
+/// refused and left as it is: another user may already have changed the key or
+/// the config in it, so the error asks for a check before the mode is fixed.
+///
+/// # Errors
+///
+/// [`CredError::Stage`] when the dir is unsafe or a write step fails.
+pub fn write_trust_secret(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf, CredError> {
+    open_trust_dir(dir)?
+        .write_secret(name, bytes)
+        .map_err(|e| CredError::Stage(e.to_string()))
+}
+
+/// Open (creating `0700` if missing) the trust-roots dir, refusing one that is
+/// group/world-writable or another user owns, with the tamper warning.
+pub(crate) fn open_trust_dir(dir: &Path) -> Result<sandy_fsutil::OwnedDir, CredError> {
+    sandy_fsutil::OwnedDir::open_or_create(dir).map_err(|e| match e {
+        sandy_fsutil::FsError::Unsafe { path, reason } => CredError::Stage(format!(
+            "trust-roots dir {} is not private ({reason}); another user may have been able to modify your App key or \
+             trust config. Verify the files in it are intact, then make sure the dir is yours (`chown`) and run \
+             `chmod 700 {}`, and retry",
+            path.display(),
+            path.display()
+        )),
+        other @ sandy_fsutil::FsError::Io { .. } => CredError::Stage(other.to_string()),
+    })
 }
 
 /// Read a secret file, refusing one that is group- or world-readable (the read
@@ -630,6 +657,65 @@ mod tests {
             text.contains("/etc/sandy/app.pem"),
             "config names the key path, not the key"
         );
+        Ok(())
+    }
+
+    fn sample_root() -> TrustRoot {
+        TrustRoot::Github {
+            base_url: None,
+            app_id: "123456".to_string(),
+            private_key_path: PathBuf::from("/etc/sandy/app.pem"),
+            installation_id: 789,
+            targets: vec![Target("acme/widgets".to_string())],
+        }
+    }
+
+    /// #194: a symlink at the trust-root config path is replaced, never written
+    /// through. The old writer created a fixed `<path>.tmp` that followed a link.
+    #[test]
+    fn a_trust_root_write_never_follows_a_symlink_at_its_temp_path() -> anyhow::Result<()> {
+        let tmp = private_tempdir()?;
+        let path = tmp.path().join("acme.json");
+        let victim = tmp.path().join("victim");
+        fs::write(&victim, b"untouched")?;
+        std::os::unix::fs::symlink(&victim, path.with_extension("tmp"))?;
+        sample_root().write(&path).context("write trust root")?;
+        assert_eq!(
+            fs::read(&victim)?,
+            b"untouched",
+            "the config was written through a planted symlink"
+        );
+        assert_eq!(TrustRoot::load(&path)?, sample_root(), "trust root must round-trip");
+        Ok(())
+    }
+
+    /// #194: a group-writable trust-roots dir is refused, not repaired, with a
+    /// message that asks the user to check for tampering before fixing the mode.
+    #[test]
+    fn a_group_writable_trust_roots_dir_is_refused_with_a_tamper_warning() -> anyhow::Result<()> {
+        let tmp = private_tempdir()?;
+        let dir = tmp.path().join("trust-roots");
+        fs::create_dir(&dir)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o775))?;
+        let err = sample_root()
+            .write(&dir.join("acme.json"))
+            .expect_err("a 0775 trust-roots dir must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("may have been able to modify"), "no tamper warning: {msg}");
+        assert!(msg.contains("chmod 700"), "no fix named: {msg}");
+        let mode = fs::metadata(&dir)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o775, "a refused dir must not be silently repaired");
+        Ok(())
+    }
+
+    /// #194: a missing trust-roots dir is created 0700 with the config 0600.
+    #[test]
+    fn a_missing_trust_roots_dir_is_created_private() -> anyhow::Result<()> {
+        let tmp = private_tempdir()?;
+        let dir = tmp.path().join("sandy").join("trust-roots");
+        sample_root().write(&dir.join("acme.json"))?;
+        let mode = fs::metadata(&dir)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "a created trust-roots dir must be 0700");
         Ok(())
     }
 
