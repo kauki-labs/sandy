@@ -351,6 +351,21 @@ channel — `Channel::join`'s existing rejection, not new logic. The escalation
 channel surviving a down orchestrator is a composition property (a genuinely
 separate `ChannelBackend` instance), not role-level code.
 
+**Load-bearing invariant: one orchestrator channel, one non-orchestrator
+membership, per sandbox.** Spec §3.4 calls the orchestrator channel
+"dedicated, per sandbox" — 1:1, not shared across sandboxes. Two separate
+findings in review (#202's `ChannelAssignment` cap confidentiality, #203's
+stdin misdelivery) both trace back to the same assumption: with exactly one
+non-orchestrator member, a cap or a byte stream posted on that channel is
+readable only by its intended recipient. Neither `Channel` nor the roles
+layer enforces this 1:1-ness — it is a composition-root invariant (#115 must
+mint exactly one orchestrator channel and one non-orchestrator membership per
+sandbox), the same trust boundary as a cap verifying against its issuing
+authority rather than something structurally impossible to violate. Flagged
+to #115's builder and noted on the sandyd epic (#205) for the real
+orchestrator, so this isn't rediscovered as a surprise once a second
+principal could plausibly join an orchestrator channel.
+
 Sequential-then-concurrent correctness: the first cut of `escalate` awaited
 the channel post before even starting the sink notify (caught in review,
 #202) — `ChannelBackend::append` has no timeout contract, and a real

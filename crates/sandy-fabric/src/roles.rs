@@ -30,6 +30,16 @@ pub enum ChannelRole {
 /// `cap`, for `role`. Carried as the JSON payload of a `Control`-typed envelope
 /// on the orchestrator channel (the bootstrap channel itself arrives over the
 /// launch fd, not this message).
+///
+/// `cap`'s confidentiality relies on the orchestrator channel being 1:1 per
+/// sandbox (spec §3.4: "dedicated, per sandbox") — exactly one non-orchestrator
+/// membership, so the cap is readable only by its intended recipient. Neither
+/// `ChannelAssignment` nor `Channel` enforces that 1:1-ness; it's a
+/// composition-root invariant (minting exactly one orchestrator channel and one
+/// non-orchestrator membership per sandbox), the same trust boundary as a cap
+/// verifying against its issuing authority. A composition that lets a second
+/// principal join an orchestrator channel reintroduces the leak this relies on
+/// not happening.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelAssignment {
     /// The channel to join.
