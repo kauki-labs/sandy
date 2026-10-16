@@ -18,6 +18,7 @@ use sandy_api::backend::{BoxState, Outcome, RunSpec};
 use crate::{
     capauth::{Cap, CapAuthority, CapError, CapRights, CapScope},
     channel_backend::{ChannelBackend, ChannelBackendError, Envelope, msg_id},
+    escalation::{EscalationMessage, EscalationSink, EscalationSinkError},
     executor::{Capabilities, Executor, ExecutorError, capabilities_satisfy},
     minter::{MintedSecret, Minter, MinterError, SecretRequest},
     placement::{
@@ -533,6 +534,57 @@ impl TelemetrySink for FakeSink {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(record.clone());
+        }
+        Ok(())
+    }
+}
+
+// ---- EscalationSink ----
+
+/// A fake human-facing backend: keeps every message while enabled, drops them
+/// while disabled. Stands in for "reaches a human" in tests.
+pub struct FakeHumanBackend {
+    /// What `enabled()` reports.
+    pub enabled: bool,
+    /// When set, messages are kept even while disabled (broken).
+    pub ignore_disabled: bool,
+    /// When set, messages are dropped even while enabled (broken).
+    pub lossy: bool,
+    /// Every message kept so far.
+    pub received: Mutex<Vec<EscalationMessage>>,
+}
+
+impl FakeHumanBackend {
+    /// A fresh backend, `enabled` or not.
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            ignore_disabled: false,
+            lossy: false,
+            received: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// How many messages are kept.
+    pub fn captured(&self) -> usize {
+        self.received
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+}
+
+impl EscalationSink for FakeHumanBackend {
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    async fn notify(&self, message: &EscalationMessage) -> Result<(), EscalationSinkError> {
+        if (self.enabled && !self.lossy) || self.ignore_disabled {
+            self.received
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(message.clone());
         }
         Ok(())
     }

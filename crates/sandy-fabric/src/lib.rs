@@ -10,9 +10,9 @@
 //! store-and-forward over links nobody can assume are live:
 //! [`Executor`](executor::Executor), [`ChannelBackend`](channel_backend::ChannelBackend),
 //! [`Transport`](transport::Transport), [`Discovery`](placement::Discovery),
-//! [`Capacity`](placement::Capacity), [`Lifecycle`](placement::Lifecycle) and
-//! [`TelemetrySink`](telemetry::TelemetrySink), plus [`Minter`](minter::Minter),
-//! whose controller-transit impl mints over the network.
+//! [`Capacity`](placement::Capacity), [`Lifecycle`](placement::Lifecycle),
+//! [`TelemetrySink`](telemetry::TelemetrySink) and [`EscalationSink`](escalation::EscalationSink),
+//! plus [`Minter`](minter::Minter), whose controller-transit impl mints over the network.
 //! [`CapAuthority`](capauth::CapAuthority) is sync: verify sits on the hot path of
 //! every join, post and subscribe, and is pure crypto.
 //! [`RawConsole`](raw_console::RawConsole) is also sync: a byte-level break-glass
@@ -20,17 +20,20 @@
 //!
 //! The channel itself is not a seam: it is one concrete abstraction layered over
 //! [`ChannelBackend`](channel_backend::ChannelBackend), carrying `sandy-proto`'s
-//! [`Envelope`](channel_backend::Envelope).
+//! [`Envelope`](channel_backend::Envelope). The three [channel roles](roles) (spec
+//! §3.4) layer over it too, each a thin wrapper an impl crate provides.
 //!
 //! With the `contract-tests` feature, the `contract` module exposes one `*_suite` per seam
 //! that an impl crate runs its implementation against.
 
 pub mod capauth;
 pub mod channel_backend;
+pub mod escalation;
 pub mod executor;
 pub mod minter;
 pub mod placement;
 pub mod raw_console;
+pub mod roles;
 pub mod telemetry;
 pub mod transport;
 pub mod types;

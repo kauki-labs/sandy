@@ -311,3 +311,75 @@ identities, which the local process backend does not (ruled out in favor of the
 out-of-band fd handoff, reaffirming §8's "set aside" on this point). Wiring
 `sandy_api::console::Transport` into `RawConsole` now: no VM-backed agent exists
 yet to wire it to.
+
+## 11. Channel roles are thin wrappers; `EscalationSink` is a new seam
+
+**Status:** accepted.
+
+**Context.** Spec §3.4 names three channel roles (orchestrator, peer-group,
+escalation) over `Channel` (#106). The orchestrator channel also carries the
+optional-telemetry leg (§3.5); the escalation channel needs to survive the
+orchestrator path being the problem.
+
+**Decision.** In `sandy-fabric-local` (`roles.rs`, #113): `OrchestratorRole`,
+`PeerGroupRole`, `EscalationRole` wrap `Channel<B, A>` and add nothing to its
+boundedness, cap verification, or dedup/ordering — they only name the
+operations a given channel is used for.
+
+- `ChannelAssignment { channel_id, cap, role }` (the orchestrator's channel-grow
+  message, a `Control`-typed envelope's payload) lives in `sandy-fabric`
+  itself, not the impl crate: `Channel` is a concrete layering, not a trait, so
+  the payload both #113's role code and #109's agent read has no business
+  depending on either side's crate. JSON-encoded, matching `encode_cap`/
+  `decode_cap`'s own choice for `Cap`, with an explicit `role` tag rather than
+  one inferred from the cap's rights (forward-compatible with a role added
+  later).
+- `OrchestratorRole` implements `TelemetrySink` directly (not the separate
+  `ChannelSink` type §9 anticipated): `LocalFirst::new(log, orchestrator_role)`
+  forwards local records as `Telemetry`-typed envelopes. One fewer type, same
+  shape as every other role operation.
+- `EscalationSink` (`sandy-fabric`, `escalation.rs`) is a new seam mirroring
+  `TelemetrySink` exactly (`enabled()`/`notify()`), with its own contract suite
+  and `FakeHumanBackend`. `EscalationRole::escalate` posts to its own channel
+  AND notifies the sink _concurrently_ (`tokio::join!`), succeeding if either
+  delivers. The channel SHAPE (who posts, who's a member, the `Escalate`
+  marker) is the in-fabric contract; which concrete sink reaches a human
+  (push, IPC, …) is an operator decision, deferred (spec §9).
+
+**Consequences.** A cap scoped to another channel still can't join a role's
+channel — `Channel::join`'s existing rejection, not new logic. The escalation
+channel surviving a down orchestrator is a composition property (a genuinely
+separate `ChannelBackend` instance), not role-level code.
+
+**Load-bearing invariant: one orchestrator channel, one non-orchestrator
+membership, per sandbox.** Spec §3.4 calls the orchestrator channel
+"dedicated, per sandbox" — 1:1, not shared across sandboxes. Two separate
+findings in review (#202's `ChannelAssignment` cap confidentiality, #203's
+stdin misdelivery) both trace back to the same assumption: with exactly one
+non-orchestrator member, a cap or a byte stream posted on that channel is
+readable only by its intended recipient. Neither `Channel` nor the roles
+layer enforces this 1:1-ness — it is a composition-root invariant (#115 must
+mint exactly one orchestrator channel and one non-orchestrator membership per
+sandbox), the same trust boundary as a cap verifying against its issuing
+authority rather than something structurally impossible to violate. Flagged
+to #115's builder and noted on the sandyd epic (#205) for the real
+orchestrator, so this isn't rediscovered as a surprise once a second
+principal could plausibly join an orchestrator channel.
+
+Sequential-then-concurrent correctness: the first cut of `escalate` awaited
+the channel post before even starting the sink notify (caught in review,
+#202) — `ChannelBackend::append` has no timeout contract, and a real
+transport is far more likely to hang on an unreachable orchestrator than to
+error cleanly, so a hang would have silently defeated the sink's redundant
+path. Fixed with `tokio::join!`; proven with a `HangingBackend` (`append`
+never resolves) regression test, confirmed to fail against the prior
+sequential code before the fix landed.
+
+**Set aside.** Bounded escalation: `tokio::join!` only resolves once _both_
+legs finish, so a channel leg that hangs forever still blocks `escalate()`
+itself from returning, even though the sink already delivered — moot for the
+all-local MVP (`InMem` never hangs), real once a vsock/P2P `ChannelBackend`
+lands with no timeout contract of its own. Needs either a per-leg timeout
+(`ChannelBackend` seam change) or return-on-first-delivery semantics; a
+transport-era question, tracked as #207, same bucket as the cross-machine
+transport work.
