@@ -13,8 +13,11 @@
 use std::{
     collections::HashMap,
     pin::Pin,
-    sync::{Arc, Mutex, PoisonError},
-    task::{Context, Poll},
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicU64, Ordering},
+    },
+    task::{Context, Poll, Waker},
 };
 
 use futures_core::Stream;
@@ -84,6 +87,19 @@ fn membership_id(cap: &Cap) -> MembershipId {
     MembershipId(hash_hex(&[&cap.proof]))
 }
 
+/// Per-membership delivery state for a resumable `subscribe()`: which
+/// generation is live, the delivery cursor, and a waker to notify when the
+/// generation changes. `generation` comes from `Channel::next_generation`
+/// (channel-wide monotonic, never reset per membership), so a rejoin after
+/// `leave()` always gets a generation no stale stream from a prior life can
+/// ever match, even when the rejoin reuses the same `MembershipId` (the same
+/// cap re-presented).
+struct MembershipState {
+    generation: u64,
+    cursor: u64,
+    waker: Option<Waker>,
+}
+
 /// Bounded membership + delivery over a [`ChannelBackend`] (spec §3.3). Every
 /// boundedness/dedup/ordering guarantee is enforced here, once, so every backend
 /// inherits it. `B`'s `stream_from` is `'static` by its trait contract, so
@@ -94,7 +110,8 @@ pub struct Channel<B, A> {
     backend: B,
     authority: A,
     members: Mutex<HashMap<MembershipId, Cap>>,
-    cursors: Arc<Mutex<HashMap<MembershipId, u64>>>,
+    sessions: Arc<Mutex<HashMap<MembershipId, MembershipState>>>,
+    next_generation: AtomicU64,
     // An async mutex, not an AtomicU64: sequence assignment and the backend
     // append it labels must land as one atomic unit (held across the .await),
     // or two concurrent posts can make their appends visible out of sequence
@@ -137,7 +154,8 @@ impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
             backend,
             authority,
             members: Mutex::new(HashMap::new()),
-            cursors: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            next_generation: AtomicU64::new(0),
             next_seq: AsyncMutex::new(next),
         })
     }
@@ -148,13 +166,12 @@ impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
     /// a cap that expired or was revoked (#129) since `join` is rejected here,
     /// not trusted from the cache. Closes that gap for every fresh
     /// `post`/`subscribe`/`invite` call. What this does NOT close: a `leave()`
-    /// racing a just-started call still lands it (checked once, not held across
-    /// the call), and an already-open `subscribe()` stream has no checkpoint of
-    /// its own once created — `CursorStream` doesn't call back in here per
-    /// yield, so a stream opened before a revocation keeps delivering after it.
-    /// That's #184 (CWE-613), not step-1 scope for `Channel` alone: it needs a
-    /// generation counter and touches the `ChannelBackend` contract (waking a
-    /// stream on something other than its own appends).
+    /// racing a just-started call still lands it (checked once, not held
+    /// across the call). An already-open `subscribe()` stream DOES have its
+    /// own checkpoint now (`CursorStream`'s generation check, #184) — but only
+    /// against an explicit `leave()`; it does not re-verify against the
+    /// authority, so a cap that organically expires (TTL) while its stream is
+    /// open is not caught by either path. That's #188, not this.
     fn member(&self, membership: &MembershipId) -> Result<Cap, ChannelError> {
         let cap = self
             .members
@@ -186,16 +203,28 @@ impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
         Ok(id)
     }
 
-    /// Remove `membership` and drop its delivery cursor.
+    /// Remove `membership` and end its session. If a `subscribe()` stream is
+    /// currently open for it, this wakes it: the stream re-polls, observes its
+    /// generation no longer matches (the entry is gone), and ends itself
+    /// (`CursorStream`) rather than waiting indefinitely for the backend's next
+    /// append, which may never come (#184). Covers only this explicit call: an
+    /// organically-expiring TTL on an open stream is NOT proactively caught —
+    /// no periodic re-check runs here — tracked separately as #188.
     pub fn leave(&self, membership: &MembershipId) {
         self.members
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(membership);
-        self.cursors
+        if let Some(state) = self
+            .sessions
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(membership);
+            .remove(membership)
+        {
+            if let Some(waker) = state.waker {
+                waker.wake();
+            }
+        }
     }
 
     /// Request an attenuated cap narrowed to `rights`, for a sub-agent that will
@@ -266,23 +295,35 @@ impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
         if !rights.read {
             return Err(ChannelError::InsufficientRights("read"));
         }
-        let from = *self
-            .cursors
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(membership)
-            .unwrap_or(&0);
+        // Reuse the existing session (same generation, resume at its cursor)
+        // if this membership already has one open or recently closed; a fresh
+        // generation is assigned only when there's none — i.e. the first
+        // subscribe ever, or after a `leave()` removed the prior one.
+        let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = sessions.entry(membership.clone()).or_insert_with(|| MembershipState {
+            generation: self.next_generation.fetch_add(1, Ordering::SeqCst),
+            cursor: 0,
+            waker: None,
+        });
+        let generation = state.generation;
+        let from = state.cursor;
+        drop(sessions);
         Ok(CursorStream {
             inner: Box::pin(self.backend.stream_from(from)),
-            cursors: Arc::clone(&self.cursors),
+            sessions: Arc::clone(&self.sessions),
             membership: membership.clone(),
+            generation,
         })
     }
 }
 
-/// Wraps a backend stream to advance the membership's stored cursor as it's read,
-/// so a later `subscribe()` on the same membership resumes where this one left
-/// off rather than from the start.
+/// Wraps a backend stream to advance the membership's stored cursor as it's
+/// read, so a later `subscribe()` on the same membership resumes where this
+/// one left off rather than from the start, and to end itself when `leave()`
+/// invalidates its generation (#184) — explicit `leave()` only: an
+/// organically-expiring TTL on an already-open stream is NOT proactively
+/// caught, no periodic re-check runs here; that's #188, and `member()`'s doc
+/// comment carries the same caveat for the per-call path.
 ///
 /// Accepted step-1 simplification: the cursor advances on yield (`poll_next`
 /// returning `Ready`), before the consumer has actually acted on the envelope.
@@ -291,14 +332,15 @@ impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
 /// at-least-once the spec wants for the offline/reconnect case. True
 /// at-least-once needs a consumer-ack'd or consumer-managed cursor instead of
 /// one the backend advances on delivery; tracked as #186, not fixed here.
-///
-/// Also doesn't re-check membership per yield: once created, it keeps polling
-/// the backend regardless of a later `leave()`/revocation/expiry — see
-/// `member()`'s doc comment and #184 (CWE-613).
 struct CursorStream {
     inner: Pin<Box<dyn Stream<Item = Result<Envelope, ChannelBackendError>> + Send>>,
-    cursors: Arc<Mutex<HashMap<MembershipId, u64>>>,
+    sessions: Arc<Mutex<HashMap<MembershipId, MembershipState>>>,
     membership: MembershipId,
+    /// The generation this stream was created (or last confirmed current)
+    /// under. Compared against `sessions`' live value on every poll; a
+    /// mismatch (including the entry being gone entirely) means `leave()`
+    /// happened, and this stream ends rather than continuing to deliver.
+    generation: u64,
 }
 
 impl Stream for CursorStream {
@@ -306,14 +348,48 @@ impl Stream for CursorStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        let next = this.inner.as_mut().poll_next(cx);
-        if let Poll::Ready(Some(Ok(ref env))) = next {
-            this.cursors
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(this.membership.clone(), env.sequence + 1);
+
+        // Still current? Checked before polling the backend at all: no point
+        // fetching an envelope for a membership that's already gone.
+        {
+            let sessions = this.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+            match sessions.get(&this.membership) {
+                Some(state) if state.generation == this.generation => {}
+                _ => return Poll::Ready(None),
+            }
         }
-        next
+
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(env))) => {
+                let mut sessions = this.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+                match sessions.get_mut(&this.membership) {
+                    Some(state) if state.generation == this.generation => {
+                        state.cursor = env.sequence + 1;
+                        Poll::Ready(Some(Ok(env)))
+                    }
+                    // Revoked between the check above and the backend's
+                    // yield: discard rather than deliver past the end.
+                    _ => Poll::Ready(None),
+                }
+            }
+            Poll::Pending => {
+                // Stash our own waker: the backend's own stream only wakes on
+                // its next append (see ChannelBackend::stream_from), which may
+                // never come. leave() wakes THIS one directly, so the stream
+                // re-polls and hits the generation check above even when
+                // nothing is ever posted again.
+                if let Some(state) = this
+                    .sessions
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get_mut(&this.membership)
+                {
+                    state.waker = Some(cx.waker().clone());
+                }
+                Poll::Pending
+            }
+            other => other,
+        }
     }
 }
 
@@ -743,6 +819,81 @@ mod tests {
             [b"a".to_vec(), b"b".to_vec()],
             "both concurrent posts arrive, none lost"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn leaving_ends_an_already_open_subscribe_stream() -> anyhow::Result<()> {
+        let (channel, _backend, id, authority) = new_channel().await?;
+        let channel = Arc::new(channel);
+        let member = channel.join(&mint(&authority, "p1", &id, full(), Some(later())))?;
+
+        // A genuinely separate spawned task, not a sibling branch of one
+        // `join!` — tokio only re-polls a parked task when ITS OWN waker
+        // fires, so this is the shape that actually proves `leave()`'s
+        // `waker.wake()` call matters: nothing else in this test ever touches
+        // this task, so if the wake call were silently dropped, it would stay
+        // parked forever and the `.await` below would hang until the outer
+        // timeout, rather than being incidentally re-polled by unrelated
+        // activity (which a same-task `join!` would do regardless).
+        let watch_channel = Arc::clone(&channel);
+        let watch_member = member.clone();
+        let watcher = tokio::spawn(async move {
+            let mut stream = Box::pin(watch_channel.subscribe(&watch_member)?);
+            Ok::<_, ChannelError>(stream.next().await)
+        });
+
+        // Nothing is posted, so the spawned task's first poll parks Pending
+        // and stashes its waker; this sleep just gives the executor a chance
+        // to actually run that poll before leave() fires.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        channel.leave(&member);
+
+        let ended = tokio::time::timeout(Duration::from_secs(2), watcher)
+            .await
+            .context("leave() did not wake the open stream within the deadline")?
+            .context("watcher task panicked")?
+            .context("watcher stream errored")?;
+
+        assert!(
+            ended.is_none(),
+            "the stream must end, not keep delivering, after leave()"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_rejoin_after_leave_gets_a_fresh_generation_unaffected_by_the_old_stream() -> anyhow::Result<()> {
+        let (channel, _backend, id, authority) = new_channel().await?;
+        let cap = mint(&authority, "p1", &id, full(), Some(later()));
+        let member = channel.join(&cap)?;
+        let mut old_stream = Box::pin(channel.subscribe(&member)?);
+
+        channel.leave(&member);
+        // TestAuthority is deterministic (no nonce), so re-minting the
+        // identical scope reproduces the identical proof — this rejoin
+        // reuses the SAME MembershipId, the exact case a generation counter
+        // (vs. just removing the map entry) is for.
+        let rejoined = channel.join(&cap)?;
+        assert_eq!(
+            rejoined, member,
+            "same cap, same membership id, deterministic authority"
+        );
+
+        let ended = tokio::time::timeout(Duration::from_secs(2), old_stream.next())
+            .await
+            .context("the pre-leave stream did not end")?;
+        assert!(
+            ended.is_none(),
+            "a stream from before the leave must not pick up the rejoined session"
+        );
+
+        channel
+            .post(&rejoined, None, "text/plain", b"after-rejoin".to_vec())
+            .await
+            .context("post after rejoin")?;
+        let mut new_stream = Box::pin(channel.subscribe(&rejoined)?);
+        assert_eq!(next(&mut new_stream).await.payload, b"after-rejoin");
         Ok(())
     }
 
