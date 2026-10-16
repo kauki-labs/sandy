@@ -311,6 +311,38 @@ mod tests {
         Ok(())
     }
 
+    /// A wide trust-roots dir is refused before capture, so register never creates
+    /// a forge App whose key it then cannot save.
+    #[test]
+    fn register_refuses_a_wide_trust_dir_before_creating_anything() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = private_tempdir()?;
+        let key = tmp.path().join("key.pem");
+        let wide = tmp.path().join("trust-roots");
+        std::fs::create_dir(&wide)?;
+        std::fs::set_permissions(&wide, std::fs::Permissions::from_mode(0o775))?;
+        let cfg = wide.join("root.json");
+
+        for skip_verify in [false, true] {
+            let provisioner = FakeProvisioner::new(github_root(&key));
+            let result = if skip_verify {
+                register_skip_verify(&provisioner, &[Capability::WriteCode], &cfg)
+            } else {
+                register(&provisioner, &[Capability::WriteCode], &cfg)
+            };
+            let err = result.expect_err("a wide trust-roots dir must be refused");
+            assert!(
+                err.to_string().contains("not private"),
+                "skip_verify={skip_verify}: {err}"
+            );
+            assert!(
+                !key.exists(),
+                "skip_verify={skip_verify}: capture must not run, so no App is created and no secret is staged"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn register_skip_verify_writes_the_config_without_running_verify() -> anyhow::Result<()> {
         // A fake whose verify would FAIL; --skip-verify must still succeed, because
