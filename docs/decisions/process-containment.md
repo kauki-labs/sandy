@@ -159,8 +159,9 @@ nonzero guest exit (INV-11). Sharing the literal argv builder, not a duplicated
 flag list, closes the whole parity class by construction (caught by sandy-b6's
 adversarial pass).
 
-**Consequences.** Write-confinement (a job cannot alter a read-only share or the host
-fs), path fidelity (same `/run/sandy/...` as the VM), and bus isolation (no
+**Consequences.** Write-confinement (a job cannot alter the read-only host-root bind
+or a read-only share; the designated writable output share stays writable, by
+design), path fidelity (same `/run/sandy/...` as the VM), and bus isolation (no
 `systemd-run --user` escape from inside the namespace) — real hardening for the
 semi-trusted/cooperative case. It does NOT make the backend untrusted-safe: under A1
 the job can still READ the whole host filesystem (`~/.ssh`, operator secrets) and the
