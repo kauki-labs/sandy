@@ -14,6 +14,21 @@
 //! the first place — the agent inherits the channel's own boundedness rather
 //! than re-checking it.
 //!
+//! Two invariants this module relies on without re-checking, both load-bearing
+//! for CWE-284 (authorization bypass):
+//!
+//! - **One channel per sandbox.** Spec §3.4: the orchestrator channel is "dedicated, per sandbox" — a 1:1 relationship.
+//!   `SandboxAgent` does not, and cannot, verify that the `Channel` it was handed is really ITS OWN dedicated channel
+//!   rather than one shared with another sandbox: nothing in an [`Envelope`](sandy_fabric::channel_backend::Envelope)
+//!   carries a sandbox target to check against. Minting one channel id per sandbox is the composition root's job
+//!   (#115/sandyd), not this module's; a composition root that reuses one channel across sandboxes lets every agent on
+//!   it receive every other's `TTY_STDIN` traffic.
+//! - **One job per bootstrap.** [`SandboxAgent::serve_tty`] is call-once, enforced structurally (a second call is a
+//!   hard [`AgentError::AlreadyServed`], not a silent stale delivery): the per-membership delivery cursor
+//!   ([`Channel::subscribe`]'s reconnect value) lives WITHIN one `serve_tty` session, not across sessions, so a second
+//!   call on the same membership could otherwise deliver a stdin frame that arrived for the first job's session into a
+//!   second job's stdin.
+//!
 //! [`UnavailableConsole`] is the process backend's honest
 //! [`RawConsole`](sandy_fabric::raw_console::RawConsole) stub: a bare process has
 //! no serial console to break glass to, so it reports
@@ -62,6 +77,13 @@ pub enum AgentError {
     /// The job's stdio faulted while bridging TTY traffic.
     #[error("TTY stdio: {0}")]
     Stdio(#[source] std::io::Error),
+    /// [`SandboxAgent::serve_tty`] was called more than once on this agent.
+    /// Structural, not a doc-comment convention: a second call could otherwise
+    /// deliver a stdin frame queued for the first job's session into a second
+    /// job's stdin (CWE-284), since the per-membership delivery cursor persists
+    /// across calls.
+    #[error("serve_tty already called on this agent; one job per bootstrap")]
+    AlreadyServed,
 }
 
 /// The per-sandbox gateway: holds the orchestrator-channel membership this
@@ -75,6 +97,9 @@ pub enum AgentError {
 pub struct SandboxAgent<B, A> {
     channel: Arc<Channel<B, A>>,
     membership: MembershipId,
+    /// Set by [`serve_tty`](Self::serve_tty) on its one allowed call. See the
+    /// module doc's "one job per bootstrap" invariant.
+    served: std::sync::atomic::AtomicBool,
 }
 
 impl<B: ChannelBackend + 'static, A: CapAuthority + 'static> SandboxAgent<B, A> {
@@ -95,7 +120,11 @@ impl<B: ChannelBackend + 'static, A: CapAuthority + 'static> SandboxAgent<B, A> 
         drop(cap_handoff);
         let cap = decode_cap(&bytes)?;
         let membership = channel.join(&cap)?;
-        Ok(Self { channel, membership })
+        Ok(Self {
+            channel,
+            membership,
+            served: std::sync::atomic::AtomicBool::new(false),
+        })
     }
 
     /// This sandbox's membership on its orchestrator channel.
@@ -114,15 +143,30 @@ impl<B: ChannelBackend + 'static, A: CapAuthority + 'static> SandboxAgent<B, A> 
     /// stdout but leaks stderr open would otherwise never let this return).
     ///
     /// # Errors
-    /// [`AgentError::Channel`] if this membership can no longer subscribe (e.g.
-    /// revoked since `bootstrap`); [`AgentError::Stdio`] if reading `job_stdout`
-    /// faults; whatever [`Channel::post`] returns if a stdout post itself fails.
+    /// [`AgentError::AlreadyServed`] if this is not the first call (see the
+    /// module doc's "one job per bootstrap" invariant); [`AgentError::Channel`]
+    /// if this membership can no longer subscribe (e.g. revoked since
+    /// `bootstrap`); [`AgentError::Stdio`] if reading `job_stdout` faults;
+    /// whatever [`Channel::post`] returns if a stdout post itself fails.
     pub async fn serve_tty(
         &self,
         mut job_stdout: impl AsyncRead + Unpin + Send + 'static,
         job_stderr: impl AsyncRead + Unpin + Send + 'static,
         mut job_stdin: impl AsyncWrite + Unpin + Send + 'static,
     ) -> Result<(), AgentError> {
+        if self
+            .served
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return Err(AgentError::AlreadyServed);
+        }
+
         let inbound_stream = self.channel.subscribe(&self.membership)?;
         let inbound = tokio::spawn(async move {
             let mut inbound_stream = std::pin::pin!(inbound_stream);
@@ -434,6 +478,34 @@ mod tests {
         job_stdout_test.shutdown().await?;
         job_stderr_test.shutdown().await?;
         timeout(TokioDuration::from_secs(5), serving).await???;
+        Ok(())
+    }
+
+    /// Adversarial (#109, CWE-284): a second `serve_tty` call on the same
+    /// agent is a hard error, not a silent stale-stdin delivery into a new
+    /// job. The delivery cursor's reconnect value lives within one session;
+    /// without this guard a frame queued for the first job could land in a
+    /// second job's stdin.
+    #[tokio::test]
+    async fn serve_tty_is_call_once() -> anyhow::Result<()> {
+        let (channel, agent_cap, _) = new_channel_and_caps().await?;
+        let agent = SandboxAgent::bootstrap(Arc::clone(&channel), Cursor::new(encode_cap(&agent_cap)?))?;
+
+        let (stdout_agent, stdout_test) = tokio::io::duplex(1024);
+        let (stderr_agent, stderr_test) = tokio::io::duplex(1024);
+        let (stdin_agent, _stdin_test) = tokio::io::duplex(1024);
+        drop(stdout_test); // EOFs stdout_agent immediately: the first call returns fast
+        drop(stderr_test);
+        agent.serve_tty(stdout_agent, stderr_agent, stdin_agent).await?;
+
+        let (stdout_agent, _) = tokio::io::duplex(1024);
+        let (stderr_agent, _) = tokio::io::duplex(1024);
+        let (stdin_agent, _) = tokio::io::duplex(1024);
+        let err = agent
+            .serve_tty(stdout_agent, stderr_agent, stdin_agent)
+            .await
+            .expect_err("a second serve_tty call must be refused");
+        assert!(matches!(err, AgentError::AlreadyServed), "got {err:?}");
         Ok(())
     }
 
