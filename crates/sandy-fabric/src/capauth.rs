@@ -85,3 +85,65 @@ pub trait CapAuthority: Send + Sync {
     /// when `rights` is not a subset of the parent's.
     fn attenuate(&self, parent: &Cap, rights: CapRights) -> Result<Cap, CapError>;
 }
+
+/// A capability could not be encoded or decoded.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("malformed capability encoding: {0}")]
+pub struct CapCodecError(String);
+
+/// Encode `cap` for handoff: the bytes one side writes and [`decode_cap`] reads,
+/// for example over the consume-once pipe that carries the bootstrap cap from the
+/// executor to the agent (#108, #109).
+pub fn encode_cap(cap: &Cap) -> Result<Vec<u8>, CapCodecError> {
+    let _ = cap;
+    Err(CapCodecError("not implemented".to_owned()))
+}
+
+/// Decode bytes written by [`encode_cap`].
+///
+/// This parses; it does not verify. A decoded cap is only a claim until
+/// [`CapAuthority::verify`] accepts it.
+pub fn decode_cap(bytes: &[u8]) -> Result<Cap, CapCodecError> {
+    let _ = bytes;
+    Err(CapCodecError("not implemented".to_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cap() -> Cap {
+        Cap {
+            scope: CapScope {
+                peer: "agent".into(),
+                channel: "orchestrator".into(),
+                rights: CapRights {
+                    post: true,
+                    read: true,
+                    invite: false,
+                },
+                expires_at: Some(4_102_444_800),
+            },
+            proof: vec![0xc0, 0xff, 0xee],
+        }
+    }
+
+    #[test]
+    fn a_cap_round_trips_through_its_encoding() -> Result<(), CapCodecError> {
+        let encoded = encode_cap(&cap())?;
+        assert_eq!(decode_cap(&encoded)?, cap());
+        Ok(())
+    }
+
+    #[test]
+    fn truncated_or_foreign_bytes_do_not_decode() -> Result<(), CapCodecError> {
+        let encoded = encode_cap(&cap())?;
+        assert!(
+            decode_cap(&encoded[..encoded.len() / 2]).is_err(),
+            "a truncated cap decoded"
+        );
+        assert!(decode_cap(b"").is_err(), "an empty handoff decoded");
+        assert!(decode_cap(b"{\"scope\":{}}").is_err(), "a cap without a proof decoded");
+        Ok(())
+    }
+}
