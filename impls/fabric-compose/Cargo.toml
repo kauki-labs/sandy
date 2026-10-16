@@ -1,0 +1,36 @@
+[package]
+name = "sandy-fabric-compose"
+description = "The agent-fabric composition root: the all-local MVP profile and its e2e acceptance (issue #115)"
+version.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+documentation = "https://docs.rs/sandy-fabric-compose"
+keywords = ["sandbox", "agent", "fabric", "compose"]
+categories = ["development-tools"]
+
+[lib]
+crate-type = ["rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# contract-tests: validate_profile calls the suite functions directly (not
+# just fakes), so the feature is a regular dependency, not a dev-only
+# override. The concrete fakes it gates stay out of this crate's production
+# code regardless (see src/lib.rs's module doc) — only tests/ uses them.
+sandy-fabric = { workspace = true, features = ["contract-tests"] }
+# deadline() (validate_profile's suite-wait timeout) is production code.
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+anyhow.workspace = true
+sandy-api.workspace = true
+sandy-backend.workspace = true
+sandy-fabric-local.workspace = true
+tempfile.workspace = true
