@@ -23,12 +23,15 @@ nothing about the VM, remote, or P2P impls that replace it.
 mirroring `sandy-api`. The `contract` module (feature `contract-tests`) has one
 generic `*_suite` per seam; an impl crate passes its impl through a factory and
 gets `Err(ContractViolation)` naming the broken rule. In-crate, a reference fake
-per seam must pass, and a deliberately broken fake per rule must fail on that
-rule, so no suite is a no-op.
+per seam must pass, and deliberately broken fakes (at least one per seam, one per
+security-relevant rule) must fail on the rule they break, so no suite is a no-op.
 
 **Consequences.** Impls live in their own blocks and cannot weaken the contract
 locally. A suite cannot check what it cannot observe, so some suites take extra
-inputs: the executor's true `Capabilities` and a telemetry `captured` count.
+inputs: the executor's true `Capabilities` and a bootable template, a telemetry
+`captured` count, and a deadline for stream waits. The suites assume
+read-your-writes, the step-1 contract; an eventually consistent impl settles
+before returning or brings a settle step to the suite when it lands.
 
 **Set aside.** Per-impl ad-hoc tests: they drift apart, and a trivial impl
 passing its own tests says nothing about a real one.
@@ -63,12 +66,13 @@ when the text/chat backend lands.
 **Decision.** No `Channel` trait. The channel is one concrete
 `Channel<B: ChannelBackend>` (#106) that layers membership, cap checks,
 sequencing, and the content id on top, once. `ChannelBackend` is a dumb,
-content-addressed log: idempotent `append` on the content id, `fetch` in `seq`
-order for `seq >= from_seq` whatever the arrival order, and `stream_from`, which
-replays and then follows as one primitive.
+content-addressed log: idempotent `append` on the content id (keeping the first),
+`fetch` in `sequence` order for `sequence >= from_seq` whatever the arrival order,
+and `stream_from`, which replays and then follows as one primitive.
 
-**Consequences.** Every backend inherits dedup and gap-free resubscription,
-because the suite checks both, including a stream opened before an append.
+**Consequences.** Every backend inherits dedup and gap-free resubscription at a
+cursor, because the suite checks both, including a stream opened before an append.
+Whether a late envelope below a stream's cursor is emitted live is open (#162).
 
 **Set aside.** A fetch-then-subscribe composition: it has a window where a
 message lands between the two and is missed.
@@ -84,8 +88,9 @@ live (spec §1). The existing `VmBackend` is sync.
 `Discovery`, `Capacity`, `Lifecycle`, `TelemetrySink`) are async and `Send`,
 written as `fn … -> impl Future<Output = …> + Send` (bare `async fn` in a public
 trait trips `async_fn_in_trait` under deny-warnings). `CapAuthority` and `Minter`
-are CPU-bound and sync. Suites are runtime-agnostic and never await an envelope
-that is not already stored, so a broken stream fails instead of hanging.
+are CPU-bound and sync, and `Send + Sync` like the rest. Suites are
+runtime-agnostic; a stream wait races a caller-supplied deadline, so a broken
+stream fails instead of hanging and an I/O-backed one gets time to deliver.
 
 **Consequences.** Real transports and remote executors land without a trait
 rewrite. Static dispatch by default; a composition root that needs `dyn` boxes at

@@ -1,11 +1,14 @@
 //! The harness proves itself: each reference impl passes its suite (positive), and
-//! each deliberately broken impl fails it (adversarial), so no suite is a no-op.
+//! each deliberately broken impl fails it on the rule it breaks (adversarial), so
+//! no suite is a no-op.
+
+use std::time::Duration;
 
 use anyhow::Context;
 
 use super::{
-    capacity_suite, capauth_suite, channel_backend_suite, discovery_suite, executor_suite, fakes::*, lifecycle_suite,
-    minter_suite, telemetry_suite, transport_suite,
+    ContractViolation, capacity_suite, capauth_suite, channel_backend_suite, discovery_suite, executor_suite, fakes::*,
+    lifecycle_suite, minter_suite, telemetry_suite, transport_suite,
 };
 use crate::{
     executor::{Arch, Capabilities, SandboxKind},
@@ -14,7 +17,7 @@ use crate::{
 
 /// Assert `res` failed on the rule containing `fragment`, not on some other rule.
 #[track_caller]
-fn assert_violates(res: Result<(), super::ContractViolation>, fragment: &str) {
+fn assert_violates(res: Result<(), ContractViolation>, fragment: &str) {
     match res {
         Err(v) => assert!(
             v.rule.contains(fragment),
@@ -31,6 +34,12 @@ const PROCESS: Capabilities = Capabilities {
     attestation: None,
 };
 
+fn deadline() -> tokio::time::Sleep {
+    tokio::time::sleep(Duration::from_secs(2))
+}
+
+// ---- CapAuthority ----
+
 #[test]
 fn capauth_reference_passes() -> anyhow::Result<()> {
     capauth_suite(FakeAuthority::new).context("reference authority")
@@ -45,6 +54,26 @@ fn capauth_suite_rejects_an_authority_that_does_not_attenuate() {
 }
 
 #[test]
+fn capauth_suite_rejects_a_proof_that_does_not_cover_rights() {
+    let make = || FakeAuthority {
+        blind_to_rights: true,
+        ..FakeAuthority::default()
+    };
+    assert_violates(capauth_suite(make), "rights edited");
+}
+
+#[test]
+fn capauth_suite_rejects_attenuating_an_unverified_parent() {
+    let make = || FakeAuthority {
+        trusts_parent: true,
+        ..FakeAuthority::default()
+    };
+    assert_violates(capauth_suite(make), "tampered parent");
+}
+
+// ---- Minter ----
+
+#[test]
 fn minter_reference_passes() -> anyhow::Result<()> {
     minter_suite(FakeMinter::new).context("reference minter")
 }
@@ -54,9 +83,11 @@ fn minter_suite_rejects_a_constant_secret() {
     assert_violates(minter_suite(|| ConstantMinter), "two mints for one job differ");
 }
 
+// ---- ChannelBackend ----
+
 #[tokio::test]
 async fn channel_backend_reference_passes() -> anyhow::Result<()> {
-    channel_backend_suite(FakeBackend::default)
+    channel_backend_suite(FakeBackend::default, deadline)
         .await
         .context("reference backend")
 }
@@ -64,10 +95,30 @@ async fn channel_backend_reference_passes() -> anyhow::Result<()> {
 #[tokio::test]
 async fn channel_backend_suite_rejects_a_snapshot_stream() {
     assert_violates(
-        channel_backend_suite(SnapshotBackend::default).await,
+        channel_backend_suite(SnapshotBackend::default, deadline).await,
         "follows an append",
     );
 }
+
+#[tokio::test]
+async fn channel_backend_suite_rejects_arrival_order_fetches() {
+    let make = || FakeBackend {
+        arrival_order: true,
+        ..FakeBackend::default()
+    };
+    assert_violates(channel_backend_suite(make, deadline).await, "sequence order");
+}
+
+#[tokio::test]
+async fn channel_backend_suite_rejects_dedup_on_sequence() {
+    let make = || FakeBackend {
+        dedup_on_sequence: true,
+        ..FakeBackend::default()
+    };
+    assert_violates(channel_backend_suite(make, deadline).await, "keeps the first");
+}
+
+// ---- Transport ----
 
 #[tokio::test]
 async fn transport_reference_passes() -> anyhow::Result<()> {
@@ -84,13 +135,17 @@ async fn transport_suite_rejects_dropping_frames_for_offline_peers() {
     );
 }
 
+// ---- Executor ----
+
 #[tokio::test]
 async fn executor_reference_passes() -> anyhow::Result<()> {
     let make = || FakeExecutor {
         caps: PROCESS,
         collapse_failures: false,
     };
-    executor_suite(PROCESS, make).await.context("reference executor")
+    executor_suite(PROCESS, "contract", make)
+        .await
+        .context("reference executor")
 }
 
 #[tokio::test]
@@ -103,7 +158,7 @@ async fn executor_suite_rejects_a_false_capability_claim() {
         collapse_failures: false,
     };
     assert_violates(
-        executor_suite(PROCESS, make).await,
+        executor_suite(PROCESS, "contract", make).await,
         "reports what the executor provides",
     );
 }
@@ -114,8 +169,13 @@ async fn executor_suite_rejects_a_task_failure_reported_as_an_infra_fault() {
         caps: PROCESS,
         collapse_failures: true,
     };
-    assert_violates(executor_suite(PROCESS, make).await, "task failure, not an infra fault");
+    assert_violates(
+        executor_suite(PROCESS, "contract", make).await,
+        "task failure, not an infra fault",
+    );
 }
+
+// ---- Discovery ----
 
 #[tokio::test]
 async fn discovery_reference_passes() -> anyhow::Result<()> {
@@ -133,6 +193,8 @@ async fn discovery_suite_rejects_ignoring_requirements() {
     assert_violates(discovery_suite(make).await, "matches on kind");
 }
 
+// ---- Capacity ----
+
 #[tokio::test]
 async fn capacity_reference_passes() -> anyhow::Result<()> {
     let host = HostId::from("h1");
@@ -142,14 +204,26 @@ async fn capacity_reference_passes() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn capacity_suite_rejects_a_leaky_probe() {
+async fn capacity_suite_rejects_a_probe_that_reserves() {
     let host = HostId::from("h1");
     let make = || FakeCapacity {
-        leaky: true,
+        reserving: true,
         ..FakeCapacity::new(host.clone(), 2)
     };
     assert_violates(capacity_suite(host.clone(), make).await, "reserves nothing");
 }
+
+#[tokio::test]
+async fn capacity_suite_rejects_capacity_for_an_unknown_host() {
+    let host = HostId::from("h1");
+    let make = || FakeCapacity {
+        phantom: true,
+        ..FakeCapacity::new(host.clone(), 2)
+    };
+    assert_violates(capacity_suite(host.clone(), make).await, "unknown host");
+}
+
+// ---- Lifecycle ----
 
 #[tokio::test]
 async fn lifecycle_reference_passes() -> anyhow::Result<()> {
@@ -164,8 +238,10 @@ async fn lifecycle_suite_rejects_accepting_unknown_leases() {
         accept_any: true,
         ..FakeLifecycle::default()
     };
-    assert_violates(lifecycle_suite(make).await, "never issued");
+    assert_violates(lifecycle_suite(make).await, "wrong host");
 }
+
+// ---- TelemetrySink ----
 
 #[tokio::test]
 async fn telemetry_reference_passes() -> anyhow::Result<()> {
@@ -183,5 +259,17 @@ async fn telemetry_suite_rejects_recording_while_disabled() {
     assert_violates(
         telemetry_suite(|| FakeSink::new(true), disabled, FakeSink::captured).await,
         "a disabled sink keeps nothing",
+    );
+}
+
+#[tokio::test]
+async fn telemetry_suite_rejects_dropping_records_while_enabled() {
+    let lossy = || FakeSink {
+        lossy: true,
+        ..FakeSink::new(true)
+    };
+    assert_violates(
+        telemetry_suite(lossy, || FakeSink::new(false), FakeSink::captured).await,
+        "an enabled sink keeps every record",
     );
 }

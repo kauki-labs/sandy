@@ -34,7 +34,7 @@ pub enum MinterError {
 }
 
 /// Mints job work-secrets. Every mint is fresh: no two calls return the same bytes.
-pub trait Minter {
+pub trait Minter: Send + Sync {
     /// Mint a new work-secret for `req`.
     fn mint(&self, req: &SecretRequest) -> Result<MintedSecret, MinterError>;
 }

@@ -32,19 +32,26 @@ use crate::{
 // ---- CapAuthority ----
 
 /// Proof = a keyed hash of the scope. Not cryptography; enough to detect tampering.
+#[derive(Default)]
 pub struct FakeAuthority {
-    key: u64,
+    /// When set, the proof does not cover the rights (broken: rights can be edited).
+    pub blind_to_rights: bool,
+    /// When set, `attenuate` trusts the parent's claimed scope unverified (broken).
+    pub trusts_parent: bool,
 }
 
 impl FakeAuthority {
     pub fn new() -> Self {
-        Self { key: 0x5eed }
+        Self::default()
     }
 
     fn proof(&self, scope: &CapScope) -> Vec<u8> {
         let mut h = DefaultHasher::new();
-        self.key.hash(&mut h);
-        format!("{scope:?}").hash(&mut h);
+        0x5eed_u64.hash(&mut h);
+        (&scope.peer, &scope.channel, scope.expires_at).hash(&mut h);
+        if !self.blind_to_rights {
+            (scope.rights.post, scope.rights.read, scope.rights.invite).hash(&mut h);
+        }
         h.finish().to_be_bytes().to_vec()
     }
 }
@@ -56,15 +63,24 @@ impl CapAuthority for FakeAuthority {
     }
 
     fn verify(&self, cap: &Cap) -> Result<CapScope, CapError> {
-        if cap.proof == self.proof(&cap.scope) {
-            Ok(cap.scope.clone())
-        } else {
-            Err(CapError::Forged)
+        if cap.proof != self.proof(&cap.scope) {
+            return Err(CapError::Forged);
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        match cap.scope.expires_at {
+            Some(t) if t <= now => Err(CapError::Expired),
+            _ => Ok(cap.scope.clone()),
         }
     }
 
     fn attenuate(&self, parent: &Cap, rights: CapRights) -> Result<Cap, CapError> {
-        let scope = self.verify(parent)?;
+        let scope = if self.trusts_parent {
+            parent.scope.clone()
+        } else {
+            self.verify(parent)?
+        };
         if !rights.is_subset_of(&scope.rights) {
             return Err(CapError::Widened);
         }
@@ -126,7 +142,7 @@ impl Minter for ConstantMinter {
 // ---- ChannelBackend ----
 
 #[derive(Default)]
-struct LogInner {
+pub struct LogInner {
     log: Vec<Envelope>,
     wakers: Vec<Waker>,
 }
@@ -134,7 +150,11 @@ struct LogInner {
 /// An in-memory log, sorted by sequence, deduped on msg_id, waking followers on append.
 #[derive(Default, Clone)]
 pub struct FakeBackend {
-    inner: Arc<Mutex<LogInner>>,
+    pub inner: Arc<Mutex<LogInner>>,
+    /// When set, dedup keys on `sequence` instead of the msg_id (broken).
+    pub dedup_on_sequence: bool,
+    /// When set, entries stay in arrival order (broken).
+    pub arrival_order: bool,
 }
 
 impl FakeBackend {
@@ -147,10 +167,19 @@ impl ChannelBackend for FakeBackend {
     async fn append(&self, env: Envelope) -> Result<(), ChannelBackendError> {
         let id = msg_id(&env).ok_or(ChannelBackendError::MissingMsgId)?.to_owned();
         let mut inner = self.lock();
-        if inner.log.iter().any(|e| msg_id(e) == Some(id.as_str())) {
+        let duplicate = if self.dedup_on_sequence {
+            inner.log.iter().any(|e| e.sequence == env.sequence)
+        } else {
+            inner.log.iter().any(|e| msg_id(e) == Some(id.as_str()))
+        };
+        if duplicate {
             return Ok(());
         }
-        let at = inner.log.partition_point(|e| e.sequence <= env.sequence);
+        let at = if self.arrival_order {
+            inner.log.len()
+        } else {
+            inner.log.partition_point(|e| e.sequence <= env.sequence)
+        };
         inner.log.insert(at, env);
         for waker in inner.wakers.drain(..) {
             waker.wake();
@@ -353,15 +382,18 @@ impl Discovery for FakeDiscovery {
 
 pub struct FakeCapacity {
     pub slots: Mutex<HashMap<HostId, u32>>,
-    /// When set, a probe reserves a slot and unknown hosts report free capacity (broken).
-    pub leaky: bool,
+    /// When set, a probe reserves a slot (broken).
+    pub reserving: bool,
+    /// When set, an unknown host reports spare capacity (broken).
+    pub phantom: bool,
 }
 
 impl FakeCapacity {
     pub fn new(host: HostId, slots: u32) -> Self {
         Self {
             slots: Mutex::new(HashMap::from([(host, slots)])),
-            leaky: false,
+            reserving: false,
+            phantom: false,
         }
     }
 }
@@ -372,12 +404,12 @@ impl Capacity for FakeCapacity {
         match slots.get_mut(host) {
             Some(free) => {
                 let available = Availability { free_slots: *free };
-                if self.leaky {
+                if self.reserving {
                     *free = free.saturating_sub(1);
                 }
                 Ok(available)
             }
-            None if self.leaky => Ok(Availability { free_slots: 1 }),
+            None if self.phantom => Ok(Availability { free_slots: 1 }),
             None => Err(CapacityError::UnknownHost(host.clone())),
         }
     }
@@ -440,6 +472,8 @@ pub struct FakeSink {
     pub enabled: bool,
     /// When set, records are kept even while disabled (broken).
     pub ignore_disabled: bool,
+    /// When set, records are dropped even while enabled (broken).
+    pub lossy: bool,
     pub records: Mutex<Vec<TelemetryRecord>>,
 }
 
@@ -448,6 +482,7 @@ impl FakeSink {
         Self {
             enabled,
             ignore_disabled: false,
+            lossy: false,
             records: Mutex::new(Vec::new()),
         }
     }
@@ -466,7 +501,7 @@ impl TelemetrySink for FakeSink {
     }
 
     async fn emit(&self, record: &TelemetryRecord) -> Result<(), TelemetryError> {
-        if self.enabled || self.ignore_disabled {
+        if (self.enabled && !self.lossy) || self.ignore_disabled {
             self.records
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)

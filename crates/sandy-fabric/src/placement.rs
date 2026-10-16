@@ -11,13 +11,15 @@
 
 use std::future::Future;
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
     executor::{Capabilities, Requirements},
     types::HostId,
 };
 
 /// A host and the sandboxes it advertises.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostDescriptor {
     /// The host.
     pub host: HostId,
@@ -75,7 +77,7 @@ pub trait Capacity: Send + Sync {
 }
 
 /// A host's registration, kept alive by heartbeats until its TTL lapses.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Lease {
     /// The leased host.
     pub host: HostId,

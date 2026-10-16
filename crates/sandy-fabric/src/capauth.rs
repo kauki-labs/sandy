@@ -70,7 +70,7 @@ pub enum CapError {
 }
 
 /// Signs, verifies and attenuates channel capabilities.
-pub trait CapAuthority {
+pub trait CapAuthority: Send + Sync {
     /// Mint a capability for `scope`.
     fn mint(&self, scope: CapScope) -> Result<Cap, CapError>;
     /// Verify `cap` and return the scope it actually authorizes.

@@ -49,6 +49,8 @@ pub trait ChannelBackend: Send + Sync {
     /// Replay the stored envelopes with `sequence >= from_seq` in order, then follow
     /// live appends, as one primitive with no gap between the two. The stream
     /// does not end while the backend lives: a reconnecting subscriber resumes
-    /// with `stream_from(cursor)` and misses nothing.
+    /// with `stream_from(cursor)` and misses nothing at or above the cursor. An
+    /// envelope that arrives below what a stream already yielded is in `fetch`;
+    /// whether it is emitted live is open (#162).
     fn stream_from(&self, from_seq: u64) -> impl Stream<Item = Result<Envelope, ChannelBackendError>> + Send;
 }
