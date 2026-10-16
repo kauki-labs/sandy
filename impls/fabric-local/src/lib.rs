@@ -8,6 +8,7 @@
 mod capauth;
 
 pub mod channel;
+pub mod executor;
 pub mod inmem;
 pub mod minter;
 pub mod placement;
