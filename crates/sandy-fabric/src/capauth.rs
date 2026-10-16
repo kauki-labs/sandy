@@ -46,12 +46,26 @@ pub struct CapScope {
 }
 
 /// A signed capability: its scope plus the authority's opaque proof.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cap {
     /// The claimed scope. Only trust it after [`CapAuthority::verify`].
     pub scope: CapScope,
-    /// The opaque proof binding `scope` to the authority.
+    /// The opaque proof binding `scope` to the authority. Bearer credential
+    /// material (a holder can present it as this `scope`): the `Debug` impl
+    /// below redacts it from `{:?}` output, but `Cap` still derives
+    /// `Serialize`/`Deserialize` over the real bytes — this does NOT guard
+    /// `serde_json::to_string`, a JSON-mode tracing subscriber, or any future
+    /// audit sink that serializes a `Cap` directly.
     pub proof: Vec<u8>,
+}
+
+impl std::fmt::Debug for Cap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Cap")
+            .field("scope", &self.scope)
+            .field("proof", &"<redacted>")
+            .finish()
+    }
 }
 
 /// A capability-authority failure.

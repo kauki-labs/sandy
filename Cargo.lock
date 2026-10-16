@@ -2101,6 +2101,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "getrandom 0.3.4",
+ "hex",
  "hmac 0.13.0",
  "rustix",
  "sandy-api",
