@@ -258,6 +258,37 @@ mod tests {
         Ok(())
     }
 
+    /// INV-1 (#174): staging never follows a symlink planted in the instance dir.
+    /// The old writer created a fixed `<NAME>.tmp` with `File::create`, which
+    /// followed a symlink there and wrote the secret into its target.
+    #[test]
+    fn a_symlink_planted_at_the_temp_path_is_not_followed() -> anyhow::Result<()> {
+        let tmp = tempfile::TempDir::new()?;
+        let src = secret_source(tmp.path(), b"s3cr3t-marker")?;
+        let inst_dir = tmp.path().join("inst");
+        std::fs::create_dir(&inst_dir)?;
+        std::fs::set_permissions(&inst_dir, std::fs::Permissions::from_mode(0o700))?;
+        let victim = tmp.path().join("victim");
+        std::fs::write(&victim, b"untouched")?;
+        std::os::unix::fs::symlink(&victim, inst_dir.join("TOK.tmp"))?;
+        let secrets = [SecretRef {
+            name: "TOK".to_string(),
+            source: SecretSource::File(src),
+        }];
+
+        stage_secrets(&secrets, &inst_dir)?;
+
+        assert_eq!(
+            std::fs::read(&victim)?,
+            b"untouched",
+            "the secret was written through a planted symlink"
+        );
+        let staged_file = inst_dir.join("TOK");
+        let file_mode = std::fs::metadata(&staged_file)?.permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600, "staged secret must be 0600");
+        Ok(())
+    }
+
     /// INV-1: the staged handle names the secret and its path but never carries
     /// the bytes — the marker is absent from every returned value.
     #[test]
