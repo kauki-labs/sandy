@@ -59,7 +59,7 @@ use std::{
 
 use command_group::CommandGroup;
 use sandy::{
-    BackendError, BoxState, Containment, ContainmentStatus, NoContainment, Outcome, ResourceLimits, RunSpec,
+    BackendError, BoxState, Containment, ContainmentStatus, Mount, NoContainment, Outcome, ResourceLimits, RunSpec,
     SandboxKind, ShareDirs, VmBackend, collect_outputs, ensure_sandy_staging_base, plan_shares, wipe,
 };
 use sandy_api::share::{GuestShareTransport, Presentation};
@@ -192,9 +192,22 @@ impl ProcessBackend {
             cpu: spec.cpu,
             mem_mib: spec.mem,
         };
+        // When the containment provides a mount namespace (#142), present each share
+        // at its faithful /run/sandy/<tag> path (matching the VM) and let the
+        // containment bind it there, read-only for inputs/secrets. Otherwise the job
+        // reads the host staging dirs directly via SANDY_*_DIR (the MVP contract).
+        let confines = self.containment.confines_filesystem();
+        let mounts: Vec<Mount> = placements
+            .iter()
+            .map(|p| Mount {
+                host: p.dir.clone(),
+                guest: guest_share_path(&p.tag),
+                readonly: p.readonly,
+            })
+            .collect();
         let launch: Vec<String> = self
             .containment
-            .wrap(&box_id, limits)
+            .wrap(&box_id, limits, &mounts)
             .into_iter()
             .chain(spec.command.iter().cloned())
             .collect();
@@ -222,7 +235,12 @@ impl ProcessBackend {
             }
         }
         for placement in &placements {
-            command.env(share_env_key(&placement.tag), &placement.dir);
+            let dir = if confines {
+                guest_share_path(&placement.tag)
+            } else {
+                placement.dir.clone()
+            };
+            command.env(share_env_key(&placement.tag), &dir);
         }
         command
             .stdin(Stdio::null())
@@ -451,6 +469,14 @@ fn share_env_key(tag: &str) -> String {
     format!("SANDY_{stem}_DIR")
 }
 
+/// The faithful in-namespace path a share is bound at when the containment confines
+/// the filesystem (#142): `sandy-inputs` → `/run/sandy/inputs`, matching the VM's
+/// fixed mount paths. Mirrors [`share_env_key`]'s stem derivation.
+fn guest_share_path(tag: &str) -> std::path::PathBuf {
+    let stem = tag.strip_prefix("sandy-").unwrap_or(tag);
+    std::path::PathBuf::from(format!("/run/sandy/{stem}"))
+}
+
 #[cfg(test)]
 mod tests {
     use sandy::Grants;
@@ -629,6 +655,74 @@ mod tests {
         assert!(
             outcome.console.contains("hello-input"),
             "the job read the input via SANDY_INPUTS_DIR, got {:?}",
+            outcome.console
+        );
+        Ok(())
+    }
+
+    /// #142 path fidelity: when the containment confines the filesystem, the backend
+    /// advertises the VM-faithful `/run/sandy/<tag>` paths via `SANDY_*_DIR` (the real
+    /// bind happens in the live bwrap leg); without confinement it advertises the host
+    /// staging dir (the MVP contract). A confining fake runs the job directly (empty
+    /// wrap), so `env` can print the advertised value.
+    #[test]
+    fn a_confining_containment_advertises_the_faithful_share_path() -> anyhow::Result<()> {
+        let src = tempfile::TempDir::new()?;
+        std::fs::write(src.path().join("data"), b"x")?;
+        let inputs = [sandy::Input {
+            host: src.path().join("data"),
+            name: "data".to_string(),
+            guest_path: None,
+        }];
+        let grants = no_grants();
+        let command = ["env".to_string()];
+        let spec = RunSpec {
+            inputs: &inputs,
+            ..run_spec(&command, &grants, 30)
+        };
+
+        let backend = ProcessBackend::with_containment(Box::new(sandy::FakeContainment::confining()));
+        let outcome = backend.run(&spec)?;
+
+        assert_eq!(outcome.guest_exit, Some(0), "the job ran");
+        assert!(
+            outcome.console.contains("SANDY_INPUTS_DIR=/run/sandy/inputs"),
+            "a confining containment advertises the faithful path, got {:?}",
+            outcome.console
+        );
+        Ok(())
+    }
+
+    /// Without confinement the backend advertises the HOST staging dir (the MVP
+    /// contract), not a faithful `/run/sandy` path that nothing would have bound.
+    #[test]
+    fn an_unconfined_containment_advertises_the_host_share_path() -> anyhow::Result<()> {
+        let src = tempfile::TempDir::new()?;
+        std::fs::write(src.path().join("data"), b"x")?;
+        let inputs = [sandy::Input {
+            host: src.path().join("data"),
+            name: "data".to_string(),
+            guest_path: None,
+        }];
+        let grants = no_grants();
+        let command = ["env".to_string()];
+        let spec = RunSpec {
+            inputs: &inputs,
+            ..run_spec(&command, &grants, 30)
+        };
+
+        // NoContainment (default) does not confine the filesystem.
+        let outcome = ProcessBackend::new().run(&spec)?;
+
+        assert_eq!(outcome.guest_exit, Some(0), "the job ran");
+        assert!(
+            !outcome.console.contains("SANDY_INPUTS_DIR=/run/sandy/inputs"),
+            "an unconfined backend must not advertise an unbound faithful path, got {:?}",
+            outcome.console
+        );
+        assert!(
+            outcome.console.contains("SANDY_INPUTS_DIR="),
+            "it still advertises the host staging dir, got {:?}",
             outcome.console
         );
         Ok(())

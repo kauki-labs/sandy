@@ -42,6 +42,128 @@ fn live_contained_backend() -> ProcessBackend {
     ProcessBackend::with_containment(Box::new(containment))
 }
 
+/// Build a backend whose containment also confines the filesystem (bwrap + userns,
+/// #142). Refuses off-matrix: the #142 live rows need bubblewrap and unprivileged
+/// user namespaces, so a host without them fails loudly rather than skip-greening.
+fn live_confining_backend() -> ProcessBackend {
+    assert!(
+        std::env::var("SANDY_LIVE").is_ok(),
+        "set SANDY_LIVE=1 to run the live containment gate (INV-S9: never green from a fake)"
+    );
+    let containment = SystemdRunContainment::detect();
+    assert!(
+        matches!(containment.status(), ContainmentStatus::Available { .. }),
+        "the live host must provide cgroup reaping; got {:?}",
+        containment.status()
+    );
+    assert!(
+        containment.confines_filesystem(),
+        "#142 live rows need bwrap + unprivileged user namespaces; this host provides neither"
+    );
+    ProcessBackend::with_containment(Box::new(containment))
+}
+
+/// Run one job with a single read-only input staged, returning the outcome. Keeps the
+/// #142 confinement tests terse.
+fn run_with_input(backend: &ProcessBackend, input: &std::path::Path, script: &str) -> anyhow::Result<sandy::Outcome> {
+    let inputs = [Input {
+        host: input.to_path_buf(),
+        name: "data".to_string(),
+        guest_path: None,
+    }];
+    let grants = no_grants();
+    let command = ["sh".to_string(), "-c".to_string(), script.to_string()];
+    let spec = RunSpec {
+        template: "process",
+        command: &command,
+        inputs: &inputs,
+        outputs: &[],
+        secrets: &[],
+        env: &[],
+        cpu: None,
+        mem: None,
+        timeout_secs: 30,
+        grants: &grants,
+        outcome_file: None,
+        secret_dir: None,
+    };
+    Ok(backend.run(&spec)?)
+}
+
+/// #142 path fidelity: a confined job reads the input at the VM-faithful FIXED path
+/// `/run/sandy/inputs/data` (not just via `SANDY_INPUTS_DIR`), because bwrap binds it
+/// there.
+#[test]
+fn a_confined_job_reads_the_faithful_run_sandy_path() -> anyhow::Result<()> {
+    let backend = live_confining_backend();
+    let src = tempfile::TempDir::new()?;
+    std::fs::write(src.path().join("data"), b"faithful-path-input")?;
+
+    let outcome = run_with_input(&backend, &src.path().join("data"), "cat /run/sandy/inputs/data")?;
+
+    assert_eq!(outcome.guest_exit, Some(0), "the job read the fixed path");
+    assert!(
+        outcome.console.contains("faithful-path-input"),
+        "job read /run/sandy/inputs/data, got {:?}",
+        outcome.console
+    );
+    Ok(())
+}
+
+/// #142 hard read-only: a write to a read-only share fails at the kernel (EROFS/
+/// EACCES), not cooperatively, and the host source is unchanged.
+#[test]
+fn a_write_to_a_read_only_share_is_denied() -> anyhow::Result<()> {
+    let backend = live_confining_backend();
+    let src = tempfile::TempDir::new()?;
+    let data = src.path().join("data");
+    std::fs::write(&data, b"original")?;
+
+    let outcome = run_with_input(
+        &backend,
+        &data,
+        "if echo tampered > /run/sandy/inputs/data 2>/dev/null; then echo WROTE; else echo DENIED; fi",
+    )?;
+
+    assert!(
+        outcome.console.contains("DENIED") && !outcome.console.contains("WROTE"),
+        "a write to the read-only share must be denied, got {:?}",
+        outcome.console
+    );
+    assert_eq!(std::fs::read(&data)?, b"original", "the host source must be unchanged");
+    Ok(())
+}
+
+/// #142 user-bus isolation: inside the namespace the session bus is gone — the env
+/// pointer is unset and `systemctl --user` cannot reach the user manager, so the job
+/// cannot spawn units outside the scope (the CWE-269 escape is closed for the confined
+/// path).
+#[test]
+fn the_user_bus_is_unreachable_in_the_namespace() -> anyhow::Result<()> {
+    let backend = live_confining_backend();
+    let src = tempfile::TempDir::new()?;
+    std::fs::write(src.path().join("data"), b"x")?;
+
+    let outcome = run_with_input(
+        &backend,
+        &src.path().join("data"),
+        "echo xdg=${XDG_RUNTIME_DIR:-UNSET}; if systemctl --user is-system-running >/dev/null 2>&1; then echo \
+         BUS_REACHABLE; else echo BUS_BLOCKED; fi",
+    )?;
+
+    assert!(
+        outcome.console.contains("xdg=UNSET"),
+        "XDG_RUNTIME_DIR must be unset in the namespace, got {:?}",
+        outcome.console
+    );
+    assert!(
+        outcome.console.contains("BUS_BLOCKED") && !outcome.console.contains("BUS_REACHABLE"),
+        "the user bus must be unreachable in the namespace, got {:?}",
+        outcome.console
+    );
+    Ok(())
+}
+
 /// A `setsid`-escaped descendant is reaped by the containment scope. Without the
 /// cgroup reap this sleeper would survive the run as a host orphan (a `killpg`
 /// misses it); `reap()` (`systemctl --user stop` of the scope's cgroup) kills it.

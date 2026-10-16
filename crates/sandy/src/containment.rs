@@ -19,7 +19,7 @@
 //! contract and the trivial [`NoContainment`]. The `FakeContainment` double lives in
 //! `sandy-test-support`.
 
-pub use sandy_api::containment::{Containment, ContainmentStatus, ResourceLimits};
+pub use sandy_api::containment::{Containment, ContainmentStatus, Mount, ResourceLimits};
 
 use crate::{BackendError, SandboxKind};
 
@@ -57,7 +57,7 @@ impl Containment for NoContainment {
         ContainmentStatus::Unavailable("no containment configured".to_string())
     }
 
-    fn wrap(&self, _id: &str, _limits: ResourceLimits) -> Vec<String> {
+    fn wrap(&self, _id: &str, _limits: ResourceLimits, _mounts: &[Mount]) -> Vec<String> {
         Vec::new()
     }
 
@@ -119,7 +119,8 @@ mod tests {
     fn no_containment_is_inert() {
         let c = NoContainment;
         assert!(matches!(c.status(), ContainmentStatus::Unavailable(_)));
-        assert!(c.wrap("run-1", ResourceLimits::default()).is_empty());
+        assert!(c.wrap("run-1", ResourceLimits::default(), &[]).is_empty());
+        assert!(!c.confines_filesystem(), "NoContainment provides no mount namespace");
         assert!(c.reap("run-1").is_ok());
     }
 
