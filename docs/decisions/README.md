@@ -28,6 +28,7 @@ acceptance matrix, [`../architecture/kpi.md`](../architecture/kpi.md).
 | [result-classification](result-classification.md) | locked envelope, exit bands, rendering     |
 | [journal](journal.md)                             | durable records, reconcile                 |
 | [agent-fabric](agent-fabric.md)                   | fabric seam contracts + test harness       |
+| [sandyd](sandyd.md)                               | control RPC, daemon, job manifest, state   |
 
 Invariants referenced across these records: **INV-1** secrets never reach
 argv/env/the store; **INV-3** liveness only through `VmBackend::boxes` + the job
