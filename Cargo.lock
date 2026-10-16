@@ -2057,6 +2057,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandy-fabric"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "futures-core",
+ "futures-util",
+ "sandy-api",
+ "sandy-proto",
+ "serde",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
 name = "sandy-impls-local"
 version = "0.1.1"
 dependencies = [

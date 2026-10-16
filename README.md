@@ -62,6 +62,7 @@ sandy run topologies.aarch64-linux.vfkit \
 ```text
 crates/sandy/          deep library behind a curated facade (seam, journal, result, topology)
 crates/sandy-backend/  native VmBackend impls: QemuBackend (Linux) + VfkitBackend (macOS)
+crates/sandy-fabric/   agent-fabric seam traits + shared contract-test harness
 crates/sandy-cli/      the `sandy` binary
 nix/packages/          crane build definitions (build, clippy, docs, tests)
 nix/guest/             bootable microVM guests + the Topology seam (own flake)

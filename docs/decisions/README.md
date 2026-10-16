@@ -27,6 +27,7 @@ acceptance matrix, [`../architecture/kpi.md`](../architecture/kpi.md).
 | [egress](egress.md)                               | guest-scoped allow-list around the boot    |
 | [result-classification](result-classification.md) | locked envelope, exit bands, rendering     |
 | [journal](journal.md)                             | durable records, reconcile                 |
+| [agent-fabric](agent-fabric.md)                   | fabric seam contracts + test harness       |
 
 Invariants referenced across these records: **INV-1** secrets never reach
 argv/env/the store; **INV-3** liveness only through `VmBackend::boxes` + the job
