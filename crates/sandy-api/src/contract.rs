@@ -193,6 +193,17 @@ pub fn guest_share_transport_suite<T: GuestShareTransport>(make: impl Fn() -> T)
 /// Run the [`EgressApplier`] contract: `apply` then `revert` succeed, and `revert`
 /// is safe to call when nothing is applied (teardown must never be the one failure
 /// mode on an already-clean or already-reverted boundary).
+///
+/// Scope: this is a contract for a TRIVIAL/isolated applier (`NoEgress`, a fake, a
+/// test double) — `make` must yield a fresh, independent instance per check, with
+/// no shared host resource across instances. The real `NftablesApplier` is NOT a
+/// conformant target: its `revert` unconditionally deletes one FIXED, shared host
+/// table regardless of what `apply` loaded, so it errors on an already-reverted
+/// boundary (the opposite of this suite's idempotence rule) and risks colliding
+/// with another concurrent run's live boundary if driven outside its real
+/// mint-apply-revert bracket. The real applier's enforcement is proven instead by
+/// the dedicated, carefully root-gated `live_egress.rs` (#29), never by this
+/// generic suite.
 pub fn egress_applier_suite<A: EgressApplier>(make: impl Fn() -> A) -> Result<(), ContractViolation> {
     const SEAM: &str = "EgressApplier";
     let applier = make();
@@ -240,10 +251,16 @@ mod tests {
     }
 
     /// Adversarial: a backend that reports a lingering box after a synchronous run
-    /// must be caught, not waved through.
-    struct LingersBackend;
+    /// must be caught, not waved through. `boxes()` is honest (empty) until `run()`
+    /// executes, so the suite's earlier "fresh backend has no boxes" check passes
+    /// and the violation actually exercises the post-run lingering-box rule.
+    #[derive(Default)]
+    struct LingersBackend {
+        ran: std::cell::Cell<bool>,
+    }
     impl VmBackend for LingersBackend {
         fn run(&self, _spec: &RunSpec) -> Result<Outcome, BackendError> {
+            self.ran.set(true);
             Ok(Outcome {
                 booted: true,
                 guest_exit: Some(0),
@@ -258,6 +275,9 @@ mod tests {
         }
 
         fn boxes(&self) -> Result<Vec<BoxState>, BackendError> {
+            if !self.ran.get() {
+                return Ok(vec![]);
+            }
             Ok(vec![BoxState {
                 box_id: "ghost".to_string(),
                 box_name: "ghost".to_string(),
@@ -270,8 +290,13 @@ mod tests {
 
     #[test]
     fn vmbackend_suite_rejects_a_lingering_box() {
-        let err = vmbackend_suite("contract", || LingersBackend).expect_err("a lingering box must be caught");
+        let err = vmbackend_suite("contract", LingersBackend::default).expect_err("a lingering box must be caught");
         assert_eq!(err.seam, "VmBackend");
+        assert!(
+            err.rule.contains("linger"),
+            "expected the post-run lingering-box rule, got: {}",
+            err.rule
+        );
     }
 
     /// A LocalDir transport whose placements correctly track the supplied shares.

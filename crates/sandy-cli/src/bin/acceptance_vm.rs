@@ -2,14 +2,18 @@
 //!
 //! The VM-side counterpart to `acceptance-local`: proves the generic, fake-free
 //! seam contract suites ([`sandy_api::contract`]) hold for the real VM impls
-//! (`QemuBackend`/`VfkitBackend`, `VirtiofsdTransport`/`VirtioFsTransport`,
-//! `NftablesApplier`/`NoEgress`), then drives one real job through the fully
-//! composed [`profiles::host_no_cred`] [`Profile`] via [`run_with_profile`] — the
-//! same no-forge-credential entry point `acceptance-local` uses, this time over a
-//! real hypervisor boot. Deep end-to-end VM behaviour (inputs, outputs, secrets,
-//! credential refresh, the real `nft` boundary) is already proven by the
-//! existing `live_*` test suites; this binary's unique job is the seam-contract
-//! level plus one composed end-to-end boot, not re-proving every live KPI.
+//! (`QemuBackend`/`VfkitBackend`, `VirtiofsdTransport`/`VirtioFsTransport`), then
+//! drives one real job through the fully composed [`profiles::host_no_cred`]
+//! [`Profile`] via [`run_with_profile`] — the same no-forge-credential entry point
+//! `acceptance-local` uses, this time over a real hypervisor boot. The egress seam
+//! check always uses `NoEgress`, even here: the real `NftablesApplier` manages one
+//! fixed, shared host table and is not a safe GENERIC-contract target (see
+//! `egress_applier_suite`'s doc) — its enforcement is proven by the dedicated,
+//! root-gated `live_egress.rs` (#29), never by this binary. Deep end-to-end VM
+//! behaviour (inputs, outputs, secrets, credential refresh, the real `nft`
+//! boundary) is already proven by the existing `live_*` test suites; this
+//! binary's unique job is the seam-contract level plus one composed end-to-end
+//! boot, not re-proving every live KPI.
 //!
 //! Live-gated: behind the `live` feature (`required-features` in `Cargo.toml`),
 //! so this binary is not even built, let alone run, in a default CI build. Run on
@@ -22,7 +26,7 @@ use sandy::{Grants, Journal, Status};
 use sandy_api::contract::{egress_applier_suite, guest_share_transport_suite, vmbackend_suite};
 use sandy_backend::{VirtioFsTransport, VirtiofsdTransport};
 use sandy_cli::{
-    live_target::{build_guest, guest_flake, on_path, require_live},
+    live_target::{build_guest, guest_flake, require_live},
     plan::JobPlan,
     profiles,
     supervisor::run_with_profile,
@@ -54,14 +58,13 @@ fn run() -> Result<(), String> {
         guest_share_transport_suite(|| VirtiofsdTransport).map_err(|e| format!("{e}"))?;
     }
 
-    // The real egress applier needs root + `nft` on Linux (the live_egress gate's
-    // own matrix); off that matrix, or on macOS, the honest NoEgress stands in —
-    // enforcement itself is live_egress.rs's job, not this seam-contract check.
-    if cfg!(target_os = "linux") && on_path("nft") {
-        egress_applier_suite(|| sandy::NftablesApplier).map_err(|e| format!("{e}"))?;
-    } else {
-        egress_applier_suite(|| sandy_backend::NoEgress).map_err(|e| format!("{e}"))?;
-    }
+    // Always NoEgress here, never the real NftablesApplier: its revert()
+    // unconditionally deletes one FIXED, shared host table, so it is not a safe
+    // generic-contract target (see egress_applier_suite's doc) — running it here
+    // would either fail the idempotent-revert check or risk colliding with another
+    // run's live boundary. The real applier's enforcement is live_egress.rs's job
+    // (#29, root-gated, its own matrix), not this seam-contract check.
+    egress_applier_suite(|| sandy_backend::NoEgress).map_err(|e| format!("{e}"))?;
 
     end_to_end(&template)
 }

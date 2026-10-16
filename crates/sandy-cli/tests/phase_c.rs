@@ -53,7 +53,7 @@ fn prebuilt_erofs_boots_without_nix_on_path() -> anyhow::Result<()> {
          if Nix cannot sneak in"
     );
     assert!(
-        is_on(&child_path, target.hypervisor),
+        is_on(&child_path, &target.hypervisor),
         "the hypervisor `{}` must still be reachable on the stripped PATH",
         target.hypervisor
     );

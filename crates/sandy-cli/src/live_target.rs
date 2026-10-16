@@ -11,8 +11,11 @@ use anyhow::{Context, bail};
 /// One live target: the guest runner package to realise and the topology attr
 /// sandy boots, chosen by host platform (vfkit on macOS, qemu on Linux).
 pub struct LiveTarget {
-    /// The hypervisor binary this target needs on `PATH`.
-    pub hypervisor: &'static str,
+    /// The hypervisor binary this target needs on `PATH` — on macOS, the
+    /// `SANDY_VFKIT_BIN`-configured vfkit path (default `"vfkit"`), the same
+    /// resolution `VfkitBackend`'s factory uses, so the live gate checks the
+    /// binary that actually runs.
+    pub hypervisor: String,
     /// The guest flake attr that builds the runner package.
     pub runner_attr: &'static str,
     /// The guest flake attr that evaluates to the typed `Topology` sandy boots.
@@ -41,20 +44,20 @@ pub fn require_live() -> anyhow::Result<LiveTarget> {
     }
     let target = if cfg!(target_os = "macos") {
         LiveTarget {
-            hypervisor: "vfkit",
+            hypervisor: std::env::var("SANDY_VFKIT_BIN").unwrap_or_else(|_| "vfkit".to_string()),
             runner_attr: "packages.aarch64-darwin.guest-runner-vfkit",
             topology_attr: "topologies.aarch64-linux.vfkit",
             target_arch: "aarch64-linux",
         }
     } else {
         LiveTarget {
-            hypervisor: "qemu-system-x86_64",
+            hypervisor: "qemu-system-x86_64".to_string(),
             runner_attr: "packages.x86_64-linux.guest-runner",
             topology_attr: "topologies.x86_64-linux.qemu",
             target_arch: "x86_64-linux",
         }
     };
-    if !on_path(target.hypervisor) {
+    if !on_path(&target.hypervisor) {
         bail!(
             "refusing: `{}` is not on PATH — run under `nix shell nixpkgs#{}`",
             target.hypervisor,
