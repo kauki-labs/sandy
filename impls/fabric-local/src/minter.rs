@@ -385,6 +385,46 @@ mod tests {
         Ok(())
     }
 
+    /// A sandbox cannot mint its own cap: an authority holding any key but the
+    /// host's produces caps the host rejects (spec §3.8).
+    #[test]
+    fn a_sandbox_cannot_mint_a_cap_the_host_accepts() -> anyhow::Result<()> {
+        use std::time::Duration;
+
+        use sandy_fabric::capauth::{CapAuthority, CapError, CapRights, CapScope, decode_cap};
+
+        use crate::LocalCapAuthority;
+
+        let ttl = Duration::from_secs(3600);
+        let host = LocalCapAuthority::new(ttl)?;
+        let sandbox = LocalCapAuthority::new(ttl)?;
+        let scope = CapScope {
+            peer: "agent".into(),
+            channel: "orchestrator".into(),
+            rights: CapRights {
+                post: true,
+                read: true,
+                invite: false,
+            },
+            expires_at: None,
+        };
+
+        let self_minted = sandbox.mint(scope.clone())?;
+        anyhow::ensure!(
+            matches!(host.verify(&self_minted), Err(CapError::Forged)),
+            "the host accepted a cap minted by another authority"
+        );
+
+        let dir = staging_dir()?;
+        let path = stage_cap(dir.path(), "CHANNEL_CAP", &host.mint(scope)?)?;
+        let delivered = decode_cap(&fs::read(path)?)?;
+        anyhow::ensure!(
+            host.verify(&delivered).is_ok(),
+            "a host-minted cap stopped verifying after staging"
+        );
+        Ok(())
+    }
+
     #[test]
     fn staging_under_the_nix_store_is_refused() {
         let res = stage_secret(Path::new("/nix/store/abc-staging"), "S", b"x");
