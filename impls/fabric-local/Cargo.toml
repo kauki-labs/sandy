@@ -21,7 +21,10 @@ workspace = true
 
 [dependencies]
 futures-core.workspace = true
+getrandom.workspace = true
+hmac.workspace = true
 sandy-fabric.workspace = true
+sha2.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
