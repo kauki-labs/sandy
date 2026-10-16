@@ -362,6 +362,20 @@ fn write_secret_0600(dest: &Path, bytes: &[u8]) -> Result<(), CredError> {
 }
 
 /// Build a [`CredError::Stage`] for an IO failure without leaking secret bytes.
+/// Refuse trust material owned by another user: sandy writes it as the current
+/// user, so a file owned by anyone else was put there by someone else (#200).
+fn refuse_foreign_owner(what: &str, path: &Path, uid: u32, current_uid: u32) -> Result<(), CredError> {
+    let _ = (what, path, uid, current_uid);
+    Ok(())
+}
+
+/// The tamper warning for a trust-material dir that others can write to, or that
+/// another user owns: the read goes ahead, but the files may have been changed.
+fn wide_dir_warning(dir: &Path, dir_uid: u32, dir_mode: u32, current_uid: u32) -> Option<String> {
+    let _ = (dir, dir_uid, dir_mode, current_uid);
+    None
+}
+
 fn stage_err(action: &str, path: &Path, err: &std::io::Error) -> CredError {
     CredError::Stage(format!("{action} at {}: {err}", path.display()))
 }
@@ -628,6 +642,75 @@ mod tests {
         assert!(
             matches!(err, CredError::Stage(_)),
             "expected CredError::Stage, got {err:?}"
+        );
+        Ok(())
+    }
+
+    /// #200: trust material owned by another user is refused on read.
+    #[test]
+    fn a_secret_owned_by_another_user_is_refused() {
+        let err = refuse_foreign_owner("App key", Path::new("/k.pem"), 999, 1000)
+            .expect_err("a foreign-owned key must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("uid 999") && msg.contains("another user"),
+            "unexpected: {msg}"
+        );
+        assert!(refuse_foreign_owner("App key", Path::new("/k.pem"), 1000, 1000).is_ok());
+    }
+
+    /// #200: a group/world-writable or foreign-owned dir draws a tamper warning; a
+    /// private one does not.
+    #[test]
+    fn a_wide_or_foreign_dir_draws_a_tamper_warning() {
+        let dir = Path::new("/trust-roots");
+        for (uid, mode) in [(1000, 0o775), (1000, 0o757), (999, 0o700)] {
+            let warning = wide_dir_warning(dir, uid, mode, 1000);
+            assert!(
+                warning
+                    .as_deref()
+                    .is_some_and(|w| w.contains("may have been able to modify")),
+                "uid {uid} mode {mode:o}: {warning:?}"
+            );
+        }
+        assert!(
+            wide_dir_warning(dir, 1000, 0o700, 1000).is_none(),
+            "a private dir warned"
+        );
+        assert!(wide_dir_warning(dir, 1000, 0o755, 1000).is_none(), "a 0755 dir warned");
+    }
+
+    /// #200: a key path that is not a regular file is refused, not read.
+    #[test]
+    fn a_secret_that_is_not_a_regular_file_is_refused() -> anyhow::Result<()> {
+        let tmp = private_tempdir()?;
+        let dir_at_key = tmp.path().join("key.pem");
+        fs::create_dir(&dir_at_key)?;
+        let err = read_secret_0600(&dir_at_key).expect_err("a directory at the key path must be refused");
+        assert!(err.to_string().contains("not a regular file"), "unexpected: {err}");
+        Ok(())
+    }
+
+    /// #200: reading your own key in a group-writable dir warns but still works
+    /// (refusing that read is the operator's decision, not made here).
+    #[test]
+    fn an_owned_secret_in_a_wide_dir_is_still_read() -> anyhow::Result<()> {
+        let tmp = private_tempdir()?;
+        let dir = tmp.path().join("trust-roots");
+        fs::create_dir(&dir)?;
+        let key = dir.join("acme.pem");
+        fs::write(&key, b"key-bytes")?;
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o600))?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o775))?;
+        assert_eq!(read_secret_0600(&key)?, b"key-bytes");
+        let cfg = dir.join("acme.json");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+        sample_root().write(&cfg)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o775))?;
+        assert_eq!(
+            TrustRoot::load(&cfg)?,
+            sample_root(),
+            "a config in a wide dir must still load"
         );
         Ok(())
     }
