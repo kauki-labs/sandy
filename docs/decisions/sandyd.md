@@ -63,6 +63,13 @@ lighter-dependency bias (protox over `protoc`, no tonic here either).
 traits and `prost`, nothing heavier. A future genuine streaming need (if one
 ever arises) would need its own seam, not a retrofit of this RPC.
 
+`AttachResponse` carries a channel-join `Cap` in plaintext bytes. Fine over
+local UDS (filesystem permissions are the boundary); once this rides vsock or
+TCP/QUIC-over-mesh (B6), that cap needs the transport's own confidentiality
+(TLS/QUIC's encryption, or an equivalent over vsock) — a bearer credential
+must never cross a network link in the clear. Flagged here so B6 doesn't lose
+it; nothing to build in B0.
+
 **Set aside.** gRPC/tonic: no streaming need to justify the HTTP/2 and
 `hyper`/`h2` dependency weight, and it would complicate the vsock/mesh
 transport swap.
