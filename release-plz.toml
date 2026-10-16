@@ -15,6 +15,11 @@
 # A GitHub release per published crate, and a changelog kept in each crate.
 git_release_enable = true
 git_tag_enable = true
+# release-plz's own auto-created releases (one per crate, on a version bump)
+# have no generated notes without this — the new github-release.yaml workflow
+# only reacts to operator-pushed v*/m* tags, never to release-plz's own
+# per-crate tags, so it can't backfill notes here. CodeRabbit's catch.
+git_release_generate_notes = true
 # Operator decision (#158): GitHub releases only for now, no crates.io
 # publishing. release-plz's own publish step is the only thing in this repo
 # that would otherwise run `cargo publish`, so disabling it here is enough —
