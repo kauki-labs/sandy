@@ -73,14 +73,14 @@ fn capauth_suite_rejects_attenuating_an_unverified_parent() {
 
 // ---- Minter ----
 
-#[test]
-fn minter_reference_passes() -> anyhow::Result<()> {
-    minter_suite(FakeMinter::new).context("reference minter")
+#[tokio::test]
+async fn minter_reference_passes() -> anyhow::Result<()> {
+    minter_suite(FakeMinter::new).await.context("reference minter")
 }
 
-#[test]
-fn minter_suite_rejects_a_constant_secret() {
-    assert_violates(minter_suite(|| ConstantMinter), "two mints for one job differ");
+#[tokio::test]
+async fn minter_suite_rejects_a_constant_secret() {
+    assert_violates(minter_suite(|| ConstantMinter).await, "two mints for one job differ");
 }
 
 // ---- ChannelBackend ----
@@ -90,6 +90,28 @@ async fn channel_backend_reference_passes() -> anyhow::Result<()> {
     channel_backend_suite(FakeBackend::default, deadline)
         .await
         .context("reference backend")
+}
+
+#[tokio::test]
+async fn a_backend_stream_outlives_the_borrow_and_reads_from_a_spawned_task() -> anyhow::Result<()> {
+    use futures_util::StreamExt;
+
+    use crate::channel_backend::{ChannelBackend, Envelope, MSG_ID_KEY};
+
+    let backend = FakeBackend::default();
+    let stream = backend.stream_from(1);
+    let reader = tokio::spawn(async move { std::pin::pin!(stream).next().await.map(|e| e.map(|e| e.sequence)) });
+    let env = Envelope {
+        sequence: 1,
+        metadata: [(MSG_ID_KEY.to_owned(), "a".to_owned())].into(),
+        ..Envelope::default()
+    };
+    backend.append(env).await.context("append")?;
+    let got = tokio::time::timeout(Duration::from_secs(2), reader)
+        .await
+        .context("reader timed out")??;
+    anyhow::ensure!(got == Some(Ok(1)), "spawned reader saw {got:?}");
+    Ok(())
 }
 
 #[tokio::test]

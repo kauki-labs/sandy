@@ -120,7 +120,7 @@ impl FakeMinter {
 }
 
 impl Minter for FakeMinter {
-    fn mint(&self, req: &SecretRequest) -> Result<MintedSecret, MinterError> {
+    async fn mint(&self, req: &SecretRequest) -> Result<MintedSecret, MinterError> {
         let n = self.counter.fetch_add(1, Ordering::Relaxed);
         Ok(MintedSecret {
             bytes: format!("{}:{n}", req.job).into_bytes(),
@@ -132,7 +132,7 @@ impl Minter for FakeMinter {
 pub struct ConstantMinter;
 
 impl Minter for ConstantMinter {
-    fn mint(&self, _req: &SecretRequest) -> Result<MintedSecret, MinterError> {
+    async fn mint(&self, _req: &SecretRequest) -> Result<MintedSecret, MinterError> {
         Ok(MintedSecret {
             bytes: b"fixed".to_vec(),
         })
@@ -197,7 +197,7 @@ impl ChannelBackend for FakeBackend {
             .collect())
     }
 
-    fn stream_from(&self, from_seq: u64) -> impl Stream<Item = Result<Envelope, ChannelBackendError>> + Send {
+    fn stream_from(&self, from_seq: u64) -> impl Stream<Item = Result<Envelope, ChannelBackendError>> + Send + 'static {
         FollowStream {
             backend: self.clone(),
             next_seq: from_seq,
@@ -242,7 +242,7 @@ impl ChannelBackend for SnapshotBackend {
         self.0.fetch(from_seq).await
     }
 
-    fn stream_from(&self, from_seq: u64) -> impl Stream<Item = Result<Envelope, ChannelBackendError>> + Send {
+    fn stream_from(&self, from_seq: u64) -> impl Stream<Item = Result<Envelope, ChannelBackendError>> + Send + 'static {
         let snapshot: Vec<_> = self
             .0
             .lock()

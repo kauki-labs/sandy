@@ -181,13 +181,13 @@ pub fn capauth_suite<A: CapAuthority>(make: impl Fn() -> A) -> Result<(), Contra
 }
 
 /// Run the [`Minter`] contract: every mint is non-empty and fresh.
-pub fn minter_suite<M: Minter>(make: impl Fn() -> M) -> Result<(), ContractViolation> {
+pub async fn minter_suite<M: Minter>(make: impl Fn() -> M) -> Result<(), ContractViolation> {
     const SEAM: &str = "Minter";
     let minter = make();
     let req = |job: &str| SecretRequest { job: job.to_owned() };
-    let a1 = expect_ok(SEAM, "mint", minter.mint(&req("a")))?;
-    let a2 = expect_ok(SEAM, "mint", minter.mint(&req("a")))?;
-    let b = expect_ok(SEAM, "mint", minter.mint(&req("b")))?;
+    let a1 = expect_ok(SEAM, "mint", minter.mint(&req("a")).await)?;
+    let a2 = expect_ok(SEAM, "mint", minter.mint(&req("a")).await)?;
+    let b = expect_ok(SEAM, "mint", minter.mint(&req("b")).await)?;
     require(SEAM, !a1.bytes.is_empty(), "a minted secret is non-empty")?;
     require(SEAM, a1 != a2, "two mints for one job differ")?;
     require(SEAM, a1 != b && a2 != b, "mints for different jobs differ")

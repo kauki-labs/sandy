@@ -5,8 +5,10 @@
 //! TTL}`, minted outside the sandbox (INV-1). A sub-agent joins with an attenuated
 //! derivative of its parent's cap, which may only ever narrow. The proof format
 //! (biscuit placeholder, minisign identity root, platform attestation, …) stays
-//! behind the seam: callers see only [`Cap`] and its [`CapScope`]. Signing is
-//! CPU-bound, so this seam is synchronous.
+//! behind the seam: callers see only [`Cap`] and its [`CapScope`]. The seam is
+//! synchronous: verify sits on the hot path of every join, post and subscribe and
+//! is pure crypto. A root backed by remote state (a chain) verifies against a
+//! locally synced cache and syncs out of band.
 
 use serde::{Deserialize, Serialize};
 

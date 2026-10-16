@@ -51,6 +51,8 @@ pub trait ChannelBackend: Send + Sync {
     /// does not end while the backend lives: a reconnecting subscriber resumes
     /// with `stream_from(cursor)` and misses nothing at or above the cursor. An
     /// envelope that arrives below what a stream already yielded is in `fetch`;
-    /// whether it is emitted live is open (#162).
-    fn stream_from(&self, from_seq: u64) -> impl Stream<Item = Result<Envelope, ChannelBackendError>> + Send;
+    /// whether it is emitted live is open (#162). The stream is `'static` so a
+    /// subscriber can read it from a spawned task; an impl holds shared state
+    /// (an `Arc`) rather than borrowing `self`.
+    fn stream_from(&self, from_seq: u64) -> impl Stream<Item = Result<Envelope, ChannelBackendError>> + Send + 'static;
 }

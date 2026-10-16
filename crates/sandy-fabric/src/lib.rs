@@ -10,8 +10,10 @@
 //! [`Executor`](executor::Executor), [`ChannelBackend`](channel_backend::ChannelBackend),
 //! [`Transport`](transport::Transport), [`Discovery`](placement::Discovery),
 //! [`Capacity`](placement::Capacity), [`Lifecycle`](placement::Lifecycle) and
-//! [`TelemetrySink`](telemetry::TelemetrySink). The pure-compute seams are sync:
-//! [`CapAuthority`](capauth::CapAuthority) and [`Minter`](minter::Minter).
+//! [`TelemetrySink`](telemetry::TelemetrySink), plus [`Minter`](minter::Minter),
+//! whose controller-transit impl mints over the network.
+//! [`CapAuthority`](capauth::CapAuthority) is sync: verify sits on the hot path of
+//! every join, post and subscribe, and is pure crypto.
 //!
 //! The channel itself is not a seam: it is one concrete abstraction layered over
 //! [`ChannelBackend`](channel_backend::ChannelBackend), carrying `sandy-proto`'s

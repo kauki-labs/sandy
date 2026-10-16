@@ -2,8 +2,11 @@
 //!
 //! The default impl is agent-local, so the secret never leaves the host (INV-1);
 //! controller-transit is the opt-in alternative. Work-secrets ride as scoped
-//! payloads, never bundled into a channel join cap. Minting is CPU-bound, so this
-//! seam is synchronous.
+//! payloads, never bundled into a channel join cap. The seam is async because
+//! controller-transit mints over the network; minting is once per job, so the
+//! cost is nil for the agent-local default.
+
+use std::future::Future;
 
 /// What to mint a work-secret for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,5 +39,5 @@ pub enum MinterError {
 /// Mints job work-secrets. Every mint is fresh: no two calls return the same bytes.
 pub trait Minter: Send + Sync {
     /// Mint a new work-secret for `req`.
-    fn mint(&self, req: &SecretRequest) -> Result<MintedSecret, MinterError>;
+    fn mint(&self, req: &SecretRequest) -> impl Future<Output = Result<MintedSecret, MinterError>> + Send;
 }

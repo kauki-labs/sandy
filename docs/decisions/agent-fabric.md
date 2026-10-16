@@ -85,10 +85,14 @@ message lands between the two and is missed.
 live (spec §1). The existing `VmBackend` is sync.
 
 **Decision.** The I/O seams (`Executor`, `ChannelBackend`, `Transport`,
-`Discovery`, `Capacity`, `Lifecycle`, `TelemetrySink`) are async and `Send`,
-written as `fn … -> impl Future<Output = …> + Send` (bare `async fn` in a public
-trait trips `async_fn_in_trait` under deny-warnings). `CapAuthority` and `Minter`
-are CPU-bound and sync, and `Send + Sync` like the rest. Suites are
+`Discovery`, `Capacity`, `Lifecycle`, `TelemetrySink`) and `Minter` are async and
+`Send`, written as `fn … -> impl Future<Output = …> + Send` (bare `async fn` in a
+public trait trips `async_fn_in_trait` under deny-warnings). `Minter` is async
+because its controller-transit impl mints over the network, once per job.
+`CapAuthority` stays sync: verify is on the hot path of every join, post and
+subscribe and is pure crypto; a chain-backed root verifies against a locally
+synced cache. Every seam is `Send + Sync`. `ChannelBackend::stream_from` returns
+a `'static` stream, so a subscriber can read it from a spawned task. Suites are
 runtime-agnostic; a stream wait races a caller-supplied deadline, so a broken
 stream fails instead of hanging and an I/O-backed one gets time to deliver.
 
@@ -97,7 +101,8 @@ rewrite. Static dispatch by default; a composition root that needs `dyn` boxes a
 its own boundary.
 
 **Set aside.** All-sync traits matching `VmBackend`: they would be rewritten when
-the first remote transport lands.
+the first remote transport lands. An async `CapAuthority`: it would add a poll to
+every message for impls that never wait.
 
 ## 5. `Executor` is additive over `VmBackend`
 
