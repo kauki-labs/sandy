@@ -2,7 +2,8 @@
 //! (the core, the backends, the light fabric impls) uses the same code (#174).
 //!
 //! - [`staging`]: the sandy-owned staging base under the OS temp dir (CWE-732, #138, #141).
-//! - [`secret`]: an [`OwnedDir`] handle and the `0600` secret writer every secret staging path goes through (INV-1).
+//! - [`secret`]: an [`OwnedDir`] handle and the `0600` secret writer every secret staged for a job goes through
+//!   (INV-1).
 //!
 //! Everything works through directory handles (`openat`, `renameat`, `fstat` on
 //! the opened fd), never a path re-resolved after it was checked, and refuses to

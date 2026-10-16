@@ -54,7 +54,8 @@ planted there, and tightened to `0600` only after writing. The credential writer
 accepted any directory. `sandy run --credential` staged the token into a
 predictable, pre-creatable `/tmp/sandy-cred-<pid>` (#192).
 
-**Decision.** Every secret is written by `sandy_fsutil::OwnedDir::write_secret`:
+**Decision.** Every secret staged for a job (credential tokens, secret-channel
+secrets, fabric work-secrets) is written by `sandy_fsutil::OwnedDir::write_secret`:
 the directory is opened once (`O_DIRECTORY | O_NOFOLLOW`) and must be this user's
 and not group- or world-writable. The file is created `0600` with
 `O_EXCL | O_NOFOLLOW` under a unique temporary name, synced, renamed into place,

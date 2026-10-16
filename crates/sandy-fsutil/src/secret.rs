@@ -1,5 +1,5 @@
 //! The `0600` secret writer (INV-1): an [`OwnedDir`] handle and
-//! [`OwnedDir::write_secret`], the one path every secret staging goes through.
+//! [`OwnedDir::write_secret`], the one writer for every secret staged for a job.
 //!
 //! The directory is opened once and everything after is relative to that handle:
 //! the owner and mode check, the create, the rename and the sync. A path swapped
@@ -294,6 +294,27 @@ mod tests {
         let secret = created.write_secret("GITHUB_TOKEN", b"token")?;
         let mode = fs::metadata(&secret)?.permissions().mode() & 0o777;
         anyhow::ensure!(mode == 0o600, "a secret in a private dir came out {mode:o}");
+        Ok(())
+    }
+
+    #[test]
+    fn private_staging_dirs_are_fresh_private_and_under_the_staging_base() -> anyhow::Result<()> {
+        let (first, second) = (private_staging_dir("contract")?, private_staging_dir("contract")?);
+        let base = crate::ensure_sandy_staging_base()?;
+        let checks = [
+            (first.path().starts_with(&base), "outside the staging base"),
+            (first.path() != second.path(), "two calls gave the same dir"),
+            (
+                fs::metadata(first.path())?.permissions().mode() & 0o777 == 0o700,
+                "not 0700",
+            ),
+        ];
+        for dir in [first.path(), second.path()] {
+            let _ = fs::remove_dir_all(dir);
+        }
+        for (ok, why) in checks {
+            anyhow::ensure!(ok, "a private staging dir was {why}");
+        }
         Ok(())
     }
 

@@ -130,7 +130,12 @@ fn credential_flows_through_git_helper_and_refreshes_midrun() -> anyhow::Result<
     let home = tempfile::tempdir().context("temp SANDY_HOME")?;
     let journal = Journal::new(home.path());
     journal.ensure_dirs().context("ensure_dirs")?;
-    let cred_dir = tempfile::tempdir().context("temp cred dir")?;
+    let cred_dir = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(
+            0o700,
+        ))
+        .tempdir()
+        .context("temp cred dir")?;
 
     // Read the token the way a real git remote op does: through the guest's git
     // credential helper (`git credential fill` for github.com), sampled repeatedly
@@ -231,7 +236,12 @@ fn credential_secret_input_output_all_compose() -> anyhow::Result<()> {
     let home = tempfile::tempdir().context("temp SANDY_HOME")?;
     let journal = Journal::new(home.path());
     journal.ensure_dirs().context("ensure_dirs")?;
-    let cred_dir = tempfile::tempdir().context("temp cred dir")?;
+    let cred_dir = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(
+            0o700,
+        ))
+        .tempdir()
+        .context("temp cred dir")?;
     let staging = tempfile::tempdir().context("temp staging")?;
 
     std::fs::create_dir_all(staging.path().join("in")).context("mk input dir")?;
