@@ -123,20 +123,27 @@ impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
 
     /// The stored cap for `membership`, cloned out from under the lock (so the
     /// caller never holds `members`' mutex across anything slower than a clone
-    /// — see `invite`'s use of this). Checked fresh on every call, not cached:
-    /// still, nothing here re-verifies the cap against the authority after
-    /// `join`, so a `leave()` racing a just-started `post()`/`subscribe()` can
-    /// still land it, and an expired-since-join cap keeps its rights until an
-    /// explicit `leave()`. Enforcing revocation/TTL against an admitted member
-    /// is the open question spec §8 defers ("capability revocation before TTL,
-    /// and where that governance lives"), not step-1 scope.
+    /// — see `invite`'s use of this), then re-verified against the authority:
+    /// a cap that expired or was revoked (#129) since `join` is rejected here,
+    /// not trusted from the cache. Closes that gap for every fresh
+    /// `post`/`subscribe`/`invite` call. What this does NOT close: a `leave()`
+    /// racing a just-started call still lands it (checked once, not held across
+    /// the call), and an already-open `subscribe()` stream has no checkpoint of
+    /// its own once created — `CursorStream` doesn't call back in here per
+    /// yield, so a stream opened before a revocation keeps delivering after it.
+    /// That's #184 (CWE-613), not step-1 scope for `Channel` alone: it needs a
+    /// generation counter and touches the `ChannelBackend` contract (waking a
+    /// stream on something other than its own appends).
     fn member(&self, membership: &MembershipId) -> Result<Cap, ChannelError> {
-        self.members
+        let cap = self
+            .members
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(membership)
             .cloned()
-            .ok_or(ChannelError::NotAMember)
+            .ok_or(ChannelError::NotAMember)?;
+        self.authority.verify(&cap)?;
+        Ok(cap)
     }
 
     fn rights_of(&self, membership: &MembershipId) -> Result<CapRights, ChannelError> {
@@ -264,6 +271,10 @@ impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
 /// at-least-once needs a consumer-ack'd or consumer-managed cursor instead of
 /// one the backend advances on delivery; tracked as a follow-up, not fixed
 /// here.
+///
+/// Also doesn't re-check membership per yield: once created, it keeps polling
+/// the backend regardless of a later `leave()`/revocation/expiry — see
+/// `member()`'s doc comment and #184 (CWE-613).
 struct CursorStream {
     inner: Pin<Box<dyn Stream<Item = Result<Envelope, ChannelBackendError>> + Send>>,
     cursors: Arc<Mutex<HashMap<MembershipId, u64>>>,
@@ -329,9 +340,13 @@ mod tests {
     /// enough to catch tampering, not real cryptography. sandy-fabric's own
     /// equivalent (`contract::fakes::FakeAuthority`) is `#[cfg(test)]`-private to
     /// that crate, so Channel's tests carry this small mirror rather than wait on
-    /// it being exported.
-    #[derive(Default)]
-    struct TestAuthority;
+    /// it being exported. `Clone` + an `Arc`-backed revoked set: a test needs a
+    /// handle to the SAME authority instance `Channel` holds internally, to call
+    /// `revoke()` on it from outside.
+    #[derive(Default, Clone)]
+    struct TestAuthority {
+        revoked: Arc<Mutex<std::collections::HashSet<Vec<u8>>>>,
+    }
 
     impl TestAuthority {
         fn proof(&self, scope: &CapScope) -> Vec<u8> {
@@ -340,6 +355,13 @@ mod tests {
             (&scope.peer, &scope.channel, scope.expires_at).hash(&mut h);
             (scope.rights.post, scope.rights.read, scope.rights.invite).hash(&mut h);
             h.finish().to_be_bytes().to_vec()
+        }
+
+        fn revoke(&self, cap: &Cap) {
+            self.revoked
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(cap.proof.clone());
         }
     }
 
@@ -354,10 +376,18 @@ mod tests {
                 return Err(CapError::Forged);
             }
             let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
-            match cap.scope.expires_at {
-                Some(t) if t <= now => Err(CapError::Expired),
-                _ => Ok(cap.scope.clone()),
+            if cap.scope.expires_at.is_some_and(|t| t <= now) {
+                return Err(CapError::Expired);
             }
+            if self
+                .revoked
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(&cap.proof)
+            {
+                return Err(CapError::Revoked);
+            }
+            Ok(cap.scope.clone())
         }
 
         fn attenuate(&self, parent: &Cap, rights: CapRights) -> Result<Cap, CapError> {
@@ -408,8 +438,11 @@ mod tests {
     fn new_channel() -> (Channel<InMem, TestAuthority>, InMem, ChannelId, TestAuthority) {
         let id = ChannelId::from("c1");
         let backend = InMem::default();
-        let authority = TestAuthority;
-        let channel = Channel::new(id.clone(), backend.clone(), TestAuthority);
+        let authority = TestAuthority::default();
+        // Clone, not a second `default()`: the returned `authority` must be the
+        // SAME instance Channel holds (shared `revoked` set), so a test can call
+        // `authority.revoke(&cap)` and have Channel's own `member()` see it.
+        let channel = Channel::new(id.clone(), backend.clone(), authority.clone());
         (channel, backend, id, authority)
     }
 
@@ -472,6 +505,32 @@ mod tests {
             channel.join(&mint(&authority, "p1", &id, full(), Some(1))),
             Err(ChannelError::Cap(CapError::Expired))
         );
+    }
+
+    #[tokio::test]
+    async fn a_post_after_revocation_is_rejected() -> anyhow::Result<()> {
+        let (channel, _backend, id, authority) = new_channel();
+        let cap = mint(&authority, "p1", &id, full(), Some(later()));
+        let member = channel.join(&cap)?;
+        // Still admitted at this point — revocation hasn't happened yet.
+        channel
+            .post(&member, None, "text/plain", b"before".to_vec())
+            .await
+            .context("post before revocation")?;
+
+        authority.revoke(&cap);
+
+        // The membership entry is untouched (no leave() was called); only a
+        // fresh re-verify against the authority catches the revocation.
+        assert_eq!(
+            channel.post(&member, None, "text/plain", b"after".to_vec()).await,
+            Err(ChannelError::Cap(CapError::Revoked))
+        );
+        assert_eq!(
+            channel.subscribe(&member).err(),
+            Some(ChannelError::Cap(CapError::Revoked))
+        );
+        Ok(())
     }
 
     #[tokio::test]
