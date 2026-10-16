@@ -1,0 +1,29 @@
+[package]
+name = "sandy-proto"
+description = "The sandy agent-fabric channel envelope: a protobuf message contract (oneof message-type + sequence + metadata + opaque payload + content_type) and its codec"
+version.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+documentation = "https://docs.rs/sandy-proto"
+keywords = ["protobuf", "prost", "messaging", "agent", "sandbox"]
+categories = ["encoding", "network-programming"]
+
+[lints]
+workspace = true
+
+[dependencies]
+prost.workspace = true
+thiserror.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true
+protox.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+rstest.workspace = true

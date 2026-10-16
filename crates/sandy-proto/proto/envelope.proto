@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package sandy.proto.v1;
+
+// The channel envelope: the logical contract every channel backend carries
+// (spec sandy-agent-fabric.md §3.3). protobuf is its default codec; a text/chat
+// backend re-encodes the same envelope as structured text.
+//
+// Fields split into two layers:
+//   - the discriminator (`message_type`): which kind of message this is;
+//   - the body (`payload` + `content_type`): opaque content, text by default,
+//     a nested protobuf when structured.
+// The opaque body keeps the envelope stable while the per-type contracts evolve
+// (spec §8 open question), so a backend routes on the type without parsing the body.
+message Envelope {
+  // Monotonic per-channel ordering/dedup key assigned by the sender.
+  uint64 sequence = 1;
+
+  // Free-form routing/trace headers (e.g. channel id, sender, cap digest).
+  map<string, string> metadata = 2;
+
+  // Media type of `payload`. Empty means text (see CONTENT_TYPE_TEXT); a nested
+  // protobuf body sets it to application/protobuf (see CONTENT_TYPE_PROTOBUF).
+  string content_type = 3;
+
+  // Opaque message body: UTF-8 text by default, encoded bytes when structured.
+  // Never interpreted by the channel layer; routing is on `message_type`.
+  bytes payload = 4;
+
+  // The message-type discriminator. Step-1 variants are thin markers: the
+  // concrete per-type contracts are deferred (spec §8), so the content rides in
+  // `payload`. Field numbers 10+ leave room below for more top-level fields, and
+  // an unknown (future) variant tag decodes as an absent `message_type` rather
+  // than an error (forward compatibility).
+  oneof message_type {
+    Control control = 10;
+    Tty tty = 11;
+    Output output = 12;
+    Telemetry telemetry = 13;
+    Escalate escalate = 14;
+    PeerMsg peer_msg = 15;
+  }
+}
+
+// Orchestrator control: which channels/caps a sandbox should use.
+message Control {}
+
+// Interactive terminal traffic to/from a sandbox.
+message Tty {}
+
+// Captured job output recorded on the orchestrator channel.
+message Output {}
+
+// Optional telemetry sample (local-first; the channel is one sink).
+message Telemetry {}
+
+// Escalation toward a human on any device, independent of the orchestrator.
+message Escalate {}
+
+// A peer-group message: agents coordinating directly in a closed set.
+message PeerMsg {}

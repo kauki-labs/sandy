@@ -45,6 +45,13 @@ base64 = "0.23"
 portable-pty = "0.9"
 tiny_http = "0.12"
 
+# Channel envelope codec (sandy-proto). prost is the runtime codec; prost-build +
+# protox compile the .proto in build.rs. protox is a pure-Rust protobuf compiler,
+# so no external `protoc` is needed in the dev shell or the hermetic crane build.
+prost = "0.14"
+prost-build = "0.14"
+protox = "0.10"
+
 # Dev-only, shared so member crates test the same way.
 anyhow = "1.0.104"
 insta = { version = "1.48.0", features = ["json", "yaml", "redactions"] }
