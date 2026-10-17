@@ -78,9 +78,15 @@ async fn run(source: LinkSource, job: Vec<OsString>) -> Result<ExitStatus, Strin
 async fn accept_vsock_link(port: u32) -> Result<tokio_vsock::VsockStream, String> {
     let listener =
         link_source::VsockAcceptor::bind(port).map_err(|e| format!("listening on vsock port {port}: {e}"))?;
-    link_source::accept_host(listener)
+    let mut link = link_source::accept_host(listener)
         .await
-        .map_err(|e| format!("accepting the host's agent link on vsock port {port}: {e}"))
+        .map_err(|e| format!("accepting the host's agent link on vsock port {port}: {e}"))?;
+    // Tell the host the stream reached the agent, not only the hypervisor's
+    // vsock proxy, before the relay writes the cap.
+    tokio::io::AsyncWriteExt::write_all(&mut link, &[sandy_api::agent::AGENT_LINK_READY])
+        .await
+        .map_err(|e| format!("acknowledging the host's agent link: {e}"))?;
+    Ok(link)
 }
 
 /// vsock exists only inside a Linux guest.

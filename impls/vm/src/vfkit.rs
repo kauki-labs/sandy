@@ -16,22 +16,36 @@
 //!   green from the sandbox; its real-boot coverage binds into #26.
 
 use std::{
-    path::PathBuf,
-    sync::Mutex,
-    time::{Duration, SystemTime},
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant, SystemTime},
 };
 
 use sandy::{
     BackendError, BoxState, Hypervisor, Outcome, RunSpec, ShareDirs, StoreBacking, Topology, VmBackend,
     collect_outputs, ensure_sandy_staging_base, plan_shares, topology, wipe,
 };
-use sandy_api::share::{GuestShareTransport, ShareSpec};
+use sandy_api::{
+    agent::{AGENT_VSOCK_PORT, AgentLaunch, AgentReport, AgentVerdict},
+    share::{GuestShareTransport, ShareSpec},
+};
 use uuid::Uuid;
 
 use crate::{
+    agent::{agent_shell_command, connect_agent_link},
     console::{Markers, PtyTransport, run_console},
     share::VirtioFsTransport,
 };
+
+/// Agent mode: how long after the guest finishes to wait for the relay's
+/// verdict (as on the process backend, it follows the link closing at once).
+const VERDICT_GRACE: Duration = Duration::from_secs(10);
+
+/// The longest unix socket path macOS accepts (`sun_path`, less the NUL).
+const MAX_SOCKET_PATH: usize = 103;
 
 /// The guest boot-ready marker the console protocol scans for before injecting
 /// the command: the guest's login shell prints it once it is up and reading (the
@@ -51,13 +65,19 @@ const BOOT_READY_MARKER: &str = "SANDY-READY";
 pub struct StagedArgs {
     /// The guest virtio-fs shares, in argv order (inputs, outputs, then the secret).
     pub shares: Vec<ShareSpec>,
+    /// Agent mode (#238): the guest vsock port the agent listens on and the host
+    /// unix socket vfkit exposes it at, for the host to connect to.
+    pub agent_vsock: Option<(u32, PathBuf)>,
 }
 
 impl StagedArgs {
     /// A [`StagedArgs`] carrying the given virtio-fs shares.
     #[must_use]
     pub fn new(shares: Vec<ShareSpec>) -> Self {
-        Self { shares }
+        Self {
+            shares,
+            agent_vsock: None,
+        }
     }
 }
 
@@ -144,6 +164,16 @@ pub fn vfkit_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> R
         args.push(format!("virtio-vsock,cid={cid}"));
     }
 
+    // Agent mode (#238): vfkit exposes the guest agent's vsock port as a host unix
+    // socket, and `connect` makes the host the one that connects.
+    if let Some((port, socket)) = &staged.agent_vsock {
+        args.push("--device".to_string());
+        args.push(format!(
+            "virtio-vsock,port={port},socketURL={},connect",
+            socket.display()
+        ));
+    }
+
     Ok(args)
 }
 
@@ -158,6 +188,10 @@ pub struct VfkitBackend {
     vfkit_bin: PathBuf,
     /// The boxes launched and not yet reaped, reported by [`boxes`](VmBackend::boxes).
     instances: Mutex<Vec<BoxState>>,
+    /// When set, the job runs as the child of the image's sandbox agent (#238).
+    agent: Option<AgentLaunch>,
+    /// Set by an agent-mode backend's one run: its cap and channel serve one job.
+    agent_used: AtomicBool,
 }
 
 impl VfkitBackend {
@@ -168,7 +202,22 @@ impl VfkitBackend {
         Self {
             vfkit_bin: vfkit_bin.into(),
             instances: Mutex::new(Vec::new()),
+            agent: None,
+            agent_used: AtomicBool::new(false),
         }
+    }
+
+    /// Run the job behind the guest's sandbox agent (#238). The console launches
+    /// the agent the topology names (`agent_program`, the binary this image
+    /// carries; `agent.program` is not used by a VM backend), the host connects
+    /// to it over vsock, and `agent.on_link` gets the link from a connector
+    /// thread. The job's exit comes only from the relay's [`AgentReport`].
+    ///
+    /// An agent-mode backend runs ONE job; build one per sandbox run.
+    #[must_use]
+    pub fn with_agent(mut self, agent: AgentLaunch) -> Self {
+        self.agent = Some(agent);
+        self
     }
 }
 
@@ -188,13 +237,30 @@ impl VfkitBackend {
         run_id: Uuid,
         box_id: &str,
         shares: Vec<ShareSpec>,
+        agent: Option<&AgentRun>,
     ) -> Result<Outcome, BackendError> {
         // The shares (secret/input/output, their read-only flags, the #49 secret_dir
         // rule) are staged by `plan_shares` in `run`; here they only become argv. The
         // guest mounts each by tag with `nofail`, so order is irrelevant. The
         // `socket` field is unused by vfkit (no daemon). INV-1: only share metadata
         // travels here, never secret bytes.
-        let staged = StagedArgs::new(shares);
+        let mut staged = StagedArgs::new(shares);
+        // Agent mode: the console launches the image's agent around the job, and
+        // vfkit exposes the agent's vsock port as the run's host socket.
+        let agent_command;
+        let agent_spec;
+        let console_spec = match agent {
+            Some(agent) => {
+                staged.agent_vsock = Some((AGENT_VSOCK_PORT, agent.socket.clone()));
+                agent_command = [agent_shell_command(&agent.program, AGENT_VSOCK_PORT, spec.command)];
+                agent_spec = RunSpec {
+                    command: &agent_command,
+                    ..*spec
+                };
+                &agent_spec
+            }
+            None => spec,
+        };
         let args = vfkit_args(topology, spec, &staged)?;
 
         let mut transport = PtyTransport::open()?;
@@ -211,13 +277,35 @@ impl VfkitBackend {
             rvport: None,
         });
 
-        let markers = Markers::for_run(BOOT_READY_MARKER, run_id);
-        let outcome = run_console(&mut transport, spec, &markers);
+        // Agent mode: connect to the guest agent from a helper thread while the
+        // console drives the run, and hand the link to the relay once it answers.
+        let stop = Arc::new(AtomicBool::new(false));
+        let connector = match (&self.agent, agent) {
+            (Some(launch), Some(agent)) => Some(spawn_connector(
+                launch,
+                agent,
+                box_id,
+                // The console's command budget only starts once the guest has
+                // booted, so allow for the boot too; the stop flag still ends the
+                // connector as soon as the console run does.
+                Instant::now() + Duration::from_secs(u64::from(spec.timeout_secs.max(1)) * 2 + 120),
+                Arc::clone(&stop),
+            )),
+            _ => None,
+        };
 
-        // Teardown: stop vfkit and deregister.
+        let markers = Markers::for_run(BOOT_READY_MARKER, run_id);
+        let outcome = run_console(&mut transport, console_spec, &markers);
+
+        // The guest is done: stop connecting, then tear vfkit down and deregister.
+        stop.store(true, Ordering::SeqCst);
+        let verdict = connector.map(|(verdict, thread)| (verdict, thread.join().unwrap_or(false)));
         transport.shutdown();
         self.lock_registry()?.retain(|state| state.box_id != box_id);
-        Ok(outcome)
+        match verdict {
+            Some((verdict, linked)) => agent_outcome(outcome, &verdict, &spec.command.join(" "), linked),
+            None => Ok(outcome),
+        }
     }
 
     /// Lock the instance registry, mapping a poisoned lock to an infra fault.
@@ -228,13 +316,127 @@ impl VfkitBackend {
     }
 }
 
+/// One agent-mode run: the image's agent and the host socket vfkit exposes its
+/// vsock port at.
+#[derive(Debug)]
+struct AgentRun {
+    /// The agent's in-guest path, from the topology.
+    program: PathBuf,
+    /// The run's host unix socket, in the private staging base.
+    socket: PathBuf,
+}
+
+/// Start the thread that connects to the guest agent and hands the link to
+/// `launch.on_link`. Returns the receiver for the run's verdict.
+fn spawn_connector(
+    launch: &AgentLaunch,
+    agent: &AgentRun,
+    box_id: &str,
+    deadline: Instant,
+    stop: Arc<AtomicBool>,
+) -> (std::sync::mpsc::Receiver<AgentVerdict>, std::thread::JoinHandle<bool>) {
+    let (report, verdict) = AgentReport::channel();
+    let (on_link, socket, box_id) = (Arc::clone(&launch.on_link), agent.socket.clone(), box_id.to_string());
+    // Returns whether the link was handed to the relay.
+    let thread = std::thread::spawn(move || {
+        match connect_agent_link(|| std::os::unix::net::UnixStream::connect(&socket), deadline, &stop) {
+            Ok(link) => {
+                // A panic drops the report unresolved: the run is an infra fault.
+                let handed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| on_link(&box_id, link, report)));
+                if handed.is_err() {
+                    tracing::warn!(box_id, "the agent link handler (on_link) panicked");
+                }
+                // A panicking handler did not take the link, even if it kept the fd.
+                handed.is_ok()
+            }
+            Err(err) => {
+                report.agent_failed(format!("could not reach the guest agent: {err}"));
+                false
+            }
+        }
+    });
+    (verdict, thread)
+}
+
+/// Agent mode: the job's exit comes only from the relay's verdict, never from
+/// the console's `exit=` (INV-11).
+///
+/// A booted guest whose agent never took its link (`linked` false) is an infra
+/// fault, even when the console then timed out: the job never started, so the
+/// timeout is not the job's. Otherwise a run that did not complete keeps its
+/// timeout or transport fault, with no exit.
+fn agent_outcome(
+    mut outcome: Outcome,
+    verdict: &std::sync::mpsc::Receiver<AgentVerdict>,
+    job: &str,
+    linked: bool,
+) -> Result<Outcome, BackendError> {
+    if outcome.booted && !linked {
+        let why = match verdict.try_recv() {
+            Ok(AgentVerdict::AgentFailed(why)) => why,
+            _ => "the link was never handed to the relay".to_string(),
+        };
+        return Err(BackendError::Spawn(format!(
+            "the guest agent never took its link for `{job}`: {why}"
+        )));
+    }
+    if !outcome.booted || outcome.timed_out || outcome.transport_error.is_some() {
+        outcome.guest_exit = None;
+        return Ok(outcome);
+    }
+    match verdict.recv_timeout(VERDICT_GRACE) {
+        Ok(AgentVerdict::JobExited(code)) => {
+            outcome.guest_exit = Some(code);
+            Ok(outcome)
+        }
+        Ok(AgentVerdict::AgentFailed(why)) => Err(BackendError::Spawn(format!(
+            "the sandbox agent failed for `{job}`: {why}"
+        ))),
+        Err(_) => Err(BackendError::Spawn(format!(
+            "the sandbox agent's relay reported no verdict for `{job}`"
+        ))),
+    }
+}
+
+/// The run's agent socket in the private staging base, short enough for
+/// `sun_path`.
+fn agent_socket(base: &Path, run_id: Uuid) -> Result<PathBuf, BackendError> {
+    let id = run_id.simple().to_string();
+    let socket = base.join(format!("ag-{}.sock", &id[..12]));
+    if socket.as_os_str().len() > MAX_SOCKET_PATH {
+        return Err(BackendError::Spawn(format!(
+            "the agent socket path {} is longer than a unix socket allows ({MAX_SOCKET_PATH} bytes)",
+            socket.display()
+        )));
+    }
+    Ok(socket)
+}
+
 impl VmBackend for VfkitBackend {
     fn run(&self, spec: &RunSpec) -> Result<Outcome, BackendError> {
+        if self.agent.is_some() && self.agent_used.swap(true, Ordering::SeqCst) {
+            return Err(BackendError::Spawn(
+                "this agent-mode backend already ran its one job; build one per sandbox run".to_string(),
+            ));
+        }
         let topology = topology(spec.template)?;
         let run_id = Uuid::new_v4();
         let box_id = format!("inst-{run_id}");
         // Staging under the OS temp dir (works on macOS, where `/run` does not exist).
         let base = ensure_sandy_staging_base()?;
+        let agent = match &self.agent {
+            Some(_) => Some(AgentRun {
+                program: topology.agent_program.clone().ok_or_else(|| {
+                    BackendError::Spawn(
+                        "agent mode needs a topology that names its agent (agent_program); this image carries no \
+                         sandy-agent"
+                            .to_string(),
+                    )
+                })?,
+                socket: agent_socket(&base, run_id)?,
+            }),
+            None => None,
+        };
         let inst_dir = base.join(&box_id);
         let inputs_dir = base.join(format!("{box_id}-inputs"));
         let outputs_dir = base.join(format!("{box_id}-outputs"));
@@ -249,7 +451,7 @@ impl VmBackend for VfkitBackend {
                 outputs_dir: &outputs_dir,
             },
         )
-        .and_then(|shares| self.boot(&topology, spec, run_id, &box_id, shares));
+        .and_then(|shares| self.boot(&topology, spec, run_id, &box_id, shares, agent.as_ref()));
 
         // Collect outputs before wiping, only if the guest booted; a collection
         // failure surfaces as an infra fault rather than silently dropping output.
@@ -264,6 +466,12 @@ impl VmBackend for VfkitBackend {
             if let Err(err) = wipe(dir) {
                 tracing::warn!(dir = %dir.display(), %err, "failed to wipe staging on teardown");
             }
+        }
+        if let Some(agent) = &agent
+            && let Err(err) = std::fs::remove_file(&agent.socket)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(socket = %agent.socket.display(), %err, "failed to remove the agent socket");
         }
         collected.and(outcome)
     }
@@ -482,6 +690,207 @@ mod tests {
             "erofs store attached as a virtio-blk device: {joined}"
         );
         assert!(joined.contains("readonly"), "erofs store device is read-only: {joined}");
+        Ok(())
+    }
+
+    fn spec_for<'a>(template: &'a str, command: &'a [String], grants: &'a Grants) -> RunSpec<'a> {
+        RunSpec {
+            template,
+            command,
+            inputs: &[],
+            outputs: &[],
+            secrets: &[],
+            env: &[],
+            cpu: None,
+            mem: None,
+            timeout_secs: 60,
+            grants,
+            outcome_file: None,
+            secret_dir: None,
+        }
+    }
+
+    fn agent_backend() -> VfkitBackend {
+        VfkitBackend::new("/nonexistent/vfkit").with_agent(AgentLaunch {
+            program: PathBuf::new(),
+            on_link: Arc::new(|_: &str, _: std::os::fd::OwnedFd, _: AgentReport| {}),
+        })
+    }
+
+    fn fixture_path(name: &str) -> String {
+        format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    /// #238: agent mode exposes the guest agent's vsock port as the run's host
+    /// socket, with the host connecting.
+    #[test]
+    fn vfkit_args_expose_the_agent_port_for_the_host_to_connect() -> anyhow::Result<()> {
+        let topology = parse_topology(AARCH64_FIXTURE).context("parse aarch64 fixture")?;
+        let command = ["true".to_string()];
+        let grants = grants();
+        let staged = StagedArgs {
+            agent_vsock: Some((5000, PathBuf::from("/tmp/sandy/ag-0123456789ab.sock"))),
+            ..StagedArgs::default()
+        };
+        let args = vfkit_args(&topology, &spec_for("demo", &command, &grants), &staged)?;
+        assert!(
+            has_token_run(
+                &args,
+                &[
+                    "--device",
+                    "virtio-vsock,port=5000,socketURL=/tmp/sandy/ag-0123456789ab.sock,connect"
+                ]
+            ),
+            "{}",
+            args.join(" ")
+        );
+        Ok(())
+    }
+
+    /// #238: agent mode on an image whose topology names no agent is refused
+    /// before vfkit is spawned, never run as a bare console job.
+    #[test]
+    fn agent_mode_refuses_a_topology_without_an_agent() {
+        let template = fixture_path("topology-aarch64.json");
+        let command = ["true".to_string()];
+        let grants = grants();
+        let result = agent_backend().run(&spec_for(&template, &command, &grants));
+        assert!(
+            matches!(&result, Err(BackendError::Spawn(why)) if why.contains("agent_program")),
+            "got {result:?}"
+        );
+    }
+
+    /// #238: an agent-mode backend runs one job; a second run is refused.
+    #[test]
+    fn an_agent_mode_backend_refuses_a_second_run() {
+        let backend = agent_backend();
+        let template = fixture_path("topology-aarch64.json");
+        let command = ["true".to_string()];
+        let grants = grants();
+        let _ = backend.run(&spec_for(&template, &command, &grants));
+        let second = backend.run(&spec_for(&template, &command, &grants));
+        assert!(
+            matches!(&second, Err(BackendError::Spawn(why)) if why.contains("one job")),
+            "got {second:?}"
+        );
+    }
+
+    fn booted(exit: Option<i32>) -> Outcome {
+        Outcome {
+            booted: true,
+            guest_exit: exit,
+            transport_error: None,
+            timed_out: false,
+            console: String::new(),
+        }
+    }
+
+    /// INV-11 (#238): in agent mode the exit comes only from the verdict; the
+    /// console's own `exit=` is ignored, and no verdict or a failed agent is an
+    /// infra fault.
+    #[test]
+    fn agent_outcome_takes_the_exit_only_from_the_verdict() -> anyhow::Result<()> {
+        let (report, verdict) = AgentReport::channel();
+        report.job_exited(7);
+        assert_eq!(
+            agent_outcome(booted(Some(0)), &verdict, "job", true)?.guest_exit,
+            Some(7)
+        );
+
+        let (report, verdict) = AgentReport::channel();
+        report.agent_failed("refused");
+        let failed = agent_outcome(booted(Some(0)), &verdict, "job", true);
+        assert!(
+            matches!(&failed, Err(BackendError::Spawn(why)) if why.contains("refused")),
+            "got {failed:?}"
+        );
+
+        let (report, verdict) = AgentReport::channel();
+        drop(report);
+        let silent = agent_outcome(booted(Some(0)), &verdict, "job", true);
+        assert!(matches!(&silent, Err(BackendError::Spawn(_))), "got {silent:?}");
+        Ok(())
+    }
+
+    /// A run that timed out keeps its timeout and gets no exit, without waiting
+    /// on the verdict.
+    #[test]
+    fn agent_outcome_keeps_a_timeout_without_an_exit() -> anyhow::Result<()> {
+        let (_report, verdict) = AgentReport::channel();
+        let mut timed_out = booted(Some(0));
+        timed_out.timed_out = true;
+        let started = std::time::Instant::now();
+        let outcome = agent_outcome(timed_out, &verdict, "job", true)?;
+        assert!(outcome.timed_out && outcome.guest_exit.is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "must not wait on the verdict"
+        );
+        Ok(())
+    }
+
+    /// CodeRabbit on #244: a guest whose agent never took its link is an infra
+    /// fault even when the console then timed out, carrying the connector's
+    /// reason; the timeout is not the job's, since the job never started.
+    #[test]
+    fn a_never_taken_link_is_infra_even_when_the_console_timed_out() {
+        let (report, verdict) = AgentReport::channel();
+        report.agent_failed("could not reach the guest agent: timed out");
+        let mut timed_out = booted(None);
+        timed_out.timed_out = true;
+        let result = agent_outcome(timed_out, &verdict, "job", false);
+        assert!(
+            matches!(&result, Err(BackendError::Spawn(why)) if why.contains("never took its link") && why.contains("could not reach")),
+            "got {result:?}"
+        );
+    }
+
+    /// CodeRabbit on #244: a panicking `on_link` has not taken the link, even if
+    /// it kept the fd first, so the connector reports it as never linked.
+    #[test]
+    fn a_panicking_link_handler_counts_as_never_linked() -> anyhow::Result<()> {
+        use std::io::Write;
+        let dir = tempfile::tempdir()?;
+        let socket = dir.path().join("agent.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket)?;
+        std::thread::spawn(move || {
+            if let Ok((mut conn, _)) = listener.accept() {
+                let _ = conn.write_all(&[sandy_api::agent::AGENT_LINK_READY]);
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        });
+        let launch = AgentLaunch {
+            program: PathBuf::new(),
+            on_link: Arc::new(|_: &str, link: std::os::fd::OwnedFd, _: AgentReport| {
+                std::mem::forget(link);
+                panic!("relay setup failed after keeping the fd");
+            }),
+        };
+        let agent = AgentRun {
+            program: PathBuf::new(),
+            socket,
+        };
+        let (_verdict, thread) = spawn_connector(
+            &launch,
+            &agent,
+            "box",
+            std::time::Instant::now() + Duration::from_secs(10),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(
+            !thread.join().unwrap_or(true),
+            "a panicking handler must not count as linked"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_agent_socket_fits_a_unix_socket_path() -> anyhow::Result<()> {
+        let short = agent_socket(Path::new("/tmp/sandy"), Uuid::nil())?;
+        assert!(short.as_os_str().len() <= MAX_SOCKET_PATH);
+        let long = agent_socket(Path::new(&"/x".repeat(60)), Uuid::nil());
+        assert!(matches!(long, Err(BackendError::Spawn(_))), "got {long:?}");
         Ok(())
     }
 

@@ -13,6 +13,7 @@
 //! keeps its heavy PTY dependency (`portable-pty`) out of a local-only build
 //! (`sandy-backend` default features, `impl-vm` off). See #147.
 
+mod agent;
 mod console;
 mod qemu;
 mod share;

@@ -21,11 +21,22 @@ use std::{
 /// Called with a run's box id, the host end of its agent link, and the handle
 /// to report the run's verdict on, right after the agent is launched.
 ///
-/// It runs on the thread that called [`VmBackend::run`](crate::backend::VmBackend::run),
-/// with no async runtime guaranteed. It must not block (start the relay
+/// It runs on a thread the backend owns (the one that called
+/// [`VmBackend::run`](crate::backend::VmBackend::run), or a VM backend's link
+/// connector), with no async runtime guaranteed. It must not block (start the relay
 /// elsewhere and return) and should not panic; a panic fails the run as an
 /// infra fault.
 pub type OnLink = Arc<dyn Fn(&str, OwnedFd, AgentReport) + Send + Sync>;
+
+/// The vsock port a VM backend's guest agent listens on for its link (#238).
+pub const AGENT_VSOCK_PORT: u32 = 5_000;
+
+/// The byte the guest agent writes as soon as it accepts the host's link
+/// connection (#238). A hypervisor's vsock proxy (vfkit) accepts the host's
+/// socket before it dials the guest, so a connected socket alone does not mean
+/// the agent is there; the host hands the link to the relay, which writes the
+/// cap first, only after this byte arrives.
+pub const AGENT_LINK_READY: u8 = b'S';
 
 /// How a backend launches the sandbox agent.
 ///

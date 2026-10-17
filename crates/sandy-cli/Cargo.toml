@@ -63,6 +63,11 @@ uuid.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+sandy-fabric.workspace = true
+sandy-fabric-local.workspace = true
+sandy-proto.workspace = true
 rustix.workspace = true
 rstest.workspace = true
 sandy-test-support.workspace = true
