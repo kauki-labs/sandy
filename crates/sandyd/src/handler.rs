@@ -12,7 +12,8 @@ use sandy_control_proto::{
     AttachResponse, CancelResponse, ControlError, ControlRequest, ControlResponse, JobSummary as WireJobSummary,
     ListResponse, StatusResponse, SubmitResponse, control_request, control_response,
 };
-use sandy_fabric::capauth::{CapCodecError, encode_cap};
+use sandy_fabric::capauth::{Cap, CapCodecError, decode_cap, encode_cap};
+use sandy_orchestrator::{JobManifest, MANIFEST_ENCODING_JSON, derive_job_caps};
 use uuid::Uuid;
 
 use crate::{
@@ -44,6 +45,63 @@ pub enum HandlerError {
     Cap(#[from] CapCodecError),
 }
 
+/// Decode `submit.submitter_caps` and, if the manifest requests anything
+/// beyond the job's own dedicated channel, bound it against what the
+/// submitter holds (decision C-at-Submit, #226). Returns the caps to attach
+/// to the job (empty for a direct-mint submission), or a [`ControlError`]
+/// naming the refusal — never silently grants more than this function itself
+/// verified.
+///
+/// **Policy: trust comes from the connection, not from whether
+/// `submitter_caps` is present.** In the local-UDS MVP, the 0700 socket IS
+/// the trust boundary — only the local operator reaches it — so an empty
+/// `submitter_caps` is the direct-mint path, exactly as before this block,
+/// and is *not* a silent way to skip bounding: there is nothing to bound,
+/// since the job gets only its own dedicated channel either way. The one
+/// case this function refuses outright is a submitter presenting caps for a
+/// manifest it cannot decode (an unrecognized `manifest_encoding`) — never
+/// silently ignoring caps the submitter explicitly went to the trouble of
+/// presenting. Once an untrusted submitter reaches Submit (cross-machine via
+/// B6, or a sub-agent submitting a sub-job), THAT connection must always
+/// carry `submitter_caps` and go through this path — gating on the
+/// connection's own trust level is a future block's job, not this
+/// function's; this function only decides what a given `SubmitRequest`'s
+/// frame is allowed to grant.
+fn resolve_granted_caps(
+    manifest: &[u8],
+    manifest_encoding: &str,
+    submitter_caps: &[Vec<u8>],
+    authority: &sandy_fabric_local::SharedCapAuthority,
+) -> Result<Vec<Cap>, ControlError> {
+    if submitter_caps.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let submitter_caps: Vec<Cap> = submitter_caps
+        .iter()
+        .map(|bytes| decode_cap(bytes))
+        .collect::<Result<_, _>>()
+        .map_err(|e| ControlError {
+            message: format!("could not decode a submitter capability: {e}"),
+        })?;
+
+    if manifest_encoding != MANIFEST_ENCODING_JSON {
+        return Err(ControlError {
+            message: format!(
+                "submitter presented capabilities but manifest_encoding {manifest_encoding:?} is not understood; \
+                 cannot bound this request"
+            ),
+        });
+    }
+    let parsed: JobManifest = serde_json::from_slice(manifest).map_err(|e| ControlError {
+        message: format!("manifest did not decode as a JobManifest: {e}"),
+    })?;
+
+    derive_job_caps(authority, &submitter_caps, &parsed).map_err(|e| ControlError {
+        message: format!("capability request refused: {e}"),
+    })
+}
+
 /// Handle `request` against `store` and `registry`, blocking on the store's
 /// synchronous connection via `spawn_blocking` so the connection's async
 /// read/write loop is never held up by it. Takes `store` by `&Arc`, cloning
@@ -59,6 +117,25 @@ pub async fn handle(
 ) -> Result<ControlResponse, HandlerError> {
     let result = match request.op {
         Some(control_request::Op::Submit(submit)) => {
+            // Decision C-at-Submit (#226): bound before anything else is
+            // created. A refusal here must leave no trace — no channel, no
+            // store row — the same "fail before any side effect" shape the
+            // existing mint-then-persist ordering below already follows.
+            let granted_caps = match resolve_granted_caps(
+                &submit.manifest,
+                &submit.manifest_encoding,
+                &submit.submitter_caps,
+                registry.authority(),
+            ) {
+                Ok(granted) => granted,
+                Err(control_error) => {
+                    return Ok(ControlResponse {
+                        request_id: request.request_id,
+                        result: Some(control_response::Result::Error(control_error)),
+                    });
+                }
+            };
+
             let job_id = Uuid::new_v4().to_string();
             let manifest = submit.manifest;
             let encoding = submit.manifest_encoding;
@@ -70,7 +147,8 @@ pub async fn handle(
             // row was already written, the row would be stranded `Pending`
             // with no channel, and `Attach` would misreport it as
             // "restarted since submit?" instead of surfacing the real fault.
-            let job_channel = dispatch::mint_job_channel(&job_id).await?;
+            let mut job_channel = dispatch::mint_job_channel(&job_id, registry.authority()).await?;
+            job_channel.granted_caps = granted_caps;
             tokio::task::spawn_blocking(move || store.insert_pending(&inserted_id, &manifest, &encoding)).await??;
             registry.insert(job_id.clone(), job_channel);
 
@@ -182,16 +260,63 @@ fn cap_has_expired(cap: &sandy_fabric::capauth::Cap) -> bool {
 mod tests {
     use anyhow::Context;
     use sandy_control_proto::{AttachRequest, CancelRequest, JobStatus, ListRequest, StatusRequest, SubmitRequest};
-    use sandy_fabric::capauth::decode_cap;
+    use sandy_fabric::{
+        capauth::{CapAuthority, CapRights, CapScope},
+        types::{ChannelId, PeerId},
+    };
+    use sandy_orchestrator::{CapRequest, JobEntrypoint};
 
     use super::*;
+
+    fn full_rights() -> CapRights {
+        CapRights {
+            post: true,
+            read: true,
+            invite: true,
+        }
+    }
+
+    fn read_only() -> CapRights {
+        CapRights {
+            read: true,
+            ..CapRights::default()
+        }
+    }
+
+    fn entrypoint() -> JobEntrypoint {
+        JobEntrypoint {
+            command: vec!["true".to_owned()],
+        }
+    }
+
+    fn manifest_json(requested_caps: Vec<CapRequest>) -> Vec<u8> {
+        serde_json::to_vec(&JobManifest {
+            entrypoint: entrypoint(),
+            requested_caps,
+        })
+        .expect("encode JobManifest")
+    }
+
+    fn submit_req_with_caps(id: u64, manifest: Vec<u8>, submitter_caps: Vec<Cap>) -> ControlRequest {
+        req(
+            id,
+            control_request::Op::Submit(SubmitRequest {
+                manifest,
+                manifest_encoding: MANIFEST_ENCODING_JSON.to_owned(),
+                submitter_caps: submitter_caps
+                    .iter()
+                    .map(|c| encode_cap(c).expect("encode cap"))
+                    .collect(),
+            }),
+        )
+    }
 
     fn new_store() -> Arc<JobStore> {
         Arc::new(JobStore::open_in_memory().expect("in-memory store"))
     }
 
     fn new_registry() -> Arc<JobRegistry> {
-        Arc::new(JobRegistry::default())
+        Arc::new(JobRegistry::new().expect("getrandom for a test registry"))
     }
 
     fn req(id: u64, op: control_request::Op) -> ControlRequest {
@@ -207,6 +332,7 @@ mod tests {
             control_request::Op::Submit(SubmitRequest {
                 manifest: b"m".to_vec(),
                 manifest_encoding: "test/v1".to_owned(),
+                submitter_caps: Vec::new(),
             }),
         )
     }
@@ -385,6 +511,7 @@ mod tests {
                 agent_cap: job.agent_cap.clone(),
                 observer_cap: expired_cap,
                 remote_link: None,
+                granted_caps: job.granted_caps.clone(),
             },
         );
 
@@ -400,6 +527,270 @@ mod tests {
             }
             other => anyhow::bail!("expected a refusal, got {other:?}"),
         }
+        Ok(())
+    }
+
+    // ---- Decision C-at-Submit (#226) ----
+
+    /// Positive: a submitter holding `full_rights` on a channel can submit a
+    /// job requesting a strictly narrower right there; the job is accepted.
+    #[tokio::test]
+    async fn a_submitter_holding_a_cap_can_submit_a_job_requesting_a_narrower_right() -> anyhow::Result<()> {
+        let (store, registry) = (new_store(), new_registry());
+        let submitter_cap = registry.authority().mint(CapScope {
+            peer: PeerId::from("operator"),
+            channel: ChannelId::from("peer-group-1"),
+            rights: full_rights(),
+            expires_at: None,
+        })?;
+        let manifest = manifest_json(vec![CapRequest {
+            channel_id: ChannelId::from("peer-group-1"),
+            rights: read_only(),
+        }]);
+
+        let response = handle(
+            &store,
+            &registry,
+            submit_req_with_caps(1, manifest, vec![submitter_cap]),
+        )
+        .await?;
+        assert!(
+            matches!(response.result, Some(control_response::Result::Submit(_))),
+            "got {:?}",
+            response.result
+        );
+        Ok(())
+    }
+
+    /// Positive: requesting EXACTLY what the submitter holds (not just
+    /// strictly narrower) is also accepted — decision C bounds at-or-below,
+    /// not strictly-below.
+    #[tokio::test]
+    async fn a_submitter_can_submit_a_job_requesting_exactly_what_they_hold() -> anyhow::Result<()> {
+        let (store, registry) = (new_store(), new_registry());
+        let submitter_cap = registry.authority().mint(CapScope {
+            peer: PeerId::from("operator"),
+            channel: ChannelId::from("peer-group-1"),
+            rights: read_only(),
+            expires_at: None,
+        })?;
+        let manifest = manifest_json(vec![CapRequest {
+            channel_id: ChannelId::from("peer-group-1"),
+            rights: read_only(),
+        }]);
+
+        let response = handle(
+            &store,
+            &registry,
+            submit_req_with_caps(1, manifest, vec![submitter_cap]),
+        )
+        .await?;
+        assert!(
+            matches!(response.result, Some(control_response::Result::Submit(_))),
+            "got {:?}",
+            response.result
+        );
+        Ok(())
+    }
+
+    /// Adversarial: a manifest requesting MORE than the submitter holds is
+    /// refused outright — never a silent narrowing to what it held, and no
+    /// job is created (checked via `list` staying empty).
+    #[tokio::test]
+    async fn a_request_exceeding_the_submitters_held_rights_refuses_the_whole_submit() -> anyhow::Result<()> {
+        let (store, registry) = (new_store(), new_registry());
+        let submitter_cap = registry.authority().mint(CapScope {
+            peer: PeerId::from("operator"),
+            channel: ChannelId::from("peer-group-1"),
+            rights: read_only(),
+            expires_at: None,
+        })?;
+        let manifest = manifest_json(vec![CapRequest {
+            channel_id: ChannelId::from("peer-group-1"),
+            rights: full_rights(),
+        }]);
+
+        let response = handle(
+            &store,
+            &registry,
+            submit_req_with_caps(1, manifest, vec![submitter_cap]),
+        )
+        .await?;
+        match response.result {
+            Some(control_response::Result::Error(ControlError { message })) => {
+                assert!(message.contains("refused"), "got {message:?}");
+            }
+            other => anyhow::bail!("expected a refusal, got {other:?}"),
+        }
+
+        let list = handle(&store, &registry, req(2, control_request::Op::List(ListRequest {}))).await?;
+        match list.result {
+            Some(control_response::Result::List(ListResponse { jobs })) => {
+                assert!(jobs.is_empty(), "a refused submit must create no job: {jobs:?}");
+            }
+            other => anyhow::bail!("expected a List response, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// Adversarial: a submitter with no cap at all for the requested channel
+    /// is refused that capability, not granted one anyway.
+    #[tokio::test]
+    async fn a_submitter_with_no_cap_on_the_requested_channel_is_refused() -> anyhow::Result<()> {
+        let (store, registry) = (new_store(), new_registry());
+        let submitter_cap = registry.authority().mint(CapScope {
+            peer: PeerId::from("operator"),
+            channel: ChannelId::from("some-other-channel"),
+            rights: full_rights(),
+            expires_at: None,
+        })?;
+        let manifest = manifest_json(vec![CapRequest {
+            channel_id: ChannelId::from("peer-group-1"),
+            rights: read_only(),
+        }]);
+
+        let response = handle(
+            &store,
+            &registry,
+            submit_req_with_caps(1, manifest, vec![submitter_cap]),
+        )
+        .await?;
+        match response.result {
+            Some(control_response::Result::Error(ControlError { message })) => {
+                assert!(message.contains("refused"), "got {message:?}");
+            }
+            other => anyhow::bail!("expected a refusal, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// Adversarial: a forged submitter cap (tampered proof) refuses the whole
+    /// submit — `attenuate`'s own re-verify catches it, not trusted blind
+    /// because it arrived in `submitter_caps`.
+    #[tokio::test]
+    async fn a_forged_submitter_cap_refuses_the_whole_submit() -> anyhow::Result<()> {
+        let (store, registry) = (new_store(), new_registry());
+        let mut forged_cap = registry.authority().mint(CapScope {
+            peer: PeerId::from("operator"),
+            channel: ChannelId::from("peer-group-1"),
+            rights: full_rights(),
+            expires_at: None,
+        })?;
+        forged_cap.proof[0] ^= 0xFF; // tamper the proof
+        let manifest = manifest_json(vec![CapRequest {
+            channel_id: ChannelId::from("peer-group-1"),
+            rights: read_only(),
+        }]);
+
+        let response = handle(&store, &registry, submit_req_with_caps(1, manifest, vec![forged_cap])).await?;
+        match response.result {
+            Some(control_response::Result::Error(ControlError { message })) => {
+                assert!(message.contains("refused"), "got {message:?}");
+            }
+            other => anyhow::bail!("expected a refusal, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// Adversarial: an expired submitter cap refuses the whole submit, the
+    /// same as a forged one — `attenuate` re-verifies expiry too.
+    #[tokio::test]
+    async fn an_expired_submitter_cap_refuses_the_whole_submit() -> anyhow::Result<()> {
+        let (store, registry) = (new_store(), new_registry());
+        let expired_cap = registry.authority().mint(CapScope {
+            peer: PeerId::from("operator"),
+            channel: ChannelId::from("peer-group-1"),
+            rights: full_rights(),
+            expires_at: Some(0), // the distant past
+        })?;
+        let manifest = manifest_json(vec![CapRequest {
+            channel_id: ChannelId::from("peer-group-1"),
+            rights: read_only(),
+        }]);
+
+        let response = handle(&store, &registry, submit_req_with_caps(1, manifest, vec![expired_cap])).await?;
+        match response.result {
+            Some(control_response::Result::Error(ControlError { message })) => {
+                assert!(message.contains("refused"), "got {message:?}");
+            }
+            other => anyhow::bail!("expected a refusal, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// Adversarial: a revoked submitter cap refuses the whole submit — the
+    /// same `attenuate` re-verify that catches forged/expired caps also
+    /// catches revocation.
+    #[tokio::test]
+    async fn a_revoked_submitter_cap_refuses_the_whole_submit() -> anyhow::Result<()> {
+        let (store, registry) = (new_store(), new_registry());
+        let cap = registry.authority().mint(CapScope {
+            peer: PeerId::from("operator"),
+            channel: ChannelId::from("peer-group-1"),
+            rights: full_rights(),
+            expires_at: None,
+        })?;
+        registry.authority().revoke(&cap);
+        let manifest = manifest_json(vec![CapRequest {
+            channel_id: ChannelId::from("peer-group-1"),
+            rights: read_only(),
+        }]);
+
+        let response = handle(&store, &registry, submit_req_with_caps(1, manifest, vec![cap])).await?;
+        match response.result {
+            Some(control_response::Result::Error(ControlError { message })) => {
+                assert!(message.contains("refused"), "got {message:?}");
+            }
+            other => anyhow::bail!("expected a refusal, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// Adversarial: a submitter presents caps, but the manifest's
+    /// `manifest_encoding` is one `sandyd` doesn't understand — the caps must
+    /// never be silently ignored (which would waive the bounding the
+    /// submitter explicitly opted into); the whole submit is refused instead.
+    #[tokio::test]
+    async fn presented_caps_with_an_unrecognized_manifest_encoding_refuse_the_submit() -> anyhow::Result<()> {
+        let (store, registry) = (new_store(), new_registry());
+        let submitter_cap = registry.authority().mint(CapScope {
+            peer: PeerId::from("operator"),
+            channel: ChannelId::from("peer-group-1"),
+            rights: full_rights(),
+            expires_at: None,
+        })?;
+        let request = req(
+            1,
+            control_request::Op::Submit(SubmitRequest {
+                manifest: b"opaque".to_vec(),
+                manifest_encoding: "application/octet-stream".to_owned(),
+                submitter_caps: vec![encode_cap(&submitter_cap)?],
+            }),
+        );
+
+        let response = handle(&store, &registry, request).await?;
+        match response.result {
+            Some(control_response::Result::Error(ControlError { message })) => {
+                assert!(message.contains("not understood"), "got {message:?}");
+            }
+            other => anyhow::bail!("expected a refusal, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// A direct-mint submit (no `submitter_caps`, the trusted-local-operator
+    /// path, #226's policy: trust from the connection, not the frame) is
+    /// completely unaffected by any of the above — unchanged from before this
+    /// block, including an opaque, undecodable manifest.
+    #[tokio::test]
+    async fn a_direct_mint_submit_with_no_submitter_caps_is_unaffected() -> anyhow::Result<()> {
+        let (store, registry) = (new_store(), new_registry());
+        let response = handle(&store, &registry, submit_req(1)).await?;
+        assert!(
+            matches!(response.result, Some(control_response::Result::Submit(_))),
+            "got {:?}",
+            response.result
+        );
         Ok(())
     }
 }

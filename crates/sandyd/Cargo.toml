@@ -25,10 +25,12 @@ sandy-control-proto.workspace = true
 sandy-fabric.workspace = true
 sandy-fabric-local.workspace = true
 sandy-fsutil.workspace = true
+sandy-orchestrator.workspace = true
 fs2.workspace = true
 rustix.workspace = true
 getrandom.workspace = true
 rusqlite.workspace = true
+serde_json.workspace = true
 tokio = { workspace = true, features = [
   "rt-multi-thread",
   "net",

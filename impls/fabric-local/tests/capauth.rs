@@ -11,7 +11,7 @@ use sandy_fabric::{
     contract::capauth_suite,
     types::{ChannelId, PeerId},
 };
-use sandy_fabric_local::LocalCapAuthority;
+use sandy_fabric_local::{LocalCapAuthority, SharedCapAuthority};
 
 /// Any sane literal: test-local, not a production default.
 const TEST_DEFAULT_TTL: Duration = Duration::from_secs(3600);
@@ -129,4 +129,38 @@ fn the_suite_rejects_a_signer_that_skips_verification() {
     let make =
         || BrokenAuthority(LocalCapAuthority::new(TEST_DEFAULT_TTL).expect("getrandom for a fresh local authority"));
     assert!(capauth_suite(make).is_err());
+}
+
+#[test]
+fn shared_cap_authority_passes_the_capauthority_contract() -> anyhow::Result<()> {
+    capauth_suite(|| {
+        SharedCapAuthority::new(
+            LocalCapAuthority::new(TEST_DEFAULT_TTL).expect("getrandom for a fresh local authority"),
+        )
+    })
+    .context("capauth_suite")
+}
+
+/// The whole point of [`SharedCapAuthority`] (#226): two clones of the SAME
+/// wrapped authority recognize each other's caps, unlike two independent
+/// [`LocalCapAuthority`] instances (`a_cap_minted_by_a_different_authority_is_forged`,
+/// above).
+#[test]
+fn two_clones_of_the_same_shared_authority_recognize_each_others_caps() -> anyhow::Result<()> {
+    let authority = SharedCapAuthority::new(LocalCapAuthority::new(TEST_DEFAULT_TTL).context("authority")?);
+    let other_handle = authority.clone();
+
+    let cap = authority
+        .mint(scope(full_rights(), None))
+        .context("mint via one handle")?;
+    other_handle.verify(&cap).context("verify via the other handle")?;
+
+    let narrower = CapRights {
+        read: true,
+        ..CapRights::default()
+    };
+    other_handle
+        .attenuate(&cap, narrower)
+        .context("attenuate via the other handle")?;
+    Ok(())
 }

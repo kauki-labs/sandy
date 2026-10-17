@@ -64,6 +64,19 @@ message SubmitRequest {
   // once B3 defines it). Empty/unset means "undefined, reject" — never a
   // silent default interpretation of unknown bytes.
   string manifest_encoding = 2;
+  // Capabilities the submitter itself holds, each an `encode_cap`-encoded
+  // `sandy_fabric::capauth::Cap` (#226, decision C-at-Submit). The submitter's
+  // identity is carried inside each cap's own `scope.peer` — no separate
+  // identity field. Bearer-cap authn, the same mechanism every other seam in
+  // the fabric already uses (Channel::join, AttachResponse's cap, the agent
+  // bootstrap handoff), not a connection-level identity: trust that a
+  // connection may submit AT ALL still comes from the transport (the 0700
+  // UDS socket today), these caps only bound WHAT a manifest's additional
+  // `requested_caps` may be granted. Empty means the manifest requests
+  // nothing beyond the job's own dedicated channel — sandyd mints that
+  // directly, as it always has; it is never a silent way to escalate a
+  // REQUESTED cap past what would otherwise be checked.
+  repeated bytes submitter_caps = 3;
 }
 
 message SubmitResponse {

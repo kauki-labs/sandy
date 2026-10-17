@@ -15,19 +15,20 @@
 //! status just honestly never advances past `Pending` until the executor
 //! wiring lands and actually dispatches it.
 //!
-//! **Known, tracked gap (#226): caps are minted directly, not derived from
-//! the submitter.** [`mint_job_channel`] mints the agent/observer caps
-//! straight from a fresh [`LocalCapAuthority`], with no reference to who
-//! submitted the job or what THEY hold — decision C (a job's caps bounded by
-//! the submitter's own attenuation, enforced by #219's `derive_job_caps`, not
-//! called here) is not wired in. That is a deliberate, acceptable shape for a
-//! single trusted local operator submitting through `sandyd`'s own control
-//! RPC — there is no untrusted submitter yet, and no submitter identity/caps
-//! reach this layer to derive from. It stops being safe the moment a
-//! submitter is anything other than the orchestrator itself (a cross-machine
-//! client, a sub-agent submitting a sub-job). #226 tracks wiring the
-//! submitter's identity and held caps into Submit and calling
-//! `derive_job_caps` instead of minting directly.
+//! **Decision C-at-Submit (#226).** A job's OWN dedicated channel (this
+//! module) is always minted directly by [`JobRegistry`]'s one persistent
+//! [`SharedCapAuthority`] — that is infrastructure sandyd itself owns, not
+//! something a submitter's held caps bound (the same way every orchestrator
+//! channel in the all-local MVP is minted fresh per sandbox, a composition-
+//! root responsibility, agent-fabric.md §11). What decision C bounds is a
+//! manifest's ADDITIONAL `requested_caps`, onto channels the submitter
+//! already participates in (its own orchestrator channel, a peer group it
+//! was invited to, …) — [`crate::handler`] calls `derive_job_caps`
+//! (`sandy-orchestrator`, #219) against this same shared authority for that,
+//! once a manifest actually requests something. The registry's authority is
+//! persistent (not fresh per job) specifically so a submitter's held caps —
+//! minted under this same authority at some point before Submit — verify
+//! against it.
 
 use std::{
     collections::HashMap,
@@ -39,7 +40,7 @@ use sandy_fabric::{
     capauth::{Cap, CapAuthority, CapError, CapRights, CapScope},
     types::{ChannelId, PeerId},
 };
-use sandy_fabric_local::{LocalCapAuthority, channel::Channel, inmem::InMem};
+use sandy_fabric_local::{LocalCapAuthority, SharedCapAuthority, channel::Channel, inmem::InMem};
 
 use crate::link_auth::{self, LinkAuthError, RemoteLink};
 
@@ -47,7 +48,7 @@ use crate::link_auth::{self, LinkAuthError, RemoteLink};
 pub struct JobChannel {
     /// The channel itself, keyed by the job's own id (spec §3.4: dedicated,
     /// one per sandbox).
-    pub channel: Arc<Channel<InMem, LocalCapAuthority>>,
+    pub channel: Arc<Channel<InMem, SharedCapAuthority>>,
     /// The bootstrap cap the agent will present to join (post + read, no
     /// invite — the agent speaks for itself, it does not grow this channel's
     /// membership). Handed to the agent over its link once dispatch wires
@@ -63,6 +64,17 @@ pub struct JobChannel {
     /// authenticate — `serve_agent_link` runs directly over a private
     /// socketpair there. Set at dispatch, never mutated after.
     pub remote_link: Option<RemoteLink>,
+    /// Caps derived from the manifest's `requested_caps`, bounded by the
+    /// submitter's own held caps (decision C, #226) — scoped to channels
+    /// OTHER than this job's own (e.g. the submitter's orchestrator channel,
+    /// a peer group). Empty for a direct-mint submission (no `submitter_caps`
+    /// presented) or a manifest requesting nothing extra. Not yet consumed:
+    /// there is no agent/dispatch-core wiring yet to hand these to (same
+    /// honest gap as the rest of this module) — `derive_job_caps` enforcing
+    /// the bound AT SUBMIT TIME (refusing an over-broad request before a job
+    /// is ever created) is #226's actual deliverable; handing the granted
+    /// caps to a running job is dispatch-core's job once it exists.
+    pub granted_caps: Vec<Cap>,
 }
 
 /// A dispatch failure.
@@ -81,14 +93,17 @@ pub enum DispatchError {
 /// jobs can actually run long enough for it to matter.
 const CAP_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Mint `job_id`'s dedicated channel plus its agent and observer caps.
+/// Mint `job_id`'s dedicated channel plus its agent and observer caps, from
+/// `authority` — the registry's one persistent [`SharedCapAuthority`], not a
+/// fresh one per job (#226: a submitter's held caps, verified against this
+/// same authority elsewhere in Submit, only mean anything if the daemon's
+/// caps all come from one shared signing key). `granted_caps` is attached
+/// separately by the caller once decided (empty for a direct-mint submit).
 ///
 /// # Errors
-/// [`DispatchError::Cap`] if the capability authority cannot mint (e.g. no OS
-/// entropy); [`DispatchError::Channel`] if the channel's backend cannot be
-/// constructed.
-pub async fn mint_job_channel(job_id: &str) -> Result<JobChannel, DispatchError> {
-    let authority = LocalCapAuthority::new(CAP_TTL)?;
+/// [`DispatchError::Cap`] if the capability authority cannot mint;
+/// [`DispatchError::Channel`] if the channel's backend cannot be constructed.
+pub async fn mint_job_channel(job_id: &str, authority: &SharedCapAuthority) -> Result<JobChannel, DispatchError> {
     let channel_id = ChannelId::from(job_id);
 
     let agent_cap = authority.mint(CapScope {
@@ -112,25 +127,46 @@ pub async fn mint_job_channel(job_id: &str) -> Result<JobChannel, DispatchError>
         expires_at: None,
     })?;
 
-    let channel = Channel::new(channel_id, InMem::default(), authority).await?;
+    let channel = Channel::new(channel_id, InMem::default(), authority.clone()).await?;
     Ok(JobChannel {
         channel: Arc::new(channel),
         agent_cap,
         observer_cap,
         remote_link: None,
+        granted_caps: Vec::new(),
     })
 }
 
-/// Every submitted job's minted channel, keyed by job id. Process-local and
+/// Every submitted job's minted channel, keyed by job id, plus the one
+/// [`SharedCapAuthority`] every job's channel and every submitter-held cap
+/// verified at Submit are minted/checked against (#226). Process-local and
 /// ephemeral by design — channels are in-memory (the all-local MVP's step-1
 /// `ChannelBackend`), so this registry holds no state that needs to survive a
 /// restart; the sqlite job store is the durable record.
-#[derive(Default)]
 pub struct JobRegistry {
     jobs: Mutex<HashMap<String, Arc<JobChannel>>>,
+    authority: SharedCapAuthority,
 }
 
 impl JobRegistry {
+    /// A fresh, empty registry with a new, randomly-keyed authority.
+    ///
+    /// # Errors
+    /// [`CapError::Authority`] if the system RNG is unavailable.
+    pub fn new() -> Result<Self, CapError> {
+        Ok(Self {
+            jobs: Mutex::new(HashMap::new()),
+            authority: SharedCapAuthority::new(LocalCapAuthority::new(CAP_TTL)?),
+        })
+    }
+
+    /// The registry's one persistent authority: every job channel is minted
+    /// from it, and a submitter's `submitter_caps` are verified against it.
+    #[must_use]
+    pub fn authority(&self) -> &SharedCapAuthority {
+        &self.authority
+    }
+
     /// Register `job`'s channel under `job_id`, replacing any previous entry
     /// for the same id (a resubmission under a reused id would be a caller
     /// bug elsewhere; this registry just reflects the latest mint).
@@ -177,9 +213,13 @@ impl JobRegistry {
 mod tests {
     use super::*;
 
+    fn test_authority() -> SharedCapAuthority {
+        SharedCapAuthority::new(LocalCapAuthority::new(CAP_TTL).expect("getrandom for a test authority"))
+    }
+
     #[tokio::test]
     async fn minted_caps_are_scoped_to_the_jobs_own_channel() -> anyhow::Result<()> {
-        let job = mint_job_channel("job-1").await?;
+        let job = mint_job_channel("job-1", &test_authority()).await?;
         job.channel.join(&job.agent_cap)?;
         job.channel.join(&job.observer_cap)?;
         Ok(())
@@ -189,7 +229,7 @@ mod tests {
     /// watch a job must never also grant the ability to inject its stdin.
     #[tokio::test]
     async fn the_observer_cap_cannot_post() -> anyhow::Result<()> {
-        let job = mint_job_channel("job-1").await?;
+        let job = mint_job_channel("job-1", &test_authority()).await?;
         let membership = job.channel.join(&job.observer_cap)?;
         let err = job
             .channel
@@ -207,36 +247,41 @@ mod tests {
     }
 
     /// Adversarial: a cap minted for one job's channel must be refused by a
-    /// different job's channel — two jobs never share membership. Each job
-    /// mints its own [`LocalCapAuthority`] (a distinct HMAC key), so a
-    /// cross-job cap fails signature verification outright (`Forged`);
-    /// `WrongChannel` is for a same-authority cap scoped to a different
-    /// channel, which this per-job-authority design never produces.
+    /// different job's channel — two jobs never share membership, even though
+    /// (#226) every job's channel now mints from the SAME registry-wide
+    /// authority, not a fresh one per job. That shared signing key means a
+    /// cross-job cap verifies correctly (it really is validly signed) and so
+    /// fails as `WrongChannel`, not `Forged` — boundedness is `Channel::join`'s
+    /// own channel-id check, never the authority's identity (agent-fabric.md
+    /// §11: "boundedness is entirely Channel::join's existing wrong-channel
+    /// rejection").
     #[tokio::test]
     async fn a_cap_for_one_job_is_refused_by_another_jobs_channel() -> anyhow::Result<()> {
-        let job_a = mint_job_channel("job-a").await?;
-        let job_b = mint_job_channel("job-b").await?;
+        let authority = test_authority();
+        let job_a = mint_job_channel("job-a", &authority).await?;
+        let job_b = mint_job_channel("job-b", &authority).await?;
         let err = job_b
             .channel
             .join(&job_a.agent_cap)
             .expect_err("a cap minted for job-a must not join job-b's channel");
         assert!(
-            matches!(err, sandy_fabric_local::channel::ChannelError::Cap(CapError::Forged)),
+            matches!(err, sandy_fabric_local::channel::ChannelError::WrongChannel),
             "got {err:?}"
         );
         Ok(())
     }
 
     #[test]
-    fn the_registry_returns_none_for_an_unregistered_job() {
-        let registry = JobRegistry::default();
+    fn the_registry_returns_none_for_an_unregistered_job() -> anyhow::Result<()> {
+        let registry = JobRegistry::new()?;
         assert!(registry.get("ghost").is_none());
+        Ok(())
     }
 
     #[tokio::test]
     async fn the_registry_round_trips_a_registered_job() -> anyhow::Result<()> {
-        let registry = JobRegistry::default();
-        let job = mint_job_channel("job-1").await?;
+        let registry = JobRegistry::new()?;
+        let job = mint_job_channel("job-1", registry.authority()).await?;
         let agent_cap_proof = job.agent_cap.proof.clone();
         registry.insert("job-1".to_owned(), job);
 
@@ -252,7 +297,7 @@ mod tests {
     #[test]
     fn authenticating_an_unregistered_job_is_refused_as_unknown() -> anyhow::Result<()> {
         use anyhow::Context;
-        let registry = JobRegistry::default();
+        let registry = JobRegistry::new()?;
         let token = [0u8; link_auth::LINK_TOKEN_LEN];
         let peer: std::net::IpAddr = "127.0.0.1".parse().context("loopback literal")?;
         match registry.authenticate_remote_link("ghost", peer, &token) {
@@ -268,8 +313,8 @@ mod tests {
     #[tokio::test]
     async fn authenticating_a_local_jobs_link_is_refused_as_not_remote() -> anyhow::Result<()> {
         use anyhow::Context;
-        let registry = JobRegistry::default();
-        let job = mint_job_channel("job-1").await?;
+        let registry = JobRegistry::new()?;
+        let job = mint_job_channel("job-1", registry.authority()).await?;
         registry.insert("job-1".to_owned(), job);
 
         let token = [0u8; link_auth::LINK_TOKEN_LEN];
@@ -287,8 +332,8 @@ mod tests {
     #[tokio::test]
     async fn authenticating_a_remote_jobs_link_round_trips_through_the_registry() -> anyhow::Result<()> {
         use anyhow::Context;
-        let registry = JobRegistry::default();
-        let mut job = mint_job_channel("job-1").await?;
+        let registry = JobRegistry::new()?;
+        let mut job = mint_job_channel("job-1", registry.authority()).await?;
         let executor_ip: std::net::IpAddr = "100.64.0.7".parse().context("executor ip literal")?;
         let link = RemoteLink::new(executor_ip)?;
         let token = *link.token().as_bytes();
@@ -300,6 +345,37 @@ mod tests {
             Err(e) => assert_eq!(e, LinkAuthError::AlreadyClaimed),
             Ok(_) => panic!("a second stream for the same run must be refused"),
         }
+        Ok(())
+    }
+
+    /// A job's channel is minted from the registry's own authority (#226): a
+    /// cap minted independently under a DIFFERENT authority — never shared
+    /// with this registry — still fails as `Forged`, the genuinely untrusted
+    /// case `WrongChannel` above is not.
+    #[tokio::test]
+    async fn a_cap_from_an_unrelated_authority_is_forged_not_merely_wrong_channel() -> anyhow::Result<()> {
+        let registry = JobRegistry::new()?;
+        let job = mint_job_channel("job-1", registry.authority()).await?;
+
+        let impostor_authority = test_authority();
+        let impostor_cap = impostor_authority.mint(CapScope {
+            peer: PeerId::from("agent"),
+            channel: ChannelId::from("job-1"),
+            rights: CapRights {
+                post: true,
+                read: true,
+                invite: false,
+            },
+            expires_at: None,
+        })?;
+        let err = job
+            .channel
+            .join(&impostor_cap)
+            .expect_err("a cap from an unrelated authority must not join");
+        assert!(
+            matches!(err, sandy_fabric_local::channel::ChannelError::Cap(CapError::Forged)),
+            "got {err:?}"
+        );
         Ok(())
     }
 }
