@@ -97,22 +97,19 @@ fn membership_id(cap: &Cap) -> MembershipId {
 struct MembershipState {
     generation: u64,
     cursor: u64,
-    // A `Vec`, not one `Option<Waker>`: `subscribe()` is never restricted to
-    // one stream per membership (its own doc comment already notes two
-    // concurrent subscriptions aren't the expected shape, but nothing stops
-    // it), so a second stream's waker would otherwise silently overwrite the
-    // first's — leaving the first parked forever on `leave()`, exactly the
-    // hang this whole mechanism exists to close, just for that stream.
-    //
-    // Known, bounded leak traded for that fix (#225): nothing removes an
-    // entry when its `CursorStream` is dropped mid-`Pending` — the documented
-    // drop-and-resubscribe reconnect pattern accumulates one dead `Waker` per
-    // reconnect, cleared only when `leave()` drains the whole `Vec`. Low
-    // severity (wakers are cheap; membership is `CapAuthority`-gated, so not
-    // externally amplifiable; `leave()`'s wake loop just wastes a little work
-    // on stale entries) but real for a long-lived membership that reconnects
-    // many times. #225 tracks a `Drop` impl that deregisters properly.
-    wakers: Vec<Waker>,
+    // Keyed by each CursorStream's own stream_id (#225), not just a bare
+    // `Vec<Waker>`: `subscribe()` is never restricted to one stream per
+    // membership (its own doc comment already notes two concurrent
+    // subscriptions aren't the expected shape, but nothing stops it), so a
+    // second stream's waker would otherwise silently overwrite the first's —
+    // leaving the first parked forever on `leave()`, exactly the hang this
+    // mechanism exists to close, just for that stream. The id also lets
+    // `CursorStream::drop` remove exactly its own entry: `Waker::will_wake`
+    // is a best-effort identity check (two distinct streams on the same task
+    // can produce wakers that compare equal under it, as seen in this fix's
+    // own regression test), so it can't be used to tell "my waker" from
+    // "some other stream's waker that happens to look the same" on drop.
+    wakers: Vec<(u64, Waker)>,
 }
 
 /// Bounded membership + delivery over a [`ChannelBackend`] (spec §3.3). Every
@@ -127,6 +124,10 @@ pub struct Channel<B, A> {
     members: Mutex<HashMap<MembershipId, Cap>>,
     sessions: Arc<Mutex<HashMap<MembershipId, MembershipState>>>,
     next_generation: AtomicU64,
+    // Channel-wide, never reused: identifies one `CursorStream` for the life
+    // of its own `wakers` entry, so its `Drop` can remove exactly that entry
+    // (#225) regardless of what other streams on the same membership exist.
+    next_stream_id: AtomicU64,
     // An async mutex, not an AtomicU64: sequence assignment and the backend
     // append it labels must land as one atomic unit (held across the .await),
     // or two concurrent posts can make their appends visible out of sequence
@@ -171,6 +172,7 @@ impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
             members: Mutex::new(HashMap::new()),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             next_generation: AtomicU64::new(0),
+            next_stream_id: AtomicU64::new(0),
             next_seq: AsyncMutex::new(next),
         })
     }
@@ -252,7 +254,7 @@ impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(membership);
         if let Some(state) = removed {
-            for waker in state.wakers {
+            for (_, waker) in state.wakers {
                 waker.wake();
             }
         }
@@ -344,6 +346,7 @@ impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
             sessions: Arc::clone(&self.sessions),
             membership: membership.clone(),
             generation,
+            stream_id: self.next_stream_id.fetch_add(1, Ordering::SeqCst),
         })
     }
 }
@@ -372,11 +375,46 @@ struct CursorStream {
     /// mismatch (including the entry being gone entirely) means `leave()`
     /// happened, and this stream ends rather than continuing to deliver.
     generation: u64,
+    /// This stream's own identity in `MembershipState::wakers` (#225):
+    /// assigned once at `subscribe()` time, used to update its own entry on
+    /// each `Pending` poll and to remove exactly that entry on `Drop`.
+    stream_id: u64,
+}
+
+impl Drop for CursorStream {
+    /// Deregisters exactly this stream's own waker entry, if it's still
+    /// registered (#225): the reconnect pattern of subscribing, parking, and
+    /// dropping without ever reading must not leak one entry per reconnect.
+    fn drop(&mut self) {
+        // Pulled out under the lock, dropped only after releasing it — same
+        // discipline as `leave()` above, and for the same reason: a `Waker`'s
+        // drop glue is caller-defined and may run arbitrary code, including
+        // dropping another `CursorStream` whose own `Drop` wants this same
+        // `sessions` lock. Dropping it (via `retain`, in place) while still
+        // holding the lock would make that a reentrant self-deadlock.
+        //
+        // A membership this stream's generation has already left behind (or
+        // that was removed by `leave()` entirely) has nothing to clean up
+        // here: `leave()` already drained and woke the whole `Vec`, including
+        // this stream's own entry if it was still in it.
+        let displaced = {
+            let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+            sessions.get_mut(&self.membership).and_then(|state| {
+                let pos = state.wakers.iter().position(|(id, _)| *id == self.stream_id)?;
+                Some(state.wakers.swap_remove(pos))
+            })
+        };
+        drop(displaced);
+    }
 }
 
 impl Stream for CursorStream {
     type Item = Result<Envelope, ChannelBackendError>;
 
+    /// Ends the stream (`Ready(None)`) once its membership's generation has
+    /// moved on (a `leave()`, possibly followed by a rejoin); otherwise polls
+    /// the backing stream, updating or registering this stream's own waker
+    /// entry by `stream_id` on `Pending` (#225).
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
@@ -419,19 +457,35 @@ impl Stream for CursorStream {
                 // we're still current and the store is safe, or we're not and
                 // we end immediately instead of parking a waker nothing will
                 // ever fire.
+                // Cloned before locking `sessions`, not after: a `Waker`
+                // clone callback is caller-defined too, and allowed to run
+                // the same arbitrary, lock-wanting code a drop callback can
+                // (see `Drop for CursorStream` above). Any waker THIS poll
+                // displaces from the slot is likewise dropped only after the
+                // guard below is released.
+                let waker = cx.waker().clone();
                 let mut sessions = this.sessions.lock().unwrap_or_else(PoisonError::into_inner);
                 match sessions.get_mut(&this.membership) {
                     Some(state) if state.generation == this.generation => {
+                        // Update-in-place by this stream's own id, not a
                         // `will_wake` dedup: this same stream's own task can
                         // poll multiple times before ever yielding (normal
-                        // executor behavior), and without this check each
-                        // Pending poll would push another functionally-
-                        // identical waker, growing the vec unboundedly over
-                        // a long-lived stream that's mostly idle.
-                        let waker = cx.waker();
-                        if !state.wakers.iter().any(|w| w.will_wake(waker)) {
-                            state.wakers.push(waker.clone());
-                        }
+                        // executor behavior, and the waker can legitimately
+                        // change between polls), so each Pending poll
+                        // replaces this stream's one entry rather than
+                        // pushing another — `will_wake` can't tell two
+                        // distinct streams' wakers apart when both happen to
+                        // run on the same task (#225's regression test hits
+                        // this), so identity has to come from `stream_id`.
+                        let displaced = match state.wakers.iter_mut().find(|(id, _)| *id == this.stream_id) {
+                            Some((_, slot)) => Some(std::mem::replace(slot, waker)),
+                            None => {
+                                state.wakers.push((this.stream_id, waker));
+                                None
+                            }
+                        };
+                        drop(sessions);
+                        drop(displaced);
                         Poll::Pending
                     }
                     _ => Poll::Ready(None),
@@ -471,6 +525,8 @@ fn content_id(message_type: &Option<MessageType>, content_type: &str, payload: &
 mod tests {
     use std::{
         hash::{DefaultHasher, Hash, Hasher},
+        sync::{atomic::AtomicBool, mpsc},
+        task::Wake,
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
@@ -599,6 +655,39 @@ mod tests {
             .expect("stream yielded before the deadline")
             .expect("stream did not end")
             .expect("stream did not error")
+    }
+
+    /// A `Waker` whose drop glue runs an arbitrary closure instead of nothing:
+    /// `std::task::Wake` lets any `Arc<W>` back a real `Waker` without
+    /// `unsafe` (forbidden in this crate), and standard library permits a
+    /// `Waker`'s clone/drop callbacks to do anything (`RawWakerVTable`'s own
+    /// contract). Used to reproduce the exact adversarial case CodeRabbit's
+    /// #254 review raised: a displaced waker's drop glue that drops ANOTHER
+    /// `CursorStream`, reentering `sessions` from inside whichever caller is
+    /// in the middle of removing or replacing this one.
+    struct DropBomb {
+        on_drop: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    // Waking is a no-op by design: only the `Drop` impl below matters for
+    // this test double. `Waker::noop()` can't stand in for it (clippy's
+    // suggestion) since it doesn't run user code on drop at all.
+    #[allow(
+        clippy::manual_noop_waker,
+        reason = "the point of this type is its Drop impl, not its wake behavior"
+    )]
+    impl Wake for DropBomb {
+        fn wake(self: Arc<Self>) {}
+
+        fn wake_by_ref(self: &Arc<Self>) {}
+    }
+
+    impl Drop for DropBomb {
+        fn drop(&mut self) {
+            if let Some(f) = self.on_drop.lock().unwrap_or_else(PoisonError::into_inner).take() {
+                f();
+            }
+        }
     }
 
     #[tokio::test]
@@ -949,6 +1038,311 @@ mod tests {
                 "every stream on a left membership must end, not just one"
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropping_a_pending_stream_removes_its_own_waker_not_just_on_leave() -> anyhow::Result<()> {
+        // #225: the documented reconnect pattern (subscribe, read nothing,
+        // drop, subscribe again later) must not accumulate one dead Waker per
+        // reconnect for the membership's whole lifetime — only leave() used to
+        // clear the Vec, so a long-lived membership that reconnects many times
+        // without ever leaving grew it unboundedly.
+        let (channel, _backend, id, authority) = new_channel().await?;
+        let member = channel.join(&mint(&authority, "p1", &id, full(), Some(later())))?;
+
+        for _ in 0..5 {
+            let mut stream = Box::pin(channel.subscribe(&member)?);
+            // Poll once to Pending (nothing posted yet), registering a waker,
+            // then drop the stream still parked — the exact reconnect pattern
+            // the issue describes.
+            let polled_once = std::future::poll_fn(|cx| {
+                let _ = stream.as_mut().poll_next(cx);
+                std::task::Poll::Ready(())
+            });
+            polled_once.await;
+            drop(stream);
+        }
+
+        let wakers_len = channel
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&member)
+            .map(|state| state.wakers.len())
+            .unwrap_or(0);
+        assert_eq!(
+            wakers_len, 0,
+            "every dropped stream must deregister its own waker; none are left open here"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn two_streams_polled_from_the_same_task_keep_independent_waker_entries() -> anyhow::Result<()> {
+        // #225's identity claim: a `will_wake`-based dedup can't distinguish
+        // two DISTINCT streams whose wakers both come from the SAME task,
+        // because `will_wake` only answers "would waking this wake the same
+        // task" — both wakers here are will_wake-equal despite belonging to
+        // different streams. Drives two real streams through interleaved
+        // polls on one task (not two spawned tasks, which would already have
+        // distinct task identity and so wouldn't exercise this collision),
+        // then drops one mid-interleaving and asserts the surviving stream's
+        // own entry is untouched — not "whichever one happened to dedup."
+        let (channel, _backend, id, authority) = new_channel().await?;
+        let member = channel.join(&mint(&authority, "p1", &id, full(), Some(later())))?;
+
+        let mut first = Box::pin(channel.subscribe(&member)?);
+        let mut second = Box::pin(channel.subscribe(&member)?);
+
+        // Interleaved: both polled to Pending from the exact same `cx`, so
+        // both register a waker that would be `will_wake`-equal to the
+        // other's under the old dedup scheme.
+        std::future::poll_fn(|cx| {
+            let _ = first.as_mut().poll_next(cx);
+            let _ = second.as_mut().poll_next(cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
+
+        // `subscribe` returns an opaque `impl Stream`, so identity is read
+        // from the registered entries themselves rather than a private field:
+        // under the old `will_wake` dedup this first assertion already fails
+        // (both polls share one `cx`, so `second`'s waker would have been
+        // treated as a duplicate of `first`'s and collapsed into one entry).
+        let ids_before = {
+            let sessions = channel
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let state = sessions.get(&member).context("membership present before any drop")?;
+            assert_eq!(
+                state.wakers.len(),
+                2,
+                "both concurrently open streams must each hold their own entry, not collapse into one"
+            );
+            state
+                .wakers
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+
+        drop(first);
+
+        let ids_after_first = {
+            let sessions = channel
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let state = sessions
+                .get(&member)
+                .context("membership present after dropping one stream")?;
+            state
+                .wakers
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(
+            ids_after_first.len(),
+            1,
+            "dropping one of two concurrently open streams must remove exactly one entry"
+        );
+        assert!(
+            ids_after_first.is_subset(&ids_before),
+            "the surviving entry must be one of the original two, not a new or corrupted id"
+        );
+
+        drop(second);
+
+        let wakers_len = channel
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&member)
+            .map(|state| state.wakers.len())
+            .unwrap_or(0);
+        assert_eq!(
+            wakers_len, 0,
+            "dropping the second stream must remove its own entry too, proving the first drop didn't remove the wrong \
+             one (which would have left this one stuck, or been a double-removal)"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropping_a_pending_stream_during_a_panic_unwind_still_deregisters_its_waker() -> anyhow::Result<()> {
+        // #225 calls out panic-unwind explicitly as an adversarial case: Drop
+        // has to run its cleanup when invoked by unwinding, not only when the
+        // caller reaches a normal scope exit or an explicit `drop()`.
+        let (channel, _backend, id, authority) = new_channel().await?;
+        let member = channel.join(&mint(&authority, "p1", &id, full(), Some(later())))?;
+
+        let mut stream = Box::pin(channel.subscribe(&member)?);
+        std::future::poll_fn(|cx| {
+            let _ = stream.as_mut().poll_next(cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _stream = stream; // moved in; its Drop runs during the unwind below.
+            panic!("deliberate panic to unwind through a parked CursorStream");
+        }));
+        assert!(
+            panicked.is_err(),
+            "the panic must actually have fired for this test to mean anything"
+        );
+
+        let wakers_len = channel
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&member)
+            .map(|state| state.wakers.len())
+            .unwrap_or(0);
+        assert_eq!(
+            wakers_len, 0,
+            "Drop must deregister the waker even when it runs via a panicking unwind"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropping_a_stream_does_not_deadlock_when_its_displaced_waker_drops_another_stream() -> anyhow::Result<()> {
+        // CodeRabbit #254 (major): `Drop for CursorStream` must pull its own
+        // displaced waker out from under the `sessions` lock and drop it only
+        // after releasing the guard — not drop it in place (e.g. via
+        // `Vec::retain`) while still holding the lock, which would make a
+        // waker whose drop glue reenters `sessions` (by dropping another
+        // `CursorStream`) deadlock on itself.
+        let (channel, _backend, id, authority) = new_channel().await?;
+        let member = channel.join(&mint(&authority, "p1", &id, full(), Some(later())))?;
+
+        let mut first = Box::pin(channel.subscribe(&member)?);
+        let second = Box::pin(channel.subscribe(&member)?);
+
+        // A real poll with an inert waker learns this stream's own slot:
+        // `stream_id` is opaque to callers (see
+        // `two_streams_polled_from_the_same_task_keep_independent_waker_entries`
+        // above), so it's read back from the one registered entry, not
+        // guessed.
+        std::future::poll_fn(|cx| {
+            let _ = first.as_mut().poll_next(cx);
+            Poll::Ready(())
+        })
+        .await;
+
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_in_bomb = Arc::clone(&fired);
+        let bomb_waker: Waker = Arc::new(DropBomb {
+            on_drop: Mutex::new(Some(Box::new(move || {
+                drop(second);
+                fired_in_bomb.store(true, Ordering::SeqCst);
+            }))),
+        })
+        .into();
+
+        // Swapped directly into the registered slot rather than via another
+        // `poll_next` call: that would also hand a clone to `Follow`'s own
+        // dedup'd waker list (`inmem.rs`), which only drains on the next
+        // `append` — never in this test — and would keep the Arc's count
+        // above zero no matter what `CursorStream` does with its own copy,
+        // masking the result.
+        {
+            let mut sessions = channel.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+            let state = sessions.get_mut(&member).context("membership present")?;
+            let slot = state
+                .wakers
+                .first_mut()
+                .context("the poll above must have registered exactly one waker")?;
+            slot.1 = bomb_waker;
+        }
+
+        // Drop `first` on its own thread: a regression (reentrant
+        // self-deadlock on `sessions`) parks that thread forever, and a
+        // bounded `recv_timeout` turns that into a clean test failure instead
+        // of hanging the whole run.
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            drop(first);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .context("dropping a stream whose displaced waker drops another stream deadlocked on `sessions`")?;
+
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "the bomb waker's drop glue must actually have run for this test to mean anything"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replacing_a_pending_waker_does_not_deadlock_when_the_displaced_waker_drops_another_stream()
+    -> anyhow::Result<()> {
+        // CodeRabbit #254 (major, "Also applies to: 461-461"): the `Pending`
+        // arm's replace-in-place path (`*slot = waker`, now `mem::replace`)
+        // carries the identical risk as the Drop path above — the OLD waker
+        // in that slot is dropped as part of the replace, and must not drop
+        // while `sessions` is still locked either.
+        let (channel, _backend, id, authority) = new_channel().await?;
+        let member = channel.join(&mint(&authority, "p1", &id, full(), Some(later())))?;
+
+        let mut first = Box::pin(channel.subscribe(&member)?);
+        let second = Box::pin(channel.subscribe(&member)?);
+
+        // A real poll with an inert waker learns this stream's own slot (see
+        // the Drop-path test above for why).
+        std::future::poll_fn(|cx| {
+            let _ = first.as_mut().poll_next(cx);
+            Poll::Ready(())
+        })
+        .await;
+
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_in_bomb = Arc::clone(&fired);
+        let bomb_waker: Waker = Arc::new(DropBomb {
+            on_drop: Mutex::new(Some(Box::new(move || {
+                drop(second);
+                fired_in_bomb.store(true, Ordering::SeqCst);
+            }))),
+        })
+        .into();
+
+        // Swapped directly into the registered slot, not via another
+        // `poll_next` call — same reasoning as the Drop-path test above.
+        {
+            let mut sessions = channel.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+            let state = sessions.get_mut(&member).context("membership present")?;
+            let slot = state
+                .wakers
+                .first_mut()
+                .context("the poll above must have registered exactly one waker")?;
+            slot.1 = bomb_waker;
+        }
+
+        // Second poll, with a plain waker, replaces the bomb in place —
+        // exercising the `Some((_, slot))` arm, not `Drop`. `poll_next` is a
+        // plain synchronous fn (the backing `Follow` stream parks on a
+        // `std::sync::Mutex`, not any tokio primitive), so it can be called
+        // directly here with no runtime needed, on its own thread so a
+        // regression (reentrant self-deadlock) parks only that thread.
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let plain_waker = Waker::noop().clone();
+            let mut cx = std::task::Context::from_waker(&plain_waker);
+            let _ = first.as_mut().poll_next(&mut cx);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .context("replacing a stream's waker with a displaced bomb waker deadlocked on `sessions`")?;
+
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "the bomb waker's drop glue must actually have run for this test to mean anything"
+        );
         Ok(())
     }
 
