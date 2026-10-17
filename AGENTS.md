@@ -28,11 +28,18 @@ version, metadata, dependency versions, and lints through the root `Cargo.toml`
   mints a scoped token from it). Text or `-o json`. The trust-root installer is
   provider-nested (`sandy cred <provider> <op>`); GitHub today, GitLab later. See
   `docs/providers/`.
+- **`sandy-proto`** — the agent-fabric channel envelope: a protobuf message
+  (`oneof` message-type, `sequence`, `metadata`, an opaque `payload` +
+  `content_type`) and its codec. No dependency on the rest of the fabric.
 - **`sandy-fabric`** — the agent-fabric contract: seam traits (`Executor`,
   `ChannelBackend`, `Transport`, `Discovery`, `Capacity`, `Lifecycle`,
   `CapAuthority`, `Minter`, `TelemetrySink`) over `sandy-proto`'s `Envelope`, and
   the shared contract-test harness (feature `contract-tests`) every impl passes.
   No impls. See `docs/decisions/agent-fabric.md`.
+- **`sandy-fabric-local`** (`impls/fabric-local`) — the agent-fabric's trivial
+  local impls, one module per seam. Under active development; see the crate's
+  `src/` for the current module set, or epic #103's sub-issues for which seams
+  have landed.
 
 ## Build & test (run before committing)
 
@@ -80,12 +87,14 @@ crates/
   ├─ sandy-api/           - the pinned seam contract (traits + data/error types, no behavior)
   ├─ sandy-test-support/  - in-memory test doubles for the seam traits (FakeBackend, FakeApplier, …), api-only
   ├─ sandy-backend/       - the backend hub: feature-gated re-export of impls/local and impls/vm
+  ├─ sandy-proto/         - agent-fabric channel envelope (protobuf) + codec
   ├─ sandy-fabric/        - agent-fabric seam traits + shared contract-test harness (no impls)
   ├─ sandy-fsutil/        - shared security fs primitives: staging base, owned dirs, the 0600 secret writer
   └─ sandy-cli/           - the `sandy` binary (doctor, run/ls/status/wait/kill/gc, cred github …)
 impls/
   ├─ local/          - raw-process backend, local-dir share transport, host containment
-  └─ vm/             - QemuBackend (Linux) + VfkitBackend (macOS), virtio-fs transports, console driver
+  ├─ vm/             - QemuBackend (Linux) + VfkitBackend (macOS), virtio-fs transports, console driver
+  └─ fabric-local/   - agent-fabric trivial local impls: in-memory ChannelBackend, LocalCapAuthority, placement
 nix/
   ├─ packages/       - crane build definitions
   └─ guest/          - bootable microVM guests + the Topology seam (own flake)

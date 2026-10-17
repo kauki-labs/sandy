@@ -2,7 +2,7 @@
 title: sandy overview
 kind: overview
 project: sandy
-updated: 2026-10-14
+updated: 2026-10-16
 ---
 
 # sandy overview
@@ -36,3 +36,24 @@ This file is a pointer; the detailed docs already live under `docs/`:
 - Credential-seam design and providers → [`design/`](design/), [`providers/`](providers/).
 
 Build, test, and house rules are in the repo-root [`AGENTS.md`](../AGENTS.md).
+
+## Agent fabric
+
+A second, separate effort alongside the sandbox above: a serverless,
+intermittency-tolerant medium for agents to communicate and run work across a
+fleet of heterogeneous devices (epic
+[#103](https://github.com/kauki-labs/sandy/issues/103)). Every seam — channel
+backend, cap authority, minter, executor, placement, telemetry — ships a
+trivial local impl first, proven against a shared contract-test harness,
+before any VM, network, or P2P transport exists; a composition root then
+selects one impl per seam (the all-local MVP, a local-VM profile, a remote
+profile). `sandy-proto` carries the channel envelope; `sandy-fabric` is the
+seam contracts and harness; `sandy-fabric-local` is the all-local profile's
+trivial impls, one module per seam.
+
+Block-by-block status lives on the epic's sub-issues, not here — a merged
+block moves fast enough that a hand-maintained landed/open list in prose goes
+stale within days. Check #103 for which blocks are merged.
+
+Design: [`design/agent-fabric/spec.md`](design/agent-fabric/spec.md). Decisions:
+[`decisions/agent-fabric.md`](decisions/agent-fabric.md).
