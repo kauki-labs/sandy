@@ -640,6 +640,34 @@ mod tests {
         Ok(())
     }
 
+    /// #281 parity with std's spawn: a bare program name is looked up on the
+    /// job's PATH (its `spec.env` may override it), not on this process's.
+    #[test]
+    fn a_bare_program_is_found_on_the_jobs_own_path() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let tools = tempfile::tempdir()?;
+        let tool = tools.path().join("sandy-only-here");
+        std::fs::write(&tool, "#!/bin/sh\necho found-on-job-path\n")?;
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755))?;
+        let grants = no_grants();
+        let command = ["sandy-only-here".to_string()];
+        let env = [("PATH".to_string(), format!("{}:/usr/bin:/bin", tools.path().display()))];
+        let spec = RunSpec {
+            env: &env,
+            ..run_spec(&command, &grants, 30)
+        };
+
+        let outcome = ProcessBackend::new().run(&spec)?;
+
+        assert_eq!(outcome.guest_exit, Some(0), "console: {}", outcome.console);
+        assert!(
+            outcome.console.contains("found-on-job-path"),
+            "console: {}",
+            outcome.console
+        );
+        Ok(())
+    }
+
     /// #281 parity with std's spawn: the job starts with SIGPIPE at its default
     /// (this test process ignores it, as every Rust program does), so a writer
     /// into a closed pipe dies quietly instead of reporting "Broken pipe".
