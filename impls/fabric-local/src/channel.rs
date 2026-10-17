@@ -231,12 +231,21 @@ impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(membership);
-        if let Some(state) = self
+        // Bound to a plain `let`, not used as an `if let` scrutinee directly:
+        // under edition 2024's temporary-scope rules, a guard produced in an
+        // `if let` scrutinee stays alive for the WHOLE body, not just the
+        // match. Waking tasks below while `sessions` is still locked risks a
+        // synchronous re-entrant poll_next trying to lock it again — a real
+        // deadlock, not just a style nit, for any executor that can poll a
+        // woken task inline rather than only ever scheduling it for later.
+        // This `let` is an ordinary statement: its temporary guard drops at
+        // the semicolon, well before the loop below runs.
+        let removed = self
             .sessions
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(membership)
-        {
+            .remove(membership);
+        if let Some(state) = removed {
             for waker in state.wakers {
                 waker.wake();
             }
