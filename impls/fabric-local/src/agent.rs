@@ -298,12 +298,14 @@ pub struct PeerDelivery {
 /// [`SandboxAgent`] does.
 pub struct LinkAgent {
     port: Arc<LinkPort>,
-    reader: std::sync::Mutex<Option<Box<dyn AsyncRead + Send + Unpin>>>,
+    /// TTY stdin from the link reader, handed to [`LinkAgent::serve_tty`] once.
+    stdin_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>>,
+    /// The link reader, which lives as long as the agent, not just the job's
+    /// stdout, so peer traffic keeps being routed and counted (#261).
+    _reader: AbortOnDrop<()>,
     served: std::sync::atomic::AtomicBool,
     /// The peer channels joined at setup (#238 slice 4).
     peers: Vec<String>,
-    /// Where the link reader routes peer deliveries.
-    peer_tx: tokio::sync::mpsc::Sender<PeerDelivery>,
     /// The receiving end, handed out once by [`LinkAgent::take_peer_inbox`].
     peer_inbox: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<PeerDelivery>>>,
     /// Peer deliveries dropped because the inbox was full.
@@ -389,17 +391,37 @@ impl LinkAgent {
             }
         }
         let (peer_tx, peer_inbox) = tokio::sync::mpsc::channel(PEER_INBOX);
+        let peer_dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let peer_refused = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // A dedicated reader that never blocks, running until the link closes or
+        // the agent is dropped: TTY stdin goes into an unbounded queue (its only
+        // source is the trusted orchestrator, and keystrokes must not be dropped)
+        // and peer deliveries go through the counted, drop-newest inbox. A job
+        // that stops reading its stdin, or closes its stdout, therefore cannot
+        // stall the link, and peer messages keep being routed or counted.
+        // Unbounded is safe only while TTY stdin stays trusted, low-volume and
+        // keystroke-paced (bulk inputs are staged as shares, not piped). A bulk
+        // stdin path would make this an out-of-memory risk: bound it first. Once
+        // the bridge ends, its receiver is gone and later stdin is discarded.
+        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
+        let reader = AbortOnDrop(tokio::spawn(route_link(
+            Box::new(rd),
+            stdin_tx,
+            peer_tx,
+            Arc::clone(&peer_dropped),
+            Arc::clone(&peer_refused),
+        )));
         Ok(Self {
             port: Arc::new(LinkPort {
                 writer: AsyncMutex::new(Box::new(wr)),
             }),
-            reader: std::sync::Mutex::new(Some(Box::new(rd))),
+            stdin_rx: std::sync::Mutex::new(Some(stdin_rx)),
+            _reader: reader,
             served: std::sync::atomic::AtomicBool::new(false),
             peers,
-            peer_tx,
             peer_inbox: std::sync::Mutex::new(Some(peer_inbox)),
-            peer_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            peer_refused: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            peer_dropped,
+            peer_refused,
         })
     }
 
@@ -415,28 +437,12 @@ impl LinkAgent {
         job_stdin: impl AsyncWrite + Unpin + Send + 'static,
     ) -> Result<(), AgentError> {
         claim_once(&self.served)?;
-        let reader = self
-            .reader
+        let stdin_rx = self
+            .stdin_rx
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
             .ok_or(AgentError::AlreadyServed)?;
-        // A dedicated reader that never blocks: TTY stdin goes into an unbounded
-        // queue (its only source is the trusted orchestrator, and keystrokes must
-        // not be dropped) and peer deliveries go through the counted, drop-newest
-        // inbox. A job that stops reading its stdin therefore cannot stall the
-        // link, and peer messages keep being routed or counted.
-        // Unbounded is safe only while TTY stdin stays trusted, low-volume and
-        // keystroke-paced (bulk inputs are staged as shares, not piped). A bulk
-        // stdin path would make this an out-of-memory risk: bound it first.
-        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
-        let _reader = AbortOnDrop(tokio::spawn(route_link(
-            reader,
-            stdin_tx,
-            self.peer_tx.clone(),
-            Arc::clone(&self.peer_dropped),
-            Arc::clone(&self.peer_refused),
-        )));
         let stdin_frames =
             futures_util::stream::unfold(
                 stdin_rx,
