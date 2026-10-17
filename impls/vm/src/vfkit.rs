@@ -285,7 +285,10 @@ impl VfkitBackend {
                 launch,
                 agent,
                 box_id,
-                Instant::now() + Duration::from_secs(u64::from(spec.timeout_secs.max(1))),
+                // The console's command budget only starts once the guest has
+                // booted, so allow for the boot too; the stop flag still ends the
+                // connector as soon as the console run does.
+                Instant::now() + Duration::from_secs(u64::from(spec.timeout_secs.max(1)) * 2 + 120),
                 Arc::clone(&stop),
             )),
             _ => None,
@@ -296,14 +299,11 @@ impl VfkitBackend {
 
         // The guest is done: stop connecting, then tear vfkit down and deregister.
         stop.store(true, Ordering::SeqCst);
-        let verdict = connector.map(|(verdict, thread)| {
-            let _ = thread.join();
-            verdict
-        });
+        let verdict = connector.map(|(verdict, thread)| (verdict, thread.join().unwrap_or(false)));
         transport.shutdown();
         self.lock_registry()?.retain(|state| state.box_id != box_id);
         match verdict {
-            Some(verdict) => agent_outcome(outcome, &verdict, &spec.command.join(" ")),
+            Some((verdict, linked)) => agent_outcome(outcome, &verdict, &spec.command.join(" "), linked),
             None => Ok(outcome),
         }
     }
@@ -334,9 +334,10 @@ fn spawn_connector(
     box_id: &str,
     deadline: Instant,
     stop: Arc<AtomicBool>,
-) -> (std::sync::mpsc::Receiver<AgentVerdict>, std::thread::JoinHandle<()>) {
+) -> (std::sync::mpsc::Receiver<AgentVerdict>, std::thread::JoinHandle<bool>) {
     let (report, verdict) = AgentReport::channel();
     let (on_link, socket, box_id) = (Arc::clone(&launch.on_link), agent.socket.clone(), box_id.to_string());
+    // Returns whether the link was handed to the relay.
     let thread = std::thread::spawn(move || {
         match connect_agent_link(|| std::os::unix::net::UnixStream::connect(&socket), deadline, &stop) {
             Ok(link) => {
@@ -345,21 +346,39 @@ fn spawn_connector(
                 if handed.is_err() {
                     tracing::warn!(box_id, "the agent link handler (on_link) panicked");
                 }
+                true
             }
-            Err(err) => report.agent_failed(format!("could not reach the guest agent: {err}")),
+            Err(err) => {
+                report.agent_failed(format!("could not reach the guest agent: {err}"));
+                false
+            }
         }
     });
     (verdict, thread)
 }
 
 /// Agent mode: the job's exit comes only from the relay's verdict, never from
-/// the console's `exit=` (INV-11). A run that did not complete keeps its
+/// the console's `exit=` (INV-11).
+///
+/// A booted guest whose agent never took its link (`linked` false) is an infra
+/// fault, even when the console then timed out: the job never started, so the
+/// timeout is not the job's. Otherwise a run that did not complete keeps its
 /// timeout or transport fault, with no exit.
 fn agent_outcome(
     mut outcome: Outcome,
     verdict: &std::sync::mpsc::Receiver<AgentVerdict>,
     job: &str,
+    linked: bool,
 ) -> Result<Outcome, BackendError> {
+    if outcome.booted && !linked {
+        let why = match verdict.try_recv() {
+            Ok(AgentVerdict::AgentFailed(why)) => why,
+            _ => "the link was never handed to the relay".to_string(),
+        };
+        return Err(BackendError::Spawn(format!(
+            "the guest agent never took its link for `{job}`: {why}"
+        )));
+    }
     if !outcome.booted || outcome.timed_out || outcome.transport_error.is_some() {
         outcome.guest_exit = None;
         return Ok(outcome);
@@ -773,11 +792,14 @@ mod tests {
     fn agent_outcome_takes_the_exit_only_from_the_verdict() -> anyhow::Result<()> {
         let (report, verdict) = AgentReport::channel();
         report.job_exited(7);
-        assert_eq!(agent_outcome(booted(Some(0)), &verdict, "job")?.guest_exit, Some(7));
+        assert_eq!(
+            agent_outcome(booted(Some(0)), &verdict, "job", true)?.guest_exit,
+            Some(7)
+        );
 
         let (report, verdict) = AgentReport::channel();
         report.agent_failed("refused");
-        let failed = agent_outcome(booted(Some(0)), &verdict, "job");
+        let failed = agent_outcome(booted(Some(0)), &verdict, "job", true);
         assert!(
             matches!(&failed, Err(BackendError::Spawn(why)) if why.contains("refused")),
             "got {failed:?}"
@@ -785,7 +807,7 @@ mod tests {
 
         let (report, verdict) = AgentReport::channel();
         drop(report);
-        let silent = agent_outcome(booted(Some(0)), &verdict, "job");
+        let silent = agent_outcome(booted(Some(0)), &verdict, "job", true);
         assert!(matches!(&silent, Err(BackendError::Spawn(_))), "got {silent:?}");
         Ok(())
     }
@@ -798,13 +820,29 @@ mod tests {
         let mut timed_out = booted(Some(0));
         timed_out.timed_out = true;
         let started = std::time::Instant::now();
-        let outcome = agent_outcome(timed_out, &verdict, "job")?;
+        let outcome = agent_outcome(timed_out, &verdict, "job", true)?;
         assert!(outcome.timed_out && outcome.guest_exit.is_none());
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "must not wait on the verdict"
         );
         Ok(())
+    }
+
+    /// CodeRabbit on #244: a guest whose agent never took its link is an infra
+    /// fault even when the console then timed out, carrying the connector's
+    /// reason; the timeout is not the job's, since the job never started.
+    #[test]
+    fn a_never_taken_link_is_infra_even_when_the_console_timed_out() {
+        let (report, verdict) = AgentReport::channel();
+        report.agent_failed("could not reach the guest agent: timed out");
+        let mut timed_out = booted(None);
+        timed_out.timed_out = true;
+        let result = agent_outcome(timed_out, &verdict, "job", false);
+        assert!(
+            matches!(&result, Err(BackendError::Spawn(why)) if why.contains("never took its link") && why.contains("could not reach")),
+            "got {result:?}"
+        );
     }
 
     #[test]
