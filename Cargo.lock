@@ -2257,6 +2257,7 @@ dependencies = [
  "rustix",
  "sandy-api",
  "sandy-backend",
+ "sandy-conn",
  "sandy-fabric",
  "sandy-fsutil",
  "sandy-proto",
