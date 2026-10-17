@@ -165,14 +165,21 @@ tested in isolation (`sandyd::link_auth`: `RemoteLink`, the constant-time
 token compare, `JobRegistry::authenticate_remote_link`) — accept-or-refuse
 given a job id, a peer IP, and a presented token, with every refusal path
 named and tested (wrong peer, wrong token, already-claimed, unknown run) and
-a dedicated test proving the token never appears in `Debug` output. What is
+a dedicated test proving the token never appears in `Debug` output.
+`RemoteLink::invalidate` plus `JobRegistry::invalidate_remote_link`, wired
+into the control handler's `Cancel` arm, close #269's token-lifecycle
+requirement: cancelling a job invalidates its unclaimed link immediately, so
+a stream that arrives after cancellation gets the same zero-byte refusal as
+an already-claimed one (regression-tested: a cancelled job's still-valid,
+still-unclaimed token must not authenticate a late-arriving stream). What is
 NOT yet built: the network accept loop itself (binding a mesh address via
-`sandy-conn`, calling this logic per accepted connection) and anything that
-calls `RemoteLink::new` to actually bind a run to an executor at dispatch —
-both wait on #263's dispatch-RPC design, which decides where that binding
-happens and what shape the accept loop's caller takes. Tracked by #212.
-Promoted from a cross-machine-safety nicety to the M2 critical path (decision
-8): M2's cross-sandbox peer-group channels depend on this binding existing.
+`sandy-conn`, calling this logic per accepted connection, #279) and anything
+that calls `RemoteLink::new` to actually bind a run to an executor at
+dispatch — both wait on #263's dispatch-RPC design, which decides where that
+binding happens and what shape the accept loop's caller takes. Tracked by
+#212. Promoted from a cross-machine-safety nicety to the M2 critical path
+(decision 8): M2's cross-sandbox peer-group channels depend on this binding
+existing.
 
 **Context.** `serve_agent_link` (#216) writes the run's agent cap as its first
 frame with no check before it — it assumes its peer is already the legitimate
@@ -207,6 +214,14 @@ peer, just not the right one.
 - The mesh-IP check is defense in depth, not the gate by itself: a shared
   executor host means IP alone can't distinguish one run's forwarder from a
   sibling job on the same machine, which is exactly what the token is for.
+- An unclaimed token's validity ends the moment its run is cancelled, times
+  out, or the executor tears down (#269). `invalidate` reuses the same
+  `claimed` flag `authenticate` claims on success — an invalidated link and an
+  already-claimed one both need "reject any future attempt, write zero
+  bytes," so one flag serves both outcomes with no new refusal variant. The
+  call site (e.g. `Cancel`) logs the invalidation itself at the point it
+  happens, so a reader does not mistake a later `AlreadyClaimed` refusal for a
+  double-claim attack when it was actually a cancellation.
 
 **Consequences.** B2's eventual mesh-accept loop needs a `JobRegistry` entry
 shape that carries executor identity + token alongside the channel/caps it
