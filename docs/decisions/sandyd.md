@@ -511,3 +511,84 @@ B6's cross-machine trust model before it exists. Designing the connection-
 trust gate itself (distinguishing a trusted UDS caller from an untrusted
 mesh one): B6's job, not this block's — #226 only decides what a given
 frame is allowed to grant, never which connections must present one.
+
+## 12. The orchestrator side of the host-client contract: `Register`'s allowlist and the persistent dispatch connection (#263)
+
+**Status:** partially implemented. `sandy-executor-proto` (new crate) defines
+`HostClientMessage`/`OrchestratorMessage` (`Register`/`Registered`/
+`RegisterRefused`/`Dispatch`), riding `sandy-control-proto`'s existing
+length-prefixed framing. `sandyd::host_registry` (`ExecutorAllowlist`,
+`HostRegistry`) and `sandyd::host_conn::serve_host_client` implement the
+orchestrator side end to end: authenticate an incoming `Register` against the
+allowlist, reply `Registered`/`RegisterRefused`, then relay `Dispatch`
+messages queued for that host down its one persistent connection until it
+closes. What is NOT yet built: anything that calls `HostRegistry::register`
+from a real network accept loop (no `sandy-conn` listener is bound in
+`main.rs` yet), and anything that decides to actually place a job on a
+registered host and calls `send_dispatch` — both wait on the rest of #269's
+stage-1 blocks (the executor side, the nix overlay/service) landing.
+
+**Context.** #269's spec frames M2 cross-machine dispatch: the orchestrator
+stays the single authority (caps, channels, the peer-hub); a remote host is an
+_executor_, not an independent orchestrator, so the agent link forwards back
+to the orchestrator rather than staying local. #263 is the contract between
+them: capability-declaring registration (kubelet-style — the host-client
+detects and declares what it can run, the orchestrator dispatches against
+that declaration, never a hardcoded host) plus the dispatch RPC.
+
+**Decision.**
+
+- One persistent, bidirectional connection per host-client, not request/
+  response (unlike decision 1's control RPC): the host-client sends `Register`
+  once, then the orchestrator pushes zero or more `Dispatch` messages down the
+  _same_ connection as it places jobs there. The connection staying open is
+  the host's liveness signal — no separate heartbeat protocol, and (per #269)
+  no re-registration machinery for stage 1.
+- `Register`'s `host_id` is self-reported and used for bookkeeping/placement
+  only — it is never the authorization boundary (an architect ruling,
+  infra-f3, on #263): the orchestrator authenticates the registrant by the
+  _transport's_ own peer identity (the mesh IP `sandy_conn::PeerAddr::Tcp`
+  reports) against `ExecutorAllowlist`, the same "never trust a self-reported
+  value for authorization" discipline decision 6 already applies to the
+  agent-link stream. An unknown registrant gets `RegisterRefused`, never
+  `Registered`, and is logged — never silently dropped, and never told more
+  than "no".
+- `Dispatch.required_isolation_class` (added per #269's CodeRabbit-driven spec
+  revision): the job's required isolation class travels with the dispatch so
+  the orchestrator/executor can refuse fail-closed rather than silently
+  downgrade an untrusted job onto stage 1's trusted-process backend.
+  `Capabilities.supported_isolation_classes` is the matching declaration on
+  the host-client side.
+- `sandy-executor-proto` is its own crate (not folded into
+  `sandy-control-proto`), landed as a standalone artifact before either side's
+  implementation, so the orchestrator half (this slice) and the executor half
+  (sandy-91, #263) build against one shared type definition instead of two
+  independently-declared, potentially-diverging copies.
+- `register` guards against two gaps a CodeRabbit review on this PR caught:
+  a `host_id` already claimed by a different allowlisted peer is refused
+  (`RegisterError::HostIdClaimedByAnotherPeer`) rather than silently handed
+  to whichever peer registers it second, and `remove` takes the
+  `RegistrationId` its own `register` call returned so a stale connection's
+  teardown can never evict a newer reconnect under the same `host_id`.
+  `send_dispatch` enforces the isolation-class gate the `Dispatch` proto's
+  own doc comment already promised (§'s bullet above): a dispatch whose
+  `required_isolation_class` the target host never declared is refused
+  outright, including an unset/`Unspecified` class, which never matches
+  anything. `serve_host_client` also bounds how long an accepted connection
+  may sit before sending `Register`, so an open-and-never-write peer cannot
+  hold a connection slot forever.
+
+**Consequences.** `host_registry`'s module doc states explicitly what it does
+NOT do (accept connections, drive the loop) so the authorization logic stays
+unit-testable without a real socket — the same shape decision 6's
+`link_auth` module already established. The real accept loop (binding a mesh
+address, calling `serve_host_client` per accepted connection) and the
+placement logic that decides when to call `send_dispatch` are both still
+open; tracked by #263 and #269's stage-1 block list, not silently assumed.
+
+**Set aside.** Building the mesh-address accept loop and wiring it into
+`main.rs` in this same slice: that needs a decision this PR doesn't own (how
+`sandyd` learns its own mesh bind address — CLI flag, config, the nix
+overlay's service unit) and isn't needed to prove the `Register`/`Dispatch`
+logic correct in isolation, matching the same "test the logic, defer the
+wiring" discipline used throughout B2.
