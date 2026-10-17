@@ -97,22 +97,19 @@ fn membership_id(cap: &Cap) -> MembershipId {
 struct MembershipState {
     generation: u64,
     cursor: u64,
-    // A `Vec`, not one `Option<Waker>`: `subscribe()` is never restricted to
-    // one stream per membership (its own doc comment already notes two
-    // concurrent subscriptions aren't the expected shape, but nothing stops
-    // it), so a second stream's waker would otherwise silently overwrite the
-    // first's — leaving the first parked forever on `leave()`, exactly the
-    // hang this whole mechanism exists to close, just for that stream.
-    //
-    // Known, bounded leak traded for that fix (#225): nothing removes an
-    // entry when its `CursorStream` is dropped mid-`Pending` — the documented
-    // drop-and-resubscribe reconnect pattern accumulates one dead `Waker` per
-    // reconnect, cleared only when `leave()` drains the whole `Vec`. Low
-    // severity (wakers are cheap; membership is `CapAuthority`-gated, so not
-    // externally amplifiable; `leave()`'s wake loop just wastes a little work
-    // on stale entries) but real for a long-lived membership that reconnects
-    // many times. #225 tracks a `Drop` impl that deregisters properly.
-    wakers: Vec<Waker>,
+    // Keyed by each CursorStream's own stream_id (#225), not just a bare
+    // `Vec<Waker>`: `subscribe()` is never restricted to one stream per
+    // membership (its own doc comment already notes two concurrent
+    // subscriptions aren't the expected shape, but nothing stops it), so a
+    // second stream's waker would otherwise silently overwrite the first's —
+    // leaving the first parked forever on `leave()`, exactly the hang this
+    // mechanism exists to close, just for that stream. The id also lets
+    // `CursorStream::drop` remove exactly its own entry: `Waker::will_wake`
+    // is a best-effort identity check (two distinct streams on the same task
+    // can produce wakers that compare equal under it, as seen in this fix's
+    // own regression test), so it can't be used to tell "my waker" from
+    // "some other stream's waker that happens to look the same" on drop.
+    wakers: Vec<(u64, Waker)>,
 }
 
 /// Bounded membership + delivery over a [`ChannelBackend`] (spec §3.3). Every
@@ -127,6 +124,10 @@ pub struct Channel<B, A> {
     members: Mutex<HashMap<MembershipId, Cap>>,
     sessions: Arc<Mutex<HashMap<MembershipId, MembershipState>>>,
     next_generation: AtomicU64,
+    // Channel-wide, never reused: identifies one `CursorStream` for the life
+    // of its own `wakers` entry, so its `Drop` can remove exactly that entry
+    // (#225) regardless of what other streams on the same membership exist.
+    next_stream_id: AtomicU64,
     // An async mutex, not an AtomicU64: sequence assignment and the backend
     // append it labels must land as one atomic unit (held across the .await),
     // or two concurrent posts can make their appends visible out of sequence
@@ -171,6 +172,7 @@ impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
             members: Mutex::new(HashMap::new()),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             next_generation: AtomicU64::new(0),
+            next_stream_id: AtomicU64::new(0),
             next_seq: AsyncMutex::new(next),
         })
     }
@@ -252,7 +254,7 @@ impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(membership);
         if let Some(state) = removed {
-            for waker in state.wakers {
+            for (_, waker) in state.wakers {
                 waker.wake();
             }
         }
@@ -344,6 +346,7 @@ impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
             sessions: Arc::clone(&self.sessions),
             membership: membership.clone(),
             generation,
+            stream_id: self.next_stream_id.fetch_add(1, Ordering::SeqCst),
         })
     }
 }
@@ -372,6 +375,27 @@ struct CursorStream {
     /// mismatch (including the entry being gone entirely) means `leave()`
     /// happened, and this stream ends rather than continuing to deliver.
     generation: u64,
+    /// This stream's own identity in `MembershipState::wakers` (#225):
+    /// assigned once at `subscribe()` time, used to update its own entry on
+    /// each `Pending` poll and to remove exactly that entry on `Drop`.
+    stream_id: u64,
+}
+
+impl Drop for CursorStream {
+    fn drop(&mut self) {
+        // A membership this stream's generation has already left behind (or
+        // that was removed by `leave()` entirely) has nothing to clean up
+        // here: `leave()` already drained and woke the whole `Vec`, including
+        // this stream's own entry if it was still in it.
+        if let Some(state) = self
+            .sessions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(&self.membership)
+        {
+            state.wakers.retain(|(id, _)| *id != self.stream_id);
+        }
+    }
 }
 
 impl Stream for CursorStream {
@@ -422,15 +446,20 @@ impl Stream for CursorStream {
                 let mut sessions = this.sessions.lock().unwrap_or_else(PoisonError::into_inner);
                 match sessions.get_mut(&this.membership) {
                     Some(state) if state.generation == this.generation => {
+                        // Update-in-place by this stream's own id, not a
                         // `will_wake` dedup: this same stream's own task can
                         // poll multiple times before ever yielding (normal
-                        // executor behavior), and without this check each
-                        // Pending poll would push another functionally-
-                        // identical waker, growing the vec unboundedly over
-                        // a long-lived stream that's mostly idle.
+                        // executor behavior, and the waker can legitimately
+                        // change between polls), so each Pending poll
+                        // replaces this stream's one entry rather than
+                        // pushing another — `will_wake` can't tell two
+                        // distinct streams' wakers apart when both happen to
+                        // run on the same task (#225's regression test hits
+                        // this), so identity has to come from `stream_id`.
                         let waker = cx.waker();
-                        if !state.wakers.iter().any(|w| w.will_wake(waker)) {
-                            state.wakers.push(waker.clone());
+                        match state.wakers.iter_mut().find(|(id, _)| *id == this.stream_id) {
+                            Some((_, slot)) => *slot = waker.clone(),
+                            None => state.wakers.push((this.stream_id, waker.clone())),
                         }
                         Poll::Pending
                     }
@@ -949,6 +978,43 @@ mod tests {
                 "every stream on a left membership must end, not just one"
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropping_a_pending_stream_removes_its_own_waker_not_just_on_leave() -> anyhow::Result<()> {
+        // #225: the documented reconnect pattern (subscribe, read nothing,
+        // drop, subscribe again later) must not accumulate one dead Waker per
+        // reconnect for the membership's whole lifetime — only leave() used to
+        // clear the Vec, so a long-lived membership that reconnects many times
+        // without ever leaving grew it unboundedly.
+        let (channel, _backend, id, authority) = new_channel().await?;
+        let member = channel.join(&mint(&authority, "p1", &id, full(), Some(later())))?;
+
+        for _ in 0..5 {
+            let mut stream = Box::pin(channel.subscribe(&member)?);
+            // Poll once to Pending (nothing posted yet), registering a waker,
+            // then drop the stream still parked — the exact reconnect pattern
+            // the issue describes.
+            let polled_once = std::future::poll_fn(|cx| {
+                let _ = stream.as_mut().poll_next(cx);
+                std::task::Poll::Ready(())
+            });
+            polled_once.await;
+            drop(stream);
+        }
+
+        let wakers_len = channel
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&member)
+            .map(|state| state.wakers.len())
+            .unwrap_or(0);
+        assert_eq!(
+            wakers_len, 0,
+            "every dropped stream must deregister its own waker; none are left open here"
+        );
         Ok(())
     }
 
