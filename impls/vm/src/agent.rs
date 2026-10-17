@@ -13,11 +13,19 @@ use std::{
     io::{self, Read},
     os::fd::OwnedFd,
     path::Path,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
-use sandy_api::agent::AGENT_LINK_READY;
+use sandy::{BackendError, Outcome};
+use sandy_api::agent::{AGENT_LINK_READY, AgentLaunch, AgentReport, AgentVerdict};
+
+/// Agent mode: how long after the guest finishes to wait for the relay's
+/// verdict (as on the process backend, it follows the link closing at once).
+const VERDICT_GRACE: Duration = Duration::from_secs(10);
 
 /// The first retry delay; it doubles up to [`MAX_BACKOFF`].
 const FIRST_BACKOFF: Duration = Duration::from_millis(50);
@@ -43,7 +51,7 @@ fn sh_quote(s: &str) -> String {
 }
 
 /// A connected stream that can wait a bounded time for its first byte.
-pub(crate) trait LinkStream: Read + Into<OwnedFd> {
+pub(crate) trait LinkStream: Read + Into<OwnedFd> + Send + 'static {
     /// Bound the next read.
     fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
 }
@@ -107,6 +115,82 @@ fn acknowledged<S: LinkStream>(mut stream: S, wait: Duration) -> io::Result<Opti
         Ok(_) => Ok(None),
         Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => Ok(None),
         Err(e) => Err(e),
+    }
+}
+
+/// Start the thread that connects to the guest agent and hands the link to
+/// `launch.on_link`. Returns the receiver for the run's verdict.
+pub(crate) fn spawn_connector<S, C>(
+    launch: &AgentLaunch,
+    connect: C,
+    box_id: &str,
+    deadline: Instant,
+    stop: Arc<AtomicBool>,
+) -> (std::sync::mpsc::Receiver<AgentVerdict>, std::thread::JoinHandle<bool>)
+where
+    S: LinkStream,
+    C: FnMut() -> io::Result<S> + Send + 'static,
+{
+    let (report, verdict) = AgentReport::channel();
+    let (on_link, box_id) = (Arc::clone(&launch.on_link), box_id.to_string());
+    // Returns whether the link was handed to the relay.
+    let thread = std::thread::spawn(move || {
+        match connect_agent_link(connect, deadline, &stop) {
+            Ok(link) => {
+                // A panic drops the report unresolved: the run is an infra fault.
+                let handed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| on_link(&box_id, link, report)));
+                if handed.is_err() {
+                    tracing::warn!(box_id, "the agent link handler (on_link) panicked");
+                }
+                // A panicking handler did not take the link, even if it kept the fd.
+                handed.is_ok()
+            }
+            Err(err) => {
+                report.agent_failed(format!("could not reach the guest agent: {err}"));
+                false
+            }
+        }
+    });
+    (verdict, thread)
+}
+
+/// Agent mode: the job's exit comes only from the relay's verdict, never from
+/// the console's `exit=` (INV-11).
+///
+/// A booted guest whose agent never took its link (`linked` false) is an infra
+/// fault, even when the console then timed out: the job never started, so the
+/// timeout is not the job's. Otherwise a run that did not complete keeps its
+/// timeout or transport fault, with no exit.
+pub(crate) fn agent_outcome(
+    mut outcome: Outcome,
+    verdict: &std::sync::mpsc::Receiver<AgentVerdict>,
+    job: &str,
+    linked: bool,
+) -> Result<Outcome, BackendError> {
+    if outcome.booted && !linked {
+        let why = match verdict.try_recv() {
+            Ok(AgentVerdict::AgentFailed(why)) => why,
+            _ => "the link was never handed to the relay".to_string(),
+        };
+        return Err(BackendError::Spawn(format!(
+            "the guest agent never took its link for `{job}`: {why}"
+        )));
+    }
+    if !outcome.booted || outcome.timed_out || outcome.transport_error.is_some() {
+        outcome.guest_exit = None;
+        return Ok(outcome);
+    }
+    match verdict.recv_timeout(VERDICT_GRACE) {
+        Ok(AgentVerdict::JobExited(code)) => {
+            outcome.guest_exit = Some(code);
+            Ok(outcome)
+        }
+        Ok(AgentVerdict::AgentFailed(why)) => Err(BackendError::Spawn(format!(
+            "the sandbox agent failed for `{job}`: {why}"
+        ))),
+        Err(_) => Err(BackendError::Spawn(format!(
+            "the sandbox agent's relay reported no verdict for `{job}`"
+        ))),
     }
 }
 
