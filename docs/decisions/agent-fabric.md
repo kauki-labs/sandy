@@ -2,7 +2,7 @@
 title: "Decisions: agent-fabric seam contracts (sandy-fabric)"
 status: accepted
 project: sandy
-updated: 2026-10-16
+updated: 2026-10-17
 ---
 
 # Decisions: agent-fabric seam contracts (`sandy-fabric`)
@@ -383,3 +383,56 @@ lands with no timeout contract of its own. Needs either a per-leg timeout
 (`ChannelBackend` seam change) or return-on-first-delivery semantics; a
 transport-era question, tracked as #207, same bucket as the cross-machine
 transport work.
+
+## 12. `EscalationRelay`: the escalation channel's reading side (#205 B8)
+
+**Status:** accepted.
+
+**Context.** §11's `EscalationRole::escalate` posts to the escalation channel
+AND notifies a sink synchronously, at escalation time — a best-effort push.
+Epic #205's settled design routes escalations to the operator through a
+master-controller client that subscribes to the channel; that client did not
+exist yet. Issue #161 scopes the richer version of this (Telegram bot +
+subscribed-Claude-session backends, a bidirectional reply path, and a richer
+`EscalationRequest{severity,summary,context_ref}` payload from #130), but #130
+is an open, unresolved design question, not a built type.
+
+**Decision.** `EscalationRelay<B, A, S>` (`sandy-fabric-local`, `roles.rs`)
+wraps a `Channel<B, A>` and subscribes from its own membership's cursor,
+notifying an `EscalationSink` for every `Escalate`-typed envelope it decodes.
+Built against today's real wire shape (`EscalationMessage{from,reason}`, JSON
+payload) — not #130's richer, unbuilt shape, which is a future migration, not
+a present blocker. A sink notify failure retries (`DELIVERY_ATTEMPTS = 3`,
+a fixed short delay) before being logged at `error` level and skipped; a
+payload that fails to decode is likewise logged and skipped. Either case
+moves on to the next envelope — one bad or undeliverable message never wedges
+the relay, and neither case is silent.
+
+The first concrete `EscalationSink` is `LogEscalationSink`
+(`escalation_sink.rs`): always enabled, logs every escalation via
+`tracing::error!`. This is a real backend, not a stub: it is exactly the
+"escalation reaches me via a subscribed Claude session" path (M4) when that
+session's terminal/log stream is what the operator is watching.
+
+**Consequences.** The relay is the durable complement to `escalate`'s
+best-effort sink call: because `Channel::subscribe` resumes from a cursor
+tied to the relay's own membership, a relay instance that was offline when an
+escalation posted still sees it on resubscribe (proven directly — see
+`a_relay_subscribing_after_the_fact_still_sees_an_earlier_escalation`). No
+real cross-process transport exists yet (vsock/mesh is #205 B6, unbuilt), so
+today this wires a relay and a sink within one process over the real
+`InMem` backend; a daemon-hosted channel a remote CLI/MCP attaches to needs
+B2's orchestrator + B7's attach wiring, not yet built.
+
+**Deferred, tracked separately:**
+
+- Telegram bot backend (#161): needs live bot credentials this work could not
+  itself verify against a real bot, so it is not shipped half-tested.
+- The operator reply-back path (#161): needs a channel-level mechanism for a
+  reply to route back to the escalating sandbox, not yet designed.
+- Migrating `EscalationMessage` to #130's richer `EscalationRequest` shape:
+  #130 is an open question; the relay/sink migrate once it resolves.
+
+**Set aside.** Building the relay against #130's unbuilt `EscalationRequest`
+shape now: would presuppose an answer to an open design question instead of
+building against what the system actually carries today.

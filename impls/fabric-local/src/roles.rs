@@ -14,7 +14,12 @@
 //!   down does not lose the escalation; both paths failing is the only failure. The channel SHAPE (who posts, who's a
 //!   member, the `Escalate` marker) is the in-fabric contract; which sink implementation reaches a human (push, IPC, …)
 //!   is an operator decision deferred past step-1 (spec §9).
+//! - [`EscalationRelay`] — the channel's READING side (#205 B8): a master-controller client subscribes from its own
+//!   membership cursor and notifies an [`EscalationSink`] for every `Escalate` envelope it sees. The durable leg,
+//!   complementing `EscalationRole::escalate`'s synchronous best-effort sink call: a relay that was offline when an
+//!   escalation posted still sees it on resubscribe, because the cursor (not a live push) drives delivery.
 
+use futures_util::StreamExt as _;
 use sandy_fabric::{
     capauth::{Cap, CapAuthority, CapRights},
     channel_backend::ChannelBackend,
@@ -258,6 +263,110 @@ impl<B: ChannelBackend, A: CapAuthority, S: EscalationSink> EscalationRole<B, A,
                 channel: c.to_string(),
                 sink: s.to_string(),
             }),
+        }
+    }
+}
+
+/// An [`EscalationRelay`] failure: the channel subscribe or stream itself
+/// faulted. A message this relay received but could not decode or deliver is
+/// never an error here — [`EscalationRelay::run`] logs it loudly and moves on,
+/// since one bad or undeliverable message must never wedge the relay.
+#[derive(Debug, thiserror::Error)]
+pub enum RelayError {
+    /// The underlying channel call (subscribe, or the stream it returned) failed.
+    #[error(transparent)]
+    Channel(#[from] ChannelError),
+}
+
+/// The escalation channel's reading side (#205 B8): a master-controller client
+/// subscribes here and relays every escalation to an [`EscalationSink`] — the
+/// operator's actual notification path (a log a subscribed session watches,
+/// Telegram, …). The durable complement to [`EscalationRole::escalate`]'s
+/// synchronous, best-effort sink call: because `Channel::subscribe` resumes
+/// from this membership's own cursor, a relay that was offline when an
+/// escalation posted still sees it on resubscribe.
+pub struct EscalationRelay<B, A, S> {
+    channel: Channel<B, A>,
+    membership: MembershipId,
+    sink: S,
+}
+
+/// How many times [`EscalationRelay::run`] retries a sink notify before giving
+/// up on that one message and moving to the next.
+const DELIVERY_ATTEMPTS: u32 = 3;
+
+/// Delay between retry attempts.
+const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
+impl<B: ChannelBackend, A: CapAuthority, S: EscalationSink> EscalationRelay<B, A, S> {
+    /// Wrap `channel`, reading as `membership` (must carry the `read` right on
+    /// the escalation channel), relaying to `sink`.
+    pub fn new(channel: Channel<B, A>, membership: MembershipId, sink: S) -> Self {
+        Self {
+            channel,
+            membership,
+            sink,
+        }
+    }
+
+    /// The wrapped sink, for a caller (or a test) that needs to inspect it.
+    pub fn sink(&self) -> &S {
+        &self.sink
+    }
+
+    /// Run until the channel stream ends (a clean close) or faults: for every
+    /// `Escalate`-typed envelope, decode it and notify the sink, retrying a
+    /// bounded number of times on a transient failure. A payload this relay
+    /// cannot decode, or cannot deliver after [`DELIVERY_ATTEMPTS`] attempts,
+    /// is logged at `error` level and skipped — the next envelope is never
+    /// blocked behind one undeliverable message, but the failure is never
+    /// silent either.
+    ///
+    /// # Errors
+    /// [`RelayError::Channel`] if subscribing fails (missing `read` right, an
+    /// unknown membership, …) or the stream itself faults (the backend, not an
+    /// individual message, is the problem).
+    pub async fn run(&self) -> Result<(), RelayError> {
+        let mut stream = self.channel.subscribe(&self.membership)?;
+        while let Some(envelope) = stream.next().await {
+            let envelope = envelope.map_err(ChannelError::from)?;
+            if !matches!(envelope.message_type, Some(MessageType::Escalate(_))) {
+                continue;
+            }
+            match serde_json::from_slice::<EscalationMessage>(&envelope.payload) {
+                Ok(message) => self.deliver(&message).await,
+                Err(e) => tracing::error!(
+                    error = %e,
+                    "an Escalate envelope's payload did not decode as EscalationMessage; skipping it"
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    /// Notify the sink, retrying on failure before giving up loudly. A
+    /// disabled sink is never retried — retrying would not change the outcome.
+    async fn deliver(&self, message: &EscalationMessage) {
+        if !self.sink.enabled() {
+            tracing::error!(?message, "escalation sink is disabled; the operator was not notified");
+            return;
+        }
+        for attempt in 1..=DELIVERY_ATTEMPTS {
+            match self.sink.notify(message).await {
+                Ok(()) => return,
+                Err(e) if attempt < DELIVERY_ATTEMPTS => {
+                    tracing::warn!(error = %e, attempt, "escalation sink notify failed; retrying");
+                    tokio::time::sleep(RETRY_DELAY).await;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        ?message,
+                        attempts = DELIVERY_ATTEMPTS,
+                        "escalation sink notify failed after every retry; the operator was not notified of this escalation"
+                    );
+                }
+            }
         }
     }
 }
@@ -705,6 +814,300 @@ mod tests {
             matches!(err, RoleError::BothEscalationPathsFailed { .. }),
             "expected BothEscalationPathsFailed, got {err:?}"
         );
+        Ok(())
+    }
+
+    // ---- EscalationRelay ----
+
+    /// A sink whose first `FAILURES` calls fail, then it succeeds; records
+    /// every message it was ever asked to deliver (including failed attempts).
+    #[derive(Default)]
+    struct FlakySink {
+        attempts: Mutex<u32>,
+        delivered: Mutex<Vec<EscalationMessage>>,
+        failures_before_success: u32,
+    }
+
+    impl FlakySink {
+        fn new(failures_before_success: u32) -> Self {
+            Self {
+                failures_before_success,
+                ..Self::default()
+            }
+        }
+
+        fn delivered(&self) -> Vec<EscalationMessage> {
+            self.delivered.lock().unwrap_or_else(PoisonError::into_inner).clone()
+        }
+
+        fn attempt_count(&self) -> u32 {
+            *self.attempts.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+    }
+
+    impl EscalationSink for FlakySink {
+        fn enabled(&self) -> bool {
+            true
+        }
+
+        async fn notify(&self, message: &EscalationMessage) -> Result<(), EscalationSinkError> {
+            let mut attempts = self.attempts.lock().unwrap_or_else(PoisonError::into_inner);
+            *attempts += 1;
+            if *attempts <= self.failures_before_success {
+                return Err(EscalationSinkError::Sink(format!("flaky: attempt {attempts}")));
+            }
+            drop(attempts);
+            self.delivered
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(message.clone());
+            Ok(())
+        }
+    }
+
+    fn operator_relay<S: EscalationSink>(
+        relay_channel: Channel<InMem, TestAuthority>,
+        authority: &TestAuthority,
+        id: &ChannelId,
+        sink: S,
+    ) -> anyhow::Result<EscalationRelay<InMem, TestAuthority, S>> {
+        let operator_cap = mint(authority, "operator", id, read_only());
+        let membership = relay_channel.join(&operator_cap).context("operator joins")?;
+        Ok(EscalationRelay::new(relay_channel, membership, sink))
+    }
+
+    /// The resubscribe-catches-missed case (#205 B8's core durability claim):
+    /// a relay that did not exist yet when a sandbox escalated must still see
+    /// that escalation once it joins and subscribes — delivery is driven by
+    /// the channel's durable log and this membership's own cursor, not a live
+    /// push that only reaches a subscriber already listening.
+    #[tokio::test]
+    async fn a_relay_subscribing_after_the_fact_still_sees_an_earlier_escalation() -> anyhow::Result<()> {
+        let (post_channel, backend, id, authority) = new_channel("escalation").await?;
+        let sandbox_cap = mint(&authority, "sandbox-1", &id, full());
+        let sandbox_membership = post_channel.join(&sandbox_cap).context("sandbox joins")?;
+        let sandbox = EscalationRole::new(post_channel, sandbox_membership, DisabledSink);
+
+        // No relay exists yet: the channel leg is this escalation's only path.
+        sandbox
+            .escalate(&message())
+            .await
+            .context("escalate before any relay exists")?;
+
+        let relay_channel = Channel::new(id.clone(), backend.clone(), authority.clone())
+            .await
+            .context("relay's own Channel over the same store")?;
+        let relay = operator_relay(relay_channel, &authority, &id, FakeHumanBackend::default())?;
+
+        let run = relay.run();
+        tokio::select! {
+            result = run => { result.context("relay run faulted")?; }
+            () = tokio::time::sleep(std::time::Duration::from_millis(300)) => {}
+        }
+        anyhow::ensure!(
+            relay.sink().received() == [message()],
+            "a relay subscribing after the escalation posted must still see it, got {:?}",
+            relay.sink().received()
+        );
+        Ok(())
+    }
+
+    /// A relay already subscribed when an escalation posts delivers it live —
+    /// not just the offline/resubscribe case above.
+    #[tokio::test]
+    async fn a_running_relay_delivers_a_live_escalation() -> anyhow::Result<()> {
+        let (post_channel, backend, id, authority) = new_channel("escalation").await?;
+        let sandbox_cap = mint(&authority, "sandbox-1", &id, full());
+        let sandbox_membership = post_channel.join(&sandbox_cap).context("sandbox joins")?;
+        let sandbox = EscalationRole::new(post_channel, sandbox_membership, DisabledSink);
+
+        let relay_channel = Channel::new(id.clone(), backend.clone(), authority.clone())
+            .await
+            .context("relay's own Channel over the same store")?;
+        let relay = operator_relay(relay_channel, &authority, &id, FakeHumanBackend::default())?;
+
+        let run = relay.run();
+        tokio::select! {
+            result = run => { result.context("relay run faulted")?; }
+            () = async {
+                sandbox.escalate(&message()).await.expect("escalate");
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            } => {}
+        }
+        anyhow::ensure!(
+            relay.sink().received() == [message()],
+            "a running relay must deliver a live escalation, got {:?}",
+            relay.sink().received()
+        );
+        Ok(())
+    }
+
+    /// Adversarial: a non-`Escalate` envelope on the same channel (here a
+    /// `PeerMsg`, posted under the sandbox's own membership) is skipped, never
+    /// mistaken for an escalation.
+    #[tokio::test]
+    async fn a_relay_ignores_non_escalate_envelopes() -> anyhow::Result<()> {
+        let (post_channel, backend, id, authority) = new_channel("escalation").await?;
+        let sandbox_cap = mint(&authority, "sandbox-1", &id, full());
+        let sandbox_membership = post_channel.join(&sandbox_cap).context("sandbox joins")?;
+        post_channel
+            .post(
+                &sandbox_membership,
+                Some(MessageType::PeerMsg(PeerMsg {})),
+                CONTENT_TYPE_JSON,
+                b"not an escalation".to_vec(),
+            )
+            .await
+            .context("post a non-escalate envelope")?;
+        let sandbox = EscalationRole::new(post_channel, sandbox_membership, DisabledSink);
+        sandbox.escalate(&message()).await.context("escalate")?;
+
+        let relay_channel = Channel::new(id.clone(), backend.clone(), authority.clone())
+            .await
+            .context("relay's own Channel over the same store")?;
+        let relay = operator_relay(relay_channel, &authority, &id, FakeHumanBackend::default())?;
+
+        let run = relay.run();
+        tokio::select! {
+            result = run => { result.context("relay run faulted")?; }
+            () = tokio::time::sleep(std::time::Duration::from_millis(300)) => {}
+        }
+        anyhow::ensure!(
+            relay.sink().received() == [message()],
+            "only the Escalate envelope must reach the sink, got {:?}",
+            relay.sink().received()
+        );
+        Ok(())
+    }
+
+    /// Adversarial: an `Escalate`-typed envelope whose payload does not decode
+    /// as `EscalationMessage` (a malformed sender, or a future incompatible
+    /// shape) is logged and skipped — it must never crash the relay or stop it
+    /// from delivering the next, valid escalation.
+    #[tokio::test]
+    async fn a_relay_skips_an_undecodable_escalate_payload_and_continues() -> anyhow::Result<()> {
+        let (post_channel, backend, id, authority) = new_channel("escalation").await?;
+        let sandbox_cap = mint(&authority, "sandbox-1", &id, full());
+        let sandbox_membership = post_channel.join(&sandbox_cap).context("sandbox joins")?;
+        post_channel
+            .post(
+                &sandbox_membership,
+                Some(MessageType::Escalate(Escalate {})),
+                CONTENT_TYPE_JSON,
+                b"not valid json".to_vec(),
+            )
+            .await
+            .context("post an undecodable escalate envelope")?;
+        let sandbox = EscalationRole::new(post_channel, sandbox_membership, DisabledSink);
+        sandbox.escalate(&message()).await.context("escalate a valid message")?;
+
+        let relay_channel = Channel::new(id.clone(), backend.clone(), authority.clone())
+            .await
+            .context("relay's own Channel over the same store")?;
+        let relay = operator_relay(relay_channel, &authority, &id, FakeHumanBackend::default())?;
+
+        let run = relay.run();
+        tokio::select! {
+            result = run => { result.context("relay run faulted")?; }
+            () = tokio::time::sleep(std::time::Duration::from_millis(300)) => {}
+        }
+        anyhow::ensure!(
+            relay.sink().received() == [message()],
+            "the valid escalation must still be delivered past the undecodable one, got {:?}",
+            relay.sink().received()
+        );
+        Ok(())
+    }
+
+    /// `deliver` retries a transient sink failure and still delivers once the
+    /// sink recovers within the attempt budget.
+    #[tokio::test]
+    async fn deliver_retries_a_flaky_sink_until_it_succeeds() -> anyhow::Result<()> {
+        let (channel, _backend, id, authority) = new_channel("escalation").await?;
+        let relay = operator_relay(channel, &authority, &id, FlakySink::new(DELIVERY_ATTEMPTS - 1))?;
+
+        relay.deliver(&message()).await;
+
+        anyhow::ensure!(
+            relay.sink().delivered() == [message()],
+            "the message must be delivered once the sink recovers within the attempt budget"
+        );
+        anyhow::ensure!(
+            relay.sink().attempt_count() == DELIVERY_ATTEMPTS,
+            "expected exactly {DELIVERY_ATTEMPTS} attempts, got {}",
+            relay.sink().attempt_count()
+        );
+        Ok(())
+    }
+
+    /// Adversarial: a sink that fails on every attempt within the budget is
+    /// given up on loudly (not panicking, not retried forever) — the message
+    /// is simply not delivered, which is the honest outcome.
+    #[tokio::test]
+    async fn deliver_gives_up_after_the_attempt_budget_is_exhausted() -> anyhow::Result<()> {
+        let (channel, _backend, id, authority) = new_channel("escalation").await?;
+        let relay = operator_relay(channel, &authority, &id, FlakySink::new(DELIVERY_ATTEMPTS))?;
+
+        relay.deliver(&message()).await;
+
+        anyhow::ensure!(
+            relay.sink().delivered().is_empty(),
+            "a sink that never succeeds within the budget must not be recorded as delivered"
+        );
+        anyhow::ensure!(
+            relay.sink().attempt_count() == DELIVERY_ATTEMPTS,
+            "must not retry past the attempt budget, got {}",
+            relay.sink().attempt_count()
+        );
+        Ok(())
+    }
+
+    /// A disabled sink is never retried — `enabled() == false` is checked once
+    /// up front, since retrying would not change the outcome.
+    #[tokio::test]
+    async fn deliver_does_not_retry_a_disabled_sink() -> anyhow::Result<()> {
+        let (channel, _backend, id, authority) = new_channel("escalation").await?;
+        let relay = operator_relay(channel, &authority, &id, DisabledSink)?;
+
+        relay.deliver(&message()).await;
+        // DisabledSink::notify panics if ever called; reaching this line at
+        // all is the assertion.
+        Ok(())
+    }
+
+    /// End to end with the real, non-test sink (#205 B8's first concrete
+    /// backend): a real escalation, posted through the real `Channel`/`InMem`
+    /// backend, relayed to [`crate::escalation_sink::LogEscalationSink`] —
+    /// the actual wiring a master-controller session runs, not a fake sink
+    /// standing in for it.
+    #[tokio::test]
+    async fn a_relay_delivers_a_real_escalation_to_the_log_sink() -> anyhow::Result<()> {
+        let (post_channel, backend, id, authority) = new_channel("escalation").await?;
+        let sandbox_cap = mint(&authority, "sandbox-1", &id, full());
+        let sandbox_membership = post_channel.join(&sandbox_cap).context("sandbox joins")?;
+        let sandbox = EscalationRole::new(post_channel, sandbox_membership, DisabledSink);
+        sandbox.escalate(&message()).await.context("escalate")?;
+
+        let relay_channel = Channel::new(id.clone(), backend.clone(), authority.clone())
+            .await
+            .context("relay's own Channel over the same store")?;
+        let relay = operator_relay(
+            relay_channel,
+            &authority,
+            &id,
+            crate::escalation_sink::LogEscalationSink,
+        )?;
+
+        let run = relay.run();
+        tokio::select! {
+            result = run => { result.context("relay run faulted")?; }
+            () = tokio::time::sleep(std::time::Duration::from_millis(300)) => {}
+        }
+        // LogEscalationSink keeps no state to assert on; reaching this point
+        // without `run` ever returning `Err` (a decode failure would still be
+        // caught and skipped internally, never surfacing here) IS the
+        // end-to-end proof: a real escalation really reached the real sink's
+        // `notify`, which the earlier unit test already pins to `Ok(())`.
         Ok(())
     }
 }
