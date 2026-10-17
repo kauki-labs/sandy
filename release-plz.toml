@@ -20,6 +20,13 @@
 # crates.io publishing uses trusted publishing: this repo + the Release workflow
 # must be registered as a Trusted Publisher for each published crate on crates.io,
 # or the publish step fails closed.
+#
+# BOOTSTRAP (one-time, before the first automated release): trusted publishing
+# cannot perform a crate's FIRST publish -- the crate must already exist on
+# crates.io before a trusted-publisher relationship can be configured for it. So
+# each publishable crate must be `cargo publish`'d once manually (with a token),
+# in dependency order, then its trusted publisher registered. Until that is done
+# for every crate, the automated release's publish step fails across the board.
 
 [workspace]
 # Library crates: published to crates.io, but no standalone git tag or GitHub

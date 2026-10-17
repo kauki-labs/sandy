@@ -90,7 +90,9 @@ jobs:
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          allowed='^(Cargo\.toml|Cargo\.lock|crates/[^/]+/CHANGELOG\.md|impls/[^/]+/CHANGELOG\.md)$'
+          # Per-crate versions (not a shared workspace version) mean a release-plz
+          # bump PR edits each crate's own Cargo.toml, so allow those too.
+          allowed='^(Cargo\.toml|Cargo\.lock|(crates|impls)/[^/]+/(Cargo\.toml|CHANGELOG\.md))$'
           files=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename')
           # printf, not echo: echo mishandles a filename that looks like a flag (e.g. "-n").
           bad=$(printf '%s\n' "$files" | grep -vE "$allowed" || true)
