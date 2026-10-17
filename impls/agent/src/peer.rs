@@ -227,11 +227,15 @@ async fn handle<P: PeerPort>(
             if wait && inbox.held.is_none() {
                 // Watch the connection while waiting: a client that went away
                 // (or sent more) ends the wait, so it neither keeps the recv
-                // slot nor takes the next message with it.
+                // slot nor takes the next message with it. The client checked
+                // first, so a message landing as it leaves stays queued. A
+                // client keeps its write side open until the reply: a
+                // half-close reads the same as leaving.
                 let mut probe = [0_u8; 1];
                 tokio::select! {
-                    first = inbox.rx.recv() => inbox.held = first.map(message),
+                    biased;
                     _ = reader.read(&mut probe) => return Ok(()),
+                    first = inbox.rx.recv() => inbox.held = first.map(message),
                 }
             }
             Reply::Messages {
