@@ -327,16 +327,25 @@ async fn a_vm_job_talks_to_a_sibling_over_its_peer_channel() -> anyhow::Result<(
     let script = r#"[ -n "$SANDY_PEER_SOCKET" ] || exit 3
         printf from-guest | sandy-agent peer send group-a text/plain || exit 4
         sandy-agent peer recv --wait"#;
-    let run = tokio::spawn(run_in_guest(template, launch, script));
+    let mut run = tokio::spawn(run_in_guest(template, launch, script));
 
-    loop {
-        let env = timeout(WAIT, sibling_view.next())
-            .await?
-            .context("group stream ended")??;
-        if env.payload == b"from-guest" {
-            break;
+    // Wait for the guest's message, but report the run at once if it ends first.
+    timeout(WAIT, async {
+        loop {
+            tokio::select! {
+                env = sibling_view.next() => {
+                    let env = env.context("group stream ended")??;
+                    if env.payload == b"from-guest" {
+                        return anyhow::Ok(());
+                    }
+                }
+                ended = &mut run => {
+                    anyhow::bail!("the guest run ended before its peer message: {:?}", ended??);
+                }
+            }
         }
-    }
+    })
+    .await??;
     group
         .post(
             &sibling,
