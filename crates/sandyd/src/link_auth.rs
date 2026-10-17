@@ -108,6 +108,17 @@ impl RemoteLink {
     pub fn token(&self) -> &LinkToken {
         &self.token
     }
+
+    /// Invalidate this link so no future stream can claim it — called on
+    /// cancel, dispatch timeout, or executor teardown (#269's token-lifecycle
+    /// requirement). Reuses the same `claimed` flag `authenticate` claims on
+    /// success: an invalidated link and an already-claimed link both need
+    /// "reject any future attempt, write zero bytes," so one flag serves
+    /// both. Idempotent — invalidating an already-claimed or already-invalid
+    /// link is a no-op, never a panic or error.
+    pub fn invalidate(&self) {
+        self.claimed.store(true, Ordering::Release);
+    }
 }
 
 impl std::fmt::Debug for RemoteLink {

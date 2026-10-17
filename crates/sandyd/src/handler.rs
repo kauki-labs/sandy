@@ -159,7 +159,16 @@ pub async fn handle(
             let store = Arc::clone(store);
             let outcome = tokio::task::spawn_blocking(move || store.cancel(&job_id)).await??;
             match outcome {
-                CancelOutcome::Cancelled => control_response::Result::Cancel(CancelResponse {}),
+                CancelOutcome::Cancelled => {
+                    // #269 token-lifecycle: an unclaimed remote link must not
+                    // outlive the job it was minted for. Logged distinctly
+                    // from an ordinary already-claimed refusal so a reader
+                    // sees "cancelled" here, not "double-claim attempted",
+                    // if a late stream later presents this job's token.
+                    tracing::info!(job_id = %cancel.job_id, "cancel: invalidating any unclaimed remote link");
+                    registry.invalidate_remote_link(&cancel.job_id);
+                    control_response::Result::Cancel(CancelResponse {})
+                }
                 CancelOutcome::NotFound => control_response::Result::Error(ControlError {
                     message: format!("no such job: {}", cancel.job_id),
                 }),
@@ -526,6 +535,55 @@ mod tests {
                 assert!(message.contains("expired"), "got {message:?}");
             }
             other => anyhow::bail!("expected a refusal, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// Regression (#269 token-lifecycle): cancelling a job through the
+    /// control-request path, not just through `JobRegistry` directly, must
+    /// invalidate its remote link so a late-arriving stream can never claim
+    /// it afterward.
+    #[tokio::test]
+    async fn cancel_invalidates_the_jobs_remote_link() -> anyhow::Result<()> {
+        use crate::link_auth::{LinkAuthError, RemoteLink};
+
+        let (store, registry) = (new_store(), new_registry());
+        let submitted = handle(&store, &registry, submit_req(1)).await?;
+        let job_id = match submitted.result {
+            Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
+            other => anyhow::bail!("expected a Submit response, got {other:?}"),
+        };
+
+        let job = registry.get(&job_id).context("the submitted job must be registered")?;
+        let executor_ip: std::net::IpAddr = "100.64.0.7".parse().context("executor ip literal")?;
+        let link = RemoteLink::new(executor_ip)?;
+        let token = *link.token().as_bytes();
+        registry.insert(
+            job_id.clone(),
+            dispatch::JobChannel {
+                channel: Arc::clone(&job.channel),
+                agent_cap: job.agent_cap.clone(),
+                observer_cap: job.observer_cap.clone(),
+                remote_link: Some(link),
+                granted_caps: job.granted_caps.clone(),
+            },
+        );
+
+        let response = handle(
+            &store,
+            &registry,
+            req(2, control_request::Op::Cancel(CancelRequest { job_id: job_id.clone() })),
+        )
+        .await?;
+        assert!(
+            matches!(response.result, Some(control_response::Result::Cancel(_))),
+            "got {:?}",
+            response.result
+        );
+
+        match registry.authenticate_remote_link(&job_id, executor_ip, &token) {
+            Err(e) => assert_eq!(e, LinkAuthError::AlreadyClaimed),
+            Ok(_) => panic!("a cancelled job's remote link must not authenticate a late-arriving stream"),
         }
         Ok(())
     }

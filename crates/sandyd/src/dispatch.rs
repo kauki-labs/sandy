@@ -207,6 +207,21 @@ impl JobRegistry {
         link_auth::authenticate(link, peer_ip, presented_token)?;
         Ok(job)
     }
+
+    /// Invalidate `job_id`'s remote link, if it has one, so a stream arriving
+    /// after this point can never claim it (#269's token-lifecycle
+    /// requirement: cancel, dispatch timeout, and executor teardown must each
+    /// close this off). A no-op if the job has no remote link or is unknown —
+    /// the caller has already decided whether the terminal transition itself
+    /// (cancel, timeout, …) succeeded; this only cleans up the link that
+    /// transition leaves behind.
+    pub fn invalidate_remote_link(&self, job_id: &str) {
+        let Some(job) = self.get(job_id) else { return };
+        let Some(link) = job.remote_link.as_ref() else {
+            return;
+        };
+        link.invalidate();
+    }
 }
 
 #[cfg(test)]
@@ -345,6 +360,49 @@ mod tests {
             Err(e) => assert_eq!(e, LinkAuthError::AlreadyClaimed),
             Ok(_) => panic!("a second stream for the same run must be refused"),
         }
+        Ok(())
+    }
+
+    /// Regression (#269 token-lifecycle): a cancelled job's token is still
+    /// cryptographically valid and still unclaimed — nothing about the token
+    /// itself changes on cancel. Without `invalidate_remote_link`, a stream
+    /// arriving after cancellation would present that same valid token and
+    /// authenticate successfully; this test fails under that gap and passes
+    /// once cancellation calls `invalidate_remote_link` before the token can
+    /// be presented again.
+    #[tokio::test]
+    async fn a_cancelled_jobs_late_arriving_stream_gets_zero_bytes() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let registry = JobRegistry::new()?;
+        let mut job = mint_job_channel("job-1", registry.authority()).await?;
+        let executor_ip: std::net::IpAddr = "100.64.0.7".parse().context("executor ip literal")?;
+        let link = RemoteLink::new(executor_ip)?;
+        let token = *link.token().as_bytes();
+        job.remote_link = Some(link);
+        registry.insert("job-1".to_owned(), job);
+
+        // Simulates the Cancel control-path calling this before the job's
+        // sandbox ever gets a chance to accept the real executor's stream.
+        registry.invalidate_remote_link("job-1");
+
+        match registry.authenticate_remote_link("job-1", executor_ip, &token) {
+            Err(e) => assert_eq!(e, LinkAuthError::AlreadyClaimed),
+            Ok(_) => panic!("a cancelled job's token must never authenticate a late-arriving stream"),
+        }
+        Ok(())
+    }
+
+    /// Invalidating a job with no remote link, or an unknown job id, is a
+    /// no-op — cancel's terminal-path cleanup must never fault just because
+    /// the job was local or already gone.
+    #[tokio::test]
+    async fn invalidating_a_local_or_unknown_job_is_a_no_op() -> anyhow::Result<()> {
+        let registry = JobRegistry::new()?;
+        let job = mint_job_channel("job-1", registry.authority()).await?;
+        registry.insert("job-1".to_owned(), job);
+
+        registry.invalidate_remote_link("job-1");
+        registry.invalidate_remote_link("ghost");
         Ok(())
     }
 
