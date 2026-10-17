@@ -95,6 +95,12 @@ pub async fn handle(
             }
         }
         Some(control_request::Op::Attach(attach)) => match registry.get(&attach.job_id) {
+            Some(job) if cap_has_expired(&job.observer_cap) => control_response::Result::Error(ControlError {
+                message: format!(
+                    "job {}'s attach cap has expired; re-submit to get a new one",
+                    attach.job_id
+                ),
+            }),
             Some(job) => control_response::Result::Attach(AttachResponse {
                 channel_id: attach.job_id.clone(),
                 cap: encode_cap(&job.observer_cap)?,
@@ -155,6 +161,21 @@ pub async fn handle(
         request_id: request.request_id,
         result: Some(result),
     })
+}
+
+/// Whether `cap`'s expiry has passed. `Attach` must never hand back a cap the
+/// client can't actually join with (#227 adversarial): `encode_cap` has no
+/// way to know that, so the check lives here, at the one place that decides
+/// whether to return the cap at all.
+fn cap_has_expired(cap: &sandy_fabric::capauth::Cap) -> bool {
+    let Some(expires_at) = cap.scope.expires_at else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    expires_at <= now
 }
 
 #[cfg(test)]
@@ -336,6 +357,45 @@ mod tests {
         match response.result {
             Some(control_response::Result::Error(ControlError { message })) => {
                 assert!(message.contains("no live channel"), "got {message:?}");
+            }
+            other => anyhow::bail!("expected a refusal, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// Adversarial (#227): `Attach` must never hand back a cap the client
+    /// can't actually join with — an expired observer cap is refused by
+    /// name, not encoded and returned as if it still worked.
+    #[tokio::test]
+    async fn attach_refuses_an_expired_observer_cap() -> anyhow::Result<()> {
+        let (store, registry) = (new_store(), new_registry());
+        let submitted = handle(&store, &registry, submit_req(1)).await?;
+        let job_id = match submitted.result {
+            Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
+            other => anyhow::bail!("expected a Submit response, got {other:?}"),
+        };
+
+        let job = registry.get(&job_id).context("the submitted job must be registered")?;
+        let mut expired_cap = job.observer_cap.clone();
+        expired_cap.scope.expires_at = Some(0); // the distant past
+        registry.insert(
+            job_id.clone(),
+            dispatch::JobChannel {
+                channel: Arc::clone(&job.channel),
+                agent_cap: job.agent_cap.clone(),
+                observer_cap: expired_cap,
+            },
+        );
+
+        let response = handle(
+            &store,
+            &registry,
+            req(2, control_request::Op::Attach(AttachRequest { job_id: job_id.clone() })),
+        )
+        .await?;
+        match response.result {
+            Some(control_response::Result::Error(ControlError { message })) => {
+                assert!(message.contains("expired"), "got {message:?}");
             }
             other => anyhow::bail!("expected a refusal, got {other:?}"),
         }
