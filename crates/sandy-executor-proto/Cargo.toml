@@ -19,6 +19,7 @@ workspace = true
 [dependencies]
 sandy-control-proto.workspace = true
 prost.workspace = true
+thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
 
 [build-dependencies]
