@@ -85,6 +85,13 @@ const POLL: Duration = Duration::from_millis(10);
 /// are NEVER joined unconditionally — `run()` stays bounded regardless of the job.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
+/// Agent mode (#216): how long after the agent exits to wait for the relay's
+/// verdict. The relay reports once it reads the link's EOF, which follows the
+/// agent's exit at once, so this only absorbs a busy relay runtime. It runs from
+/// the agent's exit, not after the console drains, and is longer than
+/// [`DRAIN_GRACE`] so a slow drain cannot eat it.
+const VERDICT_GRACE: Duration = Duration::from_secs(10);
+
 /// Called with a run's box id, the host end of its agent link, and the handle
 /// to report the run's verdict on, right after the agent is spawned.
 ///
@@ -431,6 +438,8 @@ impl ProcessBackend {
             }
         };
 
+        let agent_exited = Instant::now();
+
         // Reap on every path, exit or timeout. First destroy the containment scope:
         // when containment is Available this kills the whole cgroup, including a
         // setsid/setpgid escapee the group-kill below would miss (#135). Best-effort
@@ -461,7 +470,7 @@ impl ProcessBackend {
         } else if let Some(verdict) = verdict {
             // Agent mode: the job's exit comes only from the relay's verdict (see
             // AgentReport); the relay sees the link close as soon as the agent exits.
-            match verdict.recv_timeout(DRAIN_GRACE) {
+            match verdict.recv_timeout((agent_exited + VERDICT_GRACE).saturating_duration_since(Instant::now())) {
                 Ok(Verdict::JobExited(code)) => Some(code),
                 Ok(Verdict::AgentFailed(why)) => {
                     return Err(BackendError::Spawn(format!(
