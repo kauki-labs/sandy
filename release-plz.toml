@@ -26,6 +26,11 @@ publish = false
 git_only = true
 # Releases are driven by an intentional version bump, not lockfile churn.
 dependencies_update = false
+# Per-binary tag format: <binary-name>-<version>, e.g. `sandy-cli-0.1.1`. This is
+# deliberately distinct from the operator's milestone tags (`v*` / `m*`, handled by
+# github-release.yaml), so release-plz's per-binary tags and operator milestone
+# tags never collide.
+git_tag_name = "{{ package }}-{{ version }}"
 
 # --- Binaries: released and tagged independently, each on its own version. ---
 [[package]]
