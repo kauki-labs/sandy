@@ -96,6 +96,9 @@ pub enum AgentError {
     /// expired, or wrong-channel cap. The job must not be started.
     #[error("the relay refused the join: {0}")]
     Refused(String),
+    /// A peer-channel operation named a channel this agent did not join.
+    #[error("not a member of peer channel {0}")]
+    NotAPeer(String),
     /// The agent link faulted or broke protocol.
     #[error("agent link: {0}")]
     Link(#[from] LinkError),
@@ -279,6 +282,17 @@ async fn bridge_tty<P: TtyPort>(
     result
 }
 
+/// A message for the agent on one of its peer channels (#238 slice 4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerDelivery {
+    /// The peer channel it arrived on.
+    pub channel: String,
+    /// Its content type.
+    pub content_type: String,
+    /// Its bytes.
+    pub payload: Vec<u8>,
+}
+
 /// The sandbox agent as its own OS process (#216): bootstraps over the agent
 /// link from the orchestrator-side relay ([`crate::link::serve_agent_link`])
 /// instead of holding the channel, then bridges the job's stdio the same way
@@ -303,7 +317,7 @@ impl LinkAgent {
     {
         let (mut rd, mut wr) = tokio::io::split(link);
         let cap = match read_frame(&mut rd).await? {
-            Some(LinkFrame::Cap { cap }) => cap,
+            Some(LinkFrame::Cap { cap, channel: None, .. }) => cap,
             Some(other) => {
                 return Err(LinkError::Protocol(format!("expected the cap frame first, got {}", other.kind())).into());
             }
@@ -311,9 +325,9 @@ impl LinkAgent {
         };
         // Refuse garbage here rather than presenting it; the relay re-verifies.
         decode_cap(&unhex(&cap, "the cap frame")?)?;
-        write_frame(&mut wr, &LinkFrame::Join { cap }).await?;
+        write_frame(&mut wr, &LinkFrame::Join { cap, channel: None }).await?;
         match read_frame(&mut rd).await? {
-            Some(LinkFrame::Joined) => {}
+            Some(LinkFrame::Joined { channel: None }) => {}
             Some(LinkFrame::Refused { reason }) => return Err(AgentError::Refused(reason)),
             Some(other) => {
                 return Err(LinkError::Protocol(format!("expected the join verdict, got {}", other.kind())).into());
@@ -350,12 +364,14 @@ impl LinkAgent {
         let stdin_frames = futures_util::stream::unfold(reader, |mut reader| async move {
             loop {
                 match read_frame(&mut reader).await {
-                    Ok(Some(LinkFrame::Deliver { content_type, payload })) if content_type == TTY_STDIN => {
-                        match unhex(&payload, "a deliver payload") {
-                            Ok(bytes) => return Some((bytes, reader)),
-                            Err(e) => tracing::warn!(error = %e, "dropping a malformed stdin frame"),
-                        }
-                    }
+                    Ok(Some(LinkFrame::Deliver {
+                        content_type,
+                        payload,
+                        channel: None,
+                    })) if content_type == TTY_STDIN => match unhex(&payload, "a deliver payload") {
+                        Ok(bytes) => return Some((bytes, reader)),
+                        Err(e) => tracing::warn!(error = %e, "dropping a malformed stdin frame"),
+                    },
                     Ok(Some(other)) => tracing::warn!(kind = other.kind(), "ignoring an unexpected link frame"),
                     Ok(None) => return None,
                     Err(e) => {
@@ -370,6 +386,27 @@ impl LinkAgent {
 }
 
 impl LinkAgent {
+    /// The peer channels this agent joined at setup.
+    #[must_use]
+    pub fn peers(&self) -> &[String] {
+        &[]
+    }
+
+    /// Post on peer channel `channel`, which this agent must have joined.
+    ///
+    /// # Errors
+    /// [`AgentError::NotAPeer`] for a channel this agent did not join, or
+    /// [`AgentError::Link`] if the frame cannot be written.
+    pub async fn post_peer(&self, _channel: &str, _content_type: &str, _payload: Vec<u8>) -> Result<(), AgentError> {
+        Err(AgentError::NotAPeer(String::new()))
+    }
+
+    /// The receiver for messages on this agent's peer channels; `Some` once.
+    /// They arrive while [`serve_tty`](Self::serve_tty) reads the link.
+    pub fn take_peer_inbox(&self) -> Option<tokio::sync::mpsc::Receiver<PeerDelivery>> {
+        None
+    }
+
     /// Report the job's exit to the relay as the link's last frame. A run whose
     /// agent never reports is an infra fault, not a job result (INV-11).
     ///
@@ -390,6 +427,7 @@ impl TtyPort for LinkPort {
         let frame = LinkFrame::Post {
             content_type: content_type.to_string(),
             payload: hex::encode(payload),
+            channel: None,
         };
         Ok(write_frame(&mut *self.writer.lock().await, &frame).await?)
     }

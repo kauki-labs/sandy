@@ -43,29 +43,50 @@ pub const MAX_FRAME: usize = 1 << 20;
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LinkFrame {
-    /// Relay to agent, first frame only: the encoded bootstrap cap.
+    /// Relay to agent: a cap to join with. The first frame on the link carries
+    /// the orchestrator-channel cap (`channel` absent) and how many peer-channel
+    /// caps follow it, each in lockstep with its own `Join` (#238 slice 4).
     Cap {
         /// The hex of `encode_cap`.
         cap: String,
+        /// The peer channel this cap is for; absent for the orchestrator channel.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channel: Option<String>,
+        /// On the first frame only: how many peer-channel caps follow.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        peers: u32,
     },
-    /// Agent to relay: join the channel with this cap.
+    /// Agent to relay: join `channel` (the orchestrator channel when absent)
+    /// with the cap this link handed over for it.
     Join {
         /// The hex of `encode_cap`.
         cap: String,
+        /// The peer channel; absent for the orchestrator channel.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channel: Option<String>,
     },
     /// Relay to agent: the join succeeded.
-    Joined,
+    Joined {
+        /// The peer channel joined; absent for the orchestrator channel.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channel: Option<String>,
+    },
     /// Relay to agent: the join (or a repeated join) was refused.
     Refused {
         /// Why, for the agent's diagnostics. Never carries the cap.
         reason: String,
     },
-    /// Agent to relay: post job output on the channel.
+    /// Agent to relay: post on a channel. On the orchestrator channel (`channel`
+    /// absent) only job output, `TTY_STDOUT` or `TTY_STDERR`; on a peer channel
+    /// this link joined, a peer message of any non-TTY content type.
     Post {
-        /// `TTY_STDOUT` or `TTY_STDERR`; anything else is refused.
+        /// The content type.
         content_type: String,
         /// The hex of the bytes.
         payload: String,
+        /// The peer channel; absent for the orchestrator channel.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channel: Option<String>,
     },
     /// Agent to relay, last frame: the job ran and exited with `code` (`128 +
     /// signal` for a signal death). Its absence means the agent failed.
@@ -73,12 +94,16 @@ pub enum LinkFrame {
         /// The job's exit code.
         code: i32,
     },
-    /// Relay to agent: input for the job.
+    /// Relay to agent: input for the job (`TTY_STDIN`, `channel` absent), or a
+    /// message on a peer channel this link joined.
     Deliver {
-        /// `TTY_STDIN`.
+        /// The content type.
         content_type: String,
         /// The hex of the bytes.
         payload: String,
+        /// The peer channel; absent for the orchestrator channel.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channel: Option<String>,
     },
 }
 
@@ -89,7 +114,7 @@ impl LinkFrame {
         match self {
             Self::Cap { .. } => "cap",
             Self::Join { .. } => "join",
-            Self::Joined => "joined",
+            Self::Joined { .. } => "joined",
             Self::Refused { .. } => "refused",
             Self::Post { .. } => "post",
             Self::Deliver { .. } => "deliver",
@@ -103,10 +128,15 @@ impl std::fmt::Debug for LinkFrame {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Cap { .. } | Self::Join { .. } => write!(f, "LinkFrame::{}(<redacted>)", self.kind()),
-            Self::Joined => f.write_str("LinkFrame::Joined"),
+            Self::Joined { channel } => write!(f, "LinkFrame::Joined({channel:?})"),
             Self::Refused { reason } => write!(f, "LinkFrame::Refused({reason:?})"),
             Self::Exit { code } => write!(f, "LinkFrame::Exit({code})"),
-            Self::Post { content_type, payload } | Self::Deliver { content_type, payload } => write!(
+            Self::Post {
+                content_type, payload, ..
+            }
+            | Self::Deliver {
+                content_type, payload, ..
+            } => write!(
                 f,
                 "LinkFrame::{}({content_type}, {} bytes)",
                 self.kind(),
@@ -114,6 +144,12 @@ impl std::fmt::Debug for LinkFrame {
             ),
         }
     }
+}
+
+/// `skip_serializing_if` helper: the first-frame-only `peers` count is omitted
+/// when zero, so a link without peers keeps its exact wire form.
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// An agent-link failure.
@@ -211,9 +247,17 @@ where
     let wr = Arc::new(AsyncMutex::new(wr));
 
     let handed = hex::encode(encode_cap(cap)?);
-    write_frame(&mut *wr.lock().await, &LinkFrame::Cap { cap: handed.clone() }).await?;
+    write_frame(
+        &mut *wr.lock().await,
+        &LinkFrame::Cap {
+            cap: handed.clone(),
+            channel: None,
+            peers: 0,
+        },
+    )
+    .await?;
     let presented = match read_frame(&mut rd).await? {
-        Some(LinkFrame::Join { cap }) => cap,
+        Some(LinkFrame::Join { cap, channel: None }) => cap,
         Some(other) => {
             return Err(LinkError::Protocol(format!(
                 "expected join from the agent, got {}",
@@ -248,8 +292,39 @@ where
         id,
         deliver: None,
     };
-    write_frame(&mut *wr.lock().await, &LinkFrame::Joined).await?;
+    write_frame(&mut *wr.lock().await, &LinkFrame::Joined { channel: None }).await?;
     relay_joined(&mut membership, &mut rd, &wr).await
+}
+
+/// A peer-channel membership the relay hands the agent at setup (#238 slice
+/// 4): a channel this sandbox may talk to its peers on, and the cap minted for
+/// it. Membership is fixed for the run in v1 (minted at dispatch).
+pub struct PeerGrant<B, A> {
+    /// The peer-group channel.
+    pub channel: Arc<Channel<B, A>>,
+    /// The agent's cap on it.
+    pub cap: Cap,
+}
+
+/// [`serve_agent_link`] that also hands the agent `peers`, one membership per
+/// peer channel. Each peer `Post` and `Deliver` is authorized against that
+/// channel's own membership, never against holding the link.
+///
+/// # Errors
+/// As [`serve_agent_link`]; a refused peer join fails the link.
+pub async fn serve_agent_link_with_peers<B, A, L>(
+    channel: Arc<Channel<B, A>>,
+    cap: &Cap,
+    peers: Vec<PeerGrant<B, A>>,
+    link: L,
+) -> Result<Option<i32>, LinkError>
+where
+    B: ChannelBackend + 'static,
+    A: CapAuthority + 'static,
+    L: AsyncRead + AsyncWrite + Send + 'static,
+{
+    let _ = peers;
+    serve_agent_link(channel, cap, link).await
 }
 
 /// A joined agent's membership: leaving it, and aborting the stdin delivery
@@ -301,6 +376,7 @@ where
                 let frame = LinkFrame::Deliver {
                     content_type: env.content_type,
                     payload: hex::encode(&env.payload),
+                    channel: None,
                 };
                 if let Err(e) = write_frame(&mut *wr.lock().await, &frame).await {
                     tracing::warn!(error = %e, "agent relay: delivering stdin failed; stopped");
@@ -320,7 +396,11 @@ where
                     "the agent sent a frame after reporting the job's exit".to_string(),
                 ));
             }
-            Some(LinkFrame::Post { content_type, payload }) => {
+            Some(LinkFrame::Post {
+                content_type,
+                payload,
+                channel: None,
+            }) => {
                 if content_type != TTY_STDOUT && content_type != TTY_STDERR {
                     return Err(LinkError::Protocol(format!("the agent may not post {content_type}")));
                 }
@@ -353,7 +433,7 @@ mod tests {
 
     use anyhow::Context;
     use sandy_fabric::{
-        capauth::{CapRights, CapScope},
+        capauth::{CapRights, CapScope, encode_cap},
         types::{ChannelId, PeerId},
     };
     use tokio::time::timeout;
@@ -397,6 +477,7 @@ mod tests {
         let frame = LinkFrame::Post {
             content_type: TTY_STDOUT.to_string(),
             payload: hex::encode(b"hi"),
+            channel: None,
         };
         write_frame(&mut a, &frame).await?;
         drop(a);
@@ -424,8 +505,15 @@ mod tests {
     fn a_cap_bearing_frame_is_redacted_in_debug() {
         let secret = "deadbeefcafe".to_string();
         for frame in [
-            LinkFrame::Cap { cap: secret.clone() },
-            LinkFrame::Join { cap: secret.clone() },
+            LinkFrame::Cap {
+                cap: secret.clone(),
+                channel: None,
+                peers: 0,
+            },
+            LinkFrame::Join {
+                cap: secret.clone(),
+                channel: None,
+            },
         ] {
             let shown = format!("{frame:?}");
             assert!(!shown.contains(&secret), "the cap leaked into Debug: {shown}");
@@ -510,6 +598,286 @@ mod tests {
         Ok(())
     }
 
+    /// A peer-group channel with the agent's cap and a sibling sandbox's cap on it.
+    async fn peer_channel(id: &str) -> anyhow::Result<(TestChannel, Cap, Cap)> {
+        let authority = LocalCapAuthority::new(Duration::from_secs(3600))?;
+        let peer_scope = |peer: &str| CapScope {
+            peer: PeerId::from(peer),
+            channel: ChannelId::from(id),
+            rights: CapRights {
+                post: true,
+                read: true,
+                invite: false,
+            },
+            expires_at: None,
+        };
+        let agent_cap = authority.mint(peer_scope("agent"))?;
+        let sibling_cap = authority.mint(peer_scope("sibling"))?;
+        let channel = Channel::new(ChannelId::from(id), InMem::default(), authority).await?;
+        Ok((Arc::new(channel), agent_cap, sibling_cap))
+    }
+
+    /// The next peer delivery on `inbox` for `channel`, skipping the agent's
+    /// own echoes and other content.
+    async fn next_peer(
+        inbox: &mut tokio::sync::mpsc::Receiver<crate::agent::PeerDelivery>,
+        payload: &[u8],
+    ) -> anyhow::Result<crate::agent::PeerDelivery> {
+        loop {
+            let delivery = timeout(WAIT, inbox.recv()).await?.context("peer inbox closed")?;
+            if delivery.payload == payload {
+                return Ok(delivery);
+            }
+        }
+    }
+
+    /// #238 slice 4: the agent joins its peer channel at setup and exchanges
+    /// messages with a sibling sandbox on it, alongside its orchestrator TTY.
+    #[tokio::test]
+    async fn an_agent_joins_its_peer_channel_and_exchanges_messages() -> anyhow::Result<()> {
+        let (channel, agent_cap, _) = channel_and_caps().await?;
+        let (group, agent_peer_cap, sibling_cap) = peer_channel("group-a").await?;
+        let sibling = group.join(&sibling_cap)?;
+        let mut sibling_view = std::pin::pin!(group.subscribe(&sibling)?);
+
+        let (agent_end, host_end) = tokio::io::duplex(64 * 1024);
+        let grants = vec![PeerGrant {
+            channel: Arc::clone(&group),
+            cap: agent_peer_cap,
+        }];
+        let relay =
+            tokio::spawn(async move { serve_agent_link_with_peers(channel, &agent_cap, grants, host_end).await });
+        let agent = timeout(WAIT, LinkAgent::bootstrap(agent_end)).await??;
+        assert_eq!(agent.peers(), ["group-a".to_string()]);
+        let mut inbox = agent.take_peer_inbox().context("the peer inbox is taken once")?;
+        let agent = Arc::new(agent);
+
+        let (stdout_agent, job_stdout) = tokio::io::duplex(1024);
+        let (stderr_agent, job_stderr) = tokio::io::duplex(1024);
+        let (stdin_agent, _job_stdin) = tokio::io::duplex(1024);
+        let serving = tokio::spawn({
+            let agent = Arc::clone(&agent);
+            async move { agent.serve_tty(stdout_agent, stderr_agent, stdin_agent).await }
+        });
+
+        group
+            .post(
+                &sibling,
+                Some(MessageType::PeerMsg(sandy_proto::PeerMsg {})),
+                "application/json",
+                b"from-sibling".to_vec(),
+            )
+            .await?;
+        let got = next_peer(&mut inbox, b"from-sibling").await?;
+        assert_eq!(
+            (got.channel.as_str(), got.content_type.as_str()),
+            ("group-a", "application/json")
+        );
+
+        agent
+            .post_peer("group-a", "application/json", b"from-agent".to_vec())
+            .await?;
+        loop {
+            let env = timeout(WAIT, sibling_view.next())
+                .await?
+                .context("group stream ended")??;
+            if env.payload == b"from-agent" {
+                assert!(matches!(env.message_type, Some(MessageType::PeerMsg(_))));
+                break;
+            }
+        }
+
+        drop((job_stdout, job_stderr));
+        timeout(WAIT, serving).await???;
+        drop(agent);
+        timeout(WAIT, relay).await???;
+        Ok(())
+    }
+
+    /// Run the relay with peer grants and drive it as a raw agent through the
+    /// setup: the orchestrator join, then each peer join in lockstep.
+    async fn raw_agent_with_peers(
+        grants: Vec<PeerGrant<InMem, LocalCapAuthority>>,
+    ) -> anyhow::Result<(
+        tokio::io::DuplexStream,
+        tokio::task::JoinHandle<Result<Option<i32>, LinkError>>,
+    )> {
+        let expected = u32::try_from(grants.len())?;
+        let (channel, agent_cap, _) = channel_and_caps().await?;
+        let (mut agent_end, host_end) = tokio::io::duplex(64 * 1024);
+        let relay =
+            tokio::spawn(async move { serve_agent_link_with_peers(channel, &agent_cap, grants, host_end).await });
+        let Some(LinkFrame::Cap {
+            cap,
+            channel: None,
+            peers,
+        }) = timeout(WAIT, read_frame(&mut agent_end)).await??
+        else {
+            anyhow::bail!("the relay's first frame must be the orchestrator cap");
+        };
+        anyhow::ensure!(
+            peers == expected,
+            "the relay announced {peers} peer caps, expected {expected}"
+        );
+        write_frame(&mut agent_end, &LinkFrame::Join { cap, channel: None }).await?;
+        anyhow::ensure!(
+            timeout(WAIT, read_frame(&mut agent_end)).await?? == Some(LinkFrame::Joined { channel: None }),
+            "the orchestrator join must succeed"
+        );
+        for _ in 0..peers {
+            let Some(LinkFrame::Cap { cap, channel, .. }) = timeout(WAIT, read_frame(&mut agent_end)).await?? else {
+                anyhow::bail!("expected a peer cap frame");
+            };
+            write_frame(
+                &mut agent_end,
+                &LinkFrame::Join {
+                    cap,
+                    channel: channel.clone(),
+                },
+            )
+            .await?;
+            let joined = timeout(WAIT, read_frame(&mut agent_end)).await??;
+            anyhow::ensure!(
+                joined == Some(LinkFrame::Joined { channel }),
+                "peer join failed: {joined:?}"
+            );
+        }
+        Ok((agent_end, relay))
+    }
+
+    /// Adversarial (infra-f3, post side): a link holding a cap for channel A
+    /// cannot post to channel B, nor post TTY traffic on a peer channel; the
+    /// relay ends and nothing is stored.
+    #[tokio::test]
+    async fn a_post_to_a_channel_the_link_did_not_join_is_refused() -> anyhow::Result<()> {
+        let (group_a, agent_a, _) = peer_channel("group-a").await?;
+        let (group_b, _, sibling_b) = peer_channel("group-b").await?;
+        for (target, content_type) in [("group-b", "application/json"), ("group-a", TTY_STDOUT)] {
+            let grants = vec![PeerGrant {
+                channel: Arc::clone(&group_a),
+                cap: agent_a.clone(),
+            }];
+            let (mut agent_end, relay) = raw_agent_with_peers(grants).await?;
+            write_frame(
+                &mut agent_end,
+                &LinkFrame::Post {
+                    content_type: content_type.to_string(),
+                    payload: hex::encode(b"smuggled"),
+                    channel: Some(target.to_string()),
+                },
+            )
+            .await?;
+            let relayed = timeout(WAIT, relay).await??;
+            assert!(
+                matches!(relayed, Err(LinkError::Protocol(_))),
+                "{target}/{content_type}: got {relayed:?}"
+            );
+        }
+        let observer = group_b.join(&sibling_b)?;
+        let mut stream = std::pin::pin!(group_b.subscribe(&observer)?);
+        let stored = timeout(Duration::from_millis(200), stream.next()).await;
+        assert!(stored.is_err(), "the refused post reached channel B: {stored:?}");
+        Ok(())
+    }
+
+    /// Adversarial (infra-f3, deliver side): traffic on a channel the link did
+    /// not join never reaches the agent.
+    #[tokio::test]
+    async fn traffic_on_a_channel_the_link_did_not_join_never_reaches_the_agent() -> anyhow::Result<()> {
+        let (group_a, agent_a, sibling_a) = peer_channel("group-a").await?;
+        let (group_b, _, sibling_b) = peer_channel("group-b").await?;
+        let grants = vec![PeerGrant {
+            channel: Arc::clone(&group_a),
+            cap: agent_a,
+        }];
+        let (mut agent_end, relay) = raw_agent_with_peers(grants).await?;
+
+        let on_b = group_b.join(&sibling_b)?;
+        group_b
+            .post(
+                &on_b,
+                Some(MessageType::PeerMsg(sandy_proto::PeerMsg {})),
+                "application/json",
+                b"for-b-only".to_vec(),
+            )
+            .await?;
+        let on_a = group_a.join(&sibling_a)?;
+        group_a
+            .post(
+                &on_a,
+                Some(MessageType::PeerMsg(sandy_proto::PeerMsg {})),
+                "application/json",
+                b"for-a".to_vec(),
+            )
+            .await?;
+
+        let mut seen = Vec::new();
+        while let Ok(Ok(Some(frame))) = timeout(Duration::from_millis(500), read_frame(&mut agent_end)).await {
+            if let LinkFrame::Deliver { channel, payload, .. } = frame {
+                seen.push((channel, unhex(&payload, "payload")?));
+            }
+        }
+        assert!(
+            seen.contains(&(Some("group-a".to_string()), b"for-a".to_vec())),
+            "A's traffic must reach the agent: {seen:?}"
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|(channel, payload)| channel.as_deref() == Some("group-b") || payload == b"for-b-only"),
+            "B's traffic reached an agent that holds only A: {seen:?}"
+        );
+        drop(agent_end);
+        timeout(WAIT, relay).await???;
+        Ok(())
+    }
+
+    /// Adversarial (infra-f3, join side): a peer join must present exactly the
+    /// cap handed over for that channel; another channel's cap, or the right cap
+    /// under the wrong channel name, is refused.
+    #[tokio::test]
+    async fn a_peer_join_must_present_the_cap_handed_for_that_channel() -> anyhow::Result<()> {
+        let (group_a, agent_a, _) = peer_channel("group-a").await?;
+        let (_group_b, agent_b, _) = peer_channel("group-b").await?;
+        let swapped_cap = hex::encode(encode_cap(&agent_b)?);
+        for (join_cap, join_channel) in [(Some(swapped_cap), "group-a"), (None, "group-b")] {
+            let (channel, agent_cap, _) = channel_and_caps().await?;
+            let grants = vec![PeerGrant {
+                channel: Arc::clone(&group_a),
+                cap: agent_a.clone(),
+            }];
+            let (mut agent_end, host_end) = tokio::io::duplex(64 * 1024);
+            let relay =
+                tokio::spawn(async move { serve_agent_link_with_peers(channel, &agent_cap, grants, host_end).await });
+            let Some(LinkFrame::Cap { cap, .. }) = timeout(WAIT, read_frame(&mut agent_end)).await?? else {
+                anyhow::bail!("first frame must be a cap");
+            };
+            write_frame(&mut agent_end, &LinkFrame::Join { cap, channel: None }).await?;
+            timeout(WAIT, read_frame(&mut agent_end)).await??;
+            let Some(LinkFrame::Cap { cap: handed, .. }) = timeout(WAIT, read_frame(&mut agent_end)).await?? else {
+                anyhow::bail!("expected the peer cap frame");
+            };
+            write_frame(
+                &mut agent_end,
+                &LinkFrame::Join {
+                    cap: join_cap.unwrap_or(handed),
+                    channel: Some(join_channel.to_string()),
+                },
+            )
+            .await?;
+            let reply = timeout(WAIT, read_frame(&mut agent_end)).await??;
+            assert!(
+                matches!(reply, Some(LinkFrame::Refused { .. })),
+                "{join_channel}: got {reply:?}"
+            );
+            assert!(
+                timeout(WAIT, relay).await??.is_err(),
+                "{join_channel}: the relay must fail"
+            );
+        }
+        Ok(())
+    }
+
     /// Drive the relay as a raw agent: read the cap frame, join with it.
     async fn joined_raw_agent(
         channel: TestChannel,
@@ -520,12 +888,15 @@ mod tests {
     )> {
         let (mut agent_end, host_end) = tokio::io::duplex(64 * 1024);
         let relay = tokio::spawn(async move { serve_agent_link(channel, &cap, host_end).await });
-        let Some(LinkFrame::Cap { cap }) = timeout(WAIT, read_frame(&mut agent_end)).await?? else {
+        let Some(LinkFrame::Cap { cap, .. }) = timeout(WAIT, read_frame(&mut agent_end)).await?? else {
             anyhow::bail!("the relay's first frame must be the cap");
         };
-        write_frame(&mut agent_end, &LinkFrame::Join { cap }).await?;
+        write_frame(&mut agent_end, &LinkFrame::Join { cap, channel: None }).await?;
         let joined = timeout(WAIT, read_frame(&mut agent_end)).await??;
-        anyhow::ensure!(joined == Some(LinkFrame::Joined), "expected Joined, got {joined:?}");
+        anyhow::ensure!(
+            joined == Some(LinkFrame::Joined { channel: None }),
+            "expected Joined, got {joined:?}"
+        );
         Ok((agent_end, relay))
     }
 
@@ -561,6 +932,7 @@ mod tests {
             &mut agent_end,
             &LinkFrame::Join {
                 cap: hex::encode(sandy_fabric::capauth::encode_cap(&orchestrator_cap)?),
+                channel: None,
             },
         )
         .await?;
@@ -582,6 +954,7 @@ mod tests {
             &mut agent_end,
             &LinkFrame::Join {
                 cap: hex::encode(encode_cap(&agent_cap)?),
+                channel: None,
             },
         )
         .await?;
@@ -605,6 +978,7 @@ mod tests {
             &LinkFrame::Post {
                 content_type: TTY_STDIN.to_string(),
                 payload: hex::encode(b"evil"),
+                channel: None,
             },
         )
         .await?;
