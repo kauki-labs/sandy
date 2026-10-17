@@ -196,8 +196,92 @@ pub async fn dial_and_forward<L>(
 where
     L: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
-    let remote = sandy_conn::connect(&ConnAddr::Tcp(orchestrator)).await?;
+    // Bounded: an orchestrator that's unreachable (down, firewalled, a
+    // routing black hole on the mesh) must not hang this dial forever — the
+    // caller (relay_agent_link's spawned task) has a report to deliver, and
+    // an indefinite hang here would silently withhold it.
+    let remote = tokio::time::timeout(DIAL_TIMEOUT, sandy_conn::connect(&ConnAddr::Tcp(orchestrator)))
+        .await
+        .map_err(|_| {
+            DialAndForwardError::Dial(sandy_conn::ConnError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("dialing {orchestrator} timed out after {DIAL_TIMEOUT:?}"),
+            )))
+        })??;
     Ok(forward_agent_link(local, remote, prefix).await?)
+}
+
+/// How long [`dial_and_forward`] waits for the mesh dial to the orchestrator
+/// before giving up. Generous relative to mesh RTT (this is a TCP connect on
+/// an already-authenticated WireGuard mesh, not a public-internet dial), but
+/// bounded — an indefinitely hanging dial would never resolve the
+/// `AgentReport` it owes the backend.
+const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Relay one [`AgentLaunch::on_link`](sandy_api::agent::AgentLaunch) call to the
+/// orchestrator over the mesh: the executor-host side of #269's stage-1
+/// cross-machine dispatch, and the one place [`dial_and_forward`] meets
+/// `sandy-api`'s agent-launch contract.
+///
+/// `OnLink` itself is sync and runs on whatever thread the backend's `run`
+/// call is on, with **no ambient async runtime** — its own doc says so
+/// explicitly: "no async runtime guaranteed... must not block." So this
+/// function never awaits anything itself; it spawns the whole relay onto
+/// `rt` (a [`tokio::runtime::Handle`] the caller must capture in an async
+/// context before entering the `on_link` closure) and returns immediately,
+/// exactly the "start the relay elsewhere and return" `OnLink` asks for.
+///
+/// `report` moves into the spawned task and is consumed exactly once there,
+/// on every path: [`AgentReport::job_exited`] on
+/// [`ForwardedVerdict::JobExited`], [`AgentReport::agent_failed`] on
+/// [`ForwardedVerdict::AgentFailed`] or on a dial/link-conversion failure.
+/// `AgentReport` wraps a capacity-1 channel, so none of these sends can
+/// block. A `report` that never gets called (this function panicking before
+/// spawning) disconnects the backend's receiver and surfaces as an infra
+/// fault with no reason attached — by the type's own design, not something
+/// this function tries to paper over; reached only if `rt.spawn` itself
+/// panics, which means the runtime is already gone.
+///
+/// Reusable rather than inlined in any one backend's receive path: #269's
+/// own design note is that no production `on_link` wiring exists yet, even
+/// for the local case (#115's e2e test drives the agent library directly,
+/// bypassing `on_link` entirely) — a local backend wiring up `on_link`
+/// later for its own reasons can reuse this exact relay, not a inherit a
+/// one-off built only for the remote path.
+pub fn relay_agent_link(
+    rt: &tokio::runtime::Handle,
+    forward_back: SocketAddr,
+    host_end: std::os::fd::OwnedFd,
+    prefix: Vec<u8>,
+    report: sandy_api::agent::AgentReport,
+) {
+    rt.spawn(async move {
+        let link = match owned_fd_into_unix_stream(host_end) {
+            Ok(link) => link,
+            Err(e) => {
+                report.agent_failed(format!("converting the agent link fd: {e}"));
+                return;
+            }
+        };
+        match dial_and_forward(forward_back, link, &prefix).await {
+            Ok(ForwardedVerdict::JobExited(code)) => report.job_exited(code),
+            Ok(ForwardedVerdict::AgentFailed(reason)) => report.agent_failed(reason),
+            // DialAndForwardError's own Display already names what failed
+            // ("dialing the orchestrator: ..." or "agent link: ...");
+            // wrapping it again here would duplicate that prefix.
+            Err(e) => report.agent_failed(e.to_string()),
+        }
+    });
+}
+
+/// The relay side of the same fd-to-async-stream conversion
+/// `impls/agent/src/main.rs`'s `claim_link` does on the agent side: take
+/// ownership of a raw Unix-socket fd, mark it non-blocking (required before
+/// tokio can drive it), and hand it to tokio's reactor.
+fn owned_fd_into_unix_stream(fd: std::os::fd::OwnedFd) -> std::io::Result<tokio::net::UnixStream> {
+    let std_stream = std::os::unix::net::UnixStream::from(fd);
+    std_stream.set_nonblocking(true)?;
+    tokio::net::UnixStream::from_std(std_stream)
 }
 
 #[cfg(test)]
@@ -460,6 +544,88 @@ mod tests {
             .context("dial_and_forward did not resolve")?
             .context("forwarder task panicked")??;
         assert_eq!(verdict, ForwardedVerdict::JobExited(3));
+
+        tokio::time::timeout(Duration::from_secs(2), orchestrator)
+            .await
+            .context("the fake orchestrator did not finish")?
+            .context("orchestrator task panicked")??;
+        Ok(())
+    }
+
+    /// `relay_agent_link` is the function an `OnLink` closure actually calls:
+    /// sync, no `.await`, on a thread with no ambient runtime — so this test
+    /// drives it exactly that way, spawning the call on `spawn_blocking`
+    /// rather than awaiting it directly, the same shape `ProcessBackend`'s
+    /// own launch thread has.
+    #[tokio::test]
+    async fn relay_agent_link_resolves_job_exited_from_a_real_socketpair() -> anyhow::Result<()> {
+        use sandy_api::agent::{AgentReport, AgentVerdict};
+
+        let listener = sandy_conn::listen(&ConnAddr::Tcp("127.0.0.1:0".parse()?))
+            .await
+            .context("listen")?;
+        let orchestrator_addr = listener.local_addr().context("local_addr")?;
+
+        let orchestrator = tokio::spawn(async move {
+            let (mut orchestrator_side, _peer) = listener.accept().await?;
+            expect_prefix(&mut orchestrator_side, PREFIX).await?;
+            write_frame(
+                &mut orchestrator_side,
+                &LinkFrame::Cap {
+                    cap: "deadbeef".to_string(),
+                    channel: None,
+                    peers: 0,
+                },
+            )
+            .await?;
+            read_frame(&mut orchestrator_side).await?.context("expected Join")?;
+            read_frame(&mut orchestrator_side).await?.context("expected Exit")?;
+            Ok::<_, anyhow::Error>(())
+        });
+
+        // The real OwnedFd an OnLink closure receives: one end of a raw Unix
+        // socketpair, exactly what ProcessBackend hands it (#216).
+        let (relay_end, agent_end) = std::os::unix::net::UnixStream::pair().context("socketpair")?;
+        agent_end.set_nonblocking(true).context("set_nonblocking")?;
+        let mut agent_side = tokio::net::UnixStream::from_std(agent_end).context("from_std")?;
+
+        let (report, verdict_rx) = AgentReport::channel();
+        let rt = tokio::runtime::Handle::current();
+        // Called from spawn_blocking: a stand-in for OnLink's own "no ambient
+        // runtime" thread — relay_agent_link must not rely on one being
+        // current on ITS thread, only on the Handle it's given.
+        tokio::task::spawn_blocking(move || {
+            relay_agent_link(&rt, orchestrator_addr, relay_end.into(), PREFIX.to_vec(), report);
+        })
+        .await
+        .context("spawn_blocking panicked")?;
+
+        let cap_frame = read_frame(&mut agent_side)
+            .await?
+            .context("agent should see the Cap frame")?;
+        assert_eq!(
+            cap_frame,
+            LinkFrame::Cap {
+                cap: "deadbeef".to_string(),
+                channel: None,
+                peers: 0,
+            }
+        );
+        write_frame(
+            &mut agent_side,
+            &LinkFrame::Join {
+                cap: "deadbeef".to_string(),
+                channel: None,
+            },
+        )
+        .await?;
+        write_frame(&mut agent_side, &LinkFrame::Exit { code: 9 }).await?;
+
+        let verdict = tokio::task::spawn_blocking(move || verdict_rx.recv_timeout(Duration::from_secs(2)))
+            .await
+            .context("verdict recv task panicked")?
+            .context("the report channel did not deliver a verdict within the timeout")?;
+        assert_eq!(verdict, AgentVerdict::JobExited(9));
 
         tokio::time::timeout(Duration::from_secs(2), orchestrator)
             .await

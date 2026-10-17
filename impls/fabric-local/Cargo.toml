@@ -34,7 +34,13 @@ sandy-proto.workspace = true
 serde.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync", "io-util", "time"] }
+tokio = { workspace = true, features = [
+  "sync",
+  "io-util",
+  "time",
+  "rt",
+  "net",
+] }
 serde_json.workspace = true
 tracing.workspace = true
 
