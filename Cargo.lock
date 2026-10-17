@@ -2081,6 +2081,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandy-control-proto"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "prost",
+ "prost-build",
+ "protox",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
 name = "sandy-fabric"
 version = "0.1.1"
 dependencies = [

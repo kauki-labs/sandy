@@ -1,0 +1,34 @@
+[package]
+name = "sandy-control-proto"
+description = "sandyd's control-plane RPC surface: Submit/Cancel/Attach/Status/List as a protobuf message contract and length-prefixed framing codec, separate from the fabric's data/event channels"
+version.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+documentation = "https://docs.rs/sandy-control-proto"
+keywords = ["protobuf", "prost", "rpc", "daemon", "sandbox"]
+categories = ["encoding", "network-programming"]
+
+[lints]
+workspace = true
+
+[dependencies]
+prost.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+
+[build-dependencies]
+prost-build.workspace = true
+protox.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+tokio = { workspace = true, features = [
+  "macros",
+  "rt-multi-thread",
+  "io-util",
+] }
