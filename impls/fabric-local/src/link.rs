@@ -30,7 +30,7 @@ use tokio::{
 };
 
 use crate::{
-    agent::{TTY_STDERR, TTY_STDIN, TTY_STDOUT},
+    agent::{AbortOnDrop, TTY_STDERR, TTY_STDIN, TTY_STDOUT},
     channel::{Channel, ChannelError, MembershipId},
 };
 
@@ -71,7 +71,8 @@ pub enum LinkFrame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         channel: Option<String>,
     },
-    /// Relay to agent: the join (or a repeated join) was refused.
+    /// Relay to agent: the join (or a repeated join) was refused, or after
+    /// setup, a peer post was refused on a joined channel (#256).
     Refused {
         /// Why, for the agent's diagnostics. Never carries the cap.
         reason: String,
@@ -416,6 +417,51 @@ impl<B: ChannelBackend, A: CapAuthority> Drop for Joined<B, A> {
     }
 }
 
+/// Refusals waiting to be reported to the agent: a count and the latest reason.
+#[derive(Default)]
+struct Refusals {
+    pending: std::sync::Mutex<(u64, String)>,
+    wake: tokio::sync::Notify,
+}
+
+impl Refusals {
+    fn push(&self, reason: String) {
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            pending.0 += 1;
+            pending.1 = reason;
+        }
+        self.wake.notify_one();
+    }
+
+    fn take_one(&self) -> Option<String> {
+        let mut pending = self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        (pending.0 > 0).then(|| {
+            pending.0 -= 1;
+            pending.1.clone()
+        })
+    }
+}
+
+/// Write one `Refused` frame per pending refusal, off the relay loop: when the
+/// agent stops reading, a delivery blocks holding the writer, and the relay must
+/// still read the agent's posts and exit report (INV-11). The count stays exact
+/// and the memory bounded however many refusals wait; only the latest reason is
+/// kept. Ends when a write fails (the agent closed its side).
+async fn notify_refusals<W: AsyncWrite + Unpin>(refusals: Arc<Refusals>, wr: Arc<AsyncMutex<W>>) {
+    loop {
+        refusals.wake.notified().await;
+        while let Some(reason) = refusals.take_one() {
+            if write_frame(&mut *wr.lock().await, &LinkFrame::Refused { reason })
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+}
+
 /// The joined phase of [`serve_agent_link`]: channel stdin out to the agent,
 /// job output and the final exit in from it, until the agent closes the link.
 async fn relay_joined<B, A, R, W>(
@@ -492,6 +538,9 @@ where
         peer.deliver = Some(deliver.abort_handle());
     }
 
+    let refusals = Arc::new(Refusals::default());
+    let _notifier = AbortOnDrop(tokio::spawn(notify_refusals(Arc::clone(&refusals), Arc::clone(wr))));
+
     let mut exit = None;
     loop {
         match read_frame(rd).await? {
@@ -544,7 +593,13 @@ where
                 {
                     Ok(_) => {}
                     Err(e @ ChannelError::Backend(_)) => return Err(e.into()),
-                    Err(e) => tracing::warn!("peer channel {name} refused the agent's post: {e}"),
+                    Err(e) => {
+                        // Tell the agent too, so the job can see it (#256). The
+                        // reason is the channel error's text: it carries no cap.
+                        let reason = format!("peer channel {name} refused the post: {e}");
+                        tracing::warn!("{reason}");
+                        refusals.push(reason);
+                    }
                 }
             }
             Some(LinkFrame::Exit { code }) => exit = Some(code),
@@ -1044,16 +1099,17 @@ mod tests {
         Ok((agent_end, relay))
     }
 
-    /// CodeRabbit on #247 (INV-11): a peer cap that expires after the join gets
-    /// the job's next peer post refused, but the relay keeps going and still
-    /// returns the exit the agent reports.
-    #[tokio::test]
-    async fn a_refused_peer_post_does_not_cost_the_exit_report() -> anyhow::Result<()> {
-        let authority = LocalCapAuthority::new(Duration::from_secs(3600))?;
-        let expires_at = std::time::SystemTime::now()
+    fn unix_secs() -> anyhow::Result<u64> {
+        Ok(std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs()
-            + 3;
+            .as_secs())
+    }
+
+    /// A peer channel `group-a` whose agent cap expires a few seconds from now,
+    /// with that cap and its expiry. Wait for it with [`until_expired`].
+    async fn expiring_peer_channel() -> anyhow::Result<(TestChannel, Cap, u64)> {
+        let authority = LocalCapAuthority::new(Duration::from_secs(3600))?;
+        let expires_at = unix_secs()? + 3;
         let agent_cap = authority.mint(CapScope {
             peer: PeerId::from("agent"),
             channel: ChannelId::from("group-a"),
@@ -1065,19 +1121,29 @@ mod tests {
             expires_at: Some(expires_at),
         })?;
         let group = Arc::new(Channel::new(ChannelId::from("group-a"), InMem::default(), authority).await?);
+        Ok((group, agent_cap, expires_at))
+    }
+
+    async fn until_expired(expires_at: u64) -> anyhow::Result<()> {
+        while unix_secs()? < expires_at {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Ok(())
+    }
+
+    /// CodeRabbit on #247 (INV-11): a peer cap that expires after the join gets
+    /// the job's next peer post refused, but the relay keeps going and still
+    /// returns the exit the agent reports.
+    #[tokio::test]
+    async fn a_refused_peer_post_does_not_cost_the_exit_report() -> anyhow::Result<()> {
+        let (group, agent_cap, expires_at) = expiring_peer_channel().await?;
         let grants = vec![PeerGrant {
             channel: group,
             cap: agent_cap,
         }];
         let (mut agent_end, relay) = raw_agent_with_peers(grants).await?;
 
-        while std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs()
-            < expires_at
-        {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        until_expired(expires_at).await?;
         write_frame(
             &mut agent_end,
             &LinkFrame::Post {
@@ -1091,6 +1157,143 @@ mod tests {
         drop(agent_end);
         let relayed = timeout(WAIT, relay).await??;
         assert!(matches!(relayed, Ok(Some(3))), "got {relayed:?}");
+        Ok(())
+    }
+
+    /// #256: the relay tells the agent when it refuses a peer post, with the
+    /// existing `Refused` frame, and the reason carries no cap material.
+    #[tokio::test]
+    async fn a_refused_peer_post_is_reported_to_the_agent() -> anyhow::Result<()> {
+        let (group, agent_cap, expires_at) = expiring_peer_channel().await?;
+        let cap_hex = hex::encode(encode_cap(&agent_cap)?);
+        let grants = vec![PeerGrant {
+            channel: group,
+            cap: agent_cap,
+        }];
+        let (mut agent_end, relay) = raw_agent_with_peers(grants).await?;
+
+        until_expired(expires_at).await?;
+        write_frame(
+            &mut agent_end,
+            &LinkFrame::Post {
+                content_type: "application/json".to_string(),
+                payload: hex::encode(b"after-expiry"),
+                channel: Some("group-a".to_string()),
+            },
+        )
+        .await?;
+        let frame = timeout(WAIT, read_frame(&mut agent_end))
+            .await
+            .context("the relay did not report the refused post")??;
+        let Some(LinkFrame::Refused { reason }) = frame else {
+            anyhow::bail!("expected Refused, got {frame:?}");
+        };
+        assert!(reason.contains("group-a"), "the reason names the channel: {reason}");
+        assert!(!reason.contains(&cap_hex), "the reason leaked the cap");
+
+        write_frame(&mut agent_end, &LinkFrame::Exit { code: 0 }).await?;
+        drop(agent_end);
+        timeout(WAIT, relay).await???;
+        Ok(())
+    }
+
+    /// Adversarial review of #256: with the link to the agent full (it stopped
+    /// reading, so a peer delivery blocks holding the writer), reporting a
+    /// refusal must not stop the relay reading the agent's posts and exit.
+    #[tokio::test]
+    async fn a_refusal_report_never_stalls_the_relay_on_a_full_link() -> anyhow::Result<()> {
+        let (group_a, agent_a, expires_at) = expiring_peer_channel().await?;
+        let (group_b, agent_b, sibling_b) = peer_channel("group-b").await?;
+        let sibling = group_b.join(&sibling_b)?;
+        let mut sibling_view = std::pin::pin!(group_b.subscribe(&sibling)?);
+        let grants = vec![
+            PeerGrant {
+                channel: group_a,
+                cap: agent_a,
+            },
+            PeerGrant {
+                channel: Arc::clone(&group_b),
+                cap: agent_b,
+            },
+        ];
+        // The agent end is never read from here on.
+        let (mut agent_end, _relay) = raw_agent_with_peers(grants).await?;
+        // Distinct payloads: the channel keeps one copy of identical content.
+        for n in 0..8_u8 {
+            group_b
+                .post(
+                    &sibling,
+                    Some(MessageType::PeerMsg(PeerMsg {})),
+                    "application/octet-stream",
+                    vec![n; 16 * 1024],
+                )
+                .await?;
+        }
+
+        until_expired(expires_at).await?;
+        for (channel, payload) in [("group-a", &b"refused"[..]), ("group-b", &b"marker"[..])] {
+            write_frame(
+                &mut agent_end,
+                &LinkFrame::Post {
+                    content_type: "text/plain".to_string(),
+                    payload: hex::encode(payload),
+                    channel: Some(channel.to_string()),
+                },
+            )
+            .await?;
+        }
+        timeout(WAIT, async {
+            loop {
+                let env = sibling_view.next().await.context("group stream ended")??;
+                if env.payload == b"marker" {
+                    return anyhow::Ok(());
+                }
+            }
+        })
+        .await
+        .context("the relay stopped reading after the refusal")??;
+        Ok(())
+    }
+
+    /// #256 end to end: the agent counts the refusal the relay reports, so the
+    /// job can see a post it was told was only submitted did not go through.
+    #[tokio::test]
+    async fn an_agent_counts_the_peer_posts_the_relay_refused() -> anyhow::Result<()> {
+        let (channel, agent_cap, _) = channel_and_caps().await?;
+        let (group, agent_peer_cap, expires_at) = expiring_peer_channel().await?;
+        let grants = vec![PeerGrant {
+            channel: group,
+            cap: agent_peer_cap,
+        }];
+        let (agent_end, host_end) = tokio::io::duplex(64 * 1024);
+        let relay =
+            tokio::spawn(async move { serve_agent_link_with_peers(channel, &agent_cap, grants, host_end).await });
+        let agent = Arc::new(timeout(WAIT, LinkAgent::bootstrap(agent_end)).await??);
+        let (stdout_agent, job_stdout) = tokio::io::duplex(1024);
+        let (stderr_agent, job_stderr) = tokio::io::duplex(1024);
+        let (stdin_agent, _job_stdin) = tokio::io::duplex(1024);
+        let serving = tokio::spawn({
+            let agent = Arc::clone(&agent);
+            async move { agent.serve_tty(stdout_agent, stderr_agent, stdin_agent).await }
+        });
+
+        agent.post_peer("group-a", "text/plain", b"in-time".to_vec()).await?;
+        until_expired(expires_at).await?;
+        assert_eq!(agent.peer_refused(), 0, "a post the relay accepted is not counted");
+        agent.post_peer("group-a", "text/plain", b"too-late".to_vec()).await?;
+        timeout(WAIT, async {
+            while agent.peer_refused() == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .context("the agent never counted the refused post")?;
+        assert_eq!(agent.peer_refused(), 1);
+
+        drop((job_stdout, job_stderr));
+        timeout(WAIT, serving).await???;
+        drop(agent);
+        timeout(WAIT, relay).await???;
         Ok(())
     }
 

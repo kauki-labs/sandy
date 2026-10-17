@@ -359,7 +359,7 @@ async fn a_vm_job_talks_to_a_sibling_over_its_peer_channel() -> anyhow::Result<(
     assert_eq!(outcome.guest_exit, Some(0), "console: {}", outcome.console);
     let encoded = base64::engine::general_purpose::STANDARD.encode(b"to-guest");
     assert!(
-        outcome.console.contains(&encoded) && outcome.console.contains(r#"{"dropped":0}"#),
+        outcome.console.contains(&encoded) && outcome.console.contains(r#"{"dropped":0,"refused":0}"#),
         "the guest job must print the sibling's message and the drop count: {}",
         outcome.console
     );
