@@ -1,0 +1,33 @@
+[package]
+name = "sandy-host-client"
+description = "The M2 host-client: detects a host's real capabilities and declares them to the orchestrator (kubelet-style registration), never a hardcoded host"
+version = "0.1.1"
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+documentation = "https://docs.rs/sandy-host-client"
+keywords = ["sandbox", "agent", "fabric", "executor"]
+categories = ["development-tools"]
+
+[lib]
+crate-type = ["rlib"]
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "sandy-host-client"
+path = "src/main.rs"
+
+[dependencies]
+sandy-api.workspace = true
+sandy-fabric.workspace = true
+sandy-impls-local.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true

@@ -2282,6 +2282,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandy-host-client"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "sandy-api",
+ "sandy-fabric",
+ "sandy-impls-local",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "sandy-impls-local"
 version = "0.1.1"
 dependencies = [
