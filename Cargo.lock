@@ -2114,7 +2114,7 @@ dependencies = [
 
 [[package]]
 name = "sandy-agent"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2135,7 +2135,7 @@ dependencies = [
 
 [[package]]
 name = "sandy-api"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "serde",
@@ -2144,7 +2144,7 @@ dependencies = [
 
 [[package]]
 name = "sandy-backend"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "sandy-api",
@@ -2157,7 +2157,7 @@ dependencies = [
 
 [[package]]
 name = "sandy-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2187,7 +2187,7 @@ dependencies = [
 
 [[package]]
 name = "sandy-conn"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "fs2",
@@ -2200,7 +2200,7 @@ dependencies = [
 
 [[package]]
 name = "sandy-control-proto"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "prost",
@@ -2212,7 +2212,7 @@ dependencies = [
 
 [[package]]
 name = "sandy-fabric"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "futures-core",
@@ -2227,7 +2227,7 @@ dependencies = [
 
 [[package]]
 name = "sandy-fabric-compose"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "futures-core",
@@ -2246,7 +2246,7 @@ dependencies = [
 
 [[package]]
 name = "sandy-fabric-local"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "futures-core",
@@ -2271,7 +2271,7 @@ dependencies = [
 
 [[package]]
 name = "sandy-fsutil"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "getrandom 0.3.4",
@@ -2282,7 +2282,7 @@ dependencies = [
 
 [[package]]
 name = "sandy-impls-local"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "command-group",
@@ -2297,7 +2297,7 @@ dependencies = [
 
 [[package]]
 name = "sandy-impls-vm"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2313,7 +2313,7 @@ dependencies = [
 
 [[package]]
 name = "sandy-lib"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "fs2",
@@ -2340,7 +2340,7 @@ dependencies = [
 
 [[package]]
 name = "sandy-orchestrator"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "sandy-fabric",
@@ -2350,7 +2350,7 @@ dependencies = [
 
 [[package]]
 name = "sandy-proto"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "prost",
@@ -2362,14 +2362,14 @@ dependencies = [
 
 [[package]]
 name = "sandy-test-support"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "sandy-api",
 ]
 
 [[package]]
 name = "sandyd"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "fs2",
