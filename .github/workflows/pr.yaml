@@ -61,6 +61,39 @@ jobs:
       - uses: actions/labeler@bf12e9b00b37c5c0ca2b87b79b2daf7891dbda13 # v7.0.0
         with:
           sync-labels: true
+  release-diff-scope:
+    # release-plz (release.yaml) opens its version-bump PR with GITHUB_TOKEN,
+    # which the repo now allows (Settings -> Actions -> workflow permissions,
+    # see actions_workflow_permissions.tf). Cap the blast radius of that PR: it
+    # may only ever touch release bookkeeping, never e.g. .github/workflows/*.
+    # Scoped to github-actions[bot] PRs only, so a contributor's own PR is
+    # never restricted by this.
+    name: Release diff scope
+    if: github.event_name == 'pull_request' && github.event.pull_request.user.login == 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          disable-sudo: true
+          egress-policy: audit
+      - name: Check changed files are release bookkeeping only
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          allowed='^(Cargo\.toml|Cargo\.lock|crates/[^/]+/CHANGELOG\.md|impls/[^/]+/CHANGELOG\.md)$'
+          files=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename')
+          bad=$(echo "$files" | grep -vE "$allowed" || true)
+          if [[ -n "$bad" ]]; then
+            echo "::error::release-plz PR touches files outside the release-bookkeeping allowlist:"
+            echo "$bad"
+            exit 1
+          fi
   checks:
     name: Check
     runs-on: ubuntu-24.04
@@ -230,6 +263,7 @@ jobs:
     needs:
       - validate-pr-title
       - label
+      - release-diff-scope
       - checks
       - coverage
       - package
@@ -242,4 +276,6 @@ jobs:
           jobs: ${{ toJSON(needs) }}
           # validate-pr-title and label only run on pull_request, so they skip on
           # merge_group; that skip is allowed and must not red the gate.
-          allowed-skips: validate-pr-title, label
+          # release-diff-scope additionally skips on every pull_request that
+          # isn't a github-actions[bot] PR.
+          allowed-skips: validate-pr-title, label, release-diff-scope

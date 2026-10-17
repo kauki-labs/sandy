@@ -49,6 +49,12 @@ jobs:
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
           skipPush: ${{ github.event.pull_request.head.repo.fork == true }}
       - name: Open release PR
+        # Opened/updated with GITHUB_TOKEN, so GitHub's loop-prevention rule
+        # applies: this push/PR does not trigger pr.yaml's pull_request event
+        # (same restriction on every GITHUB_TOKEN-authored ref). Before merging,
+        # push an empty commit or click "Update branch" on the PR to force a
+        # synchronize event from a human push, so Checks/Coverage/Package/
+        # release-diff-scope run and the required "Merge gate" check posts.
         run: nix develop -c release-plz release-pr --git-token "${GITHUB_TOKEN}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
