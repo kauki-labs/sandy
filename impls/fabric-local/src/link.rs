@@ -948,18 +948,31 @@ mod tests {
     /// the link close and ends.
     #[tokio::test]
     async fn a_cancelled_serve_tty_still_closes_the_link() -> anyhow::Result<()> {
-        let (channel, agent_cap, _) = channel_and_caps().await?;
+        let (channel, agent_cap, orchestrator_cap) = channel_and_caps().await?;
+        let orchestrator = channel.join(&orchestrator_cap)?;
+        let mut observed = std::pin::pin!(channel.subscribe(&orchestrator)?);
         let (agent_end, host_end) = tokio::io::duplex(64 * 1024);
-        let relay = tokio::spawn(async move { serve_agent_link(channel, &agent_cap, host_end).await });
+        let relay = tokio::spawn({
+            let channel = Arc::clone(&channel);
+            async move { serve_agent_link(channel, &agent_cap, host_end).await }
+        });
         let agent = Arc::new(timeout(WAIT, LinkAgent::bootstrap(agent_end)).await??);
-        let (stdout_agent, _job_stdout) = tokio::io::duplex(1024);
+        let (stdout_agent, mut job_stdout) = tokio::io::duplex(1024);
         let (stderr_agent, _job_stderr) = tokio::io::duplex(1024);
         let (stdin_agent, _job_stdin) = tokio::io::duplex(1024);
         let serving = tokio::spawn({
             let agent = Arc::clone(&agent);
             async move { agent.serve_tty(stdout_agent, stderr_agent, stdin_agent).await }
         });
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Wait until serve_tty is demonstrably running (its bridge carried job
+        // output to the channel) before cancelling it.
+        job_stdout.write_all(b"running").await?;
+        loop {
+            let env = timeout(WAIT, observed.next()).await?.context("channel ended")??;
+            if env.content_type == TTY_STDOUT && env.payload == b"running" {
+                break;
+            }
+        }
         serving.abort();
         let _ = serving.await;
         drop(agent);
