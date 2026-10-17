@@ -533,9 +533,19 @@ where
                     )));
                 }
                 let bytes = unhex(&payload, "a peer post payload")?;
-                peer.channel
+                // A refused post on a joined channel (its cap expired or was
+                // revoked) loses that message only; ending the relay here would
+                // also lose the job's exit report (INV-11). A backend fault is
+                // not a refusal and still ends the relay.
+                match peer
+                    .channel
                     .post(&peer.id, Some(MessageType::PeerMsg(PeerMsg {})), content_type, bytes)
-                    .await?;
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(e @ ChannelError::Backend(_)) => return Err(e.into()),
+                    Err(e) => tracing::warn!("peer channel {name} refused the agent's post: {e}"),
+                }
             }
             Some(LinkFrame::Exit { code }) => exit = Some(code),
             Some(LinkFrame::Join { .. }) => {
@@ -1032,6 +1042,56 @@ mod tests {
             );
         }
         Ok((agent_end, relay))
+    }
+
+    /// CodeRabbit on #247 (INV-11): a peer cap that expires after the join gets
+    /// the job's next peer post refused, but the relay keeps going and still
+    /// returns the exit the agent reports.
+    #[tokio::test]
+    async fn a_refused_peer_post_does_not_cost_the_exit_report() -> anyhow::Result<()> {
+        let authority = LocalCapAuthority::new(Duration::from_secs(3600))?;
+        let expires_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs()
+            + 3;
+        let agent_cap = authority.mint(CapScope {
+            peer: PeerId::from("agent"),
+            channel: ChannelId::from("group-a"),
+            rights: CapRights {
+                post: true,
+                read: true,
+                invite: false,
+            },
+            expires_at: Some(expires_at),
+        })?;
+        let group = Arc::new(Channel::new(ChannelId::from("group-a"), InMem::default(), authority).await?);
+        let grants = vec![PeerGrant {
+            channel: group,
+            cap: agent_cap,
+        }];
+        let (mut agent_end, relay) = raw_agent_with_peers(grants).await?;
+
+        while std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs()
+            < expires_at
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        write_frame(
+            &mut agent_end,
+            &LinkFrame::Post {
+                content_type: "application/json".to_string(),
+                payload: hex::encode(b"after-expiry"),
+                channel: Some("group-a".to_string()),
+            },
+        )
+        .await?;
+        write_frame(&mut agent_end, &LinkFrame::Exit { code: 3 }).await?;
+        drop(agent_end);
+        let relayed = timeout(WAIT, relay).await??;
+        assert!(matches!(relayed, Ok(Some(3))), "got {relayed:?}");
+        Ok(())
     }
 
     /// Adversarial (infra-f3, post side): a link holding a cap for channel A
