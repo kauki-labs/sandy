@@ -66,7 +66,10 @@ use sandy::{
     BackendError, BoxState, Containment, ContainmentStatus, Mount, NoContainment, Outcome, ResourceLimits, RunSpec,
     SandboxKind, ShareDirs, VmBackend, collect_outputs, ensure_sandy_staging_base, plan_shares, wipe,
 };
-use sandy_api::share::{GuestShareTransport, Presentation};
+use sandy_api::{
+    agent::{AgentLaunch, AgentReport, AgentVerdict},
+    share::{GuestShareTransport, Presentation},
+};
 use uuid::Uuid;
 
 use crate::share::LocalDirTransport;
@@ -91,71 +94,6 @@ const DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// the agent's exit, not after the console drains, and is longer than
 /// [`DRAIN_GRACE`] so a slow drain cannot eat it.
 const VERDICT_GRACE: Duration = Duration::from_secs(10);
-
-/// Called with a run's box id, the host end of its agent link, and the handle
-/// to report the run's verdict on, right after the agent is spawned.
-///
-/// It runs on the thread that called [`VmBackend::run`], with no async runtime
-/// guaranteed. It must not block (start the relay elsewhere and return) and
-/// should not panic; a panic fails the run as an infra fault.
-pub type OnLink = Arc<dyn Fn(&str, std::os::fd::OwnedFd, AgentReport) + Send + Sync>;
-
-/// What the relay concluded about one agent-mode run.
-#[derive(Debug)]
-enum Verdict {
-    /// The agent reported the job's exit code.
-    JobExited(i32),
-    /// The agent failed: refused, faulted, or ended without reporting.
-    AgentFailed(String),
-}
-
-/// The relay's handle for reporting one run's verdict back to the backend
-/// (#216). The backend takes a job's exit code only from here, never from the
-/// agent's process status: under a wrapper that status is the wrapper's, and
-/// the job could signal the agent to fake one. Dropping it without a report
-/// fails the run as an infra fault.
-#[derive(Debug)]
-pub struct AgentReport(std::sync::mpsc::SyncSender<Verdict>);
-
-impl AgentReport {
-    /// The agent reported that the job exited with `code`.
-    pub fn job_exited(self, code: i32) {
-        let _ = self.0.send(Verdict::JobExited(code));
-    }
-
-    /// The agent failed before or without reporting the job's exit: the run is
-    /// an infra fault, not a job result (INV-11).
-    pub fn agent_failed(self, why: impl Into<String>) {
-        let _ = self.0.send(Verdict::AgentFailed(why.into()));
-    }
-}
-
-/// How the backend launches the sandbox agent (#216).
-///
-/// Per run the backend creates a close-on-exec unix socket pair, gives one end
-/// to the agent as its stdin
-/// ([`AGENT_LINK_FD`](https://docs.rs/sandy-fabric/latest/sandy_fabric/capauth/constant.AGENT_LINK_FD.html)),
-/// and passes the other to [`on_link`](Self::on_link), which runs the
-/// orchestrator-side relay. The backend's own copy of the agent end is closed
-/// once the agent is spawned, so the relay sees EOF when the agent exits.
-/// On macOS the pair gets close-on-exec in a second call (there is no
-/// `SOCK_CLOEXEC`), so a concurrent spawn on another thread of the same host
-/// process can race it.
-#[derive(Clone)]
-pub struct AgentLaunch {
-    /// The `sandy-agent` binary.
-    pub program: std::path::PathBuf,
-    /// Receives each run's host end of the agent link.
-    pub on_link: OnLink,
-}
-
-impl std::fmt::Debug for AgentLaunch {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AgentLaunch")
-            .field("program", &self.program)
-            .finish_non_exhaustive()
-    }
-}
 
 /// A [`VmBackend`] that runs the job as a raw OS process (no VM).
 ///
@@ -390,9 +328,9 @@ impl ProcessBackend {
         // on_link fails the run as infra; the agent sees EOF and exits.
         let verdict = match (&self.agent, host_end) {
             (Some(agent), Some(host_end)) => {
-                let (report, verdict) = std::sync::mpsc::sync_channel(1);
+                let (report, verdict) = AgentReport::channel();
                 let handed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    (agent.on_link)(&box_id, host_end, AgentReport(report));
+                    (agent.on_link)(&box_id, host_end, report);
                 }));
                 if handed.is_err() {
                     let _ = child.kill();
@@ -471,8 +409,8 @@ impl ProcessBackend {
             // Agent mode: the job's exit comes only from the relay's verdict (see
             // AgentReport); the relay sees the link close as soon as the agent exits.
             match verdict.recv_timeout((agent_exited + VERDICT_GRACE).saturating_duration_since(Instant::now())) {
-                Ok(Verdict::JobExited(code)) => Some(code),
-                Ok(Verdict::AgentFailed(why)) => {
+                Ok(AgentVerdict::JobExited(code)) => Some(code),
+                Ok(AgentVerdict::AgentFailed(why)) => {
                     return Err(BackendError::Spawn(format!(
                         "the sandbox agent failed for `{job_program}`: {why}"
                     )));
