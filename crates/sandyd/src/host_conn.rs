@@ -191,7 +191,7 @@ mod tests {
     use super::*;
 
     fn tcp_peer(ip: &str) -> PeerAddr {
-        PeerAddr::Tcp(SocketAddr::new(ip.parse().unwrap(), 9000))
+        PeerAddr::Tcp(SocketAddr::new(ip.parse().expect("ip literal"), 9000))
     }
 
     fn capabilities() -> Capabilities {

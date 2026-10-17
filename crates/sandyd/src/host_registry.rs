@@ -235,16 +235,18 @@ impl HostRegistry {
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+
     use sandy_executor_proto::SandboxKind;
 
     use super::*;
 
     fn executor_ip() -> IpAddr {
-        "100.64.0.7".parse().unwrap()
+        IpAddr::V4(Ipv4Addr::new(100, 64, 0, 7))
     }
 
     fn other_ip() -> IpAddr {
-        "100.64.0.9".parse().unwrap()
+        IpAddr::V4(Ipv4Addr::new(100, 64, 0, 9))
     }
 
     fn capabilities() -> Capabilities {
@@ -280,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn an_allowed_peer_registers_and_its_capabilities_are_visible() {
+    fn an_allowed_peer_registers_and_its_capabilities_are_visible() -> anyhow::Result<()> {
         let allowlist = ExecutorAllowlist::new([executor_ip()]);
         let registry = HostRegistry::default();
         registry
@@ -289,16 +291,19 @@ mod tests {
 
         assert_eq!(registry.capabilities_of("ws01"), Some(capabilities()));
         assert_eq!(registry.capabilities_of("ghost"), None);
+        Ok(())
     }
 
     /// A dual-stack accept loop may report the executor's IPv4 peer in its
     /// IPv4-mapped IPv6 form — the allowlist must still recognize it, same
     /// reasoning as decision 6's peer-IP canonicalization.
     #[test]
-    fn an_ipv4_mapped_ipv6_peer_matches_a_plain_ipv4_allowlist_entry() {
+    fn an_ipv4_mapped_ipv6_peer_matches_a_plain_ipv4_allowlist_entry() -> anyhow::Result<()> {
+        use anyhow::Context;
         let allowlist = ExecutorAllowlist::new([executor_ip()]);
-        let mapped: IpAddr = "::ffff:100.64.0.7".parse().unwrap();
+        let mapped: IpAddr = "::ffff:100.64.0.7".parse().context("mapped address literal")?;
         assert!(allowlist.permits(mapped));
+        Ok(())
     }
 
     #[tokio::test]
@@ -379,7 +384,7 @@ mod tests {
     /// allowlisted peer must never be able to claim one that's already
     /// registered — that would hand it jobs meant for the real host.
     #[test]
-    fn a_different_allowed_peer_cannot_claim_an_already_registered_host_id() {
+    fn a_different_allowed_peer_cannot_claim_an_already_registered_host_id() -> anyhow::Result<()> {
         let allowlist = ExecutorAllowlist::new([executor_ip(), other_ip()]);
         let registry = HostRegistry::default();
         registry
@@ -388,13 +393,14 @@ mod tests {
 
         let result = registry.register(&allowlist, other_ip(), "ws01".to_owned(), capabilities());
         assert_eq!(result.err(), Some(RegisterError::HostIdClaimedByAnotherPeer));
+        Ok(())
     }
 
     /// The SAME peer reconnecting under its own `host_id` is a legitimate
     /// reconnect, not an impersonation — it must still succeed, with a fresh
     /// `RegistrationId` distinguishing the new connection from the old one.
     #[test]
-    fn the_same_peer_can_reregister_under_its_own_host_id() {
+    fn the_same_peer_can_reregister_under_its_own_host_id() -> anyhow::Result<()> {
         let allowlist = ExecutorAllowlist::new([executor_ip()]);
         let registry = HostRegistry::default();
         let (_rx1, first) = registry
@@ -405,6 +411,7 @@ mod tests {
             .expect("the reconnect must succeed");
 
         assert_ne!(first, second);
+        Ok(())
     }
 
     /// Regression: the OLD connection's own teardown racing a fresh reconnect
