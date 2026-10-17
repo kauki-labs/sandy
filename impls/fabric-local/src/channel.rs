@@ -97,7 +97,13 @@ fn membership_id(cap: &Cap) -> MembershipId {
 struct MembershipState {
     generation: u64,
     cursor: u64,
-    waker: Option<Waker>,
+    // A `Vec`, not one `Option<Waker>`: `subscribe()` is never restricted to
+    // one stream per membership (its own doc comment already notes two
+    // concurrent subscriptions aren't the expected shape, but nothing stops
+    // it), so a second stream's waker would otherwise silently overwrite the
+    // first's — leaving the first parked forever on `leave()`, exactly the
+    // hang this whole mechanism exists to close, just for that stream.
+    wakers: Vec<Waker>,
 }
 
 /// Bounded membership + delivery over a [`ChannelBackend`] (spec §3.3). Every
@@ -206,10 +212,11 @@ impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
     /// Remove `membership` and end its session. If a `subscribe()` stream is
     /// currently open for it, this wakes it: the stream re-polls, observes its
     /// generation no longer matches (the entry is gone), and ends itself
-    /// (`CursorStream`) rather than waiting indefinitely for the backend's next
-    /// append, which may never come (#184). Covers only this explicit call: an
-    /// organically-expiring TTL on an open stream is NOT proactively caught —
-    /// no periodic re-check runs here — tracked separately as #188.
+    /// (every `CursorStream` open for it — `subscribe()` doesn't restrict a
+    /// membership to one) rather than waiting indefinitely for the backend's
+    /// next append, which may never come (#184). Covers only this explicit
+    /// call: an organically-expiring TTL on an open stream is NOT proactively
+    /// caught — no periodic re-check runs here — tracked separately as #188.
     pub fn leave(&self, membership: &MembershipId) {
         self.members
             .lock()
@@ -221,7 +228,7 @@ impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(membership)
         {
-            if let Some(waker) = state.waker {
+            for waker in state.wakers {
                 waker.wake();
             }
         }
@@ -303,7 +310,7 @@ impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
         let state = sessions.entry(membership.clone()).or_insert_with(|| MembershipState {
             generation: self.next_generation.fetch_add(1, Ordering::SeqCst),
             cursor: 0,
-            waker: None,
+            wakers: Vec::new(),
         });
         let generation = state.generation;
         let from = state.cursor;
@@ -391,7 +398,16 @@ impl Stream for CursorStream {
                 let mut sessions = this.sessions.lock().unwrap_or_else(PoisonError::into_inner);
                 match sessions.get_mut(&this.membership) {
                     Some(state) if state.generation == this.generation => {
-                        state.waker = Some(cx.waker().clone());
+                        // `will_wake` dedup: this same stream's own task can
+                        // poll multiple times before ever yielding (normal
+                        // executor behavior), and without this check each
+                        // Pending poll would push another functionally-
+                        // identical waker, growing the vec unboundedly over
+                        // a long-lived stream that's mostly idle.
+                        let waker = cx.waker();
+                        if !state.wakers.iter().any(|w| w.will_wake(waker)) {
+                            state.wakers.push(waker.clone());
+                        }
                         Poll::Pending
                     }
                     _ => Poll::Ready(None),
@@ -868,6 +884,47 @@ mod tests {
             ended.is_none(),
             "the stream must end, not keep delivering, after leave()"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn leaving_wakes_every_open_stream_on_the_same_membership() -> anyhow::Result<()> {
+        // subscribe() has never restricted a membership to one stream (its
+        // own doc comment already calls two concurrent subscriptions an
+        // accepted, unspecified-interleaving edge case) — but a membership
+        // with a SECOND stream open must still have BOTH end on leave(), not
+        // just whichever one most recently registered a waker.
+        let (channel, _backend, id, authority) = new_channel().await?;
+        let channel = Arc::new(channel);
+        let member = channel.join(&mint(&authority, "p1", &id, full(), Some(later())))?;
+
+        let spawn_watcher = |channel: &Arc<Channel<InMem, TestAuthority>>, member: &MembershipId| {
+            let channel = Arc::clone(channel);
+            let member = member.clone();
+            tokio::spawn(async move {
+                let mut stream = Box::pin(channel.subscribe(&member)?);
+                Ok::<_, ChannelError>(stream.next().await)
+            })
+        };
+        let first = spawn_watcher(&channel, &member);
+        let second = spawn_watcher(&channel, &member);
+
+        // Let both spawned tasks actually run their first poll (parking
+        // Pending, each registering its own waker) before leaving.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        channel.leave(&member);
+
+        for watcher in [first, second] {
+            let ended = tokio::time::timeout(Duration::from_secs(2), watcher)
+                .await
+                .context("leave() did not wake every open stream on this membership within the deadline")?
+                .context("watcher task panicked")?
+                .context("watcher stream errored")?;
+            assert!(
+                ended.is_none(),
+                "every stream on a left membership must end, not just one"
+            );
+        }
         Ok(())
     }
 
