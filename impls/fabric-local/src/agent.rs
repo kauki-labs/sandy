@@ -246,7 +246,9 @@ async fn bridge_tty<P: TtyPort>(
     job_stderr: impl AsyncRead + Unpin + Send + 'static,
     mut job_stdin: impl AsyncWrite + Unpin + Send + 'static,
 ) -> Result<(), AgentError> {
-    let inbound = tokio::spawn(async move {
+    // Both helper tasks are aborted on every path out, including this future
+    // being cancelled: a detached stderr forwarder would hold the link writer.
+    let inbound = AbortOnDrop(tokio::spawn(async move {
         let mut stdin_frames = std::pin::pin!(stdin_frames);
         while let Some(bytes) = stdin_frames.next().await {
             if let Err(e) = job_stdin.write_all(&bytes).await {
@@ -254,9 +256,9 @@ async fn bridge_tty<P: TtyPort>(
                 break;
             }
         }
-    });
+    }));
 
-    let stderr = tokio::spawn(forward_tty(Arc::clone(&port), job_stderr, TTY_STDERR));
+    let mut stderr = AbortOnDrop(tokio::spawn(forward_tty(Arc::clone(&port), job_stderr, TTY_STDERR)));
 
     let mut buf = [0_u8; TTY_CHUNK];
     let result = loop {
@@ -270,15 +272,12 @@ async fn bridge_tty<P: TtyPort>(
             Err(e) => break Err(AgentError::Stdio(e)),
         }
     };
-    inbound.abort();
+    drop(inbound);
     // Let the stderr side flush what the job wrote before exiting (a job
     // typically writes its crash/error message to stderr right before
     // closing stdout) rather than dropping it immediately; bounded so a job
-    // that leaks stderr open cannot hang serve_tty.
-    let stderr_abort = stderr.abort_handle();
-    if tokio::time::timeout(STDERR_DRAIN, stderr).await.is_err() {
-        stderr_abort.abort();
-    }
+    // that leaks stderr open cannot hang serve_tty. The guard aborts it after.
+    let _ = tokio::time::timeout(STDERR_DRAIN, &mut stderr.0).await;
     result
 }
 
@@ -428,20 +427,28 @@ impl LinkAgent {
         // keystroke-paced (bulk inputs are staged as shares, not piped). A bulk
         // stdin path would make this an out-of-memory risk: bound it first.
         let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
-        let reader = tokio::spawn(route_link(
+        let _reader = AbortOnDrop(tokio::spawn(route_link(
             reader,
             stdin_tx,
             self.peer_tx.clone(),
             Arc::clone(&self.peer_dropped),
-        ));
+        )));
         let stdin_frames =
             futures_util::stream::unfold(
                 stdin_rx,
                 |mut rx| async move { rx.recv().await.map(|bytes| (bytes, rx)) },
             );
-        let bridged = bridge_tty(Arc::clone(&self.port), stdin_frames, job_stdout, job_stderr, job_stdin).await;
-        reader.abort();
-        bridged
+        bridge_tty(Arc::clone(&self.port), stdin_frames, job_stdout, job_stderr, job_stdin).await
+    }
+}
+
+/// Aborts its task when dropped, so a cancelled caller never leaves the task
+/// detached (and the link it holds open).
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
