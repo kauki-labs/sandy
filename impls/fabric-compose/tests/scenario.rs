@@ -115,13 +115,15 @@ fn sandbox_rights() -> CapRights {
 
 /// One sandbox's orchestrator channel. The 1:1 invariant (exactly one
 /// orchestrator channel per sandbox, exactly one non-orchestrator membership
-/// on it) holds by construction, not by a runtime membership count: `Channel`
-/// is a generic bounded-membership primitive with no such limit (deliberate —
-/// spec §3.4), so this type is the only thing that can actually guarantee it.
-/// [`Self::launch`] is the only way to create one; it mints exactly one
-/// bootstrap cap as part of construction and exposes no method to mint a
-/// second — a caller holding a `LaunchedChannel` has no API path to invite a
-/// second sandbox onto it.
+/// on it) holds here by this scenario's call convention, not by a runtime
+/// membership count or a type-level guarantee: `Channel` is a generic
+/// bounded-membership primitive with no such limit (deliberate — spec §3.4),
+/// and its `invite` stays available to whoever holds an invite-capable
+/// membership — the orchestrator cap minted here — so a caller could mint a
+/// second member cap by calling it again. [`Self::launch`] mints exactly one
+/// bootstrap cap, and nothing else in this scenario calls `invite` on the
+/// orchestrator membership a second time; the invariant rests on that
+/// convention, not on an API restriction.
 struct LaunchedChannel {
     backend: Backend,
     authority: Authority,
@@ -474,10 +476,10 @@ async fn next_envelope(
 }
 
 /// Adversarial: the 1:1 orchestrator-channel invariant. `LaunchedChannel` is
-/// the only way to mint an orchestrator channel and its one bootstrap cap,
-/// and it exposes no method to mint a second cap for an already-launched
-/// channel — the type itself has no API path to do that (held by
-/// construction, not a runtime count). What's worth testing at runtime: a cap
+/// the only way to mint an orchestrator channel and its one bootstrap cap;
+/// by this scenario's convention nothing calls `invite` on it a second time
+/// (see `LaunchedChannel`'s doc — the underlying `invite` method would allow
+/// it). What's worth testing at runtime: a cap
 /// from one sandbox's launch cannot be used to join a DIFFERENT sandbox's
 /// channel, so a confused or cross-wired cap can never let one sandbox
 /// eavesdrop on or impersonate another.
