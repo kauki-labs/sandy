@@ -7,7 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust edition 2024](https://img.shields.io/badge/rust-edition%202024-orange.svg)](rust-toolchain.toml)
 
-sandy runs a job in an ephemeral NixOS microVM and returns a locked result
+`sandy` runs a job in an ephemeral NixOS microVM and returns a locked result
 envelope. One `VmBackend` seam launches the guest (qemu on Linux, vfkit on
 macOS); inputs, outputs, secrets, and a scoped forge credential travel in over
 virtio-fs shares; an egress allow-list wraps the boot.
