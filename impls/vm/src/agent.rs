@@ -29,8 +29,17 @@ const READY_WAIT: Duration = Duration::from_secs(2);
 /// The shell command the console injects in agent mode: the image's agent,
 /// listening on `port`, running the job as `sh -c <job>` so the job keeps the
 /// shell semantics a plain console run gives `command.join(" ")`.
-pub(crate) fn agent_shell_command(_program: &Path, _port: u32, _job: &[String]) -> String {
-    String::new()
+pub(crate) fn agent_shell_command(program: &Path, port: u32, job: &[String]) -> String {
+    format!(
+        "{} --vsock-listen {port} -- sh -c {}",
+        sh_quote(&program.to_string_lossy()),
+        sh_quote(&job.join(" "))
+    )
+}
+
+/// `s` as one single-quoted POSIX shell word.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 /// A connected stream that can wait a bounded time for its first byte.
@@ -55,18 +64,50 @@ impl LinkStream for std::os::unix::net::UnixStream {
 /// `TimedOut` once `deadline` passes, or `Interrupted` once `stop` is set (the
 /// guest finished without the agent connecting), naming the last failure.
 pub(crate) fn connect_agent_link<S: LinkStream>(
-    _connect: impl FnMut() -> io::Result<S>,
-    _deadline: Instant,
-    _stop: &AtomicBool,
+    mut connect: impl FnMut() -> io::Result<S>,
+    deadline: Instant,
+    stop: &AtomicBool,
 ) -> io::Result<OwnedFd> {
-    let _ = (
-        AGENT_LINK_READY,
-        FIRST_BACKOFF,
-        MAX_BACKOFF,
-        READY_WAIT,
-        Ordering::SeqCst,
-    );
-    Err(io::Error::other("not implemented"))
+    let mut backoff = FIRST_BACKOFF;
+    let mut last = "no attempt made".to_string();
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                format!("the run ended before the guest agent took its link (last: {last})"),
+            ));
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("the guest agent never took its link (last: {last})"),
+            ));
+        }
+        match connect().and_then(|stream| acknowledged(stream, READY_WAIT.min(deadline - now))) {
+            Ok(Some(fd)) => return Ok(fd),
+            Ok(None) => last = "the stream closed or sent something else".to_string(),
+            Err(e) => last = e.to_string(),
+        }
+        std::thread::sleep(backoff.min(deadline.saturating_duration_since(Instant::now())));
+        backoff = (backoff * 2).min(MAX_BACKOFF);
+    }
+}
+
+/// The stream as an fd if its first byte is [`AGENT_LINK_READY`] within `wait`;
+/// `None` if it closed or sent anything else.
+fn acknowledged<S: LinkStream>(mut stream: S, wait: Duration) -> io::Result<Option<OwnedFd>> {
+    stream.set_read_timeout(Some(wait.max(Duration::from_millis(1))))?;
+    let mut byte = [0_u8; 1];
+    match stream.read(&mut byte) {
+        Ok(1) if byte[0] == AGENT_LINK_READY => {
+            stream.set_read_timeout(None)?;
+            Ok(Some(stream.into()))
+        }
+        Ok(_) => Ok(None),
+        Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]
