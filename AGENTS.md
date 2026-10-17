@@ -41,7 +41,8 @@ version, metadata, dependency versions, and lints through the root `Cargo.toml`
   `src/` for the current module set, or epic #103's sub-issues for which seams
   have landed.
 - **`sandy-agent`** (`impls/agent`) — the sandbox agent as its own OS process: the
-  process backend launches it with its agent link on stdin, it joins through the
+  process backend launches it with its agent link on stdin (in a VM guest it takes
+  the host's connection on a vsock listener, #238), it joins through the
   orchestrator-side relay (`sandy-fabric-local::link`), and runs the job as its
   child. See `docs/decisions/agent-fabric.md` §10.
 

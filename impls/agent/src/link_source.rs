@@ -10,6 +10,10 @@
 use std::{ffi::OsString, future::Future};
 
 /// The vsock CID of the host, the only peer allowed to open the agent link.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "vsock is Linux-only; tests drive the seam")
+)]
 pub const HOST_CID: u32 = 2;
 
 /// How the agent gets its link.
@@ -42,6 +46,10 @@ pub fn parse_args(args: Vec<OsString>) -> Result<(LinkSource, Vec<OsString>), St
 }
 
 /// A listener that yields connections with the peer's vsock CID.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "vsock is Linux-only; tests drive the seam")
+)]
 pub trait Acceptor {
     /// One accepted connection.
     type Stream;
@@ -51,9 +59,23 @@ pub trait Acceptor {
 
 /// Accept the first connection from the host, rejecting every other peer, and
 /// close the listener (it is consumed) before returning the host's stream.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "vsock is Linux-only; tests drive the seam")
+)]
 pub async fn accept_host<A: Acceptor>(mut acceptor: A) -> std::io::Result<A::Stream> {
-    let (stream, _cid) = acceptor.accept().await?;
-    Ok(stream)
+    loop {
+        let (stream, cid) = acceptor.accept().await?;
+        if cid == HOST_CID {
+            return Ok(stream);
+        }
+        // Closed at once; keep listening for the host.
+        drop(stream);
+        eprintln!(
+            "sandy-agent: refused an agent-link connection from vsock cid {cid}; only the host (cid {HOST_CID}) may \
+             connect"
+        );
+    }
 }
 
 /// The guest's vsock listener.
