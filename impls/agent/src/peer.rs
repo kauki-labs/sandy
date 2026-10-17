@@ -90,6 +90,7 @@ pub enum Reply {
         /// The running count of dropped deliveries.
         dropped: u64,
         /// The running count of refused posts.
+        #[serde(default)]
         refused: u64,
     },
     /// The request failed.
@@ -387,7 +388,7 @@ fn parse(args: &[std::ffi::OsString]) -> Result<Command, String> {
 }
 
 /// `sandy-agent peer send|recv`: the job's helper. `send` posts its stdin;
-/// `recv` prints each message as a JSON line, then `{"dropped":N}`.
+/// `recv` prints each message as a JSON line, then `{"dropped":N,"refused":M}`.
 pub fn cli(args: &[std::ffi::OsString]) -> std::process::ExitCode {
     match run_cli(args) {
         Ok(()) => std::process::ExitCode::SUCCESS,

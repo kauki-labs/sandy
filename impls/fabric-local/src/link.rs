@@ -30,7 +30,7 @@ use tokio::{
 };
 
 use crate::{
-    agent::{TTY_STDERR, TTY_STDIN, TTY_STDOUT},
+    agent::{AbortOnDrop, TTY_STDERR, TTY_STDIN, TTY_STDOUT},
     channel::{Channel, ChannelError, MembershipId},
 };
 
@@ -417,6 +417,51 @@ impl<B: ChannelBackend, A: CapAuthority> Drop for Joined<B, A> {
     }
 }
 
+/// Refusals waiting to be reported to the agent: a count and the latest reason.
+#[derive(Default)]
+struct Refusals {
+    pending: std::sync::Mutex<(u64, String)>,
+    wake: tokio::sync::Notify,
+}
+
+impl Refusals {
+    fn push(&self, reason: String) {
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            pending.0 += 1;
+            pending.1 = reason;
+        }
+        self.wake.notify_one();
+    }
+
+    fn take_one(&self) -> Option<String> {
+        let mut pending = self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        (pending.0 > 0).then(|| {
+            pending.0 -= 1;
+            pending.1.clone()
+        })
+    }
+}
+
+/// Write one `Refused` frame per pending refusal, off the relay loop: when the
+/// agent stops reading, a delivery blocks holding the writer, and the relay must
+/// still read the agent's posts and exit report (INV-11). The count stays exact
+/// and the memory bounded however many refusals wait; only the latest reason is
+/// kept. Ends when a write fails (the agent closed its side).
+async fn notify_refusals<W: AsyncWrite + Unpin>(refusals: Arc<Refusals>, wr: Arc<AsyncMutex<W>>) {
+    loop {
+        refusals.wake.notified().await;
+        while let Some(reason) = refusals.take_one() {
+            if write_frame(&mut *wr.lock().await, &LinkFrame::Refused { reason })
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+}
+
 /// The joined phase of [`serve_agent_link`]: channel stdin out to the agent,
 /// job output and the final exit in from it, until the agent closes the link.
 async fn relay_joined<B, A, R, W>(
@@ -493,6 +538,9 @@ where
         peer.deliver = Some(deliver.abort_handle());
     }
 
+    let refusals = Arc::new(Refusals::default());
+    let _notifier = AbortOnDrop(tokio::spawn(notify_refusals(Arc::clone(&refusals), Arc::clone(wr))));
+
     let mut exit = None;
     loop {
         match read_frame(rd).await? {
@@ -548,11 +596,9 @@ where
                     Err(e) => {
                         // Tell the agent too, so the job can see it (#256). The
                         // reason is the channel error's text: it carries no cap.
-                        // Best effort: an agent that already closed its side may
-                        // still have its exit report queued behind this post.
                         let reason = format!("peer channel {name} refused the post: {e}");
                         tracing::warn!("{reason}");
-                        let _ = write_frame(&mut *wr.lock().await, &LinkFrame::Refused { reason }).await;
+                        refusals.push(reason);
                     }
                 }
             }

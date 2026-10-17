@@ -318,7 +318,8 @@ job holding it could post as the agent.
   channel (its cap expired or was revoked) is logged and dropped, and the relay
   goes on, so the job's exit report still arrives (INV-11); a backend fault
   still ends the relay. The relay also sends the agent the existing `Refused`
-  frame (best effort; the reason is the channel error, never the cap), and the
+  frame, from a task off the relay loop so a link the agent stopped reading
+  never stalls the relay (the reason is the channel error, never the cap), and the
   agent counts it (`LinkAgent::peer_refused`, #256), so a refusal is observable
   without a new frame; an older agent ignores it. Per-post delivery acks are
   deferred (#257). Peer messages are `PeerMsg`-typed, and the

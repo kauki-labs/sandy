@@ -448,7 +448,7 @@ impl LinkAgent {
 
 /// Aborts its task when dropped, so a cancelled caller never leaves the task
 /// detached (and the link it holds open).
-struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+pub(crate) struct AbortOnDrop<T>(pub(crate) tokio::task::JoinHandle<T>);
 
 impl<T> Drop for AbortOnDrop<T> {
     fn drop(&mut self) {
