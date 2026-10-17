@@ -2085,6 +2085,8 @@ name = "sandy-conn"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "fs2",
+ "rustix",
  "sandy-control-proto",
  "tempfile",
  "thiserror 2.0.21",
