@@ -198,6 +198,7 @@
               coverage
               ;
             tests-e2e-cli = testsE2eCli;
+            tests-daemon-e2e = sandyPackages.testsDaemonE2e;
             project-docs = projectDocs;
           };
 

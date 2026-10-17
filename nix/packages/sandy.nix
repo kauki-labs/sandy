@@ -43,7 +43,7 @@ let
 
   cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 in
-{
+rec {
   # Workspace build. Tests run in their own derivation below.
   sandy = craneLib.buildPackage (
     commonArgs
@@ -100,15 +100,12 @@ in
   # measuring them would understate real coverage. Writes an `lcov.info` the CI
   # job uploads; the per-crate summary prints in the build log.
   #
-  # `daemon_e2e` (sandy-cli's end-to-end daemon suite, #212/#227) is excluded
-  # here too (#233): it shells out to a nested `cargo build -p sandyd` mid-test
-  # to locate a sibling crate's binary, which cannot complete inside this
-  # derivation's hermetic, offline nix sandbox (giving the sandbox build/network
-  # access to make it work would defeat crane's reproducibility, the wrong
-  # direction). This temporarily drops `daemon_e2e` to dev-shell/local-only
-  # coverage until #233's proper fix lands: nix builds `sandyd` as its own
-  # derivation and passes its path in, the same `SANDY_BIN`-env-var pattern
-  # `testsE2eCli` (flake.nix) already uses for `sandy`'s own binary.
+  # `daemon_e2e` (sandy-cli's end-to-end daemon suite, #212/#227) stays
+  # excluded here (#233): it drives a SEPARATE `sandyd` process over a real
+  # Unix socket, so attributing its coverage would need the instrumented
+  # (`covCraneLib`) `sandyd` binary wired in too, not just a binary to spawn —
+  # more than this check needs to solve. Its hermetic *correctness* (not
+  # coverage) is `testsDaemonE2e` below.
   coverage = covCraneLib.cargoLlvmCov (
     commonArgs
     // {
@@ -121,6 +118,26 @@ in
       # dir. Create it first.
       preBuild = "mkdir -p \"$out\"";
       cargoLlvmCovExtraArgs = "--workspace --lcov --output-path $out/lcov.info -E 'not binary(daemon_e2e)'";
+    }
+  );
+
+  # Hermetic e2e check for `daemon_e2e` (#233): the real `sandyd` binary is
+  # already built as part of the whole-workspace `sandy` package above (crane
+  # installs every `[[bin]]` target it builds); this check just points
+  # `daemon_e2e` at it via `$SANDYD_BIN` instead of letting the test shell out
+  # to a nested `cargo build -p sandyd` mid-run, which cannot complete inside
+  # a hermetic, offline nix sandbox (no target-dir lock to share, no network).
+  # `daemon_e2e.rs`'s `sandyd_bin()` reads `$SANDYD_BIN` first, falling back to
+  # the nested build only when it's unset (the dev-shell case). `test`/
+  # `coverage` above still carry the un-filtered Rust test suite minus this one
+  # file, so this is additive, not a replacement for them.
+  testsDaemonE2e = craneLib.cargoNextest (
+    commonArgs
+    // {
+      inherit cargoArtifacts;
+      pnameSuffix = "-daemon-e2e";
+      cargoNextestExtraArgs = "-p sandy-cli --test daemon_e2e";
+      SANDYD_BIN = "${sandy}/bin/sandyd";
     }
   );
 }
