@@ -9,6 +9,7 @@ mod capauth;
 
 pub mod agent;
 pub mod channel;
+pub mod escalation_sink;
 pub mod executor;
 pub mod inmem;
 pub mod minter;
