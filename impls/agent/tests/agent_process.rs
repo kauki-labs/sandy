@@ -24,7 +24,7 @@ use sandy_fabric_local::{
     inmem::InMem,
     link::{LinkError, serve_agent_link},
 };
-use sandy_impls_local::{AgentLaunch, ProcessBackend};
+use sandy_impls_local::{AgentLaunch, AgentReport, ProcessBackend};
 use sandy_proto::{MessageType, Tty};
 use tokio::time::timeout;
 
@@ -66,13 +66,19 @@ fn backend_relaying(channel: &TestChannel, cap: Cap) -> (ProcessBackend, RelayRe
     let handle = tokio::runtime::Handle::current();
     let on_link = {
         let (channel, relay) = (Arc::clone(channel), Arc::clone(&relay));
-        Arc::new(move |_box_id: &str, host_end: OwnedFd| {
+        Arc::new(move |_box_id: &str, host_end: OwnedFd, report: AgentReport| {
             let (channel, cap) = (Arc::clone(&channel), cap.clone());
             let task = handle.spawn(async move {
                 let stream = std::os::unix::net::UnixStream::from(host_end);
                 stream.set_nonblocking(true)?;
                 let link = tokio::net::UnixStream::from_std(stream)?;
-                serve_agent_link(channel, &cap, link).await
+                let relayed = serve_agent_link(channel, &cap, link).await;
+                match &relayed {
+                    Ok(Some(code)) => report.job_exited(*code),
+                    Ok(None) => report.agent_failed("the agent ended without reporting the job's exit"),
+                    Err(e) => report.agent_failed(e.to_string()),
+                }
+                relayed
             });
             *relay.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(task);
         })
@@ -94,26 +100,7 @@ fn grants() -> Grants {
 
 /// Run `command` on `backend` off the async runtime (`run` blocks).
 async fn run_blocking(backend: ProcessBackend, command: Vec<String>) -> anyhow::Result<Result<Outcome, BackendError>> {
-    let outcome = tokio::task::spawn_blocking(move || {
-        let grants = grants();
-        let spec = RunSpec {
-            template: "process",
-            command: &command,
-            inputs: &[],
-            outputs: &[],
-            secrets: &[],
-            env: &[],
-            cpu: None,
-            mem: None,
-            timeout_secs: 30,
-            grants: &grants,
-            outcome_file: None,
-            secret_dir: None,
-        };
-        backend.run(&spec)
-    })
-    .await?;
-    Ok(outcome)
+    Ok(tokio::task::spawn_blocking(move || run_on(&backend, &command)).await?)
 }
 
 fn sh(script: &str) -> Vec<String> {
@@ -263,6 +250,88 @@ async fn a_forged_cap_never_starts_the_job_and_is_an_infra_fault() -> anyhow::Re
         "the relay must report the refused join"
     );
     Ok(())
+}
+
+/// Adversarial (review of #216): a job that kills its own agent, after
+/// printing a line that looks like an agent diagnostic, gets an infra fault
+/// whose reason it did not write — never a job result it chose, and never its
+/// own text as the failure reason.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_that_kills_its_agent_cannot_pick_the_result_or_the_reason() -> anyhow::Result<()> {
+    let (channel, agent_cap, _) = channel_and_caps().await?;
+    let (backend, relay) = backend_relaying(&channel, agent_cap);
+
+    let result = timeout(
+        WAIT,
+        run_blocking(backend, sh(r#"echo "sandy-agent: spoofed"; kill -ABRT $PPID; exit 0"#)),
+    )
+    .await??;
+    match result {
+        Err(BackendError::Spawn(why)) => assert!(!why.contains("spoofed"), "the job wrote the reason: {why}"),
+        other => panic!("a killed agent must be an infra fault, got {other:?}"),
+    }
+    assert!(
+        matches!(relay_result(&relay).await?, Ok(None)),
+        "the relay must see no exit report"
+    );
+    Ok(())
+}
+
+/// An agent-mode backend runs one job: a second run would re-join the same cap
+/// and replay the channel's earlier stdin into the new job.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_agent_backend_refuses_a_second_run() -> anyhow::Result<()> {
+    let (channel, agent_cap, _) = channel_and_caps().await?;
+    let (backend, relay) = backend_relaying(&channel, agent_cap);
+    let backend = Arc::new(backend);
+
+    let first = {
+        let backend = Arc::clone(&backend);
+        tokio::task::spawn_blocking(move || run_on(&backend, &sh("exit 0"))).await?
+    };
+    assert_eq!(first?.guest_exit, Some(0));
+    relay_result(&relay).await??;
+
+    let second = tokio::task::spawn_blocking(move || run_on(&backend, &sh("exit 0"))).await?;
+    assert!(
+        matches!(&second, Err(BackendError::Spawn(why)) if why.contains("one job")),
+        "a second run must be refused, got {second:?}"
+    );
+    Ok(())
+}
+
+/// A panicking `on_link` fails the run as infra instead of unwinding through
+/// `run`, which would skip the staging wipe.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_panicking_link_handler_fails_the_run_without_unwinding() -> anyhow::Result<()> {
+    let backend = ProcessBackend::new().with_agent(AgentLaunch {
+        program: agent_binary(),
+        on_link: Arc::new(|_: &str, _: OwnedFd, _: AgentReport| panic!("relay setup failed")),
+    });
+    let result = tokio::task::spawn_blocking(move || run_on(&backend, &sh("exit 0"))).await?;
+    assert!(
+        matches!(&result, Err(BackendError::Spawn(why)) if why.contains("on_link")),
+        "got {result:?}"
+    );
+    Ok(())
+}
+
+fn run_on(backend: &ProcessBackend, command: &[String]) -> Result<Outcome, BackendError> {
+    let grants = grants();
+    backend.run(&RunSpec {
+        template: "process",
+        command,
+        inputs: &[],
+        outputs: &[],
+        secrets: &[],
+        env: &[],
+        cpu: None,
+        mem: None,
+        timeout_secs: 30,
+        grants: &grants,
+        outcome_file: None,
+        secret_dir: None,
+    })
 }
 
 fn shell_quote(path: &Path) -> String {

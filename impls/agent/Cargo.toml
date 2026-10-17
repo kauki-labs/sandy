@@ -21,7 +21,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-rustix = { workspace = true, features = ["stdio"] }
+rustix = { workspace = true, features = ["process", "stdio"] }
 sandy-fabric-local.workspace = true
 tokio = { workspace = true, features = [
   "rt-multi-thread",

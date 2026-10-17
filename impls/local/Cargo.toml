@@ -21,7 +21,6 @@ workspace = true
 
 [dependencies]
 command-group.workspace = true
-libc.workspace = true
 sandy.workspace = true
 sandy-api.workspace = true
 sandy-fsutil.workspace = true

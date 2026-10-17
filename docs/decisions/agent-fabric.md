@@ -295,12 +295,15 @@ job holding it could post as the agent.
 - The job never inherits the link: the agent keeps a close-on-exec duplicate,
   points its own stdin at `/dev/null`, and gives the job fresh pipes. Its
   environment is the backend's, unchanged.
-- Exit status keeps job results and agent faults apart (INV-11). After the job
-  ran, the agent exits with the job's code (`128 + signal` for a signal death);
-  any agent-internal failure ends it with `SIGABRT`, which a normal exit cannot
-  produce, and the backend reports that as an infra fault, never a `guest_exit`.
-  The agent tees the job's output to its own stdio, so `Outcome.console` is
-  unchanged.
+- The job's result travels over the link, not in the agent's exit status
+  (INV-11). After the job exits, the agent sends its code (`128 + signal` for a
+  signal death) as the link's last frame; the relay returns it, and the caller
+  reports it to the backend through the `AgentReport` that `on_link` received.
+  The backend takes `guest_exit` only from that report. No report (the agent was
+  refused, faulted, panicked, or was killed) is an infra fault. The agent's
+  process status cannot serve: under `bwrap` it is the wrapper's, and the job
+  shares the agent's uid and can signal it. The agent tees the job's output to
+  its own stdio, so `Outcome.console` is unchanged.
 - TTY traffic reuses the existing `Tty` envelope marker with no new wire type:
   `content_type` (`TTY_STDIN`/`TTY_STDOUT`/`TTY_STDERR`) carries the direction,
   raw bytes ride `payload`. In-process (`SandboxAgent`) and as a process
@@ -317,9 +320,15 @@ job holding it could post as the agent.
 
 **Consequences.** The relay's join and the `Channel`'s own rights enforcement are
 the only places INV-1/boundedness is enforced for this surface; no second copy of
-either check exists to drift out of sync. The composition root builds one
-`ProcessBackend` per sandbox, with `on_link` closing over that sandbox's channel
-and cap (one channel per sandbox, spec §3.4). `UnavailableConsole` means #109's
+either check exists to drift out of sync. An agent-mode `ProcessBackend` runs one
+job, and the composition root builds one per sandbox run, with `on_link` closing
+over that run's channel and cap: re-joining with a cap replays the channel's
+earlier stdin, so neither may be reused across runs (spec §3.4). Known limits of
+the local process backend: a job shares the agent's uid, so it can kill its agent
+(an infra fault, never a result it chose) and, where `ptrace` is open, read the
+agent's memory (the agent marks itself non-dumpable on Linux); on macOS a socket
+pair gets close-on-exec in a second call, so another thread's spawn in the same
+host process can race it. `UnavailableConsole` means #109's
 "break-glass works when the agent is down" positive case is honestly NOT
 demonstrated for the process backend; it is deferred to the VM-backed
 `RawConsole`, tracked separately.

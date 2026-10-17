@@ -10,6 +10,11 @@
 //! failure is [`BackendError::Spawn`] (the supervisor maps it to band 3,
 //! retryable); a process that merely exits non-zero returns an [`Outcome`].
 //!
+//! Agent mode ([`ProcessBackend::with_agent`], #216): the backend launches the
+//! sandbox agent, which runs the job as its child. The job's exit then comes
+//! only from the relay's [`AgentReport`], and a run the agent did not report on
+//! is an infra fault.
+//!
 //! Shares (inputs, outputs, secret) are staged by the shared `plan_shares` policy
 //! into per-run dirs and presented via [`LocalDirTransport`]: the job reads each
 //! at `SANDY_<TAG>_DIR` (e.g. `SANDY_INPUTS_DIR`), read-only shares made
@@ -80,9 +85,43 @@ const POLL: Duration = Duration::from_millis(10);
 /// are NEVER joined unconditionally — `run()` stays bounded regardless of the job.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
-/// Called with a run's box id and the host end of its agent link, right after
-/// the agent is spawned and before the backend waits on it.
-pub type OnLink = Arc<dyn Fn(&str, std::os::fd::OwnedFd) + Send + Sync>;
+/// Called with a run's box id, the host end of its agent link, and the handle
+/// to report the run's verdict on, right after the agent is spawned.
+///
+/// It runs on the thread that called [`VmBackend::run`], with no async runtime
+/// guaranteed. It must not block (start the relay elsewhere and return) and
+/// should not panic; a panic fails the run as an infra fault.
+pub type OnLink = Arc<dyn Fn(&str, std::os::fd::OwnedFd, AgentReport) + Send + Sync>;
+
+/// What the relay concluded about one agent-mode run.
+#[derive(Debug)]
+enum Verdict {
+    /// The agent reported the job's exit code.
+    JobExited(i32),
+    /// The agent failed: refused, faulted, or ended without reporting.
+    AgentFailed(String),
+}
+
+/// The relay's handle for reporting one run's verdict back to the backend
+/// (#216). The backend takes a job's exit code only from here, never from the
+/// agent's process status: under a wrapper that status is the wrapper's, and
+/// the job could signal the agent to fake one. Dropping it without a report
+/// fails the run as an infra fault.
+#[derive(Debug)]
+pub struct AgentReport(std::sync::mpsc::SyncSender<Verdict>);
+
+impl AgentReport {
+    /// The agent reported that the job exited with `code`.
+    pub fn job_exited(self, code: i32) {
+        let _ = self.0.send(Verdict::JobExited(code));
+    }
+
+    /// The agent failed before or without reporting the job's exit: the run is
+    /// an infra fault, not a job result (INV-11).
+    pub fn agent_failed(self, why: impl Into<String>) {
+        let _ = self.0.send(Verdict::AgentFailed(why.into()));
+    }
+}
 
 /// How the backend launches the sandbox agent (#216).
 ///
@@ -92,6 +131,9 @@ pub type OnLink = Arc<dyn Fn(&str, std::os::fd::OwnedFd) + Send + Sync>;
 /// and passes the other to [`on_link`](Self::on_link), which runs the
 /// orchestrator-side relay. The backend's own copy of the agent end is closed
 /// once the agent is spawned, so the relay sees EOF when the agent exits.
+/// On macOS the pair gets close-on-exec in a second call (there is no
+/// `SOCK_CLOEXEC`), so a concurrent spawn on another thread of the same host
+/// process can race it.
 #[derive(Clone)]
 pub struct AgentLaunch {
     /// The `sandy-agent` binary.
@@ -118,6 +160,8 @@ pub struct ProcessBackend {
     instances: Mutex<Vec<BoxState>>,
     /// When set, every job runs as the child of the sandbox agent process (#216).
     agent: Option<AgentLaunch>,
+    /// Set by an agent-mode backend's one run: its cap and channel serve one job.
+    agent_used: AtomicBool,
     /// How a job is confined (#135). The default [`NoContainment`] keeps the backend
     /// hermetic and uncontained (best-effort group reap only); the composition root
     /// injects the host [`SystemdRunContainment`](crate::SystemdRunContainment).
@@ -145,13 +189,18 @@ impl ProcessBackend {
         Self {
             instances: Mutex::new(Vec::new()),
             agent: None,
+            agent_used: AtomicBool::new(false),
             containment,
         }
     }
 
-    /// Launch every job through the sandbox agent (#216): the backend runs
+    /// Launch the job through the sandbox agent (#216): the backend runs
     /// `agent.program -- <job>` with a fresh agent link on its stdin and hands
     /// the link's host end to `agent.on_link` right after the spawn.
+    ///
+    /// An agent-mode backend runs ONE job; a second `run` is refused. Its
+    /// `on_link` serves one cap on one channel, and re-joining with a cap replays
+    /// that channel's earlier stdin into the next job. Build one per sandbox run.
     #[must_use]
     pub fn with_agent(mut self, agent: AgentLaunch) -> Self {
         self.agent = Some(agent);
@@ -314,11 +363,8 @@ impl ProcessBackend {
             Err(err) => return Err(BackendError::Spawn(format!("spawn `{job_program}`: {err}"))),
         };
         // Close this process's copy of the agent end (held by the Command), so the
-        // relay sees EOF once the agent exits, then hand the host end over.
+        // relay sees EOF once the agent exits.
         drop(command);
-        if let (Some(agent), Some(host_end)) = (&self.agent, host_end) {
-            (agent.on_link)(&box_id, host_end);
-        }
 
         self.registry()?.push(BoxState {
             box_id: box_id.clone(),
@@ -331,6 +377,31 @@ impl ProcessBackend {
         // Drain both pipes on threads so a chatty child never blocks on a full pipe.
         let out_drain = child.inner().stdout.take().map(drain);
         let err_drain = child.inner().stderr.take().map(drain);
+
+        // Hand the relay its end of the agent link, with the console already
+        // draining so a slow on_link cannot stall the agent's output. A panic in
+        // on_link fails the run as infra; the agent sees EOF and exits.
+        let verdict = match (&self.agent, host_end) {
+            (Some(agent), Some(host_end)) => {
+                let (report, verdict) = std::sync::mpsc::sync_channel(1);
+                let handed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    (agent.on_link)(&box_id, host_end, AgentReport(report));
+                }));
+                if handed.is_err() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    if let Err(err) = self.containment.reap(&box_id) {
+                        tracing::warn!(box_id = %box_id, %err, "containment reap failed after on_link panicked");
+                    }
+                    self.registry()?.retain(|state| state.box_id != box_id);
+                    return Err(BackendError::Spawn(
+                        "the agent link handler (on_link) panicked".to_string(),
+                    ));
+                }
+                Some(verdict)
+            }
+            _ => None,
+        };
 
         // Wait for the group leader against the wall-clock budget, polling so a
         // timeout can interrupt a hung job rather than block forever.
@@ -381,27 +452,28 @@ impl ProcessBackend {
         let stderr = take_bounded(err_drain, drain_deadline);
         let console = merged_console(&stdout, &stderr);
 
-        // INV-11, agent mode: the agent exits with the job's code (a job signal death
-        // included, as 128+signal), so a SIGABRT death of the agent itself can only be
-        // an agent fault, e.g. a refused join, where the job never ran. That is infra,
-        // never a job result.
-        if self.agent.is_some() && !timed_out && status.and_then(|s| s.signal()) == Some(libc::SIGABRT) {
-            let why = console
-                .lines()
-                .rev()
-                .find(|line| line.starts_with("sandy-agent:"))
-                .unwrap_or("sandy-agent aborted without a diagnostic");
-            return Err(BackendError::Spawn(format!(
-                "the sandbox agent failed for `{job_program}`: {why}"
-            )));
-        }
-
         // INV-11: the process ran (booted), so its exit is a task result on
         // guest_exit, never a transport fault. A signal death maps to 128+signal
         // (shell convention) so it stays a task failure, not infra. A timeout
         // leaves guest_exit None; classification keys off timed_out first.
         let guest_exit = if timed_out {
             None
+        } else if let Some(verdict) = verdict {
+            // Agent mode: the job's exit comes only from the relay's verdict (see
+            // AgentReport); the relay sees the link close as soon as the agent exits.
+            match verdict.recv_timeout(DRAIN_GRACE) {
+                Ok(Verdict::JobExited(code)) => Some(code),
+                Ok(Verdict::AgentFailed(why)) => {
+                    return Err(BackendError::Spawn(format!(
+                        "the sandbox agent failed for `{job_program}`: {why}"
+                    )));
+                }
+                Err(_) => {
+                    return Err(BackendError::Spawn(format!(
+                        "the sandbox agent's relay reported no verdict for `{job_program}`"
+                    )));
+                }
+            }
         } else {
             status.and_then(|s| s.code().or_else(|| s.signal().map(|sig| 128 + sig)))
         };
@@ -420,6 +492,11 @@ impl VmBackend for ProcessBackend {
     fn run(&self, spec: &RunSpec) -> Result<Outcome, BackendError> {
         if spec.command.is_empty() {
             return Err(BackendError::Spawn("empty command".to_string()));
+        }
+        if self.agent.is_some() && self.agent_used.swap(true, Ordering::SeqCst) {
+            return Err(BackendError::Spawn(
+                "this agent-mode backend already ran its one job; build one per sandbox run".to_string(),
+            ));
         }
 
         // Per-run, sandy-owned staging dirs, mirroring the VM backends' lifecycle

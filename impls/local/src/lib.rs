@@ -15,5 +15,5 @@ mod share;
 
 pub use containment::SystemdRunContainment;
 pub use egress::NoEgress;
-pub use process::{AgentLaunch, OnLink, ProcessBackend};
+pub use process::{AgentLaunch, AgentReport, OnLink, ProcessBackend};
 pub use share::LocalDirTransport;

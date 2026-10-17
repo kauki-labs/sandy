@@ -10,11 +10,14 @@
 //! points its own stdin at `/dev/null`, and gives the job fresh pipes. It
 //! inherits the agent's environment unchanged, which is the backend's.
 //!
-//! Exit status, so the backend can tell a job result from an agent fault
-//! (INV-11): after the job ran, the agent exits with the job's code (`128 +
-//! signal` for a signal death). Any agent-internal failure, before or while
-//! bridging, ends the agent with `SIGABRT` instead, which a normal exit can
-//! never produce.
+//! The job's result reaches the backend as the link's last frame
+//! ([`LinkAgent::report_exit`]): its exit code, `128 + signal` for a signal
+//! death. The relay passes it on, and the backend takes the job's exit only
+//! from there, never from this process's status, which a wrapper or the job
+//! itself could change. An agent that fails, panics, or is killed reports
+//! nothing, and the run is an infra fault (INV-11). The agent also exits with
+//! the job's code, and aborts on an internal failure, for whoever runs it by
+//! hand.
 
 use std::{
     ffi::OsString,
@@ -62,6 +65,7 @@ fn job_argv(args: Vec<OsString>) -> Result<Vec<OsString>, String> {
 /// Bootstrap over the link, run the job as this process's child, and bridge
 /// its stdio until it exits.
 async fn run(job: Vec<OsString>) -> Result<ExitStatus, String> {
+    harden();
     let link = claim_link().map_err(|e| format!("claiming the agent link on stdin: {e}"))?;
     let agent = LinkAgent::bootstrap(link)
         .await
@@ -91,7 +95,22 @@ async fn run(job: Vec<OsString>) -> Result<ExitStatus, String> {
         let _ = child.wait().await;
         return Err(format!("bridging the job's stdio: {e}"));
     }
-    child.wait().await.map_err(|e| format!("waiting on the job: {e}"))
+    let status = child.wait().await.map_err(|e| format!("waiting on the job: {e}"))?;
+    agent
+        .report_exit(i32::from(exit_code(status)))
+        .await
+        .map_err(|e| format!("reporting the job's exit: {e}"))?;
+    Ok(status)
+}
+
+/// Keep the cap out of reach of the same-uid job where the platform allows:
+/// on Linux, a non-dumpable process writes no core dump and cannot be
+/// ptrace-attached or have its memory read by an unprivileged peer.
+fn harden() {
+    #[cfg(target_os = "linux")]
+    if let Err(e) = rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable) {
+        eprintln!("sandy-agent: could not mark the agent non-dumpable: {e}");
+    }
 }
 
 /// Take the agent link off stdin: keep a close-on-exec duplicate, then point fd
