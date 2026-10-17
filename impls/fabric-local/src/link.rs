@@ -23,7 +23,7 @@ use sandy_fabric::{
     capauth::{Cap, CapAuthority, CapCodecError, decode_cap, encode_cap},
     channel_backend::ChannelBackend,
 };
-use sandy_proto::{MessageType, Tty};
+use sandy_proto::{MessageType, PeerMsg, Tty};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::Mutex as AsyncMutex,
@@ -243,6 +243,36 @@ where
     A: CapAuthority + 'static,
     L: AsyncRead + AsyncWrite + Send + 'static,
 {
+    serve_agent_link_with_peers(channel, cap, Vec::new(), link).await
+}
+
+/// A peer-channel membership the relay hands the agent at setup (#238 slice
+/// 4): a channel this sandbox may talk to its peers on, and the cap minted for
+/// it. Membership is fixed for the run in v1 (minted at dispatch).
+pub struct PeerGrant<B, A> {
+    /// The peer-group channel.
+    pub channel: Arc<Channel<B, A>>,
+    /// The agent's cap on it.
+    pub cap: Cap,
+}
+
+/// [`serve_agent_link`] that also hands the agent `peers`, one membership per
+/// peer channel. Each peer `Post` and `Deliver` is authorized against that
+/// channel's own membership, never against holding the link.
+///
+/// # Errors
+/// As [`serve_agent_link`]; a refused peer join fails the link.
+pub async fn serve_agent_link_with_peers<B, A, L>(
+    channel: Arc<Channel<B, A>>,
+    cap: &Cap,
+    peers: Vec<PeerGrant<B, A>>,
+    link: L,
+) -> Result<Option<i32>, LinkError>
+where
+    B: ChannelBackend + 'static,
+    A: CapAuthority + 'static,
+    L: AsyncRead + AsyncWrite + Send + 'static,
+{
     let (mut rd, wr) = tokio::io::split(link);
     let wr = Arc::new(AsyncMutex::new(wr));
 
@@ -252,7 +282,8 @@ where
         &LinkFrame::Cap {
             cap: handed.clone(),
             channel: None,
-            peers: 0,
+            peers: u32::try_from(peers.len())
+                .map_err(|_| LinkError::Protocol("too many peer channels for one link".to_string()))?,
         },
     )
     .await?;
@@ -293,38 +324,79 @@ where
         deliver: None,
     };
     write_frame(&mut *wr.lock().await, &LinkFrame::Joined { channel: None }).await?;
-    relay_joined(&mut membership, &mut rd, &wr).await
+
+    // Each peer membership in lockstep: its cap, the agent's join for exactly
+    // that channel with exactly that cap, then the verdict.
+    let mut joined_peers = Vec::with_capacity(peers.len());
+    for grant in peers {
+        joined_peers.push(join_peer(grant, &mut rd, &wr).await?);
+    }
+    relay_joined(&mut membership, &mut joined_peers, &mut rd, &wr).await
 }
 
-/// A peer-channel membership the relay hands the agent at setup (#238 slice
-/// 4): a channel this sandbox may talk to its peers on, and the cap minted for
-/// it. Membership is fixed for the run in v1 (minted at dispatch).
-pub struct PeerGrant<B, A> {
-    /// The peer-group channel.
-    pub channel: Arc<Channel<B, A>>,
-    /// The agent's cap on it.
-    pub cap: Cap,
-}
-
-/// [`serve_agent_link`] that also hands the agent `peers`, one membership per
-/// peer channel. Each peer `Post` and `Deliver` is authorized against that
-/// channel's own membership, never against holding the link.
-///
-/// # Errors
-/// As [`serve_agent_link`]; a refused peer join fails the link.
-pub async fn serve_agent_link_with_peers<B, A, L>(
-    channel: Arc<Channel<B, A>>,
-    cap: &Cap,
-    peers: Vec<PeerGrant<B, A>>,
-    link: L,
-) -> Result<Option<i32>, LinkError>
+/// Hand the agent one peer cap and admit its join, which must name that
+/// channel and present exactly that cap.
+async fn join_peer<B, A, R, W>(
+    grant: PeerGrant<B, A>,
+    rd: &mut R,
+    wr: &Arc<AsyncMutex<W>>,
+) -> Result<Joined<B, A>, LinkError>
 where
     B: ChannelBackend + 'static,
     A: CapAuthority + 'static,
-    L: AsyncRead + AsyncWrite + Send + 'static,
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
 {
-    let _ = peers;
-    serve_agent_link(channel, cap, link).await
+    let name = grant.channel.id().0.clone();
+    let handed = hex::encode(encode_cap(&grant.cap)?);
+    write_frame(
+        &mut *wr.lock().await,
+        &LinkFrame::Cap {
+            cap: handed.clone(),
+            channel: Some(name.clone()),
+            peers: 0,
+        },
+    )
+    .await?;
+    let refuse = |reason: String| async {
+        let _ = write_frame(&mut *wr.lock().await, &LinkFrame::Refused { reason: reason.clone() }).await;
+        reason
+    };
+    match read_frame(rd).await? {
+        Some(LinkFrame::Join { cap, channel }) if channel.as_deref() == Some(name.as_str()) && cap == handed => {}
+        Some(LinkFrame::Join { .. }) => {
+            let reason = refuse(format!(
+                "the join for peer channel {name} must present the cap handed for it"
+            ))
+            .await;
+            return Err(LinkError::Protocol(reason));
+        }
+        Some(other) => {
+            return Err(LinkError::Protocol(format!(
+                "expected the join for peer channel {name}, got {}",
+                other.kind()
+            )));
+        }
+        None => {
+            return Err(LinkError::Protocol(format!(
+                "the agent closed the link before joining peer channel {name}"
+            )));
+        }
+    }
+    let id = match grant.channel.join(&grant.cap) {
+        Ok(id) => id,
+        Err(e) => {
+            refuse(e.to_string()).await;
+            return Err(e.into());
+        }
+    };
+    let membership = Joined {
+        channel: grant.channel,
+        id,
+        deliver: None,
+    };
+    write_frame(&mut *wr.lock().await, &LinkFrame::Joined { channel: Some(name) }).await?;
+    Ok(membership)
 }
 
 /// A joined agent's membership: leaving it, and aborting the stdin delivery
@@ -348,6 +420,7 @@ impl<B: ChannelBackend, A: CapAuthority> Drop for Joined<B, A> {
 /// job output and the final exit in from it, until the agent closes the link.
 async fn relay_joined<B, A, R, W>(
     membership: &mut Joined<B, A>,
+    peers: &mut [Joined<B, A>],
     rd: &mut R,
     wr: &Arc<AsyncMutex<W>>,
 ) -> Result<Option<i32>, LinkError>
@@ -387,6 +460,38 @@ where
     });
     membership.deliver = Some(deliver.abort_handle());
 
+    // Each peer channel delivers on its own membership's subscription, so only
+    // channels this link joined can reach the agent.
+    for peer in peers.iter_mut() {
+        let inbound = peer.channel.subscribe(&peer.id)?;
+        let name = peer.channel.id().0.clone();
+        let deliver = tokio::spawn({
+            let wr = Arc::clone(wr);
+            async move {
+                let mut inbound = std::pin::pin!(inbound);
+                while let Some(item) = inbound.next().await {
+                    let env = match item {
+                        Ok(env) => env,
+                        Err(e) => {
+                            tracing::warn!(error = %e, channel = name, "agent relay: peer stream faulted; stopped");
+                            return;
+                        }
+                    };
+                    let frame = LinkFrame::Deliver {
+                        content_type: env.content_type,
+                        payload: hex::encode(&env.payload),
+                        channel: Some(name.clone()),
+                    };
+                    if let Err(e) = write_frame(&mut *wr.lock().await, &frame).await {
+                        tracing::warn!(error = %e, channel = name, "agent relay: peer delivery failed; stopped");
+                        return;
+                    }
+                }
+            }
+        });
+        peer.deliver = Some(deliver.abort_handle());
+    }
+
     let mut exit = None;
     loop {
         match read_frame(rd).await? {
@@ -408,6 +513,28 @@ where
                 membership
                     .channel
                     .post(&membership.id, Some(MessageType::Tty(Tty {})), content_type, bytes)
+                    .await?;
+            }
+            Some(LinkFrame::Post {
+                content_type,
+                payload,
+                channel: Some(name),
+            }) => {
+                // Authorized against this channel's own membership, never against
+                // holding the link: a channel this link did not join is refused.
+                let Some(peer) = peers.iter().find(|p| p.channel.id().0 == name) else {
+                    return Err(LinkError::Protocol(format!(
+                        "the agent holds no membership on peer channel {name}"
+                    )));
+                };
+                if [TTY_STDIN, TTY_STDOUT, TTY_STDERR].contains(&content_type.as_str()) {
+                    return Err(LinkError::Protocol(format!(
+                        "TTY traffic ({content_type}) belongs on the orchestrator channel, not peer channel {name}"
+                    )));
+                }
+                let bytes = unhex(&payload, "a peer post payload")?;
+                peer.channel
+                    .post(&peer.id, Some(MessageType::PeerMsg(PeerMsg {})), content_type, bytes)
                     .await?;
             }
             Some(LinkFrame::Exit { code }) => exit = Some(code),

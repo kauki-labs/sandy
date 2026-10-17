@@ -301,7 +301,17 @@ pub struct LinkAgent {
     port: Arc<LinkPort>,
     reader: std::sync::Mutex<Option<Box<dyn AsyncRead + Send + Unpin>>>,
     served: std::sync::atomic::AtomicBool,
+    /// The peer channels joined at setup (#238 slice 4).
+    peers: Vec<String>,
+    /// Where the link reader routes peer deliveries.
+    peer_tx: tokio::sync::mpsc::Sender<PeerDelivery>,
+    /// The receiving end, handed out once by [`LinkAgent::take_peer_inbox`].
+    peer_inbox: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<PeerDelivery>>>,
 }
+
+/// How many peer deliveries wait in the inbox before newer ones are dropped
+/// (with a warning), so a slow consumer never stalls the job's stdin.
+const PEER_INBOX: usize = 1024;
 
 impl LinkAgent {
     /// Read the cap frame from `link` exactly once, present it in `Join`, and
@@ -316,8 +326,12 @@ impl LinkAgent {
         L: AsyncRead + AsyncWrite + Send + 'static,
     {
         let (mut rd, mut wr) = tokio::io::split(link);
-        let cap = match read_frame(&mut rd).await? {
-            Some(LinkFrame::Cap { cap, channel: None, .. }) => cap,
+        let (cap, peer_count) = match read_frame(&mut rd).await? {
+            Some(LinkFrame::Cap {
+                cap,
+                channel: None,
+                peers,
+            }) => (cap, peers),
             Some(other) => {
                 return Err(LinkError::Protocol(format!("expected the cap frame first, got {}", other.kind())).into());
             }
@@ -334,12 +348,53 @@ impl LinkAgent {
             }
             None => return Err(LinkError::Protocol("the link closed before the join verdict".to_string()).into()),
         }
+        // Each peer membership in lockstep: its cap, our join for exactly that
+        // channel with exactly that cap, the relay's verdict.
+        let mut peers = Vec::new();
+        for _ in 0..peer_count {
+            let (cap, channel) = match read_frame(&mut rd).await? {
+                Some(LinkFrame::Cap {
+                    cap,
+                    channel: Some(channel),
+                    ..
+                }) => (cap, channel),
+                Some(other) => {
+                    return Err(LinkError::Protocol(format!("expected a peer cap frame, got {}", other.kind())).into());
+                }
+                None => return Err(LinkError::Protocol("the link closed during the peer setup".to_string()).into()),
+            };
+            decode_cap(&unhex(&cap, "a peer cap frame")?)?;
+            write_frame(
+                &mut wr,
+                &LinkFrame::Join {
+                    cap,
+                    channel: Some(channel.clone()),
+                },
+            )
+            .await?;
+            match read_frame(&mut rd).await? {
+                Some(LinkFrame::Joined { channel: Some(joined) }) if joined == channel => peers.push(channel),
+                Some(LinkFrame::Refused { reason }) => return Err(AgentError::Refused(reason)),
+                Some(other) => {
+                    return Err(LinkError::Protocol(format!(
+                        "expected the verdict for peer channel {channel}, got {}",
+                        other.kind()
+                    ))
+                    .into());
+                }
+                None => return Err(LinkError::Protocol("the link closed during the peer setup".to_string()).into()),
+            }
+        }
+        let (peer_tx, peer_inbox) = tokio::sync::mpsc::channel(PEER_INBOX);
         Ok(Self {
             port: Arc::new(LinkPort {
                 writer: AsyncMutex::new(Box::new(wr)),
             }),
             reader: std::sync::Mutex::new(Some(Box::new(rd))),
             served: std::sync::atomic::AtomicBool::new(false),
+            peers,
+            peer_tx,
+            peer_inbox: std::sync::Mutex::new(Some(peer_inbox)),
         })
     }
 
@@ -361,22 +416,44 @@ impl LinkAgent {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
             .ok_or(AgentError::AlreadyServed)?;
-        let stdin_frames = futures_util::stream::unfold(reader, |mut reader| async move {
-            loop {
-                match read_frame(&mut reader).await {
-                    Ok(Some(LinkFrame::Deliver {
-                        content_type,
-                        payload,
-                        channel: None,
-                    })) if content_type == TTY_STDIN => match unhex(&payload, "a deliver payload") {
-                        Ok(bytes) => return Some((bytes, reader)),
-                        Err(e) => tracing::warn!(error = %e, "dropping a malformed stdin frame"),
-                    },
-                    Ok(Some(other)) => tracing::warn!(kind = other.kind(), "ignoring an unexpected link frame"),
-                    Ok(None) => return None,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "agent link faulted; stdin bridge stopped");
-                        return None;
+        let peer_tx = self.peer_tx.clone();
+        let stdin_frames = futures_util::stream::unfold(reader, move |mut reader| {
+            let peer_tx = peer_tx.clone();
+            async move {
+                loop {
+                    match read_frame(&mut reader).await {
+                        Ok(Some(LinkFrame::Deliver {
+                            content_type,
+                            payload,
+                            channel: Some(channel),
+                        })) => match unhex(&payload, "a peer deliver payload") {
+                            Ok(payload) => {
+                                let delivery = PeerDelivery {
+                                    channel,
+                                    content_type,
+                                    payload,
+                                };
+                                if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = peer_tx.try_send(delivery)
+                                {
+                                    tracing::warn!("peer inbox full; dropping a peer message");
+                                }
+                            }
+                            Err(e) => tracing::warn!(error = %e, "dropping a malformed peer frame"),
+                        },
+                        Ok(Some(LinkFrame::Deliver {
+                            content_type,
+                            payload,
+                            channel: None,
+                        })) if content_type == TTY_STDIN => match unhex(&payload, "a deliver payload") {
+                            Ok(bytes) => return Some((bytes, reader)),
+                            Err(e) => tracing::warn!(error = %e, "dropping a malformed stdin frame"),
+                        },
+                        Ok(Some(other)) => tracing::warn!(kind = other.kind(), "ignoring an unexpected link frame"),
+                        Ok(None) => return None,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "agent link faulted; stdin bridge stopped");
+                            return None;
+                        }
                     }
                 }
             }
@@ -389,7 +466,7 @@ impl LinkAgent {
     /// The peer channels this agent joined at setup.
     #[must_use]
     pub fn peers(&self) -> &[String] {
-        &[]
+        &self.peers
     }
 
     /// Post on peer channel `channel`, which this agent must have joined.
@@ -397,14 +474,25 @@ impl LinkAgent {
     /// # Errors
     /// [`AgentError::NotAPeer`] for a channel this agent did not join, or
     /// [`AgentError::Link`] if the frame cannot be written.
-    pub async fn post_peer(&self, _channel: &str, _content_type: &str, _payload: Vec<u8>) -> Result<(), AgentError> {
-        Err(AgentError::NotAPeer(String::new()))
+    pub async fn post_peer(&self, channel: &str, content_type: &str, payload: Vec<u8>) -> Result<(), AgentError> {
+        if !self.peers.iter().any(|joined| joined == channel) {
+            return Err(AgentError::NotAPeer(channel.to_string()));
+        }
+        let frame = LinkFrame::Post {
+            content_type: content_type.to_string(),
+            payload: hex::encode(payload),
+            channel: Some(channel.to_string()),
+        };
+        Ok(write_frame(&mut *self.port.writer.lock().await, &frame).await?)
     }
 
     /// The receiver for messages on this agent's peer channels; `Some` once.
     /// They arrive while [`serve_tty`](Self::serve_tty) reads the link.
     pub fn take_peer_inbox(&self) -> Option<tokio::sync::mpsc::Receiver<PeerDelivery>> {
-        None
+        self.peer_inbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 
     /// Report the job's exit to the relay as the link's last frame. A run whose
