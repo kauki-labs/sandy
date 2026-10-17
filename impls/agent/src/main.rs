@@ -35,6 +35,7 @@ use sandy_fabric_local::agent::LinkAgent;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 mod link_source;
+mod peer;
 
 use link_source::LinkSource;
 
