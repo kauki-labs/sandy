@@ -80,8 +80,16 @@ where
     let (remote_rd, mut remote_wr) = tokio::io::split(remote);
 
     remote_wr.write_all(prefix).await?;
+    remote_wr.flush().await?;
 
-    tokio::spawn(forward_orchestrator_to_agent(remote_rd, local_wr));
+    // Aborts the reverse-pipe task if this function's own future is dropped
+    // before returning normally (a caller's timeout, the run being killed):
+    // without this, a cancelled forward_agent_link would leak the spawned
+    // task and leave the orchestrator never seeing EOF on this side. Reaching
+    // the end of this function calls `detach()`, which disarms the abort —
+    // the whole point of spawning it is for it to keep running past this
+    // function's own return on the ordinary path.
+    let reverse = AbortOnDrop(Some(tokio::spawn(forward_orchestrator_to_agent(remote_rd, local_wr))));
 
     // agent (local) -> orchestrator (remote): the only direction this
     // function inspects for its own verdict.
@@ -106,6 +114,7 @@ where
         }
     };
     let _ = remote_wr.shutdown().await;
+    reverse.detach();
     Ok(verdict)
 }
 
@@ -123,6 +132,31 @@ where
         }
     }
     let _ = local_wr.shutdown().await;
+}
+
+/// Aborts its wrapped task on drop unless [`detach`](Self::detach) already
+/// took the handle. Ties the reverse-pipe task's lifetime to
+/// [`forward_agent_link`]'s own future: if that future is dropped before
+/// returning (a caller's timeout, the run being killed), this guard's own
+/// drop fires and aborts the still-running task, instead of leaking it and
+/// its open stream half forever.
+struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
+
+impl AbortOnDrop {
+    /// Let the wrapped task keep running past this guard's own drop — the
+    /// ordinary path, once `forward_agent_link` has its verdict and the
+    /// reverse pipe may still have orchestrator traffic to deliver.
+    fn detach(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -282,6 +316,42 @@ mod tests {
         assert!(
             result.is_err(),
             "a dead remote before the prefix write must propagate an error, not a verdict"
+        );
+        Ok(())
+    }
+
+    /// CodeRabbit's finding on the first version of this function: the
+    /// spawned reverse-pipe task wasn't tied to `forward_agent_link`'s own
+    /// future, so cancelling it (a caller's timeout, the run being killed)
+    /// leaked the task and left the orchestrator's connection dangling
+    /// indefinitely instead of seeing it close.
+    #[tokio::test]
+    async fn dropping_the_forwarder_mid_link_lets_the_orchestrator_see_eof() -> anyhow::Result<()> {
+        let (local_conn, _agent_side) = tokio::io::duplex(4096);
+        let (remote_conn, mut orchestrator_side) = tokio::io::duplex(4096);
+
+        let forwarder = tokio::spawn(forward_agent_link(local_conn, remote_conn, PREFIX));
+        expect_prefix(&mut orchestrator_side, PREFIX).await?;
+
+        // Cancel mid-link: no verdict has been reached, the agent is still
+        // sitting there, nothing has closed on its own yet.
+        forwarder.abort();
+
+        let mut buf = [0u8; 1];
+        let saw_eof = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match orchestrator_side.read(&mut buf).await {
+                    Ok(0) => return true,
+                    Ok(_) => continue,
+                    Err(_) => return true,
+                }
+            }
+        })
+        .await
+        .context("orchestrator never observed EOF after the forwarder was cancelled")?;
+        assert!(
+            saw_eof,
+            "a cancelled forward_agent_link must close the orchestrator's connection, not leak it"
         );
         Ok(())
     }
