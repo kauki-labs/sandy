@@ -8,6 +8,8 @@
 
 pub mod dispatch;
 pub mod handler;
+pub mod host_conn;
+pub mod host_registry;
 pub mod link_auth;
 pub mod store;
 

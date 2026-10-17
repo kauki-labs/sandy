@@ -2211,6 +2211,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandy-executor-proto"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "prost",
+ "prost-build",
+ "protox",
+ "sandy-control-proto",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
 name = "sandy-fabric"
 version = "0.1.1"
 dependencies = [
@@ -2287,8 +2300,11 @@ version = "0.1.1"
 dependencies = [
  "anyhow",
  "sandy-api",
+ "sandy-executor-proto",
  "sandy-fabric",
  "sandy-impls-local",
+ "sandy-lib",
+ "serde_json",
  "thiserror 2.0.21",
 ]
 
@@ -2388,7 +2404,9 @@ dependencies = [
  "getrandom 0.3.4",
  "rusqlite",
  "rustix",
+ "sandy-conn",
  "sandy-control-proto",
+ "sandy-executor-proto",
  "sandy-fabric",
  "sandy-fabric-local",
  "sandy-fsutil",
