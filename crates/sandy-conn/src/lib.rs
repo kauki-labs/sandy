@@ -5,22 +5,31 @@
 //! length-prefixed framing rides any of them unchanged; swapping tiers is an
 //! address choice, never a protocol change.
 //!
-//! Step-1 (this crate's current state): UDS only. vsock and TCP/QUIC-over-mesh
-//! land as [`ConnAddr`] grows variants and [`connect`]/[`listen`] grow match
-//! arms, not as a redesign.
+//! Current state: UDS and the TCP/mesh tier (#159). vsock is parked (no
+//! consumer yet; #216's agent-link relay covers the cross-machine dispatch
+//! case this crate originally scoped vsock for). QUIC-over-mesh lands as
+//! [`ConnAddr`] grows a variant and [`connect`]/[`listen`] grow a match arm,
+//! not as a redesign.
 
 use std::{
+    net::SocketAddr,
     os::unix::fs::FileTypeExt,
     path::{Path, PathBuf},
 };
 
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 
 /// An address to [`connect`] to or [`listen`] on, naming a tier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnAddr {
     /// A Unix domain socket path (step-1, local).
     Uds(PathBuf),
+    /// A TCP socket address — the mesh tier (#159): the hosts are already on
+    /// the Headscale/Netbird mesh, so a plain TCP dial to the peer's mesh IP
+    /// is the whole "cross-machine" step, with WireGuard's own
+    /// authentication and encryption as the trust boundary for whatever
+    /// protocol rides this connection (no additional mTLS layer for step-1).
+    Tcp(SocketAddr),
 }
 
 /// A connection failure: dialing, accepting, or binding.
@@ -46,6 +55,7 @@ impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin> Conn for T 
 pub async fn connect(addr: &ConnAddr) -> Result<Box<dyn Conn>, ConnError> {
     match addr {
         ConnAddr::Uds(path) => Ok(Box::new(UnixStream::connect(path).await?)),
+        ConnAddr::Tcp(socket_addr) => Ok(Box::new(TcpStream::connect(socket_addr).await?)),
     }
 }
 
@@ -54,6 +64,7 @@ pub struct Listener(ListenerInner);
 
 enum ListenerInner {
     Uds(UnixListener),
+    Tcp(TcpListener),
 }
 
 impl Listener {
@@ -67,6 +78,25 @@ impl Listener {
                 let (stream, _addr) = listener.accept().await?;
                 Ok(Box::new(stream))
             }
+            ListenerInner::Tcp(listener) => {
+                let (stream, _addr) = listener.accept().await?;
+                Ok(Box::new(stream))
+            }
+        }
+    }
+
+    /// The address actually bound — the OS-assigned port when [`listen`] was
+    /// given port 0, as every test here does to avoid a fixed, collidable
+    /// port. UDS has no socket address of this kind.
+    ///
+    /// # Errors
+    /// [`ConnError::Io`] on the UDS tier, or if the underlying query fails.
+    pub fn local_addr(&self) -> Result<SocketAddr, ConnError> {
+        match &self.0 {
+            ListenerInner::Uds(_) => Err(ConnError::Io(std::io::Error::other(
+                "a UDS listener has no SocketAddr; local_addr is TCP-only",
+            ))),
+            ListenerInner::Tcp(listener) => Ok(listener.local_addr()?),
         }
     }
 }
@@ -88,6 +118,7 @@ impl Listener {
 pub async fn listen(addr: &ConnAddr) -> Result<Listener, ConnError> {
     match addr {
         ConnAddr::Uds(path) => Ok(Listener(ListenerInner::Uds(bind_uds(path).await?))),
+        ConnAddr::Tcp(socket_addr) => Ok(Listener(ListenerInner::Tcp(TcpListener::bind(socket_addr).await?))),
     }
 }
 
@@ -230,6 +261,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tcp_connect_and_accept_round_trip_bytes() -> anyhow::Result<()> {
+        let addr = ConnAddr::Tcp("127.0.0.1:0".parse()?);
+        let listener = listen(&addr).await.context("listen")?;
+        let bound = ConnAddr::Tcp(listener.local_addr().context("local_addr")?);
+
+        let (accepted, mut dialed) = tokio::try_join!(listener.accept(), connect(&bound))?;
+        let mut accepted = accepted;
+
+        dialed.write_all(b"hello").await.context("write")?;
+        dialed.flush().await?;
+        let mut buf = [0u8; 5];
+        accepted.read_exact(&mut buf).await.context("read")?;
+        assert_eq!(&buf, b"hello");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tcp_connecting_with_nothing_listening_fails_cleanly() -> anyhow::Result<()> {
+        // Port 0 never has a real listener behind it as a dial target; a
+        // closed, unused high port stands in for "nothing there."
+        let addr = ConnAddr::Tcp("127.0.0.1:1".parse()?);
+        assert!(
+            connect(&addr).await.is_err(),
+            "dialing a port nothing listens on must error, not hang"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tcp_binding_port_zero_picks_a_free_ephemeral_port() -> anyhow::Result<()> {
+        let addr = ConnAddr::Tcp("127.0.0.1:0".parse()?);
+        let listener = listen(&addr).await.context("listen")?;
+        assert_ne!(
+            listener.local_addr().context("local_addr")?.port(),
+            0,
+            "the OS must assign a real port, not echo back 0"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn connect_and_accept_round_trip_bytes() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let addr = uds_path(&dir);
@@ -367,9 +439,10 @@ mod tests {
     async fn bind_uds_waits_for_a_lockfile_held_by_someone_else() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let addr = uds_path(&dir);
-        let socket_path = match &addr {
-            ConnAddr::Uds(path) => path.clone(),
+        let ConnAddr::Uds(socket_path) = &addr else {
+            unreachable!("uds_path always builds a ConnAddr::Uds")
         };
+        let socket_path = socket_path.clone();
 
         // Hold the lock externally, simulating another caller mid-recovery.
         let lock_file = std::fs::OpenOptions::new()
@@ -409,12 +482,10 @@ mod tests {
         // test regardless of whatever the ambient umask happens to be.
         let _listener = listen(&addr).await.context("listen")?;
 
-        let mode = std::fs::metadata(match &addr {
-            ConnAddr::Uds(path) => path,
-        })?
-        .permissions()
-        .mode()
-            & 0o777;
+        let ConnAddr::Uds(path) = &addr else {
+            unreachable!("uds_path always builds a ConnAddr::Uds")
+        };
+        let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "socket mode must be 0600, set at creation");
         Ok(())
     }
@@ -425,9 +496,10 @@ mod tests {
 
         let dir = tempfile::tempdir()?;
         let addr = uds_path(&dir);
-        let socket_path = match &addr {
-            ConnAddr::Uds(path) => path.clone(),
+        let ConnAddr::Uds(socket_path) = &addr else {
+            unreachable!("uds_path always builds a ConnAddr::Uds")
         };
+        let socket_path = socket_path.clone();
         let _listener = listen(&addr).await.context("listen")?;
 
         let mode = std::fs::metadata(lock_file_path(&socket_path))?.permissions().mode() & 0o777;
