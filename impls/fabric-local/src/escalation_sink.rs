@@ -21,7 +21,7 @@ impl EscalationSink for LogEscalationSink {
     }
 
     async fn notify(&self, message: &EscalationMessage) -> Result<(), EscalationSinkError> {
-        tracing::error!(from = %message.from.0, reason = %message.reason, "sandbox escalation: needs a human");
+        tracing::error!(from = %message.from.0, reason = ?message.reason, "sandbox escalation: needs a human");
         Ok(())
     }
 }

@@ -322,6 +322,11 @@ impl<B: ChannelBackend, A: CapAuthority, S: EscalationSink> EscalationRelay<B, A
     /// blocked behind one undeliverable message, but the failure is never
     /// silent either.
     ///
+    /// On a stream fault the caller must call `run` again to resume: the
+    /// underlying cursor advances on yield, before `deliver` completes, so a
+    /// fault (or cancellation) between those two points loses that envelope
+    /// rather than redelivering it on the next `run`.
+    ///
     /// # Errors
     /// [`RelayError::Channel`] if subscribing fails (missing `read` right, an
     /// unknown membership, …) or the stream itself faults (the backend, not an
