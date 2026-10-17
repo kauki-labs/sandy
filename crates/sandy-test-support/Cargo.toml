@@ -1,5 +1,7 @@
 [package]
 name = "sandy-test-support"
+# Not published: test doubles, used only as a dev-dependency.
+publish = false
 description = "In-memory test doubles for sandy's seam traits, over the sandy-api contract only"
 version.workspace = true
 authors.workspace = true
