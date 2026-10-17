@@ -2211,6 +2211,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandy-executor-proto"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "prost",
+ "prost-build",
+ "protox",
+ "sandy-control-proto",
+ "tokio",
+]
+
+[[package]]
 name = "sandy-fabric"
 version = "0.1.1"
 dependencies = [
@@ -2388,7 +2400,9 @@ dependencies = [
  "getrandom 0.3.4",
  "rusqlite",
  "rustix",
+ "sandy-conn",
  "sandy-control-proto",
+ "sandy-executor-proto",
  "sandy-fabric",
  "sandy-fabric-local",
  "sandy-fsutil",
