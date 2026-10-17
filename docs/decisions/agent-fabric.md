@@ -385,9 +385,14 @@ over that run's channel and cap: re-joining with a cap replays the channel's
 earlier stdin, so neither may be reused across runs (spec §3.4). Known limits of
 the local process backend: a job shares the agent's uid, so it can kill its agent
 (an infra fault, never a result it chose) and, where `ptrace` is open, read the
-agent's memory (the agent marks itself non-dumpable on Linux); on macOS a socket
-pair gets close-on-exec in a second call, so another thread's spawn in the same
-host process can race it. `UnavailableConsole` means #109's
+agent's memory (the agent marks itself non-dumpable on Linux). On macOS a socket
+pair, and std's stdio pipes, get close-on-exec in a second call. The backend
+creates each run's link and spawns under one process-wide lock (#230), so no
+backend spawn inherits another run's link or stdio pipes. Descriptors that other
+code in the same host process creates non-atomically still race a backend spawn
+in either direction. One example is a relay that dials a socket from `on_link`.
+Closing that needs a spawn that inherits only the mapped stdio
+(`POSIX_SPAWN_CLOEXEC_DEFAULT`); see #281. `UnavailableConsole` means #109's
 "break-glass works when the agent is down" positive case is honestly NOT
 demonstrated for the process backend; it is deferred to the VM-backed
 `RawConsole`, tracked separately.

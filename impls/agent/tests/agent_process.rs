@@ -204,6 +204,39 @@ async fn the_job_inherits_only_fresh_stdio_and_never_the_link() -> anyhow::Resul
     Ok(())
 }
 
+/// #230: on macOS the agent link's socket pair gets close-on-exec in a second
+/// call, so a spawn on another thread could inherit a concurrent run's link.
+/// Many agent-mode runs at once: every job still holds only its fresh stdio.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_runs_never_leak_one_link_into_another_job() -> anyhow::Result<()> {
+    const RUNS: usize = 48;
+    let script = "ls /dev/fd | sort -n | tr '\\n' ' '; echo; exit 0";
+    let mut runs = Vec::new();
+    for _ in 0..RUNS {
+        let (channel, agent_cap, _) = channel_and_caps().await?;
+        let (backend, relay) = backend_relaying(&channel, agent_cap);
+        runs.push((run_blocking(backend, sh(script)), relay));
+    }
+    let (outcomes, relays): (Vec<_>, Vec<_>) = runs.into_iter().unzip();
+    let outcomes = timeout(WAIT * 3, futures_util::future::join_all(outcomes)).await?;
+    for (n, (outcome, relay)) in outcomes.into_iter().zip(&relays).enumerate() {
+        let outcome = outcome??;
+        let console = &outcome.console;
+        let fds = console
+            .lines()
+            .find(|l| l.trim_start().starts_with("0 1 2"))
+            .context(format!("run {n}: no fd listing in the console: {console}"))?
+            .split_whitespace()
+            .count();
+        assert_eq!(
+            fds, 4,
+            "run {n}: the job holds more than stdio plus ls's own handle: {console}"
+        );
+        relay_result(relay).await??;
+    }
+    Ok(())
+}
+
 /// Adversarial (INV-1): the job's environment carries no trace of the link or
 /// the cap — exactly what the backend passes, nothing the agent added.
 #[tokio::test(flavor = "multi_thread")]
