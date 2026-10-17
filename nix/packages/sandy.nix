@@ -99,6 +99,17 @@ in
   # feature's tier-3 tests need a hypervisor + network and never run in CI, so
   # measuring them would understate real coverage. Writes an `lcov.info` the CI
   # job uploads; the per-crate summary prints in the build log.
+  #
+  # `daemon_e2e` (sandy-cli's end-to-end daemon suite) is excluded here too
+  # (#233): it shells out to a nested `cargo build -p sandyd` mid-test to
+  # locate a sibling crate's binary, which cannot complete inside this
+  # derivation's hermetic, offline nix sandbox (giving the sandbox build/network
+  # access to make it work would defeat crane's reproducibility, the wrong
+  # direction). This temporarily drops `daemon_e2e` to dev-shell/local-only
+  # coverage until #233's proper fix lands: nix builds `sandyd` as its own
+  # derivation and passes its path in, the same `SANDY_BIN`-env-var pattern
+  # `testsE2eCli` (flake.nix) already uses for `sandy`'s own binary, so the test
+  # reads a pre-built path instead of invoking cargo itself.
   coverage = covCraneLib.cargoLlvmCov (
     commonArgs
     // {
@@ -110,7 +121,7 @@ in
       # install creates $out, so `--output-path $out/lcov.info` hits a missing
       # dir. Create it first.
       preBuild = "mkdir -p \"$out\"";
-      cargoLlvmCovExtraArgs = "--workspace --lcov --output-path $out/lcov.info";
+      cargoLlvmCovExtraArgs = "--workspace --lcov --output-path $out/lcov.info -E 'not binary(daemon_e2e)'";
     }
   );
 }
