@@ -30,6 +30,7 @@ jobs:
     permissions:
       contents: write # create tags and GitHub releases
       pull-requests: write # open/update the release PR
+      id-token: write # crates.io trusted publishing (OIDC token); unlisted perms default to none
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
