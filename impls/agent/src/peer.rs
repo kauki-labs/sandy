@@ -592,6 +592,60 @@ mod tests {
         Ok(())
     }
 
+    /// CodeRabbit on #247: a `recv --wait` whose client went away must neither
+    /// hold the recv slot nor take the next message with it.
+    #[tokio::test]
+    async fn an_abandoned_recv_wait_frees_its_slot_and_keeps_the_message() -> anyhow::Result<()> {
+        let (_dir, socket, tx, _) = server(FakePort::default())?;
+        let mut gone = tokio::net::UnixStream::connect(&socket).await?;
+        gone.write_all(b"{\"op\":\"recv\",\"wait\":true}\n").await?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(gone);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        tx.send(delivery(5)).await?;
+        let reply = timeout(WAIT, ask(&socket, Request::Recv { wait: false })).await??;
+        let Reply::Messages { messages, .. } = reply else {
+            anyhow::bail!("expected messages, got {reply:?}");
+        };
+        let payloads: Vec<Vec<u8>> = messages
+            .iter()
+            .map(|m| B64.decode(&m.payload))
+            .collect::<Result<_, _>>()?;
+        assert_eq!(payloads, [vec![5]], "the abandoned wait swallowed the message");
+        Ok(())
+    }
+
+    /// CodeRabbit on #247: a drain whose reply would pass `MAX_LINE` returns
+    /// what fits and keeps the rest for the next `recv`, losing nothing.
+    #[tokio::test]
+    async fn a_drain_too_big_for_one_reply_keeps_the_rest_for_the_next() -> anyhow::Result<()> {
+        let (_dir, socket, tx, _) = server(FakePort::default())?;
+        for n in 0..6_u8 {
+            tx.send(PeerDelivery {
+                channel: "group-a".to_string(),
+                content_type: "application/octet-stream".to_string(),
+                payload: vec![n; 900 * 1024],
+            })
+            .await?;
+        }
+        let mut got = Vec::new();
+        for _ in 0..6 {
+            let reply = ask(&socket, Request::Recv { wait: false }).await?;
+            let Reply::Messages { messages, .. } = reply else {
+                anyhow::bail!("expected messages, got {reply:?}");
+            };
+            if messages.is_empty() {
+                break;
+            }
+            for m in messages {
+                got.push(B64.decode(&m.payload)?.first().copied().context("empty payload")?);
+            }
+        }
+        assert_eq!(got, [0, 1, 2, 3, 4, 5], "every message arrives once, in order");
+        Ok(())
+    }
+
     #[test]
     fn the_peer_helper_parses_send_and_recv() {
         let args = |v: &[&str]| v.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
