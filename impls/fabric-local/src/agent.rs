@@ -307,11 +307,13 @@ pub struct LinkAgent {
     peer_tx: tokio::sync::mpsc::Sender<PeerDelivery>,
     /// The receiving end, handed out once by [`LinkAgent::take_peer_inbox`].
     peer_inbox: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<PeerDelivery>>>,
+    /// Peer deliveries dropped because the inbox was full.
+    peer_dropped: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// How many peer deliveries wait in the inbox before newer ones are dropped
 /// (with a warning), so a slow consumer never stalls the job's stdin.
-const PEER_INBOX: usize = 1024;
+pub(crate) const PEER_INBOX: usize = 1024;
 
 impl LinkAgent {
     /// Read the cap frame from `link` exactly once, present it in `Join`, and
@@ -395,6 +397,7 @@ impl LinkAgent {
             peers,
             peer_tx,
             peer_inbox: std::sync::Mutex::new(Some(peer_inbox)),
+            peer_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -484,6 +487,12 @@ impl LinkAgent {
             channel: Some(channel.to_string()),
         };
         Ok(write_frame(&mut *self.port.writer.lock().await, &frame).await?)
+    }
+
+    /// How many peer deliveries were dropped because the inbox was full (stub).
+    #[must_use]
+    pub fn peer_dropped(&self) -> u64 {
+        0
     }
 
     /// The receiver for messages on this agent's peer channels; `Some` once.

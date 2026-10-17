@@ -821,6 +821,70 @@ mod tests {
         Ok(())
     }
 
+    /// Overflow policy (#238, infra-f3): a full peer inbox drops the NEWEST
+    /// delivery, so what the job reads is a gap-free, in-order prefix, and every
+    /// drop is counted so a lost peer message is observable, never silent.
+    #[tokio::test]
+    async fn a_full_peer_inbox_drops_the_newest_and_counts_each_drop() -> anyhow::Result<()> {
+        let (channel, agent_cap, _) = channel_and_caps().await?;
+        let (group, agent_peer_cap, sibling_cap) = peer_channel("group-a").await?;
+        let sibling = group.join(&sibling_cap)?;
+        let (agent_end, host_end) = tokio::io::duplex(1 << 20);
+        let grants = vec![PeerGrant {
+            channel: Arc::clone(&group),
+            cap: agent_peer_cap,
+        }];
+        let relay =
+            tokio::spawn(async move { serve_agent_link_with_peers(channel, &agent_cap, grants, host_end).await });
+        let agent = Arc::new(timeout(WAIT, LinkAgent::bootstrap(agent_end)).await??);
+        let mut inbox = agent.take_peer_inbox().context("inbox")?;
+        let (stdout_agent, job_stdout) = tokio::io::duplex(1024);
+        let (stderr_agent, job_stderr) = tokio::io::duplex(1024);
+        let (stdin_agent, _job_stdin) = tokio::io::duplex(1024);
+        let serving = tokio::spawn({
+            let agent = Arc::clone(&agent);
+            async move { agent.serve_tty(stdout_agent, stderr_agent, stdin_agent).await }
+        });
+
+        let capacity = crate::agent::PEER_INBOX;
+        let extra = 5;
+        for n in 0..capacity + extra {
+            group
+                .post(
+                    &sibling,
+                    Some(MessageType::PeerMsg(sandy_proto::PeerMsg {})),
+                    "text/plain",
+                    format!("m{n}").into_bytes(),
+                )
+                .await?;
+        }
+        // Nothing reads the inbox until every delivery has been routed.
+        let dropped = u64::try_from(extra)?;
+        timeout(WAIT, async {
+            while agent.peer_dropped() < dropped {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("the overflow was never counted")?;
+        assert_eq!(agent.peer_dropped(), dropped, "exactly the overflow is dropped");
+        for n in 0..capacity {
+            let got = timeout(WAIT, inbox.recv()).await?.context("inbox closed")?;
+            assert_eq!(
+                got.payload,
+                format!("m{n}").into_bytes(),
+                "the kept messages are the oldest, in order"
+            );
+        }
+        assert!(inbox.try_recv().is_err(), "nothing past the capacity was kept");
+
+        drop((job_stdout, job_stderr));
+        timeout(WAIT, serving).await???;
+        drop(agent);
+        timeout(WAIT, relay).await???;
+        Ok(())
+    }
+
     /// Run the relay with peer grants and drive it as a raw agent through the
     /// setup: the orchestrator join, then each peer join in lockstep.
     async fn raw_agent_with_peers(
