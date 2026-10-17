@@ -29,8 +29,8 @@ use sandy_fabric::{
     contract::{
         ContractViolation, capacity_suite, capauth_suite, channel_backend_suite, discovery_suite, executor_suite,
         fakes::{
-            FakeAuthority, FakeCapacity, FakeDiscovery, FakeLifecycle, FakeMinter, FakeSink, FakeTransport,
-            NonAttenuatingAuthority, SnapshotBackend,
+            ConstantMinter, FakeCapacity, FakeDiscovery, FakeLifecycle, FakeMinter, FakeSink, FakeTransport,
+            SnapshotBackend,
         },
         lifecycle_suite, minter_suite, telemetry_suite, transport_suite,
     },
@@ -41,14 +41,13 @@ use sandy_fabric::{
     transport::Transport,
     types::HostId,
 };
-use sandy_fabric_local::{executor::VmBackendExecutor, inmem::InMem};
+use sandy_fabric_local::{LocalCapAuthority, executor::VmBackendExecutor, inmem::InMem};
 use sha2::{Digest as _, Sha256};
 
 /// Which seams the all-local profile still composes with a placeholder fake,
 /// pending that seam's block landing. A swap PR removes its entry in the same
 /// change that lands the real impl; an empty list is #115's real close signal.
 const FAKED_SEAMS: &[&str] = &[
-    "CapAuthority",  // pending #110
     "Minter",        // pending #111
     "Discovery",     // pending #112 (static registry)
     "Capacity",      // pending #112 (direct probe)
@@ -67,6 +66,13 @@ fn faked_seams_is_not_empty_yet() {
         !FAKED_SEAMS.is_empty(),
         "every seam is real: #115 can close for real, starting with the actual scenario test"
     );
+}
+
+/// The all-local profile's `CapAuthority` slot (real, #110). `capauth_suite`
+/// always mints with an explicit `expires_at`, so `default_ttl` is never
+/// actually exercised here — the value just has to be sane.
+fn local_cap_authority() -> LocalCapAuthority {
+    LocalCapAuthority::new(std::time::Duration::from_secs(300)).expect("rng available for a fresh authority")
 }
 
 /// A fresh timeout future for `channel_backend_suite`'s stream-wait steps (its
@@ -156,7 +162,7 @@ fn process_capabilities() -> Capabilities {
 /// The all-local profile's current real/fake mix (see [`FAKED_SEAMS`]).
 async fn validate_all_local_profile() -> Result<(), ContractViolation> {
     validate_profile(
-        FakeAuthority::new,
+        local_cap_authority,
         FakeMinter::new,
         InMem::default,
         FakeTransport::default,
@@ -188,7 +194,7 @@ async fn the_all_local_profile_passes_its_own_gate() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn gate_rejects_a_broken_channel_backend_even_though_its_slot_is_real() -> anyhow::Result<()> {
     let result = validate_profile(
-        FakeAuthority::new,
+        local_cap_authority,
         FakeMinter::new,
         SnapshotBackend::default,
         FakeTransport::default,
@@ -217,16 +223,15 @@ async fn gate_rejects_a_broken_channel_backend_even_though_its_slot_is_real() ->
     Ok(())
 }
 
-/// Adversarial: swapping a still-PLACEHOLDER seam (`CapAuthority`) for a
-/// broken variant also fails the gate — proving it's uniform regardless of a
-/// slot's current real/fake status, not just for seams that happen to be real
-/// yet. `NonAttenuatingAuthority` hands back the parent cap unchanged instead
-/// of narrowing it.
+/// Adversarial: swapping a still-PLACEHOLDER seam (`Minter`) for a broken
+/// variant also fails the gate — proving it's uniform regardless of a slot's
+/// current real/fake status, not just for seams that happen to be real yet.
+/// `ConstantMinter` mints the same secret every call.
 #[tokio::test(flavor = "multi_thread")]
-async fn gate_rejects_a_broken_cap_authority_even_though_its_slot_is_a_placeholder() -> anyhow::Result<()> {
+async fn gate_rejects_a_broken_minter_even_though_its_slot_is_a_placeholder() -> anyhow::Result<()> {
     let result = validate_profile(
-        || NonAttenuatingAuthority(FakeAuthority::new()),
-        FakeMinter::new,
+        local_cap_authority,
+        || ConstantMinter,
         InMem::default,
         FakeTransport::default,
         || VmBackendExecutor::new(ProcessBackend::new()),
@@ -245,10 +250,10 @@ async fn gate_rejects_a_broken_cap_authority_even_though_its_slot_is_a_placehold
     .await;
     let violation = result
         .err()
-        .context("attenuation that doesn't narrow rights must fail the gate")?;
+        .context("a minter with a constant secret must fail the gate")?;
     assert!(
-        violation.rule.contains("narrowed rights"),
-        "violated `{}`, expected the narrowed-rights rule",
+        violation.rule.contains("two mints for one job differ"),
+        "violated `{}`, expected the fresh-mint rule",
         violation.rule
     );
     Ok(())
