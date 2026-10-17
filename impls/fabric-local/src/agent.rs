@@ -84,6 +84,13 @@ pub enum AgentError {
     /// across calls.
     #[error("serve_tty already called on this agent; one job per bootstrap")]
     AlreadyServed,
+    /// The relay refused this agent's join over the link (#216): a forged,
+    /// expired, or wrong-channel cap. The job must not be started.
+    #[error("the relay refused the join: {0}")]
+    Refused(String),
+    /// The agent link faulted or broke protocol.
+    #[error("agent link: {0}")]
+    Link(#[from] crate::link::LinkError),
 }
 
 /// The per-sandbox gateway: holds the orchestrator-channel membership this
@@ -227,6 +234,43 @@ impl<B: ChannelBackend + 'static, A: CapAuthority + 'static> SandboxAgent<B, A> 
             stderr_abort.abort();
         }
         result
+    }
+}
+
+/// The sandbox agent as its own OS process (#216): bootstraps over the agent
+/// link from the orchestrator-side relay ([`crate::link::serve_agent_link`])
+/// instead of holding the channel, then bridges the job's stdio the same way
+/// [`SandboxAgent`] does.
+pub struct LinkAgent {
+    _private: (),
+}
+
+impl LinkAgent {
+    /// Read the cap frame from `link` exactly once, present it in `Join`, and
+    /// wait for the relay's verdict.
+    ///
+    /// # Errors
+    /// [`AgentError::Refused`] if the relay refuses the join,
+    /// [`AgentError::Link`] if the link faults or the relay breaks protocol.
+    pub async fn bootstrap<L>(_link: L) -> Result<Self, AgentError>
+    where
+        L: AsyncRead + AsyncWrite + Send + 'static,
+    {
+        Err(AgentError::Refused("not implemented".to_string()))
+    }
+
+    /// Bridge the job's stdio over the link until `job_stdout` hits EOF, with
+    /// the same semantics as [`SandboxAgent::serve_tty`].
+    ///
+    /// # Errors
+    /// As [`SandboxAgent::serve_tty`], with link faults as [`AgentError::Link`].
+    pub async fn serve_tty(
+        &self,
+        _job_stdout: impl AsyncRead + Unpin + Send + 'static,
+        _job_stderr: impl AsyncRead + Unpin + Send + 'static,
+        _job_stdin: impl AsyncWrite + Unpin + Send + 'static,
+    ) -> Result<(), AgentError> {
+        Err(AgentError::Refused("not implemented".to_string()))
     }
 }
 

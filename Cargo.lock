@@ -2138,6 +2138,7 @@ dependencies = [
  "sandy-fabric",
  "sandy-fsutil",
  "sandy-proto",
+ "serde",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",

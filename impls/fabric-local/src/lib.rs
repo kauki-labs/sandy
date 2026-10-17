@@ -11,6 +11,7 @@ pub mod agent;
 pub mod channel;
 pub mod executor;
 pub mod inmem;
+pub mod link;
 pub mod minter;
 pub mod placement;
 pub mod roles;
