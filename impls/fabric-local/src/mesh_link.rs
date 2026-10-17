@@ -193,6 +193,8 @@ mod tests {
             &mut orchestrator_side,
             &LinkFrame::Cap {
                 cap: "deadbeef".to_string(),
+                channel: None,
+                peers: 0,
             },
         )
         .await?;
@@ -202,7 +204,9 @@ mod tests {
         assert_eq!(
             forwarded_cap,
             LinkFrame::Cap {
-                cap: "deadbeef".to_string()
+                cap: "deadbeef".to_string(),
+                channel: None,
+                peers: 0,
             }
         );
 
@@ -211,6 +215,7 @@ mod tests {
             &mut agent_side,
             &LinkFrame::Join {
                 cap: "deadbeef".to_string(),
+                channel: None,
             },
         )
         .await?;
@@ -220,7 +225,8 @@ mod tests {
         assert_eq!(
             forwarded_join,
             LinkFrame::Join {
-                cap: "deadbeef".to_string()
+                cap: "deadbeef".to_string(),
+                channel: None,
             }
         );
 
