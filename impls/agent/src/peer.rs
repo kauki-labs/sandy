@@ -342,6 +342,7 @@ fn run_cli(args: &[std::ffi::OsString]) -> Result<(), String> {
 mod tests {
     use std::sync::Mutex as StdMutex;
 
+    use anyhow::Context;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         sync::mpsc,
@@ -488,27 +489,73 @@ mod tests {
         Ok(())
     }
 
-    /// One client at a time: a second connection while one is open is closed
-    /// without a reply, and the client helper retries until it gets through.
+    /// sandy-b6 / infra-f3 on #247: a long poll must not starve sends. With a
+    /// `recv --wait` blocked on an empty inbox, a send still goes through.
     #[tokio::test]
-    async fn a_second_connection_is_closed_while_one_is_open() -> anyhow::Result<()> {
-        let (_dir, socket, ..) = server(FakePort::default())?;
-        let mut first = tokio::net::UnixStream::connect(&socket).await?;
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    async fn a_send_goes_through_while_a_recv_waits() -> anyhow::Result<()> {
+        let (_dir, socket, tx, port) = server(FakePort::default())?;
+        let waiting = tokio::spawn({
+            let socket = socket.clone();
+            async move { ask(&socket, Request::Recv { wait: true }).await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!waiting.is_finished(), "precondition: the recv is blocked");
+
+        let sent = timeout(
+            Duration::from_secs(2),
+            ask(
+                &socket,
+                Request::Send {
+                    channel: "group-a".to_string(),
+                    content_type: "text/plain".to_string(),
+                    payload: B64.encode(b"while-polling"),
+                },
+            ),
+        )
+        .await
+        .context("a send was starved by the blocked recv")??;
+        assert_eq!(sent, Reply::Sent);
+        assert_eq!(
+            port.posted
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1
+        );
+
+        tx.send(delivery(9)).await?;
+        let reply = timeout(WAIT, waiting).await???;
+        assert!(
+            matches!(reply, Reply::Messages { ref messages, .. } if messages.len() == 1),
+            "got {reply:?}"
+        );
+        Ok(())
+    }
+
+    /// Delivery stays unambiguous: a second recv while one waits is closed
+    /// unanswered, and the retrying client gets through once the first is done.
+    #[tokio::test]
+    async fn a_second_recv_is_refused_while_one_waits() -> anyhow::Result<()> {
+        let (_dir, socket, tx, _) = server(FakePort::default())?;
+        let waiting = tokio::spawn({
+            let socket = socket.clone();
+            async move { ask(&socket, Request::Recv { wait: true }).await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
         let mut second = tokio::net::UnixStream::connect(&socket).await?;
-        let mut buf = [0_u8; 1];
-        let read = timeout(WAIT, second.read(&mut buf)).await??;
-        assert_eq!(read, 0, "the second connection must be closed at once");
+        second.write_all(b"{\"op\":\"recv\"}\n").await?;
+        let mut reply = String::new();
+        timeout(WAIT, second.read_to_string(&mut reply)).await??;
+        assert!(reply.is_empty(), "a second recv must be closed unanswered, got {reply}");
 
         let retried = tokio::spawn({
             let socket = socket.clone();
             async move { ask(&socket, Request::Recv { wait: false }).await }
         });
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        first.write_all(b"{\"op\":\"recv\"}\n").await?;
-        let mut line = String::new();
-        first.read_to_string(&mut line).await?;
-        assert!(line.contains("messages"), "the open connection is served: {line}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        tx.send(delivery(4)).await?;
+        timeout(WAIT, waiting).await???;
         let reply = timeout(WAIT, retried).await???;
         assert!(
             matches!(reply, Reply::Messages { .. }),
