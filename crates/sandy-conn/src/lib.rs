@@ -101,16 +101,24 @@ async fn bind_uds(path: &Path) -> Result<UnixListener, ConnError> {
     // unlinks and rebinds that path, which a lock ON it wouldn't survive.
     let lock_path = lock_file_path(path);
     let _lock = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
+        use std::os::unix::fs::OpenOptionsExt;
+        // mode(0o600): a world-readable lockfile lets another local user open
+        // it and take LOCK_EX, blocking every future listen() here (CWE-59,
+        // availability, not data exposure — the file holds no content).
+        // NOFOLLOW: refuse a symlink planted at the lockfile path for the
+        // same reason the socket path itself is checked above.
         let file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(false)
+            .mode(0o600)
+            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
             .open(&lock_path)?;
         fs2::FileExt::lock_exclusive(&file)?;
         Ok(file)
     })
     .await
-    .expect("lock task panicked")?;
+    .map_err(std::io::Error::other)??;
 
     bind_uds_locked(path).await
     // _lock drops here, releasing the flock — held only for this function's
@@ -408,6 +416,25 @@ mod tests {
         .mode()
             & 0o777;
         assert_eq!(mode, 0o600, "socket mode must be 0600, set at creation");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_lockfile_is_mode_0600() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir()?;
+        let addr = uds_path(&dir);
+        let socket_path = match &addr {
+            ConnAddr::Uds(path) => path.clone(),
+        };
+        let _listener = listen(&addr).await.context("listen")?;
+
+        let mode = std::fs::metadata(lock_file_path(&socket_path))?.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a world-readable lockfile lets another user block our flock (CWE-59)"
+        );
         Ok(())
     }
 
