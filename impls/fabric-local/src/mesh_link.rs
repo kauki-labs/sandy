@@ -15,6 +15,9 @@
 //! `sandy-impls-local` only has to absorb a busy local relay, not a mesh
 //! hop).
 
+use std::net::SocketAddr;
+
+use sandy_conn::ConnAddr;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::link::{LinkError, LinkFrame, read_frame, write_frame};
@@ -157,6 +160,44 @@ impl Drop for AbortOnDrop {
             handle.abort();
         }
     }
+}
+
+/// A [`dial_and_forward`] failure: dialing the orchestrator, or the link
+/// itself once dialed.
+#[derive(Debug, thiserror::Error)]
+pub enum DialAndForwardError {
+    /// Dialing the orchestrator's mesh address failed.
+    #[error("dialing the orchestrator: {0}")]
+    Dial(#[from] sandy_conn::ConnError),
+    /// The link itself failed — see [`forward_agent_link`].
+    #[error("agent link: {0}")]
+    Link(#[from] LinkError),
+}
+
+/// The executor-host entry point for #159's cross-machine hop: dial the
+/// orchestrator's mesh address, hand the connection and `prefix` to
+/// [`forward_agent_link`] along with `local` (the agent's own link end).
+///
+/// `prefix` is opaque here too, same as in [`forward_agent_link`] — the
+/// run-id+token encoding and its enforcement are the orchestrator's accept
+/// loop's concern (decision 6), not this function's.
+///
+/// # Errors
+/// [`DialAndForwardError::Dial`] if the mesh dial itself fails (the
+/// orchestrator is unreachable, refuses the TCP connection, …);
+/// [`DialAndForwardError::Link`] for any failure inside the link once
+/// dialed — though in the ordinary run of things `forward_agent_link`
+/// resolves a [`ForwardedVerdict`] rather than erroring, see its own docs.
+pub async fn dial_and_forward<L>(
+    orchestrator: SocketAddr,
+    local: L,
+    prefix: &[u8],
+) -> Result<ForwardedVerdict, DialAndForwardError>
+where
+    L: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    let remote = sandy_conn::connect(&ConnAddr::Tcp(orchestrator)).await?;
+    Ok(forward_agent_link(local, remote, prefix).await?)
 }
 
 #[cfg(test)]
@@ -359,6 +400,71 @@ mod tests {
             saw_eof,
             "a cancelled forward_agent_link must close the orchestrator's connection, not leak it"
         );
+        Ok(())
+    }
+
+    /// The real executor-side entry point, over an actual TCP dial (not an
+    /// in-memory duplex pair, unlike the tests above) — the first test
+    /// proving the TCP tier and `forward_agent_link` compose end to end, the
+    /// way the real macOS↔WS01 hop will.
+    #[tokio::test]
+    async fn dial_and_forward_resolves_job_exited_over_a_real_tcp_dial() -> anyhow::Result<()> {
+        let listener = sandy_conn::listen(&ConnAddr::Tcp("127.0.0.1:0".parse()?))
+            .await
+            .context("listen")?;
+        let orchestrator_addr = listener.local_addr().context("local_addr")?;
+
+        let orchestrator = tokio::spawn(async move {
+            let (mut orchestrator_side, _peer) = listener.accept().await?;
+            expect_prefix(&mut orchestrator_side, PREFIX).await?;
+            write_frame(
+                &mut orchestrator_side,
+                &LinkFrame::Cap {
+                    cap: "deadbeef".to_string(),
+                    channel: None,
+                    peers: 0,
+                },
+            )
+            .await?;
+            read_frame(&mut orchestrator_side).await?.context("expected Join")?;
+            read_frame(&mut orchestrator_side).await?.context("expected Exit")?;
+            Ok::<_, anyhow::Error>(())
+        });
+
+        let (agent_conn, mut agent_side) = tokio::io::duplex(4096);
+        let forwarder = tokio::spawn(dial_and_forward(orchestrator_addr, agent_conn, PREFIX));
+
+        let cap_frame = read_frame(&mut agent_side)
+            .await?
+            .context("agent should see the Cap frame")?;
+        assert_eq!(
+            cap_frame,
+            LinkFrame::Cap {
+                cap: "deadbeef".to_string(),
+                channel: None,
+                peers: 0,
+            }
+        );
+        write_frame(
+            &mut agent_side,
+            &LinkFrame::Join {
+                cap: "deadbeef".to_string(),
+                channel: None,
+            },
+        )
+        .await?;
+        write_frame(&mut agent_side, &LinkFrame::Exit { code: 3 }).await?;
+
+        let verdict = tokio::time::timeout(Duration::from_secs(2), forwarder)
+            .await
+            .context("dial_and_forward did not resolve")?
+            .context("forwarder task panicked")??;
+        assert_eq!(verdict, ForwardedVerdict::JobExited(3));
+
+        tokio::time::timeout(Duration::from_secs(2), orchestrator)
+            .await
+            .context("the fake orchestrator did not finish")?
+            .context("orchestrator task panicked")??;
         Ok(())
     }
 }
