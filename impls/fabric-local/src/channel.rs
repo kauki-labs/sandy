@@ -103,6 +103,15 @@ struct MembershipState {
     // it), so a second stream's waker would otherwise silently overwrite the
     // first's — leaving the first parked forever on `leave()`, exactly the
     // hang this whole mechanism exists to close, just for that stream.
+    //
+    // Known, bounded leak traded for that fix (#225): nothing removes an
+    // entry when its `CursorStream` is dropped mid-`Pending` — the documented
+    // drop-and-resubscribe reconnect pattern accumulates one dead `Waker` per
+    // reconnect, cleared only when `leave()` drains the whole `Vec`. Low
+    // severity (wakers are cheap; membership is `CapAuthority`-gated, so not
+    // externally amplifiable; `leave()`'s wake loop just wastes a little work
+    // on stale entries) but real for a long-lived membership that reconnects
+    // many times. #225 tracks a `Drop` impl that deregisters properly.
     wakers: Vec<Waker>,
 }
 
