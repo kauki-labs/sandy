@@ -109,7 +109,7 @@ pub trait PeerPort: Send + Sync + 'static {
 /// Serve the job's peer requests on `listener` until it is dropped.
 pub async fn serve_peers<P: PeerPort>(listener: UnixListener, port: Arc<P>, inbox: Receiver<PeerDelivery>) {
     let inbox = Arc::new(Mutex::new(inbox));
-    let busy = Arc::new(AtomicBool::new(false));
+    let slots = Arc::new(Slots::default());
     loop {
         let conn = match listener.accept().await {
             Ok((conn, _)) => conn,
@@ -118,34 +118,62 @@ pub async fn serve_peers<P: PeerPort>(listener: UnixListener, port: Arc<P>, inbo
                 return;
             }
         };
-        // One client at a time: a second connection is closed unanswered, and
-        // the client helper retries.
-        if busy.swap(true, Ordering::SeqCst) {
-            drop(conn);
-            continue;
-        }
-        let (port, inbox, busy) = (Arc::clone(&port), Arc::clone(&inbox), Arc::clone(&busy));
+        let (port, inbox, slots) = (Arc::clone(&port), Arc::clone(&inbox), Arc::clone(&slots));
         tokio::spawn(async move {
-            if let Err(e) = handle(conn, &*port, &inbox).await {
+            if let Err(e) = handle(conn, &*port, &inbox, &slots).await {
                 eprintln!("sandy-agent: peer request failed: {e}");
             }
-            busy.store(false, Ordering::SeqCst);
         });
     }
 }
 
-/// Answer one connection's one request.
+/// One `recv` and one `send` at a time, independently: a long-polling recv
+/// never starves a send, and a second concurrent recv is refused so delivery
+/// stays unambiguous.
+#[derive(Default)]
+struct Slots {
+    recv: AtomicBool,
+    send: AtomicBool,
+}
+
+/// Holds a slot for one request, releasing it on every path out.
+struct SlotGuard<'a>(&'a AtomicBool);
+
+impl Drop for SlotGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// How long a connection may take to send its request line.
+const REQUEST_WAIT: Duration = Duration::from_secs(10);
+
+/// Answer one connection's one request, if its slot is free; otherwise close
+/// it unanswered so the client helper retries.
 async fn handle<P: PeerPort>(
     conn: tokio::net::UnixStream,
     port: &P,
     inbox: &Mutex<Receiver<PeerDelivery>>,
+    slots: &Slots,
 ) -> io::Result<()> {
     let (rd, mut wr) = conn.into_split();
     let mut line = String::new();
-    tokio::io::BufReader::new(rd.take(MAX_LINE as u64))
-        .read_line(&mut line)
-        .await?;
-    let reply = match serde_json::from_str::<Request>(line.trim()) {
+    let mut reader = tokio::io::BufReader::new(rd.take(MAX_LINE as u64));
+    tokio::time::timeout(REQUEST_WAIT, reader.read_line(&mut line))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no request line"))??;
+    let request = serde_json::from_str::<Request>(line.trim());
+    let slot = match &request {
+        Ok(Request::Recv { .. }) => Some(&slots.recv),
+        Ok(Request::Send { .. }) => Some(&slots.send),
+        Err(_) => None,
+    };
+    let _held = match slot {
+        Some(slot) if slot.swap(true, Ordering::SeqCst) => return Ok(()),
+        Some(slot) => Some(SlotGuard(slot)),
+        None => None,
+    };
+    let reply = match request {
         Err(e) => Reply::Error {
             error: format!("malformed request: {e}"),
         },

@@ -121,6 +121,8 @@ where
         [] => None,
         _ => Some(peer::start(&agent).map_err(|e| format!("starting the peer socket: {e}"))?),
     };
+    // Removed on every path out, a failed bridge included.
+    let _peer_dir_cleanup = peer_dir.clone().map(RemoveDirOnDrop);
 
     let (program, args) = job.split_first().ok_or("empty job argv")?;
     let mut command = tokio::process::Command::new(program);
@@ -151,16 +153,22 @@ where
         return Err(format!("bridging the job's stdio: {e}"));
     }
     let status = child.wait().await.map_err(|e| format!("waiting on the job: {e}"))?;
-    if let Some(dir) = &peer_dir
-        && let Err(e) = std::fs::remove_dir_all(dir)
-    {
-        eprintln!("sandy-agent: removing the peer socket dir: {e}");
-    }
     agent
         .report_exit(i32::from(exit_code(status)))
         .await
         .map_err(|e| format!("reporting the job's exit: {e}"))?;
     Ok(status)
+}
+
+/// Removes the peer socket's private dir when dropped.
+struct RemoveDirOnDrop(std::path::PathBuf);
+
+impl Drop for RemoveDirOnDrop {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.0) {
+            eprintln!("sandy-agent: removing the peer socket dir: {e}");
+        }
+    }
 }
 
 /// Keep the cap out of reach of the same-uid job where the platform allows:
