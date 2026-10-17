@@ -2239,6 +2239,7 @@ dependencies = [
  "sandy-api",
  "sandy-fsutil",
  "sandy-lib",
+ "tempfile",
  "tracing",
  "uuid",
 ]
