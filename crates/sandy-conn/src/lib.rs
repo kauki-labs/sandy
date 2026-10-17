@@ -303,6 +303,29 @@ mod tests {
         Ok(())
     }
 
+    /// Precise version of the assertion above: the accepted `PeerAddr` must be
+    /// exactly the dialing side's own bound address (ip *and* port), not just
+    /// the right IP. Dials with a raw `TcpStream` directly (not `connect()`,
+    /// which returns `Box<dyn Conn>` with no `local_addr()`) so the dialer's
+    /// own address is available to compare against.
+    #[tokio::test]
+    async fn tcp_accept_reports_exactly_the_dialers_bound_address() -> anyhow::Result<()> {
+        let listener = listen(&ConnAddr::Tcp("127.0.0.1:0".parse()?)).await.context("listen")?;
+        let bound = listener.local_addr().context("local_addr")?;
+
+        let (accept_result, dial_result) = tokio::join!(listener.accept(), tokio::net::TcpStream::connect(bound));
+        let (_accepted, peer) = accept_result?;
+        let dialed = dial_result.context("dial")?;
+        let dialer_addr = dialed.local_addr().context("dialed.local_addr")?;
+
+        assert_eq!(
+            peer,
+            PeerAddr::Tcp(dialer_addr),
+            "the accepted peer must match the dialer's own bound address exactly"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn tcp_connecting_with_nothing_listening_fails_cleanly() -> anyhow::Result<()> {
         // Port 0 never has a real listener behind it as a dial target; a
