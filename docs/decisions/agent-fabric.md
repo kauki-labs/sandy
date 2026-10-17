@@ -292,6 +292,19 @@ job holding it could post as the agent.
   only `TTY_STDOUT`/`TTY_STDERR`; the relay delivers `TTY_STDIN`. The cap is never
   a staged file: the guest's login shell exports every file under
   `/run/sandy/secrets` into the job's environment (#177).
+- In a VM (#238) the link is one vsock stream. The agent is baked into the
+  guest image; the topology names its store path (`agent_program`). The console
+  launches it as `agent --vsock-listen 5000 -- sh -c <job>`, and the host
+  connects to it, never the other way round, so the relay only ever dials its own
+  VM. The agent accepts the first connection from the host (CID 2), rejecting any
+  other peer while it keeps listening, closes the listener, and writes one ready
+  byte before the relay writes the cap, because vfkit accepts the host's socket
+  before it dials the guest. vfkit exposes the port as a per-run unix socket in
+  the private staging base (`connect` mode); the qemu leg connects over
+  `AF_VSOCK` to a CID it claims by launching. In step 1 secrets keep reaching the
+  job through the guest's login-shell export, and the agent passes that
+  environment through unchanged; #177 replaces the export with an agent-owned
+  allowlist.
 - The job never inherits the link: the agent keeps a close-on-exec duplicate,
   points its own stdin at `/dev/null`, and gives the job fresh pipes. Its
   environment is the backend's, unchanged.
