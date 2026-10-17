@@ -1,40 +1,44 @@
 # release-plz configuration. The workflow (.github/workflows/release.yaml) runs
-# two commands on every push to main:
+# on every push to main:
 #
-#   release-plz release-pr  opens/updates a PR that bumps the workspace version
-#                           and the changelogs. Merge it to cut a release.
-#   release-plz release     for each crate whose Cargo.toml version has no git
-#                           tag yet, creates the tag + GitHub release, in
-#                           dependency order (sandy-lib -> sandy-backend ->
-#                           sandy-cli -> ...). Does NOT publish to crates.io
-#                           (see `publish` below).
+#   release-plz release-pr  opens/updates a PR that bumps versions + changelogs.
+#                           Merge it to cut a release.
+#   release-plz release     creates the tag + GitHub release for each crate whose
+#                           Cargo.toml version has no git tag yet. With the config
+#                           below, only the binaries are tagged/released.
 #
-# So a version bump reaching main is what triggers the tag + release.
+# Releases are PER BINARY, not per crate: only sandy-cli, sandyd, and sandy-agent
+# get a tag + GitHub release. Library crates are versioned for dependency
+# resolution but are never released or tagged on their own. A binary's MAJOR
+# version must track sandy-lib's major — enforced by the binary-version-alignment
+# check in .github/workflows/pr.yaml.
 
 [workspace]
-# A GitHub release per published crate, and a changelog kept in each crate.
+# Default for library crates: no standalone tag or GitHub release.
+git_release_enable = false
+git_tag_enable = false
+# The released binaries still need generated notes: github-release.yaml only
+# reacts to operator-pushed v*/m* tags, not release-plz's own per-binary tags.
+git_release_generate_notes = true
+# Operator decision (#158): GitHub releases only for now, no crates.io publishing.
+publish = false
+# git tags are the version source of truth (nothing reaches crates.io).
+git_only = true
+# Releases are driven by an intentional version bump, not lockfile churn.
+dependencies_update = false
+
+# --- Binaries: released and tagged independently, each on its own version. ---
+[[package]]
+name = "sandy-cli"
 git_release_enable = true
 git_tag_enable = true
-# release-plz's own auto-created releases (one per crate, on a version bump)
-# have no generated notes without this — the new github-release.yaml workflow
-# only reacts to operator-pushed v*/m* tags, never to release-plz's own
-# per-crate tags, so it can't backfill notes here. CodeRabbit's catch.
-git_release_generate_notes = true
-# Operator decision (#158): GitHub releases only for now, no crates.io
-# publishing. release-plz's own publish step is the only thing in this repo
-# that would otherwise run `cargo publish`, so disabling it here is enough —
-# no per-crate Cargo.toml `publish = false` needed. Revisit once the operator
-# decides to publish.
-publish = false
-# Paired with `publish` above: without this, release-plz still asks the cargo
-# registry what the latest released version is to decide whether a bump is new
-# (per its own docs). Since nothing ever reaches crates.io now, that check would
-# never see a release and release-plz would keep proposing/re-tagging an
-# already-tagged version. `git_only` makes git tags the version source of truth
-# instead, which matches reality now that the registry never does.
-git_only = true
-# Don't open bump PRs just because a dependency updated; releases are driven by
-# an intentional version bump, not by lockfile churn.
-dependencies_update = false
-# The three crates inherit `version.workspace = true`, so they are always on one
-# shared number and publish together: a bump moves the single workspace version.
+
+[[package]]
+name = "sandyd"
+git_release_enable = true
+git_tag_enable = true
+
+[[package]]
+name = "sandy-agent"
+git_release_enable = true
+git_tag_enable = true

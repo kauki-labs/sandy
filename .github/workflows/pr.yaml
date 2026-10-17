@@ -95,6 +95,26 @@ jobs:
             echo "$bad"
             exit 1
           fi
+  binary-versions:
+    # Release-model invariant (release-plz.toml): releases are per-binary, and each
+    # binary's MAJOR version must track sandy-lib's major so "sandy-cli 2.x" is
+    # known to build on "sandy 2.x". Enforced here so it can't silently drift.
+    name: Binary version alignment
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          disable-sudo: true
+          egress-policy: audit
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check each binary's major matches sandy-lib
+        run: python3 scripts/ci/check-binary-major.py
   checks:
     name: Check
     runs-on: ubuntu-24.04
@@ -265,6 +285,7 @@ jobs:
       - validate-pr-title
       - label
       - release-diff-scope
+      - binary-versions
       - checks
       - coverage
       - package
