@@ -53,7 +53,7 @@ use std::{
     io::Read,
     os::{fd::OwnedFd, unix::process::ExitStatusExt},
     path::Path,
-    process::{Command, Stdio},
+    process::Command,
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering},
@@ -61,7 +61,6 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use command_group::CommandGroup;
 use sandy::{
     BackendError, BoxState, Containment, ContainmentStatus, Mount, NoContainment, Outcome, ResourceLimits, RunSpec,
     SandboxKind, ShareDirs, VmBackend, collect_outputs, ensure_sandy_staging_base, plan_shares, wipe,
@@ -303,23 +302,16 @@ impl ProcessBackend {
             }
             None => (None, None),
         };
-        command
-            .stdin(agent_end.map_or_else(Stdio::null, Stdio::from))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
         // Spawn the child as the leader of a NEW process group so a timeout or
-        // teardown reaps the whole group. command-group encapsulates the
-        // setpgid/killpg; sandy's crates stay forbid(unsafe_code).
-        let mut child = match command.group_spawn() {
+        // teardown reaps the whole group; on Apple only stdio reaches it (#281).
+        // Spawning consumes the command and the agent end, closing this
+        // process's copy so the relay sees EOF once the agent exits.
+        let mut child = match crate::job::spawn_job(command, agent_end) {
             Ok(child) => child,
             // A spawn fault is infra (band 3, retryable), not a run result.
             Err(err) => return Err(BackendError::Spawn(format!("spawn `{job_program}`: {err}"))),
         };
         drop(spawn_guard);
-        // Close this process's copy of the agent end (held by the Command), so the
-        // relay sees EOF once the agent exits.
-        drop(command);
 
         self.registry()?.push(BoxState {
             box_id: box_id.clone(),
@@ -330,8 +322,8 @@ impl ProcessBackend {
         });
 
         // Drain both pipes on threads so a chatty child never blocks on a full pipe.
-        let out_drain = child.inner().stdout.take().map(drain);
-        let err_drain = child.inner().stderr.take().map(drain);
+        let out_drain = child.take_stdout().map(drain);
+        let err_drain = child.take_stderr().map(drain);
 
         // Hand the relay its end of the agent link, with the console already
         // draining so a slow on_link cannot stall the agent's output. A panic in
@@ -645,6 +637,54 @@ mod tests {
             "a non-zero exit is not a transport fault"
         );
         assert!(!outcome.timed_out, "the job completed, it did not time out");
+        Ok(())
+    }
+
+    /// #281 parity with std's spawn: a bare program name is looked up on the
+    /// job's PATH (its `spec.env` may override it), not on this process's.
+    #[test]
+    fn a_bare_program_is_found_on_the_jobs_own_path() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let tools = tempfile::tempdir()?;
+        let tool = tools.path().join("sandy-only-here");
+        std::fs::write(&tool, "#!/bin/sh\necho found-on-job-path\n")?;
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755))?;
+        let grants = no_grants();
+        let command = ["sandy-only-here".to_string()];
+        let env = [("PATH".to_string(), format!("{}:/usr/bin:/bin", tools.path().display()))];
+        let spec = RunSpec {
+            env: &env,
+            ..run_spec(&command, &grants, 30)
+        };
+
+        let outcome = ProcessBackend::new().run(&spec)?;
+
+        assert_eq!(outcome.guest_exit, Some(0), "console: {}", outcome.console);
+        assert!(
+            outcome.console.contains("found-on-job-path"),
+            "console: {}",
+            outcome.console
+        );
+        Ok(())
+    }
+
+    /// #281 parity with std's spawn: the job starts with SIGPIPE at its default
+    /// (this test process ignores it, as every Rust program does), so a writer
+    /// into a closed pipe dies quietly instead of reporting "Broken pipe".
+    #[test]
+    fn the_job_starts_with_sigpipe_at_its_default() -> anyhow::Result<()> {
+        let grants = no_grants();
+        let command = ["sh".to_string(), "-c".to_string(), "yes | head -n1".to_string()];
+        let spec = run_spec(&command, &grants, 30);
+
+        let outcome = ProcessBackend::new().run(&spec)?;
+
+        assert_eq!(outcome.guest_exit, Some(0), "console: {}", outcome.console);
+        assert!(
+            !outcome.console.to_lowercase().contains("broken pipe"),
+            "the job inherited an ignored SIGPIPE: {}",
+            outcome.console
+        );
         Ok(())
     }
 

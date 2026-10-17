@@ -2298,6 +2298,8 @@ version = "0.1.1"
 dependencies = [
  "anyhow",
  "command-group",
+ "nix 0.31.3",
+ "rustix",
  "sandy-api",
  "sandy-fsutil",
  "sandy-lib",
