@@ -2335,6 +2335,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandy-orchestrator"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "sandy-fabric",
+ "sandy-fabric-local",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "sandy-proto"
 version = "0.1.1"
 dependencies = [
