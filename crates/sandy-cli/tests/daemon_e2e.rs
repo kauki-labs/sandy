@@ -228,9 +228,9 @@ fn status_of_an_unknown_job_is_invalid_plan_not_a_crash() -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Adversarial (#212/#205): `attach` must surface the daemon's honest refusal
-/// (no orchestrator core wired up yet) rather than printing a channel as if
-/// one existed.
+/// Adversarial (#212/#205): `attach` on a job id that was never submitted
+/// must surface the daemon's honest refusal rather than printing a channel
+/// as if one existed.
 #[test]
 fn attach_surfaces_the_daemons_honest_refusal_not_a_fabricated_channel() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir().context("temp dir")?;
@@ -239,7 +239,7 @@ fn attach_surfaces_the_daemons_honest_refusal_not_a_fabricated_channel() -> anyh
     let attach = sandy(&daemon, &["daemon", "attach", "some-job"])?;
     assert_eq!(attach.status.code(), Some(2), "stderr: {}", stderr_of(&attach));
     assert!(
-        stderr_of(&attach).contains("not yet dispatchable"),
+        stderr_of(&attach).contains("no such job"),
         "stderr must carry the daemon's real refusal: {}",
         stderr_of(&attach)
     );

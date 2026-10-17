@@ -2376,6 +2376,8 @@ dependencies = [
  "rusqlite",
  "rustix",
  "sandy-control-proto",
+ "sandy-fabric",
+ "sandy-fabric-local",
  "sandy-fsutil",
  "tempfile",
  "thiserror 2.0.21",

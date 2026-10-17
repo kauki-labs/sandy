@@ -1,15 +1,18 @@
 //! `sandyd`: the per-machine control-plane daemon (epic #205). This block
-//! (#212, B1) is the skeleton: a UDS listener serving #211's control RPC
-//! against a sqlite-backed job store, with intentionally stub handlers (see
-//! `handler`) — no real dispatch into the fabric yet. B2 (`sandy-orchestrator`)
-//! replaces the stubs once it lands; the daemon lifecycle, RPC surface, and
-//! state store built here do not change shape when it does.
+//! (#212 B1 + its B2 dispatch slice) serves #211's control RPC against a
+//! sqlite-backed job store: a `Submit` mints a real per-job channel and caps
+//! (see [`dispatch`]), but nothing yet joins that channel and runs the job —
+//! there is no `sandy-agent` binary or `ProcessBackend::with_agent` (#216)
+//! for the executor to spawn. `Attach` returning a real channel/cap for a job
+//! that stays `Pending` is the honest state of that gap, not a fake success.
 
+pub mod dispatch;
 pub mod handler;
 pub mod store;
 
 use std::sync::Arc;
 
+use dispatch::JobRegistry;
 use sandy_control_proto::{ControlRequest, read_frame, write_frame};
 use store::JobStore;
 use tokio::net::UnixStream;
@@ -23,7 +26,7 @@ use tokio::net::UnixStream;
 /// faulting frame — a single connection's own fault never brings down the
 /// listener or any other connection, which is why this takes an owned stream
 /// and is meant to run as its own task.
-pub async fn serve_connection(mut stream: UnixStream, store: Arc<JobStore>) {
+pub async fn serve_connection(mut stream: UnixStream, store: Arc<JobStore>, registry: Arc<JobRegistry>) {
     loop {
         let request: ControlRequest = match read_frame(&mut stream).await {
             Ok(Some(request)) => request,
@@ -35,7 +38,7 @@ pub async fn serve_connection(mut stream: UnixStream, store: Arc<JobStore>) {
         };
 
         let request_id = request.request_id;
-        let response = match handler::handle(&store, request).await {
+        let response = match handler::handle(&store, &registry, request).await {
             Ok(response) => response,
             Err(e) => {
                 tracing::error!(error = %e, request_id, "job store faulted handling a request");
@@ -61,7 +64,8 @@ mod tests {
     async fn a_client_can_submit_and_then_read_back_status() -> anyhow::Result<()> {
         let store = Arc::new(JobStore::open_in_memory()?);
         let (client, server) = UnixStream::pair()?;
-        let serving = tokio::spawn(serve_connection(server, store));
+        let registry = Arc::new(JobRegistry::default());
+        let serving = tokio::spawn(serve_connection(server, store, registry));
 
         let mut client = client;
         write_frame(
@@ -114,7 +118,8 @@ mod tests {
     async fn a_mid_frame_disconnect_ends_the_connection_task_cleanly() -> anyhow::Result<()> {
         let store = Arc::new(JobStore::open_in_memory()?);
         let (client, server) = UnixStream::pair()?;
-        let serving = tokio::spawn(serve_connection(server, store));
+        let registry = Arc::new(JobRegistry::default());
+        let serving = tokio::spawn(serve_connection(server, store, registry));
 
         use tokio::io::AsyncWriteExt;
         let mut client = client;

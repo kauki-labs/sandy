@@ -345,3 +345,48 @@ does not defend against the actual risk (misuse of the authority, not the
 authority being wrong). Privatizing `Cap`'s fields as part of this work: real
 and worth doing eventually, but it's `#110`'s capauth.rs, not B3's, and not a
 security gap this block needs to fix to be correct (#217).
+
+## 10. `Submit` mints a real per-job channel + caps directly; decision C's submitter-bounded derivation is a tracked follow-up (#226)
+
+**Status:** accepted, with a tracked gap.
+
+**Context.** B2 wires `Submit`/`Attach` to the fabric for real: a per-job
+`Channel` (spec §3.4's one-channel-per-sandbox) plus an agent cap (post+read)
+and an observer cap (read-only, no post — a client that only watches a job's
+output never gets to drive its stdin). Two genuine blockers stood between this
+and a full dispatch pipeline: `ProcessBackend::with_agent`/the `sandy-agent`
+binary (#216, in flight) don't exist yet, so nothing can actually join the
+channel and run the job; and the typed `JobManifest` (#219/B3) isn't merged,
+so there is no submitter-held-caps concept reaching `Submit` yet.
+
+**Decision.** `mint_job_channel` (`sandyd::dispatch`) mints the job's channel
+and caps directly from a fresh `LocalCapAuthority`, with no reference to the
+submitter's own held capabilities. `Attach` returns the real channel id and a
+decodable observer cap once a job is registered, or an honest, named refusal
+otherwise (`no such job` for an id that was never submitted; a distinct
+restarted-daemon message for a job the durable store remembers but whose
+process-local channel is gone) — never a fabricated channel id. A submitted
+job stays `Pending` forever in this slice: nothing yet joins the channel or
+runs the job, which is the honest state of the remaining gap, not a fake
+success.
+
+**Consequences.** Decision C (a job's caps bounded by what its submitter
+holds, via #219's `derive_job_caps`) is implemented but not called here —
+direct minting bypasses it. That is acceptable only under a trusted-single-
+local-operator model where the orchestrator is the only submitter; it stops
+being safe the moment a submitter is anything else (a cross-machine client, a
+sub-agent submitting a sub-job). Tracked as #226: enforce decision C at
+`Submit` once a submitter-identity/held-caps model reaches this layer, in
+place of direct minting.
+
+Each job mints its own `CapAuthority` instance (a distinct HMAC key), not a
+shared orchestrator-wide one: a cap minted for one job's channel fails
+_signature verification_ against another job's channel, not merely a
+channel-scope check. Stronger isolation than scope-matching alone, and a
+deliberate property of per-job authorities, not an accident of this slice.
+
+**Set aside.** Faking the manifest schema or the agent spawn to ship a
+complete-looking dispatch path now: both would hide a fabricated success
+behind a convincing surface, which the project's honest-gate discipline rules
+out. The scoped slice above is fully real and fully tested; the remaining gap
+is tracked, not hidden.
