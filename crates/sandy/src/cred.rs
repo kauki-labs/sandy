@@ -776,10 +776,10 @@ mod tests {
         sample_root().write(&target_cfg)?;
         let link_cfg = tmp.path().join("acme.json");
         std::os::unix::fs::symlink(&target_cfg, &link_cfg)?;
-        assert!(
-            TrustRoot::load(&link_cfg).is_err(),
-            "a symlinked trust-root config must be refused, not followed"
-        );
+        let err = TrustRoot::load(&link_cfg)
+            .err()
+            .context("a symlinked trust-root config must be refused, not followed")?;
+        assert!(err.to_string().contains("is a symlink"), "unexpected: {err}");
         Ok(())
     }
 
