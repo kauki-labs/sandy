@@ -5,11 +5,10 @@
 //! the backend's connector hands over, and posts or reads TTY traffic, while the
 //! real guest agent runs the job as its child.
 //!
-//! Run it on the live host, e.g. on Apple silicon:
+//! Run it on the live host (qemu on Linux needs `/dev/vhost-vsock`), e.g. on Apple silicon:
 //!   nix shell nixpkgs#vfkit -c \
 //!     env SANDY_LIVE=1 cargo nextest run -p sandy-cli --features live --test live_agent
-// macOS (vfkit) only until the qemu leg's agent mode lands (#238 slice 3b).
-#![cfg(all(feature = "live", target_os = "macos"))]
+#![cfg(feature = "live")]
 
 use std::{
     os::fd::OwnedFd,
@@ -46,8 +45,14 @@ const WAIT: Duration = Duration::from_secs(180);
 type TestChannel = Arc<Channel<InMem, LocalCapAuthority>>;
 type Relay = Arc<Mutex<Option<tokio::task::JoinHandle<Result<Option<i32>, LinkError>>>>>;
 
+#[cfg(target_os = "macos")]
 fn host_backend() -> sandy_backend::VfkitBackend {
     sandy_backend::VfkitBackend::new(std::env::var("SANDY_VFKIT_BIN").unwrap_or_else(|_| "vfkit".to_string()))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_backend() -> sandy_backend::QemuBackend {
+    sandy_backend::QemuBackend::new()
 }
 
 fn scope(peer: &str) -> CapScope {

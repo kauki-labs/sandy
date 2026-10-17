@@ -29,20 +29,16 @@ use sandy::{
     collect_outputs, ensure_sandy_staging_base, plan_shares, topology, wipe,
 };
 use sandy_api::{
-    agent::{AGENT_VSOCK_PORT, AgentLaunch, AgentReport, AgentVerdict},
+    agent::{AGENT_VSOCK_PORT, AgentLaunch},
     share::{GuestShareTransport, ShareSpec},
 };
 use uuid::Uuid;
 
 use crate::{
-    agent::{agent_shell_command, connect_agent_link},
+    agent::{agent_outcome, agent_shell_command, spawn_connector},
     console::{Markers, PtyTransport, run_console},
     share::VirtioFsTransport,
 };
-
-/// Agent mode: how long after the guest finishes to wait for the relay's
-/// verdict (as on the process backend, it follows the link closing at once).
-const VERDICT_GRACE: Duration = Duration::from_secs(10);
 
 /// The longest unix socket path macOS accepts (`sun_path`, less the NUL).
 const MAX_SOCKET_PATH: usize = 103;
@@ -283,7 +279,10 @@ impl VfkitBackend {
         let connector = match (&self.agent, agent) {
             (Some(launch), Some(agent)) => Some(spawn_connector(
                 launch,
-                agent,
+                {
+                    let socket = agent.socket.clone();
+                    move || std::os::unix::net::UnixStream::connect(&socket)
+                },
                 box_id,
                 // The console's command budget only starts once the guest has
                 // booted, so allow for the boot too; the stop flag still ends the
@@ -324,78 +323,6 @@ struct AgentRun {
     program: PathBuf,
     /// The run's host unix socket, in the private staging base.
     socket: PathBuf,
-}
-
-/// Start the thread that connects to the guest agent and hands the link to
-/// `launch.on_link`. Returns the receiver for the run's verdict.
-fn spawn_connector(
-    launch: &AgentLaunch,
-    agent: &AgentRun,
-    box_id: &str,
-    deadline: Instant,
-    stop: Arc<AtomicBool>,
-) -> (std::sync::mpsc::Receiver<AgentVerdict>, std::thread::JoinHandle<bool>) {
-    let (report, verdict) = AgentReport::channel();
-    let (on_link, socket, box_id) = (Arc::clone(&launch.on_link), agent.socket.clone(), box_id.to_string());
-    // Returns whether the link was handed to the relay.
-    let thread = std::thread::spawn(move || {
-        match connect_agent_link(|| std::os::unix::net::UnixStream::connect(&socket), deadline, &stop) {
-            Ok(link) => {
-                // A panic drops the report unresolved: the run is an infra fault.
-                let handed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| on_link(&box_id, link, report)));
-                if handed.is_err() {
-                    tracing::warn!(box_id, "the agent link handler (on_link) panicked");
-                }
-                // A panicking handler did not take the link, even if it kept the fd.
-                handed.is_ok()
-            }
-            Err(err) => {
-                report.agent_failed(format!("could not reach the guest agent: {err}"));
-                false
-            }
-        }
-    });
-    (verdict, thread)
-}
-
-/// Agent mode: the job's exit comes only from the relay's verdict, never from
-/// the console's `exit=` (INV-11).
-///
-/// A booted guest whose agent never took its link (`linked` false) is an infra
-/// fault, even when the console then timed out: the job never started, so the
-/// timeout is not the job's. Otherwise a run that did not complete keeps its
-/// timeout or transport fault, with no exit.
-fn agent_outcome(
-    mut outcome: Outcome,
-    verdict: &std::sync::mpsc::Receiver<AgentVerdict>,
-    job: &str,
-    linked: bool,
-) -> Result<Outcome, BackendError> {
-    if outcome.booted && !linked {
-        let why = match verdict.try_recv() {
-            Ok(AgentVerdict::AgentFailed(why)) => why,
-            _ => "the link was never handed to the relay".to_string(),
-        };
-        return Err(BackendError::Spawn(format!(
-            "the guest agent never took its link for `{job}`: {why}"
-        )));
-    }
-    if !outcome.booted || outcome.timed_out || outcome.transport_error.is_some() {
-        outcome.guest_exit = None;
-        return Ok(outcome);
-    }
-    match verdict.recv_timeout(VERDICT_GRACE) {
-        Ok(AgentVerdict::JobExited(code)) => {
-            outcome.guest_exit = Some(code);
-            Ok(outcome)
-        }
-        Ok(AgentVerdict::AgentFailed(why)) => Err(BackendError::Spawn(format!(
-            "the sandbox agent failed for `{job}`: {why}"
-        ))),
-        Err(_) => Err(BackendError::Spawn(format!(
-            "the sandbox agent's relay reported no verdict for `{job}`"
-        ))),
-    }
 }
 
 /// The run's agent socket in the private staging base, short enough for
@@ -495,6 +422,7 @@ mod tests {
 
     use anyhow::Context;
     use sandy::{Grants, Hypervisor, SecretRef, SecretSource, StoreBacking, parse_topology};
+    use sandy_api::agent::AgentReport;
 
     use super::*;
 
@@ -867,13 +795,9 @@ mod tests {
                 panic!("relay setup failed after keeping the fd");
             }),
         };
-        let agent = AgentRun {
-            program: PathBuf::new(),
-            socket,
-        };
         let (_verdict, thread) = spawn_connector(
             &launch,
-            &agent,
+            move || std::os::unix::net::UnixStream::connect(&socket),
             "box",
             std::time::Instant::now() + Duration::from_secs(10),
             Arc::new(AtomicBool::new(false)),
