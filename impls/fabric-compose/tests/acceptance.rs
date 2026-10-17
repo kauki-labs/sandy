@@ -95,6 +95,46 @@ fn deferred_fake_seams_are_tracked_not_silently_dropped() {
     );
 }
 
+/// Binds the two tracking lists above to the concrete types
+/// `validate_all_local_profile` actually composes, not just to each other: a
+/// factory quietly swapped for a contract-passing fake fails here even though
+/// it would still pass its own contract suite.
+#[test]
+fn the_all_local_profile_fake_seams_match_the_tracking_lists() {
+    fn is_fake<T>() -> bool {
+        std::any::type_name::<T>()
+            .rsplit("::")
+            .next()
+            .is_some_and(|name| name.starts_with("Fake"))
+    }
+
+    let seams: &[(&str, bool)] = &[
+        ("CapAuthority", is_fake::<LocalCapAuthority>()),
+        ("Minter", is_fake::<LocalMinter>()),
+        ("ChannelBackend", is_fake::<InMem>()),
+        ("Transport", is_fake::<FakeTransport>()),
+        ("Executor", is_fake::<VmBackendExecutor<ProcessBackend>>()),
+        ("Discovery", is_fake::<StaticRegistry>()),
+        (
+            "Capacity",
+            is_fake::<ExecutorCapacity<VmBackendExecutor<ProcessBackend>>>(),
+        ),
+        ("Lifecycle", is_fake::<LeaseTable>()),
+        ("TelemetrySink", is_fake::<LocalLog>()),
+    ];
+
+    for (seam, actually_fake) in seams {
+        let tracked_as_fake = PENDING_FAKED_SEAMS.contains(seam) || DEFERRED_FAKE_SEAMS.contains(seam);
+        assert_eq!(
+            *actually_fake,
+            tracked_as_fake,
+            "{seam}: factory type is{} a Fake*, but the tracking lists say it is{} tracked as fake",
+            if *actually_fake { "" } else { " not" },
+            if tracked_as_fake { "" } else { " not" }
+        );
+    }
+}
+
 /// The all-local profile's `CapAuthority` slot (real, #110). `capauth_suite`
 /// always mints with an explicit `expires_at`, so `default_ttl` is never
 /// actually exercised here — the value just has to be sane.
