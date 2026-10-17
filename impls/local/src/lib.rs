@@ -15,5 +15,8 @@ mod share;
 
 pub use containment::SystemdRunContainment;
 pub use egress::NoEgress;
-pub use process::{AgentLaunch, AgentReport, OnLink, ProcessBackend};
+pub use process::ProcessBackend;
+/// The agent-launch contract, now in `sandy_api::agent` (#238); re-exported
+/// here so existing imports keep compiling.
+pub use sandy_api::agent::{AgentLaunch, AgentReport, OnLink};
 pub use share::LocalDirTransport;

@@ -17,6 +17,7 @@
 //! `contract-tests`: that one covers the agent-fabric seams over `sandy-proto`
 //! (a separate epic, #103/#104); this one covers the current sandbox run plane.
 
+pub mod agent;
 pub mod backend;
 pub mod console;
 pub mod containment;
