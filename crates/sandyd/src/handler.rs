@@ -384,6 +384,7 @@ mod tests {
                 channel: Arc::clone(&job.channel),
                 agent_cap: job.agent_cap.clone(),
                 observer_cap: expired_cap,
+                remote_link: None,
             },
         );
 

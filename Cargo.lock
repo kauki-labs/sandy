@@ -2373,6 +2373,7 @@ version = "0.1.1"
 dependencies = [
  "anyhow",
  "fs2",
+ "getrandom 0.3.4",
  "rusqlite",
  "rustix",
  "sandy-control-proto",

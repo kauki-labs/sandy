@@ -8,6 +8,7 @@
 
 pub mod dispatch;
 pub mod handler;
+pub mod link_auth;
 pub mod store;
 
 use std::sync::Arc;
