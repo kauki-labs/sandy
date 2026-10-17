@@ -95,6 +95,11 @@ const DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// [`DRAIN_GRACE`] so a slow drain cannot eat it.
 const VERDICT_GRACE: Duration = Duration::from_secs(10);
 
+/// Serializes each run's agent-link creation and spawn across the process
+/// (#230): where close-on-exec takes a second call (macOS), a concurrent spawn
+/// must not land between the two and inherit another run's descriptors.
+static SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// A [`VmBackend`] that runs the job as a raw OS process (no VM).
 ///
 /// Owns its running-instance registry so [`boxes`](VmBackend::boxes) reports live
@@ -286,6 +291,10 @@ impl ProcessBackend {
         // The agent link (#216): a close-on-exec socket pair, one end as the agent's
         // stdin (AGENT_LINK_FD), the other for the relay. Without an agent the job's
         // stdin stays /dev/null.
+        // #230: on macOS the pair, and std's stdio pipes made inside spawn, get
+        // close-on-exec in a second call, so a spawn on another thread could
+        // inherit them. Every run creates its link and spawns under one lock.
+        let spawn_guard = SPAWN_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (agent_end, host_end) = match &self.agent {
             Some(_) => {
                 let (agent_end, host_end) = std::os::unix::net::UnixStream::pair()
@@ -307,6 +316,7 @@ impl ProcessBackend {
             // A spawn fault is infra (band 3, retryable), not a run result.
             Err(err) => return Err(BackendError::Spawn(format!("spawn `{job_program}`: {err}"))),
         };
+        drop(spawn_guard);
         // Close this process's copy of the agent end (held by the Command), so the
         // relay sees EOF once the agent exits.
         drop(command);
