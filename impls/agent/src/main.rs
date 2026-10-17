@@ -1,9 +1,167 @@
 //! `sandy-agent`: the sandbox agent as its own OS process (#216).
 //!
-//! Usage: `sandy-agent -- <job> [args...]`, launched by the process backend
-//! with its agent link on stdin ([`AGENT_LINK_FD`](sandy_fabric_local) is fd 0).
+//! Usage: `sandy-agent -- <job> [args...]`. The process backend launches it with
+//! its agent link on stdin (`sandy_fabric::capauth::AGENT_LINK_FD`, fd 0). The
+//! agent bootstraps over the link ([`LinkAgent::bootstrap`]: the cap is the
+//! first frame, read once and presented back to the relay), then runs the job
+//! as its child and bridges the job's stdio to the channel.
+//!
+//! The job never inherits the link: the agent keeps a close-on-exec duplicate,
+//! points its own stdin at `/dev/null`, and gives the job fresh pipes. It
+//! inherits the agent's environment unchanged, which is the backend's.
+//!
+//! Exit status, so the backend can tell a job result from an agent fault
+//! (INV-11): after the job ran, the agent exits with the job's code (`128 +
+//! signal` for a signal death). Any agent-internal failure, before or while
+//! bridging, ends the agent with `SIGABRT` instead, which a normal exit can
+//! never produce.
 
-fn main() {
-    eprintln!("sandy-agent: not implemented");
+use std::{
+    ffi::OsString,
+    io::Write,
+    os::{fd::AsFd, unix::process::ExitStatusExt},
+    pin::Pin,
+    process::{ExitCode, ExitStatus, Stdio},
+    task::{Context, Poll},
+};
+
+use sandy_fabric_local::agent::LinkAgent;
+use tokio::io::{AsyncRead, ReadBuf};
+
+fn main() -> ExitCode {
+    let job = match job_argv(std::env::args_os().skip(1).collect()) {
+        Ok(job) => job,
+        Err(usage) => fail(&usage),
+    };
+    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(e) => fail(&format!("starting the runtime: {e}")),
+    };
+    match runtime.block_on(run(job)) {
+        Ok(status) => ExitCode::from(exit_code(status)),
+        Err(e) => fail(&e),
+    }
+}
+
+/// An agent-internal failure: say why on stderr, then end with `SIGABRT` so the
+/// backend reports an infra fault, never a job exit code.
+fn fail(why: &str) -> ! {
+    eprintln!("sandy-agent: {why}");
     std::process::abort();
+}
+
+/// The job's argv: everything after a leading `--`, which must be present and
+/// followed by at least the program.
+fn job_argv(args: Vec<OsString>) -> Result<Vec<OsString>, String> {
+    match args.split_first() {
+        Some((dashdash, job)) if dashdash == "--" && !job.is_empty() => Ok(job.to_vec()),
+        _ => Err("usage: sandy-agent -- <job> [args...]".to_string()),
+    }
+}
+
+/// Bootstrap over the link, run the job as this process's child, and bridge
+/// its stdio until it exits.
+async fn run(job: Vec<OsString>) -> Result<ExitStatus, String> {
+    let link = claim_link().map_err(|e| format!("claiming the agent link on stdin: {e}"))?;
+    let agent = LinkAgent::bootstrap(link)
+        .await
+        .map_err(|e| format!("bootstrap: {e}"))?;
+
+    let (program, args) = job.split_first().ok_or("empty job argv")?;
+    let mut child = tokio::process::Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("spawning the job {}: {e}", program.to_string_lossy()))?;
+    let (Some(stdin), Some(stdout), Some(stderr)) = (child.stdin.take(), child.stdout.take(), child.stderr.take())
+    else {
+        return Err("the job's stdio pipes were not created".to_string());
+    };
+
+    // Tee the job's output to this process's own stdio as well, so the backend's
+    // console capture still carries it.
+    let bridged = agent
+        .serve_tty(Tee::new(stdout, to_stdout), Tee::new(stderr, to_stderr), stdin)
+        .await;
+    if let Err(e) = bridged {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return Err(format!("bridging the job's stdio: {e}"));
+    }
+    child.wait().await.map_err(|e| format!("waiting on the job: {e}"))
+}
+
+/// Take the agent link off stdin: keep a close-on-exec duplicate, then point fd
+/// 0 at `/dev/null` so no copy without close-on-exec is left to inherit.
+fn claim_link() -> std::io::Result<tokio::net::UnixStream> {
+    let link = std::io::stdin().as_fd().try_clone_to_owned()?;
+    let null = std::fs::File::open("/dev/null")?;
+    rustix::stdio::dup2_stdin(&null)?;
+    let link = std::os::unix::net::UnixStream::from(link);
+    link.set_nonblocking(true)?;
+    tokio::net::UnixStream::from_std(link)
+}
+
+/// The job's exit as this process's exit code: its code, or `128 + signal`.
+fn exit_code(status: ExitStatus) -> u8 {
+    let code = status
+        .code()
+        .or_else(|| status.signal().map(|sig| 128 + sig))
+        .unwrap_or(1);
+    u8::try_from(code & 0xff).unwrap_or(1)
+}
+
+fn to_stdout(bytes: &[u8]) {
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(bytes).and_then(|()| out.flush());
+}
+
+fn to_stderr(bytes: &[u8]) {
+    let _ = std::io::stderr().lock().write_all(bytes);
+}
+
+/// An [`AsyncRead`] that copies every chunk it yields to `sink`.
+struct Tee<R> {
+    inner: R,
+    sink: fn(&[u8]),
+}
+
+impl<R> Tee<R> {
+    fn new(inner: R, sink: fn(&[u8])) -> Self {
+        Self { inner, sink }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for Tee<R> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let polled = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = polled {
+            (self.sink)(&buf.filled()[before..]);
+        }
+        polled
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_job_argv_follows_a_leading_double_dash() {
+        let args = |v: &[&str]| v.iter().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(job_argv(args(&["--", "echo", "hi"])), Ok(args(&["echo", "hi"])));
+        assert!(job_argv(args(&["--"])).is_err(), "no job after --");
+        assert!(job_argv(args(&["echo", "hi"])).is_err(), "no leading --");
+        assert!(job_argv(args(&[])).is_err(), "no args");
+    }
+
+    #[test]
+    fn a_signal_death_maps_to_128_plus_the_signal() {
+        assert_eq!(exit_code(ExitStatus::from_raw(7 << 8)), 7);
+        assert_eq!(exit_code(ExitStatus::from_raw(9)), 137, "SIGKILL");
+    }
 }

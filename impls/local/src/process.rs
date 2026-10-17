@@ -46,7 +46,7 @@
 
 use std::{
     io::Read,
-    os::unix::process::ExitStatusExt,
+    os::{fd::OwnedFd, unix::process::ExitStatusExt},
     path::Path,
     process::{Command, Stdio},
     sync::{
@@ -244,10 +244,18 @@ impl ProcessBackend {
                 readonly: p.readonly,
             })
             .collect();
+        // In agent mode (#216) the job runs as the agent's child: the containment
+        // confines the agent, and the agent runs `-- <job>` inside it.
+        let agent_prefix: Vec<String> = self
+            .agent
+            .iter()
+            .flat_map(|agent| [agent.program.to_string_lossy().into_owned(), "--".to_string()])
+            .collect();
         let launch: Vec<String> = self
             .containment
             .wrap(&box_id, limits, &mounts)
             .into_iter()
+            .chain(agent_prefix)
             .chain(spec.command.iter().cloned())
             .collect();
         let (program, args) = launch
@@ -281,8 +289,19 @@ impl ProcessBackend {
             };
             command.env(share_env_key(&placement.tag), &dir);
         }
+        // The agent link (#216): a close-on-exec socket pair, one end as the agent's
+        // stdin (AGENT_LINK_FD), the other for the relay. Without an agent the job's
+        // stdin stays /dev/null.
+        let (agent_end, host_end) = match &self.agent {
+            Some(_) => {
+                let (agent_end, host_end) = std::os::unix::net::UnixStream::pair()
+                    .map_err(|err| BackendError::Spawn(format!("create the agent link: {err}")))?;
+                (Some(OwnedFd::from(agent_end)), Some(OwnedFd::from(host_end)))
+            }
+            None => (None, None),
+        };
         command
-            .stdin(Stdio::null())
+            .stdin(agent_end.map_or_else(Stdio::null, Stdio::from))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
@@ -294,6 +313,12 @@ impl ProcessBackend {
             // A spawn fault is infra (band 3, retryable), not a run result.
             Err(err) => return Err(BackendError::Spawn(format!("spawn `{job_program}`: {err}"))),
         };
+        // Close this process's copy of the agent end (held by the Command), so the
+        // relay sees EOF once the agent exits, then hand the host end over.
+        drop(command);
+        if let (Some(agent), Some(host_end)) = (&self.agent, host_end) {
+            (agent.on_link)(&box_id, host_end);
+        }
 
         self.registry()?.push(BoxState {
             box_id: box_id.clone(),
@@ -355,6 +380,21 @@ impl ProcessBackend {
         let stdout = take_bounded(out_drain, drain_deadline);
         let stderr = take_bounded(err_drain, drain_deadline);
         let console = merged_console(&stdout, &stderr);
+
+        // INV-11, agent mode: the agent exits with the job's code (a job signal death
+        // included, as 128+signal), so a SIGABRT death of the agent itself can only be
+        // an agent fault, e.g. a refused join, where the job never ran. That is infra,
+        // never a job result.
+        if self.agent.is_some() && !timed_out && status.and_then(|s| s.signal()) == Some(libc::SIGABRT) {
+            let why = console
+                .lines()
+                .rev()
+                .find(|line| line.starts_with("sandy-agent:"))
+                .unwrap_or("sandy-agent aborted without a diagnostic");
+            return Err(BackendError::Spawn(format!(
+                "the sandbox agent failed for `{job_program}`: {why}"
+            )));
+        }
 
         // INV-11: the process ran (booted), so its exit is a task result on
         // guest_exit, never a transport fault. A signal death maps to 128+signal
