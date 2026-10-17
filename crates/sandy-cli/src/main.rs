@@ -537,6 +537,10 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
             control_request::Op::Submit(SubmitRequest {
                 manifest: bytes,
                 manifest_encoding,
+                // No cap-supply flow for the CLI yet (#232): a direct-mint
+                // submit, same as today, never a silent way to claim bounded
+                // caps without actually presenting any.
+                submitter_caps: Vec::new(),
             })
         }
         DaemonOp::Cancel { job_id } => control_request::Op::Cancel(CancelRequest { job_id }),

@@ -7,7 +7,7 @@
 //! attenuation is the deferred, richer impl behind the same seam.
 
 use std::{
-    sync::{Mutex, PoisonError},
+    sync::{Arc, Mutex, PoisonError},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -150,5 +150,52 @@ fn write_field(buf: &mut Vec<u8>, bytes: &[u8]) {
 impl std::fmt::Debug for LocalCapAuthority {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LocalCapAuthority").finish_non_exhaustive()
+    }
+}
+
+/// A [`LocalCapAuthority`] shared across callers that each need their own
+/// owned `impl CapAuthority` (e.g. [`crate::channel::Channel::new`], which
+/// takes its authority by value) without minting a SEPARATE key per caller.
+///
+/// Needed wherever one party must verify or attenuate a cap another party
+/// already holds — `attenuate` re-verifies against the issuing authority's
+/// own key, so two distinct [`LocalCapAuthority`] instances can never
+/// recognize each other's caps (`CapError::Forged`, by design: INV-1). `Cap`
+/// an orchestrator holds for one channel and a job's freshly minted channel
+/// must come from the SAME authority for the orchestrator's cap to ever bound
+/// anything the job's channel will accept.
+#[derive(Clone)]
+pub struct SharedCapAuthority(Arc<LocalCapAuthority>);
+
+impl SharedCapAuthority {
+    /// Wrap an already-constructed authority for sharing.
+    #[must_use]
+    pub fn new(authority: LocalCapAuthority) -> Self {
+        Self(Arc::new(authority))
+    }
+
+    /// Mark `cap` as revoked ahead of its TTL. See [`LocalCapAuthority::revoke`].
+    pub fn revoke(&self, cap: &Cap) {
+        self.0.revoke(cap);
+    }
+
+    /// Whether `cap` has been revoked. See [`LocalCapAuthority::is_revoked`].
+    #[must_use]
+    pub fn is_revoked(&self, cap: &Cap) -> bool {
+        self.0.is_revoked(cap)
+    }
+}
+
+impl CapAuthority for SharedCapAuthority {
+    fn mint(&self, scope: CapScope) -> Result<Cap, CapError> {
+        self.0.mint(scope)
+    }
+
+    fn verify(&self, cap: &Cap) -> Result<CapScope, CapError> {
+        self.0.verify(cap)
+    }
+
+    fn attenuate(&self, parent: &Cap, rights: CapRights) -> Result<Cap, CapError> {
+        self.0.attenuate(parent, rights)
     }
 }

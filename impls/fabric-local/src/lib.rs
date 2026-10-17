@@ -23,4 +23,4 @@ pub mod placement;
 pub mod roles;
 pub mod telemetry;
 
-pub use capauth::LocalCapAuthority;
+pub use capauth::{LocalCapAuthority, SharedCapAuthority};

@@ -62,7 +62,13 @@ async fn main() {
     };
     tracing::info!(socket = %socket_path.display(), db = %db_path.display(), "sandyd listening");
 
-    let registry = Arc::new(JobRegistry::default());
+    let registry = match JobRegistry::new() {
+        Ok(registry) => Arc::new(registry),
+        Err(e) => {
+            tracing::error!(error = %e, "could not create the job registry's capability authority");
+            std::process::exit(1);
+        }
+    };
     let mut connections = tokio::task::JoinSet::new();
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);

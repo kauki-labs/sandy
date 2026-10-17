@@ -356,7 +356,7 @@ security gap this block needs to fix to be correct (#217).
 
 ## 10. `Submit` mints a real per-job channel + caps directly; decision C's submitter-bounded derivation is a tracked follow-up (#226)
 
-**Status:** accepted, with a tracked gap.
+**Status:** accepted; the tracked gap is closed by §11.
 
 **Context.** B2 wires `Submit`/`Attach` to the fabric for real: a per-job
 `Channel` (spec §3.4's one-channel-per-sandbox) plus an agent cap (post+read)
@@ -400,3 +400,92 @@ complete-looking dispatch path now: both would hide a fabricated success
 behind a convincing surface, which the project's honest-gate discipline rules
 out. The scoped slice above is fully real and fully tested; the remaining gap
 is tracked, not hidden.
+
+## 11. Decision C-at-Submit: bearer `submitter_caps` in the frame, one persistent orchestrator authority, trust from the connection (#226)
+
+**Status:** accepted.
+
+**Context.** §10 left decision C unenforced at `Submit`: no submitter
+identity or held caps reached that layer, and each job minted its channel
+from a brand-new `LocalCapAuthority` (§9/§10's own "deliberate property").
+Closing it needs an answer to the actual authn question — _how does a
+submitter's identity and held caps reach `Submit` over the control RPC_ —
+and, once answered, ran into a structural requirement the earlier design
+didn't anticipate: `derive_job_caps`'s `attenuate` call re-verifies a held
+cap against the authority that originally minted it. Two independent
+`LocalCapAuthority` instances can never recognize each other's caps by
+construction (distinct HMAC keys, the exact property §9/§10 praised for
+job-to-job isolation) — so a fresh-per-job authority makes the bounded path
+structurally unreachable for every real submitter, not merely unenforced.
+
+**Decision.**
+
+- **Wire shape.** `SubmitRequest` grows `repeated bytes submitter_caps`, each
+  entry an `encode_cap`-encoded `Cap` the submitter holds. No separate
+  identity field: a `Cap`'s own `scope.peer` already carries the submitter's
+  identity, and `CapAuthority::verify`/`attenuate` already re-check it
+  (forged, expired, revoked — all caught the same way). This is the same
+  bearer-cap authn every other seam in the fabric already uses
+  (`Channel::join`, `AttachResponse`'s cap, the agent bootstrap handoff), not
+  a connection-level identity (rejected: `SO_PEERCRED`/uid is a parallel
+  trust model with no `CapAuthority` tie-in, and is UDS-only — dead on
+  arrival for B6's vsock/mesh) and not a session/handshake (rejected: adds
+  state the control RPC's one-request-one-response design, §1, deliberately
+  avoids).
+- **One persistent orchestrator authority.** `JobRegistry` now holds one
+  `SharedCapAuthority` (`impls/fabric-local/src/capauth.rs`: an
+  `Arc<LocalCapAuthority>` behind the `CapAuthority` trait), constructed once
+  at `sandyd` startup, not a fresh instance per job. Every job's own channel
+  (§10, unchanged in shape) mints from this same authority, and
+  `submitter_caps` are verified against it too. **The HMAC key itself never
+  leaves the process** — `SharedCapAuthority` exposes only `mint`/`verify`/
+  `attenuate`/`revoke`/`is_revoked`, never the key; only the caps it mints
+  cross any boundary (INV-1).
+- **What decision C actually bounds.** The job's own dedicated channel stays
+  sandyd's own infrastructure, minted directly regardless of who submits —
+  same as every orchestrator channel in the all-local MVP (agent-fabric.md
+  §11: a composition-root responsibility, not something a submitter's held
+  caps bound). What `derive_job_caps` bounds is a manifest's ADDITIONAL
+  `requested_caps`, onto channels the submitter already participates in (its
+  own orchestrator channel, a peer group it was invited to). `JobManifest`
+  (`sandy-orchestrator`) gains `serde` derives and a recognized
+  `manifest_encoding` tag (`MANIFEST_ENCODING_JSON`) so `Submit` can actually
+  decode one — its first real consumer.
+- **Policy: trust comes from the connection, not from whether
+  `submitter_caps` is present in the frame.** In the local-UDS MVP, the 0700
+  socket IS the trust boundary — only the local operator reaches it — so
+  direct-mint (§10's path, empty `submitter_caps`) stays legitimate there,
+  and is not a silent opt-out: there is nothing to bound in that case, since
+  the job gets only its own channel either way. The one frame-level refusal
+  this block adds is a submitter presenting caps for a manifest `sandyd`
+  cannot decode — never silently dropping caps the submitter went to the
+  trouble of presenting. An untrusted submitter (cross-machine via B6, or a
+  sub-agent submitting a sub-job) must always carry `submitter_caps` and be
+  bounded; which connections those are is a future block's gate to add, not
+  a property of this frame's contents. #226 builds the bounding MACHINERY,
+  verified against a synthetic authority in tests, ready to activate — there
+  is no real submitter-cap-issuance flow yet for sandyd's own operator
+  either (#232, the CLI side, is the next piece of that).
+
+**Consequences.** A cap minted for one job's channel still cannot join a
+different job's channel, but the _reason_ changes from §10's `Forged`
+(different signing key) to `WrongChannel` (same key, correctly verified,
+scoped elsewhere) — **this is the designed boundedness mechanism, not a
+regression to fix by separating authorities again.** Boundedness was always
+`Channel::join`'s own channel-id check (agent-fabric.md §11), never the
+authority's identity; a shared authority only changes which error a
+cross-job cap fails with, not whether it's rejected. A manifest's granted
+caps (the output of `derive_job_caps`) are stored on the job's registry entry
+(`JobChannel.granted_caps`) but not yet consumed — there is no agent/
+dispatch-core wiring to hand them to. Enforcing the bound AT SUBMIT TIME
+(refusing an over-broad request before a job is ever created) is this
+block's actual deliverable; handing granted caps to a running job is
+dispatch-core's job once it exists.
+
+**Set aside.** Requiring `submitter_caps` on every `Submit` regardless of
+connection: would break the trusted-local-operator path for no security
+gain today (the 0700 socket already is the trust boundary), and bakes in
+B6's cross-machine trust model before it exists. Designing the connection-
+trust gate itself (distinguishing a trusted UDS caller from an untrusted
+mesh one): B6's job, not this block's — #226 only decides what a given
+frame is allowed to grant, never which connections must present one.

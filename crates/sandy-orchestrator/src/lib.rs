@@ -14,22 +14,26 @@
 //! protobuf `JobManifest` arriving there once that crate lands. Converting
 //! between the two is a small follow-up then; building the derivation logic
 //! against this Rust type now is not gated on it, since the fabric seams it
-//! needs (`CapAuthority`, `Cap`, `attenuate`) are already on main. No `serde`
-//! derive: nothing persists a `JobManifest` in this shape today (`sandyd`'s
-//! B1 stores only the opaque manifest bytes, confirmed with its author) — if
-//! that changes, add it then rather than inventing a serialized form no
-//! consumer needs yet.
+//! needs (`CapAuthority`, `Cap`, `attenuate`) are already on main.
+//!
+//! `serde` derives (#226): `sandyd`'s Submit decodes a JSON-encoded
+//! `JobManifest` from `SubmitRequest.manifest` when `manifest_encoding` names
+//! it and `submitter_caps` are present, to call [`derive_job_caps`] — the
+//! first real consumer of a serialized form. A submission that doesn't invoke
+//! the bounded path (no `submitter_caps`) still never needs to decode this at
+//! all.
 
 use sandy_fabric::{
     capauth::{Cap, CapAuthority, CapError, CapRights},
     types::ChannelId,
 };
+use serde::{Deserialize, Serialize};
 
 /// What the job will run. Deliberately minimal for this first cut — the full
 /// shape (working directory, environment, secrets, …) is dispatch-core work
 /// (the fuller B2), not B3's concern; this just needs to exist on
 /// [`JobManifest`] per the epic's "a job = entrypoint + capability manifest."
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobEntrypoint {
     /// The command and its arguments, `argv[0]` first.
     pub command: Vec<String>,
@@ -37,7 +41,7 @@ pub struct JobEntrypoint {
 
 /// One capability a job asks to be granted: `rights` on `channel_id`, capped
 /// at whatever the submitter already holds there (decision C).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapRequest {
     /// The channel the job wants to join.
     pub channel_id: ChannelId,
@@ -46,7 +50,7 @@ pub struct CapRequest {
 }
 
 /// A job's manifest: what it runs, and what capabilities it asks for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobManifest {
     /// What the job will run.
     pub entrypoint: JobEntrypoint,
@@ -55,6 +59,11 @@ pub struct JobManifest {
     /// [`derive_job_caps`]).
     pub requested_caps: Vec<CapRequest>,
 }
+
+/// The `manifest_encoding` tag `sandyd`'s Submit recognizes for a JSON-encoded
+/// [`JobManifest`] (#226). Any other (or absent) encoding stays fully opaque
+/// — Submit never guesses a shape for bytes it doesn't recognize.
+pub const MANIFEST_ENCODING_JSON: &str = "sandy.orchestrator.v1.JobManifest+json";
 
 /// A manifest could not be honoured.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -300,6 +309,24 @@ mod tests {
             matches!(err, ManifestError::Cap(CapError::Revoked)),
             "expected Cap(Revoked), got {err:?}"
         );
+        Ok(())
+    }
+
+    /// A `JobManifest` round-trips through JSON (#226): `sandyd`'s Submit
+    /// decodes exactly this shape from a `SubmitRequest.manifest` tagged
+    /// [`MANIFEST_ENCODING_JSON`].
+    #[test]
+    fn a_job_manifest_round_trips_through_json() -> anyhow::Result<()> {
+        let manifest = JobManifest {
+            entrypoint: entrypoint(),
+            requested_caps: vec![CapRequest {
+                channel_id: ChannelId::from("peer-group-1"),
+                rights: read_only(),
+            }],
+        };
+        let json = serde_json::to_vec(&manifest).context("encode")?;
+        let decoded: JobManifest = serde_json::from_slice(&json).context("decode")?;
+        assert_eq!(decoded, manifest);
         Ok(())
     }
 }

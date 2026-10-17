@@ -21,8 +21,10 @@ workspace = true
 
 [dependencies]
 sandy-fabric.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
 sandy-fabric-local.workspace = true
+serde_json.workspace = true

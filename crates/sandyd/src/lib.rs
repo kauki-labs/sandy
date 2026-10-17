@@ -65,7 +65,7 @@ mod tests {
     async fn a_client_can_submit_and_then_read_back_status() -> anyhow::Result<()> {
         let store = Arc::new(JobStore::open_in_memory()?);
         let (client, server) = UnixStream::pair()?;
-        let registry = Arc::new(JobRegistry::default());
+        let registry = Arc::new(JobRegistry::new()?);
         let serving = tokio::spawn(serve_connection(server, store, registry));
 
         let mut client = client;
@@ -76,6 +76,7 @@ mod tests {
                 op: Some(control_request::Op::Submit(SubmitRequest {
                     manifest: b"m".to_vec(),
                     manifest_encoding: "test/v1".to_owned(),
+                    submitter_caps: Vec::new(),
                 })),
             },
         )
@@ -119,7 +120,7 @@ mod tests {
     async fn a_mid_frame_disconnect_ends_the_connection_task_cleanly() -> anyhow::Result<()> {
         let store = Arc::new(JobStore::open_in_memory()?);
         let (client, server) = UnixStream::pair()?;
-        let registry = Arc::new(JobRegistry::default());
+        let registry = Arc::new(JobRegistry::new()?);
         let serving = tokio::spawn(serve_connection(server, store, registry));
 
         use tokio::io::AsyncWriteExt;
