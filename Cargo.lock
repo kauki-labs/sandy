@@ -2117,13 +2117,17 @@ name = "sandy-agent"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "base64 0.23.1",
  "futures-util",
  "rustix",
  "sandy-api",
  "sandy-fabric",
  "sandy-fabric-local",
+ "sandy-fsutil",
  "sandy-impls-local",
  "sandy-proto",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-vsock",
