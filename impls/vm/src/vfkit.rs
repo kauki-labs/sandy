@@ -346,7 +346,8 @@ fn spawn_connector(
                 if handed.is_err() {
                     tracing::warn!(box_id, "the agent link handler (on_link) panicked");
                 }
-                true
+                // A panicking handler did not take the link, even if it kept the fd.
+                handed.is_ok()
             }
             Err(err) => {
                 report.agent_failed(format!("could not reach the guest agent: {err}"));
@@ -843,6 +844,45 @@ mod tests {
             matches!(&result, Err(BackendError::Spawn(why)) if why.contains("never took its link") && why.contains("could not reach")),
             "got {result:?}"
         );
+    }
+
+    /// CodeRabbit on #244: a panicking `on_link` has not taken the link, even if
+    /// it kept the fd first, so the connector reports it as never linked.
+    #[test]
+    fn a_panicking_link_handler_counts_as_never_linked() -> anyhow::Result<()> {
+        use std::io::Write;
+        let dir = tempfile::tempdir()?;
+        let socket = dir.path().join("agent.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket)?;
+        std::thread::spawn(move || {
+            if let Ok((mut conn, _)) = listener.accept() {
+                let _ = conn.write_all(&[sandy_api::agent::AGENT_LINK_READY]);
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        });
+        let launch = AgentLaunch {
+            program: PathBuf::new(),
+            on_link: Arc::new(|_: &str, link: std::os::fd::OwnedFd, _: AgentReport| {
+                std::mem::forget(link);
+                panic!("relay setup failed after keeping the fd");
+            }),
+        };
+        let agent = AgentRun {
+            program: PathBuf::new(),
+            socket,
+        };
+        let (_verdict, thread) = spawn_connector(
+            &launch,
+            &agent,
+            "box",
+            std::time::Instant::now() + Duration::from_secs(10),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(
+            !thread.join().unwrap_or(true),
+            "a panicking handler must not count as linked"
+        );
+        Ok(())
     }
 
     #[test]
