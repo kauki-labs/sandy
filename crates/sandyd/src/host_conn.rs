@@ -12,7 +12,7 @@ use sandy_executor_proto::{
     HostClientMessage, OrchestratorMessage, RegisterRefused, Registered, host_client_message, orchestrator_message,
 };
 
-use crate::host_registry::{ExecutorAllowlist, HostRegistry};
+use crate::host_registry::{ExecutorAllowlist, HostRegistry, RegisterError};
 
 /// How long a freshly accepted connection has to send its `Register` frame
 /// before it's closed. Without a deadline here, a peer that opens a
@@ -63,6 +63,28 @@ pub async fn serve_host_client(
     };
 
     let host_id = register.host_id.clone();
+
+    // Allowlist membership first, before anything about the frame's content
+    // is checked (D5, #263): refusing on a missing `capabilities` field
+    // before this would hand an unauthenticated peer a different, more
+    // specific error than an allowlisted one — leaking that it passed a
+    // stage a merely-curious peer never should have reached. Every
+    // non-allowlisted peer gets the exact same generic refusal, regardless
+    // of what else is or isn't in its `Register` frame.
+    if !allowlist.permits(peer_ip) {
+        tracing::warn!(peer = %peer_ip, host_id, "Register refused: not a permitted executor host");
+        let _ = write_frame(
+            &mut conn,
+            &OrchestratorMessage {
+                op: Some(orchestrator_message::Op::Refused(RegisterRefused {
+                    reason: RegisterError::NotAllowed.to_string(),
+                })),
+            },
+        )
+        .await;
+        return;
+    }
+
     let capabilities = match register.capabilities {
         Some(capabilities) => capabilities,
         None => {
@@ -83,10 +105,11 @@ pub async fn serve_host_client(
     let (mut dispatch_rx, registration) = match registry.register(allowlist, peer_ip, host_id.clone(), capabilities) {
         Ok(registered) => registered,
         Err(e) => {
-            // Refused and logged (D5's Register-authentication ruling, #263):
-            // an unknown registrant's mesh identity never becomes
-            // dispatch-eligible, and never gets more than "no" back.
-            tracing::warn!(peer = %peer_ip, host_id, error = %e, "Register refused: not a permitted executor host");
+            // The allowlist check above already covers RegisterError::NotAllowed;
+            // reaching this arm means host_id was claimed by a different peer
+            // (D5's Register-authentication ruling, #263) — refused and
+            // logged, never more than "no" back.
+            tracing::warn!(peer = %peer_ip, host_id, error = %e, "Register refused: host_id already claimed");
             let _ = write_frame(
                 &mut conn,
                 &OrchestratorMessage {
@@ -269,6 +292,46 @@ mod tests {
         drop(client);
         let registry = tokio::time::timeout(std::time::Duration::from_secs(5), serving).await??;
         assert_eq!(registry.capabilities_of("impostor"), None);
+        Ok(())
+    }
+
+    /// Regression (sandy-91/infra-f3): a non-allowlisted peer must get the
+    /// exact same generic refusal regardless of what its `Register` frame
+    /// carries. Checking `capabilities` before the allowlist would hand an
+    /// unauthenticated peer a more specific error ("capabilities required")
+    /// than the generic one — leaking that it passed a stage it never
+    /// should have reached.
+    #[tokio::test]
+    async fn an_unknown_peer_with_no_capabilities_gets_the_generic_refusal() -> anyhow::Result<()> {
+        let allowlist = ExecutorAllowlist::new(["100.64.0.7".parse()?]);
+        let registry = HostRegistry::default();
+        let (mut client, server) = tokio::io::duplex(4096);
+
+        write_frame(
+            &mut client,
+            &HostClientMessage {
+                op: Some(host_client_message::Op::Register(Register {
+                    host_id: "impostor".to_owned(),
+                    capabilities: None,
+                })),
+            },
+        )
+        .await?;
+
+        let serving = tokio::spawn(async move {
+            serve_host_client(Box::new(server), tcp_peer("100.64.0.9"), &allowlist, &registry).await;
+        });
+
+        let response: OrchestratorMessage = read_frame(&mut client).await?.context("expected a response")?;
+        match response.op {
+            Some(orchestrator_message::Op::Refused(RegisterRefused { reason })) => {
+                assert_eq!(reason, RegisterError::NotAllowed.to_string());
+            }
+            other => anyhow::bail!("expected Refused with the generic reason, got {other:?}"),
+        }
+
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(5), serving).await??;
         Ok(())
     }
 
