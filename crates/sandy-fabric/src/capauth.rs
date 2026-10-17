@@ -120,20 +120,24 @@ pub fn decode_cap(bytes: &[u8]) -> Result<Cap, CapCodecError> {
     serde_json::from_slice(bytes).map_err(|e| CapCodecError(e.to_string()))
 }
 
-/// The file descriptor a launched sandbox agent reads its bootstrap
-/// orchestrator-channel cap from (#109), on the local process backend.
+/// The file descriptor a launched sandbox agent holds its agent link on, on the
+/// local process backend (#216): its stdin. The link is a private socket the
+/// executor created; its other end goes to the orchestrator-side relay.
 ///
-/// NOT a staged file: the guest's login shell exports every file under
-/// `/run/sandy/secrets` into the job's environment, so a cap staged there would
-/// let the untrusted job present it and act as the agent (see `docs/decisions/`,
-/// #177). Instead the executor that launches the agent opens a pipe, writes the
-/// cap ([`encode_cap`]) to the write end, closes it, and passes the read end to
-/// the agent at this fixed descriptor — never `0`/`1`/`2`. The agent reads it to
-/// EOF exactly once ([`decode_cap`]), then closes it before spawning the job, so
-/// the job never inherits the descriptor or anything derived from it. A VM
-/// sandbox's equivalent handoff rides a reserved vsock port instead; this
-/// constant is for the local/process backend only.
-pub const AGENT_CAP_FD: std::os::unix::io::RawFd = 3;
+/// The bootstrap orchestrator-channel cap is the first frame on this link, read
+/// exactly once ([`decode_cap`]) and presented back to the relay to join; the
+/// agent never holds the channel or its authority. NOT a staged file: the
+/// guest's login shell exports every file under `/run/sandy/secrets` into the
+/// job's environment, so a cap staged there would let the untrusted job present
+/// it and act as the agent (see `docs/decisions/`, #177).
+///
+/// Stdin, not a higher descriptor: under `forbid(unsafe_code)` an agent can claim
+/// only `0`/`1`/`2` safely, and an unclaimed inherited descriptor carries no
+/// close-on-exec flag into the job. The agent keeps a close-on-exec duplicate,
+/// points its stdin at `/dev/null`, and gives the job fresh pipes, so the job
+/// never inherits the link. A VM sandbox's equivalent handoff rides a reserved
+/// vsock port instead; this constant is for the local/process backend only.
+pub const AGENT_LINK_FD: std::os::unix::io::RawFd = 0;
 
 #[cfg(test)]
 mod tests {

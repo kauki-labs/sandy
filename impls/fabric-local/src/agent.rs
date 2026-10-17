@@ -2,10 +2,12 @@
 //! channel-membership unit. "Getting inside" a sandbox goes through the agent.
 //!
 //! [`SandboxAgent::bootstrap`] reads the orchestrator-channel cap exactly once
-//! from the consumed-once handoff the executor launched it with
-//! ([`AGENT_CAP_FD`](sandy_fabric::capauth::AGENT_CAP_FD) — never a staged file,
-//! which would leak into the job's exported environment, see `docs/decisions/`
-//! and #177) and joins with it. [`SandboxAgent::serve_tty`] then bridges the
+//! from a consumed-once handoff (never a staged file, which would leak into the
+//! job's exported environment, see `docs/decisions/` and #177) and joins with
+//! it. [`LinkAgent`] is the same agent as its own OS process (#216): the cap is
+//! the first frame on its agent link
+//! ([`AGENT_LINK_FD`](sandy_fabric::capauth::AGENT_LINK_FD)), and it joins
+//! through the orchestrator-side relay ([`crate::link`]). [`SandboxAgent::serve_tty`] then bridges the
 //! job's stdio to Tty traffic on that channel until the job exits.
 //!
 //! Cap-scope enforcement (observe vs interact) is never duplicated here: a
@@ -46,9 +48,15 @@ use sandy_fabric::{
     raw_console::{ConsoleError, ConsoleStatus, RawConsole},
 };
 use sandy_proto::{MessageType, Tty};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    sync::Mutex as AsyncMutex,
+};
 
-use crate::channel::{Channel, ChannelError, MembershipId};
+use crate::{
+    channel::{Channel, ChannelError, MembershipId},
+    link::{LinkError, LinkFrame, read_frame, unhex, write_frame},
+};
 
 /// `content_type` for a Tty envelope carrying orchestrator-to-sandbox input.
 pub const TTY_STDIN: &str = "application/vnd.sandy.tty.stdin";
@@ -84,6 +92,13 @@ pub enum AgentError {
     /// across calls.
     #[error("serve_tty already called on this agent; one job per bootstrap")]
     AlreadyServed,
+    /// The relay refused this agent's join over the link (#216): a forged,
+    /// expired, or wrong-channel cap. The job must not be started.
+    #[error("the relay refused the join: {0}")]
+    Refused(String),
+    /// The agent link faulted or broke protocol.
+    #[error("agent link: {0}")]
+    Link(#[from] LinkError),
 }
 
 /// The per-sandbox gateway: holds the orchestrator-channel membership this
@@ -105,9 +120,8 @@ pub struct SandboxAgent<B, A> {
 impl<B: ChannelBackend + 'static, A: CapAuthority + 'static> SandboxAgent<B, A> {
     /// Read the bootstrap cap from `cap_handoff` to EOF, decode it, and join
     /// `channel` with it. `cap_handoff` is read exactly once and dropped before
-    /// this returns — the consumed-once pipe/fd convention
-    /// ([`AGENT_CAP_FD`](sandy_fabric::capauth::AGENT_CAP_FD)): never re-read,
-    /// never staged to disk.
+    /// this returns — the consumed-once convention: never re-read, never staged
+    /// to disk.
     ///
     /// # Errors
     /// [`AgentError::BootstrapRead`] if `cap_handoff` cannot be read to EOF,
@@ -150,98 +164,244 @@ impl<B: ChannelBackend + 'static, A: CapAuthority + 'static> SandboxAgent<B, A> 
     /// whatever [`Channel::post`] returns if a stdout post itself fails.
     pub async fn serve_tty(
         &self,
-        mut job_stdout: impl AsyncRead + Unpin + Send + 'static,
+        job_stdout: impl AsyncRead + Unpin + Send + 'static,
         job_stderr: impl AsyncRead + Unpin + Send + 'static,
-        mut job_stdin: impl AsyncWrite + Unpin + Send + 'static,
+        job_stdin: impl AsyncWrite + Unpin + Send + 'static,
     ) -> Result<(), AgentError> {
-        if self
-            .served
-            .compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-            )
-            .is_err()
-        {
-            return Err(AgentError::AlreadyServed);
-        }
-
-        let inbound_stream = self.channel.subscribe(&self.membership)?;
-        let inbound = tokio::spawn(async move {
-            let mut inbound_stream = std::pin::pin!(inbound_stream);
-            loop {
-                let env = match inbound_stream.next().await {
-                    Some(Ok(env)) => env,
-                    Some(Err(e)) => {
-                        tracing::warn!(error = %e, "TTY inbound stream faulted; stdin bridge stopped");
-                        break;
-                    }
-                    None => break,
-                };
-                if !matches!(env.message_type, Some(MessageType::Tty(_))) || env.content_type != TTY_STDIN {
-                    continue;
+        claim_once(&self.served)?;
+        let inbound = self.channel.subscribe(&self.membership)?;
+        let stdin_frames = inbound
+            .take_while(|item| {
+                if let Err(e) = item {
+                    tracing::warn!(error = %e, "TTY inbound stream faulted; stdin bridge stopped");
                 }
-                if let Err(e) = job_stdin.write_all(&env.payload).await {
-                    tracing::warn!(error = %e, "writing to job stdin failed; stdin bridge stopped");
-                    break;
+                std::future::ready(item.is_ok())
+            })
+            .filter_map(|item| {
+                std::future::ready(item.ok().and_then(|env| {
+                    (matches!(env.message_type, Some(MessageType::Tty(_))) && env.content_type == TTY_STDIN)
+                        .then_some(env.payload)
+                }))
+            });
+        let port = Arc::new(ChannelPort {
+            channel: Arc::clone(&self.channel),
+            membership: self.membership.clone(),
+        });
+        bridge_tty(port, stdin_frames, job_stdout, job_stderr, job_stdin).await
+    }
+}
+
+/// Where a bridged job's output goes: the in-process channel membership, or the
+/// agent link to the relay (#216). One bridge serves both, so the two agents
+/// cannot drift apart in how they treat the job's stdio.
+trait TtyPort: Send + Sync + 'static {
+    /// Post one chunk of job output tagged `content_type`.
+    fn post(
+        &self,
+        content_type: &'static str,
+        payload: Vec<u8>,
+    ) -> impl std::future::Future<Output = Result<(), AgentError>> + Send;
+}
+
+/// A [`TtyPort`] onto an in-process [`Channel`] membership.
+struct ChannelPort<B, A> {
+    channel: Arc<Channel<B, A>>,
+    membership: MembershipId,
+}
+
+impl<B: ChannelBackend + 'static, A: CapAuthority + 'static> TtyPort for ChannelPort<B, A> {
+    async fn post(&self, content_type: &'static str, payload: Vec<u8>) -> Result<(), AgentError> {
+        self.channel
+            .post(&self.membership, Some(MessageType::Tty(Tty {})), content_type, payload)
+            .await
+            .map(drop)
+            .map_err(AgentError::from)
+    }
+}
+
+/// Mark a one-job-per-bootstrap agent as served, refusing a second call.
+fn claim_once(served: &std::sync::atomic::AtomicBool) -> Result<(), AgentError> {
+    served
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .map(drop)
+        .map_err(|_| AgentError::AlreadyServed)
+}
+
+/// Bridge the job's stdio to `port` until `job_stdout` hits EOF: stdout and
+/// stderr become [`TTY_STDOUT`]/[`TTY_STDERR`] posts, and each chunk of
+/// `stdin_frames` is written to `job_stdin`. See [`SandboxAgent::serve_tty`]
+/// for the exit and drain semantics.
+async fn bridge_tty<P: TtyPort>(
+    port: Arc<P>,
+    stdin_frames: impl futures_core::Stream<Item = Vec<u8>> + Send + 'static,
+    mut job_stdout: impl AsyncRead + Unpin + Send + 'static,
+    job_stderr: impl AsyncRead + Unpin + Send + 'static,
+    mut job_stdin: impl AsyncWrite + Unpin + Send + 'static,
+) -> Result<(), AgentError> {
+    let inbound = tokio::spawn(async move {
+        let mut stdin_frames = std::pin::pin!(stdin_frames);
+        while let Some(bytes) = stdin_frames.next().await {
+            if let Err(e) = job_stdin.write_all(&bytes).await {
+                tracing::warn!(error = %e, "writing to job stdin failed; stdin bridge stopped");
+                break;
+            }
+        }
+    });
+
+    let stderr = tokio::spawn(forward_tty(Arc::clone(&port), job_stderr, TTY_STDERR));
+
+    let mut buf = [0_u8; TTY_CHUNK];
+    let result = loop {
+        match job_stdout.read(&mut buf).await {
+            Ok(0) => break Ok(()),
+            Ok(n) => {
+                if let Err(e) = port.post(TTY_STDOUT, buf[..n].to_vec()).await {
+                    break Err(e);
+                }
+            }
+            Err(e) => break Err(AgentError::Stdio(e)),
+        }
+    };
+    inbound.abort();
+    // Let the stderr side flush what the job wrote before exiting (a job
+    // typically writes its crash/error message to stderr right before
+    // closing stdout) rather than dropping it immediately; bounded so a job
+    // that leaks stderr open cannot hang serve_tty.
+    let stderr_abort = stderr.abort_handle();
+    if tokio::time::timeout(STDERR_DRAIN, stderr).await.is_err() {
+        stderr_abort.abort();
+    }
+    result
+}
+
+/// The sandbox agent as its own OS process (#216): bootstraps over the agent
+/// link from the orchestrator-side relay ([`crate::link::serve_agent_link`])
+/// instead of holding the channel, then bridges the job's stdio the same way
+/// [`SandboxAgent`] does.
+pub struct LinkAgent {
+    port: Arc<LinkPort>,
+    reader: std::sync::Mutex<Option<Box<dyn AsyncRead + Send + Unpin>>>,
+    served: std::sync::atomic::AtomicBool,
+}
+
+impl LinkAgent {
+    /// Read the cap frame from `link` exactly once, present it in `Join`, and
+    /// wait for the relay's verdict. The cap is not kept past the `Join`.
+    ///
+    /// # Errors
+    /// [`AgentError::Refused`] if the relay refuses the join,
+    /// [`AgentError::BootstrapDecode`] if the cap frame is not a cap,
+    /// [`AgentError::Link`] if the link faults or the relay breaks protocol.
+    pub async fn bootstrap<L>(link: L) -> Result<Self, AgentError>
+    where
+        L: AsyncRead + AsyncWrite + Send + 'static,
+    {
+        let (mut rd, mut wr) = tokio::io::split(link);
+        let cap = match read_frame(&mut rd).await? {
+            Some(LinkFrame::Cap { cap }) => cap,
+            Some(other) => {
+                return Err(LinkError::Protocol(format!("expected the cap frame first, got {}", other.kind())).into());
+            }
+            None => return Err(LinkError::Protocol("the link closed before the cap frame".to_string()).into()),
+        };
+        // Refuse garbage here rather than presenting it; the relay re-verifies.
+        decode_cap(&unhex(&cap, "the cap frame")?)?;
+        write_frame(&mut wr, &LinkFrame::Join { cap }).await?;
+        match read_frame(&mut rd).await? {
+            Some(LinkFrame::Joined) => {}
+            Some(LinkFrame::Refused { reason }) => return Err(AgentError::Refused(reason)),
+            Some(other) => {
+                return Err(LinkError::Protocol(format!("expected the join verdict, got {}", other.kind())).into());
+            }
+            None => return Err(LinkError::Protocol("the link closed before the join verdict".to_string()).into()),
+        }
+        Ok(Self {
+            port: Arc::new(LinkPort {
+                writer: AsyncMutex::new(Box::new(wr)),
+            }),
+            reader: std::sync::Mutex::new(Some(Box::new(rd))),
+            served: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// Bridge the job's stdio over the link until `job_stdout` hits EOF, with
+    /// the same semantics as [`SandboxAgent::serve_tty`].
+    ///
+    /// # Errors
+    /// As [`SandboxAgent::serve_tty`], with link faults as [`AgentError::Link`].
+    pub async fn serve_tty(
+        &self,
+        job_stdout: impl AsyncRead + Unpin + Send + 'static,
+        job_stderr: impl AsyncRead + Unpin + Send + 'static,
+        job_stdin: impl AsyncWrite + Unpin + Send + 'static,
+    ) -> Result<(), AgentError> {
+        claim_once(&self.served)?;
+        let reader = self
+            .reader
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or(AgentError::AlreadyServed)?;
+        let stdin_frames = futures_util::stream::unfold(reader, |mut reader| async move {
+            loop {
+                match read_frame(&mut reader).await {
+                    Ok(Some(LinkFrame::Deliver { content_type, payload })) if content_type == TTY_STDIN => {
+                        match unhex(&payload, "a deliver payload") {
+                            Ok(bytes) => return Some((bytes, reader)),
+                            Err(e) => tracing::warn!(error = %e, "dropping a malformed stdin frame"),
+                        }
+                    }
+                    Ok(Some(other)) => tracing::warn!(kind = other.kind(), "ignoring an unexpected link frame"),
+                    Ok(None) => return None,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "agent link faulted; stdin bridge stopped");
+                        return None;
+                    }
                 }
             }
         });
+        bridge_tty(Arc::clone(&self.port), stdin_frames, job_stdout, job_stderr, job_stdin).await
+    }
+}
 
-        let stderr = tokio::spawn(forward_tty(
-            Arc::clone(&self.channel),
-            self.membership.clone(),
-            job_stderr,
-            TTY_STDERR,
-        ));
+impl LinkAgent {
+    /// Report the job's exit to the relay as the link's last frame. A run whose
+    /// agent never reports is an infra fault, not a job result (INV-11).
+    ///
+    /// # Errors
+    /// [`AgentError::Link`] if the frame cannot be written.
+    pub async fn report_exit(&self, code: i32) -> Result<(), AgentError> {
+        Ok(write_frame(&mut *self.port.writer.lock().await, &LinkFrame::Exit { code }).await?)
+    }
+}
 
-        let mut buf = [0_u8; TTY_CHUNK];
-        let result = loop {
-            match job_stdout.read(&mut buf).await {
-                Ok(0) => break Ok(()),
-                Ok(n) => {
-                    if let Err(e) = self
-                        .channel
-                        .post(
-                            &self.membership,
-                            Some(MessageType::Tty(Tty {})),
-                            TTY_STDOUT,
-                            buf[..n].to_vec(),
-                        )
-                        .await
-                    {
-                        break Err(e.into());
-                    }
-                }
-                Err(e) => break Err(AgentError::Stdio(e)),
-            }
+/// A [`TtyPort`] onto the agent link's write half.
+struct LinkPort {
+    writer: AsyncMutex<Box<dyn AsyncWrite + Send + Unpin>>,
+}
+
+impl TtyPort for LinkPort {
+    async fn post(&self, content_type: &'static str, payload: Vec<u8>) -> Result<(), AgentError> {
+        let frame = LinkFrame::Post {
+            content_type: content_type.to_string(),
+            payload: hex::encode(payload),
         };
-        inbound.abort();
-        // Let the stderr side flush what the job wrote before exiting (a job
-        // typically writes its crash/error message to stderr right before
-        // closing stdout) rather than dropping it immediately; bounded so a job
-        // that leaks stderr open cannot hang serve_tty.
-        let stderr_abort = stderr.abort_handle();
-        if tokio::time::timeout(STDERR_DRAIN, stderr).await.is_err() {
-            stderr_abort.abort();
-        }
-        result
+        Ok(write_frame(&mut *self.writer.lock().await, &frame).await?)
     }
 }
 
 /// Upper bound on draining the stderr bridge after `job_stdout` reaches EOF.
 const STDERR_DRAIN: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Forward `reader` to the channel as `content_type`-tagged Tty posts until EOF
-/// or a post fails. Used for the stderr side, which (unlike stdout) is not the
-/// signal `serve_tty` waits on to decide the job has exited.
-async fn forward_tty<B: ChannelBackend + 'static, A: CapAuthority + 'static>(
-    channel: Arc<Channel<B, A>>,
-    membership: MembershipId,
-    mut reader: impl AsyncRead + Unpin + Send,
-    content_type: &'static str,
-) {
+/// Forward `reader` to `port` as `content_type`-tagged posts until EOF or a
+/// post fails. Used for the stderr side, which (unlike stdout) is not the
+/// signal the bridge waits on to decide the job has exited.
+async fn forward_tty<P: TtyPort>(port: Arc<P>, mut reader: impl AsyncRead + Unpin + Send, content_type: &'static str) {
     let mut buf = [0_u8; TTY_CHUNK];
     loop {
         let n = match reader.read(&mut buf).await {
@@ -254,15 +414,7 @@ async fn forward_tty<B: ChannelBackend + 'static, A: CapAuthority + 'static>(
         if n == 0 {
             return;
         }
-        if let Err(e) = channel
-            .post(
-                &membership,
-                Some(MessageType::Tty(Tty {})),
-                content_type,
-                buf[..n].to_vec(),
-            )
-            .await
-        {
+        if let Err(e) = port.post(content_type, buf[..n].to_vec()).await {
             tracing::warn!(error = %e, content_type, "TTY forward post failed; bridge stopped");
             return;
         }

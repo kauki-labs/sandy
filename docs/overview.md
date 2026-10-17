@@ -49,7 +49,8 @@ before any VM, network, or P2P transport exists; a composition root then
 selects one impl per seam (the all-local MVP, a local-VM profile, a remote
 profile). `sandy-proto` carries the channel envelope; `sandy-fabric` is the
 seam contracts and harness; `sandy-fabric-local` is the all-local profile's
-trivial impls, one module per seam.
+trivial impls, one module per seam; `sandy-agent` is the sandbox agent as its own
+process, which the process backend puts between itself and the job.
 
 Block-by-block status lives on the epic's sub-issues, not here — a merged
 block moves fast enough that a hand-maintained landed/open list in prose goes

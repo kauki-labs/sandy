@@ -12,6 +12,7 @@ pub mod channel;
 pub mod escalation_sink;
 pub mod executor;
 pub mod inmem;
+pub mod link;
 pub mod minter;
 pub mod placement;
 pub mod roles;

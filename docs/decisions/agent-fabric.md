@@ -222,8 +222,8 @@ be able to mint its own cap (spec §3.8, INV-1).
 - The channel cap does not ride that channel. The guest exports every staged
   secret into the job's environment from a mount the job can read, so a cap there
   would let the untrusted job act as the agent. The bootstrap orchestrator cap goes
-  to the agent out of band over its launch channel: vsock for a VM, a consume-once
-  pipe from executor to agent for the local backend, never an env var (#108, #109).
+  to the agent out of band over its launch channel: vsock for a VM, the first frame
+  on the agent link for the local backend (§10), never an env var (#108, #109).
   `stage_cap` is a host-side writer for an agent-only surface. It returns a path,
   not a `SecretRef`, so the cap cannot be put into `RunSpec.secrets` by accident.
 
@@ -265,52 +265,88 @@ of the log is spec §7 work.
 
 ## 10. The sandbox agent: a separate process, TTY over the existing envelope, an honest break-glass stub
 
-**Status:** accepted.
+**Status:** accepted. The process wiring (#216) supersedes the original fd-3 cap
+pipe.
 
 **Context.** The agent is "the only door": the sandbox boundary is the trust
 boundary, and a channel must never become a bypass of it (spec §4). The bootstrap
 orchestrator-channel cap in particular must never reach the job it supervises — a
 job holding it could post as the agent.
 
-**Decision.** In `sandy-fabric-local` (`agent.rs`, #109):
+**Decision.** In `sandy-fabric-local` (`agent.rs`, `link.rs`) and `sandy-agent`
+(`impls/agent`):
 
-- `SandboxAgent` is launched by the executor as the sandbox's own process (not
-  in-process with the executor), which then execs/supervises the job as ITS child.
-  This holds for the process backend today and needs no redesign once a VM-backed
-  agent exists: "agent is the only door" means the same thing in both topologies.
-- The bootstrap cap arrives over a consumed-once pipe from the executor
-  (`AGENT_CAP_FD`, sandy-fabric), never a staged file: the guest's login shell
-  blanket-exports every file under `/run/sandy/secrets` into the job's environment,
-  so a staged cap would reach the job and let it present it as the agent (#177
-  tracks replacing that blanket export with an agent-owned allowlist once this
-  lands). `bootstrap` reads the fd to EOF, decodes with `decode_cap`, and joins —
-  the fd is never read twice and never touches disk.
+- The agent is its own OS process, between the executor and the job. With
+  `ProcessBackend::with_agent`, the backend launches `sandy-agent -- <job>` inside
+  the containment, and the agent runs the job as its child with fresh stdio pipes.
+  "Agent is the only door" means the same thing once a VM-backed agent exists.
+- The agent does not hold the channel. Verifying a cap needs the authority's key,
+  and an agent with that key could mint its own caps (§8). The channel stays with
+  the orchestrator, and `serve_agent_link` relays for one agent over a private link
+  the backend creates per run: a close-on-exec unix socket pair, one end as the
+  agent's stdin (`AGENT_LINK_FD`, sandy-fabric), the other handed to the caller's
+  `on_link`.
+- The bootstrap cap is the first frame on that link, read exactly once and
+  presented back in `Join`; the relay runs `Channel::join`, so a forged, expired,
+  or wrong-channel cap is refused there. One `Join` per link. The agent may post
+  only `TTY_STDOUT`/`TTY_STDERR`; the relay delivers `TTY_STDIN`. The cap is never
+  a staged file: the guest's login shell exports every file under
+  `/run/sandy/secrets` into the job's environment (#177).
+- The job never inherits the link: the agent keeps a close-on-exec duplicate,
+  points its own stdin at `/dev/null`, and gives the job fresh pipes. Its
+  environment is the backend's, unchanged.
+- The job's result travels over the link, not in the agent's exit status
+  (INV-11). After the job exits, the agent sends its code (`128 + signal` for a
+  signal death) as the link's last frame; the relay returns it, and the caller
+  reports it to the backend through the `AgentReport` that `on_link` received.
+  The backend takes `guest_exit` only from that report. No report (the agent was
+  refused, faulted, panicked, or was killed) is an infra fault. The agent's
+  process status cannot serve: under `bwrap` it is the wrapper's, and the job
+  shares the agent's uid and can signal it. The agent tees the job's output to
+  its own stdio, so `Outcome.console` is unchanged.
 - TTY traffic reuses the existing `Tty` envelope marker with no new wire type:
   `content_type` (`TTY_STDIN`/`TTY_STDOUT`/`TTY_STDERR`) carries the direction,
-  raw bytes ride `payload`. Cap-scope enforcement (observe vs interact) is never
-  duplicated in the agent — `Channel::post` already refuses a non-`post` member
-  before an envelope is stored, so an eavesdropper's input never reaches the job.
+  raw bytes ride `payload`. In-process (`SandboxAgent`) and as a process
+  (`LinkAgent`), the agent bridges through one shared function. Cap-scope
+  enforcement (observe vs interact) is never duplicated in the agent:
+  `Channel::post` already refuses a non-`post` member before an envelope is
+  stored.
 - `RawConsole` (sandy-fabric) is the break-glass seam; `UnavailableConsole` is the
   process backend's impl, reporting `Unavailable` and refusing every read/write —
   a bare process has no serial console, and a silent no-op there would be
   indistinguishable from a working fallback until an operator actually needed it.
   The real console wiring (`sandy_api::console::Transport`, already built for the
-  VM run path) lands with a VM-backed agent; not this PR's scope.
+  VM run path) lands with a VM-backed agent.
 
-**Consequences.** The executor-to-agent fd handoff and the `Channel`'s own rights
-enforcement are the only places INV-1/boundedness is enforced for this surface —
-no second copy of either check exists to drift out of sync. `UnavailableConsole`
-means #109's "break-glass works when the agent is down" positive case is honestly
-NOT demonstrated for the process backend (there is nothing to demonstrate); it is
-deferred to the VM-backed `RawConsole`, tracked separately.
+**Consequences.** The relay's join and the `Channel`'s own rights enforcement are
+the only places INV-1/boundedness is enforced for this surface; no second copy of
+either check exists to drift out of sync. An agent-mode `ProcessBackend` runs one
+job, and the composition root builds one per sandbox run, with `on_link` closing
+over that run's channel and cap: re-joining with a cap replays the channel's
+earlier stdin, so neither may be reused across runs (spec §3.4). Known limits of
+the local process backend: a job shares the agent's uid, so it can kill its agent
+(an infra fault, never a result it chose) and, where `ptrace` is open, read the
+agent's memory (the agent marks itself non-dumpable on Linux); on macOS a socket
+pair gets close-on-exec in a second call, so another thread's spawn in the same
+host process can race it. `UnavailableConsole` means #109's
+"break-glass works when the agent is down" positive case is honestly NOT
+demonstrated for the process backend; it is deferred to the VM-backed
+`RawConsole`, tracked separately.
 
-**Set aside.** Staging the cap under a reserved name or a separate agent-only
-subdirectory on the existing secrets mount: both still share the mount the job
-reads from and depend on the backend giving the agent and the job distinct
-identities, which the local process backend does not (ruled out in favor of the
-out-of-band fd handoff, reaffirming §8's "set aside" on this point). Wiring
-`sandy_api::console::Transport` into `RawConsole` now: no VM-backed agent exists
-yet to wire it to.
+**Set aside.**
+
+- The cap on a separate pipe at fd 3 (the original `AGENT_CAP_FD`). Under
+  `forbid(unsafe_code)` the agent cannot claim a descriptor above 2, and an
+  unclaimed inherited one carries no close-on-exec flag into the job. Stdin also
+  survives the `systemd-run` and `bwrap` wrappers without fd-passing flags.
+- The agent hosting its own `Channel` over a shared backend: it would need the
+  authority's key to verify caps.
+- Staging the cap under a reserved name or a separate agent-only subdirectory on
+  the existing secrets mount: both still share the mount the job reads from and
+  depend on the backend giving the agent and the job distinct identities, which
+  the local process backend does not (§8).
+- Wiring `sandy_api::console::Transport` into `RawConsole` now: no VM-backed agent
+  exists yet to wire it to.
 
 ## 11. Channel roles are thin wrappers; `EscalationSink` is a new seam
 

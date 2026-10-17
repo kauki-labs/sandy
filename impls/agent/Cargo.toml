@@ -1,0 +1,41 @@
+[package]
+name = "sandy-agent"
+description = "The sandy sandbox agent as its own OS process: joins through the orchestrator-side relay and supervises the job as its child"
+version.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+documentation = "https://docs.rs/sandy-agent"
+keywords = ["sandbox", "agent", "fabric", "process"]
+categories = ["development-tools"]
+
+[[bin]]
+name = "sandy-agent"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+rustix = { workspace = true, features = ["process", "stdio"] }
+sandy-fabric-local.workspace = true
+tokio = { workspace = true, features = [
+  "rt-multi-thread",
+  "net",
+  "process",
+  "io-util",
+] }
+
+[dev-dependencies]
+anyhow.workspace = true
+futures-util.workspace = true
+sandy-api.workspace = true
+sandy-fabric.workspace = true
+sandy-impls-local.workspace = true
+sandy-proto.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

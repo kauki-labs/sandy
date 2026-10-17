@@ -40,6 +40,10 @@ version, metadata, dependency versions, and lints through the root `Cargo.toml`
   local impls, one module per seam. Under active development; see the crate's
   `src/` for the current module set, or epic #103's sub-issues for which seams
   have landed.
+- **`sandy-agent`** (`impls/agent`) — the sandbox agent as its own OS process: the
+  process backend launches it with its agent link on stdin, it joins through the
+  orchestrator-side relay (`sandy-fabric-local::link`), and runs the job as its
+  child. See `docs/decisions/agent-fabric.md` §10.
 
 ## Build & test (run before committing)
 
@@ -94,7 +98,8 @@ crates/
 impls/
   ├─ local/          - raw-process backend, local-dir share transport, host containment
   ├─ vm/             - QemuBackend (Linux) + VfkitBackend (macOS), virtio-fs transports, console driver
-  └─ fabric-local/   - agent-fabric trivial local impls: in-memory ChannelBackend, LocalCapAuthority, placement
+  ├─ fabric-local/   - agent-fabric trivial local impls: in-memory ChannelBackend, LocalCapAuthority, placement, agent link
+  └─ agent/          - the `sandy-agent` binary: the sandbox agent as its own process, the job as its child
 nix/
   ├─ packages/       - crane build definitions
   └─ guest/          - bootable microVM guests + the Topology seam (own flake)
