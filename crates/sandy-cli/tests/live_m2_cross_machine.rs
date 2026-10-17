@@ -30,16 +30,16 @@
 //! | Register-auth: unknown mesh identity gets no ack/dispatch (infra-f3's  | this file, `register_from_an_unlisted_mesh_identity_gets_no_ack_and_no_dispatch`            |
 //! | addendum to #263)                                                      |                                                                                              |
 //! | decision-6: wrong-peer refused, zero bytes                             | `sandyd::dispatch` / `link_auth` unit tests (#266, merged); re-asserted at the mesh-accept    |
-//! |                                                                        | loop by #279 (owner sandy-d1, decodes the prefix, authenticates via decision-6)              |
-//! | decision-6: wrong-token refused, zero bytes                            | `sandyd::dispatch` / `link_auth` unit tests (#266, merged); re-asserted by #279               |
+//! |                                                                        | loop by #290 (#279, open, CI-green, holding for a pre-auth decode-deadline fix)               |
+//! | decision-6: wrong-token refused, zero bytes                            | `sandyd::dispatch` / `link_auth` unit tests (#266, merged); re-asserted by #290 (#279)         |
 //! | decision-6: unknown run id refused, zero bytes                         | `sandyd::dispatch` unit tests (#266, merged) — `LinkAuthError::UnknownRun`; re-asserted by    |
-//! |                                                                        | #279                                                                                          |
+//! |                                                                        | #290 (#279)                                                                                    |
 //! | decision-6: already-claimed link slot refused (one link per run)       | `sandyd::link_auth` unit tests (#266, merged) — `concurrent_claims_admit_exactly_one_stream`; |
-//! |                                                                        | re-asserted by #279                                                                           |
-//! | Isolation-class gate, orchestrator side: `send_dispatch` refuses a     | #280 (owner sandy-d1), not landed                                                             |
-//! | class the target host didn't declare, fail-closed                     |                                                                                                |
-//! | Isolation-class gate, executor side: the `admits_untrusted` re-check   | sandy-91's `dispatch.rs` in `sandy-host-client`, not landed                                   |
-//! | (defense in depth), fail-closed                                       |                                                                                                |
+//! |                                                                        | re-asserted by #290 (#279)                                                                     |
+//! | Isolation-class gate, orchestrator side: `send_dispatch` refuses a     | #277 (open, CI-green) — `DispatchSendError::UnsupportedIsolationClass`, tested. #280 closed   |
+//! | class the target host didn't declare, fail-closed                     | as a duplicate of this.                                                                       |
+//! | Isolation-class gate, executor side: `check_isolation_class` re-checks | #284 (open) — reuses `sandy::admits_untrusted`; `Unspecified` refused, never treated as the   |
+//! | `Dispatch.required_isolation_class` (defense in depth), fail-closed   | weaker `Trusted`.                                                                              |
 //! | Result path: exit via the locked `ResultEnvelope`/`AgentReport` (INV-  | existing unit coverage (`impls/fabric-local/src/{agent,link,executor}.rs`,                   |
 //! | 11); an agent failure with no report is an infra fault, not a job exit | `sandy-cli/tests/live_agent.rs`); reasserted end-to-end, cross-machine, in this file's        |
 //! |                                                                        | happy-path test (step 7)                                                                     |
