@@ -7,7 +7,9 @@
 //!
 //! One request per connection, one newline-terminated JSON line each way:
 //! `send` posts one message, `recv` drains the inbox (`wait` blocks for at least
-//! one message) and reports how many deliveries the full inbox dropped. A drain
+//! one message) and reports how many deliveries the full inbox dropped and how
+//! many posts the relay refused. `send` answers `submitted`: the agent took the
+//! message, but delivery is not confirmed (a refusal shows in the count). A drain
 //! returns what fits in one reply line and keeps the rest for the next `recv`.
 //! One `send` and one `recv` at a time, independently: a request whose slot is
 //! held is closed unanswered after its line is read, and the client helper
@@ -77,15 +79,18 @@ pub struct Message {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "reply", rename_all = "snake_case")]
 pub enum Reply {
-    /// The message was posted.
-    Sent,
-    /// The drained messages, and how many deliveries the full inbox has dropped
-    /// in total.
+    /// The agent took the message for the relay. Delivery is not confirmed: a
+    /// post the relay refuses shows later in [`Reply::Messages`]' `refused`.
+    Submitted,
+    /// The drained messages, how many deliveries the full inbox has dropped,
+    /// and how many posts the relay has refused, in total.
     Messages {
         /// The messages, oldest first.
         messages: Vec<Message>,
         /// The running count of dropped deliveries.
         dropped: u64,
+        /// The running count of refused posts.
+        refused: u64,
     },
     /// The request failed.
     Error {
@@ -94,8 +99,8 @@ pub enum Reply {
     },
 }
 
-/// What the server needs from the agent: posting on a joined peer channel, and
-/// the inbox overflow count.
+/// What the server needs from the agent: posting on a joined peer channel, the
+/// inbox overflow count, and the refused-post count.
 pub trait PeerPort: Send + Sync + 'static {
     /// Post on peer channel `channel`, refusing one the agent did not join.
     fn post(
@@ -106,6 +111,8 @@ pub trait PeerPort: Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), String>> + Send;
     /// Deliveries the full inbox has dropped so far.
     fn dropped(&self) -> u64;
+    /// Posts the relay has refused so far.
+    fn refused(&self) -> u64;
 }
 
 /// Serve the job's peer requests on `listener` until it is dropped.
@@ -221,7 +228,7 @@ async fn handle<P: PeerPort>(
                 error: format!("the payload is not base64: {e}"),
             },
             Ok(bytes) => match port.post(channel, content_type, bytes).await {
-                Ok(()) => Reply::Sent,
+                Ok(()) => Reply::Submitted,
                 Err(error) => Reply::Error { error },
             },
         },
@@ -244,6 +251,7 @@ async fn handle<P: PeerPort>(
             Reply::Messages {
                 messages: inbox.drain(MAX_LINE - REPLY_OVERHEAD),
                 dropped: port.dropped(),
+                refused: port.refused(),
             }
         }
     };
@@ -335,6 +343,10 @@ impl PeerPort for AgentPeers {
     fn dropped(&self) -> u64 {
         self.0.peer_dropped()
     }
+
+    fn refused(&self) -> u64 {
+        self.0.peer_refused()
+    }
 }
 
 /// Make a private (0700) dir, serve the agent's peer channels on a socket in
@@ -405,15 +417,20 @@ fn run_cli(args: &[std::ffi::OsString]) -> Result<(), String> {
         Command::Recv { wait } => Request::Recv { wait },
     };
     match request(Path::new(&socket), &req).map_err(|e| e.to_string())? {
-        Reply::Sent => Ok(()),
+        Reply::Submitted => Ok(()),
         Reply::Error { error } => Err(error),
-        Reply::Messages { messages, dropped } => {
+        Reply::Messages {
+            messages,
+            dropped,
+            refused,
+        } => {
             let mut out = io::stdout().lock();
             for message in messages {
                 let line = serde_json::to_string(&message).map_err(|e| e.to_string())?;
                 writeln!(out, "{line}").map_err(|e| e.to_string())?;
             }
-            writeln!(out, "{}", serde_json::json!({ "dropped": dropped })).map_err(|e| e.to_string())
+            writeln!(out, "{}", serde_json::json!({ "dropped": dropped, "refused": refused }))
+                .map_err(|e| e.to_string())
         }
     }
 }
@@ -453,6 +470,10 @@ mod tests {
 
         fn dropped(&self) -> u64 {
             3
+        }
+
+        fn refused(&self) -> u64 {
+            2
         }
     }
 
@@ -503,7 +524,7 @@ mod tests {
             },
         )
         .await?;
-        assert_eq!(reply, Reply::Sent);
+        assert_eq!(reply, Reply::Submitted);
         assert_eq!(
             *port.posted.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
             [("group-a".to_string(), "text/plain".to_string(), b"hi".to_vec())]
@@ -512,7 +533,7 @@ mod tests {
         tx.send(delivery(1)).await?;
         tx.send(delivery(2)).await?;
         let reply = ask(&socket, Request::Recv { wait: false }).await?;
-        let Reply::Messages { messages, dropped } = reply else {
+        let Reply::Messages { messages, dropped, .. } = reply else {
             anyhow::bail!("expected messages, got {reply:?}");
         };
         assert_eq!(dropped, 3, "the overflow count is reported with every drain");
@@ -594,7 +615,7 @@ mod tests {
         )
         .await
         .context("a send was starved by the blocked recv")??;
-        assert_eq!(sent, Reply::Sent);
+        assert_eq!(sent, Reply::Submitted);
         assert_eq!(
             port.posted
                 .lock()

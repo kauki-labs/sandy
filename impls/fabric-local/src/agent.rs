@@ -308,6 +308,8 @@ pub struct LinkAgent {
     peer_inbox: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<PeerDelivery>>>,
     /// Peer deliveries dropped because the inbox was full.
     peer_dropped: Arc<std::sync::atomic::AtomicU64>,
+    /// Peer posts the relay refused (#256).
+    peer_refused: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// How many peer deliveries wait in the inbox before newer ones are dropped
@@ -397,6 +399,7 @@ impl LinkAgent {
             peer_tx,
             peer_inbox: std::sync::Mutex::new(Some(peer_inbox)),
             peer_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            peer_refused: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -432,6 +435,7 @@ impl LinkAgent {
             stdin_tx,
             self.peer_tx.clone(),
             Arc::clone(&self.peer_dropped),
+            Arc::clone(&self.peer_refused),
         )));
         let stdin_frames =
             futures_util::stream::unfold(
@@ -459,6 +463,7 @@ async fn route_link(
     stdin_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     peer_tx: tokio::sync::mpsc::Sender<PeerDelivery>,
     peer_dropped: Arc<std::sync::atomic::AtomicU64>,
+    peer_refused: Arc<std::sync::atomic::AtomicU64>,
 ) {
     loop {
         match read_frame(&mut reader).await {
@@ -492,6 +497,13 @@ async fn route_link(
                 }
                 Err(e) => tracing::warn!(error = %e, "dropping a malformed stdin frame"),
             },
+            // After setup the relay sends `Refused` only for a peer post it
+            // refused (#256); one answering a repeated `Join` would count too,
+            // but a compliant agent never sends one.
+            Ok(Some(LinkFrame::Refused { reason })) => {
+                let total = peer_refused.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                tracing::warn!(refused = total, %reason, "the relay refused a peer post");
+            }
             Ok(Some(other)) => tracing::warn!(kind = other.kind(), "ignoring an unexpected link frame"),
             Ok(None) => return,
             Err(e) => {
@@ -533,6 +545,14 @@ impl LinkAgent {
     #[must_use]
     pub fn peer_dropped(&self) -> u64 {
         self.peer_dropped.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many peer posts the relay refused on a joined channel (its cap
+    /// expired or was revoked). [`post_peer`](Self::post_peer) returns before the
+    /// relay decides, so this count is where a refusal shows (#256).
+    #[must_use]
+    pub fn peer_refused(&self) -> u64 {
+        self.peer_refused.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The receiver for messages on this agent's peer channels; `Some` once.

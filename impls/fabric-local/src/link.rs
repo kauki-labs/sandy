@@ -71,7 +71,8 @@ pub enum LinkFrame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         channel: Option<String>,
     },
-    /// Relay to agent: the join (or a repeated join) was refused.
+    /// Relay to agent: the join (or a repeated join) was refused, or after
+    /// setup, a peer post was refused on a joined channel (#256).
     Refused {
         /// Why, for the agent's diagnostics. Never carries the cap.
         reason: String,
@@ -544,7 +545,15 @@ where
                 {
                     Ok(_) => {}
                     Err(e @ ChannelError::Backend(_)) => return Err(e.into()),
-                    Err(e) => tracing::warn!("peer channel {name} refused the agent's post: {e}"),
+                    Err(e) => {
+                        // Tell the agent too, so the job can see it (#256). The
+                        // reason is the channel error's text: it carries no cap.
+                        // Best effort: an agent that already closed its side may
+                        // still have its exit report queued behind this post.
+                        let reason = format!("peer channel {name} refused the post: {e}");
+                        tracing::warn!("{reason}");
+                        let _ = write_frame(&mut *wr.lock().await, &LinkFrame::Refused { reason }).await;
+                    }
                 }
             }
             Some(LinkFrame::Exit { code }) => exit = Some(code),
@@ -1138,6 +1147,48 @@ mod tests {
 
         write_frame(&mut agent_end, &LinkFrame::Exit { code: 0 }).await?;
         drop(agent_end);
+        timeout(WAIT, relay).await???;
+        Ok(())
+    }
+
+    /// #256 end to end: the agent counts the refusal the relay reports, so the
+    /// job can see a post it was told was only submitted did not go through.
+    #[tokio::test]
+    async fn an_agent_counts_the_peer_posts_the_relay_refused() -> anyhow::Result<()> {
+        let (channel, agent_cap, _) = channel_and_caps().await?;
+        let (group, agent_peer_cap, expires_at) = expiring_peer_channel().await?;
+        let grants = vec![PeerGrant {
+            channel: group,
+            cap: agent_peer_cap,
+        }];
+        let (agent_end, host_end) = tokio::io::duplex(64 * 1024);
+        let relay =
+            tokio::spawn(async move { serve_agent_link_with_peers(channel, &agent_cap, grants, host_end).await });
+        let agent = Arc::new(timeout(WAIT, LinkAgent::bootstrap(agent_end)).await??);
+        let (stdout_agent, job_stdout) = tokio::io::duplex(1024);
+        let (stderr_agent, job_stderr) = tokio::io::duplex(1024);
+        let (stdin_agent, _job_stdin) = tokio::io::duplex(1024);
+        let serving = tokio::spawn({
+            let agent = Arc::clone(&agent);
+            async move { agent.serve_tty(stdout_agent, stderr_agent, stdin_agent).await }
+        });
+
+        agent.post_peer("group-a", "text/plain", b"in-time".to_vec()).await?;
+        until_expired(expires_at).await?;
+        assert_eq!(agent.peer_refused(), 0, "a post the relay accepted is not counted");
+        agent.post_peer("group-a", "text/plain", b"too-late".to_vec()).await?;
+        timeout(WAIT, async {
+            while agent.peer_refused() == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .context("the agent never counted the refused post")?;
+        assert_eq!(agent.peer_refused(), 1);
+
+        drop((job_stdout, job_stderr));
+        timeout(WAIT, serving).await???;
+        drop(agent);
         timeout(WAIT, relay).await???;
         Ok(())
     }

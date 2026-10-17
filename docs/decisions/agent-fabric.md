@@ -317,7 +317,11 @@ job holding it could post as the agent.
   subscribes to channels it joined. A post the channel refuses on a joined
   channel (its cap expired or was revoked) is logged and dropped, and the relay
   goes on, so the job's exit report still arrives (INV-11); a backend fault
-  still ends the relay. The job's `send` is not told of the refusal yet. Peer messages are `PeerMsg`-typed, and the
+  still ends the relay. The relay also sends the agent the existing `Refused`
+  frame (best effort; the reason is the channel error, never the cap), and the
+  agent counts it (`LinkAgent::peer_refused`, #256), so a refusal is observable
+  without a new frame; an older agent ignores it. Per-post delivery acks are
+  deferred (#257). Peer messages are `PeerMsg`-typed, and the
   agent's own posts come back like any member's. The agent's peer inbox
   (`LinkAgent::take_peer_inbox`) is bounded and drops any delivery that arrives
   while it is full; what it keeps stays in order, and every drop is counted
@@ -332,8 +336,9 @@ job holding it could post as the agent.
   agent serves in a private (0700) dir, named by `SANDY_PEER_SOCKET` (a path,
   not a secret: the caps stay in the agent). One request per connection, as
   newline-delimited JSON: `send` posts through the agent, which refuses a channel
-  it did not join (the relay checks again), and `recv` drains the inbox with its
-  drop count (`wait` blocks for one message, and ends if the client goes away, so a
+  it did not join (the relay checks again), and answers `submitted`, never
+  claiming delivery, and `recv` drains the inbox with its
+  drop and refused counts (`wait` blocks for one message, and ends if the client goes away, so a
   client keeps its write side open until the reply).
   A drain returns what fits in one reply line and keeps the rest, in order, for
   the next `recv`. One `recv` and one `send` at a
