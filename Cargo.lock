@@ -2096,6 +2096,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandy-fabric-compose"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "hex",
+ "sandy-api",
+ "sandy-backend",
+ "sandy-fabric",
+ "sandy-fabric-local",
+ "sha2 0.11.0",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "sandy-fabric-local"
 version = "0.1.1"
 dependencies = [
