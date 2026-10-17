@@ -5,7 +5,7 @@ members = ["crates/*", "impls/*"]
 # Shared metadata and dependency versions for every member crate. Members opt in
 # with `version.workspace = true`, `thiserror.workspace = true`, and so on.
 [workspace.package]
-version = "0.1.1"
+# No shared `version`: each crate owns its version (released per binary).
 authors = ["Tibor Csóka <tibor.csoka@kauki.xyz>"]
 homepage = "https://kauki.xyz/"
 repository = "https://github.com/kauki-labs/sandy"

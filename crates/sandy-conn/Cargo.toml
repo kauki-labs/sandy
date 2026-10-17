@@ -3,7 +3,7 @@ name = "sandy-conn"
 # Not published: the cross-machine transport is not wired into any binary yet (#205 B6, future use).
 publish = false
 description = "The one stream transport sandyd's control RPC (and, later, cross-machine channel delivery) ride: UDS (local) -> vsock (VM guest) -> TCP/QUIC-over-mesh (cross-machine), per epic #205's B6"
-version.workspace = true
+version = "0.1.1"
 authors.workspace = true
 homepage.workspace = true
 repository.workspace = true

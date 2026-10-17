@@ -4,7 +4,7 @@
 # unchanged in-tree and for dependents (which alias it with `package = "sandy-lib"`).
 name = "sandy-lib"
 description = "The sandy sandbox library: run plane, provisioning, seed verification, egress, and operability behind one curated API"
-version.workspace = true
+version = "0.1.1"
 authors.workspace = true
 homepage.workspace = true
 repository.workspace = true

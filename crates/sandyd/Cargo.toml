@@ -1,7 +1,7 @@
 [package]
 name = "sandyd"
 description = "sandyd: the per-machine control-plane daemon dispatching jobs into the agent fabric (epic #205)"
-version.workspace = true
+version = "0.1.1"
 authors.workspace = true
 homepage.workspace = true
 repository.workspace = true
