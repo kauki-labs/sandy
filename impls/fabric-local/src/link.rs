@@ -943,6 +943,33 @@ mod tests {
         Ok(())
     }
 
+    /// CodeRabbit on #246: cancelling `serve_tty` must not leave the link reader
+    /// detached, holding the link open: once the agent is dropped, the relay sees
+    /// the link close and ends.
+    #[tokio::test]
+    async fn a_cancelled_serve_tty_still_closes_the_link() -> anyhow::Result<()> {
+        let (channel, agent_cap, _) = channel_and_caps().await?;
+        let (agent_end, host_end) = tokio::io::duplex(64 * 1024);
+        let relay = tokio::spawn(async move { serve_agent_link(channel, &agent_cap, host_end).await });
+        let agent = Arc::new(timeout(WAIT, LinkAgent::bootstrap(agent_end)).await??);
+        let (stdout_agent, _job_stdout) = tokio::io::duplex(1024);
+        let (stderr_agent, _job_stderr) = tokio::io::duplex(1024);
+        let (stdin_agent, _job_stdin) = tokio::io::duplex(1024);
+        let serving = tokio::spawn({
+            let agent = Arc::clone(&agent);
+            async move { agent.serve_tty(stdout_agent, stderr_agent, stdin_agent).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        serving.abort();
+        let _ = serving.await;
+        drop(agent);
+        let relayed = timeout(WAIT, relay)
+            .await
+            .context("the relay never saw the link close")??;
+        assert!(matches!(relayed, Ok(None)), "got {relayed:?}");
+        Ok(())
+    }
+
     /// Run the relay with peer grants and drive it as a raw agent through the
     /// setup: the orchestrator join, then each peer join in lockstep.
     async fn raw_agent_with_peers(
