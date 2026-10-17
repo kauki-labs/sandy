@@ -1,7 +1,9 @@
 [package]
 name = "sandy-fabric-compose"
+# Not published: composition root + e2e acceptance, used only in tests.
+publish = false
 description = "The agent-fabric composition root: the all-local MVP profile and its e2e acceptance (issue #115)"
-version.workspace = true
+version = "0.1.1"
 authors.workspace = true
 homepage.workspace = true
 repository.workspace = true

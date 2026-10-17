@@ -32,6 +32,7 @@ jobs:
             feat
             build
             chore
+            ci
             docs
             style
             refactor
@@ -61,6 +62,65 @@ jobs:
       - uses: actions/labeler@bf12e9b00b37c5c0ca2b87b79b2daf7891dbda13 # v7.0.0
         with:
           sync-labels: true
+  release-diff-scope:
+    # release-plz (release.yaml) opens its version-bump PR with GITHUB_TOKEN,
+    # which the repo now allows (Settings -> Actions -> workflow permissions,
+    # see actions_workflow_permissions.tf). Cap the blast radius of that PR: it
+    # may only ever touch release bookkeeping, never e.g. .github/workflows/*.
+    # Scoped to github-actions[bot] PRs only, so a contributor's own PR is
+    # never restricted by this.
+    # Note: a GITHUB_TOKEN-authored PR's pull_request runs sit in GitHub's
+    # pending-approval gate until a maintainer approves them, so this check (and
+    # the rest of the PR workflow) only runs on the release PR after that approval.
+    name: Release diff scope
+    if: github.event_name == 'pull_request' && github.event.pull_request.user.login == 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          disable-sudo: true
+          egress-policy: audit
+      - name: Check changed files are release bookkeeping only
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Per-crate versions (not a shared workspace version) mean a release-plz
+          # bump PR edits each crate's own Cargo.toml, so allow those too.
+          allowed='^(Cargo\.toml|Cargo\.lock|(crates|impls)/[^/]+/(Cargo\.toml|CHANGELOG\.md))$'
+          files=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename')
+          # printf, not echo: echo mishandles a filename that looks like a flag (e.g. "-n").
+          bad=$(printf '%s\n' "$files" | grep -vE "$allowed" || true)
+          if [[ -n "$bad" ]]; then
+            echo "::error::release-plz PR touches files outside the release-bookkeeping allowlist:"
+            echo "$bad"
+            exit 1
+          fi
+  binary-versions:
+    # Release-model invariant (release-plz.toml): releases are per-binary, and each
+    # binary's MAJOR version must track sandy-lib's major so "sandy-cli 2.x" is
+    # known to build on "sandy 2.x". Enforced here so it can't silently drift.
+    name: Binary version alignment
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          disable-sudo: true
+          egress-policy: audit
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check each binary's major matches sandy-lib
+        run: python3 scripts/ci/check-binary-major.py
   checks:
     name: Check
     runs-on: ubuntu-24.04
@@ -230,6 +290,8 @@ jobs:
     needs:
       - validate-pr-title
       - label
+      - release-diff-scope
+      - binary-versions
       - checks
       - coverage
       - package
@@ -242,4 +304,6 @@ jobs:
           jobs: ${{ toJSON(needs) }}
           # validate-pr-title and label only run on pull_request, so they skip on
           # merge_group; that skip is allowed and must not red the gate.
-          allowed-skips: validate-pr-title, label
+          # release-diff-scope additionally skips on every pull_request that
+          # isn't a github-actions[bot] PR.
+          allowed-skips: validate-pr-title, label, release-diff-scope

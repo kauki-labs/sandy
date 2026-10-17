@@ -1,10 +1,15 @@
 name: Release
-# A version bump reaching main drives the release. release-plz opens a bump PR
-# (release-pr) and, for any crate whose version has no tag yet, creates the tag +
-# GitHub release in dependency order (release). release-plz runs through the Nix
-# dev shell so it uses the repo's pinned toolchain. crates.io publishing is off
-# (release-plz.toml's `publish = false`, operator decision #158) — GitHub
-# releases only for now.
+# Releases and crates.io publishing are PREPARED but DISABLED until the next
+# milestone. The release-plz job is gated on the repository variable
+# ENABLE_RELEASES; while it is unset the job is skipped and nothing is published,
+# tagged, or released (this also keeps the workflow from running release-plz's
+# release-pr step before we are ready).
+#
+# To enable at the milestone: complete the crates.io bootstrap (each crate's first
+# manual publish — see release-plz.toml), then set the repo variable
+# ENABLE_RELEASES=true. The prepared model (release-plz.toml): binaries get a
+# GitHub release + <name>-<version> tag; all publishable crates publish to
+# crates.io; the three test/local crates stay publish=false.
 on:
   push:
     branches: [main]
@@ -19,10 +24,13 @@ env:
 jobs:
   release-plz:
     name: release-plz
+    # Gated off until the milestone: set repo variable ENABLE_RELEASES=true to run.
+    if: vars.ENABLE_RELEASES == 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: write # create tags and GitHub releases
       pull-requests: write # open/update the release PR
+      id-token: write # crates.io trusted publishing (OIDC token); unlisted perms default to none
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
@@ -49,6 +57,12 @@ jobs:
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
           skipPush: ${{ github.event.pull_request.head.repo.fork == true }}
       - name: Open release PR
+        # Opened/updated with GITHUB_TOKEN, so GitHub's loop-prevention rule
+        # applies: this push/PR does not trigger pr.yaml's pull_request event
+        # (same restriction on every GITHUB_TOKEN-authored ref). Before merging,
+        # push an empty commit or click "Update branch" on the PR to force a
+        # synchronize event from a human push, so Checks/Coverage/Package/
+        # release-diff-scope run and the required "Merge gate" check posts.
         run: nix develop -c release-plz release-pr --git-token "${GITHUB_TOKEN}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

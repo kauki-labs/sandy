@@ -1,7 +1,7 @@
 [package]
 name = "sandy-impls-vm"
 description = "VM sandy seam implementations: the Linux/KVM qemu and macOS vfkit backends and their virtio-fs share transports"
-version.workspace = true
+version = "0.1.1"
 authors.workspace = true
 homepage.workspace = true
 repository.workspace = true
