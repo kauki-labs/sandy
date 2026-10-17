@@ -246,7 +246,9 @@ pub trait TrustRootIo: Sized {
 
 impl TrustRootIo for TrustRoot {
     fn load(path: &Path) -> Result<Self, CredError> {
-        let text = fs::read_to_string(path).map_err(|e| stage_err("read trust root", path, &e))?;
+        let (mut file, _) = open_trust_file("trust root", path)?;
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut file, &mut text).map_err(|e| stage_err("read trust root", path, &e))?;
         serde_json::from_str(&text)
             .map_err(|e| CredError::Stage(format!("parse trust root at {}: {e}", path.display())))
     }
@@ -309,7 +311,9 @@ pub(crate) fn open_trust_dir(dir: &Path) -> Result<sandy_fsutil::OwnedDir, CredE
 /// any `0o044` bit, e.g. `0644`) or cannot be read; a group/world-readable secret is
 /// refused, never read.
 pub fn read_secret_0600(path: &Path) -> Result<Vec<u8>, CredError> {
-    let meta = fs::metadata(path).map_err(|e| stage_err("stat secret", path, &e))?;
+    use std::io::Read;
+
+    let (mut file, meta) = open_trust_file("secret", path)?;
     let mode = meta.permissions().mode() & 0o777;
     if mode & 0o044 != 0 {
         return Err(CredError::Stage(format!(
@@ -317,7 +321,10 @@ pub fn read_secret_0600(path: &Path) -> Result<Vec<u8>, CredError> {
             path.display()
         )));
     }
-    fs::read(path).map_err(|e| stage_err("read secret", path, &e))
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|e| stage_err("read secret", path, &e))?;
+    Ok(bytes)
 }
 
 /// Write `bytes` to a `0600` file named exactly `<secret_name>` under `out_dir`,
@@ -359,6 +366,82 @@ fn write_secret_0600(dest: &Path, bytes: &[u8]) -> Result<(), CredError> {
         .and_then(|dir| dir.write_secret(name, bytes))
         .map(drop)
         .map_err(|e| CredError::Stage(e.to_string()))
+}
+
+/// Refuse trust material owned by another user: sandy writes it as the current
+/// user, so a file owned by anyone else was put there by someone else (#200).
+fn refuse_foreign_owner(what: &str, path: &Path, uid: u32, current_uid: u32) -> Result<(), CredError> {
+    if uid == current_uid {
+        return Ok(());
+    }
+    Err(CredError::Stage(format!(
+        "{what} {} is owned by uid {uid}, not the current uid {current_uid}: another user put it there; refusing to \
+         use it",
+        path.display()
+    )))
+}
+
+/// The tamper warning for a trust-material dir that others can write to, or that
+/// another user owns: the read goes ahead, but the files may have been changed.
+fn wide_dir_warning(dir: &Path, dir_uid: u32, dir_mode: u32, current_uid: u32) -> Option<String> {
+    (dir_uid != current_uid || dir_mode & 0o022 != 0).then(|| {
+        format!(
+            "trust-material dir {} is not private (owner uid {dir_uid}, mode {dir_mode:o}); another user may have \
+             been able to modify your App key or trust config. Verify the files in it are intact, then make sure the \
+             dir is yours and run `chmod 700 {}`",
+            dir.display(),
+            dir.display()
+        )
+    })
+}
+
+/// Open trust material for reading: the checks run on the opened file, not the
+/// path. A symlink at the leaf is refused (`O_NOFOLLOW`), so a link planted in a
+/// wide dir cannot borrow the owner of its target. It must be a regular file
+/// (`O_NONBLOCK` keeps a FIFO from hanging the open) owned by the current user. A dir others can write to, or another
+/// user owns, logs a tamper warning and the read goes ahead.
+fn open_trust_file(what: &str, path: &Path) -> Result<(fs::File, fs::Metadata), CredError> {
+    let (file, meta, warning) = open_trust_file_as(what, path, rustix::process::getuid().as_raw())?;
+    if let Some(warning) = warning {
+        tracing::warn!("{warning}");
+    }
+    Ok((file, meta))
+}
+
+/// [`open_trust_file`] for a given current uid, returning the tamper warning
+/// instead of logging it, so tests can drive the fd path as another user.
+fn open_trust_file_as(
+    what: &str,
+    path: &Path,
+    current_uid: u32,
+) -> Result<(fs::File, fs::Metadata, Option<String>), CredError> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| match e.raw_os_error() {
+            Some(libc::ELOOP) => {
+                CredError::Stage(format!("{what} {} is a symlink; refusing to follow it", path.display()))
+            }
+            _ => stage_err(&format!("open {what}"), path, &e),
+        })?;
+    let meta = file
+        .metadata()
+        .map_err(|e| stage_err(&format!("stat {what}"), path, &e))?;
+    if !meta.is_file() {
+        return Err(CredError::Stage(format!(
+            "{what} {} is not a regular file; refusing to read it",
+            path.display()
+        )));
+    }
+    refuse_foreign_owner(what, path, meta.uid(), current_uid)?;
+    let warning = path.parent().filter(|d| !d.as_os_str().is_empty()).and_then(|dir| {
+        let dir_meta = fs::metadata(dir).ok()?;
+        wide_dir_warning(dir, dir_meta.uid(), dir_meta.mode() & 0o7777, current_uid)
+    });
+    Ok((file, meta, warning))
 }
 
 /// Build a [`CredError::Stage`] for an IO failure without leaking secret bytes.
@@ -628,6 +711,130 @@ mod tests {
         assert!(
             matches!(err, CredError::Stage(_)),
             "expected CredError::Stage, got {err:?}"
+        );
+        Ok(())
+    }
+
+    /// #200: trust material owned by another user is refused on read.
+    #[test]
+    fn a_secret_owned_by_another_user_is_refused() {
+        let err = refuse_foreign_owner("App key", Path::new("/k.pem"), 999, 1000)
+            .expect_err("a foreign-owned key must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("uid 999") && msg.contains("another user"),
+            "unexpected: {msg}"
+        );
+        assert!(refuse_foreign_owner("App key", Path::new("/k.pem"), 1000, 1000).is_ok());
+    }
+
+    /// #200: a group/world-writable or foreign-owned dir draws a tamper warning; a
+    /// private one does not.
+    #[test]
+    fn a_wide_or_foreign_dir_draws_a_tamper_warning() {
+        let dir = Path::new("/trust-roots");
+        for (uid, mode) in [(1000, 0o775), (1000, 0o757), (999, 0o700)] {
+            let warning = wide_dir_warning(dir, uid, mode, 1000);
+            assert!(
+                warning
+                    .as_deref()
+                    .is_some_and(|w| w.contains("may have been able to modify")),
+                "uid {uid} mode {mode:o}: {warning:?}"
+            );
+        }
+        assert!(
+            wide_dir_warning(dir, 1000, 0o700, 1000).is_none(),
+            "a private dir warned"
+        );
+        assert!(wide_dir_warning(dir, 1000, 0o755, 1000).is_none(), "a 0755 dir warned");
+    }
+
+    /// #200: a key path that is not a regular file is refused, not read.
+    #[test]
+    fn a_secret_that_is_not_a_regular_file_is_refused() -> anyhow::Result<()> {
+        let tmp = private_tempdir()?;
+        let dir_at_key = tmp.path().join("key.pem");
+        fs::create_dir(&dir_at_key)?;
+        let err = read_secret_0600(&dir_at_key).expect_err("a directory at the key path must be refused");
+        assert!(err.to_string().contains("not a regular file"), "unexpected: {err}");
+        Ok(())
+    }
+
+    /// #200: a symlink at the leaf is refused even when it points at a file the
+    /// reader owns, so a link planted in a wide dir cannot pass the owner check.
+    #[test]
+    fn a_symlinked_secret_is_refused_even_when_its_target_is_owned() -> anyhow::Result<()> {
+        let tmp = private_tempdir()?;
+        let target = tmp.path().join("victim-owned.pem");
+        fs::write(&target, b"not-the-app-key")?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
+        let link = tmp.path().join("acme.pem");
+        std::os::unix::fs::symlink(&target, &link)?;
+        let err = read_secret_0600(&link).expect_err("a symlinked key must be refused, not followed");
+        assert!(err.to_string().contains("is a symlink"), "unexpected: {err}");
+        let target_cfg = tmp.path().join("victim-owned.json");
+        sample_root().write(&target_cfg)?;
+        let link_cfg = tmp.path().join("acme.json");
+        std::os::unix::fs::symlink(&target_cfg, &link_cfg)?;
+        let err = TrustRoot::load(&link_cfg)
+            .err()
+            .context("a symlinked trust-root config must be refused, not followed")?;
+        assert!(err.to_string().contains("is a symlink"), "unexpected: {err}");
+        Ok(())
+    }
+
+    /// #200: the owner check runs on the opened file: a file the current uid does
+    /// not own is refused through the real read path.
+    #[test]
+    fn a_file_another_uid_owns_is_refused_on_the_fd_path() -> anyhow::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = private_tempdir()?;
+        let key = tmp.path().join("acme.pem");
+        fs::write(&key, b"key-bytes")?;
+        let other = fs::metadata(&key)?.uid().wrapping_add(1);
+        let err = open_trust_file_as("App key", &key, other).expect_err("a foreign-owned key must be refused");
+        assert!(err.to_string().contains("another user"), "unexpected: {err}");
+        Ok(())
+    }
+
+    /// #200: the fd path reports the tamper warning for a wide dir, and none for a
+    /// private one.
+    #[test]
+    fn the_fd_path_warns_for_a_wide_dir_only() -> anyhow::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = private_tempdir()?;
+        let key = tmp.path().join("acme.pem");
+        fs::write(&key, b"key-bytes")?;
+        let me = fs::metadata(&key)?.uid();
+        let (_, _, warning) = open_trust_file_as("App key", &key, me)?;
+        assert!(warning.is_none(), "a private dir warned: {warning:?}");
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o775))?;
+        let (_, _, warning) = open_trust_file_as("App key", &key, me)?;
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700))?;
+        assert!(warning.is_some(), "a 0775 dir drew no warning");
+        Ok(())
+    }
+
+    /// #200: reading your own key in a group-writable dir warns but still works
+    /// (refusing that read is the operator's decision, not made here).
+    #[test]
+    fn an_owned_secret_in_a_wide_dir_is_still_read() -> anyhow::Result<()> {
+        let tmp = private_tempdir()?;
+        let dir = tmp.path().join("trust-roots");
+        fs::create_dir(&dir)?;
+        let key = dir.join("acme.pem");
+        fs::write(&key, b"key-bytes")?;
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o600))?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o775))?;
+        assert_eq!(read_secret_0600(&key)?, b"key-bytes");
+        let cfg = dir.join("acme.json");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+        sample_root().write(&cfg)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o775))?;
+        assert_eq!(
+            TrustRoot::load(&cfg)?,
+            sample_root(),
+            "a config in a wide dir must still load"
         );
         Ok(())
     }
