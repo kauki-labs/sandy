@@ -457,6 +457,17 @@ fn open_trust_file_as(what: &str, path: &Path, current_uid: u32) -> Result<(fs::
     Ok((file, meta))
 }
 
+/// Open `path`'s file relative to `dir`, a dir handle that already passed
+/// [`refuse_unsafe_dir`], and check the file on its own handle.
+fn open_in_checked_dir(
+    what: &str,
+    path: &Path,
+    _dir: &fs::File,
+    current_uid: u32,
+) -> Result<(fs::File, fs::Metadata), CredError> {
+    open_trust_file_as(what, path, current_uid)
+}
+
 /// Build a [`CredError::Stage`] for an IO failure without leaking secret bytes.
 fn stage_err(action: &str, path: &Path, err: &std::io::Error) -> CredError {
     CredError::Stage(format!("{action} at {}: {err}", path.display()))
@@ -746,7 +757,13 @@ mod tests {
     #[test]
     fn a_wide_or_foreign_dir_is_refused_and_a_private_one_is_not() {
         let dir = Path::new("/trust-roots");
-        for (uid, mode) in [(1000, 0o775), (1000, 0o757), (1000, 0o777), (999, 0o700)] {
+        for (uid, mode) in [
+            (1000, 0o775),
+            (1000, 0o757),
+            (1000, 0o777),
+            (1000, 0o1777),
+            (999, 0o700),
+        ] {
             let refused = refuse_unsafe_dir(dir, uid, mode, 1000);
             assert!(
                 refused.is_err_and(|e| e.to_string().contains("not private")),
@@ -821,20 +838,53 @@ mod tests {
         Ok(())
     }
 
-    /// #200: the dir is checked before the file is opened at all. A FIFO at the
-    /// key path in a wide dir draws the dir refusal, not the file-type one, so
-    /// nothing in a refused dir is ever touched.
+    /// #200: the dir is checked before the file is opened at all. The key is
+    /// mode 000, so opening it first would fail with "permission denied"; the
+    /// dir refusal proves nothing in the refused dir was opened.
     #[test]
     fn the_dir_is_refused_before_the_file_is_opened() -> anyhow::Result<()> {
         let tmp = private_tempdir()?;
-        let fifo = tmp.path().join("acme.pem");
-        let made = std::process::Command::new("mkfifo").arg(&fifo).status()?;
-        anyhow::ensure!(made.success(), "mkfifo failed: {made}");
+        let key = tmp.path().join("acme.pem");
+        fs::write(&key, b"key-bytes")?;
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o000))?;
         fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o775))?;
-        let err = read_secret_0600(&fifo).err();
+        let err = read_secret_0600(&key).err();
         fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700))?;
-        let err = err.context("a FIFO in a wide dir must be refused")?;
+        let err = err.context("a key in a wide dir must be refused")?;
         assert!(err.to_string().contains("not private"), "unexpected: {err}");
+        Ok(())
+    }
+
+    /// #200: in a private dir, a trust file another uid owns is refused, on the
+    /// opened file's own handle.
+    #[test]
+    fn a_file_another_uid_owns_is_refused_in_a_checked_dir() -> anyhow::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = private_tempdir()?;
+        let key = tmp.path().join("acme.pem");
+        fs::write(&key, b"key-bytes")?;
+        let other = fs::metadata(&key)?.uid().wrapping_add(1);
+        let dir = fs::File::open(tmp.path())?;
+        let err = open_in_checked_dir("App key", &key, &dir, other).err();
+        let err = err.context("a foreign-owned key must be refused")?;
+        assert!(err.to_string().contains("is owned by uid"), "unexpected: {err}");
+        Ok(())
+    }
+
+    /// #200: a trust file others can write to is refused even in a private dir:
+    /// anyone who can write it could have changed it in place.
+    #[test]
+    fn a_trust_file_others_can_write_is_refused() -> anyhow::Result<()> {
+        let tmp = private_tempdir()?;
+        let cfg = tmp.path().join("acme.json");
+        sample_root().write(&cfg)?;
+        for mode in [0o620, 0o602, 0o666] {
+            fs::set_permissions(&cfg, fs::Permissions::from_mode(mode))?;
+            let err = TrustRoot::load(&cfg)
+                .err()
+                .context(format!("a {mode:o} trust config must be refused"))?;
+            assert!(err.to_string().contains("writable by others"), "mode {mode:o}: {err}");
+        }
         Ok(())
     }
 
