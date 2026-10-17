@@ -2,11 +2,6 @@
 resolver = "3"
 members = ["crates/*", "impls/*"]
 
-[workspace.metadata.cargo-shear]
-# sandy-control-proto (#211, B0 of the sandyd control-plane epic #205): real,
-# just has no consumer yet — sandyd (B1) is the next block.
-ignored = ["sandy-control-proto"]
-
 # Shared metadata and dependency versions for every member crate. Members opt in
 # with `version.workspace = true`, `thiserror.workspace = true`, and so on.
 [workspace.package]
@@ -61,6 +56,9 @@ hex = "0.4"
 base64 = "0.23"
 portable-pty = "0.9"
 tiny_http = "0.12"
+# sandyd's job state store (#212, B1): vendored SQLite, no system dependency,
+# synchronous API wrapped in spawn_blocking (docs/decisions/sandyd.md §4).
+rusqlite = { version = "0.37", features = ["bundled"] }
 
 # Channel envelope codec (sandy-proto). prost is the runtime codec; prost-build +
 # protox compile the .proto in build.rs. protox is a pure-Rust protobuf compiler,
