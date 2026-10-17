@@ -196,9 +196,27 @@ pub async fn dial_and_forward<L>(
 where
     L: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
-    let remote = sandy_conn::connect(&ConnAddr::Tcp(orchestrator)).await?;
+    // Bounded: an orchestrator that's unreachable (down, firewalled, a
+    // routing black hole on the mesh) must not hang this dial forever — the
+    // caller (relay_agent_link's spawned task) has a report to deliver, and
+    // an indefinite hang here would silently withhold it.
+    let remote = tokio::time::timeout(DIAL_TIMEOUT, sandy_conn::connect(&ConnAddr::Tcp(orchestrator)))
+        .await
+        .map_err(|_| {
+            DialAndForwardError::Dial(sandy_conn::ConnError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("dialing {orchestrator} timed out after {DIAL_TIMEOUT:?}"),
+            )))
+        })??;
     Ok(forward_agent_link(local, remote, prefix).await?)
 }
+
+/// How long [`dial_and_forward`] waits for the mesh dial to the orchestrator
+/// before giving up. Generous relative to mesh RTT (this is a TCP connect on
+/// an already-authenticated WireGuard mesh, not a public-internet dial), but
+/// bounded — an indefinitely hanging dial would never resolve the
+/// `AgentReport` it owes the backend.
+const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Relay one [`AgentLaunch::on_link`](sandy_api::agent::AgentLaunch) call to the
 /// orchestrator over the mesh: the executor-host side of #269's stage-1
@@ -248,7 +266,10 @@ pub fn relay_agent_link(
         match dial_and_forward(forward_back, link, &prefix).await {
             Ok(ForwardedVerdict::JobExited(code)) => report.job_exited(code),
             Ok(ForwardedVerdict::AgentFailed(reason)) => report.agent_failed(reason),
-            Err(e) => report.agent_failed(format!("dialing the orchestrator: {e}")),
+            // DialAndForwardError's own Display already names what failed
+            // ("dialing the orchestrator: ..." or "agent link: ...");
+            // wrapping it again here would duplicate that prefix.
+            Err(e) => report.agent_failed(e.to_string()),
         }
     });
 }
@@ -600,10 +621,10 @@ mod tests {
         .await?;
         write_frame(&mut agent_side, &LinkFrame::Exit { code: 9 }).await?;
 
-        let verdict = tokio::task::spawn_blocking(move || verdict_rx.recv())
+        let verdict = tokio::task::spawn_blocking(move || verdict_rx.recv_timeout(Duration::from_secs(2)))
             .await
             .context("verdict recv task panicked")?
-            .context("the report channel disconnected without a verdict")?;
+            .context("the report channel did not deliver a verdict within the timeout")?;
         assert_eq!(verdict, AgentVerdict::JobExited(9));
 
         tokio::time::timeout(Duration::from_secs(2), orchestrator)
