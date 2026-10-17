@@ -59,6 +59,27 @@ pub async fn connect(addr: &ConnAddr) -> Result<Box<dyn Conn>, ConnError> {
     }
 }
 
+/// An accepted connection's peer identity, tagged by the tier it arrived on.
+///
+/// Not `Option<SocketAddr>`: each tier's own peer-auth check needs its own
+/// identity kind — a mesh IP for TCP, a CID for vsock (parked, no variant
+/// yet), a peer uid for UDS (no consumer needs it yet, so [`PeerAddr::Uds`]
+/// carries nothing rather than guessing a shape nobody's checked against). A
+/// lossy `Option<SocketAddr>` would force every non-TCP tier's real identity
+/// into `None`, which a caller could too easily mistake for "no peer to
+/// check" instead of "this tier's identity isn't `SocketAddr`-shaped."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerAddr {
+    /// A UDS peer carries no identity here yet (no consumer checks it); add
+    /// a credential (peer uid) when one does, rather than reusing this
+    /// variant to mean something it doesn't check today.
+    Uds,
+    /// The dialing peer's socket address, as the kernel reports it to
+    /// `accept(2)` — on a mesh connection, this is the peer's mesh IP,
+    /// authenticated by WireGuard underneath (see [`ConnAddr::Tcp`]).
+    Tcp(SocketAddr),
+}
+
 /// Accepts incoming connections on whatever [`listen`] bound.
 pub struct Listener(ListenerInner);
 
@@ -68,19 +89,20 @@ enum ListenerInner {
 }
 
 impl Listener {
-    /// Accept the next incoming connection.
+    /// Accept the next incoming connection, with the peer's identity on
+    /// whatever tier this listener is.
     ///
     /// # Errors
     /// [`ConnError::Io`] if accepting fails.
-    pub async fn accept(&self) -> Result<Box<dyn Conn>, ConnError> {
+    pub async fn accept(&self) -> Result<(Box<dyn Conn>, PeerAddr), ConnError> {
         match &self.0 {
             ListenerInner::Uds(listener) => {
                 let (stream, _addr) = listener.accept().await?;
-                Ok(Box::new(stream))
+                Ok((Box::new(stream), PeerAddr::Uds))
             }
             ListenerInner::Tcp(listener) => {
-                let (stream, _addr) = listener.accept().await?;
-                Ok(Box::new(stream))
+                let (stream, addr) = listener.accept().await?;
+                Ok((Box::new(stream), PeerAddr::Tcp(addr)))
             }
         }
     }
@@ -266,7 +288,11 @@ mod tests {
         let listener = listen(&addr).await.context("listen")?;
         let bound = ConnAddr::Tcp(listener.local_addr().context("local_addr")?);
 
-        let (accepted, mut dialed) = tokio::try_join!(listener.accept(), connect(&bound))?;
+        let ((accepted, peer), mut dialed) = tokio::try_join!(listener.accept(), connect(&bound))?;
+        match peer {
+            PeerAddr::Tcp(addr) => assert_eq!(addr.ip(), "127.0.0.1".parse::<std::net::IpAddr>()?),
+            other => panic!("expected PeerAddr::Tcp, got {other:?}"),
+        }
         let mut accepted = accepted;
 
         dialed.write_all(b"hello").await.context("write")?;
@@ -274,6 +300,29 @@ mod tests {
         let mut buf = [0u8; 5];
         accepted.read_exact(&mut buf).await.context("read")?;
         assert_eq!(&buf, b"hello");
+        Ok(())
+    }
+
+    /// Precise version of the assertion above: the accepted `PeerAddr` must be
+    /// exactly the dialing side's own bound address (ip *and* port), not just
+    /// the right IP. Dials with a raw `TcpStream` directly (not `connect()`,
+    /// which returns `Box<dyn Conn>` with no `local_addr()`) so the dialer's
+    /// own address is available to compare against.
+    #[tokio::test]
+    async fn tcp_accept_reports_exactly_the_dialers_bound_address() -> anyhow::Result<()> {
+        let listener = listen(&ConnAddr::Tcp("127.0.0.1:0".parse()?)).await.context("listen")?;
+        let bound = listener.local_addr().context("local_addr")?;
+
+        let (accept_result, dial_result) = tokio::join!(listener.accept(), tokio::net::TcpStream::connect(bound));
+        let (_accepted, peer) = accept_result?;
+        let dialed = dial_result.context("dial")?;
+        let dialer_addr = dialed.local_addr().context("dialed.local_addr")?;
+
+        assert_eq!(
+            peer,
+            PeerAddr::Tcp(dialer_addr),
+            "the accepted peer must match the dialer's own bound address exactly"
+        );
         Ok(())
     }
 
@@ -307,7 +356,8 @@ mod tests {
         let addr = uds_path(&dir);
         let listener = listen(&addr).await.context("listen")?;
 
-        let (accepted, mut dialed) = tokio::try_join!(listener.accept(), connect(&addr))?;
+        let ((accepted, peer), mut dialed) = tokio::try_join!(listener.accept(), connect(&addr))?;
+        assert_eq!(peer, PeerAddr::Uds, "a UDS peer carries no address, step-1");
         let mut accepted = accepted;
 
         dialed.write_all(b"hello").await.context("write")?;
@@ -360,7 +410,7 @@ mod tests {
         let addr = uds_path(&dir);
         let listener = listen(&addr).await.context("listen")?;
 
-        let (mut server, mut client) = tokio::try_join!(listener.accept(), connect(&addr))?;
+        let ((mut server, _peer), mut client) = tokio::try_join!(listener.accept(), connect(&addr))?;
 
         let request = ControlRequest {
             request_id: 42,
