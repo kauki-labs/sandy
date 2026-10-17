@@ -120,3 +120,161 @@ feature set B2/B3's richer queries will need.
 
 **Set aside.** `sqlx`: heavier dependency tree for a benefit (native async)
 that does not matter at this daemon's scale.
+
+## 5. The CLI's daemon commands are additive (`sandy daemon <op>`), not a reuse of `run`/`status`/…
+
+**Status:** accepted.
+
+**Context.** `sandy`'s existing CLI (pre-#205) already has `run`/`ls`/`status`/
+`wait`/`kill`/`gc` for a direct-execution job model: no daemon, a local
+`Journal` + `VmBackend` run the job in the foreground. B4 adds `submit`/
+`cancel`/`attach`/`status`/`list` against `sandyd` over the control RPC — a
+different job model, with names that collide on `status` and come close on
+the rest. Routing the existing names through `sandyd` instead was considered
+and rejected: B3's `JobManifest` is cap-requests only (no I/O, secrets, or
+egress shape), so doing that today would regress `run`'s whole `--input`/
+`--out`/`--secret`/`--allow`/`--credential` surface in favor of a daemon that
+cannot do what `run` already does.
+
+**Decision.** The daemon commands live under their own `sandy daemon <op>`
+subcommand group, leaving `run`/`ls`/`status`/`wait`/`kill`/`gc` untouched.
+`daemon` names the control plane directly; `jobs` was considered and rejected
+since direct-execution's commands are also about jobs, and that name would
+blur the two models together. Issue #221 tracks the eventual convergence:
+once `JobManifest` reaches parity with `run`'s flag set, retire direct
+execution and promote the daemon commands to the top-level names.
+
+**Consequences.** Two job models coexist under one binary for as long as
+`JobManifest` lacks parity — an operator must know which namespace a given
+job lives in. The coexistence is explicitly temporary (#221 names the exit
+condition), not a permanent fork.
+
+**Set aside.** Reusing `run`/`status`/`wait`/`kill`/`gc` for the daemon path
+now: would regress real, working functionality (`run`'s full flag set) in
+favor of a daemon that cannot yet replace it. `jobs` as the subcommand group
+name: blurs direct-execution's and the daemon's job concepts together.
+
+## 6. Remote agent-link streams must authenticate before `serve_agent_link` writes a frame (hard gate, on the M2 critical path)
+
+**Status:** planned — this is a requirement on the not-yet-built remote-executor
+dispatch path, recorded now so it is designed in from the start rather than
+retrofitted. Nothing in the current codebase implements it; tracked by #212.
+Promoted from a cross-machine-safety nicety to the M2 critical path (decision
+8): M2's cross-sandbox peer-group channels depend on this binding existing.
+
+**Context.** `serve_agent_link` (#216) writes the run's agent cap as its first
+frame with no check before it — it assumes its peer is already the legitimate
+agent, which holds locally because the link is a private socketpair. Once a
+job can run on a remote executor (#159/#231, sandy-conn's mesh tier), B2's
+dispatch plane needs to hand a remote peer's stream to `serve_agent_link` the
+same way. A naive design (the orchestrator demuxes incoming mesh streams by
+an unauthenticated run-id prefix alone) breaks this assumption: any mesh peer
+that names run X and gets handed the stream receives X's real cap as frame 1,
+passes `Join` trivially (it already holds the cap it was just given), and can
+then read the job's stdin, post forged output, or send a forged `Exit` that
+B2's report path takes as the job's real result — an INV-11 break. Encryption
+alone does not close this: the attacker is a legitimately mesh-authenticated
+peer, just not the right one.
+
+**Decision** (architect ruling, infra-f3, full record on issue #212):
+
+- A run id is an addressing label only, never an authorization token.
+- At dispatch, B2 records the run's executor mesh IP **and** a fresh 32-byte
+  random per-run link token in the `JobRegistry` entry. The token is a bearer
+  secret (INV-1 discipline, same as the agent cap): sent to the executor only
+  over the encrypted control RPC, held in forwarder memory, never in
+  `RunSpec`, an env var, or a log line.
+- The mesh accept loop binds the orchestrator's mesh address only (never
+  `0.0.0.0` — mesh CGNAT ranges like `100.64.0.0/10` make a wildcard bind
+  unsafe) and, before writing any frame, requires: the transport's own peer
+  address equals the run's recorded executor IP, the presented token matches
+  in constant time, and the run's link slot is unclaimed — claimed atomically
+  on accept, which also spends the token (one link per run, ever).
+- Any failure (unknown run, wrong peer, wrong token, already-claimed slot)
+  closes the stream having written zero bytes — no cap leaks on refusal.
+- The mesh-IP check is defense in depth, not the gate by itself: a shared
+  executor host means IP alone can't distinguish one run's forwarder from a
+  sibling job on the same machine, which is exactly what the token is for.
+
+**Consequences.** B2's eventual mesh-accept loop needs a `JobRegistry` entry
+shape that carries executor identity + token alongside the channel/caps it
+already holds, and the accept path must reject before calling
+`serve_agent_link` at all, not after. Acceptance tests (owned by whichever PR
+implements this): wrong peer, wrong token, a second stream for an already-
+claimed run, and an unknown run id each receive zero bytes; no log line or
+error message ever carries the token.
+
+**Set aside.** Trusting the mesh IP alone (WireGuard/Headscale already binds
+an IP to a peer's key, so a bare `peer_addr()` looked tempting as sufficient):
+rejected because the IP identifies the host, not the process — a second job
+on the same executor shares that IP and could otherwise claim a sibling run's
+stream before its real forwarder connects. mTLS certificates per run: more
+machinery than a per-run token already colocated with the cap it's meant to
+gate, for no added guarantee once the token is itself treated as a bearer
+secret.
+
+## 7. Frontend build order: CLI first; MCP is a thin layer over a GraphQL/REST API, never a direct control-RPC client
+
+**Status:** accepted (operator directive, relayed by infra-f3).
+
+**Context.** `sandyd` has two eventual client surfaces: the `sandy` CLI (B4,
+already building against the control RPC directly) and an MCP frontend for
+agents. A direct MCP-to-control-RPC design was the implicit assumption up to
+now, since the CLI already works that way.
+
+**Decision.** Build order is CLI → a GraphQL/REST API tier over `sandyd` →
+MCP as a thin layer on that API, not on the control RPC. The CLI keeps
+talking to `sandyd` directly (decision 1's control RPC is still the right
+shape for a synchronous, single-daemon, local-or-one-hop client). The
+GraphQL/REST API is a new tier between `sandyd` and anything else: it is
+`sandyd`'s client-facing API surface, translating external requests into
+control-RPC calls against one or more `sandyd` instances. MCP consumes that
+API instead of speaking the control RPC's wire format itself.
+
+**Consequences.** This adds a new crate/service to the architecture (the
+GraphQL/REST API over `sandyd`), not yet designed — needs its own design pass
+before implementation starts, same bar as #238's VM-agent sketch. The control
+RPC itself does not need to grow MCP-specific concerns (auth models, batched
+queries, subscriptions) since those live in the API tier instead. CLI
+priority means `sandy daemon <op>` (decision 5) keeps shipping ahead of any
+API/MCP work.
+
+**Set aside.** MCP talking to the control RPC directly: would duplicate
+whatever auth/session/query-shaping logic the API tier needs to do anyway,
+and couples MCP's protocol choices to the control RPC's wire format instead
+of a purpose-built client API.
+
+## 8. Milestone 2: multiple remote sandboxes, each running the agent, communicating with each other
+
+**Status:** accepted (operator directive, relayed by infra-f3).
+
+**Context.** M2 had been read as "dispatch one job to one remote executor."
+The operator's actual bar is bigger: "multiple remote sandboxes communicating,
+agent inside each."
+
+**Decision.** M2 is done when all three hold at once:
+
+1. `sandyd` dispatches sandboxes to multiple remote hosts (not just one
+   remote executor at a time).
+2. Each dispatched sandbox runs the in-guest agent (#238, the VM-backed agent
+   work), not just the process-backed agent B2 builds against today.
+3. The sandboxes communicate with each other: peer-group channels spanning
+   machines, not just each sandbox's own channel back to the orchestrator.
+
+The comms substrate for (3) is decision 6 (per-run token + peer-identity
+binding), #234's `forward_agent_link`, and the cross-machine channel transport
+(#159). That moves decision 6's enforcement onto the M2 critical path: it is
+a prerequisite for cross-machine peer channels to exist safely at all, not
+hardening layered on afterward.
+
+**Consequences.** Decision 6 (remote agent-link authentication) is
+reprioritized — implementing it is no longer "whenever the mesh-dispatch PR
+gets to it," it blocks M2 directly. Any sequencing of B2/B6/#159/#234/#238
+work should treat decision 6's accept-loop implementation as a near-term
+dependency, not a someday-follow-up.
+
+**Set aside.** Treating M2 as satisfied by one-remote-executor dispatch
+(B2's eventual swap of the test-double agent for a real one on a single
+remote host): that is necessary but not sufficient — it proves dispatch
+works remotely, not that multiple sandboxes can run and talk to each other,
+which is the actual M2 bar.

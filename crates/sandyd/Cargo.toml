@@ -1,0 +1,44 @@
+[package]
+name = "sandyd"
+description = "sandyd: the per-machine control-plane daemon dispatching jobs into the agent fabric (epic #205)"
+version.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+documentation = "https://docs.rs/sandyd"
+keywords = ["daemon", "control-plane", "sandbox", "orchestrator"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "sandyd"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+sandy-control-proto.workspace = true
+sandy-fsutil.workspace = true
+fs2.workspace = true
+rustix.workspace = true
+rusqlite.workspace = true
+tokio = { workspace = true, features = [
+  "rt-multi-thread",
+  "net",
+  "signal",
+  "io-util",
+  "macros",
+  "time",
+] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+tempfile.workspace = true
