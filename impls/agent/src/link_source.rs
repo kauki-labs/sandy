@@ -31,10 +31,13 @@ pub fn parse_args(args: Vec<OsString>) -> Result<(LinkSource, Vec<OsString>), St
     let (source, rest) = match args.split_first() {
         Some((flag, rest)) if flag == "--vsock-listen" => {
             let (port, rest) = rest.split_first().ok_or(USAGE)?;
+            // u32::MAX is VMADDR_PORT_ANY: the kernel would bind some other
+            // port, and the host could never reach the agent.
             let port = port
                 .to_str()
                 .and_then(|p| p.parse::<u32>().ok())
-                .ok_or_else(|| format!("--vsock-listen needs a port number; {USAGE}"))?;
+                .filter(|&p| p != u32::MAX)
+                .ok_or_else(|| format!("--vsock-listen needs a port number below {}; {USAGE}", u32::MAX))?;
             (LinkSource::Vsock(port), rest)
         }
         _ => (LinkSource::Stdin, args.as_slice()),
@@ -125,6 +128,7 @@ mod tests {
         );
         for bad in [
             &["--vsock-listen", "x", "--", "echo"][..],
+            &["--vsock-listen", "4294967295", "--", "echo"],
             &["--vsock-listen"],
             &["--vsock-listen", "5000", "echo"],
             &["--"],
