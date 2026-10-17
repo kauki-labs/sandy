@@ -382,6 +382,9 @@ struct CursorStream {
 }
 
 impl Drop for CursorStream {
+    /// Deregisters exactly this stream's own waker entry, if it's still
+    /// registered (#225): the reconnect pattern of subscribing, parking, and
+    /// dropping without ever reading must not leak one entry per reconnect.
     fn drop(&mut self) {
         // A membership this stream's generation has already left behind (or
         // that was removed by `leave()` entirely) has nothing to clean up
@@ -401,6 +404,10 @@ impl Drop for CursorStream {
 impl Stream for CursorStream {
     type Item = Result<Envelope, ChannelBackendError>;
 
+    /// Ends the stream (`Ready(None)`) once its membership's generation has
+    /// moved on (a `leave()`, possibly followed by a rejoin); otherwise polls
+    /// the backing stream, updating or registering this stream's own waker
+    /// entry by `stream_id` on `Pending` (#225).
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
@@ -1014,6 +1021,137 @@ mod tests {
         assert_eq!(
             wakers_len, 0,
             "every dropped stream must deregister its own waker; none are left open here"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn two_streams_polled_from_the_same_task_keep_independent_waker_entries() -> anyhow::Result<()> {
+        // #225's identity claim: a `will_wake`-based dedup can't distinguish
+        // two DISTINCT streams whose wakers both come from the SAME task,
+        // because `will_wake` only answers "would waking this wake the same
+        // task" — both wakers here are will_wake-equal despite belonging to
+        // different streams. Drives two real streams through interleaved
+        // polls on one task (not two spawned tasks, which would already have
+        // distinct task identity and so wouldn't exercise this collision),
+        // then drops one mid-interleaving and asserts the surviving stream's
+        // own entry is untouched — not "whichever one happened to dedup."
+        let (channel, _backend, id, authority) = new_channel().await?;
+        let member = channel.join(&mint(&authority, "p1", &id, full(), Some(later())))?;
+
+        let mut first = Box::pin(channel.subscribe(&member)?);
+        let mut second = Box::pin(channel.subscribe(&member)?);
+
+        // Interleaved: both polled to Pending from the exact same `cx`, so
+        // both register a waker that would be `will_wake`-equal to the
+        // other's under the old dedup scheme.
+        std::future::poll_fn(|cx| {
+            let _ = first.as_mut().poll_next(cx);
+            let _ = second.as_mut().poll_next(cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
+
+        // `subscribe` returns an opaque `impl Stream`, so identity is read
+        // from the registered entries themselves rather than a private field:
+        // under the old `will_wake` dedup this first assertion already fails
+        // (both polls share one `cx`, so `second`'s waker would have been
+        // treated as a duplicate of `first`'s and collapsed into one entry).
+        let ids_before = {
+            let sessions = channel
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let state = sessions.get(&member).context("membership present before any drop")?;
+            assert_eq!(
+                state.wakers.len(),
+                2,
+                "both concurrently open streams must each hold their own entry, not collapse into one"
+            );
+            state
+                .wakers
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+
+        drop(first);
+
+        let ids_after_first = {
+            let sessions = channel
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let state = sessions
+                .get(&member)
+                .context("membership present after dropping one stream")?;
+            state
+                .wakers
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(
+            ids_after_first.len(),
+            1,
+            "dropping one of two concurrently open streams must remove exactly one entry"
+        );
+        assert!(
+            ids_after_first.is_subset(&ids_before),
+            "the surviving entry must be one of the original two, not a new or corrupted id"
+        );
+
+        drop(second);
+
+        let wakers_len = channel
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&member)
+            .map(|state| state.wakers.len())
+            .unwrap_or(0);
+        assert_eq!(
+            wakers_len, 0,
+            "dropping the second stream must remove its own entry too, proving the first drop didn't remove the wrong \
+             one (which would have left this one stuck, or been a double-removal)"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropping_a_pending_stream_during_a_panic_unwind_still_deregisters_its_waker() -> anyhow::Result<()> {
+        // #225 calls out panic-unwind explicitly as an adversarial case: Drop
+        // has to run its cleanup when invoked by unwinding, not only when the
+        // caller reaches a normal scope exit or an explicit `drop()`.
+        let (channel, _backend, id, authority) = new_channel().await?;
+        let member = channel.join(&mint(&authority, "p1", &id, full(), Some(later())))?;
+
+        let mut stream = Box::pin(channel.subscribe(&member)?);
+        std::future::poll_fn(|cx| {
+            let _ = stream.as_mut().poll_next(cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _stream = stream; // moved in; its Drop runs during the unwind below.
+            panic!("deliberate panic to unwind through a parked CursorStream");
+        }));
+        assert!(
+            panicked.is_err(),
+            "the panic must actually have fired for this test to mean anything"
+        );
+
+        let wakers_len = channel
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&member)
+            .map(|state| state.wakers.len())
+            .unwrap_or(0);
+        assert_eq!(
+            wakers_len, 0,
+            "Drop must deregister the waker even when it runs via a panicking unwind"
         );
         Ok(())
     }
