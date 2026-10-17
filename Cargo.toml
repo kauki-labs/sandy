@@ -5,7 +5,7 @@ members = ["crates/*", "impls/*"]
 # Shared metadata and dependency versions for every member crate. Members opt in
 # with `version.workspace = true`, `thiserror.workspace = true`, and so on.
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Tibor Csóka <tibor.csoka@kauki.xyz>"]
 homepage = "https://kauki.xyz/"
 repository = "https://github.com/kauki-labs/sandy"
@@ -17,17 +17,17 @@ rust-version = "1.85"
 # The library publishes as `sandy-lib`; the `package` alias keeps the in-tree and
 # dependent import path `sandy`. `version` is required for the path deps to be
 # publishable to crates.io (cargo drops the path and uses the version on publish).
-sandy = { path = "crates/sandy", package = "sandy-lib", version = "0.1.1" }
-sandy-api = { path = "crates/sandy-api", version = "0.1.1" }
-sandy-backend = { path = "crates/sandy-backend", version = "0.1.1" }
-sandy-fsutil = { path = "crates/sandy-fsutil", version = "0.1.1" }
-sandy-proto = { path = "crates/sandy-proto", version = "0.1.1" }
-sandy-control-proto = { path = "crates/sandy-control-proto", version = "0.1.1" }
-sandy-fabric = { path = "crates/sandy-fabric", version = "0.1.1" }
-sandy-impls-local = { path = "impls/local", version = "0.1.1" }
-sandy-impls-vm = { path = "impls/vm", version = "0.1.1" }
-sandy-test-support = { path = "crates/sandy-test-support", version = "0.1.1" }
-sandy-fabric-local = { path = "impls/fabric-local", version = "0.1.1" }
+sandy = { path = "crates/sandy", package = "sandy-lib", version = "0.1.2" }
+sandy-api = { path = "crates/sandy-api", version = "0.1.2" }
+sandy-backend = { path = "crates/sandy-backend", version = "0.1.2" }
+sandy-fsutil = { path = "crates/sandy-fsutil", version = "0.1.2" }
+sandy-proto = { path = "crates/sandy-proto", version = "0.1.2" }
+sandy-control-proto = { path = "crates/sandy-control-proto", version = "0.1.2" }
+sandy-fabric = { path = "crates/sandy-fabric", version = "0.1.2" }
+sandy-impls-local = { path = "impls/local", version = "0.1.2" }
+sandy-impls-vm = { path = "impls/vm", version = "0.1.2" }
+sandy-test-support = { path = "crates/sandy-test-support", version = "0.1.2" }
+sandy-fabric-local = { path = "impls/fabric-local", version = "0.1.2" }
 command-group = "5.0.1"
 futures-core = "0.3.34"
 futures-util = { version = "0.3.34", default-features = false, features = [
