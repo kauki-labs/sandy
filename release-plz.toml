@@ -9,9 +9,13 @@
 #
 # Release model (operator):
 #   - crates.io: ALL publishable crates are published (supersedes the earlier
-#     "GitHub releases only" decision #158). The three test/local crates stay
+#     "GitHub releases only" decision #158). The two test/local crates stay
 #     publish = false in their own Cargo.toml (sandy-test-support,
-#     sandy-fabric-compose, sandy-conn).
+#     sandy-fabric-compose). sandy-conn used to be on this list too, but
+#     sandy-fabric-local now depends on it for real (#159's dial_and_forward),
+#     and cargo requires every dependency of a published crate to carry a
+#     registry version — publish = false stopped being viable once sandy-conn
+#     had a real consumer.
 #   - GitHub releases + git tags: the BINARIES only (sandy-cli, sandyd,
 #     sandy-agent), each on its own version, tagged <binary-name>-<version>.
 #   - A binary's MAJOR version must track sandy-lib's major (enforced by the
