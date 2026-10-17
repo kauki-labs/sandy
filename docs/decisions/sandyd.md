@@ -363,12 +363,14 @@ so there is no submitter-held-caps concept reaching `Submit` yet.
 and caps directly from a fresh `LocalCapAuthority`, with no reference to the
 submitter's own held capabilities. `Attach` returns the real channel id and a
 decodable observer cap once a job is registered, or an honest, named refusal
-otherwise (`no such job` for an id that was never submitted; a distinct
+otherwise — `no such job` for an id that was never submitted; a distinct
 restarted-daemon message for a job the durable store remembers but whose
-process-local channel is gone) — never a fabricated channel id. A submitted
-job stays `Pending` forever in this slice: nothing yet joins the channel or
-runs the job, which is the honest state of the remaining gap, not a fake
-success.
+process-local channel is gone; a distinct expired-cap message when the
+registered observer cap's own TTL has passed (`LocalCapAuthority::mint`
+defaults every cap to a 24h expiry) — never a fabricated or unusable channel
+id. A submitted job stays `Pending` forever in this slice: nothing yet joins
+the channel or runs the job, which is the honest state of the remaining gap,
+not a fake success.
 
 **Consequences.** Decision C (a job's caps bounded by what its submitter
 holds, via #219's `derive_job_caps`) is implemented but not called here —
