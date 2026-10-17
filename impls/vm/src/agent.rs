@@ -62,6 +62,13 @@ impl LinkStream for std::os::unix::net::UnixStream {
     }
 }
 
+#[cfg(target_os = "linux")]
+impl LinkStream for vsock::VsockStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        vsock::VsockStream::set_read_timeout(self, timeout)
+    }
+}
+
 /// Connect with `connect` until the guest agent acknowledges with
 /// [`AGENT_LINK_READY`], then return the stream as an fd for the relay.
 ///

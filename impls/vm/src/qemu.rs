@@ -17,9 +17,12 @@
 
 use std::{
     os::unix::net::UnixStream,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime},
 };
 
@@ -27,10 +30,14 @@ use sandy::{
     BackendError, BoxState, Hypervisor, Outcome, RunSpec, ShareDirs, StoreBacking, Topology, VmBackend,
     collect_outputs, ensure_sandy_staging_base, kill_children, plan_shares, topology as eval_topology, wipe,
 };
-use sandy_api::share::{GuestShareTransport, ShareSpec};
+use sandy_api::{
+    agent::{AGENT_VSOCK_PORT, AgentLaunch},
+    share::{GuestShareTransport, ShareSpec},
+};
 use uuid::Uuid;
 
 use crate::{
+    agent::{agent_outcome, agent_shell_command},
     console::{Markers, PipeTransport, run_console},
     share::VirtiofsdTransport,
 };
@@ -176,7 +183,8 @@ pub fn qemu_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> Re
     // launched by [`QemuBackend::boot`]. readonly is a virtiofsd flag, not a qemu arg.
     args.extend(VirtiofsdTransport.plan(&staged.shares, mem).into_vm_args());
 
-    if let Some(cid) = topology.vsock_cid {
+    // An agent-mode launch claims its own CID (#238), in place of the topology's.
+    if let Some(cid) = staged.agent_cid.or(topology.vsock_cid) {
         args.push("-device".to_string());
         args.push(format!("vhost-vsock-pci,guest-cid={cid}"));
     }
@@ -223,6 +231,10 @@ pub struct QemuBackend {
     /// The boxes this backend has launched and not yet reaped, read by
     /// [`boxes`](VmBackend::boxes) and pruned by [`kill`](VmBackend::kill).
     instances: Mutex<Vec<BoxState>>,
+    /// When set, the job runs as the child of the image's sandbox agent (#238).
+    agent: Option<AgentLaunch>,
+    /// Set by an agent-mode backend's one run: its cap and channel serve one job.
+    agent_used: AtomicBool,
 }
 
 impl QemuBackend {
@@ -230,6 +242,21 @@ impl QemuBackend {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Run the job behind the guest's sandbox agent (#238). The console launches
+    /// the agent the topology names (`agent_program`; `agent.program` is not used
+    /// by a VM backend), each launch claims a random vsock CID (retried with a new
+    /// one when another VM holds it), the host connects to the agent over
+    /// `AF_VSOCK`, and `agent.on_link` gets the link from a connector thread. The
+    /// job's exit comes only from the relay's report. Linux hosts only
+    /// (vhost-vsock).
+    ///
+    /// An agent-mode backend runs ONE job; build one per sandbox run.
+    #[must_use]
+    pub fn with_agent(mut self, agent: AgentLaunch) -> Self {
+        self.agent = Some(agent);
+        self
     }
 
     /// Lock the instance registry, mapping a poisoned mutex to a typed error
@@ -254,6 +281,7 @@ impl QemuBackend {
         shares: &[ShareSpec],
         run_id: Uuid,
         inst_dir: &Path,
+        agent: Option<(&Path, u32)>,
     ) -> Result<Outcome, BackendError> {
         sandy_fsutil::OwnedDir::open_or_create(inst_dir)
             .map_err(|err| BackendError::Spawn(format!("create instance dir {}: {err}", inst_dir.display())))?;
@@ -303,7 +331,38 @@ impl QemuBackend {
             rvport: None,
         });
 
-        let mut outcome = drive_console(spec, run_id, &sock);
+        // Agent mode: the console launches the image's agent around the job, and a
+        // connector thread dials it over vsock while the console drives the run.
+        let agent_command;
+        let agent_spec;
+        let console_spec = match agent {
+            Some((program, _)) => {
+                agent_command = [agent_shell_command(program, AGENT_VSOCK_PORT, spec.command)];
+                agent_spec = RunSpec {
+                    command: &agent_command,
+                    ..*spec
+                };
+                &agent_spec
+            }
+            None => spec,
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let connector = self.agent.as_ref().zip(agent).and_then(|(launch, (_, cid))| {
+            spawn_vsock_connector(
+                launch,
+                cid,
+                &box_id,
+                Instant::now() + Duration::from_secs(u64::from(spec.timeout_secs.max(1))),
+                Arc::clone(&stop),
+            )
+        });
+
+        let mut outcome = drive_console(console_spec, run_id, &sock);
+        stop.store(true, Ordering::SeqCst);
+        let verdict = connector.map(|(verdict, thread)| {
+            let _ = thread.join();
+            verdict
+        });
 
         // Teardown: stop qemu, then the virtiofsd daemons, and deregister. Best-effort
         // kills — qemu may already have exited (e.g. a guest `poweroff`).
@@ -322,7 +381,10 @@ impl QemuBackend {
                 outcome.console = format!("[qemu stderr]\n{tail}");
             }
         }
-        Ok(outcome)
+        match verdict {
+            Some(verdict) => agent_outcome(outcome, &verdict, &spec.command.join(" ")),
+            None => Ok(outcome),
+        }
     }
 }
 
@@ -330,12 +392,53 @@ impl QemuBackend {
 /// hypervisor, 1 local, 2 the host, `u32::MAX` any). Claimed by launching: a CID
 /// another VM holds fails the launch ([`cid_in_use`]), which then retries.
 pub(crate) fn random_agent_cid() -> u32 {
-    0
+    #[allow(clippy::cast_possible_truncation, reason = "any 32 random bits will do")]
+    let bits = Uuid::new_v4().as_u128() as u32;
+    3 + bits % (u32::MAX - 3)
 }
 
 /// Whether a launch that never booted failed because its vsock CID was taken.
-pub(crate) fn cid_in_use(_outcome: &Outcome) -> bool {
-    false
+pub(crate) fn cid_in_use(outcome: &Outcome) -> bool {
+    !outcome.booted && outcome.console.contains("unable to set guest cid") && outcome.console.contains("in use")
+}
+
+/// How many fresh CIDs an agent-mode run tries before giving up.
+const CID_ATTEMPTS: usize = 8;
+
+/// The connector thread that dials the guest agent at `cid` over `AF_VSOCK`.
+#[cfg(target_os = "linux")]
+fn spawn_vsock_connector(
+    launch: &AgentLaunch,
+    cid: u32,
+    box_id: &str,
+    deadline: Instant,
+    stop: Arc<AtomicBool>,
+) -> Option<(
+    std::sync::mpsc::Receiver<sandy_api::agent::AgentVerdict>,
+    std::thread::JoinHandle<()>,
+)> {
+    Some(crate::agent::spawn_connector(
+        launch,
+        move || vsock::VsockStream::connect_with_cid_port(cid, AGENT_VSOCK_PORT),
+        box_id,
+        deadline,
+        stop,
+    ))
+}
+
+/// No host `AF_VSOCK` off Linux: [`QemuBackend::run`] refuses agent mode first.
+#[cfg(not(target_os = "linux"))]
+fn spawn_vsock_connector(
+    _launch: &AgentLaunch,
+    _cid: u32,
+    _box_id: &str,
+    _deadline: Instant,
+    _stop: Arc<AtomicBool>,
+) -> Option<(
+    std::sync::mpsc::Receiver<sandy_api::agent::AgentVerdict>,
+    std::thread::JoinHandle<()>,
+)> {
+    None
 }
 
 /// The most recent bytes of a child's stderr to retain for diagnostics (64 KiB).
@@ -414,7 +517,28 @@ fn drive_console(spec: &RunSpec, run_id: Uuid, sock: &Path) -> Outcome {
 
 impl VmBackend for QemuBackend {
     fn run(&self, spec: &RunSpec) -> Result<Outcome, BackendError> {
+        if self.agent.is_some() && self.agent_used.swap(true, Ordering::SeqCst) {
+            return Err(BackendError::Spawn(
+                "this agent-mode backend already ran its one job; build one per sandbox run".to_string(),
+            ));
+        }
+        if self.agent.is_some() && !cfg!(target_os = "linux") {
+            return Err(BackendError::Spawn(
+                "qemu agent mode needs a Linux host: the host reaches the guest agent over AF_VSOCK (vhost-vsock)"
+                    .to_string(),
+            ));
+        }
         let topology = eval_topology(spec.template)?;
+        let agent_program: Option<PathBuf> = match &self.agent {
+            Some(_) => Some(topology.agent_program.clone().ok_or_else(|| {
+                BackendError::Spawn(
+                    "agent mode needs a topology that names its agent (agent_program); this image carries no \
+                     sandy-agent"
+                        .to_string(),
+                )
+            })?),
+            None => None,
+        };
         let run_id = Uuid::new_v4();
         let base = ensure_sandy_staging_base()?;
         let inst_dir = base.join(run_id.to_string());
@@ -434,7 +558,7 @@ impl VmBackend for QemuBackend {
             },
         )?;
 
-        let staged = StagedArgs {
+        let mut staged = StagedArgs {
             shares,
             kvm: kvm_available(),
             // A tap is opt-in via $SANDY_TAP: the operator (or the #29 live gate)
@@ -444,8 +568,28 @@ impl VmBackend for QemuBackend {
             agent_cid: None,
         };
 
-        let outcome = qemu_args(&topology, spec, &staged)
-            .and_then(|args| self.boot(spec, &args, &staged.shares, run_id, &inst_dir));
+        // Agent mode claims a CID by launching with it; a CID another VM holds fails
+        // that launch, which is retried with a fresh one.
+        let mut outcome;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let agent = agent_program.as_deref().map(|program| (program, random_agent_cid()));
+            staged.agent_cid = agent.map(|(_, cid)| cid);
+            outcome = qemu_args(&topology, spec, &staged)
+                .and_then(|args| self.boot(spec, &args, &staged.shares, run_id, &inst_dir, agent));
+            let collided = agent.is_some() && outcome.as_ref().is_ok_and(cid_in_use);
+            if !collided {
+                break;
+            }
+            if attempt == CID_ATTEMPTS {
+                outcome = Err(BackendError::Spawn(format!(
+                    "every vsock CID tried for the agent was taken ({CID_ATTEMPTS} attempts)"
+                )));
+                break;
+            }
+            tracing::debug!(attempt, "vsock CID taken by another VM; relaunching with a new one");
+        }
 
         // Collect outputs before wiping, but only if the guest actually booted
         // (nothing was produced otherwise). A collection failure surfaces as an

@@ -2247,6 +2247,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "uuid",
+ "vsock",
 ]
 
 [[package]]
