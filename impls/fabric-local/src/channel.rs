@@ -203,6 +203,12 @@ impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
         Ok(self.member(membership)?.scope.rights)
     }
 
+    /// This channel's id.
+    #[must_use]
+    pub fn id(&self) -> &ChannelId {
+        &self.id
+    }
+
     /// Verify `cap` against this channel and admit it as a new membership.
     /// Boundedness: a cap scoped to a different channel is rejected.
     pub fn join(&self, cap: &Cap) -> Result<MembershipId, ChannelError> {

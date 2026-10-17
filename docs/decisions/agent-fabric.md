@@ -305,6 +305,26 @@ job holding it could post as the agent.
   job through the guest's login-shell export, and the agent passes that
   environment through unchanged; #177 replaces the export with an agent-owned
   allowlist.
+- Peer channels (#238 slice 4) ride the same link; there is no guest-to-guest
+  networking. A relay started with peer grants (`serve_agent_link_with_peers`)
+  announces how many peer caps follow the orchestrator cap and hands each over
+  in lockstep: `Cap{channel}`, the agent's `Join{channel}` with exactly that cap,
+  `Joined{channel}`. `Post` and `Deliver` carry the channel; frames without one
+  are the orchestrator channel, so a link without peers keeps its wire form.
+  Every peer post and delivery is authorized against that channel's own
+  membership, never against holding the link: a post to a channel the link did
+  not join, or TTY traffic on a peer channel, ends the relay, and the relay only
+  subscribes to channels it joined. Peer messages are `PeerMsg`-typed, and the
+  agent's own posts come back like any member's. The agent's peer inbox
+  (`LinkAgent::take_peer_inbox`) is bounded and drops any delivery that arrives
+  while it is full; what it keeps stays in order, and every drop is counted
+  (`LinkAgent::peer_dropped`) and logged, so a loss is observable, never silent.
+  The count says that deliveries were dropped and how many, not where they fell
+  among the kept messages: once the inbox drains, newer deliveries are accepted
+  again, so kept messages need not be consecutive. The sender is not told; its post is durable on the
+  channel. In v1 membership is fixed for
+  the run: sandyd mints each peer cap at dispatch, and a sandbox cannot be added
+  to a group mid-run; dynamic invite (`CapRights.invite`) is a later slice.
 - The job never inherits the link: the agent keeps a close-on-exec duplicate,
   points its own stdin at `/dev/null`, and gives the job fresh pipes. Its
   environment is the backend's, unchanged.
