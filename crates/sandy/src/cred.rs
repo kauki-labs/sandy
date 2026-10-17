@@ -246,7 +246,7 @@ pub trait TrustRootIo: Sized {
 
 impl TrustRootIo for TrustRoot {
     fn load(path: &Path) -> Result<Self, CredError> {
-        let (mut file, _) = open_trust_file("trust-root config", path)?;
+        let (mut file, _) = open_trust_file("trust root", path)?;
         let mut text = String::new();
         std::io::Read::read_to_string(&mut file, &mut text).map_err(|e| stage_err("read trust root", path, &e))?;
         serde_json::from_str(&text)
