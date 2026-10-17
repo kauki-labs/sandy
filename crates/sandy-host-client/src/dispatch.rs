@@ -1,25 +1,33 @@
-//! Receive-dispatch handling (#263, #269, M2 stage 1): the pieces of turning
-//! an orchestrator's `Dispatch` into a running trusted-process sandbox whose
+//! Receive-dispatch handling (#263, #269, #283, M2 stage 1): turning an
+//! orchestrator's `Dispatch` into a running trusted-process sandbox whose
 //! agent link forwards back over the mesh.
 //!
-//! Built incrementally against the real `sandy-executor-proto` contract
-//! (#277), not a guessed shape. This module holds the two pieces that are
-//! independently testable and fully specified today: [`decode_argv_manifest`]
-//! (pinned down with sandy-d1: `manifest_encoding = "argv/v1"`, `manifest` a
-//! JSON array of the command and its arguments) and
-//! [`check_isolation_class`] (the executor-side half of #269's two-sided
-//! isolation gate). The run-id+link-token prefix is encoded via
+//! Built against the real `sandy-executor-proto` contract (#277), not a
+//! guessed shape: [`decode_argv_manifest`] (pinned down with sandy-d1:
+//! `manifest_encoding = "argv/v1"`, `manifest` a JSON array of the command
+//! and its arguments), [`check_isolation_class`] (the executor-side half of
+//! #269's two-sided isolation gate, decision 6/#279/#280 is the other
+//! half), and [`handle_dispatch`] (the full composition: decode, re-check,
+//! launch via `ProcessBackend::with_agent`, forward the agent's link back
+//! via `sandy_fabric_local::mesh_link::relay_agent_link`). `RunSpec`'s
+//! fields with no `Dispatch` wire shape yet (timeout, grants,
+//! inputs/outputs) are architect-ruled stage-1 constants — see
+//! [`handle_dispatch`]'s own doc for the exact values and why. The run-id +
+//! link-token prefix is encoded via
 //! `sandy_executor_proto::encode_remote_link_prefix`, not duplicated here
-//! (#279). The full composition — turning the decoded argv into a
-//! `RunSpec`, wiring `ProcessBackend::with_agent` with
-//! `sandy_fabric_local::mesh_link::relay_agent_link` as the `on_link` — is
-//! tracked as its own follow-on (#283): `RunSpec` carries fields (timeout,
-//! grants, inputs/outputs) `Dispatch` doesn't define a wire shape for yet,
-//! and that's a real design decision, not a wiring exercise.
+//! (#279).
+
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use sandy::admits_untrusted;
-use sandy_api::{backend::SandboxKind as ApiSandboxKind, containment::ContainmentStatus};
-use sandy_executor_proto::IsolationClass;
+use sandy_api::{
+    agent::{AgentLaunch, OnLink},
+    backend::{BackendError, Grants, Outcome, RunSpec, SandboxKind as ApiSandboxKind, VmBackend},
+    containment::{Containment, ContainmentStatus},
+};
+use sandy_executor_proto::{Dispatch, IsolationClass};
+use sandy_fabric_local::mesh_link::relay_agent_link;
+use sandy_impls_local::ProcessBackend;
 
 /// The `Dispatch.manifest_encoding` tag stage 1 understands: the manifest is
 /// a JSON array of strings, `argv[0]` first (the command and its arguments,
@@ -114,8 +122,116 @@ pub fn check_isolation_class(
 // demux) is a shared wire seam between this crate and sandyd's accept loop
 // (#279) — per infra-f3's ruling, it lives in sandy-executor-proto (both
 // sides already depend on it) as encode_remote_link_prefix/
-// decode_remote_link_prefix, with its own round-trip test there. This
-// module calls the encode side once it lands; not duplicated here.
+// decode_remote_link_prefix, with its own round-trip test there.
+
+/// Stage 1's fixed per-run timeout (#269, D4). With the orchestrator→host
+/// `Cancel` message deferred (no mid-run teardown in M2), this default is
+/// the ONLY teardown trigger a dispatched job gets: a hung job without it
+/// would wedge the host indefinitely. Matches `sandy-cli`'s own local-run
+/// default (not imported — that's a CLI-local constant, this is the
+/// dispatch path's own; they simply agree today, by architect ruling, not
+/// by sharing a constant).
+const STAGE1_TIMEOUT_SECS: u32 = 300;
+
+/// A full dispatch-handling failure, refused before or during the run.
+#[derive(Debug, thiserror::Error)]
+pub enum HandleDispatchError {
+    /// The manifest didn't decode, or the isolation class isn't satisfied —
+    /// refused before a [`ProcessBackend`] is ever constructed.
+    #[error(transparent)]
+    Dispatch(#[from] DispatchError),
+    /// `Dispatch.forward_back` was not a parseable socket address.
+    #[error("forward_back {0:?} is not a valid socket address")]
+    InvalidForwardBack(String),
+    /// The run id was implausibly large to prefix (see
+    /// `sandy_executor_proto::encode_remote_link_prefix`).
+    #[error("encoding the run-id+token prefix: {0}")]
+    PrefixEncoding(String),
+    /// Launching or running the sandbox failed.
+    #[error("running the sandbox: {0}")]
+    Backend(#[from] BackendError),
+}
+
+/// Handle one [`Dispatch`]: decode its manifest, independently re-check the
+/// isolation class (defense in depth, #269 — never trust the orchestrator's
+/// placement decision alone), launch the trusted-process sandbox, and
+/// forward its agent's link back to the orchestrator via
+/// [`relay_agent_link`].
+///
+/// Blocks the calling thread for the run's whole duration —
+/// [`ProcessBackend::run`]'s own contract, same as
+/// [`AgentLaunch::on_link`]'s "no ambient async runtime" one. Callers run
+/// this on a blocking thread (`tokio::task::spawn_blocking`), never on an
+/// async task directly.
+///
+/// `rt` is the runtime [`relay_agent_link`]'s spawned forwarding task runs
+/// on; capture it with `Handle::current()` in the async context that reads
+/// `Dispatch` messages off the Register connection, before calling this
+/// function.
+///
+/// `containment` is consumed into the constructed [`ProcessBackend`]; its
+/// freshly probed [`Containment::status`] is also what
+/// [`check_isolation_class`] re-checks `dispatch.required_isolation_class`
+/// against — one probe, not two independently-timed ones that could drift.
+///
+/// # Errors
+/// See [`HandleDispatchError`].
+pub fn handle_dispatch(
+    dispatch: &Dispatch,
+    containment: Box<dyn Containment>,
+    agent_program: PathBuf,
+    rt: tokio::runtime::Handle,
+) -> Result<Outcome, HandleDispatchError> {
+    let status = containment.status();
+    let required = IsolationClass::try_from(dispatch.required_isolation_class).unwrap_or(IsolationClass::Unspecified);
+    check_isolation_class(required, &status)?;
+
+    let argv = decode_argv_manifest(&dispatch.manifest_encoding, &dispatch.manifest)?;
+
+    let forward_back: SocketAddr = dispatch
+        .forward_back
+        .parse()
+        .map_err(|_| HandleDispatchError::InvalidForwardBack(dispatch.forward_back.clone()))?;
+    let prefix = sandy_executor_proto::encode_remote_link_prefix(&dispatch.job_id, &dispatch.link_token)
+        .map_err(HandleDispatchError::PrefixEncoding)?;
+
+    let on_link: OnLink = Arc::new(move |_box_id, host_end, report| {
+        relay_agent_link(&rt, forward_back, host_end, prefix.clone(), report);
+    });
+
+    let backend = ProcessBackend::with_containment(containment).with_agent(AgentLaunch {
+        program: agent_program,
+        on_link,
+    });
+
+    // Stage 1 (#269, D4): no inputs/outputs/secrets (M2 is cross-machine
+    // communication through the agent channel, not sandbox IO — the IO
+    // roadmap is separate, post-#34); no cpu/mem bound; the agent channel is
+    // the whole point of M2, so it's the only grant.
+    let grants = Grants {
+        secrets: false,
+        agent: true,
+        shares: false,
+    };
+    let spec = RunSpec {
+        template: &dispatch.job_id,
+        command: &argv,
+        inputs: &[],
+        outputs: &[],
+        secrets: &[],
+        env: &[],
+        cpu: None,
+        mem: None,
+        timeout_secs: STAGE1_TIMEOUT_SECS,
+        grants: &grants,
+        // Exit comes from the agent's own report (INV-11), never an outcome
+        // file; `ProcessBackend` doesn't read this field at all.
+        outcome_file: None,
+        secret_dir: None,
+    };
+
+    Ok(backend.run(&spec)?)
+}
 
 #[cfg(test)]
 mod tests {
@@ -207,5 +323,43 @@ mod tests {
         let err = decode_argv_manifest(MANIFEST_ENCODING_ARGV_V1, &manifest).expect_err("empty argv names no command");
         assert_eq!(err, DispatchError::EmptyCommand);
         Ok(())
+    }
+
+    /// The acceptance requirement #283/#269 call out explicitly: a job
+    /// declaring an isolation class this host's trusted-process backend
+    /// can't satisfy is refused before any `ProcessBackend` is constructed
+    /// or launched — fail-closed, asserting the bad behavior, not just the
+    /// happy path. The manifest here is deliberately malformed (not valid
+    /// JSON): if the isolation check ran anywhere but first, this test
+    /// would see `MalformedManifest` instead, proving the ordering, not
+    /// just asserting a single error variant in isolation.
+    #[tokio::test]
+    async fn handle_dispatch_refuses_an_untrusted_job_before_touching_the_backend() {
+        let dispatch = sandy_executor_proto::Dispatch {
+            job_id: "job-1".to_string(),
+            manifest: b"not valid json".to_vec(),
+            manifest_encoding: MANIFEST_ENCODING_ARGV_V1.to_string(),
+            backend: sandy_executor_proto::SandboxKind::Process.into(),
+            link_token: vec![0u8; 32],
+            forward_back: "127.0.0.1:9000".to_string(),
+            required_isolation_class: IsolationClass::Untrusted.into(),
+        };
+        // A plain reaper (no bus/mount isolation): the exact host state this
+        // gate exists to refuse an untrusted job on.
+        let containment = Box::new(sandy_test_support::FakeContainment::available());
+        let rt = tokio::runtime::Handle::current();
+
+        let err = handle_dispatch(&dispatch, containment, PathBuf::from("/nonexistent/sandy-agent"), rt)
+            .expect_err("an untrusted job on a reaping-only host must be refused, never run");
+        assert!(
+            matches!(
+                err,
+                HandleDispatchError::Dispatch(DispatchError::IsolationClassNotSatisfied {
+                    required: IsolationClass::Untrusted
+                })
+            ),
+            "expected IsolationClassNotSatisfied, got {err:?} — if this is a manifest error instead, the isolation \
+             check ran after the manifest decode, not before it"
+        );
     }
 }

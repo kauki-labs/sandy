@@ -28,9 +28,18 @@ sandy.workspace = true
 sandy-api.workspace = true
 sandy-executor-proto.workspace = true
 sandy-fabric.workspace = true
+sandy-fabric-local.workspace = true
 sandy-impls-local.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 anyhow.workspace = true
+sandy-test-support.workspace = true
+tokio = { workspace = true, features = [
+  "rt-multi-thread",
+  "macros",
+  "net",
+  "io-util",
+] }

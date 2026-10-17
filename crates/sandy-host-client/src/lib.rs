@@ -5,11 +5,9 @@
 //! then receives dispatches against that declaration and runs them locally.
 //! Two independent concerns, kept as separate modules of one binary rather
 //! than two crates (infra-f3's ruling, #275): [`capability`] detects and
-//! declares; [`dispatch`] holds the manifest decode and the isolation-class
-//! gate. The full `Dispatch` → `ProcessBackend::with_agent` composition is
-//! #283, a follow-on once `RunSpec`'s own fields (timeout, grants,
-//! inputs/outputs) have a real design against what `Dispatch` actually
-//! carries.
+//! declares; [`dispatch`] decodes a `Dispatch`, re-checks the isolation
+//! class, and runs it via `ProcessBackend::with_agent`, forwarding the
+//! agent's link back over the mesh.
 
 pub mod capability;
 pub mod dispatch;

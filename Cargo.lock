@@ -2302,10 +2302,13 @@ dependencies = [
  "sandy-api",
  "sandy-executor-proto",
  "sandy-fabric",
+ "sandy-fabric-local",
  "sandy-impls-local",
  "sandy-lib",
+ "sandy-test-support",
  "serde_json",
  "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]
