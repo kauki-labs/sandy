@@ -1,7 +1,10 @@
 //! `sandy-agent`: the sandbox agent as its own OS process (#216).
 //!
-//! Usage: `sandy-agent -- <job> [args...]`. The process backend launches it with
-//! its agent link on stdin (`sandy_fabric::capauth::AGENT_LINK_FD`, fd 0). The
+//! Usage: `sandy-agent [--vsock-listen PORT] -- <job> [args...]`. The process
+//! backend launches it with its agent link on stdin
+//! (`sandy_fabric::capauth::AGENT_LINK_FD`, fd 0); in a VM guest it listens on a
+//! vsock port and takes the host's connection as the link
+//! ([`link_source`], #238). The
 //! agent bootstraps over the link ([`LinkAgent::bootstrap`]: the cap is the
 //! first frame, read once and presented back to the relay), then runs the job
 //! as its child and bridges the job's stdio to the channel.
@@ -29,18 +32,22 @@ use std::{
 };
 
 use sandy_fabric_local::agent::LinkAgent;
-use tokio::io::{AsyncRead, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+mod link_source;
+
+use link_source::LinkSource;
 
 fn main() -> ExitCode {
-    let job = match job_argv(std::env::args_os().skip(1).collect()) {
-        Ok(job) => job,
+    let (source, job) = match link_source::parse_args(std::env::args_os().skip(1).collect()) {
+        Ok(parsed) => parsed,
         Err(usage) => fail(&usage),
     };
     let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(runtime) => runtime,
         Err(e) => fail(&format!("starting the runtime: {e}")),
     };
-    match runtime.block_on(run(job)) {
+    match runtime.block_on(run(source, job)) {
         Ok(status) => ExitCode::from(exit_code(status)),
         Err(e) => fail(&e),
     }
@@ -53,20 +60,43 @@ fn fail(why: &str) -> ! {
     std::process::abort();
 }
 
-/// The job's argv: everything after a leading `--`, which must be present and
-/// followed by at least the program.
-fn job_argv(args: Vec<OsString>) -> Result<Vec<OsString>, String> {
-    match args.split_first() {
-        Some((dashdash, job)) if dashdash == "--" && !job.is_empty() => Ok(job.to_vec()),
-        _ => Err("usage: sandy-agent -- <job> [args...]".to_string()),
+/// Take the link from `source`, then [`serve`] the job over it.
+async fn run(source: LinkSource, job: Vec<OsString>) -> Result<ExitStatus, String> {
+    harden();
+    match source {
+        LinkSource::Stdin => {
+            let link = claim_link().map_err(|e| format!("claiming the agent link on stdin: {e}"))?;
+            serve(link, job).await
+        }
+        LinkSource::Vsock(port) => serve(accept_vsock_link(port).await?, job).await,
     }
 }
 
-/// Bootstrap over the link, run the job as this process's child, and bridge
-/// its stdio until it exits.
-async fn run(job: Vec<OsString>) -> Result<ExitStatus, String> {
-    harden();
-    let link = claim_link().map_err(|e| format!("claiming the agent link on stdin: {e}"))?;
+/// Listen on vsock `port` and take the host's connection as the link; the
+/// listener is closed before this returns.
+#[cfg(target_os = "linux")]
+async fn accept_vsock_link(port: u32) -> Result<tokio_vsock::VsockStream, String> {
+    let listener =
+        link_source::VsockAcceptor::bind(port).map_err(|e| format!("listening on vsock port {port}: {e}"))?;
+    link_source::accept_host(listener)
+        .await
+        .map_err(|e| format!("accepting the host's agent link on vsock port {port}: {e}"))
+}
+
+/// vsock exists only inside a Linux guest.
+#[cfg(not(target_os = "linux"))]
+async fn accept_vsock_link(port: u32) -> Result<tokio::net::UnixStream, String> {
+    Err(format!(
+        "--vsock-listen {port}: vsock is only available inside a Linux guest"
+    ))
+}
+
+/// Bootstrap over `link`, run the job as this process's child, and bridge its
+/// stdio until it exits.
+async fn serve<L>(link: L, job: Vec<OsString>) -> Result<ExitStatus, String>
+where
+    L: AsyncRead + AsyncWrite + Send + 'static,
+{
     let agent = LinkAgent::bootstrap(link)
         .await
         .map_err(|e| format!("bootstrap: {e}"))?;
@@ -168,15 +198,6 @@ impl<R: AsyncRead + Unpin> AsyncRead for Tee<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_job_argv_follows_a_leading_double_dash() {
-        let args = |v: &[&str]| v.iter().map(OsString::from).collect::<Vec<_>>();
-        assert_eq!(job_argv(args(&["--", "echo", "hi"])), Ok(args(&["echo", "hi"])));
-        assert!(job_argv(args(&["--"])).is_err(), "no job after --");
-        assert!(job_argv(args(&["echo", "hi"])).is_err(), "no leading --");
-        assert!(job_argv(args(&[])).is_err(), "no args");
-    }
 
     #[test]
     fn a_signal_death_maps_to_128_plus_the_signal() {

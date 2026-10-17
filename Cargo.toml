@@ -56,6 +56,7 @@ hex = "0.4"
 base64 = "0.23"
 portable-pty = "0.9"
 tiny_http = "0.12"
+tokio-vsock = "0.7"
 
 # Channel envelope codec (sandy-proto). prost is the runtime codec; prost-build +
 # protox compile the .proto in build.rs. protox is a pure-Rust protobuf compiler,
