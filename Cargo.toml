@@ -2,11 +2,6 @@
 resolver = "3"
 members = ["crates/*", "impls/*"]
 
-[workspace.metadata.cargo-shear]
-# sandy-control-proto (#211, B0 of the sandyd control-plane epic #205): real,
-# just has no consumer yet — sandyd (B1) is the next block.
-ignored = ["sandy-control-proto"]
-
 # Shared metadata and dependency versions for every member crate. Members opt in
 # with `version.workspace = true`, `thiserror.workspace = true`, and so on.
 [workspace.package]
