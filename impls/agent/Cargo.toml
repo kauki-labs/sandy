@@ -43,6 +43,7 @@ tokio-vsock.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
+base64.workspace = true
 futures-util.workspace = true
 sandy-api.workspace = true
 sandy-fabric.workspace = true

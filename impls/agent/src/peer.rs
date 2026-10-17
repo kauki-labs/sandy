@@ -13,15 +13,19 @@
 
 use std::{
     future::Future,
-    io::{self, BufRead, Write},
+    io::{self, BufRead, Read, Write},
     path::Path,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
-use sandy_fabric_local::agent::PeerDelivery;
+use sandy_fabric_local::agent::{LinkAgent, PeerDelivery};
 use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt},
     net::UnixListener,
     sync::{Mutex, mpsc::Receiver},
 };
@@ -103,8 +107,88 @@ pub trait PeerPort: Send + Sync + 'static {
 }
 
 /// Serve the job's peer requests on `listener` until it is dropped.
-pub async fn serve_peers<P: PeerPort>(_listener: UnixListener, _port: Arc<P>, _inbox: Receiver<PeerDelivery>) {
-    let _ = (MAX_LINE, Mutex::new(()), B64.encode([]));
+pub async fn serve_peers<P: PeerPort>(listener: UnixListener, port: Arc<P>, inbox: Receiver<PeerDelivery>) {
+    let inbox = Arc::new(Mutex::new(inbox));
+    let busy = Arc::new(AtomicBool::new(false));
+    loop {
+        let conn = match listener.accept().await {
+            Ok((conn, _)) => conn,
+            Err(e) => {
+                eprintln!("sandy-agent: peer socket accept failed: {e}");
+                return;
+            }
+        };
+        // One client at a time: a second connection is closed unanswered, and
+        // the client helper retries.
+        if busy.swap(true, Ordering::SeqCst) {
+            drop(conn);
+            continue;
+        }
+        let (port, inbox, busy) = (Arc::clone(&port), Arc::clone(&inbox), Arc::clone(&busy));
+        tokio::spawn(async move {
+            if let Err(e) = handle(conn, &*port, &inbox).await {
+                eprintln!("sandy-agent: peer request failed: {e}");
+            }
+            busy.store(false, Ordering::SeqCst);
+        });
+    }
+}
+
+/// Answer one connection's one request.
+async fn handle<P: PeerPort>(
+    conn: tokio::net::UnixStream,
+    port: &P,
+    inbox: &Mutex<Receiver<PeerDelivery>>,
+) -> io::Result<()> {
+    let (rd, mut wr) = conn.into_split();
+    let mut line = String::new();
+    tokio::io::BufReader::new(rd.take(MAX_LINE as u64))
+        .read_line(&mut line)
+        .await?;
+    let reply = match serde_json::from_str::<Request>(line.trim()) {
+        Err(e) => Reply::Error {
+            error: format!("malformed request: {e}"),
+        },
+        Ok(Request::Send {
+            channel,
+            content_type,
+            payload,
+        }) => match B64.decode(payload) {
+            Err(e) => Reply::Error {
+                error: format!("the payload is not base64: {e}"),
+            },
+            Ok(bytes) => match port.post(channel, content_type, bytes).await {
+                Ok(()) => Reply::Sent,
+                Err(error) => Reply::Error { error },
+            },
+        },
+        Ok(Request::Recv { wait }) => {
+            let mut inbox = inbox.lock().await;
+            let mut messages = Vec::new();
+            if wait && let Some(first) = inbox.recv().await {
+                messages.push(message(first));
+            }
+            while let Ok(next) = inbox.try_recv() {
+                messages.push(message(next));
+            }
+            Reply::Messages {
+                messages,
+                dropped: port.dropped(),
+            }
+        }
+    };
+    let mut out = serde_json::to_vec(&reply).map_err(io::Error::other)?;
+    out.push(b'\n');
+    wr.write_all(&out).await?;
+    wr.shutdown().await
+}
+
+fn message(delivery: PeerDelivery) -> Message {
+    Message {
+        channel: delivery.channel,
+        content_type: delivery.content_type,
+        payload: B64.encode(delivery.payload),
+    }
 }
 
 /// Send one request to the agent at `socket` and read its reply, retrying
@@ -112,11 +196,146 @@ pub async fn serve_peers<P: PeerPort>(_listener: UnixListener, _port: Arc<P>, _i
 ///
 /// # Errors
 /// The connection or the exchange failed, or the agent stayed busy.
-pub fn request(_socket: &Path, _request: &Request) -> io::Result<Reply> {
-    let _ = (BUSY_RETRY, Instant::now());
-    let _: Option<&dyn BufRead> = None;
-    let _: Option<&dyn Write> = None;
-    Err(io::Error::other("not implemented"))
+pub fn request(socket: &Path, request: &Request) -> io::Result<Reply> {
+    let deadline = Instant::now() + BUSY_RETRY;
+    let mut backoff = Duration::from_millis(20);
+    loop {
+        if let Some(reply) = exchange(socket, request)? {
+            return Ok(reply);
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "the agent's peer socket stayed busy with another connection",
+            ));
+        }
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(Duration::from_millis(200));
+    }
+}
+
+/// One connection: the request out, the reply back; `None` when the agent
+/// closed it unanswered because another connection is open.
+fn exchange(socket: &Path, request: &Request) -> io::Result<Option<Reply>> {
+    let mut stream = std::os::unix::net::UnixStream::connect(socket)?;
+    let mut line = serde_json::to_vec(request).map_err(io::Error::other)?;
+    line.push(b'\n');
+    match stream.write_all(&line) {
+        Err(e) if busy_closed(&e) => return Ok(None),
+        other => other?,
+    }
+    let mut reply = String::new();
+    match io::BufReader::new(stream.take(MAX_LINE as u64)).read_line(&mut reply) {
+        Ok(0) => Ok(None),
+        Ok(_) => serde_json::from_str(reply.trim()).map(Some).map_err(io::Error::other),
+        Err(e) if busy_closed(&e) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The agent closed the connection on us (it was serving another).
+fn busy_closed(e: &io::Error) -> bool {
+    matches!(e.kind(), io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset)
+}
+
+/// The socket's file name inside the private dir.
+pub const SOCKET_NAME: &str = "peer.sock";
+
+/// [`PeerPort`] onto the agent itself.
+struct AgentPeers(Arc<LinkAgent>);
+
+impl PeerPort for AgentPeers {
+    async fn post(&self, channel: String, content_type: String, payload: Vec<u8>) -> Result<(), String> {
+        self.0
+            .post_peer(&channel, &content_type, payload)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    fn dropped(&self) -> u64 {
+        self.0.peer_dropped()
+    }
+}
+
+/// Make a private (0700) dir, serve the agent's peer channels on a socket in
+/// it, and return the dir; the caller removes it when the job is done.
+///
+/// # Errors
+/// The dir could not be made or the socket bound, or the inbox was taken.
+pub fn start(agent: &Arc<LinkAgent>) -> io::Result<std::path::PathBuf> {
+    let dir = sandy_fsutil::private_staging_dir("peer").map_err(io::Error::other)?;
+    let listener = UnixListener::bind(dir.path().join(SOCKET_NAME))?;
+    let inbox = agent
+        .take_peer_inbox()
+        .ok_or_else(|| io::Error::other("the peer inbox was already taken"))?;
+    tokio::spawn(serve_peers(listener, Arc::new(AgentPeers(Arc::clone(agent))), inbox));
+    Ok(dir.path().to_path_buf())
+}
+
+/// What the job asked `sandy-agent peer` for.
+#[derive(Debug, PartialEq, Eq)]
+enum Command {
+    Send { channel: String, content_type: String },
+    Recv { wait: bool },
+}
+
+fn parse(args: &[std::ffi::OsString]) -> Result<Command, String> {
+    const USAGE: &str =
+        "usage: sandy-agent peer send <channel> <content-type> < payload | sandy-agent peer recv [--wait]";
+    let args: Vec<&str> = args.iter().map(|a| a.to_str().ok_or(USAGE)).collect::<Result<_, _>>()?;
+    match args.as_slice() {
+        ["send", channel, content_type] => Ok(Command::Send {
+            channel: (*channel).to_string(),
+            content_type: (*content_type).to_string(),
+        }),
+        ["recv"] => Ok(Command::Recv { wait: false }),
+        ["recv", "--wait"] => Ok(Command::Recv { wait: true }),
+        _ => Err(USAGE.to_string()),
+    }
+}
+
+/// `sandy-agent peer send|recv`: the job's helper. `send` posts its stdin;
+/// `recv` prints each message as a JSON line, then `{"dropped":N}`.
+pub fn cli(args: &[std::ffi::OsString]) -> std::process::ExitCode {
+    match run_cli(args) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("sandy-agent peer: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_cli(args: &[std::ffi::OsString]) -> Result<(), String> {
+    let command = parse(args)?;
+    let socket = std::env::var_os(PEER_SOCKET_ENV)
+        .ok_or_else(|| format!("{PEER_SOCKET_ENV} is not set: this job has no peer channels"))?;
+    let req = match command {
+        Command::Send { channel, content_type } => {
+            let mut payload = Vec::new();
+            io::stdin()
+                .read_to_end(&mut payload)
+                .map_err(|e| format!("reading the payload from stdin: {e}"))?;
+            Request::Send {
+                channel,
+                content_type,
+                payload: B64.encode(payload),
+            }
+        }
+        Command::Recv { wait } => Request::Recv { wait },
+    };
+    match request(Path::new(&socket), &req).map_err(|e| e.to_string())? {
+        Reply::Sent => Ok(()),
+        Reply::Error { error } => Err(error),
+        Reply::Messages { messages, dropped } => {
+            let mut out = io::stdout().lock();
+            for message in messages {
+                let line = serde_json::to_string(&message).map_err(|e| e.to_string())?;
+                writeln!(out, "{line}").map_err(|e| e.to_string())?;
+            }
+            writeln!(out, "{}", serde_json::json!({ "dropped": dropped })).map_err(|e| e.to_string())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -296,6 +515,23 @@ mod tests {
             "the retrying client gets through: {reply:?}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn the_peer_helper_parses_send_and_recv() {
+        let args = |v: &[&str]| v.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        assert_eq!(
+            parse(&args(&["send", "group-a", "text/plain"])),
+            Ok(Command::Send {
+                channel: "group-a".to_string(),
+                content_type: "text/plain".to_string()
+            })
+        );
+        assert_eq!(parse(&args(&["recv"])), Ok(Command::Recv { wait: false }));
+        assert_eq!(parse(&args(&["recv", "--wait"])), Ok(Command::Recv { wait: true }));
+        for bad in [&["send", "group-a"][..], &["recv", "--forever"], &[]] {
+            assert!(parse(&args(bad)).is_err(), "{bad:?}");
+        }
     }
 
     #[tokio::test]

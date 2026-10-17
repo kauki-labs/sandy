@@ -28,6 +28,7 @@ use std::{
     os::{fd::AsFd, unix::process::ExitStatusExt},
     pin::Pin,
     process::{ExitCode, ExitStatus, Stdio},
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -40,7 +41,12 @@ mod peer;
 use link_source::LinkSource;
 
 fn main() -> ExitCode {
-    let (source, job) = match link_source::parse_args(std::env::args_os().skip(1).collect()) {
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    // `sandy-agent peer …` is the job's helper for its peer channels (#238).
+    if args.first().is_some_and(|first| first == "peer") {
+        return peer::cli(&args[1..]);
+    }
+    let (source, job) = match link_source::parse_args(args) {
         Ok(parsed) => parsed,
         Err(usage) => fail(&usage),
     };
@@ -104,12 +110,24 @@ async fn serve<L>(link: L, job: Vec<OsString>) -> Result<ExitStatus, String>
 where
     L: AsyncRead + AsyncWrite + Send + 'static,
 {
-    let agent = LinkAgent::bootstrap(link)
-        .await
-        .map_err(|e| format!("bootstrap: {e}"))?;
+    let agent = Arc::new(
+        LinkAgent::bootstrap(link)
+            .await
+            .map_err(|e| format!("bootstrap: {e}"))?,
+    );
+
+    // Peer channels (#238): serve them to the job on a socket in a private dir.
+    let peer_dir = match agent.peers() {
+        [] => None,
+        _ => Some(peer::start(&agent).map_err(|e| format!("starting the peer socket: {e}"))?),
+    };
 
     let (program, args) = job.split_first().ok_or("empty job argv")?;
-    let mut child = tokio::process::Command::new(program)
+    let mut command = tokio::process::Command::new(program);
+    if let Some(dir) = &peer_dir {
+        command.env(peer::PEER_SOCKET_ENV, dir.join(peer::SOCKET_NAME));
+    }
+    let mut child = command
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -133,6 +151,11 @@ where
         return Err(format!("bridging the job's stdio: {e}"));
     }
     let status = child.wait().await.map_err(|e| format!("waiting on the job: {e}"))?;
+    if let Some(dir) = &peer_dir
+        && let Err(e) = std::fs::remove_dir_all(dir)
+    {
+        eprintln!("sandy-agent: removing the peer socket dir: {e}");
+    }
     agent
         .report_exit(i32::from(exit_code(status)))
         .await
