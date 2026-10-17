@@ -2,7 +2,7 @@
 title: sandy overview
 kind: overview
 project: sandy
-updated: 2026-10-16
+updated: 2026-10-17
 ---
 
 # sandy overview
@@ -49,8 +49,9 @@ before any VM, network, or P2P transport exists; a composition root then
 selects one impl per seam (the all-local MVP, a local-VM profile, a remote
 profile). `sandy-proto` carries the channel envelope; `sandy-fabric` is the
 seam contracts and harness; `sandy-fabric-local` is the all-local profile's
-trivial impls, one module per seam; `sandy-agent` is the sandbox agent as its own
-process, which the process backend puts between itself and the job.
+trivial impls, one module per seam; `sandy-fabric-compose` is that profile's
+composition root; `sandy-agent` is the sandbox agent as its own process, which
+the process backend puts between itself and the job.
 
 Block-by-block status lives on the epic's sub-issues, not here — a merged
 block moves fast enough that a hand-maintained landed/open list in prose goes
@@ -58,3 +59,16 @@ stale within days. Check #103 for which blocks are merged.
 
 Design: [`design/agent-fabric/spec.md`](design/agent-fabric/spec.md). Decisions:
 [`decisions/agent-fabric.md`](decisions/agent-fabric.md).
+
+## Control plane
+
+A third effort, built on the fabric above: `sandyd`, a per-machine daemon that
+dispatches jobs into the agent fabric over a control RPC surface (epic
+[#205](https://github.com/kauki-labs/sandy/issues/205)). `sandy-control-proto`
+defines the RPC contract (Submit/Cancel/Attach/Status/List); `sandy-conn` is the
+stream transport it rides (UDS locally, vsock into a VM guest, mesh across
+machines); `sandy-orchestrator` is the dispatch core (job manifest,
+submitter-bounded capability derivation).
+
+As above, check epic #205 for which blocks are merged. Decisions:
+[`decisions/sandyd.md`](decisions/sandyd.md).
