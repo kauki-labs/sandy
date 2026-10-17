@@ -685,6 +685,57 @@ mod tests {
         Ok(())
     }
 
+    /// CodeRabbit on #247: a failed `accept` (here EMFILE, from a job holding
+    /// idle connections) must not stop the peer socket for the rest of the run.
+    /// Lowers this process's fd limit, so it relies on nextest's
+    /// process-per-test.
+    #[tokio::test]
+    async fn the_peer_socket_survives_a_failed_accept() -> anyhow::Result<()> {
+        use rustix::process::{Resource, getrlimit, setrlimit};
+
+        let (_dir, socket, ..) = server(FakePort::default())?;
+        let original = getrlimit(Resource::Nofile);
+        let open = u64::try_from(std::fs::read_dir("/dev/fd")?.count())?;
+        setrlimit(
+            Resource::Nofile,
+            rustix::process::Rlimit {
+                current: Some(open + 8),
+                maximum: original.maximum,
+            },
+        )?;
+        let mut idle = Vec::new();
+        for _ in 0..16 {
+            match std::os::unix::net::UnixStream::connect(&socket) {
+                Ok(conn) => idle.push(conn),
+                Err(_) => break,
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(idle);
+        setrlimit(Resource::Nofile, original)?;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let reply = timeout(WAIT, ask(&socket, Request::Recv { wait: false }))
+            .await
+            .context("the peer socket stopped answering")??;
+        assert!(matches!(reply, Reply::Messages { .. }), "got {reply:?}");
+        Ok(())
+    }
+
+    /// CodeRabbit on #247: a request too long for one line is refused before
+    /// connecting, not sent truncated and retried as if the agent were busy.
+    #[test]
+    fn an_overlong_request_is_refused_before_connecting() {
+        let request = Request::Send {
+            channel: "group-a".to_string(),
+            content_type: "text/plain".to_string(),
+            payload: "A".repeat(MAX_LINE),
+        };
+        let err = super::request(Path::new("/nonexistent/peer.sock"), &request)
+            .expect_err("an overlong request must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "got {err}");
+    }
+
     #[test]
     fn the_peer_helper_parses_send_and_recv() {
         let args = |v: &[&str]| v.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
