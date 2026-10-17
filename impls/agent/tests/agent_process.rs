@@ -237,6 +237,58 @@ async fn concurrent_runs_never_leak_one_link_into_another_job() -> anyhow::Resul
     Ok(())
 }
 
+/// #281: on macOS a socket gets close-on-exec in a second call, so a socket
+/// that other code in the host makes during a spawn (a relay dialing from
+/// `on_link`, say) could reach the job; `SPAWN_LOCK` cannot cover code outside
+/// the backend. A thread keeps making sockets while many runs spawn: every job
+/// still holds only its fresh stdio.
+#[cfg(target_vendor = "apple")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn sockets_made_elsewhere_during_spawns_never_reach_a_job() -> anyhow::Result<()> {
+    const RUNS: usize = 32;
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hammer = std::thread::spawn({
+        let stop = Arc::clone(&stop);
+        move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                // Held briefly, as a dialed connection would be.
+                let pair = std::os::unix::net::UnixStream::pair();
+                std::thread::yield_now();
+                drop(pair);
+            }
+        }
+    });
+    let script = "ls /dev/fd | sort -n | tr '\\n' ' '; echo; exit 0";
+    let mut runs = Vec::new();
+    for _ in 0..RUNS {
+        let (channel, agent_cap, _) = channel_and_caps().await?;
+        let (backend, relay) = backend_relaying(&channel, agent_cap);
+        runs.push((run_blocking(backend, sh(script)), relay));
+    }
+    let (outcomes, relays): (Vec<_>, Vec<_>) = runs.into_iter().unzip();
+    let outcomes = timeout(WAIT * 3, futures_util::future::join_all(outcomes)).await;
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    hammer
+        .join()
+        .map_err(|_| anyhow::anyhow!("the socket thread panicked"))?;
+    for (n, (outcome, relay)) in outcomes?.into_iter().zip(&relays).enumerate() {
+        let outcome = outcome??;
+        let console = &outcome.console;
+        let fds = console
+            .lines()
+            .find(|l| l.trim_start().starts_with("0 1 2"))
+            .context(format!("run {n}: no fd listing in the console: {console}"))?
+            .split_whitespace()
+            .count();
+        assert_eq!(
+            fds, 4,
+            "run {n}: the job holds more than stdio plus ls's own handle: {console}"
+        );
+        relay_result(relay).await??;
+    }
+    Ok(())
+}
+
 /// Adversarial (INV-1): the job's environment carries no trace of the link or
 /// the cap — exactly what the backend passes, nothing the agent added.
 #[tokio::test(flavor = "multi_thread")]
