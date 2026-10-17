@@ -419,56 +419,76 @@ impl LinkAgent {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
             .ok_or(AgentError::AlreadyServed)?;
-        let peer_tx = self.peer_tx.clone();
-        let peer_dropped = Arc::clone(&self.peer_dropped);
-        let stdin_frames = futures_util::stream::unfold(reader, move |mut reader| {
-            let peer_tx = peer_tx.clone();
-            let peer_dropped = Arc::clone(&peer_dropped);
-            async move {
-                loop {
-                    match read_frame(&mut reader).await {
-                        Ok(Some(LinkFrame::Deliver {
-                            content_type,
-                            payload,
-                            channel: Some(channel),
-                        })) => match unhex(&payload, "a peer deliver payload") {
-                            Ok(payload) => {
-                                let delivery = PeerDelivery {
-                                    channel,
-                                    content_type,
-                                    payload,
-                                };
-                                if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = peer_tx.try_send(delivery)
-                                {
-                                    // Drop-newest, counted: never a silent loss.
-                                    let total = peer_dropped.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                                    tracing::warn!(
-                                        dropped = total,
-                                        "peer inbox full; dropping the newest peer message"
-                                    );
-                                }
-                            }
-                            Err(e) => tracing::warn!(error = %e, "dropping a malformed peer frame"),
-                        },
-                        Ok(Some(LinkFrame::Deliver {
-                            content_type,
-                            payload,
-                            channel: None,
-                        })) if content_type == TTY_STDIN => match unhex(&payload, "a deliver payload") {
-                            Ok(bytes) => return Some((bytes, reader)),
-                            Err(e) => tracing::warn!(error = %e, "dropping a malformed stdin frame"),
-                        },
-                        Ok(Some(other)) => tracing::warn!(kind = other.kind(), "ignoring an unexpected link frame"),
-                        Ok(None) => return None,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "agent link faulted; stdin bridge stopped");
-                            return None;
-                        }
+        // A dedicated reader that never blocks: TTY stdin goes into an unbounded
+        // queue (its only source is the trusted orchestrator, and keystrokes must
+        // not be dropped) and peer deliveries go through the counted, drop-newest
+        // inbox. A job that stops reading its stdin therefore cannot stall the
+        // link, and peer messages keep being routed or counted.
+        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
+        let reader = tokio::spawn(route_link(
+            reader,
+            stdin_tx,
+            self.peer_tx.clone(),
+            Arc::clone(&self.peer_dropped),
+        ));
+        let stdin_frames =
+            futures_util::stream::unfold(
+                stdin_rx,
+                |mut rx| async move { rx.recv().await.map(|bytes| (bytes, rx)) },
+            );
+        let bridged = bridge_tty(Arc::clone(&self.port), stdin_frames, job_stdout, job_stderr, job_stdin).await;
+        reader.abort();
+        bridged
+    }
+}
+
+/// Read the agent link until it closes, routing TTY stdin to `stdin_tx` and
+/// peer deliveries to `peer_tx`; never waits on either consumer.
+async fn route_link(
+    mut reader: Box<dyn AsyncRead + Send + Unpin>,
+    stdin_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    peer_tx: tokio::sync::mpsc::Sender<PeerDelivery>,
+    peer_dropped: Arc<std::sync::atomic::AtomicU64>,
+) {
+    loop {
+        match read_frame(&mut reader).await {
+            Ok(Some(LinkFrame::Deliver {
+                content_type,
+                payload,
+                channel: Some(channel),
+            })) => match unhex(&payload, "a peer deliver payload") {
+                Ok(payload) => {
+                    let delivery = PeerDelivery {
+                        channel,
+                        content_type,
+                        payload,
+                    };
+                    if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = peer_tx.try_send(delivery) {
+                        // Drop-newest, counted: never a silent loss.
+                        let total = peer_dropped.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        tracing::warn!(dropped = total, "peer inbox full; dropping the newest peer message");
                     }
                 }
+                Err(e) => tracing::warn!(error = %e, "dropping a malformed peer frame"),
+            },
+            Ok(Some(LinkFrame::Deliver {
+                content_type,
+                payload,
+                channel: None,
+            })) if content_type == TTY_STDIN => match unhex(&payload, "a deliver payload") {
+                Ok(bytes) => {
+                    // The stdin bridge is gone once the job's stdout closed.
+                    let _ = stdin_tx.send(bytes);
+                }
+                Err(e) => tracing::warn!(error = %e, "dropping a malformed stdin frame"),
+            },
+            Ok(Some(other)) => tracing::warn!(kind = other.kind(), "ignoring an unexpected link frame"),
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(error = %e, "agent link faulted; link reader stopped");
+                return;
             }
-        });
-        bridge_tty(Arc::clone(&self.port), stdin_frames, job_stdout, job_stderr, job_stdin).await
+        }
     }
 }
 
