@@ -420,8 +420,10 @@ impl LinkAgent {
             .take()
             .ok_or(AgentError::AlreadyServed)?;
         let peer_tx = self.peer_tx.clone();
+        let peer_dropped = Arc::clone(&self.peer_dropped);
         let stdin_frames = futures_util::stream::unfold(reader, move |mut reader| {
             let peer_tx = peer_tx.clone();
+            let peer_dropped = Arc::clone(&peer_dropped);
             async move {
                 loop {
                     match read_frame(&mut reader).await {
@@ -438,7 +440,12 @@ impl LinkAgent {
                                 };
                                 if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = peer_tx.try_send(delivery)
                                 {
-                                    tracing::warn!("peer inbox full; dropping a peer message");
+                                    // Drop-newest, counted: never a silent loss.
+                                    let total = peer_dropped.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                                    tracing::warn!(
+                                        dropped = total,
+                                        "peer inbox full; dropping the newest peer message"
+                                    );
                                 }
                             }
                             Err(e) => tracing::warn!(error = %e, "dropping a malformed peer frame"),
@@ -489,10 +496,12 @@ impl LinkAgent {
         Ok(write_frame(&mut *self.port.writer.lock().await, &frame).await?)
     }
 
-    /// How many peer deliveries were dropped because the inbox was full (stub).
+    /// How many peer deliveries were dropped because the inbox was full. The
+    /// overflow policy is drop-newest: what the job reads is a gap-free, in-order
+    /// prefix, and this count says how much was lost after it.
     #[must_use]
     pub fn peer_dropped(&self) -> u64 {
-        0
+        self.peer_dropped.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The receiver for messages on this agent's peer channels; `Some` once.
