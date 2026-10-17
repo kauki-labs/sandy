@@ -216,8 +216,12 @@ async fn the_job_environment_carries_no_link_or_cap() -> anyhow::Result<()> {
     assert_eq!(outcome.guest_exit, Some(0), "console: {console}");
     for line in console.lines().filter(|l| l.contains('=')) {
         let key = line.split('=').next().unwrap_or_default();
+        // A coverage build's LLVM profiling runtime sets this marker in the
+        // instrumented agent's own environment before `main`; it carries no link
+        // or cap, and a normal build never has it.
+        let instrumentation = key.starts_with("__LLVM_PROFILE_RT");
         assert!(
-            key == "PATH" || (key.starts_with("SANDY_") && key.ends_with("_DIR")),
+            key == "PATH" || (key.starts_with("SANDY_") && key.ends_with("_DIR")) || instrumentation,
             "the job env has an unexpected variable {key}: {console}"
         );
     }
