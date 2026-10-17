@@ -352,17 +352,17 @@ impl QemuBackend {
                 launch,
                 cid,
                 &box_id,
-                Instant::now() + Duration::from_secs(u64::from(spec.timeout_secs.max(1))),
+                // The console's command budget only starts once the guest has
+                // booted, so allow for the boot too; the stop flag still ends the
+                // connector as soon as the console run does.
+                Instant::now() + Duration::from_secs(u64::from(spec.timeout_secs.max(1)) * 2 + 120),
                 Arc::clone(&stop),
             )
         });
 
         let mut outcome = drive_console(console_spec, run_id, &sock);
         stop.store(true, Ordering::SeqCst);
-        let verdict = connector.map(|(verdict, thread)| {
-            let _ = thread.join();
-            verdict
-        });
+        let verdict = connector.map(|(verdict, thread)| (verdict, thread.join().unwrap_or(false)));
 
         // Teardown: stop qemu, then the virtiofsd daemons, and deregister. Best-effort
         // kills — qemu may already have exited (e.g. a guest `poweroff`).
@@ -382,7 +382,7 @@ impl QemuBackend {
             }
         }
         match verdict {
-            Some(verdict) => agent_outcome(outcome, &verdict, &spec.command.join(" ")),
+            Some((verdict, linked)) => agent_outcome(outcome, &verdict, &spec.command.join(" "), linked),
             None => Ok(outcome),
         }
     }
@@ -415,7 +415,7 @@ fn spawn_vsock_connector(
     stop: Arc<AtomicBool>,
 ) -> Option<(
     std::sync::mpsc::Receiver<sandy_api::agent::AgentVerdict>,
-    std::thread::JoinHandle<()>,
+    std::thread::JoinHandle<bool>,
 )> {
     Some(crate::agent::spawn_connector(
         launch,
@@ -436,7 +436,7 @@ fn spawn_vsock_connector(
     _stop: Arc<AtomicBool>,
 ) -> Option<(
     std::sync::mpsc::Receiver<sandy_api::agent::AgentVerdict>,
-    std::thread::JoinHandle<()>,
+    std::thread::JoinHandle<bool>,
 )> {
     None
 }
