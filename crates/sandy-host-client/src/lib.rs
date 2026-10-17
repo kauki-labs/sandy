@@ -5,8 +5,11 @@
 //! then receives dispatches against that declaration and runs them locally.
 //! Two independent concerns, kept as separate modules of one binary rather
 //! than two crates (infra-f3's ruling, #275): [`capability`] detects and
-//! declares; the receive-dispatch handler (sandy-91, blocked on #263's
-//! `sandy-executor-proto`) composes Dispatch → the isolation-class gate →
-//! `ProcessBackend::with_agent`.
+//! declares; [`dispatch`] holds the manifest decode and the isolation-class
+//! gate. The full `Dispatch` → `ProcessBackend::with_agent` composition is
+//! #283, a follow-on once `RunSpec`'s own fields (timeout, grants,
+//! inputs/outputs) have a real design against what `Dispatch` actually
+//! carries.
 
 pub mod capability;
+pub mod dispatch;
