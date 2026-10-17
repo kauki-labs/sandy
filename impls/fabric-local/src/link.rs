@@ -823,6 +823,46 @@ mod tests {
         }
     }
 
+    /// #261: the link reader outlives the job's stdout. A job that closes its
+    /// stdout but keeps using its peer channels still gets their deliveries.
+    #[tokio::test]
+    async fn peer_deliveries_still_arrive_after_the_job_closes_stdout() -> anyhow::Result<()> {
+        let (channel, agent_cap, _) = channel_and_caps().await?;
+        let (group, agent_peer_cap, sibling_cap) = peer_channel("group-a").await?;
+        let sibling = group.join(&sibling_cap)?;
+        let (agent_end, host_end) = tokio::io::duplex(64 * 1024);
+        let grants = vec![PeerGrant {
+            channel: Arc::clone(&group),
+            cap: agent_peer_cap,
+        }];
+        let relay =
+            tokio::spawn(async move { serve_agent_link_with_peers(channel, &agent_cap, grants, host_end).await });
+        let agent = Arc::new(timeout(WAIT, LinkAgent::bootstrap(agent_end)).await??);
+        let mut inbox = agent.take_peer_inbox().context("the peer inbox is taken once")?;
+
+        let (stdout_agent, job_stdout) = tokio::io::duplex(1024);
+        let (stderr_agent, job_stderr) = tokio::io::duplex(1024);
+        let (stdin_agent, _job_stdin) = tokio::io::duplex(1024);
+        drop((job_stdout, job_stderr));
+        timeout(WAIT, agent.serve_tty(stdout_agent, stderr_agent, stdin_agent)).await??;
+
+        group
+            .post(
+                &sibling,
+                Some(MessageType::PeerMsg(sandy_proto::PeerMsg {})),
+                "text/plain",
+                b"after-stdout-eof".to_vec(),
+            )
+            .await?;
+        next_peer(&mut inbox, b"after-stdout-eof")
+            .await
+            .context("a peer delivery after stdout EOF never reached the agent")?;
+
+        drop(agent);
+        timeout(WAIT, relay).await???;
+        Ok(())
+    }
+
     /// #238 slice 4: the agent joins its peer channel at setup and exchanges
     /// messages with a sibling sandbox on it, alongside its orchestrator TTY.
     #[tokio::test]

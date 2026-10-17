@@ -327,6 +327,10 @@ job holding it could post as the agent.
   (`LinkAgent::take_peer_inbox`) is bounded and drops any delivery that arrives
   while it is full; what it keeps stays in order, and every drop is counted
   (`LinkAgent::peer_dropped`) and logged, so a loss is observable, never silent.
+  The agent reads the link from bootstrap until the link closes or the agent is
+  dropped, not only while
+  the job's stdout is open, so peer traffic after stdout EOF is still routed
+  and counted (#261).
   The count says that deliveries were dropped and how many, not where they fell
   among the kept messages: once the inbox drains, newer deliveries are accepted
   again, so kept messages need not be consecutive. The sender is not told; its post is durable on the
