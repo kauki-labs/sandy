@@ -430,6 +430,43 @@ mod tests {
         Ok(())
     }
 
+    /// #204: under a umask that clears the owner's read bit, a private dir is
+    /// still made 0700 and opened, and a secret is still written 0600 and
+    /// readable by its owner (0400 would otherwise leave 0300 and 0200).
+    /// The umask is process-wide; nextest runs each test in its own process.
+    #[test]
+    fn a_private_dir_and_its_secret_survive_a_umask_that_clears_owner_read() -> anyhow::Result<()> {
+        let dir = staging_dir()?;
+        let parent = OwnedDir::open(dir.path())?;
+        let previous = rustix::process::umask(Mode::from_raw_mode(0o400));
+        let staged = parent
+            .create_private_dir("cred")
+            .and_then(|created| created.write_secret("TOKEN", b"token").map(|path| (created, path)));
+        rustix::process::umask(previous);
+        let (created, secret) = staged?;
+        let mode = fs::metadata(created.path())?.permissions().mode() & 0o777;
+        anyhow::ensure!(mode == 0o700, "a private dir came out {mode:o}");
+        let mode = fs::metadata(&secret)?.permissions().mode() & 0o777;
+        anyhow::ensure!(mode == 0o600, "a secret came out {mode:o}");
+        anyhow::ensure!(fs::read(&secret)? == b"token", "the secret is not readable back");
+        Ok(())
+    }
+
+    /// #204: the secret file alone, in a dir made before the umask changed.
+    /// The umask is process-wide; nextest runs each test in its own process.
+    #[test]
+    fn a_secret_is_0600_under_a_umask_that_clears_owner_read() -> anyhow::Result<()> {
+        let dir = staging_dir()?;
+        let parent = OwnedDir::open(dir.path())?;
+        let previous = rustix::process::umask(Mode::from_raw_mode(0o400));
+        let secret = parent.write_secret("TOKEN", b"token");
+        rustix::process::umask(previous);
+        let secret = secret?;
+        let mode = fs::metadata(&secret)?.permissions().mode() & 0o777;
+        anyhow::ensure!(mode == 0o600, "a secret came out {mode:o}");
+        Ok(())
+    }
+
     #[test]
     fn open_or_create_accepts_an_existing_private_dir_and_refuses_a_wide_one() -> anyhow::Result<()> {
         let root = staging_dir()?;

@@ -165,6 +165,21 @@ mod tests {
         Ok(())
     }
 
+    /// #204: a umask that clears the owner's read bit (0400 makes mkdir's 0700
+    /// into 0300) must not leave a base that cannot be opened.
+    /// The umask is process-wide; nextest runs each test in its own process.
+    #[test]
+    fn a_new_base_survives_a_umask_that_clears_owner_read() -> anyhow::Result<()> {
+        let tmp = tempfile::TempDir::new().context("tempdir")?;
+        let previous = rustix::process::umask(Mode::from_raw_mode(0o400));
+        let base = ensure_staging_base_in(tmp.path());
+        rustix::process::umask(previous);
+        let base = base?;
+        let mode = std::fs::metadata(&base).context("stat base")?.permissions().mode() & 0o777;
+        anyhow::ensure!(mode == 0o700, "a created base came out {mode:#o}");
+        Ok(())
+    }
+
     /// Adversarial (CWE-732): a pre-created world-writable base must be
     /// rejected outright — fail closed, not a silent downgrade.
     #[test]
