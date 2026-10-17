@@ -320,7 +320,9 @@ pub(crate) const PEER_INBOX: usize = 1024;
 
 impl LinkAgent {
     /// Read the cap frame from `link` exactly once, present it in `Join`, and
-    /// wait for the relay's verdict. The cap is not kept past the `Join`.
+    /// wait for the relay's verdict. The cap is not kept past the `Join`. Then
+    /// start the link reader; TTY stdin queues until
+    /// [`serve_tty`](Self::serve_tty), so call it promptly.
     ///
     /// # Errors
     /// [`AgentError::Refused`] if the relay refuses the join,
@@ -562,7 +564,7 @@ impl LinkAgent {
     }
 
     /// The receiver for messages on this agent's peer channels; `Some` once.
-    /// They arrive while [`serve_tty`](Self::serve_tty) reads the link.
+    /// They arrive from bootstrap until the link closes or the agent is dropped.
     pub fn take_peer_inbox(&self) -> Option<tokio::sync::mpsc::Receiver<PeerDelivery>> {
         self.peer_inbox
             .lock()
