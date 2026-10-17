@@ -7,7 +7,7 @@
 
 use std::{os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc, time::Duration};
 
-use sandyd::store::JobStore;
+use sandyd::{dispatch::JobRegistry, store::JobStore};
 use tokio::net::UnixListener;
 
 /// How long graceful shutdown waits for in-flight connections to finish on
@@ -16,6 +16,12 @@ use tokio::net::UnixListener;
 /// this is generous for that, not a promise to wait indefinitely for a client
 /// that never closes its end.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// How long the accept loop pauses after a failed `accept()` before trying
+/// again. A persistent resource error (e.g. the process is out of file
+/// descriptors) would otherwise spin this branch in a tight loop, burning
+/// CPU and flooding the log faster than an operator could react.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 #[tokio::main]
 async fn main() {
@@ -56,6 +62,7 @@ async fn main() {
     };
     tracing::info!(socket = %socket_path.display(), db = %db_path.display(), "sandyd listening");
 
+    let registry = Arc::new(JobRegistry::default());
     let mut connections = tokio::task::JoinSet::new();
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
@@ -66,11 +73,20 @@ async fn main() {
                 match accepted {
                     Ok((stream, _addr)) => {
                         let store = Arc::clone(&store);
-                        connections.spawn(sandyd::serve_connection(stream, store));
+                        let registry = Arc::clone(&registry);
+                        connections.spawn(sandyd::serve_connection(stream, store, registry));
                     }
-                    Err(e) => tracing::warn!(error = %e, "failed to accept a connection"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to accept a connection");
+                        tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                    }
                 }
             }
+            // Reap finished connections as they complete, not only at
+            // shutdown: `JoinSet` keeps a completed task's slot until
+            // `join_next` retrieves it, so without this branch every served
+            // connection would accumulate for the daemon's whole lifetime.
+            Some(_) = connections.join_next(), if !connections.is_empty() => {}
             () = &mut shutdown => {
                 tracing::info!("shutdown signal received; no longer accepting new connections");
                 break;
