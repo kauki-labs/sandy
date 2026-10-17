@@ -330,11 +330,11 @@ a superset search instead, deferred until that shape actually exists.
 
 Verified during this design that `Cap`'s fields (`scope`, `proof`) are public
 — constructible outside `CapAuthority::mint`/`attenuate` — but this is not an
-escalation path: every consumption point (`attenuate` itself, `Channel::join`/
-`member`) re-verifies the proof unconditionally before trusting scope, so a
-hand-constructed or tampered `Cap` fails with `Forged` the moment anything
-uses it (`capauth_suite`'s adversarial case already proves this). Tracked as
-a low-priority type-design hygiene improvement, not a security fix (#217).
+escalation path: `CapAuthority::verify` and `attenuate` reject a tampered or
+hand-constructed `Cap` with `Forged` (`capauth_suite`'s adversarial case
+proves this), and any future consumer of channel membership must re-verify
+the proof before trusting scope rather than caching it. Tracked as a
+low-priority type-design hygiene improvement, not a security fix (#217).
 
 **Set aside.** A redundant `is_subset_of` check in `derive_job_caps` before
 calling `attenuate`: adds a second rule that can drift from the first, and
