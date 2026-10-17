@@ -21,6 +21,23 @@
 //! Run manually once the real pieces exist:
 //!   SANDY_LIVE=1 SANDY_M2_REMOTE_HOST=<mesh addr of a NixOS host-client> \
 //!     cargo nextest run -p sandy-cli --features live --test live_m2_cross_machine --run-ignored all
+//!
+//! ## Acceptance traceability (#269's full list, so nothing falls between test files)
+//!
+//! | #269 acceptance item                                                  | Asserted where                                                                              |
+//! | ---------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+//! | Happy path: capability-declared dispatch, cross-machine peer message   | this file, `cross_machine_sandboxes_exchange_a_peer_message_through_the_hub`                |
+//! | Register-auth: unknown mesh identity gets no ack/dispatch (infra-f3's  | this file, `register_from_an_unlisted_mesh_identity_gets_no_ack_and_no_dispatch`            |
+//! | addendum to #263)                                                      |                                                                                              |
+//! | decision-6: wrong-peer refused, zero bytes                             | `sandyd::dispatch` / `link_auth` unit tests (#266, merged)                                  |
+//! | decision-6: wrong-token refused, zero bytes                            | `sandyd::dispatch` / `link_auth` unit tests (#266, merged)                                  |
+//! | decision-6: unknown run id refused, zero bytes                         | `sandyd::dispatch` unit tests (#266, merged) — `LinkAuthError::UnknownRun`                   |
+//! | decision-6: already-claimed link slot refused (one link per run)       | `sandyd::link_auth` unit tests (#266, merged) — `concurrent_claims_admit_exactly_one_stream` |
+//! | Isolation-class gate: an unsupported isolation class refused fail-     | **no home yet** — sandy-91's executor side, not landed. Flagged to infra-f3.                |
+//! | closed, never downgraded onto `trusted-process`                        |                                                                                              |
+//! | Result path: exit via the locked `ResultEnvelope`/`AgentReport` (INV-  | existing unit coverage (`impls/fabric-local/src/{agent,link,executor}.rs`,                   |
+//! | 11); an agent failure with no report is an infra fault, not a job exit | `sandy-cli/tests/live_agent.rs`); reasserted end-to-end, cross-machine, in this file's        |
+//! |                                                                        | happy-path test (step 7)                                                                     |
 #![cfg(feature = "live")]
 
 // Not `mod common;`: this file doesn't need `build_guest`/`on_path` (no VM
