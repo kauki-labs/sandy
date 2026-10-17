@@ -387,7 +387,7 @@ the local process backend: a job shares the agent's uid, so it can kill its agen
 (an infra fault, never a result it chose) and, where `ptrace` is open, read the
 agent's memory (the agent marks itself non-dumpable on Linux). On macOS a socket
 or pipe gets close-on-exec in a second call, so a descriptor any thread is
-creating could leak into a spawn. There the backend spawns with `posix_spawnp`
+creating could leak into a spawn. There the backend spawns with `posix_spawn`
 and `POSIX_SPAWN_CLOEXEC_DEFAULT` (#281, through `nix::spawn`, no `unsafe`):
 only the three descriptors mapped onto stdio reach the child, with SIGPIPE reset
 and a new process group as std does. Linux spawns through std, where every

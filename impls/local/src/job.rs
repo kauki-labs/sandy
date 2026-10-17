@@ -4,10 +4,10 @@
 //! Linux spawns through std (via command-group): every descriptor std and sandy
 //! create there is close-on-exec atomically. On Apple a socket or pipe gets
 //! close-on-exec in a second call, so a descriptor another thread is creating
-//! can leak into any spawn. There the child is spawned with `posix_spawnp` and
+//! can leak into any spawn. There the child is spawned with `posix_spawn` and
 //! `POSIX_SPAWN_CLOEXEC_DEFAULT`, which closes everything except the three stdio
-//! descriptors mapped onto 0, 1 and 2. The command's argv and env are read back
-//! from the same `Command`, so the two paths cannot drift apart.
+//! descriptors mapped onto 0, 1 and 2. The command's argv, env and PATH lookup
+//! come from the same `Command`, so the two paths cannot drift apart.
 
 use std::{
     fs::File,
@@ -112,18 +112,19 @@ impl JobChild {
 #[cfg(target_vendor = "apple")]
 mod apple {
     use std::{
-        ffi::CString,
+        ffi::{CString, OsStr},
         fs::File,
         io,
         os::{
             fd::{AsFd, AsRawFd, OwnedFd},
-            unix::{ffi::OsStrExt, process::ExitStatusExt},
+            unix::{ffi::OsStrExt, fs::PermissionsExt, process::ExitStatusExt},
         },
+        path::{Path, PathBuf},
         process::{Command, ExitStatus},
     };
 
     use nix::{
-        spawn::{PosixSpawnAttr, PosixSpawnFileActions, PosixSpawnFlags, posix_spawnp},
+        spawn::{PosixSpawnAttr, PosixSpawnFileActions, PosixSpawnFlags, posix_spawn},
         sys::signal::{SigSet, Signal as NixSignal},
         unistd::Pid as NixPid,
     };
@@ -142,7 +143,7 @@ mod apple {
 
     pub(super) fn spawn(command: &Command, stdin: Option<OwnedFd>) -> io::Result<Spawned> {
         let program = c_string(command.get_program().as_bytes())?;
-        let argv = std::iter::once(Ok(program.clone()))
+        let argv = std::iter::once(Ok(program))
             .chain(command.get_args().map(|arg| c_string(arg.as_bytes())))
             .collect::<io::Result<Vec<_>>>()?;
         // The env is exactly what the command sets: it was env_clear()ed, so a
@@ -190,17 +191,43 @@ mod apple {
         default_signals.add(NixSignal::SIGPIPE);
         attr.set_sigdefault(&default_signals)?;
 
-        // posix_spawnp looks the program up on this process's PATH, which is
-        // the PATH the command passes on, so the lookup matches std's.
-        let pid = posix_spawnp(&program, &actions, &attr, &argv, &envp)?;
+        // Look a bare name up on the job's PATH, as std does (via execvp in the
+        // child), never on this process's: spec.env may override PATH.
+        let job_path = command
+            .get_envs()
+            .filter(|(key, _)| *key == "PATH")
+            .last()
+            .and_then(|(_, value)| value);
+        let executable = resolve(command.get_program(), job_path)?;
+        let pid = posix_spawn(executable.as_path(), &actions, &attr, &argv, &envp)?;
         drop((stdin, out_write, err_write));
-        let pid = Pid::from_raw(pid.as_raw()).ok_or_else(|| io::Error::other("posix_spawnp returned pid 0"))?;
+        let pid = Pid::from_raw(pid.as_raw()).ok_or_else(|| io::Error::other("posix_spawn returned pid 0"))?;
         Ok(Spawned {
             pid,
             status: None,
             stdout: Some(File::from(out_read)),
             stderr: Some(File::from(err_read)),
         })
+    }
+
+    /// `program` itself if it names a path, else the first executable regular
+    /// file on `path` as execvp searches it (an empty entry is the current dir;
+    /// no PATH means the system default). Not found is `NotFound`, as std reports.
+    fn resolve(program: &OsStr, path: Option<&OsStr>) -> io::Result<PathBuf> {
+        if program.as_bytes().contains(&b'/') {
+            return Ok(PathBuf::from(program));
+        }
+        let path = path.unwrap_or(OsStr::new("/usr/bin:/bin"));
+        path.as_bytes()
+            .split(|&b| b == b':')
+            .map(|dir| match dir {
+                b"" => Path::new(".").join(program),
+                dir => Path::new(OsStr::from_bytes(dir)).join(program),
+            })
+            .find(|candidate| {
+                std::fs::metadata(candidate).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+            })
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
     }
 
     fn c_string(bytes: &[u8]) -> io::Result<CString> {
