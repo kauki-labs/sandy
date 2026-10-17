@@ -424,6 +424,9 @@ impl LinkAgent {
         // not be dropped) and peer deliveries go through the counted, drop-newest
         // inbox. A job that stops reading its stdin therefore cannot stall the
         // link, and peer messages keep being routed or counted.
+        // Unbounded is safe only while TTY stdin stays trusted, low-volume and
+        // keystroke-paced (bulk inputs are staged as shares, not piped). A bulk
+        // stdin path would make this an out-of-memory risk: bound it first.
         let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
         let reader = tokio::spawn(route_link(
             reader,
