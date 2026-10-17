@@ -72,13 +72,26 @@ sandy run topologies.aarch64-linux.vfkit \
   -- sh -c 'process /run/sandy/inputs/data > /run/sandy/outputs/result/report'
 ```
 
-Running jobs are managed with `sandy ls` / `status` / `wait` / `kill` / `gc`.
+```sh
+sandy ls                       # list every job record
+sandy status <job-id>          # reconcile + print one job's current state
+sandy wait <job-id>            # block until terminal, then print it
+sandy kill <job-id>            # cancel a running job and tear its box down
+sandy gc [--keep-last N]       # evict terminal records, keep the newest N (default 20)
+```
+
 Credential trust roots are managed with
 `sandy cred github register | import | verify | deregister` (see
-[`docs/providers/github`](docs/providers/github/README.md)). `sandy daemon
-submit | status | attach | cancel | list` drives `sandyd`, an evolving
-control-plane daemon with its own job model (see
-[`docs/decisions/sandyd.md`](docs/decisions/sandyd.md)).
+[`docs/providers/github`](docs/providers/github/README.md)).
+
+```sh
+sandy daemon submit <manifest|-> --manifest-encoding <ENCODING>
+sandy daemon status|attach|cancel <job-id>
+sandy daemon list
+```
+
+`sandy daemon` drives `sandyd`, an evolving control-plane daemon with its own
+job model (see [`docs/decisions/sandyd.md`](docs/decisions/sandyd.md)).
 
 ## Development
 
