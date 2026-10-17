@@ -30,6 +30,9 @@ sandy-backend.workspace = true
 # that needs either, so this stays dev-only.
 sandy-fabric = { workspace = true, features = ["contract-tests"] }
 sandy-fabric-local.workspace = true
+sandy-proto.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["time", "process", "io-util"] }
+futures-core.workspace = true
+futures-util.workspace = true
