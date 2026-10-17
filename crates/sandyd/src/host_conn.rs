@@ -140,6 +140,15 @@ pub async fn serve_host_client(
     tracing::info!(peer = %peer_ip, host_id, "host-client registered");
 
     loop {
+        // CAUTION (#289): read_frame below is not cancel-safe (it does
+        // separate reads for the length prefix and the payload). Safe only
+        // because the other branch never fires mid-read today — stage 1 has
+        // no host-client-to-orchestrator message after Register, so this
+        // branch never actually resolves. Adding one makes a `Dispatch`
+        // arriving mid-read drop the partially-consumed frame and desync
+        // framing on the next read. Make this cancel-safe (split the
+        // connection, read frames in a dedicated task) before adding any
+        // such message — see #289.
         tokio::select! {
             dispatch = dispatch_rx.recv() => {
                 let Some(dispatch) = dispatch else {
