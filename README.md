@@ -4,7 +4,7 @@
 [![crates.io](https://img.shields.io/crates/v/sandy-lib.svg)](https://crates.io/crates/sandy-lib)
 [![docs.rs](https://img.shields.io/docsrs/sandy-lib.svg)](https://docs.rs/sandy-lib)
 [![codecov](https://codecov.io/gh/kauki-labs/sandy/branch/main/graph/badge.svg)](https://codecov.io/gh/kauki-labs/sandy)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![Rust edition 2024](https://img.shields.io/badge/rust-edition%202024-orange.svg)](rust-toolchain.toml)
 
 sandy runs a job in an ephemeral NixOS microVM and reports a locked result
@@ -137,4 +137,9 @@ The `crates/*` glob in the root `Cargo.toml` picks it up automatically.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Sandy is dual-licensed:
+
+- **Open source:** [GNU AGPL-3.0-only](LICENSE). Free to use, modify, and distribute under the AGPL's terms, including its network-use copyleft (a service built on Sandy must offer its complete corresponding source).
+- **Commercial:** a separate commercial license is available for use that cannot meet the AGPL's obligations, such as proprietary or closed-source products and services. See [COMMERCIAL.md](COMMERCIAL.md).
+
+Contributions are accepted under the Contributor License Agreement in [CONTRIBUTING.md](CONTRIBUTING.md), which lets the project offer the commercial license above.

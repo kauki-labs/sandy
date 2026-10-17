@@ -5,6 +5,36 @@ always-current build/test/style guide is [`AGENTS.md`](AGENTS.md) (read natively
 by Claude Code and GitHub Copilot), and the design lives in
 [`docs/architecture/`](docs/architecture/overview.md).
 
+## Licensing of contributions (CLA)
+
+Sandy is dual-licensed: [AGPL-3.0-only](LICENSE) for open-source use, and a
+separate commercial license for use that cannot meet the AGPL's terms (see
+[COMMERCIAL.md](COMMERCIAL.md)). For the project to offer that commercial license,
+it must hold sufficient rights in every contribution. By submitting a
+contribution (a pull request, patch, or any other work), you agree to the
+following with the project maintainer, **Tibor Csóka** ("the Maintainer"):
+
+- **Grant.** You grant the Maintainer a perpetual, worldwide, non-exclusive,
+  royalty-free, irrevocable license to reproduce, prepare derivative works of,
+  publicly display and perform, sublicense, and distribute your contribution and
+  derivative works, **with the right to sublicense and relicense it under any
+  license, including AGPL-3.0, other open-source licenses, and
+  proprietary/commercial licenses.**
+- **Patents.** You grant the Maintainer and recipients a perpetual, worldwide,
+  non-exclusive, royalty-free, irrevocable patent license for any patent claims
+  you can license that your contribution necessarily infringes, alone or combined
+  with the project.
+- **You keep ownership.** This is a license, not an assignment; you retain all
+  right, title, and interest in your contribution and may use it however you wish.
+- **Representations.** Each contribution is your original work, you are entitled
+  to grant these licenses, and if your employer has rights to your work you have
+  permission to contribute.
+
+If you do not agree, do not submit a contribution.
+
+> These terms are the project's current CLA and may be revised; a contribution is
+> accepted under the version in effect when it is submitted.
+
 ## Setup
 
 sandy builds with [Nix](https://nixos.org/download) (flakes enabled). The dev
