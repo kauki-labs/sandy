@@ -1,0 +1,35 @@
+[package]
+name = "sandy-conn"
+description = "The one stream transport sandyd's control RPC (and, later, cross-machine channel delivery) ride: UDS (local) -> vsock (VM guest) -> TCP/QUIC-over-mesh (cross-machine), per epic #205's B6"
+version.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+documentation = "https://docs.rs/sandy-conn"
+keywords = ["network-programming", "uds", "vsock", "daemon", "sandbox"]
+categories = ["network-programming"]
+
+[lints]
+workspace = true
+
+[dependencies]
+fs2.workspace = true
+rustix.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "rt"] }
+
+[dev-dependencies]
+anyhow.workspace = true
+sandy-control-proto.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = [
+  "macros",
+  "rt-multi-thread",
+  "net",
+  "io-util",
+  "time",
+] }
