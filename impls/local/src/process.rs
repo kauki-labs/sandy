@@ -80,6 +80,34 @@ const POLL: Duration = Duration::from_millis(10);
 /// are NEVER joined unconditionally — `run()` stays bounded regardless of the job.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
+/// Called with a run's box id and the host end of its agent link, right after
+/// the agent is spawned and before the backend waits on it.
+pub type OnLink = Arc<dyn Fn(&str, std::os::fd::OwnedFd) + Send + Sync>;
+
+/// How the backend launches the sandbox agent (#216).
+///
+/// Per run the backend creates a close-on-exec unix socket pair, gives one end
+/// to the agent as its stdin
+/// ([`AGENT_LINK_FD`](https://docs.rs/sandy-fabric/latest/sandy_fabric/capauth/constant.AGENT_LINK_FD.html)),
+/// and passes the other to [`on_link`](Self::on_link), which runs the
+/// orchestrator-side relay. The backend's own copy of the agent end is closed
+/// once the agent is spawned, so the relay sees EOF when the agent exits.
+#[derive(Clone)]
+pub struct AgentLaunch {
+    /// The `sandy-agent` binary.
+    pub program: std::path::PathBuf,
+    /// Receives each run's host end of the agent link.
+    pub on_link: OnLink,
+}
+
+impl std::fmt::Debug for AgentLaunch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentLaunch")
+            .field("program", &self.program)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A [`VmBackend`] that runs the job as a raw OS process (no VM).
 ///
 /// Owns its running-instance registry so [`boxes`](VmBackend::boxes) reports live
@@ -88,6 +116,8 @@ const DRAIN_GRACE: Duration = Duration::from_secs(2);
 #[derive(Debug)]
 pub struct ProcessBackend {
     instances: Mutex<Vec<BoxState>>,
+    /// When set, every job runs as the child of the sandbox agent process (#216).
+    agent: Option<AgentLaunch>,
     /// How a job is confined (#135). The default [`NoContainment`] keeps the backend
     /// hermetic and uncontained (best-effort group reap only); the composition root
     /// injects the host [`SystemdRunContainment`](crate::SystemdRunContainment).
@@ -114,8 +144,18 @@ impl ProcessBackend {
     pub fn with_containment(containment: Box<dyn Containment>) -> Self {
         Self {
             instances: Mutex::new(Vec::new()),
+            agent: None,
             containment,
         }
+    }
+
+    /// Launch every job through the sandbox agent (#216): the backend runs
+    /// `agent.program -- <job>` with a fresh agent link on its stdin and hands
+    /// the link's host end to `agent.on_link` right after the spawn.
+    #[must_use]
+    pub fn with_agent(mut self, agent: AgentLaunch) -> Self {
+        self.agent = Some(agent);
+        self
     }
 
     /// The containment's current [`ContainmentStatus`], for the fail-closed gate
