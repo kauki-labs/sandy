@@ -84,12 +84,15 @@ user owns, is refused with the same tamper message before any file in it is
 opened, with no backwards compatibility (operator ruling). The file is then opened
 relative to the checked dir, without following a symlink at the leaf, and checked
 on its own handle: it must be a regular file owned by the current user, or it is
-refused, since another user must have put it there. An existing install whose
-trust-roots dir is group-writable (for example, registered under umask `0002`, so
-`0775`) is refused on every read, register, and import until the user verifies
-the files and runs `chmod 700`, so its credentialed runs stop until then;
-deregister writes no trust material and still works, and its shred never follows a
-symlink at the key path. That is a deliberate break. Register checks the dir before capture, so the refusal
+refused, since another user must have put it there, and writable by no one else,
+or it is refused, since it may have been changed in place. An existing install
+whose trust-roots dir is group-writable (for example, registered under umask
+`0002`, so `0775`) is refused on every read, register, import, and deregister
+(which loads the config first) until the user verifies the files and runs
+`chmod 700`, so its credentialed runs stop until then. Deregister's shred never
+follows a symlink at the key path. That is a deliberate break. The reader follows
+a symlinked trust-roots dir and checks the dir it resolves to; the writers refuse
+one. Register checks the dir before capture, so the refusal
 never leaves a forge App behind whose key it could not save. The trust-root name is
 checked to be a single file name before anything is created.
 

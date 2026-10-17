@@ -418,9 +418,6 @@ fn open_trust_file_as(what: &str, path: &Path, current_uid: u32) -> Result<(fs::
         .parent()
         .filter(|d| !d.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    let name = path
-        .file_name()
-        .ok_or_else(|| CredError::Stage(format!("{what} {} names no file", path.display())))?;
     let dir_handle = fs::File::from(
         rustix::fs::open(dir, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty())
             .map_err(|e| stage_err(&format!("open the dir of {what}"), dir, &e.into()))?,
@@ -429,10 +426,28 @@ fn open_trust_file_as(what: &str, path: &Path, current_uid: u32) -> Result<(fs::
         .metadata()
         .map_err(|e| stage_err(&format!("stat the dir of {what}"), dir, &e))?;
     refuse_unsafe_dir(dir, dir_meta.uid(), dir_meta.mode() & 0o7777, current_uid)?;
+    open_in_checked_dir(what, path, &dir_handle, current_uid)
+}
 
+/// Open `path`'s file relative to `dir`, a dir handle that already passed
+/// [`refuse_unsafe_dir`], and check the file on its own handle: not a symlink,
+/// a regular file, owned by the current user, and writable by no one else.
+fn open_in_checked_dir(
+    what: &str,
+    path: &Path,
+    dir: &fs::File,
+    current_uid: u32,
+) -> Result<(fs::File, fs::Metadata), CredError> {
+    use std::os::unix::fs::MetadataExt;
+
+    use rustix::fs::{Mode, OFlags};
+
+    let name = path
+        .file_name()
+        .ok_or_else(|| CredError::Stage(format!("{what} {} names no file", path.display())))?;
     let file = fs::File::from(
         rustix::fs::openat(
-            &dir_handle,
+            dir,
             name,
             OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
             Mode::empty(),
@@ -454,18 +469,16 @@ fn open_trust_file_as(what: &str, path: &Path, current_uid: u32) -> Result<(fs::
         )));
     }
     refuse_foreign_owner(what, path, meta.uid(), current_uid)?;
+    let mode = meta.mode() & 0o7777;
+    if mode & 0o022 != 0 {
+        return Err(CredError::Stage(format!(
+            "{what} {} is writable by others (mode {mode:o}); another user may have changed it, so it is not read. \
+             Verify it, then run `chmod 600 {}`",
+            path.display(),
+            path.display()
+        )));
+    }
     Ok((file, meta))
-}
-
-/// Open `path`'s file relative to `dir`, a dir handle that already passed
-/// [`refuse_unsafe_dir`], and check the file on its own handle.
-fn open_in_checked_dir(
-    what: &str,
-    path: &Path,
-    _dir: &fs::File,
-    current_uid: u32,
-) -> Result<(fs::File, fs::Metadata), CredError> {
-    open_trust_file_as(what, path, current_uid)
 }
 
 /// Build a [`CredError::Stage`] for an IO failure without leaking secret bytes.
