@@ -27,6 +27,7 @@ sandy-fabric-local.workspace = true
 sandy-fsutil.workspace = true
 fs2.workspace = true
 rustix.workspace = true
+getrandom.workspace = true
 rusqlite.workspace = true
 tokio = { workspace = true, features = [
   "rt-multi-thread",

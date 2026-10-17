@@ -41,6 +41,8 @@ use sandy_fabric::{
 };
 use sandy_fabric_local::{LocalCapAuthority, channel::Channel, inmem::InMem};
 
+use crate::link_auth::{self, LinkAuthError, RemoteLink};
+
 /// A job's dedicated orchestrator channel, minted at submit time.
 pub struct JobChannel {
     /// The channel itself, keyed by the job's own id (spec §3.4: dedicated,
@@ -56,6 +58,11 @@ pub struct JobChannel {
     /// through this cap. A caller wanting to drive input needs a `post`-
     /// capable cap, deliberately not what `Attach` alone grants.
     pub observer_cap: Cap,
+    /// This run's binding to a remote executor (#212 decision 6), if it has
+    /// one. `None` for a job dispatched locally, which has no mesh stream to
+    /// authenticate — `serve_agent_link` runs directly over a private
+    /// socketpair there. Set at dispatch, never mutated after.
+    pub remote_link: Option<RemoteLink>,
 }
 
 /// A dispatch failure.
@@ -110,6 +117,7 @@ pub async fn mint_job_channel(job_id: &str) -> Result<JobChannel, DispatchError>
         channel: Arc::new(channel),
         agent_cap,
         observer_cap,
+        remote_link: None,
     })
 }
 
@@ -141,6 +149,27 @@ impl JobRegistry {
             .unwrap_or_else(PoisonError::into_inner)
             .get(job_id)
             .cloned()
+    }
+
+    /// Authenticate an incoming remote agent-link stream for `job_id`
+    /// against its recorded executor binding (#212 decision 6) before the
+    /// caller may proceed to `serve_agent_link` at all.
+    ///
+    /// # Errors
+    /// [`LinkAuthError::UnknownRun`] if no such job is registered;
+    /// [`LinkAuthError::NotRemote`] if the job was dispatched locally and has
+    /// no remote link to authenticate; otherwise see
+    /// [`link_auth::authenticate`].
+    pub fn authenticate_remote_link(
+        &self,
+        job_id: &str,
+        peer_ip: std::net::IpAddr,
+        presented_token: &[u8; link_auth::LINK_TOKEN_LEN],
+    ) -> Result<Arc<JobChannel>, LinkAuthError> {
+        let job = self.get(job_id).ok_or(LinkAuthError::UnknownRun)?;
+        let link = job.remote_link.as_ref().ok_or(LinkAuthError::NotRemote)?;
+        link_auth::authenticate(link, peer_ip, presented_token)?;
+        Ok(job)
     }
 }
 
@@ -214,6 +243,57 @@ mod tests {
         let found = registry.get("job-1").expect("job-1 was registered");
         assert_eq!(found.agent_cap.proof, agent_cap_proof);
         assert!(registry.get("job-2").is_none());
+        Ok(())
+    }
+
+    /// Adversarial (#212 decision 6): an unknown job id must be refused by
+    /// name, not treated as having no remote link (a different refusal that
+    /// would leak "this job exists but is local").
+    #[test]
+    fn authenticating_an_unregistered_job_is_refused_as_unknown() {
+        let registry = JobRegistry::default();
+        let token = [0u8; link_auth::LINK_TOKEN_LEN];
+        match registry.authenticate_remote_link("ghost", "127.0.0.1".parse().unwrap(), &token) {
+            Err(e) => assert_eq!(e, LinkAuthError::UnknownRun),
+            Ok(_) => panic!("an unregistered job must be refused"),
+        }
+    }
+
+    /// A job dispatched locally (the only kind this slice mints) has no
+    /// remote link to authenticate against — refused by name, never treated
+    /// as an unknown run.
+    #[tokio::test]
+    async fn authenticating_a_local_jobs_link_is_refused_as_not_remote() -> anyhow::Result<()> {
+        let registry = JobRegistry::default();
+        let job = mint_job_channel("job-1").await?;
+        registry.insert("job-1".to_owned(), job);
+
+        let token = [0u8; link_auth::LINK_TOKEN_LEN];
+        match registry.authenticate_remote_link("job-1", "127.0.0.1".parse().unwrap(), &token) {
+            Err(e) => assert_eq!(e, LinkAuthError::NotRemote),
+            Ok(_) => panic!("a locally dispatched job has no remote link"),
+        }
+        Ok(())
+    }
+
+    /// A job bound to a remote executor authenticates against the real
+    /// peer/token and refuses a second attempt, through the registry's own
+    /// lookup path (not just `link_auth`'s unit tests in isolation).
+    #[tokio::test]
+    async fn authenticating_a_remote_jobs_link_round_trips_through_the_registry() -> anyhow::Result<()> {
+        let registry = JobRegistry::default();
+        let mut job = mint_job_channel("job-1").await?;
+        let executor_ip: std::net::IpAddr = "100.64.0.7".parse().unwrap();
+        let link = RemoteLink::new(executor_ip)?;
+        let token = *link.token().as_bytes();
+        job.remote_link = Some(link);
+        registry.insert("job-1".to_owned(), job);
+
+        registry.authenticate_remote_link("job-1", executor_ip, &token)?;
+        match registry.authenticate_remote_link("job-1", executor_ip, &token) {
+            Err(e) => assert_eq!(e, LinkAuthError::AlreadyClaimed),
+            Ok(_) => panic!("a second stream for the same run must be refused"),
+        }
         Ok(())
     }
 }

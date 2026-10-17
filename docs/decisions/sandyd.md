@@ -160,9 +160,17 @@ name: blurs direct-execution's and the daemon's job concepts together.
 
 ## 6. Remote agent-link streams must authenticate before `serve_agent_link` writes a frame (hard gate, on the M2 critical path)
 
-**Status:** planned — this is a requirement on the not-yet-built remote-executor
-dispatch path, recorded now so it is designed in from the start rather than
-retrofitted. Nothing in the current codebase implements it; tracked by #212.
+**Status:** partially implemented. The authorization logic is built and
+tested in isolation (`sandyd::link_auth`: `RemoteLink`, the constant-time
+token compare, `JobRegistry::authenticate_remote_link`) — accept-or-refuse
+given a job id, a peer IP, and a presented token, with every refusal path
+named and tested (wrong peer, wrong token, already-claimed, unknown run) and
+a dedicated test proving the token never appears in `Debug` output. What is
+NOT yet built: the network accept loop itself (binding a mesh address via
+`sandy-conn`, calling this logic per accepted connection) and anything that
+calls `RemoteLink::new` to actually bind a run to an executor at dispatch —
+both wait on #263's dispatch-RPC design, which decides where that binding
+happens and what shape the accept loop's caller takes. Tracked by #212.
 Promoted from a cross-machine-safety nicety to the M2 critical path (decision
 8): M2's cross-sandbox peer-group channels depend on this binding existing.
 
