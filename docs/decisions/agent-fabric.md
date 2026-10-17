@@ -386,13 +386,14 @@ earlier stdin, so neither may be reused across runs (spec §3.4). Known limits o
 the local process backend: a job shares the agent's uid, so it can kill its agent
 (an infra fault, never a result it chose) and, where `ptrace` is open, read the
 agent's memory (the agent marks itself non-dumpable on Linux). On macOS a socket
-pair, and std's stdio pipes, get close-on-exec in a second call. The backend
-creates each run's link and spawns under one process-wide lock (#230), so no
-backend spawn inherits another run's link or stdio pipes. Descriptors that other
-code in the same host process creates non-atomically still race a backend spawn
-in either direction. One example is a relay that dials a socket from `on_link`.
-Closing that needs a spawn that inherits only the mapped stdio
-(`POSIX_SPAWN_CLOEXEC_DEFAULT`); see #281. `UnavailableConsole` means #109's
+or pipe gets close-on-exec in a second call, so a descriptor any thread is
+creating could leak into a spawn. There the backend spawns with `posix_spawnp`
+and `POSIX_SPAWN_CLOEXEC_DEFAULT` (#281, through `nix::spawn`, no `unsafe`):
+only the three descriptors mapped onto stdio reach the child, with SIGPIPE reset
+and a new process group as std does. Linux spawns through std, where every
+descriptor is close-on-exec atomically. `SPAWN_LOCK` (#230) stays as defence in
+depth. A spawn made outside the backend, by other code in the host, is not
+covered. `UnavailableConsole` means #109's
 "break-glass works when the agent is down" positive case is honestly NOT
 demonstrated for the process backend; it is deferred to the VM-backed
 `RawConsole`, tracked separately.

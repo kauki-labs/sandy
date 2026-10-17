@@ -21,11 +21,17 @@ workspace = true
 
 [dependencies]
 command-group.workspace = true
+rustix = { workspace = true, features = ["pipe"] }
 sandy.workspace = true
 sandy-api.workspace = true
 sandy-fsutil.workspace = true
 tracing.workspace = true
 uuid = { workspace = true }
+
+# #281: spawn with POSIX_SPAWN_CLOEXEC_DEFAULT, Apple only (the safe nix::spawn
+# API keeps forbid(unsafe_code)).
+[target.'cfg(target_vendor = "apple")'.dependencies]
+nix.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
