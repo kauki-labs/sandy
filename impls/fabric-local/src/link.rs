@@ -1151,6 +1151,64 @@ mod tests {
         Ok(())
     }
 
+    /// Adversarial review of #256: with the link to the agent full (it stopped
+    /// reading, so a peer delivery blocks holding the writer), reporting a
+    /// refusal must not stop the relay reading the agent's posts and exit.
+    #[tokio::test]
+    async fn a_refusal_report_never_stalls_the_relay_on_a_full_link() -> anyhow::Result<()> {
+        let (group_a, agent_a, expires_at) = expiring_peer_channel().await?;
+        let (group_b, agent_b, sibling_b) = peer_channel("group-b").await?;
+        let sibling = group_b.join(&sibling_b)?;
+        let mut sibling_view = std::pin::pin!(group_b.subscribe(&sibling)?);
+        let grants = vec![
+            PeerGrant {
+                channel: group_a,
+                cap: agent_a,
+            },
+            PeerGrant {
+                channel: Arc::clone(&group_b),
+                cap: agent_b,
+            },
+        ];
+        // The agent end is never read from here on.
+        let (mut agent_end, _relay) = raw_agent_with_peers(grants).await?;
+        // Distinct payloads: the channel keeps one copy of identical content.
+        for n in 0..8_u8 {
+            group_b
+                .post(
+                    &sibling,
+                    Some(MessageType::PeerMsg(PeerMsg {})),
+                    "application/octet-stream",
+                    vec![n; 16 * 1024],
+                )
+                .await?;
+        }
+
+        until_expired(expires_at).await?;
+        for (channel, payload) in [("group-a", &b"refused"[..]), ("group-b", &b"marker"[..])] {
+            write_frame(
+                &mut agent_end,
+                &LinkFrame::Post {
+                    content_type: "text/plain".to_string(),
+                    payload: hex::encode(payload),
+                    channel: Some(channel.to_string()),
+                },
+            )
+            .await?;
+        }
+        timeout(WAIT, async {
+            loop {
+                let env = sibling_view.next().await.context("group stream ended")??;
+                if env.payload == b"marker" {
+                    return anyhow::Ok(());
+                }
+            }
+        })
+        .await
+        .context("the relay stopped reading after the refusal")??;
+        Ok(())
+    }
+
     /// #256 end to end: the agent counts the refusal the relay reports, so the
     /// job can see a post it was told was only submitted did not go through.
     #[tokio::test]
