@@ -585,6 +585,13 @@ unit-testable without a real socket — the same shape decision 6's
 address, calling `serve_host_client` per accepted connection) and the
 placement logic that decides when to call `send_dispatch` are both still
 open; tracked by #263 and #269's stage-1 block list, not silently assumed.
+There is also no `OrchestratorMessage` variant for cancelling a dispatched
+job: a cancelled run's sandbox keeps executing on the host until it finishes
+on its own (decision 6's token invalidation, §6, stops a late-arriving
+executor stream from claiming the run's agent link, but does nothing to stop
+the host-side process itself). Confirmed intentionally deferred past M2, not
+a contract break — a future `Cancel`/`Stop` message is an additive `oneof`
+variant, not a breaking change to what's shipped here.
 
 **Set aside.** Building the mesh-address accept loop and wiring it into
 `main.rs` in this same slice: that needs a decision this PR doesn't own (how
