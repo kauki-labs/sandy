@@ -210,15 +210,10 @@ where
     let (mut rd, wr) = tokio::io::split(link);
     let wr = Arc::new(AsyncMutex::new(wr));
 
-    write_frame(
-        &mut *wr.lock().await,
-        &LinkFrame::Cap {
-            cap: hex::encode(encode_cap(cap)?),
-        },
-    )
-    .await?;
+    let handed = hex::encode(encode_cap(cap)?);
+    write_frame(&mut *wr.lock().await, &LinkFrame::Cap { cap: handed.clone() }).await?;
     let presented = match read_frame(&mut rd).await? {
-        Some(LinkFrame::Join { cap }) => decode_cap(&unhex(&cap, "the join cap")?)?,
+        Some(LinkFrame::Join { cap }) => cap,
         Some(other) => {
             return Err(LinkError::Protocol(format!(
                 "expected join from the agent, got {}",
@@ -231,36 +226,63 @@ where
             ));
         }
     };
-    let membership = match channel.join(&presented) {
-        Ok(membership) => membership,
+    // Admit only the cap this relay handed over: the peer may not join as anyone
+    // else on this link, even with another valid cap.
+    if presented != handed {
+        let reason = "the join must present the cap this link handed over".to_string();
+        let _ = write_frame(&mut *wr.lock().await, &LinkFrame::Refused { reason: reason.clone() }).await;
+        return Err(LinkError::Protocol(reason));
+    }
+    let id = match channel.join(&decode_cap(&unhex(&presented, "the join cap")?)?) {
+        Ok(id) => id,
         Err(e) => {
             // Best effort: the agent may already be gone; the refusal is returned either way.
             let _ = write_frame(&mut *wr.lock().await, &LinkFrame::Refused { reason: e.to_string() }).await;
             return Err(e.into());
         }
     };
+    // From here on the guard leaves the membership and stops stdin delivery on
+    // every path out, including this future being dropped.
+    let mut membership = Joined {
+        channel: Arc::clone(&channel),
+        id,
+        deliver: None,
+    };
     write_frame(&mut *wr.lock().await, &LinkFrame::Joined).await?;
+    relay_joined(&mut membership, &mut rd, &wr).await
+}
 
-    let result = relay_joined(&channel, &membership, &mut rd, &wr).await;
-    channel.leave(&membership);
-    result.map(|()| None)
+/// A joined agent's membership: leaving it, and aborting the stdin delivery
+/// task, on drop.
+struct Joined<B: ChannelBackend, A: CapAuthority> {
+    channel: Arc<Channel<B, A>>,
+    id: MembershipId,
+    deliver: Option<tokio::task::AbortHandle>,
+}
+
+impl<B: ChannelBackend, A: CapAuthority> Drop for Joined<B, A> {
+    fn drop(&mut self) {
+        if let Some(deliver) = self.deliver.take() {
+            deliver.abort();
+        }
+        self.channel.leave(&self.id);
+    }
 }
 
 /// The joined phase of [`serve_agent_link`]: channel stdin out to the agent,
-/// job output in from it, until the agent closes the link.
+/// job output and the final exit in from it, until the agent closes the link.
 async fn relay_joined<B, A, R, W>(
-    channel: &Arc<Channel<B, A>>,
-    membership: &MembershipId,
+    membership: &mut Joined<B, A>,
     rd: &mut R,
     wr: &Arc<AsyncMutex<W>>,
-) -> Result<(), LinkError>
+) -> Result<Option<i32>, LinkError>
 where
     B: ChannelBackend + 'static,
     A: CapAuthority + 'static,
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let inbound = channel.subscribe(membership)?;
+    let inbound = membership.channel.subscribe(&membership.id)?;
     let deliver = tokio::spawn({
         let wr = Arc::clone(wr);
         async move {
@@ -287,44 +309,42 @@ where
             }
         }
     });
+    membership.deliver = Some(deliver.abort_handle());
 
-    let result = loop {
-        match read_frame(rd).await {
-            Ok(None) => break Ok(()),
-            Ok(Some(LinkFrame::Post { content_type, payload })) => {
-                if content_type != TTY_STDOUT && content_type != TTY_STDERR {
-                    break Err(LinkError::Protocol(format!("the agent may not post {content_type}")));
-                }
-                let bytes = match unhex(&payload, "a post payload") {
-                    Ok(bytes) => bytes,
-                    Err(e) => break Err(e),
-                };
-                if let Err(e) = channel
-                    .post(membership, Some(MessageType::Tty(Tty {})), content_type, bytes)
-                    .await
-                {
-                    break Err(e.into());
-                }
+    let mut exit = None;
+    loop {
+        match read_frame(rd).await? {
+            None => return Ok(exit),
+            Some(_) if exit.is_some() => {
+                return Err(LinkError::Protocol(
+                    "the agent sent a frame after reporting the job's exit".to_string(),
+                ));
             }
-            Ok(Some(LinkFrame::Join { .. })) => {
+            Some(LinkFrame::Post { content_type, payload }) => {
+                if content_type != TTY_STDOUT && content_type != TTY_STDERR {
+                    return Err(LinkError::Protocol(format!("the agent may not post {content_type}")));
+                }
+                let bytes = unhex(&payload, "a post payload")?;
+                membership
+                    .channel
+                    .post(&membership.id, Some(MessageType::Tty(Tty {})), content_type, bytes)
+                    .await?;
+            }
+            Some(LinkFrame::Exit { code }) => exit = Some(code),
+            Some(LinkFrame::Join { .. }) => {
                 let refused = LinkFrame::Refused {
                     reason: "already joined; one membership per link".to_string(),
                 };
-                if let Err(e) = write_frame(&mut *wr.lock().await, &refused).await {
-                    break Err(e);
-                }
+                write_frame(&mut *wr.lock().await, &refused).await?;
             }
-            Ok(Some(other)) => {
-                break Err(LinkError::Protocol(format!(
+            Some(other) => {
+                return Err(LinkError::Protocol(format!(
                     "unexpected {} frame from the agent",
                     other.kind()
                 )));
             }
-            Err(e) => break Err(e),
         }
-    };
-    deliver.abort();
-    result
+    }
 }
 
 #[cfg(test)]
@@ -547,7 +567,7 @@ mod tests {
         let reply = timeout(WAIT, read_frame(&mut agent_end)).await??;
         assert!(matches!(reply, Some(LinkFrame::Refused { .. })), "got {reply:?}");
         assert!(
-            timeout(WAIT, relay).await?.is_err(),
+            timeout(WAIT, relay).await??.is_err(),
             "the relay must report the refusal"
         );
         Ok(())

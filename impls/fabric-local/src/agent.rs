@@ -375,8 +375,8 @@ impl LinkAgent {
     ///
     /// # Errors
     /// [`AgentError::Link`] if the frame cannot be written.
-    pub async fn report_exit(&self, _code: i32) -> Result<(), AgentError> {
-        Ok(())
+    pub async fn report_exit(&self, code: i32) -> Result<(), AgentError> {
+        Ok(write_frame(&mut *self.port.writer.lock().await, &LinkFrame::Exit { code }).await?)
     }
 }
 
