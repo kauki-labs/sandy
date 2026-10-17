@@ -338,7 +338,7 @@ impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
 /// dropped mid-`select!`) loses that envelope — at-most-once, not the
 /// at-least-once the spec wants for the offline/reconnect case. True
 /// at-least-once needs a consumer-ack'd or consumer-managed cursor instead of
-/// one the backend advances on delivery; tracked as #186, not fixed here.
+/// one the backend advances on delivery; tracked as #173, not fixed here.
 struct CursorStream {
     inner: Pin<Box<dyn Stream<Item = Result<Envelope, ChannelBackendError>> + Send>>,
     sessions: Arc<Mutex<HashMap<MembershipId, MembershipState>>>,
