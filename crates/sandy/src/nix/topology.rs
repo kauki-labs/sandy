@@ -62,7 +62,8 @@ pub struct Share {
 
 /// The complete VM topology sandy evaluates out of a guest flake attr.
 ///
-/// Every field but [`Topology::vsock_cid`] is required: deserialization of a
+/// Every field but [`Topology::vsock_cid`] and [`Topology::agent_program`] is
+/// required: deserialization of a
 /// JSON object missing one fails, surfacing as [`BackendError::Protocol`] rather
 /// than a defaulted value (INV-TOPOLOGY). The native backends (#33/#34) consume
 /// this to assemble the hypervisor argv.
@@ -81,9 +82,14 @@ pub struct Topology {
     /// Memory budget in MiB.
     pub mem: u32,
     /// The guest's vsock context id, when the topology assigns one. Absent in
-    /// the JSON deserializes to `None`; it is the only optional field.
+    /// the JSON deserializes to `None`.
     #[serde(default)]
     pub vsock_cid: Option<u32>,
+    /// The guest's path to the `sandy-agent` baked into this image (#238): the
+    /// binary an agent-mode backend launches inside the guest, so it is always
+    /// the one this image carries. Absent for an image without the agent.
+    #[serde(default)]
+    pub agent_program: Option<PathBuf>,
     /// Extra host→guest virtiofs shares beyond the store.
     pub shares: Vec<Share>,
     /// The hypervisor this topology targets.
@@ -195,6 +201,22 @@ mod tests {
         assert_eq!(topology.hypervisor, Hypervisor::Vfkit);
         assert_eq!(topology.store, StoreBacking::Virtiofs("ro-store".to_string()));
         assert_eq!(topology.vsock_cid, None);
+        Ok(())
+    }
+
+    /// #238: the agent's in-guest path is carried when the image has one, and is
+    /// `None` (never a guessed path) when it does not.
+    #[test]
+    fn the_agent_program_is_carried_when_present_and_none_otherwise() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let mut doc: serde_json::Value = serde_json::from_slice(X86_64_FIXTURE).context("fixture json")?;
+        assert_eq!(parse_topology(X86_64_FIXTURE)?.agent_program, None);
+        doc["agent_program"] = serde_json::json!("/nix/store/abc-sandy-agent/bin/sandy-agent");
+        let topology = parse_topology(&serde_json::to_vec(&doc)?)?;
+        assert_eq!(
+            topology.agent_program,
+            Some(PathBuf::from("/nix/store/abc-sandy-agent/bin/sandy-agent"))
+        );
         Ok(())
     }
 
