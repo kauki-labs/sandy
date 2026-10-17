@@ -885,6 +885,64 @@ mod tests {
         Ok(())
     }
 
+    /// CodeRabbit on #246: a job that never reads its stdin must not stall the
+    /// link reader, or peer deliveries would sit unrouted and uncounted.
+    #[tokio::test]
+    async fn a_job_that_never_reads_stdin_does_not_stall_peer_delivery() -> anyhow::Result<()> {
+        let (channel, agent_cap, orchestrator_cap) = channel_and_caps().await?;
+        let (group, agent_peer_cap, sibling_cap) = peer_channel("group-a").await?;
+        let orchestrator = channel.join(&orchestrator_cap)?;
+        let sibling = group.join(&sibling_cap)?;
+        let (agent_end, host_end) = tokio::io::duplex(1 << 20);
+        let grants = vec![PeerGrant {
+            channel: Arc::clone(&group),
+            cap: agent_peer_cap,
+        }];
+        let relay = tokio::spawn({
+            let channel = Arc::clone(&channel);
+            async move { serve_agent_link_with_peers(channel, &agent_cap, grants, host_end).await }
+        });
+        let agent = Arc::new(timeout(WAIT, LinkAgent::bootstrap(agent_end)).await??);
+        let mut inbox = agent.take_peer_inbox().context("inbox")?;
+        let (stdout_agent, job_stdout) = tokio::io::duplex(1024);
+        let (stderr_agent, job_stderr) = tokio::io::duplex(1024);
+        // A one-byte stdin pipe nobody reads: the first write fills it.
+        let (stdin_agent, _never_read) = tokio::io::duplex(1);
+        let serving = tokio::spawn({
+            let agent = Arc::clone(&agent);
+            async move { agent.serve_tty(stdout_agent, stderr_agent, stdin_agent).await }
+        });
+
+        channel
+            .post(
+                &orchestrator,
+                Some(MessageType::Tty(Tty {})),
+                TTY_STDIN,
+                vec![b'x'; 64 * 1024],
+            )
+            .await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        group
+            .post(
+                &sibling,
+                Some(MessageType::PeerMsg(sandy_proto::PeerMsg {})),
+                "text/plain",
+                b"still-routed".to_vec(),
+            )
+            .await?;
+        let got = timeout(WAIT, inbox.recv())
+            .await
+            .context("the peer delivery was stalled behind the job's stdin")?
+            .context("inbox closed")?;
+        assert_eq!(got.payload, b"still-routed");
+
+        drop((job_stdout, job_stderr));
+        timeout(WAIT, serving).await???;
+        drop(agent);
+        timeout(WAIT, relay).await???;
+        Ok(())
+    }
+
     /// Run the relay with peer grants and drive it as a raw agent through the
     /// setup: the orchestrator join, then each peer join in lockstep.
     async fn raw_agent_with_peers(
