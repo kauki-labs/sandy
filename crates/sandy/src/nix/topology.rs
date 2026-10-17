@@ -82,7 +82,7 @@ pub struct Topology {
     /// Memory budget in MiB.
     pub mem: u32,
     /// The guest's vsock context id, when the topology assigns one. Absent in
-    /// the JSON deserializes to `None`; it is the only optional field.
+    /// the JSON deserializes to `None`.
     #[serde(default)]
     pub vsock_cid: Option<u32>,
     /// The guest's path to the `sandy-agent` baked into this image (#238): the
