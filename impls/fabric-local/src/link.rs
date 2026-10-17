@@ -20,12 +20,19 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use sandy_fabric::{
-    capauth::{Cap, CapAuthority, CapCodecError},
+    capauth::{Cap, CapAuthority, CapCodecError, decode_cap, encode_cap},
     channel_backend::ChannelBackend,
 };
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use sandy_proto::{MessageType, Tty};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    sync::Mutex as AsyncMutex,
+};
 
-use crate::channel::{Channel, ChannelError};
+use crate::{
+    agent::{TTY_STDERR, TTY_STDIN, TTY_STDOUT},
+    channel::{Channel, ChannelError, MembershipId},
+};
 
 /// The largest frame either side accepts. A length prefix above it is refused
 /// before anything is allocated, so a hostile peer cannot make the other side
@@ -123,8 +130,16 @@ pub enum LinkError {
 /// # Errors
 /// [`LinkError::Io`] if the write fails, [`LinkError::Protocol`] if the frame
 /// encodes above [`MAX_FRAME`].
-pub async fn write_frame(_w: &mut (impl AsyncWrite + Unpin), _frame: &LinkFrame) -> Result<(), LinkError> {
-    Err(LinkError::Protocol("not implemented".to_string()))
+pub async fn write_frame(w: &mut (impl AsyncWrite + Unpin), frame: &LinkFrame) -> Result<(), LinkError> {
+    let body = serde_json::to_vec(frame).map_err(|e| LinkError::Protocol(format!("encode {}: {e}", frame.kind())))?;
+    let len = u32::try_from(body.len())
+        .ok()
+        .filter(|&n| n as usize <= MAX_FRAME)
+        .ok_or_else(|| LinkError::Protocol(format!("{} frame too large: {} bytes", frame.kind(), body.len())))?;
+    w.write_all(&len.to_be_bytes()).await?;
+    w.write_all(&body).await?;
+    w.flush().await?;
+    Ok(())
 }
 
 /// Read one length-prefixed frame; `None` on a clean EOF before a frame starts.
@@ -133,8 +148,33 @@ pub async fn write_frame(_w: &mut (impl AsyncWrite + Unpin), _frame: &LinkFrame)
 /// [`LinkError::Io`] on a read fault or an EOF inside a frame,
 /// [`LinkError::Protocol`] for a length above [`MAX_FRAME`] or bytes that are
 /// not a [`LinkFrame`].
-pub async fn read_frame(_r: &mut (impl AsyncRead + Unpin)) -> Result<Option<LinkFrame>, LinkError> {
-    Err(LinkError::Protocol("not implemented".to_string()))
+pub async fn read_frame(r: &mut (impl AsyncRead + Unpin)) -> Result<Option<LinkFrame>, LinkError> {
+    let mut len = [0_u8; 4];
+    let mut got = 0;
+    while got < len.len() {
+        let n = r.read(&mut len[got..]).await?;
+        if n == 0 {
+            if got == 0 {
+                return Ok(None);
+            }
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+        }
+        got += n;
+    }
+    let len = u32::from_be_bytes(len) as usize;
+    if len > MAX_FRAME {
+        return Err(LinkError::Protocol(format!("frame too large: {len} bytes")));
+    }
+    let mut body = vec![0_u8; len];
+    r.read_exact(&mut body).await?;
+    serde_json::from_slice(&body)
+        .map(Some)
+        .map_err(|e| LinkError::Protocol(format!("malformed frame: {e}")))
+}
+
+/// Decode a hex field of a frame.
+pub(crate) fn unhex(field: &str, what: &str) -> Result<Vec<u8>, LinkError> {
+    hex::decode(field).map_err(|e| LinkError::Protocol(format!("{what} is not hex: {e}")))
 }
 
 /// Relay one agent's link to `channel` until the agent closes it: hand over
@@ -145,13 +185,130 @@ pub async fn read_frame(_r: &mut (impl AsyncRead + Unpin)) -> Result<Option<Link
 /// [`LinkError::Channel`] if the join is refused (the agent is told why first),
 /// [`LinkError::Protocol`] if the agent sends a frame it may not, and
 /// [`LinkError::Io`] if the link faults.
-pub async fn serve_agent_link<B, A, L>(_channel: Arc<Channel<B, A>>, _cap: &Cap, _link: L) -> Result<(), LinkError>
+pub async fn serve_agent_link<B, A, L>(channel: Arc<Channel<B, A>>, cap: &Cap, link: L) -> Result<(), LinkError>
 where
     B: ChannelBackend + 'static,
     A: CapAuthority + 'static,
     L: AsyncRead + AsyncWrite + Send + 'static,
 {
-    Err(LinkError::Protocol("not implemented".to_string()))
+    let (mut rd, wr) = tokio::io::split(link);
+    let wr = Arc::new(AsyncMutex::new(wr));
+
+    write_frame(
+        &mut *wr.lock().await,
+        &LinkFrame::Cap {
+            cap: hex::encode(encode_cap(cap)?),
+        },
+    )
+    .await?;
+    let presented = match read_frame(&mut rd).await? {
+        Some(LinkFrame::Join { cap }) => decode_cap(&unhex(&cap, "the join cap")?)?,
+        Some(other) => {
+            return Err(LinkError::Protocol(format!(
+                "expected join from the agent, got {}",
+                other.kind()
+            )));
+        }
+        None => {
+            return Err(LinkError::Protocol(
+                "the agent closed the link before joining".to_string(),
+            ));
+        }
+    };
+    let membership = match channel.join(&presented) {
+        Ok(membership) => membership,
+        Err(e) => {
+            // Best effort: the agent may already be gone; the refusal is returned either way.
+            let _ = write_frame(&mut *wr.lock().await, &LinkFrame::Refused { reason: e.to_string() }).await;
+            return Err(e.into());
+        }
+    };
+    write_frame(&mut *wr.lock().await, &LinkFrame::Joined).await?;
+
+    let result = relay_joined(&channel, &membership, &mut rd, &wr).await;
+    channel.leave(&membership);
+    result
+}
+
+/// The joined phase of [`serve_agent_link`]: channel stdin out to the agent,
+/// job output in from it, until the agent closes the link.
+async fn relay_joined<B, A, R, W>(
+    channel: &Arc<Channel<B, A>>,
+    membership: &MembershipId,
+    rd: &mut R,
+    wr: &Arc<AsyncMutex<W>>,
+) -> Result<(), LinkError>
+where
+    B: ChannelBackend + 'static,
+    A: CapAuthority + 'static,
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let inbound = channel.subscribe(membership)?;
+    let deliver = tokio::spawn({
+        let wr = Arc::clone(wr);
+        async move {
+            let mut inbound = std::pin::pin!(inbound);
+            while let Some(item) = inbound.next().await {
+                let env = match item {
+                    Ok(env) => env,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "agent relay: channel stream faulted; stdin delivery stopped");
+                        return;
+                    }
+                };
+                if !matches!(env.message_type, Some(MessageType::Tty(_))) || env.content_type != TTY_STDIN {
+                    continue;
+                }
+                let frame = LinkFrame::Deliver {
+                    content_type: env.content_type,
+                    payload: hex::encode(&env.payload),
+                };
+                if let Err(e) = write_frame(&mut *wr.lock().await, &frame).await {
+                    tracing::warn!(error = %e, "agent relay: delivering stdin failed; stopped");
+                    return;
+                }
+            }
+        }
+    });
+
+    let result = loop {
+        match read_frame(rd).await {
+            Ok(None) => break Ok(()),
+            Ok(Some(LinkFrame::Post { content_type, payload })) => {
+                if content_type != TTY_STDOUT && content_type != TTY_STDERR {
+                    break Err(LinkError::Protocol(format!("the agent may not post {content_type}")));
+                }
+                let bytes = match unhex(&payload, "a post payload") {
+                    Ok(bytes) => bytes,
+                    Err(e) => break Err(e),
+                };
+                if let Err(e) = channel
+                    .post(membership, Some(MessageType::Tty(Tty {})), content_type, bytes)
+                    .await
+                {
+                    break Err(e.into());
+                }
+            }
+            Ok(Some(LinkFrame::Join { .. })) => {
+                let refused = LinkFrame::Refused {
+                    reason: "already joined; one membership per link".to_string(),
+                };
+                if let Err(e) = write_frame(&mut *wr.lock().await, &refused).await {
+                    break Err(e);
+                }
+            }
+            Ok(Some(other)) => {
+                break Err(LinkError::Protocol(format!(
+                    "unexpected {} frame from the agent",
+                    other.kind()
+                )));
+            }
+            Err(e) => break Err(e),
+        }
+    };
+    deliver.abort();
+    result
 }
 
 #[cfg(test)]
@@ -160,15 +317,14 @@ mod tests {
 
     use anyhow::Context;
     use sandy_fabric::{
-        capauth::{CapRights, CapScope, encode_cap},
+        capauth::{CapRights, CapScope},
         types::{ChannelId, PeerId},
     };
-    use sandy_proto::{MessageType, Tty};
     use tokio::time::timeout;
 
     use super::*;
     use crate::{
-        agent::{AgentError, LinkAgent, TTY_STDERR, TTY_STDIN, TTY_STDOUT},
+        agent::{AgentError, LinkAgent},
         capauth::LocalCapAuthority,
         inmem::InMem,
     };
@@ -291,6 +447,9 @@ mod tests {
         job_stderr.shutdown().await?;
         timeout(WAIT, serving).await???;
         drop(job_stdin);
+        // The agent is dropped with its serving task, closing the link: the
+        // relay must then end cleanly and leave the membership.
+        timeout(WAIT, relay).await???;
         Ok(())
     }
 
