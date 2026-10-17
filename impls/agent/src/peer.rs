@@ -116,8 +116,11 @@ pub async fn serve_peers<P: PeerPort>(listener: UnixListener, port: Arc<P>, inbo
         let conn = match listener.accept().await {
             Ok((conn, _)) => conn,
             Err(e) => {
+                // Transient (EMFILE while the job holds idle connections, a
+                // connection aborted before accept): back off and keep serving.
                 eprintln!("sandy-agent: peer socket accept failed: {e}");
-                return;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
             }
         };
         let (port, inbox, slots) = (Arc::clone(&port), Arc::clone(&inbox), Arc::clone(&slots));
@@ -262,8 +265,18 @@ fn message(delivery: PeerDelivery) -> Message {
 /// briefly while another connection is open.
 ///
 /// # Errors
-/// The connection or the exchange failed, or the agent stayed busy.
+/// The request is longer than [`MAX_LINE`], the connection or the exchange
+/// failed, or the agent stayed busy.
 pub fn request(socket: &Path, request: &Request) -> io::Result<Reply> {
+    // The agent reads at most MAX_LINE; a longer line would be cut short and
+    // closed, which the retry loop would mistake for busy.
+    let len = serde_json::to_vec(request).map_err(io::Error::other)?.len() + 1;
+    if len > MAX_LINE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("the peer request is {len} bytes, over the {MAX_LINE}-byte line limit"),
+        ));
+    }
     let deadline = Instant::now() + BUSY_RETRY;
     let mut backoff = Duration::from_millis(20);
     loop {
