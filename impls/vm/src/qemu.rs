@@ -76,6 +76,9 @@ pub struct StagedArgs {
     /// around it) is the host/operator's to set up — the assembler only wires the
     /// guest onto it.
     pub tap: Option<String>,
+    /// Agent mode (#238): the vsock CID this launch claims for the guest, so the
+    /// host can connect to the guest agent. Overrides [`Topology::vsock_cid`].
+    pub agent_cid: Option<u32>,
 }
 
 /// Assemble the `qemu-system-<arch>` command vector for `topology` + `spec`.
@@ -323,6 +326,18 @@ impl QemuBackend {
     }
 }
 
+/// A random vsock CID for one agent-mode launch, never a reserved value (0 the
+/// hypervisor, 1 local, 2 the host, `u32::MAX` any). Claimed by launching: a CID
+/// another VM holds fails the launch ([`cid_in_use`]), which then retries.
+pub(crate) fn random_agent_cid() -> u32 {
+    0
+}
+
+/// Whether a launch that never booted failed because its vsock CID was taken.
+pub(crate) fn cid_in_use(_outcome: &Outcome) -> bool {
+    false
+}
+
 /// The most recent bytes of a child's stderr to retain for diagnostics (64 KiB).
 const QEMU_STDERR_CAP: usize = 64 * 1024;
 
@@ -426,6 +441,7 @@ impl VmBackend for QemuBackend {
             // creates and firewalls the tap, then names it here so the guest's NIC
             // attaches to it. Unset → no NIC, the default isolated boot.
             tap: std::env::var(TAP_ENV).ok().filter(|t| !t.is_empty()),
+            agent_cid: None,
         };
 
         let outcome = qemu_args(&topology, spec, &staged)
@@ -558,6 +574,7 @@ mod tests {
             }],
             kvm: true,
             tap: None,
+            agent_cid: None,
         };
         let command = ["true".to_string()];
         let grants = Grants {
@@ -627,6 +644,72 @@ mod tests {
             "a vfkit topology must be rejected by the qemu-only backend, got {result:?}"
         );
         Ok(())
+    }
+
+    fn demo_spec<'a>(command: &'a [String]) -> RunSpec<'a> {
+        RunSpec {
+            template: "demo",
+            command,
+            inputs: &[],
+            outputs: &[],
+            secrets: &[],
+            env: &[],
+            cpu: None,
+            mem: None,
+            timeout_secs: 60,
+            grants: &NO_GRANTS,
+            outcome_file: None,
+            secret_dir: None,
+        }
+    }
+
+    /// #238: an agent-mode launch claims its CID on the vhost-vsock device, in
+    /// place of any CID the topology names; only one vsock device is attached.
+    #[test]
+    fn qemu_args_attach_the_agent_cid() -> anyhow::Result<()> {
+        let topology = parse_topology(X86_64_FIXTURE).context("parse x86_64 fixture")?;
+        let command = ["true".to_string()];
+        let staged = StagedArgs {
+            agent_cid: Some(77),
+            ..StagedArgs::default()
+        };
+        let args = qemu_args(&topology, &demo_spec(&command), &staged)?;
+        let vsock: Vec<&String> = args.iter().filter(|a| a.starts_with("vhost-vsock-pci")).collect();
+        assert_eq!(vsock, vec!["vhost-vsock-pci,guest-cid=77"], "{}", args.join(" "));
+        Ok(())
+    }
+
+    #[test]
+    fn a_random_agent_cid_is_never_reserved() {
+        for _ in 0..10_000 {
+            let cid = random_agent_cid();
+            assert!((3..u32::MAX).contains(&cid), "reserved cid {cid}");
+        }
+    }
+
+    fn never_booted(console: &str) -> Outcome {
+        Outcome {
+            booted: false,
+            guest_exit: None,
+            transport_error: None,
+            timed_out: false,
+            console: console.to_string(),
+        }
+    }
+
+    /// #238: a launch whose CID another VM holds is recognised (and retried with
+    /// a new one); any other boot failure is not.
+    #[test]
+    fn a_taken_cid_is_recognised_and_nothing_else_is() {
+        let taken = "[qemu stderr]\nqemu-system-x86_64: -device vhost-vsock-pci,guest-cid=77: vhost-vsock: unable to \
+                     set guest cid: Address already in use";
+        assert!(cid_in_use(&never_booted(taken)));
+        assert!(!cid_in_use(&never_booted(
+            "[qemu stderr]\nCould not access KVM kernel module"
+        )));
+        let mut booted = never_booted(taken);
+        booted.booted = true;
+        assert!(!cid_in_use(&booted), "a booted guest did not fail on its cid");
     }
 
     /// Tier-1 (#29): with a tap bound, `qemu_args` emits the `-netdev tap,…,
