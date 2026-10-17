@@ -10,9 +10,15 @@ use sandy::{Capability, CoreError, GithubAdapter, Journal, ProcessExit, Scope, T
 use sandy_cli::{
     app_register::{self, Owner},
     doctor,
-    output::{OutputFormat, format_doctor, format_envelope, format_gc, format_record, format_records},
+    output::{
+        OutputFormat, format_attach, format_cancel, format_doctor, format_envelope, format_gc, format_list,
+        format_record, format_records, format_status, format_submit,
+    },
     plan::{JobPlan, RunArgs, parse_run},
     supervisor,
+};
+use sandy_control_proto::{
+    AttachRequest, CancelRequest, ListRequest, StatusRequest, SubmitRequest, control_request, control_response,
 };
 
 /// Command-line surface for `sandy`.
@@ -103,6 +109,49 @@ enum Command {
         #[command(subcommand)]
         provider: CredProvider,
     },
+    /// Drive `sandyd`, the control-plane daemon, over its control RPC (#205,
+    /// B4). A separate job model from `run`/`status`/…, which execute
+    /// directly with no daemon involved — see #221 for the planned
+    /// convergence once `sandy submit`'s manifest reaches parity with `run`'s
+    /// flag set.
+    Daemon {
+        /// The daemon operation to perform.
+        #[command(subcommand)]
+        op: DaemonOp,
+    },
+}
+
+/// `sandy daemon <op>`: one control-RPC call to `sandyd` per invocation.
+#[derive(Debug, Subcommand)]
+enum DaemonOp {
+    /// Submit a job manifest to `sandyd`, printing the assigned job id.
+    Submit {
+        /// Path to the manifest file, or `-` for stdin.
+        manifest: String,
+        /// Names the encoding of `manifest`'s bytes (e.g. a future
+        /// `sandy.orchestrator.v1.JobManifest`). Required — never a silent
+        /// default interpretation of unknown bytes.
+        #[arg(long)]
+        manifest_encoding: String,
+    },
+    /// Cancel a submitted job.
+    Cancel {
+        /// The job id to cancel.
+        job_id: String,
+    },
+    /// Attach to a running (or recently finished) job, printing the
+    /// data-plane channel id and cap `sandyd` hands back.
+    Attach {
+        /// The job id to attach to.
+        job_id: String,
+    },
+    /// Query one job's current status.
+    Status {
+        /// The job id to query.
+        job_id: String,
+    },
+    /// List every job `sandyd` knows about.
+    List,
 }
 
 /// `sandy cred <provider>`: the forge a trust root belongs to. Operations are
@@ -381,6 +430,117 @@ fn parse_caps(tokens: &[String]) -> Result<Vec<sandy::Capability>, String> {
     tokens.iter().map(|t| sandy::parse_capability(t)).collect()
 }
 
+/// The control socket `sandyd` listens on: `$SANDY_SOCK`, or `sandyd.sock`
+/// under the OS temp dir. Mirrors `sandyd`'s own `socket_path` default
+/// (`crates/sandyd/src/main.rs`) so a bare `sandy daemon` invocation talks to
+/// a bare `sandyd` invocation without either side setting the var.
+fn daemon_socket_path() -> std::path::PathBuf {
+    std::env::var_os("SANDY_SOCK")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("sandyd.sock"))
+}
+
+/// Read a job manifest from `path`, or from stdin when `path` is `-`.
+fn read_manifest(path: &str) -> std::io::Result<Vec<u8>> {
+    if path == "-" {
+        use std::io::Read as _;
+        let mut buf = Vec::new();
+        std::io::stdin().read_to_end(&mut buf)?;
+        Ok(buf)
+    } else {
+        std::fs::read(path)
+    }
+}
+
+/// Dispatch `sandy daemon <op>`: drives its own async connection, since `main`
+/// is synchronous like the rest of the CLI (`app_register`'s octocrab calls
+/// use the same build-a-runtime-and-block-on pattern for the same reason).
+fn dispatch_daemon(op: DaemonOp, output: OutputFormat) -> i32 {
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("sandy: could not start the async runtime: {e}");
+            return ProcessExit::InfraFault.code();
+        }
+    };
+    runtime.block_on(dispatch_daemon_async(op, output))
+}
+
+/// Connect to `sandyd`, make the one matching control-RPC call, print the
+/// result, and map it to a process exit band (INV-11). A fresh connection per
+/// invocation: the control RPC is strictly one-request-one-response with no
+/// pipelining (#211 §1), so there is nothing to pool across a single CLI run.
+async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
+    let socket = daemon_socket_path();
+    let mut stream = match tokio::net::UnixStream::connect(&socket).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            eprintln!("sandy: could not connect to sandyd at {}: {e}", socket.display());
+            return ProcessExit::InfraFault.code();
+        }
+    };
+
+    // `CancelResponse` carries no fields; keep the id the caller asked to
+    // cancel so the result can still name it.
+    let cancel_echo = if let DaemonOp::Cancel { job_id } = &op {
+        Some(job_id.clone())
+    } else {
+        None
+    };
+
+    let request_op = match op {
+        DaemonOp::Submit {
+            manifest,
+            manifest_encoding,
+        } => {
+            let bytes = match read_manifest(&manifest) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    eprintln!("sandy: could not read manifest {manifest:?}: {e}");
+                    return ProcessExit::InvalidPlan.code();
+                }
+            };
+            control_request::Op::Submit(SubmitRequest {
+                manifest: bytes,
+                manifest_encoding,
+            })
+        }
+        DaemonOp::Cancel { job_id } => control_request::Op::Cancel(CancelRequest { job_id }),
+        DaemonOp::Attach { job_id } => control_request::Op::Attach(AttachRequest { job_id }),
+        DaemonOp::Status { job_id } => control_request::Op::Status(StatusRequest { job_id }),
+        DaemonOp::List => control_request::Op::List(ListRequest {}),
+    };
+
+    let response = match sandy_control_proto::client::call(&mut stream, 1, request_op).await {
+        Ok(response) => response,
+        Err(e) => {
+            eprintln!("sandy: daemon call failed: {e}");
+            return ProcessExit::InfraFault.code();
+        }
+    };
+
+    match response.result {
+        Some(control_response::Result::Submit(r)) => succeed_or(emit(format_submit(&r, output))),
+        Some(control_response::Result::Cancel(_)) => {
+            succeed_or(emit(format_cancel(cancel_echo.as_deref().unwrap_or("?"), output)))
+        }
+        Some(control_response::Result::Attach(r)) => succeed_or(emit(format_attach(&r, output))),
+        Some(control_response::Result::Status(r)) => succeed_or(emit(format_status(&r, output))),
+        Some(control_response::Result::List(r)) => succeed_or(emit(format_list(&r, output))),
+        // The daemon understood the request but could not honour it (unknown
+        // job id, not yet dispatchable, …): the request itself is the fault,
+        // the same InvalidPlan band `run` uses for an unbootable plan.
+        Some(control_response::Result::Error(e)) => {
+            eprintln!("sandy: {}", e.message);
+            ProcessExit::InvalidPlan.code()
+        }
+        None => {
+            eprintln!("sandy: daemon sent a response with no result set");
+            ProcessExit::InfraFault.code()
+        }
+    }
+}
+
 /// Dispatch `sandy doctor`: print the host-prerequisite verdict and return its
 /// exit band. Needs no journal, so it runs before `$SANDY_HOME` is touched.
 fn dispatch_doctor(output: OutputFormat) -> i32 {
@@ -529,6 +689,11 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
         return dispatch_cred(provider);
     }
 
+    // `daemon` ops talk to sandyd over its own socket, not $SANDY_HOME.
+    if let Command::Daemon { op } = command {
+        return dispatch_daemon(op, output);
+    }
+
     let journal = Journal::new(doctor::sandy_home());
     if let Err(e) = journal.ensure_dirs() {
         eprintln!("sandy: cannot initialize $SANDY_HOME: {e}");
@@ -538,6 +703,7 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
     match command {
         Command::Doctor => unreachable!("doctor handled above"),
         Command::Cred { .. } => unreachable!("cred handled above"),
+        Command::Daemon { .. } => unreachable!("daemon handled above"),
         Command::Run {
             template,
             inputs,

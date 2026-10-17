@@ -120,3 +120,36 @@ feature set B2/B3's richer queries will need.
 
 **Set aside.** `sqlx`: heavier dependency tree for a benefit (native async)
 that does not matter at this daemon's scale.
+
+## 5. The CLI's daemon commands are additive (`sandy daemon <op>`), not a reuse of `run`/`status`/…
+
+**Status:** accepted.
+
+**Context.** `sandy`'s existing CLI (pre-#205) already has `run`/`ls`/`status`/
+`wait`/`kill`/`gc` for a direct-execution job model: no daemon, a local
+`Journal` + `VmBackend` run the job in the foreground. B4 adds `submit`/
+`cancel`/`attach`/`status`/`list` against `sandyd` over the control RPC — a
+different job model, with names that collide on `status` and come close on
+the rest. Routing the existing names through `sandyd` instead was considered
+and rejected: B3's `JobManifest` is cap-requests only (no I/O, secrets, or
+egress shape), so doing that today would regress `run`'s whole `--input`/
+`--out`/`--secret`/`--allow`/`--credential` surface in favor of a daemon that
+cannot do what `run` already does.
+
+**Decision.** The daemon commands live under their own `sandy daemon <op>`
+subcommand group, leaving `run`/`ls`/`status`/`wait`/`kill`/`gc` untouched.
+`daemon` names the control plane directly; `jobs` was considered and rejected
+since direct-execution's commands are also about jobs, and that name would
+blur the two models together. Issue #221 tracks the eventual convergence:
+once `JobManifest` reaches parity with `run`'s flag set, retire direct
+execution and promote the daemon commands to the top-level names.
+
+**Consequences.** Two job models coexist under one binary for as long as
+`JobManifest` lacks parity — an operator must know which namespace a given
+job lives in. The coexistence is explicitly temporary (#221 names the exit
+condition), not a permanent fork.
+
+**Set aside.** Reusing `run`/`status`/`wait`/`kill`/`gc` for the daemon path
+now: would regress real, working functionality (`run`'s full flag set) in
+favor of a daemon that cannot yet replace it. `jobs` as the subcommand group
+name: blurs direct-execution's and the daemon's job concepts together.

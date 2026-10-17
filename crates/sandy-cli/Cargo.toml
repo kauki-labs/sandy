@@ -43,9 +43,13 @@ live = ["dep:anyhow"]
 
 [dependencies]
 anyhow = { workspace = true, optional = true }
+# Encodes the attach cap (a bearer credential, raw bytes) for JSON output —
+# text-safe transport for an automation layer that needs the actual bytes.
+base64.workspace = true
 clap.workspace = true
 octocrab.workspace = true
 sandy.workspace = true
+sandy-control-proto.workspace = true
 sandy-fsutil.workspace = true
 # The CLI runs real VMs, so it pulls the VM backend impls in (impl-local stays on
 # by default); a local-only consumer of sandy-backend would omit impl-vm.
@@ -57,7 +61,9 @@ serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tiny_http.workspace = true
-tokio.workspace = true
+# `net` on top of the workspace default (macros, rt-multi-thread): the daemon
+# subcommands (#205, B4) connect over a Unix socket.
+tokio = { workspace = true, features = ["net"] }
 tracing.workspace = true
 uuid.workspace = true
 

@@ -2108,12 +2108,14 @@ name = "sandy-cli"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "base64 0.23.1",
  "clap",
  "octocrab",
  "rstest",
  "rustix",
  "sandy-api",
  "sandy-backend",
+ "sandy-control-proto",
  "sandy-fsutil",
  "sandy-lib",
  "sandy-test-support",
