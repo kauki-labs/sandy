@@ -2,7 +2,7 @@
 title: "Decisions: sandyd control plane"
 status: accepted
 project: sandy
-updated: 2026-10-16
+updated: 2026-10-17
 ---
 
 # Decisions: sandyd control plane
@@ -12,6 +12,10 @@ dispatching jobs into the agent fabric, with thin CLI/MCP frontends. Builds on
 the all-local fabric MVP (#103). Operator-confirmed design: (B) a dedicated
 control RPC separate from the fabric's data/event channels, (C) a submitter-
 bounded job manifest.
+
+This file also carries #214/B0's own decisions (§1-4), landing separately; a
+rebase against this entry renumbers rather than drops either side, same as
+agent-fabric.md's §10/§11 collision between #202 and #203.
 
 ## 1. The control RPC is request/response only; job output rides the fabric channels
 
@@ -278,3 +282,66 @@ dependency, not a someday-follow-up.
 remote host): that is necessary but not sufficient — it proves dispatch
 works remotely, not that multiple sandboxes can run and talk to each other,
 which is the actual M2 bar.
+
+## 9. Job-manifest capability derivation reuses `CapAuthority::attenuate` directly
+
+**Status:** accepted.
+
+**Context.** Decision C: a job's manifest is capped at the submitter's own
+attenuation — a job can never be granted more capability than the submitter
+holds (B3, #218). `sandy-control-proto`'s `SubmitRequest.manifest` carries the
+manifest as opaque bytes today (#211/#214); the typed `JobManifest` and the
+derivation are B3's job, independent of that envelope landing, since the
+fabric seams it needs (`CapAuthority`, `Cap`, `attenuate`) are already on
+main.
+
+**Decision.** `sandy-orchestrator` (new crate, this issue's skeleton):
+`JobManifest { entrypoint, requested_caps: Vec<CapRequest> }`, where each
+`CapRequest { channel_id, rights }` names what the job wants. `derive_job_caps`
+matches each request to the submitter's held `Cap` for that channel and
+attenuates it via the existing `CapAuthority::attenuate` — which already
+enforces "fail with `Widened` when rights isn't a subset of the parent's"
+(#110, contract-tested). B3 adds no independent subset check of its own: a
+second, redundant check would risk drifting out of sync with `attenuate`'s
+rule, and would not catch the actual risk (B3 misusing the authority, e.g.
+constructing a cap directly or swallowing a `Widened` error) — only correct
+wiring plus a regression test does. Fail-closed and atomic: any single
+un-grantable request fails the whole manifest with zero capabilities
+returned, never a partial grant. The same function derives an `Attach`
+request's cap too (`sandy-control-proto`'s `AttachResponse`), called with the
+job's own held caps as `submitter_caps`.
+
+`JobManifest` is a plain in-process Rust type, no `serde` derive: `sandyd`'s
+B1 persists only the raw `SubmitRequest.manifest` bytes as received (no
+interpretation at insert time, confirmed with B1's author), so there is no
+competing serialized form to collapse against. Once `sandy-control-proto`'s
+real typed `JobManifest` protobuf message lands (per its own decision record
+§3's transitional plan), this type either becomes that generated type
+directly or gains a `TryFrom` conversion from it — not two parallel manifest
+representations maintained in sync by hand.
+
+**Consequences.** The security-critical property (never escalate) lives in
+exactly one place (`CapAuthority::attenuate`, already shipped and
+contract-tested), not duplicated. `find(|c| c.scope.channel == channel_id)`
+picks the first held cap per channel: fine for the MVP's one-cap-per-channel
+assumption, which is explicit here rather than a silent limitation — a
+submitter holding multiple caps per channel with different rights would need
+a superset search instead, deferred until that shape actually exists.
+
+Verified during this design that `Cap`'s fields (`scope`, `proof`) are public
+— constructible outside `CapAuthority::mint`/`attenuate` — but this is not an
+escalation path: `CapAuthority::verify` and `attenuate` reject a `Cap` whose
+proof is altered or otherwise invalid as `Forged` (`capauth_suite`'s
+adversarial case proves this) — not every hand-constructed `Cap`, since one
+whose fields exactly match an already-valid capability's would still verify,
+being indistinguishable from the real thing. Any future consumer of channel
+membership must re-verify the proof before trusting scope rather than caching
+it. Tracked as a low-priority type-design hygiene improvement, not a security
+fix (#217).
+
+**Set aside.** A redundant `is_subset_of` check in `derive_job_caps` before
+calling `attenuate`: adds a second rule that can drift from the first, and
+does not defend against the actual risk (misuse of the authority, not the
+authority being wrong). Privatizing `Cap`'s fields as part of this work: real
+and worth doing eventually, but it's `#110`'s capauth.rs, not B3's, and not a
+security gap this block needs to fix to be correct (#217).
