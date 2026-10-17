@@ -25,16 +25,33 @@ impl Drop for Daemon {
     }
 }
 
-/// Build `sandyd`'s binary and return its path.
+/// `sandyd`'s binary path: `$SANDYD_BIN` if set, else built on demand.
 ///
 /// `CARGO_BIN_EXE_<name>` only resolves for binaries of the package that owns
 /// the integration test (`sandy-cli`, for `CARGO_BIN_EXE_sandy`) — it does not
-/// reach a sibling workspace member's binary. `sandyd` is built explicitly
-/// here (a no-op if already up to date) and located next to `sandy`'s own
-/// binary, in the same target/profile directory `cargo` used for this test
-/// run — so it matches whatever profile (debug/release) and target dir the
-/// run actually used, custom `CARGO_TARGET_DIR` included.
+/// reach a sibling workspace member's binary. The hermetic nix e2e check
+/// (`testsDaemonE2e`, #233) builds `sandyd` as part of the whole-workspace
+/// `sandy` package and points `$SANDYD_BIN` at it directly, since shelling out
+/// to `cargo build` mid-test cannot complete inside that sandbox (no network,
+/// no target-dir lock to share with the outer build). Outside that check
+/// (the dev shell, a package-scoped `cargo nextest run -p sandy-cli`) the var
+/// is unset, so `sandyd` is built explicitly here instead (a no-op if already
+/// up to date) and located next to `sandy`'s own binary, in the same
+/// target/profile directory `cargo` used for this test run.
 fn sandyd_bin() -> anyhow::Result<std::path::PathBuf> {
+    resolve_sandyd_bin(std::env::var_os("SANDYD_BIN"))
+}
+
+/// The `$SANDYD_BIN`-or-build-it-yourself logic, taking the env var's value as
+/// a plain argument (rather than reading it internally) so it can be tested
+/// without mutating real process environment state — `std::env::set_var` in a
+/// `#[test]` would race every other test in this binary that also resolves
+/// `sandyd`'s path concurrently.
+fn resolve_sandyd_bin(sandyd_bin_env: Option<std::ffi::OsString>) -> anyhow::Result<std::path::PathBuf> {
+    if let Some(path) = sandyd_bin_env {
+        return Ok(std::path::PathBuf::from(path));
+    }
+
     let sandy_bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_sandy"));
     let target_profile_dir = sandy_bin
         .parent()
@@ -260,5 +277,14 @@ fn connecting_to_a_dead_socket_is_an_infra_fault_not_a_hang() -> anyhow::Result<
         .output()
         .context("running sandy daemon list with no daemon")?;
     assert_eq!(output.status.code(), Some(3), "stderr: {}", stderr_of(&output));
+    Ok(())
+}
+
+/// `$SANDYD_BIN`, when set (the hermetic nix e2e check's path, #233), is used
+/// as-is — never overridden by the dev-shell build-it-yourself fallback.
+#[test]
+fn sandyd_bin_resolves_from_the_env_var_when_set() -> anyhow::Result<()> {
+    let resolved = resolve_sandyd_bin(Some(std::ffi::OsString::from("/some/nix/store/path/bin/sandyd")))?;
+    assert_eq!(resolved, std::path::PathBuf::from("/some/nix/store/path/bin/sandyd"));
     Ok(())
 }
