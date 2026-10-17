@@ -211,7 +211,7 @@ async fn the_job_environment_carries_no_link_or_cap() -> anyhow::Result<()> {
     let (channel, agent_cap, _) = channel_and_caps().await?;
     let (backend, relay) = backend_relaying(&channel, agent_cap);
 
-    let outcome = timeout(WAIT, run_blocking(backend, vec!["/usr/bin/env".to_string()])).await???;
+    let outcome = timeout(WAIT, run_blocking(backend, vec!["env".to_string()])).await???;
     let console = &outcome.console;
     assert_eq!(outcome.guest_exit, Some(0), "console: {console}");
     for line in console.lines().filter(|l| l.contains('=')) {
