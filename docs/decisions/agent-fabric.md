@@ -315,10 +315,12 @@ job holding it could post as the agent.
   membership, never against holding the link: a post to a channel the link did
   not join, or TTY traffic on a peer channel, ends the relay, and the relay only
   subscribes to channels it joined. Peer messages are `PeerMsg`-typed, and the
-  agent's own posts come back like any member's. The agent's peer inbox is bounded and drops the
-  newest delivery when full, so the job reads a gap-free, in-order prefix, and
-  every drop is counted (`peer_dropped`) and logged: a lost peer message is
-  observable, never silent. The sender is not told; its post is durable on the
+  agent's own posts come back like any member's. The agent's peer inbox
+  (`LinkAgent::take_peer_inbox`) is bounded and drops any delivery that arrives
+  while it is full; what it keeps stays in order, and every drop is counted
+  (`LinkAgent::peer_dropped`) and logged, so a gap is observable, never silent.
+  Once the inbox drains, newer deliveries are accepted again, so a drop can sit
+  between two kept messages; a rise in the count between reads marks it. The sender is not told; its post is durable on the
   channel. In v1 membership is fixed for
   the run: sandyd mints each peer cap at dispatch, and a sandbox cannot be added
   to a group mid-run; dynamic invite (`CapRights.invite`) is a later slice.

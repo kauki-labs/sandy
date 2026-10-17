@@ -526,9 +526,9 @@ impl LinkAgent {
         Ok(write_frame(&mut *self.port.writer.lock().await, &frame).await?)
     }
 
-    /// How many peer deliveries were dropped because the inbox was full. The
-    /// overflow policy is drop-newest: what the job reads is a gap-free, in-order
-    /// prefix, and this count says how much was lost after it.
+    /// How many peer deliveries were dropped because the inbox was full. A
+    /// delivery that arrives while the inbox is full is dropped; what is kept
+    /// stays in order, and a rise in this count between reads marks a gap.
     #[must_use]
     pub fn peer_dropped(&self) -> u64 {
         self.peer_dropped.load(std::sync::atomic::Ordering::SeqCst)

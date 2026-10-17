@@ -821,9 +821,9 @@ mod tests {
         Ok(())
     }
 
-    /// Overflow policy (#238, infra-f3): a full peer inbox drops the NEWEST
-    /// delivery, so what the job reads is a gap-free, in-order prefix, and every
-    /// drop is counted so a lost peer message is observable, never silent.
+    /// Overflow policy (#238, infra-f3): a delivery that arrives while the peer
+    /// inbox is full is dropped, the kept ones stay in order, and every drop is
+    /// counted, so a lost peer message is observable, never silent.
     #[tokio::test]
     async fn a_full_peer_inbox_drops_the_newest_and_counts_each_drop() -> anyhow::Result<()> {
         let (channel, agent_cap, _) = channel_and_caps().await?;
