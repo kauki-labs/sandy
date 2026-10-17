@@ -328,6 +328,13 @@ real typed `JobManifest` protobuf message lands (per its own decision record
 directly or gains a `TryFrom` conversion from it — not two parallel manifest
 representations maintained in sync by hand.
 
+(§11 supersedes the no-`serde` decision above: `Submit` needs to actually
+decode a manifest to bound it, so `JobManifest` gains `serde` derives there.
+The JSON encoding (`MANIFEST_ENCODING_JSON`) is an interim wire form under
+this same transitional plan, not a second permanent representation — it is
+retired once the protobuf `JobManifest` lands and this type converts from or
+becomes it, same as planned above.)
+
 **Consequences.** The security-critical property (never escalate) lives in
 exactly one place (`CapAuthority::attenuate`, already shipped and
 contract-tested), not duplicated. `find(|c| c.scope.channel == channel_id)`
