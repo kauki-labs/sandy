@@ -34,6 +34,8 @@ pub use v1::{
     control_request, control_response,
 };
 
+pub mod client;
+
 /// `AttachResponse.cap` is a bearer credential (an encoded, attenuated
 /// channel-join `Cap`): a holder can present it as that scope, so it must
 /// never print in the clear. `build.rs` skips prost's derived `Debug` for this
