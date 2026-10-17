@@ -69,6 +69,9 @@ jobs:
     # may only ever touch release bookkeeping, never e.g. .github/workflows/*.
     # Scoped to github-actions[bot] PRs only, so a contributor's own PR is
     # never restricted by this.
+    # Note: a GITHUB_TOKEN-authored PR's pull_request runs sit in GitHub's
+    # pending-approval gate until a maintainer approves them, so this check (and
+    # the rest of the PR workflow) only runs on the release PR after that approval.
     name: Release diff scope
     if: github.event_name == 'pull_request' && github.event.pull_request.user.login == 'github-actions[bot]'
     runs-on: ubuntu-24.04
@@ -89,7 +92,8 @@ jobs:
         run: |
           allowed='^(Cargo\.toml|Cargo\.lock|crates/[^/]+/CHANGELOG\.md|impls/[^/]+/CHANGELOG\.md)$'
           files=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename')
-          bad=$(echo "$files" | grep -vE "$allowed" || true)
+          # printf, not echo: echo mishandles a filename that looks like a flag (e.g. "-n").
+          bad=$(printf '%s\n' "$files" | grep -vE "$allowed" || true)
           if [[ -n "$bad" ]]; then
             echo "::error::release-plz PR touches files outside the release-bookkeeping allowlist:"
             echo "$bad"

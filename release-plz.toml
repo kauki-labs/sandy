@@ -3,36 +3,42 @@
 #
 #   release-plz release-pr  opens/updates a PR that bumps versions + changelogs.
 #                           Merge it to cut a release.
-#   release-plz release     creates the tag + GitHub release for each crate whose
-#                           Cargo.toml version has no git tag yet. With the config
-#                           below, only the binaries are tagged/released.
+#   release-plz release     publishes each crate whose version has no release yet,
+#                           in dependency order, and creates the tag + GitHub
+#                           release for the binaries.
 #
-# Releases are PER BINARY, not per crate: only sandy-cli, sandyd, and sandy-agent
-# get a tag + GitHub release. Library crates are versioned for dependency
-# resolution but are never released or tagged on their own. A binary's MAJOR
-# version must track sandy-lib's major — enforced by the binary-version-alignment
-# check in .github/workflows/pr.yaml.
+# Release model (operator):
+#   - crates.io: ALL publishable crates are published (supersedes the earlier
+#     "GitHub releases only" decision #158). The three test/local crates stay
+#     publish = false in their own Cargo.toml (sandy-test-support,
+#     sandy-fabric-compose, sandy-conn).
+#   - GitHub releases + git tags: the BINARIES only (sandy-cli, sandyd,
+#     sandy-agent), each on its own version, tagged <binary-name>-<version>.
+#   - A binary's MAJOR version must track sandy-lib's major (enforced by the
+#     binary-version-alignment check in .github/workflows/pr.yaml).
+#
+# crates.io publishing uses trusted publishing: this repo + the Release workflow
+# must be registered as a Trusted Publisher for each published crate on crates.io,
+# or the publish step fails closed.
 
 [workspace]
-# Default for library crates: no standalone tag or GitHub release.
+# Library crates: published to crates.io, but no standalone git tag or GitHub
+# release. Tags and GitHub releases are per-binary only.
 git_release_enable = false
 git_tag_enable = false
-# The released binaries still need generated notes: github-release.yaml only
-# reacts to operator-pushed v*/m* tags, not release-plz's own per-binary tags.
+# Publish all publishable crates to crates.io (the three test/local crates opt out
+# via publish = false in their own Cargo.toml).
+publish = true
+# Binaries' GitHub releases get generated notes.
 git_release_generate_notes = true
-# Operator decision (#158): GitHub releases only for now, no crates.io publishing.
-publish = false
-# git tags are the version source of truth (nothing reaches crates.io).
-git_only = true
 # Releases are driven by an intentional version bump, not lockfile churn.
 dependencies_update = false
-# Per-binary tag format: <binary-name>-<version>, e.g. `sandy-cli-0.1.1`. This is
-# deliberately distinct from the operator's milestone tags (`v*` / `m*`, handled by
-# github-release.yaml), so release-plz's per-binary tags and operator milestone
-# tags never collide.
+# Per-binary tag format: <binary-name>-<version>, e.g. `sandy-cli-0.1.1`. Distinct
+# from the operator's milestone tags (`v*` / `m*`, handled by github-release.yaml),
+# so release-plz's per-binary tags and operator milestone tags never collide.
 git_tag_name = "{{ package }}-{{ version }}"
 
-# --- Binaries: released and tagged independently, each on its own version. ---
+# --- Binaries: published to crates.io AND tagged + GitHub-released per binary. ---
 [[package]]
 name = "sandy-cli"
 git_release_enable = true
