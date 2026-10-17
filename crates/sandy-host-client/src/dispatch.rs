@@ -25,7 +25,7 @@ use sandy_api::{
     backend::{BackendError, Grants, Outcome, RunSpec, SandboxKind as ApiSandboxKind, VmBackend},
     containment::{Containment, ContainmentStatus},
 };
-use sandy_executor_proto::{Dispatch, IsolationClass};
+use sandy_executor_proto::{Dispatch, IsolationClass, REMOTE_LINK_TOKEN_LEN, SandboxKind as ProtoSandboxKind};
 use sandy_fabric_local::mesh_link::relay_agent_link;
 use sandy_impls_local::ProcessBackend;
 
@@ -140,13 +140,24 @@ pub enum HandleDispatchError {
     /// refused before a [`ProcessBackend`] is ever constructed.
     #[error(transparent)]
     Dispatch(#[from] DispatchError),
+    /// `Dispatch.backend` named a sandbox kind this host-client build does not
+    /// run — stage 1 only ever runs `Process`, so `Vm` or `Unspecified` must
+    /// be refused rather than silently run through `ProcessBackend` anyway.
+    #[error("backend {0:?} is not supported by this host-client (stage 1 runs Process only)")]
+    UnsupportedBackend(i32),
+    /// `Dispatch.link_token` was not exactly
+    /// `sandy_executor_proto::REMOTE_LINK_TOKEN_LEN` bytes — refused here
+    /// rather than silently truncated or zero-padded into a prefix the
+    /// orchestrator's accept loop would then decode wrong.
+    #[error("link_token is {0} bytes, expected {REMOTE_LINK_TOKEN_LEN}")]
+    InvalidLinkTokenLength(usize),
     /// `Dispatch.forward_back` was not a parseable socket address.
     #[error("forward_back {0:?} is not a valid socket address")]
     InvalidForwardBack(String),
     /// The run id was implausibly large to prefix (see
     /// `sandy_executor_proto::encode_remote_link_prefix`).
     #[error("encoding the run-id+token prefix: {0}")]
-    PrefixEncoding(String),
+    PrefixEncoding(#[from] sandy_executor_proto::EncodeRemoteLinkPrefixError),
     /// Launching or running the sandbox failed.
     #[error("running the sandbox: {0}")]
     Backend(#[from] BackendError),
@@ -186,14 +197,22 @@ pub fn handle_dispatch(
     let required = IsolationClass::try_from(dispatch.required_isolation_class).unwrap_or(IsolationClass::Unspecified);
     check_isolation_class(required, &status)?;
 
+    if ProtoSandboxKind::try_from(dispatch.backend) != Ok(ProtoSandboxKind::Process) {
+        return Err(HandleDispatchError::UnsupportedBackend(dispatch.backend));
+    }
+
     let argv = decode_argv_manifest(&dispatch.manifest_encoding, &dispatch.manifest)?;
 
     let forward_back: SocketAddr = dispatch
         .forward_back
         .parse()
         .map_err(|_| HandleDispatchError::InvalidForwardBack(dispatch.forward_back.clone()))?;
-    let prefix = sandy_executor_proto::encode_remote_link_prefix(&dispatch.job_id, &dispatch.link_token)
-        .map_err(HandleDispatchError::PrefixEncoding)?;
+    let link_token: [u8; REMOTE_LINK_TOKEN_LEN] = dispatch
+        .link_token
+        .clone()
+        .try_into()
+        .map_err(|token: Vec<u8>| HandleDispatchError::InvalidLinkTokenLength(token.len()))?;
+    let prefix = sandy_executor_proto::encode_remote_link_prefix(&dispatch.job_id, &link_token)?;
 
     let on_link: OnLink = Arc::new(move |_box_id, host_end, report| {
         relay_agent_link(&rt, forward_back, host_end, prefix.clone(), report);
@@ -300,14 +319,15 @@ mod tests {
     }
 
     #[test]
-    fn an_unrecognized_encoding_is_refused_not_guessed_at() {
-        let manifest = serde_json::to_vec(&["echo"]).unwrap();
+    fn an_unrecognized_encoding_is_refused_not_guessed_at() -> anyhow::Result<()> {
+        let manifest = serde_json::to_vec(&["echo"])?;
         let err = decode_argv_manifest("", &manifest).expect_err("empty encoding must be refused");
         assert_eq!(err, DispatchError::UnrecognizedManifestEncoding(String::new()));
 
         let err = decode_argv_manifest("shell/v1", &manifest)
             .expect_err("an encoding this host doesn't understand must be refused");
         assert_eq!(err, DispatchError::UnrecognizedManifestEncoding("shell/v1".to_string()));
+        Ok(())
     }
 
     #[test]
@@ -360,6 +380,58 @@ mod tests {
             ),
             "expected IsolationClassNotSatisfied, got {err:?} — if this is a manifest error instead, the isolation \
              check ran after the manifest decode, not before it"
+        );
+    }
+
+    /// Adversarial: a `Dispatch` naming `Vm` (or an unrecognized/unspecified
+    /// value) must be refused, never silently run through `ProcessBackend`
+    /// anyway — stage 1 only ever runs `Process` (CodeRabbit finding on
+    /// #284: the field was decoded but never checked).
+    #[tokio::test]
+    async fn handle_dispatch_refuses_a_backend_this_host_does_not_run() {
+        let dispatch = sandy_executor_proto::Dispatch {
+            job_id: "job-1".to_string(),
+            manifest: serde_json::to_vec(&["echo"]).expect("static manifest always encodes"),
+            manifest_encoding: MANIFEST_ENCODING_ARGV_V1.to_string(),
+            backend: sandy_executor_proto::SandboxKind::Vm.into(),
+            link_token: vec![0u8; REMOTE_LINK_TOKEN_LEN],
+            forward_back: "127.0.0.1:9000".to_string(),
+            required_isolation_class: IsolationClass::Trusted.into(),
+        };
+        let containment = Box::new(sandy_test_support::FakeContainment::available());
+        let rt = tokio::runtime::Handle::current();
+
+        let err = handle_dispatch(&dispatch, containment, PathBuf::from("/nonexistent/sandy-agent"), rt)
+            .expect_err("a Vm dispatch must be refused by a host-client that only runs Process");
+        assert!(
+            matches!(err, HandleDispatchError::UnsupportedBackend(backend)
+                if backend == i32::from(sandy_executor_proto::SandboxKind::Vm)),
+            "expected UnsupportedBackend, got {err:?}"
+        );
+    }
+
+    /// Adversarial: a `link_token` that isn't exactly `REMOTE_LINK_TOKEN_LEN`
+    /// bytes must be refused, never silently truncated or padded into a
+    /// prefix the orchestrator's accept loop would then decode wrong.
+    #[tokio::test]
+    async fn handle_dispatch_refuses_a_malformed_link_token_length() {
+        let dispatch = sandy_executor_proto::Dispatch {
+            job_id: "job-1".to_string(),
+            manifest: serde_json::to_vec(&["echo"]).expect("static manifest always encodes"),
+            manifest_encoding: MANIFEST_ENCODING_ARGV_V1.to_string(),
+            backend: sandy_executor_proto::SandboxKind::Process.into(),
+            link_token: vec![0u8; REMOTE_LINK_TOKEN_LEN - 1],
+            forward_back: "127.0.0.1:9000".to_string(),
+            required_isolation_class: IsolationClass::Trusted.into(),
+        };
+        let containment = Box::new(sandy_test_support::FakeContainment::available());
+        let rt = tokio::runtime::Handle::current();
+
+        let err = handle_dispatch(&dispatch, containment, PathBuf::from("/nonexistent/sandy-agent"), rt)
+            .expect_err("a wrong-length link_token must be refused, never silently reshaped");
+        assert!(
+            matches!(err, HandleDispatchError::InvalidLinkTokenLength(len) if len == REMOTE_LINK_TOKEN_LEN - 1),
+            "expected InvalidLinkTokenLength, got {err:?}"
         );
     }
 }

@@ -90,6 +90,17 @@ pub const MAX_JOB_ID_LEN: u32 = 4096;
 /// in sync if either changes.
 pub const REMOTE_LINK_TOKEN_LEN: usize = 32;
 
+/// An [`encode_remote_link_prefix`] failure: `job_id` cannot be encoded as a
+/// prefix [`decode_remote_link_prefix`] would accept back.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum EncodeRemoteLinkPrefixError {
+    /// `job_id` exceeds [`MAX_JOB_ID_LEN`] — encoding it anyway would produce
+    /// a prefix [`decode_remote_link_prefix`] is guaranteed to refuse on the
+    /// other end, so this is refused at the source instead.
+    #[error("job_id is {0} bytes, exceeding the maximum of {MAX_JOB_ID_LEN}")]
+    JobIdTooLong(usize),
+}
+
 /// Encode the run-id + link-token prefix [`forward_agent_link`] (sandy-fabric-local)
 /// writes before any agent-link frame, and [`decode_remote_link_prefix`]
 /// reads on the orchestrator's mesh-accept loop (decision 6, #279) — the one
@@ -99,17 +110,30 @@ pub const REMOTE_LINK_TOKEN_LEN: usize = 32;
 /// On the wire: a big-endian `u32` byte-length of `job_id`, then `job_id`'s
 /// UTF-8 bytes, then `link_token`'s raw bytes with no length prefix of their
 /// own (both sides already agree on [`REMOTE_LINK_TOKEN_LEN`]). Matches
-/// `sandy_control_proto`'s own length-prefix framing style.
+/// `sandy_control_proto`'s own length-prefix framing style. `link_token` is a
+/// fixed-size array, not a slice: the wire format carries no length prefix
+/// for it, so a caller holding a variable-length `Vec<u8>` (e.g. a `Dispatch`
+/// read off the wire) must convert it to `[u8; REMOTE_LINK_TOKEN_LEN]` first
+/// and refuse the dispatch on a length mismatch — the type makes a
+/// wrong-length token impossible to encode by construction, rather than a
+/// runtime check that could be skipped.
 ///
 /// # Errors
-/// A plain [`String`] if `job_id` is implausibly large (over 4 GiB) to fit
-/// the `u32` length prefix.
+/// [`EncodeRemoteLinkPrefixError::JobIdTooLong`] if `job_id` exceeds
+/// [`MAX_JOB_ID_LEN`] — matches what [`decode_remote_link_prefix`] would
+/// refuse on the other end, so encoding never produces a prefix the decoder
+/// is guaranteed to reject.
 ///
 /// [`forward_agent_link`]: https://docs.rs/sandy-fabric-local
-pub fn encode_remote_link_prefix(job_id: &str, link_token: &[u8]) -> Result<Vec<u8>, String> {
+pub fn encode_remote_link_prefix(
+    job_id: &str,
+    link_token: &[u8; REMOTE_LINK_TOKEN_LEN],
+) -> Result<Vec<u8>, EncodeRemoteLinkPrefixError> {
     let job_id_bytes = job_id.as_bytes();
     let len = u32::try_from(job_id_bytes.len())
-        .map_err(|_| format!("job_id is {} bytes, too large to prefix", job_id_bytes.len()))?;
+        .ok()
+        .filter(|&len| len <= MAX_JOB_ID_LEN)
+        .ok_or(EncodeRemoteLinkPrefixError::JobIdTooLong(job_id_bytes.len()))?;
     let mut prefix = Vec::with_capacity(4 + job_id_bytes.len() + link_token.len());
     prefix.extend_from_slice(&len.to_be_bytes());
     prefix.extend_from_slice(job_id_bytes);
@@ -271,9 +295,7 @@ mod tests {
         let (mut write_side, mut read_side) = tokio::io::duplex(256);
         let token = [0x5A_u8; REMOTE_LINK_TOKEN_LEN];
 
-        let prefix = encode_remote_link_prefix("job-42", &token)
-            .map_err(anyhow::Error::msg)
-            .context("encode")?;
+        let prefix = encode_remote_link_prefix("job-42", &token).context("encode")?;
         write_side.write_all(&prefix).await?;
 
         let (job_id, decoded_token) = decode_remote_link_prefix(&mut read_side).await.context("decode")?;
@@ -287,9 +309,7 @@ mod tests {
         let (mut write_side, mut read_side) = tokio::io::duplex(256);
         let token = [0u8; REMOTE_LINK_TOKEN_LEN];
 
-        let prefix = encode_remote_link_prefix("", &token)
-            .map_err(anyhow::Error::msg)
-            .context("encode")?;
+        let prefix = encode_remote_link_prefix("", &token).context("encode")?;
         write_side.write_all(&prefix).await?;
 
         let (job_id, decoded_token) = decode_remote_link_prefix(&mut read_side).await.context("decode")?;
