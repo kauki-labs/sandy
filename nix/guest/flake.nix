@@ -14,6 +14,37 @@
       microvm,
     }:
     let
+      # The sandbox agent baked into the guest image (#238), built from this
+      # repo's workspace with the guest's own toolchain. Only the workspace
+      # sources go in, so unrelated repo edits do not rebuild it.
+      sandyAgentFor =
+        pkgs:
+        let
+          # The repo root: this flake's source is the whole git tree.
+          repo = ../..;
+          src = pkgs.lib.fileset.toSource {
+            root = repo;
+            fileset = pkgs.lib.fileset.unions [
+              (repo + "/Cargo.toml")
+              (repo + "/Cargo.lock")
+              (repo + "/crates")
+              (repo + "/impls")
+            ];
+          };
+        in
+        pkgs.rustPlatform.buildRustPackage {
+          pname = "sandy-agent";
+          version = "0.1.0";
+          inherit src;
+          cargoLock.lockFile = repo + "/Cargo.lock";
+          cargoBuildFlags = [
+            "-p"
+            "sandy-agent"
+          ];
+          doCheck = false;
+          meta.mainProgram = "sandy-agent";
+        };
+
       # A minimal microVM that speaks the sandy console protocol:
       # hostName "sandy" makes getty print the `sandy login:` banner that is the
       # pinned READY_MARKER; autologin drops to a root shell on the serial console
@@ -24,7 +55,7 @@
       # vfkit (macOS, console hvc0). `vmHostPackages` is the host (darwin) pkgs
       # the vfkit runner needs so its isDarwin check passes; null for qemu.
       commonModule =
-        { lib, ... }:
+        { lib, pkgs, ... }:
         {
           networking.hostName = "sandy";
           system.stateVersion = "24.11";
@@ -88,7 +119,12 @@
           # The store is an erofs block device, so nothing else pulls in the
           # virtiofs driver; the secret share needs it. Load it in stage 2 (the
           # mount is not in the initrd).
-          boot.kernelModules = [ "virtiofs" ];
+          # virtio vsock carries the agent link from the host (#238).
+          boot.kernelModules = [
+            "virtiofs"
+            "vmw_vsock_virtio_transport"
+          ];
+          environment.systemPackages = [ (sandyAgentFor pkgs) ];
 
           # The login shell exports each staged secret as its `$NAME`, then prints
           # the READY_MARKER once it is up and reading — so the injected command (a
@@ -269,6 +305,8 @@
             guest = s.mountPoint;
           }) (builtins.filter (s: s.proto == "virtiofs") c.microvm.shares);
           hypervisor = c.microvm.hypervisor;
+          # The agent this image carries, at its in-guest store path (#238).
+          agent_program = "${sandyAgentFor cfg.pkgs}/bin/sandy-agent";
         };
     in
     {
@@ -281,6 +319,10 @@
       # these).
       nixosConfigurations.sandy-guest-qemu = qemuGuest;
       nixosConfigurations.sandy-guest-vfkit = vfkitGuest;
+
+      # The guest-side sandy-agent, per guest system (#238).
+      packages.x86_64-linux.sandy-agent = sandyAgentFor qemuGuest.pkgs;
+      packages.aarch64-linux.sandy-agent = sandyAgentFor vfkitGuest.pkgs;
 
       # sandy's `Topology` per guest: `nix eval --json <flake>#topologies.<sys>.<hv>`.
       topologies = {
