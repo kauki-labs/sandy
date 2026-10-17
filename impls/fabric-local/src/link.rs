@@ -1044,16 +1044,17 @@ mod tests {
         Ok((agent_end, relay))
     }
 
-    /// CodeRabbit on #247 (INV-11): a peer cap that expires after the join gets
-    /// the job's next peer post refused, but the relay keeps going and still
-    /// returns the exit the agent reports.
-    #[tokio::test]
-    async fn a_refused_peer_post_does_not_cost_the_exit_report() -> anyhow::Result<()> {
-        let authority = LocalCapAuthority::new(Duration::from_secs(3600))?;
-        let expires_at = std::time::SystemTime::now()
+    fn unix_secs() -> anyhow::Result<u64> {
+        Ok(std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs()
-            + 3;
+            .as_secs())
+    }
+
+    /// A peer channel `group-a` whose agent cap expires a few seconds from now,
+    /// with that cap and its expiry. Wait for it with [`until_expired`].
+    async fn expiring_peer_channel() -> anyhow::Result<(TestChannel, Cap, u64)> {
+        let authority = LocalCapAuthority::new(Duration::from_secs(3600))?;
+        let expires_at = unix_secs()? + 3;
         let agent_cap = authority.mint(CapScope {
             peer: PeerId::from("agent"),
             channel: ChannelId::from("group-a"),
@@ -1065,19 +1066,29 @@ mod tests {
             expires_at: Some(expires_at),
         })?;
         let group = Arc::new(Channel::new(ChannelId::from("group-a"), InMem::default(), authority).await?);
+        Ok((group, agent_cap, expires_at))
+    }
+
+    async fn until_expired(expires_at: u64) -> anyhow::Result<()> {
+        while unix_secs()? < expires_at {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Ok(())
+    }
+
+    /// CodeRabbit on #247 (INV-11): a peer cap that expires after the join gets
+    /// the job's next peer post refused, but the relay keeps going and still
+    /// returns the exit the agent reports.
+    #[tokio::test]
+    async fn a_refused_peer_post_does_not_cost_the_exit_report() -> anyhow::Result<()> {
+        let (group, agent_cap, expires_at) = expiring_peer_channel().await?;
         let grants = vec![PeerGrant {
             channel: group,
             cap: agent_cap,
         }];
         let (mut agent_end, relay) = raw_agent_with_peers(grants).await?;
 
-        while std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs()
-            < expires_at
-        {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        until_expired(expires_at).await?;
         write_frame(
             &mut agent_end,
             &LinkFrame::Post {
@@ -1091,6 +1102,43 @@ mod tests {
         drop(agent_end);
         let relayed = timeout(WAIT, relay).await??;
         assert!(matches!(relayed, Ok(Some(3))), "got {relayed:?}");
+        Ok(())
+    }
+
+    /// #256: the relay tells the agent when it refuses a peer post, with the
+    /// existing `Refused` frame, and the reason carries no cap material.
+    #[tokio::test]
+    async fn a_refused_peer_post_is_reported_to_the_agent() -> anyhow::Result<()> {
+        let (group, agent_cap, expires_at) = expiring_peer_channel().await?;
+        let cap_hex = hex::encode(encode_cap(&agent_cap)?);
+        let grants = vec![PeerGrant {
+            channel: group,
+            cap: agent_cap,
+        }];
+        let (mut agent_end, relay) = raw_agent_with_peers(grants).await?;
+
+        until_expired(expires_at).await?;
+        write_frame(
+            &mut agent_end,
+            &LinkFrame::Post {
+                content_type: "application/json".to_string(),
+                payload: hex::encode(b"after-expiry"),
+                channel: Some("group-a".to_string()),
+            },
+        )
+        .await?;
+        let frame = timeout(WAIT, read_frame(&mut agent_end))
+            .await
+            .context("the relay did not report the refused post")??;
+        let Some(LinkFrame::Refused { reason }) = frame else {
+            anyhow::bail!("expected Refused, got {frame:?}");
+        };
+        assert!(reason.contains("group-a"), "the reason names the channel: {reason}");
+        assert!(!reason.contains(&cap_hex), "the reason leaked the cap");
+
+        write_frame(&mut agent_end, &LinkFrame::Exit { code: 0 }).await?;
+        drop(agent_end);
+        timeout(WAIT, relay).await???;
         Ok(())
     }
 

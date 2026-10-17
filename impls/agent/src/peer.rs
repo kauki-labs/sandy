@@ -749,6 +749,31 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "got {err}");
     }
 
+    /// #256: `send` claims only that the agent took the message (`submitted`),
+    /// never delivery, and `recv` reports how many posts the relay refused (the
+    /// fake reports 2) next to the drop count.
+    #[tokio::test]
+    async fn send_is_submitted_and_recv_reports_refusals() -> anyhow::Result<()> {
+        let (_dir, socket, ..) = server(FakePort::default())?;
+        let wire = |line: &'static [u8]| {
+            let socket = socket.clone();
+            async move {
+                let mut conn = tokio::net::UnixStream::connect(&socket).await?;
+                conn.write_all(line).await?;
+                let mut reply = String::new();
+                timeout(WAIT, conn.read_to_string(&mut reply)).await??;
+                anyhow::Ok(reply)
+            }
+        };
+        let sent =
+            wire(b"{\"op\":\"send\",\"channel\":\"group-a\",\"content_type\":\"text/plain\",\"payload\":\"aGk=\"}\n")
+                .await?;
+        assert!(sent.contains(r#""reply":"submitted""#), "got {sent}");
+        let drained = wire(b"{\"op\":\"recv\"}\n").await?;
+        assert!(drained.contains(r#""refused":2"#), "got {drained}");
+        Ok(())
+    }
+
     #[test]
     fn the_peer_helper_parses_send_and_recv() {
         let args = |v: &[&str]| v.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
