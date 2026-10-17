@@ -36,10 +36,16 @@
 //! |                                                                        | #290 (#279)                                                                                    |
 //! | decision-6: already-claimed link slot refused (one link per run)       | `sandyd::link_auth` unit tests (#266, merged) — `concurrent_claims_admit_exactly_one_stream`; |
 //! |                                                                        | re-asserted by #290 (#279)                                                                     |
-//! | Isolation-class gate, orchestrator side: `send_dispatch` refuses a     | #277 (open, CI-green) — `DispatchSendError::UnsupportedIsolationClass`, tested. #280 closed   |
-//! | class the target host didn't declare, fail-closed                     | as a duplicate of this.                                                                       |
+//! | Isolation-class gate, orchestrator side: `send_dispatch` refuses a     | #277 (open, CI-green) — `DispatchSendError::UnsupportedIsolationClass`, tested             |
+//! | class the target host didn't declare, fail-closed                     | (`dispatch_requiring_an_undeclared_isolation_class_is_refused`,                            |
+//! |                                                                        | `dispatch_with_an_unset_isolation_class_is_refused`). #280 closed as a duplicate of this.    |
 //! | Isolation-class gate, executor side: `check_isolation_class` re-checks | #284 (open) — reuses `sandy::admits_untrusted`; `Unspecified` refused, never treated as the   |
 //! | `Dispatch.required_isolation_class` (defense in depth), fail-closed   | weaker `Trusted`.                                                                              |
+//! | *Not* re-asserted at this file's e2e layer, by explicit scoping call  | infra-f3's ruling: #277's unit coverage is sufficient and this file's `capabilities_of        |
+//! | (not an oversight — see #272's thread before adding one)              | (host_id)` happy-path check already covers the one thing e2e uniquely adds (declared          |
+//! |                                                                        | capabilities actually reaching the dispatch decision). A negative e2e case here would just    |
+//! |                                                                        | re-run unit-proven logic through the same seam. If the declared-caps -> gate wiring regresses  |
+//! |                                                                        | later, add one e2e negative then, not for M2.                                                 |
 //! | Result path: exit via the locked `ResultEnvelope`/`AgentReport` (INV-  | existing unit coverage (`impls/fabric-local/src/{agent,link,executor}.rs`,                   |
 //! | 11); an agent failure with no report is an infra fault, not a job exit | `sandy-cli/tests/live_agent.rs`); reasserted end-to-end, cross-machine, in this file's        |
 //! |                                                                        | happy-path test (step 7)                                                                     |
