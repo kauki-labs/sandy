@@ -5,22 +5,32 @@
 //! still a placeholder, and INV-1 holds through the real Executor dispatch
 //! path. The full issue-#115 scenario (discover a sandbox, open an
 //! orchestrator channel, the agent runs the job, a peer-group coordinates, an
-//! escalation reaches a human backend) needs #106 (Channel) and #109 (the
-//! sandbox agent) first — neither exists yet, so that scenario is a later
-//! increment, not this one.
+//! escalation reaches a human backend) is `tests/scenario.rs` (#229).
 //!
 //! `sandy_fabric::contract::fakes` fills every seam this profile doesn't have
-//! a real impl for yet (see [`FAKED_SEAMS`]). A swap PR removes its entry in
-//! the same change that lands the real impl.
+//! a real impl for yet (see [`PENDING_FAKED_SEAMS`]) plus `Transport`, which
+//! stays fake by design (see [`DEFERRED_FAKE_SEAMS`]). A swap PR removes a
+//! pending seam's entry in the same change that lands the real impl.
+//!
+//! Real does not mean isolating: this profile's `Process` executor is a
+//! verification path for library composition on one machine, never an
+//! untrusted-code boundary (#150). [`the_all_local_profile_provides_no_process_isolation`]
+//! asserts that fact directly through `sandy::admits_untrusted` rather than
+//! leaving it as an absence a reader could mistake for an oversight.
 //!
 //! `validate_profile` (the composition gate itself) lives here rather than in
 //! `src/`: running full contract suites is test-time work (`executor_suite`
 //! actually dispatches a real process), not something a real `sandyd` would
 //! do at its own startup, and there's no concrete production consumer today.
 
-use std::os::unix::fs::PermissionsExt as _;
+use std::{
+    os::unix::fs::PermissionsExt as _,
+    path::Path,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use anyhow::Context as _;
+use sandy::{VmBackend as _, admits_untrusted};
 use sandy_api::backend::{Grants, RunSpec, SandboxKind, SecretRef, SecretSource};
 use sandy_backend::ProcessBackend;
 use sandy_fabric::{
@@ -28,10 +38,7 @@ use sandy_fabric::{
     channel_backend::ChannelBackend,
     contract::{
         ContractViolation, capacity_suite, capauth_suite, channel_backend_suite, discovery_suite, executor_suite,
-        fakes::{
-            ConstantMinter, FakeCapacity, FakeDiscovery, FakeLifecycle, FakeMinter, FakeSink, FakeTransport,
-            SnapshotBackend,
-        },
+        fakes::{ConstantMinter, FakeTransport, SnapshotBackend},
         lifecycle_suite, minter_suite, telemetry_suite, transport_suite,
     },
     executor::{Arch, Capabilities, Executor},
@@ -41,30 +48,50 @@ use sandy_fabric::{
     transport::Transport,
     types::HostId,
 };
-use sandy_fabric_local::{LocalCapAuthority, executor::VmBackendExecutor, inmem::InMem};
+use sandy_fabric_local::{
+    LocalCapAuthority,
+    executor::VmBackendExecutor,
+    inmem::InMem,
+    minter::LocalMinter,
+    placement::{ExecutorCapacity, LeaseTable, StaticRegistry},
+    telemetry::LocalLog,
+};
 use sha2::{Digest as _, Sha256};
 
-/// Which seams the all-local profile still composes with a placeholder fake,
-/// pending that seam's block landing. A swap PR removes its entry in the same
-/// change that lands the real impl; an empty list is #115's real close signal.
-const FAKED_SEAMS: &[&str] = &[
-    "Minter",        // pending #111
-    "Discovery",     // pending #112 (static registry)
-    "Capacity",      // pending #112 (direct probe)
-    "Lifecycle",     // pending #112 (lease soft-state)
-    "Transport",     // deferred transport detail (spec §3.9); no block files it
-    "TelemetrySink", // pending #114
-];
+/// Seams the all-local profile still composes with a placeholder fake,
+/// pending that seam's block landing. A swap PR removes its entry in the
+/// same change that lands the real impl; an empty list means every
+/// block-pending seam is real (see [`DEFERRED_FAKE_SEAMS`] for the rest).
+const PENDING_FAKED_SEAMS: &[&str] = &[];
 
-/// Guards against the list silently going stale: an empty `FAKED_SEAMS` is
-/// #115's real close signal (every seam real, the second acceptance test
-/// becomes the issue's actual scenario), not something that should happen by
-/// someone quietly forgetting to update a const.
+/// Seams the all-local profile composes with a placeholder fake by design,
+/// not pending any block. `Transport`'s local-process detail is deferred
+/// (spec §3.9); nothing tracks a real impl as a dependency, so it stays here
+/// even once [`PENDING_FAKED_SEAMS`] is empty.
+const DEFERRED_FAKE_SEAMS: &[&str] = &["Transport"];
+
+/// #115's real close signal for seam reality: every block-pending seam now
+/// composes with its real impl. `DEFERRED_FAKE_SEAMS` stays non-empty by
+/// design, so this only guards the pending list going stale (someone adding a
+/// fake back without updating the const, or landing a real impl without
+/// removing its entry).
 #[test]
-fn faked_seams_is_not_empty_yet() {
+fn every_pending_seam_is_real() {
     assert!(
-        !FAKED_SEAMS.is_empty(),
-        "every seam is real: #115 can close for real, starting with the actual scenario test"
+        PENDING_FAKED_SEAMS.is_empty(),
+        "a seam still composes with a placeholder fake pending its own block: {PENDING_FAKED_SEAMS:?}"
+    );
+}
+
+/// Guards the deliberate-fake list going stale the other way: a seam quietly
+/// disappearing from here would read as "swapped to real" when it was
+/// actually just dropped.
+#[test]
+fn deferred_fake_seams_are_tracked_not_silently_dropped() {
+    assert_eq!(
+        DEFERRED_FAKE_SEAMS,
+        &["Transport"],
+        "update this test alongside any change to the deliberate-fake list"
     );
 }
 
@@ -88,6 +115,27 @@ fn deadline() -> tokio::time::Sleep {
 struct TelemetryFactories<E, D> {
     enabled: E,
     disabled: D,
+}
+
+/// A fresh `LocalLog`/`LocalLog::disabled` pair for one `validate_profile`
+/// call: `enabled` opens a distinct file per call under `dir` (the suite
+/// calls a seam's factory more than once), since two `LocalLog`s sharing a
+/// path would serialize on the same `flock` for no reason here.
+fn telemetry_factories(dir: &Path) -> TelemetryFactories<impl Fn() -> LocalLog + '_, impl Fn() -> LocalLog> {
+    let next_file = AtomicU64::new(0);
+    TelemetryFactories {
+        enabled: move || {
+            let i = next_file.fetch_add(1, Ordering::Relaxed);
+            LocalLog::open(dir.join(format!("t{i}.jsonl")))
+        },
+        disabled: LocalLog::disabled,
+    }
+}
+
+/// `telemetry_suite`'s `captured` probe for a [`LocalLog`]: the records it has
+/// durably appended so far.
+fn telemetry_captured(log: &LocalLog) -> usize {
+    log.records().map_or(usize::MAX, |r| r.len())
 }
 
 /// Run every seam's own contract suite against the given per-seam factories.
@@ -159,25 +207,41 @@ fn process_capabilities() -> Capabilities {
     }
 }
 
-/// The all-local profile's current real/fake mix (see [`FAKED_SEAMS`]).
-async fn validate_all_local_profile() -> Result<(), ContractViolation> {
+/// The all-local profile's `Capacity` slot (real, #112): a direct probe over
+/// a second `Process` executor instance, since `validate_profile` takes an
+/// independent factory per seam.
+fn executor_capacity() -> ExecutorCapacity<VmBackendExecutor<ProcessBackend>> {
+    ExecutorCapacity::new().with_host(
+        HostId::from(StaticRegistry::LOCALHOST),
+        VmBackendExecutor::new(ProcessBackend::new()),
+        1,
+    )
+}
+
+/// The all-local profile's `Lifecycle` slot (real, #112): lease soft-state on
+/// a generous TTL, since `lifecycle_suite` drives registration/heartbeat
+/// directly rather than waiting out a lease.
+fn lease_table() -> LeaseTable {
+    LeaseTable::new(std::time::Duration::from_secs(300))
+}
+
+/// The all-local profile's current real/fake mix (see [`PENDING_FAKED_SEAMS`]
+/// and [`DEFERRED_FAKE_SEAMS`]).
+async fn validate_all_local_profile(telemetry_dir: &Path) -> Result<(), ContractViolation> {
     validate_profile(
         local_cap_authority,
-        FakeMinter::new,
+        || LocalMinter,
         InMem::default,
         FakeTransport::default,
         || VmBackendExecutor::new(ProcessBackend::new()),
         process_capabilities(),
         "contract",
-        FakeDiscovery::default,
-        HostId::from("local"),
-        || FakeCapacity::new(HostId::from("local"), 1),
-        FakeLifecycle::default,
-        TelemetryFactories {
-            enabled: || FakeSink::new(true),
-            disabled: || FakeSink::new(false),
-        },
-        FakeSink::captured,
+        StaticRegistry::default,
+        HostId::from(StaticRegistry::LOCALHOST),
+        executor_capacity,
+        lease_table,
+        telemetry_factories(telemetry_dir),
+        telemetry_captured,
     )
     .await
 }
@@ -185,7 +249,26 @@ async fn validate_all_local_profile() -> Result<(), ContractViolation> {
 /// Positive: today's real/fake mix passes its own gate.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_all_local_profile_passes_its_own_gate() -> anyhow::Result<()> {
-    validate_all_local_profile().await.context("today's real/fake mix")
+    let telemetry_dir = tempfile::tempdir().context("telemetry dir")?;
+    validate_all_local_profile(telemetry_dir.path())
+        .await
+        .context("today's real/fake mix")
+}
+
+/// Honest-gate (#150): the all-local profile's `Process` executor is NOT an
+/// isolation boundary, asserted directly through the same fail-closed gate
+/// (`sandy::admits_untrusted`) the real executor path is keyed off, rather
+/// than leaving "no containment" as something a reader could mistake for an
+/// oversight instead of the intended scope. This profile proves library
+/// composition on one machine; untrusted code stays VM-only (process-containment.md).
+#[test]
+fn the_all_local_profile_provides_no_process_isolation() {
+    let backend = ProcessBackend::new();
+    assert!(
+        !admits_untrusted(backend.kind(), &backend.containment_status()),
+        "the all-local profile's Process executor must not admit untrusted jobs: it is a verification path, never an \
+         isolation boundary"
+    );
 }
 
 /// Adversarial: swapping the REAL ChannelBackend slot for a broken variant
@@ -193,23 +276,21 @@ async fn the_all_local_profile_passes_its_own_gate() -> anyhow::Result<()> {
 /// following live appends.
 #[tokio::test(flavor = "multi_thread")]
 async fn gate_rejects_a_broken_channel_backend_even_though_its_slot_is_real() -> anyhow::Result<()> {
+    let telemetry_dir = tempfile::tempdir().context("telemetry dir")?;
     let result = validate_profile(
         local_cap_authority,
-        FakeMinter::new,
+        || LocalMinter,
         SnapshotBackend::default,
         FakeTransport::default,
         || VmBackendExecutor::new(ProcessBackend::new()),
         process_capabilities(),
         "contract",
-        FakeDiscovery::default,
-        HostId::from("local"),
-        || FakeCapacity::new(HostId::from("local"), 1),
-        FakeLifecycle::default,
-        TelemetryFactories {
-            enabled: || FakeSink::new(true),
-            disabled: || FakeSink::new(false),
-        },
-        FakeSink::captured,
+        StaticRegistry::default,
+        HostId::from(StaticRegistry::LOCALHOST),
+        executor_capacity,
+        lease_table,
+        telemetry_factories(telemetry_dir.path()),
+        telemetry_captured,
     )
     .await;
     let violation = result
@@ -223,12 +304,13 @@ async fn gate_rejects_a_broken_channel_backend_even_though_its_slot_is_real() ->
     Ok(())
 }
 
-/// Adversarial: swapping a still-PLACEHOLDER seam (`Minter`) for a broken
-/// variant also fails the gate — proving it's uniform regardless of a slot's
-/// current real/fake status, not just for seams that happen to be real yet.
-/// `ConstantMinter` mints the same secret every call.
+/// Adversarial: swapping the REAL Minter slot for a broken variant also fails
+/// the gate — proving it's uniform across every seam now that none is a
+/// placeholder (save `Transport`, deliberately out of scope). `ConstantMinter`
+/// mints the same secret every call.
 #[tokio::test(flavor = "multi_thread")]
-async fn gate_rejects_a_broken_minter_even_though_its_slot_is_a_placeholder() -> anyhow::Result<()> {
+async fn gate_rejects_a_broken_minter_even_though_its_slot_is_real() -> anyhow::Result<()> {
+    let telemetry_dir = tempfile::tempdir().context("telemetry dir")?;
     let result = validate_profile(
         local_cap_authority,
         || ConstantMinter,
@@ -237,15 +319,12 @@ async fn gate_rejects_a_broken_minter_even_though_its_slot_is_a_placeholder() ->
         || VmBackendExecutor::new(ProcessBackend::new()),
         process_capabilities(),
         "contract",
-        FakeDiscovery::default,
-        HostId::from("local"),
-        || FakeCapacity::new(HostId::from("local"), 1),
-        FakeLifecycle::default,
-        TelemetryFactories {
-            enabled: || FakeSink::new(true),
-            disabled: || FakeSink::new(false),
-        },
-        FakeSink::captured,
+        StaticRegistry::default,
+        HostId::from(StaticRegistry::LOCALHOST),
+        executor_capacity,
+        lease_table,
+        telemetry_factories(telemetry_dir.path()),
+        telemetry_captured,
     )
     .await;
     let violation = result

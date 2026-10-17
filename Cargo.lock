@@ -2119,6 +2119,7 @@ dependencies = [
  "sandy-backend",
  "sandy-fabric",
  "sandy-fabric-local",
+ "sandy-lib",
  "sandy-proto",
  "sha2 0.11.0",
  "tempfile",

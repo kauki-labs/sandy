@@ -22,6 +22,7 @@ workspace = true
 [dev-dependencies]
 anyhow.workspace = true
 hex.workspace = true
+sandy.workspace = true
 sandy-api.workspace = true
 sandy-backend.workspace = true
 # contract-tests: validate_profile (now a tests/acceptance.rs helper) calls
