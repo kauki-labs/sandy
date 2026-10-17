@@ -237,7 +237,8 @@ fn unique_suffix() -> io::Result<String> {
 /// Set the dir `name` under `parent` to `0700` without following a symlink at
 /// `name`. Linux has no no-follow `fchmodat`, so pin the entry with
 /// `O_PATH | O_NOFOLLOW` (which needs no read permission) and chmod that inode
-/// through `/proc/self/fd`, as glibc does.
+/// through `/proc/self/fd`, as glibc does. An entry already `0700` (any sane
+/// umask) is left alone, so only a hostile umask needs `/proc`.
 #[cfg(target_os = "linux")]
 pub(crate) fn chmod_new_dir_0700(parent: impl std::os::fd::AsFd, name: &std::ffi::OsStr) -> rustix::io::Result<()> {
     use std::os::fd::AsRawFd;
@@ -247,6 +248,9 @@ pub(crate) fn chmod_new_dir_0700(parent: impl std::os::fd::AsFd, name: &std::ffi
         OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )?;
+    if rustix::fs::fstat(&pinned)?.st_mode & 0o7777 == 0o700 {
+        return Ok(());
+    }
     rustix::fs::chmod(format!("/proc/self/fd/{}", pinned.as_raw_fd()).as_str(), Mode::RWXU)
 }
 
