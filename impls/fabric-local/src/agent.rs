@@ -321,8 +321,10 @@ pub(crate) const PEER_INBOX: usize = 1024;
 impl LinkAgent {
     /// Read the cap frame from `link` exactly once, present it in `Join`, and
     /// wait for the relay's verdict. The cap is not kept past the `Join`. Then
-    /// start the link reader; TTY stdin queues until
-    /// [`serve_tty`](Self::serve_tty), so call it promptly.
+    /// start the link reader. TTY stdin queues, unbounded, until
+    /// [`serve_tty`](Self::serve_tty) takes it, so call it promptly; a caller
+    /// that never bridges a TTY must drop the agent promptly instead, or stdin
+    /// stays queued for the agent's lifetime.
     ///
     /// # Errors
     /// [`AgentError::Refused`] if the relay refuses the join,
