@@ -328,6 +328,19 @@ job holding it could post as the agent.
   channel. In v1 membership is fixed for
   the run: sandyd mints each peer cap at dispatch, and a sandbox cannot be added
   to a group mid-run; dynamic invite (`CapRights.invite`) is a later slice.
+- The job reaches its peer channels (#238 slice 4b) through a unix socket the
+  agent serves in a private (0700) dir, named by `SANDY_PEER_SOCKET` (a path,
+  not a secret: the caps stay in the agent). One request per connection, as
+  newline-delimited JSON: `send` posts through the agent, which refuses a channel
+  it did not join (the relay checks again), and `recv` drains the inbox with its
+  drop count (`wait` blocks for one message, and ends if the client goes away, so a
+  client keeps its write side open until the reply).
+  A drain returns what fits in one reply line and keeps the rest, in order, for
+  the next `recv`. One `recv` and one `send` at a
+  time, independently, so a long-polling recv never starves a send; a second
+  concurrent recv is closed unanswered (delivery stays unambiguous), and the
+  `sandy-agent peer send|recv` helper retries briefly. Stdio framing (it collides with TTY) and an inherited fd (it
+  needs `unsafe` to map) are set aside; fan-out to several clients is deferred.
 - The job never inherits the link: the agent keeps a close-on-exec duplicate,
   points its own stdin at `/dev/null`, and gives the job fresh pipes. Its
   environment is the backend's, unchanged.

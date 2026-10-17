@@ -30,7 +30,7 @@ use sandy_fabric_local::{
     agent::{TTY_STDIN, TTY_STDOUT},
     channel::Channel,
     inmem::InMem,
-    link::{LinkError, serve_agent_link},
+    link::{LinkError, PeerGrant, serve_agent_link, serve_agent_link_with_peers},
 };
 use sandy_proto::{MessageType, Tty};
 use tokio::time::timeout;
@@ -265,5 +265,104 @@ async fn a_forged_cap_never_starts_the_vm_job() -> anyhow::Result<()> {
         matches!(relay_result(&relay).await?, Err(LinkError::Channel(_))),
         "the relay must report the refused join"
     );
+    Ok(())
+}
+
+/// #238 slice 4 on a real VM: the job inside the guest sends on its peer
+/// channel with `sandy-agent peer send`, a sibling sandbox on that channel
+/// receives it and answers, and the job's `peer recv --wait` prints the answer
+/// and the drop count; the send happens while nothing else holds the link.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_vm_job_talks_to_a_sibling_over_its_peer_channel() -> anyhow::Result<()> {
+    use base64::Engine;
+
+    let template = template()?;
+    let (channel, agent_cap, _) = channel_and_caps().await?;
+    let group_authority = LocalCapAuthority::new(Duration::from_secs(3600))?;
+    let group_scope = |peer: &str| CapScope {
+        peer: PeerId::from(peer),
+        channel: ChannelId::from("group-a"),
+        rights: CapRights {
+            post: true,
+            read: true,
+            invite: false,
+        },
+        expires_at: None,
+    };
+    let agent_group_cap = group_authority.mint(group_scope("agent"))?;
+    let sibling_cap = group_authority.mint(group_scope("sibling"))?;
+    let group = Arc::new(Channel::new(ChannelId::from("group-a"), InMem::default(), group_authority).await?);
+    let sibling = group.join(&sibling_cap)?;
+    let mut sibling_view = std::pin::pin!(group.subscribe(&sibling)?);
+
+    let relay: Relay = Arc::new(Mutex::new(None));
+    let handle = tokio::runtime::Handle::current();
+    let on_link = {
+        let (group, slot) = (Arc::clone(&group), Arc::clone(&relay));
+        Arc::new(move |_box_id: &str, link: OwnedFd, report: AgentReport| {
+            let (channel, cap) = (Arc::clone(&channel), agent_cap.clone());
+            let grants = vec![PeerGrant {
+                channel: Arc::clone(&group),
+                cap: agent_group_cap.clone(),
+            }];
+            let task = handle.spawn(async move {
+                let stream = std::os::unix::net::UnixStream::from(link);
+                stream.set_nonblocking(true)?;
+                let link = tokio::net::UnixStream::from_std(stream)?;
+                let relayed = serve_agent_link_with_peers(channel, &cap, grants, link).await;
+                match &relayed {
+                    Ok(Some(code)) => report.job_exited(*code),
+                    Ok(None) => report.agent_failed("the agent ended without reporting the job's exit"),
+                    Err(e) => report.agent_failed(e.to_string()),
+                }
+                relayed
+            });
+            *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(task);
+        })
+    };
+    let launch = AgentLaunch {
+        program: PathBuf::new(),
+        on_link,
+    };
+    let script = r#"[ -n "$SANDY_PEER_SOCKET" ] || exit 3
+        printf from-guest | sandy-agent peer send group-a text/plain || exit 4
+        sandy-agent peer recv --wait"#;
+    let mut run = tokio::spawn(run_in_guest(template, launch, script));
+
+    // Wait for the guest's message, but report the run at once if it ends first.
+    timeout(WAIT, async {
+        loop {
+            tokio::select! {
+                env = sibling_view.next() => {
+                    let env = env.context("group stream ended")??;
+                    if env.payload == b"from-guest" {
+                        return anyhow::Ok(());
+                    }
+                }
+                ended = &mut run => {
+                    anyhow::bail!("the guest run ended before its peer message: {:?}", ended??);
+                }
+            }
+        }
+    })
+    .await??;
+    group
+        .post(
+            &sibling,
+            Some(MessageType::PeerMsg(sandy_proto::PeerMsg {})),
+            "text/plain",
+            b"to-guest".to_vec(),
+        )
+        .await?;
+
+    let outcome = timeout(WAIT, run).await????;
+    assert_eq!(outcome.guest_exit, Some(0), "console: {}", outcome.console);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(b"to-guest");
+    assert!(
+        outcome.console.contains(&encoded) && outcome.console.contains(r#"{"dropped":0}"#),
+        "the guest job must print the sibling's message and the drop count: {}",
+        outcome.console
+    );
+    assert_eq!(relay_result(&relay).await??, Some(0));
     Ok(())
 }

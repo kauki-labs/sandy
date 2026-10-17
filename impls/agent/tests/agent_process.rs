@@ -338,6 +338,99 @@ fn run_on(backend: &ProcessBackend, command: &[String]) -> Result<Outcome, Backe
     })
 }
 
+/// #238 slice 4b, end to end through the real agent process: the job sends on
+/// its peer channel with `sandy-agent peer send`, a sibling sandbox on that
+/// channel sees it and answers, and the job's `peer recv --wait` prints the
+/// answer and the inbox's drop count.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_talks_to_a_sibling_over_its_peer_channel() -> anyhow::Result<()> {
+    use base64::Engine;
+    use sandy_fabric_local::link::{PeerGrant, serve_agent_link_with_peers};
+
+    let (channel, agent_cap, _) = channel_and_caps().await?;
+    let group_authority = LocalCapAuthority::new(Duration::from_secs(3600))?;
+    let group_scope = |peer: &str| CapScope {
+        peer: PeerId::from(peer),
+        channel: ChannelId::from("group-a"),
+        rights: CapRights {
+            post: true,
+            read: true,
+            invite: false,
+        },
+        expires_at: None,
+    };
+    let agent_group_cap = group_authority.mint(group_scope("agent"))?;
+    let sibling_cap = group_authority.mint(group_scope("sibling"))?;
+    let group = Arc::new(Channel::new(ChannelId::from("group-a"), InMem::default(), group_authority).await?);
+    let sibling = group.join(&sibling_cap)?;
+    let mut sibling_view = std::pin::pin!(group.subscribe(&sibling)?);
+
+    let handle = tokio::runtime::Handle::current();
+    let on_link = {
+        let group = Arc::clone(&group);
+        Arc::new(move |_box_id: &str, host_end: OwnedFd, report: AgentReport| {
+            let (channel, cap) = (Arc::clone(&channel), agent_cap.clone());
+            let grants = vec![PeerGrant {
+                channel: Arc::clone(&group),
+                cap: agent_group_cap.clone(),
+            }];
+            handle.spawn(async move {
+                let stream = std::os::unix::net::UnixStream::from(host_end);
+                let relayed = match stream
+                    .set_nonblocking(true)
+                    .and_then(|()| tokio::net::UnixStream::from_std(stream))
+                {
+                    Ok(link) => serve_agent_link_with_peers(channel, &cap, grants, link).await,
+                    Err(e) => Err(LinkError::Io(e)),
+                };
+                match relayed {
+                    Ok(Some(code)) => report.job_exited(code),
+                    Ok(None) => report.agent_failed("no exit report"),
+                    Err(e) => report.agent_failed(e.to_string()),
+                }
+            });
+        })
+    };
+    let backend = ProcessBackend::new().with_agent(AgentLaunch {
+        program: agent_binary(),
+        on_link,
+    });
+    let script = format!(
+        r#"[ -n "$SANDY_PEER_SOCKET" ] || exit 3
+        printf from-job | {agent} peer send group-a text/plain || exit 4
+        {agent} peer recv --wait"#,
+        agent = shell_quote(&agent_binary())
+    );
+    let run = tokio::spawn(run_blocking(backend, sh(&script)));
+
+    loop {
+        let env = timeout(WAIT, sibling_view.next())
+            .await?
+            .context("group stream ended")??;
+        if env.payload == b"from-job" {
+            break;
+        }
+    }
+    group
+        .post(
+            &sibling,
+            Some(MessageType::PeerMsg(sandy_proto::PeerMsg {})),
+            "text/plain",
+            b"to-job".to_vec(),
+        )
+        .await?;
+
+    let outcome = timeout(WAIT, run).await????;
+    assert_eq!(outcome.guest_exit, Some(0), "console: {}", outcome.console);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(b"to-job");
+    assert!(
+        outcome.console.contains(&encoded) && outcome.console.contains(r#"{"dropped":0}"#),
+        "the job must print the sibling's message and the drop count: {}",
+        outcome.console
+    );
+    Ok(())
+}
+
 fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
 }
