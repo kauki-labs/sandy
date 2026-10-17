@@ -261,10 +261,11 @@ mod tests {
     /// sides, every legitimate executor on such a deployment would be
     /// refused — fail-closed, but a hard-to-diagnose outage, not a bypass.
     #[test]
-    fn an_ipv4_mapped_ipv6_peer_matches_a_plain_ipv4_binding() -> std::io::Result<()> {
+    fn an_ipv4_mapped_ipv6_peer_matches_a_plain_ipv4_binding() -> anyhow::Result<()> {
+        use anyhow::Context;
         let link = RemoteLink::new(executor_ip())?;
         let token = *token_bytes(&link);
-        let mapped: IpAddr = "::ffff:100.64.0.7".parse().unwrap();
+        let mapped: IpAddr = "::ffff:100.64.0.7".parse().context("mapped address literal")?;
 
         assert_eq!(authenticate(&link, mapped, &token), Ok(()));
         Ok(())

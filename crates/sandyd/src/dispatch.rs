@@ -250,13 +250,16 @@ mod tests {
     /// name, not treated as having no remote link (a different refusal that
     /// would leak "this job exists but is local").
     #[test]
-    fn authenticating_an_unregistered_job_is_refused_as_unknown() {
+    fn authenticating_an_unregistered_job_is_refused_as_unknown() -> anyhow::Result<()> {
+        use anyhow::Context;
         let registry = JobRegistry::default();
         let token = [0u8; link_auth::LINK_TOKEN_LEN];
-        match registry.authenticate_remote_link("ghost", "127.0.0.1".parse().unwrap(), &token) {
+        let peer: std::net::IpAddr = "127.0.0.1".parse().context("loopback literal")?;
+        match registry.authenticate_remote_link("ghost", peer, &token) {
             Err(e) => assert_eq!(e, LinkAuthError::UnknownRun),
             Ok(_) => panic!("an unregistered job must be refused"),
         }
+        Ok(())
     }
 
     /// A job dispatched locally (the only kind this slice mints) has no
@@ -264,12 +267,14 @@ mod tests {
     /// as an unknown run.
     #[tokio::test]
     async fn authenticating_a_local_jobs_link_is_refused_as_not_remote() -> anyhow::Result<()> {
+        use anyhow::Context;
         let registry = JobRegistry::default();
         let job = mint_job_channel("job-1").await?;
         registry.insert("job-1".to_owned(), job);
 
         let token = [0u8; link_auth::LINK_TOKEN_LEN];
-        match registry.authenticate_remote_link("job-1", "127.0.0.1".parse().unwrap(), &token) {
+        let peer: std::net::IpAddr = "127.0.0.1".parse().context("loopback literal")?;
+        match registry.authenticate_remote_link("job-1", peer, &token) {
             Err(e) => assert_eq!(e, LinkAuthError::NotRemote),
             Ok(_) => panic!("a locally dispatched job has no remote link"),
         }
@@ -281,9 +286,10 @@ mod tests {
     /// lookup path (not just `link_auth`'s unit tests in isolation).
     #[tokio::test]
     async fn authenticating_a_remote_jobs_link_round_trips_through_the_registry() -> anyhow::Result<()> {
+        use anyhow::Context;
         let registry = JobRegistry::default();
         let mut job = mint_job_channel("job-1").await?;
-        let executor_ip: std::net::IpAddr = "100.64.0.7".parse().unwrap();
+        let executor_ip: std::net::IpAddr = "100.64.0.7".parse().context("executor ip literal")?;
         let link = RemoteLink::new(executor_ip)?;
         let token = *link.token().as_bytes();
         job.remote_link = Some(link);
