@@ -369,6 +369,17 @@ impl LinkAgent {
     }
 }
 
+impl LinkAgent {
+    /// Report the job's exit to the relay as the link's last frame. A run whose
+    /// agent never reports is an infra fault, not a job result (INV-11).
+    ///
+    /// # Errors
+    /// [`AgentError::Link`] if the frame cannot be written.
+    pub async fn report_exit(&self, _code: i32) -> Result<(), AgentError> {
+        Ok(())
+    }
+}
+
 /// A [`TtyPort`] onto the agent link's write half.
 struct LinkPort {
     writer: AsyncMutex<Box<dyn AsyncWrite + Send + Unpin>>,

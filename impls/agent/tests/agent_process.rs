@@ -32,7 +32,7 @@ const CHANNEL: &str = "orchestrator";
 const WAIT: Duration = Duration::from_secs(10);
 
 type TestChannel = Arc<Channel<InMem, LocalCapAuthority>>;
-type RelayResult = Arc<Mutex<Option<tokio::task::JoinHandle<Result<(), LinkError>>>>>;
+type RelayResult = Arc<Mutex<Option<tokio::task::JoinHandle<Result<Option<i32>, LinkError>>>>>;
 
 fn agent_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_sandy-agent"))
@@ -120,7 +120,7 @@ fn sh(script: &str) -> Vec<String> {
     vec!["/bin/sh".to_string(), "-c".to_string(), script.to_string()]
 }
 
-async fn relay_result(relay: &RelayResult) -> anyhow::Result<Result<(), LinkError>> {
+async fn relay_result(relay: &RelayResult) -> anyhow::Result<Result<Option<i32>, LinkError>> {
     let task = relay
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

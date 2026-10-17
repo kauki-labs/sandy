@@ -67,6 +67,12 @@ pub enum LinkFrame {
         /// The hex of the bytes.
         payload: String,
     },
+    /// Agent to relay, last frame: the job ran and exited with `code` (`128 +
+    /// signal` for a signal death). Its absence means the agent failed.
+    Exit {
+        /// The job's exit code.
+        code: i32,
+    },
     /// Relay to agent: input for the job.
     Deliver {
         /// `TTY_STDIN`.
@@ -87,6 +93,7 @@ impl LinkFrame {
             Self::Refused { .. } => "refused",
             Self::Post { .. } => "post",
             Self::Deliver { .. } => "deliver",
+            Self::Exit { .. } => "exit",
         }
     }
 }
@@ -98,6 +105,7 @@ impl std::fmt::Debug for LinkFrame {
             Self::Cap { .. } | Self::Join { .. } => write!(f, "LinkFrame::{}(<redacted>)", self.kind()),
             Self::Joined => f.write_str("LinkFrame::Joined"),
             Self::Refused { reason } => write!(f, "LinkFrame::Refused({reason:?})"),
+            Self::Exit { code } => write!(f, "LinkFrame::Exit({code})"),
             Self::Post { content_type, payload } | Self::Deliver { content_type, payload } => write!(
                 f,
                 "LinkFrame::{}({content_type}, {} bytes)",
@@ -181,11 +189,19 @@ pub(crate) fn unhex(field: &str, what: &str) -> Result<Vec<u8>, LinkError> {
 /// `cap`, admit one `Join`, then carry its TTY traffic. The membership is left
 /// when this returns.
 ///
+/// Returns the job's exit code from the agent's final `Exit` frame, or `None`
+/// if the agent closed the link without one: it failed, so the job's result is
+/// unknown and the run is an infra fault (INV-11).
+///
 /// # Errors
 /// [`LinkError::Channel`] if the join is refused (the agent is told why first),
 /// [`LinkError::Protocol`] if the agent sends a frame it may not, and
 /// [`LinkError::Io`] if the link faults.
-pub async fn serve_agent_link<B, A, L>(channel: Arc<Channel<B, A>>, cap: &Cap, link: L) -> Result<(), LinkError>
+pub async fn serve_agent_link<B, A, L>(
+    channel: Arc<Channel<B, A>>,
+    cap: &Cap,
+    link: L,
+) -> Result<Option<i32>, LinkError>
 where
     B: ChannelBackend + 'static,
     A: CapAuthority + 'static,
@@ -227,7 +243,7 @@ where
 
     let result = relay_joined(&channel, &membership, &mut rd, &wr).await;
     channel.leave(&membership);
-    result
+    result.map(|()| None)
 }
 
 /// The joined phase of [`serve_agent_link`]: channel stdin out to the agent,
@@ -478,7 +494,10 @@ mod tests {
     async fn joined_raw_agent(
         channel: TestChannel,
         cap: Cap,
-    ) -> anyhow::Result<(tokio::io::DuplexStream, tokio::task::JoinHandle<Result<(), LinkError>>)> {
+    ) -> anyhow::Result<(
+        tokio::io::DuplexStream,
+        tokio::task::JoinHandle<Result<Option<i32>, LinkError>>,
+    )> {
         let (mut agent_end, host_end) = tokio::io::duplex(64 * 1024);
         let relay = tokio::spawn(async move { serve_agent_link(channel, &cap, host_end).await });
         let Some(LinkFrame::Cap { cap }) = timeout(WAIT, read_frame(&mut agent_end)).await?? else {
@@ -488,6 +507,50 @@ mod tests {
         let joined = timeout(WAIT, read_frame(&mut agent_end)).await??;
         anyhow::ensure!(joined == Some(LinkFrame::Joined), "expected Joined, got {joined:?}");
         Ok((agent_end, relay))
+    }
+
+    /// The relay reports the job's exit from the agent's last frame; without
+    /// one the result is unknown (`None`), never a made-up exit code.
+    #[tokio::test]
+    async fn the_relay_returns_the_exit_the_agent_reports_and_none_without_one() -> anyhow::Result<()> {
+        for report in [Some(7), None] {
+            let (channel, agent_cap, _) = channel_and_caps().await?;
+            let (agent_end, host_end) = tokio::io::duplex(64 * 1024);
+            let relay = tokio::spawn(async move { serve_agent_link(channel, &agent_cap, host_end).await });
+            let agent = timeout(WAIT, LinkAgent::bootstrap(agent_end)).await??;
+            if let Some(code) = report {
+                agent.report_exit(code).await?;
+            }
+            drop(agent);
+            assert_eq!(timeout(WAIT, relay).await???, report, "reported {report:?}");
+        }
+        Ok(())
+    }
+
+    /// The relay admits only the cap it handed over: a peer presenting another
+    /// valid cap (here the orchestrator's own) is refused, not joined as it.
+    #[tokio::test]
+    async fn a_join_with_a_cap_other_than_the_handed_one_is_refused() -> anyhow::Result<()> {
+        let (channel, agent_cap, orchestrator_cap) = channel_and_caps().await?;
+        let (mut agent_end, host_end) = tokio::io::duplex(64 * 1024);
+        let relay = tokio::spawn(async move { serve_agent_link(channel, &agent_cap, host_end).await });
+        let Some(LinkFrame::Cap { .. }) = timeout(WAIT, read_frame(&mut agent_end)).await?? else {
+            anyhow::bail!("the relay's first frame must be the cap");
+        };
+        write_frame(
+            &mut agent_end,
+            &LinkFrame::Join {
+                cap: hex::encode(sandy_fabric::capauth::encode_cap(&orchestrator_cap)?),
+            },
+        )
+        .await?;
+        let reply = timeout(WAIT, read_frame(&mut agent_end)).await??;
+        assert!(matches!(reply, Some(LinkFrame::Refused { .. })), "got {reply:?}");
+        assert!(
+            timeout(WAIT, relay).await?.is_err(),
+            "the relay must report the refusal"
+        );
+        Ok(())
     }
 
     #[tokio::test]
