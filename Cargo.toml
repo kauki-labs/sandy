@@ -26,7 +26,7 @@ sandy-control-proto = { path = "crates/sandy-control-proto", version = "0.1.1" }
 sandy-fabric = { path = "crates/sandy-fabric", version = "0.1.1" }
 sandy-impls-local = { path = "impls/local", version = "0.1.1" }
 sandy-impls-vm = { path = "impls/vm", version = "0.1.1" }
-sandy-test-support = { path = "crates/sandy-test-support", version = "0.1.1" }
+sandy-test-support = { path = "crates/sandy-test-support" } # publish=false: versionless so cargo drops it on publish
 sandy-fabric-local = { path = "impls/fabric-local", version = "0.1.1" }
 command-group = "5.0.1"
 futures-core = "0.3.34"
