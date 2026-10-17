@@ -13,6 +13,7 @@ use sandy_api::{
     backend::SandboxKind,
     containment::{Containment, ContainmentStatus},
 };
+use sandy_executor_proto::IsolationClass;
 use sandy_fabric::executor::{Arch, Capabilities};
 use sandy_impls_local::SystemdRunContainment;
 
@@ -70,6 +71,27 @@ fn capabilities_from(arch: Arch, status: &ContainmentStatus) -> Result<Capabilit
     })
 }
 
+/// Derive the isolation classes this host's containment can actually honor,
+/// for `Register`'s wire `Capabilities.supported_isolation_classes` (#280's
+/// orchestrator-side gate refuses a dispatch whose required class isn't in
+/// this list — an empty or hardcoded list would silently refuse every
+/// dispatch to this host, functional-but-dead). Mirrors the admission logic
+/// [`dispatch::check_isolation_class`](crate::dispatch::check_isolation_class)
+/// re-checks per dispatch: `is_available()` always honors `Trusted`;
+/// `is_untrusted_boundary()` additionally honors `Untrusted`. A non-available
+/// status honors neither — the empty list is the correct, fail-closed
+/// declaration for a host that can't contain anything at all.
+fn detected_isolation_classes(status: &ContainmentStatus) -> Vec<IsolationClass> {
+    if !status.is_available() {
+        return Vec::new();
+    }
+    let mut classes = vec![IsolationClass::Trusted];
+    if status.is_untrusted_boundary() {
+        classes.push(IsolationClass::Untrusted);
+    }
+    classes
+}
+
 /// Detect this host's real capabilities: the real entry point, probing both
 /// the architecture and [`SystemdRunContainment::detect`] (the exact probe
 /// `ProcessBackend` itself uses at run time) before deriving the
@@ -85,6 +107,41 @@ pub fn detect_capabilities() -> Result<Capabilities, DetectError> {
     let arch = detect_arch()?;
     let status = SystemdRunContainment::detect().status();
     capabilities_from(arch, &status)
+}
+
+/// Convert this host's declared [`Capabilities`] into the wire
+/// `Register.capabilities` shape, with `supported_isolation_classes`
+/// populated from `status` via [`detected_isolation_classes`] — never
+/// empty or hardcoded, since the orchestrator's isolation-class gate (#280)
+/// refuses any dispatch whose required class isn't in this list.
+fn to_wire_capabilities(capabilities: Capabilities, status: &ContainmentStatus) -> sandy_executor_proto::Capabilities {
+    let kind = match capabilities.kind {
+        SandboxKind::Process => sandy_executor_proto::SandboxKind::Process,
+        SandboxKind::Vm => sandy_executor_proto::SandboxKind::Vm,
+    };
+    let arch = match capabilities.arch {
+        Arch::X86_64 => sandy_executor_proto::Arch::X8664,
+        Arch::Aarch64 => sandy_executor_proto::Arch::Aarch64,
+    };
+    sandy_executor_proto::Capabilities {
+        kind: kind.into(),
+        arch: arch.into(),
+        attestation: capabilities.attestation.is_some(),
+        supported_isolation_classes: detected_isolation_classes(status).into_iter().map(Into::into).collect(),
+    }
+}
+
+/// Detect this host's real capabilities in the wire shape `Register` carries
+/// — the real entry point for registration, as [`detect_capabilities`] is
+/// for the domain type it wraps.
+///
+/// # Errors
+/// Same as [`detect_capabilities`].
+pub fn detect_register_capabilities() -> Result<sandy_executor_proto::Capabilities, DetectError> {
+    let arch = detect_arch()?;
+    let status = SystemdRunContainment::detect().status();
+    let capabilities = capabilities_from(arch, &status)?;
+    Ok(to_wire_capabilities(capabilities, &status))
 }
 
 /// The diagnostic string carried by a non-`Available` [`ContainmentStatus`].
@@ -168,5 +225,62 @@ mod tests {
             err,
             DetectError::ContainmentUnavailable("macOS has no cgroup".to_owned())
         );
+    }
+
+    /// Positive: a reaping-only containment declares exactly `[Trusted]` —
+    /// this is the case #284's merge-blocker exists for: an unpopulated
+    /// `supported_isolation_classes` would make the orchestrator's isolation
+    /// gate refuse every dispatch, even trusted ones.
+    #[test]
+    fn an_available_reaping_only_containment_declares_trusted_only() {
+        let status = ContainmentStatus::Available {
+            isolates_untrusted: false,
+        };
+        assert_eq!(detected_isolation_classes(&status), vec![IsolationClass::Trusted]);
+    }
+
+    /// Positive: an untrusted boundary declares both classes — at least what
+    /// a reaping-only host declares, plus `Untrusted`.
+    #[test]
+    fn an_untrusted_boundary_declares_trusted_and_untrusted() {
+        let status = ContainmentStatus::Available {
+            isolates_untrusted: true,
+        };
+        assert_eq!(
+            detected_isolation_classes(&status),
+            vec![IsolationClass::Trusted, IsolationClass::Untrusted]
+        );
+    }
+
+    /// Adversarial: a host with no usable containment declares no isolation
+    /// class at all — never a hardcoded `[Trusted]` for a host that can't
+    /// actually honor it.
+    #[test]
+    fn an_unavailable_containment_declares_no_isolation_class() {
+        let status = ContainmentStatus::Unavailable("no user systemd instance".to_owned());
+        assert_eq!(detected_isolation_classes(&status), Vec::<IsolationClass>::new());
+    }
+
+    /// The load-bearing property for #284: the wire `Capabilities` Register
+    /// actually carries declares `[Trusted]`, derived from a real
+    /// `ContainmentStatus`, never empty or hardcoded.
+    #[test]
+    fn to_wire_capabilities_populates_supported_isolation_classes_from_status() {
+        let status = ContainmentStatus::Available {
+            isolates_untrusted: false,
+        };
+        let capabilities = Capabilities {
+            kind: SandboxKind::Process,
+            arch: Arch::X86_64,
+            attestation: None,
+        };
+        let wire = to_wire_capabilities(capabilities, &status);
+        assert_eq!(
+            wire.supported_isolation_classes,
+            vec![i32::from(IsolationClass::Trusted)]
+        );
+        assert_eq!(wire.kind, i32::from(sandy_executor_proto::SandboxKind::Process));
+        assert_eq!(wire.arch, i32::from(sandy_executor_proto::Arch::X8664));
+        assert!(!wire.attestation);
     }
 }
