@@ -99,8 +99,6 @@ impl OwnedDir {
         // The umask may have cleared bits from 0700, even the owner's read bit,
         // which would make the dir unopenable. Set 0700 on the entry just made,
         // never following a link swapped in since, then open and validate it.
-        // create_private_dir, the staging base and write_0600_at do not follow
-        // this pattern yet; #204 aligns them.
         let secured = chmod_new_dir_0700(&parent_fd, name)
             .map_err(|e| FsError::io("set created dir to 0700", path, e))
             .and_then(|()| Self::open(path));
@@ -120,7 +118,8 @@ impl OwnedDir {
     ///
     /// An existing entry at `name` (a directory, a file, a symlink) is an error,
     /// never reused: a pre-created entry may belong to someone else. The mode is
-    /// set to `0700` on the opened handle, so the umask cannot widen it.
+    /// set to `0700` before it is opened, so no umask can narrow it into an
+    /// unopenable dir or widen it.
     ///
     /// # Errors
     ///
@@ -129,6 +128,20 @@ impl OwnedDir {
     pub fn create_private_dir(&self, name: &str) -> Result<Self, FsError> {
         let path = self.path.join(name);
         rustix::fs::mkdirat(&self.handle, name, Mode::RWXU).map_err(|e| FsError::io("create private dir", &path, e))?;
+        // As in open_or_create: the umask may have cleared the owner's read bit.
+        let secured = chmod_new_dir_0700(&self.handle, std::ffi::OsStr::new(name))
+            .map_err(|e| FsError::io("set private dir to 0700", &path, e))
+            .and_then(|()| self.open_created_dir(name, path));
+        if secured.is_err() {
+            // Best effort: never leave a half-set-up dir behind.
+            let _ = rustix::fs::unlinkat(&self.handle, name, AtFlags::REMOVEDIR);
+        }
+        secured
+    }
+
+    /// Open the dir `name` just created in this one, pin it to `0700`, and
+    /// validate it as this user's.
+    fn open_created_dir(&self, name: &str, path: PathBuf) -> Result<Self, FsError> {
         let handle = rustix::fs::openat(
             &self.handle,
             name,
@@ -226,7 +239,7 @@ fn unique_suffix() -> io::Result<String> {
 /// `O_PATH | O_NOFOLLOW` (which needs no read permission) and chmod that inode
 /// through `/proc/self/fd`, as glibc does.
 #[cfg(target_os = "linux")]
-fn chmod_new_dir_0700(parent: &std::os::fd::OwnedFd, name: &std::ffi::OsStr) -> rustix::io::Result<()> {
+pub(crate) fn chmod_new_dir_0700(parent: impl std::os::fd::AsFd, name: &std::ffi::OsStr) -> rustix::io::Result<()> {
     use std::os::fd::AsRawFd;
     let pinned = rustix::fs::openat(
         parent,
@@ -240,13 +253,14 @@ fn chmod_new_dir_0700(parent: &std::os::fd::OwnedFd, name: &std::ffi::OsStr) -> 
 /// Set the dir `name` under `parent` to `0700` without following a symlink at
 /// `name`; fails closed where no-follow chmod is unsupported.
 #[cfg(not(target_os = "linux"))]
-fn chmod_new_dir_0700(parent: &std::os::fd::OwnedFd, name: &std::ffi::OsStr) -> rustix::io::Result<()> {
+pub(crate) fn chmod_new_dir_0700(parent: impl std::os::fd::AsFd, name: &std::ffi::OsStr) -> rustix::io::Result<()> {
     rustix::fs::chmodat(parent, name, Mode::RWXU, AtFlags::SYMLINK_NOFOLLOW)
 }
 
 /// Create `name` in `dir` as a new `0600` file holding `bytes`, synced to disk.
 /// `O_EXCL` with `O_NOFOLLOW` refuses anything already there, including a planted
-/// symlink.
+/// symlink. The mode is set on the new fd too: a umask can only narrow `0600`,
+/// but clearing the owner's read bit would leave a secret its owner cannot read.
 fn write_0600_at(dir: &File, name: &str, bytes: &[u8]) -> io::Result<()> {
     let fd = rustix::fs::openat(
         dir,
@@ -254,6 +268,7 @@ fn write_0600_at(dir: &File, name: &str, bytes: &[u8]) -> io::Result<()> {
         OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::from_raw_mode(0o600),
     )?;
+    rustix::fs::fchmod(&fd, Mode::from_raw_mode(0o600))?;
     let mut file = File::from(fd);
     file.write_all(bytes)?;
     file.sync_all()
@@ -317,9 +332,11 @@ mod tests {
     #[test]
     fn a_symlink_planted_at_the_destination_never_touches_its_target() -> anyhow::Result<()> {
         let dir = staging_dir()?;
-        let victim_dir = tempfile::tempdir()?;
+        let victim_dir = staging_dir()?;
         let victim = victim_dir.path().join("id_ed25519");
         fs::write(&victim, b"private key")?;
+        // Readable back whatever the umask.
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o600))?;
         symlink(&victim, dir.path().join("S"))?;
         let path = OwnedDir::open(dir.path())?.write_secret("S", b"secret")?;
         anyhow::ensure!(
