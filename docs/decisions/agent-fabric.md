@@ -316,7 +316,8 @@ job holding it could post as the agent.
   not join, or TTY traffic on a peer channel, ends the relay, and the relay only
   subscribes to channels it joined. A post the channel refuses on a joined
   channel (its cap expired or was revoked) is logged and dropped, and the relay
-  goes on, so the job's exit report still arrives (INV-11). Peer messages are `PeerMsg`-typed, and the
+  goes on, so the job's exit report still arrives (INV-11); a backend fault
+  still ends the relay. The job's `send` is not told of the refusal yet. Peer messages are `PeerMsg`-typed, and the
   agent's own posts come back like any member's. The agent's peer inbox
   (`LinkAgent::take_peer_inbox`) is bounded and drops any delivery that arrives
   while it is full; what it keeps stays in order, and every drop is counted

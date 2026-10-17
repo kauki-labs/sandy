@@ -535,13 +535,16 @@ where
                 let bytes = unhex(&payload, "a peer post payload")?;
                 // A refused post on a joined channel (its cap expired or was
                 // revoked) loses that message only; ending the relay here would
-                // also lose the job's exit report (INV-11).
-                if let Err(e) = peer
+                // also lose the job's exit report (INV-11). A backend fault is
+                // not a refusal and still ends the relay.
+                match peer
                     .channel
                     .post(&peer.id, Some(MessageType::PeerMsg(PeerMsg {})), content_type, bytes)
                     .await
                 {
-                    tracing::warn!("peer channel {name} refused the agent's post: {e}");
+                    Ok(_) => {}
+                    Err(e @ ChannelError::Backend(_)) => return Err(e.into()),
+                    Err(e) => tracing::warn!("peer channel {name} refused the agent's post: {e}"),
                 }
             }
             Some(LinkFrame::Exit { code }) => exit = Some(code),
@@ -1050,7 +1053,7 @@ mod tests {
         let expires_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs()
-            + 2;
+            + 3;
         let agent_cap = authority.mint(CapScope {
             peer: PeerId::from("agent"),
             channel: ChannelId::from("group-a"),
