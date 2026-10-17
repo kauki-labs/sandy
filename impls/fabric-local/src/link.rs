@@ -533,9 +533,16 @@ where
                     )));
                 }
                 let bytes = unhex(&payload, "a peer post payload")?;
-                peer.channel
+                // A refused post on a joined channel (its cap expired or was
+                // revoked) loses that message only; ending the relay here would
+                // also lose the job's exit report (INV-11).
+                if let Err(e) = peer
+                    .channel
                     .post(&peer.id, Some(MessageType::PeerMsg(PeerMsg {})), content_type, bytes)
-                    .await?;
+                    .await
+                {
+                    tracing::warn!("peer channel {name} refused the agent's post: {e}");
+                }
             }
             Some(LinkFrame::Exit { code }) => exit = Some(code),
             Some(LinkFrame::Join { .. }) => {
