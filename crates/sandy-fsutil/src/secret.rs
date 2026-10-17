@@ -469,6 +469,28 @@ mod tests {
         Ok(())
     }
 
+    /// Review of #204: under a sane umask a new dir is already 0700, so the
+    /// /proc-based chmod is skipped and a host without /proc keeps working. The
+    /// inode's ctime shows it: any chmod updates it, even to the same mode.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_dir_already_0700_is_not_chmodded() -> anyhow::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let dir = staging_dir()?;
+        fs::create_dir(dir.path().join("d"))?;
+        fs::set_permissions(dir.path().join("d"), fs::Permissions::from_mode(0o700))?;
+        let before = fs::symlink_metadata(dir.path().join("d"))?;
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let parent = rustix::fs::open(dir.path(), OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())?;
+        chmod_new_dir_0700(&parent, std::ffi::OsStr::new("d"))?;
+        let after = fs::symlink_metadata(dir.path().join("d"))?;
+        anyhow::ensure!(
+            (after.ctime(), after.ctime_nsec()) == (before.ctime(), before.ctime_nsec()),
+            "a dir already 0700 was chmodded anyway"
+        );
+        Ok(())
+    }
+
     /// #204: the secret file alone, in a dir made before the umask changed.
     /// The umask is process-wide; nextest runs each test in its own process.
     #[test]
