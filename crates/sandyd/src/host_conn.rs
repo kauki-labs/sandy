@@ -14,13 +14,21 @@ use sandy_executor_proto::{
 
 use crate::host_registry::{ExecutorAllowlist, HostRegistry};
 
+/// How long a freshly accepted connection has to send its `Register` frame
+/// before it's closed. Without a deadline here, a peer that opens a
+/// connection and never writes anything would hold it (and the accept
+/// loop's resources for it) open indefinitely — a slowloris-style resource
+/// exhaustion, not just a slow client.
+const REGISTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Serve one accepted host-client connection end to end.
 ///
-/// Expects `Register` as the first frame; anything else, or a stream that
-/// closes before sending one, ends the connection without ever registering
-/// the host. A `PeerAddr::Uds` peer is refused outright — a host-client only
-/// ever connects over the mesh (`PeerAddr::Tcp`), so a UDS peer here would be
-/// a caller bug, not a registration this code should entertain.
+/// Expects `Register` as the first frame within [`REGISTER_TIMEOUT`];
+/// anything else, a stream that closes before sending one, or one that never
+/// sends it in time, ends the connection without ever registering the host.
+/// A `PeerAddr::Uds` peer is refused outright — a host-client only ever
+/// connects over the mesh (`PeerAddr::Tcp`), so a UDS peer here would be a
+/// caller bug, not a registration this code should entertain.
 pub async fn serve_host_client(
     mut conn: Box<dyn Conn>,
     peer: PeerAddr,
@@ -35,17 +43,21 @@ pub async fn serve_host_client(
         }
     };
 
-    let register = match read_frame::<HostClientMessage>(&mut conn).await {
-        Ok(Some(HostClientMessage {
+    let register = match tokio::time::timeout(REGISTER_TIMEOUT, read_frame::<HostClientMessage>(&mut conn)).await {
+        Ok(Ok(Some(HostClientMessage {
             op: Some(host_client_message::Op::Register(register)),
-        })) => register,
-        Ok(Some(_)) => {
+        }))) => register,
+        Ok(Ok(Some(_))) => {
             tracing::warn!(peer = %peer_ip, "host-client's first frame was not Register; closing");
             return;
         }
-        Ok(None) => return, // clean close before any frame: nothing to log
-        Err(e) => {
+        Ok(Ok(None)) => return, // clean close before any frame: nothing to log
+        Ok(Err(e)) => {
             tracing::warn!(peer = %peer_ip, error = %e, "host-client connection faulted reading Register");
+            return;
+        }
+        Err(_elapsed) => {
+            tracing::warn!(peer = %peer_ip, "host-client did not send Register within the timeout; closing");
             return;
         }
     };
@@ -68,8 +80,8 @@ pub async fn serve_host_client(
         }
     };
 
-    let mut dispatch_rx = match registry.register(allowlist, peer_ip, host_id.clone(), capabilities) {
-        Ok(dispatch_rx) => dispatch_rx,
+    let (mut dispatch_rx, registration) = match registry.register(allowlist, peer_ip, host_id.clone(), capabilities) {
+        Ok(registered) => registered,
         Err(e) => {
             // Refused and logged (D5's Register-authentication ruling, #263):
             // an unknown registrant's mesh identity never becomes
@@ -99,7 +111,7 @@ pub async fn serve_host_client(
     .await
     .is_err()
     {
-        registry.remove(&host_id);
+        registry.remove(&host_id, registration);
         return;
     }
     tracing::info!(peer = %peer_ip, host_id, "host-client registered");
@@ -142,7 +154,7 @@ pub async fn serve_host_client(
         }
     }
 
-    registry.remove(&host_id);
+    registry.remove(&host_id, registration);
     tracing::info!(host_id, "host-client disconnected");
 }
 
@@ -257,6 +269,24 @@ mod tests {
         drop(client);
         let registry = tokio::time::timeout(std::time::Duration::from_secs(5), serving).await??;
         assert_eq!(registry.capabilities_of("impostor"), None);
+        Ok(())
+    }
+
+    /// Regression: a connection that never sends `Register` must not be held
+    /// open forever — it's closed once `REGISTER_TIMEOUT` elapses.
+    #[tokio::test(start_paused = true)]
+    async fn a_host_that_never_sends_register_is_disconnected_after_the_timeout() -> anyhow::Result<()> {
+        let allowlist = ExecutorAllowlist::new(["100.64.0.7".parse()?]);
+        let registry = HostRegistry::default();
+        let (client, server) = tokio::io::duplex(4096);
+
+        let serving = tokio::spawn(async move {
+            serve_host_client(Box::new(server), tcp_peer("100.64.0.7"), &allowlist, &registry).await;
+        });
+
+        tokio::time::advance(REGISTER_TIMEOUT + std::time::Duration::from_millis(1)).await;
+        serving.await?; // bounded by the virtual-clock advance above, not real time
+        drop(client);
         Ok(())
     }
 }
