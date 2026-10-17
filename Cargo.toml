@@ -9,7 +9,7 @@ version = "0.1.1"
 authors = ["Tibor Csóka <tibor.csoka@kauki.xyz>"]
 homepage = "https://kauki.xyz/"
 repository = "https://github.com/kauki-labs/sandy"
-license = "MIT"
+license = "AGPL-3.0-only"
 edition = "2024"
 rust-version = "1.85"
 
