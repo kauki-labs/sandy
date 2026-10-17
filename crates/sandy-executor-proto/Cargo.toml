@@ -1,0 +1,34 @@
+[package]
+name = "sandy-executor-proto"
+description = "The orchestrator<->host-client contract (#263): capability-declaring registration and the dispatch RPC, as a protobuf message contract riding sandy-control-proto's length-prefixed framing"
+version = "0.1.1"
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+documentation = "https://docs.rs/sandy-executor-proto"
+keywords = ["protobuf", "prost", "rpc", "daemon", "sandbox"]
+categories = ["encoding", "network-programming"]
+
+[lints]
+workspace = true
+
+[dependencies]
+sandy-control-proto.workspace = true
+prost.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+
+[build-dependencies]
+prost-build.workspace = true
+protox.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+tokio = { workspace = true, features = [
+  "macros",
+  "rt-multi-thread",
+  "io-util",
+] }
