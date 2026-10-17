@@ -67,7 +67,12 @@ is a fresh `0700`, randomly named directory under the validated staging base
 by another user, is now refused where it was accepted before. That includes a
 caller-supplied `RunSpec.secret_dir` (§2) created with a permissive umask (for
 example `0002`): the caller must create it private. Every directory sandy creates
-for secrets is `0700`, so its own flows are unaffected under any umask.
+for secrets is `0700` and every secret `0600`, so its own flows are unaffected
+under any umask: each create site sets the mode on the new entry itself, so even
+a umask that clears the owner's bits (for example `0400`) cannot leave an
+unopenable dir or an unreadable secret (#197, #204). On Linux, correcting a dir
+the umask narrowed goes through `/proc/self/fd`; under a sane umask the new dir
+is already `0700` and `/proc` is not needed.
 
 **Set aside.** Checking the file rather than the directory: another principal who
 can write the directory can swap the file after any check on it.

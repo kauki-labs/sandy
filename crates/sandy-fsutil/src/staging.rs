@@ -76,7 +76,16 @@ pub fn ensure_staging_base_in(parent: &Path) -> Result<PathBuf, FsError> {
     })?;
 
     match mkdirat(&parent_fd, STAGING_DIR_NAME, Mode::RWXU) {
-        Ok(()) => {}
+        // Just created: the umask may have cleared bits from 0700, even the
+        // owner's read bit, which would make it unopenable (#204). An existing
+        // base is never repaired, only validated below.
+        Ok(()) => {
+            if let Err(e) = crate::secret::chmod_new_dir_0700(&parent_fd, std::ffi::OsStr::new(STAGING_DIR_NAME)) {
+                // Best effort: never leave a half-set-up base to block a retry.
+                let _ = rustix::fs::unlinkat(&parent_fd, STAGING_DIR_NAME, rustix::fs::AtFlags::REMOVEDIR);
+                return Err(staging_err("set sandy staging base to 0700", &base, &e));
+            }
+        }
         Err(rustix::io::Errno::EXIST) => {} // already exists — validated below
         Err(e) => return Err(staging_err("create sandy staging base", &base, &e)),
     }
@@ -152,11 +161,18 @@ mod tests {
 
     use super::*;
 
+    /// A `0700` temp dir, whatever the umask, so the fixture never depends on it.
+    fn private_tmp() -> anyhow::Result<tempfile::TempDir> {
+        let tmp = tempfile::TempDir::new().context("tempdir")?;
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).context("chmod tempdir")?;
+        Ok(tmp)
+    }
+
     /// Positive: a clean, self-owned base is created `0700` and the path is
     /// returned.
     #[test]
     fn clean_self_owned_base_is_ok() -> anyhow::Result<()> {
-        let tmp = tempfile::TempDir::new().context("tempdir")?;
+        let tmp = private_tmp()?;
 
         let base = ensure_staging_base_in(tmp.path()).expect("clean base must validate");
 
@@ -165,11 +181,26 @@ mod tests {
         Ok(())
     }
 
+    /// #204: a umask that clears the owner's read bit (0400 makes mkdir's 0700
+    /// into 0300) must not leave a base that cannot be opened.
+    /// The umask is process-wide; nextest runs each test in its own process.
+    #[test]
+    fn a_new_base_survives_a_umask_that_clears_owner_read() -> anyhow::Result<()> {
+        let tmp = private_tmp()?;
+        let previous = rustix::process::umask(Mode::from_raw_mode(0o400));
+        let base = ensure_staging_base_in(tmp.path());
+        rustix::process::umask(previous);
+        let base = base?;
+        let mode = std::fs::metadata(&base).context("stat base")?.permissions().mode() & 0o777;
+        anyhow::ensure!(mode == 0o700, "a created base came out {mode:#o}");
+        Ok(())
+    }
+
     /// Adversarial (CWE-732): a pre-created world-writable base must be
     /// rejected outright — fail closed, not a silent downgrade.
     #[test]
     fn world_writable_existing_base_is_rejected() -> anyhow::Result<()> {
-        let tmp = tempfile::TempDir::new().context("tempdir")?;
+        let tmp = private_tmp()?;
         let base = tmp.path().join("sandy");
         std::fs::create_dir(&base).context("pre-create base")?;
         std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o777)).context("widen perms")?;
@@ -192,7 +223,7 @@ mod tests {
     /// symlink check) if `O_NOFOLLOW` were ever dropped.
     #[test]
     fn symlinked_base_is_rejected() -> anyhow::Result<()> {
-        let tmp = tempfile::TempDir::new().context("tempdir")?;
+        let tmp = private_tmp()?;
         let attacker_dir = tmp.path().join("attacker-controlled");
         std::fs::create_dir(&attacker_dir).context("create attacker dir")?;
         std::fs::set_permissions(&attacker_dir, std::fs::Permissions::from_mode(0o700))
@@ -241,7 +272,7 @@ mod tests {
     /// fail closed with a named reason, before trusting anything created under it.
     #[test]
     fn world_writable_nonsticky_parent_is_rejected() -> anyhow::Result<()> {
-        let tmp = tempfile::TempDir::new().context("tempdir")?;
+        let tmp = private_tmp()?;
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o777))
             .context("make parent world-writable, non-sticky")?;
 
@@ -258,7 +289,7 @@ mod tests {
     /// `01777`) is trusted — the base is created and validated under it as usual.
     #[test]
     fn world_writable_sticky_parent_is_ok() -> anyhow::Result<()> {
-        let tmp = tempfile::TempDir::new().context("tempdir")?;
+        let tmp = private_tmp()?;
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o1777))
             .context("make parent sticky world-writable")?;
 

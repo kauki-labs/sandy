@@ -99,8 +99,6 @@ impl OwnedDir {
         // The umask may have cleared bits from 0700, even the owner's read bit,
         // which would make the dir unopenable. Set 0700 on the entry just made,
         // never following a link swapped in since, then open and validate it.
-        // create_private_dir, the staging base and write_0600_at do not follow
-        // this pattern yet; #204 aligns them.
         let secured = chmod_new_dir_0700(&parent_fd, name)
             .map_err(|e| FsError::io("set created dir to 0700", path, e))
             .and_then(|()| Self::open(path));
@@ -120,7 +118,8 @@ impl OwnedDir {
     ///
     /// An existing entry at `name` (a directory, a file, a symlink) is an error,
     /// never reused: a pre-created entry may belong to someone else. The mode is
-    /// set to `0700` on the opened handle, so the umask cannot widen it.
+    /// set to `0700` before it is opened, so no umask can narrow it into an
+    /// unopenable dir or widen it.
     ///
     /// # Errors
     ///
@@ -129,6 +128,20 @@ impl OwnedDir {
     pub fn create_private_dir(&self, name: &str) -> Result<Self, FsError> {
         let path = self.path.join(name);
         rustix::fs::mkdirat(&self.handle, name, Mode::RWXU).map_err(|e| FsError::io("create private dir", &path, e))?;
+        // As in open_or_create: the umask may have cleared the owner's read bit.
+        let secured = chmod_new_dir_0700(&self.handle, std::ffi::OsStr::new(name))
+            .map_err(|e| FsError::io("set private dir to 0700", &path, e))
+            .and_then(|()| self.open_created_dir(name, path));
+        if secured.is_err() {
+            // Best effort: never leave a half-set-up dir behind.
+            let _ = rustix::fs::unlinkat(&self.handle, name, AtFlags::REMOVEDIR);
+        }
+        secured
+    }
+
+    /// Open the dir `name` just created in this one, pin it to `0700`, and
+    /// validate it as this user's.
+    fn open_created_dir(&self, name: &str, path: PathBuf) -> Result<Self, FsError> {
         let handle = rustix::fs::openat(
             &self.handle,
             name,
@@ -224,9 +237,10 @@ fn unique_suffix() -> io::Result<String> {
 /// Set the dir `name` under `parent` to `0700` without following a symlink at
 /// `name`. Linux has no no-follow `fchmodat`, so pin the entry with
 /// `O_PATH | O_NOFOLLOW` (which needs no read permission) and chmod that inode
-/// through `/proc/self/fd`, as glibc does.
+/// through `/proc/self/fd`, as glibc does. An entry already `0700` (any sane
+/// umask) is left alone, so only a hostile umask needs `/proc`.
 #[cfg(target_os = "linux")]
-fn chmod_new_dir_0700(parent: &std::os::fd::OwnedFd, name: &std::ffi::OsStr) -> rustix::io::Result<()> {
+pub(crate) fn chmod_new_dir_0700(parent: impl std::os::fd::AsFd, name: &std::ffi::OsStr) -> rustix::io::Result<()> {
     use std::os::fd::AsRawFd;
     let pinned = rustix::fs::openat(
         parent,
@@ -234,19 +248,23 @@ fn chmod_new_dir_0700(parent: &std::os::fd::OwnedFd, name: &std::ffi::OsStr) -> 
         OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )?;
+    if rustix::fs::fstat(&pinned)?.st_mode & 0o7777 == 0o700 {
+        return Ok(());
+    }
     rustix::fs::chmod(format!("/proc/self/fd/{}", pinned.as_raw_fd()).as_str(), Mode::RWXU)
 }
 
 /// Set the dir `name` under `parent` to `0700` without following a symlink at
 /// `name`; fails closed where no-follow chmod is unsupported.
 #[cfg(not(target_os = "linux"))]
-fn chmod_new_dir_0700(parent: &std::os::fd::OwnedFd, name: &std::ffi::OsStr) -> rustix::io::Result<()> {
+pub(crate) fn chmod_new_dir_0700(parent: impl std::os::fd::AsFd, name: &std::ffi::OsStr) -> rustix::io::Result<()> {
     rustix::fs::chmodat(parent, name, Mode::RWXU, AtFlags::SYMLINK_NOFOLLOW)
 }
 
 /// Create `name` in `dir` as a new `0600` file holding `bytes`, synced to disk.
 /// `O_EXCL` with `O_NOFOLLOW` refuses anything already there, including a planted
-/// symlink.
+/// symlink. The mode is set on the new fd too: a umask can only narrow `0600`,
+/// but clearing the owner's read bit would leave a secret its owner cannot read.
 fn write_0600_at(dir: &File, name: &str, bytes: &[u8]) -> io::Result<()> {
     let fd = rustix::fs::openat(
         dir,
@@ -254,6 +272,7 @@ fn write_0600_at(dir: &File, name: &str, bytes: &[u8]) -> io::Result<()> {
         OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::from_raw_mode(0o600),
     )?;
+    rustix::fs::fchmod(&fd, Mode::from_raw_mode(0o600))?;
     let mut file = File::from(fd);
     file.write_all(bytes)?;
     file.sync_all()
@@ -317,9 +336,11 @@ mod tests {
     #[test]
     fn a_symlink_planted_at_the_destination_never_touches_its_target() -> anyhow::Result<()> {
         let dir = staging_dir()?;
-        let victim_dir = tempfile::tempdir()?;
+        let victim_dir = staging_dir()?;
         let victim = victim_dir.path().join("id_ed25519");
         fs::write(&victim, b"private key")?;
+        // Readable back whatever the umask.
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o600))?;
         symlink(&victim, dir.path().join("S"))?;
         let path = OwnedDir::open(dir.path())?.write_secret("S", b"secret")?;
         anyhow::ensure!(
@@ -427,6 +448,65 @@ mod tests {
         opened?;
         let mode = fs::metadata(&path)?.permissions().mode() & 0o777;
         anyhow::ensure!(mode == 0o700, "a created dir came out {mode:o}");
+        Ok(())
+    }
+
+    /// #204: under a umask that clears the owner's read bit, a private dir is
+    /// still made 0700 and opened, and a secret is still written 0600 and
+    /// readable by its owner (0400 would otherwise leave 0300 and 0200).
+    /// The umask is process-wide; nextest runs each test in its own process.
+    #[test]
+    fn a_private_dir_and_its_secret_survive_a_umask_that_clears_owner_read() -> anyhow::Result<()> {
+        let dir = staging_dir()?;
+        let parent = OwnedDir::open(dir.path())?;
+        let previous = rustix::process::umask(Mode::from_raw_mode(0o400));
+        let staged = parent
+            .create_private_dir("cred")
+            .and_then(|created| created.write_secret("TOKEN", b"token").map(|path| (created, path)));
+        rustix::process::umask(previous);
+        let (created, secret) = staged?;
+        let mode = fs::metadata(created.path())?.permissions().mode() & 0o777;
+        anyhow::ensure!(mode == 0o700, "a private dir came out {mode:o}");
+        let mode = fs::metadata(&secret)?.permissions().mode() & 0o777;
+        anyhow::ensure!(mode == 0o600, "a secret came out {mode:o}");
+        anyhow::ensure!(fs::read(&secret)? == b"token", "the secret is not readable back");
+        Ok(())
+    }
+
+    /// Review of #204: under a sane umask a new dir is already 0700, so the
+    /// /proc-based chmod is skipped and a host without /proc keeps working. The
+    /// inode's ctime shows it: any chmod updates it, even to the same mode.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_dir_already_0700_is_not_chmodded() -> anyhow::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let dir = staging_dir()?;
+        fs::create_dir(dir.path().join("d"))?;
+        fs::set_permissions(dir.path().join("d"), fs::Permissions::from_mode(0o700))?;
+        let before = fs::symlink_metadata(dir.path().join("d"))?;
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let parent = rustix::fs::open(dir.path(), OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())?;
+        chmod_new_dir_0700(&parent, std::ffi::OsStr::new("d"))?;
+        let after = fs::symlink_metadata(dir.path().join("d"))?;
+        anyhow::ensure!(
+            (after.ctime(), after.ctime_nsec()) == (before.ctime(), before.ctime_nsec()),
+            "a dir already 0700 was chmodded anyway"
+        );
+        Ok(())
+    }
+
+    /// #204: the secret file alone, in a dir made before the umask changed.
+    /// The umask is process-wide; nextest runs each test in its own process.
+    #[test]
+    fn a_secret_is_0600_under_a_umask_that_clears_owner_read() -> anyhow::Result<()> {
+        let dir = staging_dir()?;
+        let parent = OwnedDir::open(dir.path())?;
+        let previous = rustix::process::umask(Mode::from_raw_mode(0o400));
+        let secret = parent.write_secret("TOKEN", b"token");
+        rustix::process::umask(previous);
+        let secret = secret?;
+        let mode = fs::metadata(&secret)?.permissions().mode() & 0o777;
+        anyhow::ensure!(mode == 0o600, "a secret came out {mode:o}");
         Ok(())
     }
 
