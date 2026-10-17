@@ -527,8 +527,9 @@ impl LinkAgent {
     }
 
     /// How many peer deliveries were dropped because the inbox was full. A
-    /// delivery that arrives while the inbox is full is dropped; what is kept
-    /// stays in order, and a rise in this count between reads marks a gap.
+    /// delivery that arrives while the inbox is full is dropped and what is kept
+    /// stays in order; a rise in this count says deliveries were lost, not where
+    /// they fell among the kept ones.
     #[must_use]
     pub fn peer_dropped(&self) -> u64 {
         self.peer_dropped.load(std::sync::atomic::Ordering::SeqCst)

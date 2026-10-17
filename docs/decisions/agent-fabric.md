@@ -318,9 +318,10 @@ job holding it could post as the agent.
   agent's own posts come back like any member's. The agent's peer inbox
   (`LinkAgent::take_peer_inbox`) is bounded and drops any delivery that arrives
   while it is full; what it keeps stays in order, and every drop is counted
-  (`LinkAgent::peer_dropped`) and logged, so a gap is observable, never silent.
-  Once the inbox drains, newer deliveries are accepted again, so a drop can sit
-  between two kept messages; a rise in the count between reads marks it. The sender is not told; its post is durable on the
+  (`LinkAgent::peer_dropped`) and logged, so a loss is observable, never silent.
+  The count says that deliveries were dropped and how many, not where they fell
+  among the kept messages: once the inbox drains, newer deliveries are accepted
+  again, so kept messages need not be consecutive. The sender is not told; its post is durable on the
   channel. In v1 membership is fixed for
   the run: sandyd mints each peer cap at dispatch, and a sandbox cannot be added
   to a group mid-run; dynamic invite (`CapRights.invite`) is a later slice.
