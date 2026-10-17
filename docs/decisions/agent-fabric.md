@@ -330,7 +330,9 @@ job holding it could post as the agent.
   not a secret: the caps stay in the agent). One request per connection, as
   newline-delimited JSON: `send` posts through the agent, which refuses a channel
   it did not join (the relay checks again), and `recv` drains the inbox with its
-  drop count (`wait` blocks for one message). One `recv` and one `send` at a
+  drop count (`wait` blocks for one message, and ends if the client goes away).
+  A drain returns what fits in one reply line and keeps the rest, in order, for
+  the next `recv`. One `recv` and one `send` at a
   time, independently, so a long-polling recv never starves a send; a second
   concurrent recv is closed unanswered (delivery stays unambiguous), and the
   `sandy-agent peer send|recv` helper retries briefly. Stdio framing (it collides with TTY) and an inherited fd (it

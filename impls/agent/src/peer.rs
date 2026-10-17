@@ -7,9 +7,11 @@
 //!
 //! One request per connection, one newline-terminated JSON line each way:
 //! `send` posts one message, `recv` drains the inbox (`wait` blocks for at least
-//! one message) and reports how many deliveries the full inbox dropped. One
-//! client at a time: a connection that arrives while another is open is closed
-//! at once, and the client helper retries briefly.
+//! one message) and reports how many deliveries the full inbox dropped. A drain
+//! returns what fits in one reply line and keeps the rest for the next `recv`.
+//! One `send` and one `recv` at a time, independently: a request whose slot is
+//! held is closed unanswered after its line is read, and the client helper
+//! retries briefly.
 
 use std::{
     future::Future,
@@ -108,7 +110,7 @@ pub trait PeerPort: Send + Sync + 'static {
 
 /// Serve the job's peer requests on `listener` until it is dropped.
 pub async fn serve_peers<P: PeerPort>(listener: UnixListener, port: Arc<P>, inbox: Receiver<PeerDelivery>) {
-    let inbox = Arc::new(Mutex::new(inbox));
+    let inbox = Arc::new(Mutex::new(Inbox { rx: inbox, held: None }));
     let slots = Arc::new(Slots::default());
     loop {
         let conn = match listener.accept().await {
@@ -145,6 +147,36 @@ impl Drop for SlotGuard<'_> {
     }
 }
 
+/// Room in a reply line for everything but the messages.
+const REPLY_OVERHEAD: usize = 256;
+
+/// The peer inbox, plus the message a full reply held back for the next `recv`.
+struct Inbox {
+    rx: Receiver<PeerDelivery>,
+    held: Option<Message>,
+}
+
+impl Inbox {
+    /// Oldest first, as many as fit in `budget` bytes of reply; the first that
+    /// does not fit is held for the next drain. One message always goes out: a
+    /// link frame is at most 1 MiB, so it fits a reply line on its own.
+    fn drain(&mut self, budget: usize) -> Vec<Message> {
+        let mut messages = Vec::new();
+        let mut used = 0_usize;
+        while let Some(next) = self.held.take().or_else(|| self.rx.try_recv().ok().map(message)) {
+            // The encoded size plus its separating comma.
+            let size = serde_json::to_vec(&next).map_or(usize::MAX, |v| v.len().saturating_add(1));
+            if !messages.is_empty() && used.saturating_add(size) > budget {
+                self.held = Some(next);
+                break;
+            }
+            used = used.saturating_add(size);
+            messages.push(next);
+        }
+        messages
+    }
+}
+
 /// How long a connection may take to send its request line.
 const REQUEST_WAIT: Duration = Duration::from_secs(10);
 
@@ -153,7 +185,7 @@ const REQUEST_WAIT: Duration = Duration::from_secs(10);
 async fn handle<P: PeerPort>(
     conn: tokio::net::UnixStream,
     port: &P,
-    inbox: &Mutex<Receiver<PeerDelivery>>,
+    inbox: &Mutex<Inbox>,
     slots: &Slots,
 ) -> io::Result<()> {
     let (rd, mut wr) = conn.into_split();
@@ -192,15 +224,18 @@ async fn handle<P: PeerPort>(
         },
         Ok(Request::Recv { wait }) => {
             let mut inbox = inbox.lock().await;
-            let mut messages = Vec::new();
-            if wait && let Some(first) = inbox.recv().await {
-                messages.push(message(first));
-            }
-            while let Ok(next) = inbox.try_recv() {
-                messages.push(message(next));
+            if wait && inbox.held.is_none() {
+                // Watch the connection while waiting: a client that went away
+                // (or sent more) ends the wait, so it neither keeps the recv
+                // slot nor takes the next message with it.
+                let mut probe = [0_u8; 1];
+                tokio::select! {
+                    first = inbox.rx.recv() => inbox.held = first.map(message),
+                    _ = reader.read(&mut probe) => return Ok(()),
+                }
             }
             Reply::Messages {
-                messages,
+                messages: inbox.drain(MAX_LINE - REPLY_OVERHEAD),
                 dropped: port.dropped(),
             }
         }
