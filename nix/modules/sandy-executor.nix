@@ -117,9 +117,15 @@ in
     # rather than risking the `services.logind.settings` module's single
     # merged value silently replacing it (security review, #299/sandy-73).
     # Never assign an empty value here: that RESETS the accumulated list.
+    #
+    # `root` is included explicitly: an unset `KillExcludeUsers` implicitly
+    # excludes root, but this drop-in's own assignment overrides that
+    # default rather than adding to it (CodeRabbit, #299) — dropping `root`
+    # here would let `KillUserProcesses=yes` kill root's session processes
+    # on logout where it previously didn't.
     environment.etc."systemd/logind.conf.d/50-sandy-executor.conf".text = ''
       [Login]
-      KillExcludeUsers=${username}
+      KillExcludeUsers=root ${username}
     '';
 
     # What `loginctl enable-linger sandy-executor` itself writes: keeps this

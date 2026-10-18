@@ -79,7 +79,8 @@ nix-env --profile /nix/var/nix/profiles/system --switch-generation <n>
   `orchestrator` for this to succeed; against an unreachable one it exits
   non-zero and `Restart = on-failure` cycles it every 5s.
 - `journalctl -b -f` on first start, NOT `journalctl -u sandy-executor -f`:
-  `PAMName = "login"` makes logind open a real session for the process (the
+  `PAMName = "sandy-executor"` (a minimal PAM service, not the interactive
+  `login` stack) makes logind open a real session for the process (the
   wiring that gives `systemd-run --user` a reachable user instance), and
   logind re-parents the process into that session's own scope unit rather
   than `sandy-executor.service`'s cgroup — so the process's own stdout never
