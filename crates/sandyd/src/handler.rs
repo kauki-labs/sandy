@@ -265,6 +265,17 @@ pub async fn handle(
                     // if a late stream later presents this job's token.
                     tracing::info!(job_id = %cancel.job_id, "cancel: invalidating any unclaimed remote link");
                     registry.invalidate_remote_link(&cancel.job_id);
+                    // CAUTION (decision 12, reachable since #298/#301 - #298
+                    // is the first real send_dispatch caller): this only
+                    // stops a late agent-link stream from claiming the run.
+                    // If the job's Dispatch already reached the host-client
+                    // (running, or still queued behind another job under
+                    // decision 14's sequential processing), nothing retracts
+                    // it - there is no Cancel/Stop OrchestratorMessage. The
+                    // host-side process starts or keeps running regardless.
+                    // Confirmed intentionally deferred past M2 (decision 12):
+                    // a future Cancel/Stop message is an additive oneof
+                    // variant.
                     control_response::Result::Cancel(CancelResponse {})
                 }
                 CancelOutcome::NotFound => control_response::Result::Error(ControlError {
