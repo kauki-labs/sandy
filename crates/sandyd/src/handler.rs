@@ -190,7 +190,7 @@ pub async fn handle(
                             forward_back: forward_back.to_string(),
                             required_isolation_class: STAGE1_REQUIRED_ISOLATION_CLASS.into(),
                         };
-                        Some((candidate.host_id, dispatch))
+                        Some((candidate.host_id, candidate.registration, dispatch))
                     }
                     Err(e) => {
                         // The OS RNG is unavailable — vanishingly rare, and
@@ -210,13 +210,19 @@ pub async fn handle(
             tokio::task::spawn_blocking(move || store.insert_pending(&inserted_id, &manifest, &encoding)).await??;
             registry.insert(job_id.clone(), job_channel);
 
-            if let Some((host_id, dispatch)) = dispatch_plan {
+            if let Some((host_id, registration, dispatch)) = dispatch_plan {
                 // Best-effort: the job is already durably submitted above,
                 // so a failed dispatch (e.g. the host disconnected between
                 // being picked and this send — a narrow TOCTOU) leaves it
                 // Pending rather than failing Submit for a placement
                 // decision the caller never asked to observe directly.
-                if let Err(e) = host_registry.send_dispatch(&host_id, dispatch).await {
+                // `send_dispatch_if_current` (not plain `send_dispatch`)
+                // refuses if `host_id` has since been reclaimed by a
+                // different connection than the one actually picked.
+                if let Err(e) = host_registry
+                    .send_dispatch_if_current(&host_id, registration, dispatch)
+                    .await
+                {
                     tracing::warn!(error = %e, job_id, host_id, "could not dispatch the placed job to its host");
                 }
             }
