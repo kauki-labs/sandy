@@ -328,3 +328,38 @@ The credential refresh tests additionally need `SANDY_REFRESH_MARGIN_SECS` +
 `SANDY_REFRESH_TICK_SECS` set to force a mid-run refresh (they refuse on defaults,
 INV-S9). The real-App adapter tests need a registered trust root
 (`SANDY_CRED_LIVE_TRUST_ROOT`) and are operator-gated.
+
+## Test discipline: functional red before green
+
+A compile-red → green transition proves nothing on its own: a test that only
+fails because the API doesn't exist yet (a compile error, or a stub panicking
+on `unimplemented!()`) hasn't exercised any behavior, so making it pass by
+filling in the implementation never demonstrated the test would catch a
+regression.
+
+- **Compile-red is a valid _first_ red for an absent boundary.** A test against
+  a function, trait, or wire type that doesn't exist yet fails to build, or
+  builds and panics on `unimplemented!()`. That's the correct starting point
+  when the contract itself hasn't landed.
+- **Once the signature exists, red must become functional before green.**
+  Iterate the test against a stub or a deliberately wrong implementation until
+  it fails for a real reason — an assertion comparing actual behavior, not a
+  missing symbol or a panic from an empty body. Only then make it pass.
+- **ATDD outer loop, TDD inner loop.** An acceptance test starts red-for-
+  absent-contract (the seam isn't built yet), then functional-red at the
+  contract boundary once it is. Each slice inside that loop gets its own
+  functional-red before its own green.
+- **Record the functional red.** A comment, or a mutation/stub note, in the
+  test (or its commit) states what it failed on before passing, so a reviewer
+  — human or bot — can tell a real regression test from one that went straight
+  from "doesn't compile" to "passes."
+
+**Example (#272).** `live_m2_cross_machine.rs` scaffolded its two tests as
+deliberately `unimplemented!()`-bodied, since `sandy-executor-proto` (#263)
+hadn't landed yet when it was written — that panic was the valid first red for
+a contract that didn't exist. Once the crate landed and the bodies got filled
+in for real, the discipline required one more step before green: each test had
+to first fail on its own assertion (the cross-machine peer-message exchange
+didn't happen, or happened wrong) against a stub or partial implementation,
+proving the test would actually catch that failure — not jump straight from
+`unimplemented!()` to a passing run.
