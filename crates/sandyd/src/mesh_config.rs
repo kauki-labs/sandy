@@ -57,7 +57,12 @@ pub fn parse_mesh_listen_addr(value: Option<&str>) -> Result<Option<SocketAddr>,
     let addr: SocketAddr = value
         .parse()
         .map_err(|_| MeshConfigError::InvalidListenAddr(value.to_owned()))?;
-    if addr.ip().is_unspecified() {
+    // to_canonical() unmaps an IPv4-mapped IPv6 address (`::ffff:0.0.0.0`)
+    // down to plain IPv4 (`0.0.0.0`) before the check — is_unspecified()
+    // alone misses that form, and under Linux dual-stack (bindv6only=0) it
+    // binds IPv4 INADDR_ANY, every interface, same D5 hole as 0.0.0.0/::
+    // directly. Same canonicalization ExecutorAllowlist already applies.
+    if addr.ip().to_canonical().is_unspecified() {
         return Err(MeshConfigError::UnspecifiedListenAddr(value.to_owned()));
     }
     Ok(Some(addr))
@@ -138,6 +143,21 @@ mod tests {
         assert_eq!(
             parse_mesh_listen_addr(Some("[::]:7700")),
             Err(MeshConfigError::UnspecifiedListenAddr("[::]:7700".to_owned()))
+        );
+    }
+
+    /// Adversarial (sandy-73): the IPv4-mapped unspecified form
+    /// (`::ffff:0.0.0.0`) bypasses a bare `is_unspecified()` check — under
+    /// Linux dual-stack (bindv6only=0) it binds IPv4 `INADDR_ANY`, every
+    /// interface, the same D5 hole as `0.0.0.0` directly. Canonicalizing
+    /// before the check closes it.
+    #[test]
+    fn an_ipv4_mapped_unspecified_listen_addr_is_refused() {
+        assert_eq!(
+            parse_mesh_listen_addr(Some("[::ffff:0.0.0.0]:7700")),
+            Err(MeshConfigError::UnspecifiedListenAddr(
+                "[::ffff:0.0.0.0]:7700".to_owned()
+            ))
         );
     }
 
