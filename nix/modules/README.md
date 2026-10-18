@@ -62,8 +62,14 @@ nixos-rebuild switch --flake .#<host>
 ```
 
 Keep the prior generation's number handy (`nixos-rebuild list-generations`)
-to roll back (`nixos-rebuild switch --rollback`, or
-`--switch-generation <n>`) if anything looks wrong post-switch.
+to roll back if anything looks wrong post-switch, with `nixos-rebuild switch
+--rollback`. To select a specific generation `<n>` instead:
+`--switch-generation` is a `nix-env` operation, not a `nixos-rebuild` flag.
+
+```bash
+nix-env --profile /nix/var/nix/profiles/system --switch-generation <n>
+/nix/var/nix/profiles/system/bin/switch-to-configuration switch
+```
 
 ## After switch
 
