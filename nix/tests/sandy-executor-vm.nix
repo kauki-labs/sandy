@@ -48,11 +48,20 @@ testPkgs.testers.runNixOSTest {
         hostId = "test-host";
       };
 
-      # #300(b) proof: a short StopIdleSessionSec (set here, NOT in the
-      # module — that's ws01-specific risk, not something this module
-      # should impose on a consuming host) would tear down an idle,
-      # TTY-less logind session well within this test's runtime if the
-      # module's KillExcludeUsers drop-in didn't protect it.
+      # #300(b): a short StopIdleSessionSec, set here (NOT in the module —
+      # that's ws01-specific risk, not something this module should impose
+      # on a consuming host). NOTE this does not actually exercise
+      # KillExcludeUsers: confirmed (sandy-73, #299) that `StopIdleSessionSec`
+      # never fires against a TTY-less/no-display session in the first
+      # place, and `KillUserProcesses` defaults to `false` on NixOS, under
+      # which logind kills nothing on session end regardless of the exclude
+      # list. What actually keeps a dispatched job alive is lingering
+      # (`users.users.${username}.linger`, written as a tmpfiles marker
+      # below) keeping `user@<uid>.service` running independent of any
+      # login session — jobs run under `user@.service`'s own cgroup via
+      # `systemd-run --user`, never under `session-N.scope`. Kept here as a
+      # smoke check (it still shouldn't regress); a real session-survival
+      # assertion is tracked separately, #302.
       services.logind.settings.Login.StopIdleSessionSec = 2;
 
       # A probe unit that reuses `sandy-executor.service`'s EXACT
@@ -102,9 +111,9 @@ testPkgs.testers.runNixOSTest {
               # sandy-73 + infra-f3: a silent confines_filesystem=false
               # flip must not stay green).
               text = ''
+                # shellcheck disable=SC2016 # the $(...) is meant for the nested `sh -c`, not this script
                 systemd-run --user --scope -p Delegate=yes -- \
-                  bwrap --ro-bind / / --dev /dev --tmpfs /tmp --unshare-all --share-net -- \
-                  /run/current-system/sw/bin/echo confined-ok
+                  sh -c 'echo "job-cgroup: $(cat /proc/self/cgroup)"; exec bwrap --ro-bind / / --dev /dev --tmpfs /tmp --unshare-all --share-net -- /run/current-system/sw/bin/echo confined-ok'
               '';
             }) "sandy-executor-probe-run";
           };
@@ -215,22 +224,35 @@ testPkgs.testers.runNixOSTest {
         f"directive may have silently broken containment's confines_filesystem "
         f"path — journal:\n{probe_output}"
     )
+    # Names the real survival mechanism directly (sandy-73, #299): a
+    # dispatched job's cgroup must be under user@<uid>.service, not
+    # session-N.scope — that's what lingering actually keeps alive
+    # independent of any login session, not KillExcludeUsers. Read BEFORE
+    # bwrap, inside the systemd-run --user scope: bwrap's --unshare-all
+    # includes --unshare-cgroup, which would make /proc/self/cgroup read
+    # "0::/" from inside the new namespace and wrongly fail this check
+    # even when the real cgroup placement is correct (sandy-73, #299).
+    cgroup_line = next(line for line in probe_output.splitlines() if line.startswith("job-cgroup: "))
+    assert "user@" in cgroup_line and "session-" not in cgroup_line, (
+        f"the probed job did not run under user@.service's cgroup as "
+        f"expected: {cgroup_line}"
+    )
 
-    # #300(b) proof: with StopIdleSessionSec=2 set on this node and no
-    # KillExcludeUsers protection, logind would tear the executor's idle,
-    # TTY-less session down well within this sleep — re-checking containment
-    # afterward (not just the unit's transient active/activating state,
-    # which legitimately cycles every RestartSec against the unreachable
-    # orchestrator) is what actually proves the session, not just the
-    # process, survived: a killed session makes systemd-run --user
-    # unreachable again, which would show up as a FRESH "cannot declare any
-    # capability" line the module's drop-in is meant to prevent.
+    # #300(b) smoke check: with StopIdleSessionSec=2 set on this node, wait
+    # past it and re-check containment. This does NOT prove KillExcludeUsers
+    # is doing anything (confirmed, sandy-73, #299: StopIdleSessionSec never
+    # fires on this TTY-less session, and KillUserProcesses defaults to
+    # `false` anyway, so the exclude list is inert defense-in-depth here,
+    # not active protection). What actually keeps a dispatched job alive
+    # past this window is lingering keeping `user@<uid>.service` running
+    # independent of any login session. A real assertion of that survival
+    # path is tracked separately, #302; this block stays as a basic
+    # "nothing regressed" check.
     machine.sleep(5)
     journal_after_idle_window = machine.succeed("journalctl -b -o cat --no-pager")
     assert "cannot declare any capability" not in journal_after_idle_window, (
-        f"containment broke after the StopIdleSessionSec window — the "
-        f"KillExcludeUsers drop-in did not protect the session — journal:\n"
-        f"{journal_after_idle_window}"
+        f"containment broke after the StopIdleSessionSec window — "
+        f"journal:\n{journal_after_idle_window}"
     )
   '';
 }

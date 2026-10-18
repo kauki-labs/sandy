@@ -105,18 +105,24 @@ in
       startSession = true;
     };
 
-    # #300(b): a short `StopIdleSessionSec` on this host (if ws01's own
-    # config ever sets one for other accounts) would tear down this service's
-    # logind session as "idle" regardless of lingering — lingering only
-    # restarts the user instance after a *clean* logout, not an
-    # idle-timeout kill mid-run; `KillUserProcesses` would do the same on
-    # session end. A drop-in, not `services.logind.settings`, because
-    # `KillExcludeUsers` is a list-valued logind.conf key that ACCUMULATES
-    # across drop-in files (systemd's own conf.d semantics) — this adds
-    # `sandy-executor` to whatever ws01's own logind.conf.d already excludes,
-    # rather than risking the `services.logind.settings` module's single
-    # merged value silently replacing it (security review, #299/sandy-73).
-    # Never assign an empty value here: that RESETS the accumulated list.
+    # #300(b): defense-in-depth, inert under the default
+    # `KillUserProcesses=false` (confirmed, sandy-73/#299 — NixOS defaults it
+    # to `false`, under which logind kills nothing on session end regardless
+    # of this list, and `StopIdleSessionSec` doesn't fire on this TTY-less
+    # session anyway). What actually keeps a dispatched job alive is
+    # lingering keeping `user@<uid>.service` running independent of any
+    # login session (see nix/tests/sandy-executor-vm.nix's job-cgroup
+    # assertion, and tracking issue #302 for the one open gap: if ws01 ever
+    # sets `StopIdleSessionSec` itself, protection is logind's no-TTY idle
+    # model, not this drop-in). Kept anyway in case ws01's own config ever
+    # turns `KillUserProcesses` on for other accounts — a drop-in, not
+    # `services.logind.settings`, because `KillExcludeUsers` is a
+    # list-valued logind.conf key that ACCUMULATES across drop-in files
+    # (systemd's own conf.d semantics) — this adds `sandy-executor` to
+    # whatever ws01's own logind.conf.d already excludes, rather than
+    # risking the `services.logind.settings` module's single merged value
+    # silently replacing it (security review, #299/sandy-73). Never assign
+    # an empty value here: that RESETS the accumulated list.
     #
     # `root` is included explicitly: an unset `KillExcludeUsers` implicitly
     # excludes root, but this drop-in's own assignment overrides that
