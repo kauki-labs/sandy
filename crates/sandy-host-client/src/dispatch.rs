@@ -254,6 +254,8 @@ pub fn handle_dispatch(
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context;
+
     use super::*;
 
     fn available(isolates_untrusted: bool) -> ContainmentStatus {
@@ -388,10 +390,10 @@ mod tests {
     /// anyway — stage 1 only ever runs `Process` (CodeRabbit finding on
     /// #284: the field was decoded but never checked).
     #[tokio::test]
-    async fn handle_dispatch_refuses_a_backend_this_host_does_not_run() {
+    async fn handle_dispatch_refuses_a_backend_this_host_does_not_run() -> anyhow::Result<()> {
         let dispatch = sandy_executor_proto::Dispatch {
             job_id: "job-1".to_string(),
-            manifest: serde_json::to_vec(&["echo"]).expect("static manifest always encodes"),
+            manifest: serde_json::to_vec(&["echo"]).context("encoding the static test manifest")?,
             manifest_encoding: MANIFEST_ENCODING_ARGV_V1.to_string(),
             backend: sandy_executor_proto::SandboxKind::Vm.into(),
             link_token: vec![0u8; REMOTE_LINK_TOKEN_LEN],
@@ -408,16 +410,17 @@ mod tests {
                 if backend == i32::from(sandy_executor_proto::SandboxKind::Vm)),
             "expected UnsupportedBackend, got {err:?}"
         );
+        Ok(())
     }
 
     /// Adversarial: a `link_token` that isn't exactly `REMOTE_LINK_TOKEN_LEN`
     /// bytes must be refused, never silently truncated or padded into a
     /// prefix the orchestrator's accept loop would then decode wrong.
     #[tokio::test]
-    async fn handle_dispatch_refuses_a_malformed_link_token_length() {
+    async fn handle_dispatch_refuses_a_malformed_link_token_length() -> anyhow::Result<()> {
         let dispatch = sandy_executor_proto::Dispatch {
             job_id: "job-1".to_string(),
-            manifest: serde_json::to_vec(&["echo"]).expect("static manifest always encodes"),
+            manifest: serde_json::to_vec(&["echo"]).context("encoding the static test manifest")?,
             manifest_encoding: MANIFEST_ENCODING_ARGV_V1.to_string(),
             backend: sandy_executor_proto::SandboxKind::Process.into(),
             link_token: vec![0u8; REMOTE_LINK_TOKEN_LEN - 1],
@@ -433,5 +436,6 @@ mod tests {
             matches!(err, HandleDispatchError::InvalidLinkTokenLength(len) if len == REMOTE_LINK_TOKEN_LEN - 1),
             "expected InvalidLinkTokenLength, got {err:?}"
         );
+        Ok(())
     }
 }
