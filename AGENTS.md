@@ -240,3 +240,8 @@ repo's own setup, not general git advice.
 - **`start_paused` + a real I/O op (e.g. a real TCP dial) is flaky for timeout
   tests.** The virtual clock races the real connect; use real short durations
   instead of pairing a virtual clock with genuine I/O.
+- **`autoMergeRequest` is null for a PR in the merge queue.** It's GitHub's
+  separate native auto-merge feature; `gh pr merge --auto` enqueueing into the
+  merge queue returns silent on success and never sets it. Check
+  `mergeQueueEntry { state position }` via the GraphQL API to tell `QUEUED`
+  from genuinely unenqueued, not `autoMergeRequest`.
