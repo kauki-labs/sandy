@@ -29,6 +29,13 @@ const REGISTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10)
 /// A `PeerAddr::Uds` peer is refused outright — a host-client only ever
 /// connects over the mesh (`PeerAddr::Tcp`), so a UDS peer here would be a
 /// caller bug, not a registration this code should entertain.
+///
+/// CAUTION (#289): every `write_frame` call below, including the refusal
+/// writes before registration, has no deadline. A peer that stops reading
+/// after opening a connection can stall one of these indefinitely — see the
+/// inline notes at each site and at the connection loop's own `write_frame`
+/// for the specific consequence each one has. All are deliberately deferred
+/// to #289, not fixed here.
 pub async fn serve_host_client(
     mut conn: Box<dyn Conn>,
     peer: PeerAddr,
@@ -73,6 +80,8 @@ pub async fn serve_host_client(
     // of what else is or isn't in its `Register` frame.
     if !allowlist.permits(peer_ip) {
         tracing::warn!(peer = %peer_ip, host_id, "Register refused: not a permitted executor host");
+        // #289: no deadline — a non-reading peer stalls this task, but the
+        // connection slot is the only cost (no registry entry exists yet).
         let _ = write_frame(
             &mut conn,
             &OrchestratorMessage {
@@ -89,6 +98,7 @@ pub async fn serve_host_client(
         Some(capabilities) => capabilities,
         None => {
             tracing::warn!(peer = %peer_ip, host_id, "Register carried no capabilities; refusing");
+            // #289: same undeadlined write as the allowlist refusal above.
             let _ = write_frame(
                 &mut conn,
                 &OrchestratorMessage {
@@ -110,6 +120,7 @@ pub async fn serve_host_client(
             // (D5's Register-authentication ruling, #263) — refused and
             // logged, never more than "no" back.
             tracing::warn!(peer = %peer_ip, host_id, error = %e, "Register refused: host_id already claimed");
+            // #289: same undeadlined write as the allowlist refusal above.
             let _ = write_frame(
                 &mut conn,
                 &OrchestratorMessage {
@@ -123,6 +134,10 @@ pub async fn serve_host_client(
         }
     };
 
+    // #289: undeadlined, and unlike the three refusal writes above, the
+    // registry entry already exists at this point — a non-reading peer here
+    // stalls the registered host-client's own task with a live, dispatch-
+    // eligible entry nothing else will clean up until this write resolves.
     if write_frame(
         &mut conn,
         &OrchestratorMessage {
