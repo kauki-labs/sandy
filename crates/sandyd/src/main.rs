@@ -23,11 +23,43 @@ use tokio::net::UnixListener;
 /// that never closes its end.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
-/// How long the accept loop pauses after a failed `accept()` before trying
-/// again. A persistent resource error (e.g. the process is out of file
-/// descriptors) would otherwise spin this branch in a tight loop, burning
-/// CPU and flooding the log faster than an operator could react.
+/// The starting delay an accept loop waits after a failed `accept()` before
+/// trying again, doubling (capped at [`ACCEPT_ERROR_BACKOFF_MAX`]) on each
+/// consecutive failure and resetting the moment `accept()` succeeds again. A
+/// persistent resource error (e.g. the process is out of file descriptors)
+/// would otherwise log and retry at this fixed fast cadence indefinitely,
+/// burning CPU and flooding the log faster than an operator could react.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+/// The ceiling [`ACCEPT_ERROR_BACKOFF`]'s exponential growth never exceeds —
+/// a resource error that lasts long enough to hit this is already a serious,
+/// slow-moving incident; there's no benefit to backing off further than this.
+const ACCEPT_ERROR_BACKOFF_MAX: Duration = Duration::from_secs(5);
+
+/// Capped exponential backoff for repeated `accept()` failures, shared by
+/// every accept loop in this binary so they back off identically. Doubles on
+/// each [`AcceptBackoff::wait_and_grow`], resets to [`ACCEPT_ERROR_BACKOFF`]
+/// on [`AcceptBackoff::reset`] (call it after a successful `accept()`).
+struct AcceptBackoff(Duration);
+
+impl AcceptBackoff {
+    fn new() -> Self {
+        Self(ACCEPT_ERROR_BACKOFF)
+    }
+
+    /// Sleep for the current delay, then double it (capped).
+    async fn wait_and_grow(&mut self) {
+        tokio::time::sleep(self.0).await;
+        self.0 = (self.0 * 2).min(ACCEPT_ERROR_BACKOFF_MAX);
+    }
+
+    /// Reset to the starting delay — call after a successful `accept()` so a
+    /// transient blip doesn't leave the loop backed off far longer than the
+    /// failure that caused it.
+    fn reset(&mut self) {
+        self.0 = ACCEPT_ERROR_BACKOFF;
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -76,6 +108,20 @@ async fn main() {
         }
     };
 
+    // One shutdown signal, registered exactly once, shared with the mesh
+    // task below via a `watch` channel: `shutdown_signal()` only resolves on
+    // the first SIGTERM/SIGINT it observes after being polled, so two
+    // independent calls (one here, one in the spawned mesh task) can each
+    // miss a signal that arrives in the gap between their registrations —
+    // tokio does not replay a signal to a listener that starts listening
+    // after it fired. Broadcasting one fire-once event instead means every
+    // consumer, however many ever exist, observes the same occurrence.
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx.send(true);
+    });
+
     // The mesh management-channel listener (#291): unset by default, so
     // sandyd stays local-only unless an operator explicitly configures M2
     // cross-machine dispatch. A configured listen address with an empty
@@ -88,7 +134,7 @@ async fn main() {
     // shutdown below, not fire-and-forgotten, so its own graceful drain
     // gets a real window to run.
     let mesh_task = match setup_mesh_listener().await {
-        Ok(Some(mesh)) => Some(tokio::spawn(run_mesh_accept_loop(mesh))),
+        Ok(Some(mesh)) => Some(tokio::spawn(run_mesh_accept_loop(mesh, shutdown_rx.clone()))),
         Ok(None) => None,
         Err(e) => {
             tracing::error!(error = %e, "could not set up the mesh management-channel listener");
@@ -97,21 +143,21 @@ async fn main() {
     };
 
     let mut connections = tokio::task::JoinSet::new();
-    let shutdown = shutdown_signal();
-    tokio::pin!(shutdown);
+    let mut backoff = AcceptBackoff::new();
 
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, _addr)) => {
+                        backoff.reset();
                         let store = Arc::clone(&store);
                         let registry = Arc::clone(&registry);
                         connections.spawn(sandyd::serve_connection(stream, store, registry));
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "failed to accept a connection");
-                        tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                        backoff.wait_and_grow().await;
                     }
                 }
             }
@@ -120,7 +166,7 @@ async fn main() {
             // `join_next` retrieves it, so without this branch every served
             // connection would accumulate for the daemon's whole lifetime.
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
-            () = &mut shutdown => {
+            _ = shutdown_rx.changed() => {
                 tracing::info!("shutdown signal received; no longer accepting new connections");
                 break;
             }
@@ -290,25 +336,28 @@ async fn setup_mesh_listener() -> std::io::Result<Option<MeshSetup>> {
 /// Accept host-client connections on `mesh.listener` until shutdown, serving
 /// each with [`sandyd::host_conn::serve_host_client`] against one shared
 /// [`HostRegistry`] for this listener's whole lifetime. Mirrors `main`'s own
-/// UDS accept loop shape exactly (reap-as-you-go via `JoinSet`, backoff on a
-/// failed `accept()`, stop accepting on shutdown then drain in-flight
-/// connections within [`SHUTDOWN_GRACE`]) — runs as its own spawned task
-/// since it shares no state with the control-socket path beyond the process,
-/// but shuts down in step with it rather than being abruptly cancelled: a
-/// second, independent call to [`shutdown_signal`] resolves on the same
-/// `SIGTERM`/`SIGINT` tokio's signal driver supports multiple listeners for.
-async fn run_mesh_accept_loop(mesh: MeshSetup) {
+/// UDS accept loop shape exactly (reap-as-you-go via `JoinSet`, exponential
+/// backoff on a failed `accept()`, stop accepting on shutdown then drain
+/// in-flight connections within [`SHUTDOWN_GRACE`]) — runs as its own
+/// spawned task since it shares no state with the control-socket path beyond
+/// the process, but shuts down in step with it via `shutdown_rx`, the same
+/// shared signal `main` forwards from its own single `shutdown_signal()`
+/// registration (never a second independent one here — a signal arriving in
+/// the gap between two separate registrations would never reach the later
+/// one, since tokio does not replay a signal to a listener that starts
+/// listening after it fired).
+async fn run_mesh_accept_loop(mesh: MeshSetup, mut shutdown_rx: tokio::sync::watch::Receiver<bool>) {
     let MeshSetup { listener, allowlist } = mesh;
     let host_registry = Arc::new(HostRegistry::default());
     let mut connections = tokio::task::JoinSet::new();
-    let shutdown = shutdown_signal();
-    tokio::pin!(shutdown);
+    let mut backoff = AcceptBackoff::new();
 
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 match accepted {
                     Ok((conn, peer)) => {
+                        backoff.reset();
                         let allowlist = Arc::clone(&allowlist);
                         let host_registry = Arc::clone(&host_registry);
                         connections.spawn(async move {
@@ -317,12 +366,12 @@ async fn run_mesh_accept_loop(mesh: MeshSetup) {
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "failed to accept a mesh connection");
-                        tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                        backoff.wait_and_grow().await;
                     }
                 }
             }
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
-            () = &mut shutdown => {
+            _ = shutdown_rx.changed() => {
                 tracing::info!("shutdown signal received; mesh listener no longer accepting new connections");
                 break;
             }
@@ -380,6 +429,39 @@ fn ensure_runtime_dir() -> std::io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression (CodeRabbit, #293): a fixed retry delay on a persistent
+    /// accept() failure logs and retries at a constant fast cadence
+    /// indefinitely. The delay must double on each consecutive failure,
+    /// capped, and reset the moment a success is reported. Drives the real
+    /// `wait_and_grow`/`reset` methods over a paused virtual clock, not a
+    /// test that pokes the field directly.
+    #[tokio::test(start_paused = true)]
+    async fn accept_backoff_doubles_caps_and_resets() {
+        let mut backoff = AcceptBackoff::new();
+        assert_eq!(backoff.0, ACCEPT_ERROR_BACKOFF);
+
+        let mut previous = backoff.0;
+        for _ in 0..10 {
+            backoff.wait_and_grow().await;
+            assert!(backoff.0 >= previous, "backoff must never shrink while growing");
+            assert!(
+                backoff.0 <= ACCEPT_ERROR_BACKOFF_MAX,
+                "backoff must never exceed the cap"
+            );
+            previous = backoff.0;
+        }
+        assert_eq!(
+            backoff.0, ACCEPT_ERROR_BACKOFF_MAX,
+            "repeated growth must reach the cap, not stop short of it"
+        );
+
+        backoff.reset();
+        assert_eq!(
+            backoff.0, ACCEPT_ERROR_BACKOFF,
+            "reset must return to the starting delay, not stay backed off"
+        );
+    }
 
     /// Regression (CodeRabbit, #220): the previous connect-then-remove probe
     /// let a second starting instance observe the first as dead and unlink
