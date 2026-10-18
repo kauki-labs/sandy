@@ -571,7 +571,8 @@ that declaration, never a hardcoded host) plus the dispatch RPC.
   `RegistrationId` its own `register` call returned so a stale connection's
   teardown can never evict a newer reconnect under the same `host_id`.
   `send_dispatch` enforces the isolation-class gate the `Dispatch` proto's
-  own doc comment already promised (§'s bullet above): a dispatch whose
+  own doc comment already promised (the `required_isolation_class` bullet
+  above): a dispatch whose
   `required_isolation_class` the target host never declared is refused
   outright, including an unset/`Unspecified` class, which never matches
   anything. `serve_host_client` also bounds how long an accepted connection

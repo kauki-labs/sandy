@@ -157,6 +157,14 @@ pub async fn serve_host_client(
                     // registry entry was already replaced or removed.
                     break;
                 };
+                // CAUTION (#289): this write has no deadline. A registered
+                // host that stops reading (its send buffer fills) stalls this
+                // branch indefinitely — the loop can't poll read_frame, so
+                // registry.remove never runs, and the dispatch channel fills
+                // after 8 buffered sends, stalling future send_dispatch calls
+                // too. Add an explicit deadline here, removing the
+                // registration on expiry, before relying on this path to stay
+                // responsive to a hung or hostile host-client.
                 if write_frame(
                     &mut conn,
                     &OrchestratorMessage { op: Some(orchestrator_message::Op::Dispatch(dispatch)) },
