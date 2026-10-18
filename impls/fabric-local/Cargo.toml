@@ -51,4 +51,4 @@ sandy-backend.workspace = true
 sandy-fabric = { workspace = true, features = ["contract-tests"] }
 sandy-proto.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["time", "io-util"] }
+tokio = { workspace = true, features = ["time", "io-util", "test-util"] }

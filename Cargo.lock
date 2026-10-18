@@ -2300,6 +2300,8 @@ version = "0.1.1"
 dependencies = [
  "anyhow",
  "sandy-api",
+ "sandy-conn",
+ "sandy-control-proto",
  "sandy-executor-proto",
  "sandy-fabric",
  "sandy-fabric-local",
@@ -2309,6 +2311,8 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
