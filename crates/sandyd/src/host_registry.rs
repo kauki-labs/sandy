@@ -61,6 +61,16 @@ impl ExecutorAllowlist {
     pub fn permits(&self, peer_ip: IpAddr) -> bool {
         self.0.contains(&peer_ip.to_canonical())
     }
+
+    /// Whether this allowlist contains no entries at all. A caller binding a
+    /// mesh listener should treat a configured-but-empty allowlist as a
+    /// misconfiguration (#291) — a listener nobody can ever pass is not a
+    /// deliberate "allow no one" policy, just an operator who forgot to set
+    /// the allowlist alongside the listen address.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 /// Why a `Register` was refused. Carries no capability or job data — a
@@ -273,6 +283,12 @@ mod tests {
     /// Adversarial (#263, D5 mutual auth): a registrant not on the allowlist
     /// is refused — the self-reported host_id must never be the thing that
     /// decides this.
+    #[test]
+    fn a_fresh_allowlist_is_empty_and_a_populated_one_is_not() {
+        assert!(ExecutorAllowlist::new([]).is_empty());
+        assert!(!ExecutorAllowlist::new([executor_ip()]).is_empty());
+    }
+
     #[test]
     fn an_unknown_peer_is_refused_regardless_of_the_claimed_host_id() {
         let allowlist = ExecutorAllowlist::new([executor_ip()]);
