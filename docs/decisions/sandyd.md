@@ -522,11 +522,15 @@ length-prefixed framing. `sandyd::host_registry` (`ExecutorAllowlist`,
 orchestrator side end to end: authenticate an incoming `Register` against the
 allowlist, reply `Registered`/`RegisterRefused`, then relay `Dispatch`
 messages queued for that host down its one persistent connection until it
-closes. What is NOT yet built: anything that calls `HostRegistry::register`
-from a real network accept loop (no `sandy-conn` listener is bound in
-`main.rs` yet), and anything that decides to actually place a job on a
-registered host and calls `send_dispatch` — both wait on the rest of #269's
-stage-1 blocks (the executor side, the nix overlay/service) landing.
+closes. The executor side (#283, sandy-91) is also done: `sandy-host-client`'s
+`handle_dispatch` decodes a `Dispatch`, independently re-checks the isolation
+class, launches the trusted-process sandbox, and forwards its agent's link
+back over the mesh. What is NOT yet built: anything that calls
+`HostRegistry::register` from a real network accept loop (no `sandy-conn`
+listener is bound in `sandyd`'s `main.rs` yet, and `sandy-host-client`'s own
+`main.rs` doesn't send `Register` or receive `Dispatch` yet either — tracked
+as #288), and the nix overlay/service that runs `sandy-host-client` as a
+registered executor.
 
 **Context.** #269's spec frames M2 cross-machine dispatch: the orchestrator
 stays the single authority (caps, channels, the peer-hub); a remote host is an

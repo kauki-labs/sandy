@@ -8,7 +8,7 @@
 //! exists.
 
 fn main() {
-    match sandy_host_client::capability::detect_capabilities() {
+    match sandy_host_client::capability::detect_register_capabilities() {
         Ok(capabilities) => {
             println!("{capabilities:?}");
         }

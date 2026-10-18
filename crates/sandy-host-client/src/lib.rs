@@ -5,8 +5,9 @@
 //! then receives dispatches against that declaration and runs them locally.
 //! Two independent concerns, kept as separate modules of one binary rather
 //! than two crates (infra-f3's ruling, #275): [`capability`] detects and
-//! declares; the receive-dispatch handler (sandy-91, blocked on #263's
-//! `sandy-executor-proto`) composes Dispatch → the isolation-class gate →
-//! `ProcessBackend::with_agent`.
+//! declares; [`dispatch`] decodes a `Dispatch`, re-checks the isolation
+//! class, and runs it via `ProcessBackend::with_agent`, forwarding the
+//! agent's link back over the mesh.
 
 pub mod capability;
+pub mod dispatch;
