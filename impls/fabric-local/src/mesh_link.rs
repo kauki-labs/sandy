@@ -687,7 +687,9 @@ mod tests {
             Ok::<_, anyhow::Error>(())
         });
 
-        let (relay_end, _agent_end) = std::os::unix::net::UnixStream::pair().context("socketpair")?;
+        let (relay_end, agent_end) = std::os::unix::net::UnixStream::pair().context("socketpair")?;
+        agent_end.set_nonblocking(true).context("set_nonblocking")?;
+        let mut agent_side = tokio::net::UnixStream::from_std(agent_end).context("from_std")?;
         let (report, verdict_rx) = AgentReport::channel();
         let rt = tokio::runtime::Handle::current();
         // Comfortably shorter than dial_and_forward's own 10s DIAL_TIMEOUT,
@@ -716,6 +718,16 @@ mod tests {
             matches!(&verdict, sandy_api::agent::AgentVerdict::AgentFailed(reason) if reason.contains("did not complete")),
             "expected an AgentFailed verdict naming the timeout, got {verdict:?}"
         );
+
+        // Proves actual teardown, not just the verdict: the timed-out
+        // dial_and_forward future gets dropped, which drops its half of the
+        // socketpair, so the agent's own side observes a clean EOF rather
+        // than the fd leaking for the process's whole lifetime.
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(2), AsyncReadExt::read(&mut agent_side, &mut buf))
+            .await
+            .context("agent side did not see EOF after the relay timed out")??;
+        assert_eq!(n, 0, "expected EOF on the agent's side once the relay tears down");
 
         orchestrator.abort(); // still pending by design; nothing left to assert from it
         Ok(())

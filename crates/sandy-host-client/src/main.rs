@@ -71,7 +71,18 @@ async fn main() {
                 })
                 .await;
                 match result {
-                    Ok(Ok(outcome)) => tracing::info!(job_id, ?outcome, "dispatch finished"),
+                    // Never log `outcome` itself: its `console` field carries
+                    // up to 64 KiB of the job's own stdout/stderr, meant to
+                    // flow to the result envelope's `logs.tail`, not into this
+                    // host's own logs/journald.
+                    Ok(Ok(outcome)) => tracing::info!(
+                        job_id,
+                        booted = outcome.booted,
+                        guest_exit = outcome.guest_exit,
+                        timed_out = outcome.timed_out,
+                        transport_error = outcome.transport_error.as_deref(),
+                        "dispatch finished"
+                    ),
                     Ok(Err(e)) => tracing::warn!(job_id, error = %e, "dispatch refused or failed"),
                     Err(e) => tracing::error!(job_id, error = %e, "the dispatch task panicked"),
                 }
