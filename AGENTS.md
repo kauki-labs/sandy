@@ -221,9 +221,13 @@ repo's own setup, not general git advice.
   including one deliberately deferred to a follow-up issue (reply citing the
   issue, then resolve) — an open thread blocks the queue from picking up the
   PR regardless of `reviewDecision`.
-- **A CodeRabbit follow-up `COMMENTED` review resets `reviewDecision` to
-  empty, even after a prior `APPROVED`.** Re-read `reviewDecision` fresh
-  immediately before enqueuing; a value cached from mid-cleanup can be stale.
+- **A stale `CHANGES_REQUESTED` can linger past the point its findings are
+  actually resolved**, through later `COMMENTED` follow-ups that don't
+  themselves flip it back to `APPROVED` (confirmed on #178 and #296's own
+  review history). Re-read `reviewDecision` fresh immediately before
+  enqueuing — don't trust a value cached from earlier in a review cycle — and
+  if it's stuck at `CHANGES_REQUESTED` with every thread actually resolved,
+  `@coderabbitai approve` forces a fresh formal review state.
 - **The squash-merge-rebase trap.** A branch forked from another PR's branch
   before that PR squash-merges still carries its individual commits; a plain
   `git rebase origin/main` after the squash replays them and conflicts. Diff
