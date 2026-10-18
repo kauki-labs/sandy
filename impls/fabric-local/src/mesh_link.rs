@@ -248,12 +248,24 @@ const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// bypassing `on_link` entirely) — a local backend wiring up `on_link`
 /// later for its own reasons can reuse this exact relay, not a inherit a
 /// one-off built only for the remote path.
+///
+/// `timeout` bounds the whole relay, not just the dial (`dial_and_forward`'s
+/// own `DIAL_TIMEOUT` already bounds connecting): a connected-but-silent
+/// orchestrator — one that accepts the TCP connection and then never reads or
+/// writes again — would otherwise hang `forward_agent_link`'s writes
+/// indefinitely, leaking this task, the mesh socket, and the agent's link end
+/// forever (CodeRabbit finding on #284; architect ruling, infra-f3, #289.4:
+/// bound it here, at the call site that actually enters a long-lived loop,
+/// against the job's own wall-clock rather than inside `dial_and_forward`
+/// itself). The caller passes the same bound the job's own `RunSpec.
+/// timeout_secs` uses, so a stuck relay and a stuck job time out together.
 pub fn relay_agent_link(
     rt: &tokio::runtime::Handle,
     forward_back: SocketAddr,
     host_end: std::os::fd::OwnedFd,
     prefix: Vec<u8>,
     report: sandy_api::agent::AgentReport,
+    timeout: std::time::Duration,
 ) {
     rt.spawn(async move {
         let link = match owned_fd_into_unix_stream(host_end) {
@@ -263,13 +275,14 @@ pub fn relay_agent_link(
                 return;
             }
         };
-        match dial_and_forward(forward_back, link, &prefix).await {
-            Ok(ForwardedVerdict::JobExited(code)) => report.job_exited(code),
-            Ok(ForwardedVerdict::AgentFailed(reason)) => report.agent_failed(reason),
+        match tokio::time::timeout(timeout, dial_and_forward(forward_back, link, &prefix)).await {
+            Ok(Ok(ForwardedVerdict::JobExited(code))) => report.job_exited(code),
+            Ok(Ok(ForwardedVerdict::AgentFailed(reason))) => report.agent_failed(reason),
             // DialAndForwardError's own Display already names what failed
             // ("dialing the orchestrator: ..." or "agent link: ...");
             // wrapping it again here would duplicate that prefix.
-            Err(e) => report.agent_failed(e.to_string()),
+            Ok(Err(e)) => report.agent_failed(e.to_string()),
+            Err(_elapsed) => report.agent_failed(format!("the mesh relay did not complete within {timeout:?}")),
         }
     });
 }
@@ -595,7 +608,14 @@ mod tests {
         // runtime" thread — relay_agent_link must not rely on one being
         // current on ITS thread, only on the Handle it's given.
         tokio::task::spawn_blocking(move || {
-            relay_agent_link(&rt, orchestrator_addr, relay_end.into(), PREFIX.to_vec(), report);
+            relay_agent_link(
+                &rt,
+                orchestrator_addr,
+                relay_end.into(),
+                PREFIX.to_vec(),
+                report,
+                Duration::from_secs(300),
+            );
         })
         .await
         .context("spawn_blocking panicked")?;
@@ -631,6 +651,85 @@ mod tests {
             .await
             .context("the fake orchestrator did not finish")?
             .context("orchestrator task panicked")??;
+        Ok(())
+    }
+
+    /// Regression (CodeRabbit on #284; architect ruling, #289.4): a connected
+    /// orchestrator that never reads or writes again must not hang the relay
+    /// forever — `relay_agent_link`'s `timeout` forces it to give up and
+    /// report `agent_failed`, so the task, the mesh socket, and the agent's
+    /// link end all get torn down instead of leaking for the process's whole
+    /// lifetime. Asserts the bad-path behavior explicitly, not just that the
+    /// happy path still works.
+    ///
+    /// Uses real (short) time, not a paused virtual clock: this path dials a
+    /// real TCP socket through `dial_and_forward`, including its own
+    /// `DIAL_TIMEOUT`-bounded connect — paused time combined with real I/O is
+    /// a known tokio pitfall (the virtual clock can auto-advance past a
+    /// timeout while the real connect is still in flight), which is exactly
+    /// what made this test flaky under `start_paused = true` during
+    /// development.
+    #[tokio::test]
+    async fn relay_agent_link_times_out_against_a_connected_but_silent_orchestrator() -> anyhow::Result<()> {
+        use sandy_api::agent::AgentReport;
+
+        let listener = sandy_conn::listen(&ConnAddr::Tcp("127.0.0.1:0".parse()?))
+            .await
+            .context("listen")?;
+        let orchestrator_addr = listener.local_addr().context("local_addr")?;
+
+        // Accepts the connection (so the dial itself succeeds) and then does
+        // nothing else, ever — the exact "hung/never-EOF orchestrator"
+        // scenario the bound exists for.
+        let orchestrator = tokio::spawn(async move {
+            let (_orchestrator_side, _peer) = listener.accept().await?;
+            std::future::pending::<()>().await;
+            Ok::<_, anyhow::Error>(())
+        });
+
+        let (relay_end, agent_end) = std::os::unix::net::UnixStream::pair().context("socketpair")?;
+        agent_end.set_nonblocking(true).context("set_nonblocking")?;
+        let mut agent_side = tokio::net::UnixStream::from_std(agent_end).context("from_std")?;
+        let (report, verdict_rx) = AgentReport::channel();
+        let rt = tokio::runtime::Handle::current();
+        // Comfortably shorter than dial_and_forward's own 10s DIAL_TIMEOUT,
+        // so a real-time test run resolves in well under a second without
+        // the dial's own bound ever becoming a factor.
+        const RELAY_TIMEOUT: Duration = Duration::from_millis(100);
+
+        tokio::task::spawn_blocking(move || {
+            relay_agent_link(
+                &rt,
+                orchestrator_addr,
+                relay_end.into(),
+                PREFIX.to_vec(),
+                report,
+                RELAY_TIMEOUT,
+            );
+        })
+        .await
+        .context("spawn_blocking panicked")?;
+
+        let verdict = tokio::task::spawn_blocking(move || verdict_rx.recv_timeout(Duration::from_secs(5)))
+            .await
+            .context("verdict recv task panicked")?
+            .context("the report channel did not deliver a verdict after the timeout elapsed")?;
+        assert!(
+            matches!(&verdict, sandy_api::agent::AgentVerdict::AgentFailed(reason) if reason.contains("did not complete")),
+            "expected an AgentFailed verdict naming the timeout, got {verdict:?}"
+        );
+
+        // Proves actual teardown, not just the verdict: the timed-out
+        // dial_and_forward future gets dropped, which drops its half of the
+        // socketpair, so the agent's own side observes a clean EOF rather
+        // than the fd leaking for the process's whole lifetime.
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(2), AsyncReadExt::read(&mut agent_side, &mut buf))
+            .await
+            .context("agent side did not see EOF after the relay timed out")??;
+        assert_eq!(n, 0, "expected EOF on the agent's side once the relay tears down");
+
+        orchestrator.abort(); // still pending by design; nothing left to assert from it
         Ok(())
     }
 }

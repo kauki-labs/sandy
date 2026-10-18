@@ -663,3 +663,42 @@ revisit once #272's live e2e exercises this path for real.
 has never had one, and introducing `clap` as a dependency for two optional
 knobs when the rest of the binary's config is env-var-only would be
 inconsistent with the binary's own established shape, not a simplification.
+
+## 14. Stage 1: one host-client handles one dispatch at a time, sequentially (#288)
+
+**Status:** accepted (architect ruling, infra-f3).
+
+**Context.** `sandy-host-client`'s main loop (#288) reads `Dispatch` messages
+off its one persistent connection to the orchestrator and runs each through
+`handle_dispatch`, which blocks the calling thread for the job's whole
+duration (`ProcessBackend::run`'s own contract). Nothing in #269's spec or
+`Capabilities` says whether a second `Dispatch` may arrive and run while a
+first is still in flight on the same host.
+
+**Decision.** Sequential, one job per host-client process: read one
+`Dispatch`, run it to completion (bounded by `STAGE1_TIMEOUT_SECS`) via
+`spawn_blocking`, then read the next. `Capabilities` declares no
+concurrency/slot count, so the orchestrator has no signal a host could run
+more than one job at a time even if it wanted to place one. Concurrent
+dispatch is a future capability, pending (a) a capacity/slot count added to
+`Capabilities` and (b) a specified resource-isolation story between
+co-resident trusted-process jobs sharing one host's containment (bwrap/cgroup)
+— neither exists today, so building concurrent handling now would be
+unspecified-resolves-to-plausible guessing on a real correctness axis, not an
+implementation detail.
+
+**Consequences.** M2's acceptance (#269, stage 1) is cross-machine — one
+sandbox per host, communicating across machines — not multiple concurrent
+jobs on one host, so sequential suffices for the stated bar. Sequential
+handling also gives natural backpressure for free: a second `Dispatch` simply
+buffers in the connection (per decision 12's queued-`mpsc`-per-host shape)
+until the host-client finishes its current job and reads again; the
+connection staying open still signals liveness while the host is busy, same
+as decision 12's "no separate heartbeat" reasoning.
+
+**Set aside.** Spawning each `Dispatch` concurrently (one task per job):
+would require resolving the resource-isolation question between co-resident
+trusted-process jobs first (shared bwrap/cgroup containment is one host-wide
+resource today, not yet modeled as something multiple jobs can safely share
+or must contend for) — a real design gap, not a detail this slice can paper
+over by just calling `tokio::spawn` per dispatch.

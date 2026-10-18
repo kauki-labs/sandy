@@ -215,7 +215,14 @@ pub fn handle_dispatch(
     let prefix = sandy_executor_proto::encode_remote_link_prefix(&dispatch.job_id, &link_token)?;
 
     let on_link: OnLink = Arc::new(move |_box_id, host_end, report| {
-        relay_agent_link(&rt, forward_back, host_end, prefix.clone(), report);
+        relay_agent_link(
+            &rt,
+            forward_back,
+            host_end,
+            prefix.clone(),
+            report,
+            std::time::Duration::from_secs(u64::from(STAGE1_TIMEOUT_SECS)),
+        );
     });
 
     let backend = ProcessBackend::with_containment(containment).with_agent(AgentLaunch {
