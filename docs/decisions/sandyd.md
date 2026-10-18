@@ -603,4 +603,63 @@ variant, not a breaking change to what's shipped here.
 `sandyd` learns its own mesh bind address — CLI flag, config, the nix
 overlay's service unit) and isn't needed to prove the `Register`/`Dispatch`
 logic correct in isolation, matching the same "test the logic, defer the
-wiring" discipline used throughout B2.
+wiring" discipline used throughout B2. Resolved by decision 13.
+
+## 13. Mesh bind addresses are environment variables; two separate listeners, not one multiplexed (#291)
+
+**Status:** partially implemented. `sandyd::mesh_config` parses
+`$SANDY_MESH_LISTEN` (the host_conn management-channel's bind address) and
+`$SANDY_MESH_ALLOWLIST` (comma-separated executor mesh IPs), both pure
+functions fully unit-tested against raw string values, not real process
+environment. `main.rs`'s `setup_mesh_listener` reads them, refuses to start
+if a listen address is configured with an empty allowlist (a listener nobody
+could ever pass), binds via `sandy_conn::listen`, and `run_mesh_accept_loop`
+serves accepted connections against a dedicated `HostRegistry` as its own
+background task. What is NOT yet built: the mesh_accept (agent-link) listener
+and its own bind-address env var — that side depends on #290's accept loop
+landing on main; this decision's config surface and wiring pattern extend to
+it directly once it does, as a small follow-up, not a redesign.
+
+**Context.** #291's architect rulings (relayed by infra-f3): two separate
+mesh-bound listeners/ports (the host_conn management channel and the
+mesh_accept agent-link accept are different wire protocols — the contract
+already keeps them distinct via `Dispatch.forward_back`'s own host:port), not
+one multiplexed port demuxing on the first frame (simplicity-first for M2).
+Bind address is config-driven, never hardcoded, mesh-only (D5) — an operator
+sets it per node, the nix service unit (#287) injects it in production.
+
+**Decision.**
+
+- `sandyd` has no `clap`/CLI-flag surface at all today (`$SANDY_SOCK`,
+  `$SANDY_DB` are its only existing config knobs, both environment
+  variables) — `$SANDY_MESH_LISTEN`/`$SANDY_MESH_ALLOWLIST` follow that same
+  established convention rather than introducing a parallel CLI-args
+  mechanism for just this one feature.
+- Unset `$SANDY_MESH_LISTEN` is the default and fully supported: `sandyd`
+  stays local-only, identical to its behavior before #291. M2 cross-machine
+  dispatch is additive, never a requirement to run `sandyd` at all.
+- A configured listen address with an empty (or unset) allowlist is a
+  startup-time hard refusal (`std::process::exit(1)`), not a listener that
+  silently accepts and then refuses every connection forever — the two are
+  observably different (a refusing-but-running process looks healthy to
+  process supervision; a process that never started does not), and the
+  distinction matters for an operator who forgot to set the allowlist
+  alongside the listen address.
+- The mesh accept loop runs as its own `tokio::spawn`'ed background task
+  (not folded into `main`'s existing UDS `select!` loop): it shares no state
+  with the control-socket path beyond the process itself, and the
+  alternative (threading an `Option<Listener>` through the shared `select!`
+  with a `pending()` fallback branch) was tried and discarded as needlessly
+  convoluted for two independent accept loops that never need to coordinate.
+
+**Consequences.** `sandyd`'s mesh listener has no graceful-shutdown
+coordination with the daemon's own `SIGTERM`/`SIGINT` handling yet — it is a
+detached task that the process's own exit simply drops, unlike the UDS
+listener's bounded grace period for in-flight connections. Acceptable at
+this stage (no live cross-machine traffic exists to lose gracefully yet);
+revisit once #272's live e2e exercises this path for real.
+
+**Set aside.** A CLI-flag surface (`clap`) for these two env vars: `sandyd`
+has never had one, and introducing `clap` as a dependency for two optional
+knobs when the rest of the binary's config is env-var-only would be
+inconsistent with the binary's own established shape, not a simplification.
