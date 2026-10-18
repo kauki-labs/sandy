@@ -1085,6 +1085,68 @@ mod tests {
         Ok(())
     }
 
+    /// Adversarial (CodeRabbit on #301, infra-f3's safety-floor check): a
+    /// cancelled job's Dispatch, once delivered to a host, cannot be
+    /// retracted — there is no Cancel/Stop `OrchestratorMessage` (decision
+    /// 12). Deferring that is only acceptable if a cancelled job still
+    /// cannot DELIVER a result: the host eventually running the stale
+    /// Dispatch and dialing back with the EXACT `link_token` it was given
+    /// must still be refused by decision 6's accept path. Proven through
+    /// the real placement flow, not a manually constructed `RemoteLink`
+    /// (that's `cancel_invalidates_the_jobs_remote_link` above) — this test
+    /// captures the token from the real `Dispatch` a registered host
+    /// actually received, cancels the job, then authenticates with that
+    /// exact token.
+    #[tokio::test]
+    async fn a_cancelled_jobs_dispatched_token_cannot_authenticate_afterward() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let mut dispatch_rx = register_test_host(&host_registry, "ws01", peer_ip, trusted_host_capabilities());
+        let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+
+        let submitted = handle(&store, &registry, &host_registry, Some(forward_back), submit_req(1)).await?;
+        let job_id = match submitted.result {
+            Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
+            other => anyhow::bail!("expected a Submit response, got {other:?}"),
+        };
+
+        // The exact token the (simulated) host now holds, from the real
+        // Dispatch it received — not a token this test minted itself.
+        let dispatch = tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_rx.recv())
+            .await
+            .context("timed out waiting for the dispatch")?
+            .context("the host's dispatch channel closed before receiving anything")?;
+        let token: [u8; crate::link_auth::LINK_TOKEN_LEN] = dispatch
+            .link_token
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("link_token was not LINK_TOKEN_LEN bytes"))?;
+
+        let cancelled = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            req(2, control_request::Op::Cancel(CancelRequest { job_id: job_id.clone() })),
+        )
+        .await?;
+        assert!(
+            matches!(cancelled.result, Some(control_response::Result::Cancel(_))),
+            "got {:?}",
+            cancelled.result
+        );
+
+        // The host "runs" the stale Dispatch and dials back with the token
+        // it was actually given — must still be refused, not authenticate.
+        match registry.authenticate_remote_link(&job_id, peer_ip, &token) {
+            Err(e) => assert_eq!(e, crate::link_auth::LinkAuthError::AlreadyClaimed),
+            Ok(_) => panic!(
+                "a cancelled job's dispatched token must never authenticate afterward — that would let a cancelled \
+                 job's result reach the orchestrator"
+            ),
+        }
+        Ok(())
+    }
+
     /// Adversarial, through the real path (belt-and-suspenders with
     /// `host_registry`'s own `pick_host_for_skips_a_host_that_does_not_support_the_required_class`
     /// unit test — this is the integration-level copy proving the fail-closed
