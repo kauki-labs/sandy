@@ -146,15 +146,21 @@ mod tests {
             .context("write prefix")?;
 
         // The agent cap frame the relay writes first proves serve_agent_link
-        // actually took over the stream.
+        // actually took over the stream — asserting the read is Ok isn't
+        // enough, since EOF (n == 0, the connection closing with nothing
+        // written) would satisfy that too.
         let mut buf = [0u8; 1];
-        tokio::time::timeout(
+        let n = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             tokio::io::AsyncReadExt::read(&mut client, &mut buf),
         )
         .await
         .context("timed out waiting for the agent link's first byte")?
         .context("read the agent link's first frame")?;
+        assert_eq!(
+            n, 1,
+            "serve_agent_link must have written its first frame, not closed the stream at EOF"
+        );
 
         drop(client);
         tokio::time::timeout(std::time::Duration::from_secs(5), accepting).await??;
@@ -336,13 +342,17 @@ mod tests {
             .await
             .context("write first prefix")?;
         let mut buf = [0u8; 1];
-        tokio::time::timeout(
+        let n = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             tokio::io::AsyncReadExt::read(&mut first_client, &mut buf),
         )
         .await
         .context("timed out waiting for the first stream's agent link byte")?
         .context("read the first stream's agent link byte")?;
+        assert_eq!(
+            n, 1,
+            "the first stream's serve_agent_link must have written, not closed at EOF"
+        );
 
         // Second stream, same valid token, must be refused.
         let accept_registry = Arc::clone(&registry);
