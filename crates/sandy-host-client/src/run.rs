@@ -165,8 +165,10 @@ mod tests {
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
     /// Short enough that a test proving [`RegisterError::ResponseTimedOut`]
     /// fires doesn't cost real seconds, long enough that the orchestrator
-    /// task's own read has time to complete first.
-    const SHORT_TIMEOUT: Duration = Duration::from_millis(50);
+    /// task's own read has time to complete first even under a loaded CI
+    /// runner (a 50ms margin here flaked once under coverage instrumentation
+    /// overhead — widened after that, not guessed up front).
+    const SHORT_TIMEOUT: Duration = Duration::from_millis(500);
 
     fn capabilities() -> Capabilities {
         Capabilities {
@@ -347,7 +349,7 @@ mod tests {
         // Give the loop a moment to process both frames before asking it to
         // stop; `_server` staying alive (not dropped) means the loop would
         // otherwise wait forever for a third frame.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let _ = shutdown_tx.send(());
         let exit = tokio::time::timeout(std::time::Duration::from_secs(2), loop_task)
             .await
@@ -472,7 +474,7 @@ mod tests {
             .await
             .context("orchestrator task did not finish")??
             .context("orchestrator task failed")?;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let _ = shutdown_tx.send(());
         let exit = tokio::time::timeout(std::time::Duration::from_secs(2), loop_task)
             .await
