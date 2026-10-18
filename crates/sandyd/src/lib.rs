@@ -11,6 +11,7 @@ pub mod handler;
 pub mod host_conn;
 pub mod host_registry;
 pub mod link_auth;
+pub mod mesh_accept;
 pub mod mesh_config;
 pub mod store;
 
