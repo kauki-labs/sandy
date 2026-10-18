@@ -215,8 +215,10 @@ its full record in `docs/decisions/`, and the live matrix in `kpi.md`.
 Recurring traps this cycle's builders hit and re-discovered. Facts about this
 repo's own setup, not general git advice.
 
-- **`gh pr merge <n> --auto`, not `--squash --auto`.** The merge queue owns
-  `main`'s merge strategy; passing `--squash` alongside `--auto` errors.
+- **`gh pr merge <n> --auto`, omit `--squash`.** The merge queue, not the flag,
+  owns `main`'s merge strategy; exact `--squash --auto` behavior (hard error vs.
+  a warning that still queues) is `gh`-version-dependent and not worth relying
+  on either way — leave `--squash` off.
 - **`required_review_thread_resolution` is on.** Every thread must be resolved,
   including one deliberately deferred to a follow-up issue (reply citing the
   issue, then resolve) — an open thread blocks the queue from picking up the
@@ -245,3 +247,9 @@ repo's own setup, not general git advice.
   merge queue returns silent on success and never sets it. Check
   `mergeQueueEntry { state position }` via the GraphQL API to tell `QUEUED`
   from genuinely unenqueued, not `autoMergeRequest`.
+- **A command piped to `tail`/`head` masks its own exit code.** The shell
+  reports the pipeline's last command's exit status, not `nix build`'s (or
+  whatever ran first) — a build that actually failed can look like a clean
+  exit if only the tail of its output is read. Capture the real command's exit
+  code directly (e.g. `cmd; echo "exit=$?"` before any pipe), or read the full
+  log for an error rather than trusting a truncated tail.
