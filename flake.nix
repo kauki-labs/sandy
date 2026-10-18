@@ -30,6 +30,14 @@
         inputs.flake-root.flakeModule
         inputs.pre-commit.flakeModule
       ];
+
+      # Delivered standalone from perSystem (#287, D3): the overlay must work
+      # in a consuming flake's own nixpkgs, and the module must be importable
+      # without evaluating this flake's perSystem at all.
+      flake = {
+        overlays.default = import ./nix/overlays/sandy-executor.nix;
+        nixosModules.sandy-executor = import ./nix/modules/sandy-executor.nix;
+      };
       perSystem =
         {
           config,
@@ -38,7 +46,10 @@
           ...
         }:
         let
-          overlays = [ (import inputs.rust-overlay) ];
+          overlays = [
+            (import inputs.rust-overlay)
+            (import ./nix/overlays/sandy-executor.nix)
+          ];
           pkgs = import inputs.nixpkgs { inherit system overlays; };
 
           rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
@@ -186,6 +197,10 @@
 
           packages = sandyPackages // {
             default = sandyPackages.sandy;
+            # The overlay's own packages (#287, D3), built via `pkgs` here so
+            # `nix build .#sandy-host-client`/`.#sandy-agent` exercises the
+            # exact overlay a consumer applies, not a separate code path.
+            inherit (pkgs) sandy-host-client sandy-agent;
           };
 
           checks = {
@@ -200,6 +215,12 @@
             tests-e2e-cli = testsE2eCli;
             tests-daemon-e2e = sandyPackages.testsDaemonE2e;
             project-docs = projectDocs;
+          }
+          # nixosTest only evaluates on Linux (it builds a QEMU VM derivation
+          # for the host system); harmless to omit it from the darwin check
+          # set rather than fail evaluation there.
+          // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+            sandy-executor-vm = import ./nix/tests/sandy-executor-vm.nix { inherit pkgs; };
           };
 
           # Built with covCraneLib so the toolchain on PATH carries
@@ -236,6 +257,17 @@
               qualityPackages.cargo-anatomy
               qualityPackages.rust-code-analysis-cli
               qualityPackages.jscpd
+              # The overlay's own packages (#287, D3: dev-shell first), so an
+              # operator can run `sandy-host-client`/`sandy-agent` from the
+              # shell before any NixOS module lands them as a service.
+              pkgs.sandy-host-client
+              pkgs.sandy-agent
+            ]
+            # bwrap (the containment confinement layer this binary probes
+            # for, #142) is Linux-only; the dev shell itself still has to
+            # evaluate on macOS.
+            ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+              pkgs.bubblewrap
             ];
           };
 
