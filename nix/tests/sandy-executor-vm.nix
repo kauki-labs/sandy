@@ -30,7 +30,12 @@ testPkgs.testers.runNixOSTest {
   name = "sandy-executor-containment";
 
   nodes.machine =
-    { ... }:
+    {
+      config,
+      lib,
+      pkgs,
+      ...
+    }:
     {
       imports = [ (import ../modules/sandy-executor.nix) ];
       services.sandy-executor = {
@@ -49,6 +54,61 @@ testPkgs.testers.runNixOSTest {
       # TTY-less logind session well within this test's runtime if the
       # module's KillExcludeUsers drop-in didn't protect it.
       services.logind.settings.Login.StopIdleSessionSec = 2;
+
+      # A probe unit that reuses `sandy-executor.service`'s EXACT
+      # `serviceConfig` (not a re-typed copy that could silently drift from
+      # it) to run a real `bwrap`-confined command under the full hardened
+      # unit — not from the test driver's unconfined root shell, which the
+      # job-runs assertion below used to do and which exercised none of
+      # ProtectSystem/SystemCallFilter/PrivateDevices/ProtectProc at all
+      # (security review, #299/sandy-73). This is the test that would catch
+      # the hardening silently breaking `confines_filesystem` (bwrap) while
+      # `is_available()` (the plain reaping probe) stays true — a job would
+      # keep running, just without the mount-namespace confinement, with
+      # every existing assertion here staying green.
+      #
+      # Red/green proof this assertion actually catches that (#299 review,
+      # infra-f3 + sandy-73): temporarily adding `RestrictNamespaces = true;`
+      # to this unit's override made the test fail for the right reason —
+      # `bwrap: No permissions to create a new namespace, likely because the
+      # kernel does not allow non-privileged user namespaces`, the probe
+      # service exiting 1, and `machine.succeed` failing on it. Reverted
+      # before merge; the real unit's own `RestrictNamespaces` stays
+      # deliberately unset (the module's own comment explains why).
+      systemd.services.sandy-executor-probe = {
+        serviceConfig =
+          (builtins.removeAttrs config.systemd.services.sandy-executor.serviceConfig [
+            "RuntimeDirectory"
+            "RuntimeDirectoryMode"
+            "StateDirectory"
+            "StateDirectoryMode"
+            "Restart"
+            "RestartSec"
+          ])
+          // {
+            Type = "oneshot";
+            RemainAfterExit = false;
+            ExecStart = lib.getExe' (pkgs.writeShellApplication {
+              name = "sandy-executor-probe-run";
+              runtimeInputs = [
+                pkgs.systemd
+                pkgs.bubblewrap
+              ];
+              # No `|| true`/fallback anywhere here: a `bwrap` that can't
+              # create its own namespaces under this unit's hardening must
+              # make this whole script fail, not silently run the job
+              # unwrapped — that failure is exactly the signal this test
+              # needs to be able to observe (security review, #299/
+              # sandy-73 + infra-f3: a silent confines_filesystem=false
+              # flip must not stay green).
+              text = ''
+                systemd-run --user --scope -p Delegate=yes -- \
+                  bwrap --ro-bind / / --dev /dev --tmpfs /tmp --unshare-all --share-net -- \
+                  /run/current-system/sw/bin/echo confined-ok
+              '';
+            }) "sandy-executor-probe-run";
+          };
+      };
     };
 
   testScript = ''
@@ -115,12 +175,13 @@ testPkgs.testers.runNixOSTest {
     # which `capabilities_from` already excludes) ⟹ the Register this host
     # would send declares `[Trusted]`, never an empty or hardcoded value.
 
-    # Beyond declaring the capability: prove a REAL job actually runs through
-    # the exact mechanism a dispatched job would use (`systemd-run --user
-    # --scope`), under this unit's own hardening — not just the trivial
-    # probe `SystemdRunContainment::detect` itself runs. The service's own
-    # lingering user instance is already up (proven above), so this reuses
-    # it rather than starting a second one.
+    # A basic liveness check that `systemd-run --user --scope` itself works
+    # for this user at all. NOTE what this does NOT prove: `runuser` here
+    # starts from the test driver's unconfined root shell, outside
+    # `sandy-executor.service` entirely — none of ProtectSystem,
+    # SystemCallFilter, PrivateDevices, or ProtectProc apply to it, and it
+    # never runs `bwrap`. The in-unit probe below is what actually exercises
+    # the hardening (security review, #299/sandy-73 + infra-f3).
     # `--scope` wraps the *existing* process in place (no transient service
     # unit forked to track separately), so `--wait`/`--pipe` don't apply —
     # the command's own stdout is already this invocation's stdout.
@@ -133,6 +194,26 @@ testPkgs.testers.runNixOSTest {
     assert "integration-proof" in job_output, (
         f"a real command failed to run through systemd-run --user --scope "
         f"under the hardened unit — got:\n{job_output}"
+    )
+
+    # The load-bearing proof: `sandy-executor-probe` reuses
+    # `sandy-executor.service`'s EXACT `serviceConfig` (read live from
+    # `config`, not a hand-copied duplicate that could drift from it) to run
+    # `systemd-run --user --scope` -> `bwrap` -> a marker command FROM INSIDE
+    # the fully hardened unit. `confines_filesystem()`
+    # (`impls/local/src/containment.rs`) is what decides whether a dispatched
+    # job gets bwrap's mount-namespace confinement at all; if any hardening
+    # directive silently broke bwrap under this exact unit, `machine.succeed`
+    # here would fail loudly (the probe script has no `|| true`/fallback path
+    # — a `bwrap` that can't create its namespaces fails the whole script,
+    # never falls back to running the job unwrapped), rather than the
+    # declared capability staying `[Trusted]` while jobs silently lost their
+    # filesystem confinement.
+    probe_output = machine.succeed("systemctl start sandy-executor-probe && journalctl -b -o cat --no-pager")
+    assert "confined-ok" in probe_output, (
+        f"bwrap did not complete inside the hardened unit — a hardening "
+        f"directive may have silently broken containment's confines_filesystem "
+        f"path — journal:\n{probe_output}"
     )
 
     # #300(b) proof: with StopIdleSessionSec=2 set on this node and no
