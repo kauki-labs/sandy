@@ -22,6 +22,8 @@ workspace = true
 
 [dependencies]
 sandy-control-proto.workspace = true
+sandy-executor-proto.workspace = true
+sandy-conn.workspace = true
 sandy-fabric.workspace = true
 sandy-fabric-local.workspace = true
 sandy-fsutil.workspace = true
@@ -47,3 +49,4 @@ uuid.workspace = true
 [dev-dependencies]
 anyhow.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

@@ -1,0 +1,123 @@
+syntax = "proto3";
+
+package sandy.executor.v1;
+
+// The orchestrator<->host-client contract (#263, epic #205 M2): a
+// capability-declaring registration (kubelet-style) plus the dispatch RPC.
+// Rides sandy-conn's TCP/mesh tier. One persistent, bidirectional connection
+// per host-client: the host-client sends Register once, then the
+// orchestrator pushes zero or more Dispatch messages down the SAME
+// connection as it places jobs there. The connection staying open is the
+// liveness signal for that host — no separate heartbeat protocol.
+//
+// This is deliberately not the control RPC's shape (sandy-control-proto,
+// decision 1: pure request/response, no pipelining): a management channel
+// needs server push, a client call does not. Different protocol, different
+// crate, same framing style (length-prefixed, write_frame/read_frame).
+
+// Host-client -> orchestrator.
+message HostClientMessage {
+  oneof op {
+    Register register = 1;
+  }
+}
+
+// Orchestrator -> host-client.
+message OrchestratorMessage {
+  oneof op {
+    Registered registered = 1;
+    RegisterRefused refused = 2;
+    Dispatch dispatch = 3;
+  }
+}
+
+// What an executor can run (mirrors sandy_fabric::executor::{SandboxKind, Arch}).
+// A closed set today; grows additively (kvm, qemu, vfkit, faas, proxmox) per
+// D2 — no contract break when a new target lands.
+enum SandboxKind {
+  SANDBOX_KIND_UNSPECIFIED = 0;
+  SANDBOX_KIND_PROCESS = 1;
+  SANDBOX_KIND_VM = 2;
+}
+
+enum Arch {
+  ARCH_UNSPECIFIED = 0;
+  ARCH_X86_64 = 1;
+  ARCH_AARCH64 = 2;
+}
+
+// Whether a job may run on a shared-kernel backend (trusted-process) or needs
+// a full hypervisor boundary (#150, VM/untrusted isolation). The gate is
+// fail-closed in both directions (#269's spec, the isolation-class
+// requirement): the orchestrator must not dispatch, and the executor must
+// refuse, any job whose required class a host's declared capabilities cannot
+// provide — never a silent downgrade onto trusted-process.
+enum IsolationClass {
+  ISOLATION_CLASS_UNSPECIFIED = 0;
+  ISOLATION_CLASS_TRUSTED = 1;
+  ISOLATION_CLASS_UNTRUSTED = 2;
+}
+
+message Capabilities {
+  SandboxKind kind = 1;
+  Arch arch = 2;
+  // sandy_fabric::executor::Attestation is a stub (unit struct) today;
+  // carried as presence until it grows real fields.
+  bool attestation = 3;
+  // The isolation classes this host's declared backend(s) can actually
+  // provide. Stage 1's trusted-process backend declares only TRUSTED — its
+  // `bwrap` sandbox shares the host network namespace with no egress
+  // enforcement, so it must never be offered as a backend for an UNTRUSTED
+  // job (#269: "stage 1 accepts trusted jobs only").
+  repeated IsolationClass supported_isolation_classes = 4;
+}
+
+// Declares this host's identity and what it can run.
+//
+// host_id is a self-reported, human-readable label for bookkeeping and
+// placement — it is NEVER the authorization boundary. The orchestrator
+// authenticates the registrant by the TRANSPORT's own peer identity (mesh
+// IP) against its own allowlist of known executor hosts (D5, the Register
+// ruling on #263): an unknown registrant gets RegisterRefused, not
+// Registered, and is logged — trusting a self-reported id for authorization
+// would repeat the exact mistake decision 6 exists to prevent.
+message Register {
+  string host_id = 1;
+  Capabilities capabilities = 2;
+}
+
+message Registered {
+  string host_id = 1;
+}
+
+// The registrant's mesh identity is not on the orchestrator's executor
+// allowlist. Carries no capability or job data — a refusal must never leak
+// more than "no".
+message RegisterRefused {
+  string reason = 1;
+}
+
+// Run `manifest` on `backend`; forward the sandbox agent's link back to
+// `forward_back` using `job_id` + `link_token` as the mesh-accept-loop demux
+// prefix (decision 6). `link_token` is a bearer secret (INV-1): the
+// host-client holds it only in forwarder memory, never logs it, never writes
+// it to the job's manifest, env, or mounts.
+message Dispatch {
+  string job_id = 1;
+  bytes manifest = 2;
+  // Mirrors SubmitRequest.manifest_encoding (sandy-control-proto):
+  // empty/unset means "undefined, reject" — never a silent default.
+  string manifest_encoding = 3;
+  SandboxKind backend = 4;
+  bytes link_token = 5;
+  // "host:port" on the orchestrator's mesh interface, for the host-client's
+  // fresh dial (sandy_conn::connect(ConnAddr::Tcp(..))) before
+  // forward_agent_link — a separate stream from this management connection.
+  string forward_back = 6;
+  // The job's required isolation class. The orchestrator must not send this
+  // Dispatch at all if `backend`'s host never declared this class in its
+  // Capabilities; the executor re-checks it independently before running
+  // anything (defense in depth — never trust the orchestrator's placement
+  // decision alone for a fail-closed security gate).
+  IsolationClass required_isolation_class = 7;
+}

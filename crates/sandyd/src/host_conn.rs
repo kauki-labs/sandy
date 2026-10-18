@@ -1,0 +1,387 @@
+//! Drives one host-client's persistent connection (#263): read its
+//! `Register`, authenticate and reply, then relay `Dispatch` messages queued
+//! for it in [`HostRegistry`] down the same connection until it closes. The
+//! connection staying open is the host's liveness signal (kubelet-watch
+//! pattern) — there is no separate heartbeat protocol, and no re-registration
+//! machinery for stage 1 (#269): a host that disconnects is simply gone until
+//! it reconnects and registers again.
+
+use sandy_conn::{Conn, PeerAddr};
+use sandy_control_proto::{read_frame, write_frame};
+use sandy_executor_proto::{
+    HostClientMessage, OrchestratorMessage, RegisterRefused, Registered, host_client_message, orchestrator_message,
+};
+
+use crate::host_registry::{ExecutorAllowlist, HostRegistry, RegisterError};
+
+/// How long a freshly accepted connection has to send its `Register` frame
+/// before it's closed. Without a deadline here, a peer that opens a
+/// connection and never writes anything would hold it (and the accept
+/// loop's resources for it) open indefinitely — a slowloris-style resource
+/// exhaustion, not just a slow client.
+const REGISTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Serve one accepted host-client connection end to end.
+///
+/// Expects `Register` as the first frame within [`REGISTER_TIMEOUT`];
+/// anything else, a stream that closes before sending one, or one that never
+/// sends it in time, ends the connection without ever registering the host.
+/// A `PeerAddr::Uds` peer is refused outright — a host-client only ever
+/// connects over the mesh (`PeerAddr::Tcp`), so a UDS peer here would be a
+/// caller bug, not a registration this code should entertain.
+///
+/// CAUTION (#289): every `write_frame` call below, including the refusal
+/// writes before registration, has no deadline. A peer that stops reading
+/// after opening a connection can stall one of these indefinitely — see the
+/// inline notes at each site and at the connection loop's own `write_frame`
+/// for the specific consequence each one has. All are deliberately deferred
+/// to #289, not fixed here.
+pub async fn serve_host_client(
+    mut conn: Box<dyn Conn>,
+    peer: PeerAddr,
+    allowlist: &ExecutorAllowlist,
+    registry: &HostRegistry,
+) {
+    let peer_ip = match peer {
+        PeerAddr::Tcp(addr) => addr.ip(),
+        PeerAddr::Uds => {
+            tracing::warn!("a host-client connection arrived over UDS, not the mesh; refusing");
+            return;
+        }
+    };
+
+    let register = match tokio::time::timeout(REGISTER_TIMEOUT, read_frame::<HostClientMessage>(&mut conn)).await {
+        Ok(Ok(Some(HostClientMessage {
+            op: Some(host_client_message::Op::Register(register)),
+        }))) => register,
+        Ok(Ok(Some(_))) => {
+            tracing::warn!(peer = %peer_ip, "host-client's first frame was not Register; closing");
+            return;
+        }
+        Ok(Ok(None)) => return, // clean close before any frame: nothing to log
+        Ok(Err(e)) => {
+            tracing::warn!(peer = %peer_ip, error = %e, "host-client connection faulted reading Register");
+            return;
+        }
+        Err(_elapsed) => {
+            tracing::warn!(peer = %peer_ip, "host-client did not send Register within the timeout; closing");
+            return;
+        }
+    };
+
+    let host_id = register.host_id.clone();
+
+    // Allowlist membership first, before anything about the frame's content
+    // is checked (D5, #263): refusing on a missing `capabilities` field
+    // before this would hand an unauthenticated peer a different, more
+    // specific error than an allowlisted one — leaking that it passed a
+    // stage a merely-curious peer never should have reached. Every
+    // non-allowlisted peer gets the exact same generic refusal, regardless
+    // of what else is or isn't in its `Register` frame.
+    if !allowlist.permits(peer_ip) {
+        tracing::warn!(peer = %peer_ip, host_id, "Register refused: not a permitted executor host");
+        // #289: no deadline — a non-reading peer stalls this task, but the
+        // connection slot is the only cost (no registry entry exists yet).
+        let _ = write_frame(
+            &mut conn,
+            &OrchestratorMessage {
+                op: Some(orchestrator_message::Op::Refused(RegisterRefused {
+                    reason: RegisterError::NotAllowed.to_string(),
+                })),
+            },
+        )
+        .await;
+        return;
+    }
+
+    let capabilities = match register.capabilities {
+        Some(capabilities) => capabilities,
+        None => {
+            tracing::warn!(peer = %peer_ip, host_id, "Register carried no capabilities; refusing");
+            // #289: same undeadlined write as the allowlist refusal above.
+            let _ = write_frame(
+                &mut conn,
+                &OrchestratorMessage {
+                    op: Some(orchestrator_message::Op::Refused(RegisterRefused {
+                        reason: "capabilities required".to_owned(),
+                    })),
+                },
+            )
+            .await;
+            return;
+        }
+    };
+
+    let (mut dispatch_rx, registration) = match registry.register(allowlist, peer_ip, host_id.clone(), capabilities) {
+        Ok(registered) => registered,
+        Err(e) => {
+            // The allowlist check above already covers RegisterError::NotAllowed;
+            // reaching this arm means host_id was claimed by a different peer
+            // (D5's Register-authentication ruling, #263) — refused and
+            // logged, never more than "no" back.
+            tracing::warn!(peer = %peer_ip, host_id, error = %e, "Register refused: host_id already claimed");
+            // #289: same undeadlined write as the allowlist refusal above.
+            let _ = write_frame(
+                &mut conn,
+                &OrchestratorMessage {
+                    op: Some(orchestrator_message::Op::Refused(RegisterRefused {
+                        reason: e.to_string(),
+                    })),
+                },
+            )
+            .await;
+            return;
+        }
+    };
+
+    // #289: undeadlined, and unlike the three refusal writes above, the
+    // registry entry already exists at this point — a non-reading peer here
+    // stalls the registered host-client's own task with a live, dispatch-
+    // eligible entry nothing else will clean up until this write resolves.
+    if write_frame(
+        &mut conn,
+        &OrchestratorMessage {
+            op: Some(orchestrator_message::Op::Registered(Registered {
+                host_id: host_id.clone(),
+            })),
+        },
+    )
+    .await
+    .is_err()
+    {
+        registry.remove(&host_id, registration);
+        return;
+    }
+    tracing::info!(peer = %peer_ip, host_id, "host-client registered");
+
+    loop {
+        // CAUTION (#289): read_frame below is not cancel-safe (it does
+        // separate reads for the length prefix and the payload). Safe only
+        // because the other branch never fires mid-read today — stage 1 has
+        // no host-client-to-orchestrator message after Register, so this
+        // branch never actually resolves. Adding one makes a `Dispatch`
+        // arriving mid-read drop the partially-consumed frame and desync
+        // framing on the next read. Make this cancel-safe (split the
+        // connection, read frames in a dedicated task) before adding any
+        // such message — see #289.
+        tokio::select! {
+            dispatch = dispatch_rx.recv() => {
+                let Some(dispatch) = dispatch else {
+                    // The sending half was dropped: HostRegistry has no other
+                    // reference to this channel, so this only happens if the
+                    // registry entry was already replaced or removed.
+                    break;
+                };
+                // CAUTION (#289): this write has no deadline. A registered
+                // host that stops reading (its send buffer fills) stalls this
+                // branch indefinitely — the loop can't poll read_frame, so
+                // registry.remove never runs, and the dispatch channel fills
+                // after 8 buffered sends, stalling future send_dispatch calls
+                // too. Add an explicit deadline here, removing the
+                // registration on expiry, before relying on this path to stay
+                // responsive to a hung or hostile host-client.
+                if write_frame(
+                    &mut conn,
+                    &OrchestratorMessage { op: Some(orchestrator_message::Op::Dispatch(dispatch)) },
+                )
+                .await
+                .is_err()
+                {
+                    tracing::warn!(host_id, "failed writing Dispatch to host-client; closing");
+                    break;
+                }
+            }
+            frame = read_frame::<HostClientMessage>(&mut conn) => {
+                match frame {
+                    Ok(Some(_)) => {
+                        // Stage 1 has no re-registration or capability-update
+                        // machinery (#269): any further frame from the
+                        // host-client is unexpected but not fatal on its own.
+                        tracing::debug!(host_id, "ignoring an unexpected frame from a registered host-client");
+                    }
+                    Ok(None) => break, // clean close: the ordinary end of a connection
+                    Err(e) => {
+                        tracing::warn!(host_id, error = %e, "host-client connection faulted");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    registry.remove(&host_id, registration);
+    tracing::info!(host_id, "host-client disconnected");
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use anyhow::Context;
+    use sandy_executor_proto::{Arch, Capabilities, IsolationClass, Register, SandboxKind};
+
+    use super::*;
+
+    fn tcp_peer(ip: &str) -> PeerAddr {
+        PeerAddr::Tcp(SocketAddr::new(ip.parse().expect("ip literal"), 9000))
+    }
+
+    fn capabilities() -> Capabilities {
+        Capabilities {
+            kind: SandboxKind::Process.into(),
+            arch: Arch::X8664.into(),
+            attestation: false,
+            supported_isolation_classes: vec![IsolationClass::Trusted.into()],
+        }
+    }
+
+    #[tokio::test]
+    async fn an_allowed_host_registers_and_receives_a_queued_dispatch() -> anyhow::Result<()> {
+        let allowlist = ExecutorAllowlist::new(["100.64.0.7".parse()?]);
+        let registry = HostRegistry::default();
+        let (mut client, server) = tokio::io::duplex(4096);
+
+        write_frame(
+            &mut client,
+            &HostClientMessage {
+                op: Some(host_client_message::Op::Register(Register {
+                    host_id: "ws01".to_owned(),
+                    capabilities: Some(capabilities()),
+                })),
+            },
+        )
+        .await?;
+
+        let registry = std::sync::Arc::new(registry);
+        let allowlist = std::sync::Arc::new(allowlist);
+        let serve = tokio::spawn({
+            let registry = std::sync::Arc::clone(&registry);
+            let allowlist = std::sync::Arc::clone(&allowlist);
+            async move {
+                serve_host_client(Box::new(server), tcp_peer("100.64.0.7"), &allowlist, &registry).await;
+            }
+        });
+
+        let response: OrchestratorMessage = read_frame(&mut client)
+            .await?
+            .context("expected a Registered response")?;
+        assert!(matches!(response.op, Some(orchestrator_message::Op::Registered(_))));
+
+        let dispatch = sandy_executor_proto::Dispatch {
+            job_id: "job-1".to_owned(),
+            manifest: b"m".to_vec(),
+            manifest_encoding: "test/v1".to_owned(),
+            backend: SandboxKind::Process.into(),
+            link_token: vec![0u8; 32],
+            forward_back: "100.64.0.1:9000".to_owned(),
+            required_isolation_class: IsolationClass::Trusted.into(),
+        };
+        registry.send_dispatch("ws01", dispatch.clone()).await?;
+
+        let pushed: OrchestratorMessage = read_frame(&mut client).await?.context("expected a Dispatch push")?;
+        match pushed.op {
+            Some(orchestrator_message::Op::Dispatch(received)) => assert_eq!(received, dispatch),
+            other => anyhow::bail!("expected Dispatch, got {other:?}"),
+        }
+
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(5), serve).await??;
+        assert_eq!(
+            registry.capabilities_of("ws01"),
+            None,
+            "disconnecting must remove the host"
+        );
+        Ok(())
+    }
+
+    /// Adversarial (#263, D5): a peer not on the allowlist gets
+    /// `RegisterRefused`, never `Registered`, and is never dispatch-eligible.
+    #[tokio::test]
+    async fn an_unknown_peer_is_refused_not_registered() -> anyhow::Result<()> {
+        let allowlist = ExecutorAllowlist::new(["100.64.0.7".parse()?]);
+        let registry = HostRegistry::default();
+        let (mut client, server) = tokio::io::duplex(4096);
+
+        write_frame(
+            &mut client,
+            &HostClientMessage {
+                op: Some(host_client_message::Op::Register(Register {
+                    host_id: "impostor".to_owned(),
+                    capabilities: Some(capabilities()),
+                })),
+            },
+        )
+        .await?;
+
+        let serving = tokio::spawn(async move {
+            serve_host_client(Box::new(server), tcp_peer("100.64.0.9"), &allowlist, &registry).await;
+            registry
+        });
+
+        let response: OrchestratorMessage = read_frame(&mut client).await?.context("expected a response")?;
+        assert!(matches!(response.op, Some(orchestrator_message::Op::Refused(_))));
+
+        drop(client);
+        let registry = tokio::time::timeout(std::time::Duration::from_secs(5), serving).await??;
+        assert_eq!(registry.capabilities_of("impostor"), None);
+        Ok(())
+    }
+
+    /// Regression (sandy-91/infra-f3): a non-allowlisted peer must get the
+    /// exact same generic refusal regardless of what its `Register` frame
+    /// carries. Checking `capabilities` before the allowlist would hand an
+    /// unauthenticated peer a more specific error ("capabilities required")
+    /// than the generic one — leaking that it passed a stage it never
+    /// should have reached.
+    #[tokio::test]
+    async fn an_unknown_peer_with_no_capabilities_gets_the_generic_refusal() -> anyhow::Result<()> {
+        let allowlist = ExecutorAllowlist::new(["100.64.0.7".parse()?]);
+        let registry = HostRegistry::default();
+        let (mut client, server) = tokio::io::duplex(4096);
+
+        write_frame(
+            &mut client,
+            &HostClientMessage {
+                op: Some(host_client_message::Op::Register(Register {
+                    host_id: "impostor".to_owned(),
+                    capabilities: None,
+                })),
+            },
+        )
+        .await?;
+
+        let serving = tokio::spawn(async move {
+            serve_host_client(Box::new(server), tcp_peer("100.64.0.9"), &allowlist, &registry).await;
+        });
+
+        let response: OrchestratorMessage = read_frame(&mut client).await?.context("expected a response")?;
+        match response.op {
+            Some(orchestrator_message::Op::Refused(RegisterRefused { reason })) => {
+                assert_eq!(reason, RegisterError::NotAllowed.to_string());
+            }
+            other => anyhow::bail!("expected Refused with the generic reason, got {other:?}"),
+        }
+
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(5), serving).await??;
+        Ok(())
+    }
+
+    /// Regression: a connection that never sends `Register` must not be held
+    /// open forever — it's closed once `REGISTER_TIMEOUT` elapses.
+    #[tokio::test(start_paused = true)]
+    async fn a_host_that_never_sends_register_is_disconnected_after_the_timeout() -> anyhow::Result<()> {
+        let allowlist = ExecutorAllowlist::new(["100.64.0.7".parse()?]);
+        let registry = HostRegistry::default();
+        let (client, server) = tokio::io::duplex(4096);
+
+        let serving = tokio::spawn(async move {
+            serve_host_client(Box::new(server), tcp_peer("100.64.0.7"), &allowlist, &registry).await;
+        });
+
+        tokio::time::advance(REGISTER_TIMEOUT + std::time::Duration::from_millis(1)).await;
+        serving.await?; // bounded by the virtual-clock advance above, not real time
+        drop(client);
+        Ok(())
+    }
+}
