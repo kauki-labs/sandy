@@ -2170,6 +2170,7 @@ dependencies = [
  "sandy-api",
  "sandy-backend",
  "sandy-control-proto",
+ "sandy-executor-proto",
  "sandy-fabric",
  "sandy-fabric-local",
  "sandy-fsutil",
