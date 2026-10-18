@@ -157,7 +157,19 @@ async fn main() {
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "failed to accept a connection");
-                        backoff.wait_and_grow().await;
+                        // Raced against shutdown, not a plain await: at the
+                        // backoff cap (5s) an unraced sleep would make
+                        // shutdown wait up to 5s just to re-poll this select!,
+                        // on top of the mesh task's own drain main then waits
+                        // on — compounding delay for no reason once a
+                        // shutdown signal has already arrived.
+                        tokio::select! {
+                            () = backoff.wait_and_grow() => {}
+                            _ = shutdown_rx.changed() => {
+                                tracing::info!("shutdown signal received during accept backoff; no longer accepting new connections");
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -366,7 +378,16 @@ async fn run_mesh_accept_loop(mesh: MeshSetup, mut shutdown_rx: tokio::sync::wat
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "failed to accept a mesh connection");
-                        backoff.wait_and_grow().await;
+                        // Raced against shutdown — see the UDS loop's own
+                        // identical comment in main() for why an unraced
+                        // sleep here would compound shutdown latency.
+                        tokio::select! {
+                            () = backoff.wait_and_grow() => {}
+                            _ = shutdown_rx.changed() => {
+                                tracing::info!("shutdown signal received during accept backoff; mesh listener no longer accepting new connections");
+                                break;
+                            }
+                        }
                     }
                 }
             }
