@@ -8,6 +8,13 @@
 //! Unset is the default and still fully supported: `sandyd` with no mesh env
 //! vars set stays local-only, exactly today's behavior. M2 cross-machine
 //! dispatch is additive, not a requirement to run `sandyd` at all.
+//!
+//! CAUTION: a loopback listen address (`127.0.0.1:PORT`) with a
+//! `127.0.0.1`-only allowlist is a valid configuration this module accepts,
+//! but it authenticates nothing more than "some process on this machine" —
+//! every local user can reach it. That may be fine for local development,
+//! but production deployments must set the real mesh address (D5), not
+//! loopback, for the allowlist to mean anything.
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -19,6 +26,14 @@ pub enum MeshConfigError {
     /// `SANDY_MESH_LISTEN`'s value is not a valid `host:port` socket address.
     #[error("SANDY_MESH_LISTEN is not a valid socket address: {0:?}")]
     InvalidListenAddr(String),
+    /// `SANDY_MESH_LISTEN`'s value is an unspecified address (`0.0.0.0` or
+    /// `::`), which binds every interface rather than the mesh address alone
+    /// (D5: mesh-address-only). A wildcard bind would expose the pre-auth
+    /// surface (the `Register` timeout window, the uncapped per-connection
+    /// spawn, the frame parser) to every network the host is on, not just
+    /// the mesh.
+    #[error("SANDY_MESH_LISTEN ({0:?}) is an unspecified address (0.0.0.0/::); D5 requires a specific mesh address")]
+    UnspecifiedListenAddr(String),
     /// One comma-separated entry in `SANDY_MESH_ALLOWLIST` is not a valid IP
     /// address.
     #[error("SANDY_MESH_ALLOWLIST entry is not a valid IP address: {0:?}")]
@@ -29,15 +44,23 @@ pub enum MeshConfigError {
 /// channel's mesh bind address. `None` (the env var unset) stays `None` —
 /// `sandyd` does not bind a mesh listener at all in that case.
 ///
+/// Shared by every mesh listener this daemon binds (#290's agent-link accept
+/// included, once wired) — the unspecified-address refusal belongs here, not
+/// duplicated per caller, so no mesh listener can land without it.
+///
 /// # Errors
 /// [`MeshConfigError::InvalidListenAddr`] if set but not a valid `host:port`
-/// socket address.
+/// socket address; [`MeshConfigError::UnspecifiedListenAddr`] if it parses
+/// but names `0.0.0.0` or `::` (every interface, not the mesh alone).
 pub fn parse_mesh_listen_addr(value: Option<&str>) -> Result<Option<SocketAddr>, MeshConfigError> {
     let Some(value) = value else { return Ok(None) };
-    value
+    let addr: SocketAddr = value
         .parse()
-        .map(Some)
-        .map_err(|_| MeshConfigError::InvalidListenAddr(value.to_owned()))
+        .map_err(|_| MeshConfigError::InvalidListenAddr(value.to_owned()))?;
+    if addr.ip().is_unspecified() {
+        return Err(MeshConfigError::UnspecifiedListenAddr(value.to_owned()));
+    }
+    Ok(Some(addr))
 }
 
 /// Parse `SANDY_MESH_ALLOWLIST`'s raw value: a comma-separated list of IP
@@ -100,6 +123,21 @@ mod tests {
         assert_eq!(
             parse_mesh_listen_addr(Some("100.64.0.1")),
             Err(MeshConfigError::InvalidListenAddr("100.64.0.1".to_owned()))
+        );
+    }
+
+    /// Adversarial (D5, sandy-73): a wildcard bind exposes the pre-auth
+    /// surface off-mesh, on every interface the host has — IPv4 and IPv6
+    /// unspecified forms both refused, not just one.
+    #[test]
+    fn an_unspecified_listen_addr_is_refused_on_both_ip_versions() {
+        assert_eq!(
+            parse_mesh_listen_addr(Some("0.0.0.0:7700")),
+            Err(MeshConfigError::UnspecifiedListenAddr("0.0.0.0:7700".to_owned()))
+        );
+        assert_eq!(
+            parse_mesh_listen_addr(Some("[::]:7700")),
+            Err(MeshConfigError::UnspecifiedListenAddr("[::]:7700".to_owned()))
         );
     }
 
