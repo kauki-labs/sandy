@@ -220,6 +220,18 @@ pub async fn handle(
                 // refuses if `host_id` has since been reclaimed by a
                 // different connection than the one actually picked.
                 //
+                // CAUTION (#289): this `.await` is undeadlined — it blocks
+                // on the host's bounded (capacity 8) dispatch channel, which
+                // backs up exactly when `host_conn`'s own `write_frame` to
+                // that host stalls (a registered-but-not-reading peer). A
+                // slow/hung host can therefore delay THIS Submit response
+                // indefinitely, one layer above the write itself. #289 item
+                // 2 (the write-frame deadline, same owner) bounds this
+                // transitively: once that write times out and closes the
+                // connection, this channel's receiver drops and a blocked
+                // send here fails fast instead of hanging. Deferred to #289,
+                // not fixed here.
+                //
                 // KNOWN GAP (#292's reconnect-dispatch-preservation class):
                 // on any failure here — including `RegistrationChanged` —
                 // the job stays silently `Pending` with no re-placement
