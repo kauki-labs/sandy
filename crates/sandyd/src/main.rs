@@ -81,20 +81,20 @@ async fn main() {
     // cross-machine dispatch. A configured listen address with an empty
     // allowlist is refused outright at startup, not silently bound — a
     // listener nobody can ever pass is a forgotten config line, not a
-    // deliberate "allow no one" policy. Runs as its own background task
-    // (not folded into the daemon's main accept loop below) since it has its
-    // own independent connection set and no shared state with the UDS
-    // control-socket path beyond the process itself.
-    match setup_mesh_listener().await {
-        Ok(Some(mesh)) => {
-            tokio::spawn(run_mesh_accept_loop(mesh));
-        }
-        Ok(None) => {}
+    // deliberate "allow no one" policy. Runs as its own task (not folded
+    // into the daemon's main accept loop below) since it has its own
+    // independent connection set and no shared state with the UDS
+    // control-socket path beyond the process itself — but joined at
+    // shutdown below, not fire-and-forgotten, so its own graceful drain
+    // gets a real window to run.
+    let mesh_task = match setup_mesh_listener().await {
+        Ok(Some(mesh)) => Some(tokio::spawn(run_mesh_accept_loop(mesh))),
+        Ok(None) => None,
         Err(e) => {
             tracing::error!(error = %e, "could not set up the mesh management-channel listener");
             std::process::exit(1);
         }
-    }
+    };
 
     let mut connections = tokio::task::JoinSet::new();
     let shutdown = shutdown_signal();
@@ -140,6 +140,17 @@ async fn main() {
             remaining = connections.len(),
             "shutdown grace period elapsed with connections still in flight; exiting anyway"
         );
+    }
+
+    // Join the mesh listener's own task so its shutdown drain (bounded by
+    // its own SHUTDOWN_GRACE, started by the same shutdown signal) gets a
+    // real window to run — a fire-and-forget spawn would let the runtime
+    // drop it mid-drain the moment `main` returns, defeating the point of
+    // coordinating the shutdown at all.
+    if let Some(mesh_task) = mesh_task {
+        if let Err(e) = mesh_task.await {
+            tracing::warn!(error = %e, "the mesh listener's task panicked during shutdown");
+        }
     }
 }
 
@@ -276,16 +287,22 @@ async fn setup_mesh_listener() -> std::io::Result<Option<MeshSetup>> {
     }))
 }
 
-/// Accept host-client connections on `mesh.listener` until it errors
-/// persistently, serving each with [`sandyd::host_conn::serve_host_client`]
-/// against one shared [`HostRegistry`] for this listener's whole lifetime.
-/// Mirrors `main`'s own UDS accept loop shape (reap-as-you-go via `JoinSet`,
-/// backoff on a failed `accept()`), but runs as its own detached task since
-/// it shares no state with the control-socket path beyond the process.
+/// Accept host-client connections on `mesh.listener` until shutdown, serving
+/// each with [`sandyd::host_conn::serve_host_client`] against one shared
+/// [`HostRegistry`] for this listener's whole lifetime. Mirrors `main`'s own
+/// UDS accept loop shape exactly (reap-as-you-go via `JoinSet`, backoff on a
+/// failed `accept()`, stop accepting on shutdown then drain in-flight
+/// connections within [`SHUTDOWN_GRACE`]) — runs as its own spawned task
+/// since it shares no state with the control-socket path beyond the process,
+/// but shuts down in step with it rather than being abruptly cancelled: a
+/// second, independent call to [`shutdown_signal`] resolves on the same
+/// `SIGTERM`/`SIGINT` tokio's signal driver supports multiple listeners for.
 async fn run_mesh_accept_loop(mesh: MeshSetup) {
     let MeshSetup { listener, allowlist } = mesh;
     let host_registry = Arc::new(HostRegistry::default());
     let mut connections = tokio::task::JoinSet::new();
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
 
     loop {
         tokio::select! {
@@ -305,7 +322,25 @@ async fn run_mesh_accept_loop(mesh: MeshSetup) {
                 }
             }
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
+            () = &mut shutdown => {
+                tracing::info!("shutdown signal received; mesh listener no longer accepting new connections");
+                break;
+            }
         }
+    }
+
+    drop(listener); // stop accepting; existing host-client connections keep running
+
+    if tokio::time::timeout(SHUTDOWN_GRACE, async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await
+    .is_err()
+    {
+        tracing::warn!(
+            remaining = connections.len(),
+            "mesh listener's shutdown grace period elapsed with connections still in flight; exiting anyway"
+        );
     }
 }
 
