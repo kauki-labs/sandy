@@ -14,7 +14,7 @@ use sandy_host_client::{
     capability::detect_register_capabilities,
     client_config::{ClientConfig, parse_client_config},
     dispatch::handle_dispatch,
-    run::{register, run_dispatch_loop},
+    run::{DispatchLoopExit, REGISTER_RESPONSE_TIMEOUT, register, run_dispatch_loop},
 };
 use sandy_impls_local::SystemdRunContainment;
 
@@ -49,7 +49,7 @@ async fn main() {
         }
     };
 
-    if let Err(e) = register(&mut conn, &config.host_id, capabilities).await {
+    if let Err(e) = register(&mut conn, &config.host_id, capabilities, REGISTER_RESPONSE_TIMEOUT).await {
         tracing::error!(error = %e, host_id = %config.host_id, "registration failed");
         std::process::exit(1);
     }
@@ -57,7 +57,7 @@ async fn main() {
 
     let rt = tokio::runtime::Handle::current();
     let agent_path = config.agent_path;
-    run_dispatch_loop(
+    let exit = run_dispatch_loop(
         &mut conn,
         move |dispatch| {
             let rt = rt.clone();
@@ -91,6 +91,24 @@ async fn main() {
         shutdown_signal(),
     )
     .await;
+
+    // A requested shutdown (SIGTERM/SIGINT) exits 0; anything else means the
+    // connection died out from under this process — exit non-zero so the
+    // supervisor restarts it, matching stage 1's "no in-process reconnect,
+    // the supervisor owns that" design (decision 12). Returning unconditionally
+    // here would make a disconnected host-client exit 0, silently defeating
+    // that design (CodeRabbit finding on #294).
+    match exit {
+        DispatchLoopExit::Shutdown => {}
+        DispatchLoopExit::Closed => {
+            tracing::error!("the orchestrator closed the connection; exiting for the supervisor to restart");
+            std::process::exit(1);
+        }
+        DispatchLoopExit::Faulted(reason) => {
+            tracing::error!(reason, "the connection faulted; exiting for the supervisor to restart");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// `SANDY_HOST_CLIENT_ORCHESTRATOR`/`SANDY_HOST_CLIENT_ID`/`SANDY_AGENT_PATH`,
