@@ -234,6 +234,84 @@ mod tests {
         Ok(())
     }
 
+    /// Adversarial: a stream presenting the right job id and token but
+    /// arriving from a peer IP other than the one recorded at dispatch is
+    /// refused with zero bytes — the mesh-IP check is defense in depth
+    /// alongside the token, not skippable just because the token matched.
+    #[tokio::test]
+    async fn a_wrong_peer_is_refused_with_zero_bytes() -> anyhow::Result<()> {
+        let listener = listen(&loopback(0)).await.context("listen")?;
+        let addr = listener.local_addr().context("local_addr")?;
+        // The job is bound to a DIFFERENT executor IP than the one this test
+        // actually connects from (loopback), so the real peer never matches.
+        let (registry, job_id, token) = new_registry_with_remote_job(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 9))).await?;
+
+        let accept_registry = Arc::clone(&registry);
+        let accepting = tokio::spawn(async move {
+            let (conn, peer) = listener.accept().await.expect("accept");
+            serve_one_remote_link(conn, peer, &accept_registry).await;
+        });
+
+        let mut client = connect(&loopback(addr.port())).await.context("connect")?;
+        let prefix = encode_remote_link_prefix(&job_id, &token).expect("encode prefix");
+        tokio::io::AsyncWriteExt::write_all(&mut client, &prefix)
+            .await
+            .context("write prefix")?;
+
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read(&mut client, &mut buf),
+        )
+        .await
+        .context("timed out waiting for the refusal close")?
+        .context("read after refusal")?;
+        assert_eq!(n, 0, "a wrong peer must close the stream having written zero bytes");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), accepting).await??;
+        Ok(())
+    }
+
+    /// Adversarial: a stream that sends bytes that don't decode as a valid
+    /// run-id+token prefix (not merely one that times out mid-send) is
+    /// refused with zero bytes — a malformed prefix is a distinct failure
+    /// mode from the timeout case above, not the same code path.
+    #[tokio::test]
+    async fn a_malformed_prefix_is_refused_with_zero_bytes() -> anyhow::Result<()> {
+        let listener = listen(&loopback(0)).await.context("listen")?;
+        let addr = listener.local_addr().context("local_addr")?;
+        let registry = Arc::new(JobRegistry::new().context("registry")?);
+
+        let accept_registry = Arc::clone(&registry);
+        let accepting = tokio::spawn(async move {
+            let (conn, peer) = listener.accept().await.expect("accept");
+            serve_one_remote_link(conn, peer, &accept_registry).await;
+        });
+
+        let mut client = connect(&loopback(addr.port())).await.context("connect")?;
+        // A declared length far beyond MAX_JOB_ID_LEN: rejected by the codec
+        // itself before it would ever try to read that many bytes.
+        tokio::io::AsyncWriteExt::write_all(&mut client, &u32::MAX.to_be_bytes())
+            .await
+            .context("write a malformed prefix")?;
+
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read(&mut client, &mut buf),
+        )
+        .await
+        .context("timed out waiting for the refusal close")?
+        .context("read after refusal")?;
+        assert_eq!(
+            n, 0,
+            "a malformed prefix must close the stream having written zero bytes"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), accepting).await??;
+        Ok(())
+    }
+
     /// Adversarial: a job's link, once claimed by a first authenticated
     /// stream, refuses a second stream presenting the same valid token — the
     /// one-link-per-run invariant holds through the real network path, not
