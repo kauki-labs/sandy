@@ -781,6 +781,14 @@ happy path).
   (`a_submit_never_places_on_a_host_lacking_the_required_isolation_class`,
   through a real `handle(Submit)` call) test proving it — the second so the
   real flow's fail-closed behavior is proven, not just the unit's.
+- `PlacementCandidate` binds to the exact `RegistrationId` picked, not the
+  bare `host_id`: without this, a connection disconnecting and a DIFFERENT
+  allowlisted peer reclaiming the same self-reported `host_id` in the gap
+  between picking and sending would deliver the dispatch to the wrong
+  connection (CodeRabbit, #301). `HostRegistry::send_dispatch_if_current`
+  refuses with `DispatchSendError::RegistrationChanged` in that case; plain
+  `send_dispatch` (unchanged) is still used wherever the caller doesn't need
+  this check.
 
 **Consequences.** `handle`'s signature grew two parameters; every call site
 (the real one in `main.rs`/`lib.rs`, and ~20 in `handler.rs`'s own test
@@ -788,6 +796,20 @@ module) was updated. Placement's stage-1 policy is "the first registered
 host whose declared capabilities satisfy the required class, arbitrary
 order" — correct for D5's single-executor model, not a real scheduler;
 revisit once more than one executor exists to choose between.
+
+**Known gap, explicitly not fixed here** (#292's reconnect-dispatch-
+preservation class): when `send_dispatch_if_current` refuses —
+`RegistrationChanged` or any other `DispatchSendError` — the job stays
+silently `Pending`, with no re-placement attempt and no distinct terminal
+status a caller could poll for. This does not introduce a new strand; it
+only moves the existing "a placed job can silently never run" gap earlier,
+from the agent-link stream (decision 6's own token-based refusal) to
+`send_dispatch` time. Stage-1 accepts it as the same honest gap every other
+un-run `Pending` job already has in this module (no retry, no scheduler).
+#292 tracks closing it for real: either re-queue the undelivered dispatch
+onto a reconnecting host, or surface non-delivery as a distinct status
+rather than leaving a stranded job externally indistinguishable from a slow
+one.
 
 **Set aside.** Adding a `SubmitRequest.required_isolation_class` wire field
 now (the alternative to the stage-1 constant): premature configurability for

@@ -219,6 +219,17 @@ pub async fn handle(
                 // `send_dispatch_if_current` (not plain `send_dispatch`)
                 // refuses if `host_id` has since been reclaimed by a
                 // different connection than the one actually picked.
+                //
+                // KNOWN GAP (#292's reconnect-dispatch-preservation class):
+                // on any failure here — including `RegistrationChanged` —
+                // the job stays silently `Pending` with no re-placement
+                // attempt and no distinct terminal status a caller could
+                // poll for; this only moves the existing "a placed job can
+                // silently never run" strand earlier (to send time) rather
+                // than eliminating it. Stage-1 accepts this as the same
+                // honest gap every other un-run `Pending` job already has in
+                // this module (no retry, no scheduler) — #292 tracks closing
+                // it for good (re-queue on reconnect, or a distinct status).
                 if let Err(e) = host_registry
                     .send_dispatch_if_current(&host_id, registration, dispatch)
                     .await
