@@ -5,7 +5,7 @@
 //! and shuts down on `SIGTERM`/`SIGINT`: stops accepting new connections and
 //! waits (briefly, bounded) for in-flight ones to finish before exiting.
 
-use std::{os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc, time::Duration};
+use std::{net::SocketAddr, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc, time::Duration};
 
 use sandy_conn::{ConnAddr, Listener as MeshListener};
 use sandyd::{
@@ -122,6 +122,13 @@ async fn main() {
         let _ = shutdown_tx.send(true);
     });
 
+    // One HostRegistry (#298), shared between the mesh management-channel
+    // loop below (which registers connected host-clients) and the
+    // control-socket path (which reads it for placement on Submit) — not
+    // two separate registries, or a host registered on the mesh listener
+    // would be invisible to a job submitted over the UDS socket.
+    let host_registry = Arc::new(HostRegistry::default());
+
     // The mesh management-channel listener (#291): unset by default, so
     // sandyd stays local-only unless an operator explicitly configures M2
     // cross-machine dispatch. A configured listen address with an empty
@@ -130,14 +137,44 @@ async fn main() {
     // deliberate "allow no one" policy. Runs as its own task (not folded
     // into the daemon's main accept loop below) since it has its own
     // independent connection set and no shared state with the UDS
-    // control-socket path beyond the process itself — but joined at
-    // shutdown below, not fire-and-forgotten, so its own graceful drain
-    // gets a real window to run.
+    // control-socket path beyond `host_registry` and the process itself —
+    // but joined at shutdown below, not fire-and-forgotten, so its own
+    // graceful drain gets a real window to run.
     let mesh_task = match setup_mesh_listener().await {
-        Ok(Some(mesh)) => Some(tokio::spawn(run_mesh_accept_loop(mesh, shutdown_rx.clone()))),
+        Ok(Some(mesh)) => Some(tokio::spawn(run_mesh_accept_loop(
+            mesh,
+            Arc::clone(&host_registry),
+            shutdown_rx.clone(),
+        ))),
         Ok(None) => None,
         Err(e) => {
             tracing::error!(error = %e, "could not set up the mesh management-channel listener");
+            std::process::exit(1);
+        }
+    };
+
+    // The mesh agent-link accept listener (#279/#298): where a dispatched
+    // job's executor dials back to forward its agent link (decision 6).
+    // Unset by default, like the management listener above — no address
+    // configured means no remote placement is even reachable, so `handle`
+    // never picks a remote host regardless of what's registered (see
+    // `forward_back_addr` below). Spawned plainly, not joined at shutdown:
+    // `sandyd::mesh_accept::serve_mesh_accept_loop` has no graceful-shutdown
+    // support of its own yet (#289-class follow-up), so this loop is
+    // abruptly cancelled on process exit like every other unhandled task —
+    // an accepted-but-not-yet-authenticated agent-link connection is cheap
+    // to lose, unlike a registered host-client's live dispatch channel.
+    let forward_back_addr = match setup_mesh_agent_link_listener().await {
+        Ok(Some((listener, addr))) => {
+            let registry = Arc::clone(&registry);
+            tokio::spawn(async move {
+                sandyd::mesh_accept::serve_mesh_accept_loop(&listener, &registry).await;
+            });
+            Some(addr)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            tracing::error!(error = %e, "could not set up the mesh agent-link accept listener");
             std::process::exit(1);
         }
     };
@@ -153,7 +190,8 @@ async fn main() {
                         backoff.reset();
                         let store = Arc::clone(&store);
                         let registry = Arc::clone(&registry);
-                        connections.spawn(sandyd::serve_connection(stream, store, registry));
+                        let host_registry = Arc::clone(&host_registry);
+                        connections.spawn(sandyd::serve_connection(stream, store, registry, host_registry, forward_back_addr));
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "failed to accept a connection");
@@ -345,22 +383,49 @@ async fn setup_mesh_listener() -> std::io::Result<Option<MeshSetup>> {
     }))
 }
 
+/// Resolve and bind the mesh agent-link accept listener (#279/#298) from
+/// `$SANDY_MESH_AGENT_LINK_LISTEN` — the address a dispatched job's executor
+/// dials back to forward its agent link (decision 6). `Ok(None)` if unset:
+/// no remote placement is reachable in that case, regardless of what hosts
+/// are registered on the management channel, since there is nowhere valid to
+/// tell an executor to dial back to.
+///
+/// # Errors
+/// The env var fails to parse (including naming an unspecified address, D5),
+/// or the bind itself fails.
+async fn setup_mesh_agent_link_listener() -> std::io::Result<Option<(MeshListener, SocketAddr)>> {
+    let addr = parse_mesh_listen_addr(std::env::var("SANDY_MESH_AGENT_LINK_LISTEN").ok().as_deref())
+        .map_err(std::io::Error::other)?;
+    let Some(addr) = addr else { return Ok(None) };
+
+    let listener = sandy_conn::listen(&ConnAddr::Tcp(addr))
+        .await
+        .map_err(std::io::Error::other)?;
+    tracing::info!(addr = %addr, "sandyd mesh agent-link accept listener bound");
+    Ok(Some((listener, addr)))
+}
+
 /// Accept host-client connections on `mesh.listener` until shutdown, serving
-/// each with [`sandyd::host_conn::serve_host_client`] against one shared
-/// [`HostRegistry`] for this listener's whole lifetime. Mirrors `main`'s own
-/// UDS accept loop shape exactly (reap-as-you-go via `JoinSet`, exponential
-/// backoff on a failed `accept()`, stop accepting on shutdown then drain
-/// in-flight connections within [`SHUTDOWN_GRACE`]) — runs as its own
-/// spawned task since it shares no state with the control-socket path beyond
-/// the process, but shuts down in step with it via `shutdown_rx`, the same
-/// shared signal `main` forwards from its own single `shutdown_signal()`
-/// registration (never a second independent one here — a signal arriving in
-/// the gap between two separate registrations would never reach the later
-/// one, since tokio does not replay a signal to a listener that starts
-/// listening after it fired).
-async fn run_mesh_accept_loop(mesh: MeshSetup, mut shutdown_rx: tokio::sync::watch::Receiver<bool>) {
+/// each with [`sandyd::host_conn::serve_host_client`] against `host_registry`
+/// — the same registry the control-socket/handler path reads for placement
+/// (#298), not a loop-local one: a host registered here must be visible to a
+/// `Submit` landing on the UDS socket, or placement could never see it.
+/// Mirrors `main`'s own UDS accept loop shape exactly (reap-as-you-go via
+/// `JoinSet`, exponential backoff on a failed `accept()`, stop accepting on
+/// shutdown then drain in-flight connections within [`SHUTDOWN_GRACE`]) —
+/// runs as its own spawned task since it shares no state with the
+/// control-socket path beyond `host_registry` and the process, but shuts
+/// down in step with it via `shutdown_rx`, the same shared signal `main`
+/// forwards from its own single `shutdown_signal()` registration (never a
+/// second independent one here — a signal arriving in the gap between two
+/// separate registrations would never reach the later one, since tokio does
+/// not replay a signal to a listener that starts listening after it fired).
+async fn run_mesh_accept_loop(
+    mesh: MeshSetup,
+    host_registry: Arc<HostRegistry>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
     let MeshSetup { listener, allowlist } = mesh;
-    let host_registry = Arc::new(HostRegistry::default());
     let mut connections = tokio::task::JoinSet::new();
     let mut backoff = AcceptBackoff::new();
 

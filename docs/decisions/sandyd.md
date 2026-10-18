@@ -709,3 +709,112 @@ trusted-process jobs first (shared bwrap/cgroup containment is one host-wide
 resource today, not yet modeled as something multiple jobs can safely share
 or must contend for) — a real design gap, not a detail this slice can paper
 over by just calling `tokio::spawn` per dispatch.
+
+## 15. Orchestrator placement wiring: one shared `HostRegistry`, stage-1 required-class default, dispatch from the real submit path (#298)
+
+**Status:** implemented.
+
+**Context.** The cross-machine protocol's pieces (decision 6's auth,
+decision 12's `Register`/`Dispatch` connection, #279's agent-link accept
+loop, #291/#293's mesh listeners) all landed, but nothing connected them:
+`HostRegistry` was minted local to the mesh-accept loop in `main.rs`, never
+visible to the control-socket/`handler` path; `handler::handle`'s `Submit`
+arm never called `HostRegistry::send_dispatch`; `mesh_accept::serve_mesh_accept_loop`
+(#279) was built but never invoked from `main.rs`. A submitted job could
+never reach a registered remote executor — #277's PR body flagged this as a
+known follow-on that hadn't landed (#298, found by sandy-d9 building #272's
+happy path).
+
+**Decision.**
+
+- One `HostRegistry`, constructed once in `main`, `Arc`-shared between the
+  mesh management-channel accept loop (which registers connected
+  host-clients) and the control-socket path (which reads it for placement on
+  `Submit`) — not two registries, or a host registered on the mesh listener
+  would be invisible to a job submitted over the UDS socket.
+- The mesh agent-link accept listener (`mesh_accept::serve_mesh_accept_loop`,
+  built in #279/#290) is now wired into `main.rs`, bound from a new
+  `$SANDY_MESH_AGENT_LINK_LISTEN` env var (the same `parse_mesh_listen_addr`
+  #291 already built, including its D5 unspecified-address refusal) —
+  without a real bound address, `Dispatch.forward_back` would have nowhere
+  valid to point an executor at. This was implicit in #298's "send_dispatch
+  with ... a forward-back address" acceptance bar, not a separate line item,
+  but it is real added scope: the component-level "protocol complete" status
+  after #290 was still one wiring step short of an actual reachable address.
+  Not joined at shutdown (unlike the other two loops): `serve_mesh_accept_loop`
+  has no graceful-shutdown support of its own yet (tracked under #289's
+  robustness class) — an accepted-but-unauthenticated agent-link connection
+  is cheap to lose on abrupt cancellation, unlike a host-client's live
+  dispatch channel.
+- `handler::handle` gained two parameters (`host_registry`,
+  `forward_back_addr: Option<SocketAddr>`) and a placement step in `Submit`:
+  after minting the job's channel but before persisting it, pick a
+  registered host via `HostRegistry::pick_host_for(STAGE1_REQUIRED_ISOLATION_CLASS)`
+  — `None` if `forward_back_addr` is unset (no address configured means no
+  remote run is reachable regardless of what's registered) or no host
+  qualifies. If one is picked: mint a decision-6 `RemoteLink` bound to its
+  peer IP, set it on the job's channel, persist and register the job as
+  usual, then call `send_dispatch` — best-effort: a failure (e.g. the host
+  disconnected in the narrow window between being picked and the send) logs
+  a warning and leaves the job `Pending` rather than failing `Submit` for a
+  placement optimization the caller never asked to observe directly. No
+  host picked (including none registered, or none configured) means the job
+  stays local, today's unchanged behavior.
+- Stage-1 required-class default: `STAGE1_REQUIRED_ISOLATION_CLASS = IsolationClass::Trusted`,
+  a named constant with a loud tripwire comment at its definition (not an
+  inline magic value), because nothing on the submit path can express an
+  isolation requirement today — `SubmitRequest` has no such field, and
+  stage-1 (#269 D4) has no VM/untrusted backend, so an untrusted job is
+  genuinely inexpressible and unrunnable, not merely unimplemented. This is
+  accurate for stage-1, not a shortcut: adding a `SubmitRequest` wire field
+  for a value that can't vary until #150 (VM/untrusted isolation) lands
+  would be premature configurability. The tripwire comment names the exact
+  replacement: when #150 lands, this constant must become a real per-job
+  requirement on the submit path, or an untrusted job would silently default
+  to `Trusted` and breach isolation.
+- `HostRegistry::pick_host_for` enforces the same fail-closed-on-`Unspecified`
+  rule `send_dispatch` already does, so placement can never pick a host
+  `send_dispatch` would then refuse anyway — the gate applies at the
+  placement point, not only at the send, with both a registry-level
+  (`pick_host_for_skips_a_host_that_does_not_support_the_required_class`)
+  and a handler-integration-level
+  (`a_submit_never_places_on_a_host_lacking_the_required_isolation_class`,
+  through a real `handle(Submit)` call) test proving it — the second so the
+  real flow's fail-closed behavior is proven, not just the unit's.
+- `PlacementCandidate` binds to the exact `RegistrationId` picked, not the
+  bare `host_id`: without this, a connection disconnecting and a DIFFERENT
+  allowlisted peer reclaiming the same self-reported `host_id` in the gap
+  between picking and sending would deliver the dispatch to the wrong
+  connection (CodeRabbit, #301). `HostRegistry::send_dispatch_if_current`
+  refuses with `DispatchSendError::RegistrationChanged` in that case; plain
+  `send_dispatch` (unchanged) is still used wherever the caller doesn't need
+  this check.
+
+**Consequences.** `handle`'s signature grew two parameters; every call site
+(the real one in `main.rs`/`lib.rs`, and ~20 in `handler.rs`'s own test
+module) was updated. Placement's stage-1 policy is "the first registered
+host whose declared capabilities satisfy the required class, arbitrary
+order" — correct for D5's single-executor model, not a real scheduler;
+revisit once more than one executor exists to choose between.
+
+**Known gap, explicitly not fixed here** (#292's reconnect-dispatch-
+preservation class): when `send_dispatch_if_current` refuses —
+`RegistrationChanged` or any other `DispatchSendError` — the job stays
+silently `Pending`, with no re-placement attempt and no distinct terminal
+status a caller could poll for. This does not introduce a new strand; it
+only moves the existing "a placed job can silently never run" gap earlier,
+from the agent-link stream (decision 6's own token-based refusal) to
+`send_dispatch` time. Stage-1 accepts it as the same honest gap every other
+un-run `Pending` job already has in this module (no retry, no scheduler).
+#292 tracks closing it for real: either re-queue the undelivered dispatch
+onto a reconnecting host, or surface non-delivery as a distinct status
+rather than leaving a stranded job externally indistinguishable from a slow
+one.
+
+**Set aside.** Adding a `SubmitRequest.required_isolation_class` wire field
+now (the alternative to the stage-1 constant): premature configurability for
+a value that cannot vary until #150 lands — see the tripwire comment at
+`STAGE1_REQUIRED_ISOLATION_CLASS`'s definition. A real scheduling policy
+(load, affinity, multiple qualifying hosts): stage-1 has at most one
+executor in practice, so "first match" is equivalent to "the match"; nothing
+to decide between yet.

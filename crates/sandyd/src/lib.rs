@@ -15,9 +15,10 @@ pub mod mesh_accept;
 pub mod mesh_config;
 pub mod store;
 
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use dispatch::JobRegistry;
+use host_registry::HostRegistry;
 use sandy_control_proto::{ControlRequest, read_frame, write_frame};
 use store::JobStore;
 use tokio::net::UnixStream;
@@ -31,7 +32,13 @@ use tokio::net::UnixStream;
 /// faulting frame — a single connection's own fault never brings down the
 /// listener or any other connection, which is why this takes an owned stream
 /// and is meant to run as its own task.
-pub async fn serve_connection(mut stream: UnixStream, store: Arc<JobStore>, registry: Arc<JobRegistry>) {
+pub async fn serve_connection(
+    mut stream: UnixStream,
+    store: Arc<JobStore>,
+    registry: Arc<JobRegistry>,
+    host_registry: Arc<HostRegistry>,
+    forward_back_addr: Option<SocketAddr>,
+) {
     loop {
         let request: ControlRequest = match read_frame(&mut stream).await {
             Ok(Some(request)) => request,
@@ -43,7 +50,7 @@ pub async fn serve_connection(mut stream: UnixStream, store: Arc<JobStore>, regi
         };
 
         let request_id = request.request_id;
-        let response = match handler::handle(&store, &registry, request).await {
+        let response = match handler::handle(&store, &registry, &host_registry, forward_back_addr, request).await {
             Ok(response) => response,
             Err(e) => {
                 tracing::error!(error = %e, request_id, "job store faulted handling a request");
@@ -70,7 +77,8 @@ mod tests {
         let store = Arc::new(JobStore::open_in_memory()?);
         let (client, server) = UnixStream::pair()?;
         let registry = Arc::new(JobRegistry::new()?);
-        let serving = tokio::spawn(serve_connection(server, store, registry));
+        let host_registry = Arc::new(HostRegistry::default());
+        let serving = tokio::spawn(serve_connection(server, store, registry, host_registry, None));
 
         let mut client = client;
         write_frame(
@@ -125,7 +133,8 @@ mod tests {
         let store = Arc::new(JobStore::open_in_memory()?);
         let (client, server) = UnixStream::pair()?;
         let registry = Arc::new(JobRegistry::new()?);
-        let serving = tokio::spawn(serve_connection(server, store, registry));
+        let host_registry = Arc::new(HostRegistry::default());
+        let serving = tokio::spawn(serve_connection(server, store, registry, host_registry, None));
 
         use tokio::io::AsyncWriteExt;
         let mut client = client;
