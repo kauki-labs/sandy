@@ -16,7 +16,8 @@
 //! What's left, not in scope for this file: the second local job / peer-
 //! message-through-the-hub half of #269's acceptance, and real (non-fake)
 //! containment + a real second machine — the ws01 cross-machine run, gated
-//! on #299 (the nix overlay) and the operator's ws01 apply (#287).
+//! on #299 (the nix overlay) and the operator's ws01 apply (#287). Tracked on
+//! #303, so landing this file's proven leg doesn't drop that remaining scope.
 //!
 //! What it's for: the shape is settled (#263/#277/#298/#301, merged) and
 //! this scaffold encodes it as the exact steps the acceptance in
@@ -34,7 +35,7 @@
 //! | ---------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
 //! | Submit -> placement -> send_dispatch -> host-client runs the job       | this file, `cross_machine_sandboxes_exchange_a_peer_message_through_the_hub` (live, real     |
 //! | (host-client leg; not the second local job / hub-exchange half, nor    | `sandyd` + real `sandy daemon submit` + `handle_dispatch`; `FakeContainment` stands in for    |
-//! | real containment — a real ws01 run proves those, #287/#299)            | real containment)                                                                              |
+//! | real containment — tracked on #303, gated on #287/#299)                | real containment)                                                                              |
 //! | Register-auth: unknown mesh identity gets `RegisterRefused` (infra-     | this file, `register_from_an_unlisted_mesh_identity_gets_no_ack_and_no_dispatch` (live, a    |
 //! | f3's addendum to #263)                                                 | real `sandyd` + a real TCP client)                                                            |
 //! | decision-6: wrong-peer refused, zero bytes                             | `sandyd::dispatch` / `link_auth` unit tests (#266); re-asserted at the mesh-accept loop by    |
