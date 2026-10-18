@@ -1,55 +1,60 @@
 //! M2 cross-machine acceptance scaffold (#269 design, #263 contract, decision-6).
 //!
-//! Two of the acceptance items below are live: `register_from_an_unlisted_
-//! mesh_identity_gets_no_ack_and_no_dispatch` runs a real `sandyd` binary and
-//! a real TCP client against it (`SANDY_LIVE=1`, no hypervisor needed — M2
-//! stage 1 is the trusted-process backend). The happy path stays
-//! `#[ignore]`d: it needs the orchestrator's submit->dispatch placement
-//! wiring (#298) and the mesh-accept loop's own wiring into `sandyd::main`
-//! (unfiled as of this writing, flagged to infra-f3), neither of which exists
-//! on main yet. Per INV-S9 a live scenario is never counted green from a
-//! fake, so nothing here claims a pass it can't back.
+//! Both tests below are live, no `#[ignore]`s left: `register_from_an_
+//! unlisted_mesh_identity_gets_no_ack_and_no_dispatch` runs a real `sandyd`
+//! binary and a real TCP client against it; `cross_machine_sandboxes_
+//! exchange_a_peer_message_through_the_hub` drives a real `sandy daemon
+//! submit` through the real orchestrator placement path (#298/#301, merged)
+//! to a real `Dispatch`, then runs it via `handle_dispatch` with
+//! `FakeContainment` standing in for real containment (sandy-91: the real
+//! `sandy-host-client` binary can't start on non-Linux). `SANDY_LIVE=1`, no
+//! hypervisor needed — M2 stage 1 is the trusted-process backend. Per INV-S9
+//! a live scenario is never counted green from a fake, so nothing here
+//! claims a pass it can't back; see each test's own doc for its observed
+//! functional-red.
 //!
-//! What it's for: the shape is settled (#263/#277, merged — `sandy-executor-
-//! proto` is real) and this scaffold encodes it as the exact steps the
-//! acceptance in `docs/architecture/kpi.md`'s "Acceptance (M2 stage 1)"
-//! names, so finishing it is filling in the remaining `unimplemented!()` body
-//! against real orchestrator/executor code, not a redesign.
+//! What's left, not in scope for this file: the second local job / peer-
+//! message-through-the-hub half of #269's acceptance, and real (non-fake)
+//! containment + a real second machine — the ws01 cross-machine run, gated
+//! on #299 (the nix overlay) and the operator's ws01 apply (#287).
+//!
+//! What it's for: the shape is settled (#263/#277/#298/#301, merged) and
+//! this scaffold encodes it as the exact steps the acceptance in
+//! `docs/architecture/kpi.md`'s "Acceptance (M2 stage 1)" names.
 //!
 //! Run manually:
 //!   SANDY_LIVE=1 cargo nextest run -p sandy-cli --features live --test live_m2_cross_machine
-//! and, once the happy path is unblocked:
-//!   SANDY_LIVE=1 SANDY_M2_REMOTE_HOST=<mesh addr of a NixOS host-client> \
-//!     cargo nextest run -p sandy-cli --features live --test live_m2_cross_machine --run-ignored all
+//! and, once the real ws01 run is written:
+//!   SANDY_LIVE=1 SANDY_M2_REMOTE_HOST=<mesh addr of ws01> \
+//!     cargo nextest run -p sandy-cli --features live --test live_m2_cross_machine
 //!
 //! ## Acceptance traceability (#269's full list, so nothing falls between test files)
 //!
 //! | #269 acceptance item                                                  | Asserted where                                                                              |
 //! | ---------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-//! | Happy path: capability-declared dispatch, cross-machine peer message   | this file, `cross_machine_sandboxes_exchange_a_peer_message_through_the_hub` (`#[ignore]`d, |
-//! |                                                                        | pending #298 + the mesh-accept loop's own wiring into `sandyd::main`)                        |
+//! | Submit -> placement -> send_dispatch -> host-client runs the job       | this file, `cross_machine_sandboxes_exchange_a_peer_message_through_the_hub` (live, real     |
+//! | (host-client leg; not the second local job / hub-exchange half, nor    | `sandyd` + real `sandy daemon submit` + `handle_dispatch`; `FakeContainment` stands in for    |
+//! | real containment — a real ws01 run proves those, #287/#299)            | real containment)                                                                              |
 //! | Register-auth: unknown mesh identity gets `RegisterRefused` (infra-     | this file, `register_from_an_unlisted_mesh_identity_gets_no_ack_and_no_dispatch` (live, a    |
-//! | f3's addendum to #263)                                                 | real `sandyd` + a real TCP client, not `#[ignore]`d)                                         |
-//! | decision-6: wrong-peer refused, zero bytes                             | `sandyd::dispatch` / `link_auth` unit tests (#266, merged); re-asserted at the mesh-accept    |
-//! |                                                                        | loop by #290 (#279, open, CI-green, holding for a pre-auth decode-deadline fix)               |
-//! | decision-6: wrong-token refused, zero bytes                            | `sandyd::dispatch` / `link_auth` unit tests (#266, merged); re-asserted by #290 (#279)         |
-//! | decision-6: unknown run id refused, zero bytes                         | `sandyd::dispatch` unit tests (#266, merged) — `LinkAuthError::UnknownRun`; re-asserted by    |
-//! |                                                                        | #290 (#279)                                                                                    |
-//! | decision-6: already-claimed link slot refused (one link per run)       | `sandyd::link_auth` unit tests (#266, merged) — `concurrent_claims_admit_exactly_one_stream`; |
-//! |                                                                        | re-asserted by #290 (#279)                                                                     |
-//! | Isolation-class gate, orchestrator side: `send_dispatch` refuses a     | #277 (merged, `bab825a`) — `DispatchSendError::UnsupportedIsolationClass`, tested          |
-//! | class the target host didn't declare, fail-closed                     | (`dispatch_requiring_an_undeclared_isolation_class_is_refused`,                            |
-//! |                                                                        | `dispatch_with_an_unset_isolation_class_is_refused`). #280 closed as a duplicate of this.    |
-//! | Isolation-class gate, executor side: `check_isolation_class` re-checks | #284 (open) — reuses `sandy::admits_untrusted`; `Unspecified` refused, never treated as the   |
-//! | `Dispatch.required_isolation_class` (defense in depth), fail-closed   | weaker `Trusted`.                                                                              |
+//! | f3's addendum to #263)                                                 | real `sandyd` + a real TCP client)                                                            |
+//! | decision-6: wrong-peer refused, zero bytes                             | `sandyd::dispatch` / `link_auth` unit tests (#266); re-asserted at the mesh-accept loop by    |
+//! |                                                                        | #290 (merged, `a8d7655`)                                                                       |
+//! | decision-6: wrong-token refused, zero bytes                            | `sandyd::dispatch` / `link_auth` unit tests (#266); re-asserted by #290                       |
+//! | decision-6: unknown run id refused, zero bytes                         | `sandyd::dispatch` unit tests (#266) — `LinkAuthError::UnknownRun`; re-asserted by #290        |
+//! | decision-6: already-claimed link slot refused (one link per run)       | `sandyd::link_auth` unit tests (#266) — `concurrent_claims_admit_exactly_one_stream`;         |
+//! |                                                                        | re-asserted by #290                                                                            |
+//! | Isolation-class gate, orchestrator side: `send_dispatch` refuses a     | #277 (merged, `bab825a`) — `DispatchSendError::UnsupportedIsolationClass`, tested             |
+//! | class the target host didn't declare, fail-closed                     | (`dispatch_requiring_an_undeclared_isolation_class_is_refused`,                               |
+//! |                                                                        | `dispatch_with_an_unset_isolation_class_is_refused`). #280 closed as a duplicate of this.      |
+//! | Isolation-class gate, executor side: `check_isolation_class` re-checks | #284 (merged, `945dd2e`) — reuses `sandy::admits_untrusted`; `Unspecified` refused, never     |
+//! | `Dispatch.required_isolation_class` (defense in depth), fail-closed   | treated as the weaker `Trusted`.                                                               |
 //! | *Not* re-asserted at this file's e2e layer, by explicit scoping call  | infra-f3's ruling: #277's unit coverage is sufficient and this file's `capabilities_of        |
 //! | (not an oversight — see #272's thread before adding one)              | (host_id)` happy-path check already covers the one thing e2e uniquely adds (declared          |
 //! |                                                                        | capabilities actually reaching the dispatch decision). A negative e2e case here would just    |
 //! |                                                                        | re-run unit-proven logic through the same seam. If the declared-caps -> gate wiring regresses  |
 //! |                                                                        | later, add one e2e negative then, not for M2.                                                 |
-//! | Result path: exit via the locked `ResultEnvelope`/`AgentReport` (INV-  | existing unit coverage (`impls/fabric-local/src/{agent,link,executor}.rs`,                   |
-//! | 11); an agent failure with no report is an infra fault, not a job exit | `sandy-cli/tests/live_agent.rs`); reasserted end-to-end, cross-machine, in this file's        |
-//! |                                                                        | happy-path test (step 7)                                                                     |
+//! | Result path: exit via the locked `ResultEnvelope`/`AgentReport` (INV-  | existing unit coverage (`impls/fabric-local/src/{agent,link,executor}.rs`,                    |
+//! | 11); an agent failure with no report is an infra fault, not a job exit | `sandy-cli/tests/live_agent.rs`); reasserted end-to-end in this file's happy-path test         |
 #![cfg(feature = "live")]
 
 // Not `mod common;`: this file doesn't need `build_guest`/`on_path` — nothing
@@ -67,7 +72,7 @@ use std::{
 
 use anyhow::Context;
 use sandy_executor_proto::{
-    Arch, Capabilities, Dispatch, HostClientMessage, IsolationClass, OrchestratorMessage, Register, SandboxKind,
+    Arch, Capabilities, HostClientMessage, IsolationClass, OrchestratorMessage, Register, SandboxKind,
     host_client_message, orchestrator_message,
 };
 
@@ -85,9 +90,13 @@ fn require_live_process_test() -> anyhow::Result<()> {
 /// Refuse unless `SANDY_M2_REMOTE_HOST` names a reachable NixOS host-client's
 /// mesh address, in addition to [`require_live_process_test`]'s usual
 /// live-matrix check — the full cross-machine acceptance needs two real
-/// machines, not one. `localhost`/a loopback address is a deliberate,
-/// explicit choice for the Mac-only protocol-proof phase (infra-f3's #272
-/// ruling), never a silent default.
+/// machines, not one. Not called yet: the real ws01 run (#287/#299) is the
+/// last remaining gate, still pending the operator's apply; kept here as the
+/// gate that run will use, not speculative.
+#[allow(
+    dead_code,
+    reason = "the real ws01 cross-machine run (#287/#299) will call this once it's written"
+)]
 fn require_remote_executor() -> anyhow::Result<String> {
     require_live_process_test()?;
     std::env::var("SANDY_M2_REMOTE_HOST")
@@ -138,10 +147,15 @@ fn free_tcp_port() -> anyhow::Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
-/// A running real `sandyd` binary, its mesh management-channel listener
-/// bound and accepting, killed on drop.
+/// A running real `sandyd` binary — its control socket, mesh management-
+/// channel listener (Register/Dispatch), and mesh agent-link accept listener
+/// (decision 6, where a dispatched job's executor forwards its agent link
+/// back) all bound and accepting — killed on drop. `link_addr` isn't kept: no
+/// caller needs to dial it directly, since `forward_back` always arrives via
+/// a real `Dispatch` message instead.
 struct Orchestrator {
     child: Child,
+    sock: PathBuf,
     mesh_addr: SocketAddr,
 }
 
@@ -152,31 +166,45 @@ impl Drop for Orchestrator {
     }
 }
 
-/// Spawn the real `sandyd` binary with its mesh listener bound to a fresh
-/// loopback port and `allowlist` as `SANDY_MESH_ALLOWLIST`, waiting (bounded,
-/// polled) until the mesh listener actually accepts a connection — a fixed
-/// sleep would be either flaky under load or needlessly slow.
+/// Spawn the real `sandyd` binary with all three listeners bound to fresh
+/// loopback ports/a fresh socket and `allowlist` as `SANDY_MESH_ALLOWLIST`,
+/// waiting (bounded, polled) until each actually accepts a connection — a
+/// fixed sleep would be either flaky under load or needlessly slow.
 fn spawn_orchestrator(tmp: &std::path::Path, allowlist: &str) -> anyhow::Result<Orchestrator> {
-    let port = free_tcp_port()?;
-    let mesh_addr: SocketAddr = format!("127.0.0.1:{port}").parse()?;
+    let mesh_addr: SocketAddr = format!("127.0.0.1:{}", free_tcp_port()?).parse()?;
+    let link_addr: SocketAddr = format!("127.0.0.1:{}", free_tcp_port()?).parse()?;
+    let sock = tmp.join("sandyd.sock");
     let child = Command::new(build_workspace_bin("sandyd", "sandyd")?)
-        .env("SANDY_SOCK", tmp.join("sandyd.sock"))
+        .env("SANDY_SOCK", &sock)
         .env("SANDY_DB", tmp.join("sandyd.db"))
         .env("SANDY_MESH_LISTEN", mesh_addr.to_string())
         .env("SANDY_MESH_ALLOWLIST", allowlist)
+        .env("SANDY_MESH_AGENT_LINK_LISTEN", link_addr.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .context("spawning sandyd")?;
-    let orchestrator = Orchestrator { child, mesh_addr };
+    let orchestrator = Orchestrator { child, sock, mesh_addr };
 
     let deadline = Instant::now() + Duration::from_secs(5);
+    for addr in [mesh_addr, link_addr] {
+        loop {
+            if TcpStream::connect(addr).is_ok() {
+                break;
+            }
+            if Instant::now() > deadline {
+                anyhow::bail!("sandyd's listener on {addr} never accepted a connection");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if TcpStream::connect(mesh_addr).is_ok() {
+        if std::os::unix::net::UnixStream::connect(&orchestrator.sock).is_ok() {
             break;
         }
         if Instant::now() > deadline {
-            anyhow::bail!("sandyd's mesh listener never accepted a connection on {mesh_addr}");
+            anyhow::bail!("sandyd's control socket never accepted a connection");
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -237,69 +265,150 @@ fn trusted_process_capabilities() -> Capabilities {
     }
 }
 
-/// The M2 stage-1 acceptance floor (`docs/architecture/kpi.md`): a sandbox on
-/// macOS and a sandbox on the NixOS host, agent inside each, dispatched by
-/// capability declaration (no hardcoded host), communicating through the
-/// macOS orchestrator's peer-hub — each job's exit comes from its own agent
-/// report, not a backend-mediated outcome.
-#[test]
-#[ignore = "scaffold: wire to the orchestrator's Register/allowlist handling, the mesh-accept loop (#290), and the \
-            host-client executor (#284)"]
-fn cross_machine_sandboxes_exchange_a_peer_message_through_the_hub() -> anyhow::Result<()> {
-    let _remote = require_remote_executor()?;
+/// Run the real `sandy` binary's `daemon submit` against `orchestrator`'s
+/// control socket, returning the parsed `job_id`.
+fn submit_job(orchestrator: &Orchestrator, tmp: &std::path::Path, argv: &[&str]) -> anyhow::Result<String> {
+    let manifest = tmp.join("manifest.json");
+    std::fs::write(&manifest, serde_json::to_vec(argv)?).context("write the argv/v1 manifest")?;
 
-    // 1. Host-client probes its own real containment (`detect_register_capabilities`, #284's capability.rs) and dials
-    //    the orchestrator over sandy-conn's TCP/mesh tier, declaring what it can run — no hardcoded host on the
-    //    orchestrator side.
-    let _message = HostClientMessage {
-        op: Some(host_client_message::Op::Register(Register {
-            host_id: "the-remote-host".to_string(),
-            capabilities: Some(Capabilities {
-                kind: SandboxKind::Process.into(),
-                arch: Arch::X8664.into(),
-                attestation: false,
-                supported_isolation_classes: vec![IsolationClass::Trusted.into()],
-            }),
-        })),
-    };
+    let output = Command::new(env!("CARGO_BIN_EXE_sandy"))
+        .env("SANDY_SOCK", &orchestrator.sock)
+        .args([
+            "daemon",
+            "submit",
+            manifest.to_str().context("manifest path is utf8")?,
+            "--manifest-encoding",
+            "argv/v1",
+            "-o",
+            "json",
+        ])
+        .output()
+        .context("running sandy daemon submit")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "sandy daemon submit failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).context("parse submit json")?;
+    json["job_id"]
+        .as_str()
+        .map(str::to_owned)
+        .context("submit json must carry a job_id")
+}
 
-    // 2. Orchestrator checks the registrant's mesh identity against `ExecutorAllowlist` (`HostRegistry::register`,
-    //    #277, merged), acks with `Registered { host_id }`.
-    //
-    // 2a. Assert (sandy-7a's addition, not just "an ack arrived"): `HostRegistry::capabilities_of
-    //     (host_id)` after `Register` equals what `detect_register_capabilities` produced on the
-    //     real host — proves end-to-end storage, not just a handshake. A bug that acks correctly but
-    //     drops or mangles the capabilities on the way into the registry must not pass silently.
+/// The M2 stage-1 acceptance floor (`docs/architecture/kpi.md`), minus the
+/// peer-message/second-job half: a registered host-client receives a real
+/// `Dispatch` from a real `sandy daemon submit`, placed there by the real
+/// orchestrator (#298/#301's `send_dispatch` path), and actually runs the job
+/// — host-client side only (infra-f3's scoping ruling: the orchestrator-
+/// through-real-path proof this test gives doesn't need the second local job
+/// / hub-exchange half; that's #269's remaining acceptance once a real ws01
+/// is up, #299 + #287).
+///
+/// The host-client side is `handle_dispatch` called directly with
+/// `FakeContainment` (sandy-91: the real `sandy-host-client` binary can't
+/// start on this Mac — `detect_register_capabilities` hard-fails off Linux —
+/// so this test declares capabilities and runs dispatches itself, in-process,
+/// rather than spawning that binary) — real orchestrator binary, real wire
+/// protocol, real `ProcessBackend` run, real `sandy-agent`, only the
+/// host-client's own I/O loop and capability probe are stood in for.
+///
+/// Functional-red observed before green (2026-10-18): first ran this with
+/// the registered host declaring `Untrusted` only (not `Trusted`, which
+/// `STAGE1_REQUIRED_ISOLATION_CLASS` requires) — `pick_host_for` genuinely
+/// found no candidate, `submit_job` still succeeded (placement is
+/// best-effort, #298) but the test's own read of the next frame timed out
+/// waiting for a `Dispatch` that `send_dispatch` never called, failing for
+/// the right reason (no eligible host, not a harness bug). Reverted to
+/// declaring `Trusted` for the green below.
+#[tokio::test]
+async fn cross_machine_sandboxes_exchange_a_peer_message_through_the_hub() -> anyhow::Result<()> {
+    require_live_process_test()?;
+    let tmp = tempfile::tempdir().context("temp dir")?;
 
-    // 3. Orchestrator dispatches a job to the registered host-client against the declared capability (`Dispatch`, with
-    //    `required_isolation_class` satisfied by what was registered — #277's own unit tests cover the orchestrator
-    //    refusing a `Dispatch` the host never declared; not duplicated here), minting a fresh `link_token`. Shape for
-    //    reference:
-    let _dispatch = OrchestratorMessage {
-        op: Some(orchestrator_message::Op::Dispatch(Dispatch {
-            job_id: String::new(),
-            manifest: Vec::new(),
-            manifest_encoding: String::new(),
-            backend: SandboxKind::Process.into(),
-            link_token: Vec::new(),
-            forward_back: String::new(),
-            required_isolation_class: IsolationClass::Trusted.into(),
-        })),
-    };
+    // An allowlist that DOES include 127.0.0.1 — this leg of the acceptance is about
+    // placement/dispatch, not the allowlist refusal (already covered by the other test).
+    let orchestrator = spawn_orchestrator(tmp.path(), "127.0.0.1")?;
 
-    // 4. Host-client re-checks `required_isolation_class` independently (`check_isolation_class`, #284, defense in
-    //    depth), launches the TrustedProcess sandbox + agent, then `forward_agent_link`s back to `forward_back` on a
-    //    fresh stream, prefixed with `job_id` + `link_token`.
-    // 5. In parallel, the orchestrator runs a second job locally (macOS sandbox + agent) through the existing local
-    //    executor.
-    // 6. Both agents join the same fabric hub and exchange a peer message.
-    // 7. Assert: both jobs report a status/exit from their own agent's report (INV-11: status/ retryable/exit band
-    //    never disagree), and the peer message sent from one agent is observed received by the other.
-
-    unimplemented!(
-        "fill in once the orchestrator's Register/allowlist handling, the mesh-accept loop, and the host-client \
-         executor land"
+    // 1. Host-client declares its capabilities and registers — no hardcoded host on the orchestrator side, it places
+    //    against whatever's actually registered.
+    let mut host_conn = tokio::net::TcpStream::connect(orchestrator.mesh_addr)
+        .await
+        .context("dialing the orchestrator's mesh listener")?;
+    sandy_control_proto::write_frame(
+        &mut host_conn,
+        &HostClientMessage {
+            op: Some(host_client_message::Op::Register(Register {
+                host_id: "the-remote-host".to_owned(),
+                capabilities: Some(trusted_process_capabilities()),
+            })),
+        },
     )
+    .await
+    .context("writing Register")?;
+    let registered: OrchestratorMessage = sandy_control_proto::read_frame(&mut host_conn)
+        .await
+        .context("reading the Register response")?
+        .context("connection closed before a Register response")?;
+    assert!(
+        matches!(registered.op, Some(orchestrator_message::Op::Registered(_))),
+        "expected Registered, got {:?}",
+        registered.op
+    );
+
+    // 2. Submit a real job through the real control socket. The orchestrator's placement (#298/#301) picks the one
+    //    registered, Trusted-capable host and calls send_dispatch — this is the real path this test exists to prove,
+    //    not re-implemented here.
+    let job_id = submit_job(&orchestrator, tmp.path(), &["echo", "hi"])?;
+
+    // 3. Read the Dispatch the real orchestrator placed on this connection.
+    let dispatch_message: OrchestratorMessage =
+        tokio::time::timeout(Duration::from_secs(5), sandy_control_proto::read_frame(&mut host_conn))
+            .await
+            .context("timed out waiting for a Dispatch — placement never reached send_dispatch")?
+            .context("reading the Dispatch frame")?
+            .context("connection closed before a Dispatch arrived")?;
+    let dispatch = match dispatch_message.op {
+        Some(orchestrator_message::Op::Dispatch(dispatch)) => dispatch,
+        other => anyhow::bail!("expected Dispatch, got {other:?}"),
+    };
+    assert_eq!(dispatch.job_id, job_id, "the dispatch must name the job just submitted");
+    assert_eq!(
+        dispatch.manifest_encoding, "argv/v1",
+        "the dispatch must carry the manifest encoding submitted"
+    );
+
+    // 4. Host-client re-checks the isolation class independently (`check_isolation_class`, defense in depth) and runs
+    //    the job via the real ProcessBackend + a fake, spawnable containment (sandy-91: real SystemdRunContainment
+    //    needs Linux cgroup v2, which this Mac doesn't have — the real containment leg is #299's nixosTest and the ws01
+    //    run).
+    let agent_program = build_workspace_bin("sandy-agent", "sandy-agent")?;
+    let rt = tokio::runtime::Handle::current();
+    let outcome = tokio::task::spawn_blocking(move || {
+        sandy_host_client::dispatch::handle_dispatch(
+            &dispatch,
+            Box::new(sandy_test_support::FakeContainment::available()),
+            agent_program,
+            rt,
+        )
+    })
+    .await
+    .context("the dispatch-handling task panicked")?
+    .context("handle_dispatch failed")?;
+
+    // 5. Assert the job's own exit (INV-11): `echo hi` succeeds, and the agent's link delivered that through the real
+    //    forward-back dial, not a backend-mediated shortcut.
+    assert_eq!(
+        outcome.transport_error, None,
+        "the agent link to the orchestrator's mesh agent-link listener must not fault: {outcome:?}"
+    );
+    assert_eq!(outcome.guest_exit, Some(0), "echo hi must exit 0: {outcome:?}");
+    assert!(
+        !outcome.timed_out,
+        "echo hi must not hit the dispatch timeout: {outcome:?}"
+    );
+
+    Ok(())
 }
 
 /// Infra-f3's addendum to #263: an unknown mesh identity gets `RegisterRefused`,

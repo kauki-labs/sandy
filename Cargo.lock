@@ -2174,6 +2174,7 @@ dependencies = [
  "sandy-fabric",
  "sandy-fabric-local",
  "sandy-fsutil",
+ "sandy-host-client",
  "sandy-lib",
  "sandy-proto",
  "sandy-test-support",
