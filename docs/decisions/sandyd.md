@@ -171,15 +171,21 @@ into the control handler's `Cancel` arm, close #269's token-lifecycle
 requirement: cancelling a job invalidates its unclaimed link immediately, so
 a stream that arrives after cancellation gets the same zero-byte refusal as
 an already-claimed one (regression-tested: a cancelled job's still-valid,
-still-unclaimed token must not authenticate a late-arriving stream). What is
-NOT yet built: the network accept loop itself (binding a mesh address via
-`sandy-conn`, calling this logic per accepted connection, #279) and anything
-that calls `RemoteLink::new` to actually bind a run to an executor at
-dispatch — both wait on #263's dispatch-RPC design, which decides where that
-binding happens and what shape the accept loop's caller takes. Tracked by
-#212. Promoted from a cross-machine-safety nicety to the M2 critical path
-(decision 8): M2's cross-sandbox peer-group channels depend on this binding
-existing.
+still-unclaimed token must not authenticate a late-arriving stream). The
+network accept loop (#279) is now built too: `sandyd::mesh_accept::
+serve_mesh_accept_loop` takes an already-bound `sandy_conn::Listener`,
+decodes each connection's run-id+token prefix via `sandy-executor-proto`'s
+`decode_remote_link_prefix` (#284, the one shared codec the executor's
+`forward_agent_link` also imports), authenticates it, and hands a success to
+`serve_agent_link` — every refusal path (malformed prefix, wrong peer, wrong
+token, unknown run, already-claimed) tested over a real TCP loopback
+connection to close with zero bytes written. What is NOT yet built: wiring
+`serve_mesh_accept_loop` into `main.rs` (needs a decision this slice doesn't
+own — how `sandyd` learns its own mesh bind address) and anything that calls
+`RemoteLink::new` to actually bind a run to an executor at dispatch — both
+wait on #263's dispatch-RPC design. Tracked by #212. Promoted from a
+cross-machine-safety nicety to the M2 critical path (decision 8): M2's
+cross-sandbox peer-group channels depend on this binding existing.
 
 **Context.** `serve_agent_link` (#216) writes the run's agent cap as its first
 frame with no check before it — it assumes its peer is already the legitimate
@@ -223,11 +229,12 @@ peer, just not the right one.
   happens, so a reader does not mistake a later `AlreadyClaimed` refusal for a
   double-claim attack when it was actually a cancellation.
 
-**Consequences.** B2's eventual mesh-accept loop needs a `JobRegistry` entry
-shape that carries executor identity + token alongside the channel/caps it
-already holds, and the accept path must reject before calling
-`serve_agent_link` at all, not after. Acceptance tests (owned by whichever PR
-implements this): wrong peer, wrong token, a second stream for an already-
+**Consequences.** The mesh-accept loop needs a `JobRegistry` entry shape that
+carries executor identity + token alongside the channel/caps it already
+holds, and the accept path must reject before calling `serve_agent_link` at
+all, not after — `mesh_accept::serve_one_remote_link` never writes to the
+connection before `authenticate_remote_link` succeeds. Acceptance tests:
+wrong peer, wrong token, a second stream for an already-
 claimed run, and an unknown run id each receive zero bytes; no log line or
 error message ever carries the token.
 
