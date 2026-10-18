@@ -209,3 +209,30 @@ its full record in `docs/decisions/`, and the live matrix in `kpi.md`.
 
 1. Leaving compiler or clippy warnings → fix, or `#[allow(reason = "…")]` with a justification
 2. Hardcoding config values instead of threading them through
+
+## Merge & CI gotchas
+
+Recurring traps this cycle's builders hit and re-discovered. Facts about this
+repo's own setup, not general git advice.
+
+- **`gh pr merge <n> --auto`, not `--squash --auto`.** The merge queue owns
+  `main`'s merge strategy; passing `--squash` alongside `--auto` errors.
+- **`required_review_thread_resolution` is on.** Every thread must be resolved,
+  including one deliberately deferred to a follow-up issue (reply citing the
+  issue, then resolve) — an open thread blocks the queue from picking up the
+  PR regardless of `reviewDecision`.
+- **A CodeRabbit follow-up `COMMENTED` review resets `reviewDecision` to
+  empty, even after a prior `APPROVED`.** Re-read `reviewDecision` fresh
+  immediately before enqueuing; a value cached from mid-cleanup can be stale.
+- **The squash-merge-rebase trap.** A branch forked from another PR's branch
+  before that PR squash-merges still carries its individual commits; a plain
+  `git rebase origin/main` after the squash replays them and conflicts. Diff
+  the branch's own commits and reapply them onto a fresh branch from `main`
+  instead. For a stack of PRs, rebase bottom-up as each base actually merges,
+  not all at once.
+- **A queued PR can be silently dequeued.** When another PR lands ahead of it
+  and the base moves, `mergeQueueEntry` can go `null` while the PR is still
+  `OPEN` — not a failure, just re-enqueue.
+- **`start_paused` + a real I/O op (e.g. a real TCP dial) is flaky for timeout
+  tests.** The virtual clock races the real connect; use real short durations
+  instead of pairing a virtual clock with genuine I/O.
