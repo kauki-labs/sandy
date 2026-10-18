@@ -6,20 +6,32 @@
 //! `Pending` forever, since nothing joins its channel or runs it — see
 //! `dispatch`'s module doc for why that's an honest gap, not a fake.
 
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use sandy_control_proto::{
     AttachResponse, CancelResponse, ControlError, ControlRequest, ControlResponse, JobSummary as WireJobSummary,
     ListResponse, StatusResponse, SubmitResponse, control_request, control_response,
 };
+use sandy_executor_proto::{Dispatch, IsolationClass};
 use sandy_fabric::capauth::{Cap, CapCodecError, decode_cap, encode_cap};
 use sandy_orchestrator::{JobManifest, MANIFEST_ENCODING_JSON, derive_job_caps};
 use uuid::Uuid;
 
 use crate::{
     dispatch::{self, JobRegistry},
+    host_registry::HostRegistry,
+    link_auth::RemoteLink,
     store::{CancelOutcome, JobStore, StoreError},
 };
+
+/// STAGE-1: untrusted jobs are inexpressible (no VM/untrusted backend yet,
+/// #269 D4), so every submitted job's required isolation class is `Trusted`
+/// — this is accurate for stage-1, not a shortcut. When #150 (VM/untrusted
+/// isolation) lands, replace this default with a real per-job requirement on
+/// the submit path (a `SubmitRequest` field) — otherwise an untrusted job
+/// would silently default to `Trusted` and breach isolation. See #298, #269,
+/// #150.
+const STAGE1_REQUIRED_ISOLATION_CLASS: IsolationClass = IsolationClass::Trusted;
 
 /// A failure handling a [`ControlRequest`]: the job store or the dispatch
 /// layer faulted, or the `spawn_blocking` task running a store call panicked
@@ -113,6 +125,8 @@ fn resolve_granted_caps(
 pub async fn handle(
     store: &Arc<JobStore>,
     registry: &Arc<JobRegistry>,
+    host_registry: &Arc<HostRegistry>,
+    forward_back_addr: Option<SocketAddr>,
     request: ControlRequest,
 ) -> Result<ControlResponse, HandlerError> {
     let result = match request.op {
@@ -149,8 +163,63 @@ pub async fn handle(
             // "restarted since submit?" instead of surfacing the real fault.
             let mut job_channel = dispatch::mint_job_channel(&job_id, registry.authority()).await?;
             job_channel.granted_caps = granted_caps;
+
+            // Placement (#298): stage-1 policy. Dispatch to a registered
+            // remote host whose declared capabilities satisfy
+            // STAGE1_REQUIRED_ISOLATION_CLASS, if the orchestrator's own
+            // agent-link accept address is configured (no address means no
+            // remote run is even reachable, regardless of what's
+            // registered) and such a host exists; run locally otherwise —
+            // today's unchanged behavior. Binding the remote link (decision
+            // 6) happens BEFORE the job is persisted/registered, so a
+            // placed job's `remote_link` is set from the moment anyone can
+            // observe it; the actual `send_dispatch` call happens after,
+            // once the job is durably recorded.
+            let dispatch_plan = forward_back_addr.and_then(|forward_back| {
+                let candidate = host_registry.pick_host_for(STAGE1_REQUIRED_ISOLATION_CLASS.into())?;
+                match RemoteLink::new(candidate.peer_ip) {
+                    Ok(link) => {
+                        let link_token = link.token().as_bytes().to_vec();
+                        job_channel.remote_link = Some(link);
+                        let dispatch = Dispatch {
+                            job_id: job_id.clone(),
+                            manifest: manifest.clone(),
+                            manifest_encoding: encoding.clone(),
+                            backend: candidate.capabilities.kind,
+                            link_token,
+                            forward_back: forward_back.to_string(),
+                            required_isolation_class: STAGE1_REQUIRED_ISOLATION_CLASS.into(),
+                        };
+                        Some((candidate.host_id, dispatch))
+                    }
+                    Err(e) => {
+                        // The OS RNG is unavailable — vanishingly rare, and
+                        // placement is best-effort: the job still submits
+                        // and runs locally rather than failing Submit
+                        // outright over a remote-placement optimization.
+                        tracing::warn!(
+                            error = %e,
+                            job_id,
+                            "could not mint a remote link token; running the job locally"
+                        );
+                        None
+                    }
+                }
+            });
+
             tokio::task::spawn_blocking(move || store.insert_pending(&inserted_id, &manifest, &encoding)).await??;
             registry.insert(job_id.clone(), job_channel);
+
+            if let Some((host_id, dispatch)) = dispatch_plan {
+                // Best-effort: the job is already durably submitted above,
+                // so a failed dispatch (e.g. the host disconnected between
+                // being picked and this send — a narrow TOCTOU) leaves it
+                // Pending rather than failing Submit for a placement
+                // decision the caller never asked to observe directly.
+                if let Err(e) = host_registry.send_dispatch(&host_id, dispatch).await {
+                    tracing::warn!(error = %e, job_id, host_id, "could not dispatch the placed job to its host");
+                }
+            }
 
             control_response::Result::Submit(SubmitResponse { job_id })
         }
@@ -328,6 +397,10 @@ mod tests {
         Arc::new(JobRegistry::new().expect("getrandom for a test registry"))
     }
 
+    fn new_host_registry() -> Arc<HostRegistry> {
+        Arc::new(HostRegistry::default())
+    }
+
     fn req(id: u64, op: control_request::Op) -> ControlRequest {
         ControlRequest {
             request_id: id,
@@ -348,8 +421,8 @@ mod tests {
 
     #[tokio::test]
     async fn submit_persists_and_returns_a_job_id() -> anyhow::Result<()> {
-        let (store, registry) = (new_store(), new_registry());
-        let response = handle(&store, &registry, submit_req(1)).await?;
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let response = handle(&store, &registry, &host_registry, None, submit_req(1)).await?;
         let job_id = match response.result {
             Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
@@ -361,10 +434,12 @@ mod tests {
 
     #[tokio::test]
     async fn status_of_an_unknown_job_is_a_control_error_not_a_default() -> anyhow::Result<()> {
-        let (store, registry) = (new_store(), new_registry());
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let response = handle(
             &store,
             &registry,
+            &host_registry,
+            None,
             req(
                 1,
                 control_request::Op::Status(StatusRequest {
@@ -383,10 +458,12 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_on_an_unknown_job_is_refused() -> anyhow::Result<()> {
-        let (store, registry) = (new_store(), new_registry());
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let response = handle(
             &store,
             &registry,
+            &host_registry,
+            None,
             req(
                 1,
                 control_request::Op::Cancel(CancelRequest {
@@ -405,9 +482,16 @@ mod tests {
 
     #[tokio::test]
     async fn list_reflects_submitted_jobs() -> anyhow::Result<()> {
-        let (store, registry) = (new_store(), new_registry());
-        handle(&store, &registry, submit_req(1)).await?;
-        let response = handle(&store, &registry, req(2, control_request::Op::List(ListRequest {}))).await?;
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        handle(&store, &registry, &host_registry, None, submit_req(1)).await?;
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            None,
+            req(2, control_request::Op::List(ListRequest {})),
+        )
+        .await?;
         let jobs = match response.result {
             Some(control_response::Result::List(ListResponse { jobs })) => jobs,
             other => anyhow::bail!("expected a List response, got {other:?}"),
@@ -420,8 +504,8 @@ mod tests {
     /// process returns a real channel id and a cap that actually decodes.
     #[tokio::test]
     async fn attach_on_a_submitted_job_returns_a_real_channel_and_cap() -> anyhow::Result<()> {
-        let (store, registry) = (new_store(), new_registry());
-        let submitted = handle(&store, &registry, submit_req(1)).await?;
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let submitted = handle(&store, &registry, &host_registry, None, submit_req(1)).await?;
         let job_id = match submitted.result {
             Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
@@ -430,6 +514,8 @@ mod tests {
         let response = handle(
             &store,
             &registry,
+            &host_registry,
+            None,
             req(2, control_request::Op::Attach(AttachRequest { job_id: job_id.clone() })),
         )
         .await?;
@@ -447,10 +533,12 @@ mod tests {
     /// refused by name, never a fabricated channel.
     #[tokio::test]
     async fn attach_on_an_unknown_job_is_refused_not_fabricated() -> anyhow::Result<()> {
-        let (store, registry) = (new_store(), new_registry());
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let response = handle(
             &store,
             &registry,
+            &host_registry,
+            None,
             req(
                 1,
                 control_request::Op::Attach(AttachRequest {
@@ -475,12 +563,14 @@ mod tests {
     /// channel for a job this process can no longer actually serve.
     #[tokio::test]
     async fn attach_on_a_known_job_with_no_live_channel_names_the_gap() -> anyhow::Result<()> {
-        let (store, registry) = (new_store(), new_registry());
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         store.insert_pending("job-from-before-restart", b"m", "test/v1")?;
 
         let response = handle(
             &store,
             &registry,
+            &host_registry,
+            None,
             req(
                 1,
                 control_request::Op::Attach(AttachRequest {
@@ -503,8 +593,8 @@ mod tests {
     /// name, not encoded and returned as if it still worked.
     #[tokio::test]
     async fn attach_refuses_an_expired_observer_cap() -> anyhow::Result<()> {
-        let (store, registry) = (new_store(), new_registry());
-        let submitted = handle(&store, &registry, submit_req(1)).await?;
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let submitted = handle(&store, &registry, &host_registry, None, submit_req(1)).await?;
         let job_id = match submitted.result {
             Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
@@ -527,6 +617,8 @@ mod tests {
         let response = handle(
             &store,
             &registry,
+            &host_registry,
+            None,
             req(2, control_request::Op::Attach(AttachRequest { job_id: job_id.clone() })),
         )
         .await?;
@@ -547,8 +639,8 @@ mod tests {
     async fn cancel_invalidates_the_jobs_remote_link() -> anyhow::Result<()> {
         use crate::link_auth::{LinkAuthError, RemoteLink};
 
-        let (store, registry) = (new_store(), new_registry());
-        let submitted = handle(&store, &registry, submit_req(1)).await?;
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let submitted = handle(&store, &registry, &host_registry, None, submit_req(1)).await?;
         let job_id = match submitted.result {
             Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
@@ -572,6 +664,8 @@ mod tests {
         let response = handle(
             &store,
             &registry,
+            &host_registry,
+            None,
             req(2, control_request::Op::Cancel(CancelRequest { job_id: job_id.clone() })),
         )
         .await?;
@@ -594,7 +688,7 @@ mod tests {
     /// job requesting a strictly narrower right there; the job is accepted.
     #[tokio::test]
     async fn a_submitter_holding_a_cap_can_submit_a_job_requesting_a_narrower_right() -> anyhow::Result<()> {
-        let (store, registry) = (new_store(), new_registry());
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let submitter_cap = registry.authority().mint(CapScope {
             peer: PeerId::from("operator"),
             channel: ChannelId::from("peer-group-1"),
@@ -609,6 +703,8 @@ mod tests {
         let response = handle(
             &store,
             &registry,
+            &host_registry,
+            None,
             submit_req_with_caps(1, manifest, vec![submitter_cap]),
         )
         .await?;
@@ -625,7 +721,7 @@ mod tests {
     /// not strictly-below.
     #[tokio::test]
     async fn a_submitter_can_submit_a_job_requesting_exactly_what_they_hold() -> anyhow::Result<()> {
-        let (store, registry) = (new_store(), new_registry());
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let submitter_cap = registry.authority().mint(CapScope {
             peer: PeerId::from("operator"),
             channel: ChannelId::from("peer-group-1"),
@@ -640,6 +736,8 @@ mod tests {
         let response = handle(
             &store,
             &registry,
+            &host_registry,
+            None,
             submit_req_with_caps(1, manifest, vec![submitter_cap]),
         )
         .await?;
@@ -656,7 +754,7 @@ mod tests {
     /// job is created (checked via `list` staying empty).
     #[tokio::test]
     async fn a_request_exceeding_the_submitters_held_rights_refuses_the_whole_submit() -> anyhow::Result<()> {
-        let (store, registry) = (new_store(), new_registry());
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let submitter_cap = registry.authority().mint(CapScope {
             peer: PeerId::from("operator"),
             channel: ChannelId::from("peer-group-1"),
@@ -671,6 +769,8 @@ mod tests {
         let response = handle(
             &store,
             &registry,
+            &host_registry,
+            None,
             submit_req_with_caps(1, manifest, vec![submitter_cap]),
         )
         .await?;
@@ -681,7 +781,14 @@ mod tests {
             other => anyhow::bail!("expected a refusal, got {other:?}"),
         }
 
-        let list = handle(&store, &registry, req(2, control_request::Op::List(ListRequest {}))).await?;
+        let list = handle(
+            &store,
+            &registry,
+            &host_registry,
+            None,
+            req(2, control_request::Op::List(ListRequest {})),
+        )
+        .await?;
         match list.result {
             Some(control_response::Result::List(ListResponse { jobs })) => {
                 assert!(jobs.is_empty(), "a refused submit must create no job: {jobs:?}");
@@ -695,7 +802,7 @@ mod tests {
     /// is refused that capability, not granted one anyway.
     #[tokio::test]
     async fn a_submitter_with_no_cap_on_the_requested_channel_is_refused() -> anyhow::Result<()> {
-        let (store, registry) = (new_store(), new_registry());
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let submitter_cap = registry.authority().mint(CapScope {
             peer: PeerId::from("operator"),
             channel: ChannelId::from("some-other-channel"),
@@ -710,6 +817,8 @@ mod tests {
         let response = handle(
             &store,
             &registry,
+            &host_registry,
+            None,
             submit_req_with_caps(1, manifest, vec![submitter_cap]),
         )
         .await?;
@@ -727,7 +836,7 @@ mod tests {
     /// because it arrived in `submitter_caps`.
     #[tokio::test]
     async fn a_forged_submitter_cap_refuses_the_whole_submit() -> anyhow::Result<()> {
-        let (store, registry) = (new_store(), new_registry());
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let mut forged_cap = registry.authority().mint(CapScope {
             peer: PeerId::from("operator"),
             channel: ChannelId::from("peer-group-1"),
@@ -740,7 +849,14 @@ mod tests {
             rights: read_only(),
         }]);
 
-        let response = handle(&store, &registry, submit_req_with_caps(1, manifest, vec![forged_cap])).await?;
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            None,
+            submit_req_with_caps(1, manifest, vec![forged_cap]),
+        )
+        .await?;
         match response.result {
             Some(control_response::Result::Error(ControlError { message })) => {
                 assert!(message.contains("refused"), "got {message:?}");
@@ -754,7 +870,7 @@ mod tests {
     /// same as a forged one — `attenuate` re-verifies expiry too.
     #[tokio::test]
     async fn an_expired_submitter_cap_refuses_the_whole_submit() -> anyhow::Result<()> {
-        let (store, registry) = (new_store(), new_registry());
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let expired_cap = registry.authority().mint(CapScope {
             peer: PeerId::from("operator"),
             channel: ChannelId::from("peer-group-1"),
@@ -766,7 +882,14 @@ mod tests {
             rights: read_only(),
         }]);
 
-        let response = handle(&store, &registry, submit_req_with_caps(1, manifest, vec![expired_cap])).await?;
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            None,
+            submit_req_with_caps(1, manifest, vec![expired_cap]),
+        )
+        .await?;
         match response.result {
             Some(control_response::Result::Error(ControlError { message })) => {
                 assert!(message.contains("refused"), "got {message:?}");
@@ -781,7 +904,7 @@ mod tests {
     /// catches revocation.
     #[tokio::test]
     async fn a_revoked_submitter_cap_refuses_the_whole_submit() -> anyhow::Result<()> {
-        let (store, registry) = (new_store(), new_registry());
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let cap = registry.authority().mint(CapScope {
             peer: PeerId::from("operator"),
             channel: ChannelId::from("peer-group-1"),
@@ -794,7 +917,14 @@ mod tests {
             rights: read_only(),
         }]);
 
-        let response = handle(&store, &registry, submit_req_with_caps(1, manifest, vec![cap])).await?;
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            None,
+            submit_req_with_caps(1, manifest, vec![cap]),
+        )
+        .await?;
         match response.result {
             Some(control_response::Result::Error(ControlError { message })) => {
                 assert!(message.contains("refused"), "got {message:?}");
@@ -810,7 +940,7 @@ mod tests {
     /// submitter explicitly opted into); the whole submit is refused instead.
     #[tokio::test]
     async fn presented_caps_with_an_unrecognized_manifest_encoding_refuse_the_submit() -> anyhow::Result<()> {
-        let (store, registry) = (new_store(), new_registry());
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let submitter_cap = registry.authority().mint(CapScope {
             peer: PeerId::from("operator"),
             channel: ChannelId::from("peer-group-1"),
@@ -826,7 +956,7 @@ mod tests {
             }),
         );
 
-        let response = handle(&store, &registry, request).await?;
+        let response = handle(&store, &registry, &host_registry, None, request).await?;
         match response.result {
             Some(control_response::Result::Error(ControlError { message })) => {
                 assert!(message.contains("not understood"), "got {message:?}");
@@ -842,12 +972,142 @@ mod tests {
     /// block, including an opaque, undecodable manifest.
     #[tokio::test]
     async fn a_direct_mint_submit_with_no_submitter_caps_is_unaffected() -> anyhow::Result<()> {
-        let (store, registry) = (new_store(), new_registry());
-        let response = handle(&store, &registry, submit_req(1)).await?;
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let response = handle(&store, &registry, &host_registry, None, submit_req(1)).await?;
         assert!(
             matches!(response.result, Some(control_response::Result::Submit(_))),
             "got {:?}",
             response.result
+        );
+        Ok(())
+    }
+
+    // ---- Placement (#298) ----
+
+    fn trusted_host_capabilities() -> sandy_executor_proto::Capabilities {
+        sandy_executor_proto::Capabilities {
+            kind: sandy_executor_proto::SandboxKind::Process.into(),
+            arch: sandy_executor_proto::Arch::X8664.into(),
+            attestation: false,
+            supported_isolation_classes: vec![IsolationClass::Trusted.into()],
+        }
+    }
+
+    fn register_test_host(
+        host_registry: &HostRegistry,
+        host_id: &str,
+        peer_ip: std::net::IpAddr,
+        capabilities: sandy_executor_proto::Capabilities,
+    ) -> tokio::sync::mpsc::Receiver<Dispatch> {
+        let allowlist = crate::host_registry::ExecutorAllowlist::new([peer_ip]);
+        let (dispatch_rx, _registration) = host_registry
+            .register(&allowlist, peer_ip, host_id.to_owned(), capabilities)
+            .expect("register a test host");
+        dispatch_rx
+    }
+
+    /// Integration (#298 acceptance): a submitted job is actually dispatched
+    /// to a registered remote host through the REAL control/submit path —
+    /// `handle` itself, not a unit harness calling `send_dispatch` directly.
+    /// Proves the whole placement chain end to end: `pick_host_for` ->
+    /// `RemoteLink::new` -> a `Dispatch` built -> `send_dispatch` -> the
+    /// host's own dispatch channel actually receiving it.
+    #[tokio::test]
+    async fn a_submitted_job_is_dispatched_to_a_registered_remote_host() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let mut dispatch_rx = register_test_host(&host_registry, "ws01", peer_ip, trusted_host_capabilities());
+
+        let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+        let response = handle(&store, &registry, &host_registry, Some(forward_back), submit_req(1)).await?;
+        let job_id = match response.result {
+            Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
+            other => anyhow::bail!("expected a Submit response, got {other:?}"),
+        };
+
+        let dispatch = tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_rx.recv())
+            .await
+            .context("timed out waiting for the dispatch")?
+            .context("the host's dispatch channel closed before receiving anything")?;
+        assert_eq!(dispatch.job_id, job_id);
+        assert_eq!(dispatch.forward_back, forward_back.to_string());
+        assert_eq!(dispatch.required_isolation_class, i32::from(IsolationClass::Trusted));
+        assert_eq!(dispatch.link_token.len(), crate::link_auth::LINK_TOKEN_LEN);
+
+        // The job's own channel must carry the remote_link binding too, not
+        // just the Dispatch message handed to the host — decision 6's accept
+        // loop authenticates against JobRegistry, not against the Dispatch.
+        let job = registry.get(&job_id).context("the job must be registered")?;
+        assert!(
+            job.remote_link.is_some(),
+            "a placed job must have its remote_link bound"
+        );
+        Ok(())
+    }
+
+    /// Adversarial, through the real path (belt-and-suspenders with
+    /// `host_registry`'s own `pick_host_for_skips_a_host_that_does_not_support_the_required_class`
+    /// unit test — this is the integration-level copy proving the fail-closed
+    /// gate actually applies at the real placement point, not only in
+    /// isolation): a registered host that does NOT declare the required
+    /// isolation class is never placed on, even though it's the only host
+    /// registered. Nothing can submit an Untrusted-required job today
+    /// (#298's stage-1 tripwire — every job's required class is the
+    /// `STAGE1_REQUIRED_ISOLATION_CLASS` constant, `Trusted`), so this
+    /// simulates the mismatch the only way currently possible: a host that
+    /// declares support for Untrusted but not Trusted.
+    #[tokio::test]
+    async fn a_submit_never_places_on_a_host_lacking_the_required_isolation_class() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let untrusted_only = sandy_executor_proto::Capabilities {
+            kind: sandy_executor_proto::SandboxKind::Process.into(),
+            arch: sandy_executor_proto::Arch::X8664.into(),
+            attestation: false,
+            supported_isolation_classes: vec![IsolationClass::Untrusted.into()],
+        };
+        let mut dispatch_rx = register_test_host(&host_registry, "ws01", peer_ip, untrusted_only);
+
+        let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+        let response = handle(&store, &registry, &host_registry, Some(forward_back), submit_req(1)).await?;
+        let job_id = match response.result {
+            Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
+            other => {
+                anyhow::bail!("the submit itself must still succeed even when placement finds no match, got {other:?}")
+            }
+        };
+
+        assert!(
+            dispatch_rx.try_recv().is_err(),
+            "a host lacking the required isolation class must never receive a dispatch"
+        );
+        let job = registry.get(&job_id).context("the job must be registered")?;
+        assert!(
+            job.remote_link.is_none(),
+            "a job that failed placement must stay local, not carry a remote_link to nowhere"
+        );
+        Ok(())
+    }
+
+    /// Adversarial: with no host registered at all, Submit still succeeds
+    /// and the job simply runs local (today's unchanged behavior) — a
+    /// configured `forward_back_addr` alone must never be mistaken for "a
+    /// host is available."
+    #[tokio::test]
+    async fn a_submit_with_no_registered_host_stays_local() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+
+        let response = handle(&store, &registry, &host_registry, Some(forward_back), submit_req(1)).await?;
+        let job_id = match response.result {
+            Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
+            other => anyhow::bail!("expected a Submit response, got {other:?}"),
+        };
+
+        let job = registry.get(&job_id).context("the job must be registered")?;
+        assert!(
+            job.remote_link.is_none(),
+            "with no registered host, the job must stay local"
         );
         Ok(())
     }

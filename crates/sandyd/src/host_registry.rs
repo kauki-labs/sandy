@@ -98,6 +98,22 @@ pub enum RegisterError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RegistrationId(u64);
 
+/// A registered host identified as a placement candidate (#298): its id,
+/// peer IP (to bind a decision-6 remote link), and declared capabilities (to
+/// decide `Dispatch.backend`), captured together so a placement decision
+/// never needs a second registry lookup that could race a disconnect
+/// between "picked" and "used."
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlacementCandidate {
+    /// The host's self-reported id — bookkeeping only, never an auth
+    /// boundary (see this module's own doc).
+    pub host_id: String,
+    /// The host's mesh peer IP, as the transport reported it at `Register`.
+    pub peer_ip: IpAddr,
+    /// The host's declared capabilities.
+    pub capabilities: Capabilities,
+}
+
 /// A connected host-client: its declared capabilities and the channel its
 /// connection task reads from to learn about `Dispatch`es placed on it.
 struct ConnectedHost {
@@ -208,6 +224,37 @@ impl HostRegistry {
             .unwrap_or_else(PoisonError::into_inner)
             .get(host_id)
             .map(|host| host.capabilities.clone())
+    }
+
+    /// Stage-1 placement (#298): the first currently-registered host
+    /// (arbitrary order — D5's single-executor model makes "first match"
+    /// equivalent to "the match"; a real scheduling policy is future work
+    /// once more than one executor exists to choose between) whose declared
+    /// `supported_isolation_classes` includes `required`. `None` if no
+    /// registered host qualifies, including when `required` is
+    /// `Unspecified` — the same fail-closed-on-missing-data rule
+    /// [`Self::send_dispatch`] enforces, applied here too so a caller can't
+    /// pick a host `send_dispatch` would then refuse anyway. The caller runs
+    /// the job locally when this returns `None`.
+    ///
+    /// Returns the host's capabilities alongside its id and peer IP so a
+    /// caller can build a `Dispatch` (e.g. its `backend`) without a second
+    /// lookup that could race a concurrent disconnect between the two calls.
+    #[must_use]
+    pub fn pick_host_for(&self, required: i32) -> Option<PlacementCandidate> {
+        if required == i32::from(IsolationClass::Unspecified) {
+            return None;
+        }
+        self.hosts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|(_, host)| host.capabilities.supported_isolation_classes.contains(&required))
+            .map(|(host_id, host)| PlacementCandidate {
+                host_id: host_id.clone(),
+                peer_ip: host.peer_ip,
+                capabilities: host.capabilities.clone(),
+            })
     }
 
     /// Queue `dispatch` for delivery to `host_id`'s connection task, after
@@ -394,6 +441,81 @@ mod tests {
         let result = registry.send_dispatch("ws01", Dispatch::default()).await;
         assert_eq!(result, Err(DispatchSendError::NoSuchHost));
         Ok(())
+    }
+
+    /// Positive (#298): a registered host whose declared capabilities
+    /// satisfy the required class is picked, with its peer IP and
+    /// capabilities returned alongside its id.
+    #[test]
+    fn pick_host_for_returns_a_qualifying_registered_host() {
+        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let registry = HostRegistry::default();
+        registry
+            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
+            .expect("the allowed peer must register");
+
+        let picked = registry
+            .pick_host_for(IsolationClass::Trusted.into())
+            .expect("a Trusted-capable host is registered");
+        assert_eq!(picked.host_id, "ws01");
+        assert_eq!(picked.peer_ip, executor_ip());
+        assert_eq!(picked.capabilities, capabilities());
+    }
+
+    /// Adversarial (#298): no registered host at all means no placement —
+    /// the caller must fall back to running the job locally, not panic or
+    /// fabricate a target.
+    #[test]
+    fn pick_host_for_returns_none_with_no_registered_hosts() {
+        let registry = HostRegistry::default();
+        assert_eq!(registry.pick_host_for(IsolationClass::Trusted.into()), None);
+    }
+
+    /// Adversarial (#298): a registered host that does NOT declare the
+    /// required class is never picked, even though it's the only host
+    /// registered — the fail-closed gate applies at placement time, not
+    /// only at `send_dispatch`.
+    #[test]
+    fn pick_host_for_skips_a_host_that_does_not_support_the_required_class() {
+        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let registry = HostRegistry::default();
+        registry
+            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities()) // Trusted only
+            .expect("the allowed peer must register");
+
+        assert_eq!(registry.pick_host_for(IsolationClass::Untrusted.into()), None);
+    }
+
+    /// Adversarial (#298, the same fail-closed-on-missing-data rule
+    /// `send_dispatch` enforces): an unspecified required class never
+    /// matches anything, even a host that declared real classes — picking a
+    /// host `send_dispatch` would then refuse anyway is strictly worse than
+    /// not placing at all.
+    #[test]
+    fn pick_host_for_refuses_an_unspecified_required_class() {
+        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let registry = HostRegistry::default();
+        registry
+            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
+            .expect("the allowed peer must register");
+
+        assert_eq!(registry.pick_host_for(IsolationClass::Unspecified.into()), None);
+    }
+
+    /// Regression (#298): a host removed from the registry (disconnected) is
+    /// no longer a placement candidate, mirroring
+    /// `a_removed_host_is_no_longer_dispatch_eligible` above for the picking
+    /// side, not just the sending side.
+    #[test]
+    fn pick_host_for_skips_a_removed_host() {
+        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let registry = HostRegistry::default();
+        let (_rx, registration) = registry
+            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
+            .expect("the allowed peer must register");
+        registry.remove("ws01", registration);
+
+        assert_eq!(registry.pick_host_for(IsolationClass::Trusted.into()), None);
     }
 
     /// Adversarial (#263, D5): `host_id` is self-reported, so a different
