@@ -132,7 +132,12 @@ A two-level spec of the existing system lives under
   **end-to-end** (tier-3, `live` feature, a real boot). A live scenario is never
   counted green from a fake (INV-S9). The live acceptance floor (what must pass
   before shipping) is the matrix in
-  [`docs/architecture/kpi.md`](docs/architecture/kpi.md).
+  [`docs/architecture/kpi.md`](docs/architecture/kpi.md). Driving a test from
+  red to green follows
+  [functional red before green](docs/architecture/spec.md#test-discipline-functional-red-before-green):
+  a compile error or `unimplemented!()` is a valid first red for an absent
+  boundary, but once the signature exists the test must fail for a real reason
+  before it's made to pass.
 
 Keep these current: a subsystem change updates its decisions + KPI in `spec.md`,
 its full record in `docs/decisions/`, and the live matrix in `kpi.md`.
