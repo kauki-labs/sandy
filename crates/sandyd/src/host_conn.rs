@@ -551,23 +551,25 @@ mod tests {
         }
     }
 
-    /// Regression (#289 item 3): a frame arriving from the host-executor
-    /// interleaved with outgoing `Dispatch` writes must never desync the
-    /// connection's framing. Before this fix, `read_frame` was raced directly
-    /// inside the loop's `select!` against `dispatch_rx.recv()` — a `read_frame`
-    /// that had only completed one of its two `.await` points (the length
-    /// prefix, say) when the dispatch branch won would be dropped mid-frame,
-    /// silently discarding the bytes already consumed and leaving the next
-    /// read to start at the wrong stream offset. The fix moves reading into
-    /// `forward_frames`, its own task reading sequentially with nothing ever
-    /// racing it; the `select!` only races `frame_rx.recv()`, a channel read
-    /// that can't lose an already-sent value. This drives several dispatches
-    /// and an interleaved unexpected frame (stage 1 has no host→orchestrator
-    /// message, so a second `Register` stands in for "some frame the loop
-    /// treats as unexpected but not fatal") through concurrently and asserts
-    /// every dispatch after the interleaving still decodes correctly — a
-    /// desync would corrupt or lose a later frame, not necessarily the one
-    /// racing the write.
+    /// Regression guard (#289 item 3), NOT a discriminating red/green test:
+    /// checked (200 runs against the pre-fix code, spliced onto the old
+    /// racing `select! { ... read_frame(&mut conn) ... }` structure) and it
+    /// passed every time there too. Forcing the actual race — the dispatch
+    /// branch winning `select!` at the exact instant a `read_frame` future
+    /// has completed only its first `.await` (the length prefix) and not its
+    /// second (the payload) — needs control over poll ordering this test
+    /// doesn't have; tokio's cooperative scheduling doesn't happen to produce
+    /// that interleaving from this setup, on either the old or new code. The
+    /// correctness argument here is structural, not this test: before the
+    /// fix, `read_frame` was raced directly inside the loop's `select!`
+    /// against `dispatch_rx.recv()`, so a drop mid-read was POSSIBLE even if
+    /// this harness can't force it; after the fix, reading happens in
+    /// `forward_frames`, its own task where nothing ever races it, so a drop
+    /// mid-read is no longer possible at all, full stop, independent of
+    /// scheduling. This test exists to catch an actual regression in that
+    /// structure (e.g. someone re-inlining the read into the `select!`) and
+    /// to prove the new code still handles interleaved host-sent frames
+    /// correctly, not to demonstrate the old bug.
     #[tokio::test]
     async fn dispatches_interleaved_with_an_unexpected_frame_are_all_still_delivered_correctly() -> anyhow::Result<()> {
         let allowlist = ExecutorAllowlist::new(["100.64.0.7".parse()?]);

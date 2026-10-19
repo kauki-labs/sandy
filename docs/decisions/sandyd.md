@@ -898,11 +898,16 @@ second `send_dispatch` fails fast rather than hanging;
 drives several dispatches and an interleaved unexpected frame (stage 1 has no
 host→orchestrator message, so a second `Register` stands in for "something
 the loop treats as unexpected but not fatal") through concurrently and
-asserts every dispatch after the interleaving still decodes correctly — the
-functional proof that nothing desyncs, since the exact byte-level race the
-old code was vulnerable to is now structurally impossible to force
-(`forward_frames`'s reads are never cancelled by anything) rather than merely
-timing-dependent to reproduce.
+asserts every dispatch after the interleaving still decodes correctly — a
+regression guard, not a discriminating red/green test: checked against the
+pre-fix code (200 runs) and it passed there too, since forcing the exact
+byte-level interleaving `read_frame`'s two `.await`s needed to lose data
+requires poll-ordering control this harness doesn't have. The correctness
+argument for item 3 is structural, not this test: `forward_frames`'s reads
+are never raced against anything, so a drop mid-read is impossible by
+construction, independent of scheduling — the test exists to catch a
+regression in that structure and to prove the new code still handles
+interleaved frames correctly, not to reproduce the old bug.
 
 **Set aside.** An application-level heartbeat instead of `SO_KEEPALIVE`: the
 ruling in #289 explicitly rejected this — it would duplicate what the
