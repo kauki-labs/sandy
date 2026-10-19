@@ -77,10 +77,13 @@ As above, check epic #205 for which blocks are merged. Decisions:
 
 M2 runs a sandboxed job on a different machine than the one that submitted it.
 The macOS orchestrator (`sandyd`) places a job on a registered remote NixOS host
-(`ws01`), which runs it in a `bwrap` sandbox under `systemd-run --user` with
-`sandy-agent` inside, and links the agent back to the orchestrator over the mesh.
-Stage 1 is **trusted-process** only; untrusted/VM isolation is a later backend
-(see #269's design and `decisions/sandyd.md`).
+(`ws01`) when an agent-link listener address is configured and
+`HostRegistry::pick_host_for` finds a host whose declared backends satisfy the
+job's required isolation class; absent either, the job runs locally instead. A
+placed job runs in a `bwrap` sandbox under `systemd-run --user` with
+`sandy-agent` inside, and links the agent back to the orchestrator over the
+mesh. Stage 1 is **trusted-process** only; untrusted/VM isolation is a later
+backend (see #269's design and `decisions/sandyd.md`).
 
 The flow and the crates it added:
 
