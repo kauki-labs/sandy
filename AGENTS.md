@@ -45,6 +45,32 @@ version, metadata, dependency versions, and lints through the root `Cargo.toml`
   the host's connection on a vsock listener, #238), it joins through the
   orchestrator-side relay (`sandy-fabric-local::link`), and runs the job as its
   child. See `docs/decisions/agent-fabric.md` §10.
+- **`sandy-fabric-compose`** (`impls/fabric-compose`) — the agent-fabric's
+  composition root: the all-local MVP profile and its e2e acceptance (#115).
+  No production `AllLocalProfile` yet; today the crate holds the composition
+  gate that runs every seam's own contract suite against the current real/fake
+  mix (`tests/acceptance.rs`).
+- **`sandy-conn`** — the one stream transport sandyd's control RPC (and later,
+  cross-machine channel delivery) rides: UDS locally, vsock into a VM guest,
+  TCP/QUIC-over-mesh across machines (#205 B6).
+- **`sandy-control-proto`** — sandyd's control-plane RPC surface
+  (Submit/Cancel/Attach/Status/List) as a protobuf contract + length-prefixed
+  framing codec, separate from the fabric's data/event channels.
+- **`sandy-executor-proto`** — the orchestrator↔host-executor contract (#263,
+  M2): capability-declaring registration (Register/Registered/RegisterRefused)
+  plus the `Dispatch` RPC, as protobuf messages over `sandy-control-proto`'s
+  framing on one persistent connection per host.
+- **`sandy-orchestrator`** — the sandyd dispatch core: job manifest and
+  submitter-bounded capability derivation, with Discovery/Executor/Channel/Agent
+  dispatch wiring to follow.
+- **`sandyd`** — the per-machine control-plane daemon (epic #205) dispatching
+  jobs into the agent fabric; M2 adds the `HostRegistry`, mesh listener,
+  `pick_host_for` placement by isolation class, and the decision-6 agent-link
+  accept loop. See `docs/decisions/sandyd.md`.
+- **`sandy-host-executor`** — the M2 remote executor (#269): detects and
+  declares its capabilities, then handles dispatches sequentially — decodes the
+  manifest, **independently re-checks** the isolation class, runs the job via the
+  process backend, and relays the sandbox agent's link back over the mesh.
 
 ## Build & test (run before committing)
 
@@ -95,11 +121,18 @@ crates/
   ├─ sandy-proto/         - agent-fabric channel envelope (protobuf) + codec
   ├─ sandy-fabric/        - agent-fabric seam traits + shared contract-test harness (no impls)
   ├─ sandy-fsutil/        - shared security fs primitives: staging base, owned dirs, the 0600 secret writer
+  ├─ sandy-conn/          - the stream transport sandyd's control RPC rides: UDS -> vsock -> TCP/QUIC-over-mesh
+  ├─ sandy-control-proto/ - sandyd's control RPC surface (Submit/Cancel/Attach/Status/List), protobuf + framing
+  ├─ sandy-executor-proto/- orchestrator<->host-executor contract (#263, M2): capability registration + dispatch RPC
+  ├─ sandy-orchestrator/  - sandyd's dispatch core: job manifest, submitter-bounded capability derivation
+  ├─ sandyd/              - the control-plane daemon dispatching jobs into the agent fabric (epic #205)
+  ├─ sandy-host-executor/ - the M2 remote executor (#269): declares capabilities, runs dispatched jobs, relays the agent link
   └─ sandy-cli/           - the `sandy` binary (doctor, run/ls/status/wait/kill/gc, cred github …)
 impls/
   ├─ local/          - raw-process backend, local-dir share transport, host containment
   ├─ vm/             - QemuBackend (Linux) + VfkitBackend (macOS), virtio-fs transports, console driver
   ├─ fabric-local/   - agent-fabric trivial local impls: in-memory ChannelBackend, LocalCapAuthority, placement, agent link
+  ├─ fabric-compose/ - agent-fabric composition root: all-local MVP profile + e2e acceptance (#115)
   └─ agent/          - the `sandy-agent` binary: the sandbox agent as its own process, the job as its child
 nix/
   ├─ packages/       - crane build definitions
