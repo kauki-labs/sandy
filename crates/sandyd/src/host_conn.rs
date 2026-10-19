@@ -21,6 +21,15 @@ use crate::host_registry::{ExecutorAllowlist, HostRegistry, RegisterError};
 /// exhaustion, not just a slow client.
 const REGISTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long a single `Dispatch` write may take before its host-executor is
+/// treated as hung and disconnected (#289 item 2). Expiry closes the
+/// connection and deregisters the host, which also closes
+/// [`HostRegistry`]'s per-host `mpsc` sender — the transitive fix #301 found:
+/// a `send_dispatch`/`send_dispatch_if_current` call blocked on that channel
+/// filling up (capacity 8) now fails fast with `ConnectionClosing` once this
+/// fires, instead of hanging on a dead host indefinitely.
+const DISPATCH_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Serve one accepted host-executor connection end to end.
 ///
 /// Expects `Register` as the first frame within [`REGISTER_TIMEOUT`];
@@ -30,12 +39,14 @@ const REGISTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10)
 /// connects over the mesh (`PeerAddr::Tcp`), so a UDS peer here would be a
 /// caller bug, not a registration this code should entertain.
 ///
-/// CAUTION (#289): every `write_frame` call below, including the refusal
-/// writes before registration, has no deadline. A peer that stops reading
-/// after opening a connection can stall one of these indefinitely — see the
-/// inline notes at each site and at the connection loop's own `write_frame`
-/// for the specific consequence each one has. All are deliberately deferred
-/// to #289, not fixed here.
+/// CAUTION (#289): the three refusal writes before registration (not
+/// allowlisted, missing capabilities, `host_id` already claimed) still have
+/// no deadline. A peer that stops reading after opening a connection can
+/// stall one of those indefinitely — their cost is just the connection slot,
+/// since no registry entry exists yet, which is why they're deliberately
+/// deferred. The one write that mattered more — the registered `Dispatch`
+/// push, which stalls a live, dispatch-eligible registry entry — has
+/// [`DISPATCH_WRITE_TIMEOUT`] (#289 item 2, landed).
 pub async fn serve_host_executor(
     mut conn: Box<dyn Conn>,
     peer: PeerAddr,
@@ -172,23 +183,21 @@ pub async fn serve_host_executor(
                     // registry entry was already replaced or removed.
                     break;
                 };
-                // CAUTION (#289): this write has no deadline. A registered
-                // host that stops reading (its send buffer fills) stalls this
-                // branch indefinitely — the loop can't poll read_frame, so
-                // registry.remove never runs, and the dispatch channel fills
-                // after 8 buffered sends, stalling future send_dispatch calls
-                // too. Add an explicit deadline here, removing the
-                // registration on expiry, before relying on this path to stay
-                // responsive to a hung or hostile host-executor.
-                if write_frame(
-                    &mut conn,
-                    &OrchestratorMessage { op: Some(orchestrator_message::Op::Dispatch(dispatch)) },
+                match tokio::time::timeout(
+                    DISPATCH_WRITE_TIMEOUT,
+                    write_frame(&mut conn, &OrchestratorMessage { op: Some(orchestrator_message::Op::Dispatch(dispatch)) }),
                 )
                 .await
-                .is_err()
                 {
-                    tracing::warn!(host_id, "failed writing Dispatch to host-executor; closing");
-                    break;
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => {
+                        tracing::warn!(host_id, "failed writing Dispatch to host-executor; closing");
+                        break;
+                    }
+                    Err(_elapsed) => {
+                        tracing::warn!(host_id, "writing Dispatch to host-executor timed out; treating it as hung");
+                        break;
+                    }
                 }
             }
             frame = read_frame::<HostExecutorMessage>(&mut conn) => {
@@ -383,5 +392,125 @@ mod tests {
         serving.await?; // bounded by the virtual-clock advance above, not real time
         drop(client);
         Ok(())
+    }
+
+    /// Regression (#289 item 2, with the #301 propagation it names): a
+    /// registered host that stops reading must not stall `Dispatch` delivery
+    /// forever. A tiny duplex buffer fits the Register/Registered handshake
+    /// (drained before the Dispatch write) but not a Dispatch frame, so a
+    /// peer that stops reading genuinely blocks the write exactly like a full
+    /// TCP receive buffer would.
+    ///
+    /// Proves the documented `ConnectionClosing` result directly, not just
+    /// that *some* later call fails (CodeRabbit on #311): fills the
+    /// `HostRegistry` channel (capacity 8, one slot already drained into the
+    /// stalled write) so a 9th `send_dispatch` genuinely blocks on a full
+    /// channel, same as a real caller racing the timeout would. Once the
+    /// write's deadline expires and `registry.remove` drops the channel's
+    /// receiver, that blocked send resolves — asserted to be exactly
+    /// `DispatchSendError::ConnectionClosing`, not merely "an error."
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_host_is_disconnected_after_the_dispatch_write_timeout() -> anyhow::Result<()> {
+        let allowlist = ExecutorAllowlist::new(["100.64.0.7".parse()?]);
+        let registry = HostRegistry::default();
+        let (mut client, server) = tokio::io::duplex(64);
+
+        write_frame(
+            &mut client,
+            &HostExecutorMessage {
+                op: Some(host_executor_message::Op::Register(Register {
+                    host_id: "ws01".to_owned(),
+                    capabilities: Some(capabilities()),
+                })),
+            },
+        )
+        .await?;
+
+        let registry = std::sync::Arc::new(registry);
+        let allowlist = std::sync::Arc::new(allowlist);
+        let serve = tokio::spawn({
+            let registry = std::sync::Arc::clone(&registry);
+            let allowlist = std::sync::Arc::clone(&allowlist);
+            async move {
+                serve_host_executor(Box::new(server), tcp_peer("100.64.0.7"), &allowlist, &registry).await;
+            }
+        });
+
+        let _registered: OrchestratorMessage = read_frame(&mut client)
+            .await?
+            .context("expected a Registered response")?;
+
+        // The first send is picked up by the connection loop's select! and
+        // its write stalls immediately (the duplex buffer is too small for
+        // even one frame) — this one slot is never returned to the channel.
+        registry.send_dispatch("ws01", test_dispatch("job-1")).await?;
+
+        // Fill the channel's full capacity (8) behind the stalled write:
+        // these succeed immediately since nothing has consumed from the
+        // channel since the first send.
+        for n in 0..8 {
+            registry
+                .send_dispatch("ws01", test_dispatch(&format!("job-fill-{n}")))
+                .await?;
+        }
+
+        // The 9th send has no room left and genuinely blocks — exactly the
+        // caller this fix exists for. Spawned so the test can advance the
+        // clock concurrently with it being blocked.
+        let blocked_registry = std::sync::Arc::clone(&registry);
+        let blocked_send = tokio::spawn(async move {
+            blocked_registry
+                .send_dispatch("ws01", test_dispatch("job-overflow"))
+                .await
+        });
+
+        // Give the spawned send a chance to actually reach the blocking
+        // point before the clock advances, so the race is real rather than
+        // incidental: with the clock paused, a bare `yield_now` lets the
+        // runtime poll `blocked_send` once without passing any virtual time.
+        tokio::task::yield_now().await;
+
+        // Never read further from `client`: the Dispatch write stays
+        // stalled, standing in for a hung peer. Plain `.await` on `serve`
+        // below, not a second real-time `timeout` wrapper: with the clock
+        // paused, `advance` already drives the runtime past the one timer
+        // this task is waiting on, so nothing further needs to pass virtual
+        // time — matching the pattern the `REGISTER_TIMEOUT` regression test
+        // above uses.
+        tokio::time::advance(DISPATCH_WRITE_TIMEOUT + std::time::Duration::from_millis(1)).await;
+        serve.await?;
+
+        let blocked_result = blocked_send.await?;
+        assert_eq!(
+            blocked_result,
+            Err(crate::host_registry::DispatchSendError::ConnectionClosing),
+            "a send blocked on the full channel must resolve to ConnectionClosing once the write times out, not hang"
+        );
+
+        assert_eq!(
+            registry.capabilities_of("ws01"),
+            None,
+            "a hung Dispatch write must disconnect and deregister the host"
+        );
+
+        let resend = registry.send_dispatch("ws01", test_dispatch("job-2")).await;
+        assert!(
+            matches!(resend, Err(crate::host_registry::DispatchSendError::NoSuchHost)),
+            "a send after full deregistration must fail with NoSuchHost, not hang: got {resend:?}"
+        );
+        drop(client);
+        Ok(())
+    }
+
+    fn test_dispatch(job_id: &str) -> sandy_executor_proto::Dispatch {
+        sandy_executor_proto::Dispatch {
+            job_id: job_id.to_owned(),
+            manifest: b"m".to_vec(),
+            manifest_encoding: "test/v1".to_owned(),
+            backend: SandboxKind::Process.into(),
+            link_token: vec![0u8; 32],
+            forward_back: "100.64.0.1:9000".to_owned(),
+            required_isolation_class: IsolationClass::Trusted.into(),
+        }
     }
 }

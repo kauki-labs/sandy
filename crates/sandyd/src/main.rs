@@ -373,7 +373,7 @@ async fn setup_mesh_listener() -> std::io::Result<Option<MeshSetup>> {
         ));
     }
 
-    let listener = sandy_conn::listen(&ConnAddr::Tcp(addr))
+    let listener = sandy_conn::listen_tcp_keepalive(addr, sandy_conn::TcpKeepalive::HALF_OPEN_DETECTION)
         .await
         .map_err(std::io::Error::other)?;
     tracing::info!(addr = %addr, "sandyd mesh management-channel listener bound");

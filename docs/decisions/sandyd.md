@@ -818,3 +818,66 @@ a value that cannot vary until #150 lands — see the tripwire comment at
 (load, affinity, multiple qualifying hosts): stage-1 has at most one
 executor in practice, so "first match" is equivalent to "the match"; nothing
 to decide between yet.
+
+## 16. Cross-machine connection robustness: TCP keepalive and a Dispatch-write deadline (#289 items 1-2)
+
+**Status:** implemented (items 1-2; items 3-4 remain open, see Consequences).
+
+**Context.** Decision 12's "the connection is the liveness signal" model
+(#269) assumed a closed TCP connection is the only way a host-executor goes
+away. sandy-73's fd-lifecycle review of #277/#284 found the gap: without
+`SO_KEEPALIVE` or a read deadline, a **vanished** peer (power cut, network
+partition) leaves a half-open connection the kernel still reports as open —
+it stays dispatch-eligible, and dispatches sent to it vanish into the kernel
+send buffer with no error. Separately, `host_conn::serve_host_executor`'s
+`Dispatch` write had no deadline at all: a host-executor that stops reading
+(a hung process, a full receive buffer) blocks that write indefinitely,
+which #301 found also transitively blocks any `send_dispatch`/
+`send_dispatch_if_current` caller once the per-host `mpsc` channel (capacity 8) backs up behind it — including `handler::handle`'s `Submit` path.
+
+**Decision.**
+
+- **Keepalive, not an app-level ping.** `sandy-conn` gains `TcpKeepalive`
+  (`idle`/`interval`/`retries`, wrapping `socket2`) plus `connect_tcp_keepalive`/
+  `listen_tcp_keepalive`, additive alongside the existing tier-agnostic
+  `connect`/`listen` rather than changing their signatures — UDS has no
+  keepalive concept, so threading a TCP-only config through every tier's
+  API would be the wrong generalization for a crate whose whole point is one
+  API across tiers. `TcpKeepalive::HALF_OPEN_DETECTION` (30s idle, 15s
+  interval, 4 retries — a ~90s detection window) is the one profile used,
+  on both the dial side (`sandy-host-executor`) and the accept side (`sandyd`'s
+  `host_conn` management-channel listener), so either direction notices a
+  dead peer. A real process crash already gives an immediate connection
+  reset; keepalive only covers the vanished-host case that reset can't.
+- **A `DISPATCH_WRITE_TIMEOUT` (30s) around the `Dispatch` write** in
+  `host_conn::serve_host_executor`'s connection loop. On expiry the connection
+  closes and `registry.remove` runs exactly as it does on a write error —
+  which drops `HostRegistry`'s sender for that host, so a `send_dispatch`
+  call already blocked on the now-full channel resolves to
+  `DispatchSendError::ConnectionClosing` instead of hanging, closing the
+  #301-found transitive gap. Scoped to only this write: the three refusal
+  writes before a host is registered (not allowlisted, missing capabilities,
+  `host_id` already claimed) stay undeadlined — their cost is just the
+  connection slot, since no registry entry exists yet to leave stranded.
+
+**Consequences.** `sandy-conn`'s public surface grows by one struct and two
+functions; nothing existing changed shape. #289 items 3 (`read_frame`'s
+cancel-safety, latent until a host→orchestrator message exists) and 4
+(`sandy-91`'s relay wall-clock bound) remain open and are unaffected by this
+change. A regression test for each item proves the mechanism directly rather
+than racing on timing: `apply_tcp_keepalive_sets_the_kernel_sockopts` reads
+the sockopts back via `socket2::SockRef` rather than asserting on a timed
+disconnect; `a_hung_host_is_disconnected_after_the_dispatch_write_timeout`
+drives a real `registry.send_dispatch` into a deliberately undersized duplex
+buffer standing in for a full TCP receive buffer, advances tokio's paused
+clock past `DISPATCH_WRITE_TIMEOUT`, and asserts both the deregistration and
+that a second `send_dispatch` fails fast rather than hanging.
+
+**Set aside.** An application-level heartbeat instead of `SO_KEEPALIVE`: the
+ruling in #289 explicitly rejected this — it would duplicate what the
+kernel already does and break the "the connection is the liveness signal"
+model's simplicity (decision 12) for no detection-accuracy gain. A single
+shared read/write deadline covering every `write_frame` call in
+`host_conn.rs` (including the pre-registration refusals): deferred along
+with those three writes themselves, since they carry no live registry state
+to strand.
