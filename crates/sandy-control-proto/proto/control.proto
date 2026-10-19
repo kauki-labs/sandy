@@ -111,6 +111,17 @@ message StatusRequest {
 message StatusResponse {
   string job_id = 1;
   JobStatus status = 2;
+  // A terminal job's guest exit code, once a remote run reports one back
+  // (#292): unset while the job is still PENDING/RUNNING, or when it reached a
+  // terminal state without producing an exit (an infra fault, a timeout, a
+  // cancel). `status` is the lifecycle band; this is the raw process code the
+  // orchestrator classified that band from, surfaced so a caller sees exactly
+  // what the job exited with, not just SUCCEEDED/FAILED.
+  optional int32 exit_code = 3;
+  // A bounded tail of the job's own stdout/stderr, surfaced once a remote run
+  // reports it back — the one place a cross-machine job's output is visible to
+  // a caller that cannot reach the host. Empty while the job has reported none.
+  string console_tail = 4;
 }
 
 message ListRequest {}
