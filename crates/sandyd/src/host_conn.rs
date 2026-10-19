@@ -332,6 +332,24 @@ mod tests {
         }
     }
 
+    /// Waits until a [`PendingCounter`]'s count has risen above `baseline`,
+    /// meaning its read has returned `Pending` again since `baseline` was
+    /// captured — i.e. it consumed whatever was written and parked on the
+    /// next thing it needs. Bounded to 10,000 yields: a loud failure, not a
+    /// silent hang, if the read is never even attempted.
+    async fn wait_for_read_to_park(
+        pending_reads: &std::sync::atomic::AtomicUsize,
+        baseline: usize,
+    ) -> anyhow::Result<()> {
+        for _ in 0..10_000 {
+            if pending_reads.load(std::sync::atomic::Ordering::SeqCst) > baseline {
+                return Ok(());
+            }
+            tokio::task::yield_now().await;
+        }
+        anyhow::bail!("the connection's read never parked again after the write")
+    }
+
     fn tcp_peer(ip: &str) -> PeerAddr {
         PeerAddr::Tcp(SocketAddr::new(ip.parse().expect("ip literal"), 9000))
     }
@@ -818,18 +836,10 @@ mod tests {
 
         // Wait for an OBSERVED fact — the connection's read has genuinely
         // returned `Pending` at least once more since the write above — not
-        // an assumed one. Bounded to 10_000 yields (loud failure, not a
-        // silent hang, if the read is never even attempted).
-        for _ in 0..10_000 {
-            if pending_reads.load(std::sync::atomic::Ordering::SeqCst) > baseline {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        anyhow::ensure!(
-            pending_reads.load(std::sync::atomic::Ordering::SeqCst) > baseline,
-            "the connection's read never parked waiting for more bytes after the length-prefix-only write"
-        );
+        // an assumed one.
+        wait_for_read_to_park(&pending_reads, baseline)
+            .await
+            .context("the connection's read never parked waiting for more bytes after the length-prefix-only write")?;
 
         // The length prefix is now consumed with no payload bytes behind it:
         // the read is necessarily still pending on `read_exact`, not a race,
@@ -858,8 +868,20 @@ mod tests {
         // ready dispatch branch over the still-pending read (proven by the
         // read above), dropping the length prefix already consumed. Only
         // now does the payload follow.
+        let before_payload = pending_reads.load(std::sync::atomic::Ordering::SeqCst);
         client.write_all(&payload).await.context("write the payload")?;
         client.flush().await?;
+        // Same discipline as above, not just for the forced split: confirm
+        // the reader actually consumed this frame and parked again before
+        // trusting the dispatch delivery that follows to say anything about
+        // it (CodeRabbit, #312) — the 30/30 empirical result already proved
+        // this test discriminates correctly without it, but asserting the
+        // intermediate state explicitly, consistently, costs nothing and
+        // means a future change to any step doesn't quietly lose the
+        // guarantee this one still relies on scheduling luck for.
+        wait_for_read_to_park(&pending_reads, before_payload)
+            .await
+            .context("the reader must decode the completed frame and park on the next prefix")?;
 
         registry.send_dispatch("ws01", test_dispatch("job-2")).await?;
         let pushed: OrchestratorMessage = read_frame(&mut client).await?.context("expected a Dispatch push")?;
@@ -885,6 +907,7 @@ mod tests {
         // supplies — almost certainly failing to parse as a valid frame
         // (`TooLarge` or `Decode`), breaking the loop and deregistering the
         // host before this check runs.
+        let before_clean = pending_reads.load(std::sync::atomic::Ordering::SeqCst);
         write_frame(
             &mut client,
             &HostExecutorMessage {
@@ -895,6 +918,9 @@ mod tests {
             },
         )
         .await?;
+        wait_for_read_to_park(&pending_reads, before_clean)
+            .await
+            .context("the reader must consume the clean frame before the registration check")?;
         registry.send_dispatch("ws01", test_dispatch("job-3")).await.context(
             "the host must still be registered and dispatch-eligible after a clean frame following the forced \
              interleaving — a desync would have broken the connection by now",
