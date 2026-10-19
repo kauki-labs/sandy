@@ -73,9 +73,12 @@ communicating, agent inside each," across macOS and an external machine), now de
   the legitimate orchestrator may dispatch — mesh identity, mesh-address-only bind,
   AllowedIPs one /32 per node), not just the orchestrator authenticating the executor.
   Manifest validation: the executor never blindly runs what it is handed; submitter-bounded
-  caps apply. Per-run token flow (decision-6): the orchestrator mints the token, sends it
-  over the encrypted mesh in the dispatch, the agent presents it forwarding back, decision-6
-  verifies. Least privilege: the job runs inside the sandbox, never on the host.
+  caps apply. Per-run token flow (decision-6): the orchestrator mints the token and sends it
+  over the encrypted control RPC in the dispatch; the **executor-side forwarder** retains it
+  in memory and passes it as the opaque prefix to `forward_agent_link` — the sandbox agent
+  never receives it through a file, argv, the environment, `RunSpec`, logs, or the Nix store.
+  decision-6 verifies it on accept. Least privilege: the job runs inside the sandbox, never
+  on the host.
   - **Isolation-class gate (two-sided).** The dispatch (#263) carries the job's **required
     isolation class**. The orchestrator must not dispatch it to a host whose declared backends
     cannot provide that class (`pick_host_for` placement), **and** the executor independently
@@ -126,6 +129,10 @@ Plus these assertions, each of which Stage 1 cannot pass without:
   and executor teardown, a subsequent link claim on that run's still-unclaimed token is
   **refused** (zero bytes). Each terminal path invalidates the token (D5 token lifecycle), so a
   late or replayed claim cannot open a link against a run that is already gone.
+- **Unauthorized dispatch refused** — the executor rejects a `#263` dispatch that does not
+  arrive from the authenticated orchestrator (mesh identity, mesh-address-only bind, AllowedIPs
+  one /32 per node), fail-closed and before launching anything — the executor-side half of D5
+  mutual auth, not only decision-6's authentication of the agent-link stream.
 - **Isolation-class gate** — a job declaring an isolation class the executor cannot provide is
   refused fail-closed by **both** sides (orchestrator placement and the executor's independent
   re-check), never downgraded onto `trusted-process`.
