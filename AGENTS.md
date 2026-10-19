@@ -209,3 +209,55 @@ its full record in `docs/decisions/`, and the live matrix in `kpi.md`.
 
 1. Leaving compiler or clippy warnings → fix, or `#[allow(reason = "…")]` with a justification
 2. Hardcoding config values instead of threading them through
+
+## Merge & CI gotchas
+
+Recurring traps this cycle's builders hit and re-discovered. Facts about this
+repo's own setup, not general git advice.
+
+- **`gh pr merge <n> --auto`, omit `--squash`.** The merge queue, not the flag,
+  owns `main`'s merge strategy; exact `--squash --auto` behavior (hard error vs.
+  a warning that still queues) is `gh`-version-dependent and not worth relying
+  on either way — leave `--squash` off.
+- **`required_review_thread_resolution` is on.** Every thread must be resolved,
+  including one deliberately deferred to a follow-up issue (reply citing the
+  issue, then resolve) — an open thread blocks the queue from picking up the
+  PR regardless of `reviewDecision`.
+- **A stale `CHANGES_REQUESTED` can linger past the point its findings are
+  actually resolved**, through later `COMMENTED` follow-ups that don't
+  themselves flip it back to `APPROVED` (confirmed on #178 and #296's own
+  review history). Re-read `reviewDecision` fresh immediately before
+  enqueuing — don't trust a value cached from earlier in a review cycle — and
+  if it's stuck at `CHANGES_REQUESTED` with every thread actually resolved,
+  `@coderabbitai approve` forces a fresh formal review state.
+- **The squash-merge-rebase trap.** A branch forked from another PR's branch
+  before that PR squash-merges still carries its individual commits; a plain
+  `git rebase origin/main` after the squash replays them and conflicts. Diff
+  the branch's own commits and reapply them onto a fresh branch from `main`
+  instead. For a stack of PRs, rebase bottom-up as each base actually merges,
+  not all at once.
+- **A queued PR can be silently dequeued.** When another PR lands ahead of it
+  and the base moves, `mergeQueueEntry` can go `null` while the PR is still
+  `OPEN` — not a failure, just re-enqueue.
+- **`start_paused` + a real I/O op (e.g. a real TCP dial) is flaky for timeout
+  tests.** The virtual clock races the real connect; use real short durations
+  instead of pairing a virtual clock with genuine I/O.
+- **`autoMergeRequest` is null for a PR in the merge queue.** It's GitHub's
+  separate native auto-merge feature; `gh pr merge --auto` enqueueing into the
+  merge queue returns silent on success and never sets it. Check
+  `mergeQueueEntry { state position }` via the GraphQL API to tell `QUEUED`
+  from genuinely unenqueued, not `autoMergeRequest`.
+- **A command piped to `tail`/`head` masks its own exit code.** The shell
+  reports the pipeline's last command's exit status, not `nix build`'s (or
+  whatever ran first) — a build that actually failed can look like a clean
+  exit if only the tail of its output is read. Printing the exit code
+  (`cmd; echo "exit=$?"`) is diagnostic only — it doesn't _preserve_ it, so a
+  script that keeps going afterward still has the wrong `$?` for anything
+  later. Save it to a variable and act on that (`cmd; rc=$?; ...; exit "$rc"`)
+  before any pipe, rather than relying on an echoed value or a truncated tail.
+- **`gh pr merge --disable-auto` does not dequeue a PR already in the merge
+  queue** — it reports "already queued to merge" and leaves it there. To
+  actually remove one, use the GraphQL `dequeuePullRequest` mutation against
+  the PR's own node id (not the `mergeQueueEntry`'s id — that resolves to
+  "could not resolve"). Re-query `mergeQueueEntry` afterward to confirm it
+  came back `null`.
