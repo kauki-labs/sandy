@@ -15,6 +15,7 @@ use std::{
     net::SocketAddr,
     os::unix::fs::FileTypeExt,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
@@ -40,6 +41,49 @@ pub enum ConnError {
     Io(#[from] std::io::Error),
 }
 
+/// TCP keepalive tuning for a connection — the half-open-detection fix from
+/// #289: without this, a vanished peer (power-off, partition) leaves a
+/// TCP connection the kernel still reports as open, so the orchestrator's
+/// "the connection is the liveness signal" model (#269) never notices and
+/// keeps dispatching to a peer that's gone. The kernel tears the connection
+/// down once `idle` has passed with no traffic and `retries` keepalive
+/// probes spaced `interval` apart go unanswered — total detection time is
+/// roughly `idle + interval * retries`.
+///
+/// UDS has no equivalent (local peers can't "vanish" the way a cross-machine
+/// one can — a crashed local process gives an immediate connection-reset),
+/// so this only applies to the TCP tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpKeepalive {
+    /// How long the connection may sit idle before the first keepalive probe.
+    pub idle: Duration,
+    /// Spacing between successive unanswered probes.
+    pub interval: Duration,
+    /// How many unanswered probes before the kernel gives up on the peer.
+    pub retries: u32,
+}
+
+impl TcpKeepalive {
+    /// A profile tuned to detect a vanished peer within roughly one to two
+    /// minutes (`idle + interval * retries` = 30s + 15s * 4 = 90s) — #289
+    /// item 1's ruling for the orchestrator↔host-client management channel,
+    /// used on both the dial (`sandy-host-executor`) and accept (`sandyd`'s
+    /// `host_conn`) sides so either direction notices a half-open peer.
+    pub const HALF_OPEN_DETECTION: TcpKeepalive = TcpKeepalive {
+        idle: Duration::from_secs(30),
+        interval: Duration::from_secs(15),
+        retries: 4,
+    };
+}
+
+fn apply_tcp_keepalive(stream: &TcpStream, keepalive: &TcpKeepalive) -> std::io::Result<()> {
+    let params = socket2::TcpKeepalive::new()
+        .with_time(keepalive.idle)
+        .with_interval(keepalive.interval)
+        .with_retries(keepalive.retries);
+    socket2::SockRef::from(stream).set_tcp_keepalive(&params)
+}
+
 /// An ordered, duplex byte stream — what `sandy-control-proto`'s
 /// length-prefixed framing (`write_frame`/`read_frame`) rides directly,
 /// whichever tier produced it. A blanket impl: any type that is already
@@ -57,6 +101,19 @@ pub async fn connect(addr: &ConnAddr) -> Result<Box<dyn Conn>, ConnError> {
         ConnAddr::Uds(path) => Ok(Box::new(UnixStream::connect(path).await?)),
         ConnAddr::Tcp(socket_addr) => Ok(Box::new(TcpStream::connect(socket_addr).await?)),
     }
+}
+
+/// Dial a TCP peer with [`TcpKeepalive`] tuning applied before handing the
+/// connection back, so a vanished peer is detected rather than left
+/// half-open forever. See [`TcpKeepalive`] for what "vanished" covers and
+/// why this is TCP-only.
+///
+/// # Errors
+/// [`ConnError::Io`] if the dial or the keepalive sockopt call fails.
+pub async fn connect_tcp_keepalive(addr: SocketAddr, keepalive: TcpKeepalive) -> Result<Box<dyn Conn>, ConnError> {
+    let stream = TcpStream::connect(addr).await?;
+    apply_tcp_keepalive(&stream, &keepalive)?;
+    Ok(Box::new(stream))
 }
 
 /// An accepted connection's peer identity, tagged by the tier it arrived on.
@@ -85,7 +142,7 @@ pub struct Listener(ListenerInner);
 
 enum ListenerInner {
     Uds(UnixListener),
-    Tcp(TcpListener),
+    Tcp(TcpListener, Option<TcpKeepalive>),
 }
 
 impl Listener {
@@ -100,8 +157,11 @@ impl Listener {
                 let (stream, _addr) = listener.accept().await?;
                 Ok((Box::new(stream), PeerAddr::Uds))
             }
-            ListenerInner::Tcp(listener) => {
+            ListenerInner::Tcp(listener, keepalive) => {
                 let (stream, addr) = listener.accept().await?;
+                if let Some(keepalive) = keepalive {
+                    apply_tcp_keepalive(&stream, keepalive)?;
+                }
                 Ok((Box::new(stream), PeerAddr::Tcp(addr)))
             }
         }
@@ -118,7 +178,7 @@ impl Listener {
             ListenerInner::Uds(_) => Err(ConnError::Io(std::io::Error::other(
                 "a UDS listener has no SocketAddr; local_addr is TCP-only",
             ))),
-            ListenerInner::Tcp(listener) => Ok(listener.local_addr()?),
+            ListenerInner::Tcp(listener, _keepalive) => Ok(listener.local_addr()?),
         }
     }
 }
@@ -140,8 +200,24 @@ impl Listener {
 pub async fn listen(addr: &ConnAddr) -> Result<Listener, ConnError> {
     match addr {
         ConnAddr::Uds(path) => Ok(Listener(ListenerInner::Uds(bind_uds(path).await?))),
-        ConnAddr::Tcp(socket_addr) => Ok(Listener(ListenerInner::Tcp(TcpListener::bind(socket_addr).await?))),
+        ConnAddr::Tcp(socket_addr) => Ok(Listener(ListenerInner::Tcp(
+            TcpListener::bind(socket_addr).await?,
+            None,
+        ))),
     }
+}
+
+/// Bind a TCP listener that applies [`TcpKeepalive`] to every accepted
+/// connection, so a vanished peer on the accepting side is detected the same
+/// way a dialing one is via [`connect_tcp_keepalive`].
+///
+/// # Errors
+/// [`ConnError::Io`] if binding fails.
+pub async fn listen_tcp_keepalive(addr: SocketAddr, keepalive: TcpKeepalive) -> Result<Listener, ConnError> {
+    Ok(Listener(ListenerInner::Tcp(
+        TcpListener::bind(addr).await?,
+        Some(keepalive),
+    )))
 }
 
 async fn bind_uds(path: &Path) -> Result<UnixListener, ConnError> {
@@ -557,6 +633,58 @@ mod tests {
             mode, 0o600,
             "a world-readable lockfile lets another user block our flock (CWE-59)"
         );
+        Ok(())
+    }
+
+    fn test_keepalive() -> TcpKeepalive {
+        TcpKeepalive {
+            idle: Duration::from_secs(30),
+            interval: Duration::from_secs(15),
+            retries: 4,
+        }
+    }
+
+    /// Proves `apply_tcp_keepalive` actually sets the kernel sockopts, not
+    /// just that the call returns `Ok`. Reads the values straight back via
+    /// `SockRef`, the same crate the setter uses, so this would catch a
+    /// no-op implementation (e.g. a builder constructed but never applied).
+    #[tokio::test]
+    async fn apply_tcp_keepalive_sets_the_kernel_sockopts() -> anyhow::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.context("bind")?;
+        let addr = listener.local_addr().context("local_addr")?;
+        let (stream, _accepted) = tokio::try_join!(TcpStream::connect(addr), async { listener.accept().await })?;
+
+        let keepalive = test_keepalive();
+        apply_tcp_keepalive(&stream, &keepalive).context("apply_tcp_keepalive")?;
+
+        let sock_ref = socket2::SockRef::from(&stream);
+        assert!(
+            sock_ref.keepalive().context("keepalive")?,
+            "SO_KEEPALIVE must be enabled"
+        );
+        assert_eq!(
+            sock_ref.tcp_keepalive_time().context("tcp_keepalive_time")?,
+            keepalive.idle
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connect_tcp_keepalive_round_trips_bytes_like_plain_connect() -> anyhow::Result<()> {
+        let listener = listen_tcp_keepalive("127.0.0.1:0".parse()?, test_keepalive())
+            .await
+            .context("listen_tcp_keepalive")?;
+        let bound = listener.local_addr().context("local_addr")?;
+
+        let ((accepted, _peer), mut dialed) =
+            tokio::try_join!(listener.accept(), connect_tcp_keepalive(bound, test_keepalive()))?;
+        let mut accepted = accepted;
+
+        dialed.write_all(b"hello").await.context("write")?;
+        dialed.flush().await?;
+        let mut buf = [0u8; 5];
+        accepted.read_exact(&mut buf).await.context("read")?;
+        assert_eq!(&buf, b"hello");
         Ok(())
     }
 

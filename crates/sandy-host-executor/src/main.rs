@@ -9,7 +9,7 @@
 //! host-executor simply exits non-zero and leaves restarting it to its
 //! supervisor (the nix service, tracked separately, #287).
 
-use sandy_conn::ConnAddr;
+use sandy_conn::TcpKeepalive;
 use sandy_host_executor::{
     capability::detect_register_capabilities,
     client_config::{ExecutorConfig, parse_executor_config},
@@ -41,7 +41,8 @@ async fn main() {
         }
     };
 
-    let mut conn = match sandy_conn::connect(&ConnAddr::Tcp(config.orchestrator)).await {
+    let mut conn = match sandy_conn::connect_tcp_keepalive(config.orchestrator, TcpKeepalive::HALF_OPEN_DETECTION).await
+    {
         Ok(conn) => conn,
         Err(e) => {
             tracing::error!(error = %e, orchestrator = %config.orchestrator, "could not dial the orchestrator");

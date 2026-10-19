@@ -72,6 +72,7 @@ portable-pty = "0.9"
 tiny_http = "0.12"
 tokio-vsock = "0.7"
 vsock = "0.5"
+socket2 = "0.6"
 
 # sandyd's job state store (#212, B1): vendored SQLite, no system dependency,
 # synchronous API wrapped in spawn_blocking (docs/decisions/sandyd.md §4).
