@@ -1088,19 +1088,24 @@ mod tests {
     /// Regression (live M2 cross-machine run, infra-f3): the test above
     /// registers its host via `register_test_host`, a hand-built
     /// `Capabilities` fed directly to `HostRegistry::register` — it never
-    /// exercises `host_conn::serve_host_executor`'s real wire decode, nor
-    /// `main.rs`'s own threading of `forward_back_addr` from the bound
-    /// agent-link listener through `serve_connection` into `handle`. The live
-    /// symptom (`sandy daemon submit` returning a job that stays `Pending`
-    /// forever, zero placement activity) could in principle come from either
-    /// gap even though `host_conn`'s own placement-candidate test and the
-    /// unit-level dispatch test above both pass individually. This drives
-    /// the full path together: a REAL wire `Register` frame through
-    /// `serve_host_executor`, then a real `handle(Submit)` call with
-    /// `forward_back_addr` set exactly as `main.rs` would thread it, and
-    /// reads the resulting `Dispatch` back off the host's actual connection
-    /// (not a bare channel recv) — the same observable the host-executor
-    /// itself would see.
+    /// exercises `host_conn::serve_host_executor`'s real wire decode. This
+    /// drives that part of the path for real: a REAL wire `Register` frame
+    /// through `serve_host_executor`, then `handle(Submit)`, reading the
+    /// resulting `Dispatch` back off the host's actual connection (not a
+    /// bare channel recv) — the same observable the host-executor itself
+    /// would see.
+    ///
+    /// CAUTION (CodeRabbit, #313): `forward_back_addr` is passed to `handle`
+    /// directly here, a value this test picked — it does NOT exercise
+    /// `main.rs`'s own threading of that address from `$SANDY_MESH_AGENT_LINK_LISTEN`
+    /// through `setup_mesh_agent_link_listener` and `serve_connection` into
+    /// `handle`. A regression that broke THAT wiring (e.g. `main.rs` stops
+    /// passing the bound address through) would not be caught here — this
+    /// test only proves the handler/registry/wire path once `forward_back_addr`
+    /// is already correct, not that `main.rs` supplies it correctly. No test
+    /// in this crate currently covers that seam; it would need a real bound
+    /// listener and a `main`-level integration test, out of scope for this
+    /// PR's coverage-only aim.
     #[tokio::test]
     async fn a_submit_reaches_a_real_wire_registered_host_end_to_end() -> anyhow::Result<()> {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
