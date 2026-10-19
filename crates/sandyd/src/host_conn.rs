@@ -13,7 +13,7 @@ use sandy_executor_proto::{
 };
 use tokio::sync::mpsc;
 
-use crate::host_registry::{ExecutorAllowlist, HostRegistry, RegisterError};
+use crate::host_registry::{ExecutorAllowlist, HostRegistry, RegisterError, Registration};
 
 /// How long a freshly accepted connection has to send its `Register` frame
 /// before it's closed. Without a deadline here, a peer that opens a
@@ -132,7 +132,13 @@ pub async fn serve_host_executor(
         "decoded Register capabilities"
     );
 
-    let (mut dispatch_rx, registration) = match registry.register(allowlist, peer_ip, host_id.clone(), capabilities) {
+    // `register` logs any same-peer reclaim itself (#292 item 4), so the
+    // superseded registration is ignored here.
+    let Registration {
+        mut dispatch_rx,
+        registration,
+        ..
+    } = match registry.register(allowlist, peer_ip, host_id.clone(), capabilities) {
         Ok(registered) => registered,
         Err(e) => {
             // The allowlist check above already covers RegisterError::NotAllowed;

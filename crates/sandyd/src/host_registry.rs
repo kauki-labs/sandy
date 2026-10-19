@@ -123,6 +123,26 @@ pub struct PlacementCandidate {
     pub capabilities: Capabilities,
 }
 
+/// The outcome of a successful [`HostRegistry::register`].
+#[derive(Debug)]
+pub struct Registration {
+    /// Receiving half of this registration's dispatch channel — the
+    /// connection task reads it to learn about `Dispatch`es placed on it.
+    pub dispatch_rx: mpsc::Receiver<Dispatch>,
+    /// Identifies this exact registration; pass it to the matching
+    /// [`HostRegistry::remove`] and to [`HostRegistry::send_dispatch_if_current`].
+    pub registration: RegistrationId,
+    /// `Some(previous)` when this registration superseded a live entry the
+    /// SAME peer already held under this `host_id` — a reclaim (#292 item 4).
+    /// The previous connection is evicted (its dispatch channel dropped, so
+    /// its task tears down) and this one becomes the sole owner. A reclaim is
+    /// also logged at `warn`: a repeating reclaim means two processes are
+    /// using one `host_id`, which an operator should see rather than a silent
+    /// connection close. `None` for a fresh registration that replaced
+    /// nothing.
+    pub superseded: Option<RegistrationId>,
+}
+
 /// A connected host-executor: its declared capabilities and the channel its
 /// connection task reads from to learn about `Dispatch`es placed on it.
 struct ConnectedHost {
@@ -177,11 +197,13 @@ impl HostRegistry {
     /// `host_id` with `capabilities`, returning the receiving half of its
     /// dispatch channel for the connection task to read from, plus a
     /// [`RegistrationId`] to pass to the matching [`Self::remove`]. A
-    /// reconnect from the SAME `peer_ip` replaces its own previous entry; a
-    /// different allowlisted peer registering under an already-claimed
-    /// `host_id` is refused with [`RegisterError::HostIdClaimedByAnotherPeer`]
-    /// — `host_id` is self-reported, so this is the only thing stopping one
-    /// allowed host from claiming another's identity.
+    /// reconnect from the SAME `peer_ip` replaces its own previous entry
+    /// ([`Registration::superseded`] names the registration it evicted, and
+    /// the reclaim is logged — #292 item 4); a different allowlisted peer
+    /// registering under an already-claimed `host_id` is refused with
+    /// [`RegisterError::HostIdClaimedByAnotherPeer`] — `host_id` is
+    /// self-reported, so this is the only thing stopping one allowed host from
+    /// claiming another's identity.
     ///
     /// # Errors
     /// [`RegisterError::NotAllowed`] if `peer_ip` is not on `allowlist`;
@@ -193,18 +215,39 @@ impl HostRegistry {
         peer_ip: IpAddr,
         host_id: String,
         capabilities: Capabilities,
-    ) -> Result<(mpsc::Receiver<Dispatch>, RegistrationId), RegisterError> {
+    ) -> Result<Registration, RegisterError> {
         let peer_ip = peer_ip.to_canonical();
         if !allowlist.permits(peer_ip) {
             return Err(RegisterError::NotAllowed);
         }
         let mut hosts = self.hosts.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(existing) = hosts.get(&host_id)
-            && existing.peer_ip != peer_ip
-        {
-            return Err(RegisterError::HostIdClaimedByAnotherPeer);
-        }
+        let superseded = match hosts.get(&host_id) {
+            // A different allowlisted peer must never take over a `host_id`
+            // another peer already holds (D5, #263) — refused, not superseded.
+            Some(existing) if existing.peer_ip != peer_ip => {
+                return Err(RegisterError::HostIdClaimedByAnotherPeer);
+            }
+            // The SAME peer reclaiming its own `host_id`: a legitimate
+            // reconnect that supersedes its previous registration.
+            Some(existing) => Some(existing.registration),
+            None => None,
+        };
         let registration = RegistrationId(self.next_registration.fetch_add(1, Ordering::Relaxed));
+        if let Some(superseded) = superseded {
+            // #292 item 4: a reclaim used to be a silent connection close, so
+            // two of an operator's own processes fighting over one `host_id`
+            // (a manual debug executor and the systemd service, say) looked
+            // like a flaking connection. Name it at `warn` so a repeating
+            // reclaim is distinguishable from a one-off reconnect.
+            tracing::warn!(
+                host_id = %host_id,
+                peer = %peer_ip,
+                superseded = superseded.0,
+                installed = registration.0,
+                "host_id reclaimed: a new registration from the same peer superseded the previous connection; \
+                 if this repeats, two processes are using the same host_id"
+            );
+        }
         let (dispatch_tx, dispatch_rx) = mpsc::channel(8);
         hosts.insert(
             host_id,
@@ -215,7 +258,11 @@ impl HostRegistry {
                 dispatch_tx,
             }),
         );
-        Ok((dispatch_rx, registration))
+        Ok(Registration {
+            dispatch_rx,
+            registration,
+            superseded,
+        })
     }
 
     /// Remove `host_id`'s entry, but only if it is still the one `registration`
@@ -440,7 +487,7 @@ mod tests {
     async fn a_dispatch_is_delivered_to_the_registered_hosts_channel() -> anyhow::Result<()> {
         let allowlist = ExecutorAllowlist::new([executor_ip()]);
         let registry = HostRegistry::default();
-        let (mut dispatch_rx, _registration) = registry
+        let Registration { mut dispatch_rx, .. } = registry
             .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
             .expect("the allowed peer must register");
 
@@ -499,7 +546,7 @@ mod tests {
     async fn a_removed_host_is_no_longer_dispatch_eligible() -> anyhow::Result<()> {
         let allowlist = ExecutorAllowlist::new([executor_ip()]);
         let registry = HostRegistry::default();
-        let (_dispatch_rx, registration) = registry
+        let Registration { registration, .. } = registry
             .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
             .expect("the allowed peer must register");
 
@@ -577,7 +624,7 @@ mod tests {
     fn pick_host_for_skips_a_removed_host() {
         let allowlist = ExecutorAllowlist::new([executor_ip()]);
         let registry = HostRegistry::default();
-        let (_rx, registration) = registry
+        let Registration { registration, .. } = registry
             .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
             .expect("the allowed peer must register");
         registry.remove("ws01", registration);
@@ -600,9 +647,9 @@ mod tests {
         // The original connection is picked for placement...
         let candidate = registry
             .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
-            .map(|(_rx, registration)| PlacementCandidate {
+            .map(|registered| PlacementCandidate {
                 host_id: "ws01".to_owned(),
-                registration,
+                registration: registered.registration,
                 peer_ip: executor_ip(),
                 capabilities: capabilities(),
             })
@@ -611,7 +658,10 @@ mod tests {
         // ...then disconnects, and a DIFFERENT allowlisted peer reclaims the
         // same host_id before the dispatch is actually sent.
         registry.remove("ws01", candidate.registration);
-        let (mut new_dispatch_rx, _new_registration) = registry
+        let Registration {
+            dispatch_rx: mut new_dispatch_rx,
+            ..
+        } = registry
             .register(&allowlist, other_ip(), "ws01".to_owned(), capabilities())
             .expect("a different allowlisted peer may reclaim the vacated host_id");
 
@@ -633,7 +683,11 @@ mod tests {
     async fn send_dispatch_if_current_delivers_when_the_registration_still_matches() -> anyhow::Result<()> {
         let allowlist = ExecutorAllowlist::new([executor_ip()]);
         let registry = HostRegistry::default();
-        let (mut dispatch_rx, registration) = registry
+        let Registration {
+            mut dispatch_rx,
+            registration,
+            ..
+        } = registry
             .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
             .expect("the allowed peer must register");
 
@@ -668,14 +722,86 @@ mod tests {
     fn the_same_peer_can_reregister_under_its_own_host_id() -> anyhow::Result<()> {
         let allowlist = ExecutorAllowlist::new([executor_ip()]);
         let registry = HostRegistry::default();
-        let (_rx1, first) = registry
+        let Registration {
+            registration: first, ..
+        } = registry
             .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
             .expect("the first registration must succeed");
-        let (_rx2, second) = registry
+        let Registration {
+            registration: second, ..
+        } = registry
             .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
             .expect("the reconnect must succeed");
 
         assert_ne!(first, second);
+        Ok(())
+    }
+
+    /// Reclaim signal (#292 item 4): when the SAME peer re-registers an
+    /// already-held `host_id`, the new registration cleanly supersedes the old
+    /// one AND names the registration it evicted, so the churn of two
+    /// processes fighting over one `host_id` is observable instead of a silent
+    /// connection close. A fresh registration that replaced nothing reports
+    /// `None`. This is the behaviour that distinguishes the fix from today's
+    /// silent most-recent-wins replacement.
+    #[test]
+    fn a_same_peer_reclaim_reports_the_superseded_registration() {
+        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let registry = HostRegistry::default();
+
+        let first = registry
+            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
+            .expect("the first registration must succeed");
+        assert_eq!(first.superseded, None, "a fresh registration supersedes nothing");
+
+        let second = registry
+            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
+            .expect("the same-peer reclaim must succeed");
+        assert_eq!(
+            second.superseded,
+            Some(first.registration),
+            "a same-peer reclaim must name the registration it evicted (#292 item 4)"
+        );
+    }
+
+    /// Reclaim is deterministic and total: after a same-peer reclaim exactly
+    /// one registration is live (the newest), the superseded connection is
+    /// closed (its dispatch channel ends, so its task tears down), and a
+    /// dispatch reaches ONLY the newcomer — never a split where both the stale
+    /// and fresh connection believe they own the slot.
+    #[tokio::test]
+    async fn a_same_peer_reclaim_evicts_the_stale_connection_and_makes_the_newcomer_sole_owner() -> anyhow::Result<()> {
+        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let registry = HostRegistry::default();
+
+        let stale = registry
+            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
+            .expect("the first registration must succeed");
+        let mut stale_rx = stale.dispatch_rx;
+
+        let fresh = registry
+            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
+            .expect("the same-peer reclaim must succeed");
+        let mut fresh_rx = fresh.dispatch_rx;
+
+        // The superseded connection is evicted: its channel is closed, so the
+        // old task's `recv()` returns `None` and it tears itself down. Without
+        // this the stale connection would linger believing it still owns the
+        // slot.
+        assert_eq!(
+            stale_rx.recv().await,
+            None,
+            "the superseded connection's dispatch channel must close so its task ends"
+        );
+
+        // The newcomer is the sole owner: the one dispatch goes to it, not the
+        // stale connection.
+        registry.send_dispatch("ws01", dispatch()).await?;
+        assert_eq!(
+            fresh_rx.recv().await,
+            Some(dispatch()),
+            "the newcomer must receive the dispatch"
+        );
         Ok(())
     }
 
@@ -685,10 +811,14 @@ mod tests {
     async fn ending_an_older_registration_leaves_a_newer_one_dispatch_eligible() -> anyhow::Result<()> {
         let allowlist = ExecutorAllowlist::new([executor_ip()]);
         let registry = HostRegistry::default();
-        let (_rx1, stale) = registry
+        let Registration {
+            registration: stale, ..
+        } = registry
             .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
             .expect("the first registration must succeed");
-        let (mut rx2, _current) = registry
+        let Registration {
+            dispatch_rx: mut rx2, ..
+        } = registry
             .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
             .expect("the reconnect must succeed");
 
