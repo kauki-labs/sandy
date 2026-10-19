@@ -181,11 +181,10 @@ fn shred_secret(root: &TrustRoot) {
         .write(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
+        && let Some(meta) = file.metadata().ok().filter(fs::Metadata::is_file)
     {
-        if let Some(meta) = file.metadata().ok().filter(fs::Metadata::is_file) {
-            let len = usize::try_from(meta.len()).unwrap_or(0);
-            let _ = file.write_all(&vec![0u8; len]).and_then(|()| file.sync_all());
-        }
+        let len = usize::try_from(meta.len()).unwrap_or(0);
+        let _ = file.write_all(&vec![0u8; len]).and_then(|()| file.sync_all());
     }
     let _ = fs::remove_file(path);
 }

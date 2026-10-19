@@ -192,10 +192,10 @@ pub fn run_job<B: VmBackend + ?Sized, E: EgressApplier + ?Sized>(
     let run_result: Result<Outcome, BackendError> = match enforce(&eplan, egress) {
         Ok(eoutcome) => {
             let outcome = backend.run(&spec);
-            if matches!(eoutcome, EgressOutcome::Enforced) {
-                if let Err(e) = egress.revert() {
-                    tracing::warn!(%e, "egress revert failed");
-                }
+            if matches!(eoutcome, EgressOutcome::Enforced)
+                && let Err(e) = egress.revert()
+            {
+                tracing::warn!(%e, "egress revert failed");
             }
             outcome
         }

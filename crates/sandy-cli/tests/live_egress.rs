@@ -111,10 +111,10 @@ fn nft_load(ruleset: &str) -> anyhow::Result<()> {
 /// Resolve the WAN interface to masquerade out of: `$SANDY_EGRESS_UPLINK` or the
 /// `dev` of the default route.
 fn detect_uplink() -> anyhow::Result<String> {
-    if let Ok(iface) = std::env::var("SANDY_EGRESS_UPLINK") {
-        if !iface.is_empty() {
-            return Ok(iface);
-        }
+    if let Ok(iface) = std::env::var("SANDY_EGRESS_UPLINK")
+        && !iface.is_empty()
+    {
+        return Ok(iface);
     }
     let out = Command::new("ip")
         .args(["route", "show", "default"])

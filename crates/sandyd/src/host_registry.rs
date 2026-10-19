@@ -199,10 +199,10 @@ impl HostRegistry {
             return Err(RegisterError::NotAllowed);
         }
         let mut hosts = self.hosts.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(existing) = hosts.get(&host_id) {
-            if existing.peer_ip != peer_ip {
-                return Err(RegisterError::HostIdClaimedByAnotherPeer);
-            }
+        if let Some(existing) = hosts.get(&host_id)
+            && existing.peer_ip != peer_ip
+        {
+            return Err(RegisterError::HostIdClaimedByAnotherPeer);
         }
         let registration = RegistrationId(self.next_registration.fetch_add(1, Ordering::Relaxed));
         let (dispatch_tx, dispatch_rx) = mpsc::channel(8);
@@ -226,10 +226,10 @@ impl HostRegistry {
     /// newer reconnect that has already replaced it under the same `host_id`.
     pub fn remove(&self, host_id: &str, registration: RegistrationId) {
         let mut hosts = self.hosts.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Entry::Occupied(entry) = hosts.entry(host_id.to_owned()) {
-            if entry.get().registration == registration {
-                entry.remove();
-            }
+        if let Entry::Occupied(entry) = hosts.entry(host_id.to_owned())
+            && entry.get().registration == registration
+        {
+            entry.remove();
         }
     }
 
