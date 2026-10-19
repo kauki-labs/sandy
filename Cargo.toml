@@ -11,7 +11,7 @@ homepage = "https://kauki.xyz/"
 repository = "https://github.com/kauki-labs/sandy"
 license = "AGPL-3.0-only"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.dependencies]
 # The library publishes as `sandy-lib`; the `package` alias keeps the in-tree and
