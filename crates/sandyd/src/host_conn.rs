@@ -179,7 +179,7 @@ pub async fn serve_host_executor(
     // mid-frame (#289 item 3).
     let (read_half, mut write_half) = tokio::io::split(conn);
     let (frame_tx, mut frame_rx) = mpsc::channel(1);
-    tokio::spawn(forward_frames(read_half, frame_tx));
+    let reader_task = tokio::spawn(forward_frames(read_half, frame_tx));
 
     loop {
         tokio::select! {
@@ -230,6 +230,20 @@ pub async fn serve_host_executor(
             }
         }
     }
+
+    // The loop's own exit never ends `forward_frames` on its own: dropping
+    // `frame_tx`'s receiver doesn't cancel the task sending into it, and
+    // `tokio::io::split` keeps the underlying connection alive as long as
+    // EITHER half is held — so a loop exit that leaves `reader_task` running
+    // (e.g. a Dispatch write timeout, where the read side may still be
+    // blocked waiting for bytes that will never come) would leak both the
+    // task and the open socket, even after this function returns and drops
+    // `write_half` (CodeRabbit, #312). `abort` forces the task to drop
+    // `read_half` even mid-read; awaiting the handle (ignoring its
+    // cancellation error) makes that drop happen before this function
+    // returns, so the connection is actually closed, not just forgotten.
+    reader_task.abort();
+    let _ = reader_task.await;
 
     registry.remove(&host_id, registration);
     tracing::info!(host_id, "host-executor disconnected");
@@ -517,6 +531,12 @@ mod tests {
         tokio::time::advance(DISPATCH_WRITE_TIMEOUT + std::time::Duration::from_millis(1)).await;
         serve.await?;
 
+        // Nothing past this point is time-gated; resume real time so the
+        // EOF check below has a real timeout to fail against if the cleanup
+        // it's checking for regresses, instead of a virtual one nothing
+        // would ever advance.
+        tokio::time::resume();
+
         let blocked_result = blocked_send.await?;
         assert_eq!(
             blocked_result,
@@ -535,6 +555,24 @@ mod tests {
             matches!(resend, Err(crate::host_registry::DispatchSendError::NoSuchHost)),
             "a send after full deregistration must fail with NoSuchHost, not hang: got {resend:?}"
         );
+
+        // The peer must see the connection actually close, not just the
+        // registry forget about it (CodeRabbit, #312): `tokio::io::split`
+        // keeps the duplex stream alive as long as either half survives, so
+        // reading to EOF here only completes if `serve_host_executor` dropped
+        // BOTH `write_half` (on function return) and the `forward_frames`
+        // task's `read_half` (via the explicit abort+await) before `serve`
+        // resolved. `read_to_end`, not a single read: the stalled `Dispatch`
+        // write left whatever bytes it managed to push before blocking still
+        // sitting in the duplex buffer, which a one-shot read would observe
+        // as "more data," not EOF.
+        use tokio::io::AsyncReadExt;
+        let mut leftover = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), client.read_to_end(&mut leftover))
+            .await
+            .context("the host-executor's peer must observe EOF once the connection is torn down, not hang")?
+            .context("reading the leftover bytes to EOF")?;
+
         drop(client);
         Ok(())
     }

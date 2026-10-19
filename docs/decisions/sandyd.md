@@ -882,6 +882,18 @@ that branch never actually partial-reads in practice.
   invariant to reason about ("this read is never cancelled, full stop") than
   a buffer that must track exactly how much of a length-prefixed frame
   survived a partial read.
+- **The `forward_frames` task is tracked and torn down, not fire-and-forget**
+  (CodeRabbit, #312). `tokio::io::split` keeps the underlying connection
+  alive as long as either half survives; the loop only ever drops its own
+  `write_half` on exit (the function returning), so a fire-and-forget spawn
+  would leave the reader task — and the open socket it still holds via
+  `read_half` — running indefinitely on a path like the `Dispatch`-write
+  timeout, where the read side may be blocked waiting for bytes that will
+  never come. Keeping the `JoinHandle` and calling `.abort()` then awaiting
+  it (ignoring the resulting cancellation error) before `registry.remove`
+  forces `read_half` to drop even mid-read, so the connection is actually
+  closed by the time `serve_host_executor` returns, not just forgotten by the
+  registry.
 
 **Consequences.** `sandy-conn`'s public surface grows by one struct and two
 functions; nothing existing changed shape. #289 item 4 (`sandy-91`'s relay
@@ -892,8 +904,11 @@ back via `socket2::SockRef` rather than asserting on a timed disconnect;
 `a_hung_host_is_disconnected_after_the_dispatch_write_timeout` drives a real
 `registry.send_dispatch` into a deliberately undersized duplex buffer
 standing in for a full TCP receive buffer, advances tokio's paused clock past
-`DISPATCH_WRITE_TIMEOUT`, and asserts both the deregistration and that a
-second `send_dispatch` fails fast rather than hanging;
+`DISPATCH_WRITE_TIMEOUT`, asserts both the deregistration and that a second
+`send_dispatch` fails fast rather than hanging, then resumes real time and
+reads the connection to EOF — proving the peer actually observes the
+connection close (both split halves dropped), not just that the registry
+forgot about the host;
 `dispatches_interleaved_with_an_unexpected_frame_are_all_still_delivered_correctly`
 drives several dispatches and an interleaved unexpected frame (stage 1 has no
 host→orchestrator message, so a second `Register` stands in for "something
