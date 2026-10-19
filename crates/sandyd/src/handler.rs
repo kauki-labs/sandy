@@ -1085,6 +1085,95 @@ mod tests {
         Ok(())
     }
 
+    /// Regression (live M2 cross-machine run, infra-f3): the test above
+    /// registers its host via `register_test_host`, a hand-built
+    /// `Capabilities` fed directly to `HostRegistry::register` — it never
+    /// exercises `host_conn::serve_host_executor`'s real wire decode. This
+    /// drives that part of the path for real: a REAL wire `Register` frame
+    /// through `serve_host_executor`, then `handle(Submit)`, reading the
+    /// resulting `Dispatch` back off the host's actual connection (not a
+    /// bare channel recv) — the same observable the host-executor itself
+    /// would see.
+    ///
+    /// CAUTION (CodeRabbit, #313): `forward_back_addr` is passed to `handle`
+    /// directly here, a value this test picked — it does NOT exercise
+    /// `main.rs`'s own threading of that address from `$SANDY_MESH_AGENT_LINK_LISTEN`
+    /// through `setup_mesh_agent_link_listener` and `serve_connection` into
+    /// `handle`. A regression that broke THAT wiring (e.g. `main.rs` stops
+    /// passing the bound address through) would not be caught here — this
+    /// test only proves the handler/registry/wire path once `forward_back_addr`
+    /// is already correct, not that `main.rs` supplies it correctly. No test
+    /// in this crate currently covers that seam; it would need a real bound
+    /// listener and a `main`-level integration test, out of scope for this
+    /// PR's coverage-only aim.
+    #[tokio::test]
+    async fn a_submit_reaches_a_real_wire_registered_host_end_to_end() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let allowlist = crate::host_registry::ExecutorAllowlist::new([peer_ip]);
+        let (mut client, server) = tokio::io::duplex(4096);
+
+        sandy_control_proto::write_frame(
+            &mut client,
+            &sandy_executor_proto::HostExecutorMessage {
+                op: Some(sandy_executor_proto::host_executor_message::Op::Register(
+                    sandy_executor_proto::Register {
+                        host_id: "ws01".to_owned(),
+                        capabilities: Some(trusted_host_capabilities()),
+                    },
+                )),
+            },
+        )
+        .await?;
+
+        let host_registry_for_conn = Arc::clone(&host_registry);
+        let serve = tokio::spawn(async move {
+            crate::host_conn::serve_host_executor(
+                Box::new(server),
+                sandy_conn::PeerAddr::Tcp(std::net::SocketAddr::new(peer_ip, 9000)),
+                &allowlist,
+                &host_registry_for_conn,
+            )
+            .await;
+        });
+
+        let registered: sandy_executor_proto::OrchestratorMessage = sandy_control_proto::read_frame(&mut client)
+            .await?
+            .context("expected a Registered response")?;
+        assert!(matches!(
+            registered.op,
+            Some(sandy_executor_proto::orchestrator_message::Op::Registered(_))
+        ));
+
+        let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+        let response = handle(&store, &registry, &host_registry, Some(forward_back), submit_req(1)).await?;
+        let job_id = match response.result {
+            Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
+            other => anyhow::bail!("expected a Submit response, got {other:?}"),
+        };
+
+        let pushed: sandy_executor_proto::OrchestratorMessage = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            sandy_control_proto::read_frame(&mut client),
+        )
+        .await
+        .context("timed out waiting for the Dispatch push")?
+        .context("read_frame faulted")?
+        .context("the connection closed before a Dispatch arrived")?;
+        match pushed.op {
+            Some(sandy_executor_proto::orchestrator_message::Op::Dispatch(dispatch)) => {
+                assert_eq!(dispatch.job_id, job_id);
+                assert_eq!(dispatch.forward_back, forward_back.to_string());
+                assert_eq!(dispatch.required_isolation_class, i32::from(IsolationClass::Trusted));
+            }
+            other => anyhow::bail!("expected a Dispatch push, got {other:?}"),
+        }
+
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(5), serve).await??;
+        Ok(())
+    }
+
     /// Adversarial (CodeRabbit on #301, infra-f3's safety-floor check): a
     /// cancelled job's Dispatch, once delivered to a host, cannot be
     /// retracted — there is no Cancel/Stop `OrchestratorMessage` (decision
