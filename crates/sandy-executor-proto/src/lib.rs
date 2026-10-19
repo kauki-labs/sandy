@@ -33,8 +33,8 @@ pub mod v1 {
 /// direct `prost` dependency just for that bound.
 pub use prost::Message;
 pub use v1::{
-    Arch, Capabilities, Dispatch, HostExecutorMessage, IsolationClass, OrchestratorMessage, Register, RegisterRefused,
-    Registered, SandboxKind, host_executor_message, orchestrator_message,
+    Arch, Capabilities, Dispatch, HostExecutorMessage, IsolationClass, JobResult, OrchestratorMessage, Register,
+    RegisterRefused, Registered, SandboxKind, host_executor_message, orchestrator_message,
 };
 
 /// `Dispatch.link_token` is a bearer secret (INV-1): a holder can authenticate
@@ -248,6 +248,39 @@ mod tests {
             .await?
             .context("expected a frame, got a clean close")?;
         assert_eq!(decoded, message);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_job_result_round_trips_through_the_frame_codec() -> anyhow::Result<()> {
+        let (mut write_side, mut read_side) = tokio::io::duplex(4096);
+        let message = HostExecutorMessage {
+            op: Some(host_executor_message::Op::Result(JobResult {
+                job_id: "job-1".to_owned(),
+                booted: true,
+                exit_code: Some(0),
+                timed_out: false,
+                transport_error: None,
+                console: "hi\n".to_owned(),
+            })),
+        };
+        write_frame(&mut write_side, &message).await?;
+
+        let decoded: HostExecutorMessage = read_frame(&mut read_side)
+            .await?
+            .context("expected a frame, got a clean close")?;
+        assert_eq!(decoded, message);
+        // The optional fields must round-trip as genuinely absent, not as a
+        // zero/empty default a reader could mistake for "exit 0" or "":
+        // `exit_code = None` is "never produced an exit," distinct from
+        // `Some(0)`, and the orchestrator classifies the two differently.
+        match decoded.op {
+            Some(host_executor_message::Op::Result(result)) => {
+                assert_eq!(result.exit_code, Some(0));
+                assert_eq!(result.transport_error, None);
+            }
+            other => anyhow::bail!("expected a JobResult, got {other:?}"),
+        }
         Ok(())
     }
 
