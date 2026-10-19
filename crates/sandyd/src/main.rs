@@ -243,10 +243,10 @@ async fn main() {
     // real window to run — a fire-and-forget spawn would let the runtime
     // drop it mid-drain the moment `main` returns, defeating the point of
     // coordinating the shutdown at all.
-    if let Some(mesh_task) = mesh_task {
-        if let Err(e) = mesh_task.await {
-            tracing::warn!(error = %e, "the mesh listener's task panicked during shutdown");
-        }
+    if let Some(mesh_task) = mesh_task
+        && let Err(e) = mesh_task.await
+    {
+        tracing::warn!(error = %e, "the mesh listener's task panicked during shutdown");
     }
 }
 
