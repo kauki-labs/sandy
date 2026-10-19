@@ -819,9 +819,9 @@ a value that cannot vary until #150 lands — see the tripwire comment at
 executor in practice, so "first match" is equivalent to "the match"; nothing
 to decide between yet.
 
-## 16. Cross-machine connection robustness: TCP keepalive and a Dispatch-write deadline (#289 items 1-2)
+## 16. Cross-machine connection robustness: TCP keepalive, a Dispatch-write deadline, and cancel-safe reads (#289 items 1-3)
 
-**Status:** implemented (items 1-2; items 3-4 remain open, see Consequences).
+**Status:** implemented (items 1-3; item 4 remains open, see Consequences).
 
 **Context.** Decision 12's "the connection is the liveness signal" model
 (#269) assumed a closed TCP connection is the only way a host-executor goes
@@ -833,7 +833,15 @@ send buffer with no error. Separately, `host_conn::serve_host_executor`'s
 `Dispatch` write had no deadline at all: a host-executor that stops reading
 (a hung process, a full receive buffer) blocks that write indefinitely,
 which #301 found also transitively blocks any `send_dispatch`/
-`send_dispatch_if_current` caller once the per-host `mpsc` channel (capacity 8) backs up behind it — including `handler::handle`'s `Submit` path.
+`send_dispatch_if_current` caller once the per-host `mpsc` channel (capacity 8) backs up behind it — including `handler::handle`'s `Submit` path. A
+third, separate gap in the same connection loop: its `select!` raced
+`read_frame` directly against `dispatch_rx.recv()`. `read_frame` does two
+sequential `.await`s (the length prefix, then the payload) and is not
+cancel-safe — if the dispatch branch won while a `read_frame` future had
+completed only the first, the second would be dropped along with whatever
+bytes it had already consumed, desyncing every read after it. Latent today
+only because stage 1 has no host→orchestrator message after `Register`, so
+that branch never actually partial-reads in practice.
 
 **Decision.**
 
@@ -859,19 +867,69 @@ which #301 found also transitively blocks any `send_dispatch`/
   writes before a host is registered (not allowlisted, missing capabilities,
   `host_id` already claimed) stay undeadlined — their cost is just the
   connection slot, since no registry entry exists yet to leave stranded.
+- **Move the read off the `select!` entirely, into its own task.** The
+  connection splits via `tokio::io::split` right after registration succeeds
+  (not before: the `Register` handshake itself never races `read_frame`
+  against anything, so it needs no change). A new `forward_frames` task owns
+  the read half and calls `read_frame` sequentially — never raced against
+  anything, so it always either completes or the whole task ends, which is
+  what makes it cancel-safe — forwarding each result over an `mpsc` channel.
+  The connection loop's `select!` now races `frame_rx.recv()` instead of
+  `read_frame` directly: a channel `recv()` cannot lose a value already sent,
+  so cancelling it mid-poll (because the dispatch branch won) never drops
+  bytes. The alternative the ruling also named, a cancel-safe buffered reader
+  kept inline, was passed over since a dedicated task is the simpler
+  invariant to reason about ("this read is never cancelled, full stop") than
+  a buffer that must track exactly how much of a length-prefixed frame
+  survived a partial read.
+- **The `forward_frames` task is tracked and torn down, not fire-and-forget**
+  (CodeRabbit, #312). `tokio::io::split` keeps the underlying connection
+  alive as long as either half survives; the loop only ever drops its own
+  `write_half` on exit (the function returning), so a fire-and-forget spawn
+  would leave the reader task — and the open socket it still holds via
+  `read_half` — running indefinitely on a path like the `Dispatch`-write
+  timeout, where the read side may be blocked waiting for bytes that will
+  never come. Keeping the `JoinHandle` and calling `.abort()` then awaiting
+  it (ignoring the resulting cancellation error) before `registry.remove`
+  forces `read_half` to drop even mid-read, so the connection is actually
+  closed by the time `serve_host_executor` returns, not just forgotten by the
+  registry.
 
 **Consequences.** `sandy-conn`'s public surface grows by one struct and two
-functions; nothing existing changed shape. #289 items 3 (`read_frame`'s
-cancel-safety, latent until a host→orchestrator message exists) and 4
-(`sandy-91`'s relay wall-clock bound) remain open and are unaffected by this
-change. A regression test for each item proves the mechanism directly rather
-than racing on timing: `apply_tcp_keepalive_sets_the_kernel_sockopts` reads
-the sockopts back via `socket2::SockRef` rather than asserting on a timed
-disconnect; `a_hung_host_is_disconnected_after_the_dispatch_write_timeout`
-drives a real `registry.send_dispatch` into a deliberately undersized duplex
-buffer standing in for a full TCP receive buffer, advances tokio's paused
-clock past `DISPATCH_WRITE_TIMEOUT`, and asserts both the deregistration and
-that a second `send_dispatch` fails fast rather than hanging.
+functions; nothing existing changed shape. #289 item 4 (`sandy-91`'s relay
+wall-clock bound) remains open and is unaffected by this change. A regression
+test for each item proves the mechanism directly rather than racing on
+timing: `apply_tcp_keepalive_sets_the_kernel_sockopts` reads the sockopts
+back via `socket2::SockRef` rather than asserting on a timed disconnect;
+`a_hung_host_is_disconnected_after_the_dispatch_write_timeout` drives a real
+`registry.send_dispatch` into a deliberately undersized duplex buffer
+standing in for a full TCP receive buffer, advances tokio's paused clock past
+`DISPATCH_WRITE_TIMEOUT`, asserts both the deregistration and that a second
+`send_dispatch` fails fast rather than hanging, then resumes real time and
+reads the connection to EOF — proving the peer actually observes the
+connection close (both split halves dropped), not just that the registry
+forgot about the host;
+`dispatches_interleaved_with_an_unexpected_frame_are_all_still_delivered_correctly`
+drives several dispatches and an interleaved unexpected frame (stage 1 has no
+host→orchestrator message, so a second `Register` stands in for "something
+the loop treats as unexpected but not fatal") through concurrently and
+asserts every dispatch after the interleaving still decodes correctly — a
+regression guard, not a discriminating red/green test: checked against the
+pre-fix code (200 runs) and it passed there too, since forcing the exact
+byte-level interleaving `read_frame`'s two `.await`s needed to lose data
+requires poll-ordering control this harness doesn't have.
+`a_dispatch_becoming_ready_while_an_inbound_frame_is_only_half_written_does_not_desync_the_next_frame`
+(CodeRabbit, #312) is the test that does provide that control: it writes an
+inbound frame's length prefix alone, uses a `PendingCounter` stream wrapper
+to OBSERVE (not assume) that the read has genuinely parked on the payload,
+makes a dispatch ready, reads that dispatch back to completion (proving
+`select!` already resolved it and dropped the sibling read before any
+payload existed), and only then writes the payload — verified empirically in
+both directions: 30/30 runs failed grafted onto the pre-fix code, 30/30
+passed against the code as committed. The correctness argument for item 3
+remains structural either way: `forward_frames`'s reads are never raced
+against anything, so a drop mid-read is impossible by construction,
+independent of scheduling.
 
 **Set aside.** An application-level heartbeat instead of `SO_KEEPALIVE`: the
 ruling in #289 explicitly rejected this — it would duplicate what the
