@@ -2,7 +2,7 @@
 title: "Decisions: sandyd control plane"
 status: accepted
 project: sandy
-updated: 2026-10-17
+updated: 2026-10-19
 ---
 
 # Decisions: sandyd control plane
@@ -521,7 +521,7 @@ frame is allowed to grant, never which connections must present one.
 
 ## 12. The orchestrator side of the host-executor contract: `Register`'s allowlist and the persistent dispatch connection (#263)
 
-**Status:** partially implemented. `sandy-executor-proto` (new crate) defines
+**Status:** implemented. `sandy-executor-proto` (new crate) defines
 `HostExecutorMessage`/`OrchestratorMessage` (`Register`/`Registered`/
 `RegisterRefused`/`Dispatch`), riding `sandy-control-proto`'s existing
 length-prefixed framing. `sandyd::host_registry` (`ExecutorAllowlist`,
@@ -532,12 +532,11 @@ messages queued for that host down its one persistent connection until it
 closes. The executor side (#283, sandy-91) is also done: `sandy-host-executor`'s
 `handle_dispatch` decodes a `Dispatch`, independently re-checks the isolation
 class, launches the trusted-process sandbox, and forwards its agent's link
-back over the mesh. What is NOT yet built: anything that calls
-`HostRegistry::register` from a real network accept loop (no `sandy-conn`
-listener is bound in `sandyd`'s `main.rs` yet, and `sandy-host-executor`'s own
-`main.rs` doesn't send `Register` or receive `Dispatch` yet either — tracked
-as #288), and the nix overlay/service that runs `sandy-host-executor` as a
-registered executor.
+back over the mesh. `sandyd`'s `main.rs` binds the mesh accept loop and calls
+`serve_host_executor` per accepted connection, `sandy-host-executor`'s own
+`main.rs` sends `Register` and runs the dispatch loop, and the nix overlay/
+service that runs `sandy-host-executor` as a registered executor has landed
+(#287, #299).
 
 **Context.** #269's spec frames M2 cross-machine dispatch: the orchestrator
 stays the single authority (caps, channels, the peer-hub); a remote host is an
@@ -593,10 +592,11 @@ that declaration, never a hardcoded host) plus the dispatch RPC.
 **Consequences.** `host_registry`'s module doc states explicitly what it does
 NOT do (accept connections, drive the loop) so the authorization logic stays
 unit-testable without a real socket — the same shape decision 6's
-`link_auth` module already established. The real accept loop (binding a mesh
-address, calling `serve_host_executor` per accepted connection) and the
-placement logic that decides when to call `send_dispatch` are both still
-open; tracked by #263 and #269's stage-1 block list, not silently assumed.
+`link_auth` module already established. The real accept loop (`sandyd`'s
+`main.rs`, binding a mesh address and calling `serve_host_executor` per
+accepted connection) and the placement logic that decides when to call
+`send_dispatch` (`handler::handle`, via `HostRegistry::pick_host_for` and
+`send_dispatch_if_current`) are both now implemented.
 There is also no `OrchestratorMessage` variant for cancelling a dispatched
 job: a cancelled run's sandbox keeps executing on the host until it finishes
 on its own (decision 6's token invalidation, §6, stops a late-arriving
