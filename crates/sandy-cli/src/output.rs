@@ -187,10 +187,23 @@ pub fn format_attach(response: &AttachResponse, format: OutputFormat) -> serde_j
 pub fn format_status(response: &StatusResponse, format: OutputFormat) -> serde_json::Result<String> {
     let status = job_status_name(response.status);
     match format {
-        OutputFormat::Plain => Ok(format!("job {}: {status}", response.job_id)),
-        OutputFormat::Json => {
-            serde_json::to_string_pretty(&serde_json::json!({ "job_id": response.job_id, "status": status }))
+        OutputFormat::Plain => {
+            // Surface the exit code when a terminal run reported one (#292), so
+            // `status` shows what the job exited with, not only its band. The
+            // console tail stays out of the one-line plain form (it can be up
+            // to ~64 KiB); it is in the JSON form for a caller that wants it.
+            let mut line = format!("job {}: {status}", response.job_id);
+            if let Some(exit_code) = response.exit_code {
+                line.push_str(&format!(" (exit {exit_code})"));
+            }
+            Ok(line)
         }
+        OutputFormat::Json => serde_json::to_string_pretty(&serde_json::json!({
+            "job_id": response.job_id,
+            "status": status,
+            "exit_code": response.exit_code,
+            "console_tail": response.console_tail,
+        })),
     }
 }
 
@@ -465,6 +478,8 @@ mod tests {
         let response = StatusResponse {
             job_id: "job-a".to_string(),
             status: JobStatus::Running as i32,
+            exit_code: None,
+            console_tail: String::new(),
         };
         let plain = format_status(&response, OutputFormat::Plain).context("format status plain")?;
         assert!(
@@ -481,6 +496,31 @@ mod tests {
         Ok(())
     }
 
+    /// A terminal job's exit code and console tail reach both output forms
+    /// (#292): the plain line names the exit, the JSON carries the exit code
+    /// and the output tail.
+    #[test]
+    fn status_surfaces_the_exit_code_and_console_tail() -> anyhow::Result<()> {
+        let response = StatusResponse {
+            job_id: "job-a".to_string(),
+            status: JobStatus::Succeeded as i32,
+            exit_code: Some(0),
+            console_tail: "hi\n".to_string(),
+        };
+
+        let plain = format_status(&response, OutputFormat::Plain).context("format status plain")?;
+        assert!(plain.contains("exit 0"), "the plain line must name the exit: {plain}");
+
+        let json = format_status(&response, OutputFormat::Json).context("format status json")?;
+        let parsed: serde_json::Value = serde_json::from_str(&json).context("parse status json")?;
+        assert_eq!(parsed.get("exit_code").and_then(serde_json::Value::as_i64), Some(0));
+        assert_eq!(
+            parsed.get("console_tail").and_then(serde_json::Value::as_str),
+            Some("hi\n")
+        );
+        Ok(())
+    }
+
     /// Adversarial: a `status` value outside the enum's known range renders
     /// as unspecified rather than panicking the whole command.
     #[test]
@@ -488,6 +528,8 @@ mod tests {
         let response = StatusResponse {
             job_id: "job-a".to_string(),
             status: 99,
+            exit_code: None,
+            console_tail: String::new(),
         };
         let plain = format_status(&response, OutputFormat::Plain).context("format status plain")?;
         assert!(plain.contains("JOB_STATUS_UNSPECIFIED"), "got: {plain}");
