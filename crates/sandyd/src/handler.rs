@@ -1040,10 +1040,10 @@ mod tests {
         capabilities: sandy_executor_proto::Capabilities,
     ) -> tokio::sync::mpsc::Receiver<Dispatch> {
         let allowlist = crate::host_registry::ExecutorAllowlist::new([peer_ip]);
-        let (dispatch_rx, _registration) = host_registry
+        host_registry
             .register(&allowlist, peer_ip, host_id.to_owned(), capabilities)
-            .expect("register a test host");
-        dispatch_rx
+            .expect("register a test host")
+            .dispatch_rx
     }
 
     /// Integration (#298 acceptance): a submitted job is actually dispatched
