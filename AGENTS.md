@@ -250,6 +250,14 @@ repo's own setup, not general git advice.
 - **A command piped to `tail`/`head` masks its own exit code.** The shell
   reports the pipeline's last command's exit status, not `nix build`'s (or
   whatever ran first) — a build that actually failed can look like a clean
-  exit if only the tail of its output is read. Capture the real command's exit
-  code directly (e.g. `cmd; echo "exit=$?"` before any pipe), or read the full
-  log for an error rather than trusting a truncated tail.
+  exit if only the tail of its output is read. Printing the exit code
+  (`cmd; echo "exit=$?"`) is diagnostic only — it doesn't _preserve_ it, so a
+  script that keeps going afterward still has the wrong `$?` for anything
+  later. Save it to a variable and act on that (`cmd; rc=$?; ...; exit "$rc"`)
+  before any pipe, rather than relying on an echoed value or a truncated tail.
+- **`gh pr merge --disable-auto` does not dequeue a PR already in the merge
+  queue** — it reports "already queued to merge" and leaves it there. To
+  actually remove one, use the GraphQL `dequeuePullRequest` mutation against
+  the PR's own node id (not the `mergeQueueEntry`'s id — that resolves to
+  "could not resolve"). Re-query `mergeQueueEntry` afterward to confirm it
+  came back `null`.
