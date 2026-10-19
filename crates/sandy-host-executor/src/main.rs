@@ -14,7 +14,10 @@ use sandy_host_executor::{
     capability::detect_register_capabilities,
     client_config::{ExecutorConfig, parse_executor_config},
     dispatch::handle_dispatch,
-    run::{DispatchLoopExit, REGISTER_RESPONSE_TIMEOUT, register, run_dispatch_loop},
+    run::{
+        DispatchLoopExit, REGISTER_RESPONSE_TIMEOUT, failure_result_message, outcome_result_message, register,
+        run_dispatch_loop,
+    },
 };
 use sandy_impls_local::SystemdRunContainment;
 
@@ -71,22 +74,37 @@ async fn main() {
                     handle_dispatch(&dispatch, containment, agent_path, rt)
                 })
                 .await;
-                match result {
-                    // Never log `outcome` itself: its `console` field carries
-                    // up to 64 KiB of the job's own stdout/stderr, meant to
-                    // flow to the result envelope's `logs.tail`, not into this
-                    // host's own logs/journald.
-                    Ok(Ok(outcome)) => tracing::info!(
-                        job_id,
-                        booted = outcome.booted,
-                        guest_exit = outcome.guest_exit,
-                        timed_out = outcome.timed_out,
-                        transport_error = outcome.transport_error.as_deref(),
-                        "dispatch finished"
-                    ),
-                    Ok(Err(e)) => tracing::warn!(job_id, error = %e, "dispatch refused or failed"),
-                    Err(e) => tracing::error!(job_id, error = %e, "the dispatch task panicked"),
-                }
+                // Report the outcome back to the orchestrator over the same
+                // management connection (#292): the loop writes the returned
+                // message on `conn`, so a finished job's result reaches the
+                // orchestrator instead of being logged and forgotten here.
+                let message = match result {
+                    // Never log `outcome.console`: it carries up to 64 KiB of
+                    // the job's own stdout/stderr, meant to flow to the
+                    // orchestrator in this result message (and on to the result
+                    // envelope's `logs.tail`), not into this host's own
+                    // logs/journald. The other fields are safe to log.
+                    Ok(Ok(outcome)) => {
+                        tracing::info!(
+                            job_id,
+                            booted = outcome.booted,
+                            guest_exit = outcome.guest_exit,
+                            timed_out = outcome.timed_out,
+                            transport_error = outcome.transport_error.as_deref(),
+                            "dispatch finished"
+                        );
+                        outcome_result_message(job_id, outcome)
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(job_id, error = %e, "dispatch refused or failed");
+                        failure_result_message(job_id, e.to_string())
+                    }
+                    Err(e) => {
+                        tracing::error!(job_id, error = %e, "the dispatch task panicked");
+                        failure_result_message(job_id, format!("the dispatch task failed: {e}"))
+                    }
+                };
+                Some(message)
             }
         },
         shutdown_signal(),
