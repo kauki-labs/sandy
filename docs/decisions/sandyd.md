@@ -917,12 +917,19 @@ asserts every dispatch after the interleaving still decodes correctly — a
 regression guard, not a discriminating red/green test: checked against the
 pre-fix code (200 runs) and it passed there too, since forcing the exact
 byte-level interleaving `read_frame`'s two `.await`s needed to lose data
-requires poll-ordering control this harness doesn't have. The correctness
-argument for item 3 is structural, not this test: `forward_frames`'s reads
-are never raced against anything, so a drop mid-read is impossible by
-construction, independent of scheduling — the test exists to catch a
-regression in that structure and to prove the new code still handles
-interleaved frames correctly, not to reproduce the old bug.
+requires poll-ordering control this harness doesn't have.
+`a_dispatch_becoming_ready_while_an_inbound_frame_is_only_half_written_does_not_desync_the_next_frame`
+(CodeRabbit, #312) is the test that does provide that control: it writes an
+inbound frame's length prefix alone, uses a `PendingCounter` stream wrapper
+to OBSERVE (not assume) that the read has genuinely parked on the payload,
+makes a dispatch ready, reads that dispatch back to completion (proving
+`select!` already resolved it and dropped the sibling read before any
+payload existed), and only then writes the payload — verified empirically in
+both directions: 30/30 runs failed grafted onto the pre-fix code, 30/30
+passed against the code as committed. The correctness argument for item 3
+remains structural either way: `forward_frames`'s reads are never raced
+against anything, so a drop mid-read is impossible by construction,
+independent of scheduling.
 
 **Set aside.** An application-level heartbeat instead of `SO_KEEPALIVE`: the
 ruling in #289 explicitly rejected this — it would duplicate what the

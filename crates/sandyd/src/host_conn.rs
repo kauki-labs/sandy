@@ -282,6 +282,56 @@ mod tests {
 
     use super::*;
 
+    /// Wraps a stream, counting how many times its read side returns
+    /// `Pending` — a way to OBSERVE "the read has genuinely parked waiting
+    /// for more bytes" from outside, instead of assuming it via timing
+    /// (`yield_now`, which turned out not to reliably schedule a spawned
+    /// task at a specific intermediate point — see the commit message on the
+    /// test that uses this).
+    struct PendingCounter<T> {
+        inner: T,
+        pending_reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for PendingCounter<T> {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            let result = std::pin::Pin::new(&mut this.inner).poll_read(cx, buf);
+            if result.is_pending() {
+                this.pending_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            result
+        }
+    }
+
+    impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for PendingCounter<T> {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
     fn tcp_peer(ip: &str) -> PeerAddr {
         PeerAddr::Tcp(SocketAddr::new(ip.parse().expect("ip literal"), 9000))
     }
@@ -668,6 +718,191 @@ mod tests {
                 ),
                 other => anyhow::bail!("expected a Dispatch push for {expected_job_id}, got {other:?}"),
             }
+        }
+
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(5), serve).await??;
+        Ok(())
+    }
+
+    /// Genuinely discriminating regression test (CodeRabbit on #312, after
+    /// the honest admission that the one above never reproduces the race
+    /// through real scheduling): forces the exact interleaving the old code
+    /// was vulnerable to by controlling the wire bytes and synchronization
+    /// directly, rather than hoping `select!`'s poll order cooperates. Took
+    /// two real attempts to get right — recorded here since both failure
+    /// modes are easy to reintroduce silently:
+    ///
+    /// 1. A `yield_now` between writing the length prefix and calling `send_dispatch` does NOT reliably get the spawned
+    ///    connection task polled at that intermediate point — confirmed via tracing, the task's first real poll didn't
+    ///    happen until this test's own task hit a genuinely blocking `.await` much later, by which point the full frame
+    ///    AND the dispatch were already both available, so `select!` saw two ready branches (a coin flip) instead of
+    ///    one ready and one pending (deterministic). Fixed with [`PendingCounter`], which makes "the read has genuinely
+    ///    parked on the payload" an observed fact instead of a scheduling assumption.
+    /// 2. Even with that fixed, writing the payload immediately after `send_dispatch` could still let both branches
+    ///    become ready before the connection task's next poll, reintroducing the same coin flip one step later. Fixed
+    ///    by reading the `job-1` dispatch push back to completion BEFORE writing the payload: that read only completes
+    ///    once `select!` has already resolved the dispatch branch (and dropped the sibling read with it), so the
+    ///    payload genuinely lands on a connection that has nothing pending to confuse it with.
+    ///
+    /// Verified both directions empirically, not assumed: 30/30 runs failed
+    /// against the pre-fix code (this exact test grafted onto commit
+    /// `a4e3e7b`, before the `forward_frames` split existed) and 30/30 runs
+    /// passed against the code as committed here.
+    #[tokio::test]
+    async fn a_dispatch_becoming_ready_while_an_inbound_frame_is_only_half_written_does_not_desync_the_next_frame()
+    -> anyhow::Result<()> {
+        let allowlist = ExecutorAllowlist::new(["100.64.0.7".parse()?]);
+        let registry = HostRegistry::default();
+        let (mut client, server) = tokio::io::duplex(4096);
+
+        write_frame(
+            &mut client,
+            &HostExecutorMessage {
+                op: Some(host_executor_message::Op::Register(Register {
+                    host_id: "ws01".to_owned(),
+                    capabilities: Some(capabilities()),
+                })),
+            },
+        )
+        .await?;
+
+        // `yield_now` alone does not reliably get a spawned task polled at a
+        // specific intermediate point — checked directly (see the commit
+        // message): the spawned server task doesn't actually run until this
+        // test's own task hits a GENUINELY blocking await, which a one-shot
+        // `yield_now` after a `write_all` that itself completes without
+        // blocking does not provide. `PendingCounter` makes the wait for "the
+        // read side has genuinely parked on the payload" an observed fact
+        // instead of an assumption about scheduling.
+        let pending_reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = PendingCounter {
+            inner: server,
+            pending_reads: std::sync::Arc::clone(&pending_reads),
+        };
+
+        let registry = std::sync::Arc::new(registry);
+        let allowlist = std::sync::Arc::new(allowlist);
+        let serve = tokio::spawn({
+            let registry = std::sync::Arc::clone(&registry);
+            let allowlist = std::sync::Arc::clone(&allowlist);
+            async move {
+                serve_host_executor(Box::new(server), tcp_peer("100.64.0.7"), &allowlist, &registry).await;
+            }
+        });
+
+        let _registered: OrchestratorMessage = read_frame(&mut client)
+            .await?
+            .context("expected a Registered response")?;
+
+        // An "unexpected" inbound frame (stage 1 has no real host→orchestrator
+        // message; another Register stands in), split manually into its
+        // length prefix and payload so each can be written separately.
+        use sandy_executor_proto::Message;
+        let unexpected = HostExecutorMessage {
+            op: Some(host_executor_message::Op::Register(Register {
+                host_id: "ws01".to_owned(),
+                capabilities: Some(capabilities()),
+            })),
+        };
+        let payload = unexpected.encode_to_vec();
+        let len = u32::try_from(payload.len()).context("payload length")?;
+
+        use tokio::io::AsyncWriteExt;
+        let baseline = pending_reads.load(std::sync::atomic::Ordering::SeqCst);
+        client
+            .write_all(&len.to_be_bytes())
+            .await
+            .context("write the length prefix alone")?;
+        client.flush().await?;
+
+        // Wait for an OBSERVED fact — the connection's read has genuinely
+        // returned `Pending` at least once more since the write above — not
+        // an assumed one. Bounded to 10_000 yields (loud failure, not a
+        // silent hang, if the read is never even attempted).
+        for _ in 0..10_000 {
+            if pending_reads.load(std::sync::atomic::Ordering::SeqCst) > baseline {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        anyhow::ensure!(
+            pending_reads.load(std::sync::atomic::Ordering::SeqCst) > baseline,
+            "the connection's read never parked waiting for more bytes after the length-prefix-only write"
+        );
+
+        // The length prefix is now consumed with no payload bytes behind it:
+        // the read is necessarily still pending on `read_exact`, not a race,
+        // an observed fact about what's been written and already polled.
+        registry.send_dispatch("ws01", test_dispatch("job-1")).await?;
+
+        // Read the resulting push back BEFORE writing the payload, not
+        // after: this was the second gap once `pending_reads` fixed the
+        // first one — writing the payload right after `send_dispatch` can
+        // still let BOTH branches become ready before the connection task is
+        // next polled (if neither this test's `.await`s nor `send_dispatch`
+        // itself happens to yield control in between), turning the
+        // deterministic "ready vs pending" case back into the same
+        // scheduling-order coin flip this test exists to not depend on.
+        // Reading this push to completion proves `select!` already resolved
+        // the dispatch branch — and with it, dropped the sibling read that
+        // had consumed the length prefix — before a single payload byte
+        // exists for it to be confused with.
+        let pushed: OrchestratorMessage = read_frame(&mut client).await?.context("expected a Dispatch push")?;
+        match pushed.op {
+            Some(orchestrator_message::Op::Dispatch(received)) => assert_eq!(received.job_id, "job-1"),
+            other => anyhow::bail!("expected a Dispatch push for job-1, got {other:?}"),
+        }
+
+        // `select!` on the old code already deterministically picked the
+        // ready dispatch branch over the still-pending read (proven by the
+        // read above), dropping the length prefix already consumed. Only
+        // now does the payload follow.
+        client.write_all(&payload).await.context("write the payload")?;
+        client.flush().await?;
+
+        registry.send_dispatch("ws01", test_dispatch("job-2")).await?;
+        let pushed: OrchestratorMessage = read_frame(&mut client).await?.context("expected a Dispatch push")?;
+        match pushed.op {
+            Some(orchestrator_message::Op::Dispatch(received)) => assert_eq!(
+                received.job_id, "job-2",
+                "the deliberately-forced interleaving must not desync a later dispatch"
+            ),
+            other => anyhow::bail!("expected a Dispatch push for job-2, got {other:?}"),
+        }
+
+        // The assertions above only cover the orchestrator→host-executor
+        // direction (outbound dispatches), which a desync on the OTHER
+        // direction (host-executor→orchestrator, what was actually forced
+        // above) can't corrupt — write_frame on `write_half` has nothing to
+        // do with whatever garbage the read side may have landed on
+        // (CodeRabbit, #312: "the write half can deliver all three dispatches
+        // even if the reader loses inbound bytes"). Send one more, cleanly
+        // framed inbound message and confirm the connection is still alive
+        // and dispatch-eligible afterward: on a desync, the next `read_frame`
+        // call starts misaligned on whatever bytes follow the dropped
+        // read's already-consumed prefix, which this cleanly-framed message
+        // supplies — almost certainly failing to parse as a valid frame
+        // (`TooLarge` or `Decode`), breaking the loop and deregistering the
+        // host before this check runs.
+        write_frame(
+            &mut client,
+            &HostExecutorMessage {
+                op: Some(host_executor_message::Op::Register(Register {
+                    host_id: "ws01".to_owned(),
+                    capabilities: Some(capabilities()),
+                })),
+            },
+        )
+        .await?;
+        registry.send_dispatch("ws01", test_dispatch("job-3")).await.context(
+            "the host must still be registered and dispatch-eligible after a clean frame following the forced \
+             interleaving — a desync would have broken the connection by now",
+        )?;
+        let pushed: OrchestratorMessage = read_frame(&mut client).await?.context("expected a Dispatch push")?;
+        match pushed.op {
+            Some(orchestrator_message::Op::Dispatch(received)) => assert_eq!(received.job_id, "job-3"),
+            other => anyhow::bail!("expected a Dispatch push for job-3, got {other:?}"),
         }
 
         drop(client);
