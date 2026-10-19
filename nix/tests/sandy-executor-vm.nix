@@ -22,9 +22,15 @@
 { pkgs }:
 let
   # runNixOSTest pins `nixpkgs.pkgs` to whatever `pkgs` it's called on (the
-  # node's `nixpkgs.overlays` is read-only there), so the overlay has to be
+  # node's `nixpkgs.overlays` is read-only there), so the overlays have to be
   # applied to THIS `pkgs` before calling it, not set inside the node module.
-  testPkgs = pkgs.extend (import ../overlays/sandy-executor.nix);
+  # Both overlays (#287 split): the module's `agentPackage` option defaults
+  # to `pkgs.sandy-agent`, which only the agent overlay provides.
+  testPkgs = pkgs.extend (
+    final: prev:
+    (import ../overlays/sandy-agent.nix final prev)
+    // (import ../overlays/sandy-host-executor.nix final prev)
+  );
 in
 testPkgs.testers.runNixOSTest {
   name = "sandy-executor-containment";

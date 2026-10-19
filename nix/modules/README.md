@@ -26,7 +26,17 @@ In the host's flake, add this repo as an input and import the module:
     nixosConfigurations.<host> = nixpkgs.lib.nixosSystem {
       system = "x86_64-linux";
       modules = [
-        { nixpkgs.overlays = [ sandy.overlays.default ]; }
+        # Both overlays: the host module's `agentPackage` option defaults to
+        # the agent overlay's `sandy-agent` package (for `SANDY_AGENT_PATH`),
+        # so it needs to be applied here too even though this host runs the
+        # executor, not the agent's sandbox image. Omit `sandy.overlays.sandy-agent`
+        # only if `agentPackage` is set explicitly below instead.
+        {
+          nixpkgs.overlays = [
+            sandy.overlays.sandy-agent
+            sandy.overlays.sandy-host-executor
+          ];
+        }
         sandy.nixosModules.sandy-executor
         {
           services.sandy-executor = {
@@ -45,8 +55,8 @@ In the host's flake, add this repo as an input and import the module:
 `orchestrator` and `hostId` are required, with no defaults — an unset value
 is a configuration error, not a guessed host (see `services.sandy-executor`'s
 option docs in `sandy-executor.nix` for what each one means and why). The
-`package`/`agentPackage` options default to the overlay's own
-`sandy-host-executor`/`sandy-agent`; override only to pin a different build.
+`package`/`agentPackage` options default to the `sandy-host-executor`/
+`sandy-agent` overlays' own packages; override only to pin a different build.
 
 ## Apply
 
