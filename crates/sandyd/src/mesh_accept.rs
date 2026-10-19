@@ -27,7 +27,7 @@ use crate::dispatch::JobRegistry;
 /// opens a connection and sends nothing (or a partial prefix) would hold the
 /// spawned task and its fd open indefinitely — an uncapped accept loop means
 /// any mesh peer can EMFILE the whole daemon this way, including the
-/// control socket and the host-client path. Mirrors `host_conn`'s
+/// control socket and the host-executor path. Mirrors `host_conn`'s
 /// `REGISTER_TIMEOUT`, the same shape for the same pre-auth DoS.
 const PREFIX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 

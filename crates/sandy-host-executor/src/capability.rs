@@ -1,8 +1,8 @@
-//! Host-client capability detection (#275, M2 stage 1).
+//! Host-executor capability detection (#275, M2 stage 1).
 //!
 //! Probes the actual environment and declares real capabilities to the
 //! orchestrator — never a hardcoded constant (spec D2,
-//! `docs/design/host-client-executor/spec.md`). A host that cannot actually
+//! `docs/design/host-executor/spec.md`). A host that cannot actually
 //! provide a backend declares nothing for it, fail-closed, rather than a
 //! capability it cannot honor.
 //!

@@ -1,4 +1,4 @@
-//! Drives one host-client's persistent connection (#263): read its
+//! Drives one host-executor's persistent connection (#263): read its
 //! `Register`, authenticate and reply, then relay `Dispatch` messages queued
 //! for it in [`HostRegistry`] down the same connection until it closes. The
 //! connection staying open is the host's liveness signal (kubelet-watch
@@ -9,7 +9,7 @@
 use sandy_conn::{Conn, PeerAddr};
 use sandy_control_proto::{read_frame, write_frame};
 use sandy_executor_proto::{
-    HostClientMessage, OrchestratorMessage, RegisterRefused, Registered, host_client_message, orchestrator_message,
+    HostExecutorMessage, OrchestratorMessage, RegisterRefused, Registered, host_executor_message, orchestrator_message,
 };
 
 use crate::host_registry::{ExecutorAllowlist, HostRegistry, RegisterError};
@@ -21,12 +21,12 @@ use crate::host_registry::{ExecutorAllowlist, HostRegistry, RegisterError};
 /// exhaustion, not just a slow client.
 const REGISTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Serve one accepted host-client connection end to end.
+/// Serve one accepted host-executor connection end to end.
 ///
 /// Expects `Register` as the first frame within [`REGISTER_TIMEOUT`];
 /// anything else, a stream that closes before sending one, or one that never
 /// sends it in time, ends the connection without ever registering the host.
-/// A `PeerAddr::Uds` peer is refused outright — a host-client only ever
+/// A `PeerAddr::Uds` peer is refused outright — a host-executor only ever
 /// connects over the mesh (`PeerAddr::Tcp`), so a UDS peer here would be a
 /// caller bug, not a registration this code should entertain.
 ///
@@ -36,7 +36,7 @@ const REGISTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10)
 /// inline notes at each site and at the connection loop's own `write_frame`
 /// for the specific consequence each one has. All are deliberately deferred
 /// to #289, not fixed here.
-pub async fn serve_host_client(
+pub async fn serve_host_executor(
     mut conn: Box<dyn Conn>,
     peer: PeerAddr,
     allowlist: &ExecutorAllowlist,
@@ -45,26 +45,26 @@ pub async fn serve_host_client(
     let peer_ip = match peer {
         PeerAddr::Tcp(addr) => addr.ip(),
         PeerAddr::Uds => {
-            tracing::warn!("a host-client connection arrived over UDS, not the mesh; refusing");
+            tracing::warn!("a host-executor connection arrived over UDS, not the mesh; refusing");
             return;
         }
     };
 
-    let register = match tokio::time::timeout(REGISTER_TIMEOUT, read_frame::<HostClientMessage>(&mut conn)).await {
-        Ok(Ok(Some(HostClientMessage {
-            op: Some(host_client_message::Op::Register(register)),
+    let register = match tokio::time::timeout(REGISTER_TIMEOUT, read_frame::<HostExecutorMessage>(&mut conn)).await {
+        Ok(Ok(Some(HostExecutorMessage {
+            op: Some(host_executor_message::Op::Register(register)),
         }))) => register,
         Ok(Ok(Some(_))) => {
-            tracing::warn!(peer = %peer_ip, "host-client's first frame was not Register; closing");
+            tracing::warn!(peer = %peer_ip, "host-executor's first frame was not Register; closing");
             return;
         }
         Ok(Ok(None)) => return, // clean close before any frame: nothing to log
         Ok(Err(e)) => {
-            tracing::warn!(peer = %peer_ip, error = %e, "host-client connection faulted reading Register");
+            tracing::warn!(peer = %peer_ip, error = %e, "host-executor connection faulted reading Register");
             return;
         }
         Err(_elapsed) => {
-            tracing::warn!(peer = %peer_ip, "host-client did not send Register within the timeout; closing");
+            tracing::warn!(peer = %peer_ip, "host-executor did not send Register within the timeout; closing");
             return;
         }
     };
@@ -136,7 +136,7 @@ pub async fn serve_host_client(
 
     // #289: undeadlined, and unlike the three refusal writes above, the
     // registry entry already exists at this point — a non-reading peer here
-    // stalls the registered host-client's own task with a live, dispatch-
+    // stalls the registered host-executor's own task with a live, dispatch-
     // eligible entry nothing else will clean up until this write resolves.
     if write_frame(
         &mut conn,
@@ -152,13 +152,13 @@ pub async fn serve_host_client(
         registry.remove(&host_id, registration);
         return;
     }
-    tracing::info!(peer = %peer_ip, host_id, "host-client registered");
+    tracing::info!(peer = %peer_ip, host_id, "host-executor registered");
 
     loop {
         // CAUTION (#289): read_frame below is not cancel-safe (it does
         // separate reads for the length prefix and the payload). Safe only
         // because the other branch never fires mid-read today — stage 1 has
-        // no host-client-to-orchestrator message after Register, so this
+        // no host-executor-to-orchestrator message after Register, so this
         // branch never actually resolves. Adding one makes a `Dispatch`
         // arriving mid-read drop the partially-consumed frame and desync
         // framing on the next read. Make this cancel-safe (split the
@@ -179,7 +179,7 @@ pub async fn serve_host_client(
                 // after 8 buffered sends, stalling future send_dispatch calls
                 // too. Add an explicit deadline here, removing the
                 // registration on expiry, before relying on this path to stay
-                // responsive to a hung or hostile host-client.
+                // responsive to a hung or hostile host-executor.
                 if write_frame(
                     &mut conn,
                     &OrchestratorMessage { op: Some(orchestrator_message::Op::Dispatch(dispatch)) },
@@ -187,21 +187,21 @@ pub async fn serve_host_client(
                 .await
                 .is_err()
                 {
-                    tracing::warn!(host_id, "failed writing Dispatch to host-client; closing");
+                    tracing::warn!(host_id, "failed writing Dispatch to host-executor; closing");
                     break;
                 }
             }
-            frame = read_frame::<HostClientMessage>(&mut conn) => {
+            frame = read_frame::<HostExecutorMessage>(&mut conn) => {
                 match frame {
                     Ok(Some(_)) => {
                         // Stage 1 has no re-registration or capability-update
                         // machinery (#269): any further frame from the
-                        // host-client is unexpected but not fatal on its own.
-                        tracing::debug!(host_id, "ignoring an unexpected frame from a registered host-client");
+                        // host-executor is unexpected but not fatal on its own.
+                        tracing::debug!(host_id, "ignoring an unexpected frame from a registered host-executor");
                     }
                     Ok(None) => break, // clean close: the ordinary end of a connection
                     Err(e) => {
-                        tracing::warn!(host_id, error = %e, "host-client connection faulted");
+                        tracing::warn!(host_id, error = %e, "host-executor connection faulted");
                         break;
                     }
                 }
@@ -210,7 +210,7 @@ pub async fn serve_host_client(
     }
 
     registry.remove(&host_id, registration);
-    tracing::info!(host_id, "host-client disconnected");
+    tracing::info!(host_id, "host-executor disconnected");
 }
 
 #[cfg(test)]
@@ -243,8 +243,8 @@ mod tests {
 
         write_frame(
             &mut client,
-            &HostClientMessage {
-                op: Some(host_client_message::Op::Register(Register {
+            &HostExecutorMessage {
+                op: Some(host_executor_message::Op::Register(Register {
                     host_id: "ws01".to_owned(),
                     capabilities: Some(capabilities()),
                 })),
@@ -258,7 +258,7 @@ mod tests {
             let registry = std::sync::Arc::clone(&registry);
             let allowlist = std::sync::Arc::clone(&allowlist);
             async move {
-                serve_host_client(Box::new(server), tcp_peer("100.64.0.7"), &allowlist, &registry).await;
+                serve_host_executor(Box::new(server), tcp_peer("100.64.0.7"), &allowlist, &registry).await;
             }
         });
 
@@ -304,8 +304,8 @@ mod tests {
 
         write_frame(
             &mut client,
-            &HostClientMessage {
-                op: Some(host_client_message::Op::Register(Register {
+            &HostExecutorMessage {
+                op: Some(host_executor_message::Op::Register(Register {
                     host_id: "impostor".to_owned(),
                     capabilities: Some(capabilities()),
                 })),
@@ -314,7 +314,7 @@ mod tests {
         .await?;
 
         let serving = tokio::spawn(async move {
-            serve_host_client(Box::new(server), tcp_peer("100.64.0.9"), &allowlist, &registry).await;
+            serve_host_executor(Box::new(server), tcp_peer("100.64.0.9"), &allowlist, &registry).await;
             registry
         });
 
@@ -341,8 +341,8 @@ mod tests {
 
         write_frame(
             &mut client,
-            &HostClientMessage {
-                op: Some(host_client_message::Op::Register(Register {
+            &HostExecutorMessage {
+                op: Some(host_executor_message::Op::Register(Register {
                     host_id: "impostor".to_owned(),
                     capabilities: None,
                 })),
@@ -351,7 +351,7 @@ mod tests {
         .await?;
 
         let serving = tokio::spawn(async move {
-            serve_host_client(Box::new(server), tcp_peer("100.64.0.9"), &allowlist, &registry).await;
+            serve_host_executor(Box::new(server), tcp_peer("100.64.0.9"), &allowlist, &registry).await;
         });
 
         let response: OrchestratorMessage = read_frame(&mut client).await?.context("expected a response")?;
@@ -376,7 +376,7 @@ mod tests {
         let (client, server) = tokio::io::duplex(4096);
 
         let serving = tokio::spawn(async move {
-            serve_host_client(Box::new(server), tcp_peer("100.64.0.7"), &allowlist, &registry).await;
+            serve_host_executor(Box::new(server), tcp_peer("100.64.0.7"), &allowlist, &registry).await;
         });
 
         tokio::time::advance(REGISTER_TIMEOUT + std::time::Duration::from_millis(1)).await;

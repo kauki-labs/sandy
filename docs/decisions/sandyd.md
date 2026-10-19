@@ -519,38 +519,38 @@ trust gate itself (distinguishing a trusted UDS caller from an untrusted
 mesh one): B6's job, not this block's — #226 only decides what a given
 frame is allowed to grant, never which connections must present one.
 
-## 12. The orchestrator side of the host-client contract: `Register`'s allowlist and the persistent dispatch connection (#263)
+## 12. The orchestrator side of the host-executor contract: `Register`'s allowlist and the persistent dispatch connection (#263)
 
 **Status:** partially implemented. `sandy-executor-proto` (new crate) defines
-`HostClientMessage`/`OrchestratorMessage` (`Register`/`Registered`/
+`HostExecutorMessage`/`OrchestratorMessage` (`Register`/`Registered`/
 `RegisterRefused`/`Dispatch`), riding `sandy-control-proto`'s existing
 length-prefixed framing. `sandyd::host_registry` (`ExecutorAllowlist`,
-`HostRegistry`) and `sandyd::host_conn::serve_host_client` implement the
+`HostRegistry`) and `sandyd::host_conn::serve_host_executor` implement the
 orchestrator side end to end: authenticate an incoming `Register` against the
 allowlist, reply `Registered`/`RegisterRefused`, then relay `Dispatch`
 messages queued for that host down its one persistent connection until it
-closes. The executor side (#283, sandy-91) is also done: `sandy-host-client`'s
+closes. The executor side (#283, sandy-91) is also done: `sandy-host-executor`'s
 `handle_dispatch` decodes a `Dispatch`, independently re-checks the isolation
 class, launches the trusted-process sandbox, and forwards its agent's link
 back over the mesh. What is NOT yet built: anything that calls
 `HostRegistry::register` from a real network accept loop (no `sandy-conn`
-listener is bound in `sandyd`'s `main.rs` yet, and `sandy-host-client`'s own
+listener is bound in `sandyd`'s `main.rs` yet, and `sandy-host-executor`'s own
 `main.rs` doesn't send `Register` or receive `Dispatch` yet either — tracked
-as #288), and the nix overlay/service that runs `sandy-host-client` as a
+as #288), and the nix overlay/service that runs `sandy-host-executor` as a
 registered executor.
 
 **Context.** #269's spec frames M2 cross-machine dispatch: the orchestrator
 stays the single authority (caps, channels, the peer-hub); a remote host is an
 _executor_, not an independent orchestrator, so the agent link forwards back
 to the orchestrator rather than staying local. #263 is the contract between
-them: capability-declaring registration (kubelet-style — the host-client
+them: capability-declaring registration (kubelet-style — the host-executor
 detects and declares what it can run, the orchestrator dispatches against
 that declaration, never a hardcoded host) plus the dispatch RPC.
 
 **Decision.**
 
-- One persistent, bidirectional connection per host-client, not request/
-  response (unlike decision 1's control RPC): the host-client sends `Register`
+- One persistent, bidirectional connection per host-executor, not request/
+  response (unlike decision 1's control RPC): the host-executor sends `Register`
   once, then the orchestrator pushes zero or more `Dispatch` messages down the
   _same_ connection as it places jobs there. The connection staying open is
   the host's liveness signal — no separate heartbeat protocol, and (per #269)
@@ -569,7 +569,7 @@ that declaration, never a hardcoded host) plus the dispatch RPC.
   the orchestrator/executor can refuse fail-closed rather than silently
   downgrade an untrusted job onto stage 1's trusted-process backend.
   `Capabilities.supported_isolation_classes` is the matching declaration on
-  the host-client side.
+  the host-executor side.
 - `sandy-executor-proto` is its own crate (not folded into
   `sandy-control-proto`), landed as a standalone artifact before either side's
   implementation, so the orchestrator half (this slice) and the executor half
@@ -586,7 +586,7 @@ that declaration, never a hardcoded host) plus the dispatch RPC.
   above): a dispatch whose
   `required_isolation_class` the target host never declared is refused
   outright, including an unset/`Unspecified` class, which never matches
-  anything. `serve_host_client` also bounds how long an accepted connection
+  anything. `serve_host_executor` also bounds how long an accepted connection
   may sit before sending `Register`, so an open-and-never-write peer cannot
   hold a connection slot forever.
 
@@ -594,7 +594,7 @@ that declaration, never a hardcoded host) plus the dispatch RPC.
 NOT do (accept connections, drive the loop) so the authorization logic stays
 unit-testable without a real socket — the same shape decision 6's
 `link_auth` module already established. The real accept loop (binding a mesh
-address, calling `serve_host_client` per accepted connection) and the
+address, calling `serve_host_executor` per accepted connection) and the
 placement logic that decides when to call `send_dispatch` are both still
 open; tracked by #263 and #269's stage-1 block list, not silently assumed.
 There is also no `OrchestratorMessage` variant for cancelling a dispatched
@@ -671,18 +671,18 @@ has never had one, and introducing `clap` as a dependency for two optional
 knobs when the rest of the binary's config is env-var-only would be
 inconsistent with the binary's own established shape, not a simplification.
 
-## 14. Stage 1: one host-client handles one dispatch at a time, sequentially (#288)
+## 14. Stage 1: one host-executor handles one dispatch at a time, sequentially (#288)
 
 **Status:** accepted (architect ruling, infra-f3).
 
-**Context.** `sandy-host-client`'s main loop (#288) reads `Dispatch` messages
+**Context.** `sandy-host-executor`'s main loop (#288) reads `Dispatch` messages
 off its one persistent connection to the orchestrator and runs each through
 `handle_dispatch`, which blocks the calling thread for the job's whole
 duration (`ProcessBackend::run`'s own contract). Nothing in #269's spec or
 `Capabilities` says whether a second `Dispatch` may arrive and run while a
 first is still in flight on the same host.
 
-**Decision.** Sequential, one job per host-client process: read one
+**Decision.** Sequential, one job per host-executor process: read one
 `Dispatch`, run it to completion (bounded by `STAGE1_TIMEOUT_SECS`) via
 `spawn_blocking`, then read the next. `Capabilities` declares no
 concurrency/slot count, so the orchestrator has no signal a host could run
@@ -699,7 +699,7 @@ sandbox per host, communicating across machines — not multiple concurrent
 jobs on one host, so sequential suffices for the stated bar. Sequential
 handling also gives natural backpressure for free: a second `Dispatch` simply
 buffers in the connection (per decision 12's queued-`mpsc`-per-host shape)
-until the host-client finishes its current job and reads again; the
+until the host-executor finishes its current job and reads again; the
 connection staying open still signals liveness while the host is busy, same
 as decision 12's "no separate heartbeat" reasoning.
 
@@ -729,7 +729,7 @@ happy path).
 
 - One `HostRegistry`, constructed once in `main`, `Arc`-shared between the
   mesh management-channel accept loop (which registers connected
-  host-clients) and the control-socket path (which reads it for placement on
+  host-executors) and the control-socket path (which reads it for placement on
   `Submit`) — not two registries, or a host registered on the mesh listener
   would be invisible to a job submitted over the UDS socket.
 - The mesh agent-link accept listener (`mesh_accept::serve_mesh_accept_loop`,
@@ -744,7 +744,7 @@ happy path).
   Not joined at shutdown (unlike the other two loops): `serve_mesh_accept_loop`
   has no graceful-shutdown support of its own yet (tracked under #289's
   robustness class) — an accepted-but-unauthenticated agent-link connection
-  is cheap to lose on abrupt cancellation, unlike a host-client's live
+  is cheap to lose on abrupt cancellation, unlike a host-executor's live
   dispatch channel.
 - `handler::handle` gained two parameters (`host_registry`,
   `forward_back_addr: Option<SocketAddr>`) and a placement step in `Submit`:

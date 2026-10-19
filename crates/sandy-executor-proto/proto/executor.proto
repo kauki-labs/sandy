@@ -2,10 +2,10 @@ syntax = "proto3";
 
 package sandy.executor.v1;
 
-// The orchestrator<->host-client contract (#263, epic #205 M2): a
+// The orchestrator<->host-executor contract (#263, epic #205 M2): a
 // capability-declaring registration (kubelet-style) plus the dispatch RPC.
 // Rides sandy-conn's TCP/mesh tier. One persistent, bidirectional connection
-// per host-client: the host-client sends Register once, then the
+// per host-executor: the host-executor sends Register once, then the
 // orchestrator pushes zero or more Dispatch messages down the SAME
 // connection as it places jobs there. The connection staying open is the
 // liveness signal for that host — no separate heartbeat protocol.
@@ -16,13 +16,13 @@ package sandy.executor.v1;
 // crate, same framing style (length-prefixed, write_frame/read_frame).
 
 // Host-client -> orchestrator.
-message HostClientMessage {
+message HostExecutorMessage {
   oneof op {
     Register register = 1;
   }
 }
 
-// Orchestrator -> host-client.
+// Orchestrator -> host-executor.
 message OrchestratorMessage {
   oneof op {
     Registered registered = 1;
@@ -100,7 +100,7 @@ message RegisterRefused {
 // Run `manifest` on `backend`; forward the sandbox agent's link back to
 // `forward_back` using `job_id` + `link_token` as the mesh-accept-loop demux
 // prefix (decision 6). `link_token` is a bearer secret (INV-1): the
-// host-client holds it only in forwarder memory, never logs it, never writes
+// host-executor holds it only in forwarder memory, never logs it, never writes
 // it to the job's manifest, env, or mounts.
 message Dispatch {
   string job_id = 1;
@@ -110,7 +110,7 @@ message Dispatch {
   string manifest_encoding = 3;
   SandboxKind backend = 4;
   bytes link_token = 5;
-  // "host:port" on the orchestrator's mesh interface, for the host-client's
+  // "host:port" on the orchestrator's mesh interface, for the host-executor's
   // fresh dial (sandy_conn::connect(ConnAddr::Tcp(..))) before
   // forward_agent_link — a separate stream from this management connection.
   string forward_back = 6;

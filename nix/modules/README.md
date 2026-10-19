@@ -46,7 +46,7 @@ In the host's flake, add this repo as an input and import the module:
 is a configuration error, not a guessed host (see `services.sandy-executor`'s
 option docs in `sandy-executor.nix` for what each one means and why). The
 `package`/`agentPackage` options default to the overlay's own
-`sandy-host-client`/`sandy-agent`; override only to pin a different build.
+`sandy-host-executor`/`sandy-agent`; override only to pin a different build.
 
 ## Apply
 

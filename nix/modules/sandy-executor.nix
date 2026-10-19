@@ -1,11 +1,11 @@
-# The ws01 host-client service (#287, M2 stage 1: trusted-process only, no
+# The ws01 host-executor service (#287, M2 stage 1: trusted-process only, no
 # VM/agent-image). ADDITIVE ONLY — this module must never touch
 # `nix.buildMachines`, the nix daemon, or build users: ws01 is the sandy
 # swarm's x86_64 remote build backend, and this service is layered alongside
 # that role, never inside it. It only adds a user, a group, a service, and
 # whatever packages the service's own PATH needs.
 #
-# `sandy-host-client`'s trusted-process containment is
+# `sandy-host-executor`'s trusted-process containment is
 # `systemd-run --user --scope` over cgroup v2 (`impls/local/src/containment.rs`),
 # which needs a real user `systemd --user` instance reachable over the session
 # bus. A `DynamicUser` service has no such instance (no logind session, no
@@ -30,7 +30,7 @@
 # operator watching the log needs `journalctl -b -f`, not `-u`; see
 # `nix/modules/README.md`'s log-watch note.
 #
-# The host-client only DIALS the orchestrator (#288's main loop) — it never
+# The host-executor only DIALS the orchestrator (#288's main loop) — it never
 # binds a mesh listener itself, so there is no "bind to the mesh interface
 # only" restriction to apply here (unlike sandyd's `SANDY_MESH_LISTEN`, which
 # is out of #287's scope per the issue's own comment thread). Least privilege
@@ -48,14 +48,14 @@ let
 in
 {
   options.services.sandy-executor = {
-    enable = lib.mkEnableOption "the sandy-host-client executor service (#287, M2 stage 1)";
+    enable = lib.mkEnableOption "the sandy-host-executor service (#287, M2 stage 1)";
 
     orchestrator = lib.mkOption {
       type = lib.types.str;
       example = "100.64.0.2:7420";
       description = ''
         The macOS orchestrator's mesh management address to dial
-        (`SANDY_HOST_CLIENT_ORCHESTRATOR`). Required, no default — an unset
+        (`SANDY_HOST_EXECUTOR_ORCHESTRATOR`). Required, no default — an unset
         orchestrator address is a configuration error, never a guessed host.
       '';
     };
@@ -64,7 +64,7 @@ in
       type = lib.types.str;
       description = ''
         The self-reported host_id this host registers under
-        (`SANDY_HOST_CLIENT_ID`). Bookkeeping and placement only — the
+        (`SANDY_HOST_EXECUTOR_ID`). Bookkeeping and placement only — the
         orchestrator authorizes by mesh peer identity, never by this value
         (decision 12).
       '';
@@ -72,9 +72,9 @@ in
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = pkgs.sandy-host-client;
-      defaultText = lib.literalExpression "pkgs.sandy-host-client";
-      description = "The sandy-host-client package to run.";
+      default = pkgs.sandy-host-executor;
+      defaultText = lib.literalExpression "pkgs.sandy-host-executor";
+      description = "The sandy-host-executor package to run.";
     };
 
     agentPackage = lib.mkOption {
@@ -143,7 +143,7 @@ in
     ];
 
     systemd.services.sandy-executor = {
-      description = "sandy host-client executor (#287, M2 stage 1, trusted-process)";
+      description = "sandy host-executor (#287, M2 stage 1, trusted-process)";
       wantedBy = [ "multi-user.target" ];
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
@@ -155,13 +155,13 @@ in
       path = [ pkgs.bubblewrap ];
 
       environment = {
-        SANDY_HOST_CLIENT_ORCHESTRATOR = cfg.orchestrator;
-        SANDY_HOST_CLIENT_ID = cfg.hostId;
+        SANDY_HOST_EXECUTOR_ORCHESTRATOR = cfg.orchestrator;
+        SANDY_HOST_EXECUTOR_ID = cfg.hostId;
         SANDY_AGENT_PATH = "${cfg.agentPackage}/bin/sandy-agent";
       };
 
       serviceConfig = {
-        ExecStart = "${cfg.package}/bin/sandy-host-client";
+        ExecStart = "${cfg.package}/bin/sandy-host-executor";
         User = username;
         Group = username;
         # Registers a real logind session for this user on start, so a user
@@ -178,7 +178,7 @@ in
         Restart = "on-failure";
         RestartSec = "5s";
 
-        # Least privilege around the host-client process itself; the
+        # Least privilege around the host-executor process itself; the
         # sandboxed job it dispatches is bwrap/cgroup-confined separately
         # (security review, #299/sandy-73: since `systemd-run --user --scope`
         # execs the job in this unit's own context, this hardening is the
@@ -223,7 +223,7 @@ in
         SystemCallFilter = [
           "@system-service"
           # bwrap's own confinement needs these (#142); none are in
-          # @system-service, and none are a privilege sandy-host-client
+          # @system-service, and none are a privilege sandy-host-executor
           # itself exercises outside of spawning bwrap.
           "@mount"
           "unshare"

@@ -1,6 +1,6 @@
 [package]
 name = "sandy-executor-proto"
-description = "The orchestrator<->host-client contract (#263): capability-declaring registration and the dispatch RPC, as a protobuf message contract riding sandy-control-proto's length-prefixed framing"
+description = "The orchestrator<->host-executor contract (#263): capability-declaring registration and the dispatch RPC, as a protobuf message contract riding sandy-control-proto's length-prefixed framing"
 version = "0.1.1"
 authors.workspace = true
 homepage.workspace = true

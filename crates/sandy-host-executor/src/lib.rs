@@ -1,4 +1,4 @@
-//! `sandy-host-client`: the M2 remote executor (epic #205, #269's design).
+//! `sandy-host-executor`: the M2 remote executor (epic #205, #269's design).
 //!
 //! A per-host component that detects its own environment and declares its
 //! capabilities to the orchestrator (kubelet-style registration, spec D2),

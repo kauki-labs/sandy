@@ -1,18 +1,18 @@
-//! `sandy-host-client`: the M2 remote executor binary (#269, #263, #288).
+//! `sandy-host-executor`: the M2 remote executor binary (#269, #263, #288).
 //!
-//! Resolves its config from `SANDY_HOST_CLIENT_ORCHESTRATOR`/
-//! `SANDY_HOST_CLIENT_ID`/`SANDY_AGENT_PATH`, dials the orchestrator, probes
+//! Resolves its config from `SANDY_HOST_EXECUTOR_ORCHESTRATOR`/
+//! `SANDY_HOST_EXECUTOR_ID`/`SANDY_AGENT_PATH`, dials the orchestrator, probes
 //! and declares this host's real capabilities via `Register`, then handles
 //! `Dispatch` messages sequentially (decision 14) until the connection closes
 //! or `SIGTERM`/`SIGINT` arrives. No in-process reconnect loop: stage 1 has
 //! no re-registration machinery (decision 12), so a disconnected or refused
-//! host-client simply exits non-zero and leaves restarting it to its
+//! host-executor simply exits non-zero and leaves restarting it to its
 //! supervisor (the nix service, tracked separately, #287).
 
 use sandy_conn::ConnAddr;
-use sandy_host_client::{
+use sandy_host_executor::{
     capability::detect_register_capabilities,
-    client_config::{ClientConfig, parse_client_config},
+    client_config::{ExecutorConfig, parse_executor_config},
     dispatch::handle_dispatch,
     run::{DispatchLoopExit, REGISTER_RESPONSE_TIMEOUT, register, run_dispatch_loop},
 };
@@ -28,7 +28,7 @@ async fn main() {
     let config = match resolve_config() {
         Ok(config) => config,
         Err(e) => {
-            eprintln!("sandy-host-client: {e}");
+            eprintln!("sandy-host-executor: {e}");
             std::process::exit(1);
         }
     };
@@ -96,7 +96,7 @@ async fn main() {
     // connection died out from under this process — exit non-zero so the
     // supervisor restarts it, matching stage 1's "no in-process reconnect,
     // the supervisor owns that" design (decision 12). Returning unconditionally
-    // here would make a disconnected host-client exit 0, silently defeating
+    // here would make a disconnected host-executor exit 0, silently defeating
     // that design (CodeRabbit finding on #294).
     match exit {
         DispatchLoopExit::Shutdown => {}
@@ -111,13 +111,13 @@ async fn main() {
     }
 }
 
-/// `SANDY_HOST_CLIENT_ORCHESTRATOR`/`SANDY_HOST_CLIENT_ID`/`SANDY_AGENT_PATH`,
+/// `SANDY_HOST_EXECUTOR_ORCHESTRATOR`/`SANDY_HOST_EXECUTOR_ID`/`SANDY_AGENT_PATH`,
 /// the only place `main` reads the real process environment — everything
-/// downstream takes the already-parsed [`ClientConfig`].
-fn resolve_config() -> Result<ClientConfig, sandy_host_client::client_config::ClientConfigError> {
-    parse_client_config(
-        std::env::var("SANDY_HOST_CLIENT_ORCHESTRATOR").ok().as_deref(),
-        std::env::var("SANDY_HOST_CLIENT_ID").ok().as_deref(),
+/// downstream takes the already-parsed [`ExecutorConfig`].
+fn resolve_config() -> Result<ExecutorConfig, sandy_host_executor::client_config::ExecutorConfigError> {
+    parse_executor_config(
+        std::env::var("SANDY_HOST_EXECUTOR_ORCHESTRATOR").ok().as_deref(),
+        std::env::var("SANDY_HOST_EXECUTOR_ID").ok().as_deref(),
         std::env::var("SANDY_AGENT_PATH").ok().as_deref(),
     )
 }

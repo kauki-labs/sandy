@@ -140,10 +140,10 @@ pub enum HandleDispatchError {
     /// refused before a [`ProcessBackend`] is ever constructed.
     #[error(transparent)]
     Dispatch(#[from] DispatchError),
-    /// `Dispatch.backend` named a sandbox kind this host-client build does not
+    /// `Dispatch.backend` named a sandbox kind this host-executor build does not
     /// run — stage 1 only ever runs `Process`, so `Vm` or `Unspecified` must
     /// be refused rather than silently run through `ProcessBackend` anyway.
-    #[error("backend {0:?} is not supported by this host-client (stage 1 runs Process only)")]
+    #[error("backend {0:?} is not supported by this host-executor (stage 1 runs Process only)")]
     UnsupportedBackend(i32),
     /// `Dispatch.link_token` was not exactly
     /// `sandy_executor_proto::REMOTE_LINK_TOKEN_LEN` bytes — refused here
@@ -411,7 +411,7 @@ mod tests {
         let rt = tokio::runtime::Handle::current();
 
         let err = handle_dispatch(&dispatch, containment, PathBuf::from("/nonexistent/sandy-agent"), rt)
-            .expect_err("a Vm dispatch must be refused by a host-client that only runs Process");
+            .expect_err("a Vm dispatch must be refused by a host-executor that only runs Process");
         assert!(
             matches!(err, HandleDispatchError::UnsupportedBackend(backend)
                 if backend == i32::from(sandy_executor_proto::SandboxKind::Vm)),
