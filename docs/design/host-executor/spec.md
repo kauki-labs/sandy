@@ -82,8 +82,8 @@ communicating, agent inside each," across macOS and an external machine), now de
   - **Isolation-class gate (two-sided).** The dispatch (#263) carries the job's **required
     isolation class**. The orchestrator must not dispatch it to a host whose declared backends
     cannot provide that class (`pick_host_for` placement), **and** the executor independently
-    re-derives the required class from the manifest and re-checks it against its own backends
-    before launching — defense in depth, not trusting the orchestrator's placement. Either
+    re-checks `Dispatch.required_isolation_class` against its actual containment before
+    launching — defense in depth, not trusting the orchestrator's placement. Either
     side refusing is explicit and fail-closed: an untrusted job is never run on stage-1's
     `trusted-process` backend, and refusal is never a silent downgrade to a weaker backend.
   - **Token lifecycle.** decision-6 spends the token on accept (one link per run). Beyond
