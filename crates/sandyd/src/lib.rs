@@ -111,7 +111,9 @@ mod tests {
         .await?;
         let response: ControlResponse = read_frame(&mut client).await?.context("expected a Status response")?;
         match response.result {
-            Some(control_response::Result::Status(sandy_control_proto::StatusResponse { job_id: id, status })) => {
+            Some(control_response::Result::Status(sandy_control_proto::StatusResponse {
+                job_id: id, status, ..
+            })) => {
                 assert_eq!(id, job_id);
                 assert_eq!(status, i32::from(sandy_control_proto::JobStatus::Pending));
             }

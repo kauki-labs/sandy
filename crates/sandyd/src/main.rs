@@ -144,6 +144,7 @@ async fn main() {
         Ok(Some(mesh)) => Some(tokio::spawn(run_mesh_accept_loop(
             mesh,
             Arc::clone(&host_registry),
+            Arc::clone(&store),
             shutdown_rx.clone(),
         ))),
         Ok(None) => None,
@@ -423,6 +424,7 @@ async fn setup_mesh_agent_link_listener() -> std::io::Result<Option<(MeshListene
 async fn run_mesh_accept_loop(
     mesh: MeshSetup,
     host_registry: Arc<HostRegistry>,
+    store: Arc<JobStore>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let MeshSetup { listener, allowlist } = mesh;
@@ -437,8 +439,9 @@ async fn run_mesh_accept_loop(
                         backoff.reset();
                         let allowlist = Arc::clone(&allowlist);
                         let host_registry = Arc::clone(&host_registry);
+                        let store = Arc::clone(&store);
                         connections.spawn(async move {
-                            sandyd::host_conn::serve_host_executor(conn, peer, &allowlist, &host_registry).await;
+                            sandyd::host_conn::serve_host_executor(conn, peer, &allowlist, &host_registry, &store).await;
                         });
                     }
                     Err(e) => {
