@@ -399,9 +399,16 @@ mod tests {
     /// forever. A tiny duplex buffer fits the Register/Registered handshake
     /// (drained before the Dispatch write) but not a Dispatch frame, so a
     /// peer that stops reading genuinely blocks the write exactly like a full
-    /// TCP receive buffer would. Proves the full propagation: the write
-    /// expires, the connection closes, `registry.remove` runs — a second
-    /// `send_dispatch` into the dead channel then fails instead of blocking.
+    /// TCP receive buffer would.
+    ///
+    /// Proves the documented `ConnectionClosing` result directly, not just
+    /// that *some* later call fails (CodeRabbit on #311): fills the
+    /// `HostRegistry` channel (capacity 8, one slot already drained into the
+    /// stalled write) so a 9th `send_dispatch` genuinely blocks on a full
+    /// channel, same as a real caller racing the timeout would. Once the
+    /// write's deadline expires and `registry.remove` drops the channel's
+    /// receiver, that blocked send resolves — asserted to be exactly
+    /// `DispatchSendError::ConnectionClosing`, not merely "an error."
     #[tokio::test(start_paused = true)]
     async fn a_hung_host_is_disconnected_after_the_dispatch_write_timeout() -> anyhow::Result<()> {
         let allowlist = ExecutorAllowlist::new(["100.64.0.7".parse()?]);
@@ -433,26 +440,52 @@ mod tests {
             .await?
             .context("expected a Registered response")?;
 
-        let dispatch = sandy_executor_proto::Dispatch {
-            job_id: "job-1".to_owned(),
-            manifest: b"m".to_vec(),
-            manifest_encoding: "test/v1".to_owned(),
-            backend: SandboxKind::Process.into(),
-            link_token: vec![0u8; 32],
-            forward_back: "100.64.0.1:9000".to_owned(),
-            required_isolation_class: IsolationClass::Trusted.into(),
-        };
-        registry.send_dispatch("ws01", dispatch).await?;
+        // The first send is picked up by the connection loop's select! and
+        // its write stalls immediately (the duplex buffer is too small for
+        // even one frame) — this one slot is never returned to the channel.
+        registry.send_dispatch("ws01", test_dispatch("job-1")).await?;
 
-        // Never read further from `client`: the Dispatch write stalls once
-        // the tiny duplex buffer fills, standing in for a hung peer. Plain
-        // `.await` on `serve` below, not a second real-time `timeout`
-        // wrapper: with the clock paused, `advance` already drives the
-        // runtime past the one timer this task is waiting on, so nothing
-        // further needs to pass virtual time — matching the pattern the
-        // `REGISTER_TIMEOUT` regression test above uses.
+        // Fill the channel's full capacity (8) behind the stalled write:
+        // these succeed immediately since nothing has consumed from the
+        // channel since the first send.
+        for n in 0..8 {
+            registry
+                .send_dispatch("ws01", test_dispatch(&format!("job-fill-{n}")))
+                .await?;
+        }
+
+        // The 9th send has no room left and genuinely blocks — exactly the
+        // caller this fix exists for. Spawned so the test can advance the
+        // clock concurrently with it being blocked.
+        let blocked_registry = std::sync::Arc::clone(&registry);
+        let blocked_send = tokio::spawn(async move {
+            blocked_registry
+                .send_dispatch("ws01", test_dispatch("job-overflow"))
+                .await
+        });
+
+        // Give the spawned send a chance to actually reach the blocking
+        // point before the clock advances, so the race is real rather than
+        // incidental: with the clock paused, a bare `yield_now` lets the
+        // runtime poll `blocked_send` once without passing any virtual time.
+        tokio::task::yield_now().await;
+
+        // Never read further from `client`: the Dispatch write stays
+        // stalled, standing in for a hung peer. Plain `.await` on `serve`
+        // below, not a second real-time `timeout` wrapper: with the clock
+        // paused, `advance` already drives the runtime past the one timer
+        // this task is waiting on, so nothing further needs to pass virtual
+        // time — matching the pattern the `REGISTER_TIMEOUT` regression test
+        // above uses.
         tokio::time::advance(DISPATCH_WRITE_TIMEOUT + std::time::Duration::from_millis(1)).await;
         serve.await?;
+
+        let blocked_result = blocked_send.await?;
+        assert_eq!(
+            blocked_result,
+            Err(crate::host_registry::DispatchSendError::ConnectionClosing),
+            "a send blocked on the full channel must resolve to ConnectionClosing once the write times out, not hang"
+        );
 
         assert_eq!(
             registry.capabilities_of("ws01"),
@@ -460,18 +493,18 @@ mod tests {
             "a hung Dispatch write must disconnect and deregister the host"
         );
 
-        let resend = registry.send_dispatch("ws01", dispatch_two()).await;
+        let resend = registry.send_dispatch("ws01", test_dispatch("job-2")).await;
         assert!(
-            resend.is_err(),
-            "a second send_dispatch after deregistration must fail fast, not hang"
+            matches!(resend, Err(crate::host_registry::DispatchSendError::NoSuchHost)),
+            "a send after full deregistration must fail with NoSuchHost, not hang: got {resend:?}"
         );
         drop(client);
         Ok(())
     }
 
-    fn dispatch_two() -> sandy_executor_proto::Dispatch {
+    fn test_dispatch(job_id: &str) -> sandy_executor_proto::Dispatch {
         sandy_executor_proto::Dispatch {
-            job_id: "job-2".to_owned(),
+            job_id: job_id.to_owned(),
             manifest: b"m".to_vec(),
             manifest_encoding: "test/v1".to_owned(),
             backend: SandboxKind::Process.into(),

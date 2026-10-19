@@ -666,6 +666,14 @@ mod tests {
             sock_ref.tcp_keepalive_time().context("tcp_keepalive_time")?,
             keepalive.idle
         );
+        assert_eq!(
+            sock_ref.tcp_keepalive_interval().context("tcp_keepalive_interval")?,
+            keepalive.interval
+        );
+        assert_eq!(
+            sock_ref.tcp_keepalive_retries().context("tcp_keepalive_retries")?,
+            keepalive.retries
+        );
         Ok(())
     }
 
