@@ -19,7 +19,37 @@ package sandy.executor.v1;
 message HostExecutorMessage {
   oneof op {
     Register register = 1;
+    JobResult result = 2;
   }
+}
+
+// A finished dispatch's physical outcome, reported back up the SAME management
+// connection the Dispatch arrived on, once the host-executor has run the job to
+// completion (or failed to). `job_id` ties it back to its Dispatch. Without
+// this, a job that ran remotely stays JOB_STATUS_PENDING forever: the outcome
+// never leaves the host (#292's un-run-Pending strand).
+//
+// The host reports FACTS here, not a classified status: it mirrors
+// `sandy_api::backend::Outcome` 1:1, and the orchestrator maps these fields
+// into a terminal `sandy.control.v1.JobStatus` itself — the same split the
+// backend seam already draws ("the backend returns the physical Outcome only;
+// the core maps that into the result bands"). No field here is ever a secret
+// (INV-1): the per-run `link_token` and the like are never placed on it.
+message JobResult {
+  string job_id = 1;
+  // Whether the guest booted / the sandbox launched.
+  bool booted = 2;
+  // The guest process exit code, if it ran to completion; unset if it never
+  // produced one (never booted, a transport fault, or a timeout).
+  optional int32 exit_code = 3;
+  // Whether the run hit its wall-clock timeout.
+  bool timed_out = 4;
+  // A transport/protocol error string if the agent channel failed, else unset.
+  optional string transport_error = 5;
+  // A bounded tail of the job's OWN stdout/stderr (up to ~64 KiB), for
+  // `status`/`attach` to surface. This is the job's output, never the host's
+  // own journald logs — the host-executor must not `tracing!`-log it.
+  string console = 6;
 }
 
 // Orchestrator -> host-executor.

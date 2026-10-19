@@ -324,11 +324,17 @@ pub async fn handle(
         Some(control_request::Op::Status(status_req)) => {
             let job_id = status_req.job_id.clone();
             let store = Arc::clone(store);
-            let status = tokio::task::spawn_blocking(move || store.status(&job_id)).await??;
-            match status {
-                Some(status) => control_response::Result::Status(StatusResponse {
+            // `detail`, not `status`: a terminal job now also carries the exit
+            // code and console tail a remote run reported back (#292), surfaced
+            // so `status` returns the terminal state AND the exit, not just the
+            // lifecycle band.
+            let detail = tokio::task::spawn_blocking(move || store.detail(&job_id)).await??;
+            match detail {
+                Some(detail) => control_response::Result::Status(StatusResponse {
                     job_id: status_req.job_id,
-                    status: status.into(),
+                    status: i32::from(detail.status),
+                    exit_code: detail.exit_code,
+                    console_tail: detail.console,
                 }),
                 None => control_response::Result::Error(ControlError {
                     message: format!("no such job: {}", status_req.job_id),
@@ -1127,12 +1133,14 @@ mod tests {
         .await?;
 
         let host_registry_for_conn = Arc::clone(&host_registry);
+        let store_for_conn = Arc::clone(&store);
         let serve = tokio::spawn(async move {
             crate::host_conn::serve_host_executor(
                 Box::new(server),
                 sandy_conn::PeerAddr::Tcp(std::net::SocketAddr::new(peer_ip, 9000)),
                 &allowlist,
                 &host_registry_for_conn,
+                &store_for_conn,
             )
             .await;
         });
@@ -1299,6 +1307,280 @@ mod tests {
         assert!(
             job.remote_link.is_none(),
             "with no registered host, the job must stay local"
+        );
+        Ok(())
+    }
+
+    // ---- Result propagation (#292) ----
+
+    fn submit_req_argv(id: u64, argv: &[&str]) -> ControlRequest {
+        req(
+            id,
+            control_request::Op::Submit(SubmitRequest {
+                manifest: serde_json::to_vec(argv).expect("encode argv manifest"),
+                manifest_encoding: "argv/v1".to_owned(),
+                submitter_caps: Vec::new(),
+            }),
+        )
+    }
+
+    /// Poll the store until `job_id` leaves PENDING/RUNNING, so a test can wait
+    /// for `serve_host_executor`'s own (spawn_blocking) terminal write to land
+    /// without reaching into its internals. Bounded, so a regression that never
+    /// transitions fails loudly instead of hanging.
+    async fn wait_for_terminal(store: &JobStore, job_id: &str) -> anyhow::Result<crate::store::JobDetail> {
+        for _ in 0..200 {
+            if let Some(detail) = store.detail(job_id)?
+                && !matches!(
+                    detail.status,
+                    sandy_control_proto::JobStatus::Pending | sandy_control_proto::JobStatus::Running
+                )
+            {
+                return Ok(detail);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        anyhow::bail!("job {job_id} never reached a terminal status")
+    }
+
+    /// The acceptance bar (#292): a job submitted as `["echo","hi"]` with
+    /// `argv/v1`, dispatched to a real-wire-registered host that reports back a
+    /// clean `exit 0` with `hi` on its console, transitions OFF `Pending` and
+    /// ends `Succeeded` with the real exit code and `hi` reachable in the
+    /// output tail — through the whole real path: `serve_host_executor`
+    /// decoding the registration, `handle(Submit)` placing + dispatching, the
+    /// Dispatch read off the host's own connection, a `JobResult` frame sent
+    /// back over that same connection, and `handle(Status)`/`handle(List)`
+    /// reflecting the stored terminal result. Fails under the pre-#292
+    /// behavior, where the outcome was only logged and the job stayed
+    /// `Pending` forever.
+    #[tokio::test]
+    async fn a_completed_remote_job_ends_succeeded_with_its_exit_and_output() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let allowlist = crate::host_registry::ExecutorAllowlist::new([peer_ip]);
+        let (mut client, server) = tokio::io::duplex(8192);
+
+        sandy_control_proto::write_frame(
+            &mut client,
+            &sandy_executor_proto::HostExecutorMessage {
+                op: Some(sandy_executor_proto::host_executor_message::Op::Register(
+                    sandy_executor_proto::Register {
+                        host_id: "ws01".to_owned(),
+                        capabilities: Some(trusted_host_capabilities()),
+                    },
+                )),
+            },
+        )
+        .await?;
+
+        let host_registry_for_conn = Arc::clone(&host_registry);
+        let store_for_conn = Arc::clone(&store);
+        let serve = tokio::spawn(async move {
+            crate::host_conn::serve_host_executor(
+                Box::new(server),
+                sandy_conn::PeerAddr::Tcp(std::net::SocketAddr::new(peer_ip, 9000)),
+                &allowlist,
+                &host_registry_for_conn,
+                &store_for_conn,
+            )
+            .await;
+        });
+
+        let registered: sandy_executor_proto::OrchestratorMessage = sandy_control_proto::read_frame(&mut client)
+            .await?
+            .context("expected a Registered response")?;
+        assert!(matches!(
+            registered.op,
+            Some(sandy_executor_proto::orchestrator_message::Op::Registered(_))
+        ));
+
+        let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            submit_req_argv(1, &["echo", "hi"]),
+        )
+        .await?;
+        let job_id = match response.result {
+            Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
+            other => anyhow::bail!("expected a Submit response, got {other:?}"),
+        };
+
+        // The Dispatch the host-executor would receive, read off its own wire.
+        let pushed: sandy_executor_proto::OrchestratorMessage = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            sandy_control_proto::read_frame(&mut client),
+        )
+        .await
+        .context("timed out waiting for the Dispatch push")?
+        .context("read_frame faulted")?
+        .context("the connection closed before a Dispatch arrived")?;
+        let dispatch = match pushed.op {
+            Some(sandy_executor_proto::orchestrator_message::Op::Dispatch(dispatch)) => dispatch,
+            other => anyhow::bail!("expected a Dispatch push, got {other:?}"),
+        };
+        assert_eq!(dispatch.job_id, job_id);
+        assert_eq!(dispatch.manifest_encoding, "argv/v1");
+
+        // The host-executor "runs echo hi" and reports a clean exit 0 back over
+        // the same management connection.
+        sandy_control_proto::write_frame(
+            &mut client,
+            &sandy_executor_proto::HostExecutorMessage {
+                op: Some(sandy_executor_proto::host_executor_message::Op::Result(
+                    sandy_executor_proto::JobResult {
+                        job_id: job_id.clone(),
+                        booted: true,
+                        exit_code: Some(0),
+                        timed_out: false,
+                        transport_error: None,
+                        console: "hi\n".to_owned(),
+                    },
+                )),
+            },
+        )
+        .await?;
+
+        let detail = wait_for_terminal(&store, &job_id).await?;
+        assert_eq!(detail.status, sandy_control_proto::JobStatus::Succeeded);
+        assert_eq!(detail.exit_code, Some(0));
+        assert!(
+            detail.console.contains("hi"),
+            "the output tail must carry `hi`: {:?}",
+            detail.console
+        );
+
+        // `handle(Status)` surfaces the same off the real control path.
+        let status = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            req(2, control_request::Op::Status(StatusRequest { job_id: job_id.clone() })),
+        )
+        .await?;
+        match status.result {
+            Some(control_response::Result::Status(sandy_control_proto::StatusResponse {
+                status,
+                exit_code,
+                console_tail,
+                ..
+            })) => {
+                assert_eq!(status, i32::from(sandy_control_proto::JobStatus::Succeeded));
+                assert_eq!(exit_code, Some(0));
+                assert!(
+                    console_tail.contains("hi"),
+                    "status must surface the output tail: {console_tail:?}"
+                );
+            }
+            other => anyhow::bail!("expected a Status response, got {other:?}"),
+        }
+
+        // `list` reflects the terminal status too.
+        let list = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            req(3, control_request::Op::List(ListRequest {})),
+        )
+        .await?;
+        match list.result {
+            Some(control_response::Result::List(ListResponse { jobs })) => {
+                let job = jobs
+                    .iter()
+                    .find(|j| j.job_id == job_id)
+                    .context("the job must be listed")?;
+                assert_eq!(job.status, i32::from(sandy_control_proto::JobStatus::Succeeded));
+            }
+            other => anyhow::bail!("expected a List response, got {other:?}"),
+        }
+
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(5), serve).await??;
+        Ok(())
+    }
+
+    /// Regression (#292, failure path): a job dispatched to a host that then
+    /// disconnects mid-run — without ever reporting a result — must go to a
+    /// terminal FAILED state, never stay stuck `Pending`/`Running` forever.
+    /// Fails under the pre-#292 behavior (no result path, no disconnect
+    /// handling: the job stayed `Pending`).
+    #[tokio::test]
+    async fn a_remote_job_whose_host_disconnects_mid_run_goes_failed() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let allowlist = crate::host_registry::ExecutorAllowlist::new([peer_ip]);
+        let (mut client, server) = tokio::io::duplex(8192);
+
+        sandy_control_proto::write_frame(
+            &mut client,
+            &sandy_executor_proto::HostExecutorMessage {
+                op: Some(sandy_executor_proto::host_executor_message::Op::Register(
+                    sandy_executor_proto::Register {
+                        host_id: "ws01".to_owned(),
+                        capabilities: Some(trusted_host_capabilities()),
+                    },
+                )),
+            },
+        )
+        .await?;
+
+        let host_registry_for_conn = Arc::clone(&host_registry);
+        let store_for_conn = Arc::clone(&store);
+        let serve = tokio::spawn(async move {
+            crate::host_conn::serve_host_executor(
+                Box::new(server),
+                sandy_conn::PeerAddr::Tcp(std::net::SocketAddr::new(peer_ip, 9000)),
+                &allowlist,
+                &host_registry_for_conn,
+                &store_for_conn,
+            )
+            .await;
+        });
+
+        let _registered: sandy_executor_proto::OrchestratorMessage = sandy_control_proto::read_frame(&mut client)
+            .await?
+            .context("expected a Registered response")?;
+
+        let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            submit_req_argv(1, &["echo", "hi"]),
+        )
+        .await?;
+        let job_id = match response.result {
+            Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
+            other => anyhow::bail!("expected a Submit response, got {other:?}"),
+        };
+
+        // Drain the Dispatch so the job is genuinely in flight on the
+        // connection before the host vanishes (this is also what drives the
+        // Pending -> Running mark on the orchestrator side).
+        let _pushed: sandy_executor_proto::OrchestratorMessage = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            sandy_control_proto::read_frame(&mut client),
+        )
+        .await
+        .context("timed out waiting for the Dispatch push")?
+        .context("read_frame faulted")?
+        .context("the connection closed before a Dispatch arrived")?;
+
+        // The host disconnects mid-run, never reporting a result.
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(5), serve).await??;
+
+        let detail = wait_for_terminal(&store, &job_id).await?;
+        assert_eq!(
+            detail.status,
+            sandy_control_proto::JobStatus::Failed,
+            "a job whose host disconnected mid-run must be FAILED, never stuck Pending/Running"
         );
         Ok(())
     }

@@ -14,9 +14,11 @@
 
 use std::time::Duration;
 
+use sandy_api::backend::Outcome;
 use sandy_control_proto::{read_frame, write_frame};
 use sandy_executor_proto::{
-    Capabilities, Dispatch, HostExecutorMessage, OrchestratorMessage, host_executor_message, orchestrator_message,
+    Capabilities, Dispatch, HostExecutorMessage, JobResult, OrchestratorMessage, host_executor_message,
+    orchestrator_message,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -114,6 +116,14 @@ pub enum DispatchLoopExit {
 /// job at a time). Any other frame shape is logged and ignored — stage 1's
 /// orchestrator never sends anything else once registered (`sandyd::
 /// host_conn`'s own doc says the same of an unexpected frame on its side).
+///
+/// `handle` returns the result message to send back for that dispatch (#292):
+/// the loop writes it on the SAME `conn` the Dispatch arrived on, before
+/// reading the next frame, so a job's outcome reaches the orchestrator over
+/// the one management connection rather than being dropped on the floor. A
+/// `None` return sends nothing. A failure writing the result frame ends the
+/// loop as [`DispatchLoopExit::Faulted`], same as any other connection fault —
+/// the supervisor restarts the process (decision 12).
 pub async fn run_dispatch_loop<F, Fut>(
     conn: &mut (impl AsyncRead + AsyncWrite + Unpin),
     mut handle: F,
@@ -121,7 +131,7 @@ pub async fn run_dispatch_loop<F, Fut>(
 ) -> DispatchLoopExit
 where
     F: FnMut(Dispatch) -> Fut,
-    Fut: std::future::Future<Output = ()>,
+    Fut: std::future::Future<Output = Option<HostExecutorMessage>>,
 {
     tokio::pin!(shutdown);
     loop {
@@ -129,7 +139,18 @@ where
             frame = read_frame::<OrchestratorMessage>(conn) => {
                 match frame {
                     Ok(Some(message)) => match message.op {
-                        Some(orchestrator_message::Op::Dispatch(dispatch)) => handle(dispatch).await,
+                        Some(orchestrator_message::Op::Dispatch(dispatch)) => {
+                            // Sequential (decision 14): the Dispatch runs to
+                            // completion here, and its result is written back
+                            // before the next frame is read — conn is free to
+                            // write on, since read_frame already resolved.
+                            if let Some(result) = handle(dispatch).await
+                                && let Err(e) = write_frame(conn, &result).await
+                            {
+                                tracing::warn!(error = %e, "failed writing a job result back to the orchestrator");
+                                return DispatchLoopExit::Faulted(e.to_string());
+                            }
+                        }
                         _ => tracing::debug!("ignoring an unexpected frame from the orchestrator"),
                     },
                     Ok(None) => {
@@ -147,6 +168,45 @@ where
                 return DispatchLoopExit::Shutdown;
             }
         }
+    }
+}
+
+/// Build the `HostExecutorMessage::Result` the host-executor sends back after a
+/// dispatch ran to a physical [`Outcome`] (#292). It carries the facts —
+/// booted, exit code, timeout, transport error, console — for the orchestrator
+/// to classify into a terminal status; it does NOT classify here (the same
+/// physical-outcome/classification split the backend seam draws).
+#[must_use]
+pub fn outcome_result_message(job_id: String, outcome: Outcome) -> HostExecutorMessage {
+    HostExecutorMessage {
+        op: Some(host_executor_message::Op::Result(JobResult {
+            job_id,
+            booted: outcome.booted,
+            exit_code: outcome.guest_exit,
+            timed_out: outcome.timed_out,
+            transport_error: outcome.transport_error,
+            console: outcome.console,
+        })),
+    }
+}
+
+/// Build the `HostExecutorMessage::Result` for a dispatch that never reached a
+/// physical outcome — refused before launch, or the run task itself failed
+/// (#292). Reported as not-booted with no exit and `reason` as the transport
+/// error, so the orchestrator moves the job to a terminal FAILED state instead
+/// of leaving it stuck. `reason` is an error string: never a secret, never the
+/// job's console.
+#[must_use]
+pub fn failure_result_message(job_id: String, reason: String) -> HostExecutorMessage {
+    HostExecutorMessage {
+        op: Some(host_executor_message::Op::Result(JobResult {
+            job_id,
+            booted: false,
+            exit_code: None,
+            timed_out: false,
+            transport_error: Some(reason),
+            console: String::new(),
+        })),
     }
 }
 
@@ -332,6 +392,7 @@ mod tests {
                         seen.lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .push(dispatch.job_id);
+                        None::<HostExecutorMessage>
                     }
                 },
                 async {
@@ -370,9 +431,13 @@ mod tests {
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let loop_task = tokio::spawn(async move {
-            run_dispatch_loop(&mut client, |_dispatch: Dispatch| async {}, async {
-                let _ = shutdown_rx.await;
-            })
+            run_dispatch_loop(
+                &mut client,
+                |_dispatch: Dispatch| async { None::<HostExecutorMessage> },
+                async {
+                    let _ = shutdown_rx.await;
+                },
+            )
             .await
         });
 
@@ -398,9 +463,13 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let exit = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            run_dispatch_loop(&mut client, |_dispatch: Dispatch| async {}, async {
-                let _ = shutdown_rx.await;
-            }),
+            run_dispatch_loop(
+                &mut client,
+                |_dispatch: Dispatch| async { None::<HostExecutorMessage> },
+                async {
+                    let _ = shutdown_rx.await;
+                },
+            ),
         )
         .await
         .context("the loop did not stop once the connection closed")?;
@@ -461,6 +530,7 @@ mod tests {
                         seen.lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .push(dispatch.job_id);
+                        None::<HostExecutorMessage>
                     }
                 },
                 async {
@@ -487,5 +557,114 @@ mod tests {
             vec!["job-1".to_owned()]
         );
         Ok(())
+    }
+
+    /// The load-bearing property for #292: after a dispatch is handled, the
+    /// loop writes the result message `handle` returned back on the SAME
+    /// connection the Dispatch arrived on, so the orchestrator actually
+    /// receives it. The fix exists because the result was previously only
+    /// logged and never sent.
+    #[tokio::test]
+    async fn the_dispatch_loop_sends_the_result_back_on_the_same_connection() -> anyhow::Result<()> {
+        let (mut client, mut server) = tokio::io::duplex(8192);
+
+        // Orchestrator side: push one Dispatch, then read the frame the loop
+        // sends back. Returns `server` (not dropped) so the loop ends on the
+        // explicit shutdown below, not on a close racing the result write.
+        let orchestrator = tokio::spawn(async move {
+            write_frame(
+                &mut server,
+                &OrchestratorMessage {
+                    op: Some(orchestrator_message::Op::Dispatch(Dispatch {
+                        job_id: "job-1".to_owned(),
+                        manifest: Vec::new(),
+                        manifest_encoding: String::new(),
+                        backend: SandboxKind::Process.into(),
+                        link_token: vec![0u8; 32],
+                        forward_back: "127.0.0.1:9000".to_owned(),
+                        required_isolation_class: IsolationClass::Trusted.into(),
+                    })),
+                },
+            )
+            .await?;
+            let result: HostExecutorMessage = read_frame(&mut server).await?.context("expected a result frame")?;
+            Ok::<_, anyhow::Error>((server, result))
+        });
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let loop_task = tokio::spawn(async move {
+            run_dispatch_loop(
+                &mut client,
+                // Stand in for handle_dispatch: return a result for the job.
+                |dispatch: Dispatch| async move { Some(failure_result_message(dispatch.job_id, "boom".to_owned())) },
+                async {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+        });
+
+        let (_server, result) = tokio::time::timeout(std::time::Duration::from_secs(2), orchestrator)
+            .await
+            .context("orchestrator task did not finish")??
+            .context("orchestrator task failed")?;
+        match result.op {
+            Some(host_executor_message::Op::Result(r)) => {
+                assert_eq!(r.job_id, "job-1");
+                assert_eq!(r.transport_error.as_deref(), Some("boom"));
+                assert!(!r.booted);
+                assert_eq!(r.exit_code, None);
+            }
+            other => anyhow::bail!("expected a JobResult frame, got {other:?}"),
+        }
+
+        let _ = shutdown_tx.send(());
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(2), loop_task)
+            .await
+            .context("dispatch loop did not stop after shutdown")?
+            .context("dispatch loop task panicked")?;
+        assert_eq!(exit, DispatchLoopExit::Shutdown);
+        Ok(())
+    }
+
+    #[test]
+    fn outcome_result_message_carries_the_physical_outcome_verbatim() {
+        let outcome = Outcome {
+            booted: true,
+            guest_exit: Some(0),
+            transport_error: None,
+            timed_out: false,
+            console: "hi\n".to_owned(),
+        };
+        let message = outcome_result_message("job-1".to_owned(), outcome);
+        match message.op {
+            Some(host_executor_message::Op::Result(result)) => {
+                assert_eq!(result.job_id, "job-1");
+                assert!(result.booted);
+                assert_eq!(result.exit_code, Some(0));
+                assert!(!result.timed_out);
+                assert_eq!(result.transport_error, None);
+                assert_eq!(result.console, "hi\n");
+            }
+            other => panic!("expected a JobResult, got {other:?}"),
+        }
+    }
+
+    /// A refusal/panic reports a failure the orchestrator can move to FAILED:
+    /// not booted, no exit, the reason as the transport error, empty console.
+    #[test]
+    fn failure_result_message_reports_no_exit_and_the_reason() {
+        let message = failure_result_message("job-1".to_owned(), "refused".to_owned());
+        match message.op {
+            Some(host_executor_message::Op::Result(result)) => {
+                assert_eq!(result.job_id, "job-1");
+                assert!(!result.booted);
+                assert_eq!(result.exit_code, None);
+                assert!(!result.timed_out);
+                assert_eq!(result.transport_error.as_deref(), Some("refused"));
+                assert!(result.console.is_empty());
+            }
+            other => panic!("expected a JobResult, got {other:?}"),
+        }
     }
 }

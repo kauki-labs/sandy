@@ -6,14 +6,20 @@
 //! machinery for stage 1 (#269): a host that disconnects is simply gone until
 //! it reconnects and registers again.
 
+use std::{collections::HashSet, sync::Arc};
+
 use sandy_conn::{Conn, PeerAddr};
-use sandy_control_proto::{FrameError, read_frame, write_frame};
+use sandy_control_proto::{FrameError, JobStatus, read_frame, write_frame};
 use sandy_executor_proto::{
-    HostExecutorMessage, OrchestratorMessage, RegisterRefused, Registered, host_executor_message, orchestrator_message,
+    HostExecutorMessage, JobResult, OrchestratorMessage, RegisterRefused, Registered, host_executor_message,
+    orchestrator_message,
 };
 use tokio::sync::mpsc;
 
-use crate::host_registry::{ExecutorAllowlist, HostRegistry, RegisterError, Registration};
+use crate::{
+    host_registry::{ExecutorAllowlist, HostRegistry, RegisterError, Registration},
+    store::{JobStore, Transition},
+};
 
 /// How long a freshly accepted connection has to send its `Register` frame
 /// before it's closed. Without a deadline here, a peer that opens a
@@ -54,6 +60,7 @@ pub async fn serve_host_executor(
     peer: PeerAddr,
     allowlist: &ExecutorAllowlist,
     registry: &HostRegistry,
+    store: &Arc<JobStore>,
 ) {
     let peer_ip = match peer {
         PeerAddr::Tcp(addr) => addr.ip(),
@@ -194,6 +201,14 @@ pub async fn serve_host_executor(
     let (frame_tx, mut frame_rx) = mpsc::channel(1);
     let reader_task = tokio::spawn(forward_frames(read_half, frame_tx));
 
+    // Jobs dispatched down this connection that have not yet reported a result
+    // (#292). A job is added once its Dispatch is actually written to the wire,
+    // and removed when its `JobResult` arrives; whatever remains when the
+    // connection ends never ran to a reported result and is failed terminally
+    // below, so a job can never stay stuck PENDING/RUNNING after its host is
+    // gone.
+    let mut in_flight: HashSet<String> = HashSet::new();
+
     loop {
         tokio::select! {
             dispatch = dispatch_rx.recv() => {
@@ -203,13 +218,20 @@ pub async fn serve_host_executor(
                     // registry entry was already replaced or removed.
                     break;
                 };
+                let job_id = dispatch.job_id.clone();
                 match tokio::time::timeout(
                     DISPATCH_WRITE_TIMEOUT,
                     write_frame(&mut write_half, &OrchestratorMessage { op: Some(orchestrator_message::Op::Dispatch(dispatch)) }),
                 )
                 .await
                 {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => {
+                        // The dispatch reached the host: advance the job
+                        // PENDING -> RUNNING and track it until its result
+                        // comes back (or the connection dies).
+                        in_flight.insert(job_id.clone());
+                        mark_job_running(store, &job_id).await;
+                    }
                     Ok(Err(_)) => {
                         tracing::warn!(host_id, "failed writing Dispatch to host-executor; closing");
                         break;
@@ -222,12 +244,15 @@ pub async fn serve_host_executor(
             }
             frame = frame_rx.recv() => {
                 match frame {
-                    Some(Ok(Some(_))) => {
+                    Some(Ok(Some(message))) => match message.op {
+                        Some(host_executor_message::Op::Result(result)) => {
+                            record_job_result(store, &mut in_flight, result).await;
+                        }
                         // Stage 1 has no re-registration or capability-update
-                        // machinery (#269): any further frame from the
+                        // machinery (#269): any other frame from the
                         // host-executor is unexpected but not fatal on its own.
-                        tracing::debug!(host_id, "ignoring an unexpected frame from a registered host-executor");
-                    }
+                        _ => tracing::debug!(host_id, "ignoring an unexpected frame from a registered host-executor"),
+                    },
                     Some(Ok(None)) => break, // clean close: the ordinary end of a connection
                     Some(Err(e)) => {
                         tracing::warn!(host_id, error = %e, "host-executor connection faulted");
@@ -258,8 +283,110 @@ pub async fn serve_host_executor(
     reader_task.abort();
     let _ = reader_task.await;
 
+    // The connection is gone. Any job still in flight on it never reported a
+    // result and never will (decision 12: no reconnect, no redelivery) — fail
+    // it terminally rather than leaving it stuck PENDING/RUNNING forever
+    // (#292). `finish` refuses from a terminal state, so a job that reported
+    // just before the close, or was cancelled, is left as-is.
+    for job_id in in_flight {
+        fail_disconnected_job(store, &job_id).await;
+    }
+
     registry.remove(&host_id, registration);
     tracing::info!(host_id, "host-executor disconnected");
+}
+
+/// Classify a reported [`JobResult`] into the terminal [`JobStatus`] to record
+/// and the exit code to keep with it. The host reports physical facts; the
+/// orchestrator decides the band (the same split the backend seam draws). A
+/// clean `exit 0` — no timeout, no transport fault — is the only `Succeeded`;
+/// a non-zero exit, a timeout, a transport fault, or a run that never produced
+/// an exit at all is `Failed`, carrying whatever exit code it did report (which
+/// may be none).
+fn classify(result: &JobResult) -> (JobStatus, Option<i32>) {
+    match result.exit_code {
+        Some(0) if !result.timed_out && result.transport_error.is_none() => (JobStatus::Succeeded, Some(0)),
+        other => (JobStatus::Failed, other),
+    }
+}
+
+/// Advance a dispatched job PENDING -> RUNNING off the connection task, via the
+/// store's synchronous connection on a blocking thread. Best-effort: a store
+/// fault is logged, never fatal to the connection — the dispatch already went
+/// out, and a later result or disconnect still drives the job terminal.
+async fn mark_job_running(store: &Arc<JobStore>, job_id: &str) {
+    let store = Arc::clone(store);
+    let jid = job_id.to_owned();
+    match tokio::task::spawn_blocking(move || store.mark_running(&jid)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::warn!(job_id, error = %e, "could not mark the dispatched job running"),
+        Err(e) => tracing::warn!(job_id, error = %e, "the mark-running store task failed"),
+    }
+}
+
+/// Record a host-executor's reported result for one job, moving it to its
+/// terminal state (#292), and drop it from `in_flight` so a later disconnect
+/// does not then also fail it.
+///
+/// NEVER logs `result.console`: it carries up to ~64 KiB of the job's OWN
+/// stdout/stderr, which belongs in the job's record for `status`/`attach` to
+/// surface, not in this host's own journald logs (INV-1, the host-executor's
+/// matching no-log-the-console discipline on the other end).
+async fn record_job_result(store: &Arc<JobStore>, in_flight: &mut HashSet<String>, result: JobResult) {
+    let (status, exit_code) = classify(&result);
+    let job_id = result.job_id.clone();
+    in_flight.remove(&job_id);
+
+    let store = Arc::clone(store);
+    let console = result.console;
+    let jid = job_id.clone();
+    let transition = tokio::task::spawn_blocking(move || store.finish(&jid, status, exit_code, &console)).await;
+    match transition {
+        Ok(Ok(Transition::Applied)) => tracing::info!(job_id, ?status, ?exit_code, "recorded a job result"),
+        Ok(Ok(Transition::Refused(current))) => {
+            tracing::info!(
+                job_id,
+                ?current,
+                "a job result arrived for an already-terminal job; keeping the existing one"
+            )
+        }
+        Ok(Ok(Transition::NotFound)) => {
+            tracing::warn!(job_id, "a job result arrived for a job this daemon does not know")
+        }
+        Ok(Err(e)) => tracing::warn!(job_id, error = %e, "could not record the job result"),
+        Err(e) => tracing::warn!(job_id, error = %e, "the record-result store task failed"),
+    }
+}
+
+/// Fail a job whose host-executor disconnected before reporting a result
+/// (#292). `finish` refuses from a terminal state, so this is a no-op for a job
+/// that reached a terminal status (a result that raced the close, a cancel)
+/// just before the connection ended.
+async fn fail_disconnected_job(store: &Arc<JobStore>, job_id: &str) {
+    let store = Arc::clone(store);
+    let jid = job_id.to_owned();
+    let transition = tokio::task::spawn_blocking(move || {
+        store.finish(
+            &jid,
+            JobStatus::Failed,
+            None,
+            "host-executor disconnected before reporting a result",
+        )
+    })
+    .await;
+    match transition {
+        Ok(Ok(Transition::Applied)) => {
+            tracing::warn!(
+                job_id,
+                "failed an in-flight job: its host-executor disconnected before reporting a result"
+            )
+        }
+        // Already terminal (a result raced the close, or the job was
+        // cancelled): nothing to fail.
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::warn!(job_id, error = %e, "could not fail the in-flight job after a disconnect"),
+        Err(e) => tracing::warn!(job_id, error = %e, "the disconnect-fail store task failed"),
+    }
 }
 
 /// Reads frames from `read_half` sequentially — never raced against anything
@@ -367,6 +494,14 @@ mod tests {
         PeerAddr::Tcp(SocketAddr::new(ip.parse().expect("ip literal"), 9000))
     }
 
+    /// A throwaway in-memory store for the connection-protocol tests that do
+    /// not assert on job state — the dedicated result-propagation coverage
+    /// lives in `handler.rs`'s real-wire tests, which drive `handle` + the
+    /// store together.
+    fn test_store() -> Arc<JobStore> {
+        Arc::new(JobStore::open_in_memory().expect("in-memory store"))
+    }
+
     fn capabilities() -> Capabilities {
         Capabilities {
             kind: SandboxKind::Process.into(),
@@ -399,7 +534,14 @@ mod tests {
             let registry = std::sync::Arc::clone(&registry);
             let allowlist = std::sync::Arc::clone(&allowlist);
             async move {
-                serve_host_executor(Box::new(server), tcp_peer("100.64.0.7"), &allowlist, &registry).await;
+                serve_host_executor(
+                    Box::new(server),
+                    tcp_peer("100.64.0.7"),
+                    &allowlist,
+                    &registry,
+                    &test_store(),
+                )
+                .await;
             }
         });
 
@@ -468,7 +610,14 @@ mod tests {
             let registry = std::sync::Arc::clone(&registry);
             let allowlist = std::sync::Arc::clone(&allowlist);
             async move {
-                serve_host_executor(Box::new(server), tcp_peer("100.64.0.7"), &allowlist, &registry).await;
+                serve_host_executor(
+                    Box::new(server),
+                    tcp_peer("100.64.0.7"),
+                    &allowlist,
+                    &registry,
+                    &test_store(),
+                )
+                .await;
             }
         });
 
@@ -507,7 +656,14 @@ mod tests {
         .await?;
 
         let serving = tokio::spawn(async move {
-            serve_host_executor(Box::new(server), tcp_peer("100.64.0.9"), &allowlist, &registry).await;
+            serve_host_executor(
+                Box::new(server),
+                tcp_peer("100.64.0.9"),
+                &allowlist,
+                &registry,
+                &test_store(),
+            )
+            .await;
             registry
         });
 
@@ -544,7 +700,14 @@ mod tests {
         .await?;
 
         let serving = tokio::spawn(async move {
-            serve_host_executor(Box::new(server), tcp_peer("100.64.0.9"), &allowlist, &registry).await;
+            serve_host_executor(
+                Box::new(server),
+                tcp_peer("100.64.0.9"),
+                &allowlist,
+                &registry,
+                &test_store(),
+            )
+            .await;
         });
 
         let response: OrchestratorMessage = read_frame(&mut client).await?.context("expected a response")?;
@@ -569,7 +732,14 @@ mod tests {
         let (client, server) = tokio::io::duplex(4096);
 
         let serving = tokio::spawn(async move {
-            serve_host_executor(Box::new(server), tcp_peer("100.64.0.7"), &allowlist, &registry).await;
+            serve_host_executor(
+                Box::new(server),
+                tcp_peer("100.64.0.7"),
+                &allowlist,
+                &registry,
+                &test_store(),
+            )
+            .await;
         });
 
         tokio::time::advance(REGISTER_TIMEOUT + std::time::Duration::from_millis(1)).await;
@@ -616,7 +786,14 @@ mod tests {
             let registry = std::sync::Arc::clone(&registry);
             let allowlist = std::sync::Arc::clone(&allowlist);
             async move {
-                serve_host_executor(Box::new(server), tcp_peer("100.64.0.7"), &allowlist, &registry).await;
+                serve_host_executor(
+                    Box::new(server),
+                    tcp_peer("100.64.0.7"),
+                    &allowlist,
+                    &registry,
+                    &test_store(),
+                )
+                .await;
             }
         });
 
@@ -764,7 +941,14 @@ mod tests {
             let registry = std::sync::Arc::clone(&registry);
             let allowlist = std::sync::Arc::clone(&allowlist);
             async move {
-                serve_host_executor(Box::new(server), tcp_peer("100.64.0.7"), &allowlist, &registry).await;
+                serve_host_executor(
+                    Box::new(server),
+                    tcp_peer("100.64.0.7"),
+                    &allowlist,
+                    &registry,
+                    &test_store(),
+                )
+                .await;
             }
         });
 
@@ -870,7 +1054,14 @@ mod tests {
             let registry = std::sync::Arc::clone(&registry);
             let allowlist = std::sync::Arc::clone(&allowlist);
             async move {
-                serve_host_executor(Box::new(server), tcp_peer("100.64.0.7"), &allowlist, &registry).await;
+                serve_host_executor(
+                    Box::new(server),
+                    tcp_peer("100.64.0.7"),
+                    &allowlist,
+                    &registry,
+                    &test_store(),
+                )
+                .await;
             }
         });
 

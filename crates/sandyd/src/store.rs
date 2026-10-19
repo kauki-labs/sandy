@@ -51,6 +51,21 @@ pub enum CancelOutcome {
     AlreadyTerminal(JobStatus),
 }
 
+/// What a lifecycle transition ([`JobStore::mark_running`]/[`JobStore::finish`])
+/// did to a job row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transition {
+    /// The row moved to the requested state.
+    Applied,
+    /// No job has this id.
+    NotFound,
+    /// The job was not in a state this transition applies from, so it was
+    /// refused, not applied — a late result never clobbers an already-terminal
+    /// row (a cancelled job stays cancelled; a job that already reported a
+    /// result keeps it). Carries the status the row actually held.
+    Refused(JobStatus),
+}
+
 /// One submitted job's row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobSummary {
@@ -58,6 +73,22 @@ pub struct JobSummary {
     pub job_id: String,
     /// Its current lifecycle status.
     pub status: JobStatus,
+}
+
+/// A job's status plus the terminal detail a finished run reported back
+/// (#292): the guest exit code it classified the status from, and a bounded
+/// tail of the job's own console output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobDetail {
+    /// Its current lifecycle status.
+    pub status: JobStatus,
+    /// The guest exit code a terminal run reported, if it produced one. `None`
+    /// while non-terminal, or for a terminal state with no exit (infra fault,
+    /// timeout, cancel).
+    pub exit_code: Option<i32>,
+    /// A bounded tail of the job's own stdout/stderr, empty until a run
+    /// reports one back.
+    pub console: String,
 }
 
 /// The `jobs` table behind a single `rusqlite` connection.
@@ -96,6 +127,17 @@ impl JobStore {
                 updated_at         INTEGER NOT NULL
             )",
             (),
+        )?;
+        // Add the terminal-result columns (#292) to a table created before
+        // they existed. `CREATE TABLE IF NOT EXISTS` above never alters an
+        // existing table, so a `jobs` table from an earlier sandyd would
+        // otherwise lack these and every `finish`/`detail` query would fail;
+        // add each only if absent (SQLite has no `ADD COLUMN IF NOT EXISTS`).
+        ensure_column(&conn, "exit_code", "ALTER TABLE jobs ADD COLUMN exit_code INTEGER")?;
+        ensure_column(
+            &conn,
+            "console",
+            "ALTER TABLE jobs ADD COLUMN console TEXT NOT NULL DEFAULT ''",
         )?;
         Ok(Self { conn: Mutex::new(conn) })
     }
@@ -156,6 +198,91 @@ impl JobStore {
         Ok(CancelOutcome::Cancelled)
     }
 
+    /// Move `job_id` from `Pending` to `Running` — the dispatch actually
+    /// reached its host (#292). Refused (not applied) from any other state, so
+    /// a late or duplicate mark never pulls a terminal or cancelled job back
+    /// to `Running`.
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] if the read or write fails;
+    /// [`StoreError::CorruptStatus`] if the stored status string is not a
+    /// recognised [`JobStatus`].
+    pub fn mark_running(&self, job_id: &str) -> Result<Transition, StoreError> {
+        let conn = self.lock();
+        let Some(current) = query_status(&conn, job_id)? else {
+            return Ok(Transition::NotFound);
+        };
+        if current != JobStatus::Pending {
+            return Ok(Transition::Refused(current));
+        }
+        conn.execute(
+            "UPDATE jobs SET status = ?1, updated_at = ?2 WHERE job_id = ?3",
+            (status_name(JobStatus::Running), now_unix(), job_id),
+        )?;
+        Ok(Transition::Applied)
+    }
+
+    /// Record a terminal result for `job_id`: its final `status`, the guest
+    /// `exit_code` (if any), and a bounded `console` tail (#292). Applies only
+    /// from `Pending` or `Running`; refused from any terminal state, so a
+    /// result arriving after a cancel (decision 12: a cancel cannot retract an
+    /// already-dispatched job) never overwrites `Cancelled`, and a second
+    /// result never overwrites the first.
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] if the read or write fails;
+    /// [`StoreError::CorruptStatus`] if the stored status string is not a
+    /// recognised [`JobStatus`].
+    pub fn finish(
+        &self,
+        job_id: &str,
+        status: JobStatus,
+        exit_code: Option<i32>,
+        console: &str,
+    ) -> Result<Transition, StoreError> {
+        let conn = self.lock();
+        let Some(current) = query_status(&conn, job_id)? else {
+            return Ok(Transition::NotFound);
+        };
+        if !matches!(current, JobStatus::Pending | JobStatus::Running) {
+            return Ok(Transition::Refused(current));
+        }
+        conn.execute(
+            "UPDATE jobs SET status = ?1, exit_code = ?2, console = ?3, updated_at = ?4 WHERE job_id = ?5",
+            (status_name(status), exit_code, console, now_unix(), job_id),
+        )?;
+        Ok(Transition::Applied)
+    }
+
+    /// `job_id`'s status plus any terminal detail (exit code, console tail), or
+    /// `None` if no such job exists.
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] if the read fails; [`StoreError::CorruptStatus`]
+    /// if the stored status string is not a recognised [`JobStatus`].
+    pub fn detail(&self, job_id: &str) -> Result<Option<JobDetail>, StoreError> {
+        let conn = self.lock();
+        match conn.query_row(
+            "SELECT status, exit_code, console FROM jobs WHERE job_id = ?1",
+            [job_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i32>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        ) {
+            Ok((raw_status, exit_code, console)) => Ok(Some(JobDetail {
+                status: parse_status(job_id, &raw_status)?,
+                exit_code,
+                console,
+            })),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Every job's id and current status, in no particular guaranteed order
     /// beyond SQLite's own default row order.
     ///
@@ -205,6 +332,19 @@ fn parse_status(job_id: &str, raw: &str) -> Result<JobStatus, StoreError> {
         job_id: job_id.to_owned(),
         raw: raw.to_owned(),
     })
+}
+
+/// Run `add_column_sql` only if `column` is not already on the `jobs` table —
+/// an idempotent `ADD COLUMN IF NOT EXISTS`, which SQLite itself lacks. Reads
+/// `PRAGMA table_info` rather than matching on the "duplicate column" error
+/// string, so it stays correct regardless of SQLite's error wording.
+fn ensure_column(conn: &Connection, column: &str, add_column_sql: &str) -> Result<(), StoreError> {
+    let mut stmt = conn.prepare("SELECT name FROM pragma_table_info('jobs') WHERE name = ?1")?;
+    let present = stmt.exists([column])?;
+    if !present {
+        conn.execute(add_column_sql, ())?;
+    }
+    Ok(())
 }
 
 fn now_unix() -> i64 {
@@ -286,6 +426,149 @@ mod tests {
         store.insert_pending("job-1", b"first", "test/v1")?;
         let result = store.insert_pending("job-1", b"second", "test/v1");
         assert!(result.is_err(), "a duplicate job_id must not silently succeed");
+        Ok(())
+    }
+
+    /// A dispatched job advances Pending -> Running, then records a terminal
+    /// result with its real exit code and console tail (#292) — the whole
+    /// PENDING -> RUNNING -> SUCCEEDED path a completed remote run drives.
+    #[test]
+    fn a_job_advances_pending_running_then_records_its_result() -> Result<(), StoreError> {
+        let store = JobStore::open_in_memory()?;
+        store.insert_pending("job-1", b"m", "argv/v1")?;
+
+        assert_eq!(store.mark_running("job-1")?, Transition::Applied);
+        assert_eq!(store.status("job-1")?, Some(JobStatus::Running));
+
+        assert_eq!(
+            store.finish("job-1", JobStatus::Succeeded, Some(0), "hi\n")?,
+            Transition::Applied
+        );
+        assert_eq!(
+            store.detail("job-1")?,
+            Some(JobDetail {
+                status: JobStatus::Succeeded,
+                exit_code: Some(0),
+                console: "hi\n".to_owned(),
+            })
+        );
+        Ok(())
+    }
+
+    /// A non-zero exit is still recorded faithfully — the raw code is kept
+    /// even when the orchestrator classifies the band as Failed.
+    #[test]
+    fn finish_records_a_non_zero_exit_code() -> Result<(), StoreError> {
+        let store = JobStore::open_in_memory()?;
+        store.insert_pending("job-1", b"m", "argv/v1")?;
+        store.mark_running("job-1")?;
+
+        store.finish("job-1", JobStatus::Failed, Some(3), "boom\n")?;
+        let detail = store.detail("job-1")?.expect("job-1 exists");
+        assert_eq!(detail.status, JobStatus::Failed);
+        assert_eq!(detail.exit_code, Some(3));
+        Ok(())
+    }
+
+    /// Adversarial (decision 12): a result arriving after a cancel must not
+    /// overwrite `Cancelled` — the cancel is the terminal truth, the stale
+    /// run's late result is refused, not applied.
+    #[test]
+    fn a_result_after_cancel_is_refused_not_applied() -> Result<(), StoreError> {
+        let store = JobStore::open_in_memory()?;
+        store.insert_pending("job-1", b"m", "argv/v1")?;
+        store.cancel("job-1")?;
+
+        assert_eq!(
+            store.finish("job-1", JobStatus::Succeeded, Some(0), "hi\n")?,
+            Transition::Refused(JobStatus::Cancelled)
+        );
+        assert_eq!(store.status("job-1")?, Some(JobStatus::Cancelled));
+        Ok(())
+    }
+
+    /// Adversarial: a second result never overwrites the first terminal one.
+    #[test]
+    fn a_second_result_is_refused() -> Result<(), StoreError> {
+        let store = JobStore::open_in_memory()?;
+        store.insert_pending("job-1", b"m", "argv/v1")?;
+        store.mark_running("job-1")?;
+        store.finish("job-1", JobStatus::Succeeded, Some(0), "first")?;
+
+        assert_eq!(
+            store.finish("job-1", JobStatus::Failed, Some(1), "second")?,
+            Transition::Refused(JobStatus::Succeeded)
+        );
+        let detail = store.detail("job-1")?.expect("job-1 exists");
+        assert_eq!(detail.exit_code, Some(0));
+        assert_eq!(detail.console, "first");
+        Ok(())
+    }
+
+    /// `mark_running`/`finish` on an unknown job report `NotFound`, never a
+    /// silent success.
+    #[test]
+    fn transitions_on_an_unknown_job_are_not_found() -> Result<(), StoreError> {
+        let store = JobStore::open_in_memory()?;
+        assert_eq!(store.mark_running("ghost")?, Transition::NotFound);
+        assert_eq!(
+            store.finish("ghost", JobStatus::Succeeded, Some(0), "")?,
+            Transition::NotFound
+        );
+        Ok(())
+    }
+
+    /// `mark_running` is refused once a job is no longer Pending, so a late or
+    /// duplicate dispatch mark can't drag a terminal job back to Running.
+    #[test]
+    fn mark_running_is_refused_once_terminal() -> Result<(), StoreError> {
+        let store = JobStore::open_in_memory()?;
+        store.insert_pending("job-1", b"m", "argv/v1")?;
+        store.mark_running("job-1")?;
+        store.finish("job-1", JobStatus::Succeeded, Some(0), "")?;
+
+        assert_eq!(store.mark_running("job-1")?, Transition::Refused(JobStatus::Succeeded));
+        Ok(())
+    }
+
+    /// Migration (#292): a `jobs` table created before the result columns
+    /// existed gets them added, so `finish`/`detail` work against a store
+    /// opened on an older on-disk schema instead of failing on a missing
+    /// column.
+    #[test]
+    fn an_old_schema_without_result_columns_is_migrated() -> Result<(), StoreError> {
+        let conn = Connection::open_in_memory()?;
+        // The exact pre-#292 schema: no exit_code, no console.
+        conn.execute(
+            "CREATE TABLE jobs (
+                job_id             TEXT PRIMARY KEY,
+                status             TEXT NOT NULL,
+                manifest           BLOB NOT NULL,
+                manifest_encoding  TEXT NOT NULL,
+                created_at         INTEGER NOT NULL,
+                updated_at         INTEGER NOT NULL
+            )",
+            (),
+        )?;
+        conn.execute(
+            "INSERT INTO jobs VALUES ('job-1', 'JOB_STATUS_PENDING', X'6d', 'argv/v1', 0, 0)",
+            (),
+        )?;
+
+        let store = JobStore::from_connection(conn)?;
+        store.mark_running("job-1")?;
+        assert_eq!(
+            store.finish("job-1", JobStatus::Succeeded, Some(0), "hi\n")?,
+            Transition::Applied
+        );
+        assert_eq!(
+            store.detail("job-1")?,
+            Some(JobDetail {
+                status: JobStatus::Succeeded,
+                exit_code: Some(0),
+                console: "hi\n".to_owned(),
+            })
+        );
         Ok(())
     }
 
