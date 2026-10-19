@@ -1,12 +1,14 @@
 # Host-executor: capability-declaring cross-machine dispatch + overlay delivery
 
-Status: stage 1 shipped. The seam this doc designed landed as `sandy-executor-proto`
+Status: stage 1 implementation is present, but executor-side orchestrator authentication
+remains open. The seam this doc designed landed as `sandy-executor-proto`
 (the registration + dispatch contract), the `sandyd` control plane, and the
 `sandy-host-executor` crate — #310 renamed that crate from the original "host-client".
 Frames #263 (dispatch RPC), decision-6 (the mesh accept-loop auth gate), the WS01
 standup, and the nix overlay. One target is built (a NixOS host, trusted process); the
 seam is designed so later targets slot in without a contract change. The open stage-1
-item is result propagation back to the orchestrator (#292, see Acceptance).
+items are executor-side orchestrator authentication and result propagation back to the
+orchestrator (#292, see Acceptance).
 
 ## Context
 
