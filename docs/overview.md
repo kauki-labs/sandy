@@ -2,7 +2,7 @@
 title: sandy overview
 kind: overview
 project: sandy
-updated: 2026-10-17
+updated: 2026-10-19
 ---
 
 # sandy overview
@@ -72,3 +72,42 @@ submitter-bounded capability derivation).
 
 As above, check epic #205 for which blocks are merged. Decisions:
 [`decisions/sandyd.md`](decisions/sandyd.md).
+
+### Milestone 2 — cross-machine dispatch
+
+M2 runs a sandboxed job on a different machine than the one that submitted it.
+The macOS orchestrator (`sandyd`) places a job on a registered remote NixOS host
+(`ws01`), which runs it in a `bwrap` sandbox under `systemd-run --user` with
+`sandy-agent` inside, and links the agent back to the orchestrator over the mesh.
+Stage 1 is **trusted-process** only; untrusted/VM isolation is a later backend
+(see #269's design and `decisions/sandyd.md`).
+
+The flow and the crates it added:
+
+- **`sandy-executor-proto`** — the orchestrator↔host-executor contract:
+  `Register`/`Registered`/`RegisterRefused`, `Dispatch`, `Capabilities`,
+  `IsolationClass`, and the agent-link prefix encode/decode.
+- **`sandyd`** — the control plane (`submit`/`status`/`list`/`cancel`/`attach`
+  over the UDS), the `HostRegistry`, the mesh listener, `pick_host_for`
+  placement by isolation class, the decision-6 agent-link accept loop, and the
+  dispatch relay.
+- **`sandy-host-executor`** — dials the orchestrator, probes its containment,
+  `Register`s, then handles each `Dispatch` sequentially: decode the argv/v1
+  manifest, **re-check the isolation class independently** (defense in depth),
+  launch via `ProcessBackend`, and relay the agent link back.
+- **`sandy-agent`** + **`impls/local`** (`SystemdRunContainment`,
+  `ProcessBackend`) run and contain the job on the host.
+- Nix overlays plus a hardened `services.sandy-executor` nixosModule deploy the
+  executor onto a user-specified base.
+
+### Known gaps and operations
+
+- **Result observability (open).** A completed job still reads
+  `JOB_STATUS_PENDING` in the orchestrator — the exit code and output do not
+  propagate back yet (#292, item 5). A separate change wires this through; until
+  it lands, treat orchestrator job status as dispatch state, not job result.
+- **Watching the deployed executor.** Its own logs land in the **user** journal,
+  not the system unit: tail `journalctl _UID=992 -f`, not
+  `journalctl -u sandy-executor`. `PAMName=login` puts the process in the user
+  session scope that owns the `systemd-run --user` scopes, so the unit's own
+  journal stays empty.
