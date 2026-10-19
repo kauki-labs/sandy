@@ -7,10 +7,11 @@
 //! it reconnects and registers again.
 
 use sandy_conn::{Conn, PeerAddr};
-use sandy_control_proto::{read_frame, write_frame};
+use sandy_control_proto::{FrameError, read_frame, write_frame};
 use sandy_executor_proto::{
     HostExecutorMessage, OrchestratorMessage, RegisterRefused, Registered, host_executor_message, orchestrator_message,
 };
+use tokio::sync::mpsc;
 
 use crate::host_registry::{ExecutorAllowlist, HostRegistry, RegisterError};
 
@@ -46,7 +47,8 @@ const DISPATCH_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// since no registry entry exists yet, which is why they're deliberately
 /// deferred. The one write that mattered more — the registered `Dispatch`
 /// push, which stalls a live, dispatch-eligible registry entry — has
-/// [`DISPATCH_WRITE_TIMEOUT`] (#289 item 2, landed).
+/// [`DISPATCH_WRITE_TIMEOUT`] (#289 item 2, landed). The connection loop's
+/// own read is cancel-safe (#289 item 3, landed) via [`forward_frames`].
 pub async fn serve_host_executor(
     mut conn: Box<dyn Conn>,
     peer: PeerAddr,
@@ -165,16 +167,21 @@ pub async fn serve_host_executor(
     }
     tracing::info!(peer = %peer_ip, host_id, "host-executor registered");
 
+    // Split the connection here, not before: the handshake above never races
+    // `read_frame` against anything else (each `.await` runs to completion or
+    // the whole connection ends), so it's cancel-safe without this. The loop
+    // below is not — it needs to select! a read against `dispatch_rx.recv()`
+    // — so reading happens in its own task from here on, forwarding complete
+    // frames over `frame_rx`: a channel `recv()` is cancel-safe (a dropped
+    // `.await` never loses a value already sent), unlike `read_frame` itself,
+    // which does separate awaits for the length prefix and the payload and
+    // would drop whatever it had read so far if raced and cancelled
+    // mid-frame (#289 item 3).
+    let (read_half, mut write_half) = tokio::io::split(conn);
+    let (frame_tx, mut frame_rx) = mpsc::channel(1);
+    tokio::spawn(forward_frames(read_half, frame_tx));
+
     loop {
-        // CAUTION (#289): read_frame below is not cancel-safe (it does
-        // separate reads for the length prefix and the payload). Safe only
-        // because the other branch never fires mid-read today — stage 1 has
-        // no host-executor-to-orchestrator message after Register, so this
-        // branch never actually resolves. Adding one makes a `Dispatch`
-        // arriving mid-read drop the partially-consumed frame and desync
-        // framing on the next read. Make this cancel-safe (split the
-        // connection, read frames in a dedicated task) before adding any
-        // such message — see #289.
         tokio::select! {
             dispatch = dispatch_rx.recv() => {
                 let Some(dispatch) = dispatch else {
@@ -185,7 +192,7 @@ pub async fn serve_host_executor(
                 };
                 match tokio::time::timeout(
                     DISPATCH_WRITE_TIMEOUT,
-                    write_frame(&mut conn, &OrchestratorMessage { op: Some(orchestrator_message::Op::Dispatch(dispatch)) }),
+                    write_frame(&mut write_half, &OrchestratorMessage { op: Some(orchestrator_message::Op::Dispatch(dispatch)) }),
                 )
                 .await
                 {
@@ -200,19 +207,25 @@ pub async fn serve_host_executor(
                     }
                 }
             }
-            frame = read_frame::<HostExecutorMessage>(&mut conn) => {
+            frame = frame_rx.recv() => {
                 match frame {
-                    Ok(Some(_)) => {
+                    Some(Ok(Some(_))) => {
                         // Stage 1 has no re-registration or capability-update
                         // machinery (#269): any further frame from the
                         // host-executor is unexpected but not fatal on its own.
                         tracing::debug!(host_id, "ignoring an unexpected frame from a registered host-executor");
                     }
-                    Ok(None) => break, // clean close: the ordinary end of a connection
-                    Err(e) => {
+                    Some(Ok(None)) => break, // clean close: the ordinary end of a connection
+                    Some(Err(e)) => {
                         tracing::warn!(host_id, error = %e, "host-executor connection faulted");
                         break;
                     }
+                    // The reader task only exits after sending a terminal
+                    // Ok(None)/Err, so a closed channel with nothing left to
+                    // receive is the same "connection is gone" case as those,
+                    // just observed through the channel closing instead of a
+                    // value arriving — not a distinct failure to log.
+                    None => break,
                 }
             }
         }
@@ -220,6 +233,30 @@ pub async fn serve_host_executor(
 
     registry.remove(&host_id, registration);
     tracing::info!(host_id, "host-executor disconnected");
+}
+
+/// Reads frames from `read_half` sequentially — never raced against anything
+/// else, so each `read_frame` call always either completes or the whole task
+/// ends, which is what makes it cancel-safe from [`serve_host_executor`]'s
+/// perspective: the `select!` loop only ever observes this through
+/// `frame_tx`'s `recv()`, a plain channel read. Ends after forwarding the
+/// first terminal result (`Ok(None)` or `Err`), matching `read_frame`'s own
+/// contract that nothing more should be read from a stream once either
+/// occurs.
+async fn forward_frames<R: tokio::io::AsyncRead + Unpin>(
+    mut read_half: R,
+    frame_tx: mpsc::Sender<Result<Option<HostExecutorMessage>, FrameError>>,
+) {
+    loop {
+        let frame = read_frame::<HostExecutorMessage>(&mut read_half).await;
+        let is_terminal = !matches!(frame, Ok(Some(_)));
+        if frame_tx.send(frame).await.is_err() {
+            return; // serve_host_executor's loop already ended; nothing left to forward to
+        }
+        if is_terminal {
+            return;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -512,5 +549,89 @@ mod tests {
             forward_back: "100.64.0.1:9000".to_owned(),
             required_isolation_class: IsolationClass::Trusted.into(),
         }
+    }
+
+    /// Regression (#289 item 3): a frame arriving from the host-executor
+    /// interleaved with outgoing `Dispatch` writes must never desync the
+    /// connection's framing. Before this fix, `read_frame` was raced directly
+    /// inside the loop's `select!` against `dispatch_rx.recv()` — a `read_frame`
+    /// that had only completed one of its two `.await` points (the length
+    /// prefix, say) when the dispatch branch won would be dropped mid-frame,
+    /// silently discarding the bytes already consumed and leaving the next
+    /// read to start at the wrong stream offset. The fix moves reading into
+    /// `forward_frames`, its own task reading sequentially with nothing ever
+    /// racing it; the `select!` only races `frame_rx.recv()`, a channel read
+    /// that can't lose an already-sent value. This drives several dispatches
+    /// and an interleaved unexpected frame (stage 1 has no host→orchestrator
+    /// message, so a second `Register` stands in for "some frame the loop
+    /// treats as unexpected but not fatal") through concurrently and asserts
+    /// every dispatch after the interleaving still decodes correctly — a
+    /// desync would corrupt or lose a later frame, not necessarily the one
+    /// racing the write.
+    #[tokio::test]
+    async fn dispatches_interleaved_with_an_unexpected_frame_are_all_still_delivered_correctly() -> anyhow::Result<()> {
+        let allowlist = ExecutorAllowlist::new(["100.64.0.7".parse()?]);
+        let registry = HostRegistry::default();
+        let (mut client, server) = tokio::io::duplex(4096);
+
+        write_frame(
+            &mut client,
+            &HostExecutorMessage {
+                op: Some(host_executor_message::Op::Register(Register {
+                    host_id: "ws01".to_owned(),
+                    capabilities: Some(capabilities()),
+                })),
+            },
+        )
+        .await?;
+
+        let registry = std::sync::Arc::new(registry);
+        let allowlist = std::sync::Arc::new(allowlist);
+        let serve = tokio::spawn({
+            let registry = std::sync::Arc::clone(&registry);
+            let allowlist = std::sync::Arc::clone(&allowlist);
+            async move {
+                serve_host_executor(Box::new(server), tcp_peer("100.64.0.7"), &allowlist, &registry).await;
+            }
+        });
+
+        let _registered: OrchestratorMessage = read_frame(&mut client)
+            .await?
+            .context("expected a Registered response")?;
+
+        registry.send_dispatch("ws01", test_dispatch("job-1")).await?;
+
+        // An unexpected frame from the host, sent right as the first dispatch
+        // is in flight — the interleaving this test exists to exercise. The
+        // loop's `Ok(Some(_))` arm just logs and continues, never fatal.
+        write_frame(
+            &mut client,
+            &HostExecutorMessage {
+                op: Some(host_executor_message::Op::Register(Register {
+                    host_id: "ws01".to_owned(),
+                    capabilities: Some(capabilities()),
+                })),
+            },
+        )
+        .await?;
+
+        registry.send_dispatch("ws01", test_dispatch("job-2")).await?;
+        registry.send_dispatch("ws01", test_dispatch("job-3")).await?;
+
+        for expected_job_id in ["job-1", "job-2", "job-3"] {
+            let pushed: OrchestratorMessage = read_frame(&mut client).await?.context("expected a Dispatch push")?;
+            match pushed.op {
+                Some(orchestrator_message::Op::Dispatch(received)) => assert_eq!(
+                    received.job_id, expected_job_id,
+                    "a framing desync would corrupt or misorder a later dispatch, not necessarily the one interleaved \
+                     with the unexpected frame"
+                ),
+                other => anyhow::bail!("expected a Dispatch push for {expected_job_id}, got {other:?}"),
+            }
+        }
+
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(5), serve).await??;
+        Ok(())
     }
 }
