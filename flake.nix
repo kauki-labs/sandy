@@ -31,11 +31,18 @@
         inputs.pre-commit.flakeModule
       ];
 
-      # Delivered standalone from perSystem (#287, D3): the overlay must work
+      # Delivered standalone from perSystem (#287, D3): each overlay must work
       # in a consuming flake's own nixpkgs, and the module must be importable
-      # without evaluating this flake's perSystem at all.
+      # without evaluating this flake's perSystem at all. Two overlays, not
+      # one bundled default (#287 follow-up, operator ruling): sandy-agent
+      # (a sandbox-image deployment) and sandy-host-executor (the ws01 host)
+      # have different targets, so a consumer applies only the one(s) it
+      # needs rather than always getting both.
       flake = {
-        overlays.default = import ./nix/overlays/sandy-executor.nix;
+        overlays = {
+          sandy-agent = import ./nix/overlays/sandy-agent.nix;
+          sandy-host-executor = import ./nix/overlays/sandy-host-executor.nix;
+        };
         nixosModules.sandy-executor = import ./nix/modules/sandy-executor.nix;
       };
       perSystem =
@@ -48,7 +55,8 @@
         let
           overlays = [
             (import inputs.rust-overlay)
-            (import ./nix/overlays/sandy-executor.nix)
+            (import ./nix/overlays/sandy-agent.nix)
+            (import ./nix/overlays/sandy-host-executor.nix)
           ];
           pkgs = import inputs.nixpkgs { inherit system overlays; };
 
