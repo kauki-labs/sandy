@@ -123,7 +123,7 @@ async fn main() {
     });
 
     // One HostRegistry (#298), shared between the mesh management-channel
-    // loop below (which registers connected host-clients) and the
+    // loop below (which registers connected host-executors) and the
     // control-socket path (which reads it for placement on Submit) — not
     // two separate registries, or a host registered on the mesh listener
     // would be invisible to a job submitted over the UDS socket.
@@ -163,7 +163,7 @@ async fn main() {
     // support of its own yet (#289-class follow-up), so this loop is
     // abruptly cancelled on process exit like every other unhandled task —
     // an accepted-but-not-yet-authenticated agent-link connection is cheap
-    // to lose, unlike a registered host-client's live dispatch channel.
+    // to lose, unlike a registered host-executor's live dispatch channel.
     let forward_back_addr = match setup_mesh_agent_link_listener().await {
         Ok(Some((listener, addr))) => {
             let registry = Arc::clone(&registry);
@@ -405,8 +405,8 @@ async fn setup_mesh_agent_link_listener() -> std::io::Result<Option<(MeshListene
     Ok(Some((listener, addr)))
 }
 
-/// Accept host-client connections on `mesh.listener` until shutdown, serving
-/// each with [`sandyd::host_conn::serve_host_client`] against `host_registry`
+/// Accept host-executor connections on `mesh.listener` until shutdown, serving
+/// each with [`sandyd::host_conn::serve_host_executor`] against `host_registry`
 /// — the same registry the control-socket/handler path reads for placement
 /// (#298), not a loop-local one: a host registered here must be visible to a
 /// `Submit` landing on the UDS socket, or placement could never see it.
@@ -438,7 +438,7 @@ async fn run_mesh_accept_loop(
                         let allowlist = Arc::clone(&allowlist);
                         let host_registry = Arc::clone(&host_registry);
                         connections.spawn(async move {
-                            sandyd::host_conn::serve_host_client(conn, peer, &allowlist, &host_registry).await;
+                            sandyd::host_conn::serve_host_executor(conn, peer, &allowlist, &host_registry).await;
                         });
                     }
                     Err(e) => {
@@ -464,7 +464,7 @@ async fn run_mesh_accept_loop(
         }
     }
 
-    drop(listener); // stop accepting; existing host-client connections keep running
+    drop(listener); // stop accepting; existing host-executor connections keep running
 
     if tokio::time::timeout(SHUTDOWN_GRACE, async {
         while connections.join_next().await.is_some() {}

@@ -198,9 +198,9 @@
           packages = sandyPackages // {
             default = sandyPackages.sandy;
             # The overlay's own packages (#287, D3), built via `pkgs` here so
-            # `nix build .#sandy-host-client`/`.#sandy-agent` exercises the
+            # `nix build .#sandy-host-executor`/`.#sandy-agent` exercises the
             # exact overlay a consumer applies, not a separate code path.
-            inherit (pkgs) sandy-host-client sandy-agent;
+            inherit (pkgs) sandy-host-executor sandy-agent;
           };
 
           checks = {
@@ -258,9 +258,9 @@
               qualityPackages.rust-code-analysis-cli
               qualityPackages.jscpd
               # The overlay's own packages (#287, D3: dev-shell first), so an
-              # operator can run `sandy-host-client`/`sandy-agent` from the
+              # operator can run `sandy-host-executor`/`sandy-agent` from the
               # shell before any NixOS module lands them as a service.
-              pkgs.sandy-host-client
+              pkgs.sandy-host-executor
               pkgs.sandy-agent
             ]
             # bwrap (the containment confinement layer this binary probes

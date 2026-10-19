@@ -1,10 +1,10 @@
-//! Host-client runtime config (#288): where to find the orchestrator, which
+//! Host-executor runtime config (#288): where to find the orchestrator, which
 //! `host_id` to register as, and which binary to launch for the agent — from
 //! environment variables, never a hardcoded value (same discipline as
 //! `sandyd`'s own mesh bind-address config, #291). Pure parsing, unit
 //! testable without touching the real process environment: a caller reads
 //! the actual env vars once and hands the raw values to
-//! [`parse_client_config`].
+//! [`parse_executor_config`].
 //!
 //! All three are required, with no guessed default: an unset orchestrator
 //! address or host id is a misconfiguration to report, never silently
@@ -13,39 +13,39 @@
 
 use std::{net::SocketAddr, path::PathBuf};
 
-/// A host-client config environment variable is missing or fails to parse.
+/// A host-executor config environment variable is missing or fails to parse.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum ClientConfigError {
-    /// `SANDY_HOST_CLIENT_ORCHESTRATOR` is unset.
-    #[error("SANDY_HOST_CLIENT_ORCHESTRATOR is required (the orchestrator's mesh host:port)")]
+pub enum ExecutorConfigError {
+    /// `SANDY_HOST_EXECUTOR_ORCHESTRATOR` is unset.
+    #[error("SANDY_HOST_EXECUTOR_ORCHESTRATOR is required (the orchestrator's mesh host:port)")]
     MissingOrchestrator,
-    /// `SANDY_HOST_CLIENT_ORCHESTRATOR` is set but not a valid `host:port`
+    /// `SANDY_HOST_EXECUTOR_ORCHESTRATOR` is set but not a valid `host:port`
     /// socket address.
-    #[error("SANDY_HOST_CLIENT_ORCHESTRATOR is not a valid socket address: {0:?}")]
+    #[error("SANDY_HOST_EXECUTOR_ORCHESTRATOR is not a valid socket address: {0:?}")]
     InvalidOrchestrator(String),
-    /// `SANDY_HOST_CLIENT_ID` is unset or empty.
-    #[error("SANDY_HOST_CLIENT_ID is required and must be non-empty")]
+    /// `SANDY_HOST_EXECUTOR_ID` is unset or empty.
+    #[error("SANDY_HOST_EXECUTOR_ID is required and must be non-empty")]
     MissingHostId,
     /// `SANDY_AGENT_PATH` is unset or empty.
     #[error("SANDY_AGENT_PATH is required (the path to the sandy-agent binary)")]
     MissingAgentPath,
 }
 
-/// This host-client's resolved runtime configuration.
+/// This host-executor's resolved runtime configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClientConfig {
+pub struct ExecutorConfig {
     /// The orchestrator's mesh address to dial for `Register`/`Dispatch`.
     pub orchestrator: SocketAddr,
     /// The self-reported `host_id` this instance registers as — bookkeeping
     /// only, never the authorization boundary (decision 12: that's the
     /// transport's own peer identity, checked orchestrator-side).
     pub host_id: String,
-    /// The `sandy-agent` binary this host-client launches for each dispatch.
+    /// The `sandy-agent` binary this host-executor launches for each dispatch.
     pub agent_path: PathBuf,
 }
 
-/// Parse this host-client's config from the raw values of
-/// `SANDY_HOST_CLIENT_ORCHESTRATOR`, `SANDY_HOST_CLIENT_ID`, and
+/// Parse this host-executor's config from the raw values of
+/// `SANDY_HOST_EXECUTOR_ORCHESTRATOR`, `SANDY_HOST_EXECUTOR_ID`, and
 /// `SANDY_AGENT_PATH` (in that order), as a caller would read them from
 /// `std::env::var`.
 ///
@@ -55,25 +55,25 @@ pub struct ClientConfig {
 /// it for a dispatch.
 ///
 /// # Errors
-/// See [`ClientConfigError`]'s variants: each of the three inputs is
+/// See [`ExecutorConfigError`]'s variants: each of the three inputs is
 /// required, with its own named failure, never a silently guessed default.
-pub fn parse_client_config(
+pub fn parse_executor_config(
     orchestrator: Option<&str>,
     host_id: Option<&str>,
     agent_path: Option<&str>,
-) -> Result<ClientConfig, ClientConfigError> {
-    let orchestrator_raw = orchestrator.ok_or(ClientConfigError::MissingOrchestrator)?;
+) -> Result<ExecutorConfig, ExecutorConfigError> {
+    let orchestrator_raw = orchestrator.ok_or(ExecutorConfigError::MissingOrchestrator)?;
     let orchestrator = orchestrator_raw
         .parse()
-        .map_err(|_| ClientConfigError::InvalidOrchestrator(orchestrator_raw.to_owned()))?;
+        .map_err(|_| ExecutorConfigError::InvalidOrchestrator(orchestrator_raw.to_owned()))?;
     let host_id = host_id
         .filter(|v| !v.is_empty())
-        .ok_or(ClientConfigError::MissingHostId)?
+        .ok_or(ExecutorConfigError::MissingHostId)?
         .to_owned();
     let agent_path = agent_path
         .filter(|v| !v.is_empty())
-        .ok_or(ClientConfigError::MissingAgentPath)?;
-    Ok(ClientConfig {
+        .ok_or(ExecutorConfigError::MissingAgentPath)?;
+    Ok(ExecutorConfig {
         orchestrator,
         host_id,
         agent_path: PathBuf::from(agent_path),
@@ -86,10 +86,10 @@ mod tests {
 
     #[test]
     fn a_fully_configured_set_parses() -> anyhow::Result<()> {
-        let config = parse_client_config(Some("100.64.0.1:7700"), Some("ws01"), Some("/usr/bin/sandy-agent"))?;
+        let config = parse_executor_config(Some("100.64.0.1:7700"), Some("ws01"), Some("/usr/bin/sandy-agent"))?;
         assert_eq!(
             config,
-            ClientConfig {
+            ExecutorConfig {
                 orchestrator: "100.64.0.1:7700".parse()?,
                 host_id: "ws01".to_owned(),
                 agent_path: PathBuf::from("/usr/bin/sandy-agent"),
@@ -101,16 +101,16 @@ mod tests {
     #[test]
     fn a_missing_orchestrator_is_refused_by_name() {
         assert_eq!(
-            parse_client_config(None, Some("ws01"), Some("/usr/bin/sandy-agent")),
-            Err(ClientConfigError::MissingOrchestrator)
+            parse_executor_config(None, Some("ws01"), Some("/usr/bin/sandy-agent")),
+            Err(ExecutorConfigError::MissingOrchestrator)
         );
     }
 
     #[test]
     fn an_invalid_orchestrator_is_refused_by_name() {
         assert_eq!(
-            parse_client_config(Some("not-an-address"), Some("ws01"), Some("/usr/bin/sandy-agent")),
-            Err(ClientConfigError::InvalidOrchestrator("not-an-address".to_owned()))
+            parse_executor_config(Some("not-an-address"), Some("ws01"), Some("/usr/bin/sandy-agent")),
+            Err(ExecutorConfigError::InvalidOrchestrator("not-an-address".to_owned()))
         );
     }
 
@@ -119,32 +119,32 @@ mod tests {
     #[test]
     fn an_orchestrator_with_no_port_is_refused() {
         assert_eq!(
-            parse_client_config(Some("100.64.0.1"), Some("ws01"), Some("/usr/bin/sandy-agent")),
-            Err(ClientConfigError::InvalidOrchestrator("100.64.0.1".to_owned()))
+            parse_executor_config(Some("100.64.0.1"), Some("ws01"), Some("/usr/bin/sandy-agent")),
+            Err(ExecutorConfigError::InvalidOrchestrator("100.64.0.1".to_owned()))
         );
     }
 
     #[test]
     fn a_missing_host_id_is_refused_by_name() {
         assert_eq!(
-            parse_client_config(Some("100.64.0.1:7700"), None, Some("/usr/bin/sandy-agent")),
-            Err(ClientConfigError::MissingHostId)
+            parse_executor_config(Some("100.64.0.1:7700"), None, Some("/usr/bin/sandy-agent")),
+            Err(ExecutorConfigError::MissingHostId)
         );
     }
 
     #[test]
     fn an_empty_host_id_is_refused_same_as_missing() {
         assert_eq!(
-            parse_client_config(Some("100.64.0.1:7700"), Some(""), Some("/usr/bin/sandy-agent")),
-            Err(ClientConfigError::MissingHostId)
+            parse_executor_config(Some("100.64.0.1:7700"), Some(""), Some("/usr/bin/sandy-agent")),
+            Err(ExecutorConfigError::MissingHostId)
         );
     }
 
     #[test]
     fn a_missing_agent_path_is_refused_by_name() {
         assert_eq!(
-            parse_client_config(Some("100.64.0.1:7700"), Some("ws01"), None),
-            Err(ClientConfigError::MissingAgentPath)
+            parse_executor_config(Some("100.64.0.1:7700"), Some("ws01"), None),
+            Err(ExecutorConfigError::MissingAgentPath)
         );
     }
 }

@@ -1,6 +1,6 @@
-//! The orchestrator side of the host-client contract (#263, epic #205 M2):
+//! The orchestrator side of the host-executor contract (#263, epic #205 M2):
 //! authenticating `Register` against an allowlist of known executor hosts,
-//! tracking connected host-clients and their declared capabilities, and
+//! tracking connected host-executors and their declared capabilities, and
 //! pushing `Dispatch` messages down a host's persistent connection.
 //!
 //! Host-client identity (`host_id`) is self-reported and used for bookkeeping
@@ -123,7 +123,7 @@ pub struct PlacementCandidate {
     pub capabilities: Capabilities,
 }
 
-/// A connected host-client: its declared capabilities and the channel its
+/// A connected host-executor: its declared capabilities and the channel its
 /// connection task reads from to learn about `Dispatch`es placed on it.
 struct ConnectedHost {
     peer_ip: IpAddr,
@@ -132,7 +132,7 @@ struct ConnectedHost {
     dispatch_tx: mpsc::Sender<Dispatch>,
 }
 
-/// Every currently-connected, registered host-client, keyed by its
+/// Every currently-connected, registered host-executor, keyed by its
 /// self-reported `host_id`. A host disappears from this registry when its
 /// connection task ends (dropping the last `Arc` to its entry) — the
 /// connection staying open is the host's liveness signal, so there is no

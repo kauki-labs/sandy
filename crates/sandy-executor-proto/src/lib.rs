@@ -1,19 +1,19 @@
-//! The orchestrator<->host-client contract (#263, epic #205 M2): capability-
+//! The orchestrator<->host-executor contract (#263, epic #205 M2): capability-
 //! declaring registration (kubelet-style) plus the dispatch RPC, as
-//! `HostClientMessage`/`OrchestratorMessage` protobuf messages over one
-//! persistent, bidirectional connection per host-client.
+//! `HostExecutorMessage`/`OrchestratorMessage` protobuf messages over one
+//! persistent, bidirectional connection per host-executor.
 //!
 //! Rides [`sandy_control_proto::write_frame`]/[`sandy_control_proto::read_frame`]
 //! directly — the same length-prefixed framing as the control RPC, just a
 //! different message shape, since this is a management channel (the
-//! orchestrator pushes `Dispatch` down the connection a host-client opened
+//! orchestrator pushes `Dispatch` down the connection a host-executor opened
 //! with `Register`) rather than the control RPC's pure request/response.
 //!
 //! ```
-//! use sandy_executor_proto::{HostClientMessage, host_client_message};
+//! use sandy_executor_proto::{HostExecutorMessage, host_executor_message};
 //!
-//! let message = HostClientMessage {
-//!     op: Some(host_client_message::Op::Register(Default::default())),
+//! let message = HostExecutorMessage {
+//!     op: Some(host_executor_message::Op::Register(Default::default())),
 //! };
 //! assert!(message.op.is_some());
 //! ```
@@ -33,8 +33,8 @@ pub mod v1 {
 /// direct `prost` dependency just for that bound.
 pub use prost::Message;
 pub use v1::{
-    Arch, Capabilities, Dispatch, HostClientMessage, IsolationClass, OrchestratorMessage, Register, RegisterRefused,
-    Registered, SandboxKind, host_client_message, orchestrator_message,
+    Arch, Capabilities, Dispatch, HostExecutorMessage, IsolationClass, OrchestratorMessage, Register, RegisterRefused,
+    Registered, SandboxKind, host_executor_message, orchestrator_message,
 };
 
 /// `Dispatch.link_token` is a bearer secret (INV-1): a holder can authenticate
@@ -231,8 +231,8 @@ mod tests {
     #[tokio::test]
     async fn a_register_round_trips_through_the_frame_codec() -> anyhow::Result<()> {
         let (mut write_side, mut read_side) = tokio::io::duplex(4096);
-        let message = HostClientMessage {
-            op: Some(host_client_message::Op::Register(Register {
+        let message = HostExecutorMessage {
+            op: Some(host_executor_message::Op::Register(Register {
                 host_id: "ws01".to_owned(),
                 capabilities: Some(Capabilities {
                     kind: SandboxKind::Process.into(),
@@ -244,7 +244,7 @@ mod tests {
         };
         write_frame(&mut write_side, &message).await?;
 
-        let decoded: HostClientMessage = read_frame(&mut read_side)
+        let decoded: HostExecutorMessage = read_frame(&mut read_side)
             .await?
             .context("expected a frame, got a clean close")?;
         assert_eq!(decoded, message);

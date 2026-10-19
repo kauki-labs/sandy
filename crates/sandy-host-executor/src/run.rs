@@ -1,4 +1,4 @@
-//! The host-client's main loop (#288): register once, then receive
+//! The host-executor's main loop (#288): register once, then receive
 //! `Dispatch` frames off the same connection until it closes or shutdown is
 //! requested. Pure protocol logic over any `AsyncRead + AsyncWrite`, kept
 //! separate from `main.rs`'s real I/O (the mesh dial, the real
@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use sandy_control_proto::{read_frame, write_frame};
 use sandy_executor_proto::{
-    Capabilities, Dispatch, HostClientMessage, OrchestratorMessage, host_client_message, orchestrator_message,
+    Capabilities, Dispatch, HostExecutorMessage, OrchestratorMessage, host_executor_message, orchestrator_message,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -68,8 +68,8 @@ pub async fn register(
     capabilities: Capabilities,
     response_timeout: Duration,
 ) -> Result<(), RegisterError> {
-    let message = HostClientMessage {
-        op: Some(host_client_message::Op::Register(sandy_executor_proto::Register {
+    let message = HostExecutorMessage {
+        op: Some(host_executor_message::Op::Register(sandy_executor_proto::Register {
             host_id: host_id.to_owned(),
             capabilities: Some(capabilities),
         })),
@@ -94,9 +94,9 @@ pub async fn register(
 /// decide its exit code: [`Shutdown`](Self::Shutdown) is an ordinary,
 /// requested stop (exit 0), while [`Closed`](Self::Closed) and
 /// [`Faulted`](Self::Faulted) mean the connection died out from under the
-/// host-client and it should exit non-zero for its supervisor to restart it
+/// host-executor and it should exit non-zero for its supervisor to restart it
 /// (CodeRabbit finding on #294: returning `()` unconditionally made a
-/// disconnected host-client exit 0, exactly the case the module's own "the
+/// disconnected host-executor exit 0, exactly the case the module's own "the
 /// supervisor restarts it" design depends on *not* happening).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DispatchLoopExit {
@@ -184,7 +184,7 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(4096);
 
         let orchestrator = tokio::spawn(async move {
-            let received: HostClientMessage = read_frame(&mut server).await?.context("expected Register")?;
+            let received: HostExecutorMessage = read_frame(&mut server).await?.context("expected Register")?;
             write_frame(
                 &mut server,
                 &OrchestratorMessage {
@@ -204,7 +204,7 @@ mod tests {
             .context("orchestrator task did not finish")?
             .context("orchestrator task panicked")??;
         match received.op {
-            Some(host_client_message::Op::Register(r)) => {
+            Some(host_executor_message::Op::Register(r)) => {
                 assert_eq!(r.host_id, "ws01");
                 assert_eq!(r.capabilities, Some(capabilities()));
             }
@@ -218,7 +218,7 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(4096);
 
         let orchestrator = tokio::spawn(async move {
-            let _received: HostClientMessage = read_frame(&mut server).await?.context("expected Register")?;
+            let _received: HostExecutorMessage = read_frame(&mut server).await?.context("expected Register")?;
             write_frame(
                 &mut server,
                 &OrchestratorMessage {
@@ -248,7 +248,7 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(4096);
 
         let orchestrator = tokio::spawn(async move {
-            let _received: HostClientMessage = read_frame(&mut server).await?.context("expected Register")?;
+            let _received: HostExecutorMessage = read_frame(&mut server).await?.context("expected Register")?;
             drop(server); // closes after reading Register, before writing any response
             Ok::<_, anyhow::Error>(())
         });
@@ -275,7 +275,7 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(4096);
 
         let orchestrator = tokio::spawn(async move {
-            let _received: HostClientMessage = read_frame(&mut server).await?.context("expected Register")?;
+            let _received: HostExecutorMessage = read_frame(&mut server).await?.context("expected Register")?;
             std::future::pending::<()>().await;
             Ok::<_, anyhow::Error>(())
         });

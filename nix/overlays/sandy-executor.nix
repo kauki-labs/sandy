@@ -1,5 +1,5 @@
 # The sandy-executor overlay (#287, M2 spec #269 D3: "our infra ships as a nix
-# overlay on a user-specified base, dev-shell first"). Adds `sandy-host-client`
+# overlay on a user-specified base, dev-shell first"). Adds `sandy-host-executor`
 # and `sandy-agent` as plain packages to whatever nixpkgs a consumer applies
 # this overlay to — including a base with no rust-overlay/crane of its own.
 #
@@ -21,7 +21,7 @@ let
     ];
   };
 
-  # One binary crate's build, by its exact package name (`sandy-host-client`,
+  # One binary crate's build, by its exact package name (`sandy-host-executor`,
   # `sandy-agent`) — no tests, no dev-only extras, just the binary this
   # overlay exists to deliver.
   mkSandyBin =
@@ -39,6 +39,6 @@ let
     };
 in
 {
-  sandy-host-client = mkSandyBin "sandy-host-client";
+  sandy-host-executor = mkSandyBin "sandy-host-executor";
   sandy-agent = mkSandyBin "sandy-agent";
 }

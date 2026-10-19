@@ -40,7 +40,7 @@ pub enum MeshConfigError {
     InvalidAllowlistEntry(String),
 }
 
-/// Parse `SANDY_MESH_LISTEN`'s raw value: the host-client management
+/// Parse `SANDY_MESH_LISTEN`'s raw value: the host-executor management
 /// channel's mesh bind address. `None` (the env var unset) stays `None` —
 /// `sandyd` does not bind a mesh listener at all in that case.
 ///

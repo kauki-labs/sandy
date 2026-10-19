@@ -7,7 +7,7 @@
 //! submit` through the real orchestrator placement path (#298/#301, merged)
 //! to a real `Dispatch`, then runs it via `handle_dispatch` with
 //! `FakeContainment` standing in for real containment (sandy-91: the real
-//! `sandy-host-client` binary can't start on non-Linux). `SANDY_LIVE=1`, no
+//! `sandy-host-executor` binary can't start on non-Linux). `SANDY_LIVE=1`, no
 //! hypervisor needed — M2 stage 1 is the trusted-process backend. Per INV-S9
 //! a live scenario is never counted green from a fake, so nothing here
 //! claims a pass it can't back; see each test's own doc for its observed
@@ -33,8 +33,8 @@
 //!
 //! | #269 acceptance item                                                  | Asserted where                                                                              |
 //! | ---------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-//! | Submit -> placement -> send_dispatch -> host-client runs the job       | this file, `cross_machine_sandboxes_exchange_a_peer_message_through_the_hub` (live, real     |
-//! | (host-client leg; not the second local job / hub-exchange half, nor    | `sandyd` + real `sandy daemon submit` + `handle_dispatch`; `FakeContainment` stands in for    |
+//! | Submit -> placement -> send_dispatch -> host-executor runs the job       | this file, `cross_machine_sandboxes_exchange_a_peer_message_through_the_hub` (live, real     |
+//! | (host-executor leg; not the second local job / hub-exchange half, nor    | `sandyd` + real `sandy daemon submit` + `handle_dispatch`; `FakeContainment` stands in for    |
 //! | real containment — tracked on #303, gated on #287/#299)                | real containment)                                                                              |
 //! | Register-auth: unknown mesh identity gets `RegisterRefused` (infra-     | this file, `register_from_an_unlisted_mesh_identity_gets_no_ack_and_no_dispatch` (live, a    |
 //! | f3's addendum to #263)                                                 | real `sandyd` + a real TCP client)                                                            |
@@ -73,8 +73,8 @@ use std::{
 
 use anyhow::Context;
 use sandy_executor_proto::{
-    Arch, Capabilities, HostClientMessage, IsolationClass, OrchestratorMessage, Register, SandboxKind,
-    host_client_message, orchestrator_message,
+    Arch, Capabilities, HostExecutorMessage, IsolationClass, OrchestratorMessage, Register, SandboxKind,
+    host_executor_message, orchestrator_message,
 };
 
 /// Refuse unless `SANDY_LIVE=1` — this file spawns real OS processes and
@@ -88,7 +88,7 @@ fn require_live_process_test() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Refuse unless `SANDY_M2_REMOTE_HOST` names a reachable NixOS host-client's
+/// Refuse unless `SANDY_M2_REMOTE_HOST` names a reachable NixOS host-executor's
 /// mesh address, in addition to [`require_live_process_test`]'s usual
 /// live-matrix check — the full cross-machine acceptance needs two real
 /// machines, not one. Not called yet: the real ws01 run (#287/#299) is the
@@ -101,7 +101,7 @@ fn require_live_process_test() -> anyhow::Result<()> {
 fn require_remote_executor() -> anyhow::Result<String> {
     require_live_process_test()?;
     std::env::var("SANDY_M2_REMOTE_HOST")
-        .map_err(|_| anyhow::anyhow!("refusing: set SANDY_M2_REMOTE_HOST to a NixOS host-client's mesh address"))
+        .map_err(|_| anyhow::anyhow!("refusing: set SANDY_M2_REMOTE_HOST to a NixOS host-executor's mesh address"))
 }
 
 /// Build `package`'s `bin` binary and return its path, located next to
@@ -215,14 +215,14 @@ fn spawn_orchestrator(tmp: &std::path::Path, allowlist: &str) -> anyhow::Result<
 /// Send a real `Register` frame to `orchestrator` over a plain TCP socket and
 /// return its one response frame.
 ///
-/// Not the real `sandy-host-client` binary: `detect_register_capabilities()`
+/// Not the real `sandy-host-executor` binary: `detect_register_capabilities()`
 /// (the binary's first step, before it ever dials) hard-fails on a non-Linux
 /// host (`SystemdRunContainment::detect` is unconditionally `Unsupported`
 /// off Linux, `impls/local/src/containment.rs`), so spawning the real binary
 /// on this Mac would exit 1 before `Register` is ever attempted — a false
 /// functional-red for the wrong reason (sandy-91 caught this before this test
 /// was run). This acceptance item is about the orchestrator's allowlist
-/// behavior, which doesn't depend on the host-client's capability probe, so a
+/// behavior, which doesn't depend on the host-executor's capability probe, so a
 /// hand-rolled client sending the real wire message is a faithful test of it:
 /// real `sandyd` binary, real TCP, real `sandy_control_proto` frame codec.
 fn register_over_tcp(
@@ -235,8 +235,8 @@ fn register_over_tcp(
     let mut conn = TcpStream::connect(orchestrator.mesh_addr).context("dialing the orchestrator's mesh listener")?;
     conn.set_read_timeout(Some(Duration::from_secs(5)))?;
 
-    let message = HostClientMessage {
-        op: Some(host_client_message::Op::Register(Register {
+    let message = HostExecutorMessage {
+        op: Some(host_executor_message::Op::Register(Register {
             host_id: host_id.to_owned(),
             capabilities: Some(capabilities),
         })),
@@ -298,21 +298,21 @@ fn submit_job(orchestrator: &Orchestrator, tmp: &std::path::Path, argv: &[&str])
 }
 
 /// The M2 stage-1 acceptance floor (`docs/architecture/kpi.md`), minus the
-/// peer-message/second-job half: a registered host-client receives a real
+/// peer-message/second-job half: a registered host-executor receives a real
 /// `Dispatch` from a real `sandy daemon submit`, placed there by the real
 /// orchestrator (#298/#301's `send_dispatch` path), and actually runs the job
-/// — host-client side only (infra-f3's scoping ruling: the orchestrator-
+/// — host-executor side only (infra-f3's scoping ruling: the orchestrator-
 /// through-real-path proof this test gives doesn't need the second local job
 /// / hub-exchange half; that's #269's remaining acceptance once a real ws01
 /// is up, #299 + #287).
 ///
-/// The host-client side is `handle_dispatch` called directly with
-/// `FakeContainment` (sandy-91: the real `sandy-host-client` binary can't
+/// The host-executor side is `handle_dispatch` called directly with
+/// `FakeContainment` (sandy-91: the real `sandy-host-executor` binary can't
 /// start on this Mac — `detect_register_capabilities` hard-fails off Linux —
 /// so this test declares capabilities and runs dispatches itself, in-process,
 /// rather than spawning that binary) — real orchestrator binary, real wire
 /// protocol, real `ProcessBackend` run, real `sandy-agent`, only the
-/// host-client's own I/O loop and capability probe are stood in for.
+/// host-executor's own I/O loop and capability probe are stood in for.
 ///
 /// Functional-red observed before green (2026-10-18): first ran this with
 /// the registered host declaring `Untrusted` only (not `Trusted`, which
@@ -338,8 +338,8 @@ async fn cross_machine_sandboxes_exchange_a_peer_message_through_the_hub() -> an
         .context("dialing the orchestrator's mesh listener")?;
     sandy_control_proto::write_frame(
         &mut host_conn,
-        &HostClientMessage {
-            op: Some(host_client_message::Op::Register(Register {
+        &HostExecutorMessage {
+            op: Some(host_executor_message::Op::Register(Register {
                 host_id: "the-remote-host".to_owned(),
                 capabilities: Some(trusted_process_capabilities()),
             })),
@@ -386,7 +386,7 @@ async fn cross_machine_sandboxes_exchange_a_peer_message_through_the_hub() -> an
     let agent_program = build_workspace_bin("sandy-agent", "sandy-agent")?;
     let rt = tokio::runtime::Handle::current();
     let outcome = tokio::task::spawn_blocking(move || {
-        sandy_host_client::dispatch::handle_dispatch(
+        sandy_host_executor::dispatch::handle_dispatch(
             &dispatch,
             Box::new(sandy_test_support::FakeContainment::available()),
             agent_program,
@@ -423,7 +423,7 @@ async fn cross_machine_sandboxes_exchange_a_peer_message_through_the_hub() -> an
 ///
 /// Against a real spawned `sandyd` binary, over a real TCP socket, with the
 /// real wire codec (see [`register_over_tcp`] for why the client side is
-/// hand-rolled rather than the real `sandy-host-client` binary).
+/// hand-rolled rather than the real `sandy-host-executor` binary).
 ///
 /// Functional-red observed before green (2026-10-18): first ran this against
 /// an orchestrator whose `SANDY_MESH_ALLOWLIST` included this test's loopback

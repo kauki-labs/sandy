@@ -268,7 +268,7 @@ pub async fn handle(
                     // CAUTION (decision 12, reachable since #298/#301 - #298
                     // is the first real send_dispatch caller): this only
                     // stops a late agent-link stream from claiming the run.
-                    // If the job's Dispatch already reached the host-client
+                    // If the job's Dispatch already reached the host-executor
                     // (running, or still queued behind another job under
                     // decision 14's sequential processing), nothing retracts
                     // it - there is no Cancel/Stop OrchestratorMessage. The

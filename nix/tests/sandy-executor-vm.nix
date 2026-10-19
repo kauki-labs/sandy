@@ -12,7 +12,7 @@
 # before any ws01 apply.
 #
 # `main` (#288/#294) detects capabilities, then unconditionally dials
-# `SANDY_HOST_CLIENT_ORCHESTRATOR` before ever logging anything about the
+# `SANDY_HOST_EXECUTOR_ORCHESTRATOR` before ever logging anything about the
 # detected capabilities themselves — there is no real orchestrator in this
 # VM to dial, so the signal this test reads is which failure happens first:
 # "cannot declare any capability" (containment broken) vs. "could not dial
@@ -146,7 +146,7 @@ testPkgs.testers.runNixOSTest {
     full_journal = machine.succeed("journalctl -b -o cat --no-pager")
 
     assert "cannot declare any capability" not in full_journal, (
-        f"the host-client refused to declare any capability in the test VM "
+        f"the host-executor refused to declare any capability in the test VM "
         f"(the PAMName/linger wiring did not give it a usable user systemd "
         f"instance) — journal:\n{full_journal}"
     )
