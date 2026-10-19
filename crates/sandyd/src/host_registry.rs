@@ -260,11 +260,22 @@ impl HostRegistry {
     #[must_use]
     pub fn pick_host_for(&self, required: i32) -> Option<PlacementCandidate> {
         if required == i32::from(IsolationClass::Unspecified) {
+            tracing::debug!(
+                required,
+                "pick_host_for: required class is Unspecified, refusing fail-closed"
+            );
             return None;
         }
-        self.hosts
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        let hosts = self.hosts.lock().unwrap_or_else(PoisonError::into_inner);
+        tracing::debug!(
+            required,
+            registered = ?hosts
+                .iter()
+                .map(|(host_id, host)| (host_id.clone(), host.capabilities.supported_isolation_classes.clone()))
+                .collect::<Vec<_>>(),
+            "pick_host_for: matching against currently registered hosts"
+        );
+        hosts
             .iter()
             .find(|(_, host)| host.capabilities.supported_isolation_classes.contains(&required))
             .map(|(host_id, host)| PlacementCandidate {

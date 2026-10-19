@@ -125,6 +125,13 @@ pub async fn serve_host_executor(
         }
     };
 
+    tracing::debug!(
+        peer = %peer_ip,
+        host_id,
+        supported_isolation_classes = ?capabilities.supported_isolation_classes,
+        "decoded Register capabilities"
+    );
+
     let (mut dispatch_rx, registration) = match registry.register(allowlist, peer_ip, host_id.clone(), capabilities) {
         Ok(registered) => registered,
         Err(e) => {
@@ -419,6 +426,58 @@ mod tests {
             None,
             "disconnecting must remove the host"
         );
+        Ok(())
+    }
+
+    /// Regression (live M2 cross-machine run, reported by infra-f3): a host
+    /// registered through the REAL wire path — `write_frame` encoding a
+    /// `Register` frame, decoded by `serve_host_executor` off an actual byte
+    /// stream — must be a placement candidate for the isolation class it
+    /// declared. Every existing `pick_host_for` test (`host_registry.rs`)
+    /// registers via a hand-built `Capabilities` fed directly to
+    /// `HostRegistry::register`, bypassing the wire decode entirely; this is
+    /// the one gap that distinguished the test suite (all green) from the
+    /// live repro (`sandy daemon submit` returning a job that stayed
+    /// `Pending` forever, zero placement activity, no dispatch error).
+    #[tokio::test]
+    async fn a_host_registered_through_a_real_wire_frame_is_a_placement_candidate() -> anyhow::Result<()> {
+        let allowlist = ExecutorAllowlist::new(["100.64.0.7".parse()?]);
+        let registry = HostRegistry::default();
+        let (mut client, server) = tokio::io::duplex(4096);
+
+        write_frame(
+            &mut client,
+            &HostExecutorMessage {
+                op: Some(host_executor_message::Op::Register(Register {
+                    host_id: "ws01".to_owned(),
+                    capabilities: Some(capabilities()),
+                })),
+            },
+        )
+        .await?;
+
+        let registry = std::sync::Arc::new(registry);
+        let allowlist = std::sync::Arc::new(allowlist);
+        let serve = tokio::spawn({
+            let registry = std::sync::Arc::clone(&registry);
+            let allowlist = std::sync::Arc::clone(&allowlist);
+            async move {
+                serve_host_executor(Box::new(server), tcp_peer("100.64.0.7"), &allowlist, &registry).await;
+            }
+        });
+
+        let response: OrchestratorMessage = read_frame(&mut client)
+            .await?
+            .context("expected a Registered response")?;
+        assert!(matches!(response.op, Some(orchestrator_message::Op::Registered(_))));
+
+        let candidate = registry
+            .pick_host_for(IsolationClass::Trusted.into())
+            .expect("a host that declared Trusted over the real wire must be a Trusted placement candidate");
+        assert_eq!(candidate.host_id, "ws01");
+
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(5), serve).await??;
         Ok(())
     }
 
