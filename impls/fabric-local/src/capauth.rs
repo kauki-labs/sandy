@@ -56,7 +56,7 @@ impl LocalCapAuthority {
         self.revoked
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(cap.proof.clone());
+            .insert(cap.proof().to_vec());
     }
 
     /// Whether `cap` has been revoked. Does not check the proof or expiry;
@@ -65,7 +65,7 @@ impl LocalCapAuthority {
         self.revoked
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .contains(&cap.proof)
+            .contains(cap.proof())
     }
 
     /// Key the MAC over `scope`'s canonical bytes.
@@ -83,23 +83,23 @@ impl CapAuthority for LocalCapAuthority {
             scope.expires_at = Some(unix_now()?.saturating_add(self.default_ttl.as_secs()));
         }
         let proof = self.mac(&scope)?.finalize().into_bytes().to_vec();
-        Ok(Cap { scope, proof })
+        Ok(Cap::new(scope, proof))
     }
 
     fn verify(&self, cap: &Cap) -> Result<CapScope, CapError> {
-        self.mac(&cap.scope)?
-            .verify_slice(&cap.proof)
+        self.mac(cap.scope())?
+            .verify_slice(cap.proof())
             .map_err(|_| CapError::Forged)?;
         // Expiry is a pure clock check; revocation needs the set lock. Order is
         // otherwise arbitrary: #129 treats a cap as valid only if both hold.
         let now = unix_now()?;
-        if cap.scope.expires_at.is_some_and(|t| t <= now) {
+        if cap.scope().expires_at.is_some_and(|t| t <= now) {
             return Err(CapError::Expired);
         }
         if self.is_revoked(cap) {
             return Err(CapError::Revoked);
         }
-        Ok(cap.scope.clone())
+        Ok(cap.scope().clone())
     }
 
     fn attenuate(&self, parent: &Cap, rights: CapRights) -> Result<Cap, CapError> {

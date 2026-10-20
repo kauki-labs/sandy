@@ -21,7 +21,7 @@ use crate::{
     dispatch::{self, JobRegistry},
     host_registry::HostRegistry,
     link_auth::RemoteLink,
-    store::{CancelOutcome, JobStore, StoreError},
+    store::{CancelOutcome, InsertOutcome, JobStore, StoreError},
 };
 
 /// STAGE-1: untrusted jobs are inexpressible (no VM/untrusted backend yet,
@@ -120,6 +120,12 @@ fn resolve_granted_caps(
 /// it (a refcount bump, not a deep copy) into each `spawn_blocking` closure
 /// that needs a `'static` capture — never leaks an allocation per call.
 ///
+/// `session` (CF-H-1) is the calling connection's own id, minted once by
+/// `serve_connection` and threaded through here in-process (never on the
+/// wire): `Submit` records it on the new job, and a later `Cancel`/`Attach`
+/// compares against it to log — never refuse — a request arriving from a
+/// different connection than the one that submitted the job.
+///
 /// # Errors
 /// See [`HandlerError`].
 pub async fn handle(
@@ -127,10 +133,27 @@ pub async fn handle(
     registry: &Arc<JobRegistry>,
     host_registry: &Arc<HostRegistry>,
     forward_back_addr: Option<SocketAddr>,
+    session: Uuid,
     request: ControlRequest,
 ) -> Result<ControlResponse, HandlerError> {
     let result = match request.op {
         Some(control_request::Op::Submit(submit)) => {
+            // CF-M-1: reject an oversized manifest before anything else —
+            // even before decision C-at-Submit's own cap-bounding below, which
+            // itself has to deserialize the manifest to do its job.
+            if submit.manifest.len() > sandy_control_proto::MAX_MANIFEST_LEN as usize {
+                return Ok(ControlResponse {
+                    request_id: request.request_id,
+                    result: Some(control_response::Result::Error(ControlError {
+                        message: format!(
+                            "manifest of {} bytes exceeds the {}-byte limit",
+                            submit.manifest.len(),
+                            sandy_control_proto::MAX_MANIFEST_LEN
+                        ),
+                    })),
+                });
+            }
+
             // Decision C-at-Submit (#226): bound before anything else is
             // created. A refusal here must leave no trace — no channel, no
             // store row — the same "fail before any side effect" shape the
@@ -163,6 +186,7 @@ pub async fn handle(
             // "restarted since submit?" instead of surfacing the real fault.
             let mut job_channel = dispatch::mint_job_channel(&job_id, registry.authority()).await?;
             job_channel.granted_caps = granted_caps;
+            job_channel.session = session; // CF-H-1
 
             // Placement (#298): stage-1 policy. Dispatch to a registered
             // remote host whose declared capabilities satisfy
@@ -207,7 +231,20 @@ pub async fn handle(
                 }
             });
 
-            tokio::task::spawn_blocking(move || store.insert_pending(&inserted_id, &manifest, &encoding)).await??;
+            let insert_outcome =
+                tokio::task::spawn_blocking(move || store.insert_pending(&inserted_id, &manifest, &encoding)).await??;
+            // CF-M-2: a capacity refusal must leave no trace, same as every
+            // other Submit-time refusal above — never registered, never
+            // dispatched, even though `dispatch_plan` may already have minted
+            // a remote link above (cheap to discard, nothing observed it).
+            if let InsertOutcome::CapExceeded { max } = insert_outcome {
+                return Ok(ControlResponse {
+                    request_id: request.request_id,
+                    result: Some(control_response::Result::Error(ControlError {
+                        message: format!("the job store is at its {max}-row capacity; try again later"),
+                    })),
+                });
+            }
             registry.insert(job_id.clone(), job_channel);
 
             if let Some((host_id, registration, dispatch)) = dispatch_plan {
@@ -253,6 +290,16 @@ pub async fn handle(
             control_response::Result::Submit(SubmitResponse { job_id })
         }
         Some(control_request::Op::Cancel(cancel)) => {
+            // CF-H-1: an audit trail, not a gate — a mismatch is logged, never
+            // refused (see `handle`'s own doc on `session`).
+            if let Some(job) = registry.get(&cancel.job_id)
+                && !job.session_matches(session)
+            {
+                tracing::warn!(
+                    job_id = %cancel.job_id,
+                    "cancel from a different session than the one that submitted this job"
+                );
+            }
             let job_id = cancel.job_id.clone();
             let store = Arc::clone(store);
             let outcome = tokio::task::spawn_blocking(move || store.cancel(&job_id)).await??;
@@ -297,10 +344,20 @@ pub async fn handle(
                     attach.job_id
                 ),
             }),
-            Some(job) => control_response::Result::Attach(AttachResponse {
-                channel_id: attach.job_id.clone(),
-                cap: encode_cap(&job.observer_cap)?,
-            }),
+            Some(job) => {
+                // CF-H-1: an audit trail, not a gate — see the Cancel arm
+                // above and `handle`'s own doc on `session`.
+                if !job.session_matches(session) {
+                    tracing::warn!(
+                        job_id = %attach.job_id,
+                        "attach from a different session than the one that submitted this job"
+                    );
+                }
+                control_response::Result::Attach(AttachResponse {
+                    channel_id: attach.job_id.clone(),
+                    cap: encode_cap(&job.observer_cap)?,
+                })
+            }
             None => {
                 // No live channel for this id. Distinguish "never existed"
                 // from "existed but this daemon process doesn't hold its
@@ -370,7 +427,7 @@ pub async fn handle(
 /// way to know that, so the check lives here, at the one place that decides
 /// whether to return the cap at all.
 fn cap_has_expired(cap: &sandy_fabric::capauth::Cap) -> bool {
-    let Some(expires_at) = cap.scope.expires_at else {
+    let Some(expires_at) = cap.scope().expires_at else {
         return false;
     };
     let now = std::time::SystemTime::now()
@@ -447,6 +504,17 @@ mod tests {
         Arc::new(HostRegistry::default())
     }
 
+    /// A fresh per-call session id (CF-H-1), standing in for a distinct
+    /// connection — most tests here don't care which session an op runs
+    /// under, only that it doesn't change `handle`'s outcome, so each one
+    /// gets its own rather than a single shared constant (incidentally
+    /// realistic: `serve_connection` mints one per real connection too). The
+    /// two tests that specifically cover same-/cross-session behavior pin
+    /// their own `Uuid` instead of calling this.
+    fn test_session() -> Uuid {
+        Uuid::new_v4()
+    }
+
     fn req(id: u64, op: control_request::Op) -> ControlRequest {
         ControlRequest {
             request_id: id,
@@ -468,7 +536,7 @@ mod tests {
     #[tokio::test]
     async fn submit_persists_and_returns_a_job_id() -> anyhow::Result<()> {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
-        let response = handle(&store, &registry, &host_registry, None, submit_req(1)).await?;
+        let response = handle(&store, &registry, &host_registry, None, test_session(), submit_req(1)).await?;
         let job_id = match response.result {
             Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
@@ -486,6 +554,7 @@ mod tests {
             &registry,
             &host_registry,
             None,
+            test_session(),
             req(
                 1,
                 control_request::Op::Status(StatusRequest {
@@ -510,6 +579,7 @@ mod tests {
             &registry,
             &host_registry,
             None,
+            test_session(),
             req(
                 1,
                 control_request::Op::Cancel(CancelRequest {
@@ -529,12 +599,13 @@ mod tests {
     #[tokio::test]
     async fn list_reflects_submitted_jobs() -> anyhow::Result<()> {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
-        handle(&store, &registry, &host_registry, None, submit_req(1)).await?;
+        handle(&store, &registry, &host_registry, None, test_session(), submit_req(1)).await?;
         let response = handle(
             &store,
             &registry,
             &host_registry,
             None,
+            test_session(),
             req(2, control_request::Op::List(ListRequest {})),
         )
         .await?;
@@ -551,7 +622,7 @@ mod tests {
     #[tokio::test]
     async fn attach_on_a_submitted_job_returns_a_real_channel_and_cap() -> anyhow::Result<()> {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
-        let submitted = handle(&store, &registry, &host_registry, None, submit_req(1)).await?;
+        let submitted = handle(&store, &registry, &host_registry, None, test_session(), submit_req(1)).await?;
         let job_id = match submitted.result {
             Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
@@ -562,6 +633,7 @@ mod tests {
             &registry,
             &host_registry,
             None,
+            test_session(),
             req(2, control_request::Op::Attach(AttachRequest { job_id: job_id.clone() })),
         )
         .await?;
@@ -585,6 +657,7 @@ mod tests {
             &registry,
             &host_registry,
             None,
+            test_session(),
             req(
                 1,
                 control_request::Op::Attach(AttachRequest {
@@ -617,6 +690,7 @@ mod tests {
             &registry,
             &host_registry,
             None,
+            test_session(),
             req(
                 1,
                 control_request::Op::Attach(AttachRequest {
@@ -640,7 +714,7 @@ mod tests {
     #[tokio::test]
     async fn attach_refuses_an_expired_observer_cap() -> anyhow::Result<()> {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
-        let submitted = handle(&store, &registry, &host_registry, None, submit_req(1)).await?;
+        let submitted = handle(&store, &registry, &host_registry, None, test_session(), submit_req(1)).await?;
         let job_id = match submitted.result {
             Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
@@ -648,7 +722,7 @@ mod tests {
 
         let job = registry.get(&job_id).context("the submitted job must be registered")?;
         let mut expired_cap = job.observer_cap.clone();
-        expired_cap.scope.expires_at = Some(0); // the distant past
+        expired_cap.scope_mut().expires_at = Some(0); // the distant past
         registry.insert(
             job_id.clone(),
             dispatch::JobChannel {
@@ -657,6 +731,7 @@ mod tests {
                 observer_cap: expired_cap,
                 remote_link: None,
                 granted_caps: job.granted_caps.clone(),
+                session: job.session,
             },
         );
 
@@ -665,6 +740,7 @@ mod tests {
             &registry,
             &host_registry,
             None,
+            test_session(),
             req(2, control_request::Op::Attach(AttachRequest { job_id: job_id.clone() })),
         )
         .await?;
@@ -686,7 +762,7 @@ mod tests {
         use crate::link_auth::{LinkAuthError, RemoteLink};
 
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
-        let submitted = handle(&store, &registry, &host_registry, None, submit_req(1)).await?;
+        let submitted = handle(&store, &registry, &host_registry, None, test_session(), submit_req(1)).await?;
         let job_id = match submitted.result {
             Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
@@ -704,6 +780,7 @@ mod tests {
                 observer_cap: job.observer_cap.clone(),
                 remote_link: Some(link),
                 granted_caps: job.granted_caps.clone(),
+                session: job.session,
             },
         );
 
@@ -712,6 +789,7 @@ mod tests {
             &registry,
             &host_registry,
             None,
+            test_session(),
             req(2, control_request::Op::Cancel(CancelRequest { job_id: job_id.clone() })),
         )
         .await?;
@@ -725,6 +803,79 @@ mod tests {
             Err(e) => assert_eq!(e, LinkAuthError::AlreadyClaimed),
             Ok(_) => panic!("a cancelled job's remote link must not authenticate a late-arriving stream"),
         }
+        Ok(())
+    }
+
+    // ---- CF-H-1 (session audit trail) ----
+
+    /// A Cancel on the SAME session that submitted the job succeeds, exactly
+    /// as it always did — and `handle`'s Submit arm really did record that
+    /// session on the job, not leave `session` at its `Uuid::nil()` default
+    /// (the one thing none of this section's other tests, which all use a
+    /// fresh `test_session()` per call, would ever catch).
+    #[tokio::test]
+    async fn a_same_session_submit_then_cancel_succeeds_and_session_is_recorded() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let session = Uuid::new_v4();
+        let submitted = handle(&store, &registry, &host_registry, None, session, submit_req(1)).await?;
+        let job_id = match submitted.result {
+            Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
+            other => anyhow::bail!("expected a Submit response, got {other:?}"),
+        };
+
+        let job = registry.get(&job_id).context("the submitted job must be registered")?;
+        assert!(
+            job.session_matches(session),
+            "Submit must record the submitting session"
+        );
+        assert!(!job.session_matches(Uuid::new_v4()), "a fresh session must not match");
+
+        let cancelled = handle(
+            &store,
+            &registry,
+            &host_registry,
+            None,
+            session,
+            req(2, control_request::Op::Cancel(CancelRequest { job_id: job_id.clone() })),
+        )
+        .await?;
+        assert!(
+            matches!(cancelled.result, Some(control_response::Result::Cancel(_))),
+            "got {:?}",
+            cancelled.result
+        );
+        Ok(())
+    }
+
+    /// A Cancel on a DIFFERENT session than the one that submitted the job
+    /// still succeeds — this is an audit trail, not an access-control gate
+    /// (see `handle`'s own doc on `session`; the real gate is the separate B6
+    /// work). The mismatch itself is proven directly via
+    /// `JobChannel::session_matches` in `dispatch.rs`; this only proves
+    /// `handle` doesn't let it change the outcome.
+    #[tokio::test]
+    async fn a_cross_session_cancel_still_succeeds() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let submitted = handle(&store, &registry, &host_registry, None, Uuid::new_v4(), submit_req(1)).await?;
+        let job_id = match submitted.result {
+            Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
+            other => anyhow::bail!("expected a Submit response, got {other:?}"),
+        };
+
+        let cancelled = handle(
+            &store,
+            &registry,
+            &host_registry,
+            None,
+            Uuid::new_v4(), // a different session than the one that submitted
+            req(2, control_request::Op::Cancel(CancelRequest { job_id: job_id.clone() })),
+        )
+        .await?;
+        assert!(
+            matches!(cancelled.result, Some(control_response::Result::Cancel(_))),
+            "got {:?}",
+            cancelled.result
+        );
         Ok(())
     }
 
@@ -751,6 +902,7 @@ mod tests {
             &registry,
             &host_registry,
             None,
+            test_session(),
             submit_req_with_caps(1, manifest, vec![submitter_cap]),
         )
         .await?;
@@ -784,6 +936,7 @@ mod tests {
             &registry,
             &host_registry,
             None,
+            test_session(),
             submit_req_with_caps(1, manifest, vec![submitter_cap]),
         )
         .await?;
@@ -817,6 +970,7 @@ mod tests {
             &registry,
             &host_registry,
             None,
+            test_session(),
             submit_req_with_caps(1, manifest, vec![submitter_cap]),
         )
         .await?;
@@ -832,6 +986,7 @@ mod tests {
             &registry,
             &host_registry,
             None,
+            test_session(),
             req(2, control_request::Op::List(ListRequest {})),
         )
         .await?;
@@ -865,6 +1020,7 @@ mod tests {
             &registry,
             &host_registry,
             None,
+            test_session(),
             submit_req_with_caps(1, manifest, vec![submitter_cap]),
         )
         .await?;
@@ -889,7 +1045,7 @@ mod tests {
             rights: full_rights(),
             expires_at: None,
         })?;
-        forged_cap.proof[0] ^= 0xFF; // tamper the proof
+        forged_cap.proof_mut()[0] ^= 0xFF; // tamper the proof
         let manifest = manifest_json(vec![CapRequest {
             channel_id: ChannelId::from("peer-group-1"),
             rights: read_only(),
@@ -900,6 +1056,7 @@ mod tests {
             &registry,
             &host_registry,
             None,
+            test_session(),
             submit_req_with_caps(1, manifest, vec![forged_cap]),
         )
         .await?;
@@ -933,6 +1090,7 @@ mod tests {
             &registry,
             &host_registry,
             None,
+            test_session(),
             submit_req_with_caps(1, manifest, vec![expired_cap]),
         )
         .await?;
@@ -968,6 +1126,7 @@ mod tests {
             &registry,
             &host_registry,
             None,
+            test_session(),
             submit_req_with_caps(1, manifest, vec![cap]),
         )
         .await?;
@@ -1002,7 +1161,7 @@ mod tests {
             }),
         );
 
-        let response = handle(&store, &registry, &host_registry, None, request).await?;
+        let response = handle(&store, &registry, &host_registry, None, test_session(), request).await?;
         match response.result {
             Some(control_response::Result::Error(ControlError { message })) => {
                 assert!(message.contains("not understood"), "got {message:?}");
@@ -1019,7 +1178,75 @@ mod tests {
     #[tokio::test]
     async fn a_direct_mint_submit_with_no_submitter_caps_is_unaffected() -> anyhow::Result<()> {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
-        let response = handle(&store, &registry, &host_registry, None, submit_req(1)).await?;
+        let response = handle(&store, &registry, &host_registry, None, test_session(), submit_req(1)).await?;
+        assert!(
+            matches!(response.result, Some(control_response::Result::Submit(_))),
+            "got {:?}",
+            response.result
+        );
+        Ok(())
+    }
+
+    // ---- CF-M-1 (oversized manifest) ----
+
+    /// Adversarial: a manifest over the size cap is refused outright, before
+    /// decision C-at-Submit even runs — and, like that refusal, leaves no
+    /// trace (checked via `list` staying empty).
+    #[tokio::test]
+    async fn an_oversized_manifest_refuses_the_submit_and_creates_no_job() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let oversized = vec![0u8; sandy_control_proto::MAX_MANIFEST_LEN as usize + 1];
+        let request = req(
+            1,
+            control_request::Op::Submit(SubmitRequest {
+                manifest: oversized,
+                manifest_encoding: "test/v1".to_owned(),
+                submitter_caps: Vec::new(),
+            }),
+        );
+
+        let response = handle(&store, &registry, &host_registry, None, test_session(), request).await?;
+        match response.result {
+            Some(control_response::Result::Error(ControlError { message })) => {
+                assert!(message.contains("exceeds"), "got {message:?}");
+            }
+            other => anyhow::bail!("expected a refusal, got {other:?}"),
+        }
+
+        let list = handle(
+            &store,
+            &registry,
+            &host_registry,
+            None,
+            test_session(),
+            req(2, control_request::Op::List(ListRequest {})),
+        )
+        .await?;
+        match list.result {
+            Some(control_response::Result::List(ListResponse { jobs })) => {
+                assert!(jobs.is_empty(), "an oversized manifest must create no job: {jobs:?}");
+            }
+            other => anyhow::bail!("expected a List response, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// Positive: a manifest at EXACTLY the cap is accepted — the limit is
+    /// over, not at-or-over.
+    #[tokio::test]
+    async fn a_manifest_at_exactly_the_cap_succeeds() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let at_cap = vec![0u8; sandy_control_proto::MAX_MANIFEST_LEN as usize];
+        let request = req(
+            1,
+            control_request::Op::Submit(SubmitRequest {
+                manifest: at_cap,
+                manifest_encoding: "test/v1".to_owned(),
+                submitter_caps: Vec::new(),
+            }),
+        );
+
+        let response = handle(&store, &registry, &host_registry, None, test_session(), request).await?;
         assert!(
             matches!(response.result, Some(control_response::Result::Submit(_))),
             "got {:?}",
@@ -1065,7 +1292,15 @@ mod tests {
         let mut dispatch_rx = register_test_host(&host_registry, "ws01", peer_ip, trusted_host_capabilities());
 
         let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
-        let response = handle(&store, &registry, &host_registry, Some(forward_back), submit_req(1)).await?;
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            submit_req(1),
+        )
+        .await?;
         let job_id = match response.result {
             Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
@@ -1154,7 +1389,15 @@ mod tests {
         ));
 
         let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
-        let response = handle(&store, &registry, &host_registry, Some(forward_back), submit_req(1)).await?;
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            submit_req(1),
+        )
+        .await?;
         let job_id = match response.result {
             Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
@@ -1201,7 +1444,15 @@ mod tests {
         let mut dispatch_rx = register_test_host(&host_registry, "ws01", peer_ip, trusted_host_capabilities());
         let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
 
-        let submitted = handle(&store, &registry, &host_registry, Some(forward_back), submit_req(1)).await?;
+        let submitted = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            submit_req(1),
+        )
+        .await?;
         let job_id = match submitted.result {
             Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
@@ -1223,6 +1474,7 @@ mod tests {
             &registry,
             &host_registry,
             Some(forward_back),
+            test_session(),
             req(2, control_request::Op::Cancel(CancelRequest { job_id: job_id.clone() })),
         )
         .await?;
@@ -1268,7 +1520,15 @@ mod tests {
         let mut dispatch_rx = register_test_host(&host_registry, "ws01", peer_ip, untrusted_only);
 
         let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
-        let response = handle(&store, &registry, &host_registry, Some(forward_back), submit_req(1)).await?;
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            submit_req(1),
+        )
+        .await?;
         let job_id = match response.result {
             Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
             other => {
@@ -1297,7 +1557,15 @@ mod tests {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
 
-        let response = handle(&store, &registry, &host_registry, Some(forward_back), submit_req(1)).await?;
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            submit_req(1),
+        )
+        .await?;
         let job_id = match response.result {
             Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
@@ -1401,6 +1669,7 @@ mod tests {
             &registry,
             &host_registry,
             Some(forward_back),
+            test_session(),
             submit_req_argv(1, &["echo", "hi"]),
         )
         .await?;
@@ -1459,6 +1728,7 @@ mod tests {
             &registry,
             &host_registry,
             Some(forward_back),
+            test_session(),
             req(2, control_request::Op::Status(StatusRequest { job_id: job_id.clone() })),
         )
         .await?;
@@ -1485,6 +1755,7 @@ mod tests {
             &registry,
             &host_registry,
             Some(forward_back),
+            test_session(),
             req(3, control_request::Op::List(ListRequest {})),
         )
         .await?;
@@ -1552,6 +1823,7 @@ mod tests {
             &registry,
             &host_registry,
             Some(forward_back),
+            test_session(),
             submit_req_argv(1, &["echo", "hi"]),
         )
         .await?;

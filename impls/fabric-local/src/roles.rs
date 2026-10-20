@@ -415,18 +415,18 @@ mod tests {
     impl CapAuthority for TestAuthority {
         fn mint(&self, scope: CapScope) -> Result<Cap, CapError> {
             let proof = Self::proof(&scope);
-            Ok(Cap { scope, proof })
+            Ok(Cap::new(scope, proof))
         }
 
         fn verify(&self, cap: &Cap) -> Result<CapScope, CapError> {
-            if cap.proof != Self::proof(&cap.scope) {
+            if cap.proof() != Self::proof(cap.scope()) {
                 return Err(CapError::Forged);
             }
             let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
-            if cap.scope.expires_at.is_some_and(|t| t <= now) {
+            if cap.scope().expires_at.is_some_and(|t| t <= now) {
                 return Err(CapError::Expired);
             }
-            Ok(cap.scope.clone())
+            Ok(cap.scope().clone())
         }
 
         fn attenuate(&self, parent: &Cap, rights: CapRights) -> Result<Cap, CapError> {
@@ -556,7 +556,7 @@ mod tests {
         let parent_role = PeerGroupRole::new(parent_channel, parent_membership);
         let sub_cap = parent_role.invite_subagent(read_only()).context("invite_subagent")?;
         anyhow::ensure!(
-            !sub_cap.scope.rights.post,
+            !sub_cap.scope().rights.post,
             "an attenuated cap must not gain post rights"
         );
 

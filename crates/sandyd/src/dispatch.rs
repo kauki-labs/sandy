@@ -41,6 +41,7 @@ use sandy_fabric::{
     types::{ChannelId, PeerId},
 };
 use sandy_fabric_local::{LocalCapAuthority, SharedCapAuthority, channel::Channel, inmem::InMem};
+use uuid::Uuid;
 
 use crate::link_auth::{self, LinkAuthError, RemoteLink};
 
@@ -75,6 +76,26 @@ pub struct JobChannel {
     /// is ever created) is #226's actual deliverable; handing the granted
     /// caps to a running job is dispatch-core's job once it exists.
     pub granted_caps: Vec<Cap>,
+    /// The session id (CF-H-1) of the connection that submitted this job.
+    /// Defaults to [`Uuid::nil`] here — `handler::handle`'s Submit arm
+    /// overwrites it with the real submitting connection's session right
+    /// after minting, the same late-assignment pattern `granted_caps` above
+    /// already follows. Compared, not trusted: a mismatch on a later
+    /// Cancel/Attach is logged, not refused — see [`JobChannel::session_matches`].
+    pub session: Uuid,
+}
+
+impl JobChannel {
+    /// Whether `session` is the one that submitted this job (CF-H-1). Plain
+    /// equality, not a capability or an access-control gate: a mismatch here
+    /// is an audit signal for `handler` to log, never a refusal — the real
+    /// connection-trust gate is the separate B6 work this pass's audit trail
+    /// stands in for. Returns a flag rather than an error so the caller (and
+    /// a test) can observe a mismatch directly, without scraping logs.
+    #[must_use]
+    pub fn session_matches(&self, session: Uuid) -> bool {
+        self.session == session
+    }
 }
 
 /// A dispatch failure.
@@ -134,6 +155,7 @@ pub async fn mint_job_channel(job_id: &str, authority: &SharedCapAuthority) -> R
         observer_cap,
         remote_link: None,
         granted_caps: Vec::new(),
+        session: Uuid::nil(),
     })
 }
 
@@ -286,6 +308,21 @@ mod tests {
         Ok(())
     }
 
+    /// CF-H-1: `session_matches` is a plain flag, not an error — proven
+    /// directly here rather than only inferred from `handle`'s unchanged
+    /// response shape on a mismatch (see `handler.rs`'s own cross-session
+    /// test for that half).
+    #[tokio::test]
+    async fn session_matches_reports_a_mismatch_as_a_plain_flag() -> anyhow::Result<()> {
+        let mut job = mint_job_channel("job-1", &test_authority()).await?;
+        let submitting_session = Uuid::new_v4();
+        job.session = submitting_session;
+
+        assert!(job.session_matches(submitting_session));
+        assert!(!job.session_matches(Uuid::new_v4()));
+        Ok(())
+    }
+
     #[test]
     fn the_registry_returns_none_for_an_unregistered_job() -> anyhow::Result<()> {
         let registry = JobRegistry::new()?;
@@ -297,11 +334,11 @@ mod tests {
     async fn the_registry_round_trips_a_registered_job() -> anyhow::Result<()> {
         let registry = JobRegistry::new()?;
         let job = mint_job_channel("job-1", registry.authority()).await?;
-        let agent_cap_proof = job.agent_cap.proof.clone();
+        let agent_cap_proof = job.agent_cap.proof().to_vec();
         registry.insert("job-1".to_owned(), job);
 
         let found = registry.get("job-1").expect("job-1 was registered");
-        assert_eq!(found.agent_cap.proof, agent_cap_proof);
+        assert_eq!(found.agent_cap.proof(), agent_cap_proof.as_slice());
         assert!(registry.get("job-2").is_none());
         Ok(())
     }
