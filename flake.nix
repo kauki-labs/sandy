@@ -9,6 +9,14 @@
     treefmt-nix.url = "github:numtide/treefmt-nix";
     flake-root.url = "github:srid/flake-root";
     pre-commit.url = "github:cachix/git-hooks.nix";
+    # Pinned for the `audit` check (CF-L-2): `cargo audit -d <path>` reads the
+    # advisory TOML files directly, no git metadata needed, so the plain
+    # tarball fetch is enough and the sandboxed build needs no network fetch
+    # of its own.
+    advisory-db = {
+      url = "github:rustsec/advisory-db";
+      flake = false;
+    };
 
     flake-parts.inputs.nixpkgs-lib.follows = "nixpkgs";
     rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
@@ -87,6 +95,7 @@
               craneLib
               covCraneLib
               ;
+            advisoryDb = inputs.advisory-db;
           };
 
           # CLI end-to-end suite (tests/e2e), non-live subset: drive the built
@@ -218,6 +227,7 @@
               doc
               test
               shear
+              audit
               coverage
               ;
             tests-e2e-cli = testsE2eCli;
