@@ -119,24 +119,52 @@ pub struct JobStore {
     max_rows: Option<usize>,
 }
 
+/// Tighten `path` (an existing store file) and any journal/WAL sidecar SQLite
+/// may have left next to it (`-journal`, `-wal`, `-shm`) to `0600`. Pulled out
+/// of [`JobStore::open`] so the sidecar-tightening step is testable on its
+/// own, without going through `Connection::open`: SQLite itself deletes a
+/// stale rollback-journal sidecar as part of opening the main file, so a test
+/// that asserts on the sidecar's permissions *after* a full `open()` can't
+/// observe this step — the sidecar may simply be gone by then.
+fn tighten_existing_file_and_sidecars(path: &Path) -> Result<(), StoreError> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        let sidecar = Path::new(&sidecar);
+        if sidecar.exists() {
+            std::fs::set_permissions(sidecar, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(())
+}
+
 impl JobStore {
-    /// Open (creating if needed) the job store at `path`, ensure its schema
-    /// exists, and tighten the file to `0600` (CF-M-7) — the same floor the
-    /// control socket already gets (`main.rs`'s `bind_unix_listener`), since
-    /// this file holds the same job manifests and results that socket
-    /// carries.
+    /// Open (creating if needed) the job store at `path`, tighten it (and any
+    /// journal/WAL sidecar) to `0600` (CF-M-7), then ensure its schema exists
+    /// — the same floor the control socket already gets (`main.rs`'s
+    /// `bind_unix_listener`), since this file holds the same job manifests
+    /// and results that socket carries.
+    ///
+    /// Tightening happens *before* `Connection::open`/schema migration, not
+    /// after: a migration (`ensure_column`'s `ALTER TABLE`) is a write
+    /// transaction, and SQLite creates its journal/WAL sidecar inheriting
+    /// whatever permissions the main file already has at that moment —
+    /// chmod'ing only afterward would let a migration against a pre-existing,
+    /// loosely-permissioned file leave a sidecar at the loose mode too.
     ///
     /// # Errors
     /// [`StoreError::Sqlite`] if the file cannot be opened or the schema
     /// cannot be created; [`StoreError::Io`] if the permissions cannot be
     /// set.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        // Pre-create a brand-new file at 0600 ourselves, atomically, so a
-        // fresh store is never briefly wide-open between SQLite's own create
-        // (whatever the umask leaves it) and the chmod below. `AlreadyExists`
-        // means a prior run already owns the file; fall through to the
-        // existing-file path, which the chmod below still tightens
-        // regardless of umask.
+        // A brand-new file is created at 0600 ourselves, atomically, so it's
+        // never briefly wide-open between SQLite's own create (whatever the
+        // umask leaves it) and a chmod. `AlreadyExists` means a prior run
+        // already owns the file (or a journal/WAL sidecar it left behind,
+        // possibly pre-dating this fix, or created under a looser umask):
+        // tighten the file and every sidecar SQLite may have left before
+        // anything reopens or migrates them.
         use std::os::unix::fs::OpenOptionsExt;
         match std::fs::OpenOptions::new()
             .write(true)
@@ -145,13 +173,11 @@ impl JobStore {
             .open(path)
         {
             Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => tighten_existing_file_and_sidecars(path)?,
             Err(e) => return Err(e.into()),
         }
         let conn = Connection::open(path)?;
-        let store = Self::from_connection(conn)?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        Ok(store)
+        Self::from_connection(conn)
     }
 
     /// An in-memory store, for tests: no file, gone when the store is dropped.
@@ -709,6 +735,46 @@ mod tests {
 
         let mode = std::fs::metadata(&db_path)?.permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "got {mode:o}");
+        Ok(())
+    }
+
+    /// CF-M-7 follow-up: a journal/WAL sidecar SQLite left behind by a prior
+    /// run (pre-dating this fix, or created under a looser umask) is
+    /// tightened too, not just the main file — a sidecar SQLite reuses rather
+    /// than recreates would otherwise keep its old, wider permissions
+    /// forever. Exercises `tighten_existing_file_and_sidecars` directly
+    /// rather than through `JobStore::open`: SQLite deletes a stale
+    /// rollback-journal sidecar as part of its own opening logic, so the file
+    /// may no longer exist by the time a full `open()` call returns.
+    #[test]
+    fn a_pre_existing_sidecar_is_tightened() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db_path = tmp.path().join("sandyd.db");
+        std::fs::File::create(&db_path)?.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+        let journal_path = tmp.path().join("sandyd.db-journal");
+        std::fs::File::create(&journal_path)?.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+
+        tighten_existing_file_and_sidecars(&db_path)?;
+
+        let db_mode = std::fs::metadata(&db_path)?.permissions().mode() & 0o777;
+        assert_eq!(db_mode, 0o600, "main file got {db_mode:o}");
+        let journal_mode = std::fs::metadata(&journal_path)?.permissions().mode() & 0o777;
+        assert_eq!(journal_mode, 0o600, "sidecar got {journal_mode:o}");
+        Ok(())
+    }
+
+    /// A sidecar that doesn't exist is skipped, not an error — the common
+    /// case, since most opens find no leftover journal/WAL file at all.
+    #[test]
+    fn tightening_with_no_sidecar_present_is_not_an_error() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db_path = tmp.path().join("sandyd.db");
+        std::fs::File::create(&db_path)?.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+
+        tighten_existing_file_and_sidecars(&db_path)?;
+
+        let db_mode = std::fs::metadata(&db_path)?.permissions().mode() & 0o777;
+        assert_eq!(db_mode, 0o600, "main file got {db_mode:o}");
         Ok(())
     }
 
