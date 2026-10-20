@@ -44,6 +44,7 @@ pub async fn serve_connection(
     // session a Cancel/Attach's target job recorded at Submit. See
     // `handler::handle`'s own doc on `session`.
     let session = uuid::Uuid::new_v4();
+    tracing::info!(%session, "control connection opened");
 
     loop {
         let request: ControlRequest = match read_frame(&mut stream).await {

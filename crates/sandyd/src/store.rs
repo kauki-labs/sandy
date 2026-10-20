@@ -131,6 +131,23 @@ impl JobStore {
     /// cannot be created; [`StoreError::Io`] if the permissions cannot be
     /// set.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
+        // Pre-create a brand-new file at 0600 ourselves, atomically, so a
+        // fresh store is never briefly wide-open between SQLite's own create
+        // (whatever the umask leaves it) and the chmod below. `AlreadyExists`
+        // means a prior run already owns the file; fall through to the
+        // existing-file path, which the chmod below still tightens
+        // regardless of umask.
+        use std::os::unix::fs::OpenOptionsExt;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+        {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
         let conn = Connection::open(path)?;
         let store = Self::from_connection(conn)?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;

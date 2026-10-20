@@ -241,7 +241,10 @@ pub async fn handle(
                 return Ok(ControlResponse {
                     request_id: request.request_id,
                     result: Some(control_response::Result::Error(ControlError {
-                        message: format!("the job store is at its {max}-row capacity; try again later"),
+                        message: format!(
+                            "the job store is at its {max}-row capacity (SANDY_MAX_JOBS); terminal jobs are not \
+                             pruned, so an operator must clear old rows before new submits can succeed"
+                        ),
                     })),
                 });
             }
@@ -291,12 +294,18 @@ pub async fn handle(
         }
         Some(control_request::Op::Cancel(cancel)) => {
             // CF-H-1: an audit trail, not a gate — a mismatch is logged, never
-            // refused (see `handle`'s own doc on `session`).
+            // refused (see `handle`'s own doc on `session`). `info`, not
+            // `warn`: the CLI opens a fresh connection per invocation, so a
+            // later `cancel` from a separate `sandy daemon` call is the
+            // ordinary case, not an anomaly — this is a correlation trail,
+            // not an alert.
             if let Some(job) = registry.get(&cancel.job_id)
                 && !job.session_matches(session)
             {
-                tracing::warn!(
+                tracing::info!(
                     job_id = %cancel.job_id,
+                    submitted_session = %job.session,
+                    requesting_session = %session,
                     "cancel from a different session than the one that submitted this job"
                 );
             }
@@ -348,8 +357,10 @@ pub async fn handle(
                 // CF-H-1: an audit trail, not a gate — see the Cancel arm
                 // above and `handle`'s own doc on `session`.
                 if !job.session_matches(session) {
-                    tracing::warn!(
+                    tracing::info!(
                         job_id = %attach.job_id,
+                        submitted_session = %job.session,
+                        requesting_session = %session,
                         "attach from a different session than the one that submitted this job"
                     );
                 }
