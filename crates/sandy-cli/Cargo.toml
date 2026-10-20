@@ -66,6 +66,7 @@ tiny_http.workspace = true
 tokio = { workspace = true, features = ["net"] }
 tracing.workspace = true
 uuid.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
@@ -80,3 +81,4 @@ sandy-proto.workspace = true
 rustix.workspace = true
 rstest.workspace = true
 sandy-test-support.workspace = true
+tracing-subscriber.workspace = true

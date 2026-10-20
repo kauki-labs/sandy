@@ -44,6 +44,7 @@ fn succeeded_envelope(job_id: &str) -> ResultEnvelope {
             template_store_path: "/nix/store/xxx".to_string(),
         },
         logs: Logs { tail: String::new() },
+        warnings: Vec::new(),
     }
 }
 

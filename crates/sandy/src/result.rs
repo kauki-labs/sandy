@@ -112,6 +112,7 @@ mod tests {
             logs: Logs {
                 tail: "done".to_string(),
             },
+            warnings: vec!["credential \"GH_TOKEN\" revoke failed at teardown; relying on native expiry".to_string()],
         }
     }
 
@@ -138,12 +139,40 @@ mod tests {
                 "result_schema_version",
                 "retryable",
                 "status",
+                "warnings",
             ]
         );
         assert_eq!(value["receipts"][0]["ref"], "https://example/pull/1");
         assert_eq!(value["provenance"]["template_store_path"], "/nix/store/xxx-template");
         assert_eq!(value["logs"]["tail"], "done");
         assert_eq!(value["outputs"][0]["path"], "result.txt");
+        assert_eq!(
+            value["warnings"][0],
+            "credential \"GH_TOKEN\" revoke failed at teardown; relying on native expiry"
+        );
+        Ok(())
+    }
+
+    /// L-12: a pre-`warnings` (schema v1) journal record with no `warnings` key
+    /// still deserializes, defaulting to empty — `#[serde(default)]` keeps old
+    /// records readable across the schema bump.
+    #[test]
+    fn an_old_schema_v1_record_with_no_warnings_key_deserializes_to_empty() -> anyhow::Result<()> {
+        let v1_json = serde_json::json!({
+            "result_schema_version": 1,
+            "job_id": "job-1",
+            "box_id": null,
+            "status": "succeeded",
+            "retryable": false,
+            "message": "ok",
+            "exit_code": 0,
+            "outputs": [],
+            "receipts": [],
+            "provenance": { "template_store_path": "" },
+            "logs": { "tail": "" },
+        });
+        let envelope: ResultEnvelope = serde_json::from_value(v1_json)?;
+        assert!(envelope.warnings.is_empty());
         Ok(())
     }
 

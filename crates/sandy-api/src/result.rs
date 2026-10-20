@@ -8,7 +8,11 @@
 use serde::{Deserialize, Serialize};
 
 /// The schema version stamped into every envelope (INV-6/INV-11).
-pub const RESULT_SCHEMA_VERSION: u32 = 1;
+///
+/// Bumped to `2` for `warnings` (L-12): a non-fatal fault folded into the
+/// envelope rather than only logged. `#[serde(default)]` on the field keeps a
+/// `1` journal record readable.
+pub const RESULT_SCHEMA_VERSION: u32 = 2;
 
 /// Terminal status of a job on the wire. The lowercase values are part of the
 /// LOCKED schema; `rename_all` selects them without renaming any field key.
@@ -132,4 +136,8 @@ pub struct ResultEnvelope {
     pub provenance: Provenance,
     /// Captured logs.
     pub logs: Logs,
+    /// Non-fatal faults folded into the run rather than failing it (L-12), e.g. a
+    /// credential revoke that failed at teardown. Empty on every ordinary run.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }

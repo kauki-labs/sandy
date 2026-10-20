@@ -93,6 +93,7 @@ fn succeeded_envelope() -> ResultEnvelope {
             template_store_path: "/nix/store/xxx-template".to_string(),
         },
         logs: Logs { tail: String::new() },
+        warnings: Vec::new(),
     }
 }
 

@@ -53,3 +53,20 @@ serialized envelope) both flow through the `format_*` helpers.
 
 **Consequences.** The two renderings stay in lock-step; adding a field surfaces in
 both. `plain` is the default so interactive use is readable without a flag.
+
+## 4. Non-fatal faults surface as `warnings`, not silently
+
+**Status:** accepted. **Upholds:** INV-11.
+
+**Context.** Some failures (e.g. a credential revoke failing at teardown, L-12)
+must not fail an otherwise-successful run, but swallowing them into a log line
+only means an API/JSON caller never sees them.
+
+**Decision.** `ResultEnvelope` gains `warnings: Vec<String>` (schema bumped to
+`2`, `#[serde(default)]` so a `1` journal record still deserializes). A non-fatal
+fault is named there — never the secret value — in addition to its
+`tracing::warn!`.
+
+**Consequences.** The locked key set grows by one key, a deliberate version
+bump (not a quiet addition): `envelope_wire_keys_are_snake_case` is updated on
+purpose. `warnings` is empty on every ordinary run.

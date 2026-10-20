@@ -88,6 +88,7 @@ mod tests {
             logs: Logs {
                 tail: "done".to_string(),
             },
+            warnings: Vec::new(),
         }
     }
 

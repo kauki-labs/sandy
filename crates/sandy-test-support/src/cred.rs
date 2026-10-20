@@ -16,6 +16,7 @@ use sandy_api::cred::{CredError, CredentialHandle, CredentialProvider, Lease, MA
 pub struct FakeProvider {
     token: String,
     fail: bool,
+    fail_revoke: bool,
     mints: Mutex<Vec<(Scope, Duration)>>,
     revokes: Mutex<Vec<CredentialHandle>>,
 }
@@ -27,6 +28,7 @@ impl FakeProvider {
         Self {
             token: token.to_string(),
             fail: false,
+            fail_revoke: false,
             mints: Mutex::new(Vec::new()),
             revokes: Mutex::new(Vec::new()),
         }
@@ -38,9 +40,19 @@ impl FakeProvider {
         Self {
             token: String::new(),
             fail: true,
+            fail_revoke: false,
             mints: Mutex::new(Vec::new()),
             revokes: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Make every `revoke` call fail with [`CredError::Revoke`], while mint/refresh
+    /// behave as scripted — models a forge revoke endpoint failing after a token
+    /// minted fine (L-12).
+    #[must_use]
+    pub fn with_failing_revoke(mut self) -> Self {
+        self.fail_revoke = true;
+        self
     }
 
     /// The `(scope, ttl_hint)` of every [`CredentialProvider::mint`] call.
@@ -83,6 +95,9 @@ impl CredentialProvider for FakeProvider {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(lease.handle.clone());
+        if self.fail_revoke {
+            return Err(CredError::Revoke("fake provider configured to fail revoke".to_string()));
+        }
         Ok(())
     }
 

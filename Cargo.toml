@@ -70,6 +70,9 @@ hex = "0.4"
 base64 = "0.23"
 portable-pty = "0.9"
 tiny_http = "0.12"
+# The console-redaction secret holder (M-6): zeroized on drop, never relied on as
+# the Lease's own storage (INV-1 is unchanged).
+zeroize = "1.8"
 tokio-vsock = "0.7"
 vsock = "0.5"
 socket2 = "0.6"

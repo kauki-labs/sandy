@@ -127,6 +127,7 @@ fn terminal_record(job_id: &str, started: SystemTime) -> JobRecord {
                 template_store_path: "/nix/store/xxx".to_string(),
             },
             logs: Logs { tail: String::new() },
+            warnings: Vec::new(),
         }),
     }
 }
@@ -143,6 +144,7 @@ fn run_positive_writes_a_succeeded_record_with_the_envelope() -> anyhow::Result<
         &FakeApplier::new(),
         EgressOs::Linux,
         None,
+        &[],
     )
     .context("run_job (positive)")?;
 
@@ -177,8 +179,16 @@ fn run_lists_collected_outputs_in_the_envelope() -> anyhow::Result<()> {
     }];
 
     let backend = FakeBackend::new().with_outcome(ok_outcome(0));
-    let report = run_job(&backend, &journal, &plan, &FakeApplier::new(), EgressOs::Linux, None)
-        .context("run_job with outputs")?;
+    let report = run_job(
+        &backend,
+        &journal,
+        &plan,
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        None,
+        &[],
+    )
+    .context("run_job with outputs")?;
 
     let paths: Vec<&str> = report.envelope.outputs.iter().map(|o| o.path.as_str()).collect();
     assert_eq!(
@@ -201,6 +211,7 @@ fn run_guest_failure_is_band_one_not_retryable() -> anyhow::Result<()> {
         &FakeApplier::new(),
         EgressOs::Linux,
         None,
+        &[],
     )
     .context("run_job (guest failure)")?;
 
@@ -230,6 +241,7 @@ fn run_timeout_is_band_one_not_retryable() -> anyhow::Result<()> {
         &FakeApplier::new(),
         EgressOs::Linux,
         None,
+        &[],
     )
     .context("run_job (timeout)")?;
 
@@ -256,6 +268,7 @@ fn run_infra_fault_is_band_three_and_retryable() -> anyhow::Result<()> {
         &FakeApplier::new(),
         EgressOs::Linux,
         None,
+        &[],
     )
     .context("run_job (infra fault)")?;
 
@@ -280,6 +293,7 @@ fn run_invalid_plan_writes_no_record_and_never_boots() -> anyhow::Result<()> {
         &FakeApplier::new(),
         EgressOs::Linux,
         None,
+        &[],
     )
     .context("run_job (invalid plan)")?;
 
@@ -309,6 +323,7 @@ fn ls_lists_a_written_job() -> anyhow::Result<()> {
         &FakeApplier::new(),
         EgressOs::Linux,
         None,
+        &[],
     )
     .context("run_job before ls")?;
 
@@ -329,6 +344,7 @@ fn status_returns_the_written_job() -> anyhow::Result<()> {
         &FakeApplier::new(),
         EgressOs::Linux,
         None,
+        &[],
     )
     .context("run_job before status")?;
 
@@ -441,8 +457,16 @@ fn run_on_linux_applies_the_allow_list_ruleset_and_reverts_it() -> anyhow::Resul
     let applier = FakeApplier::new();
     let plan = allowing_plan();
 
-    let report = run_job(&backend, &journal, &plan, &applier, EgressOs::Linux, Some("sandytap0"))
-        .context("run_job (linux egress)")?;
+    let report = run_job(
+        &backend,
+        &journal,
+        &plan,
+        &applier,
+        EgressOs::Linux,
+        Some("sandytap0"),
+        &[],
+    )
+    .context("run_job (linux egress)")?;
 
     assert_eq!(report.envelope.status, Status::Succeeded);
     assert_eq!(
@@ -485,6 +509,7 @@ fn egress_apply_failure_fails_closed_with_a_terminal_record() -> anyhow::Result<
         &FailingApplier,
         EgressOs::Linux,
         Some("sandytap0"),
+        &[],
     )
     .context("run_job (egress apply fails)")?;
 
@@ -520,8 +545,16 @@ fn run_on_macos_applies_no_boundary_but_still_succeeds() -> anyhow::Result<()> {
     let backend = FakeBackend::new().with_outcome(ok_outcome(0));
     let applier = FakeApplier::new();
 
-    let report =
-        run_job(&backend, &journal, &allowing_plan(), &applier, EgressOs::MacOs, None).context("run_job (macos)")?;
+    let report = run_job(
+        &backend,
+        &journal,
+        &allowing_plan(),
+        &applier,
+        EgressOs::MacOs,
+        None,
+        &[],
+    )
+    .context("run_job (macos)")?;
 
     assert_eq!(
         report.envelope.status,
@@ -554,6 +587,7 @@ fn egress_boundary_is_reverted_even_when_the_backend_run_fails() -> anyhow::Resu
         &applier,
         EgressOs::Linux,
         Some("sandytap0"),
+        &[],
     )
     .context("run_job (boot failure)")?;
 
@@ -612,8 +646,16 @@ fn mint_run_token_stages_a_secret_and_the_token_travels_only_the_secret_channel(
         ..booting_plan()
     };
     let backend = FakeBackend::new().with_outcome(ok_outcome(0));
-    let report =
-        run_job(&backend, &journal, &plan, &FakeApplier::new(), EgressOs::Linux, None).context("run_job (token)")?;
+    let report = run_job(
+        &backend,
+        &journal,
+        &plan,
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        None,
+        &[],
+    )
+    .context("run_job (token)")?;
     assert_eq!(report.envelope.status, Status::Succeeded);
 
     // INV-1: the token bytes are in the file, never in the guest argv or env.
@@ -681,6 +723,11 @@ fn credential_is_minted_run_revoked_and_cleaned() -> anyhow::Result<()> {
     assert!(
         !cred_dir.join("GH_TOKEN").exists(),
         "the minted token file must be removed after the run (INV-1)"
+    );
+    assert!(
+        report.envelope.warnings.is_empty(),
+        "a clean revoke must leave no warning: {:?}",
+        report.envelope.warnings
     );
     Ok(())
 }
@@ -759,6 +806,178 @@ fn credential_mint_failure_fails_closed_before_any_run() -> anyhow::Result<()> {
         "a mint failure must write no job record"
     );
     assert_eq!(provider.revoked().len(), 0, "nothing to revoke when the mint failed");
+    Ok(())
+}
+
+// --- console redaction + revoke-failure warnings (M-6 / L-12) ---------------
+
+/// M-6: a console that echoes the minted token never reaches the envelope, or
+/// the journaled terminal record, in the clear.
+#[test]
+fn credentialed_run_redacts_the_token_from_the_console() -> anyhow::Result<()> {
+    let (tmp, journal) = fresh_journal()?;
+    let token = "ghs_super_secret_marker_value";
+    let provider = FakeProvider::returning(token);
+    let backend = FakeBackend::new().with_outcome(Outcome {
+        booted: true,
+        guest_exit: Some(0),
+        transport_error: None,
+        timed_out: false,
+        console: format!("booting...\ngit credential fill -> {token}\ndone"),
+    });
+    let cred_dir = tmp.path().join("cred");
+    std::fs::create_dir_all(&cred_dir).context("create cred dir")?;
+    std::fs::set_permissions(&cred_dir, std::fs::Permissions::from_mode(0o700)).context("cred dir 0700")?;
+
+    let report = run_job_with_credential(
+        &backend,
+        &journal,
+        booting_plan(),
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        None,
+        &provider,
+        &token_scope(),
+        "GH_TOKEN",
+        &cred_dir,
+        1_800,
+    )
+    .context("run_job_with_credential (console echoes token)")?;
+
+    assert!(
+        !report.envelope.logs.tail.contains(token),
+        "the returned envelope must not carry the raw token: {:?}",
+        report.envelope.logs.tail
+    );
+    assert!(
+        report.envelope.logs.tail.contains("[REDACTED]"),
+        "the console must show the redaction marker: {:?}",
+        report.envelope.logs.tail
+    );
+
+    let record = journal
+        .read_record(&report.envelope.job_id)
+        .context("terminal record must be on disk")?;
+    let persisted = record.result.context("terminal record must carry the envelope")?;
+    assert!(
+        !persisted.logs.tail.contains(token),
+        "the journaled terminal record must not carry the raw token: {:?}",
+        persisted.logs.tail
+    );
+    Ok(())
+}
+
+/// A `Vec<u8>`-backed [`tracing_subscriber`] writer shared with the test, so a
+/// subscriber installed for just one call can be inspected afterward.
+#[derive(Clone, Default)]
+struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl SharedBuf {
+    fn contents(&self) -> anyhow::Result<String> {
+        let bytes = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        String::from_utf8(bytes).context("captured log is utf8")
+    }
+}
+
+impl std::io::Write for SharedBuf {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
+    type Writer = SharedBuf;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// L-12: a revoke failure at teardown never fails the run, is folded into the
+/// envelope's `warnings` naming the credential, and the `tracing::warn!` event
+/// carries the job id with no token substring anywhere in it.
+#[test]
+fn credential_revoke_failure_surfaces_as_a_warning_not_a_fault() -> anyhow::Result<()> {
+    let (tmp, journal) = fresh_journal()?;
+    let token = "ghs_revoke_failure_marker_value";
+    let provider = FakeProvider::returning(token).with_failing_revoke();
+    let backend = FakeBackend::new().with_outcome(ok_outcome(0));
+    let cred_dir = tmp.path().join("cred");
+    std::fs::create_dir_all(&cred_dir).context("create cred dir")?;
+    std::fs::set_permissions(&cred_dir, std::fs::Permissions::from_mode(0o700)).context("cred dir 0700")?;
+
+    let buf = SharedBuf::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(buf.clone())
+        .with_ansi(false)
+        .finish();
+    let report = tracing::subscriber::with_default(subscriber, || {
+        run_job_with_credential(
+            &backend,
+            &journal,
+            booting_plan(),
+            &FakeApplier::new(),
+            EgressOs::Linux,
+            None,
+            &provider,
+            &token_scope(),
+            "GH_TOKEN",
+            &cred_dir,
+            1_800,
+        )
+    })
+    .context("run_job_with_credential (revoke fails)")?;
+
+    assert_eq!(
+        report.envelope.status,
+        Status::Succeeded,
+        "a revoke failure must not fail an otherwise-successful run"
+    );
+    assert_eq!(
+        report.envelope.warnings.len(),
+        1,
+        "the envelope must carry exactly one warning: {:?}",
+        report.envelope.warnings
+    );
+    assert!(
+        report.envelope.warnings[0].contains("GH_TOKEN"),
+        "the warning must name the credential: {:?}",
+        report.envelope.warnings
+    );
+
+    // The journaled terminal record must carry the same warning (INV-6: the
+    // record always carries the envelope) — not just the returned `RunReport`.
+    let persisted = journal
+        .read_record(&report.envelope.job_id)
+        .context("terminal record must be on disk")?
+        .result
+        .context("terminal record must carry the envelope")?;
+    assert_eq!(
+        persisted.warnings, report.envelope.warnings,
+        "the journaled record's warnings must match the returned envelope's"
+    );
+
+    let logged = buf.contents()?;
+    let warn_line = logged
+        .lines()
+        .find(|line| line.contains("credential revoke at teardown failed"))
+        .with_context(|| format!("no warn event emitted for the revoke failure: {logged}"))?;
+    assert!(
+        warn_line.contains(&report.envelope.job_id),
+        "the warn event's own line must carry the job id: {warn_line}"
+    );
+    assert!(
+        !logged.contains(token),
+        "the warn event must never carry the token value: {logged}"
+    );
     Ok(())
 }
 

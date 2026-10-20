@@ -21,8 +21,38 @@ use sandy::{
     classify_backend_error, classify_invalid_plan, classify_outcome, enforce, mint_lease, new_job_id,
     plan_egress_scoped, plan_eviction, reconcile_job, refresh_once, validate_no_secret_leak,
 };
+use zeroize::Zeroizing;
 
 use crate::plan::JobPlan;
+
+/// Redact every exact occurrence of a `secrets` entry in `console` with
+/// `[REDACTED]` (M-6). A secret under 8 bytes is skipped rather than replaced: a
+/// short value risks consuming unrelated text (a secret `"ab"` must never redact
+/// unrelated `"abc"`), and a real forge token is never that short.
+fn redact_console<S: AsRef<str>>(mut console: String, secrets: &[S]) -> String {
+    for secret in secrets {
+        let secret = secret.as_ref();
+        if secret.len() < 8 {
+            continue;
+        }
+        console = console.replace(secret, "[REDACTED]");
+    }
+    console
+}
+
+/// Re-redact `console` against `initial` plus every token `refresh_loop` queued
+/// onto `redact_log` as it staged one (M-6 follow-up): `run_job`'s own redaction
+/// pass only ever sees `initial`, so a mid-run refresh needs this second pass to
+/// catch its own token too. Both passes borrow their secrets rather than
+/// cloning them into a plain, unzeroized `String` first — `redact_console` is
+/// generic over `AsRef<str>` precisely so `initial` (a `&str`) and `refreshed`
+/// (`Zeroizing<String>`, which forwards `AsRef<str>`) can go straight through.
+/// A no-op when `refreshed` is empty: re-running `redact_console` against
+/// `initial` alone finds nothing new, since the first pass already turned
+/// every occurrence of it into `[REDACTED]`.
+fn redact_with_refreshes(console: String, initial: &str, refreshed: &[Zeroizing<String>]) -> String {
+    redact_console(redact_console(console, &[initial]), refreshed)
+}
 
 /// Build the LOCKED [`ResultEnvelope`] from a terminal [`Classification`].
 ///
@@ -54,7 +84,12 @@ fn build_envelope(
         },
         // The captured guest console tail (boot log + command output), so a boot
         // that never reached the command is diagnosable from the envelope alone.
+        // Redaction (M-6) happens in the caller, right before this console is
+        // passed in — there's no seam after `build_envelope` returns.
         logs: Logs { tail: console },
+        // A credentialed run folds a non-fatal teardown fault in here after this
+        // envelope is built (L-12); every other path leaves it empty.
+        warnings: vec![],
     }
 }
 
@@ -134,6 +169,10 @@ pub struct RunReport {
 /// and can never lock the host off the network (#29); with no tap the Linux and
 /// macOS behaviour is unchanged.
 ///
+/// `redact` lists secrets to strip from the captured console before it reaches
+/// the envelope (M-6): the non-credentialed path passes `&[]`, and
+/// [`run_job_with_credential`] passes the minted token.
+///
 /// # Errors
 ///
 /// Returns [`CoreError`] only on genuine journal I/O failure. Every run-outcome,
@@ -146,6 +185,7 @@ pub fn run_job<B: VmBackend + ?Sized, E: EgressApplier + ?Sized>(
     egress: &E,
     egress_os: EgressOs,
     tap: Option<&str>,
+    redact: &[String],
 ) -> Result<RunReport, CoreError> {
     let spec = plan.as_run_spec();
 
@@ -159,7 +199,7 @@ pub fn run_job<B: VmBackend + ?Sized, E: EgressApplier + ?Sized>(
             classification,
             None,
             plan_error.to_string(),
-            String::new(),
+            redact_console(String::new(), redact),
             vec![],
         );
         return Ok(RunReport {
@@ -236,7 +276,9 @@ pub fn run_job<B: VmBackend + ?Sized, E: EgressApplier + ?Sized>(
         }
     };
 
-    // 6. Write the terminal record carrying the envelope (INV-6).
+    // 6. Write the terminal record carrying the envelope (INV-6). Redact right before the envelope is built: this is
+    //    the last point before the journal write, and there's no seam after `run_job` returns (M-6).
+    let console = redact_console(console, redact);
     let envelope = build_envelope(&job_id, None, classification, guest_exit, message, console, outputs);
     let terminal = JobRecord {
         schema_version: JOURNAL_SCHEMA_VERSION,
@@ -279,6 +321,7 @@ pub fn run_with_profile(
         profile.egress(),
         profile.egress_os(),
         tap,
+        &[],
     )
 }
 
@@ -368,6 +411,22 @@ pub fn run_job_with_credential<
     };
     let token_path = token_path.clone();
 
+    // Read the staged plaintext back once, for console redaction only (M-6): the
+    // `Lease` itself still never carries it past staging (INV-1 unchanged). Held
+    // as long as the lease and zeroized at the same teardown point. A read
+    // failure here is after the credential was minted and staged, so it must
+    // still be revoked before this returns (INV-1) — there's no `CredTeardown`
+    // guard yet to do that for us.
+    let secret = match std::fs::read_to_string(&token_path) {
+        Ok(s) => Zeroizing::new(s),
+        Err(e) => {
+            if let Err(revoke_err) = provider.revoke(&lease) {
+                tracing::warn!(%revoke_err, "credential revoke failed after a staged-token read error; relying on native expiry");
+            }
+            let _ = std::fs::remove_file(&token_path);
+            return Err(e.into());
+        }
+    };
     // Share cred_dir directly instead of pushing a plan secret the backend copies:
     // the caller owns the dir and the refresh thread rewrites the token in it live.
     let mut plan = plan;
@@ -377,56 +436,169 @@ pub fn run_job_with_credential<
     let tick = refresh_interval("SANDY_REFRESH_TICK_SECS", DEFAULT_REFRESH_TICK_SECS);
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
 
-    // Teardown is a Drop guard, not straight-line code after the scope: it revokes
-    // the live token and removes the staged file on EVERY exit from here, including
-    // a panic unwinding out of `run_job` through `thread::scope`. Straight-line
-    // teardown is skipped on a panic, which would leave a valid forge token and the
-    // 0600 secret on disk past the run (INV-1).
-    let teardown = CredTeardown {
+    // Teardown also runs as a Drop guard, not only as the explicit call below: it
+    // revokes the live token and removes the staged file on EVERY exit from here,
+    // including a panic unwinding out of `run_job` through `thread::scope`, where
+    // the explicit call below is never reached. Skipping it on a panic would leave
+    // a valid forge token and the 0600 secret on disk past the run (INV-1).
+    let mut teardown = CredTeardown {
         provider,
         lease: Mutex::new(lease),
         token_path,
+        secret,
+        secret_name: secret_name.to_string(),
+        scope: scope.clone(),
+        job_id: String::new(),
+        done: false,
     };
+    // Borrow the zeroizing holder directly: no unzeroized plaintext clone.
+    // `run_job`'s own redaction only ever sees this initial token; `redact_log`
+    // (M-6 follow-up) catches whatever a mid-run refresh adds after that.
+    let redact = std::slice::from_ref(&*teardown.secret);
+    let redact_log: Mutex<Vec<Zeroizing<String>>> = Mutex::new(Vec::new());
 
     // Run the job on this thread; refresh the credential on a second thread until the
     // run returns, then signal it to stop by dropping the sender. The refresh thread
     // borrows the guard's lease (a `&Mutex`, so the guard isn't moved) and owns the
     // receiver; the scope joins it before the guard's teardown can run.
     let shared_lease = &teardown.lease;
-    std::thread::scope(|s| {
-        s.spawn(move || refresh_loop(provider, shared_lease, margin, tick, &stop_rx));
-        let report = run_job(backend, journal, &plan, egress, egress_os, tap);
+    let shared_redact_log = &redact_log;
+    let mut report = std::thread::scope(|s| {
+        s.spawn(move || refresh_loop(provider, shared_lease, margin, tick, &stop_rx, shared_redact_log));
+        let report = run_job(backend, journal, &plan, egress, egress_os, tap, redact);
         drop(stop_tx);
         report
-    })
-    // `teardown` drops here on return, or during unwind on a panic.
+    });
+
+    // Explicit teardown on the normal return path (the borrow of `teardown.lease`
+    // above ended with `thread::scope`, so this is the first point it can be
+    // touched again): name the job in the revoke-failure log, then fold a
+    // failure into both the returned envelope and the already-journaled terminal
+    // record (L-12) — INV-6 says the record always carries the envelope, so the
+    // two must not drift apart. On a panic, `Drop` runs the same teardown
+    // instead, with no envelope to fold into and no job id yet known.
+    if let Ok(run_report) = &report {
+        teardown.job_id = run_report.envelope.job_id.clone();
+    }
+    let warning = teardown.teardown();
+    let refreshed_tokens = redact_log.into_inner().unwrap_or_else(PoisonError::into_inner);
+    if let Ok(run_report) = &mut report {
+        let mut amended = false;
+
+        // M-6 follow-up: re-redact against every token this run ever had live,
+        // not just the one `run_job` saw at its own redaction pass.
+        if !refreshed_tokens.is_empty() {
+            run_report.envelope.logs.tail = redact_with_refreshes(
+                std::mem::take(&mut run_report.envelope.logs.tail),
+                &teardown.secret,
+                &refreshed_tokens,
+            );
+            amended = true;
+        }
+        if let Some(warning) = warning {
+            run_report.envelope.warnings.push(warning);
+            amended = true;
+        }
+
+        // The run already succeeded or failed on its own terms; an amend
+        // failure here (lock contention, a disk write error) must not
+        // overwrite that outcome with one about the journal instead. The
+        // caller still gets the corrected envelope above — only the
+        // journaled copy risks staying stale.
+        if amended && let Err(e) = amend_terminal_envelope(journal, &run_report.envelope.job_id, &run_report.envelope) {
+            tracing::warn!(job_id = %run_report.envelope.job_id, error = %e, "failed to amend the journaled terminal record");
+        }
+    }
+    report
 }
 
-/// Revokes the live credential and removes its staged `0600` file on drop, so the
-/// Block-2 teardown runs on every exit from [`run_job_with_credential`]: a normal
-/// return, an early `?`, or a panic unwinding out of `run_job`. Straight-line
-/// teardown after the refresh scope is skipped on a panic, which would leave a
-/// valid forge token and the secret file on disk past the run (INV-1).
+/// Overwrite the terminal record's envelope already written by `run_job` with
+/// `envelope`, under the job flock, so the journal stays in lock-step with what
+/// `run_job_with_credential` returns (INV-6; L-12 and its M-6 follow-up:
+/// a teardown warning or a post-run console re-redaction, or both). Re-reads
+/// the record under the lock rather than touching a cached copy: a concurrent
+/// reconcile could have touched it since `run_job` wrote it.
+fn amend_terminal_envelope(journal: &Journal, job_id: &str, envelope: &ResultEnvelope) -> Result<(), CoreError> {
+    let _lock = journal.lock_job(job_id)?;
+    let mut record = journal.read_record(job_id)?;
+    record.result = Some(envelope.clone());
+    journal.write_record(&record)
+}
+
+/// Revokes the live credential and removes its staged `0600` file, exactly once
+/// ([`CredTeardown::teardown`]): explicitly, right after [`run_job_with_credential`]
+/// gets its result, or — if a panic unwinds out of `run_job` first — via `Drop`
+/// instead, skipping the explicit call. Either way the credential never outlives
+/// the run (INV-1); the explicit path additionally gets a warning string back to
+/// fold into the envelope (L-12), which `Drop` has nowhere to return it to.
 struct CredTeardown<'a, P: CredentialProvider + ?Sized> {
     provider: &'a P,
     /// The live lease; the refresh thread advances it to the latest minted token,
     /// so teardown revokes whatever token is current when the run ends.
     lease: Mutex<Lease>,
     token_path: PathBuf,
+    /// The raw secret, read back once after staging, purely for this run's
+    /// console redaction (M-6): `run_job` is handed a clone of it (as `redact`)
+    /// before this guard is built. Held here only so it zeroizes alongside the
+    /// lease revoke, never read back out — the `Lease` it sits beside still
+    /// never carries it.
+    /// Borrowed by `redact` for the run's duration and zeroized on drop (M-6).
+    secret: Zeroizing<String>,
+    /// The credential's declared name (e.g. `"GH_TOKEN"`), naming it in a
+    /// revoke-failure warning without naming the token value (L-12).
+    secret_name: String,
+    /// The credential's scope, logged alongside a revoke failure (L-12).
+    scope: Scope,
+    /// The job id, filled in once `run_job` returns it; empty if teardown runs
+    /// from `Drop` during a panic, before the job id is known.
+    job_id: String,
+    /// Set once [`CredTeardown::teardown`] has run, so a later call — including
+    /// the implicit one from `Drop` after an explicit call already handled it —
+    /// is a no-op.
+    done: bool,
+}
+
+impl<P: CredentialProvider + ?Sized> CredTeardown<'_, P> {
+    /// Revoke the live credential and remove its staged file. A revoke failure is
+    /// never fatal to the run; it is logged (job id, scope, TTL remaining — never
+    /// the token value, L-12) and returned as a warning string naming the
+    /// credential, for the caller to fold into the envelope.
+    fn teardown(&mut self) -> Option<String> {
+        if self.done {
+            return None;
+        }
+        self.done = true;
+        // The refresh thread has joined (the scope borrowing `lease` ended before
+        // this runs), so the lock is uncontended; map poison rather than panic
+        // here. Revoke before removing the file (the GitHub revoke path reads it).
+        let lease = self.lease.get_mut().unwrap_or_else(PoisonError::into_inner);
+        let ttl_remaining = lease
+            .expires_at
+            .duration_since(SystemTime::now())
+            .unwrap_or(Duration::ZERO);
+        let warning = self.provider.revoke(lease).err().map(|e| {
+            tracing::warn!(
+                job_id = %self.job_id,
+                scope = ?self.scope,
+                ttl_remaining_secs = ttl_remaining.as_secs(),
+                %e,
+                "credential revoke at teardown failed; relying on native expiry"
+            );
+            format!(
+                "credential \"{}\" revoke failed at teardown; relying on native expiry",
+                self.secret_name
+            )
+        });
+        if let Err(e) = std::fs::remove_file(&self.token_path) {
+            tracing::warn!(path = %self.token_path.display(), %e, "failed to remove staged credential on teardown");
+        }
+        warning
+    }
 }
 
 impl<P: CredentialProvider + ?Sized> Drop for CredTeardown<'_, P> {
     fn drop(&mut self) {
-        // The refresh thread has joined (the scope borrowing `lease` ended before
-        // this drop), so the lock is uncontended; map poison rather than panic in a
-        // Drop. Revoke before removing the file (the GitHub revoke path reads it).
-        let lease = self.lease.get_mut().unwrap_or_else(PoisonError::into_inner);
-        if let Err(e) = self.provider.revoke(lease) {
-            tracing::warn!(%e, "credential revoke at teardown failed; relying on native expiry");
-        }
-        if let Err(e) = std::fs::remove_file(&self.token_path) {
-            tracing::warn!(path = %self.token_path.display(), %e, "failed to remove staged credential on teardown");
-        }
+        self.teardown();
     }
 }
 
@@ -451,12 +623,18 @@ fn refresh_interval(env_key: &str, default: u64) -> Duration {
 /// the sender half of `stop` is dropped (the run finished). Each refresh re-stages
 /// the live token file and revokes the superseded token via [`refresh_once`]; a
 /// refresh error is logged and retried on the next tick, never fatal to the run.
+///
+/// A successful refresh's new token is read back and queued onto `redact_log`
+/// (M-6 follow-up): `run_job`'s own redaction pass only ever saw the token staged
+/// before it started, so a refreshed token needs its own entry for the
+/// post-run re-redaction pass in [`run_job_with_credential`] to catch it too.
 fn refresh_loop<P: CredentialProvider + Sync + ?Sized>(
     provider: &P,
     lease: &Mutex<Lease>,
     margin: Duration,
     tick: Duration,
     stop: &mpsc::Receiver<()>,
+    redact_log: &Mutex<Vec<Zeroizing<String>>>,
 ) {
     loop {
         match stop.recv_timeout(tick) {
@@ -465,8 +643,22 @@ fn refresh_loop<P: CredentialProvider + Sync + ?Sized>(
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
         let mut guard = lease.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Err(e) = refresh_once(provider, &mut guard, SystemTime::now(), margin) {
-            tracing::warn!(%e, "mid-run credential refresh failed; keeping the current token");
+        match refresh_once(provider, &mut guard, SystemTime::now(), margin) {
+            Ok(true) => {
+                if let SecretSource::File(path) = &guard.secret_ref.source {
+                    match std::fs::read_to_string(path) {
+                        Ok(new_token) => redact_log
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .push(Zeroizing::new(new_token)),
+                        Err(e) => {
+                            tracing::warn!(%e, "could not read back a refreshed token for console redaction");
+                        }
+                    }
+                }
+            }
+            Ok(false) => {}
+            Err(e) => tracing::warn!(%e, "mid-run credential refresh failed; keeping the current token"),
         }
     }
 }
@@ -605,9 +797,52 @@ mod tests {
         Journal, Outcome, ProcessExit, Profile, Scope,
     };
     use sandy_test_support::{FakeApplier, FakeBackend};
+    use zeroize::Zeroizing;
 
-    use super::run_job;
+    use super::{redact_console, redact_with_refreshes, run_job};
     use crate::plan::JobPlan;
+
+    // --- console redaction (M-6) -------------------------------------------------
+
+    #[test]
+    fn redact_console_replaces_every_exact_occurrence() {
+        let console = "login ok\ntoken=ghs_abcdef12 used\nghs_abcdef12 again".to_string();
+        let redacted = redact_console(console, &["ghs_abcdef12".to_string()]);
+        assert_eq!(redacted, "login ok\ntoken=[REDACTED] used\n[REDACTED] again");
+    }
+
+    /// A secret under the 8-byte floor is skipped rather than redacted: a short
+    /// value like `"ab"` must never consume unrelated text like `"abc"`.
+    #[test]
+    fn redact_console_skips_secrets_under_eight_bytes() {
+        let redacted = redact_console("abc".to_string(), &["ab".to_string()]);
+        assert_eq!(redacted, "abc", "a short secret must not redact unrelated text");
+    }
+
+    #[test]
+    fn redact_console_applies_every_secret_in_the_list() {
+        let console = "first=sec-one-xx second=sec-two-yy".to_string();
+        let redacted = redact_console(console, &["sec-one-xx".to_string(), "sec-two-yy".to_string()]);
+        assert_eq!(redacted, "first=[REDACTED] second=[REDACTED]");
+    }
+
+    #[test]
+    fn redact_with_refreshes_catches_a_refreshed_token_the_first_pass_never_saw() {
+        let console = "initial=ghs_initial_marker refreshed=ghs_refreshed_marker".to_string();
+        let redacted = redact_with_refreshes(
+            console,
+            "ghs_initial_marker",
+            &[Zeroizing::new("ghs_refreshed_marker".to_string())],
+        );
+        assert_eq!(redacted, "initial=[REDACTED] refreshed=[REDACTED]");
+    }
+
+    #[test]
+    fn redact_with_refreshes_is_a_no_op_shaped_call_when_nothing_refreshed() {
+        let console = "initial=ghs_initial_marker only".to_string();
+        let redacted = redact_with_refreshes(console, "ghs_initial_marker", &[]);
+        assert_eq!(redacted, "initial=[REDACTED] only");
+    }
 
     /// A credential source that panics if asked for a provider — the non-credentialed
     /// run path never builds one, so a [`Profile`] in these tests carries this to
@@ -775,6 +1010,7 @@ mod tests {
                 &FakeApplier::new(),
                 EgressOs::Linux,
                 None,
+                &[],
             )
             .context("run_job (succeeded)")?;
             assert_eq!(report.process_exit.code(), ProcessExit::Succeeded.code());
@@ -797,6 +1033,7 @@ mod tests {
                 &FakeApplier::new(),
                 EgressOs::Linux,
                 None,
+                &[],
             )
             .context("run_job (task failure)")?;
             assert_eq!(report.process_exit.code(), ProcessExit::TaskFailure.code());
@@ -813,6 +1050,7 @@ mod tests {
                 &FakeApplier::new(),
                 EgressOs::Linux,
                 None,
+                &[],
             )
             .context("run_job (infra fault)")?;
             assert_eq!(report.process_exit.code(), ProcessExit::InfraFault.code());
@@ -835,6 +1073,7 @@ mod tests {
                 &FakeApplier::new(),
                 EgressOs::Linux,
                 None,
+                &[],
             )
             .context("run_job (invalid plan)")?;
             assert_eq!(report.process_exit.code(), ProcessExit::InvalidPlan.code());
@@ -846,6 +1085,8 @@ mod tests {
     /// `refresh_loop` refreshes the credential on each tick while the job runs and
     /// stops promptly when the sender is dropped. A margin past the token TTL makes
     /// `should_refresh` fire every tick, so a superseded token is revoked each time.
+    /// Also covers the M-6 follow-up: each refresh's new token must land in
+    /// `redact_log` so a post-run re-redaction pass can catch it.
     #[test]
     fn refresh_loop_refreshes_until_the_sender_drops() -> anyhow::Result<()> {
         use std::{
@@ -855,6 +1096,7 @@ mod tests {
 
         use sandy::{Scope, mint_lease};
         use sandy_test_support::FakeProvider;
+        use zeroize::Zeroizing;
 
         let tmp = tempfile::tempdir().context("tmp")?;
         std::fs::set_permissions(tmp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700))
@@ -867,11 +1109,13 @@ mod tests {
         let (tx, rx) = mpsc::channel::<()>();
         let margin = Duration::from_secs(1_000_000);
         let tick = Duration::from_millis(5);
+        let redact_log: Mutex<Vec<Zeroizing<String>>> = Mutex::new(Vec::new());
 
         std::thread::scope(|s| {
             let pref = &provider;
             let shared = &lease;
-            s.spawn(move || super::refresh_loop(pref, shared, margin, tick, &rx));
+            let shared_log = &redact_log;
+            s.spawn(move || super::refresh_loop(pref, shared, margin, tick, &rx, shared_log));
             std::thread::sleep(Duration::from_millis(50));
             drop(tx);
         });
@@ -879,6 +1123,10 @@ mod tests {
         assert!(
             !provider.revoked().is_empty(),
             "refresh_loop must refresh and revoke a superseded token while the job runs"
+        );
+        assert!(
+            !redact_log.into_inner().unwrap().is_empty(),
+            "a refreshed token must be queued for post-run console redaction"
         );
         Ok(())
     }

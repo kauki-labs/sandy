@@ -45,6 +45,9 @@ fn plain_envelope(envelope: &ResultEnvelope) -> String {
     for output in &envelope.outputs {
         let _ = write!(out, "\n  out: {}", output.path);
     }
+    for warning in &envelope.warnings {
+        let _ = write!(out, "\n  warning: {warning}");
+    }
     out
 }
 
@@ -278,6 +281,7 @@ mod tests {
                 template_store_path: String::new(),
             },
             logs: Logs { tail: String::new() },
+            warnings: Vec::new(),
         }
     }
 
@@ -327,6 +331,26 @@ mod tests {
         let json = format_envelope(&envelope, OutputFormat::Json).context("format json envelope")?;
         let parsed: ResultEnvelope = serde_json::from_str(&json).context("parse json envelope")?;
         assert_eq!(parsed.outputs.len(), 2, "json carries the outputs array");
+        Ok(())
+    }
+
+    /// L-12: a non-fatal warning (e.g. a credential revoke failure) appears in
+    /// both formats, same as outputs — a `warning: <text>` line in plain, and the
+    /// `warnings` array in JSON.
+    #[test]
+    fn both_formats_carry_warnings() -> anyhow::Result<()> {
+        let mut envelope = sample_envelope("job-a");
+        envelope.warnings = vec!["credential \"GH_TOKEN\" revoke failed at teardown".to_string()];
+
+        let plain = format_envelope(&envelope, OutputFormat::Plain).context("format plain envelope")?;
+        assert!(
+            plain.contains("warning: credential \"GH_TOKEN\" revoke failed at teardown"),
+            "plain lists the warning: {plain}"
+        );
+
+        let json = format_envelope(&envelope, OutputFormat::Json).context("format json envelope")?;
+        let parsed: ResultEnvelope = serde_json::from_str(&json).context("parse json envelope")?;
+        assert_eq!(parsed.warnings, envelope.warnings, "json carries the warnings array");
         Ok(())
     }
 
