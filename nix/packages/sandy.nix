@@ -11,6 +11,9 @@
   # `cargo llvm-cov` needs to find `llvm-profdata`/`llvm-cov` in the rustc sysroot.
   # Used only for the `coverage` derivation; every other build keeps `craneLib`.
   covCraneLib,
+  # Pinned rustsec/advisory-db checkout (flake input), passed to `cargo audit
+  # --db` so the `audit` derivation needs no network fetch of its own.
+  advisoryDb,
 }:
 let
   # cleanCargoSource keeps only Rust sources + manifests; the topology tests
@@ -90,6 +93,25 @@ rec {
       pnameSuffix = "-shear";
       buildPhaseCargoCommand = "cargo shear";
       nativeBuildInputs = [ pkgs.cargo-shear ];
+    }
+  );
+
+  # Supply-chain gate (CF-L-2): fail the build on any RustSec advisory against
+  # a locked dependency. `craneLib.cargoAudit` is crane's purpose-built
+  # wrapper: it needs only Cargo.lock + audit.toml (no cargoArtifacts dep
+  # build) and runs `cargo audit -n -d <advisory-db>`, so it needs no network
+  # fetch of its own — `advisoryDb` (a pinned flake input) stands in for the
+  # git-cloned advisory DB. `--deny warnings` fails closed on vulnerabilities
+  # plus whatever `.cargo/audit.toml`'s `informational_warnings` promotes to
+  # warning level (unmaintained today), matching this repo's house style;
+  # `--no-yanked` skips the yanked-crate check, which needs a live registry
+  # index this minimal derivation doesn't have.
+  # `.cargo/audit.toml` is the documented escape hatch for a triaged advisory.
+  audit = craneLib.cargoAudit (
+    commonArgs
+    // {
+      "advisory-db" = advisoryDb;
+      cargoAuditExtraArgs = "--deny warnings --no-yanked";
     }
   );
 

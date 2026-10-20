@@ -170,6 +170,8 @@ jobs:
         run: nix build -L .#checks.x86_64-linux.clippy
       - name: Dependency hygiene
         run: nix build -L .#checks.x86_64-linux.shear
+      - name: Supply-chain audit
+        run: nix build -L .#checks.x86_64-linux.audit
       - name: Build and docs
         run: nix build -L .#checks.x86_64-linux.sandy .#checks.x86_64-linux.doc .#checks.x86_64-linux.pre-commit .#checks.x86_64-linux.project-docs
   coverage:

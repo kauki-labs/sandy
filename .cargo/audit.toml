@@ -1,4 +1,5 @@
 [advisories]
+# Escape hatch for a triaged advisory: add its RUSTSEC id here with a comment.
 ignore = []
 informational_warnings = ["unmaintained"]
 severity_threshold = "low"
