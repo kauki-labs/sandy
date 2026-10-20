@@ -24,3 +24,11 @@ settings.local.json
 
 # macOS
 .DS_Store
+
+# Secrets
+.env*
+*.pem
+*.key
+*id_ed25519*
+*credentials*
+*secret*
