@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use rustix::fs::{Mode, OFlags, fstat, mkdirat, open, openat};
 
-use crate::FsError;
+use crate::{FsError, secret::OwnedDir};
 
 const STAGING_DIR_NAME: &str = "sandy";
 
@@ -37,7 +37,21 @@ const STICKY: u32 = 0o1000;
 /// Returns [`FsError`] when the base cannot be created, is a symlink, is owned
 /// by a different uid, or is group/world-writable.
 pub fn ensure_sandy_staging_base() -> Result<PathBuf, FsError> {
-    ensure_staging_base_in(&std::env::temp_dir())
+    ensure_sandy_staging_base_dir().map(|dir| dir.path().to_owned())
+}
+
+/// Same validation as [`ensure_sandy_staging_base`], returning the open,
+/// already-validated directory handle instead of discarding it for a bare path.
+///
+/// A caller that needs a child directory under the base (`private_staging_dir`)
+/// uses this directly, so it never reopens the base by path and reopens the
+/// TOCTOU window this validation just closed (L-11, #138).
+///
+/// # Errors
+///
+/// As [`ensure_sandy_staging_base`].
+pub fn ensure_sandy_staging_base_dir() -> Result<OwnedDir, FsError> {
+    ensure_staging_base_in_dir(&std::env::temp_dir())
 }
 
 /// Same validation as [`ensure_sandy_staging_base`], against an injected
@@ -57,6 +71,16 @@ pub fn ensure_sandy_staging_base() -> Result<PathBuf, FsError> {
 /// `/tmp` (`01777`) or a private `$TMPDIR` (`0700`) passes. The check `fstat`s the
 /// same `parent_fd` the base is created/opened relative to, so it is TOCTOU-safe.
 pub fn ensure_staging_base_in(parent: &Path) -> Result<PathBuf, FsError> {
+    ensure_staging_base_in_dir(parent).map(|dir| dir.path().to_owned())
+}
+
+/// Same validation as [`ensure_staging_base_in`], returning the open,
+/// already-validated directory handle. See [`ensure_sandy_staging_base_dir`].
+///
+/// # Errors
+///
+/// As [`ensure_staging_base_in`].
+pub fn ensure_staging_base_in_dir(parent: &Path) -> Result<OwnedDir, FsError> {
     let base = parent.join(STAGING_DIR_NAME);
     let parent_fd = open(
         parent,
@@ -111,7 +135,7 @@ pub fn ensure_staging_base_in(parent: &Path) -> Result<PathBuf, FsError> {
         }
     })?;
 
-    Ok(base)
+    Ok(OwnedDir::from_handle(base_fd.into(), base))
 }
 
 /// Pure check, isolated from the filesystem so the owner-mismatch and
@@ -178,6 +202,30 @@ mod tests {
 
         let mode = std::fs::metadata(&base).context("stat base")?.permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "freshly created base must be 0700, got {mode:#o}");
+        Ok(())
+    }
+
+    /// L-11: the fd-returning variant's handle and its reported path name the
+    /// same directory. A file written through the handle must be readable back
+    /// at `<path>/<name>` — if the handle opened some other directory (a stale
+    /// fd, a mismatched path), the path-based read would miss it or see a
+    /// different file.
+    #[test]
+    fn the_fd_based_base_opens_the_directory_its_path_names() -> anyhow::Result<()> {
+        let tmp = private_tmp()?;
+
+        let base_dir = ensure_staging_base_in_dir(tmp.path()).expect("clean base must validate");
+        let via_handle = base_dir.write_secret("marker", b"same inode")?;
+
+        anyhow::ensure!(
+            via_handle == base_dir.path().join("marker"),
+            "write_secret reported a path outside the base"
+        );
+        let via_path = std::fs::read(base_dir.path().join("marker")).context("read marker back via the path")?;
+        anyhow::ensure!(
+            via_path == b"same inode",
+            "the path names a different directory than the handle wrote into"
+        );
         Ok(())
     }
 
