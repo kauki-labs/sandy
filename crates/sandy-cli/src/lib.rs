@@ -8,6 +8,8 @@
 pub mod app_register;
 pub mod attach;
 pub mod doctor;
+pub mod flake_wrap;
+pub mod host_target;
 #[cfg(feature = "live")]
 pub mod live_target;
 pub mod output;

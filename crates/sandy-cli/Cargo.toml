@@ -37,12 +37,13 @@ workspace = true
 [features]
 # The live_boot / host_matrix live acceptance gates (tier-3, #26/#27), and the
 # acceptance-vm binary above. Off by default so CI and `nix flake check` never try
-# to boot a VM; enable on the live host. Pulls in `anyhow` for `live_target`'s
-# error type, kept optional so a non-live build carries no new dependency.
-live = ["dep:anyhow"]
+# to boot a VM; enable on the live host.
+live = []
 
 [dependencies]
-anyhow = { workspace = true, optional = true }
+# Used throughout (not just the `live` feature, since #325's `flake_wrap` —
+# the `--flake` resolution shell — needs it unconditionally too).
+anyhow.workspace = true
 # Encodes the attach cap (a bearer credential, raw bytes) for JSON output —
 # text-safe transport for an automation layer that needs the actual bytes.
 base64.workspace = true

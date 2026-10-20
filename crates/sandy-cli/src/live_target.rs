@@ -42,7 +42,12 @@ pub fn require_live() -> anyhow::Result<LiveTarget> {
     if std::env::var("SANDY_LIVE").ok().as_deref() != Some("1") {
         bail!("refusing: this is a live gate — set SANDY_LIVE=1 on a host with a hypervisor");
     }
-    let target = if cfg!(target_os = "macos") {
+    // The host->guest pairing shared with `doctor`'s macOS builder-prereq
+    // check and `flake_wrap`'s `--flake` auto-detection (#325) — the two
+    // previously disagreed (this hardcoded `aarch64-linux`; `doctor` used the
+    // host's actual arch), now one definition.
+    let host = crate::host_target::host_target();
+    let target = if host.hypervisor == "vfkit" {
         LiveTarget {
             hypervisor: std::env::var("SANDY_VFKIT_BIN").unwrap_or_else(|_| "vfkit".to_string()),
             runner_attr: "packages.aarch64-darwin.guest-runner-vfkit",
@@ -57,6 +62,10 @@ pub fn require_live() -> anyhow::Result<LiveTarget> {
             target_arch: "x86_64-linux",
         }
     };
+    debug_assert_eq!(
+        target.target_arch, host.guest_system,
+        "live_target/host_target must agree"
+    );
     if !on_path(&target.hypervisor) {
         bail!(
             "refusing: `{}` is not on PATH — run under `nix shell nixpkgs#{}`",

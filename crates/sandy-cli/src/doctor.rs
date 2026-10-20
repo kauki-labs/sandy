@@ -176,17 +176,13 @@ pub fn mac_prereq_result(verdict: MacPrereq) -> Option<DoctorResult> {
     }
 }
 
-/// The Linux guest system the macOS vfkit path targets: `<host-arch>-linux`
-/// (vfkit requires matching host/guest architecture).
-fn mac_guest_system() -> String {
-    format!("{}-linux", std::env::consts::ARCH)
-}
-
 /// Probe the macOS vfkit prerequisites: `nix` on `PATH` and a builder for the
-/// guest system in `/etc/nix/machines` (missing file → no builders).
-fn detect_mac_prereq() -> MacPrereq {
+/// guest system in `/etc/nix/machines` (missing file → no builders). `pub(crate)`:
+/// `flake_wrap` (#325) reuses this same check before building a `--flake` kind-2/3
+/// guest on macOS, rather than re-probing `/etc/nix/machines` itself.
+pub(crate) fn detect_mac_prereq() -> MacPrereq {
     let machines = std::fs::read_to_string("/etc/nix/machines").unwrap_or_default();
-    let guest = mac_guest_system();
+    let guest = crate::host_target::host_target().guest_system;
     // Resolve placement through the Discovery seam — a static registry over the host
     // matrix. The buildable-systems check is the matrix systems, exactly as before.
     let placement = StaticRegistry::new(parse_builder_systems(&machines)).resolve(&guest);
