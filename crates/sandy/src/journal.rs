@@ -330,6 +330,7 @@ mod tests {
                     template_store_path: "/nix/store/xxx".to_string(),
                 },
                 logs: Logs { tail: String::new() },
+                warnings: Vec::new(),
             }),
         }
     }

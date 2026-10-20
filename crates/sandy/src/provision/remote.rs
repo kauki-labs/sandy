@@ -80,6 +80,7 @@ fn succeeded_envelope(job: &Job, artifacts: &RemoteArtifacts) -> ResultEnvelope 
             template_store_path: artifacts.output_store_path.clone(),
         },
         logs: Logs { tail: String::new() },
+        warnings: Vec::new(),
     }
 }
 
@@ -100,6 +101,7 @@ fn infra_fault_envelope(job: &Job, message: &str) -> ResultEnvelope {
             template_store_path: String::new(),
         },
         logs: Logs { tail: String::new() },
+        warnings: Vec::new(),
     }
 }
 

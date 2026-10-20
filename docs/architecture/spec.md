@@ -248,14 +248,23 @@ flowchart TD
   catch-all), independent of the host dest. Receipts/provenance remain placeholders.
 - **Two renderings.** `-o plain` (default, human, lists outputs) and `-o json` (the
   full serialized envelope) stay in lock-step through the `format_*` helpers.
+- **Non-fatal faults surface as `warnings`.** A fault that must not fail an
+  otherwise-successful run (e.g. a credential revoke failing at teardown, L-12)
+  is named in `warnings: Vec<String>` — schema bumped to `2`, old records still
+  deserialize (`#[serde(default)]`) — never just a log line.
 
 **KPI.**
 
 - Integration: `result.rs` `classify_outcome` tests (all bands incl. timeout +
-  required-missing); `cli_jobs` band tests (`run_positive`, `run_guest_failure`,
-  `run_timeout`, `run_infra_fault`, `run_invalid_plan`) and
-  `run_lists_collected_outputs_in_the_envelope`; `output.rs` format tests (default
-  plain, both formats carry outputs).
+  required-missing) and the schema-bump regression
+  (`an_old_schema_v1_record_with_no_warnings_key_deserializes_to_empty`);
+  `cli_jobs` band tests (`run_positive`, `run_guest_failure`, `run_timeout`,
+  `run_infra_fault`, `run_invalid_plan`) and
+  `run_lists_collected_outputs_in_the_envelope`;
+  `credentialed_run_redacts_the_token_from_the_console` and
+  `credential_revoke_failure_surfaces_as_a_warning_not_a_fault` (M-6/L-12);
+  `output.rs` format tests (default plain, both formats carry outputs and
+  `both_formats_carry_warnings`).
 - End-to-end: every live test asserts the envelope `status`/`exit_code`; `live_e2e.rs`
   asserts `envelope.outputs` and no secret leak in `logs.tail`.
 
