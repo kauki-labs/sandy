@@ -29,12 +29,13 @@ use crate::plan::JobPlan;
 /// `[REDACTED]` (M-6). A secret under 8 bytes is skipped rather than replaced: a
 /// short value risks consuming unrelated text (a secret `"ab"` must never redact
 /// unrelated `"abc"`), and a real forge token is never that short.
-fn redact_console(mut console: String, secrets: &[String]) -> String {
+fn redact_console<S: AsRef<str>>(mut console: String, secrets: &[S]) -> String {
     for secret in secrets {
+        let secret = secret.as_ref();
         if secret.len() < 8 {
             continue;
         }
-        console = console.replace(secret.as_str(), "[REDACTED]");
+        console = console.replace(secret, "[REDACTED]");
     }
     console
 }
@@ -42,13 +43,15 @@ fn redact_console(mut console: String, secrets: &[String]) -> String {
 /// Re-redact `console` against `initial` plus every token `refresh_loop` queued
 /// onto `redact_log` as it staged one (M-6 follow-up): `run_job`'s own redaction
 /// pass only ever sees `initial`, so a mid-run refresh needs this second pass to
-/// catch its own token too. A no-op when `refreshed` is empty: re-running
-/// `redact_console` against `initial` alone finds nothing new, since the first
-/// pass already turned every occurrence of it into `[REDACTED]`.
+/// catch its own token too. Both passes borrow their secrets rather than
+/// cloning them into a plain, unzeroized `String` first — `redact_console` is
+/// generic over `AsRef<str>` precisely so `initial` (a `&str`) and `refreshed`
+/// (`Zeroizing<String>`, which forwards `AsRef<str>`) can go straight through.
+/// A no-op when `refreshed` is empty: re-running `redact_console` against
+/// `initial` alone finds nothing new, since the first pass already turned
+/// every occurrence of it into `[REDACTED]`.
 fn redact_with_refreshes(console: String, initial: &str, refreshed: &[Zeroizing<String>]) -> String {
-    let mut all_tokens = vec![initial.to_string()];
-    all_tokens.extend(refreshed.iter().map(|t| t.to_string()));
-    redact_console(console, &all_tokens)
+    redact_console(redact_console(console, &[initial]), refreshed)
 }
 
 /// Build the LOCKED [`ResultEnvelope`] from a terminal [`Classification`].
