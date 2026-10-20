@@ -26,6 +26,19 @@ pub struct OwnedDir {
 }
 
 impl OwnedDir {
+    /// Build an already-open, already-validated directory handle directly, with no
+    /// second open-by-path.
+    ///
+    /// [`crate::staging::ensure_staging_base_in_dir`] uses this to hand back the fd
+    /// its own validation already opened and checked (owner, mode, not a symlink),
+    /// so a caller needing a child directory under the staging base never reopens
+    /// the base by path and reopens the TOCTOU window that validation just closed
+    /// (L-11): a co-resident attacker swapping the path between the two opens could
+    /// otherwise redirect staged secrets.
+    pub(crate) fn from_handle(handle: File, path: PathBuf) -> Self {
+        Self { handle, path }
+    }
+
     /// Open `path` as a staging directory.
     ///
     /// # Errors
@@ -222,9 +235,15 @@ impl OwnedDir {
 ///
 /// [`FsError`] when the staging base is unsafe or the directory cannot be made.
 pub fn private_staging_dir(prefix: &str) -> Result<OwnedDir, FsError> {
-    let base = crate::ensure_sandy_staging_base()?;
-    let suffix = unique_suffix().map_err(|e| FsError::io("draw a dir name", &base, e))?;
-    OwnedDir::open(&base)?.create_private_dir(&format!("{prefix}-{suffix}"))
+    private_dir_under(&crate::staging::ensure_sandy_staging_base_dir()?, prefix)
+}
+
+/// Create a fresh `<prefix>-<random>` private dir through an already-validated
+/// `base` handle. Never reopen `base` by path here — that's the L-11 TOCTOU
+/// window this function exists to close.
+pub(crate) fn private_dir_under(base: &OwnedDir, prefix: &str) -> Result<OwnedDir, FsError> {
+    let suffix = unique_suffix().map_err(|e| FsError::io("draw a dir name", base.path(), e))?;
+    base.create_private_dir(&format!("{prefix}-{suffix}"))
 }
 
 /// A random suffix so concurrent writes of one name never share a temp file.
@@ -418,6 +437,62 @@ mod tests {
         for (ok, why) in checks {
             anyhow::ensure!(ok, "a private staging dir was {why}");
         }
+        Ok(())
+    }
+
+    /// L-11 (CWE-367 TOCTOU): once `ensure_staging_base_in_dir` validates the
+    /// base through its fd, substituting a fresh same-uid `0700` directory at
+    /// the validated path must not redirect a child directory created through
+    /// the already-open handle. `OwnedDir::open` already rejects a symlink at
+    /// that name (`O_NOFOLLOW`), so the real redirection vector a reopen-by-path
+    /// is exposed to is a same-uid, same-mode substitute: it passes
+    /// `validate_owner_and_mode` same as the original, which this test confirms
+    /// by also reopening the substitute successfully. Before this fix,
+    /// `private_staging_dir` re-resolved the base this way
+    /// (`OwnedDir::open(&base)`), which would have landed in the substitute.
+    #[test]
+    fn a_path_swap_after_base_validation_does_not_redirect_a_child_dir() -> anyhow::Result<()> {
+        let tmp = tempfile::TempDir::new()?;
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700))?;
+
+        let base_dir = crate::staging::ensure_staging_base_in_dir(tmp.path())?;
+        let base_path = base_dir.path().to_owned();
+
+        // An attacker who races the two opens moves the validated directory
+        // aside and substitutes their own same-uid, same-mode directory at the
+        // validated path — the swap a path-based reopen cannot tell apart from
+        // the original.
+        let moved_original = tmp.path().join("moved-original");
+        fs::rename(&base_path, &moved_original)?;
+        fs::create_dir(&base_path)?;
+        fs::set_permissions(&base_path, fs::Permissions::from_mode(0o700))?;
+
+        // The substitute is indistinguishable from the original to a path-based
+        // reopen: it passes validation too. This is the window the fix closes.
+        anyhow::ensure!(
+            OwnedDir::open(&base_path).is_ok(),
+            "a same-uid 0700 substitute should pass path-based validation"
+        );
+
+        // The already-open handle is unaffected by the swap: it still refers to
+        // the originally validated directory by inode, not by name. Goes through
+        // `private_dir_under`, the same helper `private_staging_dir` delegates
+        // to, so a regression back to reopening by path shows up here too.
+        private_dir_under(&base_dir, "job")?;
+
+        let original_entries: Vec<_> = fs::read_dir(&moved_original)?.collect::<io::Result<_>>()?;
+        anyhow::ensure!(
+            original_entries.len() == 1 && original_entries[0].file_name().to_string_lossy().starts_with("job-"),
+            "expected exactly one job- child in the originally validated directory, got {:?}",
+            original_entries
+                .iter()
+                .map(std::fs::DirEntry::file_name)
+                .collect::<Vec<_>>()
+        );
+        anyhow::ensure!(
+            fs::read_dir(&base_path)?.next().is_none(),
+            "the substitute directory received the child despite the swap"
+        );
         Ok(())
     }
 
