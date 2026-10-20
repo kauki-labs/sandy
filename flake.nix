@@ -9,6 +9,10 @@
     treefmt-nix.url = "github:numtide/treefmt-nix";
     flake-root.url = "github:srid/flake-root";
     pre-commit.url = "github:cachix/git-hooks.nix";
+    # The guest-composition module (#324, `lib.mkGuest`/`lib.mkTopology`) needs
+    # this to build the microVM; `nix/guest/flake.nix` pins its own copy
+    # independently, so the two lockfiles can drift without either breaking.
+    microvm.url = "github:microvm-nix/microvm.nix";
     # Pinned for the `audit` check (CF-L-2): `cargo audit -d <path>` reads the
     # advisory TOML files directly, no git metadata needed, so the plain
     # tarball fetch is enough and the sandboxed build needs no network fetch
@@ -22,6 +26,7 @@
     rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
     treefmt-nix.inputs.nixpkgs.follows = "nixpkgs";
     pre-commit.inputs.nixpkgs.follows = "nixpkgs";
+    microvm.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs =
@@ -52,6 +57,14 @@
           sandy-host-executor = import ./nix/overlays/sandy-host-executor.nix;
         };
         nixosModules.sandy-executor = import ./nix/modules/sandy-executor.nix;
+        # The reusable guest-composition module (#324): `lib.mkGuest`/
+        # `lib.mkTopology`, standalone same as the overlays above — a
+        # consumer builds a `Topology` without evaluating this flake's
+        # perSystem. `nix/guest/flake.nix` is this module's other caller
+        # (its own qemu/vfkit guests), so the wiring has one definition.
+        lib = import ./nix/lib/guest.nix {
+          inherit (inputs) nixpkgs microvm;
+        };
       };
       perSystem =
         {
