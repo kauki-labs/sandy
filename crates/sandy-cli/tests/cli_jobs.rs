@@ -953,11 +953,26 @@ fn credential_revoke_failure_surfaces_as_a_warning_not_a_fault() -> anyhow::Resu
         report.envelope.warnings
     );
 
+    // The journaled terminal record must carry the same warning (INV-6: the
+    // record always carries the envelope) — not just the returned `RunReport`.
+    let persisted = journal
+        .read_record(&report.envelope.job_id)
+        .context("terminal record must be on disk")?
+        .result
+        .context("terminal record must carry the envelope")?;
+    assert_eq!(
+        persisted.warnings, report.envelope.warnings,
+        "the journaled record's warnings must match the returned envelope's"
+    );
+
     let logged = buf.contents()?;
-    assert!(logged.contains("WARN"), "a warn event must have been emitted: {logged}");
+    let warn_line = logged
+        .lines()
+        .find(|line| line.contains("credential revoke at teardown failed"))
+        .with_context(|| format!("no warn event emitted for the revoke failure: {logged}"))?;
     assert!(
-        logged.contains(&report.envelope.job_id),
-        "the warn event must carry the job id: {logged}"
+        warn_line.contains(&report.envelope.job_id),
+        "the warn event's own line must carry the job id: {warn_line}"
     );
     assert!(
         !logged.contains(token),

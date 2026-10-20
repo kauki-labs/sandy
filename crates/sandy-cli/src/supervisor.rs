@@ -454,18 +454,34 @@ pub fn run_job_with_credential<
     // Explicit teardown on the normal return path (the borrow of `teardown.lease`
     // above ended with `thread::scope`, so this is the first point it can be
     // touched again): name the job in the revoke-failure log, then fold a
-    // failure into the envelope's `warnings` (L-12) rather than leaving it only
-    // logged. On a panic, `Drop` runs the same teardown instead, with no envelope
-    // to fold into and no job id yet known.
+    // failure into both the returned envelope and the already-journaled terminal
+    // record (L-12) — INV-6 says the record always carries the envelope, so the
+    // two must not drift apart. On a panic, `Drop` runs the same teardown
+    // instead, with no envelope to fold into and no job id yet known.
     if let Ok(run_report) = &report {
         teardown.job_id = run_report.envelope.job_id.clone();
     }
     if let Some(warning) = teardown.teardown()
         && let Ok(run_report) = &mut report
     {
-        run_report.envelope.warnings.push(warning);
+        run_report.envelope.warnings.push(warning.clone());
+        amend_terminal_warning(journal, &run_report.envelope.job_id, warning)?;
     }
     report
+}
+
+/// Push `warning` onto the terminal record's envelope already written by
+/// `run_job`, under the job flock, so the journal stays in lock-step with what
+/// `run_job_with_credential` returns (INV-6; L-12). Re-reads under the lock
+/// rather than reusing the in-memory envelope: a concurrent reconcile could have
+/// touched the record since `run_job` wrote it.
+fn amend_terminal_warning(journal: &Journal, job_id: &str, warning: String) -> Result<(), CoreError> {
+    let _lock = journal.lock_job(job_id)?;
+    let mut record = journal.read_record(job_id)?;
+    if let Some(envelope) = &mut record.result {
+        envelope.warnings.push(warning);
+    }
+    journal.write_record(&record)
 }
 
 /// Revokes the live credential and removes its staged `0600` file, exactly once
