@@ -11,6 +11,7 @@
 //! itself, so it stays usable from a plain synchronous test too.
 
 use std::{
+    os::unix::fs::PermissionsExt,
     path::Path,
     sync::{Mutex, PoisonError},
 };
@@ -36,6 +37,9 @@ pub enum StoreError {
         /// The unrecognised stored value.
         raw: String,
     },
+    /// Could not chmod the store file (CF-M-7).
+    #[error("job store: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// The outcome of a [`JobStore::cancel`] call.
@@ -66,6 +70,22 @@ pub enum Transition {
     Refused(JobStatus),
 }
 
+/// The outcome of a [`JobStore::insert_pending`] call (CF-M-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertOutcome {
+    /// The row was inserted.
+    Inserted,
+    /// The `jobs` table already holds `max` rows (see
+    /// [`JobStore::with_max_rows`]); the insert was refused rather than
+    /// growing the table further. Counts every row regardless of status —
+    /// terminal jobs are not pruned by this store, so once the cap is hit it
+    /// stays hit until an operator clears old rows some other way.
+    CapExceeded {
+        /// The configured cap that would have been exceeded.
+        max: usize,
+    },
+}
+
 /// One submitted job's row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobSummary {
@@ -94,18 +114,27 @@ pub struct JobDetail {
 /// The `jobs` table behind a single `rusqlite` connection.
 pub struct JobStore {
     conn: Mutex<Connection>,
+    /// CF-M-2: the row cap `insert_pending` enforces. `None` (the default) is
+    /// uncapped — today's unchanged behavior.
+    max_rows: Option<usize>,
 }
 
 impl JobStore {
-    /// Open (creating if needed) the job store at `path`, and ensure its
-    /// schema exists.
+    /// Open (creating if needed) the job store at `path`, ensure its schema
+    /// exists, and tighten the file to `0600` (CF-M-7) — the same floor the
+    /// control socket already gets (`main.rs`'s `bind_unix_listener`), since
+    /// this file holds the same job manifests and results that socket
+    /// carries.
     ///
     /// # Errors
     /// [`StoreError::Sqlite`] if the file cannot be opened or the schema
-    /// cannot be created.
+    /// cannot be created; [`StoreError::Io`] if the permissions cannot be
+    /// set.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         let conn = Connection::open(path)?;
-        Self::from_connection(conn)
+        let store = Self::from_connection(conn)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        Ok(store)
     }
 
     /// An in-memory store, for tests: no file, gone when the store is dropped.
@@ -139,20 +168,49 @@ impl JobStore {
             "console",
             "ALTER TABLE jobs ADD COLUMN console TEXT NOT NULL DEFAULT ''",
         )?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+            max_rows: None,
+        })
+    }
+
+    /// Cap the `jobs` table at `max_rows` total rows (CF-M-2): once reached,
+    /// `insert_pending` refuses further inserts instead of growing it
+    /// unbounded off operator-controlled Submit traffic. `None` is uncapped.
+    #[must_use]
+    pub fn with_max_rows(mut self, max_rows: Option<usize>) -> Self {
+        self.max_rows = max_rows;
+        self
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Insert a fresh `Pending` job row for `job_id`.
+    /// Insert a fresh `Pending` job row for `job_id`, unless the table is
+    /// already at its configured row cap ([`JobStore::with_max_rows`]).
     ///
     /// # Errors
-    /// [`StoreError::Sqlite`] if `job_id` already exists, or the write fails.
-    pub fn insert_pending(&self, job_id: &str, manifest: &[u8], manifest_encoding: &str) -> Result<(), StoreError> {
+    /// [`StoreError::Sqlite`] if `job_id` already exists, or a read/write
+    /// faults.
+    pub fn insert_pending(
+        &self,
+        job_id: &str,
+        manifest: &[u8],
+        manifest_encoding: &str,
+    ) -> Result<InsertOutcome, StoreError> {
+        let conn = self.lock();
+        // CF-M-2: counted under the same lock the insert itself takes, so a
+        // concurrent insert can never slip the table past the cap between
+        // the count and the write.
+        if let Some(max) = self.max_rows {
+            let count: i64 = conn.query_row("SELECT COUNT(*) FROM jobs", (), |row| row.get(0))?;
+            if count as usize >= max {
+                return Ok(InsertOutcome::CapExceeded { max });
+            }
+        }
         let now = now_unix();
-        self.lock().execute(
+        conn.execute(
             "INSERT INTO jobs (job_id, status, manifest, manifest_encoding, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
             (
@@ -163,7 +221,7 @@ impl JobStore {
                 now,
             ),
         )?;
-        Ok(())
+        Ok(InsertOutcome::Inserted)
     }
 
     /// The status of `job_id`, or `None` if no such job exists.
@@ -569,6 +627,71 @@ mod tests {
                 console: "hi\n".to_owned(),
             })
         );
+        Ok(())
+    }
+
+    /// CF-M-2: an uncapped store (the default) accepts inserts past what
+    /// would be a cap elsewhere — proves `max_rows: None` really means
+    /// unbounded, not "zero by accident".
+    #[test]
+    fn an_uncapped_store_accepts_inserts_with_no_limit() -> Result<(), StoreError> {
+        let store = JobStore::open_in_memory()?;
+        for i in 0..5 {
+            assert_eq!(
+                store.insert_pending(&format!("job-{i}"), b"m", "test/v1")?,
+                InsertOutcome::Inserted
+            );
+        }
+        Ok(())
+    }
+
+    /// CF-M-2: the cap boundary is exact — the (cap)th insert succeeds, the
+    /// (cap+1)th is refused by name, not a silent drop or a panic.
+    #[test]
+    fn insert_pending_refuses_once_the_row_cap_is_reached() -> Result<(), StoreError> {
+        let store = JobStore::open_in_memory()?.with_max_rows(Some(2));
+
+        assert_eq!(store.insert_pending("job-1", b"m", "test/v1")?, InsertOutcome::Inserted);
+        assert_eq!(store.insert_pending("job-2", b"m", "test/v1")?, InsertOutcome::Inserted);
+        assert_eq!(
+            store.insert_pending("job-3", b"m", "test/v1")?,
+            InsertOutcome::CapExceeded { max: 2 }
+        );
+        // The refused row must not have been written.
+        assert_eq!(store.status("job-3")?, None);
+        Ok(())
+    }
+
+    /// CF-M-7: a freshly created store file is `0600`, not left at whatever
+    /// the process umask would otherwise give it — the same floor the
+    /// control socket already gets.
+    #[test]
+    fn a_fresh_store_file_is_chmod_0600() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db_path = tmp.path().join("sandyd.db");
+        let _store = JobStore::open(&db_path)?;
+
+        let mode = std::fs::metadata(&db_path)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "got {mode:o}");
+        Ok(())
+    }
+
+    /// CF-M-7: a store file left loose by an older `sandyd` (or an operator's
+    /// `cp`) is tightened to `0600` on open, not merely checked — re-opening
+    /// an existing file must not skip the chmod just because the file was
+    /// already there.
+    #[test]
+    fn a_pre_existing_loosely_permissioned_store_file_is_tightened_on_open() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db_path = tmp.path().join("sandyd.db");
+        // Create the file ahead of time at a loose mode, simulating a pre-CF-M-7
+        // on-disk file.
+        std::fs::File::create(&db_path)?.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+
+        let _store = JobStore::open(&db_path)?;
+
+        let mode = std::fs::metadata(&db_path)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "got {mode:o}");
         Ok(())
     }
 

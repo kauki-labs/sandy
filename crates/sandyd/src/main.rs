@@ -5,7 +5,7 @@
 //! and shuts down on `SIGTERM`/`SIGINT`: stops accepting new connections and
 //! waits (briefly, bounded) for in-flight ones to finish before exiting.
 
-use std::{net::SocketAddr, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc, time::Duration};
+use std::{future::Future, net::SocketAddr, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc, time::Duration};
 
 use sandy_conn::{ConnAddr, Listener as MeshListener};
 use sandyd::{
@@ -35,6 +35,36 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 /// a resource error that lasts long enough to hit this is already a serious,
 /// slow-moving incident; there's no benefit to backing off further than this.
 const ACCEPT_ERROR_BACKOFF_MAX: Duration = Duration::from_secs(5);
+
+/// The largest number of control-socket connections this daemon serves
+/// concurrently (CF-L-1): past this, the accept loop stops accepting new
+/// connections until one of the existing ones finishes, rather than spawning
+/// an unbounded `JoinSet` entry per accept. Generous for a local, 0700-socket
+/// control plane with one or a handful of operators/sub-agents at a time —
+/// not a tuned production capacity figure.
+const MAX_CONCURRENT_CONNECTIONS: usize = 256;
+
+/// Acquire one permit from `semaphore`, THEN await `accept` (CF-L-1) — in
+/// that order, and combined into one future, so a full semaphore blocks only
+/// this one `select!` branch, not the whole accept loop: the surrounding
+/// `select!` keeps polling its sibling branches (reaping finished
+/// connections, the shutdown signal) every iteration regardless of whether
+/// this branch's permit acquisition has resolved yet. Acquiring the permit as
+/// a plain `.await` inside a branch's handler (after `select!` has already
+/// picked that branch) would instead block the loop's next iteration on it —
+/// shutdown would never be observed while every permit is held.
+///
+/// `Err` only if `semaphore` was explicitly closed, which this daemon never
+/// does; the caller still matches on it rather than unwrapping, per house
+/// style (no panics in a connection-accepting loop).
+async fn gate_spawn<T>(
+    semaphore: &Arc<tokio::sync::Semaphore>,
+    accept: impl Future<Output = T>,
+) -> (Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError>, T) {
+    let permit = Arc::clone(semaphore).acquire_owned().await;
+    let value = accept.await;
+    (permit, value)
+}
 
 /// Capped exponential backoff for repeated `accept()` failures, shared by
 /// every accept loop in this binary so they back off identically. Doubles on
@@ -83,8 +113,16 @@ async fn main() {
         }
     };
 
+    let max_jobs = match max_jobs() {
+        Ok(max_jobs) => max_jobs,
+        Err(e) => {
+            tracing::error!(error = %e, "SANDY_MAX_JOBS is not a valid non-negative integer");
+            std::process::exit(1);
+        }
+    };
+
     let store = match JobStore::open(&db_path) {
-        Ok(store) => Arc::new(store),
+        Ok(store) => Arc::new(store.with_max_rows(max_jobs)),
         Err(e) => {
             tracing::error!(error = %e, db = %db_path.display(), "could not open the job store");
             std::process::exit(1);
@@ -182,19 +220,33 @@ async fn main() {
 
     let mut connections = tokio::task::JoinSet::new();
     let mut backoff = AcceptBackoff::new();
+    let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
 
     loop {
         tokio::select! {
-            accepted = listener.accept() => {
+            (permit, accepted) = gate_spawn(&connection_semaphore, listener.accept()) => {
+                let Ok(permit) = permit else {
+                    // Never closed by this program (see gate_spawn's doc);
+                    // handled rather than panicked, so a connection-accepting
+                    // loop never crashes the daemon over an invariant that
+                    // should be unreachable in practice.
+                    tracing::error!("connection semaphore closed unexpectedly; no longer accepting new connections");
+                    break;
+                };
                 match accepted {
                     Ok((stream, _addr)) => {
                         backoff.reset();
                         let store = Arc::clone(&store);
                         let registry = Arc::clone(&registry);
                         let host_registry = Arc::clone(&host_registry);
-                        connections.spawn(sandyd::serve_connection(stream, store, registry, host_registry, forward_back_addr));
+                        connections.spawn(async move {
+                            let _permit = permit; // held for the connection's lifetime, released on drop
+                            sandyd::serve_connection(stream, store, registry, host_registry, forward_back_addr).await;
+                        });
                     }
                     Err(e) => {
+                        // `permit` drops here, releasing it immediately: this
+                        // connection was never served.
                         tracing::warn!(error = %e, "failed to accept a connection");
                         // Raced against shutdown, not a plain await: at the
                         // backoff cap (5s) an unraced sleep would make
@@ -501,6 +553,15 @@ fn db_path() -> std::io::Result<PathBuf> {
     }
 }
 
+/// Parse `$SANDY_MAX_JOBS` (CF-M-2): the row cap [`JobStore::with_max_rows`]
+/// enforces. `Ok(None)` if unset — uncapped, today's unchanged behavior.
+///
+/// # Errors
+/// The env var is set but is not a valid non-negative integer.
+fn max_jobs() -> Result<Option<usize>, std::num::ParseIntError> {
+    std::env::var("SANDY_MAX_JOBS").ok().map(|v| v.parse()).transpose()
+}
+
 /// A `sandyd`-owned directory to default the control socket and job store
 /// into when `$SANDY_SOCK`/`$SANDY_DB` aren't set (CWE-377: a predictable name
 /// directly under the shared OS temp dir lets another local user pre-create
@@ -517,6 +578,8 @@ fn ensure_runtime_dir() -> std::io::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context;
+
     use super::*;
 
     /// Regression (CodeRabbit, #293): a fixed retry delay on a persistent
@@ -581,6 +644,39 @@ mod tests {
             let (_listener, _lock) = bind_unix_listener(&sock)?;
         }
         let (_listener, _lock) = bind_unix_listener(&sock)?;
+        Ok(())
+    }
+
+    /// CF-L-1: once every permit is held, a further `gate_spawn` call blocks
+    /// — it does not accept past the configured cap — and resolves again the
+    /// moment a held permit is released. Drives the real `gate_spawn` (not a
+    /// bare `Semaphore` in isolation), with real short timeouts rather than a
+    /// paused virtual clock: AGENTS.md flags `start_paused` paired with real
+    /// I/O as flaky, and `tokio::time::timeout` racing a real `.await` here is
+    /// exactly that shape.
+    #[tokio::test]
+    async fn gate_spawn_blocks_once_the_semaphore_is_exhausted() -> anyhow::Result<()> {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+
+        let (permit1, ()) = gate_spawn(&semaphore, async {}).await;
+        let permit1 = permit1.context("permit1")?;
+        let (permit2, ()) = gate_spawn(&semaphore, async {}).await;
+        let permit2 = permit2.context("permit2")?;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), gate_spawn(&semaphore, async {}))
+                .await
+                .is_err(),
+            "a third gate_spawn must block while both permits are held"
+        );
+
+        drop(permit1);
+        let (permit3, ()) = tokio::time::timeout(Duration::from_secs(5), gate_spawn(&semaphore, async {}))
+            .await
+            .context("gate_spawn must resolve once a permit is released")?;
+        let _permit3 = permit3.context("permit3")?;
+
+        drop(permit2);
         Ok(())
     }
 }

@@ -56,6 +56,13 @@ impl std::fmt::Debug for AttachResponse {
 /// RPC at all).
 pub const MAX_FRAME_LEN: u32 = 1 << 20;
 
+/// The largest `SubmitRequest.manifest` `sandyd` accepts (CF-M-1). Separate
+/// from [`MAX_FRAME_LEN`] — the frame limit guards the transport against an
+/// unbounded length prefix; this guards against a manifest that fits inside a
+/// single frame but is still pointlessly large for what a manifest actually
+/// holds (an entrypoint and a short list of requested caps).
+pub const MAX_MANIFEST_LEN: u32 = 64 * 1024;
+
 /// A framing failure reading or writing a length-prefixed message.
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {

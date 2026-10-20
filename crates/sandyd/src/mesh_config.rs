@@ -204,4 +204,16 @@ mod tests {
         assert!(allowlist.permits("100.64.0.7".parse()?));
         Ok(())
     }
+
+    /// Adversarial (I-20): CIDR notation is not a single host IP, so it must
+    /// be refused by name, not silently truncated to its address part or
+    /// mistaken for a plain `IpAddr` — fail-closed, same as any other
+    /// unparseable entry.
+    #[test]
+    fn a_cidr_entry_is_refused_not_mistaken_for_a_host() {
+        assert_eq!(
+            parse_mesh_allowlist(Some("100.64.0.0/24")).err(),
+            Some(MeshConfigError::InvalidAllowlistEntry("100.64.0.0/24".to_owned()))
+        );
+    }
 }

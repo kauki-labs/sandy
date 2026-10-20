@@ -39,6 +39,12 @@ pub async fn serve_connection(
     host_registry: Arc<HostRegistry>,
     forward_back_addr: Option<SocketAddr>,
 ) {
+    // CF-H-1: one session id per connection, not per request — minted once
+    // here and compared, never trusted as access control, against the
+    // session a Cancel/Attach's target job recorded at Submit. See
+    // `handler::handle`'s own doc on `session`.
+    let session = uuid::Uuid::new_v4();
+
     loop {
         let request: ControlRequest = match read_frame(&mut stream).await {
             Ok(Some(request)) => request,
@@ -50,13 +56,14 @@ pub async fn serve_connection(
         };
 
         let request_id = request.request_id;
-        let response = match handler::handle(&store, &registry, &host_registry, forward_back_addr, request).await {
-            Ok(response) => response,
-            Err(e) => {
-                tracing::error!(error = %e, request_id, "job store faulted handling a request");
-                return;
-            }
-        };
+        let response =
+            match handler::handle(&store, &registry, &host_registry, forward_back_addr, session, request).await {
+                Ok(response) => response,
+                Err(e) => {
+                    tracing::error!(error = %e, request_id, "job store faulted handling a request");
+                    return;
+                }
+            };
 
         if let Err(e) = write_frame(&mut stream, &response).await {
             tracing::warn!(error = %e, request_id, "control connection faulted writing a response; closing it");
@@ -121,6 +128,64 @@ mod tests {
         }
 
         drop(client); // clean close: serve_connection must return, not hang
+        tokio::time::timeout(std::time::Duration::from_secs(5), serving).await??;
+        Ok(())
+    }
+
+    /// CF-M-2: a Submit refused for being at the job store's row cap gets an
+    /// `Error` response, but the connection itself stays alive — unlike a
+    /// genuine `StoreError`, which tears down the whole connection (this
+    /// function's own `Err(e)` match arm above). A routine capacity refusal
+    /// must not look like that store-faulted case to the rest of this
+    /// connection's traffic.
+    #[tokio::test]
+    async fn a_submit_past_the_row_cap_refuses_but_keeps_the_connection_alive() -> anyhow::Result<()> {
+        let store = Arc::new(JobStore::open_in_memory()?.with_max_rows(Some(0)));
+        let (client, server) = UnixStream::pair()?;
+        let registry = Arc::new(JobRegistry::new()?);
+        let host_registry = Arc::new(HostRegistry::default());
+        let serving = tokio::spawn(serve_connection(server, store, registry, host_registry, None));
+
+        let mut client = client;
+        write_frame(
+            &mut client,
+            &ControlRequest {
+                request_id: 1,
+                op: Some(control_request::Op::Submit(SubmitRequest {
+                    manifest: b"m".to_vec(),
+                    manifest_encoding: "test/v1".to_owned(),
+                    submitter_caps: Vec::new(),
+                })),
+            },
+        )
+        .await?;
+        let response: ControlResponse = read_frame(&mut client).await?.context("expected an Error response")?;
+        assert!(
+            matches!(response.result, Some(control_response::Result::Error(_))),
+            "got {:?}",
+            response.result
+        );
+
+        // The connection must still answer a later request, not have been
+        // torn down by the refusal above.
+        write_frame(
+            &mut client,
+            &ControlRequest {
+                request_id: 2,
+                op: Some(control_request::Op::List(sandy_control_proto::ListRequest {})),
+            },
+        )
+        .await?;
+        let response: ControlResponse = read_frame(&mut client)
+            .await?
+            .context("the connection must stay alive after a capacity refusal")?;
+        assert!(
+            matches!(response.result, Some(control_response::Result::List(_))),
+            "got {:?}",
+            response.result
+        );
+
+        drop(client);
         tokio::time::timeout(std::time::Duration::from_secs(5), serving).await??;
         Ok(())
     }
