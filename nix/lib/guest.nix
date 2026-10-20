@@ -27,7 +27,15 @@ let
   commonModule =
     { lib, pkgs, ... }:
     {
-      networking.hostName = "sandy";
+      # #325: `lib.mkForce` on every option below that NixOS's module system
+      # would otherwise raise a conflicting-definitions eval error on, once an
+      # arbitrary third-party `nixosModule`/`nixosConfiguration` (kinds 2/3) can
+      # also set it. `boot.kernelModules` is deliberately NOT forced: it is
+      # `listOf`-typed, so plain assignments from multiple modules concatenate
+      # instead of conflicting — forcing it would instead *discard* a target
+      # module's own kernel modules, the opposite of what kind 2/3 composition
+      # needs.
+      networking.hostName = lib.mkForce "sandy";
       system.stateVersion = "24.11";
 
       microvm = {
@@ -43,7 +51,7 @@ let
       # Autologin root on the serial console so the injected frame lands in a
       # shell, not a password prompt. microvm.nix points the guest console at
       # the hypervisor's serial device (ttyS0 for qemu, hvc0 for vfkit).
-      services.getty.autologinUser = "root";
+      services.getty.autologinUser = lib.mkForce "root";
       users.users.root.password = "";
 
       # sandy stages each job secret as a read-only file named by its env-var
@@ -52,7 +60,7 @@ let
       # microvm declaredRunner boot-proof (which attaches no such share) still
       # boots. sandy's own backends always attach the share, so the device is
       # present and the mount completes before login.
-      fileSystems."/run/sandy/secrets" = {
+      fileSystems."/run/sandy/secrets" = lib.mkForce {
         device = "sandy-secrets";
         fsType = "virtiofs";
         options = [
@@ -65,7 +73,7 @@ let
       # (sandy's INPUT_MOUNT_TAG) and mounts it read-only here, so the job reads
       # an input at /run/sandy/inputs/NAME. `nofail` so a run with no inputs (no
       # such share attached) still boots.
-      fileSystems."/run/sandy/inputs" = {
+      fileSystems."/run/sandy/inputs" = lib.mkForce {
         device = "sandy-inputs";
         fsType = "virtiofs";
         options = [
@@ -78,7 +86,7 @@ let
       # and collects it to the host at teardown; the job writes under
       # /run/sandy/outputs/NAME. Writable (no `ro`); `nofail` so a run with no
       # outputs still boots.
-      fileSystems."/run/sandy/outputs" = {
+      fileSystems."/run/sandy/outputs" = lib.mkForce {
         device = "sandy-outputs";
         fsType = "virtiofs";
         options = [
@@ -129,6 +137,13 @@ let
     };
 in
 {
+  # Exported alongside `mkGuest`/`mkTopology` (#325): the guest-wrapper flake's
+  # kind-3 strategy (`nixosConfigurations.<name>.extendModules { ... }`, a
+  # already-evaluated config rather than a fresh `mkGuest` call) needs the exact
+  # same protocol module `mkGuest` bakes in above — reusing this binding, not a
+  # second copy, is the whole point of `commonModule` being one definition.
+  inherit commonModule;
+
   mkGuest =
     {
       system,
