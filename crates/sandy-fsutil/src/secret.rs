@@ -235,7 +235,13 @@ impl OwnedDir {
 ///
 /// [`FsError`] when the staging base is unsafe or the directory cannot be made.
 pub fn private_staging_dir(prefix: &str) -> Result<OwnedDir, FsError> {
-    let base = crate::staging::ensure_sandy_staging_base_dir()?;
+    private_dir_under(&crate::staging::ensure_sandy_staging_base_dir()?, prefix)
+}
+
+/// Create a fresh `<prefix>-<random>` private dir through an already-validated
+/// `base` handle. Never reopen `base` by path here — that's the L-11 TOCTOU
+/// window this function exists to close.
+pub(crate) fn private_dir_under(base: &OwnedDir, prefix: &str) -> Result<OwnedDir, FsError> {
     let suffix = unique_suffix().map_err(|e| FsError::io("draw a dir name", base.path(), e))?;
     base.create_private_dir(&format!("{prefix}-{suffix}"))
 }
@@ -469,12 +475,19 @@ mod tests {
         );
 
         // The already-open handle is unaffected by the swap: it still refers to
-        // the originally validated directory by inode, not by name.
-        base_dir.create_private_dir("job")?;
+        // the originally validated directory by inode, not by name. Goes through
+        // `private_dir_under`, the same helper `private_staging_dir` delegates
+        // to, so a regression back to reopening by path shows up here too.
+        private_dir_under(&base_dir, "job")?;
 
+        let original_entries: Vec<_> = fs::read_dir(&moved_original)?.collect::<io::Result<_>>()?;
         anyhow::ensure!(
-            moved_original.join("job").is_dir(),
-            "the child directory did not land in the originally validated directory"
+            original_entries.len() == 1 && original_entries[0].file_name().to_string_lossy().starts_with("job-"),
+            "expected exactly one job- child in the originally validated directory, got {:?}",
+            original_entries
+                .iter()
+                .map(std::fs::DirEntry::file_name)
+                .collect::<Vec<_>>()
         );
         anyhow::ensure!(
             fs::read_dir(&base_path)?.next().is_none(),
