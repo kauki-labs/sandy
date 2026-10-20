@@ -2,7 +2,7 @@
 title: "Decisions: credential seam (CredentialProvider)"
 status: accepted
 project: sandy
-updated: 2026-10-14
+updated: 2026-10-20
 ---
 
 # Decisions: credential seam (`CredentialProvider`)
@@ -99,3 +99,22 @@ checked to be a single file name before anything is created.
 **Set aside.** Tightening the dir to `0700` and continuing: if the dir was writable
 by others, the key or config in it may already have been swapped, and continuing
 would trust it silently.
+
+## 5. Trust-root protection today is perms-only, not encryption-at-rest
+
+**Status:** accepted.
+
+**Context.** Decision 4's `0700` dir / `0600` files with `O_NOFOLLOW` (`open_trust_dir`,
+`open_trust_file`, `crates/sandy/src/cred.rs`) keep other local users and symlink
+tricks out, but the App private key and trust-root configs still sit on disk as
+plaintext readable by the controller's own user.
+
+**Decision.** That is the floor enforced today, and no more: encrypted-at-rest
+storage for the trust-roots dir (disk encryption, a secrets manager, a sealed
+box) is the operator's deployment responsibility, not something sandy enforces
+in code.
+
+**Consequences.** A controller host with unencrypted disk and an attacker who
+gains the controller user's own account (not just another local user) can read
+the trust material directly; perms-only protection does not defend against
+that. Operators who need that guarantee supply it at the deployment layer.
