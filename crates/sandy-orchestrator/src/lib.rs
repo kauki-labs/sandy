@@ -121,7 +121,7 @@ pub fn derive_job_caps<A: CapAuthority>(
         .map(|request| {
             let held = submitter_caps
                 .iter()
-                .find(|cap| cap.scope.channel == request.channel_id)
+                .find(|cap| cap.scope().channel == request.channel_id)
                 .ok_or_else(|| ManifestError::NoSuchCapability(request.channel_id.clone()))?;
             Ok(authority.attenuate(held, request.rights)?)
         })
@@ -183,9 +183,9 @@ mod tests {
         let granted = derive_job_caps(&authority, &[submitter], &manifest).context("derive_job_caps")?;
         anyhow::ensure!(granted.len() == 1, "expected exactly one granted cap");
         anyhow::ensure!(
-            granted[0].scope.rights == read_only(),
+            granted[0].scope().rights == read_only(),
             "the granted cap must carry exactly the requested rights, got {:?}",
-            granted[0].scope.rights
+            granted[0].scope().rights
         );
         // The attenuated cap must itself verify — derive_job_caps must not
         // hand back something the authority would reject downstream.

@@ -83,8 +83,8 @@ mod tests {
     fn assignment() -> ChannelAssignment {
         ChannelAssignment {
             channel_id: ChannelId::from("peer-group-1"),
-            cap: Cap {
-                scope: CapScope {
+            cap: Cap::new(
+                CapScope {
                     peer: "agent-1".into(),
                     channel: ChannelId::from("peer-group-1"),
                     rights: CapRights {
@@ -94,8 +94,8 @@ mod tests {
                     },
                     expires_at: None,
                 },
-                proof: vec![1, 2, 3],
-            },
+                vec![1, 2, 3],
+            ),
             role: ChannelRole::PeerGroup,
         }
     }

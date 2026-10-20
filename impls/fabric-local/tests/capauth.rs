@@ -79,7 +79,7 @@ fn minting_without_an_expiry_bakes_in_the_default_ttl() -> anyhow::Result<()> {
     let cap = authority.mint(scope(full_rights(), None)).context("mint")?;
     let after = unix_now()?;
     let expires_at = cap
-        .scope
+        .scope()
         .expires_at
         .context("None was not resolved to a concrete expiry")?;
     // Bracket by clock reads taken before and after mint, not a single `now`: the
@@ -116,7 +116,7 @@ impl CapAuthority for BrokenAuthority {
     }
 
     fn verify(&self, cap: &Cap) -> Result<CapScope, CapError> {
-        Ok(cap.scope.clone())
+        Ok(cap.scope().clone())
     }
 
     fn attenuate(&self, parent: &Cap, rights: CapRights) -> Result<Cap, CapError> {

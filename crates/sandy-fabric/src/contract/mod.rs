@@ -110,7 +110,7 @@ pub fn capauth_suite<A: CapAuthority>(make: impl Fn() -> A) -> Result<(), Contra
     let verified = expect_ok(SEAM, "verify of a minted cap", authority.verify(&cap))?;
     require(
         SEAM,
-        verified.peer == cap.scope.peer && verified.channel == cap.scope.channel && verified.rights == full,
+        verified.peer == cap.scope().peer && verified.channel == cap.scope().channel && verified.rights == full,
         "verify returns the minted peer, channel and rights",
     )?;
     require(
@@ -128,23 +128,25 @@ pub fn capauth_suite<A: CapAuthority>(make: impl Fn() -> A) -> Result<(), Contra
         tampered.push((rule, c));
     };
     edit("a cap with its peer edited is Forged", &|c| {
-        c.scope.peer = "intruder".into()
+        c.scope_mut().peer = "intruder".into()
     });
     edit("a cap with its channel edited is Forged", &|c| {
-        c.scope.channel = "c2".into()
+        c.scope_mut().channel = "c2".into()
     });
-    edit("a cap with its rights edited is Forged", &|c| c.scope.rights = full);
+    edit("a cap with its rights edited is Forged", &|c| {
+        c.scope_mut().rights = full
+    });
     edit("a cap with its expiry removed is Forged", &|c| {
-        c.scope.expires_at = None
+        c.scope_mut().expires_at = None
     });
     edit(
         "a cap with an altered proof is Forged",
-        &|c| match c.proof.first_mut() {
+        &|c| match c.proof_mut().first_mut() {
             Some(b) => *b ^= 1,
-            None => c.proof.push(1),
+            None => c.proof_mut().push(1),
         },
     );
-    edit("a cap with an emptied proof is Forged", &|c| c.proof.clear());
+    edit("a cap with an emptied proof is Forged", &|c| c.proof_mut().clear());
     for (rule, cap) in &tampered {
         require(SEAM, matches!(authority.verify(cap), Err(CapError::Forged)), rule)?;
     }
@@ -165,7 +167,7 @@ pub fn capauth_suite<A: CapAuthority>(make: impl Fn() -> A) -> Result<(), Contra
     )?;
     require(
         SEAM,
-        child_scope.channel == cap.scope.channel && child_scope.peer == cap.scope.peer,
+        child_scope.channel == cap.scope().channel && child_scope.peer == cap.scope().peer,
         "attenuation keeps the parent's peer and channel",
     )?;
     require(

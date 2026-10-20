@@ -286,8 +286,8 @@ mod tests {
 
     fn cap() -> Cap {
         use sandy_fabric::capauth::{CapRights, CapScope};
-        Cap {
-            scope: CapScope {
+        Cap::new(
+            CapScope {
                 peer: "agent".into(),
                 channel: "orchestrator".into(),
                 rights: CapRights {
@@ -297,8 +297,8 @@ mod tests {
                 },
                 expires_at: Some(4_102_444_800),
             },
-            proof: vec![0xc0, 0xff, 0xee],
-        }
+            vec![0xc0, 0xff, 0xee],
+        )
     }
 
     #[test]

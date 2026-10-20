@@ -46,17 +46,62 @@ pub struct CapScope {
 }
 
 /// A signed capability: its scope plus the authority's opaque proof.
+///
+/// Fields are private (#217): construct via [`Cap::new`], read via
+/// [`Cap::scope`]/[`Cap::proof`]. This is hygiene, not a security boundary —
+/// the wire format and `serde` round-trip are unchanged.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cap {
     /// The claimed scope. Only trust it after [`CapAuthority::verify`].
-    pub scope: CapScope,
+    scope: CapScope,
     /// The opaque proof binding `scope` to the authority. Bearer credential
     /// material (a holder can present it as this `scope`): the `Debug` impl
     /// below redacts it from `{:?}` output, but `Cap` still derives
     /// `Serialize`/`Deserialize` over the real bytes — this does NOT guard
     /// `serde_json::to_string`, a JSON-mode tracing subscriber, or any future
     /// audit sink that serializes a `Cap` directly.
-    pub proof: Vec<u8>,
+    proof: Vec<u8>,
+}
+
+impl Cap {
+    /// Build a `Cap` from its claimed scope and the authority's opaque proof.
+    /// Any [`CapAuthority`] impl, in any crate, mints through this — the
+    /// fields themselves are private so nothing outside this module can
+    /// fabricate or edit one without going through a real authority (or, in a
+    /// test, this constructor directly).
+    #[must_use]
+    pub fn new(scope: CapScope, proof: Vec<u8>) -> Self {
+        Self { scope, proof }
+    }
+
+    /// The claimed scope. Only trust it after [`CapAuthority::verify`].
+    #[must_use]
+    pub fn scope(&self) -> &CapScope {
+        &self.scope
+    }
+
+    /// The opaque proof binding `scope` to the authority. Bearer credential
+    /// material — never log it or place it anywhere beyond the one encoding
+    /// path it already rides.
+    #[must_use]
+    pub fn proof(&self) -> &[u8] {
+        &self.proof
+    }
+
+    /// A mutable handle onto the proof bytes, for an adversarial test that
+    /// tampers a cap to prove verification catches it. Test-only in intent,
+    /// not enforced by `cfg`: #217 is explicitly non-security hygiene, so
+    /// this is an acceptable escape hatch, not a trust-boundary violation.
+    pub fn proof_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.proof
+    }
+
+    /// A mutable handle onto the scope, for the same tampering tests as
+    /// [`Cap::proof_mut`] (the shared contract-test harness edits individual
+    /// scope fields to prove a signed cap can't be silently widened).
+    pub fn scope_mut(&mut self) -> &mut CapScope {
+        &mut self.scope
+    }
 }
 
 impl std::fmt::Debug for Cap {

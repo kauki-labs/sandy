@@ -61,25 +61,25 @@ impl FakeAuthority {
 impl CapAuthority for FakeAuthority {
     fn mint(&self, scope: CapScope) -> Result<Cap, CapError> {
         let proof = self.proof(&scope);
-        Ok(Cap { scope, proof })
+        Ok(Cap::new(scope, proof))
     }
 
     fn verify(&self, cap: &Cap) -> Result<CapScope, CapError> {
-        if cap.proof != self.proof(&cap.scope) {
+        if cap.proof() != self.proof(cap.scope()) {
             return Err(CapError::Forged);
         }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        match cap.scope.expires_at {
+        match cap.scope().expires_at {
             Some(t) if t <= now => Err(CapError::Expired),
-            _ => Ok(cap.scope.clone()),
+            _ => Ok(cap.scope().clone()),
         }
     }
 
     fn attenuate(&self, parent: &Cap, rights: CapRights) -> Result<Cap, CapError> {
         let scope = if self.trusts_parent {
-            parent.scope.clone()
+            parent.scope().clone()
         } else {
             self.verify(parent)?
         };

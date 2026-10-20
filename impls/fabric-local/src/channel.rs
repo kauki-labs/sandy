@@ -84,7 +84,7 @@ fn hash_hex(parts: &[&[u8]]) -> String {
 
 /// The membership id for `cap`: a digest of its proof, not the proof itself.
 fn membership_id(cap: &Cap) -> MembershipId {
-    MembershipId(hash_hex(&[&cap.proof]))
+    MembershipId(hash_hex(&[cap.proof()]))
 }
 
 /// Per-membership delivery state for a resumable `subscribe()`: which
@@ -202,7 +202,7 @@ impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
     }
 
     fn rights_of(&self, membership: &MembershipId) -> Result<CapRights, ChannelError> {
-        Ok(self.member(membership)?.scope.rights)
+        Ok(self.member(membership)?.scope().rights)
     }
 
     /// This channel's id.
@@ -270,7 +270,7 @@ impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
         // a signing operation, and a real backend's latency shouldn't serialize
         // every other join/leave/post/subscribe behind this one mutex.
         let parent = self.member(inviter)?;
-        if !parent.scope.rights.invite {
+        if !parent.scope().rights.invite {
             return Err(ChannelError::InsufficientRights("invite"));
         }
         Ok(self.authority.attenuate(&parent, rights)?)
@@ -562,33 +562,33 @@ mod tests {
             self.revoked
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .insert(cap.proof.clone());
+                .insert(cap.proof().to_vec());
         }
     }
 
     impl CapAuthority for TestAuthority {
         fn mint(&self, scope: CapScope) -> Result<Cap, CapError> {
             let proof = self.proof(&scope);
-            Ok(Cap { scope, proof })
+            Ok(Cap::new(scope, proof))
         }
 
         fn verify(&self, cap: &Cap) -> Result<CapScope, CapError> {
-            if cap.proof != self.proof(&cap.scope) {
+            if cap.proof() != self.proof(cap.scope()) {
                 return Err(CapError::Forged);
             }
             let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
-            if cap.scope.expires_at.is_some_and(|t| t <= now) {
+            if cap.scope().expires_at.is_some_and(|t| t <= now) {
                 return Err(CapError::Expired);
             }
             if self
                 .revoked
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .contains(&cap.proof)
+                .contains(cap.proof())
             {
                 return Err(CapError::Revoked);
             }
-            Ok(cap.scope.clone())
+            Ok(cap.scope().clone())
         }
 
         fn attenuate(&self, parent: &Cap, rights: CapRights) -> Result<Cap, CapError> {
@@ -883,7 +883,7 @@ mod tests {
 
         let child_cap = channel.invite(&parent, read_only())?;
         assert_eq!(
-            child_cap.scope.peer,
+            child_cap.scope().peer,
             PeerId::from("p1"),
             "the representative shares the inviter's principal, per spec §3.8"
         );
