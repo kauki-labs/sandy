@@ -39,6 +39,18 @@ fn redact_console(mut console: String, secrets: &[String]) -> String {
     console
 }
 
+/// Re-redact `console` against `initial` plus every token `refresh_loop` queued
+/// onto `redact_log` as it staged one (M-6 follow-up): `run_job`'s own redaction
+/// pass only ever sees `initial`, so a mid-run refresh needs this second pass to
+/// catch its own token too. A no-op when `refreshed` is empty: re-running
+/// `redact_console` against `initial` alone finds nothing new, since the first
+/// pass already turned every occurrence of it into `[REDACTED]`.
+fn redact_with_refreshes(console: String, initial: &str, refreshed: &[Zeroizing<String>]) -> String {
+    let mut all_tokens = vec![initial.to_string()];
+    all_tokens.extend(refreshed.iter().map(|t| t.to_string()));
+    redact_console(console, &all_tokens)
+}
+
 /// Build the LOCKED [`ResultEnvelope`] from a terminal [`Classification`].
 ///
 /// `outputs` are the files the backend collected to the job's declared
@@ -412,8 +424,6 @@ pub fn run_job_with_credential<
             return Err(e.into());
         }
     };
-    let redact = [secret.to_string()];
-
     // Share cred_dir directly instead of pushing a plan secret the backend copies:
     // the caller owns the dir and the refresh thread rewrites the token in it live.
     let mut plan = plan;
@@ -438,15 +448,21 @@ pub fn run_job_with_credential<
         job_id: String::new(),
         done: false,
     };
+    // Borrow the zeroizing holder directly: no unzeroized plaintext clone.
+    // `run_job`'s own redaction only ever sees this initial token; `redact_log`
+    // (M-6 follow-up) catches whatever a mid-run refresh adds after that.
+    let redact = std::slice::from_ref(&*teardown.secret);
+    let redact_log: Mutex<Vec<Zeroizing<String>>> = Mutex::new(Vec::new());
 
     // Run the job on this thread; refresh the credential on a second thread until the
     // run returns, then signal it to stop by dropping the sender. The refresh thread
     // borrows the guard's lease (a `&Mutex`, so the guard isn't moved) and owns the
     // receiver; the scope joins it before the guard's teardown can run.
     let shared_lease = &teardown.lease;
+    let shared_redact_log = &redact_log;
     let mut report = std::thread::scope(|s| {
-        s.spawn(move || refresh_loop(provider, shared_lease, margin, tick, &stop_rx));
-        let report = run_job(backend, journal, &plan, egress, egress_os, tap, &redact);
+        s.spawn(move || refresh_loop(provider, shared_lease, margin, tick, &stop_rx, shared_redact_log));
+        let report = run_job(backend, journal, &plan, egress, egress_os, tap, redact);
         drop(stop_tx);
         report
     });
@@ -461,26 +477,48 @@ pub fn run_job_with_credential<
     if let Ok(run_report) = &report {
         teardown.job_id = run_report.envelope.job_id.clone();
     }
-    if let Some(warning) = teardown.teardown()
-        && let Ok(run_report) = &mut report
-    {
-        run_report.envelope.warnings.push(warning.clone());
-        amend_terminal_warning(journal, &run_report.envelope.job_id, warning)?;
+    let warning = teardown.teardown();
+    let refreshed_tokens = redact_log.into_inner().unwrap_or_else(PoisonError::into_inner);
+    if let Ok(run_report) = &mut report {
+        let mut amended = false;
+
+        // M-6 follow-up: re-redact against every token this run ever had live,
+        // not just the one `run_job` saw at its own redaction pass.
+        if !refreshed_tokens.is_empty() {
+            run_report.envelope.logs.tail = redact_with_refreshes(
+                std::mem::take(&mut run_report.envelope.logs.tail),
+                &teardown.secret,
+                &refreshed_tokens,
+            );
+            amended = true;
+        }
+        if let Some(warning) = warning {
+            run_report.envelope.warnings.push(warning);
+            amended = true;
+        }
+
+        // The run already succeeded or failed on its own terms; an amend
+        // failure here (lock contention, a disk write error) must not
+        // overwrite that outcome with one about the journal instead. The
+        // caller still gets the corrected envelope above — only the
+        // journaled copy risks staying stale.
+        if amended && let Err(e) = amend_terminal_envelope(journal, &run_report.envelope.job_id, &run_report.envelope) {
+            tracing::warn!(job_id = %run_report.envelope.job_id, error = %e, "failed to amend the journaled terminal record");
+        }
     }
     report
 }
 
-/// Push `warning` onto the terminal record's envelope already written by
-/// `run_job`, under the job flock, so the journal stays in lock-step with what
-/// `run_job_with_credential` returns (INV-6; L-12). Re-reads under the lock
-/// rather than reusing the in-memory envelope: a concurrent reconcile could have
-/// touched the record since `run_job` wrote it.
-fn amend_terminal_warning(journal: &Journal, job_id: &str, warning: String) -> Result<(), CoreError> {
+/// Overwrite the terminal record's envelope already written by `run_job` with
+/// `envelope`, under the job flock, so the journal stays in lock-step with what
+/// `run_job_with_credential` returns (INV-6; L-12 and its M-6 follow-up:
+/// a teardown warning or a post-run console re-redaction, or both). Re-reads
+/// the record under the lock rather than touching a cached copy: a concurrent
+/// reconcile could have touched it since `run_job` wrote it.
+fn amend_terminal_envelope(journal: &Journal, job_id: &str, envelope: &ResultEnvelope) -> Result<(), CoreError> {
     let _lock = journal.lock_job(job_id)?;
     let mut record = journal.read_record(job_id)?;
-    if let Some(envelope) = &mut record.result {
-        envelope.warnings.push(warning);
-    }
+    record.result = Some(envelope.clone());
     journal.write_record(&record)
 }
 
@@ -501,10 +539,7 @@ struct CredTeardown<'a, P: CredentialProvider + ?Sized> {
     /// before this guard is built. Held here only so it zeroizes alongside the
     /// lease revoke, never read back out — the `Lease` it sits beside still
     /// never carries it.
-    #[allow(
-        dead_code,
-        reason = "held only for its Drop side effect: zeroizing the raw secret (M-6)"
-    )]
+    /// Borrowed by `redact` for the run's duration and zeroized on drop (M-6).
     secret: Zeroizing<String>,
     /// The credential's declared name (e.g. `"GH_TOKEN"`), naming it in a
     /// revoke-failure warning without naming the token value (L-12).
@@ -585,12 +620,18 @@ fn refresh_interval(env_key: &str, default: u64) -> Duration {
 /// the sender half of `stop` is dropped (the run finished). Each refresh re-stages
 /// the live token file and revokes the superseded token via [`refresh_once`]; a
 /// refresh error is logged and retried on the next tick, never fatal to the run.
+///
+/// A successful refresh's new token is read back and queued onto `redact_log`
+/// (M-6 follow-up): `run_job`'s own redaction pass only ever saw the token staged
+/// before it started, so a refreshed token needs its own entry for the
+/// post-run re-redaction pass in [`run_job_with_credential`] to catch it too.
 fn refresh_loop<P: CredentialProvider + Sync + ?Sized>(
     provider: &P,
     lease: &Mutex<Lease>,
     margin: Duration,
     tick: Duration,
     stop: &mpsc::Receiver<()>,
+    redact_log: &Mutex<Vec<Zeroizing<String>>>,
 ) {
     loop {
         match stop.recv_timeout(tick) {
@@ -599,8 +640,22 @@ fn refresh_loop<P: CredentialProvider + Sync + ?Sized>(
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
         let mut guard = lease.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Err(e) = refresh_once(provider, &mut guard, SystemTime::now(), margin) {
-            tracing::warn!(%e, "mid-run credential refresh failed; keeping the current token");
+        match refresh_once(provider, &mut guard, SystemTime::now(), margin) {
+            Ok(true) => {
+                if let SecretSource::File(path) = &guard.secret_ref.source {
+                    match std::fs::read_to_string(path) {
+                        Ok(new_token) => redact_log
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .push(Zeroizing::new(new_token)),
+                        Err(e) => {
+                            tracing::warn!(%e, "could not read back a refreshed token for console redaction");
+                        }
+                    }
+                }
+            }
+            Ok(false) => {}
+            Err(e) => tracing::warn!(%e, "mid-run credential refresh failed; keeping the current token"),
         }
     }
 }
@@ -739,8 +794,9 @@ mod tests {
         Journal, Outcome, ProcessExit, Profile, Scope,
     };
     use sandy_test_support::{FakeApplier, FakeBackend};
+    use zeroize::Zeroizing;
 
-    use super::{redact_console, run_job};
+    use super::{redact_console, redact_with_refreshes, run_job};
     use crate::plan::JobPlan;
 
     // --- console redaction (M-6) -------------------------------------------------
@@ -765,6 +821,24 @@ mod tests {
         let console = "first=sec-one-xx second=sec-two-yy".to_string();
         let redacted = redact_console(console, &["sec-one-xx".to_string(), "sec-two-yy".to_string()]);
         assert_eq!(redacted, "first=[REDACTED] second=[REDACTED]");
+    }
+
+    #[test]
+    fn redact_with_refreshes_catches_a_refreshed_token_the_first_pass_never_saw() {
+        let console = "initial=ghs_initial_marker refreshed=ghs_refreshed_marker".to_string();
+        let redacted = redact_with_refreshes(
+            console,
+            "ghs_initial_marker",
+            &[Zeroizing::new("ghs_refreshed_marker".to_string())],
+        );
+        assert_eq!(redacted, "initial=[REDACTED] refreshed=[REDACTED]");
+    }
+
+    #[test]
+    fn redact_with_refreshes_is_a_no_op_shaped_call_when_nothing_refreshed() {
+        let console = "initial=ghs_initial_marker only".to_string();
+        let redacted = redact_with_refreshes(console, "ghs_initial_marker", &[]);
+        assert_eq!(redacted, "initial=[REDACTED] only");
     }
 
     /// A credential source that panics if asked for a provider — the non-credentialed
@@ -1008,6 +1082,8 @@ mod tests {
     /// `refresh_loop` refreshes the credential on each tick while the job runs and
     /// stops promptly when the sender is dropped. A margin past the token TTL makes
     /// `should_refresh` fire every tick, so a superseded token is revoked each time.
+    /// Also covers the M-6 follow-up: each refresh's new token must land in
+    /// `redact_log` so a post-run re-redaction pass can catch it.
     #[test]
     fn refresh_loop_refreshes_until_the_sender_drops() -> anyhow::Result<()> {
         use std::{
@@ -1017,6 +1093,7 @@ mod tests {
 
         use sandy::{Scope, mint_lease};
         use sandy_test_support::FakeProvider;
+        use zeroize::Zeroizing;
 
         let tmp = tempfile::tempdir().context("tmp")?;
         std::fs::set_permissions(tmp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700))
@@ -1029,11 +1106,13 @@ mod tests {
         let (tx, rx) = mpsc::channel::<()>();
         let margin = Duration::from_secs(1_000_000);
         let tick = Duration::from_millis(5);
+        let redact_log: Mutex<Vec<Zeroizing<String>>> = Mutex::new(Vec::new());
 
         std::thread::scope(|s| {
             let pref = &provider;
             let shared = &lease;
-            s.spawn(move || super::refresh_loop(pref, shared, margin, tick, &rx));
+            let shared_log = &redact_log;
+            s.spawn(move || super::refresh_loop(pref, shared, margin, tick, &rx, shared_log));
             std::thread::sleep(Duration::from_millis(50));
             drop(tx);
         });
@@ -1041,6 +1120,10 @@ mod tests {
         assert!(
             !provider.revoked().is_empty(),
             "refresh_loop must refresh and revoke a superseded token while the job runs"
+        );
+        assert!(
+            !redact_log.into_inner().unwrap().is_empty(),
+            "a refreshed token must be queued for post-run console redaction"
         );
         Ok(())
     }
