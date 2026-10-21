@@ -262,11 +262,24 @@
           # legs, with no `extraModules` beyond what the module itself
           # carries — the same shape nix/guest/flake.nix's own qemuGuest/
           # vfkitGuest build on, proving the standalone export didn't drop
-          # anything they silently relied on. `builtins.toJSON` only forces
-          # the attrset's string interpolations (derivation output paths),
-          # never a real build — no guest artifact compiles, no hypervisor
-          # runs, so this is cheap enough for every CI run, not just the
-          # live acceptance suite. Gated to one system (x86_64-linux): the
+          # anything they silently relied on.
+          #
+          # CAUTION: `builtins.toJSON` alone is NOT eval-only here. The
+          # resulting string still carries Nix's dependency "context" (each
+          # embedded store path, e.g. the kernel/initrd/erofs image, is
+          # recorded as a build input) — assigning that string to a real
+          # derivation's environment forces Nix to REALIZE every one of
+          # those paths before the derivation can build at all, which means
+          # compiling a full guest system (confirmed the hard way: an
+          # earlier version of this check pulled in 157 derivations,
+          # including a complete x86_64-linux NixOS closure, kernel, initrd,
+          # and erofs image, needing a real x86_64-linux builder — exactly
+          # what this check exists to avoid).
+          # `builtins.unsafeDiscardStringContext` strips that dependency
+          # edge, keeping only the plain path string: Nix can always COMPUTE
+          # a derivation's own output path from its inputs without building
+          # it, so the check genuinely never compiles a guest artifact or
+          # starts a hypervisor. Gated to one system (x86_64-linux): the
           # result doesn't depend on which system evaluates it, so running
           # it once is enough; `inputs.nixpkgs.legacyPackages.aarch64-darwin`
           # is itself an eval, not a build, so pulling it in from a Linux
@@ -275,21 +288,25 @@
             lib-guest-eval =
               pkgs.runCommand "lib-guest-eval"
                 {
-                  qemuTopology = builtins.toJSON (
-                    inputs.self.lib.mkTopology (
-                      inputs.self.lib.mkGuest {
-                        system = "x86_64-linux";
-                        hypervisor = "qemu";
-                      }
+                  qemuTopology = builtins.unsafeDiscardStringContext (
+                    builtins.toJSON (
+                      inputs.self.lib.mkTopology (
+                        inputs.self.lib.mkGuest {
+                          system = "x86_64-linux";
+                          hypervisor = "qemu";
+                        }
+                      )
                     )
                   );
-                  vfkitTopology = builtins.toJSON (
-                    inputs.self.lib.mkTopology (
-                      inputs.self.lib.mkGuest {
-                        system = "aarch64-linux";
-                        hypervisor = "vfkit";
-                        vmHostPackages = inputs.nixpkgs.legacyPackages.aarch64-darwin;
-                      }
+                  vfkitTopology = builtins.unsafeDiscardStringContext (
+                    builtins.toJSON (
+                      inputs.self.lib.mkTopology (
+                        inputs.self.lib.mkGuest {
+                          system = "aarch64-linux";
+                          hypervisor = "vfkit";
+                          vmHostPackages = inputs.nixpkgs.legacyPackages.aarch64-darwin;
+                        }
+                      )
                     )
                   );
                 }
