@@ -47,18 +47,35 @@ enum Command {
         /// detects which of three template kinds it exposes (`topology` |
         /// `nixos-module` | `nixos-configuration`, see `--kind`) and wraps it
         /// through its own guest-wrapper flake, always printing which kind it
-        /// picked.
+        /// picked. `--from-devshell` adds a fourth, always-explicit kind.
         #[arg(long, conflicts_with = "template")]
         flake: Option<String>,
         /// Override the attr name `--flake` resolves within its kind (the
-        /// `nixosModules`/`nixosConfigurations` entry; default `"default"`,
-        /// ignored for kind `topology`).
+        /// `nixosModules`/`nixosConfigurations`/`devShells` entry; default
+        /// `"default"`, ignored for kind `topology`).
         #[arg(long, requires = "flake")]
         attr: Option<String>,
         /// Force the `--flake` template kind instead of auto-detecting it:
         /// `topology` | `nixos-module` | `nixos-configuration`.
         #[arg(long, requires = "flake")]
         kind: Option<String>,
+        /// Best-effort (#326): synthesize a throwaway nixos-module from
+        /// `devShells.<system>.default` (or `--attr`) instead of requiring
+        /// `nixosModules`/`nixosConfigurations`. Always opt-in — never
+        /// auto-detected — and always prints a best-effort warning: a
+        /// devShell's `shellHook` assumes an interactive shell, the dev's own
+        /// checkout as `cwd`, and inherited host env, none of which carry
+        /// over identically into the guest.
+        // `conflicts_with = "template"` is explicit here, not left to
+        // `requires = "flake"` (which already conflicts with `template`
+        // itself): with both `template` and `--from-devshell` given and no
+        // `--flake`, clap's required-args resolution is satisfied by
+        // `template` alone and never separately enforces `from_devshell`'s
+        // own `requires`, so `--from-devshell` would otherwise be silently
+        // ignored rather than refused — never acceptable for a flag whose
+        // whole contract is "never silent" (#326).
+        #[arg(long, requires = "flake", conflicts_with_all = ["kind", "template"])]
+        from_devshell: bool,
         /// `--input HOST:NAME` read-only input at `/run/sandy/inputs/NAME` (repeatable).
         #[arg(long = "input")]
         inputs: Vec<String>,
@@ -851,6 +868,7 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
             flake,
             attr,
             kind,
+            from_devshell,
             inputs,
             outputs,
             secrets,
@@ -871,7 +889,12 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
             // after `dispatch_run` returns.
             let (resolved_template, _kept_template_file) = match flake {
                 Some(flake_ref) => {
-                    match sandy_cli::flake_wrap::resolve_flake_template(&flake_ref, kind.as_deref(), attr.as_deref()) {
+                    match sandy_cli::flake_wrap::resolve_flake_template(
+                        &flake_ref,
+                        kind.as_deref(),
+                        attr.as_deref(),
+                        from_devshell,
+                    ) {
                         Ok(sandy_cli::flake_wrap::ResolvedTemplate::Direct(t)) => (t, None),
                         Ok(sandy_cli::flake_wrap::ResolvedTemplate::Prebuilt { path, _kept }) => (path, Some(_kept)),
                         Err(e) => {
