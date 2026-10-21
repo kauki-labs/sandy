@@ -170,12 +170,20 @@ async fn submit_flake(
     .context("Submit call")?;
     match response.result {
         Some(control_response::Result::Submit(r)) => Ok((r.job_id, r.attach_token)),
-        Some(control_response::Result::Error(e)) => anyhow::bail!(
-            "Submit was refused: {} — if this names SandboxKind::Vm, ws01's deployed sandy-host-executor has not been \
-             redeployed with #332's VM-capability detection yet (a known, documented blocking dependency, not a bug \
-             in this test)",
-            e.message
-        ),
+        // See `live_ws01_flake_dispatch.rs`'s identical arm for why the hint
+        // is conditional, not unconditional (CodeRabbit finding on #336: an
+        // unconditional suffix made every refusal look like "not yet
+        // registered" to the retry loop below, which string-matches on it).
+        Some(control_response::Result::Error(e)) => {
+            let hint = if e.message.contains("SandboxKind::Vm") {
+                " (ws01's deployed sandy-host-executor has not been redeployed with #332's VM-capability detection \
+                 yet, a known, documented blocking dependency, not a bug in this test — or it has registered but not \
+                 yet declared Vm)"
+            } else {
+                ""
+            };
+            anyhow::bail!("Submit was refused: {}{hint}", e.message)
+        }
         other => anyhow::bail!("expected a Submit response, got {other:?}"),
     }
 }
