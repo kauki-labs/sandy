@@ -259,7 +259,7 @@ fn register_over_tcp(
 
 fn trusted_process_capabilities() -> Capabilities {
     Capabilities {
-        kind: SandboxKind::Process.into(),
+        supported_sandbox_kinds: vec![SandboxKind::Process.into()],
         arch: Arch::X8664.into(),
         attestation: false,
         supported_isolation_classes: vec![IsolationClass::Trusted.into()],
@@ -391,6 +391,7 @@ async fn cross_machine_sandboxes_exchange_a_peer_message_through_the_hub() -> an
             Box::new(sandy_test_support::FakeContainment::available()),
             agent_program,
             rt,
+            false,
         )
     })
     .await

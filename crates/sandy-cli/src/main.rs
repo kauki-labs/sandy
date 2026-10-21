@@ -160,13 +160,35 @@ enum Command {
 enum DaemonOp {
     /// Submit a job manifest to `sandyd`, printing the assigned job id.
     Submit {
-        /// Path to the manifest file, or `-` for stdin.
-        manifest: String,
+        /// Path to the manifest file, or `-` for stdin. Mutually exclusive
+        /// with `--flake`.
+        #[arg(required_unless_present = "flake", conflicts_with = "flake")]
+        manifest: Option<String>,
         /// Names the encoding of `manifest`'s bytes (e.g. a future
-        /// `sandy.orchestrator.v1.JobManifest`). Required — never a silent
-        /// default interpretation of unknown bytes.
-        #[arg(long)]
-        manifest_encoding: String,
+        /// `sandy.orchestrator.v1.JobManifest`). Required with `manifest` —
+        /// never a silent default interpretation of unknown bytes — and
+        /// refused with `--flake`, which encodes its own `flake/v1` tag.
+        #[arg(long, required_unless_present = "flake", conflicts_with = "flake")]
+        manifest_encoding: Option<String>,
+        /// Dispatch an arbitrary flake with no sandy awareness at all as a
+        /// VM job (#332), mirroring `sandy run --flake`'s own shape: encodes
+        /// a `flake/v1` manifest the remote host-executor resolves against
+        /// ITS OWN host (never a prebuilt artifact built here) and runs via
+        /// `SandboxKind::Vm`.
+        #[arg(long, conflicts_with = "manifest")]
+        flake: Option<String>,
+        /// Override the attr name `--flake` resolves within its kind (see
+        /// `sandy run --flake`'s own flag of the same name).
+        #[arg(long, requires = "flake")]
+        attr: Option<String>,
+        /// Force the `--flake` template kind instead of auto-detecting it:
+        /// `topology` | `nixos-module` | `nixos-configuration`.
+        #[arg(long, requires = "flake")]
+        kind: Option<String>,
+        /// The trailing `-- CMD ARGS...` guest command (only meaningful with
+        /// `--flake`; empty means "boot the template's default command").
+        #[arg(last = true, requires = "flake")]
+        command: Vec<String>,
     },
     /// Cancel a submitted job.
     Cancel {
@@ -574,17 +596,48 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
         DaemonOp::Submit {
             manifest,
             manifest_encoding,
+            flake,
+            attr,
+            kind,
+            command,
         } => {
-            let bytes = match read_manifest(&manifest) {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    eprintln!("sandy: could not read manifest {manifest:?}: {e}");
-                    return ProcessExit::InvalidPlan.code();
+            // clap's `required_unless_present = "flake"`/`conflicts_with`
+            // pairs above guarantee exactly one of `manifest` or `flake` is
+            // set here.
+            let (bytes, encoding) = if let Some(flake) = flake {
+                let manifest = sandy_guest_template::manifest::FlakeManifestV1 {
+                    flake,
+                    kind,
+                    attr,
+                    command,
+                };
+                match sandy_guest_template::manifest::encode_flake_manifest(&manifest) {
+                    Ok(bytes) => (
+                        bytes,
+                        sandy_guest_template::manifest::MANIFEST_ENCODING_FLAKE_V1.to_owned(),
+                    ),
+                    Err(e) => {
+                        eprintln!("sandy: could not encode the --flake manifest: {e}");
+                        return ProcessExit::InfraFault.code();
+                    }
                 }
+            } else {
+                // `required_unless_present = "flake"` guarantees `manifest`
+                // is `Some` whenever `flake` is `None`.
+                let manifest = manifest.expect("manifest is required unless --flake is given");
+                let encoding = manifest_encoding.expect("manifest_encoding is required unless --flake is given");
+                let bytes = match read_manifest(&manifest) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        eprintln!("sandy: could not read manifest {manifest:?}: {e}");
+                        return ProcessExit::InvalidPlan.code();
+                    }
+                };
+                (bytes, encoding)
             };
             control_request::Op::Submit(SubmitRequest {
                 manifest: bytes,
-                manifest_encoding,
+                manifest_encoding: encoding,
                 // No cap-supply flow for the CLI yet (#232): a direct-mint
                 // submit, same as today, never a silent way to claim bounded
                 // caps without actually presenting any.

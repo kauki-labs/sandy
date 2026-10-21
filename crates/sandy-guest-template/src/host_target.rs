@@ -1,11 +1,14 @@
 //! The host→guest hypervisor/system pairing (#325): which native backend and
 //! which Linux guest arch this host's `sandy run` drives, with no hypervisor
-//! on `PATH` required to ask. Shared by three callers that previously each
-//! carried their own copy of this mapping (or, for `--flake`, had none yet):
-//! `live_target::require_live()` (behind the `live` feature), `doctor`'s
-//! macOS builder-prereq check, and `flake_wrap`'s `--flake` auto-detection.
-//! Ungated — unlike `live_target` — because `--flake` resolution needs it in
-//! every build, not only the live acceptance gates.
+//! on `PATH` required to ask. Shared by callers that previously each carried
+//! their own copy of this mapping (or, for `--flake`, had none yet):
+//! `sandy-cli`'s `live_target::require_live()` (behind the `live` feature),
+//! `doctor`'s macOS builder-prereq check, and `flake_wrap`'s `--flake`
+//! auto-detection — plus, since #332, `sandy-host-executor`'s own flake/v1 VM
+//! dispatch, which runs this same pairing on ITS OWN host (e.g. ws01) rather
+//! than the submitting Mac. Ungated — unlike `live_target` — because
+//! `--flake` resolution needs it in every build, not only the live
+//! acceptance gates.
 
 /// One host→guest pairing: the hypervisor this host's native backend drives,
 /// and the Linux guest system it boots.

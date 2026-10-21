@@ -83,6 +83,22 @@ in
       defaultText = lib.literalExpression "pkgs.sandy-agent";
       description = "The sandy-agent package a dispatched job's sandbox launches (SANDY_AGENT_PATH).";
     };
+
+    guestWrapperPackage = lib.mkOption {
+      type = lib.types.package;
+      default = pkgs.sandy-guest-wrapper;
+      defaultText = lib.literalExpression "pkgs.sandy-guest-wrapper";
+      description = ''
+        The packaged guest-wrapper source tree (SANDY_GUEST_WRAPPER, #332):
+        resolves+builds a `flake/v1` dispatch's guest topology, the same
+        `nix/guest-wrapper` logic `sandy run --flake` runs locally, against
+        THIS host. Declaring `SandboxKind::Vm` capability also requires this
+        to actually be present and KVM/vhost-vsock to be reachable by
+        `${username}` — none of which this module enables yet (#287 is
+        trusted-process-only stage 1); setting this option alone does not
+        make a host VM-capable.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -158,6 +174,7 @@ in
         SANDY_HOST_EXECUTOR_ORCHESTRATOR = cfg.orchestrator;
         SANDY_HOST_EXECUTOR_ID = cfg.hostId;
         SANDY_AGENT_PATH = "${cfg.agentPackage}/bin/sandy-agent";
+        SANDY_GUEST_WRAPPER = "${cfg.guestWrapperPackage}";
       };
 
       serviceConfig = {

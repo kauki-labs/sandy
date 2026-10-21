@@ -232,7 +232,7 @@ mod tests {
 
     fn capabilities() -> Capabilities {
         Capabilities {
-            kind: SandboxKind::Process.into(),
+            supported_sandbox_kinds: vec![SandboxKind::Process.into()],
             arch: Arch::X8664.into(),
             attestation: false,
             supported_isolation_classes: vec![IsolationClass::Trusted.into()],

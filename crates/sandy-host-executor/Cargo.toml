@@ -24,6 +24,10 @@ name = "sandy-host-executor"
 path = "src/main.rs"
 
 [dependencies]
+# `dispatch::is_timeout` (#332, CodeRabbit finding on PR #333) walks an
+# `anyhow::Error` chain in library code, not just tests — moved up from
+# dev-dependencies rather than duplicated in both.
+anyhow.workspace = true
 sandy.workspace = true
 sandy-api.workspace = true
 sandy-conn.workspace = true
@@ -31,7 +35,13 @@ sandy-control-proto.workspace = true
 sandy-executor-proto.workspace = true
 sandy-fabric.workspace = true
 sandy-fabric-local.workspace = true
+sandy-guest-template.workspace = true
 sandy-impls-local.workspace = true
+# The remote VM dispatch branch's backend (#332): qemu/x86_64-linux is this
+# crate's own target (ws01-shaped), so the VM impl is pulled in directly,
+# not through the `sandy-backend` feature-gated hub `sandy-cli` uses — this
+# crate already depends on `sandy-impls-local` the same direct way.
+sandy-impls-vm.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = [
@@ -45,7 +55,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
-anyhow.workspace = true
 sandy-test-support.workspace = true
 tokio = { workspace = true, features = [
   "rt-multi-thread",

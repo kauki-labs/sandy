@@ -51,6 +51,10 @@ clap.workspace = true
 octocrab.workspace = true
 sandy.workspace = true
 sandy-control-proto.workspace = true
+# The flake-template resolution + host->hypervisor pairing logic `--flake`/
+# `daemon submit --flake` call into (#325/#332, extracted to be shared with
+# sandy-host-executor's remote VM dispatch).
+sandy-guest-template.workspace = true
 # The attach data plane's (#327) wire protocol: `sandy_fabric_local::link`'s
 # LinkFrame, the same framing the real sandbox agent's own link already uses.
 hex.workspace = true

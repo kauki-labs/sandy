@@ -2189,6 +2189,7 @@ dependencies = [
  "sandy-fabric",
  "sandy-fabric-local",
  "sandy-fsutil",
+ "sandy-guest-template",
  "sandy-host-executor",
  "sandy-lib",
  "sandy-proto",
@@ -2315,6 +2316,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandy-guest-template"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "sandy-host-executor"
 version = "0.1.1"
 dependencies = [
@@ -2325,7 +2337,9 @@ dependencies = [
  "sandy-executor-proto",
  "sandy-fabric",
  "sandy-fabric-local",
+ "sandy-guest-template",
  "sandy-impls-local",
+ "sandy-impls-vm",
  "sandy-lib",
  "sandy-test-support",
  "serde_json",

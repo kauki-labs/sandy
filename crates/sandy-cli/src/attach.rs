@@ -165,24 +165,48 @@ fn spawn_stdin_reader() -> tokio::sync::mpsc::Receiver<Vec<u8>> {
 /// # Errors
 /// An I/O fault reading or writing the connection or the local terminal.
 pub async fn run_interactive<R, W>(
-    mut read_half: R,
+    read_half: R,
     write_half: W,
-    mut status_watch: Option<tokio::sync::oneshot::Receiver<String>>,
+    status_watch: Option<tokio::sync::oneshot::Receiver<String>>,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let _raw_mode = RawMode::enable();
-    let write_half = std::sync::Arc::new(tokio::sync::Mutex::new(write_half));
+    run_interactive_inner(read_half, write_half, status_watch, spawn_stdin_reader()).await
+}
 
-    let mut stdin_rx = spawn_stdin_reader();
+/// [`run_interactive`]'s bridge loop, taking its stdin feed as an
+/// `mpsc::Receiver` instead of reading the real terminal — so a test can
+/// drive it with synthetic chunks (`tokio::io::duplex` standing in for the
+/// connection) without a tty. Split out for exactly that reason; production
+/// code has only the one caller above.
+async fn run_interactive_inner<R, W>(
+    mut read_half: R,
+    write_half: W,
+    mut status_watch: Option<tokio::sync::oneshot::Receiver<String>>,
+    mut stdin_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let write_half = std::sync::Arc::new(tokio::sync::Mutex::new(write_half));
+    // Ctrl-D must explicitly signal detachment, distinct from the stdin task
+    // simply ending on piped EOF (dropping this without firing it) — a
+    // `Notify` latches the signal (`notify_one` stores a permit even if
+    // nothing is `.await`ing yet), unlike a oneshot, which would need
+    // re-creating per loop iteration and would fire `Err` on a dropped
+    // sender, conflating "detach" with "the stdin task ended."
+    let detach = std::sync::Arc::new(tokio::sync::Notify::new());
     let stdin_task = {
         let write_half = std::sync::Arc::clone(&write_half);
+        let detach = std::sync::Arc::clone(&detach);
         tokio::spawn(async move {
             while let Some(chunk) = stdin_rx.recv().await {
                 let ctrl_d_at = chunk.iter().position(|&b| b == CTRL_D);
-                let (before, detach) = match ctrl_d_at {
+                let (before, ctrl_d) = match ctrl_d_at {
                     Some(i) => (&chunk[..i], true),
                     None => (&chunk[..], false),
                 };
@@ -196,10 +220,14 @@ where
                         return;
                     }
                 }
-                if detach {
-                    return; // Ctrl-D: stop forwarding, let the connection close
+                if ctrl_d {
+                    detach.notify_one(); // Ctrl-D: tell the main loop to detach
+                    return;
                 }
             }
+            // Piped stdin reached real EOF — NOT a detach signal (the
+            // persisted-token test relies on this: it closes stdin before
+            // the echo arrives, and must keep reading deliveries after).
         })
     };
 
@@ -214,9 +242,13 @@ where
                     }
                     break Ok(());
                 }
+                () = detach.notified() => break Ok(()),
             }
         } else {
-            read_frame(&mut read_half).await
+            tokio::select! {
+                frame = read_frame(&mut read_half) => frame,
+                () = detach.notified() => break Ok(()),
+            }
         };
         match delivered {
             Ok(Some(LinkFrame::Deliver {
@@ -295,6 +327,8 @@ pub fn spawn_status_watch(
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
 
     /// A job id unique enough that two test runs (even concurrent ones on
@@ -344,5 +378,60 @@ mod tests {
         let job_id = test_job_id("empty-token");
         persist_attach_token(&job_id, &[]);
         assert_eq!(read_attach_token(&job_id), None);
+    }
+
+    /// Regression (CodeRabbit finding on this PR): Ctrl-D used to just end
+    /// the stdin task, never signaling the main `select!` loop — the bridge
+    /// then kept blocking on `read_frame` until the connection closed or
+    /// `status_watch` fired, so an operator in a real terminal had no way to
+    /// detach. Drives [`run_interactive_inner`] directly (no real tty/stdin
+    /// needed) and asserts it returns promptly once Ctrl-D is fed in.
+    #[tokio::test]
+    async fn ctrl_d_detaches_promptly() -> anyhow::Result<()> {
+        let (conn_read, _conn_read_peer) = tokio::io::duplex(4096);
+        let (conn_write, _conn_write_peer) = tokio::io::duplex(4096);
+        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::channel(8);
+
+        let task = tokio::spawn(run_interactive_inner(conn_read, conn_write, None, stdin_rx));
+        stdin_tx.send(vec![b'a', CTRL_D]).await.context("feed Ctrl-D")?;
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .context("run_interactive_inner did not return after Ctrl-D")?
+            .context("run_interactive_inner task panicked")?;
+        outcome.context("run_interactive_inner returned an error")?;
+        Ok(())
+    }
+
+    /// Regression, the other half of the same finding: piped-stdin EOF (the
+    /// stdin task's `mpsc::Receiver` closing with no Ctrl-D byte ever seen)
+    /// must NOT detach — `a_separate_attach_process_gets_post_rights_via_the_persisted_token`
+    /// (`live_attach.rs`) depends on exactly this: it closes stdin before the
+    /// echo arrives and still expects the bridge to keep running. Proven
+    /// here by closing the stdin channel immediately and asserting the loop
+    /// is still running a bit later, then closing the connection to let it
+    /// end cleanly.
+    #[tokio::test]
+    async fn piped_stdin_eof_does_not_detach() -> anyhow::Result<()> {
+        let (conn_read, conn_read_peer) = tokio::io::duplex(4096);
+        let (conn_write, _conn_write_peer) = tokio::io::duplex(4096);
+        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::channel(8);
+        drop(stdin_tx); // real EOF, no Ctrl-D byte ever sent
+
+        let mut task = tokio::spawn(run_interactive_inner(conn_read, conn_write, None, stdin_rx));
+
+        let still_running = tokio::time::timeout(std::time::Duration::from_millis(200), &mut task).await;
+        assert!(
+            still_running.is_err(),
+            "piped stdin EOF must not end the bridge on its own"
+        );
+
+        drop(conn_read_peer); // clean close of the connection: the real way this bridge ends here
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .context("run_interactive_inner did not end after the connection closed")?
+            .context("run_interactive_inner task panicked")?;
+        outcome.context("run_interactive_inner returned an error")?;
+        Ok(())
     }
 }

@@ -36,7 +36,7 @@ use std::{
     },
 };
 
-use sandy_executor_proto::{Capabilities, Dispatch, IsolationClass};
+use sandy_executor_proto::{Capabilities, Dispatch, IsolationClass, SandboxKind};
 use tokio::sync::mpsc;
 
 /// The mesh identities permitted to register as executor hosts. Self-reported
@@ -182,6 +182,14 @@ pub enum DispatchSendError {
     /// cannot run it, never a silent downgrade onto trusted-process.
     #[error("host does not support the dispatch's required isolation class")]
     UnsupportedIsolationClass,
+    /// The host never declared `dispatch.backend` among its
+    /// `supported_sandbox_kinds` (#332; including an unset/`Unspecified`
+    /// kind, never an implicit match) — the same fail-closed discipline as
+    /// [`Self::UnsupportedIsolationClass`], applied to the sandbox kind
+    /// dimension: a VM-templated dispatch must never silently land on a
+    /// Process-only host.
+    #[error("host does not support the dispatch's backend sandbox kind")]
+    UnsupportedSandboxKind,
     /// [`HostRegistry::send_dispatch_if_current`] found `host_id` currently
     /// registered, but under a DIFFERENT connection than the one named —
     /// the original connection ended and a different allowlisted peer
@@ -290,41 +298,71 @@ impl HostRegistry {
             .map(|host| host.capabilities.clone())
     }
 
-    /// Stage-1 placement (#298): the first currently-registered host
-    /// (arbitrary order — D5's single-executor model makes "first match"
-    /// equivalent to "the match"; a real scheduling policy is future work
-    /// once more than one executor exists to choose between) whose declared
-    /// `supported_isolation_classes` includes `required`. `None` if no
-    /// registered host qualifies, including when `required` is
-    /// `Unspecified` — the same fail-closed-on-missing-data rule
-    /// [`Self::send_dispatch`] enforces, applied here too so a caller can't
-    /// pick a host `send_dispatch` would then refuse anyway. The caller runs
-    /// the job locally when this returns `None`.
+    /// Stage-1 placement (#298; the sandbox-kind dimension since #332): the
+    /// first currently-registered host (arbitrary order — D5's
+    /// single-executor model makes "first match" equivalent to "the match";
+    /// a real scheduling policy is future work once more than one executor
+    /// exists to choose between) whose declared `supported_isolation_classes`
+    /// includes `required_isolation_class` AND whose declared
+    /// `supported_sandbox_kinds` includes `required_sandbox_kind` — the same
+    /// filtering shape for both dimensions, not a separate bolted-on
+    /// mechanism for the newer one. `None` if no registered host qualifies,
+    /// including when EITHER required value is `Unspecified` — the same
+    /// fail-closed-on-missing-data rule [`Self::send_dispatch`] enforces,
+    /// applied here too so a caller can't pick a host `send_dispatch` would
+    /// then refuse anyway. The caller runs the job locally when this returns
+    /// `None`.
     ///
     /// Returns the host's capabilities alongside its id and peer IP so a
     /// caller can build a `Dispatch` (e.g. its `backend`) without a second
     /// lookup that could race a concurrent disconnect between the two calls.
     #[must_use]
-    pub fn pick_host_for(&self, required: i32) -> Option<PlacementCandidate> {
-        if required == i32::from(IsolationClass::Unspecified) {
+    pub fn pick_host_for(
+        &self,
+        required_isolation_class: i32,
+        required_sandbox_kind: i32,
+    ) -> Option<PlacementCandidate> {
+        if required_isolation_class == i32::from(IsolationClass::Unspecified) {
             tracing::debug!(
-                required,
-                "pick_host_for: required class is Unspecified, refusing fail-closed"
+                required_isolation_class,
+                "pick_host_for: required isolation class is Unspecified, refusing fail-closed"
+            );
+            return None;
+        }
+        if required_sandbox_kind == i32::from(SandboxKind::Unspecified) {
+            tracing::debug!(
+                required_sandbox_kind,
+                "pick_host_for: required sandbox kind is Unspecified, refusing fail-closed"
             );
             return None;
         }
         let hosts = self.hosts.lock().unwrap_or_else(PoisonError::into_inner);
         tracing::debug!(
-            required,
+            required_isolation_class,
+            required_sandbox_kind,
             registered = ?hosts
                 .iter()
-                .map(|(host_id, host)| (host_id.clone(), host.capabilities.supported_isolation_classes.clone()))
+                .map(|(host_id, host)| {
+                    (
+                        host_id.clone(),
+                        host.capabilities.supported_isolation_classes.clone(),
+                        host.capabilities.supported_sandbox_kinds.clone(),
+                    )
+                })
                 .collect::<Vec<_>>(),
             "pick_host_for: matching against currently registered hosts"
         );
         hosts
             .iter()
-            .find(|(_, host)| host.capabilities.supported_isolation_classes.contains(&required))
+            .find(|(_, host)| {
+                host.capabilities
+                    .supported_isolation_classes
+                    .contains(&required_isolation_class)
+                    && host
+                        .capabilities
+                        .supported_sandbox_kinds
+                        .contains(&required_sandbox_kind)
+            })
             .map(|(host_id, host)| PlacementCandidate {
                 host_id: host_id.clone(),
                 registration: host.registration,
@@ -397,6 +435,17 @@ impl HostRegistry {
         if !supported {
             return Err(DispatchSendError::UnsupportedIsolationClass);
         }
+        // #332: the same fail-closed re-check for the sandbox-kind dimension
+        // — `pick_host_for` already filtered on it, but this is the actual
+        // delivery point, the same defense-in-depth reasoning the isolation
+        // check above already applies (never trust that the caller picked
+        // correctly; re-verify right before the send).
+        let backend = dispatch.backend;
+        let backend_supported = backend != i32::from(SandboxKind::Unspecified)
+            && host.capabilities.supported_sandbox_kinds.contains(&backend);
+        if !backend_supported {
+            return Err(DispatchSendError::UnsupportedSandboxKind);
+        }
         host.dispatch_tx
             .send(dispatch)
             .await
@@ -407,8 +456,6 @@ impl HostRegistry {
 #[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;
-
-    use sandy_executor_proto::SandboxKind;
 
     use super::*;
 
@@ -422,7 +469,16 @@ mod tests {
 
     fn capabilities() -> Capabilities {
         Capabilities {
-            kind: SandboxKind::Process.into(),
+            supported_sandbox_kinds: vec![SandboxKind::Process.into()],
+            arch: sandy_executor_proto::Arch::X8664.into(),
+            attestation: false,
+            supported_isolation_classes: vec![sandy_executor_proto::IsolationClass::Trusted.into()],
+        }
+    }
+
+    fn vm_capabilities() -> Capabilities {
+        Capabilities {
+            supported_sandbox_kinds: vec![SandboxKind::Vm.into()],
             arch: sandy_executor_proto::Arch::X8664.into(),
             attestation: false,
             supported_isolation_classes: vec![sandy_executor_proto::IsolationClass::Trusted.into()],
@@ -540,6 +596,26 @@ mod tests {
         Ok(())
     }
 
+    /// Fail-closed sandbox-kind gate (#332, the delivery-time mirror of
+    /// `pick_host_for_never_falls_back_to_a_process_only_host_for_a_vm_requirement`):
+    /// a host that only declared `Process` must never actually receive a
+    /// dispatch whose `backend` is `Vm`, even if something upstream of
+    /// `send_dispatch` picked it incorrectly.
+    #[tokio::test]
+    async fn dispatch_requiring_an_undeclared_sandbox_kind_is_refused() -> anyhow::Result<()> {
+        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let registry = HostRegistry::default();
+        registry
+            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities()) // Process only
+            .expect("the allowed peer must register");
+
+        let mut dispatch = dispatch();
+        dispatch.backend = SandboxKind::Vm.into();
+        let result = registry.send_dispatch("ws01", dispatch).await;
+        assert_eq!(result, Err(DispatchSendError::UnsupportedSandboxKind));
+        Ok(())
+    }
+
     /// Once a host's connection task ends and removes its entry, it stops
     /// being dispatch-eligible immediately — never a stale target.
     #[tokio::test]
@@ -569,8 +645,8 @@ mod tests {
             .expect("the allowed peer must register");
 
         let picked = registry
-            .pick_host_for(IsolationClass::Trusted.into())
-            .expect("a Trusted-capable host is registered");
+            .pick_host_for(IsolationClass::Trusted.into(), SandboxKind::Process.into())
+            .expect("a Trusted-capable, Process-capable host is registered");
         assert_eq!(picked.host_id, "ws01");
         assert_eq!(picked.peer_ip, executor_ip());
         assert_eq!(picked.capabilities, capabilities());
@@ -582,7 +658,10 @@ mod tests {
     #[test]
     fn pick_host_for_returns_none_with_no_registered_hosts() {
         let registry = HostRegistry::default();
-        assert_eq!(registry.pick_host_for(IsolationClass::Trusted.into()), None);
+        assert_eq!(
+            registry.pick_host_for(IsolationClass::Trusted.into(), SandboxKind::Process.into()),
+            None
+        );
     }
 
     /// Adversarial (#298): a registered host that does NOT declare the
@@ -597,7 +676,10 @@ mod tests {
             .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities()) // Trusted only
             .expect("the allowed peer must register");
 
-        assert_eq!(registry.pick_host_for(IsolationClass::Untrusted.into()), None);
+        assert_eq!(
+            registry.pick_host_for(IsolationClass::Untrusted.into(), SandboxKind::Process.into()),
+            None
+        );
     }
 
     /// Adversarial (#298, the same fail-closed-on-missing-data rule
@@ -613,7 +695,10 @@ mod tests {
             .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
             .expect("the allowed peer must register");
 
-        assert_eq!(registry.pick_host_for(IsolationClass::Unspecified.into()), None);
+        assert_eq!(
+            registry.pick_host_for(IsolationClass::Unspecified.into(), SandboxKind::Process.into()),
+            None
+        );
     }
 
     /// Regression (#298): a host removed from the registry (disconnected) is
@@ -629,7 +714,64 @@ mod tests {
             .expect("the allowed peer must register");
         registry.remove("ws01", registration);
 
-        assert_eq!(registry.pick_host_for(IsolationClass::Trusted.into()), None);
+        assert_eq!(
+            registry.pick_host_for(IsolationClass::Trusted.into(), SandboxKind::Process.into()),
+            None
+        );
+    }
+
+    // ---- Sandbox-kind placement dimension (#332) ----
+
+    /// Positive (#332): a host that declared `Vm` is picked for a
+    /// `Vm`-required placement.
+    #[test]
+    fn pick_host_for_returns_a_vm_capable_host_for_a_vm_requirement() {
+        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let registry = HostRegistry::default();
+        registry
+            .register(&allowlist, executor_ip(), "ws01".to_owned(), vm_capabilities())
+            .expect("the allowed peer must register");
+
+        let picked = registry
+            .pick_host_for(IsolationClass::Trusted.into(), SandboxKind::Vm.into())
+            .expect("a Vm-capable host is registered");
+        assert_eq!(picked.host_id, "ws01");
+    }
+
+    /// Adversarial (#332, the issue's own acceptance bar): a VM-templated
+    /// placement must NEVER silently fall back to a Process-only host, even
+    /// when that host is the only one registered and satisfies the
+    /// isolation-class dimension.
+    #[test]
+    fn pick_host_for_never_falls_back_to_a_process_only_host_for_a_vm_requirement() {
+        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let registry = HostRegistry::default();
+        registry
+            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities()) // Process only
+            .expect("the allowed peer must register");
+
+        assert_eq!(
+            registry.pick_host_for(IsolationClass::Trusted.into(), SandboxKind::Vm.into()),
+            None,
+            "a Process-only host must never be picked for a Vm requirement"
+        );
+    }
+
+    /// Adversarial (#332, mirrors the isolation-class unspecified case): an
+    /// unspecified required sandbox kind never matches anything, even a host
+    /// that declared real kinds.
+    #[test]
+    fn pick_host_for_refuses_an_unspecified_required_sandbox_kind() {
+        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let registry = HostRegistry::default();
+        registry
+            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
+            .expect("the allowed peer must register");
+
+        assert_eq!(
+            registry.pick_host_for(IsolationClass::Trusted.into(), SandboxKind::Unspecified.into()),
+            None
+        );
     }
 
     /// Regression (CodeRabbit, #301): a dispatch decided against one

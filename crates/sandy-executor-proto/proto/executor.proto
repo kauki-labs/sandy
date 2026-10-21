@@ -89,7 +89,16 @@ enum IsolationClass {
 }
 
 message Capabilities {
-  SandboxKind kind = 1;
+  // The sandbox kinds this host can actually run — a SET, not a single value
+  // (#332): a host declaring both `Process` and `Vm` is ordinary once a host
+  // runs both a trusted-process backend and a real hypervisor. Field number
+  // kept at 1 (was a singular `SandboxKind kind = 1` before #332): prost
+  // decodes an old singular-enum wire value as a one-element repeated field
+  // on the new generated type, so a not-yet-redeployed host-executor sending
+  // the old shape still registers correctly as `[kind]` — no live Capabilities
+  // data is ever persisted (only sent over an active connection), so this is
+  // a safe in-place field change, not a migration.
+  repeated SandboxKind supported_sandbox_kinds = 1;
   Arch arch = 2;
   // sandy_fabric::executor::Attestation is a stub (unit struct) today;
   // carried as presence until it grows real fields.

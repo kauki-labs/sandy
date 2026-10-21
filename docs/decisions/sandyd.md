@@ -1070,3 +1070,87 @@ blast radius. Exposing `attach_token` in the CLI's JSON output
 bytes to join the channel itself, but nothing here asked for a non-persisted-
 file way to carry the token, and it would widen a bearer credential's
 exposure surface (stdout, logs, CI) for no requested use case — left out.
+
+## 18. `Capabilities` declares a SET of sandbox kinds; placement filters on kind too, not isolation class alone (#332)
+
+**Status:** implemented.
+
+**Context.** #332 wires `sandy run --flake`'s flake-templated VM boot to M2's
+remote dispatch: `sandy daemon submit --flake` places a job on a
+host-executor that must run it via `QemuBackend`, not `ProcessBackend`.
+`Capabilities.kind` (both the wire `sandy_executor_proto::Capabilities` and
+decision 15's placement logic) was a SINGULAR `SandboxKind` — one executor
+process declares exactly one kind. A host that already runs `Process` jobs
+(ws01, today) and gains VM capability needs to declare BOTH without losing
+the existing declaration; a singular field can't express that, and
+`pick_host_for`/`send_dispatch` had no sandbox-kind dimension at all —
+`Dispatch.backend` was set from whatever the picked host happened to declare,
+never from what the submission actually required.
+
+**Decision.**
+
+- `Capabilities.kind` (field 1) becomes `repeated SandboxKind
+supported_sandbox_kinds` — the same field NUMBER, mirroring the existing
+  `repeated IsolationClass supported_isolation_classes` field's shape on the
+  same message. Kept the number, not moved to a fresh one: `prost` decodes an
+  old singular-enum wire value as a one-element repeated field, so a
+  not-yet-redeployed host-executor sending the old shape still registers
+  correctly as `[kind]` (proven live: `live_ws01_attach.rs` passes unmodified
+  against ws01's OLD deployed binary on this branch's `sandyd`). This is a
+  breaking proto change in general, but safe here specifically: `Capabilities`
+  is never persisted, only ever sent live over an active `Register`
+  connection, so there is no stored old-shape data to migrate.
+- `sandy_fabric::executor::Capabilities`/`capabilities_satisfy` (the
+  per-`Executor`-instance seam, #263) are deliberately left singular and
+  unchanged: that is "one Executor impl = one kind," an unrelated concept
+  from "one host-executor PROCESS can run several kinds," which is what the
+  wire type now expresses. `sandy-host-executor::capability::
+to_wire_capabilities` is the one place that builds the wire SET, by
+  combining the domain `Capabilities.kind` (always `Process`, unchanged) with
+  a new, independent `detect_vm_capability` probe (qemu-system-x86_64 +
+  `nix` both runnable, `/dev/kvm` and `/dev/vhost-vsock` both usable — every
+  fact must hold, fail-closed, same discipline as the existing containment
+  probe).
+- `HostRegistry::pick_host_for` gains a second required-value parameter,
+  `required_sandbox_kind`, filtered the identical way
+  `required_isolation_class` already is (including the same
+  fail-closed-on-`Unspecified` rule) — one filtering shape for both
+  dimensions, not a second, bolted-on mechanism. `HostRegistry::send_to`
+  (the actual delivery point both `send_dispatch` and
+  `send_dispatch_if_current` share) gained the matching re-check, mirroring
+  the existing isolation-class gate there too.
+- `Dispatch.backend` is now the SUBMISSION's own required kind
+  (`required_sandbox_kind_for`, a pure function of `manifest_encoding`:
+  `flake/v1` → `Vm`, everything else → `Process`, the existing default),
+  never merely "whatever the picked host happens to support" — the old
+  `candidate.capabilities.kind` read stopped making sense once a host's
+  declared kinds became a set a submission's own requirement could be a
+  strict subset of.
+- A `flake/v1` submit that cannot be placed (no `forward_back_addr`
+  configured, or no registered host declares `Vm`) is refused OUTRIGHT at
+  `Submit` time, before any side effect — unlike `argv/v1`'s pre-existing
+  "no registered host → silently stays `Pending` forever" gap (decision 15's
+  own accepted, honest limitation, left unchanged here), a VM job has NO
+  local execution fallback in this daemon at all, so silently accepting one
+  would create a job that can never run, with no distinct status a caller
+  could ever notice.
+
+**Consequences.** `handle_dispatch` (sandy-host-executor) gained a
+`SandboxKind::Vm` branch decoding a `flake/v1` manifest
+(`sandy_guest_template::manifest::FlakeManifestV1`) and resolving it via the
+newly-extracted `sandy-guest-template` crate's `resolve_flake_template`
+against THIS host's own `host_target()` pairing — the identical logic `sandy
+run --flake` already runs locally, now shared rather than duplicated.
+`vm_available` is threaded into `handle_dispatch` as an explicit parameter
+(the caller's own fresh `detect_vm_capability` re-probe) rather than probed
+internally, so the function stays a deterministic unit under test — a real
+qemu/kvm/vhost-vsock/nix environment would otherwise make
+`handle_dispatch`'s own adversarial tests pass or fail depending on what the
+test-running host happens to have.
+
+**Set aside.** Giving `sandyd` a dependency on `sandy-guest-template` just to
+import its one `MANIFEST_ENCODING_FLAKE_V1` string constant: `sandyd` never
+resolves or decodes a flake manifest itself, only classifies the tag, so the
+constant is duplicated locally instead — the same precedent
+`link_auth::LINK_TOKEN_LEN` already set for
+`sandy_executor_proto::REMOTE_LINK_TOKEN_LEN`.

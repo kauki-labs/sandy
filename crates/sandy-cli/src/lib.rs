@@ -9,7 +9,11 @@ pub mod app_register;
 pub mod attach;
 pub mod doctor;
 pub mod flake_wrap;
-pub mod host_target;
+// `host_target` moved to `sandy-guest-template` (#332, a pure extraction
+// shared with `sandy-host-executor`'s remote VM dispatch); re-exported here
+// wholesale so `crate::host_target::host_target()` (doctor.rs, live_target.rs)
+// and `sandy_cli::host_target::*` keep resolving unchanged.
+pub use sandy_guest_template::host_target;
 #[cfg(feature = "live")]
 pub mod live_target;
 pub mod output;
