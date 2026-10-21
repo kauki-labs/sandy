@@ -123,6 +123,8 @@ pub fn build_guest(target: &LiveTarget) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context;
+
     use super::vfkit_target;
 
     /// The only guest arch `nix/guest/flake.nix` actually builds for vfkit.
