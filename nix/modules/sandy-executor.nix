@@ -289,15 +289,18 @@ in
         ];
         ProtectProc = "invisible";
         # Still true with `vm.enable`: PrivateDevices builds a private /dev
-        # with only the safe pseudo-devices (null/zero/random/tty/…) — a
-        # physical device node never just reappears because something
-        # elsewhere in this config references it. BindPaths below is what
-        # actually punches /dev/kvm and /dev/vhost-vsock through it; a
-        # DeviceAllow= entry alone would NOT do this (that's cgroup-level
-        # access control, orthogonal to whether the path exists in this
-        # unit's mount namespace at all). bwrap's own /dev (built inside its
-        # own mount ns for the trusted-process path, #142) is unaffected
-        # either way.
+        # with only the safe pseudo-devices (null/zero/random/tty/…) AND
+        # implicitly sets DevicePolicy=closed (systemd.exec(5)) — a physical
+        # device node never just reappears because something elsewhere in
+        # this config references it, and neither BindPaths nor group
+        # membership alone grants cgroup-level device access under a closed
+        # policy. Three things have to agree for `${username}` to actually
+        # open /dev/kvm or /dev/vhost-vsock: BindPaths (the path exists in
+        # this unit's mount namespace), DeviceAllow (the cgroup eBPF device
+        # program permits it despite DevicePolicy=closed), and
+        # SupplementaryGroups (the device node's own root:kvm 0660
+        # permission bits). bwrap's own /dev (built inside its own mount ns
+        # for the trusted-process path, #142) is unaffected either way.
         PrivateDevices = true;
         BindPaths = lib.optionals cfg.vm.enable [
           "/dev/kvm"
@@ -306,8 +309,10 @@ in
           # down the trusted-process capability that works today).
           "-/dev/vhost-vsock"
         ];
-        # kvm/vhost-vsock are typically root:kvm 0660 on NixOS; BindPaths
-        # alone exposes the path, this is what lets `${username}` open it.
+        DeviceAllow = lib.optionals cfg.vm.enable [
+          "/dev/kvm rw"
+          "/dev/vhost-vsock rw"
+        ];
         SupplementaryGroups = lib.optionals cfg.vm.enable [ "kvm" ];
         UMask = "0077";
         RemoveIPC = true;

@@ -439,6 +439,10 @@
               vmOn = evalWith {
                 services.sandy-executor.vm.enable = true;
               };
+              # `.path` is a list of packages, not strings — names only, same
+              # as `BindPaths`/`RestrictAddressFamilies` these compare
+              # against plain string lists so the check stays build-free.
+              pathNames = svc: map (p: p.pname or p.name) svc.path;
             in
             {
               sandy-executor-vm-opt-eval =
@@ -447,25 +451,45 @@
                     offBindPaths = builtins.toJSON vmOff.serviceConfig.BindPaths;
                     offRestrictAF = builtins.toJSON vmOff.serviceConfig.RestrictAddressFamilies;
                     offSuppGroups = builtins.toJSON vmOff.serviceConfig.SupplementaryGroups;
+                    offDeviceAllow = builtins.toJSON (vmOff.serviceConfig.DeviceAllow or [ ]);
+                    offPath = builtins.toJSON (pathNames vmOff);
                     onBindPaths = builtins.toJSON vmOn.serviceConfig.BindPaths;
                     onRestrictAF = builtins.toJSON vmOn.serviceConfig.RestrictAddressFamilies;
                     onSuppGroups = builtins.toJSON vmOn.serviceConfig.SupplementaryGroups;
+                    onDeviceAllow = builtins.toJSON vmOn.serviceConfig.DeviceAllow;
+                    onPath = builtins.toJSON (pathNames vmOn);
                   }
                   ''
                     [ "$offBindPaths" = "[]" ] || { echo "vm.enable=false must leave BindPaths empty, got: $offBindPaths" >&2; exit 1; }
                     [ "$offSuppGroups" = "[]" ] || { echo "vm.enable=false must leave SupplementaryGroups empty, got: $offSuppGroups" >&2; exit 1; }
+                    [ "$offDeviceAllow" = "[]" ] || { echo "vm.enable=false must leave DeviceAllow empty, got: $offDeviceAllow" >&2; exit 1; }
                     case "$offRestrictAF" in
                       *AF_VSOCK*) echo "vm.enable=false must not add AF_VSOCK, got: $offRestrictAF" >&2; exit 1 ;;
                     esac
+                    for pkg in qemu nix virtiofsd git; do
+                      case "$offPath" in
+                        *"\"$pkg\""*) echo "vm.enable=false must not put $pkg on PATH, got: $offPath" >&2; exit 1 ;;
+                      esac
+                    done
                     case "$onBindPaths" in
                       *"/dev/kvm"*"-/dev/vhost-vsock"*) ;;
                       *) echo "vm.enable=true must bind /dev/kvm and -/dev/vhost-vsock, got: $onBindPaths" >&2; exit 1 ;;
                     esac
                     [ "$onSuppGroups" = '["kvm"]' ] || { echo "vm.enable=true must add the kvm group, got: $onSuppGroups" >&2; exit 1; }
+                    case "$onDeviceAllow" in
+                      *"/dev/kvm rw"*"/dev/vhost-vsock rw"*) ;;
+                      *) echo "vm.enable=true must allow /dev/kvm and /dev/vhost-vsock through the cgroup device policy (PrivateDevices implies DevicePolicy=closed), got: $onDeviceAllow" >&2; exit 1 ;;
+                    esac
                     case "$onRestrictAF" in
                       *AF_VSOCK*) ;;
                       *) echo "vm.enable=true must add AF_VSOCK, got: $onRestrictAF" >&2; exit 1 ;;
                     esac
+                    for pkg in qemu nix virtiofsd git; do
+                      case "$onPath" in
+                        *"\"$pkg\""*) ;;
+                        *) echo "vm.enable=true must put $pkg on PATH, got: $onPath" >&2; exit 1 ;;
+                      esac
+                    done
                     mkdir -p "$out"
                     echo ok > "$out/result"
                   '';
