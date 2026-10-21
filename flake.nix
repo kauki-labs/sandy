@@ -315,7 +315,83 @@
                   printf '%s' "$qemuTopology" > "$out/qemu-topology.json"
                   printf '%s' "$vfkitTopology" > "$out/vfkit-topology.json"
                 '';
-          };
+          }
+          # Eval-only proof that `nix/guest-wrapper/flake.nix` (#325, "never
+          # evaluated directly" per its own description — sandy always drives
+          # it with `--override-input target <ref>`) actually composes a real
+          # target correctly, closing the same gap #324's PR #328 closed for
+          # `lib.mkGuest`/`lib.mkTopology` themselves (`lib-guest-eval` above).
+          # `--override-input` is a CLI-only mechanism, so these checks instead
+          # call the wrapper's own `outputs` function directly with a fixture's
+          # `outputs {}` standing in for `target` — the same "a flake.nix is
+          # just an attrset" trick this file already uses for `nix/lib/guest.nix`.
+          #
+          # `guest-wrapper-module-eval` proves kind 2: the nixos-module-hostname
+          # fixture's own `networking.hostName` collides with `commonModule`'s
+          # forced `"sandy"` (#325's `lib.mkForce` fix target) and must still
+          # evaluate clean.
+          #
+          # `guest-wrapper-configuration-eval` proves kind 3's hypervisor/system
+          # matching discriminates correctly both ways: the fixture targets
+          # aarch64-linux, so vfkit (the matching hypervisor) must succeed and
+          # qemu (x86_64-linux required) must fail. `builtins.tryEval` reports
+          # only success/failure, never the thrown message (confirmed: `nix
+          # eval --expr 'builtins.tryEval (throw "x")'` returns `{ success =
+          # false; value = false; }`, no trace of "x") — so the mismatch is
+          # asserted by its outcome, not by pattern-matching
+          # `guestFromConfiguration`'s thrown text.
+          #
+          # Same CAUTION as `lib-guest-eval`: `unsafeDiscardStringContext` on
+          # the succeeding `toJSON`'d topologies keeps this eval-only, never
+          # realizing the guest closure.
+          // lib.optionalAttrs (system == "x86_64-linux") (
+            let
+              guestWrapperOutputsFor =
+                target:
+                (import ./nix/guest-wrapper/flake.nix).outputs {
+                  inherit (inputs) nixpkgs microvm;
+                  inherit target;
+                };
+              moduleFixture =
+                (import ./nix/guest-wrapper/tests/fixtures/nixos-module-hostname/flake.nix).outputs
+                  { };
+              configFixture = (import ./nix/guest-wrapper/tests/fixtures/nixos-configuration/flake.nix).outputs {
+                inherit (inputs) nixpkgs;
+                self = null;
+              };
+              moduleTopology =
+                (guestWrapperOutputsFor moduleFixture).topologiesFromModule.default.x86_64-linux.qemu;
+              configMatching = (guestWrapperOutputsFor configFixture).topologiesFromConfiguration.default.vfkit;
+              configMismatched = (guestWrapperOutputsFor configFixture).topologiesFromConfiguration.default.qemu;
+            in
+            {
+              guest-wrapper-module-eval =
+                pkgs.runCommand "guest-wrapper-module-eval"
+                  { topology = builtins.unsafeDiscardStringContext (builtins.toJSON moduleTopology); }
+                  ''
+                    mkdir -p "$out"
+                    printf '%s' "$topology" > "$out/topology.json"
+                  '';
+              guest-wrapper-configuration-eval =
+                pkgs.runCommand "guest-wrapper-configuration-eval"
+                  {
+                    topology = builtins.unsafeDiscardStringContext (builtins.toJSON configMatching);
+                    mismatchFails =
+                      if (builtins.tryEval (builtins.deepSeq configMismatched configMismatched)).success then
+                        "false"
+                      else
+                        "true";
+                  }
+                  ''
+                    [ "$mismatchFails" = "true" ] || {
+                      echo "expected topologiesFromConfiguration.default.qemu to fail (system mismatch), but it evaluated" >&2
+                      exit 1
+                    }
+                    mkdir -p "$out"
+                    printf '%s' "$topology" > "$out/topology.json"
+                  '';
+            }
+          );
 
           # Built with covCraneLib so the toolchain on PATH carries
           # llvm-tools-preview (for cargo-llvm-cov); the project itself still

@@ -40,8 +40,25 @@ enum Command {
     Doctor,
     /// Boot a template and run a job to completion in the foreground.
     Run {
-        /// The template (flake attr / image) to boot.
-        template: String,
+        /// The template (flake attr / image) to boot. Mutually exclusive with `--flake`.
+        #[arg(required_unless_present = "flake", conflicts_with = "flake")]
+        template: Option<String>,
+        /// Boot an arbitrary flake with no sandy awareness at all (#325): sandy
+        /// detects which of three template kinds it exposes (`topology` |
+        /// `nixos-module` | `nixos-configuration`, see `--kind`) and wraps it
+        /// through its own guest-wrapper flake, always printing which kind it
+        /// picked.
+        #[arg(long, conflicts_with = "template")]
+        flake: Option<String>,
+        /// Override the attr name `--flake` resolves within its kind (the
+        /// `nixosModules`/`nixosConfigurations` entry; default `"default"`,
+        /// ignored for kind `topology`).
+        #[arg(long, requires = "flake")]
+        attr: Option<String>,
+        /// Force the `--flake` template kind instead of auto-detecting it:
+        /// `topology` | `nixos-module` | `nixos-configuration`.
+        #[arg(long, requires = "flake")]
+        kind: Option<String>,
         /// `--input HOST:NAME` read-only input at `/run/sandy/inputs/NAME` (repeatable).
         #[arg(long = "input")]
         inputs: Vec<String>,
@@ -831,6 +848,9 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
         Command::Daemon { .. } => unreachable!("daemon handled above"),
         Command::Run {
             template,
+            flake,
+            attr,
+            kind,
             inputs,
             outputs,
             secrets,
@@ -843,8 +863,37 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
             cred_capability,
             command,
         } => {
+            // `--flake` resolves to either the user's own `topologies` attr
+            // (kind `topology`, unchanged) or a prebuilt topology JSON file
+            // (kinds `nixos-module`/`nixos-configuration`, #325) that
+            // `JobPlan::template` becomes — `_kept_template_file` holds that
+            // file open for exactly this call, dropped (and deleted) only
+            // after `dispatch_run` returns.
+            let (resolved_template, _kept_template_file) = match flake {
+                Some(flake_ref) => {
+                    match sandy_cli::flake_wrap::resolve_flake_template(&flake_ref, kind.as_deref(), attr.as_deref()) {
+                        Ok(sandy_cli::flake_wrap::ResolvedTemplate::Direct(t)) => (t, None),
+                        Ok(sandy_cli::flake_wrap::ResolvedTemplate::Prebuilt { path, _kept }) => (path, Some(_kept)),
+                        Err(e) => {
+                            eprintln!("sandy: --flake {flake_ref}: {e}");
+                            return ProcessExit::InvalidPlan.code();
+                        }
+                    }
+                }
+                // clap's `required_unless_present = "flake"` guarantees
+                // `template` is set whenever `flake` is not; the `None` arm
+                // is unreachable in practice but reported, not panicked, if
+                // clap's own guarantee ever changes.
+                None => match template {
+                    Some(t) => (t, None),
+                    None => {
+                        eprintln!("sandy: neither a template nor --flake was given");
+                        return ProcessExit::InvalidPlan.code();
+                    }
+                },
+            };
             let args = RunArgs {
-                template,
+                template: resolved_template,
                 inputs,
                 outputs,
                 secrets,

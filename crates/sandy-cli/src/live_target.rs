@@ -42,13 +42,13 @@ pub fn require_live() -> anyhow::Result<LiveTarget> {
     if std::env::var("SANDY_LIVE").ok().as_deref() != Some("1") {
         bail!("refusing: this is a live gate — set SANDY_LIVE=1 on a host with a hypervisor");
     }
-    let target = if cfg!(target_os = "macos") {
-        LiveTarget {
-            hypervisor: std::env::var("SANDY_VFKIT_BIN").unwrap_or_else(|_| "vfkit".to_string()),
-            runner_attr: "packages.aarch64-darwin.guest-runner-vfkit",
-            topology_attr: "topologies.aarch64-linux.vfkit",
-            target_arch: "aarch64-linux",
-        }
+    // The host->guest pairing shared with `doctor`'s macOS builder-prereq
+    // check and `flake_wrap`'s `--flake` auto-detection (#325) — the two
+    // previously disagreed (this hardcoded `aarch64-linux`; `doctor` used the
+    // host's actual arch), now one definition.
+    let host = crate::host_target::host_target();
+    let target = if host.hypervisor == "vfkit" {
+        vfkit_target(&host.guest_system)?
     } else {
         LiveTarget {
             hypervisor: "qemu-system-x86_64".to_string(),
@@ -57,6 +57,10 @@ pub fn require_live() -> anyhow::Result<LiveTarget> {
             target_arch: "x86_64-linux",
         }
     };
+    debug_assert_eq!(
+        target.target_arch, host.guest_system,
+        "live_target/host_target must agree"
+    );
     if !on_path(&target.hypervisor) {
         bail!(
             "refusing: `{}` is not on PATH — run under `nix shell nixpkgs#{}`",
@@ -69,6 +73,28 @@ pub fn require_live() -> anyhow::Result<LiveTarget> {
         );
     }
     Ok(target)
+}
+
+/// vfkit's live target for `guest_system` (derived from `host_target()`, not
+/// hardcoded — vfkit requires a matching host/guest arch, #325). Only
+/// `aarch64-linux` is wired into `nix/guest/flake.nix` today
+/// (`packages.aarch64-darwin.guest-runner-vfkit`, `topologies.aarch64-linux.vfkit`);
+/// an x86_64 Mac's `guest_system` is `x86_64-linux`, which has no built attrs
+/// to select, so it refuses with a named error instead of silently reusing
+/// the aarch64 ones (what the hardcoded version did before this fix).
+fn vfkit_target(guest_system: &str) -> anyhow::Result<LiveTarget> {
+    match guest_system {
+        "aarch64-linux" => Ok(LiveTarget {
+            hypervisor: std::env::var("SANDY_VFKIT_BIN").unwrap_or_else(|_| "vfkit".to_string()),
+            runner_attr: "packages.aarch64-darwin.guest-runner-vfkit",
+            topology_attr: "topologies.aarch64-linux.vfkit",
+            target_arch: "aarch64-linux",
+        }),
+        other => bail!(
+            "refusing: no vfkit live target for guest system `{other}` — only aarch64-linux (Apple Silicon) is wired \
+             into nix/guest/flake.nix today"
+        ),
+    }
 }
 
 /// Whether `program` resolves on `PATH`.
@@ -93,4 +119,35 @@ pub fn build_guest(target: &LiveTarget) -> anyhow::Result<()> {
         bail!("nix build of the guest runner failed");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Context;
+
+    use super::vfkit_target;
+
+    /// The only guest arch `nix/guest/flake.nix` actually builds for vfkit.
+    #[test]
+    fn vfkit_target_resolves_aarch64_linux() -> anyhow::Result<()> {
+        let target = vfkit_target("aarch64-linux").context("resolve the aarch64 vfkit target")?;
+        assert_eq!(target.runner_attr, "packages.aarch64-darwin.guest-runner-vfkit");
+        assert_eq!(target.topology_attr, "topologies.aarch64-linux.vfkit");
+        assert_eq!(target.target_arch, "aarch64-linux");
+        Ok(())
+    }
+
+    /// An Intel Mac's `guest_system` (`x86_64-linux`) has no vfkit attrs built
+    /// anywhere — this must refuse by name, not silently reuse the aarch64
+    /// ones or panic on a debug-only assertion.
+    #[test]
+    fn vfkit_target_refuses_an_unsupported_guest_system() {
+        // `LiveTarget` carries no `Debug` impl, so `unwrap_err()` isn't available;
+        // match instead.
+        let err = match vfkit_target("x86_64-linux") {
+            Err(err) => err,
+            Ok(_) => panic!("expected an unsupported-target error for x86_64-linux"),
+        };
+        assert!(err.to_string().contains("x86_64-linux"), "{err}");
+    }
 }
