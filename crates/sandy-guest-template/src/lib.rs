@@ -21,4 +21,6 @@ mod flake_wrap;
 pub mod host_target;
 pub mod manifest;
 
-pub use flake_wrap::{ResolvedTemplate, TemplateKind, guest_wrapper_present, parse_kind, resolve_flake_template};
+pub use flake_wrap::{
+    ResolvedTemplate, TemplateKind, guest_wrapper_present, nix_bin, parse_kind, resolve_flake_template,
+};

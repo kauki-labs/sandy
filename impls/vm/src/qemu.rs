@@ -193,13 +193,44 @@ pub fn qemu_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> Re
 }
 
 /// Derive the `qemu-system-<arch>` binary from the kernel store path, falling
-/// back to the host architecture.
+/// back to the host architecture — unless `SANDY_QEMU_BIN` names an absolute
+/// path to exec directly instead, which takes priority over arch derivation
+/// entirely.
 ///
 /// microvm.nix kernel paths carry the arch in the linux derivation name
 /// (`…-linux-6.6-aarch64/Image`); when none is present (the x86_64 kernel is just
 /// `…-linux-6.6/bzImage`), the host arch ([`std::env::consts::ARCH`]) is used,
 /// since a native qemu boot runs on the matching host.
+///
+/// `SANDY_QEMU_BIN` is the same escape hatch `SANDY_VIRTIOFSD_BIN` gives
+/// [`spawn_virtiofsd`](crate::share::spawn_virtiofsd): bypassing a bare-name
+/// `PATH` lookup entirely, needed on a host whose environment setup (PAM,
+/// systemd session handling, etc.) does not reliably carry the unit's own
+/// `Environment=PATH=` through to the spawned child — confirmed on ws01
+/// (#335 follow-up): the deployed unit's resolved PATH silently reverted to
+/// a stock per-user NixOS profile path with no qemu on it, despite the
+/// unit's own `path =` correctly listing it.
 fn qemu_system_binary(kernel: &Path) -> String {
+    qemu_system_binary_with_override(kernel, qemu_bin_override().as_deref())
+}
+
+/// `SANDY_QEMU_BIN`, read directly. Exported so `sandy-host-executor`'s
+/// capability probe checks the exact same override this backend's own spawn
+/// does — never a probe/boot-time definition drift.
+#[must_use]
+pub fn qemu_bin_override() -> Option<String> {
+    std::env::var("SANDY_QEMU_BIN").ok()
+}
+
+/// [`qemu_system_binary`]'s pure core, taking the override as a plain
+/// argument rather than reading the environment directly — this workspace
+/// forbids `unsafe_code`, so a test cannot call `std::env::set_var` (unsafe
+/// as of edition 2024) to exercise the override; this split keeps the logic
+/// unit-testable without it.
+fn qemu_system_binary_with_override(kernel: &Path, override_bin: Option<&str>) -> String {
+    if let Some(bin) = override_bin {
+        return bin.to_string();
+    }
     let path = kernel.to_string_lossy();
     let arch = if path.contains("aarch64") || path.contains("arm64") {
         "aarch64"
@@ -649,6 +680,25 @@ mod tests {
         agent: false,
         shares: false,
     };
+
+    /// An override takes priority over arch derivation entirely, whatever
+    /// the kernel path says.
+    #[test]
+    fn qemu_system_binary_override_wins_over_arch_derivation() {
+        assert_eq!(
+            qemu_system_binary_with_override(Path::new("/nix/store/x-linux-6.6-aarch64/Image"), Some("/abs/qemu")),
+            "/abs/qemu"
+        );
+    }
+
+    /// No override: falls back to the existing arch-derived bare name.
+    #[test]
+    fn qemu_system_binary_falls_back_to_arch_derivation_without_an_override() {
+        assert_eq!(
+            qemu_system_binary_with_override(Path::new("/nix/store/x-linux-6.6-x86_64/Image"), None),
+            "qemu-system-x86_64"
+        );
+    }
 
     /// Tier-1: `qemu_args` over the x86_64 fixture and a trivial spec emits the
     /// key boot flags (`-kernel`/`-initrd`/`-append`/`-nographic`/`-serial`/

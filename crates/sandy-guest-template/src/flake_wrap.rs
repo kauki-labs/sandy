@@ -424,9 +424,22 @@ fn summarize_nix_error(stderr: &str) -> String {
 /// `deadline` passes before it exits (the child, and its whole process
 /// group, are killed first).
 fn run_nix(args: &[&str], deadline: Option<std::time::Instant>) -> std::io::Result<Output> {
-    let mut command = Command::new("nix");
+    let mut command = Command::new(nix_bin());
     command.args(args);
     run_with_deadline(command, deadline)
+}
+
+/// `SANDY_NIX_BIN`, falling back to a bare `nix` (`PATH` lookup) — the same
+/// escape hatch `impls/vm`'s `SANDY_QEMU_BIN`/`SANDY_VIRTIOFSD_BIN` give
+/// their own subprocess spawns, needed on a host whose environment setup
+/// (PAM, systemd session handling, etc.) does not reliably carry the unit's
+/// own `Environment=PATH=` through to the spawned child — confirmed on ws01
+/// (#335 follow-up). Exported so `sandy-host-executor`'s capability probe
+/// checks the exact same override this call does, never a probe/dispatch-time
+/// definition drift.
+#[must_use]
+pub fn nix_bin() -> String {
+    std::env::var("SANDY_NIX_BIN").unwrap_or_else(|_| "nix".to_string())
 }
 
 /// Spawn `command` with piped stdout/stderr (drained on dedicated threads,

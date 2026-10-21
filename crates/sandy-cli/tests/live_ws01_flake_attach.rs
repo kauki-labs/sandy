@@ -144,10 +144,6 @@ fn spawn_orchestrator(
     Ok(orchestrator)
 }
 
-async fn wait_for_real_registration(timeout: Duration) {
-    tokio::time::sleep(timeout).await;
-}
-
 async fn submit_flake(
     conn: &mut tokio::net::UnixStream,
     request_id: u64,
@@ -174,13 +170,46 @@ async fn submit_flake(
     .context("Submit call")?;
     match response.result {
         Some(control_response::Result::Submit(r)) => Ok((r.job_id, r.attach_token)),
-        Some(control_response::Result::Error(e)) => anyhow::bail!(
-            "Submit was refused: {} — if this names SandboxKind::Vm, ws01's deployed sandy-host-executor has not been \
-             redeployed with #332's VM-capability detection yet (a known, documented blocking dependency, not a bug \
-             in this test)",
-            e.message
-        ),
+        // See `live_ws01_flake_dispatch.rs`'s identical arm for why the hint
+        // is conditional, not unconditional (CodeRabbit finding on #336: an
+        // unconditional suffix made every refusal look like "not yet
+        // registered" to the retry loop below, which string-matches on it).
+        Some(control_response::Result::Error(e)) => {
+            let hint = if e.message.contains("SandboxKind::Vm") {
+                " (ws01's deployed sandy-host-executor has not been redeployed with #332's VM-capability detection \
+                 yet, a known, documented blocking dependency, not a bug in this test — or it has registered but not \
+                 yet declared Vm)"
+            } else {
+                ""
+            };
+            anyhow::bail!("Submit was refused: {}{hint}", e.message)
+        }
         other => anyhow::bail!("expected a Submit response, got {other:?}"),
+    }
+}
+
+/// Retry Submit until ws01 has actually registered — see
+/// `live_ws01_flake_dispatch.rs`'s identical helper for the full rationale
+/// (a real host's `RestartSec=5s` redial loop does not align with any fixed
+/// wait; observed live, registration can land 10-15s after a connection
+/// drop, consistently past a flat 10s wait).
+async fn submit_flake_once_registered(
+    conn: &mut tokio::net::UnixStream,
+    request_id: &mut u64,
+    flake: &str,
+    command: &[String],
+    timeout: Duration,
+) -> anyhow::Result<(String, Vec<u8>)> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match submit_flake(conn, *request_id, flake, command.to_vec()).await {
+            Ok(result) => return Ok(result),
+            Err(err) if err.to_string().contains("SandboxKind::Vm") && Instant::now() < deadline => {
+                *request_id += 1;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(err) => return Err(err),
+        }
     }
 }
 
@@ -301,8 +330,6 @@ async fn a_separate_attach_process_drives_a_real_vm_booted_on_ws01() -> anyhow::
     let orchestrator = spawn_orchestrator(tmp.path(), host, remote_peer)?;
     let attach_sock = attach_socket_path(&orchestrator.sock);
 
-    wait_for_real_registration(Duration::from_secs(10)).await;
-
     let mut submitter_conn = tokio::net::UnixStream::connect(&orchestrator.sock)
         .await
         .context("connect the submitting control connection")?;
@@ -312,9 +339,17 @@ async fn a_separate_attach_process_drives_a_real_vm_booted_on_ws01() -> anyhow::
     // that reads commands interactively from its stdin — connected through
     // the agent channel, exactly the "boot runs an interactive shell"
     // fixture shape the acceptance bar asks for.
-    let (job_id, attach_token) = submit_flake(&mut submitter_conn, 1, &flake_ref(), vec!["sh".to_owned()])
-        .await
-        .context("submit a flake-templated VM job with an interactive shell command")?;
+    let mut submitter_request_id = 1;
+    let (job_id, attach_token) = submit_flake_once_registered(
+        &mut submitter_conn,
+        &mut submitter_request_id,
+        &flake_ref(),
+        &[String::from("sh")],
+        Duration::from_secs(60),
+    )
+    .await
+    .context("submit a flake-templated VM job with an interactive shell command")?;
+    submitter_request_id += 1;
 
     // A cold `nix build` + a real qemu boot is slow.
     tokio::time::sleep(Duration::from_secs(20)).await;
@@ -377,16 +412,15 @@ async fn a_separate_attach_process_drives_a_real_vm_booted_on_ws01() -> anyhow::
     post_input(&mut wr2, b"exit\n").await.context("exit the guest shell")?;
 
     let deadline = Instant::now() + Duration::from_secs(15);
-    let mut request_id = 2;
     loop {
         let status = call(
             &mut submitter_conn,
-            request_id,
+            submitter_request_id,
             control_request::Op::Status(StatusRequest { job_id: job_id.clone() }),
         )
         .await
         .context("Status after the round trip")?;
-        request_id += 1;
+        submitter_request_id += 1;
         match status.result {
             Some(control_response::Result::Status(s)) if s.status != sandy_control_proto::JobStatus::Running as i32 => {
                 assert_eq!(

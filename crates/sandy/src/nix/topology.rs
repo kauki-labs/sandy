@@ -142,7 +142,7 @@ pub fn topology(source: &str) -> Result<Topology, BackendError> {
     }
 
     tracing::debug!(source, "evaluating guest topology via `nix eval --json`");
-    let output = Command::new("nix")
+    let output = Command::new(nix_bin())
         .args(["eval", "--json", source])
         .output()
         .map_err(|e| BackendError::Transport(format!("failed to spawn `nix eval {source}`: {e}")))?;
@@ -157,6 +157,19 @@ pub fn topology(source: &str) -> Result<Topology, BackendError> {
     }
 
     parse_topology(&output.stdout)
+}
+
+/// `SANDY_NIX_BIN`, falling back to a bare `nix` (`PATH` lookup) — the same
+/// escape hatch `sandy-guest-template`'s own `nix_bin()` gives `run_nix`
+/// (duplicated here, not shared: `sandy-lib` deliberately does not depend on
+/// `sandy-guest-template`, a CLI/operator-shaped crate, see that crate's own
+/// doc comment). Needed on a host whose environment setup (PAM, systemd
+/// session handling, etc.) does not reliably carry a unit's own
+/// `Environment=PATH=` through to the spawned child — confirmed on ws01
+/// (#335/#336): `SANDY_NIX_BIN` alone did not help if THIS call site still
+/// did a bare `PATH` lookup (CodeRabbit finding on #336).
+fn nix_bin() -> String {
+    std::env::var("SANDY_NIX_BIN").unwrap_or_else(|_| "nix".to_string())
 }
 
 #[cfg(test)]
