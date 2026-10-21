@@ -226,6 +226,22 @@ in
         SANDY_HOST_EXECUTOR_ID = cfg.hostId;
         SANDY_AGENT_PATH = "${cfg.agentPackage}/bin/sandy-agent";
         SANDY_GUEST_WRAPPER = "${cfg.guestWrapperPackage}";
+      }
+      # Absolute-path overrides, bypassing a PATH lookup entirely (#335
+      # follow-up): confirmed live on ws01 that this unit's own `path =`
+      # correctly lists qemu/nix/virtiofsd/git, yet the ACTUAL resolved PATH
+      # the running process sees reverts to a stock per-user NixOS profile
+      # path with none of them — PAMName's session establishment appears to
+      # reset it (root cause not fully chased down; this sidesteps it rather
+      # than depends on understanding/fighting NixOS's PAM internals). Each
+      # of `capability.rs`'s probe and the real spawn (`impls/vm`'s
+      # `QemuBackend`/`VirtiofsdTransport`, `sandy-guest-template`'s
+      # `run_nix`) reads the exact same override, so they can never drift
+      # onto different binaries.
+      // lib.optionalAttrs cfg.vm.enable {
+        SANDY_QEMU_BIN = "${cfg.vm.qemuPackage}/bin/qemu-system-x86_64";
+        SANDY_NIX_BIN = "${cfg.vm.nixPackage}/bin/nix";
+        SANDY_VIRTIOFSD_BIN = "${cfg.vm.virtiofsdPackage}/bin/virtiofsd";
       };
 
       serviceConfig = {

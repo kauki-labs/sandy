@@ -150,15 +150,6 @@ fn spawn_orchestrator(
     Ok(orchestrator)
 }
 
-/// Give the REAL remote host-executor's own restart loop time to notice this
-/// orchestrator came up and register — see `live_ws01_attach.rs`'s identical
-/// helper for the full rationale (a bounded wait, not a check; the real
-/// proof is the Dispatch this test's own submit+status round trip depends
-/// on below).
-async fn wait_for_real_registration(timeout: Duration) {
-    tokio::time::sleep(timeout).await;
-}
-
 async fn submit_flake(
     conn: &mut tokio::net::UnixStream,
     request_id: u64,
@@ -195,6 +186,33 @@ async fn submit_flake(
     }
 }
 
+/// Retry Submit until ws01 has actually registered, instead of a single
+/// attempt after a fixed sleep: the real host's `RestartSec=5s` redial loop
+/// does not align with any fixed wait, and a too-short one is exactly the
+/// race this replaces (observed live: ws01 can take 10-15s to reconnect
+/// after its previous orchestrator connection drops, consistently past a
+/// flat 10s wait — a "SandboxKind::Vm" refusal right after a connection drop
+/// means "not yet registered", not "never will be").
+async fn submit_flake_once_registered(
+    conn: &mut tokio::net::UnixStream,
+    request_id: &mut u64,
+    flake: &str,
+    command: &[String],
+    timeout: Duration,
+) -> anyhow::Result<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match submit_flake(conn, *request_id, flake, command.to_vec()).await {
+            Ok(job_id) => return Ok(job_id),
+            Err(err) if err.to_string().contains("SandboxKind::Vm") && Instant::now() < deadline => {
+                *request_id += 1;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 /// The real-infra acceptance floor for #332 tier 1: a real `sandyd` bound to
 /// the actual mesh address, a REAL standing remote host-executor declaring
 /// `SandboxKind::Vm`, a `flake/v1` job dispatched, ws01 building and booting
@@ -211,7 +229,6 @@ async fn a_flake_templated_vm_job_dispatches_and_succeeds_on_ws01() -> anyhow::R
         .context("SANDY_M2_REMOTE_PEER is not a valid IP address")?;
 
     let orchestrator = spawn_orchestrator(tmp.path(), host, remote_peer)?;
-    wait_for_real_registration(Duration::from_secs(10)).await;
 
     let mut conn = tokio::net::UnixStream::connect(&orchestrator.sock)
         .await
@@ -220,14 +237,21 @@ async fn a_flake_templated_vm_job_dispatches_and_succeeds_on_ws01() -> anyhow::R
     // agent wraps it, see `impls/vm/src/agent.rs::agent_shell_command`) —
     // exit 0 regardless of which fixture flake this resolves, proving the
     // dispatch+boot+run path itself, not any particular guest content.
-    let job_id = submit_flake(&mut conn, 1, &flake_ref(), vec!["true".to_owned()])
-        .await
-        .context("submit the flake-templated VM job")?;
+    let mut request_id = 1;
+    let job_id = submit_flake_once_registered(
+        &mut conn,
+        &mut request_id,
+        &flake_ref(),
+        &[String::from("true")],
+        Duration::from_secs(60),
+    )
+    .await
+    .context("submit the flake-templated VM job")?;
+    request_id += 1;
 
     // A cold `nix build` + a real qemu boot is slow — generous, bounded
     // polling rather than a fixed sleep.
     let deadline = Instant::now() + Duration::from_secs(180);
-    let mut request_id = 2;
     let final_status = loop {
         let status = call(
             &mut conn,

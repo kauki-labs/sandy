@@ -239,8 +239,19 @@ fn device_openable(path: &str) -> bool {
 /// Probe this host's real VM-capability facts.
 fn probe_vm_facts() -> VmProbeFacts {
     VmProbeFacts {
-        qemu_runnable: runs_successfully("qemu-system-x86_64"),
-        nix_runnable: runs_successfully("nix"),
+        // `unwrap_or_else` to the bare name, not the override check alone:
+        // on a host with no override set, this still wants the normal PATH
+        // lookup `runs_successfully` does. The override and the fallback
+        // name are the exact same ones `impls_vm::QemuBackend`'s own spawn
+        // uses (`qemu_bin_override`), so the probe and the real boot can
+        // never drift onto different binaries (#335 follow-up: ws01's
+        // resolved PATH silently dropped qemu/virtiofsd/git despite the
+        // unit's own `path =` listing them — this and `nix_bin` below
+        // bypass that entirely rather than depend on PATH being trustworthy).
+        qemu_runnable: runs_successfully(
+            &sandy_impls_vm::qemu_bin_override().unwrap_or_else(|| "qemu-system-x86_64".to_string()),
+        ),
+        nix_runnable: runs_successfully(&sandy_guest_template::nix_bin()),
         kvm_usable: device_openable("/dev/kvm"),
         vhost_vsock_usable: device_openable("/dev/vhost-vsock"),
         guest_wrapper_present: sandy_guest_template::guest_wrapper_present(),

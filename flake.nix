@@ -453,11 +453,17 @@
                     offSuppGroups = builtins.toJSON vmOff.serviceConfig.SupplementaryGroups;
                     offDeviceAllow = builtins.toJSON (vmOff.serviceConfig.DeviceAllow or [ ]);
                     offPath = builtins.toJSON (pathNames vmOff);
+                    offQemuBin = vmOff.environment.SANDY_QEMU_BIN or "";
+                    offNixBin = vmOff.environment.SANDY_NIX_BIN or "";
+                    offVirtiofsdBin = vmOff.environment.SANDY_VIRTIOFSD_BIN or "";
                     onBindPaths = builtins.toJSON vmOn.serviceConfig.BindPaths;
                     onRestrictAF = builtins.toJSON vmOn.serviceConfig.RestrictAddressFamilies;
                     onSuppGroups = builtins.toJSON vmOn.serviceConfig.SupplementaryGroups;
                     onDeviceAllow = builtins.toJSON vmOn.serviceConfig.DeviceAllow;
                     onPath = builtins.toJSON (pathNames vmOn);
+                    onQemuBin = vmOn.environment.SANDY_QEMU_BIN or "";
+                    onNixBin = vmOn.environment.SANDY_NIX_BIN or "";
+                    onVirtiofsdBin = vmOn.environment.SANDY_VIRTIOFSD_BIN or "";
                   }
                   ''
                     [ "$offBindPaths" = "[]" ] || { echo "vm.enable=false must leave BindPaths empty, got: $offBindPaths" >&2; exit 1; }
@@ -471,6 +477,9 @@
                         *"\"$pkg\""*) echo "vm.enable=false must not put $pkg on PATH, got: $offPath" >&2; exit 1 ;;
                       esac
                     done
+                    [ -z "$offQemuBin" ] || { echo "vm.enable=false must not set SANDY_QEMU_BIN, got: $offQemuBin" >&2; exit 1; }
+                    [ -z "$offNixBin" ] || { echo "vm.enable=false must not set SANDY_NIX_BIN, got: $offNixBin" >&2; exit 1; }
+                    [ -z "$offVirtiofsdBin" ] || { echo "vm.enable=false must not set SANDY_VIRTIOFSD_BIN, got: $offVirtiofsdBin" >&2; exit 1; }
                     case "$onBindPaths" in
                       *"/dev/kvm"*"-/dev/vhost-vsock"*) ;;
                       *) echo "vm.enable=true must bind /dev/kvm and -/dev/vhost-vsock, got: $onBindPaths" >&2; exit 1 ;;
@@ -490,6 +499,18 @@
                         *) echo "vm.enable=true must put $pkg on PATH, got: $onPath" >&2; exit 1 ;;
                       esac
                     done
+                    case "$onQemuBin" in
+                      */bin/qemu-system-x86_64) ;;
+                      *) echo "vm.enable=true must set SANDY_QEMU_BIN to an absolute qemu-system-x86_64 path (PATH alone is not trustworthy on ws01, #335 follow-up), got: $onQemuBin" >&2; exit 1 ;;
+                    esac
+                    case "$onNixBin" in
+                      */bin/nix) ;;
+                      *) echo "vm.enable=true must set SANDY_NIX_BIN to an absolute nix path, got: $onNixBin" >&2; exit 1 ;;
+                    esac
+                    case "$onVirtiofsdBin" in
+                      */bin/virtiofsd) ;;
+                      *) echo "vm.enable=true must set SANDY_VIRTIOFSD_BIN to an absolute virtiofsd path, got: $onVirtiofsdBin" >&2; exit 1 ;;
+                    esac
                     mkdir -p "$out"
                     echo ok > "$out/result"
                   '';
