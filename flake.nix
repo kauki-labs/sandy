@@ -12,6 +12,10 @@
     # The guest-composition module (#324, `lib.mkGuest`/`lib.mkTopology`) needs
     # this to build the microVM; `nix/guest/flake.nix` pins its own copy
     # independently, so the two lockfiles can drift without either breaking.
+    # `nix/lib/guest.nix` itself must stay compatible with whichever of the
+    # two pins calls it — the `lib-guest-eval` check below evaluates it
+    # against THIS flake's pin, and `nix/guest/flake.nix`'s own checks
+    # exercise it against that nested flake's pin.
     microvm.url = "github:microvm-nix/microvm.nix";
     # Pinned for the `audit` check (CF-L-2): `cargo audit -d <path>` reads the
     # advisory TOML files directly, no git metadata needed, so the plain
@@ -252,6 +256,48 @@
           # set rather than fail evaluation there.
           // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
             sandy-executor-vm = import ./nix/tests/sandy-executor-vm.nix { inherit pkgs; };
+          }
+          # Eval-only proof that the exported `lib.mkGuest`/`lib.mkTopology`
+          # (#324) actually produce a complete `Topology` for BOTH hypervisor
+          # legs, with no `extraModules` beyond what the module itself
+          # carries — the same shape nix/guest/flake.nix's own qemuGuest/
+          # vfkitGuest build on, proving the standalone export didn't drop
+          # anything they silently relied on. `builtins.toJSON` only forces
+          # the attrset's string interpolations (derivation output paths),
+          # never a real build — no guest artifact compiles, no hypervisor
+          # runs, so this is cheap enough for every CI run, not just the
+          # live acceptance suite. Gated to one system (x86_64-linux): the
+          # result doesn't depend on which system evaluates it, so running
+          # it once is enough; `inputs.nixpkgs.legacyPackages.aarch64-darwin`
+          # is itself an eval, not a build, so pulling it in from a Linux
+          # runner for vfkit's `vmHostPackages` is fine here.
+          // lib.optionalAttrs (system == "x86_64-linux") {
+            lib-guest-eval =
+              pkgs.runCommand "lib-guest-eval"
+                {
+                  qemuTopology = builtins.toJSON (
+                    inputs.self.lib.mkTopology (
+                      inputs.self.lib.mkGuest {
+                        system = "x86_64-linux";
+                        hypervisor = "qemu";
+                      }
+                    )
+                  );
+                  vfkitTopology = builtins.toJSON (
+                    inputs.self.lib.mkTopology (
+                      inputs.self.lib.mkGuest {
+                        system = "aarch64-linux";
+                        hypervisor = "vfkit";
+                        vmHostPackages = inputs.nixpkgs.legacyPackages.aarch64-darwin;
+                      }
+                    )
+                  );
+                }
+                ''
+                  mkdir -p "$out"
+                  printf '%s' "$qemuTopology" > "$out/qemu-topology.json"
+                  printf '%s' "$vfkitTopology" > "$out/vfkit-topology.json"
+                '';
           };
 
           # Built with covCraneLib so the toolchain on PATH carries
