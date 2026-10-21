@@ -127,11 +127,12 @@ mod tests {
 
     /// The only guest arch `nix/guest/flake.nix` actually builds for vfkit.
     #[test]
-    fn vfkit_target_resolves_aarch64_linux() {
-        let target = vfkit_target("aarch64-linux").unwrap();
+    fn vfkit_target_resolves_aarch64_linux() -> anyhow::Result<()> {
+        let target = vfkit_target("aarch64-linux").context("resolve the aarch64 vfkit target")?;
         assert_eq!(target.runner_attr, "packages.aarch64-darwin.guest-runner-vfkit");
         assert_eq!(target.topology_attr, "topologies.aarch64-linux.vfkit");
         assert_eq!(target.target_arch, "aarch64-linux");
+        Ok(())
     }
 
     /// An Intel Mac's `guest_system` (`x86_64-linux`) has no vfkit attrs built
