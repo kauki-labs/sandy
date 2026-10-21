@@ -81,6 +81,16 @@ message SubmitRequest {
 
 message SubmitResponse {
   string job_id = 1;
+  // A durable bearer credential (#327), independent of this connection's
+  // CF-H-1 session: presented back on a LATER `AttachRequest` to prove "I'm
+  // the one who submitted this job" even from a fresh connection (the
+  // realistic case — `daemon submit` now, `daemon attach` later from a new
+  // terminal). The daemon persists the matching value in the job's own
+  // durable store row, not in process-local `JobRegistry` state, so it
+  // survives the submitting connection closing. A bearer credential like
+  // every other cap-shaped value here: never logged, travels only this one
+  // field and the matching `AttachRequest.attach_token`.
+  bytes attach_token = 2;
 }
 
 message CancelRequest {
@@ -95,6 +105,13 @@ message CancelResponse {}
 // for the client to `join`/`subscribe` on the data plane directly.
 message AttachRequest {
   string job_id = 1;
+  // The durable bearer credential `SubmitResponse.attach_token` handed back
+  // at submit time (#327), presented to prove the attacher is the original
+  // submitter even from a fresh connection/session. Absent (or not
+  // matching) falls back to the existing per-connection `session_matches`
+  // check — this is additive, not a replacement: a submit-then-immediately-
+  // attach on the SAME connection still works with no token at all.
+  optional bytes attach_token = 2;
 }
 
 message AttachResponse {

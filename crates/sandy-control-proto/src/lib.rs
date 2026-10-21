@@ -50,6 +50,40 @@ impl std::fmt::Debug for AttachResponse {
     }
 }
 
+/// `SubmitResponse.attach_token` is a durable bearer credential (#327): a
+/// holder can present it on a later `Attach` as the submitter. Same
+/// redaction discipline as `AttachResponse.cap`.
+impl std::fmt::Debug for SubmitResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubmitResponse")
+            .field("job_id", &self.job_id)
+            .field(
+                "attach_token",
+                &format_args!("<redacted {} bytes>", self.attach_token.len()),
+            )
+            .finish()
+    }
+}
+
+/// `AttachRequest.attach_token`, when present, is the same bearer credential
+/// presented back. Redacted for the same reason.
+impl std::fmt::Debug for AttachRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttachRequest")
+            .field("job_id", &self.job_id)
+            .field(
+                "attach_token",
+                &format_args!(
+                    "<{}>",
+                    self.attach_token
+                        .as_ref()
+                        .map_or_else(|| "absent".to_string(), |t| format!("redacted {} bytes", t.len()))
+                ),
+            )
+            .finish()
+    }
+}
+
 /// The largest frame this codec accepts, guarding against a hostile or broken
 /// peer claiming an unbounded length prefix. Generous for a control message
 /// (job manifests are small compared to job output, which never rides this
@@ -147,6 +181,21 @@ pub async fn read_frame<M: prost::Message + Default>(
     Ok(Some(M::decode(buf.as_slice())?))
 }
 
+/// `sandyd`'s attach data-plane listener (#327) binds a UDS socket next to
+/// the control socket at this fixed name, so both the daemon and its CLI
+/// client derive the same path from whatever control-socket path is in
+/// effect (`$SANDY_SOCK`, or the default runtime dir) without a second env
+/// var. Kept here, not duplicated, since both sides already depend on this
+/// crate for the control-socket conventions.
+pub const ATTACH_SOCKET_NAME: &str = "sandyd-attach.sock";
+
+/// The attach data-plane socket path alongside `control_socket` (#327): same
+/// directory, fixed sibling name ([`ATTACH_SOCKET_NAME`]).
+#[must_use]
+pub fn attach_socket_path(control_socket: &std::path::Path) -> std::path::PathBuf {
+    control_socket.with_file_name(ATTACH_SOCKET_NAME)
+}
+
 #[cfg(test)]
 mod tests {
     use anyhow::Context;
@@ -194,6 +243,60 @@ mod tests {
         assert!(
             rendered.contains("redacted"),
             "expected an explicit redaction marker, got: {rendered}"
+        );
+    }
+
+    /// Adversarial (#327): `SubmitResponse`'s new durable `attach_token` must
+    /// never print in the clear either — the same bearer-credential leak
+    /// `attach_response_debug_redacts_the_cap` guards against.
+    #[test]
+    fn submit_response_debug_redacts_the_attach_token() {
+        let marker = "sandy-attach-token-leak-marker-7c21";
+        let token = marker.as_bytes().to_vec();
+        let response = SubmitResponse {
+            job_id: "job-a".to_owned(),
+            attach_token: token.clone(),
+        };
+        let rendered = format!("{response:?}");
+
+        assert!(
+            !rendered.contains(marker),
+            "the token's text leaked into Debug output: {rendered}"
+        );
+        let numeric_repr = format!("{token:?}");
+        assert!(
+            !rendered.contains(&numeric_repr),
+            "the token's raw bytes leaked into Debug output: {rendered}"
+        );
+        assert!(rendered.contains("redacted"), "got: {rendered}");
+        assert!(rendered.contains("job-a"), "job_id must still be visible: {rendered}");
+    }
+
+    /// Adversarial (#327): `AttachRequest`'s presented `attach_token`, when
+    /// present, must never print in the clear; when absent, Debug must say
+    /// so plainly rather than rendering an empty byte dump.
+    #[test]
+    fn attach_request_debug_redacts_a_presented_token_and_names_an_absent_one() {
+        let marker = "sandy-attach-token-leak-marker-91af";
+        let with_token = AttachRequest {
+            job_id: "job-a".to_owned(),
+            attach_token: Some(marker.as_bytes().to_vec()),
+        };
+        let rendered = format!("{with_token:?}");
+        assert!(
+            !rendered.contains(marker),
+            "the token leaked into Debug output: {rendered}"
+        );
+        assert!(rendered.contains("redacted"), "got: {rendered}");
+
+        let without_token = AttachRequest {
+            job_id: "job-a".to_owned(),
+            attach_token: None,
+        };
+        let rendered = format!("{without_token:?}");
+        assert!(
+            rendered.contains("absent"),
+            "an absent token must render plainly, not as an empty redacted dump: {rendered}"
         );
     }
 
@@ -296,6 +399,7 @@ mod tests {
             &mut write_side,
             &SubmitResponse {
                 job_id: "not-a-control-request".to_owned(),
+                attach_token: Vec::new(),
             },
         )
         .await?;
@@ -303,5 +407,17 @@ mod tests {
         let result = read_frame::<ControlRequest>(&mut read_side).await;
         assert!(matches!(result, Err(FrameError::Decode(_))), "got {result:?}");
         Ok(())
+    }
+
+    /// The attach data-plane socket (#327) sits next to the control socket,
+    /// same directory, fixed sibling name — both daemon and CLI derive it
+    /// the same way from whatever control-socket path is in effect.
+    #[test]
+    fn attach_socket_path_is_a_sibling_of_the_control_socket() {
+        let control = std::path::Path::new("/run/sandy/sandyd.sock");
+        assert_eq!(
+            attach_socket_path(control),
+            std::path::Path::new("/run/sandy/sandyd-attach.sock")
+        );
     }
 }

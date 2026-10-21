@@ -458,6 +458,12 @@ fn daemon_socket_path() -> std::io::Result<std::path::PathBuf> {
 /// fits once wrapped.
 const MAX_MANIFEST_LEN: u64 = sandy_control_proto::MAX_FRAME_LEN as u64 - 4096;
 
+/// How often an interactive `sandy daemon attach` polls the job's status on
+/// its own side connection (#327), to detect the job reaching a terminal
+/// state and end the bridge. Frequent enough to feel immediate to an
+/// attached operator, far below the cost of a real job run.
+const ATTACH_STATUS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Read a job manifest from `path`, or from stdin when `path` is `-`, refusing
 /// one that exceeds [`MAX_MANIFEST_LEN`] without loading it fully first: an
 /// unbounded read of an oversized file or stdin stream would exhaust the
@@ -521,6 +527,14 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
     } else {
         None
     };
+    // Attach's job id, kept alongside the request for the same reason: once
+    // `op` moves into `request_op` below, this is the only copy left to name
+    // the interactive bridge's status-watch job and diagnostics with.
+    let attach_job_id = if let DaemonOp::Attach { job_id } = &op {
+        Some(job_id.clone())
+    } else {
+        None
+    };
 
     let request_op = match op {
         DaemonOp::Submit {
@@ -544,7 +558,16 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
             })
         }
         DaemonOp::Cancel { job_id } => control_request::Op::Cancel(CancelRequest { job_id }),
-        DaemonOp::Attach { job_id } => control_request::Op::Attach(AttachRequest { job_id }),
+        DaemonOp::Attach { job_id } => {
+            // #327: present the durable token `daemon submit` persisted for
+            // this job, if any — proves "I'm the submitter" even though this
+            // is necessarily a fresh connection/session (a separate CLI
+            // invocation). `None` (no file, or any read failure) just falls
+            // back to `session_matches` server-side, same as before this
+            // existed.
+            let attach_token = sandy_cli::attach::read_attach_token(&job_id);
+            control_request::Op::Attach(AttachRequest { job_id, attach_token })
+        }
         DaemonOp::Status { job_id } => control_request::Op::Status(StatusRequest { job_id }),
         DaemonOp::List => control_request::Op::List(ListRequest {}),
     };
@@ -558,11 +581,75 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
     };
 
     match response.result {
-        Some(control_response::Result::Submit(r)) => succeed_or(emit(format_submit(&r, output))),
+        Some(control_response::Result::Submit(r)) => {
+            // #327: persisted so a LATER, separate `daemon attach`
+            // invocation can present it and still get post rights — see
+            // `attach::persist_attach_token`'s own doc for the fallback
+            // behavior on any failure here.
+            sandy_cli::attach::persist_attach_token(&r.job_id, &r.attach_token);
+            succeed_or(emit(format_submit(&r, output)))
+        }
         Some(control_response::Result::Cancel(_)) => {
             succeed_or(emit(format_cancel(cancel_echo.as_deref().unwrap_or("?"), output)))
         }
-        Some(control_response::Result::Attach(r)) => succeed_or(emit(format_attach(&r, output))),
+        // `-o json` keeps today's one-shot machine path (print the channel id
+        // + cap, exit) — an automation caller wants the cap's bytes, not a
+        // terminal bridge. Plain (the default, every sandbox attachable, no
+        // flag) redeems the cap on `sandyd`'s separate attach data-plane
+        // socket instead (#327) and goes interactive.
+        Some(control_response::Result::Attach(r)) if output == OutputFormat::Json => {
+            succeed_or(emit(format_attach(&r, output)))
+        }
+        Some(control_response::Result::Attach(r)) => {
+            let job_id = attach_job_id.unwrap_or_default();
+            let attach_sock = sandy_control_proto::attach_socket_path(&socket);
+            let data_stream = match tokio::net::UnixStream::connect(&attach_sock).await {
+                Ok(data_stream) => data_stream,
+                Err(e) => {
+                    eprintln!(
+                        "sandy: could not connect to the attach data plane at {}: {e}",
+                        attach_sock.display()
+                    );
+                    return ProcessExit::InfraFault.code();
+                }
+            };
+            let (mut data_rd, mut data_wr) = tokio::io::split(data_stream);
+            let join = sandy_fabric_local::link::LinkFrame::Join {
+                cap: hex::encode(&r.cap),
+                channel: None,
+            };
+            if let Err(e) = sandy_fabric_local::link::write_frame(&mut data_wr, &join).await {
+                eprintln!("sandy: could not present the attach cap: {e}");
+                return ProcessExit::InfraFault.code();
+            }
+            match sandy_fabric_local::link::read_frame(&mut data_rd).await {
+                Ok(Some(sandy_fabric_local::link::LinkFrame::Joined { .. })) => {}
+                Ok(Some(sandy_fabric_local::link::LinkFrame::Refused { reason })) => {
+                    eprintln!("sandy: attach refused: {reason}");
+                    return ProcessExit::InvalidPlan.code();
+                }
+                Ok(other) => {
+                    eprintln!("sandy: attach: unexpected handshake response: {other:?}");
+                    return ProcessExit::InfraFault.code();
+                }
+                Err(e) => {
+                    eprintln!("sandy: attach: handshake failed: {e}");
+                    return ProcessExit::InfraFault.code();
+                }
+            }
+
+            // The control connection already answered Attach; it stays open,
+            // otherwise idle, just to poll Status in the same session while
+            // the data plane (above) carries the bridge.
+            let status_watch = sandy_cli::attach::spawn_status_watch(stream, job_id, ATTACH_STATUS_POLL_INTERVAL);
+            match sandy_cli::attach::run_interactive(data_rd, data_wr, Some(status_watch)).await {
+                Ok(()) => ProcessExit::Succeeded.code(),
+                Err(e) => {
+                    eprintln!("sandy: attach bridge faulted: {e}");
+                    ProcessExit::InfraFault.code()
+                }
+            }
+        }
         Some(control_response::Result::Status(r)) => succeed_or(emit(format_status(&r, output))),
         Some(control_response::Result::List(r)) => succeed_or(emit(format_list(&r, output))),
         // The daemon understood the request but could not honour it (unknown

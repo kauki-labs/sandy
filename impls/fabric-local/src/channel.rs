@@ -279,7 +279,11 @@ impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
     /// Post `payload` as `membership`, which must hold `post` rights. Returns the
     /// envelope's content id. A re-post of identical content (`payload` +
     /// `content_type` + `message_type`, never `sequence`) is deduplicated by the
-    /// backend to the same id.
+    /// backend to the same id — except for `MessageType::Tty`: a live TTY byte
+    /// stream legitimately repeats identical chunks (the same keystroke, the
+    /// same echoed line), and deduplicating those would silently drop the
+    /// second one (#327). Its content id folds in `sequence` instead, so no two
+    /// TTY posts ever collide.
     pub async fn post(
         &self,
         membership: &MembershipId,
@@ -292,11 +296,13 @@ impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
             return Err(ChannelError::InsufficientRights("post"));
         }
         let content_type = content_type.into();
-        let id = content_id(&message_type, &content_type, &payload);
         // Held across the append: see the field comment on `next_seq` for why
         // assign-then-append must be one atomic unit, not two separate steps.
+        // The content id is computed in here too (not before the lock), since a
+        // TTY post's id now depends on `sequence`.
         let mut next_seq = self.next_seq.lock().await;
         let sequence = *next_seq;
+        let id = content_id(&message_type, &content_type, &payload, sequence);
         let env = Envelope {
             sequence,
             message_type,
@@ -497,12 +503,18 @@ impl Stream for CursorStream {
 }
 
 /// The content id: a hash of `payload` + `content_type` + `message_type`'s variant
-/// — never `sequence` or `metadata` — so a re-post under a new sequence still
-/// dedups to the same id. Step-1 `message_type` variants carry no fields, so the
-/// variant tag is their whole identity; this match being exhaustive means adding a
-/// field to a variant later forces a compile-time update here rather than a silent
-/// hash that ignores the new content.
-fn content_id(message_type: &Option<MessageType>, content_type: &str, payload: &[u8]) -> String {
+/// — never `metadata` — so a re-post under a new sequence still dedups to the
+/// same id. Step-1 `message_type` variants carry no fields, so the variant tag
+/// is their whole identity; this match being exhaustive means adding a field to
+/// a variant later forces a compile-time update here rather than a silent hash
+/// that ignores the new content.
+///
+/// `MessageType::Tty` is the one exception: `sequence` folds into its hash, so
+/// it never dedups at all (#327). A TTY post is one chunk of a live byte
+/// stream, not an idempotent message — two identical chunks (a repeated
+/// keystroke, an echoed line) are two distinct, both-real events, and treating
+/// the second as "the same id, already stored" would silently drop it.
+fn content_id(message_type: &Option<MessageType>, content_type: &str, payload: &[u8], sequence: u64) -> String {
     let tag: u8 = match message_type {
         None => 0,
         Some(MessageType::Control(_)) => 1,
@@ -516,9 +528,16 @@ fn content_id(message_type: &Option<MessageType>, content_type: &str, payload: &
     // identically, so a genuinely different message would silently dedup away
     // as a "duplicate" of an unrelated one. The length makes the boundary
     // between content_type and payload unambiguous; nothing after payload
-    // needs its own prefix since it's always the last field.
+    // needs its own prefix since it's always the last field (except the TTY
+    // sequence suffix below, which is fixed-width and so needs no length
+    // prefix of its own).
     let len_prefix = (content_type.len() as u64).to_be_bytes();
-    hash_hex(&[&[tag], &len_prefix, content_type.as_bytes(), payload])
+    if matches!(message_type, Some(MessageType::Tty(_))) {
+        let seq_bytes = sequence.to_be_bytes();
+        hash_hex(&[&[tag], &len_prefix, content_type.as_bytes(), payload, &seq_bytes])
+    } else {
+        hash_hex(&[&[tag], &len_prefix, content_type.as_bytes(), payload])
+    }
 }
 
 #[cfg(test)]
@@ -535,7 +554,7 @@ mod tests {
     use sandy_fabric::{capauth::CapScope, types::PeerId};
 
     use super::*;
-    use crate::inmem::InMem;
+    use crate::{agent::TTY_STDOUT, inmem::InMem};
 
     /// A minimal [`CapAuthority`] test double: proof = a keyed hash of the scope,
     /// enough to catch tampering, not real cryptography. sandy-fabric's own
@@ -1395,20 +1414,25 @@ mod tests {
 
     #[test]
     fn content_id_is_stable_for_identical_content_and_differs_otherwise() {
-        let a = content_id(&None, "text/plain", b"hello");
-        let b = content_id(&None, "text/plain", b"hello");
-        let different_payload = content_id(&None, "text/plain", b"goodbye");
-        let different_content_type = content_id(&None, "application/json", b"hello");
+        let a = content_id(&None, "text/plain", b"hello", 0);
+        let b = content_id(&None, "text/plain", b"hello", 0);
+        let different_payload = content_id(&None, "text/plain", b"goodbye", 0);
+        let different_content_type = content_id(&None, "application/json", b"hello", 0);
         let different_message_type = content_id(
             &Some(MessageType::Control(sandy_proto::Control {})),
             "text/plain",
             b"hello",
+            0,
         );
+        // A non-Tty id must not depend on `sequence` — it's still the same
+        // idempotent-message dedup contract this test's own name promises.
+        let different_sequence = content_id(&None, "text/plain", b"hello", 1);
 
         assert_eq!(a, b, "identical content hashes identically");
         assert_ne!(a, different_payload);
         assert_ne!(a, different_content_type);
         assert_ne!(a, different_message_type);
+        assert_eq!(a, different_sequence, "a non-Tty id ignores sequence, same as before");
     }
 
     /// Regression for a real collision: before length-prefixing content_type,
@@ -1416,8 +1440,46 @@ mod tests {
     /// would have silently deduped away as a "duplicate" of the first.
     #[test]
     fn content_id_does_not_collide_across_the_content_type_payload_boundary() {
-        let a = content_id(&None, "ab", b"c");
-        let b = content_id(&None, "a", b"bc");
+        let a = content_id(&None, "ab", b"c", 0);
+        let b = content_id(&None, "a", b"bc", 0);
         assert_ne!(a, b, "distinct (content_type, payload) splits must not collide");
+    }
+
+    /// Regression (#327): a Tty id DOES depend on `sequence` — the whole point
+    /// is that identical TTY chunks never dedup.
+    #[test]
+    fn tty_content_id_differs_by_sequence_even_for_identical_bytes() {
+        let tty = Some(MessageType::Tty(sandy_proto::Tty {}));
+        let first = content_id(&tty, TTY_STDOUT, b"same bytes", 0);
+        let second = content_id(&tty, TTY_STDOUT, b"same bytes", 1);
+        assert_ne!(first, second, "two TTY posts of identical bytes must get distinct ids");
+    }
+
+    /// Regression (#327): two identical TTY posts on a real channel are BOTH
+    /// delivered, not silently deduplicated to one stored entry — the exact
+    /// shape `a_duplicate_post_is_deduplicated_to_one_stored_entry` proves for
+    /// an ordinary (non-Tty) post, with the opposite expectation.
+    #[tokio::test]
+    async fn identical_tty_posts_are_both_delivered_not_deduplicated() -> anyhow::Result<()> {
+        let (channel, backend, id, authority) = new_channel().await?;
+        let member = channel.join(&mint(&authority, "p1", &id, full(), Some(later())))?;
+        let tty = Some(MessageType::Tty(sandy_proto::Tty {}));
+
+        channel
+            .post(&member, tty, TTY_STDOUT, b"\n".to_vec())
+            .await
+            .context("post first newline")?;
+        channel
+            .post(&member, tty, TTY_STDOUT, b"\n".to_vec())
+            .await
+            .context("post second, identical newline")?;
+
+        let stored = backend.fetch(0).await.context("fetch")?;
+        assert_eq!(
+            stored.len(),
+            2,
+            "both identical TTY posts must be stored, not deduplicated to one"
+        );
+        Ok(())
     }
 }

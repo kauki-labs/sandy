@@ -6,6 +6,7 @@
 //! and a real [`sandy::Journal`], without booting a hypervisor.
 
 pub mod app_register;
+pub mod attach;
 pub mod doctor;
 #[cfg(feature = "live")]
 pub mod live_target;

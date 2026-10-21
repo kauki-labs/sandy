@@ -1,10 +1,13 @@
 //! Dispatch one [`ControlRequest`] to a [`ControlResponse`] against the
 //! [`JobStore`] and the [`JobRegistry`] (#212, B1 + B2's dispatch slice).
 //! `Submit` persists the job AND mints its dedicated channel + caps (see
-//! [`crate::dispatch`]); `Attach` returns that real channel id + an observer
-//! cap once minted. No agent or executor wiring yet: a submitted job stays
-//! `Pending` forever, since nothing joins its channel or runs it — see
-//! `dispatch`'s module doc for why that's an honest gap, not a fake.
+//! [`crate::dispatch`]); `Attach` returns that real channel id + a cap once
+//! minted — a post-capable one when the requesting session is the one that
+//! submitted the job (#327, "my own job I can log into"), the existing
+//! observer-only `job.observer_cap` otherwise ("someone else's, I can only
+//! watch"). No agent or executor wiring yet: a submitted job stays `Pending`
+//! forever, since nothing joins its channel or runs it — see `dispatch`'s
+//! module doc for why that's an honest gap, not a fake.
 
 use std::{net::SocketAddr, sync::Arc};
 
@@ -13,7 +16,10 @@ use sandy_control_proto::{
     ListResponse, StatusResponse, SubmitResponse, control_request, control_response,
 };
 use sandy_executor_proto::{Dispatch, IsolationClass};
-use sandy_fabric::capauth::{Cap, CapCodecError, decode_cap, encode_cap};
+use sandy_fabric::{
+    capauth::{Cap, CapAuthority, CapCodecError, CapRights, CapScope, decode_cap, encode_cap},
+    types::{ChannelId, PeerId},
+};
 use sandy_orchestrator::{JobManifest, MANIFEST_ENCODING_JSON, derive_job_caps};
 use uuid::Uuid;
 
@@ -32,6 +38,12 @@ use crate::{
 /// would silently default to `Trusted` and breach isolation. See #298, #269,
 /// #150.
 const STAGE1_REQUIRED_ISOLATION_CLASS: IsolationClass = IsolationClass::Trusted;
+
+/// The length, in bytes, of a job's durable attach token (#327) —
+/// `SubmitResponse.attach_token`/`AttachRequest.attach_token`. Same length as
+/// `link_auth::LINK_TOKEN_LEN`, a distinct value (a different bearer
+/// credential, minted independently): not shared with or derived from it.
+const ATTACH_TOKEN_LEN: usize = 32;
 
 /// A failure handling a [`ControlRequest`]: the job store or the dispatch
 /// layer faulted, or the `spawn_blocking` task running a store call panicked
@@ -177,7 +189,33 @@ pub async fn handle(
             let manifest = submit.manifest;
             let encoding = submit.manifest_encoding;
             let inserted_id = job_id.clone();
+            let store_for_token = Arc::clone(store);
             let store = Arc::clone(store);
+
+            // #327: a durable, re-presentable credential — independent of
+            // CF-H-1's per-connection `session` below — so a LATER `sandy
+            // daemon attach` invocation (a fresh connection, the realistic
+            // "log back into my own job" case) can still prove it's the
+            // submitter; `session_matches` alone never recognizes that case,
+            // since a fresh connection always mints a fresh session. Minted
+            // best-effort, same shape as `RemoteLink::new`'s own RNG-failure
+            // handling just below: a vanishingly rare RNG failure degrades
+            // this one job to session-only gating rather than failing the
+            // whole Submit.
+            let attach_token = {
+                let mut bytes = [0u8; ATTACH_TOKEN_LEN];
+                match getrandom::fill(&mut bytes) {
+                    Ok(()) => bytes.to_vec(),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            job_id,
+                            "could not mint a durable attach token; this job falls back to session-only attach gating"
+                        );
+                        Vec::new()
+                    }
+                }
+            };
 
             // Mint the job's dedicated channel + caps BEFORE the row is
             // persisted (#212 B2, adversarial): if minting faulted after the
@@ -248,6 +286,26 @@ pub async fn handle(
                     })),
                 });
             }
+
+            // Best-effort, same reasoning as the mint step above: a faulted
+            // write here leaves this one job without a durable attach
+            // token (degrading to session-only gating for it), never a
+            // reason to fail an otherwise-successful Submit.
+            if !attach_token.is_empty() {
+                let token_job_id = job_id.clone();
+                let token = attach_token.clone();
+                match tokio::task::spawn_blocking(move || store_for_token.set_attach_token(&token_job_id, &token)).await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %e, job_id, "could not persist the durable attach token for this job");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, job_id, "the attach-token persistence task panicked");
+                    }
+                }
+            }
+
             registry.insert(job_id.clone(), job_channel);
 
             if let Some((host_id, registration, dispatch)) = dispatch_plan {
@@ -290,7 +348,7 @@ pub async fn handle(
                 }
             }
 
-            control_response::Result::Submit(SubmitResponse { job_id })
+            control_response::Result::Submit(SubmitResponse { job_id, attach_token })
         }
         Some(control_request::Op::Cancel(cancel)) => {
             // CF-H-1: an audit trail, not a gate — a mismatch is logged, never
@@ -347,27 +405,79 @@ pub async fn handle(
             }
         }
         Some(control_request::Op::Attach(attach)) => match registry.get(&attach.job_id) {
-            Some(job) if cap_has_expired(&job.observer_cap) => control_response::Result::Error(ControlError {
-                message: format!(
-                    "job {}'s attach cap has expired; re-submit to get a new one",
-                    attach.job_id
-                ),
-            }),
             Some(job) => {
-                // CF-H-1: an audit trail, not a gate — see the Cancel arm
-                // above and `handle`'s own doc on `session`.
-                if !job.session_matches(session) {
+                // CF-H-1, extended by #327: `session_matches` alone only ever
+                // recognizes the submitter on the SAME connection Submit used
+                // — the realistic case (`daemon submit` now, `daemon attach`
+                // later from a fresh terminal) always mints a fresh session,
+                // so it would never match there. The durable `attach_token`
+                // `Submit` minted closes that: present it (from a fresh
+                // connection/process, read back from wherever the CLI
+                // persisted it) and it proves the same submitter regardless
+                // of session. Either one is sufficient; the log line below is
+                // still just an audit trail, never a refusal, on the one case
+                // neither recognizes.
+                let session_match = job.session_matches(session);
+                let token_match = match &attach.attach_token {
+                    Some(presented) => {
+                        let stored = {
+                            let store = Arc::clone(store);
+                            let job_id = attach.job_id.clone();
+                            tokio::task::spawn_blocking(move || store.attach_token(&job_id)).await??
+                        };
+                        stored.is_some_and(|stored| attach_tokens_match(&stored, presented))
+                    }
+                    None => false,
+                };
+                let is_submitter = session_match || token_match;
+                if !is_submitter {
                     tracing::info!(
                         job_id = %attach.job_id,
                         submitted_session = %job.session,
                         requesting_session = %session,
-                        "attach from a different session than the one that submitted this job"
+                        token_presented = attach.attach_token.is_some(),
+                        "attach from neither the submitting session nor a matching attach token"
                     );
                 }
-                control_response::Result::Attach(AttachResponse {
-                    channel_id: attach.job_id.clone(),
-                    cap: encode_cap(&job.observer_cap)?,
-                })
+                // The submitter gets a freshly minted post-capable cap, never
+                // the stored `job.agent_cap`: that cap's principal is the
+                // real in-guest/host agent, and presenting the identical cap
+                // bytes here would join as the SAME membership (membership is
+                // keyed by the cap's own proof digest, `Channel::join`) —
+                // sharing one cursor between the agent and an attaching
+                // operator instead of two independent ones. A different
+                // session still gets the existing observer-only cap minted
+                // at Submit.
+                let attach_cap = if is_submitter {
+                    registry
+                        .authority()
+                        .mint(CapScope {
+                            peer: PeerId::from("operator"),
+                            channel: ChannelId::from(attach.job_id.as_str()),
+                            rights: CapRights {
+                                post: true,
+                                read: true,
+                                invite: false,
+                            },
+                            expires_at: None,
+                        })
+                        .map_err(dispatch::DispatchError::Cap)?
+                } else {
+                    job.observer_cap.clone()
+                };
+                if cap_has_expired(&attach_cap) {
+                    control_response::Result::Error(ControlError {
+                        message: format!(
+                            "job {}'s attach cap has expired; re-submit to get a new one",
+                            attach.job_id
+                        ),
+                    })
+                } else {
+                    control_response::Result::Attach(AttachResponse {
+                        channel_id: attach.job_id.clone(),
+                        cap: encode_cap(&attach_cap)?,
+                    })
+                }
             }
             None => {
                 // No live channel for this id. Distinguish "never existed"
@@ -446,6 +556,22 @@ fn cap_has_expired(cap: &sandy_fabric::capauth::Cap) -> bool {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     expires_at <= now
+}
+
+/// Constant-time comparison of a stored and a presented attach token (#327):
+/// a wrong guess must not be narrowable byte-by-byte via response timing.
+/// Mirrors `link_auth::LinkToken::matches`'s discipline; not shared code
+/// since that type is fixed-size and specific to the remote-link seam, while
+/// this compares plain, store-read `Vec<u8>`s.
+fn attach_tokens_match(stored: &[u8], presented: &[u8]) -> bool {
+    if stored.len() != presented.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in stored.iter().zip(presented.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
 }
 
 #[cfg(test)]
@@ -549,7 +675,7 @@ mod tests {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let response = handle(&store, &registry, &host_registry, None, test_session(), submit_req(1)).await?;
         let job_id = match response.result {
-            Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
+            Some(control_response::Result::Submit(SubmitResponse { job_id, .. })) => job_id,
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
         };
         assert_eq!(response.request_id, 1);
@@ -635,7 +761,7 @@ mod tests {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let submitted = handle(&store, &registry, &host_registry, None, test_session(), submit_req(1)).await?;
         let job_id = match submitted.result {
-            Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
+            Some(control_response::Result::Submit(SubmitResponse { job_id, .. })) => job_id,
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
         };
 
@@ -645,13 +771,199 @@ mod tests {
             &host_registry,
             None,
             test_session(),
-            req(2, control_request::Op::Attach(AttachRequest { job_id: job_id.clone() })),
+            req(
+                2,
+                control_request::Op::Attach(AttachRequest {
+                    job_id: job_id.clone(),
+                    attach_token: None,
+                }),
+            ),
         )
         .await?;
         match response.result {
             Some(control_response::Result::Attach(AttachResponse { channel_id, cap })) => {
                 assert_eq!(channel_id, job_id);
                 decode_cap(&cap).context("the attach cap must decode")?;
+            }
+            other => anyhow::bail!("expected an Attach response, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// Positive (#327): `Attach` from the SAME session that submitted the job
+    /// gets a post-capable cap back — "my own job, I can log into".
+    #[tokio::test]
+    async fn attach_from_the_submitting_session_gets_a_post_capable_cap() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let session = Uuid::new_v4();
+        let submitted = handle(&store, &registry, &host_registry, None, session, submit_req(1)).await?;
+        let job_id = match submitted.result {
+            Some(control_response::Result::Submit(SubmitResponse { job_id, .. })) => job_id,
+            other => anyhow::bail!("expected a Submit response, got {other:?}"),
+        };
+
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            None,
+            session,
+            req(
+                2,
+                control_request::Op::Attach(AttachRequest {
+                    job_id,
+                    attach_token: None,
+                }),
+            ),
+        )
+        .await?;
+        match response.result {
+            Some(control_response::Result::Attach(AttachResponse { cap, .. })) => {
+                let decoded = decode_cap(&cap).context("the attach cap must decode")?;
+                let rights = decoded.scope().rights;
+                assert!(
+                    rights.post,
+                    "the submitter's own attach must be post-capable, got {rights:?}"
+                );
+                assert!(
+                    rights.read,
+                    "the submitter's own attach must still be read-capable, got {rights:?}"
+                );
+            }
+            other => anyhow::bail!("expected an Attach response, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// Adversarial (#327): `Attach` from a DIFFERENT session than the one
+    /// that submitted the job gets the existing observer-only cap back — read
+    /// succeeds, post would be refused (proven at the channel level by
+    /// `dispatch::tests::the_observer_cap_cannot_post`) — "someone else's job,
+    /// I can only watch".
+    #[tokio::test]
+    async fn attach_from_a_different_session_gets_observer_rights_only() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let submitted = handle(&store, &registry, &host_registry, None, Uuid::new_v4(), submit_req(1)).await?;
+        let job_id = match submitted.result {
+            Some(control_response::Result::Submit(SubmitResponse { job_id, .. })) => job_id,
+            other => anyhow::bail!("expected a Submit response, got {other:?}"),
+        };
+
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            None,
+            Uuid::new_v4(), // a different session than the one that submitted
+            req(
+                2,
+                control_request::Op::Attach(AttachRequest {
+                    job_id,
+                    attach_token: None,
+                }),
+            ),
+        )
+        .await?;
+        match response.result {
+            Some(control_response::Result::Attach(AttachResponse { cap, .. })) => {
+                let decoded = decode_cap(&cap).context("the attach cap must decode")?;
+                assert_eq!(
+                    decoded.scope().rights,
+                    read_only(),
+                    "a cross-session attach must be observer-only (read, no post), got {:?}",
+                    decoded.scope().rights
+                );
+            }
+            other => anyhow::bail!("expected an Attach response, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// Positive (#327, the realistic acceptance case): a DIFFERENT session
+    /// presenting the durable `attach_token` `Submit` handed back is STILL
+    /// post-capable — this is what closes the gap a plain cross-session
+    /// attach (the test above, presenting no token) leaves open: `daemon
+    /// submit` now, `daemon attach` later from a fresh terminal, is exactly
+    /// "a different session presenting the right token."
+    #[tokio::test]
+    async fn attach_from_a_different_session_with_the_right_token_is_still_post_capable() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let submitted = handle(&store, &registry, &host_registry, None, Uuid::new_v4(), submit_req(1)).await?;
+        let (job_id, attach_token) = match submitted.result {
+            Some(control_response::Result::Submit(SubmitResponse { job_id, attach_token })) => (job_id, attach_token),
+            other => anyhow::bail!("expected a Submit response, got {other:?}"),
+        };
+        assert!(
+            !attach_token.is_empty(),
+            "Submit must mint a durable attach token for this test to mean anything"
+        );
+
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            None,
+            Uuid::new_v4(), // a different session than the one that submitted
+            req(
+                2,
+                control_request::Op::Attach(AttachRequest {
+                    job_id,
+                    attach_token: Some(attach_token),
+                }),
+            ),
+        )
+        .await?;
+        match response.result {
+            Some(control_response::Result::Attach(AttachResponse { cap, .. })) => {
+                let decoded = decode_cap(&cap).context("the attach cap must decode")?;
+                let rights = decoded.scope().rights;
+                assert!(
+                    rights.post,
+                    "a different session presenting the right attach token must still be post-capable, got {rights:?}"
+                );
+            }
+            other => anyhow::bail!("expected an Attach response, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// Adversarial (#327): a DIFFERENT session presenting a WRONG token (not
+    /// merely an absent one) still gets observer-only rights, not refused
+    /// outright — a guessed/forged token is simply not recognized, same as
+    /// presenting none at all.
+    #[tokio::test]
+    async fn attach_from_a_different_session_with_a_wrong_token_is_still_observer_only() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let submitted = handle(&store, &registry, &host_registry, None, Uuid::new_v4(), submit_req(1)).await?;
+        let job_id = match submitted.result {
+            Some(control_response::Result::Submit(SubmitResponse { job_id, .. })) => job_id,
+            other => anyhow::bail!("expected a Submit response, got {other:?}"),
+        };
+
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            None,
+            Uuid::new_v4(),
+            req(
+                2,
+                control_request::Op::Attach(AttachRequest {
+                    job_id,
+                    attach_token: Some(vec![0xAA; 32]),
+                }),
+            ),
+        )
+        .await?;
+        match response.result {
+            Some(control_response::Result::Attach(AttachResponse { cap, .. })) => {
+                let decoded = decode_cap(&cap).context("the attach cap must decode")?;
+                assert_eq!(
+                    decoded.scope().rights,
+                    read_only(),
+                    "a wrong token must not grant post rights, got {:?}",
+                    decoded.scope().rights
+                );
             }
             other => anyhow::bail!("expected an Attach response, got {other:?}"),
         }
@@ -673,6 +985,7 @@ mod tests {
                 1,
                 control_request::Op::Attach(AttachRequest {
                     job_id: "never-submitted".to_owned(),
+                    attach_token: None,
                 }),
             ),
         )
@@ -706,6 +1019,7 @@ mod tests {
                 1,
                 control_request::Op::Attach(AttachRequest {
                     job_id: "job-from-before-restart".to_owned(),
+                    attach_token: None,
                 }),
             ),
         )
@@ -727,7 +1041,7 @@ mod tests {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let submitted = handle(&store, &registry, &host_registry, None, test_session(), submit_req(1)).await?;
         let job_id = match submitted.result {
-            Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
+            Some(control_response::Result::Submit(SubmitResponse { job_id, .. })) => job_id,
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
         };
 
@@ -752,7 +1066,13 @@ mod tests {
             &host_registry,
             None,
             test_session(),
-            req(2, control_request::Op::Attach(AttachRequest { job_id: job_id.clone() })),
+            req(
+                2,
+                control_request::Op::Attach(AttachRequest {
+                    job_id: job_id.clone(),
+                    attach_token: None,
+                }),
+            ),
         )
         .await?;
         match response.result {
@@ -775,7 +1095,7 @@ mod tests {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let submitted = handle(&store, &registry, &host_registry, None, test_session(), submit_req(1)).await?;
         let job_id = match submitted.result {
-            Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
+            Some(control_response::Result::Submit(SubmitResponse { job_id, .. })) => job_id,
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
         };
 
@@ -830,7 +1150,7 @@ mod tests {
         let session = Uuid::new_v4();
         let submitted = handle(&store, &registry, &host_registry, None, session, submit_req(1)).await?;
         let job_id = match submitted.result {
-            Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
+            Some(control_response::Result::Submit(SubmitResponse { job_id, .. })) => job_id,
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
         };
 
@@ -869,7 +1189,7 @@ mod tests {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let submitted = handle(&store, &registry, &host_registry, None, Uuid::new_v4(), submit_req(1)).await?;
         let job_id = match submitted.result {
-            Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
+            Some(control_response::Result::Submit(SubmitResponse { job_id, .. })) => job_id,
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
         };
 
@@ -1313,7 +1633,7 @@ mod tests {
         )
         .await?;
         let job_id = match response.result {
-            Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
+            Some(control_response::Result::Submit(SubmitResponse { job_id, .. })) => job_id,
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
         };
 
@@ -1410,7 +1730,7 @@ mod tests {
         )
         .await?;
         let job_id = match response.result {
-            Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
+            Some(control_response::Result::Submit(SubmitResponse { job_id, .. })) => job_id,
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
         };
 
@@ -1465,7 +1785,7 @@ mod tests {
         )
         .await?;
         let job_id = match submitted.result {
-            Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
+            Some(control_response::Result::Submit(SubmitResponse { job_id, .. })) => job_id,
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
         };
 
@@ -1541,7 +1861,7 @@ mod tests {
         )
         .await?;
         let job_id = match response.result {
-            Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
+            Some(control_response::Result::Submit(SubmitResponse { job_id, .. })) => job_id,
             other => {
                 anyhow::bail!("the submit itself must still succeed even when placement finds no match, got {other:?}")
             }
@@ -1578,7 +1898,7 @@ mod tests {
         )
         .await?;
         let job_id = match response.result {
-            Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
+            Some(control_response::Result::Submit(SubmitResponse { job_id, .. })) => job_id,
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
         };
 
@@ -1685,7 +2005,7 @@ mod tests {
         )
         .await?;
         let job_id = match response.result {
-            Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
+            Some(control_response::Result::Submit(SubmitResponse { job_id, .. })) => job_id,
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
         };
 
@@ -1839,7 +2159,7 @@ mod tests {
         )
         .await?;
         let job_id = match response.result {
-            Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
+            Some(control_response::Result::Submit(SubmitResponse { job_id, .. })) => job_id,
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
         };
 

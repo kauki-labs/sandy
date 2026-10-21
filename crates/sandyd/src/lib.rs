@@ -5,7 +5,14 @@
 //! there is no `sandy-agent` binary or `ProcessBackend::with_agent` (#216)
 //! for the executor to spawn. `Attach` returning a real channel/cap for a job
 //! that stays `Pending` is the honest state of that gap, not a fake success.
+//!
+//! The control RPC itself stays pure request/response (`docs/decisions/
+//! sandyd.md` §1: never a retrofit into a streaming call). `Attach`'s cap is
+//! redeemed on a SEPARATE connection, [`attach_relay`]'s own data-plane
+//! listener (#327) — the path §1 anticipated ("the caller subscribes on the
+//! data plane itself") but that didn't exist until this module.
 
+pub mod attach_relay;
 pub mod dispatch;
 pub mod handler;
 pub mod host_conn;
@@ -103,7 +110,7 @@ mod tests {
         .await?;
         let response: ControlResponse = read_frame(&mut client).await?.context("expected a Submit response")?;
         let job_id = match response.result {
-            Some(control_response::Result::Submit(sandy_control_proto::SubmitResponse { job_id })) => job_id,
+            Some(control_response::Result::Submit(sandy_control_proto::SubmitResponse { job_id, .. })) => job_id,
             other => anyhow::bail!("expected Submit, got {other:?}"),
         };
 

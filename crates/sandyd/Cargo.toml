@@ -28,7 +28,13 @@ sandy-fabric.workspace = true
 sandy-fabric-local.workspace = true
 sandy-fsutil.workspace = true
 sandy-orchestrator.workspace = true
+sandy-proto.workspace = true
 fs2.workspace = true
+# The attach relay's (#327) channel-output delivery task drains a `Stream`.
+futures-util.workspace = true
+# The attach data plane (#327) rides `sandy_fabric_local::link`'s hex-encoded
+# LinkFrame payloads.
+hex.workspace = true
 rustix.workspace = true
 getrandom.workspace = true
 rusqlite.workspace = true
@@ -39,6 +45,7 @@ tokio = { workspace = true, features = [
   "signal",
   "io-util",
   "macros",
+  "sync",
   "time",
 ] }
 tracing.workspace = true

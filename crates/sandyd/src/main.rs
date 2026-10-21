@@ -138,6 +138,22 @@ async fn main() {
     };
     tracing::info!(socket = %socket_path.display(), db = %db_path.display(), "sandyd listening");
 
+    // The interactive attach data plane (#327): a sibling UDS socket, kept
+    // SEPARATE from the control socket above — `docs/decisions/sandyd.md`
+    // §1 keeps the control RPC pure request/response, so a client redeems
+    // `Attach`'s cap here, not by streaming over the control connection
+    // itself. Same bind discipline (flock, 0600, umask) as the control
+    // socket, via the same `bind_unix_listener`.
+    let attach_socket_path = sandy_control_proto::attach_socket_path(&socket_path);
+    let (attach_listener, _attach_lock) = match bind_unix_listener(&attach_socket_path) {
+        Ok(bound) => bound,
+        Err(e) => {
+            tracing::error!(error = %e, socket = %attach_socket_path.display(), "could not bind the attach data-plane socket");
+            std::process::exit(1);
+        }
+    };
+    tracing::info!(socket = %attach_socket_path.display(), "sandyd attach data plane listening");
+
     let registry = match JobRegistry::new() {
         Ok(registry) => Arc::new(registry),
         Err(e) => {
@@ -145,6 +161,18 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    // Spawned plainly, like the mesh agent-link listener below: no
+    // graceful-shutdown support of its own yet (same #289-class follow-up),
+    // so it's abruptly cancelled on process exit — an in-flight attach
+    // session is cheap to lose, unlike a registered host-executor's live
+    // dispatch channel.
+    {
+        let registry = Arc::clone(&registry);
+        tokio::spawn(async move {
+            sandyd::attach_relay::serve_attach_accept_loop(&attach_listener, &registry).await;
+        });
+    }
 
     // One shutdown signal, registered exactly once, shared with the mesh
     // task below via a `watch` channel: `shutdown_signal()` only resolves on
@@ -278,6 +306,7 @@ async fn main() {
 
     drop(listener); // stop accepting; existing connections keep running
     let _ = std::fs::remove_file(&socket_path);
+    let _ = std::fs::remove_file(&attach_socket_path);
 
     if tokio::time::timeout(SHUTDOWN_GRACE, async {
         while connections.join_next().await.is_some() {}

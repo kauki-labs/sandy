@@ -50,6 +50,10 @@ clap.workspace = true
 octocrab.workspace = true
 sandy.workspace = true
 sandy-control-proto.workspace = true
+# The attach data plane's (#327) wire protocol: `sandy_fabric_local::link`'s
+# LinkFrame, the same framing the real sandbox agent's own link already uses.
+hex.workspace = true
+sandy-fabric-local.workspace = true
 sandy-fsutil.workspace = true
 # The CLI runs real VMs, so it pulls the VM backend impls in (impl-local stays on
 # by default); a local-only consumer of sandy-backend would omit impl-vm.
@@ -62,20 +66,30 @@ serde_json.workspace = true
 tempfile.workspace = true
 tiny_http.workspace = true
 # `net` on top of the workspace default (macros, rt-multi-thread): the daemon
-# subcommands (#205, B4) connect over a Unix socket.
-tokio = { workspace = true, features = ["net"] }
+# subcommands (#205, B4) connect over a Unix socket. `io-util` for the
+# interactive attach bridge's (#327) read/write calls; `sync` for its
+# `Mutex`/`oneshot`/`mpsc`; `time` for its background job-status watcher's
+# poll interval.
+tokio = { workspace = true, features = [
+  "net",
+  "io-util",
+  "io-std",
+  "sync",
+  "time",
+] }
 tracing.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
+# Raw terminal mode for `sandy daemon attach` (#327): local stdin must be
+# unbuffered/unechoed while attached, restored on every exit path.
+rustix = { workspace = true, features = ["termios"] }
 
 [dev-dependencies]
 anyhow.workspace = true
 base64.workspace = true
 futures-util.workspace = true
-hex.workspace = true
 sandy-executor-proto.workspace = true
 sandy-fabric.workspace = true
-sandy-fabric-local.workspace = true
 sandy-host-executor.workspace = true
 sandy-proto.workspace = true
 rustix.workspace = true
