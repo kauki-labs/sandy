@@ -116,8 +116,14 @@ fn spawn_orchestrator(
         .env("SANDY_MESH_LISTEN", mesh_addr.to_string())
         .env("SANDY_MESH_ALLOWLIST", remote_host.to_string())
         .env("SANDY_MESH_AGENT_LINK_LISTEN", link_addr.to_string())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        // `inherit`, not `piped`: nothing in this test reads the child's
+        // stdout/stderr, and a piped fd nobody drains blocks the child once
+        // the OS pipe buffer fills (CodeRabbit, #327's review) -- inherited
+        // output still shows up under `--no-capture` and is otherwise
+        // discarded by nextest the same way a piped-but-undrained one would
+        // have been, without the deadlock risk.
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
         .spawn()
         .context("spawning sandyd")?;
     let orchestrator = Orchestrator { child, sock };
