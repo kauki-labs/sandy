@@ -1,4 +1,5 @@
-//! Host-executor capability detection (#275, M2 stage 1).
+//! Host-executor capability detection (#275, M2 stage 1; VM detection since
+//! #332).
 //!
 //! Probes the actual environment and declares real capabilities to the
 //! orchestrator — never a hardcoded constant (spec D2,
@@ -7,7 +8,15 @@
 //! capability it cannot honor.
 //!
 //! [`Capabilities`] itself is owned by #263 (`sandy_fabric::executor`); this
-//! module consumes it, never redefines it.
+//! module consumes it, never redefines it. It stays the single-kind, one-
+//! executor-instance-per-kind domain type it always was (#332 deliberately
+//! leaves it and `capabilities_satisfy` alone — that seam is unrelated to
+//! this one host's own wire registration). The wire
+//! `sandy_executor_proto::Capabilities.supported_sandbox_kinds` this module
+//! builds is the broader, M2-specific concept: the SET of kinds one
+//! host-executor process can run, which [`to_wire_capabilities`] derives
+//! from this domain `Capabilities` (always `Process`, when containment is
+//! available) plus [`detect_vm_capability`]'s own independent probe.
 
 use sandy_api::{
     backend::SandboxKind,
@@ -114,8 +123,19 @@ pub fn detect_capabilities() -> Result<Capabilities, DetectError> {
 /// populated from `status` via [`detected_isolation_classes`] — never
 /// empty or hardcoded, since the orchestrator's isolation-class gate (#280)
 /// refuses any dispatch whose required class isn't in this list.
-fn to_wire_capabilities(capabilities: Capabilities, status: &ContainmentStatus) -> sandy_executor_proto::Capabilities {
-    let kind = match capabilities.kind {
+///
+/// `supported_sandbox_kinds` (#332) is a SET: `capabilities.kind` (always
+/// `Process`, the only kind [`capabilities_from`] ever derives) plus `Vm`
+/// when `vm_available` — additive, never replacing the existing `Process`
+/// declaration, so a host gaining VM capability never silently stops
+/// declaring the process backend it already had (the existing
+/// `ProcessBackend`/`argv/v1` dispatch path must be completely unaffected).
+fn to_wire_capabilities(
+    capabilities: Capabilities,
+    status: &ContainmentStatus,
+    vm_available: bool,
+) -> sandy_executor_proto::Capabilities {
+    let process_kind = match capabilities.kind {
         SandboxKind::Process => sandy_executor_proto::SandboxKind::Process,
         SandboxKind::Vm => sandy_executor_proto::SandboxKind::Vm,
     };
@@ -123,8 +143,12 @@ fn to_wire_capabilities(capabilities: Capabilities, status: &ContainmentStatus) 
         Arch::X86_64 => sandy_executor_proto::Arch::X8664,
         Arch::Aarch64 => sandy_executor_proto::Arch::Aarch64,
     };
+    let mut kinds = vec![i32::from(process_kind)];
+    if vm_available {
+        kinds.push(i32::from(sandy_executor_proto::SandboxKind::Vm));
+    }
     sandy_executor_proto::Capabilities {
-        kind: kind.into(),
+        supported_sandbox_kinds: kinds,
         arch: arch.into(),
         attestation: capabilities.attestation.is_some(),
         supported_isolation_classes: detected_isolation_classes(status).into_iter().map(Into::into).collect(),
@@ -133,7 +157,9 @@ fn to_wire_capabilities(capabilities: Capabilities, status: &ContainmentStatus) 
 
 /// Detect this host's real capabilities in the wire shape `Register` carries
 /// — the real entry point for registration, as [`detect_capabilities`] is
-/// for the domain type it wraps.
+/// for the domain type it wraps. Additionally probes VM capability (#332,
+/// [`detect_vm_capability`]) and folds it into `supported_sandbox_kinds`
+/// alongside the existing `Process` declaration.
 ///
 /// # Errors
 /// Same as [`detect_capabilities`].
@@ -141,7 +167,96 @@ pub fn detect_register_capabilities() -> Result<sandy_executor_proto::Capabiliti
     let arch = detect_arch()?;
     let status = SystemdRunContainment::detect().status();
     let capabilities = capabilities_from(arch, &status)?;
-    Ok(to_wire_capabilities(capabilities, &status))
+    Ok(to_wire_capabilities(capabilities, &status, detect_vm_capability()))
+}
+
+/// The facts [`vm_capability_from`] derives a VM-capability verdict from —
+/// probed once by [`detect_vm_capability`], pure from there so the
+/// derivation is unit-testable without a real `/dev/kvm`/`nix`/
+/// `qemu-system-x86_64`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VmProbeFacts {
+    /// `qemu-system-x86_64` runs — the only qemu target this host ever needs
+    /// (`host_target_for`'s own invariant: every non-macOS host pairs with
+    /// qemu/x86_64-linux, regardless of the host's own arch).
+    qemu_runnable: bool,
+    /// `nix` runs — the `flake/v1` dispatch branch resolves+builds the guest
+    /// with it, same as `sandy run --flake` does locally.
+    nix_runnable: bool,
+    /// `/dev/kvm` is openable read-write by this process — hardware
+    /// acceleration, the same probe `impls/vm/src/qemu.rs`'s own
+    /// `kvm_available` uses at boot time.
+    kvm_usable: bool,
+    /// `/dev/vhost-vsock` is openable read-write by this process — the
+    /// agent-link's AF_VSOCK transport (#238); without it a VM boots but the
+    /// sandbox agent can never connect back.
+    vhost_vsock_usable: bool,
+    /// `sandy_guest_template::guest_wrapper_present()` — the packaged
+    /// `nix/guest-wrapper` flake (plus its `nix/lib`/`nix/overlays`
+    /// dependencies) this host's `flake/v1` dispatch branch resolves+builds
+    /// against is actually present (CodeRabbit finding on PR #333): a host
+    /// whose package does not ship it, or never set `$SANDY_GUEST_WRAPPER`,
+    /// would otherwise advertise `Vm` and only fail once a real dispatch
+    /// reaches `resolve_flake_template`.
+    guest_wrapper_present: bool,
+}
+
+/// Whether `facts` satisfy declaring `SandboxKind::Vm`: every probed fact
+/// must hold — a host missing any one of them cannot actually complete a VM
+/// dispatch, so declaring the capability anyway would be exactly the kind of
+/// "a capability it cannot honor" this module's own doc rules out.
+fn vm_capability_from(facts: VmProbeFacts) -> bool {
+    facts.qemu_runnable
+        && facts.nix_runnable
+        && facts.kvm_usable
+        && facts.vhost_vsock_usable
+        && facts.guest_wrapper_present
+}
+
+/// Whether `binary --version` runs successfully — a real-usability probe
+/// (not just PATH presence), matching the spirit of
+/// `SystemdRunContainment::detect`'s own "try the real thing" discipline
+/// rather than a weaker existence check.
+fn runs_successfully(binary: &str) -> bool {
+    std::process::Command::new(binary)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Whether `path` can actually be opened read-write by this process — a
+/// device node can exist (`Path::exists`) while this process lacks the
+/// permission to use it (e.g. outside the `kvm` group, or a root-only
+/// `/dev/vhost-vsock`), which would make a host falsely advertise a
+/// capability it cannot service. Same "try the real thing" discipline
+/// [`runs_successfully`] applies to the binaries.
+fn device_openable(path: &str) -> bool {
+    std::fs::OpenOptions::new().read(true).write(true).open(path).is_ok()
+}
+
+/// Probe this host's real VM-capability facts.
+fn probe_vm_facts() -> VmProbeFacts {
+    VmProbeFacts {
+        qemu_runnable: runs_successfully("qemu-system-x86_64"),
+        nix_runnable: runs_successfully("nix"),
+        kvm_usable: device_openable("/dev/kvm"),
+        vhost_vsock_usable: device_openable("/dev/vhost-vsock"),
+        guest_wrapper_present: sandy_guest_template::guest_wrapper_present(),
+    }
+}
+
+/// Whether this host can actually run a `SandboxKind::Vm` dispatch (#332):
+/// the real entry point, probing qemu/nix/kvm/vhost-vsock before deriving
+/// the verdict via [`vm_capability_from`]. Called both at registration
+/// ([`detect_register_capabilities`]) and freshly re-probed at dispatch time
+/// ([`crate::dispatch::handle_dispatch`]'s own defense-in-depth re-check,
+/// same discipline as [`crate::dispatch::check_isolation_class`]'s re-probe
+/// — never trust an earlier registration alone).
+#[must_use]
+pub fn detect_vm_capability() -> bool {
+    vm_capability_from(probe_vm_facts())
 }
 
 /// The diagnostic string carried by a non-`Available` [`ContainmentStatus`].
@@ -274,13 +389,111 @@ mod tests {
             arch: Arch::X86_64,
             attestation: None,
         };
-        let wire = to_wire_capabilities(capabilities, &status);
+        let wire = to_wire_capabilities(capabilities, &status, false);
         assert_eq!(
             wire.supported_isolation_classes,
             vec![i32::from(IsolationClass::Trusted)]
         );
-        assert_eq!(wire.kind, i32::from(sandy_executor_proto::SandboxKind::Process));
+        assert_eq!(
+            wire.supported_sandbox_kinds,
+            vec![i32::from(sandy_executor_proto::SandboxKind::Process)]
+        );
         assert_eq!(wire.arch, i32::from(sandy_executor_proto::Arch::X8664));
         assert!(!wire.attestation);
+    }
+
+    /// Positive (#332): `vm_available = true` ADDS `Vm` to the declared
+    /// kinds — the existing `Process` declaration is completely unaffected,
+    /// never replaced.
+    #[test]
+    fn to_wire_capabilities_adds_vm_alongside_process_when_available() {
+        let status = ContainmentStatus::Available {
+            isolates_untrusted: false,
+        };
+        let capabilities = Capabilities {
+            kind: SandboxKind::Process,
+            arch: Arch::X86_64,
+            attestation: None,
+        };
+        let wire = to_wire_capabilities(capabilities, &status, true);
+        assert_eq!(
+            wire.supported_sandbox_kinds,
+            vec![
+                i32::from(sandy_executor_proto::SandboxKind::Process),
+                i32::from(sandy_executor_proto::SandboxKind::Vm),
+            ]
+        );
+    }
+
+    /// Adversarial (#332): every one of qemu/nix/kvm/vhost-vsock/
+    /// guest-wrapper must hold — a host missing any single one cannot
+    /// actually complete a VM dispatch, so it must not declare the
+    /// capability anyway.
+    #[test]
+    fn vm_capability_requires_every_probed_fact() {
+        let all_true = VmProbeFacts {
+            qemu_runnable: true,
+            nix_runnable: true,
+            kvm_usable: true,
+            vhost_vsock_usable: true,
+            guest_wrapper_present: true,
+        };
+        assert!(vm_capability_from(all_true));
+
+        assert!(!vm_capability_from(VmProbeFacts {
+            qemu_runnable: false,
+            ..all_true
+        }));
+        assert!(!vm_capability_from(VmProbeFacts {
+            nix_runnable: false,
+            ..all_true
+        }));
+        assert!(!vm_capability_from(VmProbeFacts {
+            kvm_usable: false,
+            ..all_true
+        }));
+        assert!(!vm_capability_from(VmProbeFacts {
+            vhost_vsock_usable: false,
+            ..all_true
+        }));
+        assert!(!vm_capability_from(VmProbeFacts {
+            guest_wrapper_present: false,
+            ..all_true
+        }));
+    }
+
+    /// Regression (CodeRabbit finding on this PR): existence alone must not
+    /// pass. A file this process cannot write to exists but is not usable —
+    /// the exact "device node present, permission denied" case the old
+    /// `Path::exists()` probe could not tell apart from a real `/dev/kvm`.
+    /// Assumes the test process is not running as root (root can open a
+    /// read-only file for writing anyway).
+    #[test]
+    fn device_openable_requires_a_real_readwrite_open_not_just_existence() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use anyhow::Context as _;
+
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("sandy-device-openable-test-{}", std::process::id()));
+        std::fs::write(&path, b"").context("create a scratch file")?;
+        let path_str = path.to_str().context("scratch path is valid UTF-8")?.to_owned();
+
+        assert!(device_openable(&path_str), "a plain writable file must be openable");
+
+        let mut perms = std::fs::metadata(&path).context("stat the scratch file")?.permissions();
+        perms.set_mode(0o400);
+        std::fs::set_permissions(&path, perms).context("chmod the scratch file read-only")?;
+        assert!(
+            !device_openable(&path_str),
+            "a read-only file must not be reported as read-write openable"
+        );
+
+        std::fs::remove_file(&path).ok();
+        assert!(
+            !device_openable(&path_str),
+            "a nonexistent path must not be reported as openable"
+        );
+        Ok(())
     }
 }

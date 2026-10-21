@@ -234,7 +234,9 @@
             # The overlay's own packages (#287, D3), built via `pkgs` here so
             # `nix build .#sandy-host-executor`/`.#sandy-agent` exercises the
             # exact overlay a consumer applies, not a separate code path.
-            inherit (pkgs) sandy-host-executor sandy-agent;
+            # `sandy-guest-wrapper` (#332) is the packaged `SANDY_GUEST_WRAPPER`
+            # source tree the host-executor NixOS module points at.
+            inherit (pkgs) sandy-host-executor sandy-agent sandy-guest-wrapper;
           };
 
           checks = {

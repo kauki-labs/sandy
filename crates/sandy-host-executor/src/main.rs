@@ -11,7 +11,7 @@
 
 use sandy_conn::TcpKeepalive;
 use sandy_host_executor::{
-    capability::detect_register_capabilities,
+    capability::{detect_register_capabilities, detect_vm_capability},
     client_config::{ExecutorConfig, parse_executor_config},
     dispatch::handle_dispatch,
     run::{
@@ -71,7 +71,11 @@ async fn main() {
                 tracing::info!(job_id, "running a dispatch");
                 let result = tokio::task::spawn_blocking(move || {
                     let containment = Box::new(SystemdRunContainment::detect());
-                    handle_dispatch(&dispatch, containment, agent_path, rt)
+                    // Freshly re-probed per dispatch, same discipline as
+                    // `containment` above (#332 — never trust this host's
+                    // earlier `Register` capability declaration alone).
+                    let vm_available = detect_vm_capability();
+                    handle_dispatch(&dispatch, containment, agent_path, rt, vm_available)
                 })
                 .await;
                 // Report the outcome back to the orchestrator over the same

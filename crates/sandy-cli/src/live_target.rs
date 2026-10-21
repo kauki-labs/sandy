@@ -57,10 +57,7 @@ pub fn require_live() -> anyhow::Result<LiveTarget> {
             target_arch: "x86_64-linux",
         }
     };
-    debug_assert_eq!(
-        target.target_arch, host.guest_system,
-        "live_target/host_target must agree"
-    );
+    ensure_arch_matches(target.target_arch, &host.guest_system)?;
     if !on_path(&target.hypervisor) {
         bail!(
             "refusing: `{}` is not on PATH — run under `nix shell nixpkgs#{}`",
@@ -97,6 +94,21 @@ fn vfkit_target(guest_system: &str) -> anyhow::Result<LiveTarget> {
     }
 }
 
+/// Refuses (never panics) if `target_arch` and `guest_system` disagree —
+/// extracted so this check is unit-testable (CodeRabbit finding on this PR):
+/// the old `debug_assert_eq!` here compiled out of release builds and
+/// panicked in debug ones (how `cargo nextest` runs the live suites), on any
+/// host where the two legitimately disagree (an Intel Mac: vfkit pairs with
+/// `host.guest_system == "x86_64-linux"`, but the vfkit branch above
+/// hardcodes `target_arch: "aarch64-linux"`). The live gate's contract is to
+/// refuse off-matrix, not to crash (INV-S9).
+fn ensure_arch_matches(target_arch: &str, guest_system: &str) -> anyhow::Result<()> {
+    if target_arch != guest_system {
+        bail!("refusing: this host's guest system `{guest_system}` is not on the live matrix (`{target_arch}`)");
+    }
+    Ok(())
+}
+
 /// Whether `program` resolves on `PATH`.
 #[must_use]
 pub fn on_path(program: &str) -> bool {
@@ -125,7 +137,7 @@ pub fn build_guest(target: &LiveTarget) -> anyhow::Result<()> {
 mod tests {
     use anyhow::Context;
 
-    use super::vfkit_target;
+    use super::{ensure_arch_matches, vfkit_target};
 
     /// The only guest arch `nix/guest/flake.nix` actually builds for vfkit.
     #[test]
@@ -149,5 +161,23 @@ mod tests {
             Ok(_) => panic!("expected an unsupported-target error for x86_64-linux"),
         };
         assert!(err.to_string().contains("x86_64-linux"), "{err}");
+    }
+
+    #[test]
+    fn matching_archs_are_accepted() -> anyhow::Result<()> {
+        ensure_arch_matches("aarch64-linux", "aarch64-linux").context("matching arches must not refuse")?;
+        Ok(())
+    }
+
+    /// Regression: this used to be a `debug_assert_eq!`, which panics instead
+    /// of refusing — reachable on a real host (an Intel Mac pairs vfkit's
+    /// hardcoded `aarch64-linux` target against `host.guest_system ==
+    /// "x86_64-linux"`), not just a hypothetical.
+    #[test]
+    fn mismatched_archs_refuse_instead_of_panicking() {
+        let err = ensure_arch_matches("aarch64-linux", "x86_64-linux").expect_err("a mismatch must refuse");
+        let message = err.to_string();
+        assert!(message.contains("aarch64-linux"), "message was: {message}");
+        assert!(message.contains("x86_64-linux"), "message was: {message}");
     }
 }

@@ -139,7 +139,7 @@ fn spawn_orchestrator(tmp: &std::path::Path, allowlist: &str) -> anyhow::Result<
 
 fn trusted_process_capabilities() -> Capabilities {
     Capabilities {
-        kind: SandboxKind::Process.into(),
+        supported_sandbox_kinds: vec![SandboxKind::Process.into()],
         arch: Arch::X8664.into(),
         attestation: false,
         supported_isolation_classes: vec![IsolationClass::Trusted.into()],
@@ -367,6 +367,7 @@ async fn real_attach_round_trips_proves_session_fork_and_survives_detach_reattac
             Box::new(sandy_test_support::FakeContainment::available()),
             agent_program,
             rt,
+            false,
         )
     });
 
@@ -586,6 +587,7 @@ async fn the_real_cli_binary_attaches_delivers_output_and_exits_on_job_completio
                 Box::new(sandy_test_support::FakeContainment::available()),
                 agent_program,
                 rt,
+                false,
             )
         })
         .await
@@ -761,6 +763,7 @@ async fn a_separate_attach_process_gets_post_rights_via_the_persisted_token() ->
                 Box::new(sandy_test_support::FakeContainment::available()),
                 agent_program,
                 rt,
+                false,
             )
         })
         .await

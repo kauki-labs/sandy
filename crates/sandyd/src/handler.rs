@@ -15,7 +15,7 @@ use sandy_control_proto::{
     AttachResponse, CancelResponse, ControlError, ControlRequest, ControlResponse, JobSummary as WireJobSummary,
     ListResponse, StatusResponse, SubmitResponse, control_request, control_response,
 };
-use sandy_executor_proto::{Dispatch, IsolationClass};
+use sandy_executor_proto::{Dispatch, IsolationClass, SandboxKind};
 use sandy_fabric::{
     capauth::{Cap, CapAuthority, CapCodecError, CapRights, CapScope, decode_cap, encode_cap},
     types::{ChannelId, PeerId},
@@ -38,6 +38,50 @@ use crate::{
 /// would silently default to `Trusted` and breach isolation. See #298, #269,
 /// #150.
 const STAGE1_REQUIRED_ISOLATION_CLASS: IsolationClass = IsolationClass::Trusted;
+
+/// The `manifest_encoding` tag a flake-templated VM job uses (#332) —
+/// `sandy_host_executor::dispatch`/`sandy_guest_template::manifest`'s own
+/// `MANIFEST_ENCODING_FLAKE_V1`, duplicated here (not imported) for the same
+/// reason `link_auth::LINK_TOKEN_LEN` duplicates
+/// `sandy_executor_proto::REMOTE_LINK_TOKEN_LEN`: this daemon never resolves
+/// or decodes a flake manifest itself, only classifies the tag, so it has no
+/// real need for that crate's `nix`-shelling resolution logic as a
+/// dependency. The two constants name the same wire tag and must stay in
+/// sync if either changes.
+const MANIFEST_ENCODING_FLAKE_V1: &str = "flake/v1";
+
+/// Derive the `Dispatch.backend` a submitted manifest requires, purely from
+/// its `manifest_encoding` (#332): `flake/v1` requires `Vm` (a remote
+/// host-executor resolves+boots the guest; this daemon has no local VM
+/// execution path at all). Every other encoding — `argv/v1`, the JSON
+/// `JobManifest` encoding, an opaque/unrecognized tag — requires `Process`,
+/// exactly today's only backend. A submitter never states the backend
+/// directly; it follows from the manifest shape it chose.
+fn required_sandbox_kind_for(manifest_encoding: &str) -> SandboxKind {
+    if manifest_encoding == MANIFEST_ENCODING_FLAKE_V1 {
+        SandboxKind::Vm
+    } else {
+        SandboxKind::Process
+    }
+}
+
+/// Refuses a `SandboxKind::Vm` submit this daemon cannot place, with `reason`
+/// as the explanation; `None` for anything else (a placed `Vm` job, or any
+/// `argv/v1` `Process` job, which keeps its existing "falls back to local"
+/// behavior unchanged). Shared by the two placement checks in `handle`'s
+/// `Submit` arm: the early one (before any side effect) and the one right
+/// after `dispatch_plan` is computed, which closes a narrow TOCTOU the early
+/// check alone cannot — a host disconnecting between the two `pick_host_for`
+/// calls, or `RemoteLink::new`'s RNG failing, can make the second placement
+/// attempt come back empty even though the first one found a host. `flake/v1`
+/// has no local execution fallback, so leaving that job `Pending` forever
+/// with no distinct status would be exactly the silent gap decision 18 rules
+/// out.
+fn vm_placement_error(required_sandbox_kind: SandboxKind, placed: bool, reason: &str) -> Option<ControlError> {
+    (required_sandbox_kind == SandboxKind::Vm && !placed).then(|| ControlError {
+        message: reason.to_owned(),
+    })
+}
 
 /// The length, in bytes, of a job's durable attach token (#327) —
 /// `SubmitResponse.attach_token`/`AttachRequest.attach_token`. Same length as
@@ -185,6 +229,32 @@ pub async fn handle(
                 }
             };
 
+            // #332: a required `SandboxKind` this daemon cannot place at all
+            // must refuse the whole Submit now, before any side effect —
+            // unlike `argv/v1`'s existing "no registered host → silently
+            // stays Pending forever" gap (an already-accepted, pre-#332
+            // honest limitation of the process-backend path, unchanged
+            // here), a `flake/v1` VM job has NO local execution fallback in
+            // this daemon at all: accepting it anyway would create a job
+            // that can never run, with no distinct status a caller could
+            // ever notice (item 5's "never silently" bar).
+            let required_sandbox_kind = required_sandbox_kind_for(&submit.manifest_encoding);
+            let placeable = forward_back_addr.is_some()
+                && host_registry
+                    .pick_host_for(STAGE1_REQUIRED_ISOLATION_CLASS.into(), required_sandbox_kind.into())
+                    .is_some();
+            if let Some(control_error) = vm_placement_error(
+                required_sandbox_kind,
+                placeable,
+                "no registered host declares SandboxKind::Vm capability; a flake-templated job cannot be placed (this \
+                 daemon has no local VM execution path)",
+            ) {
+                return Ok(ControlResponse {
+                    request_id: request.request_id,
+                    result: Some(control_response::Result::Error(control_error)),
+                });
+            }
+
             let job_id = Uuid::new_v4().to_string();
             let manifest = submit.manifest;
             let encoding = submit.manifest_encoding;
@@ -238,7 +308,8 @@ pub async fn handle(
             // observe it; the actual `send_dispatch` call happens after,
             // once the job is durably recorded.
             let dispatch_plan = forward_back_addr.and_then(|forward_back| {
-                let candidate = host_registry.pick_host_for(STAGE1_REQUIRED_ISOLATION_CLASS.into())?;
+                let candidate = host_registry
+                    .pick_host_for(STAGE1_REQUIRED_ISOLATION_CLASS.into(), required_sandbox_kind.into())?;
                 match RemoteLink::new(candidate.peer_ip) {
                     Ok(link) => {
                         let link_token = link.token().as_bytes().to_vec();
@@ -247,7 +318,13 @@ pub async fn handle(
                             job_id: job_id.clone(),
                             manifest: manifest.clone(),
                             manifest_encoding: encoding.clone(),
-                            backend: candidate.capabilities.kind,
+                            // The submission's OWN required kind (#332), not
+                            // merely whatever the picked host happens to
+                            // support: `supported_sandbox_kinds` is a SET, so
+                            // a host can qualify for a placement by
+                            // supporting MORE than the one kind this specific
+                            // job actually needs.
+                            backend: required_sandbox_kind.into(),
                             link_token,
                             forward_back: forward_back.to_string(),
                             required_isolation_class: STAGE1_REQUIRED_ISOLATION_CLASS.into(),
@@ -255,19 +332,41 @@ pub async fn handle(
                         Some((candidate.host_id, candidate.registration, dispatch))
                     }
                     Err(e) => {
-                        // The OS RNG is unavailable — vanishingly rare, and
-                        // placement is best-effort: the job still submits
-                        // and runs locally rather than failing Submit
-                        // outright over a remote-placement optimization.
-                        tracing::warn!(
-                            error = %e,
-                            job_id,
-                            "could not mint a remote link token; running the job locally"
-                        );
+                        // The OS RNG is unavailable — vanishingly rare.
+                        // Placement is best-effort for `argv/v1`: that job
+                        // still submits and runs locally. A `flake/v1` job
+                        // has no local fallback, so the check right after
+                        // this closure refuses the whole Submit instead —
+                        // never claim "running locally" here, since that is
+                        // only true for one of the two kinds.
+                        tracing::warn!(error = %e, job_id, "could not mint a remote link token");
                         None
                     }
                 }
             });
+
+            // #332, closing CodeRabbit's finding on this PR: the early check
+            // above is necessarily a pre-check against the SAME registry
+            // state `dispatch_plan` itself then re-reads — a host
+            // disconnecting between the two `pick_host_for` calls, or
+            // `RemoteLink::new`'s RNG failing just above, can still leave a
+            // `Vm` job's `dispatch_plan` empty here. Refuse before
+            // `insert_pending`, same "no trace" bar as every other Submit-time
+            // refusal in this function (CF-M-2's `CapExceeded` below discards
+            // a minted link exactly this way) — never insert a `flake/v1` job
+            // that would then sit `Pending` forever with no local fallback
+            // and no distinct status a caller could ever notice.
+            if let Some(control_error) = vm_placement_error(
+                required_sandbox_kind,
+                dispatch_plan.is_some(),
+                "no registered host could be bound for SandboxKind::Vm placement; a flake-templated job cannot be \
+                 placed (this daemon has no local VM execution path)",
+            ) {
+                return Ok(ControlResponse {
+                    request_id: request.request_id,
+                    result: Some(control_response::Result::Error(control_error)),
+                });
+            }
 
             let insert_outcome =
                 tokio::task::spawn_blocking(move || store.insert_pending(&inserted_id, &manifest, &encoding)).await??;
@@ -1590,7 +1689,7 @@ mod tests {
 
     fn trusted_host_capabilities() -> sandy_executor_proto::Capabilities {
         sandy_executor_proto::Capabilities {
-            kind: sandy_executor_proto::SandboxKind::Process.into(),
+            supported_sandbox_kinds: vec![SandboxKind::Process.into()],
             arch: sandy_executor_proto::Arch::X8664.into(),
             attestation: false,
             supported_isolation_classes: vec![IsolationClass::Trusted.into()],
@@ -1843,7 +1942,7 @@ mod tests {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
         let untrusted_only = sandy_executor_proto::Capabilities {
-            kind: sandy_executor_proto::SandboxKind::Process.into(),
+            supported_sandbox_kinds: vec![SandboxKind::Process.into()],
             arch: sandy_executor_proto::Arch::X8664.into(),
             attestation: false,
             supported_isolation_classes: vec![IsolationClass::Untrusted.into()],
@@ -1907,6 +2006,176 @@ mod tests {
             job.remote_link.is_none(),
             "with no registered host, the job must stay local"
         );
+        Ok(())
+    }
+
+    // ---- Sandbox-kind placement dimension (#332) ----
+
+    fn submit_req_flake(id: u64) -> ControlRequest {
+        req(
+            id,
+            control_request::Op::Submit(SubmitRequest {
+                // Opaque to `handle` at placement time — it never decodes a
+                // flake manifest itself, only classifies the encoding tag.
+                manifest: b"irrelevant-to-placement".to_vec(),
+                manifest_encoding: "flake/v1".to_owned(),
+                submitter_caps: Vec::new(),
+            }),
+        )
+    }
+
+    fn vm_host_capabilities() -> sandy_executor_proto::Capabilities {
+        sandy_executor_proto::Capabilities {
+            supported_sandbox_kinds: vec![SandboxKind::Process.into(), SandboxKind::Vm.into()],
+            arch: sandy_executor_proto::Arch::X8664.into(),
+            attestation: false,
+            supported_isolation_classes: vec![IsolationClass::Trusted.into()],
+        }
+    }
+
+    /// `required_sandbox_kind_for` is a pure function of the encoding tag
+    /// alone: `flake/v1` requires `Vm`, everything else (including an opaque
+    /// or test-only tag) requires `Process` — the existing, unchanged
+    /// default.
+    #[test]
+    fn required_sandbox_kind_for_maps_flake_v1_to_vm_and_everything_else_to_process() {
+        assert_eq!(required_sandbox_kind_for("flake/v1"), SandboxKind::Vm);
+        assert_eq!(required_sandbox_kind_for("argv/v1"), SandboxKind::Process);
+        assert_eq!(required_sandbox_kind_for("test/v1"), SandboxKind::Process);
+        assert_eq!(required_sandbox_kind_for(""), SandboxKind::Process);
+    }
+
+    /// Regression for CodeRabbit's finding on this PR: `handle`'s early
+    /// placeability check and its post-`dispatch_plan` check call this same
+    /// function, so proving the function's three cases here proves both call
+    /// sites refuse (or don't) correctly — including the narrow TOCTOU case
+    /// (a `Vm` job, placeable at the early check, unplaceable by the time
+    /// `dispatch_plan` is computed) the full async race itself can't be
+    /// reproduced deterministically in a unit test (it needs a real
+    /// concurrent host disconnect, or `RemoteLink::new`'s RNG failing,
+    /// between two reads of `host_registry`'s internal lock).
+    #[test]
+    fn vm_placement_error_refuses_only_an_unplaced_vm_requirement() {
+        assert!(
+            vm_placement_error(SandboxKind::Vm, false, "unplaced").is_some(),
+            "a Vm job with no placement must be refused"
+        );
+        assert!(
+            vm_placement_error(SandboxKind::Vm, true, "unplaced").is_none(),
+            "a Vm job that IS placed must not be refused"
+        );
+        assert!(
+            vm_placement_error(SandboxKind::Process, false, "unplaced").is_none(),
+            "an unplaced Process job keeps its existing silent local-fallback behavior"
+        );
+    }
+
+    /// Positive (#332 acceptance): a `flake/v1` submit placed on a host that
+    /// declared BOTH `Process` and `Vm` dispatches with `backend == Vm` —
+    /// the submission's own required kind, not merely whatever the picked
+    /// host happens to support.
+    #[tokio::test]
+    async fn a_flake_submit_dispatches_as_vm_to_a_vm_capable_host() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let mut dispatch_rx = register_test_host(&host_registry, "ws01", peer_ip, vm_host_capabilities());
+
+        let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            submit_req_flake(1),
+        )
+        .await?;
+        assert!(
+            matches!(response.result, Some(control_response::Result::Submit(_))),
+            "got {:?}",
+            response.result
+        );
+
+        let dispatch = tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_rx.recv())
+            .await
+            .context("timed out waiting for the dispatch")?
+            .context("the host's dispatch channel closed before receiving anything")?;
+        assert_eq!(dispatch.backend, i32::from(SandboxKind::Vm));
+        assert_eq!(dispatch.manifest_encoding, "flake/v1");
+        Ok(())
+    }
+
+    /// Adversarial (#332, the issue's own acceptance bar — "never silently
+    /// fall back"): a `flake/v1` submit with only a Process-only host
+    /// registered is refused OUTRIGHT, creating no job at all — never a
+    /// silently un-run `Pending` row, which this daemon can never advance
+    /// (no local VM execution path exists).
+    #[tokio::test]
+    async fn a_flake_submit_with_only_a_process_only_host_is_refused_and_creates_no_job() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let _dispatch_rx = register_test_host(&host_registry, "ws01", peer_ip, trusted_host_capabilities()); // Process only
+
+        let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            submit_req_flake(1),
+        )
+        .await?;
+        match response.result {
+            Some(control_response::Result::Error(ControlError { message })) => {
+                assert!(message.contains("Vm"), "got {message:?}");
+            }
+            other => anyhow::bail!("expected a refusal, got {other:?}"),
+        }
+
+        let list = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            req(2, control_request::Op::List(ListRequest {})),
+        )
+        .await?;
+        match list.result {
+            Some(control_response::Result::List(ListResponse { jobs })) => {
+                assert!(jobs.is_empty(), "a refused flake submit must create no job: {jobs:?}");
+            }
+            other => anyhow::bail!("expected a List response, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// Adversarial (#332): a `flake/v1` submit with NO remote-dispatch
+    /// address configured at all (`forward_back_addr: None`) is refused the
+    /// same way — a Vm-capable host existing somewhere is irrelevant if this
+    /// daemon can't reach it back.
+    #[tokio::test]
+    async fn a_flake_submit_with_no_forward_back_configured_is_refused() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let _dispatch_rx = register_test_host(&host_registry, "ws01", peer_ip, vm_host_capabilities());
+
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            None,
+            test_session(),
+            submit_req_flake(1),
+        )
+        .await?;
+        match response.result {
+            Some(control_response::Result::Error(ControlError { message })) => {
+                assert!(message.contains("Vm"), "got {message:?}");
+            }
+            other => anyhow::bail!("expected a refusal, got {other:?}"),
+        }
         Ok(())
     }
 

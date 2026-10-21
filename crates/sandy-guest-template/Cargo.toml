@@ -1,0 +1,31 @@
+[package]
+name = "sandy-guest-template"
+description = "Resolve an arbitrary flake template (#325/#326/#332) into a bootable guest topology: template-kind detection, the guest-wrapper build+eval, the flake/v1 dispatch manifest, and the host->hypervisor pairing — shared by sandy-cli's `--flake`/`daemon submit --flake` and sandy-host-executor's remote VM dispatch"
+version = "0.1.1"
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+documentation = "https://docs.rs/sandy-guest-template"
+keywords = ["sandbox", "microvm", "nixos", "flake"]
+categories = ["virtualization", "development-tools"]
+
+[lib]
+crate-type = ["rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+# `process` feature (workspace default): kills a timed-out `nix` child's
+# WHOLE process group (#332, CodeRabbit finding on PR #333) — a killed `nix`
+# can leave a `sh -c`/single-user-build grandchild alive, still holding the
+# piped stdout/stderr open.
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true

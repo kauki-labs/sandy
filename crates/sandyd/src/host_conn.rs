@@ -504,7 +504,7 @@ mod tests {
 
     fn capabilities() -> Capabilities {
         Capabilities {
-            kind: SandboxKind::Process.into(),
+            supported_sandbox_kinds: vec![SandboxKind::Process.into()],
             arch: Arch::X8664.into(),
             attestation: false,
             supported_isolation_classes: vec![IsolationClass::Trusted.into()],
@@ -627,7 +627,7 @@ mod tests {
         assert!(matches!(response.op, Some(orchestrator_message::Op::Registered(_))));
 
         let candidate = registry
-            .pick_host_for(IsolationClass::Trusted.into())
+            .pick_host_for(IsolationClass::Trusted.into(), SandboxKind::Process.into())
             .expect("a host that declared Trusted over the real wire must be a Trusted placement candidate");
         assert_eq!(candidate.host_id, "ws01");
 
