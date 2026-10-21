@@ -80,19 +80,71 @@
           hypervisor: system: lib.nameValuePair system { ${hypervisor} = f hypervisor; }
         ) matrix;
 
-      # Kind 2 (nixos-module, #325): wrap one `target.nixosModules.<name>` as
-      # one more `extraModules` entry — exactly the seam `mkGuest` already
-      # exposes to its own callers (`nix/guest/flake.nix`'s
-      # `networkingModule`/`credentialModule`). No new composition logic: an
-      # externally-named module is just routed through the same seam.
-      guestFromModule =
-        moduleName: hypervisor:
+      # One `mkGuest` call taking an already-built module value, shared by
+      # kind 2 (below) and kind 4 (devshell, #326) so neither duplicates the
+      # `mkGuest` invocation itself — the seam `mkGuest` already exposes to
+      # `nix/guest/flake.nix`'s own `extraModules` callers.
+      guestFromModuleValue =
+        module: hypervisor:
         mkGuest {
           system = matrix.${hypervisor};
           inherit hypervisor;
           vmHostPackages = vmHostPackagesFor hypervisor;
-          extraModules = [ target.nixosModules.${moduleName} ];
+          extraModules = [ module ];
         };
+
+      # Kind 2 (nixos-module, #325): wrap one `target.nixosModules.<name>` as
+      # one more `extraModules` entry. No new composition logic: an
+      # externally-named module is just routed through the same seam.
+      guestFromModule =
+        moduleName: hypervisor: guestFromModuleValue target.nixosModules.${moduleName} hypervisor;
+
+      # Kind 4 (devshell, #326, best-effort): synthesize a throwaway
+      # nixosModule from `target.devShells.<system>.<name>` rather than
+      # requiring the target to expose `nixosModules`/`nixosConfigurations`
+      # itself — many real flakes only ship a devShell. Always opt-in
+      # (`sandy run --flake … --from-devshell`), never auto-detected; the CLI
+      # always prints a best-effort warning before using this path, since a
+      # devShell was never designed as a NixOS module: its `shellHook`
+      # assumes an interactive shell, the dev's own checkout as `cwd`, and
+      # inherited host env (direnv, host-specific paths) — none of which
+      # exist identically in the guest's login shell (#326's negative fixture
+      # pins down what actually happens: silently different output, not a
+      # crash).
+      devShellModule =
+        shellName: hypervisor:
+        let
+          shell = target.devShells.${matrix.${hypervisor}}.${shellName};
+        in
+        { lib, ... }:
+        {
+          # `buildInputs`/`nativeBuildInputs` both just mean "on PATH in the
+          # booted guest" here — the host-side cross-compilation distinction
+          # between the two has no equivalent meaning for a systemPackages
+          # list, so both map the same way.
+          environment.systemPackages = (shell.buildInputs or [ ]) ++ (shell.nativeBuildInputs or [ ]);
+          # `mkAfter`: `nix/lib/guest.nix`'s `commonModule` pins its
+          # secrets/inputs export at `mkOrder 1000` and the SANDY-READY
+          # marker print at `mkOrder 2000` specifically so this hook (1500)
+          # can slot between them — after secrets/inputs are ready, before
+          # the marker — so the job's own command starts only once the hook
+          # has run.
+          programs.bash.loginShellInit = lib.mkAfter (shell.shellHook or "");
+        };
+      guestFromDevShell =
+        shellName: hypervisor: guestFromModuleValue (devShellModule shellName hypervisor) hypervisor;
+
+      # Every devShell name target exposes, across both guest systems — the
+      # union, not just one system's, since `topologiesFromDevShell` must be
+      # a real enumerable attrset for `nix eval`'s attribute-path access
+      # (unlike `topologiesFromModule`, `target.devShells` is nested by
+      # system first, so this can't just be `builtins.mapAttrs` over it
+      # directly).
+      devShellNames = lib.unique (
+        lib.concatMap (system: builtins.attrNames (target.devShells.${system} or { })) (
+          builtins.attrValues matrix
+        )
+      );
 
       # Kind 3 (nixos-configuration, #325): layer the same protocol wiring
       # onto an ALREADY-realized `nixosConfigurations.<name>` via
@@ -158,5 +210,26 @@
           hypervisor: _: (guestFromConfiguration name hypervisor).config.microvm.declaredRunner
         ) matrix
       ) target.nixosConfigurations;
+
+      # `nix eval --json --override-input target <ref> <this>#topologiesFromDevShell.<name>.<system>.<hypervisor>`
+      topologiesFromDevShell = builtins.listToAttrs (
+        map (
+          name:
+          lib.nameValuePair name (
+            bySystemAndHypervisor (hypervisor: mkTopology (guestFromDevShell name hypervisor))
+          )
+        ) devShellNames
+      );
+      # Same realise-before-boot role as `guestRunnersFromModule`, for kind 4.
+      guestRunnersFromDevShell = builtins.listToAttrs (
+        map (
+          name:
+          lib.nameValuePair name (
+            bySystemAndHypervisor (
+              hypervisor: (guestFromDevShell name hypervisor).config.microvm.declaredRunner
+            )
+          )
+        ) devShellNames
+      );
     };
 }

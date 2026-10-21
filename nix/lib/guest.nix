@@ -115,26 +115,35 @@ let
       # into a shell actually reading input, not during the getty→login handoff
       # that flushes pending tty input (the vfkit autologin race). The child
       # `sh` is not a login shell, so it never re-prints the marker.
-      programs.bash.loginShellInit = ''
-        if [ -d /run/sandy/secrets ]; then
-          for f in /run/sandy/secrets/*; do
-            [ -f "$f" ] && export "''${f##*/}=$(cat "$f")"
-          done
-        fi
-        # Arbitrary guest paths: sandy writes a tab-separated manifest
-        # (sandy's INPUT_MANIFEST_NAME) listing each input that asked to appear
-        # at an absolute path; symlink each one to its staged entry. Line 1 is
-        # the version; columns are name, guest_path, source, hash (last two
-        # reserved). Runs before the READY marker so the job sees the links.
-        if [ -f /run/sandy/inputs/.sandy-inputs ]; then
-          tail -n +2 /run/sandy/inputs/.sandy-inputs | while IFS="$(printf '\t')" read -r name path _; do
-            [ -n "$name" ] && [ -n "$path" ] || continue
-            mkdir -p "$(dirname "$path")"
-            ln -sfn "/run/sandy/inputs/$name" "$path"
-          done
-        fi
-        printf 'SANDY-READY\n'
-      '';
+      #
+      # Split via `mkMerge`/`mkOrder` (not one plain string) so the
+      # guest-wrapper's #326 devshell synthesis can slot a devShell's
+      # `shellHook` in between secrets/inputs and the marker, at `mkAfter`
+      # (1500) — after this block (1000), before the marker (2000) — without
+      # relying on module-import order, which `types.lines` merge does not
+      # otherwise guarantee between two separate modules.
+      programs.bash.loginShellInit = lib.mkMerge [
+        (lib.mkOrder 1000 ''
+          if [ -d /run/sandy/secrets ]; then
+            for f in /run/sandy/secrets/*; do
+              [ -f "$f" ] && export "''${f##*/}=$(cat "$f")"
+            done
+          fi
+          # Arbitrary guest paths: sandy writes a tab-separated manifest
+          # (sandy's INPUT_MANIFEST_NAME) listing each input that asked to appear
+          # at an absolute path; symlink each one to its staged entry. Line 1 is
+          # the version; columns are name, guest_path, source, hash (last two
+          # reserved). Runs before the READY marker so the job sees the links.
+          if [ -f /run/sandy/inputs/.sandy-inputs ]; then
+            tail -n +2 /run/sandy/inputs/.sandy-inputs | while IFS="$(printf '\t')" read -r name path _; do
+              [ -n "$name" ] && [ -n "$path" ] || continue
+              mkdir -p "$(dirname "$path")"
+              ln -sfn "/run/sandy/inputs/$name" "$path"
+            done
+          fi
+        '')
+        (lib.mkOrder 2000 "printf 'SANDY-READY\\n'")
+      ];
 
       # Keep the guest tiny and fast to boot.
       documentation.enable = lib.mkForce false;

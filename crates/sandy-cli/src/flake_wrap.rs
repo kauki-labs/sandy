@@ -1,8 +1,9 @@
 //! `sandy run --flake <ref>`: wrap an arbitrary flake with no sandy awareness
 //! at all as a bootable guest (#325).
 //!
-//! Three template kinds, picked by what `<ref>` actually exposes (or named
-//! with `--kind`), always printed once resolved — never silently guessed:
+//! Four template kinds. The first three are auto-detected (or named with
+//! `--kind`), always printed once resolved — never silently guessed. The
+//! fourth is always-explicit, never auto-detected:
 //!
 //! - **`topology`**: `<ref>` already calls `lib.mkGuest`/`lib.mkTopology` itself and exposes
 //!   `topologies.<system>.<hypervisor>` (#324). Unchanged from today's `sandy run <flake>#topologies…` path — `--flake`
@@ -13,8 +14,13 @@
 //! - **`nixos-configuration`**: `<ref>` exposes a full `nixosConfigurations.<attr>`. Routed through the wrapper's
 //!   `topologiesFromConfiguration`/`guestRunnersFromConfiguration`, which layer sandy's protocol wiring on with
 //!   `extendModules`.
+//! - **`devshell`** (`--from-devshell`, #326, best-effort): `<ref>` exposes `devShells.<system>.<attr>` instead of any
+//!   of the above. The wrapper synthesizes a throwaway `nixosModule` from it (`buildInputs`/`nativeBuildInputs` to
+//!   `environment.systemPackages`, `shellHook` appended into the guest's login shell before the READY marker) and feeds
+//!   it through the same `mkGuest` seam kind 2 uses. Lossy by construction — a devShell was never designed as a NixOS
+//!   module — so this path is opt-in only and always prints a best-effort warning first.
 //!
-//! The mechanism (kind 2/3): `<ref>` is wired into the wrapper flake as the
+//! The mechanism (kind 2/3/4): `<ref>` is wired into the wrapper flake as the
 //! `target` input, overridden at invocation time
 //! (`--override-input target <ref>`) rather than baked into the wrapper's own
 //! lock — the one flake in the repo not meant to be evaluated with its own
@@ -37,8 +43,9 @@ use anyhow::{Context, Result, bail};
 
 use crate::host_target::{HostTarget, host_target};
 
-/// Which of the three template kinds `--flake` resolved to (or was told to
-/// force via `--kind`).
+/// Which of the four template kinds `--flake` resolved to (or was told to
+/// force via `--kind`). `DevShell` is never produced by [`parse_kind`] — it is
+/// only ever selected by `--from-devshell`, never by `--kind` (#326).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TemplateKind {
     /// The flake already exposes `topologies.<system>.<hypervisor>` itself.
@@ -47,6 +54,10 @@ pub enum TemplateKind {
     NixosModule,
     /// The flake exposes `nixosConfigurations.<attr>`.
     NixosConfiguration,
+    /// `--from-devshell`: the flake exposes `devShells.<system>.<attr>`
+    /// instead, synthesized into a throwaway nixos-module (best-effort,
+    /// #326).
+    DevShell,
 }
 
 impl std::fmt::Display for TemplateKind {
@@ -55,6 +66,7 @@ impl std::fmt::Display for TemplateKind {
             TemplateKind::Topology => "topology",
             TemplateKind::NixosModule => "nixos-module",
             TemplateKind::NixosConfiguration => "nixos-configuration",
+            TemplateKind::DevShell => "devshell",
         })
     }
 }
@@ -73,13 +85,14 @@ pub fn parse_kind(raw: &str) -> Result<TemplateKind, String> {
 }
 
 /// `--attr`'s default when the flag is omitted: the conventional entry point
-/// for both `nixosModules` and `nixosConfigurations`.
+/// for `nixosModules`, `nixosConfigurations`, and (`--from-devshell`, #326)
+/// `devShells`.
 const DEFAULT_ATTR: &str = "default";
 
 /// The result of resolving a `--flake` template: either the user's own
 /// `topologies` attr passed straight through (kind `topology`, unchanged), or
 /// a prebuilt topology JSON file sandy evaluated+built through its own
-/// guest-wrapper flake (kinds `nixos-module`/`nixos-configuration`).
+/// guest-wrapper flake (kinds `nixos-module`/`nixos-configuration`/`devshell`).
 pub enum ResolvedTemplate {
     /// Hand straight to the existing flake-attr path
     /// (`crates/sandy/src/nix/topology.rs::topology`'s `nix eval` branch) —
@@ -98,22 +111,49 @@ pub enum ResolvedTemplate {
     },
 }
 
-/// Resolve `--flake <flake_ref>` (with optional `--kind`/`--attr` overrides)
-/// into a [`ResolvedTemplate`], printing the kind it picked (or was told) to
-/// stderr before doing anything else — `--flake` never silently guesses.
+/// Resolve `--flake <flake_ref>` (with optional `--kind`/`--attr` overrides,
+/// or `--from-devshell` for kind `devshell`, #326) into a [`ResolvedTemplate`],
+/// printing the kind it picked (or was told) to stderr before doing anything
+/// else — `--flake` never silently guesses. When `from_devshell` is set, the
+/// best-effort warning is printed first, before any `nix` call, so it is on
+/// stderr even when the probe or build that follows fails.
 ///
 /// # Errors
 /// Returns an error naming what was checked when no kind is detected, when a
-/// forced `--kind`/`--attr` names an attr the flake does not have, when the
-/// macOS vfkit build prerequisites are missing, or when the wrapper's
-/// `nix build`/`nix eval` fails (the module-system conflict case is
+/// forced `--kind`/`--attr` (or `--from-devshell`'s own attr) names an attr
+/// the flake does not have, when `--from-devshell` is combined with `--kind`,
+/// when the macOS vfkit build prerequisites are missing, or when the
+/// wrapper's `nix build`/`nix eval` fails (the module-system conflict case is
 /// summarized, not dumped as a raw stack trace).
-pub fn resolve_flake_template(flake_ref: &str, kind: Option<&str>, attr: Option<&str>) -> Result<ResolvedTemplate> {
-    let forced = kind
-        .map(|k| parse_kind(k).map_err(|e| anyhow::anyhow!(e)))
-        .transpose()?;
+pub fn resolve_flake_template(
+    flake_ref: &str,
+    kind: Option<&str>,
+    attr: Option<&str>,
+    from_devshell: bool,
+) -> Result<ResolvedTemplate> {
     let host = host_target();
-    let (kind, resolved_attr) = detect_kind(flake_ref, forced, attr, &host)?;
+    let (kind, resolved_attr) = if from_devshell {
+        if kind.is_some() {
+            bail!("--from-devshell cannot be combined with --kind");
+        }
+        // Printed before `detect_devshell`'s own `nix eval` probe, so it is
+        // never silently skipped by an early failure (#326's own acceptance
+        // bar: the warning fires on every invocation, not only a successful
+        // one).
+        eprintln!(
+            "sandy: best-effort: synthesizing a nixos-module from --from-devshell — a devShell's shellHook assumes an \
+             interactive shell, the host checkout's cwd, and inherited host env, none of which carry over identically \
+             into the guest's login shell"
+        );
+        let resolved_attr = attr.unwrap_or(DEFAULT_ATTR).to_string();
+        detect_devshell(flake_ref, &resolved_attr, &host)?;
+        (TemplateKind::DevShell, resolved_attr)
+    } else {
+        let forced = kind
+            .map(|k| parse_kind(k).map_err(|e| anyhow::anyhow!(e)))
+            .transpose()?;
+        detect_kind(flake_ref, forced, attr, &host)?
+    };
     eprintln!(
         "sandy: --flake {flake_ref} resolved to kind `{kind}`{}",
         if resolved_attr.is_empty() {
@@ -125,7 +165,7 @@ pub fn resolve_flake_template(flake_ref: &str, kind: Option<&str>, attr: Option<
 
     match kind {
         TemplateKind::Topology => Ok(ResolvedTemplate::Direct(direct_topology_ref(flake_ref, &host))),
-        TemplateKind::NixosModule | TemplateKind::NixosConfiguration => {
+        TemplateKind::NixosModule | TemplateKind::NixosConfiguration | TemplateKind::DevShell => {
             if cfg!(target_os = "macos")
                 && let Some(refusal) = crate::doctor::mac_prereq_result(crate::doctor::detect_mac_prereq())
             {
@@ -176,6 +216,13 @@ fn detect_kind(
                 bail!("--kind nixos-configuration forced, but `{flake_ref}` has no `nixosConfigurations.{attr}`")
             }
         },
+        // `parse_kind` never returns `DevShell` (there is no `--kind devshell`
+        // spelling; `--from-devshell` is the only way in, and it bypasses
+        // this function entirely) — unreachable in practice, named rather
+        // than panicked in case that ever changes.
+        Some(TemplateKind::DevShell) => {
+            bail!("--kind devshell is not a valid --kind value; pass --from-devshell instead")
+        }
         // Auto-detect, in the issue's own priority order. `detect_topology`
         // bails (rather than returning `false`) when `topologies` exists but
         // lacks this host's system/hypervisor row — a real match that just
@@ -231,8 +278,38 @@ fn detect_topology(flake_ref: &str, host: &HostTarget) -> Result<bool> {
     Ok(true)
 }
 
-/// Whether `flake_ref#<top>.<attr>` exists (`top` is `nixosModules` or
-/// `nixosConfigurations`).
+/// `--from-devshell`'s own probe: whether `flake_ref` exposes
+/// `devShells.<host.guest_system>.<attr>` — never part of auto-detection
+/// (#326's flag is always-explicit), so this is only ever called from the
+/// `from_devshell` branch of [`resolve_flake_template`], not from
+/// [`detect_kind`].
+///
+/// # Errors
+/// Bails naming what was checked: no `devShells` at all, `devShells` but not
+/// for this host's guest system, or that system's `devShells` but not
+/// `attr`.
+fn detect_devshell(flake_ref: &str, attr: &str, host: &HostTarget) -> Result<()> {
+    let Some(systems) = probe_attr_names(flake_ref, "devShells")? else {
+        bail!("--from-devshell: `{flake_ref}` exposes no `devShells` at all");
+    };
+    if !systems.iter().any(|s| s == &host.guest_system) {
+        bail!(
+            "--from-devshell: `{flake_ref}` exposes `devShells` but not for this host's guest system `{}` (has: {})",
+            host.guest_system,
+            systems.join(", ")
+        );
+    }
+    if !probe_attr_present(flake_ref, &format!("devShells.{}", host.guest_system), attr)? {
+        bail!(
+            "--from-devshell: `{flake_ref}` has no `devShells.{}.{attr}`",
+            host.guest_system
+        );
+    }
+    Ok(())
+}
+
+/// Whether `flake_ref#<top>.<attr>` exists (`top` is `nixosModules`,
+/// `nixosConfigurations`, or (via [`detect_devshell`]) `devShells.<system>`).
 fn probe_attr_present(flake_ref: &str, top: &str, attr: &str) -> Result<bool> {
     Ok(probe_attr_names(flake_ref, top)?.is_some_and(|names| names.iter().any(|n| n == attr)))
 }
@@ -339,6 +416,24 @@ fn configuration_attrs(attr: &str, host: &HostTarget) -> (String, String) {
     )
 }
 
+/// The wrapper's `topologiesFromDevShell`/`guestRunnersFromDevShell` attr
+/// paths for one `devShells.<attr>` (#326). Nested `<attr>.<system>.
+/// <hypervisor>`, matching `topologiesFromModule`'s own shape — a devShell is
+/// looked up by system like `nixosModules`/`topologies` are, unlike a
+/// `nixosConfiguration` which already fixes its own system.
+fn devshell_attrs(attr: &str, host: &HostTarget) -> (String, String) {
+    (
+        format!(
+            "topologiesFromDevShell.{attr}.{}.{}",
+            host.guest_system, host.hypervisor
+        ),
+        format!(
+            "guestRunnersFromDevShell.{attr}.{}.{}",
+            host.guest_system, host.hypervisor
+        ),
+    )
+}
+
 /// `nix build` the wrapper's runner attr (realising kernel/initrd/erofs),
 /// then `nix eval --json` its topology attr, both with `<ref>` wired in as
 /// the wrapper's `target` input override. Returns the topology JSON bytes.
@@ -352,6 +447,7 @@ fn build_and_eval(
     let (topology_attr, runner_attr) = match kind {
         TemplateKind::NixosModule => module_attrs(attr, host),
         TemplateKind::NixosConfiguration => configuration_attrs(attr, host),
+        TemplateKind::DevShell => devshell_attrs(attr, host),
         TemplateKind::Topology => bail!("internal: build_and_eval called for kind `topology`, which never wraps"),
     };
     let installable = |a: &str| format!("{}#{a}", wrapper_dir.display());
@@ -406,8 +502,8 @@ fn guest_wrapper_dir() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        HostTarget, TemplateKind, attribute_missing, configuration_attrs, direct_topology_ref, module_attrs,
-        parse_kind, summarize_nix_error,
+        HostTarget, TemplateKind, attribute_missing, configuration_attrs, devshell_attrs, direct_topology_ref,
+        module_attrs, parse_kind, summarize_nix_error,
     };
 
     fn vfkit_host() -> HostTarget {
@@ -532,5 +628,23 @@ mod tests {
         let (topology, runner) = configuration_attrs("default", &vfkit_host());
         assert_eq!(topology, "topologiesFromConfiguration.default.vfkit");
         assert_eq!(runner, "guestRunnersFromConfiguration.default.vfkit");
+    }
+
+    /// Kind 4 (devshell, #326) is nested by system like kind 2, not
+    /// system-free like kind 3.
+    #[test]
+    fn devshell_attrs_nest_by_system_then_hypervisor() {
+        let (topology, runner) = devshell_attrs("default", &vfkit_host());
+        assert_eq!(topology, "topologiesFromDevShell.default.aarch64-linux.vfkit");
+        assert_eq!(runner, "guestRunnersFromDevShell.default.aarch64-linux.vfkit");
+    }
+
+    /// `devshell` is `TemplateKind::DevShell`'s `Display` spelling — it does
+    /// NOT round-trip through `parse_kind` (`--kind devshell` is not a valid
+    /// token; `--from-devshell` is the only way in, #326).
+    #[test]
+    fn devshell_display_does_not_round_trip_through_parse_kind() {
+        assert_eq!(TemplateKind::DevShell.to_string(), "devshell");
+        assert!(parse_kind("devshell").is_err());
     }
 }
