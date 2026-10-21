@@ -282,8 +282,22 @@ fn summarize_nix_error(stderr: &str) -> String {
     if let Some(idx) = stderr.find("error: The option") {
         return stderr[idx..].trim().to_string();
     }
-    if let Some(idx) = stderr.rfind("\nerror:") {
-        return stderr[idx + 1..].trim().to_string();
+    // Nix indents the final cause under a `--show-trace`-less trace (e.g.
+    // `       error: sandy: …`), so a plain `rfind("\nerror:")` only catches
+    // an unindented header line (typically the top-level one right after a
+    // `warning:`) and returns the truncated trace above the real message.
+    // Take the last line that is an `error:` carrying a message, plus
+    // whatever nix printed after it.
+    let lines: Vec<&str> = stderr.lines().collect();
+    if let Some(pos) = lines.iter().rposition(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with("error:") && trimmed.trim_end() != "error:"
+    }) {
+        return lines[pos..]
+            .iter()
+            .map(|line| line.trim())
+            .collect::<Vec<_>>()
+            .join("\n");
     }
     stderr.trim().to_string()
 }
@@ -471,6 +485,26 @@ mod tests {
     fn summarize_falls_back_to_the_last_error_line() {
         let stderr = "warning: Git tree is dirty\nerror:\n  … while evaluating foo\nerror: something else broke";
         assert_eq!(summarize_nix_error(stderr), "error: something else broke");
+    }
+
+    /// Real nix traces indent the final cause (`       error: …`), not column
+    /// 0 — a plain `rfind("\nerror:")` only matches the empty top-level
+    /// header right after the `warning:` line and returns the truncated
+    /// trace above the real message. This is the kind-3 wrong-hypervisor
+    /// `throw` (#325) as it actually appears under a trace.
+    #[test]
+    fn summarize_matches_an_indented_final_error_line() {
+        let stderr = "warning: Git tree '/repo' is dirty\nerror:\n       … while evaluating the attribute 'x'\n       \
+                      at /repo/flake.nix:10:5:\n\n       error: sandy: nixosConfigurations.default targets system \
+                      aarch64-linux, but hypervisor qemu needs a x86_64-linux guest — pick a configuration that \
+                      targets x86_64-linux, or a hypervisor matching aarch64-linux";
+        let summary = summarize_nix_error(stderr);
+        assert!(
+            summary.starts_with("error: sandy: nixosConfigurations.default targets system aarch64-linux"),
+            "{summary}"
+        );
+        assert!(summary.ends_with("hypervisor matching aarch64-linux"), "{summary}");
+        assert!(!summary.contains("while evaluating"), "{summary}");
     }
 
     /// Kind 1's attr is the user's own flake, auto-assembled for this host.

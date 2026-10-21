@@ -1,8 +1,6 @@
 {
   description = "sandy #325 test fixture: a nixosModule that sets networking.hostName itself (kind 2, mkForce collision)";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-
   outputs = { ... }: {
     # Picks the same option `commonModule` requires (`networking.hostName =
     # "sandy"`) to prove #325's `lib.mkForce` fix in `nix/lib/guest.nix`

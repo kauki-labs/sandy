@@ -36,7 +36,7 @@ let
       # module's own kernel modules, the opposite of what kind 2/3 composition
       # needs.
       networking.hostName = lib.mkForce "sandy";
-      system.stateVersion = "24.11";
+      system.stateVersion = lib.mkForce "24.11";
 
       microvm = {
         vcpu = 2;
@@ -52,7 +52,12 @@ let
       # shell, not a password prompt. microvm.nix points the guest console at
       # the hypervisor's serial device (ttyS0 for qemu, hvc0 for vfkit).
       services.getty.autologinUser = lib.mkForce "root";
-      users.users.root.password = "";
+      users.users.root.password = lib.mkForce "";
+      # The READY marker and secret export live in bash's login init only
+      # (below); if a composed module/configuration sets a different root
+      # shell (NixOS's own default is `mkDefault cfg.defaultUserShell`), that
+      # hook never runs and the job hangs forever with no error anywhere.
+      users.users.root.shell = lib.mkForce pkgs.bashInteractive;
 
       # sandy stages each job secret as a read-only file named by its env-var
       # name under a virtiofs share tagged `sandy-secrets` (sandy's

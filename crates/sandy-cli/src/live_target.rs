@@ -48,12 +48,7 @@ pub fn require_live() -> anyhow::Result<LiveTarget> {
     // host's actual arch), now one definition.
     let host = crate::host_target::host_target();
     let target = if host.hypervisor == "vfkit" {
-        LiveTarget {
-            hypervisor: std::env::var("SANDY_VFKIT_BIN").unwrap_or_else(|_| "vfkit".to_string()),
-            runner_attr: "packages.aarch64-darwin.guest-runner-vfkit",
-            topology_attr: "topologies.aarch64-linux.vfkit",
-            target_arch: "aarch64-linux",
-        }
+        vfkit_target(&host.guest_system)?
     } else {
         LiveTarget {
             hypervisor: "qemu-system-x86_64".to_string(),
@@ -80,6 +75,28 @@ pub fn require_live() -> anyhow::Result<LiveTarget> {
     Ok(target)
 }
 
+/// vfkit's live target for `guest_system` (derived from `host_target()`, not
+/// hardcoded — vfkit requires a matching host/guest arch, #325). Only
+/// `aarch64-linux` is wired into `nix/guest/flake.nix` today
+/// (`packages.aarch64-darwin.guest-runner-vfkit`, `topologies.aarch64-linux.vfkit`);
+/// an x86_64 Mac's `guest_system` is `x86_64-linux`, which has no built attrs
+/// to select, so it refuses with a named error instead of silently reusing
+/// the aarch64 ones (what the hardcoded version did before this fix).
+fn vfkit_target(guest_system: &str) -> anyhow::Result<LiveTarget> {
+    match guest_system {
+        "aarch64-linux" => Ok(LiveTarget {
+            hypervisor: std::env::var("SANDY_VFKIT_BIN").unwrap_or_else(|_| "vfkit".to_string()),
+            runner_attr: "packages.aarch64-darwin.guest-runner-vfkit",
+            topology_attr: "topologies.aarch64-linux.vfkit",
+            target_arch: "aarch64-linux",
+        }),
+        other => bail!(
+            "refusing: no vfkit live target for guest system `{other}` — only aarch64-linux (Apple Silicon) is wired \
+             into nix/guest/flake.nix today"
+        ),
+    }
+}
+
 /// Whether `program` resolves on `PATH`.
 #[must_use]
 pub fn on_path(program: &str) -> bool {
@@ -102,4 +119,32 @@ pub fn build_guest(target: &LiveTarget) -> anyhow::Result<()> {
         bail!("nix build of the guest runner failed");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::vfkit_target;
+
+    /// The only guest arch `nix/guest/flake.nix` actually builds for vfkit.
+    #[test]
+    fn vfkit_target_resolves_aarch64_linux() {
+        let target = vfkit_target("aarch64-linux").unwrap();
+        assert_eq!(target.runner_attr, "packages.aarch64-darwin.guest-runner-vfkit");
+        assert_eq!(target.topology_attr, "topologies.aarch64-linux.vfkit");
+        assert_eq!(target.target_arch, "aarch64-linux");
+    }
+
+    /// An Intel Mac's `guest_system` (`x86_64-linux`) has no vfkit attrs built
+    /// anywhere — this must refuse by name, not silently reuse the aarch64
+    /// ones or panic on a debug-only assertion.
+    #[test]
+    fn vfkit_target_refuses_an_unsupported_guest_system() {
+        // `LiveTarget` carries no `Debug` impl, so `unwrap_err()` isn't available;
+        // match instead.
+        let err = match vfkit_target("x86_64-linux") {
+            Err(err) => err,
+            Ok(_) => panic!("expected an unsupported-target error for x86_64-linux"),
+        };
+        assert!(err.to_string().contains("x86_64-linux"), "{err}");
+    }
 }
