@@ -92,12 +92,53 @@ in
         The packaged guest-wrapper source tree (SANDY_GUEST_WRAPPER, #332):
         resolves+builds a `flake/v1` dispatch's guest topology, the same
         `nix/guest-wrapper` logic `sandy run --flake` runs locally, against
-        THIS host. Declaring `SandboxKind::Vm` capability also requires this
-        to actually be present and KVM/vhost-vsock to be reachable by
-        `${username}` — none of which this module enables yet (#287 is
-        trusted-process-only stage 1); setting this option alone does not
-        make a host VM-capable.
+        THIS host. Always set, regardless of `vm.enable`: it costs nothing to
+        build and `detect_vm_capability`'s `guest_wrapper_present` check
+        reads it unconditionally. `vm.enable` is what actually grants
+        `${username}` the qemu/kvm/vhost-vsock access this needs to make the
+        host declare `SandboxKind::Vm`.
       '';
+    };
+
+    vm = {
+      enable = lib.mkEnableOption ''
+        Vm-capable dispatch on top of #287's trusted-process stage 1:
+        qemu/nix/virtiofsd/git on PATH, `kvm` group membership, and
+        `/dev/kvm`/`/dev/vhost-vsock` bound into the service's private
+        `/dev`. Off by default — real extra attack surface, not just a flag
+      '';
+
+      qemuPackage = lib.mkOption {
+        type = lib.types.package;
+        default = pkgs.qemu;
+        defaultText = lib.literalExpression "pkgs.qemu";
+        description = "The qemu providing `qemu-system-x86_64` on the service's PATH.";
+      };
+
+      nixPackage = lib.mkOption {
+        type = lib.types.package;
+        default = config.nix.package;
+        defaultText = lib.literalExpression "config.nix.package";
+        description = ''
+          The `nix` the service's PATH uses to resolve+build a `flake/v1`
+          dispatch's guest. Defaults to the same `nix` the rest of this host
+          already runs, not a second pinned copy.
+        '';
+      };
+
+      virtiofsdPackage = lib.mkOption {
+        type = lib.types.package;
+        default = pkgs.virtiofsd;
+        defaultText = lib.literalExpression "pkgs.virtiofsd";
+        description = "The `virtiofsd` `QemuBackend` launches per guest share.";
+      };
+
+      gitPackage = lib.mkOption {
+        type = lib.types.package;
+        default = pkgs.git;
+        defaultText = lib.literalExpression "pkgs.git";
+        description = "`git`, on PATH for resolving a `git+https://…` flake ref.";
+      };
     };
   };
 
@@ -167,8 +208,18 @@ in
       # bwrap is the mount-namespace confinement layer SystemdRunContainment
       # probes for (#142); scoped to this service's own PATH, not installed
       # system-wide, so the only visible change to ws01's environment is this
-      # service's own process tree.
-      path = [ pkgs.bubblewrap ];
+      # service's own process tree. `vm.enable` adds what a `flake/v1`
+      # dispatch resolves+boots with: qemu, this host's own nix, virtiofsd
+      # per guest share, and git for a `git+https://…` flake ref.
+      path = [
+        pkgs.bubblewrap
+      ]
+      ++ lib.optionals cfg.vm.enable [
+        cfg.vm.qemuPackage
+        cfg.vm.nixPackage
+        cfg.vm.virtiofsdPackage
+        cfg.vm.gitPackage
+      ];
 
       environment = {
         SANDY_HOST_EXECUTOR_ORCHESTRATOR = cfg.orchestrator;
@@ -232,9 +283,37 @@ in
           "AF_INET"
           "AF_INET6" # the orchestrator dial + each dispatch's forward_back
           "AF_NETLINK" # dhcpcd/udev-adjacent; harmless to allow, costly to chase down
+        ]
+        ++ lib.optionals cfg.vm.enable [
+          "AF_VSOCK" # the agent-link's host<->guest transport over vhost-vsock (#238)
         ];
         ProtectProc = "invisible";
-        PrivateDevices = true; # bwrap builds its own /dev inside its own mount ns regardless
+        # Still true with `vm.enable`: PrivateDevices builds a private /dev
+        # with only the safe pseudo-devices (null/zero/random/tty/…) AND
+        # implicitly sets DevicePolicy=closed (systemd.exec(5)) — a physical
+        # device node never just reappears because something elsewhere in
+        # this config references it, and neither BindPaths nor group
+        # membership alone grants cgroup-level device access under a closed
+        # policy. Three things have to agree for `${username}` to actually
+        # open /dev/kvm or /dev/vhost-vsock: BindPaths (the path exists in
+        # this unit's mount namespace), DeviceAllow (the cgroup eBPF device
+        # program permits it despite DevicePolicy=closed), and
+        # SupplementaryGroups (the device node's own root:kvm 0660
+        # permission bits). bwrap's own /dev (built inside its own mount ns
+        # for the trusted-process path, #142) is unaffected either way.
+        PrivateDevices = true;
+        BindPaths = lib.optionals cfg.vm.enable [
+          "/dev/kvm"
+          # Dash-prefixed: tolerate a host without vhost_vsock loaded rather
+          # than failing this unit's start outright (which would also take
+          # down the trusted-process capability that works today).
+          "-/dev/vhost-vsock"
+        ];
+        DeviceAllow = lib.optionals cfg.vm.enable [
+          "/dev/kvm rw"
+          "/dev/vhost-vsock rw"
+        ];
+        SupplementaryGroups = lib.optionals cfg.vm.enable [ "kvm" ];
         UMask = "0077";
         RemoveIPC = true;
         SystemCallFilter = [

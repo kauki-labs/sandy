@@ -393,6 +393,107 @@
                     printf '%s' "$topology" > "$out/topology.json"
                   '';
             }
+          )
+          # Eval-only proof that `services.sandy-executor.vm.enable` (ws01's
+          # VM-capability hardening) is genuinely additive: OFF leaves the
+          # unit byte-for-byte what it was before that option existed, ON
+          # grants exactly the device/PATH/address-family set a real VM
+          # dispatch needs. Never builds anything — only plain string/list
+          # service-unit properties are forced, not `ExecStart` or any other
+          # attribute that would pull in a package's store path (ws01 is
+          # x86_64-linux only, so gated the same as the checks above). The
+          # refusal path (vm.enable on, a probed fact like kvm_usable false)
+          # is already exhaustively covered at the pure-function level by
+          # `capability.rs`'s `vm_capability_requires_every_probed_fact` —
+          # no redundant hermetic VM boot for the same logic here.
+          // lib.optionalAttrs (system == "x86_64-linux") (
+            let
+              executorOverlays = [
+                (import ./nix/overlays/sandy-agent.nix)
+                (import ./nix/overlays/sandy-host-executor.nix)
+              ];
+              evalWith =
+                extraConfig:
+                (inputs.nixpkgs.lib.nixosSystem {
+                  # Separate module-list entries, not a shallow `//` merge:
+                  # both this base config and `extraConfig` set
+                  # `services.sandy-executor.*`, and a shallow merge would
+                  # drop the base's `enable`/`orchestrator`/`hostId` the
+                  # instant `extraConfig` also touches `services`. The
+                  # module system deep-merges across list entries by design.
+                  modules = [
+                    ./nix/modules/sandy-executor.nix
+                    { nixpkgs.overlays = executorOverlays; }
+                    {
+                      services.sandy-executor = {
+                        enable = true;
+                        orchestrator = "127.0.0.1:1";
+                        hostId = "eval-check";
+                      };
+                    }
+                    extraConfig
+                  ];
+                  inherit system;
+                }).config.systemd.services.sandy-executor;
+              vmOff = evalWith { };
+              vmOn = evalWith {
+                services.sandy-executor.vm.enable = true;
+              };
+              # `.path` is a list of packages, not strings — names only, same
+              # as `BindPaths`/`RestrictAddressFamilies` these compare
+              # against plain string lists so the check stays build-free.
+              pathNames = svc: map (p: p.pname or p.name) svc.path;
+            in
+            {
+              sandy-executor-vm-opt-eval =
+                pkgs.runCommand "sandy-executor-vm-opt-eval"
+                  {
+                    offBindPaths = builtins.toJSON vmOff.serviceConfig.BindPaths;
+                    offRestrictAF = builtins.toJSON vmOff.serviceConfig.RestrictAddressFamilies;
+                    offSuppGroups = builtins.toJSON vmOff.serviceConfig.SupplementaryGroups;
+                    offDeviceAllow = builtins.toJSON (vmOff.serviceConfig.DeviceAllow or [ ]);
+                    offPath = builtins.toJSON (pathNames vmOff);
+                    onBindPaths = builtins.toJSON vmOn.serviceConfig.BindPaths;
+                    onRestrictAF = builtins.toJSON vmOn.serviceConfig.RestrictAddressFamilies;
+                    onSuppGroups = builtins.toJSON vmOn.serviceConfig.SupplementaryGroups;
+                    onDeviceAllow = builtins.toJSON vmOn.serviceConfig.DeviceAllow;
+                    onPath = builtins.toJSON (pathNames vmOn);
+                  }
+                  ''
+                    [ "$offBindPaths" = "[]" ] || { echo "vm.enable=false must leave BindPaths empty, got: $offBindPaths" >&2; exit 1; }
+                    [ "$offSuppGroups" = "[]" ] || { echo "vm.enable=false must leave SupplementaryGroups empty, got: $offSuppGroups" >&2; exit 1; }
+                    [ "$offDeviceAllow" = "[]" ] || { echo "vm.enable=false must leave DeviceAllow empty, got: $offDeviceAllow" >&2; exit 1; }
+                    case "$offRestrictAF" in
+                      *AF_VSOCK*) echo "vm.enable=false must not add AF_VSOCK, got: $offRestrictAF" >&2; exit 1 ;;
+                    esac
+                    for pkg in qemu nix virtiofsd git; do
+                      case "$offPath" in
+                        *"\"$pkg\""*) echo "vm.enable=false must not put $pkg on PATH, got: $offPath" >&2; exit 1 ;;
+                      esac
+                    done
+                    case "$onBindPaths" in
+                      *"/dev/kvm"*"-/dev/vhost-vsock"*) ;;
+                      *) echo "vm.enable=true must bind /dev/kvm and -/dev/vhost-vsock, got: $onBindPaths" >&2; exit 1 ;;
+                    esac
+                    [ "$onSuppGroups" = '["kvm"]' ] || { echo "vm.enable=true must add the kvm group, got: $onSuppGroups" >&2; exit 1; }
+                    case "$onDeviceAllow" in
+                      *"/dev/kvm rw"*"/dev/vhost-vsock rw"*) ;;
+                      *) echo "vm.enable=true must allow /dev/kvm and /dev/vhost-vsock through the cgroup device policy (PrivateDevices implies DevicePolicy=closed), got: $onDeviceAllow" >&2; exit 1 ;;
+                    esac
+                    case "$onRestrictAF" in
+                      *AF_VSOCK*) ;;
+                      *) echo "vm.enable=true must add AF_VSOCK, got: $onRestrictAF" >&2; exit 1 ;;
+                    esac
+                    for pkg in qemu nix virtiofsd git; do
+                      case "$onPath" in
+                        *"\"$pkg\""*) ;;
+                        *) echo "vm.enable=true must put $pkg on PATH, got: $onPath" >&2; exit 1 ;;
+                      esac
+                    done
+                    mkdir -p "$out"
+                    echo ok > "$out/result"
+                  '';
+            }
           );
 
           # Built with covCraneLib so the toolchain on PATH carries
