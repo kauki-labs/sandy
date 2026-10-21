@@ -9,6 +9,14 @@
     treefmt-nix.url = "github:numtide/treefmt-nix";
     flake-root.url = "github:srid/flake-root";
     pre-commit.url = "github:cachix/git-hooks.nix";
+    # The guest-composition module (#324, `lib.mkGuest`/`lib.mkTopology`) needs
+    # this to build the microVM; `nix/guest/flake.nix` pins its own copy
+    # independently, so the two lockfiles can drift without either breaking.
+    # `nix/lib/guest.nix` itself must stay compatible with whichever of the
+    # two pins calls it — the `lib-guest-eval` check below evaluates it
+    # against THIS flake's pin, and `nix/guest/flake.nix`'s own checks
+    # exercise it against that nested flake's pin.
+    microvm.url = "github:microvm-nix/microvm.nix";
     # Pinned for the `audit` check (CF-L-2): `cargo audit -d <path>` reads the
     # advisory TOML files directly, no git metadata needed, so the plain
     # tarball fetch is enough and the sandboxed build needs no network fetch
@@ -22,6 +30,7 @@
     rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
     treefmt-nix.inputs.nixpkgs.follows = "nixpkgs";
     pre-commit.inputs.nixpkgs.follows = "nixpkgs";
+    microvm.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs =
@@ -52,6 +61,14 @@
           sandy-host-executor = import ./nix/overlays/sandy-host-executor.nix;
         };
         nixosModules.sandy-executor = import ./nix/modules/sandy-executor.nix;
+        # The reusable guest-composition module (#324): `lib.mkGuest`/
+        # `lib.mkTopology`, standalone same as the overlays above — a
+        # consumer builds a `Topology` without evaluating this flake's
+        # perSystem. `nix/guest/flake.nix` is this module's other caller
+        # (its own qemu/vfkit guests), so the wiring has one definition.
+        lib = import ./nix/lib/guest.nix {
+          inherit (inputs) nixpkgs microvm;
+        };
       };
       perSystem =
         {
@@ -239,6 +256,65 @@
           # set rather than fail evaluation there.
           // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
             sandy-executor-vm = import ./nix/tests/sandy-executor-vm.nix { inherit pkgs; };
+          }
+          # Eval-only proof that the exported `lib.mkGuest`/`lib.mkTopology`
+          # (#324) actually produce a complete `Topology` for BOTH hypervisor
+          # legs, with no `extraModules` beyond what the module itself
+          # carries — the same shape nix/guest/flake.nix's own qemuGuest/
+          # vfkitGuest build on, proving the standalone export didn't drop
+          # anything they silently relied on.
+          #
+          # CAUTION: `builtins.toJSON` alone is NOT eval-only here. The
+          # resulting string still carries Nix's dependency "context" (each
+          # embedded store path, e.g. the kernel/initrd/erofs image, is
+          # recorded as a build input) — assigning that string to a real
+          # derivation's environment forces Nix to REALIZE every one of
+          # those paths before the derivation can build at all, which means
+          # compiling a full guest system (confirmed the hard way: an
+          # earlier version of this check pulled in 157 derivations,
+          # including a complete x86_64-linux NixOS closure, kernel, initrd,
+          # and erofs image, needing a real x86_64-linux builder — exactly
+          # what this check exists to avoid).
+          # `builtins.unsafeDiscardStringContext` strips that dependency
+          # edge, keeping only the plain path string: Nix can always COMPUTE
+          # a derivation's own output path from its inputs without building
+          # it, so the check genuinely never compiles a guest artifact or
+          # starts a hypervisor. Gated to one system (x86_64-linux): the
+          # result doesn't depend on which system evaluates it, so running
+          # it once is enough; `inputs.nixpkgs.legacyPackages.aarch64-darwin`
+          # is itself an eval, not a build, so pulling it in from a Linux
+          # runner for vfkit's `vmHostPackages` is fine here.
+          // lib.optionalAttrs (system == "x86_64-linux") {
+            lib-guest-eval =
+              pkgs.runCommand "lib-guest-eval"
+                {
+                  qemuTopology = builtins.unsafeDiscardStringContext (
+                    builtins.toJSON (
+                      inputs.self.lib.mkTopology (
+                        inputs.self.lib.mkGuest {
+                          system = "x86_64-linux";
+                          hypervisor = "qemu";
+                        }
+                      )
+                    )
+                  );
+                  vfkitTopology = builtins.unsafeDiscardStringContext (
+                    builtins.toJSON (
+                      inputs.self.lib.mkTopology (
+                        inputs.self.lib.mkGuest {
+                          system = "aarch64-linux";
+                          hypervisor = "vfkit";
+                          vmHostPackages = inputs.nixpkgs.legacyPackages.aarch64-darwin;
+                        }
+                      )
+                    )
+                  );
+                }
+                ''
+                  mkdir -p "$out"
+                  printf '%s' "$qemuTopology" > "$out/qemu-topology.json"
+                  printf '%s' "$vfkitTopology" > "$out/vfkit-topology.json"
+                '';
           };
 
           # Built with covCraneLib so the toolchain on PATH carries
