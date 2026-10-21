@@ -446,8 +446,23 @@ fn run_nix(args: &[&str], deadline: Option<std::time::Instant>) -> std::io::Resu
 fn run_with_deadline(mut command: Command, deadline: Option<std::time::Instant>) -> std::io::Result<Output> {
     use std::{io::Read as _, os::unix::process::CommandExt as _, process::Stdio};
 
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    command.process_group(0);
+    // `Stdio::null()` for stdin, always: `Command::output()` (what this
+    // replaces) defaults stdin to null, and a nix child silently inheriting
+    // this process's own stdin could block waiting for input that will
+    // never come, in the unbounded (`deadline: None`) local-run case where
+    // nothing enforces a timeout to kill it. `process_group(0)` only when a
+    // deadline is actually in play (CodeRabbit on this PR): it's the kill
+    // path's own mechanism (the whole group, not just the direct child, so a
+    // nix subprocess's own children are also reaped on expiry) and has no
+    // reason to run for `sandy run --flake`'s unbounded local path, which
+    // never calls the kill branch below at all.
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if deadline.is_some() {
+        command.process_group(0);
+    }
     let mut child = command.spawn()?;
 
     // `child.stdout`/`child.stderr` are only ever `None` if a caller already

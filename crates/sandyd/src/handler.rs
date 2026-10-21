@@ -239,15 +239,30 @@ pub async fn handle(
             // that can never run, with no distinct status a caller could
             // ever notice (item 5's "never silently" bar).
             let required_sandbox_kind = required_sandbox_kind_for(&submit.manifest_encoding);
-            let placeable = forward_back_addr.is_some()
-                && host_registry
+            // Named apart from `placeable` itself (CodeRabbit on this PR): the
+            // original message always blamed "no Vm-capable host," even when
+            // the real cause was this orchestrator's own configuration
+            // (`SANDY_MESH_AGENT_LINK_LISTEN` unset, so `forward_back_addr` is
+            // `None` and no remote placement is reachable at all, regardless
+            // of what's registered) — an operator misreads that as "go
+            // register a host" when the actual fix is on this box.
+            let placeable = if forward_back_addr.is_none() {
+                false
+            } else {
+                host_registry
                     .pick_host_for(STAGE1_REQUIRED_ISOLATION_CLASS.into(), required_sandbox_kind.into())
-                    .is_some();
+                    .is_some()
+            };
             if let Some(control_error) = vm_placement_error(
                 required_sandbox_kind,
                 placeable,
-                "no registered host declares SandboxKind::Vm capability; a flake-templated job cannot be placed (this \
-                 daemon has no local VM execution path)",
+                if forward_back_addr.is_none() {
+                    "this orchestrator has no agent-link listen address configured (SANDY_MESH_AGENT_LINK_LISTEN is \
+                     unset) — no remote placement is reachable at all, regardless of what hosts are registered"
+                } else {
+                    "no registered host declares SandboxKind::Vm capability; a flake-templated job cannot be placed \
+                     (this daemon has no local VM execution path)"
+                },
             ) {
                 return Ok(ControlResponse {
                     request_id: request.request_id,
@@ -2172,7 +2187,12 @@ mod tests {
         .await?;
         match response.result {
             Some(control_response::Result::Error(ControlError { message })) => {
-                assert!(message.contains("Vm"), "got {message:?}");
+                // CodeRabbit on this PR: this is specifically the
+                // forward_back-unconfigured case, not the no-Vm-host case —
+                // the message must name THIS orchestrator's own missing
+                // config, not point the operator at registering a host that
+                // wouldn't help.
+                assert!(message.contains("SANDY_MESH_AGENT_LINK_LISTEN"), "got {message:?}");
             }
             other => anyhow::bail!("expected a refusal, got {other:?}"),
         }
