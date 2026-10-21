@@ -2432,7 +2432,9 @@ version = "0.1.1"
 dependencies = [
  "anyhow",
  "fs2",
+ "futures-util",
  "getrandom 0.4.3",
+ "hex",
  "rusqlite",
  "rustix",
  "sandy-conn",
@@ -2442,6 +2444,7 @@ dependencies = [
  "sandy-fabric-local",
  "sandy-fsutil",
  "sandy-orchestrator",
+ "sandy-proto",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",

@@ -147,6 +147,21 @@ pub async fn read_frame<M: prost::Message + Default>(
     Ok(Some(M::decode(buf.as_slice())?))
 }
 
+/// `sandyd`'s attach data-plane listener (#327) binds a UDS socket next to
+/// the control socket at this fixed name, so both the daemon and its CLI
+/// client derive the same path from whatever control-socket path is in
+/// effect (`$SANDY_SOCK`, or the default runtime dir) without a second env
+/// var. Kept here, not duplicated, since both sides already depend on this
+/// crate for the control-socket conventions.
+pub const ATTACH_SOCKET_NAME: &str = "sandyd-attach.sock";
+
+/// The attach data-plane socket path alongside `control_socket` (#327): same
+/// directory, fixed sibling name ([`ATTACH_SOCKET_NAME`]).
+#[must_use]
+pub fn attach_socket_path(control_socket: &std::path::Path) -> std::path::PathBuf {
+    control_socket.with_file_name(ATTACH_SOCKET_NAME)
+}
+
 #[cfg(test)]
 mod tests {
     use anyhow::Context;
@@ -303,5 +318,17 @@ mod tests {
         let result = read_frame::<ControlRequest>(&mut read_side).await;
         assert!(matches!(result, Err(FrameError::Decode(_))), "got {result:?}");
         Ok(())
+    }
+
+    /// The attach data-plane socket (#327) sits next to the control socket,
+    /// same directory, fixed sibling name — both daemon and CLI derive it
+    /// the same way from whatever control-socket path is in effect.
+    #[test]
+    fn attach_socket_path_is_a_sibling_of_the_control_socket() {
+        let control = std::path::Path::new("/run/sandy/sandyd.sock");
+        assert_eq!(
+            attach_socket_path(control),
+            std::path::Path::new("/run/sandy/sandyd-attach.sock")
+        );
     }
 }

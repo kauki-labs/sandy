@@ -1,10 +1,13 @@
 //! Dispatch one [`ControlRequest`] to a [`ControlResponse`] against the
 //! [`JobStore`] and the [`JobRegistry`] (#212, B1 + B2's dispatch slice).
 //! `Submit` persists the job AND mints its dedicated channel + caps (see
-//! [`crate::dispatch`]); `Attach` returns that real channel id + an observer
-//! cap once minted. No agent or executor wiring yet: a submitted job stays
-//! `Pending` forever, since nothing joins its channel or runs it — see
-//! `dispatch`'s module doc for why that's an honest gap, not a fake.
+//! [`crate::dispatch`]); `Attach` returns that real channel id + a cap once
+//! minted — a post-capable one when the requesting session is the one that
+//! submitted the job (#327, "my own job I can log into"), the existing
+//! observer-only `job.observer_cap` otherwise ("someone else's, I can only
+//! watch"). No agent or executor wiring yet: a submitted job stays `Pending`
+//! forever, since nothing joins its channel or runs it — see `dispatch`'s
+//! module doc for why that's an honest gap, not a fake.
 
 use std::{net::SocketAddr, sync::Arc};
 
@@ -13,7 +16,10 @@ use sandy_control_proto::{
     ListResponse, StatusResponse, SubmitResponse, control_request, control_response,
 };
 use sandy_executor_proto::{Dispatch, IsolationClass};
-use sandy_fabric::capauth::{Cap, CapCodecError, decode_cap, encode_cap};
+use sandy_fabric::{
+    capauth::{Cap, CapAuthority, CapCodecError, CapRights, CapScope, decode_cap, encode_cap},
+    types::{ChannelId, PeerId},
+};
 use sandy_orchestrator::{JobManifest, MANIFEST_ENCODING_JSON, derive_job_caps};
 use uuid::Uuid;
 
@@ -347,16 +353,13 @@ pub async fn handle(
             }
         }
         Some(control_request::Op::Attach(attach)) => match registry.get(&attach.job_id) {
-            Some(job) if cap_has_expired(&job.observer_cap) => control_response::Result::Error(ControlError {
-                message: format!(
-                    "job {}'s attach cap has expired; re-submit to get a new one",
-                    attach.job_id
-                ),
-            }),
             Some(job) => {
-                // CF-H-1: an audit trail, not a gate — see the Cancel arm
-                // above and `handle`'s own doc on `session`.
-                if !job.session_matches(session) {
+                // CF-H-1, extended by #327: still an audit trail (the log
+                // line below, never a refusal), but a mismatch now also
+                // decides which cap `Attach` hands back — "my own job I can
+                // log into, someone else's I can only watch".
+                let is_submitter = job.session_matches(session);
+                if !is_submitter {
                     tracing::info!(
                         job_id = %attach.job_id,
                         submitted_session = %job.session,
@@ -364,10 +367,45 @@ pub async fn handle(
                         "attach from a different session than the one that submitted this job"
                     );
                 }
-                control_response::Result::Attach(AttachResponse {
-                    channel_id: attach.job_id.clone(),
-                    cap: encode_cap(&job.observer_cap)?,
-                })
+                // The submitter gets a freshly minted post-capable cap, never
+                // the stored `job.agent_cap`: that cap's principal is the
+                // real in-guest/host agent, and presenting the identical cap
+                // bytes here would join as the SAME membership (membership is
+                // keyed by the cap's own proof digest, `Channel::join`) —
+                // sharing one cursor between the agent and an attaching
+                // operator instead of two independent ones. A different
+                // session still gets the existing observer-only cap minted
+                // at Submit.
+                let attach_cap = if is_submitter {
+                    registry
+                        .authority()
+                        .mint(CapScope {
+                            peer: PeerId::from("operator"),
+                            channel: ChannelId::from(attach.job_id.as_str()),
+                            rights: CapRights {
+                                post: true,
+                                read: true,
+                                invite: false,
+                            },
+                            expires_at: None,
+                        })
+                        .map_err(dispatch::DispatchError::Cap)?
+                } else {
+                    job.observer_cap.clone()
+                };
+                if cap_has_expired(&attach_cap) {
+                    control_response::Result::Error(ControlError {
+                        message: format!(
+                            "job {}'s attach cap has expired; re-submit to get a new one",
+                            attach.job_id
+                        ),
+                    })
+                } else {
+                    control_response::Result::Attach(AttachResponse {
+                        channel_id: attach.job_id.clone(),
+                        cap: encode_cap(&attach_cap)?,
+                    })
+                }
             }
             None => {
                 // No live channel for this id. Distinguish "never existed"
@@ -652,6 +690,83 @@ mod tests {
             Some(control_response::Result::Attach(AttachResponse { channel_id, cap })) => {
                 assert_eq!(channel_id, job_id);
                 decode_cap(&cap).context("the attach cap must decode")?;
+            }
+            other => anyhow::bail!("expected an Attach response, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// Positive (#327): `Attach` from the SAME session that submitted the job
+    /// gets a post-capable cap back — "my own job, I can log into".
+    #[tokio::test]
+    async fn attach_from_the_submitting_session_gets_a_post_capable_cap() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let session = Uuid::new_v4();
+        let submitted = handle(&store, &registry, &host_registry, None, session, submit_req(1)).await?;
+        let job_id = match submitted.result {
+            Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
+            other => anyhow::bail!("expected a Submit response, got {other:?}"),
+        };
+
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            None,
+            session,
+            req(2, control_request::Op::Attach(AttachRequest { job_id })),
+        )
+        .await?;
+        match response.result {
+            Some(control_response::Result::Attach(AttachResponse { cap, .. })) => {
+                let decoded = decode_cap(&cap).context("the attach cap must decode")?;
+                let rights = decoded.scope().rights;
+                assert!(
+                    rights.post,
+                    "the submitter's own attach must be post-capable, got {rights:?}"
+                );
+                assert!(
+                    rights.read,
+                    "the submitter's own attach must still be read-capable, got {rights:?}"
+                );
+            }
+            other => anyhow::bail!("expected an Attach response, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// Adversarial (#327): `Attach` from a DIFFERENT session than the one
+    /// that submitted the job gets the existing observer-only cap back — read
+    /// succeeds, post would be refused (proven at the channel level by
+    /// `dispatch::tests::the_observer_cap_cannot_post`) — "someone else's job,
+    /// I can only watch".
+    #[tokio::test]
+    async fn attach_from_a_different_session_gets_observer_rights_only() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let submitted = handle(&store, &registry, &host_registry, None, Uuid::new_v4(), submit_req(1)).await?;
+        let job_id = match submitted.result {
+            Some(control_response::Result::Submit(SubmitResponse { job_id })) => job_id,
+            other => anyhow::bail!("expected a Submit response, got {other:?}"),
+        };
+
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            None,
+            Uuid::new_v4(), // a different session than the one that submitted
+            req(2, control_request::Op::Attach(AttachRequest { job_id })),
+        )
+        .await?;
+        match response.result {
+            Some(control_response::Result::Attach(AttachResponse { cap, .. })) => {
+                let decoded = decode_cap(&cap).context("the attach cap must decode")?;
+                assert_eq!(
+                    decoded.scope().rights,
+                    read_only(),
+                    "a cross-session attach must be observer-only (read, no post), got {:?}",
+                    decoded.scope().rights
+                );
             }
             other => anyhow::bail!("expected an Attach response, got {other:?}"),
         }

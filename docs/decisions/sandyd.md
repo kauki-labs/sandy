@@ -2,7 +2,7 @@
 title: "Decisions: sandyd control plane"
 status: accepted
 project: sandy
-updated: 2026-10-19
+updated: 2026-10-21
 ---
 
 # Decisions: sandyd control plane
@@ -939,3 +939,81 @@ shared read/write deadline covering every `write_frame` call in
 `host_conn.rs` (including the pre-registration refusals): deferred along
 with those three writes themselves, since they carry no live registry state
 to strand.
+
+## 13. A separate UDS listener redeems `Attach`'s cap for the interactive data plane (#327)
+
+**Status:** accepted.
+
+**Context.** #327 needed `sandy daemon attach` to become a real terminal
+bridge (post stdin, deliver stdout/stderr) instead of a one-shot cap
+printout. Decision 1 above explicitly set aside streaming `Attach` over the
+control connection itself — the first draft of this work did exactly that
+(reusing the control connection's own stream once `Attach` succeeded) before
+this record was re-read; reverted once the conflict was caught, not shipped.
+Decision 1's own "the caller subscribes on the data plane itself" assumed a
+path into a job's `Channel` that a local cap-holding client could actually
+reach — none existed: the only external entry point, the mesh agent-link
+listener (decision 6, `mesh_accept.rs`), is token-bound to one registered
+executor's peer IP, not reachable by an arbitrary local `Attach` caller.
+#327 is what builds the path decision 1 anticipated, not a retrofit of the
+control RPC.
+
+**Decision.** `sandyd` binds a second UDS socket, a fixed sibling of the
+control socket (`sandy_control_proto::attach_socket_path`, same directory,
+name `sandyd-attach.sock` — derived, not a second env var, so every existing
+per-test `$SANDY_SOCK` tempdir gets a colocated attach socket for free).
+`attach_relay::serve_attach_accept_loop` accepts connections there; each
+presents its cap as the first frame (`sandy_fabric_local::link`'s
+`LinkFrame::Join` — the SAME wire type and codec the real sandbox agent's own
+link already uses, not a bespoke protocol) before anything is written back,
+mirroring `mesh_accept`'s "zero bytes before auth" discipline. The job a
+cap belongs to is read from the cap's own (still-unverified) `scope().channel`
+as a routing hint only — `Channel::join` is the actual verification (a
+forged or cross-job cap still fails there, `WrongChannel`/`Forged`/`Expired`,
+same as every other seam). Once joined, `Post`/`Deliver` carry `TTY_STDIN`
+in and `TTY_STDOUT`/`TTY_STDERR` out; an observer-only cap's `Post` is
+answered `Refused` (not silently dropped) rather than ending the session, so
+#327's one new behavioral fork — "read succeeds, post is refused" — is
+observable on the wire, not just inferred.
+
+A cap minted for the submitter's own session (`handler::handle`'s `Attach`
+arm, #327's other half) is freshly minted per attach, not the job's stored
+`agent_cap`: presenting that cap's identical bytes would join as the SAME
+membership the real sandbox agent already holds (membership keys off a cap's
+proof digest), sharing one cursor between the agent and an attaching
+operator instead of two independent ones.
+
+**Consequences.** The control RPC (decision 1) is untouched: still pure
+request/response, one call per `Attach`, no streaming state added to
+`serve_connection`. Re-attaching is a fresh connection to the attach socket
+presenting a fresh cap (from a fresh control-RPC `Attach` call) — there is no
+session continuity to preserve across detach/reattach at the connection
+level, because there is no shared connection; the cap alone decides rights,
+re-derived every time from `handler::handle`'s own session check. This is a
+genuine, honest limitation, not glossed over: CF-H-1's `session` is scoped
+per CONTROL connection (`serve_connection` mints one per accept), so a
+submitter re-attaching from a separate `sandy daemon attach` invocation (the
+realistic "log back into my own job from a new terminal" case) opens a NEW
+control connection, gets a NEW session, and is indistinguishable from any
+other attacher — observer-only, not post-capable, even though it's the same
+operator who submitted the job. Closing this for real needs a durable,
+re-presentable per-job credential (e.g. a token `Submit` hands back
+alongside the job id, kept by the CLI and re-presented at `Attach`), which is
+a new piece of state this record does not build — tracked as a follow-up, not
+solved here. Every re-attach (same cap or a fresh one — doesn't matter,
+`Channel::leave` on the prior session reset its cursor) also replays the
+job's FULL TTY history from sequence 0, not just new output since the
+detach: a known, accepted consequence of joining fresh each time rather than
+resuming a persisted cursor, worth fixing if replay noise becomes a real
+annoyance, not blocking for this PR.
+
+**Set aside.** Streaming `Attach`'s response directly over the control
+connection (decision 1's own set-aside, re-confirmed here after briefly
+re-proposing it by accident): would need the control RPC to support
+long-lived streaming calls for no benefit decision 1 didn't already weigh.
+A new env var for the attach socket's path: derived from the control
+socket's own path instead, so the two can never silently drift apart and no
+test/deployment has to set a second variable. Persisting a connection (or a
+token) across detach/reattach to preserve post rights for the real
+submitter: the right eventual fix for the limitation above, but a new piece
+of durable state this PR does not introduce — tracked, not built here.

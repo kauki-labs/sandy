@@ -55,10 +55,13 @@ pub struct JobChannel {
     /// membership). Handed to the agent over its link once dispatch wires
     /// `ProcessBackend::with_agent` up; held here in the meantime.
     pub agent_cap: Cap,
-    /// The cap `Attach` hands to an observing client: read-only, no `post` —
-    /// an attached client watches the job's TTY, it does not drive its stdin
-    /// through this cap. A caller wanting to drive input needs a `post`-
-    /// capable cap, deliberately not what `Attach` alone grants.
+    /// The cap `Attach` hands to a client attaching from a DIFFERENT session
+    /// than the one that submitted this job: read-only, no `post` — it
+    /// watches the job's TTY, it does not drive its stdin through this cap.
+    /// `handler::handle`'s `Attach` arm mints a separate, post-capable cap on
+    /// the fly for the submitting session itself instead of handing out this
+    /// one (#327) — "my own job I can log into, someone else's I can only
+    /// watch".
     pub observer_cap: Cap,
     /// This run's binding to a remote executor (#212 decision 6), if it has
     /// one. `None` for a job dispatched locally, which has no mesh stream to
