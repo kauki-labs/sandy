@@ -558,7 +558,16 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
             })
         }
         DaemonOp::Cancel { job_id } => control_request::Op::Cancel(CancelRequest { job_id }),
-        DaemonOp::Attach { job_id } => control_request::Op::Attach(AttachRequest { job_id }),
+        DaemonOp::Attach { job_id } => {
+            // #327: present the durable token `daemon submit` persisted for
+            // this job, if any — proves "I'm the submitter" even though this
+            // is necessarily a fresh connection/session (a separate CLI
+            // invocation). `None` (no file, or any read failure) just falls
+            // back to `session_matches` server-side, same as before this
+            // existed.
+            let attach_token = sandy_cli::attach::read_attach_token(&job_id);
+            control_request::Op::Attach(AttachRequest { job_id, attach_token })
+        }
         DaemonOp::Status { job_id } => control_request::Op::Status(StatusRequest { job_id }),
         DaemonOp::List => control_request::Op::List(ListRequest {}),
     };
@@ -572,7 +581,14 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
     };
 
     match response.result {
-        Some(control_response::Result::Submit(r)) => succeed_or(emit(format_submit(&r, output))),
+        Some(control_response::Result::Submit(r)) => {
+            // #327: persisted so a LATER, separate `daemon attach`
+            // invocation can present it and still get post rights — see
+            // `attach::persist_attach_token`'s own doc for the fallback
+            // behavior on any failure here.
+            sandy_cli::attach::persist_attach_token(&r.job_id, &r.attach_token);
+            succeed_or(emit(format_submit(&r, output)))
+        }
         Some(control_response::Result::Cancel(_)) => {
             succeed_or(emit(format_cancel(cancel_echo.as_deref().unwrap_or("?"), output)))
         }

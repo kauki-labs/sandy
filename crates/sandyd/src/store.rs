@@ -211,6 +211,12 @@ impl JobStore {
             "console",
             "ALTER TABLE jobs ADD COLUMN console TEXT NOT NULL DEFAULT ''",
         )?;
+        // The durable attach credential (#327): NULL for a job submitted
+        // before this record existed, or one `set_attach_token` was never
+        // called for (a narrow crash window right after `insert_pending`) —
+        // both degrade to the existing per-connection `session_matches`
+        // gate for that one job, never a fabricated or default token.
+        ensure_column(&conn, "attach_token", "ALTER TABLE jobs ADD COLUMN attach_token BLOB")?;
         Ok(Self {
             conn: Mutex::new(conn),
             max_rows: None,
@@ -265,6 +271,41 @@ impl JobStore {
             ),
         )?;
         Ok(InsertOutcome::Inserted)
+    }
+
+    /// Record `token` as `job_id`'s durable attach credential (#327): a
+    /// bearer value a LATER `Attach` call can present to prove "I'm the one
+    /// who submitted this job" even from a fresh connection — unlike CF-H-1's
+    /// `session`, which is scoped to one connection and so never recognizes a
+    /// separate `sandy daemon attach` invocation as the same submitter.
+    /// Called once, right after a successful [`JobStore::insert_pending`] for
+    /// the same `job_id` — a separate call rather than folding into the
+    /// insert itself, so this store's existing callers/tests are unaffected.
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] if the write fails.
+    pub fn set_attach_token(&self, job_id: &str, token: &[u8]) -> Result<(), StoreError> {
+        self.lock()
+            .execute("UPDATE jobs SET attach_token = ?1 WHERE job_id = ?2", (token, job_id))?;
+        Ok(())
+    }
+
+    /// `job_id`'s durable attach token (#327), if one was recorded. `None`
+    /// for an unknown job id, one submitted before this record existed, or
+    /// one [`JobStore::set_attach_token`] was never called for.
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] if the read fails.
+    pub fn attach_token(&self, job_id: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        match self
+            .lock()
+            .query_row("SELECT attach_token FROM jobs WHERE job_id = ?1", [job_id], |row| {
+                row.get::<_, Option<Vec<u8>>>(0)
+            }) {
+            Ok(token) => Ok(token),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// The status of `job_id`, or `None` if no such job exists.
@@ -479,6 +520,39 @@ mod tests {
     fn status_of_an_unknown_job_is_none_not_an_error() -> Result<(), StoreError> {
         let store = JobStore::open_in_memory()?;
         assert_eq!(store.status("does-not-exist")?, None);
+        Ok(())
+    }
+
+    /// Positive (#327): a token set after insert round-trips back for the
+    /// same job id.
+    #[test]
+    fn an_attach_token_round_trips() -> Result<(), StoreError> {
+        let store = JobStore::open_in_memory()?;
+        store.insert_pending("job-1", b"manifest-bytes", "test/v1")?;
+        store.set_attach_token("job-1", b"a-token-worth-of-bytes")?;
+
+        assert_eq!(store.attach_token("job-1")?, Some(b"a-token-worth-of-bytes".to_vec()));
+        Ok(())
+    }
+
+    /// Adversarial (#327): a job that was never given a token (the narrow
+    /// crash window between `insert_pending` and `set_attach_token`, or a row
+    /// from before this column existed) reads back `None`, never a
+    /// fabricated or empty-but-present token.
+    #[test]
+    fn a_job_with_no_attach_token_set_reads_back_none() -> Result<(), StoreError> {
+        let store = JobStore::open_in_memory()?;
+        store.insert_pending("job-1", b"manifest-bytes", "test/v1")?;
+        assert_eq!(store.attach_token("job-1")?, None);
+        Ok(())
+    }
+
+    /// Adversarial (#327): an unknown job id reads back `None`, not an error
+    /// — mirrors `status_of_an_unknown_job_is_none_not_an_error`.
+    #[test]
+    fn attach_token_of_an_unknown_job_is_none_not_an_error() -> Result<(), StoreError> {
+        let store = JobStore::open_in_memory()?;
+        assert_eq!(store.attach_token("does-not-exist")?, None);
         Ok(())
     }
 

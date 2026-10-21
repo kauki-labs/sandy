@@ -110,7 +110,7 @@ mod tests {
         .await?;
         let response: ControlResponse = read_frame(&mut client).await?.context("expected a Submit response")?;
         let job_id = match response.result {
-            Some(control_response::Result::Submit(sandy_control_proto::SubmitResponse { job_id })) => job_id,
+            Some(control_response::Result::Submit(sandy_control_proto::SubmitResponse { job_id, .. })) => job_id,
             other => anyhow::bail!("expected Submit, got {other:?}"),
         };
 

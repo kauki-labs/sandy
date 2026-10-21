@@ -416,6 +416,7 @@ mod tests {
     fn submit_json_carries_the_assigned_job_id() -> anyhow::Result<()> {
         let response = SubmitResponse {
             job_id: "job-a".to_string(),
+            attach_token: Vec::new(),
         };
         let json = format_submit(&response, OutputFormat::Json).context("format submit json")?;
         let parsed: serde_json::Value = serde_json::from_str(&json).context("parse submit json")?;
@@ -427,6 +428,7 @@ mod tests {
     fn submit_plain_names_the_job_id() -> anyhow::Result<()> {
         let response = SubmitResponse {
             job_id: "job-a".to_string(),
+            attach_token: Vec::new(),
         };
         let plain = format_submit(&response, OutputFormat::Plain).context("format submit plain")?;
         assert!(plain.contains("job-a"), "plain must name the job id: {plain}");

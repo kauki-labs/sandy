@@ -11,11 +11,13 @@
 //!
 //! Detaching never touches the job itself: it only closes this attach
 //! connection. Re-attaching later is a fresh `sandy daemon attach` invocation
-//! — a fresh control-RPC `Attach` call (a new CF-H-1 session) redeeming a
-//! fresh cap on a fresh attach connection. #327's known limitation (see the
-//! PR's design notes): only the ORIGINAL submitting connection's own session
-//! gets a post-capable cap — a later invocation, even by the same operator,
-//! is a different session and gets observer-only rights.
+//! — a fresh control-RPC `Attach` call, a fresh CF-H-1 session — but it still
+//! gets a post-capable cap for the original submitter: `daemon submit`
+//! persists the durable `attach_token` `Submit` hands back
+//! ([`persist_attach_token`]), keyed by job id, under the same staging base
+//! `$SANDY_SOCK`'s own directory lives in; `daemon attach` reads it back
+//! ([`read_attach_token`]) and presents it, which `Attach`'s handler checks
+//! independently of (in addition to) the per-connection `session_matches`.
 
 use std::io::IsTerminal as _;
 
@@ -27,6 +29,54 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 
 /// The largest chunk read from local stdin per posted frame.
 const STDIN_CHUNK: usize = 4096;
+
+/// The owned, `0700` directory every job's durable attach token is staged
+/// under (#327) — a sibling of `sandyd`'s own owned subdir, same validated
+/// staging base (`sandy_fsutil::ensure_sandy_staging_base`) the control
+/// socket's default path already lives under, never inside `sandyd`'s own
+/// directory (a different owner's state, kept separate).
+const ATTACH_TOKEN_DIR_NAME: &str = "sandy-cli-attach-tokens";
+
+/// Persist `token` (`SubmitResponse.attach_token`) for `job_id` (#327), so a
+/// LATER, separate `sandy daemon attach` invocation can read it back and
+/// present it — the durable credential that survives this process exiting,
+/// unlike CF-H-1's per-connection `session`. A no-op if `token` is empty
+/// (the daemon's own best-effort RNG/store-write fallback — see
+/// `handler::handle`'s Submit arm — already means this job has no durable
+/// token; nothing to persist).
+///
+/// Best-effort: a failure here is logged to stderr, never fails the Submit
+/// itself — the job already submitted successfully; losing the convenience
+/// of a later post-capable re-attach is not a reason to report the whole
+/// command as failed.
+pub fn persist_attach_token(job_id: &str, token: &[u8]) {
+    if token.is_empty() {
+        return;
+    }
+    if let Err(e) = try_persist_attach_token(job_id, token) {
+        eprintln!("sandy: could not persist the attach token for job {job_id}: {e}");
+    }
+}
+
+fn try_persist_attach_token(job_id: &str, token: &[u8]) -> Result<(), sandy_fsutil::FsError> {
+    let base = sandy_fsutil::ensure_sandy_staging_base()?;
+    let dir = sandy_fsutil::OwnedDir::open_or_create(&base.join(ATTACH_TOKEN_DIR_NAME))?;
+    dir.write_secret(job_id, token)?;
+    Ok(())
+}
+
+/// Read back `job_id`'s durable attach token, if [`persist_attach_token`]
+/// ever wrote one. `None` on ANY failure (missing file, a tampered/unsafe
+/// directory, an unreadable staging base) — never an error that would block
+/// `daemon attach` itself; the caller falls back to presenting no token,
+/// which `Attach`'s handler already treats as "fall back to
+/// `session_matches`" rather than a hard refusal.
+#[must_use]
+pub fn read_attach_token(job_id: &str) -> Option<Vec<u8>> {
+    let base = sandy_fsutil::ensure_sandy_staging_base().ok()?;
+    let dir = sandy_fsutil::OwnedDir::open(&base.join(ATTACH_TOKEN_DIR_NAME)).ok()?;
+    std::fs::read(dir.path().join(job_id)).ok()
+}
 
 /// Ctrl-D's raw-mode byte (ASCII EOT, `0x04`) — the local terminal's own
 /// detach gesture. Under [`RawMode`] (canonical-mode EOF handling disabled),
@@ -241,4 +291,58 @@ pub fn spawn_status_watch(
         }
     });
     rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A job id unique enough that two test runs (even concurrent ones on
+    /// the same machine, since this touches the real shared staging base —
+    /// there is no override hook for it) never collide, and distinctive
+    /// enough to spot if it ever leaked into a real deployment's directory.
+    fn test_job_id(case: &str) -> String {
+        format!("sandy-cli-attach-test-{case}-{}", uuid::Uuid::new_v4())
+    }
+
+    /// Removes this test's own token file so a run never leaves state behind
+    /// in the real shared staging base.
+    struct CleanupToken(String);
+    impl Drop for CleanupToken {
+        fn drop(&mut self) {
+            if let Ok(base) = sandy_fsutil::ensure_sandy_staging_base() {
+                let _ = std::fs::remove_file(base.join(ATTACH_TOKEN_DIR_NAME).join(&self.0));
+            }
+        }
+    }
+
+    #[test]
+    fn a_persisted_attach_token_round_trips() {
+        let job_id = test_job_id("round-trip");
+        let _cleanup = CleanupToken(job_id.clone());
+        let token = b"a-token-worth-of-bytes".to_vec();
+
+        persist_attach_token(&job_id, &token);
+
+        assert_eq!(read_attach_token(&job_id), Some(token));
+    }
+
+    /// Adversarial: a job id with no persisted token reads back `None`, not
+    /// an error or a fabricated empty token.
+    #[test]
+    fn an_unpersisted_job_id_reads_back_none() {
+        let job_id = test_job_id("never-persisted");
+        assert_eq!(read_attach_token(&job_id), None);
+    }
+
+    /// `persist_attach_token` is a no-op for an empty token (the daemon's own
+    /// best-effort RNG/store-write fallback) — never writes an empty file a
+    /// later read could confuse with "no token at all" being handled some
+    /// other way.
+    #[test]
+    fn persisting_an_empty_token_is_a_no_op() {
+        let job_id = test_job_id("empty-token");
+        persist_attach_token(&job_id, &[]);
+        assert_eq!(read_attach_token(&job_id), None);
+    }
 }

@@ -940,7 +940,7 @@ shared read/write deadline covering every `write_frame` call in
 with those three writes themselves, since they carry no live registry state
 to strand.
 
-## 13. A separate UDS listener redeems `Attach`'s cap for the interactive data plane (#327)
+## 17. A separate UDS listener redeems `Attach`'s cap for the interactive data plane; a durable per-job token closes the cross-process reattach gap (#327)
 
 **Status:** accepted.
 
@@ -983,37 +983,90 @@ membership the real sandbox agent already holds (membership keys off a cap's
 proof digest), sharing one cursor between the agent and an attaching
 operator instead of two independent ones.
 
-**Consequences.** The control RPC (decision 1) is untouched: still pure
-request/response, one call per `Attach`, no streaming state added to
-`serve_connection`. Re-attaching is a fresh connection to the attach socket
-presenting a fresh cap (from a fresh control-RPC `Attach` call) — there is no
-session continuity to preserve across detach/reattach at the connection
-level, because there is no shared connection; the cap alone decides rights,
-re-derived every time from `handler::handle`'s own session check. This is a
-genuine, honest limitation, not glossed over: CF-H-1's `session` is scoped
-per CONTROL connection (`serve_connection` mints one per accept), so a
-submitter re-attaching from a separate `sandy daemon attach` invocation (the
-realistic "log back into my own job from a new terminal" case) opens a NEW
-control connection, gets a NEW session, and is indistinguishable from any
-other attacher — observer-only, not post-capable, even though it's the same
-operator who submitted the job. Closing this for real needs a durable,
-re-presentable per-job credential (e.g. a token `Submit` hands back
-alongside the job id, kept by the CLI and re-presented at `Attach`), which is
-a new piece of state this record does not build — tracked as a follow-up, not
-solved here. Every re-attach (same cap or a fresh one — doesn't matter,
+**Consequences (data plane).** The control RPC (decision 1) is untouched:
+still pure request/response, one call per `Attach`, no streaming state added
+to `serve_connection`. Re-attaching is a fresh connection to the attach
+socket presenting a fresh cap — there is no session continuity to preserve
+across detach/reattach at the connection level, because there is no shared
+connection. Every re-attach (same cap or a fresh one — doesn't matter,
 `Channel::leave` on the prior session reset its cursor) also replays the
 job's FULL TTY history from sequence 0, not just new output since the
 detach: a known, accepted consequence of joining fresh each time rather than
 resuming a persisted cursor, worth fixing if replay noise becomes a real
 annoyance, not blocking for this PR.
 
+**The cross-process reattach gap, closed.** The cap alone decides rights,
+and the FIRST version of this record derived that cap from `handler::handle`'s
+`session_matches` check alone — CF-H-1's `session` is scoped per CONTROL
+connection (`serve_connection` mints one per accept), so a submitter
+re-attaching from a separate `sandy daemon attach` invocation (the realistic,
+primary case this issue describes — "log back into my own job from a new
+terminal" — not an edge case) opened a NEW control connection, got a NEW
+session, and was indistinguishable from any other attacher: observer-only,
+never post-capable, even though it was the same operator who submitted the
+job. Shipping that as a documented limitation was wrong for the issue's own
+primary acceptance case, flagged on review, and fixed in the same PR:
+
+- **A durable, re-presentable `attach_token`, independent of session.**
+  `Submit` mints 32 random bytes (`handler::handle`'s Submit arm,
+  `getrandom::fill`) alongside the job's channel/caps, returns them on
+  `SubmitResponse.attach_token`, and persists them in the job's own durable
+  sqlite row (`JobStore::set_attach_token`/`attach_token`, a nullable
+  `attach_token BLOB` column) — NOT in process-local `JobRegistry` state,
+  which this file's own `Attach` handler doc already notes doesn't survive a
+  restart; the store row does.
+- **The CLI persists it client-side, keyed by job id.** `daemon submit`
+  writes it via `sandy_fsutil`'s existing `0600` secret writer
+  (`OwnedDir::write_secret`) under a sibling of `sandyd`'s own owned staging
+  subdir (`<staging base>/sandy-cli-attach-tokens/<job_id>`, same validated,
+  owned-by-this-uid base `$SANDY_SOCK`'s default path already lives under —
+  no new trust boundary introduced). `daemon attach` reads it back
+  (best-effort: any failure — missing file, unsafe directory — falls back to
+  presenting no token) and sends it on `AttachRequest.attach_token`.
+- **`Attach`'s handler checks both, additively.** `is_submitter =
+session_matches(session) || token_matches` (constant-time comparison,
+  `attach_tokens_match`, same discipline as `link_auth::LinkToken::matches`):
+  either one alone is sufficient, so the single-connection case (a test, or a
+  script that submits then immediately attaches on the same connection with
+  no token at all) is completely unaffected — this is additive, not a
+  replacement for `session_matches`.
+- **A wrong or absent token is observer-only, never refused outright** — a
+  guessed/forged token just isn't recognized, same as presenting none; there
+  is no separate "bad token" error a prober could use to distinguish "wrong
+  token" from "no token" or enumerate valid job ids.
+- **Best-effort at every step**, matching this record's own established
+  pattern for `RemoteLink::new`'s RNG-failure handling: an RNG failure
+  minting the token, a store-write failure persisting it, or a filesystem
+  failure on the CLI side all degrade that one job to session-only gating
+  (today's pre-fix behavior) rather than failing an otherwise-successful
+  `Submit` or `Attach`.
+
+Proven against a real dispatched job, not just reasoned about: the live
+acceptance (`live_attach.rs`) submits via one real `sandy daemon submit`
+process (its own connection, which then exits), waits, then runs `sandy
+daemon attach` as a SEPARATE process against the SAME job and gets a real
+round trip — typed input the attach process posts is echoed back through the
+job's own stdout — which could not pass if the attach were merely
+observer-only (the post would be silently refused, the job would never
+produce that output, and the status-watch-driven exit this test waits on
+would never fire, timing out instead). A functional-red check (temporarily
+forcing `token_match` to `false`) confirmed the test fails for exactly that
+reason under the pre-fix behavior, not for an unrelated reason.
+
 **Set aside.** Streaming `Attach`'s response directly over the control
 connection (decision 1's own set-aside, re-confirmed here after briefly
 re-proposing it by accident): would need the control RPC to support
-long-lived streaming calls for no benefit decision 1 didn't already weigh.
-A new env var for the attach socket's path: derived from the control
-socket's own path instead, so the two can never silently drift apart and no
-test/deployment has to set a second variable. Persisting a connection (or a
-token) across detach/reattach to preserve post rights for the real
-submitter: the right eventual fix for the limitation above, but a new piece
-of durable state this PR does not introduce — tracked, not built here.
+long-lived streaming calls for no benefit decision 1 didn't already weigh. A
+new env var for the attach socket's path: derived from the control socket's
+own path instead, so the two can never silently drift apart and no
+test/deployment has to set a second variable. Folding the attach token into
+`insert_pending`'s own signature (one INSERT instead of an INSERT then an
+UPDATE): would touch every existing call site/test of that method for a
+narrow, already-acceptable degradation window (a crash between the two
+leaves that one job session-only, never a security hole) — not worth the
+blast radius. Exposing `attach_token` in the CLI's JSON output
+(`format_submit`'s machine path): the cap's own JSON precedent
+(`format_attach`) does this because an automation layer needs the cap's
+bytes to join the channel itself, but nothing here asked for a non-persisted-
+file way to carry the token, and it would widen a bearer credential's
+exposure surface (stdout, logs, CI) for no requested use case — left out.
