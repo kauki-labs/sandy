@@ -78,11 +78,101 @@ pub fn read_attach_token(job_id: &str) -> Option<Vec<u8>> {
     std::fs::read(dir.path().join(job_id)).ok()
 }
 
-/// Ctrl-D's raw-mode byte (ASCII EOT, `0x04`) — the local terminal's own
-/// detach gesture. Under [`RawMode`] (canonical-mode EOF handling disabled),
-/// it arrives as a literal byte in the input stream, never as a 0-byte read;
-/// a 0-byte read is reserved for a non-tty, piped stdin reaching real EOF.
-const CTRL_D: u8 = 0x04;
+/// Writes a delivered [`ArchivePayload`] to the current directory as
+/// `<job_id>-transcript.log` and prints its path — the same user-facing
+/// shape `sandy run --out` already gives for a local job's collected
+/// outputs, sourced here from the one built-in transcript rather than a
+/// generic outputs directory (epic #340 phase 3). Best-effort: a write
+/// failure is reported but never turns an otherwise-successful attach into
+/// a failing command — the job already ran to completion.
+pub fn write_archive(job_id: &str, archive: &ArchivePayload) {
+    let path = std::path::PathBuf::from(format!("{job_id}-transcript.log"));
+    match std::fs::write(&path, &archive.bytes) {
+        Ok(()) => println!(
+            "sandy: wrote {} bytes of archived transcript ({}) to {}",
+            archive.bytes.len(),
+            archive.content_type,
+            path.display()
+        ),
+        Err(e) => eprintln!(
+            "sandy: could not write the archived transcript to {}: {e}",
+            path.display()
+        ),
+    }
+}
+
+/// The outcome of feeding one byte through [`EscapeDetector`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscapeOutcome {
+    /// Forward this byte as ordinary input.
+    Forward(u8),
+    /// A previously withheld `~` turned out not to start a real escape
+    /// (the byte after it was neither `.` nor `~`) — forward both, in order.
+    ForwardTwo(u8, u8),
+    /// A possible escape is in progress; nothing to forward yet.
+    Hold,
+    /// `~.` right after a newline: detach.
+    Detach,
+}
+
+/// SSH's own escape-sequence rule (`~.` right after a newline detaches;
+/// `~~` right after a newline forwards one literal `~`; a `~` anywhere else,
+/// or `~` not followed by `.`/`~`, is ordinary input) — needed because raw
+/// mode means Ctrl-D now reaches the guest as real EOF (shells and TUIs both
+/// rely on that), so detach can no longer be a single raw byte.
+///
+/// Session start counts as "just after a newline" (matching ssh: you can
+/// detach immediately upon attaching, before typing anything else).
+struct EscapeDetector {
+    at_line_start: bool,
+    pending_tilde: bool,
+}
+
+impl EscapeDetector {
+    fn new() -> Self {
+        Self {
+            at_line_start: true,
+            pending_tilde: false,
+        }
+    }
+
+    fn feed(&mut self, byte: u8) -> EscapeOutcome {
+        if self.pending_tilde {
+            self.pending_tilde = false;
+            return match byte {
+                b'.' => {
+                    self.at_line_start = false;
+                    EscapeOutcome::Detach
+                }
+                b'~' => {
+                    self.at_line_start = false;
+                    EscapeOutcome::Forward(b'~')
+                }
+                other => {
+                    self.at_line_start = is_line_terminator(other);
+                    EscapeOutcome::ForwardTwo(b'~', other)
+                }
+            };
+        }
+        if self.at_line_start && byte == b'~' {
+            self.pending_tilde = true;
+            self.at_line_start = false;
+            return EscapeOutcome::Hold;
+        }
+        self.at_line_start = is_line_terminator(byte);
+        EscapeOutcome::Forward(byte)
+    }
+}
+
+/// A raw-mode terminal's Enter key sends a literal `\r` (`ICRNL`, which would
+/// normally translate it to `\n`, is disabled by `make_raw()` along with the
+/// rest of raw mode) — the same CR-vs-LF distinction this whole epic started
+/// from (#340's context). The escape detector must treat either as
+/// "line start," or a real user pressing Enter before `~.` would never
+/// actually trigger detach outside of synthetic `\n`-only test input.
+fn is_line_terminator(byte: u8) -> bool {
+    byte == b'\n' || byte == b'\r'
+}
 
 /// Puts the real stdin fd into raw mode for the duration of this guard
 /// (`Drop` restores the original termios) — a no-op if stdin is not a real
@@ -177,11 +267,51 @@ where
     run_interactive_inner(read_half, write_half, status_watch, spawn_stdin_reader()).await
 }
 
-/// [`run_interactive`]'s bridge loop, taking its stdin feed as an
-/// `mpsc::Receiver` instead of reading the real terminal — so a test can
-/// drive it with synthetic chunks (`tokio::io::duplex` standing in for the
-/// connection) without a tty. Split out for exactly that reason; production
-/// code has only the one caller above.
+/// The bounded window [`drain_for_archive`] waits in, once the job's status
+/// poll reports a terminal state, for a trailing `Archive` frame that might
+/// still be in flight on the data plane.
+const ARCHIVE_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Reads further frames off `read_half` for up to [`ARCHIVE_DRAIN_BUDGET`],
+/// looking only for a trailing `LinkFrame::Archive` — called once the job's
+/// status poll already reports a terminal state, since that poll and the
+/// agent's own archive send are two independent races (CodeRabbit finding on
+/// this PR): "terminal state observed" doesn't guarantee the transcript
+/// already arrived. Stops early on a clean close or an I/O fault (nothing
+/// more to drain either way); anything other than `Archive` is ignored and
+/// does not reset the budget. Never fails `run_interactive_inner` itself —
+/// worst case, the caller just doesn't get a transcript this time.
+async fn drain_for_archive<R>(read_half: &mut R, archive: &mut Option<ArchivePayload>)
+where
+    R: AsyncRead + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + ARCHIVE_DRAIN_BUDGET;
+    while archive.is_none() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        let Ok(frame) = tokio::time::timeout(remaining, read_frame(read_half)).await else {
+            return; // drain budget exhausted
+        };
+        match frame {
+            Ok(Some(LinkFrame::Archive { content_type, payload })) => {
+                if let Ok(bytes) = hex::decode(&payload) {
+                    *archive = Some(ArchivePayload { content_type, bytes });
+                }
+                return;
+            }
+            Ok(Some(_)) => {}            // ignore anything else during the drain window
+            Ok(None) | Err(_) => return, // clean close, or a fault — nothing more to drain
+        }
+    }
+}
+
+/// [`run_interactive`]'s bridge loop, taking its stdin and resize feeds as
+/// `mpsc::Receiver`s instead of reading the real terminal/signals — so a
+/// test can drive it with synthetic chunks (`tokio::io::duplex` standing in
+/// for the connection) without a tty. Split out for exactly that reason;
+/// production code has only the one caller above.
 async fn run_interactive_inner<R, W>(
     mut read_half: R,
     write_half: W,
@@ -240,8 +370,18 @@ where
                     if let Ok(status) = status {
                         println!("sandy: job reached a terminal state ({status}); detaching");
                     }
+                    // The status poll and the agent's own Archive send are
+                    // two independent races (CodeRabbit finding on this PR)
+                    // — "terminal state observed" doesn't guarantee the
+                    // transcript already arrived on the data plane. Give it
+                    // a short bounded window before giving up on it.
+                    drain_for_archive(&mut read_half, &mut archive).await;
                     break Ok(());
                 }
+                // A manual detach ends the bridge immediately, with no
+                // archive drain: the job is still running (detaching never
+                // touches it), so there is no trailing transcript to wait
+                // for yet.
                 () = detach.notified() => break Ok(()),
             }
         } else {
@@ -433,5 +573,139 @@ mod tests {
             .context("run_interactive_inner task panicked")?;
         outcome.context("run_interactive_inner returned an error")?;
         Ok(())
+    }
+
+    /// Regression (CodeRabbit finding on this PR): the job-status poll and
+    /// the agent's own `Archive` send are two independent races — observing
+    /// a terminal state does not guarantee the transcript already arrived.
+    /// Fires the terminal-state signal FIRST, then writes the `Archive`
+    /// frame onto the connection shortly after, and asserts it still gets
+    /// captured rather than lost to an immediate break.
+    #[tokio::test]
+    async fn an_archive_arriving_shortly_after_terminal_status_is_still_captured() -> anyhow::Result<()> {
+        let (conn_read, mut conn_read_peer) = tokio::io::duplex(4096);
+        let (conn_write, _conn_write_peer) = tokio::io::duplex(4096);
+        let (_stdin_tx, stdin_rx) = tokio::sync::mpsc::channel(8);
+        let (status_tx, status_rx) = tokio::sync::oneshot::channel();
+
+        let task = tokio::spawn(run_interactive_inner(
+            conn_read,
+            conn_write,
+            Some(status_rx),
+            stdin_rx,
+            no_resize_feed(),
+        ));
+
+        status_tx
+            .send("JOB_STATUS_SUCCEEDED".to_owned())
+            .map_err(|_| anyhow::anyhow!("send status"))?;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let archive_frame = LinkFrame::Archive {
+            content_type: "text/plain".to_owned(),
+            payload: hex::encode(b"transcript bytes"),
+        };
+        write_frame(&mut conn_read_peer, &archive_frame)
+            .await
+            .context("write the archive frame")?;
+
+        let outcome = tokio::time::timeout(ARCHIVE_DRAIN_BUDGET + std::time::Duration::from_secs(1), task)
+            .await
+            .context("run_interactive_inner did not return")?
+            .context("run_interactive_inner task panicked")?
+            .context("run_interactive_inner returned an error")?;
+
+        let archive = outcome.context("expected an archive payload to have been captured")?;
+        assert_eq!(archive.bytes, b"transcript bytes");
+        assert_eq!(archive.content_type, "text/plain");
+        Ok(())
+    }
+
+    /// [`EscapeDetector`] unit tests — the state machine directly, no
+    /// bridge/tokio involved. These are the real acceptance bar for the
+    /// ssh-style escape rule (#340 phase 3's own stated requirement).
+    mod escape_detector {
+        use super::{EscapeDetector, EscapeOutcome};
+
+        /// Feeds `bytes` through a fresh detector, returning the forwarded
+        /// bytes and whether detach fired (and at which index, if so,
+        /// stopping there — matches the real stdin task's own behavior).
+        fn run(bytes: &[u8]) -> (Vec<u8>, bool) {
+            let mut detector = EscapeDetector::new();
+            let mut forwarded = Vec::new();
+            for &byte in bytes {
+                match detector.feed(byte) {
+                    EscapeOutcome::Forward(b) => forwarded.push(b),
+                    EscapeOutcome::ForwardTwo(a, b) => {
+                        forwarded.push(a);
+                        forwarded.push(b);
+                    }
+                    EscapeOutcome::Hold => {}
+                    EscapeOutcome::Detach => return (forwarded, true),
+                }
+            }
+            (forwarded, false)
+        }
+
+        #[test]
+        fn tilde_dot_at_session_start_detaches() {
+            let (forwarded, detached) = run(b"~.");
+            assert!(detached);
+            assert_eq!(forwarded, b"");
+        }
+
+        #[test]
+        fn tilde_dot_right_after_a_newline_detaches() {
+            let (forwarded, detached) = run(b"echo hi\n~.");
+            assert!(detached);
+            assert_eq!(forwarded, b"echo hi\n");
+        }
+
+        /// Regression (CodeRabbit finding on this PR): a real raw-mode
+        /// terminal's Enter key sends `\r`, not `\n` (`ICRNL` is disabled by
+        /// raw mode, same CR-vs-LF distinction this whole epic started
+        /// from) — `~.` must still detach right after a bare `\r`, not just
+        /// the synthetic `\n` every other test here uses.
+        #[test]
+        fn tilde_dot_right_after_a_carriage_return_detaches() {
+            let (forwarded, detached) = run(b"echo hi\r~.");
+            assert!(detached);
+            assert_eq!(forwarded, b"echo hi\r");
+        }
+
+        /// Adversarial: `~.` typed in the MIDDLE of a line (not right after
+        /// a newline) must pass through as ordinary input, never detach.
+        #[test]
+        fn tilde_dot_mid_line_is_ordinary_input() {
+            let (forwarded, detached) = run(b"echo ~.\n");
+            assert!(!detached);
+            assert_eq!(forwarded, b"echo ~.\n");
+        }
+
+        /// `~~` right after a newline forwards one literal `~` — ssh's own
+        /// escape-the-escape rule — rather than eating real input.
+        #[test]
+        fn tilde_tilde_after_a_newline_forwards_one_literal_tilde() {
+            let (forwarded, detached) = run(b"~~ not an escape\n");
+            assert!(!detached);
+            assert_eq!(forwarded, b"~ not an escape\n");
+        }
+
+        /// A `~` right after a newline, followed by something other than
+        /// `.`/`~`, isn't an escape at all — both bytes are forwarded.
+        #[test]
+        fn tilde_followed_by_an_ordinary_byte_forwards_both() {
+            let (forwarded, detached) = run(b"~x\n");
+            assert!(!detached);
+            assert_eq!(forwarded, b"~x\n");
+        }
+
+        /// A multi-line session: `~.` only detaches right after a newline,
+        /// not just because one appeared earlier in the stream.
+        #[test]
+        fn only_the_newline_immediately_before_tilde_dot_counts() {
+            let (forwarded, detached) = run(b"echo hi\necho ~.there\n");
+            assert!(!detached);
+            assert_eq!(forwarded, b"echo hi\necho ~.there\n");
+        }
     }
 }
