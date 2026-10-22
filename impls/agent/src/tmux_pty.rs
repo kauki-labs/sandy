@@ -42,8 +42,36 @@ const DEFAULT_ROWS: u16 = 24;
 /// How often [`wait_for_exit`] polls for the sentinel file.
 const SENTINEL_POLL: Duration = Duration::from_millis(50);
 
+/// A fixed `TERM` every `tmux` invocation gets explicitly: `ProcessBackend`
+/// spawns `sandy-agent` itself with `.env_clear()`, passing through only
+/// `PATH` (and `spec.env`, which carries no `TERM` — there is no path for
+/// arbitrary job env to reach a VM-backed job today, #340 phase 6's own
+/// gap) — so `tmux` would otherwise inherit NO `TERM` at all and refuse to
+/// attach. Per-client terminal capability negotiation (the real client's own
+/// `TERM`) is tmux's own job once a client actually attaches — this is only
+/// the session's own baseline, matching what the guest closure's terminfo
+/// package (added alongside `tmux` itself) covers.
+const TMUX_TERM: &str = "xterm-256color";
+
+/// `tmux -L socket` with [`TMUX_TERM`] set explicitly, never relying on
+/// inherited env or the shared default socket.
+fn tmux_cmd(socket: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new("tmux");
+    cmd.env("TERM", TMUX_TERM).args(["-L", socket]);
+    cmd
+}
+
 /// A detached tmux session wrapping the job, plus where to find its result.
 pub struct TmuxJob {
+    /// This job's own dedicated tmux server socket name (`-L`), never the
+    /// shared default: a host running more than one job's agent at once (or
+    /// this crate's own concurrent tests) would otherwise all fight over one
+    /// server — confirmed as a real, reproducible failure (one job's
+    /// `kill-session`/server-exit racing another's `set-option`/`new-session`
+    /// mid-sequence, surfacing as a bare "no server running" once
+    /// `impls/local/src/process.rs`'s AgentFailed console-discard bug (#340)
+    /// stopped hiding it). Each `TmuxJob` gets a server entirely its own.
+    socket: String,
     session: String,
     sentinel: PathBuf,
     /// The continuous `pipe-pane` transcript of the whole session's output,
@@ -93,6 +121,7 @@ impl TmuxJob {
             COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
         let tmp = std::env::temp_dir();
+        let socket = format!("sandy-job-{unique}");
         let session = format!("sandy-job-{unique}");
         let sentinel = tmp.join(format!("sandy-job-{unique}.exit"));
         let log = tmp.join(format!("sandy-job-{unique}.log"));
@@ -105,40 +134,80 @@ impl TmuxJob {
             sh_quote(&sentinel.to_string_lossy())
         );
 
-        let mut cmd = std::process::Command::new("tmux");
-        cmd.args([
-            "new-session",
-            "-d",
-            "-s",
-            &session,
-            "-x",
-            &DEFAULT_COLS.to_string(),
-            "-y",
-            &DEFAULT_ROWS.to_string(),
-        ]);
-        if let Some((name, dir)) = peer_env {
-            cmd.arg("-e").arg(format!("{name}={}", dir.display()));
+        // `remain-on-exit` MUST take effect at the moment the server starts,
+        // before the session (and its pane's command) exists at all — not
+        // via a `set-option` call issued as a SEPARATE process after
+        // `new-session`/`start-server` returns. Tried that first: a fast job
+        // (confirmed with `tty`, finishing in well under a millisecond) can
+        // exit and destroy its pane — and, since it's the session's only
+        // pane, the session and the whole server with it — before a later,
+        // separate OS-level process's `set-option` call ever reaches it,
+        // producing "no server running" (#340, found via the agent's own
+        // console output once `impls/local/src/process.rs`'s AgentFailed
+        // path stopped discarding it). Also tried an explicit `start-server`
+        // immediately followed by a separate `set-option -g` process: same
+        // race, one layer up — `start-server` returns once the fork is
+        // initiated, not once the server has actually finished binding its
+        // socket and is ready for a SEPARATE client connection.
+        //
+        // The actual fix: a `-f <config>` file read synchronously as tmux's
+        // OWN server starts, as part of the SAME `new-session` invocation
+        // that starts it — not a second OS process racing the first.
+        //
+        // `pipe-pane` has the IDENTICAL race, confirmed live: enabling it as
+        // a later, separate command missed the job's very first output
+        // (`echo hello` ran and printed before that second process ever
+        // reached the session, while later output the job printed after
+        // blocking on `read` was captured fine — the same shape of race as
+        // `remain-on-exit`, just gated on wall-clock timing rather than the
+        // job's own death). Fixed the same way: a `session-created` hook
+        // in this same config file fires `pipe-pane` synchronously, as part
+        // of tmux's own session-creation event, before the pane's command
+        // (the job) ever starts running — no second process to race at all.
+        let config = tmp.join(format!("sandy-job-{unique}.tmux.conf"));
+        std::fs::write(
+            &config,
+            format!(
+                "set-option -g remain-on-exit on\nset-option -g history-limit {HISTORY_LIMIT}\nset-hook -g \
+                 session-created 'pipe-pane -o \"cat >> {}\"'\n",
+                log.display()
+            ),
+        )?;
+
+        // From here on, this job's dedicated server may already be up —
+        // any failure below must kill it before returning, or it leaks a
+        // process with no `TmuxJob` value ever constructed to `Drop` it
+        // (the safety net added for a failure AFTER construction does not
+        // cover a failure DURING it).
+        let setup = (|| -> std::io::Result<()> {
+            let mut cmd = tmux_cmd(&socket);
+            cmd.args(["-f", &config.to_string_lossy(), "new-session", "-d", "-s", &session]);
+            cmd.args(["-x", &DEFAULT_COLS.to_string(), "-y", &DEFAULT_ROWS.to_string()]);
+            if let Some((name, dir)) = peer_env {
+                cmd.arg("-e").arg(format!("{name}={}", dir.display()));
+            }
+            cmd.args(["sh", "-c", &script]);
+            run_tmux(&mut cmd)?;
+            // tmux only ever reads `-f`'s config once, synchronously, at
+            // server startup — which `new-session` above already waited on,
+            // and which is also what registered the `session-created` hook
+            // that fired `pipe-pane` for this exact session. Nothing after
+            // this point needs the file.
+            let _ = std::fs::remove_file(&config);
+            Ok(())
+        })();
+        if let Err(e) = setup {
+            let _ = run_tmux(tmux_cmd(&socket).arg("kill-server"));
+            let _ = std::fs::remove_file(&config);
+            return Err(e);
         }
-        cmd.args(["sh", "-c", &script]);
-        run_tmux(&mut cmd)?;
 
-        run_tmux(std::process::Command::new("tmux").args([
-            "set-option",
-            "-t",
-            &session,
-            "history-limit",
-            &HISTORY_LIMIT.to_string(),
-        ]))?;
-        run_tmux(std::process::Command::new("tmux").args(["set-option", "-t", &session, "remain-on-exit", "on"]))?;
-        run_tmux(std::process::Command::new("tmux").args([
-            "pipe-pane",
-            "-t",
-            &session,
-            "-o",
-            &format!("cat >> {}", sh_quote(&log.to_string_lossy())),
-        ]))?;
-
-        Ok(Self { session, sentinel, log })
+        Ok(Self {
+            socket,
+            session,
+            sentinel,
+            log,
+        })
     }
 
     /// The continuous transcript [`start`] began piping the session's output
@@ -146,6 +215,22 @@ impl TmuxJob {
     #[must_use]
     pub fn log_path(&self) -> &Path {
         &self.log
+    }
+
+    /// This job's own dedicated tmux server socket name — test-only, for
+    /// confirming teardown from outside this module.
+    #[cfg(test)]
+    #[must_use]
+    pub fn socket_name(&self) -> &str {
+        &self.socket
+    }
+
+    /// This job's tmux session name — test-only, for confirming it's
+    /// actually gone after a drop.
+    #[cfg(test)]
+    #[must_use]
+    pub fn session_name(&self) -> &str {
+        &self.session
     }
 
     /// Poll for the sentinel file [`start`] wraps the job to write, parsing
@@ -157,21 +242,32 @@ impl TmuxJob {
     /// `sandy-exit:<code>` shape.
     pub async fn wait_for_exit(&self) -> std::io::Result<i32> {
         loop {
-            if let Ok(contents) = tokio::fs::read_to_string(&self.sentinel).await {
-                let code = contents
+            // A momentarily-empty (or partial) read is a real, expected
+            // state, not a failure: the wrapped script's `>` redirection
+            // creates/truncates the file the instant the shell parses the
+            // command line, strictly before `printf` has actually written
+            // anything to it — a poll can legitimately land in that window.
+            // Only treat it as ready once it parses; anything else (missing,
+            // empty, partial) just means "keep polling."
+            if let Ok(contents) = tokio::fs::read_to_string(&self.sentinel).await
+                && let Some(code) = contents
                     .trim()
                     .strip_prefix("sandy-exit:")
                     .and_then(|n| n.parse::<i32>().ok())
-                    .ok_or_else(|| std::io::Error::other(format!("malformed sentinel contents: {contents:?}")))?;
+            {
                 return Ok(code);
             }
             tokio::time::sleep(SENTINEL_POLL).await;
         }
     }
 
-    /// Tear the session down. Best-effort: the session may already be gone.
+    /// Tear the whole dedicated server down (not just the session): since
+    /// this job owns its socket exclusively, leaving the server running
+    /// with no sessions would leak a process per job just the same as
+    /// leaving the session itself running would. Best-effort — the server
+    /// may already be gone.
     pub fn kill(&self) {
-        let _ = run_tmux(std::process::Command::new("tmux").args(["kill-session", "-t", &self.session]));
+        let _ = run_tmux(tmux_cmd(&self.socket).arg("kill-server"));
     }
 
     /// Open a fresh PTY and attach it to this job's tmux session — the one
@@ -198,7 +294,8 @@ impl TmuxJob {
         let writer = pair.master.take_writer().map_err(std::io::Error::other)?;
 
         let mut builder = portable_pty::CommandBuilder::new("tmux");
-        builder.args(["attach", "-t", &self.session]);
+        builder.env("TERM", TMUX_TERM);
+        builder.args(["-L", &self.socket, "attach", "-t", &self.session]);
         let child = pair.slave.spawn_command(builder).map_err(std::io::Error::other)?;
         drop(pair.slave);
 
@@ -242,6 +339,21 @@ impl TmuxJob {
             AsyncPtyWriter { tx: wtx, _master },
             child,
         ))
+    }
+}
+
+impl Drop for TmuxJob {
+    /// The safety net for every path out, not just the explicit `kill()`
+    /// calls in `serve()`'s own normal flow: a panicking test, an early `?`
+    /// return before the job even starts bridging, or any other unplanned
+    /// exit must not leave a session running forever on a shared tmux
+    /// server. Confirmed as a real leak in CI/test runs sharing one host
+    /// before this existed (25 accumulated sessions, found during #340's
+    /// phase 2 work) — `kill()` itself is already idempotent-safe against a
+    /// session that's already gone, so calling it twice (once explicitly,
+    /// once here) is harmless.
+    fn drop(&mut self) {
+        self.kill();
     }
 }
 
@@ -354,6 +466,35 @@ mod tests {
             .map_err(std::io::Error::other)??;
         tmux_job.kill();
         assert_eq!(exit, 42);
+        Ok(())
+    }
+
+    /// Regression (#340 phase 2 found this as a real leak: 25 accumulated
+    /// sessions on a shared tmux server from test runs that never called
+    /// `kill()` explicitly): a `TmuxJob` dropped WITHOUT an explicit `kill()`
+    /// call — standing in for a panicking test or an early `?` return in
+    /// `serve()` — must still tear its whole dedicated server down, not just
+    /// end up with the session unreachable on the wrong socket. Checked
+    /// against the job's own `-L` socket (each job owns one exclusively),
+    /// via a plain `tmux` invocation, not `tmux_cmd()`, matching a real
+    /// caller checking from outside this module.
+    #[tokio::test]
+    async fn dropping_a_tmux_job_without_an_explicit_kill_still_tears_down_its_session() -> std::io::Result<()> {
+        let job = vec!["sleep".into(), "30".into()];
+        let (socket, session) = {
+            let tmux_job = TmuxJob::start(&job, None)?;
+            let ids = (tmux_job.socket_name().to_string(), tmux_job.session_name().to_string());
+            // `tmux_job` drops here, with no explicit `.kill()` call.
+            ids
+        };
+        let has_session = std::process::Command::new("tmux")
+            .args(["-L", &socket, "has-session", "-t", &session])
+            .status()?;
+        assert!(
+            !has_session.success(),
+            "the session (and its whole dedicated server) must be gone after the TmuxJob was dropped, not merely out \
+             of explicit reach"
+        );
         Ok(())
     }
 }

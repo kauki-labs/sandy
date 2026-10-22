@@ -26,14 +26,12 @@ use std::{
     ffi::OsString,
     io::Write,
     os::{fd::AsFd, unix::process::ExitStatusExt},
-    pin::Pin,
     process::{ExitCode, ExitStatus},
     sync::Arc,
-    task::{Context, Poll},
 };
 
 use sandy_fabric_local::agent::LinkAgent;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 mod link_source;
 mod peer;
@@ -139,28 +137,69 @@ where
         .open_attach()
         .map_err(|e| format!("opening the attach pty: {e}"))?;
 
-    // Tee the job's output to this process's own stdio as well, so the
-    // backend's console capture still carries it. The PTY already merges
-    // stdout+stderr, so the bridge's stderr side is an immediate EOF.
-    let bridged = agent
-        .serve_tty(Tee::new(pty_read, to_stdout), tokio::io::empty(), pty_write)
-        .await;
-    if let Err(e) = bridged {
-        tmux_job.kill();
-        let _ = attach_child.kill();
-        return Err(format!("bridging the job's stdio: {e}"));
-    }
+    // `serve_tty`/`bridge_tty` only returns once `pty_read` hits EOF — but
+    // with `remain-on-exit on` (needed so a fast job's pane survives long
+    // enough to even be usable, see `tmux_pty`'s own doc), the attach
+    // client's pty does NOT reach EOF just because the job inside finished:
+    // the dead pane stays visible, still attached. Awaiting the bridge
+    // sequentially before checking the sentinel would therefore hang
+    // forever. Instead: run the bridge in the background, wait for the
+    // job's REAL exit via the sentinel (independent of the bridge), then
+    // kill the session — which disconnects the attach client and is what
+    // actually drives the bridge's pty to EOF so it can return.
+    // No `Tee` to `to_stdout` here (unlike the old pipe-based version): a
+    // fast job can leave the live attach stream showing tmux's own
+    // escape-sequence-laden "dead pane" redraw instead of (or alongside) the
+    // job's real output, which once mixed into the backend's `console`
+    // capture occasionally produced a garbled fragment downstream code
+    // mistook for real content (confirmed: an intermittent false positive in
+    // `the_job_environment_carries_no_link_or_cap`, gone once this stopped).
+    // The pipe-pane transcript dumped to stdout below is the sole, reliable
+    // source for `console` now; this only affects that non-interactive
+    // capture, not the live TTY_STDOUT channel a real attached viewer sees
+    // (posted independently, inside `bridge_tty` itself).
+    let bridge_agent = Arc::clone(&agent);
+    let bridge_task =
+        tokio::spawn(async move { bridge_agent.serve_tty(pty_read, tokio::io::empty(), pty_write).await });
 
-    // The bridge ending (this attach's pty hit EOF) says nothing about
-    // whether the job inside the detached session has finished — only the
-    // sentinel file its wrapped command writes does; the session persists
-    // independent of any one attach connection by design (#340).
-    let exit = tmux_job
-        .wait_for_exit()
-        .await
-        .map_err(|e| format!("reading the job's real exit code: {e}"))?;
+    let exit = match tmux_job.wait_for_exit().await {
+        Ok(exit) => exit,
+        Err(e) => {
+            tmux_job.kill();
+            let _ = attach_child.kill();
+            bridge_task.abort();
+            return Err(format!("reading the job's real exit code: {e}"));
+        }
+    };
+    // The session persists independent of any one attach connection by
+    // design (#340) — this kill ends THIS bridge's attach, not the job
+    // (already finished) or (in a later phase) any other concurrent attach.
     tmux_job.kill();
     let _ = attach_child.wait();
+
+    match bridge_task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(format!("bridging the job's stdio: {e}")),
+        Err(e) => return Err(format!("the stdio bridge task panicked: {e}")),
+    }
+
+    // The live attach bridge above only reliably carries output for a job
+    // that's still running by the time `tmux attach` connects — a fast,
+    // non-interactive job (confirmed with plain `ls`/`env`-style jobs, which
+    // exit before the attach can connect at all) races it, and tmux's
+    // `remain-on-exit` death notice then replaces the screen the attach sees
+    // instead of replaying anything from before the attach existed. The
+    // backend's own `console` capture (what every non-interactive caller
+    // reads today, unaware this is now tmux-backed) still needs to be
+    // complete regardless of job speed — `pipe-pane`'s transcript, started
+    // before any attach at session creation, is exactly the race-free source
+    // for that: write it to this process's own stdout now, which
+    // `ProcessBackend` already captures as `Outcome::console`. This never
+    // touches the live TTY_STDOUT channel itself (only the bridge above
+    // posts to that), so a genuinely attached viewer sees no duplicate.
+    if let Ok(transcript) = tokio::fs::read(tmux_job.log_path()).await {
+        to_stdout(&transcript);
+    }
 
     agent
         .report_exit(exit)
@@ -213,29 +252,6 @@ fn exit_code(status: ExitStatus) -> u8 {
 fn to_stdout(bytes: &[u8]) {
     let mut out = std::io::stdout().lock();
     let _ = out.write_all(bytes).and_then(|()| out.flush());
-}
-
-/// An [`AsyncRead`] that copies every chunk it yields to `sink`.
-struct Tee<R> {
-    inner: R,
-    sink: fn(&[u8]),
-}
-
-impl<R> Tee<R> {
-    fn new(inner: R, sink: fn(&[u8])) -> Self {
-        Self { inner, sink }
-    }
-}
-
-impl<R: AsyncRead + Unpin> AsyncRead for Tee<R> {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-        let before = buf.filled().len();
-        let polled = Pin::new(&mut self.inner).poll_read(cx, buf);
-        if let Poll::Ready(Ok(())) = polled {
-            (self.sink)(&buf.filled()[before..]);
-        }
-        polled
-    }
 }
 
 #[cfg(test)]
