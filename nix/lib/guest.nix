@@ -107,7 +107,22 @@ let
         "virtiofs"
         "vmw_vsock_virtio_transport"
       ];
-      environment.systemPackages = [ pkgs.sandy-agent ];
+      # `ncurses` ships the terminfo database common `TERM` values (e.g.
+      # xterm-256color) need for correct cursor/escape-sequence handling in a
+      # TUI app (#340 phase 4). Trivial one-line rebase if phase 1's
+      # tmux-adding change lands on this same line first.
+      environment.systemPackages = [
+        pkgs.sandy-agent
+        pkgs.ncurses
+      ];
+
+      # UTF-8 locale (#340 phase 4): a job running a TUI app inside the guest
+      # (the tmux-wrapped PTY session other phases of #340 add) needs a real
+      # locale or multi-byte/wide-character rendering breaks. `C.UTF-8` needs
+      # no locale-archive generation (unlike e.g. `en_US.UTF-8`), keeping the
+      # guest's boot-time cost unchanged.
+      i18n.defaultLocale = lib.mkForce "C.UTF-8";
+      i18n.supportedLocales = lib.mkForce [ "C.UTF-8/UTF-8" ];
 
       # The login shell exports each staged secret as its `$NAME`, then prints
       # the READY_MARKER once it is up and reading — so the injected command (a
