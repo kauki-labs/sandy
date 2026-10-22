@@ -456,6 +456,7 @@
                     offQemuBin = vmOff.environment.SANDY_QEMU_BIN or "";
                     offNixBin = vmOff.environment.SANDY_NIX_BIN or "";
                     offVirtiofsdBin = vmOff.environment.SANDY_VIRTIOFSD_BIN or "";
+                    offGitBin = vmOff.environment.SANDY_GIT_BIN or "";
                     offNixSslCertFile = vmOff.environment.NIX_SSL_CERT_FILE or "";
                     offSslCertFile = vmOff.environment.SSL_CERT_FILE or "";
                     onBindPaths = builtins.toJSON vmOn.serviceConfig.BindPaths;
@@ -466,6 +467,7 @@
                     onQemuBin = vmOn.environment.SANDY_QEMU_BIN or "";
                     onNixBin = vmOn.environment.SANDY_NIX_BIN or "";
                     onVirtiofsdBin = vmOn.environment.SANDY_VIRTIOFSD_BIN or "";
+                    onGitBin = vmOn.environment.SANDY_GIT_BIN or "";
                     onNixSslCertFile = vmOn.environment.NIX_SSL_CERT_FILE or "";
                     onSslCertFile = vmOn.environment.SSL_CERT_FILE or "";
                   }
@@ -484,6 +486,7 @@
                     [ -z "$offQemuBin" ] || { echo "vm.enable=false must not set SANDY_QEMU_BIN, got: $offQemuBin" >&2; exit 1; }
                     [ -z "$offNixBin" ] || { echo "vm.enable=false must not set SANDY_NIX_BIN, got: $offNixBin" >&2; exit 1; }
                     [ -z "$offVirtiofsdBin" ] || { echo "vm.enable=false must not set SANDY_VIRTIOFSD_BIN, got: $offVirtiofsdBin" >&2; exit 1; }
+                    [ -z "$offGitBin" ] || { echo "vm.enable=false must not set SANDY_GIT_BIN, got: $offGitBin" >&2; exit 1; }
                     [ -z "$offNixSslCertFile" ] || { echo "vm.enable=false must not set NIX_SSL_CERT_FILE, got: $offNixSslCertFile" >&2; exit 1; }
                     [ -z "$offSslCertFile" ] || { echo "vm.enable=false must not set SSL_CERT_FILE, got: $offSslCertFile" >&2; exit 1; }
                     case "$onBindPaths" in
@@ -516,6 +519,10 @@
                     case "$onVirtiofsdBin" in
                       */bin/virtiofsd) ;;
                       *) echo "vm.enable=true must set SANDY_VIRTIOFSD_BIN to an absolute virtiofsd path, got: $onVirtiofsdBin" >&2; exit 1 ;;
+                    esac
+                    case "$onGitBin" in
+                      */bin/git) ;;
+                      *) echo "vm.enable=true must set SANDY_GIT_BIN to an absolute git path (nix's own internal git+https fetcher does its own PATH lookup, #337 follow-up), got: $onGitBin" >&2; exit 1 ;;
                     esac
                     [ "$onNixSslCertFile" = "/etc/ssl/certs/ca-certificates.crt" ] || { echo "vm.enable=true must set NIX_SSL_CERT_FILE to the system CA bundle, got: $onNixSslCertFile" >&2; exit 1; }
                     [ "$onSslCertFile" = "/etc/ssl/certs/ca-certificates.crt" ] || { echo "vm.enable=true must set SSL_CERT_FILE to the system CA bundle, got: $onSslCertFile" >&2; exit 1; }

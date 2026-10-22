@@ -426,6 +426,22 @@ fn summarize_nix_error(stderr: &str) -> String {
 fn run_nix(args: &[&str], deadline: Option<std::time::Instant>) -> std::io::Result<Output> {
     let mut command = Command::new(nix_bin());
     command.args(args);
+    // nix's OWN internal fetcher shells out to `git` by bare name when
+    // resolving a `git+https://…` flake ref — a SECOND PATH lookup this
+    // process does not control directly (unlike `nix_bin()`/`qemu_bin`/
+    // `virtiofsd_bin`, each used as an absolute-path `Command::new(...)`
+    // that never consults PATH at all). Confirmed on ws01 (#337 follow-up):
+    // `git` was not found even with an explicit `Environment=PATH=` set on
+    // the unit itself — whatever resets this unit's own exec environment
+    // (PAM, systemd session handling) does not survive to that top-level
+    // process's exec, but has no bearing here: this is this ALREADY-RUNNING
+    // process spawning a child directly via `std::process::Command`, a pure
+    // in-process fork+exec PAM never touches. Constructing the child's own
+    // PATH explicitly, rather than depending on whatever this process's own
+    // ambient PATH happens to be, sidesteps the whole question.
+    if let Some(path) = nix_subprocess_path() {
+        command.env("PATH", path);
+    }
     run_with_deadline(command, deadline)
 }
 
@@ -440,6 +456,32 @@ fn run_nix(args: &[&str], deadline: Option<std::time::Instant>) -> std::io::Resu
 #[must_use]
 pub fn nix_bin() -> String {
     std::env::var("SANDY_NIX_BIN").unwrap_or_else(|_| "nix".to_string())
+}
+
+/// The `PATH` to hand `nix`'s own child process, built from `SANDY_GIT_BIN`
+/// so its internal `git+https://…` fetcher can find `git` — `None` (inherit
+/// whatever this process's own ambient `PATH` is, today's behavior) when
+/// `SANDY_GIT_BIN` isn't set, the existing bare-`PATH`-lookup local-dev case.
+fn nix_subprocess_path() -> Option<String> {
+    nix_subprocess_path_with(
+        std::env::var("SANDY_GIT_BIN").ok().as_deref(),
+        std::env::var("PATH").ok().as_deref(),
+    )
+}
+
+/// [`nix_subprocess_path`]'s pure core, taking both inputs as plain
+/// arguments rather than reading the environment directly — this workspace
+/// forbids `unsafe_code`, so a test cannot call `std::env::set_var` (unsafe
+/// as of edition 2024) to exercise it; this split keeps the logic
+/// unit-testable without it (same pattern `qemu_system_binary_with_override`
+/// in `impls/vm` already uses).
+fn nix_subprocess_path_with(git_bin: Option<&str>, ambient_path: Option<&str>) -> Option<String> {
+    let git_bin = git_bin?;
+    let git_dir = std::path::Path::new(git_bin).parent()?.to_str()?;
+    Some(match ambient_path {
+        Some(ambient) if !ambient.is_empty() => format!("{git_dir}:{ambient}"),
+        _ => git_dir.to_string(),
+    })
 }
 
 /// Spawn `command` with piped stdout/stderr (drained on dedicated threads,
@@ -672,8 +714,40 @@ pub fn guest_wrapper_present() -> bool {
 mod tests {
     use super::{
         HostTarget, TemplateKind, attribute_missing, configuration_attrs, devshell_attrs, direct_topology_ref,
-        module_attrs, parse_kind, summarize_nix_error,
+        module_attrs, nix_subprocess_path_with, parse_kind, summarize_nix_error,
     };
+
+    /// No override: nix's own child inherits this process's ambient PATH
+    /// unchanged — today's local-dev behavior, no `SANDY_GIT_BIN` involved.
+    #[test]
+    fn nix_subprocess_path_is_none_without_a_git_override() {
+        assert_eq!(nix_subprocess_path_with(None, Some("/usr/bin:/bin")), None);
+    }
+
+    /// An override prepends git's own directory ahead of the ambient PATH —
+    /// git is found first, whatever else is (or isn't) on that ambient path.
+    #[test]
+    fn nix_subprocess_path_prepends_gits_directory() {
+        assert_eq!(
+            nix_subprocess_path_with(Some("/nix/store/abc-git-2.54.0/bin/git"), Some("/usr/bin:/bin")),
+            Some("/nix/store/abc-git-2.54.0/bin:/usr/bin:/bin".to_string())
+        );
+    }
+
+    /// An override with no ambient PATH at all (unset or empty) still
+    /// resolves — git's directory alone, not a malformed leading/trailing
+    /// colon.
+    #[test]
+    fn nix_subprocess_path_handles_no_ambient_path() {
+        assert_eq!(
+            nix_subprocess_path_with(Some("/nix/store/abc-git-2.54.0/bin/git"), None),
+            Some("/nix/store/abc-git-2.54.0/bin".to_string())
+        );
+        assert_eq!(
+            nix_subprocess_path_with(Some("/nix/store/abc-git-2.54.0/bin/git"), Some("")),
+            Some("/nix/store/abc-git-2.54.0/bin".to_string())
+        );
+    }
 
     fn vfkit_host() -> HostTarget {
         HostTarget {

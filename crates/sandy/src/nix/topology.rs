@@ -142,8 +142,17 @@ pub fn topology(source: &str) -> Result<Topology, BackendError> {
     }
 
     tracing::debug!(source, "evaluating guest topology via `nix eval --json`");
-    let output = Command::new(nix_bin())
-        .args(["eval", "--json", source])
+    let mut command = Command::new(nix_bin());
+    command.args(["eval", "--json", source]);
+    // nix's OWN internal `git+https://…` fetcher does its own PATH lookup
+    // for `git`, a second one this call doesn't otherwise control — see
+    // `sandy-guest-template`'s identical `nix_subprocess_path` (duplicated
+    // here for the same reason `nix_bin` is) for the full rationale (#337
+    // follow-up).
+    if let Some(path) = nix_subprocess_path() {
+        command.env("PATH", path);
+    }
+    let output = command
         .output()
         .map_err(|e| BackendError::Transport(format!("failed to spawn `nix eval {source}`: {e}")))?;
 
@@ -172,6 +181,30 @@ fn nix_bin() -> String {
     std::env::var("SANDY_NIX_BIN").unwrap_or_else(|_| "nix".to_string())
 }
 
+/// The `PATH` to hand `nix`'s own child process, built from `SANDY_GIT_BIN`
+/// so its internal `git+https://…` fetcher can find `git` (duplicated from
+/// `sandy-guest-template`'s identical `nix_subprocess_path`, same reason
+/// `nix_bin` is) — `None` (inherit this process's own ambient `PATH`,
+/// today's behavior) when `SANDY_GIT_BIN` isn't set.
+fn nix_subprocess_path() -> Option<String> {
+    nix_subprocess_path_with(
+        std::env::var("SANDY_GIT_BIN").ok().as_deref(),
+        std::env::var("PATH").ok().as_deref(),
+    )
+}
+
+/// [`nix_subprocess_path`]'s pure core — see `sandy-guest-template`'s
+/// identical split for why (this workspace forbids `unsafe_code`, so a test
+/// cannot call `std::env::set_var`, unsafe as of edition 2024).
+fn nix_subprocess_path_with(git_bin: Option<&str>, ambient_path: Option<&str>) -> Option<String> {
+    let git_bin = git_bin?;
+    let git_dir = Path::new(git_bin).parent()?.to_str()?;
+    Some(match ambient_path {
+        Some(ambient) if !ambient.is_empty() => format!("{git_dir}:{ambient}"),
+        _ => git_dir.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,6 +215,36 @@ mod tests {
     const AARCH64_FIXTURE: &[u8] = include_bytes!("../../tests/fixtures/topology-aarch64.json");
     /// The x86_64 fixture with its required `kernel` field removed.
     const MISSING_KERNEL_FIXTURE: &[u8] = include_bytes!("../../tests/fixtures/topology-missing-kernel.json");
+
+    /// No override: nix's child inherits this process's ambient PATH
+    /// unchanged — today's local-dev behavior, no `SANDY_GIT_BIN` involved.
+    #[test]
+    fn nix_subprocess_path_is_none_without_a_git_override() {
+        assert_eq!(nix_subprocess_path_with(None, Some("/usr/bin:/bin")), None);
+    }
+
+    /// An override prepends git's own directory ahead of the ambient PATH.
+    #[test]
+    fn nix_subprocess_path_prepends_gits_directory() {
+        assert_eq!(
+            nix_subprocess_path_with(Some("/nix/store/abc-git-2.54.0/bin/git"), Some("/usr/bin:/bin")),
+            Some("/nix/store/abc-git-2.54.0/bin:/usr/bin:/bin".to_string())
+        );
+    }
+
+    /// An override with no ambient PATH at all (unset or empty) still
+    /// resolves cleanly — git's directory alone.
+    #[test]
+    fn nix_subprocess_path_handles_no_ambient_path() {
+        assert_eq!(
+            nix_subprocess_path_with(Some("/nix/store/abc-git-2.54.0/bin/git"), None),
+            Some("/nix/store/abc-git-2.54.0/bin".to_string())
+        );
+        assert_eq!(
+            nix_subprocess_path_with(Some("/nix/store/abc-git-2.54.0/bin/git"), Some("")),
+            Some("/nix/store/abc-git-2.54.0/bin".to_string())
+        );
+    }
 
     /// Tier-1: a complete fixture parses into a fully populated `Topology` with
     /// the real store path, hypervisor, and cpu/mem carried through verbatim.
