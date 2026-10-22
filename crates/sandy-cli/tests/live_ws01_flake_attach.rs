@@ -351,8 +351,13 @@ async fn a_separate_attach_process_drives_a_real_vm_booted_on_ws01() -> anyhow::
     .context("submit a flake-templated VM job with an interactive shell command")?;
     submitter_request_id += 1;
 
-    // A cold `nix build` + a real qemu boot is slow.
-    tokio::time::sleep(Duration::from_secs(20)).await;
+    // A cold `nix build` + a real qemu boot is slow — measured locally
+    // (#338 follow-up) at ~115s for just the runner-attr build of this
+    // exact fixture on a cold store, well past a flat 20s. 180s leaves
+    // margin for that plus boot time without approaching
+    // `FLAKE_RESOLVE_TIMEOUT_SECS` (600s, `dispatch.rs`) or this test's own
+    // 60s registration-retry budget above.
+    tokio::time::sleep(Duration::from_secs(180)).await;
 
     // THE REALISTIC CASE: a totally fresh connection, no shared session with
     // the submitter, presenting only the durable token — standing in for a

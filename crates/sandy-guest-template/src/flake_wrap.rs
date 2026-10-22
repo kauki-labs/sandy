@@ -633,7 +633,24 @@ fn build_and_eval(
     // path: see `guest_wrapper_root`'s doc for why the installable has to
     // name the ROOT nix walks its flake-source resolution from, not the
     // wrapper subdirectory directly.
-    let installable = |a: &str| format!("{}?dir=nix/guest-wrapper#{a}", wrapper_root.display());
+    //
+    // `flake_ref_root_prefix` below picks the scheme: confirmed live (#338
+    // follow-up), a bare `/nix/store/…-sandy-guest-wrapper?dir=…` — the
+    // packaged, non-git root `$SANDY_GUEST_WRAPPER` points VM dispatch at —
+    // isn't parsed as a flake-ref-with-query at all; nix's generic `path:`
+    // auto-detection stops at the first `/`, so `?dir=nix/guest-wrapper`
+    // gets folded into the literal path name instead of recognized as a
+    // query string, and nix then reports the resulting (nonexistent) name
+    // as "required, but there is no substituter that can build it" — a
+    // flake-ref grammar gap for a BARE path, confirmed locally
+    // (`nix flake metadata "$store_path?dir=…"` reproduces it character for
+    // character). The dev-tree root (has `.git`) never hit this: nix
+    // auto-detects `.git` and resolves a bare path there as `git+file:`,
+    // whose query-string parsing is git's own URL grammar, not the generic
+    // one. An explicit `path:` prefix uses nix's OWN query-string-aware
+    // parser for the non-git case too (confirmed locally, same repro).
+    let prefix = flake_ref_root_prefix(wrapper_root);
+    let installable = |a: &str| format!("{prefix}?dir=nix/guest-wrapper#{a}");
     let override_args = ["--override-input", "target", flake_ref];
 
     let build_target = installable(&runner_attr);
@@ -660,6 +677,22 @@ fn build_and_eval(
         );
     }
     Ok(eval_output.stdout)
+}
+
+/// The flake-ref prefix for `root`: `path:{root}` when `root` has no
+/// `.git` (the packaged store copy #332's own overlay produces — see
+/// `build_and_eval`'s call site for why this matters), else the bare path
+/// unprefixed, letting nix's existing `.git`-detected `git+file:` handling
+/// apply exactly as it does for the dev-tree root today (unchanged
+/// behavior there — `path:` on a git working tree would copy the whole
+/// tree into the store, `target/` and all, not just the tracked files
+/// `git+file:` copies).
+fn flake_ref_root_prefix(root: &Path) -> String {
+    if root.join(".git").exists() {
+        root.display().to_string()
+    } else {
+        format!("path:{}", root.display())
+    }
 }
 
 /// The root `$SANDY_GUEST_WRAPPER` names if set, else this crate's
@@ -714,8 +747,35 @@ pub fn guest_wrapper_present() -> bool {
 mod tests {
     use super::{
         HostTarget, TemplateKind, attribute_missing, configuration_attrs, devshell_attrs, direct_topology_ref,
-        module_attrs, nix_subprocess_path_with, parse_kind, summarize_nix_error,
+        flake_ref_root_prefix, module_attrs, nix_subprocess_path_with, parse_kind, summarize_nix_error,
     };
+
+    /// A non-git root (the packaged store-copy shape) gets an explicit
+    /// `path:` prefix — confirmed live and reproduced locally (#338
+    /// follow-up): nix's generic auto-detection for a bare path doesn't
+    /// parse a trailing `?dir=…` as a query string at all.
+    #[test]
+    fn flake_ref_root_prefix_adds_path_scheme_for_a_non_git_root() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let dir = tempfile::tempdir().context("temp dir")?;
+        assert_eq!(
+            flake_ref_root_prefix(dir.path()),
+            format!("path:{}", dir.path().display())
+        );
+        Ok(())
+    }
+
+    /// A git-tracked root (the dev-tree shape) is left bare — nix's own
+    /// `.git` auto-detection resolves it as `git+file:`, unchanged from
+    /// today's behavior.
+    #[test]
+    fn flake_ref_root_prefix_leaves_a_git_root_bare() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let dir = tempfile::tempdir().context("temp dir")?;
+        std::fs::create_dir(dir.path().join(".git")).context("create a fake .git dir")?;
+        assert_eq!(flake_ref_root_prefix(dir.path()), dir.path().display().to_string());
+        Ok(())
+    }
 
     /// No override: nix's own child inherits this process's ambient PATH
     /// unchanged — today's local-dev behavior, no `SANDY_GIT_BIN` involved.
