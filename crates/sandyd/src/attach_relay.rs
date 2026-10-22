@@ -32,11 +32,11 @@ use sandy_fabric::{
     channel_backend::ChannelBackend,
 };
 use sandy_fabric_local::{
-    agent::{TTY_STDERR, TTY_STDIN, TTY_STDOUT},
+    agent::{ARCHIVE_TRANSCRIPT, RESIZE_CONTROL, TTY_STDERR, TTY_STDIN, TTY_STDOUT, encode_resize},
     channel::{Channel, ChannelError, MembershipId},
     link::{LinkFrame, read_frame, write_frame},
 };
-use sandy_proto::{MessageType, Tty};
+use sandy_proto::{Control, MessageType, Tty};
 use tokio::{net::UnixListener, sync::Mutex as AsyncMutex};
 
 use crate::dispatch::JobRegistry;
@@ -75,8 +75,13 @@ async fn serve_one_attach(stream: tokio::net::UnixStream, registry: &JobRegistry
     let (mut read_half, write_half) = tokio::io::split(stream);
     let write_half = Arc::new(AsyncMutex::new(write_half));
 
-    let presented = match tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame(&mut read_half)).await {
-        Ok(Ok(Some(LinkFrame::Join { cap, channel: None }))) => cap,
+    let (presented, initial_size) = match tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame(&mut read_half)).await {
+        Ok(Ok(Some(LinkFrame::Join {
+            cap,
+            channel: None,
+            cols,
+            rows,
+        }))) => (cap, cols.zip(rows)),
         Ok(Ok(Some(other))) => {
             tracing::warn!(
                 frame = other.kind(),
@@ -146,6 +151,22 @@ async fn serve_one_attach(stream: tokio::net::UnixStream, registry: &JobRegistry
     {
         job.channel.leave(&membership);
         return;
+    }
+    // The connection's initial size (epic #340 phase 2), posted as an
+    // ordinary resize so the agent sizes its PTY for this attach before
+    // anything else arrives — best-effort: a failure here is no worse than
+    // starting at the agent's own default size, never a reason to refuse the
+    // whole attach.
+    if let Some((cols, rows)) = initial_size {
+        let _ = job
+            .channel
+            .post(
+                &membership,
+                Some(MessageType::Control(Control {})),
+                RESIZE_CONTROL,
+                encode_resize(cols, rows),
+            )
+            .await;
     }
 
     if let Err(e) = relay(Arc::clone(&job.channel), membership, &mut read_half, write_half).await {
@@ -225,15 +246,23 @@ where
                     // losing output is not a reason to also sever input.
                     return;
                 };
-                if !matches!(env.message_type, Some(MessageType::Tty(_)))
-                    || (env.content_type != TTY_STDOUT && env.content_type != TTY_STDERR)
-                {
+                let is_tty = matches!(env.message_type, Some(MessageType::Tty(_)))
+                    && (env.content_type == TTY_STDOUT || env.content_type == TTY_STDERR);
+                let is_archive =
+                    matches!(env.message_type, Some(MessageType::Output(_))) && env.content_type == ARCHIVE_TRANSCRIPT;
+                let frame = if is_tty {
+                    LinkFrame::Deliver {
+                        content_type: env.content_type,
+                        payload: hex::encode(&env.payload),
+                        channel: None,
+                    }
+                } else if is_archive {
+                    LinkFrame::Archive {
+                        content_type: env.content_type,
+                        payload: hex::encode(&env.payload),
+                    }
+                } else {
                     continue;
-                }
-                let frame = LinkFrame::Deliver {
-                    content_type: env.content_type,
-                    payload: hex::encode(&env.payload),
-                    channel: None,
                 };
                 if write_frame(&mut *write_half.lock().await, &frame).await.is_err() {
                     return;
@@ -269,6 +298,27 @@ where
                         // wire, not just logged: an observer-only cap's
                         // typed input is refused, never silently dropped or
                         // mistaken for a dead relay.
+                        let _ = write_frame(
+                            &mut *write_half.lock().await,
+                            &LinkFrame::Refused { reason: e.to_string() },
+                        )
+                        .await;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            Some(LinkFrame::Resize { cols, rows }) => {
+                match channel
+                    .post(
+                        &membership,
+                        Some(MessageType::Control(Control {})),
+                        RESIZE_CONTROL,
+                        encode_resize(cols, rows),
+                    )
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(e @ ChannelError::InsufficientRights(_)) => {
                         let _ = write_frame(
                             &mut *write_half.lock().await,
                             &LinkFrame::Refused { reason: e.to_string() },
@@ -406,6 +456,101 @@ mod tests {
                 assert_eq!(hex::decode(payload)?, b"total 0\n");
             }
             other => anyhow::bail!("expected a Deliver frame, got {other:?}"),
+        }
+
+        drop(client_wr);
+        drop(client_rd);
+        tokio::time::timeout(WAIT, relaying)
+            .await
+            .context("timed out waiting for the relay to end")??
+            .context("the relay must end cleanly on a clean close")?;
+        Ok(())
+    }
+
+    /// Epic #340 phase 2: a `Resize` frame from the attach client reaches
+    /// the shared channel as a `Control`/`RESIZE_CONTROL` envelope the agent
+    /// side can decode — a different wire shape from `TTY_STDIN`, proving
+    /// the client-read loop's new arm posts it correctly rather than
+    /// refusing it as an unexpected frame.
+    #[tokio::test]
+    async fn a_resize_frame_reaches_the_channel_as_a_control_envelope() -> anyhow::Result<()> {
+        let (channel, authority) = test_channel("job-resize").await?;
+        let agent_cap = mint(&authority, "job-resize", "agent", post_capable())?;
+        let agent = channel.join(&agent_cap)?;
+        let attach_cap = mint(&authority, "job-resize", "operator", post_capable())?;
+        let attach_membership = channel.join(&attach_cap)?;
+
+        let (client, server) = tokio::io::duplex(4096);
+        let (client_rd, mut client_wr) = split(client);
+        let (mut server_rd, server_wr) = split(server);
+        let server_wr = Arc::new(AsyncMutex::new(server_wr));
+        let channel_for_relay = Arc::clone(&channel);
+        let relaying =
+            tokio::spawn(async move { relay(channel_for_relay, attach_membership, &mut server_rd, server_wr).await });
+
+        write_frame(&mut client_wr, &LinkFrame::Resize { cols: 120, rows: 40 }).await?;
+
+        let mut inbound = std::pin::pin!(channel.subscribe(&agent)?);
+        let env = tokio::time::timeout(WAIT, inbound.next())
+            .await
+            .context("timed out waiting for the resize to reach the channel")?
+            .context("the channel stream ended")?
+            .context("the channel stream faulted")?;
+        assert!(matches!(env.message_type, Some(MessageType::Control(_))), "got {env:?}");
+        assert_eq!(env.content_type, RESIZE_CONTROL);
+        assert_eq!(sandy_fabric_local::agent::decode_resize(&env.payload), Some((120, 40)));
+
+        drop(client_wr);
+        drop(client_rd);
+        tokio::time::timeout(WAIT, relaying)
+            .await
+            .context("timed out waiting for the relay to end")??
+            .context("the relay must end cleanly on a clean close")?;
+        Ok(())
+    }
+
+    /// Epic #340 phase 2: an `Output`/`ARCHIVE_TRANSCRIPT` envelope posted
+    /// onto the channel (standing in for the real agent's end-of-job
+    /// archive post) is delivered to the attach client as a dedicated
+    /// `Archive` frame, not folded into `Deliver` or silently dropped like
+    /// any other non-TTY content would be.
+    #[tokio::test]
+    async fn an_archive_envelope_is_delivered_as_an_archive_frame() -> anyhow::Result<()> {
+        let (channel, authority) = test_channel("job-archive").await?;
+        let agent_cap = mint(&authority, "job-archive", "agent", post_capable())?;
+        let agent = channel.join(&agent_cap)?;
+        let attach_cap = mint(&authority, "job-archive", "operator", post_capable())?;
+        let attach_membership = channel.join(&attach_cap)?;
+
+        let (client, server) = tokio::io::duplex(4096);
+        let (mut client_rd, client_wr) = split(client);
+        let (mut server_rd, server_wr) = split(server);
+        let server_wr = Arc::new(AsyncMutex::new(server_wr));
+        let channel_for_relay = Arc::clone(&channel);
+        let relaying =
+            tokio::spawn(async move { relay(channel_for_relay, attach_membership, &mut server_rd, server_wr).await });
+
+        channel
+            .post(
+                &agent,
+                Some(MessageType::Output(sandy_proto::Output {})),
+                ARCHIVE_TRANSCRIPT,
+                b"the whole transcript".to_vec(),
+            )
+            .await
+            .context("post the archive envelope")?;
+
+        let delivered = tokio::time::timeout(WAIT, read_frame(&mut client_rd))
+            .await
+            .context("timed out waiting for the archive delivery")?
+            .context("reading the delivered frame faulted")?
+            .context("the connection closed before delivering the archive")?;
+        match delivered {
+            LinkFrame::Archive { content_type, payload } => {
+                assert_eq!(content_type, ARCHIVE_TRANSCRIPT);
+                assert_eq!(hex::decode(payload)?, b"the whole transcript");
+            }
+            other => anyhow::bail!("expected an Archive frame, got {other:?}"),
         }
 
         drop(client_wr);
@@ -618,6 +763,8 @@ mod tests {
             &LinkFrame::Join {
                 cap: hex::encode(encode_cap(&operator_cap)?),
                 channel: None,
+                cols: None,
+                rows: None,
             },
         )
         .await?;
@@ -659,6 +806,8 @@ mod tests {
             &LinkFrame::Join {
                 cap: hex::encode(encode_cap(&ghost_cap)?),
                 channel: None,
+                cols: None,
+                rows: None,
             },
         )
         .await?;
@@ -701,6 +850,8 @@ mod tests {
             &LinkFrame::Join {
                 cap: hex::encode(encode_cap(&wrong_job_cap)?),
                 channel: None,
+                cols: None,
+                rows: None,
             },
         )
         .await?;

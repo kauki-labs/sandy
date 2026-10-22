@@ -30,7 +30,7 @@ use std::{
     sync::Arc,
 };
 
-use sandy_fabric_local::agent::LinkAgent;
+use sandy_fabric_local::agent::{ARCHIVE_TRANSCRIPT, LinkAgent};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 mod link_source;
@@ -198,8 +198,20 @@ where
     // `ProcessBackend` already captures as `Outcome::console`. This never
     // touches the live TTY_STDOUT channel itself (only the bridge above
     // posts to that), so a genuinely attached viewer sees no duplicate.
-    if let Ok(transcript) = tokio::fs::read(tmux_job.log_path()).await {
-        to_stdout(&transcript);
+    //
+    // The same transcript is also the epic #340 phase 2 archive: sent once,
+    // best-effort, to the orchestrator-side channel — the job has already
+    // succeeded or failed by this point, and losing either the console
+    // capture or the archive is not a reason to also fail reporting the
+    // exit, so one read feeds both.
+    match tokio::fs::read(tmux_job.log_path()).await {
+        Ok(transcript) => {
+            to_stdout(&transcript);
+            if let Err(e) = agent.send_archive(ARCHIVE_TRANSCRIPT, transcript).await {
+                eprintln!("sandy-agent: sending the archived transcript: {e}");
+            }
+        }
+        Err(e) => eprintln!("sandy-agent: reading the archived transcript: {e}"),
     }
 
     agent

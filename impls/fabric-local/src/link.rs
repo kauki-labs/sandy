@@ -23,14 +23,14 @@ use sandy_fabric::{
     capauth::{Cap, CapAuthority, CapCodecError, decode_cap, encode_cap},
     channel_backend::ChannelBackend,
 };
-use sandy_proto::{MessageType, PeerMsg, Tty};
+use sandy_proto::{MessageType, Output, PeerMsg, Tty};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::Mutex as AsyncMutex,
 };
 
 use crate::{
-    agent::{AbortOnDrop, TTY_STDERR, TTY_STDIN, TTY_STDOUT},
+    agent::{AbortOnDrop, RESIZE_CONTROL, TTY_STDERR, TTY_STDIN, TTY_STDOUT, decode_resize},
     channel::{Channel, ChannelError, MembershipId},
 };
 
@@ -64,6 +64,16 @@ pub enum LinkFrame {
         /// The peer channel; absent for the orchestrator channel.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         channel: Option<String>,
+        /// The attach client's initial terminal size (epic #340 phase 2) — so
+        /// the first PTY sized for this connection doesn't need a separate
+        /// round trip. Absent for a peer-channel join, and for any join that
+        /// predates this field (`#[serde(default)]`, so an old client still
+        /// decodes).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cols: Option<u16>,
+        /// See `cols`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rows: Option<u16>,
     },
     /// Relay to agent: the join succeeded.
     Joined {
@@ -106,6 +116,27 @@ pub enum LinkFrame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         channel: Option<String>,
     },
+    /// Attach client to relay, and relay to agent (epic #340 phase 2): the
+    /// terminal has resized. Carried as its own frame, not a tagged `Post`,
+    /// since it is a control signal for whoever owns the PTY, never job
+    /// input.
+    Resize {
+        /// The new terminal width, in columns.
+        cols: u16,
+        /// The new terminal height, in rows.
+        rows: u16,
+    },
+    /// Agent to relay, and relay to attach client (epic #340 phase 2):
+    /// one-shot delivery of the job's archived transcript, sent once at job
+    /// end. A dedicated frame (not a tagged `Post`/`Deliver`) because it is
+    /// not job I/O: it carries the whole captured transcript in one frame,
+    /// not a live byte stream.
+    Archive {
+        /// The content type (e.g. a plain-text transcript).
+        content_type: String,
+        /// The hex of the bytes.
+        payload: String,
+    },
 }
 
 impl LinkFrame {
@@ -120,6 +151,8 @@ impl LinkFrame {
             Self::Post { .. } => "post",
             Self::Deliver { .. } => "deliver",
             Self::Exit { .. } => "exit",
+            Self::Resize { .. } => "resize",
+            Self::Archive { .. } => "archive",
         }
     }
 }
@@ -137,12 +170,16 @@ impl std::fmt::Debug for LinkFrame {
             }
             | Self::Deliver {
                 content_type, payload, ..
+            }
+            | Self::Archive {
+                content_type, payload, ..
             } => write!(
                 f,
                 "LinkFrame::{}({content_type}, {} bytes)",
                 self.kind(),
                 payload.len() / 2
             ),
+            Self::Resize { cols, rows } => write!(f, "LinkFrame::Resize({cols}x{rows})"),
         }
     }
 }
@@ -289,7 +326,7 @@ where
     )
     .await?;
     let presented = match read_frame(&mut rd).await? {
-        Some(LinkFrame::Join { cap, channel: None }) => cap,
+        Some(LinkFrame::Join { cap, channel: None, .. }) => cap,
         Some(other) => {
             return Err(LinkError::Protocol(format!(
                 "expected join from the agent, got {}",
@@ -364,7 +401,7 @@ where
         reason
     };
     match read_frame(rd).await? {
-        Some(LinkFrame::Join { cap, channel }) if channel.as_deref() == Some(name.as_str()) && cap == handed => {}
+        Some(LinkFrame::Join { cap, channel, .. }) if channel.as_deref() == Some(name.as_str()) && cap == handed => {}
         Some(LinkFrame::Join { .. }) => {
             let reason = refuse(format!(
                 "the join for peer channel {name} must present the cap handed for it"
@@ -489,16 +526,25 @@ where
                         return;
                     }
                 };
-                if !matches!(env.message_type, Some(MessageType::Tty(_))) || env.content_type != TTY_STDIN {
+                let frame = if matches!(env.message_type, Some(MessageType::Tty(_))) && env.content_type == TTY_STDIN {
+                    LinkFrame::Deliver {
+                        content_type: env.content_type,
+                        payload: hex::encode(&env.payload),
+                        channel: None,
+                    }
+                } else if matches!(env.message_type, Some(MessageType::Control(_)))
+                    && env.content_type == RESIZE_CONTROL
+                {
+                    let Some((cols, rows)) = decode_resize(&env.payload) else {
+                        tracing::warn!("agent relay: malformed resize payload; dropped");
+                        continue;
+                    };
+                    LinkFrame::Resize { cols, rows }
+                } else {
                     continue;
-                }
-                let frame = LinkFrame::Deliver {
-                    content_type: env.content_type,
-                    payload: hex::encode(&env.payload),
-                    channel: None,
                 };
                 if let Err(e) = write_frame(&mut *wr.lock().await, &frame).await {
-                    tracing::warn!(error = %e, "agent relay: delivering stdin failed; stopped");
+                    tracing::warn!(error = %e, "agent relay: delivering stdin/resize failed; stopped");
                     return;
                 }
             }
@@ -609,6 +655,18 @@ where
                 };
                 write_frame(&mut *wr.lock().await, &refused).await?;
             }
+            Some(LinkFrame::Archive { content_type, payload }) => {
+                let bytes = unhex(&payload, "an archive payload")?;
+                membership
+                    .channel
+                    .post(
+                        &membership.id,
+                        Some(MessageType::Output(Output {})),
+                        content_type,
+                        bytes,
+                    )
+                    .await?;
+            }
             Some(other) => {
                 return Err(LinkError::Protocol(format!(
                     "unexpected {} frame from the agent",
@@ -705,6 +763,8 @@ mod tests {
             LinkFrame::Join {
                 cap: secret.clone(),
                 channel: None,
+                cols: None,
+                rows: None,
             },
         ] {
             let shown = format!("{frame:?}");
@@ -765,6 +825,76 @@ mod tests {
         drop(job_stdin);
         // The agent is dropped with its serving task, closing the link: the
         // relay must then end cleanly and leave the membership.
+        timeout(WAIT, relay).await???;
+        Ok(())
+    }
+
+    /// Epic #340 phase 2: a resize posted onto the orchestrator channel (the
+    /// shape `attach_relay`'s client-read arm now posts) reaches the agent as
+    /// a `LinkFrame::Resize`, decodable via [`crate::agent::take_resizes`] —
+    /// not folded into `TTY_STDIN`, not dropped by the inbound filter.
+    #[tokio::test]
+    async fn a_channel_resize_reaches_the_agent_as_a_resize_frame() -> anyhow::Result<()> {
+        use crate::agent::{RESIZE_CONTROL, encode_resize};
+
+        let (channel, agent_cap, orchestrator_cap) = channel_and_caps().await?;
+        let orchestrator = channel.join(&orchestrator_cap)?;
+        let (agent_end, host_end) = tokio::io::duplex(64 * 1024);
+        let relay = tokio::spawn({
+            let channel = Arc::clone(&channel);
+            async move { serve_agent_link(channel, &agent_cap, host_end).await }
+        });
+        let agent = timeout(WAIT, LinkAgent::bootstrap(agent_end)).await??;
+        let mut resizes = agent.take_resizes().context("resizes taken once")?;
+
+        channel
+            .post(
+                &orchestrator,
+                Some(MessageType::Control(sandy_proto::Control {})),
+                RESIZE_CONTROL,
+                encode_resize(100, 30),
+            )
+            .await?;
+        let (cols, rows) = timeout(WAIT, resizes.recv())
+            .await
+            .context("timed out waiting for the resize")?
+            .context("the resize channel closed")?;
+        assert_eq!((cols, rows), (100, 30));
+
+        drop(agent);
+        timeout(WAIT, relay).await???;
+        Ok(())
+    }
+
+    /// Epic #340 phase 2: [`crate::agent::LinkAgent::send_archive`] reaches
+    /// the orchestrator channel as an `Output`/`ARCHIVE_TRANSCRIPT` envelope
+    /// — the shape `attach_relay`'s delivery task now forwards as a dedicated
+    /// `Archive` frame, distinct from ordinary job output.
+    #[tokio::test]
+    async fn send_archive_reaches_the_channel_as_an_output_envelope() -> anyhow::Result<()> {
+        use crate::agent::ARCHIVE_TRANSCRIPT;
+
+        let (channel, agent_cap, orchestrator_cap) = channel_and_caps().await?;
+        let orchestrator = channel.join(&orchestrator_cap)?;
+        let mut observed = std::pin::pin!(channel.subscribe(&orchestrator)?);
+        let (agent_end, host_end) = tokio::io::duplex(64 * 1024);
+        let relay = tokio::spawn({
+            let channel = Arc::clone(&channel);
+            async move { serve_agent_link(channel, &agent_cap, host_end).await }
+        });
+        let agent = timeout(WAIT, LinkAgent::bootstrap(agent_end)).await??;
+
+        agent
+            .send_archive(ARCHIVE_TRANSCRIPT, b"the whole transcript".to_vec())
+            .await?;
+        let env = timeout(WAIT, observed.next())
+            .await?
+            .context("channel stream ended")??;
+        assert!(matches!(env.message_type, Some(MessageType::Output(_))), "got {env:?}");
+        assert_eq!(env.content_type, ARCHIVE_TRANSCRIPT);
+        assert_eq!(env.payload, b"the whole transcript");
+
+        drop(agent);
         timeout(WAIT, relay).await???;
         Ok(())
     }
@@ -1113,7 +1243,16 @@ mod tests {
             peers == expected,
             "the relay announced {peers} peer caps, expected {expected}"
         );
-        write_frame(&mut agent_end, &LinkFrame::Join { cap, channel: None }).await?;
+        write_frame(
+            &mut agent_end,
+            &LinkFrame::Join {
+                cap,
+                channel: None,
+                cols: None,
+                rows: None,
+            },
+        )
+        .await?;
         anyhow::ensure!(
             timeout(WAIT, read_frame(&mut agent_end)).await?? == Some(LinkFrame::Joined { channel: None }),
             "the orchestrator join must succeed"
@@ -1127,6 +1266,8 @@ mod tests {
                 &LinkFrame::Join {
                     cap,
                     channel: channel.clone(),
+                    cols: None,
+                    rows: None,
                 },
             )
             .await?;
@@ -1444,7 +1585,16 @@ mod tests {
             let Some(LinkFrame::Cap { cap, .. }) = timeout(WAIT, read_frame(&mut agent_end)).await?? else {
                 anyhow::bail!("first frame must be a cap");
             };
-            write_frame(&mut agent_end, &LinkFrame::Join { cap, channel: None }).await?;
+            write_frame(
+                &mut agent_end,
+                &LinkFrame::Join {
+                    cap,
+                    channel: None,
+                    cols: None,
+                    rows: None,
+                },
+            )
+            .await?;
             timeout(WAIT, read_frame(&mut agent_end)).await??;
             let Some(LinkFrame::Cap { cap: handed, .. }) = timeout(WAIT, read_frame(&mut agent_end)).await?? else {
                 anyhow::bail!("expected the peer cap frame");
@@ -1454,6 +1604,8 @@ mod tests {
                 &LinkFrame::Join {
                     cap: join_cap.unwrap_or(handed),
                     channel: Some(join_channel.to_string()),
+                    cols: None,
+                    rows: None,
                 },
             )
             .await?;
@@ -1483,7 +1635,16 @@ mod tests {
         let Some(LinkFrame::Cap { cap, .. }) = timeout(WAIT, read_frame(&mut agent_end)).await?? else {
             anyhow::bail!("the relay's first frame must be the cap");
         };
-        write_frame(&mut agent_end, &LinkFrame::Join { cap, channel: None }).await?;
+        write_frame(
+            &mut agent_end,
+            &LinkFrame::Join {
+                cap,
+                channel: None,
+                cols: None,
+                rows: None,
+            },
+        )
+        .await?;
         let joined = timeout(WAIT, read_frame(&mut agent_end)).await??;
         anyhow::ensure!(
             joined == Some(LinkFrame::Joined { channel: None }),
@@ -1525,6 +1686,8 @@ mod tests {
             &LinkFrame::Join {
                 cap: hex::encode(sandy_fabric::capauth::encode_cap(&orchestrator_cap)?),
                 channel: None,
+                cols: None,
+                rows: None,
             },
         )
         .await?;
@@ -1547,6 +1710,8 @@ mod tests {
             &LinkFrame::Join {
                 cap: hex::encode(encode_cap(&agent_cap)?),
                 channel: None,
+                cols: None,
+                rows: None,
             },
         )
         .await?;

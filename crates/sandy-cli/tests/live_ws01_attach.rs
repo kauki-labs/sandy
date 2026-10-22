@@ -217,6 +217,8 @@ async fn join_data_plane(
         &LinkFrame::Join {
             cap: hex::encode(cap),
             channel: None,
+            cols: None,
+            rows: None,
         },
     )
     .await
