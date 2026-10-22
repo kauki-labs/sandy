@@ -185,6 +185,12 @@ enum DaemonOp {
         /// `topology` | `nixos-module` | `nixos-configuration`.
         #[arg(long, requires = "flake")]
         kind: Option<String>,
+        /// The scrollback/transcript line bound for the job's interactive
+        /// session (epic #340): both the live reattach history and the
+        /// archived transcript delivered back once the job ends are capped
+        /// to this many lines.
+        #[arg(long, requires = "flake", default_value_t = sandy_guest_template::manifest::default_history_lines())]
+        history_lines: u32,
         /// The trailing `-- CMD ARGS...` guest command (only meaningful with
         /// `--flake`; empty means "boot the template's default command").
         #[arg(last = true, requires = "flake")]
@@ -599,6 +605,7 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
             flake,
             attr,
             kind,
+            history_lines,
             command,
         } => {
             // clap's `required_unless_present = "flake"`/`conflicts_with`
@@ -610,6 +617,7 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
                     kind,
                     attr,
                     command,
+                    history_lines,
                 };
                 match sandy_guest_template::manifest::encode_flake_manifest(&manifest) {
                     Ok(bytes) => (
