@@ -242,6 +242,13 @@ in
         SANDY_QEMU_BIN = "${cfg.vm.qemuPackage}/bin/qemu-system-x86_64";
         SANDY_NIX_BIN = "${cfg.vm.nixPackage}/bin/nix";
         SANDY_VIRTIOFSD_BIN = "${cfg.vm.virtiofsdPackage}/bin/virtiofsd";
+        # Unlike the three above, this one isn't exec'd directly by sandy's
+        # own code — it tells `run_nix`/`topology()` what directory to put
+        # on `nix`'s OWN child process's PATH, since `nix` itself does a bare
+        # PATH lookup for `git` internally when resolving a `git+https://…`
+        # ref (confirmed live, #337 follow-up: `git` was not found even with
+        # an explicit `Environment=PATH=` set directly on this unit).
+        SANDY_GIT_BIN = "${cfg.vm.gitPackage}/bin/git";
         # Same class of fix as the three above (#336 follow-up): a
         # `flake/v1` dispatch's `nix eval git+https://…` needs a CA bundle
         # to fetch over TLS, and whatever strips this unit's resolved PATH
