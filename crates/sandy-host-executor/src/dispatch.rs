@@ -108,6 +108,24 @@ fn is_timeout(err: &anyhow::Error) -> bool {
         .any(|io_err| io_err.kind() == std::io::ErrorKind::TimedOut)
 }
 
+/// The `SANDY_HISTORY_LINES` env entry for a flake/v1 dispatch's
+/// `RunSpec.env` (epic #340, phase 6): names, for whichever guest-agent code
+/// wraps the job in tmux (phase 1), the scrollback/transcript line bound the
+/// submitter asked for (or
+/// [`sandy_guest_template::manifest::default_history_lines`] if they didn't).
+///
+/// KNOWN GAP, not a bug in this phase: `RunSpec.env` is not plumbed through
+/// to a VM-backed job anywhere today (confirmed: `impls/vm`'s qemu/vfkit/
+/// agent code never reads `spec.env` at all) — setting this is forward-
+/// compatible and costs nothing, but it will not actually reach the guest
+/// until that separate plumbing gap is closed (likely alongside phase 1's
+/// own env-passing work, since the guest also needs `TERM`/locale for the
+/// same reason). Until then, the in-guest default applies regardless of
+/// what a submitter actually asked for.
+fn history_lines_env(history_lines: u32) -> [(String, String); 1] {
+    [("SANDY_HISTORY_LINES".to_owned(), history_lines.to_string())]
+}
+
 /// Decode `Dispatch.manifest` into the argv this host will run, per
 /// `manifest_encoding`. The only encoding stage 1 understands is
 /// [`MANIFEST_ENCODING_ARGV_V1`]; anything else — including an empty tag —
@@ -403,13 +421,14 @@ pub fn handle_dispatch(
                 program: agent_program,
                 on_link,
             });
+            let env = history_lines_env(decoded.history_lines);
             let spec = RunSpec {
                 template: &template,
                 command: &decoded.command,
                 inputs: &[],
                 outputs: &[],
                 secrets: &[],
-                env: &[],
+                env: &env,
                 cpu: None,
                 mem: None,
                 timeout_secs: STAGE1_TIMEOUT_SECS,
@@ -461,6 +480,22 @@ mod tests {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "nix: command not found");
         let wrapped = anyhow::Error::new(io_err).context("spawn `nix build ...`");
         assert!(!is_timeout(&wrapped));
+    }
+
+    #[test]
+    fn history_lines_env_carries_the_submitter_requested_bound() {
+        assert_eq!(
+            history_lines_env(5_000),
+            [("SANDY_HISTORY_LINES".to_owned(), "5000".to_owned())]
+        );
+    }
+
+    #[test]
+    fn history_lines_env_carries_the_default_when_unset() {
+        assert_eq!(
+            history_lines_env(sandy_guest_template::manifest::default_history_lines()),
+            [("SANDY_HISTORY_LINES".to_owned(), "10000".to_owned())]
+        );
     }
 
     #[test]

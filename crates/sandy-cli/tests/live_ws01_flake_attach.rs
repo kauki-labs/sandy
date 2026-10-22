@@ -155,6 +155,7 @@ async fn submit_flake(
         kind: None,
         attr: None,
         command,
+        history_lines: sandy_guest_template::manifest::default_history_lines(),
     })
     .context("encode flake/v1 manifest")?;
     let response = call(
