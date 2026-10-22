@@ -27,7 +27,7 @@ use std::{
     io::Write,
     os::{fd::AsFd, unix::process::ExitStatusExt},
     pin::Pin,
-    process::{ExitCode, ExitStatus, Stdio},
+    process::{ExitCode, ExitStatus},
     sync::Arc,
     task::{Context, Poll},
 };
@@ -37,8 +37,10 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 mod link_source;
 mod peer;
+mod tmux_pty;
 
 use link_source::LinkSource;
+use tmux_pty::TmuxJob;
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -124,40 +126,47 @@ where
     // Removed on every path out, a failed bridge included.
     let _peer_dir_cleanup = peer_dir.clone().map(RemoveDirOnDrop);
 
-    let (program, args) = job.split_first().ok_or("empty job argv")?;
-    let mut command = tokio::process::Command::new(program);
-    if let Some(dir) = &peer_dir {
-        command.env(peer::PEER_SOCKET_ENV, dir.join(peer::SOCKET_NAME));
+    if job.is_empty() {
+        return Err("empty job argv".to_string());
     }
-    let mut child = command
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| format!("spawning the job {}: {e}", program.to_string_lossy()))?;
-    let (Some(stdin), Some(stdout), Some(stderr)) = (child.stdin.take(), child.stdout.take(), child.stderr.take())
-    else {
-        return Err("the job's stdio pipes were not created".to_string());
-    };
+    // #340 phase 1: the job runs inside a detached tmux session behind a real
+    // PTY, not as this process's own direct child over three pipes — see
+    // `tmux_pty`'s module doc for why (TUI/line-discipline support, and
+    // surviving independent of any one attach connection).
+    let peer_env = peer_dir.as_deref().map(|dir| (peer::PEER_SOCKET_ENV, dir));
+    let tmux_job = TmuxJob::start(&job, peer_env).map_err(|e| format!("starting the tmux job session: {e}"))?;
+    let (pty_read, pty_write, mut attach_child) = tmux_job
+        .open_attach()
+        .map_err(|e| format!("opening the attach pty: {e}"))?;
 
-    // Tee the job's output to this process's own stdio as well, so the backend's
-    // console capture still carries it.
+    // Tee the job's output to this process's own stdio as well, so the
+    // backend's console capture still carries it. The PTY already merges
+    // stdout+stderr, so the bridge's stderr side is an immediate EOF.
     let bridged = agent
-        .serve_tty(Tee::new(stdout, to_stdout), Tee::new(stderr, to_stderr), stdin)
+        .serve_tty(Tee::new(pty_read, to_stdout), tokio::io::empty(), pty_write)
         .await;
     if let Err(e) = bridged {
-        let _ = child.start_kill();
-        let _ = child.wait().await;
+        tmux_job.kill();
+        let _ = attach_child.kill();
         return Err(format!("bridging the job's stdio: {e}"));
     }
-    let status = child.wait().await.map_err(|e| format!("waiting on the job: {e}"))?;
+
+    // The bridge ending (this attach's pty hit EOF) says nothing about
+    // whether the job inside the detached session has finished — only the
+    // sentinel file its wrapped command writes does; the session persists
+    // independent of any one attach connection by design (#340).
+    let exit = tmux_job
+        .wait_for_exit()
+        .await
+        .map_err(|e| format!("reading the job's real exit code: {e}"))?;
+    tmux_job.kill();
+    let _ = attach_child.wait();
+
     agent
-        .report_exit(i32::from(exit_code(status)))
+        .report_exit(exit)
         .await
         .map_err(|e| format!("reporting the job's exit: {e}"))?;
-    Ok(status)
+    Ok(ExitStatus::from_raw(exit << 8))
 }
 
 /// Removes the peer socket's private dir when dropped.
@@ -204,10 +213,6 @@ fn exit_code(status: ExitStatus) -> u8 {
 fn to_stdout(bytes: &[u8]) {
     let mut out = std::io::stdout().lock();
     let _ = out.write_all(bytes).and_then(|()| out.flush());
-}
-
-fn to_stderr(bytes: &[u8]) {
-    let _ = std::io::stderr().lock().write_all(bytes);
 }
 
 /// An [`AsyncRead`] that copies every chunk it yields to `sink`.

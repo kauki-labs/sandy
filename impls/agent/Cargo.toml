@@ -23,12 +23,14 @@ workspace = true
 [dependencies]
 base64.workspace = true
 sandy-api.workspace = true
+portable-pty.workspace = true
 rustix = { workspace = true, features = ["process", "stdio"] }
 sandy-fabric-local.workspace = true
 sandy-fsutil.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = [
+  "fs",
   "rt-multi-thread",
   "net",
   "process",

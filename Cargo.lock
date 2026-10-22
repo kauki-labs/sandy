@@ -2134,6 +2134,7 @@ dependencies = [
  "anyhow",
  "base64 0.23.1",
  "futures-util",
+ "portable-pty",
  "rustix",
  "sandy-api",
  "sandy-fabric",
