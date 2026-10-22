@@ -242,6 +242,25 @@ in
         SANDY_QEMU_BIN = "${cfg.vm.qemuPackage}/bin/qemu-system-x86_64";
         SANDY_NIX_BIN = "${cfg.vm.nixPackage}/bin/nix";
         SANDY_VIRTIOFSD_BIN = "${cfg.vm.virtiofsdPackage}/bin/virtiofsd";
+        # Same class of fix as the three above (#336 follow-up): a
+        # `flake/v1` dispatch's `nix eval git+https://…` needs a CA bundle
+        # to fetch over TLS, and whatever strips this unit's resolved PATH
+        # down to a stock per-user profile shape appears to strip these too
+        # — confirmed live, `nix eval` failed with "Failed to fetch git
+        # repository" (nix swallows the underlying curl/git error here,
+        # no further detail in the journal) while a plain interactive SSH
+        # session on the same host fetches the identical repo fine.
+        # `NIX_SSL_CERT_FILE` is nix's own convention for this (its fetchers
+        # run in a stripped-down environment by design and need an explicit
+        # pointer to the CA bundle); `SSL_CERT_FILE` covers anything else in
+        # the dispatch's subprocess tree that reads the plain OpenSSL
+        # convention instead. `/etc/ssl/certs/ca-certificates.crt` is the
+        # stable NixOS-wide path (a symlink the current generation
+        # maintains, not a generation-specific store path), reachable under
+        # `ProtectSystem=strict` (that only hardens `/usr`/`/boot`/`/efi`,
+        # never `/etc`).
+        NIX_SSL_CERT_FILE = "/etc/ssl/certs/ca-certificates.crt";
+        SSL_CERT_FILE = "/etc/ssl/certs/ca-certificates.crt";
       };
 
       serviceConfig = {
