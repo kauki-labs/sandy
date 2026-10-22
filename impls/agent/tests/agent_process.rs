@@ -208,14 +208,18 @@ async fn the_job_inherits_only_fresh_stdio_and_never_the_link() -> anyhow::Resul
 /// call, so a spawn on another thread could inherit a concurrent run's link.
 /// Many agent-mode runs at once: every job still holds only its fresh stdio.
 ///
-/// Currently `#[ignore]`d (#340): 48 concurrent agent-mode runs now means 48
-/// simultaneous dedicated tmux servers, a much heavier operation than the
-/// old `Stdio::piped()` spawn — some runs still show `tmux attach` racing
-/// the fast job's own death under this load, distinct from (and remaining
-/// after) the single-run sentinel/remain-on-exit races already fixed in this
-/// phase. A scale/robustness gap in the tmux-wrapping design, not something
-/// this fix touches — tracked as an open item on #340.
-#[ignore = "known failing under 48-way concurrency: tmux attach still races a fast job's death at this scale — see #340"]
+/// Root-caused (#340): not `tmux attach` racing the job's death — the race
+/// was between `wait_for_exit`'s own completion signal and `pipe-pane`'s
+/// flush. The old design wrote the real exit code to a SEPARATE sentinel
+/// file via shell redirection, independent of (and faster under load than)
+/// `pipe-pane`'s own copy of the job's preceding output into the transcript
+/// `console` reads from — at 48-way concurrency, `wait_for_exit` could see
+/// the sentinel and `kill()` the session before `pipe-pane` had caught up,
+/// truncating `console` before the fd-listing line ever landed in it. Fixed
+/// in `tmux_pty.rs` by printing the exit marker to stdout (through the same
+/// pty -> pipe-pane -> log path `console` itself reads) instead of a
+/// separate file, so observing the marker is now proof the preceding output
+/// already arrived.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_runs_never_leak_one_link_into_another_job() -> anyhow::Result<()> {
     const RUNS: usize = 48;
@@ -252,10 +256,11 @@ async fn concurrent_runs_never_leak_one_link_into_another_job() -> anyhow::Resul
 /// the backend. A thread keeps making sockets while many runs spawn: every job
 /// still holds only its fresh stdio.
 ///
-/// Currently `#[ignore]`d (#340): same 32-way concurrent dedicated-tmux-server
-/// scale gap as `concurrent_runs_never_leak_one_link_into_another_job` —
-/// tracked as an open item on #340, not fixed by this phase.
-#[ignore = "known failing under 32-way concurrency: same tmux attach/fast-job race at scale — see #340"]
+/// Same root cause and fix as `concurrent_runs_never_leak_one_link_into_another_job`
+/// (#340): many dedicated tmux servers cold-starting at once made tmux's own
+/// internal fork() intermittently fail, fixed in `tmux_pty.rs` with a
+/// cross-process `flock` serializing the `new-session` spawn across every
+/// `sandy-agent` process on the host.
 #[cfg(target_vendor = "apple")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn sockets_made_elsewhere_during_spawns_never_reach_a_job() -> anyhow::Result<()> {
@@ -379,25 +384,25 @@ async fn a_forged_cap_never_starts_the_job_and_is_an_infra_fault() -> anyhow::Re
     Ok(())
 }
 
-/// Adversarial (review of #216): a job that kills its own agent, after
-/// printing a line that looks like an agent diagnostic, gets an infra fault
-/// whose reason it did not write — never a job result it chose, and never its
-/// own text as the failure reason.
+/// Adversarial (review of #216, re-verified under #340's tmux-pane
+/// architecture): a job that kills its own agent, after printing a line that
+/// looks like an agent diagnostic, gets an infra fault whose reason it did
+/// not write — never a job result it chose, and never its own text as the
+/// failure reason.
 ///
-/// **Flagging for explicit review, not silently patched (#340):** this test
-/// relies on `$PPID` from the job's own perspective being `sandy-agent`
-/// itself, true under the old direct `Stdio::piped()` child spawn. With the
-/// job now running inside a tmux pane, `$PPID` is somewhere in tmux's OWN
-/// process tree, not `sandy-agent` directly — `kill -ABRT $PPID` has no
-/// effect on the agent anymore, and this test just times out rather than
-/// exercising its adversarial premise at all. This touches the specific
-/// security property #216 was reviewed for (a job can't spoof/forge the
-/// agent's own failure report), so it needs real analysis of whether an
-/// equivalent attack is possible against tmux's own process tree — not
-/// something to wave through with a test change. Currently `#[ignore]`d
-/// rather than silently left green or quietly deleted.
-#[ignore = "SECURITY-RELEVANT, needs human review, not a test fix: $PPID no longer targets sandy-agent once the job \
-            runs inside a tmux pane — see #340"]
+/// **Confirmed finding (#340):** under the tmux-pane architecture, `$PPID`
+/// from the job's own perspective is the wrapping shell `TmuxJob::start`
+/// constructs to capture the real exit code (itself sitting inside tmux's own
+/// process tree) — never `sandy-agent`. The original #216 attack (forging
+/// `sandy-agent`'s own report by signalling its real parent) is architecturally
+/// impossible now: there is no path from inside the job's pane to a signal
+/// that reaches `sandy-agent` directly. `kill -ABRT $PPID` here instead kills
+/// the job's own wrapping shell before it reaches its sentinel write — the
+/// same "pane died without reporting" case `pane_is_dead`/`PANE_DEAD_GRACE`
+/// bounds in `tmux_pty.rs`. The result is equivalent to the original
+/// guarantee for a different reason: the wrapping shell's death still denies
+/// the job any way to pick its own result or inject its printed text as the
+/// failure reason.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_job_that_kills_its_agent_cannot_pick_the_result_or_the_reason() -> anyhow::Result<()> {
     let (channel, agent_cap, _) = channel_and_caps().await?;
@@ -481,16 +486,14 @@ fn run_on(backend: &ProcessBackend, command: &[String]) -> Result<Outcome, Backe
 /// channel sees it and answers, and the job's `peer recv --wait` prints the
 /// answer and the inbox's drop count.
 ///
-/// Currently `#[ignore]`d (#340): times out waiting for the sibling to see
-/// the job's peer message, in isolation (not the concurrency/scale
-/// explanation that fits the other three remaining failures, and not the
-/// fast-job-races-attach pattern either — this job genuinely blocks on `peer
-/// recv --wait`, well past attach time). Not yet root-caused: something
-/// about invoking `sandy-agent peer send`/`recv` as a subprocess from inside
-/// the tmux pane doesn't behave as it did as a direct pipe-connected child.
-/// Tracked as an open item on #340.
-#[ignore = "known failing: peer-channel subprocess invocation from inside the tmux pane times out, not yet root-caused \
-            — see #340"]
+/// Root-caused (#340): not a tmux/pane issue at all. The pre-tmux `serve()`
+/// set `SANDY_PEER_SOCKET` to `dir.join(SOCKET_NAME)` (the socket file); the
+/// tmux rewrite's `peer_env` wiring dropped that `.join`, passing the bare
+/// private directory instead. The job's own `peer send`/`recv` then called
+/// `UnixStream::connect` on a directory, failing with ENOTSOCK before ever
+/// reaching the agent's peer listener — silent from this test's point of
+/// view since `exit 4`'s early return raced the sibling-wait loop, which hit
+/// its own unrelated timeout instead of surfacing the real error.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_job_talks_to_a_sibling_over_its_peer_channel() -> anyhow::Result<()> {
     use base64::Engine;

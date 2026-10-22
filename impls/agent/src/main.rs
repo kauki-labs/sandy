@@ -131,7 +131,8 @@ where
     // PTY, not as this process's own direct child over three pipes — see
     // `tmux_pty`'s module doc for why (TUI/line-discipline support, and
     // surviving independent of any one attach connection).
-    let peer_env = peer_dir.as_deref().map(|dir| (peer::PEER_SOCKET_ENV, dir));
+    let peer_socket = peer_dir.as_deref().map(|dir| dir.join(peer::SOCKET_NAME));
+    let peer_env = peer_socket.as_deref().map(|socket| (peer::PEER_SOCKET_ENV, socket));
     let tmux_job = TmuxJob::start(&job, peer_env).map_err(|e| format!("starting the tmux job session: {e}"))?;
     let (pty_read, pty_write, mut attach_child) = tmux_job
         .open_attach()

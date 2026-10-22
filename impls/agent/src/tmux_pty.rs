@@ -13,10 +13,19 @@
 //!
 //! The job's real exit code cannot be read from `tmux attach`'s own exit
 //! status (attaching ending says nothing about whether the job inside the
-//! pane has finished). Instead the pane's command is wrapped to write a
-//! sentinel file once the job exits, which [`wait_for_exit`] polls for —
-//! independent of whether the bridge already ended, since the whole point of
-//! a persistent tmux session is that the job keeps running detached.
+//! pane has finished). Instead the pane's command is wrapped to print a
+//! sentinel line as its own last line of output once the job exits, which
+//! [`wait_for_exit`] tails the `pipe-pane` transcript for — independent of
+//! whether the bridge already ended, since the whole point of a persistent
+//! tmux session is that the job keeps running detached. The marker rides the
+//! SAME stream `log_path`'s console capture reads, rather than a separate
+//! sentinel file: a separate file raced `pipe-pane`'s own, independently
+//! scheduled flush under load (confirmed: concurrent runs at scale saw the
+//! sentinel file's exit code land before `pipe-pane` had actually finished
+//! copying the job's preceding output into the log, truncating the
+//! transcript). Detecting the marker by its appearance IN the transcript
+//! makes that race structurally impossible — if the marker is visible,
+//! everything the job wrote before it in program order is already there too.
 
 use std::{
     io::{Read, Write},
@@ -39,8 +48,25 @@ const HISTORY_LIMIT: u32 = 10_000;
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
 
-/// How often [`wait_for_exit`] polls for the sentinel file.
+/// How often [`wait_for_exit`] polls the transcript for the exit marker.
 const SENTINEL_POLL: Duration = Duration::from_millis(50);
+
+/// The job's wrapped command prints `{EXIT_MARKER}<code>` as its own last
+/// line of output; [`wait_for_exit`] tails the transcript for it.
+const EXIT_MARKER: &str = "sandy-exit:";
+
+/// How many [`SENTINEL_POLL`] iterations between `pane_dead` checks (roughly
+/// once a second) — cheap compared to an interactive job's own lifetime
+/// (which can run for hours), but far too expensive to spawn `tmux
+/// display-message` on every single 50ms sentinel poll.
+const PANE_DEAD_CHECK_EVERY: u32 = 20;
+
+/// How long a dead pane with no sentinel is given before
+/// [`TmuxJob::wait_for_exit`] gives up and reports it as a real error,
+/// rather than polling forever. Short enough that a genuinely killed job
+/// resolves promptly; long enough to not race a legitimate final
+/// sentinel-write still in flight.
+const PANE_DEAD_GRACE: Duration = Duration::from_secs(2);
 
 /// A fixed `TERM` every `tmux` invocation gets explicitly: `ProcessBackend`
 /// spawns `sandy-agent` itself with `.env_clear()`, passing through only
@@ -73,7 +99,6 @@ pub struct TmuxJob {
     /// stopped hiding it). Each `TmuxJob` gets a server entirely its own.
     socket: String,
     session: String,
-    sentinel: PathBuf,
     /// The continuous `pipe-pane` transcript of the whole session's output,
     /// started before any attach — the epic #340 archival design's source
     /// file. Delivering it back to the submitter is phase 2+ scope; this
@@ -100,9 +125,9 @@ fn quote_argv(argv: &[std::ffi::OsString]) -> String {
 impl TmuxJob {
     /// Create a detached tmux session named uniquely per agent process
     /// (one job per bootstrap, so a fixed name is safe), running `job`
-    /// wrapped to report its real exit code via a sentinel file, with
-    /// `history-limit` and continuous `pipe-pane` logging enabled from the
-    /// moment the session exists (before any attach) — satisfying
+    /// wrapped to print its real exit code as the transcript's own last line,
+    /// with `history-limit` and continuous `pipe-pane` logging enabled from
+    /// the moment the session exists (before any attach) — satisfying
     /// "since the start of execution" (#340).
     ///
     /// # Errors
@@ -123,16 +148,14 @@ impl TmuxJob {
         let tmp = std::env::temp_dir();
         let socket = format!("sandy-job-{unique}");
         let session = format!("sandy-job-{unique}");
-        let sentinel = tmp.join(format!("sandy-job-{unique}.exit"));
         let log = tmp.join(format!("sandy-job-{unique}.log"));
-        let _ = std::fs::remove_file(&sentinel);
         let _ = std::fs::remove_file(&log);
 
-        let script = format!(
-            "{}; printf 'sandy-exit:%d\\n' \"$?\" > {}",
-            quote_argv(job),
-            sh_quote(&sentinel.to_string_lossy())
-        );
+        // Printed to stdout, not a separate file: this marker rides the same
+        // pty -> pipe-pane -> log stream `wait_for_exit` tails, so observing
+        // it in the log is itself proof every byte the job wrote before it
+        // is already there (see this module's own doc comment).
+        let script = format!("{}; printf '{EXIT_MARKER}%d\\n' \"$?\"", quote_argv(job));
 
         // `remain-on-exit` MUST take effect at the moment the server starts,
         // before the session (and its pane's command) exists at all — not
@@ -187,7 +210,37 @@ impl TmuxJob {
                 cmd.arg("-e").arg(format!("{name}={}", dir.display()));
             }
             cmd.args(["sh", "-c", &script]);
-            run_tmux(&mut cmd)?;
+            // Each `new-session` here cold-starts a brand new tmux SERVER
+            // (dedicated `-L` socket, never shared), which itself forks
+            // twice (daemonize, then the pane's shell) — confirmed live: at
+            // 48-way concurrency, with each job its own SEPARATE sandy-agent
+            // OS process, many servers cold-starting within the same tight
+            // window made tmux's OWN internal fork() intermittently fail
+            // ("create window failed: fork failed"), reproducing in this
+            // crate's own process tree but not in an equivalent plain shell
+            // loop of the same width — something about how tightly our own
+            // spawn path bunches them. Serializing just this one spawn
+            // across EVERY `sandy-agent` process on the host (not the
+            // session's lifetime, which still runs fully concurrently once
+            // up) needs a cross-process lock, not an in-process `Mutex` —
+            // each job is its own process, so a `Mutex` here would never
+            // have another holder to contend with. `flock` on a fixed path
+            // is released by the kernel the moment this process's fd closes
+            // (including on a crash mid-spawn), so there's no stale-lock
+            // cleanup to get wrong. The existing `SPAWN_LOCK` in
+            // `impls/local/src/process.rs` is the same fix for the same
+            // class of problem (#230/#281) one layer up, there in-process
+            // because that spawn genuinely does happen inside shared
+            // in-process concurrency.
+            let lock_file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(tmp.join("sandy-tmux-spawn.lock"))?;
+            fs2::FileExt::lock_exclusive(&lock_file)?;
+            let result = run_tmux(&mut cmd);
+            let _ = fs2::FileExt::unlock(&lock_file);
+            result?;
             // tmux only ever reads `-f`'s config once, synchronously, at
             // server startup — which `new-session` above already waited on,
             // and which is also what registered the `session-created` hook
@@ -202,12 +255,7 @@ impl TmuxJob {
             return Err(e);
         }
 
-        Ok(Self {
-            socket,
-            session,
-            sentinel,
-            log,
-        })
+        Ok(Self { socket, session, log })
     }
 
     /// The continuous transcript [`start`] began piping the session's output
@@ -233,32 +281,104 @@ impl TmuxJob {
         &self.session
     }
 
-    /// Poll for the sentinel file [`start`] wraps the job to write, parsing
-    /// its real exit code. Independent of the bridge/attach lifetime: the job
-    /// may still be running in the detached session after a lone attach ends.
+    /// Tail the `pipe-pane` transcript ([`start`] wraps the job to print its
+    /// real exit code as the transcript's own last line) for [`EXIT_MARKER`],
+    /// parsing the real exit code. Independent of the bridge/attach
+    /// lifetime: the job may still be running in the detached session after
+    /// a lone attach ends.
+    ///
+    /// Reads only newly appended bytes each poll (never the whole file), so
+    /// cost stays bounded by how much the job actually writes, not by how
+    /// long an interactive session has been attached.
     ///
     /// # Errors
-    /// If the sentinel file exists but its contents are not the expected
-    /// `sandy-exit:<code>` shape.
+    /// If the log file cannot be read once it exists.
+    ///
+    /// A pane that dies WITHOUT ever printing the marker (confirmed: a job
+    /// that signals its own wrapping shell dead mid-script, before the
+    /// trailing marker-print ever runs — `remain-on-exit` keeps a pane like
+    /// this around, so it never shows up as a dead *session* either, just a
+    /// frozen, markerless one) is treated as a real error after a grace
+    /// period, not polled for forever. Without this, exactly that case
+    /// leaked an orphaned dedicated tmux server indefinitely — confirmed
+    /// live: several hours-old orphaned servers found from this exact
+    /// scenario before this existed.
     pub async fn wait_for_exit(&self) -> std::io::Result<i32> {
+        use tokio::io::AsyncReadExt;
+
+        let mut file = loop {
+            match tokio::fs::File::open(&self.log).await {
+                Ok(file) => break file,
+                // The `session-created` hook's `pipe-pane` spawn (a separate
+                // process from `new-session` itself) can land a tick after
+                // `start()` returns — not ready yet is expected, not an error.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    tokio::time::sleep(SENTINEL_POLL).await;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        };
+
+        // Only the as-yet-unmatched tail since the last read: the marker is
+        // a single short line, so this never needs more than a tiny window
+        // regardless of how much the job has written overall.
+        let mut tail = String::new();
+        let mut dead_since: Option<std::time::Instant> = None;
+        let mut iteration: u32 = 0;
         loop {
-            // A momentarily-empty (or partial) read is a real, expected
-            // state, not a failure: the wrapped script's `>` redirection
-            // creates/truncates the file the instant the shell parses the
-            // command line, strictly before `printf` has actually written
-            // anything to it — a poll can legitimately land in that window.
-            // Only treat it as ready once it parses; anything else (missing,
-            // empty, partial) just means "keep polling."
-            if let Ok(contents) = tokio::fs::read_to_string(&self.sentinel).await
-                && let Some(code) = contents
-                    .trim()
-                    .strip_prefix("sandy-exit:")
-                    .and_then(|n| n.parse::<i32>().ok())
+            let mut chunk = Vec::new();
+            file.read_to_end(&mut chunk).await?;
+            if !chunk.is_empty() {
+                tail.push_str(&String::from_utf8_lossy(&chunk));
+                if let Some(after) = tail.find(EXIT_MARKER).map(|i| i + EXIT_MARKER.len()) {
+                    // A real pty's line discipline echoes `\n` as `\r\n`; the
+                    // line may also not have arrived in full yet.
+                    if let Some(line_end) = tail[after..].find('\n') {
+                        let code = tail[after..after + line_end].trim_end_matches('\r');
+                        if let Ok(code) = code.parse::<i32>() {
+                            return Ok(code);
+                        }
+                    }
+                } else {
+                    // No marker yet: keep only enough of the tail to catch
+                    // one split across two reads, so a long-running job's
+                    // transcript never grows this buffer unbounded.
+                    let keep_from = tail.len().saturating_sub(64);
+                    tail.drain(..keep_from);
+                }
+            }
+            // Throttled: a long-lived interactive job can run for hours, so
+            // this must not spawn `tmux display-message` on every 50ms poll
+            // — only roughly once a second, and not at all once a death is
+            // already confirmed (no point re-checking after that).
+            iteration += 1;
+            if dead_since.is_none() && iteration.is_multiple_of(PANE_DEAD_CHECK_EVERY) && self.pane_is_dead() {
+                dead_since = Some(std::time::Instant::now());
+            }
+            if let Some(since) = dead_since
+                && since.elapsed() > PANE_DEAD_GRACE
             {
-                return Ok(code);
+                return Err(std::io::Error::other(
+                    "the pane died without ever printing its exit marker (likely killed by a signal before it could \
+                     report)",
+                ));
             }
             tokio::time::sleep(SENTINEL_POLL).await;
         }
+    }
+
+    /// Whether this job's pane has already died (`#{pane_dead}`), via a
+    /// cheap, throttled `tmux display-message` query — best-effort: any
+    /// failure (including the session already being fully gone) reads as
+    /// "not dead" here, since [`wait_for_exit`]'s own sentinel read is what
+    /// actually confirms completion; this only unsticks the case where the
+    /// sentinel will never arrive.
+    fn pane_is_dead(&self) -> bool {
+        tmux_cmd(&self.socket)
+            .args(["display-message", "-p", "-t", &self.session, "#{pane_dead}"])
+            .output()
+            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).trim() == "1")
     }
 
     /// Tear the whole dedicated server down (not just the session): since
@@ -455,10 +575,11 @@ mod tests {
         Ok(())
     }
 
-    /// The real job exit code survives the sentinel round trip, independent
-    /// of `tmux attach`'s own (irrelevant) exit status.
+    /// The real job exit code survives the marker round trip through the
+    /// transcript, independent of `tmux attach`'s own (irrelevant) exit
+    /// status.
     #[tokio::test]
-    async fn the_real_exit_code_is_read_back_via_the_sentinel() -> std::io::Result<()> {
+    async fn the_real_exit_code_is_read_back_from_the_transcript() -> std::io::Result<()> {
         let job = vec!["sh".into(), "-c".into(), "exit 42".into()];
         let tmux_job = TmuxJob::start(&job, None)?;
         let exit = tokio::time::timeout(Duration::from_secs(10), tmux_job.wait_for_exit())
@@ -466,6 +587,34 @@ mod tests {
             .map_err(std::io::Error::other)??;
         tmux_job.kill();
         assert_eq!(exit, 42);
+        Ok(())
+    }
+
+    /// Regression (#340): confirmed live as the real mechanism behind a
+    /// separate leak (several hours-old orphaned dedicated tmux servers
+    /// found in this crate's own test runs) — a job that kills its own
+    /// wrapping shell via a signal, before that shell ever reaches the
+    /// trailing marker-print, must not hang `wait_for_exit` forever.
+    /// `remain-on-exit` keeps a pane like this around (it's not even a dead
+    /// *session*, just a frozen, markerless one), so without the
+    /// `pane_is_dead` check this polled indefinitely, leaking the session.
+    #[tokio::test]
+    async fn a_job_that_kills_its_own_wrapping_shell_does_not_hang_forever() -> std::io::Result<()> {
+        // `$PPID` from inside this nested `sh -c` is the OUTER wrapping
+        // shell `TmuxJob::start` itself constructs (confirmed live:
+        // completely distinct from any process outside the pane) — killing
+        // it aborts that wrapper before its trailing marker-print ever
+        // runs, exactly the scenario the adversarial `kill -ABRT $PPID` test
+        // (`agent_process.rs`) exercises against the real spawned agent.
+        let job = vec!["sh".into(), "-c".into(), "kill -ABRT $PPID; exit 0".into()];
+        let tmux_job = TmuxJob::start(&job, None)?;
+        let result = tokio::time::timeout(Duration::from_secs(10), tmux_job.wait_for_exit()).await;
+        tmux_job.kill();
+        match result {
+            Ok(Err(_)) => {} // the expected, bounded "pane died, no marker" error
+            Ok(Ok(code)) => panic!("expected an error, got a spurious exit code {code}"),
+            Err(_) => panic!("wait_for_exit hung past its own PANE_DEAD_GRACE bound — the leak this regresses"),
+        }
         Ok(())
     }
 
