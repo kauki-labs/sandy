@@ -66,6 +66,7 @@ fn end_to_end() -> Result<(), String> {
             shares: false,
         },
         secret_dir: None,
+        control: sandy::RunControl::with_timeout_secs(60),
     };
 
     let report = run_with_profile(&profiles::all_local(), &journal, &plan, None)

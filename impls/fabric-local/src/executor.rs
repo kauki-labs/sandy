@@ -23,6 +23,8 @@
 //! a multi-thread Tokio runtime, so whatever composes a [`VmBackendExecutor`]
 //! (the fabric composition root, #115) must run on one.
 
+#[cfg(test)]
+use sandy_api::backend::RunControl;
 use sandy_api::backend::{BackendError, BoxState, Outcome, RunSpec, VmBackend};
 use sandy_fabric::executor::{Arch, Capabilities, Executor, ExecutorError};
 
@@ -129,6 +131,7 @@ mod tests {
             shares: false,
         };
         let command = ["sh".to_owned(), "-c".to_owned(), "exit 3".to_owned()];
+        let control = RunControl::with_timeout_secs(30);
         let spec = RunSpec {
             template: "contract",
             command: &command,
@@ -142,6 +145,7 @@ mod tests {
             grants: &grants,
             outcome_file: None,
             secret_dir: None,
+            control: &control,
         };
         let outcome = executor.run(&spec).await?;
         assert_eq!(outcome.guest_exit, Some(3), "the real exit is carried");

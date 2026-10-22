@@ -623,6 +623,7 @@ mod tests {
         let msg = AttachStateChanged {
             job_id: "job-1".to_owned(),
             attached: true,
+            sequence: 0,
         };
         registry.send_attach_state_changed("ws01", msg.clone()).await?;
 
@@ -649,6 +650,7 @@ mod tests {
         let msg = AttachStateChanged {
             job_id: "job-1".to_owned(),
             attached: false,
+            sequence: 0,
         };
         registry.send_attach_state_changed("ws01", msg.clone()).await?;
         assert_eq!(attach_state_rx.recv().await, Some(msg));
@@ -664,6 +666,7 @@ mod tests {
                 AttachStateChanged {
                     job_id: "job-1".to_owned(),
                     attached: true,
+                    sequence: 0,
                 },
             )
             .await;

@@ -144,6 +144,7 @@ fn a_refreshed_token_reaches_the_running_guest() -> anyhow::Result<()> {
             shares: false,
         },
         secret_dir: None,
+        control: sandy::RunControl::with_timeout_secs(60),
     };
 
     let provider = RotatingProvider::new();

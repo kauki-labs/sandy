@@ -41,6 +41,16 @@ from a fake.
   aarch64-darwin host builds its aarch64-linux guest on a remote `aarch64-linux`
   builder; `sandy doctor` refuses and names the fix when nix or the builder is
   missing.
+- **A live control handle, not a timeout fixed at the start (#340).**
+  `RunSpec.control: &RunControl` carries a cancellation flag and a mutable
+  deadline (`None` = suspended, no deadline enforced) that something outside
+  the run — `daemon cancel`, sandyd's M2 attach-state signaling
+  (`docs/decisions/sandyd.md` decision 14's amendment) — can flip or move
+  while the job is still running, instead of a `u32` seconds value baked
+  into one `Instant` computed once at the start. `ProcessBackend`'s poll
+  loop reads it live each tick; the VM backends thread it through `RunSpec`
+  for contract compliance but don't yet honor it dynamically (named as an
+  explicit gap in the decision record, not silently left).
 
 **KPI.**
 

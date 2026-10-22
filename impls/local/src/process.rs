@@ -605,6 +605,15 @@ mod tests {
 
     use super::*;
 
+    /// A shared, reusable control handle for tests that don't exercise
+    /// cancellation/deadline behavior themselves (#340) — avoids threading a
+    /// fresh `RunControl` and its own `let` binding through every call site
+    /// of the `run_spec()` fixture below.
+    fn test_control() -> &'static sandy_api::backend::RunControl {
+        static CONTROL: std::sync::OnceLock<sandy_api::backend::RunControl> = std::sync::OnceLock::new();
+        CONTROL.get_or_init(|| sandy_api::backend::RunControl::with_timeout_secs(30))
+    }
+
     fn run_spec<'a>(command: &'a [String], grants: &'a Grants, timeout_secs: u32) -> RunSpec<'a> {
         RunSpec {
             template: "process",
@@ -619,6 +628,7 @@ mod tests {
             grants,
             outcome_file: None,
             secret_dir: None,
+            control: test_control(),
         }
     }
 

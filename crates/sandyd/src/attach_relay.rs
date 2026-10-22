@@ -76,30 +76,71 @@ pub async fn serve_attach_accept_loop(
     }
 }
 
-/// Best-effort: notify `job`'s placed host-executor (#340) that its attach-
-/// membership count is now `attached` (`true` right after a join that
-/// brought it from 0, `false` right after a leave that dropped it to 0). A
-/// no-op if the job was never placed remotely (`host_id` is `None`, e.g. a
-/// local-only run) or the send fails (the host disconnected, or never
-/// registered this job at all) — logged, never propagated, since losing this
-/// notification only costs the "unlimited while attached" policy for this
-/// job, never the attach session itself (the same "best-effort, not a gate"
-/// discipline `persist_attach_token` already follows elsewhere in this
-/// feature).
+/// Join `cap` onto `job`'s channel, returning the resulting membership plus
+/// — as ONE critical section, serialized against every other
+/// `join_for_attach`/`leave_for_attach` call on this SAME job via
+/// `job.attach_seq` — the post-join member count and the next monotonic
+/// attach-sequence number (#340). This is the fix for the race an earlier
+/// version of this code only documented: checking `member_count()` in a
+/// SEPARATE lock acquisition after `join`/`leave` let two concurrent
+/// transitions interleave and assign sequence numbers (or appear to
+/// transition) out of true chronological order. Serializing the whole
+/// "mutate the channel, read the resulting count, assign the next sequence"
+/// step behind one lock fixes the ORDERING; the sequence number is what
+/// then lets the asynchronous send/delivery that follows happen in any
+/// order without losing that ordering information — see
+/// [`notify_attach_state`]'s own doc for the delivery side.
 ///
-/// KNOWN RACE (documented, not fixed here): two connections joining or
-/// leaving the SAME job's channel concurrently can each observe a count
-/// that doesn't deterministically correspond to "my own join/leave caused
-/// this transition" — `Channel::join`/`leave` and `member_count` are three
-/// separate lock acquisitions, not one atomic operation. The practical
-/// impact is at most a redundant or briefly-missed notification, never an
-/// incorrect STEADY-STATE: once the race window passes, the next
-/// transition's check reflects the real count. Acceptable for a rare,
-/// low-stakes race (the host-executor's own handling is idempotent on a
-/// repeated `attached: true`); a stronger guarantee would need `Channel`'s
-/// own API to return the post-join/leave count atomically, out of scope
-/// here.
-async fn notify_attach_state(job: &dispatch::JobChannel, host_registry: &HostRegistry, job_id: &str, attached: bool) {
+/// # Errors
+/// Whatever [`Channel::join`] returns.
+fn join_for_attach(
+    job: &dispatch::JobChannel,
+    cap: &sandy_fabric::capauth::Cap,
+) -> Result<(MembershipId, usize, u64), ChannelError> {
+    let mut next_seq = job.attach_seq.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let membership = job.channel.join(cap)?;
+    let count = job.channel.member_count();
+    let seq = *next_seq;
+    *next_seq += 1;
+    Ok((membership, count, seq))
+}
+
+/// Like [`join_for_attach`], for the leave side: no `Result` (`Channel::leave`
+/// cannot fail), same atomicity guarantee.
+fn leave_for_attach(job: &dispatch::JobChannel, membership: &MembershipId) -> (usize, u64) {
+    let mut next_seq = job.attach_seq.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    job.channel.leave(membership);
+    let count = job.channel.member_count();
+    let seq = *next_seq;
+    *next_seq += 1;
+    (count, seq)
+}
+
+/// Best-effort: notify `job`'s placed host-executor (#340) that its attach-
+/// membership count transitioned to `attached` at sequence `seq` (assigned
+/// by [`join_for_attach`]/[`leave_for_attach`], atomically with the
+/// transition itself — never derived from send order here). A no-op if the
+/// job was never placed remotely (`host_id` is `None`, e.g. a local-only
+/// run) or the send fails (the host disconnected, or never registered this
+/// job at all) — logged, never propagated, since losing this notification
+/// only costs the "unlimited while attached" policy for this job, never the
+/// attach session itself (the same "best-effort, not a gate" discipline
+/// `persist_attach_token` already follows elsewhere in this feature).
+///
+/// Delivery order is NOT guaranteed to match `seq` order (independent sends,
+/// possibly over independent connections if a job were ever re-placed —
+/// not something stage 1 does, but the design doesn't assume otherwise) —
+/// the host-executor side is expected to keep only the highest `seq` it has
+/// seen per `job_id` and discard anything at or below it, which is why a
+/// correct `seq` at the SOURCE (this function's caller) is what actually
+/// matters, not the order these async sends happen to complete in.
+async fn notify_attach_state(
+    job: &dispatch::JobChannel,
+    host_registry: &HostRegistry,
+    job_id: &str,
+    attached: bool,
+    seq: u64,
+) {
     let Some(host_id) = &job.host_id else {
         return; // never placed remotely: no host-executor to notify
     };
@@ -109,11 +150,12 @@ async fn notify_attach_state(job: &dispatch::JobChannel, host_registry: &HostReg
             sandy_executor_proto::AttachStateChanged {
                 job_id: job_id.to_owned(),
                 attached,
+                sequence: seq,
             },
         )
         .await
     {
-        tracing::debug!(host_id, job_id, attached, error = %e, "could not notify the host-executor of an attach-state change");
+        tracing::debug!(host_id, job_id, attached, seq, error = %e, "could not notify the host-executor of an attach-state change");
     }
 }
 
@@ -187,27 +229,27 @@ async fn serve_one_attach(stream: tokio::net::UnixStream, registry: &JobRegistry
         return;
     };
 
-    let membership = match job.channel.join(&cap) {
-        Ok(id) => id,
+    let (membership, count, seq) = match join_for_attach(&job, &cap) {
+        Ok(joined) => joined,
         Err(e) => {
             refuse(e.to_string()).await;
             return;
         }
     };
     // #340: this join may be the one that brought the count from 0 to 1 —
-    // see `notify_attach_state`'s own doc for the race this check does not
-    // close (a concurrent join/leave on the same job can make this an
-    // imprecise signal, never an incorrect steady-state).
-    if job.channel.member_count() == 1 {
-        notify_attach_state(&job, host_registry, &job_id, true).await;
+    // `count`/`seq` were assigned atomically with the join itself
+    // (`join_for_attach`), so unlike a separate later check, this is never
+    // racing a concurrent transition on the same job.
+    if count == 1 {
+        notify_attach_state(&job, host_registry, &job_id, true, seq).await;
     }
     if write_frame(&mut *write_half.lock().await, &LinkFrame::Joined { channel: None })
         .await
         .is_err()
     {
-        job.channel.leave(&membership);
-        if job.channel.member_count() == 0 {
-            notify_attach_state(&job, host_registry, &job_id, false).await;
+        let (count, seq) = leave_for_attach(&job, &membership);
+        if count == 0 {
+            notify_attach_state(&job, host_registry, &job_id, false, seq).await;
         }
         return;
     }
@@ -228,11 +270,29 @@ async fn serve_one_attach(stream: tokio::net::UnixStream, registry: &JobRegistry
             .await;
     }
 
-    if let Err(e) = relay(Arc::clone(&job.channel), membership, &mut read_half, write_half).await {
+    // `relay` always leaves `membership` itself (via its internal
+    // `LeaveGuard`, on every exit path including a panic) — `leave_tx` is
+    // how that guard hands back the atomically-assigned `(count, seq)` for
+    // THIS leave once it's happened, so the notify below reports the real
+    // transition rather than a separately (and racily) re-checked one. See
+    // `LeaveGuard`'s own doc for why the leave and the count/seq assignment
+    // have to be one critical section rather than two steps.
+    let (leave_tx, leave_rx) = tokio::sync::oneshot::channel();
+    if let Err(e) = relay(
+        Arc::clone(&job.channel),
+        membership,
+        &mut read_half,
+        write_half,
+        Some((&job.attach_seq, leave_tx)),
+    )
+    .await
+    {
         tracing::warn!(error = %e, job_id, "attach relay faulted");
     }
-    if job.channel.member_count() == 0 {
-        notify_attach_state(&job, host_registry, &job_id, false).await;
+    if let Ok((count, seq)) = leave_rx.await
+        && count == 0
+    {
+        notify_attach_state(&job, host_registry, &job_id, false, seq).await;
     }
 }
 
@@ -258,21 +318,61 @@ impl Drop for AbortOnDrop {
 }
 
 /// Leaves `id` on `channel` when dropped, on every exit path out of
-/// [`relay`].
-struct LeaveGuard<B: ChannelBackend, A: CapAuthority> {
+/// [`relay`] — including a panic unwind, which is exactly why the leave
+/// itself must happen here (synchronously, in `Drop`) rather than in some
+/// code after `relay`'s own `.await` resolves: that code would never run on
+/// a panic.
+///
+/// `leave_seq`, when present (#340), is what makes the leave's resulting
+/// member count and its attach-sequence-number assignment ATOMIC with the
+/// leave itself — not a separate step after `relay` returns, which would
+/// reopen exactly the race `join_for_attach`/`leave_for_attach` close for
+/// every OTHER join/leave on this job: a concurrent transition could
+/// otherwise interleave between this leave and a later, separate count
+/// read. `Drop` can't `.await`, so the actual async notify send can't happen
+/// here either — the computed `(count, seq)` is handed out over a
+/// `oneshot` (whose `send` is a plain, synchronous, non-blocking call) for
+/// the caller to pick up and act on asynchronously once `relay` returns.
+/// The atomic-sequence-assignment handoff [`LeaveGuard`]'s `Drop` and
+/// [`relay`] share (#340): the per-job sequence counter to assign under, and
+/// the one-shot channel the resulting `(member_count, sequence)` pair is
+/// handed back on. See [`LeaveGuard`]'s own doc for why this exists.
+type LeaveSeqHandoff<'a> = (&'a std::sync::Mutex<u64>, tokio::sync::oneshot::Sender<(usize, u64)>);
+
+struct LeaveGuard<'a, B: ChannelBackend, A: CapAuthority> {
     channel: Arc<Channel<B, A>>,
     id: MembershipId,
+    leave_seq: Option<LeaveSeqHandoff<'a>>,
 }
 
-impl<B: ChannelBackend, A: CapAuthority> Drop for LeaveGuard<B, A> {
+impl<B: ChannelBackend, A: CapAuthority> Drop for LeaveGuard<'_, B, A> {
     fn drop(&mut self) {
         self.channel.leave(&self.id);
+        if let Some((attach_seq, tx)) = self.leave_seq.take() {
+            let mut next_seq = attach_seq.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let count = self.channel.member_count();
+            let seq = *next_seq;
+            *next_seq += 1;
+            drop(next_seq);
+            // The receiver may already be gone (the caller stopped waiting,
+            // e.g. it panicked too) — never a reason to panic again here.
+            let _ = tx.send((count, seq));
+        }
     }
 }
 
 /// The joined phase: deliver `channel`'s `TTY_STDOUT`/`TTY_STDERR` traffic to
 /// the client as `Deliver` frames, and post the client's `Post` frames as
 /// `TTY_STDIN`, until a clean close. Leaves `membership` on every exit path.
+///
+/// `leave_seq`, when `Some` (#340), is handed to the internal [`LeaveGuard`]
+/// so the leave this function always performs also gets an atomically
+/// assigned `(count, sequence)` pair, delivered to the caller over the
+/// paired `oneshot` the moment this function returns (by which point
+/// `LeaveGuard` has already dropped and sent it) — see [`LeaveGuard`]'s own
+/// doc for why this can't just be a separate step after the `.await`
+/// resolves. `None` for callers (this module's own unit tests of `relay` in
+/// isolation) that don't care about attach-state notification at all.
 ///
 /// # Errors
 /// [`AttachRelayError::Link`] if the connection faults reading or writing a
@@ -284,6 +384,7 @@ async fn relay<B, A, R, W>(
     membership: MembershipId,
     read_half: &mut R,
     write_half: Arc<AsyncMutex<W>>,
+    leave_seq: Option<LeaveSeqHandoff<'_>>,
 ) -> Result<(), AttachRelayError>
 where
     B: ChannelBackend + 'static,
@@ -294,6 +395,7 @@ where
     let _leave = LeaveGuard {
         channel: Arc::clone(&channel),
         id: membership.clone(),
+        leave_seq,
     };
 
     let inbound = channel.subscribe(&membership)?;
@@ -474,7 +576,9 @@ mod tests {
 
         let channel_for_relay = Arc::clone(&channel);
         let relaying =
-            tokio::spawn(async move { relay(channel_for_relay, attach_membership, &mut server_rd, server_wr).await });
+            tokio::spawn(
+                async move { relay(channel_for_relay, attach_membership, &mut server_rd, server_wr, None).await },
+            );
 
         write_frame(
             &mut client_wr,
@@ -644,7 +748,9 @@ mod tests {
 
         let channel_for_relay = Arc::clone(&channel);
         let relaying =
-            tokio::spawn(async move { relay(channel_for_relay, attach_membership, &mut server_rd, server_wr).await });
+            tokio::spawn(
+                async move { relay(channel_for_relay, attach_membership, &mut server_rd, server_wr, None).await },
+            );
 
         write_frame(
             &mut client_wr,
@@ -695,7 +801,9 @@ mod tests {
 
         let channel_for_relay = Arc::clone(&channel);
         let relaying =
-            tokio::spawn(async move { relay(channel_for_relay, attach_membership, &mut server_rd, server_wr).await });
+            tokio::spawn(
+                async move { relay(channel_for_relay, attach_membership, &mut server_rd, server_wr, None).await },
+            );
 
         for _ in 0..2 {
             write_frame(
@@ -754,7 +862,9 @@ mod tests {
 
         let channel_for_relay = Arc::clone(&channel);
         let relaying =
-            tokio::spawn(async move { relay(channel_for_relay, first_membership, &mut server_rd, server_wr).await });
+            tokio::spawn(
+                async move { relay(channel_for_relay, first_membership, &mut server_rd, server_wr, None).await },
+            );
 
         drop(client_wr);
         drop(client_rd);

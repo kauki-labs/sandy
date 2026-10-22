@@ -34,7 +34,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use sandy::admits_untrusted;
 use sandy_api::{
     agent::{AgentLaunch, OnLink},
-    backend::{BackendError, Grants, Outcome, RunSpec, SandboxKind as ApiSandboxKind, VmBackend},
+    backend::{BackendError, Grants, Outcome, RunControl, RunSpec, SandboxKind as ApiSandboxKind, VmBackend},
     containment::{Containment, ContainmentStatus},
 };
 use sandy_executor_proto::{Dispatch, IsolationClass, REMOTE_LINK_TOKEN_LEN, SandboxKind as ProtoSandboxKind};
@@ -215,7 +215,7 @@ pub fn check_isolation_class(
 /// default (not imported — that's a CLI-local constant, this is the
 /// dispatch path's own; they simply agree today, by architect ruling, not
 /// by sharing a constant).
-const STAGE1_TIMEOUT_SECS: u32 = 300;
+pub(crate) const STAGE1_TIMEOUT_SECS: u32 = 300;
 
 /// Budget for resolving a `flake/v1` job's guest template on THIS host
 /// (#332, CodeRabbit finding on PR #333): kind-detection probes plus the
@@ -312,6 +312,7 @@ pub fn handle_dispatch(
     agent_program: PathBuf,
     rt: tokio::runtime::Handle,
     vm_available: bool,
+    control: RunControl,
 ) -> Result<Outcome, HandleDispatchError> {
     let status = containment.status();
     let required = IsolationClass::try_from(dispatch.required_isolation_class).unwrap_or(IsolationClass::Unspecified);
@@ -373,6 +374,7 @@ pub fn handle_dispatch(
                 // all.
                 outcome_file: None,
                 secret_dir: None,
+                control: &control,
             };
             Ok(backend.run(&spec)?)
         }
@@ -435,6 +437,7 @@ pub fn handle_dispatch(
                 grants: &grants,
                 outcome_file: None,
                 secret_dir: None,
+                control: &control,
             };
             // `_kept_topology_file` (the temp JSON file, for a Prebuilt
             // template) must outlive `backend.run`'s own read of `template`
@@ -613,6 +616,7 @@ mod tests {
             PathBuf::from("/nonexistent/sandy-agent"),
             rt,
             false,
+            sandy_api::backend::RunControl::with_timeout_secs(60),
         )
         .expect_err("an untrusted job on a reaping-only host must be refused, never run");
         assert!(
@@ -654,6 +658,7 @@ mod tests {
             PathBuf::from("/nonexistent/sandy-agent"),
             rt,
             false,
+            sandy_api::backend::RunControl::with_timeout_secs(60),
         )
         .expect_err("a Vm dispatch must be refused when this host cannot actually run one");
         assert!(
@@ -687,6 +692,7 @@ mod tests {
             PathBuf::from("/nonexistent/sandy-agent"),
             rt,
             true,
+            sandy_api::backend::RunControl::with_timeout_secs(60),
         )
         .expect_err("an unspecified backend must never be silently accepted");
         assert!(
@@ -725,6 +731,7 @@ mod tests {
             PathBuf::from("/nonexistent/sandy-agent"),
             rt,
             true,
+            sandy_api::backend::RunControl::with_timeout_secs(60),
         )
         .expect_err("a non-flake/v1 encoding on the Vm branch must be refused, never guessed at");
         assert!(
@@ -762,6 +769,7 @@ mod tests {
             PathBuf::from("/nonexistent/sandy-agent"),
             rt,
             false,
+            sandy_api::backend::RunControl::with_timeout_secs(60),
         )
         .expect_err("a wrong-length link_token must be refused, never silently reshaped");
         assert!(

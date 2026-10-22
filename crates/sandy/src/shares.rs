@@ -11,6 +11,8 @@ use std::{
     process::Child,
 };
 
+#[cfg(test)]
+use sandy_api::backend::RunControl;
 use sandy_api::{
     backend::{BackendError, RunSpec},
     share::ShareSpec,
@@ -107,6 +109,15 @@ mod tests {
         shares: true,
     };
 
+    /// A shared, reusable control handle for tests that don't exercise
+    /// cancellation/deadline behavior themselves (#340) — avoids threading a
+    /// fresh `RunControl` and its own `let` binding through every call site
+    /// of the `spec()` fixture below.
+    fn test_control() -> &'static RunControl {
+        static CONTROL: std::sync::OnceLock<RunControl> = std::sync::OnceLock::new();
+        CONTROL.get_or_init(|| RunControl::with_timeout_secs(30))
+    }
+
     fn spec<'a>(command: &'a [String], secret_dir: Option<&'a Path>) -> RunSpec<'a> {
         RunSpec {
             template: "t",
@@ -121,6 +132,7 @@ mod tests {
             grants: &GRANTS,
             outcome_file: None,
             secret_dir,
+            control: test_control(),
         }
     }
 

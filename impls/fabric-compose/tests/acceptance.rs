@@ -31,7 +31,7 @@ use std::{
 
 use anyhow::Context as _;
 use sandy::{VmBackend as _, admits_untrusted};
-use sandy_api::backend::{Grants, RunSpec, SandboxKind, SecretRef, SecretSource};
+use sandy_api::backend::{Grants, RunControl, RunSpec, SandboxKind, SecretRef, SecretSource};
 use sandy_backend::ProcessBackend;
 use sandy_fabric::{
     capauth::CapAuthority,
@@ -437,6 +437,7 @@ async fn inv1_holds_through_the_real_executor_dispatch_path() -> anyhow::Result<
         grants: &grants,
         outcome_file: None,
         secret_dir: None,
+        control: &RunControl::with_timeout_secs(30),
     };
 
     let outcome = executor.run(&spec).await.context("dispatch through the real adapter")?;

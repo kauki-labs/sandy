@@ -172,4 +172,12 @@ message Dispatch {
 message AttachStateChanged {
   string job_id = 1;
   bool attached = 2;
+  // Monotonically increasing per job_id, assigned atomically with the
+  // transition it reports (sandyd's own per-job serialization, never
+  // derived from send/arrival order): two transitions for the same job_id
+  // can be enqueued and delivered in either order relative to each other
+  // (independent sends on independent connections), so the host-executor
+  // keeps only the highest-sequence value it has seen per job_id and
+  // discards anything at or below it, rather than trusting arrival order.
+  uint64 sequence = 3;
 }

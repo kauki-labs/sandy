@@ -12,10 +12,106 @@
 use std::{
     os::unix::io::RawFd,
     path::{Path, PathBuf},
-    time::SystemTime,
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Instant, SystemTime},
 };
 
 use serde::{Deserialize, Serialize};
+
+/// A live handle into a running [`VmBackend::run`] call, letting something
+/// outside the call (a `daemon cancel`, an attach-state transition, a grace
+/// period expiring) change its fate without that call having computed a
+/// fixed deadline once at the start and never hearing from anyone again
+/// (#340's "unlimited while attached" policy needs exactly this: the
+/// deadline a running job is held to is no longer a constant, it's a value
+/// that can be suspended while attached and reinstated on detach).
+///
+/// `Clone`, cheaply (an `Arc` underneath): the caller that starts a run
+/// keeps one clone to drive it (suspend/extend the deadline, cancel), and
+/// hands another to [`VmBackend::run`] itself via [`RunSpec::control`] to
+/// poll. Neither side blocks the other — every method here is a quick
+/// lock/atomic read or write, never an await or a condvar wait, so it's
+/// equally usable from `run()`'s own blocking poll loop (`impls/local`,
+/// `impls/vm`) and from an async caller holding the other clone.
+#[derive(Clone)]
+pub struct RunControl(Arc<RunControlInner>);
+
+struct RunControlInner {
+    cancelled: AtomicBool,
+    deadline: Mutex<Option<Instant>>,
+}
+
+impl RunControl {
+    /// A control handle enforcing `deadline` until something says otherwise.
+    #[must_use]
+    pub fn new(deadline: Instant) -> Self {
+        Self(Arc::new(RunControlInner {
+            cancelled: AtomicBool::new(false),
+            deadline: Mutex::new(Some(deadline)),
+        }))
+    }
+
+    /// A convenience constructor for the common case: a run's own
+    /// `timeout_secs`, converted to a deadline from now.
+    #[must_use]
+    pub fn with_timeout_secs(timeout_secs: u32) -> Self {
+        Self::new(Instant::now() + std::time::Duration::from_secs(u64::from(timeout_secs)))
+    }
+
+    /// Signal cancellation (`daemon cancel`): [`Self::is_cancelled`] becomes
+    /// `true` immediately, for any clone of this handle. `run()`'s own poll
+    /// loop checks this on every tick and tears the box down the same way a
+    /// timeout does, just without waiting for one.
+    pub fn cancel(&self) {
+        self.0.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether [`Self::cancel`] has been called.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.0.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Suspend the deadline: [`Self::timed_out`] never reports true again
+    /// until [`Self::set_deadline`] reinstates one. The attach-state-driven
+    /// "unlimited while attached" policy calls this the moment a job's
+    /// attach-membership count goes from 0 to 1.
+    pub fn suspend_deadline(&self) {
+        *self.0.deadline.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    /// Set (or replace) the enforced deadline to `at`. The grace-period
+    /// policy calls this with `Instant::now() + grace` the moment a job's
+    /// attach-membership count drops back to 0.
+    pub fn set_deadline(&self, at: Instant) {
+        *self.0.deadline.lock().unwrap_or_else(PoisonError::into_inner) = Some(at);
+    }
+
+    /// The currently enforced deadline, if any (`None` while suspended).
+    #[must_use]
+    pub fn deadline(&self) -> Option<Instant> {
+        *self.0.deadline.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether the current deadline (if any) has passed. `false` while
+    /// suspended, by construction — there is no deadline to have passed.
+    #[must_use]
+    pub fn timed_out(&self) -> bool {
+        self.deadline().is_some_and(|at| Instant::now() >= at)
+    }
+}
+
+impl std::fmt::Debug for RunControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunControl")
+            .field("cancelled", &self.is_cancelled())
+            .field("deadline", &self.deadline())
+            .finish()
+    }
+}
 
 /// A read-only input exposed to the guest under `/run/sandy/inputs/<name>`.
 ///
@@ -104,8 +200,14 @@ pub struct RunSpec<'a> {
     pub cpu: Option<u32>,
     /// Optional memory budget in MiB.
     pub mem: Option<u32>,
-    /// Wall-clock timeout in seconds.
+    /// Wall-clock timeout in seconds — the INITIAL deadline `control` is
+    /// constructed with; once running, `control` (not this field) is the
+    /// live source of truth a backend's own poll loop reads each tick.
     pub timeout_secs: u32,
+    /// The live handle `run()` polls for cancellation and its current
+    /// deadline (#340) — see [`RunControl`]'s own doc for why this isn't
+    /// just `timeout_secs` read once at the start.
+    pub control: &'a RunControl,
     /// The trust tokens the run is granted.
     pub grants: &'a Grants,
     /// `Some(path)` writes the outcome record to a file (D2, ssh); `None` uses

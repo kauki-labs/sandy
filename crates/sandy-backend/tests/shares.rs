@@ -11,8 +11,8 @@
 
 use anyhow::{Context, Result};
 use sandy::{
-    Grants, INPUT_MOUNT_TAG, Input, OUTPUT_MOUNT_TAG, Output, RunSpec, SECRET_MOUNT_TAG, Topology, collect_outputs,
-    parse_topology, prepare_outputs, stage_inputs,
+    Grants, INPUT_MOUNT_TAG, Input, OUTPUT_MOUNT_TAG, Output, RunControl, RunSpec, SECRET_MOUNT_TAG, Topology,
+    collect_outputs, parse_topology, prepare_outputs, stage_inputs,
 };
 use sandy_backend::{GuestShareTransport, Placement, Presentation, ShareSpec};
 use sandy_impls_local::LocalDirTransport;
@@ -28,6 +28,13 @@ const GRANTS: Grants = Grants {
     agent: false,
     shares: true,
 };
+
+/// A shared, reusable control handle for tests that don't exercise
+/// cancellation/deadline behavior themselves (#340).
+fn test_control() -> &'static RunControl {
+    static CONTROL: std::sync::OnceLock<RunControl> = std::sync::OnceLock::new();
+    CONTROL.get_or_init(|| RunControl::with_timeout_secs(60))
+}
 
 /// A minimal spec: the assemblers read only `cpu`/`mem`/`command`/`template` from
 /// it — the shares come from `StagedArgs`, so the spec's own input/output/secret
@@ -46,6 +53,7 @@ fn spec<'a>(command: &'a [String]) -> RunSpec<'a> {
         grants: &GRANTS,
         outcome_file: None,
         secret_dir: None,
+        control: test_control(),
     }
 }
 
@@ -407,6 +415,7 @@ fn plan_shares_stages_secret_input_output_with_the_right_flags() -> Result<()> {
         grants: &GRANTS,
         outcome_file: None,
         secret_dir: None,
+        control: test_control(),
     };
 
     let shares = plan_shares(
@@ -470,6 +479,7 @@ fn plan_shares_attaches_an_empty_secret_dir_for_refresh() -> Result<()> {
         grants: &GRANTS,
         outcome_file: None,
         secret_dir: Some(&cred),
+        control: test_control(),
     };
 
     let shares = plan_shares(

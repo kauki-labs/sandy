@@ -12,15 +12,21 @@
 //! multiple concurrent jobs on one host — see the decision record for why
 //! this isn't just an implementation shortcut.
 
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, PoisonError},
+    time::Duration,
+};
 
-use sandy_api::backend::Outcome;
+use sandy_api::backend::{Outcome, RunControl};
 use sandy_control_proto::{read_frame, write_frame};
 use sandy_executor_proto::{
     Capabilities, Dispatch, HostExecutorMessage, JobResult, OrchestratorMessage, host_executor_message,
     orchestrator_message,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
+
+use crate::dispatch::STAGE1_TIMEOUT_SECS;
 
 /// How long [`register`] waits for the orchestrator's `Registered`/
 /// `RegisterRefused` response before giving up, in production (`main.rs`
@@ -111,64 +117,182 @@ pub enum DispatchLoopExit {
 }
 
 /// Read `OrchestratorMessage` frames off `conn` until it closes, faults, or
-/// `shutdown` resolves, calling `handle` with each `Dispatch` and awaiting it
-/// to completion before reading the next frame (decision 14: sequential, one
-/// job at a time). Any other frame shape is logged and ignored — stage 1's
-/// orchestrator never sends anything else once registered (`sandyd::
-/// host_conn`'s own doc says the same of an unexpected frame on its side).
+/// `shutdown` resolves, demultiplexing by frame type rather than handling
+/// everything inline in one blocking read loop (#340, decision 14
+/// amendment — see `docs/decisions/sandyd.md`'s own record of why this
+/// changed and what it still preserves):
 ///
-/// `handle` returns the result message to send back for that dispatch (#292):
-/// the loop writes it on the SAME `conn` the Dispatch arrived on, before
-/// reading the next frame, so a job's outcome reaches the orchestrator over
-/// the one management connection rather than being dropped on the floor. A
-/// `None` return sends nothing. A failure writing the result frame ends the
-/// loop as [`DispatchLoopExit::Faulted`], same as any other connection fault —
-/// the supervisor restarts the process (decision 12).
+/// - `Dispatch` is pushed onto an internal, unbounded queue and run by a SEPARATE sequential worker task — one dispatch
+///   runs to completion before the next is dequeued, preserving decision 14's actual guarantee (one job executing at a
+///   time), just no longer by blocking this function's own frame-reading loop while it runs. The queue send here is a
+///   plain, synchronous, never-blocking push (an unbounded channel's `send` never awaits) — a second or third queued
+///   `Dispatch` can never stall this loop from reading the NEXT frame, which matters because...
+/// - `AttachStateChanged` (#340) is routed DIRECTLY to the named job_id's live [`RunControl`] (if that job is currently
+///   running — a stale or unknown job_id is silently ignored, the host-executor may simply not have started that
+///   dispatch yet or have already finished it), applying `suspend_deadline()`/`set_deadline(now + STAGE1_TIMEOUT_SECS)`
+///   for `attached: true`/`false` respectively. This is exactly the frame type that MUST keep being read promptly even
+///   while a dispatch is running — the whole reason this function no longer blocks on `Dispatch` handling the way it
+///   used to.
+/// - Any other frame shape is logged and ignored, as before.
+///
+/// `handle` returns the result message to send back for that dispatch
+/// (#292): a dedicated writer (shared with this function's own use of
+/// `conn` for reading, via `tokio::io::split`) sends it on the SAME
+/// connection the Dispatch arrived on. A `None` return sends nothing.
+///
+/// CONNECTION-DROP FAIL-SAFE (#340): if this function is about to return
+/// [`DispatchLoopExit::Closed`] or [`DispatchLoopExit::Faulted`] — the
+/// connection died, not a requested shutdown — every job still running at
+/// that moment has its `RunControl` moved to a grace deadline
+/// (`now + STAGE1_TIMEOUT_SECS`) rather than left suspended forever: with
+/// the connection gone, no further `AttachStateChanged` can ever arrive to
+/// end an "unlimited while attached" suspension, so a sandyd crash or
+/// network partition while a job was attached must not keep that job alive
+/// indefinitely. This function then waits for every already-queued or
+/// in-flight dispatch to finish (respecting its own, possibly now-grace-
+/// bounded deadline) before returning, so a job's result is still reported
+/// if there's anywhere left to report it to, and `main.rs`'s "exit
+/// non-zero, let the supervisor restart" contract only fires once nothing
+/// is still running.
 pub async fn run_dispatch_loop<F, Fut>(
-    conn: &mut (impl AsyncRead + AsyncWrite + Unpin),
-    mut handle: F,
+    conn: &mut (impl AsyncRead + AsyncWrite + Unpin + Send),
+    handle: F,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> DispatchLoopExit
 where
-    F: FnMut(Dispatch) -> Fut,
-    Fut: std::future::Future<Output = Option<HostExecutorMessage>>,
+    F: FnMut(Dispatch, RunControl) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Option<HostExecutorMessage>> + Send,
 {
+    let (mut read_half, write_half) = tokio::io::split(conn);
+    let write_half = Arc::new(tokio::sync::Mutex::new(write_half));
+
+    // job_id -> its live RunControl, for AttachStateChanged routing and the
+    // connection-drop fail-safe above. A plain std::sync::Mutex: every
+    // access here is a quick insert/remove/lookup, never held across an
+    // await.
+    let controls: Arc<Mutex<HashMap<String, RunControl>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    // Unbounded: the reader below must never block pushing a Dispatch
+    // (its own doc above explains why) — the worker draining this one at a
+    // time, awaiting each `handle` call to completion, IS decision 14's
+    // real guarantee, just moved off the frame-reading path.
+    //
+    // Run as a locally pinned future selected on below, NOT `tokio::spawn`:
+    // `conn` (and so `write_half`, split from it) is a borrow with this
+    // function's own lifetime, not `'static`, which `tokio::spawn` requires.
+    // `tokio::select!` polling a pinned future repeatedly, alongside the
+    // frame reader, gets the identical "both make progress concurrently"
+    // property a spawned task would, without that bound — this future
+    // itself never completes during normal operation (it loops on
+    // `dispatch_rx.recv()`, which only yields `None` once `dispatch_tx` is
+    // dropped, below).
+    let (dispatch_tx, mut dispatch_rx) = tokio::sync::mpsc::unbounded_channel::<Dispatch>();
+    let mut handle = handle;
+    let worker_fut = async {
+        while let Some(dispatch) = dispatch_rx.recv().await {
+            let job_id = dispatch.job_id.clone();
+            let control = RunControl::with_timeout_secs(STAGE1_TIMEOUT_SECS);
+            controls
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(job_id.clone(), control.clone());
+            let result = handle(dispatch, control).await;
+            controls.lock().unwrap_or_else(PoisonError::into_inner).remove(&job_id);
+            if let Some(result) = result {
+                let mut write_half = write_half.lock().await;
+                if let Err(e) = write_frame(&mut *write_half, &result).await {
+                    tracing::warn!(error = %e, job_id, "failed writing a job result back to the orchestrator");
+                }
+            }
+        }
+    };
+    tokio::pin!(worker_fut);
+
     tokio::pin!(shutdown);
-    loop {
+    let exit = loop {
         tokio::select! {
-            frame = read_frame::<OrchestratorMessage>(conn) => {
+            frame = read_frame::<OrchestratorMessage>(&mut read_half) => {
                 match frame {
                     Ok(Some(message)) => match message.op {
                         Some(orchestrator_message::Op::Dispatch(dispatch)) => {
-                            // Sequential (decision 14): the Dispatch runs to
-                            // completion here, and its result is written back
-                            // before the next frame is read — conn is free to
-                            // write on, since read_frame already resolved.
-                            if let Some(result) = handle(dispatch).await
-                                && let Err(e) = write_frame(conn, &result).await
-                            {
-                                tracing::warn!(error = %e, "failed writing a job result back to the orchestrator");
-                                return DispatchLoopExit::Faulted(e.to_string());
+                            // Never blocks (see this function's own doc) —
+                            // only fails if the worker future itself has
+                            // already ended, which only happens after this
+                            // loop drops `dispatch_tx` below.
+                            let _ = dispatch_tx.send(dispatch);
+                        }
+                        Some(orchestrator_message::Op::AttachStateChanged(changed)) => {
+                            let controls = controls.lock().unwrap_or_else(PoisonError::into_inner);
+                            if let Some(control) = controls.get(&changed.job_id) {
+                                if changed.attached {
+                                    control.suspend_deadline();
+                                } else {
+                                    control.set_deadline(
+                                        std::time::Instant::now()
+                                            + Duration::from_secs(u64::from(STAGE1_TIMEOUT_SECS)),
+                                    );
+                                }
                             }
+                            // An unknown/stale job_id is not an error: the
+                            // dispatch may not have reached this host yet,
+                            // or may have already finished — either way
+                            // there is nothing live to apply this to.
                         }
                         _ => tracing::debug!("ignoring an unexpected frame from the orchestrator"),
                     },
                     Ok(None) => {
                         tracing::info!("the orchestrator closed the connection");
-                        return DispatchLoopExit::Closed;
+                        break DispatchLoopExit::Closed;
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "the orchestrator connection faulted");
-                        return DispatchLoopExit::Faulted(e.to_string());
+                        break DispatchLoopExit::Faulted(e.to_string());
                     }
                 }
             }
+            () = &mut worker_fut => {
+                // Only reachable once `dispatch_tx` is dropped AND every
+                // queued dispatch has drained — i.e. after this loop itself
+                // already broke once before (see the drain step below) and
+                // is being polled again. Never happens during the loop's
+                // first pass (the reader still holds `dispatch_tx`).
+                unreachable!("worker_fut only completes after dispatch_tx is dropped, following this loop");
+            }
             () = &mut shutdown => {
                 tracing::info!("shutdown signal received; no longer reading new dispatches");
-                return DispatchLoopExit::Shutdown;
+                break DispatchLoopExit::Shutdown;
             }
         }
+    };
+
+    // Connection-drop fail-safe (this function's own doc above) — never
+    // applied on a requested Shutdown, only when the connection itself is
+    // gone.
+    if !matches!(exit, DispatchLoopExit::Shutdown) {
+        let controls = controls.lock().unwrap_or_else(PoisonError::into_inner);
+        if !controls.is_empty() {
+            tracing::warn!(
+                jobs = controls.len(),
+                "orchestrator connection ended while jobs were still running; treating them as detached and starting \
+                 their grace deadline"
+            );
+        }
+        for control in controls.values() {
+            control.set_deadline(std::time::Instant::now() + Duration::from_secs(u64::from(STAGE1_TIMEOUT_SECS)));
+        }
     }
+
+    // Let the worker drain whatever is already queued or in flight, then
+    // end — never left running detached from this function's own return,
+    // or `main.rs`'s process exit would simply kill it along with
+    // everything else (nothing outlives this function once it returns).
+    // Dropping `dispatch_tx` is what finally lets `worker_fut` complete
+    // (`dispatch_rx.recv()` yields `None`) — until now it genuinely
+    // couldn't, which is why selecting it above was always `unreachable!`.
+    drop(dispatch_tx);
+    worker_fut.await;
+
+    exit
 }
 
 /// Build the `HostExecutorMessage::Result` the host-executor sends back after a
@@ -386,7 +510,7 @@ mod tests {
         let loop_task = tokio::spawn(async move {
             run_dispatch_loop(
                 &mut client,
-                move |dispatch| {
+                move |dispatch, _control| {
                     let seen = Arc::clone(&seen_in_loop);
                     async move {
                         seen.lock()
@@ -433,7 +557,7 @@ mod tests {
         let loop_task = tokio::spawn(async move {
             run_dispatch_loop(
                 &mut client,
-                |_dispatch: Dispatch| async { None::<HostExecutorMessage> },
+                |_dispatch: Dispatch, _control| async { None::<HostExecutorMessage> },
                 async {
                     let _ = shutdown_rx.await;
                 },
@@ -465,7 +589,7 @@ mod tests {
             std::time::Duration::from_secs(2),
             run_dispatch_loop(
                 &mut client,
-                |_dispatch: Dispatch| async { None::<HostExecutorMessage> },
+                |_dispatch: Dispatch, _control| async { None::<HostExecutorMessage> },
                 async {
                     let _ = shutdown_rx.await;
                 },
@@ -524,7 +648,7 @@ mod tests {
         let loop_task = tokio::spawn(async move {
             run_dispatch_loop(
                 &mut client,
-                move |dispatch| {
+                move |dispatch, _control| {
                     let seen = Arc::clone(&seen_in_loop);
                     async move {
                         seen.lock()
@@ -596,7 +720,9 @@ mod tests {
             run_dispatch_loop(
                 &mut client,
                 // Stand in for handle_dispatch: return a result for the job.
-                |dispatch: Dispatch| async move { Some(failure_result_message(dispatch.job_id, "boom".to_owned())) },
+                |dispatch: Dispatch, _control| async move {
+                    Some(failure_result_message(dispatch.job_id, "boom".to_owned()))
+                },
                 async {
                     let _ = shutdown_rx.await;
                 },

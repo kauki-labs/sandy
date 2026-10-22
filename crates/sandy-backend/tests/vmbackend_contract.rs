@@ -8,10 +8,17 @@
 //! `acceptance` feature), shared with `sandy-cli`'s acceptance binaries (#131 R4b)
 //! so the real impl and the fake run the identical checks the capstone binaries do.
 
-use sandy::{Grants, Outcome, OutputStatus, ProcessExit, RunSpec, Status, VmBackend, classify_outcome};
+use sandy::{Grants, Outcome, OutputStatus, ProcessExit, RunControl, RunSpec, Status, VmBackend, classify_outcome};
 use sandy_api::contract::vmbackend_suite;
 use sandy_backend::ProcessBackend;
 use sandy_test_support::FakeBackend;
+
+/// A shared, reusable control handle for tests that don't exercise
+/// cancellation/deadline behavior themselves (#340).
+fn test_control() -> &'static RunControl {
+    static CONTROL: std::sync::OnceLock<RunControl> = std::sync::OnceLock::new();
+    CONTROL.get_or_init(|| RunControl::with_timeout_secs(30))
+}
 
 /// Build a `RunSpec` that runs `command` with no inputs/outputs/secrets.
 fn spec<'a>(command: &'a [String], grants: &'a Grants) -> RunSpec<'a> {
@@ -28,6 +35,7 @@ fn spec<'a>(command: &'a [String], grants: &'a Grants) -> RunSpec<'a> {
         grants,
         outcome_file: None,
         secret_dir: None,
+        control: test_control(),
     }
 }
 

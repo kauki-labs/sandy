@@ -93,6 +93,21 @@ pub struct JobChannel {
     /// (`attach_relay.rs`) reads it to know which host to notify of an
     /// attach-membership transition via `HostRegistry::send_attach_state_changed`.
     pub host_id: Option<String>,
+    /// The next sequence number [`attach_relay::join_for_attach`]/
+    /// [`attach_relay::leave_for_attach`] will assign for this job's next
+    /// attach/detach transition (#340). Held as a plain `Mutex<u64>`, not an
+    /// `AtomicU64`: the lock itself is what serializes "join/leave the
+    /// channel, read the resulting count, and assign the next sequence" as
+    /// ONE critical section across every concurrent attach/detach on this
+    /// job — an atomic counter alone would only make the NUMBER assignment
+    /// atomic, not the whole transition-detection step, which is the actual
+    /// race (two concurrent joins/leaves could still interleave their
+    /// `Channel::join`/`member_count` calls and assign sequence numbers out
+    /// of true chronological order). The async send to the host-executor
+    /// that follows is never ordered by this lock — only the NUMBER it
+    /// carries is, which is what lets the host-executor resolve any
+    /// out-of-order delivery by keeping the highest sequence seen.
+    pub attach_seq: std::sync::Mutex<u64>,
 }
 
 impl JobChannel {
@@ -167,6 +182,7 @@ pub async fn mint_job_channel(job_id: &str, authority: &SharedCapAuthority) -> R
         granted_caps: Vec::new(),
         session: Uuid::nil(),
         host_id: None,
+        attach_seq: std::sync::Mutex::new(0),
     })
 }
 

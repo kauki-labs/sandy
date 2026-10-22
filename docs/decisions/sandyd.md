@@ -710,6 +710,75 @@ resource today, not yet modeled as something multiple jobs can safely share
 or must contend for) — a real design gap, not a detail this slice can paper
 over by just calling `tokio::spawn` per dispatch.
 
+**Amendment (#340): the connection's frame-reading is no longer coupled to
+sequential job execution — only the execution itself still is.**
+
+**Context.** #340's "unlimited while attached" policy needs the
+host-executor to receive and act on a NEW message type,
+`AttachStateChanged`, promptly, including WHILE a `Dispatch` is running —
+exactly the case the original design above made impossible: reading
+`handle_dispatch` to completion inline, before reading the next frame off
+the same connection, meant the connection literally could not be read again
+until the current job finished. A signal that only matters mid-run could
+never arrive mid-run.
+
+**Decision.** Split reading from executing. A single reader loop still owns
+the one persistent connection, but now demultiplexes by frame type rather
+than handling everything inline:
+
+- `Dispatch` is pushed onto an in-process, unbounded queue — a plain,
+  synchronous, never-blocking send — and drained by a separate sequential
+  worker that still runs one `Dispatch` through `handle_dispatch` to
+  completion before dequeuing the next. **This is decision 14's actual,
+  load-bearing guarantee, unchanged**: one job executes at a time on a given
+  host-executor process. What changed is only where that sequencing lives
+  (an explicit queue + worker, not the connection's own read loop).
+- `AttachStateChanged` is routed directly to the in-flight job's live
+  `RunControl` (`sandy_api::backend::RunControl`, keyed by `job_id`),
+  applying `suspend_deadline()`/`set_deadline(now + STAGE1_TIMEOUT_SECS)` —
+  read and acted on the moment it arrives, never waiting on whatever
+  `Dispatch` happens to be running.
+- Implementation: the reader and the worker are two futures polled
+  concurrently via `tokio::select!` in one loop (not two independently
+  spawned tasks — the connection is a borrowed `&mut` with this function's
+  own lifetime, not `'static`, which `tokio::spawn` requires), so progress
+  on one never blocks the other.
+
+**Consequences.** This changes the ORIGINAL decision's stated backpressure
+mechanism, not its outcome: "a second `Dispatch` simply buffers in the
+connection... until the host-executor finishes its current job" becomes "a
+second `Dispatch` buffers in the new in-process queue" — unbounded, so
+nothing here introduces a NEW backpressure failure mode the connection's own
+bounded buffering didn't already have in practice (decision 12's
+per-host `mpsc` on the orchestrator side is itself bounded at capacity 8,
+so the host-executor was never going to see unbounded `Dispatch` pressure
+from a well-behaved orchestrator regardless). The connection staying open is
+still the host's liveness signal, unchanged.
+
+**Does NOT reopen** the set-aside concurrent-dispatch question above: jobs
+still run one at a time, in the same order they arrive, with the same
+resource-isolation assumptions. Only the connection's own read loop gained
+concurrency with respect to a DIFFERENT message type, not with respect to
+running more than one job.
+
+**Known gap, named rather than silently left:** `RunControl`'s deadline
+suspension/extension is honored by the process backend
+(`impls/local/src/process.rs`'s poll loop reads `spec.control` live) but
+NOT yet by the VM backends (`impls/vm/src/qemu.rs`/`vfkit.rs`): their
+console-protocol read loop (`impls/vm/src/console/mod.rs::run_console`)
+still enforces the STATIC `TimeoutPolicy` derived once from
+`spec.timeout_secs` at job start. `RunControl.is_cancelled()` /
+`.deadline()` compile and thread through `RunSpec` correctly for VM-backed
+jobs (every construction site satisfies the contract), but a VM-backed
+job's actual timeout/cancellation behavior is unchanged by this PR — a VM
+job still runs to its original fixed budget regardless of attach state or
+`daemon cancel`. Adapting `run_console`'s phase-timeout state machine to
+poll a live `RunControl` is real, separate follow-up work (it needs the
+socket read to return on a short, bounded interval rather than blocking for
+the whole budget, and the protocol's existing phase/timeout-policy
+semantics understood well enough not to regress the acceptance suite) —
+intentionally not attempted blind within this change.
+
 ## 15. Orchestrator placement wiring: one shared `HostRegistry`, stage-1 required-class default, dispatch from the real submit path (#298)
 
 **Status:** implemented.
