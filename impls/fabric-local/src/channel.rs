@@ -260,6 +260,16 @@ impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
         }
     }
 
+    /// How many memberships are currently joined. A caller driving an
+    /// "is anyone attached" policy (e.g. sandyd's attach-relay, #340) reads
+    /// this around its own `join`/`leave` calls to detect a 0→1 or 1→0
+    /// transition; this method itself does not track transitions, only the
+    /// current count.
+    #[must_use]
+    pub fn member_count(&self) -> usize {
+        self.members.lock().unwrap_or_else(PoisonError::into_inner).len()
+    }
+
     /// Request an attenuated cap narrowed to `rights`, for a sub-agent that will
     /// join as `inviter`'s representative (spec §3.8): same principal, same
     /// channel, only narrower. `inviter` must hold `invite` rights. This does not
@@ -739,6 +749,27 @@ mod tests {
             Err(ChannelError::NotAMember)
         );
         assert_eq!(channel.subscribe(&ghost).err(), Some(ChannelError::NotAMember));
+        Ok(())
+    }
+
+    /// `member_count` reflects joins and leaves as they happen — the fact a
+    /// 0→1/1→0 attach-state policy (#340) is built on.
+    #[tokio::test]
+    async fn member_count_tracks_joins_and_leaves() -> anyhow::Result<()> {
+        let (channel, _backend, id, authority) = new_channel().await?;
+        assert_eq!(channel.member_count(), 0);
+
+        let first = channel.join(&mint(&authority, "p1", &id, full(), Some(later())))?;
+        assert_eq!(channel.member_count(), 1);
+
+        let second = channel.join(&mint(&authority, "p2", &id, full(), Some(later())))?;
+        assert_eq!(channel.member_count(), 2);
+
+        channel.leave(&first);
+        assert_eq!(channel.member_count(), 1);
+
+        channel.leave(&second);
+        assert_eq!(channel.member_count(), 0);
         Ok(())
     }
 

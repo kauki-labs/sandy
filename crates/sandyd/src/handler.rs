@@ -329,6 +329,7 @@ pub async fn handle(
                     Ok(link) => {
                         let link_token = link.token().as_bytes().to_vec();
                         job_channel.remote_link = Some(link);
+                        job_channel.host_id = Some(candidate.host_id.clone());
                         let dispatch = Dispatch {
                             job_id: job_id.clone(),
                             manifest: manifest.clone(),
@@ -1171,6 +1172,7 @@ mod tests {
                 remote_link: None,
                 granted_caps: job.granted_caps.clone(),
                 session: job.session,
+                host_id: job.host_id.clone(),
             },
         );
 
@@ -1226,6 +1228,7 @@ mod tests {
                 remote_link: Some(link),
                 granted_caps: job.granted_caps.clone(),
                 session: job.session,
+                host_id: job.host_id.clone(),
             },
         );
 

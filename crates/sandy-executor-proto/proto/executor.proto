@@ -58,6 +58,7 @@ message OrchestratorMessage {
     Registered registered = 1;
     RegisterRefused refused = 2;
     Dispatch dispatch = 3;
+    AttachStateChanged attach_state_changed = 4;
   }
 }
 
@@ -159,4 +160,16 @@ message Dispatch {
   // anything (defense in depth — never trust the orchestrator's placement
   // decision alone for a fail-closed security gate).
   IsolationClass required_isolation_class = 7;
+}
+
+// Orchestrator -> host-executor (#340): the orchestrator's own attach-relay
+// (sandyd's attach data-plane socket) noticing a job's attach-membership
+// count cross zero in either direction. Not a job-level timeout override on
+// the wire (stage 1 still has none) — it changes what the host-executor's
+// existing fixed wall-clock cap (STAGE1_TIMEOUT_SECS) MEANS for this job:
+// suspended while `attached` is true, counting down again once it goes
+// false. Sent at most once per transition, never a heartbeat/poll.
+message AttachStateChanged {
+  string job_id = 1;
+  bool attached = 2;
 }

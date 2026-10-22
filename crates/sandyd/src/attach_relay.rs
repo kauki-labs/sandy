@@ -39,7 +39,10 @@ use sandy_fabric_local::{
 use sandy_proto::{Control, MessageType, Tty};
 use tokio::{net::UnixListener, sync::Mutex as AsyncMutex};
 
-use crate::dispatch::JobRegistry;
+use crate::{
+    dispatch::{self, JobRegistry},
+    host_registry::HostRegistry,
+};
 
 /// How long a freshly accepted attach connection has to present its `Join`
 /// cap before it's closed — mirrors `mesh_accept`'s `PREFIX_TIMEOUT` for the
@@ -51,13 +54,18 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 /// Accept connections from `listener` until it errors, handing each to
 /// [`serve_one_attach`]. A single connection's own failure never stops the
 /// loop — only ends that one connection.
-pub async fn serve_attach_accept_loop(listener: &UnixListener, registry: &Arc<JobRegistry>) {
+pub async fn serve_attach_accept_loop(
+    listener: &UnixListener,
+    registry: &Arc<JobRegistry>,
+    host_registry: &Arc<HostRegistry>,
+) {
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
                 let registry = Arc::clone(registry);
+                let host_registry = Arc::clone(host_registry);
                 tokio::spawn(async move {
-                    serve_one_attach(stream, &registry).await;
+                    serve_one_attach(stream, &registry, &host_registry).await;
                 });
             }
             Err(e) => {
@@ -68,10 +76,51 @@ pub async fn serve_attach_accept_loop(listener: &UnixListener, registry: &Arc<Jo
     }
 }
 
+/// Best-effort: notify `job`'s placed host-executor (#340) that its attach-
+/// membership count is now `attached` (`true` right after a join that
+/// brought it from 0, `false` right after a leave that dropped it to 0). A
+/// no-op if the job was never placed remotely (`host_id` is `None`, e.g. a
+/// local-only run) or the send fails (the host disconnected, or never
+/// registered this job at all) — logged, never propagated, since losing this
+/// notification only costs the "unlimited while attached" policy for this
+/// job, never the attach session itself (the same "best-effort, not a gate"
+/// discipline `persist_attach_token` already follows elsewhere in this
+/// feature).
+///
+/// KNOWN RACE (documented, not fixed here): two connections joining or
+/// leaving the SAME job's channel concurrently can each observe a count
+/// that doesn't deterministically correspond to "my own join/leave caused
+/// this transition" — `Channel::join`/`leave` and `member_count` are three
+/// separate lock acquisitions, not one atomic operation. The practical
+/// impact is at most a redundant or briefly-missed notification, never an
+/// incorrect STEADY-STATE: once the race window passes, the next
+/// transition's check reflects the real count. Acceptable for a rare,
+/// low-stakes race (the host-executor's own handling is idempotent on a
+/// repeated `attached: true`); a stronger guarantee would need `Channel`'s
+/// own API to return the post-join/leave count atomically, out of scope
+/// here.
+async fn notify_attach_state(job: &dispatch::JobChannel, host_registry: &HostRegistry, job_id: &str, attached: bool) {
+    let Some(host_id) = &job.host_id else {
+        return; // never placed remotely: no host-executor to notify
+    };
+    if let Err(e) = host_registry
+        .send_attach_state_changed(
+            host_id,
+            sandy_executor_proto::AttachStateChanged {
+                job_id: job_id.to_owned(),
+                attached,
+            },
+        )
+        .await
+    {
+        tracing::debug!(host_id, job_id, attached, error = %e, "could not notify the host-executor of an attach-state change");
+    }
+}
+
 /// Handshake, then relay, one accepted attach connection end to end. Logs
 /// and returns on any failure — never panics, never brings down the accept
 /// loop.
-async fn serve_one_attach(stream: tokio::net::UnixStream, registry: &JobRegistry) {
+async fn serve_one_attach(stream: tokio::net::UnixStream, registry: &JobRegistry, host_registry: &HostRegistry) {
     let (mut read_half, write_half) = tokio::io::split(stream);
     let write_half = Arc::new(AsyncMutex::new(write_half));
 
@@ -145,11 +194,21 @@ async fn serve_one_attach(stream: tokio::net::UnixStream, registry: &JobRegistry
             return;
         }
     };
+    // #340: this join may be the one that brought the count from 0 to 1 —
+    // see `notify_attach_state`'s own doc for the race this check does not
+    // close (a concurrent join/leave on the same job can make this an
+    // imprecise signal, never an incorrect steady-state).
+    if job.channel.member_count() == 1 {
+        notify_attach_state(&job, host_registry, &job_id, true).await;
+    }
     if write_frame(&mut *write_half.lock().await, &LinkFrame::Joined { channel: None })
         .await
         .is_err()
     {
         job.channel.leave(&membership);
+        if job.channel.member_count() == 0 {
+            notify_attach_state(&job, host_registry, &job_id, false).await;
+        }
         return;
     }
     // The connection's initial size (epic #340 phase 2), posted as an
@@ -171,6 +230,9 @@ async fn serve_one_attach(stream: tokio::net::UnixStream, registry: &JobRegistry
 
     if let Err(e) = relay(Arc::clone(&job.channel), membership, &mut read_half, write_half).await {
         tracing::warn!(error = %e, job_id, "attach relay faulted");
+    }
+    if job.channel.member_count() == 0 {
+        notify_attach_state(&job, host_registry, &job_id, false).await;
     }
 }
 
@@ -746,6 +808,151 @@ mod tests {
         Ok((registry, agent_cap, operator_cap))
     }
 
+    /// Like [`registry_with_job`], but the job is recorded as placed on
+    /// `host_id` (#340) — the fact [`notify_attach_state`] reads to decide
+    /// which host-executor to notify.
+    async fn registry_with_job_on_host(job_id: &str, host_id: &str) -> anyhow::Result<(Arc<JobRegistry>, Cap)> {
+        let registry = Arc::new(JobRegistry::new()?);
+        let mut job = dispatch::mint_job_channel(job_id, registry.authority()).await?;
+        job.host_id = Some(host_id.to_owned());
+        registry.insert(job_id.to_owned(), job);
+        let operator_cap = registry.authority().mint(CapScope {
+            peer: PeerId::from("operator"),
+            channel: ChannelId::from(job_id),
+            rights: post_capable(),
+            expires_at: None,
+        })?;
+        Ok((registry, operator_cap))
+    }
+
+    /// Positive, end to end (#340): a real wire attach causes exactly one
+    /// `AttachStateChanged { attached: true }` to reach the job's placed
+    /// host-executor's queue, and the clean close that follows causes
+    /// exactly one `{ attached: false }` — proving the 0→1/1→0 transition
+    /// detection in `serve_one_attach` actually fires through the real
+    /// `HostRegistry`, not just the lower-level `relay`/`Channel` pieces
+    /// other tests in this module already cover.
+    #[tokio::test]
+    async fn a_real_attach_then_detach_notifies_the_jobs_placed_host() -> anyhow::Result<()> {
+        use crate::host_registry::{ExecutorAllowlist, HostRegistry, Registration};
+
+        let (registry, operator_cap) = registry_with_job_on_host("job-1", "ws01").await?;
+
+        let host_registry = Arc::new(HostRegistry::default());
+        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let Registration {
+            mut attach_state_rx, ..
+        } = host_registry
+            .register(&allowlist, executor_ip(), "ws01".to_owned(), host_capabilities())
+            .expect("ws01 must register");
+
+        let (client, server) = tokio::net::UnixStream::pair()?;
+        let accepting = {
+            let registry = Arc::clone(&registry);
+            let host_registry = Arc::clone(&host_registry);
+            tokio::spawn(async move {
+                serve_one_attach(server, &registry, &host_registry).await;
+            })
+        };
+
+        let (mut client_rd, mut client_wr) = client.into_split();
+        write_frame(
+            &mut client_wr,
+            &LinkFrame::Join {
+                cap: hex::encode(encode_cap(&operator_cap)?),
+                channel: None,
+            },
+        )
+        .await?;
+        let response = tokio::time::timeout(WAIT, read_frame(&mut client_rd))
+            .await
+            .context("timed out waiting for Joined")?
+            .context("reading Joined faulted")?
+            .context("closed before Joined")?;
+        assert!(matches!(response, LinkFrame::Joined { .. }), "got {response:?}");
+
+        let attached_true = tokio::time::timeout(WAIT, attach_state_rx.recv())
+            .await
+            .context("timed out waiting for AttachStateChanged{true}")?
+            .context("attach_state_rx ended before the join notification")?;
+        assert_eq!(attached_true.job_id, "job-1");
+        assert!(attached_true.attached);
+
+        drop(client_wr);
+        drop(client_rd);
+        tokio::time::timeout(WAIT, accepting)
+            .await
+            .context("timed out waiting for the relay to end")??;
+
+        let attached_false = tokio::time::timeout(WAIT, attach_state_rx.recv())
+            .await
+            .context("timed out waiting for AttachStateChanged{false}")?
+            .context("attach_state_rx ended before the leave notification")?;
+        assert_eq!(attached_false.job_id, "job-1");
+        assert!(!attached_false.attached);
+        Ok(())
+    }
+
+    /// Adversarial: a job that was never placed remotely (`host_id: None`,
+    /// the default `registry_with_job` fixture every other test in this
+    /// module uses) must never attempt an attach-state notification at all
+    /// — there is no host-executor to notify, and `notify_attach_state`
+    /// must return immediately rather than, say, panicking on a `None`
+    /// unwrap or logging a confusing "no such host" for every local attach.
+    #[tokio::test]
+    async fn a_locally_run_jobs_attach_never_attempts_a_host_notification() -> anyhow::Result<()> {
+        use crate::host_registry::HostRegistry;
+
+        let (registry, _agent_cap, operator_cap) = registry_with_job("job-1").await?;
+        let host_registry = Arc::new(HostRegistry::default());
+
+        let (client, server) = tokio::net::UnixStream::pair()?;
+        let accepting = {
+            let registry = Arc::clone(&registry);
+            let host_registry = Arc::clone(&host_registry);
+            tokio::spawn(async move {
+                serve_one_attach(server, &registry, &host_registry).await;
+            })
+        };
+
+        let (mut client_rd, mut client_wr) = client.into_split();
+        write_frame(
+            &mut client_wr,
+            &LinkFrame::Join {
+                cap: hex::encode(encode_cap(&operator_cap)?),
+                channel: None,
+            },
+        )
+        .await?;
+        let response = tokio::time::timeout(WAIT, read_frame(&mut client_rd))
+            .await
+            .context("timed out waiting for Joined")?
+            .context("reading Joined faulted")?
+            .context("closed before Joined")?;
+        assert!(matches!(response, LinkFrame::Joined { .. }), "got {response:?}");
+
+        drop(client_wr);
+        drop(client_rd);
+        tokio::time::timeout(WAIT, accepting).await??;
+        // No assertion beyond "this didn't panic and ran to completion" —
+        // there is no host registered at all, so any attempted notification
+        // would have nowhere to go; the point is that none was attempted.
+        Ok(())
+    }
+
+    fn executor_ip() -> std::net::IpAddr {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(100, 64, 0, 7))
+    }
+
+    fn host_capabilities() -> sandy_executor_proto::Capabilities {
+        sandy_executor_proto::Capabilities {
+            supported_sandbox_kinds: vec![sandy_executor_proto::SandboxKind::Process.into()],
+            arch: sandy_executor_proto::Arch::X8664.into(),
+            attestation: false,
+            supported_isolation_classes: vec![sandy_executor_proto::IsolationClass::Trusted.into()],
+        }
+    }
+
     /// Positive: presenting a real, validly-scoped cap over the real UDS
     /// handshake is admitted (`Joined`), not refused.
     #[tokio::test]
@@ -753,8 +960,9 @@ mod tests {
         let (registry, _agent_cap, operator_cap) = registry_with_job("job-1").await?;
         let (client, server) = tokio::net::UnixStream::pair()?;
 
+        let host_registry = Arc::new(HostRegistry::default());
         let accepting = tokio::spawn(async move {
-            serve_one_attach(server, &registry).await;
+            serve_one_attach(server, &registry, &host_registry).await;
         });
 
         let (mut client_rd, mut client_wr) = client.into_split();
@@ -796,8 +1004,9 @@ mod tests {
         })?;
         let (client, server) = tokio::net::UnixStream::pair()?;
 
+        let host_registry = Arc::new(HostRegistry::default());
         let accepting = tokio::spawn(async move {
-            serve_one_attach(server, &registry).await;
+            serve_one_attach(server, &registry, &host_registry).await;
         });
 
         let (mut client_rd, mut client_wr) = client.into_split();
@@ -840,8 +1049,9 @@ mod tests {
         })?;
         let (client, server) = tokio::net::UnixStream::pair()?;
 
+        let host_registry = Arc::new(HostRegistry::default());
         let accepting = tokio::spawn(async move {
-            serve_one_attach(server, &registry).await;
+            serve_one_attach(server, &registry, &host_registry).await;
         });
 
         let (mut client_rd, mut client_wr) = client.into_split();

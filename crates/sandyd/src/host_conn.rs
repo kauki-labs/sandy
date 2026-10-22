@@ -143,6 +143,7 @@ pub async fn serve_host_executor(
     // superseded registration is ignored here.
     let Registration {
         mut dispatch_rx,
+        mut attach_state_rx,
         registration,
         ..
     } = match registry.register(allowlist, peer_ip, host_id.clone(), capabilities) {
@@ -238,6 +239,39 @@ pub async fn serve_host_executor(
                     }
                     Err(_elapsed) => {
                         tracing::warn!(host_id, "writing Dispatch to host-executor timed out; treating it as hung");
+                        break;
+                    }
+                }
+            }
+            attach_state = attach_state_rx.recv() => {
+                let Some(attach_state) = attach_state else {
+                    // Same reasoning as `dispatch_rx` above: only happens if
+                    // this registry entry was already replaced or removed.
+                    break;
+                };
+                let job_id = attach_state.job_id.clone();
+                let attached = attach_state.attached;
+                match tokio::time::timeout(
+                    DISPATCH_WRITE_TIMEOUT,
+                    write_frame(
+                        &mut write_half,
+                        &OrchestratorMessage { op: Some(orchestrator_message::Op::AttachStateChanged(attach_state)) },
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {
+                        tracing::debug!(host_id, job_id, attached, "sent AttachStateChanged to host-executor");
+                    }
+                    Ok(Err(_)) => {
+                        tracing::warn!(host_id, "failed writing AttachStateChanged to host-executor; closing");
+                        break;
+                    }
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            host_id,
+                            "writing AttachStateChanged to host-executor timed out; treating it as hung"
+                        );
                         break;
                     }
                 }

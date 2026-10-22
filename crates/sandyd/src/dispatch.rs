@@ -86,6 +86,13 @@ pub struct JobChannel {
     /// already follows. Compared, not trusted: a mismatch on a later
     /// Cancel/Attach is logged, not refused — see [`JobChannel::session_matches`].
     pub session: Uuid,
+    /// The host-executor id this job was placed on (#340), `None` for a
+    /// locally-run job or one never placed remotely. Set once, at the same
+    /// point `remote_link` is (`handler::handle`'s Submit arm, inside the
+    /// `dispatch_plan` closure), never mutated after — the attach-relay
+    /// (`attach_relay.rs`) reads it to know which host to notify of an
+    /// attach-membership transition via `HostRegistry::send_attach_state_changed`.
+    pub host_id: Option<String>,
 }
 
 impl JobChannel {
@@ -159,6 +166,7 @@ pub async fn mint_job_channel(job_id: &str, authority: &SharedCapAuthority) -> R
         remote_link: None,
         granted_caps: Vec::new(),
         session: Uuid::nil(),
+        host_id: None,
     })
 }
 

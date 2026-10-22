@@ -162,6 +162,16 @@ async fn main() {
         }
     };
 
+    // One HostRegistry (#298), shared between the mesh management-channel
+    // loop below (which registers connected host-executors), the
+    // control-socket path (which reads it for placement on Submit), and the
+    // attach-relay accept loop just below (which notifies a job's placed
+    // host of an attach-state transition, #340) — not separate registries,
+    // or a host registered on the mesh listener would be invisible to the
+    // other two. Created here, ahead of its original spot further down,
+    // specifically so the attach-relay loop can take a reference to it.
+    let host_registry = Arc::new(HostRegistry::default());
+
     // Spawned plainly, like the mesh agent-link listener below: no
     // graceful-shutdown support of its own yet (same #289-class follow-up),
     // so it's abruptly cancelled on process exit — an in-flight attach
@@ -169,8 +179,9 @@ async fn main() {
     // dispatch channel.
     {
         let registry = Arc::clone(&registry);
+        let host_registry = Arc::clone(&host_registry);
         tokio::spawn(async move {
-            sandyd::attach_relay::serve_attach_accept_loop(&attach_listener, &registry).await;
+            sandyd::attach_relay::serve_attach_accept_loop(&attach_listener, &registry, &host_registry).await;
         });
     }
 
@@ -187,13 +198,6 @@ async fn main() {
         shutdown_signal().await;
         let _ = shutdown_tx.send(true);
     });
-
-    // One HostRegistry (#298), shared between the mesh management-channel
-    // loop below (which registers connected host-executors) and the
-    // control-socket path (which reads it for placement on Submit) — not
-    // two separate registries, or a host registered on the mesh listener
-    // would be invisible to a job submitted over the UDS socket.
-    let host_registry = Arc::new(HostRegistry::default());
 
     // The mesh management-channel listener (#291): unset by default, so
     // sandyd stays local-only unless an operator explicitly configures M2

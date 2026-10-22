@@ -33,8 +33,9 @@ pub mod v1 {
 /// direct `prost` dependency just for that bound.
 pub use prost::Message;
 pub use v1::{
-    Arch, Capabilities, Dispatch, HostExecutorMessage, IsolationClass, JobResult, OrchestratorMessage, Register,
-    RegisterRefused, Registered, SandboxKind, host_executor_message, orchestrator_message,
+    Arch, AttachStateChanged, Capabilities, Dispatch, HostExecutorMessage, IsolationClass, JobResult,
+    OrchestratorMessage, Register, RegisterRefused, Registered, SandboxKind, host_executor_message,
+    orchestrator_message,
 };
 
 /// `Dispatch.link_token` is a bearer secret (INV-1): a holder can authenticate
