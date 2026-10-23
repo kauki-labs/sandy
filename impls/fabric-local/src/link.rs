@@ -899,6 +899,68 @@ mod tests {
         Ok(())
     }
 
+    /// CodeRabbit on #345: `send_archive` must not be able to hang forever
+    /// against a peer that stops reading — the real risk being that it
+    /// shares the link's one write mutex with `report_exit`, so a stuck
+    /// archive delivery would otherwise also block exit reporting
+    /// indefinitely. Drives the handshake manually (not `serve_agent_link`,
+    /// which would keep actively draining everything the agent posts) over
+    /// a deliberately tiny connection, then never reads again — proving the
+    /// write genuinely can be bounded by a timeout rather than completing
+    /// instantly into a generously-sized buffer.
+    #[tokio::test]
+    async fn send_archive_can_be_bounded_against_a_silent_peer() -> anyhow::Result<()> {
+        use crate::agent::ARCHIVE_TRANSCRIPT;
+
+        let authority = LocalCapAuthority::new(Duration::from_secs(3600))?;
+        let cap = authority.mint(scope("agent", true))?;
+        // Small enough that the archive frame below (JSON + hex-encoded,
+        // always well over this) cannot fit once the peer stops reading.
+        let (agent_end, mut host_end) = tokio::io::duplex(64);
+
+        // `LinkAgent::bootstrap` and this handshake are interleaved (its
+        // Join write is what the `read_frame` below waits on), so they must
+        // run concurrently, not one after the other.
+        let handshake = tokio::spawn(async move {
+            let handed = hex::encode(encode_cap(&cap)?);
+            write_frame(
+                &mut host_end,
+                &LinkFrame::Cap {
+                    cap: handed.clone(),
+                    channel: None,
+                    peers: 0,
+                },
+            )
+            .await?;
+            match read_frame(&mut host_end).await? {
+                Some(LinkFrame::Join { cap, channel: None, .. }) if cap == handed => {}
+                other => anyhow::bail!("expected the agent's Join, got {other:?}"),
+            }
+            write_frame(&mut host_end, &LinkFrame::Joined { channel: None }).await?;
+            // Never reads again from here — `host_end` is simply held open,
+            // idle, for the rest of the test, kept alive inside this task.
+            std::future::pending::<()>().await;
+            #[allow(unreachable_code)]
+            anyhow::Ok(())
+        });
+
+        let agent = timeout(WAIT, LinkAgent::bootstrap(agent_end)).await??;
+        let outcome = timeout(
+            Duration::from_secs(2),
+            agent.send_archive(
+                ARCHIVE_TRANSCRIPT,
+                b"the whole transcript, well over 64 bytes once framed".to_vec(),
+            ),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "send_archive completed instead of blocking against a silent peer: {outcome:?}"
+        );
+        handshake.abort();
+        Ok(())
+    }
+
     /// A cap from another authority is refused at `Join`: the agent never
     /// bootstraps, and the relay reports the forged cap.
     #[tokio::test]

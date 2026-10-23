@@ -28,10 +28,18 @@ use std::{
     os::{fd::AsFd, unix::process::ExitStatusExt},
     process::{ExitCode, ExitStatus},
     sync::Arc,
+    time::Duration,
 };
 
 use sandy_fabric_local::agent::{ARCHIVE_TRANSCRIPT, LinkAgent};
 use tokio::io::{AsyncRead, AsyncWrite};
+
+/// How long [`serve`] waits for the archived transcript to reach the relay
+/// before giving up on it and moving on to report the job's exit regardless
+/// (CodeRabbit on #345) — generous for even a large (line-capped) transcript
+/// over a healthy link, short enough that a stuck peer doesn't stall exit
+/// reporting for long.
+const ARCHIVE_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 mod link_source;
 mod peer;
@@ -207,8 +215,26 @@ where
     match tokio::fs::read(tmux_job.log_path()).await {
         Ok(transcript) => {
             to_stdout(&transcript);
-            if let Err(e) = agent.send_archive(ARCHIVE_TRANSCRIPT, transcript).await {
-                eprintln!("sandy-agent: sending the archived transcript: {e}");
+            // Bounded, not awaited unconditionally: `send_archive` shares the
+            // link's one write mutex with `report_exit` below, and a stuck
+            // peer (stopped reading) would otherwise block `write_all`
+            // forever, meaning the job's exit — which the wire protocol
+            // requires to be this link's LAST frame, so it can't simply be
+            // sent first instead — would never get reported at all (CodeRabbit
+            // on #345). `report_exit` is still attempted unconditionally
+            // below regardless of how this resolves: on success, on a link
+            // error, or on this timeout. A timeout here can't rule out a
+            // frame already half-written to the socket (bytes already handed
+            // to the kernel aren't un-sent by dropping the future) — in that
+            // rare case `report_exit`'s own write degrades to the ordinary,
+            // already-handled link-fault path (an infra fault, INV-11), not
+            // a new silent failure or a new hang.
+            match tokio::time::timeout(ARCHIVE_SEND_TIMEOUT, agent.send_archive(ARCHIVE_TRANSCRIPT, transcript)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => eprintln!("sandy-agent: sending the archived transcript: {e}"),
+                Err(_elapsed) => {
+                    eprintln!("sandy-agent: sending the archived transcript timed out after {ARCHIVE_SEND_TIMEOUT:?}");
+                }
             }
         }
         Err(e) => eprintln!("sandy-agent: reading the archived transcript: {e}"),
