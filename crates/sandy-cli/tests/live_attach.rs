@@ -363,6 +363,9 @@ async fn real_attach_round_trips_proves_session_fork_and_survives_detach_reattac
 
     let agent_program = build_workspace_bin("sandy-agent", "sandy-agent")?;
     let rt = tokio::runtime::Handle::current();
+    // Matches handle_dispatch's own internal stage-1 bound (STAGE1_TIMEOUT_SECS,
+    // private to that crate): generous for a real job run.
+    let control = sandy_api::backend::RunControl::with_timeout_secs(300);
     let running = tokio::task::spawn_blocking(move || {
         sandy_host_executor::dispatch::handle_dispatch(
             &dispatch,
@@ -370,6 +373,7 @@ async fn real_attach_round_trips_proves_session_fork_and_survives_detach_reattac
             agent_program,
             rt,
             false,
+            control,
         )
     });
 
@@ -582,6 +586,9 @@ async fn the_real_cli_binary_attaches_delivers_output_and_exits_on_job_completio
     let agent_program = build_workspace_bin("sandy-agent", "sandy-agent")?;
     let rt = tokio::runtime::Handle::current();
     let dispatch_job_id = job_id.clone();
+    // Matches handle_dispatch's own internal stage-1 bound (STAGE1_TIMEOUT_SECS,
+    // private to that crate): generous for a real job run.
+    let control = sandy_api::backend::RunControl::with_timeout_secs(300);
     let running = tokio::spawn(async move {
         let outcome = tokio::task::spawn_blocking(move || {
             sandy_host_executor::dispatch::handle_dispatch(
@@ -590,6 +597,7 @@ async fn the_real_cli_binary_attaches_delivers_output_and_exits_on_job_completio
                 agent_program,
                 rt,
                 false,
+                control,
             )
         })
         .await
@@ -758,6 +766,9 @@ async fn a_separate_attach_process_gets_post_rights_via_the_persisted_token() ->
     let agent_program = build_workspace_bin("sandy-agent", "sandy-agent")?;
     let rt = tokio::runtime::Handle::current();
     let dispatch_job_id = job_id.clone();
+    // Matches handle_dispatch's own internal stage-1 bound (STAGE1_TIMEOUT_SECS,
+    // private to that crate): generous for a real job run.
+    let control = sandy_api::backend::RunControl::with_timeout_secs(300);
     let running = tokio::spawn(async move {
         let outcome = tokio::task::spawn_blocking(move || {
             sandy_host_executor::dispatch::handle_dispatch(
@@ -766,6 +777,7 @@ async fn a_separate_attach_process_gets_post_rights_via_the_persisted_token() ->
                 agent_program,
                 rt,
                 false,
+                control,
             )
         })
         .await

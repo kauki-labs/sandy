@@ -385,6 +385,9 @@ async fn cross_machine_sandboxes_exchange_a_peer_message_through_the_hub() -> an
     //    run).
     let agent_program = build_workspace_bin("sandy-agent", "sandy-agent")?;
     let rt = tokio::runtime::Handle::current();
+    // Matches handle_dispatch's own internal stage-1 bound (STAGE1_TIMEOUT_SECS,
+    // private to that crate): generous for a real `echo hi` run.
+    let control = sandy_api::backend::RunControl::with_timeout_secs(300);
     let outcome = tokio::task::spawn_blocking(move || {
         sandy_host_executor::dispatch::handle_dispatch(
             &dispatch,
@@ -392,6 +395,7 @@ async fn cross_machine_sandboxes_exchange_a_peer_message_through_the_hub() -> an
             agent_program,
             rt,
             false,
+            control,
         )
     })
     .await

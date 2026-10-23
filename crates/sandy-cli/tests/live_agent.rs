@@ -19,7 +19,7 @@ use std::{
 
 use anyhow::Context;
 use futures_util::StreamExt;
-use sandy::{BackendError, Grants, Outcome, RunSpec, VmBackend};
+use sandy::{BackendError, Grants, Outcome, RunControl, RunSpec, VmBackend};
 use sandy_api::agent::{AgentLaunch, AgentReport};
 use sandy_fabric::{
     capauth::{Cap, CapAuthority, CapRights, CapScope, encode_cap},
@@ -120,6 +120,7 @@ async fn run_in_guest(
             agent: false,
             shares: false,
         };
+        let control = RunControl::with_timeout_secs(120);
         host_backend().with_agent(launch).run(&RunSpec {
             template: &template,
             command: &command,
@@ -133,6 +134,7 @@ async fn run_in_guest(
             grants: &grants,
             outcome_file: None,
             secret_dir: None,
+            control: &control,
         })
     })
     .await?)
