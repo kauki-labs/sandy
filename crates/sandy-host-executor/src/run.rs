@@ -14,7 +14,10 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, PoisonError},
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -98,6 +101,15 @@ pub async fn register(
     }
 }
 
+/// The last `AttachStateChanged` applied, or pending application, for one
+/// job_id — see [`run_dispatch_loop`]'s own doc on reordering and
+/// pre-registration handling.
+#[derive(Debug, Clone, Copy)]
+struct AttachState {
+    sequence: u64,
+    attached: bool,
+}
+
 /// Why [`run_dispatch_loop`] stopped reading dispatches — `main` uses this to
 /// decide its exit code: [`Shutdown`](Self::Shutdown) is an ordinary,
 /// requested stop (exit 0), while [`Closed`](Self::Closed) and
@@ -128,11 +140,15 @@ pub enum DispatchLoopExit {
 ///   plain, synchronous, never-blocking push (an unbounded channel's `send` never awaits) — a second or third queued
 ///   `Dispatch` can never stall this loop from reading the NEXT frame, which matters because...
 /// - `AttachStateChanged` (#340) is routed DIRECTLY to the named job_id's live [`RunControl`] (if that job is currently
-///   running — a stale or unknown job_id is silently ignored, the host-executor may simply not have started that
-///   dispatch yet or have already finished it), applying `suspend_deadline()`/`set_deadline(now + STAGE1_TIMEOUT_SECS)`
-///   for `attached: true`/`false` respectively. This is exactly the frame type that MUST keep being read promptly even
-///   while a dispatch is running — the whole reason this function no longer blocks on `Dispatch` handling the way it
-///   used to.
+///   running), applying `suspend_deadline()`/`set_deadline(now + STAGE1_TIMEOUT_SECS)` for `attached: true`/`false`
+///   respectively. Its `sequence` is tracked per job_id and a frame whose sequence is not strictly greater than the
+///   last one applied is ignored, so a frame reordered in flight can never overwrite newer attachment state with stale
+///   state. A frame for a job_id this host hasn't registered a `RunControl` for yet (the dispatch hasn't arrived, or
+///   has already finished) is still recorded as that job's pending attach state rather than dropped: the worker applies
+///   it the moment it registers that job_id's `RunControl`, so a frame that outraces its own job's `Dispatch` still
+///   takes effect instead of being silently lost. This is exactly the frame type that MUST keep being read promptly
+///   even while a dispatch is running — the whole reason this function no longer blocks on `Dispatch` handling the way
+///   it used to.
 /// - Any other frame shape is logged and ignored, as before.
 ///
 /// `handle` returns the result message to send back for that dispatch
@@ -140,20 +156,20 @@ pub enum DispatchLoopExit {
 /// `conn` for reading, via `tokio::io::split`) sends it on the SAME
 /// connection the Dispatch arrived on. A `None` return sends nothing.
 ///
-/// CONNECTION-DROP FAIL-SAFE (#340): if this function is about to return
-/// [`DispatchLoopExit::Closed`] or [`DispatchLoopExit::Faulted`] — the
-/// connection died, not a requested shutdown — every job still running at
-/// that moment has its `RunControl` moved to a grace deadline
-/// (`now + STAGE1_TIMEOUT_SECS`) rather than left suspended forever: with
-/// the connection gone, no further `AttachStateChanged` can ever arrive to
-/// end an "unlimited while attached" suspension, so a sandyd crash or
-/// network partition while a job was attached must not keep that job alive
-/// indefinitely. This function then waits for every already-queued or
-/// in-flight dispatch to finish (respecting its own, possibly now-grace-
-/// bounded deadline) before returning, so a job's result is still reported
-/// if there's anywhere left to report it to, and `main.rs`'s "exit
-/// non-zero, let the supervisor restart" contract only fires once nothing
-/// is still running.
+/// FAIL-SAFE ON EVERY EXIT (#340): once this function's own read loop ends — for ANY reason, including an ordinary
+/// requested [`DispatchLoopExit::Shutdown`], not only [`DispatchLoopExit::Closed`]/[`DispatchLoopExit::Faulted`] —
+/// no further `AttachStateChanged` frame can ever arrive on this connection again, so:
+/// - every job still running at that moment has its `RunControl` moved to a grace deadline (`now +
+///   STAGE1_TIMEOUT_SECS`) rather than left suspended forever, since nothing could ever end an "unlimited while
+///   attached" suspension from here on — a clean shutdown while a job was attached is exactly as unable to deliver a
+///   future detach as a sandyd crash or network partition is.
+/// - a shared stopping flag is set so the worker skips any dispatch still sitting in its queue, unstarted, rather than
+///   beginning it: a job that hasn't started yet can never receive the `AttachStateChanged` frames its own execution
+///   might need either, for the same reason.
+///
+/// A dispatch already in flight when the loop ends is left to finish (respecting its own, possibly now-grace-bounded
+/// deadline) rather than skipped, so its result is still reported if there's anywhere left to report it to, and
+/// `main.rs`'s "exit non-zero, let the supervisor restart" contract only fires once nothing is still running.
 pub async fn run_dispatch_loop<F, Fut>(
     conn: &mut (impl AsyncRead + AsyncWrite + Unpin + Send),
     handle: F,
@@ -167,10 +183,25 @@ where
     let write_half = Arc::new(tokio::sync::Mutex::new(write_half));
 
     // job_id -> its live RunControl, for AttachStateChanged routing and the
-    // connection-drop fail-safe above. A plain std::sync::Mutex: every
-    // access here is a quick insert/remove/lookup, never held across an
-    // await.
+    // fail-safe above. A plain std::sync::Mutex: every access here is a
+    // quick insert/remove/lookup, never held across an await.
     let controls: Arc<Mutex<HashMap<String, RunControl>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    // job_id -> the highest-sequence AttachStateChanged seen for it, whether
+    // or not that job has a live RunControl yet. Serves two purposes: (1) a
+    // frame whose sequence isn't strictly greater than what's stored here is
+    // a reordered duplicate and is ignored, so stale state can never
+    // overwrite newer state; (2) a frame for a job_id with no RunControl yet
+    // stays recorded here as that job's pending attach state, applied by the
+    // worker the moment it registers that job_id's RunControl below.
+    let attach_states: Arc<Mutex<HashMap<String, AttachState>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    // Set once this function's own read loop ends, for any reason — see the
+    // FAIL-SAFE ON EVERY EXIT doc above. The worker checks this before
+    // starting each still-queued dispatch so it skips, rather than begins,
+    // dispatches that can never receive an AttachStateChanged frame once the
+    // loop has stopped reading.
+    let stopping = Arc::new(AtomicBool::new(false));
 
     // Unbounded: the reader below must never block pushing a Dispatch
     // (its own doc above explains why) — the worker draining this one at a
@@ -191,13 +222,36 @@ where
     let worker_fut = async {
         while let Some(dispatch) = dispatch_rx.recv().await {
             let job_id = dispatch.job_id.clone();
+            if stopping.load(Ordering::Relaxed) {
+                tracing::info!(
+                    job_id,
+                    "skipping a still-queued dispatch: the orchestrator connection's read loop has already ended, so \
+                     this job could never receive an AttachStateChanged frame"
+                );
+                continue;
+            }
             let control = RunControl::with_timeout_secs(STAGE1_TIMEOUT_SECS);
+            if let Some(state) = attach_states
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&job_id)
+                && state.attached
+            {
+                // A pending attach arrived before this job's own Dispatch —
+                // apply it now rather than leaving the fresh control's
+                // default timeout in place.
+                control.suspend_deadline();
+            }
             controls
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(job_id.clone(), control.clone());
             let result = handle(dispatch, control).await;
             controls.lock().unwrap_or_else(PoisonError::into_inner).remove(&job_id);
+            attach_states
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&job_id);
             if let Some(result) = result {
                 let mut write_half = write_half.lock().await;
                 if let Err(e) = write_frame(&mut *write_half, &result).await {
@@ -222,21 +276,38 @@ where
                             let _ = dispatch_tx.send(dispatch);
                         }
                         Some(orchestrator_message::Op::AttachStateChanged(changed)) => {
-                            let controls = controls.lock().unwrap_or_else(PoisonError::into_inner);
-                            if let Some(control) = controls.get(&changed.job_id) {
-                                if changed.attached {
-                                    control.suspend_deadline();
-                                } else {
-                                    control.set_deadline(
-                                        std::time::Instant::now()
-                                            + Duration::from_secs(u64::from(STAGE1_TIMEOUT_SECS)),
+                            let should_apply = {
+                                let mut attach_states =
+                                    attach_states.lock().unwrap_or_else(PoisonError::into_inner);
+                                let should_apply = attach_states
+                                    .get(&changed.job_id)
+                                    .is_none_or(|state| changed.sequence > state.sequence);
+                                if should_apply {
+                                    attach_states.insert(
+                                        changed.job_id.clone(),
+                                        AttachState { sequence: changed.sequence, attached: changed.attached },
                                     );
                                 }
+                                should_apply
+                            };
+                            // A sequence not strictly greater than what's already recorded is a
+                            // reordered duplicate of older state and must not overwrite newer state.
+                            if should_apply {
+                                let controls = controls.lock().unwrap_or_else(PoisonError::into_inner);
+                                if let Some(control) = controls.get(&changed.job_id) {
+                                    if changed.attached {
+                                        control.suspend_deadline();
+                                    } else {
+                                        control.set_deadline(
+                                            std::time::Instant::now()
+                                                + Duration::from_secs(u64::from(STAGE1_TIMEOUT_SECS)),
+                                        );
+                                    }
+                                }
+                                // An unknown job_id with no RunControl yet isn't dropped: it's
+                                // already recorded in attach_states above, and the worker applies
+                                // it the moment that job_id's RunControl is registered.
                             }
-                            // An unknown/stale job_id is not an error: the
-                            // dispatch may not have reached this host yet,
-                            // or may have already finished — either way
-                            // there is nothing live to apply this to.
                         }
                         _ => tracing::debug!("ignoring an unexpected frame from the orchestrator"),
                     },
@@ -265,16 +336,19 @@ where
         }
     };
 
-    // Connection-drop fail-safe (this function's own doc above) — never
-    // applied on a requested Shutdown, only when the connection itself is
-    // gone.
-    if !matches!(exit, DispatchLoopExit::Shutdown) {
+    // Fail-safe on every exit (this function's own doc above): the read loop
+    // has ended for good, so no further AttachStateChanged can ever arrive,
+    // regardless of why it ended. Stop the worker from starting anything
+    // still queued, and bound every job still running to a grace deadline.
+    stopping.store(true, Ordering::Relaxed);
+    {
         let controls = controls.lock().unwrap_or_else(PoisonError::into_inner);
         if !controls.is_empty() {
             tracing::warn!(
                 jobs = controls.len(),
-                "orchestrator connection ended while jobs were still running; treating them as detached and starting \
-                 their grace deadline"
+                exit = ?exit,
+                "the dispatch loop is ending while jobs are still running; no further AttachStateChanged frame can \
+                 arrive, so their deadlines are being bounded to a grace period"
             );
         }
         for control in controls.values() {
@@ -339,7 +413,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use anyhow::Context;
-    use sandy_executor_proto::{Arch, IsolationClass, RegisterRefused, Registered, SandboxKind};
+    use sandy_executor_proto::{Arch, AttachStateChanged, IsolationClass, RegisterRefused, Registered, SandboxKind};
 
     use super::*;
 
@@ -750,6 +824,186 @@ mod tests {
             .context("dispatch loop did not stop after shutdown")?
             .context("dispatch loop task panicked")?;
         assert_eq!(exit, DispatchLoopExit::Shutdown);
+        Ok(())
+    }
+
+    /// Regression (CodeRabbit on #344): a reordered, stale-sequence
+    /// `AttachStateChanged` must not overwrite the newer state a
+    /// higher-sequence frame already applied.
+    #[tokio::test]
+    async fn a_lower_sequence_attach_state_change_is_ignored_after_a_higher_one() -> anyhow::Result<()> {
+        let (mut client, mut server) = tokio::io::duplex(8192);
+
+        let orchestrator = tokio::spawn(async move {
+            write_frame(
+                &mut server,
+                &OrchestratorMessage {
+                    op: Some(orchestrator_message::Op::Dispatch(Dispatch {
+                        job_id: "job-1".to_owned(),
+                        manifest: Vec::new(),
+                        manifest_encoding: String::new(),
+                        backend: SandboxKind::Process.into(),
+                        link_token: vec![0u8; 32],
+                        forward_back: "127.0.0.1:9000".to_owned(),
+                        required_isolation_class: IsolationClass::Trusted.into(),
+                    })),
+                },
+            )
+            .await?;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            write_frame(
+                &mut server,
+                &OrchestratorMessage {
+                    op: Some(orchestrator_message::Op::AttachStateChanged(AttachStateChanged {
+                        job_id: "job-1".to_owned(),
+                        attached: true,
+                        sequence: 5,
+                    })),
+                },
+            )
+            .await?;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // Reordered in flight: a stale detach with a LOWER sequence than
+            // the attach already applied above.
+            write_frame(
+                &mut server,
+                &OrchestratorMessage {
+                    op: Some(orchestrator_message::Op::AttachStateChanged(AttachStateChanged {
+                        job_id: "job-1".to_owned(),
+                        attached: false,
+                        sequence: 2,
+                    })),
+                },
+            )
+            .await?;
+            Ok::<_, anyhow::Error>(server)
+        });
+
+        let seen_control = Arc::new(Mutex::new(None));
+        let seen_control_in_loop = Arc::clone(&seen_control);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let loop_task = tokio::spawn(async move {
+            run_dispatch_loop(
+                &mut client,
+                move |_dispatch, control| {
+                    let seen_control = Arc::clone(&seen_control_in_loop);
+                    async move {
+                        *seen_control.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(control);
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        None::<HostExecutorMessage>
+                    }
+                },
+                async {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+        });
+
+        let _server = tokio::time::timeout(std::time::Duration::from_secs(2), orchestrator)
+            .await
+            .context("orchestrator task did not finish")??
+            .context("orchestrator task failed")?;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let _ = shutdown_tx.send(());
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(2), loop_task)
+            .await
+            .context("dispatch loop did not stop after shutdown")?
+            .context("dispatch loop task panicked")?;
+        assert_eq!(exit, DispatchLoopExit::Shutdown);
+
+        let control = seen_control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect("handle was called");
+        assert!(
+            control.deadline().is_none(),
+            "the stale, lower-sequence detach must not have overwritten the newer attach's suspended deadline"
+        );
+        Ok(())
+    }
+
+    /// Regression (CodeRabbit on #344): an `AttachStateChanged` that outraces
+    /// its own job's `Dispatch` must still apply once that job registers a
+    /// `RunControl`, not be silently dropped for an unknown job_id.
+    #[tokio::test]
+    async fn an_attach_state_change_received_before_its_jobs_dispatch_is_applied_once_it_starts() -> anyhow::Result<()>
+    {
+        let (mut client, mut server) = tokio::io::duplex(8192);
+
+        let orchestrator = tokio::spawn(async move {
+            write_frame(
+                &mut server,
+                &OrchestratorMessage {
+                    op: Some(orchestrator_message::Op::AttachStateChanged(AttachStateChanged {
+                        job_id: "job-1".to_owned(),
+                        attached: true,
+                        sequence: 1,
+                    })),
+                },
+            )
+            .await?;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            write_frame(
+                &mut server,
+                &OrchestratorMessage {
+                    op: Some(orchestrator_message::Op::Dispatch(Dispatch {
+                        job_id: "job-1".to_owned(),
+                        manifest: Vec::new(),
+                        manifest_encoding: String::new(),
+                        backend: SandboxKind::Process.into(),
+                        link_token: vec![0u8; 32],
+                        forward_back: "127.0.0.1:9000".to_owned(),
+                        required_isolation_class: IsolationClass::Trusted.into(),
+                    })),
+                },
+            )
+            .await?;
+            Ok::<_, anyhow::Error>(server)
+        });
+
+        let seen_deadline = Arc::new(Mutex::new(None));
+        let seen_deadline_in_loop = Arc::clone(&seen_deadline);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let loop_task = tokio::spawn(async move {
+            run_dispatch_loop(
+                &mut client,
+                move |_dispatch, control| {
+                    let seen_deadline = Arc::clone(&seen_deadline_in_loop);
+                    async move {
+                        *seen_deadline.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(control.deadline());
+                        None::<HostExecutorMessage>
+                    }
+                },
+                async {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+        });
+
+        let _server = tokio::time::timeout(std::time::Duration::from_secs(2), orchestrator)
+            .await
+            .context("orchestrator task did not finish")??
+            .context("orchestrator task failed")?;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let _ = shutdown_tx.send(());
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(2), loop_task)
+            .await
+            .context("dispatch loop did not stop after shutdown")?
+            .context("dispatch loop task panicked")?;
+        assert_eq!(exit, DispatchLoopExit::Shutdown);
+
+        let deadline = seen_deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect("handle was called");
+        assert!(
+            deadline.is_none(),
+            "a pre-registration attach signal should already have suspended the job's deadline by the time it starts"
+        );
         Ok(())
     }
 

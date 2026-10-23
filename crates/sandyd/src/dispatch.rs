@@ -93,21 +93,52 @@ pub struct JobChannel {
     /// (`attach_relay.rs`) reads it to know which host to notify of an
     /// attach-membership transition via `HostRegistry::send_attach_state_changed`.
     pub host_id: Option<String>,
-    /// The next sequence number [`attach_relay::join_for_attach`]/
-    /// [`attach_relay::leave_for_attach`] will assign for this job's next
-    /// attach/detach transition (#340). Held as a plain `Mutex<u64>`, not an
-    /// `AtomicU64`: the lock itself is what serializes "join/leave the
-    /// channel, read the resulting count, and assign the next sequence" as
-    /// ONE critical section across every concurrent attach/detach on this
-    /// job — an atomic counter alone would only make the NUMBER assignment
-    /// atomic, not the whole transition-detection step, which is the actual
-    /// race (two concurrent joins/leaves could still interleave their
-    /// `Channel::join`/`member_count` calls and assign sequence numbers out
-    /// of true chronological order). The async send to the host-executor
-    /// that follows is never ordered by this lock — only the NUMBER it
-    /// carries is, which is what lets the host-executor resolve any
-    /// out-of-order delivery by keeping the highest sequence seen.
-    pub attach_seq: std::sync::Mutex<u64>,
+    /// This job's attach bookkeeping (#340): a DEDICATED count of currently
+    /// connected attach clients, plus the next sequence number to assign —
+    /// both updated under one lock by
+    /// [`attach_relay::join_for_attach`]/[`attach_relay::leave_for_attach`].
+    ///
+    /// Deliberately NOT `self.channel.member_count()` (CodeRabbit finding,
+    /// a real bug the first version of this feature had): the channel's
+    /// own membership also includes the sandbox agent's join (a totally
+    /// separate join, from a totally separate code path, that happens as
+    /// part of ordinary job execution regardless of whether anyone ever
+    /// attaches) — reading `member_count()` directly meant the 0→1
+    /// transition this feature's whole "unlimited while attached" policy
+    /// depends on could simply never fire once the agent had already
+    /// joined (member_count() would already read 1 with zero real
+    /// attachers). It also UNDERcounts: `MembershipId` is keyed by a
+    /// digest of the cap's own proof bytes, so two distinct attach
+    /// connections presenting the identical capability collapse into ONE
+    /// `Channel::members` entry, not two — a dedicated counter, bumped once
+    /// per real `join_for_attach`/`leave_for_attach` call regardless of
+    /// what the underlying channel-level membership map does, counts
+    /// actual attach connections instead.
+    ///
+    /// One `Mutex`, not two separate fields: the lock itself is what
+    /// serializes "join/leave the channel, update the attach count, and
+    /// assign the next sequence" as ONE critical section across every
+    /// concurrent attach/detach on this job — two atomics would only make
+    /// each NUMBER's own update atomic, not the whole transition-detection
+    /// step together, which is the actual race (two concurrent joins/leaves
+    /// could still interleave their `Channel::join`/count-update pair and
+    /// assign sequence numbers out of true chronological order). The async
+    /// send to the host-executor that follows is never ordered by this
+    /// lock — only the numbers it carries are, which is what lets the
+    /// host-executor resolve any out-of-order delivery by keeping the
+    /// highest sequence seen.
+    pub attach_tracking: std::sync::Mutex<AttachTracking>,
+}
+
+/// See [`JobChannel::attach_tracking`]'s own doc for why this exists as a
+/// dedicated pair rather than reading `Channel::member_count()` directly.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AttachTracking {
+    /// How many attach clients are currently connected to this job.
+    pub count: usize,
+    /// The next sequence number to assign on this job's next attach/detach
+    /// transition.
+    pub next_seq: u64,
 }
 
 impl JobChannel {
@@ -182,7 +213,7 @@ pub async fn mint_job_channel(job_id: &str, authority: &SharedCapAuthority) -> R
         granted_caps: Vec::new(),
         session: Uuid::nil(),
         host_id: None,
-        attach_seq: std::sync::Mutex::new(0),
+        attach_tracking: std::sync::Mutex::new(AttachTracking::default()),
     })
 }
 

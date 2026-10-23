@@ -65,7 +65,7 @@ pub async fn serve_attach_accept_loop(
                 let registry = Arc::clone(registry);
                 let host_registry = Arc::clone(host_registry);
                 tokio::spawn(async move {
-                    serve_one_attach(stream, &registry, &host_registry).await;
+                    serve_one_attach(stream, registry, host_registry).await;
                 });
             }
             Err(e) => {
@@ -79,17 +79,15 @@ pub async fn serve_attach_accept_loop(
 /// Join `cap` onto `job`'s channel, returning the resulting membership plus
 /// — as ONE critical section, serialized against every other
 /// `join_for_attach`/`leave_for_attach` call on this SAME job via
-/// `job.attach_seq` — the post-join member count and the next monotonic
-/// attach-sequence number (#340). This is the fix for the race an earlier
-/// version of this code only documented: checking `member_count()` in a
-/// SEPARATE lock acquisition after `join`/`leave` let two concurrent
-/// transitions interleave and assign sequence numbers (or appear to
-/// transition) out of true chronological order. Serializing the whole
-/// "mutate the channel, read the resulting count, assign the next sequence"
-/// step behind one lock fixes the ORDERING; the sequence number is what
-/// then lets the asynchronous send/delivery that follows happen in any
-/// order without losing that ordering information — see
-/// [`notify_attach_state`]'s own doc for the delivery side.
+/// `job.attach_tracking` — the post-join DEDICATED attach count (never
+/// `Channel::member_count()`, see [`dispatch::JobChannel::attach_tracking`]'s
+/// own doc for the real bug that was) and the next monotonic attach-sequence
+/// number (#340). Serializing the whole "mutate the channel, update the
+/// attach count, assign the next sequence" step behind one lock fixes the
+/// ORDERING; the sequence number is what then lets the asynchronous
+/// send/delivery that follows happen in any order without losing that
+/// ordering information — see [`notify_attach_state`]'s own doc for the
+/// delivery side.
 ///
 /// # Errors
 /// Whatever [`Channel::join`] returns.
@@ -97,22 +95,34 @@ fn join_for_attach(
     job: &dispatch::JobChannel,
     cap: &sandy_fabric::capauth::Cap,
 ) -> Result<(MembershipId, usize, u64), ChannelError> {
-    let mut next_seq = job.attach_seq.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut tracking = job
+        .attach_tracking
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let membership = job.channel.join(cap)?;
-    let count = job.channel.member_count();
-    let seq = *next_seq;
-    *next_seq += 1;
+    tracking.count += 1;
+    let count = tracking.count;
+    let seq = tracking.next_seq;
+    tracking.next_seq += 1;
     Ok((membership, count, seq))
 }
 
 /// Like [`join_for_attach`], for the leave side: no `Result` (`Channel::leave`
-/// cannot fail), same atomicity guarantee.
+/// cannot fail), same atomicity guarantee. Saturating decrement: a leave
+/// this function is never called for twice in practice (each connection
+/// calls it at most once, on its own single exit path), but a saturating
+/// subtract is a one-line defense against the count ever going negative
+/// rather than panicking or wrapping if that invariant is ever violated.
 fn leave_for_attach(job: &dispatch::JobChannel, membership: &MembershipId) -> (usize, u64) {
-    let mut next_seq = job.attach_seq.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut tracking = job
+        .attach_tracking
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     job.channel.leave(membership);
-    let count = job.channel.member_count();
-    let seq = *next_seq;
-    *next_seq += 1;
+    tracking.count = tracking.count.saturating_sub(1);
+    let count = tracking.count;
+    let seq = tracking.next_seq;
+    tracking.next_seq += 1;
     (count, seq)
 }
 
@@ -159,10 +169,35 @@ async fn notify_attach_state(
     }
 }
 
+/// Like [`notify_attach_state`], but detached onto its own task (#340,
+/// CodeRabbit finding on this PR): the real send can await the per-host
+/// `attach_state_tx` channel (bounded, capacity 4) filling up, or the
+/// connection's own write — neither should ever delay the attach
+/// handshake's `Joined` response or `serve_one_attach`'s own teardown,
+/// which is exactly what happened when this was called inline before
+/// either of those. Fire-and-forget: nothing here observes whether the
+/// spawned task ever completes, matching this notification's own
+/// documented best-effort contract.
+fn spawn_notify_attach_state(
+    job: Arc<dispatch::JobChannel>,
+    host_registry: Arc<HostRegistry>,
+    job_id: String,
+    attached: bool,
+    seq: u64,
+) {
+    tokio::spawn(async move {
+        notify_attach_state(&job, &host_registry, &job_id, attached, seq).await;
+    });
+}
+
 /// Handshake, then relay, one accepted attach connection end to end. Logs
 /// and returns on any failure — never panics, never brings down the accept
 /// loop.
-async fn serve_one_attach(stream: tokio::net::UnixStream, registry: &JobRegistry, host_registry: &HostRegistry) {
+async fn serve_one_attach(
+    stream: tokio::net::UnixStream,
+    registry: Arc<JobRegistry>,
+    host_registry: Arc<HostRegistry>,
+) {
     let (mut read_half, write_half) = tokio::io::split(stream);
     let write_half = Arc::new(AsyncMutex::new(write_half));
 
@@ -236,20 +271,21 @@ async fn serve_one_attach(stream: tokio::net::UnixStream, registry: &JobRegistry
             return;
         }
     };
-    // #340: this join may be the one that brought the count from 0 to 1 —
-    // `count`/`seq` were assigned atomically with the join itself
-    // (`join_for_attach`), so unlike a separate later check, this is never
-    // racing a concurrent transition on the same job.
-    if count == 1 {
-        notify_attach_state(&job, host_registry, &job_id, true, seq).await;
-    }
+    // #340, CodeRabbit finding on this PR: `Joined` goes out FIRST, before
+    // anything that touches the host-executor notification — the earlier
+    // version of this code notified first and only then wrote `Joined`,
+    // which let a slow/blocked notification send (the per-host channel
+    // filling up, or its own connection write) delay the handshake response
+    // itself. The notification below is spawned, never awaited inline,
+    // for the same reason: nothing about telling a REMOTE host-executor
+    // about this attach should ever gate this LOCAL handshake.
     if write_frame(&mut *write_half.lock().await, &LinkFrame::Joined { channel: None })
         .await
         .is_err()
     {
         let (count, seq) = leave_for_attach(&job, &membership);
         if count == 0 {
-            notify_attach_state(&job, host_registry, &job_id, false, seq).await;
+            spawn_notify_attach_state(Arc::clone(&job), Arc::clone(&host_registry), job_id.clone(), false, seq);
         }
         return;
     }
@@ -269,6 +305,13 @@ async fn serve_one_attach(stream: tokio::net::UnixStream, registry: &JobRegistry
             )
             .await;
     }
+    // This join may be the one that brought the count from 0 to 1 —
+    // `count`/`seq` were assigned atomically with the join itself
+    // (`join_for_attach`), so unlike a separate later check, this is never
+    // racing a concurrent transition on the same job.
+    if count == 1 {
+        spawn_notify_attach_state(Arc::clone(&job), Arc::clone(&host_registry), job_id.clone(), true, seq);
+    }
 
     // `relay` always leaves `membership` itself (via its internal
     // `LeaveGuard`, on every exit path including a panic) — `leave_tx` is
@@ -283,7 +326,7 @@ async fn serve_one_attach(stream: tokio::net::UnixStream, registry: &JobRegistry
         membership,
         &mut read_half,
         write_half,
-        Some((&job.attach_seq, leave_tx)),
+        Some((&job.attach_tracking, leave_tx)),
     )
     .await
     {
@@ -292,7 +335,7 @@ async fn serve_one_attach(stream: tokio::net::UnixStream, registry: &JobRegistry
     if let Ok((count, seq)) = leave_rx.await
         && count == 0
     {
-        notify_attach_state(&job, host_registry, &job_id, false, seq).await;
+        spawn_notify_attach_state(Arc::clone(&job), Arc::clone(&host_registry), job_id.clone(), false, seq);
     }
 }
 
@@ -334,10 +377,13 @@ impl Drop for AbortOnDrop {
 /// `oneshot` (whose `send` is a plain, synchronous, non-blocking call) for
 /// the caller to pick up and act on asynchronously once `relay` returns.
 /// The atomic-sequence-assignment handoff [`LeaveGuard`]'s `Drop` and
-/// [`relay`] share (#340): the per-job sequence counter to assign under, and
-/// the one-shot channel the resulting `(member_count, sequence)` pair is
-/// handed back on. See [`LeaveGuard`]'s own doc for why this exists.
-type LeaveSeqHandoff<'a> = (&'a std::sync::Mutex<u64>, tokio::sync::oneshot::Sender<(usize, u64)>);
+/// [`relay`] share (#340): the job's attach-tracking lock to update under,
+/// and the one-shot channel the resulting `(attach_count, sequence)` pair
+/// is handed back on. See [`LeaveGuard`]'s own doc for why this exists.
+type LeaveSeqHandoff<'a> = (
+    &'a std::sync::Mutex<dispatch::AttachTracking>,
+    tokio::sync::oneshot::Sender<(usize, u64)>,
+);
 
 struct LeaveGuard<'a, B: ChannelBackend, A: CapAuthority> {
     channel: Arc<Channel<B, A>>,
@@ -348,12 +394,15 @@ struct LeaveGuard<'a, B: ChannelBackend, A: CapAuthority> {
 impl<B: ChannelBackend, A: CapAuthority> Drop for LeaveGuard<'_, B, A> {
     fn drop(&mut self) {
         self.channel.leave(&self.id);
-        if let Some((attach_seq, tx)) = self.leave_seq.take() {
-            let mut next_seq = attach_seq.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let count = self.channel.member_count();
-            let seq = *next_seq;
-            *next_seq += 1;
-            drop(next_seq);
+        if let Some((attach_tracking, tx)) = self.leave_seq.take() {
+            let mut tracking = attach_tracking
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            tracking.count = tracking.count.saturating_sub(1);
+            let count = tracking.count;
+            let seq = tracking.next_seq;
+            tracking.next_seq += 1;
+            drop(tracking);
             // The receiver may already be gone (the caller stopped waiting,
             // e.g. it panicked too) — never a reason to panic again here.
             let _ = tx.send((count, seq));
@@ -961,7 +1010,7 @@ mod tests {
             let registry = Arc::clone(&registry);
             let host_registry = Arc::clone(&host_registry);
             tokio::spawn(async move {
-                serve_one_attach(server, &registry, &host_registry).await;
+                serve_one_attach(server, registry, host_registry).await;
             })
         };
 
@@ -1003,6 +1052,91 @@ mod tests {
         Ok(())
     }
 
+    /// Regression (#340, CodeRabbit finding): the SANDBOX AGENT joining this
+    /// job's channel — a real, separate join, from a real, separate code
+    /// path, that happens as part of ordinary job execution regardless of
+    /// whether anyone ever attaches — must never be conflated with an
+    /// attach-client join. Before this fix, the transition check read
+    /// `Channel::member_count()` directly, so with the agent already
+    /// joined (count already 1), a real attach client's own join brought
+    /// the count to 2, not 1, and the `count == 1` check that was supposed
+    /// to fire `attached: true` never fired at all. Joining the agent FIRST
+    /// here, before the attach client ever connects, is exactly the
+    /// ordering that broke the old check.
+    #[tokio::test]
+    async fn an_already_joined_agent_never_suppresses_the_attach_notification() -> anyhow::Result<()> {
+        use crate::host_registry::{ExecutorAllowlist, HostRegistry, Registration};
+
+        let (registry, operator_cap) = registry_with_job_on_host("job-1", "ws01").await?;
+        let agent_cap = registry
+            .get("job-1")
+            .context("the job must be registered")?
+            .agent_cap
+            .clone();
+        // The agent joins first, exactly like the real dispatch path does
+        // once the sandbox agent connects over its own link — independent
+        // of, and well before, any attach client.
+        registry
+            .get("job-1")
+            .context("the job must be registered")?
+            .channel
+            .join(&agent_cap)
+            .context("the agent's own join must succeed")?;
+
+        let host_registry = Arc::new(HostRegistry::default());
+        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let Registration {
+            mut attach_state_rx, ..
+        } = host_registry
+            .register(&allowlist, executor_ip(), "ws01".to_owned(), host_capabilities())
+            .expect("ws01 must register");
+
+        let (client, server) = tokio::net::UnixStream::pair()?;
+        let accepting = {
+            let registry = Arc::clone(&registry);
+            let host_registry = Arc::clone(&host_registry);
+            tokio::spawn(async move {
+                serve_one_attach(server, registry, host_registry).await;
+            })
+        };
+
+        let (mut client_rd, mut client_wr) = client.into_split();
+        write_frame(
+            &mut client_wr,
+            &LinkFrame::Join {
+                cap: hex::encode(encode_cap(&operator_cap)?),
+                channel: None,
+            },
+        )
+        .await?;
+        let response = tokio::time::timeout(WAIT, read_frame(&mut client_rd))
+            .await
+            .context("timed out waiting for Joined")?
+            .context("reading Joined faulted")?
+            .context("closed before Joined")?;
+        assert!(matches!(response, LinkFrame::Joined { .. }), "got {response:?}");
+
+        // With the bug, this would time out: the agent's prior join already
+        // put `member_count()` at 1, so the attach client's own join took
+        // it to 2, never matching the old `count == 1` check.
+        let attached_true = tokio::time::timeout(WAIT, attach_state_rx.recv())
+            .await
+            .context(
+                "timed out waiting for AttachStateChanged{true} — the dedicated attach counter must fire this even \
+                 with the agent already joined",
+            )?
+            .context("attach_state_rx ended before the join notification")?;
+        assert_eq!(attached_true.job_id, "job-1");
+        assert!(attached_true.attached);
+
+        drop(client_wr);
+        drop(client_rd);
+        tokio::time::timeout(WAIT, accepting)
+            .await
+            .context("timed out waiting for the relay to end")??;
+        Ok(())
+    }
+
     /// Adversarial: a job that was never placed remotely (`host_id: None`,
     /// the default `registry_with_job` fixture every other test in this
     /// module uses) must never attempt an attach-state notification at all
@@ -1021,7 +1155,7 @@ mod tests {
             let registry = Arc::clone(&registry);
             let host_registry = Arc::clone(&host_registry);
             tokio::spawn(async move {
-                serve_one_attach(server, &registry, &host_registry).await;
+                serve_one_attach(server, registry, host_registry).await;
             })
         };
 
@@ -1072,7 +1206,7 @@ mod tests {
 
         let host_registry = Arc::new(HostRegistry::default());
         let accepting = tokio::spawn(async move {
-            serve_one_attach(server, &registry, &host_registry).await;
+            serve_one_attach(server, registry, host_registry).await;
         });
 
         let (mut client_rd, mut client_wr) = client.into_split();
@@ -1116,7 +1250,7 @@ mod tests {
 
         let host_registry = Arc::new(HostRegistry::default());
         let accepting = tokio::spawn(async move {
-            serve_one_attach(server, &registry, &host_registry).await;
+            serve_one_attach(server, registry, host_registry).await;
         });
 
         let (mut client_rd, mut client_wr) = client.into_split();
@@ -1161,7 +1295,7 @@ mod tests {
 
         let host_registry = Arc::new(HostRegistry::default());
         let accepting = tokio::spawn(async move {
-            serve_one_attach(server, &registry, &host_registry).await;
+            serve_one_attach(server, registry, host_registry).await;
         });
 
         let (mut client_rd, mut client_wr) = client.into_split();

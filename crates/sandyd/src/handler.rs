@@ -1173,7 +1173,7 @@ mod tests {
                 granted_caps: job.granted_caps.clone(),
                 session: job.session,
                 host_id: job.host_id.clone(),
-                attach_seq: std::sync::Mutex::new(0),
+                attach_tracking: std::sync::Mutex::new(dispatch::AttachTracking::default()),
             },
         );
 
@@ -1230,7 +1230,7 @@ mod tests {
                 granted_caps: job.granted_caps.clone(),
                 session: job.session,
                 host_id: job.host_id.clone(),
-                attach_seq: std::sync::Mutex::new(0),
+                attach_tracking: std::sync::Mutex::new(dispatch::AttachTracking::default()),
             },
         );
 

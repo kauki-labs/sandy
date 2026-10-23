@@ -779,6 +779,24 @@ the whole budget, and the protocol's existing phase/timeout-policy
 semantics understood well enough not to regress the acceptance suite) —
 intentionally not attempted blind within this change.
 
+**Follow-up (CodeRabbit on #344): the fail-safe above applies on every exit,
+not only a connection drop, and `AttachStateChanged` tolerates reordering
+and arriving before its own job's `Dispatch`.** The fail-safe originally
+only bounded a running job's deadline when `run_dispatch_loop` exited with
+`Closed`/`Faulted`; an ordinary `Shutdown` is identical in the one way that
+matters here — once the read loop has ended, no further `AttachStateChanged`
+can ever arrive on that connection, by any exit path — so the grace-deadline
+step now runs unconditionally, and a shared stopping flag (checked by the
+worker before starting each still-queued `Dispatch`) keeps it from
+beginning a job that could never receive an attach/detach signal of its
+own either. Separately, `AttachStateChanged` now tracks the highest
+`sequence` applied per `job_id` and ignores a frame whose sequence isn't
+strictly greater (a reordered frame can no longer overwrite newer state
+with stale state), and a frame for a `job_id` with no `RunControl`
+registered yet is kept as that job's pending attach state rather than
+dropped, applied the moment the worker registers its `RunControl` — so a
+frame that outraces its own job's `Dispatch` still takes effect.
+
 ## 15. Orchestrator placement wiring: one shared `HostRegistry`, stage-1 required-class default, dispatch from the real submit path (#298)
 
 **Status:** implemented.
