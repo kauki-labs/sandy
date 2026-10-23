@@ -124,7 +124,11 @@ pub enum DispatchLoopExit {
     Shutdown,
     /// The orchestrator closed the connection cleanly.
     Closed,
-    /// The connection faulted: a malformed frame, an I/O error.
+    /// The connection faulted: a malformed frame, an I/O error, or a job
+    /// result that failed to write back (CodeRabbit on #344: silently
+    /// logging and continuing left later dispatches running with no
+    /// connection left to ever report their own result to, and could even
+    /// surface as a misleadingly clean `Shutdown`/`Closed`).
     Faulted(String),
 }
 
@@ -154,7 +158,15 @@ pub enum DispatchLoopExit {
 /// `handle` returns the result message to send back for that dispatch
 /// (#292): a dedicated writer (shared with this function's own use of
 /// `conn` for reading, via `tokio::io::split`) sends it on the SAME
-/// connection the Dispatch arrived on. A `None` return sends nothing.
+/// connection the Dispatch arrived on. A `None` return sends nothing. A
+/// failed write (CodeRabbit on #344) is never just logged and swallowed:
+/// the connection is presumed broken for writes from that point on, so the
+/// worker stops there rather than running further queued dispatches whose
+/// results could never be delivered either, and the failure is reported as
+/// [`DispatchLoopExit::Faulted`] — overriding whatever exit reason the
+/// reader side had already concluded (even an ordinary `Shutdown`), since a
+/// write fault is the more serious, more truthful reason this function is
+/// ending.
 ///
 /// FAIL-SAFE ON EVERY EXIT (#340): once this function's own read loop ends — for ANY reason, including an ordinary
 /// requested [`DispatchLoopExit::Shutdown`], not only [`DispatchLoopExit::Closed`]/[`DispatchLoopExit::Faulted`] —
@@ -219,6 +231,10 @@ where
     // dropped, below).
     let (dispatch_tx, mut dispatch_rx) = tokio::sync::mpsc::unbounded_channel::<Dispatch>();
     let mut handle = handle;
+    // `Err` on a job result's write failing (CodeRabbit on #344) — see this
+    // function's own doc on `handle`'s return and `DispatchLoopExit::Faulted`.
+    // `Ok(())` is only ever reached once `dispatch_rx.recv()` yields `None`,
+    // which can't happen until `dispatch_tx` is dropped, below.
     let worker_fut = async {
         while let Some(dispatch) = dispatch_rx.recv().await {
             let job_id = dispatch.job_id.clone();
@@ -255,14 +271,25 @@ where
             if let Some(result) = result {
                 let mut write_half = write_half.lock().await;
                 if let Err(e) = write_frame(&mut *write_half, &result).await {
-                    tracing::warn!(error = %e, job_id, "failed writing a job result back to the orchestrator");
+                    // The connection is presumed broken for writes from here
+                    // on: stop rather than silently continue running further
+                    // queued dispatches whose own results could never be
+                    // delivered either (CodeRabbit on #344).
+                    return Err(format!(
+                        "failed writing job {job_id}'s result back to the orchestrator: {e}"
+                    ));
                 }
             }
         }
+        Ok(())
     };
     tokio::pin!(worker_fut);
 
     tokio::pin!(shutdown);
+    // Set the moment the worker branch below fires, so the drain step after
+    // the loop knows `worker_fut` already resolved and must not poll it
+    // again (undefined once a future has yielded Ready).
+    let mut worker_already_ended = false;
     let exit = loop {
         tokio::select! {
             frame = read_frame::<OrchestratorMessage>(&mut read_half) => {
@@ -321,13 +348,18 @@ where
                     }
                 }
             }
-            () = &mut worker_fut => {
-                // Only reachable once `dispatch_tx` is dropped AND every
-                // queued dispatch has drained — i.e. after this loop itself
-                // already broke once before (see the drain step below) and
-                // is being polled again. Never happens during the loop's
-                // first pass (the reader still holds `dispatch_tx`).
-                unreachable!("worker_fut only completes after dispatch_tx is dropped, following this loop");
+            worker_result = &mut worker_fut => {
+                // `dispatch_tx` is still held by this loop at this point, so
+                // `dispatch_rx.recv()` returning `None` (`Ok(())`) can't
+                // happen yet — only a write failure's early `Err` return can
+                // reach here (CodeRabbit on #344).
+                worker_already_ended = true;
+                match worker_result {
+                    Err(e) => break DispatchLoopExit::Faulted(e),
+                    Ok(()) => unreachable!(
+                        "worker_fut only completes with Ok(()) once dispatch_tx is dropped, after this loop"
+                    ),
+                }
             }
             () = &mut shutdown => {
                 tracing::info!("shutdown signal received; no longer reading new dispatches");
@@ -361,12 +393,27 @@ where
     // or `main.rs`'s process exit would simply kill it along with
     // everything else (nothing outlives this function once it returns).
     // Dropping `dispatch_tx` is what finally lets `worker_fut` complete
-    // (`dispatch_rx.recv()` yields `None`) — until now it genuinely
-    // couldn't, which is why selecting it above was always `unreachable!`.
+    // (`dispatch_rx.recv()` yields `None`) when it wasn't already ended
+    // above by a write failure — `worker_already_ended` guards against
+    // polling the same future again once it has already resolved.
     drop(dispatch_tx);
-    worker_fut.await;
-
-    exit
+    if worker_already_ended {
+        exit
+    } else {
+        match worker_fut.await {
+            Ok(()) => exit,
+            Err(e) => {
+                // A later queued dispatch's own result also failed to write
+                // during the drain: report that, not whatever the reader
+                // concluded — a write fault is the more serious, more
+                // truthful reason this function is ending (CodeRabbit on
+                // #344: this previously surfaced as a misleadingly clean
+                // Shutdown/Closed).
+                tracing::warn!(error = %e, prior_exit = ?exit, "a queued dispatch's result failed to write during the drain");
+                DispatchLoopExit::Faulted(e)
+            }
+        }
+    }
 }
 
 /// Build the `HostExecutorMessage::Result` the host-executor sends back after a
@@ -824,6 +871,102 @@ mod tests {
             .context("dispatch loop did not stop after shutdown")?
             .context("dispatch loop task panicked")?;
         assert_eq!(exit, DispatchLoopExit::Shutdown);
+        Ok(())
+    }
+
+    /// A connection whose reads delegate to a real [`tokio::io::DuplexStream`]
+    /// (so `Dispatch` frames arrive normally) but whose writes always fail —
+    /// deterministically forcing the result-write failure path
+    /// [`a_failed_result_write_faults_the_loop_instead_of_a_clean_exit`]
+    /// exercises, instead of racing a dropped duplex's read-side EOF against
+    /// its write-side error (both close together on drop, so which one a
+    /// `tokio::select!` observes first is not guaranteed).
+    struct ReadOkWriteFails(tokio::io::DuplexStream);
+
+    impl AsyncRead for ReadOkWriteFails {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().0).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for ReadOkWriteFails {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::Error::other("simulated write failure")))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Regression (CodeRabbit on #344): a failed result write must not be
+    /// silently logged and ignored — it must end the loop as
+    /// `DispatchLoopExit::Faulted`, overriding whatever the reader side would
+    /// otherwise have concluded (even an ordinary clean `Shutdown`), since a
+    /// job whose result could never be delivered is a more serious condition
+    /// than a clean disconnect.
+    #[tokio::test]
+    async fn a_failed_result_write_faults_the_loop_instead_of_a_clean_exit() -> anyhow::Result<()> {
+        let (mut server, client) = tokio::io::duplex(8192);
+        let mut conn = ReadOkWriteFails(client);
+
+        write_frame(
+            &mut server,
+            &OrchestratorMessage {
+                op: Some(orchestrator_message::Op::Dispatch(Dispatch {
+                    job_id: "job-1".to_owned(),
+                    manifest: Vec::new(),
+                    manifest_encoding: String::new(),
+                    backend: SandboxKind::Process.into(),
+                    link_token: vec![0u8; 32],
+                    forward_back: "127.0.0.1:9000".to_owned(),
+                    required_isolation_class: IsolationClass::Trusted.into(),
+                })),
+            },
+        )
+        .await?;
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let loop_task = tokio::spawn(async move {
+            run_dispatch_loop(
+                &mut conn,
+                |dispatch: Dispatch, _control| async move {
+                    Some(failure_result_message(dispatch.job_id, "boom".to_owned()))
+                },
+                async {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+        });
+
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(2), loop_task)
+            .await
+            .context("dispatch loop did not end after its result write failed")?
+            .context("dispatch loop task panicked")?;
+        assert!(
+            matches!(exit, DispatchLoopExit::Faulted(_)),
+            "expected Faulted after a failed result write, got {exit:?}"
+        );
+        drop(server);
         Ok(())
     }
 
