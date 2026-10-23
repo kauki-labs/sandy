@@ -1058,6 +1058,17 @@ mod tests {
             },
         )
         .await?;
+        // The expired cap must actually be refused, not silently accepted —
+        // `notify_refusals` writes this back off the relay loop (CodeRabbit
+        // on this PR): without reading it, an incorrectly accepted archive
+        // could go undetected while the exit assertion below still passes.
+        anyhow::ensure!(
+            matches!(
+                timeout(WAIT, read_frame(&mut agent_end)).await??,
+                Some(LinkFrame::Refused { .. })
+            ),
+            "the expired cap's archive post must be refused"
+        );
         write_frame(&mut agent_end, &LinkFrame::Exit { code: 7 }).await?;
         drop(agent_end);
         let relayed = timeout(WAIT, relay).await??;
@@ -1158,6 +1169,16 @@ mod tests {
         assert!(
             matches!(relayed, Ok(Some(0))),
             "the duplicate must not cost the exit report: {relayed:?}"
+        );
+        // The relay task has already completed, so every channel post it was
+        // ever going to make has already happened — a short bound here is
+        // safe, not a race, and asserts the regression CodeRabbit flagged on
+        // this PR: a second envelope arriving (the duplicate wasn't actually
+        // ignored) would otherwise pass silently, since the test above only
+        // ever reads the first one.
+        assert!(
+            timeout(Duration::from_millis(200), observed.next()).await.is_err(),
+            "the duplicate archive must never reach a second entry on the channel"
         );
         Ok(())
     }
