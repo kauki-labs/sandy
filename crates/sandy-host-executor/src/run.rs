@@ -383,8 +383,17 @@ where
                  arrive, so their deadlines are being bounded to a grace period"
             );
         }
+        // Only a currently-suspended (attached, deadline() == None) control
+        // is bounded to the grace deadline here — a control that already
+        // carries a finite deadline (never attached, or already past
+        // detach and running its own grace period) keeps it as-is, so this
+        // fail-safe can only ever shorten an unbounded wait, never extend
+        // or overwrite a deadline already in force (CodeRabbit on #344).
+        let grace_deadline = std::time::Instant::now() + Duration::from_secs(u64::from(STAGE1_TIMEOUT_SECS));
         for control in controls.values() {
-            control.set_deadline(std::time::Instant::now() + Duration::from_secs(u64::from(STAGE1_TIMEOUT_SECS)));
+            if control.deadline().is_none() {
+                control.set_deadline(grace_deadline);
+            }
         }
     }
 
@@ -965,6 +974,133 @@ mod tests {
         assert!(
             matches!(exit, DispatchLoopExit::Faulted(_)),
             "expected Faulted after a failed result write, got {exit:?}"
+        );
+        drop(server);
+        Ok(())
+    }
+
+    /// Regression (CodeRabbit on #344): the shutdown fail-safe must actually
+    /// bound a still-attached (suspended) job's deadline, and `stopping` must
+    /// actually keep the worker from starting a dispatch still sitting in its
+    /// queue, unstarted, once shutdown has ended the read loop. Job-1's
+    /// `handle` blocks on a `Notify` so the test controls exactly when
+    /// shutdown fires relative to job-1 still running and job-2 still queued;
+    /// job-2's `handle` would record itself in `seen` if it were ever
+    /// (incorrectly) called, so its absence from `seen` is the proof it was
+    /// skipped, not merely never reached.
+    #[tokio::test]
+    async fn shutdown_bounds_an_attached_jobs_deadline_and_skips_a_still_queued_dispatch() -> anyhow::Result<()> {
+        let (mut client, mut server) = tokio::io::duplex(8192);
+
+        write_frame(
+            &mut server,
+            &OrchestratorMessage {
+                op: Some(orchestrator_message::Op::Dispatch(Dispatch {
+                    job_id: "job-1".to_owned(),
+                    manifest: Vec::new(),
+                    manifest_encoding: String::new(),
+                    backend: SandboxKind::Process.into(),
+                    link_token: vec![0u8; 32],
+                    forward_back: "127.0.0.1:9000".to_owned(),
+                    required_isolation_class: IsolationClass::Trusted.into(),
+                })),
+            },
+        )
+        .await?;
+
+        let captured_control: Arc<Mutex<Option<RunControl>>> = Arc::new(Mutex::new(None));
+        let captured_control_in_loop = Arc::clone(&captured_control);
+        let job1_started = Arc::new(tokio::sync::Notify::new());
+        let job1_started_in_loop = Arc::clone(&job1_started);
+        let release_job1 = Arc::new(tokio::sync::Notify::new());
+        let release_job1_in_loop = Arc::clone(&release_job1);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_in_loop = Arc::clone(&seen);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let loop_task = tokio::spawn(async move {
+            run_dispatch_loop(
+                &mut client,
+                move |dispatch, control| {
+                    let captured_control = Arc::clone(&captured_control_in_loop);
+                    let job1_started = Arc::clone(&job1_started_in_loop);
+                    let release_job1 = Arc::clone(&release_job1_in_loop);
+                    let seen = Arc::clone(&seen_in_loop);
+                    async move {
+                        seen.lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(dispatch.job_id.clone());
+                        if dispatch.job_id == "job-1" {
+                            // Simulates an already-attached job: suspended,
+                            // no deadline, exactly the state the shutdown
+                            // fail-safe must bound.
+                            control.suspend_deadline();
+                            *captured_control
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(control.clone());
+                            job1_started.notify_one();
+                            release_job1.notified().await;
+                        }
+                        None::<HostExecutorMessage>
+                    }
+                },
+                async {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), job1_started.notified())
+            .await
+            .context("job-1's handle never started")?;
+
+        // Queued but never started while job-1's handle still blocks below.
+        write_frame(
+            &mut server,
+            &OrchestratorMessage {
+                op: Some(orchestrator_message::Op::Dispatch(Dispatch {
+                    job_id: "job-2".to_owned(),
+                    manifest: Vec::new(),
+                    manifest_encoding: String::new(),
+                    backend: SandboxKind::Process.into(),
+                    link_token: vec![0u8; 32],
+                    forward_back: "127.0.0.1:9000".to_owned(),
+                    required_isolation_class: IsolationClass::Trusted.into(),
+                })),
+            },
+        )
+        .await?;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let _ = shutdown_tx.send(());
+        // Gives the now-broken-out select loop time to run the fail-safe
+        // (synchronous, no further awaits of its own) before this checks
+        // job-1's captured deadline below.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let deadline = captured_control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .expect("job-1's control was captured")
+            .deadline();
+        assert!(
+            deadline.is_some(),
+            "the shutdown fail-safe must bound a suspended (attached) job's deadline, got None (still suspended)"
+        );
+
+        release_job1.notify_one();
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(2), loop_task)
+            .await
+            .context("dispatch loop did not end after job-1 was released")?
+            .context("dispatch loop task panicked")?;
+        assert_eq!(exit, DispatchLoopExit::Shutdown);
+
+        assert_eq!(
+            *seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec!["job-1".to_owned()],
+            "job-2 must never be handled: it was still queued, unstarted, once shutdown ended the read loop"
         );
         drop(server);
         Ok(())

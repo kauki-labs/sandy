@@ -108,6 +108,21 @@ fn is_timeout(err: &anyhow::Error) -> bool {
         .any(|io_err| io_err.kind() == std::io::ErrorKind::TimedOut)
 }
 
+/// Realign `control`'s deadline to a fresh [`STAGE1_TIMEOUT_SECS`] budget from
+/// now, so a VM dispatch's run and agent-link relay (`relay_agent_link`,
+/// which follows this same `control` live) don't start already past a
+/// deadline that flake resolution (up to `FLAKE_RESOLVE_TIMEOUT_SECS`, longer
+/// than `STAGE1_TIMEOUT_SECS`) ate into (CodeRabbit on #344). Only ever bumps
+/// a currently FINITE deadline forward: a suspended (attached) control is
+/// left alone, since "unlimited while attached" already covers it — the same
+/// rule `run_dispatch_loop`'s own shutdown fail-safe applies.
+fn realign_deadline_after_flake_resolution(control: &RunControl) {
+    if control.deadline().is_some() {
+        control
+            .set_deadline(std::time::Instant::now() + std::time::Duration::from_secs(u64::from(STAGE1_TIMEOUT_SECS)));
+    }
+}
+
 /// The `SANDY_HISTORY_LINES` env entry for a flake/v1 dispatch's
 /// `RunSpec.env` (epic #340, phase 6): names, for whichever guest-agent code
 /// wraps the job in tmux (phase 1), the scrollback/transcript line bound the
@@ -417,6 +432,12 @@ pub fn handle_dispatch(
                     DispatchError::FlakeResolve(e.to_string())
                 }
             })?;
+            // Flake resolution can take up to FLAKE_RESOLVE_TIMEOUT_SECS (600s),
+            // longer than control's own STAGE1_TIMEOUT_SECS (300s) budget set
+            // when the worker popped this dispatch — without this, the VM's run
+            // and its agent-link relay could start already past their own
+            // deadline (CodeRabbit on #344).
+            realign_deadline_after_flake_resolution(&control);
             let (template, _kept_topology_file) = match resolved {
                 sandy_guest_template::ResolvedTemplate::Direct(t) => (t, None),
                 sandy_guest_template::ResolvedTemplate::Prebuilt { path, _kept } => (path, Some(_kept)),
@@ -486,6 +507,44 @@ mod tests {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "nix: command not found");
         let wrapped = anyhow::Error::new(io_err).context("spawn `nix build ...`");
         assert!(!is_timeout(&wrapped));
+    }
+
+    /// Regression (CodeRabbit on #344): a finite deadline already eaten into
+    /// by slow flake resolution must be realigned forward, not left expired
+    /// before the VM run (and its agent-link relay) has even started.
+    #[test]
+    fn realign_deadline_after_flake_resolution_bumps_an_already_passed_finite_deadline_forward() {
+        let control =
+            sandy_api::backend::RunControl::new(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        assert!(
+            control.timed_out(),
+            "the deadline must already be in the past for this test to be meaningful"
+        );
+
+        realign_deadline_after_flake_resolution(&control);
+
+        assert!(
+            !control.timed_out(),
+            "the deadline must be realigned to the future, not left in the past"
+        );
+    }
+
+    /// Regression (CodeRabbit on #344): an attached (suspended) job's
+    /// deadline must stay suspended — flake resolution finishing is not a
+    /// reason to reinstate a bound "unlimited while attached" already lifted.
+    #[test]
+    fn realign_deadline_after_flake_resolution_leaves_a_suspended_control_alone() {
+        let control = sandy_api::backend::RunControl::with_timeout_secs(60);
+        control.suspend_deadline();
+        assert_eq!(control.deadline(), None);
+
+        realign_deadline_after_flake_resolution(&control);
+
+        assert_eq!(
+            control.deadline(),
+            None,
+            "a suspended control must stay suspended, not be given a new finite deadline"
+        );
     }
 
     #[test]
