@@ -701,7 +701,9 @@ mod tests {
         let server_wr = Arc::new(AsyncMutex::new(server_wr));
         let channel_for_relay = Arc::clone(&channel);
         let relaying =
-            tokio::spawn(async move { relay(channel_for_relay, attach_membership, &mut server_rd, server_wr).await });
+            tokio::spawn(
+                async move { relay(channel_for_relay, attach_membership, &mut server_rd, server_wr, None).await },
+            );
 
         write_frame(&mut client_wr, &LinkFrame::Resize { cols: 120, rows: 40 }).await?;
 
@@ -743,7 +745,9 @@ mod tests {
         let server_wr = Arc::new(AsyncMutex::new(server_wr));
         let channel_for_relay = Arc::clone(&channel);
         let relaying =
-            tokio::spawn(async move { relay(channel_for_relay, attach_membership, &mut server_rd, server_wr).await });
+            tokio::spawn(
+                async move { relay(channel_for_relay, attach_membership, &mut server_rd, server_wr, None).await },
+            );
 
         channel
             .post(
@@ -1020,6 +1024,8 @@ mod tests {
             &LinkFrame::Join {
                 cap: hex::encode(encode_cap(&operator_cap)?),
                 channel: None,
+                cols: None,
+                rows: None,
             },
         )
         .await?;
@@ -1106,6 +1112,8 @@ mod tests {
             &LinkFrame::Join {
                 cap: hex::encode(encode_cap(&operator_cap)?),
                 channel: None,
+                cols: None,
+                rows: None,
             },
         )
         .await?;
@@ -1165,6 +1173,8 @@ mod tests {
             &LinkFrame::Join {
                 cap: hex::encode(encode_cap(&operator_cap)?),
                 channel: None,
+                cols: None,
+                rows: None,
             },
         )
         .await?;
