@@ -30,7 +30,7 @@ use tokio::{
 };
 
 use crate::{
-    agent::{AbortOnDrop, RESIZE_CONTROL, TTY_STDERR, TTY_STDIN, TTY_STDOUT, decode_resize},
+    agent::{ARCHIVE_TRANSCRIPT, AbortOnDrop, RESIZE_CONTROL, TTY_STDERR, TTY_STDIN, TTY_STDOUT, decode_resize},
     channel::{Channel, ChannelError, MembershipId},
 };
 
@@ -588,6 +588,7 @@ where
     let _notifier = AbortOnDrop(tokio::spawn(notify_refusals(Arc::clone(&refusals), Arc::clone(wr))));
 
     let mut exit = None;
+    let mut archive_seen = false;
     loop {
         match read_frame(rd).await? {
             None => return Ok(exit),
@@ -656,6 +657,27 @@ where
                 write_frame(&mut *wr.lock().await, &refused).await?;
             }
             Some(LinkFrame::Archive { content_type, payload }) => {
+                // Only `ARCHIVE_TRANSCRIPT` is a real archive (CodeRabbit on
+                // #345): `attach_relay.rs`'s delivery task only forwards that
+                // exact content type as a client-visible `Archive` frame, so
+                // anything else would be stored as an ordinary `Output`
+                // envelope — visible to another subscriber, but silently
+                // never delivered to any attach client, which is worse than
+                // refusing it outright as the protocol violation it is.
+                if content_type != ARCHIVE_TRANSCRIPT {
+                    return Err(LinkError::Protocol(format!(
+                        "the agent may only archive {ARCHIVE_TRANSCRIPT}, not {content_type}"
+                    )));
+                }
+                // One-shot by contract (`LinkAgent::send_archive`'s own
+                // doc): a second frame is not a protocol violation (a
+                // retrying caller isn't malicious), just redundant — ignored
+                // with a log, not an error that would cost the Exit frame
+                // right after it.
+                if archive_seen {
+                    tracing::warn!("duplicate archive frame ignored");
+                    continue;
+                }
                 let bytes = unhex(&payload, "an archive payload")?;
                 // A refused archive post (the membership's cap expired or was
                 // revoked since Join) loses only the archive — ending the
@@ -674,7 +696,7 @@ where
                     )
                     .await
                 {
-                    Ok(_) => {}
+                    Ok(_) => archive_seen = true,
                     Err(e @ ChannelError::Backend(_)) => return Err(e.into()),
                     Err(e) => {
                         let reason = format!("the archive was refused: {e}");
@@ -1023,18 +1045,141 @@ mod tests {
         );
 
         until_expired(expires_at).await?;
+        // A conforming content type: the point of this test is the
+        // channel-level (authorization) refusal from the expired cap, not
+        // the protocol-level content-type check a non-`ARCHIVE_TRANSCRIPT`
+        // value would hit first and refuse for a completely different
+        // reason (CodeRabbit on #345).
         write_frame(
             &mut agent_end,
             &LinkFrame::Archive {
-                content_type: "text/plain".to_string(),
+                content_type: crate::agent::ARCHIVE_TRANSCRIPT.to_string(),
                 payload: hex::encode(b"after-expiry"),
             },
         )
         .await?;
+        // The expired cap must actually be refused, not silently accepted —
+        // `notify_refusals` writes this back off the relay loop (CodeRabbit
+        // on this PR): without reading it, an incorrectly accepted archive
+        // could go undetected while the exit assertion below still passes.
+        anyhow::ensure!(
+            matches!(
+                timeout(WAIT, read_frame(&mut agent_end)).await??,
+                Some(LinkFrame::Refused { .. })
+            ),
+            "the expired cap's archive post must be refused"
+        );
         write_frame(&mut agent_end, &LinkFrame::Exit { code: 7 }).await?;
         drop(agent_end);
         let relayed = timeout(WAIT, relay).await??;
         assert!(matches!(relayed, Ok(Some(7))), "got {relayed:?}");
+        Ok(())
+    }
+
+    /// CodeRabbit on #345: the only valid archive content type is
+    /// `ARCHIVE_TRANSCRIPT` — anything else would be stored as an ordinary
+    /// `Output` envelope `attach_relay.rs`'s delivery task never forwards as
+    /// a client-visible `Archive` frame, silently never reaching any attach
+    /// client. Refused as a protocol violation, not stored.
+    #[tokio::test]
+    async fn an_archive_with_the_wrong_content_type_is_a_protocol_violation() -> anyhow::Result<()> {
+        let (channel, agent_cap, _) = channel_and_caps().await?;
+        let (mut agent_end, host_end) = tokio::io::duplex(64 * 1024);
+        let relay = tokio::spawn(async move { serve_agent_link(channel, &agent_cap, host_end).await });
+        let Some(LinkFrame::Cap { cap, channel: None, .. }) = timeout(WAIT, read_frame(&mut agent_end)).await?? else {
+            anyhow::bail!("expected the orchestrator cap frame first");
+        };
+        write_frame(
+            &mut agent_end,
+            &LinkFrame::Join {
+                cap,
+                channel: None,
+                cols: None,
+                rows: None,
+            },
+        )
+        .await?;
+        anyhow::ensure!(
+            timeout(WAIT, read_frame(&mut agent_end)).await?? == Some(LinkFrame::Joined { channel: None }),
+            "the join must succeed"
+        );
+
+        write_frame(
+            &mut agent_end,
+            &LinkFrame::Archive {
+                content_type: "text/plain".to_string(),
+                payload: hex::encode(b"not a transcript"),
+            },
+        )
+        .await?;
+        let relayed = timeout(WAIT, relay).await??;
+        assert!(
+            matches!(relayed, Err(LinkError::Protocol(ref m)) if m.contains("text/plain")),
+            "got {relayed:?}"
+        );
+        Ok(())
+    }
+
+    /// CodeRabbit on #345: `send_archive`'s own contract is one-shot — a
+    /// second `Archive` frame is ignored (logged, not stored again, not a
+    /// protocol violation that would cost the `Exit` frame right after it).
+    #[tokio::test]
+    async fn a_duplicate_archive_frame_is_ignored_not_refused() -> anyhow::Result<()> {
+        let (channel, agent_cap, orchestrator_cap) = channel_and_caps().await?;
+        let orchestrator = channel.join(&orchestrator_cap)?;
+        let mut observed = std::pin::pin!(channel.subscribe(&orchestrator)?);
+        let (mut agent_end, host_end) = tokio::io::duplex(64 * 1024);
+        let relay = tokio::spawn(async move { serve_agent_link(channel, &agent_cap, host_end).await });
+        let Some(LinkFrame::Cap { cap, channel: None, .. }) = timeout(WAIT, read_frame(&mut agent_end)).await?? else {
+            anyhow::bail!("expected the orchestrator cap frame first");
+        };
+        write_frame(
+            &mut agent_end,
+            &LinkFrame::Join {
+                cap,
+                channel: None,
+                cols: None,
+                rows: None,
+            },
+        )
+        .await?;
+        anyhow::ensure!(
+            timeout(WAIT, read_frame(&mut agent_end)).await?? == Some(LinkFrame::Joined { channel: None }),
+            "the join must succeed"
+        );
+
+        for payload in [b"first".to_vec(), b"second".to_vec()] {
+            write_frame(
+                &mut agent_end,
+                &LinkFrame::Archive {
+                    content_type: ARCHIVE_TRANSCRIPT.to_string(),
+                    payload: hex::encode(payload),
+                },
+            )
+            .await?;
+        }
+        write_frame(&mut agent_end, &LinkFrame::Exit { code: 0 }).await?;
+        drop(agent_end);
+
+        let env = timeout(WAIT, observed.next())
+            .await?
+            .context("channel stream ended before the first archive arrived")??;
+        assert_eq!(env.payload, b"first", "only the first archive is ever stored");
+        let relayed = timeout(WAIT, relay).await??;
+        assert!(
+            matches!(relayed, Ok(Some(0))),
+            "the duplicate must not cost the exit report: {relayed:?}"
+        );
+        // The relay task has already completed, so every channel post it was
+        // ever going to make has already happened — a short bound here is
+        // safe, not a race, and asserts the regression CodeRabbit flagged on
+        // this PR: a second envelope arriving (the duplicate wasn't actually
+        // ignored) would otherwise pass silently, since the test above only
+        // ever reads the first one.
+        assert!(
+            timeout(Duration::from_millis(200), observed.next()).await.is_err(),
+            "the duplicate archive must never reach a second entry on the channel"
+        );
         Ok(())
     }
 
