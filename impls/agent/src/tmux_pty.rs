@@ -55,6 +55,11 @@ const SENTINEL_POLL: Duration = Duration::from_millis(50);
 /// line of output; [`wait_for_exit`] tails the transcript for it.
 const EXIT_MARKER: &str = "sandy-exit:";
 
+/// The longest a real exit-code line's digits can be (`i32::MIN` is 11
+/// chars, plus margin) — bounds how long [`TmuxJob::wait_for_exit`] will
+/// wait on a candidate match before deciding it isn't the real marker.
+const MAX_EXIT_CODE_DIGITS: usize = 16;
+
 /// How many [`SENTINEL_POLL`] iterations between `pane_dead` checks (roughly
 /// once a second) — cheap compared to an interactive job's own lifetime
 /// (which can run for hours), but far too expensive to spawn `tmux
@@ -122,6 +127,28 @@ fn quote_argv(argv: &[std::ffi::OsString]) -> String {
         .join(" ")
 }
 
+/// `path` as a plain UTF-8 string, rejected up front if it carries a
+/// character that would break out of the TWO quoting layers it gets embedded
+/// in inside the generated tmux config: tmux's own single-quoted `'...'`
+/// `set-hook` argument, nested inside which is a double-quoted `"cat >>
+/// ..."` shell command `pipe-pane` later spawns via `sh -c`. In ordinary use
+/// this path is `std::env::temp_dir()` joined with a filename this module
+/// builds itself from plain digits, so rejection is not expected — this
+/// exists for whatever a host's `TMPDIR` could put there, caught before the
+/// config file is ever written, not after.
+fn validate_tmux_safe_path(path: &Path) -> std::io::Result<&str> {
+    let s = path
+        .to_str()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "the path is not valid UTF-8"))?;
+    if s.contains(['\'', '"', '\\', '`', '$', '\n']) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("the path contains a character unsafe for the tmux config's nested quoting: {s:?}"),
+        ));
+    }
+    Ok(s)
+}
+
 impl TmuxJob {
     /// Create a detached tmux session named uniquely per agent process
     /// (one job per bootstrap, so a fixed name is safe), running `job`
@@ -187,13 +214,13 @@ impl TmuxJob {
         // in this same config file fires `pipe-pane` synchronously, as part
         // of tmux's own session-creation event, before the pane's command
         // (the job) ever starts running — no second process to race at all.
+        let safe_log = validate_tmux_safe_path(&log)?;
         let config = tmp.join(format!("sandy-job-{unique}.tmux.conf"));
         std::fs::write(
             &config,
             format!(
                 "set-option -g remain-on-exit on\nset-option -g history-limit {HISTORY_LIMIT}\nset-hook -g \
-                 session-created 'pipe-pane -o \"cat >> {}\"'\n",
-                log.display()
+                 session-created 'pipe-pane -o \"cat >> {safe_log}\"'\n",
             ),
         )?;
 
@@ -320,32 +347,67 @@ impl TmuxJob {
             }
         };
 
-        // Only the as-yet-unmatched tail since the last read: the marker is
-        // a single short line, so this never needs more than a tiny window
-        // regardless of how much the job has written overall.
-        let mut tail = String::new();
+        // Only the as-yet-unmatched tail since the last read, as raw bytes
+        // (never a `String`): a chunk boundary can land mid-codepoint in the
+        // job's own (non-ASCII) output, and `String::drain`'s byte-offset
+        // trimming below would panic if it didn't fall on a char boundary.
+        // The marker itself and the exit code are pure ASCII, so searching
+        // and parsing never needs a full UTF-8 decode of the whole tail.
+        let marker = EXIT_MARKER.as_bytes();
+        let mut tail: Vec<u8> = Vec::new();
         let mut dead_since: Option<std::time::Instant> = None;
         let mut iteration: u32 = 0;
         loop {
             let mut chunk = Vec::new();
             file.read_to_end(&mut chunk).await?;
             if !chunk.is_empty() {
-                tail.push_str(&String::from_utf8_lossy(&chunk));
-                if let Some(after) = tail.find(EXIT_MARKER).map(|i| i + EXIT_MARKER.len()) {
-                    // A real pty's line discipline echoes `\n` as `\r\n`; the
-                    // line may also not have arrived in full yet.
-                    if let Some(line_end) = tail[after..].find('\n') {
-                        let code = tail[after..after + line_end].trim_end_matches('\r');
-                        if let Ok(code) = code.parse::<i32>() {
-                            return Ok(code);
+                tail.extend_from_slice(&chunk);
+                // Consume every complete candidate line starting with the
+                // marker, in order: the job's own output can coincidentally
+                // contain this exact text without being a real exit-code
+                // line (or a line that starts with it but runs implausibly
+                // long before its newline) — skip past it and keep scanning
+                // rather than getting stuck on it forever. A match whose
+                // line hasn't fully arrived yet is left in place for the
+                // next poll.
+                loop {
+                    let Some(start) = tail.windows(marker.len()).position(|w| w == marker) else {
+                        // No candidate at all: keep only enough of the tail
+                        // to catch one split across the next read, so a
+                        // long-running job's transcript never grows this
+                        // buffer unbounded.
+                        let keep_from = tail.len().saturating_sub(marker.len() + MAX_EXIT_CODE_DIGITS);
+                        tail.drain(..keep_from);
+                        break;
+                    };
+                    let after = start + marker.len();
+                    let line_end = tail[after..].iter().position(|&b| b == b'\n');
+                    match line_end {
+                        Some(line_end) if line_end <= MAX_EXIT_CODE_DIGITS => {
+                            let line = &tail[after..after + line_end];
+                            let digits = line.strip_suffix(b"\r").unwrap_or(line);
+                            if let Ok(code) = std::str::from_utf8(digits).unwrap_or("").parse::<i32>() {
+                                return Ok(code);
+                            }
+                            tail.drain(..after + line_end + 1);
+                        }
+                        // Either a complete line too long to be a real exit
+                        // code, or no newline yet but already past that
+                        // bound: not our marker — skip just this occurrence
+                        // and keep scanning for a later, real one.
+                        Some(_) => {
+                            tail.drain(..start + 1);
+                        }
+                        None if tail.len() - after > MAX_EXIT_CODE_DIGITS => {
+                            tail.drain(..start + 1);
+                        }
+                        // Still short enough to plausibly be ours, just not
+                        // complete yet: wait for more data next poll.
+                        None => {
+                            tail.drain(..start);
+                            break;
                         }
                     }
-                } else {
-                    // No marker yet: keep only enough of the tail to catch
-                    // one split across two reads, so a long-running job's
-                    // transcript never grows this buffer unbounded.
-                    let keep_from = tail.len().saturating_sub(64);
-                    tail.drain(..keep_from);
                 }
             }
             // Throttled: a long-lived interactive job can run for hours, so
@@ -547,6 +609,49 @@ mod tests {
     #[test]
     fn escapes_embedded_single_quotes() {
         assert_eq!(sh_quote("it's"), r"'it'\''s'");
+    }
+
+    #[test]
+    fn rejects_a_path_carrying_the_tmux_configs_own_quote_characters() {
+        for bad in [
+            "/tmp/weird\"quote",
+            "/tmp/weird'quote",
+            "/tmp/weird$var",
+            "/tmp/weird`cmd`",
+        ] {
+            assert!(
+                validate_tmux_safe_path(Path::new(bad)).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_an_ordinary_path() {
+        assert_eq!(
+            validate_tmux_safe_path(Path::new("/tmp/sandy-job-123.log")).unwrap(),
+            "/tmp/sandy-job-123.log"
+        );
+    }
+
+    /// Regression (CodeRabbit on #342): the job's own output can coincidentally
+    /// contain the literal marker text without being the real exit-code line
+    /// (here, printed before the job actually exits) — `wait_for_exit` must
+    /// skip past it and keep scanning, not get stuck treating it as final.
+    #[tokio::test]
+    async fn a_decoy_marker_line_is_skipped_and_the_real_exit_code_still_wins() -> std::io::Result<()> {
+        let job = vec![
+            "sh".into(),
+            "-c".into(),
+            std::ffi::OsString::from(format!("echo '{EXIT_MARKER}not-a-number'; exit 9")),
+        ];
+        let tmux_job = TmuxJob::start(&job, None)?;
+        let exit = tokio::time::timeout(Duration::from_secs(10), tmux_job.wait_for_exit())
+            .await
+            .map_err(std::io::Error::other)??;
+        tmux_job.kill();
+        assert_eq!(exit, 9, "the decoy line must not be mistaken for the real exit marker");
+        Ok(())
     }
 
     /// The job runs behind a real tmux-allocated PTY, not a pipe: `tty`
