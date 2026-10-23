@@ -657,7 +657,14 @@ where
             }
             Some(LinkFrame::Archive { content_type, payload }) => {
                 let bytes = unhex(&payload, "an archive payload")?;
-                membership
+                // A refused archive post (the membership's cap expired or was
+                // revoked since Join) loses only the archive — ending the
+                // relay here would also lose the `Exit` frame the agent
+                // sends right after (CodeRabbit on #345), exactly the
+                // failure mode the peer-post branch above already guards
+                // against. A backend fault is not a refusal and still ends
+                // the relay.
+                match membership
                     .channel
                     .post(
                         &membership.id,
@@ -665,7 +672,16 @@ where
                         content_type,
                         bytes,
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(e @ ChannelError::Backend(_)) => return Err(e.into()),
+                    Err(e) => {
+                        let reason = format!("the archive was refused: {e}");
+                        tracing::warn!("{reason}");
+                        refusals.push(reason);
+                    }
+                }
             }
             Some(other) => {
                 return Err(LinkError::Protocol(format!(
@@ -958,6 +974,67 @@ mod tests {
             "send_archive completed instead of blocking against a silent peer: {outcome:?}"
         );
         handshake.abort();
+        Ok(())
+    }
+
+    /// CodeRabbit on #345: an archive post refused at the channel layer (the
+    /// membership's cap expired between `Join` and the agent sending its
+    /// `Archive` frame) must lose only the archive, not the job's exit
+    /// report — the same INV-11 guarantee `a_refused_peer_post_does_not_cost_
+    /// the_exit_report` already covers for peer posts, now covering the
+    /// orchestrator-channel Archive arm too.
+    #[tokio::test]
+    async fn a_refused_archive_does_not_cost_the_exit_report() -> anyhow::Result<()> {
+        let authority = LocalCapAuthority::new(Duration::from_secs(3600))?;
+        let expires_at = unix_secs()? + 2;
+        let agent_cap = authority.mint(CapScope {
+            peer: PeerId::from("agent"),
+            channel: ChannelId::from(CHANNEL),
+            rights: CapRights {
+                post: true,
+                read: true,
+                invite: false,
+            },
+            expires_at: Some(expires_at),
+        })?;
+        let channel = Arc::new(Channel::new(ChannelId::from(CHANNEL), InMem::default(), authority).await?);
+
+        let (mut agent_end, host_end) = tokio::io::duplex(64 * 1024);
+        let relay = tokio::spawn({
+            let channel = Arc::clone(&channel);
+            async move { serve_agent_link(channel, &agent_cap, host_end).await }
+        });
+        let Some(LinkFrame::Cap { cap, channel: None, .. }) = timeout(WAIT, read_frame(&mut agent_end)).await?? else {
+            anyhow::bail!("expected the orchestrator cap frame first");
+        };
+        write_frame(
+            &mut agent_end,
+            &LinkFrame::Join {
+                cap,
+                channel: None,
+                cols: None,
+                rows: None,
+            },
+        )
+        .await?;
+        anyhow::ensure!(
+            timeout(WAIT, read_frame(&mut agent_end)).await?? == Some(LinkFrame::Joined { channel: None }),
+            "the join must succeed"
+        );
+
+        until_expired(expires_at).await?;
+        write_frame(
+            &mut agent_end,
+            &LinkFrame::Archive {
+                content_type: "text/plain".to_string(),
+                payload: hex::encode(b"after-expiry"),
+            },
+        )
+        .await?;
+        write_frame(&mut agent_end, &LinkFrame::Exit { code: 7 }).await?;
+        drop(agent_end);
+        let relayed = timeout(WAIT, relay).await??;
+        assert!(matches!(relayed, Ok(Some(7))), "got {relayed:?}");
         Ok(())
     }
 

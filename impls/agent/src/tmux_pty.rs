@@ -462,7 +462,10 @@ impl TmuxJob {
     }
 
     /// Open a fresh PTY and attach it to this job's tmux session — the one
-    /// bridged stream for this phase's single-attach bridge.
+    /// bridged stream for this phase's single-attach bridge. The returned
+    /// [`PtyResizer`] is how a caller applies a `Join`'s initial size and any
+    /// later `Resize` frame to THIS pty (epic #340 phase 2) — `open_attach`
+    /// itself only ever sizes it to the fixed [`DEFAULT_COLS`]/[`DEFAULT_ROWS`].
     ///
     /// # Errors
     /// If the PTY cannot be allocated or `tmux attach` cannot be spawned on it.
@@ -471,6 +474,7 @@ impl TmuxJob {
     ) -> std::io::Result<(
         AsyncPtyReader,
         AsyncPtyWriter,
+        PtyResizer,
         Box<dyn portable_pty::Child + Send + Sync>,
     )> {
         let pair = portable_pty::native_pty_system()
@@ -516,18 +520,25 @@ impl TmuxJob {
             }
         });
 
-        // Keep the master's own handle alive for the connection's lifetime —
-        // dropped once both the reader thread (on EOF) and this value end,
-        // matching `impls/vm/src/console/transport.rs`'s `PtyTransport`
-        // precedent for the same portable-pty shape.
-        let _master = pair.master;
+        // Shared, not owned by one side alone: `AsyncPtyWriter` keeps it
+        // alive for the connection's lifetime (matching
+        // `impls/vm/src/console/transport.rs`'s `PtyTransport` precedent for
+        // the same portable-pty shape), while `PtyResizer` is the only way
+        // to actually call `resize` on it. A plain `Mutex`, not relying on
+        // `MasterPty`'s own (unconfirmed) `Sync`-ness, since every access
+        // here is a single, infrequent method call, never a hot path.
+        let master = std::sync::Arc::new(std::sync::Mutex::new(pair.master));
 
         Ok((
             AsyncPtyReader {
                 rx,
                 pending: Vec::new(),
             },
-            AsyncPtyWriter { tx: wtx, _master },
+            AsyncPtyWriter {
+                tx: wtx,
+                _master: std::sync::Arc::clone(&master),
+            },
+            PtyResizer(master),
             child,
         ))
     }
@@ -584,8 +595,37 @@ impl AsyncRead for AsyncPtyReader {
 /// `poll_write` never blocks the async runtime on a sync `Write`.
 pub struct AsyncPtyWriter {
     tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
-    /// Keeps the PTY master descriptor alive for this writer's lifetime.
-    _master: Box<dyn portable_pty::MasterPty + Send>,
+    /// Keeps the PTY master descriptor alive for this writer's lifetime —
+    /// shared with a [`PtyResizer`] for the same master, never used directly
+    /// through this field (hence `_`-prefixed; `resize` is `PtyResizer`'s).
+    _master: std::sync::Arc<std::sync::Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
+}
+
+/// Applies a [`crate::link_source`]-independent terminal resize to the PTY
+/// [`TmuxJob::open_attach`] returned alongside it (epic #340 phase 2): the
+/// one way a caller can honor a `Join`'s initial size or a later `Resize`
+/// frame, since neither is known yet when `open_attach` picks the fixed
+/// [`DEFAULT_COLS`]/[`DEFAULT_ROWS`] default. Cheap and `Clone`: every clone
+/// shares the one underlying master.
+#[derive(Clone)]
+pub struct PtyResizer(std::sync::Arc<std::sync::Mutex<Box<dyn portable_pty::MasterPty + Send>>>);
+
+impl PtyResizer {
+    /// # Errors
+    /// If the underlying `ioctl` fails (e.g. the pty's slave side is already
+    /// gone).
+    pub fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .resize(portable_pty::PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(std::io::Error::other)
+    }
 }
 
 impl AsyncWrite for AsyncPtyWriter {
