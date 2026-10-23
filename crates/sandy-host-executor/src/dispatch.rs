@@ -329,6 +329,9 @@ pub fn handle_dispatch(
         .map_err(|token: Vec<u8>| HandleDispatchError::InvalidLinkTokenLength(token.len()))?;
     let prefix = sandy_executor_proto::encode_remote_link_prefix(&dispatch.job_id, &link_token)?;
 
+    // A clone kept for the closure below: `control` itself is still needed
+    // by reference for both `RunSpec` literals further down.
+    let control_for_relay = control.clone();
     let on_link: OnLink = Arc::new(move |_box_id, host_end, report| {
         relay_agent_link(
             &rt,
@@ -336,7 +339,7 @@ pub fn handle_dispatch(
             host_end,
             prefix.clone(),
             report,
-            std::time::Duration::from_secs(u64::from(STAGE1_TIMEOUT_SECS)),
+            control_for_relay.clone(),
         );
     });
 

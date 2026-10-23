@@ -797,6 +797,23 @@ registered yet is kept as that job's pending attach state rather than
 dropped, applied the moment the worker registers its `RunControl` — so a
 frame that outraces its own job's `Dispatch` still takes effect.
 
+**Follow-up (CodeRabbit on #344, same pattern again): `relay_agent_link`'s
+whole-relay bound now follows the live `RunControl` too, not a flat
+duration.** It previously bounded the mesh relay (the pipe moving the
+agent's own link traffic to and from the orchestrator, once connected) with
+a static `tokio::time::timeout(STAGE1_TIMEOUT_SECS, ...)` — exactly the same
+shape the `ProcessBackend` poll-loop bug above had, just one layer further
+out: a job's relay would still be torn down on a fixed clock regardless of
+attach state, even though the job's own `RunControl` was already suspended.
+`relay_agent_link` now takes a `RunControl` clone instead and races the
+connected relay against it: the relay ends the moment the control is
+cancelled, or the moment its (non-suspended) deadline passes, polling on a
+short interval since a suspended-then-reinstated deadline has nothing to
+await on directly (the same discipline `impls/local/src/process.rs`'s own
+poll loop already uses). `dial_and_forward`'s own separate `DIAL_TIMEOUT`
+for the dial itself is unchanged — only the connected phase's bound moved
+from flat to live.
+
 ## 15. Orchestrator placement wiring: one shared `HostRegistry`, stage-1 required-class default, dispatch from the real submit path (#298)
 
 **Status:** implemented.

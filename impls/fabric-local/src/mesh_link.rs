@@ -249,7 +249,7 @@ const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// later for its own reasons can reuse this exact relay, not a inherit a
 /// one-off built only for the remote path.
 ///
-/// `timeout` bounds the whole relay, not just the dial (`dial_and_forward`'s
+/// `control` bounds the whole relay, not just the dial (`dial_and_forward`'s
 /// own `DIAL_TIMEOUT` already bounds connecting): a connected-but-silent
 /// orchestrator — one that accepts the TCP connection and then never reads or
 /// writes again — would otherwise hang `forward_agent_link`'s writes
@@ -257,15 +257,25 @@ const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// forever (CodeRabbit finding on #284; architect ruling, infra-f3, #289.4:
 /// bound it here, at the call site that actually enters a long-lived loop,
 /// against the job's own wall-clock rather than inside `dial_and_forward`
-/// itself). The caller passes the same bound the job's own `RunSpec.
-/// timeout_secs` uses, so a stuck relay and a stuck job time out together.
+/// itself).
+///
+/// Unlike the original flat timeout, `control` is a LIVE handle (#340's
+/// "unlimited while attached" policy, CodeRabbit on #344): the relay ends the
+/// moment [`RunControl::is_cancelled`] is true, or the moment
+/// [`RunControl::timed_out`] is — which, while the same job is attached and
+/// its deadline suspended, never happens, so an attached job's relay is
+/// exactly as unbounded as the job itself. The relay re-checks `control` on a
+/// short interval rather than awaiting a single fixed instant, since a
+/// suspended-then-reinstated deadline has nothing to await on directly — the
+/// same polling discipline `impls/local/src/process.rs`'s own poll loop uses
+/// for the identical reason.
 pub fn relay_agent_link(
     rt: &tokio::runtime::Handle,
     forward_back: SocketAddr,
     host_end: std::os::fd::OwnedFd,
     prefix: Vec<u8>,
     report: sandy_api::agent::AgentReport,
-    timeout: std::time::Duration,
+    control: sandy_api::backend::RunControl,
 ) {
     rt.spawn(async move {
         let link = match owned_fd_into_unix_stream(host_end) {
@@ -275,16 +285,61 @@ pub fn relay_agent_link(
                 return;
             }
         };
-        match tokio::time::timeout(timeout, dial_and_forward(forward_back, link, &prefix)).await {
-            Ok(Ok(ForwardedVerdict::JobExited(code))) => report.job_exited(code),
-            Ok(Ok(ForwardedVerdict::AgentFailed(reason))) => report.agent_failed(reason),
-            // DialAndForwardError's own Display already names what failed
-            // ("dialing the orchestrator: ..." or "agent link: ...");
-            // wrapping it again here would duplicate that prefix.
-            Ok(Err(e)) => report.agent_failed(e.to_string()),
-            Err(_elapsed) => report.agent_failed(format!("the mesh relay did not complete within {timeout:?}")),
+        tokio::select! {
+            result = dial_and_forward(forward_back, link, &prefix) => {
+                match result {
+                    Ok(ForwardedVerdict::JobExited(code)) => report.job_exited(code),
+                    Ok(ForwardedVerdict::AgentFailed(reason)) => report.agent_failed(reason),
+                    // DialAndForwardError's own Display already names what
+                    // failed ("dialing the orchestrator: ..." or "agent
+                    // link: ..."); wrapping it again here would duplicate
+                    // that prefix.
+                    Err(e) => report.agent_failed(e.to_string()),
+                }
+            }
+            reason = control_ended(&control) => {
+                report.agent_failed(match reason {
+                    ControlEndedReason::Cancelled => {
+                        "the run was cancelled while the mesh relay was still in flight".to_owned()
+                    }
+                    ControlEndedReason::DeadlinePassed => "the mesh relay exceeded the job's deadline".to_owned(),
+                });
+            }
         }
     });
+}
+
+/// How often [`control_ended`] re-checks a [`RunControl`] it has no way to
+/// await directly — a suspended deadline may be reinstated, or cancellation
+/// may fire, at any moment with no notification. Coarse relative to
+/// `impls/local/src/process.rs`'s 10ms poll: that loop also has to notice a
+/// process's own exit promptly, this one only has to notice a deadline or
+/// cancellation measured in whole seconds at the finest.
+const CONTROL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Why [`control_ended`] resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlEndedReason {
+    /// [`RunControl::cancel`] was called.
+    Cancelled,
+    /// [`RunControl::timed_out`] became true (an active, non-suspended
+    /// deadline passed).
+    DeadlinePassed,
+}
+
+/// Resolves once `control` is cancelled or its live deadline has passed.
+/// Never resolves while `control` is both un-cancelled and suspended
+/// (`deadline() == None`) — exactly the "unlimited while attached" state.
+async fn control_ended(control: &sandy_api::backend::RunControl) -> ControlEndedReason {
+    loop {
+        if control.is_cancelled() {
+            return ControlEndedReason::Cancelled;
+        }
+        if control.timed_out() {
+            return ControlEndedReason::DeadlinePassed;
+        }
+        tokio::time::sleep(CONTROL_POLL_INTERVAL).await;
+    }
 }
 
 /// The relay side of the same fd-to-async-stream conversion
@@ -578,7 +633,10 @@ mod tests {
     /// own launch thread has.
     #[tokio::test]
     async fn relay_agent_link_resolves_job_exited_from_a_real_socketpair() -> anyhow::Result<()> {
-        use sandy_api::agent::{AgentReport, AgentVerdict};
+        use sandy_api::{
+            agent::{AgentReport, AgentVerdict},
+            backend::RunControl,
+        };
 
         let listener = sandy_conn::listen(&ConnAddr::Tcp("127.0.0.1:0".parse()?))
             .await
@@ -620,7 +678,7 @@ mod tests {
                 relay_end.into(),
                 PREFIX.to_vec(),
                 report,
-                Duration::from_secs(300),
+                RunControl::with_timeout_secs(300),
             );
         })
         .await
@@ -664,11 +722,11 @@ mod tests {
 
     /// Regression (CodeRabbit on #284; architect ruling, #289.4): a connected
     /// orchestrator that never reads or writes again must not hang the relay
-    /// forever — `relay_agent_link`'s `timeout` forces it to give up and
-    /// report `agent_failed`, so the task, the mesh socket, and the agent's
-    /// link end all get torn down instead of leaking for the process's whole
-    /// lifetime. Asserts the bad-path behavior explicitly, not just that the
-    /// happy path still works.
+    /// forever — `relay_agent_link`'s `control` forces it to give up and
+    /// report `agent_failed` once its deadline passes, so the task, the mesh
+    /// socket, and the agent's link end all get torn down instead of leaking
+    /// for the process's whole lifetime. Asserts the bad-path behavior
+    /// explicitly, not just that the happy path still works.
     ///
     /// Uses real (short) time, not a paused virtual clock: this path dials a
     /// real TCP socket through `dial_and_forward`, including its own
@@ -679,7 +737,7 @@ mod tests {
     /// development.
     #[tokio::test]
     async fn relay_agent_link_times_out_against_a_connected_but_silent_orchestrator() -> anyhow::Result<()> {
-        use sandy_api::agent::AgentReport;
+        use sandy_api::{agent::AgentReport, backend::RunControl};
 
         let listener = sandy_conn::listen(&ConnAddr::Tcp("127.0.0.1:0".parse()?))
             .await
@@ -704,6 +762,7 @@ mod tests {
         // so a real-time test run resolves in well under a second without
         // the dial's own bound ever becoming a factor.
         const RELAY_TIMEOUT: Duration = Duration::from_millis(100);
+        let control = RunControl::new(std::time::Instant::now() + RELAY_TIMEOUT);
 
         tokio::task::spawn_blocking(move || {
             relay_agent_link(
@@ -712,7 +771,7 @@ mod tests {
                 relay_end.into(),
                 PREFIX.to_vec(),
                 report,
-                RELAY_TIMEOUT,
+                control,
             );
         })
         .await
@@ -721,10 +780,10 @@ mod tests {
         let verdict = tokio::task::spawn_blocking(move || verdict_rx.recv_timeout(Duration::from_secs(5)))
             .await
             .context("verdict recv task panicked")?
-            .context("the report channel did not deliver a verdict after the timeout elapsed")?;
+            .context("the report channel did not deliver a verdict after the deadline elapsed")?;
         assert!(
-            matches!(&verdict, sandy_api::agent::AgentVerdict::AgentFailed(reason) if reason.contains("did not complete")),
-            "expected an AgentFailed verdict naming the timeout, got {verdict:?}"
+            matches!(&verdict, sandy_api::agent::AgentVerdict::AgentFailed(reason) if reason.contains("deadline")),
+            "expected an AgentFailed verdict naming the deadline, got {verdict:?}"
         );
 
         // Proves actual teardown, not just the verdict: the timed-out
@@ -736,6 +795,86 @@ mod tests {
             .await
             .context("agent side did not see EOF after the relay timed out")??;
         assert_eq!(n, 0, "expected EOF on the agent's side once the relay tears down");
+
+        orchestrator.abort(); // still pending by design; nothing left to assert from it
+        Ok(())
+    }
+
+    /// Regression (CodeRabbit on #344): `relay_agent_link`'s own bound is a
+    /// live [`RunControl`], not a flat duration — a suspended deadline (the
+    /// "attached" state) must not end the relay even long after the deadline
+    /// it was suspended ahead of would otherwise have passed. Mirrors
+    /// `impls/local/src/process.rs`'s own
+    /// `suspending_the_control_survives_past_the_jobs_original_timeout` test
+    /// at the relay's own layer.
+    #[tokio::test]
+    async fn relay_agent_link_survives_past_its_original_deadline_once_suspended() -> anyhow::Result<()> {
+        use sandy_api::{agent::AgentReport, backend::RunControl};
+
+        let listener = sandy_conn::listen(&ConnAddr::Tcp("127.0.0.1:0".parse()?))
+            .await
+            .context("listen")?;
+        let orchestrator_addr = listener.local_addr().context("local_addr")?;
+
+        // Silent once connected, same as the test above — the point here is
+        // that nothing tears the relay down while suspended, not that the
+        // orchestrator ever does anything.
+        let orchestrator = tokio::spawn(async move {
+            let (_orchestrator_side, _peer) = listener.accept().await?;
+            std::future::pending::<()>().await;
+            Ok::<_, anyhow::Error>(())
+        });
+
+        let (relay_end, agent_end) = std::os::unix::net::UnixStream::pair().context("socketpair")?;
+        agent_end.set_nonblocking(true).context("set_nonblocking")?;
+        let _agent_side = tokio::net::UnixStream::from_std(agent_end).context("from_std")?;
+        let (report, verdict_rx) = AgentReport::channel();
+        let rt = tokio::runtime::Handle::current();
+
+        // A deadline that would already have passed by the time the relay
+        // even starts, were it ever consulted — suspended up front, so it
+        // must not be.
+        let control = RunControl::new(std::time::Instant::now() + Duration::from_millis(50));
+        control.suspend_deadline();
+        let control_for_relay = control.clone();
+
+        tokio::task::spawn_blocking(move || {
+            relay_agent_link(
+                &rt,
+                orchestrator_addr,
+                relay_end.into(),
+                PREFIX.to_vec(),
+                report,
+                control_for_relay,
+            );
+        })
+        .await
+        .context("spawn_blocking panicked")?;
+
+        // Wait well past the original (now-suspended) deadline: no verdict
+        // should have arrived yet — the relay is still alive.
+        let (too_soon, verdict_rx) = tokio::task::spawn_blocking(move || {
+            let result = verdict_rx.recv_timeout(Duration::from_millis(500));
+            (result, verdict_rx)
+        })
+        .await
+        .context("recv task panicked")?;
+        assert!(
+            too_soon.is_err(),
+            "a suspended deadline must not end the relay: got {too_soon:?}"
+        );
+
+        // Cancel it, proving the relay really is still alive and watching
+        // `control` live rather than merely hung for an unrelated reason.
+        control.cancel();
+        let verdict = tokio::task::spawn_blocking(move || verdict_rx.recv_timeout(Duration::from_secs(2)))
+            .await
+            .context("verdict recv task panicked")?
+            .context("the report channel did not deliver a verdict after cancellation")?;
+        assert!(
+            matches!(&verdict, sandy_api::agent::AgentVerdict::AgentFailed(reason) if reason.contains("cancelled")),
+            "expected an AgentFailed verdict naming the cancellation, got {verdict:?}"
+        );
 
         orchestrator.abort(); // still pending by design; nothing left to assert from it
         Ok(())
