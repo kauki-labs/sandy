@@ -63,7 +63,7 @@ async fn main() {
     let agent_path = config.agent_path;
     let exit = run_dispatch_loop(
         &mut conn,
-        move |dispatch| {
+        move |dispatch, control| {
             let rt = rt.clone();
             let agent_path = agent_path.clone();
             async move {
@@ -75,7 +75,7 @@ async fn main() {
                     // `containment` above (#332 — never trust this host's
                     // earlier `Register` capability declaration alone).
                     let vm_available = detect_vm_capability();
-                    handle_dispatch(&dispatch, containment, agent_path, rt, vm_available)
+                    handle_dispatch(&dispatch, containment, agent_path, rt, vm_available, control)
                 })
                 .await;
                 // Report the outcome back to the orchestrator over the same

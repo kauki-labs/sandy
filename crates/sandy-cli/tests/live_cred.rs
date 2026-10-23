@@ -164,6 +164,7 @@ fn credential_flows_through_git_helper_and_refreshes_midrun() -> anyhow::Result<
             shares: false,
         },
         secret_dir: None,
+        control: sandy::RunControl::with_timeout_secs(60),
     };
 
     let provider = RotatingProvider::new();
@@ -282,6 +283,7 @@ fn credential_secret_input_output_all_compose() -> anyhow::Result<()> {
             shares: false,
         },
         secret_dir: None,
+        control: sandy::RunControl::with_timeout_secs(60),
     };
 
     // Cred leg: a fixed fake provider minting GITHUB_TOKEN into the guest.

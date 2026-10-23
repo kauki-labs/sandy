@@ -441,6 +441,13 @@ mod tests {
         }
     }
 
+    /// A shared, reusable control handle for tests that don't exercise
+    /// cancellation/deadline behavior themselves (#340).
+    fn test_control() -> &'static sandy_api::backend::RunControl {
+        static CONTROL: std::sync::OnceLock<sandy_api::backend::RunControl> = std::sync::OnceLock::new();
+        CONTROL.get_or_init(|| sandy_api::backend::RunControl::with_timeout_secs(60))
+    }
+
     /// True when `seq` appears as a run of consecutive argv tokens — the check
     /// for a flag and its value emitted as separate tokens (`--cpus 4`).
     fn has_token_run(args: &[String], seq: &[&str]) -> bool {
@@ -470,6 +477,7 @@ mod tests {
             grants: &grants,
             outcome_file: None,
             secret_dir: None,
+            control: test_control(),
         };
         let staged = StagedArgs::default();
 
@@ -528,6 +536,7 @@ mod tests {
             grants: &grants,
             outcome_file: None,
             secret_dir: None,
+            control: test_control(),
         };
         // The argv-safe staged share: the secret bytes are already on disk in a 0600
         // file; only the share path and tag reach argv (INV-1).
@@ -574,6 +583,7 @@ mod tests {
             grants: &grants,
             outcome_file: None,
             secret_dir: None,
+            control: test_control(),
         };
         let staged = StagedArgs::default();
 
@@ -607,6 +617,7 @@ mod tests {
             grants: &grants,
             outcome_file: None,
             secret_dir: None,
+            control: test_control(),
         };
         let staged = StagedArgs::default();
 
@@ -635,6 +646,7 @@ mod tests {
             grants,
             outcome_file: None,
             secret_dir: None,
+            control: test_control(),
         }
     }
 
@@ -844,6 +856,7 @@ mod tests {
             grants: &grants,
             outcome_file: None,
             secret_dir: None,
+            control: test_control(),
         };
 
         let outcome = backend.run(&spec).context("boot vfkit guest")?;

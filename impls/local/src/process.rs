@@ -351,14 +351,20 @@ impl ProcessBackend {
         };
 
         // Wait for the group leader against the wall-clock budget, polling so a
-        // timeout can interrupt a hung job rather than block forever.
-        let deadline = Instant::now() + Duration::from_secs(u64::from(spec.timeout_secs));
+        // timeout can interrupt a hung job rather than block forever. The budget
+        // itself is read fresh from `spec.control` every tick (#340), not a fixed
+        // `Instant` computed once here: `daemon cancel` and the attach-state-driven
+        // "unlimited while attached" policy both work by mutating the SAME
+        // `RunControl` this loop reads, from outside this call, while it runs.
+        // `spec.timeout_secs` only seeds the control's initial deadline at
+        // construction (see `RunControl::with_timeout_secs`) — it is never read
+        // here directly.
         let mut timed_out = false;
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break Some(status),
                 Ok(None) => {
-                    if Instant::now() >= deadline {
+                    if spec.control.is_cancelled() || spec.control.timed_out() {
                         timed_out = true;
                         break None;
                     }
@@ -606,6 +612,18 @@ mod tests {
     use super::*;
 
     fn run_spec<'a>(command: &'a [String], grants: &'a Grants, timeout_secs: u32) -> RunSpec<'a> {
+        // A fresh control matching THIS call's own `timeout_secs` (#340),
+        // leaked (test-only, never production code) so it can outlive this
+        // function and be returned by reference without threading an extra
+        // `RunControl`/`let` binding through every call site. A single
+        // shared, fixed-duration control would be wrong here: the poll loop
+        // in `run()` now reads the control's deadline live, not
+        // `spec.timeout_secs` directly, so a test asserting a SPECIFIC fast
+        // timeout (e.g. `run_spec(&command, &grants, 1)`) needs a control
+        // actually bounded at 1s, not some other shared value.
+        let control = Box::leak(Box::new(sandy_api::backend::RunControl::with_timeout_secs(
+            timeout_secs,
+        )));
         RunSpec {
             template: "process",
             command,
@@ -619,6 +637,7 @@ mod tests {
             grants,
             outcome_file: None,
             secret_dir: None,
+            control,
         }
     }
 
@@ -735,6 +754,60 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_secs(10),
             "it was killed near the deadline, not after the full sleep"
+        );
+        Ok(())
+    }
+
+    /// Positive, the actual deliverable of #340: suspending the control's
+    /// deadline mid-run lets a job survive well past its original
+    /// `timeout_secs` budget — proving the poll loop reads `spec.control`
+    /// live on every tick, not a fixed `Instant` computed once at the start
+    /// (the bug a stale claim in this PR's own description once had: the
+    /// field compiled and threaded through everywhere, but the loop never
+    /// actually read it).
+    #[test]
+    fn suspending_the_control_survives_past_the_jobs_original_timeout() -> anyhow::Result<()> {
+        let grants = no_grants();
+        let command = ["sh".to_string(), "-c".to_string(), "sleep 3; echo done".to_string()];
+        let spec = run_spec(&command, &grants, 1);
+        spec.control.suspend_deadline();
+
+        let outcome = ProcessBackend::new().run(&spec)?;
+
+        assert!(
+            !outcome.timed_out,
+            "a suspended deadline must not time out, even 3x past the original 1s budget"
+        );
+        assert_eq!(
+            outcome.guest_exit,
+            Some(0),
+            "the job ran to completion: {}",
+            outcome.console
+        );
+        assert!(outcome.console.contains("done"), "console: {}", outcome.console);
+        Ok(())
+    }
+
+    /// Positive: `daemon cancel` (`RunControl::cancel`) ends a job immediately,
+    /// well before its own wall-clock budget would — proving the poll loop
+    /// checks `is_cancelled()` on every tick, not just the deadline.
+    #[test]
+    fn cancelling_the_control_ends_the_job_before_its_timeout() -> anyhow::Result<()> {
+        let grants = no_grants();
+        let command = ["sh".to_string(), "-c".to_string(), "sleep 30".to_string()];
+        let spec = run_spec(&command, &grants, 60);
+        spec.control.cancel();
+
+        let start = Instant::now();
+        let outcome = ProcessBackend::new().run(&spec)?;
+
+        assert!(
+            outcome.timed_out,
+            "a cancelled run is reported the same way a timeout is"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "cancellation must end the job promptly, not wait anywhere near its 60s/30s budgets"
         );
         Ok(())
     }

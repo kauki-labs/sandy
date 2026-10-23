@@ -681,6 +681,13 @@ mod tests {
         shares: false,
     };
 
+    /// A shared, reusable control handle for tests that don't exercise
+    /// cancellation/deadline behavior themselves (#340).
+    fn test_control() -> &'static sandy_api::backend::RunControl {
+        static CONTROL: std::sync::OnceLock<sandy_api::backend::RunControl> = std::sync::OnceLock::new();
+        CONTROL.get_or_init(|| sandy_api::backend::RunControl::with_timeout_secs(60))
+    }
+
     /// An override takes priority over arch derivation entirely, whatever
     /// the kernel path says.
     #[test]
@@ -721,6 +728,7 @@ mod tests {
             grants: &NO_GRANTS,
             outcome_file: None,
             secret_dir: None,
+            control: test_control(),
         };
         let staged = StagedArgs::default();
 
@@ -789,6 +797,7 @@ mod tests {
             grants: &grants,
             outcome_file: None,
             secret_dir: None,
+            control: test_control(),
         };
 
         let args = qemu_args(&topology, &spec, &staged).context("assemble qemu argv")?;
@@ -828,6 +837,7 @@ mod tests {
             grants: &NO_GRANTS,
             outcome_file: None,
             secret_dir: None,
+            control: test_control(),
         };
         let staged = StagedArgs::default();
 
@@ -854,6 +864,7 @@ mod tests {
             grants: &NO_GRANTS,
             outcome_file: None,
             secret_dir: None,
+            control: test_control(),
         }
     }
 
@@ -925,6 +936,7 @@ mod tests {
             grants: &NO_GRANTS,
             outcome_file: None,
             secret_dir: None,
+            control: test_control(),
         };
         let staged = StagedArgs {
             tap: Some("sandytap0".to_string()),
@@ -965,6 +977,7 @@ mod tests {
             grants: &NO_GRANTS,
             outcome_file: None,
             secret_dir: None,
+            control: test_control(),
         };
         let staged = StagedArgs::default();
 
@@ -1000,6 +1013,7 @@ mod tests {
             grants: &NO_GRANTS,
             outcome_file: None,
             secret_dir: None,
+            control: test_control(),
         };
 
         let outcome = backend.run(&spec).context("boot the trivial job on KVM")?;

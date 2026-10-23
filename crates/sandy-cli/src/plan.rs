@@ -26,7 +26,7 @@
 
 use std::path::PathBuf;
 
-use sandy::{AllowList, EgressRule, Grants, Input, Output, PlanError, RunSpec, SecretRef, SecretSource};
+use sandy::{AllowList, EgressRule, Grants, Input, Output, PlanError, RunControl, RunSpec, SecretRef, SecretSource};
 
 /// Default wall-clock timeout when `--timeout` is omitted (5 minutes). Picked as
 /// a sane bound for an interactive foreground `run`; override with `--timeout`.
@@ -91,6 +91,13 @@ pub struct JobPlan {
     /// Set by the credential bracket for refresh re-delivery (#49); `None` for an
     /// ordinary run. Not a CLI option, the supervisor fills it.
     pub secret_dir: Option<PathBuf>,
+    /// This run's live cancellation/deadline handle (#340) — `sandy run` is a
+    /// synchronous foreground command with no attach-state concept of its
+    /// own, so this is constructed once from `timeout_secs` and never
+    /// adjusted externally; it exists so `as_run_spec` has a real
+    /// [`RunControl`] to hand the backend, the same contract every caller of
+    /// [`VmBackend::run`] now has to satisfy.
+    pub control: RunControl,
 }
 
 impl JobPlan {
@@ -112,6 +119,7 @@ impl JobPlan {
             // Foreground local run uses fd3 for the outcome, not a file (D2/ssh only).
             outcome_file: None,
             secret_dir: self.secret_dir.as_deref(),
+            control: &self.control,
         }
     }
 }
@@ -154,6 +162,7 @@ pub fn parse_run(args: RunArgs) -> Result<JobPlan, PlanError> {
         .map(|raw| parse_allow(raw))
         .collect::<Result<Vec<_>, _>>()?;
 
+    let timeout_secs = args.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS);
     Ok(JobPlan {
         template: args.template,
         command: args.command,
@@ -164,7 +173,7 @@ pub fn parse_run(args: RunArgs) -> Result<JobPlan, PlanError> {
         allow: AllowList { rules },
         cpu: args.cpu,
         mem: args.mem,
-        timeout_secs: args.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS),
+        timeout_secs,
         // Least-privilege default: grant no trust tokens. Capability granting is
         // out of #22 scope — the detection/routing seam lands with the host work.
         grants: Grants {
@@ -173,6 +182,7 @@ pub fn parse_run(args: RunArgs) -> Result<JobPlan, PlanError> {
             shares: false,
         },
         secret_dir: None,
+        control: RunControl::with_timeout_secs(timeout_secs),
     })
 }
 

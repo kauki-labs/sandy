@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::Context;
 use futures_util::StreamExt;
-use sandy_api::backend::{BackendError, Grants, Outcome, RunSpec, VmBackend};
+use sandy_api::backend::{BackendError, Grants, Outcome, RunControl, RunSpec, VmBackend};
 use sandy_fabric::{
     capauth::{Cap, CapAuthority, CapRights, CapScope},
     types::{ChannelId, PeerId},
@@ -465,6 +465,7 @@ async fn a_panicking_link_handler_fails_the_run_without_unwinding() -> anyhow::R
 
 fn run_on(backend: &ProcessBackend, command: &[String]) -> Result<Outcome, BackendError> {
     let grants = grants();
+    let control = RunControl::with_timeout_secs(30);
     backend.run(&RunSpec {
         template: "process",
         command,
@@ -478,6 +479,7 @@ fn run_on(backend: &ProcessBackend, command: &[String]) -> Result<Outcome, Backe
         grants: &grants,
         outcome_file: None,
         secret_dir: None,
+        control: &control,
     })
 }
 

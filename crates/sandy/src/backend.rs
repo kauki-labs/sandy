@@ -78,6 +78,7 @@ mod tests {
             shares: false,
         };
         let command = ["true".to_string()];
+        let control = RunControl::with_timeout_secs(60);
         let spec = RunSpec {
             template: "demo",
             command: &command,
@@ -91,6 +92,7 @@ mod tests {
             grants: &grants,
             outcome_file: None,
             secret_dir: None,
+            control: &control,
         };
         assert!(matches!(validate_no_secret_leak(&spec), Err(PlanError::SecretLeak(_))));
     }

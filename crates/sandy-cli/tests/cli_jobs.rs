@@ -62,6 +62,7 @@ fn booting_plan() -> JobPlan {
             shares: false,
         },
         secret_dir: None,
+        control: sandy::RunControl::with_timeout_secs(60),
     }
 }
 
@@ -88,6 +89,7 @@ fn leaking_plan() -> JobPlan {
             shares: false,
         },
         secret_dir: None,
+        control: sandy::RunControl::with_timeout_secs(60),
     }
 }
 

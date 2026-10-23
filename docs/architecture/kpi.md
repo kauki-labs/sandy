@@ -97,3 +97,11 @@ absence for a gap:
 - **Receipts / provenance** in the envelope are placeholders (not asserted).
 - **No-copy / arbitrary-path inputs** (#82): inputs are copied under their name.
 - **S3 object source + sink** (#67): no object-store input/output path.
+- **"Unlimited while attached" (#340), VM backend.** `RunControl`'s live
+  deadline/cancellation is honored by the process backend's poll loop, but
+  the VM backends (qemu/vfkit) still run every job to the fixed budget
+  computed once at start — see `docs/decisions/sandyd.md` decision 14's
+  amendment for the named gap (`run_console`'s console-protocol read loop
+  needs its own retrofit). No live KPI here until that lands; a VM-backed
+  attach session today is still bounded by its original `timeout_secs`
+  regardless of attach state.

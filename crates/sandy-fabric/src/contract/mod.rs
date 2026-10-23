@@ -29,7 +29,7 @@ use futures_util::{
     StreamExt,
     future::{Either, select},
 };
-use sandy_api::backend::{Grants, RunSpec};
+use sandy_api::backend::{Grants, RunControl, RunSpec};
 use sandy_proto::{MessageType, PeerMsg};
 
 use crate::{
@@ -337,7 +337,7 @@ pub async fn transport_suite<T: Transport>(make: impl Fn() -> T) -> Result<(), C
 }
 
 /// Build a `RunSpec` for `command` in `template` with no inputs, outputs, or secrets.
-fn run_spec<'a>(template: &'a str, command: &'a [String], grants: &'a Grants) -> RunSpec<'a> {
+fn run_spec<'a>(template: &'a str, command: &'a [String], grants: &'a Grants, control: &'a RunControl) -> RunSpec<'a> {
     RunSpec {
         template,
         command,
@@ -351,6 +351,7 @@ fn run_spec<'a>(template: &'a str, command: &'a [String], grants: &'a Grants) ->
         grants,
         outcome_file: None,
         secret_dir: None,
+        control,
     }
 }
 
@@ -391,7 +392,12 @@ pub async fn executor_suite<E: Executor>(
         shares: false,
     };
     let success = ["true".to_owned()];
-    let outcome = expect_ok(SEAM, "run", executor.run(&run_spec(template, &success, &grants)).await)?;
+    let control = RunControl::with_timeout_secs(30);
+    let outcome = expect_ok(
+        SEAM,
+        "run",
+        executor.run(&run_spec(template, &success, &grants, &control)).await,
+    )?;
     require(
         SEAM,
         outcome.booted && outcome.guest_exit == Some(0) && outcome.transport_error.is_none() && !outcome.timed_out,
@@ -404,7 +410,12 @@ pub async fn executor_suite<E: Executor>(
     )?;
 
     let failure = ["sh", "-c", "exit 3"].map(str::to_owned);
-    let outcome = expect_ok(SEAM, "run", executor.run(&run_spec(template, &failure, &grants)).await)?;
+    let control = RunControl::with_timeout_secs(30);
+    let outcome = expect_ok(
+        SEAM,
+        "run",
+        executor.run(&run_spec(template, &failure, &grants, &control)).await,
+    )?;
     require(
         SEAM,
         outcome.guest_exit == Some(3) && outcome.transport_error.is_none(),

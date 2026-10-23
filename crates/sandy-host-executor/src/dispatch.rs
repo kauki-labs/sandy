@@ -34,7 +34,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use sandy::admits_untrusted;
 use sandy_api::{
     agent::{AgentLaunch, OnLink},
-    backend::{BackendError, Grants, Outcome, RunSpec, SandboxKind as ApiSandboxKind, VmBackend},
+    backend::{BackendError, Grants, Outcome, RunControl, RunSpec, SandboxKind as ApiSandboxKind, VmBackend},
     containment::{Containment, ContainmentStatus},
 };
 use sandy_executor_proto::{Dispatch, IsolationClass, REMOTE_LINK_TOKEN_LEN, SandboxKind as ProtoSandboxKind};
@@ -106,6 +106,21 @@ fn is_timeout(err: &anyhow::Error) -> bool {
     err.chain()
         .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
         .any(|io_err| io_err.kind() == std::io::ErrorKind::TimedOut)
+}
+
+/// Realign `control`'s deadline to a fresh [`STAGE1_TIMEOUT_SECS`] budget from
+/// now, so a VM dispatch's run and agent-link relay (`relay_agent_link`,
+/// which follows this same `control` live) don't start already past a
+/// deadline that flake resolution (up to `FLAKE_RESOLVE_TIMEOUT_SECS`, longer
+/// than `STAGE1_TIMEOUT_SECS`) ate into (CodeRabbit on #344). Only ever bumps
+/// a currently FINITE deadline forward: a suspended (attached) control is
+/// left alone, since "unlimited while attached" already covers it — the same
+/// rule `run_dispatch_loop`'s own shutdown fail-safe applies.
+fn realign_deadline_after_flake_resolution(control: &RunControl) {
+    if control.deadline().is_some() {
+        control
+            .set_deadline(std::time::Instant::now() + std::time::Duration::from_secs(u64::from(STAGE1_TIMEOUT_SECS)));
+    }
 }
 
 /// The `SANDY_HISTORY_LINES` env entry for a flake/v1 dispatch's
@@ -215,7 +230,7 @@ pub fn check_isolation_class(
 /// default (not imported — that's a CLI-local constant, this is the
 /// dispatch path's own; they simply agree today, by architect ruling, not
 /// by sharing a constant).
-const STAGE1_TIMEOUT_SECS: u32 = 300;
+pub(crate) const STAGE1_TIMEOUT_SECS: u32 = 300;
 
 /// Budget for resolving a `flake/v1` job's guest template on THIS host
 /// (#332, CodeRabbit finding on PR #333): kind-detection probes plus the
@@ -312,6 +327,7 @@ pub fn handle_dispatch(
     agent_program: PathBuf,
     rt: tokio::runtime::Handle,
     vm_available: bool,
+    control: RunControl,
 ) -> Result<Outcome, HandleDispatchError> {
     let status = containment.status();
     let required = IsolationClass::try_from(dispatch.required_isolation_class).unwrap_or(IsolationClass::Unspecified);
@@ -328,6 +344,9 @@ pub fn handle_dispatch(
         .map_err(|token: Vec<u8>| HandleDispatchError::InvalidLinkTokenLength(token.len()))?;
     let prefix = sandy_executor_proto::encode_remote_link_prefix(&dispatch.job_id, &link_token)?;
 
+    // A clone kept for the closure below: `control` itself is still needed
+    // by reference for both `RunSpec` literals further down.
+    let control_for_relay = control.clone();
     let on_link: OnLink = Arc::new(move |_box_id, host_end, report| {
         relay_agent_link(
             &rt,
@@ -335,7 +354,7 @@ pub fn handle_dispatch(
             host_end,
             prefix.clone(),
             report,
-            std::time::Duration::from_secs(u64::from(STAGE1_TIMEOUT_SECS)),
+            control_for_relay.clone(),
         );
     });
 
@@ -373,6 +392,7 @@ pub fn handle_dispatch(
                 // all.
                 outcome_file: None,
                 secret_dir: None,
+                control: &control,
             };
             Ok(backend.run(&spec)?)
         }
@@ -412,6 +432,12 @@ pub fn handle_dispatch(
                     DispatchError::FlakeResolve(e.to_string())
                 }
             })?;
+            // Flake resolution can take up to FLAKE_RESOLVE_TIMEOUT_SECS (600s),
+            // longer than control's own STAGE1_TIMEOUT_SECS (300s) budget set
+            // when the worker popped this dispatch — without this, the VM's run
+            // and its agent-link relay could start already past their own
+            // deadline (CodeRabbit on #344).
+            realign_deadline_after_flake_resolution(&control);
             let (template, _kept_topology_file) = match resolved {
                 sandy_guest_template::ResolvedTemplate::Direct(t) => (t, None),
                 sandy_guest_template::ResolvedTemplate::Prebuilt { path, _kept } => (path, Some(_kept)),
@@ -435,6 +461,7 @@ pub fn handle_dispatch(
                 grants: &grants,
                 outcome_file: None,
                 secret_dir: None,
+                control: &control,
             };
             // `_kept_topology_file` (the temp JSON file, for a Prebuilt
             // template) must outlive `backend.run`'s own read of `template`
@@ -480,6 +507,44 @@ mod tests {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "nix: command not found");
         let wrapped = anyhow::Error::new(io_err).context("spawn `nix build ...`");
         assert!(!is_timeout(&wrapped));
+    }
+
+    /// Regression (CodeRabbit on #344): a finite deadline already eaten into
+    /// by slow flake resolution must be realigned forward, not left expired
+    /// before the VM run (and its agent-link relay) has even started.
+    #[test]
+    fn realign_deadline_after_flake_resolution_bumps_an_already_passed_finite_deadline_forward() {
+        let control =
+            sandy_api::backend::RunControl::new(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        assert!(
+            control.timed_out(),
+            "the deadline must already be in the past for this test to be meaningful"
+        );
+
+        realign_deadline_after_flake_resolution(&control);
+
+        assert!(
+            !control.timed_out(),
+            "the deadline must be realigned to the future, not left in the past"
+        );
+    }
+
+    /// Regression (CodeRabbit on #344): an attached (suspended) job's
+    /// deadline must stay suspended — flake resolution finishing is not a
+    /// reason to reinstate a bound "unlimited while attached" already lifted.
+    #[test]
+    fn realign_deadline_after_flake_resolution_leaves_a_suspended_control_alone() {
+        let control = sandy_api::backend::RunControl::with_timeout_secs(60);
+        control.suspend_deadline();
+        assert_eq!(control.deadline(), None);
+
+        realign_deadline_after_flake_resolution(&control);
+
+        assert_eq!(
+            control.deadline(),
+            None,
+            "a suspended control must stay suspended, not be given a new finite deadline"
+        );
     }
 
     #[test]
@@ -613,6 +678,7 @@ mod tests {
             PathBuf::from("/nonexistent/sandy-agent"),
             rt,
             false,
+            sandy_api::backend::RunControl::with_timeout_secs(60),
         )
         .expect_err("an untrusted job on a reaping-only host must be refused, never run");
         assert!(
@@ -654,6 +720,7 @@ mod tests {
             PathBuf::from("/nonexistent/sandy-agent"),
             rt,
             false,
+            sandy_api::backend::RunControl::with_timeout_secs(60),
         )
         .expect_err("a Vm dispatch must be refused when this host cannot actually run one");
         assert!(
@@ -687,6 +754,7 @@ mod tests {
             PathBuf::from("/nonexistent/sandy-agent"),
             rt,
             true,
+            sandy_api::backend::RunControl::with_timeout_secs(60),
         )
         .expect_err("an unspecified backend must never be silently accepted");
         assert!(
@@ -725,6 +793,7 @@ mod tests {
             PathBuf::from("/nonexistent/sandy-agent"),
             rt,
             true,
+            sandy_api::backend::RunControl::with_timeout_secs(60),
         )
         .expect_err("a non-flake/v1 encoding on the Vm branch must be refused, never guessed at");
         assert!(
@@ -762,6 +831,7 @@ mod tests {
             PathBuf::from("/nonexistent/sandy-agent"),
             rt,
             false,
+            sandy_api::backend::RunControl::with_timeout_secs(60),
         )
         .expect_err("a wrong-length link_token must be refused, never silently reshaped");
         assert!(

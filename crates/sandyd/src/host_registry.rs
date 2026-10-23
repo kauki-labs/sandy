@@ -36,7 +36,7 @@ use std::{
     },
 };
 
-use sandy_executor_proto::{Capabilities, Dispatch, IsolationClass, SandboxKind};
+use sandy_executor_proto::{AttachStateChanged, Capabilities, Dispatch, IsolationClass, SandboxKind};
 use tokio::sync::mpsc;
 
 /// The mesh identities permitted to register as executor hosts. Self-reported
@@ -129,6 +129,12 @@ pub struct Registration {
     /// Receiving half of this registration's dispatch channel — the
     /// connection task reads it to learn about `Dispatch`es placed on it.
     pub dispatch_rx: mpsc::Receiver<Dispatch>,
+    /// Receiving half of this registration's attach-state channel (#340) —
+    /// a SEPARATE queue from `dispatch_rx`, never multiplexed onto it: a
+    /// `Dispatch` and an `AttachStateChanged` are sent down the same wire
+    /// connection but queued independently here, so a full dispatch queue
+    /// can never starve an attach-state notification (or vice versa).
+    pub attach_state_rx: mpsc::Receiver<AttachStateChanged>,
     /// Identifies this exact registration; pass it to the matching
     /// [`HostRegistry::remove`] and to [`HostRegistry::send_dispatch_if_current`].
     pub registration: RegistrationId,
@@ -150,6 +156,7 @@ struct ConnectedHost {
     registration: RegistrationId,
     capabilities: Capabilities,
     dispatch_tx: mpsc::Sender<Dispatch>,
+    attach_state_tx: mpsc::Sender<AttachStateChanged>,
 }
 
 /// Every currently-connected, registered host-executor, keyed by its
@@ -257,6 +264,12 @@ impl HostRegistry {
             );
         }
         let (dispatch_tx, dispatch_rx) = mpsc::channel(8);
+        // Capacity 4, not 8 like `dispatch_tx`: attach-state transitions are
+        // rare (one per attach/detach, never per byte of TTY traffic) and
+        // the queue is drained the moment the host-executor's connection
+        // task can read it again between dispatches — this never needs
+        // `dispatch_tx`'s headroom.
+        let (attach_state_tx, attach_state_rx) = mpsc::channel(4);
         hosts.insert(
             host_id,
             Arc::new(ConnectedHost {
@@ -264,10 +277,12 @@ impl HostRegistry {
                 registration,
                 capabilities,
                 dispatch_tx,
+                attach_state_tx,
             }),
         );
         Ok(Registration {
             dispatch_rx,
+            attach_state_rx,
             registration,
             superseded,
         })
@@ -451,6 +466,36 @@ impl HostRegistry {
             .await
             .map_err(|_| DispatchSendError::ConnectionClosing)
     }
+
+    /// Queue `msg` for delivery to `host_id`'s connection task (#340) — a
+    /// job's attach-membership count (sandyd's own attach-relay, not this
+    /// registry) crossing zero in either direction. No isolation-class or
+    /// sandbox-kind gate here (unlike [`Self::send_dispatch`]): this is a
+    /// state notification about a job the host already runs, not a
+    /// placement decision to re-validate.
+    ///
+    /// # Errors
+    /// [`DispatchSendError::NoSuchHost`] if no host is registered under that
+    /// id; [`DispatchSendError::ConnectionClosing`] if its connection task
+    /// has already ended. The other two variants (isolation class / sandbox
+    /// kind) never apply here.
+    pub async fn send_attach_state_changed(
+        &self,
+        host_id: &str,
+        msg: AttachStateChanged,
+    ) -> Result<(), DispatchSendError> {
+        let host = self
+            .hosts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(host_id)
+            .cloned()
+            .ok_or(DispatchSendError::NoSuchHost)?;
+        host.attach_state_tx
+            .send(msg)
+            .await
+            .map_err(|_| DispatchSendError::ConnectionClosing)
+    }
 }
 
 #[cfg(test)]
@@ -559,6 +604,72 @@ mod tests {
     async fn dispatching_to_an_unregistered_host_is_refused() {
         let registry = HostRegistry::default();
         let result = registry.send_dispatch("ghost", Dispatch::default()).await;
+        assert_eq!(result, Err(DispatchSendError::NoSuchHost));
+    }
+
+    /// Positive (#340): `send_attach_state_changed` reaches the registered
+    /// host's OWN attach-state queue, not `dispatch_rx` — the two channels
+    /// are independent, so a full dispatch queue can never block this.
+    #[tokio::test]
+    async fn an_attach_state_change_is_delivered_to_the_registered_hosts_channel() -> anyhow::Result<()> {
+        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let registry = HostRegistry::default();
+        let Registration {
+            mut attach_state_rx, ..
+        } = registry
+            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
+            .expect("the allowed peer must register");
+
+        let msg = AttachStateChanged {
+            job_id: "job-1".to_owned(),
+            attached: true,
+            sequence: 0,
+        };
+        registry.send_attach_state_changed("ws01", msg.clone()).await?;
+
+        let received = attach_state_rx.recv().await.expect("the message must arrive");
+        assert_eq!(received, msg);
+        Ok(())
+    }
+
+    /// Adversarial: no isolation-class or sandbox-kind gate applies to an
+    /// attach-state notification (unlike `send_dispatch`) — a host that
+    /// only declared TRUSTED/Process still receives it, since this is a
+    /// state notification about a job the host already runs, not a new
+    /// placement decision to re-validate.
+    #[tokio::test]
+    async fn an_attach_state_change_bypasses_the_isolation_and_sandbox_kind_gates() -> anyhow::Result<()> {
+        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let registry = HostRegistry::default();
+        let Registration {
+            mut attach_state_rx, ..
+        } = registry
+            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
+            .expect("the allowed peer must register");
+
+        let msg = AttachStateChanged {
+            job_id: "job-1".to_owned(),
+            attached: false,
+            sequence: 0,
+        };
+        registry.send_attach_state_changed("ws01", msg.clone()).await?;
+        assert_eq!(attach_state_rx.recv().await, Some(msg));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_attach_state_change_to_an_unregistered_host_is_refused() {
+        let registry = HostRegistry::default();
+        let result = registry
+            .send_attach_state_changed(
+                "ghost",
+                AttachStateChanged {
+                    job_id: "job-1".to_owned(),
+                    attached: true,
+                    sequence: 0,
+                },
+            )
+            .await;
         assert_eq!(result, Err(DispatchSendError::NoSuchHost));
     }
 

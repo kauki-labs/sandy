@@ -955,6 +955,7 @@ mod tests {
                 shares: false,
             },
             secret_dir: None,
+            control: sandy::RunControl::with_timeout_secs(60),
         }
     }
 
@@ -983,6 +984,7 @@ mod tests {
                 shares: false,
             },
             secret_dir: None,
+            control: sandy::RunControl::with_timeout_secs(60),
         }
     }
 

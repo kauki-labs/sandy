@@ -16,7 +16,7 @@
 use std::fmt::Display;
 
 use crate::{
-    backend::{Grants, RunSpec, VmBackend},
+    backend::{Grants, RunControl, RunSpec, VmBackend},
     egress::EgressApplier,
     share::GuestShareTransport,
 };
@@ -51,7 +51,7 @@ fn expect_ok<T, E: Display>(seam: &'static str, call: &str, res: Result<T, E>) -
 
 /// Build a `RunSpec` booting `template` with `command` and no inputs, outputs, or
 /// secrets.
-fn run_spec<'a>(template: &'a str, command: &'a [String], grants: &'a Grants) -> RunSpec<'a> {
+fn run_spec<'a>(template: &'a str, command: &'a [String], grants: &'a Grants, control: &'a RunControl) -> RunSpec<'a> {
     RunSpec {
         template,
         command,
@@ -65,6 +65,7 @@ fn run_spec<'a>(template: &'a str, command: &'a [String], grants: &'a Grants) ->
         grants,
         outcome_file: None,
         secret_dir: None,
+        control,
     }
 }
 
@@ -101,7 +102,12 @@ pub fn vmbackend_suite<B: VmBackend>(template: &str, make: impl Fn() -> B) -> Re
         shares: false,
     };
     let command = ["true".to_string()];
-    let outcome = expect_ok(SEAM, "run", backend.run(&run_spec(template, &command, &grants)))?;
+    let control = RunControl::with_timeout_secs(30);
+    let outcome = expect_ok(
+        SEAM,
+        "run",
+        backend.run(&run_spec(template, &command, &grants, &control)),
+    )?;
     require(
         SEAM,
         outcome.booted && outcome.guest_exit == Some(0) && outcome.transport_error.is_none() && !outcome.timed_out,
