@@ -86,19 +86,58 @@ pub fn read_attach_token(job_id: &str) -> Option<Vec<u8>> {
 /// failure is reported but never turns an otherwise-successful attach into
 /// a failing command — the job already ran to completion.
 pub fn write_archive(job_id: &str, archive: &ArchivePayload) {
-    let path = std::path::PathBuf::from(format!("{job_id}-transcript.log"));
-    match std::fs::write(&path, &archive.bytes) {
-        Ok(()) => println!(
-            "sandy: wrote {} bytes of archived transcript ({}) to {}",
-            archive.bytes.len(),
-            archive.content_type,
-            path.display()
-        ),
-        Err(e) => eprintln!(
-            "sandy: could not write the archived transcript to {}: {e}",
-            path.display()
-        ),
+    match create_archive_file(job_id) {
+        Ok((mut file, path)) => {
+            use std::io::Write as _;
+            match file.write_all(&archive.bytes) {
+                Ok(()) => println!(
+                    "sandy: wrote {} bytes of archived transcript ({}) to {}",
+                    archive.bytes.len(),
+                    archive.content_type,
+                    path.display()
+                ),
+                Err(e) => eprintln!(
+                    "sandy: could not write the archived transcript to {}: {e}",
+                    path.display()
+                ),
+            }
+        }
+        Err(e) => eprintln!("sandy: could not create a file for the archived transcript: {e}"),
     }
+}
+
+/// Creates `<job_id>-transcript.log` (or, if that name is already taken, the
+/// first free `<job_id>-transcript-N.log`) exclusively and `0600` (CodeRabbit
+/// findings on #347): `create_new` means this never silently truncates a
+/// prior archive sitting at the same path, and setting the mode on the
+/// `OpenOptions` itself — not a separate `chmod` after the fact — means no
+/// window where the file briefly exists at a looser (umask-determined) mode.
+/// A transcript can carry sensitive job output, so it's private from the
+/// first byte, not readable-then-restricted.
+fn create_archive_file(job_id: &str) -> std::io::Result<(std::fs::File, std::path::PathBuf)> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    const MAX_ATTEMPTS: u32 = 1000;
+    for suffix in 0..MAX_ATTEMPTS {
+        let path = if suffix == 0 {
+            std::path::PathBuf::from(format!("{job_id}-transcript.log"))
+        } else {
+            std::path::PathBuf::from(format!("{job_id}-transcript-{suffix}.log"))
+        };
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(file) => return Ok((file, path)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other(format!(
+        "no free transcript filename for job {job_id} after {MAX_ATTEMPTS} attempts"
+    )))
 }
 
 /// The outcome of feeding one byte through [`EscapeDetector`].
@@ -520,6 +559,71 @@ mod tests {
         assert_eq!(read_attach_token(&job_id), None);
     }
 
+    /// Regression (CodeRabbit finding on this PR): `create_archive_file`
+    /// must write `0600`, never a looser umask-determined mode — a
+    /// transcript can carry sensitive job output. Checked via the mode bits
+    /// cargo-nextest's one-process-per-test isolation makes a `set_current_dir`
+    /// test safe here (unlike plain `cargo test`'s shared-process model).
+    #[test]
+    fn a_created_archive_file_is_mode_0600() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().context("tempdir")?;
+        std::env::set_current_dir(dir.path()).context("set cwd")?;
+
+        let (file, _path) = create_archive_file("mode-test-job").context("create archive file")?;
+        let mode = file.metadata().context("stat the created file")?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "expected 0600, got {mode:o}");
+        Ok(())
+    }
+
+    /// Regression, the other half of the same finding: a pre-existing file
+    /// at the expected path must never be silently truncated — a second
+    /// `create_archive_file` call for the same job id falls back to a
+    /// numbered suffix instead, and the original file's content survives.
+    #[test]
+    fn a_conflicting_archive_filename_falls_back_without_clobbering() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().context("tempdir")?;
+        std::env::set_current_dir(dir.path()).context("set cwd")?;
+
+        let (mut first_file, first_path) =
+            create_archive_file("conflict-test-job").context("create the first archive file")?;
+        {
+            use std::io::Write as _;
+            first_file
+                .write_all(b"first transcript")
+                .context("write the first file's content")?;
+        }
+
+        let (_second_file, second_path) =
+            create_archive_file("conflict-test-job").context("create the second archive file")?;
+        assert_ne!(
+            first_path, second_path,
+            "a conflicting filename must fall back to a different path, not reuse the first"
+        );
+
+        let first_content = std::fs::read(&first_path).context("read back the first file")?;
+        assert_eq!(
+            first_content, b"first transcript",
+            "the first file's content must survive the second create_archive_file call untouched"
+        );
+        Ok(())
+    }
+
+    /// A bridge test's standard "no real signal/terminal" resize feed — a
+    /// channel with its sender already dropped, so `recv()` returns `None`
+    /// immediately and the resize task exits cleanly, exactly like a
+    /// non-terminal stdin under test automation ([`spawn_resize_watcher`]'s
+    /// own no-op case).
+    fn no_resize_feed() -> tokio::sync::mpsc::Receiver<(u16, u16)> {
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        rx
+    }
+
+    /// Epic #340 phase 3: a real Ctrl-D now reaches the guest (real EOF for
+    /// shells and TUIs), so it must NOT detach by itself — only the ssh-style
+    /// `~.` sequence, right after a newline, does.
+    ///
     /// Regression (CodeRabbit finding on this PR): Ctrl-D used to just end
     /// the stdin task, never signaling the main `select!` loop — the bridge
     /// then kept blocking on `read_frame` until the connection closed or
