@@ -77,6 +77,17 @@ rec {
       inherit cargoArtifacts;
       partitions = 1;
       partitionType = "count";
+      # tmux (#340): sandy-agent wraps every job in a detached tmux session
+      # behind a real PTY, so `impls/agent/tests/agent_process.rs` needs it
+      # on PATH to run at all — unlike the dev shell (which separately pulls
+      # in dev tools), this sandboxed check derivation has nothing beyond its
+      # own declared inputs. `ncurses` ships the terminfo database common
+      # `TERM` values (e.g. `xterm-256color`) resolve against, matching the
+      # same reasoning in the guest's own `environment.systemPackages`.
+      nativeBuildInputs = [
+        pkgs.tmux
+        pkgs.ncurses
+      ];
     }
   );
 
@@ -132,8 +143,15 @@ rec {
     commonArgs
     // {
       cargoArtifacts = covCraneLib.buildDepsOnly commonArgs;
-      # `cargo llvm-cov nextest` matches the `test` check's runner, so add nextest.
-      nativeBuildInputs = [ pkgs.cargo-nextest ];
+      # `cargo llvm-cov nextest` matches the `test` check's runner, so add
+      # nextest, plus tmux + ncurses for the same reason as the `test`
+      # derivation above (sandy-agent's tmux-wrapped job tests need both on
+      # PATH inside this sandboxed derivation).
+      nativeBuildInputs = [
+        pkgs.cargo-nextest
+        pkgs.tmux
+        pkgs.ncurses
+      ];
       cargoLlvmCovCommand = "nextest";
       # cargo-llvm-cov writes the report during the build phase, before crane's
       # install creates $out, so `--output-path $out/lcov.info` hits a missing

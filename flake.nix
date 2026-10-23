@@ -577,7 +577,11 @@
             # evaluate on macOS.
             ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [
               pkgs.bubblewrap
-            ];
+            ]
+            # tmux (#340): sandy-agent wraps every job in a detached tmux
+            # session behind a real PTY, so the dev shell needs it on PATH
+            # for `impls/agent/tests/agent_process.rs` to run at all.
+            ++ [ pkgs.tmux ];
           };
 
           formatter = config.treefmt.build.wrapper;

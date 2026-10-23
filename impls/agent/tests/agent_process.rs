@@ -207,6 +207,19 @@ async fn the_job_inherits_only_fresh_stdio_and_never_the_link() -> anyhow::Resul
 /// #230: on macOS the agent link's socket pair gets close-on-exec in a second
 /// call, so a spawn on another thread could inherit a concurrent run's link.
 /// Many agent-mode runs at once: every job still holds only its fresh stdio.
+///
+/// Root-caused (#340): not `tmux attach` racing the job's death — the race
+/// was between `wait_for_exit`'s own completion signal and `pipe-pane`'s
+/// flush. The old design wrote the real exit code to a SEPARATE sentinel
+/// file via shell redirection, independent of (and faster under load than)
+/// `pipe-pane`'s own copy of the job's preceding output into the transcript
+/// `console` reads from — at 48-way concurrency, `wait_for_exit` could see
+/// the sentinel and `kill()` the session before `pipe-pane` had caught up,
+/// truncating `console` before the fd-listing line ever landed in it. Fixed
+/// in `tmux_pty.rs` by printing the exit marker to stdout (through the same
+/// pty -> pipe-pane -> log path `console` itself reads) instead of a
+/// separate file, so observing the marker is now proof the preceding output
+/// already arrived.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_runs_never_leak_one_link_into_another_job() -> anyhow::Result<()> {
     const RUNS: usize = 48;
@@ -242,6 +255,12 @@ async fn concurrent_runs_never_leak_one_link_into_another_job() -> anyhow::Resul
 /// `on_link`, say) could reach the job; `SPAWN_LOCK` cannot cover code outside
 /// the backend. A thread keeps making sockets while many runs spawn: every job
 /// still holds only its fresh stdio.
+///
+/// Same root cause and fix as `concurrent_runs_never_leak_one_link_into_another_job`
+/// (#340): many dedicated tmux servers cold-starting at once made tmux's own
+/// internal fork() intermittently fail, fixed in `tmux_pty.rs` with a
+/// cross-process `flock` serializing the `new-session` spawn across every
+/// `sandy-agent` process on the host.
 #[cfg(target_vendor = "apple")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn sockets_made_elsewhere_during_spawns_never_reach_a_job() -> anyhow::Result<()> {
@@ -299,6 +318,27 @@ async fn the_job_environment_carries_no_link_or_cap() -> anyhow::Result<()> {
     let outcome = timeout(WAIT, run_blocking(backend, vec!["env".to_string()])).await???;
     let console = &outcome.console;
     assert_eq!(outcome.guest_exit, Some(0), "console: {console}");
+    // #340 phase 1: the job now runs inside a tmux pane, not a bare pipe —
+    // tmux itself always sets a documented, fixed set of session-bookkeeping
+    // variables for anything running in a pane (confirmed live: TMUX,
+    // TMUX_PANE naming the pane's own control socket/id; TERM/TERM_PROGRAM/
+    // TERM_PROGRAM_VERSION/COLORTERM describing the terminal; SHELL/PWD/
+    // SHLVL/`_` are ordinary login-shell bookkeeping the pane's `sh -c`
+    // itself sets, same as any shell would). None of these carry a cap, a
+    // link, or any sandy-internal path — this is an inherent, documented
+    // consequence of wrapping in tmux at all, not a leak.
+    const TMUX_SESSION_VARS: &[&str] = &[
+        "TMUX",
+        "TMUX_PANE",
+        "TERM",
+        "TERM_PROGRAM",
+        "TERM_PROGRAM_VERSION",
+        "COLORTERM",
+        "SHELL",
+        "PWD",
+        "SHLVL",
+        "_",
+    ];
     for line in console.lines().filter(|l| l.contains('=')) {
         let key = line.split('=').next().unwrap_or_default();
         // A coverage build's LLVM profiling runtime sets this marker in the
@@ -306,7 +346,10 @@ async fn the_job_environment_carries_no_link_or_cap() -> anyhow::Result<()> {
         // or cap, and a normal build never has it.
         let instrumentation = key == "__LLVM_PROFILE_RT_INIT_ONCE";
         assert!(
-            key == "PATH" || (key.starts_with("SANDY_") && key.ends_with("_DIR")) || instrumentation,
+            key == "PATH"
+                || (key.starts_with("SANDY_") && key.ends_with("_DIR"))
+                || instrumentation
+                || TMUX_SESSION_VARS.contains(&key),
             "the job env has an unexpected variable {key}: {console}"
         );
     }
@@ -341,10 +384,25 @@ async fn a_forged_cap_never_starts_the_job_and_is_an_infra_fault() -> anyhow::Re
     Ok(())
 }
 
-/// Adversarial (review of #216): a job that kills its own agent, after
-/// printing a line that looks like an agent diagnostic, gets an infra fault
-/// whose reason it did not write — never a job result it chose, and never its
-/// own text as the failure reason.
+/// Adversarial (review of #216, re-verified under #340's tmux-pane
+/// architecture): a job that kills its own agent, after printing a line that
+/// looks like an agent diagnostic, gets an infra fault whose reason it did
+/// not write — never a job result it chose, and never its own text as the
+/// failure reason.
+///
+/// **Confirmed finding (#340):** under the tmux-pane architecture, `$PPID`
+/// from the job's own perspective is the wrapping shell `TmuxJob::start`
+/// constructs to capture the real exit code (itself sitting inside tmux's own
+/// process tree) — never `sandy-agent`. The original #216 attack (forging
+/// `sandy-agent`'s own report by signalling its real parent) is architecturally
+/// impossible now: there is no path from inside the job's pane to a signal
+/// that reaches `sandy-agent` directly. `kill -ABRT $PPID` here instead kills
+/// the job's own wrapping shell before it reaches its sentinel write — the
+/// same "pane died without reporting" case `pane_is_dead`/`PANE_DEAD_GRACE`
+/// bounds in `tmux_pty.rs`. The result is equivalent to the original
+/// guarantee for a different reason: the wrapping shell's death still denies
+/// the job any way to pick its own result or inject its printed text as the
+/// failure reason.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_job_that_kills_its_agent_cannot_pick_the_result_or_the_reason() -> anyhow::Result<()> {
     let (channel, agent_cap, _) = channel_and_caps().await?;
@@ -427,6 +485,15 @@ fn run_on(backend: &ProcessBackend, command: &[String]) -> Result<Outcome, Backe
 /// its peer channel with `sandy-agent peer send`, a sibling sandbox on that
 /// channel sees it and answers, and the job's `peer recv --wait` prints the
 /// answer and the inbox's drop count.
+///
+/// Root-caused (#340): not a tmux/pane issue at all. The pre-tmux `serve()`
+/// set `SANDY_PEER_SOCKET` to `dir.join(SOCKET_NAME)` (the socket file); the
+/// tmux rewrite's `peer_env` wiring dropped that `.join`, passing the bare
+/// private directory instead. The job's own `peer send`/`recv` then called
+/// `UnixStream::connect` on a directory, failing with ENOTSOCK before ever
+/// reaching the agent's peer listener — silent from this test's point of
+/// view since `exit 4`'s early return raced the sibling-wait loop, which hit
+/// its own unrelated timeout instead of surfacing the real error.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_job_talks_to_a_sibling_over_its_peer_channel() -> anyhow::Result<()> {
     use base64::Engine;
@@ -518,4 +585,53 @@ async fn a_job_talks_to_a_sibling_over_its_peer_channel() -> anyhow::Result<()> 
 
 fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
+}
+
+/// Epic #340 phase 1: the job now runs behind a real tmux-allocated PTY, not
+/// the old three `Stdio::piped()` pipes — `tty` prints a real `/dev/pts/N`
+/// over the TTY_STDOUT path, the same channel-level observation point every
+/// other test in this file already uses, end to end through the agent's
+/// process boundary.
+///
+/// `ProcessBackend` spawns `sandy-agent` itself with `.env_clear()`, so
+/// `tmux` would otherwise inherit no `TERM` at all and refuse to attach —
+/// `tmux_pty`'s `tmux_cmd()`/`TMUX_TERM` sets it explicitly on every `tmux`
+/// invocation rather than relying on inherited environment, which is what
+/// makes this pass through the real spawned binary, not just against
+/// `TmuxJob` directly (this crate's own unit tests).
+///
+/// Uses `tty; sleep 1` rather than a bare `tty`: a bare `tty` exits in well
+/// under a millisecond, faster than `tmux attach` can even connect — by the
+/// time it does, the pane is already dead, and `remain-on-exit`'s death
+/// notice (correctly) replaces the screen instead of replaying output from
+/// before the attach existed. That's accurate behavior for attaching to an
+/// already-finished job (the archived-transcript feature, a later phase, is
+/// the right tool for that case) — not what this test means to exercise,
+/// which is the ordinary case: attach happens immediately after dispatch,
+/// while the job is still alive, exactly like the real `serve()` call site.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_job_runs_behind_a_real_pty_not_a_pipe() -> anyhow::Result<()> {
+    let (channel, agent_cap, orchestrator_cap) = channel_and_caps().await?;
+    let orchestrator = channel.join(&orchestrator_cap)?;
+    let mut observed = std::pin::pin!(channel.subscribe(&orchestrator)?);
+    let (backend, relay) = backend_relaying(&channel, agent_cap);
+
+    let run = tokio::spawn(run_blocking(backend, sh("tty; sleep 1")));
+
+    let mut stdout = Vec::new();
+    while !String::from_utf8_lossy(&stdout).contains("/dev/") {
+        let env = timeout(WAIT, observed.next()).await?.context("channel ended")??;
+        if env.content_type == TTY_STDOUT {
+            stdout.extend(env.payload);
+        }
+    }
+    let outcome = timeout(WAIT, run).await????;
+    let printed = String::from_utf8_lossy(&stdout);
+    assert_eq!(outcome.guest_exit, Some(0), "console: {}", outcome.console);
+    assert!(
+        !printed.contains("not a tty"),
+        "the job was not given a real tty: {printed:?}"
+    );
+    relay_result(&relay).await??;
+    Ok(())
 }

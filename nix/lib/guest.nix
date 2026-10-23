@@ -107,12 +107,15 @@ let
         "virtiofs"
         "vmw_vsock_virtio_transport"
       ];
-      # `ncurses` ships the terminfo database common `TERM` values (e.g.
-      # xterm-256color) need for correct cursor/escape-sequence handling in a
-      # TUI app (#340 phase 4). Trivial one-line rebase if phase 1's
-      # tmux-adding change lands on this same line first.
+      # tmux (#340): sandy-agent wraps every job in a detached tmux session
+      # behind a real PTY, for real terminal semantics, scrollback, and
+      # surviving independent of any one attach connection. `ncurses` ships
+      # the terminfo database common `TERM` values (e.g. xterm-256color)
+      # need for correct cursor/escape-sequence handling in a TUI app
+      # (#340 phase 4).
       environment.systemPackages = [
         pkgs.sandy-agent
+        pkgs.tmux
         pkgs.ncurses
       ];
 

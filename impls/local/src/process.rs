@@ -413,13 +413,21 @@ impl ProcessBackend {
             match verdict.recv_timeout((agent_exited + VERDICT_GRACE).saturating_duration_since(Instant::now())) {
                 Ok(AgentVerdict::JobExited(code)) => Some(code),
                 Ok(AgentVerdict::AgentFailed(why)) => {
+                    // The agent's own stdout/stderr (already captured above as
+                    // `console`, bounded by CONSOLE_TAIL_CAP) is the only place
+                    // its real failure reason lives — `why` alone is often just
+                    // "the agent ended without reporting the job's exit", which
+                    // names the symptom (relay saw no verdict), never the cause
+                    // (a panic, an early `fail()` abort, ...). Previously
+                    // discarded here, which blocked diagnosing a real sandy-agent
+                    // bug (#340) with no way to see what it actually printed.
                     return Err(BackendError::Spawn(format!(
-                        "the sandbox agent failed for `{job_program}`: {why}"
+                        "the sandbox agent failed for `{job_program}`: {why}\nagent console: {console}"
                     )));
                 }
                 Err(_) => {
                     return Err(BackendError::Spawn(format!(
-                        "the sandbox agent's relay reported no verdict for `{job_program}`"
+                        "the sandbox agent's relay reported no verdict for `{job_program}`\nagent console: {console}"
                     )));
                 }
             }
