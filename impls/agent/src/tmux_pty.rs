@@ -140,10 +140,13 @@ fn validate_tmux_safe_path(path: &Path) -> std::io::Result<&str> {
     let s = path
         .to_str()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "the path is not valid UTF-8"))?;
-    if s.contains(['\'', '"', '\\', '`', '$', '\n']) {
+    if s.contains(['\'', '"', '\\', '`', '$', '\n', '#']) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("the path contains a character unsafe for the tmux config's nested quoting: {s:?}"),
+            format!(
+                "the path contains a character unsafe for the tmux config's nested quoting, or tmux's own `#{{...}}` \
+                 format expansion: {s:?}"
+            ),
         ));
     }
     Ok(s)
@@ -389,7 +392,13 @@ impl TmuxJob {
                             if let Ok(code) = std::str::from_utf8(digits).unwrap_or("").parse::<i32>() {
                                 return Ok(code);
                             }
-                            tail.drain(..after + line_end + 1);
+                            // Not our marker: skip just this occurrence, not
+                            // the whole line — a later, real marker can sit
+                            // on the SAME line right after this decoy (no
+                            // newline between them), and draining past the
+                            // line's own newline would destroy it before it
+                            // is ever scanned.
+                            tail.drain(..start + 1);
                         }
                         // Either a complete line too long to be a real exit
                         // code, or no newline yet but already past that
@@ -626,6 +635,15 @@ mod tests {
         }
     }
 
+    /// `#{...}` is tmux's own format-expansion syntax, evaluated even inside
+    /// a value already protected by ordinary shell/tmux quoting — a crafted
+    /// path containing one could alter the `pipe-pane` command tmux itself
+    /// builds, independent of the other rejected characters.
+    #[test]
+    fn rejects_a_path_carrying_a_tmux_format_expression() {
+        assert!(validate_tmux_safe_path(Path::new("/tmp/#{pane_id}.log")).is_err());
+    }
+
     #[test]
     fn accepts_an_ordinary_path() {
         assert_eq!(
@@ -651,6 +669,30 @@ mod tests {
             .map_err(std::io::Error::other)??;
         tmux_job.kill();
         assert_eq!(exit, 9, "the decoy line must not be mistaken for the real exit marker");
+        Ok(())
+    }
+
+    /// Regression (CodeRabbit on #342, round 2): a decoy marker with no
+    /// trailing newline before `start()`'s own real marker follows right
+    /// after it, on the SAME line. Skipping the decoy must not drain past
+    /// the real marker sitting right behind it on that same line.
+    #[tokio::test]
+    async fn a_decoy_with_no_trailing_newline_does_not_swallow_the_real_marker_right_behind_it() -> std::io::Result<()>
+    {
+        let job = vec![
+            "sh".into(),
+            "-c".into(),
+            std::ffi::OsString::from(format!("printf '{EXIT_MARKER}nan'; exit 5")),
+        ];
+        let tmux_job = TmuxJob::start(&job, None)?;
+        let exit = tokio::time::timeout(Duration::from_secs(10), tmux_job.wait_for_exit())
+            .await
+            .map_err(std::io::Error::other)??;
+        tmux_job.kill();
+        assert_eq!(
+            exit, 5,
+            "the real marker right behind the decoy (no newline between them) must still be found"
+        );
         Ok(())
     }
 
