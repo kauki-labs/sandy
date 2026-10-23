@@ -26,7 +26,7 @@ use std::io::IsTerminal as _;
 
 use sandy_fabric_local::{
     agent::{TTY_STDERR, TTY_STDIN, TTY_STDOUT},
-    link::{LinkFrame, read_frame, write_frame},
+    link::{LinkError, LinkFrame, read_frame, write_frame},
 };
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 
@@ -370,7 +370,7 @@ pub async fn run_interactive<R, W>(
     status_watch: Option<tokio::sync::oneshot::Receiver<String>>,
 ) -> std::io::Result<Option<ArchivePayload>>
 where
-    R: AsyncRead + Unpin,
+    R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let _raw_mode = RawMode::enable();
@@ -389,37 +389,79 @@ where
 /// still be in flight on the data plane.
 const ARCHIVE_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Reads further frames off `read_half` for up to [`ARCHIVE_DRAIN_BUDGET`],
+/// One `read_frame` result, as forwarded by [`spawn_frame_reader`]'s
+/// background task.
+type FrameResult = Result<Option<LinkFrame>, LinkError>;
+
+/// Spawns a task that owns `read_half` exclusively and loops `read_frame` on
+/// it, forwarding each result to the returned channel — so nothing outside
+/// this task ever cancels a `read_frame` call mid-read (CodeRabbit finding on
+/// this PR): `read_frame` reads its length prefix and body in multiple steps
+/// into local buffers with no state that survives across calls, so racing it
+/// directly in a `tokio::select!` (the original, pre-#340 shape) meant a
+/// `status`/`detach` win while a read was already in progress silently
+/// discarded whatever bytes it had already pulled off the stream —
+/// permanently desyncing anything read after, exactly what
+/// [`drain_for_archive`] depends on not happening. `mpsc::Receiver::recv` is
+/// cancel-safe (a message already sent is never lost by a cancelled `recv`),
+/// so `run_interactive_inner`'s own `select!` only ever races "has the next
+/// COMPLETE frame arrived," never a read in progress.
+///
+/// Ends (and drops its sender) once `read_frame` itself ends — a clean close
+/// (`Ok(None)`) or a fault (`Err`) — after forwarding that final result; a
+/// `recv()` after the channel closes returns `None`.
+fn spawn_frame_reader<R>(mut read_half: R) -> tokio::sync::mpsc::Receiver<FrameResult>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    tokio::spawn(async move {
+        loop {
+            let frame = read_frame(&mut read_half).await;
+            let is_end = matches!(frame, Ok(None) | Err(_));
+            if tx.send(frame).await.is_err() {
+                return; // the receiver dropped; nothing left to feed
+            }
+            if is_end {
+                return;
+            }
+        }
+    });
+    rx
+}
+
+/// Reads further frames off `frame_rx` for up to [`ARCHIVE_DRAIN_BUDGET`],
 /// looking only for a trailing `LinkFrame::Archive` — called once the job's
 /// status poll already reports a terminal state, since that poll and the
 /// agent's own archive send are two independent races (CodeRabbit finding on
 /// this PR): "terminal state observed" doesn't guarantee the transcript
-/// already arrived. Stops early on a clean close or an I/O fault (nothing
-/// more to drain either way); anything other than `Archive` is ignored and
-/// does not reset the budget. Never fails `run_interactive_inner` itself —
-/// worst case, the caller just doesn't get a transcript this time.
-async fn drain_for_archive<R>(read_half: &mut R, archive: &mut Option<ArchivePayload>)
-where
-    R: AsyncRead + Unpin,
-{
+/// already arrived. Stops early on a clean close, a fault, or the channel
+/// closing (nothing more to drain either way); anything other than `Archive`
+/// is ignored and does not reset the budget. Never fails
+/// `run_interactive_inner` itself — worst case, the caller just doesn't get a
+/// transcript this time.
+async fn drain_for_archive(
+    frame_rx: &mut tokio::sync::mpsc::Receiver<FrameResult>,
+    archive: &mut Option<ArchivePayload>,
+) {
     let deadline = tokio::time::Instant::now() + ARCHIVE_DRAIN_BUDGET;
     while archive.is_none() {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             return;
         }
-        let Ok(frame) = tokio::time::timeout(remaining, read_frame(read_half)).await else {
+        let Ok(frame) = tokio::time::timeout(remaining, frame_rx.recv()).await else {
             return; // drain budget exhausted
         };
         match frame {
-            Ok(Some(LinkFrame::Archive { content_type, payload })) => {
+            Some(Ok(Some(LinkFrame::Archive { content_type, payload }))) => {
                 if let Ok(bytes) = hex::decode(&payload) {
                     *archive = Some(ArchivePayload { content_type, bytes });
                 }
                 return;
             }
-            Ok(Some(_)) => {}            // ignore anything else during the drain window
-            Ok(None) | Err(_) => return, // clean close, or a fault — nothing more to drain
+            Some(Ok(Some(_))) => {} // ignore anything else during the drain window
+            Some(Ok(None)) | Some(Err(_)) | None => return, // clean close, fault, or channel closed
         }
     }
 }
@@ -430,16 +472,17 @@ where
 /// for the connection) without a tty. Split out for exactly that reason;
 /// production code has only the one caller above.
 async fn run_interactive_inner<R, W>(
-    mut read_half: R,
+    read_half: R,
     write_half: W,
     mut status_watch: Option<tokio::sync::oneshot::Receiver<String>>,
     mut stdin_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     mut resize_rx: tokio::sync::mpsc::Receiver<(u16, u16)>,
 ) -> std::io::Result<Option<ArchivePayload>>
 where
-    R: AsyncRead + Unpin,
+    R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    let mut frame_rx = spawn_frame_reader(read_half);
     let write_half = std::sync::Arc::new(tokio::sync::Mutex::new(write_half));
     // The escape sequence (or piped EOF under test automation) must
     // explicitly signal detachment, distinct from the stdin task simply
@@ -508,7 +551,7 @@ where
     let result = loop {
         let delivered = if let Some(watch) = status_watch.as_mut() {
             tokio::select! {
-                frame = read_frame(&mut read_half) => frame,
+                frame = frame_rx.recv() => frame.unwrap_or(Ok(None)),
                 status = watch => {
                     if let Ok(status) = status {
                         print_status(&format!("sandy: job reached a terminal state ({status}); detaching"));
@@ -518,7 +561,7 @@ where
                     // — "terminal state observed" doesn't guarantee the
                     // transcript already arrived on the data plane. Give it
                     // a short bounded window before giving up on it.
-                    drain_for_archive(&mut read_half, &mut archive).await;
+                    drain_for_archive(&mut frame_rx, &mut archive).await;
                     break Ok(());
                 }
                 // A manual detach ends the bridge immediately, with no
@@ -529,7 +572,7 @@ where
             }
         } else {
             tokio::select! {
-                frame = read_frame(&mut read_half) => frame,
+                frame = frame_rx.recv() => frame.unwrap_or(Ok(None)),
                 () = detach.notified() => break Ok(()),
             }
         };
@@ -838,6 +881,96 @@ mod tests {
 
         let archive = outcome.context("expected an archive payload to have been captured")?;
         assert_eq!(archive.bytes, b"transcript bytes");
+        assert_eq!(archive.content_type, "text/plain");
+        Ok(())
+    }
+
+    /// Regression (CodeRabbit "Heavy lift" finding on this PR): the original
+    /// shape raced a bare `read_frame(&mut read_half)` directly inside the
+    /// `select!` against `status`/`detach`. `read_frame` reads its length
+    /// prefix and body across multiple `.await` points with no state
+    /// surviving between them — if `status` won while a read had already
+    /// consumed PART of a frame (e.g. the length prefix, with the body still
+    /// in flight), `tokio::select!` drops that `read_frame` future, and
+    /// whatever bytes it had already pulled off the stream were gone for
+    /// good: the next `read_frame` call (inside `drain_for_archive`) would
+    /// start reading mid-frame, desynced, and silently fail to decode the
+    /// Archive transcript. [`spawn_frame_reader`]'s background task fixes
+    /// this by giving `read_frame` exclusive, uninterrupted ownership of the
+    /// stream.
+    ///
+    /// Reproduces the exact race: manually writes a REAL `Archive` frame's
+    /// raw wire bytes (length prefix + JSON body, matching `write_frame`'s
+    /// own format) split across two separate writes, with `status` resolving
+    /// in the gap between them — so if the old bug were still present, the
+    /// `read_frame` in flight at that moment would be cancelled mid-body and
+    /// the transcript lost.
+    #[tokio::test]
+    async fn an_archive_frame_split_across_two_writes_with_status_in_the_gap_is_still_captured() -> anyhow::Result<()> {
+        let (conn_read, mut conn_read_peer) = tokio::io::duplex(4096);
+        let (conn_write, _conn_write_peer) = tokio::io::duplex(4096);
+        let (_stdin_tx, stdin_rx) = tokio::sync::mpsc::channel(8);
+        let (status_tx, status_rx) = tokio::sync::oneshot::channel();
+
+        let task = tokio::spawn(run_interactive_inner(
+            conn_read,
+            conn_write,
+            Some(status_rx),
+            stdin_rx,
+            no_resize_feed(),
+        ));
+
+        // Build the Archive frame's raw wire bytes by hand (length prefix +
+        // JSON body), the same format `write_frame` itself produces — so
+        // this test controls exactly where the split falls, something
+        // `write_frame`'s own single `write_all` call can't do.
+        let archive_frame = LinkFrame::Archive {
+            content_type: "text/plain".to_owned(),
+            payload: hex::encode(b"split transcript bytes"),
+        };
+        let body = serde_json::to_vec(&archive_frame).context("encode the archive frame")?;
+        let len = u32::try_from(body.len()).context("frame body length")?.to_be_bytes();
+        let mut wire = Vec::with_capacity(4 + body.len());
+        wire.extend_from_slice(&len);
+        wire.extend_from_slice(&body);
+
+        // Split WITHIN the body, well past the length prefix, so the real
+        // bug's failure mode (a read already past the 4-byte length and
+        // partway into `read_exact`-ing the body) is what's under test, not
+        // just a split at the length/body boundary.
+        let split_at = 4 + (body.len() / 2);
+        let (first_half, second_half) = wire.split_at(split_at);
+
+        use tokio::io::AsyncWriteExt as _;
+        conn_read_peer
+            .write_all(first_half)
+            .await
+            .context("write the first half of the split frame")?;
+        conn_read_peer.flush().await.context("flush the first half")?;
+
+        // `status` resolves while the second half is still unsent — the
+        // in-flight `read_frame` (inside spawn_frame_reader's task) is
+        // mid-body at exactly this moment.
+        status_tx
+            .send("JOB_STATUS_SUCCEEDED".to_owned())
+            .map_err(|_| anyhow::anyhow!("send status"))?;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        conn_read_peer
+            .write_all(second_half)
+            .await
+            .context("write the second half of the split frame")?;
+        conn_read_peer.flush().await.context("flush the second half")?;
+
+        let outcome = tokio::time::timeout(ARCHIVE_DRAIN_BUDGET + std::time::Duration::from_secs(1), task)
+            .await
+            .context("run_interactive_inner did not return")?
+            .context("run_interactive_inner task panicked")?
+            .context("run_interactive_inner returned an error")?;
+
+        let archive =
+            outcome.context("expected the archive payload to survive status resolving mid-read of the split frame")?;
+        assert_eq!(archive.bytes, b"split transcript bytes");
         assert_eq!(archive.content_type, "text/plain");
         Ok(())
     }
