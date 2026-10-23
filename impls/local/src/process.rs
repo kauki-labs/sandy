@@ -419,15 +419,23 @@ impl ProcessBackend {
                     // "the agent ended without reporting the job's exit", which
                     // names the symptom (relay saw no verdict), never the cause
                     // (a panic, an early `fail()` abort, ...). Previously
-                    // discarded here, which blocked diagnosing a real sandy-agent
-                    // bug (#340) with no way to see what it actually printed.
+                    // discarded entirely, which blocked diagnosing a real
+                    // sandy-agent bug (#340) with no way to see what it
+                    // actually printed. Logged separately, not folded into the
+                    // error's own message (CodeRabbit on #345): `why` is what
+                    // identifies the infra-fault band and reaches a caller's
+                    // own error handling, and console content (arbitrary job
+                    // output, however bounded) doesn't belong concatenated
+                    // into that string.
+                    tracing::debug!(box_id = %box_id, %console, "agent console at failure");
                     return Err(BackendError::Spawn(format!(
-                        "the sandbox agent failed for `{job_program}`: {why}\nagent console: {console}"
+                        "the sandbox agent failed for `{job_program}`: {why}"
                     )));
                 }
                 Err(_) => {
+                    tracing::debug!(box_id = %box_id, %console, "agent console at failure");
                     return Err(BackendError::Spawn(format!(
-                        "the sandbox agent's relay reported no verdict for `{job_program}`\nagent console: {console}"
+                        "the sandbox agent's relay reported no verdict for `{job_program}`"
                     )));
                 }
             }

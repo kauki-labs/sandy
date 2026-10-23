@@ -64,6 +64,35 @@ pub const TTY_STDIN: &str = "application/vnd.sandy.tty.stdin";
 pub const TTY_STDOUT: &str = "application/vnd.sandy.tty.stdout";
 /// `content_type` for a Tty envelope carrying the job's stderr.
 pub const TTY_STDERR: &str = "application/vnd.sandy.tty.stderr";
+/// `content_type` for a Control envelope carrying a `LinkFrame::Resize`'s
+/// `cols`/`rows`, relayed from an attach client to the agent over the shared
+/// channel (epic #340 phase 2). Payload: 4 bytes, `cols` then `rows`, each
+/// big-endian `u16`.
+pub const RESIZE_CONTROL: &str = "application/vnd.sandy.resize";
+/// `content_type` prefix an [`crate::link::LinkFrame::Archive`]'s own
+/// `content_type` is forwarded under on an Output envelope — distinguishes
+/// it from any other `MessageType::Output` traffic sharing the channel.
+pub const ARCHIVE_TRANSCRIPT: &str = "application/vnd.sandy.archive";
+
+/// Encode a resize as [`RESIZE_CONTROL`]'s 4-byte payload.
+#[must_use]
+pub fn encode_resize(cols: u16, rows: u16) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(4);
+    bytes.extend_from_slice(&cols.to_be_bytes());
+    bytes.extend_from_slice(&rows.to_be_bytes());
+    bytes
+}
+
+/// Decode [`encode_resize`]'s payload. `None` if it isn't exactly 4 bytes.
+#[must_use]
+pub fn decode_resize(payload: &[u8]) -> Option<(u16, u16)> {
+    let cols = payload.get(0..2)?;
+    let rows = payload.get(2..4)?;
+    Some((
+        u16::from_be_bytes([cols[0], cols[1]]),
+        u16::from_be_bytes([rows[0], rows[1]]),
+    ))
+}
 
 /// Bytes read per TTY chunk.
 const TTY_CHUNK: usize = 4096;
@@ -312,6 +341,11 @@ pub struct LinkAgent {
     peer_dropped: Arc<std::sync::atomic::AtomicU64>,
     /// Peer posts the relay refused (#256).
     peer_refused: Arc<std::sync::atomic::AtomicU64>,
+    /// Resize signals from the relay (epic #340 phase 2), handed out once by
+    /// [`LinkAgent::take_resizes`] — same shape as `peer_inbox`, since a
+    /// caller that never reads resizes (a job with no PTY to resize) must not
+    /// be forced to.
+    resizes: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<(u16, u16)>>>,
 }
 
 /// How many peer deliveries wait in the inbox before newer ones are dropped
@@ -348,7 +382,16 @@ impl LinkAgent {
         };
         // Refuse garbage here rather than presenting it; the relay re-verifies.
         decode_cap(&unhex(&cap, "the cap frame")?)?;
-        write_frame(&mut wr, &LinkFrame::Join { cap, channel: None }).await?;
+        write_frame(
+            &mut wr,
+            &LinkFrame::Join {
+                cap,
+                channel: None,
+                cols: None,
+                rows: None,
+            },
+        )
+        .await?;
         match read_frame(&mut rd).await? {
             Some(LinkFrame::Joined { channel: None }) => {}
             Some(LinkFrame::Refused { reason }) => return Err(AgentError::Refused(reason)),
@@ -378,6 +421,8 @@ impl LinkAgent {
                 &LinkFrame::Join {
                     cap,
                     channel: Some(channel.clone()),
+                    cols: None,
+                    rows: None,
                 },
             )
             .await?;
@@ -408,9 +453,11 @@ impl LinkAgent {
         // stdin path would make this an out-of-memory risk: bound it first. Once
         // the bridge ends, its receiver is gone and later stdin is discarded.
         let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (resize_tx, resize_rx) = tokio::sync::mpsc::unbounded_channel();
         let reader = AbortOnDrop(tokio::spawn(route_link(
             Box::new(rd),
             stdin_tx,
+            resize_tx,
             peer_tx,
             Arc::clone(&peer_dropped),
             Arc::clone(&peer_refused),
@@ -426,7 +473,38 @@ impl LinkAgent {
             peer_inbox: std::sync::Mutex::new(Some(peer_inbox)),
             peer_dropped,
             peer_refused,
+            resizes: std::sync::Mutex::new(Some(resize_rx)),
         })
+    }
+
+    /// Takes the resize-signal receiver (epic #340 phase 2), once. `None` if
+    /// already taken. Resizes queue, unbounded, until taken — same discipline
+    /// as `stdin_rx`, and for the same reason (the relay never blocks on this
+    /// agent reading them).
+    pub fn take_resizes(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<(u16, u16)>> {
+        self.resizes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// Send the job's archived transcript to the relay as one `Archive`
+    /// frame (epic #340 phase 2) — a one-shot delivery, not part of the TTY
+    /// bridge, so callable any time after bootstrap, including after
+    /// [`Self::serve_tty`] has already ended.
+    ///
+    /// # Errors
+    /// [`AgentError::Link`] if the link faults writing the frame.
+    pub async fn send_archive(&self, content_type: impl Into<String>, payload: Vec<u8>) -> Result<(), AgentError> {
+        write_frame(
+            &mut *self.port.writer.lock().await,
+            &LinkFrame::Archive {
+                content_type: content_type.into(),
+                payload: hex::encode(payload),
+            },
+        )
+        .await?;
+        Ok(())
     }
 
     /// Bridge the job's stdio over the link until `job_stdout` hits EOF, with
@@ -471,6 +549,7 @@ impl<T> Drop for AbortOnDrop<T> {
 async fn route_link(
     mut reader: Box<dyn AsyncRead + Send + Unpin>,
     stdin_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    resize_tx: tokio::sync::mpsc::UnboundedSender<(u16, u16)>,
     peer_tx: tokio::sync::mpsc::Sender<PeerDelivery>,
     peer_dropped: Arc<std::sync::atomic::AtomicU64>,
     peer_refused: Arc<std::sync::atomic::AtomicU64>,
@@ -513,6 +592,13 @@ async fn route_link(
             Ok(Some(LinkFrame::Refused { reason })) => {
                 let total = peer_refused.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                 tracing::warn!(refused = total, %reason, "the relay refused a peer post");
+            }
+            Ok(Some(LinkFrame::Resize { cols, rows })) => {
+                // Best-effort: a caller that never calls `take_resizes` (no
+                // PTY to resize) drops the receiver, and this send then just
+                // fails silently — never a reason to stop routing other
+                // frames.
+                let _ = resize_tx.send((cols, rows));
             }
             Ok(Some(other)) => tracing::warn!(kind = other.kind(), "ignoring an unexpected link frame"),
             Ok(None) => return,

@@ -709,9 +709,15 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
                 }
             };
             let (mut data_rd, mut data_wr) = tokio::io::split(data_stream);
+            // cols/rows left unset here: reading the real local terminal size
+            // (TIOCGWINSZ) and sending it on this Join is epic #340 phase 3's
+            // scope (the CLI's own raw-mode/SIGWINCH rewrite), not this
+            // phase's protocol-plumbing work.
             let join = sandy_fabric_local::link::LinkFrame::Join {
                 cap: hex::encode(&r.cap),
                 channel: None,
+                cols: None,
+                rows: None,
             };
             if let Err(e) = sandy_fabric_local::link::write_frame(&mut data_wr, &join).await {
                 eprintln!("sandy: could not present the attach cap: {e}");

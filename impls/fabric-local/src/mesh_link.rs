@@ -354,6 +354,8 @@ mod tests {
             &LinkFrame::Join {
                 cap: "deadbeef".to_string(),
                 channel: None,
+                cols: None,
+                rows: None,
             },
         )
         .await?;
@@ -365,6 +367,8 @@ mod tests {
             LinkFrame::Join {
                 cap: "deadbeef".to_string(),
                 channel: None,
+                cols: None,
+                rows: None,
             }
         );
 
@@ -547,6 +551,8 @@ mod tests {
             &LinkFrame::Join {
                 cap: "deadbeef".to_string(),
                 channel: None,
+                cols: None,
+                rows: None,
             },
         )
         .await?;
@@ -636,6 +642,8 @@ mod tests {
             &LinkFrame::Join {
                 cap: "deadbeef".to_string(),
                 channel: None,
+                cols: None,
+                rows: None,
             },
         )
         .await?;

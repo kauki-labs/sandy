@@ -28,10 +28,45 @@ use std::{
     os::{fd::AsFd, unix::process::ExitStatusExt},
     process::{ExitCode, ExitStatus},
     sync::Arc,
+    time::Duration,
 };
 
-use sandy_fabric_local::agent::LinkAgent;
+use sandy_fabric_local::agent::{ARCHIVE_TRANSCRIPT, LinkAgent};
 use tokio::io::{AsyncRead, AsyncWrite};
+
+/// How long [`serve`] waits for the archived transcript to reach the relay
+/// before giving up on it and moving on to report the job's exit regardless
+/// (CodeRabbit on #345) — generous for even a large (line-capped) transcript
+/// over a healthy link, short enough that a stuck peer doesn't stall exit
+/// reporting for long.
+const ARCHIVE_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The largest tail of the `pipe-pane` transcript either `to_stdout` or
+/// `send_archive` ever reads (CodeRabbit on #345), regardless of the file's
+/// real size: `pipe-pane` is an append-only file independent of tmux's own
+/// `history-limit` (that one only bounds the in-memory scrollback a client
+/// sees), so a long-running, chatty job's log can grow far past any
+/// configured line bound. Stays comfortably under
+/// [`sandy_fabric_local::link::MAX_FRAME`] (1 MiB) even after this gets
+/// hex-encoded (2x) and wrapped in a `LinkFrame::Archive`'s own JSON
+/// envelope — the tail, not the head, since the most recent output (and the
+/// exit marker `wait_for_exit` already found in it) is what both consumers
+/// actually need.
+const CONSOLE_TAIL_CAP: u64 = 256 * 1024;
+
+/// Read at most the last `cap` bytes of `path`, without ever loading more
+/// than that into memory regardless of the file's real size.
+async fn read_tail(path: &std::path::Path, cap: u64) -> std::io::Result<Vec<u8>> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let mut file = tokio::fs::File::open(path).await?;
+    let len = file.metadata().await?.len();
+    if len > cap {
+        file.seek(std::io::SeekFrom::Start(len - cap)).await?;
+    }
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).await?;
+    Ok(buf)
+}
 
 mod link_source;
 mod peer;
@@ -134,9 +169,28 @@ where
     let peer_socket = peer_dir.as_deref().map(|dir| dir.join(peer::SOCKET_NAME));
     let peer_env = peer_socket.as_deref().map(|socket| (peer::PEER_SOCKET_ENV, socket));
     let tmux_job = TmuxJob::start(&job, peer_env).map_err(|e| format!("starting the tmux job session: {e}"))?;
-    let (pty_read, pty_write, mut attach_child) = tmux_job
+    let (pty_read, pty_write, resizer, mut attach_child) = tmux_job
         .open_attach()
         .map_err(|e| format!("opening the attach pty: {e}"))?;
+
+    // #340 phase 2: a `Join`'s initial size and every later `Resize` frame
+    // both arrive on this one queue (`attach_relay.rs` posts the connection's
+    // initial size as an ordinary resize right after the join succeeds, so
+    // there's no separate "initial size" case to handle here) — drain it for
+    // the bridge's whole lifetime, applying each to the real pty. Queued,
+    // not dropped, by `take_resizes`'s own contract, so nothing here is lost
+    // even if this task is briefly behind; `abort()` below ends it the
+    // moment the bridge itself does, since a resize for an attach that's
+    // already gone has nothing left to apply to.
+    let resize_task = agent.take_resizes().map(|mut resizes| {
+        tokio::spawn(async move {
+            while let Some((cols, rows)) = resizes.recv().await {
+                if let Err(e) = resizer.resize(cols, rows) {
+                    eprintln!("sandy-agent: applying a terminal resize ({cols}x{rows}): {e}");
+                }
+            }
+        })
+    });
 
     // `serve_tty`/`bridge_tty` only returns once `pty_read` hits EOF — but
     // with `remain-on-exit on` (needed so a fast job's pane survives long
@@ -169,6 +223,9 @@ where
             tmux_job.kill();
             let _ = attach_child.kill();
             bridge_task.abort();
+            if let Some(resize_task) = resize_task {
+                resize_task.abort();
+            }
             return Err(format!("reading the job's real exit code: {e}"));
         }
     };
@@ -177,6 +234,9 @@ where
     // (already finished) or (in a later phase) any other concurrent attach.
     tmux_job.kill();
     let _ = attach_child.wait();
+    if let Some(resize_task) = resize_task {
+        resize_task.abort();
+    }
 
     match bridge_task.await {
         Ok(Ok(())) => {}
@@ -198,8 +258,46 @@ where
     // `ProcessBackend` already captures as `Outcome::console`. This never
     // touches the live TTY_STDOUT channel itself (only the bridge above
     // posts to that), so a genuinely attached viewer sees no duplicate.
-    if let Ok(transcript) = tokio::fs::read(tmux_job.log_path()).await {
-        to_stdout(&transcript);
+    //
+    // The same transcript is also the epic #340 phase 2 archive: sent once,
+    // best-effort, to the orchestrator-side channel.
+    //
+    // `send_archive` and `report_exit` share the link's one write mutex, and
+    // a stuck peer (stopped reading) would otherwise block `write_all`
+    // forever — but a `tokio::time::timeout` around the write itself is NOT
+    // a safe fix (CodeRabbit on #345, confirmed): `write_frame` is a length
+    // prefix, then a body, then a flush; cancelling the future mid-write
+    // doesn't un-send bytes already handed to the kernel, so a timeout can
+    // leave a real, still-open connection holding a genuinely torn frame —
+    // structurally different from an ordinary write I/O error (a broken
+    // connection, which `report_exit`'s own next write would immediately
+    // and safely re-fail on too). Writing `report_exit`'s `Exit` frame on a
+    // connection left mid-frame this way doesn't fail cleanly: the relay
+    // reads the Exit's bytes as a continued (corrupted) Archive body and
+    // fails with a decode error, losing the exit report as collateral
+    // damage — worse than the plain timeout this was meant to bound.
+    //
+    // So: an ordinary send failure (the write completed enough to observe a
+    // real I/O error) is safe to continue past, same as before — but a
+    // timeout must NOT be followed by `report_exit` over the same link.
+    // `LinkFrame::Exit`'s own absence already means "the agent failed"
+    // (INV-11); failing here cleanly, before writing anything more, is
+    // exactly that contract, not a new failure mode.
+    match read_tail(tmux_job.log_path(), CONSOLE_TAIL_CAP).await {
+        Ok(transcript) => {
+            to_stdout(&transcript);
+            match tokio::time::timeout(ARCHIVE_SEND_TIMEOUT, agent.send_archive(ARCHIVE_TRANSCRIPT, transcript)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => eprintln!("sandy-agent: sending the archived transcript: {e}"),
+                Err(_elapsed) => {
+                    return Err(format!(
+                        "sending the archived transcript timed out after {ARCHIVE_SEND_TIMEOUT:?}; the link may be \
+                         mid-frame, so the job's exit cannot be safely reported over it"
+                    ));
+                }
+            }
+        }
+        Err(e) => eprintln!("sandy-agent: reading the archived transcript: {e}"),
     }
 
     agent
