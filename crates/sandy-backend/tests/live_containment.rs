@@ -15,7 +15,7 @@
 
 use std::{process::Command, time::Duration};
 
-use sandy::{Containment, ContainmentStatus, Grants, Input, RunSpec, VmBackend};
+use sandy::{Containment, ContainmentStatus, Grants, Input, RunControl, RunSpec, VmBackend};
 use sandy_backend::{ProcessBackend, SystemdRunContainment};
 
 fn no_grants() -> Grants {
@@ -73,6 +73,7 @@ fn run_with_input(backend: &ProcessBackend, input: &std::path::Path, script: &st
     }];
     let grants = no_grants();
     let command = ["sh".to_string(), "-c".to_string(), script.to_string()];
+    let control = RunControl::with_timeout_secs(30);
     let spec = RunSpec {
         template: "process",
         command: &command,
@@ -86,6 +87,7 @@ fn run_with_input(backend: &ProcessBackend, input: &std::path::Path, script: &st
         grants: &grants,
         outcome_file: None,
         secret_dir: None,
+        control: &control,
     };
     Ok(backend.run(&spec)?)
 }
@@ -185,6 +187,7 @@ fn a_setsid_escaped_descendant_is_reaped_by_the_cgroup() -> anyhow::Result<()> {
     let marker = format!("3141.{}", std::process::id());
     let script = format!("setsid sleep {marker} & echo spawned; sleep 300");
     let command = ["sh".to_string(), "-c".to_string(), script];
+    let control = RunControl::with_timeout_secs(1);
     let spec = RunSpec {
         template: "process",
         command: &command,
@@ -198,6 +201,7 @@ fn a_setsid_escaped_descendant_is_reaped_by_the_cgroup() -> anyhow::Result<()> {
         grants: &grants,
         outcome_file: None,
         secret_dir: None,
+        control: &control,
     };
 
     let outcome = backend.run(&spec)?;
@@ -245,6 +249,7 @@ fn a_contained_job_reads_its_input_through_the_scope() -> anyhow::Result<()> {
         "-c".to_string(),
         "cat \"$SANDY_INPUTS_DIR/data\"".to_string(),
     ];
+    let control = RunControl::with_timeout_secs(30);
     let spec = RunSpec {
         template: "process",
         command: &command,
@@ -258,6 +263,7 @@ fn a_contained_job_reads_its_input_through_the_scope() -> anyhow::Result<()> {
         grants: &grants,
         outcome_file: None,
         secret_dir: None,
+        control: &control,
     };
 
     let outcome = backend.run(&spec)?;
