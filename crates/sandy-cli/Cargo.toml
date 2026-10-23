@@ -74,13 +74,18 @@ tiny_http.workspace = true
 # subcommands (#205, B4) connect over a Unix socket. `io-util` for the
 # interactive attach bridge's (#327) read/write calls; `sync` for its
 # `Mutex`/`oneshot`/`mpsc`; `time` for its background job-status watcher's
-# poll interval.
+# poll interval; `signal` for the attach bridge's SIGWINCH watcher (#340
+# phase 3) — declared explicitly here even though other workspace members
+# already enable it and cargo's feature unification would otherwise mask a
+# missing declaration: this crate's own manifest must be honest about what it
+# needs.
 tokio = { workspace = true, features = [
   "net",
   "io-util",
   "io-std",
   "sync",
   "time",
+  "signal",
 ] }
 tracing.workspace = true
 uuid.workspace = true
