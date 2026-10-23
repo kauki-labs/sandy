@@ -503,7 +503,7 @@ mod tests {
                 &mut server,
                 &OrchestratorMessage {
                     op: Some(orchestrator_message::Op::Registered(Registered {
-                        host_id: "ws01".to_owned(),
+                        host_id: "remote-host".to_owned(),
                     })),
                 },
             )
@@ -511,7 +511,7 @@ mod tests {
             Ok::<_, anyhow::Error>(received)
         });
 
-        register(&mut client, "ws01", capabilities(), TEST_TIMEOUT).await?;
+        register(&mut client, "remote-host", capabilities(), TEST_TIMEOUT).await?;
 
         let received = tokio::time::timeout(std::time::Duration::from_secs(2), orchestrator)
             .await
@@ -519,7 +519,7 @@ mod tests {
             .context("orchestrator task panicked")??;
         match received.op {
             Some(host_executor_message::Op::Register(r)) => {
-                assert_eq!(r.host_id, "ws01");
+                assert_eq!(r.host_id, "remote-host");
                 assert_eq!(r.capabilities, Some(capabilities()));
             }
             other => anyhow::bail!("expected Register, got {other:?}"),
@@ -567,7 +567,7 @@ mod tests {
             Ok::<_, anyhow::Error>(())
         });
 
-        let err = register(&mut client, "ws01", capabilities(), TEST_TIMEOUT)
+        let err = register(&mut client, "remote-host", capabilities(), TEST_TIMEOUT)
             .await
             .expect_err("a connection closed with no response must be refused, not hang or panic");
         assert_eq!(err, RegisterError::ClosedBeforeResponse);
@@ -594,7 +594,7 @@ mod tests {
             Ok::<_, anyhow::Error>(())
         });
 
-        let err = register(&mut client, "ws01", capabilities(), SHORT_TIMEOUT)
+        let err = register(&mut client, "remote-host", capabilities(), SHORT_TIMEOUT)
             .await
             .expect_err("a stalled orchestrator must time out, not hang forever");
         assert_eq!(err, RegisterError::ResponseTimedOut);
@@ -749,7 +749,7 @@ mod tests {
                 &mut server,
                 &OrchestratorMessage {
                     op: Some(orchestrator_message::Op::Registered(Registered {
-                        host_id: "ws01".to_owned(),
+                        host_id: "remote-host".to_owned(),
                     })),
                 },
             )

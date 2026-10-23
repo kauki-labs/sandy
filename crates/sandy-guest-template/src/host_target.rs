@@ -5,7 +5,7 @@
 //! `sandy-cli`'s `live_target::require_live()` (behind the `live` feature),
 //! `doctor`'s macOS builder-prereq check, and `flake_wrap`'s `--flake`
 //! auto-detection — plus, since #332, `sandy-host-executor`'s own flake/v1 VM
-//! dispatch, which runs this same pairing on ITS OWN host (e.g. ws01) rather
+//! dispatch, which runs this same pairing on ITS OWN host (e.g. the remote host) rather
 //! than the submitting Mac. Ungated — unlike `live_target` — because
 //! `--flake` resolution needs it in every build, not only the live
 //! acceptance gates.

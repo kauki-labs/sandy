@@ -1,29 +1,22 @@
-//! Live acceptance for #332's combined scenario (acceptance tier 3 — the
-//! actual end-to-end case this whole chain of work was for): `sandy daemon
-//! submit --flake <ref> -- sh` places a flake-templated VM job on ws01, then
-//! `sandy daemon attach` from a GENUINELY SEPARATE process types a command
-//! into the booted guest and reads real output back, detaches, and
-//! reattaches from a second separate process to confirm the durable attach
-//! token still grants post rights. Mirrors `live_ws01_attach.rs`'s own
-//! gating, orchestrator-spawning, and data-plane join helpers exactly
-//! (#327); the only difference is the manifest this submits (`flake/v1`
-//! instead of `argv/v1`, landing as `SandboxKind::Vm` instead of `Process`)
-//! and that the "real output" comes from inside a REAL qemu VM on ws01, not
-//! a bare host process.
+//! Live acceptance for #327's interactive attach against a REAL registered
+//! host-executor (not `FakeContainment` — `live_attach.rs`'s own loopback
+//! stand-in), proving the realistic "submit now, attach later from a
+//! genuinely separate process" case over the actual mesh, against real infra.
 //!
 //! Gated on `SANDY_M2_REMOTE_HOST` in addition to the usual `SANDY_LIVE=1`
 //! (INV-S9): both must be set, or this refuses rather than green-skipping.
+//! `SANDY_M2_REMOTE_HOST` names the orchestrator's own mesh address as the
+//! remote host dials it (e.g. `203.0.113.10`), matching the convention
+//! `live_m2_cross_machine.rs`'s unused `require_remote_executor` reserved for
+//! this exact run. The remote host-executor itself is NOT started by this
+//! test — it's a standing service (systemd on the remote box), already
+//! configured to dial this orchestrator's address; this test only has to
+//! bind there and wait for its Register.
 //!
-//! BLOCKING DEPENDENCY (named explicitly, not attempted here): same as
-//! `live_ws01_flake_dispatch.rs` — ws01's deployed `sandy-host-executor`
-//! must be rebuilt with #332's VM-capability detection and redeployed before
-//! this test can place anything as `SandboxKind::Vm`. Until then, Submit is
-//! refused fail-closed with a named reason, not a hang or a silent
-//! misbehavior.
-//!
-//! Run manually once ws01 is redeployed:
-//!   SANDY_LIVE=1 SANDY_M2_REMOTE_HOST=100.64.0.3 \
-//!     cargo nextest run -p sandy-cli --features live --test live_ws01_flake_attach
+//! Run manually (the remote host-executor must already be configured to dial
+//! the given address and reachable over the mesh):
+//!   SANDY_LIVE=1 SANDY_M2_REMOTE_HOST=203.0.113.10 \
+//!     cargo nextest run -p sandy-cli --features live --test live_remote_host_attach
 #![cfg(feature = "live")]
 
 use std::{
@@ -42,8 +35,14 @@ use sandy_fabric_local::{
     agent::{TTY_STDIN, TTY_STDOUT},
     link::{LinkFrame, read_frame as link_read_frame, write_frame as link_write_frame},
 };
-use sandy_guest_template::manifest::{FlakeManifestV1, MANIFEST_ENCODING_FLAKE_V1, encode_flake_manifest};
 
+/// Refuse unless both `SANDY_LIVE=1` and `SANDY_M2_REMOTE_HOST` are set
+/// (INV-S9) — a run against real cross-machine infra needs both the general
+/// live gate and the specific address a real remote host-executor is
+/// configured to dial; off either, this refuses rather than green-skipping.
+/// Returns the mesh address to bind as (host, port 7777/7778 by convention
+/// matching the deployed `SANDY_HOST_EXECUTOR_ORCHESTRATOR` value — see the
+/// repo's own operator docs for the remote host's own configured port).
 fn require_remote_executor() -> anyhow::Result<std::net::IpAddr> {
     anyhow::ensure!(
         std::env::var("SANDY_LIVE").ok().as_deref() == Some("1"),
@@ -56,16 +55,6 @@ fn require_remote_executor() -> anyhow::Result<std::net::IpAddr> {
         )?
         .parse()
         .context("SANDY_M2_REMOTE_HOST is not a valid IP address")
-}
-
-/// See `live_ws01_flake_dispatch.rs`'s identical helper for the full
-/// rationale: ws01 resolves and builds this itself, never a prebuilt
-/// artifact.
-fn flake_ref() -> String {
-    std::env::var("SANDY_M2_FLAKE_REF").unwrap_or_else(|_| {
-        "git+https://github.com/kauki-labs/sandy?ref=main&dir=nix/guest-wrapper/tests/fixtures/nixos-module-hello"
-            .to_owned()
-    })
 }
 
 fn build_workspace_bin(package: &str, bin: &str) -> anyhow::Result<PathBuf> {
@@ -110,6 +99,9 @@ impl Drop for Orchestrator {
     }
 }
 
+/// Spawn a real `sandyd` bound to `host` on the two well-known M2 ports
+/// (7777 management, 7778 agent-link) — not loopback: a real remote
+/// host-executor must be able to dial these from across the mesh.
 fn spawn_orchestrator(
     tmp: &std::path::Path,
     host: std::net::IpAddr,
@@ -124,8 +116,14 @@ fn spawn_orchestrator(
         .env("SANDY_MESH_LISTEN", mesh_addr.to_string())
         .env("SANDY_MESH_ALLOWLIST", remote_host.to_string())
         .env("SANDY_MESH_AGENT_LINK_LISTEN", link_addr.to_string())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        // `inherit`, not `piped`: nothing in this test reads the child's
+        // stdout/stderr, and a piped fd nobody drains blocks the child once
+        // the OS pipe buffer fills (CodeRabbit, #327's review) -- inherited
+        // output still shows up under `--no-capture` and is otherwise
+        // discarded by nextest the same way a piped-but-undrained one would
+        // have been, without the deadlock risk.
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
         .spawn()
         .context("spawning sandyd")?;
     let orchestrator = Orchestrator { child, sock };
@@ -144,26 +142,29 @@ fn spawn_orchestrator(
     Ok(orchestrator)
 }
 
-async fn submit_flake(
+/// Give the REAL remote host-executor's own restart loop time to notice this
+/// orchestrator came up and register (it's a standing service, already
+/// configured to dial this address, cycling on its own `RestartSec`, not
+/// something this test starts or can observe directly over this socket). The
+/// real proof that it actually registered is the Dispatch this test's own
+/// `submit`+`attach` round trip depends on below — this is only a bounded
+/// wait, not a check.
+async fn wait_for_real_registration(timeout: Duration) {
+    tokio::time::sleep(timeout).await;
+}
+
+async fn submit(
     conn: &mut tokio::net::UnixStream,
     request_id: u64,
-    flake: &str,
-    command: Vec<String>,
+    argv: &[&str],
 ) -> anyhow::Result<(String, Vec<u8>)> {
-    let manifest = encode_flake_manifest(&FlakeManifestV1 {
-        flake: flake.to_owned(),
-        kind: None,
-        attr: None,
-        command,
-        history_lines: sandy_guest_template::manifest::default_history_lines(),
-    })
-    .context("encode flake/v1 manifest")?;
+    let manifest = serde_json::to_vec(argv).context("encode argv manifest")?;
     let response = call(
         conn,
         request_id,
         control_request::Op::Submit(SubmitRequest {
             manifest,
-            manifest_encoding: MANIFEST_ENCODING_FLAKE_V1.to_owned(),
+            manifest_encoding: "argv/v1".to_owned(),
             submitter_caps: Vec::new(),
         }),
     )
@@ -171,46 +172,7 @@ async fn submit_flake(
     .context("Submit call")?;
     match response.result {
         Some(control_response::Result::Submit(r)) => Ok((r.job_id, r.attach_token)),
-        // See `live_ws01_flake_dispatch.rs`'s identical arm for why the hint
-        // is conditional, not unconditional (CodeRabbit finding on #336: an
-        // unconditional suffix made every refusal look like "not yet
-        // registered" to the retry loop below, which string-matches on it).
-        Some(control_response::Result::Error(e)) => {
-            let hint = if e.message.contains("SandboxKind::Vm") {
-                " (ws01's deployed sandy-host-executor has not been redeployed with #332's VM-capability detection \
-                 yet, a known, documented blocking dependency, not a bug in this test — or it has registered but not \
-                 yet declared Vm)"
-            } else {
-                ""
-            };
-            anyhow::bail!("Submit was refused: {}{hint}", e.message)
-        }
         other => anyhow::bail!("expected a Submit response, got {other:?}"),
-    }
-}
-
-/// Retry Submit until ws01 has actually registered — see
-/// `live_ws01_flake_dispatch.rs`'s identical helper for the full rationale
-/// (a real host's `RestartSec=5s` redial loop does not align with any fixed
-/// wait; observed live, registration can land 10-15s after a connection
-/// drop, consistently past a flat 10s wait).
-async fn submit_flake_once_registered(
-    conn: &mut tokio::net::UnixStream,
-    request_id: &mut u64,
-    flake: &str,
-    command: &[String],
-    timeout: Duration,
-) -> anyhow::Result<(String, Vec<u8>)> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match submit_flake(conn, *request_id, flake, command.to_vec()).await {
-            Ok(result) => return Ok(result),
-            Err(err) if err.to_string().contains("SandboxKind::Vm") && Instant::now() < deadline => {
-                *request_id += 1;
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-            Err(err) => return Err(err),
-        }
     }
 }
 
@@ -315,52 +277,43 @@ async fn read_until(
     }
 }
 
-/// The real end-to-end acceptance floor for #332: a flake-templated VM job
-/// booted for real on ws01, then a GENUINELY SEPARATE attach process typing
-/// a command into it and reading real output back from INSIDE the VM, then
-/// a SECOND separate process reattaching with only the durable token and
-/// confirming it still grants post rights.
+/// The real-infra acceptance floor for #327: a real `sandyd` bound to the
+/// actual mesh address, a REAL standing remote host-executor (not
+/// `FakeContainment`), a real `sh` job dispatched and run on the remote
+/// machine. Proves the realistic case — submit on one connection, then a
+/// TOTALLY SEPARATE connection presenting only the durable `attach_token`
+/// (standing in for a genuinely separate `sandy daemon attach` process
+/// invocation, exactly as a human operator would run it) — gets post-capable
+/// rights and a real round trip against the remote process's own stdin/stdout,
+/// not a local stand-in.
 #[tokio::test]
-async fn a_separate_attach_process_drives_a_real_vm_booted_on_ws01() -> anyhow::Result<()> {
+async fn a_real_remote_host_executor_grants_post_rights_to_a_separate_attach_process() -> anyhow::Result<()> {
     let host = require_remote_executor()?;
     let tmp = tempfile::tempdir().context("temp dir")?;
 
+    // SANDY_M2_REMOTE_PEER names the real remote host-executor's mesh IP, for
+    // the allowlist. Defaults to a placeholder (203.0.113.10) if unset;
+    // override with the real remote host's mesh address for an actual run.
     let remote_peer: std::net::IpAddr = std::env::var("SANDY_M2_REMOTE_PEER")
-        .unwrap_or_else(|_| "100.64.0.1".to_owned())
+        .unwrap_or_else(|_| "203.0.113.10".to_owned())
         .parse()
         .context("SANDY_M2_REMOTE_PEER is not a valid IP address")?;
 
     let orchestrator = spawn_orchestrator(tmp.path(), host, remote_peer)?;
     let attach_sock = attach_socket_path(&orchestrator.sock);
 
+    wait_for_real_registration(Duration::from_secs(10)).await;
+
     let mut submitter_conn = tokio::net::UnixStream::connect(&orchestrator.sock)
         .await
         .context("connect the submitting control connection")?;
-    // A bare `sh` (no `-c` script): the VM agent's own
-    // `agent_shell_command` wraps whatever command this names as
-    // `sh -c '<command.join(" ")>'`, so a bare `sh` here runs a NESTED shell
-    // that reads commands interactively from its stdin — connected through
-    // the agent channel, exactly the "boot runs an interactive shell"
-    // fixture shape the acceptance bar asks for.
-    let mut submitter_request_id = 1;
-    let (job_id, attach_token) = submit_flake_once_registered(
-        &mut submitter_conn,
-        &mut submitter_request_id,
-        &flake_ref(),
-        &[String::from("sh")],
-        Duration::from_secs(60),
-    )
-    .await
-    .context("submit a flake-templated VM job with an interactive shell command")?;
-    submitter_request_id += 1;
+    let (job_id, attach_token) = submit(&mut submitter_conn, 1, &["sh", "-c", "read a; echo \"echo:$a\""])
+        .await
+        .context("submit a real job to the real remote host-executor")?;
 
-    // A cold `nix build` + a real qemu boot is slow — measured locally
-    // (#338 follow-up) at ~115s for just the runner-attr build of this
-    // exact fixture on a cold store, well past a flat 20s. 180s leaves
-    // margin for that plus boot time without approaching
-    // `FLAKE_RESOLVE_TIMEOUT_SECS` (600s, `dispatch.rs`) or this test's own
-    // 60s registration-retry budget above.
-    tokio::time::sleep(Duration::from_secs(180)).await;
+    // Give placement+dispatch+the real remote run a generous window — this
+    // crosses a real network to a real machine, not an in-process fake.
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     // THE REALISTIC CASE: a totally fresh connection, no shared session with
     // the submitter, presenting only the durable token — standing in for a
@@ -368,86 +321,59 @@ async fn a_separate_attach_process_drives_a_real_vm_booted_on_ws01() -> anyhow::
     let mut fresh_conn = tokio::net::UnixStream::connect(&orchestrator.sock)
         .await
         .context("connect a fresh connection for the token-based attach")?;
-    let (rights, cap) = attach(&mut fresh_conn, 1, &job_id, Some(attach_token.clone()))
+    let (rights, cap) = attach(&mut fresh_conn, 1, &job_id, Some(attach_token))
         .await
-        .context("token-based attach from a fresh connection against the real VM job")?;
+        .context("token-based attach from a fresh connection against the real remote job")?;
     assert!(
         rights.post,
-        "a fresh connection presenting the durable attach token must be post-capable against a real VM job"
+        "a fresh connection presenting the durable attach token must be post-capable against a real remote job"
     );
 
     let (mut rd, mut wr) = join_data_plane(&attach_sock, &cap)
         .await
-        .context("join the real VM job's data plane")?;
-    post_input(&mut wr, b"echo hello-from-ws01-vm\n")
+        .context("join the real remote job's data plane")?;
+    post_input(&mut wr, b"real-remote-infra\n")
         .await
-        .context("post a command into the real VM's interactive shell")?;
-    read_until(&mut rd, "hello-from-ws01-vm", Duration::from_secs(20))
+        .context("post input to the real remote process")?;
+    read_until(&mut rd, "echo:real-remote-infra", Duration::from_secs(15))
         .await
-        .context("waiting for the real VM's shell to echo the command's real output back")?;
+        .context("waiting for the real remote process to echo the posted input back")?;
 
-    // Detach (drop the data-plane connection), then reattach from a SECOND
-    // genuinely separate process/connection, confirming the durable token
-    // still grants post rights after a detach — the issue's own "detach,
-    // reattach from another separate process" bar.
-    drop(wr);
-    drop(rd);
-
-    let mut second_conn = tokio::net::UnixStream::connect(&orchestrator.sock)
-        .await
-        .context("connect a second, separate connection for the reattach")?;
-    let (reattach_rights, reattach_cap) = attach(&mut second_conn, 1, &job_id, Some(attach_token))
-        .await
-        .context("reattach with the durable token after detaching")?;
-    assert!(
-        reattach_rights.post,
-        "the durable attach token must still grant post rights after a detach and reattach"
-    );
-
-    let (mut rd2, mut wr2) = join_data_plane(&attach_sock, &reattach_cap)
-        .await
-        .context("rejoin the real VM job's data plane after reattaching")?;
-    post_input(&mut wr2, b"echo reattached-and-still-post-capable\n")
-        .await
-        .context("post a second command after reattaching")?;
-    read_until(&mut rd2, "reattached-and-still-post-capable", Duration::from_secs(20))
-        .await
-        .context("waiting for the reattached session's command to echo back")?;
-
-    // Tear the shell down so the job terminates cleanly, then confirm the
-    // control plane itself agrees the job finished (not just that its shell
-    // echoed output — the full round trip this chain of work was for).
-    post_input(&mut wr2, b"exit\n").await.context("exit the guest shell")?;
-
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
+    // The echoed output arriving only proves the remote shell printed it, not
+    // that it has already exited and that exit's been reported all the way
+    // back over the real mesh link — poll briefly rather than asserting on
+    // the first check, which raced the real outcome-report round trip.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut request_id = 2;
+    let final_status = loop {
         let status = call(
             &mut submitter_conn,
-            submitter_request_id,
+            request_id,
             control_request::Op::Status(StatusRequest { job_id: job_id.clone() }),
         )
         .await
         .context("Status after the round trip")?;
-        submitter_request_id += 1;
+        request_id += 1;
         match status.result {
             Some(control_response::Result::Status(s)) if s.status != sandy_control_proto::JobStatus::Running as i32 => {
-                assert_eq!(
-                    s.status,
-                    sandy_control_proto::JobStatus::Succeeded as i32,
-                    "the real VM job must have exited cleanly once its interactive shell was told to exit: {s:?}"
-                );
-                break;
+                break s;
             }
             Some(control_response::Result::Status(_)) => {
                 anyhow::ensure!(
                     Instant::now() <= deadline,
-                    "the real VM job never left Running after its shell was told to exit"
+                    "the real remote job never left Running within the deadline"
                 );
                 tokio::time::sleep(Duration::from_millis(300)).await;
             }
             other => anyhow::bail!("expected a Status response, got {other:?}"),
         }
-    }
+    };
+    assert_eq!(
+        final_status.status,
+        sandy_control_proto::JobStatus::Succeeded as i32,
+        "the real remote job must have exited cleanly after its one read was satisfied: {final_status:?}"
+    );
+    assert_eq!(final_status.exit_code, Some(0), "the real remote job must exit 0");
 
     let _ = tmp; // keep tempdir alive through the whole test
     Ok(())

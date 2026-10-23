@@ -430,7 +430,7 @@ fn run_nix(args: &[&str], deadline: Option<std::time::Instant>) -> std::io::Resu
     // resolving a `git+https://…` flake ref — a SECOND PATH lookup this
     // process does not control directly (unlike `nix_bin()`/`qemu_bin`/
     // `virtiofsd_bin`, each used as an absolute-path `Command::new(...)`
-    // that never consults PATH at all). Confirmed on ws01 (#337 follow-up):
+    // that never consults PATH at all). Confirmed on the remote host (#337 follow-up):
     // `git` was not found even with an explicit `Environment=PATH=` set on
     // the unit itself — whatever resets this unit's own exec environment
     // (PAM, systemd session handling) does not survive to that top-level
@@ -449,7 +449,7 @@ fn run_nix(args: &[&str], deadline: Option<std::time::Instant>) -> std::io::Resu
 /// escape hatch `impls/vm`'s `SANDY_QEMU_BIN`/`SANDY_VIRTIOFSD_BIN` give
 /// their own subprocess spawns, needed on a host whose environment setup
 /// (PAM, systemd session handling, etc.) does not reliably carry the unit's
-/// own `Environment=PATH=` through to the spawned child — confirmed on ws01
+/// own `Environment=PATH=` through to the spawned child — confirmed on the remote host
 /// (#335 follow-up). Exported so `sandy-host-executor`'s capability probe
 /// checks the exact same override this call does, never a probe/dispatch-time
 /// definition drift.
