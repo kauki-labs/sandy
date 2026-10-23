@@ -1,12 +1,15 @@
-//! `sandy daemon attach`'s interactive bridge (#327): once the control
-//! connection's `Attach` request succeeds, redeem its cap on `sandyd`'s
-//! separate attach data-plane socket (`sandy_control_proto::attach_socket_path`,
-//! `docs/decisions/sandyd.md` §1 keeps the control RPC itself pure
-//! request/response — this never rides that connection) and bridge the local
-//! terminal's stdin/stdout to it: raw mode while a real terminal is attached
-//! (piped stdin, the ordinary case under test automation, bridges
-//! unmodified), until local Ctrl-D/EOF, the connection closing, or the job
-//! reaching a terminal status (polled on the now-otherwise-idle control
+//! `sandy daemon attach`'s interactive bridge (#327, ssh-style terminal
+//! handling since epic #340 phase 3): once the control connection's `Attach`
+//! request succeeds, redeem its cap on `sandyd`'s separate attach data-plane
+//! socket (`sandy_control_proto::attach_socket_path`, `docs/decisions/
+//! sandyd.md` §1 keeps the control RPC itself pure request/response — this
+//! never rides that connection) and bridge the local terminal's stdin/stdout
+//! to it: fully raw mode while a real terminal is attached (piped stdin, the
+//! ordinary case under test automation, bridges unmodified), local `SIGWINCH`
+//! posted as `Resize`, until the ssh-style `~.` escape sequence (right after
+//! a newline — see [`EscapeDetector`]; a real Ctrl-D now reaches the guest as
+//! EOF, since shells and TUIs both need that), the connection closing, or the
+//! job reaching a terminal status (polled on the now-otherwise-idle control
 //! connection, which stays open for exactly this).
 //!
 //! Detaching never touches the job itself: it only closes this attach
@@ -86,7 +89,7 @@ pub fn read_attach_token(job_id: &str) -> Option<Vec<u8>> {
 /// failure is reported but never turns an otherwise-successful attach into
 /// a failing command — the job already ran to completion.
 pub fn write_archive(job_id: &str, archive: &ArchivePayload) {
-    match create_archive_file(job_id) {
+    match create_archive_file(std::path::Path::new("."), job_id) {
         Ok((mut file, path)) => {
             use std::io::Write as _;
             match file.write_all(&archive.bytes) {
@@ -106,23 +109,30 @@ pub fn write_archive(job_id: &str, archive: &ArchivePayload) {
     }
 }
 
-/// Creates `<job_id>-transcript.log` (or, if that name is already taken, the
-/// first free `<job_id>-transcript-N.log`) exclusively and `0600` (CodeRabbit
-/// findings on #347): `create_new` means this never silently truncates a
-/// prior archive sitting at the same path, and setting the mode on the
-/// `OpenOptions` itself — not a separate `chmod` after the fact — means no
-/// window where the file briefly exists at a looser (umask-determined) mode.
-/// A transcript can carry sensitive job output, so it's private from the
-/// first byte, not readable-then-restricted.
-fn create_archive_file(job_id: &str) -> std::io::Result<(std::fs::File, std::path::PathBuf)> {
+/// Creates `<dir>/<job_id>-transcript.log` (or, if that name is already
+/// taken, the first free `<dir>/<job_id>-transcript-N.log`) exclusively and
+/// `0600` (CodeRabbit findings on #347): `create_new` means this never
+/// silently truncates a prior archive sitting at the same path, and setting
+/// the mode on the `OpenOptions` itself — not a separate `chmod` after the
+/// fact — means no window where the file briefly exists at a looser
+/// (umask-determined) mode. A transcript can carry sensitive job output, so
+/// it's private from the first byte, not readable-then-restricted.
+///
+/// Takes `dir` explicitly rather than resolving against the process's
+/// current directory (CodeRabbit finding on this PR): a test that needs an
+/// isolated destination passes its own tempdir instead of mutating the
+/// whole process's cwd via `std::env::set_current_dir`, which would race
+/// every other test running in the same process under a parallel test
+/// runner that doesn't give each test its own process.
+fn create_archive_file(dir: &std::path::Path, job_id: &str) -> std::io::Result<(std::fs::File, std::path::PathBuf)> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
     const MAX_ATTEMPTS: u32 = 1000;
     for suffix in 0..MAX_ATTEMPTS {
         let path = if suffix == 0 {
-            std::path::PathBuf::from(format!("{job_id}-transcript.log"))
+            dir.join(format!("{job_id}-transcript.log"))
         } else {
-            std::path::PathBuf::from(format!("{job_id}-transcript-{suffix}.log"))
+            dir.join(format!("{job_id}-transcript-{suffix}.log"))
         };
         match std::fs::OpenOptions::new()
             .write(true)
@@ -218,10 +228,11 @@ fn is_line_terminator(byte: u8) -> bool {
 /// terminal (piped stdin, e.g. under test automation), since there is no
 /// terminal discipline to change in the first place.
 ///
-/// `cfmakeraw` clears `OPOST`, which would also mangle output this process
-/// itself prints (not just what it relays) by turning every bare `\n` into a
-/// staircase; `output_modes` is set back to `OPOST | ONLCR` right after, so
-/// local output stays normal while input discipline goes raw.
+/// Output stays fully raw too (no local `OPOST`/`ONLCR` reset): the guest's
+/// real PTY (epic #340 phase 1) now owns terminal semantics end to end, so
+/// re-mangling output locally would corrupt a full-screen app's own cursor
+/// control. This process's own status lines print with an explicit `\r\n`
+/// instead of relying on local output processing — see [`print_status`].
 struct RawMode {
     original: Option<rustix::termios::Termios>,
 }
@@ -239,7 +250,6 @@ impl RawMode {
         };
         let mut raw = original.clone();
         raw.make_raw();
-        raw.output_modes = rustix::termios::OutputModes::OPOST | rustix::termios::OutputModes::ONLCR;
         if rustix::termios::tcsetattr(std::io::stdin(), rustix::termios::OptionalActions::Flush, &raw).is_err() {
             return Self { original: None };
         }
@@ -247,6 +257,53 @@ impl RawMode {
             original: Some(original),
         }
     }
+}
+
+/// Prints a local status line under raw mode, where bare `\n` no longer
+/// returns to column 0 (no local `OPOST`/`ONLCR`) — an explicit `\r\n`
+/// instead, flushed immediately since nothing else flushes stderr for us.
+fn print_status(line: &str) {
+    use std::io::Write as _;
+    let mut stderr = std::io::stderr();
+    let _ = write!(stderr, "{line}\r\n");
+    let _ = stderr.flush();
+}
+
+/// The local terminal's current size (`cols`, `rows`), or `None` if stdin
+/// isn't a real terminal or the ioctl fails — sent on `Join` so the first
+/// PTY sized for this connection doesn't need a separate round trip, and
+/// again on every `SIGWINCH` ([`spawn_resize_watcher`]).
+#[must_use]
+pub fn window_size() -> Option<(u16, u16)> {
+    if !std::io::stdin().is_terminal() {
+        return None;
+    }
+    let winsize = rustix::termios::tcgetwinsize(std::io::stdin()).ok()?;
+    Some((winsize.ws_col, winsize.ws_row))
+}
+
+/// Watches local `SIGWINCH` and reports the new size each time — a no-op
+/// receiver (never produces anything) if stdin isn't a real terminal, since
+/// there's no local resize to watch for under test automation.
+fn spawn_resize_watcher() -> tokio::sync::mpsc::Receiver<(u16, u16)> {
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    if std::io::stdin().is_terminal() {
+        tokio::spawn(async move {
+            let Ok(mut signals) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()) else {
+                return;
+            };
+            loop {
+                if signals.recv().await.is_none() {
+                    return;
+                }
+                let Some(size) = window_size() else { continue };
+                if tx.send(size).await.is_err() {
+                    return;
+                }
+            }
+        });
+    }
+    rx
 }
 
 impl Drop for RawMode {
@@ -285,11 +342,25 @@ fn spawn_stdin_reader() -> tokio::sync::mpsc::Receiver<Vec<u8>> {
     rx
 }
 
+/// A one-shot transcript delivered via `LinkFrame::Archive` at job end
+/// (epic #340 phase 3), decoded and handed back to the caller — this module
+/// bridges the terminal, it doesn't know the job id needed to name a
+/// sensible local file, so the caller (which does) writes it out.
+pub struct ArchivePayload {
+    /// The content type the agent tagged the transcript with.
+    pub content_type: String,
+    /// The decoded transcript bytes.
+    pub bytes: Vec<u8>,
+}
+
 /// Bridge `read_half`/`write_half` — `sandyd`'s attach data-plane connection,
 /// already past its `Join`/`Joined` handshake — to the local terminal: local
 /// stdin -> posted `TTY_STDIN`, delivered `TTY_STDOUT`/`TTY_STDERR` -> local
-/// stdout, until local Ctrl-D/EOF, the connection closing, or
-/// `status_watch` reports the job reached a terminal state.
+/// stdout, local `SIGWINCH` -> posted `Resize`, until local EOF (a real
+/// Ctrl-D now reaches the guest, per [`RawMode`]'s doc comment), the ssh-style
+/// `~.` escape sequence ([`EscapeDetector`]), the connection closing, or
+/// `status_watch` reports the job reached a terminal state. Returns any
+/// `Archive` frame the daemon delivered along the way.
 ///
 /// # Errors
 /// An I/O fault reading or writing the connection or the local terminal.
@@ -297,13 +368,20 @@ pub async fn run_interactive<R, W>(
     read_half: R,
     write_half: W,
     status_watch: Option<tokio::sync::oneshot::Receiver<String>>,
-) -> std::io::Result<()>
+) -> std::io::Result<Option<ArchivePayload>>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let _raw_mode = RawMode::enable();
-    run_interactive_inner(read_half, write_half, status_watch, spawn_stdin_reader()).await
+    run_interactive_inner(
+        read_half,
+        write_half,
+        status_watch,
+        spawn_stdin_reader(),
+        spawn_resize_watcher(),
+    )
+    .await
 }
 
 /// The bounded window [`drain_for_archive`] waits in, once the job's status
@@ -356,41 +434,55 @@ async fn run_interactive_inner<R, W>(
     write_half: W,
     mut status_watch: Option<tokio::sync::oneshot::Receiver<String>>,
     mut stdin_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
-) -> std::io::Result<()>
+    mut resize_rx: tokio::sync::mpsc::Receiver<(u16, u16)>,
+) -> std::io::Result<Option<ArchivePayload>>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let write_half = std::sync::Arc::new(tokio::sync::Mutex::new(write_half));
-    // Ctrl-D must explicitly signal detachment, distinct from the stdin task
-    // simply ending on piped EOF (dropping this without firing it) — a
-    // `Notify` latches the signal (`notify_one` stores a permit even if
-    // nothing is `.await`ing yet), unlike a oneshot, which would need
-    // re-creating per loop iteration and would fire `Err` on a dropped
-    // sender, conflating "detach" with "the stdin task ended."
+    // The escape sequence (or piped EOF under test automation) must
+    // explicitly signal detachment, distinct from the stdin task simply
+    // ending (dropping this without firing it) — a `Notify` latches the
+    // signal (`notify_one` stores a permit even if nothing is `.await`ing
+    // yet), unlike a oneshot, which would need re-creating per loop
+    // iteration and would fire `Err` on a dropped sender, conflating
+    // "detach" with "the stdin task ended."
     let detach = std::sync::Arc::new(tokio::sync::Notify::new());
     let stdin_task = {
         let write_half = std::sync::Arc::clone(&write_half);
         let detach = std::sync::Arc::clone(&detach);
         tokio::spawn(async move {
+            let mut detector = EscapeDetector::new();
             while let Some(chunk) = stdin_rx.recv().await {
-                let ctrl_d_at = chunk.iter().position(|&b| b == CTRL_D);
-                let (before, ctrl_d) = match ctrl_d_at {
-                    Some(i) => (&chunk[..i], true),
-                    None => (&chunk[..], false),
-                };
-                if !before.is_empty() {
+                let mut to_post = Vec::with_capacity(chunk.len());
+                let mut should_detach = false;
+                for byte in chunk {
+                    match detector.feed(byte) {
+                        EscapeOutcome::Forward(b) => to_post.push(b),
+                        EscapeOutcome::ForwardTwo(a, b) => {
+                            to_post.push(a);
+                            to_post.push(b);
+                        }
+                        EscapeOutcome::Hold => {}
+                        EscapeOutcome::Detach => {
+                            should_detach = true;
+                            break;
+                        }
+                    }
+                }
+                if !to_post.is_empty() {
                     let frame = LinkFrame::Post {
                         content_type: TTY_STDIN.to_string(),
-                        payload: hex::encode(before),
+                        payload: hex::encode(&to_post),
                         channel: None,
                     };
                     if write_frame(&mut *write_half.lock().await, &frame).await.is_err() {
                         return;
                     }
                 }
-                if ctrl_d {
-                    detach.notify_one(); // Ctrl-D: tell the main loop to detach
+                if should_detach {
+                    detach.notify_one();
                     return;
                 }
             }
@@ -399,15 +491,27 @@ where
             // the echo arrives, and must keep reading deliveries after).
         })
     };
+    let resize_task = {
+        let write_half = std::sync::Arc::clone(&write_half);
+        tokio::spawn(async move {
+            while let Some((cols, rows)) = resize_rx.recv().await {
+                let frame = LinkFrame::Resize { cols, rows };
+                if write_frame(&mut *write_half.lock().await, &frame).await.is_err() {
+                    return;
+                }
+            }
+        })
+    };
 
     let mut stdout = tokio::io::stdout();
+    let mut archive = None;
     let result = loop {
         let delivered = if let Some(watch) = status_watch.as_mut() {
             tokio::select! {
                 frame = read_frame(&mut read_half) => frame,
                 status = watch => {
                     if let Ok(status) = status {
-                        println!("sandy: job reached a terminal state ({status}); detaching");
+                        print_status(&format!("sandy: job reached a terminal state ({status}); detaching"));
                     }
                     // The status poll and the agent's own Archive send are
                     // two independent races (CodeRabbit finding on this PR)
@@ -443,14 +547,20 @@ where
                     break Err(e);
                 }
             }
+            Ok(Some(LinkFrame::Archive { content_type, payload })) => {
+                let Ok(bytes) = hex::decode(&payload) else {
+                    break Err(std::io::Error::other("archive frame payload was not valid hex"));
+                };
+                archive = Some(ArchivePayload { content_type, bytes });
+            }
             Ok(Some(LinkFrame::Refused { reason })) => {
-                eprintln!("sandy: {reason}");
+                print_status(&format!("sandy: {reason}"));
             }
             Ok(Some(_other)) => {
                 // Anything else on this wire would be a protocol violation
                 // from `sandyd`'s side; surfaced, not silently ignored, but
                 // not fatal to an otherwise-working bridge either.
-                eprintln!("sandy: attach: unexpected frame from the daemon");
+                print_status("sandy: attach: unexpected frame from the daemon");
             }
             Ok(None) => break Ok(()), // clean close
             Err(e) => break Err(std::io::Error::other(e)),
@@ -458,7 +568,8 @@ where
     };
 
     stdin_task.abort();
-    result
+    resize_task.abort();
+    result.map(|()| archive)
 }
 
 /// Poll `job_id`'s status on `control_connection` (the control-RPC connection
@@ -561,17 +672,18 @@ mod tests {
 
     /// Regression (CodeRabbit finding on this PR): `create_archive_file`
     /// must write `0600`, never a looser umask-determined mode — a
-    /// transcript can carry sensitive job output. Checked via the mode bits
-    /// cargo-nextest's one-process-per-test isolation makes a `set_current_dir`
-    /// test safe here (unlike plain `cargo test`'s shared-process model).
+    /// transcript can carry sensitive job output. Passes the tempdir
+    /// directly rather than mutating the process's cwd (a second CodeRabbit
+    /// finding on this same PR: `std::env::set_current_dir` affects the
+    /// whole process, racing every other test under a parallel test runner
+    /// that doesn't give each test its own process).
     #[test]
     fn a_created_archive_file_is_mode_0600() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt as _;
 
         let dir = tempfile::tempdir().context("tempdir")?;
-        std::env::set_current_dir(dir.path()).context("set cwd")?;
 
-        let (file, _path) = create_archive_file("mode-test-job").context("create archive file")?;
+        let (file, _path) = create_archive_file(dir.path(), "mode-test-job").context("create archive file")?;
         let mode = file.metadata().context("stat the created file")?.permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "expected 0600, got {mode:o}");
         Ok(())
@@ -584,10 +696,9 @@ mod tests {
     #[test]
     fn a_conflicting_archive_filename_falls_back_without_clobbering() -> anyhow::Result<()> {
         let dir = tempfile::tempdir().context("tempdir")?;
-        std::env::set_current_dir(dir.path()).context("set cwd")?;
 
         let (mut first_file, first_path) =
-            create_archive_file("conflict-test-job").context("create the first archive file")?;
+            create_archive_file(dir.path(), "conflict-test-job").context("create the first archive file")?;
         {
             use std::io::Write as _;
             first_file
@@ -596,7 +707,7 @@ mod tests {
         }
 
         let (_second_file, second_path) =
-            create_archive_file("conflict-test-job").context("create the second archive file")?;
+            create_archive_file(dir.path(), "conflict-test-job").context("create the second archive file")?;
         assert_ne!(
             first_path, second_path,
             "a conflicting filename must fall back to a different path, not reuse the first"
@@ -623,33 +734,34 @@ mod tests {
     /// Epic #340 phase 3: a real Ctrl-D now reaches the guest (real EOF for
     /// shells and TUIs), so it must NOT detach by itself — only the ssh-style
     /// `~.` sequence, right after a newline, does.
-    ///
-    /// Regression (CodeRabbit finding on this PR): Ctrl-D used to just end
-    /// the stdin task, never signaling the main `select!` loop — the bridge
-    /// then kept blocking on `read_frame` until the connection closed or
-    /// `status_watch` fired, so an operator in a real terminal had no way to
-    /// detach. Drives [`run_interactive_inner`] directly (no real tty/stdin
-    /// needed) and asserts it returns promptly once Ctrl-D is fed in.
     #[tokio::test]
-    async fn ctrl_d_detaches_promptly() -> anyhow::Result<()> {
+    async fn newline_then_tilde_dot_detaches_promptly() -> anyhow::Result<()> {
         let (conn_read, _conn_read_peer) = tokio::io::duplex(4096);
         let (conn_write, _conn_write_peer) = tokio::io::duplex(4096);
         let (stdin_tx, stdin_rx) = tokio::sync::mpsc::channel(8);
 
-        let task = tokio::spawn(run_interactive_inner(conn_read, conn_write, None, stdin_rx));
-        stdin_tx.send(vec![b'a', CTRL_D]).await.context("feed Ctrl-D")?;
+        let task = tokio::spawn(run_interactive_inner(
+            conn_read,
+            conn_write,
+            None,
+            stdin_rx,
+            no_resize_feed(),
+        ));
+        // Session start counts as "just after a newline" — detach fires
+        // without needing a real newline byte first.
+        stdin_tx.send(b"~.".to_vec()).await.context("feed ~.")?;
 
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), task)
             .await
-            .context("run_interactive_inner did not return after Ctrl-D")?
+            .context("run_interactive_inner did not return after ~.")?
             .context("run_interactive_inner task panicked")?;
         outcome.context("run_interactive_inner returned an error")?;
         Ok(())
     }
 
     /// Regression, the other half of the same finding: piped-stdin EOF (the
-    /// stdin task's `mpsc::Receiver` closing with no Ctrl-D byte ever seen)
-    /// must NOT detach — `a_separate_attach_process_gets_post_rights_via_the_persisted_token`
+    /// stdin task's `mpsc::Receiver` closing with no escape sequence ever
+    /// seen) must NOT detach — `a_separate_attach_process_gets_post_rights_via_the_persisted_token`
     /// (`live_attach.rs`) depends on exactly this: it closes stdin before the
     /// echo arrives and still expects the bridge to keep running. Proven
     /// here by closing the stdin channel immediately and asserting the loop
@@ -660,9 +772,15 @@ mod tests {
         let (conn_read, conn_read_peer) = tokio::io::duplex(4096);
         let (conn_write, _conn_write_peer) = tokio::io::duplex(4096);
         let (stdin_tx, stdin_rx) = tokio::sync::mpsc::channel(8);
-        drop(stdin_tx); // real EOF, no Ctrl-D byte ever sent
+        drop(stdin_tx); // real EOF, no escape sequence ever sent
 
-        let mut task = tokio::spawn(run_interactive_inner(conn_read, conn_write, None, stdin_rx));
+        let mut task = tokio::spawn(run_interactive_inner(
+            conn_read,
+            conn_write,
+            None,
+            stdin_rx,
+            no_resize_feed(),
+        ));
 
         let still_running = tokio::time::timeout(std::time::Duration::from_millis(200), &mut task).await;
         assert!(

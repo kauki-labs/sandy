@@ -709,15 +709,12 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
                 }
             };
             let (mut data_rd, mut data_wr) = tokio::io::split(data_stream);
-            // cols/rows left unset here: reading the real local terminal size
-            // (TIOCGWINSZ) and sending it on this Join is epic #340 phase 3's
-            // scope (the CLI's own raw-mode/SIGWINCH rewrite), not this
-            // phase's protocol-plumbing work.
+            let (cols, rows) = sandy_cli::attach::window_size().unzip();
             let join = sandy_fabric_local::link::LinkFrame::Join {
                 cap: hex::encode(&r.cap),
                 channel: None,
-                cols: None,
-                rows: None,
+                cols,
+                rows,
             };
             if let Err(e) = sandy_fabric_local::link::write_frame(&mut data_wr, &join).await {
                 eprintln!("sandy: could not present the attach cap: {e}");
@@ -742,9 +739,15 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
             // The control connection already answered Attach; it stays open,
             // otherwise idle, just to poll Status in the same session while
             // the data plane (above) carries the bridge.
-            let status_watch = sandy_cli::attach::spawn_status_watch(stream, job_id, ATTACH_STATUS_POLL_INTERVAL);
+            let status_watch =
+                sandy_cli::attach::spawn_status_watch(stream, job_id.clone(), ATTACH_STATUS_POLL_INTERVAL);
             match sandy_cli::attach::run_interactive(data_rd, data_wr, Some(status_watch)).await {
-                Ok(()) => ProcessExit::Succeeded.code(),
+                Ok(archive) => {
+                    if let Some(archive) = archive {
+                        sandy_cli::attach::write_archive(&job_id, &archive);
+                    }
+                    ProcessExit::Succeeded.code()
+                }
                 Err(e) => {
                     eprintln!("sandy: attach bridge faulted: {e}");
                     ProcessExit::InfraFault.code()
