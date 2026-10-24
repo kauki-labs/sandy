@@ -520,13 +520,6 @@ mod tests {
         let tmp = private_tmp()?;
         let base = ensure_staging_base_in(tmp.path()).context("ensure base")?;
 
-        // A privileged runner (root, or a capability that bypasses DAC
-        // checks) ignores the chmod-0o000 lockdown below, so it can't be
-        // used to force a removal failure there; the "stuck survives"
-        // assertion is skipped in that case rather than failing for a
-        // reason unrelated to the sweep logic under test.
-        let privileged = rustix::process::getuid().as_raw() == 0;
-
         // A stale dir whose child is locked down so `remove_dir_all` can't
         // recurse into it and fails for the whole `cred-stuck` tree.
         let stuck = base.join("cred-stuck");
@@ -536,6 +529,12 @@ mod tests {
         std::fs::write(blocked_child.join("file"), b"x").context("seed blocked child")?;
         std::fs::set_permissions(&blocked_child, std::fs::Permissions::from_mode(0o000))
             .context("lock down blocked child")?;
+        // root, or a non-root runner with a DAC-bypass capability (e.g.
+        // CAP_DAC_OVERRIDE), ignores the lockdown above; check whether it
+        // actually holds here, rather than inferring it from uid alone, so
+        // the "stuck survives" assertion below is skipped only when the
+        // lockdown genuinely can't force a removal failure.
+        let privileged = std::fs::read_dir(&blocked_child).is_ok();
         set_mtime_age(&stuck, Duration::from_secs(3600))?;
 
         let removable = base.join("cred-removable");
