@@ -196,18 +196,22 @@ fn decode_flake_dispatch_manifest(
 /// [`sandy::admits_untrusted`], the same gate `ProcessBackend` itself relies
 /// on, rather than a second, narrower or broader copy of the same decision.
 ///
+/// `kind` is the sandbox kind the dispatch runs on. Untrusted jobs are VM-only
+/// (#150), so an untrusted job passes only with `Vm`.
+///
 /// # Errors
 /// [`DispatchError::IsolationClassNotSatisfied`] if `required` is
-/// `Untrusted` and this host's containment does not clear
-/// [`admits_untrusted`]'s bar, or if `required` is the zero/unspecified
-/// value — an unspecified class is never treated as the weaker "trusted".
+/// `Untrusted` and [`admits_untrusted`] refuses `kind`, or if `required` is
+/// the zero/unspecified value — an unspecified class is never treated as the
+/// weaker "trusted".
 pub fn check_isolation_class(
     required: IsolationClass,
+    kind: ApiSandboxKind,
     containment_status: &ContainmentStatus,
 ) -> Result<(), DispatchError> {
     let satisfied = match required {
         IsolationClass::Trusted => true,
-        IsolationClass::Untrusted => admits_untrusted(ApiSandboxKind::Process, containment_status),
+        IsolationClass::Untrusted => admits_untrusted(kind, containment_status),
         IsolationClass::Unspecified => false,
     };
     if satisfied {
@@ -331,7 +335,13 @@ pub fn handle_dispatch(
 ) -> Result<Outcome, HandleDispatchError> {
     let status = containment.status();
     let required = IsolationClass::try_from(dispatch.required_isolation_class).unwrap_or(IsolationClass::Unspecified);
-    check_isolation_class(required, &status)?;
+    // An unknown or unset backend is checked as `Process`, the weaker kind, so
+    // an untrusted job with no usable backend is refused here, first.
+    let kind = match ProtoSandboxKind::try_from(dispatch.backend) {
+        Ok(ProtoSandboxKind::Vm) => ApiSandboxKind::Vm,
+        _ => ApiSandboxKind::Process,
+    };
+    check_isolation_class(required, kind, &status)?;
 
     let forward_back: SocketAddr = dispatch
         .forward_back
@@ -566,12 +576,13 @@ mod tests {
     #[test]
     fn a_trusted_requirement_is_always_satisfied() {
         assert_eq!(
-            check_isolation_class(IsolationClass::Trusted, &available(false)),
+            check_isolation_class(IsolationClass::Trusted, ApiSandboxKind::Process, &available(false)),
             Ok(())
         );
         assert_eq!(
             check_isolation_class(
                 IsolationClass::Trusted,
+                ApiSandboxKind::Process,
                 &ContainmentStatus::Unavailable("no systemd".to_owned())
             ),
             Ok(())
@@ -583,7 +594,7 @@ mod tests {
     /// if it were trusted-process-shaped.
     #[test]
     fn an_untrusted_requirement_is_refused_by_a_reaping_only_host() {
-        let err = check_isolation_class(IsolationClass::Untrusted, &available(false))
+        let err = check_isolation_class(IsolationClass::Untrusted, ApiSandboxKind::Process, &available(false))
             .expect_err("a plain reaper must not admit an untrusted job");
         assert_eq!(
             err,
@@ -593,17 +604,21 @@ mod tests {
         );
     }
 
+    /// Untrusted is VM-only (process-containment.md §6, #150): an isolating
+    /// process containment still refuses an untrusted job.
     #[test]
-    fn an_untrusted_requirement_is_satisfied_by_a_genuine_untrusted_boundary() {
+    fn an_untrusted_requirement_is_refused_even_by_an_isolating_process_host() {
         assert_eq!(
-            check_isolation_class(IsolationClass::Untrusted, &available(true)),
-            Ok(())
+            check_isolation_class(IsolationClass::Untrusted, ApiSandboxKind::Process, &available(true)),
+            Err(DispatchError::IsolationClassNotSatisfied {
+                required: IsolationClass::Untrusted
+            })
         );
     }
 
     #[test]
     fn an_unspecified_requirement_is_refused_not_treated_as_trusted() {
-        let err = check_isolation_class(IsolationClass::Unspecified, &available(true))
+        let err = check_isolation_class(IsolationClass::Unspecified, ApiSandboxKind::Process, &available(true))
             .expect_err("an unspecified isolation class must never default to the weaker trusted path");
         assert_eq!(
             err,
@@ -804,6 +819,83 @@ mod tests {
             ),
             "expected UnrecognizedManifestEncoding, got {err:?} — if this is UnsupportedBackend instead, the Vm \
              branch was never reached"
+        );
+        Ok(())
+    }
+
+    /// Untrusted is VM-only (#150): an untrusted `Vm` dispatch on a VM-capable
+    /// host passes the isolation gate and reaches the `Vm` branch. Host
+    /// containment is reaping-only here, because the hypervisor is the boundary
+    /// for a VM job. The non-flake encoding makes the `Vm` branch fail at decode,
+    /// which proves the gate let it through.
+    #[tokio::test]
+    async fn handle_dispatch_admits_an_untrusted_vm_dispatch_past_the_isolation_gate() -> anyhow::Result<()> {
+        let dispatch = sandy_executor_proto::Dispatch {
+            job_id: "job-1".to_string(),
+            manifest: b"irrelevant".to_vec(),
+            manifest_encoding: MANIFEST_ENCODING_ARGV_V1.to_string(), // not flake/v1
+            backend: sandy_executor_proto::SandboxKind::Vm.into(),
+            link_token: vec![0u8; REMOTE_LINK_TOKEN_LEN],
+            forward_back: "127.0.0.1:9000".to_string(),
+            required_isolation_class: IsolationClass::Untrusted.into(),
+        };
+        let containment = Box::new(sandy_test_support::FakeContainment::available());
+        let rt = tokio::runtime::Handle::current();
+
+        let err = handle_dispatch(
+            &dispatch,
+            containment,
+            PathBuf::from("/nonexistent/sandy-agent"),
+            rt,
+            true,
+            sandy_api::backend::RunControl::with_timeout_secs(60),
+        )
+        .expect_err("the non-flake encoding must be refused on the Vm branch");
+        assert!(
+            matches!(
+                &err,
+                HandleDispatchError::Dispatch(DispatchError::UnrecognizedManifestEncoding(encoding))
+                    if encoding == MANIFEST_ENCODING_ARGV_V1
+            ),
+            "expected UnrecognizedManifestEncoding from the Vm branch, got {err:?}. IsolationClassNotSatisfied means \
+             the gate checked the Vm dispatch as a Process job"
+        );
+        Ok(())
+    }
+
+    /// An untrusted dispatch with an unset backend is checked as the weaker
+    /// `Process` kind, so the isolation gate refuses it before anything else.
+    #[tokio::test]
+    async fn handle_dispatch_refuses_an_untrusted_job_with_an_unspecified_backend() -> anyhow::Result<()> {
+        let dispatch = sandy_executor_proto::Dispatch {
+            job_id: "job-1".to_string(),
+            manifest: serde_json::to_vec(&["echo"]).context("encoding the static test manifest")?,
+            manifest_encoding: MANIFEST_ENCODING_ARGV_V1.to_string(),
+            backend: sandy_executor_proto::SandboxKind::Unspecified.into(),
+            link_token: vec![0u8; REMOTE_LINK_TOKEN_LEN],
+            forward_back: "127.0.0.1:9000".to_string(),
+            required_isolation_class: IsolationClass::Untrusted.into(),
+        };
+        let containment = Box::new(sandy_test_support::FakeContainment::available());
+        let rt = tokio::runtime::Handle::current();
+
+        let err = handle_dispatch(
+            &dispatch,
+            containment,
+            PathBuf::from("/nonexistent/sandy-agent"),
+            rt,
+            true,
+            sandy_api::backend::RunControl::with_timeout_secs(60),
+        )
+        .expect_err("an untrusted job with no backend must be refused");
+        assert!(
+            matches!(
+                err,
+                HandleDispatchError::Dispatch(DispatchError::IsolationClassNotSatisfied {
+                    required: IsolationClass::Untrusted
+                })
+            ),
+            "expected IsolationClassNotSatisfied, got {err:?}"
         );
         Ok(())
     }

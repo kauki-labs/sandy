@@ -65,7 +65,7 @@ communicating, agent inside each," across macOS and an external machine), now de
   user owns their OS/shell spec; we overlay our infra. Decouples "what the machine is" from
   "it can run sandboxes."
 - **D4 — Single NixOS target now; trusted process (bwrap), no VM or agent image for stage 1.** One implementation against the seam, for M2 speed. The VM backend / untrusted
-  isolation (#150) is a later target capability, not stage 1. Stage 1 accepts **trusted jobs
+  isolation (VM-only per #150; dispatch routing in #381) is a later target capability, not stage 1. Stage 1 accepts **trusted jobs
   only**: the `bwrap` sandbox shares the host network namespace and egress is intentionally
   **unenforced** (no per-job allow-list). Egress enforcement belongs to the VM / untrusted-isolation
   seam (#150), not stage 1, and the guest-scoped Linux egress rule does not transfer to this
@@ -150,4 +150,4 @@ Plus these assertions, each of which Stage 1 cannot pass without:
   contract accommodate them; implementations come later, as new backends the host-executor
   can declare.
 - The full-OS overlay (dev-shell first).
-- The VM backend / untrusted isolation on the remote host (#150) — a later target capability.
+- The VM backend / untrusted isolation on the remote host (VM-only per #150; routing in #381) — a later target capability.
