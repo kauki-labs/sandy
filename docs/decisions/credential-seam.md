@@ -147,11 +147,10 @@ primary job-record eviction.
 
 **Consequences.** A `verify-*` dir (a short synchronous probe, no refresh
 loop) gets no heartbeat and needs none — it is always removed well within
-`MAX_TTL_SECS` on any non-crash path. Lowering `MAX_TTL_SECS` without
-widening the refresh margin accordingly would shrink the quiet window a live
-job can tolerate before its next heartbeat; the heartbeat tick
-(`DEFAULT_REFRESH_TICK_SECS`, 60s default) is far below any reasonable
-`MAX_TTL_SECS`, so this is not a practical concern at current defaults.
+`MAX_TTL_SECS` on any non-crash path. Sweep safety for a live job depends only
+on `SANDY_REFRESH_TICK_SECS` staying below `MAX_TTL_SECS` — the refresh margin
+plays no part, since the heartbeat fires every tick regardless of whether a
+refresh does. The 60s default tick satisfies that by a wide margin.
 
 **Set aside.** Tracking each staging dir's mint time in a side file (instead
 of reading mtime) was considered and rejected: it adds a second piece of
