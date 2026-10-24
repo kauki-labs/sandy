@@ -32,11 +32,11 @@ use crate::{
 
 /// STAGE-1: untrusted jobs are inexpressible (no VM/untrusted backend yet,
 /// #269 D4), so every submitted job's required isolation class is `Trusted`
-/// — this is accurate for stage-1, not a shortcut. When #150 (VM/untrusted
-/// isolation) lands, replace this default with a real per-job requirement on
-/// the submit path (a `SubmitRequest` field) — otherwise an untrusted job
-/// would silently default to `Trusted` and breach isolation. See #298, #269,
-/// #150.
+/// — this is accurate for stage-1, not a shortcut. #150 decided that untrusted
+/// jobs are VM-only. #381 replaces this default with a per-job requirement on
+/// the submit path (a `SubmitRequest` field). Do not add an untrusted submit
+/// path before #381, or an untrusted job defaults to `Trusted` and breaches
+/// isolation. See #298, #269, #381.
 const STAGE1_REQUIRED_ISOLATION_CLASS: IsolationClass = IsolationClass::Trusted;
 
 /// The `manifest_encoding` tag a flake-templated VM job uses (#332) —

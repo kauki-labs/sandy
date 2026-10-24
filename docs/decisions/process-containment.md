@@ -2,7 +2,7 @@
 title: "Decisions: process-backend containment"
 status: accepted
 project: sandy
-updated: 2026-10-15
+updated: 2026-10-25
 ---
 
 # Decisions: process-backend containment
@@ -77,8 +77,8 @@ will enforce live; the backend exposes `containment_status()` for it and for `sa
 doctor`. The untrusted-OK path is NOT delivered by the #142 confinement work (which
 is write-confinement hardening, decision #5): under its A1 `--ro-bind / /` the job
 can still READ the host filesystem and the net namespace is shared, so flipping
-`isolates_untrusted` would over-claim. The flip (A2 minimal-rootfs read-confinement
-vs VM-only-by-policy) is a separate platform threat-model decision tracked in **#150**.
+`isolates_untrusted` would over-claim. Decision #6 settles the flip question (#150):
+untrusted jobs are VM-only, so the gate refuses them on the process backend permanently.
 
 **Set aside.** Adding a trust flag to `RunSpec` and refusing inside `run()`: a
 cross-cutting change to the shared wire type with no live caller yet; the
@@ -96,13 +96,13 @@ process backend into `impls/local/`, so changes should stay localized.
 **Decision.** This record's §1-2 covered the cgroup reaping + gate + real `kill()`.
 The mount-namespace work (via `bwrap`, Linux-only) landed in **#142** as decision #5
 below: path-faithful `/run/sandy/...` mounts, hard RO, and user-bus hiding. It did
-NOT flip `admits_untrusted` — that gate-flip is a separate threat-model decision
-(#150), because the confinement leaves the host filesystem readable (decision #5).
+NOT flip `admits_untrusted`, because the confinement leaves the host filesystem
+readable (decision #5). Decision #6 rules out the flip.
 
 **Consequences.** The weak-isolation divergence from guest-shares §11 (a process
 job reads `SANDY_*_DIR`, not `/run/sandy/...`, and RO is cooperative) is closed when
 the bwrap confinement is active (decision #5), and remains the fallback when it is
-not. The gate still refuses untrusted jobs regardless, pending #150.
+not. The gate refuses untrusted jobs in both cases (decision #6).
 
 **Set aside.** Doing all three in one change: larger and harder to relocate cleanly
 into `impls/local/`, with no isolation benefit over shipping the reaping first (the
@@ -175,7 +175,44 @@ bwrap `--ro-bind` is the guest-side enforcement; the staging-base validation
 
 **Set aside.** Flipping `isolates_untrusted: true` on bwrap presence: rejected — A1's
 readable host fs + shared net is not untrusted-safe, and a caller seeing the flag
-would route untrusted work here and leak host secrets. Read-confidentiality (A2
-minimal rootfs) vs untrusted-is-VM-only is a load-bearing platform decision tracked
-in **#150**, not settled here. Unsharing the net namespace: out of scope (egress is a
-separate seam); bwrap keeps net shared.
+would route untrusted work here and leak host secrets. A2 minimal-rootfs read
+confinement: rejected by decision #6 (untrusted is VM-only). Unsharing the net
+namespace: out of scope (egress is a separate seam); bwrap keeps net shared.
+
+## 6. Untrusted jobs are VM-only; the process backend never admits them (#150)
+
+**Status:** accepted (operator decision, 2026-10-17). **Upholds:** INV-7.
+
+**Context.** Decisions #2 and #5 keep `isolates_untrusted` false on the process
+backend because its confinement does not protect the host. Under A1 the job can read
+the whole host filesystem, and it shares the host network namespace. The open
+question was whether to make the process backend untrusted-safe (A2 minimal rootfs,
+or a split capability) or to keep untrusted work on the VM backend only.
+
+**Decision.** Untrusted jobs run only on a VM backend (qemu or vfkit). The process
+backend never admits an untrusted job, with any containment, on any host.
+
+- The process backend is a verification path. It exercises the seams end to end on
+  one machine. It is not an isolation boundary.
+- The gate fails closed. `admits_untrusted` refuses an untrusted job on a `Process`
+  backend with a named refusal. It never runs the job under weaker containment.
+- `is_untrusted_boundary` stays false for every process containment. No future
+  confinement work changes this without a new decision that supersedes this one.
+- Dispatch routes untrusted work to VM executors only. sandyd's submit path does not
+  carry an isolation class yet, so every job is placed as trusted. #381 adds the
+  per-job class and the VM-only routing (see `sandyd.md` decision 15).
+
+**Consequences.** The process backend's confinement (decisions #1, #5) is hardening
+for trusted and cooperative jobs only. It does not need read confidentiality, so the
+A2 maintenance cost (a per-binary minimal rootfs) is avoided. An operator who must
+run untrusted code needs a host with a hypervisor. On macOS that is vfkit (decision
+#4). Production practice agrees: Google's Agent Compute Engine runs each untrusted
+agent session in a single-tenant microVM, not a container
+([deep dive](https://cloud.google.com/blog/topics/ai-infrastructure/agent-compute-engine-deep-dive),
+accessed 2026-10-24).
+
+**Set aside.** A2 minimal rootfs: fragile for arbitrary host binaries, because each
+binary's runtime dependencies must be in the rootfs, and it brings ongoing
+maintenance. Splitting `isolates_untrusted` into execution containment and read
+confidentiality: a seam change with no consumer, because no job needs untrusted
+execution without read confidentiality.

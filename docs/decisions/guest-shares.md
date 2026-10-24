@@ -254,7 +254,8 @@ hard (non-cooperative) read-only boundary: **delivered in #142** via a `bwrap` m
 namespace when it is available (see `process-containment.md` §5). The cooperative RO
 and `SANDY_*_DIR` host paths described above remain the fallback when bwrap/userns are
 absent. The process backend still must not run untrusted jobs: #142 is confinement
-hardening, not the untrusted gate-flip (tracked in #150).
+hardening, not an untrusted boundary: untrusted jobs are VM-only
+(`process-containment.md` §6, #150).
 
 ## 12. Host staging base validated before use (CWE-732)
 
