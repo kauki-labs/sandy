@@ -562,6 +562,7 @@ mod tests {
     use anyhow::Context;
     use futures_util::StreamExt;
     use sandy_fabric::{capauth::CapScope, types::PeerId};
+    use tokio::sync::Notify;
 
     use super::*;
     use crate::{agent::TTY_STDOUT, inmem::InMem};
@@ -974,15 +975,147 @@ mod tests {
         Ok(())
     }
 
-    /// A correctness-property test, not a reliable mutation-catching regression
-    /// test: it did NOT reproduce the pre-fix bug when checked against a
-    /// deliberately non-atomic `post()` (assign and append as two separate lock
-    /// acquisitions) — `tokio::join!` on the default test runtime doesn't force
-    /// genuine interleaving when `InMem::append` never actually yields. The fix
-    /// (holding one lock across assign-then-append) is justified by construction
-    /// — see the `next_seq` field comment — not by this test failing red first.
-    /// Kept as a positive assertion of the invariant for whoever changes this
-    /// later.
+    /// Pauses the one `append()` call whose envelope sequence equals
+    /// `pause_sequence`, so a test can land a concurrent `post()` inside the
+    /// window #106's `next_seq` lock exists to close: the window between
+    /// assigning a sequence and the backend append that stores it (#213).
+    /// `fetch`/`stream_from` delegate straight to `inner`.
+    struct PausedAppend<B> {
+        inner: B,
+        pause_sequence: u64,
+        armed: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    impl<B: ChannelBackend> ChannelBackend for PausedAppend<B> {
+        async fn append(&self, env: Envelope) -> Result<(), ChannelBackendError> {
+            if env.sequence == self.pause_sequence {
+                // `Notify::notify_one` stores a permit if nothing is waiting
+                // yet, so this handshake is race-free regardless of which
+                // side reaches its half first.
+                self.armed.notify_one();
+                self.release.notified().await;
+            }
+            self.inner.append(env).await
+        }
+
+        async fn fetch(&self, from_seq: u64) -> Result<Vec<Envelope>, ChannelBackendError> {
+            self.inner.fetch(from_seq).await
+        }
+
+        fn stream_from(
+            &self,
+            from_seq: u64,
+        ) -> impl Stream<Item = Result<Envelope, ChannelBackendError>> + Send + 'static {
+            self.inner.stream_from(from_seq)
+        }
+    }
+
+    /// The controlling half of a [`PausedAppend`]'s gate.
+    struct AppendGateHandle {
+        armed: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    impl AppendGateHandle {
+        /// Waits for the paused `append()` call to actually reach its pause
+        /// point. Bounded, so a regression that never reaches it fails the
+        /// test instead of hanging the run.
+        async fn wait_until_armed(&self) -> anyhow::Result<()> {
+            tokio::time::timeout(Duration::from_secs(5), self.armed.notified())
+                .await
+                .context("the paused append never reached its pause point before the deadline")
+        }
+
+        fn release(&self) {
+            self.release.notify_one();
+        }
+    }
+
+    fn paused_append<B>(inner: B, pause_sequence: u64) -> (PausedAppend<B>, AppendGateHandle) {
+        let armed = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        (
+            PausedAppend {
+                inner,
+                pause_sequence,
+                armed: Arc::clone(&armed),
+                release: Arc::clone(&release),
+            },
+            AppendGateHandle { armed, release },
+        )
+    }
+
+    /// Deterministic regression for #106 (#213): forces the exact interleaving
+    /// the `next_seq` field comment only justified by trace, rather than
+    /// relying on `tokio::join!` to race two posts through a backend that
+    /// never actually yields (which the test below this one could not do,
+    /// and said so). Sequence 0's append is paused mid-flight while sequence
+    /// 1's post runs concurrently; the live subscriber, parked before either
+    /// post, must see nothing until sequence 0 actually lands — proving
+    /// `next_seq` is held across the whole assign-then-append, not released
+    /// in between.
+    #[tokio::test]
+    async fn concurrent_posts_do_not_let_a_live_subscriber_skip_a_paused_entry() -> anyhow::Result<()> {
+        let id = ChannelId::from("c1");
+        let authority = TestAuthority::default();
+        let (backend, gate) = paused_append(InMem::default(), 0);
+        let channel = Arc::new(Channel::new(id.clone(), backend, authority.clone()).await?);
+        let member = channel.join(&mint(&authority, "p1", &id, full(), Some(later())))?;
+
+        // Parked before either post: nothing stored yet, so the first poll
+        // registers this follower's waker and returns Pending.
+        let mut stream = Box::pin(channel.subscribe(&member)?);
+        std::future::poll_fn(|cx| {
+            let _ = stream.as_mut().poll_next(cx);
+            Poll::Ready(())
+        })
+        .await;
+
+        let post_a = {
+            let channel = Arc::clone(&channel);
+            let member = member.clone();
+            tokio::spawn(async move { channel.post(&member, None, "text/plain", b"a".to_vec()).await })
+        };
+        gate.wait_until_armed().await.context("post_a's append")?;
+
+        let post_b = {
+            let channel = Arc::clone(&channel);
+            let member = member.clone();
+            tokio::spawn(async move { channel.post(&member, None, "text/plain", b"b".to_vec()).await })
+        };
+        // Give the scheduler a chance to drive post_b as far as the lock
+        // currently allows, before releasing post_a's paused append.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let mid_race = std::future::poll_fn(|cx| Poll::Ready(stream.as_mut().poll_next(cx))).await;
+        assert!(
+            matches!(mid_race, Poll::Pending),
+            "nothing must be visible to the live subscriber while sequence 0's append is still paused; got \
+             {mid_race:?} (a two-step assign-then-append would let post_b land sequence 1 here, which this subscriber \
+             would then skip straight to, losing sequence 0 forever)"
+        );
+
+        gate.release();
+        post_a.await.context("join post_a")?.context("post a")?;
+        post_b.await.context("join post_b")?.context("post b")?;
+
+        assert_eq!(next(&mut stream).await.payload, b"a", "sequence 0 is delivered first");
+        assert_eq!(
+            next(&mut stream).await.payload,
+            b"b",
+            "and sequence 1 follows, nothing skipped"
+        );
+        Ok(())
+    }
+
+    /// A correctness-property test for the same invariant as the harness-based
+    /// regression above, kept as a cheap smoke check: `tokio::join!` on the
+    /// default test runtime doesn't force genuine interleaving when
+    /// `InMem::append` never actually yields, so this one alone would not
+    /// have caught a reverted fix — see
+    /// `concurrent_posts_do_not_let_a_live_subscriber_skip_a_paused_entry`
+    /// (#213) for the version that forces the race deterministically.
     #[tokio::test]
     async fn concurrent_posts_are_never_lost_to_a_live_subscriber() -> anyhow::Result<()> {
         let (channel, _backend, id, authority) = new_channel().await?;
@@ -1088,6 +1221,175 @@ mod tests {
                 "every stream on a left membership must end, not just one"
             );
         }
+        Ok(())
+    }
+
+    /// Pauses the first `poll_next` call on the stream a [`PausedPollBackend`]
+    /// returns that is about to yield `Pending`, synchronously blocking the
+    /// calling thread until released. Used to land a concurrent `leave()`
+    /// inside the exact window between `CursorStream` seeing `Pending` from
+    /// the backend and storing its own waker (#184, #213).
+    ///
+    /// Blocks the thread, not the task: the pause point sits inside a
+    /// backend's synchronous `poll_next`, which cannot yield to an executor
+    /// mid-call the way an `async fn` can. The caller drives the paused poll
+    /// from a dedicated OS thread (see the test below) so the thread calling
+    /// `leave()` stays free to run concurrently; `leave()` itself never locks
+    /// the backend, so this cannot deadlock.
+    struct PollGate {
+        arrived: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+
+    impl PollGate {
+        fn pause(self) {
+            let _ = self.arrived.send(());
+            let _ = self.release.recv();
+        }
+    }
+
+    /// The controlling half of a [`PollGate`].
+    struct PollGateHandle {
+        arrived: mpsc::Receiver<()>,
+        release: mpsc::Sender<()>,
+    }
+
+    impl PollGateHandle {
+        /// Blocks until the paused poll has reached its pause point. Bounded,
+        /// so a regression that never reaches it fails the test instead of
+        /// hanging the run.
+        fn wait_until_armed(&self) -> anyhow::Result<()> {
+            self.arrived
+                .recv_timeout(Duration::from_secs(5))
+                .context("poll_next never reached its pause point before the deadline")
+        }
+
+        fn release(&self) {
+            let _ = self.release.send(());
+        }
+    }
+
+    fn poll_gate() -> (PollGate, PollGateHandle) {
+        let (arrived_tx, arrived_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        (
+            PollGate {
+                arrived: arrived_tx,
+                release: release_rx,
+            },
+            PollGateHandle {
+                arrived: arrived_rx,
+                release: release_tx,
+            },
+        )
+    }
+
+    /// Wraps a backend stream to pause (see [`PollGate`]) the first time it is
+    /// about to return `Pending`, then forwards that `Pending` on unchanged.
+    /// Boxed as a trait object rather than generic over the inner stream type,
+    /// so it doesn't need to assume the inner stream is `Unpin`.
+    struct PausedFollow {
+        inner: Pin<Box<dyn Stream<Item = Result<Envelope, ChannelBackendError>> + Send>>,
+        gate: Option<PollGate>,
+    }
+
+    impl Stream for PausedFollow {
+        type Item = Result<Envelope, ChannelBackendError>;
+
+        fn poll_next(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Option<Self::Item>> {
+            let this = self.get_mut();
+            match this.inner.as_mut().poll_next(cx) {
+                Poll::Pending => {
+                    if let Some(gate) = this.gate.take() {
+                        gate.pause();
+                    }
+                    Poll::Pending
+                }
+                other => other,
+            }
+        }
+    }
+
+    /// Wraps `inner` so its very first `stream_from()` call returns a
+    /// [`PausedFollow`] armed with `gate`. `append`/`fetch` delegate straight
+    /// to `inner`.
+    struct PausedPollBackend<B> {
+        inner: B,
+        gate: Mutex<Option<PollGate>>,
+    }
+
+    impl<B: ChannelBackend> ChannelBackend for PausedPollBackend<B> {
+        async fn append(&self, env: Envelope) -> Result<(), ChannelBackendError> {
+            self.inner.append(env).await
+        }
+
+        async fn fetch(&self, from_seq: u64) -> Result<Vec<Envelope>, ChannelBackendError> {
+            self.inner.fetch(from_seq).await
+        }
+
+        fn stream_from(
+            &self,
+            from_seq: u64,
+        ) -> impl Stream<Item = Result<Envelope, ChannelBackendError>> + Send + 'static {
+            let gate = self.gate.lock().unwrap_or_else(PoisonError::into_inner).take();
+            PausedFollow {
+                inner: Box::pin(self.inner.stream_from(from_seq)),
+                gate,
+            }
+        }
+    }
+
+    /// Deterministic regression for #184's Pending-branch fix (#213): pins the
+    /// backend-boundary half of it. Once `CursorStream` sees `Pending` from
+    /// the backend, it must re-check the membership's generation in the same
+    /// lock acquisition it uses to store its own waker, not store it
+    /// unconditionally — otherwise a `leave()` landing in the window between
+    /// "backend said Pending" and "waker stored" leaves the stream parked on
+    /// a waker nothing will ever fire, instead of ending it.
+    ///
+    /// Limit: this harness pauses at the backend's `poll_next` boundary, so it
+    /// proves the re-check exists. It cannot prove the check and the store
+    /// share one lock acquisition internally rather than two adjacent ones —
+    /// that would need a hook inside `CursorStream` itself, out of scope here
+    /// (this issue is a test-harness addition, not a `CursorStream` change).
+    #[tokio::test]
+    async fn a_leave_landing_between_pending_and_the_waker_store_ends_the_stream() -> anyhow::Result<()> {
+        let id = ChannelId::from("c1");
+        let authority = TestAuthority::default();
+        let (gate, handle) = poll_gate();
+        let backend = PausedPollBackend {
+            inner: InMem::default(),
+            gate: Mutex::new(Some(gate)),
+        };
+        let channel = Channel::new(id.clone(), backend, authority.clone()).await?;
+        let member = channel.join(&mint(&authority, "p1", &id, full(), Some(later())))?;
+        let mut stream = Box::pin(channel.subscribe(&member)?);
+
+        // `poll_next` is plain and synchronous (it only ever touches
+        // `std::sync::Mutex`es, no tokio primitive), so it runs on its own
+        // thread with no runtime needed — same discipline as the drop-bomb
+        // tests above, and for the same reason: a regression here would hang
+        // this one thread, not the whole test run.
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let waker = Waker::noop().clone();
+            let mut cx = std::task::Context::from_waker(&waker);
+            let poll = stream.as_mut().poll_next(&mut cx);
+            let _ = tx.send(poll);
+        });
+
+        handle.wait_until_armed().context("the paused poll_next")?;
+        channel.leave(&member);
+        handle.release();
+
+        let poll = rx
+            .recv_timeout(Duration::from_secs(5))
+            .context("poll_next did not return after leave() + release")?;
+        assert!(
+            matches!(poll, Poll::Ready(None)),
+            "a leave() landing in this exact window must end the stream, not leave it parked forever on a waker \
+             nothing will ever fire; got {poll:?}"
+        );
         Ok(())
     }
 
