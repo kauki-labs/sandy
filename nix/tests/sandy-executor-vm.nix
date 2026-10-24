@@ -181,6 +181,20 @@ testPkgs.testers.runNixOSTest {
     # further.
     print(machine.succeed("systemd-analyze security sandy-executor.service --no-pager --threshold=27"))
 
+    # #300: the unit actually carries the configured `TimeoutStopSec`, so a
+    # `systemctl stop` gives an in-flight job's own shutdown fail-safe
+    # (crates/sandy-host-executor/src/run.rs) the full window it's sized for
+    # before systemd SIGKILLs the process — not the default ~90s, shorter
+    # than a job's own STAGE1_TIMEOUT_SECS budget. This proves the unit's
+    # wiring only; it does NOT exercise a real dispatched job surviving a
+    # stop (that needs a fake orchestrator driving an actual `Dispatch` into
+    # this VM, a bigger harness not built here — see docs/decisions/
+    # sandyd.md §14's "Follow-up (#300)").
+    unit_file = machine.succeed("systemctl cat sandy-executor.service")
+    assert "TimeoutStopSec=330s" in unit_file, (
+        f"expected the unit file to carry TimeoutStopSec=330s — got:\n{unit_file}"
+    )
+
     # The inference chain this assertion pair relies on, spelled out since
     # it's indirect: reaching the dial step ⟹ `detect_register_capabilities`
     # returned `Ok` (main.rs hard-exits on `Err`, no fallthrough to the dial

@@ -831,6 +831,42 @@ poll loop already uses). `dial_and_forward`'s own separate `DIAL_TIMEOUT`
 for the dial itself is unchanged — only the connected phase's bound moved
 from flat to live.
 
+**Follow-up (#300): an explicit requested shutdown now cancels, not just bounds, a still-running
+job — and the nix unit's `TimeoutStopSec` is sized to match.** The grace-deadline fail-safe above
+(CodeRabbit on #344) only ever bounded an unbounded wait; it never asked a job to stop faster than
+its own deadline. That left a real gap for `systemctl stop sandy-executor`: with `TimeoutStopSec`
+unset (systemd's ~90s default), systemd SIGKILLs the whole process before a job's own
+up-to-`STAGE1_TIMEOUT_SECS` (300s) budget elapses — killing the job's `RunControl`/supervision
+context out from under it with no clean cancel, and leaving its sandbox (reparented under
+`user@<uid>.service` by design, see `nix/modules/sandy-executor.nix`) running with nothing left
+tracking it — the #135 host-orphan problem recreated at the service-management level.
+
+**Decision.** On `DispatchLoopExit::Shutdown` specifically — never `Closed`/`Faulted`, where
+nothing races a systemd kill and the existing drain-to-completion behavior is still correct — the
+fail-safe now also calls `cancel()` on every still-running job's `RunControl`, alongside the
+existing deadline bound. `nix/modules/sandy-executor.nix`'s unit now sets an explicit
+`TimeoutStopSec`, derived from `STAGE1_TIMEOUT_SECS` plus a cleanup-overhead margin, as a
+defense-in-depth second layer so systemd itself never races the cancellation before it can
+complete.
+
+**Consequences.** The process backend (`impls/local`) picks up a cancellation on its next 10ms
+poll tick, so a cancelled job tears down within its own drain grace (≤ ~10s) regardless of how far
+from its deadline it was — comfortably inside the new `TimeoutStopSec`. The known gap named above
+(VM backends not honoring `RunControl` at all) is UNCHANGED by this fix: a VM-backed job still
+runs to its static `spec.timeout_secs` budget regardless of `cancel()`. That is exactly why
+`TimeoutStopSec` is derived from the full `STAGE1_TIMEOUT_SECS` budget rather than the process
+backend's fast-cancel case alone — it has to cover whichever backend actually ran.
+
+**Verification.** Unit-tested: `shutdown_cancels_every_still_running_jobs_run_control` and
+`a_closed_connection_does_not_cancel_a_still_running_job`
+(`crates/sandy-host-executor/src/run.rs`) pin the cancel-on-`Shutdown`-only logic against the
+existing `RunControl`/queue abstractions, no real systemd needed. **Not verified live:** whether
+`systemctl stop` against a real dispatched job avoids the orphan end to end on a real boot — that
+needs a nixosTest driving an actual `Dispatch` into the hardened unit, then asserting the sandbox's
+cgroup is gone once the stop completes. That harness is a bigger lift than this change built (it
+needs a fake orchestrator inside the test VM to drive a real dispatch); tracked as an open
+follow-up, not fabricated as done here.
+
 ## 15. Orchestrator placement wiring: one shared `HostRegistry`, stage-1 required-class default, dispatch from the real submit path (#298)
 
 **Status:** implemented.

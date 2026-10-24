@@ -288,6 +288,32 @@ in
         Restart = "on-failure";
         RestartSec = "5s";
 
+        # #300: `systemctl stop`/a service restart sends SIGTERM, then SIGKILLs
+        # the whole process once `TimeoutStopSec` elapses. Left unset, systemd
+        # defaults to ~90s — shorter than an in-flight job's own budget
+        # (`STAGE1_TIMEOUT_SECS = 300` in
+        # crates/sandy-host-executor/src/dispatch.rs), so a SIGKILL could land
+        # mid-job, before `run_dispatch_loop`'s shutdown fail-safe
+        # (crates/sandy-host-executor/src/run.rs) even finishes cancelling and
+        # draining it — killing the executor's own supervision of the job
+        # without a clean cancel, and (since a dispatched job's sandbox is
+        # deliberately reparented under `user@<uid>.service`, see this
+        # module's own doc comment above) leaving it running with nothing
+        # left tracking it.
+        #
+        # 300s (STAGE1_TIMEOUT_SECS, the worst case either backend can still
+        # be running at the moment SIGTERM arrives) + 30s overhead for the
+        # shutdown fail-safe's own teardown once a job ends — covers
+        # `impls/local`'s longest per-run grace period (`VERDICT_GRACE` =
+        # 10s, agent mode's wait for the relay's verdict) plus reaping,
+        # console-drain, and staging wipe, with headroom to spare. A
+        # VM-backed job ignores `cancel()` today (a known gap, not addressed
+        # by this change — see docs/decisions/sandyd.md §14's "Follow-up
+        # (#300)") and so still runs to this same `STAGE1_TIMEOUT_SECS`
+        # budget regardless of shutdown, which this value already covers.
+        # Keep in sync with `STAGE1_TIMEOUT_SECS` if that constant changes.
+        TimeoutStopSec = "330s";
+
         # Least privilege around the host-executor process itself; the
         # sandboxed job it dispatches is bwrap/cgroup-confined separately
         # (security review, #299/sandy-73: since `systemd-run --user --scope`
