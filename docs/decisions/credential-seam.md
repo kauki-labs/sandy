@@ -118,3 +118,115 @@ in code.
 gains the controller user's own account (not just another local user) can read
 the trust material directly; perms-only protection does not defend against
 that. Operators who need that guarantee supply it at the deployment layer.
+
+## 6. `gc` reclaims a leaked `cred-*`/`verify-*` staging dir by mtime, heartbeated while live
+
+**Status:** accepted.
+
+**Context.** `sandy run --credential` and the trust-root verify probe stage a
+token into a fresh, randomly named private dir under the sandy staging base
+(`cred-<hex>` / `verify-<hex>`, #174's `private_staging_dir`). A drop guard
+removes it on normal exit or panic, but SIGKILL or a crash before the guard
+runs leaves it behind, still holding a token valid for up to its mint TTL
+(#195).
+
+**Decision.** `sandy gc` sweeps `cred-*`/`verify-*` dirs under the staging base
+whose mtime is at least `MAX_TTL_SECS` old
+(`sandy_fsutil::sweep_stale_staging_dirs`). Age is read from the dir's own
+mtime rather than a separately tracked start time, so the same mechanism that
+ages a leaked dir out also has to not age out a live one. That requirement is
+not automatic: the mid-run refresh thread only rewrites `cred_dir`'s file when
+`should_refresh` actually fires, and a provider's native token TTL (GitHub
+~1h) can exceed `MAX_TTL_SECS` (3000s) between refreshes, so a job quiet that
+long would otherwise look abandoned. The refresh loop therefore heartbeats
+`cred_dir`'s mtime every tick, independent of whether a refresh fires; a
+`kill -9`'d process stops ticking, so a genuinely leaked dir still ages out
+and gets swept. `safe_heartbeat_tick` refuses a `SANDY_REFRESH_TICK_SECS` at
+or above `MAX_TTL_SECS - CALL_DEADLINE` and falls back to the 60s default,
+leaving margin for one stalled adapter call between heartbeats, not just
+bounding the tick in isolation (the Consequences below has the full
+accounting and the one residual this doesn't close). The sweep is
+best-effort within `gc`: a staging base that cannot be validated or listed is
+logged and skipped, and a single entry that can't be read, stat'ed, or
+removed is skipped and retried on a later `gc`, neither ever blocking `gc`'s
+primary job-record eviction.
+
+The heartbeat alone isn't enough: `refresh_loop` touches `cred_dir`'s mtime
+and then calls `refresh_once` synchronously, so a stalled `GithubAdapter`
+call would block the next heartbeat for as long as the call hangs. Every
+GitHub API call this adapter makes (mint, refresh, revoke, uninstall, the
+permissions read) runs under one wall-clock deadline,
+`CALL_DEADLINE = MAX_TTL_SECS / 2` (`with_call_deadline`), covering the whole
+call including whatever retries octocrab makes internally, not a per-attempt
+figure that needs multiplying out by a retry count. If octocrab's own
+retries don't finish inside that one deadline, the call just fails, the same
+outcome as any other failed mint/refresh/revoke. A single deadline around
+the whole call also means a connection that keeps resetting a per-read
+timeout by trickling bytes still can't outlast it, wherever in the
+connect/read/retry sequence the stall happens.
+
+**Consequences.** `refresh_once` makes two sequential adapter calls on its
+live path, `refresh` then `revoke` of the superseded token (and on its
+stage-failure path, `refresh` then `revoke_orphan`, still two), so the
+relevant safety margin is not one `CALL_DEADLINE` but the gap between
+`cred_dir` mtime touches across the whole `refresh_once` call. That margin
+rests on a side effect, not just the heartbeat: staging the refreshed token
+creates and renames a temp file inside `cred_dir` between the `refresh` and
+`revoke` calls, which touches the dir's own mtime the same way the heartbeat
+does, resetting the gap. So the worst case per loop iteration is
+`CALL_DEADLINE + tick`, not `2 * CALL_DEADLINE`: whichever of `refresh` or
+`revoke` stalls to the deadline, the stage write already reset the clock
+before or after it. At the 60s default tick that is about 1560s, safely
+under `MAX_TTL_SECS`. Of the two residuals specific to this two-call margin,
+one is now closed (`safe_heartbeat_tick` caps against it) and one remains
+open, tracked separately; the last two bullets below are separate residuals
+of their own, not part of this margin:
+
+- **Closed.** `safe_heartbeat_tick` used to cap the tick to below
+  `MAX_TTL_SECS` alone (up to 2999s), not to something that keeps
+  `CALL_DEADLINE + tick` under `MAX_TTL_SECS`; a `SANDY_REFRESH_TICK_SECS`
+  configured near that ceiling could push the worst case to about 4500s,
+  over the sweep threshold. `CALL_DEADLINE` is now exported through the
+  facade (`sandy::CALL_DEADLINE`) so `safe_heartbeat_tick` (in `sandy-cli`)
+  caps against `MAX_TTL_SECS - CALL_DEADLINE` instead, keeping
+  `CALL_DEADLINE + tick` under the sweep threshold for any accepted tick.
+- **Open, tracked as [#364](https://github.com/kauki-labs/sandy/issues/364).**
+  The stage write's own create step can itself fail before touching
+  `cred_dir` (drawing a temp name, or the temp file's own `O_CREAT|O_EXCL`
+  write, on `ENOSPC`/`EDQUOT`/`EMFILE`). On that narrow path, `refresh_once`
+  goes `refresh` then `revoke_orphan` with no stage touch in between, so
+  both calls' worst cases compound: `2 * CALL_DEADLINE + tick`, about 3060s
+  at the default tick, just over the sweep threshold. It needs both a
+  stage-create failure and two full-length stalls at once. Closing it means
+  restructuring `refresh_once`'s stage-failure path to touch `cred_dir`'s
+  mtime before calling `revoke_orphan`, a bigger change than this decision's
+  timeout sizing; deferred to the linked issue.
+- Retrying a non-idempotent `POST /access_tokens` was already possible under
+  octocrab's default retry policy before this change; nothing here
+  introduces it. If GitHub completes the mint but the response is lost to a
+  retry, or `CALL_DEADLINE` cuts a request off after GitHub already
+  processed it, that token is unrecorded by `self.mints`, so neither the
+  retry's own eventual success nor a later `revoke_orphan` call can revoke
+  the earlier one; it lives out its native ~1h expiry instead of the shorter
+  TTL the seam otherwise enforces.
+- Once the job's run finishes, the refresh thread stops on the next loop
+  check of the stop signal, not mid-call. An in-flight `refresh_once` delays
+  that check, and the explicit teardown revoke, by up to the same windows
+  above. Harmless: the job has already finished by then, so a `gc` sweep
+  racing the job's own teardown cleanup only removes the same files
+  slightly early.
+
+A `verify-*` dir (the trust-root verify probe) gets no heartbeat, but the
+permissions-read call happens before the probe dir even exists, so it never
+counts against the dir's lifetime. On the probe's success path, `mint` (at
+most `CALL_DEADLINE`) is followed by the same stage touch, then `revoke` (at
+most `CALL_DEADLINE`), so the dir is at most about `CALL_DEADLINE` old when
+verify removes it, well under `MAX_TTL_SECS`. On the stage-failure branch it
+can reach `2 * CALL_DEADLINE` (`MAX_TTL_SECS`), but no token is staged in
+the dir by then, so a sweep there is harmless, and verify's own best-effort
+`remove_dir_all` cleans it up regardless.
+
+**Set aside.** Tracking each staging dir's mint time in a side file (instead
+of reading mtime) was considered and rejected: it adds a second piece of
+state that could drift from the dir's actual contents, where mtime is already
+authoritative and free.

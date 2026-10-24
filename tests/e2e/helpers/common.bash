@@ -18,12 +18,16 @@ setup() {
   if [ ! -x "$SANDY_BIN" ]; then
     skip "sandy binary not found at $SANDY_BIN (build: nix develop -c cargo build -p sandy-cli, or pass SANDY_BIN)"
   fi
-  # Isolate all host state: the journal ($SANDY_HOME) and the credential trust
-  # roots ($XDG_CONFIG_HOME/sandy). Tests never touch the real ~/.config/sandy.
+  # Isolate all host state: the journal ($SANDY_HOME), the credential trust
+  # roots ($XDG_CONFIG_HOME/sandy), and the sandy staging base
+  # ($TMPDIR/sandy, #195's gc sweep lives under it). Tests never touch the
+  # real ~/.config/sandy or /tmp/sandy. BATS_TEST_TMPDIR is per-test and
+  # bats removes it itself, so teardown here never rm -rf's $TMPDIR.
   SANDY_HOME="$(mktemp -d)"
   export SANDY_HOME
   XDG_CONFIG_HOME="$(mktemp -d)"
   export XDG_CONFIG_HOME
+  export TMPDIR="$BATS_TEST_TMPDIR"
 }
 
 teardown() {

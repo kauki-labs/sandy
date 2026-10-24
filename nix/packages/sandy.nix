@@ -42,6 +42,14 @@ let
     buildInputs = lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
       pkgs.libiconv
     ];
+
+    # A usable CA bundle for any test that builds a TLS-capable HTTP client
+    # (#195 follow-up: cred_github's regression test), even one that only
+    # ever talks to a local plain-HTTP test server: octocrab's rustls
+    # connector loads system root certs unconditionally at client-build
+    # time, regardless of the target URI's scheme, and the build sandbox
+    # has no system cert store of its own.
+    SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
   };
 
   cargoArtifacts = craneLib.buildDepsOnly commonArgs;

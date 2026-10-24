@@ -9,7 +9,11 @@
 //! trusts — a world-writable or wrong-owner base is rejected, never silently
 //! chmod'd back into shape.
 
-use std::path::{Path, PathBuf};
+use std::{
+    io,
+    path::{Path, PathBuf},
+    time::{Duration, SystemTime},
+};
 
 use rustix::fs::{Mode, OFlags, fstat, mkdirat, open, openat};
 
@@ -175,6 +179,91 @@ fn validate_parent_sticky(parent_mode: u32) -> Result<(), String> {
 
 fn staging_err(action: &'static str, path: &Path, err: &rustix::io::Errno) -> FsError {
     FsError::io(action, path, *err)
+}
+
+/// Staging-dir name prefixes a drop guard removes on normal exit or panic
+/// (`cred-` from [`crate::private_staging_dir`]'s credential staging, `verify-`
+/// from the trust-root verify probe): SIGKILL or a crash before that guard
+/// runs can leave one behind holding a live token (#195).
+pub const STALE_STAGING_PREFIXES: &[&str] = &["cred-", "verify-"];
+
+/// Remove every directory directly under `base` whose name starts with one of
+/// `prefixes` and whose mtime is at least `max_age` old (#195).
+///
+/// A `cred-*`/`verify-*` dir is normally removed by its owner's drop guard on
+/// every exit path, a panic included; SIGKILL or a crash before that guard
+/// runs can leave one behind holding a token that stays valid for up to its
+/// mint TTL. Sweeping by mtime rather than a separately tracked start time
+/// means a dir that is still genuinely in use keeps a fresh mtime and is
+/// never swept: a `cred-*` dir is heartbeated every refresh tick for exactly
+/// this reason (`sandy-cli`'s `refresh_loop`), since a provider's native token
+/// TTL can outlast `max_age` between actual refreshes.
+///
+/// Returns the removed directories' names (not full paths).
+///
+/// # Errors
+///
+/// Returns `io::Error` only if `base` itself cannot be listed. Every
+/// per-entry failure is best-effort and never aborts the sweep: an entry
+/// that disappears between listing and stat'ing (a concurrent owner's own
+/// cleanup, or a removal racing this sweep) is skipped, and an entry that
+/// fails to remove outright (e.g. a permission error) is left in place for
+/// a later sweep rather than blocking the rest of this one.
+pub fn sweep_stale_staging_dirs(base: &Path, prefixes: &[&str], max_age: Duration) -> io::Result<Vec<String>> {
+    sweep_stale_staging_dirs_with(base, prefixes, max_age, |path| std::fs::remove_dir_all(path))
+}
+
+/// [`sweep_stale_staging_dirs`]'s body, with the removal step injected so a
+/// test can force a specific entry's removal to fail deterministically,
+/// rather than relying on `read_dir`'s unspecified enumeration order or a
+/// real filesystem permission to produce that failure.
+fn sweep_stale_staging_dirs_with(
+    base: &Path,
+    prefixes: &[&str],
+    max_age: Duration,
+    mut remove: impl FnMut(&Path) -> io::Result<()>,
+) -> io::Result<Vec<String>> {
+    let now = SystemTime::now();
+    let mut removed = Vec::new();
+    for entry in std::fs::read_dir(base)? {
+        // Best-effort: a per-entry read failure (a raced removal, a transient
+        // I/O error) is skipped rather than aborting the sweep. Only a
+        // failure to list `base` itself does that (see `# Errors` above).
+        let Ok(entry) = entry else { continue };
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue; // Non-UTF-8 name: never one of our own prefixed dirs.
+        };
+        if !prefixes.iter().any(|prefix| name.starts_with(prefix)) {
+            continue;
+        }
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue, // raced a concurrent cleanup
+            // Best-effort: any other per-entry stat failure is skipped too.
+            Err(_) => continue,
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        let Ok(modified) = metadata.modified() else {
+            continue; // mtime unsupported/unreadable on this platform: skip, never abort.
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            continue; // mtime in the future (clock skew): treat as fresh, never sweep.
+        };
+        if age < max_age {
+            continue;
+        }
+        match remove(&entry.path()) {
+            Ok(()) => removed.push(name),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            // Best-effort: one unremovable stale dir must never block
+            // sweeping the rest, or a single stuck entry could wedge every
+            // later gc run indefinitely.
+            Err(_) => {}
+        }
+    }
+    Ok(removed)
 }
 
 #[cfg(test)]
@@ -369,5 +458,185 @@ mod tests {
             "a non-world-writable parent must pass"
         );
         assert!(validate_parent_sticky(0o700).is_ok(), "a private parent must pass");
+    }
+
+    /// Back-date `dir`'s mtime by `age` so a sweep sees it as that old.
+    fn set_mtime_age(dir: &Path, age: Duration) -> anyhow::Result<()> {
+        let past = SystemTime::now() - age;
+        std::fs::File::open(dir)
+            .context("open dir to back-date mtime")?
+            .set_modified(past)
+            .context("set_modified")?;
+        Ok(())
+    }
+
+    /// #195: a `cred-*` dir left behind past its mint TTL (SIGKILL or a crash
+    /// skipped the owner's drop guard) must be swept.
+    #[test]
+    fn sweep_removes_a_stale_cred_dir_past_max_age() -> anyhow::Result<()> {
+        let tmp = private_tmp()?;
+        let base = ensure_staging_base_in(tmp.path()).context("ensure base")?;
+        let stale = base.join("cred-deadbeef");
+        std::fs::create_dir(&stale).context("create stale cred dir")?;
+        set_mtime_age(&stale, Duration::from_secs(3600))?;
+
+        let removed =
+            sweep_stale_staging_dirs(&base, STALE_STAGING_PREFIXES, Duration::from_secs(3000)).context("sweep")?;
+
+        assert_eq!(removed, vec!["cred-deadbeef".to_string()]);
+        assert!(!stale.exists(), "the stale dir must be removed");
+        Ok(())
+    }
+
+    /// #195 (MUST NOT): a `verify-*` dir younger than `max_age` is a live,
+    /// in-progress stage and must survive the sweep.
+    #[test]
+    fn sweep_keeps_a_fresh_verify_dir() -> anyhow::Result<()> {
+        let tmp = private_tmp()?;
+        let base = ensure_staging_base_in(tmp.path()).context("ensure base")?;
+        let fresh = base.join("verify-cafef00d");
+        std::fs::create_dir(&fresh).context("create fresh verify dir")?;
+
+        let removed =
+            sweep_stale_staging_dirs(&base, STALE_STAGING_PREFIXES, Duration::from_secs(3000)).context("sweep")?;
+
+        assert!(removed.is_empty(), "a fresh dir must not be swept: {removed:?}");
+        assert!(fresh.exists(), "the fresh dir must survive");
+        Ok(())
+    }
+
+    /// A dir under `base` that does not carry a swept prefix must never be
+    /// touched, however old. The sweep is scoped to credential staging only.
+    #[test]
+    fn sweep_ignores_an_unrelated_stale_dir() -> anyhow::Result<()> {
+        let tmp = private_tmp()?;
+        let base = ensure_staging_base_in(tmp.path()).context("ensure base")?;
+        let unrelated = base.join("sandyd");
+        std::fs::create_dir(&unrelated).context("create unrelated dir")?;
+        set_mtime_age(&unrelated, Duration::from_secs(3600))?;
+
+        let removed =
+            sweep_stale_staging_dirs(&base, STALE_STAGING_PREFIXES, Duration::from_secs(3000)).context("sweep")?;
+
+        assert!(removed.is_empty(), "an unrelated dir must never be swept: {removed:?}");
+        assert!(unrelated.exists(), "the unrelated dir must survive");
+        Ok(())
+    }
+
+    /// Best-effort: a stale dir whose removal fails must not stop the sweep
+    /// from removing a later stale dir in the same pass. Deterministic and
+    /// order-independent: `read_dir`'s enumeration order is unspecified, so
+    /// failing a *named* entry would not be enough. If the entry meant to
+    /// stay stuck happened to be visited second, a broken (non-continuing)
+    /// loop would already have removed the other one and returned before
+    /// ever reaching the named failure, passing by luck either way. Instead
+    /// the FIRST entry the loop attempts, whichever it is, is made to fail;
+    /// a continuing loop still reaches the second entry in either order, a
+    /// broken one never does.
+    #[test]
+    fn sweep_continues_past_an_injected_removal_failure() -> anyhow::Result<()> {
+        let tmp = private_tmp()?;
+        let base = ensure_staging_base_in(tmp.path()).context("ensure base")?;
+
+        let first = base.join("cred-aaa");
+        std::fs::create_dir(&first).context("create first stale dir")?;
+        set_mtime_age(&first, Duration::from_secs(3600))?;
+
+        let second = base.join("cred-bbb");
+        std::fs::create_dir(&second).context("create second stale dir")?;
+        set_mtime_age(&second, Duration::from_secs(3600))?;
+
+        let attempted = std::cell::RefCell::new(Vec::new());
+        let removed = sweep_stale_staging_dirs_with(&base, STALE_STAGING_PREFIXES, Duration::from_secs(3000), |path| {
+            let mut attempted = attempted.borrow_mut();
+            attempted.push(path.to_path_buf());
+            if attempted.len() == 1 {
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "injected for the test"))
+            } else {
+                std::fs::remove_dir_all(path)
+            }
+        })
+        .context("sweep")?;
+        let attempted = attempted.into_inner();
+
+        assert_eq!(
+            attempted.len(),
+            2,
+            "the sweep must attempt removal of every stale entry, not stop after the first failure: {attempted:?}"
+        );
+        assert!(
+            attempted[0].exists(),
+            "the entry whose removal was injected to fail (whichever the loop visited first) must survive"
+        );
+        assert!(
+            !attempted[1].exists(),
+            "the entry visited second must still be removed despite the earlier failure"
+        );
+        assert_eq!(
+            removed.len(),
+            1,
+            "exactly the second-visited entry must be reported removed: {removed:?}"
+        );
+        Ok(())
+    }
+
+    /// Supplemental to the deterministic test above: the same continuation
+    /// behavior against a real filesystem permission failure (a
+    /// permission-blocked child `remove_dir_all` can't recurse into), rather
+    /// than an injected one.
+    #[test]
+    fn sweep_continues_past_an_unremovable_stale_dir() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = private_tmp()?;
+        let base = ensure_staging_base_in(tmp.path()).context("ensure base")?;
+
+        // A stale dir whose child is locked down so `remove_dir_all` can't
+        // recurse into it and fails for the whole `cred-stuck` tree.
+        let stuck = base.join("cred-stuck");
+        let blocked_child = stuck.join("blocked");
+        std::fs::create_dir(&stuck).context("create stuck dir")?;
+        std::fs::create_dir(&blocked_child).context("create blocked child")?;
+        std::fs::write(blocked_child.join("file"), b"x").context("seed blocked child")?;
+        std::fs::set_permissions(&blocked_child, std::fs::Permissions::from_mode(0o000))
+            .context("lock down blocked child")?;
+        // root, or a non-root runner with a DAC-bypass capability (e.g.
+        // CAP_DAC_OVERRIDE), ignores the lockdown above; check whether it
+        // actually holds here, rather than inferring it from uid alone, so
+        // the "stuck survives" assertion below is skipped only when the
+        // lockdown genuinely can't force a removal failure.
+        let privileged = std::fs::read_dir(&blocked_child).is_ok();
+        set_mtime_age(&stuck, Duration::from_secs(3600))?;
+
+        let removable = base.join("cred-removable");
+        std::fs::create_dir(&removable).context("create removable dir")?;
+        set_mtime_age(&removable, Duration::from_secs(3600))?;
+
+        let removed =
+            sweep_stale_staging_dirs(&base, STALE_STAGING_PREFIXES, Duration::from_secs(3000)).context("sweep")?;
+
+        // Restore permissions so the tempdir's own cleanup can remove it.
+        // Under a privileged runner `stuck`/`blocked_child` may already be
+        // gone (the sweep removed them too), so a missing-path failure here
+        // is tolerated rather than asserted on.
+        let _ = std::fs::set_permissions(&blocked_child, std::fs::Permissions::from_mode(0o700));
+
+        assert!(
+            removed.contains(&"cred-removable".to_string()),
+            "a removable stale dir must still be swept despite an earlier failure: {removed:?}"
+        );
+        assert!(!removable.exists(), "the removable dir must be gone");
+        if privileged {
+            // Nothing above forced a real removal failure under root, so
+            // there is no "survives" claim left to check; the removable-dir
+            // assertions are this test's whole claim under a privileged
+            // runner.
+            return Ok(());
+        }
+        assert!(
+            stuck.exists(),
+            "the unremovable dir must survive this sweep rather than wedge it"
+        );
+        Ok(())
     }
 }

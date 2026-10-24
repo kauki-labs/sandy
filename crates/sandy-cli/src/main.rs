@@ -131,7 +131,8 @@ enum Command {
         /// The job id to cancel.
         job_id: String,
     },
-    /// Garbage-collect terminal job records, keeping the newest N.
+    /// Garbage-collect terminal job records (keeping the newest N) and sweep
+    /// stale credential staging dirs past their mint TTL.
     Gc {
         /// How many terminal records to keep (newest first).
         #[arg(long, default_value_t = 20)]
@@ -1028,7 +1029,7 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
             }
         }
         Command::Gc { keep_last } => match supervisor::gc(&journal, keep_last) {
-            Ok(evicted) => succeed_or(emit(format_gc(&evicted, output))),
+            Ok(report) => succeed_or(emit(format_gc(&report, output))),
             Err(e) => report_error(&e),
         },
     }

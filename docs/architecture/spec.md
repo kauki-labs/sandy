@@ -193,11 +193,45 @@ sequenceDiagram
 - **Mid-run refresh.** With a huge margin + short tick the refresh thread re-mints
   and rewrites the live secret file, so a long job's `git credential fill` serves a
   fresh token; the guest never sees the value on argv/console.
+- **`gc` sweeps a leaked `cred-*`/`verify-*` staging dir (#195).** The drop guard
+  that removes `cred_dir`/the verify probe's temp dir runs on every normal exit
+  and on panic, but not on SIGKILL or a crash before it runs; `sandy gc` sweeps any
+  such dir under the sandy staging base whose mtime is at least `MAX_TTL_SECS` old.
+  The refresh loop heartbeats `cred_dir`'s mtime every tick (not only on an actual
+  refresh), since a provider's native token TTL can outlast `MAX_TTL_SECS` between
+  refreshes; without it, `gc` could delete a live job's credential dir. The sweep
+  is best-effort: a staging base that can't be validated or listed is logged and
+  skipped, never blocking `gc`'s record eviction. A stalled refresh call could
+  itself block the heartbeat (the two run sequentially), so every GitHub API
+  call (mint, refresh, revoke, uninstall, the permissions read) runs under a single
+  wall-clock deadline, `CALL_DEADLINE = MAX_TTL_SECS / 2`, covering the whole
+  call including whatever retries octocrab makes internally, closing the gap
+  at its source rather than only at the heartbeat. `safe_heartbeat_tick` caps
+  a configured tick against `MAX_TTL_SECS - CALL_DEADLINE`, not `MAX_TTL_SECS`
+  alone, so an accepted tick always leaves room for one stalled call. See
+  decision 6 for the residual gap this doesn't close.
 
 **KPI.**
 
 - Integration: `cred.rs` unit tests (`mint_lease` clamps TTL, stages 0600, revoke
-  bracket, `should_refresh`); the supervisor's mint-fails-closed test.
+  bracket, `should_refresh`); the supervisor's mint-fails-closed test;
+  `sandy-fsutil`'s `sweep_stale_staging_dirs` tests (sweeps a stale dir, keeps a
+  fresh one, ignores an unrelated prefix, continues past an injected removal
+  failure deterministically via `sweep_stale_staging_dirs_with`, supplemented
+  by a real-filesystem-permission variant); the supervisor's
+  `gc_sweeps_a_stale_cred_dir_past_max_ttl` / `gc_keeps_a_fresh_verify_dir`
+  (both asserting against `GcReport::swept_staging_dirs`, never `evicted`) /
+  `refresh_loop_heartbeats_the_cred_dir_mtime_every_tick` /
+  `safe_heartbeat_tick_passes_through_a_safe_tick` /
+  `safe_heartbeat_tick_falls_back_when_the_tick_reaches_max_ttl_secs` /
+  `..._exceeds_max_ttl_secs` /
+  `..._falls_back_at_max_ttl_secs_minus_call_deadline` /
+  `..._passes_through_just_below_max_ttl_secs_minus_call_deadline`;
+  `output.rs`'s `gc_json_keeps_swept_staging_dirs_out_of_evicted` /
+  `gc_plain_text_evicted_count_excludes_swept_staging_dirs`; `cred_github.rs`'s
+  `revoke_times_out_on_a_stalled_server` (drives the real adapter's `revoke`
+  against a local listener that accepts and never responds, proving the call
+  errors out at `call_deadline` rather than hanging).
 - End-to-end: `live_cred.rs` (git-helper + mid-run refresh + revoke; the "everything"
   scenario composing cred + secret + input + output), `live_refresh.rs` (a rotated
   token reaches the running guest). Adapter-live (real App): `cred_e2e.rs` /
