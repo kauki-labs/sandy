@@ -2,7 +2,7 @@
 title: "Decisions: sandyd control plane"
 status: accepted
 project: sandy
-updated: 2026-10-21
+updated: 2026-10-24
 ---
 
 # Decisions: sandyd control plane
@@ -34,6 +34,15 @@ order (no pipelining in v1; a `request_id` field exists for forward-compat and
 log correlation only). `Attach` hands back a channel id and an attenuated cap
 scoped to that job's orchestrator channel; the caller subscribes to output on
 the data plane itself via the existing `Channel::join`/`subscribe`.
+
+`request_id` is a plain (non-`optional`) `uint64`: proto3 gives it no separate
+presence bit, so 0 and "unset" are the same wire value, and the adopted
+contract (#211's adversarial test) is that 0 means absent.
+`sandy_control_proto::client::call` refuses to send a request with
+`request_id: 0`, before anything is written, rather than letting it ride to
+the wire and risk matching a different in-flight call that also defaulted to
+0; a response that itself carries `request_id: 0` is likewise never treated
+as a wildcard match.
 
 **Consequences.** No duplicate delivery/ordering/dedup logic between the
 control RPC and the fabric channel — that guarantee lives in exactly one

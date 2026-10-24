@@ -31,6 +31,13 @@ pub enum ClientError {
         /// The request id the daemon's response actually carried.
         answered: u64,
     },
+    /// `request_id` was 0. proto3 gives `request_id` no separate presence
+    /// bit, so 0 and "unset" are the same wire value (#211's decision record
+    /// §1): rejected here, before anything is written, rather than letting a
+    /// request with no real id ride to the wire and risk matching a
+    /// different in-flight call that also defaulted to 0.
+    #[error("request_id must be non-zero (0 means absent)")]
+    MissingRequestId,
 }
 
 /// Send one `op` as request `request_id` over `stream` and return the
@@ -40,7 +47,8 @@ pub enum ClientError {
 ///
 /// # Errors
 ///
-/// [`ClientError::Frame`] if the write or read itself fails;
+/// [`ClientError::MissingRequestId`] if `request_id` is 0, before anything is
+/// written; [`ClientError::Frame`] if the write or read itself fails;
 /// [`ClientError::ConnectionClosed`] if the daemon closes before answering;
 /// [`ClientError::MismatchedRequestId`] if the response's `request_id`
 /// doesn't match what was sent (a protocol violation, never silently
@@ -50,6 +58,9 @@ pub async fn call(
     request_id: u64,
     op: control_request::Op,
 ) -> Result<ControlResponse, ClientError> {
+    if request_id == 0 {
+        return Err(ClientError::MissingRequestId);
+    }
     write_frame(
         stream,
         &ControlRequest {
@@ -119,6 +130,71 @@ mod tests {
         let result = call(&mut client_side, 1, control_request::Op::List(ListRequest {})).await;
         assert!(
             matches!(result, Err(ClientError::MismatchedRequestId { sent: 1, answered: 999 })),
+            "got {result:?}"
+        );
+        serving.await??;
+        Ok(())
+    }
+
+    /// Adversarial (#211's adversarial test, decision record §1):
+    /// `request_id: 0` means absent — `call` refuses to send such a request
+    /// at all, rather than letting it ride to the wire and risk a confusing
+    /// match later. The server side is a live, responding peer (not an
+    /// idle one): if the guard were missing, `call` would write the request,
+    /// the server would answer it, and `call` would return `Ok` instead of
+    /// hanging — so a dropped guard fails this test fast, not by stalling.
+    #[tokio::test]
+    async fn a_request_id_of_zero_is_rejected_before_anything_is_written() -> anyhow::Result<()> {
+        let (mut client_side, mut server_side) = tokio::io::duplex(4096);
+        let serving = tokio::spawn(async move {
+            let request: Option<ControlRequest> = read_frame(&mut server_side).await?;
+            let saw_no_frame = request.is_none();
+            if let Some(request) = request {
+                write_frame(
+                    &mut server_side,
+                    &ControlResponse {
+                        request_id: request.request_id,
+                        result: Some(control_response::Result::List(ListResponse { jobs: vec![] })),
+                    },
+                )
+                .await?;
+            }
+            Ok::<_, anyhow::Error>(saw_no_frame)
+        });
+
+        let result = call(&mut client_side, 0, control_request::Op::List(ListRequest {})).await;
+        assert!(matches!(result, Err(ClientError::MissingRequestId)), "got {result:?}");
+
+        // Nothing was written: dropping the client side now lets the server
+        // observe a clean close rather than wait on a frame that never comes.
+        drop(client_side);
+        assert!(serving.await??, "expected the server to see a clean close, not a frame");
+        Ok(())
+    }
+
+    /// Adversarial (#211, decision: 0 is not a wildcard): a response carrying
+    /// `request_id: 0` must still be rejected as mismatched when the request
+    /// actually sent a different id — `request_id: 0` must never be read as
+    /// "no correlation check required" and let a wrong response through.
+    #[tokio::test]
+    async fn a_response_of_zero_does_not_bypass_the_mismatch_check() -> anyhow::Result<()> {
+        let (mut client_side, mut server_side) = tokio::io::duplex(4096);
+        let serving = tokio::spawn(async move {
+            let _request: ControlRequest = read_frame(&mut server_side).await?.context("expected a request")?;
+            write_frame(
+                &mut server_side,
+                &ControlResponse {
+                    request_id: 0, // wrong on purpose: the client sent a non-zero id
+                    result: Some(control_response::Result::List(ListResponse { jobs: vec![] })),
+                },
+            )
+            .await?;
+            Ok::<_, anyhow::Error>(())
+        });
+
+        let result = call(&mut client_side, 5, control_request::Op::List(ListRequest {})).await;
+        assert!(
+            matches!(result, Err(ClientError::MismatchedRequestId { sent: 5, answered: 0 })),
             "got {result:?}"
         );
         serving.await??;
