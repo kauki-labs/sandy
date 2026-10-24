@@ -37,10 +37,6 @@ use std::{
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-/// `history-limit`/`pipe-pane` log bound (lines), hardcoded for phase 1 — a
-/// manifest-level override is phase 6 (epic #340).
-const HISTORY_LIMIT: u32 = 10_000;
-
 /// A fixed default size for the pane and the one `tmux attach` PTY this phase
 /// opens: real per-connection sizing (the `Join` frame's `cols`/`rows`) is
 /// phase 2/3 — there's no client size to read yet with only one, synchronous
@@ -162,7 +158,11 @@ impl TmuxJob {
     ///
     /// # Errors
     /// If `tmux new-session` cannot be spawned or exits non-zero.
-    pub fn start(job: &[std::ffi::OsString], peer_env: Option<(&str, &Path)>) -> std::io::Result<Self> {
+    pub fn start(
+        job: &[std::ffi::OsString],
+        peer_env: Option<(&str, &Path)>,
+        history_lines: u32,
+    ) -> std::io::Result<Self> {
         // Unique per call, not just per process: several `sandy-agent`
         // processes can share one host's tmux server (a trusted-process host
         // running more than one job's agent at once), and `std::process::id`
@@ -222,7 +222,7 @@ impl TmuxJob {
         std::fs::write(
             &config,
             format!(
-                "set-option -g remain-on-exit on\nset-option -g history-limit {HISTORY_LIMIT}\nset-hook -g \
+                "set-option -g remain-on-exit on\nset-option -g history-limit {history_lines}\nset-hook -g \
                  session-created 'pipe-pane -o \"cat >> {safe_log}\"'\n",
             ),
         )?;
@@ -649,6 +649,11 @@ impl AsyncWrite for AsyncPtyWriter {
 mod tests {
     use super::*;
 
+    /// A plausible non-default value: distinct from the manifest's own
+    /// 10,000 default, so a test accidentally reading the hardcoded fallback
+    /// instead of the value actually passed in would show up as a mismatch.
+    const TEST_HISTORY_LINES: u32 = 777;
+
     #[test]
     fn quotes_each_argument_separately_preserving_boundaries() {
         let argv: Vec<std::ffi::OsString> = vec!["echo".into(), "hello world".into()];
@@ -703,7 +708,7 @@ mod tests {
             "-c".into(),
             std::ffi::OsString::from(format!("echo '{EXIT_MARKER}not-a-number'; exit 9")),
         ];
-        let tmux_job = TmuxJob::start(&job, None)?;
+        let tmux_job = TmuxJob::start(&job, None, TEST_HISTORY_LINES)?;
         let exit = tokio::time::timeout(Duration::from_secs(10), tmux_job.wait_for_exit())
             .await
             .map_err(std::io::Error::other)??;
@@ -724,7 +729,7 @@ mod tests {
             "-c".into(),
             std::ffi::OsString::from(format!("printf '{EXIT_MARKER}nan'; exit 5")),
         ];
-        let tmux_job = TmuxJob::start(&job, None)?;
+        let tmux_job = TmuxJob::start(&job, None, TEST_HISTORY_LINES)?;
         let exit = tokio::time::timeout(Duration::from_secs(10), tmux_job.wait_for_exit())
             .await
             .map_err(std::io::Error::other)??;
@@ -744,7 +749,7 @@ mod tests {
     #[tokio::test]
     async fn the_job_runs_behind_a_real_pty_and_the_transcript_captures_it() -> std::io::Result<()> {
         let job = vec!["tty".into()];
-        let tmux_job = TmuxJob::start(&job, None)?;
+        let tmux_job = TmuxJob::start(&job, None, TEST_HISTORY_LINES)?;
         let exit = tokio::time::timeout(Duration::from_secs(10), tmux_job.wait_for_exit())
             .await
             .map_err(std::io::Error::other)??;
@@ -762,13 +767,31 @@ mod tests {
         Ok(())
     }
 
+    /// A non-default `history_lines` reaches the session's own tmux option,
+    /// not just the hardcoded manifest default (epic #340 phase 6/item 3).
+    #[tokio::test]
+    async fn a_configured_history_lines_value_sets_the_sessions_tmux_option() -> std::io::Result<()> {
+        let job = vec!["sleep".into(), "5".into()];
+        let tmux_job = TmuxJob::start(&job, None, TEST_HISTORY_LINES)?;
+        let output = std::process::Command::new("tmux")
+            .args(["-L", tmux_job.socket_name(), "show-options", "-g", "history-limit"])
+            .output()?;
+        tmux_job.kill();
+        assert!(output.status.success(), "show-options failed: {output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            format!("history-limit {TEST_HISTORY_LINES}"),
+        );
+        Ok(())
+    }
+
     /// The real job exit code survives the marker round trip through the
     /// transcript, independent of `tmux attach`'s own (irrelevant) exit
     /// status.
     #[tokio::test]
     async fn the_real_exit_code_is_read_back_from_the_transcript() -> std::io::Result<()> {
         let job = vec!["sh".into(), "-c".into(), "exit 42".into()];
-        let tmux_job = TmuxJob::start(&job, None)?;
+        let tmux_job = TmuxJob::start(&job, None, TEST_HISTORY_LINES)?;
         let exit = tokio::time::timeout(Duration::from_secs(10), tmux_job.wait_for_exit())
             .await
             .map_err(std::io::Error::other)??;
@@ -794,7 +817,7 @@ mod tests {
         // runs, exactly the scenario the adversarial `kill -ABRT $PPID` test
         // (`agent_process.rs`) exercises against the real spawned agent.
         let job = vec!["sh".into(), "-c".into(), "kill -ABRT $PPID; exit 0".into()];
-        let tmux_job = TmuxJob::start(&job, None)?;
+        let tmux_job = TmuxJob::start(&job, None, TEST_HISTORY_LINES)?;
         let result = tokio::time::timeout(Duration::from_secs(10), tmux_job.wait_for_exit()).await;
         tmux_job.kill();
         match result {
@@ -818,7 +841,7 @@ mod tests {
     async fn dropping_a_tmux_job_without_an_explicit_kill_still_tears_down_its_session() -> std::io::Result<()> {
         let job = vec!["sleep".into(), "30".into()];
         let (socket, session) = {
-            let tmux_job = TmuxJob::start(&job, None)?;
+            let tmux_job = TmuxJob::start(&job, None, TEST_HISTORY_LINES)?;
             let ids = (tmux_job.socket_name().to_string(), tmux_job.session_name().to_string());
             // `tmux_job` drops here, with no explicit `.kill()` call.
             ids
