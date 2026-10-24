@@ -659,12 +659,12 @@ sets it per node, the nix service unit (#287) injects it in production.
   with a `pending()` fallback branch) was tried and discarded as needlessly
   convoluted for two independent accept loops that never need to coordinate.
 
-**Consequences.** `sandyd`'s mesh listener has no graceful-shutdown
-coordination with the daemon's own `SIGTERM`/`SIGINT` handling yet — it is a
-detached task that the process's own exit simply drops, unlike the UDS
-listener's bounded grace period for in-flight connections. Acceptable at
-this stage (no live cross-machine traffic exists to lose gracefully yet);
-revisit once #272's live e2e exercises this path for real.
+**Consequences.** `sandyd`'s mesh management listener shares the daemon's
+`SIGTERM`/`SIGINT` shutdown signal. It stops accepting new connections and
+drains active host-executor connections for the bounded grace period before
+`main` exits. The separate mesh agent-link listener remains detached and
+lacks graceful-shutdown support; revisit that listener once #272's live e2e
+exercises this path for real.
 
 **Set aside.** A CLI-flag surface (`clap`) for these two env vars: `sandyd`
 has never had one, and introducing `clap` as a dependency for two optional
