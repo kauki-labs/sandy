@@ -592,7 +592,12 @@ mod tests {
             .await
             .context("mint job channel")?;
         job.remote_link = Some(crate::link_auth::RemoteLink::new(peer_ip).context("mint remote link")?);
-        let token = *job.remote_link.as_ref().expect("just set").token().as_bytes();
+        let token = *job
+            .remote_link
+            .as_ref()
+            .context("the minted job must have a remote link")?
+            .token()
+            .as_bytes();
         job_registry.insert("job-1".to_owned(), job);
 
         fail_disconnected_job(&store, &job_registry, "job-1").await;

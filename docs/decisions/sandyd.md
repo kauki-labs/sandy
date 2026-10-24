@@ -859,10 +859,12 @@ happy path).
   remote run is reachable regardless of what's registered) or no host
   qualifies. If one is picked: mint a decision-6 `RemoteLink` bound to its
   peer IP, set it on the job's channel, persist and register the job as
-  usual, then call `send_dispatch` — a failure (e.g. the host disconnected
-  in the narrow window between being picked and the send) fails the job
-  terminally rather than leaving it silently `Pending` forever (see the
-  "Closed" paragraph below for the full history of that fix). No host
+  usual, then call `send_dispatch_if_current` — registration-bound, so a
+  reclaimed `host_id` can't receive the dispatch (see the `PlacementCandidate`
+  bullet below for why that distinction matters) — a failure (e.g. the host
+  disconnected in the narrow window between being picked and the send) fails
+  the job terminally rather than leaving it silently `Pending` forever (see
+  the "Closed" paragraph below for the full history of that fix). No host
   picked (including none registered, or none configured) means the job
   stays local, today's unchanged behavior.
 - Stage-1 required-class default: `STAGE1_REQUIRED_ISOLATION_CLASS = IsolationClass::Trusted`,
