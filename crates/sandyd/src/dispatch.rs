@@ -332,7 +332,13 @@ async fn find_and_persist_archive(
     let find_archive = async {
         let mut stream = std::pin::pin!(stream);
         while let Some(item) = stream.next().await {
-            let Ok(env) = item else { continue };
+            // A stream error ends this attempt rather than retrying: this
+            // persister is already best-effort and silent on every failure
+            // path (see this function's own doc comment above), and
+            // `continue`-ing past a repeated, immediately-ready error would
+            // busy-loop until `wait_bound` elapses instead of giving up
+            // promptly (CodeRabbit on #378).
+            let Ok(env) = item else { return None };
             if matches!(env.message_type, Some(MessageType::Output(_))) && env.content_type == ARCHIVE_TRANSCRIPT {
                 return Some(env.payload);
             }
