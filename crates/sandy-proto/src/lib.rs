@@ -75,3 +75,37 @@ pub fn encode(envelope: &Envelope) -> Vec<u8> {
 pub fn decode(bytes: &[u8]) -> Result<Envelope, ProtoError> {
     Ok(Envelope::decode(bytes)?)
 }
+
+/// `Envelope.payload` is opaque to the channel layer and can carry a bearer
+/// credential (an attenuated channel-join cap, a staged secret, …): `build.rs`
+/// skips prost's derived `Debug` for this message, and this redacts `payload`
+/// the same way `sandy_control_proto::AttachResponse` redacts its `cap`
+/// (#211). The other fields carry no secret material and print normally.
+impl std::fmt::Debug for Envelope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Envelope")
+            .field("sequence", &self.sequence)
+            .field("metadata", &self.metadata)
+            .field("content_type", &self.content_type)
+            .field("payload", &format_args!("<redacted {} bytes>", self.payload.len()))
+            .field("message_type", &self.message_type)
+            .finish()
+    }
+}
+
+/// `skip_debug` on `Envelope` also drops the derived `Debug` for its nested
+/// `oneof` enum (prost generates it as part of the same message's codegen).
+/// Each variant wraps an empty marker type with no secret material, so this
+/// just delegates to that type's own (still-derived) `Debug`.
+impl std::fmt::Debug for MessageType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MessageType::Control(inner) => f.debug_tuple("Control").field(inner).finish(),
+            MessageType::Tty(inner) => f.debug_tuple("Tty").field(inner).finish(),
+            MessageType::Output(inner) => f.debug_tuple("Output").field(inner).finish(),
+            MessageType::Telemetry(inner) => f.debug_tuple("Telemetry").field(inner).finish(),
+            MessageType::Escalate(inner) => f.debug_tuple("Escalate").field(inner).finish(),
+            MessageType::PeerMsg(inner) => f.debug_tuple("PeerMsg").field(inner).finish(),
+        }
+    }
+}
