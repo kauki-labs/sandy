@@ -22,7 +22,7 @@
 //! misbehavior.
 //!
 //! Run manually once the remote host is redeployed:
-//!   SANDY_LIVE=1 SANDY_M2_REMOTE_HOST=<remote host's mesh address> \
+//!   SANDY_LIVE=1 SANDY_M2_REMOTE_HOST=<this orchestrator's own mesh address> \
 //!     SANDY_M2_REMOTE_PEER=<remote host's mesh address> \
 //!     cargo nextest run -p sandy-cli --features live --test live_remote_host_flake_attach
 #![cfg(feature = "live")]

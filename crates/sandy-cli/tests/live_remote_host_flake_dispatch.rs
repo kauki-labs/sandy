@@ -26,7 +26,7 @@
 //! Run manually once the remote host is redeployed (the remote host-executor must
 //! already be configured to dial the given address and reachable over the
 //! mesh):
-//!   SANDY_LIVE=1 SANDY_M2_REMOTE_HOST=<remote host's mesh address> \
+//!   SANDY_LIVE=1 SANDY_M2_REMOTE_HOST=<this orchestrator's own mesh address> \
 //!     SANDY_M2_REMOTE_PEER=<remote host's mesh address> \
 //!     cargo nextest run -p sandy-cli --features live --test live_remote_host_flake_dispatch
 #![cfg(feature = "live")]
