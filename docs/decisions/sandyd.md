@@ -2,7 +2,7 @@
 title: "Decisions: sandyd control plane"
 status: accepted
 project: sandy
-updated: 2026-10-21
+updated: 2026-10-24
 ---
 
 # Decisions: sandyd control plane
@@ -34,6 +34,15 @@ order (no pipelining in v1; a `request_id` field exists for forward-compat and
 log correlation only). `Attach` hands back a channel id and an attenuated cap
 scoped to that job's orchestrator channel; the caller subscribes to output on
 the data plane itself via the existing `Channel::join`/`subscribe`.
+
+`request_id` is a plain (non-`optional`) `uint64`: proto3 gives it no separate
+presence bit, so 0 and "unset" are the same wire value, and the adopted
+contract (#211's adversarial test) is that 0 means absent.
+`sandy_control_proto::client::call` refuses to send a request with
+`request_id: 0`, before anything is written, rather than letting it ride to
+the wire and risk matching a different in-flight call that also defaulted to
+0; a response that itself carries `request_id: 0` is likewise never treated
+as a wildcard match.
 
 **Consequences.** No duplicate delivery/ordering/dedup logic between the
 control RPC and the fabric channel — that guarantee lives in exactly one
@@ -164,8 +173,13 @@ name: blurs direct-execution's and the daemon's job concepts together.
 tested in isolation (`sandyd::link_auth`: `RemoteLink`, the constant-time
 token compare, `JobRegistry::authenticate_remote_link`) — accept-or-refuse
 given a job id, a peer IP, and a presented token, with every refusal path
-named and tested (wrong peer, wrong token, already-claimed, unknown run) and
-a dedicated test proving the token never appears in `Debug` output.
+named and tested (wrong peer, wrong token, already-claimed, unknown run), a
+dedicated test proving the token never appears in `Debug` output, and a
+tracing-capture test (`mesh_accept::no_tracing_event_carries_the_raw_link_token`,
+`handler::no_tracing_event_carries_the_real_dispatch_token`) proving no
+emitted log line or error carries the raw token across the accept-loop and
+the Submit->dispatch path, in its decoded-text, hex-text, or byte-array
+`Debug` shape — the literal INV-1 addendum item on #159, closing it.
 `RemoteLink::invalidate` plus `JobRegistry::invalidate_remote_link`, wired
 into the control handler's `Cancel` arm, close #269's token-lifecycle
 requirement: cancelling a job invalidates its unclaimed link immediately, so
@@ -236,7 +250,9 @@ all, not after — `mesh_accept::serve_one_remote_link` never writes to the
 connection before `authenticate_remote_link` succeeds. Acceptance tests:
 wrong peer, wrong token, a second stream for an already-
 claimed run, and an unknown run id each receive zero bytes; no log line or
-error message ever carries the token.
+error message ever carries the token (`mesh_accept::
+no_tracing_event_carries_the_raw_link_token`, `handler::
+no_tracing_event_carries_the_real_dispatch_token`).
 
 **Set aside.** Trusting the mesh IP alone (WireGuard/Headscale already binds
 an IP to a peer's key, so a bare `peer_addr()` looked tempting as sufficient):
@@ -815,6 +831,42 @@ await on directly (the same discipline `impls/local/src/process.rs`'s own
 poll loop already uses). `dial_and_forward`'s own separate `DIAL_TIMEOUT`
 for the dial itself is unchanged — only the connected phase's bound moved
 from flat to live.
+
+**Follow-up (#300): an explicit requested shutdown now cancels, not just bounds, a still-running
+job — and the nix unit's `TimeoutStopSec` is sized to match.** The grace-deadline fail-safe above
+(CodeRabbit on #344) only ever bounded an unbounded wait; it never asked a job to stop faster than
+its own deadline. That left a real gap for `systemctl stop sandy-executor`: with `TimeoutStopSec`
+unset (systemd's ~90s default), systemd SIGKILLs the whole process before a job's own
+up-to-`STAGE1_TIMEOUT_SECS` (300s) budget elapses — killing the job's `RunControl`/supervision
+context out from under it with no clean cancel, and leaving its sandbox (reparented under
+`user@<uid>.service` by design, see `nix/modules/sandy-executor.nix`) running with nothing left
+tracking it — the #135 host-orphan problem recreated at the service-management level.
+
+**Decision.** On `DispatchLoopExit::Shutdown` specifically — never `Closed`/`Faulted`, where
+nothing races a systemd kill and the existing drain-to-completion behavior is still correct — the
+fail-safe now also calls `cancel()` on every still-running job's `RunControl`, alongside the
+existing deadline bound. `nix/modules/sandy-executor.nix`'s unit now sets an explicit
+`TimeoutStopSec`, derived from `STAGE1_TIMEOUT_SECS` plus a cleanup-overhead margin, as a
+defense-in-depth second layer so systemd itself never races the cancellation before it can
+complete.
+
+**Consequences.** The process backend (`impls/local`) picks up a cancellation on its next 10ms
+poll tick, so a cancelled job tears down within its own drain grace (≤ ~10s) regardless of how far
+from its deadline it was — comfortably inside the new `TimeoutStopSec`. The known gap named above
+(VM backends not honoring `RunControl` at all) is UNCHANGED by this fix: a VM-backed job still
+runs to its static `spec.timeout_secs` budget regardless of `cancel()`. That is exactly why
+`TimeoutStopSec` is derived from the full `STAGE1_TIMEOUT_SECS` budget rather than the process
+backend's fast-cancel case alone — it has to cover whichever backend actually ran.
+
+**Verification.** Unit-tested: `shutdown_cancels_every_still_running_jobs_run_control` and
+`a_closed_connection_does_not_cancel_a_still_running_job`
+(`crates/sandy-host-executor/src/run.rs`) pin the cancel-on-`Shutdown`-only logic against the
+existing `RunControl`/queue abstractions, no real systemd needed. **Not verified live:** whether
+`systemctl stop` against a real dispatched job avoids the orphan end to end on a real boot — that
+needs a nixosTest driving an actual `Dispatch` into the hardened unit, then asserting the sandbox's
+cgroup is gone once the stop completes. That harness is a bigger lift than this change built (it
+needs a fake orchestrator inside the test VM to drive a real dispatch); tracked as an open
+follow-up, not fabricated as done here.
 
 ## 15. Orchestrator placement wiring: one shared `HostRegistry`, stage-1 required-class default, dispatch from the real submit path (#298)
 
