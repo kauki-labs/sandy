@@ -4,7 +4,10 @@
 //! is not a local POSIX filesystem. A networked/share mount (NFS, SMB, virtiofs, 9p, ...)
 //! makes `flock` unreliable, which breaks the journal's single-writer guarantee (INV-5).
 
-use std::{collections::BTreeSet, path::PathBuf};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+};
 
 use sandy::{Discovery, ProcessExit, StaticRegistry, parse_builder_systems};
 
@@ -131,6 +134,10 @@ pub enum MacPrereq {
     MissingBuilder {
         /// The required guest system, e.g. `aarch64-linux`.
         system: String,
+        /// The machines-file path that was actually checked — `/etc/nix/machines`
+        /// in production, or `SANDY_NIX_MACHINES_FILE`'s override under test — so
+        /// the refusal message never names a file it didn't read (#163 review).
+        machines_path: PathBuf,
     },
 }
 
@@ -140,7 +147,12 @@ pub enum MacPrereq {
 /// vfkit matches host and guest architecture, so the guest is `<arch>-linux`,
 /// which a darwin host can only produce on a remote `<arch>-linux` builder.
 #[must_use]
-pub fn mac_prereq_verdict(nix_present: bool, builder_systems: &BTreeSet<String>, guest_system: &str) -> MacPrereq {
+pub fn mac_prereq_verdict(
+    nix_present: bool,
+    builder_systems: &BTreeSet<String>,
+    guest_system: &str,
+    machines_path: &Path,
+) -> MacPrereq {
     if !nix_present {
         return MacPrereq::MissingNix;
     }
@@ -149,6 +161,7 @@ pub fn mac_prereq_verdict(nix_present: bool, builder_systems: &BTreeSet<String>,
     } else {
         MacPrereq::MissingBuilder {
             system: guest_system.to_string(),
+            machines_path: machines_path.to_path_buf(),
         }
     }
 }
@@ -165,12 +178,13 @@ pub fn mac_prereq_result(verdict: MacPrereq) -> Option<DoctorResult> {
                       guest with nix. Install nix (https://nixos.org/download)."
                 .to_string(),
         }),
-        MacPrereq::MissingBuilder { system } => Some(DoctorResult {
+        MacPrereq::MissingBuilder { system, machines_path } => Some(DoctorResult {
             exit_code: ProcessExit::InvalidPlan.code(),
             message: format!(
                 "sandy doctor: refusing to start — no `{system}` remote builder is configured (checked \
-                 /etc/nix/machines), but the macOS vfkit path must build an `{system}` guest. Enable nix-darwin's \
-                 linux-builder (`nix.linux-builder.enable = true;`) or register an `{system}` builder."
+                 {}), but the macOS vfkit path must build an `{system}` guest. Enable nix-darwin's \
+                 linux-builder (`nix.linux-builder.enable = true;`) or register an `{system}` builder.",
+                machines_path.display()
             ),
         }),
     }
@@ -193,12 +207,12 @@ pub(crate) fn detect_mac_prereq() -> MacPrereq {
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/etc/nix/machines"));
-    let machines = std::fs::read_to_string(machines_path).unwrap_or_default();
+    let machines = std::fs::read_to_string(&machines_path).unwrap_or_default();
     let guest = crate::host_target::host_target().guest_system;
     // Resolve placement through the Discovery seam — a static registry over the host
     // matrix. The buildable-systems check is the matrix systems, exactly as before.
     let placement = StaticRegistry::new(parse_builder_systems(&machines)).resolve(&guest);
-    mac_prereq_verdict(nix_on_path(), &placement.systems, &guest)
+    mac_prereq_verdict(nix_on_path(), &placement.systems, &guest, &machines_path)
 }
 
 /// Whether a `nix` executable resolves on `PATH`.
@@ -208,28 +222,34 @@ fn nix_on_path() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use rstest::rstest;
 
     use super::{FsVerdict, MacPrereq, classify_fs, doctor_result_for, mac_prereq_result, mac_prereq_verdict};
+
+    const MACHINES_PATH: &str = "/etc/nix/machines";
 
     /// Missing nix wins over the builder check.
     #[test]
     fn missing_nix_is_flagged() {
         let systems = std::collections::BTreeSet::from(["aarch64-linux".to_string()]);
         assert_eq!(
-            mac_prereq_verdict(false, &systems, "aarch64-linux"),
+            mac_prereq_verdict(false, &systems, "aarch64-linux", Path::new(MACHINES_PATH)),
             MacPrereq::MissingNix
         );
     }
 
-    /// nix present but no builder for the guest arch → `MissingBuilder` naming it.
+    /// nix present but no builder for the guest arch → `MissingBuilder` naming it
+    /// and the machines file that was checked.
     #[test]
     fn missing_builder_names_the_guest_system() {
         let systems = std::collections::BTreeSet::from(["x86_64-linux".to_string()]);
         assert_eq!(
-            mac_prereq_verdict(true, &systems, "aarch64-linux"),
+            mac_prereq_verdict(true, &systems, "aarch64-linux", Path::new(MACHINES_PATH)),
             MacPrereq::MissingBuilder {
-                system: "aarch64-linux".to_string()
+                system: "aarch64-linux".to_string(),
+                machines_path: MACHINES_PATH.into(),
             }
         );
     }
@@ -238,7 +258,10 @@ mod tests {
     #[test]
     fn prereq_ok_when_nix_and_builder_present() {
         let systems = std::collections::BTreeSet::from(["aarch64-linux".to_string()]);
-        assert_eq!(mac_prereq_verdict(true, &systems, "aarch64-linux"), MacPrereq::Ok);
+        assert_eq!(
+            mac_prereq_verdict(true, &systems, "aarch64-linux", Path::new(MACHINES_PATH)),
+            MacPrereq::Ok
+        );
     }
 
     /// `Ok` maps to no refusal; each missing case maps to exit 2 with a named fix.
@@ -252,6 +275,7 @@ mod tests {
 
         let builder = mac_prereq_result(MacPrereq::MissingBuilder {
             system: "aarch64-linux".to_string(),
+            machines_path: MACHINES_PATH.into(),
         })
         .expect("missing builder must refuse");
         assert_eq!(builder.exit_code, 2);
@@ -263,6 +287,27 @@ mod tests {
         assert!(
             builder.message.contains("linux-builder"),
             "names the fix: {}",
+            builder.message
+        );
+        assert!(
+            builder.message.contains(MACHINES_PATH),
+            "names the machines file actually checked: {}",
+            builder.message
+        );
+    }
+
+    /// The refusal names a `SANDY_NIX_MACHINES_FILE` override path, not the
+    /// hardcoded `/etc/nix/machines`, when one was checked instead (#163 review).
+    #[test]
+    fn prereq_result_names_an_overridden_machines_path() {
+        let builder = mac_prereq_result(MacPrereq::MissingBuilder {
+            system: "aarch64-linux".to_string(),
+            machines_path: "/tmp/fake-machines".into(),
+        })
+        .expect("missing builder must refuse");
+        assert!(
+            builder.message.contains("/tmp/fake-machines"),
+            "names the overridden path, not /etc/nix/machines: {}",
             builder.message
         );
     }
