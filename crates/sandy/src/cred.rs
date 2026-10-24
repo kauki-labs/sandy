@@ -134,6 +134,12 @@ pub fn should_refresh(now: SystemTime, expires_at: SystemTime, margin: Duration)
 /// backstop; a failed re-mint or re-stage leaves the lease and file untouched (the
 /// current token stays in place) and surfaces as an error for the loop to retry.
 ///
+/// One re-stage outcome is neither: the rename can land and only the trailing
+/// directory sync afterward fails (#196). The new token is already in place and
+/// valid there, so revoking it would leave the guest reading a dead token until the
+/// next refresh tick; that case is logged as a warning instead, and the refresh is
+/// treated as completed (the lease advances, the superseded token is revoked).
+///
 /// Because the token is re-delivered by overwriting the file, only a consumer that
 /// re-reads `/run/sandy/secrets/<NAME>` at use-time sees the refresh; a job that
 /// captured `$NAME` into its environment at login holds the boot-time token (#49).
@@ -147,6 +153,18 @@ pub fn refresh_once<P: CredentialProvider + ?Sized>(
     lease: &mut Lease,
     now: SystemTime,
     margin: Duration,
+) -> Result<bool, CredError> {
+    refresh_once_with(provider, lease, now, margin, write_secret_0600)
+}
+
+/// [`refresh_once`]'s body, with the re-stage step injected so a test can script a
+/// [`StageOutcome::NotDurable`] without needing a real directory-sync failure.
+fn refresh_once_with<P: CredentialProvider + ?Sized>(
+    provider: &P,
+    lease: &mut Lease,
+    now: SystemTime,
+    margin: Duration,
+    stage: impl FnOnce(&Path, &[u8]) -> Result<StageOutcome, CredError>,
 ) -> Result<bool, CredError> {
     if !should_refresh(now, lease.expires_at, margin) {
         return Ok(false);
@@ -162,13 +180,26 @@ pub fn refresh_once<P: CredentialProvider + ?Sized>(
     // untouched and the current token stays staged.
     let minted = provider.refresh(lease)?;
     // Stage the new token over the shared file BEFORE revoking the old one, so a
-    // consumer reading the file never observes a revoked token. If the re-stage
-    // fails, the new token was minted but never installed: revoke it so it does not
-    // leak (the lease still names the old token, which teardown revokes), then
-    // surface the error with the current token left in place.
-    if let Err(e) = write_secret_0600(&dest, minted.secret().as_bytes()) {
-        revoke_orphan(provider, &lease.secret_ref.name, &minted);
-        return Err(e);
+    // consumer reading the file never observes a revoked token. If staging fails
+    // before the rename lands, the new token was minted but never installed:
+    // revoke it so it does not leak (the lease still names the old token, which
+    // teardown revokes), then surface the error with the current token left in
+    // place. If only the trailing directory sync failed, the rename already
+    // landed and the new token is in place and valid (#196): warn and keep it.
+    match stage(&dest, minted.secret().as_bytes()) {
+        Ok(StageOutcome::Ok) => {}
+        Ok(StageOutcome::NotDurable(e)) => {
+            tracing::warn!(
+                %e,
+                name = %lease.secret_ref.name,
+                "refreshed token re-staged but the trailing directory sync failed; keeping the new token in place \
+                 rather than revoking it"
+            );
+        }
+        Err(e) => {
+            revoke_orphan(provider, &lease.secret_ref.name, &minted);
+            return Err(e);
+        }
     }
     // Revoke the superseded token while `lease` still names it, then advance the
     // lease to the fresh handle/expiry. A revoke failure is logged, not fatal.
@@ -296,7 +327,9 @@ pub(crate) fn open_trust_dir(dir: &Path) -> Result<sandy_fsutil::OwnedDir, CredE
             path.display(),
             path.display()
         )),
-        other @ sandy_fsutil::FsError::Io { .. } => CredError::Stage(other.to_string()),
+        other @ (sandy_fsutil::FsError::Io { .. } | sandy_fsutil::FsError::NotDurable { .. }) => {
+            CredError::Stage(other.to_string())
+        }
     })
 }
 
@@ -334,8 +367,28 @@ pub fn read_secret_0600(path: &Path) -> Result<Vec<u8>, CredError> {
 /// for the atomicity contract.
 fn stage_token(out_dir: &Path, secret_name: &str, bytes: &[u8]) -> Result<PathBuf, CredError> {
     let dest = out_dir.join(secret_name);
-    write_secret_0600(&dest, bytes)?;
-    Ok(dest)
+    match write_secret_0600(&dest, bytes)? {
+        StageOutcome::Ok => Ok(dest),
+        // The initial mint has no previous valid token a consumer is already
+        // reading and no lease yet to hand back, so a not-yet-durable write is
+        // treated the same as any other staging failure here (unlike the refresh
+        // path in `refresh_once_with`, which does have a live reader, #196).
+        StageOutcome::NotDurable(e) => Err(e),
+    }
+}
+
+/// The outcome of a successful [`write_secret_0600`] call: either the write is
+/// fully durable, or the rename landed but the trailing directory sync failed
+/// (#196). Kept out of [`CredError`] (`sandy-api`'s pinned seam contract) since
+/// only [`refresh_once_with`] needs to tell the two apart.
+#[derive(Debug)]
+enum StageOutcome {
+    /// The file is in place and durable.
+    Ok,
+    /// The file is in place (the rename already landed) but not yet durable; the
+    /// carried error is the directory-sync failure, for a caller that wants to
+    /// log it.
+    NotDurable(CredError),
 }
 
 /// Write `bytes` over `dest` as a `0600` file via atomic temp → sync → rename,
@@ -352,7 +405,13 @@ fn stage_token(out_dir: &Path, secret_name: &str, bytes: &[u8]) -> Result<PathBu
 ///
 /// Re-delivery (#49) reuses this to overwrite a lease's staged token in place with
 /// a freshly minted one; the rename makes that swap atomic for the reader.
-fn write_secret_0600(dest: &Path, bytes: &[u8]) -> Result<(), CredError> {
+///
+/// # Errors
+///
+/// Returns [`CredError::Stage`] when the write fails before the rename lands;
+/// returns `Ok(`[`StageOutcome::NotDurable`]`)`, not an error, when the rename
+/// landed but only the trailing directory sync failed (#196).
+fn write_secret_0600(dest: &Path, bytes: &[u8]) -> Result<StageOutcome, CredError> {
     let (Some(dir), Some(name)) = (
         dest.parent().filter(|p| !p.as_os_str().is_empty()),
         dest.file_name().and_then(|n| n.to_str()),
@@ -362,10 +421,13 @@ fn write_secret_0600(dest: &Path, bytes: &[u8]) -> Result<(), CredError> {
             dest.display()
         )));
     };
-    sandy_fsutil::OwnedDir::open(dir)
-        .and_then(|dir| dir.write_secret(name, bytes))
-        .map(drop)
-        .map_err(|e| CredError::Stage(e.to_string()))
+    match sandy_fsutil::OwnedDir::open(dir).and_then(|dir| dir.write_secret(name, bytes)) {
+        Ok(_) => Ok(StageOutcome::Ok),
+        Err(e @ sandy_fsutil::FsError::NotDurable { .. }) => {
+            Ok(StageOutcome::NotDurable(CredError::Stage(e.to_string())))
+        }
+        Err(e) => Err(CredError::Stage(e.to_string())),
+    }
 }
 
 /// Refuse trust material owned by another user: sandy writes it as the current
@@ -1148,6 +1210,50 @@ mod tests {
         );
         assert_eq!(lease.handle.id, "h-1", "lease untouched on failure");
         assert!(provider.revoked().is_empty(), "nothing revoked on failure");
+        Ok(())
+    }
+
+    /// Adversarial (#196): the rename inside `write_secret_0600` can land before its
+    /// trailing directory sync fails, leaving the new token in place and already
+    /// valid for a consumer reading the file. Revoking it there would leave the
+    /// guest reading a dead token until the next refresh tick, so a `NotDurable`
+    /// stage outcome must be a warning that still completes the refresh, never a
+    /// revoke of the live new token.
+    #[test]
+    fn a_dir_sync_only_failure_keeps_the_new_token_and_does_not_revoke_it() -> anyhow::Result<()> {
+        let provider = RotatingProvider::new();
+        let mut lease = Lease {
+            secret_ref: SecretRef {
+                name: "GH_TOKEN".to_string(),
+                source: SecretSource::File(PathBuf::from("/unused/GH_TOKEN")),
+            },
+            expires_at: SystemTime::now() - Duration::from_secs(10),
+            handle: CredentialHandle { id: "old".to_string() },
+        };
+
+        let refreshed = refresh_once_with(
+            &provider,
+            &mut lease,
+            SystemTime::now(),
+            Duration::from_secs(300),
+            |_dest, _bytes| {
+                Ok(StageOutcome::NotDurable(CredError::Stage(
+                    "simulated dir-sync failure".to_string(),
+                )))
+            },
+        )
+        .context("refresh_once_with")?;
+
+        assert!(refreshed, "a not-durable stage still completes the refresh");
+        assert_eq!(
+            lease.handle.id, "h-1",
+            "the lease advances to the freshly minted handle"
+        );
+        assert_eq!(
+            provider.revoked(),
+            vec!["old".to_string()],
+            "only the superseded token is revoked, never the new not-yet-durable one"
+        );
         Ok(())
     }
 

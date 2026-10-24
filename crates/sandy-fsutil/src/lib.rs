@@ -33,6 +33,21 @@ pub enum FsError {
         /// The underlying error.
         source: io::Error,
     },
+    /// A write already landed at its final name (a rename already happened),
+    /// but the directory sync that makes that durable failed. The file is in
+    /// place and readable now; it may just not survive a crash before the
+    /// next sync. Returned only by [`secret::OwnedDir::write_secret`]'s
+    /// trailing fsync, so a caller that cares can tell this apart from a
+    /// failure before the rename (#196).
+    #[error("{action} at {}: {source} (the file is already in place)", path.display())]
+    NotDurable {
+        /// What was being done.
+        action: &'static str,
+        /// The path it was done to.
+        path: PathBuf,
+        /// The underlying error.
+        source: io::Error,
+    },
     /// The path exists but is not safe to use: wrong owner, too-wide mode, a
     /// non-sticky world-writable parent. The reason names the rule.
     #[error("{reason} ({})", path.display())]
@@ -47,6 +62,14 @@ pub enum FsError {
 impl FsError {
     fn io(action: &'static str, path: &Path, source: impl Into<io::Error>) -> Self {
         Self::Io {
+            action,
+            path: path.to_owned(),
+            source: source.into(),
+        }
+    }
+
+    fn not_durable(action: &'static str, path: &Path, source: impl Into<io::Error>) -> Self {
+        Self::NotDurable {
             action,
             path: path.to_owned(),
             source: source.into(),

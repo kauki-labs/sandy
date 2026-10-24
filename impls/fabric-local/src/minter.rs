@@ -102,10 +102,13 @@ pub fn stage_secret(dir: &Path, name: &str, bytes: &[u8]) -> Result<SecretRef, S
     }
     let staging = OwnedDir::open(&dir).map_err(|e| match e {
         FsError::Unsafe { .. } => StageError::UnsafeDir(dir.clone()),
-        FsError::Io { path, source, .. } => StageError::Io { path, source },
+        FsError::Io { path, source, .. } | FsError::NotDurable { path, source, .. } => StageError::Io { path, source },
     })?;
+    // A work-secret has no previous valid value a consumer is already reading, so
+    // a not-yet-durable write is treated the same as any other staging failure
+    // (unlike the credential refresh path, #196, which has a live reader to protect).
     let dest = staging.write_secret(name, bytes).map_err(|e| match e {
-        FsError::Io { path, source, .. } => StageError::Io { path, source },
+        FsError::Io { path, source, .. } | FsError::NotDurable { path, source, .. } => StageError::Io { path, source },
         FsError::Unsafe { path, .. } => StageError::UnsafeDir(path),
     })?;
     Ok(SecretRef {

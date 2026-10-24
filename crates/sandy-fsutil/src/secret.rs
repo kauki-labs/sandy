@@ -186,9 +186,10 @@ impl OwnedDir {
     /// temporary name with `O_EXCL | O_NOFOLLOW`, synced, renamed over `name`, and
     /// the directory is synced. A reader never sees a partial or wider file. A
     /// failed write leaves no temporary behind. If the final directory sync fails,
-    /// the error is returned and the file stays in place, visible but possibly not
-    /// durable: removing it by name could delete a concurrent write of the same
-    /// name, and writing again replaces it.
+    /// [`FsError::NotDurable`] is returned and the file stays in place, visible and
+    /// already readable at its final name, but possibly not durable: removing it
+    /// by name could delete a concurrent write of the same name, and writing again
+    /// replaces it.
     ///
     /// `name` must be a single file name: empty, `.`, `..`, or a name containing
     /// `/` or NUL is refused.
@@ -223,7 +224,7 @@ impl OwnedDir {
         }
         self.handle
             .sync_all()
-            .map_err(|e| FsError::io("sync staging dir", &self.path, e))?;
+            .map_err(|e| FsError::not_durable("sync staging dir", &self.path, e))?;
         Ok(dest)
     }
 }
