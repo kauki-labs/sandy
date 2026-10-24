@@ -12,8 +12,8 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use sandy_control_proto::{
-    AttachResponse, CancelResponse, ControlError, ControlRequest, ControlResponse, JobSummary as WireJobSummary,
-    ListResponse, StatusResponse, SubmitResponse, control_request, control_response,
+    AttachResponse, CancelResponse, ControlError, ControlRequest, ControlResponse, JobStatus,
+    JobSummary as WireJobSummary, ListResponse, StatusResponse, SubmitResponse, control_request, control_response,
 };
 use sandy_executor_proto::{Dispatch, IsolationClass, SandboxKind};
 use sandy_fabric::{
@@ -27,7 +27,7 @@ use crate::{
     dispatch::{self, JobRegistry},
     host_registry::HostRegistry,
     link_auth::RemoteLink,
-    store::{CancelOutcome, InsertOutcome, JobStore, StoreError},
+    store::{CancelOutcome, InsertOutcome, JobStore, StoreError, Transition},
 };
 
 /// STAGE-1: untrusted jobs are inexpressible (no VM/untrusted backend yet,
@@ -275,6 +275,12 @@ pub async fn handle(
             let encoding = submit.manifest_encoding;
             let inserted_id = job_id.clone();
             let store_for_token = Arc::clone(store);
+            // Cloned before `store` itself is moved into the `insert_pending`
+            // spawn_blocking below (#292's silent-Pending family): if the
+            // placed dispatch can't actually be delivered, the failure branch
+            // near the end of this arm needs its own store handle to fail the
+            // job terminally instead of leaving it silently `Pending`.
+            let store_for_dispatch_failure = Arc::clone(store);
             let store = Arc::clone(store);
 
             // #327: a durable, re-presentable credential — independent of
@@ -445,21 +451,47 @@ pub async fn handle(
                 // send here fails fast instead of hanging. Deferred to #289,
                 // not fixed here.
                 //
-                // KNOWN GAP (#292's reconnect-dispatch-preservation class):
-                // on any failure here — including `RegistrationChanged` —
-                // the job stays silently `Pending` with no re-placement
-                // attempt and no distinct terminal status a caller could
-                // poll for; this only moves the existing "a placed job can
-                // silently never run" strand earlier (to send time) rather
-                // than eliminating it. Stage-1 accepts this as the same
-                // honest gap every other un-run `Pending` job already has in
-                // this module (no retry, no scheduler) — #292 tracks closing
-                // it for good (re-queue on reconnect, or a distinct status).
+                // #292 item 3 (also closes #303 item 4, the same strand in a
+                // different milestone): a failure here — `RegistrationChanged`
+                // or any other `DispatchSendError` — used to leave the job
+                // silently `Pending` forever, with no re-placement attempt
+                // and no distinct terminal status a caller could poll for.
+                // Re-placement is set aside (it would need a fresh
+                // `RemoteLink` bound to whatever host is current, not just a
+                // resend): failing the job terminally instead is the
+                // minimal fix that removes the silent-no-op, matching the
+                // same "never silently" bar `host_conn`'s own
+                // `fail_disconnected_job` already holds for a dispatch lost
+                // after delivery.
                 if let Err(e) = host_registry
                     .send_dispatch_if_current(&host_id, registration, dispatch)
                     .await
                 {
-                    tracing::warn!(error = %e, job_id, host_id, "could not dispatch the placed job to its host");
+                    tracing::warn!(
+                        error = %e,
+                        job_id,
+                        host_id,
+                        "could not dispatch the placed job to its host; failing it rather than leaving it silently Pending"
+                    );
+                    let reason = format!("could not dispatch to the placed host-executor: {e}");
+                    let fail_job_id = job_id.clone();
+                    let store = Arc::clone(&store_for_dispatch_failure);
+                    match tokio::task::spawn_blocking(move || {
+                        store.finish(&fail_job_id, JobStatus::Failed, None, &reason)
+                    })
+                    .await
+                    {
+                        Ok(Ok(Transition::Applied)) => {}
+                        Ok(Ok(other)) => {
+                            tracing::warn!(
+                                job_id,
+                                ?other,
+                                "could not fail the undelivered job: unexpected transition"
+                            )
+                        }
+                        Ok(Err(e)) => tracing::warn!(job_id, error = %e, "could not fail the undelivered job"),
+                        Err(e) => tracing::warn!(job_id, error = %e, "the fail-undelivered-job store task panicked"),
+                    }
                 }
             }
 
@@ -1994,6 +2026,58 @@ mod tests {
         assert!(
             job.remote_link.is_none(),
             "a job that failed placement must stay local, not carry a remote_link to nowhere"
+        );
+        Ok(())
+    }
+
+    /// Regression (#292 item 3, also closes #303 item 4 — the same strand):
+    /// when the placed dispatch cannot actually be delivered —
+    /// `send_dispatch_if_current` refuses because the connection it was
+    /// placed on already ended — the job must be failed terminally, not left
+    /// silently `Pending` forever with no distinct status a caller could
+    /// poll for. Forces the failure deterministically (dropping the host's
+    /// `dispatch_rx` before `handle` runs, so the internal send hits
+    /// `ConnectionClosing`) rather than racing a real reconnect — the same
+    /// underlying `DispatchSendError` family `RegistrationChanged` belongs
+    /// to; the handler's fix applies uniformly to any error from this call,
+    /// not just that one variant.
+    #[tokio::test]
+    async fn a_submit_fails_the_job_when_the_placed_dispatch_cannot_be_delivered() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        // Register the host, then immediately drop its dispatch_rx: the
+        // registry entry (and `pick_host_for`'s view of it) stays live, but
+        // any `send_dispatch`/`send_dispatch_if_current` against it now
+        // fails with `ConnectionClosing` — standing in for "the connection
+        // this dispatch was placed on already ended."
+        drop(register_test_host(
+            &host_registry,
+            "ws01",
+            peer_ip,
+            trusted_host_capabilities(),
+        ));
+
+        let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            submit_req(1),
+        )
+        .await?;
+        let job_id = match response.result {
+            Some(control_response::Result::Submit(SubmitResponse { job_id, .. })) => job_id,
+            other => anyhow::bail!(
+                "Submit must still succeed even when the placed dispatch can't be delivered, got {other:?}"
+            ),
+        };
+
+        assert_eq!(
+            store.status(&job_id)?,
+            Some(JobStatus::Failed),
+            "an undeliverable dispatch must fail the job terminally, not leave it silently Pending forever"
         );
         Ok(())
     }

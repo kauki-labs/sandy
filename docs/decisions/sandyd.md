@@ -902,19 +902,22 @@ host whose declared capabilities satisfy the required class, arbitrary
 order" — correct for D5's single-executor model, not a real scheduler;
 revisit once more than one executor exists to choose between.
 
-**Known gap, explicitly not fixed here** (#292's reconnect-dispatch-
-preservation class): when `send_dispatch_if_current` refuses —
-`RegistrationChanged` or any other `DispatchSendError` — the job stays
-silently `Pending`, with no re-placement attempt and no distinct terminal
-status a caller could poll for. This does not introduce a new strand; it
-only moves the existing "a placed job can silently never run" gap earlier,
-from the agent-link stream (decision 6's own token-based refusal) to
-`send_dispatch` time. Stage-1 accepts it as the same honest gap every other
-un-run `Pending` job already has in this module (no retry, no scheduler).
-#292 tracks closing it for real: either re-queue the undelivered dispatch
-onto a reconnecting host, or surface non-delivery as a distinct status
-rather than leaving a stranded job externally indistinguishable from a slow
-one.
+**Closed** (#292 item 3, which also closed #303 item 4 — the same strand):
+when `send_dispatch_if_current` refuses — `RegistrationChanged` or any
+other `DispatchSendError` — `handle`'s `Submit` arm now fails the job
+terminally (`JobStore::finish` to `Failed`) instead of leaving it silently
+`Pending` forever with no re-placement attempt and no distinct status a
+caller could poll for. Re-placement (re-queuing the undelivered dispatch
+onto a reconnecting host) was set aside in favor of this simpler fix: it
+would need a fresh `RemoteLink` bound to whatever host is current, not just
+a resend, and failing the job removes the silent no-op either way.
+`host_conn::serve_host_executor`'s own connection loop got the matching fix
+for the same family (#292 item 2): a dispatch is now tracked as in-flight
+the moment it's popped off its channel, not only once its write to the wire
+succeeds, and the loop drains any dispatches still sitting unread in the
+channel before it tears down — so a dispatch lost to a write failure, a
+write timeout, or a same-peer reclaim racing the connection's own fault
+detection is always failed terminally, never silently dropped.
 
 **Set aside.** Adding a `SubmitRequest.required_isolation_class` wire field
 now (the alternative to the stage-1 constant): premature configurability for

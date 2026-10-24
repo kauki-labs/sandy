@@ -202,12 +202,14 @@ pub async fn serve_host_executor(
     let (frame_tx, mut frame_rx) = mpsc::channel(1);
     let reader_task = tokio::spawn(forward_frames(read_half, frame_tx));
 
-    // Jobs dispatched down this connection that have not yet reported a result
-    // (#292). A job is added once its Dispatch is actually written to the wire,
-    // and removed when its `JobResult` arrives; whatever remains when the
-    // connection ends never ran to a reported result and is failed terminally
-    // below, so a job can never stay stuck PENDING/RUNNING after its host is
-    // gone.
+    // Jobs popped off `dispatch_rx` that have not yet reported a result
+    // (#292). A job is added the moment it's popped — whether or not the
+    // write to the wire that follows then actually succeeds — and removed
+    // when its `JobResult` arrives; whatever remains when the connection
+    // ends (including a dispatch whose write failed, timed out, or was never
+    // attempted because the loop ended first) never ran to a reported result
+    // and is failed terminally below, so a job can never stay stuck
+    // PENDING/RUNNING after its host is gone.
     let mut in_flight: HashSet<String> = HashSet::new();
 
     loop {
@@ -220,6 +222,15 @@ pub async fn serve_host_executor(
                     break;
                 };
                 let job_id = dispatch.job_id.clone();
+                // Track this job from the moment it's popped off the channel,
+                // BEFORE the write below even starts (#292's silent-Pending
+                // family) — not only once the write succeeds. If the write
+                // fails or times out, the loop breaks without ever reaching
+                // the success arm; without this, that dispatch would never
+                // enter `in_flight` and the cleanup after the loop (below)
+                // would have nothing to fail it with, leaving it stuck
+                // PENDING forever despite having been popped and attempted.
+                in_flight.insert(job_id.clone());
                 match tokio::time::timeout(
                     DISPATCH_WRITE_TIMEOUT,
                     write_frame(&mut write_half, &OrchestratorMessage { op: Some(orchestrator_message::Op::Dispatch(dispatch)) }),
@@ -230,7 +241,6 @@ pub async fn serve_host_executor(
                         // The dispatch reached the host: advance the job
                         // PENDING -> RUNNING and track it until its result
                         // comes back (or the connection dies).
-                        in_flight.insert(job_id.clone());
                         mark_job_running(store, &job_id).await;
                     }
                     Ok(Err(_)) => {
@@ -316,6 +326,24 @@ pub async fn serve_host_executor(
     // returns, so the connection is actually closed, not just forgotten.
     reader_task.abort();
     let _ = reader_task.await;
+
+    // The loop above can end with dispatches still sitting UNREAD in
+    // `dispatch_rx`'s buffer — e.g. a same-peer reclaim (#292 item 4) whose
+    // `register` call drops this connection's senders concurrently with
+    // dispatches still queued behind a stalled write; `select!` can resolve
+    // a different, also-ready branch (`frame_rx`/`attach_state_rx` going to
+    // `None`) before ever observing them. Without draining here, those items
+    // would simply be dropped when `dispatch_rx` goes out of scope at the
+    // end of this function — the same silent loss #292 items 2/3 describe,
+    // just via a different trigger than the write failing outright. `close()`
+    // first so a `send` racing this drain can't land in the gap between it
+    // and `registry.remove` below and be lost the exact same way; everything
+    // already buffered is then folded into `in_flight` so the cleanup loop
+    // immediately below fails it like any other stranded job.
+    dispatch_rx.close();
+    while let Ok(dispatch) = dispatch_rx.try_recv() {
+        in_flight.insert(dispatch.job_id);
+    }
 
     // The connection is gone. Any job still in flight on it never reported a
     // result and never will (decision 12: no reconnect, no redelivery) — fail
@@ -916,6 +944,78 @@ mod tests {
             .await
             .context("the host-executor's peer must observe EOF once the connection is torn down, not hang")?
             .context("reading the leftover bytes to EOF")?;
+
+        drop(client);
+        Ok(())
+    }
+
+    /// Regression (#292 items 2/3's silent-Pending family, and the new
+    /// strand this same fix covers): every dispatch popped off `dispatch_rx`
+    /// before the connection ends must land in a terminal store state, never
+    /// left silently `Pending` — whether its own write failed, timed out, or
+    /// (job-2/job-3 here) was never even attempted because job-1's write
+    /// stalled first and the loop exited on its timeout before draining the
+    /// rest of the channel. Unlike `a_hung_host_is_disconnected_after_the_dispatch_write_timeout`,
+    /// which only proves the channel-level `DispatchSendError` behaviour
+    /// against a throwaway store, this inserts each job `Pending` first and
+    /// asserts the real terminal status — a store with no rows for these ids
+    /// would let a broken fix pass vacuously (`fail_disconnected_job`'s
+    /// `NotFound` case is silently ignored).
+    #[tokio::test(start_paused = true)]
+    async fn every_dispatch_popped_before_the_connection_ends_is_failed_not_left_pending() -> anyhow::Result<()> {
+        let allowlist = ExecutorAllowlist::new(["100.64.0.7".parse()?]);
+        let registry = HostRegistry::default();
+        let (mut client, server) = tokio::io::duplex(64);
+
+        write_frame(
+            &mut client,
+            &HostExecutorMessage {
+                op: Some(host_executor_message::Op::Register(Register {
+                    host_id: "ws01".to_owned(),
+                    capabilities: Some(capabilities()),
+                })),
+            },
+        )
+        .await?;
+
+        let store = test_store();
+        for job_id in ["job-1", "job-2", "job-3"] {
+            store.insert_pending(job_id, b"m", "test/v1")?;
+        }
+
+        let registry = std::sync::Arc::new(registry);
+        let allowlist = std::sync::Arc::new(allowlist);
+        let serve = tokio::spawn({
+            let registry = std::sync::Arc::clone(&registry);
+            let allowlist = std::sync::Arc::clone(&allowlist);
+            let store = std::sync::Arc::clone(&store);
+            async move {
+                serve_host_executor(Box::new(server), tcp_peer("100.64.0.7"), &allowlist, &registry, &store).await;
+            }
+        });
+
+        let _registered: OrchestratorMessage = read_frame(&mut client)
+            .await?
+            .context("expected a Registered response")?;
+
+        // job-1's write stalls immediately (the duplex buffer is too small
+        // for even one frame); job-2 and job-3 queue behind it in the
+        // channel, never popped before the loop below exits on the write
+        // timeout.
+        registry.send_dispatch("ws01", test_dispatch("job-1")).await?;
+        registry.send_dispatch("ws01", test_dispatch("job-2")).await?;
+        registry.send_dispatch("ws01", test_dispatch("job-3")).await?;
+
+        tokio::time::advance(DISPATCH_WRITE_TIMEOUT + std::time::Duration::from_millis(1)).await;
+        serve.await?;
+
+        for job_id in ["job-1", "job-2", "job-3"] {
+            assert_eq!(
+                store.status(job_id)?,
+                Some(JobStatus::Failed),
+                "{job_id} must be failed, not left silently Pending, once its host-executor connection ends"
+            );
+        }
 
         drop(client);
         Ok(())
