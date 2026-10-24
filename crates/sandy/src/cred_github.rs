@@ -38,29 +38,45 @@ const GITHUB_API: &str = "https://api.github.com";
 /// seam's revoke-at-teardown is the real bound; this is only the backstop.
 const GITHUB_TOKEN_TTL: Duration = Duration::from_secs(3600);
 
-/// Connect/read timeout for every GitHub API call this adapter makes (#195
-/// follow-up). Without a bound, a stalled call has no end: `refresh_loop`'s
-/// heartbeat runs synchronously before each
-/// `refresh_once` call and can't tick again until it returns, so a hung
-/// `refresh` could hold `cred_dir`'s mtime still long enough for `gc` to
-/// sweep a dir still in use. A quarter of `MAX_TTL_SECS` leaves
-/// three-quarters of the sweep window as margin even in the worst case,
-/// derived from `MAX_TTL_SECS` (not a sibling constant) so the two can never
-/// drift apart the way `DEFAULT_REFRESH_TICK_SECS` could without its own
-/// compile-time assertion. Real GitHub calls finish in seconds, so this
-/// ceiling is a defensive bound, never a typical latency.
-const HTTP_TIMEOUT: Duration = Duration::from_secs((MAX_TTL_SECS / 4) as u64);
+/// Retries per GitHub API call before giving up, pinned explicitly at
+/// octocrab's own default (`RetryConfig::Simple(3)`, i.e. up to 3 retries
+/// after the initial attempt) rather than left implicit, so [`HTTP_TIMEOUT`]'s
+/// sizing below can account for the true worst case, every attempt, not one.
+const HTTP_RETRIES: usize = 3;
 
-/// `Octocrab::builder()` with the connect/read timeout applied (see
-/// [`HTTP_TIMEOUT`]). Takes `timeout` as a parameter, rather than reaching
-/// for the constant directly, so a test can exercise the exact mechanism
-/// production uses with a timeout short enough to run in milliseconds.
+/// Connect/read timeout for ONE attempt of a GitHub API call this adapter
+/// makes (#195 follow-up). Without a bound, a stalled call has no end:
+/// `refresh_loop`'s heartbeat runs synchronously before each `refresh_once`
+/// call and can't tick again until it returns, so a hung `refresh` could
+/// hold `cred_dir`'s mtime still long enough for `gc` to sweep a dir still
+/// in use. A retried call pays this timeout up to `HTTP_RETRIES + 1` times
+/// before giving up, so the true worst-case stall is `(HTTP_RETRIES + 1) *
+/// HTTP_TIMEOUT`, not `HTTP_TIMEOUT` alone; sizing at `MAX_TTL_SECS / (2 *
+/// (HTTP_RETRIES + 1))` keeps that worst case at half of `MAX_TTL_SECS`,
+/// leaving the other half as margin for the heartbeat tick and normal
+/// operation. Derived from `MAX_TTL_SECS` (not a sibling constant) so the
+/// two can never drift apart the way `DEFAULT_REFRESH_TICK_SECS` could
+/// without its own compile-time assertion. Real GitHub calls finish in
+/// seconds, so this ceiling, and its retried worst case, are defensive
+/// bounds, never typical latency. See decision 6's Consequences for the
+/// residual gaps this bound doesn't close (a trickling response resets the
+/// per-read timeout; a tick configured close to `MAX_TTL_SECS` still eats
+/// into the margin; a retried mint can orphan a token until its native
+/// expiry).
+const HTTP_TIMEOUT: Duration = Duration::from_secs((MAX_TTL_SECS / (2 * (HTTP_RETRIES as u32 + 1))) as u64);
+
+/// `Octocrab::builder()` with the connect/read timeout and retry count
+/// applied (see [`HTTP_TIMEOUT`] / [`HTTP_RETRIES`]). Takes `timeout` as a
+/// parameter, rather than reaching for the constant directly, so a test can
+/// exercise the exact mechanism production uses with a timeout short enough
+/// to run in milliseconds.
 fn timeout_capped_builder(
     timeout: Duration,
 ) -> OctocrabBuilder<NoSvc, DefaultOctocrabBuilderConfig, NoAuth, NotLayerReady> {
     Octocrab::builder()
         .set_connect_timeout(Some(timeout))
         .set_read_timeout(Some(timeout))
+        .add_retry_config(octocrab::service::middleware::retry::RetryConfig::Simple(HTTP_RETRIES))
 }
 
 /// The scoped body for `POST /app/installations/{id}/access_tokens`.
@@ -336,12 +352,18 @@ mod tests {
     fn timeout_capped_builder_bounds_a_stalled_request() -> anyhow::Result<()> {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").context("bind a local listener")?;
         let port = listener.local_addr().context("local_addr")?.port();
-        // Accept the connection and hold it well past the client's own
-        // timeout, then drop it; the client's timeout is what must end the
-        // call, not this thread.
+        // Accept every attempt the client makes (the initial call plus every
+        // retry) and hold each connection well past the client's own
+        // per-attempt timeout before dropping it; the client's timeout is
+        // what must end each attempt, not this thread. Exactly HTTP_RETRIES
+        // + 1 connections are expected, since a stalled attempt always times
+        // out and always retries under timeout_capped_builder's real config.
         std::thread::spawn(move || {
-            if let Ok((_stream, _)) = listener.accept() {
-                std::thread::sleep(Duration::from_secs(3));
+            for _ in 0..=HTTP_RETRIES {
+                match listener.accept() {
+                    Ok((_stream, _)) => std::thread::sleep(Duration::from_millis(500)),
+                    Err(_) => break,
+                }
             }
         });
 
@@ -353,13 +375,12 @@ mod tests {
         let started = std::time::Instant::now();
         // Build the client INSIDE the runtime: octocrab's tower Buffer spawns
         // a worker at build time, which needs an active reactor (same reason
-        // app_client()/installation_permissions() do this).
+        // app_client()/installation_permissions() do this). Uses
+        // timeout_capped_builder's real retry config (unmodified), so this
+        // exercises production's actual worst case: every attempt timing out.
         let result: Result<serde_json::Value, _> = runtime.block_on(async {
             let client = timeout_capped_builder(short_timeout)
                 .base_uri(format!("http://127.0.0.1:{port}"))?
-                // A stalled connection is not a rate-limit response: disable
-                // retries so the test measures one timeout, not up to four.
-                .add_retry_config(octocrab::service::middleware::retry::RetryConfig::None)
                 .build()?;
             client.get("/ping", None::<&()>).await
         });
@@ -370,8 +391,12 @@ mod tests {
             "a stalled server must surface as an error, not hang forever"
         );
         assert!(
-            elapsed < Duration::from_secs(2),
-            "the call must fail at roughly the configured timeout, not wait out the stalled server: {elapsed:?}"
+            elapsed >= short_timeout,
+            "a near-instant error would mean this test isn't actually exercising the timeout: {elapsed:?}"
+        );
+        assert!(
+            elapsed < short_timeout * 10,
+            "every attempt stalling must still fail within roughly (retries + 1) * timeout, not hang: {elapsed:?}"
         );
         Ok(())
     }

@@ -203,8 +203,11 @@ sequenceDiagram
   is best-effort: a staging base that can't be validated or listed is logged and
   skipped, never blocking `gc`'s record eviction. A stalled refresh call could
   itself block the heartbeat (the two run sequentially), so the GitHub adapter
-  bounds every API call to `HTTP_TIMEOUT` (a quarter of `MAX_TTL_SECS`), closing
-  the gap at its source rather than only at the heartbeat.
+  pins both a per-attempt timeout and its retry count (`HTTP_TIMEOUT` /
+  `HTTP_RETRIES`), bounding every API call's worst case at `MAX_TTL_SECS / 2`
+  and closing the gap at its source rather than only at the heartbeat; see
+  decision 6 for the residual gaps (a trickling response, a tick configured
+  close to the threshold, a mint lost to a retry) this doesn't close.
 
 **KPI.**
 
