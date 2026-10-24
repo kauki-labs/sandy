@@ -917,8 +917,11 @@ happy path).
   disconnected in the narrow window between being picked and the send) fails
   the job terminally rather than leaving it silently `Pending` forever (see
   the "Closed" paragraph below for the full history of that fix). No host
-  picked (including none registered, or none configured) means the job
-  stays local, today's unchanged behavior.
+  picked means the job stays local only for a `Process`-required job
+  (including none registered, or none configured — today's unchanged
+  behavior); a `flake/v1` (VM-required) job with no host picked is refused
+  at `Submit` instead (`vm_placement_error`), before the job is ever
+  persisted — it never silently falls back to local.
 - Stage-1 required-class default: `STAGE1_REQUIRED_ISOLATION_CLASS = IsolationClass::Trusted`,
   a named constant with a loud tripwire comment at its definition (not an
   inline magic value), because nothing on the submit path can express an
