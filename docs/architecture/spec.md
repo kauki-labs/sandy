@@ -48,15 +48,27 @@ from a fake.
   (`docs/decisions/sandyd.md` decision 14's amendment) — can flip or move
   while the job is still running, instead of a `u32` seconds value baked
   into one `Instant` computed once at the start. `ProcessBackend`'s poll
-  loop reads it live each tick; the VM backends thread it through `RunSpec`
-  for contract compliance but don't yet honor it dynamically (named as an
-  explicit gap in the decision record, not silently left).
+  loop reads it live each tick; so does the VM console driver (#185, decision
+  14's amendment): `run_console`'s per-phase (boot/command) budget stays
+  authoritative for a run nothing ever touches, but the moment something
+  moves the control's deadline away from the value it carried when the run
+  started, the live value takes over — and `is_cancelled()` always ends the
+  run immediately, in either phase.
+- **A short poll quantum, not a read bound to the whole budget (#185).** The
+  console socket/PTY read timeout is a fixed ~250ms poll quantum
+  (`console::POLL_QUANTUM`), reported to the driver as `ReadEvent::Idle`
+  (distinct from `ReadEvent::Closed`, real EOF) rather than the old `Ok(0)`
+  that conflated the two. This is what lets `run_console` re-check the live
+  `RunControl` on every tick instead of blocking for the whole run on one
+  read call.
 
 **KPI.**
 
 - Integration: `qemu_args` / `vfkit_args` argv assembly and the console protocol
   (sentinel framing, `parse_exit`) as unit tests; `host_matrix` classification over
-  a real observation.
+  a real observation; `console::tests` drives `run_console` against a scripted
+  `Transport` and a real `RunControl` over genuine elapsed time (suspend/cancel/
+  idle-vs-closed, #185).
 - End-to-end: `live_boot.rs` tests `real_boot_collect_succeeds`,
   `cli_lifecycle_over_a_real_job`, `guest_failure_is_a_task_fault`.
 

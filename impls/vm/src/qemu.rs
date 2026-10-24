@@ -526,15 +526,17 @@ fn connect_serial(sock: &Path, budget: Duration) -> Result<UnixStream, BackendEr
 }
 
 /// Connect the guest serial socket and drive the console protocol to an
-/// [`Outcome`]. The socket read timeout carries the run deadline, so a silent
-/// guest resolves through the protocol's timeout path rather than blocking.
+/// [`Outcome`]. The socket read timeout is a short poll quantum, not the run
+/// deadline: `run_console` enforces the deadline (and `spec.control`'s live
+/// cancellation/suspension, #340/#185) itself on every idle tick, so a silent
+/// guest resolves through its timeout path rather than blocking.
 fn drive_console(spec: &RunSpec, run_id: Uuid, sock: &Path) -> Outcome {
-    let budget = Duration::from_secs(u64::from(spec.timeout_secs.max(1)));
-    let stream = match connect_serial(sock, budget) {
+    let connect_budget = Duration::from_secs(u64::from(spec.timeout_secs.max(1)));
+    let stream = match connect_serial(sock, connect_budget) {
         Ok(stream) => stream,
         Err(err) => return transport_outcome(&err),
     };
-    if let Err(err) = stream.set_read_timeout(Some(budget)) {
+    if let Err(err) = stream.set_read_timeout(Some(crate::console::POLL_QUANTUM)) {
         return transport_outcome(&BackendError::Transport(format!("set serial read timeout: {err}")));
     }
     let reader = match stream.try_clone() {
@@ -1025,6 +1027,95 @@ mod tests {
         if let Some(state) = boxes.first() {
             backend.kill(&state.box_id).context("tear the box down")?;
         }
+        Ok(())
+    }
+
+    /// Tier-3 (#185/#340): suspending a real KVM-backed job's `RunControl`
+    /// deadline before it runs lets it survive well past its own declared
+    /// `timeout_secs`, proving the fix end to end (argv → qemu → serial console
+    /// → `run_console`), not just at the `run_console` unit level.
+    #[test]
+    #[ignore = "tier-3: real qemu/KVM boot on a Linux node; host-gated (INV-S9), binds into #185/#340"]
+    fn suspending_the_control_survives_past_the_jobs_timeout_on_kvm() -> anyhow::Result<()> {
+        let backend = QemuBackend::new();
+        let command = ["sh".to_string(), "-c".to_string(), "sleep 20; echo done".to_string()];
+        let control = sandy::RunControl::with_timeout_secs(5);
+        control.suspend_deadline();
+        let spec = RunSpec {
+            template: "demo",
+            command: &command,
+            inputs: &[],
+            outputs: &[],
+            secrets: &[],
+            env: &[],
+            cpu: None,
+            mem: None,
+            timeout_secs: 5,
+            grants: &NO_GRANTS,
+            outcome_file: None,
+            secret_dir: None,
+            control: &control,
+        };
+
+        let outcome = backend.run(&spec).context("boot the job on KVM")?;
+        assert!(
+            !outcome.timed_out,
+            "a suspended deadline must survive well past the 5s budget: {outcome:?}"
+        );
+        assert_eq!(outcome.guest_exit, Some(0), "console: {}", outcome.console);
+        Ok(())
+    }
+
+    /// Tier-3 (#185/#340): `daemon cancel` ends a real KVM-backed job promptly,
+    /// well before its own long declared `timeout_secs`.
+    #[test]
+    #[ignore = "tier-3: real qemu/KVM boot on a Linux node; host-gated (INV-S9), binds into #185/#340"]
+    fn cancelling_the_control_ends_a_running_job_on_kvm() -> anyhow::Result<()> {
+        let backend = QemuBackend::new();
+        let command = ["sh".to_string(), "-c".to_string(), "sleep 60".to_string()];
+        let control = sandy::RunControl::with_timeout_secs(120);
+        let spec = RunSpec {
+            template: "demo",
+            command: &command,
+            inputs: &[],
+            outputs: &[],
+            secrets: &[],
+            env: &[],
+            cpu: None,
+            mem: None,
+            timeout_secs: 120,
+            grants: &NO_GRANTS,
+            outcome_file: None,
+            secret_dir: None,
+            control: &control,
+        };
+
+        let start = Instant::now();
+        let outcome = std::thread::scope(|scope| {
+            let handle = scope.spawn(|| backend.run(&spec));
+            std::thread::sleep(Duration::from_secs(5));
+            control.cancel();
+            handle.join().expect("run thread panicked")
+        })
+        .context("boot the job on KVM")?;
+
+        // The fixed 5s sleep before cancelling can't be synchronized against
+        // real boot completion (`run_console`'s own boot-ready signal isn't
+        // observable from outside the blocking `backend.run()` call), so a
+        // slow boot can land the cancel during the boot phase rather than the
+        // command phase. Both are a correct "cancel ended it" outcome —
+        // `booted: false, timed_out: false` (cancelled before the guest ever
+        // reported ready) or `booted: true, timed_out: true` (cancelled mid
+        // command) — the test only needs to prove cancellation ends the run
+        // promptly, not which phase it landed in.
+        assert!(
+            !outcome.booted || outcome.timed_out,
+            "cancellation must end the job, either before boot or mid-command: {outcome:?}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "cancellation must end the run promptly, not wait near the 120s budget"
+        );
         Ok(())
     }
 

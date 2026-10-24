@@ -20,7 +20,8 @@ mod share;
 mod vfkit;
 
 pub use console::{
-    Markers, PipeTransport, Protocol, ProtocolStep, PtyTransport, TimeoutPolicy, Transport, parse_exit, run_console,
+    Markers, PipeTransport, Protocol, ProtocolStep, PtyTransport, ReadEvent, TimeoutPolicy, Transport, parse_exit,
+    run_console,
 };
 pub use qemu::{QemuBackend, StagedArgs as QemuStagedArgs, qemu_args, qemu_bin_override};
 pub use share::{VirtioFsTransport, VirtiofsdTransport, virtiofsd_args};
