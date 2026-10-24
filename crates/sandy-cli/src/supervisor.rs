@@ -613,6 +613,10 @@ impl<P: CredentialProvider + ?Sized> Drop for CredTeardown<'_, P> {
 pub const DEFAULT_REFRESH_MARGIN_SECS: u64 = 300;
 /// Default interval between refresh checks while a credentialed job runs (60s).
 pub const DEFAULT_REFRESH_TICK_SECS: u64 = 60;
+// #195: `safe_heartbeat_tick`'s fallback relies on this default staying well
+// below `MAX_TTL_SECS`; enforced at compile time so a future bump of either
+// constant can't silently reopen the gap the heartbeat exists to close.
+const _: () = assert!(DEFAULT_REFRESH_TICK_SECS < MAX_TTL_SECS as u64);
 
 /// Read a refresh interval (seconds) from `env_key`, falling back to `default`. The
 /// tick is floored at 1s so a misconfigured `0` can't spin the poll loop.

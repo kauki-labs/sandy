@@ -154,9 +154,11 @@ loop) gets no heartbeat and needs none: it is always removed well within
 `MAX_TTL_SECS` on any non-crash path. Sweep safety for a live job needs the
 gap between heartbeats, one tick plus one refresh call's latency, to stay
 under `MAX_TTL_SECS`; the refresh margin plays no part, since the heartbeat
-fires every tick regardless of whether a refresh does. The 60s default tick
-satisfies that by a wide margin, and `safe_heartbeat_tick` enforces the floor
-even under a misconfigured override.
+fires every tick regardless of whether a refresh does. `safe_heartbeat_tick`
+caps a misconfigured `SANDY_REFRESH_TICK_SECS` at the default rather than
+honoring one that reaches `MAX_TTL_SECS`, and a compile-time assertion ties
+the default itself to `MAX_TTL_SECS` so the two constants can't drift apart
+unnoticed.
 
 **Set aside.** Tracking each staging dir's mint time in a side file (instead
 of reading mtime) was considered and rejected: it adds a second piece of
