@@ -234,7 +234,7 @@ mod tests {
         let (mut write_side, mut read_side) = tokio::io::duplex(4096);
         let message = HostExecutorMessage {
             op: Some(host_executor_message::Op::Register(Register {
-                host_id: "ws01".to_owned(),
+                host_id: "remote-host".to_owned(),
                 capabilities: Some(Capabilities {
                     supported_sandbox_kinds: vec![SandboxKind::Process.into()],
                     arch: Arch::X8664.into(),
@@ -292,7 +292,7 @@ mod tests {
             &mut write_side,
             &OrchestratorMessage {
                 op: Some(orchestrator_message::Op::Registered(Registered {
-                    host_id: "ws01".to_owned(),
+                    host_id: "remote-host".to_owned(),
                 })),
             },
         )

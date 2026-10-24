@@ -174,7 +174,7 @@ pub fn topology(source: &str) -> Result<Topology, BackendError> {
 /// `sandy-guest-template`, a CLI/operator-shaped crate, see that crate's own
 /// doc comment). Needed on a host whose environment setup (PAM, systemd
 /// session handling, etc.) does not reliably carry a unit's own
-/// `Environment=PATH=` through to the spawned child — confirmed on ws01
+/// `Environment=PATH=` through to the spawned child — confirmed on the remote host
 /// (#335/#336): `SANDY_NIX_BIN` alone did not help if THIS call site still
 /// did a bare `PATH` lookup (CodeRabbit finding on #336).
 fn nix_bin() -> String {

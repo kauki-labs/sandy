@@ -1185,7 +1185,7 @@ host-executor that must run it via `QemuBackend`, not `ProcessBackend`.
 `Capabilities.kind` (both the wire `sandy_executor_proto::Capabilities` and
 decision 15's placement logic) was a SINGULAR `SandboxKind` — one executor
 process declares exactly one kind. A host that already runs `Process` jobs
-(ws01, today) and gains VM capability needs to declare BOTH without losing
+(the remote host, today) and gains VM capability needs to declare BOTH without losing
 the existing declaration; a singular field can't express that, and
 `pick_host_for`/`send_dispatch` had no sandbox-kind dimension at all —
 `Dispatch.backend` was set from whatever the picked host happened to declare,
@@ -1199,8 +1199,8 @@ supported_sandbox_kinds` — the same field NUMBER, mirroring the existing
   same message. Kept the number, not moved to a fresh one: `prost` decodes an
   old singular-enum wire value as a one-element repeated field, so a
   not-yet-redeployed host-executor sending the old shape still registers
-  correctly as `[kind]` (proven live: `live_ws01_attach.rs` passes unmodified
-  against ws01's OLD deployed binary on this branch's `sandyd`). This is a
+  correctly as `[kind]` (proven live: `live_remote_host_attach.rs` passes unmodified
+  against the remote host's OLD deployed binary on this branch's `sandyd`). This is a
   breaking proto change in general, but safe here specifically: `Capabilities`
   is never persisted, only ever sent live over an active `Register`
   connection, so there is no stored old-shape data to migrate.

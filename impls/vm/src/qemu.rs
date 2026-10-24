@@ -206,7 +206,7 @@ pub fn qemu_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> Re
 /// [`spawn_virtiofsd`](crate::share::spawn_virtiofsd): bypassing a bare-name
 /// `PATH` lookup entirely, needed on a host whose environment setup (PAM,
 /// systemd session handling, etc.) does not reliably carry the unit's own
-/// `Environment=PATH=` through to the spawned child — confirmed on ws01
+/// `Environment=PATH=` through to the spawned child — confirmed on the remote host
 /// (#335 follow-up): the deployed unit's resolved PATH silently reverted to
 /// a stock per-user NixOS profile path with no qemu on it, despite the
 /// unit's own `path =` correctly listing it.

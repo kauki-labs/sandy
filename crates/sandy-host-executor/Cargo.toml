@@ -38,7 +38,7 @@ sandy-fabric-local.workspace = true
 sandy-guest-template.workspace = true
 sandy-impls-local.workspace = true
 # The remote VM dispatch branch's backend (#332): qemu/x86_64-linux is this
-# crate's own target (ws01-shaped), so the VM impl is pulled in directly,
+# crate's own target (the remote host's shape), so the VM impl is pulled in directly,
 # not through the `sandy-backend` feature-gated hub `sandy-cli` uses — this
 # crate already depends on `sandy-impls-local` the same direct way.
 sandy-impls-vm.workspace = true

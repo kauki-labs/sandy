@@ -1,6 +1,6 @@
-# The ws01 host-executor service (#287, M2 stage 1: trusted-process only, no
+# The remote-host host-executor service (#287, M2 stage 1: trusted-process only, no
 # VM/agent-image). ADDITIVE ONLY — this module must never touch
-# `nix.buildMachines`, the nix daemon, or build users: ws01 is the sandy
+# `nix.buildMachines`, the nix daemon, or build users: the remote host is the sandy
 # swarm's x86_64 remote build backend, and this service is layered alongside
 # that role, never inside it. It only adds a user, a group, a service, and
 # whatever packages the service's own PATH needs.
@@ -169,14 +169,14 @@ in
     # session anyway). What actually keeps a dispatched job alive is
     # lingering keeping `user@<uid>.service` running independent of any
     # login session (see nix/tests/sandy-executor-vm.nix's job-cgroup
-    # assertion, and tracking issue #302 for the one open gap: if ws01 ever
+    # assertion, and tracking issue #302 for the one open gap: if the remote host ever
     # sets `StopIdleSessionSec` itself, protection is logind's no-TTY idle
-    # model, not this drop-in). Kept anyway in case ws01's own config ever
+    # model, not this drop-in). Kept anyway in case the remote host's own config ever
     # turns `KillUserProcesses` on for other accounts — a drop-in, not
     # `services.logind.settings`, because `KillExcludeUsers` is a
     # list-valued logind.conf key that ACCUMULATES across drop-in files
     # (systemd's own conf.d semantics) — this adds `sandy-executor` to
-    # whatever ws01's own logind.conf.d already excludes, rather than
+    # whatever the remote host's own logind.conf.d already excludes, rather than
     # risking the `services.logind.settings` module's single merged value
     # silently replacing it (security review, #299/sandy-73). Never assign
     # an empty value here: that RESETS the accumulated list.
@@ -207,7 +207,7 @@ in
 
       # bwrap is the mount-namespace confinement layer SystemdRunContainment
       # probes for (#142); scoped to this service's own PATH, not installed
-      # system-wide, so the only visible change to ws01's environment is this
+      # system-wide, so the only visible change to the remote host's environment is this
       # service's own process tree. `vm.enable` adds what a `flake/v1`
       # dispatch resolves+boots with: qemu, this host's own nix, virtiofsd
       # per guest share, and git for a `git+https://…` flake ref.
@@ -228,7 +228,7 @@ in
         SANDY_GUEST_WRAPPER = "${cfg.guestWrapperPackage}";
       }
       # Absolute-path overrides, bypassing a PATH lookup entirely (#335
-      # follow-up): confirmed live on ws01 that this unit's own `path =`
+      # follow-up): confirmed live on the remote host that this unit's own `path =`
       # correctly lists qemu/nix/virtiofsd/git, yet the ACTUAL resolved PATH
       # the running process sees reverts to a stock per-user NixOS profile
       # path with none of them — PAMName's session establishment appears to

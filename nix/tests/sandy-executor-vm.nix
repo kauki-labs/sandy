@@ -9,7 +9,7 @@
 # layer further out (the OS wiring around the binary, not the binary's own
 # logic). A manual first-boot log-watch (see nix/modules/README.md) is the
 # belt-and-suspenders fallback; this test is what actually gates it in CI,
-# before any ws01 apply.
+# before any remote-host apply.
 #
 # `main` (#288/#294) detects capabilities, then unconditionally dials
 # `SANDY_HOST_EXECUTOR_ORCHESTRATOR` before ever logging anything about the
@@ -55,7 +55,7 @@ testPkgs.testers.runNixOSTest {
       };
 
       # #300(b): a short StopIdleSessionSec, set here (NOT in the module —
-      # that's ws01-specific risk, not something this module should impose
+      # that's remote-host-specific risk, not something this module should impose
       # on a consuming host). NOTE this does not actually exercise
       # KillExcludeUsers: confirmed (sandy-73, #299) that `StopIdleSessionSec`
       # never fires against a TTY-less/no-display session in the first

@@ -244,7 +244,7 @@ fn probe_vm_facts() -> VmProbeFacts {
         // lookup `runs_successfully` does. The override and the fallback
         // name are the exact same ones `impls_vm::QemuBackend`'s own spawn
         // uses (`qemu_bin_override`), so the probe and the real boot can
-        // never drift onto different binaries (#335 follow-up: ws01's
+        // never drift onto different binaries (#335 follow-up: the remote host's
         // resolved PATH silently dropped qemu/virtiofsd/git despite the
         // unit's own `path =` listing them — this and `nix_bin` below
         // bypass that entirely rather than depend on PATH being trustworthy).

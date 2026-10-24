@@ -1,29 +1,30 @@
 //! Live acceptance for #332's combined scenario (acceptance tier 3 — the
 //! actual end-to-end case this whole chain of work was for): `sandy daemon
-//! submit --flake <ref> -- sh` places a flake-templated VM job on ws01, then
+//! submit --flake <ref> -- sh` places a flake-templated VM job on the remote host, then
 //! `sandy daemon attach` from a GENUINELY SEPARATE process types a command
 //! into the booted guest and reads real output back, detaches, and
 //! reattaches from a second separate process to confirm the durable attach
-//! token still grants post rights. Mirrors `live_ws01_attach.rs`'s own
+//! token still grants post rights. Mirrors `live_remote_host_attach.rs`'s own
 //! gating, orchestrator-spawning, and data-plane join helpers exactly
 //! (#327); the only difference is the manifest this submits (`flake/v1`
 //! instead of `argv/v1`, landing as `SandboxKind::Vm` instead of `Process`)
-//! and that the "real output" comes from inside a REAL qemu VM on ws01, not
+//! and that the "real output" comes from inside a REAL qemu VM on the remote host, not
 //! a bare host process.
 //!
 //! Gated on `SANDY_M2_REMOTE_HOST` in addition to the usual `SANDY_LIVE=1`
 //! (INV-S9): both must be set, or this refuses rather than green-skipping.
 //!
 //! BLOCKING DEPENDENCY (named explicitly, not attempted here): same as
-//! `live_ws01_flake_dispatch.rs` — ws01's deployed `sandy-host-executor`
+//! `live_remote_host_flake_dispatch.rs` — the remote host's deployed `sandy-host-executor`
 //! must be rebuilt with #332's VM-capability detection and redeployed before
 //! this test can place anything as `SandboxKind::Vm`. Until then, Submit is
 //! refused fail-closed with a named reason, not a hang or a silent
 //! misbehavior.
 //!
-//! Run manually once ws01 is redeployed:
-//!   SANDY_LIVE=1 SANDY_M2_REMOTE_HOST=100.64.0.3 \
-//!     cargo nextest run -p sandy-cli --features live --test live_ws01_flake_attach
+//! Run manually once the remote host is redeployed:
+//!   SANDY_LIVE=1 SANDY_M2_REMOTE_HOST=<this orchestrator's own mesh address> \
+//!     SANDY_M2_REMOTE_PEER=<remote host's mesh address> \
+//!     cargo nextest run -p sandy-cli --features live --test live_remote_host_flake_attach
 #![cfg(feature = "live")]
 
 use std::{
@@ -58,8 +59,8 @@ fn require_remote_executor() -> anyhow::Result<std::net::IpAddr> {
         .context("SANDY_M2_REMOTE_HOST is not a valid IP address")
 }
 
-/// See `live_ws01_flake_dispatch.rs`'s identical helper for the full
-/// rationale: ws01 resolves and builds this itself, never a prebuilt
+/// See `live_remote_host_flake_dispatch.rs`'s identical helper for the full
+/// rationale: the remote host resolves and builds this itself, never a prebuilt
 /// artifact.
 fn flake_ref() -> String {
     std::env::var("SANDY_M2_FLAKE_REF").unwrap_or_else(|_| {
@@ -171,15 +172,15 @@ async fn submit_flake(
     .context("Submit call")?;
     match response.result {
         Some(control_response::Result::Submit(r)) => Ok((r.job_id, r.attach_token)),
-        // See `live_ws01_flake_dispatch.rs`'s identical arm for why the hint
+        // See `live_remote_host_flake_dispatch.rs`'s identical arm for why the hint
         // is conditional, not unconditional (CodeRabbit finding on #336: an
         // unconditional suffix made every refusal look like "not yet
         // registered" to the retry loop below, which string-matches on it).
         Some(control_response::Result::Error(e)) => {
             let hint = if e.message.contains("SandboxKind::Vm") {
-                " (ws01's deployed sandy-host-executor has not been redeployed with #332's VM-capability detection \
-                 yet, a known, documented blocking dependency, not a bug in this test — or it has registered but not \
-                 yet declared Vm)"
+                " (the remote host's deployed sandy-host-executor has not been redeployed with #332's VM-capability \
+                 detection yet, a known, documented blocking dependency, not a bug in this test — or it has registered \
+                 but not yet declared Vm)"
             } else {
                 ""
             };
@@ -189,8 +190,8 @@ async fn submit_flake(
     }
 }
 
-/// Retry Submit until ws01 has actually registered — see
-/// `live_ws01_flake_dispatch.rs`'s identical helper for the full rationale
+/// Retry Submit until the remote host has actually registered — see
+/// `live_remote_host_flake_dispatch.rs`'s identical helper for the full rationale
 /// (a real host's `RestartSec=5s` redial loop does not align with any fixed
 /// wait; observed live, registration can land 10-15s after a connection
 /// drop, consistently past a flat 10s wait).
@@ -316,17 +317,17 @@ async fn read_until(
 }
 
 /// The real end-to-end acceptance floor for #332: a flake-templated VM job
-/// booted for real on ws01, then a GENUINELY SEPARATE attach process typing
+/// booted for real on the remote host, then a GENUINELY SEPARATE attach process typing
 /// a command into it and reading real output back from INSIDE the VM, then
 /// a SECOND separate process reattaching with only the durable token and
 /// confirming it still grants post rights.
 #[tokio::test]
-async fn a_separate_attach_process_drives_a_real_vm_booted_on_ws01() -> anyhow::Result<()> {
+async fn a_separate_attach_process_drives_a_real_vm_booted_on_remote_host() -> anyhow::Result<()> {
     let host = require_remote_executor()?;
     let tmp = tempfile::tempdir().context("temp dir")?;
 
     let remote_peer: std::net::IpAddr = std::env::var("SANDY_M2_REMOTE_PEER")
-        .unwrap_or_else(|_| "100.64.0.1".to_owned())
+        .context("refusing: set SANDY_M2_REMOTE_PEER to the real remote host-executor's mesh address")?
         .parse()
         .context("SANDY_M2_REMOTE_PEER is not a valid IP address")?;
 
@@ -379,10 +380,10 @@ async fn a_separate_attach_process_drives_a_real_vm_booted_on_ws01() -> anyhow::
     let (mut rd, mut wr) = join_data_plane(&attach_sock, &cap)
         .await
         .context("join the real VM job's data plane")?;
-    post_input(&mut wr, b"echo hello-from-ws01-vm\n")
+    post_input(&mut wr, b"echo hello-from-remote-host-vm\n")
         .await
         .context("post a command into the real VM's interactive shell")?;
-    read_until(&mut rd, "hello-from-ws01-vm", Duration::from_secs(20))
+    read_until(&mut rd, "hello-from-remote-host-vm", Duration::from_secs(20))
         .await
         .context("waiting for the real VM's shell to echo the command's real output back")?;
 

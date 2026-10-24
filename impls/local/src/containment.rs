@@ -218,7 +218,7 @@ fn scope_prefix(id: &str, limits: ResourceLimits) -> Vec<String> {
 /// whole host tree (including `/run`) is read-only, so bwrap cannot `mkdir` the
 /// `/run/sandy` mountpoint it needs to create — every confined job died in under a
 /// second with `Can't mkdir /run/sandy: Read-only file system` until this fix (caught
-/// by the ws01 live run). A writable `/run` gives it somewhere to mkdir into, and
+/// by the remote-host live run). A writable `/run` gives it somewhere to mkdir into, and
 /// /run/user is then simply absent, so the bus-hide falls out for free (no separate
 /// `/run/user` tmpfs needed).
 ///

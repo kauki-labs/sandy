@@ -1,8 +1,8 @@
 //! Live acceptance for #332's flake-templated VM dispatch, alone (acceptance
-//! tier 1): `sandy daemon submit --flake <ref>` places on ws01 (the only
-//! registered host once it declares `SandboxKind::Vm`), ws01 builds and boots
+//! tier 1): `sandy daemon submit --flake <ref>` places on the remote host (the only
+//! registered host once it declares `SandboxKind::Vm`), the remote host builds and boots
 //! a REAL qemu VM from it, and the job succeeds — proven via the control
-//! plane's own `Status`, not reasoning. Mirrors `live_ws01_attach.rs`'s own
+//! plane's own `Status`, not reasoning. Mirrors `live_remote_host_attach.rs`'s own
 //! gating and orchestrator-spawning shape exactly (#327); the only real
 //! difference is the manifest this submits (`flake/v1` instead of
 //! `argv/v1`) and the backend it must land as (`Vm` instead of `Process`).
@@ -10,11 +10,11 @@
 //! Gated on `SANDY_M2_REMOTE_HOST` in addition to the usual `SANDY_LIVE=1`
 //! (INV-S9): both must be set, or this refuses rather than green-skipping.
 //! The remote host-executor is NOT started by this test — a real deployed
-//! systemd service on ws01, already configured to dial this orchestrator's
-//! address (see `live_ws01_attach.rs`'s own doc for the full picture).
+//! systemd service on the remote host, already configured to dial this orchestrator's
+//! address (see `live_remote_host_attach.rs`'s own doc for the full picture).
 //!
 //! BLOCKING DEPENDENCY (named explicitly, not attempted here): this test can
-//! only place on ws01 once its DEPLOYED `sandy-host-executor` binary is
+//! only place on the remote host once its DEPLOYED `sandy-host-executor` binary is
 //! rebuilt with #332's VM-capability detection (`capability::
 //! detect_register_capabilities`) and redeployed — the standing service
 //! today still registers `Process` only. Until that redeploy happens, a run
@@ -23,11 +23,12 @@
 //! the CORRECT, fail-closed behavior for an un-redeployed host, not a bug in
 //! this test.
 //!
-//! Run manually once ws01 is redeployed (the remote host-executor must
+//! Run manually once the remote host is redeployed (the remote host-executor must
 //! already be configured to dial the given address and reachable over the
 //! mesh):
-//!   SANDY_LIVE=1 SANDY_M2_REMOTE_HOST=100.64.0.3 \
-//!     cargo nextest run -p sandy-cli --features live --test live_ws01_flake_dispatch
+//!   SANDY_LIVE=1 SANDY_M2_REMOTE_HOST=<this orchestrator's own mesh address> \
+//!     SANDY_M2_REMOTE_PEER=<remote host's mesh address> \
+//!     cargo nextest run -p sandy-cli --features live --test live_remote_host_flake_dispatch
 #![cfg(feature = "live")]
 
 use std::{
@@ -42,7 +43,7 @@ use sandy_control_proto::{StatusRequest, SubmitRequest, client::call, control_re
 use sandy_guest_template::manifest::{FlakeManifestV1, MANIFEST_ENCODING_FLAKE_V1, encode_flake_manifest};
 
 /// Refuse unless both `SANDY_LIVE=1` and `SANDY_M2_REMOTE_HOST` are set
-/// (INV-S9) — see `live_ws01_attach.rs`'s identical gate for the full
+/// (INV-S9) — see `live_remote_host_attach.rs`'s identical gate for the full
 /// rationale.
 fn require_remote_executor() -> anyhow::Result<std::net::IpAddr> {
     anyhow::ensure!(
@@ -58,9 +59,9 @@ fn require_remote_executor() -> anyhow::Result<std::net::IpAddr> {
         .context("SANDY_M2_REMOTE_HOST is not a valid IP address")
 }
 
-/// The flake reference ws01 resolves and builds ITSELF (#332 ground truth:
+/// The flake reference the remote host resolves and builds ITSELF (#332 ground truth:
 /// never ship a prebuilt artifact here — a topology built on this Mac
-/// (aarch64) is useless on ws01 (x86_64-linux); ws01 must fetch and
+/// (aarch64) is useless on the remote host (x86_64-linux); the remote host must fetch and
 /// build its own). Defaults to `main`, where this fixture lives once #332
 /// merges — overridable via `SANDY_M2_FLAKE_REF` for a branch not yet merged
 /// (this one included, before it lands), or a different fixture.
@@ -115,7 +116,7 @@ impl Drop for Orchestrator {
 
 /// Spawn a real `sandyd` bound to `host` on the two well-known M2 ports
 /// (7777 management, 7778 agent-link) — not loopback, mirroring
-/// `live_ws01_attach.rs`'s own `spawn_orchestrator` exactly.
+/// `live_remote_host_attach.rs`'s own `spawn_orchestrator` exactly.
 fn spawn_orchestrator(
     tmp: &std::path::Path,
     host: std::net::IpAddr,
@@ -185,9 +186,9 @@ async fn submit_flake(
         // retry below, retrying for the full 60s instead of failing fast.
         Some(control_response::Result::Error(e)) => {
             let hint = if e.message.contains("SandboxKind::Vm") {
-                " (ws01's deployed sandy-host-executor has not been redeployed with #332's VM-capability detection \
-                 yet, a known, documented blocking dependency, not a bug in this test — or it has registered but not \
-                 yet declared Vm)"
+                " (the remote host's deployed sandy-host-executor has not been redeployed with #332's VM-capability \
+                 detection yet, a known, documented blocking dependency, not a bug in this test — or it has registered \
+                 but not yet declared Vm)"
             } else {
                 ""
             };
@@ -197,10 +198,10 @@ async fn submit_flake(
     }
 }
 
-/// Retry Submit until ws01 has actually registered, instead of a single
+/// Retry Submit until the remote host has actually registered, instead of a single
 /// attempt after a fixed sleep: the real host's `RestartSec=5s` redial loop
 /// does not align with any fixed wait, and a too-short one is exactly the
-/// race this replaces (observed live: ws01 can take 10-15s to reconnect
+/// race this replaces (observed live: the remote host can take 10-15s to reconnect
 /// after its previous orchestrator connection drops, consistently past a
 /// flat 10s wait — a "SandboxKind::Vm" refusal right after a connection drop
 /// means "not yet registered", not "never will be").
@@ -226,16 +227,16 @@ async fn submit_flake_once_registered(
 
 /// The real-infra acceptance floor for #332 tier 1: a real `sandyd` bound to
 /// the actual mesh address, a REAL standing remote host-executor declaring
-/// `SandboxKind::Vm`, a `flake/v1` job dispatched, ws01 building and booting
+/// `SandboxKind::Vm`, a `flake/v1` job dispatched, the remote host building and booting
 /// a real qemu VM from the flake reference it resolved itself, and the job
 /// succeeding — proven via `Status`, not reasoning.
 #[tokio::test]
-async fn a_flake_templated_vm_job_dispatches_and_succeeds_on_ws01() -> anyhow::Result<()> {
+async fn a_flake_templated_vm_job_dispatches_and_succeeds_on_remote_host() -> anyhow::Result<()> {
     let host = require_remote_executor()?;
     let tmp = tempfile::tempdir().context("temp dir")?;
 
     let remote_peer: std::net::IpAddr = std::env::var("SANDY_M2_REMOTE_PEER")
-        .unwrap_or_else(|_| "100.64.0.1".to_owned())
+        .context("refusing: set SANDY_M2_REMOTE_PEER to the real remote host-executor's mesh address")?
         .parse()
         .context("SANDY_M2_REMOTE_PEER is not a valid IP address")?;
 
@@ -279,8 +280,9 @@ async fn a_flake_templated_vm_job_dispatches_and_succeeds_on_ws01() -> anyhow::R
             Some(control_response::Result::Status(_)) => {
                 anyhow::ensure!(
                     Instant::now() <= deadline,
-                    "the flake-templated VM job never left Running within the deadline — a cold `nix build` on ws01 \
-                     can be slow; widen the deadline if this is the first run against a fresh ws01 nix store"
+                    "the flake-templated VM job never left Running within the deadline — a cold `nix build` on the \
+                     remote host can be slow; widen the deadline if this is the first run against a fresh remote-host \
+                     nix store"
                 );
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
@@ -290,7 +292,7 @@ async fn a_flake_templated_vm_job_dispatches_and_succeeds_on_ws01() -> anyhow::R
     assert_eq!(
         final_status.status,
         sandy_control_proto::JobStatus::Succeeded as i32,
-        "the flake-templated VM job must boot and exit cleanly on ws01: {final_status:?}"
+        "the flake-templated VM job must boot and exit cleanly on the remote host: {final_status:?}"
     );
     assert_eq!(
         final_status.exit_code,

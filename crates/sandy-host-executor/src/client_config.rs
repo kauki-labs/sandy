@@ -86,12 +86,16 @@ mod tests {
 
     #[test]
     fn a_fully_configured_set_parses() -> anyhow::Result<()> {
-        let config = parse_executor_config(Some("100.64.0.1:7700"), Some("ws01"), Some("/usr/bin/sandy-agent"))?;
+        let config = parse_executor_config(
+            Some("203.0.113.10:7700"),
+            Some("remote-host"),
+            Some("/usr/bin/sandy-agent"),
+        )?;
         assert_eq!(
             config,
             ExecutorConfig {
-                orchestrator: "100.64.0.1:7700".parse()?,
-                host_id: "ws01".to_owned(),
+                orchestrator: "203.0.113.10:7700".parse()?,
+                host_id: "remote-host".to_owned(),
                 agent_path: PathBuf::from("/usr/bin/sandy-agent"),
             }
         );
@@ -101,7 +105,7 @@ mod tests {
     #[test]
     fn a_missing_orchestrator_is_refused_by_name() {
         assert_eq!(
-            parse_executor_config(None, Some("ws01"), Some("/usr/bin/sandy-agent")),
+            parse_executor_config(None, Some("remote-host"), Some("/usr/bin/sandy-agent")),
             Err(ExecutorConfigError::MissingOrchestrator)
         );
     }
@@ -109,7 +113,11 @@ mod tests {
     #[test]
     fn an_invalid_orchestrator_is_refused_by_name() {
         assert_eq!(
-            parse_executor_config(Some("not-an-address"), Some("ws01"), Some("/usr/bin/sandy-agent")),
+            parse_executor_config(
+                Some("not-an-address"),
+                Some("remote-host"),
+                Some("/usr/bin/sandy-agent")
+            ),
             Err(ExecutorConfigError::InvalidOrchestrator("not-an-address".to_owned()))
         );
     }
@@ -119,15 +127,15 @@ mod tests {
     #[test]
     fn an_orchestrator_with_no_port_is_refused() {
         assert_eq!(
-            parse_executor_config(Some("100.64.0.1"), Some("ws01"), Some("/usr/bin/sandy-agent")),
-            Err(ExecutorConfigError::InvalidOrchestrator("100.64.0.1".to_owned()))
+            parse_executor_config(Some("203.0.113.10"), Some("remote-host"), Some("/usr/bin/sandy-agent")),
+            Err(ExecutorConfigError::InvalidOrchestrator("203.0.113.10".to_owned()))
         );
     }
 
     #[test]
     fn a_missing_host_id_is_refused_by_name() {
         assert_eq!(
-            parse_executor_config(Some("100.64.0.1:7700"), None, Some("/usr/bin/sandy-agent")),
+            parse_executor_config(Some("203.0.113.10:7700"), None, Some("/usr/bin/sandy-agent")),
             Err(ExecutorConfigError::MissingHostId)
         );
     }
@@ -135,7 +143,7 @@ mod tests {
     #[test]
     fn an_empty_host_id_is_refused_same_as_missing() {
         assert_eq!(
-            parse_executor_config(Some("100.64.0.1:7700"), Some(""), Some("/usr/bin/sandy-agent")),
+            parse_executor_config(Some("203.0.113.10:7700"), Some(""), Some("/usr/bin/sandy-agent")),
             Err(ExecutorConfigError::MissingHostId)
         );
     }
@@ -143,7 +151,7 @@ mod tests {
     #[test]
     fn a_missing_agent_path_is_refused_by_name() {
         assert_eq!(
-            parse_executor_config(Some("100.64.0.1:7700"), Some("ws01"), None),
+            parse_executor_config(Some("203.0.113.10:7700"), Some("remote-host"), None),
             Err(ExecutorConfigError::MissingAgentPath)
         );
     }

@@ -772,7 +772,7 @@ mod tests {
     /// `resolve_flake_template` call. This is the unit-level proof that the
     /// `Vm` arm is actually reachable and decodes with
     /// [`MANIFEST_ENCODING_FLAKE_V1`], not that a real flake resolves (the
-    /// `live_ws01_*` tests own that).
+    /// `live_remote_host_*` tests own that).
     #[tokio::test]
     async fn handle_dispatch_reaches_the_vm_branch_and_decodes_flake_v1() -> anyhow::Result<()> {
         let dispatch = sandy_executor_proto::Dispatch {

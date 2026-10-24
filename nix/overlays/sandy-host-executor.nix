@@ -1,5 +1,5 @@
 # The sandy-host-executor overlay (#287, M2 spec #269 D3): the host-side
-# executor binary, for the HOST NixOS config (ws01) — not the sandbox image.
+# executor binary, for the HOST NixOS config (the remote host) — not the sandbox image.
 # Split out from the single sandy-executor overlay (operator ruling, #287
 # follow-up): sandy-agent and sandy-host-executor have different deployment
 # targets, so one bundled overlay shipping both onto either target was the

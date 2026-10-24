@@ -6,7 +6,7 @@
 //! Gated on `SANDY_M2_REMOTE_HOST` in addition to the usual `SANDY_LIVE=1`
 //! (INV-S9): both must be set, or this refuses rather than green-skipping.
 //! `SANDY_M2_REMOTE_HOST` names the orchestrator's own mesh address as the
-//! remote host dials it (e.g. `100.64.0.3`), matching the convention
+//! remote host dials it (e.g. `203.0.113.10`), matching the convention
 //! `live_m2_cross_machine.rs`'s unused `require_remote_executor` reserved for
 //! this exact run. The remote host-executor itself is NOT started by this
 //! test — it's a standing service (systemd on the remote box), already
@@ -15,8 +15,9 @@
 //!
 //! Run manually (the remote host-executor must already be configured to dial
 //! the given address and reachable over the mesh):
-//!   SANDY_LIVE=1 SANDY_M2_REMOTE_HOST=100.64.0.3 \
-//!     cargo nextest run -p sandy-cli --features live --test live_ws01_attach
+//!   SANDY_LIVE=1 SANDY_M2_REMOTE_HOST=<this orchestrator's own mesh address> \
+//!     SANDY_M2_REMOTE_PEER=<remote host's mesh address> \
+//!     cargo nextest run -p sandy-cli --features live --test live_remote_host_attach
 #![cfg(feature = "live")]
 
 use std::{
@@ -292,10 +293,9 @@ async fn a_real_remote_host_executor_grants_post_rights_to_a_separate_attach_pro
     let tmp = tempfile::tempdir().context("temp dir")?;
 
     // SANDY_M2_REMOTE_PEER names the real remote host-executor's mesh IP, for
-    // the allowlist. Defaults to 100.64.0.1 (ws01) if unset, matching this
-    // project's documented remote host.
+    // the allowlist.
     let remote_peer: std::net::IpAddr = std::env::var("SANDY_M2_REMOTE_PEER")
-        .unwrap_or_else(|_| "100.64.0.1".to_owned())
+        .context("refusing: set SANDY_M2_REMOTE_PEER to the real remote host-executor's mesh address")?
         .parse()
         .context("SANDY_M2_REMOTE_PEER is not a valid IP address")?;
 

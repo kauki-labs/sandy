@@ -52,7 +52,7 @@
       # in a consuming flake's own nixpkgs, and the module must be importable
       # without evaluating this flake's perSystem at all. Two overlays, not
       # one bundled default (#287 follow-up, operator ruling): sandy-agent
-      # (a sandbox-image deployment) and sandy-host-executor (the ws01 host)
+      # (a sandbox-image deployment) and sandy-host-executor (the remote host)
       # have different targets, so a consumer applies only the one(s) it
       # needs rather than always getting both.
       flake = {
@@ -394,13 +394,13 @@
                   '';
             }
           )
-          # Eval-only proof that `services.sandy-executor.vm.enable` (ws01's
+          # Eval-only proof that `services.sandy-executor.vm.enable` (the remote host's
           # VM-capability hardening) is genuinely additive: OFF leaves the
           # unit byte-for-byte what it was before that option existed, ON
           # grants exactly the device/PATH/address-family set a real VM
           # dispatch needs. Never builds anything — only plain string/list
           # service-unit properties are forced, not `ExecStart` or any other
-          # attribute that would pull in a package's store path (ws01 is
+          # attribute that would pull in a package's store path (the remote host is
           # x86_64-linux only, so gated the same as the checks above). The
           # refusal path (vm.enable on, a probed fact like kvm_usable false)
           # is already exhaustively covered at the pure-function level by
@@ -510,7 +510,7 @@
                     done
                     case "$onQemuBin" in
                       */bin/qemu-system-x86_64) ;;
-                      *) echo "vm.enable=true must set SANDY_QEMU_BIN to an absolute qemu-system-x86_64 path (PATH alone is not trustworthy on ws01, #335 follow-up), got: $onQemuBin" >&2; exit 1 ;;
+                      *) echo "vm.enable=true must set SANDY_QEMU_BIN to an absolute qemu-system-x86_64 path (PATH alone is not trustworthy on the remote host, #335 follow-up), got: $onQemuBin" >&2; exit 1 ;;
                     esac
                     case "$onNixBin" in
                       */bin/nix) ;;

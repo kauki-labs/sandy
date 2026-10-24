@@ -143,7 +143,7 @@ writable outputs via `--bind`); hides the user bus (`--tmpfs /run` + `--unsetenv
 the bus vars — `/run` must be the WHOLE tmpfs, not just `/run/user`: under
 `--ro-bind / /` the host tree is read-only, so bwrap cannot `mkdir` the `/run/sandy`
 mountpoint under a merely-shadowed `/run/user`; a writable `/run` fixes the mkdir and
-drops `/run/user` for free, found by the ws01 live run — every job died in under a
+drops `/run/user` for free, found by the remote-host live run — every job died in under a
 second until this landed); and exposes the host rootfs read-only (`--ro-bind / /`,
 the **A1** choice) so host binaries resolve. The feature is gated on a `confines_filesystem()`
 capability, detected (bwrap present AND unprivileged user namespaces permitted) and

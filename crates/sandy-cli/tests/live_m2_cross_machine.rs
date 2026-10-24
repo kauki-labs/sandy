@@ -15,8 +15,8 @@
 //!
 //! What's left, not in scope for this file: the second local job / peer-
 //! message-through-the-hub half of #269's acceptance, and real (non-fake)
-//! containment + a real second machine — the ws01 cross-machine run, gated
-//! on #299 (the nix overlay) and the operator's ws01 apply (#287). Tracked on
+//! containment + a real second machine — the remote-host cross-machine run, gated
+//! on #299 (the nix overlay) and the operator's remote-host apply (#287). Tracked on
 //! #303, so landing this file's proven leg doesn't drop that remaining scope.
 //!
 //! What it's for: the shape is settled (#263/#277/#298/#301, merged) and
@@ -25,8 +25,8 @@
 //!
 //! Run manually:
 //!   SANDY_LIVE=1 cargo nextest run -p sandy-cli --features live --test live_m2_cross_machine
-//! and, once the real ws01 run is written:
-//!   SANDY_LIVE=1 SANDY_M2_REMOTE_HOST=<mesh addr of ws01> \
+//! and, once the real remote-host run is written:
+//!   SANDY_LIVE=1 SANDY_M2_REMOTE_HOST=<mesh addr of the remote host> \
 //!     cargo nextest run -p sandy-cli --features live --test live_m2_cross_machine
 //!
 //! ## Acceptance traceability (#269's full list, so nothing falls between test files)
@@ -91,12 +91,12 @@ fn require_live_process_test() -> anyhow::Result<()> {
 /// Refuse unless `SANDY_M2_REMOTE_HOST` names a reachable NixOS host-executor's
 /// mesh address, in addition to [`require_live_process_test`]'s usual
 /// live-matrix check — the full cross-machine acceptance needs two real
-/// machines, not one. Not called yet: the real ws01 run (#287/#299) is the
+/// machines, not one. Not called yet: the real remote-host run (#287/#299) is the
 /// last remaining gate, still pending the operator's apply; kept here as the
 /// gate that run will use, not speculative.
 #[allow(
     dead_code,
-    reason = "the real ws01 cross-machine run (#287/#299) will call this once it's written"
+    reason = "the real remote-host cross-machine run (#287/#299) will call this once it's written"
 )]
 fn require_remote_executor() -> anyhow::Result<String> {
     require_live_process_test()?;
@@ -303,7 +303,7 @@ fn submit_job(orchestrator: &Orchestrator, tmp: &std::path::Path, argv: &[&str])
 /// orchestrator (#298/#301's `send_dispatch` path), and actually runs the job
 /// — host-executor side only (infra-f3's scoping ruling: the orchestrator-
 /// through-real-path proof this test gives doesn't need the second local job
-/// / hub-exchange half; that's #269's remaining acceptance once a real ws01
+/// / hub-exchange half; that's #269's remaining acceptance once a real remote-host
 /// is up, #299 + #287).
 ///
 /// The host-executor side is `handle_dispatch` called directly with
@@ -381,8 +381,8 @@ async fn cross_machine_sandboxes_exchange_a_peer_message_through_the_hub() -> an
 
     // 4. Host-client re-checks the isolation class independently (`check_isolation_class`, defense in depth) and runs
     //    the job via the real ProcessBackend + a fake, spawnable containment (sandy-91: real SystemdRunContainment
-    //    needs Linux cgroup v2, which this Mac doesn't have — the real containment leg is #299's nixosTest and the ws01
-    //    run).
+    //    needs Linux cgroup v2, which this Mac doesn't have — the real containment leg is #299's nixosTest and the
+    //    remote-host run).
     let agent_program = build_workspace_bin("sandy-agent", "sandy-agent")?;
     let rt = tokio::runtime::Handle::current();
     // Matches handle_dispatch's own internal stage-1 bound (STAGE1_TIMEOUT_SECS,
