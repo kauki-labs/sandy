@@ -288,6 +288,16 @@ in
         Restart = "on-failure";
         RestartSec = "5s";
 
+        # #289: an explicit cap, not whatever systemd/the distro default
+        # happens to be — decision 14 keeps this process to one dispatch at a
+        # time (one orchestrator connection + at most one forwarded
+        # agent-link socket live concurrently), plus bwrap/cgroup-related fds
+        # per sandboxed job and ordinary process overhead (log/journal
+        # fds, dynamic libs). 4096 is generous headroom over that steady
+        # state, bounding what a connection-accounting bug or a pathological
+        # peer could otherwise grow unbounded.
+        LimitNOFILE = 4096;
+
         # Least privilege around the host-executor process itself; the
         # sandboxed job it dispatches is bwrap/cgroup-confined separately
         # (security review, #299/sandy-73: since `systemd-run --user --scope`

@@ -17,7 +17,6 @@
 
 use std::net::SocketAddr;
 
-use sandy_conn::ConnAddr;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::link::{LinkError, LinkFrame, read_frame, write_frame};
@@ -79,6 +78,37 @@ where
     L: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     R: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
+    forward_agent_link_bounded(local, remote, prefix, REVERSE_PIPE_GRACE).await
+}
+
+/// How long the orchestrator->agent reverse pipe may keep running after
+/// [`forward_agent_link`]'s own verdict is already known, before it's
+/// aborted (#289 item 4). `reverse.detach()` used to let it run for as long
+/// as the orchestrator's connection stayed open, unconditionally — a hung,
+/// or merely slow-to-close, orchestrator leaked the task, its mesh socket,
+/// and the agent's own link end for the rest of the process's life.
+/// Generous relative to ordinary trailing traffic (a late TTY resize, a few
+/// more stdin bytes already in flight when the agent exits) but bounded,
+/// the same scale as this crate's other connection timeouts (`DIAL_TIMEOUT`
+/// above, `sandyd::host_conn::DISPATCH_WRITE_TIMEOUT`).
+const REVERSE_PIPE_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// [`forward_agent_link`]'s real body, with the reverse-pipe grace period
+/// injectable so a test can prove the bound deterministically and quickly
+/// rather than waiting out the real production value — AGENTS.md flags
+/// pairing a virtual (`start_paused`) clock with genuine I/O as flaky, and
+/// this function's reads/writes are real duplex/socket I/O, so a short REAL
+/// duration here is what keeps the test both fast and reliable.
+async fn forward_agent_link_bounded<L, R>(
+    local: L,
+    remote: R,
+    prefix: &[u8],
+    reverse_grace: std::time::Duration,
+) -> Result<ForwardedVerdict, LinkError>
+where
+    L: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    R: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
     let (mut local_rd, local_wr) = tokio::io::split(local);
     let (remote_rd, mut remote_wr) = tokio::io::split(remote);
 
@@ -117,7 +147,22 @@ where
         }
     };
     let _ = remote_wr.shutdown().await;
-    reverse.detach();
+    // #289 item 4: bound the reverse pipe from here rather than detaching it
+    // unconditionally — a supervising task owns the wait, so THIS function's
+    // own return stays exactly as unblocked by the reverse pipe's lifetime
+    // as the module doc above promises; only the supervisor, not this
+    // function's caller, ever waits out `reverse_grace`.
+    if let Some(mut handle) = reverse.detach() {
+        tokio::spawn(async move {
+            if tokio::time::timeout(reverse_grace, &mut handle).await.is_err() {
+                tracing::warn!(
+                    "the orchestrator->agent reverse pipe exceeded its grace period after the agent's own exit; \
+                     aborting it rather than leaking the task and its mesh socket forever"
+                );
+                handle.abort();
+            }
+        });
+    }
     Ok(verdict)
 }
 
@@ -148,9 +193,12 @@ struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
 impl AbortOnDrop {
     /// Let the wrapped task keep running past this guard's own drop — the
     /// ordinary path, once `forward_agent_link` has its verdict and the
-    /// reverse pipe may still have orchestrator traffic to deliver.
-    fn detach(mut self) {
-        self.0 = None;
+    /// reverse pipe may still have orchestrator traffic to deliver. Returns
+    /// the handle (rather than discarding it) so the caller can still bound
+    /// the detached task's lifetime itself (#289 item 4) instead of either
+    /// aborting it immediately or losing track of it forever.
+    fn detach(mut self) -> Option<tokio::task::JoinHandle<()>> {
+        self.0.take()
     }
 }
 
@@ -200,14 +248,23 @@ where
     // routing black hole on the mesh) must not hang this dial forever — the
     // caller (relay_agent_link's spawned task) has a report to deliver, and
     // an indefinite hang here would silently withhold it.
-    let remote = tokio::time::timeout(DIAL_TIMEOUT, sandy_conn::connect(&ConnAddr::Tcp(orchestrator)))
-        .await
-        .map_err(|_| {
-            DialAndForwardError::Dial(sandy_conn::ConnError::Io(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("dialing {orchestrator} timed out after {DIAL_TIMEOUT:?}"),
-            )))
-        })??;
+    //
+    // Keepalive-tuned (#289 item 4): once dialed, a vanished orchestrator
+    // (power cut, partition) would otherwise leave this side holding a
+    // half-open connection the kernel still reports as open — the same
+    // `HALF_OPEN_DETECTION` profile decision 16 already applies to
+    // `sandyd`'s own dial/accept of the management channel.
+    let remote = tokio::time::timeout(
+        DIAL_TIMEOUT,
+        sandy_conn::connect_tcp_keepalive(orchestrator, sandy_conn::TcpKeepalive::HALF_OPEN_DETECTION),
+    )
+    .await
+    .map_err(|_| {
+        DialAndForwardError::Dial(sandy_conn::ConnError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("dialing {orchestrator} timed out after {DIAL_TIMEOUT:?}"),
+        )))
+    })??;
     Ok(forward_agent_link(local, remote, prefix).await?)
 }
 
@@ -357,6 +414,7 @@ mod tests {
     use std::time::Duration;
 
     use anyhow::Context;
+    use sandy_conn::ConnAddr;
     use tokio::io::AsyncReadExt;
 
     use super::*;
@@ -556,6 +614,59 @@ mod tests {
             saw_eof,
             "a cancelled forward_agent_link must close the orchestrator's connection, not leak it"
         );
+        Ok(())
+    }
+
+    /// Regression (#289 item 4): once the agent's own verdict is known, the
+    /// orchestrator->agent reverse pipe must not run forever just because the
+    /// orchestrator stays connected but silent (never sends EOF) — it must
+    /// be aborted after its grace period, closing the agent's own link
+    /// rather than leaking the task and the mesh socket for good. Drives the
+    /// real abort-after-grace mechanism via `forward_agent_link_bounded`
+    /// with a short real grace (not `start_paused`, per AGENTS.md: a virtual
+    /// clock paired with genuine duplex I/O is flaky) and observes the
+    /// agent's own side reaching EOF once it fires — not just that
+    /// `forward_agent_link` itself resolved, which it already does well
+    /// before the reverse pipe's fate is decided.
+    #[tokio::test]
+    async fn the_reverse_pipe_is_aborted_after_its_grace_period_against_a_silent_orchestrator() -> anyhow::Result<()> {
+        const SHORT_GRACE: Duration = Duration::from_millis(100);
+
+        let (local_conn, mut agent_side) = tokio::io::duplex(4096);
+        let (remote_conn, mut orchestrator_side) = tokio::io::duplex(4096);
+
+        let forwarder = tokio::spawn(forward_agent_link_bounded(local_conn, remote_conn, PREFIX, SHORT_GRACE));
+        expect_prefix(&mut orchestrator_side, PREFIX).await?;
+
+        write_frame(&mut agent_side, &LinkFrame::Exit { code: 0 }).await?;
+        let forwarded_exit = read_frame(&mut orchestrator_side)
+            .await?
+            .context("orchestrator should see Exit")?;
+        assert_eq!(forwarded_exit, LinkFrame::Exit { code: 0 });
+
+        let verdict = tokio::time::timeout(Duration::from_secs(2), forwarder)
+            .await
+            .context("forward_agent_link_bounded did not resolve after Exit")?
+            .context("forwarder task panicked")??;
+        assert_eq!(verdict, ForwardedVerdict::JobExited(0));
+
+        // The orchestrator never closes its side from here on — exactly the
+        // hung/silent peer this bound exists for. Without it, the next read
+        // would hang for the test's whole timeout rather than observing EOF.
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(5), agent_side.read(&mut buf))
+            .await
+            .context(
+                "the reverse pipe must be aborted (closing the agent's own link) once its grace period elapses, not \
+                 hang forever against a silent orchestrator",
+            )?
+            .context("reading the agent's side after the reverse pipe's abort")?;
+        assert_eq!(
+            n, 0,
+            "the agent's link must observe EOF once the unbounded reverse pipe is aborted"
+        );
+
+        drop(orchestrator_side);
         Ok(())
     }
 

@@ -7,7 +7,7 @@
 
 use std::{future::Future, net::SocketAddr, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc, time::Duration};
 
-use sandy_conn::{ConnAddr, Listener as MeshListener};
+use sandy_conn::Listener as MeshListener;
 use sandyd::{
     dispatch::JobRegistry,
     host_registry::{ExecutorAllowlist, HostRegistry},
@@ -476,6 +476,13 @@ async fn setup_mesh_listener() -> std::io::Result<Option<MeshSetup>> {
 /// are registered on the management channel, since there is nowhere valid to
 /// tell an executor to dial back to.
 ///
+/// Keepalive-tuned (#289 item 4, the same `HALF_OPEN_DETECTION` profile
+/// decision 16 already applies to the management-channel listener and
+/// dial): without it, a vanished executor mid-link (power cut, partition)
+/// leaves this side holding a half-open connection the kernel still reports
+/// as open — the same half-open-peer gap decision 16 closed for the
+/// management channel, left open here until now.
+///
 /// # Errors
 /// The env var fails to parse (including naming an unspecified address, D5),
 /// or the bind itself fails.
@@ -484,7 +491,7 @@ async fn setup_mesh_agent_link_listener() -> std::io::Result<Option<(MeshListene
         .map_err(std::io::Error::other)?;
     let Some(addr) = addr else { return Ok(None) };
 
-    let listener = sandy_conn::listen(&ConnAddr::Tcp(addr))
+    let listener = sandy_conn::listen_tcp_keepalive(addr, sandy_conn::TcpKeepalive::HALF_OPEN_DETECTION)
         .await
         .map_err(std::io::Error::other)?;
     tracing::info!(addr = %addr, "sandyd mesh agent-link accept listener bound");

@@ -1045,6 +1045,28 @@ shared read/write deadline covering every `write_frame` call in
 with those three writes themselves, since they carry no live registry state
 to strand.
 
+**Amendment: the same `HALF_OPEN_DETECTION` keepalive now also covers the
+agent-link mesh hop, and the executor-side reverse pipe is bounded after a
+normal exit.** The keepalive profile above only applied to `sandyd`'s
+own management-channel dial/accept; the agent-link mesh hop (`sandyd`'s
+`$SANDY_MESH_AGENT_LINK_LISTEN` accept and `sandy-fabric-local::mesh_link`'s
+`dial_and_forward`) had none, leaving the same vanished-peer half-open gap
+this decision's own "connection is the liveness signal" model is supposed
+to close, just on a second connection class it hadn't reached yet. Both now
+apply `TcpKeepalive::HALF_OPEN_DETECTION` via `listen_tcp_keepalive`/
+`connect_tcp_keepalive`, reusing the mechanism this decision already proved
+(`apply_tcp_keepalive_sets_the_kernel_sockopts`), not re-tested at this
+call-site layer. Separately (#289 item 4's own remaining half, distinct from
+`relay_agent_link`'s `RunControl`-bound relay, decision 14's amendment):
+`forward_agent_link`'s orchestrator->agent reverse pipe was detached
+unconditionally once the agent's own verdict resolved, so a connected-but-
+silent orchestrator that never sent EOF left it running — and its mesh
+socket open — for the rest of the process's life, regardless of
+`RunControl`, which only bounds the _outer_ relay select!, not a task
+already detached from it. A supervising task now aborts the reverse pipe if
+it hasn't ended on its own within `REVERSE_PIPE_GRACE` (30s), without
+blocking `forward_agent_link`'s own return on that wait.
+
 ## 17. A separate UDS listener redeems `Attach`'s cap for the interactive data plane; a durable per-job token closes the cross-process reattach gap (#327)
 
 **Status:** accepted.
