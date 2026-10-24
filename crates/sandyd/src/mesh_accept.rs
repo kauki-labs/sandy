@@ -383,6 +383,230 @@ mod tests {
         PeerAddr::Tcp(SocketAddr::new(ip.parse().expect("ip literal"), 0))
     }
 
+    /// A `Vec<u8>`-backed `tracing_subscriber` writer shared with the test, so
+    /// a subscriber installed for one scope can be inspected afterward.
+    /// Mirrors `sandy-cli`'s `tests/cli_jobs.rs::SharedBuf`.
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl SharedBuf {
+        fn contents(&self) -> anyhow::Result<String> {
+            let bytes = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+            String::from_utf8(bytes).context("captured log is utf8")
+        }
+    }
+
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
+        type Writer = SharedBuf;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Send one run-id+token prefix to `addr` and report how many bytes came
+    /// back (1 = admitted to the agent link, 0 = refused with zero bytes).
+    async fn stream_prefix(addr: SocketAddr, job_id: &str, token: &[u8; 32]) -> anyhow::Result<usize> {
+        let mut client = connect(&loopback(addr.port())).await.context("connect")?;
+        let prefix = encode_remote_link_prefix(job_id, token).expect("encode prefix");
+        tokio::io::AsyncWriteExt::write_all(&mut client, &prefix)
+            .await
+            .context("write prefix")?;
+        let mut byte = [0u8; 1];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read(&mut client, &mut byte),
+        )
+        .await
+        .context("timed out waiting for a response")?
+        .context("read response")?;
+        Ok(n)
+    }
+
+    /// A printable, 32-byte marker distinguishable from another `tag`'s —
+    /// unlike a random [`RemoteLink::new`] token, the test can reconstruct
+    /// this value to check for it in captured output, and being plain ASCII
+    /// means a lossy UTF-8 decode of the raw bytes reproduces it exactly
+    /// (catching a `Display`-of-raw-bytes leak, not just a `Debug` one).
+    fn marker_token(tag: &str) -> [u8; 32] {
+        let mut bytes = [b'.'; 32];
+        let label = format!("sandy-leak-marker-{tag}");
+        let take = label.len().min(32);
+        bytes[..take].copy_from_slice(&label.as_bytes()[..take]);
+        bytes
+    }
+
+    /// Build a one-job registry whose remote link uses a caller-chosen
+    /// token (via [`RemoteLink::with_token`]) instead of a random one.
+    async fn registry_with_marker_job(
+        job_id: &str,
+        executor_ip: IpAddr,
+        token: [u8; 32],
+    ) -> anyhow::Result<Arc<JobRegistry>> {
+        let registry = Arc::new(JobRegistry::new().context("registry")?);
+        let mut job = crate::dispatch::mint_job_channel(job_id, registry.authority())
+            .await
+            .context("mint job channel")?;
+        job.remote_link = Some(RemoteLink::with_token(executor_ip, token));
+        registry.insert(job_id.to_owned(), job);
+        Ok(registry)
+    }
+
+    /// Adversarial (INV-1, issue #159's residual item): across the real
+    /// mesh-accept authentication path, no `tracing` event anywhere carries
+    /// a raw link token, in the decoded-text, hex-text, or raw byte-array
+    /// `Debug` shape. Exercises every point a genuine token passes through
+    /// `serve_one_remote_link`'s local variables: a successful
+    /// authentication (the real token rides the wire exactly as production
+    /// does), an already-claimed refusal (the same real token presented
+    /// again after the slot is spent), a wrong-peer refusal (the real token
+    /// is presented, only the connecting IP differs from the bound
+    /// executor), and a wrong-token refusal (the genuine secret sits inside
+    /// the stored `RemoteLink` the whole time, unused on the wire — a buggy
+    /// debug log of `link.token()`'s raw bytes there would leak it even
+    /// though the presented bytes were garbage).
+    ///
+    /// Also asserts a positive control: the refusal events this test expects
+    /// (naming the job id, never the token) actually appear in the capture.
+    /// Without that, an inert subscriber (e.g. the thread-local default not
+    /// actually reaching a spawned task) would pass vacuously, with nothing
+    /// in the buffer to find a leak in.
+    ///
+    /// This is a true regression test, unlike the existing `Debug`-redaction
+    /// tests in `link_auth.rs` and `sandy-executor-proto`: those only prove
+    /// a hand-written `Debug` impl redacts the token. A future
+    /// `tracing::info!`/`warn!`/`error!` call site that interpolates the raw
+    /// token with `{}`/`{:?}` instead of going through a redacting type
+    /// bypasses that impl entirely, and only a capture of actual emitted log
+    /// output, like this one, can catch it.
+    #[tokio::test]
+    async fn no_tracing_event_carries_the_raw_link_token() -> anyhow::Result<()> {
+        let buf = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            // A future leak could land at `debug!`/`trace!`, and operators
+            // do run with `RUST_LOG=debug` — the default max level must not
+            // silently exempt those from this capture.
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let token1 = marker_token("one-success-then-claimed");
+        let token2 = marker_token("two-wrong-token-genuine");
+        let token3 = marker_token("three-wrong-peer");
+
+        // Successful authentication, then an already-claimed refusal for the
+        // same job: both present the genuine token on the wire.
+        let listener = listen(&loopback(0)).await.context("listen")?;
+        let addr = listener.local_addr().context("local_addr")?;
+        let registry = registry_with_marker_job("job-1", addr.ip(), token1).await?;
+        let listener = Arc::new(listener);
+
+        let accept_registry = Arc::clone(&registry);
+        let first_listener = Arc::clone(&listener);
+        let first = tokio::spawn(async move {
+            let (conn, peer) = first_listener.accept().await.expect("accept");
+            serve_one_remote_link(conn, peer, &accept_registry).await;
+        });
+        let n = stream_prefix(addr, "job-1", &token1).await?;
+        assert_eq!(n, 1, "the first, genuine stream must reach the agent link");
+        tokio::time::timeout(std::time::Duration::from_secs(5), first).await??;
+
+        let accept_registry = Arc::clone(&registry);
+        let second = tokio::spawn(async move {
+            let (conn, peer) = listener.accept().await.expect("accept");
+            serve_one_remote_link(conn, peer, &accept_registry).await;
+        });
+        let n = stream_prefix(addr, "job-1", &token1).await?;
+        assert_eq!(n, 0, "the second, already-claimed stream must be refused");
+        tokio::time::timeout(std::time::Duration::from_secs(5), second).await??;
+
+        // A wrong-token refusal: the genuine secret (token2) never leaves
+        // the RemoteLink, so this proves no debug path reaches in and logs
+        // it even when the presented bytes are garbage.
+        let listener2 = listen(&loopback(0)).await.context("listen 2")?;
+        let addr2 = listener2.local_addr().context("local_addr 2")?;
+        let registry2 = registry_with_marker_job("job-2", addr2.ip(), token2).await?;
+        let accept_registry = Arc::clone(&registry2);
+        let third = tokio::spawn(async move {
+            let (conn, peer) = listener2.accept().await.expect("accept");
+            serve_one_remote_link(conn, peer, &accept_registry).await;
+        });
+        let n = stream_prefix(addr2, "job-2", &[0xAA; 32]).await?;
+        assert_eq!(n, 0, "a wrong token must be refused");
+        tokio::time::timeout(std::time::Duration::from_secs(5), third).await??;
+
+        // A wrong-peer refusal: the genuine token is presented, only the
+        // connecting IP doesn't match the bound executor.
+        let listener3 = listen(&loopback(0)).await.context("listen 3")?;
+        let addr3 = listener3.local_addr().context("local_addr 3")?;
+        let registry3 = registry_with_marker_job("job-3", IpAddr::V4(Ipv4Addr::new(100, 64, 0, 9)), token3).await?;
+        let accept_registry = Arc::clone(&registry3);
+        let fourth = tokio::spawn(async move {
+            let (conn, peer) = listener3.accept().await.expect("accept");
+            serve_one_remote_link(conn, peer, &accept_registry).await;
+        });
+        let n = stream_prefix(addr3, "job-3", &token3).await?;
+        assert_eq!(n, 0, "a wrong peer must be refused");
+        tokio::time::timeout(std::time::Duration::from_secs(5), fourth).await??;
+
+        let logged = buf.contents()?;
+
+        // Positive control: the three refusals above must actually have
+        // logged, and named their job, or the leak assertions below would
+        // pass vacuously against an empty or disconnected capture.
+        let refusal_count = logged
+            .matches("mesh accept loop: refusing an unauthenticated agent-link stream")
+            .count();
+        assert_eq!(
+            refusal_count, 3,
+            "expected 3 refusal events (already-claimed, wrong-token, wrong-peer), got: {logged}"
+        );
+        assert!(
+            logged.contains("job-2"),
+            "the wrong-token refusal must have logged its job id: {logged}"
+        );
+
+        for marker in [token1, token2, token3] {
+            let text_marker = String::from_utf8_lossy(&marker).into_owned();
+            let hex_marker: String = marker.iter().map(|b| format!("{b:02x}")).collect();
+            let decimal_debug_marker = format!("{marker:?}");
+            let hex_debug_marker = format!("{marker:x?}");
+            assert!(
+                !logged.contains(&text_marker),
+                "a genuine token's decoded text leaked into tracing output: {logged}"
+            );
+            assert!(
+                !logged.contains(&hex_marker),
+                "a genuine token's hex encoding leaked into tracing output: {logged}"
+            );
+            assert!(
+                !logged.contains(&decimal_debug_marker),
+                "a genuine token's decimal byte-array Debug leaked into tracing output: {logged}"
+            );
+            assert!(
+                !logged.contains(&hex_debug_marker),
+                "a genuine token's hex byte-array Debug leaked into tracing output: {logged}"
+            );
+        }
+        Ok(())
+    }
+
     /// Regression (sandy-73, pre-auth DoS): a peer that opens a connection
     /// and never sends a full prefix must not hold the spawned task and its
     /// fd open forever — an uncapped accept loop lets any mesh peer EMFILE
