@@ -26,7 +26,8 @@
 //! Run manually once the remote host is redeployed (the remote host-executor must
 //! already be configured to dial the given address and reachable over the
 //! mesh):
-//!   SANDY_LIVE=1 SANDY_M2_REMOTE_HOST=203.0.113.10 \
+//!   SANDY_LIVE=1 SANDY_M2_REMOTE_HOST=<remote host's mesh address> \
+//!     SANDY_M2_REMOTE_PEER=<remote host's mesh address> \
 //!     cargo nextest run -p sandy-cli --features live --test live_remote_host_flake_dispatch
 #![cfg(feature = "live")]
 
@@ -235,7 +236,7 @@ async fn a_flake_templated_vm_job_dispatches_and_succeeds_on_remote_host() -> an
     let tmp = tempfile::tempdir().context("temp dir")?;
 
     let remote_peer: std::net::IpAddr = std::env::var("SANDY_M2_REMOTE_PEER")
-        .unwrap_or_else(|_| "203.0.113.10".to_owned())
+        .context("refusing: set SANDY_M2_REMOTE_PEER to the real remote host-executor's mesh address")?
         .parse()
         .context("SANDY_M2_REMOTE_PEER is not a valid IP address")?;
 

@@ -22,7 +22,8 @@
 //! misbehavior.
 //!
 //! Run manually once the remote host is redeployed:
-//!   SANDY_LIVE=1 SANDY_M2_REMOTE_HOST=203.0.113.10 \
+//!   SANDY_LIVE=1 SANDY_M2_REMOTE_HOST=<remote host's mesh address> \
+//!     SANDY_M2_REMOTE_PEER=<remote host's mesh address> \
 //!     cargo nextest run -p sandy-cli --features live --test live_remote_host_flake_attach
 #![cfg(feature = "live")]
 
@@ -326,7 +327,7 @@ async fn a_separate_attach_process_drives_a_real_vm_booted_on_remote_host() -> a
     let tmp = tempfile::tempdir().context("temp dir")?;
 
     let remote_peer: std::net::IpAddr = std::env::var("SANDY_M2_REMOTE_PEER")
-        .unwrap_or_else(|_| "203.0.113.10".to_owned())
+        .context("refusing: set SANDY_M2_REMOTE_PEER to the real remote host-executor's mesh address")?
         .parse()
         .context("SANDY_M2_REMOTE_PEER is not a valid IP address")?;
 
