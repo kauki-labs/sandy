@@ -177,11 +177,15 @@ closed by this change:
 - `safe_heartbeat_tick` caps the tick alone; a `SANDY_REFRESH_TICK_SECS`
   configured close to (but below) `MAX_TTL_SECS` still leaves little of the
   worst-case `MAX_TTL_SECS / 2` refresh-call budget as real margin.
-- A mint that GitHub completes but whose response is lost to a retry (the
-  attempt times out after the token was already issued) leaves that token
-  unrecorded by `self.mints`, so neither the retry's own eventual success nor
-  a later `revoke_orphan` call can revoke the earlier one; it lives out its
-  native ~1h expiry instead of the shorter TTL the seam otherwise enforces.
+- Retrying a non-idempotent `POST /access_tokens` was already possible under
+  octocrab's prior default retry policy; pinning `HTTP_RETRIES` here doesn't
+  introduce it, but a reliable per-attempt timeout makes the specific
+  failure mode easier to trigger than a bare connection reset did. If GitHub
+  completes the mint but the response is lost to the retry (the attempt
+  times out after the token was already issued), that token is unrecorded by
+  `self.mints`, so neither the retry's own eventual success nor a later
+  `revoke_orphan` call can revoke the earlier one; it lives out its native
+  ~1h expiry instead of the shorter TTL the seam otherwise enforces.
 
 A `verify-*` dir (the trust-root verify probe) gets no heartbeat. It
 normally lives for one mint call and one revoke call, now also bounded by
