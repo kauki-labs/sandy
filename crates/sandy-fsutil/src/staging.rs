@@ -213,7 +213,10 @@ pub fn sweep_stale_staging_dirs(base: &Path, prefixes: &[&str], max_age: Duratio
     let now = SystemTime::now();
     let mut removed = Vec::new();
     for entry in std::fs::read_dir(base)? {
-        let entry = entry?;
+        // Best-effort: a per-entry read failure (a raced removal, a transient
+        // I/O error) is skipped rather than aborting the sweep — only a
+        // failure to list `base` itself does that (see `# Errors` above).
+        let Ok(entry) = entry else { continue };
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue; // Non-UTF-8 name: never one of our own prefixed dirs.
         };
@@ -223,12 +226,16 @@ pub fn sweep_stale_staging_dirs(base: &Path, prefixes: &[&str], max_age: Duratio
         let metadata = match entry.metadata() {
             Ok(metadata) => metadata,
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue, // raced a concurrent cleanup
-            Err(e) => return Err(e),
+            // Best-effort: any other per-entry stat failure is skipped too.
+            Err(_) => continue,
         };
         if !metadata.is_dir() {
             continue;
         }
-        let Ok(age) = now.duration_since(metadata.modified()?) else {
+        let Ok(modified) = metadata.modified() else {
+            continue; // mtime unsupported/unreadable on this platform: skip, never abort.
+        };
+        let Ok(age) = now.duration_since(modified) else {
             continue; // mtime in the future (clock skew): treat as fresh, never sweep.
         };
         if age < max_age {
@@ -237,9 +244,9 @@ pub fn sweep_stale_staging_dirs(base: &Path, prefixes: &[&str], max_age: Duratio
         match std::fs::remove_dir_all(entry.path()) {
             Ok(()) => removed.push(name),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            // Best-effort: one unremovable stale dir must
-            // never block sweeping the rest, or a single stuck entry could
-            // wedge every later gc run indefinitely.
+            // Best-effort: one unremovable stale dir must never block
+            // sweeping the rest, or a single stuck entry could wedge every
+            // later gc run indefinitely.
             Err(_) => {}
         }
     }
@@ -513,6 +520,13 @@ mod tests {
         let tmp = private_tmp()?;
         let base = ensure_staging_base_in(tmp.path()).context("ensure base")?;
 
+        // A privileged runner (root, or a capability that bypasses DAC
+        // checks) ignores the chmod-0o000 lockdown below, so it can't be
+        // used to force a removal failure there; the "stuck survives"
+        // assertion is skipped in that case rather than failing for a
+        // reason unrelated to the sweep logic under test.
+        let privileged = rustix::process::getuid().as_raw() == 0;
+
         // A stale dir whose child is locked down so `remove_dir_all` can't
         // recurse into it and fails for the whole `cred-stuck` tree.
         let stuck = base.join("cred-stuck");
@@ -532,14 +546,23 @@ mod tests {
             sweep_stale_staging_dirs(&base, STALE_STAGING_PREFIXES, Duration::from_secs(3000)).context("sweep")?;
 
         // Restore permissions so the tempdir's own cleanup can remove it.
-        std::fs::set_permissions(&blocked_child, std::fs::Permissions::from_mode(0o700))
-            .context("restore blocked child perms")?;
+        // Under a privileged runner `stuck`/`blocked_child` may already be
+        // gone (the sweep removed them too), so a missing-path failure here
+        // is tolerated rather than asserted on.
+        let _ = std::fs::set_permissions(&blocked_child, std::fs::Permissions::from_mode(0o700));
 
         assert!(
             removed.contains(&"cred-removable".to_string()),
             "a removable stale dir must still be swept despite an earlier failure: {removed:?}"
         );
         assert!(!removable.exists(), "the removable dir must be gone");
+        if privileged {
+            // Nothing above forced a real removal failure under root, so
+            // there is no "survives" claim left to check; the removable-dir
+            // assertions are this test's whole claim under a privileged
+            // runner.
+            return Ok(());
+        }
         assert!(
             stuck.exists(),
             "the unremovable dir must survive this sweep rather than wedge it"
