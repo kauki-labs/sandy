@@ -203,9 +203,12 @@ pub const STALE_STAGING_PREFIXES: &[&str] = &["cred-", "verify-"];
 ///
 /// # Errors
 ///
-/// Returns `io::Error` if `base` cannot be listed. An entry that disappears
-/// between listing and stat'ing (a concurrent owner's own cleanup, or a
-/// removal racing this sweep) is skipped rather than failing the whole call.
+/// Returns `io::Error` only if `base` itself cannot be listed. Every
+/// per-entry failure is best-effort and never aborts the sweep: an entry
+/// that disappears between listing and stat'ing (a concurrent owner's own
+/// cleanup, or a removal racing this sweep) is skipped, and an entry that
+/// fails to remove outright (e.g. a permission error) is left in place for
+/// a later sweep rather than blocking the rest of this one.
 pub fn sweep_stale_staging_dirs(base: &Path, prefixes: &[&str], max_age: Duration) -> io::Result<Vec<String>> {
     let now = SystemTime::now();
     let mut removed = Vec::new();
@@ -234,7 +237,10 @@ pub fn sweep_stale_staging_dirs(base: &Path, prefixes: &[&str], max_age: Duratio
         match std::fs::remove_dir_all(entry.path()) {
             Ok(()) => removed.push(name),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
+            // Best-effort (flagged in review): one unremovable stale dir must
+            // never block sweeping the rest, or a single stuck entry could
+            // wedge every later gc run indefinitely.
+            Err(_) => {}
         }
     }
     Ok(removed)
@@ -494,6 +500,50 @@ mod tests {
 
         assert!(removed.is_empty(), "an unrelated dir must never be swept: {removed:?}");
         assert!(unrelated.exists(), "the unrelated dir must survive");
+        Ok(())
+    }
+
+    /// Best-effort (flagged in review): a stale dir that fails to remove (a
+    /// permission-blocked child it can't recurse into) must not stop the
+    /// sweep from removing a later stale dir in the same pass.
+    #[test]
+    fn sweep_continues_past_an_unremovable_stale_dir() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = private_tmp()?;
+        let base = ensure_staging_base_in(tmp.path()).context("ensure base")?;
+
+        // A stale dir whose child is locked down so `remove_dir_all` can't
+        // recurse into it and fails for the whole `cred-stuck` tree.
+        let stuck = base.join("cred-stuck");
+        let blocked_child = stuck.join("blocked");
+        std::fs::create_dir(&stuck).context("create stuck dir")?;
+        std::fs::create_dir(&blocked_child).context("create blocked child")?;
+        std::fs::write(blocked_child.join("file"), b"x").context("seed blocked child")?;
+        std::fs::set_permissions(&blocked_child, std::fs::Permissions::from_mode(0o000))
+            .context("lock down blocked child")?;
+        set_mtime_age(&stuck, Duration::from_secs(3600))?;
+
+        let removable = base.join("cred-removable");
+        std::fs::create_dir(&removable).context("create removable dir")?;
+        set_mtime_age(&removable, Duration::from_secs(3600))?;
+
+        let removed =
+            sweep_stale_staging_dirs(&base, STALE_STAGING_PREFIXES, Duration::from_secs(3000)).context("sweep")?;
+
+        // Restore permissions so the tempdir's own cleanup can remove it.
+        std::fs::set_permissions(&blocked_child, std::fs::Permissions::from_mode(0o700))
+            .context("restore blocked child perms")?;
+
+        assert!(
+            removed.contains(&"cred-removable".to_string()),
+            "a removable stale dir must still be swept despite an earlier failure: {removed:?}"
+        );
+        assert!(!removable.exists(), "the removable dir must be gone");
+        assert!(
+            stuck.exists(),
+            "the unremovable dir must survive this sweep rather than wedge it"
+        );
         Ok(())
     }
 }

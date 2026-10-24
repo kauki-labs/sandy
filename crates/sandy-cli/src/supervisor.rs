@@ -436,7 +436,10 @@ pub fn run_job_with_credential<
     plan.secret_dir = Some(cred_dir.to_path_buf());
 
     let margin = refresh_interval("SANDY_REFRESH_MARGIN_SECS", DEFAULT_REFRESH_MARGIN_SECS);
-    let tick = refresh_interval("SANDY_REFRESH_TICK_SECS", DEFAULT_REFRESH_TICK_SECS);
+    let tick = safe_heartbeat_tick(
+        refresh_interval("SANDY_REFRESH_TICK_SECS", DEFAULT_REFRESH_TICK_SECS),
+        MAX_TTL_SECS,
+    );
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
 
     // Teardown also runs as a Drop guard, not only as the explicit call below: it
@@ -626,6 +629,27 @@ fn refresh_interval(env_key: &str, default: u64) -> Duration {
 /// (#195) that a credential staging dir is still in active use.
 fn touch_dir_mtime(dir: &Path) -> std::io::Result<()> {
     std::fs::File::open(dir)?.set_modified(SystemTime::now())
+}
+
+/// Clamp `tick` so the mid-run heartbeat can never tick slower than [`gc`]'s
+/// stale-dir sweep threshold (#195, flagged in review): a
+/// `SANDY_REFRESH_TICK_SECS` at or above `max_ttl_secs` would let a live
+/// job's cred dir go stale between heartbeats and get swept out from under
+/// it, so a tick that reaches the threshold is never honored — it falls back
+/// to [`DEFAULT_REFRESH_TICK_SECS`], which is safe by construction (well
+/// below any reasonable `MAX_TTL_SECS`).
+fn safe_heartbeat_tick(tick: Duration, max_ttl_secs: u32) -> Duration {
+    if tick.as_secs() >= u64::from(max_ttl_secs) {
+        tracing::warn!(
+            configured_secs = tick.as_secs(),
+            max_ttl_secs,
+            "SANDY_REFRESH_TICK_SECS reaches MAX_TTL_SECS; falling back to the default tick so gc's stale-dir sweep \
+             can never outrun the heartbeat"
+        );
+        Duration::from_secs(DEFAULT_REFRESH_TICK_SECS)
+    } else {
+        tick
+    }
 }
 
 /// Poll `lease` every `tick` and refresh it when within `margin` of expiry, until
@@ -1158,6 +1182,29 @@ mod tests {
             assert!(!report.envelope.retryable, "band 2 must not be retryable");
         }
         Ok(())
+    }
+
+    /// A tick safely below `MAX_TTL_SECS` passes through unchanged.
+    #[test]
+    fn safe_heartbeat_tick_passes_through_a_safe_tick() {
+        let tick = super::safe_heartbeat_tick(Duration::from_secs(60), 3000);
+        assert_eq!(tick, Duration::from_secs(60));
+    }
+
+    /// #195 (flagged in review): a tick that reaches `MAX_TTL_SECS` would let a
+    /// live job's cred dir go stale between heartbeats and get swept out from
+    /// under it, so it must never be honored as-is.
+    #[test]
+    fn safe_heartbeat_tick_falls_back_when_the_tick_reaches_max_ttl_secs() {
+        let tick = super::safe_heartbeat_tick(Duration::from_secs(3000), 3000);
+        assert_eq!(tick, Duration::from_secs(super::DEFAULT_REFRESH_TICK_SECS));
+    }
+
+    /// As above, for a tick that exceeds (not just reaches) the threshold.
+    #[test]
+    fn safe_heartbeat_tick_falls_back_when_the_tick_exceeds_max_ttl_secs() {
+        let tick = super::safe_heartbeat_tick(Duration::from_secs(3_600_000), 3000);
+        assert_eq!(tick, Duration::from_secs(super::DEFAULT_REFRESH_TICK_SECS));
     }
 
     /// `refresh_loop` refreshes the credential on each tick while the job runs and
