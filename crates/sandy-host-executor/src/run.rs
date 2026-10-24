@@ -494,6 +494,23 @@ mod tests {
     /// (the happy path, a refusal, a clean close) — never expected to fire,
     /// unlike [`SHORT_TIMEOUT`] which exists specifically to fire fast.
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Waits until `control`'s deadline becomes `Some` — the exit fail-safe's
+    /// own unconditional "bound a still-suspended control" step (see its
+    /// comment in `run_dispatch_loop`) — or fails after 2s. The real
+    /// synchronization point for the `#300` shutdown-cancel tests: a fixed
+    /// sleep can't tell "the fail-safe ran" from "the runner was briefly
+    /// slow" in either direction, so a test asserting the fail-safe's effect
+    /// needs a signal the fail-safe itself produces, not a guessed delay.
+    async fn wait_for_fail_safe(control: &RunControl) -> anyhow::Result<()> {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while control.deadline().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("the exit fail-safe never bounded the suspended control's deadline")
+    }
     /// Short enough that a test proving [`RegisterError::ResponseTimedOut`]
     /// fires doesn't cost real seconds, long enough that the orchestrator
     /// task's own read has time to complete first even under a loaded CI
@@ -1186,20 +1203,24 @@ mod tests {
             .await
             .context("job-1's handle never started")?;
 
-        let _ = shutdown_tx.send(());
-        // Gives the now-broken-out select loop time to run the fail-safe
-        // (synchronous, no further awaits of its own) before this checks
-        // job-1's captured control below.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-        let cancelled = captured_control
+        // Suspend the deadline before triggering shutdown, so the exit
+        // fail-safe's own deadline-restoration step (unconditional, see its
+        // own comment) gives this test a real event to synchronize on,
+        // rather than a fixed sleep that could fire before the fail-safe
+        // runs on a busy runner (CodeRabbit on #369).
+        let job1_control = captured_control
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .expect("job-1's control was captured")
-            .is_cancelled();
+            .clone();
+        job1_control.suspend_deadline();
+
+        let _ = shutdown_tx.send(());
+        wait_for_fail_safe(&job1_control).await?;
+
         assert!(
-            cancelled,
+            job1_control.is_cancelled(),
             "an explicit requested shutdown must cancel a still-running job's RunControl"
         );
 
@@ -1274,18 +1295,23 @@ mod tests {
             .await
             .context("job-1's handle never started")?;
 
-        drop(server); // the orchestrator disconnects instead of a requested shutdown
-
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-        let cancelled = captured_control
+        // Same synchronization fix as the Shutdown test above: suspend the
+        // deadline first so the fail-safe's own unconditional
+        // deadline-restoration step is a real event to wait on, not a fixed
+        // sleep a buggy cancel() could race (CodeRabbit on #369).
+        let job1_control = captured_control
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .expect("job-1's control was captured")
-            .is_cancelled();
+            .clone();
+        job1_control.suspend_deadline();
+
+        drop(server); // the orchestrator disconnects instead of a requested shutdown
+        wait_for_fail_safe(&job1_control).await?;
+
         assert!(
-            !cancelled,
+            !job1_control.is_cancelled(),
             "a Closed connection must not cancel a still-running job — only an explicit Shutdown does"
         );
 
