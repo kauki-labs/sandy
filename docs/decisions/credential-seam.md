@@ -149,27 +149,32 @@ logged and skipped, and a single entry that can't be read, stat'ed, or
 removed is skipped and retried on a later `gc`, neither ever blocking `gc`'s
 primary job-record eviction.
 
+The heartbeat alone isn't enough: `refresh_loop` touches `cred_dir`'s mtime
+and then calls `refresh_once` synchronously, so a stalled `GithubAdapter`
+call would block the next heartbeat for as long as the call hangs. The
+adapter's `timeout_capped_builder` bounds every GitHub API call (mint,
+refresh, revoke, the permissions read) to `HTTP_TIMEOUT`, a quarter of
+`MAX_TTL_SECS`, derived from it rather than a sibling constant so the two
+can never drift apart. A stalled call now always resolves as a timeout error
+well inside the sweep window instead of hanging indefinitely.
+
 **Consequences.** Sweep safety for a live job needs the gap between
 heartbeats, one tick plus one refresh call's latency, to stay under
-`MAX_TTL_SECS`; the refresh margin plays no part, since the heartbeat fires
-every tick regardless of whether a refresh does. `safe_heartbeat_tick` caps a
-misconfigured `SANDY_REFRESH_TICK_SECS` at the default rather than honoring
-one that reaches `MAX_TTL_SECS`, and a compile-time assertion ties the
-default itself to `MAX_TTL_SECS` so the two constants can't drift apart
-unnoticed.
+`MAX_TTL_SECS`. With `HTTP_TIMEOUT` bounding that latency to `MAX_TTL_SECS /
+4` and `safe_heartbeat_tick` bounding the tick to the default on
+misconfiguration, the gap is bounded well under `MAX_TTL_SECS` by
+construction, not just by assumption. The refresh margin plays no part,
+since the heartbeat fires every tick regardless of whether a refresh does.
 
 A `verify-*` dir (the trust-root verify probe) gets no heartbeat. It
-normally lives for one mint call and one revoke call, but the GitHub adapter
-sets no HTTP timeout on either, so a hung call can in principle keep the dir
-alive past `MAX_TTL_SECS` with nothing heartbeating it. If the mint hangs,
-`gc` may sweep the now-empty probe dir before it returns; staging then fails
-on the stale dir, and `mint_lease`'s existing revoke-on-stage-failure path
-(`revoke_orphan`) revokes the token GitHub already minted, so the verify
-fails rather than leaking a token. If the revoke hangs instead, the sweep
-only removes a file whose token `revoke` already holds in memory; nothing is
-lost either way. A client-side timeout on the adapter would close the hang
-itself, but it changes every live GitHub call the adapter makes, not just
-the verify probe, so it is left to a follow-up rather than folded in here.
+normally lives for one mint call and one revoke call, now also bounded by
+`HTTP_TIMEOUT`, so it is removed well within `MAX_TTL_SECS` on any
+non-crash path. Even if a call somehow exceeded its timeout at the
+connector level, the outcome stays safe: a hung-then-timed-out mint leaves
+`mint_lease`'s existing revoke-on-stage-failure path (`revoke_orphan`) to
+revoke a token GitHub did manage to mint before the dir could be swept, and
+a hung revoke only risks the sweep removing a file whose token `revoke`
+already holds in memory.
 
 **Set aside.** Tracking each staging dir's mint time in a side file (instead
 of reading mtime) was considered and rejected: it adds a second piece of

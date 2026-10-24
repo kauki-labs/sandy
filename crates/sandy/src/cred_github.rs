@@ -24,11 +24,11 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use octocrab::{Octocrab, models::AppId};
+use octocrab::{DefaultOctocrabBuilderConfig, NoAuth, NoSvc, NotLayerReady, Octocrab, OctocrabBuilder, models::AppId};
 use uuid::Uuid;
 
 use crate::cred::{
-    CredError, CredentialHandle, CredentialProvider, Lease, Minted, Scope, TrustRoot, read_secret_0600,
+    CredError, CredentialHandle, CredentialProvider, Lease, MAX_TTL_SECS, Minted, Scope, TrustRoot, read_secret_0600,
     render_github_permissions,
 };
 
@@ -37,6 +37,31 @@ const GITHUB_API: &str = "https://api.github.com";
 /// GitHub's fixed installation-token lifetime: one hour, not configurable. The
 /// seam's revoke-at-teardown is the real bound; this is only the backstop.
 const GITHUB_TOKEN_TTL: Duration = Duration::from_secs(3600);
+
+/// Connect/read timeout for every GitHub API call this adapter makes (#195
+/// follow-up). Without a bound, a stalled call has no end: `refresh_loop`'s
+/// heartbeat runs synchronously before each
+/// `refresh_once` call and can't tick again until it returns, so a hung
+/// `refresh` could hold `cred_dir`'s mtime still long enough for `gc` to
+/// sweep a dir still in use. A quarter of `MAX_TTL_SECS` leaves
+/// three-quarters of the sweep window as margin even in the worst case,
+/// derived from `MAX_TTL_SECS` (not a sibling constant) so the two can never
+/// drift apart the way `DEFAULT_REFRESH_TICK_SECS` could without its own
+/// compile-time assertion. Real GitHub calls finish in seconds, so this
+/// ceiling is a defensive bound, never a typical latency.
+const HTTP_TIMEOUT: Duration = Duration::from_secs((MAX_TTL_SECS / 4) as u64);
+
+/// `Octocrab::builder()` with the connect/read timeout applied (see
+/// [`HTTP_TIMEOUT`]). Takes `timeout` as a parameter, rather than reaching
+/// for the constant directly, so a test can exercise the exact mechanism
+/// production uses with a timeout short enough to run in milliseconds.
+fn timeout_capped_builder(
+    timeout: Duration,
+) -> OctocrabBuilder<NoSvc, DefaultOctocrabBuilderConfig, NoAuth, NotLayerReady> {
+    Octocrab::builder()
+        .set_connect_timeout(Some(timeout))
+        .set_read_timeout(Some(timeout))
+}
 
 /// The scoped body for `POST /app/installations/{id}/access_tokens`.
 #[derive(serde::Serialize)]
@@ -104,7 +129,7 @@ impl GithubAdapter {
     fn app_client(&self) -> Result<Octocrab, CredError> {
         let key = jsonwebtoken::EncodingKey::from_rsa_pem(&self.key_pem)
             .map_err(|e| CredError::Mint(format!("parse App private key: {e}")))?;
-        Octocrab::builder()
+        timeout_capped_builder(HTTP_TIMEOUT)
             .base_uri(&self.api_base)
             .map_err(|e| CredError::Mint(format!("base_uri {:?}: {e}", self.api_base)))?
             .app(AppId(self.app_id), key)
@@ -214,7 +239,7 @@ impl CredentialProvider for GithubAdapter {
         // Build the client inside the runtime (octocrab's Buffer needs a reactor).
         let uri = format!("{}/installation/token", self.api_base);
         let status = self.runtime.block_on(async {
-            let client = Octocrab::builder()
+            let client = timeout_capped_builder(HTTP_TIMEOUT)
                 .build()
                 .and_then(|c| c.user_access_token(record.token))
                 .map_err(|e| CredError::Revoke(format!("build token client: {e}")))?;
@@ -274,6 +299,8 @@ fn permissions_from_json(value: &serde_json::Value) -> HashMap<String, String> {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context;
+
     use super::*;
 
     /// `bare_repo` strips the owner so the installation-token `repositories` param
@@ -297,5 +324,55 @@ mod tests {
         assert_eq!(perms.get("pull_requests"), Some(&"write".to_string()));
         assert_eq!(perms.get("metadata"), Some(&"read".to_string()));
         assert!(!perms.contains_key("nested"), "non-string members are ignored");
+    }
+
+    /// #195 follow-up: a stalled GitHub response must not
+    /// block past the configured timeout, since `refresh_loop`'s heartbeat
+    /// can't tick again until a synchronous `refresh`/`refresh_once` call
+    /// returns. Exercises the exact `timeout_capped_builder` production uses,
+    /// with a timeout short enough to run in milliseconds, against a local
+    /// server that accepts the connection and never writes a response.
+    #[test]
+    fn timeout_capped_builder_bounds_a_stalled_request() -> anyhow::Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").context("bind a local listener")?;
+        let port = listener.local_addr().context("local_addr")?.port();
+        // Accept the connection and hold it well past the client's own
+        // timeout, then drop it; the client's timeout is what must end the
+        // call, not this thread.
+        std::thread::spawn(move || {
+            if let Ok((_stream, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_secs(3));
+            }
+        });
+
+        let short_timeout = Duration::from_millis(100);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("build runtime")?;
+        let started = std::time::Instant::now();
+        // Build the client INSIDE the runtime: octocrab's tower Buffer spawns
+        // a worker at build time, which needs an active reactor (same reason
+        // app_client()/installation_permissions() do this).
+        let result: Result<serde_json::Value, _> = runtime.block_on(async {
+            let client = timeout_capped_builder(short_timeout)
+                .base_uri(format!("http://127.0.0.1:{port}"))?
+                // A stalled connection is not a rate-limit response: disable
+                // retries so the test measures one timeout, not up to four.
+                .add_retry_config(octocrab::service::middleware::retry::RetryConfig::None)
+                .build()?;
+            client.get("/ping", None::<&()>).await
+        });
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.is_err(),
+            "a stalled server must surface as an error, not hang forever"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the call must fail at roughly the configured timeout, not wait out the stalled server: {elapsed:?}"
+        );
+        Ok(())
     }
 }

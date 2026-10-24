@@ -199,9 +199,12 @@ sequenceDiagram
   such dir under the sandy staging base whose mtime is at least `MAX_TTL_SECS` old.
   The refresh loop heartbeats `cred_dir`'s mtime every tick (not only on an actual
   refresh), since a provider's native token TTL can outlast `MAX_TTL_SECS` between
-  refreshes — without it, `gc` could delete a live job's credential dir. The sweep
+  refreshes; without it, `gc` could delete a live job's credential dir. The sweep
   is best-effort: a staging base that can't be validated or listed is logged and
-  skipped, never blocking `gc`'s record eviction.
+  skipped, never blocking `gc`'s record eviction. A stalled refresh call could
+  itself block the heartbeat (the two run sequentially), so the GitHub adapter
+  bounds every API call to `HTTP_TIMEOUT` (a quarter of `MAX_TTL_SECS`), closing
+  the gap at its source rather than only at the heartbeat.
 
 **KPI.**
 
@@ -214,7 +217,10 @@ sequenceDiagram
   `refresh_loop_heartbeats_the_cred_dir_mtime_every_tick` /
   `safe_heartbeat_tick_passes_through_a_safe_tick` /
   `safe_heartbeat_tick_falls_back_when_the_tick_reaches_max_ttl_secs` /
-  `..._exceeds_max_ttl_secs`.
+  `..._exceeds_max_ttl_secs`; `cred_github.rs`'s
+  `timeout_capped_builder_bounds_a_stalled_request` (a local listener that
+  accepts and never responds, proving the client errors out at the configured
+  timeout rather than hanging).
 - End-to-end: `live_cred.rs` (git-helper + mid-run refresh + revoke; the "everything"
   scenario composing cred + secret + input + output), `live_refresh.rs` (a rotated
   token reaches the running guest). Adapter-live (real App): `cred_e2e.rs` /
