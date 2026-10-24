@@ -18,7 +18,9 @@ pub mod secret;
 pub mod staging;
 
 pub use secret::{OwnedDir, private_staging_dir};
-pub use staging::{ensure_sandy_staging_base, ensure_staging_base_in};
+pub use staging::{
+    STALE_STAGING_PREFIXES, ensure_sandy_staging_base, ensure_staging_base_in, sweep_stale_staging_dirs,
+};
 
 /// A filesystem operation failed, or a path was refused as unsafe.
 #[derive(Debug, thiserror::Error)]

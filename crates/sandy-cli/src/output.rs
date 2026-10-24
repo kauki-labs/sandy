@@ -88,7 +88,8 @@ pub fn format_envelope(envelope: &ResultEnvelope, format: OutputFormat) -> serde
     }
 }
 
-/// Format the `gc` result (the evicted job ids).
+/// Format the `gc` result: the evicted job ids, followed by the names of any
+/// swept stale credential staging dirs (#195).
 ///
 /// # Errors
 ///
@@ -96,7 +97,7 @@ pub fn format_envelope(envelope: &ResultEnvelope, format: OutputFormat) -> serde
 pub fn format_gc(evicted: &[String], format: OutputFormat) -> serde_json::Result<String> {
     match format {
         OutputFormat::Plain => {
-            let mut out = format!("gc: evicted {} record(s)", evicted.len());
+            let mut out = format!("gc: evicted {} item(s)", evicted.len());
             for id in evicted {
                 let _ = write!(out, "\n  {id}");
             }

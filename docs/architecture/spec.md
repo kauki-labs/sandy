@@ -193,11 +193,24 @@ sequenceDiagram
 - **Mid-run refresh.** With a huge margin + short tick the refresh thread re-mints
   and rewrites the live secret file, so a long job's `git credential fill` serves a
   fresh token; the guest never sees the value on argv/console.
+- **`gc` sweeps a leaked `cred-*`/`verify-*` staging dir (#195).** The drop guard
+  that removes `cred_dir`/the verify probe's temp dir runs on every normal exit
+  and on panic, but not on SIGKILL or a crash before it runs; `sandy gc` sweeps any
+  such dir under the sandy staging base whose mtime is at least `MAX_TTL_SECS` old.
+  The refresh loop heartbeats `cred_dir`'s mtime every tick (not only on an actual
+  refresh), since a provider's native token TTL can outlast `MAX_TTL_SECS` between
+  refreshes — without it, `gc` could delete a live job's credential dir. The sweep
+  is best-effort: a staging base that can't be validated or listed is logged and
+  skipped, never blocking `gc`'s record eviction.
 
 **KPI.**
 
 - Integration: `cred.rs` unit tests (`mint_lease` clamps TTL, stages 0600, revoke
-  bracket, `should_refresh`); the supervisor's mint-fails-closed test.
+  bracket, `should_refresh`); the supervisor's mint-fails-closed test;
+  `sandy-fsutil`'s `sweep_stale_staging_dirs` tests (sweeps a stale dir, keeps a
+  fresh one, ignores an unrelated prefix); the supervisor's
+  `gc_sweeps_a_stale_cred_dir_past_max_ttl` / `gc_keeps_a_fresh_verify_dir` /
+  `refresh_loop_heartbeats_the_cred_dir_mtime_every_tick`.
 - End-to-end: `live_cred.rs` (git-helper + mid-run refresh + revoke; the "everything"
   scenario composing cred + secret + input + output), `live_refresh.rs` (a rotated
   token reaches the running guest). Adapter-live (real App): `cred_e2e.rs` /

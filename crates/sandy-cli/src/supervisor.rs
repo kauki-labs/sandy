@@ -16,9 +16,9 @@ use std::{
 
 use sandy::{
     BackendError, Classification, CoreError, CredentialProvider, EgressApplier, EgressOs, EgressOutcome,
-    JOURNAL_SCHEMA_VERSION, JobRecord, JobState, Journal, Lease, Logs, Outcome, OutputRef, OutputStatus, ProcessExit,
-    Profile, Provenance, RESULT_SCHEMA_VERSION, ResultEnvelope, Scope, SecretSource, StagedImage, Status, VmBackend,
-    classify_backend_error, classify_invalid_plan, classify_outcome, enforce, mint_lease, new_job_id,
+    JOURNAL_SCHEMA_VERSION, JobRecord, JobState, Journal, Lease, Logs, MAX_TTL_SECS, Outcome, OutputRef, OutputStatus,
+    ProcessExit, Profile, Provenance, RESULT_SCHEMA_VERSION, ResultEnvelope, Scope, SecretSource, StagedImage, Status,
+    VmBackend, classify_backend_error, classify_invalid_plan, classify_outcome, enforce, mint_lease, new_job_id,
     plan_egress_scoped, plan_eviction, reconcile_job, refresh_once, validate_no_secret_leak,
 };
 use zeroize::Zeroizing;
@@ -367,9 +367,12 @@ pub fn mint_run_token<P: CredentialProvider + ?Sized>(
 /// a job that outlives the provider's native token cap (GitHub ~1h) keeps a valid
 /// scoped token the whole run. The refresh margin and poll interval default to
 /// [`DEFAULT_REFRESH_MARGIN_SECS`] / [`DEFAULT_REFRESH_TICK_SECS`], overridable via
-/// `SANDY_REFRESH_MARGIN_SECS` / `SANDY_REFRESH_TICK_SECS`. Teardown revokes the
-/// live token (the latest handle after any refresh) on every path and removes the
-/// staged file (INV-1); `cred_dir` itself is the caller's to clean up.
+/// `SANDY_REFRESH_MARGIN_SECS` / `SANDY_REFRESH_TICK_SECS`. Every tick also
+/// heartbeats `cred_dir`'s mtime (#195), so [`gc`]'s stale-staging-dir sweep
+/// never mistakes a live long-running job for one SIGKILL or a crash left
+/// behind. Teardown revokes the live token (the latest handle after any
+/// refresh) on every path and removes the staged file (INV-1); `cred_dir`
+/// itself is the caller's to clean up.
 ///
 /// # Errors
 ///
@@ -619,6 +622,12 @@ fn refresh_interval(env_key: &str, default: u64) -> Duration {
     Duration::from_secs(secs)
 }
 
+/// Bump `dir`'s mtime to now: proves to [`gc`]'s mtime-based stale-dir sweep
+/// (#195) that a credential staging dir is still in active use.
+fn touch_dir_mtime(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.set_modified(SystemTime::now())
+}
+
 /// Poll `lease` every `tick` and refresh it when within `margin` of expiry, until
 /// the sender half of `stop` is dropped (the run finished). Each refresh re-stages
 /// the live token file and revokes the superseded token via [`refresh_once`]; a
@@ -628,6 +637,14 @@ fn refresh_interval(env_key: &str, default: u64) -> Duration {
 /// (M-6 follow-up): `run_job`'s own redaction pass only ever saw the token staged
 /// before it started, so a refreshed token needs its own entry for the
 /// post-run re-redaction pass in [`run_job_with_credential`] to catch it too.
+///
+/// Every tick also heartbeats the cred dir's mtime (#195), regardless of
+/// whether a refresh actually fires: [`gc`] sweeps a `cred-*` staging dir whose
+/// mtime is older than `MAX_TTL_SECS` to reclaim one a crash or SIGKILL left
+/// behind, but a provider's native token TTL can exceed `MAX_TTL_SECS`, so a
+/// genuinely running job can otherwise go longer than that between refreshes.
+/// A `kill -9`'d process stops ticking, so an actually abandoned dir still
+/// ages out.
 fn refresh_loop<P: CredentialProvider + Sync + ?Sized>(
     provider: &P,
     lease: &Mutex<Lease>,
@@ -643,6 +660,12 @@ fn refresh_loop<P: CredentialProvider + Sync + ?Sized>(
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
         let mut guard = lease.lock().unwrap_or_else(PoisonError::into_inner);
+        if let SecretSource::File(path) = &guard.secret_ref.source
+            && let Some(dir) = path.parent()
+            && let Err(e) = touch_dir_mtime(dir)
+        {
+            tracing::warn!(%e, dir = %dir.display(), "could not heartbeat the credential staging dir's mtime");
+        }
         match refresh_once(provider, &mut guard, SystemTime::now(), margin) {
             Ok(true) => {
                 if let SecretSource::File(path) = &guard.secret_ref.source {
@@ -746,14 +769,44 @@ pub fn kill<B: VmBackend>(journal: &Journal, backend: &B, job_id: &str) -> Resul
     Ok(cancelled)
 }
 
-/// Garbage-collect terminal job records under the keep-last-N + referenced policy.
-/// A still-`Running` job is referenced and never evicted, even when it is oldest.
-/// Returns the evicted job ids.
+/// Garbage-collect terminal job records under the keep-last-N + referenced
+/// policy, then best-effort sweep any `cred-*`/`verify-*` credential staging
+/// dir left behind under the sandy staging base past its mint TTL (#195: a
+/// drop guard normally removes one on every exit path, but SIGKILL or a crash
+/// before it runs can leave one behind holding a live token). A still-
+/// `Running` job is referenced and never evicted, even when it is oldest.
+/// Returns the evicted job ids followed by the names of any swept staging
+/// dirs.
+///
+/// The staging sweep is independent of record eviction and never fails this
+/// call: an unreadable or unsafe staging base is logged and skipped rather
+/// than blocking `gc`'s primary duty of reclaiming journal records.
 ///
 /// # Errors
 ///
 /// Returns [`CoreError`] on journal I/O failure.
 pub fn gc(journal: &Journal, keep_last_n: usize) -> Result<Vec<String>, CoreError> {
+    match sandy_fsutil::ensure_sandy_staging_base() {
+        Ok(base) => gc_against(journal, keep_last_n, &base),
+        Err(e) => {
+            tracing::warn!(%e, "gc: could not validate the sandy staging base; skipping the stale credential dir sweep");
+            gc_records(journal, keep_last_n)
+        }
+    }
+}
+
+/// As [`gc`], against an injected `staging_base` — tests sweep a temp dir
+/// instead of the real sandy-owned staging base under the OS temp dir.
+fn gc_against(journal: &Journal, keep_last_n: usize, staging_base: &Path) -> Result<Vec<String>, CoreError> {
+    let mut evicted = gc_records(journal, keep_last_n)?;
+    evicted.extend(sweep_stale_cred_dirs(staging_base));
+    Ok(evicted)
+}
+
+/// Evict terminal job records under the keep-last-N + referenced policy (the
+/// policy half of [`gc`], split out so it runs — and can be tested —
+/// independently of the staging-dir sweep).
+fn gc_records(journal: &Journal, keep_last_n: usize) -> Result<Vec<String>, CoreError> {
     let records = journal.list()?;
 
     // Running jobs are referenced and never evicted; every terminal record maps
@@ -784,11 +837,32 @@ pub fn gc(journal: &Journal, keep_last_n: usize) -> Result<Vec<String>, CoreErro
     Ok(evicted)
 }
 
+/// Sweep stale `cred-*`/`verify-*` dirs under `staging_base` (#195),
+/// best-effort: a listing or removal failure is logged and treated as "none
+/// swept" rather than propagated, consistent with [`gc`]'s contract that the
+/// sweep never fails the call.
+fn sweep_stale_cred_dirs(staging_base: &Path) -> Vec<String> {
+    match sandy_fsutil::sweep_stale_staging_dirs(
+        staging_base,
+        sandy_fsutil::STALE_STAGING_PREFIXES,
+        Duration::from_secs(u64::from(MAX_TTL_SECS)),
+    ) {
+        Ok(swept) => swept,
+        Err(e) => {
+            tracing::warn!(%e, "gc: could not sweep stale credential staging dirs");
+            Vec::new()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        time::{Duration, SystemTime},
     };
 
     use anyhow::Context;
@@ -799,7 +873,7 @@ mod tests {
     use sandy_test_support::{FakeApplier, FakeBackend};
     use zeroize::Zeroizing;
 
-    use super::{redact_console, redact_with_refreshes, run_job};
+    use super::{gc_against, redact_console, redact_with_refreshes, run_job};
     use crate::plan::JobPlan;
 
     // --- console redaction (M-6) -------------------------------------------------
@@ -1133,6 +1207,60 @@ mod tests {
         Ok(())
     }
 
+    /// #195: `refresh_loop` must heartbeat the cred dir's mtime every tick even
+    /// when no refresh actually fires (the margin is far smaller than the
+    /// lease's TTL, so `should_refresh` never trips here — proven by asserting
+    /// nothing was revoked). Without the heartbeat, a long-running job whose
+    /// provider TTL outlasts `gc`'s `MAX_TTL_SECS` sweep window would have its
+    /// live credential dir deleted out from under it.
+    #[test]
+    fn refresh_loop_heartbeats_the_cred_dir_mtime_every_tick() -> anyhow::Result<()> {
+        use std::sync::{Mutex, mpsc};
+
+        use sandy::{Scope, mint_lease};
+        use sandy_test_support::FakeProvider;
+        use zeroize::Zeroizing;
+
+        let tmp = tempfile::tempdir().context("tmp")?;
+        std::fs::set_permissions(tmp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .context("tmp 0700")?;
+        let provider = FakeProvider::returning("tok");
+        let lease = mint_lease(&provider, &Scope::default(), 1_800, "GITHUB_TOKEN", tmp.path())
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("mint")?;
+        // Back-date the dir well past gc's MAX_TTL_SECS window before the loop
+        // starts ticking, so a surviving fresh mtime can only be the heartbeat.
+        set_mtime_age(tmp.path(), Duration::from_secs(u64::from(sandy::MAX_TTL_SECS) + 600))?;
+        let lease = Mutex::new(lease);
+        let (tx, rx) = mpsc::channel::<()>();
+        // Far smaller than the lease's 1_800s TTL, so `should_refresh` never
+        // trips in this short test: isolates the heartbeat from the
+        // already-covered refresh-rewrite path.
+        let margin = Duration::from_secs(1);
+        let tick = Duration::from_millis(5);
+        let redact_log: Mutex<Vec<Zeroizing<String>>> = Mutex::new(Vec::new());
+
+        std::thread::scope(|s| {
+            let pref = &provider;
+            let shared = &lease;
+            let shared_log = &redact_log;
+            s.spawn(move || super::refresh_loop(pref, shared, margin, tick, &rx, shared_log));
+            std::thread::sleep(Duration::from_millis(50));
+            drop(tx);
+        });
+
+        assert!(
+            provider.revoked().is_empty(),
+            "no refresh may fire in this test; the fresh mtime below must come from the heartbeat alone"
+        );
+        let age = SystemTime::now().duration_since(std::fs::metadata(tmp.path())?.modified()?)?;
+        assert!(
+            age < Duration::from_secs(5),
+            "the cred dir's mtime must be heartbeated while the loop ticks: age={age:?}"
+        );
+        Ok(())
+    }
+
     /// A backend that panics inside `run`, to drive the teardown Drop guard down the
     /// unwind path.
     struct PanicBackend;
@@ -1198,6 +1326,63 @@ mod tests {
             !cred_dir.path().join("GITHUB_TOKEN").exists(),
             "the staged token must be removed even when the run panics"
         );
+        Ok(())
+    }
+
+    // --- gc sweeps stale credential staging dirs (#195) -------------------------
+
+    /// Back-date `dir`'s mtime by `age` so gc's sweep sees it as that old.
+    fn set_mtime_age(dir: &std::path::Path, age: Duration) -> anyhow::Result<()> {
+        let past = SystemTime::now() - age;
+        std::fs::File::open(dir)
+            .context("open dir to back-date mtime")?
+            .set_modified(past)
+            .context("set_modified")?;
+        Ok(())
+    }
+
+    /// #195: a `cred-*` dir left behind past `MAX_TTL_SECS` (SIGKILL or a
+    /// crash skipped the owner's drop guard) must be swept by `gc`.
+    #[test]
+    fn gc_sweeps_a_stale_cred_dir_past_max_ttl() -> anyhow::Result<()> {
+        use sandy::MAX_TTL_SECS;
+
+        let (_tmp, journal) = fresh_journal()?;
+        let staging_parent = tempfile::tempdir().context("staging parent")?;
+        let staging_base =
+            sandy_fsutil::ensure_staging_base_in(staging_parent.path()).context("ensure staging base")?;
+        let stale = staging_base.join("cred-deadbeef");
+        std::fs::create_dir(&stale).context("create stale cred dir")?;
+        set_mtime_age(&stale, Duration::from_secs(u64::from(MAX_TTL_SECS) + 60))?;
+
+        let evicted = gc_against(&journal, 20, &staging_base).context("gc")?;
+
+        assert!(
+            evicted.contains(&"cred-deadbeef".to_string()),
+            "a stale cred dir past MAX_TTL_SECS must be swept: {evicted:?}"
+        );
+        assert!(!stale.exists(), "the stale cred dir must be removed");
+        Ok(())
+    }
+
+    /// #195 (MUST NOT): a `verify-*` dir younger than `MAX_TTL_SECS` is a
+    /// live, in-progress stage and must survive `gc`.
+    #[test]
+    fn gc_keeps_a_fresh_verify_dir() -> anyhow::Result<()> {
+        let (_tmp, journal) = fresh_journal()?;
+        let staging_parent = tempfile::tempdir().context("staging parent")?;
+        let staging_base =
+            sandy_fsutil::ensure_staging_base_in(staging_parent.path()).context("ensure staging base")?;
+        let fresh = staging_base.join("verify-cafef00d");
+        std::fs::create_dir(&fresh).context("create fresh verify dir")?;
+
+        let evicted = gc_against(&journal, 20, &staging_base).context("gc")?;
+
+        assert!(
+            !evicted.contains(&"verify-cafef00d".to_string()),
+            "a fresh verify dir must not be swept: {evicted:?}"
+        );
+        assert!(fresh.exists(), "the fresh verify dir must survive");
         Ok(())
     }
 }

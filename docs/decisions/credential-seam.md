@@ -118,3 +118,42 @@ in code.
 gains the controller user's own account (not just another local user) can read
 the trust material directly; perms-only protection does not defend against
 that. Operators who need that guarantee supply it at the deployment layer.
+
+## 6. `gc` reclaims a leaked `cred-*`/`verify-*` staging dir by mtime, heartbeated while live
+
+**Status:** accepted.
+
+**Context.** `sandy run --credential` and the trust-root verify probe stage a
+token into a fresh, randomly named private dir under the sandy staging base
+(`cred-<hex>` / `verify-<hex>`, #174's `private_staging_dir`). A drop guard
+removes it on normal exit or panic, but SIGKILL or a crash before the guard
+runs leaves it behind, still holding a token valid for up to its mint TTL
+(#195).
+
+**Decision.** `sandy gc` sweeps `cred-*`/`verify-*` dirs under the staging base
+whose mtime is at least `MAX_TTL_SECS` old
+(`sandy_fsutil::sweep_stale_staging_dirs`). Age is read from the dir's own
+mtime rather than a separately tracked start time, so the same mechanism that
+ages a leaked dir out also has to not age out a live one. That requirement is
+not automatic: the mid-run refresh thread only rewrites `cred_dir`'s file when
+`should_refresh` actually fires, and a provider's native token TTL (GitHub
+~1h) can exceed `MAX_TTL_SECS` (3000s) between refreshes — a job quiet that
+long would otherwise look abandoned. The refresh loop therefore heartbeats
+`cred_dir`'s mtime every tick, independent of whether a refresh fires; a
+`kill -9`'d process stops ticking, so a genuinely leaked dir still ages out
+and gets swept. The sweep is best-effort within `gc`: a staging base that
+cannot be validated or listed is logged and skipped, never blocking `gc`'s
+primary job-record eviction.
+
+**Consequences.** A `verify-*` dir (a short synchronous probe, no refresh
+loop) gets no heartbeat and needs none — it is always removed well within
+`MAX_TTL_SECS` on any non-crash path. Lowering `MAX_TTL_SECS` without
+widening the refresh margin accordingly would shrink the quiet window a live
+job can tolerate before its next heartbeat; the heartbeat tick
+(`DEFAULT_REFRESH_TICK_SECS`, 60s default) is far below any reasonable
+`MAX_TTL_SECS`, so this is not a practical concern at current defaults.
+
+**Set aside.** Tracking each staging dir's mint time in a side file (instead
+of reading mtime) was considered and rejected: it adds a second piece of
+state that could drift from the dir's actual contents, where mtime is already
+authoritative and free.

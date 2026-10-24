@@ -9,7 +9,11 @@
 //! trusts — a world-writable or wrong-owner base is rejected, never silently
 //! chmod'd back into shape.
 
-use std::path::{Path, PathBuf};
+use std::{
+    io,
+    path::{Path, PathBuf},
+    time::{Duration, SystemTime},
+};
 
 use rustix::fs::{Mode, OFlags, fstat, mkdirat, open, openat};
 
@@ -175,6 +179,65 @@ fn validate_parent_sticky(parent_mode: u32) -> Result<(), String> {
 
 fn staging_err(action: &'static str, path: &Path, err: &rustix::io::Errno) -> FsError {
     FsError::io(action, path, *err)
+}
+
+/// Staging-dir name prefixes a drop guard removes on normal exit or panic
+/// (`cred-` from [`crate::private_staging_dir`]'s credential staging, `verify-`
+/// from the trust-root verify probe): SIGKILL or a crash before that guard
+/// runs can leave one behind holding a live token (#195).
+pub const STALE_STAGING_PREFIXES: &[&str] = &["cred-", "verify-"];
+
+/// Remove every directory directly under `base` whose name starts with one of
+/// `prefixes` and whose mtime is at least `max_age` old (#195).
+///
+/// A `cred-*`/`verify-*` dir is normally removed by its owner's drop guard on
+/// every exit path, a panic included; SIGKILL or a crash before that guard
+/// runs can leave one behind holding a token that stays valid for up to its
+/// mint TTL. Sweeping by mtime rather than a separately tracked start time
+/// means a dir that is still genuinely in use keeps a fresh mtime and is
+/// never swept: a `cred-*` dir is heartbeated every refresh tick for exactly
+/// this reason (`sandy-cli`'s `refresh_loop`), since a provider's native token
+/// TTL can outlast `max_age` between actual refreshes.
+///
+/// Returns the removed directories' names (not full paths).
+///
+/// # Errors
+///
+/// Returns `io::Error` if `base` cannot be listed. An entry that disappears
+/// between listing and stat'ing (a concurrent owner's own cleanup, or a
+/// removal racing this sweep) is skipped rather than failing the whole call.
+pub fn sweep_stale_staging_dirs(base: &Path, prefixes: &[&str], max_age: Duration) -> io::Result<Vec<String>> {
+    let now = SystemTime::now();
+    let mut removed = Vec::new();
+    for entry in std::fs::read_dir(base)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue; // Non-UTF-8 name: never one of our own prefixed dirs.
+        };
+        if !prefixes.iter().any(|prefix| name.starts_with(prefix)) {
+            continue;
+        }
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue, // raced a concurrent cleanup
+            Err(e) => return Err(e),
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        let Ok(age) = now.duration_since(metadata.modified()?) else {
+            continue; // mtime in the future (clock skew): treat as fresh, never sweep.
+        };
+        if age < max_age {
+            continue;
+        }
+        match std::fs::remove_dir_all(entry.path()) {
+            Ok(()) => removed.push(name),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(removed)
 }
 
 #[cfg(test)]
@@ -369,5 +432,68 @@ mod tests {
             "a non-world-writable parent must pass"
         );
         assert!(validate_parent_sticky(0o700).is_ok(), "a private parent must pass");
+    }
+
+    /// Back-date `dir`'s mtime by `age` so a sweep sees it as that old.
+    fn set_mtime_age(dir: &Path, age: Duration) -> anyhow::Result<()> {
+        let past = SystemTime::now() - age;
+        std::fs::File::open(dir)
+            .context("open dir to back-date mtime")?
+            .set_modified(past)
+            .context("set_modified")?;
+        Ok(())
+    }
+
+    /// #195: a `cred-*` dir left behind past its mint TTL (SIGKILL or a crash
+    /// skipped the owner's drop guard) must be swept.
+    #[test]
+    fn sweep_removes_a_stale_cred_dir_past_max_age() -> anyhow::Result<()> {
+        let tmp = private_tmp()?;
+        let base = ensure_staging_base_in(tmp.path()).context("ensure base")?;
+        let stale = base.join("cred-deadbeef");
+        std::fs::create_dir(&stale).context("create stale cred dir")?;
+        set_mtime_age(&stale, Duration::from_secs(3600))?;
+
+        let removed =
+            sweep_stale_staging_dirs(&base, STALE_STAGING_PREFIXES, Duration::from_secs(3000)).context("sweep")?;
+
+        assert_eq!(removed, vec!["cred-deadbeef".to_string()]);
+        assert!(!stale.exists(), "the stale dir must be removed");
+        Ok(())
+    }
+
+    /// #195 (MUST NOT): a `verify-*` dir younger than `max_age` is a live,
+    /// in-progress stage and must survive the sweep.
+    #[test]
+    fn sweep_keeps_a_fresh_verify_dir() -> anyhow::Result<()> {
+        let tmp = private_tmp()?;
+        let base = ensure_staging_base_in(tmp.path()).context("ensure base")?;
+        let fresh = base.join("verify-cafef00d");
+        std::fs::create_dir(&fresh).context("create fresh verify dir")?;
+
+        let removed =
+            sweep_stale_staging_dirs(&base, STALE_STAGING_PREFIXES, Duration::from_secs(3000)).context("sweep")?;
+
+        assert!(removed.is_empty(), "a fresh dir must not be swept: {removed:?}");
+        assert!(fresh.exists(), "the fresh dir must survive");
+        Ok(())
+    }
+
+    /// A dir under `base` that does not carry a swept prefix must never be
+    /// touched, however old — the sweep is scoped to credential staging only.
+    #[test]
+    fn sweep_ignores_an_unrelated_stale_dir() -> anyhow::Result<()> {
+        let tmp = private_tmp()?;
+        let base = ensure_staging_base_in(tmp.path()).context("ensure base")?;
+        let unrelated = base.join("sandyd");
+        std::fs::create_dir(&unrelated).context("create unrelated dir")?;
+        set_mtime_age(&unrelated, Duration::from_secs(3600))?;
+
+        let removed =
+            sweep_stale_staging_dirs(&base, STALE_STAGING_PREFIXES, Duration::from_secs(3000)).context("sweep")?;
+
+        assert!(removed.is_empty(), "an unrelated dir must never be swept: {removed:?}");
+        assert!(unrelated.exists(), "the unrelated dir must survive");
+        Ok(())
     }
 }

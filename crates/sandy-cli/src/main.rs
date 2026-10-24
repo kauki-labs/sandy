@@ -131,7 +131,8 @@ enum Command {
         /// The job id to cancel.
         job_id: String,
     },
-    /// Garbage-collect terminal job records, keeping the newest N.
+    /// Garbage-collect terminal job records (keeping the newest N) and sweep
+    /// stale credential staging dirs past their mint TTL.
     Gc {
         /// How many terminal records to keep (newest first).
         #[arg(long, default_value_t = 20)]
