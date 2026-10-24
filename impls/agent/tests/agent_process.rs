@@ -103,6 +103,16 @@ async fn run_blocking(backend: ProcessBackend, command: Vec<String>) -> anyhow::
     Ok(tokio::task::spawn_blocking(move || run_on(&backend, &command)).await?)
 }
 
+/// Like [`run_blocking`], with extra env on the `RunSpec` (see
+/// [`run_on_with_env`]).
+async fn run_blocking_with_env(
+    backend: ProcessBackend,
+    command: Vec<String>,
+    env: Vec<(String, String)>,
+) -> anyhow::Result<Result<Outcome, BackendError>> {
+    Ok(tokio::task::spawn_blocking(move || run_on_with_env(&backend, &command, &env)).await?)
+}
+
 fn sh(script: &str) -> Vec<String> {
     vec!["/bin/sh".to_string(), "-c".to_string(), script.to_string()]
 }
@@ -464,6 +474,19 @@ async fn a_panicking_link_handler_fails_the_run_without_unwinding() -> anyhow::R
 }
 
 fn run_on(backend: &ProcessBackend, command: &[String]) -> Result<Outcome, BackendError> {
+    run_on_with_env(backend, command, &[])
+}
+
+/// Like [`run_on`], but with extra env on the `RunSpec` — `ProcessBackend`
+/// overlays this onto the `sandy-agent` child it spawns
+/// (`impls/local/src/process.rs`), which the job then inherits unchanged
+/// (`main.rs`'s own doc comment): the same path `SANDY_HISTORY_LINES`
+/// (#340 item 3) would reach the agent through.
+fn run_on_with_env(
+    backend: &ProcessBackend,
+    command: &[String],
+    env: &[(String, String)],
+) -> Result<Outcome, BackendError> {
     let grants = grants();
     let control = RunControl::with_timeout_secs(30);
     backend.run(&RunSpec {
@@ -472,7 +495,7 @@ fn run_on(backend: &ProcessBackend, command: &[String]) -> Result<Outcome, Backe
         inputs: &[],
         outputs: &[],
         secrets: &[],
-        env: &[],
+        env,
         cpu: None,
         mem: None,
         timeout_secs: 30,
@@ -633,6 +656,51 @@ async fn the_job_runs_behind_a_real_pty_not_a_pipe() -> anyhow::Result<()> {
     assert!(
         !printed.contains("not a tty"),
         "the job was not given a real tty: {printed:?}"
+    );
+    relay_result(&relay).await??;
+    Ok(())
+}
+
+/// #340 item 3 (partial): a non-default `SANDY_HISTORY_LINES` on `RunSpec.env`
+/// reaches `configured_history_lines()` inside the real spawned `sandy-agent`
+/// binary (not just `TmuxJob` directly, this crate's own unit tests) and
+/// bounds the console transcript it captures. This is the path a real M2
+/// dispatch would use once something upstream of the agent actually sets it
+/// for a process-backend job — today nothing does (`sandy-host-executor`'s
+/// own `history_lines_env` call site is flake/VM-only, a separate, still-open
+/// gap: VM dispatch sets it but `impls/vm` never threads `RunSpec.env` to the
+/// guest at all, #185-adjacent).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_configured_history_lines_env_value_bounds_the_captured_console() -> anyhow::Result<()> {
+    let (channel, agent_cap, _) = channel_and_caps().await?;
+    let (backend, relay) = backend_relaying(&channel, agent_cap);
+
+    // No TTY_STDOUT wait loop: this job (all 10 `echo`s plus exit) can run to
+    // completion well before `tmux attach` even connects (same race
+    // `the_job_runs_behind_a_real_pty_not_a_pipe`'s own doc comment explains
+    // for a bare `tty`), so waiting on the live channel for `line10` would be
+    // racy. `outcome.console` comes from the `pipe-pane` transcript
+    // (`read_tail_lines`/`to_stdout`), captured independent of whether any
+    // attach ever connected — exactly what this test needs to check.
+    let script = sh("for i in 1 2 3 4 5 6 7 8 9 10; do echo line$i; done; exit 0");
+    let env = vec![("SANDY_HISTORY_LINES".to_string(), "3".to_string())];
+    let outcome = timeout(WAIT, run_blocking_with_env(backend, script, env)).await???;
+    assert_eq!(outcome.guest_exit, Some(0), "console: {}", outcome.console);
+    // `.lines()`, not a raw substring match: the pane's pty has ONLCR on, so
+    // the transcript holds `line9\r\n` — a raw `contains("line9\n")` would
+    // never match regardless of whether the cap took effect, and a raw
+    // `!contains("line1\n")` would ALSO never match "line1" as its own line
+    // (it only ever appears as `line1\r\n`), silently passing whether or not
+    // the configured cap actually did anything. The real last 3 transcript
+    // lines are deterministic: `line9`, `line10`, then the exit marker.
+    let lines: Vec<&str> = outcome.console.lines().collect();
+    assert!(
+        lines.contains(&"line9") && lines.contains(&"line10"),
+        "the most recent output must still be present: {lines:?}"
+    );
+    assert!(
+        !lines.contains(&"line8"),
+        "the console must be capped to the configured 3 lines, not the full 10: {lines:?}"
     );
     relay_result(&relay).await??;
     Ok(())

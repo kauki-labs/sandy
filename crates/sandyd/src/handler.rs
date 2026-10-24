@@ -281,6 +281,7 @@ pub async fn handle(
             // near the end of this arm needs its own store handle to fail the
             // job terminally instead of leaving it silently `Pending`.
             let store_for_dispatch_failure = Arc::clone(store);
+            let store_for_archive = Arc::clone(store);
             let store = Arc::clone(store);
 
             // #327: a durable, re-presentable credential — independent of
@@ -426,6 +427,21 @@ pub async fn handle(
                     }
                 }
             }
+
+            // #340 item 4: persist the agent's eventual archived transcript
+            // into the durable job store, independent of whether anyone ever
+            // attaches to see it live (see `dispatch::persist_archive_when_posted`'s
+            // own doc for why the in-memory channel/registry alone isn't
+            // enough). Best-effort and fire-and-forget: its own failure
+            // paths are all silent-and-logged, never a reason to fail this
+            // Submit.
+            tokio::spawn(dispatch::persist_archive_when_posted(
+                Arc::clone(&job_channel.channel),
+                job_channel.archiver_cap.clone(),
+                job_id.clone(),
+                store_for_archive,
+                dispatch::ARCHIVE_WAIT_BOUND,
+            ));
 
             registry.insert(job_id.clone(), job_channel);
 
@@ -1206,6 +1222,7 @@ mod tests {
                 channel: Arc::clone(&job.channel),
                 agent_cap: job.agent_cap.clone(),
                 observer_cap: expired_cap,
+                archiver_cap: job.archiver_cap.clone(),
                 remote_link: None,
                 granted_caps: job.granted_caps.clone(),
                 session: job.session,
@@ -1263,6 +1280,7 @@ mod tests {
                 channel: Arc::clone(&job.channel),
                 agent_cap: job.agent_cap.clone(),
                 observer_cap: job.observer_cap.clone(),
+                archiver_cap: job.archiver_cap.clone(),
                 remote_link: Some(link),
                 granted_caps: job.granted_caps.clone(),
                 session: job.session,
