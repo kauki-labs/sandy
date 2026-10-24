@@ -162,9 +162,13 @@ impl PtyTransport {
             slave: Some(pair.slave),
             rx,
             pending: Vec::new(),
-            // A generous default poll quantum until the backend sets its own
-            // (every real caller does, before driving the console).
-            read_budget: Duration::from_secs(300),
+            // `PtyTransport` and `run_console` are both public: a caller that
+            // omits `set_read_timeout` must still get a safe poll quantum, not
+            // a multi-minute block that could silently delay cancellation or
+            // deadline handling (every real in-tree caller sets this
+            // explicitly before driving the console, but the default itself
+            // must not be a footgun).
+            read_budget: super::POLL_QUANTUM,
             writer,
             child: None,
         })
@@ -326,12 +330,14 @@ mod tests {
     /// the read timeout was the whole run budget; polling on a short interval
     /// would have ended the run on the first quiet tick.
     #[test]
-    fn pipe_transport_distinguishes_idle_from_closed() -> Result<(), BackendError> {
-        let (mut their_end, our_end) = std::os::unix::net::UnixStream::pair().expect("create a socket pair");
+    fn pipe_transport_distinguishes_idle_from_closed() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+
+        let (mut their_end, our_end) = std::os::unix::net::UnixStream::pair().context("create a socket pair")?;
         our_end
             .set_read_timeout(Some(Duration::from_millis(50)))
-            .expect("set read timeout");
-        let reader = our_end.try_clone().expect("clone socket");
+            .context("set read timeout")?;
+        let reader = our_end.try_clone().context("clone socket")?;
         let mut transport = PipeTransport::new(Box::new(reader), Box::new(our_end));
 
         let mut buf = [0u8; 16];
@@ -342,7 +348,7 @@ mod tests {
         );
 
         use std::io::Write as _;
-        their_end.write_all(b"hi").expect("write to the pair");
+        their_end.write_all(b"hi").context("write to the pair")?;
         assert_eq!(transport.read(&mut buf)?, ReadEvent::Data(2));
 
         drop(their_end);

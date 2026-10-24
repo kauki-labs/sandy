@@ -61,14 +61,26 @@ pub fn run_console<T: Transport + ?Sized>(transport: &mut T, spec: &RunSpec<'_>,
     // as nothing outside this call has moved it, `phase_start`/`current_deadline`
     // above stay authoritative (today's boot-then-command budget shape,
     // unchanged). The moment something moves it — an attach-state
-    // suspend/reinstate (#340) — the live value takes over instead.
+    // suspend/reinstate (#340) — the live value takes over instead, for the
+    // rest of this run, even if a later reinstatement happens to carry the
+    // same `Instant` value as `initial_deadline` again (comparing by value
+    // alone couldn't tell that apart from "never touched," and `phase_start`
+    // may have reset for an unrelated reason — boot completing — during the
+    // touched window).
     let initial_deadline = spec.control.deadline();
+    let mut deadline_touched = false;
 
     loop {
         if let Some(result) = protocol.outcome() {
             return finalize(result, booted, console.into_string());
         }
-        if control_demands_stop(spec.control, initial_deadline, phase_start, protocol.current_deadline()) {
+        if control_demands_stop(
+            spec.control,
+            initial_deadline,
+            &mut deadline_touched,
+            phase_start,
+            protocol.current_deadline(),
+        ) {
             protocol.on_timeout();
             continue;
         }
@@ -108,19 +120,37 @@ pub fn run_console<T: Transport + ?Sized>(transport: &mut T, spec: &RunSpec<'_>,
 /// a reinstated one (e.g. a post-detach grace period) is checked directly; the
 /// original per-phase [`TimeoutPolicy`] budget governs until then, so a run
 /// nothing ever touches keeps today's boot-then-command shape unchanged.
+///
+/// `*deadline_touched` latches to `true` the first time the live deadline is
+/// observed to differ from `initial_deadline` (including going `None` while
+/// suspended) and never resets for the rest of this run: once touched, the
+/// live deadline stays authoritative even if it's later reinstated to the
+/// exact same `Instant` `initial_deadline` carried. Comparing by value alone
+/// couldn't tell "touched, then restored" apart from "never touched," and
+/// `phase_start` may have reset for an unrelated reason (boot completing)
+/// during the touched window — falling back to phase-budget enforcement in
+/// that case could grant the command phase its full fresh budget instead of
+/// respecting an already-expired original deadline.
 fn control_demands_stop(
     control: &RunControl,
     initial_deadline: Option<Instant>,
+    deadline_touched: &mut bool,
     phase_start: Instant,
     phase_budget: Duration,
 ) -> bool {
     if control.is_cancelled() {
         return true;
     }
-    match control.deadline() {
+    let current = control.deadline();
+    if !*deadline_touched && current != initial_deadline {
+        *deadline_touched = true;
+    }
+    match current {
+        // Suspended: never times out, whether or not it's ever been touched
+        // — there is no deadline to have passed.
         None => false,
-        Some(deadline) if Some(deadline) == initial_deadline => phase_start.elapsed() >= phase_budget,
-        Some(_) => control.timed_out(),
+        Some(deadline) if *deadline_touched => Instant::now() >= deadline,
+        Some(_) => phase_start.elapsed() >= phase_budget,
     }
 }
 
@@ -355,6 +385,61 @@ mod tests {
             "a suspended deadline must not time out, even ~2x past the original 1s command budget: {outcome:?}"
         );
         assert_eq!(outcome.guest_exit, Some(0), "console: {}", outcome.console);
+    }
+
+    /// Regression (CodeRabbit on #366): a deadline suspended then reinstated
+    /// to the exact same `Instant` `initial_deadline` carried must still be
+    /// treated as the live, authoritative deadline — not silently fall back
+    /// to phase-budget enforcement just because the restored value happens to
+    /// equal what was captured at run start. `initial_deadline` is already
+    /// past by the time it's reinstated here; a per-phase budget generous
+    /// enough to never fire on its own (5s) isolates the live-deadline check
+    /// as the only thing that can end this run.
+    #[test]
+    fn reinstating_the_exact_initial_deadline_after_suspension_still_resolves_as_timed_out() {
+        let markers = test_markers();
+        let command = [String::from("true")];
+        let grants = no_grants();
+        let initial_deadline = Instant::now() + Duration::from_millis(100);
+        let control = RunControl::new(initial_deadline);
+        let spec = control_spec(&command, &grants, &control, 5);
+        let mut transport = ScriptedTransport::new(Duration::from_millis(20))
+            .deliver_at(Duration::from_millis(200), format!("{}\n", markers.ready));
+
+        let start = Instant::now();
+        let outcome = std::thread::scope(|scope| {
+            // `run_console` captures `spec.control.deadline()` as its own
+            // `initial_deadline` at the very top, before this sleep — still
+            // `Some(initial_deadline)` at that point, since suspension below
+            // only happens after the spawned thread is already running.
+            let handle = scope.spawn(|| run_console(&mut transport, &spec, &markers));
+            // Suspend during boot, well before `initial_deadline` (100ms)
+            // and the ready marker (200ms) — this is the "touch" that must
+            // latch for the rest of the run.
+            std::thread::sleep(Duration::from_millis(20));
+            control.suspend_deadline();
+            // Past boot and well past `initial_deadline`, reinstate the
+            // exact original value — not a fresh grace deadline —
+            // simulating a suspend/resume that happens to land back on the
+            // same Instant.
+            std::thread::sleep(Duration::from_millis(400));
+            control.set_deadline(initial_deadline);
+            handle.join().expect("run_console thread panicked")
+        });
+
+        assert!(
+            outcome.timed_out,
+            "a reinstated deadline that already passed must end the run, even if it equals initial_deadline: \
+             {outcome:?}"
+        );
+        assert!(
+            outcome.booted,
+            "the ready marker arrived before reinstatement: {outcome:?}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "the already-past live deadline must end the run promptly, not wait out the command phase's own 5s budget"
+        );
     }
 
     /// Suspending the deadline must not make a genuinely closed console hang

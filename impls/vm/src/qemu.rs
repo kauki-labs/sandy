@@ -1099,7 +1099,19 @@ mod tests {
         })
         .context("boot the job on KVM")?;
 
-        assert!(outcome.timed_out, "cancellation ends the job: {outcome:?}");
+        // The fixed 5s sleep before cancelling can't be synchronized against
+        // real boot completion (`run_console`'s own boot-ready signal isn't
+        // observable from outside the blocking `backend.run()` call), so a
+        // slow boot can land the cancel during the boot phase rather than the
+        // command phase. Both are a correct "cancel ended it" outcome —
+        // `booted: false, timed_out: false` (cancelled before the guest ever
+        // reported ready) or `booted: true, timed_out: true` (cancelled mid
+        // command) — the test only needs to prove cancellation ends the run
+        // promptly, not which phase it landed in.
+        assert!(
+            !outcome.booted || outcome.timed_out,
+            "cancellation must end the job, either before boot or mid-command: {outcome:?}"
+        );
         assert!(
             start.elapsed() < Duration::from_secs(60),
             "cancellation must end the run promptly, not wait near the 120s budget"
