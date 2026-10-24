@@ -578,7 +578,10 @@ that declaration, never a hardcoded host) plus the dispatch RPC.
   value for authorization" discipline decision 6 already applies to the
   agent-link stream. An unknown registrant gets `RegisterRefused`, never
   `Registered`, and is logged — never silently dropped, and never told more
-  than "no".
+  than "no". Authenticating by peer IP means the WireGuard key is the host's
+  identity: there is no attestation, which is an acceptable assumption for
+  operator-provisioned hosts, not a general identity check (see
+  [`spec.md`'s attacker model](../architecture/spec.md#attacker-model)).
 - `Dispatch.required_isolation_class` (added per #269's CodeRabbit-driven spec
   revision): the job's required isolation class travels with the dispatch so
   the orchestrator/executor can refuse fail-closed rather than silently
