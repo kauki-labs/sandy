@@ -632,7 +632,7 @@ fn touch_dir_mtime(dir: &Path) -> std::io::Result<()> {
 }
 
 /// Clamp `tick` so the mid-run heartbeat can never tick slower than [`gc`]'s
-/// stale-dir sweep threshold (#195, flagged in review): a
+/// stale-dir sweep threshold (#195): a
 /// `SANDY_REFRESH_TICK_SECS` at or above `max_ttl_secs` would let a live
 /// job's cred dir go stale between heartbeats and get swept out from under
 /// it, so a tick that reaches the threshold is never honored — it falls back
@@ -1191,7 +1191,7 @@ mod tests {
         assert_eq!(tick, Duration::from_secs(60));
     }
 
-    /// #195 (flagged in review): a tick that reaches `MAX_TTL_SECS` would let a
+    /// #195: a tick that reaches `MAX_TTL_SECS` would let a
     /// live job's cred dir go stale between heartbeats and get swept out from
     /// under it, so it must never be honored as-is.
     #[test]

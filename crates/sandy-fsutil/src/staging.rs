@@ -237,7 +237,7 @@ pub fn sweep_stale_staging_dirs(base: &Path, prefixes: &[&str], max_age: Duratio
         match std::fs::remove_dir_all(entry.path()) {
             Ok(()) => removed.push(name),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            // Best-effort (flagged in review): one unremovable stale dir must
+            // Best-effort: one unremovable stale dir must
             // never block sweeping the rest, or a single stuck entry could
             // wedge every later gc run indefinitely.
             Err(_) => {}
@@ -503,7 +503,7 @@ mod tests {
         Ok(())
     }
 
-    /// Best-effort (flagged in review): a stale dir that fails to remove (a
+    /// Best-effort: a stale dir that fails to remove (a
     /// permission-blocked child it can't recurse into) must not stop the
     /// sweep from removing a later stale dir in the same pass.
     #[test]

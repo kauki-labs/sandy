@@ -137,20 +137,26 @@ mtime rather than a separately tracked start time, so the same mechanism that
 ages a leaked dir out also has to not age out a live one. That requirement is
 not automatic: the mid-run refresh thread only rewrites `cred_dir`'s file when
 `should_refresh` actually fires, and a provider's native token TTL (GitHub
-~1h) can exceed `MAX_TTL_SECS` (3000s) between refreshes — a job quiet that
+~1h) can exceed `MAX_TTL_SECS` (3000s) between refreshes, so a job quiet that
 long would otherwise look abandoned. The refresh loop therefore heartbeats
 `cred_dir`'s mtime every tick, independent of whether a refresh fires; a
 `kill -9`'d process stops ticking, so a genuinely leaked dir still ages out
-and gets swept. The sweep is best-effort within `gc`: a staging base that
-cannot be validated or listed is logged and skipped, never blocking `gc`'s
-primary job-record eviction.
+and gets swept. `safe_heartbeat_tick` refuses a `SANDY_REFRESH_TICK_SECS` at
+or above `MAX_TTL_SECS` and falls back to the 60s default, so a misconfigured
+tick can't reopen the gap the heartbeat exists to close. The sweep is
+best-effort within `gc`: a staging base that cannot be validated or listed is
+logged and skipped, and a single entry that fails to remove is skipped and
+retried on a later `gc`, neither ever blocking `gc`'s primary job-record
+eviction.
 
 **Consequences.** A `verify-*` dir (a short synchronous probe, no refresh
-loop) gets no heartbeat and needs none — it is always removed well within
-`MAX_TTL_SECS` on any non-crash path. Sweep safety for a live job depends only
-on `SANDY_REFRESH_TICK_SECS` staying below `MAX_TTL_SECS` — the refresh margin
-plays no part, since the heartbeat fires every tick regardless of whether a
-refresh does. The 60s default tick satisfies that by a wide margin.
+loop) gets no heartbeat and needs none: it is always removed well within
+`MAX_TTL_SECS` on any non-crash path. Sweep safety for a live job needs the
+gap between heartbeats, one tick plus one refresh call's latency, to stay
+under `MAX_TTL_SECS`; the refresh margin plays no part, since the heartbeat
+fires every tick regardless of whether a refresh does. The 60s default tick
+satisfies that by a wide margin, and `safe_heartbeat_tick` enforces the floor
+even under a misconfigured override.
 
 **Set aside.** Tracking each staging dir's mint time in a side file (instead
 of reading mtime) was considered and rejected: it adds a second piece of

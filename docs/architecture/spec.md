@@ -208,9 +208,13 @@ sequenceDiagram
 - Integration: `cred.rs` unit tests (`mint_lease` clamps TTL, stages 0600, revoke
   bracket, `should_refresh`); the supervisor's mint-fails-closed test;
   `sandy-fsutil`'s `sweep_stale_staging_dirs` tests (sweeps a stale dir, keeps a
-  fresh one, ignores an unrelated prefix); the supervisor's
-  `gc_sweeps_a_stale_cred_dir_past_max_ttl` / `gc_keeps_a_fresh_verify_dir` /
-  `refresh_loop_heartbeats_the_cred_dir_mtime_every_tick`.
+  fresh one, ignores an unrelated prefix, continues past an unremovable one);
+  the supervisor's `gc_sweeps_a_stale_cred_dir_past_max_ttl` /
+  `gc_keeps_a_fresh_verify_dir` /
+  `refresh_loop_heartbeats_the_cred_dir_mtime_every_tick` /
+  `safe_heartbeat_tick_passes_through_a_safe_tick` /
+  `safe_heartbeat_tick_falls_back_when_the_tick_reaches_max_ttl_secs` /
+  `..._exceeds_max_ttl_secs`.
 - End-to-end: `live_cred.rs` (git-helper + mid-run refresh + revoke; the "everything"
   scenario composing cred + secret + input + output), `live_refresh.rs` (a rotated
   token reaches the running guest). Adapter-live (real App): `cred_e2e.rs` /
