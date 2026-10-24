@@ -14,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, PoisonError,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Instant, SystemTime},
 };
@@ -42,6 +42,10 @@ pub struct RunControl(Arc<RunControlInner>);
 struct RunControlInner {
     cancelled: AtomicBool,
     deadline: Mutex<Option<Instant>>,
+    /// Bumped by every [`RunControl::suspend_deadline`] or
+    /// [`RunControl::set_deadline`] call (#366's residual: see
+    /// [`RunControl::generation`]'s own doc for why this exists).
+    generation: AtomicU64,
 }
 
 impl RunControl {
@@ -51,6 +55,7 @@ impl RunControl {
         Self(Arc::new(RunControlInner {
             cancelled: AtomicBool::new(false),
             deadline: Mutex::new(Some(deadline)),
+            generation: AtomicU64::new(0),
         }))
     }
 
@@ -81,6 +86,7 @@ impl RunControl {
     /// attach-membership count goes from 0 to 1.
     pub fn suspend_deadline(&self) {
         *self.0.deadline.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        self.0.generation.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Set (or replace) the enforced deadline to `at`. The grace-period
@@ -88,12 +94,27 @@ impl RunControl {
     /// attach-membership count drops back to 0.
     pub fn set_deadline(&self, at: Instant) {
         *self.0.deadline.lock().unwrap_or_else(PoisonError::into_inner) = Some(at);
+        self.0.generation.fetch_add(1, Ordering::SeqCst);
     }
 
     /// The currently enforced deadline, if any (`None` while suspended).
     #[must_use]
     pub fn deadline(&self) -> Option<Instant> {
         *self.0.deadline.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A monotonic counter bumped by every [`Self::suspend_deadline`] or
+    /// [`Self::set_deadline`] call. A poller that only samples
+    /// [`Self::deadline`]'s current value periodically can't tell "touched,
+    /// then restored to the exact same value" apart from "never touched" —
+    /// a suspend-then-reinstate-to-the-original-Instant cycle happening
+    /// entirely between two polls is invisible to a value comparison. This
+    /// counter can't be missed the same way: capture it once, and any later
+    /// read that differs proves at least one call happened in between,
+    /// regardless of what value the deadline settled back on.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.0.generation.load(Ordering::SeqCst)
     }
 
     /// Whether the current deadline (if any) has passed. `false` while

@@ -935,13 +935,22 @@ mod tests {
         };
 
         let start = Instant::now();
-        let outcome = std::thread::scope(|scope| {
-            let handle = scope.spawn(|| backend.run(&spec));
+        let (outcome, run_duration) = std::thread::scope(|scope| {
+            // Measure `backend.run`'s own internal duration, not the
+            // thread::scope block's wall time — the main thread's 5s sleep
+            // below happens unconditionally before it ever calls `join()`,
+            // so timing the block itself would always read >=5s regardless
+            // of how fast the run inside actually finished, proving nothing
+            // about whether cancellation was what ended it.
+            let handle = scope.spawn(|| {
+                let run_start = Instant::now();
+                (backend.run(&spec), run_start.elapsed())
+            });
             std::thread::sleep(Duration::from_secs(5));
             control.cancel();
             handle.join().expect("run thread panicked")
-        })
-        .context("boot vfkit guest")?;
+        });
+        let outcome = outcome.context("boot vfkit guest")?;
 
         // The fixed 5s sleep before cancelling can't be synchronized against
         // real boot completion (`run_console`'s own boot-ready signal isn't
@@ -951,7 +960,21 @@ mod tests {
         // `booted: false, timed_out: false` (cancelled before the guest ever
         // reported ready) or `booted: true, timed_out: true` (cancelled mid
         // command) — the test only needs to prove cancellation ends the run
-        // promptly, not which phase it landed in.
+        // promptly, not which phase it landed in. `transport_error` must be
+        // None either way, ruling out an unrelated infra fault as a false
+        // positive (CodeRabbit on #366).
+        assert!(
+            outcome.transport_error.is_none(),
+            "an unrelated transport fault must not be mistaken for cancellation: {outcome:?}"
+        );
+        // `run_duration` below 5s means the guest closed its console (or
+        // `backend.run` otherwise returned) before cancel() was even sent —
+        // an early exit unrelated to cancellation, proving nothing about it
+        // (CodeRabbit on #366).
+        assert!(
+            run_duration >= Duration::from_secs(5),
+            "the run finished after {run_duration:?}, before cancel() was even sent, proving nothing: {outcome:?}"
+        );
         assert!(
             !outcome.booted || outcome.timed_out,
             "cancellation must end the job, either before boot or mid-command: {outcome:?}"

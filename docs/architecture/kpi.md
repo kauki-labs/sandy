@@ -73,10 +73,15 @@ A KPI counts as met only when all three hold:
 [^5]:
     `impls/vm`'s tier-3 tests predate this crate adopting the `live` cargo
     feature + `SANDY_LIVE=1` off-matrix-refusal contract every other row in
-    this table uses (INV-S9) — they're plain `#[ignore]`d, run with
-    `cargo nextest run -p sandy-impls-vm --run-ignored ignored-only -E 'test(_on_kvm) or test(_on_vfkit)'`
-    on a host with the matching hypervisor, and silently skip rather than
-    refuse off-matrix. That gap predates K19 (it's shared by the crate's other
+    this table uses (INV-S9) — they're plain `#[ignore]`d, and silently skip
+    rather than refuse off-matrix. Run only the tests for the hypervisor
+    actually present: on Linux/KVM,
+    `cargo nextest run -p sandy-impls-vm --run-ignored ignored-only -E 'test(_on_kvm)'`;
+    on macOS/vfkit,
+    `cargo nextest run -p sandy-impls-vm --run-ignored ignored-only -E 'test(_on_vfkit)'`
+    — running both selectors on a host with only one hypervisor also attempts
+    the other's tests, which fail for lack of that hypervisor rather than for
+    a real regression. That gap predates K19 (it's shared by the crate's other
     tier-3 tests, e.g. `boots_a_trivial_job_on_kvm`) and retrofitting the full
     contract onto the whole crate is a separate, crate-wide change — not done
     here.
