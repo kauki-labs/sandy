@@ -16,6 +16,12 @@ package sandy.control.v1;
 // A client-to-daemon call.
 message ControlRequest {
   // Caller-chosen, unique per connection. Echoed on the matching response.
+  // proto3 gives this field no separate presence bit, so an unset
+  // request_id and an explicit 0 are the same value on the wire: 0 means
+  // absent. sandy_control_proto::client::call refuses to send a request with
+  // request_id 0, before anything is written, rather than letting it ride to
+  // the wire and risk matching a different in-flight call that also
+  // defaulted to 0.
   uint64 request_id = 1;
 
   oneof op {
@@ -29,7 +35,10 @@ message ControlRequest {
 
 // A daemon-to-client reply.
 message ControlResponse {
-  // Matches the ControlRequest.request_id this answers.
+  // Matches the ControlRequest.request_id this answers. Same 0-means-absent
+  // contract as ControlRequest.request_id: a response carrying 0 here is
+  // never treated as a wildcard match for whatever the client happened to
+  // send.
   uint64 request_id = 1;
 
   oneof result {

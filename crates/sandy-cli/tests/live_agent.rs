@@ -204,8 +204,13 @@ async fn a_vm_job_runs_behind_the_guest_agent_with_tty_both_ways() -> anyhow::Re
     Ok(())
 }
 
-/// The VM job holds only fresh stdio (no vsock link socket) and its
+/// The VM job holds only its tmux-allocated pty (no vsock link socket) and its
 /// environment carries no trace of the cap.
+///
+/// Since #342 the job runs as a detached tmux session's pane, not as this
+/// process's direct child over a pipe triple — so fd 0/1/2 are the pane's
+/// real pty slave, all three the same device, rather than three fresh
+/// `pipe:[...]` fds. This replaces that stale pipe assertion (#340 item 5).
 #[tokio::test(flavor = "multi_thread")]
 async fn the_vm_job_holds_no_link_and_no_cap() -> anyhow::Result<()> {
     let template = template()?;
@@ -215,7 +220,7 @@ async fn the_vm_job_holds_no_link_and_no_cap() -> anyhow::Result<()> {
 
     let script = r#"
         echo "FDS:$(ls /proc/self/fd | sort -n | tr '\n' ' ')"
-        for fd in 0 1 2; do echo "FD$fd:$(readlink /proc/self/fd/$fd)"; done
+        for fd in 0 1 2; do echo "FD$fd:$(readlink /proc/$$/fd/$fd)"; done
         tr '\0' '\n' < /proc/self/environ
         exit 0
     "#;
@@ -231,13 +236,23 @@ async fn the_vm_job_holds_no_link_and_no_cap() -> anyhow::Result<()> {
         4,
         "stdio plus ls's own handle only: {fds}"
     );
+    let mut pty_devices = std::collections::HashSet::new();
     for fd in 0..=2 {
         let line = console
             .lines()
             .find_map(|l| after(l, &format!("FD{fd}:")))
             .context(format!("no FD{fd} line: {console}"))?;
-        assert!(line.starts_with("pipe:"), "fd {fd} must be a fresh pipe, got {line}");
+        assert!(
+            line.starts_with("/dev/pts/"),
+            "fd {fd} must be the job's tmux-allocated pty slave, got {line}"
+        );
+        pty_devices.insert(line.to_string());
     }
+    assert_eq!(
+        pty_devices.len(),
+        1,
+        "stdin/stdout/stderr must all be the same pty slave, got {pty_devices:?}"
+    );
     assert!(!console.contains(&cap_hex), "the cap reached the job: {console}");
     relay_result(&relay).await??;
     Ok(())

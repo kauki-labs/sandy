@@ -21,6 +21,8 @@ pub mod link_auth;
 pub mod mesh_accept;
 pub mod mesh_config;
 pub mod store;
+#[cfg(test)]
+mod test_support;
 
 use std::{net::SocketAddr, sync::Arc};
 

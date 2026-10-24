@@ -119,6 +119,20 @@ impl RemoteLink {
     pub fn invalidate(&self) {
         self.claimed.store(true, Ordering::Release);
     }
+
+    /// Test-only: bind a run to `executor_ip` with a caller-chosen token
+    /// rather than a random one, so a cross-module leak-regression test
+    /// (`mesh_accept`'s tracing-capture test) can assert on predictable
+    /// marker bytes it can reconstruct, instead of a value only
+    /// [`LinkToken::generate`] ever sees.
+    #[cfg(test)]
+    pub(crate) fn with_token(executor_ip: IpAddr, token: [u8; LINK_TOKEN_LEN]) -> Self {
+        Self {
+            executor_ip: executor_ip.to_canonical(),
+            token: LinkToken(token),
+            claimed: AtomicBool::new(false),
+        }
+    }
 }
 
 impl std::fmt::Debug for RemoteLink {

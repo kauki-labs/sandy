@@ -2229,6 +2229,7 @@ dependencies = [
  "prost",
  "prost-build",
  "protox",
+ "rstest",
  "thiserror 2.0.21",
  "tokio",
 ]
