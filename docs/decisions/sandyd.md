@@ -852,11 +852,10 @@ complete.
 
 **Consequences.** The process backend (`impls/local`) picks up a cancellation on its next 10ms
 poll tick, so a cancelled job tears down within its own drain grace (≤ ~10s) regardless of how far
-from its deadline it was — comfortably inside the new `TimeoutStopSec`. The known gap named above
-(VM backends not honoring `RunControl` at all) is UNCHANGED by this fix: a VM-backed job still
-runs to its static `spec.timeout_secs` budget regardless of `cancel()`. That is exactly why
-`TimeoutStopSec` is derived from the full `STAGE1_TIMEOUT_SECS` budget rather than the process
-backend's fast-cancel case alone — it has to cover whichever backend actually ran.
+from its deadline it was — comfortably inside the new `TimeoutStopSec`. The VM backends pick up a
+cancellation on the next ~250ms poll tick, as described in the VM `RunControl` paragraph above.
+`TimeoutStopSec` is still derived from the full `STAGE1_TIMEOUT_SECS` budget rather than the
+process backend's fast-cancel case alone, because it has to cover whichever backend actually ran.
 
 **Verification.** Unit-tested: `shutdown_cancels_every_still_running_jobs_run_control` and
 `a_closed_connection_does_not_cancel_a_still_running_job`
