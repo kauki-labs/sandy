@@ -487,36 +487,51 @@ mod tests {
         let accept_registry = Arc::clone(&registry);
         let first_listener = Arc::clone(&listener);
         let first = tokio::spawn(async move {
-            let (conn, peer) = first_listener.accept().await.expect("accept");
+            let (conn, peer) = first_listener.accept().await.context("accept (first)")?;
             serve_one_remote_link(conn, peer, &accept_registry).await;
+            Ok::<_, anyhow::Error>(())
         });
         let n = stream_prefix(addr, "job-1", &token1).await?;
         assert_eq!(n, 1, "the first, genuine stream must reach the agent link");
-        tokio::time::timeout(std::time::Duration::from_secs(5), first).await??;
+        tokio::time::timeout(std::time::Duration::from_secs(5), first)
+            .await
+            .context("timed out waiting for the first accept")??
+            .context("the first spawned accept task failed")?;
 
         let accept_registry = Arc::clone(&registry);
         let second = tokio::spawn(async move {
-            let (conn, peer) = listener.accept().await.expect("accept");
+            let (conn, peer) = listener.accept().await.context("accept (second)")?;
             serve_one_remote_link(conn, peer, &accept_registry).await;
+            Ok::<_, anyhow::Error>(())
         });
         let n = stream_prefix(addr, "job-1", &token1).await?;
         assert_eq!(n, 0, "the second, already-claimed stream must be refused");
-        tokio::time::timeout(std::time::Duration::from_secs(5), second).await??;
+        tokio::time::timeout(std::time::Duration::from_secs(5), second)
+            .await
+            .context("timed out waiting for the second accept")??
+            .context("the second spawned accept task failed")?;
 
         // A wrong-token refusal: the genuine secret (token2) never leaves
         // the RemoteLink, so this proves no debug path reaches in and logs
-        // it even when the presented bytes are garbage.
+        // it even when the presented bytes are garbage. Presenting token1
+        // (a genuine, valid token, just for the wrong job) rather than pure
+        // garbage also exercises cross-job confusion, not only malformed
+        // input.
         let listener2 = listen(&loopback(0)).await.context("listen 2")?;
         let addr2 = listener2.local_addr().context("local_addr 2")?;
         let registry2 = registry_with_marker_job("job-2", addr2.ip(), token2).await?;
         let accept_registry = Arc::clone(&registry2);
         let third = tokio::spawn(async move {
-            let (conn, peer) = listener2.accept().await.expect("accept");
+            let (conn, peer) = listener2.accept().await.context("accept (third)")?;
             serve_one_remote_link(conn, peer, &accept_registry).await;
+            Ok::<_, anyhow::Error>(())
         });
-        let n = stream_prefix(addr2, "job-2", &[0xAA; 32]).await?;
+        let n = stream_prefix(addr2, "job-2", &token1).await?;
         assert_eq!(n, 0, "a wrong token must be refused");
-        tokio::time::timeout(std::time::Duration::from_secs(5), third).await??;
+        tokio::time::timeout(std::time::Duration::from_secs(5), third)
+            .await
+            .context("timed out waiting for the third accept")??
+            .context("the third spawned accept task failed")?;
 
         // A wrong-peer refusal: the genuine token is presented, only the
         // connecting IP doesn't match the bound executor.
@@ -525,12 +540,16 @@ mod tests {
         let registry3 = registry_with_marker_job("job-3", IpAddr::V4(Ipv4Addr::new(100, 64, 0, 9)), token3).await?;
         let accept_registry = Arc::clone(&registry3);
         let fourth = tokio::spawn(async move {
-            let (conn, peer) = listener3.accept().await.expect("accept");
+            let (conn, peer) = listener3.accept().await.context("accept (fourth)")?;
             serve_one_remote_link(conn, peer, &accept_registry).await;
+            Ok::<_, anyhow::Error>(())
         });
         let n = stream_prefix(addr3, "job-3", &token3).await?;
         assert_eq!(n, 0, "a wrong peer must be refused");
-        tokio::time::timeout(std::time::Duration::from_secs(5), fourth).await??;
+        tokio::time::timeout(std::time::Duration::from_secs(5), fourth)
+            .await
+            .context("timed out waiting for the fourth accept")??
+            .context("the fourth spawned accept task failed")?;
 
         let logged = buf.contents()?;
 
