@@ -105,6 +105,68 @@ fn unknown_message_type_tag_is_tolerated() -> Result<()> {
     Ok(())
 }
 
+/// `Envelope`'s other fields still render in `Debug` output; only `payload` is
+/// redacted.
+#[test]
+fn debug_output_still_shows_the_non_secret_fields() {
+    let envelope = Envelope {
+        sequence: 42,
+        metadata: HashMap::from([("channel".to_owned(), "orchestrator".to_owned())]),
+        content_type: CONTENT_TYPE_TEXT.to_owned(),
+        payload: b"body".to_vec(),
+        message_type: Some(MessageType::Control(Control {})),
+    };
+
+    let rendered = format!("{envelope:?}");
+
+    assert!(
+        rendered.contains("42"),
+        "sequence missing from Debug output: {rendered}"
+    );
+    assert!(
+        rendered.contains("orchestrator"),
+        "metadata missing from Debug output: {rendered}"
+    );
+    assert!(
+        rendered.contains(CONTENT_TYPE_TEXT),
+        "content_type missing from Debug output: {rendered}"
+    );
+    assert!(
+        rendered.contains("Control"),
+        "message_type missing from Debug output: {rendered}"
+    );
+}
+
+/// `Envelope.payload` can carry a bearer credential (#215): prost's default
+/// derived `Debug` would print it in the clear. Check both leak shapes, the
+/// same way #211's `AttachResponse` regression test does — a marker-text-only
+/// check would miss the raw-byte-array leak shape.
+#[test]
+fn debug_output_redacts_the_payload() {
+    let marker = "sandy-envelope-leak-marker-7e2b91";
+    let payload = marker.as_bytes().to_vec();
+    let envelope = Envelope {
+        payload: payload.clone(),
+        ..Default::default()
+    };
+
+    let rendered = format!("{envelope:?}");
+
+    assert!(
+        !rendered.contains(marker),
+        "the payload's decoded text leaked into Debug output: {rendered}"
+    );
+    let numeric_repr = format!("{payload:?}");
+    assert!(
+        !rendered.contains(&numeric_repr),
+        "the payload's raw bytes leaked into Debug output: {rendered}"
+    );
+    assert!(
+        rendered.contains("redacted"),
+        "expected an explicit redaction marker, got: {rendered}"
+    );
+}
+
 /// A truncated frame is a decode error, never a silently default-empty envelope.
 #[test]
 fn truncated_frame_is_a_protocol_error() {

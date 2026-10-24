@@ -28,7 +28,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed={}", proto.display());
 
     let file_descriptors = protox::compile([&proto], [&proto_dir])?;
-    prost_build::Config::new().compile_fds(file_descriptors)?;
+    // Envelope.payload can carry a bearer credential (a staged secret, an
+    // attenuated cap, …): prost's derived Debug would print its raw bytes.
+    // Skip it here; src/lib.rs hand-writes a redacting Debug instead,
+    // mirroring sandy-control-proto's AttachResponse (#211).
+    prost_build::Config::new()
+        .skip_debug(["sandy.proto.v1.Envelope"])
+        .compile_fds(file_descriptors)?;
 
     Ok(())
 }
