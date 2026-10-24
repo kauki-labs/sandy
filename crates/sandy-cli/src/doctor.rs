@@ -180,8 +180,20 @@ pub fn mac_prereq_result(verdict: MacPrereq) -> Option<DoctorResult> {
 /// guest system in `/etc/nix/machines` (missing file → no builders). `pub(crate)`:
 /// `flake_wrap` (#325) reuses this same check before building a `--flake` kind-2/3
 /// guest on macOS, rather than re-probing `/etc/nix/machines` itself.
+///
+/// The machines-file path honors `SANDY_NIX_MACHINES_FILE` (same override style
+/// as `SANDY_VFKIT_BIN`/`SANDY_TAP`), falling back to the real `/etc/nix/machines`.
+/// Together with the already-real `PATH` read in `nix_on_path`, this lets the
+/// `sandy doctor` binary-level integration test (`tests/doctor.rs`) inject both
+/// host facts into the child process it spawns, instead of depending on the
+/// sandbox that built the test binary happening to have `nix` and a configured
+/// builder (#163).
 pub(crate) fn detect_mac_prereq() -> MacPrereq {
-    let machines = std::fs::read_to_string("/etc/nix/machines").unwrap_or_default();
+    let machines_path = std::env::var_os("SANDY_NIX_MACHINES_FILE")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/etc/nix/machines"));
+    let machines = std::fs::read_to_string(machines_path).unwrap_or_default();
     let guest = crate::host_target::host_target().guest_system;
     // Resolve placement through the Discovery seam — a static registry over the host
     // matrix. The buildable-systems check is the matrix systems, exactly as before.
