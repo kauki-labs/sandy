@@ -215,6 +215,7 @@ async fn main() {
             mesh,
             Arc::clone(&host_registry),
             Arc::clone(&store),
+            Arc::clone(&registry),
             shutdown_rx.clone(),
         ))),
         Ok(None) => None,
@@ -510,6 +511,7 @@ async fn run_mesh_accept_loop(
     mesh: MeshSetup,
     host_registry: Arc<HostRegistry>,
     store: Arc<JobStore>,
+    job_registry: Arc<JobRegistry>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let MeshSetup { listener, allowlist } = mesh;
@@ -525,8 +527,17 @@ async fn run_mesh_accept_loop(
                         let allowlist = Arc::clone(&allowlist);
                         let host_registry = Arc::clone(&host_registry);
                         let store = Arc::clone(&store);
+                        let job_registry = Arc::clone(&job_registry);
                         connections.spawn(async move {
-                            sandyd::host_conn::serve_host_executor(conn, peer, &allowlist, &host_registry, &store).await;
+                            sandyd::host_conn::serve_host_executor(
+                                conn,
+                                peer,
+                                &allowlist,
+                                &host_registry,
+                                &store,
+                                &job_registry,
+                            )
+                            .await;
                         });
                     }
                     Err(e) => {
