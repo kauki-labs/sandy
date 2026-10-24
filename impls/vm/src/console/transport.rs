@@ -23,7 +23,7 @@ use std::{
 };
 
 use sandy::BackendError;
-pub use sandy_api::console::Transport;
+pub use sandy_api::console::{ReadEvent, Transport};
 
 /// The Linux/qemu pipe transport: the guest serial console on a byte channel.
 ///
@@ -50,9 +50,10 @@ impl PipeTransport {
     /// owns the process spawn and the channel; the transport only drives the
     /// sentinel protocol over it.
     ///
-    /// The `reader` should carry a read timeout matching the run's deadline: a
-    /// timed-out read is reported as `Ok(0)` (see [`Transport::read`]), which the
-    /// driver treats as the deadline elapsing rather than a fault.
+    /// The `reader` should carry a short read timeout — a poll quantum, not the
+    /// run's deadline (#185): a timed-out read reports [`ReadEvent::Idle`], real
+    /// EOF reports [`ReadEvent::Closed`], and the driver (`run_console`) is the
+    /// one place that decides what either means against the live `RunControl`.
     #[must_use]
     pub fn new(reader: Box<dyn Read + Send>, writer: Box<dyn Write + Send>) -> Self {
         Self { reader, writer }
@@ -60,13 +61,15 @@ impl PipeTransport {
 }
 
 impl Transport for PipeTransport {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, BackendError> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<ReadEvent, BackendError> {
         match self.reader.read(buf) {
-            Ok(read) => Ok(read),
-            // A read timeout (the channel carries the run deadline) or EOF is
-            // reported as `Ok(0)`: the driver resolves it through the protocol's
-            // own timeout path, never as a fabricated transport fault.
-            Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => Ok(0),
+            Ok(0) => Ok(ReadEvent::Closed),
+            Ok(read) => Ok(ReadEvent::Data(read)),
+            // The poll quantum elapsed with nothing to read; the console may
+            // still be alive. Distinct from a real EOF (#185) so the driver can
+            // poll a live cancellation/deadline signal without mistaking a quiet
+            // guest for a closed one.
+            Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => Ok(ReadEvent::Idle),
             Err(err) => Err(BackendError::Transport(format!("pipe read: {err}"))),
         }
     }
@@ -98,8 +101,9 @@ pub struct PtyTransport {
     rx: mpsc::Receiver<Vec<u8>>,
     /// Bytes received from the channel but not yet handed to the caller.
     pending: Vec<u8>,
-    /// How long [`Transport::read`] waits for a chunk before reporting `Ok(0)`
-    /// (the run deadline); set by the backend via [`PtyTransport::set_read_timeout`].
+    /// How long [`Transport::read`] waits for a chunk before reporting
+    /// [`ReadEvent::Idle`] — a poll quantum, not the run deadline (#185); set by
+    /// the backend via [`PtyTransport::set_read_timeout`].
     read_budget: Duration,
     /// Writer over the PTY master (guest stdin — the injected command frame).
     writer: Box<dyn Write + Send>,
@@ -158,7 +162,8 @@ impl PtyTransport {
             slave: Some(pair.slave),
             rx,
             pending: Vec::new(),
-            // A generous default until the backend sets the run's budget.
+            // A generous default poll quantum until the backend sets its own
+            // (every real caller does, before driving the console).
             read_budget: Duration::from_secs(300),
             writer,
             child: None,
@@ -166,8 +171,9 @@ impl PtyTransport {
     }
 
     /// Set how long [`Transport::read`] waits for guest output before reporting
-    /// the deadline (`Ok(0)`). The backend sets this to the run's timeout so a
-    /// silent guest resolves through the protocol's timeout path.
+    /// [`ReadEvent::Idle`] — a poll quantum, not the run's timeout (#185): the
+    /// driver (`run_console`) checks the live `RunControl` and the phase
+    /// deadline itself on every idle tick.
     pub fn set_read_timeout(&mut self, budget: Duration) {
         self.read_budget = budget;
     }
@@ -214,21 +220,23 @@ impl PtyTransport {
 }
 
 impl Transport for PtyTransport {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, BackendError> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<ReadEvent, BackendError> {
         if self.pending.is_empty() {
             match self.rx.recv_timeout(self.read_budget) {
                 Ok(chunk) => self.pending = chunk,
-                // A timeout (the deadline elapsed) or a disconnected channel (the
-                // reader thread hit EOF — the guest exited) is reported as `Ok(0)`;
-                // the driver resolves it through the protocol's own timeout path,
-                // never as a fabricated fault.
-                Err(_) => return Ok(0),
+                // The poll quantum elapsed with nothing to read; the console may
+                // still be alive (#185) — distinct from the channel disconnecting
+                // below, which means the reader thread hit real EOF for good.
+                Err(mpsc::RecvTimeoutError::Timeout) => return Ok(ReadEvent::Idle),
+                // The reader thread exited (the guest's EOF or its own read
+                // fault): no further bytes will ever arrive.
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(ReadEvent::Closed),
             }
         }
         let take = buf.len().min(self.pending.len());
         buf[..take].copy_from_slice(&self.pending[..take]);
         self.pending.drain(..take);
-        Ok(take)
+        Ok(ReadEvent::Data(take))
     }
 
     fn write(&mut self, bytes: &[u8]) -> Result<(), BackendError> {
@@ -255,16 +263,41 @@ mod tests {
     //! a fake). It binds into `cargo test --test live_boot` (#26).
     use super::*;
 
-    /// A silent PTY (no guest spawned, no output) must have `read` return `Ok(0)`
-    /// after the budget — the deadline path — rather than blocking forever.
-    /// Regression for the vfkit hang a real boot exposed (#26).
+    /// A silent PTY (no guest spawned, no output) must have `read` report
+    /// [`ReadEvent::Idle`] after the poll quantum — not block forever, and not
+    /// be mistaken for a closed console (#185: the driver treats `Idle` and
+    /// `Closed` very differently). Regression for the vfkit hang a real boot
+    /// exposed (#26).
     #[test]
     fn pty_transport_read_times_out_on_a_silent_console() -> Result<(), BackendError> {
         let mut transport = PtyTransport::open()?;
         transport.set_read_timeout(std::time::Duration::from_millis(100));
         let mut buf = [0u8; 16];
-        let read = transport.read(&mut buf)?;
-        assert_eq!(read, 0, "a silent PTY must time out to Ok(0), not block");
+        let event = transport.read(&mut buf)?;
+        assert_eq!(
+            event,
+            ReadEvent::Idle,
+            "a silent PTY must time out to Idle, not block or close"
+        );
+        Ok(())
+    }
+
+    /// Once the child spawned on the PTY exits, the master reader thread hits a
+    /// real EOF and `read` reports [`ReadEvent::Closed`] — not another `Idle`
+    /// forever (#185: a driver that only ever saw `Idle` would spin reading a
+    /// dead console instead of resolving the run).
+    #[test]
+    fn pty_transport_read_reports_closed_once_the_child_exits() -> Result<(), BackendError> {
+        let mut transport = PtyTransport::open()?;
+        transport.set_read_timeout(Duration::from_millis(100));
+        transport.spawn(Path::new("/bin/sh"), &["-c".to_string(), "exit 0".to_string()])?;
+
+        let mut buf = [0u8; 64];
+        let closed = (0..50).any(|_| matches!(transport.read(&mut buf), Ok(ReadEvent::Closed)));
+        assert!(
+            closed,
+            "the transport must report Closed once the child exits, not loop as Idle forever"
+        );
         Ok(())
     }
 
@@ -278,9 +311,46 @@ mod tests {
         let mut transport = PipeTransport::new(reader, writer);
 
         let mut buf = [0u8; 32];
-        let read = transport.read(&mut buf)?;
+        let event = transport.read(&mut buf)?;
+        let ReadEvent::Data(read) = event else {
+            panic!("expected Data, got {event:?}");
+        };
         assert_eq!(&buf[..read], b"guest-says-hi");
         transport.write(b"cmd")?;
+        Ok(())
+    }
+
+    /// #185 regression: a quiet-but-still-open channel reports `Idle`, not
+    /// `Closed` — only an actual EOF (the write end closing) reports `Closed`.
+    /// Before the fix both collapsed into `Ok(0)`, which only worked because
+    /// the read timeout was the whole run budget; polling on a short interval
+    /// would have ended the run on the first quiet tick.
+    #[test]
+    fn pipe_transport_distinguishes_idle_from_closed() -> Result<(), BackendError> {
+        let (mut their_end, our_end) = std::os::unix::net::UnixStream::pair().expect("create a socket pair");
+        our_end
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("set read timeout");
+        let reader = our_end.try_clone().expect("clone socket");
+        let mut transport = PipeTransport::new(Box::new(reader), Box::new(our_end));
+
+        let mut buf = [0u8; 16];
+        assert_eq!(
+            transport.read(&mut buf)?,
+            ReadEvent::Idle,
+            "nothing sent yet, the channel is still open"
+        );
+
+        use std::io::Write as _;
+        their_end.write_all(b"hi").expect("write to the pair");
+        assert_eq!(transport.read(&mut buf)?, ReadEvent::Data(2));
+
+        drop(their_end);
+        assert_eq!(
+            transport.read(&mut buf)?,
+            ReadEvent::Closed,
+            "the write end closed; no further bytes will ever arrive"
+        );
         Ok(())
     }
 }

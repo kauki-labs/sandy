@@ -260,9 +260,12 @@ impl VfkitBackend {
         let args = vfkit_args(topology, spec, &staged)?;
 
         let mut transport = PtyTransport::open()?;
-        // The PTY read deadline carries the run budget, so a silent guest resolves
-        // through the protocol's timeout path instead of blocking the driver.
-        transport.set_read_timeout(Duration::from_secs(u64::from(spec.timeout_secs.max(1))));
+        // The PTY read timeout is a short poll quantum, not the run budget:
+        // `run_console` enforces the deadline (and `spec.control`'s live
+        // cancellation/suspension, #340/#185) itself on every idle tick, so a
+        // silent guest resolves through its timeout path instead of blocking
+        // the driver for the whole run.
+        transport.set_read_timeout(crate::console::POLL_QUANTUM);
         let pid = transport.spawn(&self.vfkit_bin, &args)?;
         tracing::info!(box_id, pid, "spawned vfkit under PTY console");
         self.lock_registry()?.push(BoxState {
@@ -866,6 +869,85 @@ mod tests {
             "a running box is listed"
         );
         backend.kill("box-0").context("tear the box down")?;
+        Ok(())
+    }
+
+    /// Tier-3 (#185/#340): suspending a real vfkit-backed job's `RunControl`
+    /// deadline before it runs lets it survive well past its own declared
+    /// `timeout_secs`, proving the fix end to end (argv → vfkit → PTY console →
+    /// `run_console`), not just at the `run_console` unit level.
+    #[test]
+    #[ignore = "tier-3/host: boots a real vfkit guest on an Apple-silicon host; binds into #185/#340 (INV-S9)"]
+    fn suspending_the_control_survives_past_the_jobs_timeout_on_vfkit() -> anyhow::Result<()> {
+        let backend = VfkitBackend::new("vfkit");
+        let command = ["sh".to_string(), "-c".to_string(), "sleep 20; echo done".to_string()];
+        let grants = grants();
+        let control = sandy::RunControl::with_timeout_secs(5);
+        control.suspend_deadline();
+        let spec = RunSpec {
+            template: "demo",
+            command: &command,
+            inputs: &[],
+            outputs: &[],
+            secrets: &[],
+            env: &[],
+            cpu: None,
+            mem: None,
+            timeout_secs: 5,
+            grants: &grants,
+            outcome_file: None,
+            secret_dir: None,
+            control: &control,
+        };
+
+        let outcome = backend.run(&spec).context("boot vfkit guest")?;
+        assert!(
+            !outcome.timed_out,
+            "a suspended deadline must survive well past the 5s budget: {outcome:?}"
+        );
+        assert_eq!(outcome.guest_exit, Some(0), "console: {}", outcome.console);
+        Ok(())
+    }
+
+    /// Tier-3 (#185/#340): `daemon cancel` ends a real vfkit-backed job
+    /// promptly, well before its own long declared `timeout_secs`.
+    #[test]
+    #[ignore = "tier-3/host: boots a real vfkit guest on an Apple-silicon host; binds into #185/#340 (INV-S9)"]
+    fn cancelling_the_control_ends_a_running_job_on_vfkit() -> anyhow::Result<()> {
+        let backend = VfkitBackend::new("vfkit");
+        let command = ["sh".to_string(), "-c".to_string(), "sleep 60".to_string()];
+        let grants = grants();
+        let control = sandy::RunControl::with_timeout_secs(120);
+        let spec = RunSpec {
+            template: "demo",
+            command: &command,
+            inputs: &[],
+            outputs: &[],
+            secrets: &[],
+            env: &[],
+            cpu: None,
+            mem: None,
+            timeout_secs: 120,
+            grants: &grants,
+            outcome_file: None,
+            secret_dir: None,
+            control: &control,
+        };
+
+        let start = Instant::now();
+        let outcome = std::thread::scope(|scope| {
+            let handle = scope.spawn(|| backend.run(&spec));
+            std::thread::sleep(Duration::from_secs(5));
+            control.cancel();
+            handle.join().expect("run thread panicked")
+        })
+        .context("boot vfkit guest")?;
+
+        assert!(outcome.timed_out, "cancellation ends the job: {outcome:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "cancellation must end the run promptly, not wait near the 120s budget"
+        );
         Ok(())
     }
 }
