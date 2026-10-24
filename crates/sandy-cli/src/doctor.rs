@@ -202,6 +202,13 @@ pub fn mac_prereq_result(verdict: MacPrereq) -> Option<DoctorResult> {
 /// host facts into the child process it spawns, instead of depending on the
 /// sandbox that built the test binary happening to have `nix` and a configured
 /// builder (#163).
+///
+/// Test-only: nothing else in sandy reads `SANDY_NIX_MACHINES_FILE` to build the
+/// guest — the real build still goes through Nix's own ambient `builders`
+/// config (`@/etc/nix/machines` by default). Pointing this at a file listing a
+/// builder Nix itself doesn't know about makes `doctor` approve a build that
+/// will still fail; configure Nix's own `builders`/`/etc/nix/machines` instead
+/// of this variable for a real host.
 pub(crate) fn detect_mac_prereq() -> MacPrereq {
     let machines_path = std::env::var_os("SANDY_NIX_MACHINES_FILE")
         .filter(|value| !value.is_empty())
