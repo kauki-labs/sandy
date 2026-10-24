@@ -23,26 +23,20 @@ pub use sandy_api::containment::{Containment, ContainmentStatus, Mount, Resource
 
 use crate::{BackendError, SandboxKind};
 
-/// Whether a backend providing `kind`, with containment reporting `status`, may run
-/// an **untrusted** job. Fail-closed:
+/// Whether a backend providing `kind` may run an **untrusted** job. Untrusted jobs
+/// are VM-only (`docs/decisions/process-containment.md` §6, #150):
 ///
-/// - a [`SandboxKind::Vm`] backend is the strong isolation boundary, so it always admits an untrusted job regardless of
-///   process-level containment;
-/// - a [`SandboxKind::Process`] backend admits one only when its containment is an untrusted boundary
-///   ([`ContainmentStatus::is_untrusted_boundary`]) — reap + user-bus/namespace isolation, NOT merely tree-reaping. A
-///   plain `systemd-run` scope (reaps but leaves the user bus reachable, CWE-269), and any `Unavailable`/`Unsupported`
-///   status, is REFUSED.
+/// - a [`SandboxKind::Vm`] backend is the isolation boundary, so it admits an untrusted job;
+/// - a [`SandboxKind::Process`] backend never admits one, whatever its containment reports. `_status` does not change
+///   the result, not even [`ContainmentStatus::is_untrusted_boundary`].
 ///
-/// The untrusted-OK path therefore depends on the mount-namespace / bus-isolation
-/// work (#142); until it lands, a process backend refuses untrusted jobs even where
-/// cgroup reaping is Available. This is a dispatch-time admission check (parallel to
-/// [`backend_accepts`](crate::backend_accepts)); the process backend is
-/// library-only today, so the live enforcer is the fabric dispatcher.
+/// This is a dispatch-time admission check, parallel to
+/// [`backend_accepts`](crate::backend_accepts).
 #[must_use]
-pub fn admits_untrusted(kind: SandboxKind, status: &ContainmentStatus) -> bool {
+pub fn admits_untrusted(kind: SandboxKind, _status: &ContainmentStatus) -> bool {
     match kind {
         SandboxKind::Vm => true,
-        SandboxKind::Process => status.is_untrusted_boundary(),
+        SandboxKind::Process => false,
     }
 }
 
@@ -78,7 +72,7 @@ mod tests {
     /// systemd-run scope with a reachable user bus, CWE-269), Unavailable, and
     /// Unsupported are all REFUSED. A VM backend always admits. Asserts the BAD path.
     #[test]
-    fn the_gate_refuses_an_untrusted_process_job_without_an_isolating_containment() {
+    fn the_gate_refuses_every_untrusted_process_job() {
         assert!(
             !admits_untrusted(
                 SandboxKind::Process,
@@ -100,13 +94,13 @@ mod tests {
             "unsupported containment must refuse an untrusted process job"
         );
         assert!(
-            admits_untrusted(
+            !admits_untrusted(
                 SandboxKind::Process,
                 &ContainmentStatus::Available {
                     isolates_untrusted: true
                 }
             ),
-            "an isolating containment admits an untrusted process job"
+            "untrusted is VM-only (process-containment.md §6): even an isolating containment refuses"
         );
         assert!(
             admits_untrusted(SandboxKind::Vm, &ContainmentStatus::Unavailable("irrelevant".into())),

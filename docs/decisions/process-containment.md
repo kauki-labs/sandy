@@ -194,10 +194,10 @@ backend never admits an untrusted job, with any containment, on any host.
 
 - The process backend is a verification path. It exercises the seams end to end on
   one machine. It is not an isolation boundary.
-- The gate fails closed. `admits_untrusted` refuses an untrusted job on a `Process`
-  backend with a named refusal. It never runs the job under weaker containment.
-- `is_untrusted_boundary` stays false for every process containment. No future
-  confinement work changes this without a new decision that supersedes this one.
+- The gate fails closed in code. `admits_untrusted` refuses every untrusted job on a
+  `Process` backend and ignores the containment status. A containment that reports
+  `isolates_untrusted: true` does not change the result. Only a new decision that
+  supersedes this one can change the gate.
 - Dispatch routes untrusted work to VM executors only. sandyd's submit path does not
   carry an isolation class yet, so every job is placed as trusted. #381 adds the
   per-job class and the VM-only routing (see `sandyd.md` decision 15).

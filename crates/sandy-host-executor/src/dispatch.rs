@@ -593,11 +593,15 @@ mod tests {
         );
     }
 
+    /// Untrusted is VM-only (process-containment.md §6, #150): an isolating
+    /// process containment still refuses an untrusted job.
     #[test]
-    fn an_untrusted_requirement_is_satisfied_by_a_genuine_untrusted_boundary() {
+    fn an_untrusted_requirement_is_refused_even_by_an_isolating_process_host() {
         assert_eq!(
             check_isolation_class(IsolationClass::Untrusted, &available(true)),
-            Ok(())
+            Err(DispatchError::IsolationClassNotSatisfied {
+                required: IsolationClass::Untrusted
+            })
         );
     }
 
