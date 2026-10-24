@@ -367,12 +367,13 @@ pub fn mint_run_token<P: CredentialProvider + ?Sized>(
 /// a job that outlives the provider's native token cap (GitHub ~1h) keeps a valid
 /// scoped token the whole run. The refresh margin and poll interval default to
 /// [`DEFAULT_REFRESH_MARGIN_SECS`] / [`DEFAULT_REFRESH_TICK_SECS`], overridable via
-/// `SANDY_REFRESH_MARGIN_SECS` / `SANDY_REFRESH_TICK_SECS`. Every tick also
-/// heartbeats `cred_dir`'s mtime (#195), so [`gc`]'s stale-staging-dir sweep
-/// never mistakes a live long-running job for one SIGKILL or a crash left
-/// behind. Teardown revokes the live token (the latest handle after any
-/// refresh) on every path and removes the staged file (INV-1); `cred_dir`
-/// itself is the caller's to clean up.
+/// `SANDY_REFRESH_MARGIN_SECS` / `SANDY_REFRESH_TICK_SECS` (the latter capped by
+/// [`safe_heartbeat_tick`]). Every tick also heartbeats `cred_dir`'s mtime
+/// (#195), so [`gc`]'s stale-staging-dir sweep never mistakes a live
+/// long-running job for one SIGKILL or a crash left behind. Teardown revokes
+/// the live token (the latest handle after any refresh) on every path and
+/// removes the staged file (INV-1); `cred_dir` itself is the caller's to
+/// clean up.
 ///
 /// # Errors
 ///
