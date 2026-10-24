@@ -36,14 +36,21 @@ use std::{
     time::Duration,
 };
 
+use futures_util::StreamExt;
 use sandy_fabric::{
     capauth::{Cap, CapAuthority, CapError, CapRights, CapScope},
     types::{ChannelId, PeerId},
 };
-use sandy_fabric_local::{LocalCapAuthority, SharedCapAuthority, channel::Channel, inmem::InMem};
+use sandy_fabric_local::{
+    LocalCapAuthority, SharedCapAuthority, agent::ARCHIVE_TRANSCRIPT, channel::Channel, inmem::InMem,
+};
+use sandy_proto::MessageType;
 use uuid::Uuid;
 
-use crate::link_auth::{self, LinkAuthError, RemoteLink};
+use crate::{
+    link_auth::{self, LinkAuthError, RemoteLink},
+    store::JobStore,
+};
 
 /// A job's dedicated orchestrator channel, minted at submit time.
 pub struct JobChannel {
@@ -63,6 +70,11 @@ pub struct JobChannel {
     /// one (#327) — "my own job I can log into, someone else's I can only
     /// watch".
     pub observer_cap: Cap,
+    /// A read-only cap distinct from `observer_cap`, used only by
+    /// `persist_archive_when_posted` (#340 item 4) — never handed to a real
+    /// client. See that cap's own minting comment in `mint_job_channel` for
+    /// why it must not be the same cap any attacher might hold.
+    pub archiver_cap: Cap,
     /// This run's binding to a remote executor (#212 decision 6), if it has
     /// one. `None` for a job dispatched locally, which has no mesh stream to
     /// authenticate — `serve_agent_link` runs directly over a private
@@ -203,18 +215,140 @@ pub async fn mint_job_channel(job_id: &str, authority: &SharedCapAuthority) -> R
         },
         expires_at: None,
     })?;
+    // A DISTINCT identity from `observer_cap` (#340 item 4), never handed out
+    // to a real client: `MembershipId` is a digest of the cap's own proof
+    // bytes, so `persist_archive_when_posted` joining with the SAME cap an
+    // attach client holds would share that client's membership entry. A
+    // later `attach_relay::leave_for_attach` for that client's detach then
+    // calls `Channel::leave` on that shared id, which removes the session
+    // state `CursorStream::poll_next` checks for EVERY stream still reading
+    // it — ending the persister's subscription too, silently, the moment any
+    // attacher using the same cap detaches (confirmed by reading
+    // `Channel::leave`/`CursorStream::poll_next`: session state is keyed by
+    // `MembershipId`, not per `CursorStream`). A different `peer` scope
+    // mints a cap with different proof bytes and therefore a different
+    // digest, regardless of how the authority handles nonces.
+    let archiver_cap = authority.mint(CapScope {
+        peer: PeerId::from("archiver"),
+        channel: channel_id.clone(),
+        rights: CapRights {
+            post: false,
+            read: true,
+            invite: false,
+        },
+        expires_at: None,
+    })?;
 
     let channel = Channel::new(channel_id, InMem::default(), authority.clone()).await?;
     Ok(JobChannel {
         channel: Arc::new(channel),
         agent_cap,
         observer_cap,
+        archiver_cap,
         remote_link: None,
         granted_caps: Vec::new(),
         session: Uuid::nil(),
         host_id: None,
         attach_tracking: std::sync::Mutex::new(AttachTracking::default()),
     })
+}
+
+/// How long [`persist_archive_when_posted`] waits for the agent's one-shot
+/// archived-transcript post before giving up: generous enough to outlast a
+/// job that runs a long time while attached (#340's "unlimited while
+/// attached" timeout is enforced elsewhere; this has no view into attach
+/// state at all), but bounded, so an agent that crashes, or a job that is
+/// never dispatched, doesn't leave this task running for the life of the
+/// daemon.
+pub const ARCHIVE_WAIT_BOUND: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Observe `channel` (read-only, via the job's own dedicated `archiver_cap`
+/// — never `agent_cap`, this task never needs to write, and never
+/// `observer_cap`, see that cap's own minting doc for why) for the agent's
+/// one-shot `ARCHIVE_TRANSCRIPT` post (epic #340 item 4) and persist it into
+/// `store`, independent of whether a `sandy daemon attach` client was ever
+/// connected to see it live.
+///
+/// Without this, the only consumers of that post are live attach-relay
+/// connections (`attach_relay.rs`'s per-connection `relay()`): a job nobody
+/// ever attaches to loses the transcript for good the moment it's posted,
+/// even though the agent genuinely sent it — and the registry's own doc
+/// above is explicit that the in-memory `Channel` itself holds nothing
+/// durable, so this (not the channel) is where a copy has to land to
+/// survive a restart.
+///
+/// A plain, read-only `channel.join` here never touches `attach_relay.rs`'s
+/// own `join_for_attach`/`AttachTracking` bookkeeping — those are explicit
+/// calls that function makes, not a side effect of `Channel::join` itself —
+/// so this task is invisible to attach-state accounting and the M2 timeout
+/// it drives.
+///
+/// Best-effort and silent on every failure path (a join/subscribe refusal,
+/// a channel fault, `wait_bound` elapsing with no archive ever posted, or a
+/// store write error): this is a durability nicety layered onto a live
+/// delivery path that already works correctly on its own. `wait_bound` is a
+/// parameter (callers pass [`ARCHIVE_WAIT_BOUND`]) so tests can exercise the
+/// give-up path without an actual day-long wait.
+pub async fn persist_archive_when_posted(
+    channel: Arc<Channel<InMem, SharedCapAuthority>>,
+    archiver_cap: Cap,
+    job_id: String,
+    store: Arc<JobStore>,
+    wait_bound: Duration,
+) {
+    let membership = match channel.join(&archiver_cap) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(job_id, error = %e, "archive persister: could not join the job channel");
+            return;
+        }
+    };
+    find_and_persist_archive(&channel, &membership, &job_id, &store, wait_bound).await;
+    // Always leave once done (found it, failed, or gave up): this
+    // membership belongs to this one task alone (see `archiver_cap`'s own
+    // minting doc) and has no reason to linger in the channel's membership
+    // table afterward.
+    channel.leave(&membership);
+}
+
+/// The actual find-and-persist, split out from [`persist_archive_when_posted`]
+/// purely so every early return still goes through that function's own
+/// unconditional `channel.leave` at the end — a `return` in here just ends
+/// this helper, not the cleanup.
+async fn find_and_persist_archive(
+    channel: &Channel<InMem, SharedCapAuthority>,
+    membership: &sandy_fabric_local::channel::MembershipId,
+    job_id: &str,
+    store: &Arc<JobStore>,
+    wait_bound: Duration,
+) {
+    let stream = match channel.subscribe(membership) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(job_id, error = %e, "archive persister: could not subscribe");
+            return;
+        }
+    };
+    let find_archive = async {
+        let mut stream = std::pin::pin!(stream);
+        while let Some(item) = stream.next().await {
+            let Ok(env) = item else { continue };
+            if matches!(env.message_type, Some(MessageType::Output(_))) && env.content_type == ARCHIVE_TRANSCRIPT {
+                return Some(env.payload);
+            }
+        }
+        None
+    };
+    let Ok(Some(bytes)) = tokio::time::timeout(wait_bound, find_archive).await else {
+        return;
+    };
+    let write_job_id = job_id.to_owned();
+    let store = Arc::clone(store);
+    match tokio::task::spawn_blocking(move || store.set_archive(&write_job_id, &bytes)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(job_id, error = %e, "archive persister: could not persist the transcript"),
+        Err(e) => tracing::warn!(job_id, error = %e, "archive persister: the store-write task panicked"),
+    }
 }
 
 /// Every submitted job's minted channel, keyed by job id, plus the one
@@ -528,6 +662,160 @@ mod tests {
         assert!(
             matches!(err, sandy_fabric_local::channel::ChannelError::Cap(CapError::Forged)),
             "got {err:?}"
+        );
+        Ok(())
+    }
+
+    /// #340 item 4: the agent's one-shot archive post is persisted even
+    /// though nothing ever joins as an attach client — the whole point of a
+    /// job-level, always-on observer rather than relying on
+    /// `attach_relay.rs`'s per-connection delivery.
+    #[tokio::test]
+    async fn an_archive_posted_by_the_agent_is_persisted_with_no_attach_client() -> anyhow::Result<()> {
+        let job = mint_job_channel("job-archive", &test_authority()).await?;
+        let agent = job.channel.join(&job.agent_cap)?;
+        let store = Arc::new(crate::store::JobStore::open_in_memory()?);
+        store.insert_pending("job-archive", b"m", "test/v1")?;
+
+        let persisting = tokio::spawn(persist_archive_when_posted(
+            Arc::clone(&job.channel),
+            job.archiver_cap.clone(),
+            "job-archive".to_string(),
+            Arc::clone(&store),
+            Duration::from_secs(5),
+        ));
+
+        job.channel
+            .post(
+                &agent,
+                Some(MessageType::Output(sandy_proto::Output {})),
+                ARCHIVE_TRANSCRIPT,
+                b"the whole transcript".to_vec(),
+            )
+            .await?;
+
+        tokio::time::timeout(Duration::from_secs(5), persisting).await??;
+
+        assert_eq!(store.archive("job-archive")?, Some(b"the whole transcript".to_vec()));
+        Ok(())
+    }
+
+    /// A job whose agent never posts an archive (crashed, or never ran) must
+    /// not leave the persister running forever — it gives up once
+    /// `wait_bound` elapses.
+    #[tokio::test]
+    async fn a_job_that_never_archives_leaves_no_lingering_persister() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let job = mint_job_channel("job-no-archive", &test_authority()).await?;
+        let store = Arc::new(crate::store::JobStore::open_in_memory()?);
+        store.insert_pending("job-no-archive", b"m", "test/v1")?;
+
+        let persisting = tokio::spawn(persist_archive_when_posted(
+            Arc::clone(&job.channel),
+            job.archiver_cap.clone(),
+            "job-no-archive".to_string(),
+            Arc::clone(&store),
+            Duration::from_millis(50),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(5), persisting)
+            .await
+            .context("the persister must give up once wait_bound elapses, not run forever")??;
+        assert_eq!(store.archive("job-no-archive")?, None);
+        Ok(())
+    }
+
+    /// A plain `channel.join` for the persister's own archiver membership
+    /// must never feed `attach_relay.rs`'s `AttachTracking`/`AttachStateChanged`
+    /// bookkeeping — that is driven only by `join_for_attach`'s own explicit
+    /// calls, never by `Channel::join` itself. A false "attached" signal
+    /// would suspend a job's M2 timeout forever.
+    #[tokio::test]
+    async fn the_persisters_own_join_does_not_register_as_an_attach() -> anyhow::Result<()> {
+        let job = mint_job_channel("job-archive-no-attach-tracking", &test_authority()).await?;
+        let store = Arc::new(crate::store::JobStore::open_in_memory()?);
+        store.insert_pending("job-archive-no-attach-tracking", b"m", "test/v1")?;
+
+        let persisting = tokio::spawn(persist_archive_when_posted(
+            Arc::clone(&job.channel),
+            job.archiver_cap.clone(),
+            "job-archive-no-attach-tracking".to_string(),
+            Arc::clone(&store),
+            Duration::from_millis(50),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), persisting).await??;
+
+        assert_eq!(
+            job.attach_tracking
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .count,
+            0,
+            "the persister's own read-only join must not register as an attach"
+        );
+        Ok(())
+    }
+
+    /// Regression: an attach client using `observer_cap` joining and then
+    /// leaving must not end the persister's OWN subscription. Before the
+    /// persister was given its own dedicated `archiver_cap`, both shared one
+    /// `MembershipId` (a digest of the cap's proof bytes) — `Channel::leave`
+    /// removes that id's whole session entry, which `CursorStream::poll_next`
+    /// checks for EVERY stream still reading it, so the attacher's detach
+    /// silently ended the persister's stream too, well before the agent ever
+    /// posted its archive.
+    #[tokio::test]
+    async fn an_attach_clients_detach_does_not_end_the_archive_persisters_subscription() -> anyhow::Result<()> {
+        let job = mint_job_channel("job-archive-survives-detach", &test_authority()).await?;
+        let agent = job.channel.join(&job.agent_cap)?;
+        let store = Arc::new(crate::store::JobStore::open_in_memory()?);
+        store.insert_pending("job-archive-survives-detach", b"m", "test/v1")?;
+
+        let persisting = tokio::spawn(persist_archive_when_posted(
+            Arc::clone(&job.channel),
+            job.archiver_cap.clone(),
+            "job-archive-survives-detach".to_string(),
+            Arc::clone(&store),
+            Duration::from_secs(5),
+        ));
+
+        // `#[tokio::test]` is current-thread: the spawned persister makes no
+        // progress until this task actually yields. Wait for it to have
+        // joined (member count: agent + persister = 2) before the attacher's
+        // own join/leave below, or the attacher could leave BEFORE the
+        // persister ever subscribes — which wouldn't reproduce the bug this
+        // test regresses (the persister joining fresh afterward and
+        // replaying from cursor 0 would still see the later archive post,
+        // masking the real race).
+        let join_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while job.channel.member_count() < 2 {
+            anyhow::ensure!(
+                tokio::time::Instant::now() < join_deadline,
+                "the persister never joined"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        // An ordinary attach client's full lifecycle: join with the cap a
+        // real attacher would hold, subscribe (as `attach_relay::relay`
+        // does), then leave (as a detach does).
+        let attacher = job.channel.join(&job.observer_cap)?;
+        let _ = job.channel.subscribe(&attacher)?;
+        job.channel.leave(&attacher);
+
+        job.channel
+            .post(
+                &agent,
+                Some(MessageType::Output(sandy_proto::Output {})),
+                ARCHIVE_TRANSCRIPT,
+                b"the whole transcript".to_vec(),
+            )
+            .await?;
+
+        tokio::time::timeout(Duration::from_secs(5), persisting).await??;
+        assert_eq!(
+            store.archive("job-archive-survives-detach")?,
+            Some(b"the whole transcript".to_vec())
         );
         Ok(())
     }
