@@ -614,18 +614,19 @@ wiring" discipline used throughout B2. Resolved by decision 13.
 
 ## 13. Mesh bind addresses are environment variables; two separate listeners, not one multiplexed (#291)
 
-**Status:** partially implemented. `sandyd::mesh_config` parses
-`$SANDY_MESH_LISTEN` (the host_conn management-channel's bind address) and
-`$SANDY_MESH_ALLOWLIST` (comma-separated executor mesh IPs), both pure
-functions fully unit-tested against raw string values, not real process
-environment. `main.rs`'s `setup_mesh_listener` reads them, refuses to start
-if a listen address is configured with an empty allowlist (a listener nobody
-could ever pass), binds via `sandy_conn::listen`, and `run_mesh_accept_loop`
-serves accepted connections against a dedicated `HostRegistry` as its own
-background task. What is NOT yet built: the mesh_accept (agent-link) listener
-and its own bind-address env var — that side depends on #290's accept loop
-landing on main; this decision's config surface and wiring pattern extend to
-it directly once it does, as a small follow-up, not a redesign.
+**Status:** implemented. `sandyd::mesh_config` parses `$SANDY_MESH_LISTEN`
+(the host_conn management-channel's bind address) and `$SANDY_MESH_ALLOWLIST`
+(comma-separated executor mesh IPs), both pure functions fully unit-tested
+against raw string values, not real process environment. `main.rs`'s
+`setup_mesh_listener` reads them, refuses to start if a listen address is
+configured with an empty allowlist (a listener nobody could ever pass), binds
+via `sandy_conn::listen`, and `run_mesh_accept_loop` serves accepted
+connections against a dedicated `HostRegistry` as its own background task.
+The mesh_accept (agent-link) listener is also built, bound via its own
+`$SANDY_MESH_AGENT_LINK_LISTEN` and served by
+`sandyd::mesh_accept::serve_mesh_accept_loop`; unlike the management
+listener, it has no graceful-shutdown support of its own yet (see
+Consequences).
 
 **Context.** #291's architect rulings (relayed by infra-f3): two separate
 mesh-bound listeners/ports (the host_conn management channel and the
@@ -659,12 +660,12 @@ sets it per node, the nix service unit (#287) injects it in production.
   with a `pending()` fallback branch) was tried and discarded as needlessly
   convoluted for two independent accept loops that never need to coordinate.
 
-**Consequences.** `sandyd`'s mesh listener has no graceful-shutdown
-coordination with the daemon's own `SIGTERM`/`SIGINT` handling yet — it is a
-detached task that the process's own exit simply drops, unlike the UDS
-listener's bounded grace period for in-flight connections. Acceptable at
-this stage (no live cross-machine traffic exists to lose gracefully yet);
-revisit once #272's live e2e exercises this path for real.
+**Consequences.** `sandyd`'s mesh management listener shares the daemon's
+`SIGTERM`/`SIGINT` shutdown signal. It stops accepting new connections and
+drains active host-executor connections for the bounded grace period before
+`main` exits. The separate mesh agent-link listener remains detached and
+lacks graceful-shutdown support; revisit that listener once #272's live e2e
+exercises this path for real.
 
 **Set aside.** A CLI-flag surface (`clap`) for these two env vars: `sandyd`
 has never had one, and introducing `clap` as a dependency for two optional
