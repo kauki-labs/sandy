@@ -142,8 +142,9 @@ long would otherwise look abandoned. The refresh loop therefore heartbeats
 `cred_dir`'s mtime every tick, independent of whether a refresh fires; a
 `kill -9`'d process stops ticking, so a genuinely leaked dir still ages out
 and gets swept. `safe_heartbeat_tick` refuses a `SANDY_REFRESH_TICK_SECS` at
-or above `MAX_TTL_SECS` and falls back to the 60s default, so a misconfigured
-tick can't reopen the gap the heartbeat exists to close. The sweep is
+or above `MAX_TTL_SECS` and falls back to the 60s default, bounding the tick
+itself; whether that bound also keeps a stalled refresh call from reopening
+the gap is a separate question the Consequences below addresses. The sweep is
 best-effort within `gc`: a staging base that cannot be validated or listed is
 logged and skipped, and a single entry that can't be read, stat'ed, or
 removed is skipped and retried on a later `gc`, neither ever blocking `gc`'s
@@ -151,52 +152,71 @@ primary job-record eviction.
 
 The heartbeat alone isn't enough: `refresh_loop` touches `cred_dir`'s mtime
 and then calls `refresh_once` synchronously, so a stalled `GithubAdapter`
-call would block the next heartbeat for as long as the call hangs, and
-octocrab retries a failed call (including a timeout) up to `HTTP_RETRIES`
-times by default, so a per-attempt timeout alone bounds one attempt, not the
-whole call. `timeout_capped_builder` pins both: every GitHub API call (mint,
-refresh, revoke, the permissions read) gets a per-attempt connect/read
-timeout of `HTTP_TIMEOUT`, and the retry count is set explicitly
-(`HTTP_RETRIES`, matching octocrab's own prior default) rather than left
-implicit, so `HTTP_TIMEOUT` can be sized against the true worst case:
-`(HTTP_RETRIES + 1) * HTTP_TIMEOUT`, pinned at `MAX_TTL_SECS / 2`.
+call would block the next heartbeat for as long as the call hangs. Every
+GitHub API call this adapter makes (mint, refresh, revoke, uninstall, the
+permissions read) runs under one wall-clock deadline,
+`CALL_DEADLINE = MAX_TTL_SECS / 2` (`with_call_deadline`), covering the whole
+call including whatever retries octocrab makes internally, not a per-attempt
+figure that needs multiplying out by a retry count. If octocrab's own
+retries don't finish inside that one deadline, the call just fails, the same
+outcome as any other failed mint/refresh/revoke. A single deadline around
+the whole call also means a connection that keeps resetting a per-read
+timeout by trickling bytes still can't outlast it, wherever in the
+connect/read/retry sequence the stall happens.
 
-**Consequences.** Sweep safety for a live job needs the gap between
-heartbeats, one tick plus one refresh call's latency, to stay under
-`MAX_TTL_SECS`. A silently stalled refresh now gives up after at most
-`MAX_TTL_SECS / 2` (every attempt timing out) instead of hanging
-indefinitely, and `safe_heartbeat_tick` bounds a misconfigured tick to the
-60s default; at those defaults the gap stays well under `MAX_TTL_SECS`. The
-refresh margin plays no part, since the heartbeat fires every tick
-regardless of whether a refresh does. This bound has real residuals, not
-closed by this change:
+**Consequences.** `refresh_once` makes two sequential adapter calls on its
+live path, `refresh` then `revoke` of the superseded token (and on its
+stage-failure path, `refresh` then `revoke_orphan`, still two), so the
+relevant safety margin is not one `CALL_DEADLINE` but the gap between
+`cred_dir` mtime touches across the whole `refresh_once` call. That margin
+rests on a side effect, not just the heartbeat: staging the refreshed token
+creates and renames a temp file inside `cred_dir` between the `refresh` and
+`revoke` calls, which touches the dir's own mtime the same way the heartbeat
+does, resetting the gap. So the worst case per loop iteration is
+`CALL_DEADLINE + tick`, not `2 * CALL_DEADLINE`: whichever of `refresh` or
+`revoke` stalls to the deadline, the stage write already reset the clock
+before or after it. At the 60s default tick that is about 1560s, safely
+under `MAX_TTL_SECS`. This bound has real residuals, not closed by this
+change:
 
-- A server that trickles bytes slowly enough resets the per-read timeout on
-  each read, so a sufficiently patient slow-loris response can still exceed
-  `HTTP_TIMEOUT` per attempt without ever triggering it.
-- `safe_heartbeat_tick` caps the tick alone; a `SANDY_REFRESH_TICK_SECS`
-  configured close to (but below) `MAX_TTL_SECS` still leaves little of the
-  worst-case `MAX_TTL_SECS / 2` refresh-call budget as real margin.
+- `safe_heartbeat_tick` caps the tick to below `MAX_TTL_SECS` (up to 2999s),
+  not to something that keeps `CALL_DEADLINE + tick` under `MAX_TTL_SECS`. A
+  `SANDY_REFRESH_TICK_SECS` configured near that ceiling pushes the worst
+  case to about 4500s, over the sweep threshold. Capping it at
+  `MAX_TTL_SECS - CALL_DEADLINE` instead would close this, but `CALL_DEADLINE`
+  is private to `sandy-lib`, while `safe_heartbeat_tick` lives in `sandy-cli`;
+  closing it means exporting the constant through the facade.
+- The stage write's own create step can itself fail before touching
+  `cred_dir` (drawing a temp name, or the temp file's own `O_CREAT|O_EXCL`
+  write, on `ENOSPC`/`EDQUOT`/`EMFILE`). On that narrow path, `refresh_once`
+  goes `refresh` then `revoke_orphan` with no stage touch in between, so
+  both calls' worst cases compound: `2 * CALL_DEADLINE + tick`, about 3060s
+  at the default tick, just over the sweep threshold. It needs both a
+  stage-create failure and two full-length stalls at once.
 - Retrying a non-idempotent `POST /access_tokens` was already possible under
-  octocrab's prior default retry policy; pinning `HTTP_RETRIES` here doesn't
-  introduce it, but a reliable per-attempt timeout makes the specific
-  failure mode easier to trigger than a bare connection reset did. If GitHub
-  completes the mint but the response is lost to the retry (the attempt
-  times out after the token was already issued), that token is unrecorded by
-  `self.mints`, so neither the retry's own eventual success nor a later
-  `revoke_orphan` call can revoke the earlier one; it lives out its native
-  ~1h expiry instead of the shorter TTL the seam otherwise enforces.
+  octocrab's default retry policy before this change; nothing here
+  introduces it. If GitHub completes the mint but the response is lost to a
+  retry, or `CALL_DEADLINE` cuts a request off after GitHub already
+  processed it, that token is unrecorded by `self.mints`, so neither the
+  retry's own eventual success nor a later `revoke_orphan` call can revoke
+  the earlier one; it lives out its native ~1h expiry instead of the shorter
+  TTL the seam otherwise enforces.
+- Once the job's run finishes, the refresh thread stops on the next loop
+  check of the stop signal, not mid-call. An in-flight `refresh_once` delays
+  that check, and the explicit teardown revoke, by up to the same windows
+  above. Harmless: the job has already finished by then, so a `gc` sweep
+  racing the job's own teardown cleanup only removes the same files
+  slightly early.
 
-A `verify-*` dir (the trust-root verify probe) gets no heartbeat. It
-normally lives for one mint call and one revoke call, now also bounded by
-the same `HTTP_TIMEOUT`/`HTTP_RETRIES` pair, so it is removed well within
-`MAX_TTL_SECS` on any non-crash path. If a call still somehow outlasted that
-bound, the outcome stays safe at the dir-sweep level: a hung-then-timed-out
-mint leaves `mint_lease`'s existing revoke-on-stage-failure path
-(`revoke_orphan`) to revoke a token GitHub did manage to mint before the dir
-could be swept (modulo the lost-retry residual above), and a hung revoke
-only risks the sweep removing a file whose token `revoke` already holds in
-memory.
+A `verify-*` dir (the trust-root verify probe) gets no heartbeat, but the
+permissions-read call happens before the probe dir even exists, so it never
+counts against the dir's lifetime. On the probe's success path, `mint` (at
+most `CALL_DEADLINE`) is followed by the same stage touch, then `revoke` (at
+most `CALL_DEADLINE`), so the dir is at most about `CALL_DEADLINE` old when
+verify removes it, well under `MAX_TTL_SECS`. On the stage-failure branch it
+can reach `2 * CALL_DEADLINE` (`MAX_TTL_SECS`), but no token is staged in
+the dir by then, so a sweep there is harmless, and verify's own best-effort
+`remove_dir_all` cleans it up regardless.
 
 **Set aside.** Tracking each staging dir's mint time in a side file (instead
 of reading mtime) was considered and rejected: it adds a second piece of

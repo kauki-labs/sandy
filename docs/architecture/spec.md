@@ -202,12 +202,12 @@ sequenceDiagram
   refreshes; without it, `gc` could delete a live job's credential dir. The sweep
   is best-effort: a staging base that can't be validated or listed is logged and
   skipped, never blocking `gc`'s record eviction. A stalled refresh call could
-  itself block the heartbeat (the two run sequentially), so the GitHub adapter
-  pins both a per-attempt timeout and its retry count (`HTTP_TIMEOUT` /
-  `HTTP_RETRIES`), bounding every API call's worst case at `MAX_TTL_SECS / 2`
-  and closing the gap at its source rather than only at the heartbeat; see
-  decision 6 for the residual gaps (a trickling response, a tick configured
-  close to the threshold, a mint lost to a retry) this doesn't close.
+  itself block the heartbeat (the two run sequentially), so every GitHub API
+  call (mint, refresh, revoke, uninstall, the permissions read) runs under a single
+  wall-clock deadline, `CALL_DEADLINE = MAX_TTL_SECS / 2`, covering the whole
+  call including whatever retries octocrab makes internally, closing the gap
+  at its source rather than only at the heartbeat. See decision 6 for the
+  residual gaps this doesn't close.
 
 **KPI.**
 
@@ -221,9 +221,9 @@ sequenceDiagram
   `safe_heartbeat_tick_passes_through_a_safe_tick` /
   `safe_heartbeat_tick_falls_back_when_the_tick_reaches_max_ttl_secs` /
   `..._exceeds_max_ttl_secs`; `cred_github.rs`'s
-  `timeout_capped_builder_bounds_a_stalled_request` (a local listener that
-  accepts and never responds, proving the client errors out at the configured
-  timeout rather than hanging).
+  `revoke_times_out_on_a_stalled_server` (drives the real adapter's `revoke`
+  against a local listener that accepts and never responds, proving the call
+  errors out at `call_deadline` rather than hanging).
 - End-to-end: `live_cred.rs` (git-helper + mid-run refresh + revoke; the "everything"
   scenario composing cred + secret + input + output), `live_refresh.rs` (a rotated
   token reaches the running guest). Adapter-live (real App): `cred_e2e.rs` /
