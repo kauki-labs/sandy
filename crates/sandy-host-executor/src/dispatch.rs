@@ -810,15 +810,26 @@ mod tests {
 
     /// Adversarial: a `link_token` that isn't exactly `REMOTE_LINK_TOKEN_LEN`
     /// bytes must be refused, never silently truncated or padded into a
-    /// prefix the orchestrator's accept loop would then decode wrong.
+    /// prefix the orchestrator's accept loop would then decode wrong — and
+    /// (INV-1, issue #159's residual item) the refusal's error `Display`/
+    /// `Debug` must not carry the bytes that were presented, even though
+    /// `HandleDispatchError::InvalidLinkTokenLength` only carries a length by
+    /// construction: a marker-containing token proves that, rather than
+    /// assuming it from reading the enum definition.
     #[tokio::test]
     async fn handle_dispatch_refuses_a_malformed_link_token_length() -> anyhow::Result<()> {
+        let marker = b"sandy-leak-marker-short-by-one!".to_vec();
+        assert_eq!(
+            marker.len(),
+            REMOTE_LINK_TOKEN_LEN - 1,
+            "test fixture must stay one byte short"
+        );
         let dispatch = sandy_executor_proto::Dispatch {
             job_id: "job-1".to_string(),
             manifest: serde_json::to_vec(&["echo"]).context("encoding the static test manifest")?,
             manifest_encoding: MANIFEST_ENCODING_ARGV_V1.to_string(),
             backend: sandy_executor_proto::SandboxKind::Process.into(),
-            link_token: vec![0u8; REMOTE_LINK_TOKEN_LEN - 1],
+            link_token: marker.clone(),
             forward_back: "127.0.0.1:9000".to_string(),
             required_isolation_class: IsolationClass::Trusted.into(),
         };
@@ -838,6 +849,24 @@ mod tests {
             matches!(err, HandleDispatchError::InvalidLinkTokenLength(len) if len == REMOTE_LINK_TOKEN_LEN - 1),
             "expected InvalidLinkTokenLength, got {err:?}"
         );
+        let display = err.to_string();
+        let debug = format!("{err:?}");
+        let marker_text = String::from_utf8_lossy(&marker).into_owned();
+        let marker_hex: String = marker.iter().map(|b| format!("{b:02x}")).collect();
+        for rendered in [&display, &debug] {
+            assert!(
+                !rendered.contains(&marker_text),
+                "the presented token's decoded text leaked into the error: {rendered}"
+            );
+            assert!(
+                !rendered.contains(&marker_hex),
+                "the presented token's hex encoding leaked into the error: {rendered}"
+            );
+            assert!(
+                !rendered.contains(&format!("{marker:?}")),
+                "the presented token's raw bytes leaked into the error: {rendered}"
+            );
+        }
         Ok(())
     }
 }

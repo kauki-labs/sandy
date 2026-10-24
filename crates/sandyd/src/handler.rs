@@ -1946,6 +1946,122 @@ mod tests {
         Ok(())
     }
 
+    /// Adversarial (INV-1, issue #159's residual item): across the real
+    /// Submit -> placement -> Dispatch-construction -> delivery path, no
+    /// `tracing` event or error `Display` carries the genuine per-run link
+    /// token. Exercises a successful delivery (the real token is read back
+    /// off the host's own dispatch channel, same as
+    /// `a_submitted_job_is_dispatched_to_a_registered_remote_host` above)
+    /// and an undeliverable one (the host's receiver is dropped before
+    /// Submit, so `send_dispatch_if_current` fails and `handle`'s own
+    /// "could not dispatch the placed job to its host" warning fires,
+    /// carrying the real `DispatchSendError`'s `Display` — the genuine
+    /// token for that job sits in its `remote_link` the whole time).
+    /// Complements `mesh_accept`'s
+    /// `no_tracing_event_carries_the_raw_link_token`, which covers the
+    /// accept-loop side of the same token's lifetime; this covers the
+    /// orchestrator's own construction and delivery of it.
+    #[tokio::test]
+    async fn no_tracing_event_carries_the_real_dispatch_token() -> anyhow::Result<()> {
+        let buf = crate::test_support::SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // A successful delivery: the real token travels from RemoteLink::new
+        // into the Dispatch the host's channel actually receives.
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let mut dispatch_rx = register_test_host(&host_registry, "ws01", peer_ip, trusted_host_capabilities());
+        let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            submit_req(1),
+        )
+        .await?;
+        assert!(
+            matches!(response.result, Some(control_response::Result::Submit(_))),
+            "got {:?}",
+            response.result
+        );
+        let dispatch = tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_rx.recv())
+            .await
+            .context("timed out waiting for the dispatch")?
+            .context("the host's dispatch channel closed before receiving anything")?;
+        let token1: [u8; crate::link_auth::LINK_TOKEN_LEN] = dispatch
+            .link_token
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("link_token was not LINK_TOKEN_LEN bytes"))?;
+
+        // An undeliverable dispatch, in a fresh registry so host placement
+        // can't ambiguously fall back to the first host above: the second
+        // host's receiver is dropped before Submit, so the send fails and
+        // handle logs the failure, but the job's own genuine token (never
+        // sent anywhere) still sits in its remote_link.
+        let (store2, registry2, host_registry2) = (new_store(), new_registry(), new_host_registry());
+        let dispatch_rx2 = register_test_host(&host_registry2, "ws02", peer_ip, trusted_host_capabilities());
+        drop(dispatch_rx2);
+        let response2 = handle(
+            &store2,
+            &registry2,
+            &host_registry2,
+            Some(forward_back),
+            test_session(),
+            submit_req(2),
+        )
+        .await?;
+        let job_id2 = match response2.result {
+            Some(control_response::Result::Submit(SubmitResponse { job_id, .. })) => job_id,
+            other => anyhow::bail!("expected a Submit response, got {other:?}"),
+        };
+        let token2 = *registry2
+            .get(&job_id2)
+            .context("the undeliverable job must still be registered")?
+            .remote_link
+            .as_ref()
+            .context("the undeliverable job must still have a remote_link bound")?
+            .token()
+            .as_bytes();
+
+        let logged = buf.contents()?;
+        assert!(
+            logged.contains("could not dispatch the placed job to its host"),
+            "positive control: the undeliverable dispatch must have logged its failure: {logged}"
+        );
+
+        for marker in [token1, token2] {
+            let text_marker = String::from_utf8_lossy(&marker).into_owned();
+            let hex_marker: String = marker.iter().map(|b| format!("{b:02x}")).collect();
+            let decimal_debug_marker = format!("{marker:?}");
+            let hex_debug_marker = format!("{marker:x?}");
+            assert!(
+                !logged.contains(&text_marker),
+                "a genuine dispatch token's decoded text leaked into tracing output: {logged}"
+            );
+            assert!(
+                !logged.contains(&hex_marker),
+                "a genuine dispatch token's hex encoding leaked into tracing output: {logged}"
+            );
+            assert!(
+                !logged.contains(&decimal_debug_marker),
+                "a genuine dispatch token's decimal byte-array Debug leaked into tracing output: {logged}"
+            );
+            assert!(
+                !logged.contains(&hex_debug_marker),
+                "a genuine dispatch token's hex byte-array Debug leaked into tracing output: {logged}"
+            );
+        }
+        Ok(())
+    }
+
     /// Adversarial, through the real path (belt-and-suspenders with
     /// `host_registry`'s own `pick_host_for_skips_a_host_that_does_not_support_the_required_class`
     /// unit test — this is the integration-level copy proving the fail-closed

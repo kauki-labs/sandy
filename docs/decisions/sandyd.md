@@ -164,8 +164,13 @@ name: blurs direct-execution's and the daemon's job concepts together.
 tested in isolation (`sandyd::link_auth`: `RemoteLink`, the constant-time
 token compare, `JobRegistry::authenticate_remote_link`) — accept-or-refuse
 given a job id, a peer IP, and a presented token, with every refusal path
-named and tested (wrong peer, wrong token, already-claimed, unknown run) and
-a dedicated test proving the token never appears in `Debug` output.
+named and tested (wrong peer, wrong token, already-claimed, unknown run), a
+dedicated test proving the token never appears in `Debug` output, and a
+tracing-capture test (`mesh_accept::no_tracing_event_carries_the_raw_link_token`,
+`handler::no_tracing_event_carries_the_real_dispatch_token`) proving no
+emitted log line or error carries the raw token across the accept-loop and
+the Submit->dispatch path, in its decoded-text, hex-text, or byte-array
+`Debug` shape — the literal INV-1 addendum item on #159, closing it.
 `RemoteLink::invalidate` plus `JobRegistry::invalidate_remote_link`, wired
 into the control handler's `Cancel` arm, close #269's token-lifecycle
 requirement: cancelling a job invalidates its unclaimed link immediately, so
@@ -236,7 +241,9 @@ all, not after — `mesh_accept::serve_one_remote_link` never writes to the
 connection before `authenticate_remote_link` succeeds. Acceptance tests:
 wrong peer, wrong token, a second stream for an already-
 claimed run, and an unknown run id each receive zero bytes; no log line or
-error message ever carries the token.
+error message ever carries the token (`mesh_accept::
+no_tracing_event_carries_the_raw_link_token`, `handler::
+no_tracing_event_carries_the_real_dispatch_token`).
 
 **Set aside.** Trusting the mesh IP alone (WireGuard/Headscale already binds
 an IP to a peer's key, so a bare `peer_addr()` looked tempting as sufficient):

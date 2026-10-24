@@ -383,40 +383,7 @@ mod tests {
         PeerAddr::Tcp(SocketAddr::new(ip.parse().expect("ip literal"), 0))
     }
 
-    /// A `Vec<u8>`-backed `tracing_subscriber` writer shared with the test, so
-    /// a subscriber installed for one scope can be inspected afterward.
-    /// Mirrors `sandy-cli`'s `tests/cli_jobs.rs::SharedBuf`.
-    #[derive(Clone, Default)]
-    struct SharedBuf(Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl SharedBuf {
-        fn contents(&self) -> anyhow::Result<String> {
-            let bytes = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-            String::from_utf8(bytes).context("captured log is utf8")
-        }
-    }
-
-    impl std::io::Write for SharedBuf {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
-        type Writer = SharedBuf;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
+    use crate::test_support::SharedBuf;
 
     /// Send one run-id+token prefix to `addr` and report how many bytes came
     /// back (1 = admitted to the agent link, 0 = refused with zero bytes).
