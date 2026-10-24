@@ -41,31 +41,142 @@ use tokio::io::{AsyncRead, AsyncWrite};
 /// reporting for long.
 const ARCHIVE_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The largest tail of the `pipe-pane` transcript either `to_stdout` or
-/// `send_archive` ever reads (CodeRabbit on #345), regardless of the file's
-/// real size: `pipe-pane` is an append-only file independent of tmux's own
-/// `history-limit` (that one only bounds the in-memory scrollback a client
-/// sees), so a long-running, chatty job's log can grow far past any
-/// configured line bound. Stays comfortably under
-/// [`sandy_fabric_local::link::MAX_FRAME`] (1 MiB) even after this gets
-/// hex-encoded (2x) and wrapped in a `LinkFrame::Archive`'s own JSON
-/// envelope — the tail, not the head, since the most recent output (and the
-/// exit marker `wait_for_exit` already found in it) is what both consumers
-/// actually need.
-const CONSOLE_TAIL_CAP: u64 = 256 * 1024;
+/// [`sandy_guest_template::manifest::default_history_lines`]'s own value,
+/// mirrored here rather than pulled in as a dependency just for one constant
+/// (`sandy-agent` otherwise has no reason to depend on the manifest crate):
+/// the line bound a job gets when the submitter never configured one, and
+/// what [`configured_history_lines`] falls back to on a missing or malformed
+/// `SANDY_HISTORY_LINES`.
+const DEFAULT_HISTORY_LINES: u32 = 10_000;
 
-/// Read at most the last `cap` bytes of `path`, without ever loading more
-/// than that into memory regardless of the file's real size.
-async fn read_tail(path: &std::path::Path, cap: u64) -> std::io::Result<Vec<u8>> {
+/// The env var `history_lines_env` (`sandy-host-executor/src/dispatch.rs`)
+/// sets on `RunSpec.env` for a flake/v1 (VM) dispatch (epic #340 phase 6).
+/// Read directly from this process's own environment rather than threaded
+/// through as a CLI arg: `ProcessBackend` already overlays `spec.env` onto
+/// the `sandy-agent` child it spawns (`impls/local/src/process.rs`), which
+/// is the carrier this reads from, proven directly by
+/// `agent_process.rs::a_configured_history_lines_env_value_bounds_the_captured_console`.
+///
+/// This is NOT yet wired end to end for a real dispatch, honestly: the
+/// `history_lines_env` call site above only exists on `sandy-host-executor`'s
+/// flake/VM branch, whose `RunSpec.env` never reaches a VM guest at all (a
+/// separate, tracked gap, #185-adjacent) — and the process-backend/`argv/v1`
+/// branch passes `env: &[]` unconditionally, since that manifest format has
+/// no `history_lines` field to begin with. So every real M2 dispatch still
+/// gets [`DEFAULT_HISTORY_LINES`] today, regardless of what a submitter
+/// asked for; only this agent-side half of the plumbing is closed here.
+fn configured_history_lines() -> u32 {
+    parse_history_lines(std::env::var("SANDY_HISTORY_LINES").ok())
+}
+
+/// The actual parsing, split out from [`configured_history_lines`] so it's
+/// testable as a pure function: this crate forbids `unsafe_code`
+/// (workspace lint), and mutating process env (`std::env::set_var`) from a
+/// test is unsafe as of Rust 2024 — reading real process env is for
+/// [`configured_history_lines`] alone, never a test.
+fn parse_history_lines(raw: Option<String>) -> u32 {
+    match raw {
+        Some(v) => v.parse().unwrap_or_else(|e| {
+            eprintln!("sandy-agent: SANDY_HISTORY_LINES={v:?} is not a valid u32 ({e}); using the default");
+            DEFAULT_HISTORY_LINES
+        }),
+        None => DEFAULT_HISTORY_LINES,
+    }
+}
+
+/// The largest an archived transcript can be once hex-encoded (2x) and
+/// wrapped in a `LinkFrame::Archive`'s own JSON envelope, while still fitting
+/// under [`sandy_fabric_local::link::MAX_FRAME`] (1 MiB) in one frame —
+/// there is no chunking: `Archive` is defined as one frame, sent once. A
+/// generous fixed reserve covers the envelope's `content_type` field and
+/// JSON punctuation, which is tiny and constant regardless of transcript
+/// size.
+///
+/// A job's *configured* line bound (`history_lines`, default 10,000) can
+/// still exceed this in bytes if its lines run long — this is the safety net
+/// under that case, not a replacement for it: [`read_tail_lines`] applies the
+/// line bound first, and only falls back to trimming further by bytes (from
+/// the same end) if the line-capped result still doesn't fit.
+const ARCHIVE_BYTE_CEILING: usize = (sandy_fabric_local::link::MAX_FRAME - 4096) / 2;
+
+/// Read at most the last `max_lines` lines of `path` (`pipe-pane`'s
+/// transcript — an append-only file independent of tmux's own
+/// `history-limit`, which only bounds a live client's in-memory scrollback,
+/// so a long-running job's log can grow far past any configured line bound),
+/// then, only if that's still more than `max_bytes`, trim further to the
+/// last `max_bytes` of it.
+///
+/// Scans the file backward in fixed-size chunks rather than reading it whole
+/// — a file with billions of lines (or none at all, one giant line) cannot
+/// make this allocate proportionally to the job's entire output.
+async fn read_tail_lines(path: &std::path::Path, max_lines: u32, max_bytes: usize) -> std::io::Result<Vec<u8>> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    const CHUNK: u64 = 64 * 1024;
+    if max_lines == 0 {
+        return Ok(Vec::new());
+    }
+    // However generous `max_lines` is, never scan back further than a small
+    // multiple of the byte ceiling: a file with no newlines at all (or far
+    // too few to ever satisfy `max_lines`) would otherwise make this read
+    // the whole, potentially unbounded file.
+    let scan_ceiling = (max_bytes as u64).saturating_mul(4).max(CHUNK);
+
     let mut file = tokio::fs::File::open(path).await?;
     let len = file.metadata().await?.len();
-    if len > cap {
-        file.seek(std::io::SeekFrom::Start(len - cap)).await?;
+    let mut pos = len;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut newlines: u32 = 0;
+
+    while pos > 0 {
+        let read_len = CHUNK.min(pos);
+        pos -= read_len;
+        file.seek(std::io::SeekFrom::Start(pos)).await?;
+        let mut chunk = vec![0_u8; read_len as usize];
+        file.read_exact(&mut chunk).await?;
+        newlines += u32::try_from(bytecount_newlines(&chunk)).unwrap_or(u32::MAX);
+        chunk.extend_from_slice(&buf);
+        buf = chunk;
+        // Strictly more than `max_lines`, not `>=`: with exactly `max_lines`
+        // newlines in `buf`, the bytes before the first one could still be a
+        // partial line split by this chunk boundary, and there would be no
+        // further newline left to anchor trimming it off — one extra
+        // newline guarantees a real boundary to cut at.
+        if pos == 0 || newlines > max_lines || len - pos >= scan_ceiling {
+            break;
+        }
     }
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf).await?;
+
+    // Keep only the last `max_lines` complete lines. This also drops a
+    // leading partial line when the scan stopped mid-chunk (one `pipe-pane`
+    // flush can split a chunk mid-line) — it's always among the
+    // `lines_in_buf - max_lines` lines counted from the front, so dropping
+    // that many throws it away along with the genuinely excess whole lines,
+    // whether or not the scan happened to also reach the true start of the
+    // file in the same chunk.
+    let lines_in_buf = u32::try_from(bytecount_newlines(&buf)).unwrap_or(u32::MAX);
+    if lines_in_buf > max_lines {
+        let mut remaining_to_drop = lines_in_buf - max_lines;
+        if let Some(cut) = buf.iter().position(|&b| {
+            if b == b'\n' {
+                remaining_to_drop -= 1;
+                remaining_to_drop == 0
+            } else {
+                false
+            }
+        }) {
+            buf.drain(..=cut);
+        }
+    }
+
+    if buf.len() > max_bytes {
+        let start = buf.len() - max_bytes;
+        buf.drain(..start);
+    }
     Ok(buf)
+}
+
+fn bytecount_newlines(buf: &[u8]) -> usize {
+    buf.iter().filter(|&&b| b == b'\n').count()
 }
 
 mod link_source;
@@ -168,7 +279,13 @@ where
     // surviving independent of any one attach connection).
     let peer_socket = peer_dir.as_deref().map(|dir| dir.join(peer::SOCKET_NAME));
     let peer_env = peer_socket.as_deref().map(|socket| (peer::PEER_SOCKET_ENV, socket));
-    let tmux_job = TmuxJob::start(&job, peer_env).map_err(|e| format!("starting the tmux job session: {e}"))?;
+    // #340 phase 6/item 3: the submitter's configured scrollback/transcript
+    // line bound (or the manifest default), read once and reused for both
+    // the live tmux session's own `history-limit` and the archived
+    // transcript's cap below.
+    let history_lines = configured_history_lines();
+    let tmux_job =
+        TmuxJob::start(&job, peer_env, history_lines).map_err(|e| format!("starting the tmux job session: {e}"))?;
     let (pty_read, pty_write, resizer, mut attach_child) = tmux_job
         .open_attach()
         .map_err(|e| format!("opening the attach pty: {e}"))?;
@@ -283,7 +400,7 @@ where
     // `LinkFrame::Exit`'s own absence already means "the agent failed"
     // (INV-11); failing here cleanly, before writing anything more, is
     // exactly that contract, not a new failure mode.
-    match read_tail(tmux_job.log_path(), CONSOLE_TAIL_CAP).await {
+    match read_tail_lines(tmux_job.log_path(), history_lines, ARCHIVE_BYTE_CEILING).await {
         Ok(transcript) => {
             to_stdout(&transcript);
             match tokio::time::timeout(ARCHIVE_SEND_TIMEOUT, agent.send_archive(ARCHIVE_TRANSCRIPT, transcript)).await {
@@ -361,5 +478,143 @@ mod tests {
     fn a_signal_death_maps_to_128_plus_the_signal() {
         assert_eq!(exit_code(ExitStatus::from_raw(7 << 8)), 7);
         assert_eq!(exit_code(ExitStatus::from_raw(9)), 137, "SIGKILL");
+    }
+
+    #[test]
+    fn an_absent_history_lines_value_falls_back_to_the_default() {
+        assert_eq!(parse_history_lines(None), DEFAULT_HISTORY_LINES);
+    }
+
+    #[test]
+    fn a_valid_history_lines_value_is_used_verbatim() {
+        assert_eq!(parse_history_lines(Some("42".to_string())), 42);
+    }
+
+    #[test]
+    fn a_malformed_history_lines_value_falls_back_to_the_default() {
+        assert_eq!(
+            parse_history_lines(Some("not-a-number".to_string())),
+            DEFAULT_HISTORY_LINES
+        );
+    }
+
+    /// Pins [`ARCHIVE_BYTE_CEILING`] against [`sandy_fabric_local::link::MAX_FRAME`]
+    /// directly, rather than trusting the arithmetic in its doc comment: a
+    /// real `Archive` frame carrying exactly the ceiling must still encode
+    /// under the wire limit once hex-encoded and wrapped in its JSON
+    /// envelope.
+    #[tokio::test]
+    async fn an_archive_at_the_byte_ceiling_still_fits_in_one_wire_frame() -> Result<(), Box<dyn std::error::Error>> {
+        use sandy_fabric_local::link::{LinkFrame, write_frame};
+        let frame = LinkFrame::Archive {
+            content_type: ARCHIVE_TRANSCRIPT.to_string(),
+            payload: hex::encode(vec![b'x'; ARCHIVE_BYTE_CEILING]),
+        };
+        let (mut sink, _keep_open) = tokio::io::duplex(sandy_fabric_local::link::MAX_FRAME + 4096);
+        write_frame(&mut sink, &frame).await?;
+        Ok(())
+    }
+
+    async fn write_lines(dir: &tempfile::TempDir, lines: &[&str]) -> std::io::Result<std::path::PathBuf> {
+        let path = dir.path().join("transcript.log");
+        let mut content = lines.join("\n");
+        content.push('\n');
+        tokio::fs::write(&path, content).await?;
+        Ok(path)
+    }
+
+    #[tokio::test]
+    async fn fewer_lines_than_the_cap_are_returned_whole() -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = write_lines(&dir, &["one", "two", "three"]).await?;
+        let tail = read_tail_lines(&path, 10, 1024).await?;
+        assert_eq!(String::from_utf8_lossy(&tail), "one\ntwo\nthree\n");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn more_lines_than_the_cap_keep_only_the_newest() -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let lines: Vec<String> = (0..20).map(|n| format!("line{n}")).collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let path = write_lines(&dir, &refs).await?;
+        let tail = read_tail_lines(&path, 3, 1024).await?;
+        assert_eq!(String::from_utf8_lossy(&tail), "line17\nline18\nline19\n");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_zero_line_cap_returns_nothing() -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = write_lines(&dir, &["one", "two"]).await?;
+        let tail = read_tail_lines(&path, 0, 1024).await?;
+        assert!(tail.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_line_cap_spanning_more_than_one_scan_chunk_still_keeps_only_the_newest() -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        // Each line is ~11 bytes; keeping the last 10,000 of 20,000 such
+        // lines needs well over one 64 KiB backward-scan chunk, so this
+        // exercises the multi-chunk path (a single chunk's own newline count
+        // alone would already satisfy a smaller cap, as in the other test).
+        let lines: Vec<String> = (0..20_000).map(|n| format!("line{n:06}")).collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let path = write_lines(&dir, &refs).await?;
+        let tail = read_tail_lines(&path, 10_000, 1_000_000).await?;
+        let text = String::from_utf8_lossy(&tail);
+        assert_eq!(text.lines().count(), 10_000, "got {} lines", text.lines().count());
+        assert_eq!(text.lines().next(), Some("line010000"));
+        assert_eq!(text.lines().last(), Some("line019999"));
+        Ok(())
+    }
+
+    /// A regression for an off-by-one where the scan could stop with
+    /// exactly `max_lines` newlines in the buffer while the bytes before the
+    /// first one were still a partial line split by the chunk boundary —
+    /// with no further newline left to anchor trimming it off, it leaked
+    /// into the result as a corrupted "line". `max_lines = 6554` is chosen
+    /// so the last 64 KiB scan chunk holds exactly 6,554 newlines: 6,553
+    /// whole lines plus a 6-byte partial fragment (`"03446\n"`, missing its
+    /// `line` prefix) that itself ends in a newline.
+    #[tokio::test]
+    async fn a_result_landing_on_exactly_max_lines_newlines_still_drops_the_leading_partial_line() -> std::io::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let lines: Vec<String> = (0..10_000).map(|n| format!("line{n:05}")).collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let path = write_lines(&dir, &refs).await?;
+        let tail = read_tail_lines(&path, 6554, 1_000_000).await?;
+        let text = String::from_utf8_lossy(&tail);
+        assert_eq!(
+            text.lines().next(),
+            Some("line03446"),
+            "the leading fragment must be dropped, not kept as a corrupted first line: {text:?}"
+        );
+        assert_eq!(text.lines().count(), 6554, "got {} lines", text.lines().count());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_line_capped_result_still_over_the_byte_ceiling_is_trimmed_further() -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let long_lines = ["a".repeat(100), "b".repeat(100), "c".repeat(100)];
+        let refs: Vec<&str> = long_lines.iter().map(String::as_str).collect();
+        let path = write_lines(&dir, &refs).await?;
+        // All 3 lines fit the line cap, but not the tiny byte ceiling.
+        let tail = read_tail_lines(&path, 10, 50).await?;
+        assert!(
+            tail.len() <= 50,
+            "got {} bytes: {:?}",
+            tail.len(),
+            String::from_utf8_lossy(&tail)
+        );
+        assert!(
+            !tail.contains(&b'a') && !tail.contains(&b'b'),
+            "the byte trim must keep the tail (most recent) end, not the oldest lines: {:?}",
+            String::from_utf8_lossy(&tail)
+        );
+        Ok(())
     }
 }

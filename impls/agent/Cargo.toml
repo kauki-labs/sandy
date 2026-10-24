@@ -48,6 +48,7 @@ tokio-vsock.workspace = true
 anyhow.workspace = true
 base64.workspace = true
 futures-util.workspace = true
+hex.workspace = true
 sandy-api.workspace = true
 sandy-fabric.workspace = true
 sandy-impls-local.workspace = true

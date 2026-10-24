@@ -217,6 +217,12 @@ impl JobStore {
         // both degrade to the existing per-connection `session_matches`
         // gate for that one job, never a fabricated or default token.
         ensure_column(&conn, "attach_token", "ALTER TABLE jobs ADD COLUMN attach_token BLOB")?;
+        // The durable archived transcript (#340 item 4): NULL until
+        // `set_archive` is called, which happens only once the agent's own
+        // one-shot `ARCHIVE_TRANSCRIPT` post is actually observed — never
+        // backfilled or guessed at for a job submitted before this column
+        // existed.
+        ensure_column(&conn, "archive", "ALTER TABLE jobs ADD COLUMN archive BLOB")?;
         Ok(Self {
             conn: Mutex::new(conn),
             max_rows: None,
@@ -303,6 +309,42 @@ impl JobStore {
                 row.get::<_, Option<Vec<u8>>>(0)
             }) {
             Ok(token) => Ok(token),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Persist `job_id`'s archived transcript (#340 item 4), overwriting
+    /// whatever was there before. Not status-gated like [`JobStore::finish`]:
+    /// the agent's one-shot archive post can arrive before OR after the
+    /// terminal status update reaches this store (they travel over
+    /// independent paths — the channel vs. `host_conn`'s own result
+    /// reporting), so refusing one order would just as easily drop the other.
+    /// A no-op (not an error) if `job_id` has no row.
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] if the write fails.
+    pub fn set_archive(&self, job_id: &str, archive: &[u8]) -> Result<(), StoreError> {
+        self.lock()
+            .execute("UPDATE jobs SET archive = ?1 WHERE job_id = ?2", (archive, job_id))?;
+        Ok(())
+    }
+
+    /// `job_id`'s archived transcript (#340 item 4), if one was ever
+    /// persisted. `None` for an unknown job id, one submitted before this
+    /// column existed, or one whose agent never posted an archive (or did,
+    /// but [`crate::dispatch::persist_archive_when_posted`] hadn't yet
+    /// observed it, or gave up after its own wait bound).
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] if the read fails.
+    pub fn archive(&self, job_id: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        match self
+            .lock()
+            .query_row("SELECT archive FROM jobs WHERE job_id = ?1", [job_id], |row| {
+                row.get::<_, Option<Vec<u8>>>(0)
+            }) {
+            Ok(archive) => Ok(archive),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
@@ -553,6 +595,57 @@ mod tests {
     fn attach_token_of_an_unknown_job_is_none_not_an_error() -> Result<(), StoreError> {
         let store = JobStore::open_in_memory()?;
         assert_eq!(store.attach_token("does-not-exist")?, None);
+        Ok(())
+    }
+
+    /// Positive (#340 item 4): an archive set after insert round-trips back
+    /// for the same job id.
+    #[test]
+    fn an_archive_round_trips() -> Result<(), StoreError> {
+        let store = JobStore::open_in_memory()?;
+        store.insert_pending("job-1", b"manifest-bytes", "test/v1")?;
+        store.set_archive("job-1", b"the whole transcript")?;
+
+        assert_eq!(store.archive("job-1")?, Some(b"the whole transcript".to_vec()));
+        Ok(())
+    }
+
+    /// Adversarial (#340 item 4): a job with no archive ever set (nobody
+    /// posted one, or a row from before this column existed) reads back
+    /// `None`, never a fabricated or empty-but-present value.
+    #[test]
+    fn a_job_with_no_archive_set_reads_back_none() -> Result<(), StoreError> {
+        let store = JobStore::open_in_memory()?;
+        store.insert_pending("job-1", b"manifest-bytes", "test/v1")?;
+        assert_eq!(store.archive("job-1")?, None);
+        Ok(())
+    }
+
+    /// Adversarial (#340 item 4): an unknown job id reads back `None`, not an
+    /// error.
+    #[test]
+    fn archive_of_an_unknown_job_is_none_not_an_error() -> Result<(), StoreError> {
+        let store = JobStore::open_in_memory()?;
+        assert_eq!(store.archive("does-not-exist")?, None);
+        Ok(())
+    }
+
+    /// The actual durability claim (#340 item 4): an archive set before the
+    /// store is dropped and reopened from the same file is still there —
+    /// proving it survives a sandyd restart, not just the lifetime of one
+    /// `JobStore` value (`open_in_memory`'s own round trip above cannot tell
+    /// those apart).
+    #[test]
+    fn an_archive_survives_closing_and_reopening_the_store_file() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db_path = tmp.path().join("sandyd.db");
+        {
+            let store = JobStore::open(&db_path)?;
+            store.insert_pending("job-1", b"m", "test/v1")?;
+            store.set_archive("job-1", b"the whole transcript")?;
+        }
+        let reopened = JobStore::open(&db_path)?;
+        assert_eq!(reopened.archive("job-1")?, Some(b"the whole transcript".to_vec()));
         Ok(())
     }
 
