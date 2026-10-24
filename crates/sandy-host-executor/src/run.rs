@@ -178,10 +178,19 @@ pub enum DispatchLoopExit {
 /// - a shared stopping flag is set so the worker skips any dispatch still sitting in its queue, unstarted, rather than
 ///   beginning it: a job that hasn't started yet can never receive the `AttachStateChanged` frames its own execution
 ///   might need either, for the same reason.
+/// - on an ordinary requested [`DispatchLoopExit::Shutdown`] specifically — never on `Closed`/`Faulted` — every job
+///   still running also has `cancel()` called on its `RunControl` (#300). `systemctl stop` sends SIGTERM here and
+///   SIGKILLs the whole process after `TimeoutStopSec`, which is shorter than a job's own up-to-`STAGE1_TIMEOUT_SECS`
+///   budget; without an explicit cancel a still-running job's sandbox (reparented under `user@<uid>.service` by design,
+///   see `nix/modules/sandy-executor.nix`) would be killed out from under this process with no clean teardown, left
+///   running with nothing left tracking it. `Closed`/`Faulted` don't cancel: nothing is racing a systemd kill there —
+///   this process keeps running and `main.rs` lets the drain finish on its own time before exiting non-zero for the
+///   supervisor to restart it (decision 12), so cutting a job short there would only lose work for no benefit.
 ///
 /// A dispatch already in flight when the loop ends is left to finish (respecting its own, possibly now-grace-bounded
-/// deadline) rather than skipped, so its result is still reported if there's anywhere left to report it to, and
-/// `main.rs`'s "exit non-zero, let the supervisor restart" contract only fires once nothing is still running.
+/// or now-cancelled deadline) rather than skipped, so its result is still reported if there's anywhere left to report
+/// it to, and `main.rs`'s "exit non-zero, let the supervisor restart" contract only fires once nothing is still
+/// running.
 pub async fn run_dispatch_loop<F, Fut>(
     conn: &mut (impl AsyncRead + AsyncWrite + Unpin + Send),
     handle: F,
@@ -393,6 +402,14 @@ where
         for control in controls.values() {
             if control.deadline().is_none() {
                 control.set_deadline(grace_deadline);
+            }
+            // #300: an explicit requested shutdown asks every still-running
+            // job to actually stop, not just run out its (possibly
+            // grace-bounded) deadline while `TimeoutStopSec` counts down
+            // underneath it — see this function's own doc above for why
+            // `Closed`/`Faulted` deliberately don't cancel.
+            if exit == DispatchLoopExit::Shutdown {
+                control.cancel();
             }
         }
     }
@@ -1103,6 +1120,181 @@ mod tests {
             "job-2 must never be handled: it was still queued, unstarted, once shutdown ended the read loop"
         );
         drop(server);
+        Ok(())
+    }
+
+    /// Fix (#300): `systemctl stop sandy-executor` sends SIGTERM and SIGKILLs
+    /// the whole process after `TimeoutStopSec` — shorter than a job's own
+    /// up-to-`STAGE1_TIMEOUT_SECS` budget — so a requested shutdown must give
+    /// a still-running job's `RunControl` a real `cancel()`, not just a
+    /// bounded deadline: a backend's run loop polls `is_cancelled()` on every
+    /// tick (far more often than it checks a deadline), so cancelling tears
+    /// the job down fast instead of leaving its sandbox to be killed out from
+    /// under it with no clean teardown (the orphan this issue is about).
+    #[tokio::test]
+    async fn shutdown_cancels_every_still_running_jobs_run_control() -> anyhow::Result<()> {
+        let (mut client, mut server) = tokio::io::duplex(8192);
+
+        write_frame(
+            &mut server,
+            &OrchestratorMessage {
+                op: Some(orchestrator_message::Op::Dispatch(Dispatch {
+                    job_id: "job-1".to_owned(),
+                    manifest: Vec::new(),
+                    manifest_encoding: String::new(),
+                    backend: SandboxKind::Process.into(),
+                    link_token: vec![0u8; 32],
+                    forward_back: "127.0.0.1:9000".to_owned(),
+                    required_isolation_class: IsolationClass::Trusted.into(),
+                })),
+            },
+        )
+        .await?;
+
+        let captured_control: Arc<Mutex<Option<RunControl>>> = Arc::new(Mutex::new(None));
+        let captured_control_in_loop = Arc::clone(&captured_control);
+        let job1_started = Arc::new(tokio::sync::Notify::new());
+        let job1_started_in_loop = Arc::clone(&job1_started);
+        let release_job1 = Arc::new(tokio::sync::Notify::new());
+        let release_job1_in_loop = Arc::clone(&release_job1);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let loop_task = tokio::spawn(async move {
+            run_dispatch_loop(
+                &mut client,
+                move |_dispatch, control| {
+                    let captured_control = Arc::clone(&captured_control_in_loop);
+                    let job1_started = Arc::clone(&job1_started_in_loop);
+                    let release_job1 = Arc::clone(&release_job1_in_loop);
+                    async move {
+                        *captured_control
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(control.clone());
+                        job1_started.notify_one();
+                        release_job1.notified().await;
+                        None::<HostExecutorMessage>
+                    }
+                },
+                async {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), job1_started.notified())
+            .await
+            .context("job-1's handle never started")?;
+
+        let _ = shutdown_tx.send(());
+        // Gives the now-broken-out select loop time to run the fail-safe
+        // (synchronous, no further awaits of its own) before this checks
+        // job-1's captured control below.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let cancelled = captured_control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .expect("job-1's control was captured")
+            .is_cancelled();
+        assert!(
+            cancelled,
+            "an explicit requested shutdown must cancel a still-running job's RunControl"
+        );
+
+        release_job1.notify_one();
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(2), loop_task)
+            .await
+            .context("dispatch loop did not end after job-1 was released")?
+            .context("dispatch loop task panicked")?;
+        assert_eq!(exit, DispatchLoopExit::Shutdown);
+        drop(server);
+        Ok(())
+    }
+
+    /// A lost connection (`Closed`) must NOT cancel a still-running job:
+    /// nothing is racing a systemd kill in that case — `main.rs` lets the
+    /// drain finish on its own time before exiting non-zero for its
+    /// supervisor to restart it (decision 12). Only an explicit, requested
+    /// [`DispatchLoopExit::Shutdown`] does (#300) — this pins that scoping
+    /// decision so it can't silently drift to cancelling on every exit.
+    #[tokio::test]
+    async fn a_closed_connection_does_not_cancel_a_still_running_job() -> anyhow::Result<()> {
+        let (mut client, mut server) = tokio::io::duplex(8192);
+
+        write_frame(
+            &mut server,
+            &OrchestratorMessage {
+                op: Some(orchestrator_message::Op::Dispatch(Dispatch {
+                    job_id: "job-1".to_owned(),
+                    manifest: Vec::new(),
+                    manifest_encoding: String::new(),
+                    backend: SandboxKind::Process.into(),
+                    link_token: vec![0u8; 32],
+                    forward_back: "127.0.0.1:9000".to_owned(),
+                    required_isolation_class: IsolationClass::Trusted.into(),
+                })),
+            },
+        )
+        .await?;
+
+        let captured_control: Arc<Mutex<Option<RunControl>>> = Arc::new(Mutex::new(None));
+        let captured_control_in_loop = Arc::clone(&captured_control);
+        let job1_started = Arc::new(tokio::sync::Notify::new());
+        let job1_started_in_loop = Arc::clone(&job1_started);
+        let release_job1 = Arc::new(tokio::sync::Notify::new());
+        let release_job1_in_loop = Arc::clone(&release_job1);
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let loop_task = tokio::spawn(async move {
+            run_dispatch_loop(
+                &mut client,
+                move |_dispatch, control| {
+                    let captured_control = Arc::clone(&captured_control_in_loop);
+                    let job1_started = Arc::clone(&job1_started_in_loop);
+                    let release_job1 = Arc::clone(&release_job1_in_loop);
+                    async move {
+                        *captured_control
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(control.clone());
+                        job1_started.notify_one();
+                        release_job1.notified().await;
+                        None::<HostExecutorMessage>
+                    }
+                },
+                async {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), job1_started.notified())
+            .await
+            .context("job-1's handle never started")?;
+
+        drop(server); // the orchestrator disconnects instead of a requested shutdown
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let cancelled = captured_control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .expect("job-1's control was captured")
+            .is_cancelled();
+        assert!(
+            !cancelled,
+            "a Closed connection must not cancel a still-running job — only an explicit Shutdown does"
+        );
+
+        release_job1.notify_one();
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(2), loop_task)
+            .await
+            .context("dispatch loop did not end after job-1 was released")?
+            .context("dispatch loop task panicked")?;
+        assert_eq!(exit, DispatchLoopExit::Closed);
         Ok(())
     }
 
