@@ -306,12 +306,14 @@ in
         # shutdown fail-safe's own teardown once a job ends — covers
         # `impls/local`'s longest per-run grace period (`VERDICT_GRACE` =
         # 10s, agent mode's wait for the relay's verdict) plus reaping,
-        # console-drain, and staging wipe, with headroom to spare. A
-        # VM-backed job ignores `cancel()` today (a known gap, not addressed
-        # by this change — see docs/decisions/sandyd.md §14's "Follow-up
-        # (#300)") and so still runs to this same `STAGE1_TIMEOUT_SECS`
-        # budget regardless of shutdown, which this value already covers.
-        # Keep in sync with `STAGE1_TIMEOUT_SECS` if that constant changes.
+        # console-drain, and staging wipe, with headroom to spare. Both
+        # backends now pick up cancellation promptly on shutdown (the
+        # process backend within its 10ms poll tick, a VM backend within its
+        # ~250ms poll tick, #185/#340 phase 5 — see
+        # docs/decisions/sandyd.md's VM `RunControl` decision), so this
+        # value is generous headroom rather than a strict necessity either
+        # way. Keep in sync with `STAGE1_TIMEOUT_SECS` if that constant
+        # changes.
         TimeoutStopSec = "330s";
 
         # Least privilege around the host-executor process itself; the
