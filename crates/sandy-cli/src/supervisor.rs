@@ -15,7 +15,7 @@ use std::{
 };
 
 use sandy::{
-    BackendError, Classification, CoreError, CredentialProvider, EgressApplier, EgressOs, EgressOutcome,
+    BackendError, CALL_DEADLINE, Classification, CoreError, CredentialProvider, EgressApplier, EgressOs, EgressOutcome,
     JOURNAL_SCHEMA_VERSION, JobRecord, JobState, Journal, Lease, Logs, MAX_TTL_SECS, Outcome, OutputRef, OutputStatus,
     ProcessExit, Profile, Provenance, RESULT_SCHEMA_VERSION, ResultEnvelope, Scope, SecretSource, StagedImage, Status,
     VmBackend, classify_backend_error, classify_invalid_plan, classify_outcome, enforce, mint_lease, new_job_id,
@@ -440,6 +440,7 @@ pub fn run_job_with_credential<
     let tick = safe_heartbeat_tick(
         refresh_interval("SANDY_REFRESH_TICK_SECS", DEFAULT_REFRESH_TICK_SECS),
         MAX_TTL_SECS,
+        CALL_DEADLINE,
     );
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
 
@@ -615,9 +616,11 @@ pub const DEFAULT_REFRESH_MARGIN_SECS: u64 = 300;
 /// Default interval between refresh checks while a credentialed job runs (60s).
 pub const DEFAULT_REFRESH_TICK_SECS: u64 = 60;
 // #195: `safe_heartbeat_tick`'s fallback relies on this default staying well
-// below `MAX_TTL_SECS`; enforced at compile time so a future bump of either
-// constant can't silently reopen the gap the heartbeat exists to close.
-const _: () = assert!(DEFAULT_REFRESH_TICK_SECS < MAX_TTL_SECS as u64);
+// below `MAX_TTL_SECS - CALL_DEADLINE` (the real sweep margin, not
+// `MAX_TTL_SECS` alone); enforced at compile time so a future bump of any of
+// the three constants can't silently reopen the gap the heartbeat exists to
+// close.
+const _: () = assert!(DEFAULT_REFRESH_TICK_SECS < MAX_TTL_SECS as u64 - CALL_DEADLINE.as_secs());
 
 /// Read a refresh interval (seconds) from `env_key`, falling back to `default`. The
 /// tick is floored at 1s so a misconfigured `0` can't spin the poll loop.
@@ -637,19 +640,26 @@ fn touch_dir_mtime(dir: &Path) -> std::io::Result<()> {
 }
 
 /// Clamp `tick` so the mid-run heartbeat can never tick slower than [`gc`]'s
-/// stale-dir sweep threshold (#195): a
-/// `SANDY_REFRESH_TICK_SECS` at or above `max_ttl_secs` would let a live
-/// job's cred dir go stale between heartbeats and get swept out from under
-/// it, so a tick that reaches the threshold is never honored — it falls back
-/// to [`DEFAULT_REFRESH_TICK_SECS`], which is safe by construction (well
-/// below any reasonable `MAX_TTL_SECS`).
-fn safe_heartbeat_tick(tick: Duration, max_ttl_secs: u32) -> Duration {
-    if tick.as_secs() >= u64::from(max_ttl_secs) {
+/// stale-dir sweep threshold (#195), with margin left for one stalled
+/// adapter call: a `SANDY_REFRESH_TICK_SECS` at or above
+/// `max_ttl_secs - call_deadline` would let a live job's cred dir go stale
+/// between heartbeats and get swept out from under it (the gap between two
+/// heartbeats is the tick plus however long the adapter call in between can
+/// stall, up to `call_deadline`), so a tick that reaches that margin is
+/// never honored: it falls back to [`DEFAULT_REFRESH_TICK_SECS`], which is
+/// safe by construction (well below any reasonable `MAX_TTL_SECS`). Capping
+/// against `max_ttl_secs` alone, without `call_deadline`, left a gap: a tick
+/// configured near that uncapped ceiling plus one stalled call could still
+/// exceed the sweep threshold (decision 6).
+fn safe_heartbeat_tick(tick: Duration, max_ttl_secs: u32, call_deadline: Duration) -> Duration {
+    let threshold = u64::from(max_ttl_secs).saturating_sub(call_deadline.as_secs());
+    if tick.as_secs() >= threshold {
         tracing::warn!(
             configured_secs = tick.as_secs(),
             max_ttl_secs,
-            "SANDY_REFRESH_TICK_SECS reaches MAX_TTL_SECS; falling back to the default tick so gc's stale-dir sweep \
-             can never outrun the heartbeat"
+            call_deadline_secs = call_deadline.as_secs(),
+            "SANDY_REFRESH_TICK_SECS reaches MAX_TTL_SECS minus the adapter call deadline; falling back to the \
+             default tick so gc's stale-dir sweep can never outrun the heartbeat plus one stalled call"
         );
         Duration::from_secs(DEFAULT_REFRESH_TICK_SECS)
     } else {
@@ -798,14 +808,24 @@ pub fn kill<B: VmBackend>(journal: &Journal, backend: &B, job_id: &str) -> Resul
     Ok(cancelled)
 }
 
+/// [`gc`]'s result: evicted job ids and swept staging-dir names, kept apart
+/// (#195). `evicted` holds job ids only, so a consumer passing its entries to
+/// `status`/`wait` never receives a staging-dir name, and the plain-text
+/// "evicted N record(s)" count never counts a directory as a record.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct GcReport {
+    /// Job ids evicted under the keep-last-N + referenced policy.
+    pub evicted: Vec<String>,
+    /// Names of any `cred-*`/`verify-*` staging dirs swept past `MAX_TTL_SECS`.
+    pub swept_staging_dirs: Vec<String>,
+}
+
 /// Garbage-collect terminal job records under the keep-last-N + referenced
 /// policy, then best-effort sweep any `cred-*`/`verify-*` credential staging
 /// dir left behind under the sandy staging base past its mint TTL (#195: a
 /// drop guard normally removes one on every exit path, but SIGKILL or a crash
 /// before it runs can leave one behind holding a live token). A still-
 /// `Running` job is referenced and never evicted, even when it is oldest.
-/// Returns the evicted job ids followed by the names of any swept staging
-/// dirs.
 ///
 /// The staging sweep is independent of record eviction and never fails this
 /// call: an unreadable or unsafe staging base is logged and skipped rather
@@ -814,12 +834,15 @@ pub fn kill<B: VmBackend>(journal: &Journal, backend: &B, job_id: &str) -> Resul
 /// # Errors
 ///
 /// Returns [`CoreError`] on journal I/O failure.
-pub fn gc(journal: &Journal, keep_last_n: usize) -> Result<Vec<String>, CoreError> {
+pub fn gc(journal: &Journal, keep_last_n: usize) -> Result<GcReport, CoreError> {
     match sandy_fsutil::ensure_sandy_staging_base() {
         Ok(base) => gc_against(journal, keep_last_n, &base),
         Err(e) => {
             tracing::warn!(%e, "gc: could not validate the sandy staging base; skipping the stale credential dir sweep");
-            gc_records(journal, keep_last_n)
+            Ok(GcReport {
+                evicted: gc_records(journal, keep_last_n)?,
+                swept_staging_dirs: Vec::new(),
+            })
         }
     }
 }
@@ -828,15 +851,17 @@ pub fn gc(journal: &Journal, keep_last_n: usize) -> Result<Vec<String>, CoreErro
 /// terminal records, then sweep stale staging dirs under it. [`gc`] calls this
 /// with the real sandy-owned staging base; tests call it with an injected temp
 /// dir instead.
-fn gc_against(journal: &Journal, keep_last_n: usize, staging_base: &Path) -> Result<Vec<String>, CoreError> {
-    let mut evicted = gc_records(journal, keep_last_n)?;
-    evicted.extend(sweep_stale_cred_dirs(staging_base));
-    Ok(evicted)
+fn gc_against(journal: &Journal, keep_last_n: usize, staging_base: &Path) -> Result<GcReport, CoreError> {
+    let evicted = gc_records(journal, keep_last_n)?;
+    Ok(GcReport {
+        evicted,
+        swept_staging_dirs: sweep_stale_cred_dirs(staging_base),
+    })
 }
 
-/// Evict terminal job records under the keep-last-N + referenced policy (the
-/// policy half of [`gc`], split out so it runs — and can be tested —
-/// independently of the staging-dir sweep).
+/// Evict terminal job records under the keep-last-N + referenced policy, the
+/// policy half of [`gc`]. Split out so it runs, and can be tested,
+/// independently of the staging-dir sweep.
 fn gc_records(journal: &Journal, keep_last_n: usize) -> Result<Vec<String>, CoreError> {
     let records = journal.list()?;
 
@@ -1189,10 +1214,11 @@ mod tests {
         Ok(())
     }
 
-    /// A tick safely below `MAX_TTL_SECS` passes through unchanged.
+    /// A tick safely below `MAX_TTL_SECS - call_deadline` passes through
+    /// unchanged.
     #[test]
     fn safe_heartbeat_tick_passes_through_a_safe_tick() {
-        let tick = super::safe_heartbeat_tick(Duration::from_secs(60), 3000);
+        let tick = super::safe_heartbeat_tick(Duration::from_secs(60), 3000, Duration::from_secs(1500));
         assert_eq!(tick, Duration::from_secs(60));
     }
 
@@ -1201,15 +1227,38 @@ mod tests {
     /// under it, so it must never be honored as-is.
     #[test]
     fn safe_heartbeat_tick_falls_back_when_the_tick_reaches_max_ttl_secs() {
-        let tick = super::safe_heartbeat_tick(Duration::from_secs(3000), 3000);
+        let tick = super::safe_heartbeat_tick(Duration::from_secs(3000), 3000, Duration::from_secs(1500));
         assert_eq!(tick, Duration::from_secs(super::DEFAULT_REFRESH_TICK_SECS));
     }
 
     /// As above, for a tick that exceeds (not just reaches) the threshold.
     #[test]
     fn safe_heartbeat_tick_falls_back_when_the_tick_exceeds_max_ttl_secs() {
-        let tick = super::safe_heartbeat_tick(Duration::from_secs(3_600_000), 3000);
+        let tick = super::safe_heartbeat_tick(Duration::from_secs(3_600_000), 3000, Duration::from_secs(1500));
         assert_eq!(tick, Duration::from_secs(super::DEFAULT_REFRESH_TICK_SECS));
+    }
+
+    /// #195 follow-up (CodeRabbit, PR #352): before this fix, `safe_heartbeat_tick`
+    /// only capped against `max_ttl_secs`, so a tick at `max_ttl_secs -
+    /// call_deadline` (the real margin: the heartbeat gap is the tick plus up
+    /// to one stalled adapter call) was wrongly accepted, leaving no margin
+    /// for that stalled call. Must now fall back.
+    #[test]
+    fn safe_heartbeat_tick_falls_back_at_max_ttl_secs_minus_call_deadline() {
+        let tick = super::safe_heartbeat_tick(Duration::from_secs(1500), 3000, Duration::from_secs(1500));
+        assert_eq!(
+            tick,
+            Duration::from_secs(super::DEFAULT_REFRESH_TICK_SECS),
+            "a tick at max_ttl_secs - call_deadline leaves no margin for a stalled call and must fall back"
+        );
+    }
+
+    /// As above, the boundary just below the real margin: still safe, passes
+    /// through unchanged.
+    #[test]
+    fn safe_heartbeat_tick_passes_through_just_below_max_ttl_secs_minus_call_deadline() {
+        let tick = super::safe_heartbeat_tick(Duration::from_secs(1499), 3000, Duration::from_secs(1500));
+        assert_eq!(tick, Duration::from_secs(1499));
     }
 
     /// `refresh_loop` refreshes the credential on each tick while the job runs and
@@ -1263,7 +1312,7 @@ mod tests {
 
     /// #195: `refresh_loop` must heartbeat the cred dir's mtime every tick even
     /// when no refresh actually fires (the margin is far smaller than the
-    /// lease's TTL, so `should_refresh` never trips here — proven by asserting
+    /// lease's TTL, so `should_refresh` never trips here: proven by asserting
     /// nothing was revoked). Without the heartbeat, a long-running job whose
     /// provider TTL outlasts `gc`'s `MAX_TTL_SECS` sweep window would have its
     /// live credential dir deleted out from under it.
@@ -1409,11 +1458,17 @@ mod tests {
         std::fs::create_dir(&stale).context("create stale cred dir")?;
         set_mtime_age(&stale, Duration::from_secs(u64::from(MAX_TTL_SECS) + 60))?;
 
-        let evicted = gc_against(&journal, 20, &staging_base).context("gc")?;
+        let report = gc_against(&journal, 20, &staging_base).context("gc")?;
 
         assert!(
-            evicted.contains(&"cred-deadbeef".to_string()),
-            "a stale cred dir past MAX_TTL_SECS must be swept: {evicted:?}"
+            report.swept_staging_dirs.contains(&"cred-deadbeef".to_string()),
+            "a stale cred dir past MAX_TTL_SECS must be swept: {:?}",
+            report.swept_staging_dirs
+        );
+        assert!(
+            report.evicted.is_empty(),
+            "a swept staging dir must never appear in the evicted job-id list: {:?}",
+            report.evicted
         );
         assert!(!stale.exists(), "the stale cred dir must be removed");
         Ok(())
@@ -1430,11 +1485,12 @@ mod tests {
         let fresh = staging_base.join("verify-cafef00d");
         std::fs::create_dir(&fresh).context("create fresh verify dir")?;
 
-        let evicted = gc_against(&journal, 20, &staging_base).context("gc")?;
+        let report = gc_against(&journal, 20, &staging_base).context("gc")?;
 
         assert!(
-            !evicted.contains(&"verify-cafef00d".to_string()),
-            "a fresh verify dir must not be swept: {evicted:?}"
+            !report.swept_staging_dirs.contains(&"verify-cafef00d".to_string()),
+            "a fresh verify dir must not be swept: {:?}",
+            report.swept_staging_dirs
         );
         assert!(fresh.exists(), "the fresh verify dir must survive");
         Ok(())

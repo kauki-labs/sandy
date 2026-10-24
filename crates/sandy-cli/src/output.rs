@@ -16,6 +16,8 @@ use clap::ValueEnum;
 use sandy::{JobRecord, ResultEnvelope};
 use sandy_control_proto::{AttachResponse, JobStatus, JobSummary, ListResponse, StatusResponse, SubmitResponse};
 
+use crate::supervisor::GcReport;
+
 /// Which representation the CLI prints on stdout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub enum OutputFormat {
@@ -94,16 +96,23 @@ pub fn format_envelope(envelope: &ResultEnvelope, format: OutputFormat) -> serde
 /// # Errors
 ///
 /// Returns a [`serde_json::Error`] only if JSON serialization fails.
-pub fn format_gc(evicted: &[String], format: OutputFormat) -> serde_json::Result<String> {
+pub fn format_gc(report: &GcReport, format: OutputFormat) -> serde_json::Result<String> {
     match format {
         OutputFormat::Plain => {
-            let mut out = format!("gc: evicted {} record(s)", evicted.len());
-            for id in evicted {
+            let mut out = format!("gc: evicted {} record(s)", report.evicted.len());
+            for id in &report.evicted {
                 let _ = write!(out, "\n  {id}");
+            }
+            let _ = write!(out, "\ngc: swept {} staging dir(s)", report.swept_staging_dirs.len());
+            for name in &report.swept_staging_dirs {
+                let _ = write!(out, "\n  {name}");
             }
             Ok(out)
         }
-        OutputFormat::Json => serde_json::to_string_pretty(&serde_json::json!({ "evicted": evicted })),
+        OutputFormat::Json => serde_json::to_string_pretty(&serde_json::json!({
+            "evicted": report.evicted,
+            "swept_staging_dirs": report.swept_staging_dirs,
+        })),
     }
 }
 
@@ -251,7 +260,7 @@ mod tests {
     use sandy_control_proto::{AttachResponse, JobStatus, JobSummary, ListResponse, StatusResponse, SubmitResponse};
 
     use super::{
-        OutputFormat, format_attach, format_cancel, format_doctor, format_envelope, format_gc, format_list,
+        GcReport, OutputFormat, format_attach, format_cancel, format_doctor, format_envelope, format_gc, format_list,
         format_record, format_records, format_status, format_submit,
     };
 
@@ -391,13 +400,62 @@ mod tests {
 
     #[test]
     fn gc_json_carries_the_evicted_ids() -> anyhow::Result<()> {
-        let json = format_gc(&["x".to_string(), "y".to_string()], OutputFormat::Json).context("format gc json")?;
+        let report = GcReport {
+            evicted: vec!["x".to_string(), "y".to_string()],
+            swept_staging_dirs: Vec::new(),
+        };
+        let json = format_gc(&report, OutputFormat::Json).context("format gc json")?;
         let parsed: serde_json::Value = serde_json::from_str(&json).context("parse gc json")?;
         let evicted = parsed
             .get("evicted")
             .and_then(|v| v.as_array())
             .context("gc json must have an `evicted` array")?;
         assert_eq!(evicted.len(), 2);
+        Ok(())
+    }
+
+    /// #195 follow-up: a swept staging-dir name must never land in the
+    /// `evicted` key (a JSON consumer may pass that key's entries to
+    /// `status`/`wait`, which expect job ids only), and must appear under its
+    /// own `swept_staging_dirs` key instead.
+    #[test]
+    fn gc_json_keeps_swept_staging_dirs_out_of_evicted() -> anyhow::Result<()> {
+        let report = GcReport {
+            evicted: vec!["job-a".to_string()],
+            swept_staging_dirs: vec!["cred-deadbeef".to_string()],
+        };
+        let json = format_gc(&report, OutputFormat::Json).context("format gc json")?;
+        let parsed: serde_json::Value = serde_json::from_str(&json).context("parse gc json")?;
+        let evicted = parsed
+            .get("evicted")
+            .and_then(|v| v.as_array())
+            .context("gc json must have an `evicted` array")?;
+        assert_eq!(evicted, &vec![serde_json::Value::String("job-a".to_string())]);
+        let swept = parsed
+            .get("swept_staging_dirs")
+            .and_then(|v| v.as_array())
+            .context("gc json must have a `swept_staging_dirs` array")?;
+        assert_eq!(swept, &vec![serde_json::Value::String("cred-deadbeef".to_string())]);
+        Ok(())
+    }
+
+    /// The plain-text "evicted N record(s)" count must count job ids only,
+    /// never a swept staging-dir name (#195 follow-up).
+    #[test]
+    fn gc_plain_text_evicted_count_excludes_swept_staging_dirs() -> anyhow::Result<()> {
+        let report = GcReport {
+            evicted: Vec::new(),
+            swept_staging_dirs: vec!["cred-deadbeef".to_string()],
+        };
+        let plain = format_gc(&report, OutputFormat::Plain).context("format gc plain")?;
+        assert!(
+            plain.contains("evicted 0 record(s)"),
+            "a swept staging dir must not inflate the evicted-record count: {plain}"
+        );
+        assert!(
+            plain.contains("swept 1 staging dir(s)"),
+            "the swept-dir count must be reported separately: {plain}"
+        );
         Ok(())
     }
 

@@ -56,7 +56,13 @@ const GITHUB_TOKEN_TTL: Duration = Duration::from_secs(3600);
 /// timeout per attempt, also means a connection that keeps resetting a
 /// per-read timeout by trickling bytes still can't outlast it, wherever in
 /// the connect/read/retry sequence the stall happens.
-const CALL_DEADLINE: Duration = Duration::from_secs((MAX_TTL_SECS / 2) as u64);
+///
+/// Exported through the facade so `sandy-cli`'s `safe_heartbeat_tick` can cap
+/// a configured heartbeat tick against `MAX_TTL_SECS - CALL_DEADLINE` rather
+/// than `MAX_TTL_SECS` directly, closing the gap where a tick near the
+/// uncapped ceiling plus one stalled call could still exceed `gc`'s sweep
+/// threshold.
+pub const CALL_DEADLINE: Duration = Duration::from_secs((MAX_TTL_SECS / 2) as u64);
 
 /// Run `fut` under `deadline`, the single wall-clock bound for one adapter
 /// call (see [`CALL_DEADLINE`]). If `fut` doesn't finish in time,

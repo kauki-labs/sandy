@@ -1029,7 +1029,7 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
             }
         }
         Command::Gc { keep_last } => match supervisor::gc(&journal, keep_last) {
-            Ok(evicted) => succeed_or(emit(format_gc(&evicted, output))),
+            Ok(report) => succeed_or(emit(format_gc(&report, output))),
             Err(e) => report_error(&e),
         },
     }

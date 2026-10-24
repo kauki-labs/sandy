@@ -142,9 +142,10 @@ long would otherwise look abandoned. The refresh loop therefore heartbeats
 `cred_dir`'s mtime every tick, independent of whether a refresh fires; a
 `kill -9`'d process stops ticking, so a genuinely leaked dir still ages out
 and gets swept. `safe_heartbeat_tick` refuses a `SANDY_REFRESH_TICK_SECS` at
-or above `MAX_TTL_SECS` and falls back to the 60s default, bounding the tick
-itself; whether that bound also keeps a stalled refresh call from reopening
-the gap is a separate question the Consequences below addresses. The sweep is
+or above `MAX_TTL_SECS - CALL_DEADLINE` and falls back to the 60s default,
+leaving margin for one stalled adapter call between heartbeats, not just
+bounding the tick in isolation (the Consequences below has the full
+accounting and the one residual this doesn't close). The sweep is
 best-effort within `gc`: a staging base that cannot be validated or listed is
 logged and skipped, and a single entry that can't be read, stat'ed, or
 removed is skipped and retried on a later `gc`, neither ever blocking `gc`'s
@@ -176,23 +177,30 @@ does, resetting the gap. So the worst case per loop iteration is
 `CALL_DEADLINE + tick`, not `2 * CALL_DEADLINE`: whichever of `refresh` or
 `revoke` stalls to the deadline, the stage write already reset the clock
 before or after it. At the 60s default tick that is about 1560s, safely
-under `MAX_TTL_SECS`. This bound has real residuals, not closed by this
-change:
+under `MAX_TTL_SECS`. Of the two residuals specific to this two-call margin,
+one is now closed (`safe_heartbeat_tick` caps against it) and one remains
+open, tracked separately; the last two bullets below are separate residuals
+of their own, not part of this margin:
 
-- `safe_heartbeat_tick` caps the tick to below `MAX_TTL_SECS` (up to 2999s),
-  not to something that keeps `CALL_DEADLINE + tick` under `MAX_TTL_SECS`. A
-  `SANDY_REFRESH_TICK_SECS` configured near that ceiling pushes the worst
-  case to about 4500s, over the sweep threshold. Capping it at
-  `MAX_TTL_SECS - CALL_DEADLINE` instead would close this, but `CALL_DEADLINE`
-  is private to `sandy-lib`, while `safe_heartbeat_tick` lives in `sandy-cli`;
-  closing it means exporting the constant through the facade.
-- The stage write's own create step can itself fail before touching
+- **Closed.** `safe_heartbeat_tick` used to cap the tick to below
+  `MAX_TTL_SECS` alone (up to 2999s), not to something that keeps
+  `CALL_DEADLINE + tick` under `MAX_TTL_SECS`; a `SANDY_REFRESH_TICK_SECS`
+  configured near that ceiling could push the worst case to about 4500s,
+  over the sweep threshold. `CALL_DEADLINE` is now exported through the
+  facade (`sandy::CALL_DEADLINE`) so `safe_heartbeat_tick` (in `sandy-cli`)
+  caps against `MAX_TTL_SECS - CALL_DEADLINE` instead, keeping
+  `CALL_DEADLINE + tick` under the sweep threshold for any accepted tick.
+- **Open, tracked as [#364](https://github.com/kauki-labs/sandy/issues/364).**
+  The stage write's own create step can itself fail before touching
   `cred_dir` (drawing a temp name, or the temp file's own `O_CREAT|O_EXCL`
   write, on `ENOSPC`/`EDQUOT`/`EMFILE`). On that narrow path, `refresh_once`
   goes `refresh` then `revoke_orphan` with no stage touch in between, so
   both calls' worst cases compound: `2 * CALL_DEADLINE + tick`, about 3060s
   at the default tick, just over the sweep threshold. It needs both a
-  stage-create failure and two full-length stalls at once.
+  stage-create failure and two full-length stalls at once. Closing it means
+  restructuring `refresh_once`'s stage-failure path to touch `cred_dir`'s
+  mtime before calling `revoke_orphan`, a bigger change than this decision's
+  timeout sizing; deferred to the linked issue.
 - Retrying a non-idempotent `POST /access_tokens` was already possible under
   octocrab's default retry policy before this change; nothing here
   introduces it. If GitHub completes the mint but the response is lost to a

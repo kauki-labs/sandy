@@ -206,21 +206,29 @@ sequenceDiagram
   call (mint, refresh, revoke, uninstall, the permissions read) runs under a single
   wall-clock deadline, `CALL_DEADLINE = MAX_TTL_SECS / 2`, covering the whole
   call including whatever retries octocrab makes internally, closing the gap
-  at its source rather than only at the heartbeat. See decision 6 for the
-  residual gaps this doesn't close.
+  at its source rather than only at the heartbeat. `safe_heartbeat_tick` caps
+  a configured tick against `MAX_TTL_SECS - CALL_DEADLINE`, not `MAX_TTL_SECS`
+  alone, so an accepted tick always leaves room for one stalled call. See
+  decision 6 for the residual gap this doesn't close.
 
 **KPI.**
 
 - Integration: `cred.rs` unit tests (`mint_lease` clamps TTL, stages 0600, revoke
   bracket, `should_refresh`); the supervisor's mint-fails-closed test;
   `sandy-fsutil`'s `sweep_stale_staging_dirs` tests (sweeps a stale dir, keeps a
-  fresh one, ignores an unrelated prefix, continues past an unremovable one);
-  the supervisor's `gc_sweeps_a_stale_cred_dir_past_max_ttl` /
-  `gc_keeps_a_fresh_verify_dir` /
+  fresh one, ignores an unrelated prefix, continues past an injected removal
+  failure deterministically via `sweep_stale_staging_dirs_with`, supplemented
+  by a real-filesystem-permission variant); the supervisor's
+  `gc_sweeps_a_stale_cred_dir_past_max_ttl` / `gc_keeps_a_fresh_verify_dir`
+  (both asserting against `GcReport::swept_staging_dirs`, never `evicted`) /
   `refresh_loop_heartbeats_the_cred_dir_mtime_every_tick` /
   `safe_heartbeat_tick_passes_through_a_safe_tick` /
   `safe_heartbeat_tick_falls_back_when_the_tick_reaches_max_ttl_secs` /
-  `..._exceeds_max_ttl_secs`; `cred_github.rs`'s
+  `..._exceeds_max_ttl_secs` /
+  `..._falls_back_at_max_ttl_secs_minus_call_deadline` /
+  `..._passes_through_just_below_max_ttl_secs_minus_call_deadline`;
+  `output.rs`'s `gc_json_keeps_swept_staging_dirs_out_of_evicted` /
+  `gc_plain_text_evicted_count_excludes_swept_staging_dirs`; `cred_github.rs`'s
   `revoke_times_out_on_a_stalled_server` (drives the real adapter's `revoke`
   against a local listener that accepts and never responds, proving the call
   errors out at `call_deadline` rather than hanging).

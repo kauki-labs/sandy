@@ -410,7 +410,8 @@ fn gc_evicts_oldest_terminal_beyond_keep_n_but_keeps_the_running_job() -> anyhow
         .context("t3")?;
 
     // Keep the newest 2 terminal records; the oldest terminal is evicted.
-    let evicted = gc(&journal, 2).context("gc")?;
+    let report = gc(&journal, 2).context("gc")?;
+    let evicted = &report.evicted;
 
     assert!(
         evicted.contains(&"term-old".to_string()),
