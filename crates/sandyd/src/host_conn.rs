@@ -17,6 +17,7 @@ use sandy_executor_proto::{
 use tokio::sync::mpsc;
 
 use crate::{
+    dispatch::JobRegistry,
     host_registry::{ExecutorAllowlist, HostRegistry, RegisterError, Registration},
     store::{JobStore, Transition},
 };
@@ -61,6 +62,7 @@ pub async fn serve_host_executor(
     allowlist: &ExecutorAllowlist,
     registry: &HostRegistry,
     store: &Arc<JobStore>,
+    job_registry: &JobRegistry,
 ) {
     let peer_ip = match peer {
         PeerAddr::Tcp(addr) => addr.ip(),
@@ -351,7 +353,7 @@ pub async fn serve_host_executor(
     // (#292). `finish` refuses from a terminal state, so a job that reported
     // just before the close, or was cancelled, is left as-is.
     for job_id in in_flight {
-        fail_disconnected_job(store, &job_id).await;
+        fail_disconnected_job(store, job_registry, &job_id).await;
     }
 
     registry.remove(&host_id, registration);
@@ -424,7 +426,7 @@ async fn record_job_result(store: &Arc<JobStore>, in_flight: &mut HashSet<String
 /// (#292). `finish` refuses from a terminal state, so this is a no-op for a job
 /// that reached a terminal status (a result that raced the close, a cancel)
 /// just before the connection ended.
-async fn fail_disconnected_job(store: &Arc<JobStore>, job_id: &str) {
+async fn fail_disconnected_job(store: &Arc<JobStore>, job_registry: &JobRegistry, job_id: &str) {
     let store = Arc::clone(store);
     let jid = job_id.to_owned();
     let transition = tokio::task::spawn_blocking(move || {
@@ -449,6 +451,11 @@ async fn fail_disconnected_job(store: &Arc<JobStore>, job_id: &str) {
         Ok(Err(e)) => tracing::warn!(job_id, error = %e, "could not fail the in-flight job after a disconnect"),
         Err(e) => tracing::warn!(job_id, error = %e, "the disconnect-fail store task failed"),
     }
+    // The host-executor is gone, so the job's RemoteLink (if it has one)
+    // will never be presented by the executor it was minted for — a late
+    // stream must not still be able to authenticate with it (#269: job
+    // status alone doesn't gate authentication).
+    job_registry.invalidate_remote_link(job_id);
 }
 
 /// Reads frames from `read_half` sequentially — never raced against anything
@@ -564,6 +571,43 @@ mod tests {
         Arc::new(JobStore::open_in_memory().expect("in-memory store"))
     }
 
+    /// A throwaway registry for tests that only need `serve_host_executor`'s
+    /// `job_registry` parameter satisfied, not real job/remote-link state.
+    fn test_job_registry() -> JobRegistry {
+        JobRegistry::new().expect("getrandom for a test registry")
+    }
+
+    /// Regression (#368): `fail_disconnected_job` must invalidate the job's
+    /// `RemoteLink`, not just mark it `Failed` in the store — job status
+    /// alone doesn't gate agent-link authentication, so a late stream could
+    /// otherwise still present the genuine, never-claimed token after the
+    /// host-executor it was minted for disconnected.
+    #[tokio::test]
+    async fn fail_disconnected_job_invalidates_the_remote_link() -> anyhow::Result<()> {
+        let store = test_store();
+        store.insert_pending("job-1", b"m", "test/v1")?;
+        let job_registry = test_job_registry();
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let mut job = crate::dispatch::mint_job_channel("job-1", job_registry.authority())
+            .await
+            .context("mint job channel")?;
+        job.remote_link = Some(crate::link_auth::RemoteLink::new(peer_ip).context("mint remote link")?);
+        let token = *job.remote_link.as_ref().expect("just set").token().as_bytes();
+        job_registry.insert("job-1".to_owned(), job);
+
+        fail_disconnected_job(&store, &job_registry, "job-1").await;
+
+        assert_eq!(store.status("job-1")?, Some(JobStatus::Failed));
+        let auth = job_registry
+            .authenticate_remote_link("job-1", peer_ip, &token)
+            .map(drop);
+        assert!(
+            matches!(auth, Err(crate::link_auth::LinkAuthError::AlreadyClaimed)),
+            "the genuine token must be refused once the disconnected job's host-executor is gone: {auth:?}"
+        );
+        Ok(())
+    }
+
     fn capabilities() -> Capabilities {
         Capabilities {
             supported_sandbox_kinds: vec![SandboxKind::Process.into()],
@@ -602,6 +646,7 @@ mod tests {
                     &allowlist,
                     &registry,
                     &test_store(),
+                    &test_job_registry(),
                 )
                 .await;
             }
@@ -678,6 +723,7 @@ mod tests {
                     &allowlist,
                     &registry,
                     &test_store(),
+                    &test_job_registry(),
                 )
                 .await;
             }
@@ -724,6 +770,7 @@ mod tests {
                 &allowlist,
                 &registry,
                 &test_store(),
+                &test_job_registry(),
             )
             .await;
             registry
@@ -768,6 +815,7 @@ mod tests {
                 &allowlist,
                 &registry,
                 &test_store(),
+                &test_job_registry(),
             )
             .await;
         });
@@ -800,6 +848,7 @@ mod tests {
                 &allowlist,
                 &registry,
                 &test_store(),
+                &test_job_registry(),
             )
             .await;
         });
@@ -854,6 +903,7 @@ mod tests {
                     &allowlist,
                     &registry,
                     &test_store(),
+                    &test_job_registry(),
                 )
                 .await;
             }
@@ -979,6 +1029,7 @@ mod tests {
         .await?;
 
         let store = test_store();
+        let job_registry = test_job_registry();
         for job_id in ["job-1", "job-2", "job-3"] {
             store.insert_pending(job_id, b"m", "test/v1")?;
         }
@@ -990,7 +1041,15 @@ mod tests {
             let allowlist = std::sync::Arc::clone(&allowlist);
             let store = std::sync::Arc::clone(&store);
             async move {
-                serve_host_executor(Box::new(server), tcp_peer("100.64.0.7"), &allowlist, &registry, &store).await;
+                serve_host_executor(
+                    Box::new(server),
+                    tcp_peer("100.64.0.7"),
+                    &allowlist,
+                    &registry,
+                    &store,
+                    &job_registry,
+                )
+                .await;
             }
         });
 
@@ -1081,6 +1140,7 @@ mod tests {
                     &allowlist,
                     &registry,
                     &test_store(),
+                    &test_job_registry(),
                 )
                 .await;
             }
@@ -1194,6 +1254,7 @@ mod tests {
                     &allowlist,
                     &registry,
                     &test_store(),
+                    &test_job_registry(),
                 )
                 .await;
             }

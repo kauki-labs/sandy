@@ -859,11 +859,11 @@ happy path).
   remote run is reachable regardless of what's registered) or no host
   qualifies. If one is picked: mint a decision-6 `RemoteLink` bound to its
   peer IP, set it on the job's channel, persist and register the job as
-  usual, then call `send_dispatch` — best-effort: a failure (e.g. the host
-  disconnected in the narrow window between being picked and the send) logs
-  a warning and leaves the job `Pending` rather than failing `Submit` for a
-  placement optimization the caller never asked to observe directly. No
-  host picked (including none registered, or none configured) means the job
+  usual, then call `send_dispatch` — a failure (e.g. the host disconnected
+  in the narrow window between being picked and the send) fails the job
+  terminally rather than leaving it silently `Pending` forever (see the
+  "Closed" paragraph below for the full history of that fix). No host
+  picked (including none registered, or none configured) means the job
   stays local, today's unchanged behavior.
 - Stage-1 required-class default: `STAGE1_REQUIRED_ISOLATION_CLASS = IsolationClass::Trusted`,
   a named constant with a loud tripwire comment at its definition (not an
@@ -917,7 +917,12 @@ the moment it's popped off its channel, not only once its write to the wire
 succeeds, and the loop drains any dispatches still sitting unread in the
 channel before it tears down — so a dispatch lost to a write failure, a
 write timeout, or a same-peer reclaim racing the connection's own fault
-detection is always failed terminally, never silently dropped.
+detection is always failed terminally, never silently dropped. Both paths —
+`handle`'s `Submit` arm and `host_conn`'s disconnect cleanup — also
+invalidate the job's `RemoteLink` the moment they fail it: job status alone
+never gated agent-link authentication, so a job marked `Failed` with its
+link still valid would let a late stream claim a token nobody was ever
+going to use for real work.
 
 **Set aside.** Adding a `SubmitRequest.required_isolation_class` wire field
 now (the alternative to the stage-1 constant): premature configurability for

@@ -492,6 +492,11 @@ pub async fn handle(
                         Ok(Err(e)) => tracing::warn!(job_id, error = %e, "could not fail the undelivered job"),
                         Err(e) => tracing::warn!(job_id, error = %e, "the fail-undelivered-job store task panicked"),
                     }
+                    // The dispatch never reached the host either way (the
+                    // send itself failed), so the job's RemoteLink was never
+                    // presented on the wire and must not stay claimable —
+                    // job status alone doesn't gate authentication (#269).
+                    registry.invalidate_remote_link(&job_id);
                 }
             }
 
@@ -1851,6 +1856,7 @@ mod tests {
 
         let host_registry_for_conn = Arc::clone(&host_registry);
         let store_for_conn = Arc::clone(&store);
+        let registry_for_conn = Arc::clone(&registry);
         let serve = tokio::spawn(async move {
             crate::host_conn::serve_host_executor(
                 Box::new(server),
@@ -1858,6 +1864,7 @@ mod tests {
                 &allowlist,
                 &host_registry_for_conn,
                 &store_for_conn,
+                &registry_for_conn,
             )
             .await;
         });
@@ -2078,6 +2085,24 @@ mod tests {
             store.status(&job_id)?,
             Some(JobStatus::Failed),
             "an undeliverable dispatch must fail the job terminally, not leave it silently Pending forever"
+        );
+
+        // Regression (#368): job status alone must not be the only thing
+        // gating agent-link authentication — the link itself must be
+        // invalidated too, or a late stream could still present the
+        // genuine, never-delivered token and get admitted.
+        let job = registry
+            .get(&job_id)
+            .context("the failed job must still be in the registry")?;
+        let link = job
+            .remote_link
+            .as_ref()
+            .context("the placed job must have a remote link")?;
+        let token = *link.token().as_bytes();
+        let auth = registry.authenticate_remote_link(&job_id, peer_ip, &token).map(drop);
+        assert!(
+            matches!(auth, Err(crate::link_auth::LinkAuthError::AlreadyClaimed)),
+            "the genuine token must be refused once the job it was minted for has failed: {auth:?}"
         );
         Ok(())
     }
@@ -2353,6 +2378,7 @@ mod tests {
 
         let host_registry_for_conn = Arc::clone(&host_registry);
         let store_for_conn = Arc::clone(&store);
+        let registry_for_conn = Arc::clone(&registry);
         let serve = tokio::spawn(async move {
             crate::host_conn::serve_host_executor(
                 Box::new(server),
@@ -2360,6 +2386,7 @@ mod tests {
                 &allowlist,
                 &host_registry_for_conn,
                 &store_for_conn,
+                &registry_for_conn,
             )
             .await;
         });
@@ -2511,6 +2538,7 @@ mod tests {
 
         let host_registry_for_conn = Arc::clone(&host_registry);
         let store_for_conn = Arc::clone(&store);
+        let registry_for_conn = Arc::clone(&registry);
         let serve = tokio::spawn(async move {
             crate::host_conn::serve_host_executor(
                 Box::new(server),
@@ -2518,6 +2546,7 @@ mod tests {
                 &allowlist,
                 &host_registry_for_conn,
                 &store_for_conn,
+                &registry_for_conn,
             )
             .await;
         });
