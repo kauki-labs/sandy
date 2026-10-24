@@ -795,8 +795,10 @@ pub fn gc(journal: &Journal, keep_last_n: usize) -> Result<Vec<String>, CoreErro
     }
 }
 
-/// As [`gc`], against an injected `staging_base` — tests sweep a temp dir
-/// instead of the real sandy-owned staging base under the OS temp dir.
+/// [`gc`]'s implementation against an already-resolved `staging_base`: evict
+/// terminal records, then sweep stale staging dirs under it. [`gc`] calls this
+/// with the real sandy-owned staging base; tests call it with an injected temp
+/// dir instead.
 fn gc_against(journal: &Journal, keep_last_n: usize, staging_base: &Path) -> Result<Vec<String>, CoreError> {
     let mut evicted = gc_records(journal, keep_last_n)?;
     evicted.extend(sweep_stale_cred_dirs(staging_base));
