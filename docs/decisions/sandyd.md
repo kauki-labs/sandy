@@ -614,18 +614,19 @@ wiring" discipline used throughout B2. Resolved by decision 13.
 
 ## 13. Mesh bind addresses are environment variables; two separate listeners, not one multiplexed (#291)
 
-**Status:** partially implemented. `sandyd::mesh_config` parses
-`$SANDY_MESH_LISTEN` (the host_conn management-channel's bind address) and
-`$SANDY_MESH_ALLOWLIST` (comma-separated executor mesh IPs), both pure
-functions fully unit-tested against raw string values, not real process
-environment. `main.rs`'s `setup_mesh_listener` reads them, refuses to start
-if a listen address is configured with an empty allowlist (a listener nobody
-could ever pass), binds via `sandy_conn::listen`, and `run_mesh_accept_loop`
-serves accepted connections against a dedicated `HostRegistry` as its own
-background task. What is NOT yet built: the mesh_accept (agent-link) listener
-and its own bind-address env var — that side depends on #290's accept loop
-landing on main; this decision's config surface and wiring pattern extend to
-it directly once it does, as a small follow-up, not a redesign.
+**Status:** implemented. `sandyd::mesh_config` parses `$SANDY_MESH_LISTEN`
+(the host_conn management-channel's bind address) and `$SANDY_MESH_ALLOWLIST`
+(comma-separated executor mesh IPs), both pure functions fully unit-tested
+against raw string values, not real process environment. `main.rs`'s
+`setup_mesh_listener` reads them, refuses to start if a listen address is
+configured with an empty allowlist (a listener nobody could ever pass), binds
+via `sandy_conn::listen`, and `run_mesh_accept_loop` serves accepted
+connections against a dedicated `HostRegistry` as its own background task.
+The mesh_accept (agent-link) listener is also built, bound via its own
+`$SANDY_MESH_AGENT_LINK_LISTEN` and served by
+`sandyd::mesh_accept::serve_mesh_accept_loop`; unlike the management
+listener, it has no graceful-shutdown support of its own yet (see
+Consequences).
 
 **Context.** #291's architect rulings (relayed by infra-f3): two separate
 mesh-bound listeners/ports (the host_conn management channel and the
