@@ -195,8 +195,9 @@ every knob below from environment variables — there is no CLI flag form.
 
    For something to watch, use a manifest that keeps producing output
    (`["sh","-c","for i in $(seq 1 20); do echo tick-$i; sleep 1; done"]`) rather than one that
-   finishes immediately. `attach`'s status-watch notice lands on **stderr**, not stdout —
-   stdout stays a clean byte-for-byte PTY stream.
+   finishes immediately. `attach`'s status-watch notice lands on **stderr**, not stdout. The
+   attached job's own `TTY_STDOUT` and `TTY_STDERR` both land on stdout, though — `attach`
+   doesn't split them, so a caller can't capture the job's two streams separately.
 
    This covers `argv/v1` trusted-process execution only (`ProcessBackend::with_agent`). It does
    not exercise `flake/v1`'s VM dispatch, untrusted-job execution, or per-job egress isolation.
