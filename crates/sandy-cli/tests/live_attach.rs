@@ -638,29 +638,45 @@ async fn the_real_cli_binary_attaches_delivers_output_and_exits_on_job_completio
         let mut stdout_handle = stdout_handle;
         stdout_handle.read_to_string(&mut buf).map(|_| buf)
     });
+    // `print_status` (the status-watch's "terminal state" notice included)
+    // writes to stderr by design, keeping stdout a clean byte-for-byte PTY
+    // stream a caller could pipe straight to a file — so that notice has to
+    // be read from stderr, not stdout.
+    let stderr_handle = attach_child.stderr.take().context("attach child has no stderr")?;
+    let stderr_output = tokio::task::spawn_blocking(move || {
+        use std::io::Read as _;
+        let mut buf = String::new();
+        let mut stderr_handle = stderr_handle;
+        stderr_handle.read_to_string(&mut buf).map(|_| buf)
+    });
 
     let status = tokio::task::spawn_blocking(move || attach_child.wait());
-    let (status, output) = tokio::time::timeout(Duration::from_secs(15), async { tokio::join!(status, output) })
-        .await
-        .context("timed out waiting for sandy daemon attach to exit on its own")?;
+    let (status, output, stderr_output) = tokio::time::timeout(Duration::from_secs(15), async {
+        tokio::join!(status, output, stderr_output)
+    })
+    .await
+    .context("timed out waiting for sandy daemon attach to exit on its own")?;
     let status = status
         .context("join the wait task")?
         .context("wait on the attach child")?;
     let output = output
         .context("join the stdout-reading task")?
         .context("read attach stdout")?;
+    let stderr_output = stderr_output
+        .context("join the stderr-reading task")?
+        .context("read attach stderr")?;
 
     assert!(
         status.success(),
-        "sandy daemon attach must exit 0, got {status:?}; output: {output}"
+        "sandy daemon attach must exit 0, got {status:?}; stdout: {output}; stderr: {stderr_output}"
     );
     assert!(
         output.contains("hello-from-job") && output.contains("done"),
         "the job's real output must have been delivered through attach: {output:?}"
     );
     assert!(
-        output.contains("terminal state"),
-        "the status watch must have reported the job's terminal state: {output:?}"
+        stderr_output.contains("terminal state"),
+        "the status watch must have reported the job's terminal state on stderr: {stderr_output:?}"
     );
 
     let outcome = tokio::time::timeout(Duration::from_secs(10), running)
