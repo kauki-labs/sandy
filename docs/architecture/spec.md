@@ -272,6 +272,15 @@ sequenceDiagram
 - **Mid-run refresh.** With a huge margin + short tick the refresh thread re-mints
   and rewrites the live secret file, so a long job's `git credential fill` serves a
   fresh token; the guest never sees the value on argv/console.
+- **Terminal journal write deferred until redaction is final (#322).** The
+  non-credentialed path still writes its terminal record inside `run_job`, right
+  after its one redaction pass. `run_job_with_credential` instead runs the shared
+  core without writing that record, joins the refresh thread, re-redacts the
+  console against every token the run ever had live, folds in a revoke-failure
+  warning if any, and only then writes the terminal record — once. Before this,
+  `run_job` wrote a terminal record redacted against only the initial token, and
+  `run_job_with_credential` amended it after the fact; a crash in that window left
+  a permanent record with a refreshed token unredacted. See INV-6 (§7).
 - **`gc` sweeps a leaked `cred-*`/`verify-*` staging dir (#195).** The drop guard
   that removes `cred_dir`/the verify probe's temp dir runs on every normal exit
   and on panic, but not on SIGKILL or a crash before it runs; `sandy gc` sweeps any
@@ -305,6 +314,9 @@ sequenceDiagram
   bracket, `should_refresh`);
   `mint_lease_checked_refuses_a_dir_swapped_in_after_validation` (adversarial,
   #323); the supervisor's mint-fails-closed test;
+  `credentialed_run_writes_the_terminal_record_once_after_refresh_redaction`
+  (decision 7 of `credential-seam.md`: the deferred write, exactly once, after
+  refresh redaction);
   `sandy-fsutil`'s `sweep_stale_staging_dirs` tests (sweeps a stale dir, keeps a
   fresh one, ignores an unrelated prefix, continues past an injected removal
   failure deterministically via `sweep_stale_staging_dirs_with`, supplemented
@@ -492,7 +504,30 @@ owner.
 
 - **Running before boot (INV-6).** The `Running` record is the first write, so an
   empty journal proves the backend was never reached; the terminal record always
-  carries the envelope.
+  carries the envelope. The non-credentialed path writes that terminal record
+  right after its own redaction pass. The credentialed path (`run_job_with_credential`,
+  #322) defers it instead: the shared core runs without writing one, and only after
+  the refresh thread has joined and the console is re-redacted against every token
+  the run ever had live does the terminal record get written, once — never a first
+  write against the initial token alone, amended afterward.
+- **The one terminal write guards against a concurrent `kill`, not against
+  `reconcile_job`'s own liveness guess.** `write_terminal_record` (both paths)
+  persists through `JournalWriter::persist_if_still_running`: it takes the job
+  flock and re-reads before writing. It skips the write, and returns `false`,
+  only when the current record already carries a REAL envelope — `kill`'s
+  `Cancelled` — never overwriting that result. `reconcile_job`'s `Crashed`
+  carries no envelope: it is a liveness inference ("the box is gone"), and
+  `run_job_core` never updates `box_id` on the `Running` record, so that
+  inference never even reaches the box check and fires on flock-freeness
+  alone for the whole run, not only during finalization. The live owner's own
+  write — proof the inference was wrong — overwrites it rather than losing to
+  a stale guess. When the write is skipped (a real competing result), the
+  caller returns `CoreError::State`, mapped like any other journal fault to
+  `ProcessExit::InfraFault` (band 3, retryable) at the `run_job_with_credential`
+  call site (`main.rs`); it returns no envelope for this path, unlike a normal
+  run. A failed write (I/O error, not this race) is folded into the returned
+  envelope's `warnings` (L-12) as well as logged, on both paths, so the caller
+  never sees an ordinary success with a missing INV-6 record.
 - **Reconcile through the seam (INV-3).** `ls`/`status`/`wait`/`kill`/`gc` reach
   running state via `reconcile_job` + `VmBackend::boxes` under the job flock, never
   a direct registry read, so a crashed owner is reconciled to a terminal state.
@@ -500,7 +535,14 @@ owner.
 **KPI.**
 
 - Integration: `journal` unit tests; `cli_jobs` ops (`ls`/`status`/`wait`/`kill`/`gc`,
-  reconcile of a dead box).
+  reconcile of a dead box);
+  `credentialed_run_writes_the_terminal_record_once_after_refresh_redaction`
+  (`supervisor.rs`, via `CountingJournal`: one write, after refresh redaction);
+  `persist_if_still_running_never_overwrites_an_already_terminal_record` (a
+  real `kill` `Cancelled` stands); `persist_if_still_running_overwrites_an_envelope_less_reconcile_crash`
+  (an envelope-less `reconcile_job` `Crashed` loses to the live owner's write);
+  `credentialed_run_refuses_to_report_a_result_the_journal_never_recorded`
+  (a forced skip returns `Err`, not the local result).
 - End-to-end: `live_boot.rs::cli_lifecycle_over_a_real_job` (the ops over a real job).
 
 ---
