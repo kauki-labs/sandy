@@ -45,6 +45,7 @@ fn succeeded_envelope(job_id: &str) -> ResultEnvelope {
         },
         logs: Logs { tail: String::new() },
         warnings: Vec::new(),
+        receipt: None,
     }
 }
 

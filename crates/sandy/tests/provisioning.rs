@@ -94,6 +94,7 @@ fn succeeded_envelope() -> ResultEnvelope {
         },
         logs: Logs { tail: String::new() },
         warnings: Vec::new(),
+        receipt: None,
     }
 }
 
