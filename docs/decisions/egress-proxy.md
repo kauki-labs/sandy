@@ -128,9 +128,11 @@ beside `vfkit` on macOS.
 _Lifecycle._
 
 - The backend starts the proxy before it launches the hypervisor. The proxy
-  binds its listener and then writes one `READY` line to stdout. The backend
-  waits for that line with a 5 s deadline, the same pattern as waiting for a
-  `virtiofsd` socket.
+  binds its listener, reads the policy from stdin, validates it, and only then
+  writes one `READY` line to stdout. A malformed policy exits the proxy
+  without `READY`, so the backend never launches the hypervisor on it. The
+  backend waits for `READY` with a 5 s deadline, the same pattern as waiting
+  for a `virtiofsd` socket.
 - The allow-list reaches the proxy as JSON on stdin, not on argv. The proxy
   closes stdin after it reads the policy.
 - At teardown the backend checks the proxy with `try_wait` before it kills it,
@@ -204,9 +206,12 @@ _Allow-list match._ The policy is the run's `AllowList`. An entry is
 - A denied target answers `403` with a one-line reason that names the target.
 
 _Resolution, host-side._ For an allowed name the proxy resolves on every
-CONNECT through the host's resolver (`getaddrinfo`, A and AAAA). It pins
-nothing across connections, so a name with several addresses or a short TTL
-works.
+CONNECT through the host's resolver (`getaddrinfo`, A and AAAA), bounded by the
+same 10 s deadline as the connect attempt below: a resolver call that blocks
+past it fails the CONNECT with `504`, the slot is freed, and it counts toward
+the 256-connection cap exactly like a slow connect, so a stalled resolver
+cannot starve the run's other connections. It pins nothing across connections,
+so a name with several addresses or a short TTL works.
 
 _Address filter._ The proxy filters the resolved addresses, connects only to an
 address it kept, and connects to that exact address. It never resolves a second
@@ -276,7 +281,10 @@ not the run the submitter asked for.
   observed, so the record alone is diagnosable.
 - The backend does not stop the VM early when the proxy dies. The guest has lost
   network, not gained it, so the boundary still holds.
-- Both failure paths run inside the `run_job_with_credential` mint-to-revoke
+- **Guest relay start failure** (including failure to bind `127.0.0.1:3128`):
+  `<rest>` remains stopped. The backend returns a locked band-3 infrastructure
+  result, not a guest job result.
+- All three failure paths run inside the `run_job_with_credential` mint-to-revoke
   bracket (spec section 4). Teardown revokes the live lease before removing the
   staged `0600` token file, on this path exactly as on any other backend error;
   the caller-owned credential directory is untouched.
@@ -408,3 +416,9 @@ parity gate on both backends.
 Already filed and fed by this work: #375 (egress attempts in receipts) and #377
 (hostname entries), both blocked by #404 and #405. #372 holds the deferred TLS
 termination and non-HTTP egress.
+
+#404's peer-CID check is specified above for agent-mode launches, where
+`agent_cid` names the CID `qemu_args` assigns. A console-only run (no
+`agent_program`) leaves `agent_cid` unset today, so #404 must also define the
+CID a console-only launch claims, the vsock device that exposes it, and the
+peer check the proxy runs against it, before its KP1q/KP2q rows can close.
