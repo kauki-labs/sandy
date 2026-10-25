@@ -64,10 +64,13 @@ pub fn plan_shares(spec: &RunSpec, dirs: &ShareDirs) -> Result<Vec<ShareSpec>, B
     // Attach when the run carries secrets or a pre-staged dir. Read-only.
     // A caller's dir is opened as it is and refused if it is not private; sandy's
     // own instance dir is created 0700 if missing, and refused, never repaired, if
-    // it exists but is not private.
-    let secret_dir = spec.secret_dir.unwrap_or(dirs.inst_dir);
+    // it exists but is not private. The caller's dir is also re-checked against its
+    // own fingerprint (#323): a same-uid, same-mode directory swapped in at that
+    // path since the caller validated it would otherwise pass the owner/mode check
+    // here too and silently receive the secret instead.
+    let secret_dir = spec.secret_dir.map_or(dirs.inst_dir, |(dir, _)| dir);
     let owned = match spec.secret_dir {
-        Some(dir) => sandy_fsutil::OwnedDir::open(dir),
+        Some((dir, fingerprint)) => sandy_fsutil::OwnedDir::open_matching(dir, (fingerprint.dev, fingerprint.ino)),
         None => sandy_fsutil::OwnedDir::open_or_create(dirs.inst_dir),
     }
     .map_err(|e| BackendError::Spawn(e.to_string()))?;
@@ -99,7 +102,7 @@ pub fn kill_children(children: &mut Vec<Child>) {
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
-    use sandy_api::backend::Grants;
+    use sandy_api::backend::{DirFingerprint, Grants};
 
     use super::*;
 
@@ -118,7 +121,7 @@ mod tests {
         CONTROL.get_or_init(|| RunControl::with_timeout_secs(30))
     }
 
-    fn spec<'a>(command: &'a [String], secret_dir: Option<&'a Path>) -> RunSpec<'a> {
+    fn spec<'a>(command: &'a [String], secret_dir: Option<(&'a Path, DirFingerprint)>) -> RunSpec<'a> {
         RunSpec {
             template: "t",
             command,
@@ -160,8 +163,13 @@ mod tests {
             inputs_dir: &tmp.path().join("inputs"),
             outputs_dir: &tmp.path().join("outputs"),
         };
-        let err = plan_shares(&spec(&command, Some(&secret_dir)), &dirs)
-            .expect_err("a 0775 caller secret dir must be refused");
+        // The mode check fails before the fingerprint is ever compared, so a
+        // zeroed one is fine here.
+        let err = plan_shares(
+            &spec(&command, Some((&secret_dir, DirFingerprint { dev: 0, ino: 0 }))),
+            &dirs,
+        )
+        .expect_err("a 0775 caller secret dir must be refused");
         anyhow::ensure!(
             err.to_string().contains("group/world-writable"),
             "unexpected error: {err}"
@@ -208,6 +216,77 @@ mod tests {
             mode(&inst_dir)? == 0o700,
             "a created instance dir came out {:o}",
             mode(&inst_dir)?
+        );
+        Ok(())
+    }
+
+    /// #323 (adversarial): a same-uid, same-mode directory swapped in at
+    /// `secret_dir`'s path, after the caller validated and fingerprinted it but
+    /// before this call, must never receive the staged secret — the fingerprint
+    /// `plan_shares` re-checks on reopen must refuse the swap, not silently bind
+    /// secret staging to the substitute because it too passes the owner/mode
+    /// check.
+    #[test]
+    fn a_secret_dir_swapped_after_validation_is_never_staged_into() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::backend::{SecretRef, SecretSource};
+
+        let tmp = private_tempdir()?;
+        let secret_dir = tmp.path().join("secret");
+        std::fs::create_dir(&secret_dir)?;
+        std::fs::set_permissions(&secret_dir, std::fs::Permissions::from_mode(0o700))?;
+
+        // The caller's own validation, captured before the swap — the binding #323
+        // introduces.
+        let (dev, ino) = sandy_fsutil::OwnedDir::open(&secret_dir)?.dev_ino()?;
+        let fingerprint = DirFingerprint { dev, ino };
+
+        // An attacker races the two opens: moves the validated directory aside and
+        // substitutes their own same-uid, same-mode directory at the same path —
+        // indistinguishable from the original to an owner/mode check alone.
+        let moved_original = secret_dir.with_extension("moved-original");
+        std::fs::rename(&secret_dir, &moved_original)?;
+        std::fs::create_dir(&secret_dir)?;
+        std::fs::set_permissions(&secret_dir, std::fs::Permissions::from_mode(0o700))?;
+
+        let secret_src = tmp.path().join("tok");
+        std::fs::write(&secret_src, b"S")?;
+        std::fs::set_permissions(&secret_src, std::fs::Permissions::from_mode(0o600))?;
+        let secrets = [SecretRef {
+            name: "TOK".to_string(),
+            source: SecretSource::File(secret_src),
+        }];
+        let command = ["true".to_owned()];
+        let dirs = ShareDirs {
+            inst_dir: &tmp.path().join("inst"),
+            inputs_dir: &tmp.path().join("inputs"),
+            outputs_dir: &tmp.path().join("outputs"),
+        };
+        let spec = RunSpec {
+            template: "t",
+            command: &command,
+            inputs: &[],
+            outputs: &[],
+            secrets: &secrets,
+            env: &[],
+            cpu: None,
+            mem: None,
+            timeout_secs: 30,
+            grants: &GRANTS,
+            outcome_file: None,
+            secret_dir: Some((&secret_dir, fingerprint)),
+            control: test_control(),
+        };
+
+        let result = plan_shares(&spec, &dirs);
+        anyhow::ensure!(
+            result.is_err(),
+            "staging into a directory swapped in after validation must be refused, got {result:?}"
+        );
+        anyhow::ensure!(
+            std::fs::read_dir(&secret_dir)?.next().is_none(),
+            "the secret must never land in the swapped-in substitute directory"
         );
         Ok(())
     }

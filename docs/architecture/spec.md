@@ -116,6 +116,12 @@ flowchart LR
   already exists, opens it with `O_NOFOLLOW` and rejects it unless it is owned by
   the current uid with no group/world write bit. A bad base fails closed, never
   gets chmod'd/chowned back into shape.
+- **A caller's `secret_dir` is re-checked by fingerprint, not trusted by path
+  (CWE-367, #323).** `RunSpec::secret_dir` carries `(path, DirFingerprint)`, the
+  `(dev, ino)` the caller validated before building the spec; `plan_shares`
+  reopens it with `OwnedDir::open_matching`, refusing a same-uid, same-mode
+  directory swapped in at that path since. See decision 13 in
+  `docs/decisions/guest-shares.md`.
 
 **KPI.**
 
@@ -128,7 +134,10 @@ flowchart LR
   `live_boot.rs::secret_share_mounts_read_only_virtiofs` (virtiofs fstype, guest
   write denied).
 - Unit: `sandy-backend/src/staging.rs`, a world-writable or symlinked base is
-  rejected, an owner/mode mismatch is rejected, a clean self-owned base validates.
+  rejected, an owner/mode mismatch is rejected, a clean self-owned base validates;
+  `sandy/src/shares.rs::a_secret_dir_swapped_after_validation_is_never_staged_into`
+  (adversarial, #323); `sandy-fsutil/src/secret.rs`'s
+  `open_matching_refuses_a_same_uid_mode_substitute_swapped_in_at_the_path`.
 
 ---
 
@@ -210,11 +219,22 @@ sequenceDiagram
   a configured tick against `MAX_TTL_SECS - CALL_DEADLINE`, not `MAX_TTL_SECS`
   alone, so an accepted tick always leaves room for one stalled call. See
   decision 6 for the residual gap this doesn't close.
+- **`cred_dir` is bound by fingerprint through mint and every refresh (CWE-367,
+  #323).** `run_credentialed` captures `cred_dir`'s `(dev, ino)` from the
+  `OwnedDir` `private_staging_dir` returns before reducing it to a path.
+  `mint_lease_checked`/`refresh_once_checked` reopen `cred_dir` with
+  `OwnedDir::open_matching` against that fingerprint instead of `mint_lease`'s/
+  `refresh_once`'s plain owner/mode reopen, so a same-uid, same-mode directory
+  swapped in at `cred_dir`'s path between validation and the mint, or between
+  two refreshes, is refused rather than silently receiving the token. See
+  decision 13 in `docs/decisions/guest-shares.md`.
 
 **KPI.**
 
 - Integration: `cred.rs` unit tests (`mint_lease` clamps TTL, stages 0600, revoke
-  bracket, `should_refresh`); the supervisor's mint-fails-closed test;
+  bracket, `should_refresh`);
+  `mint_lease_checked_refuses_a_dir_swapped_in_after_validation` (adversarial,
+  #323); the supervisor's mint-fails-closed test;
   `sandy-fsutil`'s `sweep_stale_staging_dirs` tests (sweeps a stale dir, keeps a
   fresh one, ignores an unrelated prefix, continues past an injected removal
   failure deterministically via `sweep_stale_staging_dirs_with`, supplemented

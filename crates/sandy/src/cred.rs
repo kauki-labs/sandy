@@ -37,7 +37,7 @@ pub use sandy_api::cred::{
     Capability, CredError, CredentialHandle, CredentialProvider, Lease, MAX_TTL_SECS, Minted, Scope, Target,
 };
 
-use crate::backend::{SecretRef, SecretSource};
+use crate::backend::{DirFingerprint, SecretRef, SecretSource};
 
 /// Mint a scoped credential and stage it to a `0600` file under `out_dir`,
 /// returning the [`Lease`] that carries it.
@@ -60,11 +60,52 @@ pub fn mint_lease<P: CredentialProvider + ?Sized>(
     secret_name: &str,
     out_dir: &Path,
 ) -> Result<Lease, CredError> {
+    mint_lease_with(provider, scope, requested_ttl_secs, secret_name, out_dir, None)
+}
+
+/// As [`mint_lease`], but refuses to stage into `out_dir` unless it still matches
+/// `expected` — the `(dev, ino)` fingerprint the caller's own validation of
+/// `out_dir` (e.g. [`sandy_fsutil::private_staging_dir`]) captured before this call
+/// (#323). Use this instead of [`mint_lease`] whenever `out_dir` was validated
+/// earlier than the mint rather than freshly opened right here: a same-uid,
+/// same-mode directory swapped in at `out_dir`'s path in between would pass a
+/// plain owner/mode reopen and receive the minted token.
+///
+/// # Errors
+///
+/// As [`mint_lease`], plus [`CredError::Stage`] when `out_dir` no longer matches
+/// `expected`.
+pub fn mint_lease_checked<P: CredentialProvider + ?Sized>(
+    provider: &P,
+    scope: &Scope,
+    requested_ttl_secs: u32,
+    secret_name: &str,
+    out_dir: &Path,
+    expected: DirFingerprint,
+) -> Result<Lease, CredError> {
+    mint_lease_with(
+        provider,
+        scope,
+        requested_ttl_secs,
+        secret_name,
+        out_dir,
+        Some(expected),
+    )
+}
+
+fn mint_lease_with<P: CredentialProvider + ?Sized>(
+    provider: &P,
+    scope: &Scope,
+    requested_ttl_secs: u32,
+    secret_name: &str,
+    out_dir: &Path,
+    expected: Option<DirFingerprint>,
+) -> Result<Lease, CredError> {
     let ttl = Duration::from_secs(u64::from(requested_ttl_secs.min(MAX_TTL_SECS)));
     // On a mint failure we return before any file is written, so the caller fails
     // exit-3 retryable rather than running the job with no credential (INV-7).
     let minted = provider.mint(scope, ttl)?;
-    let path = match stage_token(out_dir, secret_name, minted.secret().as_bytes()) {
+    let path = match stage_token(out_dir, secret_name, minted.secret().as_bytes(), expected) {
         Ok(path) => path,
         Err(e) => {
             // The token was minted at the forge but could not be staged. Revoke it
@@ -154,7 +195,32 @@ pub fn refresh_once<P: CredentialProvider + ?Sized>(
     now: SystemTime,
     margin: Duration,
 ) -> Result<bool, CredError> {
-    refresh_once_with(provider, lease, now, margin, write_secret_0600)
+    refresh_once_with(provider, lease, now, margin, |dest, bytes| {
+        write_secret_0600(dest, bytes, None)
+    })
+}
+
+/// As [`refresh_once`], but refuses to re-stage into the lease's secret dir
+/// unless it still matches `expected` — the `(dev, ino)` fingerprint captured
+/// when that dir was validated (#323), the same binding [`mint_lease_checked`]
+/// uses for the initial mint. Use this for a lease minted via
+/// [`mint_lease_checked`], so the refresh re-open is checked the same way the
+/// initial stage was.
+///
+/// # Errors
+///
+/// As [`refresh_once`], plus [`CredError::Stage`] when the lease's secret dir no
+/// longer matches `expected`.
+pub fn refresh_once_checked<P: CredentialProvider + ?Sized>(
+    provider: &P,
+    lease: &mut Lease,
+    now: SystemTime,
+    margin: Duration,
+    expected: DirFingerprint,
+) -> Result<bool, CredError> {
+    refresh_once_with(provider, lease, now, margin, |dest, bytes| {
+        write_secret_0600(dest, bytes, Some(expected))
+    })
 }
 
 /// [`refresh_once`]'s body, with the re-stage step injected so a test can script a
@@ -365,9 +431,20 @@ pub fn read_secret_0600(path: &Path) -> Result<Vec<u8>, CredError> {
 /// guest's secret share names it, so `out_dir` can be shared into the guest
 /// directly (the refresh seam, #49) without a rename. See [`write_secret_0600`]
 /// for the atomicity contract.
-fn stage_token(out_dir: &Path, secret_name: &str, bytes: &[u8]) -> Result<PathBuf, CredError> {
+///
+/// `expected`, when given, is the `(dev, ino)` fingerprint the caller's own
+/// earlier validation of `out_dir` captured (#323): `out_dir` is then re-opened
+/// through [`sandy_fsutil::OwnedDir::open_matching`] rather than a plain
+/// owner/mode check, so a same-uid, same-mode directory swapped in at `out_dir`
+/// since is refused instead of silently receiving the token.
+fn stage_token(
+    out_dir: &Path,
+    secret_name: &str,
+    bytes: &[u8],
+    expected: Option<DirFingerprint>,
+) -> Result<PathBuf, CredError> {
     let dest = out_dir.join(secret_name);
-    match write_secret_0600(&dest, bytes)? {
+    match write_secret_0600(&dest, bytes, expected)? {
         StageOutcome::Ok => Ok(dest),
         // The initial mint has no previous valid token a consumer is already
         // reading and no lease yet to hand back, so a not-yet-durable write is
@@ -406,12 +483,18 @@ enum StageOutcome {
 /// Re-delivery (#49) reuses this to overwrite a lease's staged token in place with
 /// a freshly minted one; the rename makes that swap atomic for the reader.
 ///
+/// `expected`, when given, pins the reopen of `dest`'s parent to the directory
+/// identified by that `(dev, ino)` fingerprint (#323), refusing a same-uid,
+/// same-mode substitute swapped in at the path since; `None` validates by
+/// owner/mode alone, as before.
+///
 /// # Errors
 ///
-/// Returns [`CredError::Stage`] when the write fails before the rename lands;
-/// returns `Ok(`[`StageOutcome::NotDurable`]`)`, not an error, when the rename
-/// landed but only the trailing directory sync failed (#196).
-fn write_secret_0600(dest: &Path, bytes: &[u8]) -> Result<StageOutcome, CredError> {
+/// Returns [`CredError::Stage`] when the write fails before the rename lands, or
+/// when `expected` is given and the reopened dir no longer matches it; returns
+/// `Ok(`[`StageOutcome::NotDurable`]`)`, not an error, when the rename landed but
+/// only the trailing directory sync failed (#196).
+fn write_secret_0600(dest: &Path, bytes: &[u8], expected: Option<DirFingerprint>) -> Result<StageOutcome, CredError> {
     let (Some(dir), Some(name)) = (
         dest.parent().filter(|p| !p.as_os_str().is_empty()),
         dest.file_name().and_then(|n| n.to_str()),
@@ -421,7 +504,11 @@ fn write_secret_0600(dest: &Path, bytes: &[u8]) -> Result<StageOutcome, CredErro
             dest.display()
         )));
     };
-    match sandy_fsutil::OwnedDir::open(dir).and_then(|dir| dir.write_secret(name, bytes)) {
+    let opened = match expected {
+        Some(fp) => sandy_fsutil::OwnedDir::open_matching(dir, (fp.dev, fp.ino)),
+        None => sandy_fsutil::OwnedDir::open(dir),
+    };
+    match opened.and_then(|dir| dir.write_secret(name, bytes)) {
         Ok(_) => Ok(StageOutcome::Ok),
         Err(e @ sandy_fsutil::FsError::NotDurable { .. }) => {
             Ok(StageOutcome::NotDurable(CredError::Stage(e.to_string())))
@@ -667,7 +754,7 @@ mod tests {
         let dest = tmp.path().join("adir");
         fs::create_dir(&dest).context("mk dest dir")?;
 
-        let err = write_secret_0600(&dest, b"SECRET").expect_err("renaming a file onto a dir must fail");
+        let err = write_secret_0600(&dest, b"SECRET", None).expect_err("renaming a file onto a dir must fail");
         assert!(
             matches!(err, CredError::Stage(_)),
             "expected a stage failure, got {err:?}"
@@ -700,6 +787,51 @@ mod tests {
             provider.revoked().len(),
             1,
             "a minted-but-unstaged token must be revoked, not orphaned"
+        );
+        Ok(())
+    }
+
+    /// #323 (adversarial): a same-uid, same-mode directory swapped in at
+    /// `out_dir`'s path, after the caller validated and fingerprinted it but
+    /// before the mint, must never receive the minted token — `mint_lease_checked`
+    /// must refuse, and the orphaned token must still be revoked.
+    #[test]
+    fn mint_lease_checked_refuses_a_dir_swapped_in_after_validation() -> anyhow::Result<()> {
+        let tmp = private_tempdir()?;
+        let out_dir = tmp.path().join("cred");
+        fs::create_dir(&out_dir).context("mk out_dir")?;
+        fs::set_permissions(&out_dir, fs::Permissions::from_mode(0o700)).context("chmod out_dir")?;
+
+        // The caller's own validation, captured before the swap (#323's binding).
+        let (dev, ino) = sandy_fsutil::OwnedDir::open(&out_dir)
+            .context("open out_dir")?
+            .dev_ino()
+            .context("fingerprint out_dir")?;
+        let expected = DirFingerprint { dev, ino };
+
+        // An attacker races the two opens: moves the validated directory aside and
+        // substitutes their own same-uid, same-mode directory at the same path.
+        let moved_original = out_dir.with_extension("moved-original");
+        fs::rename(&out_dir, &moved_original).context("rename aside")?;
+        fs::create_dir(&out_dir).context("mk substitute")?;
+        fs::set_permissions(&out_dir, fs::Permissions::from_mode(0o700)).context("chmod substitute")?;
+
+        let provider = FakeProvider::returning("tok");
+        let err = mint_lease_checked(&provider, &scope(), 1_800, "GH_TOKEN", &out_dir, expected)
+            .expect_err("staging into a directory swapped in after validation must be refused");
+        assert!(
+            matches!(err, CredError::Stage(_)),
+            "expected a stage failure, got {err:?}"
+        );
+        assert_eq!(
+            provider.revoked().len(),
+            1,
+            "a minted-but-refused token must be revoked, not orphaned"
+        );
+        let staged: Vec<_> = fs::read_dir(&out_dir).context("read substitute dir")?.collect();
+        assert!(
+            staged.is_empty(),
+            "the token must never land in the swapped-in substitute directory"
         );
         Ok(())
     }
