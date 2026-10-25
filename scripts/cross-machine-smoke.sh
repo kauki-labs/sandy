@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Cross-machine M2 smoke test (docs/design/host-executor/spec.md's manual
+# Cross-machine smoke test (docs/design/host-executor/spec.md's manual
 # walkthrough, scripted): starts sandyd locally with a mesh listener, syncs
 # this checkout to a remote host and starts sandy-host-executor there over
-# SSH, submits a long-running argv/v1 job, and attaches to it.
+# SSH, submits a long-running argv/v1 job, and attaches to it. Works for any
+# OS pairing — e.g. a macOS orchestrator dispatching to a Linux executor.
 #
 # Only three things point it at a real network: the orchestrator's (this
 # machine's) mesh-visible IP, the executor's mesh-visible IP (sandyd's
