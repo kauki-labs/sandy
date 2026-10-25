@@ -2,7 +2,7 @@
 title: sandy decision records
 kind: decisions-index
 project: sandy
-updated: 2026-10-15
+updated: 2026-10-25
 ---
 
 # Decision records
@@ -25,6 +25,7 @@ acceptance matrix, [`../architecture/kpi.md`](../architecture/kpi.md).
 | [secret-channel](secret-channel.md)               | `$NAME` delivery off argv/env/store        |
 | [credential-seam](credential-seam.md)             | mint → stage → refresh → revoke            |
 | [egress](egress.md)                               | guest-scoped allow-list around the boot    |
+| [egress-proxy](egress-proxy.md)                   | planned: NIC-less guest, vsock host proxy  |
 | [result-classification](result-classification.md) | locked envelope, exit bands, rendering     |
 | [journal](journal.md)                             | durable records, reconcile                 |
 | [agent-fabric](agent-fabric.md)                   | fabric seam contracts + test harness       |

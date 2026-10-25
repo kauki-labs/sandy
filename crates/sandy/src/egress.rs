@@ -72,37 +72,50 @@ pub fn to_nftables(allow: &AllowList) -> String {
 /// Translate an [`AllowList`] into a **guest-scoped** nftables ruleset: a
 /// `forward`-hook chain with a `policy accept` that filters only packets entering
 /// from the guest's tap `iface` (`iifname "<iface>"`) and leaves every other
-/// interface — the host's own egress included — untouched (#29).
+/// interface — the host's own egress included — untouched (#29), plus an
+/// `input`-hook chain that closes the guest's path to the host itself (#376).
 ///
 /// This is the safe counterpart to [`to_nftables`]: where that emits an
 /// OUTPUT-hook `policy drop` (which, applied in the host netns, would drop the
 /// HOST's own egress and lock it off the network), this scopes a default-deny to
-/// one guest interface. The chain accepts the guest's established/related return
-/// traffic and exactly the listed `host:port` pairs, then drops everything else
-/// from that interface; the trailing `iifname "<iface>" drop` is the floor, so an
-/// **empty** allow-list blocks all of the guest's new egress rather than failing
-/// open. Host names that aren't a bare address/CIDR are dropped (fail-closed),
-/// same as [`to_nftables`].
+/// one guest interface. The forward chain accepts the guest's established/related
+/// return traffic and exactly the listed `host:port` pairs, then drops everything
+/// else from that interface; the trailing `iifname "<iface>" drop` is the floor,
+/// so an **empty** allow-list blocks all of the guest's new egress rather than
+/// failing open. Host names that aren't a bare address/CIDR are dropped
+/// (fail-closed), same as [`to_nftables`].
+///
+/// Traffic the guest sends **to the host itself** (the tap's gateway address, or
+/// any other host address) is delivered through the `input` chain, never
+/// `forward`, so the forward chain alone leaves it unfiltered (#376: a host-local
+/// resolver or service stayed reachable, an empty allow-list included). The
+/// `input` chain closes that gap: `policy accept` (so traffic on every other
+/// interface stays untouched), the guest's DHCP request (`udp dport 67`) is the
+/// one thing it needs from the host, and everything else from the guest's `iface`
+/// is dropped. The allow-list never reaches this chain — a host-destined entry
+/// (e.g. the tap's own resolver) has no forward-scoped effect either, since the
+/// host is not a forward destination; allow-listing a host service is out of
+/// scope until #360's proxy resolves names host-side.
 ///
 /// An `iface` that is not a bare interface token can't be scoped to a guest
 /// without risking rule injection and can't be matched to drop the guest either,
-/// so the chain is emitted empty (table present, `policy accept`, no rules) with a
-/// warning — nothing is filtered, but the host is never touched.
+/// so both chains are emitted empty (table present, `policy accept`, no rules)
+/// with a warning — nothing is filtered, but the host is never touched.
 #[must_use]
 pub fn to_nftables_forward(allow: &AllowList, iface: &str) -> String {
-    let open = format!(
-        "table inet {EGRESS_TABLE} {{\n\tchain forward {{\n\t\ttype filter hook forward priority filter; policy \
-         accept;\n"
-    );
+    let open = format!("table inet {EGRESS_TABLE} {{\n");
     if !is_emittable_host(iface) {
         tracing::warn!(
             ?iface,
             "egress forward ruleset: interface is not a bare token; emitting no guest filter (host untouched)"
         );
-        return format!("{open}\t}}\n}}\n");
+        return format!(
+            "{open}\tchain forward {{\n\t\ttype filter hook forward priority filter; policy accept;\n\t}}\n}}\n"
+        );
     }
 
     let mut ruleset = open;
+    ruleset.push_str("\tchain forward {\n\t\ttype filter hook forward priority filter; policy accept;\n");
     // Return traffic for flows the guest was already permitted to open. With an
     // empty allow-list nothing is ever established, so this accepts nothing.
     ruleset.push_str(&format!(
@@ -129,7 +142,18 @@ pub fn to_nftables_forward(allow: &AllowList, iface: &str) -> String {
     // The default-deny floor: anything from the guest not explicitly allowed above
     // is dropped. Scoped to `iifname`, so only the guest is filtered.
     ruleset.push_str(&format!("\t\tiifname \"{iface}\" drop\n"));
-    ruleset.push_str("\t}\n}\n");
+    ruleset.push_str("\t}\n");
+
+    // #376: close the guest's path to the host. DHCP is the one thing the guest
+    // needs from the host; everything else destined for the host is dropped. The
+    // allow-list plays no part here — a host address is never a forward
+    // destination, so it has no legitimate accept to carry over.
+    ruleset.push_str("\tchain input {\n\t\ttype filter hook input priority filter; policy accept;\n");
+    ruleset.push_str(&format!("\t\tiifname \"{iface}\" udp dport 67 accept\n"));
+    ruleset.push_str(&format!("\t\tiifname \"{iface}\" drop\n"));
+    ruleset.push_str("\t}\n");
+
+    ruleset.push_str("}\n");
     ruleset
 }
 
@@ -635,6 +659,50 @@ mod tests {
             plan_egress_scoped(&allow, EgressOs::MacOs, Some("sandytap0")),
             plan_egress(&allow, EgressOs::MacOs),
             "macOS must stay honestly unenforced regardless of a tap"
+        );
+    }
+
+    // --- tier-1: the input-hook host filter (#376) -------------------------------
+
+    /// #376 (pinned translation): the forward ruleset also carries an `input`-hook
+    /// chain scoped to the guest's `iface`, with `policy accept` (so every other
+    /// interface's input is untouched), a DHCP accept, and a trailing drop. Pinned
+    /// as one exact body so a partial emission (e.g. the drop without the DHCP
+    /// accept) is caught, not just a loose `contains`.
+    #[test]
+    fn forward_ruleset_adds_an_input_chain_that_allows_only_dhcp_from_the_guest() {
+        let ruleset = to_nftables_forward(&AllowList::default(), "sandytap0");
+        let expected_input = "\tchain input {\n\t\ttype filter hook input priority filter; policy \
+                              accept;\n\t\tiifname \"sandytap0\" udp dport 67 accept\n\t\tiifname \"sandytap0\" \
+                              drop\n\t}\n";
+        assert!(
+            ruleset.contains(expected_input),
+            "the input chain must be exactly this body: {ruleset}"
+        );
+    }
+
+    /// #376 (no allow-list leak): a host-destined allow-list entry (the tap's own
+    /// address, e.g. a host-local resolver) never reaches the input chain — the
+    /// host is not a forward destination, so there is no legitimate accept to
+    /// carry over, and the entry must not turn into an input-chain hole.
+    #[test]
+    fn forward_ruleset_input_chain_ignores_a_host_address_allow_entry() {
+        let allow = AllowList {
+            rules: vec![EgressRule {
+                host: "10.77.0.1".to_string(),
+                port: 53,
+            }],
+        };
+        let ruleset = to_nftables_forward(&allow, "sandytap0");
+        let input_start = ruleset.find("chain input").expect("ruleset must carry an input chain");
+        let input_body = &ruleset[input_start..];
+        assert!(
+            !input_body.contains("10.77.0.1"),
+            "an allow-list entry must never appear in the input chain: {ruleset}"
+        );
+        assert!(
+            !input_body.contains("53"),
+            "the allow-listed port must never appear in the input chain: {ruleset}"
         );
     }
 

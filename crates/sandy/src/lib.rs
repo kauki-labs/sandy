@@ -82,8 +82,10 @@ pub use provision::{
 };
 pub use reconcile::reconcile_job;
 pub use result::{
-    Classification, Logs, OutputRef, OutputStatus, ProcessExit, Provenance, RESULT_SCHEMA_VERSION, Receipt,
-    ResultEnvelope, Status, classify_backend_error, classify_invalid_plan, classify_outcome,
+    AuditReceipt, Classification, CredentialReceipt, EgressAttempt, EgressEnforcement, EgressReceipt, GuestReported,
+    HostObserved, Location, Logs, OutputRef, OutputSizeRef, OutputStatus, ProcessExit, Provenance,
+    RESULT_SCHEMA_VERSION, Receipt, ResultEnvelope, Status, Timing, What, Who, classify_backend_error,
+    classify_invalid_plan, classify_outcome,
 };
 /// fsync a directory so a preceding create/rename within it is durable across a
 /// crash (INV-4/INV-6).

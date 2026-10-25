@@ -89,6 +89,7 @@ pub fn classify_invalid_plan(_error: &PlanError) -> Classification {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AllowList;
 
     fn sample_envelope() -> ResultEnvelope {
         ResultEnvelope {
@@ -113,6 +114,50 @@ mod tests {
                 tail: "done".to_string(),
             },
             warnings: vec!["credential \"GH_TOKEN\" revoke failed at teardown; relying on native expiry".to_string()],
+            receipt: Some(sample_receipt()),
+        }
+    }
+
+    /// A fully populated [`AuditReceipt`] exercising every nested wire key,
+    /// including the `where`/`guest_reported` raw-ish names (#361).
+    fn sample_receipt() -> AuditReceipt {
+        AuditReceipt {
+            host_observed: HostObserved {
+                who: Who {
+                    identity: "1000".to_string(),
+                    authenticated: false,
+                },
+                what: What {
+                    job_id: "job-1".to_string(),
+                    template: "demo".to_string(),
+                    template_store_path: None,
+                    manifest_digest: None,
+                },
+                location: Location {
+                    backend: "qemu".to_string(),
+                    executor_host_id: None,
+                    executor_mesh_ip: None,
+                },
+                credential: None,
+                egress: EgressReceipt {
+                    status: EgressEnforcement::Enforced,
+                    reason: None,
+                    allow_list: Some(AllowList::default()),
+                    attempts: vec![],
+                },
+                timing: Timing {
+                    boot_started_at: std::time::SystemTime::UNIX_EPOCH,
+                    job_started_at: None,
+                    teardown_at: std::time::SystemTime::UNIX_EPOCH,
+                },
+            },
+            guest_reported: GuestReported {
+                exit_code: Some(0),
+                outputs: vec![OutputSizeRef {
+                    path: "result.txt".to_string(),
+                    size_bytes: 3,
+                }],
+            },
         }
     }
 
@@ -135,6 +180,7 @@ mod tests {
                 "message",
                 "outputs",
                 "provenance",
+                "receipt",
                 "receipts",
                 "result_schema_version",
                 "retryable",
@@ -150,6 +196,21 @@ mod tests {
             value["warnings"][0],
             "credential \"GH_TOKEN\" revoke failed at teardown; relying on native expiry"
         );
+        // #361: the new receipt's nested keys, including the `where`/`guest_reported`
+        // names the issue's own vocabulary uses — never `location` or `guestReported`.
+        let receipt = &value["receipt"];
+        assert_eq!(receipt["host_observed"]["who"]["identity"], "1000");
+        assert_eq!(receipt["host_observed"]["who"]["authenticated"], false);
+        assert_eq!(receipt["host_observed"]["what"]["job_id"], "job-1");
+        assert_eq!(receipt["host_observed"]["where"]["backend"], "qemu");
+        assert!(
+            receipt["host_observed"].get("location").is_none(),
+            "the wire key must be `where`, not the Rust field name `location`"
+        );
+        assert_eq!(receipt["host_observed"]["egress"]["status"], "enforced");
+        assert_eq!(receipt["guest_reported"]["exit_code"], 0);
+        assert_eq!(receipt["guest_reported"]["outputs"][0]["path"], "result.txt");
+        assert_eq!(receipt["guest_reported"]["outputs"][0]["size_bytes"], 3);
         Ok(())
     }
 
@@ -173,6 +234,30 @@ mod tests {
         });
         let envelope: ResultEnvelope = serde_json::from_value(v1_json)?;
         assert!(envelope.warnings.is_empty());
+        Ok(())
+    }
+
+    /// #361: a pre-`3` (schema `2`) journal record with no `receipt` key still
+    /// deserializes, defaulting to `None` — same `#[serde(default)]` precedent as
+    /// `warnings` above, one schema bump later.
+    #[test]
+    fn an_old_schema_v2_record_with_no_receipt_key_deserializes_to_none() -> anyhow::Result<()> {
+        let v2_json = serde_json::json!({
+            "result_schema_version": 2,
+            "job_id": "job-1",
+            "box_id": null,
+            "status": "succeeded",
+            "retryable": false,
+            "message": "ok",
+            "exit_code": 0,
+            "outputs": [],
+            "receipts": [],
+            "provenance": { "template_store_path": "" },
+            "logs": { "tail": "" },
+            "warnings": [],
+        });
+        let envelope: ResultEnvelope = serde_json::from_value(v2_json)?;
+        assert!(envelope.receipt.is_none());
         Ok(())
     }
 

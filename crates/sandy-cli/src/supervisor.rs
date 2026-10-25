@@ -15,12 +15,14 @@ use std::{
 };
 
 use sandy::{
-    BackendError, CALL_DEADLINE, Classification, CoreError, CredentialProvider, DirFingerprint, EgressApplier,
-    EgressOs, EgressOutcome, JOURNAL_SCHEMA_VERSION, JobRecord, JobState, Journal, Lease, Logs, MAX_TTL_SECS, Outcome,
-    OutputRef, OutputStatus, ProcessExit, Profile, Provenance, RESULT_SCHEMA_VERSION, ResultEnvelope, Scope,
-    SecretSource, StagedImage, Status, VmBackend, classify_backend_error, classify_invalid_plan, classify_outcome,
-    enforce, mint_lease, mint_lease_checked, new_job_id, plan_egress_scoped, plan_eviction, reconcile_job,
-    refresh_once_checked, validate_egress_hosts, validate_no_secret_leak,
+    AllowList, AuditReceipt, BackendError, CALL_DEADLINE, Classification, CoreError, CredentialProvider,
+    CredentialReceipt, DirFingerprint, EgressApplier, EgressEnforcement, EgressOs, EgressOutcome, EgressReceipt,
+    GuestReported, HostObserved, JOURNAL_SCHEMA_VERSION, JobRecord, JobState, Journal, Lease, Location, Logs,
+    MAX_TTL_SECS, Outcome, OutputRef, OutputSizeRef, OutputStatus, ProcessExit, Profile, Provenance,
+    RESULT_SCHEMA_VERSION, ResultEnvelope, SandboxKind, Scope, SecretSource, StagedImage, Status, Timing, VmBackend,
+    What, Who, classify_backend_error, classify_invalid_plan, classify_outcome, enforce, mint_lease,
+    mint_lease_checked, new_job_id, plan_egress_scoped, plan_eviction, reconcile_job, refresh_once_checked,
+    validate_egress_hosts, validate_no_secret_leak,
 };
 use zeroize::Zeroizing;
 
@@ -59,8 +61,15 @@ fn redact_with_refreshes(console: String, initial: &str, refreshed: &[Zeroizing<
 ///
 /// `outputs` are the files the backend collected to the job's declared
 /// destinations (empty when the run never collected, e.g. an invalid plan or an
-/// infra fault). Receipts and provenance remain placeholders (provenance capture
-/// lands with #26).
+/// infra fault). `receipt` is the audit receipt (#361): `None` for a run that
+/// never reached the backend (invalid plan) or never ran one (`kill`'s synthetic
+/// cancellation). Provenance remains a placeholder (provenance capture lands
+/// with #26).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "every field of the LOCKED envelope this helper assembles; a bundling struct would just move the fields, \
+              not reduce them"
+)]
 fn build_envelope(
     job_id: &str,
     box_id: Option<String>,
@@ -69,6 +78,7 @@ fn build_envelope(
     message: String,
     console: String,
     outputs: Vec<OutputRef>,
+    receipt: Option<AuditReceipt>,
 ) -> ResultEnvelope {
     ResultEnvelope {
         result_schema_version: RESULT_SCHEMA_VERSION,
@@ -91,33 +101,135 @@ fn build_envelope(
         // A credentialed run folds a non-fatal teardown fault in here after this
         // envelope is built (L-12); every other path leaves it empty.
         warnings: vec![],
+        receipt,
+    }
+}
+
+/// The backend kind name for [`Location::backend`] (#361): `"process"` for the
+/// process backend, else `"qemu"`/`"vfkit"` by host OS — [`SandboxKind`] alone
+/// only distinguishes process from VM, and this codebase pairs exactly one VM
+/// backend with each OS (`QemuBackend` on Linux, `VfkitBackend` on macOS), so
+/// the pairing is accurate without a new seam method.
+fn backend_kind_name(kind: SandboxKind, os: EgressOs) -> &'static str {
+    match (kind, os) {
+        (SandboxKind::Process, _) => "process",
+        (SandboxKind::Vm, EgressOs::Linux) => "qemu",
+        (SandboxKind::Vm, EgressOs::MacOs) => "vfkit",
+    }
+}
+
+/// Build the egress half of the receipt (#361) from the same [`EgressOutcome`]
+/// (or apply failure) that already drove `run_job`'s enforce/revert bracket —
+/// the one platform-keyed signal, not a second copy of the logic (shared with
+/// #358's warning).
+fn build_egress_receipt(result: &Result<EgressOutcome, String>, allow: &AllowList) -> EgressReceipt {
+    match result {
+        Ok(EgressOutcome::Enforced) => EgressReceipt {
+            status: EgressEnforcement::Enforced,
+            reason: None,
+            allow_list: Some(allow.clone()),
+            attempts: vec![],
+        },
+        Ok(EgressOutcome::Unenforced { reason }) => EgressReceipt {
+            status: EgressEnforcement::Unenforced,
+            reason: Some(reason.clone()),
+            // Nothing was applied: never label an allow-list "applied" when it wasn't.
+            allow_list: None,
+            attempts: vec![],
+        },
+        Err(apply_error) => EgressReceipt {
+            status: EgressEnforcement::Unenforced,
+            reason: Some(format!("egress boundary not established: {apply_error}")),
+            allow_list: None,
+            attempts: vec![],
+        },
+    }
+}
+
+/// Build the receipt for a run that reached backend execution (#361). `who` is
+/// always the local uid today (`authenticated: false`): no run path yet derives
+/// it from a verified submitter cap — sandyd's dispatch core does not persist a
+/// receipt at all yet (#413). `credential` starts
+/// `None`; [`run_job_with_credential`] fills it in after teardown.
+fn build_host_observed(
+    job_id: &str,
+    plan: &JobPlan,
+    backend_kind: SandboxKind,
+    egress_os: EgressOs,
+    egress_result: &Result<EgressOutcome, String>,
+    started: SystemTime,
+    teardown_at: SystemTime,
+) -> HostObserved {
+    HostObserved {
+        who: Who {
+            identity: sandy_fsutil::current_uid().to_string(),
+            authenticated: false,
+        },
+        what: What {
+            job_id: job_id.to_string(),
+            template: plan.template.clone(),
+            template_store_path: None,
+            manifest_digest: None,
+        },
+        location: Location {
+            backend: backend_kind_name(backend_kind, egress_os).to_string(),
+            executor_host_id: None,
+            executor_mesh_ip: None,
+        },
+        credential: None,
+        egress: build_egress_receipt(egress_result, &plan.allow),
+        timing: Timing {
+            boot_started_at: started,
+            job_started_at: None,
+            teardown_at,
+        },
     }
 }
 
 /// List the files the backend collected to each declared output's destination as
-/// [`OutputRef`]s. The path is logical, not a host path: `<name>/<relpath>` for a
-/// named output (`--out NAME:DEST`) and `<relpath>` for a catch-all (`--out DEST`),
-/// so it identifies what the job produced independent of where on the host the
-/// caller sent it. Sorted for a deterministic envelope. Best-effort: an unreadable
-/// destination contributes no refs.
-fn collect_output_refs(plan: &JobPlan) -> Vec<OutputRef> {
-    let mut refs = Vec::new();
+/// `(logical path, size in bytes)` pairs. The path is logical, not a host path:
+/// `<name>/<relpath>` for a named output (`--out NAME:DEST`) and `<relpath>` for a
+/// catch-all (`--out DEST`), so it identifies what the job produced independent of
+/// where on the host the caller sent it. Sorted by path for a deterministic
+/// envelope. Best-effort: an unreadable destination or an unstatable file
+/// contributes no entry — shared by [`collect_output_refs`] (envelope.outputs) and
+/// [`collect_output_size_refs`] (the receipt's `guest_reported.outputs`, #361),
+/// so the two never disagree on what was collected.
+fn collect_output_entries(plan: &JobPlan) -> Vec<(String, u64)> {
+    let mut entries = Vec::new();
     for output in &plan.outputs {
-        walk_outputs(&output.dest, output.name.as_deref().unwrap_or(""), &mut refs);
+        walk_outputs(&output.dest, output.name.as_deref().unwrap_or(""), &mut entries);
     }
-    refs.sort_by(|a, b| a.path.cmp(&b.path));
-    refs
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries
 }
 
-/// Recurse `dir`, pushing one [`OutputRef`] per regular file with a
+/// [`collect_output_entries`] as [`OutputRef`]s (`envelope.outputs`).
+fn collect_output_refs(plan: &JobPlan) -> Vec<OutputRef> {
+    collect_output_entries(plan)
+        .into_iter()
+        .map(|(path, _)| OutputRef { path })
+        .collect()
+}
+
+/// [`collect_output_entries`] as [`OutputSizeRef`]s (the receipt's
+/// `guest_reported.outputs`, #361).
+fn collect_output_size_refs(plan: &JobPlan) -> Vec<OutputSizeRef> {
+    collect_output_entries(plan)
+        .into_iter()
+        .map(|(path, size_bytes)| OutputSizeRef { path, size_bytes })
+        .collect()
+}
+
+/// Recurse `dir`, pushing one `(logical path, size)` entry per regular file with a
 /// `<prefix>/<name>` logical path (an empty `prefix` yields the bare relative
 /// path). Symlinks and special files are skipped — collection already dropped
 /// escaping symlinks, so none should remain, and a stray one is not an output.
-fn walk_outputs(dir: &Path, prefix: &str, refs: &mut Vec<OutputRef>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+fn walk_outputs(dir: &Path, prefix: &str, entries: &mut Vec<(String, u64)>) {
+    let Ok(dir_entries) = std::fs::read_dir(dir) else {
         return;
     };
-    for entry in entries.flatten() {
+    for entry in dir_entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         let rel = if prefix.is_empty() {
@@ -126,8 +238,12 @@ fn walk_outputs(dir: &Path, prefix: &str, refs: &mut Vec<OutputRef>) {
             format!("{prefix}/{name}")
         };
         match entry.file_type() {
-            Ok(ft) if ft.is_dir() => walk_outputs(&entry.path(), &rel, refs),
-            Ok(ft) if ft.is_file() => refs.push(OutputRef { path: rel }),
+            Ok(ft) if ft.is_dir() => walk_outputs(&entry.path(), &rel, entries),
+            Ok(ft) if ft.is_file() => {
+                if let Ok(metadata) = entry.metadata() {
+                    entries.push((rel, metadata.len()));
+                }
+            }
             _ => {}
         }
     }
@@ -206,6 +322,7 @@ pub fn run_job<B: VmBackend + ?Sized, E: EgressApplier + ?Sized>(
             plan_error.to_string(),
             redact_console(String::new(), redact),
             vec![],
+            None,
         );
         return Ok(RunReport {
             envelope,
@@ -234,8 +351,13 @@ pub fn run_job<B: VmBackend + ?Sized, E: EgressApplier + ?Sized>(
     // 4. On a successful apply, run the backend, then ALWAYS revert when the boundary was enforced — on both the ok and
     //    error paths, so a boot failure never leaves nftables rules up.
     let eplan = plan_egress_scoped(&plan.allow, egress_os, tap);
+    // Captured alongside `run_result` so the receipt's egress half (#361) reads
+    // the SAME platform-keyed outcome that drove the enforce/revert bracket below,
+    // never a second, independently derived copy.
+    let egress_receipt_result: Result<EgressOutcome, String>;
     let run_result: Result<Outcome, BackendError> = match enforce(&eplan, egress) {
         Ok(eoutcome) => {
+            egress_receipt_result = Ok(eoutcome.clone());
             let outcome = backend.run(&spec);
             if matches!(eoutcome, EgressOutcome::Enforced)
                 && let Err(e) = egress.revert()
@@ -245,6 +367,7 @@ pub fn run_job<B: VmBackend + ?Sized, E: EgressApplier + ?Sized>(
             outcome
         }
         Err(egress_error) => {
+            egress_receipt_result = Err(egress_error.to_string());
             tracing::warn!(%job_id, %egress_error, "egress apply failed; refusing to boot (fail-closed)");
             Err(BackendError::Spawn(format!(
                 "egress boundary not established: {egress_error}"
@@ -254,7 +377,7 @@ pub fn run_job<B: VmBackend + ?Sized, E: EgressApplier + ?Sized>(
 
     // 5. Classify the physical outcome. The console tail is carried through to the envelope so a boot fault (which
     //    never produced a guest exit) is still diagnosable from the record alone.
-    let (classification, guest_exit, message, console, outputs) = match run_result {
+    let (classification, guest_exit, message, console, outputs, output_sizes) = match run_result {
         Err(backend_error) => {
             tracing::warn!(%job_id, error = %backend_error, "backend run failed (infra fault)");
             (
@@ -262,6 +385,7 @@ pub fn run_job<B: VmBackend + ?Sized, E: EgressApplier + ?Sized>(
                 None,
                 format!("infra fault: {backend_error}"),
                 String::new(),
+                vec![],
                 vec![],
             )
         }
@@ -277,14 +401,44 @@ pub fn run_job<B: VmBackend + ?Sized, E: EgressApplier + ?Sized>(
                 format!("run {:?}", classification.status),
                 outcome.console,
                 collect_output_refs(plan),
+                collect_output_size_refs(plan),
             )
         }
     };
+    // Teardown completed the moment the backend returned and the egress boundary
+    // (if enforced) was reverted, just above — captured here, before the console
+    // redaction pass or the journal write, neither of which are part of the run
+    // itself (#361's `timing.teardown_at`).
+    let teardown_at = SystemTime::now();
 
     // 6. Write the terminal record carrying the envelope (INV-6). Redact right before the envelope is built: this is
     //    the last point before the journal write, and there's no seam after `run_job` returns (M-6).
     let console = redact_console(console, redact);
-    let envelope = build_envelope(&job_id, None, classification, guest_exit, message, console, outputs);
+    let receipt = Some(AuditReceipt {
+        host_observed: build_host_observed(
+            &job_id,
+            plan,
+            backend.kind(),
+            egress_os,
+            &egress_receipt_result,
+            started,
+            teardown_at,
+        ),
+        guest_reported: GuestReported {
+            exit_code: guest_exit,
+            outputs: output_sizes,
+        },
+    });
+    let envelope = build_envelope(
+        &job_id,
+        None,
+        classification,
+        guest_exit,
+        message,
+        console,
+        outputs,
+        receipt,
+    );
     let terminal = JobRecord {
         schema_version: JOURNAL_SCHEMA_VERSION,
         job_id,
@@ -429,6 +583,9 @@ pub fn run_job_with_credential<
         cred_dir_fingerprint,
     )
     .map_err(|e| CoreError::Cred(e.to_string()))?;
+    // Captured for the receipt's `credential.minted_at` (#361): right after the
+    // mint that just succeeded, before the boot it's staged for.
+    let minted_at = SystemTime::now();
     let SecretSource::File(token_path) = &lease.secret_ref.source else {
         // mint_lease always stages a File-sourced secret; a non-File source is a
         // contract violation, not a run-with-no-credential.
@@ -484,12 +641,17 @@ pub fn run_job_with_credential<
         scope: scope.clone(),
         job_id: String::new(),
         done: false,
+        revoked_at: None,
+        revoke_succeeded: None,
     };
     // Borrow the zeroizing holder directly: no unzeroized plaintext clone.
     // `run_job`'s own redaction only ever sees this initial token; `redact_log`
     // (M-6 follow-up) catches whatever a mid-run refresh adds after that.
     let redact = std::slice::from_ref(&*teardown.secret);
     let redact_log: Mutex<Vec<Zeroizing<String>>> = Mutex::new(Vec::new());
+    // Parallel to `redact_log`: when each mid-run refresh fired, for the
+    // receipt's `credential.refreshed_at` (#361).
+    let refresh_times_log: Mutex<Vec<SystemTime>> = Mutex::new(Vec::new());
 
     // Run the job on this thread; refresh the credential on a second thread until the
     // run returns, then signal it to stop by dropping the sender. The refresh thread
@@ -497,6 +659,7 @@ pub fn run_job_with_credential<
     // receiver; the scope joins it before the guard's teardown can run.
     let shared_lease = &teardown.lease;
     let shared_redact_log = &redact_log;
+    let shared_refresh_times_log = &refresh_times_log;
     let mut report = std::thread::scope(|s| {
         s.spawn(move || {
             refresh_loop(
@@ -506,6 +669,7 @@ pub fn run_job_with_credential<
                 tick,
                 &stop_rx,
                 shared_redact_log,
+                shared_refresh_times_log,
                 cred_dir_fingerprint,
             )
         });
@@ -526,6 +690,23 @@ pub fn run_job_with_credential<
     }
     let warning = teardown.teardown();
     let refreshed_tokens = redact_log.into_inner().unwrap_or_else(PoisonError::into_inner);
+    let refreshed_at = refresh_times_log.into_inner().unwrap_or_else(PoisonError::into_inner);
+    // #361: the only credential provider implemented today (`GithubAdapter`);
+    // becomes a caller-supplied parameter once a second provider (e.g. GitLab)
+    // ships — `CredentialProvider` itself exposes no name to read back.
+    const CREDENTIAL_PROVIDER: &str = "github";
+    let credential_receipt = CredentialReceipt {
+        provider: CREDENTIAL_PROVIDER.to_string(),
+        scope: scope.clone(),
+        minted_at,
+        refreshed_at,
+        // `teardown.teardown()` above always sets both on its one real run
+        // (the `done` guard makes every later call, including `Drop`'s, a
+        // no-op); these fallbacks are unreachable in practice, not a silent
+        // default standing in for a real observation.
+        revoked_at: teardown.revoked_at.unwrap_or(minted_at),
+        revoke_succeeded: teardown.revoke_succeeded.unwrap_or(false),
+    };
     if let Ok(run_report) = &mut report {
         let mut amended = false;
 
@@ -541,6 +722,15 @@ pub fn run_job_with_credential<
         }
         if let Some(warning) = warning {
             run_report.envelope.warnings.push(warning);
+            amended = true;
+        }
+        // `run_job` always sets `credential: None` (it knows nothing of the
+        // bracket wrapping it); fill it in here, the first point the
+        // credential's own lifecycle is known. `None` only when `run_job`
+        // itself never reached a Running record (an invalid plan) — nothing
+        // to amend onto in that case.
+        if let Some(receipt) = &mut run_report.envelope.receipt {
+            receipt.host_observed.credential = Some(credential_receipt);
             amended = true;
         }
 
@@ -600,6 +790,12 @@ struct CredTeardown<'a, P: CredentialProvider + ?Sized> {
     /// the implicit one from `Drop` after an explicit call already handled it —
     /// is a no-op.
     done: bool,
+    /// When [`CredTeardown::teardown`] actually ran, for the receipt's
+    /// `credential.revoked_at` (#361). `None` only before `teardown` has run.
+    revoked_at: Option<SystemTime>,
+    /// Whether that revoke call succeeded, for `credential.revoke_succeeded`
+    /// (#361). `None` only before `teardown` has run.
+    revoke_succeeded: Option<bool>,
 }
 
 impl<P: CredentialProvider + ?Sized> CredTeardown<'_, P> {
@@ -620,7 +816,10 @@ impl<P: CredentialProvider + ?Sized> CredTeardown<'_, P> {
             .expires_at
             .duration_since(SystemTime::now())
             .unwrap_or(Duration::ZERO);
-        let warning = self.provider.revoke(lease).err().map(|e| {
+        self.revoked_at = Some(SystemTime::now());
+        let revoke_result = self.provider.revoke(lease);
+        self.revoke_succeeded = Some(revoke_result.is_ok());
+        let warning = revoke_result.err().map(|e| {
             tracing::warn!(
                 job_id = %self.job_id,
                 scope = ?self.scope,
@@ -724,6 +923,10 @@ fn safe_heartbeat_tick(tick: Duration, max_ttl_secs: u32, call_deadline: Duratio
 /// genuinely running job can otherwise go longer than that between refreshes.
 /// A `kill -9`'d process stops ticking, so an actually abandoned dir still
 /// ages out.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the loop threads the shared lease, both logs it feeds, and the caller's fingerprint check"
+)]
 fn refresh_loop<P: CredentialProvider + Sync + ?Sized>(
     provider: &P,
     lease: &Mutex<Lease>,
@@ -731,6 +934,7 @@ fn refresh_loop<P: CredentialProvider + Sync + ?Sized>(
     tick: Duration,
     stop: &mpsc::Receiver<()>,
     redact_log: &Mutex<Vec<Zeroizing<String>>>,
+    refresh_times_log: &Mutex<Vec<SystemTime>>,
     cred_dir_fingerprint: DirFingerprint,
 ) {
     loop {
@@ -748,6 +952,12 @@ fn refresh_loop<P: CredentialProvider + Sync + ?Sized>(
         }
         match refresh_once_checked(provider, &mut guard, SystemTime::now(), margin, cred_dir_fingerprint) {
             Ok(true) => {
+                // For the receipt (#361): record when this refresh happened,
+                // regardless of whether the token can also be read back below.
+                refresh_times_log
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(SystemTime::now());
                 if let SecretSource::File(path) = &guard.secret_ref.source {
                     match std::fs::read_to_string(path) {
                         Ok(new_token) => redact_log
@@ -838,6 +1048,9 @@ pub fn kill<B: VmBackend>(journal: &Journal, backend: &B, job_id: &str) -> Resul
         "cancelled by kill".to_string(),
         String::new(),
         vec![],
+        // No backend run to observe (kill tears a Running job down, it never
+        // itself runs one) — same reasoning as the invalid-plan path (#361).
+        None,
     );
     let cancelled = JobRecord {
         state: JobState::Cancelled,
@@ -1332,12 +1545,16 @@ mod tests {
         let margin = Duration::from_secs(1_000_000);
         let tick = Duration::from_millis(5);
         let redact_log: Mutex<Vec<Zeroizing<String>>> = Mutex::new(Vec::new());
+        let refresh_times_log: Mutex<Vec<SystemTime>> = Mutex::new(Vec::new());
 
         std::thread::scope(|s| {
             let pref = &provider;
             let shared = &lease;
             let shared_log = &redact_log;
-            s.spawn(move || super::refresh_loop(pref, shared, margin, tick, &rx, shared_log, fingerprint));
+            let shared_times = &refresh_times_log;
+            s.spawn(move || {
+                super::refresh_loop(pref, shared, margin, tick, &rx, shared_log, shared_times, fingerprint)
+            });
             std::thread::sleep(Duration::from_millis(50));
             drop(tx);
         });
@@ -1349,6 +1566,10 @@ mod tests {
         assert!(
             !redact_log.into_inner().unwrap().is_empty(),
             "a refreshed token must be queued for post-run console redaction"
+        );
+        assert!(
+            !refresh_times_log.into_inner().unwrap().is_empty(),
+            "a refresh's timestamp must be queued for the credential receipt (#361)"
         );
         Ok(())
     }
@@ -1387,12 +1608,16 @@ mod tests {
         let margin = Duration::from_secs(1);
         let tick = Duration::from_millis(5);
         let redact_log: Mutex<Vec<Zeroizing<String>>> = Mutex::new(Vec::new());
+        let refresh_times_log: Mutex<Vec<SystemTime>> = Mutex::new(Vec::new());
 
         std::thread::scope(|s| {
             let pref = &provider;
             let shared = &lease;
             let shared_log = &redact_log;
-            s.spawn(move || super::refresh_loop(pref, shared, margin, tick, &rx, shared_log, fingerprint));
+            let shared_times = &refresh_times_log;
+            s.spawn(move || {
+                super::refresh_loop(pref, shared, margin, tick, &rx, shared_log, shared_times, fingerprint)
+            });
             std::thread::sleep(Duration::from_millis(50));
             drop(tx);
         });
