@@ -172,10 +172,12 @@ every knob below from environment variables — there is no CLI flag form.
    address before `sandyd` sees any of this as meaningful.
 
 2. **Executor** (the remote host): `SANDY_AGENT_PATH` **must** resolve inside the `bwrap`
-   sandbox the trusted-process backend launches the job in. A path under a dev checkout or
-   `/tmp` is invisible to that sandbox — `execvp` fails with a plain "No such file or
-   directory" that looks like a missing binary even though it's right there on the real
-   filesystem. Use the Nix store path:
+   sandbox the trusted-process backend launches the job in (`--ro-bind / /`, then
+   `--tmpfs /tmp` on top). The real root is visible read-only, but `/tmp` specifically is
+   replaced by a fresh, empty tmpfs — a path under `/tmp` (a `/tmp`-based dev checkout
+   included) is invisible there, and `execvp` fails with a plain "No such file or directory"
+   that looks like a missing binary even though it's right there on the real filesystem.
+   A path outside `/tmp` works; the Nix store path is the simplest one to reach for:
 
    ```
    SANDY_AGENT_PATH="$(nix build .#sandy-agent --no-link --print-out-paths)/bin/sandy-agent" \
