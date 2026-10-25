@@ -386,17 +386,17 @@ Each attack assumes the #357 model: the job is root in the guest.
 Milestone "Hardened egress + provenance". Each issue carries its own acceptance
 criteria and live KPI rows.
 
-| Issue | Seam                                                        | Blocked by    |
-| ----- | ----------------------------------------------------------- | ------------- |
-| #E1   | `sandy-egress-proxy`: CONNECT, allow-list, and address core | -             |
-| #E2   | `sandy-agent egress-relay`: the guest-side relay            | -             |
-| #E3   | Seam: `RunSpec` egress policy, plan variant, band 3         | -             |
-| #E4   | qemu: proxy lifecycle, vsock port, peer-CID check           | #E1, #E2, #E3 |
-| #E5   | vfkit: proxy lifecycle, `listen` socket                     | #E1, #E2, #E3 |
-| #E6   | Live parity gate on qemu and vfkit                          | #E4, #E5      |
-| #E7   | Cutover: delete the nftables path, guest topology drops NIC | #E6           |
-| #E8   | Flip #358's warning to a refusal                            | #E7, #358     |
+| Issue | Seam                                                        | Blocked by       |
+| ----- | ----------------------------------------------------------- | ---------------- |
+| #401  | `sandy-egress-proxy`: CONNECT, allow-list, and address core | -                |
+| #402  | `sandy-agent egress-relay`: the guest-side relay            | -                |
+| #403  | Seam: `RunSpec` egress policy, plan variant, band 3         | -                |
+| #404  | qemu: proxy lifecycle, vsock port, peer-CID check           | #401, #402, #403 |
+| #405  | vfkit: proxy lifecycle, `listen` socket                     | #401, #402, #403 |
+| #406  | Live parity gate on qemu and vfkit                          | #404, #405       |
+| #407  | Cutover: delete the nftables path, guest topology drops NIC | #406             |
+| #408  | Flip #358's warning to a refusal                            | #407, #358       |
 
 Already filed and fed by this work: #375 (egress attempts in receipts) and #377
-(hostname entries), both blocked by #E4 and #E5. #372 holds the deferred TLS
+(hostname entries), both blocked by #404 and #405. #372 holds the deferred TLS
 termination and non-HTTP egress.
