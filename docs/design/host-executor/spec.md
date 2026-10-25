@@ -140,9 +140,58 @@ Plus these assertions, each of which Stage 1 cannot pass without:
   re-check), never downgraded onto `trusted-process`.
 - **Result path** — the `ResultEnvelope` / `AgentReport` exit-band classification is locked
   (INV-11): an agent failure without a report surfaces as an infrastructure fault, not a job
-  exit. Propagating the job's exit/output back into the orchestrator's job status is the open
-  stage-1 item — a completed job currently stays `JOB_STATUS_PENDING` in the orchestrator
-  (#292, item 5); a separate change wires it through.
+  exit. Propagation back into the orchestrator's job status now works: `outcome_result_message`
+  reports the result over the host-executor's registration connection, and `sandyd`'s
+  `record_job_result` resolves the job to its terminal `JobStatus`, observable through `attach`'s
+  status watch and through `daemon status`. Confirmed in a manual two-machine run (see below).
+
+## Manual cross-machine smoke test
+
+Three processes, no nix module, for poking at the real binaries by hand. `sandyd` resolves
+every knob below from environment variables — there is no CLI flag form.
+
+1. **Orchestrator** (anywhere; the example below is macOS, a Linux host works the same way).
+   `SANDY_MESH_LISTEN` is the address a host-executor registers against;
+   `SANDY_MESH_AGENT_LINK_LISTEN` is the **separate** address a dispatched job's agent dials
+   back on (decision 6) — both are required for a remote run to be reachable at all, and
+   each needs a distinct port:
+
+   ```
+   SANDY_SOCK=/tmp/sandyd.sock \
+   SANDY_MESH_LISTEN=<orchestrator-ip>:4000 SANDY_MESH_ALLOWLIST=<executor-ip> \
+   SANDY_MESH_AGENT_LINK_LISTEN=<orchestrator-ip>:4001 \
+   sandyd
+   ```
+
+   Both addresses must be a specific interface address, never `0.0.0.0`/`::` (D5 refuses an
+   unspecified bind). `SANDY_MESH_ALLOWLIST` is a comma-separated IP list; an unset or empty
+   allowlist with a listener configured is treated as a misconfiguration and refused, not a
+   deliberate allow-no-one policy.
+
+2. **Executor** (the remote host): `SANDY_AGENT_PATH` **must** resolve inside the `bwrap`
+   sandbox the trusted-process backend launches the job in. A path under a dev checkout or
+   `/tmp` is invisible to that sandbox — `execvp` fails with a plain "No such file or
+   directory" that looks like a missing binary even though it's right there on the real
+   filesystem. Use the Nix store path:
+
+   ```
+   SANDY_AGENT_PATH="$(nix build .#sandy-agent --no-link --print-out-paths)/bin/sandy-agent" \
+   SANDY_HOST_EXECUTOR_ORCHESTRATOR=<orchestrator-ip>:4000 \
+   SANDY_HOST_EXECUTOR_ID=<any-name> \
+   sandy-host-executor
+   ```
+
+3. **Submit and attach** (from the orchestrator host):
+
+   ```
+   SANDY_SOCK=/tmp/sandyd.sock sandy daemon submit manifest.json --manifest-encoding argv/v1 -o json
+   SANDY_SOCK=/tmp/sandyd.sock sandy daemon attach <job_id>
+   ```
+
+   For something to watch, use a manifest that keeps producing output
+   (`["sh","-c","for i in $(seq 1 20); do echo tick-$i; sleep 1; done"]`) rather than one that
+   finishes immediately. `attach`'s status-watch notice lands on **stderr**, not stdout —
+   stdout stays a clean byte-for-byte PTY stream.
 
 ## Out of scope now (seam ready, implementations deferred)
 
