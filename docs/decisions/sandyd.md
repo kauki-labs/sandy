@@ -2,7 +2,7 @@
 title: "Decisions: sandyd control plane"
 status: accepted
 project: sandy
-updated: 2026-10-24
+updated: 2026-10-25
 ---
 
 # Decisions: sandyd control plane
@@ -169,7 +169,7 @@ name: blurs direct-execution's and the daemon's job concepts together.
 
 ## 6. Remote agent-link streams must authenticate before `serve_agent_link` writes a frame (hard gate, on the M2 critical path)
 
-**Status:** partially implemented. The authorization logic is built and
+**Status:** accepted and implemented. The authorization logic is built and
 tested in isolation (`sandyd::link_auth`: `RemoteLink`, the constant-time
 token compare, `JobRegistry::authenticate_remote_link`) — accept-or-refuse
 given a job id, a peer IP, and a presented token, with every refusal path
@@ -186,18 +186,21 @@ requirement: cancelling a job invalidates its unclaimed link immediately, so
 a stream that arrives after cancellation gets the same zero-byte refusal as
 an already-claimed one (regression-tested: a cancelled job's still-valid,
 still-unclaimed token must not authenticate a late-arriving stream). The
-network accept loop (#279) is now built too: `sandyd::mesh_accept::
+network accept loop (#279) is built too: `sandyd::mesh_accept::
 serve_mesh_accept_loop` takes an already-bound `sandy_conn::Listener`,
 decodes each connection's run-id+token prefix via `sandy-executor-proto`'s
 `decode_remote_link_prefix` (#284, the one shared codec the executor's
 `forward_agent_link` also imports), authenticates it, and hands a success to
 `serve_agent_link` — every refusal path (malformed prefix, wrong peer, wrong
 token, unknown run, already-claimed) tested over a real TCP loopback
-connection to close with zero bytes written. What is NOT yet built: wiring
-`serve_mesh_accept_loop` into `main.rs` (needs a decision this slice doesn't
-own — how `sandyd` learns its own mesh bind address) and anything that calls
-`RemoteLink::new` to actually bind a run to an executor at dispatch — both
-wait on #263's dispatch-RPC design. Tracked by #212. Promoted from a
+connection to close with zero bytes written. The two remaining pieces named
+in an earlier revision of this decision are now both wired on the real
+path too: `main.rs`'s `setup_mesh_agent_link_listener` binds
+`$SANDY_MESH_AGENT_LINK_LISTEN` and spawns `sandyd::mesh_accept::
+serve_mesh_accept_loop` against it (decision 13), and the handler's own
+placement branch calls `RemoteLink::new` to bind a run to its picked
+executor before the job is persisted (`handler.rs`'s dispatch-plan
+construction). Promoted from a
 cross-machine-safety nicety to the M2 critical path (decision 8): M2's
 cross-sandbox peer-group channels depend on this binding existing.
 
@@ -797,7 +800,8 @@ poll a live `RunControl` is real, separate follow-up work (it needs the
 socket read to return on a short, bounded interval rather than blocking for
 the whole budget, and the protocol's existing phase/timeout-policy
 semantics understood well enough not to regress the acceptance suite) —
-intentionally not attempted blind within this change.
+intentionally not attempted blind within this change. Tracked by #366 (open,
+not yet merged to `main`); related: #185.
 
 **Follow-up (CodeRabbit on #344): the fail-safe above applies on every exit,
 not only a connection drop, and `AttachStateChanged` tolerates reordering
