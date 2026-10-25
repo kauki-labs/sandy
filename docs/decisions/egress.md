@@ -2,7 +2,7 @@
 title: "Decisions: egress"
 status: accepted
 project: sandy
-updated: 2026-10-14
+updated: 2026-10-25
 ---
 
 # Decisions: egress
@@ -10,6 +10,10 @@ updated: 2026-10-14
 Bracketing the boot with an allow-list so the guest's network is filtered, never
 the host's. Subsystem spec:
 [`../architecture/spec.md#5-egress`](../architecture/spec.md#5-egress).
+
+Both decisions below stay in force until the vsock egress proxy passes its live
+parity gate. The proxy then replaces them:
+[`egress-proxy.md`](egress-proxy.md) decision 5 (#360).
 
 ## 1. Guest-scoped, fail-closed
 
@@ -30,6 +34,10 @@ K13 (`live_egress.rs`, Linux + root + `nft`).
 
 **Set aside.** A host-wide ruleset: rejected, it risks locking out the controller.
 
+**Replaced after parity.** The NIC-less guest with a vsock host proxy
+([`egress-proxy.md`](egress-proxy.md)) removes this ruleset once both backends
+pass the parity gate.
+
 ## 2. macOS is a no-op
 
 **Status:** accepted.
@@ -42,3 +50,7 @@ without enforcement, **documented, not silent**.
 
 **Consequences.** macOS runs are unfiltered by design; the behaviour is stated in
 the result and the docs so it is not mistaken for enforcement.
+
+**Replaced after parity.** The vsock host proxy enforces egress on macOS the
+same way as on Linux ([`egress-proxy.md`](egress-proxy.md) decision 5). Its
+Context notes that the current vfkit argv emits no NIC at all.
