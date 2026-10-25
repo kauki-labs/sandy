@@ -26,7 +26,9 @@ the step it owns.
 flowchart TD
   cli["sandy run TEMPLATE<br/>--input / --out / --secret / --credential / --allow"]
   cli --> plan["parse_run → JobPlan"]
-  plan --> sup["supervisor::run_job<br/>Running record before boot (INV-6)"]
+  plan --> validate{"validate plan<br/>(no secret leak, egress hosts)"}
+  validate -- invalid --> band2["band 2: invalid plan<br/>no Running record, no backend run"]
+  validate -- valid --> sup["supervisor::run_job<br/>Running record before boot (INV-6)"]
   sup --> credq{"--credential?"}
 
   subgraph cred_seam["CredentialProvider seam"]

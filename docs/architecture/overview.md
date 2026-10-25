@@ -27,7 +27,9 @@ physical `Outcome`; the supervisor classifies it into the envelope and persists 
 flowchart TD
   cli["sandy run TEMPLATE<br/>--input / --out / --secret / --credential / --allow"]
   cli --> plan["parse_run → JobPlan<br/>(inputs, outputs, secrets, allow, grants)"]
-  plan --> sup["supervisor::run_job<br/>Running record BEFORE boot (INV-6)"]
+  plan --> validate{"validate plan<br/>(no secret leak, egress hosts)"}
+  validate -- invalid --> band2["band 2: invalid plan<br/>no Running record, no backend run"]
+  validate -- valid --> sup["supervisor::run_job<br/>Running record BEFORE boot (INV-6)"]
   sup --> cred{"--credential?"}
   cred -- yes --> mint["mint_lease → stage token 0600<br/>(revoke at teardown)"]
   cred -- no --> egress
