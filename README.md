@@ -93,11 +93,12 @@ sandy daemon list
 `sandy daemon` drives `sandyd`, an evolving control-plane daemon with its own
 job model (see [`docs/decisions/sandyd.md`](docs/decisions/sandyd.md)).
 
-### Running `sandyd` across multiple hosts (M2)
+### Running `sandyd` across multiple hosts
 
 `sandyd` can dispatch a job to a remote `sandy-host-executor` over a mesh
-(WireGuard/Tailscale) instead of running everything locally. All of `sandyd`'s
-config is environment variables, no CLI flags:
+(WireGuard/Tailscale) instead of running everything locally — e.g. a macOS
+orchestrator dispatching to a Linux executor, or any other OS pairing. All of
+`sandyd`'s config is environment variables, no CLI flags:
 
 ```sh
 # orchestrator host
