@@ -70,7 +70,10 @@ version, metadata, dependency versions, and lints through the root `Cargo.toml`
 - **`sandy-host-executor`** — the M2 remote executor (#269): detects and
   declares its capabilities, then handles dispatches sequentially — decodes the
   manifest, **independently re-checks** the isolation class, runs the job via the
-  process backend, and relays the sandbox agent's link back over the mesh.
+  process backend, and relays the sandbox agent's link back over the mesh. For
+  running a real `sandyd` + `sandy-host-executor` pair across two machines by
+  hand, see `docs/design/host-executor/spec.md`'s manual cross-machine smoke
+  test (mesh env vars, and why `SANDY_AGENT_PATH` must be a Nix store path).
 
 ## Build & test (run before committing)
 
