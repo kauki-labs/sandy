@@ -166,7 +166,10 @@ every knob below from environment variables — there is no CLI flag form.
    Both addresses must be a specific interface address, never `0.0.0.0`/`::` (D5 refuses an
    unspecified bind). `SANDY_MESH_ALLOWLIST` is a comma-separated IP list; an unset or empty
    allowlist with a listener configured is treated as a misconfiguration and refused, not a
-   deliberate allow-no-one policy.
+   deliberate allow-no-one policy. This allowlist is the authorization boundary (D5: the
+   orchestrator trusts the mesh's own per-peer identity, not a self-reported `host_id`) — the
+   underlying mesh (WireGuard/Tailscale) must already bind each node to its own `/32` peer
+   address before `sandyd` sees any of this as meaningful.
 
 2. **Executor** (the remote host): `SANDY_AGENT_PATH` **must** resolve inside the `bwrap`
    sandbox the trusted-process backend launches the job in. A path under a dev checkout or
@@ -192,6 +195,9 @@ every knob below from environment variables — there is no CLI flag form.
    (`["sh","-c","for i in $(seq 1 20); do echo tick-$i; sleep 1; done"]`) rather than one that
    finishes immediately. `attach`'s status-watch notice lands on **stderr**, not stdout —
    stdout stays a clean byte-for-byte PTY stream.
+
+   This covers `argv/v1` trusted-process execution only (`ProcessBackend::with_agent`). It does
+   not exercise `flake/v1`'s VM dispatch, untrusted-job execution, or per-job egress isolation.
 
 ## Out of scope now (seam ready, implementations deferred)
 
