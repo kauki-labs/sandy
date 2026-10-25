@@ -42,6 +42,7 @@ sandy-impls-vm = { workspace = true, optional = true }
 [dev-dependencies]
 anyhow.workspace = true
 sandy-api = { workspace = true, features = ["acceptance"] }
+sandy-fsutil.workspace = true
 sandy-impls-local.workspace = true
 sandy-impls-vm.workspace = true
 sandy-test-support.workspace = true

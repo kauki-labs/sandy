@@ -26,7 +26,10 @@
 
 use std::path::PathBuf;
 
-use sandy::{AllowList, EgressRule, Grants, Input, Output, PlanError, RunControl, RunSpec, SecretRef, SecretSource};
+use sandy::{
+    AllowList, DirFingerprint, EgressRule, Grants, Input, Output, PlanError, RunControl, RunSpec, SecretRef,
+    SecretSource,
+};
 
 /// Default wall-clock timeout when `--timeout` is omitted (5 minutes). Picked as
 /// a sane bound for an interactive foreground `run`; override with `--timeout`.
@@ -86,11 +89,13 @@ pub struct JobPlan {
     pub timeout_secs: u32,
     /// The trust tokens the run is granted.
     pub grants: Grants,
-    /// `Some(dir)` makes the backend stage secrets into, and share the guest
-    /// secret mount from, this caller-owned directory (see [`RunSpec::secret_dir`]).
-    /// Set by the credential bracket for refresh re-delivery (#49); `None` for an
-    /// ordinary run. Not a CLI option, the supervisor fills it.
-    pub secret_dir: Option<PathBuf>,
+    /// `Some((dir, fingerprint))` makes the backend stage secrets into, and share
+    /// the guest secret mount from, this caller-owned directory (see
+    /// [`RunSpec::secret_dir`]). Set by the credential bracket for refresh
+    /// re-delivery (#49), from the directory it validated itself and the
+    /// fingerprint that validation captured (#323); `None` for an ordinary run.
+    /// Not a CLI option, the supervisor fills it.
+    pub secret_dir: Option<(PathBuf, DirFingerprint)>,
     /// This run's live cancellation/deadline handle (#340) — `sandy run` is a
     /// synchronous foreground command with no attach-state concept of its
     /// own, so this is constructed once from `timeout_secs` and never
@@ -118,7 +123,10 @@ impl JobPlan {
             grants: &self.grants,
             // Foreground local run uses fd3 for the outcome, not a file (D2/ssh only).
             outcome_file: None,
-            secret_dir: self.secret_dir.as_deref(),
+            secret_dir: self
+                .secret_dir
+                .as_ref()
+                .map(|(dir, fingerprint)| (dir.as_path(), *fingerprint)),
             control: &self.control,
         }
     }
