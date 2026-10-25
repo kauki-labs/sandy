@@ -123,7 +123,8 @@ impl LocalLog {
         let flags = rustix::fs::OFlags::RDWR
             | rustix::fs::OFlags::APPEND
             | rustix::fs::OFlags::NOFOLLOW
-            | rustix::fs::OFlags::NONBLOCK;
+            | rustix::fs::OFlags::NONBLOCK
+            | rustix::fs::OFlags::CLOEXEC;
         let mode = rustix::fs::Mode::from_raw_mode(0o600);
         let (file, created) = match rustix::fs::openat(
             &parent_dir,
@@ -596,6 +597,26 @@ mod tests {
         let log = LocalLog::open(dir.path().join("t.jsonl"));
         log.emit(&record("a")).await?;
         anyhow::ensure!(log.records()?.len() == 1, "the emit was lost");
+        Ok(())
+    }
+
+    /// The log descriptor is close-on-exec on both the create and the reopen path,
+    /// so a job spawned later does not inherit it. `std`'s `OpenOptions` set this
+    /// implicitly; the `openat` path must set it explicitly.
+    #[test]
+    fn the_log_descriptor_is_close_on_exec() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
+        let path = dir.path().join("t.jsonl");
+        for (label, want_created) in [("create", true), ("reopen", false)] {
+            let (file, created) = LocalLog::open_for_append(&path).with_context(|| format!("{label} the log"))?;
+            anyhow::ensure!(created == want_created, "{label}: created={created}");
+            let flags = rustix::io::fcntl_getfd(&file).with_context(|| format!("{label}: F_GETFD"))?;
+            anyhow::ensure!(
+                flags.contains(rustix::io::FdFlags::CLOEXEC),
+                "{label}: the telemetry log descriptor is not close-on-exec"
+            );
+        }
         Ok(())
     }
 
