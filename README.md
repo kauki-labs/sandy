@@ -116,9 +116,10 @@ job model (see [`docs/decisions/sandyd.md`](docs/decisions/sandyd.md)).
 ### Running `sandyd` across multiple hosts
 
 `sandyd` can dispatch a job to a remote `sandy-host-executor` over a mesh
-(WireGuard/Tailscale) instead of running everything locally — e.g. a macOS
-orchestrator dispatching to a Linux executor, or any other OS pairing. All of
-`sandyd`'s config is environment variables, no CLI flags:
+(WireGuard/Tailscale) instead of running everything locally. The orchestrator
+runs anywhere (macOS or Linux); the executor is NixOS-specific (its
+trusted-process sandbox is `bwrap` + `systemd-run --user`). All of `sandyd`'s
+config is environment variables, no CLI flags:
 
 ```mermaid
 flowchart LR
@@ -130,10 +131,11 @@ flowchart LR
     chan1["SANDY_MESH_LISTEN<br/>dispatch + registration"]
     chan2["SANDY_MESH_AGENT_LINK_LISTEN<br/>job agent link"]
   end
-  subgraph exec["Executor host (allowlisted)"]
+  subgraph exec["Executor host (allowlisted, NixOS)"]
     hostexec["sandy-host-executor"] --> agent["sandy-agent<br/>(SANDY_AGENT_PATH)"]
     agent --> job(("job process"))
   end
+  hostexec -.->|Register| chan1
   sandyd -->|Dispatch: argv/v1 manifest| chan1
   chan1 --> hostexec
   agent -->|authenticated link| chan2
@@ -163,10 +165,13 @@ SANDY_SOCK=/tmp/sandyd.sock sandy daemon submit manifest.json --manifest-encodin
 SANDY_SOCK=/tmp/sandyd.sock sandy daemon attach <job-id>
 ```
 
-`--flake` submissions dispatch as a VM job instead (sandbox kind `Vm`, #332) —
-this `argv/v1` path exercises the trusted-process executor specifically. Full
-walkthrough, the allowlist/bind-address constraints, and the `SANDY_AGENT_PATH`
-gotcha above: [`docs/design/host-executor/spec.md`](docs/design/host-executor/spec.md#manual-cross-machine-smoke-test).
+`--flake` submissions dispatch as a VM job instead (sandbox kind `Vm`, #332),
+which requires a registered host that declares VM capability — `sandyd`
+refuses the submission outright when no such host exists. The trusted-process
+executor set up above does not run `--flake` jobs; this `argv/v1` path
+exercises it specifically. Full walkthrough, the allowlist/bind-address
+constraints, and the `SANDY_AGENT_PATH` gotcha above:
+[`docs/design/host-executor/spec.md`](docs/design/host-executor/spec.md#manual-cross-machine-smoke-test).
 
 ## Development
 
