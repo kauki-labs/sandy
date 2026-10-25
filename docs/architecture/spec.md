@@ -383,10 +383,12 @@ flowchart TD
   is named in `warnings: Vec<String>`. The field was introduced in schema `2`;
   the current envelope is schema `3` (below), and old records still deserialize
   (`#[serde(default)]`) — never just a log line.
-- **Envelope receipts v1 (#361).** `ResultEnvelope.receipt: Option<Receipt>`
+- **Envelope receipts v1 (#361).** `ResultEnvelope.receipt: Option<AuditReceipt>`
   (schema `3`, `None` on a pre-`3` record) is audit lineage split by who
   observed each field — an auditor never takes the guest's claim as a host
   fact, following from the attacker model (`#357`, [above](#attacker-model)).
+  Distinct from the existing `ResultEnvelope.receipts: Vec<Receipt>` (side-effect
+  receipts, e.g. a GitHub PR); the names are intentionally close, the types are not.
   `None` on an invalid-plan run (no `Running` record was ever written) and on
   `kill`'s synthetic cancellation (no backend run to observe).
   - `host_observed` (the guest cannot influence these): `who` (the submitter
