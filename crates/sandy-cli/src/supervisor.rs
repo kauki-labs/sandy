@@ -163,12 +163,14 @@ pub trait JournalWriter {
     /// and re-reads before it writes `Cancelled`/`Crashed` (INV-3/INV-6), so this
     /// is the terminal-write side of that same protocol. Never overwrites a
     /// result another writer already landed while this run was still boxing up
-    /// its own.
+    /// its own. Returns whether `record` was actually written: `false` means a
+    /// competing terminal record already stood, and the caller must not report
+    /// its own `record` as this job's result (it would drift from the journal).
     ///
     /// # Errors
     ///
     /// Returns [`CoreError`] on journal I/O failure.
-    fn persist_if_still_running(&self, record: &JobRecord) -> Result<(), CoreError>;
+    fn persist_if_still_running(&self, record: &JobRecord) -> Result<bool, CoreError>;
 }
 
 impl JournalWriter for Journal {
@@ -176,14 +178,15 @@ impl JournalWriter for Journal {
         self.write_record(record)
     }
 
-    fn persist_if_still_running(&self, record: &JobRecord) -> Result<(), CoreError> {
+    fn persist_if_still_running(&self, record: &JobRecord) -> Result<bool, CoreError> {
         let _lock = self.lock_job(&record.job_id)?;
         if self.read_record(&record.job_id)?.state != JobState::Running {
             // A concurrent kill/reconcile already landed a terminal record under
             // this same flock; that result stands (INV-3/INV-6).
-            return Ok(());
+            return Ok(false);
         }
-        self.write_record(record)
+        self.write_record(record)?;
+        Ok(true)
     }
 }
 
@@ -198,11 +201,13 @@ struct JobOutcome {
 
 /// Build and persist the terminal [`JobRecord`] carrying `report`'s envelope
 /// (INV-6). `started` is the time the job's `Running` record was written.
+/// Returns whether the write actually landed (see
+/// [`JournalWriter::persist_if_still_running`]).
 fn write_terminal_record<J: JournalWriter + ?Sized>(
     journal: &J,
     started: SystemTime,
     report: &RunReport,
-) -> Result<(), CoreError> {
+) -> Result<bool, CoreError> {
     let terminal = JobRecord {
         schema_version: JOURNAL_SCHEMA_VERSION,
         job_id: report.envelope.job_id.clone(),
@@ -261,9 +266,32 @@ pub fn run_job<B: VmBackend + ?Sized, E: EgressApplier + ?Sized>(
     tap: Option<&str>,
     redact: &[String],
 ) -> Result<RunReport, CoreError> {
-    let outcome = run_job_core(backend, journal, plan, egress, egress_os, tap, redact)?;
+    let mut outcome = run_job_core(backend, journal, plan, egress, egress_os, tap, redact)?;
     if let Some(started) = outcome.started {
-        write_terminal_record(journal, started, &outcome.report)?;
+        match write_terminal_record(journal, started, &outcome.report) {
+            Ok(true) => {}
+            Ok(false) => {
+                // A concurrent kill/reconcile already landed this job's terminal
+                // record; reporting our own result here would drift from the
+                // journal (the review finding behind this match). Fail rather
+                // than hand back a result nobody else will see.
+                return Err(CoreError::State(format!(
+                    "job {} was already finalized by a concurrent kill/reconcile; refusing to report a result that \
+                     would drift from the journal",
+                    outcome.report.envelope.job_id
+                )));
+            }
+            Err(e) => {
+                // L-12: fold into the envelope too, not just the log — see
+                // run_job_with_credential_timed's matching comment.
+                tracing::warn!(job_id = %outcome.report.envelope.job_id, error = %e, "failed to write the terminal journal record");
+                outcome
+                    .report
+                    .envelope
+                    .warnings
+                    .push(format!("terminal journal record could not be written: {e}"));
+            }
+        }
     }
     Ok(outcome.report)
 }
@@ -691,20 +719,35 @@ fn run_job_with_credential_timed<
         // (#322): no separate first write to amend. `started` is `None` only for
         // the invalid-plan early return, which never wrote a `Running` record
         // either — the silent-run guard stays intact.
-        if let Some(started) = job_outcome.started
-            && let Err(e) = write_terminal_record(journal, started, report)
-        {
-            // L-12: fold into the returned envelope too, not just the log. The
-            // caller otherwise sees an ordinary successful exit band with no sign
-            // that the journal record (INV-6) is missing or stale; a later
-            // `status`/`wait` then disagrees with the result this call already
-            // returned. Teardown has already run, so there is nothing left to
-            // undo by failing this call outright.
-            tracing::warn!(job_id = %report.envelope.job_id, error = %e, "failed to write the credentialed run's terminal journal record");
-            report
-                .envelope
-                .warnings
-                .push(format!("terminal journal record could not be written: {e}"));
+        if let Some(started) = job_outcome.started {
+            match write_terminal_record(journal, started, report) {
+                Ok(true) => {}
+                Ok(false) => {
+                    // A concurrent kill/reconcile already landed this job's
+                    // terminal record; reporting our own result here would drift
+                    // from the journal. Fail rather than hand back a result
+                    // nobody else will see.
+                    let job_id = report.envelope.job_id.clone();
+                    return Err(CoreError::State(format!(
+                        "job {job_id} was already finalized by a concurrent kill/reconcile; refusing to report a \
+                         result that would drift from the journal"
+                    )));
+                }
+                Err(e) => {
+                    // L-12: fold into the returned envelope too, not just the log.
+                    // The caller otherwise sees an ordinary successful exit band
+                    // with no sign that the journal record (INV-6) is missing or
+                    // stale; a later `status`/`wait` then disagrees with the
+                    // result this call already returned. Teardown has already
+                    // run, so there is nothing left to undo by failing this call
+                    // outright.
+                    tracing::warn!(job_id = %report.envelope.job_id, error = %e, "failed to write the credentialed run's terminal journal record");
+                    report
+                        .envelope
+                        .warnings
+                        .push(format!("terminal journal record could not be written: {e}"));
+                }
+            }
         }
     }
     outcome.map(|o| o.report)
@@ -1667,8 +1710,12 @@ mod tests {
             started,
             result: None,
         };
-        super::JournalWriter::persist_if_still_running(&journal, &late_succeeded)?;
+        let wrote = super::JournalWriter::persist_if_still_running(&journal, &late_succeeded)?;
 
+        assert!(
+            !wrote,
+            "the skipped write must report false so the caller knows not to report its own result"
+        );
         let on_disk = journal.read_record(&job_id)?;
         assert_eq!(
             on_disk.state,
@@ -1720,7 +1767,7 @@ mod tests {
             self.inner.write_record(record)
         }
 
-        fn persist_if_still_running(&self, record: &sandy::JobRecord) -> Result<(), sandy::CoreError> {
+        fn persist_if_still_running(&self, record: &sandy::JobRecord) -> Result<bool, sandy::CoreError> {
             self.writes
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -1869,6 +1916,80 @@ mod tests {
             !persisted.logs.tail.contains(initial),
             "the single journaled write must already be redacted against the initial token: {:?}",
             persisted.logs.tail
+        );
+        Ok(())
+    }
+
+    /// A [`super::JournalWriter`] whose `persist_if_still_running` always reports
+    /// the write skipped, as if a concurrent `kill`/`reconcile_job` had already
+    /// landed a terminal record, regardless of the real journal state. Isolates
+    /// `run_job_with_credential_timed`'s response to that signal from
+    /// `persist_if_still_running`'s own race detection, which is covered by
+    /// `persist_if_still_running_never_overwrites_an_already_terminal_record`.
+    struct AlwaysSkipJournal<'a> {
+        inner: &'a Journal,
+    }
+
+    impl super::JournalWriter for AlwaysSkipJournal<'_> {
+        fn persist(&self, record: &sandy::JobRecord) -> Result<(), sandy::CoreError> {
+            self.inner.write_record(record)
+        }
+
+        fn persist_if_still_running(&self, _record: &sandy::JobRecord) -> Result<bool, sandy::CoreError> {
+            Ok(false)
+        }
+    }
+
+    /// When the terminal write is skipped because another writer already landed a
+    /// terminal record, the credentialed path must not hand back its own result:
+    /// that would drift from the journal a `status`/`wait` reads next (review
+    /// finding on #415). Before this fix, `write_terminal_record` returned `()`
+    /// and the skip case was indistinguishable from a successful write, so this
+    /// call returned `Ok(report)` with a result nothing else will ever see.
+    #[test]
+    fn credentialed_run_refuses_to_report_a_result_the_journal_never_recorded() -> anyhow::Result<()> {
+        use sandy::Scope;
+
+        let (_home, real_journal) = fresh_journal()?;
+        let journal = AlwaysSkipJournal { inner: &real_journal };
+        let cred_dir = tempfile::tempdir().context("cred dir")?;
+        std::fs::set_permissions(cred_dir.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .context("cred dir 0700")?;
+        let provider = sandy_test_support::FakeProvider::returning("tok");
+        let backend = FakeBackend::new().with_outcome(Outcome {
+            booted: true,
+            guest_exit: Some(0),
+            transport_error: None,
+            timed_out: false,
+            console: String::new(),
+        });
+        let (dev, ino) = sandy_fsutil::OwnedDir::open(cred_dir.path())?.dev_ino()?;
+        let fingerprint = sandy::DirFingerprint { dev, ino };
+
+        let result = super::run_job_with_credential_timed(
+            &backend,
+            &journal,
+            booting_plan(),
+            &FakeApplier::new(),
+            EgressOs::Linux,
+            None,
+            &provider,
+            &Scope::default(),
+            "GH_TOKEN",
+            cred_dir.path(),
+            fingerprint,
+            1_800,
+            Duration::from_secs(1_000_000),
+            Duration::from_millis(1),
+        );
+
+        assert!(
+            result.is_err(),
+            "a skipped terminal write must refuse to report a result, not return the local one: {result:?}"
+        );
+        assert!(
+            !cred_dir.path().join("GH_TOKEN").exists(),
+            "teardown must still have run (credential revoked/removed) even though the report was refused"
         );
         Ok(())
     }
