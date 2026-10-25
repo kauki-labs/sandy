@@ -174,7 +174,8 @@ pub struct CredentialReceipt {
     pub minted_at: SystemTime,
     /// When each mid-run refresh re-minted a token (empty if none fired).
     pub refreshed_at: Vec<SystemTime>,
-    /// When the credential was revoked at teardown.
+    /// When teardown began the revoke call. Set even if the call failed; read
+    /// `revoke_succeeded` to learn whether the credential was actually revoked.
     pub revoked_at: SystemTime,
     /// Whether the revoke call succeeded; `false` means the warning in
     /// `ResultEnvelope::warnings` names the same failure (L-12).
@@ -229,7 +230,8 @@ pub struct Timing {
     /// today: no backend reports this moment back to the supervisor (a
     /// separate, not-yet-filed gap — `Outcome` carries no timestamp).
     pub job_started_at: Option<SystemTime>,
-    /// When teardown completed (egress reverted, credential revoked if any).
+    /// When the backend returned and the egress boundary was reverted. Credential
+    /// revocation happens afterwards and is recorded in `credential.revoked_at`.
     pub teardown_at: SystemTime,
 }
 

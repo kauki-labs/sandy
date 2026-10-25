@@ -103,7 +103,7 @@ absence for a gap:
 
 - **`Provenance.template_store_path`** in the envelope is a placeholder (not
   asserted). The audit receipt (#361) is integration-tested (`cli_jobs.rs`,
-  `result.rs`) but has no live KPI row yet (K20 below is not green).
+  `result.rs`) but has no live-proven KPI yet (K19 above is not green).
 - **No-copy / arbitrary-path inputs** (#82): inputs are copied under their name.
 - **S3 object source + sink** (#67): no object-store input/output path.
 - **"Unlimited while attached" (#340), VM backend.** `RunControl`'s live
