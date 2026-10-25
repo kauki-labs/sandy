@@ -309,6 +309,9 @@ sequenceDiagram
   bracket, `should_refresh`);
   `mint_lease_checked_refuses_a_dir_swapped_in_after_validation` (adversarial,
   #323); the supervisor's mint-fails-closed test;
+  `credentialed_run_writes_the_terminal_record_once_after_refresh_redaction`
+  (decision 7 of `credential-seam.md`: the deferred write, exactly once, after
+  refresh redaction);
   `sandy-fsutil`'s `sweep_stale_staging_dirs` tests (sweeps a stale dir, keeps a
   fresh one, ignores an unrelated prefix, continues past an injected removal
   failure deterministically via `sweep_stale_staging_dirs_with`, supplemented
@@ -423,6 +426,14 @@ owner.
   the refresh thread has joined and the console is re-redacted against every token
   the run ever had live does the terminal record get written, once — never a first
   write against the initial token alone, amended afterward.
+- **The one terminal write guards against a concurrent other writer, not just
+  itself.** `write_terminal_record` (both paths) persists through
+  `JournalWriter::persist_if_still_running`: it takes the job flock and
+  re-reads before writing, so a `kill`/`reconcile_job` that already flipped the
+  record to `Cancelled`/`Crashed` under that same flock is never overwritten.
+  A failed write (I/O error, not this race) is folded into the returned
+  envelope's `warnings` (L-12) as well as logged, on both paths, so the caller
+  never sees an ordinary success with a missing INV-6 record.
 - **Reconcile through the seam (INV-3).** `ls`/`status`/`wait`/`kill`/`gc` reach
   running state via `reconcile_job` + `VmBackend::boxes` under the job flock, never
   a direct registry read, so a crashed owner is reconciled to a terminal state.
@@ -430,7 +441,9 @@ owner.
 **KPI.**
 
 - Integration: `journal` unit tests; `cli_jobs` ops (`ls`/`status`/`wait`/`kill`/`gc`,
-  reconcile of a dead box).
+  reconcile of a dead box);
+  `credentialed_run_writes_the_terminal_record_once_after_refresh_redaction`
+  (`supervisor.rs`, via `CountingJournal`: one write, after refresh redaction).
 - End-to-end: `live_boot.rs::cli_lifecycle_over_a_real_job` (the ops over a real job).
 
 ---

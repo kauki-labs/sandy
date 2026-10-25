@@ -271,20 +271,41 @@ then writes the terminal record — once. The non-credentialed `run_job` path is
 unchanged: it still writes its terminal record immediately, since it never has
 a refresh to wait for.
 
+Both paths share that one write through `write_terminal_record`, which takes
+the job flock and re-reads before writing (`JournalWriter::persist_if_still_running`):
+a concurrent `kill`/`reconcile_job` can already have flipped the record to
+`Cancelled`/`Crashed` under the same flock while this run was still boxing up
+its own result (review finding on #415 — neither path held the job flock
+around its own run, so a `kill` racing the final write could be silently
+overwritten). The terminal write is skipped, not retried, when the record is
+no longer `Running`: that other writer's result stands.
+
+A failed terminal write (I/O error, not the race above) is folded into the
+returned envelope's `warnings` (L-12) on both paths, not only logged: without
+it, the caller sees an ordinary successful exit with no sign INV-6 wasn't met,
+and a later `status`/`wait` then disagrees with the result this call already
+returned. Teardown has already run by this point, so there is nothing left to
+undo by failing the call outright instead.
+
 **Consequences.** The credentialed path's terminal record and its token
-redaction are now one atomic write: a crash can observe either no terminal
-record (before that write) or a fully-redacted one (after it), never a
+redaction are one atomic write: a crash can observe either no terminal record
+(before that write) or a fully-redacted one (after it), never a
 partially-redacted one in between. `amend_terminal_envelope` is removed, along
-with the `read_record` + `lock_job` + overwrite sequence it used — the
-credentialed path no longer reads the journal at all before persisting. Proven
-by `run_job_core`/`write_terminal_record`'s unit tests in `supervisor.rs`
-(a `JournalWriter` test double records write order and count without touching
-the filesystem) and by the existing `credentialed_run_redacts_the_token_from_the_console`
-/ `credential_revoke_failure_surfaces_as_a_warning_not_a_fault` integration
-tests, which still pass unchanged.
+with the two-write (write, then later lock + read + overwrite) sequence it
+used. The shared `write_terminal_record` now does read the journal once before
+its single write, under the job flock, but only to guard against a _different_
+concurrent writer — never to merge into or amend a record of its own. Proven
+by `credentialed_run_writes_the_terminal_record_once_after_refresh_redaction`
+in `supervisor.rs`, which uses `CountingJournal` (a `JournalWriter` test
+double) to record the write count and checks the persisted terminal record,
+and by the existing `credentialed_run_redacts_the_token_from_the_console` /
+`credential_revoke_failure_surfaces_as_a_warning_not_a_fault` integration
+tests in `cli_jobs.rs`, which still pass unchanged.
 
 **Set aside.** Keeping the amend and instead making it atomic under the job
 flock (lock, read, merge, write) was considered and rejected: it still leaves
 the same crash window between the first write and the lock being taken, just
 narrower; removing the first write entirely closes the window rather than
-shrinking it.
+shrinking it. This is a different flock use than the one added above: that
+earlier rejection was about _this run's own_ two writes racing each other, not
+about guarding the one remaining write against _another_ writer's result.

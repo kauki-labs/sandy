@@ -151,16 +151,38 @@ fn terminal_state(status: Status) -> JobState {
 /// production caller passes a real `&Journal`, which implements this by
 /// delegating to [`Journal::write_record`].
 pub trait JournalWriter {
-    /// Persist `record`.
+    /// Persist `record` unconditionally.
     ///
     /// # Errors
     ///
     /// Returns [`CoreError`] on journal I/O failure.
     fn persist(&self, record: &JobRecord) -> Result<(), CoreError>;
+
+    /// Persist `record` under the job flock, but only if the current record is
+    /// still `Running`: a concurrent `kill`/`reconcile_job` takes the same flock
+    /// and re-reads before it writes `Cancelled`/`Crashed` (INV-3/INV-6), so this
+    /// is the terminal-write side of that same protocol. Never overwrites a
+    /// result another writer already landed while this run was still boxing up
+    /// its own.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError`] on journal I/O failure.
+    fn persist_if_still_running(&self, record: &JobRecord) -> Result<(), CoreError>;
 }
 
 impl JournalWriter for Journal {
     fn persist(&self, record: &JobRecord) -> Result<(), CoreError> {
+        self.write_record(record)
+    }
+
+    fn persist_if_still_running(&self, record: &JobRecord) -> Result<(), CoreError> {
+        let _lock = self.lock_job(&record.job_id)?;
+        if self.read_record(&record.job_id)?.state != JobState::Running {
+            // A concurrent kill/reconcile already landed a terminal record under
+            // this same flock; that result stands (INV-3/INV-6).
+            return Ok(());
+        }
         self.write_record(record)
     }
 }
@@ -190,7 +212,7 @@ fn write_terminal_record<J: JournalWriter + ?Sized>(
         started,
         result: Some(report.envelope.clone()),
     };
-    journal.persist(&terminal)
+    journal.persist_if_still_running(&terminal)
 }
 
 /// The result of a foreground `run`: the LOCKED envelope plus sandy's own process
@@ -508,6 +530,7 @@ pub fn run_job_with_credential<
         scope,
         secret_name,
         cred_dir,
+        cred_dir_fingerprint,
         requested_ttl_secs,
         margin,
         tick,
@@ -539,6 +562,7 @@ fn run_job_with_credential_timed<
     scope: &Scope,
     secret_name: &str,
     cred_dir: &Path,
+    cred_dir_fingerprint: DirFingerprint,
     requested_ttl_secs: u32,
     margin: Duration,
     tick: Duration,
@@ -670,7 +694,17 @@ fn run_job_with_credential_timed<
         if let Some(started) = job_outcome.started
             && let Err(e) = write_terminal_record(journal, started, report)
         {
+            // L-12: fold into the returned envelope too, not just the log. The
+            // caller otherwise sees an ordinary successful exit band with no sign
+            // that the journal record (INV-6) is missing or stale; a later
+            // `status`/`wait` then disagrees with the result this call already
+            // returned. Teardown has already run, so there is nothing left to
+            // undo by failing this call outright.
             tracing::warn!(job_id = %report.envelope.job_id, error = %e, "failed to write the credentialed run's terminal journal record");
+            report
+                .envelope
+                .warnings
+                .push(format!("terminal journal record could not be written: {e}"));
         }
     }
     outcome.map(|o| o.report)
@@ -1587,6 +1621,63 @@ mod tests {
         Ok(())
     }
 
+    // --- terminal write never clobbers a concurrent kill/reconcile (review on #415) --
+
+    /// `persist_if_still_running` must not overwrite a terminal record a
+    /// concurrent writer (e.g. `kill`) already landed under the job flock while
+    /// this run was still finishing up: the other writer's result stands.
+    /// Before this guard, `write_terminal_record` called plain `persist`, which
+    /// would have clobbered the `Cancelled` record below with `Succeeded`.
+    #[test]
+    fn persist_if_still_running_never_overwrites_an_already_terminal_record() -> anyhow::Result<()> {
+        let (_tmp, journal) = fresh_journal()?;
+        let job_id = "job-concurrent-kill".to_string();
+        let started = SystemTime::now();
+
+        journal.write_record(&sandy::JobRecord {
+            schema_version: sandy::JOURNAL_SCHEMA_VERSION,
+            job_id: job_id.clone(),
+            box_id: None,
+            state: sandy::JobState::Running,
+            writer_pid: std::process::id(),
+            started,
+            result: None,
+        })?;
+
+        // Simulate a concurrent `kill` landing first, under the job flock.
+        let cancelled = sandy::JobRecord {
+            schema_version: sandy::JOURNAL_SCHEMA_VERSION,
+            job_id: job_id.clone(),
+            box_id: None,
+            state: sandy::JobState::Cancelled,
+            writer_pid: std::process::id() + 1,
+            started,
+            result: None,
+        };
+        journal.write_record(&cancelled)?;
+
+        // This run finishes up on its own thread, unaware of the kill, and tries
+        // to write its own (different) terminal state.
+        let late_succeeded = sandy::JobRecord {
+            schema_version: sandy::JOURNAL_SCHEMA_VERSION,
+            job_id: job_id.clone(),
+            box_id: Some("box-1".to_string()),
+            state: sandy::JobState::Succeeded,
+            writer_pid: std::process::id(),
+            started,
+            result: None,
+        };
+        super::JournalWriter::persist_if_still_running(&journal, &late_succeeded)?;
+
+        let on_disk = journal.read_record(&job_id)?;
+        assert_eq!(
+            on_disk.state,
+            sandy::JobState::Cancelled,
+            "the concurrent kill's result must stand, never overwritten by a late terminal write"
+        );
+        Ok(())
+    }
+
     // --- terminal journal write ordering (#322) ----------------------------------
 
     use std::sync::{Mutex, PoisonError};
@@ -1627,6 +1718,14 @@ mod tests {
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(record.clone());
             self.inner.write_record(record)
+        }
+
+        fn persist_if_still_running(&self, record: &sandy::JobRecord) -> Result<(), sandy::CoreError> {
+            self.writes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(record.clone());
+            super::JournalWriter::persist_if_still_running(self.inner, record)
         }
     }
 
@@ -1718,6 +1817,9 @@ mod tests {
             delay: Duration::from_millis(2_500),
         };
 
+        let (dev, ino) = sandy_fsutil::OwnedDir::open(cred_dir.path())?.dev_ino()?;
+        let fingerprint = sandy::DirFingerprint { dev, ino };
+
         let report = super::run_job_with_credential_timed(
             &backend,
             &journal,
@@ -1729,6 +1831,7 @@ mod tests {
             &Scope::default(),
             "GH_TOKEN",
             cred_dir.path(),
+            fingerprint,
             1_800,
             Duration::from_secs(1_000_000),
             Duration::from_millis(1),
