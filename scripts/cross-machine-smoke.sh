@@ -2,8 +2,9 @@
 # Cross-machine smoke test (docs/design/host-executor/spec.md's manual
 # walkthrough, scripted): starts sandyd locally with a mesh listener, syncs
 # this checkout to a remote host and starts sandy-host-executor there over
-# SSH, submits a long-running argv/v1 job, and attaches to it. Works for any
-# OS pairing — e.g. a macOS orchestrator dispatching to a Linux executor.
+# SSH, submits a long-running argv/v1 job, and attaches to it. The
+# orchestrator runs anywhere (macOS or Linux); the executor is
+# NixOS-specific (its trusted-process sandbox is bwrap + systemd-run --user).
 #
 # Only three things point it at a real network: the orchestrator's (this
 # machine's) mesh-visible IP, the executor's mesh-visible IP (sandyd's
@@ -50,18 +51,32 @@ command -v jq >/dev/null 2>&1 || {
 
 sandyd_log=$(mktemp -t sandyd-smoke.XXXXXX.log)
 manifest=$(mktemp -t sandy-manifest.XXXXXX.json)
+filelist=$(mktemp -t sandy-smoke-files.XXXXXX)
 job_id=
 sandyd_pid=
+executor_pid=
 
+# Order matters: the executor's own SIGTERM handler cancels any still-running
+# job's RunControl before it exits (#369) — stopping it first, and waiting for
+# it to actually exit, is what ends the dispatched command. Stopping sandyd
+# first would leave the executor to take its Closed path instead, which does
+# not cancel anything. Only this run's own recorded PID is ever signaled, not
+# a name/pattern match that could hit an unrelated process on the SSH host.
 cleanup() {
   local rc=$?
   echo "==> cleaning up" >&2
   if [ -n "$job_id" ]; then
     SANDY_SOCK="$sock" "$repo_root/target/debug/sandy" daemon cancel "$job_id" >/dev/null 2>&1 || true
   fi
+  if [ -n "$executor_pid" ]; then
+    ssh "$executor_ssh" "kill -TERM '$executor_pid'" >/dev/null 2>&1 || true
+    for _ in $(seq 1 30); do
+      ssh "$executor_ssh" "kill -0 '$executor_pid'" >/dev/null 2>&1 || break
+      sleep 1
+    done
+  fi
   [ -z "$sandyd_pid" ] || kill "$sandyd_pid" >/dev/null 2>&1 || true
-  ssh "$executor_ssh" "pkill -f 'target/debug/sandy-host-executor' || true" >/dev/null 2>&1 || true
-  rm -f "$sock" "$manifest" "$sandyd_log"
+  rm -f "$sock" "$manifest" "$sandyd_log" "$filelist"
   exit "$rc"
 }
 trap cleanup EXIT
@@ -98,9 +113,12 @@ grep -q "sandyd listening" "$sandyd_log" || {
 
 echo "==> syncing this checkout to $executor_ssh:$remote_dir" >&2
 ssh "$executor_ssh" "mkdir -p '$remote_dir'"
-rsync -az --delete \
-  --exclude .git --exclude target --exclude .direnv --exclude .claude/worktrees --exclude result \
-  "$repo_root/" "$executor_ssh:$remote_dir/"
+# Only git-tracked files: rsyncing the whole tree (even with excludes) drops
+# .git, so Nix treats the remote dir as a non-git path: flake that ignores
+# .gitignore entirely — an untracked secret (.env, a local credential file)
+# would otherwise ship into the remote build's flake source verbatim.
+git -C "$repo_root" ls-files -z >"$filelist"
+rsync -az --delete --from0 --files-from="$filelist" "$repo_root/" "$executor_ssh:$remote_dir/"
 
 echo "==> building sandy-agent + sandy-host-executor remotely" >&2
 agent_store_path=$(ssh "$executor_ssh" "cd '$remote_dir' && nix build .#sandy-agent --no-link --print-out-paths")
@@ -108,11 +126,15 @@ agent_path="$agent_store_path/bin/sandy-agent"
 ssh "$executor_ssh" "cd '$remote_dir' && nix develop -c cargo build -p sandy-host-executor"
 
 echo "==> starting sandy-host-executor remotely (host_id=$host_id)" >&2
-ssh -f "$executor_ssh" "cd '$remote_dir' && \
+# setsid detaches the process from this ssh session's controlling terminal and
+# stdio (already redirected below), so ssh returns as soon as it prints the
+# PID instead of waiting for the long-running executor to exit.
+executor_pid=$(ssh "$executor_ssh" "cd '$remote_dir' && \
+  setsid nohup env \
   SANDY_AGENT_PATH='$agent_path' \
   SANDY_HOST_EXECUTOR_ORCHESTRATOR='$orchestrator_ip:$mesh_port' \
   SANDY_HOST_EXECUTOR_ID='$host_id' \
-  nohup ./target/debug/sandy-host-executor >/tmp/sandy-host-executor-smoke.log 2>&1 &"
+  ./target/debug/sandy-host-executor </dev/null >/tmp/sandy-host-executor-smoke.log 2>&1 & echo \$!")
 
 echo "==> waiting for the executor to register" >&2
 sleep 3
