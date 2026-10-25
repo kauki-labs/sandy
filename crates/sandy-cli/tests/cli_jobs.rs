@@ -20,6 +20,11 @@ use sandy_cli::{
 };
 use sandy_test_support::{FakeApplier, FakeBackend, FakeProvider};
 
+/// #358's exact envelope warning: `--allow` entries have no effect on a guest
+/// with no network device (macOS, or Linux without a bound tap).
+const NO_NETWORK_ALLOW_WARNING: &str =
+    "egress unavailable: the guest has no network device, so --allow entries have no effect (see #360)";
+
 /// A journal on a fresh local temp `$SANDY_HOME`.
 fn fresh_journal() -> anyhow::Result<(tempfile::TempDir, Journal)> {
     // 0700 whatever the umask: credentials are staged under it (#174).
@@ -611,6 +616,11 @@ fn run_on_linux_applies_the_allow_list_ruleset_and_reverts_it() -> anyhow::Resul
         applier.was_reverted(),
         "an enforced boundary must be reverted after the run"
     );
+    assert!(
+        report.envelope.warnings.is_empty(),
+        "a Linux guest with a bound tap has a real boundary, so --allow has effect: no #358 warning: {:?}",
+        report.envelope.warnings
+    );
     Ok(())
 }
 
@@ -670,8 +680,10 @@ fn egress_apply_failure_fails_closed_with_a_terminal_record() -> anyhow::Result<
     Ok(())
 }
 
-/// #24: a macOS run applies no boundary (vmnet has none), yet the run still
-/// succeeds — the honest `NoBoundary` path, not a silent failure.
+/// #24: a macOS run applies no boundary (`vfkit_args` emits no network device),
+/// yet the run still succeeds — the honest `NoBoundary` path, not a silent
+/// failure. #358: a non-empty `--allow` list has no effect with no NIC to grant
+/// it on, so the envelope warns.
 #[test]
 fn run_on_macos_applies_no_boundary_but_still_succeeds() -> anyhow::Result<()> {
     let (_tmp, journal) = fresh_journal()?;
@@ -704,6 +716,127 @@ fn run_on_macos_applies_no_boundary_but_still_succeeds() -> anyhow::Result<()> {
     assert!(
         !applier.was_reverted(),
         "nothing was applied, so nothing is reverted on macOS"
+    );
+    assert_eq!(
+        report.envelope.warnings,
+        vec![NO_NETWORK_ALLOW_WARNING],
+        "a non-empty --allow list has no effect on a NIC-less macOS guest"
+    );
+    Ok(())
+}
+
+/// #358 (adversarial): an empty `--allow` list grants nothing on macOS either
+/// way, so there is nothing for the missing NIC to defeat: no warning.
+#[test]
+fn run_on_macos_with_an_empty_allow_list_carries_no_warning() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    let backend = FakeBackend::new().with_outcome(ok_outcome(0));
+    let applier = FakeApplier::new();
+
+    let report = run_job(
+        &backend,
+        &journal,
+        &booting_plan(),
+        &applier,
+        EgressOs::MacOs,
+        None,
+        &[],
+    )
+    .context("run_job (macos, empty allow-list)")?;
+
+    assert!(
+        report.envelope.warnings.is_empty(),
+        "an empty --allow list has no effect to warn about, NIC or not: {:?}",
+        report.envelope.warnings
+    );
+    Ok(())
+}
+
+/// #358: a Linux guest with no bound tap has no NIC either, so a non-empty
+/// `--allow` list has no effect there too: same warning as macOS.
+#[test]
+fn run_on_linux_with_no_tap_and_a_nonempty_allow_list_warns() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    let backend = FakeBackend::new().with_outcome(ok_outcome(0));
+    let applier = FakeApplier::new();
+
+    let report = run_job(
+        &backend,
+        &journal,
+        &allowing_plan(),
+        &applier,
+        EgressOs::Linux,
+        None,
+        &[],
+    )
+    .context("run_job (linux, no tap)")?;
+
+    assert_eq!(
+        report.envelope.warnings,
+        vec![NO_NETWORK_ALLOW_WARNING],
+        "a non-empty --allow list has no effect on a tap-less Linux guest"
+    );
+    Ok(())
+}
+
+/// #358 (adversarial): a Linux guest with no bound tap and an empty allow-list
+/// already denies everything, NIC or not: no warning.
+#[test]
+fn run_on_linux_with_no_tap_and_an_empty_allow_list_carries_no_warning() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    let backend = FakeBackend::new().with_outcome(ok_outcome(0));
+    let applier = FakeApplier::new();
+
+    let report = run_job(
+        &backend,
+        &journal,
+        &booting_plan(),
+        &applier,
+        EgressOs::Linux,
+        None,
+        &[],
+    )
+    .context("run_job (linux, no tap, empty allow-list)")?;
+
+    assert!(
+        report.envelope.warnings.is_empty(),
+        "an empty --allow list has no effect to warn about, NIC or not: {:?}",
+        report.envelope.warnings
+    );
+    Ok(())
+}
+
+/// #358 (review finding): the process backend shares the host network with no
+/// isolation boundary at all — it has no guest and no NIC to lack. A non-empty
+/// `--allow` list is just as unenforced there, but the warning must name the
+/// real cause instead of claiming "the guest has no network device", which
+/// does not describe a process run.
+#[test]
+fn run_on_the_process_backend_with_a_nonempty_allow_list_warns_with_the_right_cause() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    let backend = FakeBackend::new()
+        .with_outcome(ok_outcome(0))
+        .with_kind(sandy::SandboxKind::Process);
+    let applier = FakeApplier::new();
+
+    let report = run_job(
+        &backend,
+        &journal,
+        &allowing_plan(),
+        &applier,
+        EgressOs::Linux,
+        None,
+        &[],
+    )
+    .context("run_job (process backend)")?;
+
+    assert_eq!(
+        report.envelope.warnings,
+        vec![
+            "egress unavailable: the process backend shares the host network with no isolation boundary, so --allow \
+             entries have no effect"
+        ],
+        "the process backend's warning must name the real cause, not the no-NIC VM reason"
     );
     Ok(())
 }
