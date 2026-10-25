@@ -357,7 +357,7 @@ never the host's.
   network device (macOS, or Linux without a tap) a non-empty `--allow` list has
   no effect to grant, so the envelope's `warnings` carries `egress unavailable:
 the guest has no network device, so --allow entries have no effect (see
-#360)`. An empty allow-list never warns. The decision keys on structure
+#360)`. An empty allow-list does not add an envelope warning. The decision keys on structure
   (`EgressOs::MacOs` or no tap), never on the `Unenforced` reason string. No
   schema bump: `warnings` already exists at schema 2 (section 6).
 - **Planned: a NIC-less guest with a vsock host proxy (#360).** The guest gets

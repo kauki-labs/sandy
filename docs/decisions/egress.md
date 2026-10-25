@@ -87,7 +87,8 @@ proceeds without enforcement, **documented, not silent**. Because there is no
 NIC, a non-empty `--allow` list has no effect to grant: the envelope's
 `warnings` says so (#358), `egress unavailable: the guest has no network
 device, so --allow entries have no effect (see #360)`, for both macOS and a
-tap-less Linux guest. An empty allow-list never warns — deny-all already
+tap-less Linux guest. An empty allow-list does not add an envelope warning —
+deny-all already
 holds with no NIC to grant anything onto. The decision keys on structure
 (`EgressOs::MacOs`, or no tap), never on the `Unenforced` reason string.
 
