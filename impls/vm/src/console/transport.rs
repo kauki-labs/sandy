@@ -292,9 +292,12 @@ mod tests {
     /// dead console instead of resolving the run).
     #[test]
     fn pty_transport_read_reports_closed_once_the_child_exits() -> Result<(), BackendError> {
+        // A nix build sandbox has no FHS `/bin/sh`; `$SHELL` is what nixpkgs'
+        // stdenv sets there, and a normal dev shell still has `/bin/sh`.
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let mut transport = PtyTransport::open()?;
         transport.set_read_timeout(Duration::from_millis(100));
-        transport.spawn(Path::new("/bin/sh"), &["-c".to_string(), "exit 0".to_string()])?;
+        transport.spawn(Path::new(&shell), &["-c".to_string(), "exit 0".to_string()])?;
 
         let mut buf = [0u8; 64];
         let closed = (0..50).any(|_| matches!(transport.read(&mut buf), Ok(ReadEvent::Closed)));
