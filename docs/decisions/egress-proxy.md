@@ -336,8 +336,9 @@ guest topology, so they should move together.
    proxy cannot start is refused (band 3, decision 3), and no VM path yields
    `NoBoundary`.
 
-**Consequences.** macOS gains enforced egress in step 6. Given the observation in
-Context, that is in effect macOS gaining egress at all, enforced from the start.
+**Consequences.** macOS gains enforced HTTP(S) egress in step 6. Given the
+observation in Context, that is in effect macOS gaining HTTP(S) egress at all,
+enforced from the start; non-HTTP egress stays out of scope, deferred to #372.
 #376 is closed for sandy's own surface by construction: with no NIC there is no
 IP path to the host. The qemu leg still reaches host `AF_VSOCK` listeners (see
 the adversarial pass). #359's IP-only semantics and its hostname refusal last

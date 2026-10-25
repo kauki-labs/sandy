@@ -53,6 +53,6 @@ an unfiltered network is available: the current vfkit argv emits no `virtio-net`
 device, so a macOS guest has no network interface at all today. The behaviour is
 stated in the result and the docs so it is not mistaken for enforcement.
 
-**Replaced after parity.** The vsock host proxy gives macOS guests network for
-the first time, enforced the same way as on Linux
+**Replaced after parity.** The vsock host proxy gives macOS guests HTTP(S)
+egress for the first time, enforced the same way as on Linux
 ([`egress-proxy.md`](egress-proxy.md) decision 5).
