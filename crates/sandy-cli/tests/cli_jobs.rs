@@ -542,8 +542,47 @@ fn egress_apply_failure_fails_closed_with_a_terminal_record() -> anyhow::Result<
 
 /// #24: a macOS run applies no boundary (vmnet has none), yet the run still
 /// succeeds — the honest `NoBoundary` path, not a silent failure.
+///
+/// #358: the envelope's `warnings` must say so, for both a non-empty and an
+/// empty allow-list — the empty-list case is the one that most needs
+/// surfacing, since it looks like "no network" but actually grants full
+/// unfiltered network.
 #[test]
 fn run_on_macos_applies_no_boundary_but_still_succeeds() -> anyhow::Result<()> {
+    for plan in [allowing_plan(), booting_plan()] {
+        let (_tmp, journal) = fresh_journal()?;
+        let backend = FakeBackend::new().with_outcome(ok_outcome(0));
+        let applier = FakeApplier::new();
+
+        let report =
+            run_job(&backend, &journal, &plan, &applier, EgressOs::MacOs, None, &[]).context("run_job (macos)")?;
+
+        assert_eq!(
+            report.envelope.status,
+            Status::Succeeded,
+            "a NoBoundary run still succeeds"
+        );
+        assert!(
+            applier.applied_rulesets().is_empty(),
+            "macOS NoBoundary must apply no ruleset, even with a non-empty allow-list"
+        );
+        assert!(
+            !applier.was_reverted(),
+            "nothing was applied, so nothing is reverted on macOS"
+        );
+        assert_eq!(
+            report.envelope.warnings,
+            vec!["egress unenforced: macOS has no per-VM boundary; the guest has unfiltered network (see #360)"],
+            "a macOS run must warn that its network is unfiltered, allow-list empty or not"
+        );
+    }
+    Ok(())
+}
+
+/// #358 (adversarial): Linux with a bound tap enforces a real boundary, so the
+/// envelope must carry NO egress warning.
+#[test]
+fn run_on_linux_with_a_tap_carries_no_egress_warning() -> anyhow::Result<()> {
     let (_tmp, journal) = fresh_journal()?;
     let backend = FakeBackend::new().with_outcome(ok_outcome(0));
     let applier = FakeApplier::new();
@@ -553,24 +592,43 @@ fn run_on_macos_applies_no_boundary_but_still_succeeds() -> anyhow::Result<()> {
         &journal,
         &allowing_plan(),
         &applier,
-        EgressOs::MacOs,
+        EgressOs::Linux,
+        Some("sandytap0"),
+        &[],
+    )
+    .context("run_job (linux, tap)")?;
+
+    assert!(
+        report.envelope.warnings.is_empty(),
+        "an enforced Linux boundary must carry no egress warning: {:?}",
+        report.envelope.warnings
+    );
+    Ok(())
+}
+
+/// #358 (adversarial): Linux with no tap has no guest NIC to enforce, but it
+/// is not the macOS unfiltered-network case either — no egress warning.
+#[test]
+fn run_on_linux_with_no_tap_carries_no_egress_warning() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    let backend = FakeBackend::new().with_outcome(ok_outcome(0));
+    let applier = FakeApplier::new();
+
+    let report = run_job(
+        &backend,
+        &journal,
+        &allowing_plan(),
+        &applier,
+        EgressOs::Linux,
         None,
         &[],
     )
-    .context("run_job (macos)")?;
+    .context("run_job (linux, no tap)")?;
 
-    assert_eq!(
-        report.envelope.status,
-        Status::Succeeded,
-        "a NoBoundary run still succeeds"
-    );
     assert!(
-        applier.applied_rulesets().is_empty(),
-        "macOS NoBoundary must apply no ruleset, even with a non-empty allow-list"
-    );
-    assert!(
-        !applier.was_reverted(),
-        "nothing was applied, so nothing is reverted on macOS"
+        report.envelope.warnings.is_empty(),
+        "a Linux run with no tap must carry no egress warning: {:?}",
+        report.envelope.warnings
     );
     Ok(())
 }

@@ -253,12 +253,22 @@ never the host's.
   and the error path, so a boot failure never leaves rules up.
 - **macOS is a no-op.** `plan_egress_scoped` yields `NoBoundary`; the run proceeds
   without enforcement (documented, not silent).
+- **Unenforced macOS egress surfaces in `warnings` (#358).** Every macOS run —
+  empty or non-empty allow-list — gets one `warnings` entry naming the platform
+  and pointing at the fix; Linux never does, enforced or not. The decision keys
+  on `EgressOs::MacOs`, not on the `Unenforced` reason string. No schema bump:
+  `warnings` already exists at schema 2 (section 6). Warn, not refuse, until
+  #360 makes macOS egress enforceable; then the gate tightens to match Linux.
 
 **KPI.**
 
 - Integration: `egress` unit tests (ruleset generation, `plan_egress_scoped`);
   `cli_jobs` `run_on_linux_applies_the_allow_list_ruleset_and_reverts_it` /
-  `..._macos_applies_no_boundary` / apply-failure-fails-closed (over `FakeApplier`).
+  `..._macos_applies_no_boundary_but_still_succeeds` (asserts the `warnings`
+  entry for both an empty and a non-empty allow-list) /
+  `run_on_linux_with_a_tap_carries_no_egress_warning` /
+  `run_on_linux_with_no_tap_carries_no_egress_warning` / apply-failure-fails-closed
+  (over `FakeApplier`).
 - End-to-end: `live_egress.rs` (Linux + root + `nft`), real nftables around a boot.
 
 ---

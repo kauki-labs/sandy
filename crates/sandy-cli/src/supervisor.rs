@@ -93,6 +93,24 @@ fn build_envelope(
     }
 }
 
+/// The envelope warning for an unenforced egress boundary (#358): one entry
+/// naming the platform and pointing at the fix, added whenever the boundary
+/// was `Unenforced` on macOS.
+///
+/// Keys on `egress_os == EgressOs::MacOs`, never on the `Unenforced` reason
+/// string — the table has two macOS rows (empty and non-empty allow-list) and
+/// both warn, since an empty allow-list still grants the guest full unfiltered
+/// network rather than none. Linux's own `Unenforced` case (no tap, no guest
+/// NIC) never warns: there is no network to be honest about.
+fn unenforced_egress_warning(egress_os: EgressOs, outcome: &EgressOutcome) -> Option<String> {
+    match (egress_os, outcome) {
+        (EgressOs::MacOs, EgressOutcome::Unenforced { .. }) => Some(
+            "egress unenforced: macOS has no per-VM boundary; the guest has unfiltered network (see #360)".to_string(),
+        ),
+        _ => None,
+    }
+}
+
 /// List the files the backend collected to each declared output's destination as
 /// [`OutputRef`]s. The path is logical, not a host path: `<name>/<relpath>` for a
 /// named output (`--out NAME:DEST`) and `<relpath>` for a catch-all (`--out DEST`),
@@ -229,7 +247,7 @@ pub fn run_job<B: VmBackend + ?Sized, E: EgressApplier + ?Sized>(
     // 4. On a successful apply, run the backend, then ALWAYS revert when the boundary was enforced — on both the ok and
     //    error paths, so a boot failure never leaves nftables rules up.
     let eplan = plan_egress_scoped(&plan.allow, egress_os, tap);
-    let run_result: Result<Outcome, BackendError> = match enforce(&eplan, egress) {
+    let (run_result, egress_warning): (Result<Outcome, BackendError>, Option<String>) = match enforce(&eplan, egress) {
         Ok(eoutcome) => {
             let outcome = backend.run(&spec);
             if matches!(eoutcome, EgressOutcome::Enforced)
@@ -237,13 +255,16 @@ pub fn run_job<B: VmBackend + ?Sized, E: EgressApplier + ?Sized>(
             {
                 tracing::warn!(%e, "egress revert failed");
             }
-            outcome
+            (outcome, unenforced_egress_warning(egress_os, &eoutcome))
         }
         Err(egress_error) => {
             tracing::warn!(%job_id, %egress_error, "egress apply failed; refusing to boot (fail-closed)");
-            Err(BackendError::Spawn(format!(
-                "egress boundary not established: {egress_error}"
-            )))
+            (
+                Err(BackendError::Spawn(format!(
+                    "egress boundary not established: {egress_error}"
+                ))),
+                None,
+            )
         }
     };
 
@@ -279,7 +300,10 @@ pub fn run_job<B: VmBackend + ?Sized, E: EgressApplier + ?Sized>(
     // 6. Write the terminal record carrying the envelope (INV-6). Redact right before the envelope is built: this is
     //    the last point before the journal write, and there's no seam after `run_job` returns (M-6).
     let console = redact_console(console, redact);
-    let envelope = build_envelope(&job_id, None, classification, guest_exit, message, console, outputs);
+    let mut envelope = build_envelope(&job_id, None, classification, guest_exit, message, console, outputs);
+    if let Some(warning) = egress_warning {
+        envelope.warnings.push(warning);
+    }
     let terminal = JobRecord {
         schema_version: JOURNAL_SCHEMA_VERSION,
         job_id,
