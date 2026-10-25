@@ -38,6 +38,37 @@ K13 (`live_egress.rs`, Linux + root + `nft`).
 ([`egress-proxy.md`](egress-proxy.md)) removes this ruleset once both backends
 pass the parity gate.
 
+## 1a. The boundary also covers host-destined traffic
+
+**Status:** accepted. **Upholds:** INV-7, #376.
+
+**Context.** The `forward` chain only sees traffic routed through the host; a
+packet addressed to the host itself (the tap's gateway address, or any other host
+address) is delivered locally through `input` and never reaches it. `to_nftables_forward`
+left that chain unfiltered, so an empty allow-list still let the guest reach a
+host-local DNS resolver or any other host service — confirmed live (#359 probe,
+2026-10-25): with the host's dnsmasq as the guest's advertised resolver, the guest
+resolved `github.com` and connected over TCP to the tap address.
+
+**Decision.** `to_nftables_forward` also emits an `input`-hook chain, scoped the
+same way: `policy accept` (every other interface's input stays untouched),
+`iifname "<iface>" udp dport 67 accept` for the guest's own DHCP request, then
+`iifname "<iface>" drop` for everything else from the guest. The allow-list plays
+no part in this chain — a host address is never a `forward` destination, so an
+entry naming one (e.g. a host-local resolver) has no accept rule to carry over.
+
+**Consequences.** DNS exfiltration through a host-local resolver, and any other
+host service reachable from the tap, is closed the same way as forwarded egress:
+fail-closed, by default, with an empty allow-list included. Allow-listing a host
+address (so a job could legitimately reach a host-local service) is out of scope
+here; it arrives, if at all, with #360's proxy, which resolves and brokers names
+host-side instead of inside the kernel ruleset.
+
+**Set aside.** Honoring a host-address allow-list entry in the `input` chain: not
+implemented. #359's probe showed hostname allow-list entries don't reliably match
+what the guest actually resolves, so widening the input chain on the strength of
+one would recreate the same mismatch this fix closes.
+
 ## 2. macOS is a no-op
 
 **Status:** accepted.
