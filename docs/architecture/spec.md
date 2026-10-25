@@ -338,6 +338,17 @@ never the host's.
   and the error path, so a boot failure never leaves rules up.
 - **macOS is a no-op.** `plan_egress_scoped` yields `NoBoundary`; the run proceeds
   without enforcement (documented, not silent).
+- **Planned: a NIC-less guest with a vsock host proxy (#360).** The guest gets
+  no NIC. `sandy-agent egress-relay` serves `127.0.0.1:3128` in the guest and
+  sets `HTTP(S)_PROXY` for the job. Each CONNECT crosses vsock to a per-run host
+  proxy that the backend owns beside `virtiofsd`. The proxy matches the target
+  name or IP and port against the allow-list before any resolution, resolves
+  names host-side, refuses loopback and host-local addresses, and refuses
+  private addresses the allow-list does not name. A proxy that fails to start
+  or dies mid-run is band 3. It replaces both decisions above once qemu and
+  vfkit pass the live parity gate. Full record:
+  [`../decisions/egress-proxy.md`](../decisions/egress-proxy.md). Planned live
+  KPIs: [`kpi.md#planned-egress-proxy`](kpi.md#planned-egress-proxy).
 
 **KPI.**
 
