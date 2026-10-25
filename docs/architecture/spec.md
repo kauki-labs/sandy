@@ -8,14 +8,77 @@ integration (tier-2, CI) and end-to-end (tier-3, live). Read
 consequences, the alternative set aside) is in [`../decisions/`](../decisions).
 The live **KPIs** are consolidated as an acceptance matrix in [`kpi.md`](kpi.md).
 
-Invariants referenced here: **INV-1** secrets never reach argv/env/the store;
-**INV-3** liveness only through `VmBackend::boxes` + the job flock, never a direct
-registry read; **INV-6** a `Running` record is written before the backend runs and
-a terminal record always carries the envelope; **INV-7** fail-closed (a mint or
-egress-apply failure is an infra fault, never a degraded run); **INV-8** the
-`Outcome` wire record is pinned `snake_case`; **INV-11** `status` ⇔ `retryable` ⇔
-process exit band never disagree; **INV-S9** a live scenario is never counted green
-from a fake.
+Invariants referenced here: **INV-1** secrets never reach argv/env/the store
+([attacker model](#attacker-model)); **INV-3** liveness only through
+`VmBackend::boxes` + the job flock, never a direct registry read ([attacker
+model](#attacker-model)); **INV-6** a `Running` record is written before the
+backend runs and a terminal record always carries the envelope; **INV-7**
+fail-closed (a mint or egress-apply failure is an infra fault, never a degraded
+run) ([attacker model](#attacker-model)); **INV-8** the `Outcome` wire record is
+pinned `snake_case`; **INV-11** `status` ⇔ `retryable` ⇔ process exit band never
+disagree; **INV-S9** a live scenario is never counted green from a fake.
+
+---
+
+## Attacker model
+
+The security invariants above assume a hostile job inside the sandbox. The
+[Agent Compute Engine design](https://cloud.google.com/blog/topics/ai-infrastructure/agent-compute-engine-deep-dive)
+(accessed 2026-10-24) states the same baseline: assume the attacker controls
+everything inside the sandbox, and leave nothing useful there to find.
+
+**Actors.**
+
+| Actor                                     | Defended by                                                                |
+| ----------------------------------------- | -------------------------------------------------------------------------- |
+| hostile job in the guest                  | covered in depth below                                                     |
+| sibling job on the same executor host     | `sandyd.md` decision 6 (per-run link token)                                |
+| a mesh peer that isn't the right executor | `sandyd.md` decisions 6, 12                                                |
+| over-reaching submitter                   | `sandyd.md` decision 11 (submitter caps)                                   |
+| another local user on the controller      | staging-base and trust-root checks (#138, `credential-seam.md` decision 4) |
+
+**Isolation class.** The hostile-job model applies to the VM backends,
+`QemuBackend` and `VfkitBackend`: a hostile job runs inside their strong
+boundary. The process backend is trusted-only and never admits an untrusted
+job, with any containment, on any host (`process-containment.md` decision 6,
+#150), so a hostile job on the process backend is outside this model by
+policy, not by luck.
+
+**The hostile job, in depth.** A compromised guest can run arbitrary code as
+root inside the guest, read anything mounted or exported into the job (inputs,
+the secret share, its own outputs), and reach anything the egress allow-list
+permits.
+
+The design still guarantees, even from inside a compromised guest:
+
+- no trust-root key and no channel signing key ever reach the guest
+  (`credential-seam.md` decisions 2 and 4);
+- no agent capability token in the job's environment;
+- on qemu, input and secret shares stay read-only enforced host-side by
+  `--readonly` on `virtiofsd`: a guest-root remount-rw still gets `EROFS` on
+  write.
+
+It does not guarantee:
+
+- **vfkit's RO shares are guest-cooperative, not host-enforced.** vfkit's
+  virtio-fs device has no read-only option, so RO rests on the guest's own
+  `ro` mount; a guest-root remount-rw can defeat it (`guest-shares.md`
+  decision 2). Each share is a single per-run dir wiped at teardown, so the
+  damage is confined to that run's own staging, not a host escape.
+- **token exfiltration, bounded by revocation, not TTL.** The minted forge
+  token is staged on the secret share and exported in-guest as
+  `$GITHUB_TOKEN` (`credential-seam.md` decisions 2-3); egress has to allow
+  the forge for git to work. A hostile job can read and exfiltrate the
+  token. The copy stays usable only until the controller revokes it: at the
+  next refresh (which supersedes and revokes the stale token,
+  `credential-seam.md` decision 3) or at job teardown at the latest
+  (`credential-seam.md` decision 1's revoke-on-every-path), whichever comes
+  first, not its full native TTL. The token is also narrowly scoped.
+  Recorded as an interim risk in `credential-seam.md`.
+- **guest-to-host traffic on Linux.** The egress ruleset filters the forward
+  chain only (`egress.md` decision 1); traffic the guest sends to the host
+  itself is not filtered. #376 tracks closing this.
+- **no egress boundary at all on macOS** (`egress.md` decision 2, #358).
 
 ---
 
@@ -128,6 +191,14 @@ flowchart LR
   already exists, opens it with `O_NOFOLLOW` and rejects it unless it is owned by
   the current uid with no group/world write bit. A bad base fails closed, never
   gets chmod'd/chowned back into shape.
+- **A caller's `secret_dir` is re-checked by fingerprint, not trusted by path
+  (CWE-367, #323).** `RunSpec::secret_dir` carries `(path, DirFingerprint)`, the
+  `(dev, ino)` the caller validated before building the spec; `plan_shares`
+  reopens it with `OwnedDir::open_matching`, refusing a same-uid, same-mode
+  directory swapped in at that path since. See decision 13 in
+  `docs/decisions/guest-shares.md`. This protects the staging reopen only: the
+  later transport resolves `ShareSpec.host_dir` by path, so a path replacement
+  after `plan_shares` returns remains a transport-level limitation.
 
 **KPI.**
 
@@ -140,7 +211,10 @@ flowchart LR
   `live_boot.rs::secret_share_mounts_read_only_virtiofs` (virtiofs fstype, guest
   write denied).
 - Unit: `sandy-backend/src/staging.rs`, a world-writable or symlinked base is
-  rejected, an owner/mode mismatch is rejected, a clean self-owned base validates.
+  rejected, an owner/mode mismatch is rejected, a clean self-owned base validates;
+  `sandy/src/shares.rs::a_secret_dir_swapped_after_validation_is_never_staged_into`
+  (adversarial, #323); `sandy-fsutil/src/secret.rs`'s
+  `open_matching_refuses_a_same_uid_mode_substitute_swapped_in_at_the_path`.
 
 ---
 
@@ -222,11 +296,22 @@ sequenceDiagram
   a configured tick against `MAX_TTL_SECS - CALL_DEADLINE`, not `MAX_TTL_SECS`
   alone, so an accepted tick always leaves room for one stalled call. See
   decision 6 for the residual gap this doesn't close.
+- **`cred_dir` is bound by fingerprint through mint and every refresh (CWE-367,
+  #323).** `run_credentialed` captures `cred_dir`'s `(dev, ino)` from the
+  `OwnedDir` `private_staging_dir` returns before reducing it to a path.
+  `mint_lease_checked`/`refresh_once_checked` reopen `cred_dir` with
+  `OwnedDir::open_matching` against that fingerprint instead of `mint_lease`'s/
+  `refresh_once`'s plain owner/mode reopen, so a same-uid, same-mode directory
+  swapped in at `cred_dir`'s path between validation and the mint, or between
+  two refreshes, is refused rather than silently receiving the token. See
+  decision 13 in `docs/decisions/guest-shares.md`.
 
 **KPI.**
 
 - Integration: `cred.rs` unit tests (`mint_lease` clamps TTL, stages 0600, revoke
-  bracket, `should_refresh`); the supervisor's mint-fails-closed test;
+  bracket, `should_refresh`);
+  `mint_lease_checked_refuses_a_dir_swapped_in_after_validation` (adversarial,
+  #323); the supervisor's mint-fails-closed test;
   `sandy-fsutil`'s `sweep_stale_staging_dirs` tests (sweeps a stale dir, keeps a
   fresh one, ignores an unrelated prefix, continues past an injected removal
   failure deterministically via `sweep_stale_staging_dirs_with`, supplemented
@@ -265,6 +350,17 @@ never the host's.
   and the error path, so a boot failure never leaves rules up.
 - **macOS is a no-op.** `plan_egress_scoped` yields `NoBoundary`; the run proceeds
   without enforcement (documented, not silent).
+- **Planned: a NIC-less guest with a vsock host proxy (#360).** The guest gets
+  no NIC. `sandy-agent egress-relay` serves `127.0.0.1:3128` in the guest and
+  sets `HTTP(S)_PROXY` for the job. Each CONNECT crosses vsock to a per-run host
+  proxy that the backend owns beside `virtiofsd`. The proxy matches the target
+  name or IP and port against the allow-list before any resolution, resolves
+  names host-side, refuses loopback and host-local addresses, and refuses
+  private addresses the allow-list does not name. A proxy that fails to start
+  or dies mid-run is band 3. It replaces both decisions above once qemu and
+  vfkit pass the live parity gate. Full record:
+  [`../decisions/egress-proxy.md`](../decisions/egress-proxy.md). Planned live
+  KPIs: [`kpi.md#planned-egress-proxy`](kpi.md#planned-egress-proxy).
 
 **KPI.**
 

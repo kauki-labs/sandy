@@ -18,16 +18,18 @@ use crate::backend::BackendError;
 /// A cgroup scope reaps the whole process tree and bounds resources, but a job
 /// inside it can still reach the user session bus and spawn units OUTSIDE the scope
 /// that teardown never reaps — so tree-reaping alone is NOT a boundary for untrusted
-/// code. The core's `admits_untrusted` keys off the stronger capability; reaping/
-/// teardown key off [`is_available`](ContainmentStatus::is_available).
+/// code. Reaping and teardown key off [`is_available`](ContainmentStatus::is_available).
+/// The core's `admits_untrusted` does not use either capability: untrusted jobs are
+/// VM-only (`docs/decisions/process-containment.md` §6), so it refuses every
+/// process-backend untrusted job.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContainmentStatus {
     /// Real containment is available: the whole process tree is reaped on teardown
     /// and resources are bounded. `isolates_untrusted` is whether this host ALSO
     /// isolates an adversary (reap + user-bus / mount-namespace isolation); a plain
     /// `systemd-run` scope sets it `false` (it reaps but does not contain a job that
-    /// talks to the user bus). The untrusted boundary lands with the mount-namespace
-    /// work (#142).
+    /// talks to the user bus). This is a reported capability only: admission ignores
+    /// it, because untrusted jobs are VM-only (#150).
     Available {
         /// Whether this containment is a safe boundary for UNTRUSTED code, not only
         /// a reaper of cooperative trees.
@@ -121,8 +123,8 @@ pub trait Containment: std::fmt::Debug + Send + Sync {
     /// `/run/sandy/<tag>` paths (and need not enforce cooperative read-only); when
     /// false it exposes the host staging dirs and keeps the cooperative fallback.
     /// This is a confinement-feature flag, NOT an untrusted-safety claim — it does
-    /// not imply [`ContainmentStatus::is_untrusted_boundary`] (#142; the untrusted
-    /// gate-flip is tracked separately in #150). Defaults to false.
+    /// not imply [`ContainmentStatus::is_untrusted_boundary`] (#142). Untrusted jobs
+    /// are VM-only (#150). Defaults to false.
     fn confines_filesystem(&self) -> bool {
         false
     }

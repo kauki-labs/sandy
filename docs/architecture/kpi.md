@@ -67,8 +67,8 @@ A KPI counts as met only when all three hold:
     and permitted unprivileged user namespaces (`kernel.unprivileged_userns_clone`,
     no blocking AppArmor profile). They refuse off-matrix — a host without bwrap/userns
     fails loudly rather than green-skipping (INV-S9). They verify confinement
-    hardening, NOT untrusted-safety: `isolates_untrusted` stays false (the gate-flip
-    is #150).
+    hardening, NOT untrusted-safety: `isolates_untrusted` stays false, because
+    untrusted jobs are VM-only (`process-containment.md` §6, #150).
 
 [^5]:
     `impls/vm`'s tier-3 tests predate this crate adopting the `live` cargo
@@ -105,6 +105,32 @@ nix shell nixpkgs#vfkit -c \
 
 K13 (egress) runs on Linux as root with `nft` on `PATH`; K12 (real App) needs
 `SANDY_CRED_LIVE_TRUST_ROOT` and is operator-run.
+
+## Planned: egress proxy
+
+The parity gate for the NIC-less guest with a vsock host proxy
+([`egress-proxy.md`](../decisions/egress-proxy.md) decision 5, #360). **None of
+these rows is green yet**, and none counts toward the floor above until its test
+exists and passes. Each capability needs both its qemu and its vfkit row to pass
+before the nftables path (K13) is deleted. All tests live in
+`sandy-cli/tests/live_egress_proxy.rs`.
+
+| #    | Capability            | Required behaviour                                                                                                                                                                                                      | Proven by                                                             | Upholds | Host matrix | Status        |
+| ---- | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- | ------- | ----------- | ------------- |
+| KP1q | Proxy allow           | An allow-listed `host:port` is reachable through the guest relay (`curl` via `HTTPS_PROXY`).                                                                                                                            | `live_egress_proxy.rs::allowed_target_is_reachable_through_the_proxy` | INV-7   | qemu        | not yet green |
+| KP1v | Proxy allow           | An allow-listed `host:port` is reachable through the guest relay (`curl` via `HTTPS_PROXY`).                                                                                                                            | `live_egress_proxy.rs::allowed_target_is_reachable_through_the_proxy` | INV-7   | vfkit       | not yet green |
+| KP2q | Proxy deny            | A target not on the allow-list gets `403` from the proxy and no connection leaves the host.                                                                                                                             | `live_egress_proxy.rs::denied_target_gets_403`                        | INV-7   | qemu        | not yet green |
+| KP2v | Proxy deny            | A target not on the allow-list gets `403` from the proxy and no connection leaves the host.                                                                                                                             | `live_egress_proxy.rs::denied_target_gets_403`                        | INV-7   | vfkit       | not yet green |
+| KP3q | Proxy empty list      | An empty allow-list refuses every CONNECT; the guest has no other route out.                                                                                                                                            | `live_egress_proxy.rs::empty_allow_list_blocks_all_egress`            | INV-7   | qemu        | not yet green |
+| KP3v | Proxy empty list      | An empty allow-list refuses every CONNECT; the guest has no other route out.                                                                                                                                            | `live_egress_proxy.rs::empty_allow_list_blocks_all_egress`            | INV-7   | vfkit       | not yet green |
+| KP4q | Proxy bypass          | As root in the guest: a direct connect by IP fails (no NIC), and a raw vsock stream to the proxy port meets the same allow-list. A stream from another CID is refused (vhost-vsock stamps the source CID).              | `live_egress_proxy.rs::in_guest_bypass_attempts_fail`                 | INV-7   | qemu        | not yet green |
+| KP4v | Proxy bypass          | As root in the guest: a direct connect by IP fails (no NIC), and a raw vsock stream to the proxy port meets the same allow-list. There is no shared CID space to restrict: only the ports the backend configures exist. | `live_egress_proxy.rs::in_guest_bypass_attempts_fail`                 | INV-7   | vfkit       | not yet green |
+| KP5q | Proxy address filter  | An allow-listed name that resolves to loopback (`localhost:<port>`) gets `403`.                                                                                                                                         | `live_egress_proxy.rs::allowed_name_resolving_to_loopback_is_refused` | INV-7   | qemu        | not yet green |
+| KP5v | Proxy address filter  | An allow-listed name that resolves to loopback (`localhost:<port>`) gets `403`.                                                                                                                                         | `live_egress_proxy.rs::allowed_name_resolving_to_loopback_is_refused` | INV-7   | vfkit       | not yet green |
+| KP6q | Proxy death           | Killing the proxy mid-run classifies the run as band 3, whatever the guest's exit.                                                                                                                                      | `live_egress_proxy.rs::proxy_death_mid_run_is_band_3`                 | INV-7   | qemu        | not yet green |
+| KP6v | Proxy death           | Killing the proxy mid-run classifies the run as band 3, whatever the guest's exit.                                                                                                                                      | `live_egress_proxy.rs::proxy_death_mid_run_is_band_3`                 | INV-7   | vfkit       | not yet green |
+| KP7q | Proxy startup failure | A proxy that cannot start refuses the VM run as band 3, with no boot.                                                                                                                                                   | `live_egress_proxy.rs::proxy_startup_failure_is_band_3`               | INV-7   | qemu        | not yet green |
+| KP7v | Proxy startup failure | A proxy that cannot start refuses the VM run as band 3, with no boot.                                                                                                                                                   | `live_egress_proxy.rs::proxy_startup_failure_is_band_3`               | INV-7   | vfkit       | not yet green |
 
 ## Not yet a KPI
 
