@@ -123,7 +123,12 @@ and scoped to one run.
 **Decision.** A new crate, `sandy-egress-proxy`, holds a pure core (CONNECT
 parsing, the allow-list match, the address filter) and a binary. The backend
 spawns one proxy per launch attempt, beside the `virtiofsd` daemons on qemu and
-beside `vfkit` on macOS.
+beside `vfkit` on macOS, with an explicit, sanitized environment: never the
+staged forge token or other secret bytes. Neither `virtiofsd`
+(`spawn_virtiofsd`, `impls/vm/src/share.rs`) nor qemu/vfkit sanitize their
+environment today; the proxy needs its own because it is new, guest-adjacent
+attack surface that parses guest-controlled input, unlike those two. #404 and
+#405 carry this in their acceptance criteria.
 
 _Lifecycle._
 
@@ -141,8 +146,10 @@ _Lifecycle._
 - A qemu CID collision relaunches with a new CID. The proxy belongs to the
   launch attempt, so the retry restarts it with the new CID.
 - The proxy needs no privilege and runs as the backend's user. It logs each
-  CONNECT target and verdict through `tracing` to stderr, which the backend
-  captures at debug level. It never logs tunnel payload.
+  CONNECT target that passes the host grammar, and its verdict, through
+  `tracing` to stderr, which the backend captures at debug level. A malformed
+  target is logged only as `malformed`, never as raw bytes. It never logs
+  tunnel payload.
 
 _Transport and peer identity._
 
@@ -344,9 +351,10 @@ guest topology, so they should move together.
    proxy cannot start is refused (band 3, decision 3), and no VM path yields
    `NoBoundary`.
 
-**Consequences.** macOS gains enforced HTTP(S) egress in step 6. Given the
-observation in Context, that is in effect macOS gaining HTTP(S) egress at all,
-enforced from the start; non-HTTP egress stays out of scope, deferred to #372.
+**Consequences.** macOS gains enforced HTTPS egress through HTTP CONNECT in
+step 6. Given the observation in Context, that is in effect macOS gaining
+HTTPS egress at all, enforced from the start; plain HTTP and non-HTTP egress
+stay out of scope, deferred to #372.
 #376 is closed for sandy's own surface by construction: with no NIC there is no
 IP path to the host. The qemu leg still reaches host `AF_VSOCK` listeners (see
 the adversarial pass). #359's IP-only semantics and its hostname refusal last
@@ -418,7 +426,8 @@ Already filed and fed by this work: #375 (egress attempts in receipts) and #377
 termination and non-HTTP egress.
 
 #404's peer-CID check is specified above for agent-mode launches, where
-`agent_cid` names the CID `qemu_args` assigns. A console-only run (no
-`agent_program`) leaves `agent_cid` unset today, so #404 must also define the
-CID a console-only launch claims, the vsock device that exposes it, and the
-peer check the proxy runs against it, before its KP1q/KP2q rows can close.
+`agent_cid` names the CID `qemu_args` assigns. A console-only run does not
+launch `agent_program`, which leaves `agent_cid` unset today, so #404 must also
+define the CID a console-only launch claims, the vsock device that exposes it,
+and the peer check the proxy runs against it, before its KP1q/KP2q rows can
+close.
