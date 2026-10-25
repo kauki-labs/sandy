@@ -578,7 +578,10 @@ that declaration, never a hardcoded host) plus the dispatch RPC.
   value for authorization" discipline decision 6 already applies to the
   agent-link stream. An unknown registrant gets `RegisterRefused`, never
   `Registered`, and is logged — never silently dropped, and never told more
-  than "no".
+  than "no". Authenticating by peer IP means the WireGuard key is the host's
+  identity: there is no attestation, which is an acceptable assumption for
+  operator-provisioned hosts, not a general identity check (see
+  [`spec.md`'s attacker model](../architecture/spec.md#attacker-model)).
 - `Dispatch.required_isolation_class` (added per #269's CodeRabbit-driven spec
   revision): the job's required isolation class travels with the dispatch so
   the orchestrator/executor can refuse fail-closed rather than silently
@@ -929,11 +932,12 @@ happy path).
   stage-1 (#269 D4) has no VM/untrusted backend, so an untrusted job is
   genuinely inexpressible and unrunnable, not merely unimplemented. This is
   accurate for stage-1, not a shortcut: adding a `SubmitRequest` wire field
-  for a value that can't vary until #150 (VM/untrusted isolation) lands
-  would be premature configurability. The tripwire comment names the exact
-  replacement: when #150 lands, this constant must become a real per-job
-  requirement on the submit path, or an untrusted job would silently default
-  to `Trusted` and breach isolation.
+  for a value that could not vary at the time would be premature
+  configurability. The tripwire comment names the exact replacement. #150 has
+  since decided that untrusted jobs are VM-only (`process-containment.md`
+  §6), and #381 replaces this constant with a per-job requirement on the
+  submit path. Until #381 lands, an untrusted job cannot be expressed, so it
+  cannot silently default to `Trusted`.
 - `HostRegistry::pick_host_for` enforces the same fail-closed-on-`Unspecified`
   rule `send_dispatch` already does, so placement can never pick a host
   `send_dispatch` would then refuse anyway — the gate applies at the
@@ -983,8 +987,9 @@ going to use for real work.
 
 **Set aside.** Adding a `SubmitRequest.required_isolation_class` wire field
 now (the alternative to the stage-1 constant): premature configurability for
-a value that cannot vary until #150 lands — see the tripwire comment at
-`STAGE1_REQUIRED_ISOLATION_CLASS`'s definition. A real scheduling policy
+a value that could not vary at the time (see the tripwire comment at
+`STAGE1_REQUIRED_ISOLATION_CLASS`'s definition). #381 adds the field now that
+#150 is decided. A real scheduling policy
 (load, affinity, multiple qualifying hosts): stage-1 has at most one
 executor in practice, so "first match" is equivalent to "the match"; nothing
 to decide between yet.

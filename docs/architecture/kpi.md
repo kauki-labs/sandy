@@ -66,8 +66,8 @@ A KPI counts as met only when all three hold:
     and permitted unprivileged user namespaces (`kernel.unprivileged_userns_clone`,
     no blocking AppArmor profile). They refuse off-matrix — a host without bwrap/userns
     fails loudly rather than green-skipping (INV-S9). They verify confinement
-    hardening, NOT untrusted-safety: `isolates_untrusted` stays false (the gate-flip
-    is #150).
+    hardening, NOT untrusted-safety: `isolates_untrusted` stays false, because
+    untrusted jobs are VM-only (`process-containment.md` §6, #150).
 
 ## Running the KPI suite
 
