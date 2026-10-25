@@ -74,15 +74,34 @@ one would recreate the same mismatch this fix closes.
 **Status:** accepted.
 
 **Context.** The guest-scoped nftables mechanism is Linux-only; macOS has no
-equivalent in this path.
+equivalent in this path. The guest also has no network device at all:
+`vfkit_args` (`impls/vm/src/vfkit.rs`) emits virtio-blk, virtio-serial,
+virtio-fs and virtio-vsock devices, and no `virtio-net`. A macOS guest's egress
+is therefore denied by construction, not merely unfiltered: a correction to
+this decision's earlier text, which said macOS had "unfiltered network
+(vmnet)". A Linux guest with no bound tap has no NIC either, for the same
+reason `plan_egress_scoped` gives it `NoBoundary`.
 
-**Decision.** On macOS `plan_egress_scoped` yields `NoBoundary`; the run proceeds
-without enforcement, **documented, not silent**.
+**Decision.** On macOS `plan_egress_scoped` yields `NoBoundary`; the run
+proceeds without enforcement, **documented, not silent**. Because there is no
+NIC, a non-empty `--allow` list has no effect to grant: the envelope's
+`warnings` says so (#358), `egress unavailable: the guest has no network
+device, so --allow entries have no effect (see #360)`, for both macOS and a
+tap-less Linux guest. An empty allow-list does not add an envelope warning —
+deny-all already
+holds with no NIC to grant anything onto. The decision keys on structure
+(`EgressOs::MacOs`, or no tap), never on the `Unenforced` reason string.
 
-**Consequences.** `NoBoundary` means no egress enforcement is installed, not that
-an unfiltered network is available: the current vfkit argv emits no `virtio-net`
-device, so a macOS guest has no network interface at all today. The behaviour is
-stated in the result and the docs so it is not mistaken for enforcement.
+**Consequences.** `NoBoundary` means no egress enforcement is installed, not
+that an unfiltered network is available: the current vfkit argv emits no
+`virtio-net` device, so a macOS guest (or a tap-less Linux guest) has no
+network interface at all today, and no network to filter or to grant. The
+result says so, in both the docs and the envelope, when `--allow` would
+otherwise look like it did something. Status stays `succeeded`: this is a
+known gap, not a fault.
+
+**Follow-up.** #360 gives guests network (a host-side proxy); #408 then turns
+this warning into a refusal once there is something for `--allow` to grant.
 
 **Replaced after parity.** The vsock host proxy gives macOS guests HTTPS
 egress (through HTTP CONNECT) for the first time, enforced the same way as on

@@ -189,6 +189,44 @@ fn build_host_observed(
     }
 }
 
+/// The envelope warning for a non-empty `--allow` list that has no effect
+/// (#358).
+///
+/// On a VM backend, `vfkit_args` (`impls/vm/src/vfkit.rs`) emits no
+/// `virtio-net` device, so a macOS guest has no NIC at all; a Linux guest with
+/// no bound tap has none either (`plan_egress_scoped`). `--allow` entries are
+/// not merely unfiltered there, they are inert: there is nothing to grant them
+/// onto. On the process backend there is no guest at all — the job runs
+/// directly on the host network, sharing it rather than lacking a NIC — but
+/// the allow-list is just as unenforced, so the warning still fires, with a
+/// cause that matches what's actually true for that backend. Keys on
+/// structure (`backend_kind`, `EgressOs::MacOs`, or no `tap`), never on the
+/// `EgressOutcome`'s reason string, so a reason that happens not to match a
+/// pattern can't defeat it. An empty allow-list never warns: deny-all already
+/// holds regardless of the reason.
+fn no_network_allow_warning(
+    allow: &AllowList,
+    backend_kind: SandboxKind,
+    egress_os: EgressOs,
+    tap: Option<&str>,
+) -> Option<String> {
+    if allow.rules.is_empty() {
+        return None;
+    }
+    match backend_kind {
+        SandboxKind::Process => Some(
+            "egress unavailable: the process backend shares the host network with no isolation boundary, so --allow \
+             entries have no effect"
+                .to_string(),
+        ),
+        SandboxKind::Vm if matches!(egress_os, EgressOs::MacOs) || tap.is_none() => Some(
+            "egress unavailable: the guest has no network device, so --allow entries have no effect (see #360)"
+                .to_string(),
+        ),
+        SandboxKind::Vm => None,
+    }
+}
+
 /// List the files the backend collected to each declared output's destination as
 /// `(logical path, size in bytes)` pairs. The path is logical, not a host path:
 /// `<name>/<relpath>` for a named output (`--out NAME:DEST`) and `<relpath>` for a
@@ -492,7 +530,7 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
     // the SAME platform-keyed outcome that drove the enforce/revert bracket below,
     // never a second, independently derived copy.
     let egress_receipt_result: Result<EgressOutcome, String>;
-    let run_result: Result<Outcome, BackendError> = match enforce(&eplan, egress) {
+    let (run_result, egress_warning): (Result<Outcome, BackendError>, Option<String>) = match enforce(&eplan, egress) {
         Ok(eoutcome) => {
             egress_receipt_result = Ok(eoutcome.clone());
             let outcome = backend.run(&spec);
@@ -501,14 +539,20 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
             {
                 tracing::warn!(%e, "egress revert failed");
             }
-            outcome
+            (
+                outcome,
+                no_network_allow_warning(&plan.allow, backend.kind(), egress_os, tap),
+            )
         }
         Err(egress_error) => {
             egress_receipt_result = Err(egress_error.to_string());
             tracing::warn!(%job_id, %egress_error, "egress apply failed; refusing to boot (fail-closed)");
-            Err(BackendError::Spawn(format!(
-                "egress boundary not established: {egress_error}"
-            )))
+            (
+                Err(BackendError::Spawn(format!(
+                    "egress boundary not established: {egress_error}"
+                ))),
+                None,
+            )
         }
     };
 
@@ -568,7 +612,7 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
             outputs: output_sizes,
         },
     });
-    let envelope = build_envelope(
+    let mut envelope = build_envelope(
         &job_id,
         None,
         classification,
@@ -578,6 +622,9 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
         outputs,
         receipt,
     );
+    if let Some(warning) = egress_warning {
+        envelope.warnings.push(warning);
+    }
 
     Ok(JobOutcome {
         report: RunReport {

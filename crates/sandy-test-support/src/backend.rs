@@ -2,24 +2,39 @@
 
 use std::sync::{Mutex, PoisonError};
 
-use sandy_api::backend::{BackendError, BoxState, Outcome, RunSpec, VmBackend};
+use sandy_api::backend::{BackendError, BoxState, Outcome, RunSpec, SandboxKind, VmBackend};
 
 /// An in-memory [`VmBackend`] test double.
 ///
 /// Script a run outcome with [`FakeBackend::with_outcome`] /
 /// [`FakeBackend::with_error`], the running-box set with
-/// [`FakeBackend::with_boxes`], and inspect teardown calls with
+/// [`FakeBackend::with_boxes`], the reported [`SandboxKind`] with
+/// [`FakeBackend::with_kind`], and inspect teardown calls with
 /// [`FakeBackend::killed`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct FakeBackend {
     /// The scripted result of the next [`VmBackend::run`] call. Set once by the
     /// by-value builders, then only read, so it needs no interior mutability.
     run_result: Option<Result<Outcome, BackendError>>,
     /// The boxes [`VmBackend::boxes`] should report.
     boxes: Vec<BoxState>,
+    /// The [`SandboxKind`] [`VmBackend::kind`] reports; `Vm` by default, matching
+    /// the trait's own default for every real backend but the process one.
+    kind: SandboxKind,
     /// Box ids passed to [`VmBackend::kill`], in call order — the one field
     /// mutated through `&self`, so the only one behind a lock.
     killed: Mutex<Vec<String>>,
+}
+
+impl Default for FakeBackend {
+    fn default() -> Self {
+        Self {
+            run_result: None,
+            boxes: Vec::new(),
+            kind: SandboxKind::Vm,
+            killed: Mutex::new(Vec::new()),
+        }
+    }
 }
 
 impl FakeBackend {
@@ -50,6 +65,13 @@ impl FakeBackend {
         self
     }
 
+    /// Script the [`SandboxKind`] [`VmBackend::kind`] reports.
+    #[must_use]
+    pub fn with_kind(mut self, kind: SandboxKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
     /// The box ids [`VmBackend::kill`] has been called with, in order.
     #[must_use]
     pub fn killed(&self) -> Vec<String> {
@@ -74,5 +96,9 @@ impl VmBackend for FakeBackend {
 
     fn boxes(&self) -> Result<Vec<BoxState>, BackendError> {
         Ok(self.boxes.clone())
+    }
+
+    fn kind(&self) -> SandboxKind {
+        self.kind
     }
 }
