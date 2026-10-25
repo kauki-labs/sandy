@@ -46,13 +46,13 @@ pub fn provision_remote_build(job: &Job, host: &str, arch: &str, remote: &impl R
             };
         }
         Ok(_) => {}
-        Err(err) => return ProvisionOutcome::Provisioned(infra_fault_envelope(job, &err.to_string())),
+        Err(err) => return ProvisionOutcome::Provisioned(Box::new(infra_fault_envelope(job, &err.to_string()))),
     }
 
     let derivation = eval_locally(job);
     match remote.build_remote(&derivation, host, arch) {
-        Ok(artifacts) => ProvisionOutcome::Provisioned(succeeded_envelope(job, &artifacts)),
-        Err(err) => ProvisionOutcome::Provisioned(infra_fault_envelope(job, &err.to_string())),
+        Ok(artifacts) => ProvisionOutcome::Provisioned(Box::new(succeeded_envelope(job, &artifacts))),
+        Err(err) => ProvisionOutcome::Provisioned(Box::new(infra_fault_envelope(job, &err.to_string()))),
     }
 }
 
@@ -81,6 +81,7 @@ fn succeeded_envelope(job: &Job, artifacts: &RemoteArtifacts) -> ResultEnvelope 
         },
         logs: Logs { tail: String::new() },
         warnings: Vec::new(),
+        receipt: None,
     }
 }
 
@@ -102,6 +103,7 @@ fn infra_fault_envelope(job: &Job, message: &str) -> ResultEnvelope {
         },
         logs: Logs { tail: String::new() },
         warnings: Vec::new(),
+        receipt: None,
     }
 }
 

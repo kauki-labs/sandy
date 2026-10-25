@@ -292,6 +292,7 @@ mod tests {
             },
             logs: Logs { tail: String::new() },
             warnings: Vec::new(),
+            receipt: None,
         }
     }
 
