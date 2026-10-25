@@ -258,8 +258,8 @@ pub fn validate_egress_hosts(allow: &AllowList, target_os: EgressOs) -> Result<(
     for rule in &allow.rules {
         if !is_ipv4_or_cidr(&rule.host) {
             return Err(PlanError::Invalid(format!(
-                "--allow `{}:{}` is a hostname; the nftables egress boundary matches by IPv4 address or CIDR only \
-                 (see #377 for hostname support)",
+                "--allow `{}:{}` is not a valid IPv4 address or IPv4 CIDR; the nftables egress boundary matches by \
+                 IPv4 address or CIDR only (see #377 for hostname support)",
                 rule.host, rule.port
             )));
         }
@@ -382,6 +382,29 @@ mod tests {
             };
             assert!(msg.contains(host), "the error must name the entry: {msg}");
             assert!(msg.contains("377"), "the error must point to #377: {msg}");
+        }
+    }
+
+    /// Review finding on #418: an IPv6 address or an out-of-range CIDR is
+    /// neither a hostname nor a valid IPv4/CIDR, so the refusal must not
+    /// mislabel it as a hostname.
+    #[test]
+    fn linux_refuses_a_non_ipv4_entry_without_calling_it_a_hostname() {
+        for host in ["2001:db8::1", "10.0.0.0/33"] {
+            let err = validate_egress_hosts(&allow_one(host, 443), EgressOs::Linux)
+                .expect_err(&format!("a non-IPv4 entry `{host}` must be refused on Linux"));
+            let PlanError::Invalid(msg) = err else {
+                panic!("expected PlanError::Invalid, got {err:?}");
+            };
+            assert!(msg.contains(host), "the error must name the entry: {msg}");
+            assert!(
+                !msg.contains("is a hostname"),
+                "the error must not call a non-hostname entry a hostname: {msg}"
+            );
+            assert!(
+                msg.contains("not a valid IPv4"),
+                "the error must say what the entry actually fails to be: {msg}"
+            );
         }
     }
 

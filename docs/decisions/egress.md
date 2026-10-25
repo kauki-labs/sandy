@@ -104,11 +104,13 @@ than the one nft had pinned, so the connection by name still failed. A hostname
 entry in the allow-list therefore only ever helps a job that already connects by
 IP — it never does what `--allow <hostname>` implies.
 
-**Decision.** An allow-list entry must be an IPv4 address or IPv4 CIDR; `plan_egress_scoped`
-refuses a hostname entry on the nftables (Linux) path as an invalid plan
-(band 2, no journal record, no boot), naming the entry and pointing to #377.
-macOS enforces no per-VM boundary, so a hostname entry there is inert rather
-than misleading, and stays accepted (decision 2, #358).
+**Decision.** An allow-list entry must be an IPv4 address or IPv4 CIDR;
+`validate_egress_hosts` (called by `run_job` before `plan_egress_scoped`, which
+does not itself validate hosts) refuses a hostname entry on the nftables
+(Linux) path as an invalid plan (band 2, no journal record, no boot), naming
+the entry and pointing to #377. macOS enforces no per-VM boundary, so a
+hostname entry there is inert rather than misleading, and stays accepted
+(decision 2, #358).
 
 **Consequences.** This is a breaking change for `--allow <hostname>` on Linux: a
 rule that silently never matched is now a clear refusal at plan time. Hostname
