@@ -25,7 +25,7 @@ use sandy::{
     RESULT_SCHEMA_VERSION, ResultEnvelope, SandboxKind, Scope, SecretSource, StagedImage, Status, Timing, VmBackend,
     What, Who, classify_backend_error, classify_invalid_plan, classify_outcome, enforce, mint_lease,
     mint_lease_checked, new_job_id, plan_egress_scoped, plan_eviction, reconcile_job, refresh_once_checked,
-    validate_no_secret_leak,
+    validate_egress_hosts, validate_no_secret_leak,
 };
 use zeroize::Zeroizing;
 
@@ -441,8 +441,12 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
     let spec = plan.as_run_spec();
 
     // 1. Validate the plan. An invalid plan is band 2 with NO journal record and NO backend run — the running record is
-    //    the first thing written, so an empty journal proves the backend was never reached (the silent-run guard).
-    if let Err(plan_error) = validate_no_secret_leak(&spec) {
+    //    the first thing written, so an empty journal proves the backend was never reached (the silent-run guard). A
+    //    hostname allow-list entry is invalid on Linux only (#359): nft pins one address at load time and the guest
+    //    can't resolve names through the boundary anyway, so it is refused here rather than loaded as a rule that never
+    //    matches. macOS enforces no boundary, so a hostname entry there stays accepted.
+    if let Err(plan_error) = validate_no_secret_leak(&spec).and_then(|()| validate_egress_hosts(&plan.allow, egress_os))
+    {
         let classification = classify_invalid_plan(&plan_error);
         let envelope = build_envelope(
             &new_job_id(),
@@ -704,6 +708,29 @@ pub fn run_job_with_credential<
     cred_dir_fingerprint: DirFingerprint,
     requested_ttl_secs: u32,
 ) -> Result<RunReport, CoreError> {
+    // Validate the plan before minting: a hostname allow-list entry is invalid on
+    // Linux (#359, same check `run_job` runs). Checking it here, before the mint,
+    // means a bad plan never mints-and-immediately-revokes a credential for a run
+    // that was always going to be refused, and a mint failure (CoreError::Cred)
+    // never masks what should be a clean band-2 invalid-plan report.
+    if let Err(plan_error) = validate_egress_hosts(&plan.allow, egress_os) {
+        let classification = classify_invalid_plan(&plan_error);
+        let envelope = build_envelope(
+            &new_job_id(),
+            None,
+            classification,
+            None,
+            plan_error.to_string(),
+            String::new(),
+            vec![],
+            None,
+        );
+        return Ok(RunReport {
+            envelope,
+            process_exit: classification.process_exit,
+        });
+    }
+
     let margin = refresh_interval("SANDY_REFRESH_MARGIN_SECS", DEFAULT_REFRESH_MARGIN_SECS);
     let tick = safe_heartbeat_tick(
         refresh_interval("SANDY_REFRESH_TICK_SECS", DEFAULT_REFRESH_TICK_SECS),

@@ -357,6 +357,18 @@ never the host's.
   no guest DNS is resolved or trusted.
 - **macOS is a no-op.** `plan_egress_scoped` yields `NoBoundary`; the run proceeds
   without enforcement (documented, not silent).
+- **IP-only matching, no guest DNS (#359).** An allow-list entry is an IPv4
+  address or IPv4 CIDR plus port; matching is by destination IPv4 address and TCP
+  port only — IPv6, UDP, and QUIC from the guest are dropped. The guest gets no
+  DNS through the boundary, so a job must connect by IP. A hostname entry is
+  refused at plan time on the nftables (Linux) path: band 2, no journal record,
+  no boot, naming the entry and #377. nft pins a hostname to one address at
+  ruleset-load time, rejects a name with several addresses, and the guest can't
+  resolve names through the boundary anyway, so a hostname entry only ever helps
+  a job that already connects by IP — refusing it turns that silent no-op into a
+  clear error. macOS enforces no boundary, so a hostname entry stays accepted
+  there (#358). Hostname policy arrives with the #360 egress proxy (#377), which
+  resolves names host-side.
 - **Planned: a NIC-less guest with a vsock host proxy (#360).** The guest gets
   no NIC. `sandy-agent egress-relay` serves `127.0.0.1:3128` in the guest and
   sets `HTTP(S)_PROXY` for the job. Each CONNECT crosses vsock to a per-run host
@@ -371,9 +383,11 @@ never the host's.
 
 **KPI.**
 
-- Integration: `egress` unit tests (ruleset generation, `plan_egress_scoped`);
-  `cli_jobs` `run_on_linux_applies_the_allow_list_ruleset_and_reverts_it` /
-  `..._macos_applies_no_boundary` / apply-failure-fails-closed (over `FakeApplier`).
+- Integration: `egress` unit tests (ruleset generation, `plan_egress_scoped`,
+  `validate_egress_hosts`); `cli_jobs`
+  `run_on_linux_applies_the_allow_list_ruleset_and_reverts_it` /
+  `..._macos_applies_no_boundary` / apply-failure-fails-closed (over
+  `FakeApplier`) / `run_hostname_allow_on_linux_is_invalid_plan_writes_no_record_and_never_boots`.
 - End-to-end: `live_egress.rs` (Linux + root + `nft`), real nftables around a boot,
   including the host-destined case (an empty allow-list plus a host-local
   resolver: the guest can't resolve names through it and can't connect to the

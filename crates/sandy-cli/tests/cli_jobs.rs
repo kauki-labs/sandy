@@ -449,8 +449,26 @@ fn gc_evicts_oldest_terminal_beyond_keep_n_but_keeps_the_running_job() -> anyhow
 
 // --- egress bracketing around the boot (#23/#24) ----------------------------
 
-/// A plan that boots `demo` behind a one-rule allow-list (`github.com:443`).
+/// A plan that boots `demo` behind a one-rule allow-list (`1.1.1.1:443`). An IP
+/// entry, not a hostname: these tests exercise the egress-bracketing mechanics
+/// (apply/revert, fail-closed), not matching, and a hostname is refused at plan
+/// time on Linux (#359).
 fn allowing_plan() -> JobPlan {
+    JobPlan {
+        allow: AllowList {
+            rules: vec![EgressRule {
+                host: "1.1.1.1".to_string(),
+                port: 443,
+            }],
+        },
+        ..booting_plan()
+    }
+}
+
+/// A plan behind a one-rule allow-list naming `github.com:443` — a hostname
+/// entry. macOS enforces no per-VM boundary, so this stays accepted there (#358);
+/// used only by the macOS egress test.
+fn allowing_plan_by_hostname() -> JobPlan {
     JobPlan {
         allow: AllowList {
             rules: vec![EgressRule {
@@ -460,6 +478,107 @@ fn allowing_plan() -> JobPlan {
         },
         ..booting_plan()
     }
+}
+
+/// #359: on Linux, a hostname allow-list entry is refused at plan time as an
+/// invalid plan (band 2) — no journal record, no boot. nft pins a hostname to
+/// one address at load time and the guest can't resolve names through the
+/// boundary anyway, so it is refused rather than loaded as a rule that never
+/// matches.
+#[test]
+fn run_hostname_allow_on_linux_is_invalid_plan_writes_no_record_and_never_boots() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    // A success is scripted on purpose: if the backend were ever run the band
+    // would be 0, so band 2 here proves the boot was skipped.
+    let backend = FakeBackend::new().with_outcome(ok_outcome(0));
+
+    let report = run_job(
+        &backend,
+        &journal,
+        &allowing_plan_by_hostname(),
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        Some("sandytap0"),
+        &[],
+    )
+    .context("run_job (hostname allow entry, linux)")?;
+
+    assert_eq!(
+        report.process_exit.code(),
+        2,
+        "a hostname allow entry on Linux is band 2"
+    );
+    assert!(!report.envelope.retryable, "band 2 is never retryable");
+    assert!(
+        report.envelope.message.contains("github.com"),
+        "the error must name the refused entry: {}",
+        report.envelope.message
+    );
+    assert!(
+        report.envelope.message.contains("377"),
+        "the error must point to #377 (hostname support via the egress proxy): {}",
+        report.envelope.message
+    );
+    assert!(
+        journal.list().context("list after hostname allow entry")?.is_empty(),
+        "a refused hostname entry must write no job record"
+    );
+    assert!(
+        backend.killed().is_empty(),
+        "a refused hostname entry must not touch the backend"
+    );
+    Ok(())
+}
+
+/// #359 + credentialed path (review finding on #418): a hostname allow-list
+/// entry on Linux must be refused BEFORE the credential mint, not after. Minting
+/// first would mint-and-immediately-revoke a credential for a plan that was
+/// always going to be refused, and a mint failure would mask the clean band-2
+/// invalid-plan report behind `CoreError::Cred`.
+#[test]
+fn run_with_credential_hostname_allow_on_linux_is_invalid_plan_never_mints() -> anyhow::Result<()> {
+    let (tmp, journal) = fresh_journal()?;
+    let provider = FakeProvider::returning("ghs_should_never_be_minted");
+    let backend = FakeBackend::new().with_outcome(ok_outcome(0));
+    let cred_dir = tmp.path().join("cred");
+    std::fs::create_dir_all(&cred_dir).context("create cred dir")?;
+    std::fs::set_permissions(&cred_dir, std::fs::Permissions::from_mode(0o700)).context("cred dir 0700")?;
+
+    let report = run_job_with_credential(
+        &backend,
+        &journal,
+        allowing_plan_by_hostname(),
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        Some("sandytap0"),
+        &provider,
+        &token_scope(),
+        "GH_TOKEN",
+        &cred_dir,
+        fingerprint(&cred_dir)?,
+        1_800,
+    )
+    .context("run_job_with_credential (hostname allow entry, linux)")?;
+
+    assert_eq!(
+        report.process_exit.code(),
+        2,
+        "a hostname allow entry on Linux is band 2, even on the credentialed path"
+    );
+    assert!(
+        report.envelope.message.contains("github.com"),
+        "the error must name the refused entry: {}",
+        report.envelope.message
+    );
+    assert!(
+        provider.mints().is_empty(),
+        "the plan must be rejected before any credential is minted"
+    );
+    assert!(
+        journal.list().context("list after hostname allow entry")?.is_empty(),
+        "a refused hostname entry must write no job record"
+    );
+    Ok(())
 }
 
 /// #23: a Linux run with a non-empty allow-list applies the `to_nftables`
@@ -559,10 +678,13 @@ fn run_on_macos_applies_no_boundary_but_still_succeeds() -> anyhow::Result<()> {
     let backend = FakeBackend::new().with_outcome(ok_outcome(0));
     let applier = FakeApplier::new();
 
+    // A hostname entry on purpose: macOS enforces no per-VM boundary, so it
+    // stays accepted there (#358) even though the same entry is refused on
+    // Linux (#359).
     let report = run_job(
         &backend,
         &journal,
-        &allowing_plan(),
+        &allowing_plan_by_hostname(),
         &applier,
         EgressOs::MacOs,
         None,
