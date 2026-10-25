@@ -451,6 +451,7 @@ fn plan_shares_stages_secret_input_output_with_the_right_flags() -> Result<()> {
 /// the guest) and points at the caller's dir, not inst_dir.
 #[test]
 fn plan_shares_attaches_an_empty_secret_dir_for_refresh() -> Result<()> {
+    use sandy::DirFingerprint;
     use sandy_backend::{ShareDirs, plan_shares};
 
     let tmp = tempfile::tempdir().context("tmp")?;
@@ -466,6 +467,12 @@ fn plan_shares_attaches_an_empty_secret_dir_for_refresh() -> Result<()> {
     let inputs = tmp.path().join("i");
     let outputs = tmp.path().join("o");
 
+    // The caller's own validation, as `private_staging_dir` would capture it (#323).
+    let (dev, ino) = sandy_fsutil::OwnedDir::open(&cred)
+        .context("open cred dir")?
+        .dev_ino()
+        .context("fingerprint cred dir")?;
+
     let spec = RunSpec {
         template: "demo",
         command: &[],
@@ -478,7 +485,7 @@ fn plan_shares_attaches_an_empty_secret_dir_for_refresh() -> Result<()> {
         timeout_secs: 60,
         grants: &GRANTS,
         outcome_file: None,
-        secret_dir: Some(&cred),
+        secret_dir: Some((&cred, DirFingerprint { dev, ino })),
         control: test_control(),
     };
 

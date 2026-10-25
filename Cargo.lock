@@ -2166,6 +2166,7 @@ version = "0.1.1"
 dependencies = [
  "anyhow",
  "sandy-api",
+ "sandy-fsutil",
  "sandy-impls-local",
  "sandy-impls-vm",
  "sandy-lib",
