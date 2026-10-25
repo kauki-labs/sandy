@@ -168,11 +168,14 @@ SANDY_SOCK=/tmp/sandyd.sock sandy daemon attach <job-id>
 ```
 
 `--flake` submissions dispatch as a VM job instead (sandbox kind `Vm`, #332),
-which requires a registered host that declares VM capability — `sandyd`
-refuses the submission outright when no such host exists. The trusted-process
-executor set up above does not run `--flake` jobs; this `argv/v1` path
-exercises it specifically. Full walkthrough, the allowlist/bind-address
-constraints, and the `SANDY_AGENT_PATH` gotcha above:
+which needs both `SANDY_MESH_AGENT_LINK_LISTEN` configured and a registered
+host that declares VM capability — `sandyd` refuses the submission when
+either is missing. The same `sandy-host-executor` also registers `Vm` when
+its own VM probes succeed (e.g. KVM present), so whether it can run
+`--flake` jobs depends on that probe, not on which dispatch path you use;
+this `argv/v1` path exercises the trusted-process executor specifically.
+Full walkthrough, the allowlist/bind-address constraints, and the
+`SANDY_AGENT_PATH` gotcha above:
 [`docs/design/host-executor/spec.md`](docs/design/host-executor/spec.md#manual-cross-machine-smoke-test).
 
 ## Development
