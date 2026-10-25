@@ -10,9 +10,9 @@ use std::{
 
 use anyhow::Context;
 use sandy::{
-    AllowList, BackendError, Capability, CoreError, EgressOs, EgressRule, Grants, JOURNAL_SCHEMA_VERSION, JobRecord,
-    JobState, Journal, Logs, Outcome, Provenance, RESULT_SCHEMA_VERSION, ResultEnvelope, Scope, SecretRef,
-    SecretSource, Status, Target, to_nftables_forward,
+    AllowList, BackendError, Capability, CoreError, EgressEnforcement, EgressOs, EgressRule, Grants,
+    JOURNAL_SCHEMA_VERSION, JobRecord, JobState, Journal, Logs, Outcome, Provenance, RESULT_SCHEMA_VERSION,
+    ResultEnvelope, Scope, SecretRef, SecretSource, Status, Target, to_nftables_forward,
 };
 use sandy_cli::{
     plan::JobPlan,
@@ -140,6 +140,7 @@ fn terminal_record(job_id: &str, started: SystemTime) -> JobRecord {
             },
             logs: Logs { tail: String::new() },
             warnings: Vec::new(),
+            receipt: None,
         }),
     }
 }
@@ -1002,3 +1003,278 @@ fn credential_revoke_failure_surfaces_as_a_warning_not_a_fault() -> anyhow::Resu
 
 // `should_refresh` and its refresh sibling now live in `sandy::cred`, unit-tested
 // there (cred.rs) with the rest of the refresh-re-delivery logic (#49).
+
+// --- envelope receipts v1 (#361) ---------------------------------------------
+
+/// The receipt is populated for a direct (non-sandyd) run, and `who` is the
+/// local-uid fallback, `authenticated: false` — there is no submitter cap on
+/// this path.
+#[test]
+fn run_job_populates_the_receipt_for_a_direct_run() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    let backend = FakeBackend::new().with_outcome(ok_outcome(0));
+
+    let report = run_job(
+        &backend,
+        &journal,
+        &booting_plan(),
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        None,
+        &[],
+    )
+    .context("run_job (receipt, direct)")?;
+
+    let receipt = report
+        .envelope
+        .receipt
+        .clone()
+        .context("a run that reached the backend must carry a receipt")?;
+    assert!(
+        !receipt.host_observed.who.authenticated,
+        "a direct run has no submitter cap; who.authenticated must be false"
+    );
+    assert!(
+        !receipt.host_observed.who.identity.is_empty(),
+        "who.identity must name the local uid"
+    );
+    assert_eq!(receipt.host_observed.what.job_id, report.envelope.job_id);
+    assert_eq!(receipt.host_observed.what.template, "demo");
+    assert_eq!(
+        receipt.host_observed.location.backend, "qemu",
+        "FakeBackend defaults to SandboxKind::Vm, paired with Linux"
+    );
+    assert!(
+        receipt.host_observed.credential.is_none(),
+        "a non-credentialed run must carry no credential receipt"
+    );
+    assert_eq!(receipt.guest_reported.exit_code, Some(0));
+    assert!(receipt.guest_reported.outputs.is_empty(), "no outputs were declared");
+
+    // The journaled copy must carry the same receipt (INV-6).
+    let persisted = journal
+        .read_record(&report.envelope.job_id)
+        .context("terminal record must be on disk")?
+        .result
+        .context("terminal record must carry the envelope")?;
+    assert_eq!(persisted.receipt, report.envelope.receipt);
+    Ok(())
+}
+
+/// `booting_plan`'s run has no guest tap, so `plan_egress_scoped` yields
+/// `NoBoundary` (macOS-style honesty even on the Linux egress_os used in these
+/// tests) — the receipt's egress half must report `unenforced` with a reason
+/// and no applied allow-list.
+#[test]
+fn receipt_reports_unenforced_egress_with_a_reason_and_no_allow_list() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    let backend = FakeBackend::new().with_outcome(ok_outcome(0));
+
+    let report = run_job(
+        &backend,
+        &journal,
+        &booting_plan(),
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        None,
+        &[],
+    )
+    .context("run_job (receipt, unenforced egress)")?;
+
+    let egress = report.envelope.receipt.context("receipt")?.host_observed.egress;
+    assert_eq!(egress.status, EgressEnforcement::Unenforced);
+    assert!(egress.reason.is_some(), "an unenforced boundary must name why");
+    assert!(
+        egress.allow_list.is_none(),
+        "nothing was applied; the allow-list field must not claim otherwise"
+    );
+    assert!(egress.attempts.is_empty(), "attempts is reserved and empty until #375");
+    Ok(())
+}
+
+/// A Linux run with a bound tap enforces the guest-scoped ruleset — the
+/// receipt's egress half must report `enforced` with the allow-list that was
+/// actually applied, and no reason (there is nothing to explain).
+#[test]
+fn receipt_reports_enforced_egress_with_the_applied_allow_list() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    let backend = FakeBackend::new().with_outcome(ok_outcome(0));
+    let plan = allowing_plan();
+
+    let report = run_job(
+        &backend,
+        &journal,
+        &plan,
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        Some("sandytap0"),
+        &[],
+    )
+    .context("run_job (receipt, enforced egress)")?;
+
+    let egress = report.envelope.receipt.context("receipt")?.host_observed.egress;
+    assert_eq!(egress.status, EgressEnforcement::Enforced);
+    assert!(egress.reason.is_none(), "an enforced boundary needs no explanation");
+    assert_eq!(
+        egress.allow_list.as_ref(),
+        Some(&plan.allow),
+        "the receipt must carry the SAME allow-list that was actually applied"
+    );
+    Ok(())
+}
+
+/// An egress apply failure (fail-closed, band 3) still must not be reported as
+/// "enforced": the receipt's egress half names it `unenforced`, with a reason.
+#[test]
+fn receipt_reports_a_failed_egress_apply_as_unenforced() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    let backend = FakeBackend::new().with_outcome(ok_outcome(0));
+
+    let report = run_job(
+        &backend,
+        &journal,
+        &allowing_plan(),
+        &FailingApplier,
+        EgressOs::Linux,
+        Some("sandytap0"),
+        &[],
+    )
+    .context("run_job (receipt, egress apply failed)")?;
+
+    let egress = report.envelope.receipt.context("receipt")?.host_observed.egress;
+    assert_eq!(egress.status, EgressEnforcement::Unenforced);
+    assert!(
+        egress.reason.as_deref().is_some_and(|r| r.contains("egress boundary")),
+        "the reason must name the apply failure: {:?}",
+        egress.reason
+    );
+    assert!(egress.allow_list.is_none());
+    Ok(())
+}
+
+/// The receipt is populated for a credentialed run too, with the credential
+/// lease's lifecycle (mint/revoke) filled in — never the token itself (INV-1).
+#[test]
+fn credentialed_run_populates_the_receipts_credential_lease() -> anyhow::Result<()> {
+    let (tmp, journal) = fresh_journal()?;
+    let provider = FakeProvider::returning("ghs_receipt_cred_marker");
+    let backend = FakeBackend::new().with_outcome(ok_outcome(0));
+    let cred_dir = tmp.path().join("cred");
+    std::fs::create_dir_all(&cred_dir).context("create cred dir")?;
+    std::fs::set_permissions(&cred_dir, std::fs::Permissions::from_mode(0o700)).context("cred dir 0700")?;
+
+    let report = run_job_with_credential(
+        &backend,
+        &journal,
+        booting_plan(),
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        None,
+        &provider,
+        &token_scope(),
+        "GH_TOKEN",
+        &cred_dir,
+        fingerprint(&cred_dir)?,
+        1_800,
+    )
+    .context("run_job_with_credential (receipt)")?;
+
+    let receipt = report
+        .envelope
+        .receipt
+        .clone()
+        .context("a credentialed run must carry a receipt")?;
+    let credential = receipt
+        .host_observed
+        .credential
+        .context("a credentialed run's receipt must carry a credential lease")?;
+    assert_eq!(credential.provider, "github");
+    assert_eq!(credential.scope, token_scope());
+    assert!(credential.revoke_succeeded, "the fake provider's revoke must succeed");
+    assert!(
+        credential.revoked_at >= credential.minted_at,
+        "revoke must be observed no earlier than mint"
+    );
+    assert!(
+        !receipt.host_observed.who.authenticated,
+        "no submitter cap on this path either"
+    );
+
+    // The journaled copy must carry the same credential receipt (INV-6).
+    let persisted = journal
+        .read_record(&report.envelope.job_id)
+        .context("terminal record must be on disk")?
+        .result
+        .context("terminal record must carry the envelope")?;
+    assert_eq!(persisted.receipt, report.envelope.receipt);
+    Ok(())
+}
+
+/// Adversarial (INV-1): no token or secret bytes appear anywhere in the
+/// serialized envelope — not in `logs.tail` (M-6, already covered), and not in
+/// any receipt field either. Driven as a real mutation test: the assertion is
+/// first proven capable of failing by temporarily smuggling the token into a
+/// receipt field, then the real (non-smuggled) code is asserted clean.
+#[test]
+fn no_token_or_secret_bytes_anywhere_in_the_serialized_envelope() -> anyhow::Result<()> {
+    let (tmp, journal) = fresh_journal()?;
+    let token = "ghs_marker_never_in_receipt_or_envelope";
+    let provider = FakeProvider::returning(token);
+    // The guest console also echoes the token (as `credentialed_run_redacts_...`
+    // already does), so this test's marker is genuinely "in flight" during the
+    // run, not merely absent because nothing ever touched it.
+    let backend = FakeBackend::new().with_outcome(Outcome {
+        booted: true,
+        guest_exit: Some(0),
+        transport_error: None,
+        timed_out: false,
+        console: format!("git credential fill -> {token}"),
+    });
+    let cred_dir = tmp.path().join("cred");
+    std::fs::create_dir_all(&cred_dir).context("create cred dir")?;
+    std::fs::set_permissions(&cred_dir, std::fs::Permissions::from_mode(0o700)).context("cred dir 0700")?;
+
+    let report = run_job_with_credential(
+        &backend,
+        &journal,
+        booting_plan(),
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        None,
+        &provider,
+        &token_scope(),
+        "GH_TOKEN",
+        &cred_dir,
+        fingerprint(&cred_dir)?,
+        1_800,
+    )
+    .context("run_job_with_credential (no-leak)")?;
+
+    // Prove this assertion can actually fail (mutation): a receipt carrying the
+    // token directly would be caught by the same check below.
+    let mut smuggled = report.envelope.clone();
+    if let Some(receipt) = &mut smuggled.receipt {
+        receipt.host_observed.what.template = token.to_string();
+    }
+    let smuggled_json = serde_json::to_string(&smuggled).context("serialize smuggled envelope")?;
+    assert!(
+        smuggled_json.contains(token),
+        "sanity: the mutation must actually be observable, or this test proves nothing"
+    );
+
+    let json = serde_json::to_string(&report.envelope).context("serialize envelope")?;
+    assert!(
+        !json.contains(token),
+        "the token must never appear anywhere in the serialized envelope: {json}"
+    );
+
+    let persisted = journal
+        .read_record(&report.envelope.job_id)
+        .context("terminal record must be on disk")?;
+    let persisted_json = serde_json::to_string(&persisted).context("serialize journaled record")?;
+    assert!(
+        !persisted_json.contains(token),
+        "the token must never appear in the journaled record either: {persisted_json}"
+    );
+    Ok(())
+}
