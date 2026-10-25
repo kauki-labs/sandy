@@ -319,7 +319,35 @@ pub fn write_trust_secret(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBu
 /// Open (creating `0700` if missing) the trust-roots dir, refusing one that is
 /// group/world-writable or another user owns, with the tamper warning.
 pub(crate) fn open_trust_dir(dir: &Path) -> Result<sandy_fsutil::OwnedDir, CredError> {
-    sandy_fsutil::OwnedDir::open_or_create(dir).map_err(|e| match e {
+    sandy_fsutil::OwnedDir::open_or_create(dir).map_err(trust_dir_unsafe_error)
+}
+
+/// Check an existing trust-roots dir is private, without creating or repairing
+/// it. `sandy doctor` uses this to report a wide dir up front (#198), with the
+/// same guidance [`open_trust_dir`] gives on write (#194): another user may
+/// already have modified the App key or trust configs in it.
+///
+/// A missing dir is nothing to report yet; returns `Ok(())`.
+///
+/// # Errors
+///
+/// [`CredError::Stage`] when the dir exists but is group/world-writable or
+/// owned by another user.
+pub fn check_trust_roots_dir(dir: &Path) -> Result<(), CredError> {
+    match std::fs::symlink_metadata(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(CredError::Stage(format!("stat trust-roots dir {}: {e}", dir.display()))),
+        Ok(_) => {}
+    }
+    sandy_fsutil::OwnedDir::open(dir)
+        .map(drop)
+        .map_err(trust_dir_unsafe_error)
+}
+
+/// Map an [`sandy_fsutil::FsError`] from opening the trust-roots dir to the
+/// tamper warning both [`open_trust_dir`] and [`check_trust_roots_dir`] give.
+fn trust_dir_unsafe_error(e: sandy_fsutil::FsError) -> CredError {
+    match e {
         sandy_fsutil::FsError::Unsafe { path, reason } => CredError::Stage(format!(
             "trust-roots dir {} is not private ({reason}); another user may have been able to modify your App key or \
              trust config. Verify the files in it are intact, then make sure the dir is yours (`chown`) and run \
@@ -330,7 +358,7 @@ pub(crate) fn open_trust_dir(dir: &Path) -> Result<sandy_fsutil::OwnedDir, CredE
         other @ (sandy_fsutil::FsError::Io { .. } | sandy_fsutil::FsError::NotDurable { .. }) => {
             CredError::Stage(other.to_string())
         }
-    })
+    }
 }
 
 /// Read a secret file, refusing one that is group- or world-readable (the read
@@ -1063,6 +1091,61 @@ mod tests {
         let mode = fs::metadata(&dir)?.permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "a created trust-roots dir must be 0700");
         Ok(())
+    }
+
+    /// #198: `sandy doctor` reports a group/world-writable trust-roots dir with
+    /// the same #194 tamper warning the write paths give, and never repairs it.
+    #[test]
+    fn check_trust_roots_dir_reports_a_wide_dir_without_repairing_it() -> anyhow::Result<()> {
+        let tmp = private_tempdir()?;
+        let dir = tmp.path().join("trust-roots");
+        fs::create_dir(&dir)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o775))?;
+
+        let err = check_trust_roots_dir(&dir).expect_err("a 0775 trust-roots dir must be reported");
+        let msg = err.to_string();
+        assert!(msg.contains("may have been able to modify"), "no tamper warning: {msg}");
+        assert!(msg.contains("chmod 700"), "no fix named: {msg}");
+
+        let mode = fs::metadata(&dir)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o775, "doctor must never repair the dir's mode");
+        Ok(())
+    }
+
+    /// A private `0700` trust-roots dir is reported as fine.
+    #[test]
+    fn check_trust_roots_dir_is_ok_for_a_private_dir() -> anyhow::Result<()> {
+        let tmp = private_tempdir()?;
+        let dir = tmp.path().join("trust-roots");
+        fs::create_dir(&dir)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+        assert!(check_trust_roots_dir(&dir).is_ok());
+        Ok(())
+    }
+
+    /// A trust-roots dir that doesn't exist yet is fine: no trust root has
+    /// been registered, so there is nothing to report.
+    #[test]
+    fn check_trust_roots_dir_is_ok_when_missing() -> anyhow::Result<()> {
+        let tmp = private_tempdir()?;
+        let dir = tmp.path().join("trust-roots");
+        assert!(check_trust_roots_dir(&dir).is_ok());
+        Ok(())
+    }
+
+    /// The ownership branch of the tamper warning, covered directly since a
+    /// test can't cheaply create a dir owned by another real uid: the same
+    /// message `check_trust_roots_dir` gives for mode also fires for an
+    /// owner mismatch, naming `another user`.
+    #[test]
+    fn trust_dir_unsafe_error_names_an_owner_mismatch() {
+        let err = trust_dir_unsafe_error(sandy_fsutil::FsError::Unsafe {
+            path: PathBuf::from("/trust-roots"),
+            reason: "owner uid 999, current uid 1000".to_string(),
+        });
+        let msg = err.to_string();
+        assert!(msg.contains("another user"), "no tamper warning: {msg}");
+        assert!(msg.contains("uid 999"), "doesn't name the foreign owner: {msg}");
     }
 
     /// A provider whose every mint/refresh yields a fresh token and handle
