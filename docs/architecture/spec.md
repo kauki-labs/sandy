@@ -380,8 +380,9 @@ flowchart TD
   full serialized envelope) stay in lock-step through the `format_*` helpers.
 - **Non-fatal faults surface as `warnings`.** A fault that must not fail an
   otherwise-successful run (e.g. a credential revoke failing at teardown, L-12)
-  is named in `warnings: Vec<String>` — schema bumped to `2`, old records still
-  deserialize (`#[serde(default)]`) — never just a log line.
+  is named in `warnings: Vec<String>`. The field was introduced in schema `2`;
+  the current envelope is schema `3` (below), and old records still deserialize
+  (`#[serde(default)]`) — never just a log line.
 - **Envelope receipts v1 (#361).** `ResultEnvelope.receipt: Option<Receipt>`
   (schema `3`, `None` on a pre-`3` record) is audit lineage split by who
   observed each field — an auditor never takes the guest's claim as a host

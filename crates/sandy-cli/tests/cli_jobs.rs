@@ -1174,6 +1174,7 @@ fn credentialed_run_populates_the_receipts_credential_lease() -> anyhow::Result<
         &token_scope(),
         "GH_TOKEN",
         &cred_dir,
+        fingerprint(&cred_dir)?,
         1_800,
     )
     .context("run_job_with_credential (receipt)")?;
@@ -1244,6 +1245,7 @@ fn no_token_or_secret_bytes_anywhere_in_the_serialized_envelope() -> anyhow::Res
         &token_scope(),
         "GH_TOKEN",
         &cred_dir,
+        fingerprint(&cred_dir)?,
         1_800,
     )
     .context("run_job_with_credential (no-leak)")?;

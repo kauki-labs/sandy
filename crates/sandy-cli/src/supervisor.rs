@@ -20,8 +20,9 @@ use sandy::{
     GuestReported, HostObserved, JOURNAL_SCHEMA_VERSION, JobRecord, JobState, Journal, Lease, Location, Logs,
     MAX_TTL_SECS, Outcome, OutputRef, OutputSizeRef, OutputStatus, ProcessExit, Profile, Provenance,
     RESULT_SCHEMA_VERSION, ResultEnvelope, SandboxKind, Scope, SecretSource, StagedImage, Status, Timing, VmBackend,
-    What, Who, classify_backend_error, classify_invalid_plan, classify_outcome, enforce, mint_lease_checked,
-    new_job_id, plan_egress_scoped, plan_eviction, reconcile_job, refresh_once_checked, validate_no_secret_leak,
+    What, Who, classify_backend_error, classify_invalid_plan, classify_outcome, enforce, mint_lease,
+    mint_lease_checked, new_job_id, plan_egress_scoped, plan_eviction, reconcile_job, refresh_once_checked,
+    validate_no_secret_leak,
 };
 use zeroize::Zeroizing;
 
@@ -918,6 +919,10 @@ fn safe_heartbeat_tick(tick: Duration, max_ttl_secs: u32, call_deadline: Duratio
 /// genuinely running job can otherwise go longer than that between refreshes.
 /// A `kill -9`'d process stops ticking, so an actually abandoned dir still
 /// ages out.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the loop threads the shared lease, both logs it feeds, and the caller's fingerprint check"
+)]
 fn refresh_loop<P: CredentialProvider + Sync + ?Sized>(
     provider: &P,
     lease: &Mutex<Lease>,
