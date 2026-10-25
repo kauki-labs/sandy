@@ -22,6 +22,16 @@ pub use staging::{
     STALE_STAGING_PREFIXES, ensure_sandy_staging_base, ensure_staging_base_in, sweep_stale_staging_dirs,
 };
 
+/// The current process's real uid, for a receipt's `who.identity` on a direct
+/// (non-sandyd) run (#361). The same `rustix::process::getuid` call
+/// `staging`/`secret` already use for ownership checks; exposed here so a
+/// caller outside this crate (the CLI supervisor) never needs its own `libc`
+/// or `rustix` dependency just to read it.
+#[must_use]
+pub fn current_uid() -> u32 {
+    rustix::process::getuid().as_raw()
+}
+
 /// A filesystem operation failed, or a path was refused as unsafe.
 #[derive(Debug, thiserror::Error)]
 pub enum FsError {

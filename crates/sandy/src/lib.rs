@@ -53,16 +53,16 @@ mod strategy;
 mod trust_root;
 
 pub use backend::{
-    BackendError, BoxState, Grants, Input, Outcome, Output, PlanError, RunControl, RunSpec, SandboxKind, SecretRef,
-    SecretSource, VmBackend, backend_accepts, validate_no_secret_leak,
+    BackendError, BoxState, DirFingerprint, Grants, Input, Outcome, Output, PlanError, RunControl, RunSpec,
+    SandboxKind, SecretRef, SecretSource, VmBackend, backend_accepts, validate_no_secret_leak,
 };
 pub use collect::{CollectError, OutputSpec, collect};
 pub use config::CollectionConfig;
 pub use containment::{Containment, ContainmentStatus, Mount, NoContainment, ResourceLimits, admits_untrusted};
 pub use cred::{
     Capability, CredError, CredentialHandle, CredentialProvider, GitlabAccount, Lease, MAX_TTL_SECS, Minted, Scope,
-    Target, TrustRoot, TrustRootIo, mint_lease, read_secret_0600, refresh_once, render_github_permissions,
-    should_refresh, write_trust_secret,
+    Target, TrustRoot, TrustRootIo, check_trust_roots_dir, mint_lease, mint_lease_checked, read_secret_0600,
+    refresh_once, refresh_once_checked, render_github_permissions, should_refresh, write_trust_secret,
 };
 pub use cred_github::{CALL_DEADLINE, GithubAdapter};
 pub use discovery::{Discovery, Placement, StaticRegistry, parse_builder_systems};
@@ -82,8 +82,10 @@ pub use provision::{
 };
 pub use reconcile::reconcile_job;
 pub use result::{
-    Classification, Logs, OutputRef, OutputStatus, ProcessExit, Provenance, RESULT_SCHEMA_VERSION, Receipt,
-    ResultEnvelope, Status, classify_backend_error, classify_invalid_plan, classify_outcome,
+    AuditReceipt, Classification, CredentialReceipt, EgressAttempt, EgressEnforcement, EgressReceipt, GuestReported,
+    HostObserved, Location, Logs, OutputRef, OutputSizeRef, OutputStatus, ProcessExit, Provenance,
+    RESULT_SCHEMA_VERSION, Receipt, ResultEnvelope, Status, Timing, What, Who, classify_backend_error,
+    classify_invalid_plan, classify_outcome,
 };
 /// fsync a directory so a preceding create/rename within it is durable across a
 /// crash (INV-4/INV-6).

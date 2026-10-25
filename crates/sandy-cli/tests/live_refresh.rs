@@ -72,6 +72,16 @@ impl CredentialProvider for RotatingProvider {
     }
 }
 
+/// The `(dev, ino)` fingerprint of an already-validated dir, as the production
+/// `run_credentialed` captures it from `private_staging_dir` before calling
+/// `run_job_with_credential` (#323).
+fn fingerprint(dir: &std::path::Path) -> anyhow::Result<sandy::DirFingerprint> {
+    let (dev, ino) = sandy_fsutil::OwnedDir::open(dir)
+        .context("open dir to fingerprint")?
+        .dev_ino()?;
+    Ok(sandy::DirFingerprint { dev, ino })
+}
+
 #[cfg(target_os = "macos")]
 fn host_backend() -> sandy_backend::VfkitBackend {
     let vfkit_bin = std::env::var("SANDY_VFKIT_BIN").unwrap_or_else(|_| "vfkit".to_string());
@@ -159,6 +169,7 @@ fn a_refreshed_token_reaches_the_running_guest() -> anyhow::Result<()> {
         &Scope::default(),
         "GITHUB_TOKEN",
         cred_dir.path(),
+        fingerprint(cred_dir.path())?,
         MAX_TTL_SECS,
     )
     .context("run_job_with_credential")?;

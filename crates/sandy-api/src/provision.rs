@@ -33,7 +33,9 @@ pub trait HostNixProvisioner {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProvisionOutcome {
     /// `HostNix` ran via Phase A's backend; carries the result envelope unchanged.
-    Provisioned(ResultEnvelope),
+    /// Boxed: the receipt (#361) made `ResultEnvelope` large enough to trip
+    /// clippy's `large_enum_variant` against `Refused`'s plain `String`.
+    Provisioned(Box<ResultEnvelope>),
     /// The strategy could not run at stage B; `reason` names the blocker — an
     /// axis propagated from `ProvisioningStrategy::Refuse`, or a "requires
     /// stage C/D" pointer (B-REQ-7).

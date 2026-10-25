@@ -184,6 +184,14 @@ flowchart LR
   already exists, opens it with `O_NOFOLLOW` and rejects it unless it is owned by
   the current uid with no group/world write bit. A bad base fails closed, never
   gets chmod'd/chowned back into shape.
+- **A caller's `secret_dir` is re-checked by fingerprint, not trusted by path
+  (CWE-367, #323).** `RunSpec::secret_dir` carries `(path, DirFingerprint)`, the
+  `(dev, ino)` the caller validated before building the spec; `plan_shares`
+  reopens it with `OwnedDir::open_matching`, refusing a same-uid, same-mode
+  directory swapped in at that path since. See decision 13 in
+  `docs/decisions/guest-shares.md`. This protects the staging reopen only: the
+  later transport resolves `ShareSpec.host_dir` by path, so a path replacement
+  after `plan_shares` returns remains a transport-level limitation.
 
 **KPI.**
 
@@ -196,7 +204,10 @@ flowchart LR
   `live_boot.rs::secret_share_mounts_read_only_virtiofs` (virtiofs fstype, guest
   write denied).
 - Unit: `sandy-backend/src/staging.rs`, a world-writable or symlinked base is
-  rejected, an owner/mode mismatch is rejected, a clean self-owned base validates.
+  rejected, an owner/mode mismatch is rejected, a clean self-owned base validates;
+  `sandy/src/shares.rs::a_secret_dir_swapped_after_validation_is_never_staged_into`
+  (adversarial, #323); `sandy-fsutil/src/secret.rs`'s
+  `open_matching_refuses_a_same_uid_mode_substitute_swapped_in_at_the_path`.
 
 ---
 
@@ -278,11 +289,22 @@ sequenceDiagram
   a configured tick against `MAX_TTL_SECS - CALL_DEADLINE`, not `MAX_TTL_SECS`
   alone, so an accepted tick always leaves room for one stalled call. See
   decision 6 for the residual gap this doesn't close.
+- **`cred_dir` is bound by fingerprint through mint and every refresh (CWE-367,
+  #323).** `run_credentialed` captures `cred_dir`'s `(dev, ino)` from the
+  `OwnedDir` `private_staging_dir` returns before reducing it to a path.
+  `mint_lease_checked`/`refresh_once_checked` reopen `cred_dir` with
+  `OwnedDir::open_matching` against that fingerprint instead of `mint_lease`'s/
+  `refresh_once`'s plain owner/mode reopen, so a same-uid, same-mode directory
+  swapped in at `cred_dir`'s path between validation and the mint, or between
+  two refreshes, is refused rather than silently receiving the token. See
+  decision 13 in `docs/decisions/guest-shares.md`.
 
 **KPI.**
 
 - Integration: `cred.rs` unit tests (`mint_lease` clamps TTL, stages 0600, revoke
-  bracket, `should_refresh`); the supervisor's mint-fails-closed test;
+  bracket, `should_refresh`);
+  `mint_lease_checked_refuses_a_dir_swapped_in_after_validation` (adversarial,
+  #323); the supervisor's mint-fails-closed test;
   `sandy-fsutil`'s `sweep_stale_staging_dirs` tests (sweeps a stale dir, keeps a
   fresh one, ignores an unrelated prefix, continues past an injected removal
   failure deterministically via `sweep_stale_staging_dirs_with`, supplemented
@@ -319,6 +341,13 @@ never the host's.
   lock the host off the network; if the boundary can't be applied, the run fails
   closed (band 3) rather than booting unprotected. It is always reverted, on the ok
   and the error path, so a boot failure never leaves rules up.
+- **Host-destined traffic is covered too (#376).** Traffic from the guest to the
+  host itself doesn't cross `forward`; it lands in `input`. `to_nftables_forward`
+  also emits an `input`-hook chain scoped to the guest's `iface`: DHCP is allowed,
+  everything else from the guest is dropped. An empty allow-list blocks it the
+  same as forwarded egress — there is no way to allow-list a host address here
+  (see `docs/decisions/egress.md`). IPv4 only, TCP only on the data-plane side;
+  no guest DNS is resolved or trusted.
 - **macOS is a no-op.** `vfkit_args` (`impls/vm/src/vfkit.rs`) emits no
   `virtio-net` device, so a macOS guest has no NIC at all; `plan_egress_scoped`
   yields `NoBoundary` and the run proceeds without enforcement (documented, not
@@ -331,6 +360,17 @@ the guest has no network device, so --allow entries have no effect (see
 #360)`. An empty allow-list never warns. The decision keys on structure
   (`EgressOs::MacOs` or no tap), never on the `Unenforced` reason string. No
   schema bump: `warnings` already exists at schema 2 (section 6).
+- **Planned: a NIC-less guest with a vsock host proxy (#360).** The guest gets
+  no NIC. `sandy-agent egress-relay` serves `127.0.0.1:3128` in the guest and
+  sets `HTTP(S)_PROXY` for the job. Each CONNECT crosses vsock to a per-run host
+  proxy that the backend owns beside `virtiofsd`. The proxy matches the target
+  name or IP and port against the allow-list before any resolution, resolves
+  names host-side, refuses loopback and host-local addresses, and refuses
+  private addresses the allow-list does not name. A proxy that fails to start
+  or dies mid-run is band 3. It replaces both decisions above once qemu and
+  vfkit pass the live parity gate. Full record:
+  [`../decisions/egress-proxy.md`](../decisions/egress-proxy.md). Planned live
+  KPIs: [`kpi.md#planned-egress-proxy`](kpi.md#planned-egress-proxy).
 
 **KPI.**
 
@@ -341,7 +381,10 @@ the guest has no network device, so --allow entries have no effect (see
   `run_on_linux_with_no_tap_and_a_nonempty_allow_list_warns` /
   `run_on_linux_with_no_tap_and_an_empty_allow_list_carries_no_warning` /
   apply-failure-fails-closed (over `FakeApplier`).
-- End-to-end: `live_egress.rs` (Linux + root + `nft`), real nftables around a boot.
+- End-to-end: `live_egress.rs` (Linux + root + `nft`), real nftables around a boot,
+  including the host-destined case (an empty allow-list plus a host-local
+  resolver: the guest can't resolve names through it and can't connect to the
+  tap's host address).
 
 ---
 
@@ -371,28 +414,72 @@ flowchart TD
   plan is band 2 with no journal record and no boot (the silent-run guard).
 - **Outputs populated.** After a successful run the supervisor lists each declared
   output's collected files as `OutputRef`s (`<name>/<rel>` named, `<rel>`
-  catch-all), independent of the host dest. Receipts/provenance remain placeholders.
+  catch-all), independent of the host dest. Provenance (`Provenance.template_store_path`)
+  remains a placeholder.
 - **Two renderings.** `-o plain` (default, human, lists outputs) and `-o json` (the
   full serialized envelope) stay in lock-step through the `format_*` helpers.
 - **Non-fatal faults surface as `warnings`.** A fault that must not fail an
   otherwise-successful run (e.g. a credential revoke failing at teardown, L-12)
-  is named in `warnings: Vec<String>` — schema bumped to `2`, old records still
-  deserialize (`#[serde(default)]`) — never just a log line.
+  is named in `warnings: Vec<String>`. The field was introduced in schema `2`;
+  the current envelope is schema `3` (below), and old records still deserialize
+  (`#[serde(default)]`) — never just a log line.
+- **Envelope receipts v1 (#361).** `ResultEnvelope.receipt: Option<AuditReceipt>`
+  (schema `3`, `None` on a pre-`3` record) is audit lineage split by who
+  observed each field — an auditor never takes the guest's claim as a host
+  fact, following from the attacker model (`#357`, [above](#attacker-model)).
+  Distinct from the existing `ResultEnvelope.receipts: Vec<Receipt>` (side-effect
+  receipts, e.g. a GitHub PR); the names are intentionally close, the types are not.
+  `None` on an invalid-plan run (no `Running` record was ever written) and on
+  `kill`'s synthetic cancellation (no backend run to observe).
+  - `host_observed` (the guest cannot influence these): `who` (the submitter
+    cap's verified `scope.peer` with `authenticated: true`, or the local uid
+    with `authenticated: false` — today always the local uid: no run path yet
+    derives a verified submitter cap, since sandyd's dispatch core does not
+    persist a receipt at all yet, tracked in #413); `what`
+    (job id, template ref, and `Option`s for a resolved store path and a
+    manifest digest — both `None` today, honestly, rather than an empty-string
+    placeholder: no run path threads a resolved store path or a manifest
+    object this far yet); `where` (the backend kind — `"qemu"`/`"vfkit"`
+    derived from `SandboxKind` + the run's `EgressOs`, `"process"` for the
+    process backend — plus `Option`s for a dispatching executor's host id/mesh
+    IP, `None` until sandyd dispatch-core exists); `credential` (provider,
+    `Scope`, mint/refresh/revoke timestamps, and whether revoke succeeded —
+    never the token, `None` for a non-credentialed run); `egress` (`enforced`/
+    `unenforced` plus a reason when unenforced, read from the SAME
+    `EgressOutcome` that already drives the enforce/revert bracket above — not
+    a second copy of the logic, and shared with #358's warning; the allow-list
+    actually applied, `None` when nothing was; `attempts`, reserved and empty
+    until #375); `timing` (boot start, an `Option` job-start that is `None`
+    today since no backend reports that moment, and teardown).
+  - `guest_reported` (a hostile guest can shape these): the exit code
+    (mirroring `ResultEnvelope.exit_code`) and collected output names/sizes.
+  - Out of v1, tracked: content digests (#373), signing (#374), filling
+    `egress.attempts` from the #360 proxy (#375).
 
 **KPI.**
 
 - Integration: `result.rs` `classify_outcome` tests (all bands incl. timeout +
-  required-missing) and the schema-bump regression
-  (`an_old_schema_v1_record_with_no_warnings_key_deserializes_to_empty`);
+  required-missing) and the schema-bump regressions
+  (`an_old_schema_v1_record_with_no_warnings_key_deserializes_to_empty`,
+  `an_old_schema_v2_record_with_no_receipt_key_deserializes_to_none`) and
+  `envelope_wire_keys_are_snake_case` (asserts the receipt's nested `where`
+  wire key, never `location`);
   `cli_jobs` band tests (`run_positive`, `run_guest_failure`, `run_timeout`,
   `run_infra_fault`, `run_invalid_plan`) and
   `run_lists_collected_outputs_in_the_envelope`;
   `credentialed_run_redacts_the_token_from_the_console` and
   `credential_revoke_failure_surfaces_as_a_warning_not_a_fault` (M-6/L-12);
+  `run_job_populates_the_receipt_for_a_direct_run`,
+  `receipt_reports_unenforced_egress_with_a_reason_and_no_allow_list`,
+  `receipt_reports_enforced_egress_with_the_applied_allow_list`,
+  `receipt_reports_a_failed_egress_apply_as_unenforced`,
+  `credentialed_run_populates_the_receipts_credential_lease`, and
+  `no_token_or_secret_bytes_anywhere_in_the_serialized_envelope` (#361);
   `output.rs` format tests (default plain, both formats carry outputs and
   `both_formats_carry_warnings`).
 - End-to-end: every live test asserts the envelope `status`/`exit_code`; `live_e2e.rs`
-  asserts `envelope.outputs` and no secret leak in `logs.tail`.
+  asserts `envelope.outputs` and no secret leak in `logs.tail`. The receipt is not
+  yet asserted on a real boot (`kpi.md`'s "Not yet a KPI").
 
 ---
 
