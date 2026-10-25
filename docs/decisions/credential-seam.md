@@ -2,7 +2,7 @@
 title: "Decisions: credential seam (CredentialProvider)"
 status: accepted
 project: sandy
-updated: 2026-10-20
+updated: 2026-10-25
 ---
 
 # Decisions: credential seam (`CredentialProvider`)
@@ -249,3 +249,63 @@ the dir by then, so a sweep there is harmless, and verify's own best-effort
 of reading mtime) was considered and rejected: it adds a second piece of
 state that could drift from the dir's actual contents, where mtime is already
 authoritative and free.
+
+## 7. The terminal journal write waits for final redaction, instead of amending
+
+**Status:** accepted. **Upholds:** INV-6, M-6.
+
+**Context.** `run_job`'s terminal journal write (step 6, INV-6) happens right
+after its own console redaction pass, which only ever sees the credential's
+initial token — `run_job_with_credential` only learns about a mid-run refresh
+after its refresh thread joins. The original fix for that (`amend_terminal_envelope`)
+re-redacted the returned envelope and then overwrote the already-journaled
+record in a second write. A crash between the first write and the amend left a
+permanent terminal record where a refreshed token that leaked into the console
+was never redacted (#322, found by CodeRabbit re-reviewing #320).
+
+**Decision.** `run_job_with_credential` runs the shared core
+(`run_job_core`) without writing a terminal record. After its refresh thread
+joins, it re-redacts the console against every token the run ever had live
+(`redact_with_refreshes`), folds in a revoke-failure warning if any, and only
+then writes the terminal record — once. The non-credentialed `run_job` path is
+unchanged: it still writes its terminal record immediately, since it never has
+a refresh to wait for.
+
+Both paths share that one write through `write_terminal_record`, which takes
+the job flock and re-reads before writing (`JournalWriter::persist_if_still_running`):
+a concurrent `kill`/`reconcile_job` can already have flipped the record to
+`Cancelled`/`Crashed` under the same flock while this run was still boxing up
+its own result (review finding on #415 — neither path held the job flock
+around its own run, so a `kill` racing the final write could be silently
+overwritten). The terminal write is skipped, not retried, when the record is
+no longer `Running`: that other writer's result stands.
+
+A failed terminal write (I/O error, not the race above) is folded into the
+returned envelope's `warnings` (L-12) on both paths, not only logged: without
+it, the caller sees an ordinary successful exit with no sign INV-6 wasn't met,
+and a later `status`/`wait` then disagrees with the result this call already
+returned. Teardown has already run by this point, so there is nothing left to
+undo by failing the call outright instead.
+
+**Consequences.** The credentialed path's terminal record and its token
+redaction are one atomic write: a crash can observe either no terminal record
+(before that write) or a fully-redacted one (after it), never a
+partially-redacted one in between. `amend_terminal_envelope` is removed, along
+with the two-write (write, then later lock + read + overwrite) sequence it
+used. The shared `write_terminal_record` now does read the journal once before
+its single write, under the job flock, but only to guard against a _different_
+concurrent writer — never to merge into or amend a record of its own. Proven
+by `credentialed_run_writes_the_terminal_record_once_after_refresh_redaction`
+in `supervisor.rs`, which uses `CountingJournal` (a `JournalWriter` test
+double) to record the write count and checks the persisted terminal record,
+and by the existing `credentialed_run_redacts_the_token_from_the_console` /
+`credential_revoke_failure_surfaces_as_a_warning_not_a_fault` integration
+tests in `cli_jobs.rs`, which still pass unchanged.
+
+**Set aside.** Keeping the amend and instead making it atomic under the job
+flock (lock, read, merge, write) was considered and rejected: it still leaves
+the same crash window between the first write and the lock being taken, just
+narrower; removing the first write entirely closes the window rather than
+shrinking it. This is a different flock use than the one added above: that
+earlier rejection was about _this run's own_ two writes racing each other, not
+about guarding the one remaining write against _another_ writer's result.

@@ -3,9 +3,12 @@
 //! `run_job` is the foreground path: it validates the plan, writes a `Running`
 //! record *before* the backend runs (INV-6), classifies the physical outcome into
 //! the LOCKED [`ResultEnvelope`] plus a process band, and writes the terminal
-//! record carrying the envelope. `ls` / `status` / `wait` / `kill` / `gc` are the
-//! management ops; all liveness goes through [`reconcile_job`], never a direct
-//! registry read (INV-3).
+//! record carrying the envelope. [`run_job_with_credential`] shares that core
+//! ([`run_job_core`]) but defers the terminal write until its refresh thread has
+//! joined and the console's final redaction is known (#322), so the write and the
+//! redaction are atomic rather than a write followed by an amend. `ls` / `status`
+//! / `wait` / `kill` / `gc` are the management ops; all liveness goes through
+//! [`reconcile_job`], never a direct registry read (INV-3).
 
 use std::{
     collections::HashSet,
@@ -258,6 +261,90 @@ fn terminal_state(status: Status) -> JobState {
     }
 }
 
+/// The write side of the journal that [`run_job_core`]/[`run_job_with_credential`]
+/// need. A trait, not the concrete [`Journal`], only so a test can wrap a real
+/// journal and observe write order/count without touching the filesystem; every
+/// production caller passes a real `&Journal`, which implements this by
+/// delegating to [`Journal::write_record`].
+pub trait JournalWriter {
+    /// Persist `record` unconditionally.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError`] on journal I/O failure.
+    fn persist(&self, record: &JobRecord) -> Result<(), CoreError>;
+
+    /// Persist `record` under the job flock, but only if the current record is
+    /// not already a REAL terminal result: a concurrent `kill` takes the same
+    /// flock, re-reads, and writes `Cancelled` carrying its own envelope
+    /// (INV-3/INV-6); that result must never be overwritten. `reconcile_job`'s
+    /// `Crashed`, by contrast, carries no envelope and rests on a liveness
+    /// inference ("the box is gone, so the owner must be") that this run's own
+    /// live write disproves — the live owner's real result overwrites it rather
+    /// than losing to a stale guess (`run_job_core` never updates `box_id` on
+    /// the `Running` record, so `reconcile_job`'s box-liveness check never even
+    /// fires for it; flock-freeness during the whole run is its only signal).
+    /// Returns whether `record` was actually written: `false` means a
+    /// competing REAL result already stood, and the caller must not report its
+    /// own `record` as this job's result (it would drift from the journal).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError`] on journal I/O failure.
+    fn persist_if_still_running(&self, record: &JobRecord) -> Result<bool, CoreError>;
+}
+
+impl JournalWriter for Journal {
+    fn persist(&self, record: &JobRecord) -> Result<(), CoreError> {
+        self.write_record(record)
+    }
+
+    fn persist_if_still_running(&self, record: &JobRecord) -> Result<bool, CoreError> {
+        let _lock = self.lock_job(&record.job_id)?;
+        let current = self.read_record(&record.job_id)?;
+        if current.state != JobState::Running && current.result.is_some() {
+            // A concurrent kill already landed a REAL terminal record (one
+            // carrying an envelope, e.g. Cancelled) under this same flock; that
+            // result stands (INV-3/INV-6). An envelope-less Crashed from
+            // reconcile_job's liveness guess does not count: this write IS the
+            // live owner, so the guess was wrong and loses.
+            return Ok(false);
+        }
+        self.write_record(record)?;
+        Ok(true)
+    }
+}
+
+/// [`run_job_core`]'s result: the report, plus the job's start time when a
+/// terminal record is still owed. `started` is `None` only for the invalid-plan
+/// early return (band 2): no `Running` record was ever written, so persisting a
+/// terminal one would break the silent-run guard.
+struct JobOutcome {
+    report: RunReport,
+    started: Option<SystemTime>,
+}
+
+/// Build and persist the terminal [`JobRecord`] carrying `report`'s envelope
+/// (INV-6). `started` is the time the job's `Running` record was written.
+/// Returns whether the write actually landed (see
+/// [`JournalWriter::persist_if_still_running`]).
+fn write_terminal_record<J: JournalWriter + ?Sized>(
+    journal: &J,
+    started: SystemTime,
+    report: &RunReport,
+) -> Result<bool, CoreError> {
+    let terminal = JobRecord {
+        schema_version: JOURNAL_SCHEMA_VERSION,
+        job_id: report.envelope.job_id.clone(),
+        box_id: report.envelope.box_id.clone(),
+        state: terminal_state(report.envelope.status),
+        writer_pid: std::process::id(),
+        started,
+        result: Some(report.envelope.clone()),
+    };
+    journal.persist_if_still_running(&terminal)
+}
+
 /// The result of a foreground `run`: the LOCKED envelope plus sandy's own process
 /// exit band (INV-11). `main` prints the envelope as JSON and exits with
 /// `process_exit.code()`.
@@ -304,6 +391,53 @@ pub fn run_job<B: VmBackend + ?Sized, E: EgressApplier + ?Sized>(
     tap: Option<&str>,
     redact: &[String],
 ) -> Result<RunReport, CoreError> {
+    let mut outcome = run_job_core(backend, journal, plan, egress, egress_os, tap, redact)?;
+    if let Some(started) = outcome.started {
+        match write_terminal_record(journal, started, &outcome.report) {
+            Ok(true) => {}
+            Ok(false) => {
+                // A concurrent kill/reconcile already landed this job's terminal
+                // record; reporting our own result here would drift from the
+                // journal (the review finding behind this match). Fail rather
+                // than hand back a result nobody else will see.
+                return Err(CoreError::State(format!(
+                    "job {} was already finalized by a concurrent kill/reconcile; refusing to report a result that \
+                     would drift from the journal",
+                    outcome.report.envelope.job_id
+                )));
+            }
+            Err(e) => {
+                // L-12: fold into the envelope too, not just the log — see
+                // run_job_with_credential_timed's matching comment.
+                tracing::warn!(job_id = %outcome.report.envelope.job_id, error = %e, "failed to write the terminal journal record");
+                outcome
+                    .report
+                    .envelope
+                    .warnings
+                    .push(format!("terminal journal record could not be written: {e}"));
+            }
+        }
+    }
+    Ok(outcome.report)
+}
+
+/// The shared core of [`run_job`] and [`run_job_with_credential`]: validates the
+/// plan, writes the `Running` record, runs the backend, classifies the outcome,
+/// and builds the envelope — everything through step 5 of [`run_job`]'s
+/// documented order, but WITHOUT writing the terminal record (step 6). [`run_job`]
+/// persists it immediately after this returns; [`run_job_with_credential`] defers
+/// it until the refresh thread has joined and `redact_with_refreshes` is final, so
+/// the credentialed path's terminal write and its token redaction are one atomic
+/// write, not a write followed by an amend (#322).
+fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWriter + ?Sized>(
+    backend: &B,
+    journal: &J,
+    plan: &JobPlan,
+    egress: &E,
+    egress_os: EgressOs,
+    tap: Option<&str>,
+    redact: &[String],
+) -> Result<JobOutcome, CoreError> {
     let spec = plan.as_run_spec();
 
     // 1. Validate the plan. An invalid plan is band 2 with NO journal record and NO backend run — the running record is
@@ -324,9 +458,12 @@ pub fn run_job<B: VmBackend + ?Sized, E: EgressApplier + ?Sized>(
             vec![],
             None,
         );
-        return Ok(RunReport {
-            envelope,
-            process_exit: classification.process_exit,
+        return Ok(JobOutcome {
+            report: RunReport {
+                envelope,
+                process_exit: classification.process_exit,
+            },
+            started: None,
         });
     }
 
@@ -342,7 +479,7 @@ pub fn run_job<B: VmBackend + ?Sized, E: EgressApplier + ?Sized>(
         started,
         result: None,
     };
-    journal.write_record(&running)?;
+    journal.persist(&running)?;
 
     // 3. Apply the egress boundary around the boot. On Linux with a tap this loads the guest-scoped forward ruleset
     //    (the safe model, #29); on macOS `plan_egress_scoped` yields `NoBoundary`, so `enforce` applies nothing and
@@ -411,8 +548,10 @@ pub fn run_job<B: VmBackend + ?Sized, E: EgressApplier + ?Sized>(
     // itself (#361's `timing.teardown_at`).
     let teardown_at = SystemTime::now();
 
-    // 6. Write the terminal record carrying the envelope (INV-6). Redact right before the envelope is built: this is
-    //    the last point before the journal write, and there's no seam after `run_job` returns (M-6).
+    // 6. Build the envelope carrying the redacted console (INV-6). Redact right before the envelope is built: for
+    //    `run_job` this is the last point before the journal write; `run_job_with_credential` re-redacts against any
+    //    mid-run refresh before persisting (M-6). The caller (`run_job` or `run_job_with_credential`) writes the
+    //    terminal record.
     let console = redact_console(console, redact);
     let receipt = Some(AuditReceipt {
         host_observed: build_host_observed(
@@ -439,20 +578,13 @@ pub fn run_job<B: VmBackend + ?Sized, E: EgressApplier + ?Sized>(
         outputs,
         receipt,
     );
-    let terminal = JobRecord {
-        schema_version: JOURNAL_SCHEMA_VERSION,
-        job_id,
-        box_id: None,
-        state: terminal_state(classification.status),
-        writer_pid: std::process::id(),
-        started,
-        result: Some(envelope.clone()),
-    };
-    journal.write_record(&terminal)?;
 
-    Ok(RunReport {
-        envelope,
-        process_exit: classification.process_exit,
+    Ok(JobOutcome {
+        report: RunReport {
+            envelope,
+            process_exit: classification.process_exit,
+        },
+        started: Some(started),
     })
 }
 
@@ -540,6 +672,14 @@ pub fn mint_run_token<P: CredentialProvider + ?Sized>(
 /// removes the staged file (INV-1); `cred_dir` itself is the caller's to
 /// clean up.
 ///
+/// Unlike [`run_job`], this runs the shared core ([`run_job_core`]) WITHOUT
+/// writing the terminal record: that write happens once, here, after the refresh
+/// thread has joined and `redact_with_refreshes` has produced the final console
+/// (#322) — never a first write against only the initial token followed by an
+/// amend. A revoke-failure warning is folded into the same envelope before that
+/// one write, so the journaled record and the returned [`RunReport`] never drift
+/// apart (L-12).
+///
 /// # Errors
 ///
 /// Returns [`CoreError::Cred`] when the mint fails, before the backend runs, so the
@@ -553,9 +693,10 @@ pub fn run_job_with_credential<
     B: VmBackend + ?Sized,
     E: EgressApplier + ?Sized,
     P: CredentialProvider + Sync + ?Sized,
+    J: JournalWriter + ?Sized,
 >(
     backend: &B,
-    journal: &Journal,
+    journal: &J,
     plan: JobPlan,
     egress: &E,
     egress_os: EgressOs,
@@ -590,6 +731,60 @@ pub fn run_job_with_credential<
         });
     }
 
+    let margin = refresh_interval("SANDY_REFRESH_MARGIN_SECS", DEFAULT_REFRESH_MARGIN_SECS);
+    let tick = safe_heartbeat_tick(
+        refresh_interval("SANDY_REFRESH_TICK_SECS", DEFAULT_REFRESH_TICK_SECS),
+        MAX_TTL_SECS,
+        CALL_DEADLINE,
+    );
+    run_job_with_credential_timed(
+        backend,
+        journal,
+        plan,
+        egress,
+        egress_os,
+        tap,
+        provider,
+        scope,
+        secret_name,
+        cred_dir,
+        cred_dir_fingerprint,
+        requested_ttl_secs,
+        margin,
+        tick,
+    )
+}
+
+/// [`run_job_with_credential`]'s body, with the refresh margin/tick taken as
+/// parameters instead of read from the environment: `std::env::set_var` is
+/// `unsafe` (edition 2024) and forbidden by this workspace's lints, so a test
+/// that needs a short tick to force a mid-run refresh calls this directly
+/// rather than mutating process environment state.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the bracket threads both the run and the credential inputs, plus the injectable timing"
+)]
+fn run_job_with_credential_timed<
+    B: VmBackend + ?Sized,
+    E: EgressApplier + ?Sized,
+    P: CredentialProvider + Sync + ?Sized,
+    J: JournalWriter + ?Sized,
+>(
+    backend: &B,
+    journal: &J,
+    plan: JobPlan,
+    egress: &E,
+    egress_os: EgressOs,
+    tap: Option<&str>,
+    provider: &P,
+    scope: &Scope,
+    secret_name: &str,
+    cred_dir: &Path,
+    cred_dir_fingerprint: DirFingerprint,
+    requested_ttl_secs: u32,
+    margin: Duration,
+    tick: Duration,
+) -> Result<RunReport, CoreError> {
     // Mint and stage the token before the guest boots, into the share dir itself so
     // the staged file IS the live guest file (refresh rewrites it). A mint failure is
     // a fail-closed infra fault: return before any backend run (INV-7).
@@ -642,12 +837,6 @@ pub fn run_job_with_credential<
     let mut plan = plan;
     plan.secret_dir = Some((cred_dir.to_path_buf(), cred_dir_fingerprint));
 
-    let margin = refresh_interval("SANDY_REFRESH_MARGIN_SECS", DEFAULT_REFRESH_MARGIN_SECS);
-    let tick = safe_heartbeat_tick(
-        refresh_interval("SANDY_REFRESH_TICK_SECS", DEFAULT_REFRESH_TICK_SECS),
-        MAX_TTL_SECS,
-        CALL_DEADLINE,
-    );
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
 
     // Teardown also runs as a Drop guard, not only as the explicit call below: it
@@ -683,7 +872,7 @@ pub fn run_job_with_credential<
     let shared_lease = &teardown.lease;
     let shared_redact_log = &redact_log;
     let shared_refresh_times_log = &refresh_times_log;
-    let mut report = std::thread::scope(|s| {
+    let mut outcome = std::thread::scope(|s| {
         s.spawn(move || {
             refresh_loop(
                 provider,
@@ -696,20 +885,17 @@ pub fn run_job_with_credential<
                 cred_dir_fingerprint,
             )
         });
-        let report = run_job(backend, journal, &plan, egress, egress_os, tap, redact);
+        let outcome = run_job_core(backend, journal, &plan, egress, egress_os, tap, redact);
         drop(stop_tx);
-        report
+        outcome
     });
 
     // Explicit teardown on the normal return path (the borrow of `teardown.lease`
     // above ended with `thread::scope`, so this is the first point it can be
-    // touched again): name the job in the revoke-failure log, then fold a
-    // failure into both the returned envelope and the already-journaled terminal
-    // record (L-12) — INV-6 says the record always carries the envelope, so the
-    // two must not drift apart. On a panic, `Drop` runs the same teardown
-    // instead, with no envelope to fold into and no job id yet known.
-    if let Ok(run_report) = &report {
-        teardown.job_id = run_report.envelope.job_id.clone();
+    // touched again): name the job in the revoke-failure log. On a panic, `Drop`
+    // runs the same teardown instead, with no job id yet known.
+    if let Ok(job_outcome) = &outcome {
+        teardown.job_id = job_outcome.report.envelope.job_id.clone();
     }
     let warning = teardown.teardown();
     let refreshed_tokens = redact_log.into_inner().unwrap_or_else(PoisonError::into_inner);
@@ -730,56 +916,66 @@ pub fn run_job_with_credential<
         revoked_at: teardown.revoked_at.unwrap_or(minted_at),
         revoke_succeeded: teardown.revoke_succeeded.unwrap_or(false),
     };
-    if let Ok(run_report) = &mut report {
-        let mut amended = false;
+    if let Ok(job_outcome) = &mut outcome {
+        let report = &mut job_outcome.report;
 
         // M-6 follow-up: re-redact against every token this run ever had live,
-        // not just the one `run_job` saw at its own redaction pass.
+        // not just the one `run_job_core` saw at its own redaction pass.
         if !refreshed_tokens.is_empty() {
-            run_report.envelope.logs.tail = redact_with_refreshes(
-                std::mem::take(&mut run_report.envelope.logs.tail),
+            report.envelope.logs.tail = redact_with_refreshes(
+                std::mem::take(&mut report.envelope.logs.tail),
                 &teardown.secret,
                 &refreshed_tokens,
             );
-            amended = true;
         }
         if let Some(warning) = warning {
-            run_report.envelope.warnings.push(warning);
-            amended = true;
+            report.envelope.warnings.push(warning);
         }
-        // `run_job` always sets `credential: None` (it knows nothing of the
-        // bracket wrapping it); fill it in here, the first point the
-        // credential's own lifecycle is known. `None` only when `run_job`
-        // itself never reached a Running record (an invalid plan) — nothing
-        // to amend onto in that case.
-        if let Some(receipt) = &mut run_report.envelope.receipt {
+        // `run_job_core` always sets `credential: None` (it knows nothing of
+        // the bracket wrapping it); fill it in here, before the single
+        // terminal write below, the first point the credential's own
+        // lifecycle is known. `None` only when the run itself never reached a
+        // Running record (an invalid plan) — nothing to fill in on that path.
+        if let Some(receipt) = &mut report.envelope.receipt {
             receipt.host_observed.credential = Some(credential_receipt);
-            amended = true;
         }
 
-        // The run already succeeded or failed on its own terms; an amend
-        // failure here (lock contention, a disk write error) must not
-        // overwrite that outcome with one about the journal instead. The
-        // caller still gets the corrected envelope above — only the
-        // journaled copy risks staying stale.
-        if amended && let Err(e) = amend_terminal_envelope(journal, &run_report.envelope.job_id, &run_report.envelope) {
-            tracing::warn!(job_id = %run_report.envelope.job_id, error = %e, "failed to amend the journaled terminal record");
+        // Persist the terminal record exactly once, now that redaction is final
+        // (#322): no separate first write to amend. `started` is `None` only for
+        // the invalid-plan early return, which never wrote a `Running` record
+        // either — the silent-run guard stays intact.
+        if let Some(started) = job_outcome.started {
+            match write_terminal_record(journal, started, report) {
+                Ok(true) => {}
+                Ok(false) => {
+                    // A concurrent kill/reconcile already landed this job's
+                    // terminal record; reporting our own result here would drift
+                    // from the journal. Fail rather than hand back a result
+                    // nobody else will see.
+                    let job_id = report.envelope.job_id.clone();
+                    return Err(CoreError::State(format!(
+                        "job {job_id} was already finalized by a concurrent kill/reconcile; refusing to report a \
+                         result that would drift from the journal"
+                    )));
+                }
+                Err(e) => {
+                    // L-12: fold into the returned envelope too, not just the log.
+                    // The caller otherwise sees an ordinary successful exit band
+                    // with no sign that the journal record (INV-6) is missing or
+                    // stale; a later `status`/`wait` then disagrees with the
+                    // result this call already returned. Teardown has already
+                    // run, so there is nothing left to undo by failing this call
+                    // outright.
+                    tracing::warn!(job_id = %report.envelope.job_id, error = %e, "failed to write the credentialed run's terminal journal record");
+                    report
+                        .envelope
+                        .warnings
+                        .push(format!("terminal journal record could not be written: {e}"));
+                }
+            }
         }
     }
-    report
-}
-
-/// Overwrite the terminal record's envelope already written by `run_job` with
-/// `envelope`, under the job flock, so the journal stays in lock-step with what
-/// `run_job_with_credential` returns (INV-6; L-12 and its M-6 follow-up:
-/// a teardown warning or a post-run console re-redaction, or both). Re-reads
-/// the record under the lock rather than touching a cached copy: a concurrent
-/// reconcile could have touched it since `run_job` wrote it.
-fn amend_terminal_envelope(journal: &Journal, job_id: &str, envelope: &ResultEnvelope) -> Result<(), CoreError> {
-    let _lock = journal.lock_job(job_id)?;
-    let mut record = journal.read_record(job_id)?;
-    record.result = Some(envelope.clone());
-    journal.write_record(&record)
+    outcome.map(|o| o.report)
 }
 
 /// Revokes the live credential and removes its staged `0600` file, exactly once
@@ -1724,6 +1920,415 @@ mod tests {
         assert!(
             !cred_dir.path().join("GITHUB_TOKEN").exists(),
             "the staged token must be removed even when the run panics"
+        );
+        Ok(())
+    }
+
+    // --- terminal write never clobbers a concurrent kill/reconcile (review on #415) --
+
+    /// `persist_if_still_running` must not overwrite a terminal record a
+    /// concurrent writer (e.g. `kill`) already landed under the job flock while
+    /// this run was still finishing up: the other writer's result stands.
+    /// Before this guard, `write_terminal_record` called plain `persist`, which
+    /// would have clobbered the `Cancelled` record below with `Succeeded`.
+    #[test]
+    fn persist_if_still_running_never_overwrites_an_already_terminal_record() -> anyhow::Result<()> {
+        let (_tmp, journal) = fresh_journal()?;
+        let job_id = "job-concurrent-kill".to_string();
+        let started = SystemTime::now();
+
+        journal.write_record(&sandy::JobRecord {
+            schema_version: sandy::JOURNAL_SCHEMA_VERSION,
+            job_id: job_id.clone(),
+            box_id: None,
+            state: sandy::JobState::Running,
+            writer_pid: std::process::id(),
+            started,
+            result: None,
+        })?;
+
+        // Simulate a concurrent `kill` landing first, under the job flock, with
+        // its own real envelope — exactly as `kill` writes it, never `None`.
+        let cancelled = sandy::JobRecord {
+            schema_version: sandy::JOURNAL_SCHEMA_VERSION,
+            job_id: job_id.clone(),
+            box_id: None,
+            state: sandy::JobState::Cancelled,
+            writer_pid: std::process::id() + 1,
+            started,
+            result: Some(sandy::ResultEnvelope {
+                result_schema_version: sandy::RESULT_SCHEMA_VERSION,
+                job_id: job_id.clone(),
+                box_id: None,
+                status: sandy::Status::Cancelled,
+                retryable: false,
+                message: "cancelled".to_string(),
+                exit_code: None,
+                outputs: vec![],
+                receipts: vec![],
+                provenance: sandy::Provenance {
+                    template_store_path: String::new(),
+                },
+                logs: sandy::Logs { tail: String::new() },
+                warnings: vec![],
+                receipt: None,
+            }),
+        };
+        journal.write_record(&cancelled)?;
+
+        // This run finishes up on its own thread, unaware of the kill, and tries
+        // to write its own (different) terminal state.
+        let late_succeeded = sandy::JobRecord {
+            schema_version: sandy::JOURNAL_SCHEMA_VERSION,
+            job_id: job_id.clone(),
+            box_id: Some("box-1".to_string()),
+            state: sandy::JobState::Succeeded,
+            writer_pid: std::process::id(),
+            started,
+            result: None,
+        };
+        let wrote = super::JournalWriter::persist_if_still_running(&journal, &late_succeeded)?;
+
+        assert!(
+            !wrote,
+            "the skipped write must report false so the caller knows not to report its own result"
+        );
+        let on_disk = journal.read_record(&job_id)?;
+        assert_eq!(
+            on_disk.state,
+            sandy::JobState::Cancelled,
+            "the concurrent kill's result must stand, never overwritten by a late terminal write"
+        );
+        Ok(())
+    }
+
+    /// `reconcile_job`'s `Crashed` carries no envelope (`result: None`) and rests
+    /// on a liveness guess ("the box is gone, so the owner must be"): it is not a
+    /// real result like `kill`'s `Cancelled`. When the live owner's own write
+    /// lands right after, that write must win — the owner being able to write at
+    /// all disproves the guess, and INV-6 requires a terminal record to carry an
+    /// envelope. Before this test's fix, `persist_if_still_running` treated any
+    /// non-`Running` state as final and would have skipped this write too,
+    /// permanently stranding the job behind a `Crashed`/`None` record even
+    /// though it actually succeeded.
+    #[test]
+    fn persist_if_still_running_overwrites_an_envelope_less_reconcile_crash() -> anyhow::Result<()> {
+        let (_tmp, journal) = fresh_journal()?;
+        let job_id = "job-spurious-reconcile".to_string();
+        let started = SystemTime::now();
+
+        journal.write_record(&sandy::JobRecord {
+            schema_version: sandy::JOURNAL_SCHEMA_VERSION,
+            job_id: job_id.clone(),
+            box_id: None,
+            state: sandy::JobState::Running,
+            writer_pid: std::process::id(),
+            started,
+            result: None,
+        })?;
+
+        // Simulate reconcile_job's guess: the box looked gone, so it flipped the
+        // record to Crashed with no envelope, under the same flock.
+        journal.write_record(&sandy::JobRecord {
+            schema_version: sandy::JOURNAL_SCHEMA_VERSION,
+            job_id: job_id.clone(),
+            box_id: None,
+            state: sandy::JobState::Crashed,
+            writer_pid: std::process::id() + 1,
+            started,
+            result: None,
+        })?;
+
+        // The actual owner was alive all along and now writes its real result.
+        let succeeded = sandy::JobRecord {
+            schema_version: sandy::JOURNAL_SCHEMA_VERSION,
+            job_id: job_id.clone(),
+            box_id: Some("box-1".to_string()),
+            state: sandy::JobState::Succeeded,
+            writer_pid: std::process::id(),
+            started,
+            result: None,
+        };
+        let wrote = super::JournalWriter::persist_if_still_running(&journal, &succeeded)?;
+
+        assert!(
+            wrote,
+            "the owner's real result must win over reconcile_job's envelope-less guess"
+        );
+        let on_disk = journal.read_record(&job_id)?;
+        assert_eq!(
+            on_disk.state,
+            sandy::JobState::Succeeded,
+            "the owner's own write must land, not stay stranded behind the spurious Crashed"
+        );
+        Ok(())
+    }
+
+    // --- terminal journal write ordering (#322) ----------------------------------
+
+    use std::sync::{Mutex, PoisonError};
+
+    /// A [`super::JournalWriter`] test double that delegates every write through to
+    /// a real [`Journal`] (so `Journal::read_record` still sees genuine persisted
+    /// state) while also recording each record passed to `persist`, in call order.
+    /// Lets a test assert how many times, and in what shape, a write happened — not
+    /// just the final content left on disk.
+    struct CountingJournal<'a> {
+        inner: &'a Journal,
+        writes: Mutex<Vec<sandy::JobRecord>>,
+    }
+
+    impl<'a> CountingJournal<'a> {
+        fn new(inner: &'a Journal) -> Self {
+            Self {
+                inner,
+                writes: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn writes_for(&self, job_id: &str) -> Vec<sandy::JobRecord> {
+            self.writes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .filter(|r| r.job_id == job_id)
+                .cloned()
+                .collect()
+        }
+    }
+
+    impl super::JournalWriter for CountingJournal<'_> {
+        fn persist(&self, record: &sandy::JobRecord) -> Result<(), sandy::CoreError> {
+            self.writes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(record.clone());
+            self.inner.write_record(record)
+        }
+
+        fn persist_if_still_running(&self, record: &sandy::JobRecord) -> Result<bool, sandy::CoreError> {
+            self.writes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(record.clone());
+            super::JournalWriter::persist_if_still_running(self.inner, record)
+        }
+    }
+
+    /// A [`CredentialProvider`] whose mint and refresh return distinct tokens, so a
+    /// test can tell the initial-token redaction pass apart from the mid-run-refresh
+    /// redaction pass (M-6 follow-up) — `FakeProvider` returns the same token for
+    /// both, which can't exercise that distinction.
+    struct TwoTokenProvider {
+        initial: &'static str,
+        refreshed: &'static str,
+    }
+
+    impl CredentialProvider for TwoTokenProvider {
+        fn mint(&self, _scope: &Scope, ttl_hint: Duration) -> Result<sandy::Minted, sandy::CredError> {
+            Ok(sandy::Minted::new(
+                self.initial.to_string(),
+                SystemTime::now() + ttl_hint,
+                sandy::CredentialHandle {
+                    id: "two-token-initial".to_string(),
+                },
+            ))
+        }
+
+        fn revoke(&self, _lease: &sandy::Lease) -> Result<(), sandy::CredError> {
+            Ok(())
+        }
+
+        fn refresh(&self, lease: &sandy::Lease) -> Result<sandy::Minted, sandy::CredError> {
+            Ok(sandy::Minted::new(
+                self.refreshed.to_string(),
+                SystemTime::now() + Duration::from_secs(u64::from(sandy::MAX_TTL_SECS)),
+                lease.handle.clone(),
+            ))
+        }
+    }
+
+    /// A backend that sleeps past `delay` before returning its scripted outcome,
+    /// giving a background refresh tick time to fire before the run itself returns.
+    struct SlowBackend {
+        inner: FakeBackend,
+        delay: Duration,
+    }
+
+    impl sandy::VmBackend for SlowBackend {
+        fn run(&self, spec: &sandy::RunSpec) -> Result<Outcome, BackendError> {
+            std::thread::sleep(self.delay);
+            self.inner.run(spec)
+        }
+
+        fn kill(&self, box_id: &str) -> Result<(), BackendError> {
+            self.inner.kill(box_id)
+        }
+
+        fn boxes(&self) -> Result<Vec<sandy::BoxState>, BackendError> {
+            self.inner.boxes()
+        }
+    }
+
+    /// #322: the credentialed path must write the terminal journal record exactly
+    /// once, after the refresh thread has joined and `redact_with_refreshes` has
+    /// run — never a first write against only the initial token, amended after a
+    /// mid-run refresh. A huge margin plus a 1ms tick forces a refresh on the
+    /// loop's very first tick; the backend sleeps past that tick so the refresh
+    /// has already happened by the time the run itself returns. Goes through
+    /// `run_job_with_credential_timed` directly rather than the env-var-driven
+    /// public entry point: `std::env::set_var` is `unsafe` (edition 2024) and
+    /// forbidden by this workspace's lints.
+    #[test]
+    fn credentialed_run_writes_the_terminal_record_once_after_refresh_redaction() -> anyhow::Result<()> {
+        use sandy::Scope;
+
+        let (_home, real_journal) = fresh_journal()?;
+        let journal = CountingJournal::new(&real_journal);
+        let cred_dir = tempfile::tempdir().context("cred dir")?;
+        std::fs::set_permissions(cred_dir.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .context("cred dir 0700")?;
+
+        let initial = "ghs_initial_marker_value";
+        let refreshed = "ghs_refreshed_marker_value";
+        let provider = TwoTokenProvider { initial, refreshed };
+        let backend = SlowBackend {
+            inner: FakeBackend::new().with_outcome(Outcome {
+                booted: true,
+                guest_exit: Some(0),
+                transport_error: None,
+                timed_out: false,
+                console: format!("boot: {initial}\nmid-run leak: {refreshed}\ndone"),
+            }),
+            delay: Duration::from_millis(2_500),
+        };
+
+        let (dev, ino) = sandy_fsutil::OwnedDir::open(cred_dir.path())?.dev_ino()?;
+        let fingerprint = sandy::DirFingerprint { dev, ino };
+
+        let report = super::run_job_with_credential_timed(
+            &backend,
+            &journal,
+            booting_plan(),
+            &FakeApplier::new(),
+            EgressOs::Linux,
+            None,
+            &provider,
+            &Scope::default(),
+            "GH_TOKEN",
+            cred_dir.path(),
+            fingerprint,
+            1_800,
+            Duration::from_secs(1_000_000),
+            Duration::from_millis(1),
+        )
+        .context("run_job_with_credential (mid-run refresh)")?;
+
+        assert!(
+            !report.envelope.logs.tail.contains(refreshed),
+            "the returned envelope must not carry the refreshed token: {:?}",
+            report.envelope.logs.tail
+        );
+        assert!(
+            !report.envelope.logs.tail.contains(initial),
+            "the returned envelope must not carry the initial token either: {:?}",
+            report.envelope.logs.tail
+        );
+
+        let writes = journal.writes_for(&report.envelope.job_id);
+        let terminal_writes: Vec<_> = writes.iter().filter(|r| r.state != sandy::JobState::Running).collect();
+        assert_eq!(
+            terminal_writes.len(),
+            1,
+            "the terminal record must be written exactly once, not written-then-amended: {writes:?}"
+        );
+        let persisted = terminal_writes[0]
+            .result
+            .as_ref()
+            .context("the terminal record must carry the envelope")?;
+        assert!(
+            !persisted.logs.tail.contains(refreshed),
+            "the single journaled write must already be redacted against the refreshed token: {:?}",
+            persisted.logs.tail
+        );
+        assert!(
+            !persisted.logs.tail.contains(initial),
+            "the single journaled write must already be redacted against the initial token: {:?}",
+            persisted.logs.tail
+        );
+        Ok(())
+    }
+
+    /// A [`super::JournalWriter`] whose `persist_if_still_running` always reports
+    /// the write skipped, as if a concurrent `kill`/`reconcile_job` had already
+    /// landed a terminal record, regardless of the real journal state. Isolates
+    /// `run_job_with_credential_timed`'s response to that signal from
+    /// `persist_if_still_running`'s own race detection, which is covered by
+    /// `persist_if_still_running_never_overwrites_an_already_terminal_record`.
+    struct AlwaysSkipJournal<'a> {
+        inner: &'a Journal,
+    }
+
+    impl super::JournalWriter for AlwaysSkipJournal<'_> {
+        fn persist(&self, record: &sandy::JobRecord) -> Result<(), sandy::CoreError> {
+            self.inner.write_record(record)
+        }
+
+        fn persist_if_still_running(&self, _record: &sandy::JobRecord) -> Result<bool, sandy::CoreError> {
+            Ok(false)
+        }
+    }
+
+    /// When the terminal write is skipped because another writer already landed a
+    /// terminal record, the credentialed path must not hand back its own result:
+    /// that would drift from the journal a `status`/`wait` reads next (review
+    /// finding on #415). Before this fix, `write_terminal_record` returned `()`
+    /// and the skip case was indistinguishable from a successful write, so this
+    /// call returned `Ok(report)` with a result nothing else will ever see.
+    #[test]
+    fn credentialed_run_refuses_to_report_a_result_the_journal_never_recorded() -> anyhow::Result<()> {
+        use sandy::Scope;
+
+        let (_home, real_journal) = fresh_journal()?;
+        let journal = AlwaysSkipJournal { inner: &real_journal };
+        let cred_dir = tempfile::tempdir().context("cred dir")?;
+        std::fs::set_permissions(cred_dir.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .context("cred dir 0700")?;
+        let provider = sandy_test_support::FakeProvider::returning("tok");
+        let backend = FakeBackend::new().with_outcome(Outcome {
+            booted: true,
+            guest_exit: Some(0),
+            transport_error: None,
+            timed_out: false,
+            console: String::new(),
+        });
+        let (dev, ino) = sandy_fsutil::OwnedDir::open(cred_dir.path())?.dev_ino()?;
+        let fingerprint = sandy::DirFingerprint { dev, ino };
+
+        let result = super::run_job_with_credential_timed(
+            &backend,
+            &journal,
+            booting_plan(),
+            &FakeApplier::new(),
+            EgressOs::Linux,
+            None,
+            &provider,
+            &Scope::default(),
+            "GH_TOKEN",
+            cred_dir.path(),
+            fingerprint,
+            1_800,
+            Duration::from_secs(1_000_000),
+            Duration::from_millis(1),
+        );
+
+        assert!(
+            result.is_err(),
+            "a skipped terminal write must refuse to report a result, not return the local one: {result:?}"
+        );
+        assert!(
+            !cred_dir.path().join("GH_TOKEN").exists(),
+            "teardown must still have run (credential revoked/removed) even though the report was refused"
         );
         Ok(())
     }
