@@ -93,6 +93,36 @@ sandy daemon list
 `sandy daemon` drives `sandyd`, an evolving control-plane daemon with its own
 job model (see [`docs/decisions/sandyd.md`](docs/decisions/sandyd.md)).
 
+### Running `sandyd` across multiple hosts (M2)
+
+`sandyd` can dispatch a job to a remote `sandy-host-executor` over a mesh
+(WireGuard/Tailscale) instead of running everything locally. All of `sandyd`'s
+config is environment variables, no CLI flags:
+
+```sh
+# orchestrator host
+SANDY_SOCK=/tmp/sandyd.sock \
+SANDY_MESH_LISTEN=<orchestrator-ip>:4000 SANDY_MESH_ALLOWLIST=<executor-ip> \
+SANDY_MESH_AGENT_LINK_LISTEN=<orchestrator-ip>:4001 \
+sandyd
+
+# executor host — SANDY_AGENT_PATH must resolve outside /tmp (the trusted-
+# process backend's bwrap sandbox replaces /tmp with an empty tmpfs)
+SANDY_AGENT_PATH="$(nix build .#sandy-agent --no-link --print-out-paths)/bin/sandy-agent" \
+SANDY_HOST_EXECUTOR_ORCHESTRATOR=<orchestrator-ip>:4000 \
+SANDY_HOST_EXECUTOR_ID=<any-name> \
+sandy-host-executor
+
+# from the orchestrator host: submit an argv/v1 manifest (a JSON array of argv), then attach
+SANDY_SOCK=/tmp/sandyd.sock sandy daemon submit manifest.json --manifest-encoding argv/v1 -o json
+SANDY_SOCK=/tmp/sandyd.sock sandy daemon attach <job-id>
+```
+
+`--flake` submissions dispatch as a VM job instead (sandbox kind `Vm`, #332) —
+this `argv/v1` path exercises the trusted-process executor specifically. Full
+walkthrough, the allowlist/bind-address constraints, and the `SANDY_AGENT_PATH`
+gotcha above: [`docs/design/host-executor/spec.md`](docs/design/host-executor/spec.md#manual-cross-machine-smoke-test).
+
 ## Development
 
 Build, test, and contribution workflow are in [`AGENTS.md`](AGENTS.md) — the
