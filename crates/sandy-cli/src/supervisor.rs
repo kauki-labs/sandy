@@ -16,12 +16,12 @@ use std::{
 
 use sandy::{
     AllowList, AuditReceipt, BackendError, CALL_DEADLINE, Classification, CoreError, CredentialProvider,
-    CredentialReceipt, EgressApplier, EgressEnforcement, EgressOs, EgressOutcome, EgressReceipt, GuestReported,
-    HostObserved, JOURNAL_SCHEMA_VERSION, JobRecord, JobState, Journal, Lease, Location, Logs, MAX_TTL_SECS, Outcome,
-    OutputRef, OutputSizeRef, OutputStatus, ProcessExit, Profile, Provenance, RESULT_SCHEMA_VERSION, ResultEnvelope,
-    SandboxKind, Scope, SecretSource, StagedImage, Status, Timing, VmBackend, What, Who, classify_backend_error,
-    classify_invalid_plan, classify_outcome, enforce, mint_lease, new_job_id, plan_egress_scoped, plan_eviction,
-    reconcile_job, refresh_once, validate_no_secret_leak,
+    CredentialReceipt, DirFingerprint, EgressApplier, EgressEnforcement, EgressOs, EgressOutcome, EgressReceipt,
+    GuestReported, HostObserved, JOURNAL_SCHEMA_VERSION, JobRecord, JobState, Journal, Lease, Location, Logs,
+    MAX_TTL_SECS, Outcome, OutputRef, OutputSizeRef, OutputStatus, ProcessExit, Profile, Provenance,
+    RESULT_SCHEMA_VERSION, ResultEnvelope, SandboxKind, Scope, SecretSource, StagedImage, Status, Timing, VmBackend,
+    What, Who, classify_backend_error, classify_invalid_plan, classify_outcome, enforce, mint_lease_checked,
+    new_job_id, plan_egress_scoped, plan_eviction, reconcile_job, refresh_once_checked, validate_no_secret_leak,
 };
 use zeroize::Zeroizing;
 
@@ -509,14 +509,20 @@ pub fn mint_run_token<P: CredentialProvider + ?Sized>(
 /// This is the credential sibling of [`run_job`]'s egress bracket, written as a
 /// wrapper rather than a parameter on `run_job` because a forge credential is
 /// opt-in while the egress boundary is universal. `requested_ttl_secs` is clamped to
-/// `MAX_TTL_SECS` by [`sandy::mint_lease`]; revoke-at-teardown is the real lifetime
-/// bound (the provider's native token TTL is too coarse, #49), so the token file is
-/// kept until after `revoke` (a GitHub revoke reads it) and then removed.
+/// `MAX_TTL_SECS` by [`sandy::mint_lease_checked`]; revoke-at-teardown is the real
+/// lifetime bound (the provider's native token TTL is too coarse, #49), so the token
+/// file is kept until after `revoke` (a GitHub revoke reads it) and then removed.
 ///
 /// `cred_dir` is the caller-owned secret share: the token is staged there as its
 /// env name and the dir is shared read-only into the guest ([`RunSpec::secret_dir`]),
-/// so a refresh can rewrite the live file in place. While the job runs, a background
-/// thread drives [`sandy::refresh_once`] (gated by [`sandy::should_refresh`]) to
+/// so a refresh can rewrite the live file in place. `cred_dir_fingerprint` is the
+/// `(dev, ino)` the caller's own validation of `cred_dir` (e.g.
+/// [`sandy_fsutil::private_staging_dir`]) captured before this call: every re-open of
+/// `cred_dir` by path from here on (the initial mint, each refresh, and the
+/// backend's own guest-share staging) is checked against it, refusing a same-uid,
+/// same-mode directory swapped in at `cred_dir`'s path in between (#323) instead of
+/// trusting the path alone. While the job runs, a background thread drives
+/// [`sandy::refresh_once_checked`] (gated by [`sandy::should_refresh`]) to
 /// re-mint and re-stage the token before it lapses, revoking each superseded one, so
 /// a job that outlives the provider's native token cap (GitHub ~1h) keeps a valid
 /// scoped token the whole run. The refresh margin and poll interval default to
@@ -553,13 +559,25 @@ pub fn run_job_with_credential<
     scope: &Scope,
     secret_name: &str,
     cred_dir: &Path,
+    cred_dir_fingerprint: DirFingerprint,
     requested_ttl_secs: u32,
 ) -> Result<RunReport, CoreError> {
     // Mint and stage the token before the guest boots, into the share dir itself so
     // the staged file IS the live guest file (refresh rewrites it). A mint failure is
     // a fail-closed infra fault: return before any backend run (INV-7).
-    let lease = mint_lease(provider, scope, requested_ttl_secs, secret_name, cred_dir)
-        .map_err(|e| CoreError::Cred(e.to_string()))?;
+    // `mint_lease_checked` refuses the stage if `cred_dir` no longer matches
+    // `cred_dir_fingerprint` — the caller's own validation of it, captured before
+    // this call (#323) — rather than trusting a same-uid, same-mode directory
+    // swapped in at `cred_dir`'s path since.
+    let lease = mint_lease_checked(
+        provider,
+        scope,
+        requested_ttl_secs,
+        secret_name,
+        cred_dir,
+        cred_dir_fingerprint,
+    )
+    .map_err(|e| CoreError::Cred(e.to_string()))?;
     // Captured for the receipt's `credential.minted_at` (#361): right after the
     // mint that just succeeded, before the boot it's staged for.
     let minted_at = SystemTime::now();
@@ -590,8 +608,11 @@ pub fn run_job_with_credential<
     };
     // Share cred_dir directly instead of pushing a plan secret the backend copies:
     // the caller owns the dir and the refresh thread rewrites the token in it live.
+    // The fingerprint rides along so the backend's own reopen-by-path (it only ever
+    // gets `RunSpec::secret_dir`'s path, never this live handle) is checked the same
+    // way (#323).
     let mut plan = plan;
-    plan.secret_dir = Some(cred_dir.to_path_buf());
+    plan.secret_dir = Some((cred_dir.to_path_buf(), cred_dir_fingerprint));
 
     let margin = refresh_interval("SANDY_REFRESH_MARGIN_SECS", DEFAULT_REFRESH_MARGIN_SECS);
     let tick = safe_heartbeat_tick(
@@ -644,6 +665,7 @@ pub fn run_job_with_credential<
                 &stop_rx,
                 shared_redact_log,
                 shared_refresh_times_log,
+                cred_dir_fingerprint,
             )
         });
         let report = run_job(backend, journal, &plan, egress, egress_os, tap, redact);
@@ -877,8 +899,12 @@ fn safe_heartbeat_tick(tick: Duration, max_ttl_secs: u32, call_deadline: Duratio
 
 /// Poll `lease` every `tick` and refresh it when within `margin` of expiry, until
 /// the sender half of `stop` is dropped (the run finished). Each refresh re-stages
-/// the live token file and revokes the superseded token via [`refresh_once`]; a
-/// refresh error is logged and retried on the next tick, never fatal to the run.
+/// the live token file and revokes the superseded token via [`refresh_once_checked`];
+/// a refresh error is logged and retried on the next tick, never fatal to the run.
+/// `cred_dir_fingerprint` is the `(dev, ino)` the caller validated `cred_dir` under
+/// before this loop started (#323): the re-stage is refused, not silently retried
+/// into a substitute, if a same-uid, same-mode directory was swapped in at that
+/// path since.
 ///
 /// A successful refresh's new token is read back and queued onto `redact_log`
 /// (M-6 follow-up): `run_job`'s own redaction pass only ever saw the token staged
@@ -900,6 +926,7 @@ fn refresh_loop<P: CredentialProvider + Sync + ?Sized>(
     stop: &mpsc::Receiver<()>,
     redact_log: &Mutex<Vec<Zeroizing<String>>>,
     refresh_times_log: &Mutex<Vec<SystemTime>>,
+    cred_dir_fingerprint: DirFingerprint,
 ) {
     loop {
         match stop.recv_timeout(tick) {
@@ -914,7 +941,7 @@ fn refresh_loop<P: CredentialProvider + Sync + ?Sized>(
         {
             tracing::warn!(%e, dir = %dir.display(), "could not heartbeat the credential staging dir's mtime");
         }
-        match refresh_once(provider, &mut guard, SystemTime::now(), margin) {
+        match refresh_once_checked(provider, &mut guard, SystemTime::now(), margin, cred_dir_fingerprint) {
             Ok(true) => {
                 // For the receipt (#361): record when this refresh happened,
                 // regardless of whether the token can also be read back below.
@@ -1502,6 +1529,8 @@ mod tests {
         let lease = mint_lease(&provider, &Scope::default(), 1_800, "GITHUB_TOKEN", tmp.path())
             .map_err(|e| anyhow::anyhow!("{e}"))
             .context("mint")?;
+        let (dev, ino) = sandy_fsutil::OwnedDir::open(tmp.path())?.dev_ino()?;
+        let fingerprint = sandy::DirFingerprint { dev, ino };
         let lease = Mutex::new(lease);
         let (tx, rx) = mpsc::channel::<()>();
         let margin = Duration::from_secs(1_000_000);
@@ -1514,7 +1543,9 @@ mod tests {
             let shared = &lease;
             let shared_log = &redact_log;
             let shared_times = &refresh_times_log;
-            s.spawn(move || super::refresh_loop(pref, shared, margin, tick, &rx, shared_log, shared_times));
+            s.spawn(move || {
+                super::refresh_loop(pref, shared, margin, tick, &rx, shared_log, shared_times, fingerprint)
+            });
             std::thread::sleep(Duration::from_millis(50));
             drop(tx);
         });
@@ -1558,6 +1589,8 @@ mod tests {
         // Back-date the dir well past gc's MAX_TTL_SECS window before the loop
         // starts ticking, so a surviving fresh mtime can only be the heartbeat.
         set_mtime_age(tmp.path(), Duration::from_secs(u64::from(sandy::MAX_TTL_SECS) + 600))?;
+        let (dev, ino) = sandy_fsutil::OwnedDir::open(tmp.path())?.dev_ino()?;
+        let fingerprint = sandy::DirFingerprint { dev, ino };
         let lease = Mutex::new(lease);
         let (tx, rx) = mpsc::channel::<()>();
         // Far smaller than the lease's 1_800s TTL, so `should_refresh` never
@@ -1573,7 +1606,9 @@ mod tests {
             let shared = &lease;
             let shared_log = &redact_log;
             let shared_times = &refresh_times_log;
-            s.spawn(move || super::refresh_loop(pref, shared, margin, tick, &rx, shared_log, shared_times));
+            s.spawn(move || {
+                super::refresh_loop(pref, shared, margin, tick, &rx, shared_log, shared_times, fingerprint)
+            });
             std::thread::sleep(Duration::from_millis(50));
             drop(tx);
         });
@@ -1624,6 +1659,8 @@ mod tests {
         let cred_dir = tempfile::tempdir().context("cred dir")?;
         std::fs::set_permissions(cred_dir.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700))
             .context("cred dir 0700")?;
+        let (dev, ino) = sandy_fsutil::OwnedDir::open(cred_dir.path())?.dev_ino()?;
+        let fingerprint = sandy::DirFingerprint { dev, ino };
         let provider = FakeProvider::returning("tok");
 
         // Suppress the deliberate panic's default backtrace print.
@@ -1641,6 +1678,7 @@ mod tests {
                 &Scope::default(),
                 "GITHUB_TOKEN",
                 cred_dir.path(),
+                fingerprint,
                 MAX_TTL_SECS,
             )
         }));

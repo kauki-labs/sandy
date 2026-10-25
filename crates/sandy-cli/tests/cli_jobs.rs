@@ -32,6 +32,16 @@ fn fresh_journal() -> anyhow::Result<(tempfile::TempDir, Journal)> {
     Ok((tmp, journal))
 }
 
+/// The `(dev, ino)` fingerprint of an already-validated dir, as the production
+/// `run_credentialed` captures it from `private_staging_dir` before calling
+/// `run_job_with_credential` (#323).
+fn fingerprint(dir: &std::path::Path) -> anyhow::Result<sandy::DirFingerprint> {
+    let (dev, ino) = sandy_fsutil::OwnedDir::open(dir)
+        .context("open dir to fingerprint")?
+        .dev_ino()?;
+    Ok(sandy::DirFingerprint { dev, ino })
+}
+
 /// A scripted physical outcome: booted, with the given guest exit code.
 fn ok_outcome(guest_exit: i32) -> Outcome {
     Outcome {
@@ -714,6 +724,7 @@ fn credential_is_minted_run_revoked_and_cleaned() -> anyhow::Result<()> {
         &token_scope(),
         "GH_TOKEN",
         &cred_dir,
+        fingerprint(&cred_dir)?,
         1_800,
     )
     .context("run_job_with_credential")?;
@@ -759,6 +770,7 @@ fn credential_is_revoked_even_when_the_run_fails() -> anyhow::Result<()> {
         &token_scope(),
         "GH_TOKEN",
         &cred_dir,
+        fingerprint(&cred_dir)?,
         1_800,
     )
     .context("run_job_with_credential (run fails)")?;
@@ -797,6 +809,7 @@ fn credential_mint_failure_fails_closed_before_any_run() -> anyhow::Result<()> {
         &token_scope(),
         "GH_TOKEN",
         &cred_dir,
+        fingerprint(&cred_dir)?,
         1_800,
     )
     .expect_err("a mint failure must fail closed");
@@ -844,6 +857,7 @@ fn credentialed_run_redacts_the_token_from_the_console() -> anyhow::Result<()> {
         &token_scope(),
         "GH_TOKEN",
         &cred_dir,
+        fingerprint(&cred_dir)?,
         1_800,
     )
     .context("run_job_with_credential (console echoes token)")?;
@@ -917,6 +931,7 @@ fn credential_revoke_failure_surfaces_as_a_warning_not_a_fault() -> anyhow::Resu
     let cred_dir = tmp.path().join("cred");
     std::fs::create_dir_all(&cred_dir).context("create cred dir")?;
     std::fs::set_permissions(&cred_dir, std::fs::Permissions::from_mode(0o700)).context("cred dir 0700")?;
+    let cred_fingerprint = fingerprint(&cred_dir)?;
 
     let buf = SharedBuf::default();
     let subscriber = tracing_subscriber::fmt()
@@ -935,6 +950,7 @@ fn credential_revoke_failure_surfaces_as_a_warning_not_a_fault() -> anyhow::Resu
             &token_scope(),
             "GH_TOKEN",
             &cred_dir,
+            cred_fingerprint,
             1_800,
         )
     })
