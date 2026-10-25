@@ -567,6 +567,29 @@ pub fn run_job_with_credential<
     cred_dir_fingerprint: DirFingerprint,
     requested_ttl_secs: u32,
 ) -> Result<RunReport, CoreError> {
+    // Validate the plan before minting: a hostname allow-list entry is invalid on
+    // Linux (#359, same check `run_job` runs). Checking it here, before the mint,
+    // means a bad plan never mints-and-immediately-revokes a credential for a run
+    // that was always going to be refused, and a mint failure (CoreError::Cred)
+    // never masks what should be a clean band-2 invalid-plan report.
+    if let Err(plan_error) = validate_egress_hosts(&plan.allow, egress_os) {
+        let classification = classify_invalid_plan(&plan_error);
+        let envelope = build_envelope(
+            &new_job_id(),
+            None,
+            classification,
+            None,
+            plan_error.to_string(),
+            String::new(),
+            vec![],
+            None,
+        );
+        return Ok(RunReport {
+            envelope,
+            process_exit: classification.process_exit,
+        });
+    }
+
     // Mint and stage the token before the guest boots, into the share dir itself so
     // the staged file IS the live guest file (refresh rewrites it). A mint failure is
     // a fail-closed infra fault: return before any backend run (INV-7).

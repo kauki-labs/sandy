@@ -530,6 +530,57 @@ fn run_hostname_allow_on_linux_is_invalid_plan_writes_no_record_and_never_boots(
     Ok(())
 }
 
+/// #359 + credentialed path (review finding on #418): a hostname allow-list
+/// entry on Linux must be refused BEFORE the credential mint, not after. Minting
+/// first would mint-and-immediately-revoke a credential for a plan that was
+/// always going to be refused, and a mint failure would mask the clean band-2
+/// invalid-plan report behind `CoreError::Cred`.
+#[test]
+fn run_with_credential_hostname_allow_on_linux_is_invalid_plan_never_mints() -> anyhow::Result<()> {
+    let (tmp, journal) = fresh_journal()?;
+    let provider = FakeProvider::returning("ghs_should_never_be_minted");
+    let backend = FakeBackend::new().with_outcome(ok_outcome(0));
+    let cred_dir = tmp.path().join("cred");
+    std::fs::create_dir_all(&cred_dir).context("create cred dir")?;
+    std::fs::set_permissions(&cred_dir, std::fs::Permissions::from_mode(0o700)).context("cred dir 0700")?;
+
+    let report = run_job_with_credential(
+        &backend,
+        &journal,
+        allowing_plan_by_hostname(),
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        Some("sandytap0"),
+        &provider,
+        &token_scope(),
+        "GH_TOKEN",
+        &cred_dir,
+        fingerprint(&cred_dir)?,
+        1_800,
+    )
+    .context("run_job_with_credential (hostname allow entry, linux)")?;
+
+    assert_eq!(
+        report.process_exit.code(),
+        2,
+        "a hostname allow entry on Linux is band 2, even on the credentialed path"
+    );
+    assert!(
+        report.envelope.message.contains("github.com"),
+        "the error must name the refused entry: {}",
+        report.envelope.message
+    );
+    assert!(
+        provider.mints().is_empty(),
+        "the plan must be rejected before any credential is minted"
+    );
+    assert!(
+        journal.list().context("list after hostname allow entry")?.is_empty(),
+        "a refused hostname entry must write no job record"
+    );
+    Ok(())
+}
+
 /// #23: a Linux run with a non-empty allow-list applies the `to_nftables`
 /// translation of that allow-list as the boundary, and reverts it after the run.
 #[test]

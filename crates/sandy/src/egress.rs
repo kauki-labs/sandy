@@ -271,7 +271,14 @@ pub fn validate_egress_hosts(allow: &AllowList, target_os: EgressOs) -> Result<(
 fn is_ipv4_or_cidr(host: &str) -> bool {
     match host.split_once('/') {
         Some((addr, prefix)) => {
-            addr.parse::<std::net::Ipv4Addr>().is_ok() && prefix.parse::<u8>().is_ok_and(|p| p <= 32)
+            // `u8::from_str` accepts a leading `+` (`"+8"`), which would pass this
+            // check but then fail `is_emittable_host`'s stricter grammar and get
+            // silently dropped (denied, not a leak) at ruleset-build time instead
+            // of refused here at plan time.
+            addr.parse::<std::net::Ipv4Addr>().is_ok()
+                && !prefix.is_empty()
+                && prefix.bytes().all(|b| b.is_ascii_digit())
+                && prefix.parse::<u8>().is_ok_and(|p| p <= 32)
         }
         None => host.parse::<std::net::Ipv4Addr>().is_ok(),
     }
@@ -386,6 +393,20 @@ mod tests {
             assert!(
                 validate_egress_hosts(&allow_one(host, 443), EgressOs::Linux).is_ok(),
                 "an IPv4 entry `{host}` must be accepted on Linux"
+            );
+        }
+    }
+
+    /// `u8::from_str` accepts a leading `+` (`"+8"`); a CIDR prefix with one must
+    /// still be refused here, at plan time, rather than passing validation and
+    /// then getting silently dropped by `is_emittable_host`'s stricter grammar
+    /// when the ruleset is built (review finding on #418).
+    #[test]
+    fn linux_refuses_a_cidr_prefix_with_a_non_decimal_sign() {
+        for host in ["10.0.0.0/+8", "10.0.0.0/-8", "10.0.0.0/"] {
+            assert!(
+                validate_egress_hosts(&allow_one(host, 443), EgressOs::Linux).is_err(),
+                "a malformed CIDR prefix `{host}` must be refused at plan time, not silently dropped later"
             );
         }
     }
