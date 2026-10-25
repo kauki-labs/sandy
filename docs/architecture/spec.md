@@ -372,6 +372,18 @@ the guest has no network device, so --allow entries have no effect (see
 #360)`. An empty allow-list does not add an envelope warning. The decision keys on structure
   (`EgressOs::MacOs` or no tap), never on the `Unenforced` reason string. No
   schema bump: `warnings` already exists at schema 2 (section 6).
+- **IP-only matching, no guest DNS (#359).** An allow-list entry is an IPv4
+  address or IPv4 CIDR plus port; matching is by destination IPv4 address and TCP
+  port only — IPv6, UDP, and QUIC from the guest are dropped. The guest gets no
+  DNS through the boundary, so a job must connect by IP. A hostname entry is
+  refused at plan time on the nftables (Linux) path: band 2, no journal record,
+  no boot, naming the entry and #377. nft pins a hostname to one address at
+  ruleset-load time, rejects a name with several addresses, and the guest can't
+  resolve names through the boundary anyway, so a hostname entry only ever helps
+  a job that already connects by IP — refusing it turns that silent no-op into a
+  clear error. macOS enforces no boundary, so a hostname entry stays accepted
+  there (#358). Hostname policy arrives with the #360 egress proxy (#377), which
+  resolves names host-side.
 - **Planned: a NIC-less guest with a vsock host proxy (#360).** The guest gets
   no NIC. `sandy-agent egress-relay` serves `127.0.0.1:3128` in the guest and
   sets `HTTP(S)_PROXY` for the job. Each CONNECT crosses vsock to a per-run host
@@ -386,12 +398,16 @@ the guest has no network device, so --allow entries have no effect (see
 
 **KPI.**
 
-- Integration: `egress` unit tests (ruleset generation, `plan_egress_scoped`);
-  `cli_jobs` `run_on_linux_applies_the_allow_list_ruleset_and_reverts_it` /
+- Integration: `egress` unit tests (ruleset generation, `plan_egress_scoped`,
+  `validate_egress_hosts`); `cli_jobs`
+  `run_on_linux_applies_the_allow_list_ruleset_and_reverts_it` /
   `run_on_macos_applies_no_boundary_but_still_succeeds` /
   `run_on_macos_with_an_empty_allow_list_carries_no_warning` /
   `run_on_linux_with_no_tap_and_a_nonempty_allow_list_warns` /
   `run_on_linux_with_no_tap_and_an_empty_allow_list_carries_no_warning` /
+  `run_on_the_process_backend_with_a_nonempty_allow_list_warns_with_the_right_cause` /
+  `run_hostname_allow_on_linux_is_invalid_plan_writes_no_record_and_never_boots` /
+  `run_with_credential_hostname_allow_on_linux_is_invalid_plan_never_mints` /
   apply-failure-fails-closed (over `FakeApplier`).
 - End-to-end: `live_egress.rs` (Linux + root + `nft`), real nftables around a boot,
   including the host-destined case (an empty allow-list plus a host-local
