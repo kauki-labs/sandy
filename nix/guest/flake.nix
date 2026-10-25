@@ -46,8 +46,13 @@
           networking.firewall.enable = false;
           # `nft` in the guest so the #29 "bypass impossible" row can really flush
           # the guest's own ruleset — otherwise that step is a silent no-op and the
-          # assertion is vacuous.
-          environment.systemPackages = [ pkgs.nftables ];
+          # assertion is vacuous. `glibc.bin` for `getent`: NixOS doesn't put it on
+          # PATH by default, and the #376 live gate needs it to prove the guest
+          # really can't resolve a name through a host-local resolver.
+          environment.systemPackages = [
+            pkgs.nftables
+            pkgs.glibc.bin
+          ];
         };
 
       # GitHub credential consumption for a `sandy run --credential` job. The scoped

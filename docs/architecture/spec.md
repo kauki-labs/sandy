@@ -251,6 +251,13 @@ never the host's.
   lock the host off the network; if the boundary can't be applied, the run fails
   closed (band 3) rather than booting unprotected. It is always reverted, on the ok
   and the error path, so a boot failure never leaves rules up.
+- **Host-destined traffic is covered too (#376).** Traffic from the guest to the
+  host itself doesn't cross `forward`; it lands in `input`. `to_nftables_forward`
+  also emits an `input`-hook chain scoped to the guest's `iface`: DHCP is allowed,
+  everything else from the guest is dropped. An empty allow-list blocks it the
+  same as forwarded egress — there is no way to allow-list a host address here
+  (see `docs/decisions/egress.md`). IPv4 only, TCP only on the data-plane side;
+  no guest DNS is resolved or trusted.
 - **macOS is a no-op.** `plan_egress_scoped` yields `NoBoundary`; the run proceeds
   without enforcement (documented, not silent).
 
@@ -259,7 +266,10 @@ never the host's.
 - Integration: `egress` unit tests (ruleset generation, `plan_egress_scoped`);
   `cli_jobs` `run_on_linux_applies_the_allow_list_ruleset_and_reverts_it` /
   `..._macos_applies_no_boundary` / apply-failure-fails-closed (over `FakeApplier`).
-- End-to-end: `live_egress.rs` (Linux + root + `nft`), real nftables around a boot.
+- End-to-end: `live_egress.rs` (Linux + root + `nft`), real nftables around a boot,
+  including the host-destined case (an empty allow-list plus a host-local
+  resolver: the guest can't resolve names through it and can't connect to the
+  tap's host address).
 
 ---
 
