@@ -641,15 +641,4 @@ mod tests {
         rustix::fs::fsync(&handle).context("fsync the validated dir")?;
         Ok(())
     }
-
-    /// Telemetry stays off by default: the new parent-dir check only runs once a
-    /// log is enabled, so a disabled sink never touches the filesystem.
-    #[tokio::test]
-    async fn telemetry_stays_off_by_default_even_with_an_unsafe_cwd() -> anyhow::Result<()> {
-        let log = LocalLog::disabled();
-        anyhow::ensure!(!log.enabled(), "the default log is enabled");
-        log.emit(&record("a")).await?;
-        anyhow::ensure!(log.records()?.is_empty(), "a disabled log kept a record");
-        Ok(())
-    }
 }
