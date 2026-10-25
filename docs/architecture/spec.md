@@ -56,7 +56,13 @@ The design still guarantees, even from inside a compromised guest:
 - no agent capability token in the job's environment;
 - on qemu, input and secret shares stay read-only enforced host-side by
   `--readonly` on `virtiofsd`: a guest-root remount-rw still gets `EROFS` on
-  write.
+  write;
+- **no egress at all on macOS, until #360.** `vfkit_args`
+  (`impls/vm/src/vfkit.rs`) emits no `virtio-net` device, so a macOS guest has
+  no NIC to reach anything over: denied by construction, not merely
+  unfiltered (`egress.md` decision 2). A non-empty `--allow` list has no
+  effect there either and the envelope's `warnings` says so (#358). This
+  guarantee ends once #360 gives guests network.
 
 It does not guarantee:
 
@@ -78,7 +84,6 @@ It does not guarantee:
 - **guest-to-host traffic on Linux.** The egress ruleset filters the forward
   chain only (`egress.md` decision 1); traffic the guest sends to the host
   itself is not filtered. #376 tracks closing this.
-- **no egress boundary at all on macOS** (`egress.md` decision 2, #358).
 
 ---
 
@@ -314,14 +319,28 @@ never the host's.
   lock the host off the network; if the boundary can't be applied, the run fails
   closed (band 3) rather than booting unprotected. It is always reverted, on the ok
   and the error path, so a boot failure never leaves rules up.
-- **macOS is a no-op.** `plan_egress_scoped` yields `NoBoundary`; the run proceeds
-  without enforcement (documented, not silent).
+- **macOS is a no-op.** `vfkit_args` (`impls/vm/src/vfkit.rs`) emits no
+  `virtio-net` device, so a macOS guest has no NIC at all; `plan_egress_scoped`
+  yields `NoBoundary` and the run proceeds without enforcement (documented, not
+  silent). A Linux guest with no bound tap has no NIC either, for the same
+  reason.
+- **A no-NIC guest's `--allow` list warns when non-empty (#358).** With no
+  network device (macOS, or Linux without a tap) a non-empty `--allow` list has
+  no effect to grant, so the envelope's `warnings` carries `egress unavailable:
+the guest has no network device, so --allow entries have no effect (see
+#360)`. An empty allow-list never warns. The decision keys on structure
+  (`EgressOs::MacOs` or no tap), never on the `Unenforced` reason string. No
+  schema bump: `warnings` already exists at schema 2 (section 6).
 
 **KPI.**
 
 - Integration: `egress` unit tests (ruleset generation, `plan_egress_scoped`);
   `cli_jobs` `run_on_linux_applies_the_allow_list_ruleset_and_reverts_it` /
-  `..._macos_applies_no_boundary` / apply-failure-fails-closed (over `FakeApplier`).
+  `run_on_macos_applies_no_boundary_but_still_succeeds` /
+  `run_on_macos_with_an_empty_allow_list_carries_no_warning` /
+  `run_on_linux_with_no_tap_and_a_nonempty_allow_list_warns` /
+  `run_on_linux_with_no_tap_and_an_empty_allow_list_carries_no_warning` /
+  apply-failure-fails-closed (over `FakeApplier`).
 - End-to-end: `live_egress.rs` (Linux + root + `nft`), real nftables around a boot.
 
 ---

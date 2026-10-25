@@ -2,7 +2,7 @@
 title: "Decisions: egress"
 status: accepted
 project: sandy
-updated: 2026-10-14
+updated: 2026-10-25
 ---
 
 # Decisions: egress
@@ -35,10 +35,27 @@ K13 (`live_egress.rs`, Linux + root + `nft`).
 **Status:** accepted.
 
 **Context.** The guest-scoped nftables mechanism is Linux-only; macOS has no
-equivalent in this path.
+equivalent in this path. The guest also has no network device at all:
+`vfkit_args` (`impls/vm/src/vfkit.rs`) emits virtio-blk, virtio-serial,
+virtio-fs and virtio-vsock devices, and no `virtio-net`. A macOS guest's egress
+is therefore denied by construction, not merely unfiltered: a correction to
+this decision's earlier text, which said macOS had "unfiltered network
+(vmnet)". A Linux guest with no bound tap has no NIC either, for the same
+reason `plan_egress_scoped` gives it `NoBoundary`.
 
-**Decision.** On macOS `plan_egress_scoped` yields `NoBoundary`; the run proceeds
-without enforcement, **documented, not silent**.
+**Decision.** On macOS `plan_egress_scoped` yields `NoBoundary`; the run
+proceeds without enforcement, **documented, not silent**. Because there is no
+NIC, a non-empty `--allow` list has no effect to grant: the envelope's
+`warnings` says so (#358), `egress unavailable: the guest has no network
+device, so --allow entries have no effect (see #360)`, for both macOS and a
+tap-less Linux guest. An empty allow-list never warns — deny-all already
+holds with no NIC to grant anything onto. The decision keys on structure
+(`EgressOs::MacOs`, or no tap), never on the `Unenforced` reason string.
 
-**Consequences.** macOS runs are unfiltered by design; the behaviour is stated in
-the result and the docs so it is not mistaken for enforcement.
+**Consequences.** A macOS run (or a tap-less Linux run) has no network to
+filter or to grant; the result says so, in both the docs and the envelope,
+when `--allow` would otherwise look like it did something. Status stays
+`succeeded`: this is a known gap, not a fault.
+
+**Follow-up.** #360 gives guests network (a host-side proxy); #408 then turns
+this warning into a refusal once there is something for `--allow` to grant.

@@ -15,11 +15,11 @@ use std::{
 };
 
 use sandy::{
-    BackendError, CALL_DEADLINE, Classification, CoreError, CredentialProvider, EgressApplier, EgressOs, EgressOutcome,
-    JOURNAL_SCHEMA_VERSION, JobRecord, JobState, Journal, Lease, Logs, MAX_TTL_SECS, Outcome, OutputRef, OutputStatus,
-    ProcessExit, Profile, Provenance, RESULT_SCHEMA_VERSION, ResultEnvelope, Scope, SecretSource, StagedImage, Status,
-    VmBackend, classify_backend_error, classify_invalid_plan, classify_outcome, enforce, mint_lease, new_job_id,
-    plan_egress_scoped, plan_eviction, reconcile_job, refresh_once, validate_no_secret_leak,
+    AllowList, BackendError, CALL_DEADLINE, Classification, CoreError, CredentialProvider, EgressApplier, EgressOs,
+    EgressOutcome, JOURNAL_SCHEMA_VERSION, JobRecord, JobState, Journal, Lease, Logs, MAX_TTL_SECS, Outcome, OutputRef,
+    OutputStatus, ProcessExit, Profile, Provenance, RESULT_SCHEMA_VERSION, ResultEnvelope, Scope, SecretSource,
+    StagedImage, Status, VmBackend, classify_backend_error, classify_invalid_plan, classify_outcome, enforce,
+    mint_lease, new_job_id, plan_egress_scoped, plan_eviction, reconcile_job, refresh_once, validate_no_secret_leak,
 };
 use zeroize::Zeroizing;
 
@@ -91,6 +91,23 @@ fn build_envelope(
         // envelope is built (L-12); every other path leaves it empty.
         warnings: vec![],
     }
+}
+
+/// The envelope warning for a non-empty `--allow` list that has no effect
+/// because the guest has no network device (#358).
+///
+/// `vfkit_args` (`impls/vm/src/vfkit.rs`) emits no `virtio-net` device, so a
+/// macOS guest has no NIC at all; a Linux guest with no bound tap has none
+/// either (`plan_egress_scoped`). In both cases `--allow` entries are not
+/// merely unfiltered, they are inert: there is nothing to grant them onto. Keys
+/// on structure (`EgressOs::MacOs`, or no `tap`), never on the `EgressOutcome`'s
+/// reason string, so a reason that happens not to match a pattern can't defeat
+/// it. An empty allow-list never warns: deny-all already holds with no NIC.
+fn no_network_allow_warning(allow: &AllowList, egress_os: EgressOs, tap: Option<&str>) -> Option<String> {
+    let no_nic = matches!(egress_os, EgressOs::MacOs) || tap.is_none();
+    (no_nic && !allow.rules.is_empty()).then(|| {
+        "egress unavailable: the guest has no network device, so --allow entries have no effect (see #360)".to_string()
+    })
 }
 
 /// List the files the backend collected to each declared output's destination as
@@ -229,7 +246,7 @@ pub fn run_job<B: VmBackend + ?Sized, E: EgressApplier + ?Sized>(
     // 4. On a successful apply, run the backend, then ALWAYS revert when the boundary was enforced — on both the ok and
     //    error paths, so a boot failure never leaves nftables rules up.
     let eplan = plan_egress_scoped(&plan.allow, egress_os, tap);
-    let run_result: Result<Outcome, BackendError> = match enforce(&eplan, egress) {
+    let (run_result, egress_warning): (Result<Outcome, BackendError>, Option<String>) = match enforce(&eplan, egress) {
         Ok(eoutcome) => {
             let outcome = backend.run(&spec);
             if matches!(eoutcome, EgressOutcome::Enforced)
@@ -237,13 +254,16 @@ pub fn run_job<B: VmBackend + ?Sized, E: EgressApplier + ?Sized>(
             {
                 tracing::warn!(%e, "egress revert failed");
             }
-            outcome
+            (outcome, no_network_allow_warning(&plan.allow, egress_os, tap))
         }
         Err(egress_error) => {
             tracing::warn!(%job_id, %egress_error, "egress apply failed; refusing to boot (fail-closed)");
-            Err(BackendError::Spawn(format!(
-                "egress boundary not established: {egress_error}"
-            )))
+            (
+                Err(BackendError::Spawn(format!(
+                    "egress boundary not established: {egress_error}"
+                ))),
+                None,
+            )
         }
     };
 
@@ -279,7 +299,10 @@ pub fn run_job<B: VmBackend + ?Sized, E: EgressApplier + ?Sized>(
     // 6. Write the terminal record carrying the envelope (INV-6). Redact right before the envelope is built: this is
     //    the last point before the journal write, and there's no seam after `run_job` returns (M-6).
     let console = redact_console(console, redact);
-    let envelope = build_envelope(&job_id, None, classification, guest_exit, message, console, outputs);
+    let mut envelope = build_envelope(&job_id, None, classification, guest_exit, message, console, outputs);
+    if let Some(warning) = egress_warning {
+        envelope.warnings.push(warning);
+    }
     let terminal = JobRecord {
         schema_version: JOURNAL_SCHEMA_VERSION,
         job_id,
