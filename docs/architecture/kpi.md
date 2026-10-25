@@ -21,6 +21,13 @@ A KPI counts as met only when all three hold:
 - The asserted envelope `status` / `exit_code` / `outputs` match the required
   behaviour, and no secret value appears in `logs.tail`.
 
+The M2 control-plane rows below (KM1, KA1) are the one named exception: they
+are real `SANDY_LIVE=1` process-level tests (a real `sandyd` binary, real TCP/UDS
+connections), but run the job itself through `handle_dispatch` against
+`FakeContainment`, not a real container or VM. They count toward the
+control-plane and attach-data-plane floor only, never toward containment or
+VM-boot KPIs, which K1-K19 and KA3-KA4 already cover.
+
 ## Required functionality
 
 | #   | Capability                    | Required behaviour                                                                                                                                                                                 | Proven by                                                                                                                                                                                                                                                                                   | Upholds          | Host matrix                           |
@@ -93,6 +100,67 @@ A KPI counts as met only when all three hold:
     Not counted green until that test exists and passes on its matrix
     (INV-S9).
 
+## M2 control plane and interactive attach (live gates)
+
+The pipeline above (K1-K19) is `sandy run`'s direct-execution path. `sandy
+daemon submit`/`attach` dispatches through `sandyd` + (optionally) a remote
+`sandy-host-executor` instead (`docs/overview.md`'s "Control plane" section,
+`docs/decisions/sandyd.md`). These rows use their own `KM*`/`KA*` prefixes so
+they never collide with K1-K19 or the `KP*` egress-proxy block above.
+`SANDY_LIVE=1` gates every row here too (INV-S9); KM1/KM2/KA1 need no
+hypervisor (`FakeContainment`, see the Definition-of-green note above); KM4,
+KA3, and KA4 boot a real guest.
+
+### Acceptance (M2 stage 1)
+
+| #   | Capability                  | Required behaviour                                                                                                                                                                                                                               | Proven by                                                                                             | Upholds        | Host matrix                                               |
+| --- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------- | -------------- | --------------------------------------------------------- |
+| KM1 | Cross-machine dispatch      | `sandy daemon submit` places through real orchestrator placement to a real `Dispatch`, run via `handle_dispatch` against `FakeContainment` (control/data plane only — sandy-91: the real `sandy-host-executor` binary cannot start on this Mac). | `live_m2_cross_machine.rs::cross_machine_sandboxes_exchange_a_peer_message_through_the_hub`           | #263, #269     | `SANDY_LIVE=1`, no hypervisor                             |
+| KM2 | Register-auth refusal       | An unlisted mesh identity's `Register` gets `RegisterRefused`, no dispatch.                                                                                                                                                                      | `live_m2_cross_machine.rs::register_from_an_unlisted_mesh_identity_gets_no_ack_and_no_dispatch`       | infra-f3, #263 | `SANDY_LIVE=1`, no hypervisor                             |
+| KM4 | Flake-templated VM dispatch | `sandy daemon submit --flake <ref>` places a `flake/v1` manifest on a remote host declaring `SandboxKind::Vm`, which boots a real qemu VM and succeeds.                                                                                          | `live_remote_host_flake_dispatch.rs::a_flake_templated_vm_job_dispatches_and_succeeds_on_remote_host` | #332           | operator-run [^remote-host], not yet green [^vm-redeploy] |
+
+### Interactive attach (#327, #340)
+
+| #   | Capability              | Required behaviour                                                                                                                                                                                                                                                                                                           | Proven by                                                                                                                                                                | Upholds    | Host matrix                                                   |
+| --- | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------- | ------------------------------------------------------------- |
+| KA1 | Attach round-trips      | Posted bytes echo back through the job's real stdout; a cross-session attach gets observer rights only; detach-then-reattach on the same control session continues interacting with the same live process. Control/data plane against `FakeContainment`, same caveat as KM1.                                                 | `live_attach.rs::real_attach_round_trips_proves_session_fork_and_survives_detach_reattach`, `::the_real_cli_binary_attaches_delivers_output_and_exits_on_job_completion` | #327       | `SANDY_LIVE=1`, no hypervisor                                 |
+| KA2 | Durable reattach token  | A separate `sandy daemon attach` process, started after `submit`, gets post rights via the persisted attach token — against a REAL registered host-executor over the mesh (also the acceptance for "a real remote host registers and accepts dispatch," folded in here since no separate test exercises registration alone). | `live_remote_host_attach.rs::a_real_remote_host_executor_grants_post_rights_to_a_separate_attach_process`                                                                | #263, #327 | operator-run: `SANDY_M2_REMOTE_HOST` + `SANDY_M2_REMOTE_PEER` |
+| KA3 | VM-backed remote attach | `sandy daemon submit --flake` places a VM job on the remote host; a separate attach process types into the booted guest and reads real output, detaches, and a second separate process reattaches with the same durable token.                                                                                               | `live_remote_host_flake_attach.rs::a_separate_attach_process_drives_a_real_vm_booted_on_remote_host`                                                                     | #327, #332 | operator-run [^remote-host], not yet green [^vm-redeploy]     |
+| KA4 | Sandbox-agent TTY       | A VM job runs behind the guest's sandbox agent over vsock, with TTY both ways, no link or cap left in the guest, and a forged cap never starts the job.                                                                                                                                                                      | `live_agent.rs::a_vm_job_runs_behind_the_guest_agent_with_tty_both_ways`, `::a_forged_cap_never_starts_the_vm_job`                                                       | #238       | qemu (`/dev/vhost-vsock`) or vfkit                            |
+
+### Flake-templated direct execution (#325, #326)
+
+Not attach or M2 dispatch — `sandy run --flake` boots locally, like K1 — but
+also not yet in the "Required functionality" table above, so it gets its own
+`KF*` prefix rather than a `K20` this page does not own (#366, open, already
+claims K19/K20 if it merges; see "Not yet a KPI" below).
+
+| #   | Capability                     | Required behaviour                                                                                                                                                    | Proven by                                                                              | Upholds | Host matrix   |
+| --- | ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- | ------- | ------------- |
+| KF1 | `--flake --from-devshell` boot | A devshell-based flake target boots with its `shellHook` run before the ready marker; a host-conditional hook diverges silently in-guest (pinned, not asserted away). | `live_flake_devshell.rs::hello_devshell_boots_hello_reachable_hook_runs_before_marker` | #326    | qemu or vfkit |
+
+Not asserted by a live KPI yet: the archived-transcript delivery path
+(`SANDY_HISTORY_LINES`, `attach.rs::write_archive`) and the
+unlimited-while-attached deadline suspension are covered at integration tier
+only (`sandyd`/`sandy-cli` unit and contract tests); no live row exercises
+either end to end. The VM-backend half of "unlimited while attached" has no
+KPI at all yet — see the "Not yet a KPI" note below.
+
+[^remote-host]:
+    KM4 and KA3 need a remote host already configured and reachable: both
+    `SANDY_M2_REMOTE_HOST` (this orchestrator's own mesh address) and
+    `SANDY_M2_REMOTE_PEER` (the remote host's mesh address), plus a standing
+    `sandy-host-executor` systemd service on that host already dialing this
+    orchestrator. Neither test starts the remote executor itself.
+
+[^vm-redeploy]:
+    KM4 and KA3 are blocked on the remote host's deployed `sandy-host-executor`
+    being rebuilt with #332's VM-capability detection and redeployed; today it
+    still registers `Process` only, so Submit is refused fail-closed ("no
+    registered host declares `SandboxKind::Vm` capability") rather than
+    placing anything. Not counted green until that redeploy happens and the
+    test passes on its matrix (INV-S9).
+
 ## Running the KPI suite
 
 The core sweep (K1-K11, K14) on a host with a hypervisor, e.g. Apple silicon:
@@ -112,6 +180,19 @@ nix shell nixpkgs#vfkit -c \
 
 K13 (egress) runs on Linux as root with `nft` on `PATH`; K12 (real App) needs
 `SANDY_CRED_LIVE_TRUST_ROOT` and is operator-run.
+
+The sweep above also runs KM1/KM2/KA1 (no extra env needed beyond
+`SANDY_LIVE=1`) and KA4 if a hypervisor is present. KM3/KM4/KA2/KA3 live
+in the three `live_remote_host_*` test binaries, in the same `-p sandy-cli
+--features live` sweep, but **fail** (`require_remote_executor` bails, not
+skips, per INV-S9) unless `SANDY_M2_REMOTE_HOST` and `SANDY_M2_REMOTE_PEER`
+are also set. Filter them out of a non-operator run:
+
+```sh
+cargo nextest run -p sandy-cli --features live -E 'not binary(~remote_host)'
+```
+
+or run them deliberately with those two variables set.
 
 ## Planned: egress proxy
 
