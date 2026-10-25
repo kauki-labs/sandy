@@ -15,33 +15,53 @@ virtio-fs shares; an egress allow-list wraps the boot.
 A job boots a real microVM and runs end to end on both backends, verified by
 host-gated live tests on Linux/KVM and Apple-silicon hosts.
 
-## Seams
+## Architecture
 
-Every hard boundary behind the library is a trait with one implementation per
-target — the extension points a new backend, transport, credential provider,
-or egress applier plugs into.
+One `sandy run` is a straight-line pipeline. Every hard boundary in it — a
+backend, a transport, a credential provider, an egress applier — is a seam: a
+trait with one implementation per target, shown below as the boundary around
+the step it owns.
 
 ```mermaid
-flowchart LR
-  subgraph seams["Seams (sandy library)"]
-    VmBackend
-    GuestShareTransport
-    CredentialProvider
-    EgressApplier
+flowchart TD
+  cli["sandy run TEMPLATE<br/>--input / --out / --secret / --credential / --allow"]
+  cli --> plan["parse_run → JobPlan"]
+  plan --> sup["supervisor::run_job<br/>Running record before boot (INV-6)"]
+  sup --> credq{"--credential?"}
+
+  subgraph cred_seam["CredentialProvider seam"]
+    mint["mint → stage token 0600<br/>(revoke at teardown)"]
   end
-  VmBackend --> QemuBackend
-  VmBackend --> VfkitBackend
-  VmBackend --> FakeBackend["FakeBackend (tests)"]
-  GuestShareTransport --> VirtiofsdTransport["VirtiofsdTransport (qemu)"]
-  GuestShareTransport --> VirtioFsTransport["VirtioFsTransport (vfkit)"]
-  CredentialProvider --> GithubAdapter
-  CredentialProvider --> FakeProvider["FakeProvider (tests)"]
-  EgressApplier --> NftablesApplier["NftablesApplier (Linux)"]
-  EgressApplier --> FakeApplier["FakeApplier (tests)"]
+  credq -- yes --> mint
+  credq -- no --> eg
+
+  subgraph egress_seam["EgressApplier seam"]
+    eg["allow-list bracket<br/>plan + enforce around the boot"]
+  end
+  mint --> eg
+
+  subgraph share_seam["GuestShareTransport seam"]
+    stage["stage inputs/outputs/secrets"]
+  end
+  eg --> stage
+
+  subgraph vm_seam["VmBackend seam"]
+    boot["boot guest + console protocol<br/>(qemu on Linux, vfkit on macOS)"]
+  end
+  stage --> boot
+
+  boot --> guest[("microVM<br/>/run/sandy/{inputs,outputs,secrets}")]
+  guest --> collect["collect_outputs → host dests"]
+  collect --> classify["classify_outcome → status + exit band (INV-11)"]
+  classify --> env["ResultEnvelope"]
+  env --> journal[("Journal: terminal record")]
+  env --> render["-o plain (default) | -o json"]
 ```
 
-The run pipeline, each subsystem's design, and the live acceptance matrix are
-in [`docs/architecture/`](docs/architecture/overview.md).
+Each seam's concrete implementations (`QemuBackend`/`VfkitBackend`,
+`VirtiofsdTransport`/`VirtioFsTransport`, `GithubAdapter`,
+`NftablesApplier`), the full subsystem design, and the live acceptance matrix
+are in [`docs/architecture/`](docs/architecture/overview.md).
 
 ## Usage
 
