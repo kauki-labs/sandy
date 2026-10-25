@@ -21,7 +21,8 @@ pub const MAX_TTL_SECS: u32 = 3000;
 /// A capability a job needs at a forge, provider-neutral. Each adapter renders a
 /// capability into provider permissions (GitHub) or scopes plus a role (GitLab);
 /// see the core's `render_github_permissions`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Capability {
     /// Read repository contents.
     ReadCode,
@@ -42,7 +43,7 @@ pub struct Target(pub String);
 
 /// The provider-neutral scope of one credential: the targets it may reach and the
 /// capabilities granted. An adapter renders this onto its provider's own model.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Scope {
     /// Repositories or projects the credential is limited to.
     pub targets: Vec<Target>,

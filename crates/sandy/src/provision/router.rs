@@ -27,7 +27,9 @@ pub fn provision(strategy: ProvisioningStrategy, job: &Job, backend: &impl HostN
     match strategy {
         // HostNix runs via Phase A's backend; the job is forwarded unchanged so
         // nothing enters argv / env / the store (INV-1, B-REQ-5).
-        ProvisioningStrategy::HostNix { arch } => ProvisionOutcome::Provisioned(backend.provision_host_nix(job, &arch)),
+        ProvisioningStrategy::HostNix { arch } => {
+            ProvisionOutcome::Provisioned(Box::new(backend.provision_host_nix(job, &arch)))
+        }
         // Deferred paths refuse with a stage pointer, never touching the backend
         // (B-REQ-7).
         ProvisioningStrategy::BuilderVM { .. } => ProvisionOutcome::Refused {
@@ -89,6 +91,7 @@ mod tests {
                 tail: "done".to_string(),
             },
             warnings: Vec::new(),
+            receipt: None,
         }
     }
 
@@ -113,7 +116,7 @@ mod tests {
             &job,
             &backend,
         );
-        assert_eq!(outcome, ProvisionOutcome::Provisioned(sample_envelope()));
+        assert_eq!(outcome, ProvisionOutcome::Provisioned(Box::new(sample_envelope())));
 
         let received = backend.received.borrow();
         assert_eq!(received.len(), 1, "the provisioner must be called exactly once");
