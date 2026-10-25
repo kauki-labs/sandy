@@ -338,12 +338,26 @@ never the host's.
   and the error path, so a boot failure never leaves rules up.
 - **macOS is a no-op.** `plan_egress_scoped` yields `NoBoundary`; the run proceeds
   without enforcement (documented, not silent).
+- **IP-only matching, no guest DNS (#359).** An allow-list entry is an IPv4
+  address or IPv4 CIDR plus port; matching is by destination IPv4 address and TCP
+  port only — IPv6, UDP, and QUIC from the guest are dropped. The guest gets no
+  DNS through the boundary, so a job must connect by IP. A hostname entry is
+  refused at plan time on the nftables (Linux) path: band 2, no journal record,
+  no boot, naming the entry and #377. nft pins a hostname to one address at
+  ruleset-load time, rejects a name with several addresses, and the guest can't
+  resolve names through the boundary anyway, so a hostname entry only ever helps
+  a job that already connects by IP — refusing it turns that silent no-op into a
+  clear error. macOS enforces no boundary, so a hostname entry stays accepted
+  there (#358). Hostname policy arrives with the #360 egress proxy (#377), which
+  resolves names host-side.
 
 **KPI.**
 
-- Integration: `egress` unit tests (ruleset generation, `plan_egress_scoped`);
-  `cli_jobs` `run_on_linux_applies_the_allow_list_ruleset_and_reverts_it` /
-  `..._macos_applies_no_boundary` / apply-failure-fails-closed (over `FakeApplier`).
+- Integration: `egress` unit tests (ruleset generation, `plan_egress_scoped`,
+  `validate_egress_hosts`); `cli_jobs`
+  `run_on_linux_applies_the_allow_list_ruleset_and_reverts_it` /
+  `..._macos_applies_no_boundary` / apply-failure-fails-closed (over
+  `FakeApplier`) / `run_hostname_allow_on_linux_is_invalid_plan_writes_no_record_and_never_boots`.
 - End-to-end: `live_egress.rs` (Linux + root + `nft`), real nftables around a boot.
 
 ---

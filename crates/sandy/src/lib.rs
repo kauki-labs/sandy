@@ -68,7 +68,7 @@ pub use cred_github::{CALL_DEADLINE, GithubAdapter};
 pub use discovery::{Discovery, Placement, StaticRegistry, parse_builder_systems};
 pub use egress::{
     AllowList, EgressApplier, EgressError, EgressOs, EgressOutcome, EgressPlan, EgressRule, NftablesApplier, enforce,
-    macos_egress_statement, plan_egress, plan_egress_scoped, to_nftables, to_nftables_forward,
+    macos_egress_statement, plan_egress, plan_egress_scoped, to_nftables, to_nftables_forward, validate_egress_hosts,
 };
 pub use error::CoreError;
 pub use gc::{StagedImage, plan_eviction};

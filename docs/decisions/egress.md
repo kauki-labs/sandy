@@ -42,3 +42,34 @@ without enforcement, **documented, not silent**.
 
 **Consequences.** macOS runs are unfiltered by design; the behaviour is stated in
 the result and the docs so it is not mistaken for enforcement.
+
+## 3. nftables matches by IP, not by name
+
+**Status:** accepted. **Upholds:** #359.
+
+**Context.** A live probe (2026-10-25) found that `--allow github.com:443`
+compiled to `ip daddr github.com tcp dport 443 accept`, but nft resolves that
+name once, at ruleset-load time, and pins the single address it got
+(`140.82.121.3`). A name with more than one A record makes nft fail to load the
+ruleset (`Error: Hostname resolves to multiple addresses`). Worse, the guest
+itself can't resolve names through the boundary: the forward rules pass TCP
+only, and DNS is UDP, so a resolver entry in the allow-list doesn't help; and
+when a host-local resolver did answer, it gave the guest a different address
+than the one nft had pinned, so the connection by name still failed. A hostname
+entry in the allow-list therefore only ever helps a job that already connects by
+IP — it never does what `--allow <hostname>` implies.
+
+**Decision.** An allow-list entry must be an IPv4 address or IPv4 CIDR; `plan_egress_scoped`
+refuses a hostname entry on the nftables (Linux) path as an invalid plan
+(band 2, no journal record, no boot), naming the entry and pointing to #377.
+macOS enforces no per-VM boundary, so a hostname entry there is inert rather
+than misleading, and stays accepted (decision 2, #358).
+
+**Consequences.** This is a breaking change for `--allow <hostname>` on Linux: a
+rule that silently never matched is now a clear refusal at plan time. Hostname
+support returns with the #360 egress proxy (#377), which resolves names
+host-side instead of asking nft or the guest to.
+
+**Set aside.** Keeping the hostname rule and warning only: rejected, because a
+rule that looks like it filters by name but doesn't is a worse failure mode than
+refusing to boot.

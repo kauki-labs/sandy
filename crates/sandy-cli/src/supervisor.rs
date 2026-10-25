@@ -20,7 +20,7 @@ use sandy::{
     OutputRef, OutputStatus, ProcessExit, Profile, Provenance, RESULT_SCHEMA_VERSION, ResultEnvelope, Scope,
     SecretSource, StagedImage, Status, VmBackend, classify_backend_error, classify_invalid_plan, classify_outcome,
     enforce, mint_lease, mint_lease_checked, new_job_id, plan_egress_scoped, plan_eviction, reconcile_job,
-    refresh_once_checked, validate_no_secret_leak,
+    refresh_once_checked, validate_egress_hosts, validate_no_secret_leak,
 };
 use zeroize::Zeroizing;
 
@@ -191,8 +191,12 @@ pub fn run_job<B: VmBackend + ?Sized, E: EgressApplier + ?Sized>(
     let spec = plan.as_run_spec();
 
     // 1. Validate the plan. An invalid plan is band 2 with NO journal record and NO backend run — the running record is
-    //    the first thing written, so an empty journal proves the backend was never reached (the silent-run guard).
-    if let Err(plan_error) = validate_no_secret_leak(&spec) {
+    //    the first thing written, so an empty journal proves the backend was never reached (the silent-run guard). A
+    //    hostname allow-list entry is invalid on Linux only (#359): nft pins one address at load time and the guest
+    //    can't resolve names through the boundary anyway, so it is refused here rather than loaded as a rule that never
+    //    matches. macOS enforces no boundary, so a hostname entry there stays accepted.
+    if let Err(plan_error) = validate_no_secret_leak(&spec).and_then(|()| validate_egress_hosts(&plan.allow, egress_os))
+    {
         let classification = classify_invalid_plan(&plan_error);
         let envelope = build_envelope(
             &new_job_id(),

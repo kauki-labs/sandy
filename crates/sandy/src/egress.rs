@@ -16,7 +16,7 @@
 
 pub use sandy_api::egress::{AllowList, EgressApplier, EgressError, EgressOs, EgressOutcome, EgressPlan, EgressRule};
 
-use crate::error::CoreError;
+use crate::{backend::PlanError, error::CoreError};
 
 /// Map the seam's narrow [`EgressError`] into the core's broad [`CoreError`] so a
 /// run's error channel stays `CoreError` while the egress seam keeps a tight,
@@ -209,6 +209,50 @@ pub fn plan_egress_scoped(allow: &AllowList, target_os: EgressOs, iface: Option<
     }
 }
 
+/// Refuse an allow-list entry whose host is not a bare IPv4 address or IPv4 CIDR,
+/// on the nftables (Linux) path (#359).
+///
+/// nft pins a hostname to one address at ruleset-load time, rejects a name with
+/// more than one address, and the guest cannot resolve names through the
+/// boundary anyway (DNS is UDP; the rules pass TCP only) — so a hostname entry
+/// only ever helps a job that already connects by IP. Refusing it here, at plan
+/// time, turns that silent no-op into a clear invalid-plan error (band 2, no
+/// journal record, no boot) instead of loading a rule that never matches.
+///
+/// macOS (vmnet) enforces no per-VM boundary, so a hostname entry there is inert
+/// rather than misleading, and stays accepted (#358). Hostname support returns
+/// with the egress proxy (#360/#377), which resolves names host-side.
+///
+/// # Errors
+///
+/// Returns [`PlanError::Invalid`] naming the first entry that isn't a bare IPv4
+/// address or CIDR, on Linux only.
+pub fn validate_egress_hosts(allow: &AllowList, target_os: EgressOs) -> Result<(), PlanError> {
+    if target_os != EgressOs::Linux {
+        return Ok(());
+    }
+    for rule in &allow.rules {
+        if !is_ipv4_or_cidr(&rule.host) {
+            return Err(PlanError::Invalid(format!(
+                "--allow `{}:{}` is a hostname; the nftables egress boundary matches by IPv4 address or CIDR only \
+                 (see #377 for hostname support)",
+                rule.host, rule.port
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `host` is a bare IPv4 address or `IPv4/prefix` CIDR (0-32).
+fn is_ipv4_or_cidr(host: &str) -> bool {
+    match host.split_once('/') {
+        Some((addr, prefix)) => {
+            addr.parse::<std::net::Ipv4Addr>().is_ok() && prefix.parse::<u8>().is_ok_and(|p| p <= 32)
+        }
+        None => host.parse::<std::net::Ipv4Addr>().is_ok(),
+    }
+}
+
 /// Host-tier applier that loads the ruleset into the Linux kernel via `nft -f -`
 /// and reverts by deleting the [`EGRESS_TABLE`].
 ///
@@ -280,8 +324,58 @@ mod tests {
 
     use super::{
         AllowList, EgressOs, EgressOutcome, EgressPlan, EgressRule, enforce, macos_egress_statement, plan_egress,
-        plan_egress_scoped, to_nftables, to_nftables_forward,
+        plan_egress_scoped, to_nftables, to_nftables_forward, validate_egress_hosts,
     };
+    use crate::backend::PlanError;
+
+    /// One allow-list rule for `host:port`.
+    fn allow_one(host: &str, port: u16) -> AllowList {
+        AllowList {
+            rules: vec![EgressRule {
+                host: host.to_string(),
+                port,
+            }],
+        }
+    }
+
+    /// #359: on Linux a hostname entry is refused at plan time, naming the entry
+    /// and #377 — nft pins one address at load time, rejects a name with several
+    /// addresses, and the guest can't resolve names through the boundary anyway.
+    #[test]
+    fn linux_refuses_a_hostname_allow_entry_naming_it_and_377() {
+        for host in ["github.com", "one.one.one.one"] {
+            let err = validate_egress_hosts(&allow_one(host, 443), EgressOs::Linux)
+                .expect_err(&format!("a hostname entry `{host}` must be refused on Linux"));
+            let PlanError::Invalid(msg) = err else {
+                panic!("expected PlanError::Invalid, got {err:?}");
+            };
+            assert!(msg.contains(host), "the error must name the entry: {msg}");
+            assert!(msg.contains("377"), "the error must point to #377: {msg}");
+        }
+    }
+
+    /// #359: an IPv4 address or IPv4 CIDR entry is accepted on Linux — the
+    /// nftables boundary matches by address, not name.
+    #[test]
+    fn linux_accepts_an_ipv4_address_or_cidr_allow_entry() {
+        for host in ["1.1.1.1", "10.0.0.0/8"] {
+            assert!(
+                validate_egress_hosts(&allow_one(host, 443), EgressOs::Linux).is_ok(),
+                "an IPv4 entry `{host}` must be accepted on Linux"
+            );
+        }
+    }
+
+    /// #358/#377: macOS enforces no per-VM boundary, so a hostname entry there is
+    /// inert rather than misleading, and stays accepted until the egress proxy
+    /// lands.
+    #[test]
+    fn macos_accepts_a_hostname_allow_entry() {
+        assert!(
+            validate_egress_hosts(&allow_one("github.com", 443), EgressOs::MacOs).is_ok(),
+            "macOS has no per-VM boundary; a hostname entry is harmless there"
+        );
+    }
 
     /// D-REQ-3 (positive translation): each allowed `host:port` appears in the
     /// ruleset, a default-deny is present, and an unlisted host is absent.
