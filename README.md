@@ -100,6 +100,30 @@ job model (see [`docs/decisions/sandyd.md`](docs/decisions/sandyd.md)).
 orchestrator dispatching to a Linux executor, or any other OS pairing. All of
 `sandyd`'s config is environment variables, no CLI flags:
 
+```mermaid
+flowchart LR
+  subgraph orch["Orchestrator host"]
+    cli["sandy daemon submit/attach"] -->|UDS, SANDY_SOCK| sandyd["sandyd<br/>JobStore + HostRegistry"]
+  end
+  subgraph mesh["Mesh (WireGuard/Tailscale)"]
+    direction LR
+    chan1["SANDY_MESH_LISTEN<br/>dispatch + registration"]
+    chan2["SANDY_MESH_AGENT_LINK_LISTEN<br/>job agent link"]
+  end
+  subgraph exec["Executor host (allowlisted)"]
+    hostexec["sandy-host-executor"] --> agent["sandy-agent<br/>(SANDY_AGENT_PATH)"]
+    agent --> job(("job process"))
+  end
+  sandyd -->|Dispatch: argv/v1 manifest| chan1
+  chan1 --> hostexec
+  agent -->|authenticated link| chan2
+  chan2 --> sandyd
+```
+
+Full operational detail (placement, the isolation-class re-check, the attach
+relay, transcript archival) is the control-plane diagram in
+[`docs/architecture/overview.md`](docs/architecture/overview.md#the-control-plane-sandyd-the-host-executor-interactive-attach).
+
 ```sh
 # orchestrator host
 SANDY_SOCK=/tmp/sandyd.sock \
