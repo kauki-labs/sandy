@@ -112,13 +112,18 @@ grep -q "sandyd listening" "$sandyd_log" || {
 }
 
 echo "==> syncing this checkout to $executor_ssh:$remote_dir" >&2
-ssh "$executor_ssh" "mkdir -p '$remote_dir'"
+# Wipe and recreate fresh: `rsync --delete --files-from` only prunes among the
+# listed paths, so a file dropped from git tracking since a previous run of
+# this script against the same remote_dir could otherwise linger there
+# indefinitely, defeating the git-ls-files filter below for exactly the stale
+# leftover case it exists to prevent.
+ssh "$executor_ssh" "rm -rf '$remote_dir' && mkdir -p '$remote_dir'"
 # Only git-tracked files: rsyncing the whole tree (even with excludes) drops
 # .git, so Nix treats the remote dir as a non-git path: flake that ignores
 # .gitignore entirely — an untracked secret (.env, a local credential file)
 # would otherwise ship into the remote build's flake source verbatim.
 git -C "$repo_root" ls-files -z >"$filelist"
-rsync -az --delete --from0 --files-from="$filelist" "$repo_root/" "$executor_ssh:$remote_dir/"
+rsync -az --from0 --files-from="$filelist" "$repo_root/" "$executor_ssh:$remote_dir/"
 
 echo "==> building sandy-agent + sandy-host-executor remotely" >&2
 agent_store_path=$(ssh "$executor_ssh" "cd '$remote_dir' && nix build .#sandy-agent --no-link --print-out-paths")
