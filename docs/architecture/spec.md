@@ -184,7 +184,9 @@ flowchart LR
   `(dev, ino)` the caller validated before building the spec; `plan_shares`
   reopens it with `OwnedDir::open_matching`, refusing a same-uid, same-mode
   directory swapped in at that path since. See decision 13 in
-  `docs/decisions/guest-shares.md`.
+  `docs/decisions/guest-shares.md`. This protects the staging reopen only: the
+  later transport resolves `ShareSpec.host_dir` by path, so a path replacement
+  after `plan_shares` returns remains a transport-level limitation.
 
 **KPI.**
 
