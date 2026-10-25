@@ -8,14 +8,77 @@ integration (tier-2, CI) and end-to-end (tier-3, live). Read
 consequences, the alternative set aside) is in [`../decisions/`](../decisions).
 The live **KPIs** are consolidated as an acceptance matrix in [`kpi.md`](kpi.md).
 
-Invariants referenced here: **INV-1** secrets never reach argv/env/the store;
-**INV-3** liveness only through `VmBackend::boxes` + the job flock, never a direct
-registry read; **INV-6** a `Running` record is written before the backend runs and
-a terminal record always carries the envelope; **INV-7** fail-closed (a mint or
-egress-apply failure is an infra fault, never a degraded run); **INV-8** the
-`Outcome` wire record is pinned `snake_case`; **INV-11** `status` ⇔ `retryable` ⇔
-process exit band never disagree; **INV-S9** a live scenario is never counted green
-from a fake.
+Invariants referenced here: **INV-1** secrets never reach argv/env/the store
+([attacker model](#attacker-model)); **INV-3** liveness only through
+`VmBackend::boxes` + the job flock, never a direct registry read ([attacker
+model](#attacker-model)); **INV-6** a `Running` record is written before the
+backend runs and a terminal record always carries the envelope; **INV-7**
+fail-closed (a mint or egress-apply failure is an infra fault, never a degraded
+run) ([attacker model](#attacker-model)); **INV-8** the `Outcome` wire record is
+pinned `snake_case`; **INV-11** `status` ⇔ `retryable` ⇔ process exit band never
+disagree; **INV-S9** a live scenario is never counted green from a fake.
+
+---
+
+## Attacker model
+
+The security invariants above assume a hostile job inside the sandbox. The
+[Agent Compute Engine design](https://cloud.google.com/blog/topics/ai-infrastructure/agent-compute-engine-deep-dive)
+(accessed 2026-10-24) states the same baseline: assume the attacker controls
+everything inside the sandbox, and leave nothing useful there to find.
+
+**Actors.**
+
+| Actor                                     | Defended by                                                                |
+| ----------------------------------------- | -------------------------------------------------------------------------- |
+| hostile job in the guest                  | covered in depth below                                                     |
+| sibling job on the same executor host     | `sandyd.md` decision 6 (per-run link token)                                |
+| a mesh peer that isn't the right executor | `sandyd.md` decisions 6, 12                                                |
+| over-reaching submitter                   | `sandyd.md` decision 11 (submitter caps)                                   |
+| another local user on the controller      | staging-base and trust-root checks (#138, `credential-seam.md` decision 4) |
+
+**Isolation class.** The hostile-job model applies to the VM backends,
+`QemuBackend` and `VfkitBackend`: a hostile job runs inside their strong
+boundary. The process backend is trusted-only and never admits an untrusted
+job, with any containment, on any host (`process-containment.md` decision 6,
+#150), so a hostile job on the process backend is outside this model by
+policy, not by luck.
+
+**The hostile job, in depth.** A compromised guest can run arbitrary code as
+root inside the guest, read anything mounted or exported into the job (inputs,
+the secret share, its own outputs), and reach anything the egress allow-list
+permits.
+
+The design still guarantees, even from inside a compromised guest:
+
+- no trust-root key and no channel signing key ever reach the guest
+  (`credential-seam.md` decisions 2 and 4);
+- no agent capability token in the job's environment;
+- on qemu, input and secret shares stay read-only enforced host-side by
+  `--readonly` on `virtiofsd`: a guest-root remount-rw still gets `EROFS` on
+  write.
+
+It does not guarantee:
+
+- **vfkit's RO shares are guest-cooperative, not host-enforced.** vfkit's
+  virtio-fs device has no read-only option, so RO rests on the guest's own
+  `ro` mount; a guest-root remount-rw can defeat it (`guest-shares.md`
+  decision 2). Each share is a single per-run dir wiped at teardown, so the
+  damage is confined to that run's own staging, not a host escape.
+- **token exfiltration, bounded by revocation, not TTL.** The minted forge
+  token is staged on the secret share and exported in-guest as
+  `$GITHUB_TOKEN` (`credential-seam.md` decisions 2-3); egress has to allow
+  the forge for git to work. A hostile job can read and exfiltrate the
+  token. The copy stays usable only until the controller revokes it: at the
+  next refresh (which supersedes and revokes the stale token,
+  `credential-seam.md` decision 3) or at job teardown at the latest
+  (`credential-seam.md` decision 1's revoke-on-every-path), whichever comes
+  first, not its full native TTL. The token is also narrowly scoped.
+  Recorded as an interim risk in `credential-seam.md`.
+- **guest-to-host traffic on Linux.** The egress ruleset filters the forward
+  chain only (`egress.md` decision 1); traffic the guest sends to the host
+  itself is not filtered. #376 tracks closing this.
+- **no egress boundary at all on macOS** (`egress.md` decision 2, #358).
 
 ---
 

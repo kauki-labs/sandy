@@ -31,7 +31,10 @@ it would turn a credential outage into a silent task failure.
 
 ## 2. Trust root, not a shared server
 
-**Status:** accepted. **Upholds:** INV-1 (the minted token is a secret).
+**Status:** accepted. **Upholds:** INV-1 for the trust root, which never
+leaves the controller. The per-job installation token is a stated interim
+exception to INV-1 (it reaches the guest's environment); see the residual
+risk below.
 
 **Context.** Handing every job a long-lived shared token is a broad blast radius;
 a central token-minting service is another thing to run and secure.
@@ -44,6 +47,22 @@ secret, delivered over the secret channel.
 **Consequences.** Each job gets a narrow, short-lived token; the trust root never
 leaves the controller. The provider is a seam (`CredentialProvider`), so GitLab
 or another forge is a new adapter.
+
+**Residual risk, interim.** The installation token is staged on the secret
+share and the guest login shell exports it as `$GITHUB_TOKEN`, so a hostile job
+can read and exfiltrate it (see
+[`spec.md`'s attacker model](../architecture/spec.md#attacker-model)). A copied
+token stays usable only until the controller revokes it: at the next refresh,
+which supersedes and revokes the stale token (decision 3), or at job teardown
+at the latest, which revokes the live token on every path (decision 1) —
+whichever comes first, not the token's full native TTL. The token's narrow
+scope bounds the damage further, but egress has to allow the forge for git to
+work at all, so the token leaving with the job is not prevented today. The
+exit is an in-flight token swap at the #360 mediation
+proxy, tracked in #372: the proxy terminates TLS and inserts the token on the
+wire as the request leaves, so the token never has to sit in the guest. #360's
+v1 deliberately leaves TLS termination out, so the swap waits on #372. If #372
+is dropped, this residual risk becomes a permanent, accepted one.
 
 ## 3. Mid-run refresh
 
