@@ -291,3 +291,62 @@ the tree than the immediate parent (grandparent and above): still out of scope �
 the immediate-parent sticky check (#141, above) closes the attacker-writable-`TMPDIR`
 gap, and walking the whole ancestry would recurse indefinitely for no gain on
 sandy's supported configurations.
+
+## 13. Validated directories are re-checked by fingerprint, not trusted by path alone (CWE-367)
+
+**Status:** accepted. **Upholds:** INV-1.
+
+**Context.** #321 (L-11) closed the TOCTOU window between the staging base's own
+validation and `private_staging_dir`'s child-directory creation by keeping the
+validated `OwnedDir` handle alive. Downstream of that, though, the credential
+path (`run_credentialed` in `sandy-cli`) and the guest-share path (`plan_shares`)
+each still converted a validated directory back to a bare path and re-resolved
+it later: `run_credentialed` called `.path().to_path_buf()` on the handle
+`private_staging_dir` returned, and `plan_shares` reopened a caller's
+`secret_dir` with `OwnedDir::open(dir)`. A same-uid, same-mode directory swapped
+in at that path between validation and the later reopen passed the owner/mode
+check exactly as the original did, and would have received the minted token or
+the guest-share secret bytes instead (#323).
+
+**Decision.** Every directory validated ahead of its use now carries its
+`(dev, ino)` fingerprint (`OwnedDir::dev_ino`) alongside its path, checked at
+reopen time with `OwnedDir::open_matching`, which refuses unless the fingerprint
+still matches. Two call chains use it:
+
+- **Credential staging.** `run_credentialed` captures the fingerprint from the
+  `OwnedDir` `private_staging_dir` returns, before converting it to a path for
+  cleanup bookkeeping. `mint_lease_checked` and `refresh_once_checked` (new,
+  fingerprint-taking siblings of `mint_lease`/`refresh_once`) check it on the
+  initial mint and on every mid-run refresh, so the token is never staged into a
+  directory other than the one actually validated.
+- **Guest shares.** `RunSpec::secret_dir` carries `(path, DirFingerprint)`
+  instead of a bare path, since a backend only ever receives the spec, never
+  the caller's live handle, across the `VmBackend` seam. `plan_shares` reopens
+  it with `open_matching` against that fingerprint.
+
+**Consequences.** A directory fingerprint, not a live file descriptor, crosses
+the `VmBackend` trait boundary: `sandy-api`'s `RunSpec` stays a plain data/error
+contract with no dependency on `sandy-fsutil`'s `OwnedDir` behavior. The
+fingerprint is as strong as the owner/mode check it rides alongside, but not
+stronger than the filesystem's own inode allocation: an attacker who can force
+inode reuse (`rmdir` the original, then `mkdir` a substitute before any other
+allocation claims the freed inode) could in principle pass the check too. This
+is a narrower, more contrived race than the same-uid/same-mode swap the
+fingerprint actually targets, and `private_staging_dir`'s random per-run naming
+(`<prefix>-<random>`) means the attacker must also predict or observe that name
+before the swap. Tracked, not fixed here: #400 covers closing it by keeping the
+live handle open for the run's duration instead of a point-in-time fingerprint,
+and the share transports (virtiofsd, vfkit, `LocalDirTransport`) still bind by
+path after `plan_shares` returns, same as before this fix.
+
+**Set aside.** Threading the live `OwnedDir` handle itself across `RunSpec`
+(a `&'a OwnedDir` field): rejected for this PR — it would pull `sandy-fsutil`
+into `sandy-api`'s dependency graph, which `sandy-api` deliberately keeps free
+of filesystem behavior (data/error types only), and every other crate that
+builds a `RunSpec` with `secret_dir: None` would need no change either way, so
+the blast radius is the same regardless; the fingerprint was chosen as the
+smaller, equally-sanctioned change. Changing `mint_lease`'s/`refresh_once`'s own
+signatures to always require a fingerprint: rejected — both have call sites
+(the trust-root verify probe, tests, the live GitHub test) that mint into a
+directory validated moments earlier in the same call, with no TOCTOU window to
+close; `mint_lease_checked`/`refresh_once_checked` are additive siblings instead.

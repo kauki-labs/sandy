@@ -180,6 +180,21 @@ pub struct Grants {
     pub shares: bool,
 }
 
+/// A directory's device and inode, fingerprinting the exact filesystem object an
+/// already-open, already-validated handle named (#323) — not just its path. A
+/// consumer that must re-open the directory by path (a [`VmBackend`] receives only
+/// [`RunSpec::secret_dir`]'s path, never the caller's live handle) checks the
+/// reopen against this instead of trusting owner/mode alone: a same-uid,
+/// same-mode directory swapped in at that path since would carry a different
+/// fingerprint and is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirFingerprint {
+    /// The device the directory's inode lives on.
+    pub dev: u64,
+    /// The directory's inode number.
+    pub ino: u64,
+}
+
 /// A fully desugared request to run one job in one box.
 #[derive(Debug)]
 pub struct RunSpec<'a> {
@@ -213,13 +228,22 @@ pub struct RunSpec<'a> {
     /// `Some(path)` writes the outcome record to a file (D2, ssh); `None` uses
     /// fd3 (local).
     pub outcome_file: Option<&'a Path>,
-    /// `Some(dir)` stages secrets into, and shares the guest secret mount from,
-    /// this caller-owned directory instead of a fresh per-run staging dir. It lets
-    /// the caller rewrite a staged secret while the guest runs (credential refresh
-    /// re-delivery, #49): the directory is the live virtiofs share, so a rewrite is
-    /// seen in-guest. `None` uses the backend's own staging dir (the default). The
-    /// caller owns the directory's lifetime, the backend never wipes it.
-    pub secret_dir: Option<&'a Path>,
+    /// `Some((dir, fingerprint))` stages secrets into, and shares the guest secret
+    /// mount from, this caller-owned directory instead of a fresh per-run staging
+    /// dir. It lets the caller rewrite a staged secret while the guest runs
+    /// (credential refresh re-delivery, #49): the directory is the live virtiofs
+    /// share, so a rewrite is seen in-guest. `None` uses the backend's own staging
+    /// dir (the default). The caller owns the directory's lifetime, the backend
+    /// never wipes it.
+    ///
+    /// `fingerprint` is the `(dev, ino)` the caller's own validation of `dir`
+    /// captured before building this spec (#323): since the backend only gets
+    /// `dir`'s path here, not the caller's live handle, it re-opens `dir` by path
+    /// and must refuse unless that reopen still matches `fingerprint` — a
+    /// same-uid, same-mode directory swapped in at `dir` between the caller's
+    /// validation and this call would otherwise pass the owner/mode check alone
+    /// and bind secret staging to the substitute instead.
+    pub secret_dir: Option<(&'a Path, DirFingerprint)>,
 }
 
 /// The physical outcome of a run, mirroring nix-vm's `snake_case` record 1:1

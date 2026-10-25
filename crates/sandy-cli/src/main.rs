@@ -828,13 +828,22 @@ fn run_credentialed(
     })?;
     // A fresh 0700 dir under the validated staging base, randomly named: a
     // predictable /tmp path could be pre-created by another user (#192).
-    let cred_dir = sandy_fsutil::private_staging_dir("cred")
-        .map_err(|e| {
-            eprintln!("sandy: create credential staging dir: {e}");
-            ProcessExit::InfraFault.code()
-        })?
-        .path()
-        .to_path_buf();
+    let cred_handle = sandy_fsutil::private_staging_dir("cred").map_err(|e| {
+        eprintln!("sandy: create credential staging dir: {e}");
+        ProcessExit::InfraFault.code()
+    })?;
+    // Captured here, not re-derived later: the fingerprint is this validation's
+    // own binding to the directory it just created (#323), carried alongside the
+    // bare path every downstream re-open (mint, refresh, the backend's guest-share
+    // staging) is checked against, instead of trusting a same-uid, same-mode
+    // directory swapped in at the path afterward.
+    let (dev, ino) = cred_handle.dev_ino().map_err(|e| {
+        eprintln!("sandy: fingerprint credential staging dir: {e}");
+        ProcessExit::InfraFault.code()
+    })?;
+    let cred_fingerprint = sandy::DirFingerprint { dev, ino };
+    let cred_dir = cred_handle.path().to_path_buf();
+    drop(cred_handle);
     // Removed on every exit from here, a panic included, not only a normal return.
     let _cleanup = RemoveDirOnDrop(cred_dir.clone());
     let result = supervisor::run_job_with_credential(
@@ -848,6 +857,7 @@ fn run_credentialed(
         &scope,
         "GITHUB_TOKEN",
         &cred_dir,
+        cred_fingerprint,
         sandy::MAX_TTL_SECS,
     );
     result.map_err(|e| {
