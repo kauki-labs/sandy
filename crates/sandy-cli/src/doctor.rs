@@ -120,7 +120,32 @@ pub fn run_doctor() -> DoctorResult {
         return refusal;
     }
 
+    // #198: an existing trust-roots dir that is group/world-writable or
+    // foreign-owned is reported up front, with the same guidance the write
+    // paths (register/import/deregister) have given since #194. Reported, not
+    // repaired or blocked: a doctor run with no trust root registered yet must
+    // still succeed.
+    if let Some(refusal) = trust_roots_result() {
+        return refusal;
+    }
+
     fs_result
+}
+
+/// `sandy doctor`'s check of the trust-roots dir: `None` when it is missing or
+/// private, `Some` refusal naming the #194 guidance otherwise.
+fn trust_roots_result() -> Option<DoctorResult> {
+    let dir = crate::app_register::trust_roots_dir().ok()?;
+    trust_roots_result_for(&dir)
+}
+
+/// [`trust_roots_result`]'s pure core, over a given dir, so tests never touch
+/// the real `$XDG_CONFIG_HOME`.
+fn trust_roots_result_for(dir: &Path) -> Option<DoctorResult> {
+    sandy::check_trust_roots_dir(dir).err().map(|e| DoctorResult {
+        exit_code: ProcessExit::InvalidPlan.code(),
+        message: format!("sandy doctor: {e}"),
+    })
 }
 
 /// The macOS native-boot (vfkit) prerequisite verdict.
@@ -301,6 +326,69 @@ mod tests {
             "names the machines file actually checked: {}",
             builder.message
         );
+    }
+
+    /// #198: a group/world-writable trust-roots dir is reported, with the
+    /// same `chmod 700` guidance the write paths give since #194.
+    #[test]
+    fn trust_roots_result_reports_a_wide_dir() -> anyhow::Result<()> {
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        let tmp = tempfile::tempdir()?;
+        let dir = tmp.path().join("trust-roots");
+        fs::create_dir(&dir)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o775))?;
+
+        let result = super::trust_roots_result_for(&dir).expect("a 0775 trust-roots dir must be reported");
+        assert_eq!(result.exit_code, 2);
+        assert!(
+            result.message.contains("chmod 700"),
+            "expected the #194 chmod guidance, got: {}",
+            result.message
+        );
+        Ok(())
+    }
+
+    /// A `0700` trust-roots dir is private; doctor reports nothing for it.
+    #[test]
+    fn trust_roots_result_is_silent_for_a_private_dir() -> anyhow::Result<()> {
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        let tmp = tempfile::tempdir()?;
+        let dir = tmp.path().join("trust-roots");
+        fs::create_dir(&dir)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+
+        assert!(super::trust_roots_result_for(&dir).is_none());
+        Ok(())
+    }
+
+    /// A trust-roots dir that doesn't exist yet (no trust root registered) is
+    /// not reported: doctor must not require one up front.
+    #[test]
+    fn trust_roots_result_is_silent_when_the_dir_is_missing() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let dir = tmp.path().join("trust-roots");
+        assert!(super::trust_roots_result_for(&dir).is_none());
+        Ok(())
+    }
+
+    /// `trust_roots_result_for` never changes the dir's mode: it reports, it
+    /// does not repair (#198).
+    #[test]
+    fn trust_roots_result_never_changes_permissions() -> anyhow::Result<()> {
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        let tmp = tempfile::tempdir()?;
+        let dir = tmp.path().join("trust-roots");
+        fs::create_dir(&dir)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o775))?;
+
+        let _ = super::trust_roots_result_for(&dir);
+
+        let mode = fs::metadata(&dir)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o775, "doctor must never repair the dir's mode");
+        Ok(())
     }
 
     /// The refusal names a `SANDY_NIX_MACHINES_FILE` override path, not the
