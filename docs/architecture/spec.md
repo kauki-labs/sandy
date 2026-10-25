@@ -279,6 +279,15 @@ sequenceDiagram
 - **Mid-run refresh.** With a huge margin + short tick the refresh thread re-mints
   and rewrites the live secret file, so a long job's `git credential fill` serves a
   fresh token; the guest never sees the value on argv/console.
+- **Terminal journal write deferred until redaction is final (#322).** The
+  non-credentialed path still writes its terminal record inside `run_job`, right
+  after its one redaction pass. `run_job_with_credential` instead runs the shared
+  core without writing that record, joins the refresh thread, re-redacts the
+  console against every token the run ever had live, folds in a revoke-failure
+  warning if any, and only then writes the terminal record — once. Before this,
+  `run_job` wrote a terminal record redacted against only the initial token, and
+  `run_job_with_credential` amended it after the fact; a crash in that window left
+  a permanent record with a refreshed token unredacted. See INV-6 (§7).
 - **`gc` sweeps a leaked `cred-*`/`verify-*` staging dir (#195).** The drop guard
   that removes `cred_dir`/the verify probe's temp dir runs on every normal exit
   and on panic, but not on SIGKILL or a crash before it runs; `sandy gc` sweeps any
@@ -312,6 +321,9 @@ sequenceDiagram
   bracket, `should_refresh`);
   `mint_lease_checked_refuses_a_dir_swapped_in_after_validation` (adversarial,
   #323); the supervisor's mint-fails-closed test;
+  `credentialed_run_writes_the_terminal_record_once_after_refresh_redaction`
+  (decision 7 of `credential-seam.md`: the deferred write, exactly once, after
+  refresh redaction);
   `sandy-fsutil`'s `sweep_stale_staging_dirs` tests (sweeps a stale dir, keeps a
   fresh one, ignores an unrelated prefix, continues past an injected removal
   failure deterministically via `sweep_stale_staging_dirs_with`, supplemented
@@ -357,6 +369,18 @@ never the host's.
   no guest DNS is resolved or trusted.
 - **macOS is a no-op.** `plan_egress_scoped` yields `NoBoundary`; the run proceeds
   without enforcement (documented, not silent).
+- **IP-only matching, no guest DNS (#359).** An allow-list entry is an IPv4
+  address or IPv4 CIDR plus port; matching is by destination IPv4 address and TCP
+  port only — IPv6, UDP, and QUIC from the guest are dropped. The guest gets no
+  DNS through the boundary, so a job must connect by IP. A hostname entry is
+  refused at plan time on the nftables (Linux) path: band 2, no journal record,
+  no boot, naming the entry and #377. nft pins a hostname to one address at
+  ruleset-load time, rejects a name with several addresses, and the guest can't
+  resolve names through the boundary anyway, so a hostname entry only ever helps
+  a job that already connects by IP — refusing it turns that silent no-op into a
+  clear error. macOS enforces no boundary, so a hostname entry stays accepted
+  there (#358). Hostname policy arrives with the #360 egress proxy (#377), which
+  resolves names host-side.
 - **Planned: a NIC-less guest with a vsock host proxy (#360).** The guest gets
   no NIC. `sandy-agent egress-relay` serves `127.0.0.1:3128` in the guest and
   sets `HTTP(S)_PROXY` for the job. Each CONNECT crosses vsock to a per-run host
@@ -371,9 +395,11 @@ never the host's.
 
 **KPI.**
 
-- Integration: `egress` unit tests (ruleset generation, `plan_egress_scoped`);
-  `cli_jobs` `run_on_linux_applies_the_allow_list_ruleset_and_reverts_it` /
-  `..._macos_applies_no_boundary` / apply-failure-fails-closed (over `FakeApplier`).
+- Integration: `egress` unit tests (ruleset generation, `plan_egress_scoped`,
+  `validate_egress_hosts`); `cli_jobs`
+  `run_on_linux_applies_the_allow_list_ruleset_and_reverts_it` /
+  `..._macos_applies_no_boundary` / apply-failure-fails-closed (over
+  `FakeApplier`) / `run_hostname_allow_on_linux_is_invalid_plan_writes_no_record_and_never_boots`.
 - End-to-end: `live_egress.rs` (Linux + root + `nft`), real nftables around a boot,
   including the host-destined case (an empty allow-list plus a host-local
   resolver: the guest can't resolve names through it and can't connect to the
@@ -485,7 +511,30 @@ owner.
 
 - **Running before boot (INV-6).** The `Running` record is the first write, so an
   empty journal proves the backend was never reached; the terminal record always
-  carries the envelope.
+  carries the envelope. The non-credentialed path writes that terminal record
+  right after its own redaction pass. The credentialed path (`run_job_with_credential`,
+  #322) defers it instead: the shared core runs without writing one, and only after
+  the refresh thread has joined and the console is re-redacted against every token
+  the run ever had live does the terminal record get written, once — never a first
+  write against the initial token alone, amended afterward.
+- **The one terminal write guards against a concurrent `kill`, not against
+  `reconcile_job`'s own liveness guess.** `write_terminal_record` (both paths)
+  persists through `JournalWriter::persist_if_still_running`: it takes the job
+  flock and re-reads before writing. It skips the write, and returns `false`,
+  only when the current record already carries a REAL envelope — `kill`'s
+  `Cancelled` — never overwriting that result. `reconcile_job`'s `Crashed`
+  carries no envelope: it is a liveness inference ("the box is gone"), and
+  `run_job_core` never updates `box_id` on the `Running` record, so that
+  inference never even reaches the box check and fires on flock-freeness
+  alone for the whole run, not only during finalization. The live owner's own
+  write — proof the inference was wrong — overwrites it rather than losing to
+  a stale guess. When the write is skipped (a real competing result), the
+  caller returns `CoreError::State`, mapped like any other journal fault to
+  `ProcessExit::InfraFault` (band 3, retryable) at the `run_job_with_credential`
+  call site (`main.rs`); it returns no envelope for this path, unlike a normal
+  run. A failed write (I/O error, not this race) is folded into the returned
+  envelope's `warnings` (L-12) as well as logged, on both paths, so the caller
+  never sees an ordinary success with a missing INV-6 record.
 - **Reconcile through the seam (INV-3).** `ls`/`status`/`wait`/`kill`/`gc` reach
   running state via `reconcile_job` + `VmBackend::boxes` under the job flock, never
   a direct registry read, so a crashed owner is reconciled to a terminal state.
@@ -493,7 +542,14 @@ owner.
 **KPI.**
 
 - Integration: `journal` unit tests; `cli_jobs` ops (`ls`/`status`/`wait`/`kill`/`gc`,
-  reconcile of a dead box).
+  reconcile of a dead box);
+  `credentialed_run_writes_the_terminal_record_once_after_refresh_redaction`
+  (`supervisor.rs`, via `CountingJournal`: one write, after refresh redaction);
+  `persist_if_still_running_never_overwrites_an_already_terminal_record` (a
+  real `kill` `Cancelled` stands); `persist_if_still_running_overwrites_an_envelope_less_reconcile_crash`
+  (an envelope-less `reconcile_job` `Crashed` loses to the live owner's write);
+  `credentialed_run_refuses_to_report_a_result_the_journal_never_recorded`
+  (a forced skip returns `Err`, not the local result).
 - End-to-end: `live_boot.rs::cli_lifecycle_over_a_real_job` (the ops over a real job).
 
 ---
