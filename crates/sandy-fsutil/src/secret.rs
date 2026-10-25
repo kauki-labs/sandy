@@ -25,6 +25,16 @@ pub struct OwnedDir {
     path: PathBuf,
 }
 
+/// Exposes the validated handle so a caller outside this module can `openat`
+/// a file relative to it, the way [`OwnedDir::write_secret`] does internally:
+/// everything after the directory check happens on this fd, never a path
+/// re-resolved after it was validated.
+impl std::os::fd::AsFd for OwnedDir {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.handle.as_fd()
+    }
+}
+
 impl OwnedDir {
     /// Build an already-open, already-validated directory handle directly, with no
     /// second open-by-path.
