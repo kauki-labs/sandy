@@ -148,7 +148,7 @@ fn build_egress_receipt(result: &Result<EgressOutcome, String>, allow: &AllowLis
 /// Build the receipt for a run that reached backend execution (#361). `who` is
 /// always the local uid today (`authenticated: false`): no run path yet derives
 /// it from a verified submitter cap — sandyd's dispatch core does not persist a
-/// receipt at all yet (follow-up filed alongside #361). `credential` starts
+/// receipt at all yet (#413). `credential` starts
 /// `None`; [`run_job_with_credential`] fills it in after teardown.
 fn build_host_observed(
     job_id: &str,

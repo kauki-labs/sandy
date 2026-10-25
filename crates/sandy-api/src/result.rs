@@ -154,7 +154,8 @@ pub struct Location {
     /// The dispatching executor's host id, for a sandyd-dispatched job
     /// (`docs/decisions/sandyd.md` decision 12). `None` for a direct
     /// `sandy run`, and for a sandyd job today — dispatch-core does not yet
-    /// persist a receipt at all (tracked in the follow-up filed with #361).
+    /// persist a receipt at all (#413 tracks wiring a dispatched job's
+    /// host-observed fields once it does).
     pub executor_host_id: Option<String>,
     /// The executor's mesh IP, same conditions as `executor_host_id`.
     pub executor_mesh_ip: Option<String>,

@@ -307,7 +307,7 @@ flowchart TD
     cap's verified `scope.peer` with `authenticated: true`, or the local uid
     with `authenticated: false` — today always the local uid: no run path yet
     derives a verified submitter cap, since sandyd's dispatch core does not
-    persist a receipt at all yet, follow-up filed alongside #361); `what`
+    persist a receipt at all yet, tracked in #413); `what`
     (job id, template ref, and `Option`s for a resolved store path and a
     manifest digest — both `None` today, honestly, rather than an empty-string
     placeholder: no run path threads a resolved store path or a manifest

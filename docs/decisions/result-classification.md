@@ -111,7 +111,7 @@ direct `sandy run`, and no run path yet derives `who` from a verified
 submitter cap or reports a job-start timestamp distinct from boot. sandyd's
 dispatch core does not persist a receipt — or any envelope — for a dispatched
 job at all yet, so `who.authenticated` is `false` on every run this version
-ships (follow-up filed alongside #361, not faked by hand-building a `Cap` in a
+ships (#413 tracks the wiring, not faked by hand-building a `Cap` in a
 test that calls itself "sandyd-path"). `egress`'s enforcement reads the same
 `EgressOutcome` that already drives `run_job`'s enforce/revert bracket — not a
 second copy of the logic, and the same signal #358's warning surfaces.
