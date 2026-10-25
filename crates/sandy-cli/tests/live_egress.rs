@@ -531,7 +531,8 @@ fn empty_allow_list_blocks_all_guest_egress() -> anyhow::Result<()> {
 ///   40 — route up, name RESOLVED through the host resolver (DNS exfiltration leak)
 ///   41 — route up, name unresolved, but host address TCP-reachable (host service leak)
 ///   42 — both leaked
-///   30-33/10 — guest networking broke before the probes ran (see [`egress_check_script`])
+///   30-34/10 — guest networking broke before the probes ran, or `getent` is
+///   missing (see [`egress_check_script`])
 fn host_block_check_script(host_addr: &str, probe_name: &str) -> String {
     format!(
         r#"set -u
@@ -556,6 +557,7 @@ if [ "$route" = no ]; then
   exit 10
 fi
 resolved=fail
+command -v getent >/dev/null 2>&1 || exit 34
 if timeout 5 getent hosts {probe_name} >/dev/null 2>&1; then resolved=ok; fi
 connected=fail
 if timeout 5 bash -c "exec 3<>/dev/tcp/{host_addr}/53" >/dev/null 2>&1; then connected=ok; fi
