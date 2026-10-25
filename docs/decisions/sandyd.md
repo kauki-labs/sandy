@@ -784,24 +784,24 @@ resource-isolation assumptions. Only the connection's own read loop gained
 concurrency with respect to a DIFFERENT message type, not with respect to
 running more than one job.
 
-**Known gap, named rather than silently left:** `RunControl`'s deadline
-suspension/extension is honored by the process backend
-(`impls/local/src/process.rs`'s poll loop reads `spec.control` live) but
-NOT yet by the VM backends (`impls/vm/src/qemu.rs`/`vfkit.rs`): their
-console-protocol read loop (`impls/vm/src/console/mod.rs::run_console`)
-still enforces the STATIC `TimeoutPolicy` derived once from
-`spec.timeout_secs` at job start. `RunControl.is_cancelled()` /
-`.deadline()` compile and thread through `RunSpec` correctly for VM-backed
-jobs (every construction site satisfies the contract), but a VM-backed
-job's actual timeout/cancellation behavior is unchanged by this PR — a VM
-job still runs to its original fixed budget regardless of attach state or
-`daemon cancel`. Adapting `run_console`'s phase-timeout state machine to
-poll a live `RunControl` is real, separate follow-up work (it needs the
-socket read to return on a short, bounded interval rather than blocking for
-the whole budget, and the protocol's existing phase/timeout-policy
-semantics understood well enough not to regress the acceptance suite) —
-intentionally not attempted blind within this change. Tracked by #366 (open,
-not yet merged to `main`); related: #185.
+**Resolved follow-up (#185/#340 phase 5): the VM backends now honor
+`RunControl` too.** The known gap above — `run_console` enforcing only the
+STATIC `TimeoutPolicy` derived once from `spec.timeout_secs`, deaf to a live
+`RunControl` — is closed. `impls/vm/src/console/transport.rs`'s socket/PTY
+read timeout dropped from the whole run budget to a fixed ~250ms poll
+quantum (`console::POLL_QUANTUM`), reported to the driver as a new
+`ReadEvent::Idle` distinct from `ReadEvent::Closed` (real EOF) — the two
+had collapsed into the same `Ok(0)` before, which only worked because the
+read blocked for the whole budget in one call. `run_console` now re-checks
+`spec.control` on every tick: `is_cancelled()` ends the run immediately in
+either phase (reported the same way a timeout is, matching the process
+backend's own precedent); the live deadline is authoritative once something
+moves it away from the value it carried when the run started (a suspended
+deadline never times out, a reinstated one — e.g. a post-detach grace
+period — is checked directly); a run nothing ever touches keeps today's
+boot-then-command budget shape unchanged. Teardown needed no new code: both
+backends already kill the hypervisor/virtiofsd and deregister the box once
+`run_console` returns, for any reason.
 
 **Follow-up (CodeRabbit on #344): the fail-safe above applies on every exit,
 not only a connection drop, and `AttachStateChanged` tolerates reordering
@@ -858,11 +858,10 @@ complete.
 
 **Consequences.** The process backend (`impls/local`) picks up a cancellation on its next 10ms
 poll tick, so a cancelled job tears down within its own drain grace (≤ ~10s) regardless of how far
-from its deadline it was — comfortably inside the new `TimeoutStopSec`. The known gap named above
-(VM backends not honoring `RunControl` at all) is UNCHANGED by this fix: a VM-backed job still
-runs to its static `spec.timeout_secs` budget regardless of `cancel()`. That is exactly why
-`TimeoutStopSec` is derived from the full `STAGE1_TIMEOUT_SECS` budget rather than the process
-backend's fast-cancel case alone — it has to cover whichever backend actually ran.
+from its deadline it was — comfortably inside the new `TimeoutStopSec`. The VM backends pick up a
+cancellation on the next ~250ms poll tick, as described in the VM `RunControl` paragraph above.
+`TimeoutStopSec` is still derived from the full `STAGE1_TIMEOUT_SECS` budget rather than the
+process backend's fast-cancel case alone, because it has to cover whichever backend actually ran.
 
 **Verification.** Unit-tested: `shutdown_cancels_every_still_running_jobs_run_control` and
 `a_closed_connection_does_not_cancel_a_still_running_job`
