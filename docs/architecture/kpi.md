@@ -165,7 +165,7 @@ K13 (egress) runs on Linux as root with `nft` on `PATH`; K12 (real App) needs
 `SANDY_CRED_LIVE_TRUST_ROOT` and is operator-run.
 
 The sweep above also runs KM1/KM2/KA1 (no extra env needed beyond
-`SANDY_LIVE=1`) and KA4/KA5 if a hypervisor is present. KM3/KM4/KA2/KA3 live
+`SANDY_LIVE=1`) and KA4 if a hypervisor is present. KM3/KM4/KA2/KA3 live
 in the three `live_remote_host_*` test binaries, in the same `-p sandy-cli
 --features live` sweep, but **fail** (`require_remote_executor` bails, not
 skips, per INV-S9) unless `SANDY_M2_REMOTE_HOST` and `SANDY_M2_REMOTE_PEER`

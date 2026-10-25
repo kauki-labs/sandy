@@ -80,9 +80,11 @@ The macOS orchestrator (`sandyd`) places a job on a registered remote NixOS host
 (the remote host) when an agent-link listener address is configured and
 `HostRegistry::pick_host_for` finds a host whose declared backends satisfy the
 job's required isolation class. For an `argv/v1` (trusted-process) submission,
-absent either condition the job runs locally instead; a placed trusted-process
-job runs in a `bwrap` sandbox under `systemd-run --user` with `sandy-agent`
-inside, and links the agent back to the orchestrator over the mesh.
+absent either condition the job is accepted and stays `Pending` — nothing
+dispatches it, an honest, tracked gap (#292), not a local fallback; a placed
+trusted-process job runs in a `bwrap` sandbox under `systemd-run --user` with
+`sandy-agent` inside, and links the agent back to the orchestrator over the
+mesh.
 Untrusted-job isolation stays VM-only, never the process backend, on any host
 (`decisions/process-containment.md` decision 6, #150).
 
@@ -109,10 +111,11 @@ The flow and the crates it added:
   over the UDS), the `HostRegistry`, the mesh listener, `pick_host_for`
   placement by isolation class, the decision-6 agent-link accept loop, and the
   dispatch relay.
-- **`sandy-host-executor`** — dials the orchestrator, probes its containment,
-  `Register`s, then handles each `Dispatch` sequentially: decode the argv/v1
-  manifest, **re-check the isolation class independently** (defense in depth),
-  launch via `ProcessBackend`, and relay the agent link back.
+- **`sandy-host-executor`** — dials the orchestrator, probes its containment
+  and VM capability, `Register`s, then handles each `Dispatch` sequentially:
+  **re-check the isolation class independently** (defense in depth), decode
+  the `argv/v1` manifest and launch via `ProcessBackend`, or the `flake/v1`
+  manifest and launch via `QemuBackend`, and relay the agent link back.
 - **`sandy-agent`** + **`impls/local`** (`SystemdRunContainment`,
   `ProcessBackend`) run and contain the job on the host.
 - Nix overlays plus a hardened `services.sandy-executor` nixosModule deploy the
@@ -130,9 +133,11 @@ input), and a durable per-job attach token lets a genuinely separate
 `attach` process reattach later with post rights, not just a fresh
 session's own observer rights. Detaching does not end the job: `sandyd`'s
 `attach_relay` (`crates/sandyd/src/attach_relay.rs`) keeps relaying the live
-process over the job's own channel, and a detached job's deadline falls back
-to a shorter grace period rather than running unlimited forever once nobody
-is attached.
+process over the job's own channel, and, for process-backed jobs, a detached
+job's deadline falls back to a shorter grace period rather than running
+unlimited forever once nobody is attached. VM-backed jobs don't honor live
+attach state yet (open PR #366; see `kpi.md`'s note on #185/#340) and keep
+running to their fixed original budget regardless.
 
 Landed on `main` (#378): the archived-transcript path. A job's stdin/stdout
 for its whole lifetime, bounded by `SANDY_HISTORY_LINES` (default 10,000,
