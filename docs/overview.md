@@ -2,7 +2,7 @@
 title: sandy overview
 kind: overview
 project: sandy
-updated: 2026-10-19
+updated: 2026-10-25
 ---
 
 # sandy overview
@@ -79,11 +79,28 @@ M2 runs a sandboxed job on a different machine than the one that submitted it.
 The macOS orchestrator (`sandyd`) places a job on a registered remote NixOS host
 (the remote host) when an agent-link listener address is configured and
 `HostRegistry::pick_host_for` finds a host whose declared backends satisfy the
-job's required isolation class; absent either, the job runs locally instead. A
-placed job runs in a `bwrap` sandbox under `systemd-run --user` with
+job's required isolation class. For an `argv/v1` (trusted-process) submission,
+absent either condition the job is accepted and stays `Pending` — nothing
+dispatches it, an honest, tracked gap (#292), not a local fallback; a placed
+trusted-process job runs in a `bwrap` sandbox under `systemd-run --user` with
 `sandy-agent` inside, and links the agent back to the orchestrator over the
-mesh. Stage 1 is **trusted-process** only; untrusted/VM isolation is a later
-backend (see #269's design and `decisions/sandyd.md`).
+mesh.
+Untrusted-job isolation stays VM-only, never the process backend, on any host
+(`decisions/process-containment.md` decision 6, #150).
+
+A placed job can also be a VM job: `sandy daemon submit --flake <ref>` dispatches
+a `flake/v1` manifest to a host that declares `SandboxKind::Vm` (#332), and the
+host-executor boots it there via `QemuBackend`, the same guest-boot path `sandy
+run --flake` uses locally. `Capabilities` is a SET of declared sandbox kinds
+per host-executor process, so one host can serve both `Process` and `Vm`
+dispatches at once. Unlike `argv/v1`, a `flake/v1` submission has no local
+fallback: if no remote is configured or no registered host declares `Vm`, it
+is refused outright at `Submit` time (named reason, no silent hang), never
+left silently `Pending`. The code path is built and host-executor-side
+tested; as an operational matter the standing `sandy-host-executor` deployed
+on the current remote test host has not yet been redeployed with #332's
+VM-capability detection, so it still registers `Process` only, and a
+`flake/v1` submit against it is refused for that reason today.
 
 The flow and the crates it added:
 
@@ -94,21 +111,56 @@ The flow and the crates it added:
   over the UDS), the `HostRegistry`, the mesh listener, `pick_host_for`
   placement by isolation class, the decision-6 agent-link accept loop, and the
   dispatch relay.
-- **`sandy-host-executor`** — dials the orchestrator, probes its containment,
-  `Register`s, then handles each `Dispatch` sequentially: decode the argv/v1
-  manifest, **re-check the isolation class independently** (defense in depth),
-  launch via `ProcessBackend`, and relay the agent link back.
+- **`sandy-host-executor`** — dials the orchestrator, probes its containment
+  and VM capability, `Register`s, then handles each `Dispatch` sequentially:
+  **re-check the isolation class independently** (defense in depth), decode
+  the `argv/v1` manifest and launch via `ProcessBackend`, or the `flake/v1`
+  manifest and launch via `QemuBackend`, and relay the agent link back.
 - **`sandy-agent`** + **`impls/local`** (`SystemdRunContainment`,
   `ProcessBackend`) run and contain the job on the host.
 - Nix overlays plus a hardened `services.sandy-executor` nixosModule deploy the
   executor onto a user-specified base.
 
+### Interactive attach (#340)
+
+`sandy daemon submit` then `sandy daemon attach` behaves like SSH into a
+`tmux` session: a real PTY exists from the moment the job starts
+(`impls/agent/src/tmux_pty.rs`, built for the trusted-process backend and
+wired through for VM jobs too, though no live gate yet proves the VM leg end
+to end — see `kpi.md`'s KA3), the detach key is SSH's own `~.` sequence
+(recognized only right after a newline, so it rarely collides with real
+input), and a durable per-job attach token lets a genuinely separate
+`attach` process reattach later with post rights, not just a fresh
+session's own observer rights. Detaching does not end the job: `sandyd`'s
+`attach_relay` (`crates/sandyd/src/attach_relay.rs`) keeps relaying the live
+process over the job's own channel, and, for process-backed jobs, a detached
+job's deadline falls back to a shorter grace period rather than running
+unlimited forever once nobody is attached. VM-backed jobs don't honor live
+attach state yet (open PR #366; see `kpi.md`'s note on #185/#340) and keep
+running to their fixed original budget regardless.
+
+Landed on `main` (#378): the archived-transcript path. A job's stdin/stdout
+for its whole lifetime, bounded by `SANDY_HISTORY_LINES` (default 10,000,
+configurable per job), is captured and persisted by `sandyd` the moment the
+agent posts it, regardless of whether anyone is attached at the time
+(`persist_archive_when_posted`). The next client that attaches, live or
+after the job has already finished, receives it as an archive frame
+(`attach.rs::write_archive`) — usable even if nobody ever attached live or
+the job and its VM are long gone.
+
+**Known gap, named (open PR #366, related #185).** `RunControl`'s live
+deadline suspension/extension — the mechanism "unlimited while attached"
+needs — is honored by the process backend's poll loop today, but NOT yet by
+the VM backends (qemu/vfkit): their console-protocol read loop still enforces
+the static timeout computed once at job start, so a VM-backed job's timeout
+keeps counting down regardless of attach state, and `daemon cancel` has no
+effect on an in-flight VM job either. PR #366 (open, not yet merged to
+`main`) fixes this; until it merges, treat "unlimited while attached" as
+process-backend-only. See `decisions/sandyd.md` decision 14's amendment for
+the full record.
+
 ### Known gaps and operations
 
-- **Result observability (open).** A completed job still reads
-  `JOB_STATUS_PENDING` in the orchestrator — the exit code and output do not
-  propagate back yet (#292, item 5). A separate change wires this through; until
-  it lands, treat orchestrator job status as dispatch state, not job result.
 - **Watching the deployed executor.** Its own logs land in the **user** journal,
   not the system unit: tail `journalctl _UID=992 -f`, not
   `journalctl -u sandy-executor`. `PAMName=login` puts the process in the user

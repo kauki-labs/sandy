@@ -61,7 +61,7 @@ the result envelope. Flags (repeatable where it makes sense):
 | `--secret NAME=@PATH`                      | inject the file's bytes as `$NAME` in-guest (never on argv/env)                                                  |
 | `--env KEY=VALUE`                          | set an environment variable in-guest                                                                             |
 | `--credential <name>`                      | mint a scoped token from a `sandy cred github` trust root, inject it as `$GITHUB_TOKEN`, revoke at teardown      |
-| `--allow HOST:PORT`                        | egress allow-list entry (enforced on Linux; macOS is unfiltered)                                                 |
+| `--allow HOST:PORT`                        | egress allow-list entry (enforced on Linux; macOS has no guest NIC, so nothing to filter)                        |
 | `--cpu N` / `--mem MiB` / `--timeout SECS` | resource knobs                                                                                                   |
 | `-o plain` (default) / `-o json`           | human summary, or the full structured envelope for agents                                                        |
 
