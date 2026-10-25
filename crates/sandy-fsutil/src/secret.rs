@@ -127,6 +127,50 @@ impl OwnedDir {
         &self.path
     }
 
+    /// This directory's device and inode, read from the already-open handle: a
+    /// fingerprint strong enough to prove a directory later re-opened by path is
+    /// the one this handle validated, not a same-uid, same-mode substitute
+    /// swapped in at the same path since (#323). The caller keeps the fingerprint
+    /// (not the fd) across a boundary that cannot carry an open handle, then
+    /// checks a later re-open against it with [`OwnedDir::open_matching`].
+    ///
+    /// # Errors
+    ///
+    /// [`FsError::Io`] if the handle can no longer be stat'd.
+    pub fn dev_ino(&self) -> Result<(u64, u64), FsError> {
+        let meta = self
+            .handle
+            .metadata()
+            .map_err(|e| FsError::io("stat staging dir", &self.path, e))?;
+        Ok((meta.dev(), meta.ino()))
+    }
+
+    /// As [`OwnedDir::open`], but additionally refuses unless the opened
+    /// directory's device and inode equal `expected` (#323): a same-uid,
+    /// same-mode directory swapped in at `path` since `expected` was captured
+    /// opens under a different identity and is refused here, where the owner/mode
+    /// checks alone would have let it through.
+    ///
+    /// # Errors
+    ///
+    /// As [`OwnedDir::open`], plus [`FsError::Unsafe`] when `path` no longer names
+    /// the directory `expected` identifies.
+    pub fn open_matching(path: &Path, expected: (u64, u64)) -> Result<Self, FsError> {
+        let dir = Self::open(path)?;
+        let actual = dir.dev_ino()?;
+        if actual != expected {
+            return Err(FsError::Unsafe {
+                path: path.to_owned(),
+                reason: format!(
+                    "{} no longer names the directory validated earlier (dev/ino {expected:?} -> {actual:?}); \
+                     refusing to stage into a possible swap",
+                    path.display()
+                ),
+            });
+        }
+        Ok(dir)
+    }
+
     /// Create the new directory `name` inside this one, `0700`, and open it.
     ///
     /// An existing entry at `name` (a directory, a file, a symlink) is an error,
@@ -383,6 +427,43 @@ mod tests {
             let res = OwnedDir::open(dir.path());
             anyhow::ensure!(matches!(res, Err(FsError::Unsafe { .. })), "mode {mode:o} gave {res:?}");
         }
+        Ok(())
+    }
+
+    /// #323: a same-uid, same-mode directory swapped in at the validated path
+    /// must not pass `open_matching` just because it passes the owner/mode check
+    /// `open` alone would apply — its dev/ino differ from the one `expected`
+    /// identifies, so the swap is refused instead of silently accepted.
+    #[test]
+    fn open_matching_refuses_a_same_uid_mode_substitute_swapped_in_at_the_path() -> anyhow::Result<()> {
+        let dir = staging_dir()?;
+        let validated = OwnedDir::open(dir.path())?;
+        let expected = validated.dev_ino()?;
+
+        // An attacker races the two opens, moving the validated directory aside
+        // and substituting their own same-uid, same-mode directory at the
+        // validated path — indistinguishable from the original to a plain `open`.
+        let moved_original = dir.path().with_extension("moved-original");
+        fs::rename(dir.path(), &moved_original)?;
+        fs::create_dir(dir.path())?;
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
+        anyhow::ensure!(
+            OwnedDir::open(dir.path()).is_ok(),
+            "a same-uid 0700 substitute should pass plain path-based validation"
+        );
+
+        let err = OwnedDir::open_matching(dir.path(), expected).expect_err("a swapped-in substitute must be refused");
+        anyhow::ensure!(matches!(err, FsError::Unsafe { .. }), "unexpected error: {err}");
+        Ok(())
+    }
+
+    /// Positive counterpart: an unchanged directory's fingerprint still matches
+    /// its own later re-open.
+    #[test]
+    fn open_matching_accepts_the_same_directory_reopened() -> anyhow::Result<()> {
+        let dir = staging_dir()?;
+        let expected = OwnedDir::open(dir.path())?.dev_ino()?;
+        OwnedDir::open_matching(dir.path(), expected).expect("reopening the same directory must still match");
         Ok(())
     }
 
