@@ -2,7 +2,7 @@
 title: "Decisions: credential seam (CredentialProvider)"
 status: accepted
 project: sandy
-updated: 2026-10-20
+updated: 2026-10-25
 ---
 
 # Decisions: credential seam (`CredentialProvider`)
@@ -230,3 +230,42 @@ the dir by then, so a sweep there is harmless, and verify's own best-effort
 of reading mtime) was considered and rejected: it adds a second piece of
 state that could drift from the dir's actual contents, where mtime is already
 authoritative and free.
+
+## 7. The terminal journal write waits for final redaction, instead of amending
+
+**Status:** accepted. **Upholds:** INV-6, M-6.
+
+**Context.** `run_job`'s terminal journal write (step 6, INV-6) happens right
+after its own console redaction pass, which only ever sees the credential's
+initial token — `run_job_with_credential` only learns about a mid-run refresh
+after its refresh thread joins. The original fix for that (`amend_terminal_envelope`)
+re-redacted the returned envelope and then overwrote the already-journaled
+record in a second write. A crash between the first write and the amend left a
+permanent terminal record where a refreshed token that leaked into the console
+was never redacted (#322, found by CodeRabbit re-reviewing #320).
+
+**Decision.** `run_job_with_credential` runs the shared core
+(`run_job_core`) without writing a terminal record. After its refresh thread
+joins, it re-redacts the console against every token the run ever had live
+(`redact_with_refreshes`), folds in a revoke-failure warning if any, and only
+then writes the terminal record — once. The non-credentialed `run_job` path is
+unchanged: it still writes its terminal record immediately, since it never has
+a refresh to wait for.
+
+**Consequences.** The credentialed path's terminal record and its token
+redaction are now one atomic write: a crash can observe either no terminal
+record (before that write) or a fully-redacted one (after it), never a
+partially-redacted one in between. `amend_terminal_envelope` is removed, along
+with the `read_record` + `lock_job` + overwrite sequence it used — the
+credentialed path no longer reads the journal at all before persisting. Proven
+by `run_job_core`/`write_terminal_record`'s unit tests in `supervisor.rs`
+(a `JournalWriter` test double records write order and count without touching
+the filesystem) and by the existing `credentialed_run_redacts_the_token_from_the_console`
+/ `credential_revoke_failure_surfaces_as_a_warning_not_a_fault` integration
+tests, which still pass unchanged.
+
+**Set aside.** Keeping the amend and instead making it atomic under the job
+flock (lock, read, merge, write) was considered and rejected: it still leaves
+the same crash window between the first write and the lock being taken, just
+narrower; removing the first write entirely closes the window rather than
+shrinking it.

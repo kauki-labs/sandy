@@ -193,6 +193,15 @@ sequenceDiagram
 - **Mid-run refresh.** With a huge margin + short tick the refresh thread re-mints
   and rewrites the live secret file, so a long job's `git credential fill` serves a
   fresh token; the guest never sees the value on argv/console.
+- **Terminal journal write deferred until redaction is final (#322).** The
+  non-credentialed path still writes its terminal record inside `run_job`, right
+  after its one redaction pass. `run_job_with_credential` instead runs the shared
+  core without writing that record, joins the refresh thread, re-redacts the
+  console against every token the run ever had live, folds in a revoke-failure
+  warning if any, and only then writes the terminal record — once. Before this,
+  `run_job` wrote a terminal record redacted against only the initial token, and
+  `run_job_with_credential` amended it after the fact; a crash in that window left
+  a permanent record with a refreshed token unredacted. See INV-6 (§7).
 - **`gc` sweeps a leaked `cred-*`/`verify-*` staging dir (#195).** The drop guard
   that removes `cred_dir`/the verify probe's temp dir runs on every normal exit
   and on panic, but not on SIGKILL or a crash before it runs; `sandy gc` sweeps any
@@ -323,7 +332,12 @@ owner.
 
 - **Running before boot (INV-6).** The `Running` record is the first write, so an
   empty journal proves the backend was never reached; the terminal record always
-  carries the envelope.
+  carries the envelope. The non-credentialed path writes that terminal record
+  right after its own redaction pass. The credentialed path (`run_job_with_credential`,
+  #322) defers it instead: the shared core runs without writing one, and only after
+  the refresh thread has joined and the console is re-redacted against every token
+  the run ever had live does the terminal record get written, once — never a first
+  write against the initial token alone, amended afterward.
 - **Reconcile through the seam (INV-3).** `ls`/`status`/`wait`/`kill`/`gc` reach
   running state via `reconcile_job` + `VmBackend::boxes` under the job flock, never
   a direct registry read, so a crashed owner is reconciled to a terminal state.
