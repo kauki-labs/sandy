@@ -187,20 +187,41 @@ fn build_host_observed(
 }
 
 /// The envelope warning for a non-empty `--allow` list that has no effect
-/// because the guest has no network device (#358).
+/// (#358).
 ///
-/// `vfkit_args` (`impls/vm/src/vfkit.rs`) emits no `virtio-net` device, so a
-/// macOS guest has no NIC at all; a Linux guest with no bound tap has none
-/// either (`plan_egress_scoped`). In both cases `--allow` entries are not
-/// merely unfiltered, they are inert: there is nothing to grant them onto. Keys
-/// on structure (`EgressOs::MacOs`, or no `tap`), never on the `EgressOutcome`'s
-/// reason string, so a reason that happens not to match a pattern can't defeat
-/// it. An empty allow-list never warns: deny-all already holds with no NIC.
-fn no_network_allow_warning(allow: &AllowList, egress_os: EgressOs, tap: Option<&str>) -> Option<String> {
-    let no_nic = matches!(egress_os, EgressOs::MacOs) || tap.is_none();
-    (no_nic && !allow.rules.is_empty()).then(|| {
-        "egress unavailable: the guest has no network device, so --allow entries have no effect (see #360)".to_string()
-    })
+/// On a VM backend, `vfkit_args` (`impls/vm/src/vfkit.rs`) emits no
+/// `virtio-net` device, so a macOS guest has no NIC at all; a Linux guest with
+/// no bound tap has none either (`plan_egress_scoped`). `--allow` entries are
+/// not merely unfiltered there, they are inert: there is nothing to grant them
+/// onto. On the process backend there is no guest at all — the job runs
+/// directly on the host network, sharing it rather than lacking a NIC — but
+/// the allow-list is just as unenforced, so the warning still fires, with a
+/// cause that matches what's actually true for that backend. Keys on
+/// structure (`backend_kind`, `EgressOs::MacOs`, or no `tap`), never on the
+/// `EgressOutcome`'s reason string, so a reason that happens not to match a
+/// pattern can't defeat it. An empty allow-list never warns: deny-all already
+/// holds regardless of the reason.
+fn no_network_allow_warning(
+    allow: &AllowList,
+    backend_kind: SandboxKind,
+    egress_os: EgressOs,
+    tap: Option<&str>,
+) -> Option<String> {
+    if allow.rules.is_empty() {
+        return None;
+    }
+    match backend_kind {
+        SandboxKind::Process => Some(
+            "egress unavailable: the process backend shares the host network with no isolation boundary, so --allow \
+             entries have no effect"
+                .to_string(),
+        ),
+        SandboxKind::Vm if matches!(egress_os, EgressOs::MacOs) || tap.is_none() => Some(
+            "egress unavailable: the guest has no network device, so --allow entries have no effect (see #360)"
+                .to_string(),
+        ),
+        SandboxKind::Vm => None,
+    }
 }
 
 /// List the files the backend collected to each declared output's destination as
@@ -377,7 +398,10 @@ pub fn run_job<B: VmBackend + ?Sized, E: EgressApplier + ?Sized>(
             {
                 tracing::warn!(%e, "egress revert failed");
             }
-            (outcome, no_network_allow_warning(&plan.allow, egress_os, tap))
+            (
+                outcome,
+                no_network_allow_warning(&plan.allow, backend.kind(), egress_os, tap),
+            )
         }
         Err(egress_error) => {
             egress_receipt_result = Err(egress_error.to_string());

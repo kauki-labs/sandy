@@ -684,6 +684,41 @@ fn run_on_linux_with_no_tap_and_an_empty_allow_list_carries_no_warning() -> anyh
     Ok(())
 }
 
+/// #358 (review finding): the process backend shares the host network with no
+/// isolation boundary at all — it has no guest and no NIC to lack. A non-empty
+/// `--allow` list is just as unenforced there, but the warning must name the
+/// real cause instead of claiming "the guest has no network device", which
+/// does not describe a process run.
+#[test]
+fn run_on_the_process_backend_with_a_nonempty_allow_list_warns_with_the_right_cause() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    let backend = FakeBackend::new()
+        .with_outcome(ok_outcome(0))
+        .with_kind(sandy::SandboxKind::Process);
+    let applier = FakeApplier::new();
+
+    let report = run_job(
+        &backend,
+        &journal,
+        &allowing_plan(),
+        &applier,
+        EgressOs::Linux,
+        None,
+        &[],
+    )
+    .context("run_job (process backend)")?;
+
+    assert_eq!(
+        report.envelope.warnings,
+        vec![
+            "egress unavailable: the process backend shares the host network with no isolation boundary, so --allow \
+             entries have no effect"
+        ],
+        "the process backend's warning must name the real cause, not the no-NIC VM reason"
+    );
+    Ok(())
+}
+
 /// #23 (adversarial): the boundary is reverted even when the backend run FAILS —
 /// a boot failure must never leave egress rules applied on the host.
 #[test]
