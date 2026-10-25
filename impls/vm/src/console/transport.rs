@@ -290,10 +290,14 @@ mod tests {
     /// real EOF and `read` reports [`ReadEvent::Closed`] — not another `Idle`
     /// forever (#185: a driver that only ever saw `Idle` would spin reading a
     /// dead console instead of resolving the run).
+    ///
+    /// Ignored like the pipe-transport test above: a nix build sandbox only
+    /// bind-mounts the derivation's own closure, so no external binary is
+    /// reachable to exec regardless of path — out of the sandbox's tier-1
+    /// budget, run on the host (#26).
     #[test]
+    #[ignore = "spawns a real subprocess on a PTY; unreachable inside the nix build sandbox (#26)"]
     fn pty_transport_read_reports_closed_once_the_child_exits() -> Result<(), BackendError> {
-        // A nix build sandbox has no FHS `/bin/sh`; `$SHELL` is what nixpkgs'
-        // stdenv sets there, and a normal dev shell still has `/bin/sh`.
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let mut transport = PtyTransport::open()?;
         transport.set_read_timeout(Duration::from_millis(100));
