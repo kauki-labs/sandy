@@ -23,7 +23,10 @@
 #   SANDY_SOCK           control socket path (default /tmp/sandyd-smoke.sock)
 #   MESH_PORT            orchestrator mesh-listen port (default 4000)
 #   AGENT_LINK_PORT      orchestrator agent-link port (default 4001)
-#   EXECUTOR_REMOTE_DIR  remote checkout path (default /tmp/sandy-smoke-test)
+#   EXECUTOR_REMOTE_DIR  remote checkout path. Default: a fresh, run-unique
+#                        /tmp dir, removed on exit — safe for concurrent
+#                        runs against the same executor. Set this to reuse
+#                        (and wipe-before-sync) a persistent path instead.
 #   EXECUTOR_HOST_ID     the host_id sandy-host-executor registers as
 #                        (default: EXECUTOR_SSH_TARGET's host part)
 set -euo pipefail
@@ -41,7 +44,13 @@ repo_root=$(cd "$(dirname "$0")/.." && pwd)
 sock=${SANDY_SOCK:-/tmp/sandyd-smoke.sock}
 mesh_port=${MESH_PORT:-4000}
 link_port=${AGENT_LINK_PORT:-4001}
-remote_dir=${EXECUTOR_REMOTE_DIR:-/tmp/sandy-smoke-test}
+remote_dir_is_default=1
+remote_dir=${EXECUTOR_REMOTE_DIR:-}
+if [ -n "$remote_dir" ]; then
+  remote_dir_is_default=
+else
+  remote_dir="/tmp/sandy-smoke-test-$$"
+fi
 host_id=${EXECUTOR_HOST_ID:-${executor_ssh##*@}}
 
 command -v jq >/dev/null 2>&1 || {
@@ -76,6 +85,9 @@ cleanup() {
     done
   fi
   [ -z "$sandyd_pid" ] || kill "$sandyd_pid" >/dev/null 2>&1 || true
+  # Only the auto-generated per-run dir is removed — an explicit
+  # EXECUTOR_REMOTE_DIR is a persistent path the caller chose to reuse.
+  [ -z "$remote_dir_is_default" ] || ssh "$executor_ssh" "rm -rf '$remote_dir'" >/dev/null 2>&1 || true
   rm -f "$sock" "$manifest" "$sandyd_log" "$filelist"
   exit "$rc"
 }
@@ -112,11 +124,12 @@ grep -q "sandyd listening" "$sandyd_log" || {
 }
 
 echo "==> syncing this checkout to $executor_ssh:$remote_dir" >&2
-# Wipe and recreate fresh: `rsync --delete --files-from` only prunes among the
-# listed paths, so a file dropped from git tracking since a previous run of
-# this script against the same remote_dir could otherwise linger there
-# indefinitely, defeating the git-ls-files filter below for exactly the stale
-# leftover case it exists to prevent.
+# Wipe and recreate fresh: a no-op for the default per-run dir, but load-
+# bearing for an explicit, reused EXECUTOR_REMOTE_DIR — `rsync --delete
+# --files-from` only prunes among the listed paths, so a file dropped from
+# git tracking since a previous run against that same path could otherwise
+# linger there indefinitely, defeating the git-ls-files filter below for
+# exactly the stale leftover case it exists to prevent.
 ssh "$executor_ssh" "rm -rf '$remote_dir' && mkdir -p '$remote_dir'"
 # Only git-tracked files: rsyncing the whole tree (even with excludes) drops
 # .git, so Nix treats the remote dir as a non-git path: flake that ignores
