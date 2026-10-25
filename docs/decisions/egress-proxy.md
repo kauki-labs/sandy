@@ -276,6 +276,10 @@ not the run the submitter asked for.
   observed, so the record alone is diagnosable.
 - The backend does not stop the VM early when the proxy dies. The guest has lost
   network, not gained it, so the boundary still holds.
+- Both failure paths run inside the `run_job_with_credential` mint-to-revoke
+  bracket (spec section 4). Teardown revokes the live lease before removing the
+  staged `0600` token file, on this path exactly as on any other backend error;
+  the caller-owned credential directory is untouched.
 
 **Consequences.** A job that succeeded while its network was gone cannot be
 reported as `succeeded`. A transient proxy fault is retryable rather than blamed
@@ -384,7 +388,10 @@ Each attack assumes the #357 model: the job is root in the guest.
 ## Implementation issues
 
 Milestone "Hardened egress + provenance". Each issue carries its own acceptance
-criteria and live KPI rows.
+criteria. Live KPI rows split across issues: #401 and #402 feed KP1-KP6 without
+owning rows directly; #403 owns KP6; #404 owns the qemu rows (KP1q, KP2q) for
+its slice, #405 the vfkit rows (KP1v, KP2v); #406 proves the full KP1-KP6
+parity gate on both backends.
 
 | Issue | Seam                                                        | Blocked by       |
 | ----- | ----------------------------------------------------------- | ---------------- |

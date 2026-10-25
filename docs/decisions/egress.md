@@ -48,9 +48,11 @@ equivalent in this path.
 **Decision.** On macOS `plan_egress_scoped` yields `NoBoundary`; the run proceeds
 without enforcement, **documented, not silent**.
 
-**Consequences.** macOS runs are unfiltered by design; the behaviour is stated in
-the result and the docs so it is not mistaken for enforcement.
+**Consequences.** `NoBoundary` means no egress enforcement is installed, not that
+an unfiltered network is available: the current vfkit argv emits no `virtio-net`
+device, so a macOS guest has no network interface at all today. The behaviour is
+stated in the result and the docs so it is not mistaken for enforcement.
 
-**Replaced after parity.** The vsock host proxy enforces egress on macOS the
-same way as on Linux ([`egress-proxy.md`](egress-proxy.md) decision 5). Its
-Context notes that the current vfkit argv emits no NIC at all.
+**Replaced after parity.** The vsock host proxy gives macOS guests network for
+the first time, enforced the same way as on Linux
+([`egress-proxy.md`](egress-proxy.md) decision 5).
