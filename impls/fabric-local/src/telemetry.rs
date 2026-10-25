@@ -101,7 +101,8 @@ impl LocalLog {
     }
 
     /// Open the log for appending, creating it `0600`; `created` reports whether
-    /// this call made the file.
+    /// this call made the file. The validated parent handle is returned too, so the
+    /// caller syncs that directory, never one reopened by path.
     ///
     /// The parent directory is validated once, the way `minter::stage_secret`
     /// validates its staging dir (#190): opened with `O_DIRECTORY | O_NOFOLLOW`
@@ -110,7 +111,7 @@ impl LocalLog {
     /// its full path. This closes the gap a file-only check leaves: an attacker
     /// controlling the parent (but not the log file) could otherwise plant a
     /// hard link to one of the user's own `0600` files at the log's name.
-    fn open_for_append(path: &Path) -> io::Result<(File, bool)> {
+    fn open_for_append(path: &Path) -> io::Result<(File, bool, sandy_fsutil::OwnedDir)> {
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -146,7 +147,7 @@ impl LocalLog {
                 "telemetry log must be this user's regular file with mode 0600",
             ));
         }
-        Ok((file, created))
+        Ok((file, created, parent_dir))
     }
 }
 
@@ -163,7 +164,7 @@ impl TelemetrySink for LocalLog {
         line.push(b'\n');
         // A std mutex guard: this body must stay free of `.await` while it is held.
         let _serialized = self.write.lock().unwrap_or_else(PoisonError::into_inner);
-        let (mut file, created) = Self::open_for_append(path).map_err(|e| sink_err(path, &e))?;
+        let (mut file, created, parent_dir) = Self::open_for_append(path).map_err(|e| sink_err(path, &e))?;
         // Serialize with every other writer of this file, not just this LocalLog:
         // held from the tail check through the syncs, released when `file` drops.
         rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive).map_err(|e| sink_err(path, &e.into()))?;
@@ -191,9 +192,7 @@ impl TelemetrySink for LocalLog {
             .map_err(|e| sink_err(path, &e))?;
         if !self.dir_synced.load(Ordering::Acquire) {
             let dir = path.parent().unwrap_or(Path::new("."));
-            File::open(dir)
-                .and_then(|d| d.sync_all())
-                .map_err(|e| sink_err(dir, &e))?;
+            rustix::fs::fsync(&parent_dir).map_err(|e| sink_err(dir, &e.into()))?;
             self.dir_synced.store(true, Ordering::Release);
         }
         Ok(())
@@ -609,7 +608,7 @@ mod tests {
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
         let path = dir.path().join("t.jsonl");
         for (label, want_created) in [("create", true), ("reopen", false)] {
-            let (file, created) = LocalLog::open_for_append(&path).with_context(|| format!("{label} the log"))?;
+            let (file, created, _dir) = LocalLog::open_for_append(&path).with_context(|| format!("{label} the log"))?;
             anyhow::ensure!(created == want_created, "{label}: created={created}");
             let flags = rustix::io::fcntl_getfd(&file).with_context(|| format!("{label}: F_GETFD"))?;
             anyhow::ensure!(
@@ -617,6 +616,29 @@ mod tests {
                 "{label}: the telemetry log descriptor is not close-on-exec"
             );
         }
+        Ok(())
+    }
+
+    /// The parent handle `open_for_append` returns stays bound to the directory it
+    /// validated. Replacing that path afterwards does not redirect the handle, so
+    /// `emit` syncs the validated directory, not a substitute.
+    #[test]
+    fn the_returned_parent_handle_stays_bound_to_the_validated_dir() -> anyhow::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir()?;
+        let dir = root.path().join("logs");
+        fs::create_dir(&dir)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+        let (_file, _created, handle) = LocalLog::open_for_append(&dir.join("t.jsonl")).context("open the log")?;
+        let validated_ino = fs::metadata(&dir)?.ino();
+        fs::rename(&dir, root.path().join("moved"))?;
+        fs::create_dir(&dir)?;
+        let handle_ino = rustix::fs::fstat(&handle).context("fstat the handle")?.st_ino;
+        anyhow::ensure!(
+            handle_ino == validated_ino && fs::metadata(&dir)?.ino() != validated_ino,
+            "the parent handle does not refer to the validated directory"
+        );
+        rustix::fs::fsync(&handle).context("fsync the validated dir")?;
         Ok(())
     }
 
