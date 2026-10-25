@@ -275,13 +275,18 @@ pub trait JournalWriter {
     fn persist(&self, record: &JobRecord) -> Result<(), CoreError>;
 
     /// Persist `record` under the job flock, but only if the current record is
-    /// still `Running`: a concurrent `kill`/`reconcile_job` takes the same flock
-    /// and re-reads before it writes `Cancelled`/`Crashed` (INV-3/INV-6), so this
-    /// is the terminal-write side of that same protocol. Never overwrites a
-    /// result another writer already landed while this run was still boxing up
-    /// its own. Returns whether `record` was actually written: `false` means a
-    /// competing terminal record already stood, and the caller must not report
-    /// its own `record` as this job's result (it would drift from the journal).
+    /// not already a REAL terminal result: a concurrent `kill` takes the same
+    /// flock, re-reads, and writes `Cancelled` carrying its own envelope
+    /// (INV-3/INV-6); that result must never be overwritten. `reconcile_job`'s
+    /// `Crashed`, by contrast, carries no envelope and rests on a liveness
+    /// inference ("the box is gone, so the owner must be") that this run's own
+    /// live write disproves — the live owner's real result overwrites it rather
+    /// than losing to a stale guess (`run_job_core` never updates `box_id` on
+    /// the `Running` record, so `reconcile_job`'s box-liveness check never even
+    /// fires for it; flock-freeness during the whole run is its only signal).
+    /// Returns whether `record` was actually written: `false` means a
+    /// competing REAL result already stood, and the caller must not report its
+    /// own `record` as this job's result (it would drift from the journal).
     ///
     /// # Errors
     ///
@@ -296,9 +301,13 @@ impl JournalWriter for Journal {
 
     fn persist_if_still_running(&self, record: &JobRecord) -> Result<bool, CoreError> {
         let _lock = self.lock_job(&record.job_id)?;
-        if self.read_record(&record.job_id)?.state != JobState::Running {
-            // A concurrent kill/reconcile already landed a terminal record under
-            // this same flock; that result stands (INV-3/INV-6).
+        let current = self.read_record(&record.job_id)?;
+        if current.state != JobState::Running && current.result.is_some() {
+            // A concurrent kill already landed a REAL terminal record (one
+            // carrying an envelope, e.g. Cancelled) under this same flock; that
+            // result stands (INV-3/INV-6). An envelope-less Crashed from
+            // reconcile_job's liveness guess does not count: this write IS the
+            // live owner, so the guess was wrong and loses.
             return Ok(false);
         }
         self.write_record(record)?;
@@ -1911,7 +1920,8 @@ mod tests {
             result: None,
         })?;
 
-        // Simulate a concurrent `kill` landing first, under the job flock.
+        // Simulate a concurrent `kill` landing first, under the job flock, with
+        // its own real envelope — exactly as `kill` writes it, never `None`.
         let cancelled = sandy::JobRecord {
             schema_version: sandy::JOURNAL_SCHEMA_VERSION,
             job_id: job_id.clone(),
@@ -1919,7 +1929,23 @@ mod tests {
             state: sandy::JobState::Cancelled,
             writer_pid: std::process::id() + 1,
             started,
-            result: None,
+            result: Some(sandy::ResultEnvelope {
+                result_schema_version: sandy::RESULT_SCHEMA_VERSION,
+                job_id: job_id.clone(),
+                box_id: None,
+                status: sandy::Status::Cancelled,
+                retryable: false,
+                message: "cancelled".to_string(),
+                exit_code: None,
+                outputs: vec![],
+                receipts: vec![],
+                provenance: sandy::Provenance {
+                    template_store_path: String::new(),
+                },
+                logs: sandy::Logs { tail: String::new() },
+                warnings: vec![],
+                receipt: None,
+            }),
         };
         journal.write_record(&cancelled)?;
 
@@ -1945,6 +1971,68 @@ mod tests {
             on_disk.state,
             sandy::JobState::Cancelled,
             "the concurrent kill's result must stand, never overwritten by a late terminal write"
+        );
+        Ok(())
+    }
+
+    /// `reconcile_job`'s `Crashed` carries no envelope (`result: None`) and rests
+    /// on a liveness guess ("the box is gone, so the owner must be"): it is not a
+    /// real result like `kill`'s `Cancelled`. When the live owner's own write
+    /// lands right after, that write must win — the owner being able to write at
+    /// all disproves the guess, and INV-6 requires a terminal record to carry an
+    /// envelope. Before this test's fix, `persist_if_still_running` treated any
+    /// non-`Running` state as final and would have skipped this write too,
+    /// permanently stranding the job behind a `Crashed`/`None` record even
+    /// though it actually succeeded.
+    #[test]
+    fn persist_if_still_running_overwrites_an_envelope_less_reconcile_crash() -> anyhow::Result<()> {
+        let (_tmp, journal) = fresh_journal()?;
+        let job_id = "job-spurious-reconcile".to_string();
+        let started = SystemTime::now();
+
+        journal.write_record(&sandy::JobRecord {
+            schema_version: sandy::JOURNAL_SCHEMA_VERSION,
+            job_id: job_id.clone(),
+            box_id: None,
+            state: sandy::JobState::Running,
+            writer_pid: std::process::id(),
+            started,
+            result: None,
+        })?;
+
+        // Simulate reconcile_job's guess: the box looked gone, so it flipped the
+        // record to Crashed with no envelope, under the same flock.
+        journal.write_record(&sandy::JobRecord {
+            schema_version: sandy::JOURNAL_SCHEMA_VERSION,
+            job_id: job_id.clone(),
+            box_id: None,
+            state: sandy::JobState::Crashed,
+            writer_pid: std::process::id() + 1,
+            started,
+            result: None,
+        })?;
+
+        // The actual owner was alive all along and now writes its real result.
+        let succeeded = sandy::JobRecord {
+            schema_version: sandy::JOURNAL_SCHEMA_VERSION,
+            job_id: job_id.clone(),
+            box_id: Some("box-1".to_string()),
+            state: sandy::JobState::Succeeded,
+            writer_pid: std::process::id(),
+            started,
+            result: None,
+        };
+        let wrote = super::JournalWriter::persist_if_still_running(&journal, &succeeded)?;
+
+        assert!(
+            wrote,
+            "the owner's real result must win over reconcile_job's envelope-less guess"
+        );
+        let on_disk = journal.read_record(&job_id)?;
+        assert_eq!(
+            on_disk.state,
+            sandy::JobState::Succeeded,
+            "the owner's own write must land, not stay stranded behind the spurious Crashed"
         );
         Ok(())
     }

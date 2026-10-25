@@ -481,12 +481,22 @@ owner.
   the refresh thread has joined and the console is re-redacted against every token
   the run ever had live does the terminal record get written, once — never a first
   write against the initial token alone, amended afterward.
-- **The one terminal write guards against a concurrent other writer, not just
-  itself.** `write_terminal_record` (both paths) persists through
-  `JournalWriter::persist_if_still_running`: it takes the job flock and
-  re-reads before writing, so a `kill`/`reconcile_job` that already flipped the
-  record to `Cancelled`/`Crashed` under that same flock is never overwritten.
-  A failed write (I/O error, not this race) is folded into the returned
+- **The one terminal write guards against a concurrent `kill`, not against
+  `reconcile_job`'s own liveness guess.** `write_terminal_record` (both paths)
+  persists through `JournalWriter::persist_if_still_running`: it takes the job
+  flock and re-reads before writing. It skips the write, and returns `false`,
+  only when the current record already carries a REAL envelope — `kill`'s
+  `Cancelled` — never overwriting that result. `reconcile_job`'s `Crashed`
+  carries no envelope: it is a liveness inference ("the box is gone"), and
+  `run_job_core` never updates `box_id` on the `Running` record, so that
+  inference never even reaches the box check and fires on flock-freeness
+  alone for the whole run, not only during finalization. The live owner's own
+  write — proof the inference was wrong — overwrites it rather than losing to
+  a stale guess. When the write is skipped (a real competing result), the
+  caller returns `CoreError::State`, mapped like any other journal fault to
+  `ProcessExit::InfraFault` (band 3, retryable) at the `run_job_with_credential`
+  call site (`main.rs`); it returns no envelope for this path, unlike a normal
+  run. A failed write (I/O error, not this race) is folded into the returned
   envelope's `warnings` (L-12) as well as logged, on both paths, so the caller
   never sees an ordinary success with a missing INV-6 record.
 - **Reconcile through the seam (INV-3).** `ls`/`status`/`wait`/`kill`/`gc` reach
@@ -498,7 +508,12 @@ owner.
 - Integration: `journal` unit tests; `cli_jobs` ops (`ls`/`status`/`wait`/`kill`/`gc`,
   reconcile of a dead box);
   `credentialed_run_writes_the_terminal_record_once_after_refresh_redaction`
-  (`supervisor.rs`, via `CountingJournal`: one write, after refresh redaction).
+  (`supervisor.rs`, via `CountingJournal`: one write, after refresh redaction);
+  `persist_if_still_running_never_overwrites_an_already_terminal_record` (a
+  real `kill` `Cancelled` stands); `persist_if_still_running_overwrites_an_envelope_less_reconcile_crash`
+  (an envelope-less `reconcile_job` `Crashed` loses to the live owner's write);
+  `credentialed_run_refuses_to_report_a_result_the_journal_never_recorded`
+  (a forced skip returns `Err`, not the local result).
 - End-to-end: `live_boot.rs::cli_lifecycle_over_a_real_job` (the ops over a real job).
 
 ---
