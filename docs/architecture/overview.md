@@ -27,7 +27,9 @@ physical `Outcome`; the supervisor classifies it into the envelope and persists 
 flowchart TD
   cli["sandy run TEMPLATE<br/>--input / --out / --secret / --credential / --allow"]
   cli --> plan["parse_run → JobPlan<br/>(inputs, outputs, secrets, allow, grants)"]
-  plan --> sup["supervisor::run_job<br/>Running record BEFORE boot (INV-6)"]
+  plan --> validate{"validate plan<br/>(no secret leak, egress hosts)"}
+  validate -- invalid --> band2["band 2: invalid plan<br/>no Running record, no backend run"]
+  validate -- valid --> sup["supervisor::run_job<br/>Running record BEFORE boot (INV-6)"]
   sup --> cred{"--credential?"}
   cred -- yes --> mint["mint_lease → stage token 0600<br/>(revoke at teardown)"]
   cred -- no --> egress
@@ -135,11 +137,10 @@ serve_mesh_accept_loop` against a per-run bearer token bound to the
   the next client that attaches, live or after the job has finished, gets it
   as an archive frame.
 - `RunControl`'s live deadline suspension (unlimited while attached, a grace
-  period once everyone detaches) is honored by the process backend's poll
-  loop today. The VM backends' console-protocol read loop does not yet poll
-  it live — a VM-backed job still runs to its fixed original budget
-  regardless of attach state (open PR #366 fixes this; see
-  [`../decisions/sandyd.md`](../decisions/sandyd.md) decision 14's amendment).
+  period once everyone detaches) is honored by both backends' poll loops: the
+  process backend's own poll loop, and, since #366, the VM backends' console
+  driver too (see [`../decisions/sandyd.md`](../decisions/sandyd.md)
+  decision 14's amendment).
 
 ## Testing, split two ways
 
