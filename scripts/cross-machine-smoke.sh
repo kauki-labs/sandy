@@ -23,10 +23,12 @@
 #   SANDY_SOCK           control socket path (default /tmp/sandyd-smoke.sock)
 #   MESH_PORT            orchestrator mesh-listen port (default 4000)
 #   AGENT_LINK_PORT      orchestrator agent-link port (default 4001)
-#   EXECUTOR_REMOTE_DIR  remote checkout path. Default: a fresh, run-unique
-#                        /tmp dir, removed on exit — safe for concurrent
-#                        runs against the same executor. Set this to reuse
-#                        (and wipe-before-sync) a persistent path instead.
+#   EXECUTOR_REMOTE_DIR  remote checkout path. Default: a fresh directory
+#                        from the executor's own `mktemp -d`, removed on
+#                        exit — safe for concurrent runs against the same
+#                        executor, and immune to a predictable-path race
+#                        (CWE-377). Set this to reuse (and wipe-before-sync)
+#                        a persistent path instead.
 #   EXECUTOR_HOST_ID     the host_id sandy-host-executor registers as
 #                        (default: EXECUTOR_SSH_TARGET's host part)
 set -euo pipefail
@@ -46,11 +48,7 @@ mesh_port=${MESH_PORT:-4000}
 link_port=${AGENT_LINK_PORT:-4001}
 remote_dir_is_default=1
 remote_dir=${EXECUTOR_REMOTE_DIR:-}
-if [ -n "$remote_dir" ]; then
-  remote_dir_is_default=
-else
-  remote_dir="/tmp/sandy-smoke-test-$$"
-fi
+[ -z "$remote_dir" ] || remote_dir_is_default=
 host_id=${EXECUTOR_HOST_ID:-${executor_ssh##*@}}
 
 command -v jq >/dev/null 2>&1 || {
@@ -123,14 +121,22 @@ grep -q "sandyd listening" "$sandyd_log" || {
   exit 1
 }
 
+if [ -n "$remote_dir_is_default" ]; then
+  # Remote mktemp -d: atomic and unpredictably named, unlike a PID-based path
+  # with a separate rm/mkdir — that race lets another local user on the
+  # executor host plant a symlink at the predictable name between the two
+  # (CWE-377), redirecting the sync and build onto attacker-controlled files.
+  remote_dir=$(ssh "$executor_ssh" "mktemp -d -t sandy-smoke-XXXXXX")
+else
+  # An explicit, reused EXECUTOR_REMOTE_DIR: wipe it fresh before syncing.
+  # `rsync --delete --files-from` only prunes among the listed paths, so a
+  # file dropped from git tracking since an earlier run against this same
+  # path could otherwise linger there indefinitely, defeating the
+  # git-ls-files filter below for exactly the stale leftover case it exists
+  # to prevent.
+  ssh "$executor_ssh" "rm -rf '$remote_dir' && mkdir -p '$remote_dir'"
+fi
 echo "==> syncing this checkout to $executor_ssh:$remote_dir" >&2
-# Wipe and recreate fresh: a no-op for the default per-run dir, but load-
-# bearing for an explicit, reused EXECUTOR_REMOTE_DIR — `rsync --delete
-# --files-from` only prunes among the listed paths, so a file dropped from
-# git tracking since a previous run against that same path could otherwise
-# linger there indefinitely, defeating the git-ls-files filter below for
-# exactly the stale leftover case it exists to prevent.
-ssh "$executor_ssh" "rm -rf '$remote_dir' && mkdir -p '$remote_dir'"
 # Only git-tracked files: rsyncing the whole tree (even with excludes) drops
 # .git, so Nix treats the remote dir as a non-git path: flake that ignores
 # .gitignore entirely — an untracked secret (.env, a local credential file)
