@@ -491,12 +491,15 @@ transport work.
 
 **Context.** §11's `EscalationRole::escalate` posts to the escalation channel
 AND notifies a sink synchronously, at escalation time — a best-effort push.
-Epic #205's settled design routes escalations to the operator through a
+Epic #205's settled design routes escalations to whoever's watching through a
 master-controller client that subscribes to the channel; that client did not
-exist yet. Issue #161 scopes the richer version of this (Telegram bot +
-subscribed-Claude-session backends, a bidirectional reply path, and a richer
-`EscalationRequest{severity,summary,context_ref}` payload from #130), but #130
-is an open, unresolved design question, not a built type.
+exist yet. Issue #161 scopes the richer version of this — `EscalationSink` is
+a well-defined, pluggable interface, deliberately not tied to any one
+notification channel: a chat app (Telegram, Slack), a paging service
+(PagerDuty, a webhook), or a harness/agent session subscribed to the same
+stream are all equally valid backends. It adds a bidirectional reply path and
+a richer `EscalationRequest{severity,summary,context_ref}` payload from #130,
+but #130 is an open, unresolved design question, not a built type.
 
 **Decision.** `EscalationRelay<B, A, S>` (`sandy-fabric-local`, `roles.rs`)
 wraps a `Channel<B, A>` and subscribes from its own membership's cursor,
@@ -511,9 +514,10 @@ the relay, and neither case is silent.
 
 The first concrete `EscalationSink` is `LogEscalationSink`
 (`escalation_sink.rs`): always enabled, logs every escalation via
-`tracing::error!`. This is a real backend, not a stub: it is exactly the
-"escalation reaches me via a subscribed Claude session" path (M4) when that
-session's terminal/log stream is what the operator is watching.
+`tracing::error!`. This is a real backend, not a stub: it's the baseline
+"escalation reaches whoever is watching the log/terminal stream" path — any
+process tailing that stream (a human's shell, a harness, a monitoring
+agent) sees it, with no dependency on which specific tool that is.
 
 **Consequences.** The relay is the durable complement to `escalate`'s
 best-effort sink call: because `Channel::subscribe` resumes from a cursor
