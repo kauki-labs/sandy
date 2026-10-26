@@ -515,8 +515,9 @@ the relay, and neither case is silent.
 The first concrete `EscalationSink` is `LogEscalationSink`
 (`escalation_sink.rs`): always enabled, logs every escalation via
 `tracing::error!`. This is a real backend, not a stub: it's the baseline
-"escalation reaches whoever is watching the log/terminal stream" path — any
-process tailing that stream (a human's shell, a harness, a monitoring
+"escalation is emitted through the configured tracing output" path. Its
+visibility depends on the active subscriber, filters, and output routing —
+whatever's consuming that output (a human's shell, a harness, a monitoring
 agent) sees it, with no dependency on which specific tool that is.
 
 **Consequences.** The relay is the durable complement to `escalate`'s
