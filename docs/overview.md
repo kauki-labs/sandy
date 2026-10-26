@@ -135,9 +135,9 @@ session's own observer rights. Detaching does not end the job: `sandyd`'s
 `attach_relay` (`crates/sandyd/src/attach_relay.rs`) keeps relaying the live
 process over the job's own channel, and, for process-backed jobs, a detached
 job's deadline falls back to a shorter grace period rather than running
-unlimited forever once nobody is attached. VM-backed jobs don't honor live
-attach state yet (open PR #366; see `kpi.md`'s note on #185/#340) and keep
-running to their fixed original budget regardless.
+unlimited forever once nobody is attached. VM-backed jobs honor live attach
+state too (#366; see `kpi.md`'s note on #185/#340), the same way
+process-backed ones do.
 
 Landed on `main` (#378): the archived-transcript path. A job's stdin/stdout
 for its whole lifetime, bounded by `SANDY_HISTORY_LINES` (default 10,000,
@@ -148,16 +148,14 @@ after the job has already finished, receives it as an archive frame
 (`attach.rs::write_archive`) — usable even if nobody ever attached live or
 the job and its VM are long gone.
 
-**Known gap, named (open PR #366, related #185).** `RunControl`'s live
-deadline suspension/extension — the mechanism "unlimited while attached"
-needs — is honored by the process backend's poll loop today, but NOT yet by
-the VM backends (qemu/vfkit): their console-protocol read loop still enforces
-the static timeout computed once at job start, so a VM-backed job's timeout
-keeps counting down regardless of attach state, and `daemon cancel` has no
-effect on an in-flight VM job either. PR #366 (open, not yet merged to
-`main`) fixes this; until it merges, treat "unlimited while attached" as
-process-backend-only. See `decisions/sandyd.md` decision 14's amendment for
-the full record.
+**Resolved (#366, related #185).** `RunControl`'s live deadline
+suspension/extension — the mechanism "unlimited while attached" needs — is
+now honored by both backends: the process backend's own poll loop, and the
+VM backends' (qemu/vfkit) console driver, which re-checks the live
+deadline/cancellation on every ~250ms poll tick instead of enforcing a
+static timeout computed once at job start. `daemon cancel` now ends an
+in-flight VM job the same way it already ended a process-backed one. See
+`decisions/sandyd.md` decision 14's amendment for the full record.
 
 ### Known gaps and operations
 
