@@ -218,7 +218,7 @@ B2's report path takes as the job's real result — an INV-11 break. Encryption
 alone does not close this: the attacker is a legitimately mesh-authenticated
 peer, just not the right one.
 
-**Decision** (architect ruling, infra-f3, full record on issue #212):
+**Decision** (an in-the-moment decision, full record on issue #212):
 
 - A run id is an addressing label only, never an authorization token.
 - At dispatch, B2 records the run's executor mesh IP **and** a fresh 32-byte
@@ -268,7 +268,7 @@ secret.
 
 ## 7. Frontend build order: CLI first; MCP is a thin layer over a GraphQL/REST API, never a direct control-RPC client
 
-**Status:** accepted (operator directive, relayed by infra-f3).
+**Status:** accepted (an in-the-moment decision).
 
 **Context.** `sandyd` has two eventual client surfaces: the `sandy` CLI (B4,
 already building against the control RPC directly) and an MCP frontend for
@@ -299,10 +299,10 @@ of a purpose-built client API.
 
 ## 8. Milestone 2: multiple remote sandboxes, each running the agent, communicating with each other
 
-**Status:** accepted (operator directive, relayed by infra-f3).
+**Status:** accepted (an in-the-moment decision).
 
 **Context.** M2 had been read as "dispatch one job to one remote executor."
-The operator's actual bar is bigger: "multiple remote sandboxes communicating,
+The actual bar is bigger: "multiple remote sandboxes communicating,
 agent inside each."
 
 **Decision.** M2 is done when all three hold at once:
@@ -548,7 +548,7 @@ length-prefixed framing. `sandyd::host_registry` (`ExecutorAllowlist`,
 orchestrator side end to end: authenticate an incoming `Register` against the
 allowlist, reply `Registered`/`RegisterRefused`, then relay `Dispatch`
 messages queued for that host down its one persistent connection until it
-closes. The executor side (#283, sandy-91) is also done: `sandy-host-executor`'s
+closes. The executor side (#283) is also done: `sandy-host-executor`'s
 `handle_dispatch` decodes a `Dispatch`, independently re-checks the isolation
 class, launches the trusted-process sandbox, and forwards its agent's link
 back over the mesh. `sandyd`'s `main.rs` binds the mesh accept loop and calls
@@ -574,8 +574,8 @@ that declaration, never a hardcoded host) plus the dispatch RPC.
   the host's liveness signal — no separate heartbeat protocol, and (per #269)
   no re-registration machinery for stage 1.
 - `Register`'s `host_id` is self-reported and used for bookkeeping/placement
-  only — it is never the authorization boundary (an architect ruling,
-  infra-f3, on #263): the orchestrator authenticates the registrant by the
+  only — it is never the authorization boundary (an in-the-moment decision
+  on #263): the orchestrator authenticates the registrant by the
   _transport's_ own peer identity (the mesh IP `sandy_conn::PeerAddr::Tcp`
   reports) against `ExecutorAllowlist`, the same "never trust a self-reported
   value for authorization" discipline decision 6 already applies to the
@@ -594,7 +594,7 @@ that declaration, never a hardcoded host) plus the dispatch RPC.
 - `sandy-executor-proto` is its own crate (not folded into
   `sandy-control-proto`), landed as a standalone artifact before either side's
   implementation, so the orchestrator half (this slice) and the executor half
-  (sandy-91, #263) build against one shared type definition instead of two
+  (#263) build against one shared type definition instead of two
   independently-declared, potentially-diverging copies.
 - `register` guards against two gaps a CodeRabbit review on this PR caught:
   a `host_id` already claimed by a different allowlisted peer is refused
@@ -650,13 +650,16 @@ The mesh_accept (agent-link) listener is also built, bound via its own
 listener, it has no graceful-shutdown support of its own yet (see
 Consequences).
 
-**Context.** #291's architect rulings (relayed by infra-f3): two separate
+**Context.** #291's in-the-moment decisions: two separate
 mesh-bound listeners/ports (the host_conn management channel and the
 mesh_accept agent-link accept are different wire protocols — the contract
 already keeps them distinct via `Dispatch.forward_back`'s own host:port), not
 one multiplexed port demuxing on the first frame (simplicity-first for M2).
-Bind address is config-driven, never hardcoded, mesh-only (D5) — an operator
-sets it per node, the nix service unit (#287) injects it in production.
+Bind address is config-driven, never hardcoded, bound to whatever network
+satisfies D5's peer-identity requirement (recommended: a WireGuard-/
+Tailscale-style mesh; see `docs/design/host-executor/spec.md`'s manual
+smoke test) — set per node, the nix service unit (#287) injects it in
+production.
 
 **Decision.**
 
@@ -696,7 +699,7 @@ inconsistent with the binary's own established shape, not a simplification.
 
 ## 14. Stage 1: one host-executor handles one dispatch at a time, sequentially (#288)
 
-**Status:** accepted (architect ruling, infra-f3).
+**Status:** accepted (an in-the-moment decision).
 
 **Context.** `sandy-host-executor`'s main loop (#288) reads `Dispatch` messages
 off its one persistent connection to the orchestrator and runs each through
@@ -885,7 +888,7 @@ visible to the control-socket/`handler` path; `handler::handle`'s `Submit`
 arm never called `HostRegistry::send_dispatch`; `mesh_accept::serve_mesh_accept_loop`
 (#279) was built but never invoked from `main.rs`. A submitted job could
 never reach a registered remote executor — #277's PR body flagged this as a
-known follow-on that hadn't landed (#298, found by sandy-d9 building #272's
+known follow-on that hadn't landed (#298, found while building #272's
 happy path).
 
 **Decision.**
@@ -1003,7 +1006,7 @@ to decide between yet.
 
 **Context.** Decision 12's "the connection is the liveness signal" model
 (#269) assumed a closed TCP connection is the only way a host-executor goes
-away. sandy-73's fd-lifecycle review of #277/#284 found the gap: without
+away. A fd-lifecycle review of #277/#284 found the gap: without
 `SO_KEEPALIVE` or a read deadline, a **vanished** peer (power cut, network
 partition) leaves a half-open connection the kernel still reports as open —
 it stays dispatch-eligible, and dispatches sent to it vanish into the kernel
@@ -1074,7 +1077,7 @@ that branch never actually partial-reads in practice.
   registry.
 
 **Consequences.** `sandy-conn`'s public surface grows by one struct and two
-functions; nothing existing changed shape. #289 item 4 (`sandy-91`'s relay
+functions; nothing existing changed shape. #289 item 4 (the relay's own
 wall-clock bound) remains open and is unaffected by this change. A regression
 test for each item proves the mechanism directly rather than racing on
 timing: `apply_tcp_keepalive_sets_the_kernel_sockopts` reads the sockopts

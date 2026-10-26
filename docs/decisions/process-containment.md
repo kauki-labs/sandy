@@ -156,8 +156,8 @@ probe but rejects one of the wrapper's own mounts under its LSM/seccomp policy
 would otherwise set `confines_filesystem() == true` while every subsequent job's
 `bwrap` dies before `exec`, a setup failure indistinguishable from an ordinary
 nonzero guest exit (INV-11). Sharing the literal argv builder, not a duplicated
-flag list, closes the whole parity class by construction (caught by sandy-b6's
-adversarial pass).
+flag list, closes the whole parity class by construction (caught by an
+adversarial review pass).
 
 **Consequences.** Write-confinement (a job cannot alter the read-only host-root bind
 or a read-only share; the designated writable output share stays writable, by
@@ -181,7 +181,7 @@ namespace: out of scope (egress is a separate seam); bwrap keeps net shared.
 
 ## 6. Untrusted jobs are VM-only; the process backend never admits them (#150)
 
-**Status:** accepted (operator decision, 2026-10-17). **Upholds:** INV-7.
+**Status:** accepted (an in-the-moment decision, 2026-10-17). **Upholds:** INV-7.
 
 **Context.** Decisions #2 and #5 keep `isolates_untrusted` false on the process
 backend because its confinement does not protect the host. Under A1 the job can read
