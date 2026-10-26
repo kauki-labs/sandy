@@ -167,9 +167,13 @@ every knob below from environment variables — there is no CLI flag form.
    unspecified bind). `SANDY_MESH_ALLOWLIST` is a comma-separated IP list; an unset or empty
    allowlist with a listener configured is treated as a misconfiguration and refused, not a
    deliberate allow-no-one policy. This allowlist is the authorization boundary (D5: the
-   orchestrator trusts the mesh's own per-peer identity, not a self-reported `host_id`) — the
-   underlying mesh (WireGuard/Tailscale) must already bind each node to its own `/32` peer
-   address before `sandyd` sees any of this as meaningful.
+   orchestrator trusts the network's own per-peer identity, not a self-reported `host_id`) — so
+   the only real requirement is a network where a peer's source IP reliably and exclusively
+   identifies that one host (no spoofing, no NAT sharing it with another node). A WireGuard- or
+   Tailscale-style mesh is the **recommended** way to get that property and is what this example
+   uses, but it isn't mandatory: any network satisfying it works, and cross-machine dispatch
+   itself stays fully optional — an unset `SANDY_MESH_LISTEN` keeps `sandyd` local-only with no
+   loss of function for single-host use.
 
 2. **Executor** (the remote host): `SANDY_AGENT_PATH` **must** resolve inside the `bwrap`
    sandbox the trusted-process backend launches the job in (`--ro-bind / /`, then
