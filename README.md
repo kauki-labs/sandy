@@ -185,6 +185,13 @@ canonical source Claude Code and GitHub Copilot both read natively. Full
 architecture, design decisions, and subsystem specs are under
 [`docs/`](docs/overview.md).
 
+### direnv (optional)
+
+With [direnv](https://direnv.net/) installed, `direnv allow` in the repo root
+loads the Nix dev shell and pre-commit hooks automatically on `cd`, so you
+don't need to run `nix develop` by hand each time. Without it, use `nix
+develop` directly as shown in [`AGENTS.md`'s Setup](AGENTS.md#setup).
+
 ## License
 
 Sandy is dual-licensed:

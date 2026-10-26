@@ -12,7 +12,10 @@ separate commercial license for use that cannot meet the AGPL's terms (see
 [COMMERCIAL.md](COMMERCIAL.md)). For the project to offer that commercial license,
 it must hold sufficient rights in every contribution. By submitting a
 contribution (a pull request, patch, or any other work), you agree to the
-following with the project maintainer, **Tibor Csóka** ("the Maintainer"):
+following with the project's current maintainer, **Tibor Csóka** ("the
+Maintainer"). This grant runs to the Maintainer and to any successor who
+takes over maintainership of this project (by transfer, assignment, or
+otherwise); it does not need to be re-granted on a change of maintainer:
 
 - **Grant.** You grant the Maintainer a perpetual, worldwide, non-exclusive,
   royalty-free, irrevocable license to reproduce, prepare derivative works of,
@@ -81,9 +84,16 @@ changelog.
 
 Publishing uses crates.io [trusted publishing](https://crates.io/docs/trusted-publishing):
 the release job mints a short-lived token from GitHub's OIDC identity, so there
-is no long-lived `CARGO_REGISTRY_TOKEN` in the repo. Before the first publish,
-register this repo and the `Release` workflow as a Trusted Publisher for each
-crate on crates.io; until that is set up the publish step fails closed.
+is no long-lived `CARGO_REGISTRY_TOKEN` in the repo. This is configured for
+`kauki-labs/sandy`'s own crates.io namespace (`sandy-lib`, `sandy-backend`,
+`sandy-cli`) only — it is not something a fork inherits. If you want to
+contribute, open a PR here rather than publishing your own crates under these
+names. If you're standing up your own deployment or a derivative project under
+the license (see [COMMERCIAL.md](COMMERCIAL.md) if the AGPL's terms don't fit
+your use), you'll register your own repo and workflow as a Trusted Publisher
+against your own crates.io namespace, likely under different crate names since
+these ones are already taken; until that's set up on your side, the publish
+step fails closed in your fork too.
 
 ## Conduct
 
