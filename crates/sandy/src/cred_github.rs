@@ -150,7 +150,11 @@ impl GithubAdapter {
 
     /// An App-JWT-authenticated octocrab client (authenticates as the App itself).
     fn app_client(&self) -> Result<Octocrab, CredError> {
-        let key = jsonwebtoken::EncodingKey::from_rsa_pem(&self.key_pem)
+        // octocrab's own re-exported jsonwebtoken, not our workspace's direct
+        // dependency: octocrab 0.54.5 pins jsonwebtoken ~10.x internally, and
+        // `.app()` below takes its `EncodingKey` specifically — a key built
+        // from a different jsonwebtoken major version is a distinct type.
+        let key = octocrab::jsonwebtoken::EncodingKey::from_rsa_pem(&self.key_pem)
             .map_err(|e| CredError::Mint(format!("parse App private key: {e}")))?;
         Octocrab::builder()
             .base_uri(&self.api_base)
