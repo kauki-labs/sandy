@@ -96,22 +96,50 @@ fn acquire_host_lock() -> anyhow::Result<File> {
     // nix-sandboxed build setting its own TMPDIR) — two processes that disagree on the
     // lock's path never contend on the same file, defeating the lock entirely.
     let path = Path::new("/tmp/sandy-live-egress.lock");
-    // `mode(0o666)` requests world read/write on creation, but the process umask still
-    // masks it (typically down to 0o644) — that would leave the lock unwritable by a
-    // later `SANDY_EGRESS_NETNS=1` run under a different, unprivileged host user than
-    // whichever user/mode created it. `set_permissions` below bypasses umask (chmod,
-    // not creation) to force 0o666 regardless, so every execution mode can reopen it.
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .mode(0o666)
-        .open(path)
-        .with_context(|| format!("open {} for the live_egress host lock", path.display()))?;
-    // Best-effort: succeeds when we own the file or are root (the common case, since
-    // the gate itself needs root or an equivalent netns identity); a failure here means
-    // the file was already permissive enough for us to have opened it above.
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666));
+    // NOFOLLOW: refuse a pre-planted symlink at the lock's path rather than opening
+    // (and later chmod-ing) through it.
+    let nofollow = rustix::fs::OFlags::NOFOLLOW.bits() as i32;
+    let open_existing = || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(nofollow)
+            .open(path)
+    };
+    // Open without O_CREAT first, falling back to a create only on the one-time-ever
+    // path where the file doesn't exist yet. `fs.protected_regular` (default-on on
+    // several hardened distros) refuses an O_CREAT open on a regular file we don't own
+    // inside a world-writable sticky directory like /tmp — plain re-opens never trip
+    // that restriction, only a creating open would, so later runs under a different
+    // user/mode than whichever one created the file stay unaffected.
+    let file = match open_existing() {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            // `create_new` is atomic (O_CREAT|O_EXCL): either we win the creation race
+            // and `mode(0o666)` sets its permissions outright, or we lose it to a
+            // sibling process and fall back to the plain reopen above.
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .mode(0o666)
+                .custom_flags(nofollow)
+                .create_new(true)
+                .open(path)
+            {
+                Ok(file) => file,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => open_existing()
+                    .with_context(|| format!("reopen {} for the live_egress host lock", path.display()))?,
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("create {} for the live_egress host lock", path.display()));
+                }
+            }
+        }
+        Err(err) => return Err(err).with_context(|| format!("open {} for the live_egress host lock", path.display())),
+    };
+    // Best-effort, through the open fd (fchmod) rather than the pathname (which would
+    // reopen a TOCTOU window the NOFOLLOW above just closed): succeeds when we own the
+    // file or are root; a failure means it was already permissive enough for the opens
+    // above to have succeeded regardless of which execution mode created it first.
+    let _ = file.set_permissions(std::fs::Permissions::from_mode(0o666));
     rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive)
         .with_context(|| format!("flock {}", path.display()))?;
     Ok(file)
