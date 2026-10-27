@@ -5,6 +5,7 @@
 //! in the library modules; `main` only parses argv, selects the host backend, and
 //! maps results to process exit bands (INV-11).
 
+use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use sandy::{Capability, CoreError, GithubAdapter, Journal, ProcessExit, Scope, TrustRoot, TrustRootIo};
 use sandy_cli::{
@@ -196,6 +197,17 @@ enum DaemonOp {
         /// `--flake`; empty means "boot the template's default command").
         #[arg(last = true, requires = "flake")]
         command: Vec<String>,
+        /// A capability this submitter already holds (decision C-at-Submit,
+        /// #226), base64-encoded — the exact encoding `sandy daemon attach -o
+        /// json`'s own `cap` field already prints, so a cap handed back by an
+        /// earlier `attach` can be copied straight into this flag. Repeatable:
+        /// each occurrence becomes one entry of `SubmitRequest.submitter_caps`.
+        /// #232's "where does a submitter's own cap come from" is answered by
+        /// this round trip for now — there is no separate local cap store or
+        /// issuance flow yet, only a way to re-present a cap the operator
+        /// already has in hand.
+        #[arg(long = "cap")]
+        caps: Vec<String>,
     },
     /// Cancel a submitted job.
     Cancel {
@@ -549,6 +561,28 @@ fn read_manifest(path: &str) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Decode each `--cap` value from base64 into the raw bytes
+/// `SubmitRequest.submitter_caps` carries (#232) — the same encoding `sandy
+/// daemon attach -o json`'s own `cap` field already prints, so a cap handed
+/// back by an earlier `attach` round-trips straight into this flag. A
+/// malformed value refuses the whole submit outright (naming which one, 1
+/// based so it matches how a human counts repeated flags), never silently
+/// dropping it and falling back to a direct-mint submit the caller didn't
+/// ask for.
+///
+/// # Errors
+/// Names the 1-based position of the first value that isn't valid base64.
+fn decode_submitter_caps(caps: Vec<String>) -> Result<Vec<Vec<u8>>, String> {
+    caps.into_iter()
+        .enumerate()
+        .map(|(index, cap)| {
+            base64::engine::general_purpose::STANDARD
+                .decode(&cap)
+                .map_err(|e| format!("--cap #{} is not valid base64: {e}", index + 1))
+        })
+        .collect()
+}
+
 /// Dispatch `sandy daemon <op>`: drives its own async connection, since `main`
 /// is synchronous like the rest of the CLI (`app_register`'s octocrab calls
 /// use the same build-a-runtime-and-block-on pattern for the same reason).
@@ -608,6 +642,7 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
             kind,
             history_lines,
             command,
+            caps,
         } => {
             // clap's `required_unless_present = "flake"`/`conflicts_with`
             // pairs above guarantee exactly one of `manifest` or `flake` is
@@ -644,13 +679,17 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
                 };
                 (bytes, encoding)
             };
+            let submitter_caps = match decode_submitter_caps(caps) {
+                Ok(caps) => caps,
+                Err(e) => {
+                    eprintln!("sandy: {e}");
+                    return ProcessExit::InvalidPlan.code();
+                }
+            };
             control_request::Op::Submit(SubmitRequest {
                 manifest: bytes,
                 manifest_encoding: encoding,
-                // No cap-supply flow for the CLI yet (#232): a direct-mint
-                // submit, same as today, never a silent way to claim bounded
-                // caps without actually presenting any.
-                submitter_caps: Vec::new(),
+                submitter_caps,
             })
         }
         DaemonOp::Cancel { job_id } => control_request::Op::Cancel(CancelRequest { job_id }),
@@ -1229,5 +1268,28 @@ mod tests {
             .expect_err("an unknown capability must be rejected");
         assert!(err.contains("unknown --cred-capability"), "got: {err}");
         Ok(())
+    }
+
+    #[test]
+    fn decode_submitter_caps_round_trips_base64() -> anyhow::Result<()> {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(b"a-real-cap-blob");
+        let decoded = decode_submitter_caps(vec![encoded]).map_err(|e| anyhow::anyhow!(e))?;
+        assert_eq!(decoded, vec![b"a-real-cap-blob".to_vec()]);
+        Ok(())
+    }
+
+    #[test]
+    fn decode_submitter_caps_allows_no_caps_at_all() -> anyhow::Result<()> {
+        let decoded = decode_submitter_caps(Vec::new()).map_err(|e| anyhow::anyhow!(e))?;
+        assert!(decoded.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn decode_submitter_caps_names_the_1_based_position_of_a_bad_value() {
+        let good = base64::engine::general_purpose::STANDARD.encode(b"fine");
+        let err = decode_submitter_caps(vec![good, "not valid base64!!".to_owned()])
+            .expect_err("a malformed second --cap must be refused");
+        assert!(err.contains("--cap #2"), "got: {err}");
     }
 }

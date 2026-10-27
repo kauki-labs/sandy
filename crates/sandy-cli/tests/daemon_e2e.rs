@@ -288,3 +288,72 @@ fn sandyd_bin_resolves_from_the_env_var_when_set() -> anyhow::Result<()> {
     assert_eq!(resolved, std::path::PathBuf::from("/some/nix/store/path/bin/sandyd"));
     Ok(())
 }
+
+/// Adversarial (#232): a malformed `--cap` value is refused as an invalid
+/// plan, naming its 1-based position — never silently dropped to fall back
+/// to a direct-mint submit the caller didn't ask for.
+#[test]
+fn submit_with_malformed_cap_base64_is_an_invalid_plan() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir().context("temp dir")?;
+    let daemon = spawn_daemon(tmp.path())?;
+
+    let manifest = tmp.path().join("manifest.bin");
+    std::fs::write(&manifest, b"opaque").context("write manifest")?;
+
+    let submit = sandy(
+        &daemon,
+        &[
+            "daemon",
+            "submit",
+            manifest.to_str().context("manifest path is utf8")?,
+            "--manifest-encoding",
+            "test/v1",
+            "--cap",
+            "not valid base64!!",
+        ],
+    )?;
+    assert_eq!(submit.status.code(), Some(2), "stderr: {}", stderr_of(&submit));
+    assert!(
+        stderr_of(&submit).contains("--cap #1"),
+        "stderr must name the malformed flag's position: {}",
+        stderr_of(&submit)
+    );
+    Ok(())
+}
+
+/// Positive (#232): a `--cap` value that IS valid base64 reaches `sandyd`
+/// over the wire — proven by the daemon's own refusal, since garbage bytes
+/// (valid base64, not a real encoded `Cap`) fail `decode_cap` server-side
+/// rather than the CLI silently dropping the flag before it ever sends
+/// anything.
+#[test]
+fn submit_with_a_well_formed_but_unreal_cap_reaches_the_daemons_own_decode() -> anyhow::Result<()> {
+    use base64::Engine as _;
+
+    let tmp = tempfile::tempdir().context("temp dir")?;
+    let daemon = spawn_daemon(tmp.path())?;
+
+    let manifest = tmp.path().join("manifest.bin");
+    std::fs::write(&manifest, b"opaque").context("write manifest")?;
+    let not_a_real_cap = base64::engine::general_purpose::STANDARD.encode(b"not-a-real-encoded-cap");
+
+    let submit = sandy(
+        &daemon,
+        &[
+            "daemon",
+            "submit",
+            manifest.to_str().context("manifest path is utf8")?,
+            "--manifest-encoding",
+            "test/v1",
+            "--cap",
+            &not_a_real_cap,
+        ],
+    )?;
+    assert_eq!(submit.status.code(), Some(2), "stderr: {}", stderr_of(&submit));
+    assert!(
+        stderr_of(&submit).contains("could not decode a submitter capability"),
+        "the daemon's own refusal must name the real cause, proving the --cap bytes reached it: {}",
+        stderr_of(&submit)
+    );
+    Ok(())
+}
