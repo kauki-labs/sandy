@@ -162,17 +162,25 @@ in
       startSession = true;
     };
 
-    # #300(b): defense-in-depth, inert under the default
-    # `KillUserProcesses=false` (confirmed, sandy-73/#299 — NixOS defaults it
-    # to `false`, under which logind kills nothing on session end regardless
-    # of this list, and `StopIdleSessionSec` doesn't fire on this TTY-less
-    # session anyway). What actually keeps a dispatched job alive is
-    # lingering keeping `user@<uid>.service` running independent of any
-    # login session (see nix/tests/sandy-executor-vm.nix's job-cgroup
-    # assertion, and tracking issue #302 for the one open gap: if the remote host ever
-    # sets `StopIdleSessionSec` itself, protection is logind's no-TTY idle
-    # model, not this drop-in). Kept anyway in case the remote host's own config ever
-    # turns `KillUserProcesses` on for other accounts — a drop-in, not
+    # #300(b): defense-in-depth for sandy-executor.service's OWN main
+    # process, not a dispatched job. The process runs in its PAMName
+    # session's own `session-N.scope` — `KillUserProcesses` (logind.conf(5))
+    # only ever reaps THAT, never anything under `user@<uid>.service` — so
+    # without this list, a remote host turning `KillUserProcesses` on would
+    # have logind force-kill the sandy-host-executor binary itself whenever
+    # its session ends (naturally, via its own `Restart=on-failure` cycling
+    # against a refused dial, or a real operator logout), instead of it
+    # exiting normally.
+    #
+    # It does NOT protect a dispatched job: that runs under
+    # `user@<uid>.service` (the job-cgroup assertion in
+    # nix/tests/sandy-executor-vm.nix), which `KillUserProcesses` never
+    # reaches regardless of this list. #302's VM test confirms the effective
+    # `KillExcludeUsers` value directly over D-Bus and separately confirms a
+    # dispatched job survives its session ending — but that survival is
+    # `Linger` overriding logind's own `UserStopDelaySec` default, not this
+    # list (an earlier version of both this comment and that test got this
+    # backwards; CodeRabbit + logind.conf(5) corrected it). A drop-in, not
     # `services.logind.settings`, because `KillExcludeUsers` is a
     # list-valued logind.conf key that ACCUMULATES across drop-in files
     # (systemd's own conf.d semantics) — this adds `sandy-executor` to

@@ -8,7 +8,7 @@
 //!
 //! [`EscalationRelay`]: crate::roles::EscalationRelay
 
-use sandy_fabric::escalation::{EscalationMessage, EscalationSink, EscalationSinkError};
+use sandy_fabric::escalation::{EscalationRequest, EscalationSink, EscalationSinkError};
 
 /// Logs every escalation via `tracing::error!`. Always enabled: there is no
 /// external dependency that could be down.
@@ -20,15 +20,21 @@ impl EscalationSink for LogEscalationSink {
         true
     }
 
-    async fn notify(&self, message: &EscalationMessage) -> Result<(), EscalationSinkError> {
-        tracing::error!(from = %message.from.0, reason = ?message.reason, "sandbox escalation: needs a human");
+    async fn notify(&self, request: &EscalationRequest) -> Result<(), EscalationSinkError> {
+        tracing::error!(
+            from = %request.from.0,
+            severity = ?request.severity,
+            summary = %request.summary,
+            context_ref = %request.context_ref,
+            "sandbox escalation: needs a human"
+        );
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use sandy_fabric::types::PeerId;
+    use sandy_fabric::{escalation::Severity, types::PeerId};
 
     use super::*;
 
@@ -36,9 +42,11 @@ mod tests {
     async fn the_sink_is_always_enabled_and_notify_always_succeeds() -> anyhow::Result<()> {
         let sink = LogEscalationSink;
         assert!(sink.enabled());
-        sink.notify(&EscalationMessage {
+        sink.notify(&EscalationRequest {
             from: PeerId::from("sandbox-1"),
-            reason: "needs human input".to_owned(),
+            severity: Severity::Critical,
+            summary: "needs human input".to_owned(),
+            context_ref: "job-42".to_owned(),
         })
         .await?;
         Ok(())

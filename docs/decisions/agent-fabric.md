@@ -497,20 +497,23 @@ exist yet. Issue #161 scopes the richer version of this — `EscalationSink` is
 a well-defined, pluggable interface, deliberately not tied to any one
 notification channel: a chat app (Telegram, Slack), a paging service
 (PagerDuty, a webhook), or a harness/agent session subscribed to the same
-stream are all equally valid backends. It adds a bidirectional reply path and
-a richer `EscalationRequest{severity,summary,context_ref}` payload from #130,
-but #130 is an open, unresolved design question, not a built type.
+stream are all equally valid backends. It adds a bidirectional reply path,
+tracked separately (#161) — not yet designed.
 
 **Decision.** `EscalationRelay<B, A, S>` (`sandy-fabric-local`, `roles.rs`)
 wraps a `Channel<B, A>` and subscribes from its own membership's cursor,
 notifying an `EscalationSink` for every `Escalate`-typed envelope it decodes.
-Built against today's real wire shape (`EscalationMessage{from,reason}`, JSON
-payload) — not #130's richer, unbuilt shape, which is a future migration, not
-a present blocker. A sink notify failure retries (`DELIVERY_ATTEMPTS = 3`,
-a fixed short delay) before being logged at `error` level and skipped; a
-payload that fails to decode is likewise logged and skipped. Either case
-moves on to the next envelope — one bad or undeliverable message never wedges
-the relay, and neither case is silent.
+Built against `EscalationRequest{from,severity,summary,context_ref}` (#130,
+resolved: `sandy-fabric::escalation`), JSON payload — same convention as
+`Control`'s `ChannelAssignment` (§11). `severity` is a closed `Info | Warning
+| Critical` enum so an operator can triage without reading every message;
+`context_ref` is opaque to the fabric, same as `PeerMessage`'s payload — a job
+id, channel id, or URL the operator can use to find more detail, allowed to be
+empty. A sink notify failure retries (`DELIVERY_ATTEMPTS = 3`, a fixed short
+delay) before being logged at `error` level and skipped; a payload that fails
+to decode is likewise logged and skipped. Either case moves on to the next
+envelope — one bad or undeliverable message never wedges the relay, and
+neither case is silent.
 
 The first concrete `EscalationSink` is `LogEscalationSink`
 (`escalation_sink.rs`): always enabled, logs every escalation via
@@ -536,9 +539,8 @@ B2's orchestrator + B7's attach wiring, not yet built.
   itself verify against a real bot, so it is not shipped half-tested.
 - The operator reply-back path (#161): needs a channel-level mechanism for a
   reply to route back to the escalating sandbox, not yet designed.
-- Migrating `EscalationMessage` to #130's richer `EscalationRequest` shape:
-  #130 is an open question; the relay/sink migrate once it resolves.
 
-**Set aside.** Building the relay against #130's unbuilt `EscalationRequest`
-shape now: would presuppose an answer to an open design question instead of
-building against what the system actually carries today.
+**Set aside.** A richer `context_ref` schema (e.g. a typed enum of reference
+kinds instead of an opaque string): no current caller needs to distinguish
+reference kinds, and the fabric never interprets it regardless — the same
+reasoning that keeps `PeerMessage`'s payload opaque.
