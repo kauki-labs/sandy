@@ -36,6 +36,7 @@ use std::{
 pub use sandy_api::cred::{
     Capability, CredError, CredentialHandle, CredentialProvider, Lease, MAX_TTL_SECS, Minted, Scope, Target,
 };
+use zeroize::Zeroizing;
 
 use crate::backend::{DirFingerprint, SecretRef, SecretSource};
 
@@ -437,7 +438,10 @@ fn trust_dir_unsafe_error(e: sandy_fsutil::FsError) -> CredError {
 /// Returns [`CredError::Stage`] when the file grants group/other read (its mode has
 /// any `0o044` bit, e.g. `0644`) or cannot be read; a group/world-readable secret is
 /// refused, never read.
-pub fn read_secret_0600(path: &Path) -> Result<Vec<u8>, CredError> {
+///
+/// The bytes come back in a [`Zeroizing`] buffer, so they are zeroed when the
+/// caller drops them (#388).
+pub fn read_secret_0600(path: &Path) -> Result<Zeroizing<Vec<u8>>, CredError> {
     use std::io::Read;
 
     let (mut file, meta) = open_trust_file("secret", path)?;
@@ -448,7 +452,10 @@ pub fn read_secret_0600(path: &Path) -> Result<Vec<u8>, CredError> {
             path.display()
         )));
     }
-    let mut bytes = Vec::new();
+    // Sized up front so the buffer is not reallocated while it fills: a realloc
+    // would leave the old, smaller copy in freed memory, out of the wrapper's reach.
+    let capacity = usize::try_from(meta.len()).unwrap_or(0).saturating_add(1);
+    let mut bytes = Zeroizing::new(Vec::with_capacity(capacity));
     file.read_to_end(&mut bytes)
         .map_err(|e| stage_err("read secret", path, &e))?;
     Ok(bytes)
@@ -961,7 +968,9 @@ mod tests {
         let tight = tmp.path().join("tight");
         fs::write(&tight, b"key-bytes").context("write tight secret")?;
         fs::set_permissions(&tight, fs::Permissions::from_mode(0o600)).context("chmod 600")?;
-        assert_eq!(read_secret_0600(&tight).context("read 0600")?, b"key-bytes");
+        // The annotation is the #388 contract: the bytes come back in a zeroing buffer.
+        let bytes: Zeroizing<Vec<u8>> = read_secret_0600(&tight).context("read 0600")?;
+        assert_eq!(*bytes, b"key-bytes");
 
         let loose = tmp.path().join("loose");
         fs::write(&loose, b"key-bytes").context("write loose secret")?;
@@ -1069,7 +1078,7 @@ mod tests {
                 assert!(err.to_string().contains("not private"), "mode {mode:o}: {err}");
             }
         }
-        assert_eq!(read_secret_0600(&key)?, b"key-bytes", "a private dir still reads");
+        assert_eq!(*read_secret_0600(&key)?, b"key-bytes", "a private dir still reads");
         Ok(())
     }
 
