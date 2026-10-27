@@ -275,6 +275,13 @@ repo's own setup, not general git advice.
 - **A queued PR can be silently dequeued.** When another PR lands ahead of it
   and the base moves, `mergeQueueEntry` can go `null` while the PR is still
   `OPEN` — not a failure, just re-enqueue.
+- **A draft PR does not reliably block the merge queue in this repo.** Once a
+  draft PR goes green and approved, something here (observed on #443) flips it
+  back to "ready for review" on its own and auto-enqueues it, with no
+  `gh pr merge` call and no `autoMergeRequest` set. Converting to draft is not
+  a safe way to hold a PR mid-iteration — if it must not merge yet, dequeue it
+  explicitly (`dequeuePullRequest` on the PR's node id) every time this
+  happens, and expect to do it more than once across a review cycle.
 - **`start_paused` + a real I/O op (e.g. a real TCP dial) is flaky for timeout
   tests.** The virtual clock races the real connect; use real short durations
   instead of pairing a virtual clock with genuine I/O.
