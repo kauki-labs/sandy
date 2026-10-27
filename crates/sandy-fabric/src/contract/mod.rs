@@ -34,7 +34,7 @@ use sandy_proto::{MessageType, PeerMsg};
 
 use crate::{
     capauth::{CapAuthority, CapError, CapRights, CapScope},
-    channel_backend::{ChannelBackend, ChannelBackendError, Envelope, MSG_ID_KEY},
+    channel_backend::{AppendOutcome, ChannelBackend, ChannelBackendError, Envelope, MSG_ID_KEY},
     escalation::{EscalationRequest, EscalationSink, Severity},
     executor::{Arch, Capabilities, Executor, Requirements, SandboxKind},
     minter::{Minter, SecretRequest},
@@ -277,8 +277,16 @@ where
         "a fresh backend is empty",
     )?;
 
-    expect_ok(SEAM, "append", backend.append(env(2, "b")).await)?;
-    expect_ok(SEAM, "append", backend.append(env(1, "a")).await)?;
+    require(
+        SEAM,
+        expect_ok(SEAM, "append", backend.append(env(2, "b")).await)? == AppendOutcome::Stored,
+        "a new envelope's append reports Stored",
+    )?;
+    require(
+        SEAM,
+        expect_ok(SEAM, "append", backend.append(env(1, "a")).await)? == AppendOutcome::Stored,
+        "a new envelope's append reports Stored",
+    )?;
     let all = expect_ok(SEAM, "fetch", backend.fetch(0).await)?;
     require(
         SEAM,
@@ -288,8 +296,16 @@ where
     let tail = expect_ok(SEAM, "fetch", backend.fetch(2).await)?;
     require(SEAM, sequences(&tail) == [2], "fetch returns only sequence >= from_seq")?;
 
-    // A re-post carries the same content id under a new sequence.
-    expect_ok(SEAM, "append of a re-post", backend.append(env(5, "a")).await)?;
+    // A re-post carries the same content id under a new sequence. The
+    // returned outcome matters as much as the stored state: a caller that
+    // assigns sequences (the channel layer) must be able to tell a genuine
+    // store from a no-op repost, or it advances past a sequence nothing ever
+    // occupies — a permanent hole under #162's hold-back.
+    require(
+        SEAM,
+        expect_ok(SEAM, "append of a re-post", backend.append(env(5, "a")).await)? == AppendOutcome::Duplicate,
+        "a re-post's append reports Duplicate, not Stored",
+    )?;
     let all = expect_ok(SEAM, "fetch", backend.fetch(0).await)?;
     require(
         SEAM,
@@ -309,7 +325,11 @@ where
         let mut stream = pin!(backend.stream_from(2));
         let rule = "stream_from starts at from_seq";
         require(SEAM, next_sequence(&mut stream, deadline(), rule).await? == 2, rule)?;
-        expect_ok(SEAM, "append", backend.append(env(3, "c")).await)?;
+        require(
+            SEAM,
+            expect_ok(SEAM, "append", backend.append(env(3, "c")).await)? == AppendOutcome::Stored,
+            "a new envelope's append reports Stored",
+        )?;
         let rule = "stream_from follows an append made after the stream was opened";
         require(SEAM, next_sequence(&mut stream, deadline(), rule).await? == 3, rule)?;
     }
@@ -318,17 +338,29 @@ where
     let mut stream = pin!(backend.stream_from(3));
     let rule = "a resubscription at the cursor replays from it";
     require(SEAM, next_sequence(&mut stream, deadline(), rule).await? == 3, rule)?;
-    expect_ok(SEAM, "append", backend.append(env(4, "d")).await)?;
+    require(
+        SEAM,
+        expect_ok(SEAM, "append", backend.append(env(4, "d")).await)? == AppendOutcome::Stored,
+        "a new envelope's append reports Stored",
+    )?;
     let rule = "a resubscription follows live appends";
     require(SEAM, next_sequence(&mut stream, deadline(), rule).await? == 4, rule)?;
 
     // #162: a late-arriving lower sequence must hold back everything after it
     // while following live, never be silently skipped. `stream` is parked at 5
     // (the next sequence after 4); storing 6 first must not release it.
-    expect_ok(SEAM, "append", backend.append(env(6, "f")).await)?;
+    require(
+        SEAM,
+        expect_ok(SEAM, "append", backend.append(env(6, "f")).await)? == AppendOutcome::Stored,
+        "a new envelope's append reports Stored",
+    )?;
     let rule = "a gap at the follower's cursor holds back a higher sequence that arrived first";
     expect_held_back(&mut stream, deadline(), rule).await?;
-    expect_ok(SEAM, "append", backend.append(env(5, "e")).await)?;
+    require(
+        SEAM,
+        expect_ok(SEAM, "append", backend.append(env(5, "e")).await)? == AppendOutcome::Stored,
+        "a new envelope's append reports Stored",
+    )?;
     let rule = "filling the gap releases it, in order, before the sequence that arrived first";
     require(SEAM, next_sequence(&mut stream, deadline(), rule).await? == 5, rule)?;
     let rule = "the previously-held-back higher sequence follows once the gap is filled";

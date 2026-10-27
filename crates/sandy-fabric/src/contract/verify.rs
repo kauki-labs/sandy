@@ -137,7 +137,14 @@ async fn channel_backend_suite_rejects_dedup_on_sequence() {
         dedup_on_sequence: true,
         ..FakeBackend::default()
     };
-    assert_violates(channel_backend_suite(make, deadline).await, "keeps the first");
+    // Dedup-on-sequence never recognizes the re-post (a NEW sequence, not a
+    // collision), so it reports Stored where the suite expects Duplicate —
+    // that now trips before the older fetch-based "keeps the first" check
+    // ever runs.
+    assert_violates(
+        channel_backend_suite(make, deadline).await,
+        "reports Duplicate, not Stored",
+    );
 }
 
 #[tokio::test]
