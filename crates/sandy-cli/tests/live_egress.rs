@@ -89,13 +89,29 @@ fn tap_name() -> String {
 /// `Drop`), covering the guest boot too — a lock scoped to setup alone would still
 /// let a concurrent `Drop` tear down rules mid-boot.
 fn acquire_host_lock() -> anyhow::Result<File> {
-    let path = std::env::temp_dir().join("sandy-live-egress.lock");
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    // A literal "/tmp", not `std::env::temp_dir()`: the latter follows $TMPDIR, which
+    // can differ between invocations (a root run under `sudo` vs. a plain shell, or a
+    // nix-sandboxed build setting its own TMPDIR) — two processes that disagree on the
+    // lock's path never contend on the same file, defeating the lock entirely.
+    let path = Path::new("/tmp/sandy-live-egress.lock");
+    // `mode(0o666)` requests world read/write on creation, but the process umask still
+    // masks it (typically down to 0o644) — that would leave the lock unwritable by a
+    // later `SANDY_EGRESS_NETNS=1` run under a different, unprivileged host user than
+    // whichever user/mode created it. `set_permissions` below bypasses umask (chmod,
+    // not creation) to force 0o666 regardless, so every execution mode can reopen it.
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(&path)
+        .mode(0o666)
+        .open(path)
         .with_context(|| format!("open {} for the live_egress host lock", path.display()))?;
+    // Best-effort: succeeds when we own the file or are root (the common case, since
+    // the gate itself needs root or an equivalent netns identity); a failure here means
+    // the file was already permissive enough for us to have opened it above.
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666));
     rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive)
         .with_context(|| format!("flock {}", path.display()))?;
     Ok(file)
