@@ -659,8 +659,8 @@ pub async fn handle(
                 let known = tokio::task::spawn_blocking(move || store.status(&job_id)).await??;
                 let message = match known {
                     Some(_) => format!(
-                        "job {} has no live channel on this daemon (restarted since submit?); re-submit to get a new \
-                         one",
+                        "job {} has no live channel on this daemon (restarted since submit, or past its terminal \
+                         retention window); re-submit to get a new one",
                         attach.job_id
                     ),
                     None => format!("no such job: {}", attach.job_id),
