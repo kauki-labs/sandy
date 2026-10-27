@@ -337,12 +337,11 @@ async fn a_separate_attach_process_drives_a_real_vm_booted_on_remote_host() -> a
     let mut submitter_conn = tokio::net::UnixStream::connect(&orchestrator.sock)
         .await
         .context("connect the submitting control connection")?;
-    // A bare `sh` (no `-c` script): the VM agent's own
-    // `agent_shell_command` wraps whatever command this names as
-    // `sh -c '<command.join(" ")>'`, so a bare `sh` here runs a NESTED shell
-    // that reads commands interactively from its stdin — connected through
-    // the agent channel, exactly the "boot runs an interactive shell"
-    // fixture shape the acceptance bar asks for.
+    // A bare `sh` (no `-c` script, no args): the VM agent execs this job's
+    // argv directly (`impls/vm/src/agent.rs::agent_command_argv`), so `sh`
+    // with no arguments reads commands interactively from its stdin —
+    // connected through the agent channel, exactly the "boot runs an
+    // interactive shell" fixture shape the acceptance bar asks for.
     let mut submitter_request_id = 1;
     let (job_id, attach_token) = submit_flake_once_registered(
         &mut submitter_conn,

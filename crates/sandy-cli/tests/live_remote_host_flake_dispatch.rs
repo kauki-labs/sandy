@@ -245,9 +245,9 @@ async fn a_flake_templated_vm_job_dispatches_and_succeeds_on_remote_host() -> an
     let mut conn = tokio::net::UnixStream::connect(&orchestrator.sock)
         .await
         .context("connect the control socket")?;
-    // A deterministic, trivial guest command (`sh -c 'true'` once the VM
-    // agent wraps it, see `impls/vm/src/agent.rs::agent_shell_command`) —
-    // exit 0 regardless of which fixture flake this resolves, proving the
+    // A deterministic, trivial guest command: `true`, exec'd directly by the
+    // VM agent (`impls/vm/src/agent.rs::agent_command_argv`) — exit 0
+    // regardless of which fixture flake this resolves, proving the
     // dispatch+boot+run path itself, not any particular guest content.
     let mut request_id = 1;
     let job_id = submit_flake_once_registered(
