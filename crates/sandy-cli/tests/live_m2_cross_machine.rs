@@ -280,6 +280,8 @@ fn submit_job(orchestrator: &Orchestrator, tmp: &std::path::Path, argv: &[&str])
             manifest.to_str().context("manifest path is utf8")?,
             "--manifest-encoding",
             "argv/v1",
+            "--isolation-class",
+            "trusted",
             "-o",
             "json",
         ])

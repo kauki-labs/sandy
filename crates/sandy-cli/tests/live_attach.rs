@@ -164,6 +164,7 @@ async fn submit(
             manifest,
             manifest_encoding: "argv/v1".to_owned(),
             submitter_caps: Vec::new(),
+            required_isolation_class: sandy_control_proto::IsolationClass::Trusted.into(),
         }),
     )
     .await
@@ -555,6 +556,8 @@ async fn the_real_cli_binary_attaches_delivers_output_and_exits_on_job_completio
             manifest.to_str().context("manifest path is utf8")?,
             "--manifest-encoding",
             "argv/v1",
+            "--isolation-class",
+            "trusted",
             "-o",
             "json",
         ])
@@ -751,6 +754,8 @@ async fn a_separate_attach_process_gets_post_rights_via_the_persisted_token() ->
             manifest.to_str().context("manifest path is utf8")?,
             "--manifest-encoding",
             "argv/v1",
+            "--isolation-class",
+            "trusted",
             "-o",
             "json",
         ])

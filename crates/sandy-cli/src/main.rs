@@ -157,6 +157,27 @@ enum Command {
     },
 }
 
+/// `sandy daemon submit --isolation-class`'s value: mirrors
+/// `sandy_control_proto::IsolationClass` minus `Unspecified`, which Submit
+/// always refuses (#381) — clap requires one of these, so the wire request
+/// never carries an unstated class.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum IsolationClassArg {
+    /// A shared-kernel backend may run this job.
+    Trusted,
+    /// Only a full hypervisor boundary (`SandboxKind::Vm`) may run this job.
+    Untrusted,
+}
+
+impl From<IsolationClassArg> for sandy_control_proto::IsolationClass {
+    fn from(value: IsolationClassArg) -> Self {
+        match value {
+            IsolationClassArg::Trusted => sandy_control_proto::IsolationClass::Trusted,
+            IsolationClassArg::Untrusted => sandy_control_proto::IsolationClass::Untrusted,
+        }
+    }
+}
+
 /// `sandy daemon <op>`: one control-RPC call to `sandyd` per invocation.
 #[derive(Debug, Subcommand)]
 enum DaemonOp {
@@ -166,6 +187,10 @@ enum DaemonOp {
         /// with `--flake`.
         #[arg(required_unless_present = "flake", conflicts_with = "flake")]
         manifest: Option<String>,
+        /// This job's required isolation class (#381). Required — `sandyd`
+        /// refuses a Submit with no stated class rather than defaulting one.
+        #[arg(long, value_enum)]
+        isolation_class: IsolationClassArg,
         /// Names the encoding of `manifest`'s bytes (e.g. a future
         /// `sandy.orchestrator.v1.JobManifest`). Required with `manifest` —
         /// never a silent default interpretation of unknown bytes — and
@@ -197,21 +222,27 @@ enum DaemonOp {
         /// `--flake`; empty means "boot the template's default command").
         #[arg(last = true, requires = "flake")]
         command: Vec<String>,
-        /// A capability this submitter already holds (decision C-at-Submit,
-        /// #226), base64-encoded — the exact encoding `sandy daemon attach -o
-        /// json`'s own `cap` field already prints, so a cap handed back by an
-        /// earlier `attach` can be copied straight into this flag. Repeatable:
-        /// each occurrence becomes one entry of `SubmitRequest.submitter_caps`.
-        /// #232's "where does a submitter's own cap come from" is answered by
-        /// this round trip for now — there is no separate local cap store or
-        /// issuance flow yet, only a way to re-present a cap the operator
-        /// already has in hand. Refused with `--flake`: a `flake/v1` manifest
-        /// is never the `sandy.orchestrator.v1.JobManifest+json` encoding
+        /// Path to a file holding a capability this submitter already holds
+        /// (decision C-at-Submit, #226), as base64 text — the exact encoding
+        /// `sandy daemon attach -o json`'s own `cap` field already prints, so
+        /// a cap handed back by an earlier `attach` can be saved to a file
+        /// and referenced here. A FILE, never an inline value (CodeRabbit on
+        /// this PR): a bearer credential given directly on the command line
+        /// is visible to anyone who can read `ps`/`/proc/<pid>/cmdline` or
+        /// this shell's history, the same reason `sandy run --secret
+        /// NAME=@PATH` already reads its secret from a file rather than
+        /// taking it inline. Repeatable: each occurrence becomes one entry of
+        /// `SubmitRequest.submitter_caps`. #232's "where does a submitter's
+        /// own cap come from" is answered by this round trip for now — there
+        /// is no separate local cap store or issuance flow yet, only a way to
+        /// re-present a cap the operator already has in hand. Refused with
+        /// `--flake`: a `flake/v1` manifest is never the
+        /// `sandy.orchestrator.v1.JobManifest+json` encoding
         /// `resolve_granted_caps` requires to bound a presented cap, so the
         /// daemon would refuse the whole submit anyway — better to say so
         /// here than let the combination reach the wire first.
-        #[arg(long = "cap", conflicts_with = "flake")]
-        caps: Vec<String>,
+        #[arg(long = "cap-file", conflicts_with = "flake")]
+        cap_files: Vec<String>,
     },
     /// Cancel a submitted job.
     Cancel {
@@ -565,24 +596,27 @@ fn read_manifest(path: &str) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Decode each `--cap` value from base64 into the raw bytes
-/// `SubmitRequest.submitter_caps` carries (#232) — the same encoding `sandy
-/// daemon attach -o json`'s own `cap` field already prints, so a cap handed
-/// back by an earlier `attach` round-trips straight into this flag. A
-/// malformed value refuses the whole submit outright (naming which one, 1
-/// based so it matches how a human counts repeated flags), never silently
-/// dropping it and falling back to a direct-mint submit the caller didn't
-/// ask for.
+/// Read and decode each `--cap-file` path into the raw bytes
+/// `SubmitRequest.submitter_caps` carries (#232). Each file holds exactly the
+/// base64 text `sandy daemon attach -o json`'s own `cap` field already
+/// prints, trimmed of surrounding whitespace — a cap handed back by an
+/// earlier `attach` round-trips straight into this flag once saved to a file.
+/// A malformed or unreadable path refuses the whole submit outright, naming
+/// it, never silently dropping it and falling back to a direct-mint submit
+/// the caller didn't ask for.
 ///
 /// # Errors
-/// Names the 1-based position of the first value that isn't valid base64.
-fn decode_submitter_caps(caps: Vec<String>) -> Result<Vec<Vec<u8>>, String> {
-    caps.into_iter()
-        .enumerate()
-        .map(|(index, cap)| {
+/// Names the path that failed to read, or whose contents aren't valid
+/// base64.
+fn read_submitter_caps(paths: &[String]) -> Result<Vec<Vec<u8>>, String> {
+    paths
+        .iter()
+        .map(|path| {
+            let contents =
+                std::fs::read_to_string(path).map_err(|e| format!("--cap-file {path:?} could not be read: {e}"))?;
             base64::engine::general_purpose::STANDARD
-                .decode(&cap)
-                .map_err(|e| format!("--cap #{} is not valid base64: {e}", index + 1))
+                .decode(contents.trim())
+                .map_err(|e| format!("--cap-file {path:?} does not contain valid base64: {e}"))
         })
         .collect()
 }
@@ -606,11 +640,12 @@ fn dispatch_daemon(op: DaemonOp, output: OutputFormat) -> i32 {
 /// invocation: the control RPC is strictly one-request-one-response with no
 /// pipelining (#211 §1), so there is nothing to pool across a single CLI run.
 async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
-    // #232 (CodeRabbit on this PR): validate `--cap` before opening any
-    // connection — a malformed value is a pure client-side input error, and
-    // refusing it must never depend on a live daemon being reachable.
-    let submitter_caps = if let DaemonOp::Submit { caps, .. } = &op {
-        match decode_submitter_caps(caps.clone()) {
+    // #232 (CodeRabbit on this PR): validate `--cap-file` before opening any
+    // connection — a malformed or unreadable path is a pure client-side
+    // input error, and refusing it must never depend on a live daemon being
+    // reachable.
+    let submitter_caps = if let DaemonOp::Submit { cap_files, .. } = &op {
+        match read_submitter_caps(cap_files) {
             Ok(caps) => caps,
             Err(e) => {
                 eprintln!("sandy: {e}");
@@ -655,13 +690,14 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
     let request_op = match op {
         DaemonOp::Submit {
             manifest,
+            isolation_class,
             manifest_encoding,
             flake,
             attr,
             kind,
             history_lines,
             command,
-            caps: _,
+            cap_files: _,
         } => {
             // clap's `required_unless_present = "flake"`/`conflicts_with`
             // pairs above guarantee exactly one of `manifest` or `flake` is
@@ -702,6 +738,7 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
                 manifest: bytes,
                 manifest_encoding: encoding,
                 submitter_caps,
+                required_isolation_class: sandy_control_proto::IsolationClass::from(isolation_class).into(),
             })
         }
         DaemonOp::Cancel { job_id } => control_request::Op::Cancel(CancelRequest { job_id }),
@@ -1282,26 +1319,57 @@ mod tests {
         Ok(())
     }
 
+    fn write_cap_file(dir: &std::path::Path, name: &str, contents: &str) -> anyhow::Result<String> {
+        let path = dir.join(name);
+        std::fs::write(&path, contents)?;
+        Ok(path.to_str().context("cap file path is utf8")?.to_owned())
+    }
+
     #[test]
-    fn decode_submitter_caps_round_trips_base64() -> anyhow::Result<()> {
+    fn read_submitter_caps_round_trips_base64() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
         let encoded = base64::engine::general_purpose::STANDARD.encode(b"a-real-cap-blob");
-        let decoded = decode_submitter_caps(vec![encoded]).map_err(|e| anyhow::anyhow!(e))?;
+        let path = write_cap_file(tmp.path(), "cap-1", &encoded)?;
+        let decoded = read_submitter_caps(&[path]).map_err(|e| anyhow::anyhow!(e))?;
         assert_eq!(decoded, vec![b"a-real-cap-blob".to_vec()]);
         Ok(())
     }
 
     #[test]
-    fn decode_submitter_caps_allows_no_caps_at_all() -> anyhow::Result<()> {
-        let decoded = decode_submitter_caps(Vec::new()).map_err(|e| anyhow::anyhow!(e))?;
+    fn read_submitter_caps_trims_surrounding_whitespace() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(b"a-real-cap-blob");
+        let path = write_cap_file(tmp.path(), "cap-1", &format!("  {encoded}\n"))?;
+        let decoded = read_submitter_caps(&[path]).map_err(|e| anyhow::anyhow!(e))?;
+        assert_eq!(decoded, vec![b"a-real-cap-blob".to_vec()]);
+        Ok(())
+    }
+
+    #[test]
+    fn read_submitter_caps_allows_no_caps_at_all() -> anyhow::Result<()> {
+        let decoded = read_submitter_caps(&[]).map_err(|e| anyhow::anyhow!(e))?;
         assert!(decoded.is_empty());
         Ok(())
     }
 
     #[test]
-    fn decode_submitter_caps_names_the_1_based_position_of_a_bad_value() {
+    fn read_submitter_caps_names_the_malformed_path() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
         let good = base64::engine::general_purpose::STANDARD.encode(b"fine");
-        let err = decode_submitter_caps(vec![good, "not valid base64!!".to_owned()])
-            .expect_err("a malformed second --cap must be refused");
-        assert!(err.contains("--cap #2"), "got: {err}");
+        let good_path = write_cap_file(tmp.path(), "cap-good", &good)?;
+        let bad_path = write_cap_file(tmp.path(), "cap-bad", "not valid base64!!")?;
+
+        let err = read_submitter_caps(&[good_path, bad_path.clone()])
+            .expect_err("a malformed second --cap-file must be refused");
+        assert!(err.contains(&bad_path), "got: {err}");
+        Ok(())
+    }
+
+    #[test]
+    fn read_submitter_caps_names_an_unreadable_path() {
+        let err = read_submitter_caps(&["/nonexistent/cap/path".to_owned()])
+            .expect_err("a missing --cap-file must be refused");
+        assert!(err.contains("/nonexistent/cap/path"), "got: {err}");
+        assert!(err.contains("could not be read"), "got: {err}");
     }
 }

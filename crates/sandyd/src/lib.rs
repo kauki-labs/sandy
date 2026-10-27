@@ -106,6 +106,7 @@ mod tests {
                     manifest: b"m".to_vec(),
                     manifest_encoding: "test/v1".to_owned(),
                     submitter_caps: Vec::new(),
+                    required_isolation_class: sandy_control_proto::IsolationClass::Trusted.into(),
                 })),
             },
         )
@@ -165,6 +166,7 @@ mod tests {
                     manifest: b"m".to_vec(),
                     manifest_encoding: "test/v1".to_owned(),
                     submitter_caps: Vec::new(),
+                    required_isolation_class: sandy_control_proto::IsolationClass::Trusted.into(),
                 })),
             },
         )

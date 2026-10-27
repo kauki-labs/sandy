@@ -30,15 +30,6 @@ use crate::{
     store::{CancelOutcome, InsertOutcome, JobStore, StoreError, Transition},
 };
 
-/// STAGE-1: untrusted jobs are inexpressible (no VM/untrusted backend yet,
-/// #269 D4), so every submitted job's required isolation class is `Trusted`
-/// — this is accurate for stage-1, not a shortcut. #150 decided that untrusted
-/// jobs are VM-only. #381 replaces this default with a per-job requirement on
-/// the submit path (a `SubmitRequest` field). Do not add an untrusted submit
-/// path before #381, or an untrusted job defaults to `Trusted` and breaches
-/// isolation. See #298, #269, #381.
-const STAGE1_REQUIRED_ISOLATION_CLASS: IsolationClass = IsolationClass::Trusted;
-
 /// The `manifest_encoding` tag a flake-templated VM job uses (#332) —
 /// `sandy_host_executor::dispatch`/`sandy_guest_template::manifest`'s own
 /// `MANIFEST_ENCODING_FLAKE_V1`, duplicated here (not imported) for the same
@@ -65,22 +56,46 @@ fn required_sandbox_kind_for(manifest_encoding: &str) -> SandboxKind {
     }
 }
 
-/// Refuses a `SandboxKind::Vm` submit this daemon cannot place, with `reason`
-/// as the explanation; `None` for anything else (a placed `Vm` job, or any
-/// `argv/v1` `Process` job, which keeps its existing "falls back to local"
-/// behavior unchanged). Shared by the two placement checks in `handle`'s
-/// `Submit` arm: the early one (before any side effect) and the one right
-/// after `dispatch_plan` is computed, which closes a narrow TOCTOU the early
-/// check alone cannot — a host disconnecting between the two `pick_host_for`
-/// calls, or `RemoteLink::new`'s RNG failing, can make the second placement
-/// attempt come back empty even though the first one found a host. `flake/v1`
-/// has no local execution fallback, so leaving that job `Pending` forever
-/// with no distinct status would be exactly the silent gap decision 18 rules
-/// out.
-fn vm_placement_error(required_sandbox_kind: SandboxKind, placed: bool, reason: &str) -> Option<ControlError> {
-    (required_sandbox_kind == SandboxKind::Vm && !placed).then(|| ControlError {
+/// Refuses a submit this daemon cannot place when placement is mandatory for
+/// it, with `reason` as the explanation; `None` for anything else (a placed
+/// job, or an `argv/v1`+`Trusted` job, which keeps its existing "falls back
+/// to local" behavior unchanged). Placement is mandatory for a `SandboxKind::Vm`
+/// requirement (a `flake/v1` job has no local execution path at all) and,
+/// independently, for an `IsolationClass::Untrusted` requirement (#381: the
+/// process backend never admits an untrusted job, so an unplaced one has no
+/// local fallback either, whatever sandbox kind it named). Shared by the two
+/// placement checks in `handle`'s `Submit` arm: the early one (before any
+/// side effect) and the one right after `dispatch_plan` is computed, which
+/// closes a narrow TOCTOU the early check alone cannot — a host disconnecting
+/// between the two `pick_host_for` calls, or `RemoteLink::new`'s RNG failing,
+/// can make the second placement attempt come back empty even though the
+/// first one found a host. Leaving either kind of mandatory-placement job
+/// `Pending` forever with no distinct status would be exactly the silent gap
+/// decision 18 rules out.
+fn placement_required_error(
+    required_isolation_class: IsolationClass,
+    required_sandbox_kind: SandboxKind,
+    placed: bool,
+    reason: &str,
+) -> Option<ControlError> {
+    let placement_mandatory =
+        required_sandbox_kind == SandboxKind::Vm || required_isolation_class == IsolationClass::Untrusted;
+    (placement_mandatory && !placed).then(|| ControlError {
         message: reason.to_owned(),
     })
+}
+
+/// Parse `SubmitRequest.required_isolation_class`'s wire value (the
+/// client-facing `sandy_control_proto::IsolationClass`) into the internal
+/// `sandy_executor_proto::IsolationClass` placement/dispatch uses. `None` for
+/// `Unspecified` or an unrecognized value — #381's contract is that an unset
+/// or invalid class is refused at Submit, never defaulted to `Trusted`.
+fn parse_required_isolation_class(wire_value: i32) -> Option<IsolationClass> {
+    match sandy_control_proto::IsolationClass::try_from(wire_value) {
+        Ok(sandy_control_proto::IsolationClass::Trusted) => Some(IsolationClass::Trusted),
+        Ok(sandy_control_proto::IsolationClass::Untrusted) => Some(IsolationClass::Untrusted),
+        Ok(sandy_control_proto::IsolationClass::Unspecified) | Err(_) => None,
+    }
 }
 
 /// The length, in bytes, of a job's durable attach token (#327) —
@@ -210,6 +225,27 @@ pub async fn handle(
                 });
             }
 
+            // #381: every submitter must state its job's required isolation
+            // class explicitly. Checked before anything else below (even
+            // decision C-at-Submit's cap-bounding), same "no trace" bar as
+            // every other Submit-time refusal in this function — an
+            // unspecified or unrecognized class is never silently treated as
+            // `Trusted`, which would breach isolation for a client that meant
+            // to ask for `Untrusted`.
+            let required_isolation_class = match parse_required_isolation_class(submit.required_isolation_class) {
+                Some(class) => class,
+                None => {
+                    return Ok(ControlResponse {
+                        request_id: request.request_id,
+                        result: Some(control_response::Result::Error(ControlError {
+                            message: "required_isolation_class must be TRUSTED or UNTRUSTED; UNSPECIFIED is refused, \
+                                      never defaulted"
+                                .to_owned(),
+                        })),
+                    });
+                }
+            };
+
             // Decision C-at-Submit (#226): bound before anything else is
             // created. A refusal here must leave no trace — no channel, no
             // store row — the same "fail before any side effect" shape the
@@ -239,6 +275,32 @@ pub async fn handle(
             // that can never run, with no distinct status a caller could
             // ever notice (item 5's "never silently" bar).
             let required_sandbox_kind = required_sandbox_kind_for(&submit.manifest_encoding);
+
+            // #381 (CodeRabbit on this PR): the process kind never admits an
+            // untrusted job (`process-containment.md` decision 6) — refuse
+            // here, before `pick_host_for` or any persistence, rather than
+            // letting an Untrusted+non-Vm submission reach placement. Without
+            // this, a host that declares BOTH `Untrusted` and `Process`
+            // (every `Vm`-capable host does — `Process` stays additive, see
+            // `to_wire_capabilities`) would satisfy `pick_host_for`, and the
+            // job would be placed and dispatched with `backend == Process`
+            // only to be refused by the host-executor's own re-check —
+            // technically fail-closed, but a wasted dispatch round trip
+            // instead of a clean Submit-time refusal.
+            if required_isolation_class == IsolationClass::Untrusted && required_sandbox_kind != SandboxKind::Vm {
+                return Ok(ControlResponse {
+                    request_id: request.request_id,
+                    result: Some(control_response::Result::Error(ControlError {
+                        message: format!(
+                            "an Untrusted job requires a Vm-backed manifest encoding (e.g. flake/v1); \
+                             manifest_encoding {:?} resolves to SandboxKind::{required_sandbox_kind:?}, which can \
+                             never satisfy Untrusted",
+                            submit.manifest_encoding
+                        ),
+                    })),
+                });
+            }
+
             // Named apart from `placeable` itself (CodeRabbit on this PR): the
             // original message always blamed "no Vm-capable host," even when
             // the real cause was this orchestrator's own configuration
@@ -250,18 +312,19 @@ pub async fn handle(
                 false
             } else {
                 host_registry
-                    .pick_host_for(STAGE1_REQUIRED_ISOLATION_CLASS.into(), required_sandbox_kind.into())
+                    .pick_host_for(required_isolation_class.into(), required_sandbox_kind.into())
                     .is_some()
             };
-            if let Some(control_error) = vm_placement_error(
+            if let Some(control_error) = placement_required_error(
+                required_isolation_class,
                 required_sandbox_kind,
                 placeable,
                 if forward_back_addr.is_none() {
                     "this orchestrator has no agent-link listen address configured (SANDY_MESH_AGENT_LINK_LISTEN is \
                      unset) — no remote placement is reachable at all, regardless of what hosts are registered"
                 } else {
-                    "no registered host declares SandboxKind::Vm capability; a flake-templated job cannot be placed \
-                     (this daemon has no local VM execution path)"
+                    "no registered host declares the required isolation class and sandbox kind; this job cannot be \
+                     placed (this daemon has no local fallback for a Vm-backend or Untrusted-class job)"
                 },
             ) {
                 return Ok(ControlResponse {
@@ -318,20 +381,22 @@ pub async fn handle(
             job_channel.granted_caps = granted_caps;
             job_channel.session = session; // CF-H-1
 
-            // Placement (#298): stage-1 policy. Dispatch to a registered
-            // remote host whose declared capabilities satisfy
-            // STAGE1_REQUIRED_ISOLATION_CLASS, if the orchestrator's own
-            // agent-link accept address is configured (no address means no
-            // remote run is even reachable, regardless of what's
-            // registered) and such a host exists; run locally otherwise —
-            // today's unchanged behavior. Binding the remote link (decision
-            // 6) happens BEFORE the job is persisted/registered, so a
-            // placed job's `remote_link` is set from the moment anyone can
-            // observe it; the actual `send_dispatch` call happens after,
-            // once the job is durably recorded.
+            // Placement (#298, #381): dispatch to a registered remote host
+            // whose declared capabilities satisfy this job's OWN required
+            // isolation class, if the orchestrator's own agent-link accept
+            // address is configured (no address means no remote run is even
+            // reachable, regardless of what's registered) and such a host
+            // exists; run locally otherwise — today's unchanged behavior for
+            // a `Trusted`+`Process` job (an `Untrusted` job with no host is
+            // refused outright instead, see `placement_required_error`
+            // below). Binding the remote link (decision 6) happens BEFORE the
+            // job is persisted/registered, so a placed job's `remote_link` is
+            // set from the moment anyone can observe it; the actual
+            // `send_dispatch` call happens after, once the job is durably
+            // recorded.
             let dispatch_plan = forward_back_addr.and_then(|forward_back| {
-                let candidate = host_registry
-                    .pick_host_for(STAGE1_REQUIRED_ISOLATION_CLASS.into(), required_sandbox_kind.into())?;
+                let candidate =
+                    host_registry.pick_host_for(required_isolation_class.into(), required_sandbox_kind.into())?;
                 match RemoteLink::new(candidate.peer_ip) {
                     Ok(link) => {
                         let link_token = link.token().as_bytes().to_vec();
@@ -350,7 +415,7 @@ pub async fn handle(
                             backend: required_sandbox_kind.into(),
                             link_token,
                             forward_back: forward_back.to_string(),
-                            required_isolation_class: STAGE1_REQUIRED_ISOLATION_CLASS.into(),
+                            required_isolation_class: required_isolation_class.into(),
                         };
                         Some((candidate.host_id, candidate.registration, dispatch))
                     }
@@ -379,11 +444,12 @@ pub async fn handle(
             // a minted link exactly this way) — never insert a `flake/v1` job
             // that would then sit `Pending` forever with no local fallback
             // and no distinct status a caller could ever notice.
-            if let Some(control_error) = vm_placement_error(
+            if let Some(control_error) = placement_required_error(
+                required_isolation_class,
                 required_sandbox_kind,
                 dispatch_plan.is_some(),
-                "no registered host could be bound for SandboxKind::Vm placement; a flake-templated job cannot be \
-                 placed (this daemon has no local VM execution path)",
+                "no registered host could be bound for this job's required isolation class and sandbox kind; it \
+                 cannot be placed (this daemon has no local fallback for a Vm-backend or Untrusted-class job)",
             ) {
                 return Ok(ControlResponse {
                     request_id: request.request_id,
@@ -794,6 +860,7 @@ mod tests {
                     .iter()
                     .map(|c| encode_cap(c).expect("encode cap"))
                     .collect(),
+                required_isolation_class: sandy_control_proto::IsolationClass::Trusted.into(),
             }),
         )
     }
@@ -846,6 +913,7 @@ mod tests {
                 manifest: b"m".to_vec(),
                 manifest_encoding: "test/v1".to_owned(),
                 submitter_caps: Vec::new(),
+                required_isolation_class: sandy_control_proto::IsolationClass::Trusted.into(),
             }),
         )
     }
@@ -1712,6 +1780,7 @@ mod tests {
                 manifest: b"opaque".to_vec(),
                 manifest_encoding: "application/octet-stream".to_owned(),
                 submitter_caps: vec![encode_cap(&submitter_cap)?],
+                required_isolation_class: sandy_control_proto::IsolationClass::Trusted.into(),
             }),
         );
 
@@ -1756,6 +1825,7 @@ mod tests {
                 manifest: oversized,
                 manifest_encoding: "test/v1".to_owned(),
                 submitter_caps: Vec::new(),
+                required_isolation_class: sandy_control_proto::IsolationClass::Trusted.into(),
             }),
         );
 
@@ -1797,6 +1867,7 @@ mod tests {
                 manifest: at_cap,
                 manifest_encoding: "test/v1".to_owned(),
                 submitter_caps: Vec::new(),
+                required_isolation_class: sandy_control_proto::IsolationClass::Trusted.into(),
             }),
         );
 
@@ -2174,11 +2245,10 @@ mod tests {
     /// gate actually applies at the real placement point, not only in
     /// isolation): a registered host that does NOT declare the required
     /// isolation class is never placed on, even though it's the only host
-    /// registered. Nothing can submit an Untrusted-required job today
-    /// (#298's stage-1 tripwire — every job's required class is the
-    /// `STAGE1_REQUIRED_ISOLATION_CLASS` constant, `Trusted`), so this
-    /// simulates the mismatch the only way currently possible: a host that
-    /// declares support for Untrusted but not Trusted.
+    /// registered. `submit_req` always requests `Trusted` (see #381's own
+    /// Untrusted-specific tests below for the other direction), so this
+    /// simulates the mismatch with a host that declares Untrusted but not
+    /// Trusted.
     #[tokio::test]
     async fn a_submit_never_places_on_a_host_lacking_the_required_isolation_class() -> anyhow::Result<()> {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
@@ -2374,6 +2444,7 @@ mod tests {
                 manifest: b"irrelevant-to-placement".to_vec(),
                 manifest_encoding: "flake/v1".to_owned(),
                 submitter_caps: Vec::new(),
+                required_isolation_class: sandy_control_proto::IsolationClass::Trusted.into(),
             }),
         )
     }
@@ -2399,28 +2470,41 @@ mod tests {
         assert_eq!(required_sandbox_kind_for(""), SandboxKind::Process);
     }
 
-    /// Regression for CodeRabbit's finding on this PR: `handle`'s early
-    /// placeability check and its post-`dispatch_plan` check call this same
-    /// function, so proving the function's three cases here proves both call
+    /// Regression for CodeRabbit's finding on #332's PR, extended by #381:
+    /// `handle`'s early placeability check and its post-`dispatch_plan` check
+    /// call this same function, so proving its cases here proves both call
     /// sites refuse (or don't) correctly — including the narrow TOCTOU case
     /// (a `Vm` job, placeable at the early check, unplaceable by the time
     /// `dispatch_plan` is computed) the full async race itself can't be
     /// reproduced deterministically in a unit test (it needs a real
     /// concurrent host disconnect, or `RemoteLink::new`'s RNG failing,
-    /// between two reads of `host_registry`'s internal lock).
+    /// between two reads of `host_registry`'s internal lock). Placement is
+    /// mandatory along TWO independent dimensions: `SandboxKind::Vm`
+    /// (unchanged since #332) and, as of #381, `IsolationClass::Untrusted` —
+    /// a `Process`+`Untrusted` combination (inexpressible as a real
+    /// dispatch, since the process backend never admits an untrusted job)
+    /// must still be refused on failed placement, not silently kept Pending.
     #[test]
-    fn vm_placement_error_refuses_only_an_unplaced_vm_requirement() {
+    fn placement_required_error_refuses_an_unplaced_vm_or_untrusted_requirement() {
         assert!(
-            vm_placement_error(SandboxKind::Vm, false, "unplaced").is_some(),
+            placement_required_error(IsolationClass::Trusted, SandboxKind::Vm, false, "unplaced").is_some(),
             "a Vm job with no placement must be refused"
         );
         assert!(
-            vm_placement_error(SandboxKind::Vm, true, "unplaced").is_none(),
+            placement_required_error(IsolationClass::Trusted, SandboxKind::Vm, true, "unplaced").is_none(),
             "a Vm job that IS placed must not be refused"
         );
         assert!(
-            vm_placement_error(SandboxKind::Process, false, "unplaced").is_none(),
-            "an unplaced Process job keeps its existing silent local-fallback behavior"
+            placement_required_error(IsolationClass::Trusted, SandboxKind::Process, false, "unplaced").is_none(),
+            "an unplaced Trusted+Process job keeps its existing silent local-fallback behavior"
+        );
+        assert!(
+            placement_required_error(IsolationClass::Untrusted, SandboxKind::Process, false, "unplaced").is_some(),
+            "an unplaced Untrusted job must be refused even when its sandbox kind alone wouldn't require placement"
+        );
+        assert!(
+            placement_required_error(IsolationClass::Untrusted, SandboxKind::Vm, true, "unplaced").is_none(),
+            "an Untrusted job that IS placed must not be refused"
         );
     }
 
@@ -2538,6 +2622,229 @@ mod tests {
         Ok(())
     }
 
+    // ---- Isolation-class placement dimension (#381) ----
+
+    fn submit_req_untrusted_flake(id: u64) -> ControlRequest {
+        req(
+            id,
+            control_request::Op::Submit(SubmitRequest {
+                manifest: b"irrelevant-to-placement".to_vec(),
+                manifest_encoding: "flake/v1".to_owned(),
+                submitter_caps: Vec::new(),
+                required_isolation_class: sandy_control_proto::IsolationClass::Untrusted.into(),
+            }),
+        )
+    }
+
+    fn submit_req_untrusted_argv(id: u64) -> ControlRequest {
+        req(
+            id,
+            control_request::Op::Submit(SubmitRequest {
+                manifest: b"m".to_vec(),
+                manifest_encoding: "test/v1".to_owned(),
+                submitter_caps: Vec::new(),
+                required_isolation_class: sandy_control_proto::IsolationClass::Untrusted.into(),
+            }),
+        )
+    }
+
+    fn submit_req_unspecified_class(id: u64) -> ControlRequest {
+        req(
+            id,
+            control_request::Op::Submit(SubmitRequest {
+                manifest: b"m".to_vec(),
+                manifest_encoding: "test/v1".to_owned(),
+                submitter_caps: Vec::new(),
+                required_isolation_class: sandy_control_proto::IsolationClass::Unspecified.into(),
+            }),
+        )
+    }
+
+    fn vm_untrusted_host_capabilities() -> sandy_executor_proto::Capabilities {
+        sandy_executor_proto::Capabilities {
+            supported_sandbox_kinds: vec![SandboxKind::Process.into(), SandboxKind::Vm.into()],
+            arch: sandy_executor_proto::Arch::X8664.into(),
+            attestation: false,
+            supported_isolation_classes: vec![IsolationClass::Trusted.into(), IsolationClass::Untrusted.into()],
+        }
+    }
+
+    /// Positive (#381 acceptance): an `Untrusted`-required submit is placed
+    /// on a host that declares BOTH `Untrusted` and `Vm`, and the resulting
+    /// `Dispatch` carries `backend == Vm` and `required_isolation_class ==
+    /// Untrusted` — the process kind never satisfies `Untrusted` (spec item
+    /// 3), so a Vm-capable host is the only combination that can ever place
+    /// one.
+    #[tokio::test]
+    async fn an_untrusted_submit_is_placed_on_a_vm_and_untrusted_capable_host_and_dispatches_as_vm()
+    -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let mut dispatch_rx = register_test_host(&host_registry, "ws01", peer_ip, vm_untrusted_host_capabilities());
+
+        let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            submit_req_untrusted_flake(1),
+        )
+        .await?;
+        assert!(
+            matches!(response.result, Some(control_response::Result::Submit(_))),
+            "got {:?}",
+            response.result
+        );
+
+        let dispatch = tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_rx.recv())
+            .await
+            .context("timed out waiting for the dispatch")?
+            .context("the host's dispatch channel closed before receiving anything")?;
+        assert_eq!(dispatch.backend, i32::from(SandboxKind::Vm));
+        assert_eq!(dispatch.required_isolation_class, i32::from(IsolationClass::Untrusted));
+        Ok(())
+    }
+
+    /// Adversarial (#381 acceptance): a Vm-encoded `Untrusted`-required submit
+    /// with only a plain process-capable host registered (no `Vm`, no
+    /// `Untrusted`) is refused OUTRIGHT at placement, creating no job — same
+    /// "never silently stay Pending" bar decision 18 already holds for an
+    /// unplaced `flake/v1` job, now extended to the isolation-class
+    /// dimension: the process backend never admits an untrusted job, so this
+    /// job has no local fallback either.
+    #[tokio::test]
+    async fn an_untrusted_submit_with_only_a_process_capable_host_is_refused_and_creates_no_job() -> anyhow::Result<()>
+    {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let _dispatch_rx = register_test_host(&host_registry, "ws01", peer_ip, trusted_host_capabilities());
+
+        let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            submit_req_untrusted_flake(1),
+        )
+        .await?;
+        match response.result {
+            Some(control_response::Result::Error(ControlError { message })) => {
+                assert!(message.contains("Untrusted"), "got {message:?}");
+            }
+            other => anyhow::bail!("expected a refusal, got {other:?}"),
+        }
+
+        let list = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            req(2, control_request::Op::List(ListRequest {})),
+        )
+        .await?;
+        match list.result {
+            Some(control_response::Result::List(ListResponse { jobs })) => {
+                assert!(
+                    jobs.is_empty(),
+                    "a refused untrusted submit must create no job: {jobs:?}"
+                );
+            }
+            other => anyhow::bail!("expected a List response, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// Adversarial (CodeRabbit on this PR): an `Untrusted`-required submit
+    /// whose `manifest_encoding` resolves to `SandboxKind::Process` (the
+    /// `argv/v1`/`test/v1` default, never `Vm`) is refused BEFORE
+    /// `pick_host_for` or any persistence — even with a host registered that
+    /// declares both `Untrusted` and `Process` (every `Vm`-capable host does,
+    /// since `Process` stays additive). Without this guard, such a host would
+    /// satisfy `pick_host_for(Untrusted, Process)` and the job would be
+    /// placed and dispatched with `backend == Process`, only to be refused by
+    /// the host-executor's own re-check later — a wasted round trip instead
+    /// of a clean Submit-time refusal.
+    #[tokio::test]
+    async fn an_untrusted_submit_with_a_non_vm_encoding_is_refused_before_placement_and_creates_no_job()
+    -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let mut dispatch_rx = register_test_host(&host_registry, "ws01", peer_ip, vm_untrusted_host_capabilities());
+
+        let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            submit_req_untrusted_argv(1),
+        )
+        .await?;
+        match response.result {
+            Some(control_response::Result::Error(ControlError { message })) => {
+                assert!(message.contains("Untrusted"), "got {message:?}");
+                assert!(message.contains("Vm"), "got {message:?}");
+            }
+            other => anyhow::bail!("expected a refusal, got {other:?}"),
+        }
+        assert!(
+            dispatch_rx.try_recv().is_err(),
+            "a Process-encoded Untrusted submit must never reach dispatch, even on a Vm+Untrusted-capable host"
+        );
+
+        let list = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            req(2, control_request::Op::List(ListRequest {})),
+        )
+        .await?;
+        match list.result {
+            Some(control_response::Result::List(ListResponse { jobs })) => {
+                assert!(
+                    jobs.is_empty(),
+                    "a refused untrusted submit must create no job: {jobs:?}"
+                );
+            }
+            other => anyhow::bail!("expected a List response, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// Adversarial (#381 acceptance): an unset/`Unspecified`
+    /// `required_isolation_class` is refused at Submit, never silently
+    /// defaulted to `Trusted` — defaulting it would breach isolation for a
+    /// client that forgot to state its job's class.
+    #[tokio::test]
+    async fn a_submit_with_an_unspecified_isolation_class_is_refused() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            None,
+            test_session(),
+            submit_req_unspecified_class(1),
+        )
+        .await?;
+        match response.result {
+            Some(control_response::Result::Error(ControlError { message })) => {
+                assert!(message.contains("required_isolation_class"), "got {message:?}");
+            }
+            other => anyhow::bail!("expected a refusal, got {other:?}"),
+        }
+        Ok(())
+    }
+
     // ---- Result propagation (#292) ----
 
     fn submit_req_argv(id: u64, argv: &[&str]) -> ControlRequest {
@@ -2547,6 +2854,7 @@ mod tests {
                 manifest: serde_json::to_vec(argv).expect("encode argv manifest"),
                 manifest_encoding: "argv/v1".to_owned(),
                 submitter_caps: Vec::new(),
+                required_isolation_class: sandy_control_proto::IsolationClass::Trusted.into(),
             }),
         )
     }
