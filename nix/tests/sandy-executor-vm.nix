@@ -299,27 +299,38 @@ testPkgs.testers.runNixOSTest {
     # overriding it, and that's the thing #302's dispatched-job-survival
     # concern actually rests on. sandy-executor.service restarts on its own
     # every few seconds for the whole test (Restart=on-failure against the
-    # always-refused orchestrator dial), so capture its CURRENT session and
-    # wait for THAT specific session to end, rather than a fixed sleep that
+    # always-refused orchestrator dial), so count its session-close events
+    # and wait for one more to happen, rather than a fixed sleep that
     # doesn't prove a session end actually happened (CodeRabbit).
     sandy_uid = machine.succeed("id -u sandy-executor").strip()
-    # sandy-executor has TWO sessions, not one: the cycling PAMName session
-    # this is actually after, and a separate, persistent "manager"-class
-    # session user@<uid>.service itself opened at boot and never closes.
-    # `list-sessions` lists both — session ids are assigned monotonically,
-    # so the manager session (opened first) always has the LOWEST number;
-    # picking the first line (`sort`'s default, or `awk`'s `exit` on first
-    # match) grabbed that one instead on an earlier draft, and
-    # `wait_until_fails` below then timed out waiting for a session that was
-    # never going to end. Sort numerically and take the highest id instead.
-    executor_session = machine.succeed(
-        "loginctl list-sessions --no-legend | awk '$3 == \"sandy-executor\" { print $1 }' | sort -n | tail -1"
-    ).strip()
+    # Count session-close events in the journal rather than tracking a
+    # specific session id: sandy-executor has TWO sessions at any moment —
+    # the cycling PAMName one this block is actually about, and a separate,
+    # persistent "manager"-class session user@<uid>.service itself opened at
+    # boot and never closes. Capturing "the" session id and polling for it
+    # to disappear (an earlier draft of this test) kept grabbing the wrong
+    # one of the two, however it tried to pick between them, and
+    # `wait_until_fails` then timed out waiting for a session that was never
+    # going to end. Counting the log line both sessions' closes share a
+    # prefix with, scoped by PID via `(sd-pam)` only ever logging for the
+    # PAMName session, sidesteps needing to tell them apart at all.
+    closes_before = int(
+        machine.succeed(
+            "journalctl -b -o cat --no-pager | "
+            "grep -c 'pam_unix(sandy-executor:session): session closed' || true"
+        ).strip()
+        or "0"
+    )
     machine.succeed(
         f"runuser -u sandy-executor -- env XDG_RUNTIME_DIR=/run/user/{sandy_uid} "
         "systemd-run --user --unit=kill-test-job -- sleep 300"
     )
-    machine.wait_until_fails(f"loginctl show-session {executor_session}", timeout=30)
+    machine.wait_until_succeeds(
+        "[ \"$(journalctl -b -o cat --no-pager | "
+        "grep -c 'pam_unix(sandy-executor:session): session closed' || true)\" "
+        f"-gt {closes_before} ]",
+        timeout=30,
+    )
 
     # Query the job directly through the existing user bus (`systemctl
     # --user`, via `runuser`), not `--machine=<user>@` (a bridge that
@@ -332,9 +343,9 @@ testPkgs.testers.runNixOSTest {
         "systemctl --user --no-pager is-active kill-test-job.service 2>&1 || true"
     ).strip()
     assert job_status == "active", (
-        f"sandy-executor's dispatched-job stand-in was killed after its session "
-        f"({executor_session}) ended (is-active: {job_status!r}) — lingering is not "
-        f"keeping user@{sandy_uid}.service alive past UserStopDelaySec as expected"
+        f"sandy-executor's dispatched-job stand-in was killed after its session ended "
+        f"(is-active: {job_status!r}) — lingering is not keeping user@{sandy_uid}.service "
+        f"alive past UserStopDelaySec as expected"
     )
   '';
 }
