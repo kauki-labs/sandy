@@ -74,6 +74,10 @@ version, metadata, dependency versions, and lints through the root `Cargo.toml`
   running a real `sandyd` + `sandy-host-executor` pair across two machines by
   hand, see `docs/design/host-executor/spec.md`'s manual cross-machine smoke
   test (mesh env vars, and why `SANDY_AGENT_PATH` must be a Nix store path).
+- **`sandy-egress-proxy`** — the per-run host egress proxy for NIC-less guests
+  (#401, epic #360): a pure CONNECT-parse / allow-list / address-filter core and an
+  unprivileged binary. Not yet wired to a backend. See
+  `docs/decisions/egress-proxy.md`.
 
 ## Build & test (run before committing)
 
@@ -130,6 +134,7 @@ crates/
   ├─ sandy-orchestrator/  - sandyd's dispatch core: job manifest, submitter-bounded capability derivation
   ├─ sandyd/              - the control-plane daemon dispatching jobs into the agent fabric (epic #205)
   ├─ sandy-host-executor/ - the M2 remote executor (#269): declares capabilities, runs dispatched jobs, relays the agent link
+  ├─ sandy-egress-proxy/  - per-run host egress proxy: CONNECT parse, allow-list match, address filter (#401)
   └─ sandy-cli/           - the `sandy` binary (doctor, run/ls/status/wait/kill/gc, cred github …)
 impls/
   ├─ local/          - raw-process backend, local-dir share transport, host containment

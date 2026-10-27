@@ -1,0 +1,61 @@
+[package]
+name = "sandy-egress-proxy"
+description = "Per-run host egress proxy for NIC-less sandy guests: a pure CONNECT/allow-list/address-filter core and an unprivileged binary"
+version = "0.1.1"
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+documentation = "https://docs.rs/sandy-egress-proxy"
+keywords = ["sandbox", "security", "proxy"]
+categories = ["network-programming"]
+
+[features]
+# Test-only: lets the proxy reach loopback so a test can run a local echo
+# upstream. The default build never carries it; only the dev-dependency below
+# turns it on, so release builds keep the always-refused loopback rule.
+test-loopback = []
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "sandy-egress-proxy"
+path = "src/main.rs"
+
+[dependencies]
+nix = { workspace = true, features = ["net"] }
+sandy-api.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = [
+  "net",
+  "io-util",
+  "sync",
+  "time",
+  "macros",
+  "rt-multi-thread",
+] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# The proxy listens on vsock only for a qemu guest (Linux host).
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-vsock.workspace = true
+
+[dev-dependencies]
+sandy-egress-proxy = { path = ".", features = ["test-loopback"] }
+anyhow.workspace = true
+proptest = "1.7"
+rstest.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = [
+  "macros",
+  "rt-multi-thread",
+  "time",
+  "net",
+  "io-util",
+] }
