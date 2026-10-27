@@ -205,8 +205,12 @@ enum DaemonOp {
         /// #232's "where does a submitter's own cap come from" is answered by
         /// this round trip for now — there is no separate local cap store or
         /// issuance flow yet, only a way to re-present a cap the operator
-        /// already has in hand.
-        #[arg(long = "cap")]
+        /// already has in hand. Refused with `--flake`: a `flake/v1` manifest
+        /// is never the `sandy.orchestrator.v1.JobManifest+json` encoding
+        /// `resolve_granted_caps` requires to bound a presented cap, so the
+        /// daemon would refuse the whole submit anyway — better to say so
+        /// here than let the combination reach the wire first.
+        #[arg(long = "cap", conflicts_with = "flake")]
         caps: Vec<String>,
     },
     /// Cancel a submitted job.
@@ -602,6 +606,21 @@ fn dispatch_daemon(op: DaemonOp, output: OutputFormat) -> i32 {
 /// invocation: the control RPC is strictly one-request-one-response with no
 /// pipelining (#211 §1), so there is nothing to pool across a single CLI run.
 async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
+    // #232 (CodeRabbit on this PR): validate `--cap` before opening any
+    // connection — a malformed value is a pure client-side input error, and
+    // refusing it must never depend on a live daemon being reachable.
+    let submitter_caps = if let DaemonOp::Submit { caps, .. } = &op {
+        match decode_submitter_caps(caps.clone()) {
+            Ok(caps) => caps,
+            Err(e) => {
+                eprintln!("sandy: {e}");
+                return ProcessExit::InvalidPlan.code();
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     let socket = match daemon_socket_path() {
         Ok(socket) => socket,
         Err(e) => {
@@ -642,7 +661,7 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
             kind,
             history_lines,
             command,
-            caps,
+            caps: _,
         } => {
             // clap's `required_unless_present = "flake"`/`conflicts_with`
             // pairs above guarantee exactly one of `manifest` or `flake` is
@@ -678,13 +697,6 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
                     }
                 };
                 (bytes, encoding)
-            };
-            let submitter_caps = match decode_submitter_caps(caps) {
-                Ok(caps) => caps,
-                Err(e) => {
-                    eprintln!("sandy: {e}");
-                    return ProcessExit::InvalidPlan.code();
-                }
             };
             control_request::Op::Submit(SubmitRequest {
                 manifest: bytes,

@@ -321,6 +321,39 @@ fn submit_with_malformed_cap_base64_is_an_invalid_plan() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Adversarial (CodeRabbit on this PR): a malformed `--cap` is refused as an
+/// invalid plan even with NO `sandyd` running at all — proving the decode
+/// happens before `dispatch_daemon_async` ever resolves the socket path or
+/// attempts a connection, not merely before the request is sent over an
+/// already-open one.
+#[test]
+fn submit_with_malformed_cap_base64_is_refused_with_no_daemon_running() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir().context("temp dir")?;
+    let manifest = tmp.path().join("manifest.bin");
+    std::fs::write(&manifest, b"opaque").context("write manifest")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sandy"))
+        .env("SANDY_SOCK", tmp.path().join("no-daemon-here.sock"))
+        .args([
+            "daemon",
+            "submit",
+            manifest.to_str().context("manifest path is utf8")?,
+            "--manifest-encoding",
+            "test/v1",
+            "--cap",
+            "not valid base64!!",
+        ])
+        .output()
+        .context("running sandy daemon submit with no daemon")?;
+    assert_eq!(output.status.code(), Some(2), "stderr: {}", stderr_of(&output));
+    assert!(
+        stderr_of(&output).contains("--cap #1"),
+        "stderr must name the malformed flag's position, not an infra-fault connection error: {}",
+        stderr_of(&output)
+    );
+    Ok(())
+}
+
 /// Positive (#232): a `--cap` value that IS valid base64 reaches `sandyd`
 /// over the wire — proven by the daemon's own refusal, since garbage bytes
 /// (valid base64, not a real encoded `Cap`) fail `decode_cap` server-side
