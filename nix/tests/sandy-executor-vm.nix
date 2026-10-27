@@ -303,8 +303,17 @@ testPkgs.testers.runNixOSTest {
     # wait for THAT specific session to end, rather than a fixed sleep that
     # doesn't prove a session end actually happened (CodeRabbit).
     sandy_uid = machine.succeed("id -u sandy-executor").strip()
+    # sandy-executor has TWO sessions, not one: the cycling PAMName session
+    # this is actually after, and a separate, persistent "manager"-class
+    # session user@<uid>.service itself opened at boot and never closes.
+    # `list-sessions` lists both — session ids are assigned monotonically,
+    # so the manager session (opened first) always has the LOWEST number;
+    # picking the first line (`sort`'s default, or `awk`'s `exit` on first
+    # match) grabbed that one instead on an earlier draft, and
+    # `wait_until_fails` below then timed out waiting for a session that was
+    # never going to end. Sort numerically and take the highest id instead.
     executor_session = machine.succeed(
-        "loginctl list-sessions --no-legend | awk '$3 == \"sandy-executor\" { print $1; exit }'"
+        "loginctl list-sessions --no-legend | awk '$3 == \"sandy-executor\" { print $1 }' | sort -n | tail -1"
     ).strip()
     machine.succeed(
         f"runuser -u sandy-executor -- env XDG_RUNTIME_DIR=/run/user/{sandy_uid} "
