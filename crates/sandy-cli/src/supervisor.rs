@@ -136,6 +136,21 @@ fn validate_run_egress(plan: &JobPlan, egress_os: EgressOs, tap: Option<&str>) -
     }
 }
 
+/// The receipt's egress outcome for a proxy-mode run, read from what the backend did.
+///
+/// The host applies nothing in proxy mode: the backend starts the proxy and boots the
+/// guest behind it, so "enforced" is true only once a guest ran. `Spawn` means the
+/// backend refused the policy or could not start the proxy, before any boot. A guest that never
+/// booted ran behind nothing. Anything later, a proxy that died mid-run included, means the
+/// proxy served the run, so it stays enforced: that fault is already a band-3 result of its own.
+fn proxy_receipt_result(run: &Result<Outcome, BackendError>) -> Result<EgressOutcome, String> {
+    match run {
+        Err(BackendError::Spawn(why)) => Err(why.clone()),
+        Ok(outcome) if !outcome.booted => Err("the guest never booted, so the egress proxy served no run".to_string()),
+        _ => Ok(EgressOutcome::Proxied),
+    }
+}
+
 /// The shared core of [`run_job`] and [`run_job_with_credential`]: validates the
 /// plan, writes the `Running` record, runs the backend, classifies the outcome,
 /// and builds the envelope — everything through step 5 of [`run_job`]'s
@@ -214,8 +229,14 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
     let egress_receipt_result: Result<EgressOutcome, String>;
     let (run_result, egress_warning): (Result<Outcome, BackendError>, Option<String>) = match enforce(&eplan, egress) {
         Ok(eoutcome) => {
-            egress_receipt_result = Ok(eoutcome.clone());
             let outcome = backend.run(&spec);
+            // The proxy is the boundary, and the backend establishes it, so the receipt reads the run's result
+            // rather than the plan's intent: a refusal before boot must not be recorded as enforced.
+            egress_receipt_result = if matches!(eoutcome, EgressOutcome::Proxied) {
+                proxy_receipt_result(&outcome)
+            } else {
+                Ok(eoutcome.clone())
+            };
             if matches!(eoutcome, EgressOutcome::Enforced)
                 && let Err(e) = egress.revert()
             {

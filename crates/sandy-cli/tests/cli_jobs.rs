@@ -662,6 +662,96 @@ fn run_without_proxy_mode_hands_the_backend_no_policy() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// #360: the receipt records the proxy as enforcing only if the run reached it. A
+/// backend that refuses the policy before boot (`Spawn`) left it unapplied, and the
+/// receipt says so, with the reason and no allow-list.
+#[test]
+fn receipt_reports_a_proxy_refused_before_boot_as_unenforced() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    let backend = FakeBackend::new().with_error(BackendError::Spawn(
+        "the vfkit backend does not support the egress proxy yet".to_string(),
+    ));
+
+    let report = run_job(
+        &backend,
+        &journal,
+        &proxy_plan(),
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        None,
+        &[],
+    )
+    .context("run_job (proxy refused before boot)")?;
+
+    assert_eq!(report.process_exit.code(), 3, "a refusal before boot is an infra fault");
+    let egress = report.envelope.receipt.context("receipt")?.host_observed.egress;
+    assert_eq!(egress.status, EgressEnforcement::Unenforced);
+    assert!(
+        egress.allow_list.is_none(),
+        "an allow-list that was never applied must not be recorded"
+    );
+    let reason = egress.reason.context("an unenforced receipt names why")?;
+    assert!(reason.contains("does not support the egress proxy"), "{reason}");
+    Ok(())
+}
+
+/// #360: a guest that never booted ran behind no proxy, so its receipt is not `enforced` either.
+#[test]
+fn receipt_reports_a_proxy_run_that_never_booted_as_unenforced() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    let backend = FakeBackend::new().with_outcome(Outcome {
+        booted: false,
+        guest_exit: None,
+        transport_error: None,
+        timed_out: false,
+        console: String::new(),
+    });
+
+    let report = run_job(
+        &backend,
+        &journal,
+        &proxy_plan(),
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        None,
+        &[],
+    )
+    .context("run_job (proxy, never booted)")?;
+
+    let egress = report.envelope.receipt.context("receipt")?.host_observed.egress;
+    assert_eq!(egress.status, EgressEnforcement::Unenforced);
+    assert!(egress.allow_list.is_none());
+    Ok(())
+}
+
+/// #360: a proxy that died after it served the run stays recorded as enforced: the
+/// boundary held, and the death is its own band-3 fault.
+#[test]
+fn receipt_keeps_a_proxy_that_died_mid_run_as_enforced() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    let backend = FakeBackend::new().with_error(BackendError::EgressProxyDied {
+        status: Some(2),
+        guest_exit: Some(0),
+    });
+    let plan = proxy_plan();
+
+    let report = run_job(
+        &backend,
+        &journal,
+        &plan,
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        None,
+        &[],
+    )
+    .context("run_job (proxy died)")?;
+
+    let egress = report.envelope.receipt.context("receipt")?.host_observed.egress;
+    assert_eq!(egress.status, EgressEnforcement::Enforced);
+    assert_eq!(egress.allow_list.as_ref(), Some(&plan.allow));
+    Ok(())
+}
+
 /// #360: a proxy that died mid-run makes the run band 3 and retryable even though
 /// the guest exited 0, and the envelope names both exits.
 #[test]
