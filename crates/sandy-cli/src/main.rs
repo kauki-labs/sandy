@@ -596,13 +596,32 @@ fn read_manifest(path: &str) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Read `path` fully as UTF-8 text, refusing one that exceeds `limit` bytes
-/// without loading it fully first — the same bounded-read discipline
-/// [`read_manifest`] applies, generalized over a byte limit since its own
-/// caller is a wire-frame size, not a plain file-content bound.
-fn read_bounded_string(path: &str, limit: u64) -> std::io::Result<String> {
-    use std::io::Read;
+/// Bound on `--cap-file`'s own size, before base64 decoding (CodeRabbit on
+/// this PR). A real encoded `Cap` is a few hundred bytes at most; anything
+/// past this is either misconfiguration (the wrong file) or a way to make
+/// this read unbounded — the same discipline [`MAX_MANIFEST_LEN`] already
+/// enforces for the job manifest via [`read_manifest`].
+const MAX_CAP_FILE_LEN: u64 = 64 * 1024;
+
+/// Read `path` fully as UTF-8 text from a SINGLE already-open handle,
+/// refusing one that exceeds `limit` bytes or is group/world-readable
+/// (CodeRabbit on this PR, INV-1 — the same discipline
+/// [`sandy::cred::read_secret_0600`] already applies to the forge App key /
+/// service PAT: a bearer cap is exactly as sensitive). The mode check reads
+/// the OPEN FILE's own metadata (fstat), not a separate stat-then-open by
+/// path: checking permissions on the path and then reopening it to read
+/// would leave a TOCTOU window where a symlink swap or `chmod` between the
+/// two calls slips a now-wide-open file past the check.
+fn read_bounded_private_file(path: &str, limit: u64) -> std::io::Result<String> {
+    use std::{io::Read, os::unix::fs::PermissionsExt};
     let mut file = std::fs::File::open(path)?;
+    let mode = file.metadata()?.permissions().mode() & 0o777;
+    if mode & 0o044 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("is group/world-readable (mode {mode:#o}); refusing to read it (INV-1)"),
+        ));
+    }
     let mut buf = Vec::new();
     let read = file.by_ref().take(limit + 1).read_to_end(&mut buf)?;
     if read as u64 > limit {
@@ -612,34 +631,6 @@ fn read_bounded_string(path: &str, limit: u64) -> std::io::Result<String> {
         ));
     }
     String::from_utf8(buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-}
-
-/// Bound on `--cap-file`'s own size, before base64 decoding (CodeRabbit on
-/// this PR). A real encoded `Cap` is a few hundred bytes at most; anything
-/// past this is either misconfiguration (the wrong file) or a way to make
-/// this read unbounded — the same discipline [`MAX_MANIFEST_LEN`] already
-/// enforces for the job manifest via [`read_manifest`].
-const MAX_CAP_FILE_LEN: u64 = 64 * 1024;
-
-/// Refuse a `--cap-file` that's group- or world-readable (CodeRabbit on this
-/// PR, INV-1) — the same discipline [`sandy::cred::read_secret_0600`] already
-/// applies to the forge App key / service PAT: a bearer cap is exactly as
-/// sensitive as those secrets, readable by anyone who can present it as that
-/// scope. A stat failure here is never reported as a permission refusal —
-/// it's left for the real read right after this to surface its own, more
-/// specific I/O error (missing file, no access, …).
-fn check_cap_file_permissions(path: &str) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    let Ok(meta) = std::fs::metadata(path) else {
-        return Ok(());
-    };
-    let mode = meta.permissions().mode() & 0o777;
-    if mode & 0o044 != 0 {
-        return Err(format!(
-            "is group/world-readable (mode {mode:#o}); refusing to read it (INV-1)"
-        ));
-    }
-    Ok(())
 }
 
 /// Read and decode each `--cap-file` path into the raw bytes
@@ -659,8 +650,7 @@ fn read_submitter_caps(paths: &[String]) -> Result<Vec<Vec<u8>>, String> {
     paths
         .iter()
         .map(|path| {
-            check_cap_file_permissions(path).map_err(|e| format!("--cap-file {path:?} {e}"))?;
-            let contents = read_bounded_string(path, MAX_CAP_FILE_LEN)
+            let contents = read_bounded_private_file(path, MAX_CAP_FILE_LEN)
                 .map_err(|e| format!("--cap-file {path:?} could not be read: {e}"))?;
             base64::engine::general_purpose::STANDARD
                 .decode(contents.trim())
