@@ -497,7 +497,7 @@ pub async fn handle(
                     })
                     .await
                     {
-                        Ok(Ok(Transition::Applied)) => {}
+                        Ok(Ok(Transition::Applied)) => registry.mark_terminal(&job_id),
                         Ok(Ok(other)) => {
                             tracing::warn!(
                                 job_id,
@@ -547,6 +547,7 @@ pub async fn handle(
                     // if a late stream later presents this job's token.
                     tracing::info!(job_id = %cancel.job_id, "cancel: invalidating any unclaimed remote link");
                     registry.invalidate_remote_link(&cancel.job_id);
+                    registry.mark_terminal(&cancel.job_id);
                     // CAUTION (decision 12, reachable since #298/#301 - #298
                     // is the first real send_dispatch caller): this only
                     // stops a late agent-link stream from claiming the run.
@@ -658,8 +659,8 @@ pub async fn handle(
                 let known = tokio::task::spawn_blocking(move || store.status(&job_id)).await??;
                 let message = match known {
                     Some(_) => format!(
-                        "job {} has no live channel on this daemon (restarted since submit?); re-submit to get a new \
-                         one",
+                        "job {} has no live channel on this daemon (restarted since submit, or past its terminal \
+                         retention window); re-submit to get a new one",
                         attach.job_id
                     ),
                     None => format!("no such job: {}", attach.job_id),
@@ -803,6 +804,17 @@ mod tests {
 
     fn new_registry() -> Arc<JobRegistry> {
         Arc::new(JobRegistry::new().expect("getrandom for a test registry"))
+    }
+
+    /// A registry whose terminal-retention sweep (#270) fires immediately,
+    /// for tests that need to observe a job being reaped rather than wait
+    /// out the real production default.
+    fn new_registry_with_zero_retention() -> Arc<JobRegistry> {
+        Arc::new(
+            JobRegistry::new()
+                .expect("getrandom for a test registry")
+                .with_retention(std::time::Duration::ZERO),
+        )
     }
 
     fn new_host_registry() -> Arc<HostRegistry> {
@@ -1308,6 +1320,43 @@ mod tests {
             Err(e) => assert_eq!(e, LinkAuthError::AlreadyClaimed),
             Ok(_) => panic!("a cancelled job's remote link must not authenticate a late-arriving stream"),
         }
+        Ok(())
+    }
+
+    /// #270: Cancel must call `JobRegistry::mark_terminal`, not just
+    /// invalidate the remote link above — otherwise a cancelled job's
+    /// channel would never be reaped by the registry's retention sweep.
+    #[tokio::test]
+    async fn cancel_marks_the_job_terminal_for_the_registrys_retention_sweep() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry_with_zero_retention(), new_host_registry());
+        let submitted = handle(&store, &registry, &host_registry, None, test_session(), submit_req(1)).await?;
+        let job_id = match submitted.result {
+            Some(control_response::Result::Submit(SubmitResponse { job_id, .. })) => job_id,
+            other => anyhow::bail!("expected a Submit response, got {other:?}"),
+        };
+
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            None,
+            test_session(),
+            req(2, control_request::Op::Cancel(CancelRequest { job_id: job_id.clone() })),
+        )
+        .await?;
+        assert!(
+            matches!(response.result, Some(control_response::Result::Cancel(_))),
+            "got {:?}",
+            response.result
+        );
+
+        // A second Submit's insert is what the sweep is tied to (#270).
+        handle(&store, &registry, &host_registry, None, test_session(), submit_req(3)).await?;
+
+        assert!(
+            registry.get(&job_id).is_none(),
+            "a cancelled job's channel must be reaped once retention elapses"
+        );
         Ok(())
     }
 
@@ -2237,6 +2286,48 @@ mod tests {
         assert!(
             matches!(auth, Err(crate::link_auth::LinkAuthError::AlreadyClaimed)),
             "the genuine token must be refused once the job it was minted for has failed: {auth:?}"
+        );
+        Ok(())
+    }
+
+    /// #270: the undelivered-dispatch failure path above must call
+    /// `JobRegistry::mark_terminal` too, not just fail the job in the store
+    /// — otherwise a job that failed this way would sit in the registry
+    /// forever, never reached by the retention sweep.
+    #[tokio::test]
+    async fn an_undelivered_dispatch_marks_the_job_terminal_for_the_registrys_retention_sweep() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry_with_zero_retention(), new_host_registry());
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        drop(register_test_host(
+            &host_registry,
+            "ws01",
+            peer_ip,
+            trusted_host_capabilities(),
+        ));
+
+        let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            submit_req(1),
+        )
+        .await?;
+        let job_id = match response.result {
+            Some(control_response::Result::Submit(SubmitResponse { job_id, .. })) => job_id,
+            other => anyhow::bail!("expected a Submit response, got {other:?}"),
+        };
+        assert_eq!(store.status(&job_id)?, Some(JobStatus::Failed));
+
+        // A second Submit's insert is what the sweep is tied to (#270). No
+        // host registered for this one — it just needs to be AN insert.
+        handle(&store, &registry, &host_registry, None, test_session(), submit_req(2)).await?;
+
+        assert!(
+            registry.get(&job_id).is_none(),
+            "an undelivered-dispatch job's channel must be reaped once retention elapses"
         );
         Ok(())
     }
