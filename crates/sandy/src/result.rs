@@ -360,4 +360,22 @@ mod tests {
         assert_eq!(c.process_exit, ProcessExit::InvalidPlan);
         assert!(!c.retryable);
     }
+
+    /// INV-7 + INV-11 (#360): a dead egress proxy is band 3 and retryable whatever
+    /// the guest exit. A guest that exited 0 behind a dead proxy must not read as
+    /// `succeeded`: it ran without its network.
+    #[test]
+    fn a_dead_egress_proxy_is_an_infra_fault_whatever_the_guest_exit() {
+        for guest_exit in [None, Some(0), Some(7)] {
+            let c = classify_backend_error(&BackendError::EgressProxyDied {
+                status: Some(2),
+                guest_exit,
+            });
+            assert_eq!(c.process_exit, ProcessExit::InfraFault, "guest_exit {guest_exit:?}");
+            assert!(c.retryable, "guest_exit {guest_exit:?}");
+            assert_ne!(c.status, Status::Succeeded, "guest_exit {guest_exit:?}");
+            // Status, retryable, and exit band agree (INV-11).
+            assert_eq!(c.process_exit == ProcessExit::InfraFault, c.retryable);
+        }
+    }
 }

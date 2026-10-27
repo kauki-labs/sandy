@@ -1003,13 +1003,23 @@ fn dispatch_run(
     journal: &Journal,
     output: OutputFormat,
 ) -> i32 {
-    let plan = match parse_run(args) {
+    let mut plan = match parse_run(args) {
         Ok(plan) => plan,
         Err(e) => {
             eprintln!("sandy: {e}");
             return ProcessExit::InvalidPlan.code();
         }
     };
+    // `SANDY_EGRESS=proxy` runs the guest behind the backend's egress proxy instead of the nftables boundary (#360).
+    // An unknown value is refused rather than ignored, so a typo never boots under the other model.
+    match std::env::var("SANDY_EGRESS").ok().as_deref() {
+        None | Some("") => {}
+        Some("proxy") => plan.egress_proxy = true,
+        Some(other) => {
+            eprintln!("sandy: SANDY_EGRESS must be `proxy` or unset, got `{other}`");
+            return ProcessExit::InvalidPlan.code();
+        }
+    }
     // The run seams come from the injected `profile` — the sandbox backend, the
     // egress applier (Linux enforces the nftables boundary, macOS has none), and the
     // credential source. The composition root selects the profile at the top

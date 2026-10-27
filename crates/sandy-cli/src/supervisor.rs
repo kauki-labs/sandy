@@ -25,10 +25,11 @@ use std::{
 
 use sandy::{
     AuditReceipt, BackendError, CALL_DEADLINE, Classification, CoreError, CredentialProvider, CredentialReceipt,
-    DirFingerprint, EgressApplier, EgressOs, EgressOutcome, GuestReported, JOURNAL_SCHEMA_VERSION, JobRecord, JobState,
-    Journal, Lease, MAX_TTL_SECS, Outcome, OutputStatus, ProcessExit, Profile, ResultEnvelope, Scope, SecretSource,
-    Status, VmBackend, classify_backend_error, classify_invalid_plan, classify_outcome, enforce, mint_lease,
-    mint_lease_checked, new_job_id, plan_egress_scoped, reconcile_job, validate_egress_hosts, validate_no_secret_leak,
+    DirFingerprint, EgressApplier, EgressOs, EgressOutcome, EgressPlan, GuestReported, JOURNAL_SCHEMA_VERSION,
+    JobRecord, JobState, Journal, Lease, MAX_TTL_SECS, Outcome, OutputStatus, PlanError, ProcessExit, Profile,
+    ResultEnvelope, Scope, SecretSource, Status, VmBackend, classify_backend_error, classify_invalid_plan,
+    classify_outcome, enforce, mint_lease, mint_lease_checked, new_job_id, plan_egress_scoped, reconcile_job,
+    validate_egress_hosts, validate_no_secret_leak, validate_proxy_egress,
 };
 use zeroize::Zeroizing;
 
@@ -124,6 +125,17 @@ pub fn run_job<B: VmBackend + ?Sized, E: EgressApplier + ?Sized>(
     Ok(outcome.report)
 }
 
+/// The plan-time egress check for the run's boundary model: the nftables path
+/// refuses hostname entries (#359); a proxy-mode run (`SANDY_EGRESS=proxy`, #360)
+/// resolves names host-side, so it refuses a guest NIC on Linux instead.
+fn validate_run_egress(plan: &JobPlan, egress_os: EgressOs, tap: Option<&str>) -> Result<(), PlanError> {
+    if plan.egress_proxy {
+        validate_proxy_egress(egress_os, tap)
+    } else {
+        validate_egress_hosts(&plan.allow, egress_os)
+    }
+}
+
 /// The shared core of [`run_job`] and [`run_job_with_credential`]: validates the
 /// plan, writes the `Running` record, runs the backend, classifies the outcome,
 /// and builds the envelope — everything through step 5 of [`run_job`]'s
@@ -147,9 +159,10 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
     //    the first thing written, so an empty journal proves the backend was never reached (the silent-run guard). A
     //    hostname allow-list entry is invalid on Linux only (#359): nft pins one address at load time and the guest
     //    can't resolve names through the boundary anyway, so it is refused here rather than loaded as a rule that never
-    //    matches. macOS enforces no boundary, so a hostname entry there stays accepted.
-    if let Err(plan_error) = validate_no_secret_leak(&spec).and_then(|()| validate_egress_hosts(&plan.allow, egress_os))
-    {
+    //    matches. macOS enforces no boundary, so a hostname entry there stays accepted. A proxy-mode run
+    //    (`SANDY_EGRESS=proxy`, #360) swaps that check: the proxy resolves names host-side, so hostnames are valid, and
+    //    what is refused instead is a guest NIC (`$SANDY_TAP`) on Linux.
+    if let Err(plan_error) = validate_no_secret_leak(&spec).and_then(|()| validate_run_egress(plan, egress_os, tap)) {
         let classification = classify_invalid_plan(&plan_error);
         let envelope = build_envelope(
             &new_job_id(),
@@ -190,7 +203,11 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
     //    a terminal record (band 3) rather than leaving a dangling `Running` record.
     // 4. On a successful apply, run the backend, then ALWAYS revert when the boundary was enforced — on both the ok and
     //    error paths, so a boot failure never leaves nftables rules up.
-    let eplan = plan_egress_scoped(&plan.allow, egress_os, tap);
+    let eplan = if plan.egress_proxy {
+        EgressPlan::Proxy
+    } else {
+        plan_egress_scoped(&plan.allow, egress_os, tap)
+    };
     // Captured alongside `run_result` so the receipt's egress half (#361) reads
     // the SAME platform-keyed outcome that drove the enforce/revert bracket below,
     // never a second, independently derived copy.
@@ -204,10 +221,14 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
             {
                 tracing::warn!(%e, "egress revert failed");
             }
-            (
-                outcome,
-                no_network_allow_warning(&plan.allow, backend.kind(), egress_os, tap),
-            )
+            // In proxy mode the guest has no NIC by design and the proxy enforces the allow-list, so the
+            // "allow-list has no effect" warning would be false.
+            let warning = if plan.egress_proxy {
+                None
+            } else {
+                no_network_allow_warning(&plan.allow, backend.kind(), egress_os, tap)
+            };
+            (outcome, warning)
         }
         Err(egress_error) => {
             egress_receipt_result = Err(egress_error.to_string());
@@ -425,7 +446,7 @@ pub fn run_job_with_credential<
     // means a bad plan never mints-and-immediately-revokes a credential for a run
     // that was always going to be refused, and a mint failure (CoreError::Cred)
     // never masks what should be a clean band-2 invalid-plan report.
-    if let Err(plan_error) = validate_egress_hosts(&plan.allow, egress_os) {
+    if let Err(plan_error) = validate_run_egress(&plan, egress_os, tap) {
         let classification = classify_invalid_plan(&plan_error);
         let envelope = build_envelope(
             &new_job_id(),
@@ -930,6 +951,7 @@ mod tests {
     /// A minimal plan that boots `demo` with no secrets or env.
     fn booting_plan() -> JobPlan {
         JobPlan {
+            egress_proxy: false,
             template: "demo".to_string(),
             command: vec![],
             inputs: vec![],
@@ -956,6 +978,7 @@ mod tests {
     fn leaking_plan() -> JobPlan {
         use sandy::{SecretRef, SecretSource};
         JobPlan {
+            egress_proxy: false,
             template: "demo".to_string(),
             command: vec![],
             inputs: vec![],

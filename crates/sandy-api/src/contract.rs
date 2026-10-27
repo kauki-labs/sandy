@@ -66,6 +66,7 @@ fn run_spec<'a>(template: &'a str, command: &'a [String], grants: &'a Grants, co
         outcome_file: None,
         secret_dir: None,
         control,
+        egress: None,
     }
 }
 

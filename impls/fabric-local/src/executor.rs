@@ -66,10 +66,13 @@ impl<B: VmBackend + Send + Sync> Executor for VmBackendExecutor<B> {
 /// Map an infra-level [`BackendError`] onto the coarser [`ExecutorError`] space.
 /// `Protocol` (a malformed console exchange) folds into `Transport`: both are
 /// infra faults the Executor contract treats identically, never a task failure.
+/// A dead egress proxy (#360) folds in the same way: the guest lost its network,
+/// so whatever it then did is not a result, and the message keeps both exits.
 fn map_err(err: BackendError) -> ExecutorError {
     match err {
         BackendError::Spawn(msg) => ExecutorError::Spawn(msg),
         BackendError::Transport(msg) | BackendError::Protocol(msg) => ExecutorError::Transport(msg),
+        died @ BackendError::EgressProxyDied { .. } => ExecutorError::Transport(died.to_string()),
     }
 }
 
@@ -110,6 +113,20 @@ mod tests {
         }
     }
 
+    /// #360: a dead egress proxy is an infra fault at the Executor seam too, and the
+    /// message keeps the proxy status and the guest exit.
+    #[test]
+    fn a_dead_egress_proxy_maps_to_a_transport_infra_fault() {
+        let mapped = map_err(BackendError::EgressProxyDied {
+            status: Some(2),
+            guest_exit: Some(0),
+        });
+        let ExecutorError::Transport(msg) = mapped else {
+            panic!("expected ExecutorError::Transport, got {mapped:?}");
+        };
+        assert!(msg.contains("exit status 2") && msg.contains("guest exit 0"), "{msg}");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn vm_backend_executor_satisfies_the_executor_contract() -> anyhow::Result<()> {
         executor_suite(expected_caps(), "contract", || {
@@ -133,6 +150,7 @@ mod tests {
         let command = ["sh".to_owned(), "-c".to_owned(), "exit 3".to_owned()];
         let control = RunControl::with_timeout_secs(30);
         let spec = RunSpec {
+            egress: None,
             template: "contract",
             command: &command,
             inputs: &[],

@@ -21,6 +21,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::egress::AllowList;
+
 /// A live handle into a running [`VmBackend::run`] call, letting something
 /// outside the call (a `daemon cancel`, an attach-state transition, a grace
 /// period expiring) change its fate without that call having computed a
@@ -265,6 +267,30 @@ pub struct RunSpec<'a> {
     /// validation and this call would otherwise pass the owner/mode check alone
     /// and bind secret staging to the substitute instead.
     pub secret_dir: Option<(&'a Path, DirFingerprint)>,
+    /// `Some(allow)` runs the guest behind a per-run egress proxy that enforces
+    /// this allow-list (#360); the guest has no NIC. `None` means no proxy: the
+    /// nftables path or a no-network run, unchanged. A backend that cannot run
+    /// the proxy must refuse a spec that carries a policy before it boots, so a
+    /// proxy-mode run never boots without a boundary.
+    pub egress: Option<&'a AllowList>,
+}
+
+impl RunSpec<'_> {
+    /// Refuse a spec that carries an egress policy, for a backend that cannot run
+    /// the egress proxy yet. Call it before any boot work, so a proxy-mode run
+    /// never boots without a boundary: it is an infra fault (band 3) with no boot.
+    ///
+    /// # Errors
+    /// [`BackendError::Spawn`] naming `backend` when [`RunSpec::egress`] is set.
+    pub fn refuse_egress_proxy(&self, backend: &str) -> Result<(), BackendError> {
+        if self.egress.is_some() {
+            return Err(BackendError::Spawn(format!(
+                "the {backend} backend does not support the egress proxy yet; refusing the run rather than booting \
+                 without the egress boundary"
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// The physical outcome of a run, mirroring nix-vm's `snake_case` record 1:1
@@ -317,6 +343,24 @@ pub enum BackendError {
     /// The box spoke the contract incorrectly.
     #[error("protocol error: {0}")]
     Protocol(String),
+    /// The run's egress proxy exited before the backend killed it (#360). The
+    /// guest lost its network, so whatever the guest then did is not a result
+    /// the submitter asked for: the run is an infra fault whatever `guest_exit`.
+    #[error("egress proxy died ({}); guest exit {}", proxy_status_text(.status), guest_exit_text(.guest_exit))]
+    EgressProxyDied {
+        /// The proxy's exit code; `None` when a signal ended it.
+        status: Option<i32>,
+        /// The guest's own exit code, when one was observed before teardown.
+        guest_exit: Option<i32>,
+    },
+}
+
+fn proxy_status_text(status: &Option<i32>) -> String {
+    status.map_or_else(|| "killed by a signal".to_string(), |c| format!("exit status {c}"))
+}
+
+fn guest_exit_text(guest_exit: &Option<i32>) -> String {
+    guest_exit.map_or_else(|| "not observed".to_string(), |c| c.to_string())
 }
 
 /// What kind of sandbox a backend provides, so a job that requires a particular
@@ -362,4 +406,80 @@ pub enum PlanError {
     /// The plan is otherwise invalid (path escape, ungranted capability, …).
     #[error("invalid plan: {0}")]
     Invalid(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::egress::EgressRule;
+
+    fn spec<'a>(grants: &'a Grants, control: &'a RunControl, egress: Option<&'a AllowList>) -> RunSpec<'a> {
+        RunSpec {
+            template: "demo",
+            command: &[],
+            inputs: &[],
+            outputs: &[],
+            secrets: &[],
+            env: &[],
+            cpu: None,
+            mem: None,
+            timeout_secs: 30,
+            control,
+            grants,
+            outcome_file: None,
+            secret_dir: None,
+            egress,
+        }
+    }
+
+    fn no_grants() -> Grants {
+        Grants {
+            secrets: false,
+            agent: false,
+            shares: false,
+        }
+    }
+
+    #[test]
+    fn a_spec_without_a_policy_passes_the_proxy_refusal() {
+        let (grants, control) = (no_grants(), RunControl::with_timeout_secs(30));
+        assert_eq!(spec(&grants, &control, None).refuse_egress_proxy("qemu"), Ok(()));
+    }
+
+    #[test]
+    fn a_spec_with_a_policy_is_refused_naming_the_backend_before_any_boot() {
+        let (grants, control) = (no_grants(), RunControl::with_timeout_secs(30));
+        // An empty allow-list is still a policy: deny-all must not boot unbounded either.
+        for allow in [
+            AllowList::default(),
+            AllowList {
+                rules: vec![EgressRule {
+                    host: "github.com".to_string(),
+                    port: 443,
+                }],
+            },
+        ] {
+            let refused = spec(&grants, &control, Some(&allow)).refuse_egress_proxy("vfkit");
+            let Err(BackendError::Spawn(message)) = refused else {
+                panic!("a policy-carrying spec must be refused with Spawn, got {refused:?}");
+            };
+            assert!(message.contains("vfkit"), "names the backend: {message}");
+            assert!(message.contains("egress proxy"), "names the cause: {message}");
+        }
+    }
+
+    #[test]
+    fn the_proxy_death_message_names_the_proxy_status_and_the_guest_exit() {
+        let died = |status, guest_exit| BackendError::EgressProxyDied { status, guest_exit }.to_string();
+        let both = died(Some(2), Some(0));
+        assert!(
+            both.contains("exit status 2") && both.contains("guest exit 0"),
+            "{both}"
+        );
+        let neither = died(None, None);
+        assert!(
+            neither.contains("killed by a signal") && neither.contains("not observed"),
+            "{neither}"
+        );
+    }
 }

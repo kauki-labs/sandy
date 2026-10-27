@@ -350,6 +350,7 @@ mod tests {
         timeout_secs: u32,
     ) -> RunSpec<'a> {
         RunSpec {
+            egress: None,
             template: "demo",
             command,
             inputs: &[],

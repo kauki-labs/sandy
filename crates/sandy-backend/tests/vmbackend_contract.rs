@@ -23,6 +23,7 @@ fn test_control() -> &'static RunControl {
 /// Build a `RunSpec` that runs `command` with no inputs/outputs/secrets.
 fn spec<'a>(command: &'a [String], grants: &'a Grants) -> RunSpec<'a> {
     RunSpec {
+        egress: None,
         template: "contract",
         command,
         inputs: &[],

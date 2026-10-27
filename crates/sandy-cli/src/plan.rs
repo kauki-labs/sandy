@@ -81,6 +81,10 @@ pub struct JobPlan {
     pub env: Vec<(String, String)>,
     /// The egress allow-list enforced around the boot (empty = deny-all on Linux).
     pub allow: AllowList,
+    /// Run behind the backend's egress proxy (`SANDY_EGRESS=proxy`, #360) instead of
+    /// the nftables boundary: the guest has no NIC and `allow` travels to the backend
+    /// in [`RunSpec::egress`]. Not a CLI option: `dispatch_run` reads the environment.
+    pub egress_proxy: bool,
     /// Optional vCPU count.
     pub cpu: Option<u32>,
     /// Optional memory budget in MiB.
@@ -128,6 +132,7 @@ impl JobPlan {
                 .as_ref()
                 .map(|(dir, fingerprint)| (dir.as_path(), *fingerprint)),
             control: &self.control,
+            egress: self.egress_proxy.then_some(&self.allow),
         }
     }
 }
@@ -179,6 +184,7 @@ pub fn parse_run(args: RunArgs) -> Result<JobPlan, PlanError> {
         secrets,
         env,
         allow: AllowList { rules },
+        egress_proxy: false,
         cpu: args.cpu,
         mem: args.mem,
         timeout_secs,

@@ -339,6 +339,7 @@ pub async fn transport_suite<T: Transport>(make: impl Fn() -> T) -> Result<(), C
 /// Build a `RunSpec` for `command` in `template` with no inputs, outputs, or secrets.
 fn run_spec<'a>(template: &'a str, command: &'a [String], grants: &'a Grants, control: &'a RunControl) -> RunSpec<'a> {
     RunSpec {
+        egress: None,
         template,
         command,
         inputs: &[],
