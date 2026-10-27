@@ -17,6 +17,7 @@
 
 use std::net::SocketAddr;
 
+#[cfg(test)]
 use sandy_conn::ConnAddr;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
