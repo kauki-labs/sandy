@@ -38,7 +38,31 @@ const REGISTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10)
 /// fires, instead of hanging on a dead host indefinitely.
 const DISPATCH_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Serve one accepted host-executor connection end to end.
+/// Serve one accepted host-executor connection end to end: authenticate it
+/// via [`register_and_authenticate`], then, on success, relay dispatches over
+/// it via [`relay_dispatches`] until it closes. See each function's own doc
+/// for the behavior it owns.
+pub async fn serve_host_executor(
+    conn: Box<dyn Conn>,
+    peer: PeerAddr,
+    allowlist: &ExecutorAllowlist,
+    registry: &HostRegistry,
+    store: &Arc<JobStore>,
+    job_registry: &JobRegistry,
+) {
+    let Some((conn, registration)) = register_and_authenticate(conn, peer, allowlist, registry).await else {
+        return;
+    };
+    let registration_id = registration.registration;
+    let host_id = registration.host_id.clone();
+
+    relay_dispatches(conn, registration, store, job_registry).await;
+
+    registry.remove(&host_id, registration_id);
+    tracing::info!(host_id, "host-executor disconnected");
+}
+
+/// Read, authenticate, and acknowledge a host-executor's `Register` frame.
 ///
 /// Expects `Register` as the first frame within [`REGISTER_TIMEOUT`];
 /// anything else, a stream that closes before sending one, or one that never
@@ -54,21 +78,24 @@ const DISPATCH_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// since no registry entry exists yet, which is why they're deliberately
 /// deferred. The one write that mattered more — the registered `Dispatch`
 /// push, which stalls a live, dispatch-eligible registry entry — has
-/// [`DISPATCH_WRITE_TIMEOUT`] (#289 item 2, landed). The connection loop's
-/// own read is cancel-safe (#289 item 3, landed) via [`forward_frames`].
-pub async fn serve_host_executor(
+/// [`DISPATCH_WRITE_TIMEOUT`], enforced by [`relay_dispatches`] (#289 item 2,
+/// landed).
+///
+/// Returns `None` once the connection has already been fully handled
+/// (refused, timed out, or faulted) — there is nothing left for the caller to
+/// do but return. On success, hands back the still-open connection and its
+/// [`Registration`], the only state [`relay_dispatches`] needs.
+async fn register_and_authenticate(
     mut conn: Box<dyn Conn>,
     peer: PeerAddr,
     allowlist: &ExecutorAllowlist,
     registry: &HostRegistry,
-    store: &Arc<JobStore>,
-    job_registry: &JobRegistry,
-) {
+) -> Option<(Box<dyn Conn>, Registration)> {
     let peer_ip = match peer {
         PeerAddr::Tcp(addr) => addr.ip(),
         PeerAddr::Uds => {
             tracing::warn!("a host-executor connection arrived over UDS, not the mesh; refusing");
-            return;
+            return None;
         }
     };
 
@@ -78,16 +105,16 @@ pub async fn serve_host_executor(
         }))) => register,
         Ok(Ok(Some(_))) => {
             tracing::warn!(peer = %peer_ip, "host-executor's first frame was not Register; closing");
-            return;
+            return None;
         }
-        Ok(Ok(None)) => return, // clean close before any frame: nothing to log
+        Ok(Ok(None)) => return None, // clean close before any frame: nothing to log
         Ok(Err(e)) => {
             tracing::warn!(peer = %peer_ip, error = %e, "host-executor connection faulted reading Register");
-            return;
+            return None;
         }
         Err(_elapsed) => {
             tracing::warn!(peer = %peer_ip, "host-executor did not send Register within the timeout; closing");
-            return;
+            return None;
         }
     };
 
@@ -113,7 +140,7 @@ pub async fn serve_host_executor(
             },
         )
         .await;
-        return;
+        return None;
     }
 
     let capabilities = match register.capabilities {
@@ -130,7 +157,7 @@ pub async fn serve_host_executor(
                 },
             )
             .await;
-            return;
+            return None;
         }
     };
 
@@ -143,12 +170,7 @@ pub async fn serve_host_executor(
 
     // `register` logs any same-peer reclaim itself (#292 item 4), so the
     // superseded registration is ignored here.
-    let Registration {
-        mut dispatch_rx,
-        mut attach_state_rx,
-        registration,
-        ..
-    } = match registry.register(allowlist, peer_ip, host_id.clone(), capabilities) {
+    let registration = match registry.register(allowlist, peer_ip, host_id.clone(), capabilities) {
         Ok(registered) => registered,
         Err(e) => {
             // The allowlist check above already covers RegisterError::NotAllowed;
@@ -166,7 +188,7 @@ pub async fn serve_host_executor(
                 },
             )
             .await;
-            return;
+            return None;
         }
     };
 
@@ -185,10 +207,34 @@ pub async fn serve_host_executor(
     .await
     .is_err()
     {
-        registry.remove(&host_id, registration);
-        return;
+        registry.remove(&host_id, registration.registration);
+        return None;
     }
     tracing::info!(peer = %peer_ip, host_id, "host-executor registered");
+
+    Some((conn, registration))
+}
+
+/// Relay queued `Dispatch`/`AttachStateChanged` messages down a registered
+/// host-executor's connection until it closes, feeding reported `JobResult`s
+/// back into `store` and `job_registry`. `registration` is the only state
+/// carried over from [`register_and_authenticate`]: this function never
+/// touches the allowlist and never re-derives capabilities. Does not remove
+/// the registry entry — that is `serve_host_executor`'s job once this
+/// returns, since `registry` itself is not one of this function's
+/// parameters.
+async fn relay_dispatches(
+    conn: Box<dyn Conn>,
+    registration: Registration,
+    store: &Arc<JobStore>,
+    job_registry: &JobRegistry,
+) {
+    let Registration {
+        mut dispatch_rx,
+        mut attach_state_rx,
+        host_id,
+        ..
+    } = registration;
 
     // Split the connection here, not before: the handshake above never races
     // `read_frame` against anything else (each `.await` runs to completion or
@@ -339,9 +385,10 @@ pub async fn serve_host_executor(
     // end of this function — the same silent loss #292 items 2/3 describe,
     // just via a different trigger than the write failing outright. `close()`
     // first so a `send` racing this drain can't land in the gap between it
-    // and `registry.remove` below and be lost the exact same way; everything
-    // already buffered is then folded into `in_flight` so the cleanup loop
-    // immediately below fails it like any other stranded job.
+    // and `serve_host_executor`'s `registry.remove` after this function
+    // returns, and be lost the exact same way; everything already buffered
+    // is then folded into `in_flight` so the cleanup loop immediately below
+    // fails it like any other stranded job.
     dispatch_rx.close();
     while let Ok(dispatch) = dispatch_rx.try_recv() {
         in_flight.insert(dispatch.job_id);
@@ -355,9 +402,6 @@ pub async fn serve_host_executor(
     for job_id in in_flight {
         fail_disconnected_job(store, job_registry, &job_id).await;
     }
-
-    registry.remove(&host_id, registration);
-    tracing::info!(host_id, "host-executor disconnected");
 }
 
 /// Classify a reported [`JobResult`] into the terminal [`JobStatus`] to record
@@ -460,7 +504,7 @@ async fn fail_disconnected_job(store: &Arc<JobStore>, job_registry: &JobRegistry
 
 /// Reads frames from `read_half` sequentially — never raced against anything
 /// else, so each `read_frame` call always either completes or the whole task
-/// ends, which is what makes it cancel-safe from [`serve_host_executor`]'s
+/// ends, which is what makes it cancel-safe from [`relay_dispatches`]'s
 /// perspective: the `select!` loop only ever observes this through
 /// `frame_tx`'s `recv()`, a plain channel read. Ends after forwarding the
 /// first terminal result (`Ok(None)` or `Err`), matching `read_frame`'s own
@@ -474,7 +518,7 @@ async fn forward_frames<R: tokio::io::AsyncRead + Unpin>(
         let frame = read_frame::<HostExecutorMessage>(&mut read_half).await;
         let is_terminal = !matches!(frame, Ok(Some(_)));
         if frame_tx.send(frame).await.is_err() {
-            return; // serve_host_executor's loop already ended; nothing left to forward to
+            return; // relay_dispatches's loop already ended; nothing left to forward to
         }
         if is_terminal {
             return;
