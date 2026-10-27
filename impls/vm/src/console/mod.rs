@@ -55,32 +55,13 @@ pub fn run_console<T: Transport + ?Sized>(transport: &mut T, spec: &RunSpec<'_>,
     // A bounded tail of everything read from the console, so a boot that never
     // reaches the command is still diagnosable (the console is otherwise lost).
     let mut console = ConsoleTail::new();
-    // Start of the current phase's budget; reset when the command is injected.
-    let mut phase_start = Instant::now();
-    // `spec.control`'s own update generation as observed when this run
-    // started: as long as nothing outside this call has touched the control,
-    // `phase_start`/`current_deadline` above stay authoritative (today's
-    // boot-then-command budget shape, unchanged). The moment something moves
-    // it — an attach-state suspend/reinstate (#340) — the live deadline takes
-    // over instead, for the rest of this run. The generation counter (not the
-    // deadline's value) is what detects this: a suspend-then-reinstate cycle
-    // that lands on the exact same `Instant` the run started with, entirely
-    // between two polls of this loop, is invisible to a value comparison but
-    // still bumps the generation at least once.
-    let initial_generation = spec.control.generation();
-    let mut deadline_touched = false;
+    let mut deadline = PhaseDeadline::new(spec.control, Instant::now());
 
     loop {
         if let Some(result) = protocol.outcome() {
             return finalize(result, booted, console.into_string());
         }
-        if control_demands_stop(
-            spec.control,
-            initial_generation,
-            &mut deadline_touched,
-            phase_start,
-            protocol.current_deadline(),
-        ) {
+        if deadline.should_stop(spec.control, protocol.current_deadline()) {
             protocol.on_timeout();
             continue;
         }
@@ -99,7 +80,7 @@ pub fn run_console<T: Transport + ?Sized>(transport: &mut T, spec: &RunSpec<'_>,
                 match protocol.feed(&buf[..read]) {
                     ProtocolStep::Inject(frame) => {
                         booted = true;
-                        phase_start = Instant::now();
+                        deadline.reset_phase(Instant::now());
                         if let Err(err) = transport.write(&frame) {
                             return transport_fault(err, booted, console.into_string());
                         }
@@ -112,46 +93,80 @@ pub fn run_console<T: Transport + ?Sized>(transport: &mut T, spec: &RunSpec<'_>,
     }
 }
 
-/// Whether the driver should treat the current phase's budget as exhausted.
+/// Tracks whether `run_console`'s current phase budget is exhausted, across an
+/// attach-state suspend/reinstate of the live `RunControl` deadline (#340).
 ///
-/// `daemon cancel` always does. Otherwise `spec.control`'s live deadline is
-/// authoritative once something has moved it away from the value it carried
-/// when this run started — a suspended deadline (`None`) never times out, and
-/// a reinstated one (e.g. a post-detach grace period) is checked directly; the
-/// original per-phase [`TimeoutPolicy`] budget governs until then, so a run
-/// nothing ever touches keeps today's boot-then-command shape unchanged.
-///
-/// `*deadline_touched` latches to `true` the first time `control`'s update
-/// generation differs from `initial_generation` and never resets for the
-/// rest of this run: once touched, the live deadline stays authoritative
-/// even if it's later reinstated to the exact same `Instant` the run started
-/// with. The generation counter, not the deadline's value, is what makes
-/// this latch reliable — a suspend-then-reinstate-to-the-original-value
-/// cycle happening entirely between two polls of this function is invisible
-/// to a value comparison (it never observes the intermediate `None`), but
-/// still bumps the generation at least once, so a later poll that reads a
-/// different generation still catches it. Missing that window and falling
-/// back to phase-budget enforcement could grant the command phase its full
-/// fresh budget instead of respecting an already-expired original deadline.
-fn control_demands_stop(
-    control: &RunControl,
+/// `initial_generation` is `spec.control`'s own update generation as observed
+/// when the run started: as long as nothing outside this call has touched the
+/// control, `phase_start`/the per-phase [`TimeoutPolicy`] budget stay
+/// authoritative (today's boot-then-command budget shape, unchanged). The
+/// moment something moves it — an attach-state suspend/reinstate — the live
+/// deadline takes over instead, for the rest of this run. The generation
+/// counter (not the deadline's value) is what detects this: a
+/// suspend-then-reinstate cycle that lands on the exact same `Instant` the run
+/// started with, entirely between two polls, is invisible to a value
+/// comparison but still bumps the generation at least once.
+struct PhaseDeadline {
     initial_generation: u64,
-    deadline_touched: &mut bool,
+    deadline_touched: bool,
     phase_start: Instant,
-    phase_budget: Duration,
-) -> bool {
-    if control.is_cancelled() {
-        return true;
+}
+
+impl PhaseDeadline {
+    /// Capture `control`'s current generation and start the first phase's
+    /// budget at `now`.
+    fn new(control: &RunControl, now: Instant) -> Self {
+        Self {
+            initial_generation: control.generation(),
+            deadline_touched: false,
+            phase_start: now,
+        }
     }
-    if !*deadline_touched && control.generation() != initial_generation {
-        *deadline_touched = true;
+
+    /// Restart the phase budget at `now` (called on `ProtocolStep::Inject`,
+    /// when the boot phase hands off to the command phase).
+    fn reset_phase(&mut self, now: Instant) {
+        self.phase_start = now;
     }
-    match control.deadline() {
-        // Suspended: never times out, whether or not it's ever been touched
-        // — there is no deadline to have passed.
-        None => false,
-        Some(deadline) if *deadline_touched => Instant::now() >= deadline,
-        Some(_) => phase_start.elapsed() >= phase_budget,
+
+    /// Whether the driver should treat the current phase's budget as
+    /// exhausted.
+    ///
+    /// `daemon cancel` always does. Otherwise `control`'s live deadline is
+    /// authoritative once something has moved it away from the value it
+    /// carried when this run started — a suspended deadline (`None`) never
+    /// times out, and a reinstated one (e.g. a post-detach grace period) is
+    /// checked directly; the original per-phase `phase_budget` governs until
+    /// then, so a run nothing ever touches keeps today's boot-then-command
+    /// shape unchanged.
+    ///
+    /// `deadline_touched` latches to `true` the first time `control`'s update
+    /// generation differs from `initial_generation` and never resets for the
+    /// rest of this run: once touched, the live deadline stays authoritative
+    /// even if it's later reinstated to the exact same `Instant` the run
+    /// started with. The generation counter, not the deadline's value, is
+    /// what makes this latch reliable — a suspend-then-reinstate-to-the-
+    /// original-value cycle happening entirely between two polls of this
+    /// method is invisible to a value comparison (it never observes the
+    /// intermediate `None`), but still bumps the generation at least once, so
+    /// a later poll that reads a different generation still catches it.
+    /// Missing that window and falling back to phase-budget enforcement could
+    /// grant the command phase its full fresh budget instead of respecting an
+    /// already-expired original deadline.
+    fn should_stop(&mut self, control: &RunControl, phase_budget: Duration) -> bool {
+        if control.is_cancelled() {
+            return true;
+        }
+        if !self.deadline_touched && control.generation() != self.initial_generation {
+            self.deadline_touched = true;
+        }
+        match control.deadline() {
+            // Suspended: never times out, whether or not it's ever been
+            // touched — there is no deadline to have passed.
+            None => false,
+            Some(deadline) if self.deadline_touched => Instant::now() >= deadline,
+            Some(_) => self.phase_start.elapsed() >= phase_budget,
+        }
     }
 }
 
@@ -465,54 +480,41 @@ mod tests {
 
     /// Regression (CodeRabbit on #366, the deeper residual): a full
     /// suspend-then-reinstate-to-the-exact-original-value cycle happening
-    /// entirely BETWEEN two polls of `control_demands_stop` — never once
-    /// observed mid-suspension — must still latch `deadline_touched`. A
+    /// entirely BETWEEN two polls of [`PhaseDeadline::should_stop`] — never
+    /// once observed mid-suspension — must still latch `deadline_touched`. A
     /// value comparison alone can't: `control.deadline()` reads `Some(deadline)`
     /// both before and after the cycle, indistinguishable from "never
-    /// touched." Drives `control_demands_stop` directly (no `run_console`,
-    /// no transport, no thread) so the race the fuller tests above can only
+    /// touched." Drives `PhaseDeadline` directly (no `run_console`, no
+    /// transport, no thread) so the race the fuller tests above can only
     /// approximate under real elapsed time is instead a deterministic,
     /// single-threaded sequence.
     #[test]
     fn a_suspend_restore_cycle_between_polls_still_latches_touched() {
-        let deadline = Instant::now() + Duration::from_secs(1);
-        let control = RunControl::new(deadline);
-        let initial_generation = control.generation();
-        let mut touched = false;
+        let deadline_instant = Instant::now() + Duration::from_secs(1);
+        let control = RunControl::new(deadline_instant);
+        let mut deadline = PhaseDeadline::new(&control, Instant::now());
 
         // One ordinary poll first: nothing has touched the control yet.
         assert!(
-            !control_demands_stop(
-                &control,
-                initial_generation,
-                &mut touched,
-                Instant::now(),
-                Duration::from_secs(10)
-            ),
+            !deadline.should_stop(&control, Duration::from_secs(10)),
             "an untouched control with a live 1s-out deadline must not demand a stop yet"
         );
-        assert!(!touched, "nothing has touched the control yet");
+        assert!(!deadline.deadline_touched, "nothing has touched the control yet");
 
         // The full cycle happens here, with no poll in between — this is
         // the exact window a value comparison can't see into.
         control.suspend_deadline();
-        control.set_deadline(deadline); // restored to the EXACT same Instant
+        control.set_deadline(deadline_instant); // restored to the EXACT same Instant
 
         // `phase_start` far enough in the past, with a tiny budget, that the
         // OLD (buggy) equality-based logic would wrongly treat this as
         // "untouched" and fire on phase-budget alone — the live deadline
         // (1s out, not yet passed) is the only correct reason to say no.
-        let phase_start = Instant::now() - Duration::from_secs(2);
-        let demands_stop = control_demands_stop(
-            &control,
-            initial_generation,
-            &mut touched,
-            phase_start,
-            Duration::from_millis(1),
-        );
+        deadline.phase_start = Instant::now() - Duration::from_secs(2);
+        let demands_stop = deadline.should_stop(&control, Duration::from_millis(1));
 
         assert!(
-            touched,
+            deadline.deadline_touched,
             "a suspend+restore cycle landing back on the original value must still latch touched"
         );
         assert!(
