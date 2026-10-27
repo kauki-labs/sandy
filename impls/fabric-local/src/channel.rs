@@ -329,7 +329,8 @@ impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
     /// membership's last-delivered cursor (0 on first subscribe), so dropping the
     /// stream and subscribing again later — the "member goes offline, comes back"
     /// case — delivers what was missed, not just the live tail. The cursor
-    /// advances as the stream is read.
+    /// advances when the stream is polled again after a yield, so an envelope
+    /// the consumer never got to act on is redelivered (at-least-once, #173).
     ///
     /// Two concurrent `subscribe()` calls on the same membership each read the
     /// cursor independently and race on writing it back as they're polled; the
@@ -363,6 +364,7 @@ impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
             membership: membership.clone(),
             generation,
             stream_id: self.next_stream_id.fetch_add(1, Ordering::SeqCst),
+            unacked: None,
         })
     }
 }
@@ -375,13 +377,12 @@ impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
 /// caught, no periodic re-check runs here; that's #188, and `member()`'s doc
 /// comment carries the same caveat for the per-call path.
 ///
-/// Accepted step-1 simplification: the cursor advances on yield (`poll_next`
-/// returning `Ready`), before the consumer has actually acted on the envelope.
-/// A consumer cancelled between the yield and acting on it (e.g. the stream
-/// dropped mid-`select!`) loses that envelope — at-most-once, not the
-/// at-least-once the spec wants for the offline/reconnect case. True
-/// at-least-once needs a consumer-ack'd or consumer-managed cursor instead of
-/// one the backend advances on delivery; tracked as #173, not fixed here.
+/// Delivery is at-least-once (#173): a yielded envelope is acked implicitly by
+/// the NEXT `poll_next`, not by the yield itself. A consumer cancelled between
+/// the yield and acting on it (e.g. the stream dropped mid-`select!`) never
+/// polls again, so the cursor stays put and the envelope is redelivered on
+/// resubscribe. The cost is that the last envelope read before a clean drop is
+/// redelivered too, so consumers must tolerate a duplicate.
 struct CursorStream {
     inner: Pin<Box<dyn Stream<Item = Result<Envelope, ChannelBackendError>> + Send>>,
     sessions: Arc<Mutex<HashMap<MembershipId, MembershipState>>>,
@@ -395,6 +396,9 @@ struct CursorStream {
     /// assigned once at `subscribe()` time, used to update its own entry on
     /// each `Pending` poll and to remove exactly that entry on `Drop`.
     stream_id: u64,
+    /// The cursor value to commit once the consumer polls again: the sequence
+    /// after the envelope last yielded, `None` before the first yield.
+    unacked: Option<u64>,
 }
 
 impl Drop for CursorStream {
@@ -436,20 +440,25 @@ impl Stream for CursorStream {
 
         // Still current? Checked before polling the backend at all: no point
         // fetching an envelope for a membership that's already gone.
+        // The same critical section commits the previous yield's implicit ack.
         {
-            let sessions = this.sessions.lock().unwrap_or_else(PoisonError::into_inner);
-            match sessions.get(&this.membership) {
-                Some(state) if state.generation == this.generation => {}
+            let mut sessions = this.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+            match sessions.get_mut(&this.membership) {
+                Some(state) if state.generation == this.generation => {
+                    if let Some(next) = this.unacked.take() {
+                        state.cursor = next;
+                    }
+                }
                 _ => return Poll::Ready(None),
             }
         }
 
         match this.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(env))) => {
-                let mut sessions = this.sessions.lock().unwrap_or_else(PoisonError::into_inner);
-                match sessions.get_mut(&this.membership) {
+                let sessions = this.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+                match sessions.get(&this.membership) {
                     Some(state) if state.generation == this.generation => {
-                        state.cursor = env.sequence + 1;
+                        this.unacked = Some(env.sequence + 1);
                         Poll::Ready(Some(Ok(env)))
                     }
                     // Revoked between the check above and the backend's
@@ -560,7 +569,7 @@ mod tests {
     };
 
     use anyhow::Context;
-    use futures_util::StreamExt;
+    use futures_util::{FutureExt, StreamExt};
     use sandy_fabric::{capauth::CapScope, types::PeerId};
     use tokio::sync::Notify;
 
@@ -900,8 +909,10 @@ mod tests {
         {
             let mut stream = Box::pin(channel.subscribe(&member)?);
             assert_eq!(next(&mut stream).await.payload, b"a");
-            // Dropped here: the member goes offline mid-stream, cursor already
-            // advanced past "a".
+            // Polling again is the implicit ack of "a" (#173); nothing newer
+            // exists, so the poll is Pending.
+            assert!(stream.next().now_or_never().is_none());
+            // Dropped here: the member goes offline mid-stream, cursor past "a".
         }
 
         channel
@@ -924,6 +935,61 @@ mod tests {
             b"c",
             "and delivers everything missed while offline"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_envelope_dropped_before_the_next_poll_is_redelivered_on_resubscribe() -> anyhow::Result<()> {
+        let (channel, _backend, id, authority) = new_channel().await?;
+        let member = channel.join(&mint(&authority, "p1", &id, full(), Some(later())))?;
+        for payload in [b"a", b"b"] {
+            channel
+                .post(&member, None, "text/plain", payload.to_vec())
+                .await
+                .context("post")?;
+        }
+
+        {
+            let mut stream = Box::pin(channel.subscribe(&member)?);
+            assert_eq!(next(&mut stream).await.payload, b"a");
+            // Cancelled here: "a" was yielded but the consumer never acted on
+            // it and never polled for the next one.
+        }
+
+        let mut resumed = Box::pin(channel.subscribe(&member)?);
+        assert_eq!(
+            next(&mut resumed).await.payload,
+            b"a",
+            "an un-acked envelope is delivered again (at-least-once)"
+        );
+        assert_eq!(
+            next(&mut resumed).await.payload,
+            b"b",
+            "then the stream continues in order"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_envelope_acked_by_polling_on_is_not_redelivered() -> anyhow::Result<()> {
+        let (channel, _backend, id, authority) = new_channel().await?;
+        let member = channel.join(&mint(&authority, "p1", &id, full(), Some(later())))?;
+        for payload in [b"a", b"b"] {
+            channel
+                .post(&member, None, "text/plain", payload.to_vec())
+                .await
+                .context("post")?;
+        }
+
+        {
+            let mut stream = Box::pin(channel.subscribe(&member)?);
+            assert_eq!(next(&mut stream).await.payload, b"a");
+            assert_eq!(next(&mut stream).await.payload, b"b");
+        }
+
+        // "a" was acked by the poll that yielded "b"; "b" was not.
+        let mut resumed = Box::pin(channel.subscribe(&member)?);
+        assert_eq!(next(&mut resumed).await.payload, b"b");
         Ok(())
     }
 
