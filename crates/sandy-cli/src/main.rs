@@ -621,6 +621,27 @@ fn read_bounded_string(path: &str, limit: u64) -> std::io::Result<String> {
 /// enforces for the job manifest via [`read_manifest`].
 const MAX_CAP_FILE_LEN: u64 = 64 * 1024;
 
+/// Refuse a `--cap-file` that's group- or world-readable (CodeRabbit on this
+/// PR, INV-1) — the same discipline [`sandy::cred::read_secret_0600`] already
+/// applies to the forge App key / service PAT: a bearer cap is exactly as
+/// sensitive as those secrets, readable by anyone who can present it as that
+/// scope. A stat failure here is never reported as a permission refusal —
+/// it's left for the real read right after this to surface its own, more
+/// specific I/O error (missing file, no access, …).
+fn check_cap_file_permissions(path: &str) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Ok(());
+    };
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o044 != 0 {
+        return Err(format!(
+            "is group/world-readable (mode {mode:#o}); refusing to read it (INV-1)"
+        ));
+    }
+    Ok(())
+}
+
 /// Read and decode each `--cap-file` path into the raw bytes
 /// `SubmitRequest.submitter_caps` carries (#232). Each file holds exactly the
 /// base64 text `sandy daemon attach -o json`'s own `cap` field already
@@ -632,11 +653,13 @@ const MAX_CAP_FILE_LEN: u64 = 64 * 1024;
 ///
 /// # Errors
 /// Names the path that failed to read (including one over
-/// [`MAX_CAP_FILE_LEN`]), or whose contents aren't valid base64.
+/// [`MAX_CAP_FILE_LEN`] or group/world-readable), or whose contents aren't
+/// valid base64.
 fn read_submitter_caps(paths: &[String]) -> Result<Vec<Vec<u8>>, String> {
     paths
         .iter()
         .map(|path| {
+            check_cap_file_permissions(path).map_err(|e| format!("--cap-file {path:?} {e}"))?;
             let contents = read_bounded_string(path, MAX_CAP_FILE_LEN)
                 .map_err(|e| format!("--cap-file {path:?} could not be read: {e}"))?;
             base64::engine::general_purpose::STANDARD
@@ -1347,7 +1370,21 @@ mod tests {
     fn write_cap_file(dir: &std::path::Path, name: &str, contents: &str) -> anyhow::Result<String> {
         let path = dir.join(name);
         std::fs::write(&path, contents)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         Ok(path.to_str().context("cap file path is utf8")?.to_owned())
+    }
+
+    #[test]
+    fn read_submitter_caps_refuses_a_group_or_world_readable_file() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(b"a-real-cap-blob");
+        let path = write_cap_file(tmp.path(), "cap-1", &encoded)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+
+        let err = read_submitter_caps(&[path]).expect_err("a group/world-readable --cap-file must be refused");
+        assert!(err.contains("group/world-readable"), "got: {err}");
+        assert!(err.contains("INV-1"), "got: {err}");
+        Ok(())
     }
 
     #[test]

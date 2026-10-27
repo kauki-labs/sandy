@@ -5,6 +5,7 @@
 
 use std::{
     io::Write as _,
+    os::unix::fs::PermissionsExt as _,
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
@@ -138,6 +139,16 @@ fn sandy(daemon: &Daemon, args: &[&str]) -> anyhow::Result<std::process::Output>
 
 fn stderr_of(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// Write `contents` to `path` as a `0600` file: `sandy daemon submit
+/// --cap-file` refuses a group/world-readable one (INV-1), so every cap file
+/// these tests create must already be private, same as a real cap saved to
+/// disk by an operator would need to be.
+fn write_cap_file(path: &std::path::Path, contents: &str) -> anyhow::Result<()> {
+    std::fs::write(path, contents).context("write cap file")?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).context("chmod cap file")?;
+    Ok(())
 }
 
 #[test]
@@ -312,7 +323,7 @@ fn submit_with_malformed_cap_file_is_an_invalid_plan() -> anyhow::Result<()> {
     let manifest = tmp.path().join("manifest.bin");
     std::fs::write(&manifest, b"opaque").context("write manifest")?;
     let cap_file = tmp.path().join("cap.txt");
-    std::fs::write(&cap_file, "not valid base64!!").context("write cap file")?;
+    write_cap_file(&cap_file, "not valid base64!!")?;
     let cap_file = cap_file.to_str().context("cap file path is utf8")?;
 
     let submit = sandy(
@@ -349,7 +360,7 @@ fn submit_with_malformed_cap_file_is_refused_with_no_daemon_running() -> anyhow:
     let manifest = tmp.path().join("manifest.bin");
     std::fs::write(&manifest, b"opaque").context("write manifest")?;
     let cap_file = tmp.path().join("cap.txt");
-    std::fs::write(&cap_file, "not valid base64!!").context("write cap file")?;
+    write_cap_file(&cap_file, "not valid base64!!")?;
     let cap_file = cap_file.to_str().context("cap file path is utf8")?;
 
     let output = Command::new(env!("CARGO_BIN_EXE_sandy"))
@@ -392,7 +403,7 @@ fn submit_with_a_well_formed_but_unreal_cap_file_reaches_the_daemons_own_decode(
     std::fs::write(&manifest, b"opaque").context("write manifest")?;
     let not_a_real_cap = base64::engine::general_purpose::STANDARD.encode(b"not-a-real-encoded-cap");
     let cap_file = tmp.path().join("cap.txt");
-    std::fs::write(&cap_file, &not_a_real_cap).context("write cap file")?;
+    write_cap_file(&cap_file, &not_a_real_cap)?;
     let cap_file = cap_file.to_str().context("cap file path is utf8")?;
 
     let submit = sandy(
@@ -465,7 +476,7 @@ fn submit_with_a_cap_file_from_a_real_attach_grants_the_requested_subset() -> an
     let attach_json: serde_json::Value = serde_json::from_slice(&attach.stdout).context("parse attach json")?;
     let cap_b64 = attach_json["cap"].as_str().context("attach json must carry a cap")?;
     let cap_file = tmp.path().join("cap.txt");
-    std::fs::write(&cap_file, cap_b64).context("write cap file")?;
+    write_cap_file(&cap_file, cap_b64)?;
     let cap_file = cap_file.to_str().context("cap file path is utf8")?;
 
     // `sandy_fabric::types::ChannelId` is a one-field newtype, so it
