@@ -49,6 +49,7 @@
 #![cfg(feature = "live")]
 
 use std::{
+    fs::File,
     path::Path,
     process::{Child, Command, Stdio},
 };
@@ -71,6 +72,33 @@ use common::{build_guest, guest_flake, require_live_root};
 /// would reintroduce the exact collision this exists to prevent.
 fn tap_name() -> String {
     format!("sandytap{}", std::process::id())
+}
+
+/// Block until this process holds the exclusive cross-process lock serializing every
+/// `HostNet` lifetime.
+///
+/// The per-process tap name only fixes the tap-name collision. The rest of the gate's
+/// host state is still a single shared global: sandy's own `sandy_egress`/
+/// `sandy_egress_nat` nftables tables ([`sandy::egress::EGRESS_TABLE`] is a fixed
+/// constant, not parameterized per run) and the fixed `10.77.0.0/24` DHCP subnet.
+/// Nextest runs each test as its own process, in parallel by default, so without
+/// this lock one process's `preclean`/`Drop` can delete the nftables rules a sibling
+/// process's guest is mid-boot under, letting that guest reach a denied destination
+/// and passing a run that should have failed. The lock is held for a `HostNet`'s
+/// whole lifetime (acquired before `preclean`, released when the file closes on
+/// `Drop`), covering the guest boot too — a lock scoped to setup alone would still
+/// let a concurrent `Drop` tear down rules mid-boot.
+fn acquire_host_lock() -> anyhow::Result<File> {
+    let path = std::env::temp_dir().join("sandy-live-egress.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open {} for the live_egress host lock", path.display()))?;
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive)
+        .with_context(|| format!("flock {}", path.display()))?;
+    Ok(file)
 }
 /// The guest subnet routed through the host.
 const SUBNET: &str = "10.77.0.0/24";
@@ -165,6 +193,10 @@ fn detect_uplink() -> anyhow::Result<String> {
 /// and a dnsmasq DHCP server. Everything is torn down on `Drop` so no path leaves
 /// state behind.
 struct HostNet {
+    /// Held for this value's entire lifetime; never read, only kept open so the
+    /// cross-process lock [`acquire_host_lock`] took stays held until `Drop` closes
+    /// it, after every teardown command has run.
+    _lock: File,
     tap: String,
     prev_ip_forward: String,
     dnsmasq: Option<Child>,
@@ -177,6 +209,10 @@ impl HostNet {
     /// host-local-resolver case; every other case runs with DNS off (`--port=0`),
     /// matching the original gate.
     fn setup(enable_dns: bool) -> anyhow::Result<Self> {
+        // Serialize the whole gate across processes before touching any host state —
+        // see acquire_host_lock's doc for why a lock scoped to just this function
+        // would not be enough.
+        let lock = acquire_host_lock()?;
         let uplink = detect_uplink()?;
         let tap = tap_name();
 
@@ -290,6 +326,7 @@ impl HostNet {
         }
 
         Ok(Self {
+            _lock: lock,
             tap,
             prev_ip_forward,
             dnsmasq: Some(dnsmasq),
