@@ -440,7 +440,7 @@ fn trust_dir_unsafe_error(e: sandy_fsutil::FsError) -> CredError {
 /// refused, never read.
 ///
 /// The bytes come back in a [`Zeroizing`] buffer, so they are zeroed when the
-/// caller drops them (#388).
+/// caller drops them (#388). A file over 1 MiB is refused as too large.
 pub fn read_secret_0600(path: &Path) -> Result<Zeroizing<Vec<u8>>, CredError> {
     let (mut file, meta) = open_trust_file("secret", path)?;
     let mode = meta.permissions().mode() & 0o777;
@@ -453,6 +453,11 @@ pub fn read_secret_0600(path: &Path) -> Result<Zeroizing<Vec<u8>>, CredError> {
     read_declared_len(&mut file, meta.len()).map_err(|e| stage_err("read secret", path, &e))
 }
 
+/// The largest secret [`read_secret_0600`] reads. An App private key (PEM) is a few KiB and a
+/// trust-root config a few hundred bytes; 1 MiB bounds the up-front allocation, so a huge
+/// file is an error and not an allocation failure that aborts the process.
+const MAX_SECRET_BYTES: u64 = 1 << 20;
+
 /// Read `reader` into a zeroing buffer sized for `declared` bytes, never growing it.
 ///
 /// `declared` is a snapshot (the file's length at open), and a same-uid process may
@@ -464,9 +469,16 @@ fn read_declared_len(reader: impl std::io::Read, declared: u64) -> std::io::Resu
     use std::io::{Error, ErrorKind, Read as _};
 
     let too_large = || Error::new(ErrorKind::InvalidData, "secret is too large to read");
-    let limit = declared.checked_add(1).ok_or_else(too_large)?;
+    if declared > MAX_SECRET_BYTES {
+        return Err(too_large());
+    }
+    let limit = declared + 1;
     let capacity = usize::try_from(limit).map_err(|_| too_large())?;
-    let mut bytes = Zeroizing::new(Vec::with_capacity(capacity));
+    let mut bytes = Zeroizing::new(Vec::new());
+    // Fallible, so an allocation failure is an error and not an abort.
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|e| Error::new(ErrorKind::OutOfMemory, e))?;
     reader.take(limit).read_to_end(&mut bytes)?;
     if u64::try_from(bytes.len()).map_or(true, |read| read > declared) {
         return Err(Error::new(
@@ -993,10 +1005,18 @@ mod tests {
         Ok(())
     }
 
-    /// An absurd declared length is an error, not an overflow or an allocation attempt.
+    /// A declared length over the maximum is refused before any allocation: `u64::MAX / 2`
+    /// fits `usize` on a 64-bit host and would abort `Vec::with_capacity`, and `u64::MAX`
+    /// would overflow `declared + 1`. The maximum itself is still read.
     #[test]
-    fn an_unrepresentable_declared_length_is_refused() {
-        assert!(read_declared_len(&b""[..], u64::MAX).is_err());
+    fn a_declared_length_over_the_maximum_is_refused_before_allocating() -> anyhow::Result<()> {
+        for declared in [MAX_SECRET_BYTES + 1, u64::MAX / 2, u64::MAX] {
+            let refused = read_declared_len(&b""[..], declared).expect_err("an oversized declared length is refused");
+            assert!(refused.to_string().contains("too large"), "{declared}: {refused}");
+        }
+        let at_the_limit = read_declared_len(&b"short"[..], MAX_SECRET_BYTES).context("the maximum itself reads")?;
+        assert_eq!(*at_the_limit, b"short");
+        Ok(())
     }
 
     /// [`read_secret_0600`] reads a `0600` secret and refuses a `0644` one with a
