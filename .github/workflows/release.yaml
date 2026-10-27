@@ -1,15 +1,15 @@
 name: Release
-# Releases and crates.io publishing are PREPARED but DISABLED until the next
-# milestone. The release-plz job is gated on the repository variable
-# ENABLE_RELEASES; while it is unset the job is skipped and nothing is published,
-# tagged, or released (this also keeps the workflow from running release-plz's
+# Releases are PREPARED but DISABLED until the operator enables them. The
+# release-plz job is gated on the repository variable ENABLE_RELEASES; while
+# it is unset the job is skipped and nothing is published, tagged, or
+# released (this also keeps the workflow from running release-plz's
 # release-pr step before we are ready).
 #
-# To enable at the milestone: complete the crates.io bootstrap (each crate's first
-# manual publish — see release-plz.toml), then set the repo variable
-# ENABLE_RELEASES=true. The prepared model (release-plz.toml): binaries get a
-# GitHub release + <name>-<version> tag; all publishable crates publish to
-# crates.io; the three test/local crates stay publish=false.
+# To enable: set the repo variable ENABLE_RELEASES=true. The current model
+# (release-plz.toml): binaries (sandy-cli, sandyd, sandy-agent) get a GitHub
+# release + <name>-<version> tag each. crates.io publishing is deferred for
+# now (publish=false workspace-wide) — see release-plz.toml for what
+# re-enabling it later requires (the trusted-publishing bootstrap).
 on:
   push:
     branches: [main]
