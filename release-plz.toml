@@ -47,10 +47,15 @@ publish = false
 git_release_generate_notes = true
 # Releases are driven by an intentional version bump, not lockfile churn.
 dependencies_update = false
-# Per-binary tag format: <binary-name>-<version>, e.g. `sandy-cli-0.1.1`. Distinct
-# from the operator's milestone tags (`v*` / `m*`, handled by github-release.yaml),
-# so release-plz's per-binary tags and operator milestone tags never collide.
-git_tag_name = "{{ package }}-{{ version }}"
+# Per-binary tag format: <binary-name>-v<version>, e.g. `sandy-cli-v0.1.1` — this
+# must match the tags release-plz already created for v0.1.1 (release-plz's own
+# default format), since with git_only = true below, release-plz parses this
+# template against existing tags to find each binary's latest released version.
+# A mismatched template finds no tag and treats 0.1.1 as unreleased, which would
+# cut a duplicate release on the first gated push. Distinct from the operator's
+# milestone tags (`v*` / `m*`, handled by github-release.yaml), so release-plz's
+# per-binary tags and operator milestone tags never collide.
+git_tag_name = "{{ package }}-v{{ version }}"
 
 # --- Binaries: tagged + GitHub-released per binary (crates.io deferred, see above). ---
 [[package]]
