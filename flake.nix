@@ -82,6 +82,7 @@
             (import inputs.rust-overlay)
             (import ./nix/overlays/sandy-agent.nix)
             (import ./nix/overlays/sandy-host-executor.nix)
+            (import ./nix/overlays/cargo-llvm-cov-skip-tests.nix)
           ];
           pkgs = import inputs.nixpkgs { inherit system overlays; };
 
