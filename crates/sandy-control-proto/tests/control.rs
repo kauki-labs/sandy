@@ -21,6 +21,7 @@ use sandy_control_proto::{
     manifest: b"manifest-bytes".to_vec(),
     manifest_encoding: "sandy.orchestrator.v1.JobManifest".to_owned(),
     submitter_caps: vec![b"cap-a".to_vec(), b"cap-b".to_vec()],
+    required_isolation_class: sandy_control_proto::IsolationClass::Trusted.into(),
 }))]
 #[case(control_request::Op::Cancel(CancelRequest { job_id: "job-1".to_owned() }))]
 #[case(control_request::Op::Attach(AttachRequest {

@@ -931,19 +931,33 @@ happy path).
   behavior); a `flake/v1` (VM-required) job with no host picked is refused
   at `Submit` instead (`vm_placement_error`), before the job is ever
   persisted — it never silently falls back to local.
-- Stage-1 required-class default: `STAGE1_REQUIRED_ISOLATION_CLASS = IsolationClass::Trusted`,
-  a named constant with a loud tripwire comment at its definition (not an
-  inline magic value), because nothing on the submit path can express an
-  isolation requirement today — `SubmitRequest` has no such field, and
-  stage-1 (#269 D4) has no VM/untrusted backend, so an untrusted job is
-  genuinely inexpressible and unrunnable, not merely unimplemented. This is
-  accurate for stage-1, not a shortcut: adding a `SubmitRequest` wire field
-  for a value that could not vary at the time would be premature
-  configurability. The tripwire comment names the exact replacement. #150 has
-  since decided that untrusted jobs are VM-only (`process-containment.md`
-  §6), and #381 replaces this constant with a per-job requirement on the
-  submit path. Until #381 lands, an untrusted job cannot be expressed, so it
-  cannot silently default to `Trusted`.
+- **Superseded by #381.** Stage-1 originally placed every job against a
+  hardcoded `STAGE1_REQUIRED_ISOLATION_CLASS = IsolationClass::Trusted`
+  constant, since nothing on the submit path could express an isolation
+  requirement — accurate at the time (#269 D4 had no VM/untrusted backend at
+  all), not a shortcut. #150 then decided untrusted jobs are VM-only
+  (`process-containment.md` §6), and #381 replaced the constant with
+  `SubmitRequest.required_isolation_class` (`sandy_control_proto::IsolationClass`,
+  a wire-level mirror of `sandy_executor_proto::IsolationClass` kept separate
+  so this client-facing proto carries no dependency on the orchestrator
+  internal one): `Unspecified` is refused at Submit, never defaulted to
+  `Trusted` — a client that forgot to state its job's class gets an explicit
+  refusal, not a silent trust downgrade for an `Untrusted` request. Placement
+  now filters on the submitter's OWN required class via the already
+  class-aware `HostRegistry::pick_host_for`, unchanged from this decision's
+  original wiring. An `Untrusted` job additionally requires `SandboxKind::Vm`
+  (the process backend never admits one, `process-containment.md` decision
+  6): `placement_required_error` (renamed from `vm_placement_error`) now
+  refuses a Submit outright, same as an unplaceable `flake/v1` job, whenever
+  EITHER `SandboxKind::Vm` or `IsolationClass::Untrusted` is required and
+  placement fails — the two mandatory-placement dimensions are independent,
+  not only the sandbox-kind one. `sandy-host-executor::capability::
+detected_isolation_classes` also changed: it declared `Untrusted` off
+  `ContainmentStatus::is_untrusted_boundary()` before #381, a flag that never
+  implied the VM-only decision and (being always `false` in the current
+  `systemd-run` probe) made `Untrusted` undeclarable by any real host in
+  practice; it now declares `Untrusted` exactly when `detect_vm_capability`
+  says so, matching `check_isolation_class`'s own re-check rule one for one.
 - `HostRegistry::pick_host_for` enforces the same fail-closed-on-`Unspecified`
   rule `send_dispatch` already does, so placement can never pick a host
   `send_dispatch` would then refuse anyway — the gate applies at the
@@ -992,10 +1006,9 @@ link still valid would let a late stream claim a token nobody was ever
 going to use for real work.
 
 **Set aside.** Adding a `SubmitRequest.required_isolation_class` wire field
-now (the alternative to the stage-1 constant): premature configurability for
-a value that could not vary at the time (see the tripwire comment at
-`STAGE1_REQUIRED_ISOLATION_CLASS`'s definition). #381 adds the field now that
-#150 is decided. A real scheduling policy
+before #150 decided untrusted jobs are VM-only: premature configurability
+for a value that could not vary at the time (resolved by #381 once the
+decision existed). A real scheduling policy
 (load, affinity, multiple qualifying hosts): stage-1 has at most one
 executor in practice, so "first match" is equivalent to "the match"; nothing
 to decide between yet.

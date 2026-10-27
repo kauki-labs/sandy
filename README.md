@@ -107,7 +107,7 @@ Credential trust roots are managed with
 [`docs/providers/github`](docs/providers/github/README.md)).
 
 ```sh
-sandy daemon submit <manifest|-> --manifest-encoding <ENCODING>
+sandy daemon submit <manifest|-> --manifest-encoding <ENCODING> --isolation-class <trusted|untrusted>
 sandy daemon status|attach|cancel <job-id>
 sandy daemon list
 ```
@@ -163,7 +163,7 @@ SANDY_HOST_EXECUTOR_ID=<any-name> \
 sandy-host-executor
 
 # from the orchestrator host: submit an argv/v1 manifest (a JSON array of argv), then attach
-SANDY_SOCK=/tmp/sandyd.sock sandy daemon submit manifest.json --manifest-encoding argv/v1 -o json
+SANDY_SOCK=/tmp/sandyd.sock sandy daemon submit manifest.json --manifest-encoding argv/v1 --isolation-class trusted -o json
 SANDY_SOCK=/tmp/sandyd.sock sandy daemon attach <job-id>
 ```
 

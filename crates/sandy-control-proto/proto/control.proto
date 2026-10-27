@@ -61,6 +61,19 @@ enum JobStatus {
   JOB_STATUS_CANCELLED = 5;
 }
 
+// Whether a job may run on a shared-kernel backend (trusted) or needs a full
+// hypervisor boundary (untrusted, #150's decision). Mirrors
+// `sandy_executor_proto::IsolationClass` one-for-one, defined separately here
+// so this client-facing wire contract carries no dependency on the internal
+// orchestrator<->host-executor proto; `sandyd::handler` converts between the
+// two. UNSPECIFIED is never a usable value on `SubmitRequest` (#381) — it is
+// refused at Submit, not defaulted to TRUSTED.
+enum IsolationClass {
+  ISOLATION_CLASS_UNSPECIFIED = 0;
+  ISOLATION_CLASS_TRUSTED = 1;
+  ISOLATION_CLASS_UNTRUSTED = 2;
+}
+
 // Submit a job. `manifest` is opaque here: the typed, submitter-bounded
 // JobManifest (capped at the submitter's own attenuation, decision C) is
 // B3's job (#205) — B0 only defines the envelope it travels in, not its
@@ -86,6 +99,11 @@ message SubmitRequest {
   // directly, as it always has; it is never a silent way to escalate a
   // REQUESTED cap past what would otherwise be checked.
   repeated bytes submitter_caps = 3;
+  // The job's required isolation class (#381). UNSPECIFIED is refused at
+  // Submit — every client must state TRUSTED or UNTRUSTED explicitly, never
+  // a silent default, since defaulting an unstated class to TRUSTED would
+  // breach isolation for a client that meant to ask for UNTRUSTED.
+  IsolationClass required_isolation_class = 4;
 }
 
 message SubmitResponse {

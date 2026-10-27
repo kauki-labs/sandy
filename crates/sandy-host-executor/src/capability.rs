@@ -80,22 +80,26 @@ fn capabilities_from(arch: Arch, status: &ContainmentStatus) -> Result<Capabilit
     })
 }
 
-/// Derive the isolation classes this host's containment can actually honor,
-/// for `Register`'s wire `Capabilities.supported_isolation_classes` (#280's
+/// Derive the isolation classes this host's backends can actually honor, for
+/// `Register`'s wire `Capabilities.supported_isolation_classes` (#280's
 /// orchestrator-side gate refuses a dispatch whose required class isn't in
 /// this list — an empty or hardcoded list would silently refuse every
-/// dispatch to this host, functional-but-dead). Mirrors the admission logic
-/// [`dispatch::check_isolation_class`](crate::dispatch::check_isolation_class)
-/// re-checks per dispatch: `is_available()` always honors `Trusted`;
-/// `is_untrusted_boundary()` additionally honors `Untrusted`. A non-available
-/// status honors neither — the empty list is the correct, fail-closed
-/// declaration for a host that can't contain anything at all.
-fn detected_isolation_classes(status: &ContainmentStatus) -> Vec<IsolationClass> {
+/// dispatch to this host, functional-but-dead). Mirrors
+/// [`dispatch::check_isolation_class`](crate::dispatch::check_isolation_class)'s
+/// own fail-closed rule (`process-containment.md` decision 6, #150, #381):
+/// `is_available()` honors `Trusted`; `Untrusted` is honored only when
+/// `vm_available` — the process backend never admits an untrusted job, with
+/// ANY containment, on any host, so declaring `Untrusted` off
+/// `ContainmentStatus::is_untrusted_boundary()` alone (as this function did
+/// before #381) would advertise a capability the re-check could never honor.
+/// A non-available status honors neither — the empty list is the correct,
+/// fail-closed declaration for a host that can't contain anything at all.
+fn detected_isolation_classes(status: &ContainmentStatus, vm_available: bool) -> Vec<IsolationClass> {
     if !status.is_available() {
         return Vec::new();
     }
     let mut classes = vec![IsolationClass::Trusted];
-    if status.is_untrusted_boundary() {
+    if vm_available {
         classes.push(IsolationClass::Untrusted);
     }
     classes
@@ -151,7 +155,10 @@ fn to_wire_capabilities(
         supported_sandbox_kinds: kinds,
         arch: arch.into(),
         attestation: capabilities.attestation.is_some(),
-        supported_isolation_classes: detected_isolation_classes(status).into_iter().map(Into::into).collect(),
+        supported_isolation_classes: detected_isolation_classes(status, vm_available)
+            .into_iter()
+            .map(Into::into)
+            .collect(),
     }
 }
 
@@ -353,38 +360,47 @@ mod tests {
         );
     }
 
-    /// Positive: a reaping-only containment declares exactly `[Trusted]` —
-    /// this is the case #284's merge-blocker exists for: an unpopulated
-    /// `supported_isolation_classes` would make the orchestrator's isolation
-    /// gate refuse every dispatch, even trusted ones.
+    /// Positive: an available containment with no VM capability declares
+    /// exactly `[Trusted]` — this is the case #284's merge-blocker exists
+    /// for: an unpopulated `supported_isolation_classes` would make the
+    /// orchestrator's isolation gate refuse every dispatch, even trusted
+    /// ones. An `isolates_untrusted: true` status does NOT add `Untrusted`
+    /// on its own (#381, process-containment.md decision 6): the process
+    /// backend never admits an untrusted job regardless of containment.
     #[test]
-    fn an_available_reaping_only_containment_declares_trusted_only() {
-        let status = ContainmentStatus::Available {
-            isolates_untrusted: false,
-        };
-        assert_eq!(detected_isolation_classes(&status), vec![IsolationClass::Trusted]);
-    }
-
-    /// Positive: an untrusted boundary declares both classes — at least what
-    /// a reaping-only host declares, plus `Untrusted`.
-    #[test]
-    fn an_untrusted_boundary_declares_trusted_and_untrusted() {
+    fn an_available_containment_with_no_vm_declares_trusted_only() {
         let status = ContainmentStatus::Available {
             isolates_untrusted: true,
         };
         assert_eq!(
-            detected_isolation_classes(&status),
+            detected_isolation_classes(&status, false),
+            vec![IsolationClass::Trusted]
+        );
+    }
+
+    /// Positive (#381): VM capability declares both classes — `Trusted` plus
+    /// `Untrusted` — regardless of what the process containment's own
+    /// `isolates_untrusted` flag reports, since `Untrusted` is gated on
+    /// `vm_available` alone.
+    #[test]
+    fn vm_capability_declares_trusted_and_untrusted() {
+        let status = ContainmentStatus::Available {
+            isolates_untrusted: false,
+        };
+        assert_eq!(
+            detected_isolation_classes(&status, true),
             vec![IsolationClass::Trusted, IsolationClass::Untrusted]
         );
     }
 
     /// Adversarial: a host with no usable containment declares no isolation
     /// class at all — never a hardcoded `[Trusted]` for a host that can't
-    /// actually honor it.
+    /// actually honor it — even when `vm_available` is true (no reaping
+    /// means no backend can run anything at all).
     #[test]
     fn an_unavailable_containment_declares_no_isolation_class() {
         let status = ContainmentStatus::Unavailable("no user systemd instance".to_owned());
-        assert_eq!(detected_isolation_classes(&status), Vec::<IsolationClass>::new());
+        assert_eq!(detected_isolation_classes(&status, true), Vec::<IsolationClass>::new());
     }
 
     /// The load-bearing property for #284: the wire `Capabilities` Register
@@ -413,11 +429,12 @@ mod tests {
         assert!(!wire.attestation);
     }
 
-    /// Positive (#332): `vm_available = true` ADDS `Vm` to the declared
+    /// Positive (#332, #381): `vm_available = true` ADDS `Vm` to the declared
     /// kinds — the existing `Process` declaration is completely unaffected,
-    /// never replaced.
+    /// never replaced — AND adds `Untrusted` to the declared isolation
+    /// classes, the only way a host can ever advertise it.
     #[test]
-    fn to_wire_capabilities_adds_vm_alongside_process_when_available() {
+    fn to_wire_capabilities_adds_vm_and_untrusted_when_available() {
         let status = ContainmentStatus::Available {
             isolates_untrusted: false,
         };
@@ -433,6 +450,10 @@ mod tests {
                 i32::from(sandy_executor_proto::SandboxKind::Process),
                 i32::from(sandy_executor_proto::SandboxKind::Vm),
             ]
+        );
+        assert_eq!(
+            wire.supported_isolation_classes,
+            vec![i32::from(IsolationClass::Trusted), i32::from(IsolationClass::Untrusted)]
         );
     }
 

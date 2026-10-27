@@ -168,7 +168,7 @@ cat >"$manifest" <<'EOF'
 EOF
 
 echo "==> submitting the job" >&2
-submit_json=$(SANDY_SOCK="$sock" "$repo_root/target/debug/sandy" daemon submit "$manifest" --manifest-encoding argv/v1 -o json)
+submit_json=$(SANDY_SOCK="$sock" "$repo_root/target/debug/sandy" daemon submit "$manifest" --manifest-encoding argv/v1 --isolation-class trusted -o json)
 job_id=$(jq -r .job_id <<<"$submit_json")
 [ -n "$job_id" ] && [ "$job_id" != null ] || {
   echo "submit did not return a job_id: $submit_json" >&2

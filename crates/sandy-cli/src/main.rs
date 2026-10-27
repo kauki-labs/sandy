@@ -156,6 +156,27 @@ enum Command {
     },
 }
 
+/// `sandy daemon submit --isolation-class`'s value: mirrors
+/// `sandy_control_proto::IsolationClass` minus `Unspecified`, which Submit
+/// always refuses (#381) — clap requires one of these, so the wire request
+/// never carries an unstated class.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum IsolationClassArg {
+    /// A shared-kernel backend may run this job.
+    Trusted,
+    /// Only a full hypervisor boundary (`SandboxKind::Vm`) may run this job.
+    Untrusted,
+}
+
+impl From<IsolationClassArg> for sandy_control_proto::IsolationClass {
+    fn from(value: IsolationClassArg) -> Self {
+        match value {
+            IsolationClassArg::Trusted => sandy_control_proto::IsolationClass::Trusted,
+            IsolationClassArg::Untrusted => sandy_control_proto::IsolationClass::Untrusted,
+        }
+    }
+}
+
 /// `sandy daemon <op>`: one control-RPC call to `sandyd` per invocation.
 #[derive(Debug, Subcommand)]
 enum DaemonOp {
@@ -165,6 +186,10 @@ enum DaemonOp {
         /// with `--flake`.
         #[arg(required_unless_present = "flake", conflicts_with = "flake")]
         manifest: Option<String>,
+        /// This job's required isolation class (#381). Required — `sandyd`
+        /// refuses a Submit with no stated class rather than defaulting one.
+        #[arg(long, value_enum)]
+        isolation_class: IsolationClassArg,
         /// Names the encoding of `manifest`'s bytes (e.g. a future
         /// `sandy.orchestrator.v1.JobManifest`). Required with `manifest` —
         /// never a silent default interpretation of unknown bytes — and
@@ -602,6 +627,7 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
     let request_op = match op {
         DaemonOp::Submit {
             manifest,
+            isolation_class,
             manifest_encoding,
             flake,
             attr,
@@ -651,6 +677,7 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
                 // submit, same as today, never a silent way to claim bounded
                 // caps without actually presenting any.
                 submitter_caps: Vec::new(),
+                required_isolation_class: sandy_control_proto::IsolationClass::from(isolation_class).into(),
             })
         }
         DaemonOp::Cancel { job_id } => control_request::Op::Cancel(CancelRequest { job_id }),
