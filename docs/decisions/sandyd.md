@@ -1038,6 +1038,14 @@ that branch never actually partial-reads in practice.
   `host_conn` management-channel listener), so either direction notices a
   dead peer. A real process crash already gives an immediate connection
   reset; keepalive only covers the vanished-host case that reset can't.
+  **Extended to the agent-link path** (a later audit of #289's remaining
+  scope): `sandyd::main::setup_mesh_agent_link_listener` and
+  `sandy-fabric-local::mesh_link::dial_and_forward` used plain
+  `sandy_conn::listen`/`connect` — without the same profile, a vanished
+  executor mid-run left `serve_agent_link` waiting forever on this
+  listener's accepted stream for a frame that would never arrive (INV-11:
+  a job's exit must come from the agent's own report, never a hang). Same
+  `HALF_OPEN_DETECTION` profile, both directions, same reasoning.
 - **A `DISPATCH_WRITE_TIMEOUT` (30s) around the `Dispatch` write** in
   `host_conn::serve_host_executor`'s connection loop. On expiry the connection
   closes and `registry.remove` runs exactly as it does on a write error —
