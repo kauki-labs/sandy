@@ -55,6 +55,18 @@ fn emit_sentinel(sentinel: &str) -> String {
     format!("printf '%s%s' '{head}' '{tail}'")
 }
 
+/// POSIX-quote `arg` for safe inclusion in a single shell command line: wrap it
+/// in single quotes, escaping an embedded quote as `'\''`.
+///
+/// [`Protocol::build_frame`] re-joins `command`'s elements into one line that
+/// the guest's own `sh` re-tokenizes on whitespace once decoded; a naive
+/// space-join loses any argv element that itself contains a space (e.g.
+/// `"exit 3"` from `["sh", "-c", "exit 3"]`), silently splitting it into two
+/// words and changing what the guest actually runs — found live, #116.
+fn shell_quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', r"'\''"))
+}
+
 /// The per-run markers that delimit the console protocol.
 ///
 /// `ready` is the host-agnostic boot-ready marker (e.g. the guest's login
@@ -213,7 +225,8 @@ impl Protocol {
     /// base64-wrapped command, runs it between the START/END sentinels, and
     /// reports the exit status the parser reads.
     fn build_frame(markers: &Markers, command: &[String]) -> Vec<u8> {
-        let encoded = STANDARD.encode(command.join(" ").as_bytes());
+        let joined = command.iter().map(|arg| shell_quote(arg)).collect::<Vec<_>>().join(" ");
+        let encoded = STANDARD.encode(joined.as_bytes());
         // Two constraints a live boot imposes that the sandbox fixtures do not
         // (they hand-build the console stream rather than calling this frame):
         //
@@ -564,6 +577,41 @@ mod tests {
             .context("Outcome, not a protocol error")?;
         assert!(outcome.booted);
         assert_eq!(outcome.guest_exit, Some(0), "must capture the real exit, not the echo");
+        Ok(())
+    }
+
+    /// Regression (#116, found on a live qemu boot): a single argv element
+    /// containing whitespace (`"exit 3"`, from `["sh", "-c", "exit 3"]`) must
+    /// survive the frame's join-then-guest-reparse round trip, not get split
+    /// into extra words. Replays the exact guest-side pipeline (`base64 -d |
+    /// sh`) locally with a real `sh`, which catches a join/re-tokenize bug
+    /// without needing a VM boot.
+    #[test]
+    fn a_multi_word_argv_element_round_trips_through_the_frame() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let markers = test_markers();
+        let command = [String::from("sh"), String::from("-c"), String::from("exit 3")];
+        let frame = Protocol::build_frame(&markers, &command);
+        let frame_text = String::from_utf8(frame).context("frame is valid UTF-8")?;
+
+        let prefix = "printf '%s' '";
+        let start = frame_text.find(prefix).context("frame has the printf payload prefix")? + prefix.len();
+        let end = frame_text[start..]
+            .find("' | base64 -d")
+            .context("frame has the base64 marker")?
+            + start;
+        let encoded = &frame_text[start..end];
+
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '%s' '{encoded}' | base64 -d | sh"))
+            .status()
+            .context("spawn sh to replay the guest-side decode pipeline")?;
+        assert_eq!(
+            status.code(),
+            Some(3),
+            "the guest must see argv [\"sh\", \"-c\", \"exit 3\"], not re-tokenized words"
+        );
         Ok(())
     }
 
