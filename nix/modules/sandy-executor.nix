@@ -162,17 +162,18 @@ in
       startSession = true;
     };
 
-    # #300(b): defense-in-depth, inert under the default
-    # `KillUserProcesses=false` (confirmed, sandy-73/#299 — NixOS defaults it
-    # to `false`, under which logind kills nothing on session end regardless
-    # of this list, and `StopIdleSessionSec` doesn't fire on this TTY-less
-    # session anyway). What actually keeps a dispatched job alive is
-    # lingering keeping `user@<uid>.service` running independent of any
-    # login session (see nix/tests/sandy-executor-vm.nix's job-cgroup
-    # assertion, and tracking issue #302 for the one open gap: if the remote host ever
-    # sets `StopIdleSessionSec` itself, protection is logind's no-TTY idle
-    # model, not this drop-in). Kept anyway in case the remote host's own config ever
-    # turns `KillUserProcesses` on for other accounts — a drop-in, not
+    # #300(b): defense-in-depth. `StopIdleSessionSec` doesn't fire on this
+    # TTY-less session, and even with a remote host turning
+    # `KillUserProcesses` on directly (#302's VM test, which exercises this
+    # for real rather than relying on that proxy), this list turned out to
+    # be inert in practice: lingering is what actually keeps `user@<uid>.service`
+    # (and a dispatched job under it) alive across a session ending, full
+    # stop, independent of whatever's in `KillExcludeUsers` — confirmed by
+    # removing `${username}` from this list under a live `KillUserProcesses=yes`
+    # sweep and observing no change, since testing it the other way around
+    # (disabling lingering to isolate this list's own effect) breaks
+    # `SystemdRunContainment::detect` itself, long before KillUserProcesses
+    # ever enters the picture. Kept anyway in case the remote host's own config ever
     # `services.logind.settings`, because `KillExcludeUsers` is a
     # list-valued logind.conf key that ACCUMULATES across drop-in files
     # (systemd's own conf.d semantics) — this adds `sandy-executor` to

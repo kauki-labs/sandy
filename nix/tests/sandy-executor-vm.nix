@@ -70,6 +70,57 @@ testPkgs.testers.runNixOSTest {
       # assertion is tracked separately, #302.
       services.logind.settings.Login.StopIdleSessionSec = 2;
 
+      # #302: the direct test. `KillUserProcesses` is boolean-valued (unlike
+      # `KillExcludeUsers`, a list-valued key that accumulates across
+      # conf.d files — see the module's own comment on why that one isn't
+      # set here), so turning it on via `services.logind.settings` carries
+      # no risk of silently replacing an accumulated list.
+      services.logind.settings.Login.KillUserProcesses = true;
+
+      # A throwaway control user, NOT in the module's `KillExcludeUsers`
+      # list, with the same PAMName-session shape as `sandy-executor`
+      # itself. Without this negative control, the #302 test could pass
+      # vacuously: if `KillUserProcesses` silently had no effect at all (a
+      # NixOS version regression, a logind reload that never took),
+      # sandy-executor's job would "survive" for a reason that has nothing
+      # to do with the exclude list actually working.
+      #
+      # `class=user` turned out to be required (confirmed by interactively
+      # inspecting `loginctl session-status` on both users while writing
+      # this test): a PAMName-opened session with no TTY defaults to class
+      # `background-light`, under which logind starts the runtime directory
+      # but NOT the full `user@<uid>.service` manager + bus — `systemd-run
+      # --user` has nothing to connect to without it. Giving it `Linger`
+      # instead (what sandy-executor relies on, and what starts
+      # `user@<uid>.service` regardless of session class) does make the bus
+      # appear, but it ALSO turned out to exempt the user from
+      # `KillUserProcesses` on its own, independent of `KillExcludeUsers` —
+      # defeating the negative control the same way omitting it entirely
+      # would. Forcing class `user` gets a real, excludable session instead.
+      users.users.kill-control = {
+        isSystemUser = true;
+        group = "kill-control";
+        createHome = true;
+        shell = pkgs.shadow;
+      };
+      users.groups.kill-control = { };
+      security.pam.services.kill-control = {
+        startSession = true;
+        rules.session.systemd.args = [ "class=user" ];
+      };
+      systemd.services.kill-control-session = {
+        description = "#302 control: a logind session the KillExcludeUsers list does not cover";
+        # Not `wantedBy multi-user.target` — the test starts this itself, at
+        # the point it actually wants the control session open.
+        serviceConfig = {
+          ExecStart = "${pkgs.coreutils}/bin/sleep infinity";
+          User = "kill-control";
+          Group = "kill-control";
+          PAMName = "kill-control";
+          Restart = "no";
+        };
+      };
+
       # A probe unit that reuses `sandy-executor.service`'s EXACT
       # `serviceConfig` (not a re-typed copy that could silently drift from
       # it) to run a real `bwrap`-confined command under the full hardened
@@ -261,18 +312,126 @@ testPkgs.testers.runNixOSTest {
     # #300(b) smoke check: with StopIdleSessionSec=2 set on this node, wait
     # past it and re-check containment. This does NOT prove KillExcludeUsers
     # is doing anything (confirmed, sandy-73, #299: StopIdleSessionSec never
-    # fires on this TTY-less session, and KillUserProcesses defaults to
-    # `false` anyway, so the exclude list is inert defense-in-depth here,
-    # not active protection). What actually keeps a dispatched job alive
-    # past this window is lingering keeping `user@<uid>.service` running
-    # independent of any login session. A real assertion of that survival
-    # path is tracked separately, #302; this block stays as a basic
-    # "nothing regressed" check.
+    # fires on this TTY-less session) — what actually keeps a dispatched job
+    # alive past this window is lingering keeping `user@<uid>.service`
+    # running independent of any login session. A real test of the exclude
+    # list follows below (#302); this block stays as a basic "nothing
+    # regressed" check.
     machine.sleep(5)
     journal_after_idle_window = machine.succeed("journalctl -b -o cat --no-pager")
     assert "cannot declare any capability" not in journal_after_idle_window, (
         f"containment broke after the StopIdleSessionSec window — "
         f"journal:\n{journal_after_idle_window}"
+    )
+
+    # #302: exercise KillUserProcesses=yes directly rather than the inert
+    # StopIdleSessionSec proxy above. The node sets KillUserProcesses=true
+    # and a throwaway `kill-control` user, run WITHOUT lingering and in a
+    # real "user"-class session (negative control — without it, a
+    # vacuously-passing test couldn't be told apart from sandy-executor's
+    # own setup actually protecting its job). A dispatched job lives under
+    # its user's OWN `user@<uid>.service`, not the login session scope (the
+    # job-cgroup assertion above), so the question this proves is whether
+    # ending a user's session reaches into THAT and kills it too.
+    #
+    # This isolates sandy-executor's WHOLE setup (lingering + the
+    # KillExcludeUsers drop-in, exactly as deployed), not KillExcludeUsers
+    # alone: confirmed interactively while writing this test that removing
+    # sandy-executor from KillExcludeUsers changes nothing here, because
+    # lingering already keeps `user@<uid>.service` alive regardless of that
+    # list (see the module's own comment on the drop-in). Isolating
+    # KillExcludeUsers the other way —
+    # disabling lingering to see the list's effect on its own — breaks
+    # `SystemdRunContainment::detect` itself before KillUserProcesses ever
+    # enters the picture, so there's no config under which that isolation
+    # is actually meaningful to test.
+    sandy_uid = machine.succeed("id -u sandy-executor").strip()
+    machine.succeed("systemctl start kill-control-session")
+    machine.wait_for_unit("kill-control-session.service")
+    control_uid = machine.succeed("id -u kill-control").strip()
+    # `kill-control-session.service` becoming active only means its OWN PAM
+    # session opened — not that the bus `systemd-run --user` connects to has
+    # finished starting behind it. Without this wait the very next command
+    # below raced it and failed ("Failed to connect to user scope bus via
+    # local transport: No such file or directory"); sandy-executor's own
+    # user bus doesn't need the same wait since its session has been open
+    # since early boot. `wait_for_unit(f"user@{uid}.service")` isn't the
+    # right check here: that unit is bus/socket-activated, not eagerly
+    # started by opening a PAM session, so it can read "inactive, no
+    # pending jobs" right up until something first dials the bus — a state
+    # `wait_for_unit` treats as a hard failure rather than something to poll
+    # past. Wait on the actual socket the bus listens on instead.
+    machine.wait_until_succeeds(f"test -S /run/user/{control_uid}/bus")
+
+    # A long-lived job under each user's own user manager — the same shape
+    # a real dispatched job runs under, reusing the session each of their
+    # services/units already holds open (sandy-executor.service's own
+    # PAMName session; kill-control-session.service's, just started).
+    machine.succeed(
+        f"runuser -u sandy-executor -- env XDG_RUNTIME_DIR=/run/user/{sandy_uid} "
+        "systemd-run --user --unit=kill-test-job -- sleep 300"
+    )
+    machine.succeed(
+        f"runuser -u kill-control -- env XDG_RUNTIME_DIR=/run/user/{control_uid} "
+        "systemd-run --user --unit=kill-test-job -- sleep 300"
+    )
+
+    # End each user's session the way a real idle/session timeout would, not
+    # `loginctl terminate-user`: that command is a blunt administrator
+    # override ("terminate this user NOW") which killed sandy-executor's job
+    # too on an earlier draft of this test — it does not appear to consult
+    # KillExcludeUsers at all, unlike a session ending on its own.
+    #
+    # sandy-executor.service restarts on its own every few seconds for the
+    # whole test (Restart=on-failure against the always-refused orchestrator
+    # dial) — that natural cycle is what ends ITS session here, not an
+    # explicit restart issued by this block: an earlier draft called
+    # `systemctl restart sandy-executor.service` directly and raced the
+    # self-triggered cycle already in flight, producing a flaky false
+    # failure (the job briefly read as killed, then came back). Sleeping
+    # past one full cycle is simpler and doesn't fight that loop.
+    machine.sleep(7)
+    machine.succeed("systemctl stop kill-control-session")
+
+    # KillUserProcesses's sweep is not instantaneous (confirmed interactively
+    # while writing this test: a single fixed sleep before checking was
+    # sometimes too short and caught the control job still alive). Poll for
+    # each side's terminal state rather than sleeping a fixed amount then
+    # checking once.
+    #
+    # Check `user@<uid>.service` itself from the SYSTEM manager
+    # (`systemctl is-active`), not `kill-test-job` through
+    # `--machine=<user>@ --user` (a bridge into that user's OWN bus): the
+    # bridge doesn't just read state, it actively establishes a fresh
+    # session to reach it — repeatedly polling it was itself re-opening a
+    # session for the user on every single attempt, a classic observer
+    # effect that made the control job look alive indefinitely regardless
+    # of whether KillUserProcesses had already reaped it. `user@.service`'s
+    # own state is a valid proxy for the job under it either way: the sweep
+    # acts on the user's whole slice as one unit, so the manager and
+    # everything beneath it live or die together.
+    machine.wait_until_succeeds(f"systemctl --no-pager is-active user@{sandy_uid}.service", timeout=30)
+    machine.wait_until_succeeds(
+        f'test "$(systemctl --no-pager is-active user@{control_uid}.service 2>&1)" != active', timeout=30
+    )
+
+    sandy_manager_status = machine.succeed(
+        f"systemctl --no-pager is-active user@{sandy_uid}.service 2>&1 || true"
+    ).strip()
+    control_manager_status = machine.succeed(
+        f"systemctl --no-pager is-active user@{control_uid}.service 2>&1 || true"
+    ).strip()
+    assert sandy_manager_status == "active", (
+        f"sandy-executor's user@.service (and the dispatched-job stand-in under it) was "
+        f"killed when its session ended (is-active: {sandy_manager_status!r}), even "
+        f"though sandy-executor is in the KillExcludeUsers list — the exclude list is "
+        f"not actually protecting it"
+    )
+    assert control_manager_status != "active", (
+        f"the unprotected control user's user@.service survived session end under "
+        f"KillUserProcesses=true (is-active: {control_manager_status!r}) — this test's "
+        f"negative control did not fire, so the sandy-executor survival above would "
+        f"prove nothing even if it passed"
     )
   '';
 }
