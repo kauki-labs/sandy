@@ -338,7 +338,7 @@ async fn relay_dispatches(
                 match frame {
                     Some(Ok(Some(message))) => match message.op {
                         Some(host_executor_message::Op::Result(result)) => {
-                            record_job_result(store, &mut in_flight, result).await;
+                            record_job_result(store, job_registry, &mut in_flight, result).await;
                         }
                         // Stage 1 has no re-registration or capability-update
                         // machinery (#269): any other frame from the
@@ -440,7 +440,12 @@ async fn mark_job_running(store: &Arc<JobStore>, job_id: &str) {
 /// stdout/stderr, which belongs in the job's record for `status`/`attach` to
 /// surface, not in this host's own journald logs (INV-1, the host-executor's
 /// matching no-log-the-console discipline on the other end).
-async fn record_job_result(store: &Arc<JobStore>, in_flight: &mut HashSet<String>, result: JobResult) {
+async fn record_job_result(
+    store: &Arc<JobStore>,
+    job_registry: &JobRegistry,
+    in_flight: &mut HashSet<String>,
+    result: JobResult,
+) {
     let (status, exit_code) = classify(&result);
     let job_id = result.job_id.clone();
     in_flight.remove(&job_id);
@@ -450,7 +455,10 @@ async fn record_job_result(store: &Arc<JobStore>, in_flight: &mut HashSet<String
     let jid = job_id.clone();
     let transition = tokio::task::spawn_blocking(move || store.finish(&jid, status, exit_code, &console)).await;
     match transition {
-        Ok(Ok(Transition::Applied)) => tracing::info!(job_id, ?status, ?exit_code, "recorded a job result"),
+        Ok(Ok(Transition::Applied)) => {
+            job_registry.mark_terminal(&job_id);
+            tracing::info!(job_id, ?status, ?exit_code, "recorded a job result");
+        }
         Ok(Ok(Transition::Refused(current))) => {
             tracing::info!(
                 job_id,
@@ -484,6 +492,7 @@ async fn fail_disconnected_job(store: &Arc<JobStore>, job_registry: &JobRegistry
     .await;
     match transition {
         Ok(Ok(Transition::Applied)) => {
+            job_registry.mark_terminal(job_id);
             tracing::warn!(
                 job_id,
                 "failed an in-flight job: its host-executor disconnected before reporting a result"
@@ -621,6 +630,15 @@ mod tests {
         JobRegistry::new().expect("getrandom for a test registry")
     }
 
+    /// A registry whose terminal-retention sweep (#270) fires immediately,
+    /// for tests that need to observe a job being reaped rather than wait
+    /// out the real production default.
+    fn test_job_registry_zero_retention() -> JobRegistry {
+        JobRegistry::new()
+            .expect("getrandom for a test registry")
+            .with_retention(std::time::Duration::ZERO)
+    }
+
     /// Regression (#368): `fail_disconnected_job` must invalidate the job's
     /// `RemoteLink`, not just mark it `Failed` in the store — job status
     /// alone doesn't gate agent-link authentication, so a late stream could
@@ -653,6 +671,73 @@ mod tests {
         assert!(
             matches!(auth, Err(crate::link_auth::LinkAuthError::AlreadyClaimed)),
             "the genuine token must be refused once the disconnected job's host-executor is gone: {auth:?}"
+        );
+        Ok(())
+    }
+
+    /// #270: `fail_disconnected_job` must call `JobRegistry::mark_terminal`,
+    /// not just mark the job `Failed` in the store — otherwise a job failed
+    /// this way would sit in the registry forever, never reached by the
+    /// retention sweep.
+    #[tokio::test]
+    async fn fail_disconnected_job_marks_the_job_terminal_for_the_registrys_retention_sweep() -> anyhow::Result<()> {
+        let store = test_store();
+        store.insert_pending("job-1", b"m", "test/v1")?;
+        let job_registry = test_job_registry_zero_retention();
+        let job = crate::dispatch::mint_job_channel("job-1", job_registry.authority())
+            .await
+            .context("mint job channel")?;
+        job_registry.insert("job-1".to_owned(), job);
+
+        fail_disconnected_job(&store, &job_registry, "job-1").await;
+
+        // A second insert is what the sweep is tied to (#270).
+        let job2 = crate::dispatch::mint_job_channel("job-2", job_registry.authority())
+            .await
+            .context("mint job channel")?;
+        job_registry.insert("job-2".to_owned(), job2);
+
+        assert!(
+            job_registry.get("job-1").is_none(),
+            "a disconnected job's channel must be reaped once retention elapses"
+        );
+        Ok(())
+    }
+
+    /// #270: `record_job_result` must call `JobRegistry::mark_terminal`
+    /// whenever `store.finish` actually applies the transition — otherwise a
+    /// normally-completed job's channel would sit in the registry forever.
+    #[tokio::test]
+    async fn record_job_result_marks_the_job_terminal_for_the_registrys_retention_sweep() -> anyhow::Result<()> {
+        let store = test_store();
+        store.insert_pending("job-1", b"m", "test/v1")?;
+        let job_registry = test_job_registry_zero_retention();
+        let job = crate::dispatch::mint_job_channel("job-1", job_registry.authority())
+            .await
+            .context("mint job channel")?;
+        job_registry.insert("job-1".to_owned(), job);
+
+        let mut in_flight = HashSet::from(["job-1".to_owned()]);
+        let result = JobResult {
+            job_id: "job-1".to_owned(),
+            booted: true,
+            exit_code: Some(0),
+            timed_out: false,
+            transport_error: None,
+            console: String::new(),
+        };
+        record_job_result(&store, &job_registry, &mut in_flight, result).await;
+        assert_eq!(store.status("job-1")?, Some(JobStatus::Succeeded));
+
+        // A second insert is what the sweep is tied to (#270).
+        let job2 = crate::dispatch::mint_job_channel("job-2", job_registry.authority())
+            .await
+            .context("mint job channel")?;
+        job_registry.insert("job-2".to_owned(), job2);
+
+        assert!(
+            job_registry.get("job-1").is_none(),
+            "a succeeded job's channel must be reaped once retention elapses"
         );
         Ok(())
     }

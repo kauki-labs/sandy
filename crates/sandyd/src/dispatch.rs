@@ -33,7 +33,7 @@
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, PoisonError},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use futures_util::StreamExt;
@@ -357,15 +357,41 @@ async fn find_and_persist_archive(
     }
 }
 
+/// How long a job's channel stays in the registry after it reaches a
+/// terminal state, before [`JobRegistry::insert`]'s opportunistic sweep
+/// reaps it (#270). `Attach` looks the channel up by id (`handler::handle`'s
+/// `Attach` arm), not by a held cap — #327 mints a fresh post-capable cap
+/// per Attach call rather than reusing the job's original one — so a stale
+/// cap expiring doesn't gate anything here; the channel being gone from this
+/// map is what actually ends Attach's window. Reuses [`CAP_TTL`] as a
+/// reasonable existing duration rather than inventing a second magic number,
+/// not because the two are mechanically linked.
+const TERMINAL_RETENTION: Duration = CAP_TTL;
+
 /// Every submitted job's minted channel, keyed by job id, plus the one
 /// [`SharedCapAuthority`] every job's channel and every submitter-held cap
 /// verified at Submit are minted/checked against (#226). Process-local and
 /// ephemeral by design — channels are in-memory (the all-local MVP's step-1
 /// `ChannelBackend`), so this registry holds no state that needs to survive a
 /// restart; the sqlite job store is the durable record.
+///
+/// #270: without `mark_terminal`+the sweep in [`JobRegistry::insert`], this
+/// map would retain one entry per job ever submitted for the daemon's whole
+/// lifetime. A job's terminal timestamp lives in a side map, not alongside
+/// the channel itself, so a non-terminal job's hot path (`get`,
+/// `authenticate_remote_link`) never has to touch it.
 pub struct JobRegistry {
     jobs: Mutex<HashMap<String, Arc<JobChannel>>>,
+    /// When each terminal job reached that state, for the sweep in
+    /// [`JobRegistry::insert`] to reap by. A job absent from this map is
+    /// either still live, or was already reaped.
+    terminal_at: Mutex<HashMap<String, Instant>>,
     authority: SharedCapAuthority,
+    /// The grace period [`JobRegistry::insert`]'s sweep reaps by (#270).
+    /// [`TERMINAL_RETENTION`] in production; overridable via
+    /// [`JobRegistry::with_retention`] for tests that need to observe the
+    /// sweep without waiting out the real default.
+    retention: Duration,
 }
 
 impl JobRegistry {
@@ -376,8 +402,22 @@ impl JobRegistry {
     pub fn new() -> Result<Self, CapError> {
         Ok(Self {
             jobs: Mutex::new(HashMap::new()),
+            terminal_at: Mutex::new(HashMap::new()),
             authority: SharedCapAuthority::new(LocalCapAuthority::new(CAP_TTL)?),
+            retention: TERMINAL_RETENTION,
         })
+    }
+
+    /// Override the terminal-retention grace period (#270). Production
+    /// callers never need this — [`JobRegistry::new`] already uses
+    /// [`TERMINAL_RETENTION`] — it exists so a test can pass
+    /// [`Duration::ZERO`] and observe [`JobRegistry::insert`]'s sweep
+    /// deterministically, instead of waiting out the real multi-hour
+    /// default.
+    #[must_use]
+    pub fn with_retention(mut self, retention: Duration) -> Self {
+        self.retention = retention;
+        self
     }
 
     /// The registry's one persistent authority: every job channel is minted
@@ -390,11 +430,51 @@ impl JobRegistry {
     /// Register `job`'s channel under `job_id`, replacing any previous entry
     /// for the same id (a resubmission under a reused id would be a caller
     /// bug elsewhere; this registry just reflects the latest mint).
+    ///
+    /// Opportunistically sweeps every job whose [`JobRegistry::mark_terminal`]
+    /// timestamp is older than [`TERMINAL_RETENTION`] (#270) — tied to Submit
+    /// traffic, the same thing that grows this registry, rather than a
+    /// separate background task: a daemon that stops receiving Submits also
+    /// stops growing, so there's nothing that needs reaping between one
+    /// Submit and the next.
     pub fn insert(&self, job_id: String, job: JobChannel) {
         self.jobs
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(job_id, Arc::new(job));
+        self.reap_expired();
+    }
+
+    /// Record that `job_id` reached a terminal status (`Succeeded`, `Failed`,
+    /// or `Cancelled`) just now, starting its [`TERMINAL_RETENTION`] clock.
+    /// Call exactly once per job, from whichever call site actually applied
+    /// the terminal transition in [`crate::store::JobStore`] — calling it
+    /// again for an already-terminal job only pushes its reap time later,
+    /// never earlier.
+    pub fn mark_terminal(&self, job_id: &str) {
+        self.terminal_at
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(job_id.to_owned(), Instant::now());
+    }
+
+    /// Remove every job whose [`JobRegistry::mark_terminal`] timestamp is
+    /// older than [`TERMINAL_RETENTION`] from both maps.
+    fn reap_expired(&self) {
+        let mut terminal_at = self.terminal_at.lock().unwrap_or_else(PoisonError::into_inner);
+        let expired: Vec<String> = terminal_at
+            .iter()
+            .filter(|&(_, &at)| at.elapsed() >= self.retention)
+            .map(|(job_id, _)| job_id.clone())
+            .collect();
+        if expired.is_empty() {
+            return;
+        }
+        let mut jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+        for job_id in expired {
+            jobs.remove(&job_id);
+            terminal_at.remove(&job_id);
+        }
     }
 
     /// `job_id`'s minted channel, if one was registered.
@@ -538,6 +618,72 @@ mod tests {
         let found = registry.get("job-1").expect("job-1 was registered");
         assert_eq!(found.agent_cap.proof(), agent_cap_proof.as_slice());
         assert!(registry.get("job-2").is_none());
+        Ok(())
+    }
+
+    /// #270: a job marked terminal is reaped by the NEXT insert once its
+    /// retention window has elapsed — `with_retention(Duration::ZERO)` makes
+    /// that window elapse immediately, so a single later insert is enough to
+    /// observe the sweep without a real sleep.
+    #[tokio::test]
+    async fn a_terminal_job_is_reaped_on_the_next_insert() -> anyhow::Result<()> {
+        let registry = JobRegistry::new()?.with_retention(Duration::ZERO);
+        let job = mint_job_channel("job-1", registry.authority()).await?;
+        registry.insert("job-1".to_owned(), job);
+        registry.mark_terminal("job-1");
+        assert!(registry.get("job-1").is_some(), "not reaped before any later insert");
+
+        let job2 = mint_job_channel("job-2", registry.authority()).await?;
+        registry.insert("job-2".to_owned(), job2);
+
+        assert!(
+            registry.get("job-1").is_none(),
+            "job-1 should have been reaped by job-2's insert"
+        );
+        assert!(
+            registry.get("job-2").is_some(),
+            "job-2 is not itself terminal and must survive the sweep"
+        );
+        Ok(())
+    }
+
+    /// #270 adversarial: a non-terminal job must never be reaped, however
+    /// long it has sat in the registry — only `mark_terminal` starts the
+    /// clock a later insert's sweep acts on.
+    #[tokio::test]
+    async fn a_non_terminal_job_is_never_reaped() -> anyhow::Result<()> {
+        let registry = JobRegistry::new()?.with_retention(Duration::ZERO);
+        let job = mint_job_channel("job-1", registry.authority()).await?;
+        registry.insert("job-1".to_owned(), job);
+        // No mark_terminal call for job-1.
+
+        let job2 = mint_job_channel("job-2", registry.authority()).await?;
+        registry.insert("job-2".to_owned(), job2);
+
+        assert!(
+            registry.get("job-1").is_some(),
+            "a non-terminal job must survive every sweep"
+        );
+        Ok(())
+    }
+
+    /// #270: a job inside its retention window (the production default, not
+    /// overridden here) stays attachable across a later insert — the sweep
+    /// must not reap early.
+    #[tokio::test]
+    async fn a_terminal_job_inside_its_retention_window_stays_attachable() -> anyhow::Result<()> {
+        let registry = JobRegistry::new()?; // default TERMINAL_RETENTION, hours away
+        let job = mint_job_channel("job-1", registry.authority()).await?;
+        registry.insert("job-1".to_owned(), job);
+        registry.mark_terminal("job-1");
+
+        let job2 = mint_job_channel("job-2", registry.authority()).await?;
+        registry.insert("job-2".to_owned(), job2);
+
+        assert!(
+            registry.get("job-1").is_some(),
+            "job-1 is well inside its retention window"
+        );
         Ok(())
     }
 
