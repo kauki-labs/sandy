@@ -301,16 +301,19 @@ fn sandyd_bin_resolves_from_the_env_var_when_set() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Adversarial (#232): a malformed `--cap` value is refused as an invalid
-/// plan, naming its 1-based position — never silently dropped to fall back
-/// to a direct-mint submit the caller didn't ask for.
+/// Adversarial (#232): a `--cap-file` whose contents aren't valid base64 is
+/// refused as an invalid plan, naming the path — never silently dropped to
+/// fall back to a direct-mint submit the caller didn't ask for.
 #[test]
-fn submit_with_malformed_cap_base64_is_an_invalid_plan() -> anyhow::Result<()> {
+fn submit_with_malformed_cap_file_is_an_invalid_plan() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir().context("temp dir")?;
     let daemon = spawn_daemon(tmp.path())?;
 
     let manifest = tmp.path().join("manifest.bin");
     std::fs::write(&manifest, b"opaque").context("write manifest")?;
+    let cap_file = tmp.path().join("cap.txt");
+    std::fs::write(&cap_file, "not valid base64!!").context("write cap file")?;
+    let cap_file = cap_file.to_str().context("cap file path is utf8")?;
 
     let submit = sandy(
         &daemon,
@@ -320,29 +323,34 @@ fn submit_with_malformed_cap_base64_is_an_invalid_plan() -> anyhow::Result<()> {
             manifest.to_str().context("manifest path is utf8")?,
             "--manifest-encoding",
             "test/v1",
-            "--cap",
-            "not valid base64!!",
+            "--isolation-class",
+            "trusted",
+            "--cap-file",
+            cap_file,
         ],
     )?;
     assert_eq!(submit.status.code(), Some(2), "stderr: {}", stderr_of(&submit));
     assert!(
-        stderr_of(&submit).contains("--cap #1"),
-        "stderr must name the malformed flag's position: {}",
+        stderr_of(&submit).contains(cap_file),
+        "stderr must name the malformed file's path: {}",
         stderr_of(&submit)
     );
     Ok(())
 }
 
-/// Adversarial (CodeRabbit on this PR): a malformed `--cap` is refused as an
-/// invalid plan even with NO `sandyd` running at all — proving the decode
-/// happens before `dispatch_daemon_async` ever resolves the socket path or
-/// attempts a connection, not merely before the request is sent over an
-/// already-open one.
+/// Adversarial (CodeRabbit on this PR): a malformed `--cap-file` is refused
+/// as an invalid plan even with NO `sandyd` running at all — proving the
+/// read+decode happens before `dispatch_daemon_async` ever resolves the
+/// socket path or attempts a connection, not merely before the request is
+/// sent over an already-open one.
 #[test]
-fn submit_with_malformed_cap_base64_is_refused_with_no_daemon_running() -> anyhow::Result<()> {
+fn submit_with_malformed_cap_file_is_refused_with_no_daemon_running() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir().context("temp dir")?;
     let manifest = tmp.path().join("manifest.bin");
     std::fs::write(&manifest, b"opaque").context("write manifest")?;
+    let cap_file = tmp.path().join("cap.txt");
+    std::fs::write(&cap_file, "not valid base64!!").context("write cap file")?;
+    let cap_file = cap_file.to_str().context("cap file path is utf8")?;
 
     let output = Command::new(env!("CARGO_BIN_EXE_sandy"))
         .env("SANDY_SOCK", tmp.path().join("no-daemon-here.sock"))
@@ -352,27 +360,29 @@ fn submit_with_malformed_cap_base64_is_refused_with_no_daemon_running() -> anyho
             manifest.to_str().context("manifest path is utf8")?,
             "--manifest-encoding",
             "test/v1",
-            "--cap",
-            "not valid base64!!",
+            "--isolation-class",
+            "trusted",
+            "--cap-file",
+            cap_file,
         ])
         .output()
         .context("running sandy daemon submit with no daemon")?;
     assert_eq!(output.status.code(), Some(2), "stderr: {}", stderr_of(&output));
     assert!(
-        stderr_of(&output).contains("--cap #1"),
-        "stderr must name the malformed flag's position, not an infra-fault connection error: {}",
+        stderr_of(&output).contains(cap_file),
+        "stderr must name the malformed file's path, not an infra-fault connection error: {}",
         stderr_of(&output)
     );
     Ok(())
 }
 
-/// Positive (#232): a `--cap` value that IS valid base64 reaches `sandyd`
-/// over the wire — proven by the daemon's own refusal, since garbage bytes
-/// (valid base64, not a real encoded `Cap`) fail `decode_cap` server-side
-/// rather than the CLI silently dropping the flag before it ever sends
-/// anything.
+/// Positive (#232): a `--cap-file` whose contents ARE valid base64 reaches
+/// `sandyd` over the wire — proven by the daemon's own refusal, since garbage
+/// bytes (valid base64, not a real encoded `Cap`) fail `decode_cap`
+/// server-side rather than the CLI silently dropping the flag before it ever
+/// sends anything.
 #[test]
-fn submit_with_a_well_formed_but_unreal_cap_reaches_the_daemons_own_decode() -> anyhow::Result<()> {
+fn submit_with_a_well_formed_but_unreal_cap_file_reaches_the_daemons_own_decode() -> anyhow::Result<()> {
     use base64::Engine as _;
 
     let tmp = tempfile::tempdir().context("temp dir")?;
@@ -381,6 +391,9 @@ fn submit_with_a_well_formed_but_unreal_cap_reaches_the_daemons_own_decode() -> 
     let manifest = tmp.path().join("manifest.bin");
     std::fs::write(&manifest, b"opaque").context("write manifest")?;
     let not_a_real_cap = base64::engine::general_purpose::STANDARD.encode(b"not-a-real-encoded-cap");
+    let cap_file = tmp.path().join("cap.txt");
+    std::fs::write(&cap_file, &not_a_real_cap).context("write cap file")?;
+    let cap_file = cap_file.to_str().context("cap file path is utf8")?;
 
     let submit = sandy(
         &daemon,
@@ -390,14 +403,16 @@ fn submit_with_a_well_formed_but_unreal_cap_reaches_the_daemons_own_decode() -> 
             manifest.to_str().context("manifest path is utf8")?,
             "--manifest-encoding",
             "test/v1",
-            "--cap",
-            &not_a_real_cap,
+            "--isolation-class",
+            "trusted",
+            "--cap-file",
+            cap_file,
         ],
     )?;
     assert_eq!(submit.status.code(), Some(2), "stderr: {}", stderr_of(&submit));
     assert!(
         stderr_of(&submit).contains("could not decode a submitter capability"),
-        "the daemon's own refusal must name the real cause, proving the --cap bytes reached it: {}",
+        "the daemon's own refusal must name the real cause, proving the --cap-file bytes reached it: {}",
         stderr_of(&submit)
     );
     Ok(())
