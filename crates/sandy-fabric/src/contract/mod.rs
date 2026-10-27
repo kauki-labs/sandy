@@ -221,6 +221,30 @@ where
     }
 }
 
+/// The inverse of [`next_sequence`]: assert `stream` yields nothing before
+/// `deadline` (#162's hold-back) — an item arriving is the violation here,
+/// not the timeout.
+async fn expect_held_back<S, F>(
+    stream: &mut std::pin::Pin<&mut S>,
+    deadline: F,
+    rule: &str,
+) -> Result<(), ContractViolation>
+where
+    S: Stream<Item = Result<Envelope, ChannelBackendError>>,
+    F: Future<Output = ()>,
+{
+    const SEAM: &str = "ChannelBackend";
+    match select(stream.next(), pin!(deadline)).await {
+        Either::Left((Some(Ok(env)), _)) => Err(violation(
+            SEAM,
+            format!("{rule}: got sequence {} before the gap filled", env.sequence),
+        )),
+        Either::Left((Some(Err(e)), _)) => Err(violation(SEAM, format!("{rule}: the stream yielded {e}"))),
+        Either::Left((None, _)) => Err(violation(SEAM, format!("{rule}: the stream ended"))),
+        Either::Right(((), _)) => Ok(()),
+    }
+}
+
 /// Run the [`ChannelBackend`] contract: sequence-ordered, `>= from_seq` fetches;
 /// dedup on the content id, keeping the first; rejection of an id-less envelope; a
 /// stream that starts at `from_seq`, replays, then follows live appends; and a
@@ -296,7 +320,19 @@ where
     require(SEAM, next_sequence(&mut stream, deadline(), rule).await? == 3, rule)?;
     expect_ok(SEAM, "append", backend.append(env(4, "d")).await)?;
     let rule = "a resubscription follows live appends";
-    require(SEAM, next_sequence(&mut stream, deadline(), rule).await? == 4, rule)
+    require(SEAM, next_sequence(&mut stream, deadline(), rule).await? == 4, rule)?;
+
+    // #162: a late-arriving lower sequence must hold back everything after it
+    // while following live, never be silently skipped. `stream` is parked at 5
+    // (the next sequence after 4); storing 6 first must not release it.
+    expect_ok(SEAM, "append", backend.append(env(6, "f")).await)?;
+    let rule = "a gap at the follower's cursor holds back a higher sequence that arrived first";
+    expect_held_back(&mut stream, deadline(), rule).await?;
+    expect_ok(SEAM, "append", backend.append(env(5, "e")).await)?;
+    let rule = "filling the gap releases it, in order, before the sequence that arrived first";
+    require(SEAM, next_sequence(&mut stream, deadline(), rule).await? == 5, rule)?;
+    let rule = "the previously-held-back higher sequence follows once the gap is filled";
+    require(SEAM, next_sequence(&mut stream, deadline(), rule).await? == 6, rule)
 }
 
 /// Run the [`Transport`] contract: frames queue for a peer that has not yet

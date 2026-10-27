@@ -629,7 +629,10 @@ mod tests {
     struct BrokenBackend;
 
     impl sandy_fabric::channel_backend::ChannelBackend for BrokenBackend {
-        async fn append(&self, _env: Envelope) -> Result<(), ChannelBackendError> {
+        async fn append(
+            &self,
+            _env: Envelope,
+        ) -> Result<sandy_fabric::channel_backend::AppendOutcome, ChannelBackendError> {
             Err(ChannelBackendError::Unavailable("backend is down".to_owned()))
         }
 
@@ -653,7 +656,10 @@ mod tests {
     struct HangingBackend;
 
     impl sandy_fabric::channel_backend::ChannelBackend for HangingBackend {
-        async fn append(&self, _env: Envelope) -> Result<(), ChannelBackendError> {
+        async fn append(
+            &self,
+            _env: Envelope,
+        ) -> Result<sandy_fabric::channel_backend::AppendOutcome, ChannelBackendError> {
             std::future::pending().await
         }
 

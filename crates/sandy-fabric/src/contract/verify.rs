@@ -140,6 +140,15 @@ async fn channel_backend_suite_rejects_dedup_on_sequence() {
     assert_violates(channel_backend_suite(make, deadline).await, "keeps the first");
 }
 
+#[tokio::test]
+async fn channel_backend_suite_rejects_skipping_a_gap_while_following() {
+    let make = || FakeBackend {
+        skip_gaps_while_following: true,
+        ..FakeBackend::default()
+    };
+    assert_violates(channel_backend_suite(make, deadline).await, "holds back");
+}
+
 // ---- Transport ----
 
 #[tokio::test]

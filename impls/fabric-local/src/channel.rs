@@ -23,7 +23,7 @@ use std::{
 use futures_core::Stream;
 use sandy_fabric::{
     capauth::{Cap, CapAuthority, CapError, CapRights},
-    channel_backend::{ChannelBackend, ChannelBackendError, Envelope, MSG_ID_KEY},
+    channel_backend::{AppendOutcome, ChannelBackend, ChannelBackendError, Envelope, MSG_ID_KEY},
     types::ChannelId,
 };
 use sandy_proto::MessageType;
@@ -320,8 +320,16 @@ impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
             payload,
             metadata: HashMap::from([(MSG_ID_KEY.to_owned(), id.clone())]),
         };
-        self.backend.append(env).await?;
-        *next_seq += 1;
+        // Only a real store earns the sequence: a non-Tty duplicate (same
+        // message_type/content_type/payload, `content_id` ignores `sequence`)
+        // dedups to the id already stored at a LOWER sequence, so this one
+        // must not be spent — advancing past it regardless would leave a
+        // sequence no envelope will ever occupy, a permanent gap under #162's
+        // hold-back (a live follower parked waiting for it would never see
+        // anything past it either).
+        if self.backend.append(env).await? == AppendOutcome::Stored {
+            *next_seq += 1;
+        }
         Ok(id)
     }
 
@@ -988,7 +996,7 @@ mod tests {
     }
 
     impl<B: ChannelBackend> ChannelBackend for PausedAppend<B> {
-        async fn append(&self, env: Envelope) -> Result<(), ChannelBackendError> {
+        async fn append(&self, env: Envelope) -> Result<AppendOutcome, ChannelBackendError> {
             if env.sequence == self.pause_sequence {
                 // `Notify::notify_one` stores a permit if nothing is waiting
                 // yet, so this handshake is race-free regardless of which
@@ -1319,7 +1327,7 @@ mod tests {
     }
 
     impl<B: ChannelBackend> ChannelBackend for PausedPollBackend<B> {
-        async fn append(&self, env: Envelope) -> Result<(), ChannelBackendError> {
+        async fn append(&self, env: Envelope) -> Result<AppendOutcome, ChannelBackendError> {
             self.inner.append(env).await
         }
 
