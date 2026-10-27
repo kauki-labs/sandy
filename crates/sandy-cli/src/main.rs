@@ -5,6 +5,7 @@
 //! in the library modules; `main` only parses argv, selects the host backend, and
 //! maps results to process exit bands (INV-11).
 
+use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use sandy::{Capability, CoreError, GithubAdapter, Journal, ProcessExit, Scope, TrustRoot, TrustRootIo};
 use sandy_cli::{
@@ -221,6 +222,27 @@ enum DaemonOp {
         /// `--flake`; empty means "boot the template's default command").
         #[arg(last = true, requires = "flake")]
         command: Vec<String>,
+        /// Path to a file holding a capability this submitter already holds
+        /// (decision C-at-Submit, #226), as base64 text — the exact encoding
+        /// `sandy daemon attach -o json`'s own `cap` field already prints, so
+        /// a cap handed back by an earlier `attach` can be saved to a file
+        /// and referenced here. A FILE, never an inline value (CodeRabbit on
+        /// this PR): a bearer credential given directly on the command line
+        /// is visible to anyone who can read `ps`/`/proc/<pid>/cmdline` or
+        /// this shell's history, the same reason `sandy run --secret
+        /// NAME=@PATH` already reads its secret from a file rather than
+        /// taking it inline. Repeatable: each occurrence becomes one entry of
+        /// `SubmitRequest.submitter_caps`. #232's "where does a submitter's
+        /// own cap come from" is answered by this round trip for now — there
+        /// is no separate local cap store or issuance flow yet, only a way to
+        /// re-present a cap the operator already has in hand. Refused with
+        /// `--flake`: a `flake/v1` manifest is never the
+        /// `sandy.orchestrator.v1.JobManifest+json` encoding
+        /// `resolve_granted_caps` requires to bound a presented cap, so the
+        /// daemon would refuse the whole submit anyway — better to say so
+        /// here than let the combination reach the wire first.
+        #[arg(long = "cap-file", conflicts_with = "flake")]
+        cap_files: Vec<String>,
     },
     /// Cancel a submitted job.
     Cancel {
@@ -574,6 +596,69 @@ fn read_manifest(path: &str) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Bound on `--cap-file`'s own size, before base64 decoding (CodeRabbit on
+/// this PR). A real encoded `Cap` is a few hundred bytes at most; anything
+/// past this is either misconfiguration (the wrong file) or a way to make
+/// this read unbounded — the same discipline [`MAX_MANIFEST_LEN`] already
+/// enforces for the job manifest via [`read_manifest`].
+const MAX_CAP_FILE_LEN: u64 = 64 * 1024;
+
+/// Read `path` fully as UTF-8 text from a SINGLE already-open handle,
+/// refusing one that exceeds `limit` bytes or is group/world-readable
+/// (CodeRabbit on this PR, INV-1 — the same discipline
+/// [`sandy::cred::read_secret_0600`] already applies to the forge App key /
+/// service PAT: a bearer cap is exactly as sensitive). The mode check reads
+/// the OPEN FILE's own metadata (fstat), not a separate stat-then-open by
+/// path: checking permissions on the path and then reopening it to read
+/// would leave a TOCTOU window where a symlink swap or `chmod` between the
+/// two calls slips a now-wide-open file past the check.
+fn read_bounded_private_file(path: &str, limit: u64) -> std::io::Result<String> {
+    use std::{io::Read, os::unix::fs::PermissionsExt};
+    let mut file = std::fs::File::open(path)?;
+    let mode = file.metadata()?.permissions().mode() & 0o777;
+    if mode & 0o044 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("is group/world-readable (mode {mode:#o}); refusing to read it (INV-1)"),
+        ));
+    }
+    let mut buf = Vec::new();
+    let read = file.by_ref().take(limit + 1).read_to_end(&mut buf)?;
+    if read as u64 > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("exceeds the {limit}-byte limit"),
+        ));
+    }
+    String::from_utf8(buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// Read and decode each `--cap-file` path into the raw bytes
+/// `SubmitRequest.submitter_caps` carries (#232). Each file holds exactly the
+/// base64 text `sandy daemon attach -o json`'s own `cap` field already
+/// prints, trimmed of surrounding whitespace — a cap handed back by an
+/// earlier `attach` round-trips straight into this flag once saved to a file.
+/// A malformed or unreadable path refuses the whole submit outright, naming
+/// it, never silently dropping it and falling back to a direct-mint submit
+/// the caller didn't ask for.
+///
+/// # Errors
+/// Names the path that failed to read (including one over
+/// [`MAX_CAP_FILE_LEN`] or group/world-readable), or whose contents aren't
+/// valid base64.
+fn read_submitter_caps(paths: &[String]) -> Result<Vec<Vec<u8>>, String> {
+    paths
+        .iter()
+        .map(|path| {
+            let contents = read_bounded_private_file(path, MAX_CAP_FILE_LEN)
+                .map_err(|e| format!("--cap-file {path:?} could not be read: {e}"))?;
+            base64::engine::general_purpose::STANDARD
+                .decode(contents.trim())
+                .map_err(|e| format!("--cap-file {path:?} does not contain valid base64: {e}"))
+        })
+        .collect()
+}
+
 /// Dispatch `sandy daemon <op>`: drives its own async connection, since `main`
 /// is synchronous like the rest of the CLI (`app_register`'s octocrab calls
 /// use the same build-a-runtime-and-block-on pattern for the same reason).
@@ -593,6 +678,22 @@ fn dispatch_daemon(op: DaemonOp, output: OutputFormat) -> i32 {
 /// invocation: the control RPC is strictly one-request-one-response with no
 /// pipelining (#211 §1), so there is nothing to pool across a single CLI run.
 async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
+    // #232 (CodeRabbit on this PR): validate `--cap-file` before opening any
+    // connection — a malformed or unreadable path is a pure client-side
+    // input error, and refusing it must never depend on a live daemon being
+    // reachable.
+    let submitter_caps = if let DaemonOp::Submit { cap_files, .. } = &op {
+        match read_submitter_caps(cap_files) {
+            Ok(caps) => caps,
+            Err(e) => {
+                eprintln!("sandy: {e}");
+                return ProcessExit::InvalidPlan.code();
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     let socket = match daemon_socket_path() {
         Ok(socket) => socket,
         Err(e) => {
@@ -634,6 +735,7 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
             kind,
             history_lines,
             command,
+            cap_files: _,
         } => {
             // clap's `required_unless_present = "flake"`/`conflicts_with`
             // pairs above guarantee exactly one of `manifest` or `flake` is
@@ -673,10 +775,7 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
             control_request::Op::Submit(SubmitRequest {
                 manifest: bytes,
                 manifest_encoding: encoding,
-                // No cap-supply flow for the CLI yet (#232): a direct-mint
-                // submit, same as today, never a silent way to claim bounded
-                // caps without actually presenting any.
-                submitter_caps: Vec::new(),
+                submitter_caps,
                 required_isolation_class: sandy_control_proto::IsolationClass::from(isolation_class).into(),
             })
         }
@@ -1256,5 +1355,84 @@ mod tests {
             .expect_err("an unknown capability must be rejected");
         assert!(err.contains("unknown --cred-capability"), "got: {err}");
         Ok(())
+    }
+
+    fn write_cap_file(dir: &std::path::Path, name: &str, contents: &str) -> anyhow::Result<String> {
+        let path = dir.join(name);
+        std::fs::write(&path, contents)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        Ok(path.to_str().context("cap file path is utf8")?.to_owned())
+    }
+
+    #[test]
+    fn read_submitter_caps_refuses_a_group_or_world_readable_file() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(b"a-real-cap-blob");
+        let path = write_cap_file(tmp.path(), "cap-1", &encoded)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+
+        let err = read_submitter_caps(&[path]).expect_err("a group/world-readable --cap-file must be refused");
+        assert!(err.contains("group/world-readable"), "got: {err}");
+        assert!(err.contains("INV-1"), "got: {err}");
+        Ok(())
+    }
+
+    #[test]
+    fn read_submitter_caps_round_trips_base64() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(b"a-real-cap-blob");
+        let path = write_cap_file(tmp.path(), "cap-1", &encoded)?;
+        let decoded = read_submitter_caps(&[path]).map_err(|e| anyhow::anyhow!(e))?;
+        assert_eq!(decoded, vec![b"a-real-cap-blob".to_vec()]);
+        Ok(())
+    }
+
+    #[test]
+    fn read_submitter_caps_trims_surrounding_whitespace() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(b"a-real-cap-blob");
+        let path = write_cap_file(tmp.path(), "cap-1", &format!("  {encoded}\n"))?;
+        let decoded = read_submitter_caps(&[path]).map_err(|e| anyhow::anyhow!(e))?;
+        assert_eq!(decoded, vec![b"a-real-cap-blob".to_vec()]);
+        Ok(())
+    }
+
+    #[test]
+    fn read_submitter_caps_allows_no_caps_at_all() -> anyhow::Result<()> {
+        let decoded = read_submitter_caps(&[]).map_err(|e| anyhow::anyhow!(e))?;
+        assert!(decoded.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn read_submitter_caps_refuses_a_file_over_the_size_limit() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let oversized = "A".repeat((MAX_CAP_FILE_LEN + 1) as usize);
+        let path = write_cap_file(tmp.path(), "cap-huge", &oversized)?;
+
+        let err = read_submitter_caps(&[path]).expect_err("an oversized --cap-file must be refused");
+        assert!(err.contains("exceeds"), "got: {err}");
+        Ok(())
+    }
+
+    #[test]
+    fn read_submitter_caps_names_the_malformed_path() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let good = base64::engine::general_purpose::STANDARD.encode(b"fine");
+        let good_path = write_cap_file(tmp.path(), "cap-good", &good)?;
+        let bad_path = write_cap_file(tmp.path(), "cap-bad", "not valid base64!!")?;
+
+        let err = read_submitter_caps(&[good_path, bad_path.clone()])
+            .expect_err("a malformed second --cap-file must be refused");
+        assert!(err.contains(&bad_path), "got: {err}");
+        Ok(())
+    }
+
+    #[test]
+    fn read_submitter_caps_names_an_unreadable_path() {
+        let err = read_submitter_caps(&["/nonexistent/cap/path".to_owned()])
+            .expect_err("a missing --cap-file must be refused");
+        assert!(err.contains("/nonexistent/cap/path"), "got: {err}");
+        assert!(err.contains("could not be read"), "got: {err}");
     }
 }

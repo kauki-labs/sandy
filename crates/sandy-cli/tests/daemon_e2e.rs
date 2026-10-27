@@ -5,6 +5,7 @@
 
 use std::{
     io::Write as _,
+    os::unix::fs::PermissionsExt as _,
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
@@ -138,6 +139,16 @@ fn sandy(daemon: &Daemon, args: &[&str]) -> anyhow::Result<std::process::Output>
 
 fn stderr_of(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// Write `contents` to `path` as a `0600` file: `sandy daemon submit
+/// --cap-file` refuses a group/world-readable one (INV-1), so every cap file
+/// these tests create must already be private, same as a real cap saved to
+/// disk by an operator would need to be.
+fn write_cap_file(path: &std::path::Path, contents: &str) -> anyhow::Result<()> {
+    std::fs::write(path, contents).context("write cap file")?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).context("chmod cap file")?;
+    Ok(())
 }
 
 #[test]
@@ -298,5 +309,214 @@ fn connecting_to_a_dead_socket_is_an_infra_fault_not_a_hang() -> anyhow::Result<
 fn sandyd_bin_resolves_from_the_env_var_when_set() -> anyhow::Result<()> {
     let resolved = resolve_sandyd_bin(Some(std::ffi::OsString::from("/some/nix/store/path/bin/sandyd")))?;
     assert_eq!(resolved, std::path::PathBuf::from("/some/nix/store/path/bin/sandyd"));
+    Ok(())
+}
+
+/// Adversarial (#232): a `--cap-file` whose contents aren't valid base64 is
+/// refused as an invalid plan, naming the path — never silently dropped to
+/// fall back to a direct-mint submit the caller didn't ask for.
+#[test]
+fn submit_with_malformed_cap_file_is_an_invalid_plan() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir().context("temp dir")?;
+    let daemon = spawn_daemon(tmp.path())?;
+
+    let manifest = tmp.path().join("manifest.bin");
+    std::fs::write(&manifest, b"opaque").context("write manifest")?;
+    let cap_file = tmp.path().join("cap.txt");
+    write_cap_file(&cap_file, "not valid base64!!")?;
+    let cap_file = cap_file.to_str().context("cap file path is utf8")?;
+
+    let submit = sandy(
+        &daemon,
+        &[
+            "daemon",
+            "submit",
+            manifest.to_str().context("manifest path is utf8")?,
+            "--manifest-encoding",
+            "test/v1",
+            "--isolation-class",
+            "trusted",
+            "--cap-file",
+            cap_file,
+        ],
+    )?;
+    assert_eq!(submit.status.code(), Some(2), "stderr: {}", stderr_of(&submit));
+    assert!(
+        stderr_of(&submit).contains(cap_file),
+        "stderr must name the malformed file's path: {}",
+        stderr_of(&submit)
+    );
+    Ok(())
+}
+
+/// Adversarial (CodeRabbit on this PR): a malformed `--cap-file` is refused
+/// as an invalid plan even with NO `sandyd` running at all — proving the
+/// read+decode happens before `dispatch_daemon_async` ever resolves the
+/// socket path or attempts a connection, not merely before the request is
+/// sent over an already-open one.
+#[test]
+fn submit_with_malformed_cap_file_is_refused_with_no_daemon_running() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir().context("temp dir")?;
+    let manifest = tmp.path().join("manifest.bin");
+    std::fs::write(&manifest, b"opaque").context("write manifest")?;
+    let cap_file = tmp.path().join("cap.txt");
+    write_cap_file(&cap_file, "not valid base64!!")?;
+    let cap_file = cap_file.to_str().context("cap file path is utf8")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sandy"))
+        .env("SANDY_SOCK", tmp.path().join("no-daemon-here.sock"))
+        .args([
+            "daemon",
+            "submit",
+            manifest.to_str().context("manifest path is utf8")?,
+            "--manifest-encoding",
+            "test/v1",
+            "--isolation-class",
+            "trusted",
+            "--cap-file",
+            cap_file,
+        ])
+        .output()
+        .context("running sandy daemon submit with no daemon")?;
+    assert_eq!(output.status.code(), Some(2), "stderr: {}", stderr_of(&output));
+    assert!(
+        stderr_of(&output).contains(cap_file),
+        "stderr must name the malformed file's path, not an infra-fault connection error: {}",
+        stderr_of(&output)
+    );
+    Ok(())
+}
+
+/// Positive (#232): a `--cap-file` whose contents ARE valid base64 reaches
+/// `sandyd` over the wire — proven by the daemon's own refusal, since garbage
+/// bytes (valid base64, not a real encoded `Cap`) fail `decode_cap`
+/// server-side rather than the CLI silently dropping the flag before it ever
+/// sends anything.
+#[test]
+fn submit_with_a_well_formed_but_unreal_cap_file_reaches_the_daemons_own_decode() -> anyhow::Result<()> {
+    use base64::Engine as _;
+
+    let tmp = tempfile::tempdir().context("temp dir")?;
+    let daemon = spawn_daemon(tmp.path())?;
+
+    let manifest = tmp.path().join("manifest.bin");
+    std::fs::write(&manifest, b"opaque").context("write manifest")?;
+    let not_a_real_cap = base64::engine::general_purpose::STANDARD.encode(b"not-a-real-encoded-cap");
+    let cap_file = tmp.path().join("cap.txt");
+    write_cap_file(&cap_file, &not_a_real_cap)?;
+    let cap_file = cap_file.to_str().context("cap file path is utf8")?;
+
+    let submit = sandy(
+        &daemon,
+        &[
+            "daemon",
+            "submit",
+            manifest.to_str().context("manifest path is utf8")?,
+            "--manifest-encoding",
+            "test/v1",
+            "--isolation-class",
+            "trusted",
+            "--cap-file",
+            cap_file,
+        ],
+    )?;
+    assert_eq!(submit.status.code(), Some(2), "stderr: {}", stderr_of(&submit));
+    assert!(
+        stderr_of(&submit).contains("could not decode a submitter capability"),
+        "the daemon's own refusal must name the real cause, proving the --cap-file bytes reached it: {}",
+        stderr_of(&submit)
+    );
+    Ok(())
+}
+
+/// Positive (CodeRabbit on this PR): the full #232 round trip with a REAL
+/// cap, not just a rejection. Submit a seed job, attach to it (minting a
+/// post+read cap scoped to the seed job's own channel — its job_id, CF-H-1),
+/// save that cap to a file, then submit a second job whose `JobManifest`
+/// requests read-only (a strict subset) on that same channel via
+/// `--cap-file`. `derive_job_caps`'s subset check must grant it, proving a
+/// cap minted by a real `attach` actually satisfies Submit once presented
+/// back through `--cap-file` — not just that malformed or unreal bytes are
+/// refused.
+#[test]
+fn submit_with_a_cap_file_from_a_real_attach_grants_the_requested_subset() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir().context("temp dir")?;
+    let daemon = spawn_daemon(tmp.path())?;
+
+    let seed_manifest = tmp.path().join("seed.bin");
+    std::fs::write(&seed_manifest, b"opaque").context("write seed manifest")?;
+    let seed_submit = sandy(
+        &daemon,
+        &[
+            "daemon",
+            "submit",
+            seed_manifest.to_str().context("seed manifest path is utf8")?,
+            "--manifest-encoding",
+            "test/v1",
+            "--isolation-class",
+            "trusted",
+            "-o",
+            "json",
+        ],
+    )?;
+    assert_eq!(
+        seed_submit.status.code(),
+        Some(0),
+        "seed submit stderr: {}",
+        stderr_of(&seed_submit)
+    );
+    let seed_json: serde_json::Value = serde_json::from_slice(&seed_submit.stdout).context("parse seed submit json")?;
+    let seed_job_id = seed_json["job_id"]
+        .as_str()
+        .context("seed submit json must carry a job_id")?
+        .to_owned();
+
+    let attach = sandy(&daemon, &["daemon", "attach", &seed_job_id, "-o", "json"])?;
+    assert_eq!(attach.status.code(), Some(0), "attach stderr: {}", stderr_of(&attach));
+    let attach_json: serde_json::Value = serde_json::from_slice(&attach.stdout).context("parse attach json")?;
+    let cap_b64 = attach_json["cap"].as_str().context("attach json must carry a cap")?;
+    let cap_file = tmp.path().join("cap.txt");
+    write_cap_file(&cap_file, cap_b64)?;
+    let cap_file = cap_file.to_str().context("cap file path is utf8")?;
+
+    // `sandy_fabric::types::ChannelId` is a one-field newtype, so it
+    // serializes transparently as the bare string, not `[seed_job_id]`.
+    let manifest_json = serde_json::json!({
+        "entrypoint": {"command": ["true"]},
+        "requested_caps": [{
+            "channel_id": seed_job_id,
+            "rights": {"post": false, "read": true, "invite": false},
+        }],
+    });
+    let manifest_path = tmp.path().join("manifest.json");
+    std::fs::write(&manifest_path, serde_json::to_vec(&manifest_json)?).context("write manifest json")?;
+
+    let submit = sandy(
+        &daemon,
+        &[
+            "daemon",
+            "submit",
+            manifest_path.to_str().context("manifest path is utf8")?,
+            "--manifest-encoding",
+            "sandy.orchestrator.v1.JobManifest+json",
+            "--isolation-class",
+            "trusted",
+            "--cap-file",
+            cap_file,
+            "-o",
+            "json",
+        ],
+    )?;
+    assert_eq!(
+        submit.status.code(),
+        Some(0),
+        "a read-only request strictly narrower than the attach cap's post+read must be granted: {}",
+        stderr_of(&submit)
+    );
+    let submit_json: serde_json::Value = serde_json::from_slice(&submit.stdout).context("parse submit json")?;
+    assert!(
+        submit_json["job_id"].as_str().is_some_and(|id| !id.is_empty()),
+        "got {submit_json:?}"
+    );
     Ok(())
 }
