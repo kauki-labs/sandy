@@ -66,11 +66,11 @@ use common::{build_guest, guest_flake, require_live_root};
 /// can race `ip tuntap add`/qemu's own tap open against the kernel still finishing the
 /// previous process's teardown, surfacing as a spurious "Device or resource busy". A
 /// per-process name makes that collision structurally impossible rather than relying on
-/// a delay or a retry. `% 1_000_000` keeps the name within Linux's 15-character
-/// `IFNAMSIZ` limit; collisions need two live processes sharing the same truncated PID,
-/// which `preclean`'s best-effort delete already tolerates if it ever happens.
+/// a delay or a retry. No truncation: `sandytap` (8 chars) plus a PID (Linux caps at 7
+/// digits) fits exactly within the 15-character `IFNAMSIZ` limit, and a truncated PID
+/// would reintroduce the exact collision this exists to prevent.
 fn tap_name() -> String {
-    format!("sandytap{}", std::process::id() % 1_000_000)
+    format!("sandytap{}", std::process::id())
 }
 /// The guest subnet routed through the host.
 const SUBNET: &str = "10.77.0.0/24";
