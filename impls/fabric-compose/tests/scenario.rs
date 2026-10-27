@@ -49,7 +49,7 @@ use sandy_fabric::{
     capauth::{Cap, CapAuthority, CapError, CapRights, CapScope, decode_cap, encode_cap},
     channel_backend::ChannelBackendError,
     contract::fakes::FakeHumanBackend,
-    escalation::EscalationMessage,
+    escalation::{EscalationRequest, Severity},
     executor::{Arch, Capabilities, Requirements},
     placement::Lifecycle as _,
     roles::{ChannelAssignment, ChannelRole, decode_assignment},
@@ -407,9 +407,11 @@ async fn the_all_local_scenario_runs_end_to_end() -> anyhow::Result<()> {
         .context("sandbox joins the escalation channel")?;
     let escalation_role = EscalationRole::new(escalation_channel, escalation_membership, FakeHumanBackend::new(true));
     escalation_role
-        .escalate(&EscalationMessage {
+        .escalate(&EscalationRequest {
             from: PeerId::from("sandbox-1"),
-            reason: "needs a human".to_owned(),
+            severity: Severity::Critical,
+            summary: "needs a human".to_owned(),
+            context_ref: String::new(),
         })
         .await
         .context("escalate")?;

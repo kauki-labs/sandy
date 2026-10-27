@@ -18,7 +18,7 @@ use sandy_api::backend::{BoxState, Outcome, RunSpec};
 use crate::{
     capauth::{Cap, CapAuthority, CapError, CapRights, CapScope},
     channel_backend::{ChannelBackend, ChannelBackendError, Envelope, msg_id},
-    escalation::{EscalationMessage, EscalationSink, EscalationSinkError},
+    escalation::{EscalationRequest, EscalationSink, EscalationSinkError},
     executor::{Capabilities, Executor, ExecutorError, capabilities_satisfy},
     minter::{MintedSecret, Minter, MinterError, SecretRequest},
     placement::{
@@ -551,7 +551,7 @@ pub struct FakeHumanBackend {
     /// When set, messages are dropped even while enabled (broken).
     pub lossy: bool,
     /// Every message kept so far.
-    pub received: Mutex<Vec<EscalationMessage>>,
+    pub received: Mutex<Vec<EscalationRequest>>,
 }
 
 impl FakeHumanBackend {
@@ -579,7 +579,7 @@ impl EscalationSink for FakeHumanBackend {
         self.enabled
     }
 
-    async fn notify(&self, message: &EscalationMessage) -> Result<(), EscalationSinkError> {
+    async fn notify(&self, message: &EscalationRequest) -> Result<(), EscalationSinkError> {
         if (self.enabled && !self.lossy) || self.ignore_disabled {
             self.received
                 .lock()

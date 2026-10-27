@@ -35,7 +35,7 @@ use sandy_proto::{MessageType, PeerMsg};
 use crate::{
     capauth::{CapAuthority, CapError, CapRights, CapScope},
     channel_backend::{ChannelBackend, ChannelBackendError, Envelope, MSG_ID_KEY},
-    escalation::{EscalationMessage, EscalationSink},
+    escalation::{EscalationRequest, EscalationSink, Severity},
     executor::{Arch, Capabilities, Executor, Requirements, SandboxKind},
     minter::{Minter, SecretRequest},
     placement::{Capacity, CapacityError, Discovery, HostDescriptor, Lease, Lifecycle},
@@ -620,9 +620,11 @@ pub async fn escalation_suite<S: EscalationSink>(
     captured: impl Fn(&S) -> usize,
 ) -> Result<(), ContractViolation> {
     const SEAM: &str = "EscalationSink";
-    let message = EscalationMessage {
+    let message = EscalationRequest {
         from: PeerId::from("sandbox-1"),
-        reason: "contract".to_owned(),
+        severity: Severity::Critical,
+        summary: "contract".to_owned(),
+        context_ref: String::new(),
     };
 
     for (sink, enabled, kept) in [(make_enabled(), true, 3), (make_disabled(), false, 0)] {
