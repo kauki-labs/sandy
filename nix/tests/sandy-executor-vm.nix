@@ -63,6 +63,12 @@ testPkgs.testers.runNixOSTest {
       # KillExcludeUsers assertion is below (#302).
       services.logind.settings.Login.StopIdleSessionSec = 2;
 
+      # #302: shortened so the survival check below can sleep past it
+      # deterministically (default 10s), rather than needing a longer sleep
+      # or risking the check running inside the real default's window, where
+      # it could pass without lingering actually doing anything (CodeRabbit).
+      services.logind.settings.Login.UserStopDelaySec = 2;
+
       # A probe unit that reuses `sandy-executor.service`'s EXACT
       # `serviceConfig` (not a re-typed copy that could silently drift from
       # it) to run a real `bwrap`-confined command under the full hardened
@@ -303,6 +309,10 @@ testPkgs.testers.runNixOSTest {
     # and wait for one more to happen, rather than a fixed sleep that
     # doesn't prove a session end actually happened (CodeRabbit).
     sandy_uid = machine.succeed("id -u sandy-executor").strip()
+    machine.succeed(
+        f"runuser -u sandy-executor -- env XDG_RUNTIME_DIR=/run/user/{sandy_uid} "
+        "systemd-run --user --unit=kill-test-job -- sleep 300"
+    )
     # Count session-close events in the journal rather than tracking a
     # specific session id: sandy-executor has TWO sessions at any moment —
     # the cycling PAMName one this block is actually about, and a separate,
@@ -313,7 +323,12 @@ testPkgs.testers.runNixOSTest {
     # `wait_until_fails` then timed out waiting for a session that was never
     # going to end. Counting the log line both sessions' closes share a
     # prefix with, scoped by PID via `(sd-pam)` only ever logging for the
-    # PAMName session, sidesteps needing to tell them apart at all.
+    # PAMName session, sidesteps needing to tell them apart at all. The
+    # baseline is read AFTER the job starts (CodeRabbit): sandy-executor's
+    # own restart loop can close a session in the gap between reading a
+    # baseline and starting the job, and a baseline taken before that close
+    # would let the wait below pass on it instead of a close that actually
+    # happened with the job already running.
     closes_before = int(
         machine.succeed(
             "journalctl -b -o cat --no-pager | "
@@ -321,16 +336,22 @@ testPkgs.testers.runNixOSTest {
         ).strip()
         or "0"
     )
-    machine.succeed(
-        f"runuser -u sandy-executor -- env XDG_RUNTIME_DIR=/run/user/{sandy_uid} "
-        "systemd-run --user --unit=kill-test-job -- sleep 300"
-    )
     machine.wait_until_succeeds(
         "[ \"$(journalctl -b -o cat --no-pager | "
         "grep -c 'pam_unix(sandy-executor:session): session closed' || true)\" "
         f"-gt {closes_before} ]",
         timeout=30,
     )
+
+    # The wait above only proves A session closed, not that the delayed
+    # user@.service stop that follows it (UserStopDelaySec, logind.conf(5))
+    # has had time to run — checking right away could pass even WITHOUT
+    # lingering, inside that delay window or if a fresh PAM session reopened
+    # first (CodeRabbit). Explicitly stop the service for a clean, singular
+    # session end, then sleep past the shortened UserStopDelaySec the node
+    # sets, so only lingering (not timing) can make the assertion below pass.
+    machine.succeed("systemctl stop sandy-executor.service")
+    machine.sleep(5)
 
     # Query the job directly through the existing user bus (`systemctl
     # --user`, via `runuser`), not `--machine=<user>@` (a bridge that
