@@ -162,18 +162,25 @@ in
       startSession = true;
     };
 
-    # #300(b): defense-in-depth. `StopIdleSessionSec` doesn't fire on this
-    # TTY-less session, and even with a remote host turning
-    # `KillUserProcesses` on directly (#302's VM test, which exercises this
-    # for real rather than relying on that proxy), this list turned out to
-    # be inert in practice: lingering is what actually keeps `user@<uid>.service`
-    # (and a dispatched job under it) alive across a session ending, full
-    # stop, independent of whatever's in `KillExcludeUsers` — confirmed by
-    # removing `${username}` from this list under a live `KillUserProcesses=yes`
-    # sweep and observing no change, since testing it the other way around
-    # (disabling lingering to isolate this list's own effect) breaks
-    # `SystemdRunContainment::detect` itself, long before KillUserProcesses
-    # ever enters the picture. Kept anyway in case the remote host's own config ever
+    # #300(b): defense-in-depth for sandy-executor.service's OWN main
+    # process, not a dispatched job. The process runs in its PAMName
+    # session's own `session-N.scope` — `KillUserProcesses` (logind.conf(5))
+    # only ever reaps THAT, never anything under `user@<uid>.service` — so
+    # without this list, a remote host turning `KillUserProcesses` on would
+    # have logind force-kill the sandy-host-executor binary itself whenever
+    # its session ends (naturally, via its own `Restart=on-failure` cycling
+    # against a refused dial, or a real operator logout), instead of it
+    # exiting normally.
+    #
+    # It does NOT protect a dispatched job: that runs under
+    # `user@<uid>.service` (the job-cgroup assertion in
+    # nix/tests/sandy-executor-vm.nix), which `KillUserProcesses` never
+    # reaches regardless of this list. #302's VM test confirms the effective
+    # `KillExcludeUsers` value directly over D-Bus and separately confirms a
+    # dispatched job survives its session ending — but that survival is
+    # `Linger` overriding logind's own `UserStopDelaySec` default, not this
+    # list (an earlier version of both this comment and that test got this
+    # backwards; CodeRabbit + logind.conf(5) corrected it). A drop-in, not
     # `services.logind.settings`, because `KillExcludeUsers` is a
     # list-valued logind.conf key that ACCUMULATES across drop-in files
     # (systemd's own conf.d semantics) — this adds `sandy-executor` to
