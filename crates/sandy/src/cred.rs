@@ -442,8 +442,6 @@ fn trust_dir_unsafe_error(e: sandy_fsutil::FsError) -> CredError {
 /// The bytes come back in a [`Zeroizing`] buffer, so they are zeroed when the
 /// caller drops them (#388).
 pub fn read_secret_0600(path: &Path) -> Result<Zeroizing<Vec<u8>>, CredError> {
-    use std::io::Read;
-
     let (mut file, meta) = open_trust_file("secret", path)?;
     let mode = meta.permissions().mode() & 0o777;
     if mode & 0o044 != 0 {
@@ -452,12 +450,30 @@ pub fn read_secret_0600(path: &Path) -> Result<Zeroizing<Vec<u8>>, CredError> {
             path.display()
         )));
     }
-    // Sized up front so the buffer is not reallocated while it fills: a realloc
-    // would leave the old, smaller copy in freed memory, out of the wrapper's reach.
-    let capacity = usize::try_from(meta.len()).unwrap_or(0).saturating_add(1);
+    read_declared_len(&mut file, meta.len()).map_err(|e| stage_err("read secret", path, &e))
+}
+
+/// Read `reader` into a zeroing buffer sized for `declared` bytes, never growing it.
+///
+/// `declared` is a snapshot (the file's length at open), and a same-uid process may
+/// append to the file afterwards. A buffer that grew would be reallocated, and the
+/// freed old copy of the secret would sit outside the [`Zeroizing`] wrapper's reach.
+/// So the read is capped at `declared + 1` bytes, which always fit the up-front
+/// capacity, and a read that needs the extra byte is refused as a changed file.
+fn read_declared_len(reader: impl std::io::Read, declared: u64) -> std::io::Result<Zeroizing<Vec<u8>>> {
+    use std::io::{Error, ErrorKind, Read as _};
+
+    let too_large = || Error::new(ErrorKind::InvalidData, "secret is too large to read");
+    let limit = declared.checked_add(1).ok_or_else(too_large)?;
+    let capacity = usize::try_from(limit).map_err(|_| too_large())?;
     let mut bytes = Zeroizing::new(Vec::with_capacity(capacity));
-    file.read_to_end(&mut bytes)
-        .map_err(|e| stage_err("read secret", path, &e))?;
+    reader.take(limit).read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).map_or(true, |read| read > declared) {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "secret changed while it was being read",
+        ));
+    }
     Ok(bytes)
 }
 
@@ -958,6 +974,29 @@ mod tests {
             ],
             "read+write on contents must resolve to a single write, not drop or duplicate"
         );
+    }
+
+    /// #388: a file that grew past its length snapshot is refused, not read into a
+    /// reallocated buffer whose freed first copy the wrapper could not zero. The
+    /// capacity check proves the buffer was never reallocated on the normal path.
+    #[test]
+    fn a_secret_that_grew_after_the_length_snapshot_is_refused() -> anyhow::Result<()> {
+        let grown = read_declared_len(&b"123456789"[..], 4).expect_err("9 bytes against a declared 4 must be refused");
+        assert!(grown.to_string().contains("changed"), "{grown}");
+
+        let exact = read_declared_len(&b"hello"[..], 5).context("exact length")?;
+        assert_eq!(*exact, b"hello");
+        assert_eq!(exact.capacity(), 6, "sized once for declared + 1, never reallocated");
+
+        let shrunk = read_declared_len(&b"abc"[..], 10).context("shrunk file")?;
+        assert_eq!(*shrunk, b"abc");
+        Ok(())
+    }
+
+    /// An absurd declared length is an error, not an overflow or an allocation attempt.
+    #[test]
+    fn an_unrepresentable_declared_length_is_refused() {
+        assert!(read_declared_len(&b""[..], u64::MAX).is_err());
     }
 
     /// [`read_secret_0600`] reads a `0600` secret and refuses a `0644` one with a
