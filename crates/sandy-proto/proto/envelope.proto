@@ -10,8 +10,11 @@ package sandy.proto.v1;
 //   - the discriminator (`message_type`): which kind of message this is;
 //   - the body (`payload` + `content_type`): opaque content, text by default,
 //     a nested protobuf when structured.
-// The opaque body keeps the envelope stable while the per-type contracts evolve
-// (spec §8 open question), so a backend routes on the type without parsing the body.
+// The opaque body keeps the envelope stable while the per-type contracts evolve.
+// `Control` and `Escalate` have a resolved JSON payload contract (#130:
+// sandy_fabric::roles::ChannelAssignment, sandy_fabric::escalation::EscalationRequest);
+// the rest are still deferred (spec §8 open question), so a backend routes on
+// the type without parsing the body.
 message Envelope {
   // Monotonic per-channel ordering/dedup key assigned by the sender.
   uint64 sequence = 1;
@@ -27,9 +30,10 @@ message Envelope {
   // Never interpreted by the channel layer; routing is on `message_type`.
   bytes payload = 4;
 
-  // The message-type discriminator. Step-1 variants are thin markers: the
-  // concrete per-type contracts are deferred (spec §8), so the content rides in
-  // `payload`. Field numbers 10+ leave room below for more top-level fields, and
+  // The message-type discriminator. Variants are thin markers: the concrete
+  // per-type contracts (where resolved — #130: Control, Escalate; the rest
+  // deferred, spec §8) ride in `payload` as JSON, not a nested protobuf
+  // message. Field numbers 10+ leave room below for more top-level fields, and
   // an unknown (future) variant tag decodes as an absent `message_type` rather
   // than an error (forward compatibility).
   oneof message_type {
@@ -43,6 +47,7 @@ message Envelope {
 }
 
 // Orchestrator control: which channels/caps a sandbox should use.
+// Payload: JSON-encoded sandy_fabric::roles::ChannelAssignment (#130).
 message Control {}
 
 // Interactive terminal traffic to/from a sandbox.
@@ -55,6 +60,7 @@ message Output {}
 message Telemetry {}
 
 // Escalation toward a human on any device, independent of the orchestrator.
+// Payload: JSON-encoded sandy_fabric::escalation::EscalationRequest (#130).
 message Escalate {}
 
 // A peer-group message: agents coordinating directly in a closed set.

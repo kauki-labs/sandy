@@ -23,7 +23,7 @@ use futures_util::StreamExt as _;
 use sandy_fabric::{
     capauth::{Cap, CapAuthority, CapRights},
     channel_backend::ChannelBackend,
-    escalation::{EscalationMessage, EscalationSink, EscalationSinkError},
+    escalation::{EscalationRequest, EscalationSink, EscalationSinkError, decode_escalation, encode_escalation},
     roles::{AssignmentCodecError, ChannelAssignment, encode_assignment},
     telemetry::{TelemetryError, TelemetryRecord, TelemetrySink},
 };
@@ -44,7 +44,7 @@ pub enum RoleError {
     /// The channel call failed.
     #[error(transparent)]
     Channel(#[from] ChannelError),
-    /// The role's own payload (a [`ChannelAssignment`] or [`EscalationMessage`])
+    /// The role's own payload (a [`ChannelAssignment`] or [`EscalationRequest`])
     /// could not be encoded.
     #[error("payload codec: {0}")]
     Codec(String),
@@ -227,8 +227,8 @@ impl<B: ChannelBackend, A: CapAuthority, S: EscalationSink> EscalationRole<B, A,
     /// [`RoleError::Codec`] if `message` cannot be encoded;
     /// [`RoleError::BothEscalationPathsFailed`] if neither the channel post nor
     /// the sink notify succeeded.
-    pub async fn escalate(&self, message: &EscalationMessage) -> Result<(), RoleError> {
-        let payload = serde_json::to_vec(message).map_err(|e| RoleError::Codec(e.to_string()))?;
+    pub async fn escalate(&self, message: &EscalationRequest) -> Result<(), RoleError> {
+        let payload = encode_escalation(message).map_err(|e| RoleError::Codec(e.to_string()))?;
         let post = self.channel.post(
             &self.membership,
             Some(MessageType::Escalate(Escalate {})),
@@ -338,11 +338,11 @@ impl<B: ChannelBackend, A: CapAuthority, S: EscalationSink> EscalationRelay<B, A
             if !matches!(envelope.message_type, Some(MessageType::Escalate(_))) {
                 continue;
             }
-            match serde_json::from_slice::<EscalationMessage>(&envelope.payload) {
+            match decode_escalation(&envelope.payload) {
                 Ok(message) => self.deliver(&message).await,
                 Err(e) => tracing::error!(
                     error = %e,
-                    "an Escalate envelope's payload did not decode as EscalationMessage; skipping it"
+                    "an Escalate envelope's payload did not decode as EscalationRequest; skipping it"
                 ),
             }
         }
@@ -351,7 +351,7 @@ impl<B: ChannelBackend, A: CapAuthority, S: EscalationSink> EscalationRelay<B, A
 
     /// Notify the sink, retrying on failure before giving up loudly. A
     /// disabled sink is never retried — retrying would not change the outcome.
-    async fn deliver(&self, message: &EscalationMessage) {
+    async fn deliver(&self, message: &EscalationRequest) {
         if !self.sink.enabled() {
             tracing::error!(?message, "escalation sink is disabled; the operator was not notified");
             return;
@@ -389,6 +389,7 @@ mod tests {
     use sandy_fabric::{
         capauth::{CapError, CapScope},
         channel_backend::{ChannelBackendError, Envelope},
+        escalation::Severity,
         types::{ChannelId, PeerId},
     };
 
@@ -597,11 +598,11 @@ mod tests {
     /// `Default` and `received()` helpers used by these tests.
     #[derive(Default)]
     struct FakeHumanBackend {
-        received: Mutex<Vec<EscalationMessage>>,
+        received: Mutex<Vec<EscalationRequest>>,
     }
 
     impl FakeHumanBackend {
-        fn received(&self) -> Vec<EscalationMessage> {
+        fn received(&self) -> Vec<EscalationRequest> {
             self.received.lock().unwrap_or_else(PoisonError::into_inner).clone()
         }
     }
@@ -613,7 +614,7 @@ mod tests {
 
         async fn notify(
             &self,
-            message: &EscalationMessage,
+            message: &EscalationRequest,
         ) -> Result<(), sandy_fabric::escalation::EscalationSinkError> {
             self.received
                 .lock()
@@ -668,10 +669,12 @@ mod tests {
         }
     }
 
-    fn message() -> EscalationMessage {
-        EscalationMessage {
+    fn message() -> EscalationRequest {
+        EscalationRequest {
             from: PeerId::from("sandbox-1"),
-            reason: "needs human input".to_owned(),
+            severity: Severity::Critical,
+            summary: "needs human input".to_owned(),
+            context_ref: String::new(),
         }
     }
 
@@ -685,7 +688,7 @@ mod tests {
 
         async fn notify(
             &self,
-            _message: &EscalationMessage,
+            _message: &EscalationRequest,
         ) -> Result<(), sandy_fabric::escalation::EscalationSinkError> {
             Err(sandy_fabric::escalation::EscalationSinkError::Sink(
                 "sink is down".to_owned(),
@@ -704,7 +707,7 @@ mod tests {
 
         async fn notify(
             &self,
-            _message: &EscalationMessage,
+            _message: &EscalationRequest,
         ) -> Result<(), sandy_fabric::escalation::EscalationSinkError> {
             panic!("a disabled sink's notify must never be called");
         }
@@ -829,7 +832,7 @@ mod tests {
     #[derive(Default)]
     struct FlakySink {
         attempts: Mutex<u32>,
-        delivered: Mutex<Vec<EscalationMessage>>,
+        delivered: Mutex<Vec<EscalationRequest>>,
         failures_before_success: u32,
     }
 
@@ -841,7 +844,7 @@ mod tests {
             }
         }
 
-        fn delivered(&self) -> Vec<EscalationMessage> {
+        fn delivered(&self) -> Vec<EscalationRequest> {
             self.delivered.lock().unwrap_or_else(PoisonError::into_inner).clone()
         }
 
@@ -855,7 +858,7 @@ mod tests {
             true
         }
 
-        async fn notify(&self, message: &EscalationMessage) -> Result<(), EscalationSinkError> {
+        async fn notify(&self, message: &EscalationRequest) -> Result<(), EscalationSinkError> {
             let mut attempts = self.attempts.lock().unwrap_or_else(PoisonError::into_inner);
             *attempts += 1;
             if *attempts <= self.failures_before_success {
@@ -986,7 +989,7 @@ mod tests {
     }
 
     /// Adversarial: an `Escalate`-typed envelope whose payload does not decode
-    /// as `EscalationMessage` (a malformed sender, or a future incompatible
+    /// as `EscalationRequest` (a malformed sender, or a future incompatible
     /// shape) is logged and skipped — it must never crash the relay or stop it
     /// from delivering the next, valid escalation.
     #[tokio::test]
