@@ -65,6 +65,26 @@ async fn echo_upstream() -> Result<u16> {
     Ok(port)
 }
 
+/// Raise the soft `RLIMIT_NOFILE` to `want`. `false` when the hard limit is lower.
+fn raise_nofile(want: u64) -> bool {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+    let limit = getrlimit(Resource::Nofile);
+    if limit.current.is_some_and(|c| c >= want) {
+        return true;
+    }
+    if limit.maximum.is_some_and(|m| m < want) {
+        return false;
+    }
+    setrlimit(
+        Resource::Nofile,
+        Rlimit {
+            current: Some(want),
+            maximum: limit.maximum,
+        },
+    )
+    .is_ok()
+}
+
 fn policy_for(host: &str, port: u16) -> String {
     format!(r#"{{"rules":[{{"host":"{host}","port":{port}}}]}}"#)
 }
@@ -132,8 +152,20 @@ async fn a_non_connect_method_gets_405() -> Result<()> {
 async fn a_head_over_eight_kib_is_closed_unanswered() -> Result<()> {
     let proxy = start(&policy_for("allowed.example", 443))?;
     let mut s = connect(&proxy.sock).await?;
-    s.write_all(&vec![b'a'; 9 * 1024]).await?;
-    assert_eq!(read_to_end(&mut s).await?, "");
+    // The proxy closes with bytes unread: Linux then resets the connection
+    // where macOS gives a clean EOF. Either is "closed"; no answer may arrive.
+    let _ = s.write_all(&vec![b'a'; 9 * 1024]).await;
+    let mut out = Vec::new();
+    let read = timeout(Duration::from_secs(5), s.read_to_end(&mut out))
+        .await
+        .context("read timed out")?;
+    if let Err(e) = read {
+        anyhow::ensure!(
+            e.kind() == std::io::ErrorKind::ConnectionReset,
+            "unexpected read error: {e}"
+        );
+    }
+    assert!(out.is_empty(), "answered: {:?}", String::from_utf8_lossy(&out));
     Ok(())
 }
 
@@ -152,6 +184,12 @@ async fn a_head_that_never_completes_is_closed_at_the_deadline() -> Result<()> {
 
 #[tokio::test]
 async fn connection_257_is_closed_at_accept() -> Result<()> {
+    // 256 held sockets, their proxy-side peers, and the listener need more
+    // descriptors than a 256 soft limit gives. The proxy child inherits the raise.
+    if !raise_nofile(1024) {
+        eprintln!("skipped: the hard RLIMIT_NOFILE is below 1024");
+        return Ok(());
+    }
     let proxy = start(&policy_for("allowed.example", 443))?;
     // Idle connections hold a slot while the proxy waits for their head.
     let mut held = Vec::new();

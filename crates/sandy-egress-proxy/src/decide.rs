@@ -78,6 +78,7 @@ pub fn decide(
 mod tests {
     use std::cell::{Cell, RefCell};
 
+    use anyhow::Context;
     use sandy_api::egress::{AllowList, EgressRule};
 
     use super::*;
@@ -130,7 +131,7 @@ mod tests {
     }
 
     #[test]
-    fn a_denied_name_never_reaches_the_resolver() {
+    fn a_denied_name_never_reaches_the_resolver() -> anyhow::Result<()> {
         let resolver = Scripted::new(vec![Ok(vec![ip("93.184.216.34")])]);
         let v = decide(
             &target("evil.example:443"),
@@ -138,9 +139,11 @@ mod tests {
             &resolver,
             &[],
         )
-        .unwrap_err();
+        .err()
+        .context("expected a refusal")?;
         assert_eq!(v.status, Status::Forbidden);
         assert_eq!(resolver.calls.get(), 0);
+        Ok(())
     }
 
     #[test]
@@ -156,7 +159,7 @@ mod tests {
     }
 
     #[test]
-    fn the_checked_address_is_the_one_returned_after_one_lookup() {
+    fn the_checked_address_is_the_one_returned_after_one_lookup() -> anyhow::Result<()> {
         // A rebinding resolver: public first, loopback on any later call.
         let resolver = Scripted::new(vec![Ok(vec![ip("93.184.216.34")]), Ok(vec![ip("127.0.0.1")])]);
         let kept = decide(
@@ -165,13 +168,14 @@ mod tests {
             &resolver,
             &[],
         )
-        .expect("allowed");
+        .context("allowed")?;
         assert_eq!(kept, vec![ip("93.184.216.34")]);
         assert_eq!(resolver.calls.get(), 1, "never resolves a second time");
+        Ok(())
     }
 
     #[test]
-    fn a_name_resolving_to_private_space_is_403_unless_an_ip_entry_names_it() {
+    fn a_name_resolving_to_private_space_is_403_unless_an_ip_entry_names_it() -> anyhow::Result<()> {
         let answers = || Scripted::new(vec![Ok(vec![ip("10.0.0.5")])]);
         let v = decide(
             &target("reg.internal:443"),
@@ -179,18 +183,20 @@ mod tests {
             &answers(),
             &[],
         )
-        .unwrap_err();
+        .err()
+        .context("expected a refusal")?;
         assert_eq!(v.status, Status::Forbidden);
         assert!(v.reason.contains("non-public"));
         let both = policy(&[("reg.internal", 443), ("10.0.0.0/8", 443)]);
         assert_eq!(
-            decide(&target("reg.internal:443"), &both, &answers(), &[]).expect("allowed"),
+            decide(&target("reg.internal:443"), &both, &answers(), &[]).context("allowed")?,
             vec![ip("10.0.0.5")]
         );
+        Ok(())
     }
 
     #[test]
-    fn a_name_resolving_to_a_mapped_loopback_is_403() {
+    fn a_name_resolving_to_a_mapped_loopback_is_403() -> anyhow::Result<()> {
         let resolver = Scripted::new(vec![Ok(vec![ip("::ffff:127.0.0.1")])]);
         let v = decide(
             &target("ok.example:443"),
@@ -198,46 +204,59 @@ mod tests {
             &resolver,
             &[],
         )
-        .unwrap_err();
+        .err()
+        .context("expected a refusal")?;
         assert_eq!(v.status, Status::Forbidden);
+        Ok(())
     }
 
     #[test]
-    fn resolver_failure_is_502_and_timeout_is_504() {
+    fn resolver_failure_is_502_and_timeout_is_504() -> anyhow::Result<()> {
         let p = policy(&[("ok.example", 443)]);
         let failed = Scripted::new(vec![Err(ResolveError::Failed)]);
         let timed_out = Scripted::new(vec![Err(ResolveError::TimedOut)]);
         assert_eq!(
-            decide(&target("ok.example:443"), &p, &failed, &[]).unwrap_err().status,
+            decide(&target("ok.example:443"), &p, &failed, &[])
+                .err()
+                .context("expected a refusal")?
+                .status,
             Status::BadGateway
         );
         assert_eq!(
             decide(&target("ok.example:443"), &p, &timed_out, &[])
-                .unwrap_err()
+                .err()
+                .context("expected a refusal")?
                 .status,
             Status::GatewayTimeout
         );
+        Ok(())
     }
 
     #[test]
-    fn an_allowed_ip_literal_skips_the_resolver_and_still_passes_the_filter() {
+    fn an_allowed_ip_literal_skips_the_resolver_and_still_passes_the_filter() -> anyhow::Result<()> {
         let resolver = Scripted::new(vec![]);
         let p = policy(&[("192.0.2.7", 443), ("127.0.0.1", 443)]);
         assert_eq!(
-            decide(&target("192.0.2.7:443"), &p, &resolver, &[]).expect("allowed"),
+            decide(&target("192.0.2.7:443"), &p, &resolver, &[]).context("allowed")?,
             vec![ip("192.0.2.7")]
         );
-        let v = decide(&target("127.0.0.1:443"), &p, &resolver, &[]).unwrap_err();
+        let v = decide(&target("127.0.0.1:443"), &p, &resolver, &[])
+            .err()
+            .context("expected a refusal")?;
         assert_eq!(v.status, Status::Forbidden);
         assert_eq!(resolver.calls.get(), 0);
+        Ok(())
     }
 
     #[test]
-    fn an_ipv6_literal_is_403_without_a_lookup() {
+    fn an_ipv6_literal_is_403_without_a_lookup() -> anyhow::Result<()> {
         let resolver = Scripted::new(vec![]);
         let p = policy(&[("0.0.0.0/0", 443)]);
-        let v = decide(&target("[2001:db8::1]:443"), &p, &resolver, &[]).unwrap_err();
+        let v = decide(&target("[2001:db8::1]:443"), &p, &resolver, &[])
+            .err()
+            .context("expected a refusal")?;
         assert_eq!(v.status, Status::Forbidden);
         assert_eq!(resolver.calls.get(), 0);
+        Ok(())
     }
 }

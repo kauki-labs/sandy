@@ -2340,6 +2340,7 @@ dependencies = [
  "nix 0.31.3",
  "proptest",
  "rstest",
+ "rustix",
  "sandy-api",
  "sandy-egress-proxy",
  "serde_json",

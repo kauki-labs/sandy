@@ -3,6 +3,7 @@
 
 use std::net::IpAddr;
 
+use anyhow::Context;
 use proptest::prelude::*;
 use sandy_api::egress::{AllowList, EgressRule};
 use sandy_egress_proxy::{Host, Policy, ResolveError, Resolver, Status, decide, parse_head};
@@ -73,12 +74,16 @@ proptest! {
 }
 
 #[test]
-fn the_oracle_agrees_on_a_known_allowed_target() {
-    let t = parse_head(b"CONNECT allowed.example:443 HTTP/1.1\r\n\r\n").expect("parses");
+fn the_oracle_agrees_on_a_known_allowed_target() -> anyhow::Result<()> {
+    let t = parse_head(b"CONNECT allowed.example:443 HTTP/1.1\r\n\r\n").context("parses")?;
     assert!(decide(&t, &policy(), &Public, &[]).is_ok());
-    let t = parse_head(b"CONNECT allowed.example:80 HTTP/1.1\r\n\r\n").expect("parses");
+    let t = parse_head(b"CONNECT allowed.example:80 HTTP/1.1\r\n\r\n").context("parses")?;
     assert_eq!(
-        decide(&t, &policy(), &Public, &[]).unwrap_err().status,
+        decide(&t, &policy(), &Public, &[])
+            .err()
+            .context("expected a refusal")?
+            .status,
         Status::Forbidden
     );
+    Ok(())
 }

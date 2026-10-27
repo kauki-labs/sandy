@@ -1,7 +1,5 @@
 //! The proxy's answer to one CONNECT: an HTTP status and a one-line reason.
 
-use std::fmt;
-
 /// The statuses the proxy answers with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -42,7 +40,8 @@ impl Status {
 ///
 /// The reason never carries raw request bytes: a target that fails the host
 /// grammar is described as `malformed`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{} {}", .status.code(), .reason)]
 pub struct Verdict {
     /// The status to answer with.
     pub status: Status,
@@ -74,11 +73,5 @@ impl Verdict {
             body.len()
         )
         .into_bytes()
-    }
-}
-
-impl fmt::Display for Verdict {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {}", self.status.code(), self.reason)
     }
 }

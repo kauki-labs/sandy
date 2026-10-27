@@ -129,6 +129,7 @@ impl Policy {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context;
     use rstest::rstest;
     use sandy_api::egress::EgressRule;
 
@@ -160,11 +161,18 @@ mod tests {
     }
 
     #[test]
-    fn a_name_matches_only_a_name_entry_with_the_same_port() {
+    fn a_name_matches_only_a_name_entry_with_the_same_port() -> anyhow::Result<()> {
         let p = policy(&[("github.com", 443)]);
         assert!(p.check(&name("github.com", 443)).is_ok());
-        assert_eq!(p.check(&name("github.com", 80)).unwrap_err().status, Status::Forbidden);
+        assert_eq!(
+            p.check(&name("github.com", 80))
+                .err()
+                .context("expected a refusal")?
+                .status,
+            Status::Forbidden
+        );
         assert!(p.check(&name("api.github.com", 443)).is_err());
+        Ok(())
     }
 
     #[test]
@@ -208,21 +216,26 @@ mod tests {
     }
 
     #[test]
-    fn an_ipv6_literal_is_refused_even_when_a_wide_entry_exists() {
+    fn an_ipv6_literal_is_refused_even_when_a_wide_entry_exists() -> anyhow::Result<()> {
         let p = policy(&[("0.0.0.0/0", 443)]);
         let t = Target {
-            host: Host::V6("2001:db8::1".parse().expect("ip")),
+            host: Host::V6("2001:db8::1".parse().context("ip")?),
             port: 443,
         };
-        let v = p.check(&t).unwrap_err();
+        let v = p.check(&t).err().context("expected a refusal")?;
         assert_eq!(v.status, Status::Forbidden);
         assert!(v.reason.contains("2001:db8::1"));
+        Ok(())
     }
 
     #[test]
-    fn the_refusal_names_the_target() {
-        let v = Policy::default().check(&name("evil.example", 443)).unwrap_err();
+    fn the_refusal_names_the_target() -> anyhow::Result<()> {
+        let v = Policy::default()
+            .check(&name("evil.example", 443))
+            .err()
+            .context("expected a refusal")?;
         assert!(v.reason.contains("evil.example:443"), "{}", v.reason);
+        Ok(())
     }
 
     #[rstest]

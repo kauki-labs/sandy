@@ -2,7 +2,10 @@
 
 use std::{
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -11,7 +14,7 @@ use sandy_egress_proxy::{HeadRead, Policy, ResolveError, Resolver, Status, Verdi
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
-    time::{sleep, timeout},
+    time::{Instant, sleep, timeout},
 };
 
 /// Deadline for the request head.
@@ -38,21 +41,27 @@ impl Resolver for SystemResolver {
 }
 
 /// Every address on one of the host's own interfaces, read on each CONNECT.
-fn host_interface_addrs() -> Vec<IpAddr> {
-    let Ok(ifaces) = getifaddrs() else {
-        // Unreadable interface set: fail closed is not possible per address,
-        // so log and continue with the loopback and unspecified refusals.
-        tracing::warn!("getifaddrs failed; host-interface refusal is skipped for this CONNECT");
-        return Vec::new();
+///
+/// `None` when the set cannot be read: the caller refuses the CONNECT, because
+/// a missing set would let a named host-interface address through.
+fn host_interface_addrs() -> Option<Vec<IpAddr>> {
+    let ifaces = match getifaddrs() {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::warn!("getifaddrs failed: {e}; refusing this CONNECT");
+            return None;
+        }
     };
-    ifaces
-        .filter_map(|i| {
-            let a = i.address?;
-            a.as_sockaddr_in()
-                .map(|s| IpAddr::V4(s.ip()))
-                .or_else(|| a.as_sockaddr_in6().map(|s| IpAddr::V6(s.ip())))
-        })
-        .collect()
+    Some(
+        ifaces
+            .filter_map(|i| {
+                let a = i.address?;
+                a.as_sockaddr_in()
+                    .map(|s| IpAddr::V4(s.ip()))
+                    .or_else(|| a.as_sockaddr_in6().map(|s| IpAddr::V6(s.ip())))
+            })
+            .collect(),
+    )
 }
 
 /// Read until the head ends. `None` closes the connection unanswered
@@ -106,7 +115,15 @@ where
 
     let decided = {
         let (t, p) = (target.clone(), Arc::clone(&policy));
-        let work = tokio::task::spawn_blocking(move || decide(&t, &p, &SystemResolver, &host_interface_addrs()));
+        let work = tokio::task::spawn_blocking(move || {
+            let Some(ifaces) = host_interface_addrs() else {
+                return Err(Verdict::new(
+                    Status::BadGateway,
+                    format!("{}: cannot list host interfaces", t.label()),
+                ));
+            };
+            decide(&t, &p, &SystemResolver, &ifaces)
+        });
         match timeout(STEP_DEADLINE, work).await {
             Ok(Ok(r)) => r,
             Ok(Err(_)) => Err(Verdict::new(Status::BadGateway, format!("{label}: lookup task failed"))),
@@ -162,32 +179,78 @@ async fn connect_first(addrs: &[IpAddr], port: u16, label: &str) -> Result<TcpSt
     Err(Verdict::new(status, format!("{label}: {what}")))
 }
 
-/// Copy bytes both ways. The idle timer resets on any byte in either direction.
+/// Time of the last byte moved in either direction, shared by both pumps.
+struct Activity {
+    start: Instant,
+    last_ms: AtomicU64,
+}
+
+impl Activity {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            last_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn touch(&self) {
+        let ms = u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// Resolves once nothing has moved for [`IDLE_TIMEOUT`].
+    async fn idle(&self) {
+        loop {
+            let last = Duration::from_millis(self.last_ms.load(Ordering::Relaxed));
+            let quiet = self.start.elapsed().saturating_sub(last);
+            if quiet >= IDLE_TIMEOUT {
+                return;
+            }
+            sleep(IDLE_TIMEOUT - quiet).await;
+        }
+    }
+}
+
+/// Copy one direction until EOF, then half-close the writer.
+async fn pump<R, W>(mut from: R, mut to: W, activity: &Activity) -> Result<(), ()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        match from.read(&mut buf).await {
+            Ok(0) => {
+                let _ = to.shutdown().await;
+                return Ok(());
+            }
+            Ok(n) => {
+                activity.touch();
+                to.write_all(&buf[..n]).await.map_err(|_| ())?;
+                activity.touch();
+            }
+            Err(_) => return Err(()),
+        }
+    }
+}
+
+/// Copy bytes both ways, each direction on its own, so a stalled write in one
+/// never stops reads in the other. The tunnel ends on an error in either
+/// direction, after both reach EOF, or when nothing moves for [`IDLE_TIMEOUT`].
 async fn tunnel<S>(client: S, upstream: TcpStream, early: &[u8])
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let (mut cr, mut cw) = tokio::io::split(client);
-    let (mut ur, mut uw) = upstream.into_split();
+    let (cr, cw) = tokio::io::split(client);
+    let (ur, mut uw) = upstream.into_split();
     if !early.is_empty() && write_idle(&mut uw, early).await.is_err() {
         return;
     }
-    let (mut cbuf, mut ubuf) = ([0u8; 16 * 1024], [0u8; 16 * 1024]);
-    let (mut client_open, mut upstream_open) = (true, true);
-    while client_open || upstream_open {
-        tokio::select! {
-            r = cr.read(&mut cbuf), if client_open => match r {
-                Ok(0) => { client_open = false; let _ = uw.shutdown().await; }
-                Ok(n) => if write_idle(&mut uw, &cbuf[..n]).await.is_err() { return },
-                Err(_) => return,
-            },
-            r = ur.read(&mut ubuf), if upstream_open => match r {
-                Ok(0) => { upstream_open = false; let _ = cw.shutdown().await; }
-                Ok(n) => if write_idle(&mut cw, &ubuf[..n]).await.is_err() { return },
-                Err(_) => return,
-            },
-            () = sleep(IDLE_TIMEOUT) => return,
-        }
+    let activity = Activity::new();
+    let copy = async { tokio::try_join!(pump(cr, uw, &activity), pump(ur, cw, &activity)) };
+    tokio::select! {
+        _ = copy => {}
+        () = activity.idle() => {}
     }
 }
 

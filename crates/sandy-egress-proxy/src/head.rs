@@ -160,6 +160,7 @@ fn normalise_name(host: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context;
     use rstest::rstest;
 
     use super::*;
@@ -211,9 +212,10 @@ mod tests {
     #[case("GET http://example.com/ HTTP/1.1")]
     #[case("POST example.com:443 HTTP/1.1")]
     #[case("connect example.com:443 HTTP/1.1")]
-    fn any_other_method_is_405(#[case] line: &str) {
-        let v = parse_head(&req(line)).unwrap_err();
+    fn any_other_method_is_405(#[case] line: &str) -> anyhow::Result<()> {
+        let v = parse_head(&req(line)).err().context("expected a refusal")?;
         assert_eq!(v.status, Status::MethodNotAllowed);
+        Ok(())
     }
 
     #[rstest]
@@ -228,9 +230,10 @@ mod tests {
     #[case::no_version("CONNECT example.com:443")]
     #[case::extra_token("CONNECT example.com:443 HTTP/1.1 x")]
     #[case::double_space("CONNECT  example.com:443 HTTP/1.1")]
-    fn a_malformed_line_or_port_is_400(#[case] line: &str) {
-        let v = parse_head(&req(line)).unwrap_err();
+    fn a_malformed_line_or_port_is_400(#[case] line: &str) -> anyhow::Result<()> {
+        let v = parse_head(&req(line)).err().context("expected a refusal")?;
         assert_eq!(v.status, Status::BadRequest, "{line}");
+        Ok(())
     }
 
     #[rstest]
@@ -254,10 +257,13 @@ mod tests {
     #[case::empty("")]
     #[case::bad_ipv6("[not-an-ip]")]
     #[case::unbracketed_ipv6("2001:db8::1")]
-    fn a_host_outside_the_grammar_is_400(#[case] host: &str) {
-        let v = parse_head(&req(&format!("CONNECT {host}:443 HTTP/1.1"))).unwrap_err();
+    fn a_host_outside_the_grammar_is_400(#[case] host: &str) -> anyhow::Result<()> {
+        let v = parse_head(&req(&format!("CONNECT {host}:443 HTTP/1.1")))
+            .err()
+            .context("expected a refusal")?;
         assert_eq!(v.status, Status::BadRequest, "{host:?}");
         assert!(!v.reason.contains(host) || host.is_empty(), "no echo");
+        Ok(())
     }
 
     #[test]

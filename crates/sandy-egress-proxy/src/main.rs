@@ -98,6 +98,13 @@ where
     });
 }
 
+/// A failed `accept` (`EMFILE`, `ECONNABORTED`, ...) is not a listener failure:
+/// dying would drop every open tunnel. Log, back off, and keep serving.
+async fn accept_failed(e: &std::io::Error) {
+    tracing::warn!("accept failed: {e}");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}
+
 async fn serve(listen: Listen, policy: Policy) -> Result<(), String> {
     let policy = Arc::new(policy);
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
@@ -107,18 +114,30 @@ async fn serve(listen: Listen, policy: Policy) -> Result<(), String> {
                 tokio::net::UnixListener::bind(&path).map_err(|e| format!("bind {}: {e}", path.display()))?;
             ready().map_err(|e| format!("writing READY: {e}"))?;
             loop {
-                let (stream, _) = listener.accept().await.map_err(|e| format!("accept: {e}"))?;
+                let stream = match listener.accept().await {
+                    Ok((stream, _)) => stream,
+                    Err(e) => {
+                        accept_failed(&e).await;
+                        continue;
+                    }
+                };
                 spawn_conn(stream, &policy, &slots);
             }
         }
         #[cfg(target_os = "linux")]
         Listen::Vsock { port, peer_cid } => {
             let addr = tokio_vsock::VsockAddr::new(tokio_vsock::VMADDR_CID_ANY, port);
-            let mut listener =
+            let listener =
                 tokio_vsock::VsockListener::bind(addr).map_err(|e| format!("bind vsock port {port}: {e}"))?;
             ready().map_err(|e| format!("writing READY: {e}"))?;
             loop {
-                let (stream, peer) = listener.accept().await.map_err(|e| format!("accept: {e}"))?;
+                let (stream, peer) = match listener.accept().await {
+                    Ok(accepted) => accepted,
+                    Err(e) => {
+                        accept_failed(&e).await;
+                        continue;
+                    }
+                };
                 if peer.cid() != peer_cid {
                     tracing::warn!(cid = peer.cid(), "refused a vsock peer with the wrong CID");
                     continue;

@@ -51,6 +51,7 @@ sandy-egress-proxy = { path = ".", features = ["test-loopback"] }
 anyhow.workspace = true
 proptest = "1.7"
 rstest.workspace = true
+rustix.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = [
   "macros",

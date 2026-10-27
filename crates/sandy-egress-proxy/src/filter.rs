@@ -69,12 +69,16 @@ fn permitted(addr: IpAddr, port: u16, policy: &Policy, host_ifaces: &[IpAddr]) -
     let IpAddr::V6(v6) = addr else {
         return false;
     };
-    let first = v6.segments()[0];
+    let [first, second, third, ..] = v6.segments();
     let non_global = v6.is_loopback()
         || v6.is_unspecified()
         || v6.is_multicast()
         || first & 0xffc0 == 0xfe80
-        || first & 0xfe00 == 0xfc00;
+        || first & 0xfe00 == 0xfc00
+        // Documentation (2001:db8::/32, 3fff::/20) and benchmarking (2001:2::/48).
+        || (first == 0x2001 && second == 0x0db8)
+        || (first == 0x3fff && second <= 0x0fff)
+        || (first == 0x2001 && second == 0x0002 && third == 0);
     !non_global && !host_ifaces.contains(&addr)
 }
 
@@ -154,6 +158,10 @@ mod tests {
     #[case("fc00::1")]
     #[case("fd12:3456::1")]
     #[case("ff02::1")]
+    #[case("2001:db8::1")]
+    #[case("3fff::1")]
+    #[case("3fff:fff:ffff::1")]
+    #[case("2001:2::1")]
     fn a_special_use_address_is_refused_without_a_naming_entry(#[case] addr: &str) {
         assert!(!kept(addr, &Policy::default(), &[]), "{addr}");
     }
