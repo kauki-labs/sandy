@@ -39,7 +39,6 @@ sha2.workspace = true
 hex.workspace = true
 octocrab.workspace = true
 tokio.workspace = true
-jsonwebtoken.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
