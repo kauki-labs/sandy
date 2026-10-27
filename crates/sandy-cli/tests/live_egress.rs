@@ -49,6 +49,7 @@
 #![cfg(feature = "live")]
 
 use std::{
+    fs::File,
     path::Path,
     process::{Child, Command, Stdio},
 };
@@ -59,7 +60,103 @@ mod common;
 use common::{build_guest, guest_flake, require_live_root};
 
 /// The host tap sandy attaches the guest NIC to (matches the backend's `$SANDY_TAP`).
-const TAP: &str = "sandytap0";
+///
+/// Suffixed with this process's PID rather than a fixed name: `ip link del` unregisters
+/// a netdevice asynchronously (an RCU grace period, not a synchronous free), so two
+/// nextest processes reusing the same tap name back to back — even fully serialized —
+/// can race `ip tuntap add`/qemu's own tap open against the kernel still finishing the
+/// previous process's teardown, surfacing as a spurious "Device or resource busy". A
+/// per-process name makes that collision structurally impossible rather than relying on
+/// a delay or a retry. No truncation: `sandytap` (8 chars) plus a PID (Linux caps at 7
+/// digits) fits exactly within the 15-character `IFNAMSIZ` limit, and a truncated PID
+/// would reintroduce the exact collision this exists to prevent.
+fn tap_name() -> String {
+    format!("sandytap{}", std::process::id())
+}
+
+/// Block until this process holds the exclusive cross-process lock serializing every
+/// `HostNet` lifetime.
+///
+/// The per-process tap name only fixes the tap-name collision. The rest of the gate's
+/// host state is still a single shared global: sandy's own `sandy_egress`/
+/// `sandy_egress_nat` nftables tables ([`sandy::egress::EGRESS_TABLE`] is a fixed
+/// constant, not parameterized per run) and the fixed `10.77.0.0/24` DHCP subnet.
+/// Nextest runs each test as its own process, in parallel by default, so without
+/// this lock one process's `preclean`/`Drop` can delete the nftables rules a sibling
+/// process's guest is mid-boot under, letting that guest reach a denied destination
+/// and passing a run that should have failed. The lock is held for a `HostNet`'s
+/// whole lifetime (acquired before `preclean`, released when the file closes on
+/// `Drop`), covering the guest boot too — a lock scoped to setup alone would still
+/// let a concurrent `Drop` tear down rules mid-boot.
+fn acquire_host_lock() -> anyhow::Result<File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    // A literal "/tmp", not `std::env::temp_dir()`: the latter follows $TMPDIR, which
+    // can differ between invocations (a root run under `sudo` vs. a plain shell, or a
+    // nix-sandboxed build setting its own TMPDIR) — two processes that disagree on the
+    // lock's path never contend on the same file, defeating the lock entirely.
+    let path = Path::new("/tmp/sandy-live-egress.lock");
+    // NOFOLLOW: refuse a pre-planted symlink at the lock's path rather than opening
+    // (and later chmod-ing) through it. NONBLOCK: a pre-planted FIFO at the path would
+    // otherwise block this open (and the guest boot behind it) until a reader shows up,
+    // which NOFOLLOW alone doesn't prevent (it isn't a symlink); the regular-file check
+    // right after opening is what actually rejects it.
+    let open_flags = (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32;
+    let open_existing = || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(open_flags)
+            .open(path)
+    };
+    // Open without O_CREAT first, falling back to a create only on the one-time-ever
+    // path where the file doesn't exist yet. `fs.protected_regular` (default-on on
+    // several hardened distros) refuses an O_CREAT open on a regular file we don't own
+    // inside a world-writable sticky directory like /tmp — plain re-opens never trip
+    // that restriction, only a creating open would, so later runs under a different
+    // user/mode than whichever one created the file stay unaffected.
+    let file = match open_existing() {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            // `create_new` is atomic (O_CREAT|O_EXCL): either we win the creation race
+            // and `mode(0o666)` sets its permissions outright, or we lose it to a
+            // sibling process and fall back to the plain reopen above.
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .mode(0o666)
+                .custom_flags(open_flags)
+                .create_new(true)
+                .open(path)
+            {
+                Ok(file) => file,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => open_existing()
+                    .with_context(|| format!("reopen {} for the live_egress host lock", path.display()))?,
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("create {} for the live_egress host lock", path.display()));
+                }
+            }
+        }
+        Err(err) => return Err(err).with_context(|| format!("open {} for the live_egress host lock", path.display())),
+    };
+    // Reject anything other than a regular file at the path (e.g. a pre-planted FIFO,
+    // which NONBLOCK above stopped from hanging this open, but which NOFOLLOW doesn't
+    // reject on its own since it isn't a symlink).
+    if !file
+        .metadata()
+        .with_context(|| format!("stat {} for the live_egress host lock", path.display()))?
+        .is_file()
+    {
+        bail!("{} is not a regular file", path.display());
+    }
+    // Best-effort, through the open fd (fchmod) rather than the pathname (which would
+    // reopen a TOCTOU window the NOFOLLOW above just closed): succeeds when we own the
+    // file or are root; a failure means it was already permissive enough for the opens
+    // above to have succeeded regardless of which execution mode created it first.
+    let _ = file.set_permissions(std::fs::Permissions::from_mode(0o666));
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive)
+        .with_context(|| format!("flock {}", path.display()))?;
+    Ok(file)
+}
 /// The guest subnet routed through the host.
 const SUBNET: &str = "10.77.0.0/24";
 /// The host-side gateway address on the tap (the guest's default route).
@@ -153,6 +250,11 @@ fn detect_uplink() -> anyhow::Result<String> {
 /// and a dnsmasq DHCP server. Everything is torn down on `Drop` so no path leaves
 /// state behind.
 struct HostNet {
+    /// Held for this value's entire lifetime; never read, only kept open so the
+    /// cross-process lock [`acquire_host_lock`] took stays held until `Drop` closes
+    /// it, after every teardown command has run.
+    _lock: File,
+    tap: String,
     prev_ip_forward: String,
     dnsmasq: Option<Child>,
 }
@@ -164,18 +266,23 @@ impl HostNet {
     /// host-local-resolver case; every other case runs with DNS off (`--port=0`),
     /// matching the original gate.
     fn setup(enable_dns: bool) -> anyhow::Result<Self> {
+        // Serialize the whole gate across processes before touching any host state —
+        // see acquire_host_lock's doc for why a lock scoped to just this function
+        // would not be enough.
+        let lock = acquire_host_lock()?;
         let uplink = detect_uplink()?;
+        let tap = tap_name();
 
         // 0. Clear any state a previously interrupted run left behind. `Drop` does not run on SIGINT/SIGKILL, so a
         //    killed run leaves the tap and tables in place and `ip tuntap add` would fail with "Device or resource
         //    busy". Each delete tolerates an already-absent resource, so this is a no-op on the normal (clean) path and
         //    makes the gate re-runnable.
-        preclean();
+        preclean(&tap);
 
         // 1. The tap the guest NIC attaches to, with the host-side gateway address.
-        run(Command::new("ip").args(["tuntap", "add", "dev", TAP, "mode", "tap"]))?;
-        run(Command::new("ip").args(["addr", "add", HOST_ADDR, "dev", TAP]))?;
-        run(Command::new("ip").args(["link", "set", TAP, "up"]))?;
+        run(Command::new("ip").args(["tuntap", "add", "dev", &tap, "mode", "tap"]))?;
+        run(Command::new("ip").args(["addr", "add", HOST_ADDR, "dev", &tap]))?;
+        run(Command::new("ip").args(["link", "set", &tap, "up"]))?;
 
         // 1b. Trust the tap in the host firewall. A stock NixOS/Docker host refuses
         //     unsolicited input on a fresh tap (so the guest's DHCP DISCOVER never
@@ -183,7 +290,7 @@ impl HostNet {
         //     policy to DROP). These accept the guest's input and forwarding.
         //     sandy's own `sandy_egress` nft forward-drop still fires for denied
         //     hosts — a `drop` in any base chain is final — so enforcement holds.
-        for rule in tap_firewall_rules() {
+        for rule in tap_firewall_rules(&tap) {
             run(Command::new("iptables").arg("-w").arg("-I").args(&rule))
                 .context("trust the tap in the host firewall (needs `iptables` on PATH)")?;
         }
@@ -209,7 +316,7 @@ impl HostNet {
         let mut args: Vec<String> = vec![
             "--keep-in-foreground".to_string(),
             "--bind-interfaces".to_string(),
-            format!("--interface={TAP}"),
+            format!("--interface={tap}"),
             "--except-interface=lo".to_string(),
             format!("--dhcp-range={DHCP_RANGE}"),
             "--dhcp-authoritative".to_string(),
@@ -276,6 +383,8 @@ impl HostNet {
         }
 
         Ok(Self {
+            _lock: lock,
+            tap,
             prev_ip_forward,
             dnsmasq: Some(dnsmasq),
         })
@@ -289,12 +398,12 @@ impl HostNet {
 /// Under [`netns_mode`] the `nixos-fw` chain is skipped: it's a NixOS firewall
 /// chain the host creates, not a kernel built-in, so it doesn't exist in a plain
 /// network namespace (unlike `FORWARD`, which always does).
-fn tap_firewall_rules() -> Vec<[String; 5]> {
+fn tap_firewall_rules(tap: &str) -> Vec<[String; 5]> {
     let accept = |chain: &str, dir: &str| {
         [
             chain.to_string(),
             dir.to_string(),
-            TAP.to_string(),
+            tap.to_string(),
             "-j".to_string(),
             "ACCEPT".to_string(),
         ]
@@ -315,15 +424,17 @@ fn silent(cmd: &mut Command) {
     let _ = cmd.stdout(Stdio::null()).stderr(Stdio::null()).status();
 }
 
-/// Best-effort removal of the resources [`HostNet::setup`] is about to create,
-/// in case a previous run was interrupted before its `Drop` teardown could run.
-fn preclean() {
-    for rule in tap_firewall_rules() {
+/// Best-effort removal of the resources [`HostNet::setup`] is about to create, in
+/// case this process's own last run was interrupted before its `Drop` teardown could
+/// run (SIGINT/SIGKILL skips `Drop`). `tap` is this process's own [`tap_name`], never
+/// another process's, so this never touches a concurrently running test's resources.
+fn preclean(tap: &str) {
+    for rule in tap_firewall_rules(tap) {
         silent(Command::new("iptables").arg("-w").arg("-D").args(&rule));
     }
     silent(Command::new("nft").args(["delete", "table", "inet", "sandy_egress"]));
     silent(Command::new("nft").args(["delete", "table", "ip", "sandy_egress_nat"]));
-    silent(Command::new("ip").args(["link", "del", TAP]));
+    silent(Command::new("ip").args(["link", "del", tap]));
 }
 
 impl Drop for HostNet {
@@ -335,14 +446,14 @@ impl Drop for HostNet {
             let _ = child.wait();
         }
         // Remove the host-firewall trust rules added in setup (step 1b).
-        for rule in tap_firewall_rules() {
+        for rule in tap_firewall_rules(&self.tap) {
             silent(Command::new("iptables").arg("-w").arg("-D").args(&rule));
         }
         // sandy reverts its own `sandy_egress` table, but delete it too in case a
         // run was interrupted mid-boot before the revert.
         silent(Command::new("nft").args(["delete", "table", "inet", "sandy_egress"]));
         silent(Command::new("nft").args(["delete", "table", "ip", "sandy_egress_nat"]));
-        silent(Command::new("ip").args(["link", "del", TAP]));
+        silent(Command::new("ip").args(["link", "del", &self.tap]));
         // Two args, not a bundled "-wnet.ipv4…": sysctl parses the latter as
         // stacked short flags (-w -n -e -t -…) and rejects it, silently skipping
         // the restore. Mirror setup's `-w`, `net.ipv4.ip_forward=…` form.
@@ -357,6 +468,7 @@ impl Drop for HostNet {
 /// guest-scoped forward egress model (never the host-OUTPUT drop-all).
 fn sandy_run_on_tap(
     home: &Path,
+    tap: &str,
     topology_attr: &str,
     allow: &[String],
     guest_cmd: &str,
@@ -364,7 +476,7 @@ fn sandy_run_on_tap(
     let attr = format!("{}#{}", guest_flake().display(), topology_attr);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_sandy"));
     cmd.env("SANDY_HOME", home)
-        .env("SANDY_TAP", TAP)
+        .env("SANDY_TAP", tap)
         .args(["-o", "json", "run", &attr, "--timeout", "120"]);
     for entry in allow {
         cmd.args(["--allow", entry]);
@@ -450,14 +562,14 @@ exit 13
 fn allowed_host_reachable_denied_host_blocked() -> anyhow::Result<()> {
     let target = require_live_root()?;
     build_guest(&target)?;
-    let _net = HostNet::setup(false)?;
+    let net = HostNet::setup(false)?;
     let home = tempfile::tempdir().context("temp SANDY_HOME")?;
     let (allowed, denied) = (allowed_host(), denied_host());
 
     let guest_cmd = egress_check_script("", &allowed, &denied, PROBE_PORT);
     let allow = vec![format!("{allowed}:{PROBE_PORT}")];
 
-    let (code, env) = sandy_run_on_tap(home.path(), target.topology_attr, &allow, &guest_cmd)?;
+    let (code, env) = sandy_run_on_tap(home.path(), &net.tap, target.topology_attr, &allow, &guest_cmd)?;
 
     assert_eq!(env["status"], "succeeded", "allow+deny must hold; envelope: {env}");
     assert_eq!(
@@ -478,14 +590,14 @@ fn allowed_host_reachable_denied_host_blocked() -> anyhow::Result<()> {
 fn in_guest_firewall_flush_cannot_bypass_the_host_boundary() -> anyhow::Result<()> {
     let target = require_live_root()?;
     build_guest(&target)?;
-    let _net = HostNet::setup(false)?;
+    let net = HostNet::setup(false)?;
     let home = tempfile::tempdir().context("temp SANDY_HOME")?;
     let (allowed, denied) = (allowed_host(), denied_host());
 
     let guest_cmd = egress_check_script("nft flush ruleset 2>/dev/null || true", &allowed, &denied, PROBE_PORT);
     let allow = vec![format!("{allowed}:{PROBE_PORT}")];
 
-    let (_code, env) = sandy_run_on_tap(home.path(), target.topology_attr, &allow, &guest_cmd)?;
+    let (_code, env) = sandy_run_on_tap(home.path(), &net.tap, target.topology_attr, &allow, &guest_cmd)?;
 
     assert_eq!(
         env["exit_code"], 0,
@@ -503,14 +615,14 @@ fn in_guest_firewall_flush_cannot_bypass_the_host_boundary() -> anyhow::Result<(
 fn empty_allow_list_blocks_all_guest_egress() -> anyhow::Result<()> {
     let target = require_live_root()?;
     build_guest(&target)?;
-    let _net = HostNet::setup(false)?;
+    let net = HostNet::setup(false)?;
     let home = tempfile::tempdir().context("temp SANDY_HOME")?;
     let (allowed, denied) = (allowed_host(), denied_host());
 
     let guest_cmd = egress_check_script("", &allowed, &denied, PROBE_PORT);
 
     // No --allow entries: sandy applies the forward ruleset with only the drop floor.
-    let (_code, env) = sandy_run_on_tap(home.path(), target.topology_attr, &[], &guest_cmd)?;
+    let (_code, env) = sandy_run_on_tap(home.path(), &net.tap, target.topology_attr, &[], &guest_cmd)?;
 
     assert_eq!(
         env["exit_code"], 20,
@@ -580,14 +692,14 @@ exit 42
 fn empty_allow_list_blocks_the_host_local_resolver_and_host_address() -> anyhow::Result<()> {
     let target = require_live_root()?;
     build_guest(&target)?;
-    let _net = HostNet::setup(true)?;
+    let net = HostNet::setup(true)?;
     let home = tempfile::tempdir().context("temp SANDY_HOME")?;
 
     let guest_cmd = host_block_check_script(HOST_IP, HOST_RESOLVER_PROBE_NAME);
 
     // No --allow entries: sandy applies the forward + input rulesets with only the
     // drop floors.
-    let (_code, env) = sandy_run_on_tap(home.path(), target.topology_attr, &[], &guest_cmd)?;
+    let (_code, env) = sandy_run_on_tap(home.path(), &net.tap, target.topology_attr, &[], &guest_cmd)?;
 
     assert_eq!(
         env["exit_code"], 0,
