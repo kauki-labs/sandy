@@ -104,8 +104,10 @@ missing_docs = "warn"
 all = { level = "warn", priority = -1 }
 
 # Releases are automated by release-plz (.github/workflows/release.yaml) and
-# configured in release-plz.toml: a version bump landing on main creates the tag,
-# the GitHub release, and publishes the crates to crates.io in dependency order.
+# configured in release-plz.toml: a version bump landing on main creates the
+# tag and the GitHub release for each binary. crates.io publishing is
+# deferred (release-plz.toml) until the trusted-publishing bootstrap
+# completes (CONTRIBUTING.md).
 
 [profile.dev]
 opt-level = 0

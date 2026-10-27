@@ -3,9 +3,10 @@
 #
 #   release-plz release-pr  opens/updates a PR that bumps versions + changelogs.
 #                           Merge it to cut a release.
-#   release-plz release     publishes each crate whose version has no release yet,
-#                           in dependency order, and creates the tag + GitHub
-#                           release for the binaries.
+#   release-plz release     creates the tag + GitHub release for each binary
+#                           whose version has no release yet, in dependency
+#                           order. crates.io publishing is deferred — see
+#                           below.
 #
 # Release model (operator):
 #   - crates.io: DEFERRED for now (reverts to the original "GitHub releases
