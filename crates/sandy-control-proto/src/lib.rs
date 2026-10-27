@@ -30,8 +30,8 @@ pub mod v1 {
 
 pub use v1::{
     AttachRequest, AttachResponse, CancelRequest, CancelResponse, ControlError, ControlRequest, ControlResponse,
-    JobStatus, JobSummary, ListRequest, ListResponse, StatusRequest, StatusResponse, SubmitRequest, SubmitResponse,
-    control_request, control_response,
+    IsolationClass, JobStatus, JobSummary, ListRequest, ListResponse, StatusRequest, StatusResponse, SubmitRequest,
+    SubmitResponse, control_request, control_response,
 };
 
 pub mod client;

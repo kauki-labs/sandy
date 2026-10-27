@@ -156,6 +156,8 @@ fn submit_status_list_and_cancel_round_trip_through_a_live_sandyd() -> anyhow::R
             manifest.to_str().context("manifest path is utf8")?,
             "--manifest-encoding",
             "test/v1",
+            "--isolation-class",
+            "trusted",
             "-o",
             "json",
         ],
@@ -207,7 +209,17 @@ fn submit_reads_the_manifest_from_stdin_when_the_path_is_a_dash() -> anyhow::Res
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_sandy"))
         .env("SANDY_SOCK", &daemon.sock)
-        .args(["daemon", "submit", "-", "--manifest-encoding", "test/v1", "-o", "json"])
+        .args([
+            "daemon",
+            "submit",
+            "-",
+            "--manifest-encoding",
+            "test/v1",
+            "--isolation-class",
+            "trusted",
+            "-o",
+            "json",
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

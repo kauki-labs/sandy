@@ -193,7 +193,7 @@ every knob below from environment variables — there is no CLI flag form.
 3. **Submit and attach** (from the orchestrator host):
 
    ```
-   SANDY_SOCK=/tmp/sandyd.sock sandy daemon submit manifest.json --manifest-encoding argv/v1 -o json
+   SANDY_SOCK=/tmp/sandyd.sock sandy daemon submit manifest.json --manifest-encoding argv/v1 --isolation-class trusted -o json
    SANDY_SOCK=/tmp/sandyd.sock sandy daemon attach <job_id>
    ```
 

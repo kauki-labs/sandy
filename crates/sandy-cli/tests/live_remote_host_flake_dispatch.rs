@@ -172,6 +172,7 @@ async fn submit_flake(
             manifest,
             manifest_encoding: MANIFEST_ENCODING_FLAKE_V1.to_owned(),
             submitter_caps: Vec::new(),
+            required_isolation_class: sandy_control_proto::IsolationClass::Trusted.into(),
         }),
     )
     .await
