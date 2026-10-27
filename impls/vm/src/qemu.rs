@@ -37,7 +37,7 @@ use sandy_api::{
 use uuid::Uuid;
 
 use crate::{
-    agent::{agent_outcome, agent_shell_command},
+    agent::{agent_command_argv, agent_outcome},
     console::{Markers, PipeTransport, run_console},
     share::VirtiofsdTransport,
 };
@@ -368,7 +368,7 @@ impl QemuBackend {
         let agent_spec;
         let console_spec = match agent {
             Some((program, _)) => {
-                agent_command = [agent_shell_command(program, AGENT_VSOCK_PORT, spec.command)];
+                agent_command = agent_command_argv(program, AGENT_VSOCK_PORT, spec.command);
                 agent_spec = RunSpec {
                     command: &agent_command,
                     ..*spec

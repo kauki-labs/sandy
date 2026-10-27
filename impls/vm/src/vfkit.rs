@@ -35,7 +35,7 @@ use sandy_api::{
 use uuid::Uuid;
 
 use crate::{
-    agent::{agent_outcome, agent_shell_command, spawn_connector},
+    agent::{agent_command_argv, agent_outcome, spawn_connector},
     console::{Markers, PtyTransport, run_console},
     share::VirtioFsTransport,
 };
@@ -248,7 +248,7 @@ impl VfkitBackend {
         let console_spec = match agent {
             Some(agent) => {
                 staged.agent_vsock = Some((AGENT_VSOCK_PORT, agent.socket.clone()));
-                agent_command = [agent_shell_command(&agent.program, AGENT_VSOCK_PORT, spec.command)];
+                agent_command = agent_command_argv(&agent.program, AGENT_VSOCK_PORT, spec.command);
                 agent_spec = RunSpec {
                     command: &agent_command,
                     ..*spec

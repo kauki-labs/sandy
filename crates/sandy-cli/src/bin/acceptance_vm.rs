@@ -2,8 +2,11 @@
 //!
 //! The VM-side counterpart to `acceptance-local`: proves the generic, fake-free
 //! seam contract suites ([`sandy_api::contract`]) hold for the real VM impls
-//! (`QemuBackend`/`VfkitBackend`, `VirtiofsdTransport`/`VirtioFsTransport`), then
-//! drives one real job through the fully composed [`profiles::host_no_cred`]
+//! (`QemuBackend`/`VfkitBackend`, `VirtiofsdTransport`/`VirtioFsTransport`), and
+//! that the fabric's own [`sandy_fabric::executor::Executor`] seam holds for the
+//! same backend wrapped in [`VmBackendExecutor`] (#116: a richer impl of the
+//! same contract, not part of the all-local MVP). It then drives one real job
+//! through the fully composed [`profiles::host_no_cred`]
 //! [`Profile`] via [`run_with_profile`] — the same no-forge-credential entry point
 //! `acceptance-local` uses, this time over a real hypervisor boot. The egress seam
 //! check always uses `NoEgress`, even here: the real `NftablesApplier` manages one
@@ -23,7 +26,10 @@
 //! live gate is never counted green from a skip.
 
 use sandy::{Grants, Journal, Status};
-use sandy_api::contract::{egress_applier_suite, guest_share_transport_suite, vmbackend_suite};
+use sandy_api::{
+    backend::SandboxKind,
+    contract::{egress_applier_suite, guest_share_transport_suite, vmbackend_suite},
+};
 use sandy_backend::{VirtioFsTransport, VirtiofsdTransport};
 use sandy_cli::{
     live_target::{build_guest, guest_flake, require_live},
@@ -31,6 +37,8 @@ use sandy_cli::{
     profiles,
     supervisor::run_with_profile,
 };
+use sandy_fabric::{contract::executor_suite, executor::Capabilities};
+use sandy_fabric_local::executor::VmBackendExecutor;
 
 fn main() {
     match run() {
@@ -49,6 +57,8 @@ fn run() -> Result<(), String> {
 
     vmbackend_suite(&template, host_backend).map_err(|e| format!("VmBackend: {e}"))?;
 
+    run_executor_suite(&template, target.target_arch)?;
+
     // The share-transport contract is PURE (plan() only, no daemon spawn — see
     // sandy_api::contract's doc), so both VM transports run it with no live boot.
     if cfg!(target_os = "macos") {
@@ -66,6 +76,50 @@ fn run() -> Result<(), String> {
     egress_applier_suite(|| sandy_backend::NoEgress).map_err(|e| format!("{e}"))?;
 
     end_to_end(&template)
+}
+
+/// Prove the fabric's [`sandy_fabric::executor::Executor`] seam holds for the
+/// real VM backend, wrapped in [`VmBackendExecutor`] (#116: a richer impl of
+/// the same contract, not part of the all-local MVP). `expected` is built
+/// independently of the executor under test — `SandboxKind::Vm` (every live
+/// backend here is a hypervisor) and `target_arch` converted via
+/// [`arch_from_target`], the live target's own independently-detected guest
+/// arch ([`require_live`]'s `host_target()` + `ensure_arch_matches`), not
+/// [`sandy_fabric_local::executor::host_arch`] — the same function
+/// `VmBackendExecutor::capabilities()` itself calls, which would make the
+/// check compare a value to itself instead of catching a real mismatch — so a
+/// false `capabilities()` claim still fails the suite, per its own doc.
+///
+/// `block_in_place` inside [`VmBackendExecutor`] needs a multi-thread Tokio
+/// runtime; the rest of this binary is synchronous, so this builds one just
+/// for the suite rather than converting `main` to async.
+fn run_executor_suite(template: &str, target_arch: &str) -> Result<(), String> {
+    let expected = Capabilities {
+        kind: SandboxKind::Vm,
+        arch: arch_from_target(target_arch)?,
+        attestation: None,
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("build tokio runtime for the Executor seam check: {e}"))?;
+    runtime
+        .block_on(executor_suite(expected, template, || {
+            VmBackendExecutor::new(host_backend())
+        }))
+        .map_err(|e| format!("Executor: {e}"))
+}
+
+/// Map a [`live_target::LiveTarget::target_arch`] string (`"x86_64-linux"` or
+/// `"aarch64-linux"`, the only two values [`require_live`] ever produces) to
+/// the fabric's [`Arch`], independently of
+/// [`sandy_fabric_local::executor::host_arch`] (see [`run_executor_suite`]'s doc).
+fn arch_from_target(target_arch: &str) -> Result<sandy_fabric::executor::Arch, String> {
+    match target_arch {
+        "x86_64-linux" => Ok(sandy_fabric::executor::Arch::X86_64),
+        "aarch64-linux" => Ok(sandy_fabric::executor::Arch::Aarch64),
+        other => Err(format!("unrecognized live target_arch: {other}")),
+    }
 }
 
 /// Drive one real job through the composed, no-forge-credential host profile: a

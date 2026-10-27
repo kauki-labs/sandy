@@ -34,20 +34,25 @@ const MAX_BACKOFF: Duration = Duration::from_millis(500);
 /// How long one attempt waits for the agent's ready byte.
 const READY_WAIT: Duration = Duration::from_secs(2);
 
-/// The shell command the console injects in agent mode: the image's agent,
-/// listening on `port`, running the job as `sh -c <job>` so the job keeps the
-/// shell semantics a plain console run gives `command.join(" ")`.
-pub(crate) fn agent_shell_command(program: &Path, port: u32, job: &[String]) -> String {
-    format!(
-        "{} --vsock-listen {port} -- sh -c {}",
-        sh_quote(&program.to_string_lossy()),
-        sh_quote(&job.join(" "))
-    )
-}
-
-/// `s` as one single-quoted POSIX shell word.
-fn sh_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
+/// The argv the console injects in agent mode: the image's agent, listening
+/// on `port`, exec'ing `job` directly as its own child.
+///
+/// Returns a real argv (not a pre-joined shell string) so
+/// [`Protocol::build_frame`](crate::console::protocol::Protocol::build_frame)
+/// quotes each element independently, the same as a plain console run — no
+/// extra `sh -c` wrapper needed. An earlier version built one shell string by
+/// hand (`sh -c <job.join(" ")>`), which double-joined `job` and lost any
+/// multi-word element (e.g. `["sh", "-c", "exit 3"]` ran as `exit`, `3`
+/// re-tokenized) — the same bug class #116 found live in the plain path.
+pub(crate) fn agent_command_argv(program: &Path, port: u32, job: &[String]) -> Vec<String> {
+    let mut argv = vec![
+        program.to_string_lossy().into_owned(),
+        "--vsock-listen".to_owned(),
+        port.to_string(),
+        "--".to_owned(),
+    ];
+    argv.extend(job.iter().cloned());
+    argv
 }
 
 /// A connected stream that can wait a bounded time for its first byte.
@@ -216,15 +221,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_agent_command_quotes_the_job_for_the_guest_shell() {
-        let command = agent_shell_command(
+    fn the_agent_command_is_the_program_and_job_as_one_flat_argv() {
+        let argv = agent_command_argv(
             Path::new("/nix/store/abc-sandy-agent/bin/sandy-agent"),
             5000,
-            &["echo".to_string(), "it's".to_string(), "$HOME".to_string()],
+            &["sh".to_string(), "-c".to_string(), "exit 3".to_string()],
         );
         assert_eq!(
-            command,
-            r#"'/nix/store/abc-sandy-agent/bin/sandy-agent' --vsock-listen 5000 -- sh -c 'echo it'\''s $HOME'"#
+            argv,
+            vec![
+                "/nix/store/abc-sandy-agent/bin/sandy-agent".to_string(),
+                "--vsock-listen".to_string(),
+                "5000".to_string(),
+                "--".to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                "exit 3".to_string(),
+            ],
+            "job's argv (including a multi-word element) must come through unchanged, not re-joined or re-split"
         );
     }
 
