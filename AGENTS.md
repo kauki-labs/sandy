@@ -44,7 +44,9 @@ version, metadata, dependency versions, and lints through the root `Cargo.toml`
   process backend launches it with its agent link on stdin (in a VM guest it takes
   the host's connection on a vsock listener, #238), it joins through the
   orchestrator-side relay (`sandy-fabric-local::link`), and runs the job as its
-  child. See `docs/decisions/agent-fabric.md` §10.
+  child. See `docs/decisions/agent-fabric.md` §10. Its `egress-relay` mode (#402)
+  wraps the job in the guest-side egress relay: a loopback listener that forwards
+  to the host egress proxy over vsock (`docs/decisions/egress-proxy.md` decision 1).
 - **`sandy-fabric-compose`** (`impls/fabric-compose`) — the agent-fabric's
   composition root: the all-local MVP profile and its e2e acceptance (#115).
   No production `AllLocalProfile` yet; today the crate holds the composition
