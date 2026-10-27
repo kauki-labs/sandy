@@ -75,13 +75,17 @@ fn map_err(err: BackendError) -> ExecutorError {
 
 /// The compiled host architecture, as the fabric's [`Arch`].
 ///
+/// `pub`: also the independent source of truth a live acceptance binary uses
+/// to build its own expected [`Capabilities`] (#116), rather than reading
+/// them back off the executor under test.
+///
 /// # Panics
 ///
 /// Panics on a host triple this isn't `x86_64` or `aarch64` — the project's
 /// flake only ever builds for `x86_64-linux` or `aarch64-darwin` (see
 /// `AGENTS.md`), so any other value means this binary was built outside that
 /// matrix, not a reachable runtime condition.
-fn host_arch() -> Arch {
+pub fn host_arch() -> Arch {
     match std::env::consts::ARCH {
         "x86_64" => Arch::X86_64,
         "aarch64" => Arch::Aarch64,

@@ -2,8 +2,11 @@
 //!
 //! The VM-side counterpart to `acceptance-local`: proves the generic, fake-free
 //! seam contract suites ([`sandy_api::contract`]) hold for the real VM impls
-//! (`QemuBackend`/`VfkitBackend`, `VirtiofsdTransport`/`VirtioFsTransport`), then
-//! drives one real job through the fully composed [`profiles::host_no_cred`]
+//! (`QemuBackend`/`VfkitBackend`, `VirtiofsdTransport`/`VirtioFsTransport`), and
+//! that the fabric's own [`sandy_fabric::executor::Executor`] seam holds for the
+//! same backend wrapped in [`VmBackendExecutor`] (#116: a richer impl of the
+//! same contract, not part of the all-local MVP). It then drives one real job
+//! through the fully composed [`profiles::host_no_cred`]
 //! [`Profile`] via [`run_with_profile`] — the same no-forge-credential entry point
 //! `acceptance-local` uses, this time over a real hypervisor boot. The egress seam
 //! check always uses `NoEgress`, even here: the real `NftablesApplier` manages one
@@ -23,7 +26,10 @@
 //! live gate is never counted green from a skip.
 
 use sandy::{Grants, Journal, Status};
-use sandy_api::contract::{egress_applier_suite, guest_share_transport_suite, vmbackend_suite};
+use sandy_api::{
+    backend::SandboxKind,
+    contract::{egress_applier_suite, guest_share_transport_suite, vmbackend_suite},
+};
 use sandy_backend::{VirtioFsTransport, VirtiofsdTransport};
 use sandy_cli::{
     live_target::{build_guest, guest_flake, require_live},
@@ -31,6 +37,8 @@ use sandy_cli::{
     profiles,
     supervisor::run_with_profile,
 };
+use sandy_fabric::{contract::executor_suite, executor::Capabilities};
+use sandy_fabric_local::executor::{VmBackendExecutor, host_arch};
 
 fn main() {
     match run() {
@@ -49,6 +57,8 @@ fn run() -> Result<(), String> {
 
     vmbackend_suite(&template, host_backend).map_err(|e| format!("VmBackend: {e}"))?;
 
+    run_executor_suite(&template)?;
+
     // The share-transport contract is PURE (plan() only, no daemon spawn — see
     // sandy_api::contract's doc), so both VM transports run it with no live boot.
     if cfg!(target_os = "macos") {
@@ -66,6 +76,34 @@ fn run() -> Result<(), String> {
     egress_applier_suite(|| sandy_backend::NoEgress).map_err(|e| format!("{e}"))?;
 
     end_to_end(&template)
+}
+
+/// Prove the fabric's [`sandy_fabric::executor::Executor`] seam holds for the
+/// real VM backend, wrapped in [`VmBackendExecutor`] (#116: a richer impl of
+/// the same contract, not part of the all-local MVP). `expected` is built
+/// independently of the executor under test — `SandboxKind::Vm` (every live
+/// backend here is a hypervisor) and [`host_arch`] (the same host-arch mapping
+/// the adapter itself uses) — so a false `capabilities()` claim still fails
+/// the suite, per its own doc.
+///
+/// `block_in_place` inside [`VmBackendExecutor`] needs a multi-thread Tokio
+/// runtime; the rest of this binary is synchronous, so this builds one just
+/// for the suite rather than converting `main` to async.
+fn run_executor_suite(template: &str) -> Result<(), String> {
+    let expected = Capabilities {
+        kind: SandboxKind::Vm,
+        arch: host_arch(),
+        attestation: None,
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("build tokio runtime for the Executor seam check: {e}"))?;
+    runtime
+        .block_on(executor_suite(expected, template, || {
+            VmBackendExecutor::new(host_backend())
+        }))
+        .map_err(|e| format!("Executor: {e}"))
 }
 
 /// Drive one real job through the composed, no-forge-credential host profile: a
