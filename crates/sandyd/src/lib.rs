@@ -24,13 +24,41 @@ pub mod store;
 #[cfg(test)]
 mod test_support;
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{future::Future, net::SocketAddr, sync::Arc};
 
 use dispatch::JobRegistry;
 use host_registry::HostRegistry;
 use sandy_control_proto::{ControlRequest, read_frame, write_frame};
 use store::JobStore;
 use tokio::net::UnixStream;
+
+/// Acquire one permit from `semaphore`, THEN await `accept` (CF-L-1, #289
+/// item 3) — in that order, and combined into one future, so a full
+/// semaphore blocks only this one `select!` branch, not the whole accept
+/// loop: the surrounding `select!` keeps polling its sibling branches
+/// (reaping finished connections, the shutdown signal) every iteration
+/// regardless of whether this branch's permit acquisition has resolved yet.
+/// Acquiring the permit as a plain `.await` inside a branch's handler (after
+/// `select!` has already picked that branch) would instead block the loop's
+/// next iteration on it — shutdown would never be observed while every
+/// permit is held.
+///
+/// Shared by every accept loop in this crate (the UDS control socket, the
+/// mesh management-channel listener, and the mesh agent-link listener) so
+/// each gets the same pre-auth concurrency cap under the same discipline,
+/// rather than one loop remembering it and the others not.
+///
+/// `Err` only if `semaphore` was explicitly closed, which no caller in this
+/// crate ever does; the caller still matches on it rather than unwrapping,
+/// per house style (no panics in a connection-accepting loop).
+pub async fn gate_spawn<T>(
+    semaphore: &Arc<tokio::sync::Semaphore>,
+    accept: impl Future<Output = T>,
+) -> (Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError>, T) {
+    let permit = Arc::clone(semaphore).acquire_owned().await;
+    let value = accept.await;
+    (permit, value)
+}
 
 /// Serve one client connection: read [`ControlRequest`] frames, dispatch each
 /// against `store`, and write the matching

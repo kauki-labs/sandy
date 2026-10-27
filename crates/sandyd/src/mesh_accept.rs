@@ -31,23 +31,56 @@ use crate::dispatch::JobRegistry;
 /// `REGISTER_TIMEOUT`, the same shape for the same pre-auth DoS.
 const PREFIX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// The largest number of pre-auth agent-link streams this loop authenticates
+/// concurrently (CF-L-1, #289 item 3): past this, accepting a new connection
+/// waits for one of the in-flight ones to finish authenticating (or to be
+/// handed off to [`serve_agent_link`]) rather than spawning an unbounded task
+/// per accept. Before this cap, any mesh peer could open connections without
+/// limit and exhaust the daemon's file descriptors before a single one ever
+/// reached [`PREFIX_TIMEOUT`].
+const MAX_CONCURRENT_LINKS: usize = 256;
+
 /// Accept connections from `listener` until it errors, authenticating each
 /// against `registry` before relaying it to its job's agent link. A single
 /// connection's own failure (malformed prefix, auth refusal, a faulted link)
 /// never stops the loop — only ends that one connection.
 pub async fn serve_mesh_accept_loop(listener: &Listener, registry: &Arc<JobRegistry>) {
+    serve_mesh_accept_loop_with_cap(listener, registry, MAX_CONCURRENT_LINKS).await;
+}
+
+/// [`serve_mesh_accept_loop`]'s body, parameterized over the concurrency cap
+/// so a test can drive it with a small `max_concurrent` instead of waiting
+/// for [`MAX_CONCURRENT_LINKS`] real connections to prove the cap holds.
+async fn serve_mesh_accept_loop_with_cap(listener: &Listener, registry: &Arc<JobRegistry>, max_concurrent: usize) {
+    let mut connections = tokio::task::JoinSet::new();
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+
     loop {
-        match listener.accept().await {
-            Ok((conn, peer)) => {
-                let registry = Arc::clone(registry);
-                tokio::spawn(async move {
-                    serve_one_remote_link(conn, peer, &registry).await;
-                });
+        tokio::select! {
+            (permit, accepted) = crate::gate_spawn(&semaphore, listener.accept()) => {
+                let Ok(permit) = permit else {
+                    // Never closed by this process; handled rather than
+                    // panicked, per house style.
+                    tracing::error!("mesh accept loop: link semaphore closed unexpectedly; no longer accepting new connections");
+                    break;
+                };
+                match accepted {
+                    Ok((conn, peer)) => {
+                        let registry = Arc::clone(registry);
+                        connections.spawn(async move {
+                            let _permit = permit; // held for the stream's lifetime, released on drop
+                            serve_one_remote_link(conn, peer, &registry).await;
+                        });
+                    }
+                    Err(e) => {
+                        // `permit` drops here, releasing it immediately: this
+                        // connection was never served.
+                        tracing::warn!(error = %e, "mesh accept loop: accept faulted; backing off");
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "mesh accept loop: accept faulted; backing off");
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
+            Some(_) = connections.join_next(), if !connections.is_empty() => {}
         }
     }
 }
@@ -609,6 +642,69 @@ mod tests {
         tokio::time::advance(PREFIX_TIMEOUT + std::time::Duration::from_millis(1)).await;
         serving.await?; // bounded by the virtual-clock advance above, not real time
         drop(client);
+        Ok(())
+    }
+
+    /// Regression (#289 item 3, pre-auth DoS): before this cap, the loop
+    /// spawned one task per accepted connection with no limit, so a peer
+    /// opening connections faster than they're authenticated could exhaust
+    /// the daemon's file descriptors well before any single one reached
+    /// `PREFIX_TIMEOUT`. With `max_concurrent` set to 1, a second connection
+    /// is accepted at the TCP level (the listener's own backlog) but its
+    /// `serve_one_remote_link` task does not start — proven by it staying
+    /// silent (no refusal, no agent-link byte) — until the first
+    /// connection's stream closes and releases its permit.
+    #[tokio::test]
+    async fn a_second_stream_is_not_authenticated_until_the_cap_admits_it() -> anyhow::Result<()> {
+        let listener = listen(&loopback(0)).await.context("listen")?;
+        let addr = listener.local_addr().context("local_addr")?;
+        let registry = Arc::new(JobRegistry::new().context("registry")?);
+
+        let loop_registry = Arc::clone(&registry);
+        let accept_loop = tokio::spawn(async move {
+            serve_mesh_accept_loop_with_cap(&listener, &loop_registry, 1).await;
+        });
+
+        // First connection: holds the only permit by never sending its
+        // prefix, so it is never authenticated and never releases.
+        let first_client = connect(&loopback(addr.port())).await.context("connect first")?;
+
+        // Second connection: the TCP accept succeeds (it's the OS listen
+        // backlog, not the semaphore), but the loop must not have started
+        // serve_one_remote_link for it yet — presenting a WRONG token on it
+        // right now would be refused immediately if it had, so instead this
+        // proves silence: no byte arrives within a short window.
+        let mut second_client = connect(&loopback(addr.port())).await.context("connect second")?;
+        let mut buf = [0u8; 1];
+        let still_waiting = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            tokio::io::AsyncReadExt::read(&mut second_client, &mut buf),
+        )
+        .await;
+        assert!(
+            still_waiting.is_err(),
+            "the second stream must not be served while the cap's one permit is held by the first"
+        );
+
+        // Releasing the first connection's permit lets the second proceed:
+        // presenting a garbage prefix on it now gets a prompt refusal.
+        drop(first_client);
+        tokio::io::AsyncWriteExt::write_all(&mut second_client, &u32::MAX.to_be_bytes())
+            .await
+            .context("write a malformed prefix on the second connection")?;
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read(&mut second_client, &mut buf),
+        )
+        .await
+        .context("timed out waiting for the second stream to be served once the cap admitted it")?
+        .context("read after refusal")?;
+        assert_eq!(
+            n, 0,
+            "a malformed prefix must close the stream having written zero bytes"
+        );
+
+        accept_loop.abort();
         Ok(())
     }
 }
