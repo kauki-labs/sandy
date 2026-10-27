@@ -70,3 +70,31 @@ jobs:
         run: nix develop -c release-plz release --git-token "${GITHUB_TOKEN}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # release-plz writes `*(scope)*` in the changelogs; treefmt wants `_(scope)_`.
+      # Without this step the release PR fails its Format check on every regeneration.
+      # Runs last: it switches the checkout to the release branch, and
+      # `release-plz release` must see main. The push comes from GITHUB_TOKEN, so it
+      # does not trigger pr.yaml either (same gap as above).
+      - name: Format the release PR
+        run: |
+          set -euo pipefail
+          branch="$(gh pr list --state open --search 'chore: release in:title' --json headRefName \
+            --jq '[.[] | select(.headRefName | startswith("release-plz-"))][0].headRefName // empty')"
+          if [ -z "${branch}" ]; then
+            echo "No open release PR; nothing to format."
+            exit 0
+          fi
+          git fetch origin "${branch}"
+          git switch --detach "origin/${branch}"
+          nix fmt
+          if git diff --quiet; then
+            echo "Release PR already formatted."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -u
+          git commit -m "chore(release): format the generated changelogs"
+          git push origin "HEAD:${branch}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
