@@ -76,9 +76,12 @@ nix flake check -L               # the full gate: build, clippy, docs, tests, fo
 
 ## Releases
 
-Releases are automated by [release-plz](https://release-plz.dev). A version bump
-reaching `main` opens the release; you do not tag or publish by hand.
-release-plz also keeps a prepared bump PR open with the changelog.
+Releases are automated by [release-plz](https://release-plz.dev), gated on the
+repo variable `ENABLE_RELEASES` (`.github/workflows/release.yaml`) — while
+unset, the release job is skipped entirely and a version bump on `main`
+creates nothing. Once it's `true`, a version bump opens the release; you do
+not tag or publish by hand. release-plz also keeps a prepared bump PR open
+with the changelog.
 
 **Currently GitHub releases only** (`release-plz.toml`): each binary
 (`sandy-cli`, `sandyd`, `sandy-agent`) gets its own version, tag, and GitHub
