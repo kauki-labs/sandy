@@ -108,12 +108,18 @@ fn relaying(channel: &TestChannel, cap: Cap) -> (AgentLaunch, Relay) {
 }
 
 /// Boot the guest and run `script` behind its agent, off the async runtime.
+///
+/// `RunSpec.command` is "the guest command and its arguments" (argv, exec'd
+/// directly, never shell-interpreted as a whole) — so a multi-line `script`
+/// must be wrapped as `["sh", "-c", script]`, not passed as a single bare
+/// element (that only ever worked by accident on the pre-fix VM console path,
+/// where joining a one-element command was a no-op).
 async fn run_in_guest(
     template: String,
     launch: AgentLaunch,
     script: &str,
 ) -> anyhow::Result<Result<Outcome, BackendError>> {
-    let command = vec![script.to_string()];
+    let command = vec!["sh".to_string(), "-c".to_string(), script.to_string()];
     Ok(tokio::task::spawn_blocking(move || {
         let grants = Grants {
             secrets: false,
