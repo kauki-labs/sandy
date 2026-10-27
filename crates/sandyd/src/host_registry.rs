@@ -138,6 +138,11 @@ pub struct Registration {
     /// Identifies this exact registration; pass it to the matching
     /// [`HostRegistry::remove`] and to [`HostRegistry::send_dispatch_if_current`].
     pub registration: RegistrationId,
+    /// The `host_id` this registration was made under — carried here so a
+    /// caller holding only a `Registration` (e.g. `host_conn`'s
+    /// `relay_dispatches`) can log and call [`HostRegistry::remove`] without
+    /// a separate `host_id` parameter alongside it.
+    pub host_id: String,
     /// `Some(previous)` when this registration superseded a live entry the
     /// SAME peer already held under this `host_id` — a reclaim (#292 item 4).
     /// The previous connection is evicted (its dispatch channel dropped, so
@@ -271,7 +276,7 @@ impl HostRegistry {
         // `dispatch_tx`'s headroom.
         let (attach_state_tx, attach_state_rx) = mpsc::channel(4);
         hosts.insert(
-            host_id,
+            host_id.clone(),
             Arc::new(ConnectedHost {
                 peer_ip,
                 registration,
@@ -284,6 +289,7 @@ impl HostRegistry {
             dispatch_rx,
             attach_state_rx,
             registration,
+            host_id,
             superseded,
         })
     }
