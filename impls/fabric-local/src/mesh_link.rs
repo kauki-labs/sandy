@@ -200,14 +200,26 @@ where
     // routing black hole on the mesh) must not hang this dial forever — the
     // caller (relay_agent_link's spawned task) has a report to deliver, and
     // an indefinite hang here would silently withhold it.
-    let remote = tokio::time::timeout(DIAL_TIMEOUT, sandy_conn::connect(&ConnAddr::Tcp(orchestrator)))
-        .await
-        .map_err(|_| {
-            DialAndForwardError::Dial(sandy_conn::ConnError::Io(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("dialing {orchestrator} timed out after {DIAL_TIMEOUT:?}"),
-            )))
-        })??;
+    //
+    // Keepalive-bound too (#289 item 1, the same `HALF_OPEN_DETECTION`
+    // profile the host-executor's own management-channel dial already uses):
+    // `DIAL_TIMEOUT` only bounds the initial connect, not a vanished
+    // orchestrator AFTER the dial succeeds — without keepalive, a hung
+    // `dial_and_forward` already has its own `RunControl` deadline/cancel
+    // race in `relay_agent_link`, but a dead connection that never produces
+    // an error or EOF would otherwise rely on that alone instead of the OS
+    // also noticing within keepalive's own ~90s window.
+    let remote = tokio::time::timeout(
+        DIAL_TIMEOUT,
+        sandy_conn::connect_tcp_keepalive(orchestrator, sandy_conn::TcpKeepalive::HALF_OPEN_DETECTION),
+    )
+    .await
+    .map_err(|_| {
+        DialAndForwardError::Dial(sandy_conn::ConnError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("dialing {orchestrator} timed out after {DIAL_TIMEOUT:?}"),
+        )))
+    })??;
     Ok(forward_agent_link(local, remote, prefix).await?)
 }
 
