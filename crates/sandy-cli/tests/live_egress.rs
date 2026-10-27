@@ -97,12 +97,15 @@ fn acquire_host_lock() -> anyhow::Result<File> {
     // lock's path never contend on the same file, defeating the lock entirely.
     let path = Path::new("/tmp/sandy-live-egress.lock");
     // NOFOLLOW: refuse a pre-planted symlink at the lock's path rather than opening
-    // (and later chmod-ing) through it.
-    let nofollow = rustix::fs::OFlags::NOFOLLOW.bits() as i32;
+    // (and later chmod-ing) through it. NONBLOCK: a pre-planted FIFO at the path would
+    // otherwise block this open (and the guest boot behind it) until a reader shows up,
+    // which NOFOLLOW alone doesn't prevent (it isn't a symlink); the regular-file check
+    // right after opening is what actually rejects it.
+    let open_flags = (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32;
     let open_existing = || {
         std::fs::OpenOptions::new()
             .write(true)
-            .custom_flags(nofollow)
+            .custom_flags(open_flags)
             .open(path)
     };
     // Open without O_CREAT first, falling back to a create only on the one-time-ever
@@ -120,7 +123,7 @@ fn acquire_host_lock() -> anyhow::Result<File> {
             match std::fs::OpenOptions::new()
                 .write(true)
                 .mode(0o666)
-                .custom_flags(nofollow)
+                .custom_flags(open_flags)
                 .create_new(true)
                 .open(path)
             {
@@ -135,6 +138,16 @@ fn acquire_host_lock() -> anyhow::Result<File> {
         }
         Err(err) => return Err(err).with_context(|| format!("open {} for the live_egress host lock", path.display())),
     };
+    // Reject anything other than a regular file at the path (e.g. a pre-planted FIFO,
+    // which NONBLOCK above stopped from hanging this open, but which NOFOLLOW doesn't
+    // reject on its own since it isn't a symlink).
+    if !file
+        .metadata()
+        .with_context(|| format!("stat {} for the live_egress host lock", path.display()))?
+        .is_file()
+    {
+        bail!("{} is not a regular file", path.display());
+    }
     // Best-effort, through the open fd (fchmod) rather than the pathname (which would
     // reopen a TOCTOU window the NOFOLLOW above just closed): succeeds when we own the
     // file or are root; a failure means it was already permissive enough for the opens
