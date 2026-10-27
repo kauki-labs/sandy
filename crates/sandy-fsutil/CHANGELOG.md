@@ -1,0 +1,33 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.1.1](https://github.com/kauki-labs/sandy/releases/tag/sandy-fsutil-v0.1.1) - 2026-10-27
+
+### Added
+
+- *(sandyd)* per-job isolation class on Submit ([#442](https://github.com/kauki-labs/sandy/pull/442))
+- *(result)* define and implement envelope receipts v1 ([#361](https://github.com/kauki-labs/sandy/pull/361)) ([#414](https://github.com/kauki-labs/sandy/pull/414))
+- *(ci)* scope release-plz's PR and document its CI-trigger gap ([#249](https://github.com/kauki-labs/sandy/pull/249))
+
+### Fixed
+
+- *(sandy-fabric-local)* validate the telemetry log's parent dir ([#412](https://github.com/kauki-labs/sandy/pull/412))
+- *(sandy-fsutil,sandy,sandy-cli)* bind credential and guest-share staging to a validated fingerprint ([#323](https://github.com/kauki-labs/sandy/pull/323)) ([#410](https://github.com/kauki-labs/sandy/pull/410))
+- *(sandy-cli)* gc sweeps stale cred-*/verify-* staging dirs ([#352](https://github.com/kauki-labs/sandy/pull/352))
+- *(sandy)* don't revoke a refreshed token when only the dir sync fails ([#353](https://github.com/kauki-labs/sandy/pull/353))
+- *(sandy-fsutil)* reuse the validated staging base fd (audit L-11) ([#321](https://github.com/kauki-labs/sandy/pull/321))
+- *(fsutil)* set the mode on every new entry, whatever the umask ([#204](https://github.com/kauki-labs/sandy/pull/204)) ([#276](https://github.com/kauki-labs/sandy/pull/276))
+
+### Other
+
+- public-domain readiness pass (operator/codename cleanup, escalation, mesh, licensing) ([#428](https://github.com/kauki-labs/sandy/pull/428))
+- *(readme)* document running sandyd across multiple hosts ([#422](https://github.com/kauki-labs/sandy/pull/422))
+- /project-docs conformance pass for the first release ([#419](https://github.com/kauki-labs/sandy/pull/419))
+- *(readme)* trim to binary usage, drop dev setup, add the seams diagram ([#260](https://github.com/kauki-labs/sandy/pull/260))
+- *(license)* [**breaking**] relicense MIT → AGPL-3.0 + commercial dual + CLA ([#242](https://github.com/kauki-labs/sandy/pull/242))
