@@ -596,6 +596,31 @@ fn read_manifest(path: &str) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Read `path` fully as UTF-8 text, refusing one that exceeds `limit` bytes
+/// without loading it fully first — the same bounded-read discipline
+/// [`read_manifest`] applies, generalized over a byte limit since its own
+/// caller is a wire-frame size, not a plain file-content bound.
+fn read_bounded_string(path: &str, limit: u64) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut buf = Vec::new();
+    let read = file.by_ref().take(limit + 1).read_to_end(&mut buf)?;
+    if read as u64 > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("exceeds the {limit}-byte limit"),
+        ));
+    }
+    String::from_utf8(buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// Bound on `--cap-file`'s own size, before base64 decoding (CodeRabbit on
+/// this PR). A real encoded `Cap` is a few hundred bytes at most; anything
+/// past this is either misconfiguration (the wrong file) or a way to make
+/// this read unbounded — the same discipline [`MAX_MANIFEST_LEN`] already
+/// enforces for the job manifest via [`read_manifest`].
+const MAX_CAP_FILE_LEN: u64 = 64 * 1024;
+
 /// Read and decode each `--cap-file` path into the raw bytes
 /// `SubmitRequest.submitter_caps` carries (#232). Each file holds exactly the
 /// base64 text `sandy daemon attach -o json`'s own `cap` field already
@@ -606,14 +631,14 @@ fn read_manifest(path: &str) -> std::io::Result<Vec<u8>> {
 /// the caller didn't ask for.
 ///
 /// # Errors
-/// Names the path that failed to read, or whose contents aren't valid
-/// base64.
+/// Names the path that failed to read (including one over
+/// [`MAX_CAP_FILE_LEN`]), or whose contents aren't valid base64.
 fn read_submitter_caps(paths: &[String]) -> Result<Vec<Vec<u8>>, String> {
     paths
         .iter()
         .map(|path| {
-            let contents =
-                std::fs::read_to_string(path).map_err(|e| format!("--cap-file {path:?} could not be read: {e}"))?;
+            let contents = read_bounded_string(path, MAX_CAP_FILE_LEN)
+                .map_err(|e| format!("--cap-file {path:?} could not be read: {e}"))?;
             base64::engine::general_purpose::STANDARD
                 .decode(contents.trim())
                 .map_err(|e| format!("--cap-file {path:?} does not contain valid base64: {e}"))
@@ -1349,6 +1374,17 @@ mod tests {
     fn read_submitter_caps_allows_no_caps_at_all() -> anyhow::Result<()> {
         let decoded = read_submitter_caps(&[]).map_err(|e| anyhow::anyhow!(e))?;
         assert!(decoded.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn read_submitter_caps_refuses_a_file_over_the_size_limit() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let oversized = "A".repeat((MAX_CAP_FILE_LEN + 1) as usize);
+        let path = write_cap_file(tmp.path(), "cap-huge", &oversized)?;
+
+        let err = read_submitter_caps(&[path]).expect_err("an oversized --cap-file must be refused");
+        assert!(err.contains("exceeds"), "got: {err}");
         Ok(())
     }
 

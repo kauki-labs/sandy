@@ -417,3 +417,95 @@ fn submit_with_a_well_formed_but_unreal_cap_file_reaches_the_daemons_own_decode(
     );
     Ok(())
 }
+
+/// Positive (CodeRabbit on this PR): the full #232 round trip with a REAL
+/// cap, not just a rejection. Submit a seed job, attach to it (minting a
+/// post+read cap scoped to the seed job's own channel — its job_id, CF-H-1),
+/// save that cap to a file, then submit a second job whose `JobManifest`
+/// requests read-only (a strict subset) on that same channel via
+/// `--cap-file`. `derive_job_caps`'s subset check must grant it, proving a
+/// cap minted by a real `attach` actually satisfies Submit once presented
+/// back through `--cap-file` — not just that malformed or unreal bytes are
+/// refused.
+#[test]
+fn submit_with_a_cap_file_from_a_real_attach_grants_the_requested_subset() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir().context("temp dir")?;
+    let daemon = spawn_daemon(tmp.path())?;
+
+    let seed_manifest = tmp.path().join("seed.bin");
+    std::fs::write(&seed_manifest, b"opaque").context("write seed manifest")?;
+    let seed_submit = sandy(
+        &daemon,
+        &[
+            "daemon",
+            "submit",
+            seed_manifest.to_str().context("seed manifest path is utf8")?,
+            "--manifest-encoding",
+            "test/v1",
+            "--isolation-class",
+            "trusted",
+            "-o",
+            "json",
+        ],
+    )?;
+    assert_eq!(
+        seed_submit.status.code(),
+        Some(0),
+        "seed submit stderr: {}",
+        stderr_of(&seed_submit)
+    );
+    let seed_json: serde_json::Value = serde_json::from_slice(&seed_submit.stdout).context("parse seed submit json")?;
+    let seed_job_id = seed_json["job_id"]
+        .as_str()
+        .context("seed submit json must carry a job_id")?
+        .to_owned();
+
+    let attach = sandy(&daemon, &["daemon", "attach", &seed_job_id, "-o", "json"])?;
+    assert_eq!(attach.status.code(), Some(0), "attach stderr: {}", stderr_of(&attach));
+    let attach_json: serde_json::Value = serde_json::from_slice(&attach.stdout).context("parse attach json")?;
+    let cap_b64 = attach_json["cap"].as_str().context("attach json must carry a cap")?;
+    let cap_file = tmp.path().join("cap.txt");
+    std::fs::write(&cap_file, cap_b64).context("write cap file")?;
+    let cap_file = cap_file.to_str().context("cap file path is utf8")?;
+
+    // `sandy_fabric::types::ChannelId` is a one-field newtype, so it
+    // serializes transparently as the bare string, not `[seed_job_id]`.
+    let manifest_json = serde_json::json!({
+        "entrypoint": {"command": ["true"]},
+        "requested_caps": [{
+            "channel_id": seed_job_id,
+            "rights": {"post": false, "read": true, "invite": false},
+        }],
+    });
+    let manifest_path = tmp.path().join("manifest.json");
+    std::fs::write(&manifest_path, serde_json::to_vec(&manifest_json)?).context("write manifest json")?;
+
+    let submit = sandy(
+        &daemon,
+        &[
+            "daemon",
+            "submit",
+            manifest_path.to_str().context("manifest path is utf8")?,
+            "--manifest-encoding",
+            "sandy.orchestrator.v1.JobManifest+json",
+            "--isolation-class",
+            "trusted",
+            "--cap-file",
+            cap_file,
+            "-o",
+            "json",
+        ],
+    )?;
+    assert_eq!(
+        submit.status.code(),
+        Some(0),
+        "a read-only request strictly narrower than the attach cap's post+read must be granted: {}",
+        stderr_of(&submit)
+    );
+    let submit_json: serde_json::Value = serde_json::from_slice(&submit.stdout).context("parse submit json")?;
+    assert!(
+        submit_json["job_id"].as_str().is_some_and(|id| !id.is_empty()),
+        "got {submit_json:?}"
+    );
+    Ok(())
+}
