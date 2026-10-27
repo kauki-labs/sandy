@@ -23,6 +23,15 @@
 # Re-enabling crates.io later: flip `publish` back to `true` here once the
 # bootstrap (manual first publish + trusted-publisher registration per crate)
 # is done — see CONTRIBUTING.md's publishing section.
+#
+# `git_only` on the three binaries (below): with `publish = false` workspace-
+# wide, release-plz's default version-baseline lookup (the cargo registry)
+# never reflects anything, since nothing is published there. `git_only = true`
+# makes it read the binaries' own GitHub tags instead, so a release-pr doesn't
+# re-bundle changes a prior GitHub-only release already tagged. Library crates
+# have no tags either (git_tag_enable = false above) and stay untracked until
+# crates.io publishing resumes — an accepted limitation of the deferral, not a
+# new problem this introduces.
 
 [workspace]
 # Library crates: no standalone git tag or GitHub release. Tags and GitHub
@@ -45,13 +54,16 @@ git_tag_name = "{{ package }}-{{ version }}"
 name = "sandy-cli"
 git_release_enable = true
 git_tag_enable = true
+git_only = true
 
 [[package]]
 name = "sandyd"
 git_release_enable = true
 git_tag_enable = true
+git_only = true
 
 [[package]]
 name = "sandy-agent"
 git_release_enable = true
 git_tag_enable = true
+git_only = true

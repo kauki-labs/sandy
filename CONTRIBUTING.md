@@ -77,23 +77,35 @@ nix flake check -L               # the full gate: build, clippy, docs, tests, fo
 ## Releases
 
 Releases are automated by [release-plz](https://release-plz.dev). A version bump
-reaching `main` opens the release (tag, GitHub release, and a crates.io publish
-of `sandy-lib` / `sandy-backend` / `sandy-cli` in dependency order); you do not
-tag or publish by hand. release-plz also keeps a prepared bump PR open with the
-changelog.
+reaching `main` opens the release; you do not tag or publish by hand.
+release-plz also keeps a prepared bump PR open with the changelog.
 
-Publishing uses crates.io [trusted publishing](https://crates.io/docs/trusted-publishing):
-the release job mints a short-lived token from GitHub's OIDC identity, so there
-is no long-lived `CARGO_REGISTRY_TOKEN` in the repo. This is configured for
-`kauki-labs/sandy`'s own crates.io namespace (`sandy-lib`, `sandy-backend`,
-`sandy-cli`) only — it is not something a fork inherits. If you want to
-contribute, open a PR here rather than publishing your own crates under these
-names. If you're standing up your own deployment or a derivative project under
-the license (see [COMMERCIAL.md](COMMERCIAL.md) if the AGPL's terms don't fit
-your use), you'll register your own repo and workflow as a Trusted Publisher
-against your own crates.io namespace, likely under different crate names since
-these ones are already taken; until that's set up on your side, the publish
-step fails closed in your fork too.
+**Currently GitHub releases only** (`release-plz.toml`): each binary
+(`sandy-cli`, `sandyd`, `sandy-agent`) gets its own version, tag, and GitHub
+release. crates.io publishing is deferred — `publish = false` workspace-wide —
+until the trusted-publishing bootstrap below is done.
+
+**crates.io bootstrap (not yet done; `kauki-labs/sandy` maintainer-only),
+needed before `publish` flips back to `true`:**
+
+1. [Trusted publishing](https://crates.io/docs/trusted-publishing) can't
+   perform a crate's _first_ publish — each publishable crate needs one
+   manual `cargo publish` (with a real token), in dependency order, before it
+   exists on crates.io at all.
+2. Once published once, register this repo + the `Release` workflow as a
+   Trusted Publisher for that crate on crates.io — the release job then mints
+   a short-lived OIDC token per run, so there's no long-lived
+   `CARGO_REGISTRY_TOKEN` in the repo.
+3. Repeat for every publishable crate, then flip `release-plz.toml`'s
+   `publish` back to `true`.
+
+This bootstrap is scoped to `kauki-labs/sandy`'s own crates.io namespace — not
+something a fork inherits. If you want to contribute, open a PR here rather
+than publishing your own crates under these names. If you're standing up your
+own deployment or a derivative project under the license (see
+[COMMERCIAL.md](COMMERCIAL.md) if the AGPL's terms don't fit your use), you'll
+run this same bootstrap against your own crates.io namespace, likely under
+different crate names since these ones are already taken.
 
 ## Conduct
 
