@@ -275,6 +275,32 @@ pub async fn handle(
             // that can never run, with no distinct status a caller could
             // ever notice (item 5's "never silently" bar).
             let required_sandbox_kind = required_sandbox_kind_for(&submit.manifest_encoding);
+
+            // #381 (CodeRabbit on this PR): the process kind never admits an
+            // untrusted job (`process-containment.md` decision 6) — refuse
+            // here, before `pick_host_for` or any persistence, rather than
+            // letting an Untrusted+non-Vm submission reach placement. Without
+            // this, a host that declares BOTH `Untrusted` and `Process`
+            // (every `Vm`-capable host does — `Process` stays additive, see
+            // `to_wire_capabilities`) would satisfy `pick_host_for`, and the
+            // job would be placed and dispatched with `backend == Process`
+            // only to be refused by the host-executor's own re-check —
+            // technically fail-closed, but a wasted dispatch round trip
+            // instead of a clean Submit-time refusal.
+            if required_isolation_class == IsolationClass::Untrusted && required_sandbox_kind != SandboxKind::Vm {
+                return Ok(ControlResponse {
+                    request_id: request.request_id,
+                    result: Some(control_response::Result::Error(ControlError {
+                        message: format!(
+                            "an Untrusted job requires a Vm-backed manifest encoding (e.g. flake/v1); \
+                             manifest_encoding {:?} resolves to SandboxKind::{required_sandbox_kind:?}, which can \
+                             never satisfy Untrusted",
+                            submit.manifest_encoding
+                        ),
+                    })),
+                });
+            }
+
             // Named apart from `placeable` itself (CodeRabbit on this PR): the
             // original message always blamed "no Vm-capable host," even when
             // the real cause was this orchestrator's own configuration
@@ -2590,12 +2616,13 @@ mod tests {
         Ok(())
     }
 
-    /// Adversarial (#381 acceptance): an `Untrusted`-required submit with
-    /// only a process-capable host registered is refused OUTRIGHT, creating
-    /// no job — same "never silently stay Pending" bar decision 18 already
-    /// holds for an unplaced `flake/v1` job, now extended to the isolation-
-    /// class dimension: the process backend never admits an untrusted job,
-    /// so this job has no local fallback either.
+    /// Adversarial (#381 acceptance): a Vm-encoded `Untrusted`-required submit
+    /// with only a plain process-capable host registered (no `Vm`, no
+    /// `Untrusted`) is refused OUTRIGHT at placement, creating no job — same
+    /// "never silently stay Pending" bar decision 18 already holds for an
+    /// unplaced `flake/v1` job, now extended to the isolation-class
+    /// dimension: the process backend never admits an untrusted job, so this
+    /// job has no local fallback either.
     #[tokio::test]
     async fn an_untrusted_submit_with_only_a_process_capable_host_is_refused_and_creates_no_job() -> anyhow::Result<()>
     {
@@ -2610,7 +2637,7 @@ mod tests {
             &host_registry,
             Some(forward_back),
             test_session(),
-            submit_req_untrusted_argv(1),
+            submit_req_untrusted_flake(1),
         )
         .await?;
         match response.result {
@@ -2619,6 +2646,66 @@ mod tests {
             }
             other => anyhow::bail!("expected a refusal, got {other:?}"),
         }
+
+        let list = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            req(2, control_request::Op::List(ListRequest {})),
+        )
+        .await?;
+        match list.result {
+            Some(control_response::Result::List(ListResponse { jobs })) => {
+                assert!(
+                    jobs.is_empty(),
+                    "a refused untrusted submit must create no job: {jobs:?}"
+                );
+            }
+            other => anyhow::bail!("expected a List response, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// Adversarial (CodeRabbit on this PR): an `Untrusted`-required submit
+    /// whose `manifest_encoding` resolves to `SandboxKind::Process` (the
+    /// `argv/v1`/`test/v1` default, never `Vm`) is refused BEFORE
+    /// `pick_host_for` or any persistence — even with a host registered that
+    /// declares both `Untrusted` and `Process` (every `Vm`-capable host does,
+    /// since `Process` stays additive). Without this guard, such a host would
+    /// satisfy `pick_host_for(Untrusted, Process)` and the job would be
+    /// placed and dispatched with `backend == Process`, only to be refused by
+    /// the host-executor's own re-check later — a wasted round trip instead
+    /// of a clean Submit-time refusal.
+    #[tokio::test]
+    async fn an_untrusted_submit_with_a_non_vm_encoding_is_refused_before_placement_and_creates_no_job()
+    -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let mut dispatch_rx = register_test_host(&host_registry, "ws01", peer_ip, vm_untrusted_host_capabilities());
+
+        let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            submit_req_untrusted_argv(1),
+        )
+        .await?;
+        match response.result {
+            Some(control_response::Result::Error(ControlError { message })) => {
+                assert!(message.contains("Untrusted"), "got {message:?}");
+                assert!(message.contains("Vm"), "got {message:?}");
+            }
+            other => anyhow::bail!("expected a refusal, got {other:?}"),
+        }
+        assert!(
+            dispatch_rx.try_recv().is_err(),
+            "a Process-encoded Untrusted submit must never reach dispatch, even on a Vm+Untrusted-capable host"
+        );
 
         let list = handle(
             &store,
