@@ -20,9 +20,11 @@
 #   - A binary's MAJOR version must track sandy-lib's major (enforced by the
 #     binary-version-alignment check in .github/workflows/pr.yaml).
 #
-# Re-enabling crates.io later: flip `publish` back to `true` here once the
-# bootstrap (manual first publish + trusted-publisher registration per crate)
-# is done — see CONTRIBUTING.md's publishing section.
+# Re-enabling crates.io later: flip `publish` back to `true` here AND remove
+# the three binaries' `git_only = true` lines below (release-plz treats
+# `publish = true` with `git_only = true` as an error) once the bootstrap
+# (manual first publish + trusted-publisher registration per crate) is done —
+# see CONTRIBUTING.md's publishing section.
 #
 # `git_only` on the three binaries (below): with `publish = false` workspace-
 # wide, release-plz's default version-baseline lookup (the cargo registry)

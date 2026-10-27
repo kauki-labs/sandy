@@ -92,12 +92,16 @@ needed before `publish` flips back to `true`:**
    perform a crate's _first_ publish — each publishable crate needs one
    manual `cargo publish` (with a real token), in dependency order, before it
    exists on crates.io at all.
-2. Once published once, register this repo + the `Release` workflow as a
-   Trusted Publisher for that crate on crates.io — the release job then mints
-   a short-lived OIDC token per run, so there's no long-lived
+2. Once published once, register this repo + the workflow **file**
+   `.github/workflows/release.yaml` (crates.io binds to the filename, not its
+   `name: Release` display label — entering `Release` fails the OIDC
+   exchange) as a Trusted Publisher for that crate — the release job then
+   mints a short-lived OIDC token per run, so there's no long-lived
    `CARGO_REGISTRY_TOKEN` in the repo.
-3. Repeat for every publishable crate, then flip `release-plz.toml`'s
-   `publish` back to `true`.
+3. Repeat for every publishable crate, then in `release-plz.toml`: flip
+   `publish` back to `true`, **and** remove the three binaries'
+   `git_only = true` lines — release-plz treats `publish = true` together
+   with `git_only = true` as an error, so both have to change together.
 
 This bootstrap is scoped to `kauki-labs/sandy`'s own crates.io namespace — not
 something a fork inherits. If you want to contribute, open a PR here rather
