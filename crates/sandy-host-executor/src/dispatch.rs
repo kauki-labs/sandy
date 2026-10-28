@@ -42,6 +42,7 @@ use sandy_fabric_local::mesh_link::relay_agent_link;
 use sandy_guest_template::manifest::MANIFEST_ENCODING_FLAKE_V1;
 use sandy_impls_local::ProcessBackend;
 use sandy_impls_vm::QemuBackend;
+use serde::Deserialize;
 
 /// The `Dispatch.manifest_encoding` tag stage 1 understands for a
 /// `SandboxKind::Process` dispatch: the manifest is a JSON array of strings,
@@ -108,19 +109,32 @@ fn is_timeout(err: &anyhow::Error) -> bool {
         .any(|io_err| io_err.kind() == std::io::ErrorKind::TimedOut)
 }
 
-/// Realign `control`'s deadline to a fresh [`STAGE1_TIMEOUT_SECS`] budget from
-/// now, so a VM dispatch's run and agent-link relay (`relay_agent_link`,
-/// which follows this same `control` live) don't start already past a
-/// deadline that flake resolution (up to `FLAKE_RESOLVE_TIMEOUT_SECS`, longer
-/// than `STAGE1_TIMEOUT_SECS`) ate into (CodeRabbit on #344). Only ever bumps
-/// a currently FINITE deadline forward: a suspended (attached) control is
-/// left alone, since "unlimited while attached" already covers it — the same
-/// rule `run_dispatch_loop`'s own shutdown fail-safe applies.
-fn realign_deadline_after_flake_resolution(control: &RunControl) {
-    if control.deadline().is_some() {
-        control
-            .set_deadline(std::time::Instant::now() + std::time::Duration::from_secs(u64::from(STAGE1_TIMEOUT_SECS)));
-    }
+/// `timeout_secs`'s default AND ceiling (manifest-parity #480, `sandyd.md`
+/// §19): a manifest requesting more than [`STAGE1_TIMEOUT_SECS`] is clamped
+/// to it, never honored past the host's own bound; a manifest requesting
+/// none gets the ceiling itself as the default (today's unchanged behavior).
+fn clamp_timeout_secs(requested: Option<u32>) -> u32 {
+    requested.map_or(STAGE1_TIMEOUT_SECS, |t| t.min(STAGE1_TIMEOUT_SECS))
+}
+
+/// Set `control`'s deadline to a fresh `timeout_secs`-second budget from now.
+/// `RunSpec.timeout_secs` only seeds a *newly constructed* `RunControl`
+/// (`impls/local/src/process.rs`'s own doc) — every backend actually
+/// enforces the budget by reading `spec.control` live, so a manifest's
+/// clamped request has to reach the ALREADY-CONSTRUCTED `control`
+/// `handle_dispatch`'s caller passed in, not merely `RunSpec.timeout_secs`
+/// itself. Used right after decode (both branches), and again after a VM
+/// dispatch's flake resolution (up to `FLAKE_RESOLVE_TIMEOUT_SECS`, longer
+/// than `STAGE1_TIMEOUT_SECS`) to undo however much of the original budget
+/// that resolution step ate into (CodeRabbit on #344). Delegates to
+/// [`RunControl::set_deadline_if_finite`] for the check-then-set as ONE
+/// locked operation: a suspended (attached) control is left alone, since
+/// "unlimited while attached" already covers it, and doing the check and the
+/// set as two separate calls would race a concurrent `suspend_deadline()`
+/// landing in between them, silently reinstating a deadline attach just
+/// lifted (CodeRabbit on #487).
+fn set_deadline_from_timeout_secs(control: &RunControl, timeout_secs: u32) {
+    control.set_deadline_if_finite(std::time::Instant::now() + std::time::Duration::from_secs(u64::from(timeout_secs)));
 }
 
 /// The `SANDY_HISTORY_LINES` env entry for a flake/v1 dispatch's
@@ -141,26 +155,93 @@ fn history_lines_env(history_lines: u32) -> [(String, String); 1] {
     [("SANDY_HISTORY_LINES".to_owned(), history_lines.to_string())]
 }
 
-/// Decode `Dispatch.manifest` into the argv this host will run, per
-/// `manifest_encoding`. The only encoding stage 1 understands is
-/// [`MANIFEST_ENCODING_ARGV_V1`]; anything else — including an empty tag —
-/// is refused rather than guessed at.
+/// An `argv/v1` manifest's decoded shape (manifest-parity #480, `sandyd.md`
+/// §19): a bare `["cmd", "arg", ...]` array still decodes, with every field
+/// but `command` absent — the backward-compat form `scripts/cross-machine-
+/// smoke.sh`, the host-executor manual smoke test, and `README.md`'s own
+/// usage example all construct by hand against a real remote host-executor.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArgvManifestV1Fields {
+    command: Vec<String>,
+    #[serde(default)]
+    env: Vec<(String, String)>,
+    #[serde(default)]
+    cpu: Option<u32>,
+    #[serde(default)]
+    mem: Option<u32>,
+    #[serde(default)]
+    timeout_secs: Option<u32>,
+}
+
+/// The wire shape `argv/v1` accepts: the historical bare array, or the
+/// object form carrying the manifest-parity fields. `untagged` tries each
+/// variant in order; a JSON array only ever matches [`Self::Bare`], a JSON
+/// object only ever matches [`Self::Full`] — the two shapes never collide.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(untagged)]
+enum ArgvManifestV1Wire {
+    Bare(Vec<String>),
+    Full(ArgvManifestV1Fields),
+}
+
+/// An `argv/v1` manifest, normalized to one shape regardless of which wire
+/// form it decoded from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArgvManifest {
+    /// The command and its arguments, `argv[0]` first.
+    pub command: Vec<String>,
+    /// Extra environment entries for the job (manifest-parity #480). Merged
+    /// ahead of the plumbing env `ProcessBackend` itself sets (share dirs,
+    /// the containment passthrough list), which always applies last and
+    /// wins a key collision.
+    pub env: Vec<(String, String)>,
+    /// A request for vCPUs; `None` keeps the backend's own default.
+    pub cpu: Option<u32>,
+    /// A request for memory in MiB; `None` keeps the backend's own default.
+    pub mem: Option<u32>,
+    /// A request for the run's wall-clock budget in seconds, clamped to the
+    /// host's ceiling ([`STAGE1_TIMEOUT_SECS`]). `None` keeps the host's
+    /// default.
+    pub timeout_secs: Option<u32>,
+}
+
+/// Decode `Dispatch.manifest` into the argv (plus manifest-parity fields)
+/// this host will run, per `manifest_encoding`. The only encoding stage 1
+/// understands is [`MANIFEST_ENCODING_ARGV_V1`]; anything else — including
+/// an empty tag — is refused rather than guessed at.
 ///
 /// # Errors
 /// See [`DispatchError`]'s `UnrecognizedManifestEncoding`,
 /// `MalformedManifest`, and `EmptyCommand` variants.
-pub fn decode_argv_manifest(manifest_encoding: &str, manifest: &[u8]) -> Result<Vec<String>, DispatchError> {
+pub fn decode_argv_manifest(manifest_encoding: &str, manifest: &[u8]) -> Result<ArgvManifest, DispatchError> {
     if manifest_encoding != MANIFEST_ENCODING_ARGV_V1 {
         return Err(DispatchError::UnrecognizedManifestEncoding(
             manifest_encoding.to_owned(),
         ));
     }
-    let argv: Vec<String> =
+    let wire: ArgvManifestV1Wire =
         serde_json::from_slice(manifest).map_err(|e| DispatchError::MalformedManifest(e.to_string()))?;
-    if argv.is_empty() {
+    let decoded = match wire {
+        ArgvManifestV1Wire::Bare(command) => ArgvManifest {
+            command,
+            env: Vec::new(),
+            cpu: None,
+            mem: None,
+            timeout_secs: None,
+        },
+        ArgvManifestV1Wire::Full(fields) => ArgvManifest {
+            command: fields.command,
+            env: fields.env,
+            cpu: fields.cpu,
+            mem: fields.mem,
+            timeout_secs: fields.timeout_secs,
+        },
+    };
+    if decoded.command.is_empty() {
         return Err(DispatchError::EmptyCommand);
     }
-    Ok(argv)
+    Ok(decoded)
 }
 
 /// Decode `Dispatch.manifest` into a
@@ -381,7 +462,9 @@ pub fn handle_dispatch(
 
     match ProtoSandboxKind::try_from(dispatch.backend).ok() {
         Some(ProtoSandboxKind::Process) => {
-            let argv = decode_argv_manifest(&dispatch.manifest_encoding, &dispatch.manifest)?;
+            let decoded = decode_argv_manifest(&dispatch.manifest_encoding, &dispatch.manifest)?;
+            let timeout_secs = clamp_timeout_secs(decoded.timeout_secs);
+            set_deadline_from_timeout_secs(&control, timeout_secs);
             let backend = ProcessBackend::with_containment(containment).with_agent(AgentLaunch {
                 program: agent_program,
                 on_link,
@@ -390,14 +473,14 @@ pub fn handle_dispatch(
                 digests: false,
                 egress: None,
                 template: &dispatch.job_id,
-                command: &argv,
+                command: &decoded.command,
                 inputs: &[],
                 outputs: &[],
                 secrets: &[],
-                env: &[],
-                cpu: None,
-                mem: None,
-                timeout_secs: STAGE1_TIMEOUT_SECS,
+                env: &decoded.env,
+                cpu: decoded.cpu,
+                mem: decoded.mem,
+                timeout_secs,
                 grants: &grants,
                 // Exit comes from the agent's own report (INV-11), never an
                 // outcome file; `ProcessBackend` doesn't read this field at
@@ -445,11 +528,11 @@ pub fn handle_dispatch(
                 }
             })?;
             // Flake resolution can take up to FLAKE_RESOLVE_TIMEOUT_SECS (600s),
-            // longer than control's own STAGE1_TIMEOUT_SECS (300s) budget set
-            // when the worker popped this dispatch — without this, the VM's run
-            // and its agent-link relay could start already past their own
-            // deadline (CodeRabbit on #344).
-            realign_deadline_after_flake_resolution(&control);
+            // longer than control's own budget set when the worker popped this
+            // dispatch — without this, the VM's run and its agent-link relay
+            // could start already past their own deadline (CodeRabbit on #344).
+            let timeout_secs = clamp_timeout_secs(decoded.timeout_secs);
+            set_deadline_from_timeout_secs(&control, timeout_secs);
             let (template, _kept_topology_file) = match resolved {
                 sandy_guest_template::ResolvedTemplate::Direct(t) => (t, None),
                 sandy_guest_template::ResolvedTemplate::Prebuilt { path, _kept } => (path, Some(_kept)),
@@ -459,7 +542,13 @@ pub fn handle_dispatch(
                 program: agent_program,
                 on_link,
             });
-            let env = history_lines_env(decoded.history_lines);
+            // The manifest's own env first, the plumbing entry
+            // (`SANDY_HISTORY_LINES`) last so it always wins a key collision
+            // — the same precedence `impls/local/src/process.rs` already
+            // establishes for the process backend's share-dir/passthrough
+            // overlays (manifest-parity #480, `sandyd.md` §19).
+            let mut env = decoded.env.clone();
+            env.extend(history_lines_env(decoded.history_lines));
             let spec = RunSpec {
                 digests: false,
                 egress: None,
@@ -469,9 +558,9 @@ pub fn handle_dispatch(
                 outputs: &[],
                 secrets: &[],
                 env: &env,
-                cpu: None,
-                mem: None,
-                timeout_secs: STAGE1_TIMEOUT_SECS,
+                cpu: decoded.cpu,
+                mem: decoded.mem,
+                timeout_secs,
                 grants: &grants,
                 outcome_file: None,
                 secret_dir: None,
@@ -527,7 +616,7 @@ mod tests {
     /// by slow flake resolution must be realigned forward, not left expired
     /// before the VM run (and its agent-link relay) has even started.
     #[test]
-    fn realign_deadline_after_flake_resolution_bumps_an_already_passed_finite_deadline_forward() {
+    fn set_deadline_from_timeout_secs_bumps_an_already_passed_finite_deadline_forward() {
         let control =
             sandy_api::backend::RunControl::new(std::time::Instant::now() - std::time::Duration::from_secs(1));
         assert!(
@@ -535,7 +624,7 @@ mod tests {
             "the deadline must already be in the past for this test to be meaningful"
         );
 
-        realign_deadline_after_flake_resolution(&control);
+        set_deadline_from_timeout_secs(&control, STAGE1_TIMEOUT_SECS);
 
         assert!(
             !control.timed_out(),
@@ -544,21 +633,36 @@ mod tests {
     }
 
     /// Regression (CodeRabbit on #344): an attached (suspended) job's
-    /// deadline must stay suspended — flake resolution finishing is not a
-    /// reason to reinstate a bound "unlimited while attached" already lifted.
+    /// deadline must stay suspended — a fresh timeout is not a reason to
+    /// reinstate a bound "unlimited while attached" already lifted.
     #[test]
-    fn realign_deadline_after_flake_resolution_leaves_a_suspended_control_alone() {
+    fn set_deadline_from_timeout_secs_leaves_a_suspended_control_alone() {
         let control = sandy_api::backend::RunControl::with_timeout_secs(60);
         control.suspend_deadline();
         assert_eq!(control.deadline(), None);
 
-        realign_deadline_after_flake_resolution(&control);
+        set_deadline_from_timeout_secs(&control, STAGE1_TIMEOUT_SECS);
 
         assert_eq!(
             control.deadline(),
             None,
             "a suspended control must stay suspended, not be given a new finite deadline"
         );
+    }
+
+    #[test]
+    fn clamp_timeout_secs_keeps_a_request_under_the_ceiling() {
+        assert_eq!(clamp_timeout_secs(Some(60)), 60);
+    }
+
+    #[test]
+    fn clamp_timeout_secs_clamps_a_request_over_the_ceiling() {
+        assert_eq!(clamp_timeout_secs(Some(STAGE1_TIMEOUT_SECS + 1)), STAGE1_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn clamp_timeout_secs_defaults_to_the_ceiling_when_unrequested() {
+        assert_eq!(clamp_timeout_secs(None), STAGE1_TIMEOUT_SECS);
     }
 
     #[test]
@@ -632,11 +736,62 @@ mod tests {
         );
     }
 
+    /// The historical bare-array shape (`scripts/cross-machine-smoke.sh`,
+    /// `docs/design/host-executor/spec.md`'s manual smoke test, and
+    /// `README.md`'s own usage example all construct this by hand) must keep
+    /// decoding unchanged, with every manifest-parity field absent.
     #[test]
-    fn an_argv_v1_manifest_decodes_to_its_command_and_args() -> anyhow::Result<()> {
+    fn a_bare_array_manifest_decodes_to_its_command_with_no_parity_fields() -> anyhow::Result<()> {
         let manifest = serde_json::to_vec(&["echo", "hello"])?;
-        let argv = decode_argv_manifest(MANIFEST_ENCODING_ARGV_V1, &manifest)?;
-        assert_eq!(argv, vec!["echo".to_string(), "hello".to_string()]);
+        let decoded = decode_argv_manifest(MANIFEST_ENCODING_ARGV_V1, &manifest)?;
+        assert_eq!(decoded.command, vec!["echo".to_string(), "hello".to_string()]);
+        assert_eq!(decoded.env, Vec::<(String, String)>::new());
+        assert_eq!(decoded.cpu, None);
+        assert_eq!(decoded.mem, None);
+        assert_eq!(decoded.timeout_secs, None);
+        Ok(())
+    }
+
+    /// The object shape (manifest-parity #480) decodes every field.
+    #[test]
+    fn an_object_manifest_decodes_its_parity_fields() -> anyhow::Result<()> {
+        let manifest = serde_json::json!({
+            "command": ["echo", "hello"],
+            "env": [["FOO", "bar"]],
+            "cpu": 4,
+            "mem": 2048,
+            "timeout_secs": 120,
+        });
+        let decoded = decode_argv_manifest(MANIFEST_ENCODING_ARGV_V1, &serde_json::to_vec(&manifest)?)?;
+        assert_eq!(decoded.command, vec!["echo".to_string(), "hello".to_string()]);
+        assert_eq!(decoded.env, vec![("FOO".to_string(), "bar".to_string())]);
+        assert_eq!(decoded.cpu, Some(4));
+        assert_eq!(decoded.mem, Some(2048));
+        assert_eq!(decoded.timeout_secs, Some(120));
+        Ok(())
+    }
+
+    /// Object-shape fields besides `command` are each optional, same
+    /// forward-compat contract `flake/v1`'s own `history_lines` established.
+    #[test]
+    fn an_object_manifest_with_only_command_defaults_the_rest() -> anyhow::Result<()> {
+        let manifest = serde_json::json!({ "command": ["echo"] });
+        let decoded = decode_argv_manifest(MANIFEST_ENCODING_ARGV_V1, &serde_json::to_vec(&manifest)?)?;
+        assert_eq!(decoded.env, Vec::<(String, String)>::new());
+        assert_eq!(decoded.cpu, None);
+        assert_eq!(decoded.mem, None);
+        assert_eq!(decoded.timeout_secs, None);
+        Ok(())
+    }
+
+    /// An unrecognized field is refused, not silently dropped (manifest-parity
+    /// spec #459 item 1).
+    #[test]
+    fn an_object_manifest_with_an_unknown_field_is_refused() -> anyhow::Result<()> {
+        let manifest = serde_json::json!({ "command": ["echo"], "bogus": 1 });
+        let err = decode_argv_manifest(MANIFEST_ENCODING_ARGV_V1, &serde_json::to_vec(&manifest)?)
+            .expect_err("an unknown field must be refused, not dropped");
+        assert!(matches!(err, DispatchError::MalformedManifest(_)));
         Ok(())
     }
 

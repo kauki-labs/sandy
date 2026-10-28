@@ -99,6 +99,26 @@ impl RunControl {
         self.0.generation.fetch_add(1, Ordering::SeqCst);
     }
 
+    /// Set the deadline to `at`, but only if one is currently set — never
+    /// reinstate a deadline a concurrent [`Self::suspend_deadline`] call
+    /// lifted. The check-then-set is one locked critical section, not two
+    /// separate calls: a caller doing `if control.deadline().is_some() {
+    /// control.set_deadline(at) }` has a window between the read and the
+    /// write where another thread's `suspend_deadline()` is silently
+    /// overwritten (CodeRabbit on #487) — the exact race the
+    /// unlimited-while-attached policy exists to prevent. Returns whether a
+    /// deadline was actually set.
+    pub fn set_deadline_if_finite(&self, at: Instant) -> bool {
+        let mut deadline = self.0.deadline.lock().unwrap_or_else(PoisonError::into_inner);
+        if deadline.is_some() {
+            *deadline = Some(at);
+            self.0.generation.fetch_add(1, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    }
+
     /// The currently enforced deadline, if any (`None` while suspended).
     #[must_use]
     pub fn deadline(&self) -> Option<Instant> {
@@ -519,5 +539,27 @@ mod tests {
             "{neither}"
         );
         assert!(neither.contains("before the guest booted"), "{neither}");
+    }
+
+    #[test]
+    fn set_deadline_if_finite_sets_a_finite_deadline() {
+        let control = RunControl::with_timeout_secs(60);
+        let later = Instant::now() + std::time::Duration::from_secs(120);
+        assert!(control.set_deadline_if_finite(later));
+        assert_eq!(control.deadline(), Some(later));
+    }
+
+    /// The race CodeRabbit flagged on #487: a suspended control must never
+    /// have its deadline reinstated by a later `set_deadline_if_finite`
+    /// call, even one computed before the suspend happened.
+    #[test]
+    fn set_deadline_if_finite_leaves_a_suspended_control_alone() {
+        let control = RunControl::with_timeout_secs(60);
+        control.suspend_deadline();
+        assert_eq!(control.deadline(), None);
+
+        let later = Instant::now() + std::time::Duration::from_secs(120);
+        assert!(!control.set_deadline_if_finite(later));
+        assert_eq!(control.deadline(), None, "a suspended control must stay suspended");
     }
 }

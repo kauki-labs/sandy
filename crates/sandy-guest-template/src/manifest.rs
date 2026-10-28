@@ -14,7 +14,11 @@ pub const MANIFEST_ENCODING_FLAKE_V1: &str = "flake/v1";
 
 /// A `flake/v1` manifest's decoded shape: everything
 /// [`crate::resolve_flake_template`] needs, plus the guest command.
+///
+/// `deny_unknown_fields`: an unrecognized field is refused, never silently
+/// dropped (manifest-parity spec #459 item 1, decision `sandyd.md` §19).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FlakeManifestV1 {
     /// The flake reference `--flake` named (a path, `github:…`, or any other
     /// `nix` installable flake-ref syntax) — resolved by the EXECUTOR against
@@ -37,6 +41,25 @@ pub struct FlakeManifestV1 {
     /// default matches what a consumer should assume absent any override.
     #[serde(default = "default_history_lines")]
     pub history_lines: u32,
+    /// Extra environment entries for the guest job (manifest-parity #480,
+    /// `sandyd.md` §19). Merged ahead of the plumbing env this crate's own
+    /// callers set (e.g. `SANDY_HISTORY_LINES`), which always applies last
+    /// and wins a key collision.
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
+    /// A request for vCPUs, clamped by `resolve_flake_template`'s caller
+    /// against the executing host's own topology default. `None` keeps the
+    /// template's own default.
+    #[serde(default)]
+    pub cpu: Option<u32>,
+    /// A request for guest memory in MiB, same clamping rule as [`Self::cpu`].
+    #[serde(default)]
+    pub mem: Option<u32>,
+    /// A request for the run's wall-clock budget in seconds, clamped to the
+    /// host's ceiling (`STAGE1_TIMEOUT_SECS` today). `None` keeps the host's
+    /// default.
+    #[serde(default)]
+    pub timeout_secs: Option<u32>,
 }
 
 /// [`FlakeManifestV1::history_lines`]'s default (10,000) — also `sandy
@@ -79,6 +102,10 @@ mod tests {
             attr: Some("default".to_owned()),
             command: vec!["sh".to_owned()],
             history_lines: 5_000,
+            env: vec![("FOO".to_owned(), "bar".to_owned())],
+            cpu: Some(4),
+            mem: Some(2_048),
+            timeout_secs: Some(120),
         };
         let bytes = encode_flake_manifest(&manifest)?;
         assert_eq!(decode_flake_manifest(&bytes)?, manifest);
@@ -96,10 +123,37 @@ mod tests {
             attr: None,
             command: Vec::new(),
             history_lines: default_history_lines(),
+            env: Vec::new(),
+            cpu: None,
+            mem: None,
+            timeout_secs: None,
         };
         let bytes = encode_flake_manifest(&manifest)?;
         assert_eq!(decode_flake_manifest(&bytes)?, manifest);
         Ok(())
+    }
+
+    /// A manifest encoded before `env`/`cpu`/`mem`/`timeout_secs` existed (no
+    /// fields in the JSON at all, same as a pre-#480 sender) must still
+    /// decode, each field absent — the same forward-compat contract
+    /// `history_lines` already established.
+    #[test]
+    fn a_manifest_with_no_parity_fields_defaults_them_absent() -> Result<(), serde_json::Error> {
+        let legacy_json = br#"{"flake":"./fixture","kind":null,"attr":null,"command":[],"history_lines":10000}"#;
+        let decoded = decode_flake_manifest(legacy_json)?;
+        assert_eq!(decoded.env, Vec::<(String, String)>::new());
+        assert_eq!(decoded.cpu, None);
+        assert_eq!(decoded.mem, None);
+        assert_eq!(decoded.timeout_secs, None);
+        Ok(())
+    }
+
+    /// An unrecognized field is refused, not silently dropped (manifest-parity
+    /// spec #459 item 1).
+    #[test]
+    fn an_unknown_field_is_refused() {
+        let json = br#"{"flake":"./fixture","kind":null,"attr":null,"command":[],"history_lines":10000,"bogus":1}"#;
+        assert!(decode_flake_manifest(json).is_err());
     }
 
     /// Malformed bytes are refused, not silently defaulted.

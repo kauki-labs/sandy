@@ -223,6 +223,23 @@ enum DaemonOp {
         /// to this many lines.
         #[arg(long, requires = "flake", default_value_t = sandy_guest_template::manifest::default_history_lines())]
         history_lines: u32,
+        /// `--env KEY=VALUE` for the job (repeatable, only meaningful with
+        /// `--flake`; manifest-parity #480).
+        #[arg(long = "env", requires = "flake")]
+        env: Vec<String>,
+        /// Optional vCPU count (only meaningful with `--flake`;
+        /// manifest-parity #480).
+        #[arg(long, requires = "flake")]
+        cpu: Option<u32>,
+        /// Optional memory budget in MiB (only meaningful with `--flake`;
+        /// manifest-parity #480).
+        #[arg(long, requires = "flake")]
+        mem: Option<u32>,
+        /// Optional wall-clock timeout in seconds, clamped to the executing
+        /// host's own ceiling (only meaningful with `--flake`;
+        /// manifest-parity #480).
+        #[arg(long, requires = "flake")]
+        timeout: Option<u32>,
         /// The trailing `-- CMD ARGS...` guest command (only meaningful with
         /// `--flake`; empty means "boot the template's default command").
         #[arg(last = true, requires = "flake")]
@@ -699,6 +716,30 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
         Vec::new()
     };
 
+    // CodeRabbit on this PR, same bar as `--cap-file` above: a malformed
+    // `--env` value is a pure client-side input error and must be refused
+    // the same way regardless of whether sandyd is reachable, not get a
+    // different exit band (`InfraFault` vs `InvalidPlan`) depending on
+    // daemon state.
+    let flake_env = if let DaemonOp::Submit {
+        env, flake: Some(_), ..
+    } = &op
+    {
+        match env
+            .iter()
+            .map(|raw| sandy_cli::plan::parse_env(raw))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(env) => env,
+            Err(e) => {
+                eprintln!("sandy: {e}");
+                return ProcessExit::InvalidPlan.code();
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     let socket = match daemon_socket_path() {
         Ok(socket) => socket,
         Err(e) => {
@@ -739,6 +780,10 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
             attr,
             kind,
             history_lines,
+            env: _,
+            cpu,
+            mem,
+            timeout,
             command,
             cap_files: _,
         } => {
@@ -752,6 +797,10 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
                     attr,
                     command,
                     history_lines,
+                    env: flake_env,
+                    cpu,
+                    mem,
+                    timeout_secs: timeout,
                 };
                 match sandy_guest_template::manifest::encode_flake_manifest(&manifest) {
                     Ok(bytes) => (
