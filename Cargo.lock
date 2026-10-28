@@ -2254,6 +2254,7 @@ dependencies = [
  "anyhow",
  "serde",
  "thiserror 2.0.21",
+ "zeroize",
 ]
 
 [[package]]
@@ -2423,6 +2424,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -2527,6 +2529,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
