@@ -26,7 +26,7 @@ use std::{
 
 use sandy::{
     BackendError, BoxState, Hypervisor, Outcome, RunSpec, ShareDirs, StoreBacking, Topology, VmBackend,
-    collect_outputs, ensure_sandy_staging_base, plan_shares, topology, wipe,
+    collect_outputs, ensure_sandy_staging_base, plan_shares, topology, wipe, with_digests,
 };
 use sandy_api::{
     agent::{AGENT_VSOCK_PORT, AgentLaunch},
@@ -250,6 +250,7 @@ impl VfkitBackend {
                 staged.agent_vsock = Some((AGENT_VSOCK_PORT, agent.socket.clone()));
                 agent_command = agent_command_argv(&agent.program, AGENT_VSOCK_PORT, spec.command);
                 agent_spec = RunSpec {
+                    digests: false,
                     command: &agent_command,
                     ..*spec
                 };
@@ -374,6 +375,7 @@ impl VmBackend for VfkitBackend {
 
         // Stage the shares via the shared policy, then boot on them. A staging
         // failure skips the boot but still wipes below (INV-1).
+        let mut input_digests = None;
         let outcome = plan_shares(
             spec,
             &ShareDirs {
@@ -382,14 +384,17 @@ impl VmBackend for VfkitBackend {
                 outputs_dir: &outputs_dir,
             },
         )
-        .and_then(|shares| self.boot(&topology, spec, run_id, &box_id, shares, agent.as_ref()));
+        .and_then(|plan| {
+            input_digests = plan.input_digests;
+            self.boot(&topology, spec, run_id, &box_id, plan.shares, agent.as_ref())
+        });
 
         // Collect outputs before wiping, only if the guest booted; a collection
         // failure surfaces as an infra fault rather than silently dropping output.
         let collected = if outcome.as_ref().is_ok_and(|o| o.booted) {
-            collect_outputs(spec.outputs, &outputs_dir)
+            collect_outputs(spec.outputs, &outputs_dir, spec.digests)
         } else {
-            Ok(())
+            Ok(None)
         };
 
         // Wipe staging on every path so secret bytes never outlive the run (INV-1).
@@ -404,7 +409,7 @@ impl VmBackend for VfkitBackend {
         {
             tracing::warn!(socket = %agent.socket.display(), %err, "failed to remove the agent socket");
         }
-        collected.and(outcome)
+        with_digests(outcome, input_digests, collected)
     }
 
     fn kill(&self, box_id: &str) -> Result<(), BackendError> {
@@ -469,6 +474,7 @@ mod tests {
         let command = ["true".to_string()];
         let grants = grants();
         let spec = RunSpec {
+            digests: false,
             egress: None,
             template: "demo",
             command: &command,
@@ -529,6 +535,7 @@ mod tests {
             source: SecretSource::File(PathBuf::from("/host/secret")),
         }];
         let spec = RunSpec {
+            digests: false,
             egress: None,
             template: "demo",
             command: &command,
@@ -577,6 +584,7 @@ mod tests {
         let command = ["true".to_string()];
         let grants = grants();
         let spec = RunSpec {
+            digests: false,
             egress: None,
             template: "demo",
             command: &command,
@@ -612,6 +620,7 @@ mod tests {
         let command = ["true".to_string()];
         let grants = grants();
         let spec = RunSpec {
+            digests: false,
             egress: None,
             template: "demo",
             command: &command,
@@ -642,6 +651,7 @@ mod tests {
 
     fn spec_for<'a>(template: &'a str, command: &'a [String], grants: &'a Grants) -> RunSpec<'a> {
         RunSpec {
+            digests: false,
             template,
             command,
             inputs: &[],
@@ -671,6 +681,7 @@ mod tests {
             shares: false,
         };
         let spec = RunSpec {
+            digests: false,
             egress: Some(&allow),
             ..spec_for("demo", &command, &grants)
         };
@@ -750,6 +761,7 @@ mod tests {
 
     fn booted(exit: Option<i32>) -> Outcome {
         Outcome {
+            digests: None,
             booted: true,
             guest_exit: exit,
             transport_error: None,
@@ -876,6 +888,7 @@ mod tests {
         let command = ["true".to_string()];
         let grants = grants();
         let spec = RunSpec {
+            digests: false,
             egress: None,
             template: "demo",
             command: &command,
@@ -915,6 +928,7 @@ mod tests {
         let control = sandy::RunControl::with_timeout_secs(5);
         control.suspend_deadline();
         let spec = RunSpec {
+            digests: false,
             egress: None,
             template: "demo",
             command: &command,
@@ -950,6 +964,7 @@ mod tests {
         let grants = grants();
         let control = sandy::RunControl::with_timeout_secs(120);
         let spec = RunSpec {
+            digests: false,
             egress: None,
             template: "demo",
             command: &command,

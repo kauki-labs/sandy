@@ -50,6 +50,7 @@ fn end_to_end() -> Result<(), String> {
         .map_err(|e| format!("journal ensure_dirs at {}: {e}", home.path().display()))?;
 
     let plan = JobPlan {
+        digests: false,
         egress_proxy: false,
         template: "acceptance-local".to_string(),
         command: vec!["true".to_string()],

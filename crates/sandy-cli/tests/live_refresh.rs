@@ -138,6 +138,7 @@ fn a_refreshed_token_reaches_the_running_guest() -> anyhow::Result<()> {
     let probe = r#"f=/run/sandy/secrets/GITHUB_TOKEN; a=$(cat "$f"); sleep 6; b=$(cat "$f"); [ -n "$a" ] && [ "$a" != "$b" ] && exit 0 || exit 7"#;
 
     let plan = JobPlan {
+        digests: false,
         egress_proxy: false,
         template: format!("{}#{}", guest_flake().display(), target.topology_attr),
         command: vec![probe.to_string()],

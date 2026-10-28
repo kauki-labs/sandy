@@ -175,6 +175,8 @@ pub(super) fn build_host_observed(
             job_started_at: None,
             teardown_at,
         },
+        // Filled by `run_job_core` from the backend's `Outcome` when `--digests` was given (#373).
+        input_digests: None,
     }
 }
 

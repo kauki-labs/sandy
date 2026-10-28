@@ -124,5 +124,20 @@ avoid breaking old records, so a retype was never on the table once that
 precedent is honored.
 
 **Consequences.** The locked key set grows by one key (`receipt`), schema `3`.
-Digests (#373), signing (#374), and filling `egress.attempts` from the #360
-proxy (#375) are explicitly out of this version.
+Digests (#373) landed in schema `4` (below); signing (#374) and filling
+`egress.attempts` from the #360 proxy (#375) are explicitly out of this version.
+
+### Content digests (#373)
+
+Opt-in (`sandy run --digests`, `RunSpec.digests`), because hashing a large
+output costs real time on every run. Input digests go in `host_observed`
+(`input_digests`) and are computed on the staged host copy before boot; output
+digests go in `guest_reported` (`outputs[].sha256`), since a hostile guest chose
+the content. Symlinks and special files that collection skips are recorded in
+`guest_reported.skipped_outputs`, not omitted. Every new field is
+`skip_serializing_if` empty/`None`, so a run without the flag serializes
+byte-for-byte as schema `3` did, and the schema is bumped to `4` per the
+decision 4 precedent. The staging dirs are wiped at teardown, so the backend
+computes the digests and carries them out through `Outcome.digests`. The
+collection ceiling stays a hard error (it never drops entries silently), so
+there is no "over ceiling" skip reason.

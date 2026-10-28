@@ -23,6 +23,7 @@ fn test_control() -> &'static RunControl {
 /// Build a `RunSpec` that runs `command` with no inputs/outputs/secrets.
 fn spec<'a>(command: &'a [String], grants: &'a Grants) -> RunSpec<'a> {
     RunSpec {
+        digests: false,
         egress: None,
         template: "contract",
         command,
@@ -43,6 +44,7 @@ fn spec<'a>(command: &'a [String], grants: &'a Grants) -> RunSpec<'a> {
 #[test]
 fn fake_backend_satisfies_the_contract() -> anyhow::Result<()> {
     let success = Outcome {
+        digests: None,
         booted: true,
         guest_exit: Some(0),
         transport_error: None,

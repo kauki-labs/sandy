@@ -27,8 +27,9 @@ use std::{
 };
 
 use sandy::{
-    BackendError, BoxState, Hypervisor, Outcome, RunSpec, ShareDirs, StoreBacking, Topology, VmBackend,
+    BackendError, BoxState, Hypervisor, Outcome, RunSpec, ShareDirs, SharePlan, StoreBacking, Topology, VmBackend,
     collect_outputs, ensure_sandy_staging_base, kill_children, plan_shares, topology as eval_topology, wipe,
+    with_digests,
 };
 use sandy_api::{
     agent::{AGENT_VSOCK_PORT, AgentLaunch},
@@ -370,6 +371,7 @@ impl QemuBackend {
             Some((program, _)) => {
                 agent_command = agent_command_argv(program, AGENT_VSOCK_PORT, spec.command);
                 agent_spec = RunSpec {
+                    digests: false,
                     command: &agent_command,
                     ..*spec
                 };
@@ -417,6 +419,22 @@ impl QemuBackend {
             None => Ok(outcome),
         }
     }
+}
+
+/// [`plan_shares`], wiping the sandy-owned staging dirs if it fails.
+///
+/// It stages the secret first and the inputs after, so a late failure (a missing input, or with
+/// digests on a failed digest read) would leave the staged secret on disk: `run` returns on the
+/// error before its teardown loop (INV-1). A caller-owned `secret_dir` is not touched, it keeps its
+/// own lifecycle.
+fn plan_shares_or_wipe(spec: &RunSpec, dirs: &ShareDirs<'_>) -> Result<SharePlan, BackendError> {
+    plan_shares(spec, dirs).inspect_err(|_| {
+        for dir in [dirs.inst_dir, dirs.inputs_dir, dirs.outputs_dir] {
+            if let Err(err) = wipe(dir) {
+                tracing::warn!(dir = %dir.display(), %err, "failed to wipe staging after a staging error");
+            }
+        }
+    })
 }
 
 /// A random vsock CID for one agent-mode launch, never a reserved value (0 the
@@ -499,6 +517,7 @@ fn drain_stderr(mut stderr: std::process::ChildStderr) -> std::thread::JoinHandl
 /// An infra transport fault as an [`Outcome`] (no fabricated exit, INV-OUTCOME).
 fn transport_outcome(err: &BackendError) -> Outcome {
     Outcome {
+        digests: None,
         booted: false,
         guest_exit: None,
         transport_error: Some(err.to_string()),
@@ -583,7 +602,7 @@ impl VmBackend for QemuBackend {
         // flags, the #49 secret_dir rule). Each virtiofsd socket lives in inst_dir
         // (sandy-owned, created in `boot`); the read-only flag is enforced at the
         // virtiofsd boundary below.
-        let shares = plan_shares(
+        let SharePlan { shares, input_digests } = plan_shares_or_wipe(
             spec,
             &ShareDirs {
                 inst_dir: &inst_dir,
@@ -629,9 +648,9 @@ impl VmBackend for QemuBackend {
         // (nothing was produced otherwise). A collection failure surfaces as an
         // infra fault rather than silently dropping the output.
         let collected = if outcome.as_ref().is_ok_and(|o| o.booted) {
-            collect_outputs(spec.outputs, &outputs_dir)
+            collect_outputs(spec.outputs, &outputs_dir, spec.digests)
         } else {
-            Ok(())
+            Ok(None)
         };
 
         // Teardown clears staging on every path so secret bytes never outlive
@@ -641,7 +660,7 @@ impl VmBackend for QemuBackend {
                 tracing::warn!(dir = %dir.display(), %err, "failed to wipe staging on teardown");
             }
         }
-        collected.and(outcome)
+        with_digests(outcome, input_digests, collected)
     }
 
     fn kill(&self, box_id: &str) -> Result<(), BackendError> {
@@ -668,7 +687,7 @@ fn kvm_available() -> bool {
 #[cfg(test)]
 mod tests {
     use anyhow::Context;
-    use sandy::{Grants, Hypervisor, SECRET_MOUNT_TAG, parse_topology};
+    use sandy::{Grants, Hypervisor, Input, SECRET_MOUNT_TAG, SecretRef, SecretSource, parse_topology};
 
     use super::*;
 
@@ -719,6 +738,7 @@ mod tests {
         let topology = parse_topology(X86_64_FIXTURE).context("parse x86_64 fixture")?;
         let command = ["true".to_string()];
         let spec = RunSpec {
+            digests: false,
             egress: None,
             template: "demo",
             command: &command,
@@ -789,6 +809,7 @@ mod tests {
             shares: false,
         };
         let spec = RunSpec {
+            digests: false,
             egress: None,
             template: "demo",
             command: &command,
@@ -830,6 +851,7 @@ mod tests {
         assert_eq!(topology.hypervisor, Hypervisor::Vfkit, "fixture is the vfkit topology");
         let command = ["true".to_string()];
         let spec = RunSpec {
+            digests: false,
             egress: None,
             template: "demo",
             command: &command,
@@ -856,8 +878,76 @@ mod tests {
         Ok(())
     }
 
+    /// #373 review: `plan_shares` stages the secret first and the inputs after, so a late failure
+    /// (here a missing input; with digests on, a failed digest read) leaves the staged secret on disk
+    /// unless the staging is wiped (INV-1). The control shows the plain call leaks; the helper must not.
+    #[test]
+    fn a_staging_failure_wipes_the_qemu_owned_staging_with_its_secret() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir()?;
+        let secret_src = tmp.path().join("secret-src");
+        std::fs::write(&secret_src, b"S")?;
+        std::fs::set_permissions(&secret_src, std::fs::Permissions::from_mode(0o600))?;
+        let secrets = [SecretRef {
+            name: "TOK".to_string(),
+            source: SecretSource::File(secret_src),
+        }];
+        let inputs = [Input {
+            host: tmp.path().join("no-such-input"),
+            name: "in".to_string(),
+            guest_path: None,
+        }];
+        let command = ["true".to_string()];
+        let spec = RunSpec {
+            secrets: &secrets,
+            inputs: &inputs,
+            ..demo_spec(&command)
+        };
+        let dirs_under = |name: &str| {
+            (
+                tmp.path().join(name),
+                tmp.path().join(format!("{name}-in")),
+                tmp.path().join(format!("{name}-out")),
+            )
+        };
+
+        // Control: the plain call fails after staging the secret and leaves it behind.
+        let (inst, inputs_dir, outputs_dir) = dirs_under("plain");
+        let plain = plan_shares(
+            &spec,
+            &ShareDirs {
+                inst_dir: &inst,
+                inputs_dir: &inputs_dir,
+                outputs_dir: &outputs_dir,
+            },
+        );
+        anyhow::ensure!(plain.is_err(), "a missing input must fail staging");
+        anyhow::ensure!(
+            inst.join("TOK").exists(),
+            "the control must leave the staged secret behind, or this test proves nothing"
+        );
+
+        // The helper fails the same way and leaves no staging behind.
+        let (inst, inputs_dir, outputs_dir) = dirs_under("wiped");
+        let wiped = plan_shares_or_wipe(
+            &spec,
+            &ShareDirs {
+                inst_dir: &inst,
+                inputs_dir: &inputs_dir,
+                outputs_dir: &outputs_dir,
+            },
+        );
+        anyhow::ensure!(wiped.is_err(), "the helper must return the staging error");
+        for dir in [&inst, &inputs_dir, &outputs_dir] {
+            anyhow::ensure!(!dir.exists(), "{} must be wiped after a staging error", dir.display());
+        }
+        Ok(())
+    }
+
     fn demo_spec<'a>(command: &'a [String]) -> RunSpec<'a> {
         RunSpec {
+            digests: false,
             template: "demo",
             command,
             inputs: &[],
@@ -882,6 +972,7 @@ mod tests {
         let allow = sandy_api::egress::AllowList::default();
         let command = ["true".to_string()];
         let spec = RunSpec {
+            digests: false,
             egress: Some(&allow),
             ..demo_spec(&command)
         };
@@ -919,6 +1010,7 @@ mod tests {
 
     fn never_booted(console: &str) -> Outcome {
         Outcome {
+            digests: None,
             booted: false,
             guest_exit: None,
             transport_error: None,
@@ -949,6 +1041,7 @@ mod tests {
         let topology = parse_topology(X86_64_FIXTURE).context("parse x86_64 fixture")?;
         let command = ["true".to_string()];
         let spec = RunSpec {
+            digests: false,
             egress: None,
             template: "demo",
             command: &command,
@@ -991,6 +1084,7 @@ mod tests {
         let topology = parse_topology(X86_64_FIXTURE).context("parse x86_64 fixture")?;
         let command = ["true".to_string()];
         let spec = RunSpec {
+            digests: false,
             egress: None,
             template: "demo",
             command: &command,
@@ -1028,6 +1122,7 @@ mod tests {
         let backend = QemuBackend::new();
         let command = ["true".to_string()];
         let spec = RunSpec {
+            digests: false,
             egress: None,
             template: "demo",
             command: &command,
@@ -1068,6 +1163,7 @@ mod tests {
         let control = sandy::RunControl::with_timeout_secs(5);
         control.suspend_deadline();
         let spec = RunSpec {
+            digests: false,
             egress: None,
             template: "demo",
             command: &command,
@@ -1102,6 +1198,7 @@ mod tests {
         let command = ["sh".to_string(), "-c".to_string(), "sleep 60".to_string()];
         let control = sandy::RunControl::with_timeout_secs(120);
         let spec = RunSpec {
+            digests: false,
             egress: None,
             template: "demo",
             command: &command,
