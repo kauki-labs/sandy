@@ -62,6 +62,17 @@ fn allowed_host() -> String {
     std::env::var("SANDY_EGRESS_ALLOWED").unwrap_or_else(|_| "1.1.1.1".to_string())
 }
 
+/// The allow-listed hostname for the name-entry tests. The default, `one.one.one.one`, resolves to several
+/// IPv4 addresses, so a pass also shows a multi-address name works (`nft` rejects one).
+fn allowed_name() -> String {
+    std::env::var("SANDY_EGRESS_ALLOWED_NAME").unwrap_or_else(|_| "one.one.one.one".to_string())
+}
+
+/// A hostname that is never on the allow-list.
+fn denied_name() -> String {
+    std::env::var("SANDY_EGRESS_DENIED_NAME").unwrap_or_else(|_| "example.com".to_string())
+}
+
 /// The denied target: never on the allow-list.
 fn denied_host() -> String {
     std::env::var("SANDY_EGRESS_DENIED").unwrap_or_else(|_| "1.0.0.1".to_string())
@@ -206,6 +217,56 @@ fn denied_target_gets_403() -> anyhow::Result<()> {
     let (code, env) = sandy_proxy_run(home.path(), &target, &allow, &script)?;
 
     assert_guest_ok(code, &env, &format!("CONNECT {denied}:{PROBE_PORT} must get 403"));
+    Ok(())
+}
+
+/// #377: a hostname entry is matched by name at the proxy. `--allow <name>:443` lets a CONNECT by that name
+/// through (`200`), though the name resolves to several addresses and the guest has no DNS.
+#[test]
+fn allowed_hostname_is_reachable_by_name() -> anyhow::Result<()> {
+    let target = require_proxy_live()?;
+    build_guest(&target)?;
+    let home = tempfile::tempdir().context("temp SANDY_HOME")?;
+    let name = allowed_name();
+    let allow = vec![format!("{name}:{PROBE_PORT}")];
+
+    let script = connect_expect_script(&format!("{name}:{PROBE_PORT}"), 200);
+    let (code, env) = sandy_proxy_run(home.path(), &target, &allow, &script)?;
+
+    assert_guest_ok(code, &env, &format!("CONNECT {name}:{PROBE_PORT} must get 200"));
+    Ok(())
+}
+
+/// #377: a name entry allows that name only. A different hostname, and the IP the allowed name resolves to
+/// (`$SANDY_EGRESS_ALLOWED`, default `1.1.1.1`, one of `one.one.one.one`'s addresses), both get `403`.
+#[test]
+fn a_hostname_entry_does_not_allow_another_name_or_its_ip() -> anyhow::Result<()> {
+    let target = require_proxy_live()?;
+    build_guest(&target)?;
+    let home = tempfile::tempdir().context("temp SANDY_HOME")?;
+    let (name, other, ip) = (allowed_name(), denied_name(), allowed_host());
+    let allow = vec![format!("{name}:{PROBE_PORT}")];
+
+    // Exit 12 (no status line) fails the test: a dead relay would otherwise look like a refusal.
+    let script = format!(
+        r#"set -u
+{CONNECT_FN}
+for t in {other}:{PROBE_PORT} {ip}:{PROBE_PORT}; do
+  connect_status $t
+  echo "live_egress_proxy: CONNECT $t -> $status"
+  [ "$status" = none ] && exit 12
+  [ "$status" = 403 ] || exit 10
+done
+exit 0
+"#
+    );
+    let (code, env) = sandy_proxy_run(home.path(), &target, &allow, &script)?;
+
+    assert_guest_ok(
+        code,
+        &env,
+        &format!("with only {name}:{PROBE_PORT} allowed, {other} and {ip} must both get 403"),
+    );
     Ok(())
 }
 
