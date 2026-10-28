@@ -126,3 +126,117 @@ precedent is honored.
 **Consequences.** The locked key set grows by one key (`receipt`), schema `3`.
 Digests (#373), signing (#374), and filling `egress.attempts` from the #360
 proxy (#375) are explicitly out of this version.
+
+## 6. Sign receipts relayed from remote executors (#374)
+
+**Status:** accepted (design only — no relay path exists to sign yet; see
+Consequences). **Upholds:** INV-1.
+
+**Context.** Decision 5's `host_observed`/`guest_reported` split assumes the
+guest is the only hostile party (#357's attacker model): fields a hostile
+_guest_ can shape are already named and isolated. It says nothing about a
+hostile _relay path_ — once a receipt crosses from a remote executor back to
+`sandyd` and into its store, nothing stops it being altered in transit or
+after storage. #374's own framing names exactly that gap: "for local runs the
+host supervisor writes the envelope and the guest can't touch it... signing
+only matters once receipts are relayed between machines and have to stay
+verifiable after the fact [to] an auditor [who checks] a receipt later
+without trusting sandyd's database." Decision 12 (`sandyd.md`) already
+accepts that an executor's identity is its mesh IP, with no attestation; this
+decision does not change that — it is a different problem (receipt
+integrity, not registration authenticity) with a different answer.
+
+**Decision.**
+
+- **Key: a per-executor Ed25519 keypair, not the WireGuard identity.**
+  `ExecutorAllowlist` (`crates/sandyd/src/host_registry.rs`, today a bare
+  `HashSet<IpAddr>`) grows a verifying key alongside each allowed peer IP —
+  the same trust anchor decision 12 already uses for registration, extended
+  rather than duplicated. Reusing the mesh WireGuard key is set aside below.
+  Ed25519 over an HMAC (decision in `impls/fabric-local/src/capauth.rs`) is
+  deliberate: HMAC is symmetric, so whoever can _verify_ a receipt can also
+  _forge_ one — exactly what #374 rules out for a third-party auditor who
+  must verify without being handed sandyd's own secret.
+- **Format: a detached Ed25519 signature over the receipt's canonical
+  bytes**, encoded the same way `capauth.rs`'s `canonical_scope_bytes` already
+  does for `CapScope` (length-prefixed, field-order-fixed, so no two fields'
+  concatenation can collide with a different split between them) — a second,
+  independent implementation of the same scheme, not a shared helper, since
+  `AuditReceipt` and `CapScope` have no fields in common and forcing one
+  through the other's shape would obscure both. The signed bytes cover the
+  **whole** `AuditReceipt` — `host_observed` AND `guest_reported` — not just
+  `host_observed`. The split in decision 5 is about which party's _claims_
+  to trust, not about which bytes get tamper-evidence: the executor
+  physically relayed both blocks, so both should be verifiably exactly what
+  it sent, even though `guest_reported`'s contents remain a guest's
+  unverified claim once you look inside them.
+- **sandyd countersigns.** Once `sandyd` verifies the executor's signature
+  and accepts the receipt, it signs `(executor_signature, the receipt's own
+canonical bytes, job_id, the verified submitter's identity from decision
+12's `ExecutorAllowlist` check)` with its own orchestrator key. This closes
+  the gap the executor's signature alone leaves open: an auditor who trusts
+  only the executor's signature still has to trust that `sandyd` stored,
+  rather than substituted, the bytes it verified. The countersignature is an
+  attestation of custody ("sandyd received exactly this, from this verified
+  peer, for this job"), independent of and layered over the executor's own
+  attestation of origin ("I produced exactly this"). Either layer's failure
+  is independently detectable.
+- **Replay is closed by binding, not a nonce.** The signed canonical bytes
+  include `job_id` and the dispatching executor's identity (mirroring
+  `AuditReceipt.host_observed.location`), so a signature cannot be lifted
+  from one job's receipt and attached to another's. `sandyd`'s ingestion
+  additionally refuses a receipt for a `job_id` it has no matching dispatch
+  record for (decision 12's `HostRegistry` already tracks which host a job
+  was placed on), and treats a job's receipt as write-once: a second,
+  differently-signed receipt for an already-recorded `job_id` is rejected,
+  not silently overwritten. Both checks are enforcement sandyd already has
+  the state to do; neither needs new state invented for this decision.
+
+**Adversarial pass.**
+
+- _A compromised executor forges a receipt for a job it never ran._ Signing
+  does not defend against this directly, and the design does not pretend to:
+  decision 6's (`sandyd.md`) per-job agent-link authentication (the run-id +
+  token prefix) already scopes a dispatched job's relay channel to that one
+  job, so an executor holding a valid key cannot use it to originate traffic
+  for a `job_id` `sandyd` never dispatched to that peer — that boundary is
+  transport-level, not cryptographic. What signing adds on top: `sandyd`'s
+  own ingestion check (above) that a signed receipt's `job_id` matches an
+  actual dispatch to that signing identity, so even a replayed-and-resigned
+  attempt (not just a raw replay) is refused.
+- _A compromised executor lies about `host_observed` fields it genuinely
+  controls_ (fake timing, a fake backend kind). Out of scope for this
+  decision, and stated as such: a compromised _executor_ is a stronger
+  attacker than the compromised _guest_ decision 5's split defends against,
+  and decision 12 already accepts "mesh IP is identity, no attestation" as
+  the limit of what registration alone can prove. Signing makes the lie
+  non-repudiable (the executor cannot later deny having asserted it) and
+  tamper-evident (no one downstream can alter it without invalidating the
+  signature) — it does not make the assertion true. This matches #374's own
+  framing: the goal is "stays verifiable after the fact," not "cannot lie."
+- _Replaying another run's receipt._ Closed by the job_id-binding + write-once
+  rule above: a captured, validly-signed receipt for job A cannot be
+  resubmitted as job B's receipt (the signed bytes name A), and cannot be
+  resubmitted as a second receipt for job A once sandyd has already recorded
+  one (write-once).
+
+**Alternative set aside.** Deriving the receipt-signing key from the
+executor's WireGuard identity (decision 12) instead of provisioning a second
+keypair. Set aside: WireGuard's X25519 keys are for key exchange, not
+signing, and converting one into an Ed25519 signing key is a non-standard,
+easy-to-get-subtly-wrong construction for no real provisioning savings — an
+operator already has to get a value onto each allow-listed host (the IP) and
+onto `sandyd` (the allowlist entry); adding a public key to that same
+one-time step costs little next to a conversion that would need its own
+security review.
+
+**Consequences.** This decision answers #374's open questions; it does not
+implement them. #413 confirms that `sandyd`'s dispatch core does not persist
+a `ResultEnvelope` for a dispatched job at all yet (no relay path exists to
+sign), so implementation is blocked on that landing first — tracked
+separately, not reopened here. `ExecutorAllowlist`'s wire/config shape
+changes (an `IpAddr` set becomes an `IpAddr -> VerifyingKey` map); key
+provisioning (how an operator generates and installs a keypair) is left to
+the implementation issue, not decided here. `ed25519-dalek` becomes a new
+dependency of whichever crate ends up owning the signing/verification
+(`sandy-executor-proto` or a new seam) once implemented.
