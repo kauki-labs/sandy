@@ -211,7 +211,14 @@ recorded on the dispatch/job record)` with its own orchestrator key — two
   attestation of custody ("sandyd received exactly this, from this verified
   executor, for this job, submitted by this identity"), independent of and
   layered over the executor's own attestation of origin ("I produced exactly
-  this"). Either layer's failure is independently detectable.
+  this"). Either layer's failure is independently detectable. `sandyd`
+  rejects the receipt outright, before countersigning, if the submitter
+  identity on its own dispatch record does not match
+  `AuditReceipt.host_observed.who` (CodeRabbit on this PR): without that
+  equality check, a compromised executor could sign a receipt naming a
+  different `who` than the one `sandyd` actually dispatched the job under,
+  and the countersignature would attest to custody of a record that
+  internally disagrees with itself about who submitted it.
 - **Replay is closed by binding, not a nonce — and acceptance is atomic.**
   The signed canonical bytes include `job_id` and the dispatching executor's
   identity (mirroring `AuditReceipt.host_observed.location`), so a signature
@@ -226,7 +233,17 @@ recorded on the dispatch/job record)` with its own orchestrator key — two
   commits, producing two differently-countersigned artifacts for one job.
   `sandyd` issues the countersignature only after its own write wins; a
   second submission that loses the race gets the already-stored record back,
-  not a fresh signature. Neither the dispatch record nor the receipt table
+  not a fresh signature. Winning the write and producing the countersignature
+  must themselves be crash-atomic (CodeRabbit on this PR, major): accepting
+  the marker and computing the countersignature as two separate steps leaves
+  a window where a crash between them commits an accepted record with no
+  countersignature, and a retry reading that record back has nothing valid
+  to return. Either the marker write and the countersignature are one
+  durable transaction (the common case, since Ed25519 signing is fast enough
+  to do inline), or acceptance passes through an explicit pending state a
+  restart can deterministically finish signing from — never a state where
+  "accepted" and "countersigned" can observably disagree. Neither the
+  dispatch record nor the receipt table
   exists today (CodeRabbit on this PR): `HostRegistry` tracks which host a
   job was _placed_ on, live, for routing — it is not a durable record of
   past dispatches, and nothing persists an accepted receipt yet. Whichever
