@@ -27,8 +27,9 @@ use std::{
 };
 
 use sandy::{
-    BackendError, BoxState, Hypervisor, Outcome, RunSpec, ShareDirs, StoreBacking, Topology, VmBackend,
+    BackendError, BoxState, Hypervisor, Outcome, RunSpec, ShareDirs, SharePlan, StoreBacking, Topology, VmBackend,
     collect_outputs, ensure_sandy_staging_base, kill_children, plan_shares, topology as eval_topology, wipe,
+    with_digests,
 };
 use sandy_api::{
     agent::{AGENT_VSOCK_PORT, AgentLaunch},
@@ -370,6 +371,7 @@ impl QemuBackend {
             Some((program, _)) => {
                 agent_command = agent_command_argv(program, AGENT_VSOCK_PORT, spec.command);
                 agent_spec = RunSpec {
+                    digests: false,
                     command: &agent_command,
                     ..*spec
                 };
@@ -499,6 +501,7 @@ fn drain_stderr(mut stderr: std::process::ChildStderr) -> std::thread::JoinHandl
 /// An infra transport fault as an [`Outcome`] (no fabricated exit, INV-OUTCOME).
 fn transport_outcome(err: &BackendError) -> Outcome {
     Outcome {
+        digests: None,
         booted: false,
         guest_exit: None,
         transport_error: Some(err.to_string()),
@@ -583,7 +586,7 @@ impl VmBackend for QemuBackend {
         // flags, the #49 secret_dir rule). Each virtiofsd socket lives in inst_dir
         // (sandy-owned, created in `boot`); the read-only flag is enforced at the
         // virtiofsd boundary below.
-        let shares = plan_shares(
+        let SharePlan { shares, input_digests } = plan_shares(
             spec,
             &ShareDirs {
                 inst_dir: &inst_dir,
@@ -629,9 +632,9 @@ impl VmBackend for QemuBackend {
         // (nothing was produced otherwise). A collection failure surfaces as an
         // infra fault rather than silently dropping the output.
         let collected = if outcome.as_ref().is_ok_and(|o| o.booted) {
-            collect_outputs(spec.outputs, &outputs_dir)
+            collect_outputs(spec.outputs, &outputs_dir, spec.digests)
         } else {
-            Ok(())
+            Ok(None)
         };
 
         // Teardown clears staging on every path so secret bytes never outlive
@@ -641,7 +644,7 @@ impl VmBackend for QemuBackend {
                 tracing::warn!(dir = %dir.display(), %err, "failed to wipe staging on teardown");
             }
         }
-        collected.and(outcome)
+        with_digests(outcome, input_digests, collected)
     }
 
     fn kill(&self, box_id: &str) -> Result<(), BackendError> {
@@ -719,6 +722,7 @@ mod tests {
         let topology = parse_topology(X86_64_FIXTURE).context("parse x86_64 fixture")?;
         let command = ["true".to_string()];
         let spec = RunSpec {
+            digests: false,
             egress: None,
             template: "demo",
             command: &command,
@@ -789,6 +793,7 @@ mod tests {
             shares: false,
         };
         let spec = RunSpec {
+            digests: false,
             egress: None,
             template: "demo",
             command: &command,
@@ -830,6 +835,7 @@ mod tests {
         assert_eq!(topology.hypervisor, Hypervisor::Vfkit, "fixture is the vfkit topology");
         let command = ["true".to_string()];
         let spec = RunSpec {
+            digests: false,
             egress: None,
             template: "demo",
             command: &command,
@@ -858,6 +864,7 @@ mod tests {
 
     fn demo_spec<'a>(command: &'a [String]) -> RunSpec<'a> {
         RunSpec {
+            digests: false,
             template: "demo",
             command,
             inputs: &[],
@@ -882,6 +889,7 @@ mod tests {
         let allow = sandy_api::egress::AllowList::default();
         let command = ["true".to_string()];
         let spec = RunSpec {
+            digests: false,
             egress: Some(&allow),
             ..demo_spec(&command)
         };
@@ -919,6 +927,7 @@ mod tests {
 
     fn never_booted(console: &str) -> Outcome {
         Outcome {
+            digests: None,
             booted: false,
             guest_exit: None,
             transport_error: None,
@@ -949,6 +958,7 @@ mod tests {
         let topology = parse_topology(X86_64_FIXTURE).context("parse x86_64 fixture")?;
         let command = ["true".to_string()];
         let spec = RunSpec {
+            digests: false,
             egress: None,
             template: "demo",
             command: &command,
@@ -991,6 +1001,7 @@ mod tests {
         let topology = parse_topology(X86_64_FIXTURE).context("parse x86_64 fixture")?;
         let command = ["true".to_string()];
         let spec = RunSpec {
+            digests: false,
             egress: None,
             template: "demo",
             command: &command,
@@ -1028,6 +1039,7 @@ mod tests {
         let backend = QemuBackend::new();
         let command = ["true".to_string()];
         let spec = RunSpec {
+            digests: false,
             egress: None,
             template: "demo",
             command: &command,
@@ -1068,6 +1080,7 @@ mod tests {
         let control = sandy::RunControl::with_timeout_secs(5);
         control.suspend_deadline();
         let spec = RunSpec {
+            digests: false,
             egress: None,
             template: "demo",
             command: &command,
@@ -1102,6 +1115,7 @@ mod tests {
         let command = ["sh".to_string(), "-c".to_string(), "sleep 60".to_string()];
         let control = sandy::RunControl::with_timeout_secs(120);
         let spec = RunSpec {
+            digests: false,
             egress: None,
             template: "demo",
             command: &command,

@@ -201,6 +201,7 @@ mod tests {
             per_job_cap_bytes: 1 << 20,
         };
         let outcome = Outcome {
+            digests: None,
             booted: true,
             guest_exit: Some(1),
             transport_error: None,

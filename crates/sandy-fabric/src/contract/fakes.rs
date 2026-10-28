@@ -343,6 +343,7 @@ impl Executor for FakeExecutor {
         };
         let collapsed = self.collapse_failures && exit != 0;
         Ok(Outcome {
+            digests: None,
             booted: true,
             guest_exit: (!collapsed).then_some(exit),
             transport_error: collapsed.then(|| "lost".to_owned()),

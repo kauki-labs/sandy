@@ -158,6 +158,7 @@ fn credential_flows_through_git_helper_and_refreshes_midrun() -> anyhow::Result<
     let probe = r#"f() { printf 'protocol=https\nhost=github.com\n\n' | git credential fill 2>/dev/null | sed -n 's/^password=//p'; }; prev=""; changed=0; i=0; while [ $i -lt 12 ]; do cur=$(f); if [ -n "$prev" ] && [ -n "$cur" ] && [ "$cur" != "$prev" ]; then changed=$((changed+1)); fi; prev="$cur"; i=$((i+1)); sleep 1; done; [ -n "$prev" ] && [ $changed -ge 1 ] && exit 0 || exit 7"#;
 
     let plan = JobPlan {
+        digests: false,
         egress_proxy: false,
         template: format!("{}#{}", guest_flake().display(), target.topology_attr),
         command: vec![probe.to_string()],
@@ -269,6 +270,7 @@ fn credential_secret_input_output_all_compose() -> anyhow::Result<()> {
     let job = r#"[ -n "$GITHUB_TOKEN" ] && [ "$TOK" = SECRET-VALUE ] && grep -q INPUT-MARKER /run/sandy/inputs/data/f && printf done > /run/sandy/outputs/result/out"#;
 
     let plan = JobPlan {
+        digests: false,
         egress_proxy: false,
         template: format!("{}#{}", guest_flake().display(), target.topology_attr),
         command: vec![job.to_string()],

@@ -75,6 +75,7 @@ fn run_with_input(backend: &ProcessBackend, input: &std::path::Path, script: &st
     let command = ["sh".to_string(), "-c".to_string(), script.to_string()];
     let control = RunControl::with_timeout_secs(30);
     let spec = RunSpec {
+        digests: false,
         egress: None,
         template: "process",
         command: &command,
@@ -190,6 +191,7 @@ fn a_setsid_escaped_descendant_is_reaped_by_the_cgroup() -> anyhow::Result<()> {
     let command = ["sh".to_string(), "-c".to_string(), script];
     let control = RunControl::with_timeout_secs(1);
     let spec = RunSpec {
+        digests: false,
         egress: None,
         template: "process",
         command: &command,
@@ -253,6 +255,7 @@ fn a_contained_job_reads_its_input_through_the_scope() -> anyhow::Result<()> {
     ];
     let control = RunControl::with_timeout_secs(30);
     let spec = RunSpec {
+        digests: false,
         egress: None,
         template: "process",
         command: &command,

@@ -50,6 +50,7 @@ fn fingerprint(dir: &std::path::Path) -> anyhow::Result<sandy::DirFingerprint> {
 /// A scripted physical outcome: booted, with the given guest exit code.
 fn ok_outcome(guest_exit: i32) -> Outcome {
     Outcome {
+        digests: None,
         booted: true,
         guest_exit: Some(guest_exit),
         transport_error: None,
@@ -61,6 +62,7 @@ fn ok_outcome(guest_exit: i32) -> Outcome {
 /// A minimal plan that boots `demo` with no secrets or env.
 fn booting_plan() -> JobPlan {
     JobPlan {
+        digests: false,
         template: "demo".to_string(),
         command: vec![],
         inputs: vec![],
@@ -86,6 +88,7 @@ fn booting_plan() -> JobPlan {
 /// `validate_no_secret_leak` (INV-1).
 fn leaking_plan() -> JobPlan {
     JobPlan {
+        digests: false,
         template: "demo".to_string(),
         command: vec![],
         inputs: vec![],
@@ -219,6 +222,128 @@ fn run_lists_collected_outputs_in_the_envelope() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// #373: digests the backend reports reach the receipt in the right section:
+/// inputs under `host_observed`, outputs under `guest_reported` (on the entry the
+/// supervisor listed for that path), and skipped output entries beside them.
+/// `FakeBackend` stages and collects nothing, so the hashing itself is covered by
+/// the `stage` unit tests over the real `stage_inputs` / `collect_outputs`; this
+/// proves only the supervisor's placement of a scripted report.
+#[test]
+fn run_places_reported_digests_in_the_right_receipt_sections() -> anyhow::Result<()> {
+    use sandy::{ContentDigests, FileDigest, RunDigests, SkipReason, SkippedEntry};
+
+    const HELLO: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+    const WORLD: &str = "486ea46224d1bb4fb680f34f7c9ad96a8f24ec88be73ea8e5a6c65260e9cb8a7";
+    let (tmp, journal) = fresh_journal()?;
+    let dest = tmp.path().join("collected");
+    std::fs::create_dir_all(&dest).context("mk output dest")?;
+    std::fs::write(dest.join("f"), b"hello").context("write output")?;
+    std::fs::write(dest.join("stale"), b"left by someone else").context("write stale file")?;
+    let mut plan = booting_plan();
+    plan.digests = true;
+    plan.outputs = vec![sandy::Output {
+        name: Some("result".to_string()),
+        dest,
+    }];
+    let mut outcome = ok_outcome(0);
+    outcome.digests = Some(RunDigests {
+        inputs: ContentDigests {
+            files: vec![FileDigest {
+                path: "in/a".to_string(),
+                sha256: WORLD.to_string(),
+            }],
+            skipped: vec![],
+        },
+        outputs: ContentDigests {
+            files: vec![FileDigest {
+                path: "result/f".to_string(),
+                sha256: HELLO.to_string(),
+            }],
+            skipped: vec![SkippedEntry {
+                path: "result/leak".to_string(),
+                reason: SkipReason::Symlink,
+            }],
+        },
+    });
+
+    let backend = FakeBackend::new().with_outcome(outcome);
+    let report = run_job(
+        &backend,
+        &journal,
+        &plan,
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        None,
+        &[],
+    )
+    .context("run_job with digests")?;
+
+    let receipt = report.envelope.receipt.context("receipt")?;
+    let inputs = receipt
+        .host_observed
+        .input_digests
+        .context("input digests are host-observed")?;
+    assert_eq!(inputs.files.len(), 1);
+    assert_eq!(
+        (inputs.files[0].path.as_str(), inputs.files[0].sha256.as_str()),
+        ("in/a", WORLD)
+    );
+    let outputs: Vec<(&str, Option<&str>)> = receipt
+        .guest_reported
+        .outputs
+        .iter()
+        .map(|o| (o.path.as_str(), o.sha256.as_deref()))
+        .collect();
+    assert_eq!(
+        outputs,
+        [("result/f", Some(HELLO)), ("result/stale", None)],
+        "a file this run did not collect carries no digest"
+    );
+    assert_eq!(
+        receipt.guest_reported.skipped_outputs,
+        [SkippedEntry {
+            path: "result/leak".to_string(),
+            reason: SkipReason::Symlink
+        }]
+    );
+    Ok(())
+}
+
+/// #373: with `--digests` off the supervisor asks for no hashing and the serialized
+/// envelope has no digest key anywhere.
+#[test]
+fn run_without_digests_flag_requests_none_and_serializes_no_digest_keys() -> anyhow::Result<()> {
+    let (tmp, journal) = fresh_journal()?;
+    let dest = tmp.path().join("collected");
+    std::fs::create_dir_all(&dest).context("mk output dest")?;
+    std::fs::write(dest.join("f"), b"hello").context("write output")?;
+    let mut plan = booting_plan();
+    plan.outputs = vec![sandy::Output {
+        name: Some("result".to_string()),
+        dest,
+    }];
+    assert!(!plan.digests && !plan.as_run_spec().digests, "off by default");
+
+    let backend = FakeBackend::new().with_outcome(ok_outcome(0));
+    let report = run_job(
+        &backend,
+        &journal,
+        &plan,
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        None,
+        &[],
+    )
+    .context("run_job without digests")?;
+
+    let json = serde_json::to_string(&report.envelope)?;
+    assert!(json.contains("size_bytes"), "the receipt itself is present: {json}");
+    for key in ["sha256", "input_digests", "skipped"] {
+        assert!(!json.contains(key), "unexpected `{key}` in {json}");
+    }
+    Ok(())
+}
+
 #[test]
 fn run_guest_failure_is_band_one_not_retryable() -> anyhow::Result<()> {
     let (_tmp, journal) = fresh_journal()?;
@@ -246,6 +371,7 @@ fn run_timeout_is_band_one_not_retryable() -> anyhow::Result<()> {
     let (_tmp, journal) = fresh_journal()?;
     // A booted guest that hit its wall-clock timeout: no exit code, `timed_out`.
     let timed_out = Outcome {
+        digests: None,
         booted: true,
         guest_exit: None,
         transport_error: None,
@@ -462,6 +588,7 @@ fn gc_evicts_oldest_terminal_beyond_keep_n_but_keeps_the_running_job() -> anyhow
 /// time on Linux (#359).
 fn allowing_plan() -> JobPlan {
     JobPlan {
+        digests: false,
         allow: AllowList {
             rules: vec![EgressRule {
                 host: "1.1.1.1".to_string(),
@@ -477,6 +604,7 @@ fn allowing_plan() -> JobPlan {
 /// used only by the macOS egress test.
 fn allowing_plan_by_hostname() -> JobPlan {
     JobPlan {
+        digests: false,
         allow: AllowList {
             rules: vec![EgressRule {
                 host: "github.com".to_string(),
@@ -541,6 +669,7 @@ fn run_hostname_allow_on_linux_is_invalid_plan_writes_no_record_and_never_boots(
 /// the nftables plan refuses on Linux (#359).
 fn proxy_plan() -> JobPlan {
     JobPlan {
+        digests: false,
         allow: AllowList {
             rules: vec![
                 EgressRule {
@@ -700,6 +829,7 @@ fn receipt_reports_a_proxy_refused_before_boot_as_unenforced() -> anyhow::Result
 fn receipt_reports_a_proxy_run_that_never_booted_as_unenforced() -> anyhow::Result<()> {
     let (_tmp, journal) = fresh_journal()?;
     let backend = FakeBackend::new().with_outcome(Outcome {
+        digests: None,
         booted: false,
         guest_exit: None,
         transport_error: None,
@@ -1191,6 +1321,7 @@ fn mint_run_token_stages_a_secret_and_the_token_travels_only_the_secret_channel(
 
     // Thread the secret into a run and prove it still succeeds over the secret channel.
     let plan = JobPlan {
+        digests: false,
         secrets: vec![lease.secret_ref],
         ..booting_plan()
     };
@@ -1371,6 +1502,7 @@ fn credentialed_run_redacts_the_token_from_the_console() -> anyhow::Result<()> {
     let token = "ghs_super_secret_marker_value";
     let provider = FakeProvider::returning(token);
     let backend = FakeBackend::new().with_outcome(Outcome {
+        digests: None,
         booted: true,
         guest_exit: Some(0),
         transport_error: None,
@@ -1759,6 +1891,7 @@ fn no_token_or_secret_bytes_anywhere_in_the_serialized_envelope() -> anyhow::Res
     // already does), so this test's marker is genuinely "in flight" during the
     // run, not merely absent because nothing ever touched it.
     let backend = FakeBackend::new().with_outcome(Outcome {
+        digests: None,
         booted: true,
         guest_exit: Some(0),
         transport_error: None,

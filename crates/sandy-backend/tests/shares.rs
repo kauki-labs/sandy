@@ -41,6 +41,7 @@ fn test_control() -> &'static RunControl {
 /// slices are empty here.
 fn spec<'a>(command: &'a [String]) -> RunSpec<'a> {
     RunSpec {
+        digests: false,
         egress: None,
         template: "demo",
         command,
@@ -253,7 +254,7 @@ fn outputs_collect_named_and_catch_all() -> Result<()> {
     std::fs::write(outputs_dir.join("result").join("r"), b"named")?;
     std::fs::write(outputs_dir.join("loose"), b"root")?;
 
-    collect_outputs(&outputs, &outputs_dir)?;
+    collect_outputs(&outputs, &outputs_dir, false)?;
 
     assert_eq!(
         std::fs::read(named_dest.join("r"))?,
@@ -291,7 +292,7 @@ fn output_symlink_escape_is_skipped() -> Result<()> {
     std::os::unix::fs::symlink(&secret, outputs_dir.join("o").join("leak"))?;
     std::fs::write(outputs_dir.join("o").join("real"), b"ok")?;
 
-    collect_outputs(&outputs, &outputs_dir)?;
+    collect_outputs(&outputs, &outputs_dir, false)?;
 
     assert!(
         std::fs::symlink_metadata(dest.join("leak")).is_err(),
@@ -404,6 +405,7 @@ fn plan_shares_stages_secret_input_output_with_the_right_flags() -> Result<()> {
         dest: tmp.path().join("dest"),
     }];
     let spec = RunSpec {
+        digests: false,
         egress: None,
         template: "demo",
         command: &[],
@@ -428,7 +430,8 @@ fn plan_shares_stages_secret_input_output_with_the_right_flags() -> Result<()> {
             outputs_dir: &outputs,
         },
     )
-    .context("plan_shares")?;
+    .context("plan_shares")?
+    .shares;
 
     let tags: Vec<&str> = shares.iter().map(|s| s.tag.as_str()).collect();
     assert_eq!(
@@ -476,6 +479,7 @@ fn plan_shares_attaches_an_empty_secret_dir_for_refresh() -> Result<()> {
         .context("fingerprint cred dir")?;
 
     let spec = RunSpec {
+        digests: false,
         egress: None,
         template: "demo",
         command: &[],
@@ -500,7 +504,8 @@ fn plan_shares_attaches_an_empty_secret_dir_for_refresh() -> Result<()> {
             outputs_dir: &outputs,
         },
     )
-    .context("plan_shares")?;
+    .context("plan_shares")?
+    .shares;
 
     assert_eq!(shares.len(), 1, "only the secret share attaches");
     assert_eq!(shares[0].tag, SECRET_MOUNT_TAG);

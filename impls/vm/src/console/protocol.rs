@@ -374,6 +374,7 @@ impl Protocol {
             "console capture complete"
         );
         Ok(Outcome {
+            digests: None,
             booted: true,
             guest_exit: Some(code),
             transport_error: None,
@@ -396,6 +397,7 @@ impl Protocol {
             // Ready was seen and the command injected, but the END sentinel
             // never arrived: the command hung (INV-OUTCOME — no fabricated exit).
             Outcome {
+                digests: None,
                 booted: true,
                 guest_exit: None,
                 transport_error: None,
@@ -405,6 +407,7 @@ impl Protocol {
         } else {
             // The ready marker never arrived within the boot budget.
             Outcome {
+                digests: None,
                 booted: false,
                 guest_exit: None,
                 transport_error: None,
@@ -514,6 +517,7 @@ mod tests {
         assert_eq!(
             outcome,
             Outcome {
+                digests: None,
                 booted: true,
                 guest_exit: Some(0),
                 transport_error: None,

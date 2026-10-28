@@ -1507,6 +1507,7 @@ mod tests {
     #[test]
     fn outcome_result_message_carries_the_physical_outcome_verbatim() {
         let outcome = Outcome {
+            digests: None,
             booted: true,
             guest_exit: Some(0),
             transport_error: None,

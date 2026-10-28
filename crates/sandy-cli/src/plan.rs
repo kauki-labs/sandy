@@ -59,6 +59,8 @@ pub struct RunArgs {
     pub mem: Option<u32>,
     /// `--timeout SECS`.
     pub timeout: Option<u32>,
+    /// `--digests`: record sha256 content digests of inputs and outputs in the receipt (#373).
+    pub digests: bool,
     /// The trailing `-- CMD ARGS...`, already split into argv.
     pub command: Vec<String>,
 }
@@ -85,6 +87,9 @@ pub struct JobPlan {
     /// the nftables boundary: the guest has no NIC and `allow` travels to the backend
     /// in [`RunSpec::egress`]. Not a CLI option: `dispatch_run` reads the environment.
     pub egress_proxy: bool,
+    /// Record sha256 digests of inputs and collected outputs in the receipt (#373).
+    /// Set by `sandy run --digests`; never from the environment.
+    pub digests: bool,
     /// Optional vCPU count.
     pub cpu: Option<u32>,
     /// Optional memory budget in MiB.
@@ -133,6 +138,7 @@ impl JobPlan {
                 .map(|(dir, fingerprint)| (dir.as_path(), *fingerprint)),
             control: &self.control,
             egress: self.egress_proxy.then_some(&self.allow),
+            digests: self.digests,
         }
     }
 }
@@ -185,6 +191,7 @@ pub fn parse_run(args: RunArgs) -> Result<JobPlan, PlanError> {
         env,
         allow: AllowList { rules },
         egress_proxy: false,
+        digests: args.digests,
         cpu: args.cpu,
         mem: args.mem,
         timeout_secs,
@@ -575,6 +582,25 @@ mod tests {
         };
         let plan = parse_run(args).map_err(|e| anyhow::anyhow!("parse_run: {e}"))?;
         assert_eq!(plan.command, vec!["echo".to_string(), "hi".to_string()]);
+        Ok(())
+    }
+
+    /// #373: `--digests` reaches the plan and its `RunSpec`; omitted, both are off.
+    #[test]
+    fn digests_flag_reaches_the_run_spec() -> anyhow::Result<()> {
+        let on = parse_run(RunArgs {
+            template: "demo".to_string(),
+            digests: true,
+            ..RunArgs::default()
+        })
+        .map_err(|e| anyhow::anyhow!("parse_run: {e}"))?;
+        assert!(on.digests && on.as_run_spec().digests);
+        let off = parse_run(RunArgs {
+            template: "demo".to_string(),
+            ..RunArgs::default()
+        })
+        .map_err(|e| anyhow::anyhow!("parse_run: {e}"))?;
+        assert!(!off.digests && !off.as_run_spec().digests);
         Ok(())
     }
 
