@@ -51,6 +51,16 @@ use crate::{
 /// nothing.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// The largest number of pre-auth attach connections this loop serves
+/// concurrently (NV-06, #395): past this, accepting a new connection waits
+/// for one of the in-flight ones to finish its handshake rather than
+/// spawning an unbounded task per accept. Mirrors the UDS control socket's
+/// own `MAX_CONCURRENT_CONNECTIONS` — before this cap, a local peer opening
+/// connections without ever presenting a `Join` cap could exhaust the
+/// daemon's file descriptors well before any single one reached
+/// `HANDSHAKE_TIMEOUT`.
+const MAX_CONCURRENT_ATTACH_CONNECTIONS: usize = 256;
+
 /// Accept connections from `listener` until it errors, handing each to
 /// [`serve_one_attach`]. A single connection's own failure never stops the
 /// loop — only ends that one connection.
@@ -59,19 +69,49 @@ pub async fn serve_attach_accept_loop(
     registry: &Arc<JobRegistry>,
     host_registry: &Arc<HostRegistry>,
 ) {
+    serve_attach_accept_loop_with_cap(listener, registry, host_registry, MAX_CONCURRENT_ATTACH_CONNECTIONS).await;
+}
+
+/// [`serve_attach_accept_loop`]'s body, parameterized over the concurrency
+/// cap so a test can drive it with a small `max_concurrent` instead of
+/// waiting for [`MAX_CONCURRENT_ATTACH_CONNECTIONS`] real connections to
+/// prove the cap holds.
+async fn serve_attach_accept_loop_with_cap(
+    listener: &UnixListener,
+    registry: &Arc<JobRegistry>,
+    host_registry: &Arc<HostRegistry>,
+    max_concurrent: usize,
+) {
+    let mut connections = tokio::task::JoinSet::new();
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+
     loop {
-        match listener.accept().await {
-            Ok((stream, _addr)) => {
-                let registry = Arc::clone(registry);
-                let host_registry = Arc::clone(host_registry);
-                tokio::spawn(async move {
-                    serve_one_attach(stream, registry, host_registry).await;
-                });
+        tokio::select! {
+            (permit, accepted) = crate::gate_spawn(&semaphore, listener.accept()) => {
+                let Ok(permit) = permit else {
+                    // Never closed by this process; handled rather than
+                    // panicked, per house style.
+                    tracing::error!("attach accept loop: connection semaphore closed unexpectedly; no longer accepting new connections");
+                    break;
+                };
+                match accepted {
+                    Ok((stream, _addr)) => {
+                        let registry = Arc::clone(registry);
+                        let host_registry = Arc::clone(host_registry);
+                        connections.spawn(async move {
+                            let _permit = permit; // held for the connection's lifetime, released on drop
+                            serve_one_attach(stream, registry, host_registry).await;
+                        });
+                    }
+                    Err(e) => {
+                        // `permit` drops here, releasing it immediately: this
+                        // connection was never served.
+                        tracing::warn!(error = %e, "attach accept loop: accept faulted; backing off");
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "attach accept loop: accept faulted; backing off");
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
+            Some(_) = connections.join_next(), if !connections.is_empty() => {}
         }
     }
 }
@@ -1330,6 +1370,75 @@ mod tests {
         drop(client_wr);
         drop(client_rd);
         tokio::time::timeout(WAIT, accepting).await??;
+        Ok(())
+    }
+
+    /// Regression (NV-06, #395): before this cap, the loop spawned one task
+    /// per accepted connection with no limit, so a local peer opening
+    /// connections faster than they're handshaked could exhaust the
+    /// daemon's file descriptors. With `max_concurrent` set to 1, a second
+    /// connection is accepted at the socket level (the OS listen backlog)
+    /// but its `serve_one_attach` task does not start — proven by it staying
+    /// silent — until the first connection closes and releases its permit.
+    #[tokio::test]
+    async fn a_second_attach_connection_is_not_served_until_the_cap_admits_it() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir().context("tempdir")?;
+        let sock = tmp.path().join("attach.sock");
+        let listener = UnixListener::bind(&sock).context("bind")?;
+
+        let registry = Arc::new(JobRegistry::new()?);
+        let host_registry = Arc::new(HostRegistry::default());
+        let loop_registry = Arc::clone(&registry);
+        let loop_host_registry = Arc::clone(&host_registry);
+        let accept_loop = tokio::spawn(async move {
+            serve_attach_accept_loop_with_cap(&listener, &loop_registry, &loop_host_registry, 1).await;
+        });
+
+        // First connection: holds the only permit by never presenting its
+        // Join cap, so it is never served and never releases.
+        let first_client = tokio::net::UnixStream::connect(&sock).await.context("connect first")?;
+
+        // Second connection: the socket-level accept succeeds, but the loop
+        // must not have started serve_one_attach for it yet.
+        let second_client = tokio::net::UnixStream::connect(&sock).await.context("connect second")?;
+        let (mut second_rd, mut second_wr) = second_client.into_split();
+        let ghost_cap = registry.authority().mint(CapScope {
+            peer: PeerId::from("operator"),
+            channel: ChannelId::from("never-submitted"),
+            rights: post_capable(),
+            expires_at: None,
+        })?;
+        write_frame(
+            &mut second_wr,
+            &LinkFrame::Join {
+                cap: hex::encode(encode_cap(&ghost_cap)?),
+                channel: None,
+                cols: None,
+                rows: None,
+            },
+        )
+        .await
+        .context("write the second connection's Join frame")?;
+
+        let still_waiting = tokio::time::timeout(Duration::from_millis(200), read_frame(&mut second_rd)).await;
+        assert!(
+            still_waiting.is_err(),
+            "the second connection must not be served while the cap's one permit is held by the first"
+        );
+
+        // Releasing the first connection's permit lets the second proceed:
+        // its already-sent Join (for an unknown job) now gets a refusal.
+        drop(first_client);
+        let response = tokio::time::timeout(WAIT, read_frame(&mut second_rd))
+            .await
+            .context("timed out waiting for the second connection to be served once the cap admitted it")?
+            .context("reading the refusal faulted")?
+            .context("the connection closed before refusing")?;
+        assert!(matches!(response, LinkFrame::Refused { .. }), "got {response:?}");
+
+        drop(second_wr);
+        drop(second_rd);
+        accept_loop.abort();
         Ok(())
     }
 }

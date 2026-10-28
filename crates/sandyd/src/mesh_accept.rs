@@ -670,11 +670,14 @@ mod tests {
         let first_client = connect(&loopback(addr.port())).await.context("connect first")?;
 
         // Second connection: the TCP accept succeeds (it's the OS listen
-        // backlog, not the semaphore), but the loop must not have started
-        // serve_one_remote_link for it yet — presenting a WRONG token on it
-        // right now would be refused immediately if it had, so instead this
-        // proves silence: no byte arrives within a short window.
+        // backlog, not the semaphore). It sends its malformed prefix
+        // immediately — a decode-only rejection an uncapped loop would
+        // refuse right away — so staying silent past the window below is
+        // proof the cap, not the decode, is what's holding it.
         let mut second_client = connect(&loopback(addr.port())).await.context("connect second")?;
+        tokio::io::AsyncWriteExt::write_all(&mut second_client, &u32::MAX.to_be_bytes())
+            .await
+            .context("write a malformed prefix on the second connection")?;
         let mut buf = [0u8; 1];
         let still_waiting = tokio::time::timeout(
             std::time::Duration::from_millis(200),
@@ -687,11 +690,8 @@ mod tests {
         );
 
         // Releasing the first connection's permit lets the second proceed:
-        // presenting a garbage prefix on it now gets a prompt refusal.
+        // its already-sent malformed prefix now gets a prompt refusal.
         drop(first_client);
-        tokio::io::AsyncWriteExt::write_all(&mut second_client, &u32::MAX.to_be_bytes())
-            .await
-            .context("write a malformed prefix on the second connection")?;
         let n = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             tokio::io::AsyncReadExt::read(&mut second_client, &mut buf),
