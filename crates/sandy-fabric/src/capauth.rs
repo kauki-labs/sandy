@@ -89,16 +89,21 @@ impl Cap {
     }
 
     /// A mutable handle onto the proof bytes, for an adversarial test that
-    /// tampers a cap to prove verification catches it. Test-only in intent,
-    /// not enforced by `cfg`: #217 is explicitly non-security hygiene, so
-    /// this is an acceptable escape hatch, not a trust-boundary violation.
+    /// tampers a cap to prove verification catches it. Compiled only for this
+    /// crate's own tests and the `contract-tests` feature (the same gate as the
+    /// `contract` module), so a production build has no way to edit a cap in
+    /// place (#385). Verification would still catch the edit, since the MAC
+    /// covers the scope, but a cap should not be editable at all.
+    #[cfg(any(test, feature = "contract-tests"))]
     pub fn proof_mut(&mut self) -> &mut Vec<u8> {
         &mut self.proof
     }
 
     /// A mutable handle onto the scope, for the same tampering tests as
     /// [`Cap::proof_mut`] (the shared contract-test harness edits individual
-    /// scope fields to prove a signed cap can't be silently widened).
+    /// scope fields to prove a signed cap can't be silently widened). Gated
+    /// like [`Cap::proof_mut`].
+    #[cfg(any(test, feature = "contract-tests"))]
     pub fn scope_mut(&mut self) -> &mut CapScope {
         &mut self.scope
     }
