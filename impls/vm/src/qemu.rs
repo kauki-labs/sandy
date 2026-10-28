@@ -195,6 +195,11 @@ pub fn qemu_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> Re
         args.push(format!("tap,id=net0,ifname={tap},script=no,downscript=no"));
         args.push("-device".to_string());
         args.push(format!("virtio-net-pci,netdev=net0,mac={GUEST_MAC}"));
+    } else {
+        // Without this qemu adds a default NIC on user-mode (NAT) networking: a guest with root could then
+        // reach the internet around the egress boundary.
+        args.push("-nic".to_string());
+        args.push("none".to_string());
     }
 
     // The virtio-fs shares: a shared memfd memory backend plus a client chardev +
@@ -1108,6 +1113,17 @@ mod tests {
         assert_eq!(vsock, vec!["vhost-vsock-pci,guest-cid=1234"], "{joined}");
         assert!(!joined.contains("-netdev"), "{joined}");
         assert!(!joined.contains("virtio-net"), "{joined}");
+        assert_nic_none(&args)?;
+        Ok(())
+    }
+
+    /// qemu adds a default user-mode NIC unless told otherwise, so a "no NIC" argv must say `-nic none`
+    /// (#406: the live gate found `ens3` in a proxy-mode guest).
+    fn assert_nic_none(args: &[String]) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            args.windows(2).any(|w| w[0] == "-nic" && w[1] == "none"),
+            "no tap must pass `-nic none`: {args:?}"
+        );
         Ok(())
     }
 
@@ -1398,6 +1414,7 @@ mod tests {
             !joined.contains("-netdev") && !joined.contains("virtio-net"),
             "no tap must emit no NIC: {joined}"
         );
+        assert_nic_none(&args)?;
         Ok(())
     }
 
