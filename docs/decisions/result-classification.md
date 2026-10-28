@@ -169,7 +169,15 @@ integrity, not registration authenticity) with a different answer.
   to trust, not about which bytes get tamper-evidence: the executor
   physically relayed both blocks, so both should be verifiably exactly what
   it sent, even though `guest_reported`'s contents remain a guest's
-  unverified claim once you look inside them.
+  unverified claim once you look inside them. This decision names the
+  scheme (length-prefixed, field-order-fixed) but not the field-by-field
+  byte mapping for `AuditReceipt`'s own shape (nested structs, `Option`s,
+  enums like `EgressEnforcement`, timestamps, vectors like `attempts` and
+  `outputs`, free text) — CodeRabbit on this PR. That mapping is the
+  implementation issue's job, explicitly: every nested field, `Option`, and
+  collection needs one fixed encoding before two independent
+  implementations (executor-side signing, sandyd-side verification) can be
+  guaranteed to produce or check the same bytes.
 - **sandyd countersigns.** Once `sandyd` verifies the executor's signature
   and accepts the receipt, it signs `(executor_signature, the receipt's own
 canonical bytes, job_id, the verified submitter's identity from decision
@@ -186,24 +194,32 @@ canonical bytes, job_id, the verified submitter's identity from decision
   `AuditReceipt.host_observed.location`), so a signature cannot be lifted
   from one job's receipt and attached to another's. `sandyd`'s ingestion
   additionally refuses a receipt for a `job_id` it has no matching dispatch
-  record for (decision 12's `HostRegistry` already tracks which host a job
-  was placed on), and treats a job's receipt as write-once: a second,
+  record for, and treats a job's receipt as write-once: a second,
   differently-signed receipt for an already-recorded `job_id` is rejected,
-  not silently overwritten. Both checks are enforcement sandyd already has
-  the state to do; neither needs new state invented for this decision.
+  not silently overwritten. Neither check exists today (CodeRabbit on this
+  PR): `HostRegistry` tracks which host a job was _placed_ on, live, for
+  routing — it is not a durable record of past dispatches, and nothing
+  persists an accepted receipt yet. Whichever store ends up owning
+  dispatched-job state (`JobStore`/`JobRegistry`, or a new table) must
+  persist both the dispatch-to-executor mapping and the write-once
+  accepted-receipt marker before these checks are implementable; this is
+  new persistent state the implementation issue adds, not enforcement
+  `sandyd` already has lying around.
 
 **Adversarial pass.**
 
-- _A compromised executor forges a receipt for a job it never ran._ Signing
-  does not defend against this directly, and the design does not pretend to:
-  decision 6's (`sandyd.md`) per-job agent-link authentication (the run-id +
-  token prefix) already scopes a dispatched job's relay channel to that one
-  job, so an executor holding a valid key cannot use it to originate traffic
-  for a `job_id` `sandyd` never dispatched to that peer — that boundary is
-  transport-level, not cryptographic. What signing adds on top: `sandyd`'s
-  own ingestion check (above) that a signed receipt's `job_id` matches an
-  actual dispatch to that signing identity, so even a replayed-and-resigned
-  attempt (not just a raw replay) is refused.
+- _A compromised executor forges a receipt for a `job_id` never dispatched to
+  it._ Signing does not defend against this directly, and the design does
+  not pretend to: decision 6's (`sandyd.md`) per-job agent-link
+  authentication (the run-id + token prefix) already scopes a dispatched
+  job's relay channel to that one job, so an executor holding a valid key
+  cannot use it to originate traffic for a `job_id` `sandyd` never
+  dispatched to that peer — that boundary is transport-level, not
+  cryptographic. What signing adds on top: `sandyd`'s own ingestion check
+  (above) that a signed receipt's `job_id` matches an actual dispatch to
+  that signing identity, so even a replayed-and-resigned attempt (not just a
+  raw replay) is refused. This does NOT cover a job that genuinely _was_
+  dispatched to that executor and never ran — see below.
 - _A compromised executor lies about `host_observed` fields it genuinely
   controls_ (fake timing, a fake backend kind). Out of scope for this
   decision, and stated as such: a compromised _executor_ is a stronger
@@ -216,9 +232,31 @@ canonical bytes, job_id, the verified submitter's identity from decision
   framing: the goal is "stays verifiable after the fact," not "cannot lie."
 - _Replaying another run's receipt._ Closed by the job_id-binding + write-once
   rule above: a captured, validly-signed receipt for job A cannot be
-  resubmitted as job B's receipt (the signed bytes name A), and cannot be
-  resubmitted as a second receipt for job A once sandyd has already recorded
-  one (write-once).
+  resubmitted as job B's receipt (the signed bytes name A). An exact
+  resubmission of job A's own already-accepted receipt (bit-identical
+  signature and bytes, e.g. a retried network send) is accepted
+  idempotently — a no-op that stores nothing new — rather than rejected: it
+  carries no new claim to distrust. A _different_ signed receipt for a
+  `job_id` that already has one is rejected (CodeRabbit on this PR narrows
+  this from the stronger, inaccurate claim that every second submission is
+  blocked): write-once means one accepted receipt per job, not one
+  submission attempt per job.
+- _A job that was dispatched but never actually run._ CodeRabbit on this PR:
+  the defenses above only bind a receipt to a `job_id` `sandyd` genuinely
+  dispatched to that executor — they do not prove the executor ran it. A
+  compromised executor that received a real `Dispatch` for job A can skip
+  running it entirely and sign a receipt for job A anyway; the dispatch-match
+  check in the bullet above accepts that receipt, because by its own
+  definition job A _was_ dispatched there. This decision's "forges a receipt
+  for a job it never ran" framing is narrower than it reads: it rules out a
+  receipt for a `job_id` never dispatched to that peer, not a receipt for a
+  dispatched job the executor never actually executed. Signing makes that
+  claim non-repudiable and tamper-evident; it does not make it true, and
+  nothing in this design supplies independent execution evidence (e.g. a
+  liveness/progress signal from the running job itself) that `sandyd` could
+  check the claim against. Left as a stated limit, not closed: an auditor
+  reading a signed receipt should know it attests "the executor claimed
+  this," not "sandyd independently confirmed this ran."
 
 **Alternative set aside.** Deriving the receipt-signing key from the
 executor's WireGuard identity (decision 12) instead of provisioning a second
