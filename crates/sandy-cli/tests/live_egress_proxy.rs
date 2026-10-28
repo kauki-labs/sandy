@@ -467,6 +467,7 @@ exit 0
 }
 
 /// Write an executable `#!/bin/sh` script to `path`.
+#[cfg(target_os = "linux")]
 fn write_script(path: &Path, body: &str) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -476,6 +477,7 @@ fn write_script(path: &Path, body: &str) -> anyhow::Result<()> {
 }
 
 /// The first `name` found on `PATH`.
+#[cfg(target_os = "linux")]
 fn find_on_path(name: &str) -> Option<std::path::PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?)
         .map(|dir| dir.join(name))
@@ -485,7 +487,9 @@ fn find_on_path(name: &str) -> Option<std::path::PathBuf> {
 /// KP7: a proxy that cannot start refuses the run as band 3, and the guest never boots. The proxy binary is
 /// swapped for a stub that records that it ran and exits before it prints `READY`. `SANDY_QEMU_BIN` points at
 /// a wrapper that records a launch and then runs the real qemu, because a failed run's envelope carries no
-/// console to inspect. This is the qemu leg: a vfkit leg needs the same wrapper for the vfkit binary.
+/// console to inspect. This is the qemu leg, so it exists only on Linux: a vfkit leg (KP7v) needs the same
+/// wrapper for the vfkit binary and is not written, so its row stays not green.
+#[cfg(target_os = "linux")]
 #[test]
 fn proxy_startup_failure_is_band_3() -> anyhow::Result<()> {
     let target = require_proxy_live()?;
@@ -495,8 +499,8 @@ fn proxy_startup_failure_is_band_3() -> anyhow::Result<()> {
     let qemu_ran = home.path().join("qemu-ran");
     let stub = home.path().join("failing-proxy");
     write_script(&stub, &format!("touch '{}'\nexit 3", proxy_ran.display()))?;
-    let qemu_name = format!("qemu-system-{}", std::env::consts::ARCH);
-    let real_qemu = find_on_path(&qemu_name).with_context(|| format!("refusing: `{qemu_name}` is not on PATH"))?;
+    let qemu_name = &target.hypervisor;
+    let real_qemu = find_on_path(qemu_name).with_context(|| format!("refusing: `{qemu_name}` is not on PATH"))?;
     let wrapper = home.path().join("qemu-wrapper");
     write_script(
         &wrapper,
@@ -517,6 +521,10 @@ fn proxy_startup_failure_is_band_3() -> anyhow::Result<()> {
         control.status.code(),
         String::from_utf8_lossy(&control.stderr)
     );
+    // The wrapper writes its marker before qemu runs, so the control must also have booted and succeeded.
+    let (control_code, control_env) =
+        parse_envelope(control.status.code().unwrap_or(-1), &control.stdout, &control.stderr)?;
+    assert_guest_ok(control_code, &control_env, "the control run must boot and exit 0");
     std::fs::remove_file(&qemu_ran).context("reset the qemu marker")?;
 
     let output = sandy_proxy_cmd(home.path(), &target, &allow, "exit 0")
