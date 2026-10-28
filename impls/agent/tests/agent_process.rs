@@ -490,6 +490,7 @@ fn run_on_with_env(
     let grants = grants();
     let control = RunControl::with_timeout_secs(30);
     backend.run(&RunSpec {
+        egress: None,
         template: "process",
         command,
         inputs: &[],

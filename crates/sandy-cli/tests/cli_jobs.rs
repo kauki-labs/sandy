@@ -68,6 +68,7 @@ fn booting_plan() -> JobPlan {
         secrets: vec![],
         env: vec![],
         allow: AllowList::default(),
+        egress_proxy: false,
         cpu: None,
         mem: None,
         timeout_secs: 60,
@@ -95,6 +96,7 @@ fn leaking_plan() -> JobPlan {
         }],
         env: vec![("TOK".to_string(), "leaked".to_string())],
         allow: AllowList::default(),
+        egress_proxy: false,
         cpu: None,
         mem: None,
         timeout_secs: 60,
@@ -531,6 +533,284 @@ fn run_hostname_allow_on_linux_is_invalid_plan_writes_no_record_and_never_boots(
     assert!(
         backend.killed().is_empty(),
         "a refused hostname entry must not touch the backend"
+    );
+    Ok(())
+}
+
+/// A proxy-mode plan (`SANDY_EGRESS=proxy`, #360) behind hostname entries, which
+/// the nftables plan refuses on Linux (#359).
+fn proxy_plan() -> JobPlan {
+    JobPlan {
+        allow: AllowList {
+            rules: vec![
+                EgressRule {
+                    host: "github.com".to_string(),
+                    port: 443,
+                },
+                EgressRule {
+                    host: "localhost".to_string(),
+                    port: 8080,
+                },
+            ],
+        },
+        egress_proxy: true,
+        ..booting_plan()
+    }
+}
+
+/// #360: on Linux a bound `$SANDY_TAP` with `SANDY_EGRESS=proxy` would put two
+/// boundary models on one guest, so it is an invalid plan (band 2): no journal
+/// record, no boot, no ruleset.
+#[test]
+fn run_proxy_mode_with_a_bound_tap_on_linux_is_invalid_plan_writes_no_record_and_never_boots() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    // A success is scripted on purpose: a boot would make the band 0.
+    let backend = FakeBackend::new().with_outcome(ok_outcome(0));
+    let applier = FakeApplier::new();
+
+    let report = run_job(
+        &backend,
+        &journal,
+        &proxy_plan(),
+        &applier,
+        EgressOs::Linux,
+        Some("sandytap0"),
+        &[],
+    )
+    .context("run_job (proxy mode with a tap, linux)")?;
+
+    assert_eq!(report.process_exit.code(), 2, "proxy mode with a tap is band 2");
+    assert!(!report.envelope.retryable, "band 2 is never retryable");
+    assert!(
+        report.envelope.message.contains("SANDY_TAP"),
+        "the error must name the conflicting variable: {}",
+        report.envelope.message
+    );
+    assert!(
+        journal.list().context("list after refused proxy plan")?.is_empty(),
+        "a refused plan must write no job record"
+    );
+    assert!(
+        backend.run_egress().is_empty(),
+        "a refused plan must never reach the backend"
+    );
+    assert!(
+        applier.applied_rulesets().is_empty(),
+        "a refused plan applies no ruleset"
+    );
+    Ok(())
+}
+
+/// #360: in proxy mode the backend receives the allow-list in `RunSpec`, the
+/// applier sees no apply and no revert, and hostname entries pass plan
+/// validation (#359's refusal is scoped to the nftables plan).
+#[test]
+fn run_proxy_mode_hands_the_allow_list_to_the_backend_and_applies_no_ruleset() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    let backend = FakeBackend::new().with_outcome(ok_outcome(0));
+    let applier = FakeApplier::new();
+    let plan = proxy_plan();
+
+    let report = run_job(&backend, &journal, &plan, &applier, EgressOs::Linux, None, &[])
+        .context("run_job (proxy mode, linux, no tap)")?;
+
+    assert_eq!(
+        report.process_exit.code(),
+        0,
+        "hostname entries are valid in proxy mode: {}",
+        report.envelope.message
+    );
+    assert_eq!(
+        backend.run_egress(),
+        vec![Some(plan.allow.clone())],
+        "the backend must receive exactly the plan's allow-list"
+    );
+    assert!(
+        applier.applied_rulesets().is_empty(),
+        "proxy mode applies no nftables ruleset"
+    );
+    assert!(!applier.was_reverted(), "proxy mode reverts nothing");
+    assert!(
+        report.envelope.warnings.is_empty(),
+        "the no-NIC `--allow has no effect` warning would be false in proxy mode: {:?}",
+        report.envelope.warnings
+    );
+    let egress = report.envelope.receipt.context("receipt")?.host_observed.egress;
+    assert_eq!(egress.status, EgressEnforcement::Enforced);
+    assert_eq!(egress.allow_list.as_ref(), Some(&plan.allow));
+    Ok(())
+}
+
+/// A plan with no proxy mode hands the backend no policy: the nftables path is unchanged.
+#[test]
+fn run_without_proxy_mode_hands_the_backend_no_policy() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    let backend = FakeBackend::new().with_outcome(ok_outcome(0));
+
+    run_job(
+        &backend,
+        &journal,
+        &allowing_plan(),
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        Some("sandytap0"),
+        &[],
+    )
+    .context("run_job (nftables path)")?;
+
+    assert_eq!(backend.run_egress(), vec![None]);
+    Ok(())
+}
+
+/// #360: the receipt records the proxy as enforcing only if the run reached it. A
+/// backend that refuses the policy before boot (`Spawn`) left it unapplied, and the
+/// receipt says so, with the reason and no allow-list.
+#[test]
+fn receipt_reports_a_proxy_refused_before_boot_as_unenforced() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    let backend = FakeBackend::new().with_error(BackendError::Spawn(
+        "the vfkit backend does not support the egress proxy yet".to_string(),
+    ));
+
+    let report = run_job(
+        &backend,
+        &journal,
+        &proxy_plan(),
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        None,
+        &[],
+    )
+    .context("run_job (proxy refused before boot)")?;
+
+    assert_eq!(report.process_exit.code(), 3, "a refusal before boot is an infra fault");
+    let egress = report.envelope.receipt.context("receipt")?.host_observed.egress;
+    assert_eq!(egress.status, EgressEnforcement::Unenforced);
+    assert!(
+        egress.allow_list.is_none(),
+        "an allow-list that was never applied must not be recorded"
+    );
+    let reason = egress.reason.context("an unenforced receipt names why")?;
+    assert!(reason.contains("does not support the egress proxy"), "{reason}");
+    Ok(())
+}
+
+/// #360: a guest that never booted ran behind no proxy, so its receipt is not `enforced` either.
+#[test]
+fn receipt_reports_a_proxy_run_that_never_booted_as_unenforced() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    let backend = FakeBackend::new().with_outcome(Outcome {
+        booted: false,
+        guest_exit: None,
+        transport_error: None,
+        timed_out: false,
+        console: String::new(),
+    });
+
+    let report = run_job(
+        &backend,
+        &journal,
+        &proxy_plan(),
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        None,
+        &[],
+    )
+    .context("run_job (proxy, never booted)")?;
+
+    let egress = report.envelope.receipt.context("receipt")?.host_observed.egress;
+    assert_eq!(egress.status, EgressEnforcement::Unenforced);
+    assert!(egress.allow_list.is_none());
+    Ok(())
+}
+
+/// #360: a proxy found dead before the guest booted served no run, so its receipt is not
+/// `enforced` either: `guest_exit: None` alone could not tell this from a mid-run death.
+#[test]
+fn receipt_reports_a_proxy_that_died_before_the_guest_booted_as_unenforced() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    let backend = FakeBackend::new().with_error(BackendError::EgressProxyDied {
+        status: Some(1),
+        booted: false,
+        guest_exit: None,
+    });
+
+    let report = run_job(
+        &backend,
+        &journal,
+        &proxy_plan(),
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        None,
+        &[],
+    )
+    .context("run_job (proxy died before boot)")?;
+
+    assert_eq!(report.process_exit.code(), 3, "a dead proxy is an infra fault");
+    let egress = report.envelope.receipt.context("receipt")?.host_observed.egress;
+    assert_eq!(egress.status, EgressEnforcement::Unenforced);
+    assert!(egress.allow_list.is_none());
+    Ok(())
+}
+
+/// #360: a proxy that died after it served the run stays recorded as enforced: the
+/// boundary held, and the death is its own band-3 fault.
+#[test]
+fn receipt_keeps_a_proxy_that_died_mid_run_as_enforced() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    let backend = FakeBackend::new().with_error(BackendError::EgressProxyDied {
+        status: Some(2),
+        booted: true,
+        guest_exit: Some(0),
+    });
+    let plan = proxy_plan();
+
+    let report = run_job(
+        &backend,
+        &journal,
+        &plan,
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        None,
+        &[],
+    )
+    .context("run_job (proxy died)")?;
+
+    let egress = report.envelope.receipt.context("receipt")?.host_observed.egress;
+    assert_eq!(egress.status, EgressEnforcement::Enforced);
+    assert_eq!(egress.allow_list.as_ref(), Some(&plan.allow));
+    Ok(())
+}
+
+/// #360: a proxy that died mid-run makes the run band 3 and retryable even though
+/// the guest exited 0, and the envelope names both exits.
+#[test]
+fn run_a_dead_egress_proxy_is_band_three_whatever_the_guest_exit() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    let backend = FakeBackend::new().with_error(BackendError::EgressProxyDied {
+        status: Some(2),
+        booted: true,
+        guest_exit: Some(0),
+    });
+
+    let report = run_job(
+        &backend,
+        &journal,
+        &proxy_plan(),
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        None,
+        &[],
+    )
+    .context("run_job (proxy died)")?;
+
+    assert_eq!(report.process_exit.code(), 3, "a dead proxy is an infra fault");
+    assert!(report.envelope.retryable);
+    assert_ne!(report.envelope.status, Status::Succeeded);
+    assert!(
+        report.envelope.message.contains("exit status 2") && report.envelope.message.contains("guest exit 0"),
+        "the envelope must name the proxy status and the guest exit: {}",
+        report.envelope.message
     );
     Ok(())
 }

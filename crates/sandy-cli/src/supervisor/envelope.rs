@@ -115,6 +115,13 @@ fn build_egress_receipt(result: &Result<EgressOutcome, String>, allow: &AllowLis
             allow_list: Some(allow.clone()),
             attempts: vec![],
         },
+        // The proxy is the boundary and it enforces `allow`; a backend that cannot run it refuses before boot.
+        Ok(EgressOutcome::Proxied) => EgressReceipt {
+            status: EgressEnforcement::Enforced,
+            reason: None,
+            allow_list: Some(allow.clone()),
+            attempts: vec![],
+        },
         Ok(EgressOutcome::Unenforced { reason }) => EgressReceipt {
             status: EgressEnforcement::Unenforced,
             reason: Some(reason.clone()),

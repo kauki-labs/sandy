@@ -461,6 +461,7 @@ impl ProcessBackend {
 
 impl VmBackend for ProcessBackend {
     fn run(&self, spec: &RunSpec) -> Result<Outcome, BackendError> {
+        spec.refuse_egress_proxy("process")?;
         if spec.command.is_empty() {
             return Err(BackendError::Spawn("empty command".to_string()));
         }
@@ -638,7 +639,27 @@ mod tests {
             outcome_file: None,
             secret_dir: None,
             control,
+            egress: None,
         }
+    }
+
+    /// #403: a backend with no egress proxy support refuses a policy-carrying
+    /// spec before it boots anything, so a proxy-mode run never runs unbounded.
+    #[test]
+    fn process_refuses_a_spec_that_carries_an_egress_policy() -> anyhow::Result<()> {
+        let allow = sandy_api::egress::AllowList::default();
+        let command = ["true".to_string()];
+        let grants = no_grants();
+        let spec = RunSpec {
+            egress: Some(&allow),
+            ..run_spec(&command, &grants, 30)
+        };
+        let refused = ProcessBackend::new().run(&spec);
+        let Err(BackendError::Spawn(message)) = refused else {
+            anyhow::bail!("expected a Spawn refusal, got {refused:?}");
+        };
+        anyhow::ensure!(message.contains("egress proxy"), "unexpected refusal: {message}");
+        Ok(())
     }
 
     fn no_grants() -> Grants {

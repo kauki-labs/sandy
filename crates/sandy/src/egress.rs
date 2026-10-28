@@ -267,6 +267,27 @@ pub fn validate_egress_hosts(allow: &AllowList, target_os: EgressOs) -> Result<(
     Ok(())
 }
 
+/// Validate a proxy-mode run (`SANDY_EGRESS=proxy`, #360) at plan time.
+///
+/// The proxy resolves names host-side, so hostname entries are valid here:
+/// [`validate_egress_hosts`]' refusal (#359) is scoped to the nftables plan
+/// only. What the proxy cannot share a run with is a guest NIC: on Linux a bound
+/// `tap` means the nftables path and the proxy would both claim the boundary, so
+/// the combination is refused rather than booted with two models.
+///
+/// # Errors
+///
+/// Returns [`PlanError::Invalid`] on Linux when `tap` is set.
+pub fn validate_proxy_egress(os: EgressOs, tap: Option<&str>) -> Result<(), PlanError> {
+    match (os, tap) {
+        (EgressOs::Linux, Some(tap)) => Err(PlanError::Invalid(format!(
+            "SANDY_EGRESS=proxy needs a guest with no NIC, but SANDY_TAP={tap} binds one; unset SANDY_TAP to use the \
+             egress proxy, or unset SANDY_EGRESS to keep the nftables boundary"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Whether `host` is a bare IPv4 address or `IPv4/prefix` CIDR (0-32).
 fn is_ipv4_or_cidr(host: &str) -> bool {
     match host.split_once('/') {
@@ -346,6 +367,8 @@ pub fn enforce<A: EgressApplier + ?Sized>(plan: &EgressPlan, applier: &A) -> Res
             tracing::warn!(reason = %reason, "egress boundary not enforced");
             Ok(EgressOutcome::Unenforced { reason: reason.clone() })
         }
+        // The backend's proxy is the boundary; the host applies nothing, so there is nothing to revert.
+        EgressPlan::Proxy => Ok(EgressOutcome::Proxied),
     }
 }
 
@@ -355,7 +378,7 @@ mod tests {
 
     use super::{
         AllowList, EgressOs, EgressOutcome, EgressPlan, EgressRule, enforce, macos_egress_statement, plan_egress,
-        plan_egress_scoped, to_nftables, to_nftables_forward, validate_egress_hosts,
+        plan_egress_scoped, to_nftables, to_nftables_forward, validate_egress_hosts, validate_proxy_egress,
     };
     use crate::backend::PlanError;
 
@@ -794,5 +817,46 @@ mod tests {
             }
             other => panic!("macOS must yield Unenforced, got {other:?}"),
         }
+    }
+
+    /// #360: the proxy plan applies nothing on the host: the applier sees no apply
+    /// and no revert, and the outcome says so rather than claiming a ruleset.
+    #[test]
+    fn the_proxy_plan_applies_nothing_and_reports_proxied() {
+        let applier = FakeApplier::new();
+        let outcome = enforce(&EgressPlan::Proxy, &applier);
+        assert!(matches!(outcome, Ok(EgressOutcome::Proxied)), "{outcome:?}");
+        assert!(applier.applied_rulesets().is_empty());
+        assert!(!applier.was_reverted());
+    }
+
+    /// #360: on Linux a bound guest tap and the proxy would claim the boundary
+    /// twice, so the combination is an invalid plan naming both variables.
+    #[test]
+    fn proxy_mode_on_linux_refuses_a_bound_tap() {
+        let Err(PlanError::Invalid(msg)) = validate_proxy_egress(EgressOs::Linux, Some("sandytap0")) else {
+            panic!("SANDY_EGRESS=proxy with a tap must be refused on Linux");
+        };
+        assert!(msg.contains("SANDY_EGRESS=proxy"), "{msg}");
+        assert!(msg.contains("SANDY_TAP=sandytap0"), "{msg}");
+    }
+
+    #[test]
+    fn proxy_mode_accepts_a_guest_with_no_nic() {
+        assert!(validate_proxy_egress(EgressOs::Linux, None).is_ok());
+        assert!(validate_proxy_egress(EgressOs::MacOs, None).is_ok());
+    }
+
+    /// #359 is scoped to the nftables plan: the same hostname entries that
+    /// `validate_egress_hosts` refuses on Linux are what the proxy plan exists for.
+    #[test]
+    fn the_hostname_refusal_belongs_to_the_nftables_plan_only() {
+        for host in ["github.com", "localhost"] {
+            assert!(
+                validate_egress_hosts(&allow_one(host, 8080), EgressOs::Linux).is_err(),
+                "the nftables plan refuses `{host}`"
+            );
+        }
+        assert!(validate_proxy_egress(EgressOs::Linux, None).is_ok());
     }
 }

@@ -2,7 +2,10 @@
 
 use std::sync::{Mutex, PoisonError};
 
-use sandy_api::backend::{BackendError, BoxState, Outcome, RunSpec, SandboxKind, VmBackend};
+use sandy_api::{
+    backend::{BackendError, BoxState, Outcome, RunSpec, SandboxKind, VmBackend},
+    egress::AllowList,
+};
 
 /// An in-memory [`VmBackend`] test double.
 ///
@@ -24,6 +27,9 @@ pub struct FakeBackend {
     /// Box ids passed to [`VmBackend::kill`], in call order — the one field
     /// mutated through `&self`, so the only one behind a lock.
     killed: Mutex<Vec<String>>,
+    /// The egress policy each [`VmBackend::run`] call carried, in call order; its
+    /// length is the number of runs, so an empty list proves nothing booted.
+    run_egress: Mutex<Vec<Option<AllowList>>>,
 }
 
 impl Default for FakeBackend {
@@ -33,6 +39,7 @@ impl Default for FakeBackend {
             boxes: Vec::new(),
             kind: SandboxKind::Vm,
             killed: Mutex::new(Vec::new()),
+            run_egress: Mutex::new(Vec::new()),
         }
     }
 }
@@ -72,6 +79,13 @@ impl FakeBackend {
         self
     }
 
+    /// The [`RunSpec::egress`] of each [`VmBackend::run`] call, in order. Empty
+    /// when `run` was never reached.
+    #[must_use]
+    pub fn run_egress(&self) -> Vec<Option<AllowList>> {
+        self.run_egress.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
     /// The box ids [`VmBackend::kill`] has been called with, in order.
     #[must_use]
     pub fn killed(&self) -> Vec<String> {
@@ -80,7 +94,11 @@ impl FakeBackend {
 }
 
 impl VmBackend for FakeBackend {
-    fn run(&self, _spec: &RunSpec) -> Result<Outcome, BackendError> {
+    fn run(&self, spec: &RunSpec) -> Result<Outcome, BackendError> {
+        self.run_egress
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(spec.egress.cloned());
         self.run_result
             .clone()
             .unwrap_or_else(|| Err(BackendError::Protocol("no scripted run outcome".to_string())))

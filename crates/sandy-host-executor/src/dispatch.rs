@@ -387,6 +387,7 @@ pub fn handle_dispatch(
                 on_link,
             });
             let spec = RunSpec {
+                egress: None,
                 template: &dispatch.job_id,
                 command: &argv,
                 inputs: &[],
@@ -459,6 +460,7 @@ pub fn handle_dispatch(
             });
             let env = history_lines_env(decoded.history_lines);
             let spec = RunSpec {
+                egress: None,
                 template: &template,
                 command: &decoded.command,
                 inputs: &[],

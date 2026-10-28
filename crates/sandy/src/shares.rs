@@ -123,6 +123,7 @@ mod tests {
 
     fn spec<'a>(command: &'a [String], secret_dir: Option<(&'a Path, DirFingerprint)>) -> RunSpec<'a> {
         RunSpec {
+            egress: None,
             template: "t",
             command,
             inputs: &[],
@@ -264,6 +265,7 @@ mod tests {
             outputs_dir: &tmp.path().join("outputs"),
         };
         let spec = RunSpec {
+            egress: None,
             template: "t",
             command: &command,
             inputs: &[],

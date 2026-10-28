@@ -344,6 +344,7 @@ fn agent_socket(base: &Path, run_id: Uuid) -> Result<PathBuf, BackendError> {
 
 impl VmBackend for VfkitBackend {
     fn run(&self, spec: &RunSpec) -> Result<Outcome, BackendError> {
+        spec.refuse_egress_proxy("vfkit")?;
         if self.agent.is_some() && self.agent_used.swap(true, Ordering::SeqCst) {
             return Err(BackendError::Spawn(
                 "this agent-mode backend already ran its one job; build one per sandbox run".to_string(),
@@ -468,6 +469,7 @@ mod tests {
         let command = ["true".to_string()];
         let grants = grants();
         let spec = RunSpec {
+            egress: None,
             template: "demo",
             command: &command,
             inputs: &[],
@@ -527,6 +529,7 @@ mod tests {
             source: SecretSource::File(PathBuf::from("/host/secret")),
         }];
         let spec = RunSpec {
+            egress: None,
             template: "demo",
             command: &command,
             inputs: &[],
@@ -574,6 +577,7 @@ mod tests {
         let command = ["true".to_string()];
         let grants = grants();
         let spec = RunSpec {
+            egress: None,
             template: "demo",
             command: &command,
             inputs: &[],
@@ -608,6 +612,7 @@ mod tests {
         let command = ["true".to_string()];
         let grants = grants();
         let spec = RunSpec {
+            egress: None,
             template: "demo",
             command: &command,
             inputs: &[],
@@ -650,7 +655,31 @@ mod tests {
             outcome_file: None,
             secret_dir: None,
             control: test_control(),
+            egress: None,
         }
+    }
+
+    /// #403: a backend with no egress proxy support refuses a policy-carrying
+    /// spec before it boots anything, so a proxy-mode run never runs unbounded.
+    #[test]
+    fn vfkit_refuses_a_spec_that_carries_an_egress_policy() -> anyhow::Result<()> {
+        let allow = sandy_api::egress::AllowList::default();
+        let command = ["true".to_string()];
+        let grants = Grants {
+            secrets: false,
+            agent: false,
+            shares: false,
+        };
+        let spec = RunSpec {
+            egress: Some(&allow),
+            ..spec_for("demo", &command, &grants)
+        };
+        let refused = VfkitBackend::new("/nonexistent/vfkit").run(&spec);
+        let Err(BackendError::Spawn(message)) = refused else {
+            anyhow::bail!("expected a Spawn refusal, got {refused:?}");
+        };
+        anyhow::ensure!(message.contains("egress proxy"), "unexpected refusal: {message}");
+        Ok(())
     }
 
     fn agent_backend() -> VfkitBackend {
@@ -847,6 +876,7 @@ mod tests {
         let command = ["true".to_string()];
         let grants = grants();
         let spec = RunSpec {
+            egress: None,
             template: "demo",
             command: &command,
             inputs: &[],
@@ -885,6 +915,7 @@ mod tests {
         let control = sandy::RunControl::with_timeout_secs(5);
         control.suspend_deadline();
         let spec = RunSpec {
+            egress: None,
             template: "demo",
             command: &command,
             inputs: &[],
@@ -919,6 +950,7 @@ mod tests {
         let grants = grants();
         let control = sandy::RunControl::with_timeout_secs(120);
         let spec = RunSpec {
+            egress: None,
             template: "demo",
             command: &command,
             inputs: &[],

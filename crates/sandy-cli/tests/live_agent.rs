@@ -128,6 +128,7 @@ async fn run_in_guest(
         };
         let control = RunControl::with_timeout_secs(120);
         host_backend().with_agent(launch).run(&RunSpec {
+            egress: None,
             template: &template,
             command: &command,
             inputs: &[],
