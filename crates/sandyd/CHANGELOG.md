@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/kauki-labs/sandy/compare/sandyd-v0.2.0...sandyd-v0.2.1) - 2026-10-28
+
+### Added
+
+- _(sandyd)_ wire orchestrator Cancel through to a remote host-executor's RunControl ([#478](https://github.com/kauki-labs/sandy/pull/478))
+
+### Fixed
+
+- _(sandy-fabric)_ compile the Cap mutators only for tests and contract-tests ([#467](https://github.com/kauki-labs/sandy/pull/467))
+- _(sandyd)_ cap pre-auth concurrency on the mesh and attach accept loops (NV-06, #395) ([#460](https://github.com/kauki-labs/sandy/pull/460))
+
 ## [0.2.0](https://github.com/kauki-labs/sandy/compare/sandyd-v0.1.1...sandyd-v0.2.0) - 2026-10-27
 
 ### Added

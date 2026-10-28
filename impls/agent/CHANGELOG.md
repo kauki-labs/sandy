@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/kauki-labs/sandy/compare/sandy-agent-v0.2.0...sandy-agent-v0.2.1) - 2026-10-28
+
+### Added
+
+- _(qemu)_ run the egress proxy per launch on a vsock port with a peer-CID check ([#468](https://github.com/kauki-labs/sandy/pull/468))
+- _(receipts)_ opt-in sha256 content digests of inputs and outputs ([#469](https://github.com/kauki-labs/sandy/pull/469))
+- _(egress)_ RunSpec egress policy, proxy plan variant, and band-3 EgressProxyDied ([#453](https://github.com/kauki-labs/sandy/pull/453))
+
 ## [0.2.0](https://github.com/kauki-labs/sandy/compare/sandy-agent-v0.1.1...sandy-agent-v0.2.0) - 2026-10-27
 
 ### Added
