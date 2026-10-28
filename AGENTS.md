@@ -117,6 +117,10 @@ time (the reasoning lives in the `rust-engineer` skill). Concrete commands:
 | `Cargo.toml`, deps, or `flake.nix` | `cargo shear --fix`, then `nix develop -c cargo check`                                                      |
 | Before opening a PR                | `nix fmt`, then `nix flake check -L` (full gate: build, clippy with deny-warnings, docs, tests, formatting) |
 
+A change that creates a feature or modifies an existing one goes through `swe-process:implement`;
+its quality-pass step is the change-specific row in the checks table above. The "Before opening a PR"
+row is the full gate.
+
 Commit with a Conventional Commits title.
 
 ## Architecture
