@@ -33,7 +33,7 @@ pub mod v1 {
 /// direct `prost` dependency just for that bound.
 pub use prost::Message;
 pub use v1::{
-    Arch, AttachStateChanged, Capabilities, Dispatch, HostExecutorMessage, IsolationClass, JobResult,
+    Arch, AttachStateChanged, Cancel, Capabilities, Dispatch, HostExecutorMessage, IsolationClass, JobResult,
     OrchestratorMessage, Register, RegisterRefused, Registered, SandboxKind, host_executor_message,
     orchestrator_message,
 };

@@ -38,9 +38,9 @@ use sandy_api::{
 use uuid::Uuid;
 
 use crate::{
-    agent::{agent_command_argv, agent_outcome},
+    agent::agent_outcome,
     console::{Markers, PipeTransport, run_console},
-    egress_proxy::{EgressLaunch, ProxyHandle, egress_relay_argv},
+    egress_proxy::{EgressLaunch, ProxyHandle, console_command},
     share::VirtiofsdTransport,
 };
 
@@ -195,6 +195,11 @@ pub fn qemu_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> Re
         args.push(format!("tap,id=net0,ifname={tap},script=no,downscript=no"));
         args.push("-device".to_string());
         args.push(format!("virtio-net-pci,netdev=net0,mac={GUEST_MAC}"));
+    } else {
+        // Without this qemu adds a default NIC on user-mode (NAT) networking: a guest with root could then
+        // reach the internet around the egress boundary.
+        args.push("-nic".to_string());
+        args.push("none".to_string());
     }
 
     // The virtio-fs shares: a shared memfd memory backend plus a client chardev +
@@ -495,19 +500,6 @@ fn plan_shares_or_wipe(spec: &RunSpec, dirs: &ShareDirs<'_>) -> Result<SharePlan
             }
         }
     })
-}
-
-/// The command the guest console runs: the job, behind the agent in agent mode, behind the egress
-/// relay in proxy mode (outermost, so the relay's variables reach the agent and the job).
-fn console_command(job: &[String], agent: Option<&Path>, relay: Option<(&Path, u32)>) -> Vec<String> {
-    let inner = match agent {
-        Some(program) => agent_command_argv(program, AGENT_VSOCK_PORT, job),
-        None => job.to_vec(),
-    };
-    match relay {
-        Some((program, port)) => egress_relay_argv(program, port, &inner),
-        None => inner,
-    }
 }
 
 /// Refuse a policy-carrying spec off Linux: the proxy listens on `AF_VSOCK` (vhost-vsock).
@@ -1121,6 +1113,17 @@ mod tests {
         assert_eq!(vsock, vec!["vhost-vsock-pci,guest-cid=1234"], "{joined}");
         assert!(!joined.contains("-netdev"), "{joined}");
         assert!(!joined.contains("virtio-net"), "{joined}");
+        assert_nic_none(&args)?;
+        Ok(())
+    }
+
+    /// qemu adds a default user-mode NIC unless told otherwise, so a "no NIC" argv must say `-nic none`
+    /// (#406: the live gate found `ens3` in a proxy-mode guest).
+    fn assert_nic_none(args: &[String]) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            args.windows(2).any(|w| w[0] == "-nic" && w[1] == "none"),
+            "no tap must pass `-nic none`: {args:?}"
+        );
         Ok(())
     }
 
@@ -1151,59 +1154,6 @@ mod tests {
             "cid: {refused:?}"
         );
         Ok(())
-    }
-
-    /// #404: the console command in console-only proxy mode is the relay wrapper around the job.
-    #[test]
-    fn the_console_command_wraps_a_console_only_job_in_the_relay() {
-        let job = [
-            "sh".to_string(),
-            "-c".to_string(),
-            "curl https://github.com".to_string(),
-        ];
-        let program = Path::new("/nix/store/a-sandy-agent/bin/sandy-agent");
-        assert_eq!(
-            console_command(&job, None, Some((program, 50123))),
-            [
-                "/nix/store/a-sandy-agent/bin/sandy-agent",
-                "egress-relay",
-                "--vsock-port",
-                "50123",
-                "--",
-                "sh",
-                "-c",
-                "curl https://github.com"
-            ]
-        );
-    }
-
-    /// #404: in agent mode the relay is outermost and the agent invocation is its `<rest>`.
-    #[test]
-    fn the_console_command_wraps_the_agent_invocation_in_the_relay() {
-        let job = ["sh".to_string(), "-c".to_string(), "env".to_string()];
-        let program = Path::new("/nix/store/a-sandy-agent/bin/sandy-agent");
-        assert_eq!(
-            console_command(&job, Some(program), Some((program, 50123))),
-            [
-                "/nix/store/a-sandy-agent/bin/sandy-agent",
-                "egress-relay",
-                "--vsock-port",
-                "50123",
-                "--",
-                "/nix/store/a-sandy-agent/bin/sandy-agent",
-                "--vsock-listen",
-                "5000",
-                "--",
-                "sh",
-                "-c",
-                "env"
-            ]
-        );
-        assert_eq!(
-            console_command(&job, None, None),
-            job,
-            "no agent, no proxy: the job unchanged"
-        );
     }
 
     /// A stub qemu that never opens the serial socket, so the console fails to connect within the
@@ -1464,6 +1414,7 @@ mod tests {
             !joined.contains("-netdev") && !joined.contains("virtio-net"),
             "no tap must emit no NIC: {joined}"
         );
+        assert_nic_none(&args)?;
         Ok(())
     }
 

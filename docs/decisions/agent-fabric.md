@@ -72,7 +72,12 @@ and `stream_from`, which replays and then follows as one primitive.
 
 **Consequences.** Every backend inherits dedup and gap-free resubscription at a
 cursor, because the suite checks both, including a stream opened before an append.
-Whether a late envelope below a stream's cursor is emitted live is open (#162).
+A missing envelope at a follower's cursor holds back every later sequence until
+it fills, never emitted out of order (#162, resolved): `stream_from` yields only
+the entry at exactly the follower's cursor. Safe to hold indefinitely rather than
+time out and skip, since a conforming single-writer `Channel` only advances its
+sequence counter past an envelope it actually stored (never a deduplicated
+repost), so it can never leave a gap open.
 
 **Set aside.** A fetch-then-subscribe composition: it has a window where a
 message lands between the two and is missed.
@@ -184,7 +189,13 @@ rather than reimplements.
 - `StaticRegistry` is a host list (`localhost` for the all-local profile) filtered
   with `capabilities_satisfy`.
 - `ExecutorCapacity` probes an `Executor` directly: free slots are its limit minus
-  the boxes `observe()` reports.
+  the boxes `observe()` reports. Its `descriptor_for(host)` reads that same
+  executor's `capabilities()` to build the `HostDescriptor` a composition root
+  registers in `Discovery` — the required path, not a hand-typed `Capabilities`
+  value, since two independently maintained tables for the same host can drift
+  (#209): `Discovery::find` would then match a request the wired executor can't
+  actually satisfy, surfacing as a confusing run-time failure instead of a
+  placement-time mismatch.
 - `LeaseTable` is lease soft-state on an injected `Clock`. A lease is live while
   `now < deadline`; at the deadline it lapses and is unknown to every call. A host
   holds one lease: registering again replaces it, so deregistering ends liveness.

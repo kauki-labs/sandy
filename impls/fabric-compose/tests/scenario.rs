@@ -50,7 +50,7 @@ use sandy_fabric::{
     channel_backend::ChannelBackendError,
     contract::fakes::FakeHumanBackend,
     escalation::{EscalationRequest, Severity},
-    executor::{Arch, Capabilities, Requirements},
+    executor::{Arch, Requirements},
     placement::Lifecycle as _,
     roles::{ChannelAssignment, ChannelRole, decode_assignment},
     types::{ChannelId, HostId, PeerId},
@@ -88,14 +88,6 @@ impl CapAuthority for SharedAuthority {
 
 type Backend = InMem;
 type Authority = SharedAuthority;
-
-fn host_arch() -> Arch {
-    match std::env::consts::ARCH {
-        "x86_64" => Arch::X86_64,
-        "aarch64" => Arch::Aarch64,
-        other => panic!("unsupported host architecture for this scenario test: {other}"),
-    }
-}
 
 fn full_rights() -> CapRights {
     CapRights {
@@ -223,14 +215,12 @@ impl LaunchedChannel {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_all_local_scenario_runs_end_to_end() -> anyhow::Result<()> {
     // ---- Discover a host (real Discovery + Capacity + Lifecycle + place) ----
-    let caps = Capabilities {
-        kind: SandboxKind::Process,
-        arch: host_arch(),
-        attestation: None,
-    };
-    let discovery = StaticRegistry::localhost(caps.kind, caps.arch);
+    // The registered descriptor comes from the SAME executor Capacity probes
+    // (#209): a separately hand-typed Capabilities value here could drift from
+    // what's actually wired in, matching a request Discovery never should have.
     let host_id = HostId::from(StaticRegistry::LOCALHOST);
     let capacity = ExecutorCapacity::new().with_host(host_id.clone(), VmBackendExecutor::new(ProcessBackend::new()), 1);
+    let discovery = StaticRegistry::new([capacity.descriptor_for(&host_id).context("describe the local host")?]);
     let lifecycle = LeaseTable::new(Duration::from_secs(60));
     lifecycle
         .register(host_id.clone())
@@ -245,6 +235,31 @@ async fn the_all_local_scenario_runs_end_to_end() -> anyhow::Result<()> {
         .context("place")?
         .context("a host should have been placed")?;
     assert_eq!(placed, host_id, "the only registered host is the one placed");
+
+    // The registered descriptor's own architecture is authoritative: a
+    // request for the OTHER architecture must find no host, proving
+    // `descriptor_for`'s capabilities are what `place` actually enforces,
+    // not a looser value a hand-typed descriptor could have carried.
+    let registered_arch = capacity
+        .descriptor_for(&host_id)
+        .context("describe the local host")?
+        .capabilities
+        .arch;
+    let mismatched_arch = match registered_arch {
+        Arch::X86_64 => Arch::Aarch64,
+        Arch::Aarch64 => Arch::X86_64,
+    };
+    let unmet_req = Requirements {
+        kind: SandboxKind::Process,
+        arch: Some(mismatched_arch),
+    };
+    let unplaced = place(&discovery, &lifecycle, &capacity, &unmet_req)
+        .await
+        .context("place with an architecture the host doesn't provide")?;
+    assert_eq!(
+        unplaced, None,
+        "a host whose registered arch doesn't match the request must not be placed"
+    );
 
     // ---- Launch the sandbox's orchestrator channel (the 1:1 invariant) ----
     let (launched, bootstrap_cap_bytes) =

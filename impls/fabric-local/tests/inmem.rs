@@ -73,25 +73,31 @@ async fn next_seq(
 
 /// Two independent `stream_from` subscribers track their own cursors: reading
 /// from one does not advance or skip entries for the other.
+///
+/// Sequences start at 0 here, matching how a real `Channel` numbers them
+/// (contiguous from 0) — hold-back (#162) means `stream_from(n)` waits for
+/// sequence `n` itself to exist, so a fixture that skipped 0 entirely (no
+/// entry ever occupies it) would park forever rather than exercising this
+/// test's actual concern.
 #[tokio::test]
 async fn independent_stream_subscribers_do_not_cross_cursors() -> anyhow::Result<()> {
     let backend = InMem::default();
-    backend.append(envelope(1, "a")).await.context("append 1")?;
-    backend.append(envelope(2, "b")).await.context("append 2")?;
+    backend.append(envelope(0, "a")).await.context("append 0")?;
+    backend.append(envelope(1, "b")).await.context("append 1")?;
 
     let mut from_zero = backend.stream_from(0);
-    let mut from_two = backend.stream_from(2);
+    let mut from_one = backend.stream_from(1);
 
-    assert_eq!(next_seq(&mut from_zero).await?, 1, "from_zero starts at its own cursor");
+    assert_eq!(next_seq(&mut from_zero).await?, 0, "from_zero starts at its own cursor");
     assert_eq!(
-        next_seq(&mut from_two).await?,
-        2,
-        "from_two starts at its own cursor, unaffected by from_zero"
+        next_seq(&mut from_one).await?,
+        1,
+        "from_one starts at its own cursor, unaffected by from_zero"
     );
     assert_eq!(
         next_seq(&mut from_zero).await?,
-        2,
-        "from_zero's second read is unaffected by from_two"
+        1,
+        "from_zero's second read is unaffected by from_one"
     );
 
     // Both subscribers are caught up with nothing left to read. Spawn their next
@@ -100,18 +106,18 @@ async fn independent_stream_subscribers_do_not_cross_cursors() -> anyhow::Result
     // already exists — that would pass even with a broken waker, since a fresh
     // scan finds the new entry regardless of whether anything woke the task.
     let zero_task = tokio::spawn(async move { next_seq(&mut from_zero).await });
-    let two_task = tokio::spawn(async move { next_seq(&mut from_two).await });
+    let one_task = tokio::spawn(async move { next_seq(&mut from_one).await });
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    backend.append(envelope(3, "c")).await.context("append 3")?;
+    backend.append(envelope(2, "c")).await.context("append 2")?;
 
     let zero_seq = zero_task.await.context("join from_zero")??;
-    let two_seq = two_task.await.context("join from_two")??;
+    let one_seq = one_task.await.context("join from_one")??;
     assert_eq!(
-        zero_seq, 3,
+        zero_seq, 2,
         "from_zero follows the live append it was genuinely parked on"
     );
-    assert_eq!(two_seq, 3, "from_two follows the live append independently");
+    assert_eq!(one_seq, 2, "from_one follows the live append independently");
     Ok(())
 }
 
