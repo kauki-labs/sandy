@@ -179,6 +179,7 @@ fn bytecount_newlines(buf: &[u8]) -> usize {
     buf.iter().filter(|&&b| b == b'\n').count()
 }
 
+mod egress_relay;
 mod link_source;
 mod peer;
 mod tmux_pty;
@@ -191,6 +192,10 @@ fn main() -> ExitCode {
     // `sandy-agent peer …` is the job's helper for its peer channels (#238).
     if args.first().is_some_and(|first| first == "peer") {
         return peer::cli(&args[1..]);
+    }
+    // `sandy-agent egress-relay …` wraps the job in the guest-side egress relay (#402).
+    if args.first().is_some_and(|first| first == "egress-relay") {
+        return egress_relay::cli(&args[1..]);
     }
     let (source, job) = match link_source::parse_args(args) {
         Ok(parsed) => parsed,
