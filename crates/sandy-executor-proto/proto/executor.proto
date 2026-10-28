@@ -59,6 +59,7 @@ message OrchestratorMessage {
     RegisterRefused refused = 2;
     Dispatch dispatch = 3;
     AttachStateChanged attach_state_changed = 4;
+    Cancel cancel = 5;
   }
 }
 
@@ -180,4 +181,20 @@ message AttachStateChanged {
   // keeps only the highest-sequence value it has seen per job_id and
   // discards anything at or below it, rather than trusting arrival order.
   uint64 sequence = 3;
+}
+
+// Orchestrator -> host-executor (#477): the client-facing Cancel RPC
+// (sandy-control-proto) reached a job that was already placed on a remote
+// host. Before this message, sandyd's Cancel only marked the job terminal in
+// its own local store — nothing retracted an already-dispatched job on the
+// host-executor side (decision 12's own residual-gap note). The
+// host-executor calls `control.cancel()` on the matching job's live
+// `RunControl`, the same cooperative mechanism an in-process caller already
+// uses (#340/#344) — this is just the one missing transport hop, not a new
+// cancellation mechanism. Best-effort: if the host is unreachable, or the
+// job has already finished, the send/application is a no-op (sandyd's own
+// local cancel already took effect regardless; this is the on-top synchronous
+// stop for a job genuinely still running on the host).
+message Cancel {
+  string job_id = 1;
 }

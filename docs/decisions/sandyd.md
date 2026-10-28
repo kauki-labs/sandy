@@ -619,13 +619,21 @@ unit-testable without a real socket — the same shape decision 6's
 accepted connection) and the placement logic that decides when to call
 `send_dispatch` (`handler::handle`, via `HostRegistry::pick_host_for` and
 `send_dispatch_if_current`) are both now implemented.
-There is also no `OrchestratorMessage` variant for cancelling a dispatched
-job: a cancelled run's sandbox keeps executing on the host until it finishes
-on its own (decision 6's token invalidation, §6, stops a late-arriving
-executor stream from claiming the run's agent link, but does nothing to stop
-the host-side process itself). Confirmed intentionally deferred past M2, not
-a contract break — a future `Cancel`/`Stop` message is an additive `oneof`
-variant, not a breaking change to what's shipped here.
+At the time, there was also no `OrchestratorMessage` variant for cancelling a
+dispatched job — a cancelled run's sandbox kept executing on the host until
+it finished on its own, with only decision 6's token invalidation (§6)
+stopping a late-arriving executor stream from claiming the run's agent link,
+never touching the host-side process itself. Confirmed intentionally
+deferred past M2, not a contract break: a future `Cancel`/`Stop` message was
+always going to be an additive `oneof` variant, not a breaking change to what
+shipped here. That gap is closed by #477: `Cancel { job_id }` reaches the
+owning host-executor over the same per-host connection `AttachStateChanged`
+already rides (a separate queue, so a full dispatch queue can't starve it),
+which calls `control.cancel()` on the matching job's live `RunControl` —
+the same cooperative mechanism decision 16's keepalive work and #340 already
+wired an in-process caller to. Best-effort: if the host is unreachable or the
+job already finished, sandyd's own local cancel (this section's bookkeeping)
+still took effect regardless.
 
 **Set aside.** Building the mesh-address accept loop and wiring it into
 `main.rs` in this same slice: that needs a decision this PR doesn't own (how
