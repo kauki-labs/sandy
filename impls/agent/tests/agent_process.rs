@@ -386,12 +386,16 @@ async fn a_job_behind_the_egress_relay_and_tmux_sees_the_proxy_variables() -> an
     }
     let dir = tempfile::tempdir()?;
     let wrapper = dir.path().join("agent-behind-relay");
-    let agent = agent_binary();
+    // Reach the agent through a path with spaces, so the wrapper only works if it quotes the path.
+    let spaced = dir.path().join("a dir with spaces");
+    std::fs::create_dir_all(&spaced)?;
+    let agent = spaced.join("sandy-agent");
+    std::os::unix::fs::symlink(agent_binary(), &agent)?;
     std::fs::write(
         &wrapper,
         format!(
             "#!/bin/sh\nexec {agent} egress-relay --vsock-port 5001 -- {agent} \"$@\"\n",
-            agent = agent.display()
+            agent = shell_quote(&agent)
         ),
     )?;
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))?;
