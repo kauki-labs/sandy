@@ -201,6 +201,9 @@ impl PtyTransport {
             .take()
             .ok_or_else(|| BackendError::Spawn("pty slave already consumed".to_string()))?;
         let mut builder = portable_pty::CommandBuilder::new(program);
+        // portable-pty chdirs into $HOME by default; a missing HOME (the nix build sandbox) then fails the
+        // spawn with ENOENT. Every path the child gets is absolute, so run it from `/`.
+        builder.cwd("/");
         for arg in args {
             builder.arg(arg);
         }

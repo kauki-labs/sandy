@@ -38,9 +38,9 @@ use sandy_api::{
 use uuid::Uuid;
 
 use crate::{
-    agent::{agent_command_argv, agent_outcome},
+    agent::agent_outcome,
     console::{Markers, PipeTransport, run_console},
-    egress_proxy::{EgressLaunch, ProxyHandle, egress_relay_argv},
+    egress_proxy::{EgressLaunch, ProxyHandle, console_command},
     share::VirtiofsdTransport,
 };
 
@@ -495,19 +495,6 @@ fn plan_shares_or_wipe(spec: &RunSpec, dirs: &ShareDirs<'_>) -> Result<SharePlan
             }
         }
     })
-}
-
-/// The command the guest console runs: the job, behind the agent in agent mode, behind the egress
-/// relay in proxy mode (outermost, so the relay's variables reach the agent and the job).
-fn console_command(job: &[String], agent: Option<&Path>, relay: Option<(&Path, u32)>) -> Vec<String> {
-    let inner = match agent {
-        Some(program) => agent_command_argv(program, AGENT_VSOCK_PORT, job),
-        None => job.to_vec(),
-    };
-    match relay {
-        Some((program, port)) => egress_relay_argv(program, port, &inner),
-        None => inner,
-    }
 }
 
 /// Refuse a policy-carrying spec off Linux: the proxy listens on `AF_VSOCK` (vhost-vsock).
@@ -1151,59 +1138,6 @@ mod tests {
             "cid: {refused:?}"
         );
         Ok(())
-    }
-
-    /// #404: the console command in console-only proxy mode is the relay wrapper around the job.
-    #[test]
-    fn the_console_command_wraps_a_console_only_job_in_the_relay() {
-        let job = [
-            "sh".to_string(),
-            "-c".to_string(),
-            "curl https://github.com".to_string(),
-        ];
-        let program = Path::new("/nix/store/a-sandy-agent/bin/sandy-agent");
-        assert_eq!(
-            console_command(&job, None, Some((program, 50123))),
-            [
-                "/nix/store/a-sandy-agent/bin/sandy-agent",
-                "egress-relay",
-                "--vsock-port",
-                "50123",
-                "--",
-                "sh",
-                "-c",
-                "curl https://github.com"
-            ]
-        );
-    }
-
-    /// #404: in agent mode the relay is outermost and the agent invocation is its `<rest>`.
-    #[test]
-    fn the_console_command_wraps_the_agent_invocation_in_the_relay() {
-        let job = ["sh".to_string(), "-c".to_string(), "env".to_string()];
-        let program = Path::new("/nix/store/a-sandy-agent/bin/sandy-agent");
-        assert_eq!(
-            console_command(&job, Some(program), Some((program, 50123))),
-            [
-                "/nix/store/a-sandy-agent/bin/sandy-agent",
-                "egress-relay",
-                "--vsock-port",
-                "50123",
-                "--",
-                "/nix/store/a-sandy-agent/bin/sandy-agent",
-                "--vsock-listen",
-                "5000",
-                "--",
-                "sh",
-                "-c",
-                "env"
-            ]
-        );
-        assert_eq!(
-            console_command(&job, None, None),
-            job,
-            "no agent, no proxy: the job unchanged"
-        );
     }
 
     /// A stub qemu that never opens the serial socket, so the console fails to connect within the
