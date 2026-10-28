@@ -542,6 +542,13 @@ booted, guest_exit }`. It is band 3 and retryable whatever the guest exit, so a 
 - End-to-end: every live test asserts the envelope `status`/`exit_code`; `live_e2e.rs`
   asserts `envelope.outputs` and no secret leak in `logs.tail`. The receipt is not
   yet asserted on a real boot (`kpi.md`'s "Not yet a KPI").
+- **Signing receipts relayed from remote executors (decision 6, #374).**
+  Design-only (`docs/decisions/result-classification.md` decision 6): a
+  per-executor Ed25519 signature plus a `sandyd` countersignature, answering
+  #374's key/format/countersign questions with an adversarial pass.
+  Implementation is `#472`, blocked by `#413` (no relay path exists to sign
+  until a dispatched job's receipt is persisted at all). Stays out of
+  `kpi.md`'s live matrix until #472 lands and is asserted on a real boot.
 
 ---
 
