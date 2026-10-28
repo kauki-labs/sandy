@@ -46,7 +46,10 @@ is `agent`.
   manifest is read by whoever executes it. A path that is valid on the submitter's machine
   is wrong or hostile on another host.
 - **P3 — One manifest type.** `JobManifest` grows the fields. The executor's two ad-hoc
-  decodes become views of it, so the two shapes stop drifting.
+  decodes become views of it, so the two shapes stop drifting. Deferred as its own decision
+  (`docs/decisions/sandyd.md` §19): #480 lands the plain-value fields by growing `argv/v1`/
+  `flake/v1` in place instead, since collapsing to one wire tag needs an explicit `SandboxKind`
+  field to replace what the encoding tag signals today (decision 18).
 - **P4 — Bounds are the host's, requests are the submitter's.** cpu, mem and timeout are
   requests, clamped by the executing host's policy. `STAGE1_TIMEOUT_SECS` becomes the
   default and the ceiling, not a constant.
