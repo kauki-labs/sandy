@@ -78,7 +78,7 @@ version, metadata, dependency versions, and lints through the root `Cargo.toml`
   test (mesh env vars, and why `SANDY_AGENT_PATH` must be a Nix store path).
 - **`sandy-egress-proxy`** — the per-run host egress proxy for NIC-less guests
   (#401, epic #360): a pure CONNECT-parse / allow-list / address-filter core and an
-  unprivileged binary. `QemuBackend` runs one per launch (#404); the vfkit wiring is #405. See
+  unprivileged binary. `QemuBackend` (#404) and `VfkitBackend` (#405) run one per launch, not yet live-verified. See
   `docs/decisions/egress-proxy.md`.
 
 ## Build & test (run before committing)

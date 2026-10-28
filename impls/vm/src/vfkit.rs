@@ -35,8 +35,9 @@ use sandy_api::{
 use uuid::Uuid;
 
 use crate::{
-    agent::{agent_command_argv, agent_outcome, spawn_connector},
+    agent::{agent_outcome, spawn_connector},
     console::{Markers, PtyTransport, run_console},
+    egress_proxy::{EGRESS_VSOCK_PORT, EgressLaunch, ProxyHandle, console_command},
     share::VirtioFsTransport,
 };
 
@@ -64,6 +65,9 @@ pub struct StagedArgs {
     /// Agent mode (#238): the guest vsock port the agent listens on and the host
     /// unix socket vfkit exposes it at, for the host to connect to.
     pub agent_vsock: Option<(u32, PathBuf)>,
+    /// Egress-proxy mode (#405): the host unix socket vfkit dials for each guest
+    /// connection to the fixed egress vsock port. The proxy listens there.
+    pub egress_socket: Option<PathBuf>,
 }
 
 impl StagedArgs {
@@ -73,6 +77,7 @@ impl StagedArgs {
         Self {
             shares,
             agent_vsock: None,
+            egress_socket: None,
         }
     }
 }
@@ -99,6 +104,9 @@ impl StagedArgs {
 ///   the secret share), via the [`VirtioFsTransport`]. Each `--device` and its descriptor are separate argv tokens;
 ///   read-only is enforced by the guest mount (vfkit's virtio-fs device rejects a `,ro` option).
 /// - `--device virtio-vsock,…` when [`Topology::vsock_cid`] is `Some` (absent in the aarch64 fixture).
+/// - proxy mode ([`StagedArgs::egress_socket`], #405): `--device virtio-vsock,port=5001,socketURL=<socket>,listen`, so
+///   vfkit dials the proxy's unix socket for each guest-initiated connection. It coexists with the agent link's
+///   `connect` device on port 5000. No `virtio-net` is emitted in either mode: the guest has no NIC.
 ///
 /// # Errors
 ///
@@ -170,6 +178,16 @@ pub fn vfkit_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> R
         ));
     }
 
+    // Proxy mode (#405): `listen` makes vfkit the dialer: it connects to the proxy's unix socket for each
+    // guest-initiated connection to the egress port.
+    if let Some(socket) = &staged.egress_socket {
+        args.push("--device".to_string());
+        args.push(format!(
+            "virtio-vsock,port={EGRESS_VSOCK_PORT},socketURL={},listen",
+            socket.display()
+        ));
+    }
+
     Ok(args)
 }
 
@@ -226,6 +244,13 @@ impl VfkitBackend {
     /// synchronous: the box lives only for this call. The console never fabricates
     /// `guest_exit`: a transport/timeout fault lands in the [`Outcome`], only
     /// staging/spawn faults are errors.
+    ///
+    /// In proxy mode (`egress`, #405) the proxy starts first, so a start failure
+    /// returns before vfkit spawns. At teardown it is health-checked with
+    /// `try_wait` BEFORE it is killed: one that died first is an
+    /// [`BackendError::EgressProxyDied`], which takes precedence over the guest's
+    /// own result and the agent verdict (the guest lost its network).
+    #[allow(clippy::too_many_arguments, reason = "one launch attempt's inputs, all distinct")]
     fn boot(
         &self,
         topology: &Topology,
@@ -234,6 +259,7 @@ impl VfkitBackend {
         box_id: &str,
         shares: Vec<ShareSpec>,
         agent: Option<&AgentRun>,
+        egress: Option<&EgressLaunch<'_>>,
     ) -> Result<Outcome, BackendError> {
         // The shares (secret/input/output, their read-only flags, the #49 secret_dir
         // rule) are staged by `plan_shares` in `run`; here they only become argv. The
@@ -241,24 +267,29 @@ impl VfkitBackend {
         // `socket` field is unused by vfkit (no daemon). INV-1: only share metadata
         // travels here, never secret bytes.
         let mut staged = StagedArgs::new(shares);
-        // Agent mode: the console launches the image's agent around the job, and
-        // vfkit exposes the agent's vsock port as the run's host socket.
-        let agent_command;
-        let agent_spec;
-        let console_spec = match agent {
-            Some(agent) => {
-                staged.agent_vsock = Some((AGENT_VSOCK_PORT, agent.socket.clone()));
-                agent_command = agent_command_argv(&agent.program, AGENT_VSOCK_PORT, spec.command);
-                agent_spec = RunSpec {
-                    digests: false,
-                    command: &agent_command,
-                    ..*spec
-                };
-                &agent_spec
-            }
-            None => spec,
-        };
+        // Agent mode: vfkit exposes the agent's vsock port as the run's host socket.
+        if let Some(agent) = agent {
+            staged.agent_vsock = Some((AGENT_VSOCK_PORT, agent.socket.clone()));
+        }
+        // Proxy mode: vfkit dials the proxy's unix socket for the egress port.
+        staged.egress_socket = egress.and_then(EgressLaunch::unix_socket).map(Path::to_path_buf);
         let args = vfkit_args(topology, spec, &staged)?;
+
+        // The proxy belongs to this attempt and starts before vfkit. `ProxyHandle` kills on
+        // drop, so every early return below stops it too.
+        let mut proxy = egress.map(EgressLaunch::start).transpose()?;
+        // The console launches the image's agent around the job (agent mode) and the egress
+        // relay around that (proxy mode).
+        let console_command = console_command(
+            spec.command,
+            agent.map(|agent| agent.program.as_path()),
+            egress.zip(proxy.as_ref()).map(|(e, p)| (e.relay_program, p.port())),
+        );
+        let console_spec = RunSpec {
+            digests: false,
+            command: &console_command,
+            ..*spec
+        };
 
         let mut transport = PtyTransport::open()?;
         // The PTY read timeout is a short poll quantum, not the run budget:
@@ -298,13 +329,23 @@ impl VfkitBackend {
         };
 
         let markers = Markers::for_run(BOOT_READY_MARKER, run_id);
-        let outcome = run_console(&mut transport, console_spec, &markers);
+        let outcome = run_console(&mut transport, &console_spec, &markers);
 
-        // The guest is done: stop connecting, then tear vfkit down and deregister.
+        // The guest is done: stop connecting, check the proxy BEFORE killing it (our own
+        // kill is never a death), then tear the proxy and vfkit down and deregister.
         stop.store(true, Ordering::SeqCst);
         let verdict = connector.map(|(verdict, thread)| (verdict, thread.join().unwrap_or(false)));
+        let proxy_exit = proxy.as_mut().and_then(ProxyHandle::exited);
+        drop(proxy);
         transport.shutdown();
         self.lock_registry()?.retain(|state| state.box_id != box_id);
+        if let Some(status) = proxy_exit {
+            return Err(BackendError::EgressProxyDied {
+                status,
+                booted: outcome.booted,
+                guest_exit: outcome.guest_exit,
+            });
+        }
         match verdict {
             Some((verdict, linked)) => agent_outcome(outcome, &verdict, &spec.command.join(" "), linked),
             None => Ok(outcome),
@@ -329,23 +370,52 @@ struct AgentRun {
     socket: PathBuf,
 }
 
-/// The run's agent socket in the private staging base, short enough for
+/// A run's `<prefix>-<id>.sock` in the private staging base, short enough for
 /// `sun_path`.
-fn agent_socket(base: &Path, run_id: Uuid) -> Result<PathBuf, BackendError> {
+fn run_socket(base: &Path, run_id: Uuid, prefix: &str, what: &str) -> Result<PathBuf, BackendError> {
     let id = run_id.simple().to_string();
-    let socket = base.join(format!("ag-{}.sock", &id[..12]));
+    let socket = base.join(format!("{prefix}-{}.sock", &id[..12]));
     if socket.as_os_str().len() > MAX_SOCKET_PATH {
         return Err(BackendError::Spawn(format!(
-            "the agent socket path {} is longer than a unix socket allows ({MAX_SOCKET_PATH} bytes)",
+            "the {what} socket path {} is longer than a unix socket allows ({MAX_SOCKET_PATH} bytes)",
             socket.display()
         )));
     }
     Ok(socket)
 }
 
+/// The run's agent socket in the private staging base.
+fn agent_socket(base: &Path, run_id: Uuid) -> Result<PathBuf, BackendError> {
+    run_socket(base, run_id, "ag", "agent")
+}
+
+/// The run's egress proxy socket in the private staging base, beside the agent socket.
+fn egress_socket(base: &Path, run_id: Uuid) -> Result<PathBuf, BackendError> {
+    run_socket(base, run_id, "eg", "egress proxy")
+}
+
 impl VmBackend for VfkitBackend {
     fn run(&self, spec: &RunSpec) -> Result<Outcome, BackendError> {
-        spec.refuse_egress_proxy("vfkit")?;
+        self.run_with(spec, None)
+    }
+
+    fn kill(&self, box_id: &str) -> Result<(), BackendError> {
+        // The synchronous run already tore the vfkit child down in `boot`; a kill
+        // from another call just drops the box from the registry.
+        self.lock_registry()?.retain(|state| state.box_id != box_id);
+        tracing::debug!(box_id, "dropped vfkit instance from the registry");
+        Ok(())
+    }
+
+    fn boxes(&self) -> Result<Vec<BoxState>, BackendError> {
+        Ok(self.lock_registry()?.clone())
+    }
+}
+
+impl VfkitBackend {
+    /// [`run`](VmBackend::run), with `proxy_override` replacing the egress proxy binary and its `READY`
+    /// deadline (tests drive a stub).
+    fn run_with(&self, spec: &RunSpec, proxy_override: Option<(&Path, Duration)>) -> Result<Outcome, BackendError> {
         if self.agent.is_some() && self.agent_used.swap(true, Ordering::SeqCst) {
             return Err(BackendError::Spawn(
                 "this agent-mode backend already ran its one job; build one per sandbox run".to_string(),
@@ -369,6 +439,25 @@ impl VmBackend for VfkitBackend {
             }),
             None => None,
         };
+        // Proxy mode: the relay runs the image's own `sandy-agent`, so the topology must name it.
+        let egress = match spec.egress {
+            Some(policy) => {
+                let program = topology.agent_program.as_deref().ok_or_else(|| {
+                    BackendError::Spawn(
+                        "the egress proxy needs a topology that names its agent (agent_program) to run the relay; \
+                         this image carries no sandy-agent"
+                            .to_string(),
+                    )
+                })?;
+                let mut launch = EgressLaunch::new_unix(policy, egress_socket(&base, run_id)?, program);
+                if let Some((bin, ready_deadline)) = proxy_override {
+                    launch.bin = bin.to_path_buf();
+                    launch.ready_deadline = ready_deadline;
+                }
+                Some(launch)
+            }
+            None => None,
+        };
         let inst_dir = base.join(&box_id);
         let inputs_dir = base.join(format!("{box_id}-inputs"));
         let outputs_dir = base.join(format!("{box_id}-outputs"));
@@ -386,7 +475,15 @@ impl VmBackend for VfkitBackend {
         )
         .and_then(|plan| {
             input_digests = plan.input_digests;
-            self.boot(&topology, spec, run_id, &box_id, plan.shares, agent.as_ref())
+            self.boot(
+                &topology,
+                spec,
+                run_id,
+                &box_id,
+                plan.shares,
+                agent.as_ref(),
+                egress.as_ref(),
+            )
         });
 
         // Collect outputs before wiping, only if the guest booted; a collection
@@ -403,25 +500,19 @@ impl VmBackend for VfkitBackend {
                 tracing::warn!(dir = %dir.display(), %err, "failed to wipe staging on teardown");
             }
         }
-        if let Some(agent) = &agent
-            && let Err(err) = std::fs::remove_file(&agent.socket)
-            && err.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(socket = %agent.socket.display(), %err, "failed to remove the agent socket");
+        let sockets = agent
+            .as_ref()
+            .map(|agent| agent.socket.as_path())
+            .into_iter()
+            .chain(egress.as_ref().and_then(EgressLaunch::unix_socket));
+        for socket in sockets {
+            if let Err(err) = std::fs::remove_file(socket)
+                && err.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(socket = %socket.display(), %err, "failed to remove a run socket");
+            }
         }
         with_digests(outcome, input_digests, collected)
-    }
-
-    fn kill(&self, box_id: &str) -> Result<(), BackendError> {
-        // The synchronous run already tore the vfkit child down in `boot`; a kill
-        // from another call just drops the box from the registry.
-        self.lock_registry()?.retain(|state| state.box_id != box_id);
-        tracing::debug!(box_id, "dropped vfkit instance from the registry");
-        Ok(())
-    }
-
-    fn boxes(&self) -> Result<Vec<BoxState>, BackendError> {
-        Ok(self.lock_registry()?.clone())
     }
 }
 
@@ -669,27 +760,316 @@ mod tests {
         }
     }
 
-    /// #403: a backend with no egress proxy support refuses a policy-carrying
-    /// spec before it boots anything, so a proxy-mode run never runs unbounded.
+    /// #405: in proxy mode vfkit dials the proxy's unix socket for guest connections to port 5001,
+    /// and no NIC is attached.
     #[test]
-    fn vfkit_refuses_a_spec_that_carries_an_egress_policy() -> anyhow::Result<()> {
-        let allow = sandy_api::egress::AllowList::default();
+    fn vfkit_args_in_proxy_mode_listen_on_the_egress_socket_and_attach_no_nic() -> anyhow::Result<()> {
+        let topology = parse_topology(AARCH64_FIXTURE).context("parse aarch64 fixture")?;
         let command = ["true".to_string()];
-        let grants = Grants {
-            secrets: false,
-            agent: false,
-            shares: false,
+        let grants = grants();
+        let staged = StagedArgs {
+            egress_socket: Some(PathBuf::from("/tmp/sandy/eg-0123456789ab.sock")),
+            ..StagedArgs::default()
         };
+        let args = vfkit_args(&topology, &spec_for("demo", &command, &grants), &staged)?;
+        assert!(
+            has_token_run(
+                &args,
+                &[
+                    "--device",
+                    "virtio-vsock,port=5001,socketURL=/tmp/sandy/eg-0123456789ab.sock,listen"
+                ]
+            ),
+            "{}",
+            args.join(" ")
+        );
+        assert!(
+            !args.iter().any(|arg| arg.contains("virtio-net")),
+            "no NIC in proxy mode: {}",
+            args.join(" ")
+        );
+        let plain = vfkit_args(&topology, &spec_for("demo", &command, &grants), &StagedArgs::default())?;
+        assert!(
+            !plain
+                .iter()
+                .any(|arg| arg.contains("listen") || arg.contains("virtio-net")),
+            "no egress device without a proxy: {}",
+            plain.join(" ")
+        );
+        Ok(())
+    }
+
+    /// #405: the agent link (`connect`, 5000) and the egress proxy (`listen`, 5001) coexist on distinct
+    /// ports, each with its own socket.
+    #[test]
+    fn the_agent_link_and_the_egress_proxy_coexist_on_distinct_ports() -> anyhow::Result<()> {
+        let topology = parse_topology(AARCH64_FIXTURE).context("parse aarch64 fixture")?;
+        let command = ["true".to_string()];
+        let grants = grants();
+        let staged = StagedArgs {
+            agent_vsock: Some((AGENT_VSOCK_PORT, PathBuf::from("/tmp/sandy/ag-0123456789ab.sock"))),
+            egress_socket: Some(PathBuf::from("/tmp/sandy/eg-0123456789ab.sock")),
+            ..StagedArgs::default()
+        };
+        let args = vfkit_args(&topology, &spec_for("demo", &command, &grants), &staged)?;
+        let devices: Vec<&String> = args.iter().filter(|a| a.starts_with("virtio-vsock,port=")).collect();
+        assert_eq!(
+            devices,
+            [
+                "virtio-vsock,port=5000,socketURL=/tmp/sandy/ag-0123456789ab.sock,connect",
+                "virtio-vsock,port=5001,socketURL=/tmp/sandy/eg-0123456789ab.sock,listen"
+            ]
+        );
+        Ok(())
+    }
+
+    /// #405: the console command starts with the relay wrapper on port 5001, in console-only and agent mode.
+    #[test]
+    fn the_console_command_starts_with_the_relay_on_the_constant_port() {
+        let job = ["sh".to_string(), "-c".to_string(), "env".to_string()];
+        let program = Path::new("/nix/store/a-sandy-agent/bin/sandy-agent");
+        let relay = Some((program, EGRESS_VSOCK_PORT));
+        let prefix = [
+            "/nix/store/a-sandy-agent/bin/sandy-agent",
+            "egress-relay",
+            "--vsock-port",
+            "5001",
+            "--",
+        ];
+        let console_only = console_command(&job, None, relay);
+        assert_eq!(console_only[..5], prefix);
+        assert_eq!(console_only[5..], job);
+        let agent_mode = console_command(&job, Some(program), relay);
+        assert_eq!(agent_mode[..5], prefix);
+        assert_eq!(
+            agent_mode[5..8],
+            ["/nix/store/a-sandy-agent/bin/sandy-agent", "--vsock-listen", "5000"],
+            "the agent invocation is the relay's rest"
+        );
+    }
+
+    /// #405: both run sockets fit macOS's 104-byte `sun_path` under a realistic staging base.
+    #[test]
+    fn the_run_sockets_fit_a_macos_sun_path() -> anyhow::Result<()> {
+        let base = Path::new("/var/folders/xx/yyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/T/sandy");
+        let run_id = Uuid::new_v4();
+        for socket in [egress_socket(base, run_id)?, agent_socket(base, run_id)?] {
+            assert!(
+                socket.as_os_str().len() <= MAX_SOCKET_PATH,
+                "{} is {} bytes",
+                socket.display(),
+                socket.as_os_str().len()
+            );
+        }
+        let egress = egress_socket(base, run_id)?;
+        assert_eq!(
+            egress.parent(),
+            Some(base),
+            "beside the agent socket, in the staging base"
+        );
+        let name = egress
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        assert!(name.starts_with("eg-") && name.ends_with(".sock"), "{name}");
+        let too_long = egress_socket(Path::new(&"/x".repeat(60)), run_id);
+        assert!(
+            matches!(&too_long, Err(BackendError::Spawn(why)) if why.contains("egress proxy socket")),
+            "got {too_long:?}"
+        );
+        Ok(())
+    }
+
+    /// Single-quote a path for a stub script.
+    fn quote(path: &Path) -> String {
+        format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
+    }
+
+    /// The aarch64 fixture with an `agent_program`, written to `dir`: the template a proxy-mode run needs.
+    fn topology_with_agent(dir: &Path) -> anyhow::Result<String> {
+        let mut json: serde_json::Value = serde_json::from_slice(AARCH64_FIXTURE).context("fixture json")?;
+        json["agent_program"] = "/nix/store/a-sandy-agent/bin/sandy-agent".into();
+        let path = dir.join("topology.json");
+        std::fs::write(&path, serde_json::to_vec(&json)?).context("write topology")?;
+        Ok(path.display().to_string())
+    }
+
+    fn pid_alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    /// A fixture for a proxy-mode `run_with` against stubs: the proxy stub creates its socket (as the real
+    /// proxy does) and records its argv and pid; the vfkit stub records its argv, whether the egress
+    /// socket already existed when it started, and never boots.
+    struct StubRun {
+        dir: tempfile::TempDir,
+        template: String,
+        vfkit: PathBuf,
+        proxy: PathBuf,
+    }
+
+    impl StubRun {
+        fn new(proxy_tail: &str) -> anyhow::Result<Self> {
+            let dir = tempfile::tempdir()?;
+            let template = topology_with_agent(dir.path())?;
+            let d = dir.path();
+            let vfkit = crate::egress_proxy::tests::stub(
+                d,
+                "vfkit",
+                &format!(
+                    "echo spawned > {spawned}; echo \"$@\" > {args}; for a in \"$@\"; do case \"$a\" in \
+                     *socketURL=*,listen) s=${{a#*socketURL=}}; s=${{s%,listen}}; [ -e \"$s\" ] && echo present > \
+                     {present};; esac; done; exec sleep 30",
+                    spawned = quote(&d.join("vfkit-ran")),
+                    args = quote(&d.join("vfkit-args")),
+                    present = quote(&d.join("socket-present")),
+                ),
+            )?;
+            let proxy = crate::egress_proxy::tests::stub(
+                d,
+                "proxy",
+                &format!(
+                    "echo $$ > {pid}; echo \"$@\" > {args}; touch \"$2\"; cat >/dev/null; {proxy_tail}",
+                    pid = quote(&d.join("proxy-pid")),
+                    args = quote(&d.join("proxy-args")),
+                ),
+            )?;
+            Ok(Self {
+                dir,
+                template,
+                vfkit,
+                proxy,
+            })
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.dir.path().join(name)
+        }
+
+        /// The socket the proxy stub was told to listen on.
+        fn proxy_socket(&self) -> anyhow::Result<PathBuf> {
+            let args = std::fs::read_to_string(self.path("proxy-args")).context("proxy args")?;
+            let socket = args.trim().strip_prefix("--unix ").context("--unix flag")?;
+            Ok(PathBuf::from(socket))
+        }
+
+        fn run(&self, ready: Duration) -> Result<Outcome, BackendError> {
+            let allow = sandy_api::egress::AllowList::default();
+            let command = ["true".to_string()];
+            let grants = grants();
+            let control = sandy_api::backend::RunControl::with_timeout_secs(1);
+            let spec = RunSpec {
+                timeout_secs: 1,
+                control: &control,
+                egress: Some(&allow),
+                ..spec_for(&self.template, &command, &grants)
+            };
+            VfkitBackend::new(&self.vfkit).run_with(&spec, Some((&self.proxy, ready)))
+        }
+    }
+
+    /// #405: a proxy that never prints READY fails the run as `Spawn` before vfkit spawns, and leaves
+    /// neither a process nor a socket behind.
+    #[test]
+    fn a_proxy_that_never_becomes_ready_fails_before_vfkit_and_leaves_nothing() -> anyhow::Result<()> {
+        let stub = StubRun::new("exec sleep 30")?;
+        let result = stub.run(Duration::from_millis(300));
+        let Err(BackendError::Spawn(message)) = result else {
+            anyhow::bail!("expected Spawn, got {result:?}");
+        };
+        anyhow::ensure!(
+            message.starts_with("egress proxy did not start: no READY within"),
+            "{message}"
+        );
+        anyhow::ensure!(!stub.path("vfkit-ran").exists(), "vfkit must not spawn");
+        let pid: u32 = std::fs::read_to_string(stub.path("proxy-pid"))?.trim().parse()?;
+        anyhow::ensure!(!pid_alive(pid), "the stuck proxy must be killed");
+        let socket = stub.proxy_socket()?;
+        anyhow::ensure!(!socket.exists(), "the socket must be removed: {}", socket.display());
+        Ok(())
+    }
+
+    /// #405: a proxy that exits after READY makes the run an `EgressProxyDied` (the guest never booted
+    /// here), and no socket outlives the run.
+    #[test]
+    fn a_proxy_that_exits_early_makes_the_run_egress_proxy_died() -> anyhow::Result<()> {
+        let stub = StubRun::new("echo READY; exit 3")?;
+        let result = stub.run(Duration::from_secs(5));
+        anyhow::ensure!(
+            matches!(
+                result,
+                Err(BackendError::EgressProxyDied {
+                    status: Some(3),
+                    booted: false,
+                    guest_exit: None
+                })
+            ),
+            "expected EgressProxyDied, got {result:?}"
+        );
+        anyhow::ensure!(stub.path("vfkit-ran").exists(), "vfkit did spawn in this scenario");
+        let socket = stub.proxy_socket()?;
+        anyhow::ensure!(!socket.exists(), "the socket must be removed: {}", socket.display());
+        Ok(())
+    }
+
+    /// #405: a healthy proxy is not read as dead, the egress socket is created in the private staging
+    /// base before vfkit starts and named in vfkit's `listen` device, and teardown kills the proxy and
+    /// removes the socket.
+    #[test]
+    fn a_live_proxy_is_not_a_death_and_its_socket_is_staged_then_removed() -> anyhow::Result<()> {
+        let stub = StubRun::new("echo READY; exec sleep 30")?;
+        let outcome = stub
+            .run(Duration::from_secs(5))
+            .context("a live proxy must not fail the run")?;
+        anyhow::ensure!(!outcome.booted, "the stub vfkit never boots: {outcome:?}");
+        let socket = stub.proxy_socket()?;
+        let base = ensure_sandy_staging_base()?;
+        anyhow::ensure!(
+            socket.parent() == Some(base.as_path()),
+            "{} not in {}",
+            socket.display(),
+            base.display()
+        );
+        let name = socket.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        anyhow::ensure!(name.starts_with("eg-") && name.ends_with(".sock"), "{name}");
+        anyhow::ensure!(
+            stub.path("socket-present").exists(),
+            "the socket must exist before vfkit starts"
+        );
+        let argv = std::fs::read_to_string(stub.path("vfkit-args"))?;
+        anyhow::ensure!(
+            argv.contains(&format!("virtio-vsock,port=5001,socketURL={},listen", socket.display())),
+            "{argv}"
+        );
+        anyhow::ensure!(!argv.contains("virtio-net"), "{argv}");
+        let pid: u32 = std::fs::read_to_string(stub.path("proxy-pid"))?.trim().parse()?;
+        anyhow::ensure!(!pid_alive(pid), "the proxy must be killed at teardown");
+        anyhow::ensure!(!socket.exists(), "the socket must be removed: {}", socket.display());
+        Ok(())
+    }
+
+    /// #405: a policy-carrying spec on an image whose topology names no agent is refused before the
+    /// proxy or vfkit starts: the relay runs the image's own `sandy-agent`.
+    #[test]
+    fn proxy_mode_refuses_a_topology_without_an_agent() -> anyhow::Result<()> {
+        let allow = sandy_api::egress::AllowList::default();
+        let template = fixture_path("topology-aarch64.json");
+        let command = ["true".to_string()];
+        let grants = grants();
         let spec = RunSpec {
-            digests: false,
             egress: Some(&allow),
-            ..spec_for("demo", &command, &grants)
+            ..spec_for(&template, &command, &grants)
         };
-        let refused = VfkitBackend::new("/nonexistent/vfkit").run(&spec);
-        let Err(BackendError::Spawn(message)) = refused else {
-            anyhow::bail!("expected a Spawn refusal, got {refused:?}");
+        let result = VfkitBackend::new("/nonexistent/vfkit").run(&spec);
+        let Err(BackendError::Spawn(message)) = result else {
+            anyhow::bail!("expected Spawn, got {result:?}");
         };
-        anyhow::ensure!(message.contains("egress proxy"), "unexpected refusal: {message}");
+        anyhow::ensure!(message.contains("agent_program"), "{message}");
         Ok(())
     }
 
