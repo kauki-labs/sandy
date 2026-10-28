@@ -182,8 +182,9 @@ jobs:
     # One test run, instrumented: cargo-llvm-cov runs the whole CI suite and emits
     # the lcov report, so a separate plain `cargo nextest` job would just run the
     # same tests again. This job is the test gate.
+    # No `needs: checks`: it runs in parallel with Check (a failing Check no
+    # longer skips it, which costs runner minutes but saves the Check wall clock).
     name: Test
-    needs: checks
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -283,13 +284,21 @@ jobs:
           purge-prefixes: nix-${{ runner.os }}-${{ github.job }}-
           purge-created: 0
           purge-primary-key: never
-      # Publish dry-run: package and verify every crate the way `cargo publish`
-      # will, in dependency order, so a crates.io-publishability break (bad
-      # metadata, a missing include, a version mismatch) fails the PR instead of
-      # the release. Does not upload. Runs in the minimal `package` dev shell (the
-      # toolchain only): it needs the network, so it cannot be a sandboxed check,
-      # and the default shell would also build sandy-agent first.
-      - name: Package (publish dry-run)
+      # Publish dry-run: package every crate the way `cargo publish` will, in
+      # dependency order, so a crates.io-publishability break (bad metadata, a
+      # missing include, a version mismatch) fails before the release. Does not
+      # upload. Runs in the minimal `package` dev shell (the toolchain only): it
+      # needs the network, so it cannot be a sandboxed check, and the default
+      # shell would also build sandy-agent first.
+      #
+      # The verify step recompiles the workspace on every run (about 4 to 11
+      # minutes, cached by nothing), so a PR run skips it and the merge queue,
+      # which still gates the merge, runs it in full.
+      - name: Package (publish dry-run, no verify)
+        if: github.event_name == 'pull_request'
+        run: nix develop .#package -c cargo package --workspace --all-features --no-verify
+      - name: Package (publish dry-run, full verify)
+        if: github.event_name == 'merge_group'
         run: nix develop .#package -c cargo package --workspace --all-features
   # Single aggregate merge gate: green only if every other job in this run
   # succeeded. Mark THIS one as the required check in branch protection, so
