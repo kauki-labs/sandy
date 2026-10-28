@@ -180,12 +180,18 @@ fn start_once(launch: &EgressLaunch<'_>, port: u32, policy: &[u8]) -> Result<Pro
         .map_err(|err| StartFailure::Other(format!("spawn `{}`: {err}", launch.bin.display())))?;
     let mut handle = ProxyHandle { child, port };
 
-    // The policy goes on stdin, then stdin closes: the proxy waits for EOF.
-    if let Some(mut stdin) = handle.child.stdin.take()
-        && let Err(err) = stdin.write_all(policy)
-    {
-        // A proxy that died at once surfaces below with its own stderr.
-        tracing::debug!(%err, "write egress policy to proxy stdin");
+    // The policy goes on stdin, then stdin closes (the thread owns it and drops it): the proxy waits
+    // for EOF. The write runs on a thread so the READY deadline bounds a proxy that never reads it:
+    // a policy bigger than the pipe buffer would otherwise block `write_all` here for good. Killing
+    // the proxy closes the pipe and ends the thread.
+    if let Some(mut stdin) = handle.child.stdin.take() {
+        let policy = policy.to_vec();
+        std::thread::spawn(move || {
+            if let Err(err) = stdin.write_all(&policy) {
+                // A proxy that died at once surfaces below with its own stderr.
+                tracing::debug!(%err, "write egress policy to proxy stdin");
+            }
+        });
     }
 
     let stderr = Arc::new(Mutex::new(Vec::new()));
@@ -384,6 +390,49 @@ pub(crate) mod tests {
                 "unexpected variable in the proxy environment: {line}"
             );
         }
+        Ok(())
+    }
+
+    /// The `READY` deadline bounds the WHOLE start, including the policy write: a proxy that never
+    /// reads stdin, given a policy bigger than the pipe buffer, must fail as "no READY", not block
+    /// the launch thread in `write_all` forever (decisions 2 and 3).
+    #[test]
+    fn a_proxy_that_never_reads_stdin_is_still_bounded_by_the_ready_deadline() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pidfile = dir.path().join("pid");
+        // Never reads stdin and never prints READY.
+        let bin = stub(
+            dir.path(),
+            "proxy",
+            &format!("echo $$ > {}; exec sleep 30", pidfile.display()),
+        )?;
+        // ~450 KiB of JSON, several times a 64 KiB pipe buffer.
+        let huge: &'static AllowList = Box::leak(Box::new(AllowList {
+            rules: (0..4000)
+                .map(|i| EgressRule {
+                    host: format!("{i:0>100}.example"),
+                    port: 443,
+                })
+                .collect(),
+        }));
+        let launch = launch(huge, bin, Duration::from_millis(300));
+        // Run the start on its own thread so a regression fails this test instead of hanging it.
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(launch.start().err());
+        });
+        let err = rx
+            .recv_timeout(Duration::from_secs(5))
+            .context("start() blocked past the READY deadline: the policy write is not bounded")?;
+        let Some(BackendError::Spawn(message)) = err else {
+            anyhow::bail!("expected Spawn, got {err:?}");
+        };
+        assert!(
+            message.starts_with("egress proxy did not start: no READY within"),
+            "{message}"
+        );
+        let pid = std::fs::read_to_string(&pidfile)?;
+        assert!(!alive(pid.trim()), "the stuck proxy must be killed");
         Ok(())
     }
 

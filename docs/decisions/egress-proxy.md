@@ -428,9 +428,10 @@ Already filed and fed by this work: #375 (egress attempts in receipts) and #377
 (hostname entries), both blocked by #404 and #405. #372 holds the deferred TLS
 termination and non-HTTP egress.
 
-#404's peer-CID check is specified above for agent-mode launches, where
-`agent_cid` names the CID `qemu_args` assigns. A console-only run does not
-launch `agent_program`, which leaves `agent_cid` unset today, so #404 must also
-define the CID a console-only launch claims, the vsock device that exposes it,
-and the peer check the proxy runs against it, before its KP1q/KP2q rows can
-close.
+#404 settled the CID for every proxy-mode launch. A console-only run does not
+launch `agent_program`, so `QemuBackend::run` claims a random CID with
+`random_agent_cid` whenever the spec carries an egress policy, with or without
+agent mode, and retries on a collision. `qemu_args` emits it as
+`vhost-vsock-pci,guest-cid=<CID>` with no NIC, and the proxy receives it as
+`--peer-cid`, so it serves only that CID. The KP1q and KP2q live rows are still
+pending: no VM has booted behind the proxy yet (#406).
