@@ -602,6 +602,10 @@ pub async fn handle(
                 );
             }
             let job_id = cancel.job_id.clone();
+            // Captured before mark_terminal/invalidate below, which touch
+            // this same registry entry: read the placement while it's
+            // certainly still there, rather than racing its own cleanup.
+            let placed_host = registry.get(&cancel.job_id).and_then(|job| job.host_id.clone());
             let store = Arc::clone(store);
             let outcome = tokio::task::spawn_blocking(move || store.cancel(&job_id)).await??;
             match outcome {
@@ -614,17 +618,26 @@ pub async fn handle(
                     tracing::info!(job_id = %cancel.job_id, "cancel: invalidating any unclaimed remote link");
                     registry.invalidate_remote_link(&cancel.job_id);
                     registry.mark_terminal(&cancel.job_id);
-                    // CAUTION (decision 12, reachable since #298/#301 - #298
-                    // is the first real send_dispatch caller): this only
-                    // stops a late agent-link stream from claiming the run.
-                    // If the job's Dispatch already reached the host-executor
-                    // (running, or still queued behind another job under
-                    // decision 14's sequential processing), nothing retracts
-                    // it - there is no Cancel/Stop OrchestratorMessage. The
-                    // host-side process starts or keeps running regardless.
-                    // Confirmed intentionally deferred past M2 (decision 12):
-                    // a future Cancel/Stop message is an additive oneof
-                    // variant.
+                    // #477: the local store-cancel above only stops a late
+                    // agent-link stream from claiming the run (decision 12's
+                    // own residual-gap note). If the job was placed on a
+                    // remote host, also reach its live RunControl there —
+                    // best-effort, fire-and-forget: the local cancel already
+                    // took effect regardless of whether this send succeeds,
+                    // so a send failure (host disconnected, queue full) is
+                    // logged, never surfaced as this RPC's own failure.
+                    if let Some(host_id) = placed_host {
+                        let host_registry = Arc::clone(host_registry);
+                        let job_id = cancel.job_id.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = host_registry
+                                .send_cancel(&host_id, sandy_executor_proto::Cancel { job_id: job_id.clone() })
+                                .await
+                            {
+                                tracing::debug!(host_id, job_id, error = %e, "could not deliver Cancel to the host-executor");
+                            }
+                        });
+                    }
                     control_response::Result::Cancel(CancelResponse {})
                 }
                 CancelOutcome::NotFound => control_response::Result::Error(ControlError {
@@ -1391,6 +1404,67 @@ mod tests {
         Ok(())
     }
 
+    /// #477: a Cancel for a job already placed on a remote host reaches that
+    /// host's own connection — not just the local store/registry bookkeeping
+    /// `cancel_invalidates_the_jobs_remote_link` above already covers.
+    #[tokio::test]
+    async fn cancel_reaches_a_registered_remote_hosts_connection() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let allowlist = crate::host_registry::ExecutorAllowlist::new([peer_ip]);
+        // Keep the whole `Registration` alive, not just `cancel_rx`: dropping
+        // `dispatch_rx` would close that channel immediately, failing the
+        // Submit's own dispatch send before this test ever gets to Cancel.
+        let registration = host_registry
+            .register(&allowlist, peer_ip, "ws01".to_owned(), trusted_host_capabilities())
+            .expect("register a test host");
+        let mut cancel_rx = registration.cancel_rx;
+        let _dispatch_rx = registration.dispatch_rx;
+
+        let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+        let submitted = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            submit_req(1),
+        )
+        .await?;
+        let job_id = match submitted.result {
+            Some(control_response::Result::Submit(SubmitResponse { job_id, .. })) => job_id,
+            other => anyhow::bail!("expected a Submit response, got {other:?}"),
+        };
+        let job = registry.get(&job_id).context("the submitted job must be registered")?;
+        assert_eq!(
+            job.host_id.as_deref(),
+            Some("ws01"),
+            "the job must actually be placed on the registered host for this test to mean anything"
+        );
+
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            None,
+            test_session(),
+            req(2, control_request::Op::Cancel(CancelRequest { job_id: job_id.clone() })),
+        )
+        .await?;
+        assert!(
+            matches!(response.result, Some(control_response::Result::Cancel(_))),
+            "got {:?}",
+            response.result
+        );
+
+        let cancel = tokio::time::timeout(std::time::Duration::from_secs(5), cancel_rx.recv())
+            .await
+            .context("timed out waiting for the Cancel to reach the host")?
+            .context("the host's cancel channel closed before receiving anything")?;
+        assert_eq!(cancel.job_id, job_id);
+        Ok(())
+    }
+
     /// #270: Cancel must call `JobRegistry::mark_terminal`, not just
     /// invalidate the remote link above — otherwise a cancelled job's
     /// channel would never be reaped by the registry's retention sweep.
@@ -2052,18 +2126,22 @@ mod tests {
         Ok(())
     }
 
-    /// Adversarial (CodeRabbit on #301, infra-f3's safety-floor check): a
-    /// cancelled job's Dispatch, once delivered to a host, cannot be
-    /// retracted — there is no Cancel/Stop `OrchestratorMessage` (decision
-    /// 12). Deferring that is only acceptable if a cancelled job still
-    /// cannot DELIVER a result: the host eventually running the stale
-    /// Dispatch and dialing back with the EXACT `link_token` it was given
-    /// must still be refused by decision 6's accept path. Proven through
-    /// the real placement flow, not a manually constructed `RemoteLink`
-    /// (that's `cancel_invalidates_the_jobs_remote_link` above) — this test
-    /// captures the token from the real `Dispatch` a registered host
-    /// actually received, cancels the job, then authenticates with that
-    /// exact token.
+    /// Adversarial (CodeRabbit on #301, infra-f3's safety-floor check): this
+    /// test uses `register_test_host`, which discards the host's own
+    /// `cancel_rx` (#477's own Cancel delivery is a separate, best-effort
+    /// send that this test never observes) — the exact "Cancel never
+    /// reaches the host" case: the host never ran, a stale connection, an
+    /// older host-executor build. A cancelled job's already-delivered
+    /// Dispatch cannot be retracted from the host side in that case, so the
+    /// independent safety floor still has to hold: a cancelled job must
+    /// still be unable to DELIVER a result, meaning the host eventually
+    /// running the stale Dispatch and dialing back with the EXACT
+    /// `link_token` it was given must still be refused by decision 6's
+    /// accept path. Proven through the real placement flow, not a manually
+    /// constructed `RemoteLink` (that's `cancel_invalidates_the_jobs_remote_link`
+    /// above) — this test captures the token from the real `Dispatch` a
+    /// registered host actually received, cancels the job, then
+    /// authenticates with that exact token.
     #[tokio::test]
     async fn a_cancelled_jobs_dispatched_token_cannot_authenticate_afterward() -> anyhow::Result<()> {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());

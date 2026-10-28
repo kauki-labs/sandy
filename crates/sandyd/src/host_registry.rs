@@ -36,7 +36,7 @@ use std::{
     },
 };
 
-use sandy_executor_proto::{AttachStateChanged, Capabilities, Dispatch, IsolationClass, SandboxKind};
+use sandy_executor_proto::{AttachStateChanged, Cancel, Capabilities, Dispatch, IsolationClass, SandboxKind};
 use tokio::sync::mpsc;
 
 /// The mesh identities permitted to register as executor hosts. Self-reported
@@ -135,6 +135,12 @@ pub struct Registration {
     /// connection but queued independently here, so a full dispatch queue
     /// can never starve an attach-state notification (or vice versa).
     pub attach_state_rx: mpsc::Receiver<AttachStateChanged>,
+    /// Receiving half of this registration's cancel channel (#477) — a
+    /// client-facing Cancel RPC reaching a job already placed on this host.
+    /// A separate queue from `dispatch_rx`/`attach_state_rx` for the same
+    /// reason as `attach_state_rx`: a full dispatch queue must never starve
+    /// a cancel, or vice versa.
+    pub cancel_rx: mpsc::Receiver<Cancel>,
     /// Identifies this exact registration; pass it to the matching
     /// [`HostRegistry::remove`] and to [`HostRegistry::send_dispatch_if_current`].
     pub registration: RegistrationId,
@@ -162,6 +168,7 @@ struct ConnectedHost {
     capabilities: Capabilities,
     dispatch_tx: mpsc::Sender<Dispatch>,
     attach_state_tx: mpsc::Sender<AttachStateChanged>,
+    cancel_tx: mpsc::Sender<Cancel>,
 }
 
 /// Every currently-connected, registered host-executor, keyed by its
@@ -275,6 +282,11 @@ impl HostRegistry {
         // task can read it again between dispatches — this never needs
         // `dispatch_tx`'s headroom.
         let (attach_state_tx, attach_state_rx) = mpsc::channel(4);
+        // Capacity 4, matching `attach_state_tx`: a cancel is as rare as an
+        // attach transition (at most one per client-facing Cancel RPC, never
+        // per byte of job traffic), and drained just as promptly between
+        // dispatches.
+        let (cancel_tx, cancel_rx) = mpsc::channel(4);
         hosts.insert(
             host_id.clone(),
             Arc::new(ConnectedHost {
@@ -283,11 +295,13 @@ impl HostRegistry {
                 capabilities,
                 dispatch_tx,
                 attach_state_tx,
+                cancel_tx,
             }),
         );
         Ok(Registration {
             dispatch_rx,
             attach_state_rx,
+            cancel_rx,
             registration,
             host_id,
             superseded,
@@ -498,6 +512,36 @@ impl HostRegistry {
             .cloned()
             .ok_or(DispatchSendError::NoSuchHost)?;
         host.attach_state_tx
+            .send(msg)
+            .await
+            .map_err(|_| DispatchSendError::ConnectionClosing)
+    }
+
+    /// Queue `msg` for delivery to `host_id`'s connection task (#477) — a
+    /// client-facing Cancel RPC reaching a job this host already has a
+    /// `Dispatch` for. No isolation-class or sandbox-kind gate here, same as
+    /// [`Self::send_attach_state_changed`]: this is a control signal about a
+    /// job the host already runs, not a new placement decision.
+    ///
+    /// Best-effort by design: the caller's own local cancel (marking the job
+    /// terminal in sandyd's store) already took effect regardless of whether
+    /// this reaches the host, so a [`DispatchSendError`] here is logged, not
+    /// surfaced as the RPC's own failure.
+    ///
+    /// # Errors
+    /// [`DispatchSendError::NoSuchHost`] if no host is registered under that
+    /// id; [`DispatchSendError::ConnectionClosing`] if its connection task
+    /// has already ended. The other two variants (isolation class / sandbox
+    /// kind) never apply here.
+    pub async fn send_cancel(&self, host_id: &str, msg: Cancel) -> Result<(), DispatchSendError> {
+        let host = self
+            .hosts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(host_id)
+            .cloned()
+            .ok_or(DispatchSendError::NoSuchHost)?;
+        host.cancel_tx
             .send(msg)
             .await
             .map_err(|_| DispatchSendError::ConnectionClosing)
