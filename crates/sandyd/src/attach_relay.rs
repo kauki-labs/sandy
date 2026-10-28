@@ -271,9 +271,21 @@ async fn serve_one_attach(
         move |reason: String| {
             let write_half = Arc::clone(&write_half);
             async move {
-                let _ = write_frame(
-                    &mut *write_half.lock().await,
-                    &LinkFrame::Refused { reason: reason.clone() },
+                // CodeRabbit, #395: a same-user client can present a
+                // structurally valid cap (e.g. one naming an oversized
+                // ChannelId), then stop reading. Every refusal reason below
+                // can carry caller-controlled content, so an unbounded write
+                // here could fill the socket's send buffer and block this
+                // task — and, since #395 now caps concurrent attach
+                // connections, block it while holding one of that cap's
+                // permits, eventually starving every other attach attempt.
+                // Bounded the same way the handshake read already is.
+                let _ = tokio::time::timeout(
+                    HANDSHAKE_TIMEOUT,
+                    write_frame(
+                        &mut *write_half.lock().await,
+                        &LinkFrame::Refused { reason: reason.clone() },
+                    ),
                 )
                 .await;
                 tracing::info!(reason, "attach accept: refused");
