@@ -2,7 +2,7 @@
 title: "Decisions: sandyd control plane"
 status: accepted
 project: sandy
-updated: 2026-10-25
+updated: 2026-10-28
 ---
 
 # Decisions: sandyd control plane
@@ -1364,3 +1364,145 @@ resolves or decodes a flake manifest itself, only classifies the tag, so the
 constant is duplicated locally instead — the same precedent
 `link_auth::LINK_TOKEN_LEN` already set for
 `sandy_executor_proto::REMOTE_LINK_TOKEN_LEN`.
+
+## 19. Manifest parity (#480): grow the two existing wire shapes in place; defer collapsing them into one `JobManifest` encoding
+
+**Status:** proposed.
+
+**Context.** `docs/design/manifest-parity/spec.md` (#459) names P3 ("one
+manifest type — `JobManifest` grows the fields, the executor's two ad-hoc
+decodes become views of it") as a goal for reaching `sandy run` parity
+(#221). Confirmed against the current code rather than assumed:
+
+- `handler.rs`'s `Dispatch` construction forwards `SubmitRequest.manifest`/
+  `manifest_encoding` to the host-executor verbatim — there is no
+  translation layer. `sandy daemon submit` never sends a
+  `sandy.orchestrator.v1.JobManifest+json`-encoded manifest today;
+  `JobManifest` is used only for submitter-bounded capability derivation
+  (decision 1/C-at-Submit, `resolve_granted_caps`), not as a wire shape
+  anyone decodes at dispatch time.
+- `required_sandbox_kind_for` (decision 18) derives `SandboxKind` purely
+  from `manifest_encoding`: `flake/v1` → `Vm`, everything else → `Process`.
+  Collapsing to one wire tag removes that signal; `SandboxKind` would need
+  its own explicit field somewhere in `SubmitRequest`/`JobManifest`, which
+  ripples into placement (`pick_host_for`) and the Submit-time
+  Untrusted+non-Vm refusal (decision 15/#381) — a second, independently
+  sized change.
+- `argv/v1` is not an internal-only shape. `scripts/cross-machine-smoke.sh`,
+  `docs/design/host-executor/spec.md`'s manual cross-machine smoke test, and
+  `README.md`'s own M2 usage example all construct a bare `["cmd", "arg",
+...]` JSON array by hand and submit it against a real remote
+  `sandy-host-executor`. Decision 18 already notes a case of a
+  not-yet-redeployed host-executor on the wire. Changing `argv/v1`'s shape
+  in place, with no migration, would break a documented operator procedure
+  and any already-deployed host-executor still decoding the old binary.
+
+Making `JobManifest` the one true wire encoding is its own protocol change,
+not a prerequisite for shipping the plain-value fields (`env`, `cpu`, `mem`,
+`timeout_secs`) a job manifest already needs today.
+
+**Decision.** Land P1 by growing `argv/v1` and `flake/v1` in place, each
+backward compatible with what's deployed today; leave `manifest_encoding` as
+the `SandboxKind` signal; treat P3's full unification as a deferred,
+separately scoped decision (tracked on #221, not blocking #480-#483).
+
+- `argv/v1` accepts EITHER its existing bare `["cmd", "arg", ...]` array
+  (command only) OR an object, `{ "command": [...], "env": [[k, v], ...],
+"cpu": u32?, "mem": u32?, "timeout_secs": u32? }`, decoded with
+  `#[serde(untagged)]`. A bare array still means "no env/cpu/mem/
+  timeout_secs". An old, not-yet-redeployed host-executor decoding an
+  object-shaped manifest fails to decode — a clear `MalformedManifest`
+  refusal, not a silent field drop; operators must redeploy before relying
+  on the new fields, same as any other wire addition.
+- `FlakeManifestV1` gains the same four fields, following the precedent its
+  own `history_lines` already set: `#[serde(default)]`. It does NOT have
+  `#[serde(deny_unknown_fields)]` today — this decision adds it, in the
+  same change that adds the four fields. Both attributes combine without
+  conflict (unknown is about extra fields, default is about missing ones).
+  Sequencing matters: `deny_unknown_fields` must land in the SAME commit
+  that adds the fields, not after. Landed together, both directions of the
+  version skew fail closed — a new sender talking to an old,
+  not-yet-redeployed host-executor gets a decode refusal there (old code
+  rejects fields it doesn't recognize), and an old sender talking to a new
+  host-executor decodes cleanly (every new field is `#[serde(default)]`).
+  Landed with a gap between them (fields added, `deny_unknown_fields` added
+  later), an old host-executor would silently drop the new fields instead
+  of refusing — exactly the failure mode this decision exists to prevent.
+- `cpu`/`mem` get no clamp in this step. Unlike `timeout_secs`
+  (`STAGE1_TIMEOUT_SECS` is both the default and the existing ceiling), no
+  host-side cpu/mem policy exists anywhere today — inventing one is its own
+  config-surface decision, out of scope here. They pass through unclamped;
+  P4's "bound by host policy" is satisfied for `timeout_secs` only, until a
+  real cpu/mem policy is designed and filed separately.
+- `timeout_secs` is a silent no-op if only copied into `RunSpec.timeout_secs`:
+  confirmed (`impls/local/src/process.rs`'s own comment) that field "only
+  seeds the control's initial deadline at construction" and every backend
+  actually enforces the budget by reading `spec.control`, which
+  `handle_dispatch`'s caller constructs with `RunControl::with_timeout_secs`
+  BEFORE the manifest is even decoded. `handle_dispatch` must call
+  `control.set_deadline(...)` with the clamped value after decoding.
+  **Exactly one call site per branch, not two.** The existing
+  `realign_deadline_after_flake_resolution` (renamed
+  `set_deadline_from_timeout_secs`, now taking the target seconds as a
+  parameter instead of hardcoding `STAGE1_TIMEOUT_SECS`) already runs once,
+  on the VM branch, AFTER flake resolution — that single call site is where
+  the clamped manifest value is applied, not a second, earlier call right
+  after decode. An earlier call plus this existing one would have the later
+  call unconditionally overwrite the clamp with the flake-resolve
+  realignment's own value, silently discarding the manifest's request — the
+  reason to reuse and rename the one existing call site rather than add a
+  new one beside it. The Process branch has no flake-resolution step, so it
+  calls the same function once, right after decode, with nothing after it to
+  overwrite the result.
+- "The clamp visible in the status" (a spec acceptance item) is deferred,
+  not part of #480: the clamp decision happens on the host-executor, and
+  there is no field today carrying host-side decisions back into `sandyd`'s
+  `JobDetail` (no wire path exists until #482's streaming or a result-
+  metadata field is added). Filed as a follow-up once that path exists.
+- `template`: no change needed. The process branch's `RunSpec.template`
+  (currently `&dispatch.job_id`, a label `ProcessBackend` doesn't act on) is
+  unaffected; the VM branch's `template` already comes from `flake/v1`'s
+  existing `flake`/`kind`/`attr` fields, resolved before `RunSpec` is built.
+  P1's `TEMPLATE` matrix row is already satisfied by what `flake/v1` carries
+  today.
+- `env` merge order: submitter `env` is applied first, then plumbing
+  overlays win (`SANDY_HISTORY_LINES` on the VM branch; `SANDY_SECRETS_DIR`
+  and the per-share `SANDY_<TAG>_DIR` keys on the process branch via
+  `share_env_key`) — this already matches `impls/local/src/process.rs`'s
+  existing construction order (`spec.env` first, share/passthrough env set
+  after, overwriting any collision). `handle_dispatch`'s VM branch, which
+  today only ever sets the synthetic `history_lines_env` entry, must merge
+  the manifest's `env` the same way: submitter keys first, then
+  `SANDY_HISTORY_LINES` applied last so it always wins a collision.
+- CLI surface: `sandy daemon submit --flake` gains `--env KEY=VAL`
+  (repeatable), `--cpu`, `--mem`, `--timeout` flags building the new
+  `FlakeManifestV1` fields, mirroring the existing `--history-lines`
+  precedent. The bare `sandy daemon submit <manifest-file>` path needs no
+  new flags — an operator writing `argv/v1` JSON by hand already has the
+  object shape available.
+
+**Consequences.** `decode_argv_manifest` and `decode_flake_dispatch_manifest`
+both grow a richer return type but stay two functions, not one — P3's
+"single decode path" is not reached by this decision. `handle_dispatch`
+copies `env`/`cpu`/`mem` into `RunSpec` and separately clamps+applies
+`timeout_secs` onto `control`. Existing bare-array `argv/v1` submissions
+(the CLI, the cross-machine smoke test, `README.md`'s example) keep working
+unchanged against a redeployed host-executor.
+
+For `SandboxKind::Vm`, copying the manifest's `env` into `RunSpec.env` is
+NOT the finish line, and this decision does not claim it is: `RunSpec.env`
+does not reach a VM guest at all today (no plumbing in `impls/agent`/
+`impls/vm`; `dispatch.rs`'s own doc comment on `history_lines_env` already
+names this gap). #480 sets the field correctly so the value is READY the
+moment that plumbing lands; until then, a submitter's `env` for a `flake/v1`
+job has no observable effect in the guest, same as `SANDY_HISTORY_LINES`
+today. Only the process branch's `env` is end-to-end live right now
+(`impls/local/src/process.rs` already overlays `spec.env` on the child).
+
+**Set aside.** Collapsing `argv/v1`/`flake/v1` into one
+`JobManifest+json`-encoded wire tag (true P3): requires an explicit
+`SandboxKind` field (`SubmitRequest` or `JobManifest` itself) to replace the
+encoding-tag signal decision 18 established, plus matching changes to
+placement and the Untrusted+non-Vm Submit-time refusal. Worth doing once the
+CLI/daemon migration (#483) actually needs one manifest type end to end, not
+as a prerequisite for #480's field parity.
