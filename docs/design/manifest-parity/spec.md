@@ -23,17 +23,17 @@ is `agent`.
 
 ## Parity matrix
 
-| `run` flag                          | `RunSpec` field                                                                        | In `JobManifest` today | Local dispatch                                                                       | Remote dispatch                                                                |
-| ----------------------------------- | -------------------------------------------------------------------------------------- | ---------------------- | ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------ |
-| `TEMPLATE`, `--flake/--attr/--kind` | `template`                                                                             | no (VM decode only)    | pass the name                                                                        | resolve on the host (done for VM, #332)                                        |
-| `-- CMD`                            | `command`                                                                              | yes                    | done                                                                                 | done                                                                           |
-| `--env`                             | `env`                                                                                  | no                     | copy                                                                                 | copy                                                                           |
-| `--cpu`, `--mem`, `--timeout`       | `cpu`, `mem`, `timeout`                                                                | no                     | copy, bound by host policy                                                           | copy, bound by host policy                                                     |
-| `--input HOST:NAME`                 | `inputs`                                                                               | no                     | the daemon reads a submitter path                                                    | streamed over the control connection (later step)                              |
-| `--out [NAME:]DEST`                 | `outputs`                                                                              | no                     | the daemon writes a submitter path                                                   | streamed back over the control connection (later)                              |
-| `--secret NAME=@PATH`               | `secrets`, `grants`                                                                    | no                     | stage from the submitter's file                                                      | refused with a named error (decision 4)                                        |
-| `--allow HOST:PORT`                 | `JobPlan.allow`, outside `RunSpec` (reaches it as `RunSpec.egress` only in proxy mode) | no                     | apply and revert through the existing egress boundary (nftables, or the proxy, #403) | refuse with a named error until the host applies and reverts the policy (#408) |
-| `--credential`, `--cred-capability` | credential bracket                                                                     | no                     | bracket runs in the daemon                                                           | token minted on the daemon (decision 3)                                        |
+| `run` flag                          | `RunSpec` field                                                                        | In `JobManifest` today | Local dispatch                                                                                                                                                                                          | Remote dispatch                                                                |
+| ----------------------------------- | -------------------------------------------------------------------------------------- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| `TEMPLATE`, `--flake/--attr/--kind` | `template`                                                                             | no (VM decode only)    | pass the name                                                                                                                                                                                           | resolve on the host (done for VM, #332)                                        |
+| `-- CMD`                            | `command`                                                                              | yes                    | done                                                                                                                                                                                                    | done                                                                           |
+| `--env`                             | `env`                                                                                  | no                     | copy                                                                                                                                                                                                    | copy                                                                           |
+| `--cpu`, `--mem`, `--timeout`       | `cpu`, `mem`, `timeout_secs`                                                           | no                     | copy, bound by host policy                                                                                                                                                                              | copy, bound by host policy                                                     |
+| `--input HOST:NAME`                 | `inputs`                                                                               | no                     | the daemon reads a submitter path                                                                                                                                                                       | streamed over the mesh channel (later step)                                    |
+| `--out [NAME:]DEST`                 | `outputs`                                                                              | no                     | the daemon writes a submitter path                                                                                                                                                                      | streamed back over the mesh channel (later)                                    |
+| `--secret NAME=@PATH`               | `secrets`, `grants`                                                                    | no                     | stage from the submitter's file                                                                                                                                                                         | refused with a named error (decision 4)                                        |
+| `--allow HOST:PORT`                 | `JobPlan.allow`, outside `RunSpec` (reaches it as `RunSpec.egress` only in proxy mode) | no                     | apply and revert through the existing egress boundary (nftables, or the proxy, #403); a local apply failure refuses the run (band 3, before boot), and the policy is reverted on both success and error | refuse with a named error until the host applies and reverts the policy (#408) |
+| `--credential`, `--cred-capability` | credential bracket                                                                     | no                     | bracket runs in the daemon                                                                                                                                                                              | token minted on the daemon (decision 3)                                        |
 
 ## Decisions (proposed)
 
@@ -70,18 +70,24 @@ is `agent`.
 ## Acceptance tests
 
 - For each flag in the matrix, a table-driven test builds a `RunSpec` from `RunArgs` and from
-  the equivalent `JobManifest`, and asserts they are equal.
+  the equivalent `JobManifest`, and compares an explicit projection of the manifest-derived
+  fields (`RunSpec` has no `PartialEq`). Runtime fields (`control`, `outcome_file`,
+  `secret_dir`) are not part of this projection; they are tested separately.
 - A manifest with a path field submitted for a remote host is refused with the field named.
 - A manifest with an unknown field is refused, not accepted with the field dropped.
 - A `timeout` above the host ceiling is clamped, and the clamp is visible in the status.
-- A `--secret` value never appears in the manifest bytes, the Dispatch frame, a log line, argv,
-  the ordinary environment, mounts, or the Nix store. It reaches the job only through a staged
-  file with mode 0600, and the staging is removed at teardown. The remote Submit refusal is a
-  separate test.
+- A `--secret` value never appears on the host side: not in the manifest bytes, the Dispatch
+  frame, a log line, host argv, the host's own environment, or the Nix store. Inside the guest
+  it's exposed deliberately, through a dedicated read-only share: staged under a `0700` base as a
+  `0600` file, with `SANDY_SECRETS_DIR` naming the staged directory's path to the job (never the
+  bytes). Separate tests cover the dedicated share, rejecting a source with the wrong
+  permissions, the share being read-only, and staging removed at teardown. The remote Submit
+  refusal is a separate test.
 - The executor acts on every `RunSpec` field it receives. A tier-2 test over `FakeBackend`
-  asserts that `env`, `timeout`, resources and `outputs` reach the backend. A tier-3 `live`
-  test asserts the guest-visible effect. A fake never counts as live evidence. `RunSpec.env` is
-  a known gap today (`dispatch.rs` does not plumb it into the guest), so this test starts red.
+  asserts that `env`, `timeout_secs`, `cpu`, `mem`, and `outputs` each reach the backend. A
+  tier-3 `live` test asserts the guest-visible effect. A fake never counts as live evidence.
+  `RunSpec.env` is a known gap today (`dispatch.rs` does not plumb it into the guest), so this
+  test starts red.
 
 ## Out of scope
 
@@ -95,13 +101,23 @@ The owner answered the four questions of the first draft.
 
 1. **Local first.** P1 stands: plain-value fields ship for local and remote dispatch; path
    fields ship for local dispatch only.
-2. **Remote inputs and outputs stream over the control connection.** This reuses the mesh
-   connection and its auth. It needs framing in `sandy-executor-proto` and a size cap, which
-   is the one detail still open. It is not part of the local-first step.
-3. **The credential is minted on the daemon.** The trust root stays on the orchestrator host.
-   The scoped, short-lived token crosses the mesh to the executor over a transport that
+2. **Remote inputs and outputs stream over the mesh channel, not a control RPC.** The mesh
+   channel is `sandy-executor-proto`'s one persistent, bidirectional connection per
+   host-executor (`docs/decisions/sandyd.md` §12), separate from Submit/Cancel/Attach/Status's
+   request/response shape. A client's job output stays on the fabric data plane
+   (`sandy-proto`'s `Envelope`); this decision only adds input/output framing to the
+   orchestrator↔host-executor connection. The framing needs a message type, a maximum payload
+   size, and backpressure behavior, which is the one detail still open. It is not part of the
+   local-first step.
+3. **The credential is minted on the daemon, before boot, fail-closed.** The trust root stays
+   on the orchestrator host. Mint failure refuses the Submit; no backend starts without a
+   token. The scoped, short-lived token crosses the mesh to the executor over a transport that
    encrypts traffic (TLS, QUIC, or an equivalent over vsock), as `sandyd.md` §2 requires for a
-   bearer credential. Mesh authentication alone does not protect it in transit.
+   bearer credential. Mesh authentication alone does not protect it in transit. A long-running
+   job gets the token refreshed before expiry; the token is revoked on the job's terminal state
+   (success, failure, or cancellation), and any credential staged for it is cleaned up at
+   teardown. Tier-2 `FakeProvider` tests cover mint success, mint failure, cancellation or kill
+   mid-run, refresh, and a revoke failure.
 4. **A secret never crosses the mesh.** A remote Submit that carries `--secret` is refused
    with a named error. INV-1 stays simple: secret bytes stay on the submitter's machine.
 
@@ -110,6 +126,8 @@ Still open: the size cap for streamed inputs and outputs.
 ## Self-test: what could pass every test above and still be wrong?
 
 A field that the daemon accepts and the executor drops without a trace. The matrix requires a
-named refusal for each unsupported field. The table test should also destructure `RunSpec`
-exhaustively, so a new field with no matrix row fails to compile instead of becoming a silent
-gap.
+named refusal for each unsupported field. The table test defines its parity-field projection as
+an explicit list, plus an allowlist of plumbing-only fields (`control`, `outcome_file`,
+`secret_dir`) that are deliberately excluded, and asserts every projected field has a matrix
+row. It still destructures `RunSpec` exhaustively, so a new field with no classification in
+either list fails to compile instead of becoming a silent gap.
