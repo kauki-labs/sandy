@@ -1415,15 +1415,19 @@ separately scoped decision (tracked on #221, not blocking #480-#483).
   refusal, not a silent field drop; operators must redeploy before relying
   on the new fields, same as any other wire addition.
 - `FlakeManifestV1` gains the same four fields, following the precedent its
-  own `history_lines` already set: `#[serde(default)]`.
-- Both structs get `#[serde(deny_unknown_fields)]`, which the spec's item 1
-  and self-test require and neither struct has today. This combines with
-  `#[serde(default)]` without conflict (unknown is about extra fields,
-  default is about missing ones). Consequence for `FlakeManifestV1`: an
-  old, not-yet-redeployed host-executor decoding a manifest with these new
-  fields already fails `deny_unknown_fields` today in the opposite
-  direction too (old code rejects a manifest with fields it doesn't know) —
-  both directions of the skew fail closed, never silently drop a field.
+  own `history_lines` already set: `#[serde(default)]`. It does NOT have
+  `#[serde(deny_unknown_fields)]` today — this decision adds it, in the
+  same change that adds the four fields. Both attributes combine without
+  conflict (unknown is about extra fields, default is about missing ones).
+  Sequencing matters: `deny_unknown_fields` must land in the SAME commit
+  that adds the fields, not after. Landed together, both directions of the
+  version skew fail closed — a new sender talking to an old,
+  not-yet-redeployed host-executor gets a decode refusal there (old code
+  rejects fields it doesn't recognize), and an old sender talking to a new
+  host-executor decodes cleanly (every new field is `#[serde(default)]`).
+  Landed with a gap between them (fields added, `deny_unknown_fields` added
+  later), an old host-executor would silently drop the new fields instead
+  of refusing — exactly the failure mode this decision exists to prevent.
 - `cpu`/`mem` get no clamp in this step. Unlike `timeout_secs`
   (`STAGE1_TIMEOUT_SECS` is both the default and the existing ceiling), no
   host-side cpu/mem policy exists anywhere today — inventing one is its own
@@ -1436,11 +1440,20 @@ separately scoped decision (tracked on #221, not blocking #480-#483).
   actually enforces the budget by reading `spec.control`, which
   `handle_dispatch`'s caller constructs with `RunControl::with_timeout_secs`
   BEFORE the manifest is even decoded. `handle_dispatch` must call
-  `control.set_deadline(...)` with the clamped value after decoding —
-  mutating the already-constructed `control`, the same pattern
-  `realign_deadline_after_flake_resolution` already uses for the VM branch's
-  flake-resolve budget — not merely set `RunSpec.timeout_secs` and assume
-  enforcement follows.
+  `control.set_deadline(...)` with the clamped value after decoding.
+  **Exactly one call site per branch, not two.** The existing
+  `realign_deadline_after_flake_resolution` (renamed
+  `set_deadline_from_timeout_secs`, now taking the target seconds as a
+  parameter instead of hardcoding `STAGE1_TIMEOUT_SECS`) already runs once,
+  on the VM branch, AFTER flake resolution — that single call site is where
+  the clamped manifest value is applied, not a second, earlier call right
+  after decode. An earlier call plus this existing one would have the later
+  call unconditionally overwrite the clamp with the flake-resolve
+  realignment's own value, silently discarding the manifest's request — the
+  reason to reuse and rename the one existing call site rather than add a
+  new one beside it. The Process branch has no flake-resolution step, so it
+  calls the same function once, right after decode, with nothing after it to
+  overwrite the result.
 - "The clamp visible in the status" (a spec acceptance item) is deferred,
   not part of #480: the clamp decision happens on the host-executor, and
   there is no field today carrying host-side decisions back into `sandyd`'s
@@ -1475,6 +1488,16 @@ copies `env`/`cpu`/`mem` into `RunSpec` and separately clamps+applies
 `timeout_secs` onto `control`. Existing bare-array `argv/v1` submissions
 (the CLI, the cross-machine smoke test, `README.md`'s example) keep working
 unchanged against a redeployed host-executor.
+
+For `SandboxKind::Vm`, copying the manifest's `env` into `RunSpec.env` is
+NOT the finish line, and this decision does not claim it is: `RunSpec.env`
+does not reach a VM guest at all today (no plumbing in `impls/agent`/
+`impls/vm`; `dispatch.rs`'s own doc comment on `history_lines_env` already
+names this gap). #480 sets the field correctly so the value is READY the
+moment that plumbing lands; until then, a submitter's `env` for a `flake/v1`
+job has no observable effect in the guest, same as `SANDY_HISTORY_LINES`
+today. Only the process branch's `env` is end-to-end live right now
+(`impls/local/src/process.rs` already overlays `spec.env` on the child).
 
 **Set aside.** Collapsing `argv/v1`/`flake/v1` into one
 `JobManifest+json`-encoded wire tag (true P3): requires an explicit
