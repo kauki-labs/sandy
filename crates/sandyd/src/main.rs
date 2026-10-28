@@ -5,11 +5,12 @@
 //! and shuts down on `SIGTERM`/`SIGINT`: stops accepting new connections and
 //! waits (briefly, bounded) for in-flight ones to finish before exiting.
 
-use std::{future::Future, net::SocketAddr, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc, time::Duration};
+use std::{net::SocketAddr, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc, time::Duration};
 
 use sandy_conn::Listener as MeshListener;
 use sandyd::{
     dispatch::JobRegistry,
+    gate_spawn,
     host_registry::{ExecutorAllowlist, HostRegistry},
     mesh_config::{parse_mesh_allowlist, parse_mesh_listen_addr},
     store::JobStore,
@@ -44,27 +45,14 @@ const ACCEPT_ERROR_BACKOFF_MAX: Duration = Duration::from_secs(5);
 /// not a tuned production capacity figure.
 const MAX_CONCURRENT_CONNECTIONS: usize = 256;
 
-/// Acquire one permit from `semaphore`, THEN await `accept` (CF-L-1) — in
-/// that order, and combined into one future, so a full semaphore blocks only
-/// this one `select!` branch, not the whole accept loop: the surrounding
-/// `select!` keeps polling its sibling branches (reaping finished
-/// connections, the shutdown signal) every iteration regardless of whether
-/// this branch's permit acquisition has resolved yet. Acquiring the permit as
-/// a plain `.await` inside a branch's handler (after `select!` has already
-/// picked that branch) would instead block the loop's next iteration on it —
-/// shutdown would never be observed while every permit is held.
-///
-/// `Err` only if `semaphore` was explicitly closed, which this daemon never
-/// does; the caller still matches on it rather than unwrapping, per house
-/// style (no panics in a connection-accepting loop).
-async fn gate_spawn<T>(
-    semaphore: &Arc<tokio::sync::Semaphore>,
-    accept: impl Future<Output = T>,
-) -> (Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError>, T) {
-    let permit = Arc::clone(semaphore).acquire_owned().await;
-    let value = accept.await;
-    (permit, value)
-}
+/// The largest number of mesh host-executor connections this daemon serves
+/// concurrently (CF-L-1, #289 item 3): past this, the mesh management-channel
+/// accept loop stops accepting new connections until one of the existing
+/// ones finishes. Mirrors [`MAX_CONCURRENT_CONNECTIONS`]'s reasoning for the
+/// UDS control socket — this loop had no cap at all before, so an unbounded
+/// number of pre-auth connections from the mesh could spawn an unbounded
+/// number of tasks and exhaust file descriptors.
+const MAX_CONCURRENT_MESH_CONNECTIONS: usize = 256;
 
 /// Capped exponential backoff for repeated `accept()` failures, shared by
 /// every accept loop in this binary so they back off identically. Doubles on
@@ -523,10 +511,17 @@ async fn run_mesh_accept_loop(
     let MeshSetup { listener, allowlist } = mesh;
     let mut connections = tokio::task::JoinSet::new();
     let mut backoff = AcceptBackoff::new();
+    let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_MESH_CONNECTIONS));
 
     loop {
         tokio::select! {
-            accepted = listener.accept() => {
+            (permit, accepted) = gate_spawn(&connection_semaphore, listener.accept()) => {
+                let Ok(permit) = permit else {
+                    // Never closed by this program (see gate_spawn's doc);
+                    // handled rather than panicked, per house style.
+                    tracing::error!("mesh connection semaphore closed unexpectedly; no longer accepting new connections");
+                    break;
+                };
                 match accepted {
                     Ok((conn, peer)) => {
                         backoff.reset();
@@ -535,6 +530,7 @@ async fn run_mesh_accept_loop(
                         let store = Arc::clone(&store);
                         let job_registry = Arc::clone(&job_registry);
                         connections.spawn(async move {
+                            let _permit = permit; // held for the connection's lifetime, released on drop
                             sandyd::host_conn::serve_host_executor(
                                 conn,
                                 peer,
@@ -547,6 +543,8 @@ async fn run_mesh_accept_loop(
                         });
                     }
                     Err(e) => {
+                        // `permit` drops here, releasing it immediately: this
+                        // connection was never served.
                         tracing::warn!(error = %e, "failed to accept a mesh connection");
                         // Raced against shutdown — see the UDS loop's own
                         // identical comment in main() for why an unraced
