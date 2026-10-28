@@ -45,7 +45,7 @@
 mod common;
 
 use std::{
-    net::TcpListener,
+    net::{IpAddr, TcpListener, TcpStream, UdpSocket},
     path::Path,
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -168,6 +168,42 @@ fn assert_guest_ok(code: i32, env: &serde_json::Value, what: &str) {
     assert_eq!(code, 0, "process band 0; envelope: {env}");
 }
 
+/// A host listener on the host's own non-loopback address, for tests that need to see whether (and when)
+/// the proxy connects out. The proxy refuses loopback even when named, so the listener sits on the address
+/// the host uses to reach the network; a special-use address (LAN, CGNAT) passes when an entry names it.
+struct HostProbe {
+    listener: TcpListener,
+    /// `ip:port`, the form an allow-list entry and a CONNECT target take.
+    target: String,
+}
+
+impl HostProbe {
+    fn bind() -> anyhow::Result<Self> {
+        // A connected UDP socket sends nothing; it only makes the kernel pick the outbound source address.
+        let probe = UdpSocket::bind("0.0.0.0:0").context("bind a udp socket")?;
+        probe
+            .connect("192.0.2.1:9")
+            .context("pick the host's outbound address")?;
+        let ip: IpAddr = probe.local_addr().context("udp local addr")?.ip();
+        let listener = TcpListener::bind((ip, 0)).with_context(|| format!("bind a host listener on {ip}"))?;
+        listener.set_nonblocking(true).context("nonblocking listener")?;
+        let port = listener.local_addr().context("listener addr")?.port();
+        Ok(Self {
+            listener,
+            target: format!("{ip}:{port}"),
+        })
+    }
+
+    /// The accepted connection, if one arrived.
+    fn try_accept(&self) -> anyhow::Result<Option<TcpStream>> {
+        match self.listener.accept() {
+            Ok((stream, _)) => Ok(Some(stream)),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(e).context("poll the host listener"),
+        }
+    }
+}
+
 /// KP1: an allow-listed `host:port` is reachable through the guest relay (`200`).
 #[test]
 fn allowed_target_is_reachable_through_the_proxy() -> anyhow::Result<()> {
@@ -184,19 +220,25 @@ fn allowed_target_is_reachable_through_the_proxy() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// KP2: a target not on the allow-list gets `403`.
+/// KP2: a target not on the allow-list gets `403`, and no connection reaches the host listener behind it.
 #[test]
 fn denied_target_gets_403() -> anyhow::Result<()> {
     let target = require_proxy_live()?;
     build_guest(&target)?;
     let home = tempfile::tempdir().context("temp SANDY_HOME")?;
-    let (allowed, denied) = (allowed_host(), denied_host());
+    let allowed = allowed_host();
     let allow = vec![format!("{allowed}:{PROBE_PORT}")];
+    let denied = HostProbe::bind()?;
 
-    let script = connect_expect_script(&format!("{denied}:{PROBE_PORT}"), 403);
+    let script = connect_expect_script(&denied.target, 403);
     let (code, env) = sandy_proxy_run(home.path(), &target, &allow, &script)?;
 
-    assert_guest_ok(code, &env, &format!("CONNECT {denied}:{PROBE_PORT} must get 403"));
+    assert_guest_ok(code, &env, &format!("CONNECT {} must get 403", denied.target));
+    anyhow::ensure!(
+        denied.try_accept()?.is_none(),
+        "the proxy connected to {}, which is not on the allow-list",
+        denied.target
+    );
     Ok(())
 }
 
@@ -337,32 +379,37 @@ fn find_proxy_child(parent: u32) -> anyhow::Result<Option<u32>> {
     Ok(None)
 }
 
-/// Wait for the proxy child of `sandy` to appear, let the guest boot, then SIGKILL it. Errors here must
+/// Wait for the guest job to reach the host through the proxy, then SIGKILL the proxy. Errors here must
 /// not skip reaping `sandy`: the caller waits for it on every path so the CLI runs its normal qemu,
 /// proxy and virtiofsd teardown.
-fn kill_proxy_mid_run(sandy: &mut std::process::Child) -> anyhow::Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let proxy = loop {
-        if let Some(pid) = find_proxy_child(sandy.id())? {
-            break pid;
+///
+/// The guest has no channel to the host except the proxy, so the job's own CONNECT to `probe` is the ready
+/// signal: when the proxy dials the listener, the guest has booted and the job is running behind the relay.
+/// The returned stream is kept open so the proxy's tunnel is still live when it dies.
+fn kill_proxy_once_guest_runs(sandy: &mut std::process::Child, probe: &HostProbe) -> anyhow::Result<TcpStream> {
+    let deadline = Instant::now() + Duration::from_secs(100);
+    let tunnel = loop {
+        if let Some(stream) = probe.try_accept()? {
+            break stream;
         }
         if let Some(status) = sandy.try_wait().context("poll sandy")? {
-            bail!("sandy exited ({status}) before a proxy child appeared");
+            bail!("sandy exited ({status}) before the guest job reached the host through the proxy");
         }
         if Instant::now() > deadline {
-            bail!("no sandy-egress-proxy child of sandy (pid {}) within 60s", sandy.id());
+            bail!(
+                "the guest job did not reach {} through the proxy within 100s",
+                probe.target
+            );
         }
         std::thread::sleep(Duration::from_millis(200));
     };
-    // The guest has no channel to the host before the run ends, so there is no ready signal to wait for.
-    // The test proves the guest booted and finished after the fact, from the error text it asserts below.
-    std::thread::sleep(Duration::from_secs(15));
+    let proxy = find_proxy_child(sandy.id())?.context("no sandy-egress-proxy child of sandy while the guest runs")?;
     let killed = Command::new("kill")
         .args(["-KILL", &proxy.to_string()])
         .status()
         .context("kill the proxy")?;
     anyhow::ensure!(killed.success(), "kill -KILL {proxy} failed: {killed}");
-    Ok(())
+    Ok(tunnel)
 }
 
 /// KP6: killing the proxy while the guest job runs classifies the run as band 3, although
@@ -373,20 +420,30 @@ fn proxy_death_mid_run_is_band_3() -> anyhow::Result<()> {
     build_guest(&target)?;
     let home = tempfile::tempdir().context("temp SANDY_HOME")?;
     let stderr_path = home.path().join("sandy.stderr");
-    let allowed = allowed_host();
-    let allow = vec![format!("{allowed}:{PROBE_PORT}")];
+    let probe = HostProbe::bind()?;
+    let allow = vec![probe.target.clone()];
 
-    // The job outlives the kill by a wide margin and exits 0 either way.
-    let mut child = sandy_proxy_cmd(home.path(), &target, &allow, "sleep 45; exit 0")
+    // The job opens a tunnel to the host listener, then outlives the kill by a wide margin and exits 0.
+    let script = format!(
+        r#"set -u
+exec 3<>/dev/tcp/127.0.0.1/3128
+printf 'CONNECT {t} HTTP/1.1\r\nHost: {t}\r\n\r\n' >&3
+IFS= read -r -t 15 line <&3 || true
+sleep 45
+exit 0
+"#,
+        t = probe.target
+    );
+    let mut child = sandy_proxy_cmd(home.path(), &target, &allow, &script)
         .stdout(Stdio::piped())
         .stderr(std::fs::File::create(&stderr_path).context("create stderr file")?)
         .spawn()
         .context("spawn sandy")?;
 
-    let killed = kill_proxy_mid_run(&mut child);
+    let killed = kill_proxy_once_guest_runs(&mut child, &probe);
     // Always reap sandy, bounded by its own --timeout, so its teardown runs even when the kill failed.
     let output = child.wait_with_output().context("wait for sandy")?;
-    killed?;
+    let _tunnel = killed?;
     let stderr = std::fs::read(&stderr_path).unwrap_or_default();
     let (code, env) = parse_envelope(output.status.code().unwrap_or(-1), &output.stdout, &stderr)?;
 
@@ -395,8 +452,8 @@ fn proxy_death_mid_run_is_band_3() -> anyhow::Result<()> {
         env["status"], "succeeded",
         "a run without its boundary must not succeed; envelope: {env}"
     );
-    // `BackendError::EgressProxyDied` names whether the guest had booted and how it exited. A kill that
-    // landed during boot, or a guest that never ran its job, must fail the test rather than pass it.
+    // `BackendError::EgressProxyDied` names whether the guest had booted and how it exited. The kill came
+    // after the guest's tunnel reached the host, so the guest had booted; its job then ran on to exit 0.
     let text = env.to_string();
     assert!(
         text.contains("after the guest booted") && text.contains("guest exit 0"),
