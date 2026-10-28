@@ -294,6 +294,13 @@ jobs:
       # The verify step recompiles the workspace on every run (about 4 to 11
       # minutes, cached by nothing), so a PR run skips it and the merge queue,
       # which still gates the merge, runs it in full.
+      # `cargo package` only warns about a missing description or license (it exits 0), so
+      # check them explicitly, in both the PR and the merge-queue path. `publish == []` is
+      # `publish = false`, which is exempt.
+      - name: Publish metadata (description and license)
+        run: |
+          set -o pipefail
+          nix develop .#package -c cargo metadata --no-deps --format-version 1 | jq '[.packages[] | select(.publish != []) | select((.description // "") == "" or ((.license // "") == "" and (.license_file // "") == "")) | .name] as $bad | if ($bad | length) > 0 then ("publishable crates missing a description or a license: " + ($bad | join(", ")) + "\n") | halt_error(1) else empty end'
       - name: Package (publish dry-run, no verify)
         if: github.event_name == 'pull_request'
         run: nix develop .#package -c cargo package --workspace --all-features --no-verify
