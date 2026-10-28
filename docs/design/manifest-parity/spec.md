@@ -1,6 +1,7 @@
 # JobManifest parity with `sandy run`
 
-Status: draft. It needs owner decisions on the open questions before any code. It is the
+Status: draft, owner decisions recorded below. One detail is still open (the size cap for
+streamed inputs and outputs), and it does not block the local-first step. It is the
 gating work for #221 (migrate the direct-execution CLI onto sandyd), which the issue itself
 calls "not yet scoped".
 
@@ -28,11 +29,11 @@ is `agent`.
 | `-- CMD`                            | `command`               | yes                    | done                               | done                                              |
 | `--env`                             | `env`                   | no                     | copy                               | copy                                              |
 | `--cpu`, `--mem`, `--timeout`       | `cpu`, `mem`, `timeout` | no                     | copy, bound by host policy         | copy, bound by host policy                        |
-| `--input HOST:NAME`                 | `inputs`                | no                     | the daemon reads a submitter path  | needs file transfer (no mechanism exists)         |
-| `--out [NAME:]DEST`                 | `outputs`               | no                     | the daemon writes a submitter path | needs file transfer back                          |
-| `--secret NAME=@PATH`               | `secrets`, `grants`     | no                     | stage from the submitter's file    | secret bytes cross the mesh (INV-1 review needed) |
+| `--input HOST:NAME`                 | `inputs`                | no                     | the daemon reads a submitter path  | streamed over the control connection (later step) |
+| `--out [NAME:]DEST`                 | `outputs`               | no                     | the daemon writes a submitter path | streamed back over the control connection (later) |
+| `--secret NAME=@PATH`               | `secrets`, `grants`     | no                     | stage from the submitter's file    | refused with a named error (decision 4)           |
 | `--allow HOST:PORT`                 | egress allow-list       | no                     | blocked on the egress proxy (#403) | blocked on the egress proxy (#403) and #408       |
-| `--credential`, `--cred-capability` | credential bracket      | no                     | bracket runs in the daemon         | token minted where? (open question 3)             |
+| `--credential`, `--cred-capability` | credential bracket      | no                     | bracket runs in the daemon         | token minted on the daemon (decision 3)           |
 
 ## Decisions (proposed)
 
@@ -80,14 +81,21 @@ is `agent`.
   steps of #221 and depend on this work.
 - The egress proxy itself (#401 to #408). This spec only needs a field to carry the policy.
 
-## Open questions for the owner
+## Owner decisions
 
-1. Is local-first (P1) acceptable, or must remote parity ship together?
-2. Remote inputs and outputs need a transfer mechanism (stream over the control connection, a
-   shared store, or a pre-staged path). Which one, and what size cap?
-3. Where is the credential minted for a remote job: on the daemon (token crosses the mesh) or
-   on the host (the trust root crosses the mesh)? Both widen the trust boundary.
-4. Does a secret ever cross the mesh? If yes, it needs its own decision record.
+The owner answered the four questions of the first draft.
+
+1. **Local first.** P1 stands: plain-value fields ship for local and remote dispatch; path
+   fields ship for local dispatch only.
+2. **Remote inputs and outputs stream over the control connection.** This reuses the mesh
+   connection and its auth. It needs framing in `sandy-executor-proto` and a size cap, which
+   is the one detail still open. It is not part of the local-first step.
+3. **The credential is minted on the daemon.** The trust root stays on the orchestrator host.
+   The scoped, short-lived token crosses the authenticated mesh to the executor.
+4. **A secret never crosses the mesh.** A remote Submit that carries `--secret` is refused
+   with a named error. INV-1 stays simple: secret bytes stay on the submitter's machine.
+
+Still open: the size cap for streamed inputs and outputs.
 
 ## Self-test: what could pass every test above and still be wrong?
 
