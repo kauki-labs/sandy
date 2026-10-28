@@ -1,12 +1,16 @@
 //! The per-launch egress proxy (#404, `docs/decisions/egress-proxy.md` decisions 1 and 2).
 //!
-//! In proxy mode the qemu guest has no NIC. The backend runs one `sandy-egress-proxy` per launch
-//! attempt on a random host vsock port, scoped to the CID that attempt claimed, and wraps the job
-//! in `sandy-agent egress-relay` so the guest reaches the proxy over vsock.
+//! In proxy mode the guest has no NIC. The backend runs one `sandy-egress-proxy` per launch
+//! attempt and wraps the job in `sandy-agent egress-relay` so the guest reaches the proxy over vsock.
+//! How the proxy listens depends on the host ([`ProxyListen`]):
+//!
+//! - qemu (#404): a random host vsock port, scoped to the CID that attempt claimed.
+//! - vfkit (#405): a unix socket in the private staging base. vfkit dials it for each guest connection to the constant
+//!   guest port [`EGRESS_VSOCK_PORT`].
 //!
 //! - [`ProxyHandle::start`] spawns the proxy with a sanitized environment, writes the policy on stdin, and waits for
 //!   its `READY` line.
-//! - [`egress_relay_argv`] builds the guest-side wrapper command.
+//! - [`egress_relay_argv`] builds the guest-side wrapper command, and [`console_command`] nests it around the agent.
 //! - [`ProxyHandle::exited`] tells a proxy that died from one the backend is about to kill.
 
 use std::{
@@ -18,13 +22,17 @@ use std::{
 };
 
 use sandy::BackendError;
-use sandy_api::egress::AllowList;
+use sandy_api::{agent::AGENT_VSOCK_PORT, egress::AllowList};
 use uuid::Uuid;
+
+use crate::agent::agent_command_argv;
 
 /// Names the proxy binary, like `SANDY_VIRTIOFSD_BIN` names virtiofsd.
 const PROXY_BIN_ENV: &str = "SANDY_EGRESS_PROXY_BIN";
 /// The proxy binary looked up on `PATH` when [`PROXY_BIN_ENV`] is unset.
 const PROXY_BIN_DEFAULT: &str = "sandy-egress-proxy";
+/// The vsock port the guest relay dials under vfkit: constant, since the port space is per VM (#405).
+pub(crate) const EGRESS_VSOCK_PORT: u32 = 5001;
 /// How long the proxy has to print `READY` (decision 2).
 pub(crate) const READY_DEADLINE: Duration = Duration::from_secs(5);
 /// Ports tried before the launch fails: the vsock port space is shared by every VM on the host.
@@ -40,13 +48,29 @@ const ADDR_IN_USE: &str = "Address already in use";
 /// How long to wait for a proxy that closed stdout to be reaped, and for its stderr to reach EOF.
 const REAP_GRACE: Duration = Duration::from_secs(1);
 
+/// How the proxy listens for the guest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProxyListen {
+    /// A random host vsock port (retried when taken), serving only the guest that claimed `cid` (qemu).
+    Vsock {
+        /// The CID this attempt claimed for the guest: the only peer the proxy serves.
+        cid: u32,
+    },
+    /// A unix socket vfkit dials for each guest connection. It lives in the 0700 private staging base, so only this
+    /// VM's vfkit can reach it.
+    Unix {
+        /// The socket path, short enough for `sun_path`.
+        socket: PathBuf,
+    },
+}
+
 /// What the backend needs to start the proxy for one launch attempt.
 #[derive(Debug, Clone)]
 pub(crate) struct EgressLaunch<'a> {
     /// The allow-list the proxy enforces.
     pub(crate) policy: &'a AllowList,
-    /// The CID this attempt claimed for the guest: the only peer the proxy serves.
-    pub(crate) cid: u32,
+    /// How the proxy listens.
+    pub(crate) listen: ProxyListen,
     /// The image's `sandy-agent`, which runs the relay in the guest.
     pub(crate) relay_program: &'a Path,
     /// The proxy binary.
@@ -56,15 +80,32 @@ pub(crate) struct EgressLaunch<'a> {
 }
 
 impl<'a> EgressLaunch<'a> {
-    /// A launch with the production binary resolution and the 5 s `READY` deadline.
+    /// A vsock launch (qemu) with the production binary resolution and the 5 s `READY` deadline.
     pub(crate) fn new(policy: &'a AllowList, cid: u32, relay_program: &'a Path) -> Self {
+        Self::with_listen(policy, ProxyListen::Vsock { cid }, relay_program)
+    }
+
+    /// A unix-socket launch (vfkit) with the production binary resolution and the 5 s `READY` deadline.
+    pub(crate) fn new_unix(policy: &'a AllowList, socket: PathBuf, relay_program: &'a Path) -> Self {
+        Self::with_listen(policy, ProxyListen::Unix { socket }, relay_program)
+    }
+
+    fn with_listen(policy: &'a AllowList, listen: ProxyListen, relay_program: &'a Path) -> Self {
         let bin = std::env::var_os(PROXY_BIN_ENV).map_or_else(|| PathBuf::from(PROXY_BIN_DEFAULT), PathBuf::from);
         Self {
             policy,
-            cid,
+            listen,
             relay_program,
             bin,
             ready_deadline: READY_DEADLINE,
+        }
+    }
+
+    /// The proxy's unix socket, when it listens on one.
+    pub(crate) fn unix_socket(&self) -> Option<&Path> {
+        match &self.listen {
+            ProxyListen::Unix { socket } => Some(socket),
+            ProxyListen::Vsock { .. } => None,
         }
     }
 
@@ -93,7 +134,7 @@ enum StartFailure {
 }
 
 impl ProxyHandle {
-    /// The host vsock port the guest relay dials.
+    /// The vsock port the guest relay dials: the random host port (qemu) or [`EGRESS_VSOCK_PORT`] (vfkit).
     pub(crate) fn port(&self) -> u32 {
         self.port
     }
@@ -116,10 +157,29 @@ impl ProxyHandle {
     fn start(launch: &EgressLaunch<'_>) -> Result<Self, BackendError> {
         let policy = serde_json::to_vec(launch.policy)
             .map_err(|err| BackendError::Spawn(format!("egress proxy did not start: encode policy: {err}")))?;
+        let cid = match &launch.listen {
+            ProxyListen::Vsock { cid } => *cid,
+            // A bind failure on the unix socket is not a port clash: no retry.
+            ProxyListen::Unix { socket } => {
+                let args = ["--unix".to_owned(), socket.to_string_lossy().into_owned()];
+                return match start_once(launch, &args, EGRESS_VSOCK_PORT, &policy) {
+                    Ok(handle) => Ok(handle),
+                    Err(StartFailure::AddrInUse(why) | StartFailure::Other(why)) => {
+                        Err(BackendError::Spawn(format!("egress proxy did not start: {why}")))
+                    }
+                };
+            }
+        };
         let mut last = String::new();
         for attempt in 1..=PORT_ATTEMPTS {
             let port = random_proxy_port();
-            match start_once(launch, port, &policy) {
+            let args = [
+                "--vsock-port".to_owned(),
+                port.to_string(),
+                "--peer-cid".to_owned(),
+                cid.to_string(),
+            ];
+            match start_once(launch, &args, port, &policy) {
                 Ok(handle) => return Ok(handle),
                 Err(StartFailure::AddrInUse(why)) => {
                     tracing::debug!(attempt, port, "egress proxy port in use; retrying");
@@ -163,8 +223,27 @@ pub(crate) fn egress_relay_argv(program: &Path, port: u32, rest: &[String]) -> V
     argv
 }
 
-/// Spawn the proxy on `port` and wait for `READY`.
-fn start_once(launch: &EgressLaunch<'_>, port: u32, policy: &[u8]) -> Result<ProxyHandle, StartFailure> {
+/// The guest command: the job, behind the agent in agent mode, behind the egress relay in proxy mode
+/// (outermost, so the relay's variables reach the agent and the job).
+pub(crate) fn console_command(job: &[String], agent: Option<&Path>, relay: Option<(&Path, u32)>) -> Vec<String> {
+    let inner = match agent {
+        Some(program) => agent_command_argv(program, AGENT_VSOCK_PORT, job),
+        None => job.to_vec(),
+    };
+    match relay {
+        Some((program, port)) => egress_relay_argv(program, port, &inner),
+        None => inner,
+    }
+}
+
+/// Spawn the proxy with `args` (the `--vsock-port`/`--peer-cid` or `--unix` listen flags), report `port` as the
+/// relay's port, and wait for `READY`.
+fn start_once(
+    launch: &EgressLaunch<'_>,
+    args: &[String],
+    port: u32,
+    policy: &[u8],
+) -> Result<ProxyHandle, StartFailure> {
     let mut command = Command::new(&launch.bin);
     // Sanitized environment: PATH only, never the forge token or any other secret.
     command.env_clear();
@@ -172,7 +251,7 @@ fn start_once(launch: &EgressLaunch<'_>, port: u32, policy: &[u8]) -> Result<Pro
         command.env("PATH", path);
     }
     let child = command
-        .args(["--vsock-port", &port.to_string(), "--peer-cid", &launch.cid.to_string()])
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -318,7 +397,7 @@ pub(crate) mod tests {
     pub(crate) fn launch<'a>(policy: &'a AllowList, bin: PathBuf, deadline: Duration) -> EgressLaunch<'a> {
         EgressLaunch {
             policy,
-            cid: 42,
+            listen: ProxyListen::Vsock { cid: 42 },
             relay_program: Path::new("/nix/store/x-sandy-agent/bin/sandy-agent"),
             bin,
             ready_deadline: deadline,
@@ -529,6 +608,118 @@ pub(crate) mod tests {
         assert!(message.contains("no free vsock port after 8 attempts"), "{message}");
         assert_eq!(std::fs::read_to_string(&count)?.lines().count(), PORT_ATTEMPTS);
         Ok(())
+    }
+
+    /// #405: the vfkit variant listens on a unix socket, has no CID or vsock port, and reports the constant
+    /// relay port.
+    #[test]
+    fn a_unix_proxy_gets_the_socket_flag_only_and_reports_the_constant_port() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let seen = dir.path().join("seen");
+        let bin = stub(
+            dir.path(),
+            "proxy",
+            &format!(
+                "cat > {seen}.stdin; echo \"$@\" > {seen}.args; echo READY; exec sleep 30",
+                seen = seen.display()
+            ),
+        )?;
+        let allow = policy();
+        let socket = dir.path().join("eg-0123456789ab.sock");
+        let mut launch = launch(&allow, bin, Duration::from_secs(5));
+        launch.listen = ProxyListen::Unix { socket: socket.clone() };
+        assert_eq!(launch.unix_socket(), Some(socket.as_path()));
+        let mut handle = launch.start()?;
+        assert_eq!(handle.port(), EGRESS_VSOCK_PORT);
+        assert_eq!(handle.port(), 5001);
+        handle.kill();
+        let args = std::fs::read_to_string(dir.path().join("seen.args"))?;
+        assert_eq!(args.trim(), format!("--unix {}", socket.display()));
+        let stdin = std::fs::read_to_string(dir.path().join("seen.stdin"))?;
+        assert_eq!(serde_json::from_str::<AllowList>(&stdin).context("policy json")?, allow);
+        Ok(())
+    }
+
+    /// #405: a bind failure on the unix socket is not retried like a vsock port clash, even when its
+    /// stderr says "Address already in use" (a stale socket file prints it too).
+    #[test]
+    fn a_unix_bind_failure_is_not_retried() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let count = dir.path().join("count");
+        let bin = stub(
+            dir.path(),
+            "proxy",
+            &format!(
+                "cat >/dev/null; echo x >> {}; echo 'bind /x.sock: Address already in use' >&2; exit 2",
+                count.display()
+            ),
+        )?;
+        let allow = policy();
+        let mut launch = launch(&allow, bin, Duration::from_secs(5));
+        launch.listen = ProxyListen::Unix {
+            socket: dir.path().join("eg.sock"),
+        };
+        let err = launch.start().err();
+        let Some(BackendError::Spawn(message)) = err else {
+            anyhow::bail!("expected Spawn, got {err:?}");
+        };
+        assert!(message.starts_with("egress proxy did not start:"), "{message}");
+        assert!(message.contains("Address already in use"), "{message}");
+        assert_eq!(std::fs::read_to_string(&count)?.lines().count(), 1, "one attempt only");
+        Ok(())
+    }
+
+    /// #404: the console command in console-only proxy mode is the relay wrapper around the job.
+    #[test]
+    fn the_console_command_wraps_a_console_only_job_in_the_relay() {
+        let job = [
+            "sh".to_string(),
+            "-c".to_string(),
+            "curl https://github.com".to_string(),
+        ];
+        let program = Path::new("/nix/store/a-sandy-agent/bin/sandy-agent");
+        assert_eq!(
+            console_command(&job, None, Some((program, 50123))),
+            [
+                "/nix/store/a-sandy-agent/bin/sandy-agent",
+                "egress-relay",
+                "--vsock-port",
+                "50123",
+                "--",
+                "sh",
+                "-c",
+                "curl https://github.com"
+            ]
+        );
+    }
+
+    /// #404: in agent mode the relay is outermost and the agent invocation is its `<rest>`.
+    #[test]
+    fn the_console_command_wraps_the_agent_invocation_in_the_relay() {
+        let job = ["sh".to_string(), "-c".to_string(), "env".to_string()];
+        let program = Path::new("/nix/store/a-sandy-agent/bin/sandy-agent");
+        assert_eq!(
+            console_command(&job, Some(program), Some((program, 50123))),
+            [
+                "/nix/store/a-sandy-agent/bin/sandy-agent",
+                "egress-relay",
+                "--vsock-port",
+                "50123",
+                "--",
+                "/nix/store/a-sandy-agent/bin/sandy-agent",
+                "--vsock-listen",
+                "5000",
+                "--",
+                "sh",
+                "-c",
+                "env"
+            ]
+        );
+        assert_eq!(
+            console_command(&job, None, None),
+            job,
+            "no agent, no proxy: the job unchanged"
+        );
     }
 
     #[test]
