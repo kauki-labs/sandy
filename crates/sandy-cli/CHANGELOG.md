@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
-- *(egress)* live tests for hostname allow-list entries at the proxy ([#377](https://github.com/kauki-labs/sandy/pull/377)) ([#489](https://github.com/kauki-labs/sandy/pull/489))
+- _(egress)_ live tests for hostname allow-list entries at the proxy ([#377](https://github.com/kauki-labs/sandy/pull/377)) ([#489](https://github.com/kauki-labs/sandy/pull/489))
 
 ## [0.2.1](https://github.com/kauki-labs/sandy/compare/sandy-cli-v0.2.0...sandy-cli-v0.2.1) - 2026-10-28
 
