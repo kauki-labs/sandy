@@ -269,7 +269,7 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
 
     // 5. Classify the physical outcome. The console tail is carried through to the envelope so a boot fault (which
     //    never produced a guest exit) is still diagnosable from the record alone.
-    let (classification, guest_exit, message, console, outputs, output_sizes) = match run_result {
+    let (classification, guest_exit, message, console, outputs, output_sizes, digests) = match run_result {
         Err(backend_error) => {
             tracing::warn!(%job_id, error = %backend_error, "backend run failed (infra fault)");
             (
@@ -279,6 +279,7 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
                 String::new(),
                 vec![],
                 vec![],
+                None,
             )
         }
         Ok(outcome) => {
@@ -293,7 +294,8 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
                 format!("run {:?}", classification.status),
                 outcome.console,
                 collect_output_refs(plan),
-                collect_output_size_refs(plan),
+                collect_output_size_refs(plan, outcome.digests.as_ref().map(|d| &d.outputs)),
+                outcome.digests,
             )
         }
     };
@@ -308,19 +310,25 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
     //    mid-run refresh before persisting (M-6). The caller (`run_job` or `run_job_with_credential`) writes the
     //    terminal record.
     let console = redact_console(console, redact);
+    let mut host_observed = build_host_observed(
+        &job_id,
+        plan,
+        backend.kind(),
+        egress_os,
+        &egress_receipt_result,
+        started,
+        teardown_at,
+    );
+    // #373: the backend hashed the staged inputs before boot (host-observed) and the
+    // collected outputs (guest-reported). Both are `None` unless `--digests` was given.
+    let skipped_outputs = digests.as_ref().map(|d| d.outputs.skipped.clone()).unwrap_or_default();
+    host_observed.input_digests = digests.map(|d| d.inputs);
     let receipt = Some(AuditReceipt {
-        host_observed: build_host_observed(
-            &job_id,
-            plan,
-            backend.kind(),
-            egress_os,
-            &egress_receipt_result,
-            started,
-            teardown_at,
-        ),
+        host_observed,
         guest_reported: GuestReported {
             exit_code: guest_exit,
             outputs: output_sizes,
+            skipped_outputs,
         },
     });
     let mut envelope = build_envelope(
@@ -926,6 +934,7 @@ mod tests {
     fn run_with_profile_uses_the_injected_backend_and_egress() -> anyhow::Result<()> {
         let (_tmp, journal) = fresh_journal()?;
         let backend = FakeBackend::new().with_outcome(Outcome {
+            digests: None,
             booted: true,
             guest_exit: Some(0),
             transport_error: None,
@@ -976,6 +985,7 @@ mod tests {
     /// A minimal plan that boots `demo` with no secrets or env.
     fn booting_plan() -> JobPlan {
         JobPlan {
+            digests: false,
             egress_proxy: false,
             template: "demo".to_string(),
             command: vec![],
@@ -1003,6 +1013,7 @@ mod tests {
     fn leaking_plan() -> JobPlan {
         use sandy::{SecretRef, SecretSource};
         JobPlan {
+            digests: false,
             egress_proxy: false,
             template: "demo".to_string(),
             command: vec![],
@@ -1038,6 +1049,7 @@ mod tests {
         {
             let (_tmp, journal) = fresh_journal()?;
             let backend = FakeBackend::new().with_outcome(Outcome {
+                digests: None,
                 booted: true,
                 guest_exit: Some(0),
                 transport_error: None,
@@ -1061,6 +1073,7 @@ mod tests {
         {
             let (_tmp, journal) = fresh_journal()?;
             let backend = FakeBackend::new().with_outcome(Outcome {
+                digests: None,
                 booted: true,
                 guest_exit: Some(1),
                 transport_error: None,
@@ -1101,6 +1114,7 @@ mod tests {
         {
             let (_tmp, journal) = fresh_journal()?;
             let backend = FakeBackend::new().with_outcome(Outcome {
+                digests: None,
                 booted: true,
                 guest_exit: Some(0),
                 transport_error: None,
@@ -1324,6 +1338,7 @@ mod tests {
         let provider = TwoTokenProvider { initial, refreshed };
         let backend = SlowBackend {
             inner: FakeBackend::new().with_outcome(Outcome {
+                digests: None,
                 booted: true,
                 guest_exit: Some(0),
                 transport_error: None,
@@ -1426,6 +1441,7 @@ mod tests {
             .context("cred dir 0700")?;
         let provider = sandy_test_support::FakeProvider::returning("tok");
         let backend = FakeBackend::new().with_outcome(Outcome {
+            digests: None,
             booted: true,
             guest_exit: Some(0),
             transport_error: None,

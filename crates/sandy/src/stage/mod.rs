@@ -16,10 +16,11 @@
 //! in-guest under its `$NAME` — is host-gated (INV-S9) and lives in the
 //! `sandy-cli` live tests, not here.
 
+mod digest;
 mod inputs;
 mod outputs;
 mod secrets;
 
-pub use inputs::{INPUT_MOUNT_TAG, stage_inputs};
+pub use inputs::{INPUT_MOUNT_TAG, digest_staged_inputs, stage_inputs};
 pub use outputs::{OUTPUT_MOUNT_TAG, collect_outputs, prepare_outputs};
 pub use secrets::{SECRET_MOUNT_TAG, StagedSecret, stage_secrets, wipe};

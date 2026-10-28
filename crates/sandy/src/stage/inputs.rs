@@ -17,6 +17,9 @@
 
 use std::{fs, os::unix::fs::PermissionsExt, path::Path};
 
+use sandy_api::result::ContentDigests;
+
+use super::digest::digest_tree;
 use crate::backend::{BackendError, Input};
 
 /// The virtiofs `mountTag` for the inputs share. Fixed, not per-run, so the guest
@@ -61,6 +64,25 @@ pub fn stage_inputs(inputs: &[Input], inputs_dir: &Path) -> Result<usize, Backen
     }
     write_manifest(inputs, inputs_dir)?;
     Ok(inputs.len())
+}
+
+/// Hash the STAGED copy of each input under `inputs_dir` (#373), after
+/// [`stage_inputs`] copied it and before the guest boots, so the digest names
+/// what the guest will read, not whatever the host source holds by then. A
+/// directory input yields one digest per regular file at `<name>/<relpath>`.
+/// The manifest file is not an input and is not hashed. Opt-in
+/// (`RunSpec::digests`): never called on an ordinary run.
+///
+/// # Errors
+///
+/// Returns [`BackendError::Spawn`] when a staged entry cannot be read.
+pub fn digest_staged_inputs(inputs: &[Input], inputs_dir: &Path) -> Result<ContentDigests, BackendError> {
+    let mut digests = ContentDigests::default();
+    for input in inputs {
+        digest_tree(&inputs_dir.join(&input.name), &input.name, &mut digests)?;
+    }
+    digests.sort();
+    Ok(digests)
 }
 
 /// Write the inputs manifest ([`INPUT_MANIFEST_NAME`]) for every input that
@@ -202,6 +224,79 @@ mod tests {
         assert_eq!(cols[1], "/workspace/data", "guest path");
         assert_eq!(cols[2], "copy", "source slot");
         assert_eq!(cols[3], "", "hash slot reserved, empty today");
+        Ok(())
+    }
+
+    /// #373: the digest is of the STAGED copy. A file and a directory input get
+    /// known sha256 vectors under `<name>` / `<name>/<relpath>`, the manifest is
+    /// not hashed, and mutating the host source after staging changes nothing.
+    #[test]
+    fn digests_the_staged_copy_with_known_vectors() -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        const HELLO: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+        const EMPTY: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let src = tempfile::TempDir::new()?;
+        fs::write(src.path().join("f"), b"hello")?;
+        fs::create_dir(src.path().join("tree"))?;
+        fs::write(src.path().join("tree").join("nested"), b"hello")?;
+        fs::write(src.path().join("tree").join("empty"), b"")?;
+        let out = tempfile::TempDir::new()?;
+        let inputs_dir = out.path().join("inputs");
+        let inputs = [
+            Input {
+                host: src.path().join("f"),
+                name: "file".to_string(),
+                guest_path: Some(std::path::PathBuf::from("/w/f")),
+            },
+            Input {
+                host: src.path().join("tree"),
+                name: "dir".to_string(),
+                guest_path: None,
+            },
+        ];
+        stage_inputs(&inputs, &inputs_dir).context("stage")?;
+        // The host source changes after staging: the digest must still be the staged bytes.
+        fs::write(src.path().join("f"), b"tampered")?;
+
+        let digests = digest_staged_inputs(&inputs, &inputs_dir).context("digest")?;
+
+        let got: Vec<(&str, &str)> = digests
+            .files
+            .iter()
+            .map(|d| (d.path.as_str(), d.sha256.as_str()))
+            .collect();
+        assert_eq!(got, [("dir/empty", EMPTY), ("dir/nested", HELLO), ("file", HELLO)]);
+        assert!(digests.skipped.is_empty());
+        Ok(())
+    }
+
+    /// Adversarial: the staged tree is hashed without following a symlink; one
+    /// planted there is recorded as skipped, not read.
+    #[test]
+    fn a_symlink_in_the_staged_tree_is_recorded_as_skipped() -> anyhow::Result<()> {
+        use sandy_api::result::{SkipReason, SkippedEntry};
+
+        let out = tempfile::TempDir::new()?;
+        let inputs_dir = out.path().join("inputs");
+        fs::create_dir_all(inputs_dir.join("d"))?;
+        std::os::unix::fs::symlink("/etc/hostname", inputs_dir.join("d").join("link"))?;
+        let inputs = [Input {
+            host: out.path().to_path_buf(),
+            name: "d".to_string(),
+            guest_path: None,
+        }];
+
+        let digests = digest_staged_inputs(&inputs, &inputs_dir)?;
+
+        assert!(digests.files.is_empty());
+        assert_eq!(
+            digests.skipped,
+            [SkippedEntry {
+                path: "d/link".to_string(),
+                reason: SkipReason::Symlink
+            }]
+        );
         Ok(())
     }
 

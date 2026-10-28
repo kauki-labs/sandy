@@ -151,6 +151,7 @@ mod tests {
         let command = ["sh".to_owned(), "-c".to_owned(), "exit 3".to_owned()];
         let control = RunControl::with_timeout_secs(30);
         let spec = RunSpec {
+            digests: false,
             egress: None,
             template: "contract",
             command: &command,

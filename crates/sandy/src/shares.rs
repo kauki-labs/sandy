@@ -14,11 +14,15 @@ use std::{
 #[cfg(test)]
 use sandy_api::backend::RunControl;
 use sandy_api::{
-    backend::{BackendError, RunSpec},
+    backend::{BackendError, Outcome, RunDigests, RunSpec},
+    result::ContentDigests,
     share::ShareSpec,
 };
 
-use crate::{INPUT_MOUNT_TAG, OUTPUT_MOUNT_TAG, SECRET_MOUNT_TAG, prepare_outputs, stage_inputs, stage_secrets};
+use crate::{
+    INPUT_MOUNT_TAG, OUTPUT_MOUNT_TAG, SECRET_MOUNT_TAG, digest_staged_inputs, prepare_outputs, stage_inputs,
+    stage_secrets,
+};
 
 /// The per-run staging directories a backend hands to [`plan_shares`]. The backend
 /// owns the naming (qemu keys them on the run id, vfkit on its `inst-<id>` box id)
@@ -33,8 +37,46 @@ pub struct ShareDirs<'a> {
     pub outputs_dir: &'a Path,
 }
 
+/// What [`plan_shares`] staged: the shares to attach, plus the input digests when
+/// the run asked for them (#373).
+#[derive(Debug)]
+pub struct SharePlan {
+    /// The shares to attach, in a fixed secret → input → output order.
+    pub shares: Vec<ShareSpec>,
+    /// sha256 of each staged input, hashed after the copy and before boot. `Some`
+    /// only when [`RunSpec::digests`] is set; `None` means nothing was hashed.
+    pub input_digests: Option<ContentDigests>,
+}
+
+/// Fold a run's digests into its [`Outcome`] and apply the collection result,
+/// the shared tail of every backend's `run` (#373).
+///
+/// `collected` is what [`collect_outputs`](crate::collect_outputs) returned. A
+/// collection error wins over the outcome, as before. With `input_digests`
+/// `Some` (the run asked for digests), the outcome gains
+/// [`Outcome::digests`]; with it `None`, the outcome is returned untouched.
+///
+/// # Errors
+/// The collection error, else the outcome's own error.
+pub fn with_digests(
+    outcome: Result<Outcome, BackendError>,
+    input_digests: Option<ContentDigests>,
+    collected: Result<Option<ContentDigests>, BackendError>,
+) -> Result<Outcome, BackendError> {
+    let outputs = collected?;
+    outcome.map(|mut outcome| {
+        if let Some(inputs) = input_digests {
+            outcome.digests = Some(RunDigests {
+                inputs,
+                outputs: outputs.unwrap_or_default(),
+            });
+        }
+        outcome
+    })
+}
+
 /// Stage one run's secret, inputs, and outputs per `spec` and return the
-/// [`ShareSpec`]s both backends attach, in a fixed secret → input → output order.
+/// [`SharePlan`] both backends attach, in a fixed secret → input → output order.
 ///
 /// This is the single home for the share-staging *policy*: which dirs are shared
 /// under which tag, each share's read-only flag (secret and inputs read-only,
@@ -50,7 +92,7 @@ pub struct ShareDirs<'a> {
 ///
 /// # Errors
 /// [`BackendError`] if staging the secret, inputs, or outputs fails.
-pub fn plan_shares(spec: &RunSpec, dirs: &ShareDirs) -> Result<Vec<ShareSpec>, BackendError> {
+pub fn plan_shares(spec: &RunSpec, dirs: &ShareDirs) -> Result<SharePlan, BackendError> {
     let mut shares = Vec::new();
     let share = |host_dir: PathBuf, tag: &str, readonly: bool| ShareSpec {
         socket: dirs.inst_dir.join(format!("vfsd-{tag}.sock")),
@@ -82,11 +124,16 @@ pub fn plan_shares(spec: &RunSpec, dirs: &ShareDirs) -> Result<Vec<ShareSpec>, B
     if stage_inputs(spec.inputs, dirs.inputs_dir)? > 0 {
         shares.push(share(dirs.inputs_dir.to_path_buf(), INPUT_MOUNT_TAG, true));
     }
+    // #373: hash the staged copy now, before any boot. Opt-in; no read otherwise.
+    let input_digests = spec
+        .digests
+        .then(|| digest_staged_inputs(spec.inputs, dirs.inputs_dir))
+        .transpose()?;
     // Outputs: their own per-run dir, writable; collected to the host after boot.
     if prepare_outputs(spec.outputs, dirs.outputs_dir)? > 0 {
         shares.push(share(dirs.outputs_dir.to_path_buf(), OUTPUT_MOUNT_TAG, false));
     }
-    Ok(shares)
+    Ok(SharePlan { shares, input_digests })
 }
 
 /// Kill and reap a set of child processes, best-effort (the virtiofsd daemons at
@@ -123,6 +170,7 @@ mod tests {
 
     fn spec<'a>(command: &'a [String], secret_dir: Option<(&'a Path, DirFingerprint)>) -> RunSpec<'a> {
         RunSpec {
+            digests: false,
             egress: None,
             template: "t",
             command,
@@ -201,6 +249,87 @@ mod tests {
         Ok(())
     }
 
+    /// #373: with `digests` off `plan_shares` hashes nothing (`None`); with it on
+    /// it digests the staged copy of each input before returning.
+    #[test]
+    fn plan_shares_digests_inputs_only_when_asked() -> anyhow::Result<()> {
+        use anyhow::Context;
+        use sandy_api::backend::Input;
+
+        let tmp = private_tempdir()?;
+        let host = tmp.path().join("in.txt");
+        std::fs::write(&host, b"hello")?;
+        let inputs = [Input {
+            host,
+            name: "in".to_owned(),
+            guest_path: None,
+        }];
+        let command = ["true".to_owned()];
+        let plan = |digests: bool, sub: &str| -> anyhow::Result<SharePlan> {
+            let dirs = ShareDirs {
+                inst_dir: &tmp.path().join(sub).join("inst"),
+                inputs_dir: &tmp.path().join(sub).join("inputs"),
+                outputs_dir: &tmp.path().join(sub).join("outputs"),
+            };
+            std::fs::create_dir_all(tmp.path().join(sub))?;
+            let mut spec = spec(&command, None);
+            spec.inputs = &inputs;
+            spec.digests = digests;
+            Ok(plan_shares(&spec, &dirs)?)
+        };
+
+        assert!(plan(false, "off")?.input_digests.is_none(), "flag off must not hash");
+        let on = plan(true, "on")?.input_digests.context("flag on yields digests")?;
+        assert_eq!(on.files.len(), 1);
+        assert_eq!(on.files[0].path, "in");
+        assert_eq!(
+            on.files[0].sha256,
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+        Ok(())
+    }
+
+    /// #373: `with_digests` leaves an outcome untouched when no input digests
+    /// were asked for, folds both sides in when they were, and lets a collection
+    /// error win over the outcome as `collected.and(outcome)` did.
+    #[test]
+    fn with_digests_folds_both_sides_and_lets_a_collection_error_win() -> anyhow::Result<()> {
+        use anyhow::Context;
+        use sandy_api::result::{FileDigest, SkipReason, SkippedEntry};
+
+        let outcome = || {
+            Ok(Outcome {
+                booted: true,
+                guest_exit: Some(0),
+                transport_error: None,
+                timed_out: false,
+                console: String::new(),
+                digests: None,
+            })
+        };
+        let some = |path: &str| ContentDigests {
+            files: vec![FileDigest {
+                path: path.to_owned(),
+                sha256: "ab".to_owned(),
+            }],
+            skipped: vec![SkippedEntry {
+                path: "s".to_owned(),
+                reason: SkipReason::Symlink,
+            }],
+        };
+
+        let plain = with_digests(outcome(), None, Ok(None)).context("off")?;
+        assert_eq!(plain.digests, None);
+
+        let on = with_digests(outcome(), Some(some("i")), Ok(Some(some("o")))).context("on")?;
+        let digests = on.digests.context("digests present")?;
+        assert_eq!((digests.inputs, digests.outputs), (some("i"), some("o")));
+
+        let failed = with_digests(outcome(), None, Err(BackendError::Spawn("full".to_owned())));
+        assert!(failed.is_err(), "a collection error must still fail the run");
+        Ok(())
+    }
+
     /// A missing instance dir is created 0700.
     #[test]
     fn a_missing_instance_dir_is_created_private() -> anyhow::Result<()> {
@@ -265,6 +394,7 @@ mod tests {
             outputs_dir: &tmp.path().join("outputs"),
         };
         let spec = RunSpec {
+            digests: false,
             egress: None,
             template: "t",
             command: &command,

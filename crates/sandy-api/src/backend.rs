@@ -21,7 +21,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::egress::AllowList;
+use crate::{egress::AllowList, result::ContentDigests};
 
 /// A live handle into a running [`VmBackend::run`] call, letting something
 /// outside the call (a `daemon cancel`, an attach-state transition, a grace
@@ -273,6 +273,9 @@ pub struct RunSpec<'a> {
     /// the proxy must refuse a spec that carries a policy before it boots, so a
     /// proxy-mode run never boots without a boundary.
     pub egress: Option<&'a AllowList>,
+    /// `true` records a sha256 of each staged input and collected output into
+    /// [`Outcome::digests`] (#373). `false` (the default everywhere) hashes nothing.
+    pub digests: bool,
 }
 
 impl RunSpec<'_> {
@@ -312,6 +315,22 @@ pub struct Outcome {
     /// result envelope's `logs.tail`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub console: String,
+    /// The content digests the backend computed when [`RunSpec::digests`] was
+    /// set (#373); `None` when it was not, or the backend computed none. The
+    /// staging dirs are wiped at teardown, so the backend must produce this
+    /// before returning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digests: Option<RunDigests>,
+}
+
+/// The content digests a backend reports for one run (#373): inputs hashed on
+/// the staged host copy before boot, outputs hashed as collected.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunDigests {
+    /// Staged inputs, hashed before boot.
+    pub inputs: ContentDigests,
+    /// Collected outputs, with the entries collection skipped.
+    pub outputs: ContentDigests,
 }
 
 /// The state of one running box, as reported by [`VmBackend::boxes`].
@@ -424,6 +443,7 @@ mod tests {
 
     fn spec<'a>(grants: &'a Grants, control: &'a RunControl, egress: Option<&'a AllowList>) -> RunSpec<'a> {
         RunSpec {
+            digests: false,
             template: "demo",
             command: &[],
             inputs: &[],

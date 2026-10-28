@@ -468,7 +468,7 @@ booted, guest_exit }`. It is band 3 and retryable whatever the guest exit, so a 
 - **Non-fatal faults surface as `warnings`.** A fault that must not fail an
   otherwise-successful run (e.g. a credential revoke failing at teardown, L-12)
   is named in `warnings: Vec<String>`. The field was introduced in schema `2`;
-  the current envelope is schema `3` (below), and old records still deserialize
+  the current envelope is schema `4` (below), and old records still deserialize
   (`#[serde(default)]`) — never just a log line.
 - **Envelope receipts v1 (#361).** `ResultEnvelope.receipt: Option<AuditReceipt>`
   (schema `3`, `None` on a pre-`3` record) is audit lineage split by who
@@ -500,8 +500,18 @@ booted, guest_exit }`. It is band 3 and retryable whatever the guest exit, so a 
     today since no backend reports that moment, and teardown).
   - `guest_reported` (a hostile guest can shape these): the exit code
     (mirroring `ResultEnvelope.exit_code`) and collected output names/sizes.
-  - Out of v1, tracked: content digests (#373), signing (#374), filling
-    `egress.attempts` from the #360 proxy (#375).
+  - Content digests (#373, schema `4`, opt-in via `sandy run --digests`): the
+    backend hashes each staged input (`host_observed.input_digests`, computed on
+    the staged copy before boot) and each collected output
+    (`guest_reported.outputs[].sha256`, hashed in the same pass as the copy),
+    one sha256 per regular file at its logical path. A symlink or special file
+    is recorded as skipped (`guest_reported.skipped_outputs`, reason `symlink` or
+    `non_regular`), not omitted. Off, no digest key is serialized and nothing is
+    hashed. The collection ceiling stays a hard error, so no entry is dropped
+    under it. The staging dirs are wiped at teardown, so the backend reports the
+    digests through `Outcome.digests`.
+  - Out of v1, tracked: signing (#374), filling `egress.attempts` from the #360
+    proxy (#375).
 
 **KPI.**
 
@@ -510,7 +520,12 @@ booted, guest_exit }`. It is band 3 and retryable whatever the guest exit, so a 
   (`an_old_schema_v1_record_with_no_warnings_key_deserializes_to_empty`,
   `an_old_schema_v2_record_with_no_receipt_key_deserializes_to_none`) and
   `envelope_wire_keys_are_snake_case` (asserts the receipt's nested `where`
-  wire key, never `location`);
+  wire key, never `location`) and the digest regressions
+  (`an_old_schema_v3_receipt_with_no_digest_keys_deserializes_to_none`,
+  `a_receipt_without_digests_serializes_no_digest_keys`,
+  `digests_on_hashes_each_collected_file_by_logical_path`,
+  `digests_the_staged_copy_with_known_vectors`,
+  `run_places_reported_digests_in_the_right_receipt_sections`);
   `cli_jobs` band tests (`run_positive`, `run_guest_failure`, `run_timeout`,
   `run_infra_fault`, `run_invalid_plan`) and
   `run_lists_collected_outputs_in_the_envelope`;

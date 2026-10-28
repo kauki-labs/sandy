@@ -2,9 +2,9 @@
 //! for both the envelope (`OutputRef`) and the audit receipt
 //! (`OutputSizeRef`, #361).
 
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
-use sandy::{OutputRef, OutputSizeRef};
+use sandy::{ContentDigests, OutputRef, OutputSizeRef};
 
 use crate::plan::JobPlan;
 
@@ -35,11 +35,26 @@ pub(super) fn collect_output_refs(plan: &JobPlan) -> Vec<OutputRef> {
 }
 
 /// [`collect_output_entries`] as [`OutputSizeRef`]s (the receipt's
-/// `guest_reported.outputs`, #361).
-pub(super) fn collect_output_size_refs(plan: &JobPlan) -> Vec<OutputSizeRef> {
+/// `guest_reported.outputs`, #361). With `digests` (#373, the backend's report
+/// of what it collected) each entry carries the sha256 recorded for its logical
+/// path; an entry with no recorded digest (a file already at the destination
+/// that this run did not collect) carries none.
+pub(super) fn collect_output_size_refs(plan: &JobPlan, digests: Option<&ContentDigests>) -> Vec<OutputSizeRef> {
+    let by_path: HashMap<&str, &str> = digests
+        .into_iter()
+        .flat_map(|d| d.files.iter())
+        .map(|f| (f.path.as_str(), f.sha256.as_str()))
+        .collect();
     collect_output_entries(plan)
         .into_iter()
-        .map(|(path, size_bytes)| OutputSizeRef { path, size_bytes })
+        .map(|(path, size_bytes)| {
+            let sha256 = by_path.get(path.as_str()).map(|s| (*s).to_owned());
+            OutputSizeRef {
+                path,
+                size_bytes,
+                sha256,
+            }
+        })
         .collect()
 }
 

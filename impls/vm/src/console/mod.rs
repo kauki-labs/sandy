@@ -215,6 +215,7 @@ fn finalize(result: Result<Outcome, BackendError>, booted: bool, console: String
 /// boot state and the captured console, and never inventing an exit code.
 fn transport_fault(err: BackendError, booted: bool, console: String) -> Outcome {
     Outcome {
+        digests: None,
         booted,
         guest_exit: None,
         transport_error: Some(err.to_string()),
@@ -350,6 +351,7 @@ mod tests {
         timeout_secs: u32,
     ) -> RunSpec<'a> {
         RunSpec {
+            digests: false,
             egress: None,
             template: "demo",
             command,

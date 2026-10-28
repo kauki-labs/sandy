@@ -102,6 +102,11 @@ enum Command {
         /// Optional wall-clock timeout in seconds.
         #[arg(long)]
         timeout: Option<u32>,
+        /// Record a sha256 content digest of each input (host-observed) and each
+        /// collected output (guest-reported) in the receipt. Off by default:
+        /// hashing large outputs costs time on every run that asks for it.
+        #[arg(long)]
+        digests: bool,
         /// Mint a scoped forge token for the job from the named trust root (a
         /// `sandy cred github` name); the token is injected as `GITHUB_TOKEN` and
         /// revoked at teardown.
@@ -1094,6 +1099,7 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
             cpu,
             mem,
             timeout,
+            digests,
             credential,
             cred_capability,
             command,
@@ -1142,6 +1148,7 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
                 cpu,
                 mem,
                 timeout,
+                digests,
                 command,
             };
             // The composition root: select the run profile here and inject it. Today
@@ -1256,6 +1263,7 @@ mod tests {
             cpu: None,
             mem: None,
             timeout: None,
+            digests: false,
             command: vec![],
         }
     }
@@ -1271,6 +1279,7 @@ mod tests {
         let journal = Journal::new(tmp.path());
         journal.ensure_dirs().context("ensure_dirs")?;
         let backend = FakeBackend::new().with_outcome(Outcome {
+            digests: None,
             booted: true,
             guest_exit: Some(0),
             transport_error: None,

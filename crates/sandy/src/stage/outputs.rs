@@ -23,6 +23,10 @@ use std::{
     path::Path,
 };
 
+use sandy_api::result::{ContentDigests, FileDigest, SkipReason, SkippedEntry};
+use sha2::{Digest, Sha256};
+
+use super::digest::join_logical;
 use crate::backend::{BackendError, Output};
 
 /// The virtiofs `mountTag` for the writable outputs share. Fixed, not per-run, so
@@ -68,14 +72,27 @@ pub fn prepare_outputs(outputs: &[Output], outputs_dir: &Path) -> Result<usize, 
 /// caller runs this before wiping the share. Symlinks are skipped (never followed
 /// or recreated), and the run-wide byte/entry ceiling is enforced.
 ///
+/// With `digests` set (#373, `RunSpec::digests`) the copy also hashes each
+/// collected file in the same pass, so there is no second read, and returns the
+/// report: a sha256 per regular file at its logical path (`<name>/<relpath>` for
+/// a named output, `<relpath>` for a catch-all) plus every symlink or special
+/// file skipped. The ceiling stays a hard error, so no entry is ever dropped
+/// silently under it. With `digests` unset nothing is hashed and the result is
+/// `None`.
+///
 /// # Errors
 ///
 /// Returns [`BackendError::Spawn`] on a copy failure or when the ceiling is hit.
-pub fn collect_outputs(outputs: &[Output], outputs_dir: &Path) -> Result<(), BackendError> {
+pub fn collect_outputs(
+    outputs: &[Output],
+    outputs_dir: &Path,
+    digests: bool,
+) -> Result<Option<ContentDigests>, BackendError> {
     let mut budget = Budget {
         bytes: MAX_OUTPUT_BYTES,
         entries: MAX_OUTPUT_ENTRIES,
     };
+    let mut report = digests.then(ContentDigests::default);
     for output in outputs {
         // A named output collects its subtree; a catch-all (`name = None`) collects
         // the whole output dir root.
@@ -87,10 +104,19 @@ pub fn collect_outputs(outputs: &[Output], outputs_dir: &Path) -> Result<(), Bac
             // The guest declared but never wrote the output: nothing to collect.
             continue;
         }
-        copy_tree(&src, &output.dest, &mut budget)?;
+        copy_tree(
+            &src,
+            &output.dest,
+            output.name.as_deref().unwrap_or(""),
+            &mut budget,
+            report.as_mut(),
+        )?;
         tracing::debug!(name = ?output.name, dest = %output.dest.display(), "collected output");
     }
-    Ok(())
+    if let Some(report) = report.as_mut() {
+        report.sort();
+    }
+    Ok(report)
 }
 
 /// Remaining collection ceiling, decremented as entries are copied.
@@ -132,13 +158,22 @@ fn validate_output_name(name: &str) -> Result<(), BackendError> {
 /// Copy `src` to `dest`, charging the budget. A directory is created and its
 /// entries recursed, and a regular file is streamed. A symlink is skipped (never
 /// followed, never recreated — see the module docs), as is any other special file
-/// (fifo, socket, device).
-fn copy_tree(src: &Path, dest: &Path, budget: &mut Budget) -> Result<(), BackendError> {
+/// (fifo, socket, device). `logical` is the entry's logical path; when `report`
+/// is `Some`, each file's sha256 is recorded as it is copied and each skipped
+/// entry is recorded with its reason.
+fn copy_tree(
+    src: &Path,
+    dest: &Path,
+    logical: &str,
+    budget: &mut Budget,
+    mut report: Option<&mut ContentDigests>,
+) -> Result<(), BackendError> {
     let meta = fs::symlink_metadata(src).map_err(|e| err("stat output entry", src, &e))?;
     let ty = meta.file_type();
 
     if ty.is_symlink() {
         tracing::warn!(path = %src.display(), "skipping symlink in collected output (host-escape guard)");
+        record_skipped(report, logical, SkipReason::Symlink);
         return Ok(());
     }
 
@@ -148,22 +183,49 @@ fn copy_tree(src: &Path, dest: &Path, budget: &mut Budget) -> Result<(), Backend
         fs::create_dir_all(dest).map_err(|e| err("create output dir", dest, &e))?;
         for entry in fs::read_dir(src).map_err(|e| err("read output dir", src, &e))? {
             let entry = entry.map_err(|e| err("read output entry", src, &e))?;
-            copy_tree(&entry.path(), &dest.join(entry.file_name()), budget)?;
+            let name = entry.file_name();
+            copy_tree(
+                &entry.path(),
+                &dest.join(&name),
+                &join_logical(logical, &name.to_string_lossy()),
+                budget,
+                report.as_deref_mut(),
+            )?;
         }
         Ok(())
     } else if ty.is_file() {
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).map_err(|e| err("create output parent", parent, &e))?;
         }
-        stream_copy(src, dest)
+        let sha256 = stream_copy(src, dest, report.is_some())?;
+        if let (Some(report), Some(sha256)) = (report, sha256) {
+            report.files.push(FileDigest {
+                path: logical.to_owned(),
+                sha256,
+            });
+        }
+        Ok(())
     } else {
         tracing::warn!(path = %src.display(), "skipping non-regular output entry");
+        record_skipped(report, logical, SkipReason::NonRegular);
         Ok(())
     }
 }
 
-/// Stream `src` to `dest` a block at a time (outputs may be large).
-fn stream_copy(src: &Path, dest: &Path) -> Result<(), BackendError> {
+fn record_skipped(report: Option<&mut ContentDigests>, logical: &str, reason: SkipReason) {
+    if let Some(report) = report {
+        report.skipped.push(SkippedEntry {
+            path: logical.to_owned(),
+            reason,
+        });
+    }
+}
+
+/// Stream `src` to `dest` a block at a time (outputs may be large). With `hash`
+/// set, the bytes written are also fed through sha256 and its lowercase hex is
+/// returned; otherwise nothing is hashed.
+fn stream_copy(src: &Path, dest: &Path, hash: bool) -> Result<Option<String>, BackendError> {
+    let mut hasher = hash.then(Sha256::new);
     let mut reader = fs::File::open(src).map_err(|e| err("open output file", src, &e))?;
     let mut writer = fs::File::create(dest).map_err(|e| err("create output file", dest, &e))?;
     let mut buf = [0u8; 64 * 1024];
@@ -173,8 +235,11 @@ fn stream_copy(src: &Path, dest: &Path) -> Result<(), BackendError> {
             break;
         }
         io::Write::write_all(&mut writer, &buf[..n]).map_err(|e| err("write output file", dest, &e))?;
+        if let Some(hasher) = hasher.as_mut() {
+            hasher.update(&buf[..n]);
+        }
     }
-    Ok(())
+    Ok(hasher.map(|h| hex::encode(h.finalize())))
 }
 
 /// A named [`BackendError::Spawn`] carrying the failed op, path, and os error.
@@ -184,6 +249,8 @@ fn err(op: &str, path: &Path, e: &std::io::Error) -> BackendError {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context;
+
     use super::*;
 
     /// `prepare_outputs` makes a `0700` dir with an empty writable subdir per
@@ -206,7 +273,7 @@ mod tests {
         fs::create_dir(outputs_dir.join("result").join("sub"))?;
         fs::write(outputs_dir.join("result").join("sub").join("g"), b"deep")?;
 
-        collect_outputs(&outputs, &outputs_dir)?;
+        collect_outputs(&outputs, &outputs_dir, false)?;
 
         assert_eq!(fs::read(dest.join("f"))?, b"produced");
         assert_eq!(fs::read(dest.join("sub").join("g"))?, b"deep");
@@ -231,7 +298,7 @@ mod tests {
         std::os::unix::fs::symlink(&secret, outputs_dir.join("o").join("leak"))?;
         fs::write(outputs_dir.join("o").join("real"), b"ok")?;
 
-        collect_outputs(&outputs, &outputs_dir)?;
+        collect_outputs(&outputs, &outputs_dir, false)?;
 
         assert!(
             fs::symlink_metadata(dest.join("leak")).is_err(),
@@ -239,6 +306,122 @@ mod tests {
         );
         // Real files alongside it are still collected.
         assert_eq!(fs::read(dest.join("real"))?, b"ok");
+        Ok(())
+    }
+
+    /// #373: with digests off nothing is hashed and there is no report.
+    #[test]
+    fn digests_off_returns_no_report() -> anyhow::Result<()> {
+        let run = tempfile::TempDir::new()?;
+        let outputs_dir = run.path().join("outputs");
+        let outputs = [Output {
+            name: Some("o".to_string()),
+            dest: run.path().join("collected"),
+        }];
+        prepare_outputs(&outputs, &outputs_dir)?;
+        fs::write(outputs_dir.join("o").join("f"), b"hello")?;
+
+        assert_eq!(collect_outputs(&outputs, &outputs_dir, false)?, None);
+        Ok(())
+    }
+
+    /// #373: digests on gives a known sha256 per collected file at its logical
+    /// path (named: `<name>/<rel>`; catch-all: `<rel>`), sorted, with the bytes
+    /// at the destination matching.
+    #[test]
+    fn digests_on_hashes_each_collected_file_by_logical_path() -> anyhow::Result<()> {
+        const HELLO: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+        const EMPTY: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let run = tempfile::TempDir::new()?;
+        let outputs_dir = run.path().join("outputs");
+        let named_dest = run.path().join("named");
+        let loose_dest = run.path().join("loose");
+        let named = [Output {
+            name: Some("result".to_string()),
+            dest: named_dest.clone(),
+        }];
+        prepare_outputs(&named, &outputs_dir)?;
+        fs::write(outputs_dir.join("result").join("f"), b"hello")?;
+        fs::create_dir(outputs_dir.join("result").join("sub"))?;
+        fs::write(outputs_dir.join("result").join("sub").join("e"), b"")?;
+
+        let report = collect_outputs(&named, &outputs_dir, true)?.context("report when digests are on")?;
+
+        let got: Vec<(&str, &str)> = report
+            .files
+            .iter()
+            .map(|d| (d.path.as_str(), d.sha256.as_str()))
+            .collect();
+        assert_eq!(got, [("result/f", HELLO), ("result/sub/e", EMPTY)]);
+        assert!(report.skipped.is_empty());
+        assert_eq!(fs::read(named_dest.join("f"))?, b"hello");
+
+        let catch_all = [Output {
+            name: None,
+            dest: loose_dest,
+        }];
+        fs::write(outputs_dir.join("top"), b"hello")?;
+        let report = collect_outputs(&catch_all, &outputs_dir, true)?.context("catch-all report")?;
+        assert!(
+            report.files.iter().any(|d| d.path == "top" && d.sha256 == HELLO),
+            "catch-all path has no name prefix: {report:?}"
+        );
+        assert!(report.files.iter().any(|d| d.path == "result/f"));
+        Ok(())
+    }
+
+    /// #373: a symlink the guest planted is recorded as skipped (and still not
+    /// collected), not silently omitted.
+    #[test]
+    fn digests_record_a_skipped_symlink() -> anyhow::Result<()> {
+        let run = tempfile::TempDir::new()?;
+        let outputs_dir = run.path().join("outputs");
+        let dest = run.path().join("collected");
+        let outputs = [Output {
+            name: Some("o".to_string()),
+            dest: dest.clone(),
+        }];
+        prepare_outputs(&outputs, &outputs_dir)?;
+        std::os::unix::fs::symlink("/etc/hostname", outputs_dir.join("o").join("leak"))?;
+        fs::write(outputs_dir.join("o").join("real"), b"hello")?;
+
+        let report = collect_outputs(&outputs, &outputs_dir, true)?.context("report")?;
+
+        assert_eq!(
+            report.skipped,
+            [SkippedEntry {
+                path: "o/leak".to_string(),
+                reason: SkipReason::Symlink
+            }]
+        );
+        assert_eq!(report.files.len(), 1);
+        assert!(fs::symlink_metadata(dest.join("leak")).is_err());
+        Ok(())
+    }
+
+    /// #373: a fifo is recorded as skipped (`non_regular`).
+    #[test]
+    fn digests_record_a_skipped_special_file() -> anyhow::Result<()> {
+        let run = tempfile::TempDir::new()?;
+        let outputs_dir = run.path().join("outputs");
+        let outputs = [Output {
+            name: Some("o".to_string()),
+            dest: run.path().join("collected"),
+        }];
+        prepare_outputs(&outputs, &outputs_dir)?;
+        let fifo = outputs_dir.join("o").join("pipe");
+        let status = std::process::Command::new("mkfifo").arg(&fifo).status()?;
+        anyhow::ensure!(status.success(), "mkfifo failed");
+
+        let report = collect_outputs(&outputs, &outputs_dir, true)?.context("report")?;
+
+        assert_eq!(
+            report.skipped,
+            [SkippedEntry {
+                path: "o/pipe".to_string(),
+                reason: SkipReason::NonRegular
+            }]
+        );
         Ok(())
     }
 
@@ -271,7 +454,7 @@ mod tests {
         fs::create_dir(outputs_dir.join("d"))?;
         fs::write(outputs_dir.join("d").join("nested"), b"deep")?;
 
-        collect_outputs(&outputs, &outputs_dir)?;
+        collect_outputs(&outputs, &outputs_dir, false)?;
 
         assert_eq!(fs::read(dest.join("top"))?, b"root");
         assert_eq!(fs::read(dest.join("d").join("nested"))?, b"deep");
