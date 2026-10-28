@@ -337,6 +337,34 @@ fn find_proxy_child(parent: u32) -> anyhow::Result<Option<u32>> {
     Ok(None)
 }
 
+/// Wait for the proxy child of `sandy` to appear, let the guest boot, then SIGKILL it. Errors here must
+/// not skip reaping `sandy`: the caller waits for it on every path so the CLI runs its normal qemu,
+/// proxy and virtiofsd teardown.
+fn kill_proxy_mid_run(sandy: &mut std::process::Child) -> anyhow::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let proxy = loop {
+        if let Some(pid) = find_proxy_child(sandy.id())? {
+            break pid;
+        }
+        if let Some(status) = sandy.try_wait().context("poll sandy")? {
+            bail!("sandy exited ({status}) before a proxy child appeared");
+        }
+        if Instant::now() > deadline {
+            bail!("no sandy-egress-proxy child of sandy (pid {}) within 60s", sandy.id());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    // The guest has no channel to the host before the run ends, so there is no ready signal to wait for.
+    // The test proves the guest booted and finished after the fact, from the error text it asserts below.
+    std::thread::sleep(Duration::from_secs(15));
+    let killed = Command::new("kill")
+        .args(["-KILL", &proxy.to_string()])
+        .status()
+        .context("kill the proxy")?;
+    anyhow::ensure!(killed.success(), "kill -KILL {proxy} failed: {killed}");
+    Ok(())
+}
+
 /// KP6: killing the proxy while the guest job runs classifies the run as band 3, although
 /// the guest exits 0.
 #[test]
@@ -355,29 +383,10 @@ fn proxy_death_mid_run_is_band_3() -> anyhow::Result<()> {
         .spawn()
         .context("spawn sandy")?;
 
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let proxy = loop {
-        if let Some(pid) = find_proxy_child(child.id())? {
-            break pid;
-        }
-        if let Some(status) = child.try_wait().context("poll sandy")? {
-            bail!("sandy exited ({status}) before a proxy child appeared");
-        }
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            bail!("no sandy-egress-proxy child of sandy (pid {}) within 60s", child.id());
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    };
-    // Let the guest boot and the job start sleeping before the proxy dies.
-    std::thread::sleep(Duration::from_secs(15));
-    let killed = Command::new("kill")
-        .args(["-KILL", &proxy.to_string()])
-        .status()
-        .context("kill the proxy")?;
-    anyhow::ensure!(killed.success(), "kill -KILL {proxy} failed: {killed}");
-
+    let killed = kill_proxy_mid_run(&mut child);
+    // Always reap sandy, bounded by its own --timeout, so its teardown runs even when the kill failed.
     let output = child.wait_with_output().context("wait for sandy")?;
+    killed?;
     let stderr = std::fs::read(&stderr_path).unwrap_or_default();
     let (code, env) = parse_envelope(output.status.code().unwrap_or(-1), &output.stdout, &stderr)?;
 
@@ -385,6 +394,13 @@ fn proxy_death_mid_run_is_band_3() -> anyhow::Result<()> {
     assert_ne!(
         env["status"], "succeeded",
         "a run without its boundary must not succeed; envelope: {env}"
+    );
+    // `BackendError::EgressProxyDied` names whether the guest had booted and how it exited. A kill that
+    // landed during boot, or a guest that never ran its job, must fail the test rather than pass it.
+    let text = env.to_string();
+    assert!(
+        text.contains("after the guest booted") && text.contains("guest exit 0"),
+        "the proxy must die after the guest booted, with the job exiting 0; envelope: {env}"
     );
     Ok(())
 }
