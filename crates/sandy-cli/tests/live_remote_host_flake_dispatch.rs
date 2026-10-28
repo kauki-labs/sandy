@@ -163,6 +163,10 @@ async fn submit_flake(
         attr: None,
         command,
         history_lines: sandy_guest_template::manifest::default_history_lines(),
+        env: Vec::new(),
+        cpu: None,
+        mem: None,
+        timeout_secs: None,
     })
     .context("encode flake/v1 manifest")?;
     let response = call(

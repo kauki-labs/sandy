@@ -716,6 +716,30 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
         Vec::new()
     };
 
+    // CodeRabbit on this PR, same bar as `--cap-file` above: a malformed
+    // `--env` value is a pure client-side input error and must be refused
+    // the same way regardless of whether sandyd is reachable, not get a
+    // different exit band (`InfraFault` vs `InvalidPlan`) depending on
+    // daemon state.
+    let flake_env = if let DaemonOp::Submit {
+        env, flake: Some(_), ..
+    } = &op
+    {
+        match env
+            .iter()
+            .map(|raw| sandy_cli::plan::parse_env(raw))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(env) => env,
+            Err(e) => {
+                eprintln!("sandy: {e}");
+                return ProcessExit::InvalidPlan.code();
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     let socket = match daemon_socket_path() {
         Ok(socket) => socket,
         Err(e) => {
@@ -756,7 +780,7 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
             attr,
             kind,
             history_lines,
-            env,
+            env: _,
             cpu,
             mem,
             timeout,
@@ -767,20 +791,13 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
             // pairs above guarantee exactly one of `manifest` or `flake` is
             // set here.
             let (bytes, encoding) = if let Some(flake) = flake {
-                let env = match env.iter().map(|raw| sandy_cli::plan::parse_env(raw)).collect() {
-                    Ok(env) => env,
-                    Err(e) => {
-                        eprintln!("sandy: {e}");
-                        return ProcessExit::InvalidPlan.code();
-                    }
-                };
                 let manifest = sandy_guest_template::manifest::FlakeManifestV1 {
                     flake,
                     kind,
                     attr,
                     command,
                     history_lines,
-                    env,
+                    env: flake_env,
                     cpu,
                     mem,
                     timeout_secs: timeout,

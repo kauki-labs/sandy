@@ -126,14 +126,15 @@ fn clamp_timeout_secs(requested: Option<u32>) -> u32 {
 /// itself. Used right after decode (both branches), and again after a VM
 /// dispatch's flake resolution (up to `FLAKE_RESOLVE_TIMEOUT_SECS`, longer
 /// than `STAGE1_TIMEOUT_SECS`) to undo however much of the original budget
-/// that resolution step ate into (CodeRabbit on #344). Only ever bumps a
-/// currently FINITE deadline forward: a suspended (attached) control is left
-/// alone, since "unlimited while attached" already covers it — the same rule
-/// `run_dispatch_loop`'s own shutdown fail-safe applies.
+/// that resolution step ate into (CodeRabbit on #344). Delegates to
+/// [`RunControl::set_deadline_if_finite`] for the check-then-set as ONE
+/// locked operation: a suspended (attached) control is left alone, since
+/// "unlimited while attached" already covers it, and doing the check and the
+/// set as two separate calls would race a concurrent `suspend_deadline()`
+/// landing in between them, silently reinstating a deadline attach just
+/// lifted (CodeRabbit on #487).
 fn set_deadline_from_timeout_secs(control: &RunControl, timeout_secs: u32) {
-    if control.deadline().is_some() {
-        control.set_deadline(std::time::Instant::now() + std::time::Duration::from_secs(u64::from(timeout_secs)));
-    }
+    control.set_deadline_if_finite(std::time::Instant::now() + std::time::Duration::from_secs(u64::from(timeout_secs)));
 }
 
 /// The `SANDY_HISTORY_LINES` env entry for a flake/v1 dispatch's
