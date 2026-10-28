@@ -66,11 +66,39 @@ fn allowed_host() -> String {
 /// matches). An IP literal is refused: the proxy keeps IP and name entries
 /// apart, so a literal here would make a hostname test run on an IP entry and prove nothing.
 fn hostname_setting(var: &str, default: &str) -> anyhow::Result<String> {
-    let name = std::env::var(var).unwrap_or_else(|_| default.to_string());
-    if name.parse::<IpAddr>().is_ok() {
-        bail!("refusing: {var}={name} is an IP literal, but these tests exercise hostname entries");
+    let raw = std::env::var(var).unwrap_or_else(|_| default.to_string());
+    normalise_hostname(&raw).with_context(|| format!("refusing: {var}={raw}"))
+}
+
+/// The pure core of [`hostname_setting`]: `raw` as the proxy would match it, or an error. This mirrors the
+/// proxy's own `normalise_name` (`sandy-egress-proxy/src/head.rs`): ASCII, lower-cased, at most one trailing dot
+/// removed, at most 253 bytes, labels of 1 to 63 bytes from `[a-z0-9-]` that neither start nor end with `-`, and a
+/// last label that is not all digits. A malformed setting is refused, never rewritten into a valid one.
+fn normalise_hostname(raw: &str) -> anyhow::Result<String> {
+    if raw.parse::<IpAddr>().is_ok() {
+        bail!("an IP literal, but these tests exercise hostname entries");
     }
-    Ok(name.to_ascii_lowercase().trim_end_matches('.').to_string())
+    anyhow::ensure!(raw.is_ascii(), "not ASCII");
+    let lowered = raw.to_ascii_lowercase();
+    let name = lowered.strip_suffix('.').unwrap_or(&lowered);
+    anyhow::ensure!(!name.is_empty() && name.len() <= 253, "empty or longer than 253 bytes");
+    let mut last = "";
+    for label in name.split('.') {
+        let ok = !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        anyhow::ensure!(ok, "label {label:?} is not valid");
+        last = label;
+    }
+    anyhow::ensure!(
+        !last.bytes().all(|b| b.is_ascii_digit()),
+        "the last label is all digits"
+    );
+    Ok(name.to_owned())
 }
 
 /// The allow-listed hostname for the name-entry tests. The default, `one.one.one.one`, resolves to several
@@ -689,4 +717,35 @@ fn proxy_startup_failure_is_band_3() -> anyhow::Result<()> {
         "qemu was launched although the proxy could not start; envelope: {env}"
     );
     Ok(())
+}
+
+#[test]
+fn a_hostname_is_lowercased_and_loses_one_trailing_dot() -> anyhow::Result<()> {
+    anyhow::ensure!(normalise_hostname("One.One.One.One.")? == "one.one.one.one");
+    anyhow::ensure!(normalise_hostname("a-b.example")? == "a-b.example");
+    // The default names the live tests use must pass unchanged.
+    for default in ["one.one.one.one", "example.com", "1dot1dot1dot1.cloudflare-dns.com"] {
+        anyhow::ensure!(normalise_hostname(default)? == default, "{default} must stay as is");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_setting_the_proxy_would_not_accept_is_refused() {
+    let too_long_label = format!("{}.example", "a".repeat(64));
+    for bad in [
+        "one.one.one.one..",
+        "",
+        ".",
+        "a..example",
+        "-a.example",
+        "a-.example",
+        "a_b.example",
+        "caf\u{e9}.example",
+        "1.2.3",
+        "1.1.1.1",
+        too_long_label.as_str(),
+    ] {
+        assert!(normalise_hostname(bad).is_err(), "{bad:?} must be refused");
+    }
 }
