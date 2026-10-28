@@ -13,7 +13,7 @@
 //! this isn't just an implementation shortcut.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc, Mutex, PoisonError,
         atomic::{AtomicBool, Ordering},
@@ -217,6 +217,15 @@ where
     // worker the moment it registers that job_id's RunControl below.
     let attach_states: Arc<Mutex<HashMap<String, AttachState>>> = Arc::new(Mutex::new(HashMap::new()));
 
+    // job_ids with a `Cancel` (#477) that arrived before this job's own
+    // `RunControl` was registered below — `Dispatch` and `Cancel` travel on
+    // separate queues (like `AttachStateChanged`), so `tokio::select!` can
+    // deliver a Cancel sent after its own job's Dispatch to the wire FIRST.
+    // The worker checks this the moment it registers a job_id's RunControl
+    // and cancels immediately if it's already here, the same "pending state
+    // applied at registration" shape `attach_states` already uses.
+    let pending_cancels: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+
     // Set once this function's own read loop ends, for any reason — see the
     // FAIL-SAFE ON EVERY EXIT doc above. The worker checks this before
     // starting each still-queued dispatch so it skips, rather than begins,
@@ -266,6 +275,16 @@ where
                 // apply it now rather than leaving the fresh control's
                 // default timeout in place.
                 control.suspend_deadline();
+            }
+            if pending_cancels
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&job_id)
+            {
+                // A Cancel for this job outraced its own Dispatch to the
+                // wire (#477) — apply it the moment the control exists
+                // instead of letting the job start uncancelled.
+                control.cancel();
             }
             controls
                 .lock()
@@ -343,6 +362,38 @@ where
                                 // An unknown job_id with no RunControl yet isn't dropped: it's
                                 // already recorded in attach_states above, and the worker applies
                                 // it the moment that job_id's RunControl is registered.
+                            }
+                        }
+                        Some(orchestrator_message::Op::Cancel(cancel)) => {
+                            let job_id = cancel.job_id;
+                            let found = {
+                                let controls = controls.lock().unwrap_or_else(PoisonError::into_inner);
+                                if let Some(control) = controls.get(&job_id) {
+                                    control.cancel();
+                                    true
+                                } else {
+                                    false
+                                }
+                            };
+                            if found {
+                                tracing::info!(job_id, "cancelled a running job on request (#477)");
+                            } else {
+                                // Either this job hasn't been dequeued and
+                                // registered yet (the Cancel outraced its own
+                                // Dispatch to the wire), or it already
+                                // finished. Recorded as pending either way —
+                                // the worker consumes and clears it the
+                                // moment it registers that job_id's
+                                // RunControl, so applying it twice, or to a
+                                // job that never arrives, is harmless.
+                                pending_cancels
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .insert(job_id.clone());
+                                tracing::debug!(
+                                    job_id,
+                                    "cancel for a job with no live RunControl yet; recorded as pending"
+                                );
                             }
                         }
                         _ => tracing::debug!("ignoring an unexpected frame from the orchestrator"),
@@ -486,7 +537,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use anyhow::Context;
-    use sandy_executor_proto::{Arch, AttachStateChanged, IsolationClass, RegisterRefused, Registered, SandboxKind};
+    use sandy_executor_proto::{
+        Arch, AttachStateChanged, Cancel, IsolationClass, RegisterRefused, Registered, SandboxKind,
+    };
 
     use super::*;
 
@@ -1500,6 +1553,194 @@ mod tests {
         assert!(
             deadline.is_none(),
             "a pre-registration attach signal should already have suspended the job's deadline by the time it starts"
+        );
+        Ok(())
+    }
+
+    /// #477: a `Cancel` frame for a job already running reaches its live
+    /// `RunControl` directly.
+    #[tokio::test]
+    async fn a_cancel_frame_cancels_the_matching_running_jobs_control() -> anyhow::Result<()> {
+        let (mut client, mut server) = tokio::io::duplex(8192);
+
+        let orchestrator = tokio::spawn(async move {
+            write_frame(
+                &mut server,
+                &OrchestratorMessage {
+                    op: Some(orchestrator_message::Op::Dispatch(Dispatch {
+                        job_id: "job-1".to_owned(),
+                        manifest: Vec::new(),
+                        manifest_encoding: String::new(),
+                        backend: SandboxKind::Process.into(),
+                        link_token: vec![0u8; 32],
+                        forward_back: "127.0.0.1:9000".to_owned(),
+                        required_isolation_class: IsolationClass::Trusted.into(),
+                    })),
+                },
+            )
+            .await?;
+            Ok::<_, anyhow::Error>(server)
+        });
+
+        let captured_control: Arc<Mutex<Option<RunControl>>> = Arc::new(Mutex::new(None));
+        let job1_started = Arc::new(tokio::sync::Notify::new());
+        let release_job1 = Arc::new(tokio::sync::Notify::new());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let loop_task = tokio::spawn({
+            let captured_control = Arc::clone(&captured_control);
+            let job1_started = Arc::clone(&job1_started);
+            let release_job1 = Arc::clone(&release_job1);
+            async move {
+                run_dispatch_loop(
+                    &mut client,
+                    move |_dispatch, control| {
+                        let captured_control = Arc::clone(&captured_control);
+                        let job1_started = Arc::clone(&job1_started);
+                        let release_job1 = Arc::clone(&release_job1);
+                        async move {
+                            *captured_control
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(control.clone());
+                            job1_started.notify_one();
+                            release_job1.notified().await;
+                            None::<HostExecutorMessage>
+                        }
+                    },
+                    async {
+                        let _ = shutdown_rx.await;
+                    },
+                )
+                .await
+            }
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), job1_started.notified())
+            .await
+            .context("job-1's handle never started")?;
+        let job1_control = captured_control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .expect("job-1's control was captured")
+            .clone();
+        assert!(
+            !job1_control.is_cancelled(),
+            "not cancelled before the Cancel frame arrives"
+        );
+
+        let mut server = tokio::time::timeout(std::time::Duration::from_secs(2), orchestrator)
+            .await
+            .context("orchestrator task did not finish")??
+            .context("orchestrator task failed")?;
+        write_frame(
+            &mut server,
+            &OrchestratorMessage {
+                op: Some(orchestrator_message::Op::Cancel(Cancel {
+                    job_id: "job-1".to_owned(),
+                })),
+            },
+        )
+        .await?;
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !job1_control.is_cancelled() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("the Cancel frame never reached job-1's RunControl")?;
+
+        release_job1.notify_one();
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let _ = shutdown_tx.send(());
+            loop_task.await
+        })
+        .await
+        .context("dispatch loop did not stop")?
+        .context("dispatch loop task panicked")?;
+        assert_eq!(exit, DispatchLoopExit::Shutdown);
+        Ok(())
+    }
+
+    /// #477: a `Cancel` that arrives before its own job's `Dispatch` is
+    /// registered (the two frames travel on separate queues, so delivery
+    /// order on the wire isn't guaranteed to match send order) is still
+    /// applied, the moment that job's `RunControl` is created — mirrors
+    /// `an_attach_state_change_received_before_its_jobs_dispatch_is_applied_once_it_starts`
+    /// for the pending-cancel path.
+    #[tokio::test]
+    async fn a_cancel_that_outraces_its_own_dispatch_is_applied_once_the_job_starts() -> anyhow::Result<()> {
+        let (mut client, mut server) = tokio::io::duplex(8192);
+
+        let orchestrator = tokio::spawn(async move {
+            write_frame(
+                &mut server,
+                &OrchestratorMessage {
+                    op: Some(orchestrator_message::Op::Cancel(Cancel {
+                        job_id: "job-1".to_owned(),
+                    })),
+                },
+            )
+            .await?;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            write_frame(
+                &mut server,
+                &OrchestratorMessage {
+                    op: Some(orchestrator_message::Op::Dispatch(Dispatch {
+                        job_id: "job-1".to_owned(),
+                        manifest: Vec::new(),
+                        manifest_encoding: String::new(),
+                        backend: SandboxKind::Process.into(),
+                        link_token: vec![0u8; 32],
+                        forward_back: "127.0.0.1:9000".to_owned(),
+                        required_isolation_class: IsolationClass::Trusted.into(),
+                    })),
+                },
+            )
+            .await?;
+            Ok::<_, anyhow::Error>(server)
+        });
+
+        let seen_cancelled = Arc::new(Mutex::new(None));
+        let seen_cancelled_in_loop = Arc::clone(&seen_cancelled);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let loop_task = tokio::spawn(async move {
+            run_dispatch_loop(
+                &mut client,
+                move |_dispatch, control| {
+                    let seen_cancelled = Arc::clone(&seen_cancelled_in_loop);
+                    async move {
+                        *seen_cancelled.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(control.is_cancelled());
+                        None::<HostExecutorMessage>
+                    }
+                },
+                async {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+        });
+
+        let _server = tokio::time::timeout(std::time::Duration::from_secs(2), orchestrator)
+            .await
+            .context("orchestrator task did not finish")??
+            .context("orchestrator task failed")?;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let _ = shutdown_tx.send(());
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(2), loop_task)
+            .await
+            .context("dispatch loop did not stop after shutdown")?
+            .context("dispatch loop task panicked")?;
+        assert_eq!(exit, DispatchLoopExit::Shutdown);
+
+        let cancelled = seen_cancelled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect("handle was called");
+        assert!(
+            cancelled,
+            "a pre-registration Cancel should already have cancelled the job's control by the time it starts"
         );
         Ok(())
     }

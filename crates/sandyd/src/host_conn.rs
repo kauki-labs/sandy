@@ -232,6 +232,7 @@ async fn relay_dispatches(
     let Registration {
         mut dispatch_rx,
         mut attach_state_rx,
+        mut cancel_rx,
         host_id,
         ..
     } = registration;
@@ -330,6 +331,35 @@ async fn relay_dispatches(
                             host_id,
                             "writing AttachStateChanged to host-executor timed out; treating it as hung"
                         );
+                        break;
+                    }
+                }
+            }
+            cancel = cancel_rx.recv() => {
+                let Some(cancel) = cancel else {
+                    // Same reasoning as `dispatch_rx` above: only happens if
+                    // this registry entry was already replaced or removed.
+                    break;
+                };
+                let job_id = cancel.job_id.clone();
+                match tokio::time::timeout(
+                    DISPATCH_WRITE_TIMEOUT,
+                    write_frame(
+                        &mut write_half,
+                        &OrchestratorMessage { op: Some(orchestrator_message::Op::Cancel(cancel)) },
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {
+                        tracing::debug!(host_id, job_id, "sent Cancel to host-executor");
+                    }
+                    Ok(Err(_)) => {
+                        tracing::warn!(host_id, "failed writing Cancel to host-executor; closing");
+                        break;
+                    }
+                    Err(_elapsed) => {
+                        tracing::warn!(host_id, "writing Cancel to host-executor timed out; treating it as hung");
                         break;
                     }
                 }
