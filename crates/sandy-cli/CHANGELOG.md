@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/kauki-labs/sandy/compare/sandy-cli-v0.2.0...sandy-cli-v0.2.1) - 2026-10-28
+
+### Added
+
+- *(sandy-host-executor)* manifest-parity local-first fields ([#480](https://github.com/kauki-labs/sandy/pull/480)) ([#487](https://github.com/kauki-labs/sandy/pull/487))
+- *(receipts)* opt-in sha256 content digests of inputs and outputs ([#469](https://github.com/kauki-labs/sandy/pull/469))
+- *(egress)* RunSpec egress policy, proxy plan variant, and band-3 EgressProxyDied ([#453](https://github.com/kauki-labs/sandy/pull/453))
+
+### Other
+
+- *(egress)* KP7 live test for a proxy that cannot start ([#406](https://github.com/kauki-labs/sandy/pull/406)) ([#484](https://github.com/kauki-labs/sandy/pull/484))
+- *(egress)* live parity gate for the egress proxy, and -nic none for tap-less qemu guests ([#406](https://github.com/kauki-labs/sandy/pull/406)) ([#476](https://github.com/kauki-labs/sandy/pull/476))
+
 ## [0.2.0](https://github.com/kauki-labs/sandy/compare/sandy-cli-v0.1.1...sandy-cli-v0.2.0) - 2026-10-27
 
 ### Added
