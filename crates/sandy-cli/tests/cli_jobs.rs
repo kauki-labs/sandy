@@ -309,6 +309,98 @@ fn run_places_reported_digests_in_the_right_receipt_sections() -> anyhow::Result
     Ok(())
 }
 
+/// A backend that runs the REAL staging and collection code on tempdirs, as qemu, vfkit and the
+/// process backend do, and reports what a guest that wrote one output file would. `FakeBackend`
+/// cannot do this: it stages nothing, and `sandy-test-support` cannot depend on `sandy`.
+struct StagingBackend {
+    work: std::path::PathBuf,
+}
+
+impl sandy::VmBackend for StagingBackend {
+    fn run(&self, spec: &sandy::RunSpec) -> Result<Outcome, BackendError> {
+        let (inputs_dir, outputs_dir) = (self.work.join("inputs"), self.work.join("outputs"));
+        sandy::stage_inputs(spec.inputs, &inputs_dir)?;
+        let input_digests = spec
+            .digests
+            .then(|| sandy::digest_staged_inputs(spec.inputs, &inputs_dir))
+            .transpose()?;
+        sandy::prepare_outputs(spec.outputs, &outputs_dir)?;
+        // The "guest" writes one output file after boot.
+        std::fs::write(outputs_dir.join("result").join("f"), b"hello")
+            .map_err(|e| BackendError::Spawn(e.to_string()))?;
+        let collected = sandy::collect_outputs(spec.outputs, &outputs_dir, spec.digests);
+        sandy::with_digests(Ok(ok_outcome(0)), input_digests, collected)
+    }
+
+    fn kill(&self, _box_id: &str) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    fn boxes(&self) -> Result<Vec<sandy::BoxState>, BackendError> {
+        Ok(vec![])
+    }
+}
+
+/// #373: known content flows through the real `stage_inputs`, `digest_staged_inputs`, and
+/// `collect_outputs`, then through the supervisor, and the receipt carries the known sha256 values in
+/// the right sections. This is the end-to-end check the scripted-outcome test above cannot give: it
+/// fails if the staged or collected bytes hash differently from what the receipt reports.
+#[test]
+fn run_digests_known_content_through_the_real_staging_and_collection() -> anyhow::Result<()> {
+    const HELLO: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+    const WORLD: &str = "486ea46224d1bb4fb680f34f7c9ad96a8f24ec88be73ea8e5a6c65260e9cb8a7";
+    let (tmp, journal) = fresh_journal()?;
+    let source = tmp.path().join("source");
+    std::fs::create_dir_all(&source).context("mk input source")?;
+    std::fs::write(source.join("a"), b"world").context("write input")?;
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).context("mk work dir")?;
+    let mut plan = booting_plan();
+    plan.digests = true;
+    plan.inputs = vec![sandy::Input {
+        host: source,
+        name: "in".to_string(),
+        guest_path: None,
+    }];
+    plan.outputs = vec![sandy::Output {
+        name: Some("result".to_string()),
+        dest: tmp.path().join("collected"),
+    }];
+
+    let report = run_job(
+        &StagingBackend { work },
+        &journal,
+        &plan,
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        None,
+        &[],
+    )
+    .context("run_job over the real staging")?;
+
+    assert_eq!(report.process_exit.code(), 0, "{}", report.envelope.message);
+    let receipt = report.envelope.receipt.context("receipt")?;
+    let inputs = receipt
+        .host_observed
+        .input_digests
+        .context("input digests are host-observed")?;
+    let input_files: Vec<(&str, &str)> = inputs
+        .files
+        .iter()
+        .map(|d| (d.path.as_str(), d.sha256.as_str()))
+        .collect();
+    assert_eq!(input_files, [("in/a", WORLD)]);
+    let outputs: Vec<(&str, Option<&str>)> = receipt
+        .guest_reported
+        .outputs
+        .iter()
+        .map(|o| (o.path.as_str(), o.sha256.as_deref()))
+        .collect();
+    assert_eq!(outputs, [("result/f", Some(HELLO))]);
+    assert!(receipt.guest_reported.skipped_outputs.is_empty());
+    Ok(())
+}
+
 /// #373: with `--digests` off the supervisor asks for no hashing and the serialized
 /// envelope has no digest key anywhere.
 #[test]
