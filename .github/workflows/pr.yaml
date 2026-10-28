@@ -223,6 +223,10 @@ jobs:
       # `--no-link` leaves the coverage `result` symlink below untouched.
       - name: End-to-end CLI
         run: nix build -L --no-link .#checks.x86_64-linux.tests-e2e-cli
+      # sandy-cli's `daemon_e2e` against the Nix-built `sandyd`; the coverage run
+      # below excludes it, so without this step it never ran in CI.
+      - name: Daemon end-to-end
+        run: nix build -L --no-link .#checks.x86_64-linux.tests-daemon-e2e
       # Line coverage over the CI-runnable suite (tier-1/2); the `live` tier-3 tests
       # need a hypervisor and never run in CI, so they are excluded by design.
       - name: Coverage
@@ -242,8 +246,9 @@ jobs:
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
   package:
+    # No `needs: checks`: the minimal shell shares no Nix outputs with Check, so
+    # this runs in parallel with it.
     name: Package
-    needs: checks
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -281,9 +286,11 @@ jobs:
       # Publish dry-run: package and verify every crate the way `cargo publish`
       # will, in dependency order, so a crates.io-publishability break (bad
       # metadata, a missing include, a version mismatch) fails the PR instead of
-      # the release. Does not upload.
+      # the release. Does not upload. Runs in the minimal `package` dev shell (the
+      # toolchain only): it needs the network, so it cannot be a sandboxed check,
+      # and the default shell would also build sandy-agent first.
       - name: Package (publish dry-run)
-        run: nix develop -c cargo package --workspace --all-features
+        run: nix develop .#package -c cargo package --workspace --all-features
   # Single aggregate merge gate: green only if every other job in this run
   # succeeded. Mark THIS one as the required check in branch protection, so
   # adding, renaming, or removing a job never needs a branch-protection change.

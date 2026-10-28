@@ -585,6 +585,14 @@
             ++ [ pkgs.tmux ];
           };
 
+          # Minimal shell for CI's publish dry-run (`cargo package`, which needs
+          # network for the crates.io index and so cannot be a sandboxed check):
+          # the pinned toolchain only, without the default shell's sandy-agent
+          # build, pre-commit hooks, and quality tools.
+          devShells.package = pkgs.mkShell {
+            packages = [ rustToolchain ];
+          };
+
           formatter = config.treefmt.build.wrapper;
         };
     };
