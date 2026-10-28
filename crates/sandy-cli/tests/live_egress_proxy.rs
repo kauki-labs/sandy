@@ -45,7 +45,7 @@
 mod common;
 
 use std::{
-    net::{Ipv4Addr, TcpListener},
+    net::{IpAddr, Ipv4Addr, TcpListener, ToSocketAddrs},
     path::Path,
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -60,6 +60,78 @@ const PROBE_PORT: u16 = 443;
 /// The allowed target: reachable from the host, and the only entry on the allow-list.
 fn allowed_host() -> String {
     std::env::var("SANDY_EGRESS_ALLOWED").unwrap_or_else(|_| "1.1.1.1".to_string())
+}
+
+/// A hostname setting from `var`, or `default`, lower-cased and without a trailing dot (the form the proxy
+/// matches). An IP literal is refused: the proxy keeps IP and name entries
+/// apart, so a literal here would make a hostname test run on an IP entry and prove nothing.
+fn hostname_setting(var: &str, default: &str) -> anyhow::Result<String> {
+    let raw = std::env::var(var).unwrap_or_else(|_| default.to_string());
+    normalise_hostname(&raw).with_context(|| format!("refusing: {var}={raw}"))
+}
+
+/// The pure core of [`hostname_setting`]: `raw` as the proxy would match it, or an error. This mirrors the
+/// proxy's own `normalise_name` (`sandy-egress-proxy/src/head.rs`): ASCII, lower-cased, at most one trailing dot
+/// removed, at most 253 bytes, labels of 1 to 63 bytes from `[a-z0-9-]` that neither start nor end with `-`, and a
+/// last label that is not all digits. A malformed setting is refused, never rewritten into a valid one.
+fn normalise_hostname(raw: &str) -> anyhow::Result<String> {
+    if raw.parse::<IpAddr>().is_ok() {
+        bail!("an IP literal, but these tests exercise hostname entries");
+    }
+    anyhow::ensure!(raw.is_ascii(), "not ASCII");
+    let lowered = raw.to_ascii_lowercase();
+    let name = lowered.strip_suffix('.').unwrap_or(&lowered);
+    anyhow::ensure!(!name.is_empty() && name.len() <= 253, "empty or longer than 253 bytes");
+    let mut last = "";
+    for label in name.split('.') {
+        let ok = !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        anyhow::ensure!(ok, "label {label:?} is not valid");
+        last = label;
+    }
+    anyhow::ensure!(
+        !last.bytes().all(|b| b.is_ascii_digit()),
+        "the last label is all digits"
+    );
+    Ok(name.to_owned())
+}
+
+/// The allow-listed hostname for the name-entry tests. The default, `one.one.one.one`, resolves to several
+/// IPv4 addresses, so a pass also shows a multi-address name works (`nft` rejects one).
+fn allowed_name() -> anyhow::Result<String> {
+    hostname_setting("SANDY_EGRESS_ALLOWED_NAME", "one.one.one.one")
+}
+
+/// A hostname that is never on the allow-list.
+fn denied_name() -> anyhow::Result<String> {
+    hostname_setting("SANDY_EGRESS_DENIED_NAME", "example.com")
+}
+
+/// A second hostname that is never on the allow-list but shares an address with [`allowed_name`]. The default
+/// resolves to the same addresses as `one.one.one.one`; the test checks that on the host before it relies on it.
+fn same_address_name() -> anyhow::Result<String> {
+    hostname_setting("SANDY_EGRESS_SAME_ADDRESS_NAME", "1dot1dot1dot1.cloudflare-dns.com")
+}
+
+/// The IPv4 addresses `name` resolves to on this host.
+fn resolved_ipv4(name: &str) -> anyhow::Result<Vec<Ipv4Addr>> {
+    let mut ips: Vec<Ipv4Addr> = (name, PROBE_PORT)
+        .to_socket_addrs()
+        .with_context(|| format!("resolve {name} on the host"))?
+        .filter_map(|addr| match addr.ip() {
+            IpAddr::V4(ip) => Some(ip),
+            IpAddr::V6(_) => None,
+        })
+        .collect();
+    ips.sort();
+    ips.dedup();
+    anyhow::ensure!(!ips.is_empty(), "refusing: {name} has no IPv4 address on this host");
+    Ok(ips)
 }
 
 /// The denied target: never on the allow-list.
@@ -143,6 +215,25 @@ connect_status() {
 }
 "#;
 
+/// Guest shell that sends `CONNECT host:port` and sets `$status` as [`CONNECT_FN`] does, and also `$reason` to
+/// the response body (the proxy writes one reason line and closes the connection after a refusal).
+const CONNECT_FULL_FN: &str = r#"
+connect_full() {
+  status=none
+  reason=
+  exec 3<>/dev/tcp/127.0.0.1/3128 || return 0
+  printf 'CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n' "$1" "$1" >&3
+  line=
+  IFS= read -r -t 15 line <&3 || true
+  line=${line%$'\r'}
+  case $line in
+    HTTP/*" "*) status=${line#* }; status=${status%% *} ;;
+  esac
+  while IFS= read -r -t 5 l <&3; do l=${l%$'\r'}; reason="$reason$l|"; done
+  exec 3<&- 3>&-
+}
+"#;
+
 /// A guest script that issues one CONNECT to `target` and exits with the outcome:
 /// 0 = `want` status, 10 = a different status, 12 = no status line (relay unreachable or silent).
 fn connect_expect_script(target: &str, want: u16) -> String {
@@ -206,6 +297,80 @@ fn denied_target_gets_403() -> anyhow::Result<()> {
     let (code, env) = sandy_proxy_run(home.path(), &target, &allow, &script)?;
 
     assert_guest_ok(code, &env, &format!("CONNECT {denied}:{PROBE_PORT} must get 403"));
+    Ok(())
+}
+
+/// #377: a hostname entry is matched by name at the proxy. `--allow <name>:443` lets a CONNECT by that name
+/// through (`200`), though the name resolves to several addresses and the guest has no DNS.
+#[test]
+fn allowed_hostname_is_reachable_by_name() -> anyhow::Result<()> {
+    let target = require_proxy_live()?;
+    build_guest(&target)?;
+    let home = tempfile::tempdir().context("temp SANDY_HOME")?;
+    let name = allowed_name()?;
+    let allow = vec![format!("{name}:{PROBE_PORT}")];
+
+    let script = connect_expect_script(&format!("{name}:{PROBE_PORT}"), 200);
+    let (code, env) = sandy_proxy_run(home.path(), &target, &allow, &script)?;
+
+    assert_guest_ok(code, &env, &format!("CONNECT {name}:{PROBE_PORT} must get 200"));
+    Ok(())
+}
+
+/// #377: a name entry allows that name only. Three targets all get `403` with only `<name>:443` allowed: a
+/// different hostname, one of the allowed name's own resolved IPs (an IP never matches a name entry), and a
+/// second hostname that resolves to an address the allowed name also resolves to (the proxy must not authorize
+/// by resolved address). The test checks on the host that the shared address really exists.
+#[test]
+fn a_hostname_entry_does_not_allow_another_name_or_its_ip() -> anyhow::Result<()> {
+    let target = require_proxy_live()?;
+    build_guest(&target)?;
+    let home = tempfile::tempdir().context("temp SANDY_HOME")?;
+    let (name, other, same) = (allowed_name()?, denied_name()?, same_address_name()?);
+    anyhow::ensure!(
+        name != other && name != same && other != same,
+        "refusing: the allowed, denied and same-address names must be three different hostnames, got {name}, {other}, \
+         {same}"
+    );
+    let name_ips = resolved_ipv4(&name)?;
+    let same_ips = resolved_ipv4(&same)?;
+    anyhow::ensure!(
+        same_ips.iter().any(|ip| name_ips.contains(ip)),
+        "refusing: {same} ({same_ips:?}) shares no address with {name} ({name_ips:?}) on this host, so it cannot show \
+         that an unlisted name with the same address is refused"
+    );
+    let ip = name_ips[0];
+    let allow = vec![format!("{name}:{PROBE_PORT}")];
+
+    // Each refusal must be an allow-list refusal: a `403` from the address filter ("non-public address") would
+    // also pass a status check on a private address, and prove nothing about name matching. Exit 12 (no status
+    // line) fails the test too: a dead relay would otherwise look like a refusal.
+    let script = format!(
+        r#"set -u
+{CONNECT_FULL_FN}
+for t in {other}:{PROBE_PORT} {ip}:{PROBE_PORT} {same}:{PROBE_PORT}; do
+  connect_full $t
+  echo "live_egress_proxy: CONNECT $t -> $status $reason"
+  [ "$status" = none ] && exit 12
+  [ "$status" = 403 ] || exit 10
+  case $reason in
+    *"not in the allow-list"*) ;;
+    *) exit 11 ;;
+  esac
+done
+exit 0
+"#
+    );
+    let (code, env) = sandy_proxy_run(home.path(), &target, &allow, &script)?;
+
+    assert_guest_ok(
+        code,
+        &env,
+        &format!(
+            "with only {name}:{PROBE_PORT} allowed, {other}, {ip} and {same} must all get a 403 that says `not in the \
+             allow-list` (guest exit 11 = a 403 for another reason)"
+        ),
+    );
     Ok(())
 }
 
@@ -552,4 +717,35 @@ fn proxy_startup_failure_is_band_3() -> anyhow::Result<()> {
         "qemu was launched although the proxy could not start; envelope: {env}"
     );
     Ok(())
+}
+
+#[test]
+fn a_hostname_is_lowercased_and_loses_one_trailing_dot() -> anyhow::Result<()> {
+    anyhow::ensure!(normalise_hostname("One.One.One.One.")? == "one.one.one.one");
+    anyhow::ensure!(normalise_hostname("a-b.example")? == "a-b.example");
+    // The default names the live tests use must pass unchanged.
+    for default in ["one.one.one.one", "example.com", "1dot1dot1dot1.cloudflare-dns.com"] {
+        anyhow::ensure!(normalise_hostname(default)? == default, "{default} must stay as is");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_setting_the_proxy_would_not_accept_is_refused() {
+    let too_long_label = format!("{}.example", "a".repeat(64));
+    for bad in [
+        "one.one.one.one..",
+        "",
+        ".",
+        "a..example",
+        "-a.example",
+        "a-.example",
+        "a_b.example",
+        "caf\u{e9}.example",
+        "1.2.3",
+        "1.1.1.1",
+        too_long_label.as_str(),
+    ] {
+        assert!(normalise_hostname(bad).is_err(), "{bad:?} must be refused");
+    }
 }
