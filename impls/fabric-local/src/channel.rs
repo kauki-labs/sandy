@@ -1150,22 +1150,32 @@ mod tests {
             .await
             .context("post")?;
 
-        let ack = {
+        let stale_ack = {
             let mut stream = Box::pin(channel.subscribe_acked(&member)?);
             let (env, ack) = next_acked(&mut stream).await;
             assert_eq!(env.payload, b"a");
             ack
         };
         channel.leave(&member);
-        ack.ack();
 
         // Rejoin with the SAME cap: same proof bytes, so the same MembershipId,
-        // but `leave()` dropped the session, so this gets a fresh generation —
-        // exactly the stale-handle-after-leave scenario this test is for.
+        // but `leave()` dropped the session, so this gets a fresh generation.
+        // The rejoined session's entry must exist BEFORE the stale ack runs,
+        // or `Ack::ack` takes its "no session at all" no-op path instead of its
+        // generation-mismatch one — not what this test is actually for.
         let rejoined = channel.join(&cap)?;
         assert_eq!(rejoined, member, "rejoining the same cap reuses the same MembershipId");
         let mut stream = Box::pin(channel.subscribe_acked(&rejoined)?);
-        let (env, _ack) = next_acked(&mut stream).await;
+        let (env, _fresh_ack) = next_acked(&mut stream).await;
+        assert_eq!(
+            env.payload, b"a",
+            "the rejoined session resumes at cursor 0, not past it"
+        );
+
+        stale_ack.ack();
+        drop(stream);
+        let mut resumed = Box::pin(channel.subscribe_acked(&rejoined)?);
+        let (env, _ack) = next_acked(&mut resumed).await;
         assert_eq!(
             env.payload, b"a",
             "a stale ack against a left generation must not have advanced the cursor"
