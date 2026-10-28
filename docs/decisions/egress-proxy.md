@@ -14,8 +14,11 @@ parity gate (decision 5) passes. Tracked in #360. Subsystem spec:
 [`../architecture/spec.md#5-egress`](../architecture/spec.md#5-egress). Planned
 live KPIs: [`../architecture/kpi.md#planned-egress-proxy`](../architecture/kpi.md#planned-egress-proxy).
 
-All decisions here are accepted and not yet implemented. The implementation
-issues are listed at the end.
+All decisions here are accepted. Implementation status: the proxy crate (#401), the
+guest relay (#402), and the seam and band-3 classification (#403) are merged. The qemu
+wiring (#404) is implemented but not live-verified. The vfkit wiring (#405), the live
+parity gate (#406), and the cutover (#407) are pending. The implementation issues are
+listed at the end.
 
 ## Context
 
@@ -58,7 +61,7 @@ including root.
 
 ## 1. Guest side: an HTTP CONNECT relay in `sandy-agent`
 
-**Status:** accepted, not yet implemented. **Upholds:** INV-7.
+**Status:** accepted. The relay is implemented (#402) and qemu runs it (#404); vfkit is pending (#405). **Upholds:** INV-7.
 
 **Context.** The guest has no NIC, so a client needs a local endpoint to reach
 the host proxy. The relay must work on every VM run, with or without the agent
@@ -114,7 +117,7 @@ it.
 
 ## 2. Host side: one proxy process per run, owned by the backend
 
-**Status:** accepted, not yet implemented. **Upholds:** INV-7.
+**Status:** accepted. The proxy crate is implemented (#401) and qemu runs one per launch (#404); vfkit is pending (#405) and the live proof is pending (#406). **Upholds:** INV-7.
 
 **Context.** The proxy is the only thing that touches the network for the
 guest. It parses guest-controlled input, so it must be small, unprivileged,
@@ -269,7 +272,7 @@ property tests, `forbid(unsafe_code)`, and no privilege.
 
 ## 3. Failure classification: band 3
 
-**Status:** accepted, not yet implemented. **Upholds:** INV-7, INV-11.
+**Status:** accepted. The seam and the band-3 classification are implemented (#403) and qemu uses them (#404); vfkit is pending (#405). **Upholds:** INV-7, INV-11.
 
 **Context.** The proxy is the egress boundary. A run without its boundary is
 not the run the submitter asked for.
@@ -425,9 +428,10 @@ Already filed and fed by this work: #375 (egress attempts in receipts) and #377
 (hostname entries), both blocked by #404 and #405. #372 holds the deferred TLS
 termination and non-HTTP egress.
 
-#404's peer-CID check is specified above for agent-mode launches, where
-`agent_cid` names the CID `qemu_args` assigns. A console-only run does not
-launch `agent_program`, which leaves `agent_cid` unset today, so #404 must also
-define the CID a console-only launch claims, the vsock device that exposes it,
-and the peer check the proxy runs against it, before its KP1q/KP2q rows can
-close.
+#404 settled the CID for every proxy-mode launch. A console-only run does not
+launch `agent_program`, so `QemuBackend::run` claims a random CID with
+`random_agent_cid` whenever the spec carries an egress policy, with or without
+agent mode, and retries on a collision. `qemu_args` emits it as
+`vhost-vsock-pci,guest-cid=<CID>` with no NIC, and the proxy receives it as
+`--peer-cid`, so it serves only that CID. The KP1q and KP2q live rows are still
+pending: no VM has booted behind the proxy yet (#406).

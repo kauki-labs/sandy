@@ -15,6 +15,7 @@
 
 mod agent;
 mod console;
+mod egress_proxy;
 mod qemu;
 mod share;
 mod vfkit;

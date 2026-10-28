@@ -62,6 +62,12 @@ async fn channel_and_caps() -> anyhow::Result<(TestChannel, Cap, Cap)> {
 /// A backend whose `on_link` runs the relay for `cap` on this test's runtime,
 /// keeping the relay's handle so the test can check how it ended.
 fn backend_relaying(channel: &TestChannel, cap: Cap) -> (ProcessBackend, RelayResult) {
+    backend_relaying_via(channel, cap, agent_binary())
+}
+
+/// Like [`backend_relaying`], launching `program` (which must end up running the agent with its
+/// arguments and the link on stdin) in place of the bare agent binary.
+fn backend_relaying_via(channel: &TestChannel, cap: Cap, program: PathBuf) -> (ProcessBackend, RelayResult) {
     let relay: RelayResult = Arc::new(Mutex::new(None));
     let handle = tokio::runtime::Handle::current();
     let on_link = {
@@ -83,10 +89,7 @@ fn backend_relaying(channel: &TestChannel, cap: Cap) -> (ProcessBackend, RelayRe
             *relay.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(task);
         })
     };
-    let backend = ProcessBackend::new().with_agent(AgentLaunch {
-        program: agent_binary(),
-        on_link,
-    });
+    let backend = ProcessBackend::new().with_agent(AgentLaunch { program, on_link });
     (backend, relay)
 }
 
@@ -363,6 +366,60 @@ async fn the_job_environment_carries_no_link_or_cap() -> anyhow::Result<()> {
             "the job env has an unexpected variable {key}: {console}"
         );
     }
+    relay_result(&relay).await??;
+    Ok(())
+}
+
+/// #404 (via #402): the console command in proxy mode runs the job behind `sandy-agent egress-relay`,
+/// then the agent, then tmux. The wrapper below stands in for that outermost relay (the real chain
+/// minus the VM), and the job must see the relay's six proxy variables and no `ALL_PROXY`.
+///
+/// The relay binds a fixed `127.0.0.1:3128`, so the test skips when something else holds the port.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_behind_the_egress_relay_and_tmux_sees_the_proxy_variables() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if std::net::TcpListener::bind("127.0.0.1:3128").is_err() {
+        eprintln!("skipped: 127.0.0.1:3128 is already in use");
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let wrapper = dir.path().join("agent-behind-relay");
+    // Reach the agent through a path with spaces, so the wrapper only works if it quotes the path.
+    let spaced = dir.path().join("a dir with spaces");
+    std::fs::create_dir_all(&spaced)?;
+    let agent = spaced.join("sandy-agent");
+    std::os::unix::fs::symlink(agent_binary(), &agent)?;
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nexec {agent} egress-relay --vsock-port 5001 -- {agent} \"$@\"\n",
+            agent = shell_quote(&agent)
+        ),
+    )?;
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))?;
+    let (channel, agent_cap, _) = channel_and_caps().await?;
+    let (backend, relay) = backend_relaying_via(&channel, agent_cap, wrapper);
+
+    let outcome = timeout(WAIT, run_blocking(backend, vec!["env".to_string()])).await???;
+    let console = &outcome.console;
+    assert_eq!(outcome.guest_exit, Some(0), "console: {console}");
+    let seen: Vec<&str> = console.lines().map(str::trim).collect();
+    for expected in [
+        "HTTPS_PROXY=http://127.0.0.1:3128",
+        "https_proxy=http://127.0.0.1:3128",
+        "HTTP_PROXY=http://127.0.0.1:3128",
+        "http_proxy=http://127.0.0.1:3128",
+        "NO_PROXY=localhost,127.0.0.1,::1",
+        "no_proxy=localhost,127.0.0.1,::1",
+    ] {
+        assert!(seen.contains(&expected), "the job env lacks {expected}: {console}");
+    }
+    assert!(
+        !seen.iter().any(|l| l.starts_with("ALL_PROXY=")),
+        "the relay must not set ALL_PROXY: {console}"
+    );
     relay_result(&relay).await??;
     Ok(())
 }
