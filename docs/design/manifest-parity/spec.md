@@ -75,7 +75,7 @@ is `agent`.
   `secret_dir`) are not part of this projection; they are tested separately.
 - A manifest with a path field submitted for a remote host is refused with the field named.
 - A manifest with an unknown field is refused, not accepted with the field dropped.
-- A `timeout` above the host ceiling is clamped, and the clamp is visible in the status.
+- A `timeout_secs` above the host ceiling is clamped, and the clamp is visible in the status.
 - A `--secret` value never appears on the host side: not in the manifest bytes, the Dispatch
   frame, a log line, host argv, the host's own environment, or the Nix store. Inside the guest
   it's exposed deliberately, through a dedicated read-only share: staged under a `0700` base as a
