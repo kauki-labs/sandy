@@ -17,7 +17,8 @@
 //! mutually exclusive. From the repo root:
 //!
 //! ```text
-//! SANDY_LIVE=1 SANDY_EGRESS_PROXY_BIN="$(nix build --no-link --print-out-paths .#sandy-egress-proxy)/bin/sandy-egress-proxy" \
+//! cargo build -p sandy-egress-proxy
+//! SANDY_LIVE=1 SANDY_EGRESS_PROXY_BIN="$PWD/target/debug/sandy-egress-proxy" \
 //!   nix shell nixpkgs#qemu -c \
 //!   cargo nextest run -p sandy-cli --features live --test live_egress_proxy --no-capture
 //! ```
