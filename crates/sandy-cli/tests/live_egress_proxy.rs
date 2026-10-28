@@ -465,3 +465,45 @@ exit 0
     );
     Ok(())
 }
+
+/// KP7: a proxy that cannot start refuses the run as band 3, and the guest never boots. The proxy binary is
+/// swapped for a stub that exits before it prints `READY`.
+#[test]
+fn proxy_startup_failure_is_band_3() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let target = require_proxy_live()?;
+    build_guest(&target)?;
+    let home = tempfile::tempdir().context("temp SANDY_HOME")?;
+    let stub = home.path().join("failing-proxy");
+    std::fs::write(&stub, "#!/bin/sh\nexit 3\n").context("write the failing proxy stub")?;
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).context("chmod the stub")?;
+    let allowed = allowed_host();
+    let allow = vec![format!("{allowed}:{PROBE_PORT}")];
+
+    let output = sandy_proxy_cmd(home.path(), &target, &allow, "exit 0")
+        .env("SANDY_EGRESS_PROXY_BIN", &stub)
+        .output()
+        .context("run sandy with a proxy that cannot start")?;
+    let (code, env) = parse_envelope(output.status.code().unwrap_or(-1), &output.stdout, &output.stderr)?;
+
+    assert_eq!(
+        code, 3,
+        "a proxy that cannot start is an infra fault, band 3; envelope: {env}"
+    );
+    assert_ne!(
+        env["status"], "succeeded",
+        "a run whose proxy never started must not succeed; envelope: {env}"
+    );
+    let text = env.to_string();
+    assert!(
+        text.contains("egress proxy"),
+        "the envelope must name the proxy failure; envelope: {env}"
+    );
+    // The SeaBIOS banner is the first thing qemu prints to the serial console: its presence means a boot.
+    assert!(
+        !text.contains("SeaBIOS"),
+        "the guest must not boot when the proxy cannot start; envelope: {env}"
+    );
+    Ok(())
+}
