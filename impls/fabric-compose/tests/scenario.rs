@@ -50,7 +50,7 @@ use sandy_fabric::{
     channel_backend::ChannelBackendError,
     contract::fakes::FakeHumanBackend,
     escalation::{EscalationRequest, Severity},
-    executor::{Arch, Capabilities, Requirements},
+    executor::Requirements,
     placement::Lifecycle as _,
     roles::{ChannelAssignment, ChannelRole, decode_assignment},
     types::{ChannelId, HostId, PeerId},
@@ -88,14 +88,6 @@ impl CapAuthority for SharedAuthority {
 
 type Backend = InMem;
 type Authority = SharedAuthority;
-
-fn host_arch() -> Arch {
-    match std::env::consts::ARCH {
-        "x86_64" => Arch::X86_64,
-        "aarch64" => Arch::Aarch64,
-        other => panic!("unsupported host architecture for this scenario test: {other}"),
-    }
-}
 
 fn full_rights() -> CapRights {
     CapRights {
@@ -223,14 +215,12 @@ impl LaunchedChannel {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_all_local_scenario_runs_end_to_end() -> anyhow::Result<()> {
     // ---- Discover a host (real Discovery + Capacity + Lifecycle + place) ----
-    let caps = Capabilities {
-        kind: SandboxKind::Process,
-        arch: host_arch(),
-        attestation: None,
-    };
-    let discovery = StaticRegistry::localhost(caps.kind, caps.arch);
+    // The registered descriptor comes from the SAME executor Capacity probes
+    // (#209): a separately hand-typed Capabilities value here could drift from
+    // what's actually wired in, matching a request Discovery never should have.
     let host_id = HostId::from(StaticRegistry::LOCALHOST);
     let capacity = ExecutorCapacity::new().with_host(host_id.clone(), VmBackendExecutor::new(ProcessBackend::new()), 1);
+    let discovery = StaticRegistry::new([capacity.descriptor_for(&host_id).context("describe the local host")?]);
     let lifecycle = LeaseTable::new(Duration::from_secs(60));
     lifecycle
         .register(host_id.clone())
