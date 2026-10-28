@@ -197,8 +197,8 @@ or run them deliberately with those two variables set.
 ## Planned: egress proxy
 
 The parity gate for the NIC-less guest with a vsock host proxy
-([`egress-proxy.md`](../decisions/egress-proxy.md) decision 5, #360). **KP1q, KP3q, KP5q and KP6q are green; KP2q and KP4q are partial; KP7q and every vfkit row
-are not yet green**, and none counts toward
+([`egress-proxy.md`](../decisions/egress-proxy.md) decision 5, #360). **KP1q, KP3q, KP5q, KP6q and KP7q are green; KP2q and KP4q are partial; every vfkit row
+is not yet green**, and none counts toward
 the floor above until its test exists and passes on its matrix. Each capability needs both its qemu and its vfkit row to pass
 before the nftables path (K13) is deleted. All tests live in
 `sandy-cli/tests/live_egress_proxy.rs`.
@@ -217,7 +217,7 @@ before the nftables path (K13) is deleted. All tests live in
 | KP5v | Proxy address filter  | An allow-listed name that resolves to loopback (`localhost:<port>`) gets `403`.                                                                                                                                         | `live_egress_proxy.rs::allowed_name_resolving_to_loopback_is_refused` | INV-7   | vfkit       | not yet green                                                                                           |
 | KP6q | Proxy death           | Killing the proxy mid-run classifies the run as band 3, whatever the guest's exit.                                                                                                                                      | `live_egress_proxy.rs::proxy_death_mid_run_is_band_3`                 | INV-7   | qemu        | green (ws01 x86_64 KVM, 2026-10-28)                                                                     |
 | KP6v | Proxy death           | Killing the proxy mid-run classifies the run as band 3, whatever the guest's exit.                                                                                                                                      | `live_egress_proxy.rs::proxy_death_mid_run_is_band_3`                 | INV-7   | vfkit       | not yet green                                                                                           |
-| KP7q | Proxy startup failure | A proxy that cannot start refuses the VM run as band 3, with no boot.                                                                                                                                                   | `live_egress_proxy.rs::proxy_startup_failure_is_band_3`               | INV-7   | qemu        | not yet green                                                                                           |
+| KP7q | Proxy startup failure | A proxy that cannot start refuses the VM run as band 3, with no boot.                                                                                                                                                   | `live_egress_proxy.rs::proxy_startup_failure_is_band_3`               | INV-7   | qemu        | green (ws01 x86_64 KVM, 2026-10-28)                                                                     |
 | KP7v | Proxy startup failure | A proxy that cannot start refuses the VM run as band 3, with no boot.                                                                                                                                                   | `live_egress_proxy.rs::proxy_startup_failure_is_band_3`               | INV-7   | vfkit       | not yet green                                                                                           |
 
 ## Not yet a KPI

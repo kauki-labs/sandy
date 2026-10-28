@@ -168,6 +168,14 @@ fn assert_guest_ok(code: i32, env: &serde_json::Value, what: &str) {
     assert_eq!(code, 0, "process band 0; envelope: {env}");
 }
 
+/// Assert the whole infra-fault classification: process band 3, status `failed`, `retryable` true. A bare
+/// "not succeeded" would also accept `cancelled` or a non-retryable result.
+fn assert_infra_fault(code: i32, env: &serde_json::Value, what: &str) {
+    assert_eq!(code, 3, "{what}: process band 3; envelope: {env}");
+    assert_eq!(env["status"], "failed", "{what}: status failed; envelope: {env}");
+    assert_eq!(env["retryable"], true, "{what}: retryable; envelope: {env}");
+}
+
 /// KP1: an allow-listed `host:port` is reachable through the guest relay (`200`).
 #[test]
 fn allowed_target_is_reachable_through_the_proxy() -> anyhow::Result<()> {
@@ -451,17 +459,97 @@ exit 0
     let stderr = std::fs::read(&stderr_path).unwrap_or_default();
     let (code, env) = parse_envelope(output.status.code().unwrap_or(-1), &output.stdout, &stderr)?;
 
-    assert_eq!(code, 3, "a dead proxy is an infra fault, band 3; envelope: {env}");
-    assert_ne!(
-        env["status"], "succeeded",
-        "a run without its boundary must not succeed; envelope: {env}"
-    );
+    assert_infra_fault(code, &env, "a dead proxy is an infra fault");
     // `BackendError::EgressProxyDied` names whether the guest had booted and how it exited. The kill came
     // after the guest's tunnel was up, so the guest had booted; its job then ran on to exit 0.
     let text = env.to_string();
     assert!(
         text.contains("after the guest booted") && text.contains("guest exit 0"),
         "the proxy must die after the guest booted, with the job exiting 0; envelope: {env}"
+    );
+    Ok(())
+}
+
+/// Write an executable `#!/bin/sh` script to `path`.
+#[cfg(target_os = "linux")]
+fn write_script(path: &Path, body: &str) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::write(path, format!("#!/bin/sh\n{body}\n")).with_context(|| format!("write {}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("chmod {}", path.display()))
+}
+
+/// The first `name` found on `PATH`.
+#[cfg(target_os = "linux")]
+fn find_on_path(name: &str) -> Option<std::path::PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+/// KP7: a proxy that cannot start refuses the run as band 3, and the guest never boots. The proxy binary is
+/// swapped for a stub that records that it ran and exits before it prints `READY`. `SANDY_QEMU_BIN` points at
+/// a wrapper that records a launch and then runs the real qemu, because a failed run's envelope carries no
+/// console to inspect. This is the qemu leg, so it exists only on Linux: a vfkit leg (KP7v) needs the same
+/// wrapper for the vfkit binary and is not written, so its row stays not green.
+#[cfg(target_os = "linux")]
+#[test]
+fn proxy_startup_failure_is_band_3() -> anyhow::Result<()> {
+    let target = require_proxy_live()?;
+    build_guest(&target)?;
+    let home = tempfile::tempdir().context("temp SANDY_HOME")?;
+    let proxy_ran = home.path().join("proxy-ran");
+    let qemu_ran = home.path().join("qemu-ran");
+    let stub = home.path().join("failing-proxy");
+    write_script(&stub, &format!("touch '{}'\nexit 3", proxy_ran.display()))?;
+    let qemu_name = &target.hypervisor;
+    let real_qemu = find_on_path(qemu_name).with_context(|| format!("refusing: `{qemu_name}` is not on PATH"))?;
+    let wrapper = home.path().join("qemu-wrapper");
+    write_script(
+        &wrapper,
+        &format!("touch '{}'\nexec '{}' \"$@\"", qemu_ran.display(), real_qemu.display()),
+    )?;
+    let allowed = allowed_host();
+    let allow = vec![format!("{allowed}:{PROBE_PORT}")];
+
+    // Positive control: with the real proxy the wrapper must see a launch, or the "never launched" check
+    // below could not fail.
+    let control = sandy_proxy_cmd(home.path(), &target, &allow, "exit 0")
+        .env("SANDY_QEMU_BIN", &wrapper)
+        .output()
+        .context("run the control sandy")?;
+    anyhow::ensure!(
+        qemu_ran.exists(),
+        "SANDY_QEMU_BIN never saw a launch on a healthy run (exit {:?}); stderr: {}",
+        control.status.code(),
+        String::from_utf8_lossy(&control.stderr)
+    );
+    // The wrapper writes its marker before qemu runs, so the control must also have booted and succeeded.
+    let (control_code, control_env) =
+        parse_envelope(control.status.code().unwrap_or(-1), &control.stdout, &control.stderr)?;
+    assert_guest_ok(control_code, &control_env, "the control run must boot and exit 0");
+    std::fs::remove_file(&qemu_ran).context("reset the qemu marker")?;
+
+    let output = sandy_proxy_cmd(home.path(), &target, &allow, "exit 0")
+        .env("SANDY_EGRESS_PROXY_BIN", &stub)
+        .env("SANDY_QEMU_BIN", &wrapper)
+        .output()
+        .context("run sandy with a proxy that cannot start")?;
+    let (code, env) = parse_envelope(output.status.code().unwrap_or(-1), &output.stdout, &output.stderr)?;
+
+    assert!(
+        proxy_ran.exists(),
+        "the failing proxy stub never ran, so no pre-READY exit was tested; envelope: {env}"
+    );
+    assert_infra_fault(code, &env, "a proxy that cannot start is an infra fault");
+    assert!(
+        env.to_string().contains("egress proxy"),
+        "the envelope must name the proxy failure; envelope: {env}"
+    );
+    assert!(
+        !qemu_ran.exists(),
+        "qemu was launched although the proxy could not start; envelope: {env}"
     );
     Ok(())
 }
