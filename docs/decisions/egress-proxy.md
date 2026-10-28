@@ -282,7 +282,7 @@ not the run the submitter asked for.
   the same class as an egress-apply failure today.
 - **Proxy death mid-run:** at teardown, `try_wait` shows the proxy exited before
   the backend killed it. The backend returns a new
-  `BackendError::EgressProxyDied { status, guest_exit }`, classified band 3
+  `BackendError::EgressProxyDied { status, booted, guest_exit }`, classified band 3
   (retryable, like any infra fault) whatever the guest's own exit. The envelope
   message names the proxy's exit status and the guest exit, if one was
   observed, so the record alone is diagnosable.

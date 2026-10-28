@@ -346,10 +346,19 @@ pub enum BackendError {
     /// The run's egress proxy exited before the backend killed it (#360). The
     /// guest lost its network, so whatever the guest then did is not a result
     /// the submitter asked for: the run is an infra fault whatever `guest_exit`.
-    #[error("egress proxy died ({}); guest exit {}", proxy_status_text(.status), guest_exit_text(.guest_exit))]
+    #[error(
+        "egress proxy died ({}) {}; guest exit {}",
+        proxy_status_text(.status),
+        if *.booted { "after the guest booted" } else { "before the guest booted" },
+        guest_exit_text(.guest_exit)
+    )]
     EgressProxyDied {
         /// The proxy's exit code; `None` when a signal ended it.
         status: Option<i32>,
+        /// Whether the guest had booted when the proxy was found dead. A receipt
+        /// records the proxy as enforcing only for a run that reached it, and
+        /// `guest_exit: None` alone cannot tell "never booted" from "still running".
+        booted: bool,
         /// The guest's own exit code, when one was observed before teardown.
         guest_exit: Option<i32>,
     },
@@ -470,16 +479,25 @@ mod tests {
 
     #[test]
     fn the_proxy_death_message_names_the_proxy_status_and_the_guest_exit() {
-        let died = |status, guest_exit| BackendError::EgressProxyDied { status, guest_exit }.to_string();
-        let both = died(Some(2), Some(0));
+        let died = |status, booted, guest_exit| {
+            BackendError::EgressProxyDied {
+                status,
+                booted,
+                guest_exit,
+            }
+            .to_string()
+        };
+        let both = died(Some(2), true, Some(0));
         assert!(
             both.contains("exit status 2") && both.contains("guest exit 0"),
             "{both}"
         );
-        let neither = died(None, None);
+        assert!(both.contains("after the guest booted"), "{both}");
+        let neither = died(None, false, None);
         assert!(
             neither.contains("killed by a signal") && neither.contains("not observed"),
             "{neither}"
         );
+        assert!(neither.contains("before the guest booted"), "{neither}");
     }
 }

@@ -143,9 +143,13 @@ fn validate_run_egress(plan: &JobPlan, egress_os: EgressOs, tap: Option<&str>) -
 /// backend refused the policy or could not start the proxy, before any boot. A guest that never
 /// booted ran behind nothing. Anything later, a proxy that died mid-run included, means the
 /// proxy served the run, so it stays enforced: that fault is already a band-3 result of its own.
+/// A proxy found dead before the guest booted (`booted: false`) counts as a guest that never booted.
 fn proxy_receipt_result(run: &Result<Outcome, BackendError>) -> Result<EgressOutcome, String> {
     match run {
         Err(BackendError::Spawn(why)) => Err(why.clone()),
+        Err(BackendError::EgressProxyDied { booted: false, .. }) => {
+            Err("the egress proxy died before the guest booted, so it served no run".to_string())
+        }
         Ok(outcome) if !outcome.booted => Err("the guest never booted, so the egress proxy served no run".to_string()),
         _ => Ok(EgressOutcome::Proxied),
     }

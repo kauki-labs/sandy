@@ -724,6 +724,35 @@ fn receipt_reports_a_proxy_run_that_never_booted_as_unenforced() -> anyhow::Resu
     Ok(())
 }
 
+/// #360: a proxy found dead before the guest booted served no run, so its receipt is not
+/// `enforced` either: `guest_exit: None` alone could not tell this from a mid-run death.
+#[test]
+fn receipt_reports_a_proxy_that_died_before_the_guest_booted_as_unenforced() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    let backend = FakeBackend::new().with_error(BackendError::EgressProxyDied {
+        status: Some(1),
+        booted: false,
+        guest_exit: None,
+    });
+
+    let report = run_job(
+        &backend,
+        &journal,
+        &proxy_plan(),
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        None,
+        &[],
+    )
+    .context("run_job (proxy died before boot)")?;
+
+    assert_eq!(report.process_exit.code(), 3, "a dead proxy is an infra fault");
+    let egress = report.envelope.receipt.context("receipt")?.host_observed.egress;
+    assert_eq!(egress.status, EgressEnforcement::Unenforced);
+    assert!(egress.allow_list.is_none());
+    Ok(())
+}
+
 /// #360: a proxy that died after it served the run stays recorded as enforced: the
 /// boundary held, and the death is its own band-3 fault.
 #[test]
@@ -731,6 +760,7 @@ fn receipt_keeps_a_proxy_that_died_mid_run_as_enforced() -> anyhow::Result<()> {
     let (_tmp, journal) = fresh_journal()?;
     let backend = FakeBackend::new().with_error(BackendError::EgressProxyDied {
         status: Some(2),
+        booted: true,
         guest_exit: Some(0),
     });
     let plan = proxy_plan();
@@ -759,6 +789,7 @@ fn run_a_dead_egress_proxy_is_band_three_whatever_the_guest_exit() -> anyhow::Re
     let (_tmp, journal) = fresh_journal()?;
     let backend = FakeBackend::new().with_error(BackendError::EgressProxyDied {
         status: Some(2),
+        booted: true,
         guest_exit: Some(0),
     });
 

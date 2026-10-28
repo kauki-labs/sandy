@@ -369,6 +369,7 @@ mod tests {
         for guest_exit in [None, Some(0), Some(7)] {
             let c = classify_backend_error(&BackendError::EgressProxyDied {
                 status: Some(2),
+                booted: true,
                 guest_exit,
             });
             assert_eq!(c.process_exit, ProcessExit::InfraFault, "guest_exit {guest_exit:?}");

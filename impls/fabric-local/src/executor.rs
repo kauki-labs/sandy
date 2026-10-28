@@ -119,6 +119,7 @@ mod tests {
     fn a_dead_egress_proxy_maps_to_a_transport_infra_fault() {
         let mapped = map_err(BackendError::EgressProxyDied {
             status: Some(2),
+            booted: true,
             guest_exit: Some(0),
         });
         let ExecutorError::Transport(msg) = mapped else {

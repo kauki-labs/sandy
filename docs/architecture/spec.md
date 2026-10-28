@@ -454,7 +454,7 @@ flowchart TD
   plan is band 2 with no journal record and no boot (the silent-run guard).
 - **A dead egress proxy is band 3 (#360).** A backend that finds the run's egress
   proxy exited before it killed it returns `BackendError::EgressProxyDied { status,
-guest_exit }`. It is band 3 and retryable whatever the guest exit, so a guest that
+booted, guest_exit }`. It is band 3 and retryable whatever the guest exit, so a guest that
   exited 0 without its network never reads as `succeeded`; the envelope message
   names the proxy's exit status and the guest exit. A backend with no proxy support
   refuses a `RunSpec` that carries an egress policy before boot (band 3, no boot).
