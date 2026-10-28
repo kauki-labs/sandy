@@ -933,8 +933,13 @@ mod tests {
         .await
         .context("spawn_blocking panicked")?;
 
-        let cap_frame = read_frame(&mut agent_side)
-            .await?
+        // Bounded separately from the (suspended) job deadline (CodeRabbit):
+        // if the relay connected but stalled before ever forwarding Cap, an
+        // un-timed read here would hang the test indefinitely, since
+        // suspend_deadline() means `control` itself has nothing to end it.
+        let cap_frame = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut agent_side))
+            .await
+            .context("the relay never forwarded a Cap frame within the handshake window")??
             .context("agent should see the Cap frame")?;
         assert_eq!(
             cap_frame,
