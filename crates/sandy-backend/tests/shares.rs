@@ -41,6 +41,7 @@ fn test_control() -> &'static RunControl {
 /// slices are empty here.
 fn spec<'a>(command: &'a [String]) -> RunSpec<'a> {
     RunSpec {
+        egress: None,
         template: "demo",
         command,
         inputs: &[],
@@ -403,6 +404,7 @@ fn plan_shares_stages_secret_input_output_with_the_right_flags() -> Result<()> {
         dest: tmp.path().join("dest"),
     }];
     let spec = RunSpec {
+        egress: None,
         template: "demo",
         command: &[],
         inputs: &in_specs,
@@ -474,6 +476,7 @@ fn plan_shares_attaches_an_empty_secret_dir_for_refresh() -> Result<()> {
         .context("fingerprint cred dir")?;
 
     let spec = RunSpec {
+        egress: None,
         template: "demo",
         command: &[],
         inputs: &[],

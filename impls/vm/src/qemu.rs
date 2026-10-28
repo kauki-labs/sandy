@@ -550,6 +550,7 @@ fn drive_console(spec: &RunSpec, run_id: Uuid, sock: &Path) -> Outcome {
 
 impl VmBackend for QemuBackend {
     fn run(&self, spec: &RunSpec) -> Result<Outcome, BackendError> {
+        spec.refuse_egress_proxy("qemu")?;
         if self.agent.is_some() && self.agent_used.swap(true, Ordering::SeqCst) {
             return Err(BackendError::Spawn(
                 "this agent-mode backend already ran its one job; build one per sandbox run".to_string(),
@@ -718,6 +719,7 @@ mod tests {
         let topology = parse_topology(X86_64_FIXTURE).context("parse x86_64 fixture")?;
         let command = ["true".to_string()];
         let spec = RunSpec {
+            egress: None,
             template: "demo",
             command: &command,
             inputs: &[],
@@ -787,6 +789,7 @@ mod tests {
             shares: false,
         };
         let spec = RunSpec {
+            egress: None,
             template: "demo",
             command: &command,
             inputs: &[],
@@ -827,6 +830,7 @@ mod tests {
         assert_eq!(topology.hypervisor, Hypervisor::Vfkit, "fixture is the vfkit topology");
         let command = ["true".to_string()];
         let spec = RunSpec {
+            egress: None,
             template: "demo",
             command: &command,
             inputs: &[],
@@ -867,7 +871,26 @@ mod tests {
             outcome_file: None,
             secret_dir: None,
             control: test_control(),
+            egress: None,
         }
+    }
+
+    /// #403: a backend with no egress proxy support refuses a policy-carrying
+    /// spec before it boots anything, so a proxy-mode run never runs unbounded.
+    #[test]
+    fn qemu_refuses_a_spec_that_carries_an_egress_policy() -> anyhow::Result<()> {
+        let allow = sandy_api::egress::AllowList::default();
+        let command = ["true".to_string()];
+        let spec = RunSpec {
+            egress: Some(&allow),
+            ..demo_spec(&command)
+        };
+        let refused = QemuBackend::new().run(&spec);
+        let Err(BackendError::Spawn(message)) = refused else {
+            anyhow::bail!("expected a Spawn refusal, got {refused:?}");
+        };
+        anyhow::ensure!(message.contains("egress proxy"), "unexpected refusal: {message}");
+        Ok(())
     }
 
     /// #238: an agent-mode launch claims its CID on the vhost-vsock device, in
@@ -926,6 +949,7 @@ mod tests {
         let topology = parse_topology(X86_64_FIXTURE).context("parse x86_64 fixture")?;
         let command = ["true".to_string()];
         let spec = RunSpec {
+            egress: None,
             template: "demo",
             command: &command,
             inputs: &[],
@@ -967,6 +991,7 @@ mod tests {
         let topology = parse_topology(X86_64_FIXTURE).context("parse x86_64 fixture")?;
         let command = ["true".to_string()];
         let spec = RunSpec {
+            egress: None,
             template: "demo",
             command: &command,
             inputs: &[],
@@ -1003,6 +1028,7 @@ mod tests {
         let backend = QemuBackend::new();
         let command = ["true".to_string()];
         let spec = RunSpec {
+            egress: None,
             template: "demo",
             command: &command,
             inputs: &[],
@@ -1042,6 +1068,7 @@ mod tests {
         let control = sandy::RunControl::with_timeout_secs(5);
         control.suspend_deadline();
         let spec = RunSpec {
+            egress: None,
             template: "demo",
             command: &command,
             inputs: &[],
@@ -1075,6 +1102,7 @@ mod tests {
         let command = ["sh".to_string(), "-c".to_string(), "sleep 60".to_string()];
         let control = sandy::RunControl::with_timeout_secs(120);
         let spec = RunSpec {
+            egress: None,
             template: "demo",
             command: &command,
             inputs: &[],

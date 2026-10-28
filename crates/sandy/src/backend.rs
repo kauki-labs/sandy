@@ -80,6 +80,7 @@ mod tests {
         let command = ["true".to_string()];
         let control = RunControl::with_timeout_secs(60);
         let spec = RunSpec {
+            egress: None,
             template: "demo",
             command: &command,
             inputs: &[],

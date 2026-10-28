@@ -452,6 +452,13 @@ flowchart TD
 - **Locked envelope.** `status` / `retryable` / `exit_code` are authoritative and
   cross-checked (INV-11): band 3 (infra) is the only retryable band; an invalid
   plan is band 2 with no journal record and no boot (the silent-run guard).
+- **A dead egress proxy is band 3 (#360).** A backend that finds the run's egress
+  proxy exited before it killed it returns `BackendError::EgressProxyDied { status,
+booted, guest_exit }`. It is band 3 and retryable whatever the guest exit, so a guest that
+  exited 0 without its network never reads as `succeeded`; the envelope message
+  names the proxy's exit status and the guest exit. A backend with no proxy support
+  refuses a `RunSpec` that carries an egress policy before boot (band 3, no boot).
+  Design: [`../decisions/egress-proxy.md`](../decisions/egress-proxy.md) decision 3.
 - **Outputs populated.** After a successful run the supervisor lists each declared
   output's collected files as `OutputRef`s (`<name>/<rel>` named, `<rel>`
   catch-all), independent of the host dest. Provenance (`Provenance.template_store_path`)
