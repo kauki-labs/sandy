@@ -180,31 +180,47 @@ integrity, not registration authenticity) with a different answer.
   guaranteed to produce or check the same bytes.
 - **sandyd countersigns.** Once `sandyd` verifies the executor's signature
   and accepts the receipt, it signs `(executor_signature, the receipt's own
-canonical bytes, job_id, the verified submitter's identity from decision
-12's `ExecutorAllowlist` check)` with its own orchestrator key. This closes
-  the gap the executor's signature alone leaves open: an auditor who trusts
-  only the executor's signature still has to trust that `sandyd` stored,
-  rather than substituted, the bytes it verified. The countersignature is an
+canonical bytes, job_id, the executor's identity as authenticated by
+decision 12's `ExecutorAllowlist` check, the submitter's identity as
+recorded on the dispatch/job record)` with its own orchestrator key — two
+  separate identities, not one (CodeRabbit on this PR): `ExecutorAllowlist`
+  authenticates which _executor_ ran the job, by transport peer IP; it says
+  nothing about who _submitted_ it. The submitter identity is whatever
+  decision 5's `host_observed.who` already resolved to at submit time — a
+  verified cap's `scope.peer` with `authenticated: true`, or the local uid
+  with `authenticated: false` — carried into the countersignature from the
+  dispatch record, not re-derived from the executor check. This closes the
+  gap the executor's signature alone leaves open: an auditor who trusts only
+  the executor's signature still has to trust that `sandyd` stored, rather
+  than substituted, the bytes it verified. The countersignature is an
   attestation of custody ("sandyd received exactly this, from this verified
-  peer, for this job"), independent of and layered over the executor's own
-  attestation of origin ("I produced exactly this"). Either layer's failure
-  is independently detectable.
-- **Replay is closed by binding, not a nonce.** The signed canonical bytes
-  include `job_id` and the dispatching executor's identity (mirroring
-  `AuditReceipt.host_observed.location`), so a signature cannot be lifted
-  from one job's receipt and attached to another's. `sandyd`'s ingestion
-  additionally refuses a receipt for a `job_id` it has no matching dispatch
-  record for, and treats a job's receipt as write-once: a second,
-  differently-signed receipt for an already-recorded `job_id` is rejected,
-  not silently overwritten. Neither check exists today (CodeRabbit on this
-  PR): `HostRegistry` tracks which host a job was _placed_ on, live, for
-  routing — it is not a durable record of past dispatches, and nothing
-  persists an accepted receipt yet. Whichever store ends up owning
-  dispatched-job state (`JobStore`/`JobRegistry`, or a new table) must
-  persist both the dispatch-to-executor mapping and the write-once
-  accepted-receipt marker before these checks are implementable; this is
-  new persistent state the implementation issue adds, not enforcement
-  `sandyd` already has lying around.
+  executor, for this job, submitted by this identity"), independent of and
+  layered over the executor's own attestation of origin ("I produced exactly
+  this"). Either layer's failure is independently detectable.
+- **Replay is closed by binding, not a nonce — and acceptance is atomic.**
+  The signed canonical bytes include `job_id` and the dispatching executor's
+  identity (mirroring `AuditReceipt.host_observed.location`), so a signature
+  cannot be lifted from one job's receipt and attached to another's.
+  `sandyd`'s ingestion additionally refuses a receipt for a `job_id` it has
+  no matching dispatch record for, and treats a job's receipt as write-once:
+  a second, differently-signed receipt for an already-recorded `job_id` is
+  rejected, not silently overwritten. That rejection must be a transactional
+  compare-and-set on a unique `job_id` constraint, not a check-then-write
+  (CodeRabbit on this PR, major): two valid submissions racing for the same
+  `job_id` could otherwise both pass the "no record yet" check before either
+  commits, producing two differently-countersigned artifacts for one job.
+  `sandyd` issues the countersignature only after its own write wins; a
+  second submission that loses the race gets the already-stored record back,
+  not a fresh signature. Neither the dispatch record nor the receipt table
+  exists today (CodeRabbit on this PR): `HostRegistry` tracks which host a
+  job was _placed_ on, live, for routing — it is not a durable record of
+  past dispatches, and nothing persists an accepted receipt yet. Whichever
+  store ends up owning dispatched-job state (`JobStore`/`JobRegistry`, or a
+  new table) must persist both the dispatch-to-executor mapping and the
+  write-once accepted-receipt marker, with the uniqueness enforced as a
+  storage-level constraint (e.g. a unique index on `job_id`), before these
+  checks are implementable; this is new persistent state the implementation
+  issue adds, not enforcement `sandyd` already has lying around.
 
 **Adversarial pass.**
 
@@ -278,7 +294,21 @@ a `ResultEnvelope` for a dispatched job at all yet (no relay path exists to
 sign), so implementation is blocked on that landing first — tracked
 separately, not reopened here. `ExecutorAllowlist`'s wire/config shape
 changes (an `IpAddr` set becomes an `IpAddr -> VerifyingKey` map); key
-provisioning (how an operator generates and installs a keypair) is left to
-the implementation issue, not decided here. `ed25519-dalek` becomes a new
-dependency of whichever crate ends up owning the signing/verification
-(`sandy-executor-proto` or a new seam) once implemented.
+_provisioning_ (how an operator generates and installs a keypair) is left to
+the implementation issue, not decided here, but INV-1 binds that work the
+same way it binds every other secret in this codebase (CodeRabbit on this
+PR): the private half of an executor's signing keypair is secret material
+and must follow the existing discipline — generated and held the way
+`LocalCapAuthority`'s key already is (`Zeroizing`, never printed, a
+`finish_non_exhaustive` `Debug` impl), staged to disk (if at all) only
+through `sandy-fsutil`'s existing 0600 writer, never logged, and never
+present in a receipt or a tracing event. The implementation issue must also
+decide, not this one: key rotation (replacing a compromised or
+routinely-rotated key without invalidating already-countersigned past
+receipts) and revocation (removing a decommissioned or compromised
+executor's key from whatever store holds the `IpAddr -> VerifyingKey` map,
+mirroring `LocalCapAuthority::revoke`'s existing pattern for caps). Both are
+named here as required scope, not designed here.
+`ed25519-dalek` becomes a new dependency of whichever crate ends up owning
+the signing/verification (`sandy-executor-proto` or a new seam) once
+implemented.
