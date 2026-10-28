@@ -891,8 +891,22 @@ mod tests {
             .context("post second")?;
 
         assert_eq!(first, second, "identical content addresses to the same id");
+
+        // A duplicate must not burn a sequence: the next distinct post lands
+        // right after the first, not with a gap where the duplicate would
+        // have gone (#162 -- a gap no envelope will ever fill).
+        channel
+            .post(&member, None, "text/plain", b"distinct".to_vec())
+            .await
+            .context("post distinct")?;
+
         let stored = backend.fetch(0).await.context("fetch")?;
-        assert_eq!(stored.len(), 1, "a re-post of the same content is a no-op in the store");
+        assert_eq!(stored.len(), 2, "the duplicate must not add an entry");
+        assert_eq!(
+            stored[1].sequence,
+            stored[0].sequence + 1,
+            "the duplicate's sequence was never spent"
+        );
         Ok(())
     }
 
