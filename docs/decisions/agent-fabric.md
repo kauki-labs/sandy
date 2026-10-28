@@ -72,7 +72,12 @@ and `stream_from`, which replays and then follows as one primitive.
 
 **Consequences.** Every backend inherits dedup and gap-free resubscription at a
 cursor, because the suite checks both, including a stream opened before an append.
-Whether a late envelope below a stream's cursor is emitted live is open (#162).
+A missing envelope at a follower's cursor holds back every later sequence until
+it fills, never emitted out of order (#162, resolved): `stream_from` yields only
+the entry at exactly the follower's cursor. Safe to hold indefinitely rather than
+time out and skip, since a conforming single-writer `Channel` only advances its
+sequence counter past an envelope it actually stored (never a deduplicated
+repost), so it can never leave a gap open.
 
 **Set aside.** A fetch-then-subscribe composition: it has a window where a
 message lands between the two and is missed.

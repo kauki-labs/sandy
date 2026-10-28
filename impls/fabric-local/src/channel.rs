@@ -23,7 +23,7 @@ use std::{
 use futures_core::Stream;
 use sandy_fabric::{
     capauth::{Cap, CapAuthority, CapError, CapRights},
-    channel_backend::{ChannelBackend, ChannelBackendError, Envelope, MSG_ID_KEY},
+    channel_backend::{AppendOutcome, ChannelBackend, ChannelBackendError, Envelope, MSG_ID_KEY},
     types::ChannelId,
 };
 use sandy_proto::MessageType;
@@ -320,8 +320,16 @@ impl<B: ChannelBackend, A: CapAuthority> Channel<B, A> {
             payload,
             metadata: HashMap::from([(MSG_ID_KEY.to_owned(), id.clone())]),
         };
-        self.backend.append(env).await?;
-        *next_seq += 1;
+        // Only a real store earns the sequence: a non-Tty duplicate (same
+        // message_type/content_type/payload, `content_id` ignores `sequence`)
+        // dedups to the id already stored at a LOWER sequence, so this one
+        // must not be spent — advancing past it regardless would leave a
+        // sequence no envelope will ever occupy, a permanent gap under #162's
+        // hold-back (a live follower parked waiting for it would never see
+        // anything past it either).
+        if self.backend.append(env).await? == AppendOutcome::Stored {
+            *next_seq += 1;
+        }
         Ok(id)
     }
 
@@ -1000,8 +1008,22 @@ mod tests {
             .context("post second")?;
 
         assert_eq!(first, second, "identical content addresses to the same id");
+
+        // A duplicate must not burn a sequence: the next distinct post lands
+        // right after the first, not with a gap where the duplicate would
+        // have gone (#162 -- a gap no envelope will ever fill).
+        channel
+            .post(&member, None, "text/plain", b"distinct".to_vec())
+            .await
+            .context("post distinct")?;
+
         let stored = backend.fetch(0).await.context("fetch")?;
-        assert_eq!(stored.len(), 1, "a re-post of the same content is a no-op in the store");
+        assert_eq!(stored.len(), 2, "the duplicate must not add an entry");
+        assert_eq!(
+            stored[1].sequence,
+            stored[0].sequence + 1,
+            "the duplicate's sequence was never spent"
+        );
         Ok(())
     }
 
@@ -1244,7 +1266,7 @@ mod tests {
     }
 
     impl<B: ChannelBackend> ChannelBackend for PausedAppend<B> {
-        async fn append(&self, env: Envelope) -> Result<(), ChannelBackendError> {
+        async fn append(&self, env: Envelope) -> Result<AppendOutcome, ChannelBackendError> {
             if env.sequence == self.pause_sequence {
                 // `Notify::notify_one` stores a permit if nothing is waiting
                 // yet, so this handshake is race-free regardless of which
@@ -1575,7 +1597,7 @@ mod tests {
     }
 
     impl<B: ChannelBackend> ChannelBackend for PausedPollBackend<B> {
-        async fn append(&self, env: Envelope) -> Result<(), ChannelBackendError> {
+        async fn append(&self, env: Envelope) -> Result<AppendOutcome, ChannelBackendError> {
             self.inner.append(env).await
         }
 

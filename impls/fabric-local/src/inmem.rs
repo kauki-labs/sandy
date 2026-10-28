@@ -13,7 +13,7 @@ use std::{
 };
 
 use futures_core::Stream;
-use sandy_fabric::channel_backend::{ChannelBackend, ChannelBackendError, Envelope, msg_id};
+use sandy_fabric::channel_backend::{AppendOutcome, ChannelBackend, ChannelBackendError, Envelope, msg_id};
 
 /// The shared state behind one [`InMem`] handle: the log, its dedup index, and
 /// the followers parked on an empty tail.
@@ -47,12 +47,12 @@ impl InMem {
 }
 
 impl ChannelBackend for InMem {
-    async fn append(&self, env: Envelope) -> Result<(), ChannelBackendError> {
+    async fn append(&self, env: Envelope) -> Result<AppendOutcome, ChannelBackendError> {
         let id = msg_id(&env).ok_or(ChannelBackendError::MissingMsgId)?.to_owned();
         let mut log = self.lock();
         if log.ids.contains(&id) {
             // A re-post of a stored content id is a no-op; the first entry stands.
-            return Ok(());
+            return Ok(AppendOutcome::Duplicate);
         }
         // The id is marked seen only once its envelope is actually stored below:
         // marking it first and checking the sequence slot second would poison a
@@ -64,7 +64,7 @@ impl ChannelBackend for InMem {
                 for waker in log.wakers.drain(..) {
                     waker.wake();
                 }
-                Ok(())
+                Ok(AppendOutcome::Stored)
             }
             Entry::Occupied(_) => {
                 // Two distinct content ids collided on `sequence`; the channel
@@ -107,6 +107,18 @@ impl ChannelBackend for InMem {
 
 /// The `stream_from` follower: replays from `next_seq`, then parks a waker on
 /// the shared log until the next append.
+///
+/// Hold-back (#162): only the envelope stored AT exactly `next_seq` unblocks
+/// this follower, never a higher one. A late-arriving lower sequence (store-
+/// and-forward can deliver out of order) stalls every later sequence until it
+/// fills the gap, rather than being silently skipped past forever — the old
+/// `range(next_seq..)` scan would jump straight to whatever was next
+/// available, permanently losing anything that arrived below it afterward,
+/// live or on resubscribe. Safe to hold indefinitely rather than time out and
+/// skip: `Channel::post` (the only writer) assigns and stores sequences
+/// strictly in order one at a time (its `next_seq` lock is held across the
+/// append), and only a genuine store advances it (a non-Tty duplicate does
+/// not) — so a single-writer channel can never produce a gap that stays open.
 struct Follow {
     log: Arc<Mutex<Log>>,
     next_seq: u64,
@@ -125,10 +137,10 @@ impl Stream for Follow {
         let next = if this.exhausted {
             None
         } else {
-            log.entries.range(this.next_seq..).next()
+            log.entries.get(&this.next_seq).map(|env| (this.next_seq, env))
         };
         match next {
-            Some((&seq, env)) => {
+            Some((seq, env)) => {
                 let env = env.clone();
                 match seq.checked_add(1) {
                     Some(next_seq) => this.next_seq = next_seq,

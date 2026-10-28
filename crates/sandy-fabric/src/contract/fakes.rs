@@ -17,7 +17,7 @@ use sandy_api::backend::{BoxState, Outcome, RunSpec};
 
 use crate::{
     capauth::{Cap, CapAuthority, CapError, CapRights, CapScope},
-    channel_backend::{ChannelBackend, ChannelBackendError, Envelope, msg_id},
+    channel_backend::{AppendOutcome, ChannelBackend, ChannelBackendError, Envelope, msg_id},
     escalation::{EscalationRequest, EscalationSink, EscalationSinkError},
     executor::{Capabilities, Executor, ExecutorError, capabilities_satisfy},
     minter::{MintedSecret, Minter, MinterError, SecretRequest},
@@ -167,6 +167,9 @@ pub struct FakeBackend {
     pub dedup_on_sequence: bool,
     /// When set, entries stay in arrival order (broken).
     pub arrival_order: bool,
+    /// When set, `stream_from` jumps to the next stored sequence past a gap
+    /// instead of holding back for it (broken: #162's late-lower-sequence rule).
+    pub skip_gaps_while_following: bool,
 }
 
 impl FakeBackend {
@@ -176,7 +179,7 @@ impl FakeBackend {
 }
 
 impl ChannelBackend for FakeBackend {
-    async fn append(&self, env: Envelope) -> Result<(), ChannelBackendError> {
+    async fn append(&self, env: Envelope) -> Result<AppendOutcome, ChannelBackendError> {
         let id = msg_id(&env).ok_or(ChannelBackendError::MissingMsgId)?.to_owned();
         let mut inner = self.lock();
         let duplicate = if self.dedup_on_sequence {
@@ -185,7 +188,7 @@ impl ChannelBackend for FakeBackend {
             inner.log.iter().any(|e| msg_id(e) == Some(id.as_str()))
         };
         if duplicate {
-            return Ok(());
+            return Ok(AppendOutcome::Duplicate);
         }
         let at = if self.arrival_order {
             inner.log.len()
@@ -196,7 +199,7 @@ impl ChannelBackend for FakeBackend {
         for waker in inner.wakers.drain(..) {
             waker.wake();
         }
-        Ok(())
+        Ok(AppendOutcome::Stored)
     }
 
     async fn fetch(&self, from_seq: u64) -> Result<Vec<Envelope>, ChannelBackendError> {
@@ -213,6 +216,7 @@ impl ChannelBackend for FakeBackend {
         FollowStream {
             backend: self.clone(),
             next_seq: from_seq,
+            skip_gaps: self.skip_gaps_while_following,
         }
     }
 }
@@ -220,6 +224,7 @@ impl ChannelBackend for FakeBackend {
 struct FollowStream {
     backend: FakeBackend,
     next_seq: u64,
+    skip_gaps: bool,
 }
 
 impl Stream for FollowStream {
@@ -228,7 +233,17 @@ impl Stream for FollowStream {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         let mut inner = this.backend.lock();
-        match inner.log.iter().find(|e| e.sequence >= this.next_seq).cloned() {
+        // Correct (hold-back, #162): only the envelope AT exactly `next_seq`
+        // unblocks the follower, never a higher one — a gap at `next_seq`
+        // stalls every later sequence until it fills, rather than being
+        // silently skipped past. `skip_gaps` reproduces the broken, pre-#162
+        // behavior on purpose, for `verify.rs`'s adversarial case.
+        let found = if this.skip_gaps {
+            inner.log.iter().find(|e| e.sequence >= this.next_seq).cloned()
+        } else {
+            inner.log.iter().find(|e| e.sequence == this.next_seq).cloned()
+        };
+        match found {
             Some(env) => {
                 this.next_seq = env.sequence + 1;
                 Poll::Ready(Some(Ok(env)))
@@ -246,7 +261,7 @@ impl Stream for FollowStream {
 pub struct SnapshotBackend(pub FakeBackend);
 
 impl ChannelBackend for SnapshotBackend {
-    async fn append(&self, env: Envelope) -> Result<(), ChannelBackendError> {
+    async fn append(&self, env: Envelope) -> Result<AppendOutcome, ChannelBackendError> {
         self.0.append(env).await
     }
 
