@@ -113,6 +113,31 @@ impl<E: Executor> ExecutorCapacity<E> {
         self.hosts.insert(host, (executor, max_slots));
         self
     }
+
+    /// The [`HostDescriptor`] to register in [`Discovery`] for `host`, with
+    /// capabilities read directly from the wired executor's own
+    /// [`Executor::capabilities`] — never hand-typed separately.
+    ///
+    /// A composition root that registers a host here must register this
+    /// descriptor, not a separately constructed [`Capabilities`] value: two
+    /// independently maintained capability tables for the same host can drift
+    /// (#209) — `Discovery::find` would then match a request the wired
+    /// executor can't actually satisfy, surfacing as a confusing run-time
+    /// failure instead of a placement-time mismatch.
+    ///
+    /// # Errors
+    /// [`CapacityError::UnknownHost`] if `host` was never added with
+    /// [`ExecutorCapacity::with_host`].
+    pub fn descriptor_for(&self, host: &HostId) -> Result<HostDescriptor, CapacityError> {
+        let (executor, _) = self
+            .hosts
+            .get(host)
+            .ok_or_else(|| CapacityError::UnknownHost(host.clone()))?;
+        Ok(HostDescriptor {
+            host: host.clone(),
+            capabilities: executor.capabilities(),
+        })
+    }
 }
 
 impl<E: Executor> Capacity for ExecutorCapacity<E> {
@@ -331,16 +356,33 @@ mod tests {
     struct BusyExecutor {
         running: usize,
         broken: bool,
+        capabilities: Capabilities,
     }
 
     fn busy(running: usize) -> BusyExecutor {
-        BusyExecutor { running, broken: false }
+        BusyExecutor {
+            running,
+            broken: false,
+            capabilities: PROCESS_X86,
+        }
+    }
+
+    /// Like [`busy`], but self-reporting `capabilities` instead of the
+    /// default `PROCESS_X86` — for proving a caller reads a host's wired
+    /// executor's own capabilities, not some other host's or a hand-typed one.
+    fn busy_as(running: usize, capabilities: Capabilities) -> BusyExecutor {
+        BusyExecutor {
+            running,
+            broken: false,
+            capabilities,
+        }
     }
 
     fn broken() -> BusyExecutor {
         BusyExecutor {
             running: 0,
             broken: true,
+            capabilities: PROCESS_X86,
         }
     }
 
@@ -369,7 +411,7 @@ mod tests {
         }
 
         fn capabilities(&self) -> Capabilities {
-            PROCESS_X86
+            self.capabilities
         }
     }
 
@@ -478,6 +520,43 @@ mod tests {
         anyhow::ensure!(half.free_slots == 1 && half.can_accept(), "half: {half:?}");
         let full = capacity.probe(&full).await?;
         anyhow::ensure!(full.free_slots == 0 && !full.can_accept(), "full: {full:?}");
+        Ok(())
+    }
+
+    /// #209: `descriptor_for` must read each host's OWN wired executor's
+    /// capabilities, not a hand-typed value and not another host's — the
+    /// exact drift `StaticRegistry` and `ExecutorCapacity` being two
+    /// independently maintained tables made possible.
+    #[tokio::test]
+    async fn descriptor_for_reads_the_hosts_own_wired_executors_capabilities() -> anyhow::Result<()> {
+        let vm_arm = Capabilities {
+            kind: SandboxKind::Vm,
+            arch: Arch::Aarch64,
+            attestation: None,
+        };
+        let (proc_host, vm_host) = (HostId::from("proc-host"), HostId::from("vm-host"));
+        let capacity = ExecutorCapacity::new()
+            .with_host(proc_host.clone(), busy(0), 4)
+            .with_host(vm_host.clone(), busy_as(0, vm_arm), 4);
+
+        let proc_descriptor = capacity.descriptor_for(&proc_host)?;
+        anyhow::ensure!(
+            proc_descriptor.host == proc_host && proc_descriptor.capabilities == PROCESS_X86,
+            "proc-host's descriptor must carry its own executor's capabilities: {proc_descriptor:?}"
+        );
+        let vm_descriptor = capacity.descriptor_for(&vm_host)?;
+        anyhow::ensure!(
+            vm_descriptor.host == vm_host && vm_descriptor.capabilities == vm_arm,
+            "vm-host's descriptor must carry its own executor's capabilities, not proc-host's: {vm_descriptor:?}"
+        );
+
+        anyhow::ensure!(
+            matches!(
+                capacity.descriptor_for(&HostId::from("ghost")),
+                Err(CapacityError::UnknownHost(_))
+            ),
+            "an unknown host must fail, not fabricate a descriptor"
+        );
         Ok(())
     }
 

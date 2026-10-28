@@ -189,7 +189,13 @@ rather than reimplements.
 - `StaticRegistry` is a host list (`localhost` for the all-local profile) filtered
   with `capabilities_satisfy`.
 - `ExecutorCapacity` probes an `Executor` directly: free slots are its limit minus
-  the boxes `observe()` reports.
+  the boxes `observe()` reports. Its `descriptor_for(host)` reads that same
+  executor's `capabilities()` to build the `HostDescriptor` a composition root
+  registers in `Discovery` — the required path, not a hand-typed `Capabilities`
+  value, since two independently maintained tables for the same host can drift
+  (#209): `Discovery::find` would then match a request the wired executor can't
+  actually satisfy, surfacing as a confusing run-time failure instead of a
+  placement-time mismatch.
 - `LeaseTable` is lease soft-state on an injected `Clock`. A lease is live while
   `now < deadline`; at the deadline it lapses and is unknown to every call. A host
   holds one lease: registering again replaces it, so deregistering ends liveness.
