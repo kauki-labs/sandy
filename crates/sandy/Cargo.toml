@@ -39,6 +39,7 @@ sha2.workspace = true
 hex.workspace = true
 octocrab.workspace = true
 tokio.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true

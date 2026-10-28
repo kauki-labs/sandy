@@ -14,6 +14,7 @@ use std::{
 use hmac::{Hmac, KeyInit, Mac};
 use sandy_fabric::capauth::{Cap, CapAuthority, CapError, CapRights, CapScope};
 use sha2::Sha256;
+use zeroize::Zeroizing;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -23,7 +24,7 @@ type HmacSha256 = Hmac<Sha256>;
 /// authority, only caps it mints (INV-1), so a cap minted anywhere else fails
 /// [`verify`](CapAuthority::verify) as [`CapError::Forged`].
 pub struct LocalCapAuthority {
-    key: [u8; 32],
+    key: Zeroizing<[u8; 32]>,
     /// Applied to a minted scope's `expires_at` when the caller leaves it `None`,
     /// so "`None` means the authority's default TTL" is literally true: every
     /// signed scope carries a concrete expiry (CWE-613, no unbounded cap).
@@ -42,8 +43,10 @@ impl LocalCapAuthority {
     /// # Errors
     /// [`CapError::Authority`] if the system RNG is unavailable.
     pub fn new(default_ttl: Duration) -> Result<Self, CapError> {
-        let mut key = [0u8; 32];
-        getrandom::fill(&mut key).map_err(|e| CapError::Authority(format!("rng: {e}")))?;
+        // Filled in place inside the wrapper: a plain array would be copied in, leaving
+        // the original on the stack unzeroed.
+        let mut key = Zeroizing::new([0u8; 32]);
+        getrandom::fill(&mut *key).map_err(|e| CapError::Authority(format!("rng: {e}")))?;
         Ok(Self {
             key,
             default_ttl,
@@ -71,7 +74,7 @@ impl LocalCapAuthority {
     /// Key the MAC over `scope`'s canonical bytes.
     fn mac(&self, scope: &CapScope) -> Result<HmacSha256, CapError> {
         let mut mac =
-            HmacSha256::new_from_slice(&self.key).map_err(|e| CapError::Authority(format!("hmac key: {e}")))?;
+            HmacSha256::new_from_slice(&self.key[..]).map_err(|e| CapError::Authority(format!("hmac key: {e}")))?;
         mac.update(&canonical_scope_bytes(scope));
         Ok(mac)
     }
@@ -197,5 +200,24 @@ impl CapAuthority for SharedCapAuthority {
 
     fn attenuate(&self, parent: &Cap, rights: CapRights) -> Result<Cap, CapError> {
         self.0.attenuate(parent, rights)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    /// #388: the HMAC signing key is held in a type that zeroes it on drop. The
+    /// annotation is the contract: it stops compiling if the field goes back to a
+    /// plain array.
+    #[test]
+    fn the_signing_key_is_zeroed_on_drop() -> Result<(), CapError> {
+        let authority = LocalCapAuthority::new(Duration::from_secs(60))?;
+        let _zeroizing: &Zeroizing<[u8; 32]> = &authority.key;
+        // A fresh key is random, not the all-zero array a failed fill would leave.
+        assert_ne!(*authority.key, [0u8; 32]);
+        Ok(())
     }
 }

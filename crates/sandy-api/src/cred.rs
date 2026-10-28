@@ -9,6 +9,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::backend::SecretRef;
 
@@ -62,9 +63,11 @@ pub struct CredentialHandle {
 
 /// The transient result of a mint: the secret bytes plus the lease metadata,
 /// immediately staged into a [`Lease`] by the core's `mint_lease`. Its
-/// [`fmt::Debug`] redacts the secret so a stray log never leaks it (INV-1).
+/// [`fmt::Debug`] redacts the secret so a stray log never leaks it (INV-1), and
+/// the secret is zeroed when this value drops, so it does not linger in freed
+/// memory for a same-uid process to scan (#388).
 pub struct Minted {
-    secret: String,
+    secret: Zeroizing<String>,
     /// When the provider's token expires (the backstop, not the primary bound).
     pub expires_at: SystemTime,
     /// The handle to revoke or refresh this credential.
@@ -77,7 +80,7 @@ impl Minted {
     #[must_use]
     pub fn new(secret: String, expires_at: SystemTime, handle: CredentialHandle) -> Self {
         Self {
-            secret,
+            secret: Zeroizing::new(secret),
             expires_at,
             handle,
         }
@@ -229,4 +232,36 @@ pub enum GitlabAccount {
         /// The group id or path.
         id: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #388: the minted secret is held in a type that zeroes it on drop. The
+    /// annotation is the contract: it stops compiling if the field goes back to a
+    /// plain `String`.
+    #[test]
+    fn the_minted_secret_is_zeroed_on_drop() {
+        let minted = Minted::new(
+            "ghs_token".to_string(),
+            SystemTime::UNIX_EPOCH,
+            CredentialHandle { id: "h".to_string() },
+        );
+        let _zeroizing: &Zeroizing<String> = &minted.secret;
+        assert_eq!(minted.secret(), "ghs_token");
+    }
+
+    /// The `Debug` redaction (INV-1) still holds with the wrapper in place.
+    #[test]
+    fn the_minted_debug_output_still_redacts_the_secret() {
+        let minted = Minted::new(
+            "ghs_token".to_string(),
+            SystemTime::UNIX_EPOCH,
+            CredentialHandle { id: "h".to_string() },
+        );
+        let shown = format!("{minted:?}");
+        assert!(!shown.contains("ghs_token"), "{shown}");
+        assert!(shown.contains("<redacted>"), "{shown}");
+    }
 }
