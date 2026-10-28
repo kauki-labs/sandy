@@ -25,10 +25,11 @@ use std::{
 
 use sandy::{
     AuditReceipt, BackendError, CALL_DEADLINE, Classification, CoreError, CredentialProvider, CredentialReceipt,
-    DirFingerprint, EgressApplier, EgressOs, EgressOutcome, GuestReported, JOURNAL_SCHEMA_VERSION, JobRecord, JobState,
-    Journal, Lease, MAX_TTL_SECS, Outcome, OutputStatus, ProcessExit, Profile, ResultEnvelope, Scope, SecretSource,
-    Status, VmBackend, classify_backend_error, classify_invalid_plan, classify_outcome, enforce, mint_lease,
-    mint_lease_checked, new_job_id, plan_egress_scoped, reconcile_job, validate_egress_hosts, validate_no_secret_leak,
+    DirFingerprint, EgressApplier, EgressOs, EgressOutcome, EgressPlan, GuestReported, JOURNAL_SCHEMA_VERSION,
+    JobRecord, JobState, Journal, Lease, MAX_TTL_SECS, Outcome, OutputStatus, PlanError, ProcessExit, Profile,
+    ResultEnvelope, Scope, SecretSource, Status, VmBackend, classify_backend_error, classify_invalid_plan,
+    classify_outcome, enforce, mint_lease, mint_lease_checked, new_job_id, plan_egress_scoped, reconcile_job,
+    validate_egress_hosts, validate_no_secret_leak, validate_proxy_egress,
 };
 use zeroize::Zeroizing;
 
@@ -124,6 +125,36 @@ pub fn run_job<B: VmBackend + ?Sized, E: EgressApplier + ?Sized>(
     Ok(outcome.report)
 }
 
+/// The plan-time egress check for the run's boundary model: the nftables path
+/// refuses hostname entries (#359); a proxy-mode run (`SANDY_EGRESS=proxy`, #360)
+/// resolves names host-side, so it refuses a guest NIC on Linux instead.
+fn validate_run_egress(plan: &JobPlan, egress_os: EgressOs, tap: Option<&str>) -> Result<(), PlanError> {
+    if plan.egress_proxy {
+        validate_proxy_egress(egress_os, tap)
+    } else {
+        validate_egress_hosts(&plan.allow, egress_os)
+    }
+}
+
+/// The receipt's egress outcome for a proxy-mode run, read from what the backend did.
+///
+/// The host applies nothing in proxy mode: the backend starts the proxy and boots the
+/// guest behind it, so "enforced" is true only once a guest ran. `Spawn` means the
+/// backend refused the policy or could not start the proxy, before any boot. A guest that never
+/// booted ran behind nothing. Anything later, a proxy that died mid-run included, means the
+/// proxy served the run, so it stays enforced: that fault is already a band-3 result of its own.
+/// A proxy found dead before the guest booted (`booted: false`) counts as a guest that never booted.
+fn proxy_receipt_result(run: &Result<Outcome, BackendError>) -> Result<EgressOutcome, String> {
+    match run {
+        Err(BackendError::Spawn(why)) => Err(why.clone()),
+        Err(BackendError::EgressProxyDied { booted: false, .. }) => {
+            Err("the egress proxy died before the guest booted, so it served no run".to_string())
+        }
+        Ok(outcome) if !outcome.booted => Err("the guest never booted, so the egress proxy served no run".to_string()),
+        _ => Ok(EgressOutcome::Proxied),
+    }
+}
+
 /// The shared core of [`run_job`] and [`run_job_with_credential`]: validates the
 /// plan, writes the `Running` record, runs the backend, classifies the outcome,
 /// and builds the envelope — everything through step 5 of [`run_job`]'s
@@ -147,9 +178,10 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
     //    the first thing written, so an empty journal proves the backend was never reached (the silent-run guard). A
     //    hostname allow-list entry is invalid on Linux only (#359): nft pins one address at load time and the guest
     //    can't resolve names through the boundary anyway, so it is refused here rather than loaded as a rule that never
-    //    matches. macOS enforces no boundary, so a hostname entry there stays accepted.
-    if let Err(plan_error) = validate_no_secret_leak(&spec).and_then(|()| validate_egress_hosts(&plan.allow, egress_os))
-    {
+    //    matches. macOS enforces no boundary, so a hostname entry there stays accepted. A proxy-mode run
+    //    (`SANDY_EGRESS=proxy`, #360) swaps that check: the proxy resolves names host-side, so hostnames are valid, and
+    //    what is refused instead is a guest NIC (`$SANDY_TAP`) on Linux.
+    if let Err(plan_error) = validate_no_secret_leak(&spec).and_then(|()| validate_run_egress(plan, egress_os, tap)) {
         let classification = classify_invalid_plan(&plan_error);
         let envelope = build_envelope(
             &new_job_id(),
@@ -190,24 +222,38 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
     //    a terminal record (band 3) rather than leaving a dangling `Running` record.
     // 4. On a successful apply, run the backend, then ALWAYS revert when the boundary was enforced — on both the ok and
     //    error paths, so a boot failure never leaves nftables rules up.
-    let eplan = plan_egress_scoped(&plan.allow, egress_os, tap);
+    let eplan = if plan.egress_proxy {
+        EgressPlan::Proxy
+    } else {
+        plan_egress_scoped(&plan.allow, egress_os, tap)
+    };
     // Captured alongside `run_result` so the receipt's egress half (#361) reads
     // the SAME platform-keyed outcome that drove the enforce/revert bracket below,
     // never a second, independently derived copy.
     let egress_receipt_result: Result<EgressOutcome, String>;
     let (run_result, egress_warning): (Result<Outcome, BackendError>, Option<String>) = match enforce(&eplan, egress) {
         Ok(eoutcome) => {
-            egress_receipt_result = Ok(eoutcome.clone());
             let outcome = backend.run(&spec);
+            // The proxy is the boundary, and the backend establishes it, so the receipt reads the run's result
+            // rather than the plan's intent: a refusal before boot must not be recorded as enforced.
+            egress_receipt_result = if matches!(eoutcome, EgressOutcome::Proxied) {
+                proxy_receipt_result(&outcome)
+            } else {
+                Ok(eoutcome.clone())
+            };
             if matches!(eoutcome, EgressOutcome::Enforced)
                 && let Err(e) = egress.revert()
             {
                 tracing::warn!(%e, "egress revert failed");
             }
-            (
-                outcome,
-                no_network_allow_warning(&plan.allow, backend.kind(), egress_os, tap),
-            )
+            // In proxy mode the guest has no NIC by design and the proxy enforces the allow-list, so the
+            // "allow-list has no effect" warning would be false.
+            let warning = if plan.egress_proxy {
+                None
+            } else {
+                no_network_allow_warning(&plan.allow, backend.kind(), egress_os, tap)
+            };
+            (outcome, warning)
         }
         Err(egress_error) => {
             egress_receipt_result = Err(egress_error.to_string());
@@ -223,7 +269,7 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
 
     // 5. Classify the physical outcome. The console tail is carried through to the envelope so a boot fault (which
     //    never produced a guest exit) is still diagnosable from the record alone.
-    let (classification, guest_exit, message, console, outputs, output_sizes) = match run_result {
+    let (classification, guest_exit, message, console, outputs, output_sizes, digests) = match run_result {
         Err(backend_error) => {
             tracing::warn!(%job_id, error = %backend_error, "backend run failed (infra fault)");
             (
@@ -233,6 +279,7 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
                 String::new(),
                 vec![],
                 vec![],
+                None,
             )
         }
         Ok(outcome) => {
@@ -247,7 +294,8 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
                 format!("run {:?}", classification.status),
                 outcome.console,
                 collect_output_refs(plan),
-                collect_output_size_refs(plan),
+                collect_output_size_refs(plan, outcome.digests.as_ref().map(|d| &d.outputs)),
+                outcome.digests,
             )
         }
     };
@@ -262,19 +310,25 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
     //    mid-run refresh before persisting (M-6). The caller (`run_job` or `run_job_with_credential`) writes the
     //    terminal record.
     let console = redact_console(console, redact);
+    let mut host_observed = build_host_observed(
+        &job_id,
+        plan,
+        backend.kind(),
+        egress_os,
+        &egress_receipt_result,
+        started,
+        teardown_at,
+    );
+    // #373: the backend hashed the staged inputs before boot (host-observed) and the
+    // collected outputs (guest-reported). Both are `None` unless `--digests` was given.
+    let skipped_outputs = digests.as_ref().map(|d| d.outputs.skipped.clone()).unwrap_or_default();
+    host_observed.input_digests = digests.map(|d| d.inputs);
     let receipt = Some(AuditReceipt {
-        host_observed: build_host_observed(
-            &job_id,
-            plan,
-            backend.kind(),
-            egress_os,
-            &egress_receipt_result,
-            started,
-            teardown_at,
-        ),
+        host_observed,
         guest_reported: GuestReported {
             exit_code: guest_exit,
             outputs: output_sizes,
+            skipped_outputs,
         },
     });
     let mut envelope = build_envelope(
@@ -425,7 +479,7 @@ pub fn run_job_with_credential<
     // means a bad plan never mints-and-immediately-revokes a credential for a run
     // that was always going to be refused, and a mint failure (CoreError::Cred)
     // never masks what should be a clean band-2 invalid-plan report.
-    if let Err(plan_error) = validate_egress_hosts(&plan.allow, egress_os) {
+    if let Err(plan_error) = validate_run_egress(&plan, egress_os, tap) {
         let classification = classify_invalid_plan(&plan_error);
         let envelope = build_envelope(
             &new_job_id(),
@@ -880,6 +934,7 @@ mod tests {
     fn run_with_profile_uses_the_injected_backend_and_egress() -> anyhow::Result<()> {
         let (_tmp, journal) = fresh_journal()?;
         let backend = FakeBackend::new().with_outcome(Outcome {
+            digests: None,
             booted: true,
             guest_exit: Some(0),
             transport_error: None,
@@ -930,6 +985,8 @@ mod tests {
     /// A minimal plan that boots `demo` with no secrets or env.
     fn booting_plan() -> JobPlan {
         JobPlan {
+            digests: false,
+            egress_proxy: false,
             template: "demo".to_string(),
             command: vec![],
             inputs: vec![],
@@ -956,6 +1013,8 @@ mod tests {
     fn leaking_plan() -> JobPlan {
         use sandy::{SecretRef, SecretSource};
         JobPlan {
+            digests: false,
+            egress_proxy: false,
             template: "demo".to_string(),
             command: vec![],
             inputs: vec![],
@@ -990,6 +1049,7 @@ mod tests {
         {
             let (_tmp, journal) = fresh_journal()?;
             let backend = FakeBackend::new().with_outcome(Outcome {
+                digests: None,
                 booted: true,
                 guest_exit: Some(0),
                 transport_error: None,
@@ -1013,6 +1073,7 @@ mod tests {
         {
             let (_tmp, journal) = fresh_journal()?;
             let backend = FakeBackend::new().with_outcome(Outcome {
+                digests: None,
                 booted: true,
                 guest_exit: Some(1),
                 transport_error: None,
@@ -1053,6 +1114,7 @@ mod tests {
         {
             let (_tmp, journal) = fresh_journal()?;
             let backend = FakeBackend::new().with_outcome(Outcome {
+                digests: None,
                 booted: true,
                 guest_exit: Some(0),
                 transport_error: None,
@@ -1276,6 +1338,7 @@ mod tests {
         let provider = TwoTokenProvider { initial, refreshed };
         let backend = SlowBackend {
             inner: FakeBackend::new().with_outcome(Outcome {
+                digests: None,
                 booted: true,
                 guest_exit: Some(0),
                 transport_error: None,
@@ -1378,6 +1441,7 @@ mod tests {
             .context("cred dir 0700")?;
         let provider = sandy_test_support::FakeProvider::returning("tok");
         let backend = FakeBackend::new().with_outcome(Outcome {
+            digests: None,
             booted: true,
             guest_exit: Some(0),
             transport_error: None,

@@ -43,9 +43,23 @@ pub const CONTENT_TYPE_TEXT: &str = "text/plain; charset=utf-8";
 /// `content_type` for a payload that is itself an encoded protobuf message.
 pub const CONTENT_TYPE_PROTOBUF: &str = "application/protobuf";
 
+/// The largest encoded envelope [`decode`] accepts: 1 MiB, the agent link's own
+/// `MAX_FRAME`. An envelope the link can carry always fits; anything bigger is
+/// refused before it is parsed (#390).
+pub const MAX_ENVELOPE_BYTES: usize = 1 << 20;
+
 /// Errors from decoding a channel envelope off the wire.
 #[derive(Debug, thiserror::Error)]
 pub enum ProtoError {
+    /// The input is over [`MAX_ENVELOPE_BYTES`]. It was not parsed, so no payload
+    /// or metadata allocation scaled with it.
+    #[error("envelope frame is {len} bytes, over the {max}-byte limit")]
+    TooLarge {
+        /// The input's length.
+        len: usize,
+        /// The limit it exceeded, [`MAX_ENVELOPE_BYTES`].
+        max: usize,
+    },
     /// The bytes are not a valid envelope: a malformed or truncated frame. The
     /// caller gets this error rather than a silently default-empty envelope.
     #[error("malformed envelope frame: {0}")]
@@ -64,15 +78,23 @@ pub fn encode(envelope: &Envelope) -> Vec<u8> {
 /// default-empty [`Envelope`]. An unknown (future) field or `message_type`
 /// variant is skipped, leaving the known fields intact (forward compatibility).
 ///
-/// This crate places no upper bound on `bytes`: the `metadata` map and
-/// `payload` allocations scale with the input size. `bytes` crosses a trust
-/// boundary (a channel backend carrying sandbox traffic), so the caller is
-/// responsible for capping frame size before calling `decode` on untrusted input.
+/// `bytes` crosses a trust boundary (a channel backend carrying sandbox traffic),
+/// and the `metadata` map and `payload` allocations scale with its size, so an
+/// input over [`MAX_ENVELOPE_BYTES`] is refused before it is parsed. A caller
+/// that frames the stream should still cap the frame before it buffers it: this
+/// check bounds the decoder's allocation, not the caller's own read buffer.
 ///
 /// # Errors
 ///
-/// Returns [`ProtoError::Decode`] when `bytes` is not a valid envelope frame.
+/// Returns [`ProtoError::TooLarge`] when `bytes` is over [`MAX_ENVELOPE_BYTES`],
+/// and [`ProtoError::Decode`] when it is not a valid envelope frame.
 pub fn decode(bytes: &[u8]) -> Result<Envelope, ProtoError> {
+    if bytes.len() > MAX_ENVELOPE_BYTES {
+        return Err(ProtoError::TooLarge {
+            len: bytes.len(),
+            max: MAX_ENVELOPE_BYTES,
+        });
+    }
     Ok(Envelope::decode(bytes)?)
 }
 

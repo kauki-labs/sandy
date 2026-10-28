@@ -136,6 +136,8 @@ fn end_to_end(template: &str) -> Result<(), String> {
         .map_err(|e| format!("journal ensure_dirs at {}: {e}", home.path().display()))?;
 
     let plan = JobPlan {
+        digests: false,
+        egress_proxy: false,
         template: template.to_string(),
         command: vec!["true".to_string()],
         inputs: vec![],

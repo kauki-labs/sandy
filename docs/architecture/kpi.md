@@ -228,5 +228,9 @@ absence for a gap:
 - **`Provenance.template_store_path`** in the envelope is a placeholder (not
   asserted). The audit receipt (#361) is integration-tested (`cli_jobs.rs`,
   `result.rs`) but has no live-proven KPI yet (K20 above is not green).
+- **Signing receipts relayed from remote executors** (#374, decision 6 of
+  `result-classification.md`): design-only, no implementation yet (#472,
+  blocked by #413). No KPI row until #472 lands and is asserted on a real
+  boot.
 - **No-copy / arbitrary-path inputs** (#82): inputs are copied under their name.
 - **S3 object source + sink** (#67): no object-store input/output path.

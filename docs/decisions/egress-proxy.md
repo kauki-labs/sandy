@@ -14,8 +14,11 @@ parity gate (decision 5) passes. Tracked in #360. Subsystem spec:
 [`../architecture/spec.md#5-egress`](../architecture/spec.md#5-egress). Planned
 live KPIs: [`../architecture/kpi.md#planned-egress-proxy`](../architecture/kpi.md#planned-egress-proxy).
 
-All decisions here are accepted and not yet implemented. The implementation
-issues are listed at the end.
+All decisions here are accepted. Implementation status: the proxy crate (#401), the
+guest relay (#402), and the seam and band-3 classification (#403) are merged. The qemu
+wiring (#404) and the vfkit wiring (#405) are implemented but not live-verified. The
+live parity gate (#406) and the cutover (#407) are pending. The implementation issues are
+listed at the end.
 
 ## Context
 
@@ -58,7 +61,7 @@ including root.
 
 ## 1. Guest side: an HTTP CONNECT relay in `sandy-agent`
 
-**Status:** accepted, not yet implemented. **Upholds:** INV-7.
+**Status:** accepted. The relay is implemented (#402) and qemu (#404) and vfkit (#405) run it; neither is live-verified. **Upholds:** INV-7.
 
 **Context.** The guest has no NIC, so a client needs a local endpoint to reach
 the host proxy. The relay must work on every VM run, with or without the agent
@@ -114,7 +117,7 @@ it.
 
 ## 2. Host side: one proxy process per run, owned by the backend
 
-**Status:** accepted, not yet implemented. **Upholds:** INV-7.
+**Status:** accepted. The proxy crate is implemented (#401) and qemu (#404) and vfkit (#405) run one per launch; neither is live-verified, and the live proof is pending (#406). **Upholds:** INV-7.
 
 **Context.** The proxy is the only thing that touches the network for the
 guest. It parses guest-controlled input, so it must be small, unprivileged,
@@ -269,7 +272,7 @@ property tests, `forbid(unsafe_code)`, and no privilege.
 
 ## 3. Failure classification: band 3
 
-**Status:** accepted, not yet implemented. **Upholds:** INV-7, INV-11.
+**Status:** accepted. The seam and the band-3 classification are implemented (#403) and qemu (#404) and vfkit (#405) use them; neither is live-verified. **Upholds:** INV-7, INV-11.
 
 **Context.** The proxy is the egress boundary. A run without its boundary is
 not the run the submitter asked for.
@@ -282,7 +285,7 @@ not the run the submitter asked for.
   the same class as an egress-apply failure today.
 - **Proxy death mid-run:** at teardown, `try_wait` shows the proxy exited before
   the backend killed it. The backend returns a new
-  `BackendError::EgressProxyDied { status, guest_exit }`, classified band 3
+  `BackendError::EgressProxyDied { status, booted, guest_exit }`, classified band 3
   (retryable, like any infra fault) whatever the guest's own exit. The envelope
   message names the proxy's exit status and the guest exit, if one was
   observed, so the record alone is diagnosable.
@@ -425,9 +428,21 @@ Already filed and fed by this work: #375 (egress attempts in receipts) and #377
 (hostname entries), both blocked by #404 and #405. #372 holds the deferred TLS
 termination and non-HTTP egress.
 
-#404's peer-CID check is specified above for agent-mode launches, where
-`agent_cid` names the CID `qemu_args` assigns. A console-only run does not
-launch `agent_program`, which leaves `agent_cid` unset today, so #404 must also
-define the CID a console-only launch claims, the vsock device that exposes it,
-and the peer check the proxy runs against it, before its KP1q/KP2q rows can
-close.
+#404 settled the CID for every proxy-mode launch. A console-only run does not
+launch `agent_program`, so `QemuBackend::run` claims a random CID with
+`random_agent_cid` whenever the spec carries an egress policy, with or without
+agent mode, and retries on a collision. `qemu_args` emits it as
+`vhost-vsock-pci,guest-cid=<CID>` with no NIC, and the proxy receives it as
+`--peer-cid`, so it serves only that CID.
+
+#405 wired vfkit the other way round. There is no CID to scope: the proxy runs as
+`sandy-egress-proxy --unix <staging>/eg-<id>.sock` (the 0700 private staging base, beside
+the agent link socket `ag-<id>.sock`, with the file name kept short to fit macOS's
+104-byte `sun_path`), and vfkit gets `--device
+virtio-vsock,port=5001,socketURL=<that socket>,listen`, so it dials the socket for each
+guest-initiated connection. The guest port is the constant `EGRESS_VSOCK_PORT = 5001`
+(the port space is per VM; the agent link keeps 5000). A unix-socket bind failure is not
+retried. At teardown the backend `try_wait`s the proxy before killing it, so an early
+exit is an `EgressProxyDied` and its own kill is never read as one; then it kills the
+proxy and vfkit and removes the socket. The KP1q, KP2q, KP1v and KP2v live rows are still
+pending: no VM has booted behind the proxy yet (#406).

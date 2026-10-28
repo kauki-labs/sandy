@@ -51,6 +51,10 @@ pub enum EgressPlan {
         /// Why no boundary exists — surfaced to the operator, never swallowed.
         reason: String,
     },
+    /// The guest has no NIC and the backend runs a per-run egress proxy that
+    /// applies the allow-list (#360). Nothing is applied on the host here; the
+    /// allow-list travels to the backend in [`crate::backend::RunSpec::egress`].
+    Proxy,
 }
 
 /// The result of driving an [`EgressPlan`] through the core's `enforce`.
@@ -58,6 +62,10 @@ pub enum EgressPlan {
 pub enum EgressOutcome {
     /// The ruleset was applied as the per-VM boundary (Linux).
     Enforced,
+    /// The boundary is the backend's egress proxy: the host applied nothing, so
+    /// there is nothing to revert. A backend that cannot run the proxy refuses
+    /// the run before boot, so this outcome never covers an unbounded run.
+    Proxied,
     /// No boundary was applied; `reason` carries the honest explanation (macOS).
     Unenforced {
         /// Why egress is unenforced — mirrors [`EgressPlan::NoBoundary`]'s reason.

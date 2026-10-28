@@ -62,8 +62,9 @@ use std::{
 };
 
 use sandy::{
-    BackendError, BoxState, Containment, ContainmentStatus, Mount, NoContainment, Outcome, ResourceLimits, RunSpec,
-    SandboxKind, ShareDirs, VmBackend, collect_outputs, ensure_sandy_staging_base, plan_shares, wipe,
+    BackendError, BoxState, Containment, ContainmentStatus, ContentDigests, Mount, NoContainment, Outcome,
+    ResourceLimits, RunSpec, SandboxKind, ShareDirs, SharePlan, VmBackend, collect_outputs, ensure_sandy_staging_base,
+    plan_shares, wipe, with_digests,
 };
 use sandy_api::{
     agent::{AgentLaunch, AgentReport, AgentVerdict},
@@ -184,7 +185,7 @@ impl ProcessBackend {
         inst_dir: &Path,
         inputs_dir: &Path,
         outputs_dir: &Path,
-    ) -> Result<Outcome, BackendError> {
+    ) -> Result<(Outcome, Option<ContentDigests>), BackendError> {
         // The job's own program, kept for diagnostics: the launch program below may
         // be the containment wrapper (e.g. `systemd-run`), not the job.
         let (job_program, _) = spec
@@ -199,7 +200,7 @@ impl ProcessBackend {
 
         // Stage secret/input/output per the shared policy, then present them as
         // local dirs and enforce cooperative read-only on inputs/secrets.
-        let shares = plan_shares(
+        let SharePlan { shares, input_digests } = plan_shares(
             spec,
             &ShareDirs {
                 inst_dir,
@@ -449,18 +450,21 @@ impl ProcessBackend {
             status.and_then(|s| s.code().or_else(|| s.signal().map(|sig| 128 + sig)))
         };
 
-        Ok(Outcome {
+        let outcome = Outcome {
             booted: true,
             guest_exit,
             transport_error: None,
             timed_out,
             console,
-        })
+            digests: None,
+        };
+        Ok((outcome, input_digests))
     }
 }
 
 impl VmBackend for ProcessBackend {
     fn run(&self, spec: &RunSpec) -> Result<Outcome, BackendError> {
+        spec.refuse_egress_proxy("process")?;
         if spec.command.is_empty() {
             return Err(BackendError::Spawn("empty command".to_string()));
         }
@@ -480,22 +484,25 @@ impl VmBackend for ProcessBackend {
 
         // Run the staged job, capturing the result so outputs are collected and
         // staging is wiped on EVERY path (INV-1 — secret bytes never outlive the run).
-        let result = self.run_staged(spec, run_id, &inst_dir, &inputs_dir, &outputs_dir);
+        let (result, input_digests) = match self.run_staged(spec, run_id, &inst_dir, &inputs_dir, &outputs_dir) {
+            Ok((outcome, input_digests)) => (Ok(outcome), input_digests),
+            Err(err) => (Err(err), None),
+        };
 
         // Collect the chosen outputs to the host before wiping, but only if the job
         // ran (nothing is produced otherwise). A collection failure is an infra
         // fault, never a silent drop.
         let collected = if result.as_ref().is_ok_and(|outcome| outcome.booted) {
-            collect_outputs(spec.outputs, &outputs_dir)
+            collect_outputs(spec.outputs, &outputs_dir, spec.digests)
         } else {
-            Ok(())
+            Ok(None)
         };
         for dir in [&inst_dir, &inputs_dir, &outputs_dir] {
             if let Err(err) = wipe(dir) {
                 tracing::warn!(dir = %dir.display(), %err, "failed to wipe process staging on teardown");
             }
         }
-        collected.and(result)
+        with_digests(result, input_digests, collected)
     }
 
     fn kill(&self, box_id: &str) -> Result<(), BackendError> {
@@ -625,6 +632,7 @@ mod tests {
             timeout_secs,
         )));
         RunSpec {
+            digests: false,
             template: "process",
             command,
             inputs: &[],
@@ -638,7 +646,28 @@ mod tests {
             outcome_file: None,
             secret_dir: None,
             control,
+            egress: None,
         }
+    }
+
+    /// #403: a backend with no egress proxy support refuses a policy-carrying
+    /// spec before it boots anything, so a proxy-mode run never runs unbounded.
+    #[test]
+    fn process_refuses_a_spec_that_carries_an_egress_policy() -> anyhow::Result<()> {
+        let allow = sandy_api::egress::AllowList::default();
+        let command = ["true".to_string()];
+        let grants = no_grants();
+        let spec = RunSpec {
+            digests: false,
+            egress: Some(&allow),
+            ..run_spec(&command, &grants, 30)
+        };
+        let refused = ProcessBackend::new().run(&spec);
+        let Err(BackendError::Spawn(message)) = refused else {
+            anyhow::bail!("expected a Spawn refusal, got {refused:?}");
+        };
+        anyhow::ensure!(message.contains("egress proxy"), "unexpected refusal: {message}");
+        Ok(())
     }
 
     fn no_grants() -> Grants {
@@ -688,6 +717,7 @@ mod tests {
         let command = ["sandy-only-here".to_string()];
         let env = [("PATH".to_string(), format!("{}:/usr/bin:/bin", tools.path().display()))];
         let spec = RunSpec {
+            digests: false,
             env: &env,
             ..run_spec(&command, &grants, 30)
         };
@@ -887,6 +917,7 @@ mod tests {
             "cat \"$SANDY_INPUTS_DIR/data\"".to_string(),
         ];
         let spec = RunSpec {
+            digests: false,
             inputs: &inputs,
             ..run_spec(&command, &grants, 30)
         };
@@ -919,6 +950,7 @@ mod tests {
         let grants = no_grants();
         let command = ["env".to_string()];
         let spec = RunSpec {
+            digests: false,
             inputs: &inputs,
             ..run_spec(&command, &grants, 30)
         };
@@ -949,6 +981,7 @@ mod tests {
         let grants = no_grants();
         let command = ["env".to_string()];
         let spec = RunSpec {
+            digests: false,
             inputs: &inputs,
             ..run_spec(&command, &grants, 30)
         };
@@ -987,6 +1020,7 @@ mod tests {
             "mkdir -p \"$SANDY_OUTPUTS_DIR/result\"; printf done > \"$SANDY_OUTPUTS_DIR/result/f\"".to_string(),
         ];
         let spec = RunSpec {
+            digests: false,
             outputs: &outputs,
             ..run_spec(&command, &grants, 30)
         };
@@ -1028,6 +1062,7 @@ mod tests {
             "cat \"$SANDY_SECRETS_DIR/TOKEN\"".to_string(),
         ];
         let spec = RunSpec {
+            digests: false,
             secrets: &secrets,
             grants: &grants,
             ..run_spec(&command, &grants, 30)
@@ -1066,6 +1101,7 @@ mod tests {
         };
         let command = ["sh".to_string(), "-c".to_string(), "env".to_string()];
         let spec = RunSpec {
+            digests: false,
             secrets: &secrets,
             grants: &grants,
             ..run_spec(&command, &grants, 30)

@@ -50,6 +50,7 @@ fn fingerprint(dir: &std::path::Path) -> anyhow::Result<sandy::DirFingerprint> {
 /// A scripted physical outcome: booted, with the given guest exit code.
 fn ok_outcome(guest_exit: i32) -> Outcome {
     Outcome {
+        digests: None,
         booted: true,
         guest_exit: Some(guest_exit),
         transport_error: None,
@@ -61,6 +62,7 @@ fn ok_outcome(guest_exit: i32) -> Outcome {
 /// A minimal plan that boots `demo` with no secrets or env.
 fn booting_plan() -> JobPlan {
     JobPlan {
+        digests: false,
         template: "demo".to_string(),
         command: vec![],
         inputs: vec![],
@@ -68,6 +70,7 @@ fn booting_plan() -> JobPlan {
         secrets: vec![],
         env: vec![],
         allow: AllowList::default(),
+        egress_proxy: false,
         cpu: None,
         mem: None,
         timeout_secs: 60,
@@ -85,6 +88,7 @@ fn booting_plan() -> JobPlan {
 /// `validate_no_secret_leak` (INV-1).
 fn leaking_plan() -> JobPlan {
     JobPlan {
+        digests: false,
         template: "demo".to_string(),
         command: vec![],
         inputs: vec![],
@@ -95,6 +99,7 @@ fn leaking_plan() -> JobPlan {
         }],
         env: vec![("TOK".to_string(), "leaked".to_string())],
         allow: AllowList::default(),
+        egress_proxy: false,
         cpu: None,
         mem: None,
         timeout_secs: 60,
@@ -217,6 +222,220 @@ fn run_lists_collected_outputs_in_the_envelope() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// #373: digests the backend reports reach the receipt in the right section:
+/// inputs under `host_observed`, outputs under `guest_reported` (on the entry the
+/// supervisor listed for that path), and skipped output entries beside them.
+/// `FakeBackend` stages and collects nothing, so the hashing itself is covered by
+/// the `stage` unit tests over the real `stage_inputs` / `collect_outputs`; this
+/// proves only the supervisor's placement of a scripted report.
+#[test]
+fn run_places_reported_digests_in_the_right_receipt_sections() -> anyhow::Result<()> {
+    use sandy::{ContentDigests, FileDigest, RunDigests, SkipReason, SkippedEntry};
+
+    const HELLO: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+    const WORLD: &str = "486ea46224d1bb4fb680f34f7c9ad96a8f24ec88be73ea8e5a6c65260e9cb8a7";
+    let (tmp, journal) = fresh_journal()?;
+    let dest = tmp.path().join("collected");
+    std::fs::create_dir_all(&dest).context("mk output dest")?;
+    std::fs::write(dest.join("f"), b"hello").context("write output")?;
+    std::fs::write(dest.join("stale"), b"left by someone else").context("write stale file")?;
+    let mut plan = booting_plan();
+    plan.digests = true;
+    plan.outputs = vec![sandy::Output {
+        name: Some("result".to_string()),
+        dest,
+    }];
+    let mut outcome = ok_outcome(0);
+    outcome.digests = Some(RunDigests {
+        inputs: ContentDigests {
+            files: vec![FileDigest {
+                path: "in/a".to_string(),
+                sha256: WORLD.to_string(),
+            }],
+            skipped: vec![],
+        },
+        outputs: ContentDigests {
+            files: vec![FileDigest {
+                path: "result/f".to_string(),
+                sha256: HELLO.to_string(),
+            }],
+            skipped: vec![SkippedEntry {
+                path: "result/leak".to_string(),
+                reason: SkipReason::Symlink,
+            }],
+        },
+    });
+
+    let backend = FakeBackend::new().with_outcome(outcome);
+    let report = run_job(
+        &backend,
+        &journal,
+        &plan,
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        None,
+        &[],
+    )
+    .context("run_job with digests")?;
+
+    let receipt = report.envelope.receipt.context("receipt")?;
+    let inputs = receipt
+        .host_observed
+        .input_digests
+        .context("input digests are host-observed")?;
+    assert_eq!(inputs.files.len(), 1);
+    assert_eq!(
+        (inputs.files[0].path.as_str(), inputs.files[0].sha256.as_str()),
+        ("in/a", WORLD)
+    );
+    let outputs: Vec<(&str, Option<&str>)> = receipt
+        .guest_reported
+        .outputs
+        .iter()
+        .map(|o| (o.path.as_str(), o.sha256.as_deref()))
+        .collect();
+    assert_eq!(
+        outputs,
+        [("result/f", Some(HELLO)), ("result/stale", None)],
+        "a file this run did not collect carries no digest"
+    );
+    assert_eq!(
+        receipt.guest_reported.skipped_outputs,
+        [SkippedEntry {
+            path: "result/leak".to_string(),
+            reason: SkipReason::Symlink
+        }]
+    );
+    Ok(())
+}
+
+/// A backend that runs the REAL staging and collection code on tempdirs, as qemu, vfkit and the
+/// process backend do, and reports what a guest that wrote one output file would. `FakeBackend`
+/// cannot do this: it stages nothing, and `sandy-test-support` cannot depend on `sandy`.
+struct StagingBackend {
+    work: std::path::PathBuf,
+}
+
+impl sandy::VmBackend for StagingBackend {
+    fn run(&self, spec: &sandy::RunSpec) -> Result<Outcome, BackendError> {
+        let (inputs_dir, outputs_dir) = (self.work.join("inputs"), self.work.join("outputs"));
+        sandy::stage_inputs(spec.inputs, &inputs_dir)?;
+        let input_digests = spec
+            .digests
+            .then(|| sandy::digest_staged_inputs(spec.inputs, &inputs_dir))
+            .transpose()?;
+        sandy::prepare_outputs(spec.outputs, &outputs_dir)?;
+        // The "guest" writes one output file after boot.
+        std::fs::write(outputs_dir.join("result").join("f"), b"hello")
+            .map_err(|e| BackendError::Spawn(e.to_string()))?;
+        let collected = sandy::collect_outputs(spec.outputs, &outputs_dir, spec.digests);
+        sandy::with_digests(Ok(ok_outcome(0)), input_digests, collected)
+    }
+
+    fn kill(&self, _box_id: &str) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    fn boxes(&self) -> Result<Vec<sandy::BoxState>, BackendError> {
+        Ok(vec![])
+    }
+}
+
+/// #373: known content flows through the real `stage_inputs`, `digest_staged_inputs`, and
+/// `collect_outputs`, then through the supervisor, and the receipt carries the known sha256 values in
+/// the right sections. This is the end-to-end check the scripted-outcome test above cannot give: it
+/// fails if the staged or collected bytes hash differently from what the receipt reports.
+#[test]
+fn run_digests_known_content_through_the_real_staging_and_collection() -> anyhow::Result<()> {
+    const HELLO: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+    const WORLD: &str = "486ea46224d1bb4fb680f34f7c9ad96a8f24ec88be73ea8e5a6c65260e9cb8a7";
+    let (tmp, journal) = fresh_journal()?;
+    let source = tmp.path().join("source");
+    std::fs::create_dir_all(&source).context("mk input source")?;
+    std::fs::write(source.join("a"), b"world").context("write input")?;
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).context("mk work dir")?;
+    let mut plan = booting_plan();
+    plan.digests = true;
+    plan.inputs = vec![sandy::Input {
+        host: source,
+        name: "in".to_string(),
+        guest_path: None,
+    }];
+    plan.outputs = vec![sandy::Output {
+        name: Some("result".to_string()),
+        dest: tmp.path().join("collected"),
+    }];
+
+    let report = run_job(
+        &StagingBackend { work },
+        &journal,
+        &plan,
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        None,
+        &[],
+    )
+    .context("run_job over the real staging")?;
+
+    assert_eq!(report.process_exit.code(), 0, "{}", report.envelope.message);
+    let receipt = report.envelope.receipt.context("receipt")?;
+    let inputs = receipt
+        .host_observed
+        .input_digests
+        .context("input digests are host-observed")?;
+    let input_files: Vec<(&str, &str)> = inputs
+        .files
+        .iter()
+        .map(|d| (d.path.as_str(), d.sha256.as_str()))
+        .collect();
+    assert_eq!(input_files, [("in/a", WORLD)]);
+    let outputs: Vec<(&str, Option<&str>)> = receipt
+        .guest_reported
+        .outputs
+        .iter()
+        .map(|o| (o.path.as_str(), o.sha256.as_deref()))
+        .collect();
+    assert_eq!(outputs, [("result/f", Some(HELLO))]);
+    assert!(receipt.guest_reported.skipped_outputs.is_empty());
+    Ok(())
+}
+
+/// #373: with `--digests` off the supervisor asks for no hashing and the serialized
+/// envelope has no digest key anywhere.
+#[test]
+fn run_without_digests_flag_requests_none_and_serializes_no_digest_keys() -> anyhow::Result<()> {
+    let (tmp, journal) = fresh_journal()?;
+    let dest = tmp.path().join("collected");
+    std::fs::create_dir_all(&dest).context("mk output dest")?;
+    std::fs::write(dest.join("f"), b"hello").context("write output")?;
+    let mut plan = booting_plan();
+    plan.outputs = vec![sandy::Output {
+        name: Some("result".to_string()),
+        dest,
+    }];
+    assert!(!plan.digests && !plan.as_run_spec().digests, "off by default");
+
+    let backend = FakeBackend::new().with_outcome(ok_outcome(0));
+    let report = run_job(
+        &backend,
+        &journal,
+        &plan,
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        None,
+        &[],
+    )
+    .context("run_job without digests")?;
+
+    let json = serde_json::to_string(&report.envelope)?;
+    assert!(json.contains("size_bytes"), "the receipt itself is present: {json}");
+    for key in ["sha256", "input_digests", "skipped"] {
+        assert!(!json.contains(key), "unexpected `{key}` in {json}");
+    }
+    Ok(())
+}
+
 #[test]
 fn run_guest_failure_is_band_one_not_retryable() -> anyhow::Result<()> {
     let (_tmp, journal) = fresh_journal()?;
@@ -244,6 +463,7 @@ fn run_timeout_is_band_one_not_retryable() -> anyhow::Result<()> {
     let (_tmp, journal) = fresh_journal()?;
     // A booted guest that hit its wall-clock timeout: no exit code, `timed_out`.
     let timed_out = Outcome {
+        digests: None,
         booted: true,
         guest_exit: None,
         transport_error: None,
@@ -460,6 +680,7 @@ fn gc_evicts_oldest_terminal_beyond_keep_n_but_keeps_the_running_job() -> anyhow
 /// time on Linux (#359).
 fn allowing_plan() -> JobPlan {
     JobPlan {
+        digests: false,
         allow: AllowList {
             rules: vec![EgressRule {
                 host: "1.1.1.1".to_string(),
@@ -475,6 +696,7 @@ fn allowing_plan() -> JobPlan {
 /// used only by the macOS egress test.
 fn allowing_plan_by_hostname() -> JobPlan {
     JobPlan {
+        digests: false,
         allow: AllowList {
             rules: vec![EgressRule {
                 host: "github.com".to_string(),
@@ -531,6 +753,286 @@ fn run_hostname_allow_on_linux_is_invalid_plan_writes_no_record_and_never_boots(
     assert!(
         backend.killed().is_empty(),
         "a refused hostname entry must not touch the backend"
+    );
+    Ok(())
+}
+
+/// A proxy-mode plan (`SANDY_EGRESS=proxy`, #360) behind hostname entries, which
+/// the nftables plan refuses on Linux (#359).
+fn proxy_plan() -> JobPlan {
+    JobPlan {
+        digests: false,
+        allow: AllowList {
+            rules: vec![
+                EgressRule {
+                    host: "github.com".to_string(),
+                    port: 443,
+                },
+                EgressRule {
+                    host: "localhost".to_string(),
+                    port: 8080,
+                },
+            ],
+        },
+        egress_proxy: true,
+        ..booting_plan()
+    }
+}
+
+/// #360: on Linux a bound `$SANDY_TAP` with `SANDY_EGRESS=proxy` would put two
+/// boundary models on one guest, so it is an invalid plan (band 2): no journal
+/// record, no boot, no ruleset.
+#[test]
+fn run_proxy_mode_with_a_bound_tap_on_linux_is_invalid_plan_writes_no_record_and_never_boots() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    // A success is scripted on purpose: a boot would make the band 0.
+    let backend = FakeBackend::new().with_outcome(ok_outcome(0));
+    let applier = FakeApplier::new();
+
+    let report = run_job(
+        &backend,
+        &journal,
+        &proxy_plan(),
+        &applier,
+        EgressOs::Linux,
+        Some("sandytap0"),
+        &[],
+    )
+    .context("run_job (proxy mode with a tap, linux)")?;
+
+    assert_eq!(report.process_exit.code(), 2, "proxy mode with a tap is band 2");
+    assert!(!report.envelope.retryable, "band 2 is never retryable");
+    assert!(
+        report.envelope.message.contains("SANDY_TAP"),
+        "the error must name the conflicting variable: {}",
+        report.envelope.message
+    );
+    assert!(
+        journal.list().context("list after refused proxy plan")?.is_empty(),
+        "a refused plan must write no job record"
+    );
+    assert!(
+        backend.run_egress().is_empty(),
+        "a refused plan must never reach the backend"
+    );
+    assert!(
+        applier.applied_rulesets().is_empty(),
+        "a refused plan applies no ruleset"
+    );
+    Ok(())
+}
+
+/// #360: in proxy mode the backend receives the allow-list in `RunSpec`, the
+/// applier sees no apply and no revert, and hostname entries pass plan
+/// validation (#359's refusal is scoped to the nftables plan).
+#[test]
+fn run_proxy_mode_hands_the_allow_list_to_the_backend_and_applies_no_ruleset() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    let backend = FakeBackend::new().with_outcome(ok_outcome(0));
+    let applier = FakeApplier::new();
+    let plan = proxy_plan();
+
+    let report = run_job(&backend, &journal, &plan, &applier, EgressOs::Linux, None, &[])
+        .context("run_job (proxy mode, linux, no tap)")?;
+
+    assert_eq!(
+        report.process_exit.code(),
+        0,
+        "hostname entries are valid in proxy mode: {}",
+        report.envelope.message
+    );
+    assert_eq!(
+        backend.run_egress(),
+        vec![Some(plan.allow.clone())],
+        "the backend must receive exactly the plan's allow-list"
+    );
+    assert!(
+        applier.applied_rulesets().is_empty(),
+        "proxy mode applies no nftables ruleset"
+    );
+    assert!(!applier.was_reverted(), "proxy mode reverts nothing");
+    assert!(
+        report.envelope.warnings.is_empty(),
+        "the no-NIC `--allow has no effect` warning would be false in proxy mode: {:?}",
+        report.envelope.warnings
+    );
+    let egress = report.envelope.receipt.context("receipt")?.host_observed.egress;
+    assert_eq!(egress.status, EgressEnforcement::Enforced);
+    assert_eq!(egress.allow_list.as_ref(), Some(&plan.allow));
+    Ok(())
+}
+
+/// A plan with no proxy mode hands the backend no policy: the nftables path is unchanged.
+#[test]
+fn run_without_proxy_mode_hands_the_backend_no_policy() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    let backend = FakeBackend::new().with_outcome(ok_outcome(0));
+
+    run_job(
+        &backend,
+        &journal,
+        &allowing_plan(),
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        Some("sandytap0"),
+        &[],
+    )
+    .context("run_job (nftables path)")?;
+
+    assert_eq!(backend.run_egress(), vec![None]);
+    Ok(())
+}
+
+/// #360: the receipt records the proxy as enforcing only if the run reached it. A
+/// backend that refuses the policy before boot (`Spawn`) left it unapplied, and the
+/// receipt says so, with the reason and no allow-list.
+#[test]
+fn receipt_reports_a_proxy_refused_before_boot_as_unenforced() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    let backend = FakeBackend::new().with_error(BackendError::Spawn(
+        "the vfkit backend does not support the egress proxy yet".to_string(),
+    ));
+
+    let report = run_job(
+        &backend,
+        &journal,
+        &proxy_plan(),
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        None,
+        &[],
+    )
+    .context("run_job (proxy refused before boot)")?;
+
+    assert_eq!(report.process_exit.code(), 3, "a refusal before boot is an infra fault");
+    let egress = report.envelope.receipt.context("receipt")?.host_observed.egress;
+    assert_eq!(egress.status, EgressEnforcement::Unenforced);
+    assert!(
+        egress.allow_list.is_none(),
+        "an allow-list that was never applied must not be recorded"
+    );
+    let reason = egress.reason.context("an unenforced receipt names why")?;
+    assert!(reason.contains("does not support the egress proxy"), "{reason}");
+    Ok(())
+}
+
+/// #360: a guest that never booted ran behind no proxy, so its receipt is not `enforced` either.
+#[test]
+fn receipt_reports_a_proxy_run_that_never_booted_as_unenforced() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    let backend = FakeBackend::new().with_outcome(Outcome {
+        digests: None,
+        booted: false,
+        guest_exit: None,
+        transport_error: None,
+        timed_out: false,
+        console: String::new(),
+    });
+
+    let report = run_job(
+        &backend,
+        &journal,
+        &proxy_plan(),
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        None,
+        &[],
+    )
+    .context("run_job (proxy, never booted)")?;
+
+    let egress = report.envelope.receipt.context("receipt")?.host_observed.egress;
+    assert_eq!(egress.status, EgressEnforcement::Unenforced);
+    assert!(egress.allow_list.is_none());
+    Ok(())
+}
+
+/// #360: a proxy found dead before the guest booted served no run, so its receipt is not
+/// `enforced` either: `guest_exit: None` alone could not tell this from a mid-run death.
+#[test]
+fn receipt_reports_a_proxy_that_died_before_the_guest_booted_as_unenforced() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    let backend = FakeBackend::new().with_error(BackendError::EgressProxyDied {
+        status: Some(1),
+        booted: false,
+        guest_exit: None,
+    });
+
+    let report = run_job(
+        &backend,
+        &journal,
+        &proxy_plan(),
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        None,
+        &[],
+    )
+    .context("run_job (proxy died before boot)")?;
+
+    assert_eq!(report.process_exit.code(), 3, "a dead proxy is an infra fault");
+    let egress = report.envelope.receipt.context("receipt")?.host_observed.egress;
+    assert_eq!(egress.status, EgressEnforcement::Unenforced);
+    assert!(egress.allow_list.is_none());
+    Ok(())
+}
+
+/// #360: a proxy that died after it served the run stays recorded as enforced: the
+/// boundary held, and the death is its own band-3 fault.
+#[test]
+fn receipt_keeps_a_proxy_that_died_mid_run_as_enforced() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    let backend = FakeBackend::new().with_error(BackendError::EgressProxyDied {
+        status: Some(2),
+        booted: true,
+        guest_exit: Some(0),
+    });
+    let plan = proxy_plan();
+
+    let report = run_job(
+        &backend,
+        &journal,
+        &plan,
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        None,
+        &[],
+    )
+    .context("run_job (proxy died)")?;
+
+    let egress = report.envelope.receipt.context("receipt")?.host_observed.egress;
+    assert_eq!(egress.status, EgressEnforcement::Enforced);
+    assert_eq!(egress.allow_list.as_ref(), Some(&plan.allow));
+    Ok(())
+}
+
+/// #360: a proxy that died mid-run makes the run band 3 and retryable even though
+/// the guest exited 0, and the envelope names both exits.
+#[test]
+fn run_a_dead_egress_proxy_is_band_three_whatever_the_guest_exit() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    let backend = FakeBackend::new().with_error(BackendError::EgressProxyDied {
+        status: Some(2),
+        booted: true,
+        guest_exit: Some(0),
+    });
+
+    let report = run_job(
+        &backend,
+        &journal,
+        &proxy_plan(),
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        None,
+        &[],
+    )
+    .context("run_job (proxy died)")?;
+
+    assert_eq!(report.process_exit.code(), 3, "a dead proxy is an infra fault");
+    assert!(report.envelope.retryable);
+    assert_ne!(report.envelope.status, Status::Succeeded);
+    assert!(
+        report.envelope.message.contains("exit status 2") && report.envelope.message.contains("guest exit 0"),
+        "the envelope must name the proxy status and the guest exit: {}",
+        report.envelope.message
     );
     Ok(())
 }
@@ -911,6 +1413,7 @@ fn mint_run_token_stages_a_secret_and_the_token_travels_only_the_secret_channel(
 
     // Thread the secret into a run and prove it still succeeds over the secret channel.
     let plan = JobPlan {
+        digests: false,
         secrets: vec![lease.secret_ref],
         ..booting_plan()
     };
@@ -1091,6 +1594,7 @@ fn credentialed_run_redacts_the_token_from_the_console() -> anyhow::Result<()> {
     let token = "ghs_super_secret_marker_value";
     let provider = FakeProvider::returning(token);
     let backend = FakeBackend::new().with_outcome(Outcome {
+        digests: None,
         booted: true,
         guest_exit: Some(0),
         transport_error: None,
@@ -1479,6 +1983,7 @@ fn no_token_or_secret_bytes_anywhere_in_the_serialized_envelope() -> anyhow::Res
     // already does), so this test's marker is genuinely "in flight" during the
     // run, not merely absent because nothing ever touched it.
     let backend = FakeBackend::new().with_outcome(Outcome {
+        digests: None,
         booted: true,
         guest_exit: Some(0),
         transport_error: None,

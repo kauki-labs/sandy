@@ -51,6 +51,7 @@ fn succeeded_envelope(job_id: &str) -> ResultEnvelope {
 
 fn exit_zero() -> Outcome {
     Outcome {
+        digests: None,
         booted: true,
         guest_exit: Some(0),
         transport_error: None,

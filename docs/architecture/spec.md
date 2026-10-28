@@ -452,6 +452,13 @@ flowchart TD
 - **Locked envelope.** `status` / `retryable` / `exit_code` are authoritative and
   cross-checked (INV-11): band 3 (infra) is the only retryable band; an invalid
   plan is band 2 with no journal record and no boot (the silent-run guard).
+- **A dead egress proxy is band 3 (#360).** A backend that finds the run's egress
+  proxy exited before it killed it returns `BackendError::EgressProxyDied { status,
+booted, guest_exit }`. It is band 3 and retryable whatever the guest exit, so a guest that
+  exited 0 without its network never reads as `succeeded`; the envelope message
+  names the proxy's exit status and the guest exit. A backend with no proxy support
+  refuses a `RunSpec` that carries an egress policy before boot (band 3, no boot).
+  Design: [`../decisions/egress-proxy.md`](../decisions/egress-proxy.md) decision 3.
 - **Outputs populated.** After a successful run the supervisor lists each declared
   output's collected files as `OutputRef`s (`<name>/<rel>` named, `<rel>`
   catch-all), independent of the host dest. Provenance (`Provenance.template_store_path`)
@@ -461,7 +468,7 @@ flowchart TD
 - **Non-fatal faults surface as `warnings`.** A fault that must not fail an
   otherwise-successful run (e.g. a credential revoke failing at teardown, L-12)
   is named in `warnings: Vec<String>`. The field was introduced in schema `2`;
-  the current envelope is schema `3` (below), and old records still deserialize
+  the current envelope is schema `4` (below), and old records still deserialize
   (`#[serde(default)]`) — never just a log line.
 - **Envelope receipts v1 (#361).** `ResultEnvelope.receipt: Option<AuditReceipt>`
   (schema `3`, `None` on a pre-`3` record) is audit lineage split by who
@@ -493,8 +500,18 @@ flowchart TD
     today since no backend reports that moment, and teardown).
   - `guest_reported` (a hostile guest can shape these): the exit code
     (mirroring `ResultEnvelope.exit_code`) and collected output names/sizes.
-  - Out of v1, tracked: content digests (#373), signing (#374), filling
-    `egress.attempts` from the #360 proxy (#375).
+  - Content digests (#373, schema `4`, opt-in via `sandy run --digests`): the
+    backend hashes each staged input (`host_observed.input_digests`, computed on
+    the staged copy before boot) and each collected output
+    (`guest_reported.outputs[].sha256`, hashed in the same pass as the copy),
+    one sha256 per regular file at its logical path. A symlink or special file
+    is recorded as skipped (`guest_reported.skipped_outputs`, reason `symlink` or
+    `non_regular`), not omitted. Off, no digest key is serialized and nothing is
+    hashed. The collection ceiling stays a hard error, so no entry is dropped
+    under it. The staging dirs are wiped at teardown, so the backend reports the
+    digests through `Outcome.digests`.
+  - Out of v1, tracked: signing (#374), filling `egress.attempts` from the #360
+    proxy (#375).
 
 **KPI.**
 
@@ -503,7 +520,12 @@ flowchart TD
   (`an_old_schema_v1_record_with_no_warnings_key_deserializes_to_empty`,
   `an_old_schema_v2_record_with_no_receipt_key_deserializes_to_none`) and
   `envelope_wire_keys_are_snake_case` (asserts the receipt's nested `where`
-  wire key, never `location`);
+  wire key, never `location`) and the digest regressions
+  (`an_old_schema_v3_receipt_with_no_digest_keys_deserializes_to_none`,
+  `a_receipt_without_digests_serializes_no_digest_keys`,
+  `digests_on_hashes_each_collected_file_by_logical_path`,
+  `digests_the_staged_copy_with_known_vectors`,
+  `run_places_reported_digests_in_the_right_receipt_sections`);
   `cli_jobs` band tests (`run_positive`, `run_guest_failure`, `run_timeout`,
   `run_infra_fault`, `run_invalid_plan`) and
   `run_lists_collected_outputs_in_the_envelope`;
@@ -520,6 +542,13 @@ flowchart TD
 - End-to-end: every live test asserts the envelope `status`/`exit_code`; `live_e2e.rs`
   asserts `envelope.outputs` and no secret leak in `logs.tail`. The receipt is not
   yet asserted on a real boot (`kpi.md`'s "Not yet a KPI").
+- **Signing receipts relayed from remote executors (decision 6, #374).**
+  Design-only (`docs/decisions/result-classification.md` decision 6): a
+  per-executor Ed25519 signature plus a `sandyd` countersignature, answering
+  #374's key/format/countersign questions with an adversarial pass.
+  Implementation is `#472`, blocked by `#413` (no relay path exists to sign
+  until a dispatched job's receipt is persisted at all). Stays out of
+  `kpi.md`'s live matrix until #472 lands and is asserted on a real boot.
 
 ---
 

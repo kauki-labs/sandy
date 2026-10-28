@@ -44,7 +44,9 @@ version, metadata, dependency versions, and lints through the root `Cargo.toml`
   process backend launches it with its agent link on stdin (in a VM guest it takes
   the host's connection on a vsock listener, #238), it joins through the
   orchestrator-side relay (`sandy-fabric-local::link`), and runs the job as its
-  child. See `docs/decisions/agent-fabric.md` §10.
+  child. See `docs/decisions/agent-fabric.md` §10. Its `egress-relay` mode (#402)
+  wraps the job in the guest-side egress relay: a loopback listener that forwards
+  to the host egress proxy over vsock (`docs/decisions/egress-proxy.md` decision 1).
 - **`sandy-fabric-compose`** (`impls/fabric-compose`) — the agent-fabric's
   composition root: the all-local MVP profile and its e2e acceptance (#115).
   No production `AllLocalProfile` yet; today the crate holds the composition
@@ -76,7 +78,7 @@ version, metadata, dependency versions, and lints through the root `Cargo.toml`
   test (mesh env vars, and why `SANDY_AGENT_PATH` must be a Nix store path).
 - **`sandy-egress-proxy`** — the per-run host egress proxy for NIC-less guests
   (#401, epic #360): a pure CONNECT-parse / allow-list / address-filter core and an
-  unprivileged binary. Not yet wired to a backend. See
+  unprivileged binary. `QemuBackend` (#404) and `VfkitBackend` (#405) run one per launch, not yet live-verified. See
   `docs/decisions/egress-proxy.md`.
 
 ## Build & test (run before committing)

@@ -53,6 +53,7 @@ fn expect_ok<T, E: Display>(seam: &'static str, call: &str, res: Result<T, E>) -
 /// secrets.
 fn run_spec<'a>(template: &'a str, command: &'a [String], grants: &'a Grants, control: &'a RunControl) -> RunSpec<'a> {
     RunSpec {
+        digests: false,
         template,
         command,
         inputs: &[],
@@ -66,6 +67,7 @@ fn run_spec<'a>(template: &'a str, command: &'a [String], grants: &'a Grants, co
         outcome_file: None,
         secret_dir: None,
         control,
+        egress: None,
     }
 }
 
@@ -234,6 +236,7 @@ mod tests {
     impl VmBackend for TrivialBackend {
         fn run(&self, _spec: &RunSpec) -> Result<Outcome, BackendError> {
             Ok(Outcome {
+                digests: None,
                 booted: true,
                 guest_exit: Some(0),
                 transport_error: None,
@@ -268,6 +271,7 @@ mod tests {
         fn run(&self, _spec: &RunSpec) -> Result<Outcome, BackendError> {
             self.ran.set(true);
             Ok(Outcome {
+                digests: None,
                 booted: true,
                 guest_exit: Some(0),
                 transport_error: None,

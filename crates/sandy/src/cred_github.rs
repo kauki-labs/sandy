@@ -26,6 +26,7 @@ use std::{
 
 use octocrab::{Octocrab, models::AppId};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::cred::{
     CredError, CredentialHandle, CredentialProvider, Lease, MAX_TTL_SECS, Minted, Scope, TrustRoot, read_secret_0600,
@@ -93,7 +94,7 @@ struct CreateTokenBody {
 /// scope: the scope to re-mint from, and the token to authenticate a revoke.
 struct MintRecord {
     scope: Scope,
-    token: String,
+    token: Zeroizing<String>,
 }
 
 /// A live [`CredentialProvider`] backed by a GitHub App installation.
@@ -101,7 +102,7 @@ pub struct GithubAdapter {
     app_id: u64,
     installation_id: u64,
     api_base: String,
-    key_pem: Vec<u8>,
+    key_pem: Zeroizing<Vec<u8>>,
     runtime: tokio::runtime::Runtime,
     mints: Mutex<HashMap<String, MintRecord>>,
     /// Wall-clock deadline for one adapter call (see [`CALL_DEADLINE`]). A
@@ -250,7 +251,7 @@ impl GithubAdapter {
             id.clone(),
             MintRecord {
                 scope: scope.clone(),
-                token: token.clone(),
+                token: Zeroizing::new(token.clone()),
             },
         );
         Minted::new(token, SystemTime::now() + GITHUB_TOKEN_TTL, CredentialHandle { id })
@@ -287,7 +288,7 @@ impl CredentialProvider for GithubAdapter {
             async {
                 let client = Octocrab::builder()
                     .build()
-                    .and_then(|c| c.user_access_token(record.token))
+                    .and_then(|c| c.user_access_token(String::clone(&record.token)))
                     .map_err(|e| CredError::Revoke(format!("build token client: {e}")))?;
                 let response = client
                     ._delete(uri, None::<&()>)
@@ -352,6 +353,20 @@ fn permissions_from_json(value: &serde_json::Value) -> HashMap<String, String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// #388: the App private key and every retained token sit in types that zero
+    /// them on drop. The annotations are the contract: they stop compiling if a
+    /// field goes back to a plain `Vec<u8>` or `String`.
+    #[test]
+    fn the_app_key_and_retained_tokens_are_zeroed_on_drop() {
+        fn key(adapter: &GithubAdapter) -> &Zeroizing<Vec<u8>> {
+            &adapter.key_pem
+        }
+        fn token(record: &MintRecord) -> &Zeroizing<String> {
+            &record.token
+        }
+        let _ = (key, token);
+    }
     use std::path::PathBuf;
 
     use anyhow::Context;
@@ -412,7 +427,7 @@ mod tests {
             app_id: 1,
             installation_id: 1,
             api_base: format!("http://127.0.0.1:{port}"),
-            key_pem: Vec::new(),
+            key_pem: Zeroizing::new(Vec::new()),
             runtime,
             mints: Mutex::new(HashMap::new()),
             call_deadline: short_deadline,
@@ -421,7 +436,7 @@ mod tests {
             "handle-1".to_string(),
             MintRecord {
                 scope: Scope::default(),
-                token: "stale-token".to_string(),
+                token: Zeroizing::new("stale-token".to_string()),
             },
         );
         let lease = Lease {

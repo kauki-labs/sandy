@@ -16,7 +16,12 @@ use crate::{cred::Scope, egress::AllowList};
 /// Bumped to `3` for the audit receipt (#361): `receipt` is a new
 /// `Option<Receipt>` field, `None` on a pre-`3` record (`#[serde(default)]`),
 /// matching the `2`/`warnings` precedent (L-12).
-pub const RESULT_SCHEMA_VERSION: u32 = 3;
+///
+/// Bumped to `4` for the opt-in content digests (#373): `host_observed.input_digests`,
+/// `guest_reported.outputs[].sha256`, and `guest_reported.skipped_outputs` are new
+/// optional fields, absent from the JSON unless `sandy run --digests` was given and
+/// `#[serde(default)]` on a pre-`4` record.
+pub const RESULT_SCHEMA_VERSION: u32 = 4;
 
 /// Terminal status of a job on the wire. The lowercase values are part of the
 /// LOCKED schema; `rename_all` selects them without renaming any field key.
@@ -242,6 +247,61 @@ pub struct OutputSizeRef {
     pub path: String,
     /// Size in bytes on the host after collection.
     pub size_bytes: u64,
+    /// Lowercase-hex sha256 of the collected file's bytes (#373). `None` unless
+    /// `sandy run --digests` was given, or when no digest was recorded for this
+    /// path (e.g. a file already present at the destination that this run did
+    /// not collect). Guest-reported: a hostile guest chose the content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+}
+
+/// Lowercase-hex sha256 of one regular file (#373).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileDigest {
+    /// Logical path, same convention as [`OutputRef::path`]: `<name>/<relpath>`
+    /// for a named input or output, `<relpath>` for a catch-all output.
+    pub path: String,
+    /// Lowercase-hex sha256 of the file's bytes.
+    pub sha256: String,
+}
+
+/// Why an entry has no digest (#373): recorded instead of silently omitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipReason {
+    /// A symlink: never followed or copied (host-escape guard).
+    Symlink,
+    /// Neither a regular file, directory, nor symlink (fifo, socket, device).
+    NonRegular,
+}
+
+/// An entry the run saw but did not digest (#373).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedEntry {
+    /// Logical path, same convention as [`FileDigest::path`].
+    pub path: String,
+    /// Why it was skipped.
+    pub reason: SkipReason,
+}
+
+/// The digests of one side of a run (its inputs or its outputs), sorted by path
+/// (#373).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentDigests {
+    /// One sha256 per regular file.
+    pub files: Vec<FileDigest>,
+    /// Entries skipped rather than digested; empty on a plain tree.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<SkippedEntry>,
+}
+
+impl ContentDigests {
+    /// Sort both lists by path so a report is deterministic whatever order the
+    /// directory walk returned entries in.
+    pub fn sort(&mut self) {
+        self.files.sort_by(|a, b| a.path.cmp(&b.path));
+        self.skipped.sort_by(|a, b| a.path.cmp(&b.path));
+    }
 }
 
 /// Values a hostile guest could shape (#361, `docs/architecture/spec.md`'s
@@ -253,6 +313,10 @@ pub struct GuestReported {
     pub exit_code: Option<i32>,
     /// Collected output names and sizes.
     pub outputs: Vec<OutputSizeRef>,
+    /// Output entries collection skipped rather than copied (symlinks, special
+    /// files), recorded only with `--digests` (#373). Empty otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_outputs: Vec<SkippedEntry>,
 }
 
 /// Facts the host supervisor or executor recorded directly; the guest cannot
@@ -272,6 +336,10 @@ pub struct HostObserved {
     pub egress: EgressReceipt,
     /// Lifecycle timestamps.
     pub timing: Timing,
+    /// sha256 of each input, computed on the staged host copy before boot (#373).
+    /// `None` unless `sandy run --digests` was given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_digests: Option<ContentDigests>,
 }
 
 /// The envelope receipt v1 (#361): audit lineage split by who observed each

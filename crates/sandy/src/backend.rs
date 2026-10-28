@@ -49,6 +49,7 @@ mod tests {
     #[test]
     fn outcome_wire_fields_are_snake_case() -> anyhow::Result<()> {
         let outcome = Outcome {
+            digests: None,
             booted: true,
             guest_exit: Some(0),
             transport_error: None,
@@ -80,6 +81,8 @@ mod tests {
         let command = ["true".to_string()];
         let control = RunControl::with_timeout_secs(60);
         let spec = RunSpec {
+            digests: false,
+            egress: None,
             template: "demo",
             command: &command,
             inputs: &[],

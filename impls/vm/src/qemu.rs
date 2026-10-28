@@ -27,8 +27,9 @@ use std::{
 };
 
 use sandy::{
-    BackendError, BoxState, Hypervisor, Outcome, RunSpec, ShareDirs, StoreBacking, Topology, VmBackend,
+    BackendError, BoxState, Hypervisor, Outcome, RunSpec, ShareDirs, SharePlan, StoreBacking, Topology, VmBackend,
     collect_outputs, ensure_sandy_staging_base, kill_children, plan_shares, topology as eval_topology, wipe,
+    with_digests,
 };
 use sandy_api::{
     agent::{AGENT_VSOCK_PORT, AgentLaunch},
@@ -37,8 +38,9 @@ use sandy_api::{
 use uuid::Uuid;
 
 use crate::{
-    agent::{agent_command_argv, agent_outcome},
+    agent::agent_outcome,
     console::{Markers, PipeTransport, run_console},
+    egress_proxy::{EgressLaunch, ProxyHandle, console_command},
     share::VirtiofsdTransport,
 };
 
@@ -83,8 +85,9 @@ pub struct StagedArgs {
     /// around it) is the host/operator's to set up — the assembler only wires the
     /// guest onto it.
     pub tap: Option<String>,
-    /// Agent mode (#238): the vsock CID this launch claims for the guest, so the
-    /// host can connect to the guest agent. Overrides [`Topology::vsock_cid`].
+    /// Agent mode (#238) or egress-proxy mode (#404): the vsock CID this launch claims
+    /// for the guest, so the host can connect to the guest agent and the proxy can
+    /// serve it. Overrides [`Topology::vsock_cid`].
     pub agent_cid: Option<u32>,
 }
 
@@ -109,7 +112,8 @@ pub struct StagedArgs {
 ///   The matching `virtiofsd` daemons are launched by [`QemuBackend::boot`] (new run dependency: `virtiofsd` on PATH).
 /// - a `-netdev tap,…,ifname=<tap> -device virtio-net-pci,…` NIC pair when `staged.tap` is set (so the guest has egress
 ///   to filter, #29); nothing when it is `None` (the default isolated boot).
-/// - `-device vhost-vsock-pci,guest-cid=<cid>` when `topology.vsock_cid` is set.
+/// - `-device vhost-vsock-pci,guest-cid=<cid>` when `topology.vsock_cid` is set. A run with an egress policy
+///   ([`RunSpec::egress`]) needs that CID, and no NIC: it is refused with a tap or without a CID.
 ///
 /// # Errors
 ///
@@ -124,6 +128,21 @@ pub fn qemu_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> Re
             "qemu backend refuses a {:?} topology (qemu-only)",
             topology.hypervisor
         )));
+    }
+
+    // Proxy mode (#404): the guest's only egress is its vsock to the host proxy, so it has no
+    // NIC, and it needs a CID to be served on.
+    if spec.egress.is_some() {
+        if staged.tap.is_some() {
+            return Err(BackendError::Spawn(format!(
+                "the egress proxy and ${TAP_ENV} are exclusive: the proxy guest has no NIC"
+            )));
+        }
+        if staged.agent_cid.or(topology.vsock_cid).is_none() {
+            return Err(BackendError::Spawn(
+                "the egress proxy needs the guest to claim a vsock CID, and none was set".to_string(),
+            ));
+        }
     }
 
     let mut args = vec![qemu_system_binary(&topology.kernel)];
@@ -305,6 +324,7 @@ impl QemuBackend {
     /// is a [`BackendError::Spawn`]; a connect/transport/timeout fault during the
     /// run lands in the returned [`Outcome`] (never a fabricated `guest_exit`,
     /// INV-OUTCOME).
+    #[allow(clippy::too_many_arguments, reason = "one launch attempt's inputs, all distinct")]
     fn boot(
         &self,
         spec: &RunSpec,
@@ -313,15 +333,49 @@ impl QemuBackend {
         run_id: Uuid,
         inst_dir: &Path,
         agent: Option<(&Path, u32)>,
+        egress: Option<&EgressLaunch<'_>>,
     ) -> Result<Outcome, BackendError> {
         sandy_fsutil::OwnedDir::open_or_create(inst_dir)
             .map_err(|err| BackendError::Spawn(format!("create instance dir {}: {err}", inst_dir.display())))?;
-        let sock = inst_dir.join("serial.sock");
 
         // Launch a virtiofsd per share and wait for its socket before qemu starts:
         // qemu connects to each as a client chardev, so the socket must exist first.
         // A launch or socket fault kills any daemon already up and fails the boot.
-        let mut virtiofsds = VirtiofsdTransport.activate(shares)?;
+        let virtiofsds = VirtiofsdTransport.activate(shares)?;
+        self.launch(spec, args, run_id, inst_dir, agent, egress, virtiofsds)
+    }
+
+    /// Start the egress proxy (when `egress` is set) beside the already-running
+    /// `virtiofsds`, spawn qemu, drive the console, and tear everything down in
+    /// order: proxy, qemu, virtiofsd daemons.
+    ///
+    /// The proxy is health-checked with `try_wait` BEFORE it is killed. One that died
+    /// first is an [`BackendError::EgressProxyDied`], which takes precedence over the
+    /// guest's own result: the guest lost its network, so its result is not what the
+    /// submitter asked for.
+    #[allow(clippy::too_many_arguments, reason = "one launch attempt's inputs, all distinct")]
+    fn launch(
+        &self,
+        spec: &RunSpec,
+        args: &[String],
+        run_id: Uuid,
+        inst_dir: &Path,
+        agent: Option<(&Path, u32)>,
+        egress: Option<&EgressLaunch<'_>>,
+        mut virtiofsds: Vec<std::process::Child>,
+    ) -> Result<Outcome, BackendError> {
+        let sock = inst_dir.join("serial.sock");
+
+        // The proxy belongs to this attempt. A start failure kills the daemons
+        // already up and returns before qemu launches. `ProxyHandle` kills on drop,
+        // so every later exit path stops it too.
+        let mut proxy: Option<ProxyHandle> = match egress.map(EgressLaunch::start).transpose() {
+            Ok(proxy) => proxy,
+            Err(err) => {
+                kill_children(&mut virtiofsds);
+                return Err(err);
+            }
+        };
 
         // qemu_args emits `-serial chardev:<id>`; bind that id to a Unix-socket
         // chardev qemu creates (server=on, wait=off so the spawn doesn't block).
@@ -364,19 +418,17 @@ impl QemuBackend {
 
         // Agent mode: the console launches the image's agent around the job, and a
         // connector thread dials it over vsock while the console drives the run.
-        let agent_command;
-        let agent_spec;
-        let console_spec = match agent {
-            Some((program, _)) => {
-                agent_command = agent_command_argv(program, AGENT_VSOCK_PORT, spec.command);
-                agent_spec = RunSpec {
-                    command: &agent_command,
-                    ..*spec
-                };
-                &agent_spec
-            }
-            None => spec,
+        let console_command = console_command(
+            spec.command,
+            agent.map(|(program, _)| program),
+            egress.zip(proxy.as_ref()).map(|(e, p)| (e.relay_program, p.port())),
+        );
+        let console_spec = RunSpec {
+            digests: false,
+            command: &console_command,
+            ..*spec
         };
+        let console_spec = &console_spec;
         let stop = Arc::new(AtomicBool::new(false));
         let connector = self.agent.as_ref().zip(agent).and_then(|(launch, (_, cid))| {
             spawn_vsock_connector(
@@ -395,8 +447,11 @@ impl QemuBackend {
         stop.store(true, Ordering::SeqCst);
         let verdict = connector.map(|(verdict, thread)| (verdict, thread.join().unwrap_or(false)));
 
-        // Teardown: stop qemu, then the virtiofsd daemons, and deregister. Best-effort
-        // kills — qemu may already have exited (e.g. a guest `poweroff`).
+        // Teardown: check the proxy BEFORE killing it, then stop it, qemu, and the
+        // virtiofsd daemons, and deregister. Best-effort kills — qemu may already
+        // have exited (e.g. a guest `poweroff`).
+        let proxy_exit = proxy.as_mut().and_then(ProxyHandle::exited);
+        drop(proxy);
         let _ = child.kill();
         let _ = child.wait();
         kill_children(&mut virtiofsds);
@@ -412,11 +467,46 @@ impl QemuBackend {
                 outcome.console = format!("[qemu stderr]\n{tail}");
             }
         }
+        if let Some(status) = proxy_exit {
+            return Err(BackendError::EgressProxyDied {
+                status,
+                booted: outcome.booted,
+                guest_exit: outcome.guest_exit,
+            });
+        }
         match verdict {
             Some((verdict, linked)) => agent_outcome(outcome, &verdict, &spec.command.join(" "), linked),
             None => Ok(outcome),
         }
     }
+}
+
+/// [`plan_shares`], wiping the sandy-owned staging dirs if it fails.
+///
+/// It stages the secret first and the inputs after, so a late failure (a missing input, or with
+/// digests on a failed digest read) would leave the staged secret on disk: `run` returns on the
+/// error before its teardown loop (INV-1). A caller-owned `secret_dir` is not touched, it keeps its
+/// own lifecycle.
+fn plan_shares_or_wipe(spec: &RunSpec, dirs: &ShareDirs<'_>) -> Result<SharePlan, BackendError> {
+    plan_shares(spec, dirs).inspect_err(|_| {
+        for dir in [dirs.inst_dir, dirs.inputs_dir, dirs.outputs_dir] {
+            if let Err(err) = wipe(dir) {
+                tracing::warn!(dir = %dir.display(), %err, "failed to wipe staging after a staging error");
+            }
+        }
+    })
+}
+
+/// Refuse a policy-carrying spec off Linux: the proxy listens on `AF_VSOCK` (vhost-vsock).
+fn require_proxy_host(spec: &RunSpec, linux: bool) -> Result<(), BackendError> {
+    if spec.egress.is_some() && !linux {
+        return Err(BackendError::Spawn(
+            "the qemu egress proxy needs a Linux host: the guest reaches it over AF_VSOCK (vhost-vsock); refusing the \
+             run rather than booting without the egress boundary"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// A random vsock CID for one agent-mode launch, never a reserved value (0 the
@@ -499,6 +589,7 @@ fn drain_stderr(mut stderr: std::process::ChildStderr) -> std::thread::JoinHandl
 /// An infra transport fault as an [`Outcome`] (no fabricated exit, INV-OUTCOME).
 fn transport_outcome(err: &BackendError) -> Outcome {
     Outcome {
+        digests: None,
         booted: false,
         guest_exit: None,
         transport_error: Some(err.to_string()),
@@ -550,6 +641,7 @@ fn drive_console(spec: &RunSpec, run_id: Uuid, sock: &Path) -> Outcome {
 
 impl VmBackend for QemuBackend {
     fn run(&self, spec: &RunSpec) -> Result<Outcome, BackendError> {
+        require_proxy_host(spec, cfg!(target_os = "linux"))?;
         if self.agent.is_some() && self.agent_used.swap(true, Ordering::SeqCst) {
             return Err(BackendError::Spawn(
                 "this agent-mode backend already ran its one job; build one per sandbox run".to_string(),
@@ -572,6 +664,17 @@ impl VmBackend for QemuBackend {
             })?),
             None => None,
         };
+        // Proxy mode runs the relay in the guest, so the image must carry sandy-agent.
+        let relay_program: Option<&Path> = match spec.egress {
+            Some(_) => Some(topology.agent_program.as_deref().ok_or_else(|| {
+                BackendError::Spawn(
+                    "the egress proxy needs a topology that names its agent (agent_program) to run the relay; this \
+                     image carries no sandy-agent"
+                        .to_string(),
+                )
+            })?),
+            None => None,
+        };
         let run_id = Uuid::new_v4();
         let base = ensure_sandy_staging_base()?;
         let inst_dir = base.join(run_id.to_string());
@@ -582,7 +685,7 @@ impl VmBackend for QemuBackend {
         // flags, the #49 secret_dir rule). Each virtiofsd socket lives in inst_dir
         // (sandy-owned, created in `boot`); the read-only flag is enforced at the
         // virtiofsd boundary below.
-        let shares = plan_shares(
+        let SharePlan { shares, input_digests } = plan_shares_or_wipe(
             spec,
             &ShareDirs {
                 inst_dir: &inst_dir,
@@ -607,11 +710,18 @@ impl VmBackend for QemuBackend {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let agent = agent_program.as_deref().map(|program| (program, random_agent_cid()));
-            staged.agent_cid = agent.map(|(_, cid)| cid);
+            // Agent mode and proxy mode both need the guest to claim a CID.
+            let cid = (agent_program.is_some() || spec.egress.is_some()).then(random_agent_cid);
+            let agent = agent_program.as_deref().zip(cid);
+            let egress = spec
+                .egress
+                .zip(relay_program)
+                .zip(cid)
+                .map(|((policy, program), cid)| EgressLaunch::new(policy, cid, program));
+            staged.agent_cid = cid;
             outcome = qemu_args(&topology, spec, &staged)
-                .and_then(|args| self.boot(spec, &args, &staged.shares, run_id, &inst_dir, agent));
-            let collided = agent.is_some() && outcome.as_ref().is_ok_and(cid_in_use);
+                .and_then(|args| self.boot(spec, &args, &staged.shares, run_id, &inst_dir, agent, egress.as_ref()));
+            let collided = cid.is_some() && outcome.as_ref().is_ok_and(cid_in_use);
             if !collided {
                 break;
             }
@@ -628,9 +738,9 @@ impl VmBackend for QemuBackend {
         // (nothing was produced otherwise). A collection failure surfaces as an
         // infra fault rather than silently dropping the output.
         let collected = if outcome.as_ref().is_ok_and(|o| o.booted) {
-            collect_outputs(spec.outputs, &outputs_dir)
+            collect_outputs(spec.outputs, &outputs_dir, spec.digests)
         } else {
-            Ok(())
+            Ok(None)
         };
 
         // Teardown clears staging on every path so secret bytes never outlive
@@ -640,7 +750,7 @@ impl VmBackend for QemuBackend {
                 tracing::warn!(dir = %dir.display(), %err, "failed to wipe staging on teardown");
             }
         }
-        collected.and(outcome)
+        with_digests(outcome, input_digests, collected)
     }
 
     fn kill(&self, box_id: &str) -> Result<(), BackendError> {
@@ -667,7 +777,7 @@ fn kvm_available() -> bool {
 #[cfg(test)]
 mod tests {
     use anyhow::Context;
-    use sandy::{Grants, Hypervisor, SECRET_MOUNT_TAG, parse_topology};
+    use sandy::{Grants, Hypervisor, Input, SECRET_MOUNT_TAG, SecretRef, SecretSource, parse_topology};
 
     use super::*;
 
@@ -718,6 +828,8 @@ mod tests {
         let topology = parse_topology(X86_64_FIXTURE).context("parse x86_64 fixture")?;
         let command = ["true".to_string()];
         let spec = RunSpec {
+            digests: false,
+            egress: None,
             template: "demo",
             command: &command,
             inputs: &[],
@@ -787,6 +899,8 @@ mod tests {
             shares: false,
         };
         let spec = RunSpec {
+            digests: false,
+            egress: None,
             template: "demo",
             command: &command,
             inputs: &[],
@@ -827,6 +941,8 @@ mod tests {
         assert_eq!(topology.hypervisor, Hypervisor::Vfkit, "fixture is the vfkit topology");
         let command = ["true".to_string()];
         let spec = RunSpec {
+            digests: false,
+            egress: None,
             template: "demo",
             command: &command,
             inputs: &[],
@@ -852,8 +968,76 @@ mod tests {
         Ok(())
     }
 
+    /// #373 review: `plan_shares` stages the secret first and the inputs after, so a late failure
+    /// (here a missing input; with digests on, a failed digest read) leaves the staged secret on disk
+    /// unless the staging is wiped (INV-1). The control shows the plain call leaks; the helper must not.
+    #[test]
+    fn a_staging_failure_wipes_the_qemu_owned_staging_with_its_secret() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir()?;
+        let secret_src = tmp.path().join("secret-src");
+        std::fs::write(&secret_src, b"S")?;
+        std::fs::set_permissions(&secret_src, std::fs::Permissions::from_mode(0o600))?;
+        let secrets = [SecretRef {
+            name: "TOK".to_string(),
+            source: SecretSource::File(secret_src),
+        }];
+        let inputs = [Input {
+            host: tmp.path().join("no-such-input"),
+            name: "in".to_string(),
+            guest_path: None,
+        }];
+        let command = ["true".to_string()];
+        let spec = RunSpec {
+            secrets: &secrets,
+            inputs: &inputs,
+            ..demo_spec(&command)
+        };
+        let dirs_under = |name: &str| {
+            (
+                tmp.path().join(name),
+                tmp.path().join(format!("{name}-in")),
+                tmp.path().join(format!("{name}-out")),
+            )
+        };
+
+        // Control: the plain call fails after staging the secret and leaves it behind.
+        let (inst, inputs_dir, outputs_dir) = dirs_under("plain");
+        let plain = plan_shares(
+            &spec,
+            &ShareDirs {
+                inst_dir: &inst,
+                inputs_dir: &inputs_dir,
+                outputs_dir: &outputs_dir,
+            },
+        );
+        anyhow::ensure!(plain.is_err(), "a missing input must fail staging");
+        anyhow::ensure!(
+            inst.join("TOK").exists(),
+            "the control must leave the staged secret behind, or this test proves nothing"
+        );
+
+        // The helper fails the same way and leaves no staging behind.
+        let (inst, inputs_dir, outputs_dir) = dirs_under("wiped");
+        let wiped = plan_shares_or_wipe(
+            &spec,
+            &ShareDirs {
+                inst_dir: &inst,
+                inputs_dir: &inputs_dir,
+                outputs_dir: &outputs_dir,
+            },
+        );
+        anyhow::ensure!(wiped.is_err(), "the helper must return the staging error");
+        for dir in [&inst, &inputs_dir, &outputs_dir] {
+            anyhow::ensure!(!dir.exists(), "{} must be wiped after a staging error", dir.display());
+        }
+        Ok(())
+    }
+
     fn demo_spec<'a>(command: &'a [String]) -> RunSpec<'a> {
         RunSpec {
+            digests: false,
             template: "demo",
             command,
             inputs: &[],
@@ -867,7 +1051,226 @@ mod tests {
             outcome_file: None,
             secret_dir: None,
             control: test_control(),
+            egress: None,
         }
+    }
+
+    fn allow_all_github() -> sandy_api::egress::AllowList {
+        sandy_api::egress::AllowList {
+            rules: vec![sandy_api::egress::EgressRule {
+                host: "github.com".to_string(),
+                port: 443,
+            }],
+        }
+    }
+
+    /// #404: the proxy listens on AF_VSOCK, so a policy-carrying spec is refused off Linux, before
+    /// anything boots. A spec without a policy is never refused.
+    #[test]
+    fn a_policy_carrying_spec_is_refused_off_linux() -> anyhow::Result<()> {
+        let allow = allow_all_github();
+        let command = ["true".to_string()];
+        let spec = RunSpec {
+            digests: false,
+            egress: Some(&allow),
+            ..demo_spec(&command)
+        };
+        let refused = require_proxy_host(&spec, false);
+        let Err(BackendError::Spawn(message)) = refused else {
+            anyhow::bail!("expected a Spawn refusal, got {refused:?}");
+        };
+        anyhow::ensure!(message.contains("egress proxy"), "unexpected refusal: {message}");
+        anyhow::ensure!(require_proxy_host(&spec, true).is_ok(), "Linux must be accepted");
+        anyhow::ensure!(
+            require_proxy_host(&demo_spec(&command), false).is_ok(),
+            "no policy, no refusal"
+        );
+        Ok(())
+    }
+
+    /// #404: proxy mode claims a vsock CID and emits no NIC.
+    #[test]
+    fn qemu_args_in_proxy_mode_attach_the_cid_and_no_nic() -> anyhow::Result<()> {
+        let topology = parse_topology(X86_64_FIXTURE).context("parse x86_64 fixture")?;
+        let allow = allow_all_github();
+        let command = ["true".to_string()];
+        let spec = RunSpec {
+            egress: Some(&allow),
+            ..demo_spec(&command)
+        };
+        let staged = StagedArgs {
+            agent_cid: Some(1234),
+            ..StagedArgs::default()
+        };
+        let args = qemu_args(&topology, &spec, &staged)?;
+        let joined = args.join(" ");
+        let vsock: Vec<&String> = args.iter().filter(|a| a.starts_with("vhost-vsock-pci")).collect();
+        assert_eq!(vsock, vec!["vhost-vsock-pci,guest-cid=1234"], "{joined}");
+        assert!(!joined.contains("-netdev"), "{joined}");
+        assert!(!joined.contains("virtio-net"), "{joined}");
+        Ok(())
+    }
+
+    /// #404: proxy mode and `$SANDY_TAP` are exclusive, and the proxy needs a CID.
+    #[test]
+    fn qemu_args_refuse_proxy_mode_with_a_tap_or_without_a_cid() -> anyhow::Result<()> {
+        let mut topology = parse_topology(X86_64_FIXTURE).context("parse x86_64 fixture")?;
+        let allow = allow_all_github();
+        let command = ["true".to_string()];
+        let spec = RunSpec {
+            egress: Some(&allow),
+            ..demo_spec(&command)
+        };
+        let with_tap = StagedArgs {
+            agent_cid: Some(9),
+            tap: Some("tap0".to_string()),
+            ..StagedArgs::default()
+        };
+        let refused = qemu_args(&topology, &spec, &with_tap);
+        anyhow::ensure!(
+            matches!(&refused, Err(BackendError::Spawn(m)) if m.contains("exclusive")),
+            "tap: {refused:?}"
+        );
+        topology.vsock_cid = None;
+        let refused = qemu_args(&topology, &spec, &StagedArgs::default());
+        anyhow::ensure!(
+            matches!(&refused, Err(BackendError::Spawn(m)) if m.contains("vsock CID")),
+            "cid: {refused:?}"
+        );
+        Ok(())
+    }
+
+    /// A stub qemu that never opens the serial socket, so the console fails to connect within the
+    /// 1 s test budget. Writes a marker so a test can prove qemu was (not) spawned.
+    fn stub_qemu(dir: &Path, marker: &Path) -> anyhow::Result<PathBuf> {
+        crate::egress_proxy::tests::stub(
+            dir,
+            "qemu",
+            &format!("echo spawned > {}; exec sleep 30", marker.display()),
+        )
+    }
+
+    fn pid_alive(pid: u32) -> bool {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    fn quick_spec<'a>(command: &'a [String], allow: &'a sandy_api::egress::AllowList) -> RunSpec<'a> {
+        RunSpec {
+            timeout_secs: 1,
+            egress: Some(allow),
+            ..demo_spec(command)
+        }
+    }
+
+    /// #404: a proxy that never prints READY fails the launch before qemu spawns, and the
+    /// virtiofsd daemons already up are killed.
+    #[test]
+    fn a_proxy_that_never_becomes_ready_fails_before_qemu_and_kills_the_daemons() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let marker = dir.path().join("qemu-ran");
+        let qemu = stub_qemu(dir.path(), &marker)?;
+        let proxy_bin = crate::egress_proxy::tests::stub(dir.path(), "proxy", "cat >/dev/null; exec sleep 30")?;
+        let allow = allow_all_github();
+        let command = ["true".to_string()];
+        let spec = quick_spec(&command, &allow);
+        let program = PathBuf::from("/nix/store/a-sandy-agent/bin/sandy-agent");
+        let mut egress = EgressLaunch::new(&allow, 77, &program);
+        egress.bin = proxy_bin;
+        egress.ready_deadline = Duration::from_millis(300);
+        let daemon = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .context("spawn stand-in virtiofsd")?;
+        let daemon_pid = daemon.id();
+        let backend = QemuBackend::new();
+        let inst = dir.path().join("inst");
+        let args = vec![qemu.display().to_string()];
+        let result = backend.launch(&spec, &args, Uuid::new_v4(), &inst, None, Some(&egress), vec![daemon]);
+        let Err(BackendError::Spawn(message)) = result else {
+            anyhow::bail!("expected Spawn, got {result:?}");
+        };
+        anyhow::ensure!(message.starts_with("egress proxy did not start"), "{message}");
+        anyhow::ensure!(!marker.exists(), "qemu must not spawn after a proxy start failure");
+        anyhow::ensure!(!pid_alive(daemon_pid), "the virtiofsd daemon must be killed");
+        Ok(())
+    }
+
+    /// #404: a proxy that exits after READY makes the run an `EgressProxyDied`, whatever the guest
+    /// did, and no process outlives the run.
+    #[test]
+    fn a_proxy_that_exits_early_makes_the_run_egress_proxy_died() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let marker = dir.path().join("qemu-ran");
+        let qemu = stub_qemu(dir.path(), &marker)?;
+        let proxy_bin = crate::egress_proxy::tests::stub(dir.path(), "proxy", "cat >/dev/null; echo READY; exit 3")?;
+        let allow = allow_all_github();
+        let command = ["true".to_string()];
+        let spec = quick_spec(&command, &allow);
+        let program = PathBuf::from("/nix/store/a-sandy-agent/bin/sandy-agent");
+        let mut egress = EgressLaunch::new(&allow, 77, &program);
+        egress.bin = proxy_bin;
+        let daemon = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .context("spawn stand-in virtiofsd")?;
+        let daemon_pid = daemon.id();
+        let backend = QemuBackend::new();
+        let inst = dir.path().join("inst");
+        sandy_fsutil::OwnedDir::open_or_create(&inst).context("inst dir")?;
+        let args = vec![qemu.display().to_string()];
+        let result = backend.launch(&spec, &args, Uuid::new_v4(), &inst, None, Some(&egress), vec![daemon]);
+        anyhow::ensure!(
+            matches!(
+                result,
+                Err(BackendError::EgressProxyDied {
+                    status: Some(3),
+                    booted: false,
+                    guest_exit: None
+                })
+            ),
+            "expected EgressProxyDied, got {result:?}"
+        );
+        anyhow::ensure!(marker.exists(), "qemu did spawn in this scenario");
+        anyhow::ensure!(!pid_alive(daemon_pid), "the virtiofsd daemon must be killed");
+        Ok(())
+    }
+
+    /// #404: a healthy proxy is not read as dead, and the backend's own kill stops it.
+    #[test]
+    fn a_live_proxy_is_not_a_death_and_is_killed_at_teardown() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let marker = dir.path().join("qemu-ran");
+        let pidfile = dir.path().join("proxy-pid");
+        let qemu = stub_qemu(dir.path(), &marker)?;
+        let proxy_bin = crate::egress_proxy::tests::stub(
+            dir.path(),
+            "proxy",
+            &format!(
+                "echo $$ > {}; cat >/dev/null; echo READY; exec sleep 30",
+                pidfile.display()
+            ),
+        )?;
+        let allow = allow_all_github();
+        let command = ["true".to_string()];
+        let spec = quick_spec(&command, &allow);
+        let program = PathBuf::from("/nix/store/a-sandy-agent/bin/sandy-agent");
+        let mut egress = EgressLaunch::new(&allow, 77, &program);
+        egress.bin = proxy_bin;
+        let backend = QemuBackend::new();
+        let inst = dir.path().join("inst");
+        sandy_fsutil::OwnedDir::open_or_create(&inst).context("inst dir")?;
+        let args = vec![qemu.display().to_string()];
+        let outcome = backend
+            .launch(&spec, &args, Uuid::new_v4(), &inst, None, Some(&egress), Vec::new())
+            .context("a live proxy must not fail the run")?;
+        anyhow::ensure!(!outcome.booted, "the stub qemu never boots: {outcome:?}");
+        let pid: u32 = std::fs::read_to_string(&pidfile)?.trim().parse().context("proxy pid")?;
+        anyhow::ensure!(!pid_alive(pid), "the proxy must be killed at teardown");
+        Ok(())
     }
 
     /// #238: an agent-mode launch claims its CID on the vhost-vsock device, in
@@ -896,6 +1299,7 @@ mod tests {
 
     fn never_booted(console: &str) -> Outcome {
         Outcome {
+            digests: None,
             booted: false,
             guest_exit: None,
             transport_error: None,
@@ -926,6 +1330,8 @@ mod tests {
         let topology = parse_topology(X86_64_FIXTURE).context("parse x86_64 fixture")?;
         let command = ["true".to_string()];
         let spec = RunSpec {
+            digests: false,
+            egress: None,
             template: "demo",
             command: &command,
             inputs: &[],
@@ -967,6 +1373,8 @@ mod tests {
         let topology = parse_topology(X86_64_FIXTURE).context("parse x86_64 fixture")?;
         let command = ["true".to_string()];
         let spec = RunSpec {
+            digests: false,
+            egress: None,
             template: "demo",
             command: &command,
             inputs: &[],
@@ -1003,6 +1411,8 @@ mod tests {
         let backend = QemuBackend::new();
         let command = ["true".to_string()];
         let spec = RunSpec {
+            digests: false,
+            egress: None,
             template: "demo",
             command: &command,
             inputs: &[],
@@ -1042,6 +1452,8 @@ mod tests {
         let control = sandy::RunControl::with_timeout_secs(5);
         control.suspend_deadline();
         let spec = RunSpec {
+            digests: false,
+            egress: None,
             template: "demo",
             command: &command,
             inputs: &[],
@@ -1075,6 +1487,8 @@ mod tests {
         let command = ["sh".to_string(), "-c".to_string(), "sleep 60".to_string()];
         let control = sandy::RunControl::with_timeout_secs(120);
         let spec = RunSpec {
+            digests: false,
+            egress: None,
             template: "demo",
             command: &command,
             inputs: &[],

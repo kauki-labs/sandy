@@ -425,6 +425,8 @@ async fn inv1_holds_through_the_real_executor_dispatch_path() -> anyhow::Result<
         r#"echo "SECRET_DIGEST=$(sha256sum < "$SANDY_SECRETS_DIR/TOKEN" | cut -d' ' -f1)"; env"#.to_owned(),
     ];
     let spec = RunSpec {
+        digests: false,
+        egress: None,
         template: "contract",
         command: &command,
         inputs: &[],

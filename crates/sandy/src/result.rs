@@ -88,8 +88,10 @@ pub fn classify_invalid_plan(_error: &PlanError) -> Classification {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context;
+
     use super::*;
-    use crate::AllowList;
+    use crate::{AllowList, ContentDigests, FileDigest, SkipReason, SkippedEntry};
 
     fn sample_envelope() -> ResultEnvelope {
         ResultEnvelope {
@@ -150,13 +152,16 @@ mod tests {
                     job_started_at: None,
                     teardown_at: std::time::SystemTime::UNIX_EPOCH,
                 },
+                input_digests: None,
             },
             guest_reported: GuestReported {
                 exit_code: Some(0),
                 outputs: vec![OutputSizeRef {
                     path: "result.txt".to_string(),
                     size_bytes: 3,
+                    sha256: None,
                 }],
+                skipped_outputs: vec![],
             },
         }
     }
@@ -261,6 +266,71 @@ mod tests {
         Ok(())
     }
 
+    /// #373: a pre-`4` (schema `3`) receipt, with none of the digest keys, still
+    /// deserializes, every digest field defaulting to absent.
+    #[test]
+    fn an_old_schema_v3_receipt_with_no_digest_keys_deserializes_to_none() -> anyhow::Result<()> {
+        let mut v3 = serde_json::to_value(sample_envelope())?;
+        v3["result_schema_version"] = 3.into();
+        let receipt = v3["receipt"].as_object().context("receipt object")?;
+        assert!(receipt["host_observed"].get("input_digests").is_none());
+
+        let envelope: ResultEnvelope = serde_json::from_value(v3)?;
+
+        let receipt = envelope.receipt.context("receipt")?;
+        assert_eq!(receipt.host_observed.input_digests, None);
+        assert_eq!(receipt.guest_reported.outputs[0].sha256, None);
+        assert!(receipt.guest_reported.skipped_outputs.is_empty());
+        Ok(())
+    }
+
+    /// #373: with the flag off no digest key reaches the wire at all, at any
+    /// level of the receipt.
+    #[test]
+    fn a_receipt_without_digests_serializes_no_digest_keys() -> anyhow::Result<()> {
+        let json = serde_json::to_string(&sample_envelope())?;
+        for key in ["sha256", "input_digests", "skipped_outputs", "skipped"] {
+            assert!(!json.contains(key), "unexpected `{key}` in {json}");
+        }
+        Ok(())
+    }
+
+    /// #373: the digest wire shape, including the `snake_case` skip reasons.
+    #[test]
+    fn digest_wire_shape_is_locked() -> anyhow::Result<()> {
+        let mut receipt = sample_receipt();
+        receipt.host_observed.input_digests = Some(ContentDigests {
+            files: vec![FileDigest {
+                path: "in/a".to_string(),
+                sha256: "ab".to_string(),
+            }],
+            skipped: vec![],
+        });
+        receipt.guest_reported.outputs[0].sha256 = Some("cd".to_string());
+        receipt.guest_reported.skipped_outputs = vec![
+            SkippedEntry {
+                path: "o/l".to_string(),
+                reason: SkipReason::Symlink,
+            },
+            SkippedEntry {
+                path: "o/p".to_string(),
+                reason: SkipReason::NonRegular,
+            },
+        ];
+
+        let value = serde_json::to_value(&receipt)?;
+
+        assert_eq!(value["host_observed"]["input_digests"]["files"][0]["path"], "in/a");
+        assert_eq!(value["host_observed"]["input_digests"]["files"][0]["sha256"], "ab");
+        assert!(value["host_observed"]["input_digests"].get("skipped").is_none());
+        assert_eq!(value["guest_reported"]["outputs"][0]["sha256"], "cd");
+        assert_eq!(value["guest_reported"]["skipped_outputs"][0]["reason"], "symlink");
+        assert_eq!(value["guest_reported"]["skipped_outputs"][1]["reason"], "non_regular");
+        let back: AuditReceipt = serde_json::from_value(value)?;
+        assert_eq!(back, receipt);
+        Ok(())
+    }
+
     /// INV-11: the wire `status` values are the LOCKED lowercase strings.
     #[test]
     fn status_wire_values_are_locked() -> anyhow::Result<()> {
@@ -284,6 +354,7 @@ mod tests {
     #[test]
     fn exit_zero_maps_to_succeeded_band_zero() {
         let outcome = Outcome {
+            digests: None,
             booted: true,
             guest_exit: Some(0),
             transport_error: None,
@@ -301,6 +372,7 @@ mod tests {
     #[test]
     fn guest_nonzero_is_task_failure_not_retryable() {
         let outcome = Outcome {
+            digests: None,
             booted: true,
             guest_exit: Some(7),
             transport_error: None,
@@ -317,6 +389,7 @@ mod tests {
     #[test]
     fn timeout_is_task_failure_not_retryable() {
         let outcome = Outcome {
+            digests: None,
             booted: true,
             guest_exit: None,
             transport_error: None,
@@ -333,6 +406,7 @@ mod tests {
     #[test]
     fn boot_failure_is_infra_fault_and_retryable() {
         let outcome = Outcome {
+            digests: None,
             booted: false,
             guest_exit: None,
             transport_error: None,
@@ -359,5 +433,24 @@ mod tests {
         let c = classify_invalid_plan(&PlanError::Invalid("bad path".to_string()));
         assert_eq!(c.process_exit, ProcessExit::InvalidPlan);
         assert!(!c.retryable);
+    }
+
+    /// INV-7 + INV-11 (#360): a dead egress proxy is band 3 and retryable whatever
+    /// the guest exit. A guest that exited 0 behind a dead proxy must not read as
+    /// `succeeded`: it ran without its network.
+    #[test]
+    fn a_dead_egress_proxy_is_an_infra_fault_whatever_the_guest_exit() {
+        for guest_exit in [None, Some(0), Some(7)] {
+            let c = classify_backend_error(&BackendError::EgressProxyDied {
+                status: Some(2),
+                booted: true,
+                guest_exit,
+            });
+            assert_eq!(c.process_exit, ProcessExit::InfraFault, "guest_exit {guest_exit:?}");
+            assert!(c.retryable, "guest_exit {guest_exit:?}");
+            assert_ne!(c.status, Status::Succeeded, "guest_exit {guest_exit:?}");
+            // Status, retryable, and exit band agree (INV-11).
+            assert_eq!(c.process_exit == ProcessExit::InfraFault, c.retryable);
+        }
     }
 }

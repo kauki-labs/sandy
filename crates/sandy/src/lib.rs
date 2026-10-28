@@ -53,7 +53,7 @@ mod strategy;
 mod trust_root;
 
 pub use backend::{
-    BackendError, BoxState, DirFingerprint, Grants, Input, Outcome, Output, PlanError, RunControl, RunSpec,
+    BackendError, BoxState, DirFingerprint, Grants, Input, Outcome, Output, PlanError, RunControl, RunDigests, RunSpec,
     SandboxKind, SecretRef, SecretSource, VmBackend, backend_accepts, validate_no_secret_leak,
 };
 pub use collect::{CollectError, OutputSpec, collect};
@@ -69,6 +69,7 @@ pub use discovery::{Discovery, Placement, StaticRegistry, parse_builder_systems}
 pub use egress::{
     AllowList, EgressApplier, EgressError, EgressOs, EgressOutcome, EgressPlan, EgressRule, NftablesApplier, enforce,
     macos_egress_statement, plan_egress, plan_egress_scoped, to_nftables, to_nftables_forward, validate_egress_hosts,
+    validate_proxy_egress,
 };
 pub use error::CoreError;
 pub use gc::{StagedImage, plan_eviction};
@@ -82,10 +83,10 @@ pub use provision::{
 };
 pub use reconcile::reconcile_job;
 pub use result::{
-    AuditReceipt, Classification, CredentialReceipt, EgressAttempt, EgressEnforcement, EgressReceipt, GuestReported,
-    HostObserved, Location, Logs, OutputRef, OutputSizeRef, OutputStatus, ProcessExit, Provenance,
-    RESULT_SCHEMA_VERSION, Receipt, ResultEnvelope, Status, Timing, What, Who, classify_backend_error,
-    classify_invalid_plan, classify_outcome,
+    AuditReceipt, Classification, ContentDigests, CredentialReceipt, EgressAttempt, EgressEnforcement, EgressReceipt,
+    FileDigest, GuestReported, HostObserved, Location, Logs, OutputRef, OutputSizeRef, OutputStatus, ProcessExit,
+    Provenance, RESULT_SCHEMA_VERSION, Receipt, ResultEnvelope, SkipReason, SkippedEntry, Status, Timing, What, Who,
+    classify_backend_error, classify_invalid_plan, classify_outcome,
 };
 /// fsync a directory so a preceding create/rename within it is durable across a
 /// crash (INV-4/INV-6).
@@ -95,10 +96,10 @@ pub use seed::{
     ALLOWED_IMAGE_FORMATS, ArtifactEntry, MinisignVerifier, Requirements, SeedManifest, SeedRefusal, SignatureVerifier,
     VerifiedSeed, acquire, sha256_hex,
 };
-pub use shares::{ShareDirs, kill_children, plan_shares};
+pub use shares::{ShareDirs, SharePlan, kill_children, plan_shares, with_digests};
 pub use stage::{
-    INPUT_MOUNT_TAG, OUTPUT_MOUNT_TAG, SECRET_MOUNT_TAG, StagedSecret, collect_outputs, prepare_outputs, stage_inputs,
-    stage_secrets, wipe,
+    INPUT_MOUNT_TAG, OUTPUT_MOUNT_TAG, SECRET_MOUNT_TAG, StagedSecret, collect_outputs, digest_staged_inputs,
+    prepare_outputs, stage_inputs, stage_secrets, wipe,
 };
 pub use staging::ensure_sandy_staging_base;
 pub use strategy::{BootAxis, BuildAxis, HostFacts, ProvisioningStrategy, classify};
