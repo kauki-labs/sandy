@@ -640,8 +640,18 @@ mod tests {
         // verdict, reverse pipe still detached" scenario this guards.
         const DEADLINE: Duration = Duration::from_millis(150);
         let control = RunControl::new(std::time::Instant::now() + DEADLINE);
+        // Suspended for the forwarding check below: proves the reverse pipe
+        // still forwards normally right after the verdict (the "capped
+        // deadline, not a cancelled task" case), not merely that it was
+        // torn down immediately regardless of `control`.
+        control.suspend_deadline();
 
-        let forwarder = tokio::spawn(forward_agent_link(local_conn, remote_conn, PREFIX, Some(control)));
+        let forwarder = tokio::spawn(forward_agent_link(
+            local_conn,
+            remote_conn,
+            PREFIX,
+            Some(control.clone()),
+        ));
         expect_prefix(&mut orchestrator_side, PREFIX).await?;
 
         write_frame(&mut agent_side, &LinkFrame::Exit { code: 0 }).await?;
@@ -650,6 +660,25 @@ mod tests {
             .context("forward_agent_link did not resolve after Exit")?
             .context("forwarder task panicked")??;
         assert_eq!(verdict, ForwardedVerdict::JobExited(0));
+
+        // Positive control (CodeRabbit): with the deadline suspended, the
+        // reverse pipe must still carry a real frame — proving the earlier
+        // EOF assertion below means "torn down once control ends", not
+        // "torn down unconditionally the moment the primary verdict
+        // resolves" (which would also pass against an empty read).
+        let late_frame = LinkFrame::Cap {
+            cap: "late".to_string(),
+            channel: None,
+            peers: 0,
+        };
+        write_frame(&mut orchestrator_side, &late_frame).await?;
+        let forwarded_late = tokio::time::timeout(Duration::from_millis(100), read_frame(&mut agent_side))
+            .await
+            .context("the reverse pipe closed while control was still live")??
+            .context("the agent did not receive the post-verdict frame")?;
+        assert_eq!(forwarded_late, late_frame);
+
+        control.set_deadline(std::time::Instant::now() + DEADLINE);
 
         // The orchestrator stays completely silent on its own side from here
         // on — never sends anything, never closes. Without the reaper, the
@@ -823,6 +852,123 @@ mod tests {
             .await
             .context("the fake orchestrator did not finish")?
             .context("orchestrator task panicked")??;
+        Ok(())
+    }
+
+    /// Regression (#289 item 2, at the `relay_agent_link` call site): proves
+    /// the `Some(control.clone())` `dial_and_forward` is actually called with
+    /// (inside `relay_agent_link`'s own body) is load-bearing — a test that
+    /// only drives `forward_agent_link` directly, as the test above this one
+    /// does, would keep passing even if that clone were dropped, since
+    /// nothing re-threads `control` through `relay_agent_link` itself.
+    /// Mirrors `the_reverse_pipe_is_torn_down_once_control_ends_after_a_normal_exit`
+    /// one level up: the orchestrator accepts, exchanges the normal Cap/Join/
+    /// Exit handshake, resolves a verdict, then goes completely silent —
+    /// never closing its side — and the agent must still see EOF once
+    /// `control`'s deadline passes.
+    #[tokio::test]
+    async fn relay_agent_link_tears_down_the_reverse_pipe_once_control_ends_after_exit() -> anyhow::Result<()> {
+        use sandy_api::{
+            agent::{AgentReport, AgentVerdict},
+            backend::RunControl,
+        };
+
+        let listener = sandy_conn::listen(&ConnAddr::Tcp("127.0.0.1:0".parse()?))
+            .await
+            .context("listen")?;
+        let orchestrator_addr = listener.local_addr().context("local_addr")?;
+
+        let orchestrator = tokio::spawn(async move {
+            let (mut orchestrator_side, _peer) = listener.accept().await?;
+            expect_prefix(&mut orchestrator_side, PREFIX).await?;
+            write_frame(
+                &mut orchestrator_side,
+                &LinkFrame::Cap {
+                    cap: "deadbeef".to_string(),
+                    channel: None,
+                    peers: 0,
+                },
+            )
+            .await?;
+            read_frame(&mut orchestrator_side).await?.context("expected Join")?;
+            read_frame(&mut orchestrator_side).await?.context("expected Exit")?;
+            // Unlike relay_agent_link_resolves_job_exited_from_a_real_socketpair,
+            // this orchestrator is kept alive past the handshake instead of
+            // returning (which would drop it and close the connection) — the
+            // exact "connected but silent after the verdict" scenario this
+            // test guards against.
+            std::future::pending::<()>().await;
+            #[allow(
+                unreachable_code,
+                reason = "pending() above never resolves; this satisfies the return type"
+            )]
+            Ok::<_, anyhow::Error>(())
+        });
+
+        let (relay_end, agent_end) = std::os::unix::net::UnixStream::pair().context("socketpair")?;
+        agent_end.set_nonblocking(true).context("set_nonblocking")?;
+        let mut agent_side = tokio::net::UnixStream::from_std(agent_end).context("from_std")?;
+
+        const DEADLINE: Duration = Duration::from_millis(150);
+        let control = RunControl::new(std::time::Instant::now() + DEADLINE);
+        let (report, verdict_rx) = AgentReport::channel();
+        let rt = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            relay_agent_link(
+                &rt,
+                orchestrator_addr,
+                relay_end.into(),
+                PREFIX.to_vec(),
+                report,
+                control,
+            );
+        })
+        .await
+        .context("spawn_blocking panicked")?;
+
+        let cap_frame = read_frame(&mut agent_side)
+            .await?
+            .context("agent should see the Cap frame")?;
+        assert_eq!(
+            cap_frame,
+            LinkFrame::Cap {
+                cap: "deadbeef".to_string(),
+                channel: None,
+                peers: 0,
+            }
+        );
+        write_frame(
+            &mut agent_side,
+            &LinkFrame::Join {
+                cap: "deadbeef".to_string(),
+                channel: None,
+                cols: None,
+                rows: None,
+            },
+        )
+        .await?;
+        write_frame(&mut agent_side, &LinkFrame::Exit { code: 0 }).await?;
+
+        let verdict = tokio::task::spawn_blocking(move || verdict_rx.recv_timeout(Duration::from_secs(2)))
+            .await
+            .context("verdict recv task panicked")?
+            .context("the report channel did not deliver a verdict within the timeout")?;
+        assert_eq!(verdict, AgentVerdict::JobExited(0));
+
+        // The orchestrator stays silent from here on, by construction
+        // (pending() above) — without control reaching the reverse pipe's
+        // reaper, this would hang for the orchestrator task's whole lifetime
+        // instead of resolving once the deadline passes.
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(2), agent_side.read(&mut buf))
+            .await
+            .context("the agent side never saw EOF — the reverse pipe leaked past the job's control ending")??;
+        assert_eq!(
+            n, 0,
+            "expected EOF on the agent's side once control ended and the reaper aborted the reverse pipe"
+        );
+
+        orchestrator.abort();
         Ok(())
     }
 
