@@ -911,6 +911,13 @@ mod tests {
 
         const DEADLINE: Duration = Duration::from_millis(150);
         let control = RunControl::new(std::time::Instant::now() + DEADLINE);
+        // Suspended until after the verdict (CodeRabbit): the unsuspended
+        // 150ms window would otherwise start ticking before spawn_blocking,
+        // the TCP connect, and the Cap/Join/Exit exchange even begin — on a
+        // slow runner that's enough for relay_agent_link to report
+        // AgentFailed from its own deadline before Exit ever arrives.
+        control.suspend_deadline();
+        let relay_control = control.clone();
         let (report, verdict_rx) = AgentReport::channel();
         let rt = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
@@ -920,7 +927,7 @@ mod tests {
                 relay_end.into(),
                 PREFIX.to_vec(),
                 report,
-                control,
+                relay_control,
             );
         })
         .await
@@ -954,6 +961,8 @@ mod tests {
             .context("verdict recv task panicked")?
             .context("the report channel did not deliver a verdict within the timeout")?;
         assert_eq!(verdict, AgentVerdict::JobExited(0));
+
+        control.set_deadline(std::time::Instant::now() + DEADLINE);
 
         // The orchestrator stays silent from here on, by construction
         // (pending() above) — without control reaching the reverse pipe's
