@@ -421,6 +421,22 @@ impl QemuBackend {
     }
 }
 
+/// [`plan_shares`], wiping the sandy-owned staging dirs if it fails.
+///
+/// It stages the secret first and the inputs after, so a late failure (a missing input, or with
+/// digests on a failed digest read) would leave the staged secret on disk: `run` returns on the
+/// error before its teardown loop (INV-1). A caller-owned `secret_dir` is not touched, it keeps its
+/// own lifecycle.
+fn plan_shares_or_wipe(spec: &RunSpec, dirs: &ShareDirs<'_>) -> Result<SharePlan, BackendError> {
+    plan_shares(spec, dirs).inspect_err(|_| {
+        for dir in [dirs.inst_dir, dirs.inputs_dir, dirs.outputs_dir] {
+            if let Err(err) = wipe(dir) {
+                tracing::warn!(dir = %dir.display(), %err, "failed to wipe staging after a staging error");
+            }
+        }
+    })
+}
+
 /// A random vsock CID for one agent-mode launch, never a reserved value (0 the
 /// hypervisor, 1 local, 2 the host, `u32::MAX` any). Claimed by launching: a CID
 /// another VM holds fails the launch ([`cid_in_use`]), which then retries.
@@ -586,7 +602,7 @@ impl VmBackend for QemuBackend {
         // flags, the #49 secret_dir rule). Each virtiofsd socket lives in inst_dir
         // (sandy-owned, created in `boot`); the read-only flag is enforced at the
         // virtiofsd boundary below.
-        let SharePlan { shares, input_digests } = plan_shares(
+        let SharePlan { shares, input_digests } = plan_shares_or_wipe(
             spec,
             &ShareDirs {
                 inst_dir: &inst_dir,
@@ -671,7 +687,7 @@ fn kvm_available() -> bool {
 #[cfg(test)]
 mod tests {
     use anyhow::Context;
-    use sandy::{Grants, Hypervisor, SECRET_MOUNT_TAG, parse_topology};
+    use sandy::{Grants, Hypervisor, Input, SECRET_MOUNT_TAG, SecretRef, SecretSource, parse_topology};
 
     use super::*;
 
@@ -859,6 +875,73 @@ mod tests {
             result.is_err(),
             "a vfkit topology must be rejected by the qemu-only backend, got {result:?}"
         );
+        Ok(())
+    }
+
+    /// #373 review: `plan_shares` stages the secret first and the inputs after, so a late failure
+    /// (here a missing input; with digests on, a failed digest read) leaves the staged secret on disk
+    /// unless the staging is wiped (INV-1). The control shows the plain call leaks; the helper must not.
+    #[test]
+    fn a_staging_failure_wipes_the_qemu_owned_staging_with_its_secret() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir()?;
+        let secret_src = tmp.path().join("secret-src");
+        std::fs::write(&secret_src, b"S")?;
+        std::fs::set_permissions(&secret_src, std::fs::Permissions::from_mode(0o600))?;
+        let secrets = [SecretRef {
+            name: "TOK".to_string(),
+            source: SecretSource::File(secret_src),
+        }];
+        let inputs = [Input {
+            host: tmp.path().join("no-such-input"),
+            name: "in".to_string(),
+            guest_path: None,
+        }];
+        let command = ["true".to_string()];
+        let spec = RunSpec {
+            secrets: &secrets,
+            inputs: &inputs,
+            ..demo_spec(&command)
+        };
+        let dirs_under = |name: &str| {
+            (
+                tmp.path().join(name),
+                tmp.path().join(format!("{name}-in")),
+                tmp.path().join(format!("{name}-out")),
+            )
+        };
+
+        // Control: the plain call fails after staging the secret and leaves it behind.
+        let (inst, inputs_dir, outputs_dir) = dirs_under("plain");
+        let plain = plan_shares(
+            &spec,
+            &ShareDirs {
+                inst_dir: &inst,
+                inputs_dir: &inputs_dir,
+                outputs_dir: &outputs_dir,
+            },
+        );
+        anyhow::ensure!(plain.is_err(), "a missing input must fail staging");
+        anyhow::ensure!(
+            inst.join("TOK").exists(),
+            "the control must leave the staged secret behind, or this test proves nothing"
+        );
+
+        // The helper fails the same way and leaves no staging behind.
+        let (inst, inputs_dir, outputs_dir) = dirs_under("wiped");
+        let wiped = plan_shares_or_wipe(
+            &spec,
+            &ShareDirs {
+                inst_dir: &inst,
+                inputs_dir: &inputs_dir,
+                outputs_dir: &outputs_dir,
+            },
+        );
+        anyhow::ensure!(wiped.is_err(), "the helper must return the staging error");
+        for dir in [&inst, &inputs_dir, &outputs_dir] {
+            anyhow::ensure!(!dir.exists(), "{} must be wiped after a staging error", dir.display());
+        }
         Ok(())
     }
 
