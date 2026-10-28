@@ -42,6 +42,7 @@ sandy-impls-local.workspace = true
 # not through the `sandy-backend` feature-gated hub `sandy-cli` uses — this
 # crate already depends on `sandy-impls-local` the same direct way.
 sandy-impls-vm.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = [

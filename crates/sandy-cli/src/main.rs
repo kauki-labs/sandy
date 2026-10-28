@@ -223,6 +223,23 @@ enum DaemonOp {
         /// to this many lines.
         #[arg(long, requires = "flake", default_value_t = sandy_guest_template::manifest::default_history_lines())]
         history_lines: u32,
+        /// `--env KEY=VALUE` for the job (repeatable, only meaningful with
+        /// `--flake`; manifest-parity #480).
+        #[arg(long = "env", requires = "flake")]
+        env: Vec<String>,
+        /// Optional vCPU count (only meaningful with `--flake`;
+        /// manifest-parity #480).
+        #[arg(long, requires = "flake")]
+        cpu: Option<u32>,
+        /// Optional memory budget in MiB (only meaningful with `--flake`;
+        /// manifest-parity #480).
+        #[arg(long, requires = "flake")]
+        mem: Option<u32>,
+        /// Optional wall-clock timeout in seconds, clamped to the executing
+        /// host's own ceiling (only meaningful with `--flake`;
+        /// manifest-parity #480).
+        #[arg(long, requires = "flake")]
+        timeout: Option<u32>,
         /// The trailing `-- CMD ARGS...` guest command (only meaningful with
         /// `--flake`; empty means "boot the template's default command").
         #[arg(last = true, requires = "flake")]
@@ -739,6 +756,10 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
             attr,
             kind,
             history_lines,
+            env,
+            cpu,
+            mem,
+            timeout,
             command,
             cap_files: _,
         } => {
@@ -746,12 +767,23 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
             // pairs above guarantee exactly one of `manifest` or `flake` is
             // set here.
             let (bytes, encoding) = if let Some(flake) = flake {
+                let env = match env.iter().map(|raw| sandy_cli::plan::parse_env(raw)).collect() {
+                    Ok(env) => env,
+                    Err(e) => {
+                        eprintln!("sandy: {e}");
+                        return ProcessExit::InvalidPlan.code();
+                    }
+                };
                 let manifest = sandy_guest_template::manifest::FlakeManifestV1 {
                     flake,
                     kind,
                     attr,
                     command,
                     history_lines,
+                    env,
+                    cpu,
+                    mem,
+                    timeout_secs: timeout,
                 };
                 match sandy_guest_template::manifest::encode_flake_manifest(&manifest) {
                     Ok(bytes) => (

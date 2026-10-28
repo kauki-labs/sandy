@@ -324,8 +324,11 @@ fn parse_secret(raw: &str) -> Result<SecretRef, PlanError> {
     })
 }
 
-/// Parse one `--env KEY=VALUE` token into a `(key, value)` pair.
-fn parse_env(raw: &str) -> Result<(String, String), PlanError> {
+/// Parse one `--env KEY=VALUE` token into a `(key, value)` pair. `pub` so the
+/// `sandy` binary's `daemon submit --flake` (manifest-parity #480) reuses
+/// this validation instead of a second copy — the bin crate only sees this
+/// library crate's `pub` surface, not `pub(crate)`.
+pub fn parse_env(raw: &str) -> Result<(String, String), PlanError> {
     let (key, value) = raw
         .split_once('=')
         .ok_or_else(|| PlanError::Invalid(format!("--env `{raw}` must be KEY=VALUE")))?;
