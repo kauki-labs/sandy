@@ -218,7 +218,11 @@ canonical bytes, job_id, the verified submitter's identity from decision
   cryptographic. What signing adds on top: `sandyd`'s own ingestion check
   (above) that a signed receipt's `job_id` matches an actual dispatch to
   that signing identity, so even a replayed-and-resigned attempt (not just a
-  raw replay) is refused. This does NOT cover a job that genuinely _was_
+  raw replay) is refused. This ingestion check applies to every
+  receipt-submission path, including any future relay channel beyond the
+  agent-link — it must not come to depend on agent-link authentication
+  specifically, which is a property of today's one transport, not of the
+  check itself. This does NOT cover a job that genuinely _was_
   dispatched to that executor and never ran — see below.
 - _A compromised executor lies about `host_observed` fields it genuinely
   controls_ (fake timing, a fake backend kind). Out of scope for this
