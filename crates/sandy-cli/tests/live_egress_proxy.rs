@@ -269,7 +269,7 @@ for t in {allowed} {denied}; do
 done
 # Root tries to flush any guest firewall and add a default route, then dials again.
 nft flush ruleset 2>/dev/null || true
-ip route add default dev lo 2>/dev/null || true
+ip route add default dev lo || exit 43
 if timeout 5 bash -c "exec 3<>/dev/tcp/{denied}/{PROBE_PORT}" >/dev/null 2>&1; then
   echo "live_egress_proxy: direct connect after route tampering SUCCEEDED"
   exit 42
@@ -287,7 +287,8 @@ exit 0
     assert_guest_ok(
         code,
         &env,
-        "bypass attempts must fail (guest exit 40 = not root, 41/42 = a direct connect got out)",
+        "bypass attempts must fail (guest exit 40 = not root, 41/42 = a direct connect got out, 43 = the route change \
+         failed, so the tampering case did not run)",
     );
     Ok(())
 }
