@@ -62,14 +62,15 @@ fn allowed_host() -> String {
     std::env::var("SANDY_EGRESS_ALLOWED").unwrap_or_else(|_| "1.1.1.1".to_string())
 }
 
-/// A hostname setting from `var`, or `default`. An IP literal is refused: the proxy keeps IP and name entries
+/// A hostname setting from `var`, or `default`, lower-cased and without a trailing dot (the form the proxy
+/// matches). An IP literal is refused: the proxy keeps IP and name entries
 /// apart, so a literal here would make a hostname test run on an IP entry and prove nothing.
 fn hostname_setting(var: &str, default: &str) -> anyhow::Result<String> {
     let name = std::env::var(var).unwrap_or_else(|_| default.to_string());
     if name.parse::<IpAddr>().is_ok() {
         bail!("refusing: {var}={name} is an IP literal, but these tests exercise hostname entries");
     }
-    Ok(name)
+    Ok(name.to_ascii_lowercase().trim_end_matches('.').to_string())
 }
 
 /// The allow-listed hostname for the name-entry tests. The default, `one.one.one.one`, resolves to several
@@ -186,6 +187,25 @@ connect_status() {
 }
 "#;
 
+/// Guest shell that sends `CONNECT host:port` and sets `$status` as [`CONNECT_FN`] does, and also `$reason` to
+/// the response body (the proxy writes one reason line and closes the connection after a refusal).
+const CONNECT_FULL_FN: &str = r#"
+connect_full() {
+  status=none
+  reason=
+  exec 3<>/dev/tcp/127.0.0.1/3128 || return 0
+  printf 'CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n' "$1" "$1" >&3
+  line=
+  IFS= read -r -t 15 line <&3 || true
+  line=${line%$'\r'}
+  case $line in
+    HTTP/*" "*) status=${line#* }; status=${status%% *} ;;
+  esac
+  while IFS= read -r -t 5 l <&3; do l=${l%$'\r'}; reason="$reason$l|"; done
+  exec 3<&- 3>&-
+}
+"#;
+
 /// A guest script that issues one CONNECT to `target` and exits with the outcome:
 /// 0 = `want` status, 10 = a different status, 12 = no status line (relay unreachable or silent).
 fn connect_expect_script(target: &str, want: u16) -> String {
@@ -279,6 +299,11 @@ fn a_hostname_entry_does_not_allow_another_name_or_its_ip() -> anyhow::Result<()
     build_guest(&target)?;
     let home = tempfile::tempdir().context("temp SANDY_HOME")?;
     let (name, other, same) = (allowed_name()?, denied_name()?, same_address_name()?);
+    anyhow::ensure!(
+        name != other && name != same && other != same,
+        "refusing: the allowed, denied and same-address names must be three different hostnames, got {name}, {other}, \
+         {same}"
+    );
     let name_ips = resolved_ipv4(&name)?;
     let same_ips = resolved_ipv4(&same)?;
     anyhow::ensure!(
@@ -289,15 +314,21 @@ fn a_hostname_entry_does_not_allow_another_name_or_its_ip() -> anyhow::Result<()
     let ip = name_ips[0];
     let allow = vec![format!("{name}:{PROBE_PORT}")];
 
-    // Exit 12 (no status line) fails the test: a dead relay would otherwise look like a refusal.
+    // Each refusal must be an allow-list refusal: a `403` from the address filter ("non-public address") would
+    // also pass a status check on a private address, and prove nothing about name matching. Exit 12 (no status
+    // line) fails the test too: a dead relay would otherwise look like a refusal.
     let script = format!(
         r#"set -u
-{CONNECT_FN}
+{CONNECT_FULL_FN}
 for t in {other}:{PROBE_PORT} {ip}:{PROBE_PORT} {same}:{PROBE_PORT}; do
-  connect_status $t
-  echo "live_egress_proxy: CONNECT $t -> $status"
+  connect_full $t
+  echo "live_egress_proxy: CONNECT $t -> $status $reason"
   [ "$status" = none ] && exit 12
   [ "$status" = 403 ] || exit 10
+  case $reason in
+    *"not in the allow-list"*) ;;
+    *) exit 11 ;;
+  esac
 done
 exit 0
 "#
@@ -307,7 +338,10 @@ exit 0
     assert_guest_ok(
         code,
         &env,
-        &format!("with only {name}:{PROBE_PORT} allowed, {other}, {ip} and {same} must all get 403"),
+        &format!(
+            "with only {name}:{PROBE_PORT} allowed, {other}, {ip} and {same} must all get a 403 that says `not in the \
+             allow-list` (guest exit 11 = a 403 for another reason)"
+        ),
     );
     Ok(())
 }
