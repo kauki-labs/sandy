@@ -168,6 +168,14 @@ fn assert_guest_ok(code: i32, env: &serde_json::Value, what: &str) {
     assert_eq!(code, 0, "process band 0; envelope: {env}");
 }
 
+/// Assert the whole infra-fault classification: process band 3, status `failed`, `retryable` true. A bare
+/// "not succeeded" would also accept `cancelled` or a non-retryable result.
+fn assert_infra_fault(code: i32, env: &serde_json::Value, what: &str) {
+    assert_eq!(code, 3, "{what}: process band 3; envelope: {env}");
+    assert_eq!(env["status"], "failed", "{what}: status failed; envelope: {env}");
+    assert_eq!(env["retryable"], true, "{what}: retryable; envelope: {env}");
+}
+
 /// KP1: an allow-listed `host:port` is reachable through the guest relay (`200`).
 #[test]
 fn allowed_target_is_reachable_through_the_proxy() -> anyhow::Result<()> {
@@ -451,11 +459,7 @@ exit 0
     let stderr = std::fs::read(&stderr_path).unwrap_or_default();
     let (code, env) = parse_envelope(output.status.code().unwrap_or(-1), &output.stdout, &stderr)?;
 
-    assert_eq!(code, 3, "a dead proxy is an infra fault, band 3; envelope: {env}");
-    assert_ne!(
-        env["status"], "succeeded",
-        "a run without its boundary must not succeed; envelope: {env}"
-    );
+    assert_infra_fault(code, &env, "a dead proxy is an infra fault");
     // `BackendError::EgressProxyDied` names whether the guest had booted and how it exited. The kill came
     // after the guest's tunnel was up, so the guest had booted; its job then ran on to exit 0.
     let text = env.to_string();
@@ -538,14 +542,7 @@ fn proxy_startup_failure_is_band_3() -> anyhow::Result<()> {
         proxy_ran.exists(),
         "the failing proxy stub never ran, so no pre-READY exit was tested; envelope: {env}"
     );
-    assert_eq!(
-        code, 3,
-        "a proxy that cannot start is an infra fault, band 3; envelope: {env}"
-    );
-    assert_ne!(
-        env["status"], "succeeded",
-        "a run whose proxy never started must not succeed; envelope: {env}"
-    );
+    assert_infra_fault(code, &env, "a proxy that cannot start is an infra fault");
     assert!(
         env.to_string().contains("egress proxy"),
         "the envelope must name the proxy failure; envelope: {env}"
