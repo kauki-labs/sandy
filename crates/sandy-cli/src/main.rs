@@ -565,10 +565,7 @@ fn dispatch_mesh(op: MeshOp) -> i32 {
 fn dispatch_mesh_key(op: MeshKeyOp) -> i32 {
     match op {
         MeshKeyOp::Generate { dir } => match sandy_conn::TlsIdentity::load_or_generate(&dir) {
-            Ok(identity) => {
-                println!("{}", identity.fingerprint().to_hex());
-                0
-            }
+            Ok(identity) => succeed_or(emit_str(Ok(identity.fingerprint().to_hex()))),
             Err(e) => {
                 eprintln!("sandy: {e}");
                 ProcessExit::InvalidPlan.code()
@@ -588,10 +585,7 @@ fn dispatch_mesh_key(op: MeshKeyOp) -> i32 {
             // Both files already confirmed present, so `load_or_generate`
             // only ever takes its load path here — never mints a fresh one.
             match sandy_conn::TlsIdentity::load_or_generate(&dir) {
-                Ok(identity) => {
-                    println!("{}", identity.fingerprint().to_hex());
-                    0
-                }
+                Ok(identity) => succeed_or(emit_str(Ok(identity.fingerprint().to_hex()))),
                 Err(e) => {
                     eprintln!("sandy: {e}");
                     ProcessExit::InvalidPlan.code()
