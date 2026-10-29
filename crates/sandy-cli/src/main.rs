@@ -17,8 +17,8 @@ use sandy_cli::{
     app_register::{self, Owner},
     doctor,
     output::{
-        AttachedChannel, CancelledJob, JobRecords, JobStatusReport, JobSummaries, OutputFormat, Render, SubmittedJob,
-        emit,
+        AttachedChannel, CancelledJob, JobRecords, JobStatusReport, JobSummaries, MeshFingerprint, OutputFormat,
+        SubmittedJob, emit,
     },
     plan::{JobPlan, RunArgs, parse_run},
     supervisor,
@@ -557,18 +557,23 @@ fn main() {
 }
 
 /// Dispatch a `sandy mesh <op>` command.
-fn dispatch_mesh(op: MeshOp) -> i32 {
+fn dispatch_mesh(op: MeshOp, output: OutputFormat) -> i32 {
     match op {
-        MeshOp::Key { op } => dispatch_mesh_key(op),
+        MeshOp::Key { op } => dispatch_mesh_key(op, output),
     }
 }
 
 /// Dispatch a `sandy mesh key <op>` command: mint/load or print a node's
 /// persisted mesh TLS identity fingerprint (decision 20).
-fn dispatch_mesh_key(op: MeshKeyOp) -> i32 {
+fn dispatch_mesh_key(op: MeshKeyOp, output: OutputFormat) -> i32 {
     match op {
         MeshKeyOp::Generate { dir } => match sandy_conn::TlsIdentity::load_or_generate(&dir) {
-            Ok(identity) => succeed_or(emit_str(Ok(identity.fingerprint().to_hex()))),
+            Ok(identity) => succeed_or(emit(
+                &MeshFingerprint {
+                    fingerprint: identity.fingerprint().to_hex(),
+                },
+                output,
+            )),
             Err(e) => {
                 eprintln!("sandy: {e}");
                 ProcessExit::InvalidPlan.code()
@@ -588,7 +593,12 @@ fn dispatch_mesh_key(op: MeshKeyOp) -> i32 {
             // Both files already confirmed present, so `load_or_generate`
             // only ever takes its load path here — never mints a fresh one.
             match sandy_conn::TlsIdentity::load_or_generate(&dir) {
-                Ok(identity) => succeed_or(emit_str(Ok(identity.fingerprint().to_hex()))),
+                Ok(identity) => succeed_or(emit(
+                    &MeshFingerprint {
+                        fingerprint: identity.fingerprint().to_hex(),
+                    },
+                    output,
+                )),
                 Err(e) => {
                     eprintln!("sandy: {e}");
                     ProcessExit::InvalidPlan.code()
@@ -1370,7 +1380,7 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
 
     // `mesh` ops touch only the caller-named identity dir, not $SANDY_HOME.
     if let Command::Mesh { op } = command {
-        return dispatch_mesh(op);
+        return dispatch_mesh(op, output);
     }
 
     // `daemon` ops talk to sandyd over its own socket, not $SANDY_HOME.

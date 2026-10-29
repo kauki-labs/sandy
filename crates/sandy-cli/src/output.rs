@@ -147,6 +147,20 @@ impl Render for JobRecord {
     }
 }
 
+/// A node's persisted mesh TLS identity fingerprint (decision 20), as
+/// printed by `sandy mesh key generate`/`fingerprint`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeshFingerprint {
+    /// The hex-encoded SHA-256 fingerprint of the identity's certificate.
+    pub fingerprint: String,
+}
+
+impl Render for MeshFingerprint {
+    fn render_plain(&self, out: &mut dyn io::Write) -> io::Result<()> {
+        write!(out, "{}", self.fingerprint)
+    }
+}
+
 /// `ls`'s result: every job record `sandy` knows about, as one named type
 /// (not a bare `Vec`) per #512's spec — `#[serde(transparent)]` keeps the
 /// JSON an array, byte-identical to serializing the `Vec` directly.
