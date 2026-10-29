@@ -1937,3 +1937,41 @@ original wording): rejected per the reopened owner decision above — head-
 of-line blocking against `Dispatch`/`Cancel`/`AttachStateChanged` for every
 other job sharing that host-executor's one connection was judged worse
 than the added complexity of a second dial-back link.
+||||||| parent of 9a6f17f (feat(sandyd): Cancel requires the job attach token (#540))
+
+## 23. `Cancel` is gated per job by the job's attach token (#540, audit #391)
+
+**Status:** accepted. **Upholds:** INV-1.
+
+**Context.** `Cancel` took only a job id. A cross-session mismatch was logged at info level and the cancel
+proceeded (CF-H-1, "an audit trail, not a gate"). The control socket is mode 0600, so only the operator's own
+uid can reach it, but any process of that uid could cancel any job. Audit #391 asked whether that trust
+boundary is enough.
+
+**Decision.** The owner's answer, 2026-10-29: "Cancel gated per job", with the mechanism chosen as the job's
+**attach token** (the credential `SubmitResponse.attach_token` already returns, #327) rather than the submitting
+session or a peer-uid check.
+
+- `CancelRequest` carries `optional bytes attach_token`. `Cancel` proceeds only when the presented token matches
+  the job's stored token, compared with the helper `Attach` uses (`attach_tokens_match`).
+- Every refusal (no token, a wrong one, another job's token, a job with no stored token, an unknown job id)
+  returns the same message. A caller cannot probe which job ids exist, what state a job is in, or which part of
+  the credential was wrong. A refused cancel writes nothing and sends nothing to the host-executor.
+- The submitting session is not trusted without the token: a cancel from the same connection that submitted is
+  refused too. `sandy daemon cancel <id>` reads the token `daemon submit` persisted, as `daemon attach` does, so
+  the same user on the same machine keeps working with no flag.
+- The token is never logged. The refusal log line names the job id and whether a token was presented, nothing else.
+
+**Consequence.** A client that did not keep the token (a job submitted from another machine or by another tool)
+can no longer cancel it. That is the intended effect. Two cases make a job uncancellable through this RPC, and
+neither has a fallback: a job that has no stored token (rows created before the token column existed, and the rare
+case where the token write fails right after the job is inserted), and an operator who lost the persisted token file
+(for example by cleaning the staging directory). A token that cannot be minted at all (RNG failure) refuses the
+Submit instead, so no new such job is created that way. An empty stored token never matches, not even an empty
+presented one. Cancelling one of those jobs needs the daemon's database or a restart; an operator-only path is
+tracked in #545. `Attach` is unchanged: it still falls back to the session
+hint and an observer-only cap (#327).
+
+**Alternative set aside.** A peer-uid (`SO_PEERCRED`) check: the socket is 0600, so the same uid always passes
+and it closes nothing. Gating by session alone: the CLI opens a fresh connection per call, so it would refuse the
+ordinary `submit` then `cancel` flow.

@@ -65,6 +65,25 @@ impl std::fmt::Debug for SubmitResponse {
     }
 }
 
+/// Redacting `Debug` for [`CancelRequest`] (#540): its `attach_token` is a bearer credential, so Debug
+/// reports only whether one was presented and its length.
+impl std::fmt::Debug for CancelRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CancelRequest")
+            .field("job_id", &self.job_id)
+            .field(
+                "attach_token",
+                &format_args!(
+                    "<{}>",
+                    self.attach_token
+                        .as_ref()
+                        .map_or_else(|| "absent".to_string(), |t| format!("redacted {} bytes", t.len()))
+                ),
+            )
+            .finish()
+    }
+}
+
 /// `AttachRequest.attach_token`, when present, is the same bearer credential
 /// presented back. Redacted for the same reason.
 impl std::fmt::Debug for AttachRequest {
@@ -275,6 +294,41 @@ mod tests {
     /// Adversarial (#327): `AttachRequest`'s presented `attach_token`, when
     /// present, must never print in the clear; when absent, Debug must say
     /// so plainly rather than rendering an empty byte dump.
+    /// #540: a `Cancel` carries the job's attach token too, so its Debug must redact it like `AttachRequest`'s.
+    #[test]
+    fn cancel_request_debug_redacts_a_presented_token_and_names_an_absent_one() {
+        let marker = "sandy-cancel-token-leak-marker-5c2e";
+        let with_token = CancelRequest {
+            job_id: "job-a".to_owned(),
+            attach_token: Some(marker.as_bytes().to_vec()),
+        };
+        let rendered = format!("{with_token:?}");
+        assert!(
+            !rendered.contains(marker),
+            "the token leaked into Debug output: {rendered}"
+        );
+        assert!(rendered.contains("redacted"), "got: {rendered}");
+        let nested = format!(
+            "{:?}",
+            ControlRequest {
+                request_id: 1,
+                op: Some(control_request::Op::Cancel(with_token)),
+            }
+        );
+        assert!(
+            !nested.contains(marker),
+            "the token leaked through ControlRequest: {nested}"
+        );
+        let absent = format!(
+            "{:?}",
+            CancelRequest {
+                job_id: "job-b".to_owned(),
+                attach_token: None
+            }
+        );
+        assert!(absent.contains("absent"), "got: {absent}");
+    }
+
     #[test]
     fn attach_request_debug_redacts_a_presented_token_and_names_an_absent_one() {
         let marker = "sandy-attach-token-leak-marker-91af";

@@ -42,6 +42,10 @@ use crate::{
 /// sync if either changes.
 const MANIFEST_ENCODING_FLAKE_V1: &str = "flake/v1";
 
+/// The one refusal text for a `Cancel` that is not authorized (#540): it must not say whether the job
+/// exists, what state it is in, or which part of the credential was wrong.
+const CANCEL_REFUSED: &str = "cancel refused: a valid attach token for this job is required";
+
 /// Derive the `Dispatch.backend` a submitted manifest requires, purely from
 /// its `manifest_encoding` (#332): `flake/v1` requires `Vm` (a remote
 /// host-executor resolves+boots the guest; this daemon has no local VM
@@ -447,22 +451,23 @@ pub async fn handle(
             // daemon attach` invocation (a fresh connection, the realistic
             // "log back into my own job" case) can still prove it's the
             // submitter; `session_matches` alone never recognizes that case,
-            // since a fresh connection always mints a fresh session. Minted
-            // best-effort, same shape as `RemoteLink::new`'s own RNG-failure
-            // handling just below: a vanishingly rare RNG failure degrades
-            // this one job to session-only gating rather than failing the
-            // whole Submit.
+            // since a fresh connection always mints a fresh session.
+            // Since #540 the token is also the only way to cancel the job, so an RNG failure refuses the
+            // whole Submit (below) rather than leaving an uncancellable job.
             let attach_token = {
                 let mut bytes = [0u8; ATTACH_TOKEN_LEN];
                 match getrandom::fill(&mut bytes) {
                     Ok(()) => bytes.to_vec(),
                     Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            job_id,
-                            "could not mint a durable attach token; this job falls back to session-only attach gating"
-                        );
-                        Vec::new()
+                        // Cancel needs this token (#540), so a job without one could never be cancelled:
+                        // refuse the Submit instead, before any side effect.
+                        tracing::warn!(error = %e, job_id, "could not mint a durable attach token; refusing the submit");
+                        return Ok(ControlResponse {
+                            request_id: request.request_id,
+                            result: Some(control_response::Result::Error(ControlError {
+                                message: "could not mint a durable attach token; submit refused".to_owned(),
+                            })),
+                        });
                     }
                 }
             };
@@ -593,10 +598,10 @@ pub async fn handle(
                 });
             }
 
-            // Best-effort, same reasoning as the mint step above: a faulted
-            // write here leaves this one job without a durable attach
-            // token (degrading to session-only gating for it), never a
-            // reason to fail an otherwise-successful Submit.
+            // Best-effort: the job is already durably submitted, so a faulted write here is logged, not a
+            // reason to fail the Submit. KNOWN GAP (#540): such a job has no stored token, so it can never
+            // be cancelled through this RPC (decision 23). Rare: it needs the store write to fail right
+            // after the job insert succeeded.
             if !attach_token.is_empty() {
                 let token_job_id = job_id.clone();
                 let token = attach_token.clone();
@@ -703,21 +708,35 @@ pub async fn handle(
             control_response::Result::Submit(SubmitResponse { job_id, attach_token })
         }
         Some(control_request::Op::Cancel(cancel)) => {
-            // CF-H-1: an audit trail, not a gate — a mismatch is logged, never
-            // refused (see `handle`'s own doc on `session`). `info`, not
-            // `warn`: the CLI opens a fresh connection per invocation, so a
-            // later `cancel` from a separate `sandy daemon` call is the
-            // ordinary case, not an anomaly — this is a correlation trail,
-            // not an alert.
-            if let Some(job) = registry.get(&cancel.job_id)
-                && !job.session_matches(session)
-            {
+            // #540 (owner decision on audit #391, 2026-10-29): Cancel is gated per job by the job's
+            // `attach_token`, from any session. CF-H-1's old "audit trail, not a gate" no longer holds
+            // for Cancel (Attach still uses `session_matches` as a hint, see below). Every refusal (no
+            // token, a wrong one, another job's, a job with none stored, an unknown job id) returns the
+            // one message, so a caller cannot probe which job ids exist or why it was refused. The
+            // token is never logged.
+            let authorized = match &cancel.attach_token {
+                Some(presented) => {
+                    let store = Arc::clone(store);
+                    let job_id = cancel.job_id.clone();
+                    let stored = tokio::task::spawn_blocking(move || store.attach_token(&job_id)).await??;
+                    stored.is_some_and(|stored| attach_tokens_match(&stored, presented))
+                }
+                None => false,
+            };
+            if !authorized {
+                // The id is caller-supplied and unbounded: log a short escaped prefix only.
+                let shown: String = cancel.job_id.chars().take(64).collect();
                 tracing::info!(
-                    job_id = %cancel.job_id,
-                    submitted_session = %job.session,
-                    requesting_session = %session,
-                    "cancel from a different session than the one that submitted this job"
+                    job_id = ?shown,
+                    token_presented = cancel.attach_token.is_some(),
+                    "cancel refused: no matching attach token"
                 );
+                return Ok(ControlResponse {
+                    request_id: request.request_id,
+                    result: Some(control_response::Result::Error(ControlError {
+                        message: CANCEL_REFUSED.to_owned(),
+                    })),
+                });
             }
             let job_id = cancel.job_id.clone();
             // Captured before mark_terminal/invalidate below, which touch
@@ -930,7 +949,8 @@ fn cap_has_expired(cap: &sandy_fabric::capauth::Cap) -> bool {
 /// since that type is fixed-size and specific to the remote-link seam, while
 /// this compares plain, store-read `Vec<u8>`s.
 fn attach_tokens_match(stored: &[u8], presented: &[u8]) -> bool {
-    if stored.len() != presented.len() {
+    // An empty token is "no token": two empty slices must never count as a match (#540).
+    if stored.is_empty() || stored.len() != presented.len() {
         return false;
     }
     let mut diff = 0u8;
@@ -1111,6 +1131,7 @@ mod tests {
                 1,
                 control_request::Op::Cancel(CancelRequest {
                     job_id: "ghost".to_owned(),
+                    attach_token: None,
                 }),
             ),
         )
@@ -1517,7 +1538,7 @@ mod tests {
             &host_registry,
             None,
             test_session(),
-            req(2, control_request::Op::Cancel(CancelRequest { job_id: job_id.clone() })),
+            req(2, cancel_authed(&store, &job_id)),
         )
         .await?;
         assert!(
@@ -1583,7 +1604,7 @@ mod tests {
             &host_registry,
             None,
             test_session(),
-            req(2, control_request::Op::Cancel(CancelRequest { job_id: job_id.clone() })),
+            req(2, cancel_authed(&store, &job_id)),
         )
         .await?;
         assert!(
@@ -1618,7 +1639,7 @@ mod tests {
             &host_registry,
             None,
             test_session(),
-            req(2, control_request::Op::Cancel(CancelRequest { job_id: job_id.clone() })),
+            req(2, cancel_authed(&store, &job_id)),
         )
         .await?;
         assert!(
@@ -1667,7 +1688,7 @@ mod tests {
             &host_registry,
             None,
             session,
-            req(2, control_request::Op::Cancel(CancelRequest { job_id: job_id.clone() })),
+            req(2, cancel_authed(&store, &job_id)),
         )
         .await?;
         assert!(
@@ -1684,28 +1705,163 @@ mod tests {
     /// work). The mismatch itself is proven directly via
     /// `JobChannel::session_matches` in `dispatch.rs`; this only proves
     /// `handle` doesn't let it change the outcome.
+    /// A `Cancel` carrying the job's own stored attach token: what a client that kept the token from
+    /// `Submit` sends (#540).
+    fn cancel_authed(store: &JobStore, job_id: &str) -> control_request::Op {
+        let attach_token = store.attach_token(job_id).ok().flatten();
+        control_request::Op::Cancel(CancelRequest {
+            job_id: job_id.to_owned(),
+            attach_token,
+        })
+    }
+
+    fn cancel_with(job_id: &str, attach_token: Option<Vec<u8>>) -> control_request::Op {
+        control_request::Op::Cancel(CancelRequest {
+            job_id: job_id.to_owned(),
+            attach_token,
+        })
+    }
+
+    /// Submit one job; return its id and the attach token `Submit` handed back.
+    async fn submit_job(
+        store: &Arc<JobStore>,
+        registry: &Arc<JobRegistry>,
+        host_registry: &Arc<HostRegistry>,
+    ) -> anyhow::Result<(String, Vec<u8>)> {
+        let submitted = handle(store, registry, host_registry, None, Uuid::new_v4(), submit_req(1)).await?;
+        match submitted.result {
+            Some(control_response::Result::Submit(SubmitResponse {
+                job_id, attach_token, ..
+            })) => Ok((job_id, attach_token)),
+            other => anyhow::bail!("expected a Submit response, got {other:?}"),
+        }
+    }
+
+    async fn cancel_message(
+        deps: (&Arc<JobStore>, &Arc<JobRegistry>, &Arc<HostRegistry>),
+        op: control_request::Op,
+    ) -> anyhow::Result<Result<(), String>> {
+        let response = handle(deps.0, deps.1, deps.2, None, Uuid::new_v4(), req(2, op)).await?;
+        match response.result {
+            Some(control_response::Result::Cancel(_)) => Ok(Ok(())),
+            Some(control_response::Result::Error(e)) => Ok(Err(e.message)),
+            other => anyhow::bail!("unexpected Cancel response {other:?}"),
+        }
+    }
+
+    /// #540 (owner decision on audit #391): Cancel is gated by the job's attach token, from any session.
     #[tokio::test]
-    async fn a_cross_session_cancel_still_succeeds() -> anyhow::Result<()> {
+    async fn a_cancel_with_the_jobs_attach_token_succeeds_from_any_session() -> anyhow::Result<()> {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
-        let submitted = handle(&store, &registry, &host_registry, None, Uuid::new_v4(), submit_req(1)).await?;
+        let (job_id, token) = submit_job(&store, &registry, &host_registry).await?;
+        let outcome = cancel_message((&store, &registry, &host_registry), cancel_with(&job_id, Some(token))).await?;
+        assert_eq!(outcome, Ok(()));
+        Ok(())
+    }
+
+    /// The refusal cases all answer with one message, and each leaves the job cancellable: a refused
+    /// cancel must change nothing.
+    #[tokio::test]
+    async fn a_cancel_without_a_valid_token_is_refused_the_same_way_and_changes_nothing() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let (job_id, token) = submit_job(&store, &registry, &host_registry).await?;
+        let (other_id, other_token) = submit_job(&store, &registry, &host_registry).await?;
+        let deps = (&store, &registry, &host_registry);
+
+        let mut wrong = token.clone();
+        wrong[0] ^= 0xff;
+        let refusals = [
+            cancel_message(deps, cancel_with(&job_id, None)).await?,
+            cancel_message(deps, cancel_with(&job_id, Some(wrong))).await?,
+            cancel_message(deps, cancel_with(&job_id, Some(Vec::new()))).await?,
+            cancel_message(deps, cancel_with(&job_id, Some(other_token))).await?,
+            cancel_message(deps, cancel_with("ghost", Some(token.clone()))).await?,
+            cancel_message(deps, cancel_with("ghost", None)).await?,
+        ];
+        let first = refusals[0].clone().expect_err("a cancel with no token must be refused");
+        for refusal in &refusals {
+            assert_eq!(refusal.as_ref().expect_err("must be refused"), &first);
+        }
+        // The message names neither the job, its state, nor any token.
+        assert!(
+            !first.contains(&job_id) && !first.contains("ghost") && !first.contains("PENDING"),
+            "{first}"
+        );
+
+        // Nothing changed: both jobs still cancel with their own tokens.
+        assert_eq!(cancel_message(deps, cancel_with(&job_id, Some(token))).await?, Ok(()));
+        let (_, other_token) = (
+            other_id.clone(),
+            store.attach_token(&other_id)?.context("stored token")?,
+        );
+        assert_eq!(
+            cancel_message(deps, cancel_with(&other_id, Some(other_token))).await?,
+            Ok(())
+        );
+        Ok(())
+    }
+
+    /// An empty stored token (a hand-edited row, a legacy migration) must never match an empty presented
+    /// one: that would let any caller cancel the job.
+    #[test]
+    fn two_empty_tokens_never_match() {
+        assert!(!attach_tokens_match(&[], &[]));
+        assert!(!attach_tokens_match(&[], &[1]));
+        assert!(attach_tokens_match(&[1, 2], &[1, 2]));
+        assert!(!attach_tokens_match(&[1, 2], &[1, 3]));
+    }
+
+    #[tokio::test]
+    async fn a_job_whose_stored_token_is_empty_cannot_be_cancelled_with_an_empty_token() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let (job_id, token) = submit_job(&store, &registry, &host_registry).await?;
+        store.set_attach_token(&job_id, &[])?;
+        let deps = (&store, &registry, &host_registry);
+        for presented in [Some(Vec::new()), Some(token), None] {
+            let outcome = cancel_message(deps, cancel_with(&job_id, presented)).await?;
+            assert!(
+                outcome.is_err(),
+                "a job with no usable stored token must refuse every cancel"
+            );
+        }
+        Ok(())
+    }
+
+    /// A refused cancel must not reach the host-executor either.
+    #[tokio::test]
+    async fn a_refused_cancel_sends_nothing_to_the_host() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let peer_ip: std::net::IpAddr = "100.64.0.9".parse().context("peer ip literal")?;
+        let allowlist = crate::host_registry::ExecutorAllowlist::new([peer_ip]);
+        let registration = host_registry
+            .register(&allowlist, peer_ip, "ws01".to_owned(), trusted_host_capabilities())
+            .expect("register a test host");
+        let mut cancel_rx = registration.cancel_rx;
+        let _dispatch_rx = registration.dispatch_rx;
+        let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+        let submitted = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            Uuid::new_v4(),
+            submit_req(1),
+        )
+        .await?;
         let job_id = match submitted.result {
             Some(control_response::Result::Submit(SubmitResponse { job_id, .. })) => job_id,
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
         };
-
-        let cancelled = handle(
-            &store,
-            &registry,
-            &host_registry,
-            None,
-            Uuid::new_v4(), // a different session than the one that submitted
-            req(2, control_request::Op::Cancel(CancelRequest { job_id: job_id.clone() })),
-        )
-        .await?;
+        anyhow::ensure!(
+            registry.get(&job_id).and_then(|j| j.host_id.clone()).as_deref() == Some("ws01"),
+            "the job must be placed on the host for this test to mean anything"
+        );
+        let refused = cancel_message((&store, &registry, &host_registry), cancel_with(&job_id, None)).await?;
+        assert!(refused.is_err());
+        let sent = tokio::time::timeout(std::time::Duration::from_millis(300), cancel_rx.recv()).await;
         assert!(
-            matches!(cancelled.result, Some(control_response::Result::Cancel(_))),
-            "got {:?}",
-            cancelled.result
+            sent.is_err(),
+            "a refused cancel must not send a Cancel to the host, got {sent:?}"
         );
         Ok(())
     }
@@ -2325,7 +2481,7 @@ mod tests {
             &host_registry,
             Some(forward_back),
             test_session(),
-            req(2, control_request::Op::Cancel(CancelRequest { job_id: job_id.clone() })),
+            req(2, cancel_authed(&store, &job_id)),
         )
         .await?;
         assert!(

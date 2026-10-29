@@ -76,6 +76,11 @@ fn try_persist_attach_token(job_id: &str, token: &[u8]) -> Result<(), sandy_fsut
 /// `session_matches`" rather than a hard refusal.
 #[must_use]
 pub fn read_attach_token(job_id: &str) -> Option<Vec<u8>> {
+    // The id names a file in the token directory: refuse anything that is not one plain component,
+    // so `sandy daemon cancel ../../x` cannot read an arbitrary file and send it as a token.
+    if job_id.is_empty() || job_id == "." || job_id == ".." || job_id.contains(['/', '\\', '\0']) {
+        return None;
+    }
     let base = sandy_fsutil::ensure_sandy_staging_base().ok()?;
     let dir = sandy_fsutil::OwnedDir::open(&base.join(ATTACH_TOKEN_DIR_NAME)).ok()?;
     std::fs::read(dir.path().join(job_id)).ok()
@@ -1065,6 +1070,20 @@ mod tests {
             let (forwarded, detached) = run(b"echo hi\necho ~.there\n");
             assert!(!detached);
             assert_eq!(forwarded, b"echo hi\necho ~.there\n");
+        }
+    }
+}
+
+#[cfg(test)]
+mod token_path_tests {
+    use super::read_attach_token;
+
+    /// #540: `daemon cancel` reads the token file named by the job id, so an id that is not one plain
+    /// path component must never reach the filesystem.
+    #[test]
+    fn a_job_id_that_is_not_one_plain_component_reads_no_token() {
+        for id in ["", ".", "..", "../x", "a/b", "/etc/passwd", "a\\b", "x\0y"] {
+            assert_eq!(read_attach_token(id), None, "id {id:?}");
         }
     }
 }
