@@ -44,6 +44,10 @@ use crate::{
     share::VirtiofsdTransport,
 };
 
+/// The `-sandbox` value: qemu's seccomp filter, denying the obsolete syscalls, privilege elevation, `fork`/`exec`
+/// and resource-control changes (#392).
+const QEMU_SANDBOX: &str = "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny";
+
 /// The chardev id the guest serial console binds to. `qemu_args` emits
 /// `-serial chardev:<SERIAL_CHARDEV_ID>`; `run` adds the matching
 /// `-chardev socket,…` and drives it over the #33 [`PipeTransport`].
@@ -201,6 +205,12 @@ pub fn qemu_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> Re
         args.push("-nic".to_string());
         args.push("none".to_string());
     }
+
+    // Confine the qemu process with seccomp (#392): a guest-to-host escape through a device bug would otherwise get
+    // the sandy user's full syscall surface. The qemu live suite passes under this filter on qemu/KVM x86_64 with
+    // virtio-fs, vhost-user and vsock devices; other architectures are untested.
+    args.push("-sandbox".to_string());
+    args.push(QEMU_SANDBOX.to_string());
 
     // The virtio-fs shares: a shared memfd memory backend plus a client chardev +
     // `vhost-user-fs-pci` device per share. The matching virtiofsd daemons are
