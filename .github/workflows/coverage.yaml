@@ -1,0 +1,69 @@
+name: Coverage
+# Instrumented cargo-llvm-cov, split out from pr.yaml (CI gate stays a plain
+# `cargo nextest` run): slower, and has been failing outright on GitHub's
+# runners (reproduced locally). Runs once per push to main instead of once
+# per PR, so Codecov's history keeps updating without gating every PR on it.
+on:
+  push:
+    branches: [main]
+concurrency:
+  group: coverage
+  cancel-in-progress: false
+permissions:
+  contents: read
+env:
+  CACHIX_CACHE_NAME: sandy
+jobs:
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          # Installing Nix (multi-user daemon) needs sudo, so sudo stays enabled here.
+          egress-policy: audit
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: Cachix (sandy)
+        uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
+        with:
+          name: ${{ env.CACHIX_CACHE_NAME }}
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - name: Cache Nix store
+        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
+        with:
+          primary-key: nix-${{ runner.os }}-${{ github.job }}-${{ hashFiles('flake.lock', 'rust-toolchain.toml', '**/Cargo.lock', '**/*.nix') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-${{ github.job }}-
+          gc-max-store-size-linux: 4G
+          purge: true
+          purge-prefixes: nix-${{ runner.os }}-${{ github.job }}-
+          purge-created: 0
+          purge-primary-key: never
+      # Line coverage over the CI-runnable suite (tier-1/2); the `live` tier-3 tests
+      # need a hypervisor and never run in CI, so they are excluded by design.
+      - name: Coverage
+        run: nix build -L .#checks.x86_64-linux.coverage
+      - name: Upload lcov report
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-lcov
+          path: result/lcov.info
+          if-no-files-found: error
+      # Publish to Codecov. A reporting hiccup must not fail the push, so
+      # fail_ci_if_error stays false.
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: result/lcov.info
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
