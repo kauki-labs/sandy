@@ -1,6 +1,5 @@
 [package]
 name = "sandy-proto"
-description = "The sandy agent-fabric channel envelope: a protobuf message contract (oneof message-type + sequence + metadata + opaque payload + content_type) and its codec"
 version = "0.1.1"
 authors.workspace = true
 homepage.workspace = true
