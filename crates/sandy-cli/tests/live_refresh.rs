@@ -141,7 +141,7 @@ fn a_refreshed_token_reaches_the_running_guest() -> anyhow::Result<()> {
         digests: false,
         egress_proxy: false,
         template: format!("{}#{}", guest_flake().display(), target.topology_attr),
-        command: vec![probe.to_string()],
+        command: vec!["sh".to_string(), "-c".to_string(), probe.to_string()],
         inputs: vec![],
         outputs: vec![],
         secrets: vec![],

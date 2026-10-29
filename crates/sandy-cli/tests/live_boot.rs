@@ -60,7 +60,7 @@ fn staged_secret_is_exported_to_the_job_env() -> anyhow::Result<()> {
     // sandy joins the command argv and runs it through `sh`, so the probe is a
     // single element (wrapping in `sh -c` would double-nest and mangle the quoting).
     let probe = r#"[ -n "$TOK" ] && [ "$TOK" = "$(cat /run/sandy/secrets/TOK)" ] && exit 0 || exit 7"#;
-    let (code, env) = sandy_run_with_secret(home.path(), &target, "TOK", &secret_file, &[probe])?;
+    let (code, env) = sandy_run_with_secret(home.path(), &target, "TOK", &secret_file, &["sh", "-c", probe])?;
 
     assert_eq!(
         env["status"], "succeeded",
@@ -103,7 +103,7 @@ fn secret_share_mounts_read_only_virtiofs() -> anyhow::Result<()> {
     // Exit 0 iff /run/sandy/secrets is a virtiofs mount AND a guest write is denied.
     // Exit 8 = wrong fs type; exit 9 = the share was writable (RO not enforced).
     let probe = r#"m=$(grep -m1 ' /run/sandy/secrets ' /proc/mounts); case "$m" in *virtiofs*) : ;; *) echo "BAD_FS:$m"; exit 8;; esac; if (echo x > /run/sandy/secrets/TOK) 2>/dev/null; then echo RW_VIOLATION; exit 9; fi; exit 0"#;
-    let (code, env) = sandy_run_with_secret(home.path(), &target, "TOK", &secret_file, &[probe])?;
+    let (code, env) = sandy_run_with_secret(home.path(), &target, "TOK", &secret_file, &["sh", "-c", probe])?;
 
     assert_eq!(
         env["status"], "succeeded",
@@ -138,7 +138,7 @@ fn github_credential_helper_serves_the_staged_token() -> anyhow::Result<()> {
     // the password line is extracted and matched against the mounted file. A helper
     // that fired for the wrong host (or not at all) yields an empty `got` and exit 7.
     let probe = r#"got=$(printf 'protocol=https\nhost=github.com\n\n' | git credential fill | sed -n 's/^password=//p'); [ -n "$got" ] && [ "$got" = "$(cat /run/sandy/secrets/GITHUB_TOKEN)" ] && exit 0 || exit 7"#;
-    let (code, env) = sandy_run_with_secret(home.path(), &target, "GITHUB_TOKEN", &secret_file, &[probe])?;
+    let (code, env) = sandy_run_with_secret(home.path(), &target, "GITHUB_TOKEN", &secret_file, &["sh", "-c", probe])?;
 
     assert_eq!(
         env["status"], "succeeded",
