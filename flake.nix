@@ -240,12 +240,14 @@
             inherit (pkgs) sandy-host-executor sandy-agent sandy-guest-wrapper;
           };
 
-          # `checks.audit` (below) is hermetic: crane's `cargoAudit` passes
-          # `--no-fetch -d <pinned advisory-db>`, so it only ever sees
-          # whatever `flake.lock` pinned, and a new RustSec advisory stays
-          # invisible until someone bumps that pin (#494). `nix run .#audit`
-          # is the live counterpart: no Rust toolchain (cargo-audit only
-          # reads `Cargo.lock`, so there is nothing to compile), and no `-d`
+          # `checks.audit` (below, via crane's `cargoAudit`) always passes
+          # `-n -d <advisory-db>` (crane's own default; see nix/packages/
+          # sandy.nix) plus this derivation's `--deny warnings --no-yanked`,
+          # so it only ever sees whatever `flake.lock` pinned `advisory-db`
+          # to, and a new RustSec advisory stays invisible until someone
+          # bumps that pin (#494). `nix run .#audit` is the live
+          # counterpart: no Rust toolchain (cargo-audit only reads
+          # `Cargo.lock`, so there is nothing to compile), and no `-d`
           # override, so it falls through to `.cargo/audit.toml`'s
           # `[database] fetch = true` and clones RustSec/advisory-db fresh
           # on every run. `"$@"` passthrough lets a caller point it at a
