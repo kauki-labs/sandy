@@ -56,7 +56,19 @@ testPkgs.testers.runNixOSTest {
         # TLS handshake is attempted) — a syntactically valid 64-char hex
         # placeholder satisfies the option's required type, nothing more.
         orchestratorFingerprint = builtins.concatStringsSep "" (builtins.genList (_: "aa") 32);
+        # #523: the unit's `/dev/kvm` plumbing (BindPaths + DeviceAllow + kvm group under
+        # PrivateDevices) only exists with `vm.enable`; the probe below needs it. The wrapper tree is
+        # never read here, so an empty dir stands in for the packaged one.
+        vm.enable = true;
+        guestWrapperPackage = pkgs.emptyDirectory;
       };
+
+      # The nixosTest guest needs nested virtualisation (the ws01 host has it) and the kvm module for
+      # `/dev/kvm` to exist inside it.
+      boot.kernelModules = [
+        "kvm-amd"
+        "kvm-intel"
+      ];
 
       # #300(b): a short StopIdleSessionSec, set here (NOT in the module —
       # that's remote-host-specific risk, not something this module should impose
@@ -162,6 +174,22 @@ testPkgs.testers.runNixOSTest {
                   rm -f /tmp/qemu-sandbox.log
                   [ "$rc" -eq 124 ]
                 '
+
+                # #523: the unit sets PrivateDevices (closed device policy, private /dev). With `vm.enable`
+                # it re-adds /dev/kvm via BindPaths + DeviceAllow + the kvm group. `-accel kvm` has no TCG
+                # fallback, so qemu stays up (timeout exits 124) only if the guest can really open /dev/kvm.
+                # Measured by mutation: dropping the `/dev/kvm rw` DeviceAllow entry leaves this passing. The
+                # job runs in the user manager's scope, outside the unit's cgroup device policy; the bind
+                # mount and group access are what this probe guards.
+                # shellcheck disable=SC2016 # the $vars are meant for the nested `sh -c`
+                systemd-run --user --scope -p Delegate=yes -- sh -c '
+                  rc=0
+                  timeout 2 qemu-system-x86_64 -machine accel=kvm -nodefaults -display none -S \
+                    >/tmp/qemu-kvm.log 2>&1 || rc=$?
+                  if [ "$rc" -eq 124 ]; then echo qemu-kvm-ok; else echo "qemu-kvm-failed rc=$rc: $(cat /tmp/qemu-kvm.log)"; fi
+                  rm -f /tmp/qemu-kvm.log
+                  [ "$rc" -eq 124 ]
+                '
               '';
             }) "sandy-executor-probe-run";
           };
@@ -221,7 +249,11 @@ testPkgs.testers.runNixOSTest {
     # failing on an actual regression (a hardening option dropped, a new
     # capability granted, etc). Tighten this if the module gets hardened
     # further.
-    print(machine.succeed("systemd-analyze security sandy-executor.service --no-pager --threshold=27"))
+    #
+    # #523: this node now runs with `vm.enable` (the `/dev/kvm` DeviceAllow
+    # entries cost 0.1: 2.8 displayed), so the gate is 28, one step above the
+    # old 27.
+    print(machine.succeed("systemd-analyze security sandy-executor.service --no-pager --threshold=28"))
 
     # #300: the unit actually carries the configured `TimeoutStopSec`, so a
     # `systemctl stop` gives an in-flight job's own shutdown fail-safe
@@ -308,6 +340,10 @@ testPkgs.testers.runNixOSTest {
     assert "qemu-sandbox-ok" in probe_output, (
         f"qemu -sandbox did not start inside the hardened unit — its seccomp filter may clash with the unit's "
         f"SystemCallFilter or NoNewPrivileges — journal:\n{probe_output}"
+    )
+    assert "qemu-kvm-ok" in probe_output, (
+        f"qemu could not open /dev/kvm inside the hardened unit — PrivateDevices/DeviceAllow/the kvm group "
+        f"may hide it, so no KVM guest can run under this unit — journal:\n{probe_output}"
     )
 
     # #300(b) smoke check: with StopIdleSessionSec=2 set on this node, wait
