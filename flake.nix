@@ -457,6 +457,11 @@
                         enable = true;
                         orchestrator = "127.0.0.1:1";
                         hostId = "eval-check";
+                        # Never dialed (pure eval, nothing here ever boots):
+                        # a syntactically valid 64-char hex placeholder
+                        # satisfies the option's required type, same as
+                        # `nix/tests/sandy-executor-vm.nix`'s own placeholder.
+                        orchestratorFingerprint = builtins.concatStringsSep "" (builtins.genList (_: "aa") 32);
                       };
                     }
                     extraConfig
