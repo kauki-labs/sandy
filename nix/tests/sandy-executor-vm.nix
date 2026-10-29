@@ -35,6 +35,28 @@ in
 testPkgs.testers.runNixOSTest {
   name = "sandy-executor-containment";
 
+  # #523: a second, minimal node keeping `vm.enable` at its default (false) —
+  # the far more common deployment shape (every non-VM-capable stage-1 host).
+  # Before this PR, the single `machine` node tested exactly this
+  # configuration; flipping it to `vm.enable = true` would otherwise silently
+  # stop verifying the default unit's own (tighter) hardening score, since
+  # `vm.enable` only ever adds device/bind-mount exposure, never removes it.
+  # Deliberately lightweight: just enough config to evaluate
+  # `systemd-analyze security`, not a second full containment/probe run —
+  # the `machine` node below already covers that end to end.
+  nodes.machineDefault =
+    { ... }:
+    {
+      imports = [ (import ../modules/sandy-executor.nix) ];
+      services.sandy-executor = {
+        enable = true;
+        orchestrator = "127.0.0.1:1";
+        hostId = "test-host-default";
+        orchestratorFingerprint = builtins.concatStringsSep "" (builtins.genList (_: "aa") 32);
+        # vm.enable left at its default (false) — the point of this node.
+      };
+    };
+
   nodes.machine =
     {
       config,
@@ -178,18 +200,24 @@ testPkgs.testers.runNixOSTest {
                 # #523: the unit sets PrivateDevices (closed device policy, private /dev). With `vm.enable`
                 # it re-adds /dev/kvm via BindPaths + DeviceAllow + the kvm group. `-accel kvm` has no TCG
                 # fallback, so qemu stays up (timeout exits 124) only if the guest can really open /dev/kvm.
-                # Measured by mutation: dropping the `/dev/kvm rw` DeviceAllow entry leaves this passing. The
-                # job runs in the user manager's scope, outside the unit's cgroup device policy; the bind
-                # mount and group access are what this probe guards.
-                # shellcheck disable=SC2016 # the $vars are meant for the nested `sh -c`
-                systemd-run --user --scope -p Delegate=yes -- sh -c '
-                  rc=0
-                  timeout 2 qemu-system-x86_64 -machine accel=kvm -nodefaults -display none -S \
-                    >/tmp/qemu-kvm.log 2>&1 || rc=$?
-                  if [ "$rc" -eq 124 ]; then echo qemu-kvm-ok; else echo "qemu-kvm-failed rc=$rc: $(cat /tmp/qemu-kvm.log)"; fi
-                  rm -f /tmp/qemu-kvm.log
-                  [ "$rc" -eq 124 ]
-                '
+                # Measured by mutation: dropping the `/dev/kvm rw` DeviceAllow entry leaves this failing (ENODEV
+                # opening /dev/kvm, confirmed by re-running with that entry removed).
+                #
+                # Deliberately NOT wrapped in `systemd-run --user --scope` like the checks above: those
+                # reparent into user@<uid>.service's cgroup, which is correct for THEM (a real dispatched
+                # `Process`-backend job genuinely runs there, via `SystemdRunContainment`). The real `Vm`
+                # backend does not — `QemuBackend::launch` (impls/vm/src/qemu.rs) spawns qemu as a plain
+                # `Command::spawn()` child of `sandy-executor.service` itself, with no containment wrapper at
+                # all (`handle_dispatch`'s Vm arm, crates/sandy-host-executor/src/dispatch.rs, passes no
+                # `Containment`). So qemu's real `/dev/kvm` access is gated by THIS unit's own DeviceAllow,
+                # not user@.service's — running the check here, inside the probe's own ExecStart (which
+                # already copies sandy-executor.service's full serviceConfig), is what actually exercises it.
+                rc=0
+                timeout 2 qemu-system-x86_64 -machine accel=kvm -nodefaults -display none -S \
+                  >/tmp/qemu-kvm.log 2>&1 || rc=$?
+                if [ "$rc" -eq 124 ]; then echo qemu-kvm-ok; else echo "qemu-kvm-failed rc=$rc: $(cat /tmp/qemu-kvm.log)"; fi
+                rm -f /tmp/qemu-kvm.log
+                [ "$rc" -eq 124 ]
               '';
             }) "sandy-executor-probe-run";
           };
@@ -197,6 +225,12 @@ testPkgs.testers.runNixOSTest {
     };
 
   testScript = ''
+    machineDefault.wait_for_unit("multi-user.target")
+    # #523: the default (vm.enable = false) unit's own hardening score,
+    # unaffected by the new /dev/kvm DeviceAllow/BindPaths entries — kept at
+    # the original, tighter threshold this file used before this PR.
+    print(machineDefault.succeed("systemd-analyze security sandy-executor.service --no-pager --threshold=27"))
+
     machine.wait_for_unit("multi-user.target")
 
     # Not `journalctl -u sandy-executor`: `PAMName = "login"` makes
