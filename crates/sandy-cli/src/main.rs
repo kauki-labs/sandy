@@ -6,8 +6,8 @@
 //! maps results to process exit bands (INV-11).
 //!
 //! A separate crate root from `lib.rs`, so it repeats that file's
-//! `clippy::print_stdout` deny (#512): [`sandy_cli::output::emit`] and
-//! [`emit_str`] are this binary's only sanctioned stdout sinks.
+//! `clippy::print_stdout` deny (#512): [`sandy_cli::output::emit`] is
+//! this binary's only sanctioned stdout sink.
 #![deny(clippy::print_stdout)]
 
 use base64::Engine as _;
@@ -17,7 +17,8 @@ use sandy_cli::{
     app_register::{self, Owner},
     doctor,
     output::{
-        JobRecords, OutputFormat, Render, emit, format_attach, format_cancel, format_list, format_status, format_submit,
+        AttachedChannel, CancelledJob, JobRecords, JobStatusReport, JobSummaries, MeshFingerprint, OutputFormat,
+        Render, SubmittedJob, emit,
     },
     plan::{JobPlan, RunArgs, parse_run},
     supervisor,
@@ -556,18 +557,23 @@ fn main() {
 }
 
 /// Dispatch a `sandy mesh <op>` command.
-fn dispatch_mesh(op: MeshOp) -> i32 {
+fn dispatch_mesh(op: MeshOp, output: OutputFormat) -> i32 {
     match op {
-        MeshOp::Key { op } => dispatch_mesh_key(op),
+        MeshOp::Key { op } => dispatch_mesh_key(op, output),
     }
 }
 
 /// Dispatch a `sandy mesh key <op>` command: mint/load or print a node's
 /// persisted mesh TLS identity fingerprint (decision 20).
-fn dispatch_mesh_key(op: MeshKeyOp) -> i32 {
+fn dispatch_mesh_key(op: MeshKeyOp, output: OutputFormat) -> i32 {
     match op {
         MeshKeyOp::Generate { dir } => match sandy_conn::TlsIdentity::load_or_generate(&dir) {
-            Ok(identity) => succeed_or(emit_str(Ok(identity.fingerprint().to_hex()))),
+            Ok(identity) => succeed_or(emit(
+                &MeshFingerprint {
+                    fingerprint: identity.fingerprint().to_hex(),
+                },
+                output,
+            )),
             Err(e) => {
                 eprintln!("sandy: {e}");
                 ProcessExit::InvalidPlan.code()
@@ -587,7 +593,12 @@ fn dispatch_mesh_key(op: MeshKeyOp) -> i32 {
             // Both files already confirmed present, so `load_or_generate`
             // only ever takes its load path here — never mints a fresh one.
             match sandy_conn::TlsIdentity::load_or_generate(&dir) {
-                Ok(identity) => succeed_or(emit_str(Ok(identity.fingerprint().to_hex()))),
+                Ok(identity) => succeed_or(emit(
+                    &MeshFingerprint {
+                        fingerprint: identity.fingerprint().to_hex(),
+                    },
+                    output,
+                )),
                 Err(e) => {
                     eprintln!("sandy: {e}");
                     ProcessExit::InvalidPlan.code()
@@ -1114,10 +1125,10 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
             // `attach::persist_attach_token`'s own doc for the fallback
             // behavior on any failure here.
             sandy_cli::attach::persist_attach_token(&r.job_id, &r.attach_token);
-            succeed_or(emit_str(format_submit(&r, output)))
+            succeed_or(emit(&SubmittedJob::from(&r), output))
         }
         Some(control_response::Result::Cancel(_)) => {
-            succeed_or(emit_str(format_cancel(cancel_echo.as_deref().unwrap_or("?"), output)))
+            succeed_or(emit(&CancelledJob::new(cancel_echo.as_deref().unwrap_or("?")), output))
         }
         // `-o json` keeps today's one-shot machine path (print the channel id
         // + cap, exit) — an automation caller wants the cap's bytes, not a
@@ -1125,7 +1136,7 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
         // flag) redeems the cap on `sandyd`'s separate attach data-plane
         // socket instead (#327) and goes interactive.
         Some(control_response::Result::Attach(r)) if output == OutputFormat::Json => {
-            succeed_or(emit_str(format_attach(&r, output)))
+            succeed_or(emit(&AttachedChannel::from(&r), output))
         }
         Some(control_response::Result::Attach(r)) => {
             let job_id = attach_job_id.unwrap_or_default();
@@ -1186,8 +1197,8 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
                 }
             }
         }
-        Some(control_response::Result::Status(r)) => succeed_or(emit_str(format_status(&r, output))),
-        Some(control_response::Result::List(r)) => succeed_or(emit_str(format_list(&r, output))),
+        Some(control_response::Result::Status(r)) => succeed_or(emit(&JobStatusReport::from(&r), output)),
+        Some(control_response::Result::List(r)) => succeed_or(emit(&JobSummaries::from(&r), output)),
         // The daemon understood the request but could not honour it (unknown
         // job id, not yet dispatchable, …): the request itself is the fault,
         // the same InvalidPlan band `run` uses for an unbootable plan.
@@ -1369,7 +1380,7 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
 
     // `mesh` ops touch only the caller-named identity dir, not $SANDY_HOME.
     if let Command::Mesh { op } = command {
-        return dispatch_mesh(op);
+        return dispatch_mesh(op, output);
     }
 
     // `daemon` ops talk to sandyd over its own socket, not $SANDY_HOME.
@@ -1491,31 +1502,7 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
     }
 }
 
-/// Print an already-formatted string to stdout, or report a serialization
-/// failure — the pre-#512 `emit`, kept only for the `daemon` commands
-/// (`format_submit`/`format_cancel`/`format_attach`/`format_status`/
-/// `format_list`) that #513 migrates to typed [`Render`](output::Render)
-/// output; remove this once it does.
-///
-/// An empty text rendering prints nothing; JSON always prints (an empty list
-/// is a valid `[]`). On a `serde_json` failure, returns the infra-fault band.
-#[allow(clippy::print_stdout, reason = "legacy sink for #513's not-yet-migrated commands")]
-fn emit_str(formatted: serde_json::Result<String>) -> Result<(), i32> {
-    match formatted {
-        Ok(out) => {
-            if !out.is_empty() {
-                println!("{out}");
-            }
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("sandy: could not serialize output: {e}");
-            Err(ProcessExit::InfraFault.code())
-        }
-    }
-}
-
-/// Map an [`emit`]/[`emit_str`] result to a process band: success (band 0) or
+/// Map an [`emit`] result to a process band: success (band 0) or
 /// the serialization failure band it carries.
 fn succeed_or(emitted: Result<(), i32>) -> i32 {
     match emitted {
