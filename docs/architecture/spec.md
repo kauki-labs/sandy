@@ -58,8 +58,8 @@ The design still guarantees, even from inside a compromised guest:
   `--readonly` on `virtiofsd`: a guest-root remount-rw still gets `EROFS` on
   write;
 - on qemu, the qemu process runs under seccomp (`-sandbox on`, `qemu_args`), so a device-bug escape does not get
-  the sandy user's full syscall surface (#392). Resource limits (cgroup) and `virtiofsd`'s own sandbox are not yet
-  enforced;
+  the sandy user's full syscall surface (#392). Each `virtiofsd` runs in its own mount, user and pid namespaces
+  under seccomp (`--sandbox=namespace`, #523). Resource limits (cgroup) are not yet enforced;
 - **no egress at all on macOS, until #360.** `vfkit_args`
   (`impls/vm/src/vfkit.rs`) emits no `virtio-net` device, so a macOS guest has
   no NIC to reach anything over: denied by construction, not merely

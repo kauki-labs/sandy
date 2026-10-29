@@ -105,14 +105,14 @@ impl GuestShareTransport for VirtioFsTransport {
 }
 
 /// The `virtiofsd` CLI args (after the binary) serving `share`: its socket, the
-/// shared dir, `--sandbox=none`, and `--readonly` for a read-only share so guest
+/// shared dir, `--sandbox=namespace`, and `--readonly` for a read-only share so guest
 /// writes are denied at the host boundary (INV-1), not only by the guest mount.
 ///
-/// `--sandbox=none` disables virtiofsd's own namespace/chroot confinement (it is
-/// NOT a sandbox): the `namespace` and `chroot` modes need privileges sandy's
-/// unprivileged launch does not have. The daemon only ever serves a single
-/// per-run, sandy-owned dir that is wiped at teardown, and the guest is confined to
-/// the VM, so the daemon's own confinement is not the containment boundary here.
+/// `--sandbox=namespace` runs the serving process in its own mount, user and pid
+/// namespaces, rootless through a user namespace (#523; measured with virtiofsd 1.13.3
+/// as an unprivileged user), on top of the seccomp filter virtiofsd applies by default.
+/// `chroot` is root-only and is not used. A host that forbids unprivileged user
+/// namespaces makes the daemon fail to start, which surfaces as a boot fault.
 ///
 /// Pure, so the read-only decision per share is unit-testable without launching the
 /// daemon.
@@ -121,7 +121,7 @@ pub fn virtiofsd_args(share: &ShareSpec) -> Vec<String> {
     let mut args = vec![
         format!("--socket-path={}", share.socket.display()),
         format!("--shared-dir={}", share.host_dir.display()),
-        "--sandbox=none".to_string(),
+        "--sandbox=namespace".to_string(),
     ];
     if share.readonly {
         args.push("--readonly".to_string());

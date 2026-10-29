@@ -55,26 +55,33 @@ to `sharedDir`) or reach another run, and the VM is the trust boundary. K5
 unavailable in the vfkit CLI as of v0.6.3 (its virtio-fs device has no read-only
 option, though other vfkit devices do). Revisit if vfkit adds one.
 
-## 3. virtiofsd runs `--sandbox=none`
+## 3. virtiofsd runs `--sandbox=namespace`
 
-**Status:** accepted.
+**Status:** accepted. Amended 2026-10-29 (#523, audit NV-02); it was `--sandbox=none`.
 
-**Context.** `virtiofsd` offers `--sandbox=namespace` (the default) and
-`--sandbox=chroot` to confine the daemon itself, but both need privileges
-(user-namespace setup or `CAP_SYS_CHROOT`) that sandy's unprivileged launch does
-not hold.
+**Context.** `virtiofsd` offers `--sandbox=namespace`, `--sandbox=chroot` and
+`--sandbox=none`. The first version of this decision assumed both confining modes need
+privileges that sandy's unprivileged launch does not hold. That is false for
+`namespace`. Measured on ws01 (virtiofsd 1.13.3, uid 1000, 2026-10-29): `namespace`
+starts and serves rootless through a user namespace; `chroot` fails with "can only be
+used by root". Under `none` the daemon still runs under virtiofsd's default seccomp
+filter (`Seccomp: 2`), but in the host's mount, user and pid namespaces. Under
+`namespace` the serving process has its own mount, user and pid namespaces and keeps
+seccomp.
 
-**Decision.** The qemu transport launches each `virtiofsd` with `--sandbox=none`,
-so the daemon has no namespace/chroot confinement of its own.
+**Decision.** The qemu transport launches each `virtiofsd` with `--sandbox=namespace`.
 
-**Consequences.** The daemon's own sandbox is not a containment layer; the VM
-boundary plus the fact that each daemon serves only one per-run, sandy-owned dir
-(wiped at teardown) bound the blast radius. Dropping `--sandbox=none` for a
-privileged mode would make the unprivileged launch fail, so it stays.
+**Consequences.** The serving process is confined by namespaces as well as seccomp;
+the VM boundary and the single per-run, sandy-owned dir (wiped at teardown) still bound
+the blast radius. A host that forbids unprivileged user namespaces makes the daemon
+fail to start, which surfaces as a boot fault, not a silent downgrade. The live gate
+`live_qemu_sandbox::a_virtiofsd_runs_in_its_own_namespaces_under_seccomp` (K22) proves
+the confinement on qemu.
 
-**Set aside.** A privileged `namespace`/`chroot` sandbox: rejected — it would
-require sandy to run virtiofsd with elevated privileges, a larger attack surface
-than the confinement it buys given the VM boundary.
+**Set aside (do not re-propose without new information).** `--sandbox=chroot`: root
+only. A fallback to `--sandbox=none` when namespaces are unavailable: it would
+silently drop the confinement. Running `virtiofsd` with elevated privileges: still
+rejected, a larger attack surface than the confinement buys.
 
 ## 4. Inputs copied, outputs collected
 
