@@ -91,7 +91,7 @@ jobs:
           fi
           jq '{number, head_sha: .head.sha, author: .user.login}' <<<"$pr" > pr.json
           gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
-            --jq '.[] | {body, created_at, updated_at, author_association}' | jq -s . > comments.json
+            --jq '.[] | {body, created_at, updated_at, author_association, author: .user.login}' | jq -s . > comments.json
           # Fetch the PR head as git objects only; never check it out or run it.
           git fetch --no-tags origin "refs/pull/$PR_NUMBER/head"
           git diff --no-color -U100000 "$base_sha...$head_sha" > diff.patch

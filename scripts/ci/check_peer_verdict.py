@@ -7,8 +7,11 @@ SHA says CHANGES. A new push changes the head SHA, so it voids the verdict. If t
 diff changes text under an `Owner decisions` heading, a comment whose first line is
 `Owner sign-off: APPROVE, pinned to <sha>` is also required.
 
-Only comments from OWNER, MEMBER or COLLABORATOR count: the repo is public, so any
-stranger could otherwise post a verdict. All sessions share one GitHub account, so
+Only comments from a trusted commenter count: the repo is public, so any stranger
+could otherwise post a verdict. Trusted means the shared agent account (by login) or
+an OWNER, MEMBER or COLLABORATOR association. The login is needed because the Actions
+token sees a private org member as CONTRIBUTOR or NONE, so the association alone
+rejected the real account (found by the evidence run on #530). All sessions share one GitHub account, so
 the author says nothing about WHO wrote it. This check guards against forgetting the
 gate. It cannot prove who gave a verdict, or that a session did not write its own.
 The reviewer name is optional (a verdict without one passes); when present it is
@@ -24,7 +27,7 @@ so it is never an exemption.
 
 CLI: check_peer_verdict.py --pr pr.json --comments comments.json --diff diff.patch
 pr.json is {number, head_sha, author}; comments.json is a list of
-{body, created_at, updated_at, author_association}. The diff should carry wide context (`git diff -U100000`) so the
+{body, created_at, updated_at, author_association, author}. The diff should carry wide context (`git diff -U100000`) so the
 nearest heading is always visible. Exit 0 passes, 1 fails with the reason on stdout.
 """
 
@@ -35,6 +38,8 @@ import sys
 
 REVIEWER = re.compile(r"^(sandy-[a-z0-9]+|sandbox PoC)$")
 TRUSTED = {"OWNER", "MEMBER", "COLLABORATOR"}
+# The one account all agent sessions post as (see the module docstring).
+TRUSTED_LOGINS = {"Teebor-Choka"}
 PINNED = r"[,.]?\s+pinned to\s+[`*]*(?P<sha>[0-9a-f]{40})\b"
 VERDICT = re.compile(
     r"^\**Peer verdict(?:\s*\((?P<name>[^)]+)\))?\s*:\s*(?P<kind>APPROVE|CHANGES)" + PINNED,
@@ -53,8 +58,21 @@ def first_line(body: str) -> str:
     return ""
 
 
+def is_trusted(comment: dict) -> bool:
+    return comment.get("author") in TRUSTED_LOGINS or comment.get("author_association") in TRUSTED
+
+
 def trusted(comments: list) -> list:
-    return [c for c in comments if c.get("author_association") in TRUSTED]
+    return [c for c in comments if is_trusted(c)]
+
+
+def ignored_note(comments: list) -> str:
+    """Say how many comments were ignored as untrusted, so a failure is diagnosable."""
+    ignored = [c for c in comments if not is_trusted(c)]
+    if not ignored:
+        return ""
+    seen = sorted({c.get("author_association") or "none" for c in ignored})
+    return f" ({len(ignored)} untrusted comment(s) ignored, associations seen: {', '.join(seen)})"
 
 
 def changes_owner_decisions(diff: str) -> bool:
@@ -108,7 +126,7 @@ def verdict_problem(pr: dict, comments: list) -> str:
         return "" if pinned[-1] == "APPROVE" else f"the latest peer verdict on {head} is CHANGES"
     if bad_name:
         return f"the verdict names reviewer '{bad_name}', not a sandy-* session or sandbox PoC"
-    return f"no peer verdict pinned to the full head SHA {head}"
+    return f"no peer verdict pinned to the full head SHA {head}{ignored_note(comments)}"
 
 
 def evaluate(pr: dict, comments: list, diff: str):

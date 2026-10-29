@@ -16,12 +16,13 @@ def pr(author="Teebor-Choka", title="test(sandyd): a change", head=HEAD):
     return {"number": 517, "head_sha": head, "author": author, "title": title}
 
 
-def comment(body, at="2026-10-29T14:58:23Z", assoc="MEMBER", updated=None):
+def comment(body, at="2026-10-29T14:58:23Z", assoc="MEMBER", updated=None, login="someone-else"):
     return {
         "body": body,
         "created_at": at,
         "updated_at": updated or at,
         "author_association": assoc,
+        "author": login,
     }
 
 
@@ -111,6 +112,24 @@ class PeerVerdict(unittest.TestCase):
         for assoc in ("NONE", "CONTRIBUTOR", "FIRST_TIMER"):
             ok, _ = cpv.evaluate(pr(), [comment(verdict(), assoc=assoc)], "")
             self.assertFalse(ok, assoc)
+
+    def test_the_shared_account_counts_even_when_its_association_is_hidden(self):
+        # The Actions token sees a private org member as CONTRIBUTOR or NONE (#528 evidence run).
+        for assoc in ("CONTRIBUTOR", "NONE"):
+            c = comment(verdict(), assoc=assoc, login="Teebor-Choka")
+            ok, why = cpv.evaluate(pr(), [c], "")
+            self.assertTrue(ok, f"{assoc}: {why}")
+
+    def test_an_unlisted_login_with_a_hidden_association_does_not_count(self):
+        c = comment(verdict(), assoc="CONTRIBUTOR", login="a-stranger")
+        ok, _ = cpv.evaluate(pr(), [c], "")
+        self.assertFalse(ok)
+
+    def test_the_failure_says_how_many_comments_were_ignored_as_untrusted(self):
+        c = comment(verdict(), assoc="CONTRIBUTOR", login="a-stranger")
+        _, why = cpv.evaluate(pr(), [c], "")
+        self.assertIn("1 untrusted", why)
+        self.assertIn("CONTRIBUTOR", why)
 
     def test_a_collaborator_verdict_counts(self):
         ok, why = cpv.evaluate(pr(), [comment(verdict(), assoc="COLLABORATOR")], "")
