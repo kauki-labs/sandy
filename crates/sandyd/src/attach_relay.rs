@@ -1054,11 +1054,17 @@ mod tests {
         let (registry, operator_cap) = registry_with_job_on_host("job-1", "ws01").await?;
 
         let host_registry = Arc::new(HostRegistry::default());
-        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let allowlist = ExecutorAllowlist::new([(executor_ip(), test_fp())]);
         let Registration {
             mut attach_state_rx, ..
         } = host_registry
-            .register(&allowlist, executor_ip(), "ws01".to_owned(), host_capabilities())
+            .register(
+                &allowlist,
+                executor_ip(),
+                test_fp(),
+                "ws01".to_owned(),
+                host_capabilities(),
+            )
             .expect("ws01 must register");
 
         let (client, server) = tokio::net::UnixStream::pair()?;
@@ -1142,11 +1148,17 @@ mod tests {
             .context("the agent's own join must succeed")?;
 
         let host_registry = Arc::new(HostRegistry::default());
-        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let allowlist = ExecutorAllowlist::new([(executor_ip(), test_fp())]);
         let Registration {
             mut attach_state_rx, ..
         } = host_registry
-            .register(&allowlist, executor_ip(), "ws01".to_owned(), host_capabilities())
+            .register(
+                &allowlist,
+                executor_ip(),
+                test_fp(),
+                "ws01".to_owned(),
+                host_capabilities(),
+            )
             .expect("ws01 must register");
 
         let (client, server) = tokio::net::UnixStream::pair()?;
@@ -1248,6 +1260,11 @@ mod tests {
 
     fn executor_ip() -> std::net::IpAddr {
         std::net::IpAddr::V4(std::net::Ipv4Addr::new(100, 64, 0, 7))
+    }
+
+    /// A deterministic test fingerprint, not a real certificate digest.
+    fn test_fp() -> sandy_conn::Fingerprint {
+        sandy_conn::Fingerprint::from_hex(&"aa".repeat(32)).expect("64-char hex literal")
     }
 
     fn host_capabilities() -> sandy_executor_proto::Capabilities {

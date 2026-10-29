@@ -29,6 +29,19 @@ pub enum ExecutorConfigError {
     /// `SANDY_AGENT_PATH` is unset or empty.
     #[error("SANDY_AGENT_PATH is required (the path to the sandy-agent binary)")]
     MissingAgentPath,
+    /// `SANDY_HOST_EXECUTOR_ORCHESTRATOR_FINGERPRINT` is unset or empty.
+    #[error(
+        "SANDY_HOST_EXECUTOR_ORCHESTRATOR_FINGERPRINT is required (decision 20: the pinned fingerprint of sandyd's \
+         mesh TLS identity)"
+    )]
+    MissingOrchestratorFingerprint,
+    /// `SANDY_HOST_EXECUTOR_ORCHESTRATOR_FINGERPRINT` is set but not a valid
+    /// 64-char hex SHA-256 digest.
+    #[error("SANDY_HOST_EXECUTOR_ORCHESTRATOR_FINGERPRINT is not a valid fingerprint: {0:?}")]
+    InvalidOrchestratorFingerprint(String),
+    /// `SANDY_HOST_EXECUTOR_TLS_IDENTITY_DIR` is unset or empty.
+    #[error("SANDY_HOST_EXECUTOR_TLS_IDENTITY_DIR is required (where this host's persisted mesh TLS identity lives)")]
+    MissingTlsIdentityDir,
 }
 
 /// This host-executor's resolved runtime configuration.
@@ -42,6 +55,14 @@ pub struct ExecutorConfig {
     pub host_id: String,
     /// The `sandy-agent` binary this host-executor launches for each dispatch.
     pub agent_path: PathBuf,
+    /// sandyd's pinned mesh TLS certificate fingerprint (decision 20):
+    /// provisioned out of band, the mirror of what `SANDY_MESH_ALLOWLIST`
+    /// pins on sandyd's own side for this host.
+    pub orchestrator_fingerprint: sandy_conn::Fingerprint,
+    /// Where this host-executor's own persisted mesh TLS identity lives
+    /// (`SANDY_HOST_EXECUTOR_TLS_IDENTITY_DIR`) — loaded or generated once
+    /// at startup via [`sandy_conn::TlsIdentity::load_or_generate`].
+    pub tls_identity_dir: PathBuf,
 }
 
 /// Parse this host-executor's config from the raw values of
@@ -61,6 +82,8 @@ pub fn parse_executor_config(
     orchestrator: Option<&str>,
     host_id: Option<&str>,
     agent_path: Option<&str>,
+    orchestrator_fingerprint: Option<&str>,
+    tls_identity_dir: Option<&str>,
 ) -> Result<ExecutorConfig, ExecutorConfigError> {
     let orchestrator_raw = orchestrator.ok_or(ExecutorConfigError::MissingOrchestrator)?;
     let orchestrator = orchestrator_raw
@@ -73,10 +96,20 @@ pub fn parse_executor_config(
     let agent_path = agent_path
         .filter(|v| !v.is_empty())
         .ok_or(ExecutorConfigError::MissingAgentPath)?;
+    let fingerprint_raw = orchestrator_fingerprint
+        .filter(|v| !v.is_empty())
+        .ok_or(ExecutorConfigError::MissingOrchestratorFingerprint)?;
+    let orchestrator_fingerprint = sandy_conn::Fingerprint::from_hex(fingerprint_raw)
+        .map_err(|_| ExecutorConfigError::InvalidOrchestratorFingerprint(fingerprint_raw.to_owned()))?;
+    let tls_identity_dir = tls_identity_dir
+        .filter(|v| !v.is_empty())
+        .ok_or(ExecutorConfigError::MissingTlsIdentityDir)?;
     Ok(ExecutorConfig {
         orchestrator,
         host_id,
         agent_path: PathBuf::from(agent_path),
+        orchestrator_fingerprint,
+        tls_identity_dir: PathBuf::from(tls_identity_dir),
     })
 }
 
@@ -84,12 +117,19 @@ pub fn parse_executor_config(
 mod tests {
     use super::*;
 
+    /// A valid 64-char hex fingerprint literal, not a real certificate digest.
+    fn fp_hex() -> String {
+        "aa".repeat(32)
+    }
+
     #[test]
     fn a_fully_configured_set_parses() -> anyhow::Result<()> {
         let config = parse_executor_config(
             Some("203.0.113.10:7700"),
             Some("remote-host"),
             Some("/usr/bin/sandy-agent"),
+            Some(&fp_hex()),
+            Some("/var/lib/sandy-executor/mesh-tls"),
         )?;
         assert_eq!(
             config,
@@ -97,6 +137,8 @@ mod tests {
                 orchestrator: "203.0.113.10:7700".parse()?,
                 host_id: "remote-host".to_owned(),
                 agent_path: PathBuf::from("/usr/bin/sandy-agent"),
+                orchestrator_fingerprint: sandy_conn::Fingerprint::from_hex(&fp_hex())?,
+                tls_identity_dir: PathBuf::from("/var/lib/sandy-executor/mesh-tls"),
             }
         );
         Ok(())
@@ -105,7 +147,13 @@ mod tests {
     #[test]
     fn a_missing_orchestrator_is_refused_by_name() {
         assert_eq!(
-            parse_executor_config(None, Some("remote-host"), Some("/usr/bin/sandy-agent")),
+            parse_executor_config(
+                None,
+                Some("remote-host"),
+                Some("/usr/bin/sandy-agent"),
+                Some(&fp_hex()),
+                Some("/var/lib/sandy-executor/mesh-tls")
+            ),
             Err(ExecutorConfigError::MissingOrchestrator)
         );
     }
@@ -116,7 +164,9 @@ mod tests {
             parse_executor_config(
                 Some("not-an-address"),
                 Some("remote-host"),
-                Some("/usr/bin/sandy-agent")
+                Some("/usr/bin/sandy-agent"),
+                Some(&fp_hex()),
+                Some("/var/lib/sandy-executor/mesh-tls")
             ),
             Err(ExecutorConfigError::InvalidOrchestrator("not-an-address".to_owned()))
         );
@@ -127,7 +177,13 @@ mod tests {
     #[test]
     fn an_orchestrator_with_no_port_is_refused() {
         assert_eq!(
-            parse_executor_config(Some("203.0.113.10"), Some("remote-host"), Some("/usr/bin/sandy-agent")),
+            parse_executor_config(
+                Some("203.0.113.10"),
+                Some("remote-host"),
+                Some("/usr/bin/sandy-agent"),
+                Some(&fp_hex()),
+                Some("/var/lib/sandy-executor/mesh-tls")
+            ),
             Err(ExecutorConfigError::InvalidOrchestrator("203.0.113.10".to_owned()))
         );
     }
@@ -135,7 +191,13 @@ mod tests {
     #[test]
     fn a_missing_host_id_is_refused_by_name() {
         assert_eq!(
-            parse_executor_config(Some("203.0.113.10:7700"), None, Some("/usr/bin/sandy-agent")),
+            parse_executor_config(
+                Some("203.0.113.10:7700"),
+                None,
+                Some("/usr/bin/sandy-agent"),
+                Some(&fp_hex()),
+                Some("/var/lib/sandy-executor/mesh-tls")
+            ),
             Err(ExecutorConfigError::MissingHostId)
         );
     }
@@ -143,7 +205,13 @@ mod tests {
     #[test]
     fn an_empty_host_id_is_refused_same_as_missing() {
         assert_eq!(
-            parse_executor_config(Some("203.0.113.10:7700"), Some(""), Some("/usr/bin/sandy-agent")),
+            parse_executor_config(
+                Some("203.0.113.10:7700"),
+                Some(""),
+                Some("/usr/bin/sandy-agent"),
+                Some(&fp_hex()),
+                Some("/var/lib/sandy-executor/mesh-tls")
+            ),
             Err(ExecutorConfigError::MissingHostId)
         );
     }
@@ -151,8 +219,58 @@ mod tests {
     #[test]
     fn a_missing_agent_path_is_refused_by_name() {
         assert_eq!(
-            parse_executor_config(Some("203.0.113.10:7700"), Some("remote-host"), None),
+            parse_executor_config(
+                Some("203.0.113.10:7700"),
+                Some("remote-host"),
+                None,
+                Some(&fp_hex()),
+                Some("/var/lib/sandy-executor/mesh-tls")
+            ),
             Err(ExecutorConfigError::MissingAgentPath)
+        );
+    }
+
+    #[test]
+    fn a_missing_orchestrator_fingerprint_is_refused_by_name() {
+        assert_eq!(
+            parse_executor_config(
+                Some("203.0.113.10:7700"),
+                Some("remote-host"),
+                Some("/usr/bin/sandy-agent"),
+                None,
+                Some("/var/lib/sandy-executor/mesh-tls")
+            ),
+            Err(ExecutorConfigError::MissingOrchestratorFingerprint)
+        );
+    }
+
+    #[test]
+    fn an_invalid_orchestrator_fingerprint_is_refused_by_name() {
+        assert_eq!(
+            parse_executor_config(
+                Some("203.0.113.10:7700"),
+                Some("remote-host"),
+                Some("/usr/bin/sandy-agent"),
+                Some("not-a-fingerprint"),
+                Some("/var/lib/sandy-executor/mesh-tls")
+            ),
+            Err(ExecutorConfigError::InvalidOrchestratorFingerprint(
+                "not-a-fingerprint".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_missing_tls_identity_dir_is_refused_by_name() {
+        assert_eq!(
+            parse_executor_config(
+                Some("203.0.113.10:7700"),
+                Some("remote-host"),
+                Some("/usr/bin/sandy-agent"),
+                Some(&fp_hex()),
+                None
+            ),
+            Err(ExecutorConfigError::MissingTlsIdentityDir)
         );
     }
 }

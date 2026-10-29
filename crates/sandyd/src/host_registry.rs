@@ -28,7 +28,7 @@
 //! real socket, matching [`crate::link_auth`]'s own shape.
 
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    collections::{HashMap, HashSet, hash_map::Entry},
     net::IpAddr,
     sync::{
         Arc, Mutex, PoisonError,
@@ -36,30 +36,39 @@ use std::{
     },
 };
 
+use sandy_conn::Fingerprint;
 use sandy_executor_proto::{AttachStateChanged, Cancel, Capabilities, Dispatch, IsolationClass, SandboxKind};
 use tokio::sync::mpsc;
 
-/// The mesh identities permitted to register as executor hosts. Self-reported
+/// The mesh identities permitted to register as executor hosts: pinned
+/// (peer IP, pinned-key [`Fingerprint`]) pairs (decision 20). Self-reported
 /// `host_id`s are never checked against this — only the transport's own peer
-/// IP is.
+/// IP AND the fingerprint its mutual-TLS certificate presented are. Checking
+/// the pair, not fingerprint membership alone, matters: a listener's
+/// `listen_tls` call already restricts which fingerprints may complete the
+/// handshake at all, but this allowlist is the authorization boundary for
+/// WHICH ip+fingerprint combination may register — a different allowlisted
+/// host presenting its own genuine, pinned key from an unexpected IP is still
+/// not the specific host an operator provisioned that pairing for.
 #[derive(Debug, Default, Clone)]
-pub struct ExecutorAllowlist(std::collections::HashSet<IpAddr>);
+pub struct ExecutorAllowlist(HashSet<(IpAddr, Fingerprint)>);
 
 impl ExecutorAllowlist {
-    /// An allowlist containing exactly `ips`.
+    /// An allowlist containing exactly `pairs`.
     #[must_use]
-    pub fn new(ips: impl IntoIterator<Item = IpAddr>) -> Self {
-        Self(ips.into_iter().map(|ip| ip.to_canonical()).collect())
+    pub fn new(pairs: impl IntoIterator<Item = (IpAddr, Fingerprint)>) -> Self {
+        Self(pairs.into_iter().map(|(ip, fp)| (ip.to_canonical(), fp)).collect())
     }
 
-    /// Whether `peer_ip` is a permitted executor host. Canonicalizes before
-    /// comparing, for the same reason decision 6's peer check does: a
-    /// dual-stack accept loop may report an IPv4 peer in its IPv4-mapped IPv6
-    /// form, which `IpAddr`'s `PartialEq` would otherwise treat as distinct
-    /// from the plain IPv4 form an operator configured.
+    /// Whether `(peer_ip, fingerprint)` is a permitted executor host pairing.
+    /// Canonicalizes `peer_ip` before comparing, for the same reason decision
+    /// 6's peer check does: a dual-stack accept loop may report an IPv4 peer
+    /// in its IPv4-mapped IPv6 form, which `IpAddr`'s `PartialEq` would
+    /// otherwise treat as distinct from the plain IPv4 form an operator
+    /// configured.
     #[must_use]
-    pub fn permits(&self, peer_ip: IpAddr) -> bool {
-        self.0.contains(&peer_ip.to_canonical())
+    pub fn permits(&self, peer_ip: IpAddr, fingerprint: Fingerprint) -> bool {
+        self.0.contains(&(peer_ip.to_canonical(), fingerprint))
     }
 
     /// Whether this allowlist contains no entries at all. A caller binding a
@@ -70,6 +79,16 @@ impl ExecutorAllowlist {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// The set of every pinned fingerprint this allowlist names, with peer
+    /// IPs dropped — what [`sandy_conn::listen_tls`]'s own `allowed` parameter
+    /// needs: the TLS layer pins by certificate fingerprint alone (it has no
+    /// IP to check yet at handshake time), so the IP side of each pair is
+    /// re-checked separately, at `Register` time, by [`Self::permits`].
+    #[must_use]
+    pub fn fingerprints(&self) -> HashSet<Fingerprint> {
+        self.0.iter().map(|(_ip, fp)| *fp).collect()
     }
 }
 
@@ -240,11 +259,12 @@ impl HostRegistry {
         &self,
         allowlist: &ExecutorAllowlist,
         peer_ip: IpAddr,
+        fingerprint: Fingerprint,
         host_id: String,
         capabilities: Capabilities,
     ) -> Result<Registration, RegisterError> {
         let peer_ip = peer_ip.to_canonical();
-        if !allowlist.permits(peer_ip) {
+        if !allowlist.permits(peer_ip, fingerprint) {
             return Err(RegisterError::NotAllowed);
         }
         let mut hosts = self.hosts.lock().unwrap_or_else(PoisonError::into_inner);
@@ -569,6 +589,18 @@ mod tests {
         IpAddr::V4(Ipv4Addr::new(100, 64, 0, 9))
     }
 
+    /// A deterministic, distinguishable test fingerprint — not a real
+    /// certificate digest, just a fixed 64-hex-char value these tests pin
+    /// `executor_ip()` to in [`ExecutorAllowlist`].
+    fn executor_fp() -> Fingerprint {
+        Fingerprint::from_hex(&"aa".repeat(32)).expect("64-char hex literal")
+    }
+
+    /// A second, distinct test fingerprint, pinned to `other_ip()`.
+    fn other_fp() -> Fingerprint {
+        Fingerprint::from_hex(&"bb".repeat(32)).expect("64-char hex literal")
+    }
+
     fn capabilities() -> Capabilities {
         Capabilities {
             supported_sandbox_kinds: vec![SandboxKind::Process.into()],
@@ -617,23 +649,43 @@ mod tests {
     #[test]
     fn a_fresh_allowlist_is_empty_and_a_populated_one_is_not() {
         assert!(ExecutorAllowlist::new([]).is_empty());
-        assert!(!ExecutorAllowlist::new([executor_ip()]).is_empty());
+        assert!(!ExecutorAllowlist::new([(executor_ip(), executor_fp())]).is_empty());
     }
 
     #[test]
     fn an_unknown_peer_is_refused_regardless_of_the_claimed_host_id() {
-        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let allowlist = ExecutorAllowlist::new([(executor_ip(), executor_fp())]);
         let registry = HostRegistry::default();
-        let result = registry.register(&allowlist, other_ip(), "ws01".to_owned(), capabilities());
+        let result = registry.register(&allowlist, other_ip(), other_fp(), "ws01".to_owned(), capabilities());
+        assert_eq!(result.err(), Some(RegisterError::NotAllowed));
+    }
+
+    /// Adversarial (decision 20): the allowlist pins an (ip, fingerprint)
+    /// PAIR, not fingerprint membership alone — a peer presenting a key
+    /// that's genuinely pinned, but from a DIFFERENT IP than the one it's
+    /// paired with, must still be refused. A bare "is this fingerprint
+    /// anywhere in the allowlist" check would wrongly accept this.
+    #[test]
+    fn a_pinned_fingerprint_presented_from_the_wrong_ip_is_refused() {
+        let allowlist = ExecutorAllowlist::new([(executor_ip(), executor_fp()), (other_ip(), other_fp())]);
+        let registry = HostRegistry::default();
+        // executor_fp() is genuinely pinned, just not to other_ip().
+        let result = registry.register(&allowlist, other_ip(), executor_fp(), "ws01".to_owned(), capabilities());
         assert_eq!(result.err(), Some(RegisterError::NotAllowed));
     }
 
     #[test]
     fn an_allowed_peer_registers_and_its_capabilities_are_visible() -> anyhow::Result<()> {
-        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let allowlist = ExecutorAllowlist::new([(executor_ip(), executor_fp())]);
         let registry = HostRegistry::default();
         registry
-            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
+            .register(
+                &allowlist,
+                executor_ip(),
+                executor_fp(),
+                "ws01".to_owned(),
+                capabilities(),
+            )
             .expect("the allowed peer must register");
 
         assert_eq!(registry.capabilities_of("ws01"), Some(capabilities()));
@@ -647,18 +699,24 @@ mod tests {
     #[test]
     fn an_ipv4_mapped_ipv6_peer_matches_a_plain_ipv4_allowlist_entry() -> anyhow::Result<()> {
         use anyhow::Context;
-        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let allowlist = ExecutorAllowlist::new([(executor_ip(), executor_fp())]);
         let mapped: IpAddr = "::ffff:100.64.0.7".parse().context("mapped address literal")?;
-        assert!(allowlist.permits(mapped));
+        assert!(allowlist.permits(mapped, executor_fp()));
         Ok(())
     }
 
     #[tokio::test]
     async fn a_dispatch_is_delivered_to_the_registered_hosts_channel() -> anyhow::Result<()> {
-        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let allowlist = ExecutorAllowlist::new([(executor_ip(), executor_fp())]);
         let registry = HostRegistry::default();
         let Registration { mut dispatch_rx, .. } = registry
-            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
+            .register(
+                &allowlist,
+                executor_ip(),
+                executor_fp(),
+                "ws01".to_owned(),
+                capabilities(),
+            )
             .expect("the allowed peer must register");
 
         let dispatch = dispatch();
@@ -681,12 +739,18 @@ mod tests {
     /// are independent, so a full dispatch queue can never block this.
     #[tokio::test]
     async fn an_attach_state_change_is_delivered_to_the_registered_hosts_channel() -> anyhow::Result<()> {
-        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let allowlist = ExecutorAllowlist::new([(executor_ip(), executor_fp())]);
         let registry = HostRegistry::default();
         let Registration {
             mut attach_state_rx, ..
         } = registry
-            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
+            .register(
+                &allowlist,
+                executor_ip(),
+                executor_fp(),
+                "ws01".to_owned(),
+                capabilities(),
+            )
             .expect("the allowed peer must register");
 
         let msg = AttachStateChanged {
@@ -708,12 +772,18 @@ mod tests {
     /// placement decision to re-validate.
     #[tokio::test]
     async fn an_attach_state_change_bypasses_the_isolation_and_sandbox_kind_gates() -> anyhow::Result<()> {
-        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let allowlist = ExecutorAllowlist::new([(executor_ip(), executor_fp())]);
         let registry = HostRegistry::default();
         let Registration {
             mut attach_state_rx, ..
         } = registry
-            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
+            .register(
+                &allowlist,
+                executor_ip(),
+                executor_fp(),
+                "ws01".to_owned(),
+                capabilities(),
+            )
             .expect("the allowed peer must register");
 
         let msg = AttachStateChanged {
@@ -746,10 +816,16 @@ mod tests {
     /// must never receive a dispatch requiring UNTRUSTED.
     #[tokio::test]
     async fn dispatch_requiring_an_undeclared_isolation_class_is_refused() -> anyhow::Result<()> {
-        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let allowlist = ExecutorAllowlist::new([(executor_ip(), executor_fp())]);
         let registry = HostRegistry::default();
         registry
-            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
+            .register(
+                &allowlist,
+                executor_ip(),
+                executor_fp(),
+                "ws01".to_owned(),
+                capabilities(),
+            )
             .expect("the allowed peer must register");
 
         let mut dispatch = dispatch();
@@ -763,10 +839,16 @@ mod tests {
     /// never matches anything, even a host that declared classes.
     #[tokio::test]
     async fn dispatch_with_an_unset_isolation_class_is_refused() -> anyhow::Result<()> {
-        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let allowlist = ExecutorAllowlist::new([(executor_ip(), executor_fp())]);
         let registry = HostRegistry::default();
         registry
-            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
+            .register(
+                &allowlist,
+                executor_ip(),
+                executor_fp(),
+                "ws01".to_owned(),
+                capabilities(),
+            )
             .expect("the allowed peer must register");
 
         let mut dispatch = dispatch();
@@ -783,10 +865,16 @@ mod tests {
     /// `send_dispatch` picked it incorrectly.
     #[tokio::test]
     async fn dispatch_requiring_an_undeclared_sandbox_kind_is_refused() -> anyhow::Result<()> {
-        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let allowlist = ExecutorAllowlist::new([(executor_ip(), executor_fp())]);
         let registry = HostRegistry::default();
         registry
-            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities()) // Process only
+            .register(
+                &allowlist,
+                executor_ip(),
+                executor_fp(),
+                "ws01".to_owned(),
+                capabilities(),
+            ) // Process only
             .expect("the allowed peer must register");
 
         let mut dispatch = dispatch();
@@ -800,10 +888,16 @@ mod tests {
     /// being dispatch-eligible immediately — never a stale target.
     #[tokio::test]
     async fn a_removed_host_is_no_longer_dispatch_eligible() -> anyhow::Result<()> {
-        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let allowlist = ExecutorAllowlist::new([(executor_ip(), executor_fp())]);
         let registry = HostRegistry::default();
         let Registration { registration, .. } = registry
-            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
+            .register(
+                &allowlist,
+                executor_ip(),
+                executor_fp(),
+                "ws01".to_owned(),
+                capabilities(),
+            )
             .expect("the allowed peer must register");
 
         registry.remove("ws01", registration);
@@ -818,10 +912,16 @@ mod tests {
     /// capabilities returned alongside its id.
     #[test]
     fn pick_host_for_returns_a_qualifying_registered_host() {
-        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let allowlist = ExecutorAllowlist::new([(executor_ip(), executor_fp())]);
         let registry = HostRegistry::default();
         registry
-            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
+            .register(
+                &allowlist,
+                executor_ip(),
+                executor_fp(),
+                "ws01".to_owned(),
+                capabilities(),
+            )
             .expect("the allowed peer must register");
 
         let picked = registry
@@ -833,10 +933,16 @@ mod tests {
 
     #[test]
     fn pick_host_for_skips_a_non_local_host_when_local_is_required() {
-        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let allowlist = ExecutorAllowlist::new([(executor_ip(), executor_fp())]);
         let registry = HostRegistry::default();
         registry
-            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities()) // shares_submitter_filesystem: false
+            .register(
+                &allowlist,
+                executor_ip(),
+                executor_fp(),
+                "ws01".to_owned(),
+                capabilities(),
+            ) // shares_submitter_filesystem: false
             .expect("the allowed peer must register");
 
         assert_eq!(
@@ -848,10 +954,16 @@ mod tests {
 
     #[test]
     fn pick_host_for_returns_a_local_host_when_required() {
-        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let allowlist = ExecutorAllowlist::new([(executor_ip(), executor_fp())]);
         let registry = HostRegistry::default();
         registry
-            .register(&allowlist, executor_ip(), "ws01".to_owned(), local_capabilities())
+            .register(
+                &allowlist,
+                executor_ip(),
+                executor_fp(),
+                "ws01".to_owned(),
+                local_capabilities(),
+            )
             .expect("the allowed peer must register");
 
         let picked = registry
@@ -879,10 +991,16 @@ mod tests {
     /// only at `send_dispatch`.
     #[test]
     fn pick_host_for_skips_a_host_that_does_not_support_the_required_class() {
-        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let allowlist = ExecutorAllowlist::new([(executor_ip(), executor_fp())]);
         let registry = HostRegistry::default();
         registry
-            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities()) // Trusted only
+            .register(
+                &allowlist,
+                executor_ip(),
+                executor_fp(),
+                "ws01".to_owned(),
+                capabilities(),
+            ) // Trusted only
             .expect("the allowed peer must register");
 
         assert_eq!(
@@ -898,10 +1016,16 @@ mod tests {
     /// not placing at all.
     #[test]
     fn pick_host_for_refuses_an_unspecified_required_class() {
-        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let allowlist = ExecutorAllowlist::new([(executor_ip(), executor_fp())]);
         let registry = HostRegistry::default();
         registry
-            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
+            .register(
+                &allowlist,
+                executor_ip(),
+                executor_fp(),
+                "ws01".to_owned(),
+                capabilities(),
+            )
             .expect("the allowed peer must register");
 
         assert_eq!(
@@ -916,10 +1040,16 @@ mod tests {
     /// side, not just the sending side.
     #[test]
     fn pick_host_for_skips_a_removed_host() {
-        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let allowlist = ExecutorAllowlist::new([(executor_ip(), executor_fp())]);
         let registry = HostRegistry::default();
         let Registration { registration, .. } = registry
-            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
+            .register(
+                &allowlist,
+                executor_ip(),
+                executor_fp(),
+                "ws01".to_owned(),
+                capabilities(),
+            )
             .expect("the allowed peer must register");
         registry.remove("ws01", registration);
 
@@ -935,10 +1065,16 @@ mod tests {
     /// `Vm`-required placement.
     #[test]
     fn pick_host_for_returns_a_vm_capable_host_for_a_vm_requirement() {
-        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let allowlist = ExecutorAllowlist::new([(executor_ip(), executor_fp())]);
         let registry = HostRegistry::default();
         registry
-            .register(&allowlist, executor_ip(), "ws01".to_owned(), vm_capabilities())
+            .register(
+                &allowlist,
+                executor_ip(),
+                executor_fp(),
+                "ws01".to_owned(),
+                vm_capabilities(),
+            )
             .expect("the allowed peer must register");
 
         let picked = registry
@@ -953,10 +1089,16 @@ mod tests {
     /// isolation-class dimension.
     #[test]
     fn pick_host_for_never_falls_back_to_a_process_only_host_for_a_vm_requirement() {
-        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let allowlist = ExecutorAllowlist::new([(executor_ip(), executor_fp())]);
         let registry = HostRegistry::default();
         registry
-            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities()) // Process only
+            .register(
+                &allowlist,
+                executor_ip(),
+                executor_fp(),
+                "ws01".to_owned(),
+                capabilities(),
+            ) // Process only
             .expect("the allowed peer must register");
 
         assert_eq!(
@@ -971,10 +1113,16 @@ mod tests {
     /// that declared real kinds.
     #[test]
     fn pick_host_for_refuses_an_unspecified_required_sandbox_kind() {
-        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let allowlist = ExecutorAllowlist::new([(executor_ip(), executor_fp())]);
         let registry = HostRegistry::default();
         registry
-            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
+            .register(
+                &allowlist,
+                executor_ip(),
+                executor_fp(),
+                "ws01".to_owned(),
+                capabilities(),
+            )
             .expect("the allowed peer must register");
 
         assert_eq!(
@@ -992,12 +1140,18 @@ mod tests {
     /// new, wrong connection; `send_dispatch_if_current` must refuse.
     #[tokio::test]
     async fn send_dispatch_if_current_refuses_a_reclaimed_host_id() -> anyhow::Result<()> {
-        let allowlist = ExecutorAllowlist::new([executor_ip(), other_ip()]);
+        let allowlist = ExecutorAllowlist::new([(executor_ip(), executor_fp()), (other_ip(), other_fp())]);
         let registry = HostRegistry::default();
 
         // The original connection is picked for placement...
         let candidate = registry
-            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
+            .register(
+                &allowlist,
+                executor_ip(),
+                executor_fp(),
+                "ws01".to_owned(),
+                capabilities(),
+            )
             .map(|registered| PlacementCandidate {
                 host_id: "ws01".to_owned(),
                 registration: registered.registration,
@@ -1013,7 +1167,7 @@ mod tests {
             dispatch_rx: mut new_dispatch_rx,
             ..
         } = registry
-            .register(&allowlist, other_ip(), "ws01".to_owned(), capabilities())
+            .register(&allowlist, other_ip(), other_fp(), "ws01".to_owned(), capabilities())
             .expect("a different allowlisted peer may reclaim the vacated host_id");
 
         let result = registry
@@ -1032,14 +1186,20 @@ mod tests {
     /// plain `send_dispatch` would.
     #[tokio::test]
     async fn send_dispatch_if_current_delivers_when_the_registration_still_matches() -> anyhow::Result<()> {
-        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let allowlist = ExecutorAllowlist::new([(executor_ip(), executor_fp())]);
         let registry = HostRegistry::default();
         let Registration {
             mut dispatch_rx,
             registration,
             ..
         } = registry
-            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
+            .register(
+                &allowlist,
+                executor_ip(),
+                executor_fp(),
+                "ws01".to_owned(),
+                capabilities(),
+            )
             .expect("the allowed peer must register");
 
         registry
@@ -1055,13 +1215,19 @@ mod tests {
     /// registered — that would hand it jobs meant for the real host.
     #[test]
     fn a_different_allowed_peer_cannot_claim_an_already_registered_host_id() -> anyhow::Result<()> {
-        let allowlist = ExecutorAllowlist::new([executor_ip(), other_ip()]);
+        let allowlist = ExecutorAllowlist::new([(executor_ip(), executor_fp()), (other_ip(), other_fp())]);
         let registry = HostRegistry::default();
         registry
-            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
+            .register(
+                &allowlist,
+                executor_ip(),
+                executor_fp(),
+                "ws01".to_owned(),
+                capabilities(),
+            )
             .expect("the first peer must register");
 
-        let result = registry.register(&allowlist, other_ip(), "ws01".to_owned(), capabilities());
+        let result = registry.register(&allowlist, other_ip(), other_fp(), "ws01".to_owned(), capabilities());
         assert_eq!(result.err(), Some(RegisterError::HostIdClaimedByAnotherPeer));
         Ok(())
     }
@@ -1071,17 +1237,29 @@ mod tests {
     /// `RegistrationId` distinguishing the new connection from the old one.
     #[test]
     fn the_same_peer_can_reregister_under_its_own_host_id() -> anyhow::Result<()> {
-        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let allowlist = ExecutorAllowlist::new([(executor_ip(), executor_fp())]);
         let registry = HostRegistry::default();
         let Registration {
             registration: first, ..
         } = registry
-            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
+            .register(
+                &allowlist,
+                executor_ip(),
+                executor_fp(),
+                "ws01".to_owned(),
+                capabilities(),
+            )
             .expect("the first registration must succeed");
         let Registration {
             registration: second, ..
         } = registry
-            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
+            .register(
+                &allowlist,
+                executor_ip(),
+                executor_fp(),
+                "ws01".to_owned(),
+                capabilities(),
+            )
             .expect("the reconnect must succeed");
 
         assert_ne!(first, second);
@@ -1097,16 +1275,28 @@ mod tests {
     /// silent most-recent-wins replacement.
     #[test]
     fn a_same_peer_reclaim_reports_the_superseded_registration() {
-        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let allowlist = ExecutorAllowlist::new([(executor_ip(), executor_fp())]);
         let registry = HostRegistry::default();
 
         let first = registry
-            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
+            .register(
+                &allowlist,
+                executor_ip(),
+                executor_fp(),
+                "ws01".to_owned(),
+                capabilities(),
+            )
             .expect("the first registration must succeed");
         assert_eq!(first.superseded, None, "a fresh registration supersedes nothing");
 
         let second = registry
-            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
+            .register(
+                &allowlist,
+                executor_ip(),
+                executor_fp(),
+                "ws01".to_owned(),
+                capabilities(),
+            )
             .expect("the same-peer reclaim must succeed");
         assert_eq!(
             second.superseded,
@@ -1122,16 +1312,28 @@ mod tests {
     /// and fresh connection believe they own the slot.
     #[tokio::test]
     async fn a_same_peer_reclaim_evicts_the_stale_connection_and_makes_the_newcomer_sole_owner() -> anyhow::Result<()> {
-        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let allowlist = ExecutorAllowlist::new([(executor_ip(), executor_fp())]);
         let registry = HostRegistry::default();
 
         let stale = registry
-            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
+            .register(
+                &allowlist,
+                executor_ip(),
+                executor_fp(),
+                "ws01".to_owned(),
+                capabilities(),
+            )
             .expect("the first registration must succeed");
         let mut stale_rx = stale.dispatch_rx;
 
         let fresh = registry
-            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
+            .register(
+                &allowlist,
+                executor_ip(),
+                executor_fp(),
+                "ws01".to_owned(),
+                capabilities(),
+            )
             .expect("the same-peer reclaim must succeed");
         let mut fresh_rx = fresh.dispatch_rx;
 
@@ -1160,17 +1362,29 @@ mod tests {
     /// must not evict the NEW registration that has already replaced it.
     #[tokio::test]
     async fn ending_an_older_registration_leaves_a_newer_one_dispatch_eligible() -> anyhow::Result<()> {
-        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let allowlist = ExecutorAllowlist::new([(executor_ip(), executor_fp())]);
         let registry = HostRegistry::default();
         let Registration {
             registration: stale, ..
         } = registry
-            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
+            .register(
+                &allowlist,
+                executor_ip(),
+                executor_fp(),
+                "ws01".to_owned(),
+                capabilities(),
+            )
             .expect("the first registration must succeed");
         let Registration {
             dispatch_rx: mut rx2, ..
         } = registry
-            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities())
+            .register(
+                &allowlist,
+                executor_ip(),
+                executor_fp(),
+                "ws01".to_owned(),
+                capabilities(),
+            )
             .expect("the reconnect must succeed");
 
         registry.remove("ws01", stale); // the old connection's own teardown, after the reconnect

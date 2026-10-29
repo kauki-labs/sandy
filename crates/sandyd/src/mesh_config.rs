@@ -18,6 +18,8 @@
 
 use std::net::{IpAddr, SocketAddr};
 
+use sandy_conn::Fingerprint;
+
 use crate::host_registry::ExecutorAllowlist;
 
 /// A mesh bind-address or allowlist environment variable failed to parse.
@@ -34,10 +36,26 @@ pub enum MeshConfigError {
     /// the mesh.
     #[error("SANDY_MESH_LISTEN ({0:?}) is an unspecified address (0.0.0.0/::); D5 requires a specific mesh address")]
     UnspecifiedListenAddr(String),
-    /// One comma-separated entry in `SANDY_MESH_ALLOWLIST` is not a valid IP
-    /// address.
-    #[error("SANDY_MESH_ALLOWLIST entry is not a valid IP address: {0:?}")]
-    InvalidAllowlistEntry(String),
+    /// One comma-separated entry in `SANDY_MESH_ALLOWLIST` is not `ip=fingerprint`
+    /// (decision 20: pinned per-host keys, not a bare IP — this format
+    /// changed when the mesh tier grew mutual TLS. A pre-#495 bare-IP entry
+    /// hits this, not [`Self::InvalidAllowlistEntryIp`]/
+    /// [`Self::InvalidAllowlistEntryFingerprint`] below, since it never even
+    /// contains the required `=` separator: name the migration outright
+    /// rather than mis-attribute it to a malformed IP or fingerprint.
+    #[error(
+        "SANDY_MESH_ALLOWLIST entry {0:?} is not ip=fingerprint (decision 20: the allowlist now pins a per-host key \
+         fingerprint alongside each IP, not a bare IP list — mint one with `sandy mesh key generate`/`sandy mesh key \
+         fingerprint`)"
+    )]
+    MissingFingerprintSeparator(String),
+    /// One `ip=fingerprint` entry's `ip` half is not a valid IP address.
+    #[error("SANDY_MESH_ALLOWLIST entry's IP is not valid: {0:?}")]
+    InvalidAllowlistEntryIp(String),
+    /// One `ip=fingerprint` entry's `fingerprint` half is not a 64-char hex
+    /// SHA-256 digest.
+    #[error("SANDY_MESH_ALLOWLIST entry's fingerprint is not valid: {0:?}")]
+    InvalidAllowlistEntryFingerprint(String),
 }
 
 /// Parse `SANDY_MESH_LISTEN`'s raw value: the host-executor management
@@ -68,31 +86,40 @@ pub fn parse_mesh_listen_addr(value: Option<&str>) -> Result<Option<SocketAddr>,
     Ok(Some(addr))
 }
 
-/// Parse `SANDY_MESH_ALLOWLIST`'s raw value: a comma-separated list of IP
-/// addresses permitted to register as executor hosts (D5 — the transport's
-/// own peer identity, never the self-reported `host_id`). `None` (the env
-/// var unset) is an empty allowlist, not an error here; the caller decides
-/// whether an empty allowlist alongside a configured listener is itself a
-/// misconfiguration (binding a listener nobody can ever pass).
+/// Parse `SANDY_MESH_ALLOWLIST`'s raw value: a comma-separated list of
+/// `ip=fingerprint` pairs permitted to register as executor hosts (decision
+/// 20 — the transport's own peer identity AND its pinned mutual-TLS
+/// certificate fingerprint, never the self-reported `host_id`). `None` (the
+/// env var unset) is an empty allowlist, not an error here; the caller
+/// decides whether an empty allowlist alongside a configured listener is
+/// itself a misconfiguration (binding a listener nobody can ever pass).
 ///
 /// # Errors
-/// [`MeshConfigError::InvalidAllowlistEntry`] if any comma-separated entry is
-/// not a valid IP address.
+/// [`MeshConfigError::MissingFingerprintSeparator`] if an entry has no `=`
+/// separator (the pre-decision-20 bare-IP format); the `Ip`/`Fingerprint`
+/// variants if either half of a well-separated entry doesn't parse.
 pub fn parse_mesh_allowlist(value: Option<&str>) -> Result<ExecutorAllowlist, MeshConfigError> {
     let Some(value) = value else {
         return Ok(ExecutorAllowlist::new([]));
     };
-    let ips = value
+    let pairs = value
         .split(',')
         .map(str::trim)
         .filter(|entry| !entry.is_empty())
         .map(|entry| {
-            entry
+            let (ip_part, fp_part) = entry
+                .split_once('=')
+                .ok_or_else(|| MeshConfigError::MissingFingerprintSeparator(entry.to_owned()))?;
+            let ip = ip_part
+                .trim()
                 .parse::<IpAddr>()
-                .map_err(|_| MeshConfigError::InvalidAllowlistEntry(entry.to_owned()))
+                .map_err(|_| MeshConfigError::InvalidAllowlistEntryIp(ip_part.to_owned()))?;
+            let fingerprint = Fingerprint::from_hex(fp_part.trim())
+                .map_err(|_| MeshConfigError::InvalidAllowlistEntryFingerprint(fp_part.to_owned()))?;
+            Ok((ip, fingerprint))
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(ExecutorAllowlist::new(ips))
+        .collect::<Result<Vec<_>, MeshConfigError>>()?;
+    Ok(ExecutorAllowlist::new(pairs))
 }
 
 #[cfg(test)]
@@ -161,6 +188,14 @@ mod tests {
         );
     }
 
+    fn fp_a() -> Fingerprint {
+        Fingerprint::from_hex(&"aa".repeat(32)).expect("64-char hex literal")
+    }
+
+    fn fp_b() -> Fingerprint {
+        Fingerprint::from_hex(&"bb".repeat(32)).expect("64-char hex literal")
+    }
+
     #[test]
     fn an_unset_allowlist_is_empty() -> anyhow::Result<()> {
         assert!(parse_mesh_allowlist(None)?.is_empty());
@@ -169,10 +204,14 @@ mod tests {
 
     #[test]
     fn a_valid_allowlist_parses_every_entry() -> anyhow::Result<()> {
-        let allowlist = parse_mesh_allowlist(Some("100.64.0.7,100.64.0.9"))?;
-        assert!(allowlist.permits("100.64.0.7".parse()?));
-        assert!(allowlist.permits("100.64.0.9".parse()?));
-        assert!(!allowlist.permits("100.64.0.10".parse()?));
+        let allowlist = parse_mesh_allowlist(Some(&format!(
+            "100.64.0.7={},100.64.0.9={}",
+            fp_a().to_hex(),
+            fp_b().to_hex()
+        )))?;
+        assert!(allowlist.permits("100.64.0.7".parse()?, fp_a()));
+        assert!(allowlist.permits("100.64.0.9".parse()?, fp_b()));
+        assert!(!allowlist.permits("100.64.0.10".parse()?, fp_a()));
         Ok(())
     }
 
@@ -181,27 +220,53 @@ mod tests {
     /// the address and refused.
     #[test]
     fn allowlist_entries_tolerate_surrounding_whitespace() -> anyhow::Result<()> {
-        let allowlist = parse_mesh_allowlist(Some(" 100.64.0.7 , 100.64.0.9 "))?;
-        assert!(allowlist.permits("100.64.0.7".parse()?));
-        assert!(allowlist.permits("100.64.0.9".parse()?));
+        let allowlist = parse_mesh_allowlist(Some(&format!(
+            " 100.64.0.7 = {} , 100.64.0.9 = {} ",
+            fp_a().to_hex(),
+            fp_b().to_hex()
+        )))?;
+        assert!(allowlist.permits("100.64.0.7".parse()?, fp_a()));
+        assert!(allowlist.permits("100.64.0.9".parse()?, fp_b()));
         Ok(())
     }
 
     #[test]
-    fn an_invalid_allowlist_entry_is_refused_by_name() {
+    fn an_invalid_allowlist_entry_ip_is_refused_by_name() {
         assert_eq!(
-            parse_mesh_allowlist(Some("100.64.0.7,not-an-ip")).err(),
-            Some(MeshConfigError::InvalidAllowlistEntry("not-an-ip".to_owned()))
+            parse_mesh_allowlist(Some(&format!("not-an-ip={}", fp_a().to_hex()))).err(),
+            Some(MeshConfigError::InvalidAllowlistEntryIp("not-an-ip".to_owned()))
+        );
+    }
+
+    #[test]
+    fn an_invalid_allowlist_entry_fingerprint_is_refused_by_name() {
+        assert_eq!(
+            parse_mesh_allowlist(Some("100.64.0.7=not-a-fingerprint")).err(),
+            Some(MeshConfigError::InvalidAllowlistEntryFingerprint(
+                "not-a-fingerprint".to_owned()
+            ))
+        );
+    }
+
+    /// Migration (decision 20): a pre-#495 bare-IP entry (no `=fingerprint`)
+    /// is refused by a dedicated, named error, not folded into "invalid IP"
+    /// — an operator upgrading from the old format needs to be told it's a
+    /// migration, not a typo.
+    #[test]
+    fn a_bare_ip_entry_with_no_fingerprint_names_the_migration() {
+        assert_eq!(
+            parse_mesh_allowlist(Some("100.64.0.7")).err(),
+            Some(MeshConfigError::MissingFingerprintSeparator("100.64.0.7".to_owned()))
         );
     }
 
     /// Adversarial: a trailing comma (another easy config typo) produces an
-    /// empty entry, which is skipped rather than refused as an invalid IP —
-    /// the real entries before it must still parse.
+    /// empty entry, which is skipped rather than refused — the real entry
+    /// before it must still parse.
     #[test]
     fn a_trailing_comma_is_tolerated() -> anyhow::Result<()> {
-        let allowlist = parse_mesh_allowlist(Some("100.64.0.7,"))?;
-        assert!(allowlist.permits("100.64.0.7".parse()?));
+        let allowlist = parse_mesh_allowlist(Some(&format!("100.64.0.7={},", fp_a().to_hex())))?;
+        assert!(allowlist.permits("100.64.0.7".parse()?, fp_a()));
         Ok(())
     }
 
@@ -212,8 +277,8 @@ mod tests {
     #[test]
     fn a_cidr_entry_is_refused_not_mistaken_for_a_host() {
         assert_eq!(
-            parse_mesh_allowlist(Some("100.64.0.0/24")).err(),
-            Some(MeshConfigError::InvalidAllowlistEntry("100.64.0.0/24".to_owned()))
+            parse_mesh_allowlist(Some(&format!("100.64.0.0/24={}", fp_a().to_hex()))).err(),
+            Some(MeshConfigError::InvalidAllowlistEntryIp("100.64.0.0/24".to_owned()))
         );
     }
 }

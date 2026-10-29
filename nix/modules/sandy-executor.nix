@@ -70,6 +70,30 @@ in
       '';
     };
 
+    orchestratorFingerprint = lib.mkOption {
+      type = lib.types.str;
+      example = "3f29e8…";
+      description = ''
+        The orchestrator's pinned mesh mutual-TLS certificate fingerprint
+        (`SANDY_HOST_EXECUTOR_ORCHESTRATOR_FINGERPRINT`, decision 20).
+        Required, no default — print it on the orchestrator with `sandy mesh
+        key fingerprint <dir>` and provision it here out of band, the same
+        trust model `services.sandy-executor.hostId`'s own pinning mirrors
+        the other direction via the orchestrator's `SANDY_MESH_ALLOWLIST`.
+      '';
+    };
+
+    tlsIdentityDir = lib.mkOption {
+      type = lib.types.str;
+      default = "/var/lib/${username}/mesh-tls";
+      description = ''
+        Where this host's own persisted mesh TLS identity lives
+        (`SANDY_HOST_EXECUTOR_TLS_IDENTITY_DIR`, decision 20) — generated on
+        first start if empty (`TlsIdentity::load_or_generate`), under this
+        service's own `StateDirectory` by default so it survives restarts.
+      '';
+    };
+
     package = lib.mkOption {
       type = lib.types.package;
       default = pkgs.sandy-host-executor;
@@ -232,6 +256,8 @@ in
       environment = {
         SANDY_HOST_EXECUTOR_ORCHESTRATOR = cfg.orchestrator;
         SANDY_HOST_EXECUTOR_ID = cfg.hostId;
+        SANDY_HOST_EXECUTOR_ORCHESTRATOR_FINGERPRINT = cfg.orchestratorFingerprint;
+        SANDY_HOST_EXECUTOR_TLS_IDENTITY_DIR = cfg.tlsIdentityDir;
         SANDY_AGENT_PATH = "${cfg.agentPackage}/bin/sandy-agent";
         SANDY_GUEST_WRAPPER = "${cfg.guestWrapperPackage}";
       }

@@ -7,12 +7,13 @@
 
 use std::{net::SocketAddr, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc, time::Duration};
 
-use sandy_conn::Listener as MeshListener;
+use sandy_conn::{Listener as MeshListener, TlsIdentity};
 use sandyd::{
     dispatch::JobRegistry,
     gate_spawn,
     host_registry::{ExecutorAllowlist, HostRegistry},
     mesh_config::{parse_mesh_allowlist, parse_mesh_listen_addr},
+    spawn_gated_accept,
     store::JobStore,
 };
 use tokio::net::UnixListener;
@@ -53,6 +54,15 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 256;
 /// number of pre-auth connections from the mesh could spawn an unbounded
 /// number of tasks and exhaust file descriptors.
 const MAX_CONCURRENT_MESH_CONNECTIONS: usize = 256;
+
+/// How long an accepted TCP connection on a mesh listener has to complete its
+/// TLS handshake before it's dropped (decision 20's Consequences section:
+/// "the implementation PR needs a handshake timeout on `listen_tls`'s accept
+/// path... without one, a connection that completes TCP accept but never
+/// finishes (or never starts) the TLS handshake occupies an accept slot
+/// indefinitely"). Generous for a real mesh-local peer, short enough that a
+/// stalled/adversarial one doesn't tie up a connection slot for long.
+const MESH_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Capped exponential backoff for repeated `accept()` failures, shared by
 /// every accept loop in this binary so they back off identically. Doubles on
@@ -187,6 +197,34 @@ async fn main() {
         let _ = shutdown_tx.send(true);
     });
 
+    // Peek both mesh listen addresses, unparsed error aside, before touching
+    // the allowlist or the TLS identity at all: `sandyd` with neither env var
+    // set must stay exactly as local-only as before decision 20 — no key
+    // file written, no SANDY_MESH_ALLOWLIST format enforced — since binding
+    // nothing is "exactly today's behavior" per `mesh_config`'s own doc.
+    // Each `setup_*` function below re-parses its own address (cheap, pure);
+    // this is only a peek to decide whether decision 20's machinery runs at
+    // all, never the value either listener actually binds to.
+    let any_mesh_listener_configured =
+        std::env::var("SANDY_MESH_LISTEN").is_ok() || std::env::var("SANDY_MESH_AGENT_LINK_LISTEN").is_ok();
+
+    // Decision 20: one pinned-fingerprint allowlist and one sandyd mesh TLS
+    // identity, shared by BOTH mesh listeners below — an operator provisions
+    // and pins exactly one fingerprint for this daemon, not a different one
+    // per listener. Parsed/loaded once, ahead of either listener's own setup,
+    // and ONLY if a mesh listener is actually configured (see above).
+    let mesh_allowlist = if any_mesh_listener_configured {
+        match parse_mesh_allowlist(std::env::var("SANDY_MESH_ALLOWLIST").ok().as_deref()) {
+            Ok(allowlist) => Arc::new(allowlist),
+            Err(e) => {
+                tracing::error!(error = %e, "could not parse SANDY_MESH_ALLOWLIST");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        Arc::new(ExecutorAllowlist::default())
+    };
+
     // The mesh management-channel listener (#291): unset by default, so
     // sandyd stays local-only unless an operator explicitly configures M2
     // cross-machine dispatch. A configured listen address with an empty
@@ -198,19 +236,30 @@ async fn main() {
     // control-socket path beyond `host_registry` and the process itself —
     // but joined at shutdown below, not fire-and-forgotten, so its own
     // graceful drain gets a real window to run.
-    let mesh_task = match setup_mesh_listener().await {
-        Ok(Some(mesh)) => Some(tokio::spawn(run_mesh_accept_loop(
-            mesh,
-            Arc::clone(&host_registry),
-            Arc::clone(&store),
-            Arc::clone(&registry),
-            shutdown_rx.clone(),
-        ))),
-        Ok(None) => None,
-        Err(e) => {
-            tracing::error!(error = %e, "could not set up the mesh management-channel listener");
-            std::process::exit(1);
+    let mesh_task = if any_mesh_listener_configured {
+        let management_identity = match load_mesh_tls_identity().await {
+            Ok(identity) => identity,
+            Err(e) => {
+                tracing::error!(error = %e, "could not load or generate sandyd's mesh TLS identity");
+                std::process::exit(1);
+            }
+        };
+        match setup_mesh_listener(management_identity, Arc::clone(&mesh_allowlist)).await {
+            Ok(Some(mesh)) => Some(tokio::spawn(run_mesh_accept_loop(
+                mesh,
+                Arc::clone(&host_registry),
+                Arc::clone(&store),
+                Arc::clone(&registry),
+                shutdown_rx.clone(),
+            ))),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::error!(error = %e, "could not set up the mesh management-channel listener");
+                std::process::exit(1);
+            }
         }
+    } else {
+        None
     };
 
     // The mesh agent-link accept listener (#279/#298): where a dispatched
@@ -224,19 +273,38 @@ async fn main() {
     // abruptly cancelled on process exit like every other unhandled task —
     // an accepted-but-not-yet-authenticated agent-link connection is cheap
     // to lose, unlike a registered host-executor's live dispatch channel.
-    let forward_back_addr = match setup_mesh_agent_link_listener().await {
-        Ok(Some((listener, addr))) => {
-            let registry = Arc::clone(&registry);
-            tokio::spawn(async move {
-                sandyd::mesh_accept::serve_mesh_accept_loop(&listener, &registry).await;
-            });
-            Some(addr)
+    //
+    // Loaded a SECOND time (not cloned): `TlsIdentity` holds no `Clone`
+    // impl, and `listen_tls` takes it by value since each listener owns its
+    // own `rustls::ServerConfig`. `load_or_generate` reads the same
+    // already-persisted files the management listener's own load just
+    // wrote/read, so this is the same identity (same fingerprint), not a
+    // fresh one.
+    let forward_back_addr = if any_mesh_listener_configured {
+        let agent_link_identity = match load_mesh_tls_identity().await {
+            Ok(identity) => identity,
+            Err(e) => {
+                tracing::error!(error = %e, "could not load sandyd's mesh TLS identity for the agent-link listener");
+                std::process::exit(1);
+            }
+        };
+        match setup_mesh_agent_link_listener(agent_link_identity, mesh_allowlist.fingerprints()).await {
+            Ok(Some((listener, addr))) => {
+                let listener = Arc::new(listener);
+                let registry = Arc::clone(&registry);
+                tokio::spawn(async move {
+                    sandyd::mesh_accept::serve_mesh_accept_loop(listener, &registry).await;
+                });
+                Some(addr)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                tracing::error!(error = %e, "could not set up the mesh agent-link accept listener");
+                std::process::exit(1);
+            }
         }
-        Ok(None) => None,
-        Err(e) => {
-            tracing::error!(error = %e, "could not set up the mesh agent-link accept listener");
-            std::process::exit(1);
-        }
+    } else {
+        None
     };
 
     let mut connections = tokio::task::JoinSet::new();
@@ -427,20 +495,47 @@ struct MeshSetup {
     allowlist: Arc<ExecutorAllowlist>,
 }
 
+/// `$SANDY_MESH_TLS_IDENTITY_DIR` if set, else `<runtime_dir>/mesh-tls`
+/// (decision 20's deferred key-provisioning UX: a flag-driven keypair,
+/// persisted so its [`sandy_conn::Fingerprint`] stays stable across
+/// restarts, mirroring `socket_path`/`db_path`'s own optional-with-a-default
+/// pattern).
+fn mesh_tls_identity_dir() -> std::io::Result<PathBuf> {
+    match std::env::var_os("SANDY_MESH_TLS_IDENTITY_DIR") {
+        Some(path) => Ok(PathBuf::from(path)),
+        None => Ok(ensure_runtime_dir()?.join("mesh-tls")),
+    }
+}
+
+/// Load or generate sandyd's own mesh mutual-TLS identity — ONE identity
+/// shared by both the management-channel listener and the agent-link accept
+/// listener (decision 20's "scope: both mesh listeners" — an operator pins
+/// one fingerprint for sandyd, not two).
+async fn load_mesh_tls_identity() -> std::io::Result<TlsIdentity> {
+    let dir = mesh_tls_identity_dir()?;
+    tokio::task::spawn_blocking(move || TlsIdentity::load_or_generate(&dir))
+        .await
+        .map_err(std::io::Error::other)?
+        .map_err(std::io::Error::other)
+}
+
 /// Resolve and bind the mesh management-channel listener from
-/// `$SANDY_MESH_LISTEN`/`$SANDY_MESH_ALLOWLIST`. `Ok(None)` if
-/// `$SANDY_MESH_LISTEN` is unset — `sandyd` stays local-only, the default.
+/// `$SANDY_MESH_LISTEN`/`$SANDY_MESH_ALLOWLIST`, mutual-TLS-wrapped
+/// (decision 20) using `identity` and the allowlist's pinned fingerprints.
+/// `Ok(None)` if `$SANDY_MESH_LISTEN` is unset — `sandyd` stays local-only,
+/// the default.
 ///
 /// # Errors
 /// An env var fails to parse, the configured allowlist is empty (a listener
 /// nobody could ever pass), or the bind itself fails.
-async fn setup_mesh_listener() -> std::io::Result<Option<MeshSetup>> {
+async fn setup_mesh_listener(
+    identity: TlsIdentity,
+    allowlist: Arc<ExecutorAllowlist>,
+) -> std::io::Result<Option<MeshSetup>> {
     let addr =
         parse_mesh_listen_addr(std::env::var("SANDY_MESH_LISTEN").ok().as_deref()).map_err(std::io::Error::other)?;
     let Some(addr) = addr else { return Ok(None) };
 
-    let allowlist =
-        parse_mesh_allowlist(std::env::var("SANDY_MESH_ALLOWLIST").ok().as_deref()).map_err(std::io::Error::other)?;
     if allowlist.is_empty() {
         return Err(std::io::Error::other(
             "SANDY_MESH_LISTEN is set but SANDY_MESH_ALLOWLIST is empty or unset; a listener nobody can ever pass is \
@@ -448,21 +543,27 @@ async fn setup_mesh_listener() -> std::io::Result<Option<MeshSetup>> {
         ));
     }
 
-    let listener = sandy_conn::listen_tcp_keepalive(addr, sandy_conn::TcpKeepalive::HALF_OPEN_DETECTION)
-        .await
-        .map_err(std::io::Error::other)?;
-    tracing::info!(addr = %addr, "sandyd mesh management-channel listener bound");
-    Ok(Some(MeshSetup {
-        listener,
-        allowlist: Arc::new(allowlist),
-    }))
+    let listener = sandy_conn::listen_tls(
+        addr,
+        identity,
+        allowlist.fingerprints(),
+        MESH_TLS_HANDSHAKE_TIMEOUT,
+        Some(sandy_conn::TcpKeepalive::HALF_OPEN_DETECTION),
+    )
+    .await
+    .map_err(std::io::Error::other)?;
+    tracing::info!(addr = %addr, "sandyd mesh management-channel listener bound (mutual TLS)");
+    Ok(Some(MeshSetup { listener, allowlist }))
 }
 
 /// Resolve and bind the mesh agent-link accept listener (#279/#298) from
 /// `$SANDY_MESH_AGENT_LINK_LISTEN` — the address a dispatched job's executor
-/// dials back to forward its agent link (decision 6). `Ok(None)` if unset:
-/// no remote placement is reachable in that case, regardless of what hosts
-/// are registered on the management channel, since there is nowhere valid to
+/// dials back to forward its agent link (decision 6) — mutual-TLS-wrapped
+/// (decision 20) using `identity` and `allowed` (the SAME pinned-fingerprint
+/// set the management channel enforces: any executor dialing back must
+/// present a key already pinned to register at all). `Ok(None)` if unset: no
+/// remote placement is reachable in that case, regardless of what hosts are
+/// registered on the management channel, since there is nowhere valid to
 /// tell an executor to dial back to.
 ///
 /// Keepalive-bound (#289 item 1, same `HALF_OPEN_DETECTION` profile as the
@@ -473,16 +574,25 @@ async fn setup_mesh_listener() -> std::io::Result<Option<MeshSetup>> {
 ///
 /// # Errors
 /// The env var fails to parse (including naming an unspecified address, D5),
-/// or the bind itself fails.
-async fn setup_mesh_agent_link_listener() -> std::io::Result<Option<(MeshListener, SocketAddr)>> {
+/// `allowed` is empty, or the bind itself fails.
+async fn setup_mesh_agent_link_listener(
+    identity: TlsIdentity,
+    allowed: std::collections::HashSet<sandy_conn::Fingerprint>,
+) -> std::io::Result<Option<(MeshListener, SocketAddr)>> {
     let addr = parse_mesh_listen_addr(std::env::var("SANDY_MESH_AGENT_LINK_LISTEN").ok().as_deref())
         .map_err(std::io::Error::other)?;
     let Some(addr) = addr else { return Ok(None) };
 
-    let listener = sandy_conn::listen_tcp_keepalive(addr, sandy_conn::TcpKeepalive::HALF_OPEN_DETECTION)
-        .await
-        .map_err(std::io::Error::other)?;
-    tracing::info!(addr = %addr, "sandyd mesh agent-link accept listener bound");
+    let listener = sandy_conn::listen_tls(
+        addr,
+        identity,
+        allowed,
+        MESH_TLS_HANDSHAKE_TIMEOUT,
+        Some(sandy_conn::TcpKeepalive::HALF_OPEN_DETECTION),
+    )
+    .await
+    .map_err(std::io::Error::other)?;
+    tracing::info!(addr = %addr, "sandyd mesh agent-link accept listener bound (mutual TLS)");
     Ok(Some((listener, addr)))
 }
 
@@ -509,13 +619,39 @@ async fn run_mesh_accept_loop(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let MeshSetup { listener, allowlist } = mesh;
+    let listener = Arc::new(listener);
     let mut connections = tokio::task::JoinSet::new();
     let mut backoff = AcceptBackoff::new();
     let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_MESH_CONNECTIONS));
 
+    // Decision 20's accept+handshake hazard: `listener.accept()` on this
+    // TLS-tier listener bundles the raw TCP accept and the full TLS
+    // handshake into one future, so it must never be polled directly inside
+    // the `select!` below — a sibling branch (`connections.join_next()`)
+    // resolving first would drop an in-progress, healthy handshake. Spawned
+    // via `spawn_gated_accept` into its own task instead, and the SAME
+    // `JoinHandle` is re-polled (`&mut accept_task`) across loop iterations
+    // rather than re-created each time, so losing a `select!` race just means
+    // the next iteration observes the same still-running task, never a fresh
+    // one that silently abandons the old.
+    let mut accept_task = spawn_gated_accept(Arc::clone(&connection_semaphore), Arc::clone(&listener));
+
     loop {
         tokio::select! {
-            (permit, accepted) = gate_spawn(&connection_semaphore, listener.accept()) => {
+            result = &mut accept_task => {
+                let Ok((permit, accepted)) = result else {
+                    // The spawned accept task itself panicked (not expected
+                    // in practice — `Listener::accept`/`gate_spawn` don't
+                    // panic): nothing left to re-arm against, so this loop
+                    // ends rather than spin re-spawning a task that just
+                    // panicked.
+                    tracing::error!("the mesh accept task panicked; no longer accepting new connections");
+                    break;
+                };
+                // Re-arm immediately, before handling this result, so the
+                // loop always has a pending accept — never a gap where a
+                // slow connection handler delays the next accept call.
+                accept_task = spawn_gated_accept(Arc::clone(&connection_semaphore), Arc::clone(&listener));
                 let Ok(permit) = permit else {
                     // Never closed by this program (see gate_spawn's doc);
                     // handled rather than panicked, per house style.
@@ -542,6 +678,21 @@ async fn run_mesh_accept_loop(
                             .await;
                         });
                     }
+                    Err(e @ (sandy_conn::ConnError::Tls(_) | sandy_conn::ConnError::HandshakeTimeout)) => {
+                        // `permit` drops here, releasing it immediately: this
+                        // connection was never served. NOT the listener-wide
+                        // backoff below: a TLS-tier `accept()` also returns
+                        // `Err` for a per-peer failure — a wrong pinned key, a
+                        // port scanner, a plaintext dialer, a handshake that
+                        // never finishes — none of which indicate the
+                        // listener itself (or the process's resources) are in
+                        // trouble the way a real accept(2) fault does.
+                        // Backing off here would let one bad peer (e.g. an
+                        // old, not-yet-redeployed host-executor still dialing
+                        // in plaintext) throttle every OTHER peer's
+                        // registration for up to `ACCEPT_ERROR_BACKOFF_MAX`.
+                        tracing::warn!(error = %e, "mesh connection handshake failed; not backing off, this is a per-peer failure");
+                    }
                     Err(e) => {
                         // `permit` drops here, releasing it immediately: this
                         // connection was never served.
@@ -567,6 +718,13 @@ async fn run_mesh_accept_loop(
         }
     }
 
+    // The pending accept task holds its own `Arc<Listener>` clone, so
+    // dropping `listener` here does not actually stop it from accepting —
+    // abort it explicitly, mirroring `relay_dispatches`'s own
+    // abort-then-await discipline for a task whose owned resource must stop
+    // before this function proceeds.
+    accept_task.abort();
+    let _ = accept_task.await;
     drop(listener); // stop accepting; existing host-executor connections keep running
 
     if tokio::time::timeout(SHUTDOWN_GRACE, async {

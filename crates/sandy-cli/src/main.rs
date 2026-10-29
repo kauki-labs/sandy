@@ -152,6 +152,14 @@ enum Command {
         #[command(subcommand)]
         provider: CredProvider,
     },
+    /// Manage a node's mesh mutual-TLS identity (decision 20): the pinned
+    /// keypair `sandyd`/`sandy-host-executor` each load at startup for
+    /// `listen_tls`/`connect_tls`.
+    Mesh {
+        /// The operation on this node's mesh TLS identity.
+        #[command(subcommand)]
+        op: MeshOp,
+    },
     /// Drive `sandyd`, the control-plane daemon, over its control RPC (#205,
     /// B4). A separate job model from `run`/`status`/…, which execute
     /// directly with no daemon involved — see #221 for the planned
@@ -308,6 +316,44 @@ enum DaemonOp {
     },
     /// List every job `sandyd` knows about.
     List,
+}
+
+/// `sandy mesh <op>`: today, only a node's TLS identity key (decision 20).
+/// Nested like `cred <provider>` so a future mesh-wide operation (e.g.
+/// rotating the allowlist format) has a natural home alongside `key`.
+#[derive(Debug, Subcommand)]
+enum MeshOp {
+    /// Operations on this node's persisted mesh mutual-TLS identity.
+    Key {
+        /// The operation on the identity.
+        #[command(subcommand)]
+        op: MeshKeyOp,
+    },
+}
+
+/// `sandy mesh key <op>`: mint/load, or just print the fingerprint of, a
+/// node's persisted mesh TLS identity (`identity.cert.der`/`identity.key.der`
+/// under `dir`) — the operator-facing side of decision 20's pinned-key
+/// provisioning. The same directory is what `$SANDY_MESH_TLS_IDENTITY_DIR`/
+/// `$SANDY_HOST_EXECUTOR_TLS_IDENTITY_DIR` point sandyd/sandy-host-executor
+/// at.
+#[derive(Debug, Subcommand)]
+enum MeshKeyOp {
+    /// Mint a fresh identity if `dir` holds none yet (idempotent: reloads
+    /// an existing one unchanged, never rotates it), then print its
+    /// fingerprint — the value to hand the peer operator to pin in their
+    /// own `SANDY_MESH_ALLOWLIST`/`SANDY_HOST_EXECUTOR_ORCHESTRATOR_FINGERPRINT`.
+    Generate {
+        /// Directory to hold `identity.cert.der`/`identity.key.der`.
+        dir: std::path::PathBuf,
+    },
+    /// Print the fingerprint of an identity already generated at `dir` —
+    /// refuses outright (never mints one) if `dir` holds none yet, so a
+    /// typo'd path can't be mistaken for "no identity needed here."
+    Fingerprint {
+        /// Directory already holding `identity.cert.der`/`identity.key.der`.
+        dir: std::path::PathBuf,
+    },
 }
 
 /// `sandy cred <provider>`: the forge a trust root belongs to. Operations are
@@ -505,6 +551,54 @@ fn host_profile() -> sandy::Profile {
 fn main() {
     let cli = Cli::parse();
     std::process::exit(dispatch(cli.command, cli.output));
+}
+
+/// Dispatch a `sandy mesh <op>` command.
+fn dispatch_mesh(op: MeshOp) -> i32 {
+    match op {
+        MeshOp::Key { op } => dispatch_mesh_key(op),
+    }
+}
+
+/// Dispatch a `sandy mesh key <op>` command: mint/load or print a node's
+/// persisted mesh TLS identity fingerprint (decision 20).
+fn dispatch_mesh_key(op: MeshKeyOp) -> i32 {
+    match op {
+        MeshKeyOp::Generate { dir } => match sandy_conn::TlsIdentity::load_or_generate(&dir) {
+            Ok(identity) => {
+                println!("{}", identity.fingerprint().to_hex());
+                0
+            }
+            Err(e) => {
+                eprintln!("sandy: {e}");
+                ProcessExit::InvalidPlan.code()
+            }
+        },
+        MeshKeyOp::Fingerprint { dir } => {
+            let cert_path = dir.join("identity.cert.der");
+            let key_path = dir.join("identity.key.der");
+            if !cert_path.exists() || !key_path.exists() {
+                eprintln!(
+                    "sandy: no mesh TLS identity at {}; run `sandy mesh key generate {}` first",
+                    dir.display(),
+                    dir.display()
+                );
+                return ProcessExit::InvalidPlan.code();
+            }
+            // Both files already confirmed present, so `load_or_generate`
+            // only ever takes its load path here — never mints a fresh one.
+            match sandy_conn::TlsIdentity::load_or_generate(&dir) {
+                Ok(identity) => {
+                    println!("{}", identity.fingerprint().to_hex());
+                    0
+                }
+                Err(e) => {
+                    eprintln!("sandy: {e}");
+                    ProcessExit::InvalidPlan.code()
+                }
+            }
+        }
+    }
 }
 
 /// Dispatch a `sandy cred <provider>` command to the provider's handler.
@@ -1260,6 +1354,11 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
         return dispatch_cred(provider);
     }
 
+    // `mesh` ops touch only the caller-named identity dir, not $SANDY_HOME.
+    if let Command::Mesh { op } = command {
+        return dispatch_mesh(op);
+    }
+
     // `daemon` ops talk to sandyd over its own socket, not $SANDY_HOME.
     if let Command::Daemon { op } = command {
         return dispatch_daemon(op, output);
@@ -1274,6 +1373,7 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
     match command {
         Command::Doctor => unreachable!("doctor handled above"),
         Command::Cred { .. } => unreachable!("cred handled above"),
+        Command::Mesh { .. } => unreachable!("mesh handled above"),
         Command::Daemon { .. } => unreachable!("daemon handled above"),
         Command::Run {
             template,

@@ -91,8 +91,16 @@ async fn register_and_authenticate(
     allowlist: &ExecutorAllowlist,
     registry: &HostRegistry,
 ) -> Option<(Box<dyn Conn>, Registration)> {
-    let peer_ip = match peer {
-        PeerAddr::Tcp(addr) | PeerAddr::TcpTls(addr, _) => addr.ip(),
+    let (peer_ip, fingerprint) = match peer {
+        PeerAddr::TcpTls(addr, fingerprint) => (addr.ip(), fingerprint),
+        PeerAddr::Tcp(addr) => {
+            // Decision 20: fail closed, no plaintext fallback. This listener
+            // is bound via `listen_tls` once wired, so a bare `Tcp` peer here
+            // means a caller constructed this connection outside that
+            // listener — a bug in the caller, not a real host-executor.
+            tracing::warn!(peer = %addr.ip(), "a host-executor connection arrived without mutual TLS; refusing");
+            return None;
+        }
         PeerAddr::Uds => {
             tracing::warn!("a host-executor connection arrived over UDS, not the mesh; refusing");
             return None;
@@ -127,7 +135,7 @@ async fn register_and_authenticate(
     // stage a merely-curious peer never should have reached. Every
     // non-allowlisted peer gets the exact same generic refusal, regardless
     // of what else is or isn't in its `Register` frame.
-    if !allowlist.permits(peer_ip) {
+    if !allowlist.permits(peer_ip, fingerprint) {
         tracing::warn!(peer = %peer_ip, host_id, "Register refused: not a permitted executor host");
         // #289: no deadline — a non-reading peer stalls this task, but the
         // connection slot is the only cost (no registry entry exists yet).
@@ -170,7 +178,7 @@ async fn register_and_authenticate(
 
     // `register` logs any same-peer reclaim itself (#292 item 4), so the
     // superseded registration is ignored here.
-    let registration = match registry.register(allowlist, peer_ip, host_id.clone(), capabilities) {
+    let registration = match registry.register(allowlist, peer_ip, fingerprint, host_id.clone(), capabilities) {
         Ok(registered) => registered,
         Err(e) => {
             // The allowlist check above already covers RegisterError::NotAllowed;
@@ -642,8 +650,17 @@ mod tests {
         anyhow::bail!("the connection's read never parked again after the write")
     }
 
+    /// A deterministic test fingerprint — not a real certificate digest, a
+    /// fixed 64-hex-char value these tests pin `tcp_peer`'s IP to in
+    /// [`ExecutorAllowlist`].
+    fn test_fp() -> sandy_conn::Fingerprint {
+        sandy_conn::Fingerprint::from_hex(&"aa".repeat(32)).expect("64-char hex literal")
+    }
+
+    /// A TLS mesh peer (decision 20: this listener is `listen_tls`-only once
+    /// wired), carrying [`test_fp`]'s fingerprint.
     fn tcp_peer(ip: &str) -> PeerAddr {
-        PeerAddr::Tcp(SocketAddr::new(ip.parse().expect("ip literal"), 9000))
+        PeerAddr::TcpTls(SocketAddr::new(ip.parse().expect("ip literal"), 9000), test_fp())
     }
 
     /// A throwaway in-memory store for the connection-protocol tests that do
@@ -784,7 +801,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_allowed_host_registers_and_receives_a_queued_dispatch() -> anyhow::Result<()> {
-        let allowlist = ExecutorAllowlist::new(["100.64.0.7".parse()?]);
+        let allowlist = ExecutorAllowlist::new([("100.64.0.7".parse()?, test_fp())]);
         let registry = HostRegistry::default();
         let (mut client, server) = tokio::io::duplex(4096);
 
@@ -864,7 +881,7 @@ mod tests {
     /// `Pending` forever, zero placement activity, no dispatch error).
     #[tokio::test]
     async fn a_host_registered_through_a_real_wire_frame_is_a_placement_candidate() -> anyhow::Result<()> {
-        let allowlist = ExecutorAllowlist::new(["100.64.0.7".parse()?]);
+        let allowlist = ExecutorAllowlist::new([("100.64.0.7".parse()?, test_fp())]);
         let registry = HostRegistry::default();
         let (mut client, server) = tokio::io::duplex(4096);
 
@@ -912,11 +929,80 @@ mod tests {
         Ok(())
     }
 
+    /// Adversarial (decision 20: fail closed, no plaintext fallback): a peer
+    /// that arrives as a bare `PeerAddr::Tcp` — not `TcpTls` — is refused
+    /// outright, even one whose IP is genuinely allowlisted. Once this
+    /// listener is bound via `listen_tls`, a plaintext peer here would mean a
+    /// caller bug, never a real host-executor; this must not silently fall
+    /// back to IP-only authorization.
+    #[tokio::test]
+    async fn a_plaintext_peer_is_refused_even_with_an_allowlisted_ip() -> anyhow::Result<()> {
+        let allowlist = ExecutorAllowlist::new([("100.64.0.7".parse()?, test_fp())]);
+        let registry = HostRegistry::default();
+        let (mut client, server) = tokio::io::duplex(4096);
+
+        // A REAL `Register` frame for an allowlisted IP's own host_id — on
+        // the old code (no TcpTls-only check), this would register and get a
+        // `Registered` reply. Writing it is what makes this test fail on the
+        // old code instead of passing vacuously (a client that never writes
+        // anything would also see no `Registered` reply before
+        // `REGISTER_TIMEOUT`, regardless of whether the plaintext check
+        // exists).
+        write_frame(
+            &mut client,
+            &HostExecutorMessage {
+                op: Some(host_executor_message::Op::Register(Register {
+                    host_id: "ws01".to_owned(),
+                    capabilities: Some(capabilities()),
+                })),
+            },
+        )
+        .await?;
+
+        let plaintext_peer = PeerAddr::Tcp(SocketAddr::new("100.64.0.7".parse()?, 9000));
+        let serving = tokio::spawn(async move {
+            serve_host_executor(
+                Box::new(server),
+                plaintext_peer,
+                &allowlist,
+                &registry,
+                &test_store(),
+                &test_job_registry(),
+            )
+            .await;
+            registry
+        });
+
+        // The server must close having sent nothing, not a `Registered`
+        // reply — read to EOF, not a single `read_frame` call, since a
+        // `read_frame` that happens to return `Ok(None)` already proves
+        // "no frame", but reading raw bytes first is the more direct check
+        // that nothing at all was written before the close.
+        use tokio::io::AsyncReadExt;
+        let mut leftover = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), client.read_to_end(&mut leftover))
+            .await
+            .context("a plaintext peer must be refused promptly, not held open")?
+            .context("reading to EOF")?;
+        assert!(
+            leftover.is_empty(),
+            "a plaintext peer must never receive a Registered reply, got {leftover:?}"
+        );
+
+        let registry = tokio::time::timeout(std::time::Duration::from_secs(5), serving).await??;
+        assert_eq!(
+            registry.capabilities_of("ws01"),
+            None,
+            "a plaintext peer must never register, regardless of its IP or a real Register frame"
+        );
+        Ok(())
+    }
+
     /// Adversarial (#263, D5): a peer not on the allowlist gets
     /// `RegisterRefused`, never `Registered`, and is never dispatch-eligible.
     #[tokio::test]
     async fn an_unknown_peer_is_refused_not_registered() -> anyhow::Result<()> {
-        let allowlist = ExecutorAllowlist::new(["100.64.0.7".parse()?]);
+        let allowlist = ExecutorAllowlist::new([("100.64.0.7".parse()?, test_fp())]);
         let registry = HostRegistry::default();
         let (mut client, server) = tokio::io::duplex(4096);
 
@@ -961,7 +1047,7 @@ mod tests {
     /// should have reached.
     #[tokio::test]
     async fn an_unknown_peer_with_no_capabilities_gets_the_generic_refusal() -> anyhow::Result<()> {
-        let allowlist = ExecutorAllowlist::new(["100.64.0.7".parse()?]);
+        let allowlist = ExecutorAllowlist::new([("100.64.0.7".parse()?, test_fp())]);
         let registry = HostRegistry::default();
         let (mut client, server) = tokio::io::duplex(4096);
 
@@ -1005,7 +1091,7 @@ mod tests {
     /// open forever — it's closed once `REGISTER_TIMEOUT` elapses.
     #[tokio::test(start_paused = true)]
     async fn a_host_that_never_sends_register_is_disconnected_after_the_timeout() -> anyhow::Result<()> {
-        let allowlist = ExecutorAllowlist::new(["100.64.0.7".parse()?]);
+        let allowlist = ExecutorAllowlist::new([("100.64.0.7".parse()?, test_fp())]);
         let registry = HostRegistry::default();
         let (client, server) = tokio::io::duplex(4096);
 
@@ -1044,7 +1130,7 @@ mod tests {
     /// `DispatchSendError::ConnectionClosing`, not merely "an error."
     #[tokio::test(start_paused = true)]
     async fn a_hung_host_is_disconnected_after_the_dispatch_write_timeout() -> anyhow::Result<()> {
-        let allowlist = ExecutorAllowlist::new(["100.64.0.7".parse()?]);
+        let allowlist = ExecutorAllowlist::new([("100.64.0.7".parse()?, test_fp())]);
         let registry = HostRegistry::default();
         let (mut client, server) = tokio::io::duplex(64);
 
@@ -1181,7 +1267,7 @@ mod tests {
     /// `NotFound` case is silently ignored).
     #[tokio::test(start_paused = true)]
     async fn every_dispatch_popped_before_the_connection_ends_is_failed_not_left_pending() -> anyhow::Result<()> {
-        let allowlist = ExecutorAllowlist::new(["100.64.0.7".parse()?]);
+        let allowlist = ExecutorAllowlist::new([("100.64.0.7".parse()?, test_fp())]);
         let registry = HostRegistry::default();
         let (mut client, server) = tokio::io::duplex(64);
 
@@ -1284,7 +1370,7 @@ mod tests {
     /// correctly, not to demonstrate the old bug.
     #[tokio::test]
     async fn dispatches_interleaved_with_an_unexpected_frame_are_all_still_delivered_correctly() -> anyhow::Result<()> {
-        let allowlist = ExecutorAllowlist::new(["100.64.0.7".parse()?]);
+        let allowlist = ExecutorAllowlist::new([("100.64.0.7".parse()?, test_fp())]);
         let registry = HostRegistry::default();
         let (mut client, server) = tokio::io::duplex(4096);
 
@@ -1384,7 +1470,7 @@ mod tests {
     #[tokio::test]
     async fn a_dispatch_becoming_ready_while_an_inbound_frame_is_only_half_written_does_not_desync_the_next_frame()
     -> anyhow::Result<()> {
-        let allowlist = ExecutorAllowlist::new(["100.64.0.7".parse()?]);
+        let allowlist = ExecutorAllowlist::new([("100.64.0.7".parse()?, test_fp())]);
         let registry = HostRegistry::default();
         let (mut client, server) = tokio::io::duplex(4096);
 

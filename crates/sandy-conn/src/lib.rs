@@ -339,6 +339,73 @@ impl TlsIdentity {
     pub fn fingerprint(&self) -> Fingerprint {
         Fingerprint::of(&self.cert)
     }
+
+    /// Load a previously persisted identity from `dir`
+    /// (`identity.cert.der`/`identity.key.der`), or generate a fresh one and
+    /// persist it there if `dir` holds neither file yet.
+    ///
+    /// Persisting (not regenerating on every start) is the whole point: a
+    /// [`Fingerprint`] is the SHA-256 digest of the CERTIFICATE, so minting a
+    /// fresh self-signed cert over the same key — or just calling
+    /// [`Self::generate`] again — would change the fingerprint on every
+    /// restart and silently break whatever peer pinned the old one (decision
+    /// 20's "pinned per-host keys, not TOFU" only holds if the pinned value
+    /// is actually stable across restarts).
+    ///
+    /// Exactly one of the two files existing is treated as a corrupt or
+    /// tampered directory, not an invitation to regenerate: silently minting
+    /// a new identity there would rotate the fingerprint without telling the
+    /// operator, the same silent-failure class this module refuses elsewhere
+    /// (decision 20: fail closed, never a silent downgrade).
+    ///
+    /// # Errors
+    /// [`ConnError::Io`] if `dir` cannot be created, or exactly one of the two
+    /// identity files exists; [`ConnError::Tls`] if an existing key file is
+    /// not valid PKCS#8 DER, or key generation fails for a fresh identity.
+    pub fn load_or_generate(dir: &Path) -> Result<Self, ConnError> {
+        let cert_path = dir.join("identity.cert.der");
+        let key_path = dir.join("identity.key.der");
+        match (cert_path.exists(), key_path.exists()) {
+            (true, true) => {
+                let cert_bytes = std::fs::read(&cert_path)?;
+                let key_bytes = std::fs::read(&key_path)?;
+                Ok(TlsIdentity {
+                    cert: rustls::pki_types::CertificateDer::from(cert_bytes),
+                    key: rustls::pki_types::PrivateKeyDer::try_from(key_bytes)
+                        .map_err(|err| ConnError::Tls(format!("loading persisted TLS key: {err}")))?,
+                })
+            }
+            (false, false) => {
+                let identity = Self::generate()?;
+                identity.persist(dir, &cert_path, &key_path)?;
+                Ok(identity)
+            }
+            (true, false) | (false, true) => Err(ConnError::Io(std::io::Error::other(format!(
+                "{} holds only one of identity.cert.der/identity.key.der; refusing to regenerate over a \
+                 partial/corrupt identity (that would silently rotate the pinned fingerprint)",
+                dir.display()
+            )))),
+        }
+    }
+
+    /// Write this identity's cert/key DER bytes to `dir`, creating it if
+    /// needed. The key is written mode 0600 at creation (same umask-bracketed
+    /// discipline [`bind_uds_0600`] uses for the UDS socket) — a key readable
+    /// by another local user defeats the whole point of pinning it.
+    fn persist(&self, dir: &Path, cert_path: &Path, key_path: &Path) -> Result<(), ConnError> {
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(cert_path, self.cert.as_ref())?;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut key_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(key_path)?;
+        use std::io::Write;
+        key_file.write_all(self.key.secret_der())?;
+        Ok(())
+    }
 }
 
 fn ensure_crypto_provider() {
@@ -1225,6 +1292,46 @@ mod tests {
         let hex = fp.to_hex();
         assert_eq!(hex.len(), 64);
         assert_eq!(Fingerprint::from_hex(&hex)?, fp);
+        Ok(())
+    }
+
+    #[test]
+    fn load_or_generate_persists_and_reloads_the_same_fingerprint() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let first = TlsIdentity::load_or_generate(dir.path()).context("first load_or_generate")?;
+        let second = TlsIdentity::load_or_generate(dir.path()).context("second load_or_generate")?;
+        assert_eq!(
+            first.fingerprint(),
+            second.fingerprint(),
+            "reloading a persisted identity must report the same fingerprint, not mint a fresh one"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn load_or_generate_persisted_key_file_is_mode_0600() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir()?;
+        TlsIdentity::load_or_generate(dir.path()).context("load_or_generate")?;
+        let mode = std::fs::metadata(dir.path().join("identity.key.der"))?
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a world-readable key file defeats the whole point of pinning it"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn load_or_generate_refuses_a_directory_with_only_the_cert() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("identity.cert.der"), b"not a real cert")?;
+        assert!(
+            TlsIdentity::load_or_generate(dir.path()).is_err(),
+            "a partial identity directory must be refused, not silently regenerated over"
+        );
         Ok(())
     }
 

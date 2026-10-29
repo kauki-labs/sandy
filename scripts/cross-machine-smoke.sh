@@ -87,39 +87,13 @@ cleanup() {
   # EXECUTOR_REMOTE_DIR is a persistent path the caller chose to reuse.
   [ -z "$remote_dir_is_default" ] || ssh "$executor_ssh" "rm -rf '$remote_dir'" >/dev/null 2>&1 || true
   rm -f "$sock" "$manifest" "$sandyd_log" "$filelist"
+  [ -z "${orchestrator_tls_dir:-}" ] || rm -rf "$orchestrator_tls_dir"
   exit "$rc"
 }
 trap cleanup EXIT
 
 echo "==> building sandyd + sandy locally" >&2
 (cd "$repo_root" && nix develop -c cargo build -p sandyd -p sandy-cli)
-
-echo "==> starting sandyd (orchestrator: $orchestrator_ip, allowing $executor_ip)" >&2
-(
-  cd "$repo_root"
-  SANDY_SOCK="$sock" \
-    SANDY_MESH_LISTEN="$orchestrator_ip:$mesh_port" \
-    SANDY_MESH_ALLOWLIST="$executor_ip" \
-    SANDY_MESH_AGENT_LINK_LISTEN="$orchestrator_ip:$link_port" \
-    ./target/debug/sandyd
-) >"$sandyd_log" 2>&1 &
-sandyd_pid=$!
-
-echo "==> waiting for sandyd to come up" >&2
-for _ in $(seq 1 30); do
-  grep -q "sandyd listening" "$sandyd_log" 2>/dev/null && break
-  kill -0 "$sandyd_pid" 2>/dev/null || {
-    echo "sandyd exited early:" >&2
-    cat "$sandyd_log" >&2
-    exit 1
-  }
-  sleep 1
-done
-grep -q "sandyd listening" "$sandyd_log" || {
-  echo "sandyd never reported listening:" >&2
-  cat "$sandyd_log" >&2
-  exit 1
-}
 
 if [ -n "$remote_dir_is_default" ]; then
   # Remote mktemp -d: atomic and unpredictably named, unlike a PID-based path
@@ -144,10 +118,49 @@ echo "==> syncing this checkout to $executor_ssh:$remote_dir" >&2
 git -C "$repo_root" ls-files -z >"$filelist"
 rsync -az --from0 --files-from="$filelist" "$repo_root/" "$executor_ssh:$remote_dir/"
 
-echo "==> building sandy-agent + sandy-host-executor remotely" >&2
+echo "==> building sandy-agent + sandy-host-executor + sandy remotely" >&2
 agent_store_path=$(ssh "$executor_ssh" "cd '$remote_dir' && nix build .#sandy-agent --no-link --print-out-paths")
 agent_path="$agent_store_path/bin/sandy-agent"
-ssh "$executor_ssh" "cd '$remote_dir' && nix develop -c cargo build -p sandy-host-executor"
+ssh "$executor_ssh" "cd '$remote_dir' && nix develop -c cargo build -p sandy-host-executor -p sandy-cli"
+
+# Decision 20: both mesh listeners are mutual TLS, pinned per host — mint/load
+# each side's identity and exchange fingerprints before either process
+# starts. `sandy mesh key generate` is idempotent (reloads an existing
+# identity at DIR unchanged), so re-running this script against the same
+# dirs keeps the same pinned fingerprints.
+orchestrator_tls_dir=$(mktemp -d -t sandyd-mesh-tls.XXXXXX)
+executor_tls_dir="$remote_dir/.sandy-mesh-tls"
+echo "==> minting/loading each side's mesh TLS identity" >&2
+orchestrator_fp=$(cd "$repo_root" && ./target/debug/sandy mesh key generate "$orchestrator_tls_dir")
+executor_fp=$(ssh "$executor_ssh" "cd '$remote_dir' && ./target/debug/sandy mesh key generate '$executor_tls_dir'")
+
+echo "==> starting sandyd (orchestrator: $orchestrator_ip, allowing $executor_ip)" >&2
+(
+  cd "$repo_root"
+  SANDY_SOCK="$sock" \
+    SANDY_MESH_LISTEN="$orchestrator_ip:$mesh_port" \
+    SANDY_MESH_ALLOWLIST="$executor_ip=$executor_fp" \
+    SANDY_MESH_AGENT_LINK_LISTEN="$orchestrator_ip:$link_port" \
+    SANDY_MESH_TLS_IDENTITY_DIR="$orchestrator_tls_dir" \
+    ./target/debug/sandyd
+) >"$sandyd_log" 2>&1 &
+sandyd_pid=$!
+
+echo "==> waiting for sandyd to come up" >&2
+for _ in $(seq 1 30); do
+  grep -q "sandyd listening" "$sandyd_log" 2>/dev/null && break
+  kill -0 "$sandyd_pid" 2>/dev/null || {
+    echo "sandyd exited early:" >&2
+    cat "$sandyd_log" >&2
+    exit 1
+  }
+  sleep 1
+done
+grep -q "sandyd listening" "$sandyd_log" || {
+  echo "sandyd never reported listening:" >&2
+  cat "$sandyd_log" >&2
+  exit 1
+}
 
 echo "==> starting sandy-host-executor remotely (host_id=$host_id)" >&2
 # setsid detaches the process from this ssh session's controlling terminal and
@@ -158,6 +171,8 @@ executor_pid=$(ssh "$executor_ssh" "cd '$remote_dir' && \
   SANDY_AGENT_PATH='$agent_path' \
   SANDY_HOST_EXECUTOR_ORCHESTRATOR='$orchestrator_ip:$mesh_port' \
   SANDY_HOST_EXECUTOR_ID='$host_id' \
+  SANDY_HOST_EXECUTOR_ORCHESTRATOR_FINGERPRINT='$orchestrator_fp' \
+  SANDY_HOST_EXECUTOR_TLS_IDENTITY_DIR='$executor_tls_dir' \
   ./target/debug/sandy-host-executor </dev/null >/tmp/sandy-host-executor-smoke.log 2>&1 & echo \$!")
 
 echo "==> waiting for the executor to register" >&2
