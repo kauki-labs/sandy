@@ -30,6 +30,15 @@ use tokio::time::timeout;
 
 const CHANNEL: &str = "orchestrator";
 const WAIT: Duration = Duration::from_secs(10);
+/// A longer budget for a wait whose slow path is process/tmux/PTY startup
+/// itself (spawning `sandy-agent`, allocating a tmux session, attaching a
+/// PTY, forking the job's shell), not application logic hanging. Under a
+/// `--release` + coverage-instrumented, heavily parallel test run — or Nix's
+/// sandboxed build specifically, which showed this consistently (#297) where
+/// an unsandboxed `cargo nextest run` only occasionally did — that startup
+/// path can genuinely take longer than [`WAIT`]'s 10s. Matches the 30s
+/// magnitude this file already uses elsewhere for a job's own `timeout_secs`.
+const STARTUP_WAIT: Duration = Duration::from_secs(30);
 
 type TestChannel = Arc<Channel<InMem, LocalCapAuthority>>;
 type RelayResult = Arc<Mutex<Option<tokio::task::JoinHandle<Result<Option<i32>, LinkError>>>>>;
@@ -639,8 +648,12 @@ async fn a_job_talks_to_a_sibling_over_its_peer_channel() -> anyhow::Result<()> 
     );
     let run = tokio::spawn(run_blocking(backend, sh(&script)));
 
+    // STARTUP_WAIT, not WAIT (#297): this loop's slow path is the job
+    // process actually starting — spawning `sandy-agent`, allocating its
+    // tmux session, attaching a PTY, forking the shell — before it ever
+    // reaches its first `peer send`, not application logic hanging.
     loop {
-        let env = timeout(WAIT, sibling_view.next())
+        let env = timeout(STARTUP_WAIT, sibling_view.next())
             .await?
             .context("group stream ended")??;
         if env.payload == b"from-job" {
