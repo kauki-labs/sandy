@@ -14,7 +14,7 @@ use std::io;
 use base64::Engine as _;
 use clap::ValueEnum;
 use sandy::{JobRecord, ResultEnvelope};
-use sandy_control_proto::{AttachResponse, JobStatus, JobSummary, ListResponse, StatusResponse, SubmitResponse};
+use sandy_control_proto::{AttachResponse, JobStatus, ListResponse, StatusResponse, SubmitResponse};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -273,111 +273,173 @@ fn job_status_name(wire: i32) -> &'static str {
         .as_str_name()
 }
 
-/// Format a `daemon submit` result: the job id `sandyd` assigned.
-///
-/// # Errors
-///
-/// Returns a [`serde_json::Error`] only if JSON serialization fails.
-pub fn format_submit(response: &SubmitResponse, format: OutputFormat) -> serde_json::Result<String> {
-    match format {
-        OutputFormat::Plain => Ok(format!("submitted job {}", response.job_id)),
-        OutputFormat::Json => serde_json::to_string_pretty(&serde_json::json!({ "job_id": response.job_id })),
-    }
+/// `daemon submit`'s result: the job id `sandyd` assigned. The attach token `Submit` also returns is a
+/// bearer credential and is persisted by the CLI, never printed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmittedJob {
+    /// The id `sandyd` assigned.
+    pub job_id: String,
 }
 
-/// Format a `daemon cancel` result. `CancelResponse` carries no fields, so
-/// `job_id` is the id the caller passed on the command line, not something
-/// read back off the response.
-///
-/// # Errors
-///
-/// Returns a [`serde_json::Error`] only if JSON serialization fails.
-pub fn format_cancel(job_id: &str, format: OutputFormat) -> serde_json::Result<String> {
-    match format {
-        OutputFormat::Plain => Ok(format!("cancelled job {job_id}")),
-        OutputFormat::Json => serde_json::to_string_pretty(&serde_json::json!({ "job_id": job_id, "cancelled": true })),
-    }
-}
-
-/// Format a `daemon attach` result: the data-plane channel id and the
-/// attenuated join cap `sandyd` hands back.
-///
-/// The cap is a bearer credential — the same reason
-/// [`sandy_control_proto::AttachResponse`]'s own `Debug` redacts it. `plain`
-/// never prints it (a human terminal isn't `attach`'s intended consumer);
-/// `json` carries it base64-encoded, since the automation layer that actually
-/// joins the channel needs the real bytes, not a redaction marker.
-///
-/// # Errors
-///
-/// Returns a [`serde_json::Error`] only if JSON serialization fails.
-pub fn format_attach(response: &AttachResponse, format: OutputFormat) -> serde_json::Result<String> {
-    match format {
-        OutputFormat::Plain => Ok(format!(
-            "channel {} (cap: {} bytes, redacted — use -o json to retrieve)",
-            response.channel_id,
-            response.cap.len()
-        )),
-        OutputFormat::Json => serde_json::to_string_pretty(&serde_json::json!({
-            "channel_id": response.channel_id,
-            "cap": base64::engine::general_purpose::STANDARD.encode(&response.cap),
-        })),
-    }
-}
-
-/// Format a `daemon status` result: the job id and its lifecycle state.
-///
-/// # Errors
-///
-/// Returns a [`serde_json::Error`] only if JSON serialization fails.
-pub fn format_status(response: &StatusResponse, format: OutputFormat) -> serde_json::Result<String> {
-    let status = job_status_name(response.status);
-    match format {
-        OutputFormat::Plain => {
-            // Surface the exit code when a terminal run reported one (#292), so
-            // `status` shows what the job exited with, not only its band. The
-            // console tail stays out of the one-line plain form (it can be up
-            // to ~64 KiB); it is in the JSON form for a caller that wants it.
-            let mut line = format!("job {}: {status}", response.job_id);
-            if let Some(exit_code) = response.exit_code {
-                line.push_str(&format!(" (exit {exit_code})"));
-            }
-            Ok(line)
+impl From<&SubmitResponse> for SubmittedJob {
+    fn from(response: &SubmitResponse) -> Self {
+        Self {
+            job_id: response.job_id.clone(),
         }
-        OutputFormat::Json => serde_json::to_string_pretty(&serde_json::json!({
-            "job_id": response.job_id,
-            "status": status,
-            "exit_code": response.exit_code,
-            "console_tail": response.console_tail,
-        })),
     }
 }
 
-/// One job summary as a human line: the id and its lifecycle state.
-fn plain_job_summary(job: &JobSummary) -> String {
-    format!("{:<36}  {}", job.job_id, job_status_name(job.status))
+impl Render for SubmittedJob {
+    fn render_plain(&self, out: &mut dyn io::Write) -> io::Result<()> {
+        write!(out, "submitted job {}", self.job_id)
+    }
 }
 
-/// Format a `daemon list` result: every job `sandyd` knows about.
+/// `daemon cancel`'s result. `CancelResponse` carries no fields, so `job_id` is the id the caller passed on
+/// the command line, not something read back off the response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CancelledJob {
+    /// The id the caller asked to cancel.
+    pub job_id: String,
+    /// Always `true` on success; a refused cancel is an error, not a result.
+    pub cancelled: bool,
+}
+
+impl CancelledJob {
+    /// The result for `job_id`, cancelled.
+    #[must_use]
+    pub fn new(job_id: &str) -> Self {
+        Self {
+            job_id: job_id.to_owned(),
+            cancelled: true,
+        }
+    }
+}
+
+impl Render for CancelledJob {
+    fn render_plain(&self, out: &mut dyn io::Write) -> io::Result<()> {
+        write!(out, "cancelled job {}", self.job_id)
+    }
+}
+
+/// `daemon attach`'s result: the data-plane channel id and the attenuated join cap `sandyd` hands back.
 ///
-/// # Errors
-///
-/// Returns a [`serde_json::Error`] only if JSON serialization fails.
-pub fn format_list(response: &ListResponse, format: OutputFormat) -> serde_json::Result<String> {
-    match format {
-        OutputFormat::Plain => Ok(response
-            .jobs
-            .iter()
-            .map(plain_job_summary)
-            .collect::<Vec<_>>()
-            .join("\n")),
-        OutputFormat::Json => serde_json::to_string_pretty(
-            &response
+/// The cap is a bearer credential, the same reason [`sandy_control_proto::AttachResponse`]'s own `Debug`
+/// redacts it. `plain` never prints it (a human terminal is not `attach`'s intended consumer); `json` carries
+/// it base64-encoded, since the automation layer that joins the channel needs the real bytes. `Debug` redacts
+/// it too, so a stray `{:?}` cannot leak it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachedChannel {
+    /// The channel to join.
+    pub channel_id: String,
+    /// The join cap, base64 (standard alphabet).
+    pub cap: String,
+}
+
+impl From<&AttachResponse> for AttachedChannel {
+    fn from(response: &AttachResponse) -> Self {
+        Self {
+            channel_id: response.channel_id.clone(),
+            cap: base64::engine::general_purpose::STANDARD.encode(&response.cap),
+        }
+    }
+}
+
+impl std::fmt::Debug for AttachedChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttachedChannel")
+            .field("channel_id", &self.channel_id)
+            .field("cap", &format_args!("<redacted {} chars>", self.cap.len()))
+            .finish()
+    }
+}
+
+impl Render for AttachedChannel {
+    fn render_plain(&self, out: &mut dyn io::Write) -> io::Result<()> {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&self.cap)
+            .map_or(0, |cap| cap.len());
+        write!(
+            out,
+            "channel {} (cap: {bytes} bytes, redacted — use -o json to retrieve)",
+            self.channel_id
+        )
+    }
+}
+
+/// `daemon status`'s result: the job id, its lifecycle state, and (once terminal) the exit code and console
+/// tail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobStatusReport {
+    /// The job asked about.
+    pub job_id: String,
+    /// The state's wire name, e.g. `JOB_STATUS_RUNNING`.
+    pub status: String,
+    /// The guest's exit code, when a terminal run reported one (#292).
+    pub exit_code: Option<i32>,
+    /// The console tail, up to about 64 KiB. JSON only: the plain form stays one line.
+    pub console_tail: String,
+}
+
+impl From<&StatusResponse> for JobStatusReport {
+    fn from(response: &StatusResponse) -> Self {
+        Self {
+            job_id: response.job_id.clone(),
+            status: job_status_name(response.status).to_owned(),
+            exit_code: response.exit_code,
+            console_tail: response.console_tail.clone(),
+        }
+    }
+}
+
+impl Render for JobStatusReport {
+    fn render_plain(&self, out: &mut dyn io::Write) -> io::Result<()> {
+        write!(out, "job {}: {}", self.job_id, self.status)?;
+        if let Some(exit_code) = self.exit_code {
+            write!(out, " (exit {exit_code})")?;
+        }
+        Ok(())
+    }
+}
+
+/// One job in `daemon list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobSummaryView {
+    /// The job id.
+    pub job_id: String,
+    /// The state's wire name.
+    pub status: String,
+}
+
+/// `daemon list`'s result: every job `sandyd` knows about. `#[serde(transparent)]` keeps the JSON an array.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct JobSummaries(pub Vec<JobSummaryView>);
+
+impl From<&ListResponse> for JobSummaries {
+    fn from(response: &ListResponse) -> Self {
+        Self(
+            response
                 .jobs
                 .iter()
-                .map(|job| serde_json::json!({ "job_id": job.job_id, "status": job_status_name(job.status) }))
-                .collect::<Vec<_>>(),
-        ),
+                .map(|job| JobSummaryView {
+                    job_id: job.job_id.clone(),
+                    status: job_status_name(job.status).to_owned(),
+                })
+                .collect(),
+        )
+    }
+}
+
+impl Render for JobSummaries {
+    fn render_plain(&self, out: &mut dyn io::Write) -> io::Result<()> {
+        for (i, job) in self.0.iter().enumerate() {
+            if i > 0 {
+                writeln!(out)?;
+            }
+            write!(out, "{:<36}  {}", job.job_id, job.status)?;
+        }
+        Ok(())
     }
 }
 
@@ -393,9 +455,118 @@ mod tests {
     use sandy_control_proto::{AttachResponse, JobStatus, JobSummary, ListResponse, StatusResponse, SubmitResponse};
 
     use super::{
-        GcReport, JobRecords, OutputFormat, Render, format_attach, format_cancel, format_list, format_status,
-        format_submit,
+        AttachedChannel, CancelledJob, EmitError, GcReport, JobRecords, JobStatusReport, JobSummaries, OutputFormat,
+        Render, SubmittedJob, emit_to,
     };
+
+    /// `emit_to` into a string without the trailing newline, so the contract tests below read as they did
+    /// when each command had its own `format_*` helper (#513: the typed views must keep that exact output).
+    fn emitted<T: Render + serde::Serialize>(value: &T, format: OutputFormat) -> Result<String, EmitError> {
+        let mut buf = Vec::new();
+        emit_to(value, format, &mut buf)?;
+        Ok(String::from_utf8_lossy(&buf).trim_end_matches('\n').to_owned())
+    }
+
+    fn format_submit(response: &SubmitResponse, format: OutputFormat) -> Result<String, EmitError> {
+        emitted(&SubmittedJob::from(response), format)
+    }
+
+    fn format_cancel(job_id: &str, format: OutputFormat) -> Result<String, EmitError> {
+        emitted(&CancelledJob::new(job_id), format)
+    }
+
+    fn format_attach(response: &AttachResponse, format: OutputFormat) -> Result<String, EmitError> {
+        emitted(&AttachedChannel::from(response), format)
+    }
+
+    fn format_status(response: &StatusResponse, format: OutputFormat) -> Result<String, EmitError> {
+        emitted(&JobStatusReport::from(response), format)
+    }
+
+    fn format_list(response: &ListResponse, format: OutputFormat) -> Result<String, EmitError> {
+        emitted(&JobSummaries::from(response), format)
+    }
+
+    /// #513: every daemon output type is a real serde type: its JSON deserializes back to itself.
+    #[test]
+    fn every_daemon_output_type_round_trips_through_json() -> anyhow::Result<()> {
+        fn round_trip<T>(value: &T) -> anyhow::Result<()>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+        {
+            let json = serde_json::to_string(value).context("serialize")?;
+            let back: T = serde_json::from_str(&json).context("deserialize")?;
+            assert_eq!(&back, value, "round trip changed the value: {json}");
+            Ok(())
+        }
+        round_trip(&SubmittedJob { job_id: "j".into() })?;
+        round_trip(&CancelledJob::new("j"))?;
+        round_trip(&AttachedChannel::from(&AttachResponse {
+            channel_id: "c".into(),
+            cap: vec![1, 2, 3],
+        }))?;
+        round_trip(&JobStatusReport {
+            job_id: "j".into(),
+            status: "JOB_STATUS_SUCCEEDED".into(),
+            exit_code: Some(0),
+            console_tail: "hi\n".into(),
+        })?;
+        round_trip(&JobSummaries::from(&ListResponse {
+            jobs: vec![JobSummary {
+                job_id: "j".into(),
+                status: JobStatus::Running as i32,
+            }],
+        }))?;
+        Ok(())
+    }
+
+    /// A stray `{:?}` of the attach view must not print the cap (it is a bearer credential).
+    #[test]
+    fn attached_channel_debug_redacts_the_cap() {
+        let marker = "sandy-cap-debug-marker-31c9";
+        let view = AttachedChannel::from(&AttachResponse {
+            channel_id: "orchestrator".into(),
+            cap: marker.as_bytes().to_vec(),
+        });
+        let encoded = base64::engine::general_purpose::STANDARD.encode(marker);
+        let rendered = format!("{view:?}");
+        assert!(!rendered.contains(marker) && !rendered.contains(&encoded), "{rendered}");
+        assert!(rendered.contains("redacted"), "{rendered}");
+    }
+
+    /// Plain `list` with no jobs prints nothing at all (not a blank line), as `ls` does.
+    #[test]
+    fn an_empty_list_renders_no_plain_output() -> anyhow::Result<()> {
+        let mut buf = Vec::new();
+        emit_to(&JobSummaries(Vec::new()), OutputFormat::Plain, &mut buf).context("emit")?;
+        assert!(buf.is_empty(), "got {:?}", String::from_utf8_lossy(&buf));
+        Ok(())
+    }
+
+    /// The JSON keys are the contract scripts already parse; a rename must be a deliberate, reviewed change.
+    #[test]
+    fn the_json_shapes_keep_their_keys() -> anyhow::Result<()> {
+        let status = serde_json::to_value(JobStatusReport {
+            job_id: "j".into(),
+            status: "JOB_STATUS_FAILED".into(),
+            exit_code: None,
+            console_tail: String::new(),
+        })?;
+        assert_eq!(
+            status,
+            serde_json::json!({"job_id": "j", "status": "JOB_STATUS_FAILED", "exit_code": null, "console_tail": ""})
+        );
+        assert_eq!(
+            serde_json::to_value(CancelledJob::new("j"))?,
+            serde_json::json!({"job_id": "j", "cancelled": true})
+        );
+        assert_eq!(
+            serde_json::to_value(SubmittedJob { job_id: "j".into() })?,
+            serde_json::json!({"job_id": "j"})
+        );
+        Ok(())
+    }
+
     use crate::doctor::DoctorResult;
 
     /// A value's plain rendering, as a `String` — what [`emit_to`](super::emit_to)
