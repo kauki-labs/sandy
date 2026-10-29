@@ -11,7 +11,8 @@
 //!
 //! The job never inherits the link: the agent keeps a close-on-exec duplicate,
 //! points its own stdin at `/dev/null`, and gives the job fresh pipes. It
-//! inherits the agent's environment unchanged, which is the backend's.
+//! inherits the agent's environment, which is the backend's; in a VM guest (`--vsock-listen`) the agent scrubs it
+//! to `PATH`, `SANDY_*` and `TERM` first (#389).
 //!
 //! The job's result reaches the backend as the link's last frame
 //! ([`LinkAgent::report_exit`]): its exit code, `128 + signal` for a signal
@@ -185,7 +186,7 @@ mod peer;
 mod tmux_pty;
 
 use link_source::LinkSource;
-use tmux_pty::TmuxJob;
+use tmux_pty::{EnvPolicy, TmuxJob};
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -224,9 +225,9 @@ async fn run(source: LinkSource, job: Vec<OsString>) -> Result<ExitStatus, Strin
     match source {
         LinkSource::Stdin => {
             let link = claim_link().map_err(|e| format!("claiming the agent link on stdin: {e}"))?;
-            serve(link, job).await
+            serve(link, job, EnvPolicy::Inherit).await
         }
-        LinkSource::Vsock(port) => serve(accept_vsock_link(port).await?, job).await,
+        LinkSource::Vsock(port) => serve(accept_vsock_link(port).await?, job, EnvPolicy::Scrubbed).await,
     }
 }
 
@@ -257,7 +258,7 @@ async fn accept_vsock_link(port: u32) -> Result<tokio::net::UnixStream, String> 
 
 /// Bootstrap over `link`, run the job as this process's child, and bridge its
 /// stdio until it exits.
-async fn serve<L>(link: L, job: Vec<OsString>) -> Result<ExitStatus, String>
+async fn serve<L>(link: L, job: Vec<OsString>, env: EnvPolicy) -> Result<ExitStatus, String>
 where
     L: AsyncRead + AsyncWrite + Send + 'static,
 {
@@ -289,8 +290,8 @@ where
     // the live tmux session's own `history-limit` and the archived
     // transcript's cap below.
     let history_lines = configured_history_lines();
-    let tmux_job =
-        TmuxJob::start(&job, peer_env, history_lines).map_err(|e| format!("starting the tmux job session: {e}"))?;
+    let tmux_job = TmuxJob::start_with_env(&job, peer_env, history_lines, env)
+        .map_err(|e| format!("starting the tmux job session: {e}"))?;
     let (pty_read, pty_write, resizer, mut attach_child) = tmux_job
         .open_attach()
         .map_err(|e| format!("opening the attach pty: {e}"))?;

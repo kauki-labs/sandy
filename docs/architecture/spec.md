@@ -54,6 +54,8 @@ The design still guarantees, even from inside a compromised guest:
 - no trust-root key and no channel signing key ever reach the guest
   (`credential-seam.md` decisions 2 and 4);
 - no agent capability token in the job's environment;
+- the job's environment is `PATH`, `SANDY_*`, the egress relay's proxy variables and tmux's pane variables, not the
+  guest root login shell's: the agent in a guest scrubs it before it starts the job (#389);
 - on qemu, input and secret shares stay read-only enforced host-side by
   `--readonly` on `virtiofsd`: a guest-root remount-rw still gets `EROFS` on
   write;

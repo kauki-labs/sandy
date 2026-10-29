@@ -88,6 +88,37 @@ fn tmux_cmd(socket: &str) -> std::process::Command {
     cmd
 }
 
+/// What environment the job's tmux server, and so the job, starts with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnvPolicy {
+    /// The agent's own environment. Right when the backend already built it (the process backend clears it).
+    Inherit,
+    /// Only `PATH`, `SANDY_*` and `TERM`. For a VM guest, where the agent starts from the console's root login
+    /// shell and its ambient variables (`HOME`, `NIX_PATH`, `EDITOR`, ...) would otherwise reach the untrusted job
+    /// (#389).
+    Scrubbed,
+}
+
+/// Clear `cmd`'s environment, then keep what the job may see: `PATH`, `SANDY_*` (share and secret directories),
+/// the proxy variables the egress relay wrapper set for the job (#402), and the fixed `TERM` every tmux command gets.
+fn scrub_env(cmd: &mut std::process::Command) {
+    cmd.env_clear().env("TERM", TMUX_TERM);
+    cmd.envs(job_env(std::env::vars_os()));
+}
+
+/// The variables of `ambient` the job may keep (see [`scrub_env`]).
+fn job_env(
+    ambient: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    let relay = crate::egress_relay::proxy_env(std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
+    ambient
+        .filter(|(key, _)| {
+            let name = key.to_string_lossy();
+            name == "PATH" || name.starts_with("SANDY_") || relay.iter().any(|(proxy, _)| *proxy == name)
+        })
+        .collect()
+}
+
 /// A detached tmux session wrapping the job, plus where to find its result.
 pub struct TmuxJob {
     /// This job's own dedicated tmux server socket name (`-L`), never the
@@ -158,10 +189,24 @@ impl TmuxJob {
     ///
     /// # Errors
     /// If `tmux new-session` cannot be spawned or exits non-zero.
+    #[cfg(test)]
     pub fn start(
         job: &[std::ffi::OsString],
         peer_env: Option<(&str, &Path)>,
         history_lines: u32,
+    ) -> std::io::Result<Self> {
+        Self::start_with_env(job, peer_env, history_lines, EnvPolicy::Inherit)
+    }
+
+    /// As [`TmuxJob::start`], with the job's environment set by `env`.
+    ///
+    /// # Errors
+    /// As [`TmuxJob::start`].
+    pub fn start_with_env(
+        job: &[std::ffi::OsString],
+        peer_env: Option<(&str, &Path)>,
+        history_lines: u32,
+        env: EnvPolicy,
     ) -> std::io::Result<Self> {
         // Unique per call, not just per process: several `sandy-agent`
         // processes can share one host's tmux server (a trusted-process host
@@ -234,6 +279,9 @@ impl TmuxJob {
         // cover a failure DURING it).
         let setup = (|| -> std::io::Result<()> {
             let mut cmd = tmux_cmd(&socket);
+            if env == EnvPolicy::Scrubbed {
+                scrub_env(&mut cmd);
+            }
             cmd.args(["-f", &config.to_string_lossy(), "new-session", "-d", "-s", &session]);
             cmd.args(["-x", &DEFAULT_COLS.to_string(), "-y", &DEFAULT_ROWS.to_string()]);
             if let Some((name, dir)) = peer_env {
@@ -653,6 +701,34 @@ mod tests {
     /// 10,000 default, so a test accidentally reading the hardcoded fallback
     /// instead of the value actually passed in would show up as a mismatch.
     const TEST_HISTORY_LINES: u32 = 777;
+
+    /// #389: a scrubbed job keeps `PATH`, `SANDY_*` and the relay's six proxy variables, and nothing from the
+    /// guest's root login shell. The VM-level gate is `live_agent::the_vm_job_environment_is_only_the_allowlist`;
+    /// this pins the relay variables, which that gate cannot reach (no egress proxy there).
+    #[test]
+    fn a_scrubbed_job_keeps_path_sandy_and_proxy_variables_only() {
+        let ambient = [
+            ("PATH", "/bin"),
+            ("SANDY_PEER_SOCKET", "/s"),
+            ("SANDY_X_DIR", "/d"),
+            ("HTTPS_PROXY", "http://127.0.0.1:3128"),
+            ("no_proxy", "localhost"),
+            ("ALL_PROXY", "x"),
+            ("NIX_PATH", "n"),
+            ("EDITOR", "nano"),
+            ("HOME", "/root"),
+        ]
+        .map(|(k, v)| (k.into(), v.into()));
+        let mut kept: Vec<String> = job_env(ambient.into_iter())
+            .into_iter()
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        kept.sort();
+        assert_eq!(
+            kept,
+            ["HTTPS_PROXY", "PATH", "SANDY_PEER_SOCKET", "SANDY_X_DIR", "no_proxy"]
+        );
+    }
 
     #[test]
     fn quotes_each_argument_separately_preserving_boundaries() {
