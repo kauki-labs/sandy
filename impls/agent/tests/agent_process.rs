@@ -29,24 +29,21 @@ use sandy_proto::{MessageType, Tty};
 use tokio::time::timeout;
 
 const CHANNEL: &str = "orchestrator";
-const WAIT: Duration = Duration::from_secs(10);
-/// A longer budget for waits whose slow path is process/tmux/PTY startup or
-/// teardown (spawning `sandy-agent`, allocating a tmux session, attaching a
-/// PTY, forking the job's shell, or the job's own exit + session teardown),
-/// not application logic hanging. Under `--release` plus coverage
-/// instrumentation plus a heavily parallel test run that can genuinely take
-/// longer than [`WAIT`]'s 10s — reproduced on ws01 both inside `nix build`'s
-/// sandbox (consistently, across several separate attempts) and once in a
-/// plain dev shell (see #297; one data point there, not enough to call it
-/// "occasional" vs. "consistent" outside the sandbox). Matches the 30s
+/// How long a wait in this file budgets for the real `sandy-agent`
+/// process/tmux/PTY path (spawn, tmux session allocation, PTY attach, the
+/// job's shell exec, or the job's own exit + session teardown) to finish,
+/// not application logic hanging. #297 traced one of these timing out at
+/// exactly its old 10s value on ws01, both inside `nix build`'s sandbox
+/// (consistently, across several attempts) and once in a plain dev shell —
+/// under `--release` plus coverage instrumentation plus a heavily parallel
+/// test run, that path can genuinely exceed 10s. Confirmed structurally
+/// (ws01, a minimal sandboxed build) that `/dev/pts` and `tmux new-session`
+/// both work fine inside the build sandbox — this is resource/timing
+/// pressure under load, not a PTY/sandbox incompatibility, so every wait on
+/// this same real-process path gets the same wider budget rather than
+/// treating the one observed failure as the only one at risk. Matches the
 /// magnitude this file already uses elsewhere for a job's own `timeout_secs`.
-///
-/// Only [`a_job_talks_to_a_sibling_over_its_peer_channel`] uses this today;
-/// several other tests in this file share the same real spawn/tmux/PTY path
-/// at the plain `WAIT` budget and are equally exposed in principle, but this
-/// is the one actually observed failing — narrower evidence, not a claim
-/// that the others are safe.
-const STARTUP_WAIT: Duration = Duration::from_secs(30);
+const WAIT: Duration = Duration::from_secs(30);
 
 type TestChannel = Arc<Channel<InMem, LocalCapAuthority>>;
 type RelayResult = Arc<Mutex<Option<tokio::task::JoinHandle<Result<Option<i32>, LinkError>>>>>;
@@ -663,17 +660,11 @@ async fn a_job_talks_to_a_sibling_over_its_peer_channel() -> anyhow::Result<()> 
     // instead of surfacing the real error. A `select!` against `&mut run`
     // means a job that exits (for any reason) before ever reaching its
     // first `peer send` is reported immediately and precisely, rather than
-    // waiting out STARTUP_WAIT to report a generic "deadline has elapsed."
-    // STARTUP_WAIT itself (30s, vs. the file's usual 10s `WAIT`) budgets
-    // the one path that genuinely can take longer than 10s while the job
-    // is still healthy: spawning `sandy-agent`, allocating its tmux
-    // session, attaching a PTY, and forking the job's shell, under
-    // `--release` plus coverage instrumentation plus a heavily parallel
-    // test run (confirmed on ws01, both inside `nix build`'s sandbox and
-    // in a plain dev shell — see #297).
+    // waiting out the full budget to report a generic "deadline has
+    // elapsed."
     loop {
         tokio::select! {
-            env = timeout(STARTUP_WAIT, sibling_view.next()) => {
+            env = timeout(WAIT, sibling_view.next()) => {
                 let env = env?.context("group stream ended")??;
                 if env.payload == b"from-job" {
                     break;
@@ -698,12 +689,7 @@ async fn a_job_talks_to_a_sibling_over_its_peer_channel() -> anyhow::Result<()> 
         )
         .await?;
 
-    // STARTUP_WAIT, not WAIT: the job's own `peer recv --wait` exec, exit,
-    // and tmux-session teardown (a documented source of flakiness under
-    // load — see the #340 pipe-pane-vs-kill() race noted in this file's
-    // history) are exposed to the same environment slowness the wait above
-    // budgets for.
-    let outcome = timeout(STARTUP_WAIT, run).await????;
+    let outcome = timeout(WAIT, run).await????;
     assert_eq!(outcome.guest_exit, Some(0), "console: {}", outcome.console);
     let encoded = base64::engine::general_purpose::STANDARD.encode(b"to-job");
     assert!(
