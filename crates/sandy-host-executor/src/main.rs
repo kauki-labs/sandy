@@ -44,7 +44,21 @@ async fn main() {
         }
     };
 
-    let mut conn = match sandy_conn::connect_tcp_keepalive(config.orchestrator, TcpKeepalive::HALF_OPEN_DETECTION).await
+    let identity = match sandy_conn::TlsIdentity::load_or_generate(&config.tls_identity_dir) {
+        Ok(identity) => std::sync::Arc::new(identity),
+        Err(e) => {
+            tracing::error!(error = %e, dir = %config.tls_identity_dir.display(), "could not load or generate this host's mesh TLS identity");
+            std::process::exit(1);
+        }
+    };
+
+    let mut conn = match sandy_conn::connect_tls(
+        config.orchestrator,
+        &identity,
+        config.orchestrator_fingerprint,
+        Some(TcpKeepalive::HALF_OPEN_DETECTION),
+    )
+    .await
     {
         Ok(conn) => conn,
         Err(e) => {
@@ -61,11 +75,16 @@ async fn main() {
 
     let rt = tokio::runtime::Handle::current();
     let agent_path = config.agent_path;
+    let mesh_tls = sandy_fabric_local::mesh_link::MeshTlsIdentity {
+        identity,
+        orchestrator_fingerprint: config.orchestrator_fingerprint,
+    };
     let exit = run_dispatch_loop(
         &mut conn,
         move |dispatch, control| {
             let rt = rt.clone();
             let agent_path = agent_path.clone();
+            let mesh_tls = mesh_tls.clone();
             async move {
                 let job_id = dispatch.job_id.clone();
                 tracing::info!(job_id, "running a dispatch");
@@ -75,7 +94,7 @@ async fn main() {
                     // `containment` above (#332 — never trust this host's
                     // earlier `Register` capability declaration alone).
                     let vm_available = detect_vm_capability();
-                    handle_dispatch(&dispatch, containment, agent_path, rt, vm_available, control)
+                    handle_dispatch(&dispatch, containment, agent_path, rt, vm_available, control, mesh_tls)
                 })
                 .await;
                 // Report the outcome back to the orchestrator over the same
@@ -134,7 +153,8 @@ async fn main() {
     }
 }
 
-/// `SANDY_HOST_EXECUTOR_ORCHESTRATOR`/`SANDY_HOST_EXECUTOR_ID`/`SANDY_AGENT_PATH`,
+/// `SANDY_HOST_EXECUTOR_ORCHESTRATOR`/`SANDY_HOST_EXECUTOR_ID`/`SANDY_AGENT_PATH`/
+/// `SANDY_HOST_EXECUTOR_ORCHESTRATOR_FINGERPRINT`/`SANDY_HOST_EXECUTOR_TLS_IDENTITY_DIR`,
 /// the only place `main` reads the real process environment — everything
 /// downstream takes the already-parsed [`ExecutorConfig`].
 fn resolve_config() -> Result<ExecutorConfig, sandy_host_executor::client_config::ExecutorConfigError> {
@@ -142,6 +162,10 @@ fn resolve_config() -> Result<ExecutorConfig, sandy_host_executor::client_config
         std::env::var("SANDY_HOST_EXECUTOR_ORCHESTRATOR").ok().as_deref(),
         std::env::var("SANDY_HOST_EXECUTOR_ID").ok().as_deref(),
         std::env::var("SANDY_AGENT_PATH").ok().as_deref(),
+        std::env::var("SANDY_HOST_EXECUTOR_ORCHESTRATOR_FINGERPRINT")
+            .ok()
+            .as_deref(),
+        std::env::var("SANDY_HOST_EXECUTOR_TLS_IDENTITY_DIR").ok().as_deref(),
     )
 }
 

@@ -52,6 +52,10 @@ testPkgs.testers.runNixOSTest {
         # test reads (see the file's top comment).
         orchestrator = "127.0.0.1:1";
         hostId = "test-host";
+        # Never dialed (the connect fails fast on ECONNREFUSED before any
+        # TLS handshake is attempted) — a syntactically valid 64-char hex
+        # placeholder satisfies the option's required type, nothing more.
+        orchestratorFingerprint = builtins.concatStringsSep "" (builtins.genList (_: "aa") 32);
       };
 
       # #300(b): a short StopIdleSessionSec, set here (NOT in the module —

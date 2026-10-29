@@ -26,11 +26,20 @@ use std::{
 };
 
 use anyhow::Context;
+use sandy_conn::{Conn, Fingerprint, TlsIdentity, connect_tls};
 use sandy_executor_proto::{
     Arch, Capabilities, HostExecutorMessage, IsolationClass, OrchestratorMessage, Register, SandboxKind,
     host_executor_message, orchestrator_message,
 };
 use sandy_guest_template::manifest::{FlakeManifestV1, default_history_lines, encode_flake_manifest};
+
+/// A throwaway mesh TLS identity for a stand-in host-executor dialing in over
+/// the real mesh wire (decision 20) — this file never completes a real
+/// production registration, so an unpersisted, freshly generated identity is
+/// fine, the same pattern `live_attach.rs`'s own `test_mesh_tls()` uses.
+fn host_identity() -> TlsIdentity {
+    TlsIdentity::generate().expect("generate a throwaway test host identity")
+}
 
 /// How long to wait for a Dispatch that must not come. Placement is a
 /// synchronous step of the Submit handler, so by the time `sandy` has returned
@@ -82,6 +91,10 @@ struct Orchestrator {
     child: Child,
     sock: PathBuf,
     mesh_addr: SocketAddr,
+    /// The orchestrator's own pinned-key fingerprint, learned by pre-generating
+    /// its persisted mesh TLS identity before spawn (below) — what a stand-in
+    /// host-executor pins via `connect_tls`.
+    fingerprint: Fingerprint,
 }
 
 impl Drop for Orchestrator {
@@ -91,25 +104,48 @@ impl Drop for Orchestrator {
     }
 }
 
-fn spawn_orchestrator(tmp: &Path) -> anyhow::Result<Orchestrator> {
+/// Spawn a real `sandyd`, allowlisting exactly `host_fingerprints` (each
+/// paired with loopback, decision 20's `ip=fingerprint` format) as permitted
+/// executor hosts.
+fn spawn_orchestrator(tmp: &Path, host_fingerprints: &[Fingerprint]) -> anyhow::Result<Orchestrator> {
     let (mesh_reserved, mesh_addr) = reserve_tcp_port()?;
     let (link_reserved, link_addr) = reserve_tcp_port()?;
     let sock = tmp.join("sandyd.sock");
     let stderr_log = tmp.join("sandyd.stderr");
     let bin = sandyd_bin()?;
+    // Pre-generate/persist the orchestrator's own mesh identity so this test
+    // learns its fingerprint before sandyd starts: sandyd's own
+    // `load_or_generate` reads the SAME files back (same fingerprint), the
+    // pattern `scripts/cross-machine-smoke.sh` uses to exchange fingerprints
+    // ahead of either side starting.
+    let identity_dir = tmp.join("mesh-tls");
+    let fingerprint = TlsIdentity::load_or_generate(&identity_dir)
+        .context("pre-generating the orchestrator's mesh TLS identity")?
+        .fingerprint();
+    let allowlist = host_fingerprints
+        .iter()
+        .map(|fp| format!("127.0.0.1={}", fp.to_hex()))
+        .collect::<Vec<_>>()
+        .join(",");
     drop((mesh_reserved, link_reserved));
     let child = Command::new(bin)
         .env("SANDY_SOCK", &sock)
         .env("SANDY_DB", tmp.join("sandyd.db"))
         .env("SANDY_MESH_LISTEN", mesh_addr.to_string())
-        .env("SANDY_MESH_ALLOWLIST", "127.0.0.1")
+        .env("SANDY_MESH_ALLOWLIST", allowlist)
         .env("SANDY_MESH_AGENT_LINK_LISTEN", link_addr.to_string())
+        .env("SANDY_MESH_TLS_IDENTITY_DIR", &identity_dir)
         .stdout(Stdio::null())
         .stderr(std::fs::File::create(&stderr_log).context("create the sandyd stderr log")?)
         .spawn()
         .context("spawning sandyd")?;
     // Constructed before any wait below, so a timeout drops it and kills the child.
-    let mut orchestrator = Orchestrator { child, sock, mesh_addr };
+    let mut orchestrator = Orchestrator {
+        child,
+        sock,
+        mesh_addr,
+        fingerprint,
+    };
 
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
@@ -136,17 +172,19 @@ fn spawn_orchestrator(tmp: &Path) -> anyhow::Result<Orchestrator> {
 }
 
 /// Register a host that declares exactly `kind` and `classes`, over the real
-/// mesh wire, and return the open connection (the orchestrator drops the
-/// registration when it closes).
+/// mesh wire (mutual TLS, decision 20, pinned to the orchestrator's
+/// fingerprint and dialing under `identity`), and return the open connection
+/// (the orchestrator drops the registration when it closes).
 async fn register_host(
     orchestrator: &Orchestrator,
+    identity: &TlsIdentity,
     host_id: &str,
     kind: SandboxKind,
     classes: &[IsolationClass],
-) -> anyhow::Result<tokio::net::TcpStream> {
-    let mut conn = tokio::net::TcpStream::connect(orchestrator.mesh_addr)
+) -> anyhow::Result<Box<dyn Conn>> {
+    let mut conn = connect_tls(orchestrator.mesh_addr, identity, orchestrator.fingerprint, None)
         .await
-        .context("dialing the orchestrator's mesh listener")?;
+        .context("dialing the orchestrator's mesh listener over TLS")?;
     sandy_control_proto::write_frame(
         &mut conn,
         &HostExecutorMessage {
@@ -232,7 +270,7 @@ fn submit(
 /// `window`, `None` if the window passes in silence. A closed connection, a read
 /// error or any other frame is an error, so silence never hides a dead host.
 async fn next_dispatch(
-    conn: &mut tokio::net::TcpStream,
+    conn: &mut Box<dyn Conn>,
     window: Duration,
 ) -> anyhow::Result<Option<sandy_executor_proto::Dispatch>> {
     let Ok(read) = tokio::time::timeout(window, sandy_control_proto::read_frame::<OrchestratorMessage>(conn)).await
@@ -258,9 +296,11 @@ fn stderr_of(output: &std::process::Output) -> String {
 #[tokio::test]
 async fn an_untrusted_argv_job_is_refused_even_when_a_host_declares_untrusted() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir().context("temp dir")?;
-    let orchestrator = spawn_orchestrator(tmp.path())?;
+    let process_host_identity = host_identity();
+    let orchestrator = spawn_orchestrator(tmp.path(), &[process_host_identity.fingerprint()])?;
     let mut host = register_host(
         &orchestrator,
+        &process_host_identity,
         "process-host",
         SandboxKind::Process,
         &[IsolationClass::Trusted, IsolationClass::Untrusted],
@@ -298,9 +338,15 @@ async fn an_untrusted_argv_job_is_refused_even_when_a_host_declares_untrusted() 
 #[tokio::test]
 async fn an_untrusted_flake_job_is_refused_when_no_vm_host_declares_untrusted() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir().context("temp dir")?;
-    let orchestrator = spawn_orchestrator(tmp.path())?;
+    let vm_host_identity = host_identity();
+    let process_host_identity = host_identity();
+    let orchestrator = spawn_orchestrator(
+        tmp.path(),
+        &[vm_host_identity.fingerprint(), process_host_identity.fingerprint()],
+    )?;
     let mut host = register_host(
         &orchestrator,
+        &vm_host_identity,
         "trusted-vm-host",
         SandboxKind::Vm,
         &[IsolationClass::Trusted],
@@ -309,6 +355,7 @@ async fn an_untrusted_flake_job_is_refused_when_no_vm_host_declares_untrusted() 
     // Declares Untrusted but not Vm: the sandbox kind is part of placement too.
     let mut process_host = register_host(
         &orchestrator,
+        &process_host_identity,
         "untrusted-process-host",
         SandboxKind::Process,
         &[IsolationClass::Untrusted],
@@ -349,9 +396,11 @@ async fn an_untrusted_flake_job_is_refused_when_no_vm_host_declares_untrusted() 
 #[tokio::test]
 async fn an_untrusted_flake_job_is_dispatched_to_a_vm_host_that_declares_untrusted() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir().context("temp dir")?;
-    let orchestrator = spawn_orchestrator(tmp.path())?;
+    let vm_host_identity = host_identity();
+    let orchestrator = spawn_orchestrator(tmp.path(), &[vm_host_identity.fingerprint()])?;
     let mut host = register_host(
         &orchestrator,
+        &vm_host_identity,
         "untrusted-vm-host",
         SandboxKind::Vm,
         &[IsolationClass::Untrusted],

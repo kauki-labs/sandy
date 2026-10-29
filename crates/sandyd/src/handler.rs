@@ -1007,6 +1007,11 @@ mod tests {
         Arc::new(JobRegistry::new().expect("getrandom for a test registry"))
     }
 
+    /// A deterministic test fingerprint, not a real certificate digest.
+    fn test_fp() -> sandy_conn::Fingerprint {
+        sandy_conn::Fingerprint::from_hex(&"aa".repeat(32)).expect("64-char hex literal")
+    }
+
     /// A registry whose terminal-retention sweep (#270) fires immediately,
     /// for tests that need to observe a job being reaped rather than wait
     /// out the real production default.
@@ -1535,12 +1540,18 @@ mod tests {
     async fn cancel_reaches_a_registered_remote_hosts_connection() -> anyhow::Result<()> {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
-        let allowlist = crate::host_registry::ExecutorAllowlist::new([peer_ip]);
+        let allowlist = crate::host_registry::ExecutorAllowlist::new([(peer_ip, test_fp())]);
         // Keep the whole `Registration` alive, not just `cancel_rx`: dropping
         // `dispatch_rx` would close that channel immediately, failing the
         // Submit's own dispatch send before this test ever gets to Cancel.
         let registration = host_registry
-            .register(&allowlist, peer_ip, "ws01".to_owned(), trusted_host_capabilities())
+            .register(
+                &allowlist,
+                peer_ip,
+                test_fp(),
+                "ws01".to_owned(),
+                trusted_host_capabilities(),
+            )
             .expect("register a test host");
         let mut cancel_rx = registration.cancel_rx;
         let _dispatch_rx = registration.dispatch_rx;
@@ -2105,9 +2116,9 @@ mod tests {
         peer_ip: std::net::IpAddr,
         capabilities: sandy_executor_proto::Capabilities,
     ) -> tokio::sync::mpsc::Receiver<Dispatch> {
-        let allowlist = crate::host_registry::ExecutorAllowlist::new([peer_ip]);
+        let allowlist = crate::host_registry::ExecutorAllowlist::new([(peer_ip, test_fp())]);
         host_registry
-            .register(&allowlist, peer_ip, host_id.to_owned(), capabilities)
+            .register(&allowlist, peer_ip, test_fp(), host_id.to_owned(), capabilities)
             .expect("register a test host")
             .dispatch_rx
     }
@@ -2184,7 +2195,7 @@ mod tests {
     async fn a_submit_reaches_a_real_wire_registered_host_end_to_end() -> anyhow::Result<()> {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
-        let allowlist = crate::host_registry::ExecutorAllowlist::new([peer_ip]);
+        let allowlist = crate::host_registry::ExecutorAllowlist::new([(peer_ip, test_fp())]);
         let (mut client, server) = tokio::io::duplex(4096);
 
         sandy_control_proto::write_frame(
@@ -2206,7 +2217,7 @@ mod tests {
         let serve = tokio::spawn(async move {
             crate::host_conn::serve_host_executor(
                 Box::new(server),
-                sandy_conn::PeerAddr::Tcp(std::net::SocketAddr::new(peer_ip, 9000)),
+                sandy_conn::PeerAddr::TcpTls(std::net::SocketAddr::new(peer_ip, 9000), test_fp()),
                 &allowlist,
                 &host_registry_for_conn,
                 &store_for_conn,
@@ -3130,7 +3141,7 @@ mod tests {
     async fn a_completed_remote_job_ends_succeeded_with_its_exit_and_output() -> anyhow::Result<()> {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
-        let allowlist = crate::host_registry::ExecutorAllowlist::new([peer_ip]);
+        let allowlist = crate::host_registry::ExecutorAllowlist::new([(peer_ip, test_fp())]);
         let (mut client, server) = tokio::io::duplex(8192);
 
         sandy_control_proto::write_frame(
@@ -3152,7 +3163,7 @@ mod tests {
         let serve = tokio::spawn(async move {
             crate::host_conn::serve_host_executor(
                 Box::new(server),
-                sandy_conn::PeerAddr::Tcp(std::net::SocketAddr::new(peer_ip, 9000)),
+                sandy_conn::PeerAddr::TcpTls(std::net::SocketAddr::new(peer_ip, 9000), test_fp()),
                 &allowlist,
                 &host_registry_for_conn,
                 &store_for_conn,
@@ -3290,7 +3301,7 @@ mod tests {
     async fn a_remote_job_whose_host_disconnects_mid_run_goes_failed() -> anyhow::Result<()> {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
-        let allowlist = crate::host_registry::ExecutorAllowlist::new([peer_ip]);
+        let allowlist = crate::host_registry::ExecutorAllowlist::new([(peer_ip, test_fp())]);
         let (mut client, server) = tokio::io::duplex(8192);
 
         sandy_control_proto::write_frame(
@@ -3312,7 +3323,7 @@ mod tests {
         let serve = tokio::spawn(async move {
             crate::host_conn::serve_host_executor(
                 Box::new(server),
-                sandy_conn::PeerAddr::Tcp(std::net::SocketAddr::new(peer_ip, 9000)),
+                sandy_conn::PeerAddr::TcpTls(std::net::SocketAddr::new(peer_ip, 9000), test_fp()),
                 &allowlist,
                 &host_registry_for_conn,
                 &store_for_conn,

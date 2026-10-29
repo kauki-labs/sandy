@@ -60,6 +60,40 @@ pub async fn gate_spawn<T>(
     (permit, value)
 }
 
+/// `(permit, accept result)`, as [`spawn_gated_accept`] hands back once its
+/// spawned task resolves. The accept result is a raw [`sandy_conn::AcceptedStream`],
+/// not yet handshaken on the TLS tier — see `spawn_gated_accept`'s own doc.
+pub type GatedAcceptResult = (
+    Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError>,
+    Result<sandy_conn::AcceptedStream, sandy_conn::ConnError>,
+);
+
+/// Spawn one gated [`sandy_conn::Listener::accept_raw`] call into its own
+/// task, decoupling its execution from whatever `select!` loop awaits the
+/// returned [`tokio::task::JoinHandle`].
+///
+/// This spawns the RAW accept only, not the TLS handshake (the decision-20
+/// accept+handshake hazard `listen_tls`'s own doc comment flags): a caller
+/// holding one pending accept task at a time and re-arming it only once it
+/// resolves — every accept loop in this crate — would otherwise have one
+/// peer's handshake (up to the handshake timeout) delay the next accept from
+/// even starting, serializing TLS handshakes across the whole listener. The
+/// caller is responsible for calling [`sandy_conn::AcceptedStream::handshake`]
+/// itself, inside the per-connection task it spawns once this resolves, so a
+/// slow or silent peer's handshake only occupies its own task and connection
+/// permit, never the shared accept slot.
+///
+/// `listener` is `Arc`-wrapped so the spawned task can hold its own
+/// reference independent of the caller's loop — the point of spawning is
+/// that the task must keep running even if the loop that spawned it moves on
+/// to its next iteration before this task resolves.
+pub fn spawn_gated_accept(
+    semaphore: Arc<tokio::sync::Semaphore>,
+    listener: Arc<sandy_conn::Listener>,
+) -> tokio::task::JoinHandle<GatedAcceptResult> {
+    tokio::spawn(async move { gate_spawn(&semaphore, async move { listener.accept_raw().await }).await })
+}
+
 /// Serve one client connection: read [`ControlRequest`] frames, dispatch each
 /// against `store`, and write the matching
 /// [`ControlResponse`](sandy_control_proto::ControlResponse), until the peer

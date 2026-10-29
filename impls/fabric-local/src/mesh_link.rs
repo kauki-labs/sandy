@@ -15,10 +15,8 @@
 //! `sandy-impls-local` only has to absorb a busy local relay, not a mesh
 //! hop).
 
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::Arc};
 
-#[cfg(test)]
-use sandy_conn::ConnAddr;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::link::{LinkError, LinkFrame, read_frame, write_frame};
@@ -216,6 +214,21 @@ pub enum DialAndForwardError {
     Link(#[from] LinkError),
 }
 
+/// What [`dial_and_forward`]/[`relay_agent_link`] need to
+/// [`sandy_conn::connect_tls`] the mesh agent-link listener (decision 20):
+/// this host's own persisted identity, and the orchestrator's pinned
+/// fingerprint. Bundled into one struct (not two trailing params) to keep
+/// both functions under clippy's argument-count lint.
+#[derive(Clone)]
+pub struct MeshTlsIdentity {
+    /// This host's own mesh mutual-TLS identity. `Arc`-wrapped since
+    /// `TlsIdentity` has no `Clone` and a caller dialing more than once
+    /// shares one loaded identity across calls.
+    pub identity: Arc<sandy_conn::TlsIdentity>,
+    /// The orchestrator's pinned certificate fingerprint.
+    pub orchestrator_fingerprint: sandy_conn::Fingerprint,
+}
+
 /// The executor-host entry point for #159's cross-machine hop: dial the
 /// orchestrator's mesh address, hand the connection and `prefix` to
 /// [`forward_agent_link`] along with `local` (the agent's own link end).
@@ -235,6 +248,7 @@ pub async fn dial_and_forward<L>(
     local: L,
     prefix: &[u8],
     control: Option<sandy_api::backend::RunControl>,
+    mesh_tls: &MeshTlsIdentity,
 ) -> Result<ForwardedVerdict, DialAndForwardError>
 where
     L: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -252,9 +266,19 @@ where
     // race in `relay_agent_link`, but a dead connection that never produces
     // an error or EOF would otherwise rely on that alone instead of the OS
     // also noticing within keepalive's own ~90s window.
+    //
+    // Mutual TLS (decision 20): this is the dial side of sandyd's mesh
+    // agent-link listener, which — once wired — only accepts `listen_tls`
+    // connections pinned to this host's own key. Plaintext here would just
+    // fail the handshake sandyd's side requires.
     let remote = tokio::time::timeout(
         DIAL_TIMEOUT,
-        sandy_conn::connect_tcp_keepalive(orchestrator, sandy_conn::TcpKeepalive::HALF_OPEN_DETECTION),
+        sandy_conn::connect_tls(
+            orchestrator,
+            &mesh_tls.identity,
+            mesh_tls.orchestrator_fingerprint,
+            Some(sandy_conn::TcpKeepalive::HALF_OPEN_DETECTION),
+        ),
     )
     .await
     .map_err(|_| {
@@ -335,6 +359,7 @@ pub fn relay_agent_link(
     prefix: Vec<u8>,
     report: sandy_api::agent::AgentReport,
     control: sandy_api::backend::RunControl,
+    mesh_tls: MeshTlsIdentity,
 ) {
     rt.spawn(async move {
         let link = match owned_fd_into_unix_stream(host_end) {
@@ -345,7 +370,7 @@ pub fn relay_agent_link(
             }
         };
         tokio::select! {
-            result = dial_and_forward(forward_back, link, &prefix, Some(control.clone())) => {
+            result = dial_and_forward(forward_back, link, &prefix, Some(control.clone()), &mesh_tls) => {
                 match result {
                     Ok(ForwardedVerdict::JobExited(code)) => report.job_exited(code),
                     Ok(ForwardedVerdict::AgentFailed(reason)) => report.agent_failed(reason),
@@ -421,6 +446,24 @@ mod tests {
     use super::*;
 
     const PREFIX: &[u8] = b"run-7:token-bytes";
+
+    /// A fresh (orchestrator identity, agent identity, orchestrator's own
+    /// fingerprint) triple for a real `listen_tls`/`connect_tls` test pair:
+    /// the listener binds with the orchestrator identity pinned to the
+    /// agent's fingerprint, and `relay_agent_link`/`dial_and_forward` dial
+    /// with the agent identity pinned to the orchestrator's fingerprint.
+    fn mesh_tls_pair() -> anyhow::Result<(sandy_conn::TlsIdentity, MeshTlsIdentity)> {
+        let orchestrator_identity = sandy_conn::TlsIdentity::generate().context("orchestrator identity")?;
+        let agent_identity = sandy_conn::TlsIdentity::generate().context("agent identity")?;
+        let orchestrator_fingerprint = orchestrator_identity.fingerprint();
+        Ok((
+            orchestrator_identity,
+            MeshTlsIdentity {
+                identity: Arc::new(agent_identity),
+                orchestrator_fingerprint,
+            },
+        ))
+    }
 
     /// Reads exactly `prefix.len()` bytes and asserts they match — the first
     /// thing any peer of [`forward_agent_link`] must see on `remote`.
@@ -700,9 +743,17 @@ mod tests {
     /// way the real macOS↔WS01 hop will.
     #[tokio::test]
     async fn dial_and_forward_resolves_job_exited_over_a_real_tcp_dial() -> anyhow::Result<()> {
-        let listener = sandy_conn::listen(&ConnAddr::Tcp("127.0.0.1:0".parse()?))
-            .await
-            .context("listen")?;
+        let (orchestrator_identity, mesh_tls) = mesh_tls_pair()?;
+
+        let listener = sandy_conn::listen_tls(
+            "127.0.0.1:0".parse()?,
+            orchestrator_identity,
+            std::collections::HashSet::from([mesh_tls.identity.fingerprint()]),
+            Duration::from_secs(5),
+            None,
+        )
+        .await
+        .context("listen_tls")?;
         let orchestrator_addr = listener.local_addr().context("local_addr")?;
 
         let orchestrator = tokio::spawn(async move {
@@ -723,7 +774,8 @@ mod tests {
         });
 
         let (agent_conn, mut agent_side) = tokio::io::duplex(4096);
-        let forwarder = tokio::spawn(dial_and_forward(orchestrator_addr, agent_conn, PREFIX, None));
+        let forwarder =
+            tokio::spawn(async move { dial_and_forward(orchestrator_addr, agent_conn, PREFIX, None, &mesh_tls).await });
 
         let cap_frame = read_frame(&mut agent_side)
             .await?
@@ -773,9 +825,16 @@ mod tests {
             backend::RunControl,
         };
 
-        let listener = sandy_conn::listen(&ConnAddr::Tcp("127.0.0.1:0".parse()?))
-            .await
-            .context("listen")?;
+        let (orchestrator_identity, mesh_tls) = mesh_tls_pair()?;
+        let listener = sandy_conn::listen_tls(
+            "127.0.0.1:0".parse()?,
+            orchestrator_identity,
+            std::collections::HashSet::from([mesh_tls.identity.fingerprint()]),
+            Duration::from_secs(5),
+            None,
+        )
+        .await
+        .context("listen_tls")?;
         let orchestrator_addr = listener.local_addr().context("local_addr")?;
 
         let orchestrator = tokio::spawn(async move {
@@ -814,6 +873,7 @@ mod tests {
                 PREFIX.to_vec(),
                 report,
                 RunControl::with_timeout_secs(300),
+                mesh_tls,
             );
         })
         .await
@@ -873,9 +933,16 @@ mod tests {
             backend::RunControl,
         };
 
-        let listener = sandy_conn::listen(&ConnAddr::Tcp("127.0.0.1:0".parse()?))
-            .await
-            .context("listen")?;
+        let (orchestrator_identity, mesh_tls) = mesh_tls_pair()?;
+        let listener = sandy_conn::listen_tls(
+            "127.0.0.1:0".parse()?,
+            orchestrator_identity,
+            std::collections::HashSet::from([mesh_tls.identity.fingerprint()]),
+            Duration::from_secs(5),
+            None,
+        )
+        .await
+        .context("listen_tls")?;
         let orchestrator_addr = listener.local_addr().context("local_addr")?;
 
         let orchestrator = tokio::spawn(async move {
@@ -928,6 +995,7 @@ mod tests {
                 PREFIX.to_vec(),
                 report,
                 relay_control,
+                mesh_tls,
             );
         })
         .await
@@ -1005,9 +1073,16 @@ mod tests {
     async fn relay_agent_link_times_out_against_a_connected_but_silent_orchestrator() -> anyhow::Result<()> {
         use sandy_api::{agent::AgentReport, backend::RunControl};
 
-        let listener = sandy_conn::listen(&ConnAddr::Tcp("127.0.0.1:0".parse()?))
-            .await
-            .context("listen")?;
+        let (orchestrator_identity, mesh_tls) = mesh_tls_pair()?;
+        let listener = sandy_conn::listen_tls(
+            "127.0.0.1:0".parse()?,
+            orchestrator_identity,
+            std::collections::HashSet::from([mesh_tls.identity.fingerprint()]),
+            Duration::from_secs(5),
+            None,
+        )
+        .await
+        .context("listen_tls")?;
         let orchestrator_addr = listener.local_addr().context("local_addr")?;
 
         // Accepts the connection (so the dial itself succeeds) and then does
@@ -1038,6 +1113,7 @@ mod tests {
                 PREFIX.to_vec(),
                 report,
                 control,
+                mesh_tls,
             );
         })
         .await
@@ -1077,9 +1153,16 @@ mod tests {
     async fn relay_agent_link_survives_past_its_original_deadline_once_suspended() -> anyhow::Result<()> {
         use sandy_api::{agent::AgentReport, backend::RunControl};
 
-        let listener = sandy_conn::listen(&ConnAddr::Tcp("127.0.0.1:0".parse()?))
-            .await
-            .context("listen")?;
+        let (orchestrator_identity, mesh_tls) = mesh_tls_pair()?;
+        let listener = sandy_conn::listen_tls(
+            "127.0.0.1:0".parse()?,
+            orchestrator_identity,
+            std::collections::HashSet::from([mesh_tls.identity.fingerprint()]),
+            Duration::from_secs(5),
+            None,
+        )
+        .await
+        .context("listen_tls")?;
         let orchestrator_addr = listener.local_addr().context("local_addr")?;
 
         // Silent once connected, same as the test above — the point here is
@@ -1112,6 +1195,7 @@ mod tests {
                 PREFIX.to_vec(),
                 report,
                 control_for_relay,
+                mesh_tls,
             );
         })
         .await

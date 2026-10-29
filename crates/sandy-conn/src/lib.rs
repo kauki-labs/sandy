@@ -160,31 +160,33 @@ enum ListenerInner {
     TcpTls(TcpListener, Option<TcpKeepalive>, tokio_rustls::TlsAcceptor, Duration),
 }
 
-impl Listener {
-    /// Accept the next incoming connection, with the peer's identity on
-    /// whatever tier this listener is.
+/// A raw-accepted connection, from [`Listener::accept_raw`]: the TCP accept
+/// has completed but a TLS-tier connection has not yet run its handshake.
+/// Splitting the two steps is what lets a caller re-arm the next accept
+/// immediately rather than waiting on one peer's handshake (see
+/// `accept_raw`'s own doc for the hazard this avoids).
+pub enum AcceptedStream {
+    /// Already a usable connection — the UDS and plaintext-TCP tiers have no
+    /// handshake step, so there is nothing left to defer.
+    Ready(Box<dyn Conn>, PeerAddr),
+    /// A TCP-tier TLS connection whose handshake has not run yet. Call
+    /// [`AcceptedStream::handshake`] to complete it.
+    PendingTls(TcpStream, SocketAddr, tokio_rustls::TlsAcceptor, Duration),
+}
+
+impl AcceptedStream {
+    /// Complete the connection: a no-op for [`AcceptedStream::Ready`], or run
+    /// the deferred TLS handshake for [`AcceptedStream::PendingTls`].
     ///
     /// # Errors
-    /// [`ConnError::Io`] if accepting fails.
-    pub async fn accept(&self) -> Result<(Box<dyn Conn>, PeerAddr), ConnError> {
-        match &self.0 {
-            ListenerInner::Uds(listener) => {
-                let (stream, _addr) = listener.accept().await?;
-                Ok((Box::new(stream), PeerAddr::Uds))
-            }
-            ListenerInner::Tcp(listener, keepalive) => {
-                let (stream, addr) = listener.accept().await?;
-                if let Some(keepalive) = keepalive {
-                    apply_tcp_keepalive(&stream, keepalive)?;
-                }
-                Ok((Box::new(stream), PeerAddr::Tcp(addr)))
-            }
-            ListenerInner::TcpTls(listener, keepalive, acceptor, handshake_timeout) => {
-                let (stream, addr) = listener.accept().await?;
-                if let Some(keepalive) = keepalive {
-                    apply_tcp_keepalive(&stream, keepalive)?;
-                }
-                let tls_stream = tokio::time::timeout(*handshake_timeout, acceptor.accept(stream))
+    /// [`ConnError::HandshakeTimeout`] if the TLS handshake does not finish
+    /// within the configured timeout, or [`ConnError::Tls`] for any other
+    /// handshake failure (a wrong pinned key, no client certificate, …).
+    pub async fn handshake(self) -> Result<(Box<dyn Conn>, PeerAddr), ConnError> {
+        match self {
+            AcceptedStream::Ready(conn, peer) => Ok((conn, peer)),
+            AcceptedStream::PendingTls(stream, addr, acceptor, handshake_timeout) => {
+                let tls_stream = tokio::time::timeout(handshake_timeout, acceptor.accept(stream))
                     .await
                     .map_err(|_elapsed| ConnError::HandshakeTimeout)?
                     .map_err(|err| ConnError::Tls(format!("TLS handshake: {err}")))?;
@@ -198,6 +200,58 @@ impl Listener {
                 Ok((Box::new(tls_stream), PeerAddr::TcpTls(addr, fingerprint)))
             }
         }
+    }
+}
+
+impl Listener {
+    /// Accept the next incoming connection without running a TLS-tier
+    /// handshake yet: the raw `accept(2)` resolves as soon as the OS hands
+    /// over a connection, so a caller holding one pending accept at a time
+    /// (as `sandyd`'s mesh accept loops do) is never blocked by another
+    /// peer's in-progress handshake — the hazard `accept`'s doc used to warn
+    /// callers about. Call [`AcceptedStream::handshake`] to finish it.
+    ///
+    /// # Errors
+    /// [`ConnError::Io`] if accepting fails.
+    pub async fn accept_raw(&self) -> Result<AcceptedStream, ConnError> {
+        match &self.0 {
+            ListenerInner::Uds(listener) => {
+                let (stream, _addr) = listener.accept().await?;
+                Ok(AcceptedStream::Ready(Box::new(stream), PeerAddr::Uds))
+            }
+            ListenerInner::Tcp(listener, keepalive) => {
+                let (stream, addr) = listener.accept().await?;
+                if let Some(keepalive) = keepalive {
+                    apply_tcp_keepalive(&stream, keepalive)?;
+                }
+                Ok(AcceptedStream::Ready(Box::new(stream), PeerAddr::Tcp(addr)))
+            }
+            ListenerInner::TcpTls(listener, keepalive, acceptor, handshake_timeout) => {
+                let (stream, addr) = listener.accept().await?;
+                if let Some(keepalive) = keepalive {
+                    apply_tcp_keepalive(&stream, keepalive)?;
+                }
+                Ok(AcceptedStream::PendingTls(
+                    stream,
+                    addr,
+                    acceptor.clone(),
+                    *handshake_timeout,
+                ))
+            }
+        }
+    }
+
+    /// Accept the next incoming connection, with the peer's identity on
+    /// whatever tier this listener is — [`Listener::accept_raw`] followed
+    /// immediately by [`AcceptedStream::handshake`]. Fine for a caller with no
+    /// reason to split the two steps; `sandyd`'s mesh/host-conn accept loops
+    /// use `accept_raw` and `handshake` separately instead, so one peer's
+    /// handshake never delays the next accept.
+    ///
+    /// # Errors
+    /// [`ConnError::Io`] if accepting fails, or whatever [`AcceptedStream::handshake`] returns.
+    pub async fn accept(&self) -> Result<(Box<dyn Conn>, PeerAddr), ConnError> {
+        self.accept_raw().await?.handshake().await
     }
 
     /// The address actually bound — the OS-assigned port when [`listen`] was
@@ -338,6 +392,73 @@ impl TlsIdentity {
     #[must_use]
     pub fn fingerprint(&self) -> Fingerprint {
         Fingerprint::of(&self.cert)
+    }
+
+    /// Load a previously persisted identity from `dir`
+    /// (`identity.cert.der`/`identity.key.der`), or generate a fresh one and
+    /// persist it there if `dir` holds neither file yet.
+    ///
+    /// Persisting (not regenerating on every start) is the whole point: a
+    /// [`Fingerprint`] is the SHA-256 digest of the CERTIFICATE, so minting a
+    /// fresh self-signed cert over the same key — or just calling
+    /// [`Self::generate`] again — would change the fingerprint on every
+    /// restart and silently break whatever peer pinned the old one (decision
+    /// 20's "pinned per-host keys, not TOFU" only holds if the pinned value
+    /// is actually stable across restarts).
+    ///
+    /// Exactly one of the two files existing is treated as a corrupt or
+    /// tampered directory, not an invitation to regenerate: silently minting
+    /// a new identity there would rotate the fingerprint without telling the
+    /// operator, the same silent-failure class this module refuses elsewhere
+    /// (decision 20: fail closed, never a silent downgrade).
+    ///
+    /// # Errors
+    /// [`ConnError::Io`] if `dir` cannot be created, or exactly one of the two
+    /// identity files exists; [`ConnError::Tls`] if an existing key file is
+    /// not valid PKCS#8 DER, or key generation fails for a fresh identity.
+    pub fn load_or_generate(dir: &Path) -> Result<Self, ConnError> {
+        let cert_path = dir.join("identity.cert.der");
+        let key_path = dir.join("identity.key.der");
+        match (cert_path.exists(), key_path.exists()) {
+            (true, true) => {
+                let cert_bytes = std::fs::read(&cert_path)?;
+                let key_bytes = std::fs::read(&key_path)?;
+                Ok(TlsIdentity {
+                    cert: rustls::pki_types::CertificateDer::from(cert_bytes),
+                    key: rustls::pki_types::PrivateKeyDer::try_from(key_bytes)
+                        .map_err(|err| ConnError::Tls(format!("loading persisted TLS key: {err}")))?,
+                })
+            }
+            (false, false) => {
+                let identity = Self::generate()?;
+                identity.persist(dir, &cert_path, &key_path)?;
+                Ok(identity)
+            }
+            (true, false) | (false, true) => Err(ConnError::Io(std::io::Error::other(format!(
+                "{} holds only one of identity.cert.der/identity.key.der; refusing to regenerate over a \
+                 partial/corrupt identity (that would silently rotate the pinned fingerprint)",
+                dir.display()
+            )))),
+        }
+    }
+
+    /// Write this identity's cert/key DER bytes to `dir`, creating it if
+    /// needed. The key is written mode 0600 at creation (same umask-bracketed
+    /// discipline [`bind_uds_0600`] uses for the UDS socket) — a key readable
+    /// by another local user defeats the whole point of pinning it.
+    fn persist(&self, dir: &Path, cert_path: &Path, key_path: &Path) -> Result<(), ConnError> {
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(cert_path, self.cert.as_ref())?;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut key_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(key_path)?;
+        use std::io::Write;
+        key_file.write_all(self.key.secret_der())?;
+        Ok(())
     }
 }
 
@@ -541,14 +662,11 @@ pub async fn connect_tls(
 /// connection that does not complete the TLS handshake within
 /// `handshake_timeout` is dropped rather than held forever.
 ///
-/// **Caller hazard:** [`Listener::accept`] on a `listen_tls` listener bundles
-/// the raw TCP accept and the full TLS handshake into one future. A caller
-/// that races this inside a `tokio::select!` alongside other branches (as
-/// `sandyd`'s accept loops do today for the plaintext tier) will silently
-/// drop an in-progress, perfectly healthy handshake if a sibling branch
-/// resolves first — not just a slow/adversarial one. Spawn
-/// `Listener::accept` into its own task per connection rather than polling
-/// it directly inside a `select!` with other work.
+/// **Caller note:** [`Listener::accept`] bundles the raw TCP accept and the
+/// full TLS handshake into one future. A caller that holds a single pending
+/// accept at a time (as `sandyd`'s mesh accept loops do) should use
+/// [`Listener::accept_raw`] and [`AcceptedStream::handshake`] separately
+/// instead, so one peer's handshake never delays the next raw accept.
 ///
 /// # Errors
 /// [`ConnError::Io`] if binding fails, or `allowed` is empty.
@@ -1219,12 +1337,124 @@ mod tests {
         Ok(())
     }
 
+    /// Regression: a stalled peer's TLS handshake must not delay accepting
+    /// the NEXT connection. Before splitting `accept_raw`/`handshake`, a
+    /// caller that held one pending `Listener::accept` at a time (as
+    /// `sandyd`'s mesh accept loops do) would not even issue its next raw
+    /// `accept(2)` until the current connection's handshake resolved —
+    /// serializing every handshake across the whole listener. With the
+    /// split, `accept_raw` on a second connection must resolve promptly even
+    /// while a first connection's handshake has not completed and never will.
+    #[tokio::test]
+    async fn a_stalled_handshake_does_not_delay_the_next_raw_accept() -> anyhow::Result<()> {
+        let identity = TlsIdentity::generate().context("identity")?;
+        let client_identity = TlsIdentity::generate().context("client identity")?;
+        let server_fp = identity.fingerprint();
+        let allowed = std::collections::HashSet::from([client_identity.fingerprint()]);
+        let listener = listen_tls(
+            "127.0.0.1:0".parse()?,
+            identity,
+            allowed,
+            Duration::from_secs(30), // long enough that this test's own bound catches a regression first
+            None,
+        )
+        .await
+        .context("listen_tls")?;
+        let bound = listener.local_addr().context("local_addr")?;
+
+        // First peer: completes the TCP three-way handshake but never speaks
+        // TLS, so its handshake stalls for the full (long) timeout above.
+        let _dangling = tokio::net::TcpStream::connect(bound).await.context("raw dial")?;
+        let first = listener
+            .accept_raw()
+            .await
+            .context("accept_raw (first, stalled peer)")?;
+        assert!(
+            matches!(first, AcceptedStream::PendingTls(..)),
+            "the first accept must hand back a pending handshake, not run it inline"
+        );
+
+        // Second peer: a real, well-behaved client, dialed in the
+        // background — its own TLS handshake can't complete until THIS
+        // test calls `second.handshake()` below, so it must run
+        // concurrently with the raw-accept check below, not be awaited
+        // alongside it (joining the two would deadlock: the client's
+        // handshake never finishes until the server runs its own, which
+        // only happens after the raw accept resolves).
+        let connect_task = tokio::spawn(async move { connect_tls(bound, &client_identity, server_fp, None).await });
+
+        // The raw accept must resolve quickly — not wait on the first
+        // connection's handshake, which is never going to complete.
+        let second = tokio::time::timeout(Duration::from_secs(2), listener.accept_raw())
+            .await
+            .context(
+                "accept_raw (second, well-behaved peer) must not be blocked by the first peer's stalled handshake",
+            )?
+            .context("accept_raw (second)")?;
+
+        // The second connection's own handshake completes normally — the
+        // first peer's stall affects only its own connection. This also
+        // unblocks the spawned `connect_tls` task above.
+        let (mut accepted, peer) = second.handshake().await.context("handshake (second)")?;
+        assert!(matches!(peer, PeerAddr::TcpTls(..)));
+        let mut dialed = connect_task
+            .await
+            .context("join connect_tls task")?
+            .context("connect_tls")?;
+        dialed.write_all(b"ok").await.context("write")?;
+        dialed.flush().await?;
+        let mut buf = [0u8; 2];
+        accepted.read_exact(&mut buf).await.context("read")?;
+        assert_eq!(&buf, b"ok");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn fingerprint_hex_round_trips() -> anyhow::Result<()> {
         let fp = TlsIdentity::generate().context("identity")?.fingerprint();
         let hex = fp.to_hex();
         assert_eq!(hex.len(), 64);
         assert_eq!(Fingerprint::from_hex(&hex)?, fp);
+        Ok(())
+    }
+
+    #[test]
+    fn load_or_generate_persists_and_reloads_the_same_fingerprint() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let first = TlsIdentity::load_or_generate(dir.path()).context("first load_or_generate")?;
+        let second = TlsIdentity::load_or_generate(dir.path()).context("second load_or_generate")?;
+        assert_eq!(
+            first.fingerprint(),
+            second.fingerprint(),
+            "reloading a persisted identity must report the same fingerprint, not mint a fresh one"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn load_or_generate_persisted_key_file_is_mode_0600() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir()?;
+        TlsIdentity::load_or_generate(dir.path()).context("load_or_generate")?;
+        let mode = std::fs::metadata(dir.path().join("identity.key.der"))?
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a world-readable key file defeats the whole point of pinning it"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn load_or_generate_refuses_a_directory_with_only_the_cert() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("identity.cert.der"), b"not a real cert")?;
+        assert!(
+            TlsIdentity::load_or_generate(dir.path()).is_err(),
+            "a partial identity directory must be refused, not silently regenerated over"
+        );
         Ok(())
     }
 

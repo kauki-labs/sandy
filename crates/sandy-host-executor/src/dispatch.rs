@@ -456,6 +456,7 @@ pub fn handle_dispatch(
     rt: tokio::runtime::Handle,
     vm_available: bool,
     control: RunControl,
+    mesh_tls: sandy_fabric_local::mesh_link::MeshTlsIdentity,
 ) -> Result<Outcome, HandleDispatchError> {
     let status = containment.status();
     let required = IsolationClass::try_from(dispatch.required_isolation_class).unwrap_or(IsolationClass::Unspecified);
@@ -489,6 +490,7 @@ pub fn handle_dispatch(
             prefix.clone(),
             report,
             control_for_relay.clone(),
+            mesh_tls.clone(),
         );
     });
 
@@ -633,6 +635,18 @@ mod tests {
 
     fn available(isolates_untrusted: bool) -> ContainmentStatus {
         ContainmentStatus::Available { isolates_untrusted }
+    }
+
+    /// A throwaway mesh TLS config for `handle_dispatch` tests that never
+    /// actually reach `relay_agent_link`'s dial (every test here fails before
+    /// `on_link` is ever invoked) — a fresh, unpersisted identity is fine.
+    fn test_mesh_tls_config() -> sandy_fabric_local::mesh_link::MeshTlsIdentity {
+        sandy_fabric_local::mesh_link::MeshTlsIdentity {
+            identity: Arc::new(sandy_conn::TlsIdentity::generate().expect("generate a throwaway test identity")),
+            orchestrator_fingerprint: sandy_conn::TlsIdentity::generate()
+                .expect("generate a throwaway test identity")
+                .fingerprint(),
+        }
     }
 
     /// Regression (#332, CodeRabbit finding on PR #333): a timed-out `nix`
@@ -954,6 +968,7 @@ mod tests {
             rt,
             false,
             sandy_api::backend::RunControl::with_timeout_secs(60),
+            test_mesh_tls_config(),
         )
         .expect_err("an untrusted job on a reaping-only host must be refused, never run");
         assert!(
@@ -999,6 +1014,7 @@ mod tests {
             rt,
             false,
             sandy_api::backend::RunControl::with_timeout_secs(60),
+            test_mesh_tls_config(),
         )
         .expect_err("a Vm dispatch must be refused when this host cannot actually run one");
         assert!(
@@ -1036,6 +1052,7 @@ mod tests {
             rt,
             true,
             sandy_api::backend::RunControl::with_timeout_secs(60),
+            test_mesh_tls_config(),
         )
         .expect_err("an unspecified backend must never be silently accepted");
         assert!(
@@ -1078,6 +1095,7 @@ mod tests {
             rt,
             true,
             sandy_api::backend::RunControl::with_timeout_secs(60),
+            test_mesh_tls_config(),
         )
         .expect_err("a non-flake/v1 encoding on the Vm branch must be refused, never guessed at");
         assert!(
@@ -1121,6 +1139,7 @@ mod tests {
             rt,
             true,
             sandy_api::backend::RunControl::with_timeout_secs(60),
+            test_mesh_tls_config(),
         )
         .expect_err("the non-flake encoding must be refused on the Vm branch");
         assert!(
@@ -1161,6 +1180,7 @@ mod tests {
             rt,
             true,
             sandy_api::backend::RunControl::with_timeout_secs(60),
+            test_mesh_tls_config(),
         )
         .expect_err("an untrusted job with no backend must be refused");
         assert!(
@@ -1213,6 +1233,7 @@ mod tests {
             rt,
             false,
             sandy_api::backend::RunControl::with_timeout_secs(60),
+            test_mesh_tls_config(),
         )
         .expect_err("a wrong-length link_token must be refused, never silently reshaped");
         assert!(

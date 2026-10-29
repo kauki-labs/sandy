@@ -150,6 +150,21 @@ Plus these assertions, each of which Stage 1 cannot pass without:
 Three processes, no nix module, for poking at the real binaries by hand. `sandyd` resolves
 every knob below from environment variables — there is no CLI flag form.
 
+0. **Key provisioning** (decision 20: both mesh listeners are mutual TLS, pinned per host — do
+   this before starting either process). On each host, mint (or reload, idempotently) that
+   host's own persisted identity and print its fingerprint:
+
+   ```
+   sandy mesh key generate /var/lib/sandyd/mesh-tls          # on the orchestrator
+   sandy mesh key generate /var/lib/sandy-executor/mesh-tls  # on the executor
+   ```
+
+   Hand each fingerprint to the other side out of band (the same way an operator already
+   provisions `SANDY_MESH_ALLOWLIST`'s IPs) — the orchestrator pins the executor's fingerprint
+   in its allowlist entry, the executor pins the orchestrator's fingerprint in its own config. A
+   mismatched or unpinned key is refused at the TLS handshake, before any frame is read; there is
+   no plaintext fallback.
+
 1. **Orchestrator** (anywhere; the example below is macOS, a Linux host works the same way).
    `SANDY_MESH_LISTEN` is the address a host-executor registers against;
    `SANDY_MESH_AGENT_LINK_LISTEN` is the **separate** address a dispatched job's agent dials
@@ -158,22 +173,25 @@ every knob below from environment variables — there is no CLI flag form.
 
    ```
    SANDY_SOCK=/tmp/sandyd.sock \
-   SANDY_MESH_LISTEN=<orchestrator-ip>:4000 SANDY_MESH_ALLOWLIST=<executor-ip> \
+   SANDY_MESH_LISTEN=<orchestrator-ip>:4000 SANDY_MESH_ALLOWLIST=<executor-ip>=<executor-fingerprint> \
    SANDY_MESH_AGENT_LINK_LISTEN=<orchestrator-ip>:4001 \
+   SANDY_MESH_TLS_IDENTITY_DIR=/var/lib/sandyd/mesh-tls \
    sandyd
    ```
 
    Both addresses must be a specific interface address, never `0.0.0.0`/`::` (D5 refuses an
-   unspecified bind). `SANDY_MESH_ALLOWLIST` is a comma-separated IP list; an unset or empty
-   allowlist with a listener configured is treated as a misconfiguration and refused, not a
-   deliberate allow-no-one policy. This allowlist is the authorization boundary (D5: the
-   orchestrator trusts the network's own per-peer identity, not a self-reported `host_id`) — so
-   the only real requirement is a network where a peer's source IP reliably and exclusively
-   identifies that one host (no spoofing, no NAT sharing it with another node). A WireGuard- or
-   Tailscale-style mesh is the **recommended** way to get that property and is what this example
-   uses, but it isn't mandatory: any network satisfying it works, and cross-machine dispatch
-   itself stays fully optional — an unset `SANDY_MESH_LISTEN` keeps `sandyd` local-only with no
-   loss of function for single-host use.
+   unspecified bind). `SANDY_MESH_ALLOWLIST` is a comma-separated list of `ip=fingerprint` pairs
+   (decision 20 — a bare IP, the pre-#495 format, is refused by name, naming the migration); an
+   unset or empty allowlist with a listener configured is treated as a misconfiguration and
+   refused, not a deliberate allow-no-one policy. This allowlist is the authorization boundary
+   (D5/decision 20: the orchestrator trusts the network's own per-peer identity AND its pinned
+   mutual-TLS certificate, never a self-reported `host_id`) — so the only real requirement is a
+   network where a peer's source IP reliably and exclusively identifies that one host (no
+   spoofing, no NAT sharing it with another node). A WireGuard- or Tailscale-style mesh is the
+   **recommended** way to get that property and is what this example uses, but it isn't
+   mandatory: any network satisfying it works, and cross-machine dispatch itself stays fully
+   optional — an unset `SANDY_MESH_LISTEN` keeps `sandyd` local-only with no loss of function for
+   single-host use (and skips decision 20's identity/allowlist machinery entirely in that case).
 
 2. **Executor** (the remote host): `SANDY_AGENT_PATH` **must** resolve inside the `bwrap`
    sandbox the trusted-process backend launches the job in (`--ro-bind / /`, then
@@ -187,6 +205,8 @@ every knob below from environment variables — there is no CLI flag form.
    SANDY_AGENT_PATH="$(nix build .#sandy-agent --no-link --print-out-paths)/bin/sandy-agent" \
    SANDY_HOST_EXECUTOR_ORCHESTRATOR=<orchestrator-ip>:4000 \
    SANDY_HOST_EXECUTOR_ID=<any-name> \
+   SANDY_HOST_EXECUTOR_ORCHESTRATOR_FINGERPRINT=<orchestrator-fingerprint> \
+   SANDY_HOST_EXECUTOR_TLS_IDENTITY_DIR=/var/lib/sandy-executor/mesh-tls \
    sandy-host-executor
    ```
 

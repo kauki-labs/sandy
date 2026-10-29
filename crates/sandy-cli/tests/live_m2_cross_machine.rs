@@ -77,6 +77,22 @@ use sandy_executor_proto::{
     host_executor_message, orchestrator_message,
 };
 
+/// A throwaway mesh TLS config for `handle_dispatch`'s decision-20 parameter.
+/// NOTE: this file's own mesh dials (`spawn_orchestrator`'s plaintext
+/// `TcpStream::connect` calls, `SANDY_MESH_ALLOWLIST`'s bare-IP format) still
+/// predate decision 20's mutual-TLS wiring and will need updating before this
+/// live suite actually passes against a real `sandyd` again — tracked as a
+/// follow-up (PR #519's own description). This helper only unblocks
+/// compilation of `handle_dispatch`'s new parameter.
+fn test_mesh_tls() -> sandy_fabric_local::mesh_link::MeshTlsIdentity {
+    sandy_fabric_local::mesh_link::MeshTlsIdentity {
+        identity: std::sync::Arc::new(sandy_conn::TlsIdentity::generate().expect("generate a throwaway test identity")),
+        orchestrator_fingerprint: sandy_conn::TlsIdentity::generate()
+            .expect("generate a throwaway test identity")
+            .fingerprint(),
+    }
+}
+
 /// Refuse unless `SANDY_LIVE=1` — this file spawns real OS processes and
 /// binds real TCP sockets, so it stays opt-in like every other `live` gate
 /// (INV-S9), even though stage 1 needs no hypervisor.
@@ -399,6 +415,7 @@ async fn cross_machine_sandboxes_exchange_a_peer_message_through_the_hub() -> an
             rt,
             false,
             control,
+            test_mesh_tls(),
         )
     })
     .await

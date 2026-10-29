@@ -20,7 +20,7 @@ use sandy_conn::{Conn, Listener, PeerAddr};
 use sandy_executor_proto::decode_remote_link_prefix;
 use sandy_fabric_local::link::serve_agent_link;
 
-use crate::dispatch::JobRegistry;
+use crate::{dispatch::JobRegistry, spawn_gated_accept};
 
 /// How long a freshly accepted connection has to deliver its full run-id +
 /// token prefix before it's closed. Without a deadline here, a peer that
@@ -44,20 +44,36 @@ const MAX_CONCURRENT_LINKS: usize = 256;
 /// against `registry` before relaying it to its job's agent link. A single
 /// connection's own failure (malformed prefix, auth refusal, a faulted link)
 /// never stops the loop — only ends that one connection.
-pub async fn serve_mesh_accept_loop(listener: &Listener, registry: &Arc<JobRegistry>) {
+pub async fn serve_mesh_accept_loop(listener: Arc<Listener>, registry: &Arc<JobRegistry>) {
     serve_mesh_accept_loop_with_cap(listener, registry, MAX_CONCURRENT_LINKS).await;
 }
 
 /// [`serve_mesh_accept_loop`]'s body, parameterized over the concurrency cap
 /// so a test can drive it with a small `max_concurrent` instead of waiting
 /// for [`MAX_CONCURRENT_LINKS`] real connections to prove the cap holds.
-async fn serve_mesh_accept_loop_with_cap(listener: &Listener, registry: &Arc<JobRegistry>, max_concurrent: usize) {
+///
+/// `listener` is `Arc`-wrapped (decision 20's accept+handshake hazard, same
+/// fix `sandyd::main`'s `run_mesh_accept_loop` applies): the raw accept is
+/// spawned into its own task via [`spawn_gated_accept`] rather than raced
+/// directly inside the `select!` below — the SAME `JoinHandle` is re-polled
+/// across loop iterations, never re-created, so losing a `select!` race to
+/// `connections.join_next()` never drops an in-progress accept. The TLS
+/// handshake itself runs inside the per-connection task spawned below, not
+/// inside `accept_task`, so one peer's handshake (up to the handshake
+/// timeout) never delays the next raw accept from starting.
+async fn serve_mesh_accept_loop_with_cap(listener: Arc<Listener>, registry: &Arc<JobRegistry>, max_concurrent: usize) {
     let mut connections = tokio::task::JoinSet::new();
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+    let mut accept_task = spawn_gated_accept(Arc::clone(&semaphore), Arc::clone(&listener));
 
     loop {
         tokio::select! {
-            (permit, accepted) = crate::gate_spawn(&semaphore, listener.accept()) => {
+            result = &mut accept_task => {
+                let Ok((permit, accepted)) = result else {
+                    tracing::error!("mesh accept loop: the accept task panicked; no longer accepting new connections");
+                    break;
+                };
+                accept_task = spawn_gated_accept(Arc::clone(&semaphore), Arc::clone(&listener));
                 let Ok(permit) = permit else {
                     // Never closed by this process; handled rather than
                     // panicked, per house style.
@@ -65,16 +81,30 @@ async fn serve_mesh_accept_loop_with_cap(listener: &Listener, registry: &Arc<Job
                     break;
                 };
                 match accepted {
-                    Ok((conn, peer)) => {
+                    Ok(accepted_stream) => {
                         let registry = Arc::clone(registry);
                         connections.spawn(async move {
                             let _permit = permit; // held for the stream's lifetime, released on drop
-                            serve_one_remote_link(conn, peer, &registry).await;
+                            match accepted_stream.handshake().await {
+                                Ok((conn, peer)) => serve_one_remote_link(conn, peer, &registry).await,
+                                Err(e) => {
+                                    // A per-peer TLS handshake failure (wrong
+                                    // key, a plaintext dialer, a stalled
+                                    // handshake) — confined to this one
+                                    // connection's own task, never the shared
+                                    // accept loop, so it cannot throttle any
+                                    // other peer's agent-link registration.
+                                    tracing::warn!(error = %e, "mesh accept loop: handshake failed");
+                                }
+                            }
                         });
                     }
                     Err(e) => {
                         // `permit` drops here, releasing it immediately: this
-                        // connection was never served.
+                        // connection was never served. A real accept(2)
+                        // fault (accept_raw's only error), not a per-peer
+                        // handshake failure — those are handled inside the
+                        // per-connection task above.
                         tracing::warn!(error = %e, "mesh accept loop: accept faulted; backing off");
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
@@ -83,6 +113,9 @@ async fn serve_mesh_accept_loop_with_cap(listener: &Listener, registry: &Arc<Job
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
         }
     }
+
+    accept_task.abort();
+    let _ = accept_task.await;
 }
 
 /// Authenticate and serve one accepted connection end to end. `conn` is
@@ -656,13 +689,13 @@ mod tests {
     /// connection's stream closes and releases its permit.
     #[tokio::test]
     async fn a_second_stream_is_not_authenticated_until_the_cap_admits_it() -> anyhow::Result<()> {
-        let listener = listen(&loopback(0)).await.context("listen")?;
+        let listener = Arc::new(listen(&loopback(0)).await.context("listen")?);
         let addr = listener.local_addr().context("local_addr")?;
         let registry = Arc::new(JobRegistry::new().context("registry")?);
 
         let loop_registry = Arc::clone(&registry);
         let accept_loop = tokio::spawn(async move {
-            serve_mesh_accept_loop_with_cap(&listener, &loop_registry, 1).await;
+            serve_mesh_accept_loop_with_cap(listener, &loop_registry, 1).await;
         });
 
         // First connection: holds the only permit by never sending its

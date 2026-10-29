@@ -50,6 +50,10 @@ base64.workspace = true
 clap.workspace = true
 octocrab.workspace = true
 sandy.workspace = true
+# `sandy mesh key generate`/`fingerprint` (decision 20): mint/load/print a
+# node's persisted mesh mutual-TLS identity, the same `TlsIdentity` sandyd
+# and sandy-host-executor each load at startup.
+sandy-conn.workspace = true
 sandy-control-proto.workspace = true
 # The flake-template resolution + host->hypervisor pairing logic `--flake`/
 # `daemon submit --flake` call into (#325/#332, extracted to be shared with
