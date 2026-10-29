@@ -1750,3 +1750,190 @@ implied by its network address (a co-located container can have its own
 mount namespace; a genuinely remote host can tunnel to appear local). A
 declared flag puts the fact in the hands of whoever actually knows it: the
 operator deploying the host-executor.
+
+## 22. Remote input/output streaming (#482): a per-job dial-back data link, reopening #459's "control connection" wording
+
+**Status:** proposed.
+
+**Context.** #459's spec (`docs/design/manifest-parity/spec.md`) originally
+decided remote `inputs`/`outputs` "stream over the control connection,"
+reusing sandyd's one persistent, bidirectional management connection per
+host-executor (`sandy-executor-proto` over `sandy-control-proto`'s framing).
+Confirmed against the current code: that connection's write side
+(`host_conn.rs::relay_dispatches`) is a single unbiased `tokio::select!`
+loop, writing `Dispatch`/`AttachStateChanged`/`Cancel` under a flat
+`DISPATCH_WRITE_TIMEOUT`, and its read side is a capacity-1 `mpsc` channel
+fed by a separate `forward_frames` reader task — built for small, latency-
+sensitive control messages, not for streaming potentially gigabytes of job
+data. Multiplexing large chunked transfers onto it would mean a slow or
+large output transfer for one job could delay `Cancel`/`Dispatch` for every
+OTHER job on that same host-executor, since everything shares the one
+connection and one write-under-timeout loop. That analysis is the
+implementer's own (this item, 2026-10-29), building on top of sandy-00's
+earlier spec check (#492), which raised the two questions below without
+answering either.
+
+Two questions put to the owner this same session, both now decided
+(2026-10-29; the owner's own words are recorded in
+`docs/design/manifest-parity/spec.md`'s decision 2, not repeated here):
+reopen the control-connection mechanism in favor of a per-job channel, and
+cap remote inputs the same as outputs (4 GiB / 100,000 entries) even
+though local inputs stay uncapped. Everything below this point — the
+mechanism's design, the ordering, the placement predicate, the path-safety
+handling — is the implementer's design for carrying out those two
+decisions, not itself an owner decision.
+
+**Decision.**
+
+- **Mechanism: a second per-job dial-back link, mirroring the agent
+  link's shape, not its code as-is.** The agent link mints one
+  `RemoteLink`/`LinkToken` pair (`link_auth.rs`) per job and stores it as
+  `job_channel.remote_link: Option<RemoteLink>`; `mesh_accept` looks up an
+  incoming claimed stream by `job_id` alone and routes it to that one
+  link. A data link is a SECOND, independently-claimed link for the same
+  job, so this needs real additions, not just reuse: `job_channel` gains a
+  second field (e.g. `data_link: Option<RemoteLink>`), and `mesh_accept`'s
+  demux needs to tell the two kinds of claimed stream apart for the same
+  `job_id` — either a purpose byte/tag in `encode_remote_link_prefix`'s
+  prefix, or a second token namespace — and route each to its own handler.
+  Framing over the data link reuses `sandy-control-proto`'s existing
+  length-prefixed `write_frame`/`read_frame` (1 MiB `MAX_FRAME_LEN`),
+  carrying a new small message set in `sandy-executor-proto` (names
+  illustrative, not final): `InputChunk { name, offset, bytes }`,
+  `InputEnd`, `OutputChunk { name, bytes }`, `OutputEnd`,
+  `TransferError { reason }`. Each `InputChunk`'s `bytes` is capped well
+  under `MAX_FRAME_LEN` (256 KiB, leaving headroom for the frame's other
+  fields and the protobuf/length-prefix overhead) — a frame is not
+  streamed incrementally, so the whole chunk must fit in one. This link
+  rides the same `mesh_accept` listener the agent link does, so it
+  inherits that listener's own transport: plaintext today, mutual TLS
+  once #504/#519 land (decision 20) — streamed bytes are not protected in
+  transit until then, same as every other mesh connection.
+- **Order of operations: the data link is established from information
+  carried ON `Dispatch`, not before it — the host-executor cannot dial
+  back with a token it has not been given.** `Dispatch` itself carries
+  the second `(job_id, data_link_token)` pair (alongside the existing
+  agent-link `forward_back`/`link_token`) when the manifest names
+  inputs/outputs. `handle_dispatch` adds one blocking pre-run step: dial
+  back on the data link, read `InputChunk`s to completion (`InputEnd`),
+  stage the received bytes into a host-local temp directory exactly as
+  `stage_inputs` already stages a local path (that function itself is
+  unchanged — only what feeds it changes), and only then proceed to boot,
+  staying inside `handle_dispatch`'s existing sequential shape as one more
+  step in the sequence, not a wait nested inside it. After the job ends,
+  the host-executor runs its existing `collect_outputs` into a local temp
+  directory (also unchanged) and streams that back over the data link.
+  Because `JobResult` (on the management connection) and the output
+  transfer (on the data link) are two different connections, their
+  arrival order at sandyd is not guaranteed — `JobResult` must carry
+  enough information (an expected-output count, or a flag) that sandyd
+  keeps the job non-terminal until EITHER the matching `OutputEnd`
+  arrives on the data link or a `TransferError`/disconnect ends it, rather
+  than reporting `SUCCEEDED` the instant `JobResult` alone arrives. The
+  data link's lifetime is NOT bounded by the job's own deadline/timeout:
+  decision 14's #340 amendment suspends that deadline to `None` for the
+  whole time anyone is attached, so a job's own timeout is not a safe
+  bound for anything here. Instead: the data link closes once its OWN terminal
+  event fires — `JobResult` received (success or failure) plus a fixed
+  grace period for the final output transfer to finish — or once the
+  host-executor connection itself is lost, whichever comes first; it
+  also needs its own idle timeout (no bytes for N seconds) independent of
+  both, since `mesh_accept`'s existing prefix-claim timeout only bounds
+  the initial claim, not an established link sitting open with no
+  traffic.
+- **Failure paths, named explicitly, not left implicit.** A `Cancel`
+  arriving while the pre-boot input pull is still in progress aborts the
+  pull; the job never boots, and is reported cancelled, not as a transfer
+  failure. A `TransferError` or a truncated/incomplete input transfer
+  (connection lost before `InputEnd`) fails the job before boot, named
+  distinctly from a guest-side failure — the guest never ran. Host-local
+  temp directories staged for inputs or collected for outputs are removed
+  at teardown on every one of these paths (success, cancel, transfer
+  failure, guest failure) — never left behind, same INV-1-adjacent
+  cleanup discipline the credential seam and local staging already
+  follow.
+- **Size cap: the owner-decided local collect-cap numbers, applied to
+  both directions of remote transfer specifically.** `MAX_OUTPUT_BYTES`
+  (4 GiB) / `MAX_OUTPUT_ENTRIES` (100,000) apply to remote outputs (where
+  they already match the existing local behavior) AND to remote inputs
+  (where they're a new bound local dispatch doesn't have, per the owner's
+  decision). Enforced twice: at Submit, against the summed `stat` size of
+  every declared input/output (a cheap, early refusal naming the
+  offending field); and again while streaming, by counting bytes/entries
+  as they arrive, since a file can grow between the `stat` and the actual
+  send — a cap checked only once at Submit is not a real cap.
+- **Placement: a declared `transfer` capability, OR an already-local
+  host.** `Capabilities` (`executor.proto`) gains a `transfer` flag,
+  following decision 21's own `shares_submitter_filesystem` precedent: an
+  operator sets it when that host-executor's deployment is prepared to
+  receive streamed data (disk headroom, the temp-staging path
+  configured). The exact placement predicate for `inputs`/`outputs`:
+  placed on a host declaring `transfer` OR a host declaring
+  `shares_submitter_filesystem` (decision 21's existing gate already
+  covers that case directly, with no network transfer needed at all) —
+  never placed on a host declaring neither. `secrets` keep their OWN,
+  narrower requirement unchanged: `shares_submitter_filesystem`
+  specifically, never satisfied by `transfer` alone (decision 4; a
+  secret's bytes still never cross the mesh at all, which `transfer`
+  says nothing about). A credential request stays refused for remote
+  dispatch until the mesh transport is actually encrypted (decision 20,
+  #481's own gate), independent of `transfer`. #496's existing
+  `require_local`-refusal acceptance test (the one in #459's own spec)
+  needs updating to this predicate, since `inputs`/`outputs` are no
+  longer local-dispatch-only once this item lands.
+- **Path safety on the way back (zip-slip): sandyd re-validates, never
+  trusts the host-executor's own names.** The host-executor is the
+  untrusted side of this specific boundary — a compromised or buggy
+  remote host could claim any name for a returned output chunk. Before
+  writing a single byte to the submitter's requested destination, sandyd
+  re-checks every relative path the host-executor reports: no `..`
+  component, never absolute, never a symlink component — the same checks
+  `collect_outputs` itself already applies locally, applied a SECOND time
+  here since the bytes crossed an untrusted boundary in between. Each
+  output is written to a temp name in the destination's own directory and
+  renamed into place only once fully received and validated, never
+  streamed directly onto the final path.
+- **Disk I/O off the connection-driving task.** Reading a local input
+  file to send, or writing a received output chunk, goes through a
+  bounded channel into a blocking task, the same shape `spawn_blocking`
+  already uses elsewhere in this codebase for store I/O — never inline on
+  whatever task is also responsible for the data link's own framing and
+  timeouts.
+- **A real, confirmed-open risk, named rather than assumed away:** sandyd
+  must run as (or with equivalent filesystem access to) the actual
+  submitter's own user to safely read input paths and write output
+  destinations on the submitter's behalf — anything else makes it a
+  confused deputy, reading or writing files the connecting CLI's own user
+  could not. Checked for this item: `nix/modules/sandy-executor.nix` has a
+  systemd unit for the host-executor side; no equivalent
+  `nix/modules/sandyd.nix` exists for sandyd itself. `ensure_runtime_dir`
+  (`crates/sandyd/src/main.rs`) creates its runtime dir "owned by this
+  uid" — whatever uid happens to start the process, with nothing pinning
+  it to the submitter's. Today sandyd is only ever run ad hoc, so this
+  has never mattered in practice; it becomes a real gap the moment a
+  deployment runs sandyd as a shared user serving more than one
+  submitter. Filed as #533, to close before any such deployment carries
+  path fields — not something this item or decision 21 resolves, only
+  surfaces.
+
+**Consequences.** A second per-job connection per transfer-carrying
+dispatch (on top of the existing agent link), each independently claimed
+and torn down, requiring `job_channel`/`mesh_accept` changes beyond the
+existing single-link shape; `Dispatch` gains a second link-token pair;
+`sandy-executor-proto` grows the new chunk/end/error message set;
+`Capabilities` grows `transfer`; `JobResult` grows whatever marks "outputs
+are still coming"; placement logic grows the `transfer`-or-local
+predicate. `handle_dispatch` stays sequential (decision 14), so a large
+input pull for one job blocks that host-executor from starting its NEXT
+dispatch until the pull finishes — an accepted consequence of decision 14's
+own one-at-a-time model, not something this item changes or fixes. `docs/design/manifest-parity/spec.md`'s parity matrix and
+decision 2 are updated to match (see that file's own diff) — the
+mechanism recorded there no longer says "control connection", and its
+acceptance test for remote path-field refusal is updated to the new
+predicate.
+
+**Set aside.** Multiplexing onto the existing control connection (#459's
+original wording): rejected per the reopened owner decision above — head-
+of-line blocking against `Dispatch`/`Cancel`/`AttachStateChanged` for every
+other job sharing that host-executor's one connection was judged worse
+than the added complexity of a second dial-back link.
