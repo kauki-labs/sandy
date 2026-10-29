@@ -11,8 +11,12 @@ Only comments from OWNER, MEMBER or COLLABORATOR count: the repo is public, so a
 stranger could otherwise post a verdict. All sessions share one GitHub account, so
 the author says nothing about WHO wrote it. This check guards against forgetting the
 gate. It cannot prove who gave a verdict, or that a session did not write its own.
-The reviewer name, when present, is checked against the charter's list for APPROVE.
-A CHANGES verdict counts whoever wrote it.
+The reviewer name is optional (a verdict without one passes); when present it is
+checked against the charter's list for an APPROVE. A CHANGES verdict counts whatever
+name it carries, but like any verdict it must come from a trusted commenter.
+
+The owner guard reads ATX headings (`## Owner decisions`) only. A bold line or a
+setext heading is not recognised.
 
 Exempt from the verdict (not from the owner guard): PRs authored by a bot (the
 release PR is authored by github-actions[bot]). The title is the author's to choose,

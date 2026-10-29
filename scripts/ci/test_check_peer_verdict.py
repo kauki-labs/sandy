@@ -178,6 +178,15 @@ class PeerVerdict(unittest.TestCase):
         ok, _ = cpv.evaluate(pr(), comments, diff_with("Owner decisions"))
         self.assertFalse(ok)
 
+    def test_the_heading_used_in_the_manifest_parity_spec_is_recognised(self):
+        # docs/design/manifest-parity/spec.md carries `## Owner decisions` (#459).
+        ok, _ = cpv.evaluate(pr(), [comment(verdict())], diff_with("Owner decisions"))
+        self.assertFalse(ok)
+
+    def test_an_unnamed_verdict_passes(self):
+        ok, why = cpv.evaluate(pr(), [comment(verdict(name=None))], "")
+        self.assertTrue(ok, why)
+
     def test_a_change_in_a_subsection_of_owner_decisions_counts(self):
         diff = (
             "diff --git a/d.md b/d.md\n--- a/d.md\n+++ b/d.md\n@@ -1,6 +1,6 @@\n"
