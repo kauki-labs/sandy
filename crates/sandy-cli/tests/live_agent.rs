@@ -266,6 +266,63 @@ async fn the_vm_job_holds_no_link_and_no_cap() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// #389: the VM job's environment is a known allowlist. The agent starts from the guest's console login
+/// shell, so it must not hand that shell's ambient variables (`HOME`, `USER`, `LANG`, anything a guest image or
+/// a console session sets) on to the untrusted job. Mirrors `the_job_environment_carries_no_link_or_cap` in
+/// `impls/agent/tests/agent_process.rs`, which covers the process backend only.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_vm_job_environment_is_only_the_allowlist() -> anyhow::Result<()> {
+    let template = template()?;
+    let (channel, agent_cap, _) = channel_and_caps().await?;
+    let (launch, relay) = relaying(&channel, agent_cap);
+
+    let script = r#"
+        echo "ENVSTART"
+        env
+        echo "ENVEND"
+        exit 0
+    "#;
+    let outcome = timeout(WAIT, run_in_guest(template, launch, script)).await???;
+    let console = &outcome.console;
+    assert_eq!(outcome.guest_exit, Some(0), "console: {console}");
+    // tmux sets these for anything in a pane (see the process-backend test for the full reasoning).
+    const TMUX_SESSION_VARS: &[&str] = &[
+        "TMUX",
+        "TMUX_PANE",
+        "TERM",
+        "TERM_PROGRAM",
+        "TERM_PROGRAM_VERSION",
+        "COLORTERM",
+        "SHELL",
+        "PWD",
+        "SHLVL",
+        "_",
+    ];
+    // Only the job's own printout: between its two markers, past the echoed command line.
+    let listing = console
+        .rsplit_once("ENVSTART")
+        .and_then(|(_, rest)| rest.split_once("ENVEND"))
+        .map_or("", |(listing, _)| listing);
+    let keys: Vec<&str> = listing
+        .lines()
+        .filter(|l| l.contains('='))
+        .map(|l| l.split('=').next().unwrap_or_default())
+        .collect();
+    assert!(keys.contains(&"PATH"), "the job saw no environment at all: {console}");
+    for key in &keys {
+        assert!(
+            *key == "PATH"
+                || (key.starts_with("SANDY_") && key.ends_with("_DIR"))
+                || *key == "SANDY_PEER_SOCKET"
+                || *key == "__LLVM_PROFILE_RT_INIT_ONCE"
+                || TMUX_SESSION_VARS.contains(key),
+            "the VM job env has an unexpected variable {key}: {console}"
+        );
+    }
+    relay_result(&relay).await??;
+    Ok(())
+}
+
 /// The text after `marker` on `line`. The console's start sentinel can share the
 /// line with the job's first output, so the marker need not lead it.
 fn after<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
