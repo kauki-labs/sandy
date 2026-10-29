@@ -17,15 +17,19 @@
 }:
 let
   # cleanCargoSource keeps only Rust sources + manifests; the topology tests
-  # `include_str!` JSON fixtures at compile time, so keep `.json` too, and
+  # `include_str!` JSON fixtures at compile time, so keep `.json` too;
   # sandy-proto's build.rs compiles `.proto` files at build time, so keep those
-  # too (else the crane clippy/test derivations fail to read them in the sandbox).
+  # too; and insta's committed snapshots (`.snap`) are plain fixtures the
+  # filter would otherwise drop, which made `assert_snapshot!` treat every
+  # one as new and fail `test`/`coverage` in the sandbox (found via #494's
+  # follow-up work; fail-fast nextest only ever surfaced the first handful).
   src = lib.cleanSourceWith {
     src = ../..;
     filter =
       path: type:
       (lib.hasSuffix ".json" path)
       || (lib.hasSuffix ".proto" path)
+      || (lib.hasSuffix ".snap" path)
       || (craneLib.filterCargoSources path type);
     name = "source";
   };
