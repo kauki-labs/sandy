@@ -91,7 +91,7 @@ async fn serve_mesh_accept_loop_with_cap(listener: &Listener, registry: &Arc<Job
 /// stream closes with zero bytes written.
 async fn serve_one_remote_link(mut conn: Box<dyn Conn>, peer: PeerAddr, registry: &JobRegistry) {
     let peer_ip = match peer {
-        PeerAddr::Tcp(addr) => addr.ip(),
+        PeerAddr::Tcp(addr) | PeerAddr::TcpTls(addr, _) => addr.ip(),
         PeerAddr::Uds => {
             tracing::error!("mesh accept loop: got a UDS peer; this listener must be bound to the mesh TCP tier");
             return;

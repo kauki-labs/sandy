@@ -39,6 +39,15 @@ pub enum ConnError {
     /// The underlying I/O failed.
     #[error("connection I/O: {0}")]
     Io(#[from] std::io::Error),
+    /// A TLS-tier failure: config construction, the handshake itself, or a
+    /// pinned-key fingerprint mismatch (decision 20).
+    #[error("TLS: {0}")]
+    Tls(String),
+    /// An accepted TCP connection did not complete its TLS handshake within
+    /// the configured timeout (decision 20) — dropped rather than held
+    /// forever.
+    #[error("TLS handshake did not complete within the configured timeout")]
+    HandshakeTimeout,
 }
 
 /// TCP keepalive tuning for a connection — the half-open-detection fix from
@@ -135,6 +144,11 @@ pub enum PeerAddr {
     /// `accept(2)` — on a mesh connection, this is the peer's mesh IP,
     /// authenticated by WireGuard underneath (see [`ConnAddr::Tcp`]).
     Tcp(SocketAddr),
+    /// A TCP peer authenticated over mutual TLS (decision 20): the dialer's
+    /// socket address plus the pinned-key [`Fingerprint`] its certificate
+    /// presented — already verified against the listener's allowlist by the
+    /// time [`Listener::accept`] returns this.
+    TcpTls(SocketAddr, Fingerprint),
 }
 
 /// Accepts incoming connections on whatever [`listen`] bound.
@@ -143,6 +157,7 @@ pub struct Listener(ListenerInner);
 enum ListenerInner {
     Uds(UnixListener),
     Tcp(TcpListener, Option<TcpKeepalive>),
+    TcpTls(TcpListener, Option<TcpKeepalive>, tokio_rustls::TlsAcceptor, Duration),
 }
 
 impl Listener {
@@ -164,6 +179,24 @@ impl Listener {
                 }
                 Ok((Box::new(stream), PeerAddr::Tcp(addr)))
             }
+            ListenerInner::TcpTls(listener, keepalive, acceptor, handshake_timeout) => {
+                let (stream, addr) = listener.accept().await?;
+                if let Some(keepalive) = keepalive {
+                    apply_tcp_keepalive(&stream, keepalive)?;
+                }
+                let tls_stream = tokio::time::timeout(*handshake_timeout, acceptor.accept(stream))
+                    .await
+                    .map_err(|_elapsed| ConnError::HandshakeTimeout)?
+                    .map_err(|err| ConnError::Tls(format!("TLS handshake: {err}")))?;
+                let peer_cert = tls_stream
+                    .get_ref()
+                    .1
+                    .peer_certificates()
+                    .and_then(|certs| certs.first())
+                    .ok_or_else(|| ConnError::Tls("no client certificate presented".to_owned()))?;
+                let fingerprint = Fingerprint::of(peer_cert);
+                Ok((Box::new(tls_stream), PeerAddr::TcpTls(addr, fingerprint)))
+            }
         }
     }
 
@@ -179,6 +212,7 @@ impl Listener {
                 "a UDS listener has no SocketAddr; local_addr is TCP-only",
             ))),
             ListenerInner::Tcp(listener, _keepalive) => Ok(listener.local_addr()?),
+            ListenerInner::TcpTls(listener, ..) => Ok(listener.local_addr()?),
         }
     }
 }
@@ -217,6 +251,326 @@ pub async fn listen_tcp_keepalive(addr: SocketAddr, keepalive: TcpKeepalive) -> 
     Ok(Listener(ListenerInner::Tcp(
         TcpListener::bind(addr).await?,
         Some(keepalive),
+    )))
+}
+
+/// A pinned-key fingerprint: the SHA-256 digest of a [`TlsIdentity`]'s
+/// end-entity certificate DER bytes. This is the identity a peer is checked
+/// against (decision 20: pinned per-host keys, not a CA) — never a chain
+/// validation, since every certificate here is self-signed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Fingerprint([u8; 32]);
+
+impl Fingerprint {
+    fn of(cert: &rustls::pki_types::CertificateDer<'_>) -> Self {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(cert.as_ref());
+        Fingerprint(digest.into())
+    }
+
+    /// Render as lowercase hex, for config files and CLI display.
+    #[must_use]
+    pub fn to_hex(&self) -> String {
+        hex_encode(&self.0)
+    }
+
+    /// Parse a lowercase-or-uppercase hex fingerprint, as produced by
+    /// [`Fingerprint::to_hex`].
+    ///
+    /// # Errors
+    /// [`ConnError::Tls`] if `hex` is not exactly 64 hex characters.
+    pub fn from_hex(hex: &str) -> Result<Self, ConnError> {
+        let bytes = hex_decode(hex).ok_or_else(|| ConnError::Tls(format!("not a 64-char hex fingerprint: {hex}")))?;
+        Ok(Fingerprint(bytes))
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+fn hex_decode(s: &str) -> Option<[u8; 32]> {
+    // `is_ascii` first: a 64-*byte* string containing a multi-byte UTF-8
+    // character (e.g. one "€" plus 61 ASCII bytes) would pass the length
+    // check below and then panic on a `&s[i*2..i*2+2]` slice that lands
+    // mid-character. ASCII guarantees every byte is its own char boundary.
+    if !s.is_ascii() || s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in out.iter_mut().enumerate() {
+        *chunk = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// A self-signed TLS identity for the mesh tier: a fresh keypair and the
+/// matching self-signed certificate, minted once per node (decision 20 —
+/// pinned per-host keys, no CA). The certificate's only job is to carry the
+/// public key through the TLS handshake; its subject/SAN content is never
+/// checked by either [`connect_tls`] or [`listen_tls`], only its
+/// [`Fingerprint`].
+pub struct TlsIdentity {
+    cert: rustls::pki_types::CertificateDer<'static>,
+    key: rustls::pki_types::PrivateKeyDer<'static>,
+}
+
+impl TlsIdentity {
+    /// Generate a fresh self-signed identity.
+    ///
+    /// # Errors
+    /// [`ConnError::Tls`] if key generation or self-signing fails.
+    pub fn generate() -> Result<Self, ConnError> {
+        let rcgen::CertifiedKey { cert, key_pair } = rcgen::generate_simple_self_signed(vec!["sandy-mesh".to_owned()])
+            .map_err(|err| ConnError::Tls(format!("generating a self-signed identity: {err}")))?;
+        let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(key_pair.serialize_der().into());
+        Ok(TlsIdentity {
+            cert: cert.der().clone(),
+            key: key_der,
+        })
+    }
+
+    /// This identity's [`Fingerprint`] — what a peer pins against.
+    #[must_use]
+    pub fn fingerprint(&self) -> Fingerprint {
+        Fingerprint::of(&self.cert)
+    }
+}
+
+fn ensure_crypto_provider() {
+    static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        // Ignore the result: a concurrent caller (or an embedding binary)
+        // may have already installed a different provider (e.g. aws-lc-rs,
+        // also in this workspace's dependency graph via octocrab), which is
+        // fine — we only need *a* provider installed, and the verifiers
+        // below always read back whichever one actually won via
+        // `active_verification_algorithms`, never assuming it was ring's.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+/// The signature-verification algorithms of whichever [`rustls::CryptoProvider`]
+/// actually won process-wide installation — never hardcoded to `ring`, since
+/// [`ensure_crypto_provider`] only guarantees *some* provider is installed,
+/// not which one (another dependency may install `aws-lc-rs` first). The
+/// `ring` fallback only matters if this is somehow called before any
+/// `connect_tls`/`listen_tls` call has run `ensure_crypto_provider`.
+fn active_verification_algorithms() -> &'static rustls::crypto::WebPkiSupportedAlgorithms {
+    if let Some(provider) = rustls::crypto::CryptoProvider::get_default() {
+        return &provider.signature_verification_algorithms;
+    }
+    static FALLBACK: std::sync::OnceLock<rustls::crypto::CryptoProvider> = std::sync::OnceLock::new();
+    &FALLBACK
+        .get_or_init(rustls::crypto::ring::default_provider)
+        .signature_verification_algorithms
+}
+
+#[derive(Debug)]
+struct PinnedServerVerifier {
+    allowed: std::collections::HashSet<Fingerprint>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedServerVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if self.allowed.contains(&Fingerprint::of(end_entity)) {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(
+                "server certificate fingerprint is not in the pinned allowlist".to_owned(),
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, active_verification_algorithms())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, active_verification_algorithms())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        active_verification_algorithms().supported_schemes()
+    }
+}
+
+#[derive(Debug)]
+struct PinnedClientVerifier {
+    allowed: std::collections::HashSet<Fingerprint>,
+}
+
+impl rustls::server::danger::ClientCertVerifier for PinnedClientVerifier {
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        // Fail closed (decision 20): an anonymous peer is never accepted.
+        true
+    }
+
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        if self.allowed.contains(&Fingerprint::of(end_entity)) {
+            Ok(rustls::server::danger::ClientCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(
+                "client certificate fingerprint is not in the pinned allowlist".to_owned(),
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, active_verification_algorithms())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, active_verification_algorithms())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        active_verification_algorithms().supported_schemes()
+    }
+}
+
+fn client_tls_config(
+    identity: &TlsIdentity,
+    expected_peer: Fingerprint,
+) -> Result<std::sync::Arc<rustls::ClientConfig>, ConnError> {
+    ensure_crypto_provider();
+    let verifier = PinnedServerVerifier {
+        allowed: std::collections::HashSet::from([expected_peer]),
+    };
+    let config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(verifier))
+        .with_client_auth_cert(vec![identity.cert.clone()], identity.key.clone_key())
+        .map_err(|err| ConnError::Tls(format!("building the TLS client config: {err}")))?;
+    Ok(std::sync::Arc::new(config))
+}
+
+fn server_tls_config(
+    identity: &TlsIdentity,
+    allowed: std::collections::HashSet<Fingerprint>,
+) -> Result<std::sync::Arc<rustls::ServerConfig>, ConnError> {
+    ensure_crypto_provider();
+    let verifier = PinnedClientVerifier { allowed };
+    let config = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(std::sync::Arc::new(verifier))
+        .with_single_cert(vec![identity.cert.clone()], identity.key.clone_key())
+        .map_err(|err| ConnError::Tls(format!("building the TLS server config: {err}")))?;
+    Ok(std::sync::Arc::new(config))
+}
+
+/// Dial `addr` over mutual TLS, pinning the peer to `expected_peer`'s
+/// [`Fingerprint`] (decision 20) rather than validating a certificate chain —
+/// every identity here is self-signed, so chain validation would check
+/// nothing. [`TcpKeepalive`], if given, is applied to the underlying TCP
+/// socket before the handshake, so it governs the connection regardless of
+/// the TLS layer above it.
+///
+/// # Errors
+/// [`ConnError::Io`] if the TCP dial fails; [`ConnError::Tls`] if the
+/// handshake fails or the peer's certificate fingerprint does not match
+/// `expected_peer`.
+pub async fn connect_tls(
+    addr: SocketAddr,
+    identity: &TlsIdentity,
+    expected_peer: Fingerprint,
+    keepalive: Option<TcpKeepalive>,
+) -> Result<Box<dyn Conn>, ConnError> {
+    let stream = TcpStream::connect(addr).await?;
+    if let Some(keepalive) = &keepalive {
+        apply_tcp_keepalive(&stream, keepalive)?;
+    }
+    let config = client_tls_config(identity, expected_peer)?;
+    let connector = tokio_rustls::TlsConnector::from(config);
+    let server_name = rustls::pki_types::ServerName::IpAddress(addr.ip().into());
+    let tls_stream = connector
+        .connect(server_name, stream)
+        .await
+        .map_err(|err| ConnError::Tls(format!("TLS handshake: {err}")))?;
+    Ok(Box::new(tls_stream))
+}
+
+/// Bind `addr`, accepting only mutual-TLS connections from a peer whose
+/// certificate fingerprint is in `allowed` (decision 20). Refuses to bind at
+/// all if `allowed` is empty — a listener with no one who could ever connect
+/// is a startup-time misconfiguration, not a running-but-useless listener
+/// (mirrors decision 13's empty-allowlist refusal). An accepted TCP
+/// connection that does not complete the TLS handshake within
+/// `handshake_timeout` is dropped rather than held forever.
+///
+/// **Caller hazard:** [`Listener::accept`] on a `listen_tls` listener bundles
+/// the raw TCP accept and the full TLS handshake into one future. A caller
+/// that races this inside a `tokio::select!` alongside other branches (as
+/// `sandyd`'s accept loops do today for the plaintext tier) will silently
+/// drop an in-progress, perfectly healthy handshake if a sibling branch
+/// resolves first — not just a slow/adversarial one. Spawn
+/// `Listener::accept` into its own task per connection rather than polling
+/// it directly inside a `select!` with other work.
+///
+/// # Errors
+/// [`ConnError::Io`] if binding fails, or `allowed` is empty.
+pub async fn listen_tls(
+    addr: SocketAddr,
+    identity: TlsIdentity,
+    allowed: std::collections::HashSet<Fingerprint>,
+    handshake_timeout: Duration,
+    keepalive: Option<TcpKeepalive>,
+) -> Result<Listener, ConnError> {
+    if allowed.is_empty() {
+        return Err(ConnError::Io(std::io::Error::other(
+            "listen_tls refuses an empty pinned-key allowlist: nobody could ever connect",
+        )));
+    }
+    let config = server_tls_config(&identity, allowed)?;
+    let listener = TcpListener::bind(addr).await?;
+    Ok(Listener(ListenerInner::TcpTls(
+        listener,
+        keepalive,
+        tokio_rustls::TlsAcceptor::from(config),
+        handshake_timeout,
     )))
 }
 
@@ -712,5 +1066,178 @@ mod tests {
             "a refused bind must never create anything at the symlink's target"
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn tls_round_trips_bytes_when_both_fingerprints_are_pinned() -> anyhow::Result<()> {
+        let server_identity = TlsIdentity::generate().context("server identity")?;
+        let client_identity = TlsIdentity::generate().context("client identity")?;
+        let server_fp = server_identity.fingerprint();
+        let client_fp = client_identity.fingerprint();
+
+        let listener = listen_tls(
+            "127.0.0.1:0".parse()?,
+            server_identity,
+            std::collections::HashSet::from([client_fp]),
+            Duration::from_secs(5),
+            None,
+        )
+        .await
+        .context("listen_tls")?;
+        let bound = listener.local_addr().context("local_addr")?;
+
+        let (accept_result, connect_result) =
+            tokio::join!(listener.accept(), connect_tls(bound, &client_identity, server_fp, None));
+        let (mut accepted, peer) = accept_result.context("accept")?;
+        let mut dialed = connect_result.context("connect_tls")?;
+
+        match peer {
+            PeerAddr::TcpTls(addr, fp) => {
+                assert_eq!(addr.ip(), "127.0.0.1".parse::<std::net::IpAddr>()?);
+                assert_eq!(fp, client_fp, "accept must report the dialer's own pinned fingerprint");
+            }
+            other => panic!("expected PeerAddr::TcpTls, got {other:?}"),
+        }
+
+        dialed.write_all(b"hello").await.context("write")?;
+        dialed.flush().await?;
+        let mut buf = [0u8; 5];
+        accepted.read_exact(&mut buf).await.context("read")?;
+        assert_eq!(&buf, b"hello");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connect_tls_is_refused_when_the_servers_fingerprint_does_not_match() -> anyhow::Result<()> {
+        let server_identity = TlsIdentity::generate().context("server identity")?;
+        let client_identity = TlsIdentity::generate().context("client identity")?;
+        let wrong_fp = TlsIdentity::generate().context("unrelated identity")?.fingerprint();
+
+        let listener = listen_tls(
+            "127.0.0.1:0".parse()?,
+            server_identity,
+            std::collections::HashSet::from([client_identity.fingerprint()]),
+            Duration::from_secs(5),
+            None,
+        )
+        .await
+        .context("listen_tls")?;
+        let bound = listener.local_addr().context("local_addr")?;
+
+        let (accept_result, connect_result) =
+            tokio::join!(listener.accept(), connect_tls(bound, &client_identity, wrong_fp, None));
+        assert!(
+            connect_result.is_err(),
+            "pinning the wrong server fingerprint must be refused, not silently accepted"
+        );
+        // The server side also sees the handshake fail (the client aborted
+        // mid-handshake once it rejected the server's certificate).
+        assert!(
+            accept_result.is_err(),
+            "the server's accept must also fail, not hang or succeed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accept_refuses_a_client_whose_fingerprint_is_not_allowlisted() -> anyhow::Result<()> {
+        let server_identity = TlsIdentity::generate().context("server identity")?;
+        let client_identity = TlsIdentity::generate().context("client identity")?;
+        let unlisted_identity = TlsIdentity::generate().context("unlisted identity")?;
+        let server_fp = server_identity.fingerprint();
+
+        let listener = listen_tls(
+            "127.0.0.1:0".parse()?,
+            server_identity,
+            // The allowlist pins a different client than the one that dials.
+            std::collections::HashSet::from([client_identity.fingerprint()]),
+            Duration::from_secs(5),
+            None,
+        )
+        .await
+        .context("listen_tls")?;
+        let bound = listener.local_addr().context("local_addr")?;
+
+        let (accept_result, _connect_result) = tokio::join!(
+            listener.accept(),
+            connect_tls(bound, &unlisted_identity, server_fp, None)
+        );
+        assert!(
+            accept_result.is_err(),
+            "a client whose fingerprint isn't pinned must be refused, not accepted"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn listen_tls_refuses_to_bind_with_an_empty_allowlist() -> anyhow::Result<()> {
+        let identity = TlsIdentity::generate().context("identity")?;
+        let result = listen_tls(
+            "127.0.0.1:0".parse()?,
+            identity,
+            std::collections::HashSet::new(),
+            Duration::from_secs(5),
+            None,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "an empty pinned-key allowlist must refuse to bind at all, not run and refuse every peer"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_accept_that_never_completes_the_tls_handshake_times_out() -> anyhow::Result<()> {
+        let identity = TlsIdentity::generate().context("identity")?;
+        let allowed =
+            std::collections::HashSet::from([TlsIdentity::generate().context("peer identity")?.fingerprint()]);
+        // A real, short duration — a paused virtual clock races the real TCP
+        // connect below and is flaky for this kind of test (AGENTS.md).
+        let listener = listen_tls(
+            "127.0.0.1:0".parse()?,
+            identity,
+            allowed,
+            Duration::from_millis(200),
+            None,
+        )
+        .await
+        .context("listen_tls")?;
+        let bound = listener.local_addr().context("local_addr")?;
+
+        // A raw TCP client that completes the three-way handshake but never
+        // speaks TLS: the "accepted but never finishes" case the timeout
+        // exists for.
+        let _dangling = tokio::net::TcpStream::connect(bound).await.context("raw dial")?;
+        let result = listener.accept().await;
+        let is_timeout = matches!(result, Err(ConnError::HandshakeTimeout));
+        assert!(
+            is_timeout,
+            "a connection that never completes its TLS handshake must time out, not hang forever; got {:?}",
+            result.map(|_| "Ok").map_err(|err| err.to_string())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fingerprint_hex_round_trips() -> anyhow::Result<()> {
+        let fp = TlsIdentity::generate().context("identity")?.fingerprint();
+        let hex = fp.to_hex();
+        assert_eq!(hex.len(), 64);
+        assert_eq!(Fingerprint::from_hex(&hex)?, fp);
+        Ok(())
+    }
+
+    #[test]
+    fn fingerprint_from_hex_rejects_malformed_input_instead_of_panicking() {
+        // A 64-*byte* string containing a multi-byte UTF-8 character: the
+        // length check alone would pass, and slicing by byte index would
+        // panic on a non-char-boundary without the `is_ascii` guard.
+        let non_ascii_but_64_bytes = format!("{}{}", "€", "a".repeat(61));
+        assert_eq!(non_ascii_but_64_bytes.len(), 64);
+        assert!(Fingerprint::from_hex(&non_ascii_but_64_bytes).is_err());
+
+        assert!(Fingerprint::from_hex("too-short").is_err());
+        assert!(Fingerprint::from_hex(&"zz".repeat(32)).is_err());
     }
 }
