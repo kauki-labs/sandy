@@ -36,6 +36,8 @@ fn run_with_output(target: &LiveTarget, out_arg: &str, sh_command: &str) -> anyh
             "--out",
             out_arg,
             "--",
+            "sh",
+            "-c",
             sh_command,
         ])
         .output()

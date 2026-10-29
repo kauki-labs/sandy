@@ -62,6 +62,8 @@ fn input_secret_and_output_compose_in_one_run() -> Result<()> {
             "--out",
             &format!("result:{}", out_dest.display()),
             "--",
+            "sh",
+            "-c",
             job,
         ])
         .output()

@@ -273,7 +273,7 @@ fn credential_secret_input_output_all_compose() -> anyhow::Result<()> {
         digests: false,
         egress_proxy: false,
         template: format!("{}#{}", guest_flake().display(), target.topology_attr),
-        command: vec![job.to_string()],
+        command: vec!["sh".to_string(), "-c".to_string(), job.to_string()],
         secrets: vec![SecretRef {
             name: "TOK".to_string(),
             source: SecretSource::File(tok),

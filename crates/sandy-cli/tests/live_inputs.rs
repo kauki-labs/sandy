@@ -38,6 +38,8 @@ fn run_with_input(target: &LiveTarget, input_arg: &str, sh_command: &str) -> any
             "--input",
             input_arg,
             "--",
+            "sh",
+            "-c",
             sh_command,
         ])
         .output()
