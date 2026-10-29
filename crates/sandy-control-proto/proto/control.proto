@@ -104,6 +104,42 @@ message SubmitRequest {
   // a silent default, since defaulting an unstated class to TRUSTED would
   // breach isolation for a client that meant to ask for UNTRUSTED.
   IsolationClass required_isolation_class = 4;
+  // Path fields (#496, sandyd.md decision 20): read-only inputs, collected
+  // outputs, and file-sourced secrets, named on the SUBMITTER's own
+  // filesystem — never inside `manifest` (decision 20 keeps spec.md's P2
+  // intact: the manifest names data, never a submitter path, regardless of
+  // which host decodes it). Non-empty here requires placement onto a
+  // host-executor that declared `shares_submitter_filesystem` at Register;
+  // a Submit carrying one of these with no such host placeable is refused
+  // with the field named, never silently dropped or placed remotely.
+  repeated Input inputs = 5;
+  repeated Output outputs = 6;
+  repeated SecretRef secrets = 7;
+}
+
+// Mirrors `sandy_api::backend::Input`. A host path exposed read-only in the
+// guest at `/run/sandy/inputs/<name>`, optionally also symlinked to an
+// absolute guest path.
+message Input {
+  string host = 1;
+  string name = 2;
+  optional string guest_path = 3;
+}
+
+// Mirrors `sandy_api::backend::Output`. `name` unset is the catch-all: the
+// whole `/run/sandy/outputs` tree collected to `dest`.
+message Output {
+  optional string name = 1;
+  string dest = 2;
+}
+
+// Mirrors `sandy_api::backend::SecretRef` with a file-backed source only —
+// `SecretSource::Fd` has no wire representation; a submitted secret always
+// names a host file. The bytes never ride this message or any other wire
+// field; only the path does, same as `--secret NAME=@PATH` today.
+message SecretRef {
+  string name = 1;
+  string host_path = 2;
 }
 
 message SubmitResponse {

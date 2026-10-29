@@ -1668,3 +1668,86 @@ actually mesh-protected — the same "never trust a self-reported value"
 discipline decision 12 already applies to `host_id` applies here to the
 transport's assumed environment.
 as a prerequisite for #480's field parity.
+
+## 20. "Local dispatch" for path fields (#496): a declared locality flag at Register, not a new in-process runner
+
+**Status:** accepted.
+
+**Context.** `docs/design/manifest-parity/spec.md`'s owner decision P1
+("local first") and its parity matrix ("the daemon reads a submitter path")
+assumed a dispatch path where the daemon itself performs local I/O. Spec
+check on #496 found this path does not exist: `crates/sandyd` has no
+`ProcessBackend`/`RunSpec`/`backend.run` anywhere. Every job, with or
+without a registered host, dispatches through `HostRegistry::pick_host_for`
+and a host-executor's `Dispatch`; a Submit with no placeable host (decision
+15/#381, `handler.rs`) just leaves the job `Pending` forever (the
+pre-existing, documented "argv/v1 with no registered host" gap) — it is
+never run in-process by `sandyd`. Nothing in the registration data model
+(`sandy_executor_proto::Capabilities`, `HostRegistry`) distinguishes a
+host-executor that happens to share the submitter's filesystem from a
+genuinely remote one.
+
+Escalated to the owner (two framings offered: a declared locality flag at
+Register, vs. giving `sandyd` its own in-process runner). Decided: a
+declared flag. No new runner.
+
+**Decision.** "Local" means a host-executor that declares, at `Register`,
+that it shares the submitter's filesystem — not a loopback-IP inference
+(a container boundary can share neither namespace nor filesystem even over
+127.0.0.1) and not a new sandyd-side execution path.
+
+- `Capabilities` (`executor.proto`) gains `bool shares_submitter_filesystem
+= 5`. A host-executor sets it true only when an operator has deployed it
+  co-located with `sandyd` on the same filesystem as submitters connecting
+  to that `sandyd` instance — a deployment fact the host-executor cannot
+  detect on its own, so it comes from its own startup configuration
+  (`SANDY_HOST_SHARES_SUBMITTER_FS`, mirroring the existing capability-env
+  precedent in `capability.rs`), not auto-detected. Default `false`:
+  an undeclared host is never assumed local.
+- `SubmitRequest` (`control.proto`) and `Dispatch` (`executor.proto`) each
+  gain `repeated Input inputs`, `repeated Output outputs`, `repeated
+SecretRef secrets` (new proto messages mirroring `sandy-api`'s existing
+  `Input`/`Output`/`SecretRef` shapes) — carried as typed fields alongside
+  `manifest`/`manifest_encoding`, never inside the opaque manifest bytes.
+  This keeps P2 ("the manifest names data, never submitter paths on a
+  remote host") intact regardless of which host a manifest's OTHER fields
+  end up decoded on: a path field is a property of the Submit/Dispatch
+  envelope, not of the portable manifest payload.
+- `HostRegistry::pick_host_for` gains a `require_local: bool` parameter.
+  `handler.rs`'s Submit path sets it whenever `inputs`/`outputs`/`secrets`
+  is non-empty; a pick that finds no `shares_submitter_filesystem` host
+  under that constraint is refused the same way an unplaceable isolation
+  class or sandbox kind already is (decision 15's `placement_required_error`
+  family) — never silently dropped, never silently placed on a non-local
+  host.
+- `handle_dispatch` (`sandy-host-executor`) stages `dispatch.inputs`/
+  `dispatch.outputs`/`dispatch.secrets` via the existing `stage_inputs`/
+  `prepare_outputs`/`collect_outputs` (`crates/sandy/src/stage/{inputs,outputs}.rs`)
+  exactly as `sandy run`'s own direct path already does, and builds
+  `RunSpec.inputs`/`outputs`/`secrets` from the staged result. A
+  `shares_submitter_filesystem` host-executor is, by construction, reading
+  paths that are valid on its own filesystem — the same filesystem the
+  CLI that built the `SubmitRequest` is on.
+- `sandy daemon submit` gains `--input`/`--out`/`--secret`, parsed with the
+  same `plan::parse_input`/`parse_output`/`parse_secret` the direct `run`
+  path already uses (no second grammar).
+
+**Consequences.** A `Dispatch` carrying path fields is only ever sent to a
+host that declared `shares_submitter_filesystem`; an operator who deploys a
+host-executor on a different machine and sets that flag anyway gets exactly
+what they configured (a trust boundary this decision does not re-derive —
+same posture as every other self-reported `Capabilities` field, see this
+crate's own `host_registry.rs` module doc on `host_id`: self-reported for
+bookkeeping and placement, authorization stays at the transport layer; a
+false locality claim is an operator misconfiguration, not a vector this
+decision needs to independently defend against). Remote dispatch of path
+fields (`sandyd.md`'s own parity matrix "streamed over the control
+connection (later step)") stays #482's job, unblocked by this decision,
+not implemented by it.
+
+**Set aside.** Inferring locality from the mesh peer IP (loopback):
+rejected because the host-executor's own filesystem namespace is not
+implied by its network address (a co-located container can have its own
+mount namespace; a genuinely remote host can tunnel to appear local). A
+declared flag puts the fact in the hands of whoever actually knows it: the
+operator deploying the host-executor.

@@ -577,6 +577,7 @@ mod tests {
             arch: Arch::X8664.into(),
             attestation: false,
             supported_isolation_classes: vec![IsolationClass::Trusted.into()],
+            shares_submitter_filesystem: false,
         }
     }
 
@@ -712,6 +713,9 @@ mod tests {
                             link_token: vec![0u8; 32],
                             forward_back: "127.0.0.1:9000".to_owned(),
                             required_isolation_class: IsolationClass::Trusted.into(),
+                            inputs: Vec::new(),
+                            outputs: Vec::new(),
+                            secrets: Vec::new(),
                         })),
                     },
                 )
@@ -852,6 +856,9 @@ mod tests {
                         link_token: vec![0u8; 32],
                         forward_back: "127.0.0.1:9000".to_owned(),
                         required_isolation_class: IsolationClass::Trusted.into(),
+                        inputs: Vec::new(),
+                        outputs: Vec::new(),
+                        secrets: Vec::new(),
                     })),
                 },
             )
@@ -924,6 +931,9 @@ mod tests {
                         link_token: vec![0u8; 32],
                         forward_back: "127.0.0.1:9000".to_owned(),
                         required_isolation_class: IsolationClass::Trusted.into(),
+                        inputs: Vec::new(),
+                        outputs: Vec::new(),
+                        secrets: Vec::new(),
                     })),
                 },
             )
@@ -1035,6 +1045,9 @@ mod tests {
                     link_token: vec![0u8; 32],
                     forward_back: "127.0.0.1:9000".to_owned(),
                     required_isolation_class: IsolationClass::Trusted.into(),
+                    inputs: Vec::new(),
+                    outputs: Vec::new(),
+                    secrets: Vec::new(),
                 })),
             },
         )
@@ -1090,6 +1103,9 @@ mod tests {
                     link_token: vec![0u8; 32],
                     forward_back: "127.0.0.1:9000".to_owned(),
                     required_isolation_class: IsolationClass::Trusted.into(),
+                    inputs: Vec::new(),
+                    outputs: Vec::new(),
+                    secrets: Vec::new(),
                 })),
             },
         )
@@ -1154,6 +1170,9 @@ mod tests {
                     link_token: vec![0u8; 32],
                     forward_back: "127.0.0.1:9000".to_owned(),
                     required_isolation_class: IsolationClass::Trusted.into(),
+                    inputs: Vec::new(),
+                    outputs: Vec::new(),
+                    secrets: Vec::new(),
                 })),
             },
         )
@@ -1216,6 +1235,9 @@ mod tests {
                     link_token: vec![0u8; 32],
                     forward_back: "127.0.0.1:9000".to_owned(),
                     required_isolation_class: IsolationClass::Trusted.into(),
+                    inputs: Vec::new(),
+                    outputs: Vec::new(),
+                    secrets: Vec::new(),
                 })),
             },
         )
@@ -1308,6 +1330,9 @@ mod tests {
                     link_token: vec![0u8; 32],
                     forward_back: "127.0.0.1:9000".to_owned(),
                     required_isolation_class: IsolationClass::Trusted.into(),
+                    inputs: Vec::new(),
+                    outputs: Vec::new(),
+                    secrets: Vec::new(),
                 })),
             },
         )
@@ -1396,6 +1421,9 @@ mod tests {
                         link_token: vec![0u8; 32],
                         forward_back: "127.0.0.1:9000".to_owned(),
                         required_isolation_class: IsolationClass::Trusted.into(),
+                        inputs: Vec::new(),
+                        outputs: Vec::new(),
+                        secrets: Vec::new(),
                     })),
                 },
             )
@@ -1506,6 +1534,9 @@ mod tests {
                         link_token: vec![0u8; 32],
                         forward_back: "127.0.0.1:9000".to_owned(),
                         required_isolation_class: IsolationClass::Trusted.into(),
+                        inputs: Vec::new(),
+                        outputs: Vec::new(),
+                        secrets: Vec::new(),
                     })),
                 },
             )
@@ -1575,6 +1606,9 @@ mod tests {
                         link_token: vec![0u8; 32],
                         forward_back: "127.0.0.1:9000".to_owned(),
                         required_isolation_class: IsolationClass::Trusted.into(),
+                        inputs: Vec::new(),
+                        outputs: Vec::new(),
+                        secrets: Vec::new(),
                     })),
                 },
             )
@@ -1694,6 +1728,9 @@ mod tests {
                         link_token: vec![0u8; 32],
                         forward_back: "127.0.0.1:9000".to_owned(),
                         required_isolation_class: IsolationClass::Trusted.into(),
+                        inputs: Vec::new(),
+                        outputs: Vec::new(),
+                        secrets: Vec::new(),
                     })),
                 },
             )

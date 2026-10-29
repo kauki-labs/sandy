@@ -34,7 +34,10 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use sandy::admits_untrusted;
 use sandy_api::{
     agent::{AgentLaunch, OnLink},
-    backend::{BackendError, Grants, Outcome, RunControl, RunSpec, SandboxKind as ApiSandboxKind, VmBackend},
+    backend::{
+        BackendError, Grants, Input, Outcome, Output, RunControl, RunSpec, SandboxKind as ApiSandboxKind, SecretRef,
+        SecretSource, VmBackend,
+    },
     containment::{Containment, ContainmentStatus},
 };
 use sandy_executor_proto::{Dispatch, IsolationClass, REMOTE_LINK_TOKEN_LEN, SandboxKind as ProtoSandboxKind};
@@ -115,6 +118,46 @@ fn is_timeout(err: &anyhow::Error) -> bool {
 /// none gets the ceiling itself as the default (today's unchanged behavior).
 fn clamp_timeout_secs(requested: Option<u32>) -> u32 {
     requested.map_or(STAGE1_TIMEOUT_SECS, |t| t.min(STAGE1_TIMEOUT_SECS))
+}
+
+/// Convert `Dispatch.inputs` into the backend's own `Input` shape (#496,
+/// decision 20). A pure field copy: the orchestrator only ever forwards a
+/// non-empty list to a host that declared `shares_submitter_filesystem`, so
+/// `host` names a path that's valid right here.
+fn to_run_inputs(inputs: &[sandy_executor_proto::Input]) -> Vec<Input> {
+    inputs
+        .iter()
+        .map(|i| Input {
+            host: PathBuf::from(&i.host),
+            name: i.name.clone(),
+            guest_path: i.guest_path.as_deref().map(PathBuf::from),
+        })
+        .collect()
+}
+
+/// Convert `Dispatch.outputs` into the backend's own `Output` shape.
+fn to_run_outputs(outputs: &[sandy_executor_proto::Output]) -> Vec<Output> {
+    outputs
+        .iter()
+        .map(|o| Output {
+            name: o.name.clone(),
+            dest: PathBuf::from(&o.dest),
+        })
+        .collect()
+}
+
+/// Convert `Dispatch.secrets` into the backend's own `SecretRef` shape. Always
+/// a file source — the only shape a `SecretRef` ever crosses this wire as
+/// (`SecretSource::Fd` has no wire representation, same as the CLI's own
+/// `--secret NAME=@PATH` grammar).
+fn to_run_secrets(secrets: &[sandy_executor_proto::SecretRef]) -> Vec<SecretRef> {
+    secrets
+        .iter()
+        .map(|s| SecretRef {
+            name: s.name.clone(),
+            source: SecretSource::File(PathBuf::from(&s.host_path)),
+        })
+        .collect()
 }
 
 /// Set `control`'s deadline to a fresh `timeout_secs`-second budget from now.
@@ -449,13 +492,18 @@ pub fn handle_dispatch(
         );
     });
 
-    // Stage 1 (#269, D4): no inputs/outputs/secrets (M2 is cross-machine
-    // communication through the agent channel, not sandbox IO — the IO
-    // roadmap is separate, post-#34); no cpu/mem bound; the agent channel is
-    // the whole point of M2, so it's the only grant. Shared by both
-    // branches below.
+    // Path fields (#496, sandyd.md decision 20): the orchestrator only ever
+    // forwards these non-empty when it placed this job on a host that
+    // declared `shares_submitter_filesystem` — this host IS that host, so
+    // the names are valid on its own filesystem. `agent` stays the one
+    // always-on grant from Stage 1 (#269, D4: cross-machine communication
+    // through the agent channel, not sandbox IO); `secrets` turns on
+    // precisely when a secret was actually forwarded, never unconditionally.
+    let path_inputs = to_run_inputs(&dispatch.inputs);
+    let path_outputs = to_run_outputs(&dispatch.outputs);
+    let path_secrets = to_run_secrets(&dispatch.secrets);
     let grants = Grants {
-        secrets: false,
+        secrets: !path_secrets.is_empty(),
         agent: true,
         shares: false,
     };
@@ -474,9 +522,9 @@ pub fn handle_dispatch(
                 egress: None,
                 template: &dispatch.job_id,
                 command: &decoded.command,
-                inputs: &[],
-                outputs: &[],
-                secrets: &[],
+                inputs: &path_inputs,
+                outputs: &path_outputs,
+                secrets: &path_secrets,
                 env: &decoded.env,
                 cpu: decoded.cpu,
                 mem: decoded.mem,
@@ -554,9 +602,9 @@ pub fn handle_dispatch(
                 egress: None,
                 template: &template,
                 command: &decoded.command,
-                inputs: &[],
-                outputs: &[],
-                secrets: &[],
+                inputs: &path_inputs,
+                outputs: &path_outputs,
+                secrets: &path_secrets,
                 env: &env,
                 cpu: decoded.cpu,
                 mem: decoded.mem,
@@ -695,6 +743,56 @@ mod tests {
             ),
             Ok(())
         );
+    }
+
+    #[test]
+    fn to_run_inputs_copies_every_field_including_guest_path() {
+        let converted = to_run_inputs(&[
+            sandy_executor_proto::Input {
+                host: "/submitter/data".to_owned(),
+                name: "in0".to_owned(),
+                guest_path: Some("/workspace".to_owned()),
+            },
+            sandy_executor_proto::Input {
+                host: "/submitter/plain".to_owned(),
+                name: "plain".to_owned(),
+                guest_path: None,
+            },
+        ]);
+        assert_eq!(converted[0].host, PathBuf::from("/submitter/data"));
+        assert_eq!(converted[0].name, "in0");
+        assert_eq!(converted[0].guest_path, Some(PathBuf::from("/workspace")));
+        assert_eq!(converted[1].guest_path, None);
+    }
+
+    #[test]
+    fn to_run_outputs_copies_name_and_dest() {
+        let converted = to_run_outputs(&[
+            sandy_executor_proto::Output {
+                name: Some("out0".to_owned()),
+                dest: "/submitter/dest".to_owned(),
+            },
+            sandy_executor_proto::Output {
+                name: None,
+                dest: "/submitter/catchall".to_owned(),
+            },
+        ]);
+        assert_eq!(converted[0].name, Some("out0".to_owned()));
+        assert_eq!(converted[0].dest, PathBuf::from("/submitter/dest"));
+        assert_eq!(converted[1].name, None);
+    }
+
+    #[test]
+    fn to_run_secrets_always_produces_a_file_source() {
+        let converted = to_run_secrets(&[sandy_executor_proto::SecretRef {
+            name: "token".to_owned(),
+            host_path: "/submitter/secret.txt".to_owned(),
+        }]);
+        assert_eq!(converted[0].name, "token");
+        match &converted[0].source {
+            sandy_api::backend::SecretSource::File(path) => assert_eq!(path, &PathBuf::from("/submitter/secret.txt")),
+            other => panic!("expected a File source, got {other:?}"),
+        }
     }
 
     /// The hard case: stage-1's bwrap backend (reaping only, no bus/mount
@@ -840,6 +938,9 @@ mod tests {
             link_token: vec![0u8; 32],
             forward_back: "127.0.0.1:9000".to_string(),
             required_isolation_class: IsolationClass::Untrusted.into(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            secrets: Vec::new(),
         };
         // A plain reaper (no bus/mount isolation): the exact host state this
         // gate exists to refuse an untrusted job on.
@@ -884,6 +985,9 @@ mod tests {
             link_token: vec![0u8; REMOTE_LINK_TOKEN_LEN],
             forward_back: "127.0.0.1:9000".to_string(),
             required_isolation_class: IsolationClass::Trusted.into(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            secrets: Vec::new(),
         };
         let containment = Box::new(sandy_test_support::FakeContainment::available());
         let rt = tokio::runtime::Handle::current();
@@ -918,6 +1022,9 @@ mod tests {
             link_token: vec![0u8; REMOTE_LINK_TOKEN_LEN],
             forward_back: "127.0.0.1:9000".to_string(),
             required_isolation_class: IsolationClass::Trusted.into(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            secrets: Vec::new(),
         };
         let containment = Box::new(sandy_test_support::FakeContainment::available());
         let rt = tokio::runtime::Handle::current();
@@ -957,6 +1064,9 @@ mod tests {
             link_token: vec![0u8; REMOTE_LINK_TOKEN_LEN],
             forward_back: "127.0.0.1:9000".to_string(),
             required_isolation_class: IsolationClass::Trusted.into(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            secrets: Vec::new(),
         };
         let containment = Box::new(sandy_test_support::FakeContainment::available());
         let rt = tokio::runtime::Handle::current();
@@ -997,6 +1107,9 @@ mod tests {
             link_token: vec![0u8; REMOTE_LINK_TOKEN_LEN],
             forward_back: "127.0.0.1:9000".to_string(),
             required_isolation_class: IsolationClass::Untrusted.into(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            secrets: Vec::new(),
         };
         let containment = Box::new(sandy_test_support::FakeContainment::available());
         let rt = tokio::runtime::Handle::current();
@@ -1034,6 +1147,9 @@ mod tests {
             link_token: vec![0u8; REMOTE_LINK_TOKEN_LEN],
             forward_back: "127.0.0.1:9000".to_string(),
             required_isolation_class: IsolationClass::Untrusted.into(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            secrets: Vec::new(),
         };
         let containment = Box::new(sandy_test_support::FakeContainment::available());
         let rt = tokio::runtime::Handle::current();
@@ -1083,6 +1199,9 @@ mod tests {
             link_token: marker.clone(),
             forward_back: "127.0.0.1:9000".to_string(),
             required_isolation_class: IsolationClass::Trusted.into(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            secrets: Vec::new(),
         };
         let containment = Box::new(sandy_test_support::FakeContainment::available());
         let rt = tokio::runtime::Handle::current();

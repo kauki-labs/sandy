@@ -215,7 +215,10 @@ pub fn parse_run(args: RunArgs) -> Result<JobPlan, PlanError> {
 ///   staged under an internal name `in<index>` the job never needs to know.
 ///
 /// `index` disambiguates the auto-assigned staging name across inputs.
-fn parse_input(raw: &str, index: usize) -> Result<Input, PlanError> {
+/// `pub` for the same reason [`parse_env`] is: `sandy daemon submit`
+/// (manifest-parity #496) reuses this validation from the `sandy` bin crate,
+/// which only sees this library crate's `pub` surface, not `pub(crate)`.
+pub fn parse_input(raw: &str, index: usize) -> Result<Input, PlanError> {
     let invalid = || PlanError::Invalid(format!("--input `{raw}` must be HOST:NAME or HOST:/guest/path"));
     let (host, spec) = raw.rsplit_once(':').ok_or_else(invalid)?;
     if host.is_empty() || spec.is_empty() {
@@ -265,7 +268,9 @@ fn validate_guest_path(path: &str) -> Option<()> {
 
 /// Reject two inputs resolving to the same staging name (a user `NAME` colliding
 /// with an auto-assigned `in<index>`), which would overwrite one in the share.
-fn reject_duplicate_input_names(inputs: &[Input]) -> Result<(), PlanError> {
+/// `pub` for the same reason [`parse_env`] is: `sandy daemon submit`
+/// (manifest-parity #496) reuses this validation from the `sandy` bin crate.
+pub fn reject_duplicate_input_names(inputs: &[Input]) -> Result<(), PlanError> {
     let mut seen = std::collections::HashSet::new();
     for input in inputs {
         if !seen.insert(input.name.as_str()) {
@@ -284,7 +289,10 @@ fn reject_duplicate_input_names(inputs: &[Input]) -> Result<(), PlanError> {
 /// - `--out DEST` (catch-all) — anything else: the whole `/run/sandy/outputs` tree is collected to the host path
 ///   `DEST`. A `DEST` that itself contains a `:` must be path-like (contain `/`, e.g. `./out:dir`) so it is not read as
 ///   a name.
-fn parse_output(raw: &str) -> Result<Output, PlanError> {
+///
+/// `pub` for the same reason [`parse_env`] is: `sandy daemon submit`
+/// (manifest-parity #496) reuses this validation from the `sandy` bin crate.
+pub fn parse_output(raw: &str) -> Result<Output, PlanError> {
     let invalid = || PlanError::Invalid(format!("--out `{raw}` must be DEST or NAME:DEST"));
     if raw.is_empty() {
         return Err(invalid());
@@ -311,7 +319,9 @@ fn is_single_component(s: &str) -> bool {
 }
 
 /// Parse one `--secret NAME=@PATH` token into a file-sourced [`SecretRef`].
-fn parse_secret(raw: &str) -> Result<SecretRef, PlanError> {
+/// `pub` for the same reason [`parse_env`] is: `sandy daemon submit`
+/// (manifest-parity #496) reuses this validation from the `sandy` bin crate.
+pub fn parse_secret(raw: &str) -> Result<SecretRef, PlanError> {
     let invalid = || PlanError::Invalid(format!("--secret `{raw}` must be NAME=@PATH"));
     let (name, value) = raw.split_once('=').ok_or_else(invalid)?;
     let path = value.strip_prefix('@').ok_or_else(invalid)?;

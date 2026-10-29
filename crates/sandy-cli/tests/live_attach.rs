@@ -143,6 +143,7 @@ fn trusted_process_capabilities() -> Capabilities {
         arch: Arch::X8664.into(),
         attestation: false,
         supported_isolation_classes: vec![IsolationClass::Trusted.into()],
+        shares_submitter_filesystem: false,
     }
 }
 
@@ -165,6 +166,9 @@ async fn submit(
             manifest_encoding: "argv/v1".to_owned(),
             submitter_caps: Vec::new(),
             required_isolation_class: sandy_control_proto::IsolationClass::Trusted.into(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            secrets: Vec::new(),
         }),
     )
     .await

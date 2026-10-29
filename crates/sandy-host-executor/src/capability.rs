@@ -138,6 +138,7 @@ fn to_wire_capabilities(
     capabilities: Capabilities,
     status: &ContainmentStatus,
     vm_available: bool,
+    shares_submitter_filesystem: bool,
 ) -> sandy_executor_proto::Capabilities {
     let process_kind = match capabilities.kind {
         SandboxKind::Process => sandy_executor_proto::SandboxKind::Process,
@@ -159,7 +160,31 @@ fn to_wire_capabilities(
             .into_iter()
             .map(Into::into)
             .collect(),
+        shares_submitter_filesystem,
     }
+}
+
+/// Whether this host-executor was deployed sharing the submitter's own
+/// filesystem (sandyd.md decision 20) — an operator-set deployment fact,
+/// never auto-detected: this process cannot know what filesystem a future
+/// submitter's CLI will run on. `SANDY_HOST_SHARES_SUBMITTER_FS=1` (or any of
+/// `true`/`yes`, case-insensitive) declares it; unset or anything else is
+/// `false`, the fail-closed default — an undeclared host never carries path
+/// fields.
+fn shares_submitter_filesystem_from_env() -> bool {
+    shares_submitter_filesystem_from(std::env::var("SANDY_HOST_SHARES_SUBMITTER_FS").ok().as_deref())
+}
+
+/// Pure decision logic behind [`shares_submitter_filesystem_from_env`],
+/// separated so tests can exercise every input without mutating this
+/// process's real environment (edition 2024 makes `std::env::set_var` unsafe;
+/// this crate's lints forbid `unsafe_code`, so a test never does that here —
+/// see `sandy::nix::topology`'s own doc on the same constraint).
+fn shares_submitter_filesystem_from(value: Option<&str>) -> bool {
+    value.is_some_and(|v| {
+        let v = v.trim().to_ascii_lowercase();
+        v == "1" || v == "true" || v == "yes"
+    })
 }
 
 /// Detect this host's real capabilities in the wire shape `Register` carries
@@ -174,7 +199,12 @@ pub fn detect_register_capabilities() -> Result<sandy_executor_proto::Capabiliti
     let arch = detect_arch()?;
     let status = SystemdRunContainment::detect().status();
     let capabilities = capabilities_from(arch, &status)?;
-    Ok(to_wire_capabilities(capabilities, &status, detect_vm_capability()))
+    Ok(to_wire_capabilities(
+        capabilities,
+        &status,
+        detect_vm_capability(),
+        shares_submitter_filesystem_from_env(),
+    ))
 }
 
 /// The facts [`vm_capability_from`] derives a VM-capability verdict from —
@@ -416,7 +446,7 @@ mod tests {
             arch: Arch::X86_64,
             attestation: None,
         };
-        let wire = to_wire_capabilities(capabilities, &status, false);
+        let wire = to_wire_capabilities(capabilities, &status, false, false);
         assert_eq!(
             wire.supported_isolation_classes,
             vec![i32::from(IsolationClass::Trusted)]
@@ -427,6 +457,7 @@ mod tests {
         );
         assert_eq!(wire.arch, i32::from(sandy_executor_proto::Arch::X8664));
         assert!(!wire.attestation);
+        assert!(!wire.shares_submitter_filesystem);
     }
 
     /// Positive (#332, #381): `vm_available = true` ADDS `Vm` to the declared
@@ -443,7 +474,7 @@ mod tests {
             arch: Arch::X86_64,
             attestation: None,
         };
-        let wire = to_wire_capabilities(capabilities, &status, true);
+        let wire = to_wire_capabilities(capabilities, &status, true, false);
         assert_eq!(
             wire.supported_sandbox_kinds,
             vec![
@@ -455,6 +486,37 @@ mod tests {
             wire.supported_isolation_classes,
             vec![i32::from(IsolationClass::Trusted), i32::from(IsolationClass::Untrusted)]
         );
+    }
+
+    #[test]
+    fn shares_submitter_filesystem_from_reads_truthy_values() {
+        for value in ["1", "true", "TRUE", "yes"] {
+            assert!(
+                shares_submitter_filesystem_from(Some(value)),
+                "{value:?} should be read as true"
+            );
+        }
+        for value in ["0", "false", "no", ""] {
+            assert!(
+                !shares_submitter_filesystem_from(Some(value)),
+                "{value:?} should be read as false"
+            );
+        }
+        assert!(!shares_submitter_filesystem_from(None), "unset should be false");
+    }
+
+    #[test]
+    fn to_wire_capabilities_declares_shares_submitter_filesystem_when_asked() {
+        let status = ContainmentStatus::Available {
+            isolates_untrusted: false,
+        };
+        let capabilities = Capabilities {
+            kind: SandboxKind::Process,
+            arch: Arch::X86_64,
+            attestation: None,
+        };
+        let wire = to_wire_capabilities(capabilities, &status, false, true);
+        assert!(wire.shares_submitter_filesystem);
     }
 
     /// Adversarial (#332): every one of qemu/nix/kvm/vhost-vsock/

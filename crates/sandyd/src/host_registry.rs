@@ -348,6 +348,11 @@ impl HostRegistry {
     /// then refuse anyway. The caller runs the job locally when this returns
     /// `None`.
     ///
+    /// `require_local` (#496, sandyd.md decision 20) additionally filters on
+    /// the host's declared `shares_submitter_filesystem` — set it when the
+    /// Submit carries any path field (`inputs`/`outputs`/`secrets`), since a
+    /// non-local host cannot read the submitter's files.
+    ///
     /// Returns the host's capabilities alongside its id and peer IP so a
     /// caller can build a `Dispatch` (e.g. its `backend`) without a second
     /// lookup that could race a concurrent disconnect between the two calls.
@@ -356,6 +361,7 @@ impl HostRegistry {
         &self,
         required_isolation_class: i32,
         required_sandbox_kind: i32,
+        require_local: bool,
     ) -> Option<PlacementCandidate> {
         if required_isolation_class == i32::from(IsolationClass::Unspecified) {
             tracing::debug!(
@@ -397,6 +403,7 @@ impl HostRegistry {
                         .capabilities
                         .supported_sandbox_kinds
                         .contains(&required_sandbox_kind)
+                    && (!require_local || host.capabilities.shares_submitter_filesystem)
             })
             .map(|(host_id, host)| PlacementCandidate {
                 host_id: host_id.clone(),
@@ -568,6 +575,7 @@ mod tests {
             arch: sandy_executor_proto::Arch::X8664.into(),
             attestation: false,
             supported_isolation_classes: vec![sandy_executor_proto::IsolationClass::Trusted.into()],
+            shares_submitter_filesystem: false,
         }
     }
 
@@ -577,6 +585,14 @@ mod tests {
             arch: sandy_executor_proto::Arch::X8664.into(),
             attestation: false,
             supported_isolation_classes: vec![sandy_executor_proto::IsolationClass::Trusted.into()],
+            shares_submitter_filesystem: false,
+        }
+    }
+
+    fn local_capabilities() -> Capabilities {
+        Capabilities {
+            shares_submitter_filesystem: true,
+            ..capabilities()
         }
     }
 
@@ -589,6 +605,9 @@ mod tests {
             link_token: vec![0u8; 32],
             forward_back: "100.64.0.1:9000".to_owned(),
             required_isolation_class: sandy_executor_proto::IsolationClass::Trusted.into(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            secrets: Vec::new(),
         }
     }
 
@@ -806,11 +825,40 @@ mod tests {
             .expect("the allowed peer must register");
 
         let picked = registry
-            .pick_host_for(IsolationClass::Trusted.into(), SandboxKind::Process.into())
+            .pick_host_for(IsolationClass::Trusted.into(), SandboxKind::Process.into(), false)
             .expect("a Trusted-capable, Process-capable host is registered");
         assert_eq!(picked.host_id, "ws01");
         assert_eq!(picked.peer_ip, executor_ip());
-        assert_eq!(picked.capabilities, capabilities());
+    }
+
+    #[test]
+    fn pick_host_for_skips_a_non_local_host_when_local_is_required() {
+        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let registry = HostRegistry::default();
+        registry
+            .register(&allowlist, executor_ip(), "ws01".to_owned(), capabilities()) // shares_submitter_filesystem: false
+            .expect("the allowed peer must register");
+
+        assert_eq!(
+            registry.pick_host_for(IsolationClass::Trusted.into(), SandboxKind::Process.into(), true),
+            None,
+            "a host that didn't declare shares_submitter_filesystem must never be picked when require_local is set"
+        );
+    }
+
+    #[test]
+    fn pick_host_for_returns_a_local_host_when_required() {
+        let allowlist = ExecutorAllowlist::new([executor_ip()]);
+        let registry = HostRegistry::default();
+        registry
+            .register(&allowlist, executor_ip(), "ws01".to_owned(), local_capabilities())
+            .expect("the allowed peer must register");
+
+        let picked = registry
+            .pick_host_for(IsolationClass::Trusted.into(), SandboxKind::Process.into(), true)
+            .expect("a host declaring shares_submitter_filesystem qualifies under require_local");
+        assert_eq!(picked.host_id, "ws01");
+        assert_eq!(picked.capabilities, local_capabilities());
     }
 
     /// Adversarial (#298): no registered host at all means no placement —
@@ -820,7 +868,7 @@ mod tests {
     fn pick_host_for_returns_none_with_no_registered_hosts() {
         let registry = HostRegistry::default();
         assert_eq!(
-            registry.pick_host_for(IsolationClass::Trusted.into(), SandboxKind::Process.into()),
+            registry.pick_host_for(IsolationClass::Trusted.into(), SandboxKind::Process.into(), false),
             None
         );
     }
@@ -838,7 +886,7 @@ mod tests {
             .expect("the allowed peer must register");
 
         assert_eq!(
-            registry.pick_host_for(IsolationClass::Untrusted.into(), SandboxKind::Process.into()),
+            registry.pick_host_for(IsolationClass::Untrusted.into(), SandboxKind::Process.into(), false),
             None
         );
     }
@@ -857,7 +905,7 @@ mod tests {
             .expect("the allowed peer must register");
 
         assert_eq!(
-            registry.pick_host_for(IsolationClass::Unspecified.into(), SandboxKind::Process.into()),
+            registry.pick_host_for(IsolationClass::Unspecified.into(), SandboxKind::Process.into(), false),
             None
         );
     }
@@ -876,7 +924,7 @@ mod tests {
         registry.remove("ws01", registration);
 
         assert_eq!(
-            registry.pick_host_for(IsolationClass::Trusted.into(), SandboxKind::Process.into()),
+            registry.pick_host_for(IsolationClass::Trusted.into(), SandboxKind::Process.into(), false),
             None
         );
     }
@@ -894,7 +942,7 @@ mod tests {
             .expect("the allowed peer must register");
 
         let picked = registry
-            .pick_host_for(IsolationClass::Trusted.into(), SandboxKind::Vm.into())
+            .pick_host_for(IsolationClass::Trusted.into(), SandboxKind::Vm.into(), false)
             .expect("a Vm-capable host is registered");
         assert_eq!(picked.host_id, "ws01");
     }
@@ -912,7 +960,7 @@ mod tests {
             .expect("the allowed peer must register");
 
         assert_eq!(
-            registry.pick_host_for(IsolationClass::Trusted.into(), SandboxKind::Vm.into()),
+            registry.pick_host_for(IsolationClass::Trusted.into(), SandboxKind::Vm.into(), false),
             None,
             "a Process-only host must never be picked for a Vm requirement"
         );
@@ -930,7 +978,7 @@ mod tests {
             .expect("the allowed peer must register");
 
         assert_eq!(
-            registry.pick_host_for(IsolationClass::Trusted.into(), SandboxKind::Unspecified.into()),
+            registry.pick_host_for(IsolationClass::Trusted.into(), SandboxKind::Unspecified.into(), false),
             None
         );
     }
