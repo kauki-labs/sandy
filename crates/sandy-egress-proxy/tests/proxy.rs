@@ -196,9 +196,38 @@ async fn connection_257_is_closed_at_accept() -> Result<()> {
     for _ in 0..256 {
         held.push(connect(&proxy.sock).await?);
     }
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let mut extra = connect(&proxy.sock).await?;
-    assert_eq!(read_to_end(&mut extra).await?, "");
+    // Poll for refusal instead of a single fixed sleep (#538): a UDS
+    // `connect()` succeeds the moment the OS queues it in the listen
+    // backlog, before the proxy's own single-threaded accept loop has
+    // necessarily dequeued and semaphore-acquired it (`spawn_conn`,
+    // src/main.rs) — so all 256 `connect()`s above resolving does not
+    // itself prove the proxy has caught up. Under `cargo llvm-cov`'s
+    // heavier per-instruction overhead and a full-workspace parallel test
+    // run, that catch-up reliably took longer than a single fixed 500ms
+    // delay. A probe that gets admitted instead of refused (no EOF within
+    // the short per-attempt window) is dropped and retried after a short
+    // backoff, rather than guessing a bigger constant.
+    let probe_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let mut probe = connect(&proxy.sock).await?;
+        let mut buf = [0u8; 1];
+        match timeout(Duration::from_millis(200), probe.read(&mut buf)).await {
+            // EOF with no bytes, observed quickly: genuinely refused at accept.
+            Ok(Ok(0)) => break,
+            // Either real bytes arrived (unexpected) or the read never
+            // resolved in time: the proxy hasn't refused this one, so it
+            // hasn't caught up to all 256 holds yet. Drop the probe (it
+            // never counts toward the 256) and try again.
+            _ => {
+                drop(probe);
+                anyhow::ensure!(
+                    tokio::time::Instant::now() < probe_deadline,
+                    "the proxy never refused a 257th connection within the poll deadline"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
     // A held slot still works: it is answered, not dropped.
     held[0].write_all(b"GET / HTTP/1.1\r\n\r\n").await?;
     assert!(read_to_end(&mut held[0]).await?.starts_with("HTTP/1.1 405"));
