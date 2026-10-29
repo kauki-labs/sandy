@@ -35,6 +35,28 @@ in
 testPkgs.testers.runNixOSTest {
   name = "sandy-executor-containment";
 
+  # #523: a second, minimal node keeping `vm.enable` at its default (false) —
+  # the far more common deployment shape (every non-VM-capable stage-1 host).
+  # Before this PR, the single `machine` node tested exactly this
+  # configuration; flipping it to `vm.enable = true` would otherwise silently
+  # stop verifying the default unit's own (tighter) hardening score, since
+  # `vm.enable` only ever adds device/bind-mount exposure, never removes it.
+  # Deliberately lightweight: just enough config to evaluate
+  # `systemd-analyze security`, not a second full containment/probe run —
+  # the `machine` node below already covers that end to end.
+  nodes.machineDefault =
+    { ... }:
+    {
+      imports = [ (import ../modules/sandy-executor.nix) ];
+      services.sandy-executor = {
+        enable = true;
+        orchestrator = "127.0.0.1:1";
+        hostId = "test-host-default";
+        orchestratorFingerprint = builtins.concatStringsSep "" (builtins.genList (_: "aa") 32);
+        # vm.enable left at its default (false) — the point of this node.
+      };
+    };
+
   nodes.machine =
     {
       config,
@@ -56,7 +78,19 @@ testPkgs.testers.runNixOSTest {
         # TLS handshake is attempted) — a syntactically valid 64-char hex
         # placeholder satisfies the option's required type, nothing more.
         orchestratorFingerprint = builtins.concatStringsSep "" (builtins.genList (_: "aa") 32);
+        # #523: the unit's `/dev/kvm` plumbing (BindPaths + DeviceAllow + kvm group under
+        # PrivateDevices) only exists with `vm.enable`; the probe below needs it. The wrapper tree is
+        # never read here, so an empty dir stands in for the packaged one.
+        vm.enable = true;
+        guestWrapperPackage = pkgs.emptyDirectory;
       };
+
+      # The nixosTest guest needs nested virtualisation (the ws01 host has it) and the kvm module for
+      # `/dev/kvm` to exist inside it.
+      boot.kernelModules = [
+        "kvm-amd"
+        "kvm-intel"
+      ];
 
       # #300(b): a short StopIdleSessionSec, set here (NOT in the module —
       # that's remote-host-specific risk, not something this module should impose
@@ -162,6 +196,28 @@ testPkgs.testers.runNixOSTest {
                   rm -f /tmp/qemu-sandbox.log
                   [ "$rc" -eq 124 ]
                 '
+
+                # #523: the unit sets PrivateDevices (closed device policy, private /dev). With `vm.enable`
+                # it re-adds /dev/kvm via BindPaths + DeviceAllow + the kvm group. `-accel kvm` has no TCG
+                # fallback, so qemu stays up (timeout exits 124) only if the guest can really open /dev/kvm.
+                # Measured by mutation: dropping the `/dev/kvm rw` DeviceAllow entry leaves this failing (ENODEV
+                # opening /dev/kvm, confirmed by re-running with that entry removed).
+                #
+                # Deliberately NOT wrapped in `systemd-run --user --scope` like the checks above: those
+                # reparent into user@<uid>.service's cgroup, which is correct for THEM (a real dispatched
+                # `Process`-backend job genuinely runs there, via `SystemdRunContainment`). The real `Vm`
+                # backend does not — `QemuBackend::launch` (impls/vm/src/qemu.rs) spawns qemu as a plain
+                # `Command::spawn()` child of `sandy-executor.service` itself, with no containment wrapper at
+                # all (`handle_dispatch`'s Vm arm, crates/sandy-host-executor/src/dispatch.rs, passes no
+                # `Containment`). So qemu's real `/dev/kvm` access is gated by THIS unit's own DeviceAllow,
+                # not user@.service's — running the check here, inside the probe's own ExecStart (which
+                # already copies sandy-executor.service's full serviceConfig), is what actually exercises it.
+                rc=0
+                timeout 2 qemu-system-x86_64 -machine accel=kvm -nodefaults -display none -S \
+                  >/tmp/qemu-kvm.log 2>&1 || rc=$?
+                if [ "$rc" -eq 124 ]; then echo qemu-kvm-ok; else echo "qemu-kvm-failed rc=$rc: $(cat /tmp/qemu-kvm.log)"; fi
+                rm -f /tmp/qemu-kvm.log
+                [ "$rc" -eq 124 ]
               '';
             }) "sandy-executor-probe-run";
           };
@@ -169,6 +225,12 @@ testPkgs.testers.runNixOSTest {
     };
 
   testScript = ''
+    machineDefault.wait_for_unit("multi-user.target")
+    # #523: the default (vm.enable = false) unit's own hardening score,
+    # unaffected by the new /dev/kvm DeviceAllow/BindPaths entries — kept at
+    # the original, tighter threshold this file used before this PR.
+    print(machineDefault.succeed("systemd-analyze security sandy-executor.service --no-pager --threshold=27"))
+
     machine.wait_for_unit("multi-user.target")
 
     # Not `journalctl -u sandy-executor`: `PAMName = "login"` makes
@@ -221,7 +283,11 @@ testPkgs.testers.runNixOSTest {
     # failing on an actual regression (a hardening option dropped, a new
     # capability granted, etc). Tighten this if the module gets hardened
     # further.
-    print(machine.succeed("systemd-analyze security sandy-executor.service --no-pager --threshold=27"))
+    #
+    # #523: this node now runs with `vm.enable` (the `/dev/kvm` DeviceAllow
+    # entries cost 0.1: 2.8 displayed), so the gate is 28, one step above the
+    # old 27.
+    print(machine.succeed("systemd-analyze security sandy-executor.service --no-pager --threshold=28"))
 
     # #300: the unit actually carries the configured `TimeoutStopSec`, so a
     # `systemctl stop` gives an in-flight job's own shutdown fail-safe
@@ -308,6 +374,10 @@ testPkgs.testers.runNixOSTest {
     assert "qemu-sandbox-ok" in probe_output, (
         f"qemu -sandbox did not start inside the hardened unit — its seccomp filter may clash with the unit's "
         f"SystemCallFilter or NoNewPrivileges — journal:\n{probe_output}"
+    )
+    assert "qemu-kvm-ok" in probe_output, (
+        f"qemu could not open /dev/kvm in a job scope started from the unit's user — the nested guest may lack "
+        f"KVM (this probe does not exercise the unit's own PrivateDevices/DeviceAllow) — journal:\n{probe_output}"
     )
 
     # #300(b) smoke check: with StopIdleSessionSec=2 set on this node, wait
