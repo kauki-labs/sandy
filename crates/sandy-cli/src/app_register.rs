@@ -570,9 +570,11 @@ pub fn run_register(
         ..
     } = root
     else {
-        return Err(InstallError::Capture(
-            "the registered trust root is not a GitHub one".to_string(),
-        ));
+        return Err(InstallError::Capture(format!(
+            "registration finished and {} is written, but it is not a GitHub trust root; run `sandy cred github \
+             verify {handle}`",
+            cfg.display()
+        )));
     };
     Ok(CredRegistered {
         app_name: github_app_name.to_string(),
