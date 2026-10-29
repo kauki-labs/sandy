@@ -121,7 +121,7 @@ fn clamp_timeout_secs(requested: Option<u32>) -> u32 {
 }
 
 /// Convert `Dispatch.inputs` into the backend's own `Input` shape (#496,
-/// decision 20). A pure field copy: the orchestrator only ever forwards a
+/// decision 21). A pure field copy: the orchestrator only ever forwards a
 /// non-empty list to a host that declared `shares_submitter_filesystem`, so
 /// `host` names a path that's valid right here.
 fn to_run_inputs(inputs: &[sandy_executor_proto::Input]) -> Vec<Input> {
@@ -492,7 +492,7 @@ pub fn handle_dispatch(
         );
     });
 
-    // Path fields (#496, sandyd.md decision 20): the orchestrator only ever
+    // Path fields (#496, sandyd.md decision 21): the orchestrator only ever
     // forwards these non-empty when it placed this job on a host that
     // declared `shares_submitter_filesystem` — this host IS that host, so
     // the names are valid on its own filesystem. `agent` stays the one

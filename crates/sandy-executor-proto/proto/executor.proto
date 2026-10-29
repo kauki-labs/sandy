@@ -112,7 +112,7 @@ message Capabilities {
   // job (#269: "stage 1 accepts trusted jobs only").
   repeated IsolationClass supported_isolation_classes = 4;
   // Whether this host-executor shares the submitter's own filesystem (#496,
-  // sandyd.md decision 20) — set by the host-executor's own startup
+  // sandyd.md decision 21) — set by the host-executor's own startup
   // configuration (`SANDY_HOST_SHARES_SUBMITTER_FS`), never auto-detected
   // from the mesh peer address: a loopback IP does not imply a shared
   // filesystem (a co-located container can have its own mount namespace),
@@ -171,7 +171,7 @@ message Dispatch {
   // anything (defense in depth — never trust the orchestrator's placement
   // decision alone for a fail-closed security gate).
   IsolationClass required_isolation_class = 7;
-  // Path fields (#496, decision 20), forwarded verbatim from
+  // Path fields (#496, decision 21), forwarded verbatim from
   // `SubmitRequest`. The orchestrator must not send any of these non-empty
   // unless `backend`'s host declared `shares_submitter_filesystem`; the
   // executor stages them via the same code `sandy run`'s direct path uses

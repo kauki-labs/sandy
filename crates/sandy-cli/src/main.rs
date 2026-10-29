@@ -276,7 +276,7 @@ enum DaemonOp {
         /// `--input HOST:NAME` (repeatable; manifest-parity #496). Same
         /// grammar as `sandy run`'s own `--input`. Valid with either
         /// `manifest` or `--flake`: the path is carried in `SubmitRequest`,
-        /// never inside the manifest (decision 20) — `sandyd` refuses the
+        /// never inside the manifest (decision 21) — `sandyd` refuses the
         /// whole Submit unless a registered host declared
         /// `shares_submitter_filesystem`.
         #[arg(long = "input")]

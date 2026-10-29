@@ -104,9 +104,9 @@ message SubmitRequest {
   // a silent default, since defaulting an unstated class to TRUSTED would
   // breach isolation for a client that meant to ask for UNTRUSTED.
   IsolationClass required_isolation_class = 4;
-  // Path fields (#496, sandyd.md decision 20): read-only inputs, collected
+  // Path fields (#496, sandyd.md decision 21): read-only inputs, collected
   // outputs, and file-sourced secrets, named on the SUBMITTER's own
-  // filesystem — never inside `manifest` (decision 20 keeps spec.md's P2
+  // filesystem — never inside `manifest` (decision 21 keeps spec.md's P2
   // intact: the manifest names data, never a submitter path, regardless of
   // which host decodes it). Non-empty here requires placement onto a
   // host-executor that declared `shares_submitter_filesystem` at Register;

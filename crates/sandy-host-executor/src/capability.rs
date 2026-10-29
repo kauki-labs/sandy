@@ -165,7 +165,7 @@ fn to_wire_capabilities(
 }
 
 /// Whether this host-executor was deployed sharing the submitter's own
-/// filesystem (sandyd.md decision 20) — an operator-set deployment fact,
+/// filesystem (sandyd.md decision 21) — an operator-set deployment fact,
 /// never auto-detected: this process cannot know what filesystem a future
 /// submitter's CLI will run on. `SANDY_HOST_SHARES_SUBMITTER_FS=1` (or any of
 /// `true`/`yes`, case-insensitive) declares it; unset or anything else is
