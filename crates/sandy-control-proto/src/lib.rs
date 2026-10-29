@@ -307,6 +307,11 @@ mod tests {
             !rendered.contains(marker),
             "the token leaked into Debug output: {rendered}"
         );
+        let numeric_repr = format!("{:?}", marker.as_bytes());
+        assert!(
+            !rendered.contains(&numeric_repr),
+            "the token's raw bytes leaked into Debug output: {rendered}"
+        );
         assert!(rendered.contains("redacted"), "got: {rendered}");
         let nested = format!(
             "{:?}",
