@@ -1604,30 +1604,29 @@ gap is still open. Confirmed against the current code rather than assumed:
   both adopt `listen_tls`/`connect_tls` — the agent-link listener is exactly
   where decision 6's own token and a future cross-machine `AttachResponse`
   `Cap` need this, per the Context finding above.
-- **vsock: no encryption layer, but the peer-CID check is a prerequisite,
-  not a deferrable follow-up.** The host hypervisor can already read a
-  guest's memory directly, so TLS between a guest and its own host would
-  protect data from a party that already has an unconditionally stronger
-  access path — encryption genuinely adds nothing on a true one-guest-to-
-  its-own-host link. But "only two endpoints" does not hold on a host
-  running more than one guest concurrently: `impls/agent/src/link_source.rs`'s
-  `VsockAcceptor` does not check the connecting CID today, so any sibling
-  guest on the same host can dial another job's agent-link listener — a
-  real third party, not a hypothetical one, the moment decision 14's
-  stage-1 "one host-executor handles one dispatch at a time" constraint
-  lifts (named there as temporary, not permanent). That is the identical
-  INV-11 gap decision 6 closed on TCP with a per-run token ("the attacker
-  is a legitimately mesh-authenticated peer, just not the right one" — an
-  identity check at the transport layer that identifies the host, not the
-  process). Decision 20 therefore does not claim "no encryption needed" as
-  a closed, general-purpose property of vsock: it holds only as long as a
-  host runs one guest/dispatch at a time. **The CID check is a prerequisite
-  for lifting that constraint**, not an independent follow-up on its own
-  timeline — tracked as a blocking dependency of whatever item relaxes
-  decision 14, not filed loose. It is a `sandy-agent`/`impls/vm` change, not
-  a `sandy-conn` one (vsock doesn't route through this crate), and is out of
-  scope for #495's TCP-tier deliverable only because decision 14 still
-  holds today.
+- **vsock: no encryption layer; the earlier draft of this decision was wrong
+  about why.** A prior revision claimed `VsockAcceptor`
+  (`impls/agent/src/link_source.rs`) does not check the connecting CID,
+  reasoning from that to a "sibling guest" threat this TLS design would
+  need to cover once decision 14's stage-1 constraint lifts. Corrected
+  before merge (caught while wiring #504, confirmed against the code, not
+  assumed from the finding that prompted it): `VsockAcceptor::accept`
+  already rejects any peer whose CID is not the host's
+  (`a_guest_local_peer_is_rejected_and_the_host_still_connects`,
+  `link_source.rs`), and vsock's own routing model (vhost-vsock on Linux,
+  `VZVirtioSocketDevice` on macOS) has no guest-to-guest path at all — a
+  guest can only ever reach its own host, never another guest, independent
+  of any check either side adds. The "sibling guest dials another job's
+  listener" scenario this paragraph used to describe is not a live
+  possibility to defend against, not merely one that's currently
+  mitigated. No encryption layer is needed on vsock, full stop, for the
+  same reason stated above (the host can already read the guest's memory
+  directly) — not conditioned on decision 14's constraint holding. Audit
+  finding #396 (NV-07) already covers vsock's actual open question —
+  whether CID isolation itself could be violated by a compromised
+  hypervisor, which is a deployment/validation question, not a `sandy-conn`
+  or `sandy-agent` code change — and supersedes this paragraph's withdrawn
+  "add a CID check" item.
 
 **Consequences.** `scripts/cross-machine-smoke.sh` and
 `docs/design/host-executor/spec.md`'s manual cross-machine smoke test both
