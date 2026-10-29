@@ -6,8 +6,8 @@
 //! maps results to process exit bands (INV-11).
 //!
 //! A separate crate root from `lib.rs`, so it repeats that file's
-//! `clippy::print_stdout` deny (#512): [`sandy_cli::output::emit`] and
-//! are this binary's only sanctioned stdout sinks.
+//! `clippy::print_stdout` deny (#512): [`sandy_cli::output::emit`] is
+//! this binary's only sanctioned stdout sink.
 #![deny(clippy::print_stdout)]
 
 use base64::Engine as _;

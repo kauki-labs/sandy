@@ -356,12 +356,13 @@ impl std::fmt::Debug for AttachedChannel {
 
 impl Render for AttachedChannel {
     fn render_plain(&self, out: &mut dyn io::Write) -> io::Result<()> {
-        let bytes = base64::engine::general_purpose::STANDARD
+        // A hand-built view may carry a cap that is not valid base64: say so rather than print "0 bytes".
+        let size = base64::engine::general_purpose::STANDARD
             .decode(&self.cap)
-            .map_or(0, |cap| cap.len());
+            .map_or_else(|_| "unreadable".to_owned(), |cap| format!("{} bytes", cap.len()));
         write!(
             out,
-            "channel {} (cap: {bytes} bytes, redacted — use -o json to retrieve)",
+            "channel {} (cap: {size}, redacted — use -o json to retrieve)",
             self.channel_id
         )
     }
@@ -532,6 +533,21 @@ mod tests {
         let rendered = format!("{view:?}");
         assert!(!rendered.contains(marker) && !rendered.contains(&encoded), "{rendered}");
         assert!(rendered.contains("redacted"), "{rendered}");
+    }
+
+    /// A cap that is not valid base64 must not print as "0 bytes", and must stay out of the output.
+    #[test]
+    fn a_malformed_cap_renders_as_unreadable_not_zero_bytes() -> anyhow::Result<()> {
+        let view = AttachedChannel {
+            channel_id: "orchestrator".into(),
+            cap: "not base64 !!".into(),
+        };
+        let mut buf = Vec::new();
+        view.render_plain(&mut buf)?;
+        let line = String::from_utf8(buf)?;
+        assert!(line.contains("unreadable") && !line.contains("0 bytes"), "{line}");
+        assert!(!line.contains("not base64"), "{line}");
+        Ok(())
     }
 
     /// Plain `list` with no jobs prints nothing at all (not a blank line), as `ls` does.
