@@ -1,0 +1,15 @@
+# #297: the coverage check's full-workspace, `--release` + llvm-cov-instrumented
+# test run has no concurrency control today, so nextest's default (one test
+# thread per logical CPU, 4 on this repo's standard GitHub-hosted runner) lets
+# every real-process-spawning test in sandy-agent's integration suite — each
+# one forking `sandy-agent`, allocating a tmux session, attaching a PTY, and
+# often forking a job shell on top of that — compete for CPU and process-table
+# slots at once, on top of the coverage instrumentation overhead every test in
+# the workspace already pays. #550/#552 widened the per-wait timeouts these
+# tests use (so a slow-but-healthy run doesn't time out), but a fixed timeout
+# only hides contention, it doesn't reduce it. Capping sandy-agent's own
+# concurrency directly addresses the contention itself, the same lever #538's
+# fix used for a different crate's fd-heavy test.
+[[profile.default.overrides]]
+filter = 'package(sandy-agent)'
+threads-required = 2
