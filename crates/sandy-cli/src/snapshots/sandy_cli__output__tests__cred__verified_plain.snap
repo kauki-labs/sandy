@@ -1,0 +1,5 @@
+---
+source: crates/sandy-cli/src/output.rs
+expression: "plain_of(&CredVerified { verified: true })"
+---
+Verified: mints a scoped token and the installation grants the requested capabilities.

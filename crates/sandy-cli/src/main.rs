@@ -16,7 +16,9 @@ use sandy::{Capability, CoreError, GithubAdapter, Journal, ProcessExit, Scope, T
 use sandy_cli::{
     app_register::{self, Owner},
     doctor,
-    output::{JobRecords, OutputFormat, emit, format_attach, format_cancel, format_list, format_status, format_submit},
+    output::{
+        JobRecords, OutputFormat, Render, emit, format_attach, format_cancel, format_list, format_status, format_submit,
+    },
     plan::{JobPlan, RunArgs, parse_run},
     supervisor,
 };
@@ -596,16 +598,27 @@ fn dispatch_mesh_key(op: MeshKeyOp) -> i32 {
 }
 
 /// Dispatch a `sandy cred <provider>` command to the provider's handler.
-fn dispatch_cred(provider: CredProvider) -> i32 {
+fn dispatch_cred(provider: CredProvider, output: OutputFormat) -> i32 {
     match provider {
-        CredProvider::Github { op } => dispatch_github(op),
+        CredProvider::Github { op } => dispatch_github(op, output),
     }
 }
 
-/// Dispatch a `sandy cred github <op>`, mapping an [`InstallError`] to a nonzero
-/// exit. These touch only the user config dir.
-fn dispatch_github(op: GithubOp) -> i32 {
-    let result = match op {
+/// Emit a cred command's typed result, or map its [`sandy::InstallError`] to a
+/// nonzero exit.
+fn finish_cred<T: Render + serde::Serialize>(result: Result<T, sandy::InstallError>, output: OutputFormat) -> i32 {
+    match result {
+        Ok(value) => succeed_or(emit(&value, output)),
+        Err(e) => {
+            eprintln!("sandy: {e}");
+            ProcessExit::InvalidPlan.code()
+        }
+    }
+}
+
+/// Dispatch a `sandy cred github <op>`. These touch only the user config dir.
+fn dispatch_github(op: GithubOp, output: OutputFormat) -> i32 {
+    match op {
         GithubOp::Register {
             name,
             name_override,
@@ -627,16 +640,19 @@ fn dispatch_github(op: GithubOp) -> i32 {
             let owner = org.map_or(Owner::User, Owner::Org);
             let targets = repos.into_iter().map(sandy::Target).collect();
             let github_name = app_register::github_app_name(&name, &owner, name_override.as_deref());
-            app_register::run_register(
-                &name,
-                &github_name,
-                &homepage,
-                owner,
-                &base_url,
-                &caps,
-                targets,
-                skip_verify,
-                force,
+            finish_cred(
+                app_register::run_register(
+                    &name,
+                    &github_name,
+                    &homepage,
+                    owner,
+                    &base_url,
+                    &caps,
+                    targets,
+                    skip_verify,
+                    force,
+                ),
+                output,
             )
         }
         GithubOp::Import {
@@ -648,22 +664,20 @@ fn dispatch_github(op: GithubOp) -> i32 {
             repos,
         } => {
             let targets = repos.into_iter().map(sandy::Target).collect();
-            app_register::run_import(&name, &app_id, installation_id, &pem, base_url, targets)
+            finish_cred(
+                app_register::run_import(&name, &app_id, installation_id, &pem, base_url, targets),
+                output,
+            )
         }
         GithubOp::Verify { name, capabilities } => match parse_caps(&capabilities) {
-            Ok(caps) => app_register::run_verify(&name, &caps),
+            Ok(caps) => finish_cred(app_register::run_verify(&name, &caps), output),
             Err(bad) => {
                 eprintln!("sandy: unknown capability '{bad}' (use read-code | write-code | read-pr | write-pr)");
-                return ProcessExit::InvalidPlan.code();
+                ProcessExit::InvalidPlan.code()
             }
         },
-        GithubOp::Deregister { name, keep_remote } => app_register::run_deregister(&name, keep_remote),
-    };
-    match result {
-        Ok(()) => 0,
-        Err(e) => {
-            eprintln!("sandy: {e}");
-            ProcessExit::InvalidPlan.code()
+        GithubOp::Deregister { name, keep_remote } => {
+            finish_cred(app_register::run_deregister(&name, keep_remote), output)
         }
     }
 }
@@ -1345,7 +1359,7 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
 
     // `cred` ops need only the user config dir, not $SANDY_HOME.
     if let Command::Cred { provider } = command {
-        return dispatch_cred(provider);
+        return dispatch_cred(provider, output);
     }
 
     // `mesh` ops touch only the caller-named identity dir, not $SANDY_HOME.
@@ -1473,17 +1487,14 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
 }
 
 /// Print an already-formatted string to stdout, or report a serialization
-/// failure — the pre-#512 `emit`, kept only for the `daemon`/`cred` commands
+/// failure — the pre-#512 `emit`, kept only for the `daemon` commands
 /// (`format_submit`/`format_cancel`/`format_attach`/`format_status`/
-/// `format_list`) that #513/#514 migrate to typed [`Render`](output::Render)
-/// output; remove this once they do.
+/// `format_list`) that #513 migrates to typed [`Render`](output::Render)
+/// output; remove this once it does.
 ///
 /// An empty text rendering prints nothing; JSON always prints (an empty list
 /// is a valid `[]`). On a `serde_json` failure, returns the infra-fault band.
-#[allow(
-    clippy::print_stdout,
-    reason = "legacy sink for #513/#514's not-yet-migrated commands"
-)]
+#[allow(clippy::print_stdout, reason = "legacy sink for #513's not-yet-migrated commands")]
 fn emit_str(formatted: serde_json::Result<String>) -> Result<(), i32> {
     match formatted {
         Ok(out) => {

@@ -1,0 +1,7 @@
+---
+source: crates/sandy-cli/src/output.rs
+expression: "plain_of(&deregistered(true, Some(\"https://github.com/settings/apps/x\")))"
+---
+Uninstalled the App at the forge.
+The App registration shell can't be deleted via API; remove it in the UI: https://github.com/settings/apps/x
+Shredded the local key and removed /cfg/trust-roots/sandy-runner.json

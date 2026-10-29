@@ -1,0 +1,9 @@
+---
+source: crates/sandy-cli/src/output.rs
+expression: "json_of(&deregistered(true, Some(\"https://github.com/settings/apps/x\")))"
+---
+{
+  "uninstalled": true,
+  "registration_residue": "https://github.com/settings/apps/x",
+  "trust_root": "/cfg/trust-roots/sandy-runner.json"
+}

@@ -1,0 +1,11 @@
+---
+source: crates/sandy-cli/src/output.rs
+expression: "json_of(&registered(PathBuf::from(\"/cfg/trust-roots/sandy-runner.pem\")))"
+---
+{
+  "app_name": "sandy-runner",
+  "app_id": "5285548",
+  "installation_id": 170585018,
+  "trust_root": "/cfg/trust-roots/sandy-runner.json",
+  "private_key": "/cfg/trust-roots/sandy-runner.pem"
+}
