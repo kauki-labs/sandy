@@ -1,0 +1,17 @@
+# #538: `connection_257_is_closed_at_accept` (crates/sandy-egress-proxy/tests/proxy.rs)
+# holds 256 live connections plus their proxy-side peers and the listener — well
+# over 512 file descriptors in one test process. It raises its OWN rlimit before
+# opening them, but that only bounds what THIS process may hold; it does nothing
+# about file-descriptor pressure from every OTHER test binary nextest runs at the
+# same time. Under `cargo llvm-cov nextest` specifically — slower, heavier
+# instrumented binaries, so more tests are genuinely in flight at once than under
+# the plain `test` check — that shared pressure was enough to flake this test on
+# three separate, unrelated PRs, never the test's own logic.
+#
+# `threads-required = "num-cpus"` makes nextest treat this one test as needing
+# every available thread slot, so it never runs concurrently with anything else
+# in the suite — the cheapest fix that doesn't touch the test's own behavior or
+# weaken what it actually proves (a real fd-exhaustion boundary, not a mock).
+[[profile.default.overrides]]
+filter = 'test(connection_257_is_closed_at_accept)'
+threads-required = "num-cpus"
