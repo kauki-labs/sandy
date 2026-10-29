@@ -19,7 +19,7 @@ use std::{
 
 use anyhow::Context;
 use futures_util::StreamExt;
-use sandy::{BackendError, Grants, Outcome, RunControl, RunSpec, VmBackend};
+use sandy::{BackendError, Grants, Outcome, RunControl, RunSpec, SecretRef, SecretSource, VmBackend};
 use sandy_api::agent::{AgentLaunch, AgentReport};
 use sandy_fabric::{
     capauth::{Cap, CapAuthority, CapRights, CapScope, encode_cap},
@@ -146,6 +146,56 @@ async fn run_in_guest(
         })
     })
     .await?)
+}
+
+/// Like [`run_in_guest`], but with a secret staged over the secret channel —
+/// needed only by the environment-contract test below, so kept separate
+/// rather than growing every other caller's argument list.
+async fn run_in_guest_with_secret(
+    template: String,
+    launch: AgentLaunch,
+    script: String,
+    secret_name: &str,
+    secret_value: &'static [u8],
+) -> anyhow::Result<Result<Outcome, BackendError>> {
+    let command = vec!["sh".to_string(), "-c".to_string(), script];
+    let secret_name = secret_name.to_string();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<Result<Outcome, BackendError>> {
+        use std::os::unix::fs::PermissionsExt;
+        let src = tempfile::TempDir::new()?;
+        let secret_file = src.path().join("secret");
+        std::fs::write(&secret_file, secret_value)?;
+        // INV-1: the host secret source must be 0600, or staging refuses it.
+        std::fs::set_permissions(&secret_file, std::fs::Permissions::from_mode(0o600))?;
+        let secrets = [SecretRef {
+            name: secret_name,
+            source: SecretSource::File(secret_file),
+        }];
+        let grants = Grants {
+            secrets: true,
+            agent: false,
+            shares: false,
+        };
+        let control = RunControl::with_timeout_secs(120);
+        Ok(host_backend().with_agent(launch).run(&RunSpec {
+            digests: false,
+            egress: None,
+            template: &template,
+            command: &command,
+            inputs: &[],
+            outputs: &[],
+            secrets: &secrets,
+            env: &[],
+            cpu: None,
+            mem: None,
+            timeout_secs: 120,
+            grants: &grants,
+            outcome_file: None,
+            secret_dir: None,
+            control: &control,
+        }))
+    })
+    .await?
 }
 
 fn template() -> anyhow::Result<String> {
@@ -389,5 +439,119 @@ async fn a_vm_job_talks_to_a_sibling_over_its_peer_channel() -> anyhow::Result<(
         outcome.console
     );
     assert_eq!(relay_result(&relay).await??, Some(0));
+    Ok(())
+}
+
+/// A VM job's environment is the guest image's own login environment plus
+/// exported secrets and devShell variables — not a fixed allowlist
+/// (docs/decisions/agent-fabric.md §13, #509). Asserts the three parts of
+/// that contract directly: a guest login-shell variable is visible, a
+/// staged secret is visible as `$NAME`, and a variable set on the HOST
+/// process before the run is never visible in the guest.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_vm_job_environment_is_the_guest_login_environment() -> anyhow::Result<()> {
+    let template = template()?;
+    let (channel, agent_cap, orchestrator_cap) = channel_and_caps().await?;
+    let orchestrator = channel.join(&orchestrator_cap)?;
+    let mut observed = std::pin::pin!(channel.subscribe(&orchestrator)?);
+    let (launch, relay) = relaying(&channel, agent_cap);
+
+    // The host's own environment must never cross into the guest: a VM
+    // boots from the image, never from the host process's env block, but
+    // this proves it rather than assuming it. `CARGO` is set by the test
+    // harness that launched this process (`cargo nextest run`), not by
+    // anything guest-side — `unsafe_code = forbid` (workspace lints) rules
+    // out setting a fresh host-only variable, so an already-present one
+    // with a host-specific value (the path to this host's own `cargo`
+    // binary) serves the same purpose.
+    const HOST_MARKER_NAME: &str = "CARGO";
+    let host_marker_value = std::env::var(HOST_MARKER_NAME).context("CARGO must be set by the test harness")?;
+
+    const SECRET_NAME: &str = "SANDY_TEST_SECRET";
+    const SECRET_VALUE: &[u8] = b"s3cr3t-value";
+
+    // Echo only the three variables this test actually checks, not a full
+    // `env` dump: a dump (~70 lines, some hundreds of bytes long, e.g.
+    // `LS_COLORS`) reliably lost bytes somewhere in the TTY relay chain
+    // (tmux PTY -> agent -> vsock -> channel) under live testing on ws01 —
+    // confirmed by a run where the secret line and several neighboring
+    // lines were simply missing or truncated mid-value from the collected
+    // TTY_STDOUT stream, not a parsing bug. A few short, known-length lines
+    // stay well under whatever buffer in that chain was overflowing.
+    const LOGIN_VAR_NAME: &str = "LOGNAME";
+    let script = format!(
+        r#"
+        echo "ENVSTART"
+        echo "{LOGIN_VAR_NAME}=${LOGIN_VAR_NAME}"
+        echo "{SECRET_NAME}=${{{SECRET_NAME}:-}}"
+        echo "{HOST_MARKER_NAME}=${{{HOST_MARKER_NAME}:-}}"
+        echo "ENVEND"
+        exit 0
+    "#
+    );
+    let run = tokio::spawn(run_in_guest_with_secret(
+        template,
+        launch,
+        script,
+        SECRET_NAME,
+        SECRET_VALUE,
+    ));
+
+    // The job's output arrives over the agent-link channel as TTY_STDOUT
+    // frames (not `Outcome.console`, which only ever holds the boot
+    // console up to the agent handoff — the earlier version of this test
+    // asserted against that field directly and failed even though the
+    // guest genuinely exported the secret, since the job's own stdout was
+    // never routed through it in agent mode. See the TTY round-trip test
+    // above for the same pattern.)
+    let mut stdout = Vec::new();
+    while !String::from_utf8_lossy(&stdout).contains("ENVEND") {
+        let env = timeout(WAIT, observed.next()).await?.context("channel ended")??;
+        if env.content_type == TTY_STDOUT {
+            stdout.extend(env.payload);
+        }
+    }
+    let listing = String::from_utf8_lossy(&stdout).into_owned();
+
+    let outcome = timeout(WAIT, run).await????;
+    assert_eq!(outcome.guest_exit, Some(0), "console: {}", outcome.console);
+
+    // Only the job's own printout: between its two markers, past the echoed command line.
+    let listing = listing
+        .rsplit_once("ENVSTART")
+        .and_then(|(_, rest)| rest.split_once("ENVEND"))
+        .map_or("", |(listing, _)| listing);
+    let pairs: Vec<(&str, &str)> = listing.lines().filter_map(|l| l.split_once('=')).collect();
+
+    // The guest login environment is visible: `LOGNAME` is set by the
+    // guest's own login shell, never by this test or the job's command.
+    assert!(
+        pairs.iter().any(|(k, v)| *k == LOGIN_VAR_NAME && !v.is_empty()),
+        "the job saw no value for the guest login shell's own {LOGIN_VAR_NAME}: {listing}"
+    );
+
+    // The staged secret reaches the job as a real exported variable, not
+    // just a file under a secrets dir (the VM path, unlike the process
+    // backend's $SANDY_SECRETS_DIR).
+    assert!(
+        pairs
+            .iter()
+            .any(|(k, v)| *k == SECRET_NAME && *v == String::from_utf8_lossy(SECRET_VALUE)),
+        "the job did not see the staged secret {SECRET_NAME} exported: {listing}"
+    );
+
+    // The host's own value never crosses into the guest — the key alone
+    // isn't proof (a guest image could independently define `$CARGO` for
+    // its own reasons), the host's specific value is: a Nix store path is
+    // content-addressed, so a guest built from a different Nix evaluation
+    // reproducing it by coincidence would need a hash collision.
+    assert!(
+        !pairs
+            .iter()
+            .any(|(k, v)| *k == HOST_MARKER_NAME && *v == host_marker_value),
+        "the host's own {HOST_MARKER_NAME} value leaked into the guest job: {listing}"
+    );
+
+    relay_result(&relay).await??;
     Ok(())
 }
