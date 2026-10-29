@@ -139,7 +139,9 @@ testPkgs.testers.runNixOSTest {
                   i=0
                   while [ ! -S "$d/s.sock" ] && [ "$i" -lt 50 ]; do sleep 0.2; i=$((i + 1)); done
                   ok=1
-                  if [ -S "$d/s.sock" ]; then echo virtiofsd-none-ok; ok=0; else echo "virtiofsd-none-failed: $(cat "$d/log")"; fi
+                  # A daemon can create the socket and then die on a late sandbox/seccomp failure: settle, then require it alive.
+                  sleep 1
+                  if [ -S "$d/s.sock" ] && kill -0 "$pid" 2>/dev/null; then echo virtiofsd-none-ok; ok=0; else echo "virtiofsd-none-failed: $(cat "$d/log")"; fi
                   kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; rm -rf "$d"
                   exit "$ok"
                 '
