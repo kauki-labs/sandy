@@ -1843,9 +1843,15 @@ mod tests {
     async fn a_refused_cancel_sends_nothing_to_the_host() -> anyhow::Result<()> {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let peer_ip: std::net::IpAddr = "100.64.0.9".parse().context("peer ip literal")?;
-        let allowlist = crate::host_registry::ExecutorAllowlist::new([peer_ip]);
+        let allowlist = crate::host_registry::ExecutorAllowlist::new([(peer_ip, test_fp())]);
         let registration = host_registry
-            .register(&allowlist, peer_ip, "ws01".to_owned(), trusted_host_capabilities())
+            .register(
+                &allowlist,
+                peer_ip,
+                test_fp(),
+                "ws01".to_owned(),
+                trusted_host_capabilities(),
+            )
             .expect("register a test host");
         let mut cancel_rx = registration.cancel_rx;
         let _dispatch_rx = registration.dispatch_rx;
