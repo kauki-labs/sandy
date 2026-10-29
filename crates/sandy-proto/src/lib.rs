@@ -131,3 +131,5 @@ impl std::fmt::Debug for MessageType {
         }
     }
 }
+
+fn   badly_formatted ( ){let x=1;let _=x;}
