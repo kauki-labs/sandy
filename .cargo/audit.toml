@@ -1,11 +1,18 @@
 [advisories]
-# Escape hatch for a triaged advisory: add its RUSTSEC id here with a comment.
+# Escape hatch for a triaged advisory. One entry per line, each with a
+# comment naming the cause (which crate pulls it in) and the exit condition
+# (what makes it safe to remove), e.g.:
+#   "RUSTSEC-2026-0194", # quick-xml 0.26.0 via pprof -> inferno; dev-only
 ignore = []
 informational_warnings = ["unmaintained"]
 severity_threshold = "low"
 
 [database]
-path = "~/.cargo/advisory-db"
+# No `path`: cargo-audit does not expand `~`, so a literal one here creates a
+# `./~/` directory wherever it's invoked from (confirmed running `nix run
+# .#audit`, #494) instead of caching under the real home directory. Omitting
+# it falls back to cargo-audit's own default cache dir, which does resolve
+# correctly.
 url = "https://github.com/RustSec/advisory-db.git"
 fetch = true
 stale = false
@@ -21,4 +28,9 @@ arch = ["x86_64", "aarch64"]
 os = ["linux", "macos"]
 
 [yanked]
+# `checks.audit` (the hermetic, pinned-DB gate) overrides this with
+# `--no-yanked`: its sandboxed build has no network, so no live crates.io
+# index to check yanked status against. `nix run .#audit` passes no such
+# override, so the live run (apps.audit, #494) does run this check against
+# the real index.
 enabled = true
