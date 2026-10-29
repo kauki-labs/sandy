@@ -53,13 +53,14 @@ pub async fn serve_mesh_accept_loop(listener: Arc<Listener>, registry: &Arc<JobR
 /// for [`MAX_CONCURRENT_LINKS`] real connections to prove the cap holds.
 ///
 /// `listener` is `Arc`-wrapped (decision 20's accept+handshake hazard, same
-/// fix `sandyd::main`'s `run_mesh_accept_loop` applies): `Listener::accept`
-/// on a `listen_tls` listener bundles the raw TCP accept and the full TLS
-/// handshake into one future, so it is spawned into its own task via
-/// [`spawn_gated_accept`] rather than raced directly inside the `select!`
-/// below — the SAME `JoinHandle` is re-polled across loop iterations, never
-/// re-created, so losing a `select!` race to `connections.join_next()` never
-/// drops an in-progress handshake.
+/// fix `sandyd::main`'s `run_mesh_accept_loop` applies): the raw accept is
+/// spawned into its own task via [`spawn_gated_accept`] rather than raced
+/// directly inside the `select!` below — the SAME `JoinHandle` is re-polled
+/// across loop iterations, never re-created, so losing a `select!` race to
+/// `connections.join_next()` never drops an in-progress accept. The TLS
+/// handshake itself runs inside the per-connection task spawned below, not
+/// inside `accept_task`, so one peer's handshake (up to the handshake
+/// timeout) never delays the next raw accept from starting.
 async fn serve_mesh_accept_loop_with_cap(listener: Arc<Listener>, registry: &Arc<JobRegistry>, max_concurrent: usize) {
     let mut connections = tokio::task::JoinSet::new();
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
@@ -80,26 +81,30 @@ async fn serve_mesh_accept_loop_with_cap(listener: Arc<Listener>, registry: &Arc
                     break;
                 };
                 match accepted {
-                    Ok((conn, peer)) => {
+                    Ok(accepted_stream) => {
                         let registry = Arc::clone(registry);
                         connections.spawn(async move {
                             let _permit = permit; // held for the stream's lifetime, released on drop
-                            serve_one_remote_link(conn, peer, &registry).await;
+                            match accepted_stream.handshake().await {
+                                Ok((conn, peer)) => serve_one_remote_link(conn, peer, &registry).await,
+                                Err(e) => {
+                                    // A per-peer TLS handshake failure (wrong
+                                    // key, a plaintext dialer, a stalled
+                                    // handshake) — confined to this one
+                                    // connection's own task, never the shared
+                                    // accept loop, so it cannot throttle any
+                                    // other peer's agent-link registration.
+                                    tracing::warn!(error = %e, "mesh accept loop: handshake failed");
+                                }
+                            }
                         });
-                    }
-                    Err(e @ (sandy_conn::ConnError::Tls(_) | sandy_conn::ConnError::HandshakeTimeout)) => {
-                        // `permit` drops here, releasing it immediately. NOT
-                        // the listener-wide backoff below: this is a
-                        // per-peer TLS handshake failure (wrong key, a
-                        // plaintext dialer, a stalled handshake), not a sign
-                        // the listener/process itself is in trouble — backing
-                        // off here would let one bad peer throttle every
-                        // other peer's agent-link registration.
-                        tracing::warn!(error = %e, "mesh accept loop: handshake failed; not backing off, this is a per-peer failure");
                     }
                     Err(e) => {
                         // `permit` drops here, releasing it immediately: this
-                        // connection was never served.
+                        // connection was never served. A real accept(2)
+                        // fault (accept_raw's only error), not a per-peer
+                        // handshake failure — those are handled inside the
+                        // per-connection task above.
                         tracing::warn!(error = %e, "mesh accept loop: accept faulted; backing off");
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }

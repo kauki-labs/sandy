@@ -624,16 +624,17 @@ async fn run_mesh_accept_loop(
     let mut backoff = AcceptBackoff::new();
     let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_MESH_CONNECTIONS));
 
-    // Decision 20's accept+handshake hazard: `listener.accept()` on this
-    // TLS-tier listener bundles the raw TCP accept and the full TLS
-    // handshake into one future, so it must never be polled directly inside
-    // the `select!` below — a sibling branch (`connections.join_next()`)
-    // resolving first would drop an in-progress, healthy handshake. Spawned
-    // via `spawn_gated_accept` into its own task instead, and the SAME
+    // Decision 20's accept+handshake hazard: the raw TCP accept is spawned
+    // via `spawn_gated_accept` into its own task, never polled directly
+    // inside the `select!` below — a sibling branch (`connections.join_next()`)
+    // resolving first would otherwise drop an in-progress accept. The SAME
     // `JoinHandle` is re-polled (`&mut accept_task`) across loop iterations
     // rather than re-created each time, so losing a `select!` race just means
     // the next iteration observes the same still-running task, never a fresh
-    // one that silently abandons the old.
+    // one that silently abandons the old. The TLS handshake itself runs
+    // inside the per-connection task spawned below, not inside `accept_task`,
+    // so one peer's handshake (up to the handshake timeout) never delays the
+    // next raw accept from starting.
     let mut accept_task = spawn_gated_accept(Arc::clone(&connection_semaphore), Arc::clone(&listener));
 
     loop {
@@ -659,7 +660,7 @@ async fn run_mesh_accept_loop(
                     break;
                 };
                 match accepted {
-                    Ok((conn, peer)) => {
+                    Ok(accepted_stream) => {
                         backoff.reset();
                         let allowlist = Arc::clone(&allowlist);
                         let host_registry = Arc::clone(&host_registry);
@@ -667,35 +668,38 @@ async fn run_mesh_accept_loop(
                         let job_registry = Arc::clone(&job_registry);
                         connections.spawn(async move {
                             let _permit = permit; // held for the connection's lifetime, released on drop
-                            sandyd::host_conn::serve_host_executor(
-                                conn,
-                                peer,
-                                &allowlist,
-                                &host_registry,
-                                &store,
-                                &job_registry,
-                            )
-                            .await;
+                            match accepted_stream.handshake().await {
+                                Ok((conn, peer)) => {
+                                    sandyd::host_conn::serve_host_executor(
+                                        conn,
+                                        peer,
+                                        &allowlist,
+                                        &host_registry,
+                                        &store,
+                                        &job_registry,
+                                    )
+                                    .await;
+                                }
+                                Err(e) => {
+                                    // A per-peer TLS handshake failure (wrong
+                                    // pinned key, a port scanner, a plaintext
+                                    // dialer, a handshake that never
+                                    // finishes) — confined to this one
+                                    // connection's own task, never the shared
+                                    // accept loop, so it cannot throttle any
+                                    // OTHER peer's registration the way
+                                    // backing off the whole listener would.
+                                    tracing::warn!(error = %e, "mesh connection handshake failed");
+                                }
+                            }
                         });
-                    }
-                    Err(e @ (sandy_conn::ConnError::Tls(_) | sandy_conn::ConnError::HandshakeTimeout)) => {
-                        // `permit` drops here, releasing it immediately: this
-                        // connection was never served. NOT the listener-wide
-                        // backoff below: a TLS-tier `accept()` also returns
-                        // `Err` for a per-peer failure — a wrong pinned key, a
-                        // port scanner, a plaintext dialer, a handshake that
-                        // never finishes — none of which indicate the
-                        // listener itself (or the process's resources) are in
-                        // trouble the way a real accept(2) fault does.
-                        // Backing off here would let one bad peer (e.g. an
-                        // old, not-yet-redeployed host-executor still dialing
-                        // in plaintext) throttle every OTHER peer's
-                        // registration for up to `ACCEPT_ERROR_BACKOFF_MAX`.
-                        tracing::warn!(error = %e, "mesh connection handshake failed; not backing off, this is a per-peer failure");
                     }
                     Err(e) => {
                         // `permit` drops here, releasing it immediately: this
-                        // connection was never served.
+                        // connection was never served. A real accept(2)
+                        // fault (accept_raw's only error) — a per-peer
+                        // handshake failure is handled inside the
+                        // per-connection task above instead.
                         tracing::warn!(error = %e, "failed to accept a mesh connection");
                         // Raced against shutdown — see the UDS loop's own
                         // identical comment in main() for why an unraced

@@ -61,28 +61,27 @@ pub async fn gate_spawn<T>(
 }
 
 /// `(permit, accept result)`, as [`spawn_gated_accept`] hands back once its
-/// spawned task resolves.
+/// spawned task resolves. The accept result is a raw [`sandy_conn::AcceptedStream`],
+/// not yet handshaken on the TLS tier — see `spawn_gated_accept`'s own doc.
 pub type GatedAcceptResult = (
     Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError>,
-    Result<(Box<dyn sandy_conn::Conn>, sandy_conn::PeerAddr), sandy_conn::ConnError>,
+    Result<sandy_conn::AcceptedStream, sandy_conn::ConnError>,
 );
 
-/// Spawn one gated [`sandy_conn::Listener::accept`] call into its own task,
-/// decoupling its execution from whatever `select!` loop awaits the returned
-/// [`tokio::task::JoinHandle`] (the decision-20 accept+handshake hazard
-/// `listen_tls`'s own doc comment flags): on a TLS-tier listener,
-/// `Listener::accept` bundles the raw TCP accept and the full TLS handshake
-/// into one future. A caller racing that future directly inside a
-/// `tokio::select!` — as every accept loop in this crate did for the
-/// plaintext tier — drops it the instant a sibling branch (e.g.
-/// `connections.join_next()`) resolves first, silently aborting an
-/// in-progress, perfectly healthy handshake, not just a slow or adversarial
-/// one. Spawning this onto its own task means the handshake keeps running to
-/// completion regardless: the `select!` loop only ever observes it by
-/// awaiting this function's `JoinHandle`, and losing that particular
-/// `select!` race just means the result is picked up on a later loop
-/// iteration, polling the SAME still-running task rather than dropping and
-/// re-creating it.
+/// Spawn one gated [`sandy_conn::Listener::accept_raw`] call into its own
+/// task, decoupling its execution from whatever `select!` loop awaits the
+/// returned [`tokio::task::JoinHandle`].
+///
+/// This spawns the RAW accept only, not the TLS handshake (the decision-20
+/// accept+handshake hazard `listen_tls`'s own doc comment flags): a caller
+/// holding one pending accept task at a time and re-arming it only once it
+/// resolves — every accept loop in this crate — would otherwise have one
+/// peer's handshake (up to the handshake timeout) delay the next accept from
+/// even starting, serializing TLS handshakes across the whole listener. The
+/// caller is responsible for calling [`sandy_conn::AcceptedStream::handshake`]
+/// itself, inside the per-connection task it spawns once this resolves, so a
+/// slow or silent peer's handshake only occupies its own task and connection
+/// permit, never the shared accept slot.
 ///
 /// `listener` is `Arc`-wrapped so the spawned task can hold its own
 /// reference independent of the caller's loop — the point of spawning is
@@ -92,7 +91,7 @@ pub fn spawn_gated_accept(
     semaphore: Arc<tokio::sync::Semaphore>,
     listener: Arc<sandy_conn::Listener>,
 ) -> tokio::task::JoinHandle<GatedAcceptResult> {
-    tokio::spawn(async move { gate_spawn(&semaphore, async move { listener.accept().await }).await })
+    tokio::spawn(async move { gate_spawn(&semaphore, async move { listener.accept_raw().await }).await })
 }
 
 /// Serve one client connection: read [`ControlRequest`] frames, dispatch each
