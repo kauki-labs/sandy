@@ -92,7 +92,7 @@ async fn register_and_authenticate(
     registry: &HostRegistry,
 ) -> Option<(Box<dyn Conn>, Registration)> {
     let peer_ip = match peer {
-        PeerAddr::Tcp(addr) => addr.ip(),
+        PeerAddr::Tcp(addr) | PeerAddr::TcpTls(addr, _) => addr.ip(),
         PeerAddr::Uds => {
             tracing::warn!("a host-executor connection arrived over UDS, not the mesh; refusing");
             return None;

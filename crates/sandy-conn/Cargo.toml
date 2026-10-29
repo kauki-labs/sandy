@@ -18,10 +18,14 @@ workspace = true
 
 [dependencies]
 fs2.workspace = true
+rcgen.workspace = true
 rustix.workspace = true
+rustls.workspace = true
+sha2.workspace = true
 socket2.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["net", "io-util", "rt"] }
+tokio = { workspace = true, features = ["net", "io-util", "rt", "time"] }
+tokio-rustls.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
