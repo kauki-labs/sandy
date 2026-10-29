@@ -121,6 +121,9 @@ jobs:
           persist-credentials: false
       - name: Check each binary's major matches sandy-lib
         run: python3 scripts/ci/check-binary-major.py
+      # The CI scripts' own tests, here because this job already checks out and runs python3.
+      - name: CI script tests
+        run: python3 -m unittest scripts/ci/test_check_peer_verdict.py
   checks:
     name: Check
     runs-on: ubuntu-24.04
