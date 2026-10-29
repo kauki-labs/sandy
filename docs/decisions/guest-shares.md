@@ -57,24 +57,42 @@ option, though other vfkit devices do). Revisit if vfkit adds one.
 
 ## 3. virtiofsd runs `--sandbox=none`
 
-**Status:** accepted.
+**Status:** accepted. Premise corrected 2026-10-29 (#523, audit NV-02); the decision is unchanged.
 
-**Context.** `virtiofsd` offers `--sandbox=namespace` (the default) and
-`--sandbox=chroot` to confine the daemon itself, but both need privileges
-(user-namespace setup or `CAP_SYS_CHROOT`) that sandy's unprivileged launch does
-not hold.
+**Context.** `virtiofsd` offers `--sandbox=namespace`, `--sandbox=chroot` and
+`--sandbox=none`. The first version of this decision said both confining modes need
+privileges that sandy's launch does not hold (the original text: "both need privileges
+(user-namespace setup or `CAP_SYS_CHROOT`) that sandy's unprivileged launch does not
+hold"). Measured 2026-10-29, virtiofsd 1.13.3 as uid 1000 on ws01 and 1.14.0 in the
+executor nixosTest:
 
-**Decision.** The qemu transport launches each `virtiofsd` with `--sandbox=none`,
-so the daemon has no namespace/chroot confinement of its own.
+- `chroot`: root only ("sandbox mode 'chroot' can only be used by root").
+- `namespace`: starts as a plain user; the serving child gets new mount, user and pid
+  namespaces and keeps seccomp. It does **not** start under `sandy-executor.service`'s
+  hardening: the kernel logs `VFS: Mount too revealing` and virtiofsd fails with
+  `Error entering sandbox: MountProc(... Operation not permitted)`. Measured by hand
+  with the same probe that `nix/tests/sandy-executor-vm.nix` runs for `none` today (the
+  unit's exact `serviceConfig`); nothing in the repo reproduces the `namespace` run.
+- `none`: starts in both (under the unit only the socket appearing was checked). As a
+  plain user the daemon runs under virtiofsd's own default seccomp filter
+  (`Seccomp: 2`, read on ws01), in the host's mount, user and pid namespaces. Seccomp
+  under the unit was not read, and `chroot` was never observed running.
 
-**Consequences.** The daemon's own sandbox is not a containment layer; the VM
-boundary plus the fact that each daemon serves only one per-run, sandy-owned dir
-(wiped at teardown) bound the blast radius. Dropping `--sandbox=none` for a
-privileged mode would make the unprivileged launch fail, so it stays.
+**Decision.** The qemu transport launches each `virtiofsd` with `--sandbox=none`.
 
-**Set aside.** A privileged `namespace`/`chroot` sandbox: rejected — it would
-require sandy to run virtiofsd with elevated privileges, a larger attack surface
-than the confinement it buys given the VM boundary.
+**Consequences.** The daemon has no namespace confinement of its own. It does have its
+default seccomp filter (the live gate K22 guards that, as a plain user), the executor
+unit's own hardening applies to the daemon when it runs there, and the VM boundary plus
+the single per-run, sandy-owned dir (wiped at teardown) bound the blast radius. Whether
+a real KVM guest can run under that unit at all is untested (it sets `PrivateDevices`).
+
+**Set aside (do not re-propose without new information).** `--sandbox=namespace`: it
+starts under the executor unit only if the unit's hardening is relaxed so a fresh procfs
+can be mounted. Which directive blocks it was not isolated (`ProtectProc` and
+`ProtectKernelTunables` were not tried one by one). Relaxing the unit around every job to
+confine one daemon is a security tradeoff for the owner. `--sandbox=chroot`: root only.
+A fallback to `none` when namespaces are unavailable: a silent downgrade. Running
+`virtiofsd` with elevated privileges: a larger attack surface than the confinement buys.
 
 ## 4. Inputs copied, outputs collected
 

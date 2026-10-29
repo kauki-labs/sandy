@@ -1,4 +1,4 @@
-//! Live qemu confinement gate (#392, audit NV-02).
+//! Live qemu confinement gate (#392, #523, audit NV-02).
 //!
 //! Tier-3 (behind the `live` feature): a real qemu process, started by a real `sandy run`, must run under a
 //! seccomp filter. Without one, a qemu escape has the full syscall surface of the sandy user. The test reads
@@ -143,5 +143,69 @@ fn the_qemu_process_runs_under_a_seccomp_filter() -> anyhow::Result<()> {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(output.status.code(), Some(0), "the sandboxed run must still succeed");
+    Ok(())
+}
+
+/// A virtiofsd that serves a share runs under a seccomp filter. virtiofsd applies its own by default (`--seccomp
+/// kill`), also with `--sandbox=none`; this guards against a change that switches it off (`--seccomp=none`). The
+/// namespace sandbox is deliberately not required: it does not start under the executor unit
+/// (`docs/decisions/guest-shares.md` decision 3).
+#[test]
+fn a_virtiofsd_runs_under_a_seccomp_filter() -> anyhow::Result<()> {
+    let target = require_live()?;
+    build_guest(&target)?;
+    let home = tempfile::tempdir().context("temp SANDY_HOME")?;
+    let input = tempfile::tempdir().context("temp input dir")?;
+    std::fs::write(input.path().join("f"), b"x").context("write input")?;
+    let attr = format!("{}#{}", guest_flake().display(), target.topology_attr);
+
+    // An `--input` makes a virtio-fs share, so a virtiofsd serves this run.
+    let mut sandy = Command::new(env!("CARGO_BIN_EXE_sandy"))
+        .env("SANDY_HOME", home.path())
+        .args(["-o", "json", "run", &attr, "--timeout", "120", "--input"])
+        .arg(format!("{}:data", input.path().display()))
+        .args(["--", "sleep", JOB_SECS])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawn sandy run")?;
+
+    // A filter is inherited, so a sandy that already runs under seccomp would make virtiofsd read mode 2 without
+    // any filter of its own. Refuse, after letting the run finish so sandy tears its VM down itself (killing sandy
+    // would orphan its qemu and virtiofsd; dropping a `Child` does not stop it).
+    let parent_seccomp = seccomp_mode(sandy.id());
+    if parent_seccomp.as_ref().ok() != Some(&0) {
+        let _ = sandy.wait();
+        anyhow::bail!("refusing: the sandy process already runs under seccomp ({parent_seccomp:?})");
+    }
+
+    let deadline = Instant::now() + APPEAR_WITHIN;
+    let mut seen = Vec::new();
+    let mut last_family = Vec::new();
+    while Instant::now() < deadline && !seen.iter().any(|(_, mode)| *mode == Some(2)) {
+        let family = descendants(sandy.id());
+        if !family.is_empty() {
+            last_family = family.clone();
+        }
+        let now: Vec<_> = family
+            .into_iter()
+            .filter(|(_, comm, argv0)| comm.contains("virtiofsd") || argv0.contains("virtiofsd"))
+            .map(|(pid, ..)| (pid, seccomp_mode(pid).ok()))
+            .collect();
+        // Keep the last snapshot that held a virtiofsd: once the run ends the list is empty, which says nothing.
+        if !now.is_empty() {
+            seen = now;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let output = sandy.wait_with_output().context("wait for sandy run")?;
+
+    assert!(
+        seen.iter().any(|(_, mode)| *mode == Some(2)),
+        "a virtiofsd must run under a seccomp filter; virtiofsd processes last seen (pid, Seccomp; empty = never seen \
+         one): {seen:?}; last sandy descendants (pid, comm, argv0): {last_family:?}; sandy stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(0), "the run must still succeed");
     Ok(())
 }

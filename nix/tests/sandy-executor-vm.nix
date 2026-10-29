@@ -107,6 +107,8 @@ testPkgs.testers.runNixOSTest {
               runtimeInputs = [
                 pkgs.systemd
                 pkgs.bubblewrap
+                pkgs.virtiofsd
+                pkgs.qemu
               ];
               # No `|| true`/fallback anywhere here: a `bwrap` that can't
               # create its own namespaces under this unit's hardening must
@@ -119,6 +121,39 @@ testPkgs.testers.runNixOSTest {
                 # shellcheck disable=SC2016 # the $(...) is meant for the nested `sh -c`, not this script
                 systemd-run --user --scope -p Delegate=yes -- \
                   sh -c 'echo "job-cgroup: $(cat /proc/self/cgroup)"; exec bwrap --ro-bind / / --dev /dev --tmpfs /tmp --unshare-all --share-net -- /run/current-system/sw/bin/echo confined-ok'
+
+                # #523: the qemu transport starts virtiofsd as `virtiofsd_args` (impls/vm/src/share.rs)
+                # spells it: `--sandbox=none --readonly`. Start it for real under this exact unit and
+                # require the socket. `--sandbox=namespace` was tried and does NOT start here: the unit's
+                # /proc handling makes the fresh procfs mount fail (kernel "VFS: Mount too revealing",
+                # virtiofsd "Error entering sandbox: MountProc ... Operation not permitted"), so it is not used.
+                # shellcheck disable=SC2016 # the $(...) and $vars are meant for the nested `sh -c`
+                systemd-run --user --scope -p Delegate=yes -- sh -c '
+                  d=$(mktemp -d); mkdir "$d/share"
+                  virtiofsd --socket-path="$d/s.sock" --shared-dir="$d/share" --sandbox=none --readonly >"$d/log" 2>&1 &
+                  pid=$!
+                  i=0
+                  while [ ! -S "$d/s.sock" ] && [ "$i" -lt 50 ]; do sleep 0.2; i=$((i + 1)); done
+                  ok=1
+                  if [ -S "$d/s.sock" ]; then echo virtiofsd-none-ok; ok=0; else echo "virtiofsd-none-failed: $(cat "$d/log")"; fi
+                  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; rm -rf "$d"
+                  exit "$ok"
+                '
+
+                # #392: qemu starts with `-sandbox <QEMU_SANDBOX>` (impls/vm/src/qemu.rs; keep this value in step
+                # with that constant). qemu installs its own seccomp filter on top of this unit's
+                # SystemCallFilter and NoNewPrivileges. `-machine none` needs no KVM; `-S` keeps the guest
+                # stopped. It must still be running after 2 s (timeout exits 124); a failed filter install exits at once.
+                # shellcheck disable=SC2016 # the $vars are meant for the nested `sh -c`
+                systemd-run --user --scope -p Delegate=yes -- sh -c '
+                  rc=0
+                  timeout 2 qemu-system-x86_64 -machine none -nodefaults -display none -S \
+                    -sandbox on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny \
+                    >/tmp/qemu-sandbox.log 2>&1 || rc=$?
+                  if [ "$rc" -eq 124 ]; then echo qemu-sandbox-ok; else echo "qemu-sandbox-failed rc=$rc: $(cat /tmp/qemu-sandbox.log)"; fi
+                  rm -f /tmp/qemu-sandbox.log
+                  [ "$rc" -eq 124 ]
+                '
               '';
             }) "sandy-executor-probe-run";
           };
@@ -255,6 +290,16 @@ testPkgs.testers.runNixOSTest {
     assert "user@" in cgroup_line and "session-" not in cgroup_line, (
         f"the probed job did not run under user@.service's cgroup as "
         f"expected: {cgroup_line}"
+    )
+
+    # #523, #392: the real virtiofsd and qemu launches also start inside the hardened unit.
+    assert "virtiofsd-none-ok" in probe_output, (
+        f"virtiofsd (as the qemu transport launches it) did not start inside the hardened unit — a hardening "
+        f"directive may have broken the qemu share daemon — journal:\n{probe_output}"
+    )
+    assert "qemu-sandbox-ok" in probe_output, (
+        f"qemu -sandbox did not start inside the hardened unit — its seccomp filter may clash with the unit's "
+        f"SystemCallFilter or NoNewPrivileges — journal:\n{probe_output}"
     )
 
     # #300(b) smoke check: with StopIdleSessionSec=2 set on this node, wait
