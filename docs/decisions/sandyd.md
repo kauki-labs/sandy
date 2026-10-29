@@ -1505,4 +1505,166 @@ today. Only the process branch's `env` is end-to-end live right now
 encoding-tag signal decision 18 established, plus matching changes to
 placement and the Untrusted+non-Vm Submit-time refusal. Worth doing once the
 CLI/daemon migration (#483) actually needs one manifest type end to end, not
+
+## 20. Encrypted mesh transport for sandy-conn's TCP tier: mutual TLS with pinned host keys; vsock stays unencrypted (#495)
+
+**Status:** proposed.
+
+**Context.** Decision 2 flagged this gap when it chose plain length-prefixed
+framing: `AttachResponse`'s `Cap` is fine in plaintext over local UDS (the
+socket's own permissions are the boundary) but "once this rides vsock or
+TCP/QUIC-over-mesh (B6), that cap needs the transport's own confidentiality
+... a bearer credential must never cross a network link in the clear." That
+gap is still open. Confirmed against the current code rather than assumed:
+
+- `sandy-conn`'s `ConnAddr::Tcp` doc comment (`crates/sandy-conn/src/lib.rs`)
+  already records a decision on this question: "the hosts are already on the
+  Headscale/Netbird mesh ... WireGuard's own authentication and encryption
+  as the trust boundary for whatever protocol rides this connection (no
+  additional mTLS layer for step-1)." Decision 12 (`Register`'s allowlist)
+  builds directly on that assumption: "the WireGuard key is the host's
+  identity: there is no attestation, which is an acceptable assumption for
+  operator-provisioned hosts." Neither of those decisions is being reopened
+  here — they're the reason mTLS, not a bare `TcpStream`, is this decision's
+  shape (see below).
+- Decision 13 binds the mesh listeners to whatever address an operator sets
+  in `$SANDY_MESH_LISTEN`/`$SANDY_MESH_AGENT_LINK_LISTEN`; "recommended: a
+  WireGuard-/Tailscale-style mesh" is a recommendation, not something
+  `sandy_conn::listen`/`ExecutorAllowlist` enforce. A bind address off the
+  mesh (operator error, or a future deployment that doesn't use one) sends
+  every bearer secret in the clear and makes `ExecutorAllowlist`'s IP check
+  (`crates/sandyd/src/host_registry.rs`) spoofable, since nothing ties the
+  observed source IP to a key the way WireGuard does.
+- Decision 6's own text already assumes this is solved: the per-run link
+  token is "sent to the executor only over the encrypted control RPC" — but
+  decision 2 is explicit that the control RPC carries no transport
+  encryption of its own today. That line has been true only because every
+  deployment so far has, in practice, run the mesh tier over WireGuard.
+- Two connections carry bearer material across the TCP tier today, both
+  needing this fix, not just "the control RPC" read literally: the
+  host_conn management channel (`Register`/`Dispatch`, decision 12 — #481's
+  remote credential, once #495 lands, will ride a `Dispatch` on this
+  connection) and the mesh agent-link listener (decision 6 — the per-run
+  link token, and `AttachResponse`'s `Cap` once a cross-machine `Attach`
+  exists). Scoping this ADR to the control RPC alone would miss the second.
+- `rustls`/`tokio-rustls` (0.26) and `quinn` (QUIC) are already transitive
+  dependencies in `Cargo.lock` (pulled in via the credential provider's HTTP
+  stack), so adding `tokio-rustls` as a direct dependency for the TCP tier
+  adds negligible weight versus decision 2's light-deps bias. `quinn` is
+  not: decision 2's "no genuine streaming need" holds for this RPC exactly
+  as it did when ruling out gRPC/tonic, so QUIC is set aside below alongside
+  gRPC rather than adopted just because it happens to be in the tree.
+- vsock is not a `sandy-conn` consumer today (its own module doc: "vsock is
+  parked (no consumer yet)"). The guest-side agent link
+  (`impls/agent/src/link_source.rs`'s `VsockAcceptor`,
+  `impls/vm/src/agent.rs`'s `connect_agent_link`) talks raw vsock directly,
+  outside this crate. #495 asks for vsock's analysis to not be assumed
+  identical to TCP's, which this decision honors by treating it separately
+  below rather than forcing it through the same TLS design.
+
+**Decision.**
+
+- **Mutual TLS over TCP, not QUIC, not server-only TLS.** `sandy-conn`
+  grows a TLS-wrapped tier: `connect_tls`/`listen_tls` alongside the
+  existing `connect`/`connect_tcp_keepalive`/`listen`/`listen_tcp_keepalive`
+  (additive, same pattern decision 16 used for keepalive — not a change to
+  the existing functions' signatures). `tokio-rustls` wraps the `TcpStream`
+  after `apply_tcp_keepalive` runs, so the keepalive sockopt (a kernel-level
+  TCP option) applies to the same underlying socket regardless of the TLS
+  layer above it. Both peers present a certificate: the host_conn channel
+  carries bearer material in both directions once a `Cancel`/status message
+  travels back (decision 12's consequences already flag this as a near-term
+  addition), so server-only TLS (authenticating only the orchestrator)
+  would leave the executor's identity resting on the IP check alone — the
+  exact assumption this decision replaces.
+- **Pinned per-host keys, not a CA, and not trust-on-first-use.** `ExecutorAllowlist`
+  grows from a bare IP set to IP-to-pinned-public-key-fingerprint pairs, the
+  same manual-provisioning model `$SANDY_MESH_ALLOWLIST` already uses for
+  IPs (decision 13) — an operator provisions a host's key fingerprint into
+  the allowlist out of band, the same way they provision its IP today,
+  **before** that host is allowed to register. This is static pinning, not
+  real TOFU: an unpinned key is refused outright (see Fail closed below),
+  never auto-accepted and stored on first contact — real TOFU would leave a
+  host's very first registration vulnerable to an on-path attacker, which
+  is exactly the window pinning closes. A certificate authority was
+  considered and set aside below: it adds a CA lifecycle (issuance,
+  rotation, revocation) this project has no operational story for yet,
+  where pinning reuses machinery decision 13 already established and
+  decision 12 already accepted the operator-provisioning trust model for.
+- **Fail closed, no plaintext fallback.** A configured mesh listen address
+  with no TLS identity (key/cert) configured refuses to start, mirroring
+  decision 13's empty-allowlist refusal (`std::process::exit(1)`, not a
+  listener that silently accepts cleartext connections). A peer presenting
+  an unpinned or mismatched key is refused at the TLS handshake, before any
+  frame is read — same "write zero bytes on refusal" discipline decision 6
+  established for the agent-link accept path.
+- **Scope: both mesh listeners, not just the literal control RPC.** The TLS
+  tier is a `sandy-conn` capability, so `sandyd`'s host_conn management
+  listener (decision 12/13) and its mesh agent-link listener (decision 6/13)
+  both adopt `listen_tls`/`connect_tls` — the agent-link listener is exactly
+  where decision 6's own token and a future cross-machine `AttachResponse`
+  `Cap` need this, per the Context finding above.
+- **vsock: no encryption layer, but the peer-CID check is a prerequisite,
+  not a deferrable follow-up.** The host hypervisor can already read a
+  guest's memory directly, so TLS between a guest and its own host would
+  protect data from a party that already has an unconditionally stronger
+  access path — encryption genuinely adds nothing on a true one-guest-to-
+  its-own-host link. But "only two endpoints" does not hold on a host
+  running more than one guest concurrently: `impls/agent/src/link_source.rs`'s
+  `VsockAcceptor` does not check the connecting CID today, so any sibling
+  guest on the same host can dial another job's agent-link listener — a
+  real third party, not a hypothetical one, the moment decision 14's
+  stage-1 "one host-executor handles one dispatch at a time" constraint
+  lifts (named there as temporary, not permanent). That is the identical
+  INV-11 gap decision 6 closed on TCP with a per-run token ("the attacker
+  is a legitimately mesh-authenticated peer, just not the right one" — an
+  identity check at the transport layer that identifies the host, not the
+  process). Decision 20 therefore does not claim "no encryption needed" as
+  a closed, general-purpose property of vsock: it holds only as long as a
+  host runs one guest/dispatch at a time. **The CID check is a prerequisite
+  for lifting that constraint**, not an independent follow-up on its own
+  timeline — tracked as a blocking dependency of whatever item relaxes
+  decision 14, not filed loose. It is a `sandy-agent`/`impls/vm` change, not
+  a `sandy-conn` one (vsock doesn't route through this crate), and is out of
+  scope for #495's TCP-tier deliverable only because decision 14 still
+  holds today.
+
+**Consequences.** `scripts/cross-machine-smoke.sh` and
+`docs/design/host-executor/spec.md`'s manual cross-machine smoke test both
+construct a plain TCP dial against a real remote host-executor by hand
+(decision 19 found the same operator-procedure exposure for `argv/v1`); both
+need a documented key-provisioning step once this lands, and an
+old/not-yet-redeployed host-executor dialing in plaintext gets a hard
+refusal, not a silent downgrade. `ExecutorAllowlist`'s wire format changes
+from a bare IP list to IP+fingerprint pairs — a migration note belongs in
+the implementation PR, not this ADR. `connect_tls`/`listen_tls` return the
+same `Box<dyn Conn>`/`Listener` shapes the plaintext tier does, so
+`sandy-control-proto`'s framing and `host_conn`/`mesh_accept`'s `forward_frames`
+task (decision 16) ride the TLS stream unchanged — TLS is a tier choice at
+the `ConnAddr`/dial-site level, not a protocol change above it. The
+implementation PR needs a handshake timeout on `listen_tls`'s accept path
+(no equivalent exists yet, unlike decision 16's `DISPATCH_WRITE_TIMEOUT`):
+without one, a connection that completes TCP accept but never finishes (or
+never starts) the TLS handshake occupies an accept slot indefinitely.
+
+**Open items for the owner:** the exact key-provisioning UX (a CLI
+subcommand to mint/pin a host key, vs. an operator-supplied cert file) is
+left to the implementation PR rather than decided here; default if
+unanswered is a flag-driven `sandy-host-executor`/`sandyd` keypair + a CLI
+command to print/pin the fingerprint, following `sandy cred`'s existing
+provider-nested CLI shape.
+
+**Set aside.** QUIC: no genuine streaming need over this RPC (decision 2's
+reasoning restated, not revisited), and `quinn`'s UDP-based transport model
+would need its own NAT/firewall story on top of the mesh this project
+doesn't need to solve for a request/response RPC. A CA-issued certificate
+model: more lifecycle machinery than pinning for no added guarantee in a
+fleet of operator-provisioned hosts (same shape as decision 6's "mTLS
+certificates per run" set-aside). Relying on the WireGuard mesh alone and
+not adding transport-level auth in `sandy-conn` at all: rejected because
+decision 13 only recommends, never enforces, a mesh-only bind, so
+`sandy-conn` itself has no way to know whether a given `ConnAddr::Tcp` is
+actually mesh-protected — the same "never trust a self-reported value"
+discipline decision 12 already applies to `host_id` applies here to the
+transport's assumed environment.
 as a prerequisite for #480's field parity.
