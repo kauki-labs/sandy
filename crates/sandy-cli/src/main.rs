@@ -18,7 +18,7 @@ use sandy_cli::{
     doctor,
     output::{
         AttachedChannel, CancelledJob, JobRecords, JobStatusReport, JobSummaries, MeshFingerprint, OutputFormat,
-        SubmittedJob, emit,
+        Render, SubmittedJob, emit,
     },
     plan::{JobPlan, RunArgs, parse_run},
     supervisor,
