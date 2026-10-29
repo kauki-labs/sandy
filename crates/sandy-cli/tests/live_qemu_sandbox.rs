@@ -109,6 +109,18 @@ fn the_qemu_process_runs_under_a_seccomp_filter() -> anyhow::Result<()> {
         .spawn()
         .context("spawn sandy run")?;
 
+    // A seccomp filter is inherited and stacks, so a `sandy` that already runs under one (a unit with
+    // `SystemCallFilter`, a sandboxed CI runner) would make its qemu read mode 2 without the flag. Refuse then:
+    // the test could not tell the flag from the environment.
+    let parent_mode = seccomp_mode(sandy.id()).context("read the sandy process's own seccomp mode")?;
+    if parent_mode != 0 {
+        let _ = sandy.wait();
+        anyhow::bail!(
+            "refusing: the sandy process already runs under seccomp (mode {parent_mode}), so qemu's mode proves \
+             nothing"
+        );
+    }
+
     // The mode is read once the process exists and its filter is installed; qemu installs it early, so poll the
     // mode, not only the pid. The run is always waited for below, so no qemu is left behind.
     let deadline = Instant::now() + APPEAR_WITHIN;
