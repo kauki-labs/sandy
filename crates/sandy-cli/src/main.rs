@@ -1079,7 +1079,12 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
                 secrets: submit_secrets,
             })
         }
-        DaemonOp::Cancel { job_id } => control_request::Op::Cancel(CancelRequest { job_id }),
+        DaemonOp::Cancel { job_id } => {
+            // Cancel needs the job's attach token (#540), read back from where `submit` persisted it,
+            // the same way `attach` does.
+            let attach_token = sandy_cli::attach::read_attach_token(&job_id);
+            control_request::Op::Cancel(CancelRequest { job_id, attach_token })
+        }
         DaemonOp::Attach { job_id } => {
             // #327: present the durable token `daemon submit` persisted for
             // this job, if any — proves "I'm the submitter" even though this

@@ -38,6 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "sandy.control.v1.AttachResponse",
             "sandy.control.v1.SubmitResponse",
             "sandy.control.v1.AttachRequest",
+            "sandy.control.v1.CancelRequest",
         ])
         .compile_fds(file_descriptors)?;
 

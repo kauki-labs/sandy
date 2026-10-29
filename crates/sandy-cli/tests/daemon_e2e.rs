@@ -291,6 +291,29 @@ fn attach_surfaces_the_daemons_honest_refusal_not_a_fabricated_channel() -> anyh
     Ok(())
 }
 
+/// #540: a cancel the CLI has no attach token for (here, an id this machine never submitted) is
+/// refused by the real daemon with the one refusal message, exit 2, nothing on stdout.
+#[test]
+fn cancel_without_a_token_is_refused_with_the_daemons_one_message() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir().context("temp dir")?;
+    let daemon = spawn_daemon(tmp.path())?;
+
+    let cancel = sandy(&daemon, &["daemon", "cancel", "never-submitted-here"])?;
+    assert_eq!(cancel.status.code(), Some(2), "stderr: {}", stderr_of(&cancel));
+    assert!(
+        stderr_of(&cancel).contains("a valid attach token for this job is required"),
+        "stderr must carry the daemon's refusal: {}",
+        stderr_of(&cancel)
+    );
+    assert!(
+        !stderr_of(&cancel).contains("never-submitted-here"),
+        "the refusal must not echo the job id: {}",
+        stderr_of(&cancel)
+    );
+    assert!(String::from_utf8_lossy(&cancel.stdout).is_empty());
+    Ok(())
+}
+
 #[test]
 fn connecting_to_a_dead_socket_is_an_infra_fault_not_a_hang() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir().context("temp dir")?;

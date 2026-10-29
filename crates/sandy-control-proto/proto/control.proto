@@ -158,6 +158,11 @@ message SubmitResponse {
 
 message CancelRequest {
   string job_id = 1;
+  // The job's durable `SubmitResponse.attach_token` (#327). Required to cancel
+  // (#540, owner decision on audit #391): a Cancel with no token, a wrong one, or
+  // one for another job is refused, and the refusal does not say which. Optional
+  // on the wire so an old client's request still decodes, then is refused.
+  optional bytes attach_token = 2;
 }
 
 message CancelResponse {}

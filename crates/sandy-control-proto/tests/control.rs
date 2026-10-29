@@ -26,7 +26,7 @@ use sandy_control_proto::{
     outputs: vec![],
     secrets: vec![],
 }))]
-#[case(control_request::Op::Cancel(CancelRequest { job_id: "job-1".to_owned() }))]
+#[case(control_request::Op::Cancel(CancelRequest { job_id: "job-1".to_owned(), attach_token: Some(vec![1, 2, 3]) }))]
 #[case(control_request::Op::Attach(AttachRequest {
     job_id: "job-1".to_owned(),
     attach_token: Some(b"attach-token".to_vec()),
