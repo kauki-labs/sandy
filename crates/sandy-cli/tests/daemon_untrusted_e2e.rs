@@ -157,6 +157,7 @@ async fn register_host(
                     arch: Arch::X8664.into(),
                     attestation: false,
                     supported_isolation_classes: classes.iter().map(|c| i32::from(*c)).collect(),
+                    shares_submitter_filesystem: false,
                 }),
             })),
         },
