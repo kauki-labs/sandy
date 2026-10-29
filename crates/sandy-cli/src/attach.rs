@@ -88,6 +88,10 @@ pub fn read_attach_token(job_id: &str) -> Option<Vec<u8>> {
 /// generic outputs directory (epic #340 phase 3). Best-effort: a write
 /// failure is reported but never turns an otherwise-successful attach into
 /// a failing command — the job already ran to completion.
+#[allow(
+    clippy::print_stdout,
+    reason = "attach's own output migration is tracked in a follow-up item (#513)"
+)]
 pub fn write_archive(job_id: &str, archive: &ArchivePayload) {
     match create_archive_file(std::path::Path::new("."), job_id) {
         Ok((mut file, path)) => {

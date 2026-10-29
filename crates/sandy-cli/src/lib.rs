@@ -4,6 +4,12 @@
 //! exposed as a library target so the job-op logic (`plan`, `supervisor`) can be
 //! exercised directly from integration tests with a `sandy_test_support::FakeBackend`
 //! and a real [`sandy::Journal`], without booting a hypervisor.
+//!
+//! Output goes through one typed pipeline (#512): [`output::Render`] +
+//! [`output::emit`]/[`output::emit_stream_to`] are the only sanctioned stdout
+//! sinks, enforced by denying `print!`/`println!` everywhere else in this
+//! crate — a command that prints directly fails clippy, not just review.
+#![deny(clippy::print_stdout)]
 
 pub mod app_register;
 pub mod attach;

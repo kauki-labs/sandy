@@ -9,12 +9,13 @@
 //! stderr as text, and the process exit band (INV-11) carries success/failure
 //! regardless of format.
 
-use std::fmt::Write as _;
+use std::io;
 
 use base64::Engine as _;
 use clap::ValueEnum;
 use sandy::{JobRecord, ResultEnvelope};
 use sandy_control_proto::{AttachResponse, JobStatus, JobSummary, ListResponse, StatusResponse, SubmitResponse};
+use serde::{Deserialize, Serialize};
 
 use crate::supervisor::GcReport;
 
@@ -28,105 +29,181 @@ pub enum OutputFormat {
     Json,
 }
 
+/// A command's result, in both directions: it serializes/deserializes with
+/// `serde` for `-o json` (so JSON output is a real type, not a hand-built
+/// shape with no contract), and renders its own human-readable form for
+/// `-o plain` via [`Render::render_plain`]. [`emit`] is the only function
+/// that writes either form to stdout.
+pub trait Render {
+    /// Write this value's human-readable (`-o plain`) rendering to `out`.
+    ///
+    /// # Errors
+    /// Propagates a write failure on `out`.
+    fn render_plain(&self, out: &mut dyn io::Write) -> io::Result<()>;
+}
+
+/// Either half of [`emit`]/[`emit_stream`] failing: JSON serialization, or
+/// writing to the sink itself.
+#[derive(Debug, thiserror::Error)]
+pub enum EmitError {
+    /// `-o json` serialization failed.
+    #[error("could not serialize output: {0}")]
+    Serialize(#[from] serde_json::Error),
+    /// Writing the rendered output to its sink failed.
+    #[error("could not write output: {0}")]
+    Io(#[from] io::Error),
+}
+
+/// Writes `value` to `out` in `format`: the plain rendering (skipped
+/// entirely if it would be empty — `ls` with zero jobs prints nothing, not a
+/// blank line) or the pretty-printed JSON serialization.
+///
+/// # Errors
+/// [`EmitError::Serialize`] or [`EmitError::Io`], see [`EmitError`].
+pub fn emit_to<T, W>(value: &T, format: OutputFormat, out: &mut W) -> Result<(), EmitError>
+where
+    T: Render + Serialize,
+    W: io::Write,
+{
+    match format {
+        OutputFormat::Plain => {
+            let mut buf = Vec::new();
+            value.render_plain(&mut buf)?;
+            if !buf.is_empty() {
+                out.write_all(&buf)?;
+                out.write_all(b"\n")?;
+            }
+        }
+        OutputFormat::Json => writeln!(out, "{}", serde_json::to_string_pretty(value)?)?,
+    }
+    Ok(())
+}
+
+/// [`emit_to`] against real stdout, mapped to a process exit band on failure
+/// (band 3, infra fault) — the one function in this crate allowed to call
+/// `println!`/`print!` directly ([`clippy::print_stdout`] is denied
+/// everywhere else).
+///
+/// # Errors
+/// `Err` carries the process exit code to use; the failure is already
+/// reported on stderr.
+#[allow(
+    clippy::print_stdout,
+    reason = "the one sanctioned stdout sink; see EmitError's own eprintln above it"
+)]
+pub fn emit<T: Render + Serialize>(value: &T, format: OutputFormat) -> Result<(), i32> {
+    let mut buf = Vec::new();
+    match emit_to(value, format, &mut buf) {
+        Ok(()) => {
+            if !buf.is_empty() {
+                print!("{}", String::from_utf8_lossy(&buf));
+            }
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("sandy: {e}");
+            Err(sandy::ProcessExit::InfraFault.code())
+        }
+    }
+}
+
+/// Writes every item of a stream to `out` as it arrives: one plain line, or
+/// one NDJSON object, per item — flushed after each so a consumer reading
+/// the stream live sees each event as soon as it's produced, never buffered
+/// to the end.
+///
+/// # Errors
+/// [`EmitError::Serialize`] or [`EmitError::Io`] from the failing item;
+/// already-written items are not rolled back.
+pub fn emit_stream_to<T, I, W>(items: I, format: OutputFormat, out: &mut W) -> Result<(), EmitError>
+where
+    T: Render + Serialize,
+    I: IntoIterator<Item = T>,
+    W: io::Write,
+{
+    for item in items {
+        match format {
+            OutputFormat::Plain => {
+                item.render_plain(out)?;
+                writeln!(out)?;
+            }
+            // NDJSON: one COMPACT object per line — `to_string_pretty` (what
+            // `emit_to` uses for a single value) would spread one item
+            // across several lines, breaking "each line parses alone".
+            OutputFormat::Json => writeln!(out, "{}", serde_json::to_string(&item)?)?,
+        }
+        out.flush()?;
+    }
+    Ok(())
+}
+
 /// One job record as a human line: the id and its lifecycle state.
-fn plain_record(record: &JobRecord) -> String {
-    format!("{:<36}  {:?}", record.job_id, record.state)
+impl Render for JobRecord {
+    fn render_plain(&self, out: &mut dyn io::Write) -> io::Result<()> {
+        write!(out, "{:<36}  {:?}", self.job_id, self.state)
+    }
+}
+
+/// `ls`'s result: every job record `sandy` knows about, as one named type
+/// (not a bare `Vec`) per #512's spec — `#[serde(transparent)]` keeps the
+/// JSON an array, byte-identical to serializing the `Vec` directly.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct JobRecords(pub Vec<JobRecord>);
+
+impl Render for JobRecords {
+    fn render_plain(&self, out: &mut dyn io::Write) -> io::Result<()> {
+        for (i, record) in self.0.iter().enumerate() {
+            if i > 0 {
+                writeln!(out)?;
+            }
+            record.render_plain(out)?;
+        }
+        Ok(())
+    }
 }
 
 /// A concise human summary of a terminal result envelope, including the collected
 /// outputs (one `  out: <path>` line each) so the plain format carries the same
 /// information the JSON `outputs` array does.
-fn plain_envelope(envelope: &ResultEnvelope) -> String {
-    let exit = envelope
-        .exit_code
-        .map_or_else(|| "-".to_string(), |code| code.to_string());
-    let mut out = format!(
-        "job {}: {:?} (guest exit {exit}, retryable {})\n{}",
-        envelope.job_id, envelope.status, envelope.retryable, envelope.message
-    );
-    for output in &envelope.outputs {
-        let _ = write!(out, "\n  out: {}", output.path);
-    }
-    for warning in &envelope.warnings {
-        let _ = write!(out, "\n  warning: {warning}");
-    }
-    out
-}
-
-/// Format a single job record in the chosen format.
-///
-/// # Errors
-///
-/// Returns a [`serde_json::Error`] only if JSON serialization fails.
-pub fn format_record(record: &JobRecord, format: OutputFormat) -> serde_json::Result<String> {
-    match format {
-        OutputFormat::Plain => Ok(plain_record(record)),
-        OutputFormat::Json => serde_json::to_string_pretty(record),
-    }
-}
-
-/// Format a list of job records (e.g. `ls`). Plain yields one line per record;
-/// JSON yields an array (so an empty list is a valid `[]`).
-///
-/// # Errors
-///
-/// Returns a [`serde_json::Error`] only if JSON serialization fails.
-pub fn format_records(records: &[JobRecord], format: OutputFormat) -> serde_json::Result<String> {
-    match format {
-        OutputFormat::Plain => Ok(records.iter().map(plain_record).collect::<Vec<_>>().join("\n")),
-        OutputFormat::Json => serde_json::to_string_pretty(records),
-    }
-}
-
-/// Format a `run` result envelope: a human summary, or the full envelope as JSON.
-///
-/// # Errors
-///
-/// Returns a [`serde_json::Error`] only if JSON serialization fails.
-pub fn format_envelope(envelope: &ResultEnvelope, format: OutputFormat) -> serde_json::Result<String> {
-    match format {
-        OutputFormat::Plain => Ok(plain_envelope(envelope)),
-        OutputFormat::Json => serde_json::to_string_pretty(envelope),
-    }
-}
-
-/// Format the `gc` result: the evicted job ids, followed by the names of any
-/// swept stale credential staging dirs (#195).
-///
-/// # Errors
-///
-/// Returns a [`serde_json::Error`] only if JSON serialization fails.
-pub fn format_gc(report: &GcReport, format: OutputFormat) -> serde_json::Result<String> {
-    match format {
-        OutputFormat::Plain => {
-            let mut out = format!("gc: evicted {} record(s)", report.evicted.len());
-            for id in &report.evicted {
-                let _ = write!(out, "\n  {id}");
-            }
-            let _ = write!(out, "\ngc: swept {} staging dir(s)", report.swept_staging_dirs.len());
-            for name in &report.swept_staging_dirs {
-                let _ = write!(out, "\n  {name}");
-            }
-            Ok(out)
+impl Render for ResultEnvelope {
+    fn render_plain(&self, out: &mut dyn io::Write) -> io::Result<()> {
+        let exit = self.exit_code.map_or_else(|| "-".to_string(), |code| code.to_string());
+        write!(
+            out,
+            "job {}: {:?} (guest exit {exit}, retryable {})\n{}",
+            self.job_id, self.status, self.retryable, self.message
+        )?;
+        for output in &self.outputs {
+            write!(out, "\n  out: {}", output.path)?;
         }
-        OutputFormat::Json => serde_json::to_string_pretty(&serde_json::json!({
-            "evicted": report.evicted,
-            "swept_staging_dirs": report.swept_staging_dirs,
-        })),
+        for warning in &self.warnings {
+            write!(out, "\n  warning: {warning}")?;
+        }
+        Ok(())
     }
 }
 
-/// Format a `doctor` verdict (its exit code + message).
-///
-/// # Errors
-///
-/// Returns a [`serde_json::Error`] only if JSON serialization fails.
-pub fn format_doctor(exit_code: i32, message: &str, format: OutputFormat) -> serde_json::Result<String> {
-    match format {
-        OutputFormat::Plain => Ok(message.to_string()),
-        OutputFormat::Json => {
-            serde_json::to_string_pretty(&serde_json::json!({ "exit_code": exit_code, "message": message }))
+/// `gc`'s result: the evicted job ids, followed by the names of any swept
+/// stale credential staging dirs (#195).
+impl Render for GcReport {
+    fn render_plain(&self, out: &mut dyn io::Write) -> io::Result<()> {
+        write!(out, "gc: evicted {} record(s)", self.evicted.len())?;
+        for id in &self.evicted {
+            write!(out, "\n  {id}")?;
         }
+        write!(out, "\ngc: swept {} staging dir(s)", self.swept_staging_dirs.len())?;
+        for name in &self.swept_staging_dirs {
+            write!(out, "\n  {name}")?;
+        }
+        Ok(())
+    }
+}
+
+/// `doctor`'s verdict (its exit code + message).
+impl Render for crate::doctor::DoctorResult {
+    fn render_plain(&self, out: &mut dyn io::Write) -> io::Result<()> {
+        write!(out, "{}", self.message)
     }
 }
 
@@ -260,9 +337,26 @@ mod tests {
     use sandy_control_proto::{AttachResponse, JobStatus, JobSummary, ListResponse, StatusResponse, SubmitResponse};
 
     use super::{
-        GcReport, OutputFormat, format_attach, format_cancel, format_doctor, format_envelope, format_gc, format_list,
-        format_record, format_records, format_status, format_submit,
+        GcReport, JobRecords, OutputFormat, Render, format_attach, format_cancel, format_list, format_status,
+        format_submit,
     };
+    use crate::doctor::DoctorResult;
+
+    /// A value's plain rendering, as a `String` — what [`emit_to`](super::emit_to)
+    /// writes for [`OutputFormat::Plain`], minus the trailing newline `emit_to`
+    /// itself adds (so content assertions below match the old `format_*`
+    /// functions' return values exactly).
+    fn plain_of<T: Render>(value: &T) -> String {
+        let mut buf = Vec::new();
+        value.render_plain(&mut buf).expect("render_plain to a Vec never fails");
+        String::from_utf8(buf).expect("render_plain output must be UTF-8")
+    }
+
+    /// A value's pretty JSON — what [`emit_to`](super::emit_to) writes for
+    /// [`OutputFormat::Json`], minus the trailing newline.
+    fn json_of<T: serde::Serialize>(value: &T) -> String {
+        serde_json::to_string_pretty(value).expect("serializing a sample value never fails")
+    }
 
     fn sample_record(job_id: &str) -> JobRecord {
         JobRecord {
@@ -301,21 +395,97 @@ mod tests {
         assert_eq!(OutputFormat::default(), OutputFormat::Plain);
     }
 
+    // Snapshots taken against the pre-#512 `format_*` functions, now exercised
+    // against the typed `Render`/`emit_to` pipeline that replaced them — same
+    // snapshot files, so a shape change is a reviewed diff, not a silent one.
+    // `plain_of`/`json_of` are exactly what `emit_to` writes, minus its
+    // trailing newline (snapshotting doesn't care about a trailing newline,
+    // but matching keeps these assertions symmetric with the rest of the
+    // module's tests).
+    mod pre_refactor_snapshots {
+        use super::{DoctorResult, GcReport, JobRecords, json_of, plain_of, sample_envelope, sample_record};
+
+        #[test]
+        fn record_plain() {
+            insta::assert_snapshot!(plain_of(&sample_record("job-a")));
+        }
+
+        #[test]
+        fn record_json() {
+            insta::assert_snapshot!(json_of(&sample_record("job-a")));
+        }
+
+        #[test]
+        fn records_plain_empty_is_an_empty_string() {
+            insta::assert_snapshot!(plain_of(&JobRecords(vec![])));
+        }
+
+        #[test]
+        fn records_json_empty_is_an_empty_array() {
+            insta::assert_snapshot!(json_of(&JobRecords(vec![])));
+        }
+
+        #[test]
+        fn envelope_plain() {
+            insta::assert_snapshot!(plain_of(&sample_envelope("job-a")));
+        }
+
+        #[test]
+        fn envelope_json() {
+            insta::assert_snapshot!(json_of(&sample_envelope("job-a")));
+        }
+
+        #[test]
+        fn gc_plain() {
+            let report = GcReport {
+                evicted: vec!["job-a".to_string(), "job-b".to_string()],
+                swept_staging_dirs: vec!["cred-abc".to_string()],
+            };
+            insta::assert_snapshot!(plain_of(&report));
+        }
+
+        #[test]
+        fn gc_json() {
+            let report = GcReport {
+                evicted: vec!["job-a".to_string(), "job-b".to_string()],
+                swept_staging_dirs: vec!["cred-abc".to_string()],
+            };
+            insta::assert_snapshot!(json_of(&report));
+        }
+
+        #[test]
+        fn doctor_plain() {
+            let result = DoctorResult {
+                exit_code: 0,
+                message: "sandy doctor: ok".to_string(),
+            };
+            insta::assert_snapshot!(plain_of(&result));
+        }
+
+        #[test]
+        fn doctor_json() {
+            let result = DoctorResult {
+                exit_code: 2,
+                message: "sandy doctor: refused".to_string(),
+            };
+            insta::assert_snapshot!(json_of(&result));
+        }
+    }
+
     #[test]
     fn json_record_round_trips_to_the_same_record() -> anyhow::Result<()> {
         let record = sample_record("job-a");
-        let json = format_record(&record, OutputFormat::Json).context("format json")?;
+        let json = json_of(&record);
         let parsed: JobRecord = serde_json::from_str(&json).context("parse json record")?;
         assert_eq!(parsed, record, "json output must round-trip to the same record");
         Ok(())
     }
 
     #[test]
-    fn plain_record_names_the_job_and_state() -> anyhow::Result<()> {
-        let plain = format_record(&sample_record("job-a"), OutputFormat::Plain).context("format plain")?;
+    fn plain_record_names_the_job_and_state() {
+        let plain = plain_of(&sample_record("job-a"));
         assert!(plain.contains("job-a"), "plain must name the job id: {plain}");
         assert!(plain.contains("Succeeded"), "plain must name the state: {plain}");
-        Ok(())
     }
 
     /// Collected outputs appear in both formats: a `out: <path>` line in plain, and
@@ -332,14 +502,14 @@ mod tests {
             },
         ];
 
-        let plain = format_envelope(&envelope, OutputFormat::Plain).context("format plain envelope")?;
+        let plain = plain_of(&envelope);
         assert!(plain.contains("out: result/f"), "plain lists the output: {plain}");
         assert!(
             plain.contains("out: result/sub/g"),
             "plain lists the nested output: {plain}"
         );
 
-        let json = format_envelope(&envelope, OutputFormat::Json).context("format json envelope")?;
+        let json = json_of(&envelope);
         let parsed: ResultEnvelope = serde_json::from_str(&json).context("parse json envelope")?;
         assert_eq!(parsed.outputs.len(), 2, "json carries the outputs array");
         Ok(())
@@ -353,13 +523,13 @@ mod tests {
         let mut envelope = sample_envelope("job-a");
         envelope.warnings = vec!["credential \"GH_TOKEN\" revoke failed at teardown".to_string()];
 
-        let plain = format_envelope(&envelope, OutputFormat::Plain).context("format plain envelope")?;
+        let plain = plain_of(&envelope);
         assert!(
             plain.contains("warning: credential \"GH_TOKEN\" revoke failed at teardown"),
             "plain lists the warning: {plain}"
         );
 
-        let json = format_envelope(&envelope, OutputFormat::Json).context("format json envelope")?;
+        let json = json_of(&envelope);
         let parsed: ResultEnvelope = serde_json::from_str(&json).context("parse json envelope")?;
         assert_eq!(parsed.warnings, envelope.warnings, "json carries the warnings array");
         Ok(())
@@ -367,12 +537,12 @@ mod tests {
 
     #[test]
     fn json_records_is_an_array_even_when_empty() -> anyhow::Result<()> {
-        let empty = format_records(&[], OutputFormat::Json).context("format empty json")?;
+        let empty = json_of(&JobRecords(vec![]));
         let parsed: Vec<JobRecord> = serde_json::from_str(&empty).context("parse empty array")?;
         assert!(parsed.is_empty(), "empty ls must serialize to an empty JSON array");
 
-        let two = [sample_record("a"), sample_record("b")];
-        let json = format_records(&two, OutputFormat::Json).context("format two json")?;
+        let two = JobRecords(vec![sample_record("a"), sample_record("b")]);
+        let json = json_of(&two);
         let parsed: Vec<JobRecord> = serde_json::from_str(&json).context("parse two")?;
         assert_eq!(parsed.len(), 2);
         Ok(())
@@ -381,22 +551,21 @@ mod tests {
     #[test]
     fn json_envelope_round_trips() -> anyhow::Result<()> {
         let envelope = sample_envelope("job-a");
-        let json = format_envelope(&envelope, OutputFormat::Json).context("format json envelope")?;
+        let json = json_of(&envelope);
         let parsed: ResultEnvelope = serde_json::from_str(&json).context("parse json envelope")?;
         assert_eq!(parsed, envelope);
         Ok(())
     }
 
     #[test]
-    fn plain_envelope_summarizes_status_and_message() -> anyhow::Result<()> {
-        let plain = format_envelope(&sample_envelope("job-a"), OutputFormat::Plain).context("format plain envelope")?;
+    fn plain_envelope_summarizes_status_and_message() {
+        let plain = plain_of(&sample_envelope("job-a"));
         assert!(plain.contains("job-a"));
         assert!(plain.contains("Failed"), "summary must name the status: {plain}");
         assert!(
             plain.contains("retryable true"),
             "summary must name retryability: {plain}"
         );
-        Ok(())
     }
 
     #[test]
@@ -405,7 +574,7 @@ mod tests {
             evicted: vec!["x".to_string(), "y".to_string()],
             swept_staging_dirs: Vec::new(),
         };
-        let json = format_gc(&report, OutputFormat::Json).context("format gc json")?;
+        let json = json_of(&report);
         let parsed: serde_json::Value = serde_json::from_str(&json).context("parse gc json")?;
         let evicted = parsed
             .get("evicted")
@@ -425,7 +594,7 @@ mod tests {
             evicted: vec!["job-a".to_string()],
             swept_staging_dirs: vec!["cred-deadbeef".to_string()],
         };
-        let json = format_gc(&report, OutputFormat::Json).context("format gc json")?;
+        let json = json_of(&report);
         let parsed: serde_json::Value = serde_json::from_str(&json).context("parse gc json")?;
         let evicted = parsed
             .get("evicted")
@@ -443,12 +612,12 @@ mod tests {
     /// The plain-text "evicted N record(s)" count must count job ids only,
     /// never a swept staging-dir name (#195 follow-up).
     #[test]
-    fn gc_plain_text_evicted_count_excludes_swept_staging_dirs() -> anyhow::Result<()> {
+    fn gc_plain_text_evicted_count_excludes_swept_staging_dirs() {
         let report = GcReport {
             evicted: Vec::new(),
             swept_staging_dirs: vec!["cred-deadbeef".to_string()],
         };
-        let plain = format_gc(&report, OutputFormat::Plain).context("format gc plain")?;
+        let plain = plain_of(&report);
         assert!(
             plain.contains("evicted 0 record(s)"),
             "a swept staging dir must not inflate the evicted-record count: {plain}"
@@ -457,12 +626,15 @@ mod tests {
             plain.contains("swept 1 staging dir(s)"),
             "the swept-dir count must be reported separately: {plain}"
         );
-        Ok(())
     }
 
     #[test]
     fn doctor_json_carries_exit_code_and_message() -> anyhow::Result<()> {
-        let json = format_doctor(2, "refusing to start", OutputFormat::Json).context("format doctor json")?;
+        let result = DoctorResult {
+            exit_code: 2,
+            message: "refusing to start".to_string(),
+        };
+        let json = json_of(&result);
         let parsed: serde_json::Value = serde_json::from_str(&json).context("parse doctor json")?;
         assert_eq!(parsed.get("exit_code").and_then(serde_json::Value::as_i64), Some(2));
         assert_eq!(
@@ -470,6 +642,144 @@ mod tests {
             Some("refusing to start")
         );
         Ok(())
+    }
+
+    #[test]
+    fn doctor_round_trips_through_json() -> anyhow::Result<()> {
+        let result = DoctorResult {
+            exit_code: 0,
+            message: "sandy doctor: ok".to_string(),
+        };
+        let json = json_of(&result);
+        let parsed: DoctorResult = serde_json::from_str(&json).context("parse doctor json")?;
+        assert_eq!(parsed, result);
+        Ok(())
+    }
+
+    /// The generic `emit_to`/`emit_stream_to` machinery itself (the new
+    /// deliverable, not a migration of an existing `format_*` function):
+    /// a single value, the empty-plain-prints-nothing convention, and NDJSON
+    /// streaming with a per-line flush.
+    mod emit_mechanism {
+        use serde::{Deserialize, Serialize};
+
+        use super::{
+            super::{emit_stream_to, emit_to},
+            OutputFormat, Render,
+        };
+
+        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+        #[serde(tag = "type")]
+        enum TestStreamEvent {
+            /// Models the attach data plane's real output-delivery shape
+            /// (`sandy_fabric_local::link::LinkFrame`'s data variants) so the
+            /// follow-up that wires a real stream through this reuses this
+            /// shape rather than redesigning it.
+            Output { line: String },
+            /// Models `LinkFrame::Exit { code }` — the terminal event every
+            /// stream ends with.
+            Exit { code: i32 },
+        }
+
+        impl Render for TestStreamEvent {
+            fn render_plain(&self, out: &mut dyn std::io::Write) -> std::io::Result<()> {
+                match self {
+                    TestStreamEvent::Output { line } => write!(out, "{line}"),
+                    TestStreamEvent::Exit { code } => write!(out, "(exited {code})"),
+                }
+            }
+        }
+
+        /// A `Write` that snapshots its buffer's content every time `flush`
+        /// is called, so a test can assert what was visible to a reader at
+        /// each flush point, not just the final concatenated output.
+        #[derive(Default)]
+        struct FlushCapture {
+            buf: Vec<u8>,
+            at_each_flush: Vec<Vec<u8>>,
+        }
+
+        impl std::io::Write for FlushCapture {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.buf.extend_from_slice(data);
+                Ok(data.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.at_each_flush.push(self.buf.clone());
+                Ok(())
+            }
+        }
+
+        #[test]
+        fn emit_to_plain_skips_an_empty_rendering() {
+            let empty = super::JobRecords(vec![]);
+            let mut buf = Vec::new();
+            emit_to(&empty, OutputFormat::Plain, &mut buf).expect("emit_to");
+            assert!(
+                buf.is_empty(),
+                "an empty plain rendering must print nothing, not a blank line"
+            );
+        }
+
+        #[test]
+        fn emit_to_json_always_prints_even_when_empty() {
+            let empty = super::JobRecords(vec![]);
+            let mut buf = Vec::new();
+            emit_to(&empty, OutputFormat::Json, &mut buf).expect("emit_to");
+            assert_eq!(String::from_utf8(buf).unwrap().trim(), "[]");
+        }
+
+        #[test]
+        fn emit_stream_writes_one_tagged_ndjson_object_per_line_flushed_after_each() {
+            let events = vec![
+                TestStreamEvent::Output {
+                    line: "hello".to_string(),
+                },
+                TestStreamEvent::Output {
+                    line: "world".to_string(),
+                },
+                TestStreamEvent::Exit { code: 0 },
+            ];
+            let mut out = FlushCapture::default();
+            emit_stream_to(events.clone(), OutputFormat::Json, &mut out).expect("emit_stream_to");
+
+            assert_eq!(out.at_each_flush.len(), 3, "one flush per item");
+            let lines: Vec<String> = String::from_utf8(out.buf.clone())
+                .unwrap()
+                .lines()
+                .map(str::to_string)
+                .collect();
+            assert_eq!(lines.len(), 3, "one NDJSON line per item");
+
+            for (line, event) in lines.iter().zip(&events) {
+                let parsed: TestStreamEvent =
+                    serde_json::from_str(line).unwrap_or_else(|e| panic!("line did not parse alone: {line:?}: {e}"));
+                assert_eq!(&parsed, event, "line {line:?} must decode back to its event");
+                assert!(line.starts_with("{\"type\":"), "each line must be tagged: {line}");
+            }
+            assert!(
+                matches!(events.last(), Some(TestStreamEvent::Exit { .. })),
+                "the stream's last event must be the terminal object"
+            );
+
+            // Flushing happens after each item is fully written: the first
+            // captured buffer must already contain the first line in full.
+            let first_flush = String::from_utf8(out.at_each_flush[0].clone()).unwrap();
+            assert_eq!(first_flush.trim_end(), lines[0]);
+        }
+
+        #[test]
+        fn emit_stream_plain_renders_one_human_line_per_item_as_they_arrive() {
+            let events = vec![
+                TestStreamEvent::Output { line: "hi".to_string() },
+                TestStreamEvent::Exit { code: 1 },
+            ];
+            let mut out = Vec::new();
+            emit_stream_to(events, OutputFormat::Plain, &mut out).expect("emit_stream_to");
+            let text = String::from_utf8(out).unwrap();
+            assert_eq!(text, "hi\n(exited 1)\n");
+        }
     }
 
     #[test]

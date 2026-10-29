@@ -1,0 +1,5 @@
+---
+source: crates/sandy-cli/src/output.rs
+expression: "format_doctor(0, \"sandy doctor: ok\", OutputFormat::Plain)?"
+---
+sandy doctor: ok

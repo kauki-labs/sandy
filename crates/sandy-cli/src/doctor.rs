@@ -41,7 +41,7 @@ pub fn classify_fs(fstype: &str) -> FsVerdict {
 }
 
 /// The outcome of a `sandy doctor` run: a process exit code and a human-readable message.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DoctorResult {
     /// The process exit code sandy should use: `0` ok, `2` invalid env (INV-11).
     pub exit_code: i32,

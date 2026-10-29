@@ -1,0 +1,5 @@
+---
+source: crates/sandy-cli/src/output.rs
+expression: "format_record(&sample_record(\"job-a\"), OutputFormat::Plain)?"
+---
+job-a                                 Succeeded
