@@ -342,8 +342,8 @@ testPkgs.testers.runNixOSTest {
         f"SystemCallFilter or NoNewPrivileges — journal:\n{probe_output}"
     )
     assert "qemu-kvm-ok" in probe_output, (
-        f"qemu could not open /dev/kvm inside the hardened unit — PrivateDevices/DeviceAllow/the kvm group "
-        f"may hide it, so no KVM guest can run under this unit — journal:\n{probe_output}"
+        f"qemu could not open /dev/kvm in a job scope started from the unit's user — the nested guest may lack "
+        f"KVM (this probe does not exercise the unit's own PrivateDevices/DeviceAllow) — journal:\n{probe_output}"
     )
 
     # #300(b) smoke check: with StopIdleSessionSec=2 set on this node, wait
