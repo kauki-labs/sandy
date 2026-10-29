@@ -348,7 +348,7 @@ impl HostRegistry {
     /// then refuse anyway. The caller runs the job locally when this returns
     /// `None`.
     ///
-    /// `require_local` (#496, sandyd.md decision 20) additionally filters on
+    /// `require_local` (#496, sandyd.md decision 21) additionally filters on
     /// the host's declared `shares_submitter_filesystem` — set it when the
     /// Submit carries any path field (`inputs`/`outputs`/`secrets`), since a
     /// non-local host cannot read the submitter's files.

@@ -88,7 +88,7 @@ fn placement_required_error(
     })
 }
 
-/// Whether `submit` names any path field (#496, decision 20) — `inputs`,
+/// Whether `submit` names any path field (#496, decision 21) — `inputs`,
 /// `outputs`, or `secrets`. Non-empty here means placement must land on a
 /// host-executor that declared `shares_submitter_filesystem`; a path is only
 /// ever meaningful on the filesystem the submitter itself is on.
@@ -378,7 +378,7 @@ pub async fn handle(
             // `None` and no remote placement is reachable at all, regardless
             // of what's registered) — an operator misreads that as "go
             // register a host" when the actual fix is on this box.
-            // #496, decision 20: a path field is only ever meaningful on the
+            // #496, decision 21: a path field is only ever meaningful on the
             // submitter's own filesystem — require a host-executor that
             // declared `shares_submitter_filesystem`, same fail-closed
             // treatment as an Untrusted or Vm requirement with no qualifying

@@ -1668,7 +1668,7 @@ discipline decision 12 already applies to `host_id` applies here to the
 transport's assumed environment.
 as a prerequisite for #480's field parity.
 
-## 20. "Local dispatch" for path fields (#496): a declared locality flag at Register, not a new in-process runner
+## 21. "Local dispatch" for path fields (#496): a declared locality flag at Register, not a new in-process runner
 
 **Status:** accepted.
 
