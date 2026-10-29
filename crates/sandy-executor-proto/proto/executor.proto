@@ -111,6 +111,16 @@ message Capabilities {
   // enforcement, so it must never be offered as a backend for an UNTRUSTED
   // job (#269: "stage 1 accepts trusted jobs only").
   repeated IsolationClass supported_isolation_classes = 4;
+  // Whether this host-executor shares the submitter's own filesystem (#496,
+  // sandyd.md decision 20) — set by the host-executor's own startup
+  // configuration (`SANDY_HOST_SHARES_SUBMITTER_FS`), never auto-detected
+  // from the mesh peer address: a loopback IP does not imply a shared
+  // filesystem (a co-located container can have its own mount namespace),
+  // and a genuinely remote host can tunnel to appear local. Default false —
+  // an undeclared host is never assumed local. The orchestrator only places
+  // a Dispatch carrying path fields (`inputs`/`outputs`/`secrets`) on a host
+  // that declares this true.
+  bool shares_submitter_filesystem = 5;
 }
 
 // Declares this host's identity and what it can run.
@@ -161,6 +171,42 @@ message Dispatch {
   // anything (defense in depth — never trust the orchestrator's placement
   // decision alone for a fail-closed security gate).
   IsolationClass required_isolation_class = 7;
+  // Path fields (#496, decision 20), forwarded verbatim from
+  // `SubmitRequest`. The orchestrator must not send any of these non-empty
+  // unless `backend`'s host declared `shares_submitter_filesystem`; the
+  // executor stages them via the same code `sandy run`'s direct path uses
+  // (`stage_inputs`/`prepare_outputs`), never re-deriving locality itself —
+  // it trusts the orchestrator's placement for this field the same way it
+  // already does for `required_isolation_class` above, since both are
+  // defense-in-depth re-checked at the backend (isolation class) or made
+  // safe by construction (a non-local host that was never sent these fields
+  // has nothing to stage).
+  repeated Input inputs = 8;
+  repeated Output outputs = 9;
+  repeated SecretRef secrets = 10;
+}
+
+// Mirrors `sandy.control.v1.Input` (sandy-control-proto) — kept as a
+// separate message, not a shared import, matching this crate's existing
+// stance of no cross-proto-package dependency between the control RPC and
+// the orchestrator<->host-executor contract (see `sandy.control.v1.IsolationClass`'s
+// own doc on why it duplicates rather than imports).
+message Input {
+  string host = 1;
+  string name = 2;
+  optional string guest_path = 3;
+}
+
+// Mirrors `sandy.control.v1.Output`.
+message Output {
+  optional string name = 1;
+  string dest = 2;
+}
+
+// Mirrors `sandy.control.v1.SecretRef`.
+message SecretRef {
+  string name = 1;
+  string host_path = 2;
 }
 
 // Orchestrator -> host-executor (#340): the orchestrator's own attach-relay

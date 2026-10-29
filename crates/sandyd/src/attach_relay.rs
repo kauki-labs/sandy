@@ -1256,6 +1256,7 @@ mod tests {
             arch: sandy_executor_proto::Arch::X8664.into(),
             attestation: false,
             supported_isolation_classes: vec![sandy_executor_proto::IsolationClass::Trusted.into()],
+            shares_submitter_filesystem: false,
         }
     }
 

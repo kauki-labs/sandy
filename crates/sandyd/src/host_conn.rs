@@ -778,6 +778,7 @@ mod tests {
             arch: Arch::X8664.into(),
             attestation: false,
             supported_isolation_classes: vec![IsolationClass::Trusted.into()],
+            shares_submitter_filesystem: false,
         }
     }
 
@@ -829,6 +830,9 @@ mod tests {
             link_token: vec![0u8; 32],
             forward_back: "100.64.0.1:9000".to_owned(),
             required_isolation_class: IsolationClass::Trusted.into(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            secrets: Vec::new(),
         };
         registry.send_dispatch("ws01", dispatch.clone()).await?;
 
@@ -899,7 +903,7 @@ mod tests {
         assert!(matches!(response.op, Some(orchestrator_message::Op::Registered(_))));
 
         let candidate = registry
-            .pick_host_for(IsolationClass::Trusted.into(), SandboxKind::Process.into())
+            .pick_host_for(IsolationClass::Trusted.into(), SandboxKind::Process.into(), false)
             .expect("a host that declared Trusted over the real wire must be a Trusted placement candidate");
         assert_eq!(candidate.host_id, "ws01");
 
@@ -1253,6 +1257,9 @@ mod tests {
             link_token: vec![0u8; 32],
             forward_back: "100.64.0.1:9000".to_owned(),
             required_isolation_class: IsolationClass::Trusted.into(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            secrets: Vec::new(),
         }
     }
 

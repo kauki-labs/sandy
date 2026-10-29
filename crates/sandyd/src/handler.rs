@@ -13,7 +13,8 @@ use std::{net::SocketAddr, sync::Arc};
 
 use sandy_control_proto::{
     AttachResponse, CancelResponse, ControlError, ControlRequest, ControlResponse, JobStatus,
-    JobSummary as WireJobSummary, ListResponse, StatusResponse, SubmitResponse, control_request, control_response,
+    JobSummary as WireJobSummary, ListResponse, StatusResponse, SubmitRequest, SubmitResponse, control_request,
+    control_response,
 };
 use sandy_executor_proto::{Dispatch, IsolationClass, SandboxKind};
 use sandy_fabric::{
@@ -75,14 +76,67 @@ fn required_sandbox_kind_for(manifest_encoding: &str) -> SandboxKind {
 fn placement_required_error(
     required_isolation_class: IsolationClass,
     required_sandbox_kind: SandboxKind,
+    require_local: bool,
     placed: bool,
     reason: &str,
 ) -> Option<ControlError> {
-    let placement_mandatory =
-        required_sandbox_kind == SandboxKind::Vm || required_isolation_class == IsolationClass::Untrusted;
+    let placement_mandatory = required_sandbox_kind == SandboxKind::Vm
+        || required_isolation_class == IsolationClass::Untrusted
+        || require_local;
     (placement_mandatory && !placed).then(|| ControlError {
         message: reason.to_owned(),
     })
+}
+
+/// Whether `submit` names any path field (#496, decision 20) — `inputs`,
+/// `outputs`, or `secrets`. Non-empty here means placement must land on a
+/// host-executor that declared `shares_submitter_filesystem`; a path is only
+/// ever meaningful on the filesystem the submitter itself is on.
+fn submit_requires_local_dispatch(submit: &SubmitRequest) -> bool {
+    !submit.inputs.is_empty() || !submit.outputs.is_empty() || !submit.secrets.is_empty()
+}
+
+/// Convert `SubmitRequest`'s client-facing path fields (`sandy_control_proto`)
+/// into their `Dispatch` wire shape (`sandy_executor_proto`) — two structurally
+/// identical but separately-defined proto messages (this crate's existing
+/// stance of no cross-proto-package dependency between the two contracts,
+/// matching `IsolationClass`'s own duplication). A pure field-by-field copy,
+/// never touching the paths' bytes — the daemon forwards names, it does not
+/// read them (that's the host-executor's job, once placed on a host that
+/// declared it shares the submitter's filesystem).
+fn to_dispatch_path_fields(
+    submit: &SubmitRequest,
+) -> (
+    Vec<sandy_executor_proto::Input>,
+    Vec<sandy_executor_proto::Output>,
+    Vec<sandy_executor_proto::SecretRef>,
+) {
+    let inputs = submit
+        .inputs
+        .iter()
+        .map(|i| sandy_executor_proto::Input {
+            host: i.host.clone(),
+            name: i.name.clone(),
+            guest_path: i.guest_path.clone(),
+        })
+        .collect();
+    let outputs = submit
+        .outputs
+        .iter()
+        .map(|o| sandy_executor_proto::Output {
+            name: o.name.clone(),
+            dest: o.dest.clone(),
+        })
+        .collect();
+    let secrets = submit
+        .secrets
+        .iter()
+        .map(|s| sandy_executor_proto::SecretRef {
+            name: s.name.clone(),
+            host_path: s.host_path.clone(),
+        })
+        .collect();
+    (inputs, outputs, secrets)
 }
 
 /// Parse `SubmitRequest.required_isolation_class`'s wire value (the
@@ -308,20 +362,36 @@ pub async fn handle(
             // `None` and no remote placement is reachable at all, regardless
             // of what's registered) — an operator misreads that as "go
             // register a host" when the actual fix is on this box.
+            // #496, decision 20: a path field is only ever meaningful on the
+            // submitter's own filesystem — require a host-executor that
+            // declared `shares_submitter_filesystem`, same fail-closed
+            // treatment as an Untrusted or Vm requirement with no qualifying
+            // host (never a silent `Pending` forever, never a silent place-
+            // anywhere).
+            let require_local = submit_requires_local_dispatch(&submit);
+            let (path_inputs, path_outputs, path_secrets) = to_dispatch_path_fields(&submit);
             let placeable = if forward_back_addr.is_none() {
                 false
             } else {
                 host_registry
-                    .pick_host_for(required_isolation_class.into(), required_sandbox_kind.into())
+                    .pick_host_for(
+                        required_isolation_class.into(),
+                        required_sandbox_kind.into(),
+                        require_local,
+                    )
                     .is_some()
             };
             if let Some(control_error) = placement_required_error(
                 required_isolation_class,
                 required_sandbox_kind,
+                require_local,
                 placeable,
                 if forward_back_addr.is_none() {
                     "this orchestrator has no agent-link listen address configured (SANDY_MESH_AGENT_LINK_LISTEN is \
                      unset) — no remote placement is reachable at all, regardless of what hosts are registered"
+                } else if require_local {
+                    "no registered host declares shares_submitter_filesystem; this Submit names an input, output, or \
+                     secret path, which is only ever valid on the submitter's own filesystem"
                 } else {
                     "no registered host declares the required isolation class and sandbox kind; this job cannot be \
                      placed (this daemon has no local fallback for a Vm-backend or Untrusted-class job)"
@@ -395,8 +465,11 @@ pub async fn handle(
             // `send_dispatch` call happens after, once the job is durably
             // recorded.
             let dispatch_plan = forward_back_addr.and_then(|forward_back| {
-                let candidate =
-                    host_registry.pick_host_for(required_isolation_class.into(), required_sandbox_kind.into())?;
+                let candidate = host_registry.pick_host_for(
+                    required_isolation_class.into(),
+                    required_sandbox_kind.into(),
+                    require_local,
+                )?;
                 match RemoteLink::new(candidate.peer_ip) {
                     Ok(link) => {
                         let link_token = link.token().as_bytes().to_vec();
@@ -416,6 +489,16 @@ pub async fn handle(
                             link_token,
                             forward_back: forward_back.to_string(),
                             required_isolation_class: required_isolation_class.into(),
+                            // Safe to forward unconditionally (#496): `candidate`
+                            // only exists because `pick_host_for` was called with
+                            // `require_local`, which already filtered on
+                            // `shares_submitter_filesystem` for a Submit that
+                            // actually carries any of these — a non-local pick
+                            // only ever happens when all three were empty to
+                            // begin with.
+                            inputs: path_inputs.clone(),
+                            outputs: path_outputs.clone(),
+                            secrets: path_secrets.clone(),
                         };
                         Some((candidate.host_id, candidate.registration, dispatch))
                     }
@@ -447,9 +530,15 @@ pub async fn handle(
             if let Some(control_error) = placement_required_error(
                 required_isolation_class,
                 required_sandbox_kind,
+                require_local,
                 dispatch_plan.is_some(),
-                "no registered host could be bound for this job's required isolation class and sandbox kind; it \
-                 cannot be placed (this daemon has no local fallback for a Vm-backend or Untrusted-class job)",
+                if require_local {
+                    "no registered host declaring shares_submitter_filesystem could be bound for this job's input, \
+                     output, or secret path"
+                } else {
+                    "no registered host could be bound for this job's required isolation class and sandbox kind; it \
+                     cannot be placed (this daemon has no local fallback for a Vm-backend or Untrusted-class job)"
+                },
             ) {
                 return Ok(ControlResponse {
                     request_id: request.request_id,
@@ -874,6 +963,9 @@ mod tests {
                     .map(|c| encode_cap(c).expect("encode cap"))
                     .collect(),
                 required_isolation_class: sandy_control_proto::IsolationClass::Trusted.into(),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                secrets: Vec::new(),
             }),
         )
     }
@@ -927,6 +1019,9 @@ mod tests {
                 manifest_encoding: "test/v1".to_owned(),
                 submitter_caps: Vec::new(),
                 required_isolation_class: sandy_control_proto::IsolationClass::Trusted.into(),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                secrets: Vec::new(),
             }),
         )
     }
@@ -1855,6 +1950,9 @@ mod tests {
                 manifest_encoding: "application/octet-stream".to_owned(),
                 submitter_caps: vec![encode_cap(&submitter_cap)?],
                 required_isolation_class: sandy_control_proto::IsolationClass::Trusted.into(),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                secrets: Vec::new(),
             }),
         );
 
@@ -1900,6 +1998,9 @@ mod tests {
                 manifest_encoding: "test/v1".to_owned(),
                 submitter_caps: Vec::new(),
                 required_isolation_class: sandy_control_proto::IsolationClass::Trusted.into(),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                secrets: Vec::new(),
             }),
         );
 
@@ -1942,6 +2043,9 @@ mod tests {
                 manifest_encoding: "test/v1".to_owned(),
                 submitter_caps: Vec::new(),
                 required_isolation_class: sandy_control_proto::IsolationClass::Trusted.into(),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                secrets: Vec::new(),
             }),
         );
 
@@ -1962,6 +2066,7 @@ mod tests {
             arch: sandy_executor_proto::Arch::X8664.into(),
             attestation: false,
             supported_isolation_classes: vec![IsolationClass::Trusted.into()],
+            shares_submitter_filesystem: false,
         }
     }
 
@@ -2336,6 +2441,7 @@ mod tests {
             arch: sandy_executor_proto::Arch::X8664.into(),
             attestation: false,
             supported_isolation_classes: vec![IsolationClass::Untrusted.into()],
+            shares_submitter_filesystem: false,
         };
         let mut dispatch_rx = register_test_host(&host_registry, "ws01", peer_ip, untrusted_only);
 
@@ -2523,6 +2629,9 @@ mod tests {
                 manifest_encoding: "flake/v1".to_owned(),
                 submitter_caps: Vec::new(),
                 required_isolation_class: sandy_control_proto::IsolationClass::Trusted.into(),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                secrets: Vec::new(),
             }),
         )
     }
@@ -2533,6 +2642,7 @@ mod tests {
             arch: sandy_executor_proto::Arch::X8664.into(),
             attestation: false,
             supported_isolation_classes: vec![IsolationClass::Trusted.into()],
+            shares_submitter_filesystem: false,
         }
     }
 
@@ -2565,23 +2675,30 @@ mod tests {
     #[test]
     fn placement_required_error_refuses_an_unplaced_vm_or_untrusted_requirement() {
         assert!(
-            placement_required_error(IsolationClass::Trusted, SandboxKind::Vm, false, "unplaced").is_some(),
+            placement_required_error(IsolationClass::Trusted, SandboxKind::Vm, false, false, "unplaced").is_some(),
             "a Vm job with no placement must be refused"
         );
         assert!(
-            placement_required_error(IsolationClass::Trusted, SandboxKind::Vm, true, "unplaced").is_none(),
+            placement_required_error(IsolationClass::Trusted, SandboxKind::Vm, false, true, "unplaced").is_none(),
             "a Vm job that IS placed must not be refused"
         );
         assert!(
-            placement_required_error(IsolationClass::Trusted, SandboxKind::Process, false, "unplaced").is_none(),
+            placement_required_error(IsolationClass::Trusted, SandboxKind::Process, false, false, "unplaced").is_none(),
             "an unplaced Trusted+Process job keeps its existing silent local-fallback behavior"
         );
         assert!(
-            placement_required_error(IsolationClass::Untrusted, SandboxKind::Process, false, "unplaced").is_some(),
+            placement_required_error(
+                IsolationClass::Untrusted,
+                SandboxKind::Process,
+                false,
+                false,
+                "unplaced"
+            )
+            .is_some(),
             "an unplaced Untrusted job must be refused even when its sandbox kind alone wouldn't require placement"
         );
         assert!(
-            placement_required_error(IsolationClass::Untrusted, SandboxKind::Vm, true, "unplaced").is_none(),
+            placement_required_error(IsolationClass::Untrusted, SandboxKind::Vm, false, true, "unplaced").is_none(),
             "an Untrusted job that IS placed must not be refused"
         );
     }
@@ -2710,6 +2827,9 @@ mod tests {
                 manifest_encoding: "flake/v1".to_owned(),
                 submitter_caps: Vec::new(),
                 required_isolation_class: sandy_control_proto::IsolationClass::Untrusted.into(),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                secrets: Vec::new(),
             }),
         )
     }
@@ -2722,6 +2842,9 @@ mod tests {
                 manifest_encoding: "test/v1".to_owned(),
                 submitter_caps: Vec::new(),
                 required_isolation_class: sandy_control_proto::IsolationClass::Untrusted.into(),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                secrets: Vec::new(),
             }),
         )
     }
@@ -2734,6 +2857,9 @@ mod tests {
                 manifest_encoding: "test/v1".to_owned(),
                 submitter_caps: Vec::new(),
                 required_isolation_class: sandy_control_proto::IsolationClass::Unspecified.into(),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                secrets: Vec::new(),
             }),
         )
     }
@@ -2744,6 +2870,7 @@ mod tests {
             arch: sandy_executor_proto::Arch::X8664.into(),
             attestation: false,
             supported_isolation_classes: vec![IsolationClass::Trusted.into(), IsolationClass::Untrusted.into()],
+            shares_submitter_filesystem: false,
         }
     }
 
@@ -2933,6 +3060,9 @@ mod tests {
                 manifest_encoding: "argv/v1".to_owned(),
                 submitter_caps: Vec::new(),
                 required_isolation_class: sandy_control_proto::IsolationClass::Trusted.into(),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                secrets: Vec::new(),
             }),
         )
     }

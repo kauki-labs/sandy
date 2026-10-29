@@ -33,8 +33,8 @@ pub mod v1 {
 /// direct `prost` dependency just for that bound.
 pub use prost::Message;
 pub use v1::{
-    Arch, AttachStateChanged, Cancel, Capabilities, Dispatch, HostExecutorMessage, IsolationClass, JobResult,
-    OrchestratorMessage, Register, RegisterRefused, Registered, SandboxKind, host_executor_message,
+    Arch, AttachStateChanged, Cancel, Capabilities, Dispatch, HostExecutorMessage, Input, IsolationClass, JobResult,
+    OrchestratorMessage, Output, Register, RegisterRefused, Registered, SandboxKind, SecretRef, host_executor_message,
     orchestrator_message,
 };
 
@@ -55,6 +55,12 @@ impl std::fmt::Debug for Dispatch {
             )
             .field("forward_back", &self.forward_back)
             .field("required_isolation_class", &self.required_isolation_class)
+            .field("inputs", &self.inputs)
+            .field("outputs", &self.outputs)
+            .field(
+                "secrets",
+                &format_args!("<{} secret name(s), paths redacted>", self.secrets.len()),
+            )
             .finish()
     }
 }
@@ -206,6 +212,9 @@ mod tests {
             link_token: marker.to_vec(),
             forward_back: "100.64.0.1:9000".to_owned(),
             required_isolation_class: IsolationClass::Trusted.into(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            secrets: Vec::new(),
         };
         let rendered = format!("{dispatch:?}");
 
@@ -240,6 +249,7 @@ mod tests {
                     arch: Arch::X8664.into(),
                     attestation: false,
                     supported_isolation_classes: vec![IsolationClass::Trusted.into()],
+                    shares_submitter_filesystem: false,
                 }),
             })),
         };
@@ -308,6 +318,9 @@ mod tests {
                     link_token: vec![0u8; 32],
                     forward_back: "100.64.0.1:9000".to_owned(),
                     required_isolation_class: IsolationClass::Trusted.into(),
+                    inputs: Vec::new(),
+                    outputs: Vec::new(),
+                    secrets: Vec::new(),
                 })),
             },
         )

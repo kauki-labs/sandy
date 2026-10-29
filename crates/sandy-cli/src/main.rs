@@ -265,6 +265,22 @@ enum DaemonOp {
         /// here than let the combination reach the wire first.
         #[arg(long = "cap-file", conflicts_with = "flake")]
         cap_files: Vec<String>,
+        /// `--input HOST:NAME` (repeatable; manifest-parity #496). Same
+        /// grammar as `sandy run`'s own `--input`. Valid with either
+        /// `manifest` or `--flake`: the path is carried in `SubmitRequest`,
+        /// never inside the manifest (decision 20) — `sandyd` refuses the
+        /// whole Submit unless a registered host declared
+        /// `shares_submitter_filesystem`.
+        #[arg(long = "input")]
+        inputs: Vec<String>,
+        /// `--out [NAME:]DEST` (repeatable; manifest-parity #496). Same
+        /// grammar as `sandy run`'s own `--out`.
+        #[arg(long = "out")]
+        outputs: Vec<String>,
+        /// `--secret NAME=@PATH` (repeatable; manifest-parity #496). Same
+        /// grammar as `sandy run`'s own `--secret`.
+        #[arg(long = "secret")]
+        secrets: Vec<String>,
     },
     /// Cancel a submitted job.
     Cancel {
@@ -740,6 +756,86 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
         Vec::new()
     };
 
+    // Same pre-connection bar as `--cap-file`/`--env` above (manifest-parity
+    // #496): a malformed `--input`/`--out`/`--secret` value, or two inputs
+    // colliding on the same staged name, is a pure client-side input error.
+    let (submit_inputs, submit_outputs, submit_secrets) = if let DaemonOp::Submit {
+        inputs,
+        outputs,
+        secrets,
+        ..
+    } = &op
+    {
+        let parsed_inputs = match inputs
+            .iter()
+            .enumerate()
+            .map(|(i, raw)| sandy_cli::plan::parse_input(raw, i))
+            .collect::<Result<Vec<_>, _>>()
+            .and_then(|parsed| {
+                sandy_cli::plan::reject_duplicate_input_names(&parsed)?;
+                Ok(parsed)
+            }) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                eprintln!("sandy: {e}");
+                return ProcessExit::InvalidPlan.code();
+            }
+        };
+        let parsed_outputs = match outputs
+            .iter()
+            .map(|raw| sandy_cli::plan::parse_output(raw))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                eprintln!("sandy: {e}");
+                return ProcessExit::InvalidPlan.code();
+            }
+        };
+        let parsed_secrets = match secrets
+            .iter()
+            .map(|raw| sandy_cli::plan::parse_secret(raw))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                eprintln!("sandy: {e}");
+                return ProcessExit::InvalidPlan.code();
+            }
+        };
+        (
+            parsed_inputs
+                .into_iter()
+                .map(|i| sandy_control_proto::Input {
+                    host: i.host.display().to_string(),
+                    name: i.name,
+                    guest_path: i.guest_path.map(|p| p.display().to_string()),
+                })
+                .collect(),
+            parsed_outputs
+                .into_iter()
+                .map(|o| sandy_control_proto::Output {
+                    name: o.name,
+                    dest: o.dest.display().to_string(),
+                })
+                .collect(),
+            parsed_secrets
+                .into_iter()
+                .map(|s| {
+                    let sandy::SecretSource::File(path) = s.source else {
+                        unreachable!("parse_secret only ever produces a File source")
+                    };
+                    sandy_control_proto::SecretRef {
+                        name: s.name,
+                        host_path: path.display().to_string(),
+                    }
+                })
+                .collect(),
+        )
+    } else {
+        (Vec::new(), Vec::new(), Vec::new())
+    };
+
     let socket = match daemon_socket_path() {
         Ok(socket) => socket,
         Err(e) => {
@@ -786,6 +882,9 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
             timeout,
             command,
             cap_files: _,
+            inputs: _,
+            outputs: _,
+            secrets: _,
         } => {
             // clap's `required_unless_present = "flake"`/`conflicts_with`
             // pairs above guarantee exactly one of `manifest` or `flake` is
@@ -831,6 +930,9 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
                 manifest_encoding: encoding,
                 submitter_caps,
                 required_isolation_class: sandy_control_proto::IsolationClass::from(isolation_class).into(),
+                inputs: submit_inputs,
+                outputs: submit_outputs,
+                secrets: submit_secrets,
             })
         }
         DaemonOp::Cancel { job_id } => control_request::Op::Cancel(CancelRequest { job_id }),
