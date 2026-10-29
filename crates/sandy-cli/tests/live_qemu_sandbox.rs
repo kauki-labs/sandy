@@ -171,10 +171,10 @@ fn a_virtiofsd_runs_under_a_seccomp_filter() -> anyhow::Result<()> {
         .context("spawn sandy run")?;
 
     // A filter is inherited, so a sandy that already runs under seccomp would make virtiofsd read mode 2 without
-    // any filter of its own. Refuse, and do not leave the VM run behind (dropping a `Child` does not stop it).
+    // any filter of its own. Refuse, after letting the run finish so sandy tears its VM down itself (killing sandy
+    // would orphan its qemu and virtiofsd; dropping a `Child` does not stop it).
     let parent_seccomp = seccomp_mode(sandy.id());
     if parent_seccomp.as_ref().ok() != Some(&0) {
-        let _ = sandy.kill();
         let _ = sandy.wait();
         anyhow::bail!("refusing: the sandy process already runs under seccomp ({parent_seccomp:?})");
     }

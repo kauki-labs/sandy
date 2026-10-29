@@ -286,6 +286,13 @@ testPkgs.testers.runNixOSTest {
     # includes --unshare-cgroup, which would make /proc/self/cgroup read
     # "0::/" from inside the new namespace and wrongly fail this check
     # even when the real cgroup placement is correct (sandy-73, #299).
+    cgroup_line = next(line for line in probe_output.splitlines() if line.startswith("job-cgroup: "))
+    assert "user@" in cgroup_line and "session-" not in cgroup_line, (
+        f"the probed job did not run under user@.service's cgroup as "
+        f"expected: {cgroup_line}"
+    )
+
+    # #523, #392: the real virtiofsd and qemu launches also start inside the hardened unit.
     assert "virtiofsd-none-ok" in probe_output, (
         f"virtiofsd (as the qemu transport launches it) did not start inside the hardened unit — a hardening "
         f"directive may have broken the qemu share daemon — journal:\n{probe_output}"
@@ -293,11 +300,6 @@ testPkgs.testers.runNixOSTest {
     assert "qemu-sandbox-ok" in probe_output, (
         f"qemu -sandbox did not start inside the hardened unit — its seccomp filter may clash with the unit's "
         f"SystemCallFilter or NoNewPrivileges — journal:\n{probe_output}"
-    )
-    cgroup_line = next(line for line in probe_output.splitlines() if line.startswith("job-cgroup: "))
-    assert "user@" in cgroup_line and "session-" not in cgroup_line, (
-        f"the probed job did not run under user@.service's cgroup as "
-        f"expected: {cgroup_line}"
     )
 
     # #300(b) smoke check: with StopIdleSessionSec=2 set on this node, wait

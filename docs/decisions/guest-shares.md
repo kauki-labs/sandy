@@ -70,17 +70,21 @@ executor nixosTest:
 - `namespace`: starts as a plain user; the serving child gets new mount, user and pid
   namespaces and keeps seccomp. It does **not** start under `sandy-executor.service`'s
   hardening: the kernel logs `VFS: Mount too revealing` and virtiofsd fails with
-  `Error entering sandbox: MountProc(... Operation not permitted)`. The probe is in
-  `nix/tests/sandy-executor-vm.nix` and ran under the unit's exact `serviceConfig`.
-- `none`: starts in both. The daemon still runs under virtiofsd's own default seccomp
-  filter (`Seccomp: 2`), in the host's mount, user and pid namespaces.
+  `Error entering sandbox: MountProc(... Operation not permitted)`. Measured by hand
+  with the same probe that `nix/tests/sandy-executor-vm.nix` runs for `none` today (the
+  unit's exact `serviceConfig`); nothing in the repo reproduces the `namespace` run.
+- `none`: starts in both (under the unit only the socket appearing was checked). As a
+  plain user the daemon runs under virtiofsd's own default seccomp filter
+  (`Seccomp: 2`, read on ws01), in the host's mount, user and pid namespaces. Seccomp
+  under the unit was not read, and `chroot` was never observed running.
 
 **Decision.** The qemu transport launches each `virtiofsd` with `--sandbox=none`.
 
 **Consequences.** The daemon has no namespace confinement of its own. It does have its
-default seccomp filter (the live gate K22 guards that), the executor unit confines the
-whole process tree, and the VM boundary plus the single per-run, sandy-owned dir
-(wiped at teardown) bound the blast radius.
+default seccomp filter (the live gate K22 guards that, as a plain user), the executor
+unit's own hardening applies to the daemon when it runs there, and the VM boundary plus
+the single per-run, sandy-owned dir (wiped at teardown) bound the blast radius. Whether
+a real KVM guest can run under that unit at all is untested (it sets `PrivateDevices`).
 
 **Set aside (do not re-propose without new information).** `--sandbox=namespace`: it
 starts under the executor unit only if the unit's hardening is relaxed so a fresh procfs
