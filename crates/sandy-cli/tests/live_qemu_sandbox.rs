@@ -1,4 +1,4 @@
-//! Live qemu confinement gate (#392, audit NV-02).
+//! Live qemu confinement gate (#392, #523, audit NV-02).
 //!
 //! Tier-3 (behind the `live` feature): a real qemu process, started by a real `sandy run`, must run under a
 //! seccomp filter. Without one, a qemu escape has the full syscall surface of the sandy user. The test reads
@@ -143,5 +143,95 @@ fn the_qemu_process_runs_under_a_seccomp_filter() -> anyhow::Result<()> {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(output.status.code(), Some(0), "the sandboxed run must still succeed");
+    Ok(())
+}
+
+/// The namespace link of `pid` (`mnt`, `user`, `pid`), or empty when unreadable.
+fn namespace_of(pid: u32, kind: &str) -> String {
+    std::fs::read_link(format!("/proc/{pid}/ns/{kind}"))
+        .map(|link| link.display().to_string())
+        .unwrap_or_default()
+}
+
+/// A virtiofsd that serves a share runs confined: in its own mount, user and pid namespaces and under seccomp.
+/// `--sandbox=none` leaves it in the host's namespaces (it still runs under virtiofsd's default seccomp filter).
+/// The daemon forks, so the check looks for the serving child among all virtiofsd processes.
+#[test]
+fn a_virtiofsd_runs_in_its_own_namespaces_under_seccomp() -> anyhow::Result<()> {
+    let target = require_live()?;
+    build_guest(&target)?;
+    let home = tempfile::tempdir().context("temp SANDY_HOME")?;
+    let input = tempfile::tempdir().context("temp input dir")?;
+    std::fs::write(input.path().join("f"), b"x").context("write input")?;
+    let attr = format!("{}#{}", guest_flake().display(), target.topology_attr);
+
+    // An `--input` makes a virtio-fs share, so a virtiofsd serves this run.
+    let mut sandy = Command::new(env!("CARGO_BIN_EXE_sandy"))
+        .env("SANDY_HOME", home.path())
+        .args(["-o", "json", "run", &attr, "--timeout", "120", "--input"])
+        .arg(format!("{}:data", input.path().display()))
+        .args(["--", "sleep", JOB_SECS])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawn sandy run")?;
+
+    let mine = (
+        namespace_of(sandy.id(), "mnt"),
+        namespace_of(sandy.id(), "user"),
+        namespace_of(sandy.id(), "pid"),
+    );
+    anyhow::ensure!(
+        !mine.0.is_empty() && !mine.1.is_empty() && !mine.2.is_empty(),
+        "cannot read the sandy process's namespaces"
+    );
+
+    let deadline = Instant::now() + APPEAR_WITHIN;
+    let mut confined = false;
+    let mut last_seen = Vec::new();
+    let mut last_family = Vec::new();
+    while Instant::now() < deadline && !confined {
+        let family = descendants(sandy.id());
+        if !family.is_empty() {
+            last_family = family.clone();
+        }
+        let seen = family
+            .into_iter()
+            .filter(|(_, comm, argv0)| comm.contains("virtiofsd") || argv0.contains("virtiofsd"))
+            .map(|(pid, ..)| {
+                (
+                    pid,
+                    seccomp_mode(pid).ok(),
+                    namespace_of(pid, "mnt"),
+                    namespace_of(pid, "user"),
+                    namespace_of(pid, "pid"),
+                )
+            })
+            .collect::<Vec<_>>();
+        // Keep the last snapshot that held a virtiofsd: once the run ends the list is empty, which says nothing.
+        if !seen.is_empty() {
+            last_seen = seen;
+        }
+        confined = last_seen.iter().any(|(_, seccomp, mnt, user, pid_ns)| {
+            *seccomp == Some(2)
+                && !mnt.is_empty()
+                && *mnt != mine.0
+                && !user.is_empty()
+                && *user != mine.1
+                && !pid_ns.is_empty()
+                && *pid_ns != mine.2
+        });
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let output = sandy.wait_with_output().context("wait for sandy run")?;
+
+    assert!(
+        confined,
+        "a virtiofsd must run under seccomp in its own mount, user and pid namespaces; sandy's namespaces {mine:?}; \
+         virtiofsd processes last seen (pid, seccomp, mnt, user, pid ns; empty = never seen one): {last_seen:?}; last \
+         sandy descendants (pid, comm, argv0): {last_family:?}; sandy stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(0), "the confined run must still succeed");
     Ok(())
 }
