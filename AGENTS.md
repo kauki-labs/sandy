@@ -315,3 +315,33 @@ repo's own setup, not general git advice.
   the PR's own node id (not the `mergeQueueEntry`'s id — that resolves to
   "could not resolve"). Re-query `mergeQueueEntry` afterward to confirm it
   came back `null`.
+
+## Review gate: CodeRabbit, with a local-adversarial fallback
+
+Every PR gets at least one adversarial review from someone other than its
+author before it merges — never self-graded. CodeRabbit on GitHub is the
+default channel; fix its findings the same as always, whenever it actually
+reviews.
+
+- **CodeRabbit unavailable → fall back to a local reviewer, don't wait on
+  it indefinitely.** If a (re-)triggered CodeRabbit review gets no response
+  within 5 minutes, or CodeRabbit states outright that it cannot review
+  (rate-limited, errored, disabled for the repo) — observed on PR #501,
+  "You've used all free OSS reviews for now" with zero actual review
+  posted — request an adversarial review from a different local agent
+  instead (a subagent or a peer session, never the same agent that wrote
+  the change). This substitutes for CodeRabbit for that PR; it does not
+  cancel a later real CodeRabbit review if one eventually arrives — apply
+  that the same as always.
+- **Post the local review's findings (and any fixes) to the PR itself,
+  not just to the session.** A comment naming what was reviewed, what was
+  found, and what was fixed — the same durable trail a GitHub review
+  thread leaves — plus a short note in the PR description saying CodeRabbit
+  was unavailable and a local adversarial review substituted (who/what
+  reviewed, when). A review that only exists in a chat transcript is
+  invisible to the next person (or agent) who opens the PR.
+- **This is a review-gate rule, not a merge-timing rule.** Satisfying the
+  review requirement (GitHub or local-fallback) never substitutes for the
+  separate, per-action, in-the-moment human approval merging still
+  requires — the two are independent gates, and clearing one is not
+  license to skip the other.
