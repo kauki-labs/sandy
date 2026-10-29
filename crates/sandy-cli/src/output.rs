@@ -661,6 +661,7 @@ mod tests {
     /// a single value, the empty-plain-prints-nothing convention, and NDJSON
     /// streaming with a per-line flush.
     mod emit_mechanism {
+        use anyhow::Context;
         use serde::{Deserialize, Serialize};
 
         use super::{
@@ -723,15 +724,17 @@ mod tests {
         }
 
         #[test]
-        fn emit_to_json_always_prints_even_when_empty() {
+        fn emit_to_json_always_prints_even_when_empty() -> anyhow::Result<()> {
             let empty = super::JobRecords(vec![]);
             let mut buf = Vec::new();
             emit_to(&empty, OutputFormat::Json, &mut buf).expect("emit_to");
-            assert_eq!(String::from_utf8(buf).unwrap().trim(), "[]");
+            let text = String::from_utf8(buf).context("emit_to output must be UTF-8")?;
+            assert_eq!(text.trim(), "[]");
+            Ok(())
         }
 
         #[test]
-        fn emit_stream_writes_one_tagged_ndjson_object_per_line_flushed_after_each() {
+        fn emit_stream_writes_one_tagged_ndjson_object_per_line_flushed_after_each() -> anyhow::Result<()> {
             let events = vec![
                 TestStreamEvent::Output {
                     line: "hello".to_string(),
@@ -746,7 +749,7 @@ mod tests {
 
             assert_eq!(out.at_each_flush.len(), 3, "one flush per item");
             let lines: Vec<String> = String::from_utf8(out.buf.clone())
-                .unwrap()
+                .context("emit_stream_to output must be UTF-8")?
                 .lines()
                 .map(str::to_string)
                 .collect();
@@ -754,7 +757,7 @@ mod tests {
 
             for (line, event) in lines.iter().zip(&events) {
                 let parsed: TestStreamEvent =
-                    serde_json::from_str(line).unwrap_or_else(|e| panic!("line did not parse alone: {line:?}: {e}"));
+                    serde_json::from_str(line).with_context(|| format!("line did not parse alone: {line:?}"))?;
                 assert_eq!(&parsed, event, "line {line:?} must decode back to its event");
                 assert!(line.starts_with("{\"type\":"), "each line must be tagged: {line}");
             }
@@ -765,20 +768,22 @@ mod tests {
 
             // Flushing happens after each item is fully written: the first
             // captured buffer must already contain the first line in full.
-            let first_flush = String::from_utf8(out.at_each_flush[0].clone()).unwrap();
+            let first_flush = String::from_utf8(out.at_each_flush[0].clone()).context("first flush must be UTF-8")?;
             assert_eq!(first_flush.trim_end(), lines[0]);
+            Ok(())
         }
 
         #[test]
-        fn emit_stream_plain_renders_one_human_line_per_item_as_they_arrive() {
+        fn emit_stream_plain_renders_one_human_line_per_item_as_they_arrive() -> anyhow::Result<()> {
             let events = vec![
                 TestStreamEvent::Output { line: "hi".to_string() },
                 TestStreamEvent::Exit { code: 1 },
             ];
             let mut out = Vec::new();
             emit_stream_to(events, OutputFormat::Plain, &mut out).expect("emit_stream_to");
-            let text = String::from_utf8(out).unwrap();
+            let text = String::from_utf8(out).context("emit_stream_to output must be UTF-8")?;
             assert_eq!(text, "hi\n(exited 1)\n");
+            Ok(())
         }
     }
 
