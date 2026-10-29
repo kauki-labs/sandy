@@ -1,0 +1,5 @@
+---
+source: crates/sandy-cli/src/output.rs
+expression: "plain_of(&deregistered(false, None))"
+---
+Shredded the local key and removed /cfg/trust-roots/sandy-runner.json

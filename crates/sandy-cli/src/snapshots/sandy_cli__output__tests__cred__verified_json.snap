@@ -1,0 +1,7 @@
+---
+source: crates/sandy-cli/src/output.rs
+expression: "json_of(&CredVerified { verified: true })"
+---
+{
+  "verified": true
+}

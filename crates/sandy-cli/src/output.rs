@@ -17,7 +17,10 @@ use sandy::{JobRecord, ResultEnvelope};
 use sandy_control_proto::{AttachResponse, JobStatus, JobSummary, ListResponse, StatusResponse, SubmitResponse};
 use serde::{Deserialize, Serialize};
 
-use crate::supervisor::GcReport;
+use crate::{
+    app_register::{CredDeregistered, CredImported, CredRegistered, CredVerified},
+    supervisor::GcReport,
+};
 
 /// Which representation the CLI prints on stdout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
@@ -204,6 +207,59 @@ impl Render for GcReport {
 impl Render for crate::doctor::DoctorResult {
     fn render_plain(&self, out: &mut dyn io::Write) -> io::Result<()> {
         write!(out, "{}", self.message)
+    }
+}
+
+impl Render for CredRegistered {
+    fn render_plain(&self, out: &mut dyn io::Write) -> io::Result<()> {
+        writeln!(
+            out,
+            "Registered GitHub App \"{}\": app_id={}, installation_id={}",
+            self.app_name, self.app_id, self.installation_id
+        )?;
+        writeln!(out, "Trust root: {}", self.trust_root.display())?;
+        write!(out, "Private key: {} (0600)", self.private_key.display())
+    }
+}
+
+impl Render for CredImported {
+    fn render_plain(&self, out: &mut dyn io::Write) -> io::Result<()> {
+        writeln!(
+            out,
+            "Imported shared GitHub App trust root: app_id={}, installation_id={}",
+            self.app_id, self.installation_id
+        )?;
+        write!(out, "Trust root: {}", self.trust_root.display())
+    }
+}
+
+impl Render for CredVerified {
+    fn render_plain(&self, out: &mut dyn io::Write) -> io::Result<()> {
+        write!(
+            out,
+            "Verified: mints a scoped token and the installation grants the requested capabilities."
+        )
+    }
+}
+
+impl Render for CredDeregistered {
+    fn render_plain(&self, out: &mut dyn io::Write) -> io::Result<()> {
+        if self.uninstalled {
+            writeln!(out, "Uninstalled the App at the forge.")?;
+            if let Some(url) = &self.registration_residue {
+                writeln!(
+                    out,
+                    "The App registration shell can't be deleted via API; remove it in the UI: {url}"
+                )?;
+            }
+        } else if let Some(url) = &self.registration_residue {
+            writeln!(
+                out,
+                "Did not uninstall at the forge (needs the App key, which only its live .pem can sign)."
+            )?;
+            writeln!(out, "Uninstall it yourself in the GitHub UI (no key needed): {url}")?;
+        }
+        write!(out, "Shredded the local key and removed {}", self.trust_root.display())
     }
 }
 
@@ -973,5 +1029,148 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).context("parse list json")?;
         assert_eq!(parsed.as_array().map(Vec::len), Some(2));
         Ok(())
+    }
+
+    /// The cred commands' typed results (#514): plain and JSON snapshots, a serde
+    /// round trip, and INV-1 (no secret in either rendering) for each command.
+    mod cred {
+        use std::path::PathBuf;
+
+        use super::{json_of, plain_of};
+        use crate::app_register::{CredDeregistered, CredImported, CredRegistered, CredVerified};
+
+        const SECRET: &str = "-----BEGIN RSA PRIVATE KEY-----\nsentinel-secret-0451\n-----END RSA PRIVATE KEY-----\n";
+
+        /// A key file holding [`SECRET`], so a rendering that read the file
+        /// instead of naming its path would show up.
+        fn key_file(dir: &tempfile::TempDir, name: &str) -> anyhow::Result<PathBuf> {
+            let path = dir.path().join(name);
+            std::fs::write(&path, SECRET)?;
+            Ok(path)
+        }
+
+        fn registered(key: PathBuf) -> CredRegistered {
+            CredRegistered {
+                app_name: "sandy-runner".to_string(),
+                app_id: "5285548".to_string(),
+                installation_id: 170_585_018,
+                trust_root: PathBuf::from("/cfg/trust-roots/sandy-runner.json"),
+                private_key: key,
+            }
+        }
+
+        fn deregistered(uninstalled: bool, residue: Option<&str>) -> CredDeregistered {
+            CredDeregistered {
+                uninstalled,
+                registration_residue: residue.map(str::to_string),
+                trust_root: PathBuf::from("/cfg/trust-roots/sandy-runner.json"),
+            }
+        }
+
+        fn no_secret(rendered: &str) -> anyhow::Result<()> {
+            anyhow::ensure!(!rendered.contains("sentinel-secret-0451"), "secret leaked: {rendered}");
+            anyhow::ensure!(!rendered.contains("PRIVATE KEY"), "key material leaked: {rendered}");
+            Ok(())
+        }
+
+        #[test]
+        fn registered_plain() {
+            insta::assert_snapshot!(plain_of(&registered(PathBuf::from(
+                "/cfg/trust-roots/sandy-runner.pem"
+            ))));
+        }
+
+        #[test]
+        fn registered_json() {
+            insta::assert_snapshot!(json_of(&registered(PathBuf::from("/cfg/trust-roots/sandy-runner.pem"))));
+        }
+
+        #[test]
+        fn imported_plain() {
+            insta::assert_snapshot!(plain_of(&CredImported {
+                app_id: "5285548".to_string(),
+                installation_id: 170_585_018,
+                trust_root: PathBuf::from("/cfg/trust-roots/sandy-runner.json"),
+            }));
+        }
+
+        #[test]
+        fn imported_json() {
+            insta::assert_snapshot!(json_of(&CredImported {
+                app_id: "5285548".to_string(),
+                installation_id: 170_585_018,
+                trust_root: PathBuf::from("/cfg/trust-roots/sandy-runner.json"),
+            }));
+        }
+
+        #[test]
+        fn verified_plain() {
+            insta::assert_snapshot!(plain_of(&CredVerified { verified: true }));
+        }
+
+        #[test]
+        fn verified_json() {
+            insta::assert_snapshot!(json_of(&CredVerified { verified: true }));
+        }
+
+        #[test]
+        fn deregistered_plain_uninstalled_with_residue() {
+            insta::assert_snapshot!(plain_of(&deregistered(
+                true,
+                Some("https://github.com/settings/apps/x")
+            )));
+        }
+
+        #[test]
+        fn deregistered_plain_not_uninstalled_with_residue() {
+            insta::assert_snapshot!(plain_of(&deregistered(
+                false,
+                Some("https://github.com/settings/installations/1")
+            )));
+        }
+
+        #[test]
+        fn deregistered_plain_keep_remote_without_residue() {
+            insta::assert_snapshot!(plain_of(&deregistered(false, None)));
+        }
+
+        #[test]
+        fn deregistered_json() {
+            insta::assert_snapshot!(json_of(&deregistered(true, Some("https://github.com/settings/apps/x"))));
+        }
+
+        #[test]
+        fn every_cred_result_round_trips_through_json() -> anyhow::Result<()> {
+            let dereg = deregistered(true, None);
+            let reg = registered(PathBuf::from("/k.pem"));
+            let ver = CredVerified { verified: true };
+            anyhow::ensure!(serde_json::from_str::<CredDeregistered>(&json_of(&dereg))? == dereg);
+            anyhow::ensure!(serde_json::from_str::<CredRegistered>(&json_of(&reg))? == reg);
+            anyhow::ensure!(serde_json::from_str::<CredVerified>(&json_of(&ver))? == ver);
+            Ok(())
+        }
+
+        #[test]
+        fn register_never_prints_the_key_in_either_format() -> anyhow::Result<()> {
+            let dir = tempfile::TempDir::new()?;
+            let out = registered(key_file(&dir, "k.pem")?);
+            no_secret(&plain_of(&out))?;
+            no_secret(&json_of(&out))
+        }
+
+        #[test]
+        fn deregister_never_prints_the_key_in_either_format() -> anyhow::Result<()> {
+            let dir = tempfile::TempDir::new()?;
+            let mut out = deregistered(true, Some("https://github.com/settings/apps/x"));
+            out.trust_root = key_file(&dir, "sandy-runner.json")?;
+            no_secret(&plain_of(&out))?;
+            no_secret(&json_of(&out))
+        }
+
+        #[test]
+        fn verify_never_prints_the_key_in_either_format() -> anyhow::Result<()> {
+            no_secret(&plain_of(&CredVerified { verified: true }))?;
+            no_secret(&json_of(&CredVerified { verified: true }))
+        }
     }
 }

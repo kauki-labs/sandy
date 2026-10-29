@@ -1,0 +1,7 @@
+---
+source: crates/sandy-cli/src/output.rs
+expression: "plain_of(&registered(PathBuf::from(\"/cfg/trust-roots/sandy-runner.pem\")))"
+---
+Registered GitHub App "sandy-runner": app_id=5285548, installation_id=170585018
+Trust root: /cfg/trust-roots/sandy-runner.json
+Private key: /cfg/trust-roots/sandy-runner.pem (0600)

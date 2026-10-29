@@ -1,0 +1,7 @@
+---
+source: crates/sandy-cli/src/output.rs
+expression: "plain_of(&deregistered(false,\nSome(\"https://github.com/settings/installations/1\")))"
+---
+Did not uninstall at the forge (needs the App key, which only its live .pem can sign).
+Uninstall it yourself in the GitHub UI (no key needed): https://github.com/settings/installations/1
+Shredded the local key and removed /cfg/trust-roots/sandy-runner.json

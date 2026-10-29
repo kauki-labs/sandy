@@ -1,0 +1,6 @@
+---
+source: crates/sandy-cli/src/output.rs
+expression: "plain_of(&CredImported\n{\n    app_id: \"5285548\".to_string(), installation_id: 170_585_018, trust_root:\n    PathBuf::from(\"/cfg/trust-roots/sandy-runner.json\"),\n})"
+---
+Imported shared GitHub App trust root: app_id=5285548, installation_id=170585018
+Trust root: /cfg/trust-roots/sandy-runner.json

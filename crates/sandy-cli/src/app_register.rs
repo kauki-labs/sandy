@@ -14,10 +14,6 @@
 //! ceiling check) and `deregister`'s forge uninstall run through the credential
 //! seam's live [`sandy::GithubAdapter`]; `register` verifies by default, and
 //! `--skip-verify` is the explicit (never default) escape for a key-only bootstrap.
-#![allow(
-    clippy::print_stdout,
-    reason = "the cred commands' output migration is tracked in #514"
-)]
 
 use std::{
     collections::HashMap,
@@ -30,7 +26,56 @@ use sandy::{
     Capability, CredentialProvider, GithubAdapter, InstallError, Provisioner, RegistrationPlan, RevokeOutcome, Scope,
     Target, TrustRoot, TrustRootIo, mint_lease, render_github_permissions,
 };
+use serde::{Deserialize, Serialize};
 use tiny_http::{Header, Response, Server};
+
+/// `sandy cred github register`'s result. Paths only: the key itself is never
+/// part of any output (INV-1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredRegistered {
+    /// The App's name at the forge.
+    pub app_name: String,
+    /// The forge's App id.
+    pub app_id: String,
+    /// The installation the trust root points at.
+    pub installation_id: u64,
+    /// The trust-root config written.
+    pub trust_root: PathBuf,
+    /// The `0600` private-key file written.
+    pub private_key: PathBuf,
+}
+
+/// `sandy cred github import`'s result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredImported {
+    /// The imported App's id.
+    pub app_id: String,
+    /// The installation the trust root points at.
+    pub installation_id: u64,
+    /// The trust-root config written.
+    pub trust_root: PathBuf,
+}
+
+/// `sandy cred github verify`'s result: the probe minted a scoped token and
+/// the installation grants the requested capabilities. A failed probe is an
+/// error, never a `verified: false` value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredVerified {
+    /// Always `true` on success.
+    pub verified: bool,
+}
+
+/// `sandy cred github deregister`'s result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredDeregistered {
+    /// Whether the App was uninstalled at the forge.
+    pub uninstalled: bool,
+    /// Where the operator removes what the API cannot (the App registration, or
+    /// the installation when the key was unavailable), if anything is left.
+    pub registration_residue: Option<String>,
+    /// The trust-root config removed along with the shredded local key.
+    pub trust_root: PathBuf,
+}
 
 /// Where the account the App is registered under lives.
 #[derive(Debug, Clone)]
@@ -488,7 +533,7 @@ pub fn run_register(
     targets: Vec<Target>,
     skip_verify: bool,
     force: bool,
-) -> Result<(), InstallError> {
+) -> Result<CredRegistered, InstallError> {
     sandy::validate_trust_root_name(handle)?;
     let dir = trust_roots_dir().map_err(|e| InstallError::Capture(e.to_string()))?;
     let cfg = config_path(&dir, handle);
@@ -518,18 +563,24 @@ pub fn run_register(
         sandy::register(&provisioner, capabilities, &cfg)?
     };
 
-    if let TrustRoot::Github {
+    let TrustRoot::Github {
         app_id,
         installation_id,
         private_key_path,
         ..
-    } = &root
-    {
-        println!("Registered GitHub App \"{github_app_name}\": app_id={app_id}, installation_id={installation_id}");
-        println!("Trust root: {}", cfg.display());
-        println!("Private key: {} (0600)", private_key_path.display());
-    }
-    Ok(())
+    } = root
+    else {
+        return Err(InstallError::Capture(
+            "the registered trust root is not a GitHub one".to_string(),
+        ));
+    };
+    Ok(CredRegistered {
+        app_name: github_app_name.to_string(),
+        app_id,
+        installation_id,
+        trust_root: cfg,
+        private_key: private_key_path,
+    })
 }
 
 /// `sandy cred github deregister`: uninstall the App at the forge, then shred
@@ -537,7 +588,7 @@ pub fn run_register(
 ///
 /// # Errors
 /// Any [`InstallError`] from loading, the forge revoke, or the local removal.
-pub fn run_deregister(name: &str, keep_remote: bool) -> Result<(), InstallError> {
+pub fn run_deregister(name: &str, keep_remote: bool) -> Result<CredDeregistered, InstallError> {
     sandy::validate_trust_root_name(name)?;
     let dir = trust_roots_dir().map_err(|e| InstallError::Capture(e.to_string()))?;
     let cfg = config_path(&dir, name);
@@ -546,17 +597,11 @@ pub fn run_deregister(name: &str, keep_remote: bool) -> Result<(), InstallError>
 
     let outcome = sandy::deregister(&provisioner, &cfg, keep_remote)?;
 
-    if outcome.uninstalled {
-        println!("Uninstalled the App at the forge.");
-        if let Some(url) = &outcome.registration_residue {
-            println!("The App registration shell can't be deleted via API; remove it in the UI: {url}");
-        }
-    } else if let Some(url) = &outcome.registration_residue {
-        println!("Did not uninstall at the forge (needs the App key, which only its live .pem can sign).");
-        println!("Uninstall it yourself in the GitHub UI (no key needed): {url}");
-    }
-    println!("Shredded the local key and removed {}", cfg.display());
-    Ok(())
+    Ok(CredDeregistered {
+        uninstalled: outcome.uninstalled,
+        registration_residue: outcome.registration_residue,
+        trust_root: cfg,
+    })
 }
 
 /// Build a [`GithubProvisioner`] from a loaded trust root, for the deregister
@@ -643,13 +688,10 @@ pub fn run_import(
     pem_source: &Path,
     base_url: Option<String>,
     targets: Vec<Target>,
-) -> Result<(), InstallError> {
+) -> Result<CredImported, InstallError> {
     sandy::validate_trust_root_name(handle)?;
     let dir = trust_roots_dir().map_err(|e| InstallError::Capture(e.to_string()))?;
-    let cfg = import_into(&dir, handle, app_id, installation_id, pem_source, base_url, targets)?;
-    println!("Imported shared GitHub App trust root: app_id={app_id}, installation_id={installation_id}");
-    println!("Trust root: {}", cfg.display());
-    Ok(())
+    import_into(&dir, handle, app_id, installation_id, pem_source, base_url, targets)
 }
 
 /// `sandy cred github verify`: re-run the verify probe against an existing trust root —
@@ -658,18 +700,17 @@ pub fn run_import(
 ///
 /// # Errors
 /// [`InstallError::Verify`] if the probe fails, or a config/load error.
-pub fn run_verify(handle: &str, capabilities: &[Capability]) -> Result<(), InstallError> {
+pub fn run_verify(handle: &str, capabilities: &[Capability]) -> Result<CredVerified, InstallError> {
     sandy::validate_trust_root_name(handle)?;
     let dir = trust_roots_dir().map_err(|e| InstallError::Capture(e.to_string()))?;
     let cfg = config_path(&dir, handle);
     let root = TrustRoot::load(&cfg)?;
     provisioner_for(&root, handle).verify(&root, capabilities)?;
-    println!("Verified: mints a scoped token and the installation grants the requested capabilities.");
-    Ok(())
+    Ok(CredVerified { verified: true })
 }
 
 /// Core of [`run_import`], with the trust-roots dir as a parameter so it is
-/// testable without the real config dir. Returns the written config path.
+/// testable without the real config dir. Returns the command's result.
 fn import_into(
     dir: &Path,
     handle: &str,
@@ -678,7 +719,7 @@ fn import_into(
     pem_source: &Path,
     base_url: Option<String>,
     targets: Vec<Target>,
-) -> Result<PathBuf, InstallError> {
+) -> Result<CredImported, InstallError> {
     let cfg = config_path(dir, handle);
     if cfg.exists() {
         return Err(InstallError::AlreadyExists { path: cfg });
@@ -703,7 +744,11 @@ fn import_into(
         targets,
     };
     root.write(&cfg)?;
-    Ok(cfg)
+    Ok(CredImported {
+        app_id: app_id.to_string(),
+        installation_id,
+        trust_root: cfg,
+    })
 }
 
 #[cfg(test)]
@@ -876,7 +921,7 @@ mod tests {
             "-----BEGIN RSA PRIVATE KEY-----\nx\n-----END RSA PRIVATE KEY-----\n",
         )?;
 
-        let cfg = import_into(
+        let imported = import_into(
             &roots,
             "sandy-runner",
             "5285548",
@@ -887,7 +932,7 @@ mod tests {
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        match TrustRoot::load(&cfg)? {
+        match TrustRoot::load(&imported.trust_root)? {
             TrustRoot::Github {
                 app_id,
                 installation_id,
@@ -915,6 +960,40 @@ mod tests {
             import_into(&roots, "other", "1", 2, &not_a_key, None, Vec::new()).is_err(),
             "a non-PEM file is refused"
         );
+        Ok(())
+    }
+
+    /// INV-1: importing a key with a known secret value prints neither the key
+    /// body nor its source path's contents in plain or JSON.
+    #[test]
+    fn import_never_prints_the_key_in_either_format() -> anyhow::Result<()> {
+        use crate::output::{OutputFormat, emit_to};
+
+        let tmp = tempfile::TempDir::new()?;
+        let pem = tmp.path().join("shared.pem");
+        std::fs::write(
+            &pem,
+            "-----BEGIN RSA PRIVATE KEY-----\nsentinel-secret-0451\n-----END RSA PRIVATE KEY-----\n",
+        )?;
+        let imported = import_into(
+            &tmp.path().join("roots"),
+            "sandy-runner",
+            "1",
+            2,
+            &pem,
+            None,
+            Vec::new(),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        for format in [OutputFormat::Plain, OutputFormat::Json] {
+            let mut out = Vec::new();
+            emit_to(&imported, format, &mut out)?;
+            let rendered = String::from_utf8(out)?;
+            anyhow::ensure!(
+                !rendered.contains("sentinel-secret-0451") && !rendered.contains("PRIVATE KEY"),
+                "{format:?} output leaked the key: {rendered}"
+            );
+        }
         Ok(())
     }
 }
