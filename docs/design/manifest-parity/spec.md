@@ -1,7 +1,8 @@
 # JobManifest parity with `sandy run`
 
-Status: draft, owner decisions recorded below. One detail is still open (the size cap for
-streamed inputs and outputs), and it does not block the local-first step. It is the
+Status: draft, owner decisions recorded below. Decision 2's mechanism and the streamed-transfer
+size cap, both originally left open, are now decided (below); the implementation design and
+rationale for how they're built live in `sandyd.md` §22 (#482), not here. It is the
 gating work for #221 (migrate the direct-execution CLI onto sandyd), which the issue itself
 calls "not yet scoped".
 
@@ -23,17 +24,17 @@ is `agent`.
 
 ## Parity matrix
 
-| `run` flag                          | `RunSpec` field                                                                        | In `JobManifest` today | Local dispatch                                                                                                                                                                                          | Remote dispatch                                                                |
-| ----------------------------------- | -------------------------------------------------------------------------------------- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| `TEMPLATE`, `--flake/--attr/--kind` | `template`                                                                             | no (VM decode only)    | pass the name                                                                                                                                                                                           | resolve on the host (done for VM, #332)                                        |
-| `-- CMD`                            | `command`                                                                              | yes                    | done                                                                                                                                                                                                    | done                                                                           |
-| `--env`                             | `env`                                                                                  | no                     | copy                                                                                                                                                                                                    | copy                                                                           |
-| `--cpu`, `--mem`, `--timeout`       | `cpu`, `mem`, `timeout_secs`                                                           | no                     | copy, bound by host policy                                                                                                                                                                              | copy, bound by host policy                                                     |
-| `--input HOST:NAME`                 | `inputs`                                                                               | no                     | the picked host-executor reads a submitter path (#496, `sandyd.md` §21: only a host that declared `shares_submitter_filesystem`)                                                                        | streamed over the control connection (later step)                              |
-| `--out [NAME:]DEST`                 | `outputs`                                                                              | no                     | the picked host-executor writes a submitter path (same #496 gate)                                                                                                                                       | streamed back over the control connection (later)                              |
-| `--secret NAME=@PATH`               | `secrets`, `grants`                                                                    | no                     | stage from the submitter's file (same #496 gate)                                                                                                                                                        | refused with a named error (decision 4)                                        |
-| `--allow HOST:PORT`                 | `JobPlan.allow`, outside `RunSpec` (reaches it as `RunSpec.egress` only in proxy mode) | no                     | apply and revert through the existing egress boundary (nftables, or the proxy, #403); a local apply failure refuses the run (band 3, before boot), and the policy is reverted on both success and error | refuse with a named error until the host applies and reverts the policy (#408) |
-| `--credential`, `--cred-capability` | credential bracket                                                                     | no                     | bracket runs in the daemon                                                                                                                                                                              | token minted on the daemon (decision 3)                                        |
+| `run` flag                          | `RunSpec` field                                                                        | In `JobManifest` today | Local dispatch                                                                                                                                                                                          | Remote dispatch                                                                                                        |
+| ----------------------------------- | -------------------------------------------------------------------------------------- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `TEMPLATE`, `--flake/--attr/--kind` | `template`                                                                             | no (VM decode only)    | pass the name                                                                                                                                                                                           | resolve on the host (done for VM, #332)                                                                                |
+| `-- CMD`                            | `command`                                                                              | yes                    | done                                                                                                                                                                                                    | done                                                                                                                   |
+| `--env`                             | `env`                                                                                  | no                     | copy                                                                                                                                                                                                    | copy                                                                                                                   |
+| `--cpu`, `--mem`, `--timeout`       | `cpu`, `mem`, `timeout_secs`                                                           | no                     | copy, bound by host policy                                                                                                                                                                              | copy, bound by host policy                                                                                             |
+| `--input HOST:NAME`                 | `inputs`                                                                               | no                     | the picked host-executor reads a submitter path (#496, `sandyd.md` §21: only a host that declared `shares_submitter_filesystem`)                                                                        | streamed over a per-job dial-back data link (#482, `sandyd.md` §22), capped at `MAX_OUTPUT_BYTES`/`MAX_OUTPUT_ENTRIES` |
+| `--out [NAME:]DEST`                 | `outputs`                                                                              | no                     | the picked host-executor writes a submitter path (same #496 gate)                                                                                                                                       | streamed back over the same data link (#482, `sandyd.md` §22), sandyd re-validates every path before writing it        |
+| `--secret NAME=@PATH`               | `secrets`, `grants`                                                                    | no                     | stage from the submitter's file (same #496 gate)                                                                                                                                                        | refused with a named error (decision 4) — unchanged by #482                                                            |
+| `--allow HOST:PORT`                 | `JobPlan.allow`, outside `RunSpec` (reaches it as `RunSpec.egress` only in proxy mode) | no                     | apply and revert through the existing egress boundary (nftables, or the proxy, #403); a local apply failure refuses the run (band 3, before boot), and the policy is reverted on both success and error | refuse with a named error until the host applies and reverts the policy (#408)                                         |
+| `--credential`, `--cred-capability` | credential bracket                                                                     | no                     | bracket runs in the daemon                                                                                                                                                                              | token minted on the daemon (decision 3)                                                                                |
 
 ## Decisions (proposed)
 
@@ -62,11 +63,13 @@ is `agent`.
 2. **Expected output.** For the same supported flags, a job run through sandyd produces the same
    `RunSpec` as the direct path, and the same result envelope (INV-11) except the job id
    scheme.
-3. **Failure definition.** An unsupported field for the chosen dispatch (a path field on a
-   remote host) is a refusal at Submit with the field named. No backend starts and no journal
-   record is written. No field is silently ignored.
-4. **Performance and scale.** No new limit. Input and output transfer, when it exists, needs
-   its own size cap (open question 2).
+3. **Failure definition.** A path field on a remote host whose picked placement declares
+   neither `transfer` nor `shares_submitter_filesystem` (`secrets` specifically needs
+   `shares_submitter_filesystem`, #482) is a refusal at Submit with the field named. No backend
+   starts and no journal record is written. No field is silently ignored.
+4. **Performance and scale.** Remote input/output transfer (#482) is capped at
+   `MAX_OUTPUT_BYTES`/`MAX_OUTPUT_ENTRIES` per direction (`sandyd.md` §22), enforced at Submit
+   and again while streaming.
 5. **Dependency behaviour.** The executor re-validates every field it acts on, as it already
    does for the isolation class (defense in depth).
 
@@ -76,7 +79,11 @@ is `agent`.
   the equivalent `JobManifest`, and compares an explicit projection of the manifest-derived
   fields (`RunSpec` has no `PartialEq`). Runtime fields (`control`, `outcome_file`,
   `secret_dir`) are not part of this projection; they are tested separately.
-- A manifest with a path field submitted for a remote host is refused with the field named.
+- A manifest with a path field submitted for a remote host whose placement declares neither
+  `transfer` nor `shares_submitter_filesystem` is refused with the field named
+  (`secrets` specifically needs `shares_submitter_filesystem`, #482).
+- The inverse: `inputs`/`outputs` submitted for remote dispatch onto a host that DOES declare
+  `transfer` (or `shares_submitter_filesystem`) is accepted, not refused (#482).
 - A manifest with an unknown field is refused, not accepted with the field dropped.
 - A `timeout_secs` above the host ceiling is clamped, and the clamp is visible in the status.
 - A `--secret` value never appears on the host side: not in the manifest bytes, the Dispatch
@@ -104,9 +111,14 @@ The owner answered the four questions of the first draft.
 
 1. **Local first.** P1 stands: plain-value fields ship for local and remote dispatch; path
    fields ship for local dispatch only.
-2. **Remote inputs and outputs stream over the control connection.** This reuses the mesh
-   connection and its auth. It needs framing in `sandy-executor-proto` and a size cap, which
-   is the one detail still open. It is not part of the local-first step.
+2. **Remote inputs and outputs stream over a per-job dial-back link, not the shared control
+   connection** — reopened from the original draft's "control connection" wording (owner
+   decision, 2026-10-29; the mechanism rationale is recorded in `sandyd.md` §22, #482, not
+   repeated here). The size cap matches the existing local collect caps exactly:
+   `MAX_OUTPUT_BYTES` (4 GiB) and `MAX_OUTPUT_ENTRIES` (100,000), applied to BOTH inputs and
+   outputs for remote transfer (owner decision, 2026-10-29) — local inputs stay uncapped,
+   unaffected; this cap is specific to the remote path. It is not part of the local-first
+   step.
 3. **The credential is minted on the daemon, before boot, fail-closed.** The trust root stays
    on the orchestrator host. Mint failure refuses the Submit; no backend starts without a
    token. The scoped, short-lived token crosses the mesh to the executor over a transport that
@@ -119,7 +131,8 @@ The owner answered the four questions of the first draft.
 4. **A secret never crosses the mesh.** A remote Submit that carries `--secret` is refused
    with a named error. INV-1 stays simple: secret bytes stay on the submitter's machine.
 
-Still open: the size cap for streamed inputs and outputs.
+The size cap for streamed inputs and outputs, originally left open here, is now decided —
+see decision 2 above.
 
 ## Self-test: what could pass every test above and still be wrong?
 
