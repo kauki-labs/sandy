@@ -1,9 +1,10 @@
 //! CLI output formatting: human `plain` (default) or `json` (`-o json`).
 //!
 //! The `json` format exists so an agent can drive `sandy` and parse stdout
-//! directly. Every command routes its result through one of the `format_*`
-//! helpers, so the two formats stay in lock-step and JSON output is the
-//! `serde` serialization of the same contract types the journal persists.
+//! directly. Every command routes its result through [`emit`]/[`emit_to`]
+//! over a typed, `Render` + `Serialize` struct, so the two formats stay in
+//! lock-step and JSON output is the `serde` serialization of the same
+//! contract types the journal persists.
 //!
 //! The format applies to stdout (the data channel) only. Diagnostics stay on
 //! stderr as text, and the process exit band (INV-11) carries success/failure
@@ -149,7 +150,7 @@ impl Render for JobRecord {
 
 /// A node's persisted mesh TLS identity fingerprint (decision 20), as
 /// printed by `sandy mesh key generate`/`fingerprint`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeshFingerprint {
     /// The hex-encoded SHA-256 fingerprint of the identity's certificate.
     pub fingerprint: String,
@@ -470,8 +471,8 @@ mod tests {
     use sandy_control_proto::{AttachResponse, JobStatus, JobSummary, ListResponse, StatusResponse, SubmitResponse};
 
     use super::{
-        AttachedChannel, CancelledJob, EmitError, GcReport, JobRecords, JobStatusReport, JobSummaries, OutputFormat,
-        Render, SubmittedJob, emit_to,
+        AttachedChannel, CancelledJob, EmitError, GcReport, JobRecords, JobStatusReport, JobSummaries, MeshFingerprint,
+        OutputFormat, Render, SubmittedJob, emit_to,
     };
 
     /// `emit_to` into a string without the trailing newline, so the contract tests below read as they did
@@ -532,6 +533,36 @@ mod tests {
                 status: JobStatus::Running as i32,
             }],
         }))?;
+        round_trip(&MeshFingerprint {
+            fingerprint: "aa".repeat(32),
+        })?;
+        Ok(())
+    }
+
+    /// `sandy mesh key generate`/`fingerprint`'s plain output is the bare hex
+    /// fingerprint, matching `emit_str`'s own pre-typed-pipeline behavior —
+    /// see `dispatch_mesh_key`'s own doc comment.
+    #[test]
+    fn mesh_fingerprint_renders_as_the_bare_hex_string() -> anyhow::Result<()> {
+        let hex = "aa".repeat(32);
+        let mut buf = Vec::new();
+        MeshFingerprint {
+            fingerprint: hex.clone(),
+        }
+        .render_plain(&mut buf)?;
+        assert_eq!(String::from_utf8(buf)?, hex);
+        Ok(())
+    }
+
+    /// `-o json` is new surface for the mesh-key commands (the pre-migration
+    /// `emit_str` call ignored `OutputFormat` entirely); pin its shape.
+    #[test]
+    fn mesh_fingerprint_json_shape_is_a_named_field() -> anyhow::Result<()> {
+        let hex = "aa".repeat(32);
+        let value = serde_json::to_value(MeshFingerprint {
+            fingerprint: hex.clone(),
+        })?;
+        assert_eq!(value, serde_json::json!({ "fingerprint": hex }));
         Ok(())
     }
 
