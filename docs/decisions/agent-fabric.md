@@ -555,3 +555,73 @@ B2's orchestrator + B7's attach wiring, not yet built.
 kinds instead of an opaque string): no current caller needs to distinguish
 reference kinds, and the fabric never interprets it regardless — the same
 reasoning that keeps `PeerMessage`'s payload opaque.
+
+## 13. A VM job's environment is the guest's own login environment, not an allowlist (#509)
+
+**Status:** accepted.
+
+**Context.** #389 and #502 each assumed a VM job's environment should be
+scrubbed to a fixed allowlist, matching the process backend's contract
+(`PATH` + `spec.env` + share dirs, INV-1). Neither landed: #503 (the #389
+red test + scrub) found that a scrub is not free — secrets and devShell
+variables are not distinguishable from ambient guest state by name alone,
+so a blanket scrub drops them along with everything else. #509 escalated
+the underlying question (what the contract actually is) to the owner
+rather than letting either PR guess at a per-name exception list.
+
+Verified facts from #509 (ws01, qemu, 2026-10-29): a VM job sees roughly 30
+variables from the guest's root login shell (`NIX_PATH`, `EDITOR`,
+`LOGNAME`, `SSH_ASKPASS`, `XDG_*`, `__ETC_PROFILE_DONE`, …), all sourced
+from the guest image, and no host variable. This is also how secrets and
+devShell variables already reach a job: `nix/lib/guest.nix`'s
+`programs.bash.loginShellInit` exports each `/run/sandy/secrets/<NAME>` as
+`$NAME`, and `nix/guest-wrapper/flake.nix` appends a devShell's `shellHook`
+to the same login shell.
+
+**Decision.** Owner answer, 2026-10-29, in session sandy-f4 (quoted
+verbatim — only the owner changes this wording):
+
+> option **A**. A VM job's environment is the guest image's own login
+> environment, plus the exported secrets (`$NAME`) and devShell
+> `shellHook` variables that the guest's login shell already provides. It
+> is not a fixed allowlist. This matches sandy-00's recommendation: no
+> host variable crosses into the guest (verified on qemu), and a scrub
+> would break the secret and devShell path that #481 and #496 use.
+>
+> Consequences:
+>
+> - #389 and #502 are by design. Closed with this answer as the reason.
+> - The live test `live_agent::the_vm_job_environment_is_only_the_allowlist`
+>   asserts the opposite contract. It is rewritten, with the decision
+>   recorded, in the follow-up item below.
+> - The process backend keeps its allowlist (`PATH`, `spec.env`, share
+>   dirs; INV-1). The two backends differ on purpose; the decision record
+>   must say so.
+
+The two backends differ on purpose: the process backend's job shares the
+host kernel, so its environment is an explicit, audited grant (INV-1); a
+VM job's environment comes from an image the operator already chose to
+boot, and the VM itself — not a per-variable scrub — is the trust
+boundary. Scrubbing a VM job's environment to an allowlist would not add a
+security property the VM doesn't already provide, and would actively break
+the secret/devShell delivery path #481 and #496 build on.
+
+**Consequences.** No behavior change in `impls/vm`, `impls/agent`, or the
+guest image — this closes #389 and #502 as "by design," records why, and
+corrects the one test (`live_agent::the_vm_job_environment_is_only_the_allowlist`,
+rewritten in the same change as this record) that asserted the now-rejected
+contract. This section's own §10 (above) still says "#177 replaces the
+export with an agent-owned allowlist" — that line predates this decision
+and is now in tension with it; flagged on #177 for the owner/triage to
+reconcile (close as superseded, or rescope to something this decision
+doesn't cover), not resolved here, since only the owner changes
+owner-recorded text and #177 itself is out of this item's scope.
+
+**Set aside.** A fixed allowlist for VM jobs (#509's option B, and #503's
+own scrub): would need an explicit secret/devShell passthrough designed
+first (a VM job's secrets aren't distinguishable from ambient guest state
+by name), and buys no security property the VM boundary doesn't already
+provide. Do not re-propose without new information. An image-level opt-in
+to a smaller ambient environment (#509's option 3, a guest module option):
+defers the question to image authors rather than answering it; left open
+as a future enhancement, not required by this decision.
