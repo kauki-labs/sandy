@@ -1,0 +1,13 @@
+---
+source: crates/sandy-cli/src/output.rs
+expression: "format_gc(&report, OutputFormat::Json)?"
+---
+{
+  "evicted": [
+    "job-a",
+    "job-b"
+  ],
+  "swept_staging_dirs": [
+    "cred-abc"
+  ]
+}

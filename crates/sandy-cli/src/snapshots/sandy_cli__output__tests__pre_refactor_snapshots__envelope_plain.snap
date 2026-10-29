@@ -1,0 +1,6 @@
+---
+source: crates/sandy-cli/src/output.rs
+expression: "format_envelope(&sample_envelope(\"job-a\"), OutputFormat::Plain)?"
+---
+job job-a: Failed (guest exit -, retryable true)
+infra fault: spawn failed

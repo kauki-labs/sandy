@@ -1,0 +1,9 @@
+---
+source: crates/sandy-cli/src/output.rs
+expression: "format_gc(&report, OutputFormat::Plain)?"
+---
+gc: evicted 2 record(s)
+  job-a
+  job-b
+gc: swept 1 staging dir(s)
+  cred-abc

@@ -1,0 +1,5 @@
+---
+source: crates/sandy-cli/src/output.rs
+expression: "format_records(&[], OutputFormat::Json)?"
+---
+[]

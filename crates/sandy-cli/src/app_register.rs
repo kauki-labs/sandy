@@ -14,6 +14,10 @@
 //! ceiling check) and `deregister`'s forge uninstall run through the credential
 //! seam's live [`sandy::GithubAdapter`]; `register` verifies by default, and
 //! `--skip-verify` is the explicit (never default) escape for a key-only bootstrap.
+#![allow(
+    clippy::print_stdout,
+    reason = "the cred commands' output migration is tracked in #514"
+)]
 
 use std::{
     collections::HashMap,

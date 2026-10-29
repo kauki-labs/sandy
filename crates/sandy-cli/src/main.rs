@@ -4,6 +4,11 @@
 //! Block 6 job ops `run`/`ls`/`status`/`wait`/`kill`/`gc`. All orchestration lives
 //! in the library modules; `main` only parses argv, selects the host backend, and
 //! maps results to process exit bands (INV-11).
+//!
+//! A separate crate root from `lib.rs`, so it repeats that file's
+//! `clippy::print_stdout` deny (#512): [`sandy_cli::output::emit`] and
+//! [`emit_str`] are this binary's only sanctioned stdout sinks.
+#![deny(clippy::print_stdout)]
 
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
@@ -11,10 +16,7 @@ use sandy::{Capability, CoreError, GithubAdapter, Journal, ProcessExit, Scope, T
 use sandy_cli::{
     app_register::{self, Owner},
     doctor,
-    output::{
-        OutputFormat, format_attach, format_cancel, format_doctor, format_envelope, format_gc, format_list,
-        format_record, format_records, format_status, format_submit,
-    },
+    output::{JobRecords, OutputFormat, emit, format_attach, format_cancel, format_list, format_status, format_submit},
     plan::{JobPlan, RunArgs, parse_run},
     supervisor,
 };
@@ -1005,10 +1007,10 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
             // `attach::persist_attach_token`'s own doc for the fallback
             // behavior on any failure here.
             sandy_cli::attach::persist_attach_token(&r.job_id, &r.attach_token);
-            succeed_or(emit(format_submit(&r, output)))
+            succeed_or(emit_str(format_submit(&r, output)))
         }
         Some(control_response::Result::Cancel(_)) => {
-            succeed_or(emit(format_cancel(cancel_echo.as_deref().unwrap_or("?"), output)))
+            succeed_or(emit_str(format_cancel(cancel_echo.as_deref().unwrap_or("?"), output)))
         }
         // `-o json` keeps today's one-shot machine path (print the channel id
         // + cap, exit) — an automation caller wants the cap's bytes, not a
@@ -1016,7 +1018,7 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
         // flag) redeems the cap on `sandyd`'s separate attach data-plane
         // socket instead (#327) and goes interactive.
         Some(control_response::Result::Attach(r)) if output == OutputFormat::Json => {
-            succeed_or(emit(format_attach(&r, output)))
+            succeed_or(emit_str(format_attach(&r, output)))
         }
         Some(control_response::Result::Attach(r)) => {
             let job_id = attach_job_id.unwrap_or_default();
@@ -1077,8 +1079,8 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
                 }
             }
         }
-        Some(control_response::Result::Status(r)) => succeed_or(emit(format_status(&r, output))),
-        Some(control_response::Result::List(r)) => succeed_or(emit(format_list(&r, output))),
+        Some(control_response::Result::Status(r)) => succeed_or(emit_str(format_status(&r, output))),
+        Some(control_response::Result::List(r)) => succeed_or(emit_str(format_list(&r, output))),
         // The daemon understood the request but could not honour it (unknown
         // job id, not yet dispatchable, …): the request itself is the fault,
         // the same InvalidPlan band `run` uses for an unbootable plan.
@@ -1097,18 +1099,15 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
 /// exit band. Needs no journal, so it runs before `$SANDY_HOME` is touched.
 fn dispatch_doctor(output: OutputFormat) -> i32 {
     let result = doctor::run_doctor();
-    match output {
-        // Plain keeps the stream convention (ok→stdout, refusal→stderr); JSON
-        // always goes to stdout so an agent reads the verdict from one channel.
-        OutputFormat::Plain if result.exit_code != 0 => eprintln!("{}", result.message),
-        OutputFormat::Plain => println!("{}", result.message),
-        OutputFormat::Json => match format_doctor(result.exit_code, &result.message, output) {
-            Ok(json) => println!("{json}"),
-            Err(e) => {
-                eprintln!("sandy: could not serialize output: {e}");
-                return ProcessExit::InfraFault.code();
-            }
-        },
+    if output == OutputFormat::Plain && result.exit_code != 0 {
+        // Plain keeps the stream convention (ok→stdout, refusal→stderr): a
+        // refusal explains itself, so it's a diagnostic like every other
+        // eprintln! in this file, not routed through emit's one stdout sink.
+        eprintln!("{}", result.message);
+    } else if let Err(code) = emit(&result, output) {
+        // JSON always goes to stdout (emit's only sink) regardless of
+        // exit_code, so an agent reads the verdict from one channel.
+        return code;
     }
     result.exit_code
 }
@@ -1243,7 +1242,7 @@ fn dispatch_run(
     };
     // The envelope is the result, not a diagnostic — print it (the band, not
     // stdout, signals failure) and exit on the process band.
-    if let Err(code) = emit(format_envelope(&report.envelope, output)) {
+    if let Err(code) = emit(&report.envelope, output) {
         return code;
     }
     report.process_exit.code()
@@ -1348,43 +1347,50 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
             dispatch_run(&host_profile(), args, credential, &cred_capability, &journal, output)
         }
         Command::Ls => match supervisor::ls(&journal) {
-            Ok(records) => succeed_or(emit(format_records(&records, output))),
+            Ok(records) => succeed_or(emit(&JobRecords(records), output)),
             Err(e) => report_error(&e),
         },
         Command::Status { job_id } => {
             let backend = host_backend();
             match supervisor::status(&journal, &backend, &job_id) {
-                Ok(record) => succeed_or(emit(format_record(&record, output))),
+                Ok(record) => succeed_or(emit(&record, output)),
                 Err(e) => report_error(&e),
             }
         }
         Command::Wait { job_id } => {
             let backend = host_backend();
             match supervisor::wait(&journal, &backend, &job_id) {
-                Ok(record) => succeed_or(emit(format_record(&record, output))),
+                Ok(record) => succeed_or(emit(&record, output)),
                 Err(e) => report_error(&e),
             }
         }
         Command::Kill { job_id } => {
             let backend = host_backend();
             match supervisor::kill(&journal, &backend, &job_id) {
-                Ok(record) => succeed_or(emit(format_record(&record, output))),
+                Ok(record) => succeed_or(emit(&record, output)),
                 Err(e) => report_error(&e),
             }
         }
         Command::Gc { keep_last } => match supervisor::gc(&journal, keep_last) {
-            Ok(report) => succeed_or(emit(format_gc(&report, output))),
+            Ok(report) => succeed_or(emit(&report, output)),
             Err(e) => report_error(&e),
         },
     }
 }
 
-/// Print a formatted result to stdout, or report a serialization failure.
+/// Print an already-formatted string to stdout, or report a serialization
+/// failure — the pre-#512 `emit`, kept only for the `daemon`/`cred` commands
+/// (`format_submit`/`format_cancel`/`format_attach`/`format_status`/
+/// `format_list`) that #513/#514 migrate to typed [`Render`](output::Render)
+/// output; remove this once they do.
 ///
-/// An empty text rendering (e.g. `ls` with no jobs) prints nothing; JSON always
-/// prints (an empty list is a valid `[]`). On a `serde_json` failure, returns the
-/// infra-fault band so the caller can exit on it.
-fn emit(formatted: serde_json::Result<String>) -> Result<(), i32> {
+/// An empty text rendering prints nothing; JSON always prints (an empty list
+/// is a valid `[]`). On a `serde_json` failure, returns the infra-fault band.
+#[allow(
+    clippy::print_stdout,
+    reason = "legacy sink for #513/#514's not-yet-migrated commands"
+)]
+fn emit_str(formatted: serde_json::Result<String>) -> Result<(), i32> {
     match formatted {
         Ok(out) => {
             if !out.is_empty() {
@@ -1399,8 +1405,8 @@ fn emit(formatted: serde_json::Result<String>) -> Result<(), i32> {
     }
 }
 
-/// Map an [`emit`] result to a process band: success (band 0) or the serialization
-/// failure band it carries.
+/// Map an [`emit`]/[`emit_str`] result to a process band: success (band 0) or
+/// the serialization failure band it carries.
 fn succeed_or(emitted: Result<(), i32>) -> i32 {
     match emitted {
         Ok(()) => ProcessExit::Succeeded.code(),

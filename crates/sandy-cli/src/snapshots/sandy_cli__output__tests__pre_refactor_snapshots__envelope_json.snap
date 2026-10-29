@@ -1,0 +1,23 @@
+---
+source: crates/sandy-cli/src/output.rs
+expression: "format_envelope(&sample_envelope(\"job-a\"), OutputFormat::Json)?"
+---
+{
+  "result_schema_version": 4,
+  "job_id": "job-a",
+  "box_id": null,
+  "status": "failed",
+  "retryable": true,
+  "message": "infra fault: spawn failed",
+  "exit_code": null,
+  "outputs": [],
+  "receipts": [],
+  "provenance": {
+    "template_store_path": ""
+  },
+  "logs": {
+    "tail": ""
+  },
+  "warnings": [],
+  "receipt": null
+}

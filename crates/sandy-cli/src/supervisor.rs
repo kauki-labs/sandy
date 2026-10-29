@@ -834,7 +834,7 @@ pub fn kill<B: VmBackend>(journal: &Journal, backend: &B, job_id: &str) -> Resul
 /// (#195). `evicted` holds job ids only, so a consumer passing its entries to
 /// `status`/`wait` never receives a staging-dir name, and the plain-text
 /// "evicted N record(s)" count never counts a directory as a record.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GcReport {
     /// Job ids evicted under the keep-last-N + referenced policy.
     pub evicted: Vec<String>,
