@@ -289,6 +289,7 @@ pub fn reject_duplicate_input_names(inputs: &[Input]) -> Result<(), PlanError> {
 /// - `--out DEST` (catch-all) — anything else: the whole `/run/sandy/outputs` tree is collected to the host path
 ///   `DEST`. A `DEST` that itself contains a `:` must be path-like (contain `/`, e.g. `./out:dir`) so it is not read as
 ///   a name.
+///
 /// `pub` for the same reason [`parse_env`] is: `sandy daemon submit`
 /// (manifest-parity #496) reuses this validation from the `sandy` bin crate.
 pub fn parse_output(raw: &str) -> Result<Output, PlanError> {

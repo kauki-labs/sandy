@@ -168,6 +168,9 @@ async fn submit(
             manifest_encoding: "argv/v1".to_owned(),
             submitter_caps: Vec::new(),
             required_isolation_class: sandy_control_proto::IsolationClass::Trusted.into(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            secrets: Vec::new(),
         }),
     )
     .await

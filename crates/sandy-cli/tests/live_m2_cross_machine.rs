@@ -263,6 +263,7 @@ fn trusted_process_capabilities() -> Capabilities {
         arch: Arch::X8664.into(),
         attestation: false,
         supported_isolation_classes: vec![IsolationClass::Trusted.into()],
+        shares_submitter_filesystem: false,
     }
 }
 

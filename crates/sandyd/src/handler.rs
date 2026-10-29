@@ -96,6 +96,22 @@ fn submit_requires_local_dispatch(submit: &SubmitRequest) -> bool {
     !submit.inputs.is_empty() || !submit.outputs.is_empty() || !submit.secrets.is_empty()
 }
 
+/// Name the path field that made [`submit_requires_local_dispatch`] true, for
+/// a refusal message — `control.proto`'s own doc on these fields and the
+/// manifest-parity spec both require naming the field, never a generic "a
+/// path field" (CodeRabbit on #508). Checked in the same order the proto
+/// declares them; a Submit naming more than one still gets a single,
+/// representative name rather than every one of them.
+fn first_path_field_name(submit: &SubmitRequest) -> &'static str {
+    if !submit.inputs.is_empty() {
+        "inputs"
+    } else if !submit.outputs.is_empty() {
+        "outputs"
+    } else {
+        "secrets"
+    }
+}
+
 /// Convert `SubmitRequest`'s client-facing path fields (`sandy_control_proto`)
 /// into their `Dispatch` wire shape (`sandy_executor_proto`) — two structurally
 /// identical but separately-defined proto messages (this crate's existing
@@ -369,6 +385,10 @@ pub async fn handle(
             // host (never a silent `Pending` forever, never a silent place-
             // anywhere).
             let require_local = submit_requires_local_dispatch(&submit);
+            // Cached before `submit.manifest`/`manifest_encoding` are moved
+            // out below: a partial move of one field makes rustc refuse any
+            // later `&submit` borrow, even to read a different field.
+            let path_field_name = first_path_field_name(&submit);
             let (path_inputs, path_outputs, path_secrets) = to_dispatch_path_fields(&submit);
             let placeable = if forward_back_addr.is_none() {
                 false
@@ -381,21 +401,26 @@ pub async fn handle(
                     )
                     .is_some()
             };
+            let placement_reason = if forward_back_addr.is_none() {
+                "this orchestrator has no agent-link listen address configured (SANDY_MESH_AGENT_LINK_LISTEN is unset) \
+                 — no remote placement is reachable at all, regardless of what hosts are registered"
+                    .to_owned()
+            } else if require_local {
+                format!(
+                    "no registered host declares shares_submitter_filesystem; this Submit names a `{path_field_name}` \
+                     path, which is only ever valid on the submitter's own filesystem"
+                )
+            } else {
+                "no registered host declares the required isolation class and sandbox kind; this job cannot be placed \
+                 (this daemon has no local fallback for a Vm-backend or Untrusted-class job)"
+                    .to_owned()
+            };
             if let Some(control_error) = placement_required_error(
                 required_isolation_class,
                 required_sandbox_kind,
                 require_local,
                 placeable,
-                if forward_back_addr.is_none() {
-                    "this orchestrator has no agent-link listen address configured (SANDY_MESH_AGENT_LINK_LISTEN is \
-                     unset) — no remote placement is reachable at all, regardless of what hosts are registered"
-                } else if require_local {
-                    "no registered host declares shares_submitter_filesystem; this Submit names an input, output, or \
-                     secret path, which is only ever valid on the submitter's own filesystem"
-                } else {
-                    "no registered host declares the required isolation class and sandbox kind; this job cannot be \
-                     placed (this daemon has no local fallback for a Vm-backend or Untrusted-class job)"
-                },
+                &placement_reason,
             ) {
                 return Ok(ControlResponse {
                     request_id: request.request_id,
@@ -527,18 +552,22 @@ pub async fn handle(
             // a minted link exactly this way) — never insert a `flake/v1` job
             // that would then sit `Pending` forever with no local fallback
             // and no distinct status a caller could ever notice.
+            let dispatch_plan_reason = if require_local {
+                format!(
+                    "no registered host declaring shares_submitter_filesystem could be bound for this job's \
+                     `{path_field_name}` path"
+                )
+            } else {
+                "no registered host could be bound for this job's required isolation class and sandbox kind; it cannot \
+                 be placed (this daemon has no local fallback for a Vm-backend or Untrusted-class job)"
+                    .to_owned()
+            };
             if let Some(control_error) = placement_required_error(
                 required_isolation_class,
                 required_sandbox_kind,
                 require_local,
                 dispatch_plan.is_some(),
-                if require_local {
-                    "no registered host declaring shares_submitter_filesystem could be bound for this job's input, \
-                     output, or secret path"
-                } else {
-                    "no registered host could be bound for this job's required isolation class and sandbox kind; it \
-                     cannot be placed (this daemon has no local fallback for a Vm-backend or Untrusted-class job)"
-                },
+                &dispatch_plan_reason,
             ) {
                 return Ok(ControlResponse {
                     request_id: request.request_id,
