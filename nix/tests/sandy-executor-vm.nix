@@ -139,9 +139,11 @@ testPkgs.testers.runNixOSTest {
                   i=0
                   while [ ! -S "$d/s.sock" ] && [ "$i" -lt 50 ]; do sleep 0.2; i=$((i + 1)); done
                   ok=1
-                  # A daemon can create the socket and then die on a late sandbox/seccomp failure: settle, then require it alive.
+                  # A daemon can create the socket and then die on a late sandbox/seccomp failure: settle, then require it
+                  # alive. A dead child stays a zombie until the `wait` below and `kill -0` still succeeds on a zombie,
+                  # so also reject state Z.
                   sleep 1
-                  if [ -S "$d/s.sock" ] && kill -0 "$pid" 2>/dev/null; then echo virtiofsd-none-ok; ok=0; else echo "virtiofsd-none-failed: $(cat "$d/log")"; fi
+                  if [ -S "$d/s.sock" ] && kill -0 "$pid" 2>/dev/null && ! grep -q "^State:[[:space:]]*Z" "/proc/$pid/status" 2>/dev/null; then echo virtiofsd-none-ok; ok=0; else echo "virtiofsd-none-failed: $(cat "$d/log")"; fi
                   kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; rm -rf "$d"
                   exit "$ok"
                 '
