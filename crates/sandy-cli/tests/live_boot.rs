@@ -57,8 +57,8 @@ fn staged_secret_is_exported_to_the_job_env() -> anyhow::Result<()> {
     // Exit 0 iff $TOK is exported, non-empty, and equals the mounted secret file.
     // The comparison is in-guest so the secret value is never in the command argv,
     // and an unmounted/empty share fails the `-n` guard rather than false-passing.
-    // sandy joins the command argv and runs it through `sh`, so the probe is a
-    // single element (wrapping in `sh -c` would double-nest and mangle the quoting).
+    // The console shell-quotes each argv element (#443), so a bare probe string would be taken as a
+    // program name: run it as `sh -c <probe>`.
     let probe = r#"[ -n "$TOK" ] && [ "$TOK" = "$(cat /run/sandy/secrets/TOK)" ] && exit 0 || exit 7"#;
     let (code, env) = sandy_run_with_secret(home.path(), &target, "TOK", &secret_file, &["sh", "-c", probe])?;
 
