@@ -141,8 +141,8 @@ rec {
   # measuring them would understate real coverage. Writes an `lcov.info` the CI
   # job uploads; the per-crate summary prints in the build log.
   #
-  # `daemon_e2e` (sandy-cli's end-to-end daemon suite, #212/#227) stays
-  # excluded here (#233): it drives a SEPARATE `sandyd` process over a real
+  # `daemon_e2e` and `daemon_untrusted_e2e` (sandy-cli's end-to-end daemon
+  # suites, #212/#227, #505) stay excluded here (#233): they drive a SEPARATE `sandyd` process over a real
   # Unix socket, so attributing its coverage would need the instrumented
   # (`covCraneLib`) `sandyd` binary wired in too, not just a binary to spawn —
   # more than this check needs to solve. Its hermetic *correctness* (not
@@ -165,7 +165,7 @@ rec {
       # install creates $out, so `--output-path $out/lcov.info` hits a missing
       # dir. Create it first.
       preBuild = "mkdir -p \"$out\"";
-      cargoLlvmCovExtraArgs = "--workspace --lcov --output-path $out/lcov.info -E 'not binary(daemon_e2e)'";
+      cargoLlvmCovExtraArgs = "--workspace --lcov --output-path $out/lcov.info -E 'not binary(daemon_e2e) and not binary(daemon_untrusted_e2e)'";
     }
   );
 
@@ -184,7 +184,7 @@ rec {
     // {
       inherit cargoArtifacts;
       pnameSuffix = "-daemon-e2e";
-      cargoNextestExtraArgs = "-p sandy-cli --test daemon_e2e";
+      cargoNextestExtraArgs = "-p sandy-cli --test daemon_e2e --test daemon_untrusted_e2e";
       SANDYD_BIN = "${sandy}/bin/sandyd";
     }
   );
