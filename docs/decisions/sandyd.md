@@ -1245,11 +1245,12 @@ session_matches(session) || token_matches` (constant-time comparison,
   is no separate "bad token" error a prober could use to distinguish "wrong
   token" from "no token" or enumerate valid job ids.
 - **Best-effort at every step**, matching this record's own established
-  pattern for `RemoteLink::new`'s RNG-failure handling: an RNG failure
-  minting the token, a store-write failure persisting it, or a filesystem
-  failure on the CLI side all degrade that one job to session-only gating
-  (today's pre-fix behavior) rather than failing an otherwise-successful
-  `Submit` or `Attach`.
+  pattern for `RemoteLink::new`'s RNG-failure handling: a store-write
+  failure persisting the token, or a filesystem failure on the CLI side,
+  degrades that one job to session-only gating (today's pre-fix behavior)
+  rather than failing an otherwise-successful `Submit` or `Attach`. An RNG
+  failure minting the token no longer degrades: decision 23 refuses the
+  `Submit`, because a job with no token cannot be cancelled.
 
 Proven against a real dispatched job, not just reasoned about: the live
 acceptance (`live_attach.rs`) submits via one real `sandy daemon submit`
@@ -1937,7 +1938,6 @@ original wording): rejected per the reopened owner decision above — head-
 of-line blocking against `Dispatch`/`Cancel`/`AttachStateChanged` for every
 other job sharing that host-executor's one connection was judged worse
 than the added complexity of a second dial-back link.
-||||||| parent of 9a6f17f (feat(sandyd): Cancel requires the job attach token (#540))
 
 ## 23. `Cancel` is gated per job by the job's attach token (#540, audit #391)
 

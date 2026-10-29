@@ -718,7 +718,18 @@ pub async fn handle(
                 Some(presented) => {
                     let store = Arc::clone(store);
                     let job_id = cancel.job_id.clone();
-                    let stored = tokio::task::spawn_blocking(move || store.attach_token(&job_id)).await??;
+                    // A store fault refuses like any other failure, with the one message.
+                    let stored = match tokio::task::spawn_blocking(move || store.attach_token(&job_id)).await {
+                        Ok(Ok(stored)) => stored,
+                        Ok(Err(error)) => {
+                            tracing::warn!(%error, "cancel: reading the attach token failed");
+                            None
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "cancel: the attach token read task failed");
+                            None
+                        }
+                    };
                     stored.is_some_and(|stored| attach_tokens_match(&stored, presented))
                 }
                 None => false,

@@ -73,7 +73,9 @@ cleanup() {
   local rc=$?
   echo "==> cleaning up" >&2
   if [ -n "$job_id" ]; then
-    SANDY_SOCK="$sock" "$repo_root/target/debug/sandy" daemon cancel "$job_id" >/dev/null 2>&1 || true
+    # Cancel needs the job's attach token (#540); a refusal leaves the job running, so say so.
+    SANDY_SOCK="$sock" "$repo_root/target/debug/sandy" daemon cancel "$job_id" >/dev/null 2>&1 ||
+      echo "warning: cancel of job $job_id failed or was refused; it may still be running" >&2
   fi
   if [ -n "$executor_pid" ]; then
     ssh "$executor_ssh" "kill -TERM '$executor_pid'" >/dev/null 2>&1 || true
