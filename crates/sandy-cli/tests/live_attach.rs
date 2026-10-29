@@ -32,6 +32,21 @@ use sandy_fabric_local::{
     link::{LinkFrame, read_frame as link_read_frame, write_frame as link_write_frame},
 };
 
+/// A throwaway mesh TLS config for `handle_dispatch`'s decision-20 parameter:
+/// this file's `handle_dispatch` calls never reach `on_link`'s
+/// `relay_agent_link` dial (the fake `forward_back` address here is never
+/// actually dialed in these tests — the real attach path they exercise is
+/// local-session, not a remote mesh hop), so an unpersisted, freshly
+/// generated identity is fine.
+fn test_mesh_tls() -> sandy_fabric_local::mesh_link::MeshTlsIdentity {
+    sandy_fabric_local::mesh_link::MeshTlsIdentity {
+        identity: std::sync::Arc::new(sandy_conn::TlsIdentity::generate().expect("generate a throwaway test identity")),
+        orchestrator_fingerprint: sandy_conn::TlsIdentity::generate()
+            .expect("generate a throwaway test identity")
+            .fingerprint(),
+    }
+}
+
 /// Refuse unless `SANDY_LIVE=1` (INV-S9) — mirrors `live_m2_cross_machine.rs`'s
 /// own gate exactly; this file spawns real OS processes and binds real TCP
 /// sockets, M2 stage 1 needs no hypervisor.
@@ -379,6 +394,7 @@ async fn real_attach_round_trips_proves_session_fork_and_survives_detach_reattac
             rt,
             false,
             control,
+            test_mesh_tls(),
         )
     });
 
@@ -605,6 +621,7 @@ async fn the_real_cli_binary_attaches_delivers_output_and_exits_on_job_completio
                 rt,
                 false,
                 control,
+                test_mesh_tls(),
             )
         })
         .await
@@ -803,6 +820,7 @@ async fn a_separate_attach_process_gets_post_rights_via_the_persisted_token() ->
                 rt,
                 false,
                 control,
+                test_mesh_tls(),
             )
         })
         .await
