@@ -1,0 +1,116 @@
+# Peer-verdict gate (#528, charter #462 Gates): a PR needs a comment pinning its full
+# head SHA as `Peer verdict (<reviewer>): APPROVE`, and an `Owner sign-off:` comment when
+# it changes an `Owner decisions` section. The logic is scripts/ci/check_peer_verdict.py.
+#
+# Three triggers, one context:
+# - pull_request and issue_comment: the job publishes a COMMIT STATUS named
+#   `Peer verdict gate` on the PR head. A comment posted after the first CI run re-runs
+#   it, which a pull_request-only job could not do.
+# - merge_group: the job itself is a check run named `Peer verdict gate` on the
+#   merge-group commit, because the merge queue ignores a status on the PR head.
+#
+# Making it a gate needs `Peer verdict gate` in the repo ruleset's required checks. That
+# is a protected-branch setting, outside this repo, and is the owner's step. The same
+# step should restrict edits to this file and scripts/ci/check_peer_verdict.py (a ruleset
+# path restriction, or a CODEOWNERS entry with required review).
+#
+# What this guards, and what it does not:
+# - It guards against FORGETTING the gate. All agent sessions share one GitHub account,
+#   so it cannot prove who wrote a verdict. Only OWNER, MEMBER and COLLABORATOR comments
+#   count, because the repo is public.
+# - The script and its checkout come from the DEFAULT branch, never from the PR. The
+#   workflow YAML does not: a PR runs its own copy of this file (pull_request) and
+#   merge_group runs the merge-group commit's copy. Until the file is protected by the
+#   ruleset step above, a PR that edits this file can defeat the gate.
+# - PR content is fetched as git objects and read as text only; nothing from it is
+#   executed. Comment bodies are data (env, never interpolated into a shell).
+name: Peer verdict
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  issue_comment:
+    types: [created, edited]
+  merge_group:
+    types: [checks_requested]
+permissions: {}
+concurrency:
+  group: peer-verdict-${{ github.event.pull_request.number || github.event.issue.number || github.event.merge_group.head_ref }}
+  cancel-in-progress: true
+jobs:
+  peer-verdict:
+    # The check run is named only on merge_group, so the status and the check run
+    # never share a context.
+    name: ${{ github.event_name == 'merge_group' && 'Peer verdict gate' || 'Peer verdict status' }}
+    if: github.event_name != 'issue_comment' || github.event.issue.pull_request
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: write
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          disable-sudo: true
+          egress-policy: audit
+      - name: Checkout the default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Evaluate the gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+          MERGE_GROUP_REF: ${{ github.event.merge_group.head_ref }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT" == merge_group ]]; then
+            # Merge-group refs look like gh-readonly-queue/main/pr-<N>-<sha>.
+            if [[ ! "$MERGE_GROUP_REF" =~ ^.*/pr-([0-9]+)- ]]; then
+              echo "::error::cannot read the PR number from merge group ref: $MERGE_GROUP_REF"
+              exit 1
+            fi
+            PR_NUMBER="${BASH_REMATCH[1]}"
+          fi
+          pr=$(gh api "repos/$REPO/pulls/$PR_NUMBER")
+          head_sha=$(jq -r .head.sha <<<"$pr")
+          base_sha=$(jq -r .base.sha <<<"$pr")
+          post_status() {
+            # A status description is capped at 140 characters.
+            gh api "repos/$REPO/statuses/$head_sha" -f state="$1" -f context="Peer verdict gate" -f description="${2:0:140}" > /dev/null
+          }
+          finished=""
+          if [[ "$EVENT" != merge_group ]]; then
+            # Fail closed: a stale success on this head must not survive a run that dies half way.
+            post_status pending "evaluating"
+            trap 'if [[ -z "$finished" ]]; then post_status failure "the gate job failed before it could decide"; fi' EXIT
+          fi
+          jq '{number, head_sha: .head.sha, author: .user.login}' <<<"$pr" > pr.json
+          gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
+            --jq '.[] | {body, created_at, updated_at, author_association}' | jq -s . > comments.json
+          # Fetch the PR head as git objects only; never check it out or run it.
+          git fetch --no-tags origin "refs/pull/$PR_NUMBER/head"
+          git diff --no-color -U100000 "$base_sha...$head_sha" > diff.patch
+          if [[ ! -f scripts/ci/check_peer_verdict.py ]]; then
+            # Bootstrap: only the PR that ADDS the script may run before it is on the default branch.
+            if git diff --name-only "$base_sha...$head_sha" | grep -qx 'scripts/ci/check_peer_verdict.py'; then
+              echo "::warning::the gate script is not on the default branch yet; this PR adds it."
+              finished=1
+              [[ "$EVENT" == merge_group ]] || post_status success "bootstrap: this PR adds the gate"
+              exit 0
+            fi
+            echo "::error::scripts/ci/check_peer_verdict.py is missing on the default branch"
+            exit 1
+          fi
+          rc=0
+          python3 scripts/ci/check_peer_verdict.py --pr pr.json --comments comments.json --diff diff.patch | tee result.txt || rc=$?
+          finished=1
+          if [[ "$EVENT" == merge_group ]]; then
+            exit "$rc"
+          fi
+          if [[ "$rc" -eq 0 ]]; then state=success; else state=failure; fi
+          post_status "$state" "$(tr '\n' ' ' < result.txt)"
