@@ -161,7 +161,7 @@ fn credential_flows_through_git_helper_and_refreshes_midrun() -> anyhow::Result<
         digests: false,
         egress_proxy: false,
         template: format!("{}#{}", guest_flake().display(), target.topology_attr),
-        command: vec![probe.to_string()],
+        command: vec!["sh".to_string(), "-c".to_string(), probe.to_string()],
         secrets: vec![],
         inputs: vec![],
         outputs: vec![],
