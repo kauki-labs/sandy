@@ -542,7 +542,9 @@ async fn the_vm_job_environment_is_the_guest_login_environment() -> anyhow::Resu
 
     // The host's own value never crosses into the guest — the key alone
     // isn't proof (a guest image could independently define `$CARGO` for
-    // its own reasons), the host's specific value is.
+    // its own reasons), the host's specific value is: a Nix store path is
+    // content-addressed, so a guest built from a different Nix evaluation
+    // reproducing it by coincidence would need a hash collision.
     assert!(
         !pairs
             .iter()

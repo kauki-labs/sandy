@@ -607,10 +607,13 @@ security property the VM doesn't already provide, and would actively break
 the secret/devShell delivery path #481 and #496 build on.
 
 **Consequences.** No behavior change in `impls/vm`, `impls/agent`, or the
-guest image — this closes #389 and #502 as "by design," records why, and
-corrects the one test (`live_agent::the_vm_job_environment_is_only_the_allowlist`,
-rewritten in the same change as this record) that asserted the now-rejected
-contract. This section's own §10 (above) still says "#177 replaces the
+guest image — this closes #389 and #502 as "by design," records why, and adds
+a live test (`live_agent::the_vm_job_environment_is_the_guest_login_environment`,
+in the same change as this record) proving the accepted contract. No test
+asserting the rejected allowlist contract ever reached `main`: the one the
+owner's answer above refers to
+(`live_agent::the_vm_job_environment_is_only_the_allowlist`) lived only on
+the unmerged #503. This section's own §10 (above) still says "#177 replaces the
 export with an agent-owned allowlist" — that line predates this decision
 and is now in tension with it; flagged on #177 for the owner/triage to
 reconcile (close as superseded, or rescope to something this decision
