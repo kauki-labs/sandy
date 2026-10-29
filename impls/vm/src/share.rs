@@ -108,11 +108,12 @@ impl GuestShareTransport for VirtioFsTransport {
 /// shared dir, `--sandbox=none`, and `--readonly` for a read-only share so guest
 /// writes are denied at the host boundary (INV-1), not only by the guest mount.
 ///
-/// `--sandbox=none` disables virtiofsd's own namespace/chroot confinement (it is
-/// NOT a sandbox): the `namespace` and `chroot` modes need privileges sandy's
-/// unprivileged launch does not have. The daemon only ever serves a single
-/// per-run, sandy-owned dir that is wiped at teardown, and the guest is confined to
-/// the VM, so the daemon's own confinement is not the containment boundary here.
+/// `--sandbox=none` leaves the daemon in the host's namespaces, but virtiofsd still applies
+/// its default seccomp filter in this mode (K22). `--sandbox=namespace` was measured and does
+/// not start under the executor unit's hardening (fresh procfs mount refused), and `chroot`
+/// is root-only: see `docs/decisions/guest-shares.md` decision 3. The daemon only ever serves
+/// a single per-run, sandy-owned dir that is wiped at teardown, and the guest is confined to
+/// the VM.
 ///
 /// Pure, so the read-only decision per share is unit-testable without launching the
 /// daemon.
