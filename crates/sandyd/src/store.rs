@@ -214,8 +214,11 @@ impl JobStore {
         // The durable attach credential (#327): NULL for a job submitted
         // before this record existed, or one `set_attach_token` was never
         // called for (a narrow crash window right after `insert_pending`) —
-        // both degrade to the existing per-connection `session_matches`
-        // gate for that one job, never a fabricated or default token.
+        // never a fabricated or default token. For `Attach`, both degrade to
+        // the existing per-connection `session_matches` gate for that one
+        // job. For `Cancel` (#540, decision 23), there is no such fallback:
+        // a NULL token makes that job uncancellable via this RPC, tracked
+        // in #545.
         ensure_column(&conn, "attach_token", "ALTER TABLE jobs ADD COLUMN attach_token BLOB")?;
         // The durable archived transcript (#340 item 4): NULL until
         // `set_archive` is called, which happens only once the agent's own

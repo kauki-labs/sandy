@@ -71,9 +71,11 @@ fn try_persist_attach_token(job_id: &str, token: &[u8]) -> Result<(), sandy_fsut
 /// Read back `job_id`'s durable attach token, if [`persist_attach_token`]
 /// ever wrote one. `None` on ANY failure (missing file, a tampered/unsafe
 /// directory, an unreadable staging base) — never an error that would block
-/// `daemon attach` itself; the caller falls back to presenting no token,
-/// which `Attach`'s handler already treats as "fall back to
-/// `session_matches`" rather than a hard refusal.
+/// the caller. What "no token" means differs by RPC: for `daemon attach`,
+/// the handler falls back to `session_matches` rather than a hard refusal;
+/// for `daemon cancel` (#540, decision 23), there is no such fallback — a
+/// missing token is a hard refusal, since `Cancel` has no session gate to
+/// fall back to.
 #[must_use]
 pub fn read_attach_token(job_id: &str) -> Option<Vec<u8>> {
     // The id names a file in the token directory: refuse anything that is not one plain component,
