@@ -1,0 +1,48 @@
+name: Scheduled supply-chain audit
+# `checks.audit` (pr.yaml) is hermetic: it reads the `advisory-db` flake input
+# pinned in flake.lock, so a new RustSec advisory stays invisible on every PR
+# until someone bumps that pin (#494). This workflow runs `nix run .#audit`
+# instead: no toolchain, no pin, a fresh `git clone` of RustSec/advisory-db on
+# every run, so a new advisory (or a dependency going unmaintained/yanked)
+# fails visibly here without waiting for a PR.
+#
+# A failing scheduled run does not block anything: it only shows up as a red
+# run in the Actions tab (and, per GitHub's default, an email to whoever last
+# edited this file). Escalating it further (opening an issue, pinging a
+# channel) is not done here — out of scope for #494, left for a follow-up if
+# the plain red run proves insufficient in practice.
+on:
+  schedule:
+    - cron: "17 4 * * *" # daily; an arbitrary off-hour minute, not :00, to avoid the GitHub Actions top-of-hour pileup
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: audit-schedule
+  cancel-in-progress: false
+jobs:
+  audit:
+    name: Live advisory audit
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      # No Cachix/Nix-store cache: cargo-audit (the only thing this builds or
+      # fetches besides the live advisory DB itself) is a small, public-cache
+      # derivation (~300 MiB closure, no Rust toolchain), so a warm cache
+      # buys little here versus the Rust-build jobs in pr.yaml.
+      - name: Audit against a live RustSec advisory DB
+        run: nix run .#audit

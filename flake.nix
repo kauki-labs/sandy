@@ -240,6 +240,33 @@
             inherit (pkgs) sandy-host-executor sandy-agent sandy-guest-wrapper;
           };
 
+          # `checks.audit` (below, via crane's `cargoAudit`) always passes
+          # `-n -d <advisory-db>` (crane's own default; see nix/packages/
+          # sandy.nix) plus this derivation's `--deny warnings --no-yanked`,
+          # so it only ever sees whatever `flake.lock` pinned `advisory-db`
+          # to, and a new RustSec advisory stays invisible until someone
+          # bumps that pin (#494). `nix run .#audit` is the live
+          # counterpart: no Rust toolchain (cargo-audit only reads
+          # `Cargo.lock`, so there is nothing to compile), and no `-d`
+          # override, so it falls through to `.cargo/audit.toml`'s
+          # `[database] fetch = true` and clones RustSec/advisory-db fresh
+          # on every run. `"$@"` passthrough lets a caller point it at a
+          # different lockfile (e.g. `-- --file <path>`) for a one-off check
+          # without a second app. Run from the repo root, the same way
+          # `cargo audit` itself discovers `.cargo/audit.toml`.
+          apps.audit = {
+            type = "app";
+            program = "${
+              pkgs.writeShellApplication {
+                name = "sandy-audit";
+                runtimeInputs = [ pkgs.cargo-audit ];
+                text = ''cargo-audit audit "$@"'';
+                meta.description = "Audit Cargo.lock against a freshly fetched RustSec advisory DB (no toolchain, network required)";
+              }
+            }/bin/sandy-audit";
+            meta.description = "Live RustSec advisory audit (see checks.audit for the hermetic, pinned-DB gate)";
+          };
+
           checks = {
             inherit (sandyPackages)
               sandy
