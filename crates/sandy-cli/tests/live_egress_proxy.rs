@@ -283,8 +283,8 @@ fn allowed_target_is_reachable_through_the_proxy() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// KP2: a target not on the allow-list gets `403`. That no connection leaves the host is not observed
-/// here, so `kpi.md` keeps that half of KP2q out of the green claim.
+/// KP2: a target not on the allow-list gets `403`. That the proxy dials nothing is observed by
+/// `a_denied_target_is_never_dialed_by_the_proxy`.
 #[test]
 fn denied_target_gets_403() -> anyhow::Result<()> {
     let target = require_proxy_live()?;
@@ -631,6 +631,97 @@ exit 0
     assert!(
         text.contains("after the guest booted") && text.contains("guest exit 0"),
         "the proxy must die after the guest booted, with the job exiting 0; envelope: {env}"
+    );
+    Ok(())
+}
+
+/// KP2, host side: while the guest gets `403` for a denied target, the proxy holds no connection to it. The
+/// job first opens a tunnel to the allowed target and keeps it, which proves the observer sees the proxy's
+/// connections (a positive control: without it an empty observation would prove nothing). It then asks for the
+/// denied target, expects `403`, and waits so the host samples for a while. A dial that opened and closed
+/// between two 200 ms samples would be missed; this check does not claim to catch that.
+#[test]
+fn a_denied_target_is_never_dialed_by_the_proxy() -> anyhow::Result<()> {
+    let target = require_proxy_live()?;
+    build_guest(&target)?;
+    let home = tempfile::tempdir().context("temp SANDY_HOME")?;
+    let stderr_path = home.path().join("sandy.stderr");
+    let (allowed, denied) = (allowed_host(), denied_host());
+    let parse = |name: &str, host: &str| {
+        host.parse::<Ipv4Addr>()
+            .with_context(|| format!("KP2 needs {name} to be an IPv4 literal, got {host}"))
+    };
+    let (allowed_ip, denied_ip) = (
+        parse("SANDY_EGRESS_ALLOWED", &allowed)?,
+        parse("SANDY_EGRESS_DENIED", &denied)?,
+    );
+    anyhow::ensure!(allowed_ip != denied_ip, "KP2 needs distinct allowed and denied targets");
+    let allow = vec![format!("{allowed}:{PROBE_PORT}")];
+
+    let script = format!(
+        r#"set -u
+exec 3<>/dev/tcp/127.0.0.1/3128
+printf 'CONNECT {a}:{PROBE_PORT} HTTP/1.1\r\nHost: {a}:{PROBE_PORT}\r\n\r\n' >&3
+IFS= read -r -t 15 line3 <&3 || true
+exec 4<>/dev/tcp/127.0.0.1/3128
+printf 'CONNECT {d}:{PROBE_PORT} HTTP/1.1\r\nHost: {d}:{PROBE_PORT}\r\n\r\n' >&4
+IFS= read -r -t 15 line4 <&4 || true
+echo "live_egress_proxy: allowed -> $line3 / denied -> $line4"
+sleep 20
+case "$line4" in *" 403 "*) exit 0 ;; *) exit 10 ;; esac
+"#,
+        a = allowed,
+        d = denied
+    );
+    let mut child = sandy_proxy_cmd(home.path(), &target, &allow, &script)
+        .stdout(Stdio::piped())
+        .stderr(std::fs::File::create(&stderr_path).context("create stderr file")?)
+        .spawn()
+        .context("spawn sandy")?;
+
+    // Sample the proxy's connections until sandy exits. Every error path still reaps sandy below.
+    let mut seen_allowed = false;
+    let mut dialed_denied = false;
+    let deadline = Instant::now() + Duration::from_secs(400);
+    let observed: anyhow::Result<()> = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break Ok(()),
+            Ok(None) => {}
+            Err(e) => break Err(anyhow::Error::new(e).context("poll sandy")),
+        }
+        if Instant::now() > deadline {
+            break Err(anyhow::anyhow!("sandy ran past the 400 s observation budget"));
+        }
+        let sample = find_proxy_child(child.id()).and_then(|proxy| match proxy {
+            Some(pid) => Ok(Some((
+                has_tunnel(pid, allowed_ip, PROBE_PORT)?,
+                has_tunnel(pid, denied_ip, PROBE_PORT)?,
+            ))),
+            None => Ok(None),
+        });
+        match sample {
+            Ok(Some((to_allowed, to_denied))) => {
+                seen_allowed |= to_allowed;
+                dialed_denied |= to_denied;
+            }
+            Ok(None) => {}
+            Err(e) => break Err(e),
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let output = child.wait_with_output().context("wait for sandy")?;
+    observed?;
+    let stderr = std::fs::read(&stderr_path).unwrap_or_default();
+    let (code, env) = parse_envelope(output.status.code().unwrap_or(-1), &output.stdout, &stderr)?;
+
+    assert_guest_ok(code, &env, &format!("CONNECT {denied}:{PROBE_PORT} must get 403"));
+    assert!(
+        seen_allowed,
+        "the observer never saw the proxy's tunnel to the allowed target, so it proves nothing; envelope: {env}"
+    );
+    assert!(
+        !dialed_denied,
+        "the proxy held a connection to the denied target {denied}:{PROBE_PORT}; envelope: {env}"
     );
     Ok(())
 }
