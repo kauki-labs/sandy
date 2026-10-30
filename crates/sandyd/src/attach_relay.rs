@@ -69,18 +69,27 @@ pub async fn serve_attach_accept_loop(
     registry: &Arc<JobRegistry>,
     host_registry: &Arc<HostRegistry>,
 ) {
-    serve_attach_accept_loop_with_cap(listener, registry, host_registry, MAX_CONCURRENT_ATTACH_CONNECTIONS).await;
+    serve_attach_accept_loop_with_cap(
+        listener,
+        registry,
+        host_registry,
+        MAX_CONCURRENT_ATTACH_CONNECTIONS,
+        rustix::process::geteuid().as_raw(),
+    )
+    .await;
 }
 
 /// [`serve_attach_accept_loop`]'s body, parameterized over the concurrency
 /// cap so a test can drive it with a small `max_concurrent` instead of
 /// waiting for [`MAX_CONCURRENT_ATTACH_CONNECTIONS`] real connections to
-/// prove the cap holds.
+/// prove the cap holds, and over the uid a peer must have so a test can
+/// refuse its own uid without root.
 async fn serve_attach_accept_loop_with_cap(
     listener: &UnixListener,
     registry: &Arc<JobRegistry>,
     host_registry: &Arc<HostRegistry>,
     max_concurrent: usize,
+    owner_uid: u32,
 ) {
     let mut connections = tokio::task::JoinSet::new();
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
@@ -96,6 +105,10 @@ async fn serve_attach_accept_loop_with_cap(
                 };
                 match accepted {
                     Ok((stream, _addr)) => {
+                        if let Err(refused) = crate::peer_cred::require_user(&stream, owner_uid) {
+                            tracing::warn!(%refused, "refusing an attach connection");
+                            continue;
+                        }
                         let registry = Arc::clone(registry);
                         let host_registry = Arc::clone(host_registry);
                         connections.spawn(async move {
@@ -1403,6 +1416,57 @@ mod tests {
         Ok(())
     }
 
+    /// A peer whose uid is not the daemon's gets a closed connection and no bytes, even with a
+    /// valid-looking Join frame already sent (#533).
+    #[tokio::test]
+    async fn a_peer_with_another_uid_is_closed_without_a_reply() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir().context("tempdir")?;
+        let sock = tmp.path().join("attach.sock");
+        let listener = UnixListener::bind(&sock).context("bind")?;
+
+        let registry = Arc::new(JobRegistry::new()?);
+        let host_registry = Arc::new(HostRegistry::default());
+        let loop_registry = Arc::clone(&registry);
+        let loop_host_registry = Arc::clone(&host_registry);
+        let other_uid = rustix::process::geteuid().as_raw().wrapping_add(1);
+        let accept_loop = tokio::spawn(async move {
+            serve_attach_accept_loop_with_cap(&listener, &loop_registry, &loop_host_registry, 1, other_uid).await;
+        });
+
+        let client = tokio::net::UnixStream::connect(&sock).await.context("connect")?;
+        let (mut rd, mut wr) = client.into_split();
+        let ghost_cap = registry.authority().mint(CapScope {
+            peer: PeerId::from("operator"),
+            channel: ChannelId::from("never-submitted"),
+            rights: post_capable(),
+            expires_at: None,
+        })?;
+        // The refusal may close the socket before this write lands; either outcome is fine.
+        let _ = write_frame(
+            &mut wr,
+            &LinkFrame::Join {
+                cap: hex::encode(encode_cap(&ghost_cap)?),
+                channel: None,
+                cols: None,
+                rows: None,
+            },
+        )
+        .await;
+
+        let reply = tokio::time::timeout(WAIT, read_frame(&mut rd))
+            .await
+            .context("timed out: the refused connection was left open")?;
+        // A close with the Join frame still unread can surface as ECONNRESET on Linux; both are a refusal.
+        assert!(
+            matches!(&reply, Ok(None))
+                || matches!(&reply, Err(sandy_fabric_local::link::LinkError::Io(e)) if e.kind() == std::io::ErrorKind::ConnectionReset),
+            "a refused peer must see a plain close, got {reply:?}"
+        );
+
+        accept_loop.abort();
+        Ok(())
+    }
+
     /// Regression (NV-06, #395): before this cap, the loop spawned one task
     /// per accepted connection with no limit, so a local peer opening
     /// connections faster than they're handshaked could exhaust the
@@ -1421,7 +1485,14 @@ mod tests {
         let loop_registry = Arc::clone(&registry);
         let loop_host_registry = Arc::clone(&host_registry);
         let accept_loop = tokio::spawn(async move {
-            serve_attach_accept_loop_with_cap(&listener, &loop_registry, &loop_host_registry, 1).await;
+            serve_attach_accept_loop_with_cap(
+                &listener,
+                &loop_registry,
+                &loop_host_registry,
+                1,
+                rustix::process::geteuid().as_raw(),
+            )
+            .await;
         });
 
         // First connection: holds the only permit by never presenting its

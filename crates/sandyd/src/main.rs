@@ -354,6 +354,10 @@ async fn main() {
                 match accepted {
                     Ok((stream, _addr)) => {
                         backoff.reset();
+                        if let Err(refused) = sandyd::peer_cred::require_same_user(&stream) {
+                            tracing::warn!(%refused, "refusing a control connection");
+                            continue;
+                        }
                         let store = Arc::clone(&store);
                         let registry = Arc::clone(&registry);
                         let host_registry = Arc::clone(&host_registry);
