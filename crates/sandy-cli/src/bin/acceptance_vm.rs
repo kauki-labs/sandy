@@ -84,7 +84,7 @@ fn run() -> Result<(), String> {
 /// independently of the executor under test — `SandboxKind::Vm` (every live
 /// backend here is a hypervisor) and `target_arch` converted via
 /// [`arch_from_target`], the live target's own independently-detected guest
-/// arch ([`require_live`]'s `host_target()` + `ensure_arch_matches`), not
+/// arch ([`require_live`]'s `host_target()`, `qemu_target` and `ensure_arch_matches`), not
 /// [`sandy_fabric_local::executor::host_arch`] — the same function
 /// `VmBackendExecutor::capabilities()` itself calls, which would make the
 /// check compare a value to itself instead of catching a real mismatch — so a
