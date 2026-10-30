@@ -773,12 +773,18 @@ async fn run_mesh_accept_loop(
     }
 }
 
-/// `sandyd cancel <job-id>` (#545): the operator's offline cancel. `None` when the first argument is not
-/// a subcommand, so the daemon starts as usual; otherwise the exit code.
+/// `sandyd cancel <job-id>` (#545): the operator's offline cancel. `None` when there is no argument, so the
+/// daemon starts as usual; otherwise the exit code.
 fn run_operator_command() -> Option<i32> {
     let mut args = std::env::args().skip(1);
-    if args.next().as_deref() != Some("cancel") {
-        return None;
+    match args.next().as_deref() {
+        None => return None,
+        Some("cancel") => {}
+        // `--version` was handled before this; any other argument is a typo, not a request to start.
+        Some(other) => {
+            eprintln!("sandyd: unknown argument `{other}`; usage: sandyd [--version | cancel <job-id>]");
+            return Some(2);
+        }
     }
     let (Some(job_id), None) = (args.next(), args.next()) else {
         eprintln!("usage: sandyd cancel <job-id>");
