@@ -200,7 +200,7 @@ or run them deliberately with those two variables set.
 
 The parity gate for the NIC-less guest with a vsock host proxy
 ([`egress-proxy.md`](../decisions/egress-proxy.md) decision 5, #360). **KP1q, KP3q, KP5q, KP6q and KP7q are green; KP2q and KP4q are partial. On vfkit KP1v, KP3v,
-KP5v and KP6v are green, KP2v and KP4v are partial, and KP7v has no test yet**, and none counts toward
+KP5v, KP6v and KP7v are green, and KP2v and KP4v are partial**, and none counts toward
 the floor above until its test exists and passes on its matrix. Each capability needs both its qemu and its vfkit row to pass
 before the nftables path (K13) is deleted. All tests live in
 `sandy-cli/tests/live_egress_proxy.rs`.
@@ -220,7 +220,7 @@ before the nftables path (K13) is deleted. All tests live in
 | KP6q | Proxy death           | Killing the proxy mid-run classifies the run as band 3, whatever the guest's exit.                                                                                                                                      | `live_egress_proxy.rs::proxy_death_mid_run_is_band_3`                 | INV-7   | qemu        | green (the Linux KVM host, 2026-10-28)                                                                                |
 | KP6v | Proxy death           | Killing the proxy mid-run classifies the run as band 3, whatever the guest's exit.                                                                                                                                      | `live_egress_proxy.rs::proxy_death_mid_run_is_band_3`                 | INV-7   | vfkit       | green (Apple silicon, vfkit 0.6.3, linux-builder, 2026-10-30)                                                         |
 | KP7q | Proxy startup failure | A proxy that cannot start refuses the VM run as band 3, with no boot.                                                                                                                                                   | `live_egress_proxy.rs::proxy_startup_failure_is_band_3`               | INV-7   | qemu        | green (the Linux KVM host, 2026-10-28)                                                                                |
-| KP7v | Proxy startup failure | A proxy that cannot start refuses the VM run as band 3, with no boot.                                                                                                                                                   | `live_egress_proxy.rs::proxy_startup_failure_is_band_3`               | INV-7   | vfkit       | not yet green: no vfkit test exists (`proxy_startup_failure_is_band_3` is Linux-only)                                 |
+| KP7v | Proxy startup failure | A proxy that cannot start refuses the VM run as band 3, with no boot.                                                                                                                                                   | `live_egress_proxy.rs::proxy_startup_failure_is_band_3`               | INV-7   | vfkit       | green (Apple silicon, vfkit 0.6.3, linux-builder, 2026-10-30)                                                         |
 
 ## Not yet a KPI
 
