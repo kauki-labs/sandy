@@ -35,10 +35,8 @@
 //!
 //! ## Not covered
 //!
-//! KP4's raw `AF_VSOCK` sub-case: the guest has no tool that opens an `AF_VSOCK`
-//! stream (bash has none, and the image carries no python or socat), so a raw vsock
-//! stream to the proxy port is not attempted. The relay path is covered by KP2/KP3. The
-//! qemu "second CID is refused" sub-case needs a second VM and is a TODO.
+//! KP4's qemu "second CID is refused" sub-case needs a second VM; `a_vsock_peer_with_another_cid_is_closed_unanswered`
+//! covers the same CID filter from the host over vsock loopback instead.
 
 #![cfg(feature = "live")]
 
@@ -729,6 +727,54 @@ case "$line4" in *" 403 "*) exit 0 ;; *) exit 10 ;; esac
 /// `path` as one single-quoted shell word; an embedded `'` is closed, escaped and reopened.
 fn sh_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
+/// KP4, raw vsock: a job that skips the relay and opens its own AF_VSOCK stream to the host proxy meets the
+/// same allow-list. The job reads the proxy port off the relay's command line (`--vsock-port`, random on
+/// qemu, constant on vfkit), then speaks CONNECT through `socat VSOCK-CONNECT:2:<port>`: the allowed target
+/// gets `200`, the denied one `403`. Both legs run this one test.
+#[test]
+fn a_raw_vsock_stream_meets_the_same_allow_list() -> anyhow::Result<()> {
+    let target = require_proxy_live()?;
+    build_guest(&target)?;
+    let home = tempfile::tempdir().context("temp SANDY_HOME")?;
+    let (allowed, denied) = (allowed_host(), denied_host());
+    let allow = vec![format!("{allowed}:{PROBE_PORT}")];
+
+    let script = format!(
+        r#"set -u
+command -v socat >/dev/null || exit 49
+port=""
+for f in /proc/[0-9]*/cmdline; do
+  c=$(tr '\0' ' ' <"$f" 2>/dev/null) || continue
+  case "$c" in
+    *egress-relay*--vsock-port*)
+      port=$(printf '%s' "$c" | sed -n 's/.*--vsock-port \([0-9][0-9]*\).*/\1/p')
+      break ;;
+  esac
+done
+[ -n "$port" ] || exit 50
+raw_status() {{
+  printf 'CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n' "$1" "$1" \
+    | timeout 10 socat -T3 - "VSOCK-CONNECT:2:$port" 2>/dev/null | head -n1 | cut -d' ' -f2
+}}
+denied_status=$(raw_status {denied}:{PROBE_PORT})
+allowed_status=$(raw_status {allowed}:{PROBE_PORT})
+echo "live_egress_proxy: raw vsock port $port: denied -> $denied_status, allowed -> $allowed_status"
+[ "$denied_status" = 403 ] || exit 51
+[ "$allowed_status" = 200 ] || exit 52
+exit 0
+"#
+    );
+    let (code, env) = sandy_proxy_run(home.path(), &target, &allow, &script)?;
+
+    assert_guest_ok(
+        code,
+        &env,
+        "a raw vsock stream must meet the allow-list (guest exit 49 = no socat in the image, 50 = no relay command \
+         line found, 51 = the denied target did not get 403, 52 = the allowed target did not get 200)",
+    );
+    Ok(())
 }
 
 /// A `sandy-egress-proxy` listening on vsock `port` for `peer_cid` only, started standalone. Killed on drop.
