@@ -1,13 +1,19 @@
 name: Coverage
 # Instrumented cargo-llvm-cov, split out from pr.yaml (CI gate stays a plain
-# `cargo nextest` run): slower, and has been failing outright on GitHub's
-# runners (reproduced locally). Runs once per push to main instead of once
-# per PR, so Codecov's history keeps updating without gating every PR on it.
+# `cargo nextest` run): noticeably slower, and there's no need to re-run it
+# on every PR when Codecov already has the last push's report. Runs once per
+# push to main instead.
 on:
   push:
     branches: [main]
 concurrency:
   group: coverage
+  # cancel-in-progress: false only protects a run already in progress; with
+  # the implicit queue: single, a push to main that lands while a coverage
+  # run is active still cancels any pending run, so that commit gets no LCOV
+  # upload. queue: max (GitHub, May 2026) is the real fix, but this repo's
+  # pinned actionlint (1.7.12) predates that field and rejects it as unknown
+  # — see CodeRabbit's review on #561. Revisit once actionlint catches up.
   cancel-in-progress: false
 permissions:
   contents: read
