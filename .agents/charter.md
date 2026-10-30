@@ -21,8 +21,10 @@ peer (`sandy-*` or sandbox PoC) that did not write the change.
 
 ## Claim, lease, handoff
 
-1. Claim an item only if it has `state:ready`. Post `lease: <agent-id>`, swap the label to
-   `state:in-progress`, and re-read to confirm you won (lowest agent id wins a race).
+1. Claim an item only if it has `state:ready`. Post a `claim: <agent-id>` comment, wait 60
+   seconds, and re-read the comments. The earliest `claim:` comment by `createdAt` wins; ties
+   go to the lowest agent id. Only the winner posts `lease: <agent-id>` and swaps the label
+   to `state:in-progress`. Losers pull another item.
 2. Refresh the lease comment (edit it, do not add comments) at least every 5 minutes. A lease
    silent for 15 minutes is reaped.
 3. Claim before the first commit. Do not push or open a PR for an item another agent leases.
