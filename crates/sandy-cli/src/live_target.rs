@@ -73,7 +73,7 @@ pub fn require_live() -> anyhow::Result<LiveTarget> {
 /// (#447) instead of surfacing as an `executor_suite` capability mismatch.
 fn qemu_target(host_arch: &str) -> anyhow::Result<LiveTarget> {
     if host_arch != "x86_64" {
-        bail!("refusing: no qemu live target for a `{host_arch}` host — only x86_64 Linux is on the live matrix");
+        bail!("refusing: no qemu live target for host arch `{host_arch}` — only x86_64 Linux is on the live matrix");
     }
     Ok(LiveTarget {
         hypervisor: "qemu-system-x86_64".to_string(),
@@ -157,7 +157,10 @@ mod tests {
             Err(err) => err,
             Ok(_) => panic!("expected a refusal for an aarch64 host"),
         };
-        assert!(err.to_string().contains("aarch64"), "{err}");
+        assert!(
+            err.to_string().contains("refusing") && err.to_string().contains("aarch64"),
+            "{err}"
+        );
     }
 
     #[test]
