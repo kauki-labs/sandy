@@ -731,6 +731,108 @@ fn sh_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }
 
+/// A `sandy-egress-proxy` listening on vsock `port` for `peer_cid` only, started standalone. Killed on drop.
+#[cfg(target_os = "linux")]
+struct VsockProxy(std::process::Child);
+
+#[cfg(target_os = "linux")]
+impl VsockProxy {
+    fn start(port: u32, peer_cid: u32, rules: &[(&str, u16)]) -> anyhow::Result<Self> {
+        use std::io::{BufRead, Write};
+
+        let bin = std::env::var_os("SANDY_EGRESS_PROXY_BIN")
+            .map(std::path::PathBuf::from)
+            .or_else(|| find_on_path("sandy-egress-proxy"))
+            .context("refusing: sandy-egress-proxy is neither SANDY_EGRESS_PROXY_BIN nor on PATH")?;
+        let policy = serde_json::json!({
+            "rules": rules.iter().map(|(host, port)| serde_json::json!({"host": host, "port": port})).collect::<Vec<_>>()
+        });
+        let child = Command::new(bin)
+            .args(["--vsock-port", &port.to_string(), "--peer-cid", &peer_cid.to_string()])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("spawn the standalone proxy")?;
+        // The guard owns the child before anything can fail, so an early return still reaps it.
+        let mut proxy = Self(child);
+        proxy
+            .0
+            .stdin
+            .take()
+            .context("proxy stdin")?
+            .write_all(policy.to_string().as_bytes())
+            .context("write the policy")?;
+        let mut ready = String::new();
+        std::io::BufReader::new(proxy.0.stdout.take().context("proxy stdout")?)
+            .read_line(&mut ready)
+            .context("read READY")?;
+        anyhow::ensure!(ready.trim() == "READY", "the proxy did not print READY, got {ready:?}");
+        Ok(proxy)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for VsockProxy {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Send one `CONNECT` to the proxy over vsock loopback and return what the proxy answers (empty on a plain
+/// close). `VMADDR_CID_LOCAL` (1) is the peer CID the proxy sees for a connection from this host.
+#[cfg(target_os = "linux")]
+fn vsock_loopback_connect_answer(port: u32, target: &str) -> anyhow::Result<Vec<u8>> {
+    use std::io::{Read, Write};
+
+    let mut stream = vsock::VsockStream::connect_with_cid_port(1, port)
+        .context("connect over vsock loopback (CID 1): is the `vsock_loopback` kernel module loaded?")?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    // A refused peer may already be closed; a failed write is part of the refusal, not an error here.
+    let _ = stream.write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes());
+    let mut answer = Vec::new();
+    match stream.read_to_end(&mut answer) {
+        Ok(_) => {}
+        // A reset after the proxy dropped the stream counts as a close with no answer.
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Err(e) => return Err(anyhow::Error::new(e).context("read the proxy's answer")),
+    }
+    Ok(answer)
+}
+
+/// KP4, qemu wrong-CID case: the proxy serves only the CID of the guest it was started for. A vsock peer with
+/// any other CID is closed unanswered. A second VM is not needed: a connection from this host over vsock
+/// loopback arrives with CID 1, which is a CID the proxy was not started for. A control run with the proxy
+/// started for CID 1 gets an HTTP answer, so the silent close in the first run is the CID filter and not a
+/// broken listener or client.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_vsock_peer_with_another_cid_is_closed_unanswered() -> anyhow::Result<()> {
+    require_proxy_live()?;
+    #[allow(clippy::cast_possible_truncation, reason = "a pid fits a port offset")]
+    let base = 50_000 + (std::process::id() % 10_000);
+    let denied = format!("{}:{PROBE_PORT}", denied_host());
+
+    let control = VsockProxy::start(base, 1, &[("203.0.113.9", PROBE_PORT)])?;
+    let answered = vsock_loopback_connect_answer(base, &denied)?;
+    assert!(
+        answered.starts_with(b"HTTP/1.1 403"),
+        "control: the proxy for CID 1 must answer a denied CONNECT with 403, got {:?}",
+        String::from_utf8_lossy(&answered)
+    );
+    drop(control);
+
+    let _refusing = VsockProxy::start(base + 1, 4242, &[("203.0.113.9", PROBE_PORT)])?;
+    let answered = vsock_loopback_connect_answer(base + 1, &denied)?;
+    assert!(
+        answered.is_empty(),
+        "a peer whose CID is not 4242 must be closed unanswered, got {:?}",
+        String::from_utf8_lossy(&answered)
+    );
+    Ok(())
+}
+
 /// Write an executable `#!/bin/sh` script to `path`.
 fn write_script(path: &Path, body: &str) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
