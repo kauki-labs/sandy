@@ -656,7 +656,13 @@ mod tests {
     fn an_unknown_peer_is_refused_regardless_of_the_claimed_host_id() {
         let allowlist = ExecutorAllowlist::new([(executor_ip(), executor_fp())]);
         let registry = HostRegistry::default();
-        let result = registry.register(&allowlist, other_ip(), other_fp(), "ws01".to_owned(), capabilities());
+        let result = registry.register(
+            &allowlist,
+            other_ip(),
+            other_fp(),
+            "remote-host".to_owned(),
+            capabilities(),
+        );
         assert_eq!(result.err(), Some(RegisterError::NotAllowed));
     }
 
@@ -670,7 +676,13 @@ mod tests {
         let allowlist = ExecutorAllowlist::new([(executor_ip(), executor_fp()), (other_ip(), other_fp())]);
         let registry = HostRegistry::default();
         // executor_fp() is genuinely pinned, just not to other_ip().
-        let result = registry.register(&allowlist, other_ip(), executor_fp(), "ws01".to_owned(), capabilities());
+        let result = registry.register(
+            &allowlist,
+            other_ip(),
+            executor_fp(),
+            "remote-host".to_owned(),
+            capabilities(),
+        );
         assert_eq!(result.err(), Some(RegisterError::NotAllowed));
     }
 
@@ -683,12 +695,12 @@ mod tests {
                 &allowlist,
                 executor_ip(),
                 executor_fp(),
-                "ws01".to_owned(),
+                "remote-host".to_owned(),
                 capabilities(),
             )
             .expect("the allowed peer must register");
 
-        assert_eq!(registry.capabilities_of("ws01"), Some(capabilities()));
+        assert_eq!(registry.capabilities_of("remote-host"), Some(capabilities()));
         assert_eq!(registry.capabilities_of("ghost"), None);
         Ok(())
     }
@@ -714,13 +726,13 @@ mod tests {
                 &allowlist,
                 executor_ip(),
                 executor_fp(),
-                "ws01".to_owned(),
+                "remote-host".to_owned(),
                 capabilities(),
             )
             .expect("the allowed peer must register");
 
         let dispatch = dispatch();
-        registry.send_dispatch("ws01", dispatch.clone()).await?;
+        registry.send_dispatch("remote-host", dispatch.clone()).await?;
 
         let received = dispatch_rx.recv().await.expect("the dispatch must arrive");
         assert_eq!(received, dispatch);
@@ -748,7 +760,7 @@ mod tests {
                 &allowlist,
                 executor_ip(),
                 executor_fp(),
-                "ws01".to_owned(),
+                "remote-host".to_owned(),
                 capabilities(),
             )
             .expect("the allowed peer must register");
@@ -758,7 +770,7 @@ mod tests {
             attached: true,
             sequence: 0,
         };
-        registry.send_attach_state_changed("ws01", msg.clone()).await?;
+        registry.send_attach_state_changed("remote-host", msg.clone()).await?;
 
         let received = attach_state_rx.recv().await.expect("the message must arrive");
         assert_eq!(received, msg);
@@ -781,7 +793,7 @@ mod tests {
                 &allowlist,
                 executor_ip(),
                 executor_fp(),
-                "ws01".to_owned(),
+                "remote-host".to_owned(),
                 capabilities(),
             )
             .expect("the allowed peer must register");
@@ -791,7 +803,7 @@ mod tests {
             attached: false,
             sequence: 0,
         };
-        registry.send_attach_state_changed("ws01", msg.clone()).await?;
+        registry.send_attach_state_changed("remote-host", msg.clone()).await?;
         assert_eq!(attach_state_rx.recv().await, Some(msg));
         Ok(())
     }
@@ -823,14 +835,14 @@ mod tests {
                 &allowlist,
                 executor_ip(),
                 executor_fp(),
-                "ws01".to_owned(),
+                "remote-host".to_owned(),
                 capabilities(),
             )
             .expect("the allowed peer must register");
 
         let mut dispatch = dispatch();
         dispatch.required_isolation_class = sandy_executor_proto::IsolationClass::Untrusted.into();
-        let result = registry.send_dispatch("ws01", dispatch).await;
+        let result = registry.send_dispatch("remote-host", dispatch).await;
         assert_eq!(result, Err(DispatchSendError::UnsupportedIsolationClass));
         Ok(())
     }
@@ -846,14 +858,14 @@ mod tests {
                 &allowlist,
                 executor_ip(),
                 executor_fp(),
-                "ws01".to_owned(),
+                "remote-host".to_owned(),
                 capabilities(),
             )
             .expect("the allowed peer must register");
 
         let mut dispatch = dispatch();
         dispatch.required_isolation_class = sandy_executor_proto::IsolationClass::Unspecified.into();
-        let result = registry.send_dispatch("ws01", dispatch).await;
+        let result = registry.send_dispatch("remote-host", dispatch).await;
         assert_eq!(result, Err(DispatchSendError::UnsupportedIsolationClass));
         Ok(())
     }
@@ -872,14 +884,14 @@ mod tests {
                 &allowlist,
                 executor_ip(),
                 executor_fp(),
-                "ws01".to_owned(),
+                "remote-host".to_owned(),
                 capabilities(),
             ) // Process only
             .expect("the allowed peer must register");
 
         let mut dispatch = dispatch();
         dispatch.backend = SandboxKind::Vm.into();
-        let result = registry.send_dispatch("ws01", dispatch).await;
+        let result = registry.send_dispatch("remote-host", dispatch).await;
         assert_eq!(result, Err(DispatchSendError::UnsupportedSandboxKind));
         Ok(())
     }
@@ -895,14 +907,14 @@ mod tests {
                 &allowlist,
                 executor_ip(),
                 executor_fp(),
-                "ws01".to_owned(),
+                "remote-host".to_owned(),
                 capabilities(),
             )
             .expect("the allowed peer must register");
 
-        registry.remove("ws01", registration);
+        registry.remove("remote-host", registration);
 
-        let result = registry.send_dispatch("ws01", Dispatch::default()).await;
+        let result = registry.send_dispatch("remote-host", Dispatch::default()).await;
         assert_eq!(result, Err(DispatchSendError::NoSuchHost));
         Ok(())
     }
@@ -919,7 +931,7 @@ mod tests {
                 &allowlist,
                 executor_ip(),
                 executor_fp(),
-                "ws01".to_owned(),
+                "remote-host".to_owned(),
                 capabilities(),
             )
             .expect("the allowed peer must register");
@@ -927,7 +939,7 @@ mod tests {
         let picked = registry
             .pick_host_for(IsolationClass::Trusted.into(), SandboxKind::Process.into(), false)
             .expect("a Trusted-capable, Process-capable host is registered");
-        assert_eq!(picked.host_id, "ws01");
+        assert_eq!(picked.host_id, "remote-host");
         assert_eq!(picked.peer_ip, executor_ip());
     }
 
@@ -940,7 +952,7 @@ mod tests {
                 &allowlist,
                 executor_ip(),
                 executor_fp(),
-                "ws01".to_owned(),
+                "remote-host".to_owned(),
                 capabilities(),
             ) // shares_submitter_filesystem: false
             .expect("the allowed peer must register");
@@ -961,7 +973,7 @@ mod tests {
                 &allowlist,
                 executor_ip(),
                 executor_fp(),
-                "ws01".to_owned(),
+                "remote-host".to_owned(),
                 local_capabilities(),
             )
             .expect("the allowed peer must register");
@@ -969,7 +981,7 @@ mod tests {
         let picked = registry
             .pick_host_for(IsolationClass::Trusted.into(), SandboxKind::Process.into(), true)
             .expect("a host declaring shares_submitter_filesystem qualifies under require_local");
-        assert_eq!(picked.host_id, "ws01");
+        assert_eq!(picked.host_id, "remote-host");
         assert_eq!(picked.capabilities, local_capabilities());
     }
 
@@ -998,7 +1010,7 @@ mod tests {
                 &allowlist,
                 executor_ip(),
                 executor_fp(),
-                "ws01".to_owned(),
+                "remote-host".to_owned(),
                 capabilities(),
             ) // Trusted only
             .expect("the allowed peer must register");
@@ -1023,7 +1035,7 @@ mod tests {
                 &allowlist,
                 executor_ip(),
                 executor_fp(),
-                "ws01".to_owned(),
+                "remote-host".to_owned(),
                 capabilities(),
             )
             .expect("the allowed peer must register");
@@ -1047,11 +1059,11 @@ mod tests {
                 &allowlist,
                 executor_ip(),
                 executor_fp(),
-                "ws01".to_owned(),
+                "remote-host".to_owned(),
                 capabilities(),
             )
             .expect("the allowed peer must register");
-        registry.remove("ws01", registration);
+        registry.remove("remote-host", registration);
 
         assert_eq!(
             registry.pick_host_for(IsolationClass::Trusted.into(), SandboxKind::Process.into(), false),
@@ -1072,7 +1084,7 @@ mod tests {
                 &allowlist,
                 executor_ip(),
                 executor_fp(),
-                "ws01".to_owned(),
+                "remote-host".to_owned(),
                 vm_capabilities(),
             )
             .expect("the allowed peer must register");
@@ -1080,7 +1092,7 @@ mod tests {
         let picked = registry
             .pick_host_for(IsolationClass::Trusted.into(), SandboxKind::Vm.into(), false)
             .expect("a Vm-capable host is registered");
-        assert_eq!(picked.host_id, "ws01");
+        assert_eq!(picked.host_id, "remote-host");
     }
 
     /// Adversarial (#332, the issue's own acceptance bar): a VM-templated
@@ -1096,7 +1108,7 @@ mod tests {
                 &allowlist,
                 executor_ip(),
                 executor_fp(),
-                "ws01".to_owned(),
+                "remote-host".to_owned(),
                 capabilities(),
             ) // Process only
             .expect("the allowed peer must register");
@@ -1120,7 +1132,7 @@ mod tests {
                 &allowlist,
                 executor_ip(),
                 executor_fp(),
-                "ws01".to_owned(),
+                "remote-host".to_owned(),
                 capabilities(),
             )
             .expect("the allowed peer must register");
@@ -1149,11 +1161,11 @@ mod tests {
                 &allowlist,
                 executor_ip(),
                 executor_fp(),
-                "ws01".to_owned(),
+                "remote-host".to_owned(),
                 capabilities(),
             )
             .map(|registered| PlacementCandidate {
-                host_id: "ws01".to_owned(),
+                host_id: "remote-host".to_owned(),
                 registration: registered.registration,
                 peer_ip: executor_ip(),
                 capabilities: capabilities(),
@@ -1162,12 +1174,18 @@ mod tests {
 
         // ...then disconnects, and a DIFFERENT allowlisted peer reclaims the
         // same host_id before the dispatch is actually sent.
-        registry.remove("ws01", candidate.registration);
+        registry.remove("remote-host", candidate.registration);
         let Registration {
             dispatch_rx: mut new_dispatch_rx,
             ..
         } = registry
-            .register(&allowlist, other_ip(), other_fp(), "ws01".to_owned(), capabilities())
+            .register(
+                &allowlist,
+                other_ip(),
+                other_fp(),
+                "remote-host".to_owned(),
+                capabilities(),
+            )
             .expect("a different allowlisted peer may reclaim the vacated host_id");
 
         let result = registry
@@ -1197,13 +1215,13 @@ mod tests {
                 &allowlist,
                 executor_ip(),
                 executor_fp(),
-                "ws01".to_owned(),
+                "remote-host".to_owned(),
                 capabilities(),
             )
             .expect("the allowed peer must register");
 
         registry
-            .send_dispatch_if_current("ws01", registration, dispatch())
+            .send_dispatch_if_current("remote-host", registration, dispatch())
             .await?;
         let received = dispatch_rx.recv().await.expect("the dispatch must arrive");
         assert_eq!(received, dispatch());
@@ -1222,12 +1240,18 @@ mod tests {
                 &allowlist,
                 executor_ip(),
                 executor_fp(),
-                "ws01".to_owned(),
+                "remote-host".to_owned(),
                 capabilities(),
             )
             .expect("the first peer must register");
 
-        let result = registry.register(&allowlist, other_ip(), other_fp(), "ws01".to_owned(), capabilities());
+        let result = registry.register(
+            &allowlist,
+            other_ip(),
+            other_fp(),
+            "remote-host".to_owned(),
+            capabilities(),
+        );
         assert_eq!(result.err(), Some(RegisterError::HostIdClaimedByAnotherPeer));
         Ok(())
     }
@@ -1246,7 +1270,7 @@ mod tests {
                 &allowlist,
                 executor_ip(),
                 executor_fp(),
-                "ws01".to_owned(),
+                "remote-host".to_owned(),
                 capabilities(),
             )
             .expect("the first registration must succeed");
@@ -1257,7 +1281,7 @@ mod tests {
                 &allowlist,
                 executor_ip(),
                 executor_fp(),
-                "ws01".to_owned(),
+                "remote-host".to_owned(),
                 capabilities(),
             )
             .expect("the reconnect must succeed");
@@ -1283,7 +1307,7 @@ mod tests {
                 &allowlist,
                 executor_ip(),
                 executor_fp(),
-                "ws01".to_owned(),
+                "remote-host".to_owned(),
                 capabilities(),
             )
             .expect("the first registration must succeed");
@@ -1294,7 +1318,7 @@ mod tests {
                 &allowlist,
                 executor_ip(),
                 executor_fp(),
-                "ws01".to_owned(),
+                "remote-host".to_owned(),
                 capabilities(),
             )
             .expect("the same-peer reclaim must succeed");
@@ -1320,7 +1344,7 @@ mod tests {
                 &allowlist,
                 executor_ip(),
                 executor_fp(),
-                "ws01".to_owned(),
+                "remote-host".to_owned(),
                 capabilities(),
             )
             .expect("the first registration must succeed");
@@ -1331,7 +1355,7 @@ mod tests {
                 &allowlist,
                 executor_ip(),
                 executor_fp(),
-                "ws01".to_owned(),
+                "remote-host".to_owned(),
                 capabilities(),
             )
             .expect("the same-peer reclaim must succeed");
@@ -1349,7 +1373,7 @@ mod tests {
 
         // The newcomer is the sole owner: the one dispatch goes to it, not the
         // stale connection.
-        registry.send_dispatch("ws01", dispatch()).await?;
+        registry.send_dispatch("remote-host", dispatch()).await?;
         assert_eq!(
             fresh_rx.recv().await,
             Some(dispatch()),
@@ -1371,7 +1395,7 @@ mod tests {
                 &allowlist,
                 executor_ip(),
                 executor_fp(),
-                "ws01".to_owned(),
+                "remote-host".to_owned(),
                 capabilities(),
             )
             .expect("the first registration must succeed");
@@ -1382,15 +1406,15 @@ mod tests {
                 &allowlist,
                 executor_ip(),
                 executor_fp(),
-                "ws01".to_owned(),
+                "remote-host".to_owned(),
                 capabilities(),
             )
             .expect("the reconnect must succeed");
 
-        registry.remove("ws01", stale); // the old connection's own teardown, after the reconnect
+        registry.remove("remote-host", stale); // the old connection's own teardown, after the reconnect
 
         let dispatch = dispatch();
-        registry.send_dispatch("ws01", dispatch.clone()).await?;
+        registry.send_dispatch("remote-host", dispatch.clone()).await?;
         assert_eq!(rx2.recv().await, Some(dispatch));
         Ok(())
     }
