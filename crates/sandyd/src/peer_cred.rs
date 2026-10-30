@@ -2,8 +2,10 @@
 //!
 //! The deployment model is one sandyd per submitter user (`User=%i`), so the only peer that may
 //! drive the daemon is a process with the daemon's own effective uid. The socket is mode 0600,
-//! which already blocks other uids except root; this check refuses those too, and keeps holding
-//! if the socket mode is ever loosened or the fd is passed to another uid.
+//! which already blocks other uids except root; this check refuses root and any other uid that
+//! connects, and keeps holding if the socket mode is ever loosened. The kernel records the
+//! credentials at `connect()`, so a same-uid process that passes its connected fd to another uid
+//! is not caught.
 
 use tokio::net::UnixStream;
 
@@ -31,7 +33,7 @@ pub fn require_same_user(stream: &UnixStream) -> Result<(), PeerRefused> {
     require_user(stream, rustix::process::geteuid().as_raw())
 }
 
-fn require_user(stream: &UnixStream, owner_uid: u32) -> Result<(), PeerRefused> {
+pub(crate) fn require_user(stream: &UnixStream, owner_uid: u32) -> Result<(), PeerRefused> {
     let cred = stream
         .peer_cred()
         .map_err(|err| PeerRefused::Unavailable(err.to_string()))?;

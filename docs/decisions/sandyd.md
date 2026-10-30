@@ -479,7 +479,8 @@ structurally unreachable for every real submitter, not merely unenforced.
   trust model with no `CapAuthority` tie-in, and is UDS-only — dead on
   arrival for B6's vsock/mesh) and not a session/handshake (rejected: adds
   state the control RPC's one-request-one-response design, §1, deliberately
-  avoids).
+  avoids). Decision 24 later uses the peer uid as an accept gate on the UDS
+  listeners, not as a submitter identity, so it does not reopen this.
 - **One persistent orchestrator authority.** `JobRegistry` now holds one
   `SharedCapAuthority` (`impls/fabric-local/src/capauth.rs`: an
   `Arc<LocalCapAuthority>` behind the `CapAuthority` trait), constructed once
@@ -1991,12 +1992,14 @@ user it compares the daemon's uid with itself.
   several submitters is a separate future option and needs its own design.
 - Both UDS accept loops (the control socket and the attach socket) read the peer's uid with `SO_PEERCRED` (tokio
   `peer_cred`; `LOCAL_PEERCRED` on macOS) and refuse a peer whose uid differs from the daemon's effective uid.
-- A refused connection is dropped before any frame is read. The log line names the peer uid and the daemon uid.
-  It carries no token or frame content.
+- A refused connection is dropped before any frame is read. The log line names the peer uid and the daemon uid
+  (or the OS error when the credentials cannot be read). It carries no token or frame content.
 - If the kernel cannot report the peer's credentials, the connection is refused.
 
-**Consequence.** The check adds defense in depth to the 0600 socket mode: it also refuses root and any fd passed
-to another uid. Root cannot drive a user's sandyd. This differs from the check set aside in decision 23: that check
+**Consequence.** The check adds defense in depth to the 0600 socket mode: it also refuses root and any other uid
+that connects. Root cannot drive a user's sandyd. The kernel records the peer's credentials at `connect()`, so a
+same-uid process that hands its connected fd to another uid is not caught. A refused peer sees a plain close with
+no reason. This differs from the check set aside in decision 23: that check
 was proposed as the gate for `Cancel` and closes nothing for same-uid processes, while this one pins the daemon's
 trust boundary to its own user. The mesh and vsock listeners are unchanged. They authenticate with caps and TLS
 fingerprints. `nix/modules/sandyd.nix` (the templated unit) is not part of this item.
