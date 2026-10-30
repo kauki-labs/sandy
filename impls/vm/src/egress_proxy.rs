@@ -225,9 +225,14 @@ pub(crate) fn egress_relay_argv(program: &Path, port: u32, rest: &[String]) -> V
 
 /// The guest command: the job, behind the agent in agent mode, behind the egress relay in proxy mode
 /// (outermost, so the relay's variables reach the agent and the job).
-pub(crate) fn console_command(job: &[String], agent: Option<&Path>, relay: Option<(&Path, u32)>) -> Vec<String> {
+pub(crate) fn console_command(
+    job: &[String],
+    env: &[(String, String)],
+    agent: Option<&Path>,
+    relay: Option<(&Path, u32)>,
+) -> Vec<String> {
     let inner = match agent {
-        Some(program) => agent_command_argv(program, AGENT_VSOCK_PORT, job),
+        Some(program) => agent_command_argv(program, AGENT_VSOCK_PORT, job, env),
         None => job.to_vec(),
     };
     match relay {
@@ -679,7 +684,7 @@ pub(crate) mod tests {
         ];
         let program = Path::new("/nix/store/a-sandy-agent/bin/sandy-agent");
         assert_eq!(
-            console_command(&job, None, Some((program, 50123))),
+            console_command(&job, &[], None, Some((program, 50123))),
             [
                 "/nix/store/a-sandy-agent/bin/sandy-agent",
                 "egress-relay",
@@ -699,7 +704,7 @@ pub(crate) mod tests {
         let job = ["sh".to_string(), "-c".to_string(), "env".to_string()];
         let program = Path::new("/nix/store/a-sandy-agent/bin/sandy-agent");
         assert_eq!(
-            console_command(&job, Some(program), Some((program, 50123))),
+            console_command(&job, &[], Some(program), Some((program, 50123))),
             [
                 "/nix/store/a-sandy-agent/bin/sandy-agent",
                 "egress-relay",
@@ -715,8 +720,14 @@ pub(crate) mod tests {
                 "env"
             ]
         );
+        let env = [("SANDY_HISTORY_LINES".to_string(), "250".to_string())];
         assert_eq!(
-            console_command(&job, None, None),
+            console_command(&job, &env, Some(program), None)[..2],
+            ["env", "SANDY_HISTORY_LINES=250"],
+            "the job env reaches the agent through the console command"
+        );
+        assert_eq!(
+            console_command(&job, &[], None, None),
             job,
             "no agent, no proxy: the job unchanged"
         );

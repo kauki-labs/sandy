@@ -282,6 +282,7 @@ impl VfkitBackend {
         // relay around that (proxy mode).
         let console_command = console_command(
             spec.command,
+            spec.env,
             agent.map(|agent| agent.program.as_path()),
             egress.zip(proxy.as_ref()).map(|(e, p)| (e.relay_program, p.port())),
         );
@@ -836,10 +837,10 @@ mod tests {
             "5001",
             "--",
         ];
-        let console_only = console_command(&job, None, relay);
+        let console_only = console_command(&job, &[], None, relay);
         assert_eq!(console_only[..5], prefix);
         assert_eq!(console_only[5..], job);
-        let agent_mode = console_command(&job, Some(program), relay);
+        let agent_mode = console_command(&job, &[], Some(program), relay);
         assert_eq!(agent_mode[..5], prefix);
         assert_eq!(
             agent_mode[5..8],

@@ -57,14 +57,9 @@ const DEFAULT_HISTORY_LINES: u32 = 10_000;
 /// is the carrier this reads from, proven directly by
 /// `agent_process.rs::a_configured_history_lines_env_value_bounds_the_captured_console`.
 ///
-/// This is NOT yet wired end to end for a real dispatch, honestly: the
-/// `history_lines_env` call site above only exists on `sandy-host-executor`'s
-/// flake/VM branch, whose `RunSpec.env` never reaches a VM guest at all (a
-/// separate, tracked gap, #185-adjacent) — and the process-backend/`argv/v1`
-/// branch passes `env: &[]` unconditionally, since that manifest format has
-/// no `history_lines` field to begin with. So every real M2 dispatch still
-/// gets [`DEFAULT_HISTORY_LINES`] today, regardless of what a submitter
-/// asked for; only this agent-side half of the plumbing is closed here.
+/// The VM backends forward `SANDY_HISTORY_LINES` from `RunSpec.env` to this agent (#398); the
+/// process-backend/`argv/v1` branch passes `env: &[]`, since that manifest has no `history_lines`
+/// field, so it gets [`DEFAULT_HISTORY_LINES`].
 fn configured_history_lines() -> u32 {
     parse_history_lines(std::env::var("SANDY_HISTORY_LINES").ok())
 }

@@ -122,7 +122,14 @@ jobs:
       - name: Check each binary's major matches sandy-lib
         run: python3 scripts/ci/check-binary-major.py
   checks:
+    # Merge-queue only: every authoring session already runs this repo's own
+    # full local gate (AGENTS.md's "Before opening a PR" row, and
+    # scripts/dev/linux-gate.sh for the x86_64-linux platform CI gates on)
+    # before opening a PR, so re-running it identically on every PR push was
+    # pure duplication. This is now the one place it actually runs, right
+    # before merge, against the real post-merge tree.
     name: Check
+    if: github.event_name == 'merge_group'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -186,7 +193,11 @@ jobs:
     # stops re-running it per PR.
     # No `needs: checks`: it runs in parallel with Check (a failing Check no
     # longer skips it, which costs runner minutes but saves the Check wall clock).
+    # Merge-queue only, same reasoning as Check above: authors already run
+    # this locally (or on the Linux host via linux-gate.sh) before opening a
+    # PR; this is where it runs once, authoritatively, before merge.
     name: Test
+    if: github.event_name == 'merge_group'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -323,4 +334,8 @@ jobs:
           # merge_group; that skip is allowed and must not red the gate.
           # release-diff-scope additionally skips on every pull_request that
           # isn't a github-actions[bot] PR.
-          allowed-skips: validate-pr-title, label, release-diff-scope
+          # checks/test are merge-queue-only (see their own `if:`): on
+          # pull_request they're expected to skip; on merge_group they are
+          # NOT in this list, so a skip there (e.g. a broken `if:`) still
+          # reds the gate instead of silently passing.
+          allowed-skips: "${{ github.event_name == 'pull_request' && 'validate-pr-title, label, release-diff-scope, checks, test' || 'validate-pr-title, label, release-diff-scope' }}"

@@ -142,10 +142,22 @@ time (the reasoning lives in the `rust-engineer` skill). Concrete commands:
 | Docs, comments, `///`              | `nix fmt`; no tests unless a doctest changed                                                                |
 | `Cargo.toml`, deps, or `flake.nix` | `cargo shear --fix`, then `nix develop -c cargo check`                                                      |
 | Before opening a PR                | `nix fmt`, then `nix flake check -L` (full gate: build, clippy with deny-warnings, docs, tests, formatting) |
+| Before a PR, on the macOS host     | `scripts/dev/linux-gate.sh` (see below) — your local gate only built `aarch64-darwin`                       |
 
 A change that creates a feature or modifies an existing one goes through `swe-process:implement`;
 its quality-pass step is the change-specific row in the checks table above. The "Before opening a PR"
 row is the full gate.
+
+**Linux-platform pre-PR gate.** CI gates on `x86_64-linux` Nix checks, and the PR workflow
+no longer runs Check or Test on `pull_request` — only in the merge queue, once, right before
+merge (every authoring session is trusted to have already verified locally). A session on
+the macOS host only builds `aarch64-darwin` outputs natively, a different platform than what
+CI checks, so before opening a PR it must also run `scripts/dev/linux-gate.sh`, which runs
+the exact `x86_64-linux` check attrs CI uses, on the Linux host, over SSH. Set
+`SANDY_LINUX_HOST` to your own ssh alias for that host (from your local ssh config — never
+commit a host name or address here; see Hosts below). Paste the script's `linux-gate:`
+success line into the PR body, since it's the only evidence a reviewer has that Check/Test
+would pass.
 
 Commit with a Conventional Commits title.
 
@@ -342,32 +354,31 @@ repo's own setup, not general git advice.
   "could not resolve"). Re-query `mergeQueueEntry` afterward to confirm it
   came back `null`.
 
-## Review gate: CodeRabbit, with a local-adversarial fallback
+## Review gate: a local adversarial reviewer, CodeRabbit as a bonus
 
 Every PR gets at least one adversarial review from someone other than its
-author before it merges — never self-graded. CodeRabbit on GitHub is the
-default channel; fix its findings the same as always, whenever it actually
-reviews.
+author before it merges — never self-graded. **The default, named path is
+a local reviewer**: a different agent (a subagent or a peer session, never
+the same agent that wrote the change) reads the diff adversarially and
+posts its findings (and any fixes) to the PR itself, not just the session —
+a comment naming what was reviewed, what was found, and what was fixed, the
+same durable trail a GitHub review thread leaves. A review that only exists
+in a chat transcript is invisible to the next person (or agent) who opens
+the PR.
 
-- **CodeRabbit unavailable → fall back to a local reviewer, don't wait on
-  it indefinitely.** If a (re-)triggered CodeRabbit review gets no response
-  within 5 minutes, or CodeRabbit states outright that it cannot review
-  (rate-limited, errored, disabled for the repo) — observed on PR #501,
-  "You've used all free OSS reviews for now" with zero actual review
-  posted — request an adversarial review from a different local agent
-  instead (a subagent or a peer session, never the same agent that wrote
-  the change). This substitutes for CodeRabbit for that PR; it does not
-  cancel a later real CodeRabbit review if one eventually arrives — apply
-  that the same as always.
-- **Post the local review's findings (and any fixes) to the PR itself,
-  not just to the session.** A comment naming what was reviewed, what was
-  found, and what was fixed — the same durable trail a GitHub review
-  thread leaves — plus a short note in the PR description saying CodeRabbit
-  was unavailable and a local adversarial review substituted (who/what
-  reviewed, when). A review that only exists in a chat transcript is
-  invisible to the next person (or agent) who opens the PR.
+- **CodeRabbit is a bonus signal, not something waited on.** It frequently
+  hits its free OSS-tier rate limit ("You've used all free OSS reviews for
+  now", observed repeatedly) and posts no review at all. Trigger it if it's
+  responsive and fix whatever it finds the same as always, but don't block
+  on it or wait out a retry window before doing the local review — the
+  local review is the plan from the start, not a fallback reached after
+  CodeRabbit fails.
+- **A stale CodeRabbit `CHANGES_REQUESTED`** that's already been addressed
+  gets cleared with `@coderabbitai approve` (forces a fresh review state;
+  see the Merge & CI gotchas section above) — no separate dismissal
+  mechanism exists or is needed for this.
 - **This is a review-gate rule, not a merge-timing rule.** Satisfying the
-  review requirement (GitHub or local-fallback) never substitutes for the
+  review requirement (local or CodeRabbit) never substitutes for the
   separate, per-action, in-the-moment human approval merging still
   requires — the two are independent gates, and clearing one is not
   license to skip the other.
