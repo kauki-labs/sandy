@@ -1913,9 +1913,8 @@ decisions, not itself an owner decision.
   it to the submitter's. Today sandyd is only ever run ad hoc, so this
   has never mattered in practice; it becomes a real gap the moment a
   deployment runs sandyd as a shared user serving more than one
-  submitter. Filed as #533, to close before any such deployment carries
-  path fields — not something this item or decision 21 resolves, only
-  surfaces.
+  submitter. Filed as #533 and settled by decision 24 (one sandyd per
+  submitter user, enforced by a peer-uid check on accept).
 
 **Consequences.** A second per-job connection per transfer-carrying
 dispatch (on top of the existing agent link), each independently claimed
@@ -1975,3 +1974,32 @@ hint and an observer-only cap (#327).
 **Alternative set aside.** A peer-uid (`SO_PEERCRED`) check: the socket is 0600, so the same uid always passes
 and it closes nothing. Gating by session alone: the CLI opens a fresh connection per call, so it would refuse the
 ordinary `submit` then `cancel` flow.
+
+## 24. One sandyd per submitter user; UDS peers must share the daemon's uid (#533)
+
+**Status:** accepted. **Upholds:** INV-1.
+
+**Context.** Decisions 21 and 22 make sandyd read submitter input paths and write submitter output paths. This is
+safe only when sandyd runs as the submitter. A sandyd that serves other users reads and writes files the submitter
+could not (a confused deputy). The owner decided on #562 (2026-10-30): one sandyd per submitter user, with a
+peer-credential check on accept. A startup self-check of the daemon's own uid was rejected: under one sandyd per
+user it compares the daemon's uid with itself.
+
+**Decision.**
+
+- Deployment model: one sandyd per submitter user (a templated systemd unit with `User=%i`). A sandyd that serves
+  several submitters is a separate future option and needs its own design.
+- Both UDS accept loops (the control socket and the attach socket) read the peer's uid with `SO_PEERCRED` (tokio
+  `peer_cred`; `LOCAL_PEERCRED` on macOS) and refuse a peer whose uid differs from the daemon's effective uid.
+- A refused connection is dropped before any frame is read. The log line names the peer uid and the daemon uid.
+  It carries no token or frame content.
+- If the kernel cannot report the peer's credentials, the connection is refused.
+
+**Consequence.** The check adds defense in depth to the 0600 socket mode: it also refuses root and any fd passed
+to another uid. Root cannot drive a user's sandyd. This differs from the check set aside in decision 23: that check
+was proposed as the gate for `Cancel` and closes nothing for same-uid processes, while this one pins the daemon's
+trust boundary to its own user. The mesh and vsock listeners are unchanged. They authenticate with caps and TLS
+fingerprints. `nix/modules/sandyd.nix` (the templated unit) is not part of this item.
+
+**Alternative set aside.** A startup check that the daemon's uid equals an "expected submitter" uid: circular
+under one sandyd per user.

@@ -96,6 +96,10 @@ async fn serve_attach_accept_loop_with_cap(
                 };
                 match accepted {
                     Ok((stream, _addr)) => {
+                        if let Err(refused) = crate::peer_cred::require_same_user(&stream) {
+                            tracing::warn!(%refused, "refusing an attach connection");
+                            continue;
+                        }
                         let registry = Arc::clone(registry);
                         let host_registry = Arc::clone(host_registry);
                         connections.spawn(async move {
