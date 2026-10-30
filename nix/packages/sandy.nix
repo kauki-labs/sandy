@@ -93,6 +93,15 @@ rec {
       inherit cargoArtifacts;
       partitions = 1;
       partitionType = "count";
+      # Make a test failure readable in the nix log (#297). Nix shows only the
+      # last 25 lines of a failed build, and nextest's default progress bar
+      # redraws with carriage returns, burying the failing test's output.
+      # Hide the bar, reprint every failure at the end, and keep running past
+      # the first failure so the final list is complete. None of this changes
+      # which tests run or pass.
+      NEXTEST_HIDE_PROGRESS_BAR = "1";
+      NEXTEST_FAILURE_OUTPUT = "immediate-final";
+      cargoNextestExtraArgs = "--no-fail-fast";
       # tmux (#340): sandy-agent wraps every job in a detached tmux session
       # behind a real PTY, so `impls/agent/tests/agent_process.rs` needs it
       # on PATH to run at all — unlike the dev shell (which separately pulls
