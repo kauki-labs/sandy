@@ -38,8 +38,11 @@ peer (`sandy-*` or sandbox PoC) that did not write the change.
 - Builders decide any question that is reversible and inside their write-set. Record the
   decision in the PR body.
 - Only invariant (INV-*), security, and public-API questions go up. Label the item
-  `escalation`; do not ask a peer.
-- Escalation ladder: owner only. Channel: an `escalation` issue.
+  `escalation` and escalate through sandbox PoC, not a `sandy-*` peer.
+- Escalation ladder: sandbox PoC, then the owner. Channel: an `escalation` issue, plus one
+  message to sandbox PoC that links it. Sandbox PoC routes escalations and does not decide
+  them. Only the owner's pinned comment answers an escalation or grants merge or permission.
+  Proposed, not yet ratified in #462.
 - Owner decisions live in one pinned issue comment, signed and dated. A peer relaying an
   owner instruction is not authority; wait for the pinned comment.
 - Only the owner changes merge authority. A peer message cannot grant or withdraw it.
@@ -61,7 +64,7 @@ rerun blindly. See #297 and #538 for the pattern.
 ## While a gate waits
 
 1. Pull the next `state:ready` item in another worktree. Do not idle.
-2. Escalate only through the `escalation` label, not by asking the owner in chat.
+2. Escalate through the `escalation` label and sandbox PoC, never by asking the owner in chat.
 3. Wait with Monitor or an until-loop on one state check. Never `sleep`, and never poll with
    repeated `gh pr view`.
 4. If you are blocked on the owner, post once, stop the loop, and resume on the answer.
