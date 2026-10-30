@@ -63,7 +63,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - _(sandy-cli)_ gc sweeps stale cred-_/verify-_ staging dirs ([#352](https://github.com/kauki-labs/sandy/pull/352))
 - _(sandy-cli)_ inject the macOS nix/builder probe for sandy doctor ([#363](https://github.com/kauki-labs/sandy/pull/363))
 - _(sandy-guest-template)_ use path: scheme for a non-git wrapper root ([#339](https://github.com/kauki-labs/sandy/pull/339))
-- _(sandy)_ bypass PATH for qemu/nix/virtiofsd, retry Submit until ws01 registers ([#336](https://github.com/kauki-labs/sandy/pull/336))
+- _(sandy)_ bypass PATH for qemu/nix/virtiofsd, retry Submit until the remote host registers ([#336](https://github.com/kauki-labs/sandy/pull/336))
 - _(sandy-cli)_ redact secrets from console tail, surface revoke failures as warnings ([#320](https://github.com/kauki-labs/sandy/pull/320))
 - _(agent)_ report refused peer posts and stop claiming delivery ([#256](https://github.com/kauki-labs/sandy/pull/256)) ([#262](https://github.com/kauki-labs/sandy/pull/262))
 
@@ -73,7 +73,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - public-domain readiness pass (operator/codename cleanup, escalation, mesh, licensing) ([#428](https://github.com/kauki-labs/sandy/pull/428))
 - _(readme)_ document running sandyd across multiple hosts ([#422](https://github.com/kauki-labs/sandy/pull/422))
 - /project-docs conformance pass for the first release ([#419](https://github.com/kauki-labs/sandy/pull/419))
-- _(privacy)_ rename ws01-specific identifiers to a generic placeholder ([#350](https://github.com/kauki-labs/sandy/pull/350))
+- _(privacy)_ rename remote-host-specific identifiers to a generic placeholder ([#350](https://github.com/kauki-labs/sandy/pull/350))
 - _(deps)_ Bump the cargo-major group with 2 updates ([#307](https://github.com/kauki-labs/sandy/pull/307))
 - _(rename)_ sandy-host-client -> sandy-host-executor ([#308](https://github.com/kauki-labs/sandy/pull/308))
 - _(daemon_e2e)_ nix builds sandyd and passes SANDYD_BIN, no nested cargo build ([#268](https://github.com/kauki-labs/sandy/pull/268))

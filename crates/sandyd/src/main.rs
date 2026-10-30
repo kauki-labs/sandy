@@ -15,7 +15,7 @@ use sandyd::{
     host_registry::{ExecutorAllowlist, HostRegistry},
     mesh_config::{parse_mesh_allowlist, parse_mesh_listen_addr},
     spawn_gated_accept,
-    store::JobStore,
+    store::{CancelOutcome, JobStore},
 };
 use tokio::net::UnixListener;
 
@@ -102,6 +102,9 @@ async fn main() {
         return;
     }
 
+    if let Some(code) = run_operator_command() {
+        std::process::exit(code);
+    }
     let filter = tracing_subscriber::EnvFilter::builder()
         .with_default_directive(tracing::level_filters::LevelFilter::INFO.into())
         .from_env_lossy();
@@ -144,6 +147,20 @@ async fn main() {
         Err(e) => {
             tracing::error!(error = %e, socket = %socket_path.display(), "could not bind the control socket");
             std::process::exit(1);
+        }
+    };
+
+    // `sandyd cancel` locks the store, not the socket, so hold the store's lock too (the same file as
+    // the socket's under the default paths, which is then already held).
+    let _store_lock = if sandyd::operator::daemon_lock_path(&db_path) == socket_path.with_extension("lock") {
+        None
+    } else {
+        match sandyd::operator::lock_store(&db_path) {
+            Ok(lock) => Some(lock),
+            Err(e) => {
+                tracing::error!(error = %e, db = %db_path.display(), "could not lock the job store");
+                std::process::exit(1);
+            }
         }
     };
     tracing::info!(socket = %socket_path.display(), db = %db_path.display(), "sandyd listening");
@@ -758,6 +775,50 @@ async fn run_mesh_accept_loop(
             "mesh listener's shutdown grace period elapsed with connections still in flight; exiting anyway"
         );
     }
+}
+
+/// `sandyd cancel <job-id>` (#545): the operator's offline cancel. `None` when there is no argument, so the
+/// daemon starts as usual; otherwise the exit code.
+fn run_operator_command() -> Option<i32> {
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        None => return None,
+        Some("cancel") => {}
+        // `--version` was handled before this; any other argument is a typo, not a request to start.
+        Some(other) => {
+            eprintln!("sandyd: unknown argument `{other}`; usage: sandyd [--version | cancel <job-id>]");
+            return Some(2);
+        }
+    }
+    let (Some(job_id), None) = (args.next(), args.next()) else {
+        eprintln!("usage: sandyd cancel <job-id>");
+        return Some(2);
+    };
+    let db = match db_path() {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("sandyd cancel: could not resolve the store path: {e}");
+            return Some(1);
+        }
+    };
+    Some(match sandyd::operator::cancel_offline(&db, &job_id) {
+        Ok(CancelOutcome::Cancelled) => {
+            println!("cancelled {job_id}");
+            0
+        }
+        Ok(CancelOutcome::NotFound) => {
+            eprintln!("sandyd cancel: no job {job_id}");
+            1
+        }
+        Ok(CancelOutcome::AlreadyTerminal(status)) => {
+            eprintln!("sandyd cancel: job {job_id} is already {status:?}");
+            1
+        }
+        Err(e) => {
+            eprintln!("sandyd cancel: {e}");
+            1
+        }
+    })
 }
 
 /// The control socket path: `$SANDY_SOCK` if set (a deployer's explicit

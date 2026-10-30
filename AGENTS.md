@@ -121,7 +121,7 @@ may relay one, but a relay is not authority.
 
 ## Hosts
 
-- `ws01` is the x86_64 Linux KVM host for live and Linux checks (ssh alias `ws01`). If the
+- The x86_64 Linux KVM host is used for live and Linux checks. If your ssh config
   alias fails, ask the owner for the direct address rather than guessing or hardcoding one.
   Wake it before asking the owner. `strings` is absent; use `grep -a`. Leave no artifacts:
   remove `/tmp/sandy-<name>` when done. The deploy recipe is in `~/.config/nix/AGENTS.md`.
@@ -155,9 +155,21 @@ the macOS host only builds `aarch64-darwin` outputs natively, a different platfo
 CI checks, so before opening a PR it must also run `scripts/dev/linux-gate.sh`, which runs
 the exact `x86_64-linux` check attrs CI uses, on the Linux host, over SSH. Set
 `SANDY_LINUX_HOST` to your own ssh alias for that host (from your local ssh config — never
-commit a host name or address here; see Hosts below). Paste the script's `linux-gate:`
+commit a host name or address here; see Hosts above). Paste the script's `linux-gate:`
 success line into the PR body, since it's the only evidence a reviewer has that Check/Test
 would pass.
+
+**`--admin`-bypassing a PR now skips Check and Test entirely, not just a formality.**
+Before Check/Test moved to the merge queue, a bypass merge still left a Check/Test result
+on the PR's own head — the bypass only skipped review/approval. Now, bypassing also means
+leaving the merge queue, which is the ONLY place Check/Test run. A PR merged with
+`gh pr merge --admin` today can land with **zero** build or test verification, not even a
+failing one. The existing "acceptable red" pattern (bypassing a known-flaky Test failure,
+e.g. the #297 signature) only applies to a PR that actually entered the queue and failed
+there for a confirmed-unrelated reason — never to skip the queue outright. If CI needs to
+be bypassed, let the PR enter the queue first (`gh pr merge --auto`, not `--admin`), confirm
+Check/Test actually ran, and only then use `--admin` if something unrelated to this change
+is red.
 
 Commit with a Conventional Commits title.
 

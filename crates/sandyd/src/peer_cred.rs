@@ -34,9 +34,16 @@ pub fn require_same_user(stream: &UnixStream) -> Result<(), PeerRefused> {
 }
 
 pub(crate) fn require_user(stream: &UnixStream, owner_uid: u32) -> Result<(), PeerRefused> {
-    let cred = stream
-        .peer_cred()
-        .map_err(|err| PeerRefused::Unavailable(err.to_string()))?;
+    require_user_with(owner_uid, || stream.peer_cred())
+}
+
+/// [`require_user`] over an injectable credential reader, so the unreadable-credential branch is testable:
+/// a real socket pair always reports its credentials.
+fn require_user_with(
+    owner_uid: u32,
+    read_cred: impl FnOnce() -> std::io::Result<tokio::net::unix::UCred>,
+) -> Result<(), PeerRefused> {
+    let cred = read_cred().map_err(|err| PeerRefused::Unavailable(err.to_string()))?;
     if cred.uid() == owner_uid {
         Ok(())
     } else {
@@ -72,5 +79,12 @@ mod tests {
             })
         );
         Ok(())
+    }
+
+    /// An unreadable credential is refused, never accepted (fail closed).
+    #[test]
+    fn an_unreadable_credential_is_refused_as_unavailable() {
+        let refused = require_user_with(0, || Err(std::io::Error::other("injected")));
+        assert!(matches!(refused, Err(PeerRefused::Unavailable(_))), "got {refused:?}");
     }
 }

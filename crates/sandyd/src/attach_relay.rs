@@ -1064,7 +1064,7 @@ mod tests {
     async fn a_real_attach_then_detach_notifies_the_jobs_placed_host() -> anyhow::Result<()> {
         use crate::host_registry::{ExecutorAllowlist, HostRegistry, Registration};
 
-        let (registry, operator_cap) = registry_with_job_on_host("job-1", "ws01").await?;
+        let (registry, operator_cap) = registry_with_job_on_host("job-1", "remote-host").await?;
 
         let host_registry = Arc::new(HostRegistry::default());
         let allowlist = ExecutorAllowlist::new([(executor_ip(), test_fp())]);
@@ -1075,10 +1075,10 @@ mod tests {
                 &allowlist,
                 executor_ip(),
                 test_fp(),
-                "ws01".to_owned(),
+                "remote-host".to_owned(),
                 host_capabilities(),
             )
-            .expect("ws01 must register");
+            .expect("remote-host must register");
 
         let (client, server) = tokio::net::UnixStream::pair()?;
         let accepting = {
@@ -1144,7 +1144,7 @@ mod tests {
     async fn an_already_joined_agent_never_suppresses_the_attach_notification() -> anyhow::Result<()> {
         use crate::host_registry::{ExecutorAllowlist, HostRegistry, Registration};
 
-        let (registry, operator_cap) = registry_with_job_on_host("job-1", "ws01").await?;
+        let (registry, operator_cap) = registry_with_job_on_host("job-1", "remote-host").await?;
         let agent_cap = registry
             .get("job-1")
             .context("the job must be registered")?
@@ -1169,10 +1169,10 @@ mod tests {
                 &allowlist,
                 executor_ip(),
                 test_fp(),
-                "ws01".to_owned(),
+                "remote-host".to_owned(),
                 host_capabilities(),
             )
-            .expect("ws01 must register");
+            .expect("remote-host must register");
 
         let (client, server) = tokio::net::UnixStream::pair()?;
         let accepting = {
