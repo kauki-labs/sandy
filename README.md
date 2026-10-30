@@ -7,6 +7,8 @@
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![Rust edition 2024](https://img.shields.io/badge/rust-edition%202024-orange.svg)](rust-toolchain.toml)
 
+[![codecov](https://codecov.io/gh/kauki-labs/sandy/graphs/tree.svg?token=A9TAJHW2FH)](https://codecov.io/gh/kauki-labs/sandy)
+
 `sandy` runs a job in an ephemeral NixOS microVM and returns a locked result
 envelope. One `VmBackend` seam launches the guest (qemu on Linux, vfkit on
 macOS); inputs, outputs, secrets, and a scoped forge credential travel in over

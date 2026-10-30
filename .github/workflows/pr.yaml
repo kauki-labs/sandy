@@ -178,10 +178,12 @@ jobs:
         run: nix build -L .#checks.x86_64-linux.guest-wrapper-module-eval .#checks.x86_64-linux.guest-wrapper-configuration-eval
       - name: sandy-executor vm.enable additivity (eval-only)
         run: nix build -L .#checks.x86_64-linux.sandy-executor-vm-opt-eval
-  coverage:
-    # One test run, instrumented: cargo-llvm-cov runs the whole CI suite and emits
-    # the lcov report, so a separate plain `cargo nextest` job would just run the
-    # same tests again. This job is the test gate.
+  test:
+    # Plain `cargo nextest` (no cargo-llvm-cov instrumentation): the PR gate
+    # just needs pass/fail, and the instrumented build is noticeably slower
+    # for that. coverage.yaml runs the instrumented build once per push to
+    # main instead, so the Codecov history still updates; this job just
+    # stops re-running it per PR.
     # No `needs: checks`: it runs in parallel with Check (a failing Check no
     # longer skips it, which costs runner minutes but saves the Check wall clock).
     name: Test
@@ -221,31 +223,17 @@ jobs:
           purge-primary-key: never
       # End-to-end CLI suite (tests/e2e/basic): drive the built binary at the
       # process boundary (argv, exit bands, `-o json`, error paths). No hypervisor;
-      # `--no-link` leaves the coverage `result` symlink below untouched.
+      # `--no-link` leaves the Test step's `result` symlink below untouched.
       - name: End-to-end CLI
         run: nix build -L --no-link .#checks.x86_64-linux.tests-e2e-cli
       # sandy-cli's `daemon_e2e` against the Nix-built `sandyd`; the coverage run
       # below excludes it, so without this step it never ran in CI.
       - name: Daemon end-to-end
         run: nix build -L --no-link .#checks.x86_64-linux.tests-daemon-e2e
-      # Line coverage over the CI-runnable suite (tier-1/2); the `live` tier-3 tests
-      # need a hypervisor and never run in CI, so they are excluded by design.
-      - name: Coverage
-        run: nix build -L .#checks.x86_64-linux.coverage
-      - name: Upload lcov report
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: coverage-lcov
-          path: result/lcov.info
-          if-no-files-found: error
-      # Publish to Codecov for the badge and PR annotations. A reporting hiccup
-      # must not fail the PR, so fail_ci_if_error stays false.
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
-        with:
-          files: result/lcov.info
-          fail_ci_if_error: false
-          token: ${{ secrets.CODECOV_TOKEN }}
+      # Whole-workspace test run (tier-1/2); the `live` tier-3 tests need a
+      # hypervisor and never run in CI, so they are excluded by design.
+      - name: Test
+        run: nix build -L .#checks.x86_64-linux.test
   package:
     # No `needs: checks`: the minimal shell shares no Nix outputs with Check, so
     # this runs in parallel with it.
@@ -322,7 +310,7 @@ jobs:
       - release-diff-scope
       - binary-versions
       - checks
-      - coverage
+      - test
       - package
     runs-on: ubuntu-24.04
     permissions: {}
