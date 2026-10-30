@@ -31,8 +31,13 @@ use sandy::{
     collect_outputs, ensure_sandy_staging_base, kill_children, plan_shares, topology as eval_topology, wipe,
     with_digests,
 };
+// Only `spawn_vsock_connector` below (the sole user) is Linux-only
+// (`#[cfg(target_os = "linux")]`); a plain import here is unused, and so a
+// clippy warning, on every other target.
+#[cfg(target_os = "linux")]
+use sandy_api::agent::AGENT_VSOCK_PORT;
 use sandy_api::{
-    agent::{AGENT_VSOCK_PORT, AgentLaunch},
+    agent::AgentLaunch,
     share::{GuestShareTransport, ShareSpec},
 };
 use uuid::Uuid;
