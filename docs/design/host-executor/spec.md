@@ -4,8 +4,8 @@ Status: stage 1 implementation is present, but executor-side orchestrator authen
 remains open. The seam this doc designed landed as `sandy-executor-proto`
 (the registration + dispatch contract), the `sandyd` control plane, and the
 `sandy-host-executor` crate — #310 renamed that crate from the original "host-client".
-Frames #263 (dispatch RPC), decision-6 (the mesh accept-loop auth gate), the WS01
-standup, and the nix overlay. One target is built (a NixOS host, trusted process); the
+Frames #263 (dispatch RPC), decision-6 (the mesh accept-loop auth gate), the Linux
+host standup, and the nix overlay. One target is built (a NixOS host, trusted process); the
 seam is designed so later targets slot in without a contract change. The open stage-1
 items are executor-side orchestrator authentication and result propagation back to the
 orchestrator (#292, see Acceptance).
@@ -93,7 +93,7 @@ communicating, agent inside each," across macOS and an external machine), now de
     invalidates its still-unclaimed token, and the mesh accept loop rejects an invalidated
     token before writing any bytes.
 - **D6 — #263 is the capability-declaring orchestrator↔host-executor contract**, not a
-  WS01-specific one-off.
+  a Linux-host-specific one-off.
 - **D7 — Sequential dispatch, one job per host-executor process (decision 14, #288).** The
   executor reads one `Dispatch`, runs it to completion (bounded by `STAGE1_TIMEOUT_SECS`) via
   `spawn_blocking`, then reads the next; a second `Dispatch` buffers in the connection as

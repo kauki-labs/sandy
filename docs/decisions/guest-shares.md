@@ -63,7 +63,7 @@ option, though other vfkit devices do). Revisit if vfkit adds one.
 `--sandbox=none`. The first version of this decision said both confining modes need
 privileges that sandy's launch does not hold (the original text: "both need privileges
 (user-namespace setup or `CAP_SYS_CHROOT`) that sandy's unprivileged launch does not
-hold"). Measured 2026-10-29, virtiofsd 1.13.3 as uid 1000 on ws01 and 1.14.0 in the
+hold"). Measured 2026-10-29, virtiofsd 1.13.3 as uid 1000 on the Linux host and 1.14.0 in the
 executor nixosTest:
 
 - `chroot`: root only ("sandbox mode 'chroot' can only be used by root").
@@ -75,7 +75,7 @@ executor nixosTest:
   unit's exact `serviceConfig`); nothing in the repo reproduces the `namespace` run.
 - `none`: starts in both (under the unit only the socket appearing was checked). As a
   plain user the daemon runs under virtiofsd's own default seccomp filter
-  (`Seccomp: 2`, read on ws01), in the host's mount, user and pid namespaces. Seccomp
+  (`Seccomp: 2`, read on the Linux host), in the host's mount, user and pid namespaces. Seccomp
   under the unit was not read, and `chroot` was never observed running.
 
 **Decision.** The qemu transport launches each `virtiofsd` with `--sandbox=none`.

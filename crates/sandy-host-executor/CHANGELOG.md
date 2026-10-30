@@ -26,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - _(containment)_ record and enforce the untrusted-is-VM-only decision ([#150](https://github.com/kauki-labs/sandy/pull/150)) ([#382](https://github.com/kauki-labs/sandy/pull/382))
 - _(sandy-host-executor)_ cancel in-flight jobs on shutdown, set TimeoutStopSec ([#369](https://github.com/kauki-labs/sandy/pull/369))
-- _(sandy)_ bypass PATH for qemu/nix/virtiofsd, retry Submit until ws01 registers ([#336](https://github.com/kauki-labs/sandy/pull/336))
+- _(sandy)_ bypass PATH for qemu/nix/virtiofsd, retry Submit until the remote host registers ([#336](https://github.com/kauki-labs/sandy/pull/336))
 
 ### Other
 
@@ -34,7 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - _(readme)_ document running sandyd across multiple hosts ([#422](https://github.com/kauki-labs/sandy/pull/422))
 - /project-docs conformance pass for the first release ([#419](https://github.com/kauki-labs/sandy/pull/419))
 - _(sandyd)_ prove no log line or error carries the link token ([#367](https://github.com/kauki-labs/sandy/pull/367))
-- _(privacy)_ rename ws01-specific identifiers to a generic placeholder ([#350](https://github.com/kauki-labs/sandy/pull/350))
+- _(privacy)_ rename remote-host-specific identifiers to a generic placeholder ([#350](https://github.com/kauki-labs/sandy/pull/350))
 - _(rename)_ sandy-host-client -> sandy-host-executor ([#308](https://github.com/kauki-labs/sandy/pull/308))
 - _(readme)_ trim to binary usage, drop dev setup, add the seams diagram ([#260](https://github.com/kauki-labs/sandy/pull/260))
 - _(license)_ [**breaking**] relicense MIT → AGPL-3.0 + commercial dual + CLA ([#242](https://github.com/kauki-labs/sandy/pull/242))

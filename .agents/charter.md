@@ -58,7 +58,7 @@ gate" hold the details. Tags and releases always need owner ratification.
 ## Main is red
 
 Red main is the top item. Any idle peer takes it. If one failure appears on two unrelated
-PRs, assign one owner and write a repro (for example a `--keep-failed` run on ws01). Do not
+PRs, assign one owner and write a repro (for example a `--keep-failed` run on the Linux host). Do not
 rerun blindly. See #297 and #538 for the pattern.
 
 ## While a gate waits

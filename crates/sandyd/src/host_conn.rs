@@ -809,7 +809,7 @@ mod tests {
             &mut client,
             &HostExecutorMessage {
                 op: Some(host_executor_message::Op::Register(Register {
-                    host_id: "ws01".to_owned(),
+                    host_id: "remote-host".to_owned(),
                     capabilities: Some(capabilities()),
                 })),
             },
@@ -851,7 +851,7 @@ mod tests {
             outputs: Vec::new(),
             secrets: Vec::new(),
         };
-        registry.send_dispatch("ws01", dispatch.clone()).await?;
+        registry.send_dispatch("remote-host", dispatch.clone()).await?;
 
         let pushed: OrchestratorMessage = read_frame(&mut client).await?.context("expected a Dispatch push")?;
         match pushed.op {
@@ -862,7 +862,7 @@ mod tests {
         drop(client);
         tokio::time::timeout(std::time::Duration::from_secs(5), serve).await??;
         assert_eq!(
-            registry.capabilities_of("ws01"),
+            registry.capabilities_of("remote-host"),
             None,
             "disconnecting must remove the host"
         );
@@ -889,7 +889,7 @@ mod tests {
             &mut client,
             &HostExecutorMessage {
                 op: Some(host_executor_message::Op::Register(Register {
-                    host_id: "ws01".to_owned(),
+                    host_id: "remote-host".to_owned(),
                     capabilities: Some(capabilities()),
                 })),
             },
@@ -922,7 +922,7 @@ mod tests {
         let candidate = registry
             .pick_host_for(IsolationClass::Trusted.into(), SandboxKind::Process.into(), false)
             .expect("a host that declared Trusted over the real wire must be a Trusted placement candidate");
-        assert_eq!(candidate.host_id, "ws01");
+        assert_eq!(candidate.host_id, "remote-host");
 
         drop(client);
         tokio::time::timeout(std::time::Duration::from_secs(5), serve).await??;
@@ -952,7 +952,7 @@ mod tests {
             &mut client,
             &HostExecutorMessage {
                 op: Some(host_executor_message::Op::Register(Register {
-                    host_id: "ws01".to_owned(),
+                    host_id: "remote-host".to_owned(),
                     capabilities: Some(capabilities()),
                 })),
             },
@@ -991,7 +991,7 @@ mod tests {
 
         let registry = tokio::time::timeout(std::time::Duration::from_secs(5), serving).await??;
         assert_eq!(
-            registry.capabilities_of("ws01"),
+            registry.capabilities_of("remote-host"),
             None,
             "a plaintext peer must never register, regardless of its IP or a real Register frame"
         );
@@ -1138,7 +1138,7 @@ mod tests {
             &mut client,
             &HostExecutorMessage {
                 op: Some(host_executor_message::Op::Register(Register {
-                    host_id: "ws01".to_owned(),
+                    host_id: "remote-host".to_owned(),
                     capabilities: Some(capabilities()),
                 })),
             },
@@ -1170,14 +1170,14 @@ mod tests {
         // The first send is picked up by the connection loop's select! and
         // its write stalls immediately (the duplex buffer is too small for
         // even one frame) — this one slot is never returned to the channel.
-        registry.send_dispatch("ws01", test_dispatch("job-1")).await?;
+        registry.send_dispatch("remote-host", test_dispatch("job-1")).await?;
 
         // Fill the channel's full capacity (8) behind the stalled write:
         // these succeed immediately since nothing has consumed from the
         // channel since the first send.
         for n in 0..8 {
             registry
-                .send_dispatch("ws01", test_dispatch(&format!("job-fill-{n}")))
+                .send_dispatch("remote-host", test_dispatch(&format!("job-fill-{n}")))
                 .await?;
         }
 
@@ -1187,7 +1187,7 @@ mod tests {
         let blocked_registry = std::sync::Arc::clone(&registry);
         let blocked_send = tokio::spawn(async move {
             blocked_registry
-                .send_dispatch("ws01", test_dispatch("job-overflow"))
+                .send_dispatch("remote-host", test_dispatch("job-overflow"))
                 .await
         });
 
@@ -1221,12 +1221,12 @@ mod tests {
         );
 
         assert_eq!(
-            registry.capabilities_of("ws01"),
+            registry.capabilities_of("remote-host"),
             None,
             "a hung Dispatch write must disconnect and deregister the host"
         );
 
-        let resend = registry.send_dispatch("ws01", test_dispatch("job-2")).await;
+        let resend = registry.send_dispatch("remote-host", test_dispatch("job-2")).await;
         assert!(
             matches!(resend, Err(crate::host_registry::DispatchSendError::NoSuchHost)),
             "a send after full deregistration must fail with NoSuchHost, not hang: got {resend:?}"
@@ -1275,7 +1275,7 @@ mod tests {
             &mut client,
             &HostExecutorMessage {
                 op: Some(host_executor_message::Op::Register(Register {
-                    host_id: "ws01".to_owned(),
+                    host_id: "remote-host".to_owned(),
                     capabilities: Some(capabilities()),
                 })),
             },
@@ -1315,9 +1315,9 @@ mod tests {
         // for even one frame); job-2 and job-3 queue behind it in the
         // channel, never popped before the loop below exits on the write
         // timeout.
-        registry.send_dispatch("ws01", test_dispatch("job-1")).await?;
-        registry.send_dispatch("ws01", test_dispatch("job-2")).await?;
-        registry.send_dispatch("ws01", test_dispatch("job-3")).await?;
+        registry.send_dispatch("remote-host", test_dispatch("job-1")).await?;
+        registry.send_dispatch("remote-host", test_dispatch("job-2")).await?;
+        registry.send_dispatch("remote-host", test_dispatch("job-3")).await?;
 
         tokio::time::advance(DISPATCH_WRITE_TIMEOUT + std::time::Duration::from_millis(1)).await;
         serve.await?;
@@ -1378,7 +1378,7 @@ mod tests {
             &mut client,
             &HostExecutorMessage {
                 op: Some(host_executor_message::Op::Register(Register {
-                    host_id: "ws01".to_owned(),
+                    host_id: "remote-host".to_owned(),
                     capabilities: Some(capabilities()),
                 })),
             },
@@ -1407,7 +1407,7 @@ mod tests {
             .await?
             .context("expected a Registered response")?;
 
-        registry.send_dispatch("ws01", test_dispatch("job-1")).await?;
+        registry.send_dispatch("remote-host", test_dispatch("job-1")).await?;
 
         // An unexpected frame from the host, sent right as the first dispatch
         // is in flight — the interleaving this test exists to exercise. The
@@ -1416,15 +1416,15 @@ mod tests {
             &mut client,
             &HostExecutorMessage {
                 op: Some(host_executor_message::Op::Register(Register {
-                    host_id: "ws01".to_owned(),
+                    host_id: "remote-host".to_owned(),
                     capabilities: Some(capabilities()),
                 })),
             },
         )
         .await?;
 
-        registry.send_dispatch("ws01", test_dispatch("job-2")).await?;
-        registry.send_dispatch("ws01", test_dispatch("job-3")).await?;
+        registry.send_dispatch("remote-host", test_dispatch("job-2")).await?;
+        registry.send_dispatch("remote-host", test_dispatch("job-3")).await?;
 
         for expected_job_id in ["job-1", "job-2", "job-3"] {
             let pushed: OrchestratorMessage = read_frame(&mut client).await?.context("expected a Dispatch push")?;
@@ -1478,7 +1478,7 @@ mod tests {
             &mut client,
             &HostExecutorMessage {
                 op: Some(host_executor_message::Op::Register(Register {
-                    host_id: "ws01".to_owned(),
+                    host_id: "remote-host".to_owned(),
                     capabilities: Some(capabilities()),
                 })),
             },
@@ -1527,7 +1527,7 @@ mod tests {
         use sandy_executor_proto::Message;
         let unexpected = HostExecutorMessage {
             op: Some(host_executor_message::Op::Register(Register {
-                host_id: "ws01".to_owned(),
+                host_id: "remote-host".to_owned(),
                 capabilities: Some(capabilities()),
             })),
         };
@@ -1552,7 +1552,7 @@ mod tests {
         // The length prefix is now consumed with no payload bytes behind it:
         // the read is necessarily still pending on `read_exact`, not a race,
         // an observed fact about what's been written and already polled.
-        registry.send_dispatch("ws01", test_dispatch("job-1")).await?;
+        registry.send_dispatch("remote-host", test_dispatch("job-1")).await?;
 
         // Read the resulting push back BEFORE writing the payload, not
         // after: this was the second gap once `pending_reads` fixed the
@@ -1591,7 +1591,7 @@ mod tests {
             .await
             .context("the reader must decode the completed frame and park on the next prefix")?;
 
-        registry.send_dispatch("ws01", test_dispatch("job-2")).await?;
+        registry.send_dispatch("remote-host", test_dispatch("job-2")).await?;
         let pushed: OrchestratorMessage = read_frame(&mut client).await?.context("expected a Dispatch push")?;
         match pushed.op {
             Some(orchestrator_message::Op::Dispatch(received)) => assert_eq!(
@@ -1620,7 +1620,7 @@ mod tests {
             &mut client,
             &HostExecutorMessage {
                 op: Some(host_executor_message::Op::Register(Register {
-                    host_id: "ws01".to_owned(),
+                    host_id: "remote-host".to_owned(),
                     capabilities: Some(capabilities()),
                 })),
             },
@@ -1629,10 +1629,13 @@ mod tests {
         wait_for_read_to_park(&pending_reads, before_clean)
             .await
             .context("the reader must consume the clean frame before the registration check")?;
-        registry.send_dispatch("ws01", test_dispatch("job-3")).await.context(
-            "the host must still be registered and dispatch-eligible after a clean frame following the forced \
-             interleaving — a desync would have broken the connection by now",
-        )?;
+        registry
+            .send_dispatch("remote-host", test_dispatch("job-3"))
+            .await
+            .context(
+                "the host must still be registered and dispatch-eligible after a clean frame following the forced \
+                 interleaving — a desync would have broken the connection by now",
+            )?;
         let pushed: OrchestratorMessage = read_frame(&mut client).await?.context("expected a Dispatch push")?;
         match pushed.op {
             Some(orchestrator_message::Op::Dispatch(received)) => assert_eq!(received.job_id, "job-3"),

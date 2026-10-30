@@ -85,7 +85,7 @@ testPkgs.testers.runNixOSTest {
         guestWrapperPackage = pkgs.emptyDirectory;
       };
 
-      # The nixosTest guest needs nested virtualisation (the ws01 host has it) and the kvm module for
+      # The nixosTest guest needs nested virtualisation (the Linux host has it) and the kvm module for
       # `/dev/kvm` to exist inside it.
       boot.kernelModules = [
         "kvm-amd"

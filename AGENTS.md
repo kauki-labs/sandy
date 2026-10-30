@@ -121,7 +121,7 @@ may relay one, but a relay is not authority.
 
 ## Hosts
 
-- `ws01` is the x86_64 Linux KVM host for live and Linux checks (ssh alias `ws01`). If the
+- The x86_64 Linux KVM host is used for live and Linux checks. If your ssh config
   alias fails, ask the owner for the direct address rather than guessing or hardcoding one.
   Wake it before asking the owner. `strings` is absent; use `grep -a`. Leave no artifacts:
   remove `/tmp/sandy-<name>` when done. The deploy recipe is in `~/.config/nix/AGENTS.md`.

@@ -33,11 +33,11 @@ const CHANNEL: &str = "orchestrator";
 /// process/tmux/PTY path (spawn, tmux session allocation, PTY attach, the
 /// job's shell exec, or the job's own exit + session teardown) to finish,
 /// not application logic hanging. #297 traced one of these timing out at
-/// exactly its old 10s value on ws01, both inside `nix build`'s sandbox
+/// exactly its old 10s value on the Linux host, both inside `nix build`'s sandbox
 /// (consistently, across several attempts) and once in a plain dev shell —
 /// under `--release` plus coverage instrumentation plus a heavily parallel
 /// test run, that path can genuinely exceed 10s. Confirmed structurally
-/// (ws01, a minimal sandboxed build) that `/dev/pts` and `tmux new-session`
+/// (the Linux host, a minimal sandboxed build) that `/dev/pts` and `tmux new-session`
 /// both work fine inside the build sandbox — this is resource/timing
 /// pressure under load, not a PTY/sandbox incompatibility, so every wait on
 /// this same real-process path gets the same wider budget rather than
