@@ -720,6 +720,12 @@ pub(crate) mod tests {
                 "env"
             ]
         );
+        let env = [("SANDY_HISTORY_LINES".to_string(), "250".to_string())];
+        assert_eq!(
+            console_command(&job, &env, Some(program), None)[..2],
+            ["env", "SANDY_HISTORY_LINES=250"],
+            "the job env reaches the agent through the console command"
+        );
         assert_eq!(
             console_command(&job, &[], None, None),
             job,

@@ -50,8 +50,9 @@ const READY_WAIT: Duration = Duration::from_secs(2);
 pub(crate) fn agent_command_argv(program: &Path, port: u32, job: &[String], env: &[(String, String)]) -> Vec<String> {
     let mut argv = Vec::new();
     // Only the history bound crosses: no host variable enters the guest (#527). The
-    // guest's `env` sets it for the agent, which reads it at startup (#378).
-    if let Some((key, value)) = env.iter().find(|(key, _)| key == HISTORY_LINES_ENV) {
+    // guest's `env` sets it for the agent, which reads it at startup (#378). The last entry
+    // wins, as in the process backend's overlay: the executor appends its own value last.
+    if let Some((key, value)) = env.iter().rfind(|(key, _)| key == HISTORY_LINES_ENV) {
         argv.extend(["env".to_owned(), format!("{key}={value}")]);
     }
     argv.extend([
@@ -272,6 +273,15 @@ mod tests {
                 "true"
             ],
             "the history bound is set for the agent and no other host variable crosses"
+        );
+        let duplicated = [
+            ("SANDY_HISTORY_LINES".to_string(), "5".to_string()),
+            ("SANDY_HISTORY_LINES".to_string(), "250".to_string()),
+        ];
+        assert_eq!(
+            agent_command_argv(program, 5000, &["true".to_string()], &duplicated)[1],
+            "SANDY_HISTORY_LINES=250",
+            "a repeated key resolves last-wins, so the executor's value beats the manifest's"
         );
         let other = [("HOME".to_string(), "/host/home".to_string())];
         assert_eq!(
