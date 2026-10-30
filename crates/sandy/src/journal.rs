@@ -183,14 +183,15 @@ impl Journal {
 
     /// Open (creating if absent) a job's lockfile with `O_CLOEXEC` so only the
     /// supervisor holds it — forked children must not inherit it, or reconcile
-    /// would never fire (INV-3, D3).
+    /// would never fire (INV-3, D3). `O_NOFOLLOW` refuses a symlink planted at
+    /// the lockfile name (#397).
     fn open_lockfile(&self, job_id: &str) -> Result<File, CoreError> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .custom_flags(libc::O_CLOEXEC)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
             .open(self.lock_path(job_id))?;
         Ok(file)
     }
@@ -300,6 +301,8 @@ pub fn is_networked_fs(fstype: &str) -> bool {
 mod tests {
     use std::time::SystemTime;
 
+    use anyhow::Context as _;
+
     use super::*;
     use crate::{
         result::{Logs, OutputRef, Provenance, RESULT_SCHEMA_VERSION, ResultEnvelope, Status},
@@ -365,6 +368,25 @@ mod tests {
             journal.try_lock_job("job-1")?.is_none(),
             "a second writer must not acquire the held lock"
         );
+        Ok(())
+    }
+
+    /// #397: a symlink planted at a job's lockfile name is refused, not followed
+    /// to lock (and possibly create) a file outside `$SANDY_HOME`.
+    #[test]
+    fn a_symlinked_lockfile_is_refused() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let journal = Journal::new(tmp.path());
+        journal.ensure_dirs()?;
+        let outside = tempfile::tempdir()?;
+        let target = outside.path().join("victim");
+        std::os::unix::fs::symlink(&target, journal.lock_path("job-1"))?;
+        let err = journal
+            .try_lock_job("job-1")
+            .err()
+            .context("a symlinked lockfile must be refused")?;
+        assert!(matches!(err, CoreError::Io(_)), "got {err:?}");
+        assert!(!target.exists(), "the link target must not be created");
         Ok(())
     }
 
