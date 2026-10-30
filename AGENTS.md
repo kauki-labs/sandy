@@ -119,10 +119,10 @@ Proposed, not yet ratified in #462: owner decisions live in one pinned issue com
 
 ## Hosts
 
-- `ws01` is the x86_64 Linux KVM host for live and Linux checks (ssh alias `ws01`; if the
-  alias fails, `ssh teebor@100.64.0.1`, the same machine). Wake it before asking the owner.
-  `strings` is absent; use `grep -a`. Leave no artifacts: remove `/tmp/sandy-<name>` when done.
-  The deploy recipe is in `~/.config/nix/AGENTS.md`.
+- `ws01` is the x86_64 Linux KVM host for live and Linux checks (ssh alias `ws01`). If the
+  alias fails, ask the owner for the direct address rather than guessing or hardcoding one.
+  Wake it before asking the owner. `strings` is absent; use `grep -a`. Leave no artifacts:
+  remove `/tmp/sandy-<name>` when done. The deploy recipe is in `~/.config/nix/AGENTS.md`.
 - Running `sandyd` plus the executor across a Mac and Linux host: the manual smoke test in
   [`docs/design/host-executor/spec.md`](docs/design/host-executor/spec.md).
 - The audit log is at `../audit.md` (`products/audit.md`, one level above this repo).
