@@ -113,10 +113,13 @@ let
       # the terminfo database common `TERM` values (e.g. xterm-256color)
       # need for correct cursor/escape-sequence handling in a TUI app
       # (#340 phase 4).
+      # `socat` (#406 KP4): opens a raw AF_VSOCK stream, so the live gate can prove a job that
+      # skips the relay meets the same allow-list. bash has no vsock; the image had no tool for it.
       environment.systemPackages = [
         pkgs.sandy-agent
         pkgs.tmux
         pkgs.ncurses
+        pkgs.socat
       ];
 
       # UTF-8 locale (#340 phase 4): a job running a TUI app inside the guest

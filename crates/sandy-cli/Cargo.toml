@@ -117,3 +117,6 @@ rustix.workspace = true
 rstest.workspace = true
 sandy-test-support.workspace = true
 tracing-subscriber.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+vsock.workspace = true

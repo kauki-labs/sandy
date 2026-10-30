@@ -35,10 +35,8 @@
 //!
 //! ## Not covered
 //!
-//! KP4's raw `AF_VSOCK` sub-case: the guest has no tool that opens an `AF_VSOCK`
-//! stream (bash has none, and the image carries no python or socat), so a raw vsock
-//! stream to the proxy port is not attempted. The relay path is covered by KP2/KP3. The
-//! qemu "second CID is refused" sub-case needs a second VM and is a TODO.
+//! KP4's qemu "second CID is refused" sub-case needs a second VM; `a_vsock_peer_with_another_cid_is_closed_unanswered`
+//! covers the same CID filter from the host over vsock loopback instead.
 
 #![cfg(feature = "live")]
 
@@ -729,6 +727,156 @@ case "$line4" in *" 403 "*) exit 0 ;; *) exit 10 ;; esac
 /// `path` as one single-quoted shell word; an embedded `'` is closed, escaped and reopened.
 fn sh_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
+/// KP4, raw vsock: a job that skips the relay and opens its own AF_VSOCK stream to the host proxy meets the
+/// same allow-list. The job reads the proxy port off the relay's command line (`--vsock-port`, random on
+/// qemu, constant on vfkit), then speaks CONNECT through `socat VSOCK-CONNECT:2:<port>`: the allowed target
+/// gets `200`, the denied one `403`. Both legs run this one test.
+#[test]
+fn a_raw_vsock_stream_meets_the_same_allow_list() -> anyhow::Result<()> {
+    let target = require_proxy_live()?;
+    build_guest(&target)?;
+    let home = tempfile::tempdir().context("temp SANDY_HOME")?;
+    let (allowed, denied) = (allowed_host(), denied_host());
+    let allow = vec![format!("{allowed}:{PROBE_PORT}")];
+
+    let script = format!(
+        r#"set -u
+command -v socat >/dev/null || exit 49
+port=""
+for f in /proc/[0-9]*/cmdline; do
+  c=$(tr '\0' ' ' <"$f" 2>/dev/null) || continue
+  case "$c" in
+    *egress-relay*--vsock-port*)
+      port=$(printf '%s' "$c" | sed -n 's/.*--vsock-port \([0-9][0-9]*\).*/\1/p')
+      break ;;
+  esac
+done
+[ -n "$port" ] || exit 50
+raw_status() {{
+  printf 'CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n' "$1" "$1" \
+    | timeout 10 socat -T3 - "VSOCK-CONNECT:2:$port" 2>/dev/null | head -n1 | cut -d' ' -f2
+}}
+denied_status=$(raw_status {denied}:{PROBE_PORT})
+allowed_status=$(raw_status {allowed}:{PROBE_PORT})
+echo "live_egress_proxy: raw vsock port $port: denied -> $denied_status, allowed -> $allowed_status"
+[ "$denied_status" = 403 ] || exit 51
+[ "$allowed_status" = 200 ] || exit 52
+exit 0
+"#
+    );
+    let (code, env) = sandy_proxy_run(home.path(), &target, &allow, &script)?;
+
+    assert_guest_ok(
+        code,
+        &env,
+        "a raw vsock stream must meet the allow-list (guest exit 49 = no socat in the image, 50 = no relay command \
+         line found, 51 = the denied target did not get 403, 52 = the allowed target did not get 200)",
+    );
+    Ok(())
+}
+
+/// A `sandy-egress-proxy` listening on vsock `port` for `peer_cid` only, started standalone. Killed on drop.
+#[cfg(target_os = "linux")]
+struct VsockProxy(std::process::Child);
+
+#[cfg(target_os = "linux")]
+impl VsockProxy {
+    fn start(port: u32, peer_cid: u32, rules: &[(&str, u16)]) -> anyhow::Result<Self> {
+        use std::io::{BufRead, Write};
+
+        let bin = std::env::var_os("SANDY_EGRESS_PROXY_BIN")
+            .map(std::path::PathBuf::from)
+            .or_else(|| find_on_path("sandy-egress-proxy"))
+            .context("refusing: sandy-egress-proxy is neither SANDY_EGRESS_PROXY_BIN nor on PATH")?;
+        let policy = serde_json::json!({
+            "rules": rules.iter().map(|(host, port)| serde_json::json!({"host": host, "port": port})).collect::<Vec<_>>()
+        });
+        let child = Command::new(bin)
+            .args(["--vsock-port", &port.to_string(), "--peer-cid", &peer_cid.to_string()])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("spawn the standalone proxy")?;
+        // The guard owns the child before anything can fail, so an early return still reaps it.
+        let mut proxy = Self(child);
+        proxy
+            .0
+            .stdin
+            .take()
+            .context("proxy stdin")?
+            .write_all(policy.to_string().as_bytes())
+            .context("write the policy")?;
+        let mut ready = String::new();
+        std::io::BufReader::new(proxy.0.stdout.take().context("proxy stdout")?)
+            .read_line(&mut ready)
+            .context("read READY")?;
+        anyhow::ensure!(ready.trim() == "READY", "the proxy did not print READY, got {ready:?}");
+        Ok(proxy)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for VsockProxy {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Send one `CONNECT` to the proxy over vsock loopback and return what the proxy answers (empty on a plain
+/// close). `VMADDR_CID_LOCAL` (1) is the peer CID the proxy sees for a connection from this host.
+#[cfg(target_os = "linux")]
+fn vsock_loopback_connect_answer(port: u32, target: &str) -> anyhow::Result<Vec<u8>> {
+    use std::io::{Read, Write};
+
+    let mut stream = vsock::VsockStream::connect_with_cid_port(1, port)
+        .context("connect over vsock loopback (CID 1): is the `vsock_loopback` kernel module loaded?")?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    // A refused peer may already be closed; a failed write is part of the refusal, not an error here.
+    let _ = stream.write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes());
+    let mut answer = Vec::new();
+    match stream.read_to_end(&mut answer) {
+        Ok(_) => {}
+        // A reset after the proxy dropped the stream counts as a close with no answer.
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Err(e) => return Err(anyhow::Error::new(e).context("read the proxy's answer")),
+    }
+    Ok(answer)
+}
+
+/// KP4, qemu wrong-CID case: the proxy serves only the CID of the guest it was started for. A vsock peer with
+/// any other CID is closed unanswered. A second VM is not needed: a connection from this host over vsock
+/// loopback arrives with CID 1, which is a CID the proxy was not started for. A control run with the proxy
+/// started for CID 1 gets an HTTP answer, so the silent close in the first run is the CID filter and not a
+/// broken listener or client.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_vsock_peer_with_another_cid_is_closed_unanswered() -> anyhow::Result<()> {
+    require_proxy_live()?;
+    #[allow(clippy::cast_possible_truncation, reason = "a pid fits a port offset")]
+    let base = 50_000 + (std::process::id() % 10_000);
+    let denied = format!("{}:{PROBE_PORT}", denied_host());
+
+    let control = VsockProxy::start(base, 1, &[("203.0.113.9", PROBE_PORT)])?;
+    let answered = vsock_loopback_connect_answer(base, &denied)?;
+    assert!(
+        answered.starts_with(b"HTTP/1.1 403"),
+        "control: the proxy for CID 1 must answer a denied CONNECT with 403, got {:?}",
+        String::from_utf8_lossy(&answered)
+    );
+    drop(control);
+
+    let _refusing = VsockProxy::start(base + 1, 4242, &[("203.0.113.9", PROBE_PORT)])?;
+    let answered = vsock_loopback_connect_answer(base + 1, &denied)?;
+    assert!(
+        answered.is_empty(),
+        "a peer whose CID is not 4242 must be closed unanswered, got {:?}",
+        String::from_utf8_lossy(&answered)
+    );
+    Ok(())
 }
 
 /// Write an executable `#!/bin/sh` script to `path`.
