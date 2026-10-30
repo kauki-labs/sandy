@@ -49,7 +49,7 @@ lifecycle bracket, both adapters) is settled and does not wait on this.
 
 ## Repos referenced
 
-- `/Users/teebor/Fun/kauki.xyz/products/sandy` (this repo). Follow `AGENTS.md`: edition-2024 Rust,
+- `kauki-labs/sandy` (this repo). Follow `AGENTS.md`: edition-2024 Rust,
   `nix develop -c cargo ...`, `nix fmt` + `nix flake check -L` before a PR, Conventional Commits,
   branch `<nick>/<type>/<component>/<desc>`, never push to `main`.
 - Tracking issues: `#49` (this seam's tracker), `#50` (guest-consumption blocker), `#36` (agent-model
