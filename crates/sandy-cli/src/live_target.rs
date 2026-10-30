@@ -50,12 +50,7 @@ pub fn require_live() -> anyhow::Result<LiveTarget> {
     let target = if host.hypervisor == "vfkit" {
         vfkit_target(&host.guest_system)?
     } else {
-        LiveTarget {
-            hypervisor: "qemu-system-x86_64".to_string(),
-            runner_attr: "packages.x86_64-linux.guest-runner",
-            topology_attr: "topologies.x86_64-linux.qemu",
-            target_arch: "x86_64-linux",
-        }
+        qemu_target(std::env::consts::ARCH)?
     };
     ensure_arch_matches(target.target_arch, &host.guest_system)?;
     if !on_path(&target.hypervisor) {
@@ -70,6 +65,22 @@ pub fn require_live() -> anyhow::Result<LiveTarget> {
         );
     }
     Ok(target)
+}
+
+/// The qemu (Linux) live target for a host of `host_arch` (`std::env::consts::ARCH`).
+/// `host_target()` pairs every non-macOS host with `x86_64-linux`, so the later
+/// `ensure_arch_matches` cannot see a non-x86_64 Linux host; refuse it here by name
+/// (#447) instead of surfacing as an `executor_suite` capability mismatch.
+fn qemu_target(host_arch: &str) -> anyhow::Result<LiveTarget> {
+    if host_arch != "x86_64" {
+        bail!("refusing: no qemu live target for host arch `{host_arch}` — only x86_64 Linux is on the live matrix");
+    }
+    Ok(LiveTarget {
+        hypervisor: "qemu-system-x86_64".to_string(),
+        runner_attr: "packages.x86_64-linux.guest-runner",
+        topology_attr: "topologies.x86_64-linux.qemu",
+        target_arch: "x86_64-linux",
+    })
 }
 
 /// vfkit's live target for `guest_system` (derived from `host_target()`, not
@@ -137,7 +148,27 @@ pub fn build_guest(target: &LiveTarget) -> anyhow::Result<()> {
 mod tests {
     use anyhow::Context;
 
-    use super::{ensure_arch_matches, vfkit_target};
+    use super::{ensure_arch_matches, qemu_target, vfkit_target};
+
+    /// #447: a non-x86_64 Linux host refuses by name, not as a later capability mismatch.
+    #[test]
+    fn qemu_target_refuses_a_non_x86_64_host() {
+        let err = match qemu_target("aarch64") {
+            Err(err) => err,
+            Ok(_) => panic!("expected a refusal for an aarch64 host"),
+        };
+        assert!(
+            err.to_string().contains("refusing") && err.to_string().contains("aarch64"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn qemu_target_resolves_on_an_x86_64_host() -> anyhow::Result<()> {
+        let target = qemu_target("x86_64").context("resolve the x86_64 qemu target")?;
+        assert_eq!(target.target_arch, "x86_64-linux");
+        Ok(())
+    }
 
     /// The only guest arch `nix/guest/flake.nix` actually builds for vfkit.
     #[test]

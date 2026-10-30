@@ -9,6 +9,7 @@ use std::{net::SocketAddr, os::unix::fs::PermissionsExt, path::PathBuf, sync::Ar
 
 use sandy_conn::{Listener as MeshListener, TlsIdentity};
 use sandyd::{
+    build_rev::{log_startup, resolve_rev, version_line, wants_version},
     dispatch::JobRegistry,
     gate_spawn,
     host_registry::{ExecutorAllowlist, HostRegistry},
@@ -17,6 +18,9 @@ use sandyd::{
     store::{CancelOutcome, JobStore},
 };
 use tokio::net::UnixListener;
+
+const BIN: &str = env!("CARGO_PKG_NAME");
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// How long graceful shutdown waits for in-flight connections to finish on
 /// their own before the process exits anyway. A control-plane request is
@@ -91,6 +95,13 @@ impl AcceptBackoff {
 
 #[tokio::main]
 async fn main() {
+    // Set by nix at build time (flake `shortRev`/`dirtyShortRev`); unset under `cargo run`.
+    let rev = resolve_rev(option_env!("SANDY_BUILD_REV"));
+    if wants_version(std::env::args().skip(1)) {
+        println!("{}", version_line(BIN, VERSION, rev));
+        return;
+    }
+
     if let Some(code) = run_operator_command() {
         std::process::exit(code);
     }
@@ -98,6 +109,7 @@ async fn main() {
         .with_default_directive(tracing::level_filters::LevelFilter::INFO.into())
         .from_env_lossy();
     tracing_subscriber::fmt().with_env_filter(filter).init();
+    log_startup(BIN, VERSION, rev);
 
     let socket_path = match socket_path() {
         Ok(path) => path,

@@ -429,6 +429,22 @@ in
           "unshare"
           "pivot_root"
           "setns"
+          # virtiofsd (#544/#523's Vm backend) calls this for its
+          # inode-file-handle open path; it isn't in `@system-service`, and
+          # systemd's default for a filtered-out call is SIGSYS (confirmed:
+          # #553, a direct `systemd-run --user` reproduction of this exact
+          # filter on ws01 core-dumped virtiofsd with `status=31/SYS`, the
+          # stack trace pointing at
+          # `passthrough::file_handle::OpenableFileHandle::open`). Allowing
+          # it grants no new privilege: `CapabilityBoundingSet = ""` above
+          # already strips CAP_DAC_READ_SEARCH, so the call still fails with
+          # EPERM at the kernel, which virtiofsd already handles gracefully
+          # (logs a warning, falls back) — confirmed unprivileged outside any
+          # seccomp filter. Allow-listing it by name, rather than softening
+          # `SystemCallErrorNumber` unit-wide, keeps every other out-of-filter
+          # syscall in this cgroup (bwrap, the dispatched job, qemu) killing
+          # loudly instead of failing silently.
+          "open_by_handle_at"
         ];
         # Left open (not hardened): `bwrap` needs to create its own mount/PID
         # namespaces for the confinement layer SystemdRunContainment probes
