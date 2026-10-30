@@ -186,14 +186,7 @@ fn set_deadline_from_timeout_secs(control: &RunControl, timeout_secs: u32) {
 /// submitter asked for (or
 /// [`sandy_guest_template::manifest::default_history_lines`] if they didn't).
 ///
-/// KNOWN GAP, not a bug in this phase: `RunSpec.env` is not plumbed through
-/// to a VM-backed job anywhere today (confirmed: `impls/vm`'s qemu/vfkit/
-/// agent code never reads `spec.env` at all) — setting this is forward-
-/// compatible and costs nothing, but it will not actually reach the guest
-/// until that separate plumbing gap is closed (likely alongside phase 1's
-/// own env-passing work, since the guest also needs `TERM`/locale for the
-/// same reason). Until then, the in-guest default applies regardless of
-/// what a submitter actually asked for.
+/// `impls/vm` forwards this one entry to the guest agent (#398); no other `RunSpec.env` entry crosses.
 fn history_lines_env(history_lines: u32) -> [(String, String); 1] {
     [("SANDY_HISTORY_LINES".to_owned(), history_lines.to_string())]
 }

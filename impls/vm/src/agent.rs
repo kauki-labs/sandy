@@ -27,6 +27,9 @@ use sandy_api::agent::{AGENT_LINK_READY, AgentLaunch, AgentReport, AgentVerdict}
 /// verdict (as on the process backend, it follows the link closing at once).
 const VERDICT_GRACE: Duration = Duration::from_secs(10);
 
+/// The job env entry the guest agent reads for its scrollback bound.
+const HISTORY_LINES_ENV: &str = "SANDY_HISTORY_LINES";
+
 /// The first retry delay; it doubles up to [`MAX_BACKOFF`].
 const FIRST_BACKOFF: Duration = Duration::from_millis(50);
 /// The longest wait between connection attempts.
@@ -44,13 +47,19 @@ const READY_WAIT: Duration = Duration::from_secs(2);
 /// hand (`sh -c <job.join(" ")>`), which double-joined `job` and lost any
 /// multi-word element (e.g. `["sh", "-c", "exit 3"]` ran as `exit`, `3`
 /// re-tokenized) — the same bug class #116 found live in the plain path.
-pub(crate) fn agent_command_argv(program: &Path, port: u32, job: &[String]) -> Vec<String> {
-    let mut argv = vec![
+pub(crate) fn agent_command_argv(program: &Path, port: u32, job: &[String], env: &[(String, String)]) -> Vec<String> {
+    let mut argv = Vec::new();
+    // Only the history bound crosses: no host variable enters the guest (#527). The
+    // guest's `env` sets it for the agent, which reads it at startup (#378).
+    if let Some((key, value)) = env.iter().find(|(key, _)| key == HISTORY_LINES_ENV) {
+        argv.extend(["env".to_owned(), format!("{key}={value}")]);
+    }
+    argv.extend([
         program.to_string_lossy().into_owned(),
         "--vsock-listen".to_owned(),
         port.to_string(),
         "--".to_owned(),
-    ];
+    ]);
     argv.extend(job.iter().cloned());
     argv
 }
@@ -226,6 +235,7 @@ mod tests {
             Path::new("/nix/store/abc-sandy-agent/bin/sandy-agent"),
             5000,
             &["sh".to_string(), "-c".to_string(), "exit 3".to_string()],
+            &[],
         );
         assert_eq!(
             argv,
@@ -239,6 +249,35 @@ mod tests {
                 "exit 3".to_string(),
             ],
             "job's argv (including a multi-word element) must come through unchanged, not re-joined or re-split"
+        );
+    }
+
+    #[test]
+    fn only_the_history_lines_env_reaches_the_guest_agent() {
+        let program = Path::new("/nix/store/abc-sandy-agent/bin/sandy-agent");
+        let env = [
+            ("HOME".to_string(), "/host/home".to_string()),
+            ("SANDY_HISTORY_LINES".to_string(), "250".to_string()),
+        ];
+        let argv = agent_command_argv(program, 5000, &["true".to_string()], &env);
+        assert_eq!(
+            argv,
+            [
+                "env",
+                "SANDY_HISTORY_LINES=250",
+                "/nix/store/abc-sandy-agent/bin/sandy-agent",
+                "--vsock-listen",
+                "5000",
+                "--",
+                "true"
+            ],
+            "the history bound is set for the agent and no other host variable crosses"
+        );
+        let other = [("HOME".to_string(), "/host/home".to_string())];
+        assert_eq!(
+            agent_command_argv(program, 5000, &["true".to_string()], &other)[0],
+            "/nix/store/abc-sandy-agent/bin/sandy-agent",
+            "without the history bound the command is unchanged"
         );
     }
 
