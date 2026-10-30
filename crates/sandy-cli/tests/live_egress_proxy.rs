@@ -283,8 +283,8 @@ fn allowed_target_is_reachable_through_the_proxy() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// KP2: a target not on the allow-list gets `403`. That no connection leaves the host is not observed
-/// here, so `kpi.md` keeps that half of KP2q out of the green claim.
+/// KP2: a target not on the allow-list gets `403`. That the proxy dials nothing is observed by
+/// `a_denied_target_is_never_dialed_by_the_proxy`.
 #[test]
 fn denied_target_gets_403() -> anyhow::Result<()> {
     let target = require_proxy_live()?;
@@ -635,8 +635,103 @@ exit 0
     Ok(())
 }
 
+/// KP2, host side: while the guest gets `403` for a denied target, the proxy holds no connection to it. The
+/// job first opens a tunnel to the allowed target and keeps it, which proves the observer sees the proxy's
+/// connections (a positive control: without it an empty observation would prove nothing). It then asks for the
+/// denied target, expects `403`, and waits so the host samples for a while. A dial that opened and closed
+/// between two 200 ms samples would be missed; this check does not claim to catch that.
+#[test]
+fn a_denied_target_is_never_dialed_by_the_proxy() -> anyhow::Result<()> {
+    let target = require_proxy_live()?;
+    build_guest(&target)?;
+    let home = tempfile::tempdir().context("temp SANDY_HOME")?;
+    let stderr_path = home.path().join("sandy.stderr");
+    let (allowed, denied) = (allowed_host(), denied_host());
+    let parse = |name: &str, host: &str| {
+        host.parse::<Ipv4Addr>()
+            .with_context(|| format!("KP2 needs {name} to be an IPv4 literal, got {host}"))
+    };
+    let (allowed_ip, denied_ip) = (
+        parse("SANDY_EGRESS_ALLOWED", &allowed)?,
+        parse("SANDY_EGRESS_DENIED", &denied)?,
+    );
+    anyhow::ensure!(allowed_ip != denied_ip, "KP2 needs distinct allowed and denied targets");
+    let allow = vec![format!("{allowed}:{PROBE_PORT}")];
+
+    let script = format!(
+        r#"set -u
+exec 3<>/dev/tcp/127.0.0.1/3128
+printf 'CONNECT {a}:{PROBE_PORT} HTTP/1.1\r\nHost: {a}:{PROBE_PORT}\r\n\r\n' >&3
+IFS= read -r -t 15 line3 <&3 || true
+exec 4<>/dev/tcp/127.0.0.1/3128
+printf 'CONNECT {d}:{PROBE_PORT} HTTP/1.1\r\nHost: {d}:{PROBE_PORT}\r\n\r\n' >&4
+IFS= read -r -t 15 line4 <&4 || true
+echo "live_egress_proxy: allowed -> $line3 / denied -> $line4"
+sleep 20
+case "$line4" in *" 403 "*) exit 0 ;; *) exit 10 ;; esac
+"#,
+        a = allowed,
+        d = denied
+    );
+    let mut child = sandy_proxy_cmd(home.path(), &target, &allow, &script)
+        .stdout(Stdio::piped())
+        .stderr(std::fs::File::create(&stderr_path).context("create stderr file")?)
+        .spawn()
+        .context("spawn sandy")?;
+
+    // Sample the proxy's connections until sandy exits. Every error path still reaps sandy below.
+    let mut seen_allowed = false;
+    let mut dialed_denied = false;
+    let deadline = Instant::now() + Duration::from_secs(400);
+    let observed: anyhow::Result<()> = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break Ok(()),
+            Ok(None) => {}
+            Err(e) => break Err(anyhow::Error::new(e).context("poll sandy")),
+        }
+        if Instant::now() > deadline {
+            break Err(anyhow::anyhow!("sandy ran past the 400 s observation budget"));
+        }
+        let sample = find_proxy_child(child.id()).and_then(|proxy| match proxy {
+            Some(pid) => Ok(Some((
+                has_tunnel(pid, allowed_ip, PROBE_PORT)?,
+                has_tunnel(pid, denied_ip, PROBE_PORT)?,
+            ))),
+            None => Ok(None),
+        });
+        match sample {
+            Ok(Some((to_allowed, to_denied))) => {
+                seen_allowed |= to_allowed;
+                dialed_denied |= to_denied;
+            }
+            Ok(None) => {}
+            Err(e) => break Err(e),
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let output = child.wait_with_output().context("wait for sandy")?;
+    observed?;
+    let stderr = std::fs::read(&stderr_path).unwrap_or_default();
+    let (code, env) = parse_envelope(output.status.code().unwrap_or(-1), &output.stdout, &stderr)?;
+
+    assert_guest_ok(code, &env, &format!("CONNECT {denied}:{PROBE_PORT} must get 403"));
+    assert!(
+        seen_allowed,
+        "the observer never saw the proxy's tunnel to the allowed target, so it proves nothing; envelope: {env}"
+    );
+    assert!(
+        !dialed_denied,
+        "the proxy held a connection to the denied target {denied}:{PROBE_PORT}; envelope: {env}"
+    );
+    Ok(())
+}
+
+/// `path` as one single-quoted shell word; an embedded `'` is closed, escaped and reopened.
+fn sh_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
 /// Write an executable `#!/bin/sh` script to `path`.
-#[cfg(target_os = "linux")]
 fn write_script(path: &Path, body: &str) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -646,7 +741,6 @@ fn write_script(path: &Path, body: &str) -> anyhow::Result<()> {
 }
 
 /// The first `name` found on `PATH`.
-#[cfg(target_os = "linux")]
 fn find_on_path(name: &str) -> Option<std::path::PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?)
         .map(|dir| dir.join(name))
@@ -656,9 +750,8 @@ fn find_on_path(name: &str) -> Option<std::path::PathBuf> {
 /// KP7: a proxy that cannot start refuses the run as band 3, and the guest never boots. The proxy binary is
 /// swapped for a stub that records that it ran and exits before it prints `READY`. `SANDY_QEMU_BIN` points at
 /// a wrapper that records a launch and then runs the real qemu, because a failed run's envelope carries no
-/// console to inspect. This is the qemu leg, so it exists only on Linux: a vfkit leg (KP7v) needs the same
-/// wrapper for the vfkit binary and is not written, so its row stays not green.
-#[cfg(target_os = "linux")]
+/// console to inspect. The same test is both legs (KP7q, KP7v): the wrapper replaces `SANDY_QEMU_BIN` on Linux
+/// and `SANDY_VFKIT_BIN` on macOS.
 #[test]
 fn proxy_startup_failure_is_band_3() -> anyhow::Result<()> {
     let target = require_proxy_live()?;
@@ -667,13 +760,18 @@ fn proxy_startup_failure_is_band_3() -> anyhow::Result<()> {
     let proxy_ran = home.path().join("proxy-ran");
     let qemu_ran = home.path().join("qemu-ran");
     let stub = home.path().join("failing-proxy");
-    write_script(&stub, &format!("touch '{}'\nexit 3", proxy_ran.display()))?;
+    write_script(&stub, &format!("touch {}\nexit 3", sh_quote(&proxy_ran)))?;
+    let hypervisor_env = if cfg!(target_os = "linux") {
+        "SANDY_QEMU_BIN"
+    } else {
+        "SANDY_VFKIT_BIN"
+    };
     let qemu_name = &target.hypervisor;
     let real_qemu = find_on_path(qemu_name).with_context(|| format!("refusing: `{qemu_name}` is not on PATH"))?;
-    let wrapper = home.path().join("qemu-wrapper");
+    let wrapper = home.path().join("hypervisor-wrapper");
     write_script(
         &wrapper,
-        &format!("touch '{}'\nexec '{}' \"$@\"", qemu_ran.display(), real_qemu.display()),
+        &format!("touch {}\nexec {} \"$@\"", sh_quote(&qemu_ran), sh_quote(&real_qemu)),
     )?;
     let allowed = allowed_host();
     let allow = vec![format!("{allowed}:{PROBE_PORT}")];
@@ -681,12 +779,12 @@ fn proxy_startup_failure_is_band_3() -> anyhow::Result<()> {
     // Positive control: with the real proxy the wrapper must see a launch, or the "never launched" check
     // below could not fail.
     let control = sandy_proxy_cmd(home.path(), &target, &allow, "exit 0")
-        .env("SANDY_QEMU_BIN", &wrapper)
+        .env(hypervisor_env, &wrapper)
         .output()
         .context("run the control sandy")?;
     anyhow::ensure!(
         qemu_ran.exists(),
-        "SANDY_QEMU_BIN never saw a launch on a healthy run (exit {:?}); stderr: {}",
+        "{hypervisor_env} never saw a launch on a healthy run (exit {:?}); stderr: {}",
         control.status.code(),
         String::from_utf8_lossy(&control.stderr)
     );
@@ -698,7 +796,7 @@ fn proxy_startup_failure_is_band_3() -> anyhow::Result<()> {
 
     let output = sandy_proxy_cmd(home.path(), &target, &allow, "exit 0")
         .env("SANDY_EGRESS_PROXY_BIN", &stub)
-        .env("SANDY_QEMU_BIN", &wrapper)
+        .env(hypervisor_env, &wrapper)
         .output()
         .context("run sandy with a proxy that cannot start")?;
     let (code, env) = parse_envelope(output.status.code().unwrap_or(-1), &output.stdout, &output.stderr)?;
@@ -748,4 +846,10 @@ fn a_setting_the_proxy_would_not_accept_is_refused() {
     ] {
         assert!(normalise_hostname(bad).is_err(), "{bad:?} must be refused");
     }
+}
+
+#[test]
+fn a_path_with_an_apostrophe_is_one_shell_word() {
+    assert_eq!(sh_quote(Path::new("/a/b'c")), r"'/a/b'\''c'");
+    assert_eq!(sh_quote(Path::new("/plain")), "'/plain'");
 }
