@@ -3,8 +3,9 @@
 How agents work on sandy as a peer swarm (`orchestrate:pull`, load it as `pull` if the
 namespaced name is unknown). The owner-approved run charter is
 [issue #462](https://github.com/kauki-labs/sandy/issues/462) (tradeoffs: #463). If this file
-and #462 disagree, #462 wins. Items marked (proposed) are not yet in #462 and need the owner
-to ratify them there.
+and #462 disagree, #462 wins. The `handoff` label, the Authority section, Merge gate, Main is
+red, While a gate waits, and Live tests are (proposed): not confirmed in #462, and the owner
+must ratify them there.
 
 ## Roles and write-sets
 
