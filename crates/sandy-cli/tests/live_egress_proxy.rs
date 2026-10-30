@@ -726,6 +726,11 @@ case "$line4" in *" 403 "*) exit 0 ;; *) exit 10 ;; esac
     Ok(())
 }
 
+/// `path` as one single-quoted shell word; an embedded `'` is closed, escaped and reopened.
+fn sh_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
 /// Write an executable `#!/bin/sh` script to `path`.
 fn write_script(path: &Path, body: &str) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -755,7 +760,7 @@ fn proxy_startup_failure_is_band_3() -> anyhow::Result<()> {
     let proxy_ran = home.path().join("proxy-ran");
     let qemu_ran = home.path().join("qemu-ran");
     let stub = home.path().join("failing-proxy");
-    write_script(&stub, &format!("touch '{}'\nexit 3", proxy_ran.display()))?;
+    write_script(&stub, &format!("touch {}\nexit 3", sh_quote(&proxy_ran)))?;
     let hypervisor_env = if cfg!(target_os = "linux") {
         "SANDY_QEMU_BIN"
     } else {
@@ -766,7 +771,7 @@ fn proxy_startup_failure_is_band_3() -> anyhow::Result<()> {
     let wrapper = home.path().join("hypervisor-wrapper");
     write_script(
         &wrapper,
-        &format!("touch '{}'\nexec '{}' \"$@\"", qemu_ran.display(), real_qemu.display()),
+        &format!("touch {}\nexec {} \"$@\"", sh_quote(&qemu_ran), sh_quote(&real_qemu)),
     )?;
     let allowed = allowed_host();
     let allow = vec![format!("{allowed}:{PROBE_PORT}")];
@@ -841,4 +846,10 @@ fn a_setting_the_proxy_would_not_accept_is_refused() {
     ] {
         assert!(normalise_hostname(bad).is_err(), "{bad:?} must be refused");
     }
+}
+
+#[test]
+fn a_path_with_an_apostrophe_is_one_shell_word() {
+    assert_eq!(sh_quote(Path::new("/a/b'c")), r"'/a/b'\''c'");
+    assert_eq!(sh_quote(Path::new("/plain")), "'/plain'");
 }
