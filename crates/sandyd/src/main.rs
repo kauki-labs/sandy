@@ -14,7 +14,7 @@ use sandyd::{
     host_registry::{ExecutorAllowlist, HostRegistry},
     mesh_config::{parse_mesh_allowlist, parse_mesh_listen_addr},
     spawn_gated_accept,
-    store::JobStore,
+    store::{CancelOutcome, JobStore},
 };
 use tokio::net::UnixListener;
 
@@ -91,6 +91,9 @@ impl AcceptBackoff {
 
 #[tokio::main]
 async fn main() {
+    if let Some(code) = run_operator_command() {
+        std::process::exit(code);
+    }
     let filter = tracing_subscriber::EnvFilter::builder()
         .with_default_directive(tracing::level_filters::LevelFilter::INFO.into())
         .from_env_lossy();
@@ -437,7 +440,7 @@ async fn shutdown_signal() {
 /// flock automatically on a crash, so a process that dies without cleaning up
 /// never blocks the next one from starting.
 fn bind_unix_listener(path: &std::path::Path) -> std::io::Result<(UnixListener, std::fs::File)> {
-    let lock_path = path.with_extension("lock");
+    let lock_path = sandyd::operator::daemon_lock_path(path);
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -742,6 +745,45 @@ async fn run_mesh_accept_loop(
             "mesh listener's shutdown grace period elapsed with connections still in flight; exiting anyway"
         );
     }
+}
+
+/// `sandyd cancel <job-id>` (#545): the operator's offline cancel. `None` when the first argument is not
+/// a subcommand, so the daemon starts as usual; otherwise the exit code.
+fn run_operator_command() -> Option<i32> {
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() != Some("cancel") {
+        return None;
+    }
+    let (Some(job_id), None) = (args.next(), args.next()) else {
+        eprintln!("usage: sandyd cancel <job-id>");
+        return Some(2);
+    };
+    let paths = socket_path().and_then(|socket| db_path().map(|db| (socket, db)));
+    let (socket, db) = match paths {
+        Ok(paths) => paths,
+        Err(e) => {
+            eprintln!("sandyd cancel: could not resolve the socket or store path: {e}");
+            return Some(1);
+        }
+    };
+    Some(match sandyd::operator::cancel_offline(&socket, &db, &job_id) {
+        Ok(CancelOutcome::Cancelled) => {
+            println!("cancelled {job_id}");
+            0
+        }
+        Ok(CancelOutcome::NotFound) => {
+            eprintln!("sandyd cancel: no job {job_id}");
+            1
+        }
+        Ok(CancelOutcome::AlreadyTerminal(status)) => {
+            eprintln!("sandyd cancel: job {job_id} is already {status:?}");
+            1
+        }
+        Err(e) => {
+            eprintln!("sandyd cancel: {e}");
+            1
+        }
+    })
 }
 
 /// The control socket path: `$SANDY_SOCK` if set (a deployer's explicit
