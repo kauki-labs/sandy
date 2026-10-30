@@ -178,13 +178,12 @@ jobs:
         run: nix build -L .#checks.x86_64-linux.guest-wrapper-module-eval .#checks.x86_64-linux.guest-wrapper-configuration-eval
       - name: sandy-executor vm.enable additivity (eval-only)
         run: nix build -L .#checks.x86_64-linux.sandy-executor-vm-opt-eval
-  coverage:
+  test:
     # Plain `cargo nextest` (no cargo-llvm-cov instrumentation): the PR gate
-    # just needs pass/fail. The instrumented coverage build is slower and, on
-    # GitHub's runners, has been failing outright (reproduced locally,
-    # tracked separately) — not worth blocking every PR on. It still runs on
-    # every push to main (coverage.yaml), so the Codecov history keeps
-    # updating; this job just stops re-running it per PR.
+    # just needs pass/fail, and the instrumented build is noticeably slower
+    # for that. coverage.yaml runs the instrumented build once per push to
+    # main instead, so the Codecov history still updates; this job just
+    # stops re-running it per PR.
     # No `needs: checks`: it runs in parallel with Check (a failing Check no
     # longer skips it, which costs runner minutes but saves the Check wall clock).
     name: Test
@@ -224,7 +223,7 @@ jobs:
           purge-primary-key: never
       # End-to-end CLI suite (tests/e2e/basic): drive the built binary at the
       # process boundary (argv, exit bands, `-o json`, error paths). No hypervisor;
-      # `--no-link` leaves the coverage `result` symlink below untouched.
+      # `--no-link` leaves the Test step's `result` symlink below untouched.
       - name: End-to-end CLI
         run: nix build -L --no-link .#checks.x86_64-linux.tests-e2e-cli
       # sandy-cli's `daemon_e2e` against the Nix-built `sandyd`; the coverage run
@@ -311,7 +310,7 @@ jobs:
       - release-diff-scope
       - binary-versions
       - checks
-      - coverage
+      - test
       - package
     runs-on: ubuntu-24.04
     permissions: {}
