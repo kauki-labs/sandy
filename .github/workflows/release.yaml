@@ -61,8 +61,10 @@ jobs:
         # applies: this push/PR does not trigger pr.yaml's pull_request event
         # (same restriction on every GITHUB_TOKEN-authored ref). Before merging,
         # push an empty commit or click "Update branch" on the PR to force a
-        # synchronize event from a human push, so Checks/Coverage/Package/
+        # synchronize event from a human push, so the PR-gate jobs and
         # release-diff-scope run and the required "Merge gate" check posts.
+        # Check/Test don't run here regardless (merge-queue-only); they run
+        # once this PR actually enters the queue.
         run: nix develop -c release-plz release-pr --git-token "${GITHUB_TOKEN}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
