@@ -1581,7 +1581,7 @@ mod tests {
                 &allowlist,
                 peer_ip,
                 test_fp(),
-                "ws01".to_owned(),
+                "remote-host".to_owned(),
                 trusted_host_capabilities(),
             )
             .expect("register a test host");
@@ -1605,7 +1605,7 @@ mod tests {
         let job = registry.get(&job_id).context("the submitted job must be registered")?;
         assert_eq!(
             job.host_id.as_deref(),
-            Some("ws01"),
+            Some("remote-host"),
             "the job must actually be placed on the registered host for this test to mean anything"
         );
 
@@ -1849,7 +1849,7 @@ mod tests {
                 &allowlist,
                 peer_ip,
                 test_fp(),
-                "ws01".to_owned(),
+                "remote-host".to_owned(),
                 trusted_host_capabilities(),
             )
             .expect("register a test host");
@@ -1870,7 +1870,7 @@ mod tests {
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
         };
         anyhow::ensure!(
-            registry.get(&job_id).and_then(|j| j.host_id.clone()).as_deref() == Some("ws01"),
+            registry.get(&job_id).and_then(|j| j.host_id.clone()).as_deref() == Some("remote-host"),
             "the job must be placed on the host for this test to mean anything"
         );
         let refused = cancel_message((&store, &registry, &host_registry), cancel_with(&job_id, None)).await?;
@@ -2306,7 +2306,7 @@ mod tests {
     async fn a_submitted_job_is_dispatched_to_a_registered_remote_host() -> anyhow::Result<()> {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
-        let mut dispatch_rx = register_test_host(&host_registry, "ws01", peer_ip, trusted_host_capabilities());
+        let mut dispatch_rx = register_test_host(&host_registry, "remote-host", peer_ip, trusted_host_capabilities());
 
         let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
         let response = handle(
@@ -2376,7 +2376,7 @@ mod tests {
             &sandy_executor_proto::HostExecutorMessage {
                 op: Some(sandy_executor_proto::host_executor_message::Op::Register(
                     sandy_executor_proto::Register {
-                        host_id: "ws01".to_owned(),
+                        host_id: "remote-host".to_owned(),
                         capabilities: Some(trusted_host_capabilities()),
                     },
                 )),
@@ -2464,7 +2464,7 @@ mod tests {
     async fn a_cancelled_jobs_dispatched_token_cannot_authenticate_afterward() -> anyhow::Result<()> {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
-        let mut dispatch_rx = register_test_host(&host_registry, "ws01", peer_ip, trusted_host_capabilities());
+        let mut dispatch_rx = register_test_host(&host_registry, "remote-host", peer_ip, trusted_host_capabilities());
         let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
 
         let submitted = handle(
@@ -2548,7 +2548,7 @@ mod tests {
         // into the Dispatch the host's channel actually receives.
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
-        let mut dispatch_rx = register_test_host(&host_registry, "ws01", peer_ip, trusted_host_capabilities());
+        let mut dispatch_rx = register_test_host(&host_registry, "remote-host", peer_ip, trusted_host_capabilities());
         let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
 
         let response = handle(
@@ -2580,7 +2580,7 @@ mod tests {
         // handle logs the failure, but the job's own genuine token (never
         // sent anywhere) still sits in its remote_link.
         let (store2, registry2, host_registry2) = (new_store(), new_registry(), new_host_registry());
-        let dispatch_rx2 = register_test_host(&host_registry2, "ws02", peer_ip, trusted_host_capabilities());
+        let dispatch_rx2 = register_test_host(&host_registry2, "remote-host-2", peer_ip, trusted_host_capabilities());
         drop(dispatch_rx2);
         let response2 = handle(
             &store2,
@@ -2656,7 +2656,7 @@ mod tests {
             supported_isolation_classes: vec![IsolationClass::Untrusted.into()],
             shares_submitter_filesystem: false,
         };
-        let mut dispatch_rx = register_test_host(&host_registry, "ws01", peer_ip, untrusted_only);
+        let mut dispatch_rx = register_test_host(&host_registry, "remote-host", peer_ip, untrusted_only);
 
         let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
         let response = handle(
@@ -2709,7 +2709,7 @@ mod tests {
         // this dispatch was placed on already ended."
         drop(register_test_host(
             &host_registry,
-            "ws01",
+            "remote-host",
             peer_ip,
             trusted_host_capabilities(),
         ));
@@ -2767,7 +2767,7 @@ mod tests {
         let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
         drop(register_test_host(
             &host_registry,
-            "ws01",
+            "remote-host",
             peer_ip,
             trusted_host_capabilities(),
         ));
@@ -2924,7 +2924,7 @@ mod tests {
     async fn a_flake_submit_dispatches_as_vm_to_a_vm_capable_host() -> anyhow::Result<()> {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
-        let mut dispatch_rx = register_test_host(&host_registry, "ws01", peer_ip, vm_host_capabilities());
+        let mut dispatch_rx = register_test_host(&host_registry, "remote-host", peer_ip, vm_host_capabilities());
 
         let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
         let response = handle(
@@ -2960,7 +2960,7 @@ mod tests {
     async fn a_flake_submit_with_only_a_process_only_host_is_refused_and_creates_no_job() -> anyhow::Result<()> {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
-        let _dispatch_rx = register_test_host(&host_registry, "ws01", peer_ip, trusted_host_capabilities()); // Process only
+        let _dispatch_rx = register_test_host(&host_registry, "remote-host", peer_ip, trusted_host_capabilities()); // Process only
 
         let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
         let response = handle(
@@ -3005,7 +3005,7 @@ mod tests {
     async fn a_flake_submit_with_no_forward_back_configured_is_refused() -> anyhow::Result<()> {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
-        let _dispatch_rx = register_test_host(&host_registry, "ws01", peer_ip, vm_host_capabilities());
+        let _dispatch_rx = register_test_host(&host_registry, "remote-host", peer_ip, vm_host_capabilities());
 
         let response = handle(
             &store,
@@ -3098,7 +3098,8 @@ mod tests {
     -> anyhow::Result<()> {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
-        let mut dispatch_rx = register_test_host(&host_registry, "ws01", peer_ip, vm_untrusted_host_capabilities());
+        let mut dispatch_rx =
+            register_test_host(&host_registry, "remote-host", peer_ip, vm_untrusted_host_capabilities());
 
         let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
         let response = handle(
@@ -3137,7 +3138,7 @@ mod tests {
     {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
-        let _dispatch_rx = register_test_host(&host_registry, "ws01", peer_ip, trusted_host_capabilities());
+        let _dispatch_rx = register_test_host(&host_registry, "remote-host", peer_ip, trusted_host_capabilities());
 
         let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
         let response = handle(
@@ -3192,7 +3193,8 @@ mod tests {
     -> anyhow::Result<()> {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
-        let mut dispatch_rx = register_test_host(&host_registry, "ws01", peer_ip, vm_untrusted_host_capabilities());
+        let mut dispatch_rx =
+            register_test_host(&host_registry, "remote-host", peer_ip, vm_untrusted_host_capabilities());
 
         let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
         let response = handle(
@@ -3322,7 +3324,7 @@ mod tests {
             &sandy_executor_proto::HostExecutorMessage {
                 op: Some(sandy_executor_proto::host_executor_message::Op::Register(
                     sandy_executor_proto::Register {
-                        host_id: "ws01".to_owned(),
+                        host_id: "remote-host".to_owned(),
                         capabilities: Some(trusted_host_capabilities()),
                     },
                 )),
@@ -3482,7 +3484,7 @@ mod tests {
             &sandy_executor_proto::HostExecutorMessage {
                 op: Some(sandy_executor_proto::host_executor_message::Op::Register(
                     sandy_executor_proto::Register {
-                        host_id: "ws01".to_owned(),
+                        host_id: "remote-host".to_owned(),
                         capabilities: Some(trusted_host_capabilities()),
                     },
                 )),

@@ -740,7 +740,7 @@ mod tests {
     /// The real executor-side entry point, over an actual TCP dial (not an
     /// in-memory duplex pair, unlike the tests above) — the first test
     /// proving the TCP tier and `forward_agent_link` compose end to end, the
-    /// way the real macOS↔WS01 hop will.
+    /// way the real macOS↔Linux-host hop will.
     #[tokio::test]
     async fn dial_and_forward_resolves_job_exited_over_a_real_tcp_dial() -> anyhow::Result<()> {
         let (orchestrator_identity, mesh_tls) = mesh_tls_pair()?;

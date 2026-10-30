@@ -1964,12 +1964,18 @@ session or a peer-uid check.
 
 **Consequence.** A client that did not keep the token (a job submitted from another machine or by another tool)
 can no longer cancel it. That is the intended effect. Two cases make a job uncancellable through this RPC, and
-neither has a fallback: a job that has no stored token (rows created before the token column existed, and the rare
+neither has a fallback through the RPC: a job that has no stored token (rows created before the token column existed, and the rare
 case where the token write fails right after the job is inserted), and an operator who lost the persisted token file
 (for example by cleaning the staging directory). A token that cannot be minted at all (RNG failure) refuses the
 Submit instead, so no new such job is created that way. An empty stored token never matches, not even an empty
-presented one. Cancelling one of those jobs needs the daemon's database or a restart; an operator-only path is
-tracked in #545. `Attach` is unchanged: it still falls back to the session
+presented one. The operator cancels one of those jobs with `sandyd cancel <job-id>` (#545), run as the daemon's uid
+on the daemon's host. It opens the job store directly and holds the store's lock file (`$SANDY_DB` with
+a `.lock` extension, which the daemon also holds), so it refuses while a sandyd uses that store: stop the
+daemon first. It only marks the row `Cancelled`. It does not stop a sandbox still running on a
+host-executor, which drains to its deadline after sandyd stops, or one left behind by a crashed local
+daemon. A store path that does not exist is refused, not created. An unknown id and an already-terminal
+job are reported as such (the operator is trusted, so there is no oracle concern). It is not reachable
+over the control socket or the mesh, and the RPC gate is unchanged. `Attach` is unchanged: it still falls back to the session
 hint and an observer-only cap (#327).
 
 **Alternative set aside.** A peer-uid (`SO_PEERCRED`) check: the socket is 0600, so the same uid always passes

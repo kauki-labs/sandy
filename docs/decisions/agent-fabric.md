@@ -569,7 +569,7 @@ so a blanket scrub drops them along with everything else. #509 escalated
 the underlying question (what the contract actually is) to the owner
 rather than letting either PR guess at a per-name exception list.
 
-Verified facts from #509 (ws01, qemu, 2026-10-29): a VM job sees roughly 30
+Verified facts from #509 (the Linux host, qemu, 2026-10-29): a VM job sees roughly 30
 variables from the guest's root login shell (`NIX_PATH`, `EDITOR`,
 `LOGNAME`, `SSH_ASKPASS`, `XDG_*`, `__ETC_PROFILE_DONE`, …), all sourced
 from the guest image, and no host variable. This is also how secrets and

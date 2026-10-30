@@ -14,6 +14,7 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::Path,
     sync::{Mutex, PoisonError},
+    time::Duration,
 };
 
 use rusqlite::Connection;
@@ -189,6 +190,9 @@ impl JobStore {
     }
 
     fn from_connection(conn: Connection) -> Result<Self, StoreError> {
+        // Wait briefly instead of failing at once when `sandyd cancel` and a starting daemon open the
+        // same file together (#545).
+        conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute(
             "CREATE TABLE IF NOT EXISTS jobs (
                 job_id             TEXT PRIMARY KEY,

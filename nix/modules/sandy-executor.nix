@@ -433,7 +433,7 @@ in
           # inode-file-handle open path; it isn't in `@system-service`, and
           # systemd's default for a filtered-out call is SIGSYS (confirmed:
           # #553, a direct `systemd-run --user` reproduction of this exact
-          # filter on ws01 core-dumped virtiofsd with `status=31/SYS`, the
+          # filter on the Linux host core-dumped virtiofsd with `status=31/SYS`, the
           # stack trace pointing at
           # `passthrough::file_handle::OpenableFileHandle::open`). Allowing
           # it grants no new privilege: `CapabilityBoundingSet = ""` above

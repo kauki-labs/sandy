@@ -440,6 +440,7 @@ impl QemuBackend {
         // connector thread dials it over vsock while the console drives the run.
         let console_command = console_command(
             spec.command,
+            spec.env,
             agent.map(|(program, _)| program),
             egress.zip(proxy.as_ref()).map(|(e, p)| (e.relay_program, p.port())),
         );

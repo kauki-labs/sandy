@@ -473,7 +473,7 @@ async fn the_vm_job_environment_is_the_guest_login_environment() -> anyhow::Resu
     // Echo only the three variables this test actually checks, not a full
     // `env` dump: a dump (~70 lines, some hundreds of bytes long, e.g.
     // `LS_COLORS`) reliably lost bytes somewhere in the TTY relay chain
-    // (tmux PTY -> agent -> vsock -> channel) under live testing on ws01 —
+    // (tmux PTY -> agent -> vsock -> channel) under live testing on the Linux host —
     // confirmed by a run where the secret line and several neighboring
     // lines were simply missing or truncated mid-value from the collected
     // TTY_STDOUT stream, not a parsing bug. A few short, known-length lines
