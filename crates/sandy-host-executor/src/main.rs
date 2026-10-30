@@ -11,6 +11,7 @@
 
 use sandy_conn::TcpKeepalive;
 use sandy_host_executor::{
+    build_rev::{log_startup, resolve_rev, version_line, wants_version},
     capability::{detect_register_capabilities, detect_vm_capability},
     client_config::{ExecutorConfig, parse_executor_config},
     dispatch::handle_dispatch,
@@ -21,12 +22,23 @@ use sandy_host_executor::{
 };
 use sandy_impls_local::SystemdRunContainment;
 
+const BIN: &str = env!("CARGO_PKG_NAME");
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[tokio::main]
 async fn main() {
+    // Set by nix at build time (flake `shortRev`/`dirtyShortRev`); unset under `cargo run`.
+    let rev = resolve_rev(option_env!("SANDY_BUILD_REV"));
+    if wants_version(std::env::args().skip(1)) {
+        println!("{}", version_line(BIN, VERSION, rev));
+        return;
+    }
+
     let filter = tracing_subscriber::EnvFilter::builder()
         .with_default_directive(tracing::level_filters::LevelFilter::INFO.into())
         .from_env_lossy();
     tracing_subscriber::fmt().with_env_filter(filter).init();
+    log_startup(BIN, VERSION, rev);
 
     let config = match resolve_config() {
         Ok(config) => config,

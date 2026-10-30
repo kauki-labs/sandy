@@ -12,6 +12,7 @@
 //! together — register once, then handle dispatches sequentially (decision
 //! 13) until the connection closes or shutdown is requested.
 
+pub mod build_rev;
 pub mod capability;
 pub mod client_config;
 pub mod dispatch;

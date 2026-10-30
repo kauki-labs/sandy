@@ -35,6 +35,11 @@
 
   outputs =
     inputs@{ flake-parts, ... }:
+    let
+      # Compiled into the executor (`--version`, startup log) as
+      # `SANDY_BUILD_REV`; "unknown" outside a git checkout.
+      buildRev = inputs.self.shortRev or inputs.self.dirtyShortRev or "unknown";
+    in
     flake-parts.lib.mkFlake { inherit inputs; } {
       systems = [
         "x86_64-linux"
@@ -58,7 +63,7 @@
       flake = {
         overlays = {
           sandy-agent = import ./nix/overlays/sandy-agent.nix;
-          sandy-host-executor = import ./nix/overlays/sandy-host-executor.nix;
+          sandy-host-executor = import ./nix/overlays/sandy-host-executor.nix { rev = buildRev; };
         };
         nixosModules.sandy-executor = import ./nix/modules/sandy-executor.nix;
         # The reusable guest-composition module (#324): `lib.mkGuest`/
@@ -81,7 +86,7 @@
           overlays = [
             (import inputs.rust-overlay)
             (import ./nix/overlays/sandy-agent.nix)
-            (import ./nix/overlays/sandy-host-executor.nix)
+            (import ./nix/overlays/sandy-host-executor.nix { })
             (import ./nix/overlays/cargo-llvm-cov-skip-tests.nix)
           ];
           pkgs = import inputs.nixpkgs { inherit system overlays; };
@@ -112,6 +117,7 @@
               lib
               craneLib
               covCraneLib
+              buildRev
               ;
             advisoryDb = inputs.advisory-db;
           };
@@ -237,7 +243,13 @@
             # exact overlay a consumer applies, not a separate code path.
             # `sandy-guest-wrapper` (#332) is the packaged `SANDY_GUEST_WRAPPER`
             # source tree the host-executor NixOS module points at.
-            inherit (pkgs) sandy-host-executor sandy-agent sandy-guest-wrapper;
+            inherit (pkgs) sandy-agent sandy-guest-wrapper;
+            # Carries the build revision (`--version`, startup log). The dev
+            # shell keeps the revision-less `pkgs.sandy-host-executor`, so a
+            # new commit does not rebuild it on every shell entry.
+            inherit (pkgs.extend (import ./nix/overlays/sandy-host-executor.nix { rev = buildRev; }))
+              sandy-host-executor
+              ;
           };
 
           # `checks.audit` (below, via crane's `cargoAudit`) always passes
@@ -438,7 +450,7 @@
             let
               executorOverlays = [
                 (import ./nix/overlays/sandy-agent.nix)
-                (import ./nix/overlays/sandy-host-executor.nix)
+                (import ./nix/overlays/sandy-host-executor.nix { })
               ];
               evalWith =
                 extraConfig:

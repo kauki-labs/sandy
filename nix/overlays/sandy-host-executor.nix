@@ -10,8 +10,14 @@
 # `SANDY_AGENT_PATH` injection) rather than defining it — a consumer applies
 # both this overlay and `sandy-agent.nix` to get that default, or supplies
 # its own `agentPackage` if it only wants this one.
+#
+# `rev` is the git revision compiled into the binary (`--version`, startup log);
+# "unknown" when a consumer applies the overlay without one.
+{
+  rev ? "unknown",
+}:
 final: prev: {
-  sandy-host-executor = import ./lib.nix final prev "sandy-host-executor";
+  sandy-host-executor = import ./lib.nix final prev "sandy-host-executor" { inherit rev; };
   # The packaged `$SANDY_GUEST_WRAPPER` source tree (#332, CodeRabbit finding
   # on PR #333) — a sibling package, not folded into `sandy-host-executor`
   # itself: it is data `nix` reads at dispatch time, never compiled into the
