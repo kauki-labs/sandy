@@ -102,6 +102,30 @@ nix develop -c cargo shear --fix              # Prune unused dependencies
 1. Nix with flakes enabled (`experimental-features = nix-command flakes`).
 2. `direnv allow` to load the dev shell and pre-commit hooks (needs an `.envrc`;
    see the README).
+3. In a fresh worktree, `.pre-commit-config.yaml` (gitignored, written by the dev shell)
+   is missing and `git commit` fails. Link it from the main checkout, then run
+   `pre-commit install` (hooks live in the shared `.git/hooks`: commit-msg, pre-commit,
+   pre-push). Never use `--no-verify`.
+4. `cd` into a fresh worktree triggers direnv and a Nix evaluation. Use `git -C <path>` or
+   absolute paths instead.
+5. Reindex the code graph (graph MCP is `codebase-memory-mcp`): `index_repository` with this
+   repo's path.
+
+## Swarm
+
+Multi-agent runs follow [`.agents/charter.md`](.agents/charter.md), which mirrors the run
+charter in issue #462. Roles, claim and lease, escalation, and the merge gate are there.
+Proposed, not yet ratified in #462: owner decisions live in one pinned issue comment; peers never relay them.
+
+## Hosts
+
+- `ws01` is the x86_64 Linux KVM host for live and Linux checks (ssh alias `ws01`; if the
+  alias fails, `ssh teebor@100.64.0.1`, the same machine). Wake it before asking the owner.
+  `strings` is absent; use `grep -a`. Leave no artifacts: remove `/tmp/sandy-<name>` when done.
+  The deploy recipe is in `~/.config/nix/AGENTS.md`.
+- Running `sandyd` plus the executor across a Mac and Linux host: the manual smoke test in
+  [`docs/design/host-executor/spec.md`](docs/design/host-executor/spec.md).
+- The audit log is at `../audit.md` (`products/audit.md`, one level above this repo).
 
 ## Workflow
 
