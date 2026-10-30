@@ -25,6 +25,10 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
+      # Lets codecov-action exchange a short-lived OIDC JWT for a Codecov
+      # upload token (use_oidc below) instead of a stored CODECOV_TOKEN
+      # secret, mirroring hoprnet/hoprnet's own setup.
+      id-token: write
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
@@ -65,11 +69,18 @@ jobs:
           name: coverage-lcov
           path: result/lcov.info
           if-no-files-found: error
-      # Publish to Codecov. A reporting hiccup must not fail the push, so
-      # fail_ci_if_error stays false.
+      # Publish to Codecov via OIDC (use_oidc): the runner's own OIDC JWT is
+      # exchanged for a short-lived upload token, so no CODECOV_TOKEN secret
+      # is needed (and none was ever configured — every prior run silently
+      # failed to upload with "Token required because branch is protected").
+      # This job isn't a required status check (only "Merge gate" in pr.yaml
+      # is), so fail_ci_if_error: true just makes a real failure visible
+      # instead of silently swallowed; it blocks nothing.
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           files: result/lcov.info
-          fail_ci_if_error: false
-          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: unit
+          slug: ${{ github.repository }}
+          use_oidc: true
+          fail_ci_if_error: true
