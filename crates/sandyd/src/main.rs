@@ -137,6 +137,20 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    // `sandyd cancel` locks the store, not the socket, so hold the store's lock too (the same file as
+    // the socket's under the default paths, which is then already held).
+    let _store_lock = if sandyd::operator::daemon_lock_path(&db_path) == socket_path.with_extension("lock") {
+        None
+    } else {
+        match sandyd::operator::lock_store(&db_path) {
+            Ok(lock) => Some(lock),
+            Err(e) => {
+                tracing::error!(error = %e, db = %db_path.display(), "could not lock the job store");
+                std::process::exit(1);
+            }
+        }
+    };
     tracing::info!(socket = %socket_path.display(), db = %db_path.display(), "sandyd listening");
 
     // The interactive attach data plane (#327): a sibling UDS socket, kept
@@ -440,7 +454,7 @@ async fn shutdown_signal() {
 /// flock automatically on a crash, so a process that dies without cleaning up
 /// never blocks the next one from starting.
 fn bind_unix_listener(path: &std::path::Path) -> std::io::Result<(UnixListener, std::fs::File)> {
-    let lock_path = sandyd::operator::daemon_lock_path(path);
+    let lock_path = path.with_extension("lock");
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -758,15 +772,14 @@ fn run_operator_command() -> Option<i32> {
         eprintln!("usage: sandyd cancel <job-id>");
         return Some(2);
     };
-    let paths = socket_path().and_then(|socket| db_path().map(|db| (socket, db)));
-    let (socket, db) = match paths {
-        Ok(paths) => paths,
+    let db = match db_path() {
+        Ok(db) => db,
         Err(e) => {
-            eprintln!("sandyd cancel: could not resolve the socket or store path: {e}");
+            eprintln!("sandyd cancel: could not resolve the store path: {e}");
             return Some(1);
         }
     };
-    Some(match sandyd::operator::cancel_offline(&socket, &db, &job_id) {
+    Some(match sandyd::operator::cancel_offline(&db, &job_id) {
         Ok(CancelOutcome::Cancelled) => {
             println!("cancelled {job_id}");
             0

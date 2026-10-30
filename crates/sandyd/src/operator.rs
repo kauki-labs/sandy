@@ -4,8 +4,8 @@
 //! The operator runs this as the daemon's uid, on the daemon's host, against the job store directly.
 //! It is not reachable over the control socket or the mesh.
 //!
-//! It holds the daemon's lock file for the whole call, so it refuses while a daemon is running. A
-//! stopped daemon has no live job to stop, so marking the row `Cancelled` is all that is left to do.
+//! It holds the store's lock file for the whole call, so it refuses while a daemon uses that store.
+//! It only marks the row `Cancelled`: see [`cancel_offline`] for what it does not stop.
 
 use std::path::{Path, PathBuf};
 
@@ -14,8 +14,8 @@ use crate::store::{CancelOutcome, JobStore, StoreError};
 /// Why [`cancel_offline`] did not cancel.
 #[derive(Debug, thiserror::Error)]
 pub enum OperatorCancelError {
-    /// A sandyd holds the lock for this socket path: stop it first.
-    #[error("a sandyd is running on {0}: stop it before cancelling offline")]
+    /// A sandyd holds the lock for this job store: stop it first.
+    #[error("a sandyd is running on the job store {0}: stop it before cancelling offline")]
     DaemonRunning(PathBuf),
     /// The lock file could not be opened or locked.
     #[error("cannot lock {path}: {source}")]
@@ -26,25 +26,28 @@ pub enum OperatorCancelError {
         #[source]
         source: std::io::Error,
     },
+    /// No job store exists at the path: a wrong `SANDY_DB`, not an empty store.
+    #[error("no job store at {0}: check SANDY_DB")]
+    NoStore(PathBuf),
     /// The job store faulted.
     #[error(transparent)]
     Store(#[from] StoreError),
 }
 
-/// The lock file a sandyd holds while it serves `socket`.
+/// The lock file a sandyd holds while it uses the job store `db`. Keyed on the store, not the
+/// socket, so `sandyd cancel` is refused whichever `SANDY_SOCK` the operator's shell sets.
 #[must_use]
-pub fn daemon_lock_path(socket: &Path) -> PathBuf {
-    socket.with_extension("lock")
+pub fn daemon_lock_path(db: &Path) -> PathBuf {
+    db.with_extension("lock")
 }
 
-/// Mark `job_id` `Cancelled` in the job store at `db`, if no sandyd serves `socket`.
+/// Take the exclusive lock on the store's lock file and keep it for as long as the file lives.
 ///
 /// # Errors
-/// [`OperatorCancelError::DaemonRunning`] while a sandyd holds the lock;
-/// [`OperatorCancelError::Lock`] if the lock file cannot be opened; [`OperatorCancelError::Store`]
-/// if the store cannot be opened or written.
-pub fn cancel_offline(socket: &Path, db: &Path, job_id: &str) -> Result<CancelOutcome, OperatorCancelError> {
-    let lock_path = daemon_lock_path(socket);
+/// [`OperatorCancelError::DaemonRunning`] when another process holds it;
+/// [`OperatorCancelError::Lock`] if the file cannot be opened or locked.
+pub fn lock_store(db: &Path) -> Result<std::fs::File, OperatorCancelError> {
+    let lock_path = daemon_lock_path(db);
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -56,7 +59,7 @@ pub fn cancel_offline(socket: &Path, db: &Path, job_id: &str) -> Result<CancelOu
         })?;
     fs2::FileExt::try_lock_exclusive(&lock_file).map_err(|source| {
         if source.kind() == std::io::ErrorKind::WouldBlock {
-            OperatorCancelError::DaemonRunning(socket.to_owned())
+            OperatorCancelError::DaemonRunning(db.to_owned())
         } else {
             OperatorCancelError::Lock {
                 path: lock_path,
@@ -64,6 +67,24 @@ pub fn cancel_offline(socket: &Path, db: &Path, job_id: &str) -> Result<CancelOu
             }
         }
     })?;
+    Ok(lock_file)
+}
+
+/// Mark `job_id` `Cancelled` in the job store at `db`, if no sandyd uses that store.
+///
+/// This only marks the row. It does not stop a sandbox still running on a host-executor (a
+/// stopped sandyd leaves a remote dispatch to drain until its deadline) or one left behind by a
+/// crashed local daemon.
+///
+/// # Errors
+/// [`OperatorCancelError::DaemonRunning`] while a sandyd holds the store's lock;
+/// [`OperatorCancelError::NoStore`] if `db` does not exist; [`OperatorCancelError::Lock`] if the
+/// lock file cannot be opened; [`OperatorCancelError::Store`] if the store cannot be written.
+pub fn cancel_offline(db: &Path, job_id: &str) -> Result<CancelOutcome, OperatorCancelError> {
+    let _lock = lock_store(db)?;
+    if !db.exists() {
+        return Err(OperatorCancelError::NoStore(db.to_owned()));
+    }
     Ok(JobStore::open(db)?.cancel(job_id)?)
 }
 
@@ -76,15 +97,11 @@ mod tests {
     use super::*;
     use crate::{dispatch::JobRegistry, handler, host_registry::HostRegistry};
 
-    fn paths(dir: &Path) -> (PathBuf, PathBuf) {
-        (dir.join("sandyd.sock"), dir.join("sandyd.db"))
-    }
-
     /// Acceptance (#545): a job with an empty stored token is refused by the RPC and cancelled by the operator.
     #[tokio::test]
     async fn a_job_with_no_stored_token_is_refused_by_the_rpc_and_cancelled_by_the_operator() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
-        let (socket, db) = paths(tmp.path());
+        let db = tmp.path().join("sandyd.db");
         {
             let store = JobStore::open(&db)?;
             store.insert_pending("job-1", b"m", "enc")?;
@@ -108,7 +125,7 @@ mod tests {
         );
         drop(store);
 
-        let outcome = cancel_offline(&socket, &db, "job-1")?;
+        let outcome = cancel_offline(&db, "job-1")?;
         assert_eq!(outcome, CancelOutcome::Cancelled);
         assert_eq!(JobStore::open(&db)?.status("job-1")?, Some(JobStatus::Cancelled));
         Ok(())
@@ -117,31 +134,43 @@ mod tests {
     #[test]
     fn an_unknown_and_an_already_terminal_job_are_reported_as_such() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
-        let (socket, db) = paths(tmp.path());
+        let db = tmp.path().join("sandyd.db");
         JobStore::open(&db)?.insert_pending("job-1", b"m", "enc")?;
 
-        assert_eq!(cancel_offline(&socket, &db, "nope")?, CancelOutcome::NotFound);
-        assert_eq!(cancel_offline(&socket, &db, "job-1")?, CancelOutcome::Cancelled);
+        assert_eq!(cancel_offline(&db, "nope")?, CancelOutcome::NotFound);
+        assert_eq!(cancel_offline(&db, "job-1")?, CancelOutcome::Cancelled);
         assert_eq!(
-            cancel_offline(&socket, &db, "job-1")?,
+            cancel_offline(&db, "job-1")?,
             CancelOutcome::AlreadyTerminal(JobStatus::Cancelled)
         );
         Ok(())
     }
 
     #[test]
+    fn a_missing_store_is_refused_not_created() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = tmp.path().join("sandyd.db");
+
+        let err = cancel_offline(&db, "job-1").expect_err("must refuse");
+
+        assert!(matches!(err, OperatorCancelError::NoStore(_)), "got {err:?}");
+        assert!(!db.exists(), "a wrong path must not leave an empty store behind");
+        Ok(())
+    }
+
+    #[test]
     fn it_refuses_while_a_daemon_holds_the_lock() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
-        let (socket, db) = paths(tmp.path());
+        let db = tmp.path().join("sandyd.db");
         JobStore::open(&db)?.insert_pending("job-1", b"m", "enc")?;
         let held = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
-            .open(daemon_lock_path(&socket))?;
+            .open(daemon_lock_path(&db))?;
         fs2::FileExt::try_lock_exclusive(&held).context("hold the daemon lock")?;
 
-        let err = cancel_offline(&socket, &db, "job-1").expect_err("must refuse");
+        let err = cancel_offline(&db, "job-1").expect_err("must refuse");
 
         assert!(matches!(err, OperatorCancelError::DaemonRunning(_)), "got {err:?}");
         assert_eq!(JobStore::open(&db)?.status("job-1")?, Some(JobStatus::Pending));
