@@ -1,4 +1,7 @@
 name: PR
+# Verification-only comment (#579 follow-up): confirms the merge-queue-only
+# Check/Test gating actually runs by forcing a real merge_group event on a
+# trivial change. Remove once a merge_group run has been observed passing.
 on:
   merge_group:
     types: [checks_requested]
