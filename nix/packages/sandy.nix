@@ -169,7 +169,15 @@ rec {
       # install creates $out, so `--output-path $out/lcov.info` hits a missing
       # dir. Create it first.
       preBuild = "mkdir -p \"$out\"";
-      cargoLlvmCovExtraArgs = "--workspace --lcov --output-path $out/lcov.info -E 'not binary(daemon_e2e) and not binary(daemon_untrusted_e2e)'";
+      # Make a test failure readable in the nix log (#297). Nix shows only the
+      # last 25 lines of a failed build, and nextest's default progress bar
+      # redraws with carriage returns, burying the failing test's output.
+      # Hide the bar, reprint every failure at the end, and keep running past
+      # the first failure so the final list is complete. None of this changes
+      # which tests run or pass.
+      NEXTEST_HIDE_PROGRESS_BAR = "1";
+      NEXTEST_FAILURE_OUTPUT = "immediate-final";
+      cargoLlvmCovExtraArgs = "--workspace --no-fail-fast --lcov --output-path $out/lcov.info -E 'not binary(daemon_e2e) and not binary(daemon_untrusted_e2e)'";
     }
   );
 
