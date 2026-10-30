@@ -1980,7 +1980,7 @@ ordinary `submit` then `cancel` flow.
 
 **Status:** accepted. **Upholds:** INV-1.
 
-**Context.** Decisions 21 and 22 make sandyd read submitter input paths and write submitter output paths. This is
+**Context.** Refs #391 (no per-operation authorization on the control RPC) and #562. Decisions 21 and 22 make sandyd read submitter input paths and write submitter output paths. This is
 safe only when sandyd runs as the submitter. A sandyd that serves other users reads and writes files the submitter
 could not (a confused deputy). The owner decided on #562 (2026-10-30): one sandyd per submitter user, with a
 peer-credential check on accept. A startup self-check of the daemon's own uid was rejected: under one sandyd per
@@ -1990,8 +1990,8 @@ user it compares the daemon's uid with itself.
 
 - Deployment model: one sandyd per submitter user (a templated systemd unit with `User=%i`). A sandyd that serves
   several submitters is a separate future option and needs its own design.
-- Both UDS accept loops (the control socket and the attach socket) read the peer's uid with `SO_PEERCRED` (tokio
-  `peer_cred`; `LOCAL_PEERCRED` on macOS) and refuse a peer whose uid differs from the daemon's effective uid.
+- Both UDS accept loops (the control socket and the attach socket) read the peer's uid with tokio's `peer_cred`
+  (`SO_PEERCRED` on Linux, `getpeereid` on macOS) and refuse a peer whose uid differs from the daemon's effective uid.
 - A refused connection is dropped before any frame is read. The log line names the peer uid and the daemon uid
   (or the OS error when the credentials cannot be read). It carries no token or frame content.
 - If the kernel cannot report the peer's credentials, the connection is refused.

@@ -1456,8 +1456,10 @@ mod tests {
         let reply = tokio::time::timeout(WAIT, read_frame(&mut rd))
             .await
             .context("timed out: the refused connection was left open")?;
+        // A close with the Join frame still unread can surface as ECONNRESET on Linux; both are a refusal.
         assert!(
-            matches!(reply, Ok(None)),
+            matches!(&reply, Ok(None))
+                || matches!(&reply, Err(sandy_fabric_local::link::LinkError::Io(e)) if e.kind() == std::io::ErrorKind::ConnectionReset),
             "a refused peer must see a plain close, got {reply:?}"
         );
 

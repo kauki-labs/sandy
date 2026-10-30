@@ -29,13 +29,13 @@ everything inside the sandbox, and leave nothing useful there to find.
 
 **Actors.**
 
-| Actor                                     | Defended by                                                                |
-| ----------------------------------------- | -------------------------------------------------------------------------- |
-| hostile job in the guest                  | covered in depth below                                                     |
-| sibling job on the same executor host     | `sandyd.md` decision 6 (per-run link token)                                |
-| a mesh peer that isn't the right executor | `sandyd.md` decisions 6, 12                                                |
-| over-reaching submitter                   | `sandyd.md` decision 11 (submitter caps)                                   |
-| another local user on the controller      | staging-base and trust-root checks (#138, `credential-seam.md` decision 4) |
+| Actor                                     | Defended by                                                                                                        |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| hostile job in the guest                  | covered in depth below                                                                                             |
+| sibling job on the same executor host     | `sandyd.md` decision 6 (per-run link token)                                                                        |
+| a mesh peer that isn't the right executor | `sandyd.md` decisions 6, 12                                                                                        |
+| over-reaching submitter                   | `sandyd.md` decision 11 (submitter caps)                                                                           |
+| another local user on the controller      | staging-base and trust-root checks (#138, `credential-seam.md` decision 4); `sandyd.md` decision 24 (UDS peer uid) |
 
 **Isolation class.** The hostile-job model applies to the VM backends,
 `QemuBackend` and `VfkitBackend`: a hostile job runs inside their strong
