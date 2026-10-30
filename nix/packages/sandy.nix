@@ -14,6 +14,8 @@
   # Pinned rustsec/advisory-db checkout (flake input), passed to `cargo audit
   # --db` so the `audit` derivation needs no network fetch of its own.
   advisoryDb,
+  # Git revision compiled into the executor (`--version`, startup log).
+  buildRev,
 }:
 let
   # cleanCargoSource keeps only Rust sources + manifests; the topology tests
@@ -65,6 +67,8 @@ rec {
     // {
       inherit cargoArtifacts;
       doCheck = false;
+      # Only here, not in `commonArgs`: the dep layer must not rebuild per commit.
+      SANDY_BUILD_REV = buildRev;
     }
   );
 

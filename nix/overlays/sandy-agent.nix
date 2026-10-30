@@ -11,5 +11,5 @@
 # and a bare-host deployment never drift from two independent build
 # definitions of the same binary.
 final: prev: {
-  sandy-agent = import ./lib.nix final prev "sandy-agent";
+  sandy-agent = import ./lib.nix final prev "sandy-agent" { };
 }

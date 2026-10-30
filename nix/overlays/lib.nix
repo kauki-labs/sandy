@@ -5,6 +5,9 @@
 # work standalone in a consuming flake's nixpkgs, which has no reason to
 # already carry crane or a pinned rust-overlay channel.
 final: prev: pname:
+{
+  rev ? "unknown",
+}:
 let
   repo = ../..;
   src = prev.lib.fileset.toSource {
@@ -26,5 +29,6 @@ prev.rustPlatform.buildRustPackage {
     pname
   ];
   doCheck = false;
+  env.SANDY_BUILD_REV = rev;
   meta.mainProgram = pname;
 }
