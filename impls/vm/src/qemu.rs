@@ -38,7 +38,7 @@ use sandy::{
 use sandy_api::agent::AGENT_VSOCK_PORT;
 use sandy_api::{
     agent::AgentLaunch,
-    egress::{NETWORK_ENV, NetworkMode},
+    egress::NetworkMode,
     share::{GuestShareTransport, ShareSpec},
 };
 use uuid::Uuid;
@@ -99,8 +99,8 @@ pub struct StagedArgs {
     /// for the guest, so the host can connect to the guest agent and the proxy can
     /// serve it. Overrides [`Topology::vsock_cid`].
     pub agent_cid: Option<u32>,
-    /// The guest network profile (#602). [`NetworkMode::Nic`] needs an egress policy and emits a NIC
-    /// (the tap when bound, else restricted user-mode); the default emits none.
+    /// The guest network profile (#602). [`NetworkMode::Nic`] needs an egress policy and emits a
+    /// restricted user-mode NIC; it is refused with a bound tap. The default emits none.
     pub network: NetworkMode,
 }
 
@@ -152,7 +152,7 @@ pub fn qemu_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> Re
         ));
     }
     if spec.egress.is_some() {
-        if staged.tap.is_some() && !nic {
+        if staged.tap.is_some() {
             return Err(BackendError::Spawn(format!(
                 "the egress proxy and ${TAP_ENV} are exclusive: the proxy guest has no NIC"
             )));
@@ -216,9 +216,10 @@ pub fn qemu_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> Re
         args.push(format!("virtio-net-pci,netdev=net0,mac={GUEST_MAC}"));
     } else if nic {
         // `restrict=on`: the guest cannot reach the host network through the user-mode stack; the allow-list
-        // is enforced by the vsock proxy (#602).
+        // is enforced by the vsock proxy. `ipv6=off`: no IPv6 path around it (#602). No `hostfwd`: the host
+        // cannot reach a guest port yet, so NN1 is pending on qemu.
         args.push("-netdev".to_string());
-        args.push("user,id=net0,restrict=on".to_string());
+        args.push("user,id=net0,restrict=on,ipv6=off".to_string());
         args.push("-device".to_string());
         args.push(format!("virtio-net-pci,netdev=net0,mac={GUEST_MAC}"));
     } else {
@@ -692,6 +693,8 @@ impl VmBackend for QemuBackend {
             ));
         }
         let topology = eval_topology(spec.template)?;
+        // Parsed before any staging: a bad value must not return past the shares' teardown wipe (INV-1).
+        let network = NetworkMode::from_env().map_err(BackendError::Spawn)?;
         let agent_program: Option<PathBuf> = match &self.agent {
             Some(_) => Some(topology.agent_program.clone().ok_or_else(|| {
                 BackendError::Spawn(
@@ -740,8 +743,7 @@ impl VmBackend for QemuBackend {
             // attaches to it. Unset → no NIC, the default isolated boot.
             tap: std::env::var(TAP_ENV).ok().filter(|t| !t.is_empty()),
             agent_cid: None,
-            network: NetworkMode::parse(&std::env::var(NETWORK_ENV).unwrap_or_default())
-                .map_err(BackendError::Spawn)?,
+            network,
         };
 
         // Agent mode claims a CID by launching with it; a CID another VM holds fails
@@ -1175,10 +1177,19 @@ mod tests {
             egress: Some(&allow),
             ..demo_spec(&command)
         };
+        let with_tap = StagedArgs {
+            tap: Some("tap0".to_string()),
+            ..nic.clone()
+        };
+        let refused = qemu_args(&topology, &spec, &with_tap);
+        anyhow::ensure!(
+            matches!(&refused, Err(BackendError::Spawn(m)) if m.contains("exclusive")),
+            "tap + nic + policy: {refused:?}"
+        );
         let args = qemu_args(&topology, &spec, &nic)?;
         anyhow::ensure!(
             args.windows(2)
-                .any(|w| w[0] == "-netdev" && w[1] == "user,id=net0,restrict=on"),
+                .any(|w| w[0] == "-netdev" && w[1] == "user,id=net0,restrict=on,ipv6=off"),
             "nic: {args:?}"
         );
         anyhow::ensure!(args.join(" ").contains("virtio-net-pci"), "nic: {args:?}");

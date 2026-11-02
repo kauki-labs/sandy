@@ -53,6 +53,29 @@ impl NetworkMode {
             other => Err(format!("{NETWORK_ENV}={other:?} is not a network profile (none|nic)")),
         }
     }
+
+    /// Read [`NETWORK_ENV`]: unset is [`NetworkMode::None`]; a value that is not UTF-8 or not a
+    /// profile is an error, never a silent default.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason when the variable holds a non-UTF-8 or unknown value.
+    pub fn from_env() -> Result<Self, String> {
+        Self::from_var(std::env::var(NETWORK_ENV))
+    }
+
+    /// [`Self::from_env`] over an already-read variable, so the non-UTF-8 case is unit-testable.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason when the variable holds a non-UTF-8 or unknown value.
+    pub fn from_var(var: Result<String, std::env::VarError>) -> Result<Self, String> {
+        match var {
+            Ok(value) => Self::parse(&value),
+            Err(std::env::VarError::NotPresent) => Ok(Self::None),
+            Err(std::env::VarError::NotUnicode(_)) => Err(format!("{NETWORK_ENV} is not valid UTF-8")),
+        }
+    }
 }
 
 /// The target OS an egress plan is computed for — injected so the core's
@@ -154,5 +177,14 @@ mod tests {
         assert_eq!(NetworkMode::parse("nic"), Ok(NetworkMode::Nic));
         assert!(NetworkMode::parse("NIC").is_err());
         assert_eq!(NetworkMode::default(), NetworkMode::None);
+    }
+
+    /// #602: an unset variable is `none`, a non-UTF-8 one is refused rather than defaulted.
+    #[test]
+    fn network_mode_from_var_refuses_non_utf8() {
+        use std::{env::VarError, ffi::OsString};
+        assert_eq!(NetworkMode::from_var(Err(VarError::NotPresent)), Ok(NetworkMode::None));
+        assert!(NetworkMode::from_var(Err(VarError::NotUnicode(OsString::new()))).is_err());
+        assert_eq!(NetworkMode::from_var(Ok("nic".to_string())), Ok(NetworkMode::Nic));
     }
 }

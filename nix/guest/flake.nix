@@ -25,7 +25,8 @@
       guestLib = import ../lib/guest.nix { inherit nixpkgs microvm; };
       inherit (guestLib) mkGuest mkTopology;
 
-      # Guest networking for the #29 live egress gate. sandy's qemu backend adds
+      # Guest networking for the #29 live egress gate and the #602 `nic` profile (the vfkit guest carries it
+      # too; there the NIC has no host egress boundary, #603). sandy's qemu backend adds
       # the NIC itself (`-netdev tap,ifname=$SANDY_TAP` + virtio-net with the fixed
       # `02:00:00:00:00:01` MAC) because it assembles its own qemu argv rather than
       # using microvm's declaredRunner — so the guest only needs to bring up and

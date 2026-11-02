@@ -30,7 +30,7 @@ use sandy::{
 };
 use sandy_api::{
     agent::{AGENT_VSOCK_PORT, AgentLaunch},
-    egress::{NETWORK_ENV, NetworkMode},
+    egress::NetworkMode,
     share::{GuestShareTransport, ShareSpec},
 };
 use uuid::Uuid;
@@ -214,8 +214,7 @@ pub fn vfkit_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> R
 
 /// The guest network profile from [`NETWORK_ENV`] (#602); unset means no NIC.
 fn network_from_env() -> Result<NetworkMode, BackendError> {
-    let value = std::env::var(NETWORK_ENV).unwrap_or_default();
-    NetworkMode::parse(&value).map_err(BackendError::Spawn)
+    NetworkMode::from_env().map_err(BackendError::Spawn)
 }
 
 /// The macOS vfkit [`VmBackend`].
