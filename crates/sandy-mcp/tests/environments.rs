@@ -1,5 +1,6 @@
 //! Environment tools over a stateful fake broker: the contract the tools must
-//! pass through unchanged (O1-O9; AT-1 to AT-4, AT-6, AT-9, AT-14, AT-16, AT-17).
+//! pass through unchanged. The fake broker holds the O1-O9 rules; these tests prove the
+//! tools forward arguments and typed results faithfully, not that a real broker obeys them.
 
 use std::{
     collections::HashMap,
@@ -119,7 +120,7 @@ fn spawn_args(request_id: &str) -> Value {
 }
 
 #[tokio::test]
-async fn spawn_is_idempotent_by_request_id() -> Result<()> {
+async fn spawn_forwards_the_request_id_unchanged() -> Result<()> {
     let (url, state) = broker()?;
     let server = Server::new(Api::new(&url, "c"));
     let (_, a) = call(&server, "spawn_environment", spawn_args("r1")).await?;
@@ -143,7 +144,7 @@ async fn the_same_request_id_with_another_payload_is_a_typed_conflict() -> Resul
 }
 
 #[tokio::test]
-async fn connection_appears_only_when_ready_and_failure_names_the_step() -> Result<()> {
+async fn connection_and_failure_pass_through_unchanged() -> Result<()> {
     let (url, state) = broker()?;
     let server = Server::new(Api::new(&url, "c"));
     let (_, s) = call(&server, "spawn_environment", spawn_args("r1")).await?;

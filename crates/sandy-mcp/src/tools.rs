@@ -42,7 +42,7 @@ fn spawn_props() -> Value {
         "request_id":{"type":"string","description":"Idempotency key: a retry never creates a second environment."},
         "profile":{"type":"string","description":"Credential identity profile name. Never a secret."},
         "size":{"type":"string"},
-        "lifetime":{"type":"object","properties":{
+        "lifetime":{"type":"object","required":["kind"],"additionalProperties":false,"properties":{
             "kind":{"type":"string","enum":["ephemeral","persistent"]},
             "ttl_secs":{"type":"integer","minimum":1}}},
         "task_ref":{"type":"string"},
@@ -63,10 +63,15 @@ fn submit_props() -> Value {
         "manifest":{"type":"string","description":"Base64 job manifest."},
         "manifest_encoding":{"type":"string"},
         "required_isolation_class":{"type":"string","enum":["trusted","untrusted"]},
-        "inputs":{"type":"array","items":{"type":"object"}},
-        "outputs":{"type":"array","items":{"type":"object"}},
+        "inputs":{"type":"array","items":{"type":"object","required":["host","name"],
+            "additionalProperties":false,"properties":{
+            "host":{"type":"string"},"name":{"type":"string"},"guest_path":{"type":"string"}}}},
+        "outputs":{"type":"array","items":{"type":"object","required":["dest"],
+            "additionalProperties":false,"properties":{
+            "name":{"type":"string"},"dest":{"type":"string"}}}},
         "secrets":{"type":"array","description":"File references only: name and host_path.",
-                   "items":{"type":"object"}},
+            "items":{"type":"object","required":["name","host_path"],"additionalProperties":false,
+            "properties":{"name":{"type":"string"},"host_path":{"type":"string"}}}},
     })
 }
 

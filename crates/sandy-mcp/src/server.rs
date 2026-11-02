@@ -1,12 +1,13 @@
 //! JSON-RPC 2.0 over newline-delimited stdio: the MCP subset a tool server needs.
 
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 use crate::{
     api::{Api, ApiError},
     guard::find_secret,
     tools::{TOOLS, Tool},
+    validate::validate,
 };
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -24,7 +25,14 @@ impl Server {
 
     /// Handles one JSON-RPC message. `None` for a notification.
     pub async fn handle(&self, msg: Value) -> Option<Value> {
-        let id = msg.get("id").cloned()?;
+        let Some(obj) = msg.as_object() else {
+            return Some(rpc_error(Value::Null, -32600, "invalid request"));
+        };
+        let id = match obj.get("id") {
+            None => return None,
+            Some(Value::Null) => return Some(rpc_error(Value::Null, -32600, "invalid request: null id")),
+            Some(id) => id.clone(),
+        };
         let method = msg["method"].as_str().unwrap_or_default();
         Some(match method {
             "initialize" => reply(
@@ -54,55 +62,68 @@ impl Server {
 
     /// One tool call: validate, make exactly one API request, screen the result.
     async fn run(&self, tool: &Tool, args: Value) -> Result<Value, ApiError> {
-        let Value::Object(mut args) = args else {
-            return Err(ApiError::new("invalid_request", "arguments must be an object"));
-        };
-        let props = (tool.properties)();
-        if let Some(extra) = args.keys().find(|k| props.get(k.as_str()).is_none()) {
-            return Err(ApiError::new("invalid_request", format!("unknown argument `{extra}`")));
-        }
-        if let Some(missing) = tool.required.iter().find(|r| !args.contains_key(**r)) {
-            return Err(ApiError::new(
-                "invalid_request",
-                format!("missing argument `{missing}`"),
-            ));
-        }
-        if let Some(at) = find_secret(&Value::Object(args.clone())) {
+        validate(&tool.input_schema(), &args, "$").map_err(|m| ApiError::new("invalid_request", m))?;
+        if let Some(at) = find_secret(&args) {
             return Err(ApiError::new(
                 "invalid_request",
                 format!("a secret is not allowed in a tool argument (at {at})"),
             ));
         }
+        let Value::Object(mut args) = args else {
+            return Err(ApiError::new("invalid_request", "arguments must be an object"));
+        };
         let mut path = tool.path.to_owned();
         for name in tool.path_args {
             let value = args.remove(*name).and_then(|v| v.as_str().map(str::to_owned));
-            let value = value.filter(|v| !v.is_empty() && !v.contains(['/', '?', '#']));
+            let value = value.filter(|v| valid_segment(v));
             let value = value.ok_or_else(|| ApiError::new("invalid_request", format!("invalid `{name}`")))?;
             path = path.replace(&format!("{{{name}}}"), &value);
         }
         let mut query = Vec::new();
         for name in tool.query {
-            if let Some(v) = args.remove(*name) {
-                let v = v
-                    .as_str()
-                    .filter(|v| v.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)));
-                let v = v.ok_or_else(|| ApiError::new("invalid_request", format!("invalid `{name}`")))?;
-                query.push(format!("{name}={v}"));
+            if let Some(v) = args.remove(*name).and_then(|v| v.as_str().map(str::to_owned)) {
+                query.push(format!("{name}={}", percent_encode(&v)));
             }
         }
         if !query.is_empty() {
             path = format!("{path}?{}", query.join("&"));
         }
         let body = (!matches!(tool.method, "GET" | "DELETE") && !args.is_empty()).then_some(Value::Object(args));
-        let out = self.api.request(tool.method, &path, body.as_ref()).await?;
-        if find_secret(&out).is_some() {
-            return Err(ApiError::new(
-                "unavailable",
-                "the API result was withheld: it held a secret",
-            ));
+        match self.api.request(tool.method, &path, body.as_ref()).await {
+            Ok(out) if find_secret(&out).is_some() => Err(ApiError::new(
+                "withheld",
+                "the operation ran; its result was withheld because it held a secret. Do not retry with a new \
+                 request_id.",
+            )),
+            Err(e) if find_secret(&e.to_json()).is_some() => Err(ApiError::new(
+                "withheld",
+                "the broker answered with an error that held a secret; the error was withheld.",
+            )),
+            other => other,
         }
-        Ok(out)
     }
+}
+
+/// A path segment: letters, digits, `_`, `-` and `.`, and not `.` or `..`.
+fn valid_segment(v: &str) -> bool {
+    !v.is_empty()
+        && v.len() <= 128
+        && !v.bytes().all(|b| b == b'.')
+        && v.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
+/// Percent-encodes every byte outside the RFC 3986 unreserved set.
+fn percent_encode(v: &str) -> String {
+    v.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
 }
 
 fn describe(t: &Tool) -> Value {
@@ -121,17 +142,35 @@ fn rpc_error(id: Value, code: i32, message: &str) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
 }
 
+/// Largest stdin message accepted.
+const MAX_LINE: u64 = 1024 * 1024;
+
 /// Serves `server` on stdin/stdout until stdin closes.
 pub async fn serve_stdio(server: &Server) -> std::io::Result<()> {
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut input = BufReader::new(tokio::io::stdin());
     let mut out = tokio::io::stdout();
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        let n = (&mut input).take(MAX_LINE + 1).read_until(b'\n', &mut buf).await?;
+        if n == 0 {
+            return Ok(());
         }
-        let resp = match serde_json::from_str::<Value>(&line) {
-            Ok(msg) => server.handle(msg).await,
-            Err(_) => Some(rpc_error(Value::Null, -32700, "parse error")),
+        let too_long = buf.last() != Some(&b'\n') && buf.len() as u64 > MAX_LINE;
+        let resp = if too_long {
+            // Discard the rest of the oversized line, then refuse it.
+            let mut sink = Vec::new();
+            while input.read_until(b'\n', &mut sink).await? > 0 && sink.last() != Some(&b'\n') {
+                sink.clear();
+            }
+            Some(rpc_error(Value::Null, -32600, "message too large"))
+        } else if buf.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        } else {
+            match serde_json::from_slice::<Value>(&buf) {
+                Ok(msg) => server.handle(msg).await,
+                Err(_) => Some(rpc_error(Value::Null, -32700, "parse error")),
+            }
         };
         if let Some(resp) = resp {
             out.write_all(resp.to_string().as_bytes()).await?;
@@ -139,5 +178,4 @@ pub async fn serve_stdio(server: &Server) -> std::io::Result<()> {
             out.flush().await?;
         }
     }
-    Ok(())
 }

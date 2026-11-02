@@ -257,6 +257,7 @@ components:
             - unsupported_for_lifetime
             - unsupported
             - unavailable
+            - withheld
         message: {type: string}
     IsolationClass:
       type: string

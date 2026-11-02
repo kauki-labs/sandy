@@ -8,6 +8,7 @@ mod api;
 mod guard;
 mod server;
 mod tools;
+mod validate;
 
-pub use api::Api;
+pub use api::{Api, check_base_url};
 pub use server::{Server, serve_stdio};
