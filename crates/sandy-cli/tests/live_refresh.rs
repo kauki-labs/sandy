@@ -140,6 +140,7 @@ fn a_refreshed_token_reaches_the_running_guest() -> anyhow::Result<()> {
     let plan = JobPlan {
         digests: false,
         egress_proxy: false,
+        network: sandy::NetworkMode::None,
         template: format!("{}#{}", guest_flake().display(), target.topology_attr),
         command: vec!["sh".to_string(), "-c".to_string(), probe.to_string()],
         inputs: vec![],

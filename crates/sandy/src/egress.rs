@@ -14,7 +14,10 @@
 //! boundary an in-guest root flush cannot bypass — is tier-3 and is asserted by
 //! `cargo test --test live_egress` (#29); it is not exercised here.
 
-pub use sandy_api::egress::{AllowList, EgressApplier, EgressError, EgressOs, EgressOutcome, EgressPlan, EgressRule};
+pub use sandy_api::egress::{
+    AllowList, EgressApplier, EgressError, EgressOs, EgressOutcome, EgressPlan, EgressRule, NetworkMode,
+    is_valid_tap_name,
+};
 
 use crate::{backend::PlanError, error::CoreError};
 
@@ -103,7 +106,7 @@ pub fn to_nftables(allow: &AllowList) -> String {
 /// with a warning — nothing is filtered, but the host is never touched.
 #[must_use]
 pub fn to_nftables_forward(allow: &AllowList, iface: &str) -> String {
-    let open = format!("table inet {EGRESS_TABLE} {{\n");
+    let open = format!("table inet {} {{\n", forward_table_name(iface));
     if !is_emittable_host(iface) {
         tracing::warn!(
             ?iface,
@@ -182,6 +185,27 @@ pub fn macos_egress_statement() -> &'static str {
 /// The name of the nftables table [`to_nftables`] emits and [`NftablesApplier`]
 /// tears down on revert; the two must agree.
 const EGRESS_TABLE: &str = "sandy_egress";
+
+/// The table a guest-scoped forward ruleset for `iface` loads into (#602). One table per tap, so a run that reverts
+/// its own boundary never deletes the table of another concurrent `nic` run. The suffix encoding is injective, so two
+/// different taps never share a table: `_` becomes `__`, `-` becomes `_h` and `.` becomes `_d`. An `iface` that is
+/// not a bare token falls back to [`EGRESS_TABLE`]; the plan-time tap check refuses such a name before any run
+/// reaches here.
+fn forward_table_name(iface: &str) -> String {
+    if !is_emittable_host(iface) {
+        return EGRESS_TABLE.to_string();
+    }
+    let mut suffix = String::with_capacity(iface.len());
+    for c in iface.chars() {
+        match c {
+            '_' => suffix.push_str("__"),
+            '-' => suffix.push_str("_h"),
+            '.' => suffix.push_str("_d"),
+            other => suffix.push(other),
+        }
+    }
+    format!("{EGRESS_TABLE}_{suffix}")
+}
 
 /// Resolve an [`AllowList`] and target [`EgressOs`] into an [`EgressPlan`].
 ///
@@ -288,6 +312,41 @@ pub fn validate_proxy_egress(os: EgressOs, tap: Option<&str>) -> Result<(), Plan
     }
 }
 
+/// Validate the guest network profile against the tap and the proxy at plan time (#602).
+///
+/// On Linux a `nic` guest is filtered only by the guest-scoped nftables forward ruleset, which needs a bound tap, so
+/// `nic` without a tap would boot a NIC with no boundary, and a tap without `nic` would be a silent NIC. The proxy
+/// guest has no NIC, so `nic` and the proxy never share a run. On macOS `nic` is the trusted-only NAT NIC (#603) and
+/// there is no tap. Refusing here makes each a band-2 invalid plan: no journal record, no boot.
+///
+/// # Errors
+///
+/// Returns [`PlanError::Invalid`] naming the conflicting settings.
+pub fn validate_network_mode(os: EgressOs, mode: NetworkMode, tap: Option<&str>, proxy: bool) -> Result<(), PlanError> {
+    let nic = mode == NetworkMode::Nic;
+    if let Some(tap) = tap.filter(|t| !is_valid_tap_name(t)) {
+        return Err(PlanError::Invalid(format!(
+            "SANDY_TAP={tap:?} is not a valid interface name (1 to 15 of A-Z a-z 0-9 _ - .); refusing a NIC whose \
+             boundary cannot be scoped to it"
+        )));
+    }
+    match (os, nic, tap, proxy) {
+        (_, true, _, true) => Err(PlanError::Invalid(
+            "SANDY_NETWORK=nic and SANDY_EGRESS=proxy are exclusive: the proxy guest has no NIC".to_string(),
+        )),
+        (EgressOs::Linux, true, None, _) => Err(PlanError::Invalid(
+            "SANDY_NETWORK=nic needs a bound tap (SANDY_TAP) with the host egress boundary; a NIC with no boundary is \
+             refused"
+                .to_string(),
+        )),
+        (EgressOs::Linux, false, Some(tap), _) => Err(PlanError::Invalid(format!(
+            "SANDY_TAP={tap} binds a guest NIC, which needs SANDY_NETWORK=nic; unset SANDY_TAP, or set \
+             SANDY_NETWORK=nic"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Whether `host` is a bare IPv4 address or `IPv4/prefix` CIDR (0-32).
 fn is_ipv4_or_cidr(host: &str) -> bool {
     match host.split_once('/') {
@@ -306,14 +365,18 @@ fn is_ipv4_or_cidr(host: &str) -> bool {
 }
 
 /// Host-tier applier that loads the ruleset into the Linux kernel via `nft -f -`
-/// and reverts by deleting the [`EGRESS_TABLE`].
+/// and reverts by deleting the table that ruleset created (read from its first line, so a
+/// per-tap table is the one removed, never another run's).
 ///
 /// This is intentionally thin and is **not** unit-tested: the behaviour that
 /// matters — that the loaded boundary holds against an in-guest root flush — is a
 /// live, root-only, host-tier assertion that binds into `cargo test --test
 /// live_egress` (#29), not something a unit test can observe.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NftablesApplier;
+#[derive(Debug, Default)]
+pub struct NftablesApplier {
+    /// The table the last applied ruleset created, for [`EgressApplier::revert`] to delete.
+    applied_table: std::sync::Mutex<Option<String>>,
+}
 
 impl EgressApplier for NftablesApplier {
     fn apply(&self, ruleset: &str) -> Result<(), EgressError> {
@@ -322,6 +385,13 @@ impl EgressApplier for NftablesApplier {
             process::{Command, Stdio},
         };
 
+        let table = ruleset
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("table inet "))
+            .and_then(|rest| rest.split_whitespace().next())
+            .ok_or_else(|| EgressError::Apply("the ruleset does not start with `table inet <name> {`".to_string()))?
+            .to_string();
         let mut child = Command::new("nft").args(["-f", "-"]).stdin(Stdio::piped()).spawn()?;
         child
             .stdin
@@ -332,16 +402,26 @@ impl EgressApplier for NftablesApplier {
         if !status.success() {
             return Err(EgressError::Apply(format!("`nft -f -` exited with {status}")));
         }
+        *self
+            .applied_table
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(table);
         Ok(())
     }
 
     fn revert(&self) -> Result<(), EgressError> {
+        let table = self
+            .applied_table
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap_or_else(|| EGRESS_TABLE.to_string());
         let status = std::process::Command::new("nft")
-            .args(["delete", "table", "inet", EGRESS_TABLE])
+            .args(["delete", "table", "inet", &table])
             .status()?;
         if !status.success() {
             return Err(EgressError::Apply(format!(
-                "`nft delete table inet {EGRESS_TABLE}` exited with {status}"
+                "`nft delete table inet {table}` exited with {status}"
             )));
         }
         Ok(())
@@ -377,8 +457,9 @@ mod tests {
     use sandy_test_support::FakeApplier;
 
     use super::{
-        AllowList, EgressOs, EgressOutcome, EgressPlan, EgressRule, enforce, macos_egress_statement, plan_egress,
-        plan_egress_scoped, to_nftables, to_nftables_forward, validate_egress_hosts, validate_proxy_egress,
+        AllowList, EgressOs, EgressOutcome, EgressPlan, EgressRule, NetworkMode, enforce, forward_table_name,
+        is_valid_tap_name, macos_egress_statement, plan_egress, plan_egress_scoped, to_nftables, to_nftables_forward,
+        validate_egress_hosts, validate_network_mode, validate_proxy_egress,
     };
     use crate::backend::PlanError;
 
@@ -839,6 +920,107 @@ mod tests {
         };
         assert!(msg.contains("SANDY_EGRESS=proxy"), "{msg}");
         assert!(msg.contains("SANDY_TAP=sandytap0"), "{msg}");
+    }
+
+    /// #602: the profile, tap and proxy must agree, or the plan is invalid before any boot.
+    #[test]
+    fn network_mode_must_agree_with_the_tap_and_the_proxy() {
+        use NetworkMode::{Nic, None as NoNic};
+        let linux = EgressOs::Linux;
+        assert!(validate_network_mode(linux, NoNic, None, false).is_ok());
+        assert!(validate_network_mode(linux, NoNic, None, true).is_ok());
+        assert!(validate_network_mode(linux, Nic, Some("sandytap0"), false).is_ok());
+        for (mode, tap, proxy, needle) in [
+            (Nic, None, false, "needs a bound tap"),
+            (NoNic, Some("sandytap0"), false, "needs SANDY_NETWORK=nic"),
+            (Nic, Some("sandytap0"), true, "exclusive"),
+            (Nic, None, true, "exclusive"),
+        ] {
+            let Err(PlanError::Invalid(msg)) = validate_network_mode(linux, mode, tap, proxy) else {
+                panic!("{mode:?} tap={tap:?} proxy={proxy} must be refused");
+            };
+            assert!(msg.contains(needle), "{msg}");
+        }
+        // macOS has no tap: `nic` is the trusted-only NAT NIC, but still never beside the proxy.
+        assert!(validate_network_mode(EgressOs::MacOs, Nic, None, false).is_ok());
+        assert!(validate_network_mode(EgressOs::MacOs, Nic, None, true).is_err());
+    }
+
+    /// #602: a tap name that cannot be scoped is refused at plan time, so a `,` cannot split the `-netdev` argument
+    /// or open the ruleset.
+    #[test]
+    fn a_tap_name_that_is_not_a_bare_interface_is_refused() {
+        for bad in [
+            "sandytap0,vhost=on",
+            "tap 0",
+            "",
+            "a/b",
+            "waytoolonginterfacename",
+            "..",
+        ] {
+            assert!(!is_valid_tap_name(bad), "{bad:?}");
+            let refused = validate_network_mode(EgressOs::Linux, NetworkMode::Nic, Some(bad), false);
+            assert!(matches!(refused, Err(PlanError::Invalid(_))), "{bad:?}: {refused:?}");
+        }
+        for good in ["sandytap0", "tap-1", "t.0", "SANDY_TAP_1"] {
+            assert!(is_valid_tap_name(good), "{good:?}");
+        }
+    }
+
+    /// #602: each tap gets its own table, so one run's revert cannot delete another run's boundary.
+    #[test]
+    fn each_tap_gets_its_own_forward_table() {
+        let allow = AllowList::default();
+        let first = to_nftables_forward(&allow, "sandytap0");
+        let second = to_nftables_forward(&allow, "sandytap1");
+        assert!(first.starts_with("table inet sandy_egress_sandytap0 {"), "{first}");
+        assert!(second.starts_with("table inet sandy_egress_sandytap1 {"), "{second}");
+        assert!(to_nftables_forward(&allow, "tap-1.x").starts_with("table inet sandy_egress_tap_h1_dx {"));
+        // Distinct taps never share a table, even when they differ only in `_`, `-` or `.`.
+        let tables: std::collections::HashSet<String> = ["tap-1", "tap_1", "tap.1", "tap1", "tap__1", "tap_h1"]
+            .iter()
+            .map(|tap| forward_table_name(tap))
+            .collect();
+        assert_eq!(tables.len(), 6, "{tables:?}");
+    }
+
+    /// #602 (NN5): the guest-scoped ruleset accepts only IPv4 TCP to allow-listed addresses and drops the rest of the
+    /// guest's traffic, so IPv6 and UDP get no accept rule.
+    #[test]
+    fn the_forward_ruleset_accepts_only_allow_listed_ipv4_tcp() {
+        let allow = AllowList {
+            rules: vec![EgressRule {
+                host: "10.1.2.3".to_string(),
+                port: 443,
+            }],
+        };
+        let ruleset = to_nftables_forward(&allow, "sandytap0");
+        let (forward, input) = ruleset
+            .split_once("chain input")
+            .expect("a forward chain and an input chain");
+        for line in forward
+            .lines()
+            .filter(|l| l.contains("accept") && l.contains("iifname"))
+        {
+            assert!(
+                line.contains("ct state established,related")
+                    || (line.contains("ip daddr") && line.contains("tcp dport")),
+                "unexpected forward accept: {line}"
+            );
+        }
+        assert!(!forward.contains("udp") && !forward.contains("ip6"), "{forward}");
+        assert!(forward.contains("iifname \"sandytap0\" drop"), "{forward}");
+        // Host-destined traffic (#376): only the guest's DHCP request is accepted, then everything else drops.
+        let guest_accepts: Vec<&str> = input
+            .lines()
+            .filter(|l| l.contains("iifname") && l.contains("accept"))
+            .collect();
+        assert_eq!(
+            guest_accepts,
+            ["\t\tiifname \"sandytap0\" udp dport 67 accept"],
+            "{input}"
+        );
+        assert!(input.contains("iifname \"sandytap0\" drop"), "{input}");
     }
 
     #[test]

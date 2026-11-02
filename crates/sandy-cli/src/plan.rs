@@ -87,6 +87,10 @@ pub struct JobPlan {
     /// the nftables boundary: the guest has no NIC and `allow` travels to the backend
     /// in [`RunSpec::egress`]. Not a CLI option: `dispatch_run` reads the environment.
     pub egress_proxy: bool,
+    /// The guest network profile (`SANDY_NETWORK`, #602). `nic` boots the guest with a NIC behind the Linux nftables
+    /// boundary (a bound tap) or, on macOS, the trusted-only NAT NIC. Not a CLI option: `dispatch_run` reads the
+    /// environment, as it does for `egress_proxy`.
+    pub network: sandy::NetworkMode,
     /// Record sha256 digests of inputs and collected outputs in the receipt (#373).
     /// Set by `sandy run --digests`; never from the environment.
     pub digests: bool,
@@ -191,6 +195,7 @@ pub fn parse_run(args: RunArgs) -> Result<JobPlan, PlanError> {
         env,
         allow: AllowList { rules },
         egress_proxy: false,
+        network: sandy::NetworkMode::None,
         digests: args.digests,
         cpu: args.cpu,
         mem: args.mem,

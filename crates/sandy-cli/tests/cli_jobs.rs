@@ -71,6 +71,7 @@ fn booting_plan() -> JobPlan {
         env: vec![],
         allow: AllowList::default(),
         egress_proxy: false,
+        network: sandy::NetworkMode::None,
         cpu: None,
         mem: None,
         timeout_secs: 60,
@@ -81,6 +82,14 @@ fn booting_plan() -> JobPlan {
         },
         secret_dir: None,
         control: sandy::RunControl::with_timeout_secs(60),
+    }
+}
+
+/// `plan` as a `network = nic` run: a bound tap needs the profile (#602), or the plan is invalid.
+fn on_tap(plan: JobPlan) -> JobPlan {
+    JobPlan {
+        network: sandy::NetworkMode::Nic,
+        ..plan
     }
 }
 
@@ -100,6 +109,7 @@ fn leaking_plan() -> JobPlan {
         env: vec![("TOK".to_string(), "leaked".to_string())],
         allow: AllowList::default(),
         egress_proxy: false,
+        network: sandy::NetworkMode::None,
         cpu: None,
         mem: None,
         timeout_secs: 60,
@@ -722,7 +732,7 @@ fn run_hostname_allow_on_linux_is_invalid_plan_writes_no_record_and_never_boots(
     let report = run_job(
         &backend,
         &journal,
-        &allowing_plan_by_hostname(),
+        &on_tap(allowing_plan_by_hostname()),
         &FakeApplier::new(),
         EgressOs::Linux,
         Some("sandytap0"),
@@ -775,6 +785,7 @@ fn proxy_plan() -> JobPlan {
             ],
         },
         egress_proxy: true,
+        network: sandy::NetworkMode::None,
         ..booting_plan()
     }
 }
@@ -819,6 +830,40 @@ fn run_proxy_mode_with_a_bound_tap_on_linux_is_invalid_plan_writes_no_record_and
         applier.applied_rulesets().is_empty(),
         "a refused plan applies no ruleset"
     );
+    Ok(())
+}
+
+/// #602: a profile that disagrees with the tap or the proxy is an invalid plan (band 2): no journal record, no boot,
+/// no ruleset. Deleting the `validate_network_mode` call from the supervisor must fail this test.
+#[test]
+fn run_a_network_profile_that_disagrees_with_the_tap_or_proxy_is_refused_before_anything_runs() -> anyhow::Result<()> {
+    let nic = |plan: JobPlan| JobPlan {
+        network: sandy::NetworkMode::Nic,
+        ..plan
+    };
+    let cases: Vec<(&str, JobPlan, Option<&str>)> = vec![
+        ("nic without a tap", nic(allowing_plan()), None),
+        ("a tap without nic", allowing_plan(), Some("sandytap0")),
+        ("nic with the proxy", nic(proxy_plan()), None),
+        (
+            "nic with a malformed tap",
+            nic(allowing_plan()),
+            Some("sandytap0,vhost=on"),
+        ),
+    ];
+    for (name, plan, tap) in cases {
+        let (_tmp, journal) = fresh_journal()?;
+        // A success is scripted on purpose: a boot would make the band 0.
+        let backend = FakeBackend::new().with_outcome(ok_outcome(0));
+        let applier = FakeApplier::new();
+        let report = run_job(&backend, &journal, &plan, &applier, EgressOs::Linux, tap, &[])
+            .with_context(|| format!("run_job ({name})"))?;
+        assert_eq!(report.process_exit.code(), 2, "{name}: band 2");
+        assert!(!report.envelope.retryable, "{name}: band 2 is never retryable");
+        assert!(journal.list().context(name)?.is_empty(), "{name}: no job record");
+        assert!(backend.run_egress().is_empty(), "{name}: the backend never runs");
+        assert!(applier.applied_rulesets().is_empty(), "{name}: no ruleset");
+    }
     Ok(())
 }
 
@@ -871,7 +916,7 @@ fn run_without_proxy_mode_hands_the_backend_no_policy() -> anyhow::Result<()> {
     run_job(
         &backend,
         &journal,
-        &allowing_plan(),
+        &on_tap(allowing_plan()),
         &FakeApplier::new(),
         EgressOs::Linux,
         Some("sandytap0"),
@@ -1054,7 +1099,7 @@ fn run_with_credential_hostname_allow_on_linux_is_invalid_plan_never_mints() -> 
     let report = run_job_with_credential(
         &backend,
         &journal,
-        allowing_plan_by_hostname(),
+        on_tap(allowing_plan_by_hostname()),
         &FakeApplier::new(),
         EgressOs::Linux,
         Some("sandytap0"),
@@ -1095,7 +1140,7 @@ fn run_on_linux_applies_the_allow_list_ruleset_and_reverts_it() -> anyhow::Resul
     let (_tmp, journal) = fresh_journal()?;
     let backend = FakeBackend::new().with_outcome(ok_outcome(0));
     let applier = FakeApplier::new();
-    let plan = allowing_plan();
+    let plan = on_tap(allowing_plan());
 
     let report = run_job(
         &backend,
@@ -1150,7 +1195,7 @@ fn egress_apply_failure_fails_closed_with_a_terminal_record() -> anyhow::Result<
     let report = run_job(
         &backend,
         &journal,
-        &allowing_plan(),
+        &on_tap(allowing_plan()),
         &FailingApplier,
         EgressOs::Linux,
         Some("sandytap0"),
@@ -1354,7 +1399,7 @@ fn egress_boundary_is_reverted_even_when_the_backend_run_fails() -> anyhow::Resu
     let report = run_job(
         &backend,
         &journal,
-        &allowing_plan(),
+        &on_tap(allowing_plan()),
         &applier,
         EgressOs::Linux,
         Some("sandytap0"),
@@ -1858,7 +1903,7 @@ fn receipt_reports_unenforced_egress_with_a_reason_and_no_allow_list() -> anyhow
 fn receipt_reports_enforced_egress_with_the_applied_allow_list() -> anyhow::Result<()> {
     let (_tmp, journal) = fresh_journal()?;
     let backend = FakeBackend::new().with_outcome(ok_outcome(0));
-    let plan = allowing_plan();
+    let plan = on_tap(allowing_plan());
 
     let report = run_job(
         &backend,
@@ -1892,7 +1937,7 @@ fn receipt_reports_a_failed_egress_apply_as_unenforced() -> anyhow::Result<()> {
     let report = run_job(
         &backend,
         &journal,
-        &allowing_plan(),
+        &on_tap(allowing_plan()),
         &FailingApplier,
         EgressOs::Linux,
         Some("sandytap0"),

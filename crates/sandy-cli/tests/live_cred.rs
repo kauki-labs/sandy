@@ -160,6 +160,7 @@ fn credential_flows_through_git_helper_and_refreshes_midrun() -> anyhow::Result<
     let plan = JobPlan {
         digests: false,
         egress_proxy: false,
+        network: sandy::NetworkMode::None,
         template: format!("{}#{}", guest_flake().display(), target.topology_attr),
         command: vec!["sh".to_string(), "-c".to_string(), probe.to_string()],
         secrets: vec![],
@@ -272,6 +273,7 @@ fn credential_secret_input_output_all_compose() -> anyhow::Result<()> {
     let plan = JobPlan {
         digests: false,
         egress_proxy: false,
+        network: sandy::NetworkMode::None,
         template: format!("{}#{}", guest_flake().display(), target.topology_attr),
         command: vec!["sh".to_string(), "-c".to_string(), job.to_string()],
         secrets: vec![SecretRef {

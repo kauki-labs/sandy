@@ -473,7 +473,7 @@ fn host_backend() -> sandy_backend::QemuBackend {
 /// whose boundary an in-guest root flush cannot bypass is tier-3 (#29).
 #[cfg(target_os = "linux")]
 fn egress_applier() -> sandy::NftablesApplier {
-    sandy::NftablesApplier
+    sandy::NftablesApplier::default()
 }
 
 /// The non-Linux egress applier: the local no-op ([`sandy_backend::NoEgress`]),
@@ -1330,6 +1330,14 @@ fn dispatch_run(
         Some("proxy") => plan.egress_proxy = true,
         Some(other) => {
             eprintln!("sandy: SANDY_EGRESS must be `proxy` or unset, got `{other}`");
+            return ProcessExit::InvalidPlan.code();
+        }
+    }
+    // `SANDY_NETWORK=nic` boots the guest with a NIC (#602). An unknown value is refused, never defaulted.
+    match sandy::NetworkMode::from_env() {
+        Ok(mode) => plan.network = mode,
+        Err(e) => {
+            eprintln!("sandy: {e}");
             return ProcessExit::InvalidPlan.code();
         }
     }

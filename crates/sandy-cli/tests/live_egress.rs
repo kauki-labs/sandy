@@ -477,6 +477,7 @@ fn sandy_run_on_tap(
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_sandy"));
     cmd.env("SANDY_HOME", home)
         .env("SANDY_TAP", tap)
+        .env("SANDY_NETWORK", "nic")
         .args(["-o", "json", "run", &attr, "--timeout", "120"]);
     for entry in allow {
         cmd.args(["--allow", entry]);

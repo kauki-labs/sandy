@@ -38,6 +38,7 @@ use sandy::{
 use sandy_api::agent::AGENT_VSOCK_PORT;
 use sandy_api::{
     agent::AgentLaunch,
+    egress::{NETWORK_ENV, NetworkMode, is_valid_tap_name},
     share::{GuestShareTransport, ShareSpec},
 };
 use uuid::Uuid;
@@ -98,6 +99,32 @@ pub struct StagedArgs {
     /// for the guest, so the host can connect to the guest agent and the proxy can
     /// serve it. Overrides [`Topology::vsock_cid`].
     pub agent_cid: Option<u32>,
+    /// The guest network profile (#602). The tap NIC is emitted only under [`NetworkMode::Nic`], which needs
+    /// a bound tap and no egress proxy: the caller then owns the nftables boundary on that tap. A tap without
+    /// `nic`, and `nic` without a tap, are refused.
+    pub network: NetworkMode,
+}
+
+/// Refuse a tap NIC that has no declared boundary, and any tap name that cannot be scoped (#602).
+///
+/// The tap NIC is filtered only when the caller applied the nftables ruleset on it, which `nic` declares. A NIC
+/// without that declaration, or `nic` with no tap to filter, would boot unfiltered. The tap name goes into the
+/// `-netdev` argument and the ruleset, so it must be a bare interface name. Pure, so `run` can call it before staging.
+fn check_nic_profile(network: NetworkMode, tap: Option<&str>) -> Result<(), BackendError> {
+    if let Some(tap) = tap.filter(|t| !is_valid_tap_name(t)) {
+        return Err(BackendError::Spawn(format!(
+            "${TAP_ENV}={tap:?} is not a valid interface name (1 to 15 of A-Z a-z 0-9 _ - .)"
+        )));
+    }
+    match (network == NetworkMode::Nic, tap) {
+        (true, None) => Err(BackendError::Spawn(format!(
+            "network = nic needs a bound tap (${TAP_ENV}) carrying the host egress boundary"
+        ))),
+        (false, Some(_)) => Err(BackendError::Spawn(format!(
+            "${TAP_ENV} binds a guest NIC, which needs {NETWORK_ENV}=nic; refusing an unfiltered NIC"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// Assemble the `qemu-system-<arch>` command vector for `topology` + `spec`.
@@ -119,8 +146,9 @@ pub struct StagedArgs {
 ///   plus a `-device vhost-user-fs-pci,…,tag=<mount_tag>` the guest mounts as virtiofs; when any share is present, a
 ///   one-time `-object memory-backend-memfd,…,share=on` + `-numa node,memdev=…` so virtio-fs has shareable guest RAM.
 ///   The matching `virtiofsd` daemons are launched by [`QemuBackend::boot`] (new run dependency: `virtiofsd` on PATH).
-/// - a `-netdev tap,…,ifname=<tap> -device virtio-net-pci,…` NIC pair when `staged.tap` is set (so the guest has egress
-///   to filter, #29); nothing when it is `None` (the default isolated boot).
+/// - a `-netdev tap,…,ifname=<tap> -device virtio-net-pci,…` NIC pair when `staged.tap` is set together with
+///   `staged.network = nic` (so the guest has egress to filter, #29); `-nic none` otherwise (the default isolated
+///   boot).
 /// - `-device vhost-vsock-pci,guest-cid=<cid>` when `topology.vsock_cid` is set. A run with an egress policy
 ///   ([`RunSpec::egress`]) needs that CID, and no NIC: it is refused with a tap or without a CID.
 ///
@@ -141,7 +169,13 @@ pub fn qemu_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> Re
 
     // Proxy mode (#404): the guest's only egress is its vsock to the host proxy, so it has no
     // NIC, and it needs a CID to be served on.
+    let nic = staged.network == NetworkMode::Nic;
     if spec.egress.is_some() {
+        if nic {
+            return Err(BackendError::Spawn(
+                "network = nic and the egress proxy are exclusive: the proxy guest has no NIC".to_string(),
+            ));
+        }
         if staged.tap.is_some() {
             return Err(BackendError::Spawn(format!(
                 "the egress proxy and ${TAP_ENV} are exclusive: the proxy guest has no NIC"
@@ -153,6 +187,8 @@ pub fn qemu_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> Re
             ));
         }
     }
+
+    check_nic_profile(staged.network, staged.tap.as_deref())?;
 
     let mut args = vec![qemu_system_binary(&topology.kernel)];
 
@@ -675,6 +711,11 @@ impl VmBackend for QemuBackend {
             ));
         }
         let topology = eval_topology(spec.template)?;
+        // Parsed and checked before any staging: a refused profile must not return past the shares' teardown wipe
+        // (INV-1).
+        let network = NetworkMode::from_env().map_err(BackendError::Spawn)?;
+        let tap = std::env::var(TAP_ENV).ok().filter(|t| !t.is_empty());
+        check_nic_profile(network, tap.as_deref())?;
         let agent_program: Option<PathBuf> = match &self.agent {
             Some(_) => Some(topology.agent_program.clone().ok_or_else(|| {
                 BackendError::Spawn(
@@ -721,8 +762,9 @@ impl VmBackend for QemuBackend {
             // A tap is opt-in via $SANDY_TAP: the operator (or the #29 live gate)
             // creates and firewalls the tap, then names it here so the guest's NIC
             // attaches to it. Unset → no NIC, the default isolated boot.
-            tap: std::env::var(TAP_ENV).ok().filter(|t| !t.is_empty()),
+            tap,
             agent_cid: None,
+            network,
         };
 
         // Agent mode claims a CID by launching with it; a CID another VM holds fails
@@ -912,6 +954,7 @@ mod tests {
             kvm: true,
             tap: None,
             agent_cid: None,
+            network: NetworkMode::None,
         };
         let command = ["true".to_string()];
         let grants = Grants {
@@ -1130,6 +1173,59 @@ mod tests {
         assert!(!joined.contains("-netdev"), "{joined}");
         assert!(!joined.contains("virtio-net"), "{joined}");
         assert_nic_none(&args)?;
+        Ok(())
+    }
+
+    /// #602: the default emits no NIC; the tap NIC needs `nic` and a tap together, and never the proxy.
+    #[test]
+    fn qemu_args_gate_the_nic_on_network_mode() -> anyhow::Result<()> {
+        let topology = parse_topology(X86_64_FIXTURE).context("parse x86_64 fixture")?;
+        let command = ["true".to_string()];
+        let plain = qemu_args(&topology, &demo_spec(&command), &StagedArgs::default())?;
+        anyhow::ensure!(!plain.join(" ").contains("virtio-net"), "default: {plain:?}");
+        assert_nic_none(&plain)?;
+        let refusal = |staged: &StagedArgs, spec: &RunSpec<'_>| match qemu_args(&topology, spec, staged) {
+            Err(BackendError::Spawn(m)) => Ok(m),
+            other => Err(anyhow::anyhow!("expected a refusal, got {other:?}")),
+        };
+        let tap = Some("tap0".to_string());
+        let nic_no_tap = StagedArgs {
+            network: NetworkMode::Nic,
+            ..StagedArgs::default()
+        };
+        anyhow::ensure!(refusal(&nic_no_tap, &demo_spec(&command))?.contains("bound tap"));
+        let tap_no_nic = StagedArgs {
+            tap: tap.clone(),
+            ..StagedArgs::default()
+        };
+        anyhow::ensure!(refusal(&tap_no_nic, &demo_spec(&command))?.contains("needs SANDY_NETWORK=nic"));
+        let bad_tap = StagedArgs {
+            tap: Some("tap0,vhost=on".to_string()),
+            network: NetworkMode::Nic,
+            ..StagedArgs::default()
+        };
+        anyhow::ensure!(refusal(&bad_tap, &demo_spec(&command))?.contains("valid interface name"));
+        let nic_tap = StagedArgs {
+            tap,
+            network: NetworkMode::Nic,
+            ..StagedArgs::default()
+        };
+        let allow = allow_all_github();
+        let proxy_spec = RunSpec {
+            egress: Some(&allow),
+            ..demo_spec(&command)
+        };
+        anyhow::ensure!(refusal(&nic_tap, &proxy_spec)?.contains("exclusive"));
+        let args = qemu_args(&topology, &demo_spec(&command), &nic_tap)?;
+        anyhow::ensure!(
+            args.windows(2)
+                .any(|w| w[0] == "-netdev" && w[1] == "tap,id=net0,ifname=tap0,script=no,downscript=no"),
+            "nic + tap: {args:?}"
+        );
+        anyhow::ensure!(
+            !args.windows(2).any(|w| w[0] == "-nic"),
+            "no `-nic none` with a NIC: {args:?}"
+        );
         Ok(())
     }
 
@@ -1380,6 +1476,7 @@ mod tests {
         };
         let staged = StagedArgs {
             tap: Some("sandytap0".to_string()),
+            network: NetworkMode::Nic,
             ..StagedArgs::default()
         };
 

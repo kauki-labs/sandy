@@ -379,6 +379,40 @@ It gets no proxy.
 **Consequences.** The egress allow-list does not apply to process-backend
 runs, which is stated, not silent.
 
+## 7. Opt-in NIC profile (#602)
+
+The default guest has no NIC. A sandbox that needs a routable guest sets `SANDY_NETWORK=nic` (`NetworkMode::Nic`);
+an unknown or non-UTF-8 value is refused. Sandboxes that do not set it are unchanged.
+
+- **qemu (Linux):** `nic` is the existing tap + nftables path (#29): the operator binds a tap (`SANDY_TAP`), the guest
+  NIC attaches to it, and `sandy run` applies the guest-scoped forward ruleset around the boot. The proxy is not
+  involved: a `nic` guest and the proxy guest are exclusive. The user-mode NIC was tried and dropped: with
+  `restrict=on` it has no path in either direction, so it only added a dead interface.
+- **Plan-time refusals (band 2, no journal record, no boot):** `nic` without a tap, a tap without `nic`, and `nic`
+  with `SANDY_EGRESS=proxy` (`validate_network_mode`). A boundary-less NIC is therefore never booted by `sandy run`.
+- **Backend refusals (checked before any staging):** the qemu backend refuses the same three combinations and a tap
+  name that is not a bare interface name (1 to 15 of `A-Z a-z 0-9 _ - .`), so a value like `tap0,vhost=on` can neither
+  split the `-netdev` argument nor open the ruleset. It reads `SANDY_NETWORK` and `SANDY_TAP` itself, and it cannot
+  know whether the caller applied the ruleset. **A library caller that bypasses `sandy run` with both variables set
+  (for example an acceptance binary) boots a tap NIC with no ruleset.** Threading the profile and tap through
+  `RunSpec` closes that, and is tracked in #603.
+- **One nft table per tap:** `sandy_egress_<tap>`, so one `nic` run's revert never deletes another concurrent run's
+  boundary. Before #602 the table name was fixed and a concurrent second run lost its filter when the first exited.
+- **Dispatched VMs never get a NIC:** `sandy-host-executor` and sandyd dispatch apply no nftables ruleset, so the
+  host-executor refuses a VM dispatch while `SANDY_NETWORK` is set to anything but `none`. A tap alone is refused by
+  the backend.
+- **vfkit (macOS):** `nic` adds `virtio-net,nat` with **no egress boundary**. macOS has no nftables, and a guest-side
+  filter does not survive a guest with root. It is trusted-only: the egress proxy beside it is refused, and a plain
+  `--allow` list, empty or not, gets an "unenforced" envelope warning (it filters nothing). Enforcement is tracked in
+  #603.
+- **Limits of the nftables path:** the boundary matches IPv4 addresses and CIDRs and passes TCP only (#359), so a
+  `nic` guest cannot allow-list a provider by hostname and has no DNS until #377. The forward chain drops everything
+  not allow-listed (IPv6 and UDP included), and the input chain accepts only the guest's DHCP request (#376).
+- **No host path into the guest yet:** the tap is the host's to configure. Tailnet reachability of the guest's T3
+  port is the host's job (`tailscale serve`), not sandy's.
+- The `SANDY_NETWORK` env var is the per-run switch for `sandy run`, one process per run. A per-run `RunSpec` field is
+  tracked in #603.
+
 ## Adversarial pass
 
 Each attack assumes the #357 model: the job is root in the guest.
@@ -386,7 +420,7 @@ Each attack assumes the #357 model: the job is root in the guest.
 | Attack                                                                                                                        | Result                                                                                                                                                                                                                                                                                        |
 | ----------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | The guest opens its own vsock stream to the proxy port, bypassing the relay.                                                  | Mitigated. The relay is not a boundary. A direct stream meets the same parser, allow-list, and address filter.                                                                                                                                                                                |
-| The guest ignores the proxy and connects directly.                                                                            | Mitigated. There is no NIC, so there is no route.                                                                                                                                                                                                                                             |
+| The guest ignores the proxy and connects directly.                                                                            | Mitigated. There is no NIC, so there is no route (except under `network = nic`, section 7).                                                                                                                                                                                                   |
 | The guest kills the relay or binds `127.0.0.1:3128` itself.                                                                   | Mitigated. It denies only itself network.                                                                                                                                                                                                                                                     |
 | CONNECT to an IP literal.                                                                                                     | Mitigated. Allowed only if an IP or CIDR entry contains it with the same port. Loopback and host-interface addresses are refused even then. Non-canonical numeric forms answer `400` and are never resolved.                                                                                  |
 | CONNECT to an allowed name that resolves to a private or host-local address (DNS rebinding).                                  | Mitigated. The filter runs on the resolved addresses, and the proxy connects to the exact address it checked, so a second lookup cannot swap it. Private addresses pass only when an IP entry names them, and loopback never.                                                                 |
@@ -401,7 +435,7 @@ Each attack assumes the #357 model: the job is root in the guest.
 | A same-uid host process connects to the vfkit proxy socket.                                                                   | **Accepted residual risk.** The socket is in the 0700 staging base. A same-uid process already has the host's network, so the proxy grants it nothing new.                                                                                                                                    |
 | Bandwidth exhaustion through an allowed host.                                                                                 | **Accepted residual risk.** v1 sets no bandwidth cap.                                                                                                                                                                                                                                         |
 | The guest floods egress to starve the agent link.                                                                             | Mitigated. Separate vsock ports and separate host processes (decision 2, set aside).                                                                                                                                                                                                          |
-| The proxy dies and the job keeps running.                                                                                     | Mitigated. The guest has no network (fail closed), and the run is band 3 (decision 3).                                                                                                                                                                                                        |
+| The proxy dies and the job keeps running.                                                                                     | Mitigated. The guest has no network (fail closed; a `network = nic` guest on vfkit keeps its NAT NIC, section 7), and the run is band 3 (decision 3).                                                                                                                                         |
 | Log or receipt injection through the CONNECT target.                                                                          | Mitigated. Only targets that pass the host grammar are logged or recorded (#375). Others are logged as `malformed`.                                                                                                                                                                           |
 | An attack on the host kernel's vsock code.                                                                                    | **Accepted residual risk.** The guest kernel no longer has a network driver, but vhost-vsock (qemu) and Virtualization.framework (vfkit) remain host surface. The agent link already depends on them.                                                                                         |
 

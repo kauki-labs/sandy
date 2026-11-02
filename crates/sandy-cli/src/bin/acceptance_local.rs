@@ -52,6 +52,7 @@ fn end_to_end() -> Result<(), String> {
     let plan = JobPlan {
         digests: false,
         egress_proxy: false,
+        network: sandy::NetworkMode::None,
         template: "acceptance-local".to_string(),
         command: vec!["true".to_string()],
         inputs: vec![],
