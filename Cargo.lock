@@ -2555,6 +2555,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandy-mcp"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "reqwest",
+ "serde_json",
+ "tiny_http",
+ "tokio",
+]
+
+[[package]]
 name = "sandy-orchestrator"
 version = "0.1.1"
 dependencies = [

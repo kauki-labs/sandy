@@ -1,0 +1,371 @@
+openapi: 3.1.0
+info:
+  title: sandy broker API
+  version: 0.1.0
+  description: >-
+    Client-facing API tier over sandyd (docs/decisions/sandyd.md section 7). Draft contract for #585 and #591. The job operations mirror the control RPC; the environment operations follow the orb contract O1-O9 in #585. No operation accepts or returns a secret (O8). The job attach token stays in the API tier, bound to the caller's identity, and never crosses this surface.
+servers:
+  - url: http://127.0.0.1:8787
+security:
+  - bearer: []
+paths:
+  /v1/jobs:
+    post:
+      operationId: submitJob
+      summary: Submit a job.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/SubmitJob"}
+      responses:
+        "202":
+          description: Accepted.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/JobSummary"}
+        default: {$ref: "#/components/responses/Error"}
+    get:
+      operationId: listJobs
+      summary: List jobs.
+      responses:
+        "200":
+          description: Jobs.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [jobs]
+                properties:
+                  jobs:
+                    type: array
+                    items: {$ref: "#/components/schemas/JobSummary"}
+        default: {$ref: "#/components/responses/Error"}
+  /v1/jobs/{job_id}:
+    parameters:
+      - {$ref: "#/components/parameters/JobId"}
+    get:
+      operationId: getJob
+      summary: Job status.
+      responses:
+        "200":
+          description: Status.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/JobStatus"}
+        default: {$ref: "#/components/responses/Error"}
+  /v1/jobs/{job_id}/cancel:
+    parameters:
+      - {$ref: "#/components/parameters/JobId"}
+    post:
+      operationId: cancelJob
+      summary: Cancel a job.
+      responses:
+        "200":
+          description: Cancelled.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/JobSummary"}
+        default: {$ref: "#/components/responses/Error"}
+  /v1/jobs/{job_id}/attach:
+    parameters:
+      - {$ref: "#/components/parameters/JobId"}
+    post:
+      operationId: attachJob
+      summary: Open the job's output stream.
+      description: >-
+        Returns a stream location. The channel-join cap is redeemed by the API tier, not returned to the caller.
+      responses:
+        "200":
+          description: Stream location.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [stream_url]
+                properties:
+                  stream_url: {type: string, format: uri}
+        default: {$ref: "#/components/responses/Error"}
+  /v1/environments:
+    post:
+      operationId: spawnEnvironment
+      summary: Create an environment. Idempotent by request_id (O1).
+      description: >-
+        The same request_id with the same payload returns the same environment. The same request_id with a different payload fails with request_id_conflict.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/SpawnEnvironment"}
+      responses:
+        "202":
+          description: Accepted.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/EnvironmentSummary"}
+        default: {$ref: "#/components/responses/Error"}
+    get:
+      operationId: listEnvironments
+      summary: List environments.
+      parameters:
+        - name: state
+          in: query
+          schema: {$ref: "#/components/schemas/EnvironmentState"}
+        - name: task_ref
+          in: query
+          schema: {type: string}
+      responses:
+        "200":
+          description: Summaries.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [environments]
+                properties:
+                  environments:
+                    type: array
+                    items: {$ref: "#/components/schemas/EnvironmentSummary"}
+        default: {$ref: "#/components/responses/Error"}
+  /v1/environments/{environment_id}:
+    parameters:
+      - {$ref: "#/components/parameters/EnvironmentId"}
+    get:
+      operationId: getEnvironment
+      summary: Environment detail.
+      responses:
+        "200":
+          description: Detail.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Environment"}
+        default: {$ref: "#/components/responses/Error"}
+    delete:
+      operationId: deleteEnvironment
+      summary: Delete an environment and revoke its credentials. Idempotent (O6).
+      responses:
+        "200":
+          description: Terminal state.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/EnvironmentSummary"}
+        default: {$ref: "#/components/responses/Error"}
+  /v1/environments/{environment_id}/cancel:
+    parameters:
+      - {$ref: "#/components/parameters/EnvironmentId"}
+    post:
+      operationId: cancelEnvironment
+      summary: Cancel provisioning (O5).
+      responses:
+        "200":
+          description: Terminal state.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/EnvironmentSummary"}
+        default: {$ref: "#/components/responses/Error"}
+  /v1/environments/{environment_id}/stop:
+    parameters:
+      - {$ref: "#/components/parameters/EnvironmentId"}
+    post:
+      operationId: stopEnvironment
+      summary: Pause. unsupported_for_lifetime for ephemeral environments (O9).
+      responses:
+        "200":
+          description: State.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/EnvironmentSummary"}
+        default: {$ref: "#/components/responses/Error"}
+  /v1/environments/{environment_id}/resume:
+    parameters:
+      - {$ref: "#/components/parameters/EnvironmentId"}
+    post:
+      operationId: resumeEnvironment
+      summary: Resume a stopped environment.
+      responses:
+        "200":
+          description: State.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/EnvironmentSummary"}
+        default: {$ref: "#/components/responses/Error"}
+  /v1/environments/{environment_id}/link:
+    parameters:
+      - {$ref: "#/components/parameters/EnvironmentId"}
+    post:
+      operationId: linkEnvironment
+      summary: Pair the environment with a primary, server-side.
+      description: >-
+        The pairing code is generated and consumed inside the API tier. It never appears in a request or response. Returns unsupported until T3 offers an external link interface (#585 open point 1).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [primary]
+              additionalProperties: false
+              properties:
+                primary: {type: string}
+      responses:
+        "200":
+          description: Link status.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [link_status]
+                properties:
+                  link_status: {type: string, enum: [linked, pending, unsupported]}
+        default: {$ref: "#/components/responses/Error"}
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+  parameters:
+    JobId:
+      name: job_id
+      in: path
+      required: true
+      schema: {type: string}
+    EnvironmentId:
+      name: environment_id
+      in: path
+      required: true
+      schema: {type: string}
+  responses:
+    Error:
+      description: Typed error.
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum:
+            - unauthenticated
+            - forbidden
+            - not_found
+            - invalid_request
+            - request_id_conflict
+            - quota_exceeded
+            - unsupported_for_lifetime
+            - unsupported
+            - unavailable
+            - withheld
+        message: {type: string}
+    IsolationClass:
+      type: string
+      enum: [trusted, untrusted]
+    SubmitJob:
+      type: object
+      required: [manifest, manifest_encoding, required_isolation_class]
+      additionalProperties: false
+      properties:
+        manifest: {type: string, contentEncoding: base64}
+        manifest_encoding: {type: string, minLength: 1}
+        required_isolation_class: {$ref: "#/components/schemas/IsolationClass"}
+        inputs:
+          type: array
+          items:
+            type: object
+            required: [host, name]
+            additionalProperties: false
+            properties:
+              host: {type: string}
+              name: {type: string}
+              guest_path: {type: string}
+        outputs:
+          type: array
+          items:
+            type: object
+            required: [dest]
+            additionalProperties: false
+            properties:
+              name: {type: string}
+              dest: {type: string}
+        secrets:
+          description: File-backed references. The value never travels.
+          type: array
+          items:
+            type: object
+            required: [name, host_path]
+            additionalProperties: false
+            properties:
+              name: {type: string}
+              host_path: {type: string}
+    JobState:
+      type: string
+      enum: [pending, running, succeeded, failed, cancelled]
+    JobSummary:
+      type: object
+      required: [job_id, state]
+      properties:
+        job_id: {type: string}
+        state: {$ref: "#/components/schemas/JobState"}
+    JobStatus:
+      allOf:
+        - {$ref: "#/components/schemas/JobSummary"}
+        - type: object
+          properties:
+            exit_code: {type: integer}
+            console_tail: {type: string}
+    SpawnEnvironment:
+      type: object
+      required: [request_id, profile, lifetime]
+      additionalProperties: false
+      properties:
+        request_id: {type: string, minLength: 1}
+        profile:
+          description: Name of a credential identity profile (#592). Never a secret.
+          type: string
+        size: {type: string}
+        lifetime:
+          type: object
+          required: [kind]
+          additionalProperties: false
+          properties:
+            kind: {type: string, enum: [ephemeral, persistent]}
+            ttl_secs: {type: integer, minimum: 1}
+        task_ref: {type: string}
+    EnvironmentState:
+      type: string
+      enum: [provisioning, ready, stopped, failed, deleted]
+    EnvironmentSummary:
+      type: object
+      required: [environment_id, state]
+      properties:
+        environment_id: {type: string}
+        state: {$ref: "#/components/schemas/EnvironmentState"}
+    Environment:
+      allOf:
+        - {$ref: "#/components/schemas/EnvironmentSummary"}
+        - type: object
+          required: [steps]
+          properties:
+            steps:
+              description: Ordered provisioning steps (O4).
+              type: array
+              items:
+                type: object
+                required: [name, status]
+                properties:
+                  name: {type: string}
+                  status: {type: string, enum: [pending, running, done, failed]}
+            failure:
+              type: object
+              required: [step, reason]
+              properties:
+                step: {type: string}
+                reason: {type: string}
+            connection:
+              description: Present only when state is ready (O3).
+              type: object
+              required: [url]
+              properties:
+                url: {type: string, format: uri}

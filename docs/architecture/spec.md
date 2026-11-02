@@ -608,6 +608,17 @@ owner.
 
 ---
 
+## 8. MCP frontend (`sandy-mcp`)
+
+**Decisions** ([`sandyd.md`](../decisions/sandyd.md) decision 25, #585):
+
+- MCP is a thin layer over the broker API, never over the control RPC. A test fails the build if `sandy-mcp` reaches `sandy-control-proto`. Invariant: layering of decision 7.
+- One tool call makes one API request: no retry, no redirect, no state.
+- No tool argument or result carries a secret. A guard refuses secret-named fields and token-shaped values in arguments and withholds a result or error that holds one. Invariant: O8 of #585.
+- The client accepts a loopback `http` broker URL only, since it has no TLS backend.
+
+**KPI:** rows KMCP1 to KMCP7 in [`kpi.md`](kpi.md).
+
 ## Testing: integration vs end-to-end
 
 The two tiers are deliberately separate, and a subsystem's KPI names tests from each.
