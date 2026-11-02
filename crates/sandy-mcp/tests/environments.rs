@@ -2,106 +2,12 @@
 //! pass through unchanged. The fake broker holds the O1-O9 rules; these tests prove the
 //! tools forward arguments and typed results faithfully, not that a real broker obeys them.
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
+mod common;
 
 use anyhow::{Context, Result};
+use common::broker;
 use sandy_mcp::{Api, Server};
 use serde_json::{Value, json};
-
-/// A minimal in-memory broker: idempotent spawn, a probe gate, typed errors.
-#[derive(Default)]
-struct Broker {
-    by_request: HashMap<String, (Value, String)>,
-    states: HashMap<String, String>,
-    requests: Vec<(String, String)>,
-}
-
-fn broker() -> Result<(String, Arc<Mutex<Broker>>)> {
-    let server = tiny_http::Server::http("127.0.0.1:0").map_err(|e| anyhow::anyhow!("{e}"))?;
-    let url = format!("http://{}", server.server_addr());
-    let state = Arc::new(Mutex::new(Broker::default()));
-    let s = Arc::clone(&state);
-    std::thread::spawn(move || {
-        for mut req in server.incoming_requests() {
-            let mut body = String::new();
-            let _ = req.as_reader().read_to_string(&mut body);
-            let method = req.method().to_string();
-            let url = req.url().to_string();
-            let (status, out) = route(&mut s.lock().unwrap(), &method, &url, &body);
-            let resp = tiny_http::Response::from_string(out.to_string())
-                .with_status_code(status)
-                .with_header(tiny_http::Header::from_bytes("content-type", "application/json").unwrap());
-            let _ = req.respond(resp);
-        }
-    });
-    Ok((url, state))
-}
-
-fn err(status: u16, code: &str) -> (u16, Value) {
-    (status, json!({"code": code, "message": code}))
-}
-
-fn route(b: &mut Broker, method: &str, url: &str, body: &str) -> (u16, Value) {
-    b.requests.push((method.to_owned(), url.to_owned()));
-    let (path, query) = url.split_once('?').unwrap_or((url, ""));
-    let parts: Vec<_> = path.trim_matches('/').split('/').collect();
-    match (method, parts.as_slice()) {
-        ("POST", ["v1", "environments"]) => {
-            let payload: Value = serde_json::from_str(body).unwrap_or_default();
-            let rid = payload["request_id"].as_str().unwrap_or_default().to_owned();
-            if let Some((first, id)) = b.by_request.get(&rid) {
-                if *first != payload {
-                    return err(409, "request_id_conflict");
-                }
-                return (202, json!({"environment_id": id, "state": b.states[id]}));
-            }
-            if b.states.values().filter(|s| *s != "deleted").count() >= 2 {
-                return err(429, "quota_exceeded");
-            }
-            let id = format!("env{}", b.states.len() + 1);
-            b.by_request.insert(rid, (payload, id.clone()));
-            b.states.insert(id.clone(), "provisioning".into());
-            (202, json!({"environment_id": id, "state": "provisioning"}))
-        }
-        ("GET", ["v1", "environments"]) => {
-            let want = query.strip_prefix("state=");
-            let envs: Vec<_> = b
-                .states
-                .iter()
-                .filter(|(_, s)| want.is_none_or(|w| w == s.as_str()))
-                .map(|(id, s)| json!({"environment_id": id, "state": s}))
-                .collect();
-            (200, json!({"environments": envs}))
-        }
-        ("GET", ["v1", "environments", id]) => match b.states.get(*id) {
-            None => err(404, "not_found"),
-            Some(s) if s == "ready" => (
-                200,
-                json!({"environment_id": id, "state": s, "steps": [],
-                       "connection": {"url": "http://10.0.0.2:3773"}}),
-            ),
-            Some(s) if s == "failed" => (
-                200,
-                json!({"environment_id": id, "state": s, "steps": [],
-                       "failure": {"step": "boot", "reason": "probe timed out"}}),
-            ),
-            Some(s) => (200, json!({"environment_id": id, "state": s, "steps": []})),
-        },
-        ("DELETE", ["v1", "environments", id]) | ("POST", ["v1", "environments", id, "cancel"]) => {
-            if !b.states.contains_key(*id) {
-                return err(404, "not_found");
-            }
-            b.states.insert((*id).to_owned(), "deleted".into());
-            (200, json!({"environment_id": id, "state": "deleted"}))
-        }
-        ("POST", ["v1", "environments", _, "stop" | "resume"]) => err(409, "unsupported_for_lifetime"),
-        ("POST", ["v1", "environments", _, "link"]) => (200, json!({"link_status": "unsupported"})),
-        _ => err(404, "not_found"),
-    }
-}
 
 async fn call(server: &Server, name: &str, args: Value) -> Result<(bool, Value)> {
     let resp = server
