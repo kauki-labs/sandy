@@ -69,7 +69,7 @@ fn host_backend() -> sandy_backend::QemuBackend {
 /// The Linux egress applier: real `nft`-backed default-deny enforcement.
 #[cfg(target_os = "linux")]
 fn egress_applier() -> sandy::NftablesApplier {
-    sandy::NftablesApplier
+    sandy::NftablesApplier::default()
 }
 
 /// The non-Linux egress applier: the local no-op, since `plan_egress` yields

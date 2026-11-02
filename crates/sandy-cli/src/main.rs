@@ -473,7 +473,7 @@ fn host_backend() -> sandy_backend::QemuBackend {
 /// whose boundary an in-guest root flush cannot bypass is tier-3 (#29).
 #[cfg(target_os = "linux")]
 fn egress_applier() -> sandy::NftablesApplier {
-    sandy::NftablesApplier
+    sandy::NftablesApplier::default()
 }
 
 /// The non-Linux egress applier: the local no-op ([`sandy_backend::NoEgress`]),

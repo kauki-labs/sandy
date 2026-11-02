@@ -79,6 +79,20 @@ impl NetworkMode {
     }
 }
 
+/// Whether `tap` is a safe guest tap interface name (#602): 1 to 15 bytes (the Linux `IFNAMSIZ` limit) of ASCII
+/// letters, digits, `_`, `-` and `.`. It is interpolated into the qemu `-netdev` argument and the nftables ruleset, so
+/// a `,` or a space would let a value like `sandytap0,vhost=on` split the argument or open the ruleset.
+#[must_use]
+pub fn is_valid_tap_name(tap: &str) -> bool {
+    !tap.is_empty()
+        && tap.len() <= 15
+        && tap != "."
+        && tap != ".."
+        && tap
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
 /// The target OS an egress plan is computed for — injected so the core's
 /// `plan_egress` is a pure function unit-testable without a real host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

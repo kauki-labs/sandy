@@ -833,6 +833,40 @@ fn run_proxy_mode_with_a_bound_tap_on_linux_is_invalid_plan_writes_no_record_and
     Ok(())
 }
 
+/// #602: a profile that disagrees with the tap or the proxy is an invalid plan (band 2): no journal record, no boot,
+/// no ruleset. Deleting the `validate_network_mode` call from the supervisor must fail this test.
+#[test]
+fn run_a_network_profile_that_disagrees_with_the_tap_or_proxy_is_refused_before_anything_runs() -> anyhow::Result<()> {
+    let nic = |plan: JobPlan| JobPlan {
+        network: sandy::NetworkMode::Nic,
+        ..plan
+    };
+    let cases: Vec<(&str, JobPlan, Option<&str>)> = vec![
+        ("nic without a tap", nic(allowing_plan()), None),
+        ("a tap without nic", allowing_plan(), Some("sandytap0")),
+        ("nic with the proxy", nic(proxy_plan()), None),
+        (
+            "nic with a malformed tap",
+            nic(allowing_plan()),
+            Some("sandytap0,vhost=on"),
+        ),
+    ];
+    for (name, plan, tap) in cases {
+        let (_tmp, journal) = fresh_journal()?;
+        // A success is scripted on purpose: a boot would make the band 0.
+        let backend = FakeBackend::new().with_outcome(ok_outcome(0));
+        let applier = FakeApplier::new();
+        let report = run_job(&backend, &journal, &plan, &applier, EgressOs::Linux, tap, &[])
+            .with_context(|| format!("run_job ({name})"))?;
+        assert_eq!(report.process_exit.code(), 2, "{name}: band 2");
+        assert!(!report.envelope.retryable, "{name}: band 2 is never retryable");
+        assert!(journal.list().context(name)?.is_empty(), "{name}: no job record");
+        assert!(backend.run_egress().is_empty(), "{name}: the backend never runs");
+        assert!(applier.applied_rulesets().is_empty(), "{name}: no ruleset");
+    }
+    Ok(())
+}
+
 /// #360: in proxy mode the backend receives the allow-list in `RunSpec`, the
 /// applier sees no apply and no revert, and hostname entries pass plan
 /// validation (#359's refusal is scoped to the nftables plan).

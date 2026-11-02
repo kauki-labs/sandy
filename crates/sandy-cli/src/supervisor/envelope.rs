@@ -203,7 +203,9 @@ pub(super) fn no_network_allow_warning(
     tap: Option<&str>,
     network: NetworkMode,
 ) -> Option<String> {
-    if allow.rules.is_empty() {
+    // An empty list means deny-all except on a macOS `nic` guest, whose NAT NIC has no boundary to enforce it (#603).
+    let unenforced_nic = matches!(egress_os, EgressOs::MacOs) && network == NetworkMode::Nic;
+    if allow.rules.is_empty() && !unenforced_nic {
         return None;
     }
     match backend_kind {
@@ -243,6 +245,16 @@ mod tests {
             }],
         };
         let warn = |mode, os, tap| no_network_allow_warning(&allow, SandboxKind::Vm, os, tap, mode);
+        let none_listed = AllowList::default();
+        let empty = no_network_allow_warning(&none_listed, SandboxKind::Vm, EgressOs::MacOs, None, NetworkMode::Nic);
+        assert!(
+            empty.is_some_and(|w| w.contains("NAT NIC")),
+            "an empty list must still warn on a macOS nic guest"
+        );
+        assert_eq!(
+            no_network_allow_warning(&none_listed, SandboxKind::Vm, EgressOs::MacOs, None, NetworkMode::None),
+            None
+        );
         let none = warn(NetworkMode::None, EgressOs::MacOs, None).unwrap_or_default();
         assert!(none.contains("no network device"), "{none}");
         let nic = warn(NetworkMode::Nic, EgressOs::MacOs, None).unwrap_or_default();

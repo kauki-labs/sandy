@@ -390,14 +390,21 @@ an unknown or non-UTF-8 value is refused. Sandboxes that do not set it are uncha
   `restrict=on` it has no path in either direction, so it only added a dead interface.
 - **Plan-time refusals (band 2, no journal record, no boot):** `nic` without a tap, a tap without `nic`, and `nic`
   with `SANDY_EGRESS=proxy` (`validate_network_mode`). A boundary-less NIC is therefore never booted by `sandy run`.
-- **Backend refusals (defense in depth):** `qemu_args` refuses the same three combinations, so a caller that skips the
-  plan check still cannot boot an unfiltered NIC.
+- **Backend refusals (checked before any staging):** the qemu backend refuses the same three combinations and a tap
+  name that is not a bare interface name (1 to 15 of `A-Z a-z 0-9 _ - .`), so a value like `tap0,vhost=on` can neither
+  split the `-netdev` argument nor open the ruleset. It reads `SANDY_NETWORK` and `SANDY_TAP` itself, and it cannot
+  know whether the caller applied the ruleset. **A library caller that bypasses `sandy run` with both variables set
+  (for example an acceptance binary) boots a tap NIC with no ruleset.** Threading the profile and tap through
+  `RunSpec` closes that, and is tracked in #603.
+- **One nft table per tap:** `sandy_egress_<tap>`, so one `nic` run's revert never deletes another concurrent run's
+  boundary. Before #602 the table name was fixed and a concurrent second run lost its filter when the first exited.
 - **Dispatched VMs never get a NIC:** `sandy-host-executor` and sandyd dispatch apply no nftables ruleset, so the
   host-executor refuses a VM dispatch while `SANDY_NETWORK` is set to anything but `none`. A tap alone is refused by
   the backend.
 - **vfkit (macOS):** `nic` adds `virtio-net,nat` with **no egress boundary**. macOS has no nftables, and a guest-side
-  filter does not survive a guest with root. It is trusted-only: a policy beside it is refused, because it would read
-  as filtered. Enforcement is tracked in #603.
+  filter does not survive a guest with root. It is trusted-only: the egress proxy beside it is refused, and a plain
+  `--allow` list, empty or not, gets an "unenforced" envelope warning (it filters nothing). Enforcement is tracked in
+  #603.
 - **Limits of the nftables path:** the boundary matches IPv4 addresses and CIDRs and passes TCP only (#359), so a
   `nic` guest cannot allow-list a provider by hostname and has no DNS until #377. The forward chain drops everything
   not allow-listed (IPv6 and UDP included), and the input chain accepts only the guest's DHCP request (#376).
