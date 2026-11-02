@@ -1,0 +1,118 @@
+{
+  "name": "primary-t3 stand-in",
+  "description": "One fixed script run against any sandy-mcp: the fake broker (tier-2) and, later, a real broker (tier-3). Pointers are RFC 6901. A string equal to `$name` is a captured value or a fixture. A target overrides `fixtures` (manifest, encoding, profiles) and reads no broker-internal state. `cleanup` steps run after any failure, best effort.",
+  "fixtures": {
+    "manifest": "AA==",
+    "manifest_encoding": "conformance.v1",
+    "profile": "harness",
+    "other_profile": "other"
+  },
+  "steps": [
+    { "tool": "list", "args": {}, "expect": { "present": ["/jobs"] } },
+    {
+      "tool": "submit",
+      "args": {
+        "manifest": "$manifest",
+        "manifest_encoding": "$manifest_encoding",
+        "required_isolation_class": "untrusted"
+      },
+      "capture": { "job": "/job_id" },
+      "expect": { "in": { "/state": ["pending", "running"] } }
+    },
+    {
+      "tool": "status",
+      "args": { "job_id": "$job" },
+      "expect": { "equals": { "/job_id": "$job" } }
+    },
+    {
+      "tool": "attach",
+      "args": { "job_id": "$job" },
+      "expect": { "present": ["/stream_url"] }
+    },
+    {
+      "tool": "cancel",
+      "args": { "job_id": "$job" },
+      "expect": { "in": { "/state": ["cancelled", "cancelling"] } }
+    },
+
+    {
+      "tool": "spawn_environment",
+      "args": {
+        "request_id": "conf-1",
+        "profile": "$profile",
+        "lifetime": { "kind": "ephemeral", "ttl_secs": 600 },
+        "task_ref": "conf"
+      },
+      "capture": { "env": "/environment_id" },
+      "expect": { "in": { "/state": ["provisioning", "ready"] } }
+    },
+    {
+      "note": "O1: a retry with the same request_id and payload returns the same environment",
+      "tool": "spawn_environment",
+      "args": {
+        "request_id": "conf-1",
+        "profile": "$profile",
+        "lifetime": { "kind": "ephemeral", "ttl_secs": 600 },
+        "task_ref": "conf"
+      },
+      "expect": { "equals": { "/environment_id": "$env" } }
+    },
+    {
+      "note": "AT-9: the same request_id with another payload is a typed conflict",
+      "tool": "spawn_environment",
+      "args": {
+        "request_id": "conf-1",
+        "profile": "$profile",
+        "lifetime": { "kind": "ephemeral", "ttl_secs": 600 },
+        "task_ref": "a-different-task"
+      },
+      "expect": { "ok": false, "code": "request_id_conflict" }
+    },
+    {
+      "note": "O3: a connection appears only when the state is ready",
+      "tool": "get_environment",
+      "args": { "environment_id": "$env" },
+      "expect": {
+        "absent_unless": [
+          { "pointer": "/connection", "when": { "/state": "ready" } }
+        ]
+      }
+    },
+    {
+      "note": "O2: Ready only after the probe; then the connection appears",
+      "tool": "get_environment",
+      "args": { "environment_id": "$env" },
+      "until": { "/state": "ready" },
+      "timeout_ms": 20000,
+      "poll_interval_ms": 50,
+      "expect": { "present": ["/connection/url"] }
+    },
+    {
+      "note": "O9: an ephemeral environment cannot be paused",
+      "tool": "stop_environment",
+      "args": { "environment_id": "$env" },
+      "expect": { "ok": false, "code": "unsupported_for_lifetime" }
+    },
+    {
+      "note": "open point 1: no external link interface yet",
+      "tool": "link_environment",
+      "args": { "environment_id": "$env", "primary": "primary" },
+      "expect": { "equals": { "/link_status": "unsupported" } }
+    },
+    {
+      "note": "O6: delete is idempotent",
+      "tool": "delete_environment",
+      "args": { "environment_id": "$env" },
+      "expect": { "equals": { "/state": "deleted" } }
+    },
+    {
+      "tool": "delete_environment",
+      "args": { "environment_id": "$env" },
+      "expect": { "equals": { "/state": "deleted" } }
+    }
+  ],
+  "cleanup": [
+    { "tool": "cancel", "args": { "job_id": "$job" } },
+    { "tool": "delete_environment", "args": { "environment_id": "$env" } }
+  ]
+}
