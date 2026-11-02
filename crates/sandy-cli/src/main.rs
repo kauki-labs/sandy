@@ -1333,6 +1333,14 @@ fn dispatch_run(
             return ProcessExit::InvalidPlan.code();
         }
     }
+    // `SANDY_NETWORK=nic` boots the guest with a NIC (#602). An unknown value is refused, never defaulted.
+    match sandy::NetworkMode::from_env() {
+        Ok(mode) => plan.network = mode,
+        Err(e) => {
+            eprintln!("sandy: {e}");
+            return ProcessExit::InvalidPlan.code();
+        }
+    }
     // The run seams come from the injected `profile` — the sandbox backend, the
     // egress applier (Linux enforces the nftables boundary, macOS has none), and the
     // credential source. The composition root selects the profile at the top

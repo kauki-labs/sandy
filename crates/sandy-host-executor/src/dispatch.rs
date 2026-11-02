@@ -99,6 +99,27 @@ pub enum DispatchError {
     /// rather than reading like a generic `nix` spawn/build failure.
     #[error("resolving the flake template timed out after {0}s")]
     FlakeResolveTimedOut(u64),
+    /// `SANDY_NETWORK` asks for a guest NIC (or holds a value that is not `none`). Only `sandy run` applies the
+    /// nftables boundary a NIC needs, so a dispatched VM never gets one (#602).
+    #[error("SANDY_NETWORK is set to a guest NIC on this host, but a dispatched VM has no egress boundary: {0}")]
+    NetworkProfileUnsupported(String),
+}
+
+/// Refuse a guest NIC for a dispatched VM (#602).
+///
+/// The qemu backend reads `SANDY_NETWORK` and `SANDY_TAP` from its own environment, and nothing in this dispatch path
+/// applies the nftables ruleset on the tap, so a host started with them set would boot a NIC with no filter.
+/// Anything but an unset or `none` profile is refused, a malformed value included.
+///
+/// # Errors
+///
+/// Returns [`DispatchError::NetworkProfileUnsupported`] for any profile other than `none`.
+fn refuse_guest_nic(var: Result<String, std::env::VarError>) -> Result<(), DispatchError> {
+    match sandy_api::egress::NetworkMode::from_var(var) {
+        Ok(sandy_api::egress::NetworkMode::None) => Ok(()),
+        Ok(mode) => Err(DispatchError::NetworkProfileUnsupported(format!("{mode:?}"))),
+        Err(why) => Err(DispatchError::NetworkProfileUnsupported(why)),
+    }
 }
 
 /// Whether `err`'s anyhow chain carries an [`std::io::Error`] of kind
@@ -542,6 +563,7 @@ pub fn handle_dispatch(
         // with VM support at all) falls through to the catch-all refusal
         // below, exactly like an unrecognized backend value.
         Some(ProtoSandboxKind::Vm) if vm_available => {
+            refuse_guest_nic(std::env::var(sandy_api::egress::NETWORK_ENV))?;
             let decoded = decode_flake_dispatch_manifest(&dispatch.manifest_encoding, &dispatch.manifest)?;
             let resolved = sandy_guest_template::resolve_flake_template(
                 &decoded.flake,
@@ -1145,6 +1167,25 @@ mod tests {
              the gate checked the Vm dispatch as a Process job"
         );
         Ok(())
+    }
+
+    /// #602: a dispatched VM never boots a guest NIC, because this path applies no egress boundary.
+    #[test]
+    fn a_dispatched_vm_refuses_a_guest_nic() {
+        use std::{env::VarError, ffi::OsString};
+        assert_eq!(refuse_guest_nic(Err(VarError::NotPresent)), Ok(()));
+        assert_eq!(refuse_guest_nic(Ok(String::new())), Ok(()));
+        assert_eq!(refuse_guest_nic(Ok("none".to_string())), Ok(()));
+        for bad in [
+            Ok("nic".to_string()),
+            Ok("NIC".to_string()),
+            Err(VarError::NotUnicode(OsString::new())),
+        ] {
+            assert!(
+                matches!(refuse_guest_nic(bad), Err(DispatchError::NetworkProfileUnsupported(_))),
+                "a NIC or malformed profile must be refused"
+            );
+        }
     }
 
     /// An untrusted dispatch with an unset backend is checked as the weaker

@@ -14,7 +14,9 @@
 //! boundary an in-guest root flush cannot bypass — is tier-3 and is asserted by
 //! `cargo test --test live_egress` (#29); it is not exercised here.
 
-pub use sandy_api::egress::{AllowList, EgressApplier, EgressError, EgressOs, EgressOutcome, EgressPlan, EgressRule};
+pub use sandy_api::egress::{
+    AllowList, EgressApplier, EgressError, EgressOs, EgressOutcome, EgressPlan, EgressRule, NetworkMode,
+};
 
 use crate::{backend::PlanError, error::CoreError};
 
@@ -288,6 +290,35 @@ pub fn validate_proxy_egress(os: EgressOs, tap: Option<&str>) -> Result<(), Plan
     }
 }
 
+/// Validate the guest network profile against the tap and the proxy at plan time (#602).
+///
+/// On Linux a `nic` guest is filtered only by the guest-scoped nftables forward ruleset, which needs a bound tap, so
+/// `nic` without a tap would boot a NIC with no boundary, and a tap without `nic` would be a silent NIC. The proxy
+/// guest has no NIC, so `nic` and the proxy never share a run. On macOS `nic` is the trusted-only NAT NIC (#603) and
+/// there is no tap. Refusing here makes each a band-2 invalid plan: no journal record, no boot.
+///
+/// # Errors
+///
+/// Returns [`PlanError::Invalid`] naming the conflicting settings.
+pub fn validate_network_mode(os: EgressOs, mode: NetworkMode, tap: Option<&str>, proxy: bool) -> Result<(), PlanError> {
+    let nic = mode == NetworkMode::Nic;
+    match (os, nic, tap, proxy) {
+        (_, true, _, true) => Err(PlanError::Invalid(
+            "SANDY_NETWORK=nic and SANDY_EGRESS=proxy are exclusive: the proxy guest has no NIC".to_string(),
+        )),
+        (EgressOs::Linux, true, None, _) => Err(PlanError::Invalid(
+            "SANDY_NETWORK=nic needs a bound tap (SANDY_TAP) with the host egress boundary; a NIC with no boundary is \
+             refused"
+                .to_string(),
+        )),
+        (EgressOs::Linux, false, Some(tap), _) => Err(PlanError::Invalid(format!(
+            "SANDY_TAP={tap} binds a guest NIC, which needs SANDY_NETWORK=nic; unset SANDY_TAP, or set \
+             SANDY_NETWORK=nic"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Whether `host` is a bare IPv4 address or `IPv4/prefix` CIDR (0-32).
 fn is_ipv4_or_cidr(host: &str) -> bool {
     match host.split_once('/') {
@@ -377,8 +408,9 @@ mod tests {
     use sandy_test_support::FakeApplier;
 
     use super::{
-        AllowList, EgressOs, EgressOutcome, EgressPlan, EgressRule, enforce, macos_egress_statement, plan_egress,
-        plan_egress_scoped, to_nftables, to_nftables_forward, validate_egress_hosts, validate_proxy_egress,
+        AllowList, EgressOs, EgressOutcome, EgressPlan, EgressRule, NetworkMode, enforce, macos_egress_statement,
+        plan_egress, plan_egress_scoped, to_nftables, to_nftables_forward, validate_egress_hosts,
+        validate_network_mode, validate_proxy_egress,
     };
     use crate::backend::PlanError;
 
@@ -839,6 +871,69 @@ mod tests {
         };
         assert!(msg.contains("SANDY_EGRESS=proxy"), "{msg}");
         assert!(msg.contains("SANDY_TAP=sandytap0"), "{msg}");
+    }
+
+    /// #602: the profile, tap and proxy must agree, or the plan is invalid before any boot.
+    #[test]
+    fn network_mode_must_agree_with_the_tap_and_the_proxy() {
+        use NetworkMode::{Nic, None as NoNic};
+        let linux = EgressOs::Linux;
+        assert!(validate_network_mode(linux, NoNic, None, false).is_ok());
+        assert!(validate_network_mode(linux, NoNic, None, true).is_ok());
+        assert!(validate_network_mode(linux, Nic, Some("sandytap0"), false).is_ok());
+        for (mode, tap, proxy, needle) in [
+            (Nic, None, false, "needs a bound tap"),
+            (NoNic, Some("sandytap0"), false, "needs SANDY_NETWORK=nic"),
+            (Nic, Some("sandytap0"), true, "exclusive"),
+            (Nic, None, true, "exclusive"),
+        ] {
+            let Err(PlanError::Invalid(msg)) = validate_network_mode(linux, mode, tap, proxy) else {
+                panic!("{mode:?} tap={tap:?} proxy={proxy} must be refused");
+            };
+            assert!(msg.contains(needle), "{msg}");
+        }
+        // macOS has no tap: `nic` is the trusted-only NAT NIC, but still never beside the proxy.
+        assert!(validate_network_mode(EgressOs::MacOs, Nic, None, false).is_ok());
+        assert!(validate_network_mode(EgressOs::MacOs, Nic, None, true).is_err());
+    }
+
+    /// #602 (NN5): the guest-scoped ruleset accepts only IPv4 TCP to allow-listed addresses and drops the rest of the
+    /// guest's traffic, so IPv6 and UDP get no accept rule.
+    #[test]
+    fn the_forward_ruleset_accepts_only_allow_listed_ipv4_tcp() {
+        let allow = AllowList {
+            rules: vec![EgressRule {
+                host: "10.1.2.3".to_string(),
+                port: 443,
+            }],
+        };
+        let ruleset = to_nftables_forward(&allow, "sandytap0");
+        let (forward, input) = ruleset
+            .split_once("chain input")
+            .expect("a forward chain and an input chain");
+        for line in forward
+            .lines()
+            .filter(|l| l.contains("accept") && l.contains("iifname"))
+        {
+            assert!(
+                line.contains("ct state established,related")
+                    || (line.contains("ip daddr") && line.contains("tcp dport")),
+                "unexpected forward accept: {line}"
+            );
+        }
+        assert!(!forward.contains("udp") && !forward.contains("ip6"), "{forward}");
+        assert!(forward.contains("iifname \"sandytap0\" drop"), "{forward}");
+        // Host-destined traffic (#376): only the guest's DHCP request is accepted, then everything else drops.
+        let guest_accepts: Vec<&str> = input
+            .lines()
+            .filter(|l| l.contains("iifname") && l.contains("accept"))
+            .collect();
+        assert_eq!(
+            guest_accepts,
+            ["\t\tiifname \"sandytap0\" udp dport 67 accept"],
+            "{input}"
+        );
+        assert!(input.contains("iifname \"sandytap0\" drop"), "{input}");
     }
 
     #[test]

@@ -30,8 +30,9 @@ pub enum NetworkMode {
     /// No NIC: the guest reaches the host only over virtio-fs and vsock (#360). The default.
     #[default]
     None,
-    /// A NIC, for environments that need a routable guest. Requires an egress policy
-    /// ([`crate::backend::RunSpec::egress`]); egress still goes through the vsock proxy.
+    /// A NIC, for sandboxes that need a routable guest. On Linux it needs a bound tap, and the caller applies the
+    /// nftables boundary on it; it never shares a run with the egress proxy. On macOS it is the trusted-only NAT
+    /// NIC with no boundary (#603).
     Nic,
 }
 

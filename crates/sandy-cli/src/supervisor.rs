@@ -29,7 +29,7 @@ use sandy::{
     JobRecord, JobState, Journal, Lease, MAX_TTL_SECS, Outcome, OutputStatus, PlanError, ProcessExit, Profile,
     ResultEnvelope, Scope, SecretSource, Status, VmBackend, classify_backend_error, classify_invalid_plan,
     classify_outcome, enforce, mint_lease, mint_lease_checked, new_job_id, plan_egress_scoped, reconcile_job,
-    validate_egress_hosts, validate_no_secret_leak, validate_proxy_egress,
+    validate_egress_hosts, validate_network_mode, validate_no_secret_leak, validate_proxy_egress,
 };
 use zeroize::Zeroizing;
 
@@ -130,10 +130,11 @@ pub fn run_job<B: VmBackend + ?Sized, E: EgressApplier + ?Sized>(
 /// resolves names host-side, so it refuses a guest NIC on Linux instead.
 fn validate_run_egress(plan: &JobPlan, egress_os: EgressOs, tap: Option<&str>) -> Result<(), PlanError> {
     if plan.egress_proxy {
-        validate_proxy_egress(egress_os, tap)
+        validate_proxy_egress(egress_os, tap)?;
     } else {
-        validate_egress_hosts(&plan.allow, egress_os)
+        validate_egress_hosts(&plan.allow, egress_os)?;
     }
+    validate_network_mode(egress_os, plan.network, tap, plan.egress_proxy)
 }
 
 /// The receipt's egress outcome for a proxy-mode run, read from what the backend did.
@@ -180,7 +181,8 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
     //    can't resolve names through the boundary anyway, so it is refused here rather than loaded as a rule that never
     //    matches. macOS enforces no boundary, so a hostname entry there stays accepted. A proxy-mode run
     //    (`SANDY_EGRESS=proxy`, #360) swaps that check: the proxy resolves names host-side, so hostnames are valid, and
-    //    what is refused instead is a guest NIC (`$SANDY_TAP`) on Linux.
+    //    what is refused instead is a guest NIC (`$SANDY_TAP`) on Linux. The guest network profile must agree with the
+    //    tap and the proxy (#602).
     if let Err(plan_error) = validate_no_secret_leak(&spec).and_then(|()| validate_run_egress(plan, egress_os, tap)) {
         let classification = classify_invalid_plan(&plan_error);
         let envelope = build_envelope(
@@ -251,7 +253,7 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
             let warning = if plan.egress_proxy {
                 None
             } else {
-                no_network_allow_warning(&plan.allow, backend.kind(), egress_os, tap)
+                no_network_allow_warning(&plan.allow, backend.kind(), egress_os, tap, plan.network)
             };
             (outcome, warning)
         }
@@ -955,8 +957,11 @@ mod tests {
         );
         // A bound tap on Linux selects an enforced guest-scoped forward ruleset, so the
         // boot is bracketed by the injected egress applier (apply then revert).
-        let report =
-            super::run_with_profile(&profile, &journal, &booting_plan(), Some("tap0")).context("run_with_profile")?;
+        let plan = JobPlan {
+            network: sandy::NetworkMode::Nic,
+            ..booting_plan()
+        };
+        let report = super::run_with_profile(&profile, &journal, &plan, Some("tap0")).context("run_with_profile")?;
         assert_eq!(
             report.process_exit.code(),
             ProcessExit::Succeeded.code(),
@@ -987,6 +992,7 @@ mod tests {
         JobPlan {
             digests: false,
             egress_proxy: false,
+            network: sandy::NetworkMode::None,
             template: "demo".to_string(),
             command: vec![],
             inputs: vec![],
@@ -1015,6 +1021,7 @@ mod tests {
         JobPlan {
             digests: false,
             egress_proxy: false,
+            network: sandy::NetworkMode::None,
             template: "demo".to_string(),
             command: vec![],
             inputs: vec![],

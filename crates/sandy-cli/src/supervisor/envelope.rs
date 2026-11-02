@@ -7,7 +7,8 @@ use std::time::SystemTime;
 
 use sandy::{
     AllowList, AuditReceipt, Classification, EgressEnforcement, EgressOs, EgressOutcome, EgressReceipt, HostObserved,
-    Location, Logs, OutputRef, Provenance, RESULT_SCHEMA_VERSION, ResultEnvelope, SandboxKind, Timing, What, Who,
+    Location, Logs, NetworkMode, OutputRef, Provenance, RESULT_SCHEMA_VERSION, ResultEnvelope, SandboxKind, Timing,
+    What, Who,
 };
 use zeroize::Zeroizing;
 
@@ -200,6 +201,7 @@ pub(super) fn no_network_allow_warning(
     backend_kind: SandboxKind,
     egress_os: EgressOs,
     tap: Option<&str>,
+    network: NetworkMode,
 ) -> Option<String> {
     if allow.rules.is_empty() {
         return None;
@@ -208,6 +210,12 @@ pub(super) fn no_network_allow_warning(
         SandboxKind::Process => Some(
             "egress unavailable: the process backend shares the host network with no isolation boundary, so --allow \
              entries have no effect"
+                .to_string(),
+        ),
+        // A macOS `nic` guest has a NAT NIC and no boundary (#603): the entries are not inert, they are unenforced.
+        SandboxKind::Vm if matches!(egress_os, EgressOs::MacOs) && network == NetworkMode::Nic => Some(
+            "egress unenforced: the guest has a NAT NIC and macOS has no per-VM boundary, so --allow entries are not \
+             enforced (see #603)"
                 .to_string(),
         ),
         SandboxKind::Vm if matches!(egress_os, EgressOs::MacOs) || tap.is_none() => Some(
@@ -220,9 +228,27 @@ pub(super) fn no_network_allow_warning(
 
 #[cfg(test)]
 mod tests {
+    use sandy::{AllowList, EgressOs, EgressRule, NetworkMode, SandboxKind};
     use zeroize::Zeroizing;
 
-    use super::{redact_console, redact_with_refreshes};
+    use super::{no_network_allow_warning, redact_console, redact_with_refreshes};
+
+    /// #602: a macOS `nic` guest has a NAT NIC, so `--allow` is unenforced, not "no network device".
+    #[test]
+    fn a_macos_nic_guest_is_not_reported_as_having_no_network_device() {
+        let allow = AllowList {
+            rules: vec![EgressRule {
+                host: "10.0.0.1".to_string(),
+                port: 443,
+            }],
+        };
+        let warn = |mode, os, tap| no_network_allow_warning(&allow, SandboxKind::Vm, os, tap, mode);
+        let none = warn(NetworkMode::None, EgressOs::MacOs, None).unwrap_or_default();
+        assert!(none.contains("no network device"), "{none}");
+        let nic = warn(NetworkMode::Nic, EgressOs::MacOs, None).unwrap_or_default();
+        assert!(nic.contains("NAT NIC") && !nic.contains("no network device"), "{nic}");
+        assert_eq!(warn(NetworkMode::Nic, EgressOs::Linux, Some("sandytap0")), None);
+    }
 
     // --- console redaction (M-6) -------------------------------------------------
 

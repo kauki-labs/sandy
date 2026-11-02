@@ -381,19 +381,30 @@ runs, which is stated, not silent.
 
 ## 7. Opt-in NIC profile (#602)
 
-The default guest has no NIC. A harness environment that needs a routable guest sets `SANDY_NETWORK=nic`
-(`NetworkMode::Nic`, an unknown value is refused).
+The default guest has no NIC. A sandbox that needs a routable guest sets `SANDY_NETWORK=nic` (`NetworkMode::Nic`);
+an unknown or non-UTF-8 value is refused. Sandboxes that do not set it are unchanged.
 
-- **qemu:** a user-mode NIC with `restrict=on,ipv6=off`, so the guest cannot reach the host network through qemu. It
-  requires an egress policy, so the vsock proxy stays the allow-list. A `nic` run without a policy is refused before
-  boot, and so is `nic` with `SANDY_TAP` bound. There is no `hostfwd`, so the host cannot reach a guest port yet: a
-  harness needs that path (a forward or the #590 bridge) before NN1 can pass on qemu.
-- **vfkit:** `virtio-net,nat`, with **no egress boundary**. macOS has no nftables, and a guest-side filter does not
-  survive a guest with root. It is trusted-only: a policy beside it is refused, because it would read as filtered.
-  Enforcement is tracked in #603.
-- The `tap` NIC path (#29) stays as it is: `SANDY_TAP` alone still emits it, and it stays exclusive with an egress
-  policy. #407 amends its acceptance to "the default argv has no `-netdev`".
-- Tailnet reachability of the guest's T3 port is the host's job (`tailscale serve`), not sandy's.
+- **qemu (Linux):** `nic` is the existing tap + nftables path (#29): the operator binds a tap (`SANDY_TAP`), the guest
+  NIC attaches to it, and `sandy run` applies the guest-scoped forward ruleset around the boot. The proxy is not
+  involved: a `nic` guest and the proxy guest are exclusive. The user-mode NIC was tried and dropped: with
+  `restrict=on` it has no path in either direction, so it only added a dead interface.
+- **Plan-time refusals (band 2, no journal record, no boot):** `nic` without a tap, a tap without `nic`, and `nic`
+  with `SANDY_EGRESS=proxy` (`validate_network_mode`). A boundary-less NIC is therefore never booted by `sandy run`.
+- **Backend refusals (defense in depth):** `qemu_args` refuses the same three combinations, so a caller that skips the
+  plan check still cannot boot an unfiltered NIC.
+- **Dispatched VMs never get a NIC:** `sandy-host-executor` and sandyd dispatch apply no nftables ruleset, so the
+  host-executor refuses a VM dispatch while `SANDY_NETWORK` is set to anything but `none`. A tap alone is refused by
+  the backend.
+- **vfkit (macOS):** `nic` adds `virtio-net,nat` with **no egress boundary**. macOS has no nftables, and a guest-side
+  filter does not survive a guest with root. It is trusted-only: a policy beside it is refused, because it would read
+  as filtered. Enforcement is tracked in #603.
+- **Limits of the nftables path:** the boundary matches IPv4 addresses and CIDRs and passes TCP only (#359), so a
+  `nic` guest cannot allow-list a provider by hostname and has no DNS until #377. The forward chain drops everything
+  not allow-listed (IPv6 and UDP included), and the input chain accepts only the guest's DHCP request (#376).
+- **No host path into the guest yet:** the tap is the host's to configure. Tailnet reachability of the guest's T3
+  port is the host's job (`tailscale serve`), not sandy's.
+- The `SANDY_NETWORK` env var is the per-run switch for `sandy run`, one process per run. A per-run `RunSpec` field is
+  tracked in #603.
 
 ## Adversarial pass
 
