@@ -187,17 +187,23 @@ pub fn macos_egress_statement() -> &'static str {
 const EGRESS_TABLE: &str = "sandy_egress";
 
 /// The table a guest-scoped forward ruleset for `iface` loads into (#602). One table per tap, so a run that reverts
-/// its own boundary never deletes the table of another concurrent `nic` run. Characters nft does not take in a table
-/// name (`-`, `.`) become `_`. An `iface` that is not a bare token falls back to [`EGRESS_TABLE`]; the plan-time tap
-/// check refuses such a name before any run reaches here.
+/// its own boundary never deletes the table of another concurrent `nic` run. The suffix encoding is injective, so two
+/// different taps never share a table: `_` becomes `__`, `-` becomes `_h` and `.` becomes `_d`. An `iface` that is
+/// not a bare token falls back to [`EGRESS_TABLE`]; the plan-time tap check refuses such a name before any run
+/// reaches here.
 fn forward_table_name(iface: &str) -> String {
     if !is_emittable_host(iface) {
         return EGRESS_TABLE.to_string();
     }
-    let suffix: String = iface
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
+    let mut suffix = String::with_capacity(iface.len());
+    for c in iface.chars() {
+        match c {
+            '_' => suffix.push_str("__"),
+            '-' => suffix.push_str("_h"),
+            '.' => suffix.push_str("_d"),
+            other => suffix.push(other),
+        }
+    }
     format!("{EGRESS_TABLE}_{suffix}")
 }
 
@@ -451,8 +457,8 @@ mod tests {
     use sandy_test_support::FakeApplier;
 
     use super::{
-        AllowList, EgressOs, EgressOutcome, EgressPlan, EgressRule, NetworkMode, enforce, is_valid_tap_name,
-        macos_egress_statement, plan_egress, plan_egress_scoped, to_nftables, to_nftables_forward,
+        AllowList, EgressOs, EgressOutcome, EgressPlan, EgressRule, NetworkMode, enforce, forward_table_name,
+        is_valid_tap_name, macos_egress_statement, plan_egress, plan_egress_scoped, to_nftables, to_nftables_forward,
         validate_egress_hosts, validate_network_mode, validate_proxy_egress,
     };
     use crate::backend::PlanError;
@@ -969,7 +975,13 @@ mod tests {
         let second = to_nftables_forward(&allow, "sandytap1");
         assert!(first.starts_with("table inet sandy_egress_sandytap0 {"), "{first}");
         assert!(second.starts_with("table inet sandy_egress_sandytap1 {"), "{second}");
-        assert!(to_nftables_forward(&allow, "tap-1.x").starts_with("table inet sandy_egress_tap_1_x {"));
+        assert!(to_nftables_forward(&allow, "tap-1.x").starts_with("table inet sandy_egress_tap_h1_dx {"));
+        // Distinct taps never share a table, even when they differ only in `_`, `-` or `.`.
+        let tables: std::collections::HashSet<String> = ["tap-1", "tap_1", "tap.1", "tap1", "tap__1", "tap_h1"]
+            .iter()
+            .map(|tap| forward_table_name(tap))
+            .collect();
+        assert_eq!(tables.len(), 6, "{tables:?}");
     }
 
     /// #602 (NN5): the guest-scoped ruleset accepts only IPv4 TCP to allow-listed addresses and drops the rest of the
