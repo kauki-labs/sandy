@@ -119,8 +119,10 @@ remote_cmd() {
   if [ "$build_all" -eq 1 ]; then
     echo "nix --extra-experimental-features 'nix-command flakes' flake check -L \"$flake_ref\""
   else
-    local attr_args
-    attr_args=$(printf '%s\n' "$attr_list" | sed "s|^|\"$flake_ref#|; s|\$|\"|" | paste -sd' ' -)
+    # `&` in a sed replacement means "the match", so escape it or the `&rev=` pin is dropped.
+    local attr_args sed_ref
+    sed_ref=$(printf '%s' "$flake_ref" | sed 's/&/\\&/g')
+    attr_args=$(printf '%s\n' "$attr_list" | sed "s|^|\"$sed_ref#|; s|\$|\"|" | paste -sd' ' -)
     echo "nix --extra-experimental-features 'nix-command flakes' build -L --no-link $attr_args"
   fi
   if [ "$run_package" -eq 1 ]; then
