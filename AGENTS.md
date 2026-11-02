@@ -76,6 +76,10 @@ version, metadata, dependency versions, and lints through the root `Cargo.toml`
   running a real `sandyd` + `sandy-host-executor` pair across two machines by
   hand, see `docs/design/host-executor/spec.md`'s manual cross-machine smoke
   test (mesh env vars, and why `SANDY_AGENT_PATH` must be a Nix store path).
+- **`sandy-mcp`** — the agent-facing MCP stdio server over the sandyd broker API (#585): job
+  and environment tools, one API request per tool call, no state and no dispatch logic. It never
+  depends on `sandy-control-proto` (a test enforces it). Contract: `docs/api/broker.openapi.yaml`.
+  See `docs/decisions/sandyd.md` decision 25.
 - **`sandy-egress-proxy`** — the per-run host egress proxy for NIC-less guests
   (#401, epic #360): a pure CONNECT-parse / allow-list / address-filter core and an
   unprivileged binary. `QemuBackend` (#404) and `VfkitBackend` (#405) run one per launch, not yet live-verified. See
@@ -190,6 +194,7 @@ crates/
   ├─ sandy-orchestrator/  - sandyd's dispatch core: job manifest, submitter-bounded capability derivation
   ├─ sandyd/              - the control-plane daemon dispatching jobs into the agent fabric (epic #205)
   ├─ sandy-host-executor/ - the M2 remote executor (#269): declares capabilities, runs dispatched jobs, relays the agent link
+  ├─ sandy-mcp/           - MCP stdio server over the broker API: job + environment tools (#585)
   ├─ sandy-egress-proxy/  - per-run host egress proxy: CONNECT parse, allow-list match, address filter (#401)
   └─ sandy-cli/           - the `sandy` binary (doctor, run/ls/status/wait/kill/gc, cred github …)
 impls/

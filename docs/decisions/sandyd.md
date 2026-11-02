@@ -2012,3 +2012,30 @@ fingerprints. `nix/modules/sandyd.nix` (the templated unit) is not part of this 
 
 **Alternative set aside.** A startup check that the daemon's uid equals an "expected submitter" uid: circular
 under one sandyd per user.
+
+## 25. `sandy-mcp` also drives environments; it calls the API tier and holds no state (#585)
+
+**Status:** proposed. Owner decisions pending on #585 open points 3 to 5.
+
+**Context.** Decision 7 puts MCP over the API tier. The T3 broker (epic #597) adds a second caller of
+that tier: an orchestrator agent that hands a task to a fresh sandbox. An agent acts only through tools,
+so the environment operations need an MCP surface beside the job operations.
+
+**Decision.**
+
+- `sandy-mcp` serves job tools (`submit`, `status`, `cancel`, `list`, `attach`) and environment tools
+  (`spawn_environment`, `get_environment`, `link_environment`, `cancel_environment`,
+  `delete_environment`, `stop_environment`, `resume_environment`, `list_environments`).
+- One tool call makes one API request. The server holds no state and has no dispatch logic.
+- The contract is `docs/api/broker.openapi.yaml`. `sandy-mcp` does not depend on
+  `sandy-control-proto`. A test reads `Cargo.lock` and fails if the crate reaches it.
+- No tool argument or result carries a secret. The server refuses secret-named fields and
+  token-shaped values in arguments, and withholds a result that holds one. The job attach token and the
+  pairing code stay in the API tier. The API credential comes from a file path, not from argv or env.
+
+**Consequence.** The API tier (#591) must serve the job operations too. `link_environment` returns
+`unsupported` until T3 offers an external link interface. The tools pass typed API errors through
+unchanged, so idempotency, quota and lifetime rules live in one place.
+
+**Alternative set aside.** MCP tools that hold a pairing code or an attach token for the caller: they
+put a bearer secret into the agent's context.
