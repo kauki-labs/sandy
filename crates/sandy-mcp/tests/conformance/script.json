@@ -1,17 +1,23 @@
 {
   "name": "primary-t3 stand-in",
-  "description": "One fixed script run against any sandy-mcp: the fake broker (tier-2) and, later, a real broker (tier-3). Pointers are RFC 6901. A string value `$name` is a captured value.",
+  "description": "One fixed script run against any sandy-mcp: the fake broker (tier-2) and, later, a real broker (tier-3). Pointers are RFC 6901. A string equal to `$name` is a captured value or a fixture. A target overrides `fixtures` (manifest, encoding, profiles) and reads no broker-internal state. `cleanup` steps run after any failure, best effort.",
+  "fixtures": {
+    "manifest": "AA==",
+    "manifest_encoding": "conformance.v1",
+    "profile": "harness",
+    "other_profile": "other"
+  },
   "steps": [
     { "tool": "list", "args": {}, "expect": { "present": ["/jobs"] } },
     {
       "tool": "submit",
       "args": {
-        "manifest": "AA==",
-        "manifest_encoding": "conformance.v1",
+        "manifest": "$manifest",
+        "manifest_encoding": "$manifest_encoding",
         "required_isolation_class": "untrusted"
       },
       "capture": { "job": "/job_id" },
-      "expect": { "equals": { "/state": "pending" } }
+      "expect": { "in": { "/state": ["pending", "running"] } }
     },
     {
       "tool": "status",
@@ -26,26 +32,26 @@
     {
       "tool": "cancel",
       "args": { "job_id": "$job" },
-      "expect": { "equals": { "/state": "cancelled" } }
+      "expect": { "in": { "/state": ["cancelled", "cancelling"] } }
     },
 
     {
       "tool": "spawn_environment",
       "args": {
         "request_id": "conf-1",
-        "profile": "harness",
+        "profile": "$profile",
         "lifetime": { "kind": "ephemeral", "ttl_secs": 600 },
         "task_ref": "conf"
       },
       "capture": { "env": "/environment_id" },
-      "expect": { "equals": { "/state": "provisioning" } }
+      "expect": { "in": { "/state": ["provisioning", "ready"] } }
     },
     {
       "note": "O1: a retry with the same request_id and payload returns the same environment",
       "tool": "spawn_environment",
       "args": {
         "request_id": "conf-1",
-        "profile": "harness",
+        "profile": "$profile",
         "lifetime": { "kind": "ephemeral", "ttl_secs": 600 },
         "task_ref": "conf"
       },
@@ -56,18 +62,20 @@
       "tool": "spawn_environment",
       "args": {
         "request_id": "conf-1",
-        "profile": "other",
-        "lifetime": { "kind": "ephemeral", "ttl_secs": 600 }
+        "profile": "$profile",
+        "lifetime": { "kind": "ephemeral", "ttl_secs": 600 },
+        "task_ref": "a-different-task"
       },
       "expect": { "ok": false, "code": "request_id_conflict" }
     },
     {
-      "note": "O3: no connection before Ready",
+      "note": "O3: a connection appears only when the state is ready",
       "tool": "get_environment",
       "args": { "environment_id": "$env" },
       "expect": {
-        "equals": { "/state": "provisioning" },
-        "absent": ["/connection"]
+        "absent_unless": [
+          { "pointer": "/connection", "when": { "/state": "ready" } }
+        ]
       }
     },
     {
@@ -75,7 +83,8 @@
       "tool": "get_environment",
       "args": { "environment_id": "$env" },
       "until": { "/state": "ready" },
-      "max_polls": 10,
+      "timeout_ms": 20000,
+      "poll_interval_ms": 50,
       "expect": { "present": ["/connection/url"] }
     },
     {
@@ -101,5 +110,9 @@
       "args": { "environment_id": "$env" },
       "expect": { "equals": { "/state": "deleted" } }
     }
+  ],
+  "cleanup": [
+    { "tool": "cancel", "args": { "job_id": "$job" } },
+    { "tool": "delete_environment", "args": { "environment_id": "$env" } }
   ]
 }

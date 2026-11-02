@@ -617,7 +617,7 @@ owner.
 - No tool argument or result carries a secret. A guard refuses secret-named fields and token-shaped values in arguments and withholds a result or error that holds one. Invariant: O8 of #585.
 - The client accepts a loopback `http` broker URL only, since it has no TLS backend.
 
-**KPI:** rows KMCP1 to KMCP7 in [`kpi.md`](kpi.md).
+**KPI:** rows KMCP1 to KMCP8 in [`kpi.md`](kpi.md).
 
 ## Testing: integration vs end-to-end
 

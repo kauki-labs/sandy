@@ -46,12 +46,14 @@ impl Default for Broker {
 }
 
 impl Broker {
-    /// Environments and jobs not yet in a terminal state.
+    /// Environments and jobs the fake's own state table lists as non-terminal.
+    /// This reads the fake's internals, so it is tier-2 only: a live target must
+    /// check `sandy ls`, VM processes and credential leases instead.
     pub fn leftovers(&self) -> usize {
         let envs = self
             .states
             .values()
-            .filter(|s| !matches!(s.as_str(), "deleted" | "failed"))
+            .filter(|s| matches!(s.as_str(), "provisioning" | "ready" | "stopped"))
             .count();
         let jobs = self
             .jobs
