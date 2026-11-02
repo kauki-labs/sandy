@@ -30,6 +30,7 @@ use sandy::{
 };
 use sandy_api::{
     agent::{AGENT_VSOCK_PORT, AgentLaunch},
+    egress::{NETWORK_ENV, NetworkMode},
     share::{GuestShareTransport, ShareSpec},
 };
 use uuid::Uuid;
@@ -68,6 +69,9 @@ pub struct StagedArgs {
     /// Egress-proxy mode (#405): the host unix socket vfkit dials for each guest
     /// connection to the fixed egress vsock port. The proxy listens there.
     pub egress_socket: Option<PathBuf>,
+    /// The guest network profile (#602). [`NetworkMode::Nic`] adds a NAT `virtio-net` with no egress
+    /// boundary, and is refused beside an egress policy; the default emits none.
+    pub network: NetworkMode,
 }
 
 impl StagedArgs {
@@ -78,6 +82,7 @@ impl StagedArgs {
             shares,
             agent_vsock: None,
             egress_socket: None,
+            network: NetworkMode::None,
         }
     }
 }
@@ -106,7 +111,8 @@ impl StagedArgs {
 /// - `--device virtio-vsock,…` when [`Topology::vsock_cid`] is `Some` (absent in the aarch64 fixture).
 /// - proxy mode ([`StagedArgs::egress_socket`], #405): `--device virtio-vsock,port=5001,socketURL=<socket>,listen`, so
 ///   vfkit dials the proxy's unix socket for each guest-initiated connection. It coexists with the agent link's
-///   `connect` device on port 5000. No `virtio-net` is emitted in either mode: the guest has no NIC.
+///   `connect` device on port 5000. No `virtio-net` is emitted in either mode: the guest has no NIC unless
+///   [`StagedArgs::network`] is `nic` (#602).
 ///
 /// # Errors
 ///
@@ -188,7 +194,28 @@ pub fn vfkit_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> R
         ));
     }
 
+    // vfkit has no per-VM egress boundary (no nftables on macOS), so a NAT NIC is trusted-only (#602). A
+    // policy beside it would read as filtered while permitting all, so the pair is refused.
+    if staged.network == NetworkMode::Nic {
+        if spec.egress.is_some() {
+            return Err(BackendError::Spawn(
+                "network = nic on vfkit has no egress boundary, so it cannot carry an egress policy; refusing the run \
+                 rather than booting a NIC that looks filtered"
+                    .to_string(),
+            ));
+        }
+        tracing::warn!("network = nic on vfkit: the guest has direct NAT egress and no egress boundary");
+        args.push("--device".to_string());
+        args.push("virtio-net,nat".to_string());
+    }
+
     Ok(args)
+}
+
+/// The guest network profile from [`NETWORK_ENV`] (#602); unset means no NIC.
+fn network_from_env() -> Result<NetworkMode, BackendError> {
+    let value = std::env::var(NETWORK_ENV).unwrap_or_default();
+    NetworkMode::parse(&value).map_err(BackendError::Spawn)
 }
 
 /// The macOS vfkit [`VmBackend`].
@@ -273,6 +300,7 @@ impl VfkitBackend {
         }
         // Proxy mode: vfkit dials the proxy's unix socket for the egress port.
         staged.egress_socket = egress.and_then(EgressLaunch::unix_socket).map(Path::to_path_buf);
+        staged.network = network_from_env()?;
         let args = vfkit_args(topology, spec, &staged)?;
 
         // The proxy belongs to this attempt and starts before vfkit. `ProxyHandle` kills on
@@ -540,6 +568,33 @@ mod tests {
             agent: false,
             shares: true,
         }
+    }
+
+    /// #602: the default emits no NIC; `nic` adds an unenforced NAT `virtio-net` and is refused beside an egress policy.
+    #[test]
+    fn vfkit_args_gate_the_nic_on_network_mode() -> anyhow::Result<()> {
+        let topology = parse_topology(AARCH64_FIXTURE).context("parse aarch64 fixture")?;
+        let command = ["true".to_string()];
+        let grants = grants();
+        let allow = sandy_api::egress::AllowList::default();
+        let plain = vfkit_args(&topology, &spec_for("demo", &command, &grants), &StagedArgs::default())?;
+        anyhow::ensure!(!plain.iter().any(|a| a.contains("virtio-net")), "default: {plain:?}");
+        let nic = StagedArgs {
+            network: NetworkMode::Nic,
+            ..StagedArgs::default()
+        };
+        let args = vfkit_args(&topology, &spec_for("demo", &command, &grants), &nic)?;
+        anyhow::ensure!(has_token_run(&args, &["--device", "virtio-net,nat"]), "nic: {args:?}");
+        let spec = RunSpec {
+            egress: Some(&allow),
+            ..spec_for("demo", &command, &grants)
+        };
+        let refused = vfkit_args(&topology, &spec, &nic);
+        anyhow::ensure!(
+            matches!(&refused, Err(BackendError::Spawn(m)) if m.contains("no egress boundary")),
+            "policy + nic: {refused:?}"
+        );
+        Ok(())
     }
 
     /// A shared, reusable control handle for tests that don't exercise

@@ -237,6 +237,21 @@ over a fake broker. Tier-3 rows need a Linux/KVM host and a real boot.
 | KMCP6 | One request per tool     | Each of the 13 tools makes exactly one API request, follows no redirect and retries nothing.                                                             | `crates/sandy-mcp/tests/hardening.rs::every_tool_makes_exactly_one_api_request`, `::a_redirect_is_not_followed`                            | tier-2 green                                 |
 | KMCP7 | Layering                 | `sandy-mcp` never reaches `sandy-control-proto`.                                                                                                         | `crates/sandy-mcp/tests/layering.rs::sandy_mcp_does_not_depend_on_sandy_control_proto`                                                     | tier-2 green                                 |
 
+### Opt-in NIC profile (#602)
+
+`SANDY_NETWORK=nic` boots a guest with a NIC, for harness environments. The default stays NIC-less. Tier-2 argv tests
+(`qemu_args_gate_the_nic_on_network_mode`, `vfkit_args_gate_the_nic_on_network_mode`) pin the default and the refusals.
+No row below is live-proven yet. On vfkit a `nic` guest has no egress boundary (#603), so NN3 to NN6 apply to qemu only.
+
+| ID  | Check                    | Pass condition                                                                                                 | Test                                                             | Backend | Status                                                  |
+| --- | ------------------------ | -------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- | ------- | ------------------------------------------------------- |
+| NN1 | T3 port reachable        | With `network = nic`, the host reaches a port the guest listens on.                                            | live test, to write                                              | both    | not run                                                 |
+| NN2 | Allow-list               | A `nic` guest reaches an allow-listed host and nothing else.                                                   | live test, to write                                              | qemu    | not run                                                 |
+| NN3 | Host bypass              | A `nic` guest cannot reach the host's own services (#376).                                                     | live test, to write                                              | qemu    | not run                                                 |
+| NN4 | Cross-environment        | A `nic` guest cannot reach another environment's guest.                                                        | live test, to write                                              | qemu    | not run                                                 |
+| NN5 | Address filter, IPv6/UDP | An allow-listed name resolving to a private range is refused (#593), and IPv6 and UDP do not bypass it (#387). | live test, to write                                              | qemu    | not run                                                 |
+| NN6 | Applier failure          | `nic` without an egress policy, or an egress applier that fails to start, refuses the run as band 3, no boot.  | tier-2 argv test (policy refusal); live test for applier failure | both    | policy refusal green at tier-2; applier failure not run |
+
 ## Not yet a KPI
 
 Deferred capability with no live floor yet, so a reader does not mistake its

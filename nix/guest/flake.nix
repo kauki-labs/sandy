@@ -117,7 +117,10 @@
         system = "aarch64-linux";
         hypervisor = "vfkit";
         vmHostPackages = nixpkgs.legacyPackages.aarch64-darwin;
-        extraModules = [ credentialModule ];
+        extraModules = [
+          networkingModule
+          credentialModule
+        ];
       };
 
     in

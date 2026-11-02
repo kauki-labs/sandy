@@ -23,6 +23,38 @@ pub struct AllowList {
     pub rules: Vec<EgressRule>,
 }
 
+/// The guest network profile (#602): whether the guest boots with a NIC.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NetworkMode {
+    /// No NIC: the guest reaches the host only over virtio-fs and vsock (#360). The default.
+    #[default]
+    None,
+    /// A NIC, for environments that need a routable guest. Requires an egress policy
+    /// ([`crate::backend::RunSpec::egress`]); egress still goes through the vsock proxy.
+    Nic,
+}
+
+/// The environment variable that selects the guest network profile (#602), read by each VM backend
+/// like `$SANDY_TAP`. Unset or empty means [`NetworkMode::None`].
+pub const NETWORK_ENV: &str = "SANDY_NETWORK";
+
+impl NetworkMode {
+    /// Parse a [`NETWORK_ENV`] value. An unknown value is an error, so a typo can never fall back
+    /// silently to a different profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns the rejected value when it is neither `none` nor `nic`.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "" | "none" => Ok(Self::None),
+            "nic" => Ok(Self::Nic),
+            other => Err(format!("{NETWORK_ENV}={other:?} is not a network profile (none|nic)")),
+        }
+    }
+}
+
 /// The target OS an egress plan is computed for — injected so the core's
 /// `plan_egress` is a pure function unit-testable without a real host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,4 +140,19 @@ pub trait EgressApplier {
     /// # Errors
     /// Returns [`EgressError`] if the teardown fails.
     fn revert(&self) -> Result<(), EgressError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #602: the profile defaults to no NIC and a typo is refused, not defaulted.
+    #[test]
+    fn network_mode_parses_none_nic_and_refuses_a_typo() {
+        assert_eq!(NetworkMode::parse(""), Ok(NetworkMode::None));
+        assert_eq!(NetworkMode::parse("none"), Ok(NetworkMode::None));
+        assert_eq!(NetworkMode::parse("nic"), Ok(NetworkMode::Nic));
+        assert!(NetworkMode::parse("NIC").is_err());
+        assert_eq!(NetworkMode::default(), NetworkMode::None);
+    }
 }

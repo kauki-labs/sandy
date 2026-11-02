@@ -379,6 +379,19 @@ It gets no proxy.
 **Consequences.** The egress allow-list does not apply to process-backend
 runs, which is stated, not silent.
 
+## 7. Opt-in NIC profile (#602)
+
+The default guest has no NIC. A harness environment that needs a routable guest sets `SANDY_NETWORK=nic`
+(`NetworkMode::Nic`, an unknown value is refused).
+
+- **qemu:** a user-mode NIC with `restrict=on`, so the guest cannot reach the host network through qemu. It requires an
+  egress policy, so the vsock proxy stays the allow-list. A `nic` run without a policy is refused before boot.
+- **vfkit:** `virtio-net,nat`, with **no egress boundary**. macOS has no nftables, and a guest-side filter does not
+  survive a guest with root. It is trusted-only: a policy beside it is refused, because it would read as filtered.
+  Enforcement is tracked in #603.
+- The `tap` NIC path (#29) stays behind the profile. #407 amends its acceptance to "the default argv has no `-netdev`".
+- Tailnet reachability of the guest's T3 port is the host's job (`tailscale serve`), not sandy's.
+
 ## Adversarial pass
 
 Each attack assumes the #357 model: the job is root in the guest.

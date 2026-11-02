@@ -38,6 +38,7 @@ use sandy::{
 use sandy_api::agent::AGENT_VSOCK_PORT;
 use sandy_api::{
     agent::AgentLaunch,
+    egress::{NETWORK_ENV, NetworkMode},
     share::{GuestShareTransport, ShareSpec},
 };
 use uuid::Uuid;
@@ -98,6 +99,9 @@ pub struct StagedArgs {
     /// for the guest, so the host can connect to the guest agent and the proxy can
     /// serve it. Overrides [`Topology::vsock_cid`].
     pub agent_cid: Option<u32>,
+    /// The guest network profile (#602). [`NetworkMode::Nic`] needs an egress policy and emits a NIC
+    /// (the tap when bound, else restricted user-mode); the default emits none.
+    pub network: NetworkMode,
 }
 
 /// Assemble the `qemu-system-<arch>` command vector for `topology` + `spec`.
@@ -141,8 +145,14 @@ pub fn qemu_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> Re
 
     // Proxy mode (#404): the guest's only egress is its vsock to the host proxy, so it has no
     // NIC, and it needs a CID to be served on.
+    let nic = staged.network == NetworkMode::Nic;
+    if nic && spec.egress.is_none() {
+        return Err(BackendError::Spawn(
+            "network = nic needs an egress policy; refusing the run rather than booting an open NIC".to_string(),
+        ));
+    }
     if spec.egress.is_some() {
-        if staged.tap.is_some() {
+        if staged.tap.is_some() && !nic {
             return Err(BackendError::Spawn(format!(
                 "the egress proxy and ${TAP_ENV} are exclusive: the proxy guest has no NIC"
             )));
@@ -202,6 +212,13 @@ pub fn qemu_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> Re
     if let Some(tap) = &staged.tap {
         args.push("-netdev".to_string());
         args.push(format!("tap,id=net0,ifname={tap},script=no,downscript=no"));
+        args.push("-device".to_string());
+        args.push(format!("virtio-net-pci,netdev=net0,mac={GUEST_MAC}"));
+    } else if nic {
+        // `restrict=on`: the guest cannot reach the host network through the user-mode stack; the allow-list
+        // is enforced by the vsock proxy (#602).
+        args.push("-netdev".to_string());
+        args.push("user,id=net0,restrict=on".to_string());
         args.push("-device".to_string());
         args.push(format!("virtio-net-pci,netdev=net0,mac={GUEST_MAC}"));
     } else {
@@ -723,6 +740,8 @@ impl VmBackend for QemuBackend {
             // attaches to it. Unset → no NIC, the default isolated boot.
             tap: std::env::var(TAP_ENV).ok().filter(|t| !t.is_empty()),
             agent_cid: None,
+            network: NetworkMode::parse(&std::env::var(NETWORK_ENV).unwrap_or_default())
+                .map_err(BackendError::Spawn)?,
         };
 
         // Agent mode claims a CID by launching with it; a CID another VM holds fails
@@ -912,6 +931,7 @@ mod tests {
             kvm: true,
             tap: None,
             agent_cid: None,
+            network: NetworkMode::None,
         };
         let command = ["true".to_string()];
         let grants = Grants {
@@ -1130,6 +1150,42 @@ mod tests {
         assert!(!joined.contains("-netdev"), "{joined}");
         assert!(!joined.contains("virtio-net"), "{joined}");
         assert_nic_none(&args)?;
+        Ok(())
+    }
+
+    /// #602: the default emits no NIC; `nic` emits a restricted user-mode NIC and is refused without an egress policy.
+    #[test]
+    fn qemu_args_gate_the_nic_on_network_mode() -> anyhow::Result<()> {
+        let topology = parse_topology(X86_64_FIXTURE).context("parse x86_64 fixture")?;
+        let command = ["true".to_string()];
+        let plain = qemu_args(&topology, &demo_spec(&command), &StagedArgs::default())?;
+        anyhow::ensure!(!plain.join(" ").contains("virtio-net"), "default: {plain:?}");
+        assert_nic_none(&plain)?;
+        let nic = StagedArgs {
+            network: NetworkMode::Nic,
+            ..StagedArgs::default()
+        };
+        let refused = qemu_args(&topology, &demo_spec(&command), &nic);
+        anyhow::ensure!(
+            matches!(&refused, Err(BackendError::Spawn(m)) if m.contains("egress policy")),
+            "no policy: {refused:?}"
+        );
+        let allow = allow_all_github();
+        let spec = RunSpec {
+            egress: Some(&allow),
+            ..demo_spec(&command)
+        };
+        let args = qemu_args(&topology, &spec, &nic)?;
+        anyhow::ensure!(
+            args.windows(2)
+                .any(|w| w[0] == "-netdev" && w[1] == "user,id=net0,restrict=on"),
+            "nic: {args:?}"
+        );
+        anyhow::ensure!(args.join(" ").contains("virtio-net-pci"), "nic: {args:?}");
+        anyhow::ensure!(
+            !args.windows(2).any(|w| w[0] == "-nic"),
+            "no `-nic none` with a NIC: {args:?}"
+        );
         Ok(())
     }
 
