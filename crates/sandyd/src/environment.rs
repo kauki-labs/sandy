@@ -18,8 +18,8 @@ use prost::Message;
 use sandy_control_proto::{
     ControlRequest, ControlResponse, control_request, control_response,
     v1::{
-        EnvironmentError, EnvironmentErrorCode, EnvironmentFailure, EnvironmentLifetimeKind, EnvironmentResponse,
-        EnvironmentSpec, EnvironmentState as WireState, ListEnvironmentsResponse,
+        EnvironmentConnection, EnvironmentError, EnvironmentErrorCode, EnvironmentFailure, EnvironmentLifetimeKind,
+        EnvironmentResponse, EnvironmentSpec, EnvironmentState as WireState, ListEnvironmentsResponse,
     },
 };
 
@@ -225,8 +225,15 @@ fn to_wire(record: EnvironmentRecord) -> Result<EnvironmentResponse, Environment
             step: f.step,
             reason: f.reason,
         }),
-        // Set by the launch driver (slice C) once the environment is Ready.
-        connection: None,
+        // The launch driver records the endpoint when its probe passes. Shown
+        // only while Ready: any other state has no service to reach.
+        connection: record
+            .endpoint
+            .as_ref()
+            .filter(|_| record.state == EnvironmentState::Ready)
+            .map(|endpoint| EnvironmentConnection {
+                url: format!("http://{endpoint}"),
+            }),
         spec: Some(spec),
     })
 }
@@ -1034,6 +1041,50 @@ mod tests {
                 assert!(message.contains("malformed"), "{message}")
             }
             other => bail!("expected a refusal, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_ready_environment_reports_its_connection_and_no_other_state_does() -> Result<()> {
+        use sandy_control_proto::v1::EnvironmentConnection;
+        let s = store()?;
+        let env = create(&s, "k1", persistent()).await?;
+        // Still Provisioning: no endpoint, no connection.
+        match call(&s, get(&env.environment_id)).await? {
+            Ok(control_response::Result::Environment(got)) => assert_eq!(got.connection, None),
+            other => bail!("expected an environment, got {other:?}"),
+        }
+        s.mark_ready_with_endpoint(&env.environment_id, "127.0.0.1:41000")?;
+        match call(&s, get(&env.environment_id)).await? {
+            Ok(control_response::Result::Environment(got)) => assert_eq!(
+                got.connection,
+                Some(EnvironmentConnection {
+                    url: "http://127.0.0.1:41000".to_owned()
+                })
+            ),
+            other => bail!("expected an environment, got {other:?}"),
+        }
+        // A stopped environment shows no connection, even with an endpoint left on the row.
+        s.stop(&env.environment_id)?;
+        match call(&s, get(&env.environment_id)).await? {
+            Ok(control_response::Result::Environment(got)) => assert_eq!(got.connection, None),
+            other => bail!("expected an environment, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_ready_environment_with_no_recorded_endpoint_reports_no_connection() -> Result<()> {
+        let s = store()?;
+        let env = create(&s, "k1", persistent()).await?;
+        s.mark_ready(&env.environment_id)?;
+        match call(&s, get(&env.environment_id)).await? {
+            Ok(control_response::Result::Environment(got)) => {
+                assert_eq!(WireState::try_from(got.state)?, WireState::Ready);
+                assert_eq!(got.connection, None, "never a made-up address");
+            }
+            other => bail!("expected an environment, got {other:?}"),
         }
         Ok(())
     }

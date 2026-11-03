@@ -26,6 +26,7 @@ pub mod contract;
 pub mod cred;
 pub mod discovery;
 pub mod egress;
+pub mod environment;
 pub mod provision;
 pub mod result;
 pub mod seed;

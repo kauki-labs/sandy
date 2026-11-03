@@ -2125,3 +2125,53 @@ client is the API tier's rule (#585 AT-14); the row cap is the daemon's own boun
 
 **Alternative set aside.** A `code` field on `ControlError`: it would touch every job-handler literal for no gain to
 the job operations.
+
+## 28. A level-triggered launch driver converges boxes to environment rows; the backend seam is `EnvironmentBackend` (#587)
+
+**Status:** accepted (owner decisions on #587, 2026-11-03: a sibling trait beside `VmBackend`). **Upholds:** INV-6.
+
+**Context.** Decision 26 records environments and decision 27 puts them on the wire, but nothing turns `Provisioning`
+into a running VM or into `Ready`. `VmBackend::run` is run-to-completion, so a long-lived box needs its own seam.
+
+**Decision.**
+
+- `sandy_api::environment::EnvironmentBackend` has four methods: `launch` (returns once the hypervisor process runs,
+  idempotent per environment id), `probe` (`Starting`, `Ready{endpoint}`, `Failed{step, reason}` or `NotRunning`),
+  `kill` (idempotent) and `boxes`. A box is keyed by the environment id, never by an in-memory handle, so a restarted
+  daemon finds its boxes with `boxes()`. `stop` and `resume` are not in the seam: an ephemeral environment cannot be
+  stopped, and a real resume needs persistent guest state (#588). `FakeEnvironmentBackend` in `sandy-test-support`
+  stands in for tier-2.
+- `EnvironmentDriver` is a level-triggered loop, not a set of handler hooks. Each pass takes the backend's box list,
+  then reads every row, and fixes each difference. A `Provisioning` row launches a box unless one already runs, then
+  probes it: Ready marks the row `Ready` and records the endpoint in the same write; Failed records the step and reason
+  and kills the box; a probe that is not Ready after the provision timeout, counted from the moment a box first existed for this
+  attempt (`launched_at`, kept across passes and restarts, cleared by a resume), fails the row with step `provision`
+  and kills the box; a probe that cannot run is retried and fails the row only after twice the timeout. The probe comes first and the clock starts at the launch, so a long daemon downtime never fails a row that can still
+  become Ready. A `delete` that lands during the launch makes the Ready write refuse; the driver kills the box at once. A `Ready` row
+  whose box is gone is marked lost (`Failed`, step `reconcile`); one whose probe fails is marked lost with the probe's
+  own step. A `Stopped`, `Failed` or `Deleted` row keeps no box, and a box no row names is an orphan and is killed. The
+  same pass is the reconciler after a restart: nothing is held in memory. The box list is read before the rows, so a
+  box in the snapshot always has its row in the listing.
+- A store fault on one row, or a row with an unreadable state, is logged and skipped; the rest of the pass runs, and
+  an unreadable row's box is not killed as an orphan.
+- The endpoint a backend reports becomes `host:port` (brackets around IPv6) only if the host is an IP address or a
+  plain DNS name; anything else (a scheme, path, userinfo, space) fails the environment at step `probe`. The store gains
+  an `endpoint` column (migrated into an older table; two processes opening an old file at once are safe),
+  `mark_ready_with_endpoint` (one guarded `Provisioning` to `Ready` write) and `mark_lost` (`Provisioning` or `Ready` to
+  `Failed`). `mark_failed` stays `Provisioning` only. `GetEnvironment` reports `connection.url = http://<endpoint>` only
+  while `Ready` and only when an endpoint was recorded, never a made-up one.
+- `EnvironmentBackend::boxes` must list only environment boxes the backend launched: the driver kills any listed box no
+  row names, so listing a `VmBackend` job VM would kill it.
+
+**Consequences.**
+
+- A launch error fails the environment (step `launch`); there is no retry, so a transient backend fault costs one
+  environment. A probe that cannot run is logged and retried on the next pass.
+- Latency from `Provisioning` to `Ready` includes up to one pass interval after the probe passes.
+- A box that dies between two passes is seen at the next pass, not at once.
+- The driver is not started by `sandyd` yet: no real `EnvironmentBackend` exists until slice C3 (qemu and vfkit in
+  `impls/vm`), which also adds the wiring. Until then environments created over the RPC stay `Provisioning`.
+
+**Alternative set aside.** Starting a task from the create handler: it would lose the launch on a crash between the
+store write and the spawn, which the level-triggered pass makes impossible (a row with no box is launched on the next
+pass).
