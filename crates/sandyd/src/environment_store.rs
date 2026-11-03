@@ -28,7 +28,7 @@ use std::{
     time::Duration,
 };
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
 use crate::store::{StoreError, open_private_connection};
 
@@ -166,6 +166,74 @@ pub struct EnvironmentStore {
     max_rows: Option<usize>,
 }
 
+/// A raw `environments` row, read before its `state` string is validated.
+struct RawRow {
+    environment_id: String,
+    request_id: String,
+    state: String,
+    spec: Vec<u8>,
+    spec_encoding: String,
+    failure_step: Option<String>,
+    failure_reason: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+const COLUMNS: &str =
+    "environment_id, request_id, state, spec, spec_encoding, failure_step, failure_reason, created_at, updated_at";
+
+impl RawRow {
+    fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            environment_id: row.get(0)?,
+            request_id: row.get(1)?,
+            state: row.get(2)?,
+            spec: row.get(3)?,
+            spec_encoding: row.get(4)?,
+            failure_step: row.get(5)?,
+            failure_reason: row.get(6)?,
+            created_at: row.get(7)?,
+            updated_at: row.get(8)?,
+        })
+    }
+
+    fn into_record(self) -> Result<EnvironmentRecord, EnvironmentStoreError> {
+        let state = EnvironmentState::parse(&self.state).ok_or_else(|| EnvironmentStoreError::CorruptState {
+            environment_id: self.environment_id.clone(),
+            raw: self.state.clone(),
+        })?;
+        let failure = match (self.failure_step, self.failure_reason) {
+            (Some(step), Some(reason)) => Some(EnvironmentFailure { step, reason }),
+            _ => None,
+        };
+        Ok(EnvironmentRecord {
+            environment_id: self.environment_id,
+            request_id: self.request_id,
+            state,
+            spec: self.spec,
+            spec_encoding: self.spec_encoding,
+            failure,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        })
+    }
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as i64
+}
+
+/// The states `delete` applies from: every one but `Deleted`.
+const LIVE: [EnvironmentState; 4] = [
+    EnvironmentState::Provisioning,
+    EnvironmentState::Ready,
+    EnvironmentState::Stopped,
+    EnvironmentState::Failed,
+];
+
 impl EnvironmentStore {
     /// Open (creating if needed) the store at `path` with the same `0600`
     /// floor as the job store, then ensure its schema exists.
@@ -175,8 +243,7 @@ impl EnvironmentStore {
     /// tightened; [`EnvironmentStoreError::Sqlite`] if the schema cannot be
     /// created.
     pub fn open(path: &Path) -> Result<Self, EnvironmentStoreError> {
-        let _ = (path, open_private_connection);
-        unimplemented!("#587 slice A: red")
+        Self::from_connection(open_private_connection(path)?)
     }
 
     /// An in-memory store, for tests.
@@ -184,16 +251,44 @@ impl EnvironmentStore {
     /// # Errors
     /// [`EnvironmentStoreError::Sqlite`] if the schema cannot be created.
     pub fn open_in_memory() -> Result<Self, EnvironmentStoreError> {
-        let _ = (Duration::ZERO, &PoisonError::<()>::into_inner);
-        unimplemented!("#587 slice A: red")
+        Self::from_connection(Connection::open_in_memory()?)
+    }
+
+    fn from_connection(conn: Connection) -> Result<Self, EnvironmentStoreError> {
+        // Wait briefly instead of failing at once if another process holds the file.
+        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS environments (
+                environment_id  TEXT PRIMARY KEY,
+                request_id      TEXT NOT NULL UNIQUE,
+                state           TEXT NOT NULL,
+                spec            BLOB NOT NULL,
+                spec_encoding   TEXT NOT NULL,
+                failure_step    TEXT,
+                failure_reason  TEXT,
+                created_at      INTEGER NOT NULL,
+                updated_at      INTEGER NOT NULL
+            )",
+            (),
+        )?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+            max_rows: None,
+        })
     }
 
     /// Cap the table at `max_rows` rows in total (every state counts, since
-    /// deleted rows are kept for replay): once reached, `create` refuses.
+    /// deleted rows are kept for replay): once reached, `create` refuses a new
+    /// environment. A retry of a stored `request_id` needs no new row and is
+    /// never refused.
     #[must_use]
     pub fn with_max_rows(mut self, max_rows: Option<usize>) -> Self {
         self.max_rows = max_rows;
         self
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Create an environment for `request_id`, or return the one this
@@ -210,8 +305,52 @@ impl EnvironmentStore {
         spec: &[u8],
         spec_encoding: &str,
     ) -> Result<CreateOutcome, EnvironmentStoreError> {
-        let _ = (request_id, new_id, spec, spec_encoding, &self.conn, self.max_rows);
-        unimplemented!("#587 slice A: red")
+        let mut conn = self.lock();
+        // IMMEDIATE takes the write lock up front, so the lookup, the cap check
+        // and the insert are one step even across processes sharing the file.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let found = tx
+            .query_row(
+                &format!("SELECT {COLUMNS} FROM environments WHERE request_id = ?1"),
+                [request_id],
+                RawRow::read,
+            )
+            .optional()?;
+        if let Some(raw) = found {
+            let existing = raw.into_record()?;
+            return Ok(if existing.spec == spec && existing.spec_encoding == spec_encoding {
+                CreateOutcome::Existing(existing)
+            } else {
+                CreateOutcome::Conflict
+            });
+        }
+        if let Some(max) = self.max_rows {
+            let count: i64 = tx.query_row("SELECT COUNT(*) FROM environments", (), |row| row.get(0))?;
+            if count as usize >= max {
+                return Ok(CreateOutcome::CapExceeded { max });
+            }
+        }
+        let now = now_unix();
+        tx.execute(
+            "INSERT INTO environments
+                 (environment_id, request_id, state, spec, spec_encoding, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            (
+                new_id,
+                request_id,
+                EnvironmentState::Provisioning.as_str(),
+                spec,
+                spec_encoding,
+                now,
+            ),
+        )?;
+        let raw = tx.query_row(
+            &format!("SELECT {COLUMNS} FROM environments WHERE environment_id = ?1"),
+            [new_id],
+            RawRow::read,
+        )?;
+        tx.commit()?;
+        Ok(CreateOutcome::Created(raw.into_record()?))
     }
 
     /// The environment with this id, if any.
@@ -219,8 +358,15 @@ impl EnvironmentStore {
     /// # Errors
     /// As [`EnvironmentStore::create`].
     pub fn get(&self, environment_id: &str) -> Result<Option<EnvironmentRecord>, EnvironmentStoreError> {
-        let _ = environment_id;
-        unimplemented!("#587 slice A: red")
+        let conn = self.lock();
+        conn.query_row(
+            &format!("SELECT {COLUMNS} FROM environments WHERE environment_id = ?1"),
+            [environment_id],
+            RawRow::read,
+        )
+        .optional()?
+        .map(RawRow::into_record)
+        .transpose()
     }
 
     /// Every environment, oldest first.
@@ -228,7 +374,7 @@ impl EnvironmentStore {
     /// # Errors
     /// As [`EnvironmentStore::create`].
     pub fn list(&self) -> Result<Vec<EnvironmentRecord>, EnvironmentStoreError> {
-        unimplemented!("#587 slice A: red")
+        self.query_many("", ())
     }
 
     /// Every environment in `state`, oldest first.
@@ -236,8 +382,22 @@ impl EnvironmentStore {
     /// # Errors
     /// As [`EnvironmentStore::create`].
     pub fn list_by_state(&self, state: EnvironmentState) -> Result<Vec<EnvironmentRecord>, EnvironmentStoreError> {
-        let _ = state;
-        unimplemented!("#587 slice A: red")
+        self.query_many("WHERE state = ?1", [state.as_str()])
+    }
+
+    fn query_many(
+        &self,
+        filter: &str,
+        params: impl rusqlite::Params,
+    ) -> Result<Vec<EnvironmentRecord>, EnvironmentStoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM environments {filter} ORDER BY created_at, rowid"
+        ))?;
+        let rows = stmt
+            .query_map(params, RawRow::read)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter().map(RawRow::into_record).collect()
     }
 
     /// `Provisioning` to `Ready`: the health probe passed.
@@ -245,8 +405,12 @@ impl EnvironmentStore {
     /// # Errors
     /// As [`EnvironmentStore::create`].
     pub fn mark_ready(&self, environment_id: &str) -> Result<EnvTransition, EnvironmentStoreError> {
-        let _ = environment_id;
-        unimplemented!("#587 slice A: red")
+        self.transition(
+            environment_id,
+            &[EnvironmentState::Provisioning],
+            EnvironmentState::Ready,
+            None,
+        )
     }
 
     /// `Provisioning` to `Failed`, recording the failing `step` and `reason`.
@@ -259,8 +423,12 @@ impl EnvironmentStore {
         step: &str,
         reason: &str,
     ) -> Result<EnvTransition, EnvironmentStoreError> {
-        let _ = (environment_id, step, reason);
-        unimplemented!("#587 slice A: red")
+        self.transition(
+            environment_id,
+            &[EnvironmentState::Provisioning],
+            EnvironmentState::Failed,
+            Some((step, reason)),
+        )
     }
 
     /// `Ready` to `Stopped`.
@@ -268,8 +436,12 @@ impl EnvironmentStore {
     /// # Errors
     /// As [`EnvironmentStore::create`].
     pub fn stop(&self, environment_id: &str) -> Result<EnvTransition, EnvironmentStoreError> {
-        let _ = environment_id;
-        unimplemented!("#587 slice A: red")
+        self.transition(
+            environment_id,
+            &[EnvironmentState::Ready],
+            EnvironmentState::Stopped,
+            None,
+        )
     }
 
     /// `Stopped` to `Provisioning`: the environment boots again under the same id.
@@ -277,8 +449,12 @@ impl EnvironmentStore {
     /// # Errors
     /// As [`EnvironmentStore::create`].
     pub fn resume(&self, environment_id: &str) -> Result<EnvTransition, EnvironmentStoreError> {
-        let _ = environment_id;
-        unimplemented!("#587 slice A: red")
+        self.transition(
+            environment_id,
+            &[EnvironmentState::Stopped],
+            EnvironmentState::Provisioning,
+            None,
+        )
     }
 
     /// Any state but `Deleted` to `Deleted`. Deleting a deleted environment is
@@ -287,8 +463,51 @@ impl EnvironmentStore {
     /// # Errors
     /// As [`EnvironmentStore::create`].
     pub fn delete(&self, environment_id: &str) -> Result<EnvTransition, EnvironmentStoreError> {
-        let _ = environment_id;
-        unimplemented!("#587 slice A: red")
+        self.transition(environment_id, &LIVE, EnvironmentState::Deleted, None)
+    }
+
+    /// Move `environment_id` to `to` if it is in one of the `from` states.
+    /// Read and write share one IMMEDIATE transaction, so two racing
+    /// transitions cannot both pass the same guard.
+    fn transition(
+        &self,
+        environment_id: &str,
+        from: &[EnvironmentState],
+        to: EnvironmentState,
+        failure: Option<(&str, &str)>,
+    ) -> Result<EnvTransition, EnvironmentStoreError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let raw: Option<String> = tx
+            .query_row(
+                "SELECT state FROM environments WHERE environment_id = ?1",
+                [environment_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(raw) = raw else {
+            return Ok(EnvTransition::NotFound);
+        };
+        let current = EnvironmentState::parse(&raw).ok_or_else(|| EnvironmentStoreError::CorruptState {
+            environment_id: environment_id.to_owned(),
+            raw,
+        })?;
+        if current == to && to == EnvironmentState::Deleted {
+            return Ok(EnvTransition::Unchanged);
+        }
+        if !from.contains(&current) {
+            return Ok(EnvTransition::Refused(current));
+        }
+        let (step, reason) = failure.unzip();
+        tx.execute(
+            "UPDATE environments
+                SET state = ?2, failure_step = COALESCE(?3, failure_step),
+                    failure_reason = COALESCE(?4, failure_reason), updated_at = ?5
+              WHERE environment_id = ?1",
+            (environment_id, to.as_str(), step, reason, now_unix()),
+        )?;
+        tx.commit()?;
+        Ok(EnvTransition::Applied)
     }
 }
 
