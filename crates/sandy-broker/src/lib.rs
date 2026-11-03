@@ -174,18 +174,35 @@ fn validate_clients(clients: &[Client]) -> Result<(), BrokerError> {
 /// when the address cannot be bound, [`BrokerError::Owners`] when the state
 /// directory is unsafe or its table is unreadable.
 pub async fn serve(config: BrokerConfig) -> Result<Running, BrokerError> {
-    serve_with_ticket_ttl(config, std::time::Duration::from_secs(30)).await
+    serve_with_tuning(config, Tuning::default()).await
 }
 
-/// [`serve`] with a chosen stream-ticket lifetime. Tests use a short one.
+/// Attach-stream timing, for tests that need short ones.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct Tuning {
+    /// How long a stream ticket lives.
+    pub ticket_ttl: std::time::Duration,
+    /// How long one write to a client that stopped reading may block before the stream ends.
+    pub send_timeout: std::time::Duration,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Self {
+            ticket_ttl: std::time::Duration::from_secs(30),
+            send_timeout: std::time::Duration::from_secs(30),
+        }
+    }
+}
+
+/// [`serve`] with chosen attach-stream timing.
 ///
 /// # Errors
 /// As [`serve`].
 #[doc(hidden)]
-pub async fn serve_with_ticket_ttl(
-    config: BrokerConfig,
-    ticket_ttl: std::time::Duration,
-) -> Result<Running, BrokerError> {
+pub async fn serve_with_tuning(config: BrokerConfig, tuning: Tuning) -> Result<Running, BrokerError> {
+    let ticket_ttl = tuning.ticket_ttl;
     if !config.bind.ip().is_loopback() {
         return Err(BrokerError::NonLoopback { addr: config.bind });
     }

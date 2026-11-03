@@ -384,6 +384,41 @@ mod tests {
         assert!(matches!(tickets.issue("fresh", "job"), Err(IssueError::OverCap)));
     }
 
+    /// A control socket that accepts and never answers: every status poll hangs to the deadline.
+    fn silent_state(dir: &std::path::Path) -> anyhow::Result<State> {
+        let socket = dir.join("silent.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket)?;
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept() {
+                held.push(stream);
+            }
+        });
+        Ok(State {
+            control_socket: socket,
+            rpc_deadline: Duration::from_secs(30),
+            clients: Vec::new(),
+            owners: crate::owners::Owners::open(&dir.join("state"))?,
+            tickets: Tickets::new(Duration::from_secs(30)),
+            env_create: HashMap::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_hang_up_is_noticed_while_a_status_poll_is_stuck() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = silent_state(dir.path())?;
+        let (tx, rx) = mpsc::channel(1);
+        let (_frames_tx, mut frames): (mpsc::Sender<Result<Option<LinkFrame>, ()>>, Frames) = mpsc::channel(1);
+        let running = tokio::spawn(async move { run(&state, "job", &tx, &mut frames).await });
+        // The first poll starts after POLL and then hangs for the whole rpc deadline.
+        tokio::time::sleep(POLL + Duration::from_millis(300)).await;
+        drop(rx);
+        let ended = tokio::time::timeout(Duration::from_millis(500), running).await;
+        assert!(ended.is_ok(), "the hang-up was not noticed while the status call hung");
+        Ok(())
+    }
+
     #[test]
     fn a_ticket_lapses_and_frees_its_slot() {
         let tickets = Tickets::new(Duration::from_millis(1));

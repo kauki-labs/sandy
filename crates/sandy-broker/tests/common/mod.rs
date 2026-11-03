@@ -6,7 +6,7 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use reqwest::{Client as Http, StatusCode};
-use sandy_broker::{BrokerConfig, Client, IsolationClass, Running, serve_with_ticket_ttl};
+use sandy_broker::{BrokerConfig, Client, IsolationClass, Running, Tuning, serve_with_tuning};
 use sandy_fabric_local::{agent::TTY_STDOUT, channel::MembershipId};
 use sandy_proto::{MessageType, Tty};
 use sandyd::{
@@ -38,6 +38,8 @@ pub struct Opts {
     pub attach_socket: bool,
     /// How long a stream ticket lives.
     pub ticket_ttl: Duration,
+    /// How long a write to a client that stopped reading may block.
+    pub send_timeout: Duration,
 }
 
 impl Default for Opts {
@@ -45,6 +47,7 @@ impl Default for Opts {
         Self {
             attach_socket: true,
             ticket_ttl: Duration::from_secs(30),
+            send_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -119,7 +122,7 @@ async fn build(max_environments: usize, max_environment_records: usize, opts: Op
     });
     let root_a = dir.path().join("root-a");
     std::fs::create_dir(&root_a)?;
-    let broker = serve_with_ticket_ttl(
+    let broker = serve_with_tuning(
         BrokerConfig {
             control_socket: socket,
             rpc_deadline: std::time::Duration::from_secs(30),
@@ -134,7 +137,10 @@ async fn build(max_environments: usize, max_environment_records: usize, opts: Op
                 client("b", TOKEN_B, IsolationClass::Untrusted, vec![]),
             ],
         },
-        opts.ticket_ttl,
+        Tuning {
+            ticket_ttl: opts.ticket_ttl,
+            send_timeout: opts.send_timeout,
+        },
     )
     .await?;
     Ok(Fixture {

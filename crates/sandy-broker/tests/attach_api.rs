@@ -284,3 +284,74 @@ async fn a_finished_job_cannot_be_attached() -> Result<()> {
     );
     Ok(())
 }
+
+const BIG_CHUNKS: usize = 64;
+const BIG_CHUNK: usize = 64 * 1024;
+
+#[tokio::test]
+async fn a_job_finished_before_the_stream_opens_still_delivers_every_byte_to_a_slow_reader() -> Result<()> {
+    let f = fixture().await?;
+    let id = f.submit(TOKEN_A).await?;
+    let agent = f.agent(&id)?;
+    for n in 0..BIG_CHUNKS {
+        agent.stdout(&vec![u8::try_from(n)?; BIG_CHUNK]).await?;
+    }
+    let url = f.attach(&id, TOKEN_A).await?;
+    f.finish(&id, JobStatus::Succeeded)?;
+    let resp = f.open_stream(&url, Some(TOKEN_A)).await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Longer than any fixed drain window: the replay has to wait on this reader.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let mut lines = Lines::new(resp);
+    let got = lines.output_bytes(BIG_CHUNKS * BIG_CHUNK).await?;
+    assert_eq!(got.len(), BIG_CHUNKS * BIG_CHUNK);
+    for (n, chunk) in got.chunks(BIG_CHUNK).enumerate() {
+        assert!(chunk.iter().all(|b| usize::from(*b) == n), "chunk {n} is wrong");
+    }
+    let last = tokio::time::timeout(WAIT, lines.last())
+        .await
+        .context("no exit line")??;
+    assert_eq!(
+        last,
+        json!({"type": "exit", "reason": "job_terminal:JOB_STATUS_SUCCEEDED"})
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_client_that_stops_reading_frees_its_slot_within_the_send_timeout() -> Result<()> {
+    let f = fixture_with_opts(Opts {
+        send_timeout: Duration::from_millis(300),
+        ..Opts::default()
+    })
+    .await?;
+    let id = f.submit(TOKEN_A).await?;
+    let agent = f.agent(&id)?;
+    for _ in 0..BIG_CHUNKS {
+        agent.stdout(&vec![7_u8; BIG_CHUNK]).await?;
+    }
+    // Three idle tickets leave one slot: the stream's own.
+    let mut spare = Vec::new();
+    for _ in 0..3 {
+        spare.push(f.attach(&id, TOKEN_A).await?);
+    }
+    let url = f.attach(&id, TOKEN_A).await.context("the fourth slot")?;
+    // Hold the response open and never read it.
+    let stalled = f.open_stream(&url, Some(TOKEN_A)).await?;
+    assert_eq!(stalled.status(), StatusCode::OK);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut freed = false;
+    for _ in 0..50 {
+        let (status, _) = f
+            .call("POST", &format!("/v1/jobs/{id}/attach"), Some(TOKEN_A), Some(json!({})))
+            .await?;
+        if status == StatusCode::OK {
+            freed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(freed, "a stalled reader pinned its stream slot");
+    drop(stalled);
+    Ok(())
+}
