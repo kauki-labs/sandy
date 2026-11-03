@@ -116,7 +116,8 @@ pub struct EnvironmentRecord {
     pub spec: Vec<u8>,
     /// Names the encoding of `spec`.
     pub spec_encoding: String,
-    /// Set when `state` is [`EnvironmentState::Failed`].
+    /// Set once provisioning failed; it stays on the row if the environment
+    /// is then deleted.
     pub failure: Option<EnvironmentFailure>,
     /// Unix seconds at creation.
     pub created_at: i64,
@@ -136,6 +137,9 @@ pub enum CreateOutcome {
     /// The `request_id` was seen before with a different payload. Nothing was
     /// written.
     Conflict,
+    /// `new_id` already names another request's environment, so nothing was
+    /// written. The caller mints ids, so this is a minting fault, not a retry.
+    IdTaken,
     /// The table already holds `max` rows (see
     /// [`EnvironmentStore::with_max_rows`]); the insert was refused.
     CapExceeded {
@@ -329,6 +333,14 @@ impl EnvironmentStore {
             if count as usize >= max {
                 return Ok(CreateOutcome::CapExceeded { max });
             }
+        }
+        let id_taken: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM environments WHERE environment_id = ?1)",
+            [new_id],
+            |row| row.get(0),
+        )?;
+        if id_taken {
+            return Ok(CreateOutcome::IdTaken);
         }
         let now = now_unix();
         tx.execute(
@@ -673,35 +685,29 @@ mod tests {
 
     #[test]
     fn delete_applies_from_every_live_state_without_a_prior_stop() -> Result<()> {
+        use EnvironmentState::{Failed, Provisioning, Ready, Stopped};
         let s = store()?;
-        for (i, prepare) in [
-            |_: &EnvironmentStore, _: &str| Ok(()) as Result<()>,
-            |s: &EnvironmentStore, id: &str| {
-                s.mark_ready(id)?;
-                Ok(())
-            },
-            |s: &EnvironmentStore, id: &str| {
-                s.mark_ready(id)?;
-                s.stop(id)?;
-                Ok(())
-            },
-            |s: &EnvironmentStore, id: &str| {
-                s.mark_failed(id, "boot", "no")?;
-                Ok(())
-            },
+        for (i, (want, setup)) in [
+            (Provisioning, &[][..]),
+            (Ready, &["ready"][..]),
+            (Stopped, &["ready", "stop"][..]),
+            (Failed, &["fail"][..]),
         ]
         .into_iter()
         .enumerate()
         {
             let id = format!("env-{i}");
             s.create(&format!("r{i}"), &id, SPEC, ENC)?;
-            prepare(&s, &id)?;
-            assert_eq!(
-                s.delete(&id)?,
-                EnvTransition::Applied,
-                "from {}",
-                state_of(&s, &id)?.as_str()
-            );
+            for step in setup {
+                let moved = match *step {
+                    "ready" => s.mark_ready(&id)?,
+                    "stop" => s.stop(&id)?,
+                    _ => s.mark_failed(&id, "boot", "no")?,
+                };
+                assert_eq!(moved, EnvTransition::Applied, "setup step {step} for {id}");
+            }
+            assert_eq!(state_of(&s, &id)?, want, "the setup must reach the state under test");
+            assert_eq!(s.delete(&id)?, EnvTransition::Applied, "from {want:?}");
             assert_eq!(state_of(&s, &id)?, EnvironmentState::Deleted);
         }
         Ok(())
@@ -795,8 +801,75 @@ mod tests {
         Ok(())
     }
 
+    /// Opens `n` stores on one file, as separate processes sharing it would:
+    /// each has its own connection, so only the database lock orders them.
+    fn stores_on_one_file(n: usize) -> Result<(tempfile::TempDir, Vec<Arc<EnvironmentStore>>)> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("env.db");
+        let stores = (0..n)
+            .map(|_| Ok(Arc::new(EnvironmentStore::open(&path)?)))
+            .collect::<Result<Vec<_>>>()?;
+        Ok((dir, stores))
+    }
+
     #[test]
-    fn a_corrupt_stored_state_fails_that_read_and_no_other() -> Result<()> {
+    fn creates_racing_across_connections_make_exactly_one_environment() -> Result<()> {
+        let (_dir, stores) = stores_on_one_file(4)?;
+        let handles: Vec<_> = (0..16)
+            .map(|n| {
+                let s = Arc::clone(&stores[n % stores.len()]);
+                std::thread::spawn(move || s.create("r1", &format!("env-{n}"), SPEC, ENC))
+            })
+            .collect();
+        let mut outcomes = Vec::new();
+        for h in handles {
+            outcomes.push(h.join().map_err(|_| anyhow::anyhow!("thread panicked"))??);
+        }
+        let created = outcomes
+            .iter()
+            .filter(|r| matches!(r, CreateOutcome::Created(_)))
+            .count();
+        let existing = outcomes
+            .iter()
+            .filter(|r| matches!(r, CreateOutcome::Existing(_)))
+            .count();
+        assert_eq!((created, existing), (1, 15));
+        assert_eq!(stores[0].list()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn two_deletes_racing_across_connections_apply_once_and_report_unchanged_for_the_rest() -> Result<()> {
+        let (_dir, stores) = stores_on_one_file(4)?;
+        stores[0].create("r1", "env-1", SPEC, ENC)?;
+        let handles: Vec<_> = (0..8)
+            .map(|n| {
+                let s = Arc::clone(&stores[n % stores.len()]);
+                std::thread::spawn(move || s.delete("env-1"))
+            })
+            .collect();
+        let mut results = Vec::new();
+        for h in handles {
+            results.push(h.join().map_err(|_| anyhow::anyhow!("thread panicked"))??);
+        }
+        let applied = results.iter().filter(|r| **r == EnvTransition::Applied).count();
+        let unchanged = results.iter().filter(|r| **r == EnvTransition::Unchanged).count();
+        assert_eq!((applied, unchanged), (1, 7));
+        Ok(())
+    }
+
+    #[test]
+    fn an_id_already_taken_by_another_request_is_a_typed_outcome_and_writes_nothing() -> Result<()> {
+        let s = store()?;
+        let first = created(&s)?;
+        assert_eq!(s.create("r2", "env-1", SPEC, ENC)?, CreateOutcome::IdTaken);
+        assert_eq!(s.list()?, vec![first], "the first environment must be untouched");
+        assert_eq!(s.get("env-1")?.map(|r| r.request_id), Some("r1".to_owned()));
+        Ok(())
+    }
+
+    #[test]
+    fn a_corrupt_row_fails_list_and_reads_of_that_row_but_not_reads_of_others() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("env.db");
         {
@@ -811,54 +884,14 @@ mod tests {
         let s = EnvironmentStore::open(&path)?;
         assert!(matches!(
             s.get("env-1"),
-            Err(EnvironmentStoreError::CorruptState { ref raw, .. }) if raw == "bogus"
+            Err(EnvironmentStoreError::CorruptState { .. })
         ));
+        assert!(matches!(
+            s.delete("env-1"),
+            Err(EnvironmentStoreError::CorruptState { .. })
+        ));
+        assert!(matches!(s.list(), Err(EnvironmentStoreError::CorruptState { .. })));
         assert_eq!(state_of(&s, "env-2")?, EnvironmentState::Provisioning);
-        Ok(())
-    }
-
-    #[test]
-    fn concurrent_creates_with_one_request_id_make_exactly_one_environment() -> Result<()> {
-        let s = Arc::new(store()?);
-        let results: Vec<_> = (0..16)
-            .map(|n| {
-                let s = Arc::clone(&s);
-                std::thread::spawn(move || s.create("r1", &format!("env-{n}"), SPEC, ENC))
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|h| {
-                h.join()
-                    .map_err(|_| anyhow::anyhow!("thread panicked"))?
-                    .map_err(Into::into)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let created = results
-            .iter()
-            .filter(|r| matches!(r, CreateOutcome::Created(_)))
-            .count();
-        let existing = results
-            .iter()
-            .filter(|r| matches!(r, CreateOutcome::Existing(_)))
-            .count();
-        assert_eq!((created, existing), (1, 15));
-        assert_eq!(s.list()?.len(), 1);
-        Ok(())
-    }
-
-    #[test]
-    fn a_create_racing_a_delete_of_the_same_environment_ends_deleted_not_resurrected() -> Result<()> {
-        let s = Arc::new(store()?);
-        created(&s)?;
-        let racer = {
-            let s = Arc::clone(&s);
-            std::thread::spawn(move || s.create("r1", "env-2", SPEC, ENC))
-        };
-        s.delete("env-1")?;
-        let outcome = racer.join().map_err(|_| anyhow::anyhow!("thread panicked"))??;
-        assert!(matches!(outcome, CreateOutcome::Existing(_)));
-        assert_eq!(state_of(&s, "env-1")?, EnvironmentState::Deleted);
-        assert_eq!(s.list()?.len(), 1);
         Ok(())
     }
 }

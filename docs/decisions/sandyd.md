@@ -2066,8 +2066,20 @@ are later slices.
 environment is Ready only after its health probe passes again (#585 O2). `Archive` is not implemented: its
 meaning for an environment is undefined (a job's archive is a transcript), so it waits for a definition.
 
-**Consequence.** Callers that forward a raw client payload as `spec` get `Conflict` for two equal retries whose
-bytes differ (JSON key order). A2 therefore stores a deterministic, typed encoding of the request.
+**Consequences.**
+
+- Callers that forward a raw client payload as `spec` get `Conflict` for two equal retries whose bytes differ (JSON
+  key order). A2 therefore stores a deterministic, typed encoding of the request.
+- A `delete` while a launch is in flight makes the driver's late `mark_ready` return `Refused(Deleted)`. The driver
+  must treat that as "tear the box down", not as an ignorable refusal.
+- A failed resume (`Stopped` to `Provisioning` to `Failed`) leaves a once-good environment with only `delete` left.
+- Deleted rows stay for replay, and the row cap counts them, so once the table holds `max` rows every new create is
+  refused until rows are cleared. Slice A has no purge; retention is tracked as a follow-up.
+- A row with an unreadable state fails every read of that row, `delete` of it and `list` as a whole, and no other
+  `get`. It is surfaced, not skipped, so a corrupt row is noticed.
+- `create` and every move run in one `IMMEDIATE` transaction on their own connection, so two processes sharing the
+  file cannot both pass one guard (tests open several stores on one file). A `new_id` that another request already
+  holds is `IdTaken`, not a raw SQLite error.
 
 **Alternative set aside.** Carrying environment state in the journal: its records are per run and end at a
 terminal envelope, so it would need a second record kind and a different reconcile rule.
