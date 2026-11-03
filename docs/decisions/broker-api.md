@@ -104,8 +104,7 @@ user's files. Tracked in a follow-up issue.
 
 ## 5. Deferred in this slice
 
-- `attach` returns the typed error `unsupported`. The control RPC's data plane is a UDS stream.
-  An HTTP bridge is its own design and aligns with #513 (NDJSON).
+- `attach` is no longer deferred: decision 7 bridges it (#616).
 - `link` returns `unsupported` until T3 offers an external link interface (#585 open point 1).
 - Rate limiting, quotas, and the audit trail are #596.
 - `SubmitJob` has no `request_id`. Job idempotency is a contract change and is not made here.
@@ -163,6 +162,49 @@ to it. Closing it is the correlation work in #621. A create whose owner save fai
 and does not replay, because the broker has no record of the request. The broker does not
 record the request before the create: a refused request that was then corrected would skip the
 quota check, and a client could exceed the quota by one environment per distinct key.
+
+## 7. Attach is a ticket plus a bearer-gated NDJSON stream (#616)
+
+**Decision.**
+
+- `POST /v1/jobs/{id}/attach` (bearer) mints a random 256-bit single-use ticket for the caller's
+  own live job and answers `{"stream_url": "/v1/jobs/{id}/stream/{ticket}", "expires_in_s": 30}`.
+  `stream_url` is a relative path: the client resolves it against the API URL it already uses.
+  A foreign or unknown job is `not_found`; a finished job is `unavailable`. This call does no
+  attach RPC and no join.
+- Tickets live in broker memory only, never on disk, and expire after 30 seconds. A client holds
+  at most 4 tickets plus open streams, and the broker at most 32. Over a cap answers
+  `quota_exceeded` (429). No new public error code.
+- `GET /v1/jobs/{id}/stream/{ticket}` needs the bearer too, so a leaked URL alone gives
+  nothing. An unknown, expired, malformed, other-client or other-job ticket gives one identical
+  `not_found`; a mismatched presenter does not spend the ticket. A valid ticket is removed
+  before anything else, so it works once.
+- The broker then makes the attach RPC with the stored attach token, connects to sandyd's attach
+  socket and sends `Join` with the cap. `Refused`, a timeout (10 s) or any fault gives a fixed
+  `unavailable`; sandyd's text is not relayed.
+- The response is `200`, `application/x-ndjson`, `Cache-Control: no-store`, chunked. Each
+  delivered stdout or stderr chunk is `{"type":"output","data":"<base64>"}` (bytes opaque,
+  streams merged). The last line is `{"type":"exit","reason":...}` with `closed`,
+  `job_terminal:<JOB_STATUS_*>` or a fixed `fault:` text. The shape follows the CLI's
+  `daemon attach -o json` (#513) minus its `attached` line, which carries the cap.
+- The token and the cap never appear in a response, header, URL or log line. The broker never
+  logs the stream URL.
+- The stream is read-only. The broker never writes to the data-plane connection and never
+  closes its write half: a client EOF makes sandyd's relay leave. Archive frames are dropped.
+- sandyd replays the channel from sequence 0 on every join. A second stream for the same job
+  sees the output again. Accepted.
+- The broker polls job status about once a second. On a terminal status it drains for up to
+  2 seconds, then sends `exit`. If the HTTP client goes away the broker drops the data-plane
+  connection at once and sends nothing; the job is untouched.
+- The stream's producer task has its own cap: the handler slot is free once the response head
+  is out, so the ticket and stream caps above bound the producers.
+
+**Side effect.** An open broker stream is an attach to sandyd. On a remote host that keeps the
+job attached and lifts the unlimited-while-attached policy (#340, `sandyd.md` decision 17) for as
+long as the stream is open, up to the client's four. Closing the stream restores it.
+
+**Residual.** A client that opens a stream and stops reading holds its slot until the TCP
+connection dies. The caps bound the cost, there is no idle timeout.
 
 ## Consequences
 

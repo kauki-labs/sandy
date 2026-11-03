@@ -3,7 +3,9 @@
 //! Serves the job and environment endpoints of `docs/api/broker.openapi.yaml` to bearer-token
 //! clients and speaks the control RPC to one sandyd over a UDS.
 
+mod attach;
 mod auth;
+mod body;
 mod environments;
 mod owners;
 mod paths;
@@ -182,7 +184,7 @@ pub async fn serve(config: BrokerConfig) -> Result<Running, BrokerError> {
 #[doc(hidden)]
 pub async fn serve_with_ticket_ttl(
     config: BrokerConfig,
-    _ticket_ttl: std::time::Duration,
+    ticket_ttl: std::time::Duration,
 ) -> Result<Running, BrokerError> {
     if !config.bind.ip().is_loopback() {
         return Err(BrokerError::NonLoopback { addr: config.bind });
@@ -195,6 +197,7 @@ pub async fn serve_with_ticket_ttl(
         .collect();
     let state = Arc::new(server::State {
         owners: owners::Owners::open(&config.state_dir)?,
+        tickets: attach::Tickets::new(ticket_ttl),
         control_socket: config.control_socket,
         rpc_deadline: config.rpc_deadline,
         clients: config.clients,

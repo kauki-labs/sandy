@@ -115,11 +115,13 @@ async fn no_response_carries_the_attach_token() -> Result<()> {
 
     // The attach bridge: its response, the stream URL, the stream's headers and content carry
     // neither the token nor the cap the broker presented on sandyd's attach socket.
-    let agent = f.agent(&id)?;
+    // The job above was cancelled; attach needs a live one.
+    let live = f.submit(TOKEN_A).await?;
+    let agent = f.agent(&live)?;
     agent.stdout(b"hello").await?;
     let attach = f
         .http
-        .post(format!("{}/v1/jobs/{id}/attach", f.base))
+        .post(format!("{}/v1/jobs/{live}/attach", f.base))
         .bearer_auth(TOKEN_A)
         .send()
         .await?;
@@ -131,7 +133,7 @@ async fn no_response_carries_the_attach_token() -> Result<()> {
     seen.push_str(&format!("{:?}", resp.headers()));
     let mut lines = common::Lines::new(resp);
     lines.output_bytes(5).await?;
-    f.finish(&id, sandy_control_proto::JobStatus::Succeeded)?;
+    f.finish(&live, sandy_control_proto::JobStatus::Succeeded)?;
     seen.push_str(&lines.last().await?.to_string());
     let caps = f.caps.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.clone();
     assert!(

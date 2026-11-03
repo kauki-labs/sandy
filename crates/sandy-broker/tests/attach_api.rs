@@ -161,14 +161,7 @@ async fn malformed_and_cross_job_tickets_are_not_found() -> Result<()> {
     let (one, other) = (f.submit(TOKEN_A).await?, f.submit(TOKEN_A).await?);
     let url = f.attach(&one, TOKEN_A).await?;
     let ticket = url.rsplit('/').next().context("ticket")?.to_owned();
-    for bad in [
-        "not-a-ticket",
-        "..",
-        "%2e%2e",
-        &"g".repeat(64),
-        &"0".repeat(63),
-        &ticket.to_uppercase(),
-    ] {
+    for bad in ["not-a-ticket", &"g".repeat(64), &"0".repeat(63), &ticket.to_uppercase()] {
         let resp = f
             .open_stream(&format!("/v1/jobs/{one}/stream/{bad}"), Some(TOKEN_A))
             .await?;

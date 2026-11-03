@@ -80,8 +80,7 @@ broker and stores jobs and environments.
 
 - No environment becomes `ready` until a launch backend exists (#587 slice C). Today a
   spawn stays `provisioning` and `connection` is absent.
-- `attach` returns `unsupported` (#616). `link` returns `unsupported` until T3 offers an
-  external link interface.
+- `link` returns `unsupported` until T3 offers an external link interface.
 - No TLS or remote callers. mTLS client auth is an owner decision (#607).
 - A create whose reply times out and is never retried leaves an environment with no owner
   (#621). sandyd keeps deleted rows forever (#633).

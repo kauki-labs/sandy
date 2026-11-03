@@ -158,10 +158,10 @@ async fn record_and_forward(
     let Ok(Some(join)) = read_frame(&mut client).await else {
         return;
     };
-    if let LinkFrame::Join { cap, .. } = &join {
-        if let Ok(mut seen) = seen.lock() {
-            seen.push(cap.clone());
-        }
+    if let LinkFrame::Join { cap, .. } = &join
+        && let Ok(mut seen) = seen.lock()
+    {
+        seen.push(cap.clone());
     }
     let Ok(mut upstream) = UnixStream::connect(real).await else {
         return;

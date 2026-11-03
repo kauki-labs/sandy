@@ -86,7 +86,8 @@ version, metadata, dependency versions, and lints through the root `Cargo.toml`
 - **`sandy-broker`** — the broker HTTP API tier over sandyd (#591): bearer-token clients, per-client
   job and environment ownership, the job and environment endpoints of the OpenAPI contract,
   loopback only. It speaks the control RPC over UDS and keeps each job's attach token. Attach
-  and link answer `unsupported` for now. See `docs/decisions/broker-api.md`.
+  bridges sandyd's attach socket to an NDJSON stream behind a single-use ticket (#616); link
+  answers `unsupported` for now. See `docs/decisions/broker-api.md`.
 - **`sandy-environment`** — `EnvironmentBackend` implementations for `sandyd` (#587). Today the
   opt-in, trusted-only `ProcessEnvironmentBackend`: a service such as `t3 serve` as a host process
   group with a cleared environment and no isolation, selected by `SANDY_ENV_BACKEND=process-insecure`.
