@@ -296,13 +296,15 @@ async fn a_profile_the_client_may_not_use_is_forbidden_and_creates_nothing() -> 
     Ok(())
 }
 
-/// Rows owned by nobody the broker knows, enough to need several sandyd list pages. The spec bytes are a
+/// Rows owned by nobody the broker knows, enough to need several sandyd list pages. Their ids
+/// (`env--foreign-N`) sort before every minted `env-<hex>` id, so a client's own rows are on the
+/// last page, never the first. The spec bytes are a
 /// valid `EnvironmentSpec` (field 1, `profile`, set to `p`).
 fn fill_foreign_rows(f: &common::Fixture, n: usize) -> Result<()> {
     for i in 0..n {
         f.environments.create(
             &format!("foreign-{i}"),
-            &format!("env-foreign-{i:06}"),
+            &format!("env--foreign-{i:06}"),
             b"\x0a\x01p",
             sandyd::environment::SPEC_ENCODING,
         )?;
@@ -355,5 +357,58 @@ async fn churn_by_fresh_keys_cannot_fill_sandyds_row_cap_for_other_clients() -> 
             .await?;
     }
     spawn_id(&f, TOKEN_B, spawn_body("b1")).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_replay_of_a_key_sandyd_has_collected_counts_against_the_quota_again() -> Result<()> {
+    let f = common::fixture_with_limits(2, 64).await?;
+    let old = spawn_id(&f, TOKEN_A, spawn_body("old")).await?;
+    f.call("DELETE", &format!("/v1/environments/{old}"), Some(TOKEN_A), None)
+        .await?;
+    f.environments.gc_deleted(
+        i64::MAX / 2,
+        &sandyd::environment_store::RetentionPolicy {
+            window_secs: 1,
+            max_deleted: 100,
+        },
+    )?;
+    spawn_id(&f, TOKEN_A, spawn_body("f1")).await?;
+    spawn_id(&f, TOKEN_A, spawn_body("f2")).await?;
+    // The key is forgotten by sandyd, so this replay would create a third live environment.
+    let (status, body) = spawn(&f, TOKEN_A, spawn_body("old")).await?;
+    assert_eq!(
+        (status, &body["code"]),
+        (StatusCode::TOO_MANY_REQUESTS, &json!("quota_exceeded")),
+        "{body}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_replay_inside_the_retention_window_still_skips_the_quota_check() -> Result<()> {
+    let f = common::fixture_with_limits(1, 64).await?;
+    let first = spawn_id(&f, TOKEN_A, spawn_body("r")).await?;
+    let again = spawn_id(&f, TOKEN_A, spawn_body("r")).await?;
+    assert_eq!(first, again, "at quota, a replay still returns the same environment");
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_broker_scan_ceiling_is_exactly_10000_rows() -> Result<()> {
+    let f = common::fixture_with_limits(200, 200).await?;
+    fill_foreign_rows(&f, 9_999)?;
+    let a = spawn_id(&f, TOKEN_A, spawn_body("edge")).await?; // the table now holds 10000 rows
+    let (status, list) = f.call("GET", "/v1/environments", Some(TOKEN_A), None).await?;
+    assert_eq!(status, StatusCode::OK, "10000 rows are within the ceiling: {list}");
+    assert_eq!(list["environments"][0]["environment_id"], a.as_str());
+    let (status, body) = spawn(&f, TOKEN_A, spawn_body("over")).await?; // scans 10000, creates the 10001st
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let (status, body) = f.call("GET", "/v1/environments", Some(TOKEN_A), None).await?;
+    assert_eq!(
+        (status, &body["code"]),
+        (StatusCode::SERVICE_UNAVAILABLE, &json!("unavailable")),
+        "{body}"
+    );
     Ok(())
 }
