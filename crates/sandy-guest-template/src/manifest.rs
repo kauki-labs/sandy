@@ -62,7 +62,7 @@ pub struct FlakeManifestV1 {
     pub timeout_secs: Option<u32>,
     /// Declares `command` a long-running service (#589): it reaches Ready only once its health probe
     /// passes, instead of ending when the command exits. `None` is an ordinary job.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service: Option<ServiceSpec>,
 }
 
@@ -437,6 +437,27 @@ mod tests {
             );
         }
         assert_eq!(decode_flake_manifest(base("null").as_bytes())?.service, None);
+        Ok(())
+    }
+
+    /// #589 review: a manifest without a service encodes without a `service` key at all. An older executor
+    /// (`deny_unknown_fields`) would otherwise refuse every new manifest, service or not, over `"service":null`.
+    #[test]
+    fn a_plain_manifest_encodes_without_a_service_key() -> Result<(), serde_json::Error> {
+        let manifest = FlakeManifestV1 {
+            flake: ".".to_owned(),
+            kind: None,
+            attr: None,
+            command: Vec::new(),
+            history_lines: default_history_lines(),
+            env: Vec::new(),
+            cpu: None,
+            mem: None,
+            timeout_secs: None,
+            service: None,
+        };
+        let json = String::from_utf8(encode_flake_manifest(&manifest)?).expect("JSON is UTF-8");
+        assert!(!json.contains("service"), "{json}");
         Ok(())
     }
 
