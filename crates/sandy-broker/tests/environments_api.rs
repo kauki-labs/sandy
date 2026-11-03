@@ -295,3 +295,163 @@ async fn a_profile_the_client_may_not_use_is_forbidden_and_creates_nothing() -> 
     assert_eq!(list["environments"].as_array().map(Vec::len), Some(0));
     Ok(())
 }
+
+/// Rows owned by nobody the broker knows, enough to need several sandyd list pages. Their ids
+/// (`env--foreign-N`) sort before every minted `env-<hex>` id, so a client's own rows are on the
+/// last page, never the first. The spec bytes are a
+/// valid `EnvironmentSpec` (field 1, `profile`, set to `p`).
+fn fill_foreign_rows(f: &common::Fixture, n: usize) -> Result<()> {
+    for i in 0..n {
+        f.environments.create(
+            &format!("foreign-{i}"),
+            &format!("env--foreign-{i:06}"),
+            b"\x0a\x01p",
+            sandyd::environment::SPEC_ENCODING,
+        )?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_broker_list_and_quota_check_keep_working_over_more_rows_than_one_page() -> Result<()> {
+    let f = common::fixture_with_limits(200, 200).await?;
+    fill_foreign_rows(&f, 1100)?;
+    let a = spawn_id(&f, TOKEN_A, spawn_body("p1")).await?;
+    let (status, list) = f.call("GET", "/v1/environments", Some(TOKEN_A), None).await?;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let ids: Vec<&str> = list["environments"]
+        .as_array()
+        .context("environments")?
+        .iter()
+        .filter_map(|e| e["environment_id"].as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        [a.as_str()],
+        "only the caller's environment, found past the first page"
+    );
+    // The quota check lists everything too, so a second spawn proves it works.
+    spawn_id(&f, TOKEN_A, spawn_body("p2")).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_daemon_with_more_rows_than_the_broker_will_scan_is_unavailable_not_truncated() -> Result<()> {
+    let f = common::fixture_with_limits(200, 200).await?;
+    fill_foreign_rows(&f, 10_001)?;
+    let (status, body) = f.call("GET", "/v1/environments", Some(TOKEN_A), None).await?;
+    assert_eq!(
+        (status, &body["code"]),
+        (StatusCode::SERVICE_UNAVAILABLE, &json!("unavailable")),
+        "{body}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn churn_by_fresh_keys_cannot_fill_sandyds_row_cap_for_other_clients() -> Result<()> {
+    let f = common::fixture_with_row_cap(4, 64, Some(2)).await?;
+    for n in 0..6 {
+        let id = spawn_id(&f, TOKEN_A, spawn_body(&format!("c{n}"))).await?;
+        f.call("DELETE", &format!("/v1/environments/{id}"), Some(TOKEN_A), None)
+            .await?;
+    }
+    spawn_id(&f, TOKEN_B, spawn_body("b1")).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_replay_of_a_key_sandyd_has_collected_counts_against_the_quota_again() -> Result<()> {
+    let f = common::fixture_with_limits(2, 64).await?;
+    let old = spawn_id(&f, TOKEN_A, spawn_body("old")).await?;
+    f.call("DELETE", &format!("/v1/environments/{old}"), Some(TOKEN_A), None)
+        .await?;
+    f.environments.gc_deleted(
+        i64::MAX / 2,
+        &sandyd::environment_store::RetentionPolicy {
+            window_secs: 1,
+            max_deleted: 100,
+        },
+    )?;
+    spawn_id(&f, TOKEN_A, spawn_body("f1")).await?;
+    spawn_id(&f, TOKEN_A, spawn_body("f2")).await?;
+    // The key is forgotten by sandyd, so this replay would create a third live environment.
+    let (status, body) = spawn(&f, TOKEN_A, spawn_body("old")).await?;
+    assert_eq!(
+        (status, &body["code"]),
+        (StatusCode::TOO_MANY_REQUESTS, &json!("quota_exceeded")),
+        "{body}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_replay_inside_the_retention_window_still_skips_the_quota_check() -> Result<()> {
+    let f = common::fixture_with_limits(1, 64).await?;
+    let first = spawn_id(&f, TOKEN_A, spawn_body("r")).await?;
+    let again = spawn_id(&f, TOKEN_A, spawn_body("r")).await?;
+    assert_eq!(first, again, "at quota, a replay still returns the same environment");
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_broker_scan_ceiling_is_exactly_10000_rows() -> Result<()> {
+    let f = common::fixture_with_limits(200, 200).await?;
+    fill_foreign_rows(&f, 9_999)?;
+    let a = spawn_id(&f, TOKEN_A, spawn_body("edge")).await?; // the table now holds 10000 rows
+    let (status, list) = f.call("GET", "/v1/environments", Some(TOKEN_A), None).await?;
+    assert_eq!(status, StatusCode::OK, "10000 rows are within the ceiling: {list}");
+    assert_eq!(list["environments"][0]["environment_id"], a.as_str());
+    let (status, body) = spawn(&f, TOKEN_A, spawn_body("over")).await?; // scans 10000, creates the 10001st
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let (status, body) = f.call("GET", "/v1/environments", Some(TOKEN_A), None).await?;
+    assert_eq!(
+        (status, &body["code"]),
+        (StatusCode::SERVICE_UNAVAILABLE, &json!("unavailable")),
+        "{body}"
+    );
+    Ok(())
+}
+
+/// The retention sweep can collect a replayed key's row between the broker's lookup and the create.
+/// The owner table here names `env-seed`, which sandyd still holds under another key, so the lookup
+/// succeeds while sandyd has never seen this request's key: the create makes a new environment.
+#[tokio::test]
+async fn a_replay_that_creates_a_new_environment_after_the_lookup_is_quota_checked_and_undone() -> Result<()> {
+    let f = common::fixture_with_owner_table(1, 64, |store| {
+        let spec = b"\x0a\x01p";
+        store.create("seed-key", "env-seed", spec, sandyd::environment::SPEC_ENCODING)?;
+        store.delete("env-seed")?;
+        Ok(json!({"environments": {"env-seed": "a"}, "keys": {"a\nrace": "env-seed"}}).to_string())
+    })
+    .await?;
+    let live = spawn_id(&f, TOKEN_A, spawn_body("f1")).await?; // the client is now at quota
+    let (status, body) = spawn(&f, TOKEN_A, spawn_body("race")).await?;
+    assert_eq!(
+        (status, &body["code"]),
+        (StatusCode::TOO_MANY_REQUESTS, &json!("quota_exceeded")),
+        "{body}"
+    );
+    // The environment sandyd created for the refused request is deleted, and the broker does not own it.
+    let rows = f.environments.list()?;
+    let undone: Vec<_> = rows
+        .iter()
+        .filter(|r| r.environment_id != "env-seed" && r.environment_id != live)
+        .collect();
+    assert_eq!(undone.len(), 1, "{rows:?}");
+    assert_eq!(undone[0].state, sandyd::environment_store::EnvironmentState::Deleted);
+    let (_, list) = f
+        .call("GET", "/v1/environments?state=deleted", Some(TOKEN_A), None)
+        .await?;
+    let ids: Vec<&str> = list["environments"]
+        .as_array()
+        .context("environments")?
+        .iter()
+        .filter_map(|e| e["environment_id"].as_str())
+        .collect();
+    assert!(
+        !ids.contains(&undone[0].environment_id.as_str()),
+        "the undone row is not the client's"
+    );
+    Ok(())
+}

@@ -113,7 +113,7 @@ user's files. Tracked in a follow-up issue.
 
 **Decision.**
 
-- Spawn, get, list, stop, resume, cancel and delete each make one control RPC with the typed
+- Spawn, get, stop, resume, cancel and delete each make one control RPC with the typed
   messages. The broker never forwards client JSON bytes: sandyd compares the create spec
   byte for byte, so the broker builds the message.
 - sandyd keys idempotency over all callers. The broker sends `idempotency_key` as a 16-digit
@@ -124,7 +124,14 @@ user's files. Tracked in a follow-up issue.
   environment, and an unknown one, both give `not_found` on every route, and list shows only
   the caller's.
 - Per-client quota: `max_environments` in the clients file (default 4) counts the client's
-  non-terminal environments. A replay of a request id the client already used skips the check.
+  non-terminal environments. A replay of a request id the client already used skips the check only while sandyd still
+  holds that environment: the broker asks sandyd (`GetEnvironment`), and if retention has
+  collected it (`NOT_FOUND`) the replay would create a new environment, so both checks run.
+  The sweep can also collect the row between that lookup and the create. When a replay
+  that skipped the checks gets back an id other than the recorded one, the broker runs both
+  checks then; over quota, it deletes the new environment, does not record it, and answers
+  `quota_exceeded`. A replay that returns the recorded id, even a deleted one inside the
+  window, is never checked.
   Creates of one client run one at a time, so the check and the create cannot race, and one
   client cannot hold up another.
 - sandyd's `EnvironmentError` codes map to fixed messages: `NOT_FOUND` 404 `not_found`,
@@ -134,10 +141,15 @@ user's files. Tracked in a follow-up issue.
 - A create whose owner save fails answers `unavailable`. The client's retry replays the create,
   gets the same environment, and records it, so no orphan outlives a retry.
 - A client may hold `max_environments` non-terminal environments (default 4) and may ever
-  create `max_environment_records` (default 64). sandyd keeps a deleted row for replay and
-  counts it against its own cap, so without the second limit one client could create and
-  delete until sandyd's table is full for everyone. The real fix is sandyd pruning deleted
-  rows and paging its list reply (#633).
+  create `max_environment_records` (default 64). sandyd keeps a deleted row for replay, so without
+  the second limit one client could create and delete many rows. sandyd now collects deleted rows
+  after a retention window and counts only rows that are not deleted against its cap (#633,
+  sandyd decision 27), so the record cap is a per-client bound, not the only defence.
+- List and the quota check read sandyd's list page by page (500 rows a page, following
+  `next_page_token`) and filter to the caller's rows. The broker reads at most 10000 rows for one
+  request; a daemon holding more answers `unavailable` and logs it, never a truncated list or
+  quota count. The broker's own list is not paged: a client sees only its own rows, which
+  `max_environment_records` bounds.
 - A create that sandyd answers with an environment another client already owns is refused
   (`TakenOver`), and two clients whose ids share a 16-digit hash prefix are refused at startup.
 - `failure.reason` is neither relayed nor logged by the broker: it is sandyd's text and may name

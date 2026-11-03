@@ -103,7 +103,13 @@ stops the process on the driver's next tick (about a second).
 - `link` returns `unsupported` until T3 offers an external link interface.
 - No TLS or remote callers. mTLS client auth is an owner decision (#607).
 - A create whose reply times out and is never retried leaves an environment with no owner
-  (#621). sandyd keeps deleted rows forever (#633).
+  (#621). sandyd collects deleted rows after `SANDY_ENV_RETENTION_SECS` (default one day) (#633).
+
+- Upgrade sandyd and the broker together. A broker that predates paging ignores
+  `next_page_token`, sees only the first 100 rows and undercounts quota. Set
+  `SANDY_MAX_ENVIRONMENTS` at or below 10000: the broker's scan ceiling counts rows before
+  its ownership filter, and `Failed` rows count toward the cap (a client can hold up to
+  `max_environment_records` of them).
 
 ## When a call fails
 

@@ -25,6 +25,7 @@ pub struct Fixture {
     pub registry: Arc<JobRegistry>,
     /// Every cap (hex) the broker presented on the attach socket, in order.
     pub caps: Arc<std::sync::Mutex<Vec<String>>>,
+    pub environments: Arc<EnvironmentStore>,
     pub http: Http,
     pub _broker: Running,
     pub _dir: tempfile::TempDir,
@@ -69,7 +70,7 @@ pub async fn fixture() -> Result<Fixture> {
 }
 
 pub async fn fixture_with_opts(opts: Opts) -> Result<Fixture> {
-    build(4, 64, opts).await
+    build(4, 64, opts, None, None).await
 }
 
 /// A fixture whose client `a` may hold `max_environments` environments.
@@ -80,14 +81,68 @@ pub async fn fixture_with_env_quota(max_environments: usize) -> Result<Fixture> 
 /// A fixture whose client `a` may hold `max_environments` live environments and ever
 /// create `max_environment_records`.
 pub async fn fixture_with_limits(max_environments: usize, max_environment_records: usize) -> Result<Fixture> {
-    build(max_environments, max_environment_records, Opts::default()).await
+    fixture_with_row_cap(max_environments, max_environment_records, None).await
 }
 
-async fn build(max_environments: usize, max_environment_records: usize, opts: Opts) -> Result<Fixture> {
+/// [`fixture_with_limits`] over a sandyd whose environment table holds at most `row_cap` live rows.
+pub async fn fixture_with_row_cap(
+    max_environments: usize,
+    max_environment_records: usize,
+    row_cap: Option<usize>,
+) -> Result<Fixture> {
+    build(
+        max_environments,
+        max_environment_records,
+        Opts::default(),
+        row_cap,
+        None,
+    )
+    .await
+}
+
+/// [`fixture_with_limits`] with `owners_json` written as the broker's owner table before it
+/// starts. `seed` runs first on sandyd's store so the table can name rows that exist there.
+pub async fn fixture_with_owner_table(
+    max_environments: usize,
+    max_environment_records: usize,
+    seed: impl FnOnce(&EnvironmentStore) -> Result<String> + 'static,
+) -> Result<Fixture> {
+    build(
+        max_environments,
+        max_environment_records,
+        Opts::default(),
+        None,
+        Some(Box::new(seed)),
+    )
+    .await
+}
+
+type OwnerSeed = Box<dyn FnOnce(&EnvironmentStore) -> Result<String>>;
+
+async fn build(
+    max_environments: usize,
+    max_environment_records: usize,
+    opts: Opts,
+    row_cap: Option<usize>,
+    owner_seed: Option<OwnerSeed>,
+) -> Result<Fixture> {
     let dir = tempfile::tempdir()?;
     let socket = dir.path().join("sandyd.sock");
     let store = Arc::new(JobStore::open_in_memory()?);
-    let environments = Arc::new(EnvironmentStore::open_in_memory()?);
+    let environments = Arc::new(EnvironmentStore::open_in_memory()?.with_max_rows(row_cap));
+    if let Some(seed) = owner_seed {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let json = seed(&environments)?;
+        let state = dir.path().join("state");
+        std::fs::create_dir(&state)?;
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700))?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(state.join("owners.json"))?;
+        std::io::Write::write_all(&mut file, json.as_bytes())?;
+    }
     let registry = Arc::new(JobRegistry::new()?);
     let hosts = Arc::new(HostRegistry::default());
     let listener = UnixListener::bind(&socket)?;
@@ -107,7 +162,12 @@ async fn build(max_environments: usize, max_environment_records: usize, opts: Op
             }
         });
     }
-    let (s, e, r, h) = (Arc::clone(&store), environments, Arc::clone(&registry), hosts);
+    let (s, e, r, h) = (
+        Arc::clone(&store),
+        Arc::clone(&environments),
+        Arc::clone(&registry),
+        hosts,
+    );
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             tokio::spawn(sandyd::serve_connection(
@@ -148,6 +208,7 @@ async fn build(max_environments: usize, max_environment_records: usize, opts: Op
         store,
         registry,
         caps,
+        environments,
         http: Http::new(),
         _broker: broker,
         _dir: dir,
