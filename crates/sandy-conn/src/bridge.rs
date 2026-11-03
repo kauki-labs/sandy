@@ -164,6 +164,7 @@ mod tests {
     };
 
     use anyhow::Context;
+    use sandy_api::agent::PORT_RELAY_READY;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
@@ -181,6 +182,9 @@ mod tests {
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 tokio::spawn(async move {
+                    if socket.write_all(&[PORT_RELAY_READY]).await.is_err() {
+                        return;
+                    }
                     let mut buf = [0u8; 1024];
                     while let Ok(n) = socket.read(&mut buf).await {
                         if n == 0 || socket.write_all(&buf[..n]).await.is_err() {
@@ -191,6 +195,47 @@ mod tests {
             }
         });
         Ok(addr)
+    }
+
+    /// A guest that accepts and closes at once for its first `close_first` connections (what vfkit's proxy does
+    /// before the guest listens, or the relay when its service is down), then behaves like [`echo_guest`]. Returns
+    /// its address and a count of accepted connections.
+    async fn flaky_guest(close_first: u32) -> anyhow::Result<(SocketAddr, Arc<AtomicU32>)> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .context("bind flaky guest")?;
+        let addr = listener.local_addr()?;
+        let accepted = Arc::new(AtomicU32::new(0));
+        let count = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                if count.fetch_add(1, Ordering::SeqCst) < close_first {
+                    drop(socket);
+                    continue;
+                }
+                tokio::spawn(async move {
+                    if socket.write_all(&[PORT_RELAY_READY]).await.is_err() {
+                        return;
+                    }
+                    let mut buf = [0u8; 1024];
+                    while let Ok(n) = socket.read(&mut buf).await {
+                        if n == 0 || socket.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        Ok((addr, accepted))
+    }
+
+    /// True when the peer has already closed: a non-blocking read sees EOF without waiting. Used right after
+    /// `shutdown().await`, where "eventually closed" is not good enough.
+    fn already_closed(client: TcpStream) -> anyhow::Result<bool> {
+        let client = client.into_std()?;
+        client.set_nonblocking(true)?;
+        let mut buf = [0u8; 1];
+        Ok(matches!(std::io::Read::read(&mut &client, &mut buf), Ok(0)))
     }
 
     /// Dials a TCP address, after failing `failures` times first, and counts every attempt.
@@ -340,8 +385,20 @@ mod tests {
         );
 
         drop(first);
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // The slot frees when the first connection's task ends; poll for it instead of guessing a delay.
         let mut third = TcpStream::connect(bridge.addr()).await?;
+        for _ in 0..50 {
+            third = TcpStream::connect(bridge.addr()).await?;
+            third.write_all(b"x").await?;
+            let mut byte = [0u8; 1];
+            if matches!(
+                timeout(Duration::from_millis(100), third.read(&mut byte)).await,
+                Ok(Ok(1))
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         assert!(
             echoes(&mut third, b"three").await,
             "a slot freed by a closed connection is reusable"
@@ -382,6 +439,95 @@ mod tests {
         assert!(closed_unanswered(&mut live).await?, "a drop closes a live connection");
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(TcpStream::connect(addr).await.is_err(), "a drop stops listening");
+        Ok(())
+    }
+
+    /// A dial that connects but never announces readiness (vfkit's proxy before the guest listens) is a failed
+    /// dial: it is retried inside the window and the client is closed when the window ends.
+    #[tokio::test]
+    async fn a_dial_that_connects_but_never_announces_readiness_is_retried_then_closed() -> anyhow::Result<()> {
+        let (guest, accepted) = flaky_guest(u32::MAX).await?;
+        let (dialer, _) = TcpDialer::new(guest);
+        let bridge = Bridge::start(dialer, config(8, 150)).await?;
+        let mut client = TcpStream::connect(bridge.addr()).await?;
+        assert!(
+            closed_unanswered(&mut client).await?,
+            "the client is closed once the window ends"
+        );
+        let made = accepted.load(Ordering::SeqCst);
+        assert!(
+            (2..=20).contains(&made),
+            "retried inside the window, not forever: {made} dials"
+        );
+        Ok(())
+    }
+
+    /// The same guest comes up after a few early connects: the client is served once the ready byte arrives, and
+    /// the ready byte itself is not forwarded to the client.
+    #[tokio::test]
+    async fn a_dial_is_retried_until_the_ready_byte_arrives() -> anyhow::Result<()> {
+        let (guest, accepted) = flaky_guest(3).await?;
+        let (dialer, _) = TcpDialer::new(guest);
+        let bridge = Bridge::start(dialer, config(8, 2_000)).await?;
+        let mut client = TcpStream::connect(bridge.addr()).await?;
+        assert!(
+            echoes(&mut client, b"late").await,
+            "served once ready, with no stray ready byte"
+        );
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            4,
+            "three early closes, then the ready one"
+        );
+        Ok(())
+    }
+
+    /// `shutdown` returns only after every live connection is closed, so a restart or reuse that relies on it
+    /// cannot see a late byte forwarded. Run multi-threaded: a connection task on another worker finishes its poll
+    /// before it is cancelled, and a current-thread runtime hides that.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_has_closed_every_connection_when_it_returns() -> anyhow::Result<()> {
+        let (dialer, _) = TcpDialer::new(echo_guest().await?);
+        let bridge = Bridge::start(dialer, config(8, 0)).await?;
+        let mut live = TcpStream::connect(bridge.addr()).await?;
+        assert!(echoes(&mut live, b"live").await, "the connection works before shutdown");
+
+        bridge.shutdown().await;
+
+        assert!(already_closed(live)?, "no live connection may outlive shutdown");
+        Ok(())
+    }
+
+    /// A client still waiting inside its dial window is closed by shutdown too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_closes_a_client_waiting_in_its_dial_window() -> anyhow::Result<()> {
+        let (guest, _) = flaky_guest(u32::MAX).await?;
+        let (dialer, _) = TcpDialer::new(guest);
+        let bridge = Bridge::start(dialer, config(8, 5_000)).await?;
+        let waiting = TcpStream::connect(bridge.addr()).await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        bridge.shutdown().await;
+
+        assert!(
+            already_closed(waiting)?,
+            "a client in its dial window is closed by shutdown"
+        );
+        Ok(())
+    }
+
+    /// A config that can never serve is an error at `start`, not a bridge that silently refuses everyone.
+    #[tokio::test]
+    async fn a_config_that_cannot_serve_is_refused_at_start() -> anyhow::Result<()> {
+        let (guest, _) = flaky_guest(0).await?;
+        for max in [0, usize::MAX] {
+            let (dialer, _) = TcpDialer::new(guest);
+            let started = Bridge::start(dialer, config(max, 0)).await;
+            assert!(
+                matches!(&started, Err(e) if e.kind() == io::ErrorKind::InvalidInput),
+                "max_connections {max} must be refused, got {started:?}"
+            );
+        }
         Ok(())
     }
 }
