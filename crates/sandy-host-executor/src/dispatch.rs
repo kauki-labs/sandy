@@ -212,6 +212,19 @@ fn history_lines_env(history_lines: u32) -> [(String, String); 1] {
     [("SANDY_HISTORY_LINES".to_owned(), history_lines.to_string())]
 }
 
+/// The `SANDY_SERVICE` env entry for a flake/v1 dispatch that declares a service (#589): the spec as JSON for
+/// the guest agent's probe loop. `None` for a plain job. `impls/vm` forwards this entry like the history bound.
+///
+/// # Errors
+/// `serde_json`'s error if the spec cannot be serialized (it cannot in practice).
+fn service_env(
+    service: Option<&sandy_guest_template::manifest::ServiceSpec>,
+) -> Result<Option<(String, String)>, serde_json::Error> {
+    service
+        .map(|spec| Ok((sandy_api::agent::SERVICE_ENV.to_owned(), serde_json::to_string(spec)?)))
+        .transpose()
+}
+
 /// An `argv/v1` manifest's decoded shape (manifest-parity #480, `sandyd.md`
 /// §19): a bare `["cmd", "arg", ...]` array still decodes, with every field
 /// but `command` absent — the backward-compat form `scripts/cross-machine-
@@ -614,6 +627,10 @@ pub fn handle_dispatch(
             // overlays (manifest-parity #480, `sandyd.md` §19).
             let mut env = decoded.env.clone();
             env.extend(history_lines_env(decoded.history_lines));
+            env.extend(
+                service_env(decoded.service.as_ref())
+                    .map_err(|e| DispatchError::MalformedManifest(format!("the service spec: {e}")))?,
+            );
             let spec = RunSpec {
                 digests: false,
                 egress: None,
@@ -748,6 +765,28 @@ mod tests {
             history_lines_env(5_000),
             [("SANDY_HISTORY_LINES".to_owned(), "5000".to_owned())]
         );
+    }
+
+    /// #589: a service manifest reaches the guest agent as one JSON env entry; a plain job adds none.
+    #[test]
+    fn service_env_carries_the_spec_and_is_absent_for_a_plain_job() -> Result<(), serde_json::Error> {
+        use sandy_guest_template::manifest::{HealthProbe, ProbeCheck, RestartPolicy, ServiceSpec};
+
+        assert_eq!(service_env(None)?, None);
+        let spec = ServiceSpec {
+            user: "dev".to_owned(),
+            probe: HealthProbe {
+                check: ProbeCheck::Tcp { port: 3773 },
+                interval_secs: 2,
+                timeout_secs: 1,
+                max_attempts: 30,
+            },
+            restart: RestartPolicy::Never,
+        };
+        let (key, value) = service_env(Some(&spec))?.expect("a service sets the env entry");
+        assert_eq!(key, sandy_api::agent::SERVICE_ENV);
+        assert_eq!(serde_json::from_str::<ServiceSpec>(&value)?, spec);
+        Ok(())
     }
 
     #[test]

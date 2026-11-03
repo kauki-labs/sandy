@@ -177,6 +177,7 @@ fn bytecount_newlines(buf: &[u8]) -> usize {
 mod egress_relay;
 mod link_source;
 mod peer;
+mod service;
 mod tmux_pty;
 
 use link_source::LinkSource;
@@ -284,8 +285,12 @@ where
     // the live tmux session's own `history-limit` and the archived
     // transcript's cap below.
     let history_lines = configured_history_lines();
+    // #589: a declared service reports readiness from its health probe, never from console text. Parsed
+    // before the job starts so a mangled spec refuses the run instead of skipping the probe.
+    let service = service::from_env()?;
     let tmux_job =
         TmuxJob::start(&job, peer_env, history_lines).map_err(|e| format!("starting the tmux job session: {e}"))?;
+    let readiness = service.map(|spec| service::spawn_readiness(Arc::clone(&agent), spec.probe));
     let (pty_read, pty_write, resizer, mut attach_child) = tmux_job
         .open_attach()
         .map_err(|e| format!("opening the attach pty: {e}"))?;
@@ -359,6 +364,11 @@ where
         Ok(Ok(())) => {}
         Ok(Err(e)) => return Err(format!("bridging the job's stdio: {e}")),
         Err(e) => return Err(format!("the stdio bridge task panicked: {e}")),
+    }
+    // The exit is the link's last frame: end the probe (finishing a verdict write already begun, never
+    // tearing it) before anything else is written.
+    if let Some(readiness) = readiness {
+        readiness.finish().await;
     }
 
     // The live attach bridge above only reliably carries output for a job
