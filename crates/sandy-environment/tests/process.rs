@@ -171,6 +171,11 @@ fn an_unknown_or_killed_environment_is_not_running_and_kill_is_idempotent() -> R
 /// The counter in `beat` advances while its writer lives.
 fn is_beating(beat: &Path) -> bool {
     let read = || std::fs::read_to_string(beat).unwrap_or_default();
+    // A freshly started writer may not have written yet, most of all on a loaded host.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while read().is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let first = read();
     std::thread::sleep(Duration::from_millis(250));
     !first.is_empty() && first != read()
