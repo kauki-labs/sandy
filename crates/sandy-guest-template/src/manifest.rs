@@ -186,6 +186,15 @@ pub fn validate_service(manifest: &FlakeManifestV1) -> Result<(), String> {
     if manifest.command.is_empty() {
         return Err("a service needs a command to run".to_owned());
     }
+    validate_service_spec(service)
+}
+
+/// The part of [`validate_service`] that needs only the spec: the guest agent calls it on the spec it reads from
+/// `SANDY_SERVICE`, so a spec that skipped the executor's decode (a submitter's own env entry) is checked too.
+///
+/// # Errors
+/// The first problem found, as a message.
+pub fn validate_service_spec(service: &ServiceSpec) -> Result<(), String> {
     if !is_service_account_name(&service.user) || service.user == "root" {
         return Err(format!(
             "a service must name a non-root user account ([a-z_][a-z0-9_-]*, at most 32 characters), got {:?}",
@@ -420,6 +429,18 @@ mod tests {
         }
         assert_eq!(decode_flake_manifest(base("null").as_bytes())?.service, None);
         Ok(())
+    }
+
+    /// The bare-spec check the agent uses accepts the T3 shape and refuses what the manifest check refuses.
+    #[test]
+    fn validate_service_spec_checks_a_spec_without_a_manifest() {
+        assert_eq!(validate_service_spec(&t3_service()), Ok(()));
+        let mut zero_interval = t3_service();
+        zero_interval.probe.interval_secs = 0;
+        assert!(validate_service_spec(&zero_interval).is_err());
+        let mut root = t3_service();
+        root.user = "root".to_owned();
+        assert!(validate_service_spec(&root).is_err());
     }
 
     /// The T3 shape decodes, and an omitted restart policy and probe timing take their defaults.
