@@ -458,6 +458,59 @@ mod tests {
         })
     }
 
+    /// A state whose control socket does not exist: every status call fails at once.
+    fn dead_state(dir: &std::path::Path) -> anyhow::Result<State> {
+        Ok(State {
+            control_socket: dir.join("absent.sock"),
+            rpc_deadline: Duration::from_secs(30),
+            clients: Vec::new(),
+            owners: crate::owners::Owners::open(&dir.join("state"))?,
+            tickets: Tickets::new(Duration::from_secs(30)),
+            send_timeout: Duration::from_secs(30),
+            env_create: HashMap::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_data_plane_error_while_draining_is_a_fault_not_a_terminal_exit() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = dead_state(dir.path())?;
+        let (tx, _rx) = mpsc::channel(4);
+        let (frames_tx, mut frames): (mpsc::Sender<Result<Option<LinkFrame>, ()>>, Frames) = mpsc::channel(2);
+        frames_tx.send(Err(())).await?;
+        let end = drain(&state, &tx, &mut frames, "JOB_STATUS_SUCCEEDED").await;
+        assert!(
+            matches!(&end, End::Exit(r) if r == "fault:data plane error"),
+            "got {:?}",
+            exit_reason(&end)
+        );
+        // A clean close and a quiet plane still end as terminal.
+        frames_tx.send(Ok(None)).await?;
+        let end = drain(&state, &tx, &mut frames, "JOB_STATUS_SUCCEEDED").await;
+        assert!(matches!(&end, End::Exit(r) if r == "job_terminal:JOB_STATUS_SUCCEEDED"));
+        Ok(())
+    }
+
+    fn exit_reason(end: &End) -> Option<&str> {
+        match end {
+            End::Exit(r) => Some(r),
+            End::ClientGone => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_status_path_that_keeps_failing_ends_the_stream_with_a_fault() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = dead_state(dir.path())?;
+        let (tx, _rx) = mpsc::channel(1);
+        let (_frames_tx, mut frames): (mpsc::Sender<Result<Option<LinkFrame>, ()>>, Frames) = mpsc::channel(1);
+        let end = tokio::time::timeout(Duration::from_secs(12), run(&state, "job", &tx, &mut frames))
+            .await
+            .map_err(|_| anyhow::anyhow!("the stream held its slot while status kept failing"))?;
+        assert_eq!(exit_reason(&end), Some("fault:status unavailable"));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_hang_up_is_noticed_while_a_status_poll_is_stuck() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
