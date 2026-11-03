@@ -247,3 +247,32 @@ async fn creating_and_deleting_cannot_grow_sandyds_table_past_the_clients_record
     spawn_id(&f, TOKEN_B, spawn_body("r3")).await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn a_list_filter_by_state_and_task_ref_and_a_bad_filter() -> Result<()> {
+    let f = fixture().await?;
+    let mut body = spawn_body("t1");
+    body["task_ref"] = json!("task-a");
+    let a = spawn_id(&f, TOKEN_A, body).await?;
+    spawn_id(&f, TOKEN_A, spawn_body("t2")).await?;
+    let (_, by_task) = f
+        .call("GET", "/v1/environments?task_ref=task-a", Some(TOKEN_A), None)
+        .await?;
+    assert_eq!(by_task["environments"].as_array().map(Vec::len), Some(1));
+    assert_eq!(by_task["environments"][0]["environment_id"], a.as_str());
+    let (_, ready) = f
+        .call("GET", "/v1/environments?state=ready", Some(TOKEN_A), None)
+        .await?;
+    assert_eq!(ready["environments"].as_array().map(Vec::len), Some(0));
+    for bad in ["state=nonsense", "task_ref=%00bad"] {
+        let (status, resp) = f
+            .call("GET", &format!("/v1/environments?{bad}"), Some(TOKEN_A), None)
+            .await?;
+        assert_eq!(
+            (status, &resp["code"]),
+            (StatusCode::BAD_REQUEST, &json!("invalid_request")),
+            "{bad}"
+        );
+    }
+    Ok(())
+}

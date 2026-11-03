@@ -171,6 +171,17 @@ async fn call(state: &State, op: control_request::Op) -> Result<control_response
     }
 }
 
+/// sandyd refuses a list that matches too many rows with `INVALID_ARGUMENT`. The
+/// caller's own arguments were already checked, so that refusal is the daemon's
+/// limit, not a bad request.
+fn list_refusal(e: ApiError) -> ApiError {
+    if e.status == StatusCode::BAD_REQUEST && e.code == "invalid_request" {
+        UNAVAILABLE
+    } else {
+        e
+    }
+}
+
 async fn one(state: &State, op: control_request::Op) -> Result<EnvironmentResponse, ApiError> {
     match call(state, op).await? {
         control_response::Result::Environment(e) => Ok(e),
@@ -238,7 +249,7 @@ pub(crate) async fn spawn(state: &State, client: &Client, req: Request<Incoming>
 /// How many non-terminal environments `client` holds.
 async fn live_owned(state: &State, client: &Client) -> Result<usize, ApiError> {
     let op = control_request::Op::ListEnvironments(ListEnvironmentsRequest::default());
-    let control_response::Result::Environments(all) = call(state, op).await? else {
+    let control_response::Result::Environments(all) = call(state, op).await.map_err(list_refusal)? else {
         return Err(UNAVAILABLE);
     };
     Ok(all
@@ -293,11 +304,15 @@ pub(crate) async fn list(state: &State, client: &Client, query: Option<&str>) ->
         Some("deleted") => EnvironmentState::Deleted,
         Some(_) => return Err(INVALID),
     };
+    let task_ref = query_param(query, "task_ref").unwrap_or_default();
+    if task_ref.len() > 256 || task_ref.chars().any(char::is_control) {
+        return Err(INVALID);
+    }
     let op = control_request::Op::ListEnvironments(ListEnvironmentsRequest {
         state: wanted.into(),
-        task_ref: query_param(query, "task_ref").unwrap_or_default(),
+        task_ref,
     });
-    let control_response::Result::Environments(all) = call(state, op).await? else {
+    let control_response::Result::Environments(all) = call(state, op).await.map_err(list_refusal)? else {
         return Err(UNAVAILABLE);
     };
     let environments: Vec<Value> = all
@@ -353,6 +368,13 @@ mod tests {
         for bad in ["has space", "a\nb", "a/b", "a:b", "tab\t", "\u{e9}"] {
             assert!(!valid_request_id(bad), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_list_the_daemon_refuses_is_unavailable_not_a_bad_request() {
+        assert_eq!(list_refusal(REFUSED_FIELDS).code, "unavailable");
+        assert_eq!(list_refusal(NOT_FOUND).code, "not_found");
+        assert_eq!(list_refusal(QUOTA).code, "quota_exceeded");
     }
 
     #[test]
