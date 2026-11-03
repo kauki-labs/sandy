@@ -752,11 +752,9 @@ where
                 {
                     Ok(_) => readiness_seen = true,
                     Err(e @ ChannelError::Backend(_)) => return Err(e.into()),
-                    Err(e) => {
-                        let reason = format!("the service readiness verdict was refused: {e}");
-                        tracing::warn!("{reason}");
-                        refusals.push(reason);
-                    }
+                    // Logged, not sent back: the agent counts every `Refused` frame as a refused peer post, and a
+                    // lost verdict is not one (CodeRabbit on #622).
+                    Err(e) => tracing::warn!("the service readiness verdict was refused: {e}"),
                 }
             }
             Some(other) => {
@@ -1174,6 +1172,22 @@ mod tests {
             payload.len()
         );
         std::str::from_utf8(payload).context("the kept output is valid UTF-8")?;
+        Ok(())
+    }
+
+    /// CodeRabbit on #622: output above `MAX_FRAME` is cut by the agent before the frame is written. Without
+    /// that cut `write_frame` refuses the frame and no verdict is sent at all.
+    #[tokio::test]
+    async fn a_probe_output_above_the_frame_limit_is_cut_before_it_is_written() -> anyhow::Result<()> {
+        use crate::agent::MAX_PROBE_OUTPUT;
+
+        let huge = "x".repeat(MAX_FRAME + 1);
+        let (seen, result) = service_envelopes(async |agent| agent.report_probe_failed(&huge).await).await?;
+        assert_eq!(result?, Some(0));
+        assert_eq!(
+            seen.first().context("a probe-failed envelope")?.1.len(),
+            MAX_PROBE_OUTPUT
+        );
         Ok(())
     }
 
