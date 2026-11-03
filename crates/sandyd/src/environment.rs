@@ -14,49 +14,359 @@
 
 use std::sync::Arc;
 
+use prost::Message;
 use sandy_control_proto::{
-    ControlRequest, ControlResponse, control_request,
+    ControlRequest, ControlResponse, control_request, control_response,
     v1::{
         EnvironmentError, EnvironmentErrorCode, EnvironmentFailure, EnvironmentLifetimeKind, EnvironmentResponse,
         EnvironmentSpec, EnvironmentState as WireState, ListEnvironmentsResponse,
     },
 };
 
-use crate::environment_store::{EnvironmentStore, EnvironmentStoreError};
+use crate::environment_store::{
+    CreateOutcome, EnvTransition, EnvironmentRecord, EnvironmentState, EnvironmentStore, EnvironmentStoreError,
+};
 
-/// `EnvironmentStore::create`'s payload encoding name.
+/// The create payload's encoding name, stored beside the spec bytes.
 pub const SPEC_ENCODING: &str = "sandy.control.v1.EnvironmentSpec";
+
+const MAX_KEY: usize = 128;
+const MAX_PROFILE: usize = 64;
+const MAX_SIZE: usize = 32;
+const MAX_TASK_REF: usize = 256;
+/// The longest ephemeral lifetime a client may ask for: seven days.
+const MAX_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// A fault the handler cannot turn into a typed refusal. The connection is
+/// closed and the fault logged, like a job-store fault.
+#[derive(Debug, thiserror::Error)]
+pub enum EnvironmentHandlerError {
+    /// The environment store faulted.
+    #[error(transparent)]
+    Store(#[from] EnvironmentStoreError),
+    /// A blocking store call panicked.
+    #[error("environment store task failed: {0}")]
+    Join(#[from] tokio::task::JoinError),
+    /// A stored spec does not decode; a row this handler wrote always does.
+    #[error("environment {0:?} holds a spec that does not decode")]
+    CorruptSpec(String),
+    /// A freshly minted id already names another environment.
+    #[error("a freshly minted environment id collided with an existing one")]
+    IdCollision,
+}
 
 /// Whether `op` is an environment operation this module serves.
 pub fn is_environment_op(op: &Option<control_request::Op>) -> bool {
-    let _ = (
+    matches!(
         op,
-        EnvironmentErrorCode::NotFound,
-        EnvironmentLifetimeKind::Ephemeral,
-        WireState::Ready,
-    );
-    unimplemented!("#587 slice A2: red")
+        Some(
+            control_request::Op::CreateEnvironment(_)
+                | control_request::Op::GetEnvironment(_)
+                | control_request::Op::ListEnvironments(_)
+                | control_request::Op::StopEnvironment(_)
+                | control_request::Op::ResumeEnvironment(_)
+                | control_request::Op::CancelEnvironment(_)
+                | control_request::Op::DeleteEnvironment(_)
+        )
+    )
 }
 
-/// Serve one environment request against `store`.
+type Reply = Result<control_response::Result, EnvironmentHandlerError>;
+
+fn refuse(code: EnvironmentErrorCode, message: impl Into<String>) -> Reply {
+    Ok(control_response::Result::EnvironmentError(EnvironmentError {
+        code: code.into(),
+        message: message.into(),
+    }))
+}
+
+/// Run a blocking store call off the async runtime.
+async fn blocking<T: Send + 'static>(
+    store: &Arc<EnvironmentStore>,
+    f: impl FnOnce(&EnvironmentStore) -> Result<T, EnvironmentStoreError> + Send + 'static,
+) -> Result<T, EnvironmentHandlerError> {
+    let store = Arc::clone(store);
+    Ok(tokio::task::spawn_blocking(move || f(&store)).await??)
+}
+
+/// Serve one environment request against `store`. A refused request is an
+/// [`EnvironmentError`] reply, not an `Err`.
 ///
 /// # Errors
-/// [`EnvironmentStoreError`] when the store itself faults; a refused request is
-/// an [`EnvironmentError`] response, not an `Err`.
+/// [`EnvironmentHandlerError`] for a fault no client can act on.
 pub async fn handle(
     store: &Arc<EnvironmentStore>,
     request: ControlRequest,
-) -> Result<ControlResponse, EnvironmentStoreError> {
-    let _ = (
+) -> Result<ControlResponse, EnvironmentHandlerError> {
+    use control_request::Op;
+    let result = match request.op {
+        Some(Op::CreateEnvironment(r)) => create(store, r.idempotency_key, r.spec).await?,
+        Some(Op::GetEnvironment(r)) => get(store, r.environment_id).await?,
+        Some(Op::ListEnvironments(r)) => list(store, r.state, r.task_ref).await?,
+        Some(Op::StopEnvironment(r)) => stop_or_resume(store, r.environment_id, true).await?,
+        Some(Op::ResumeEnvironment(r)) => stop_or_resume(store, r.environment_id, false).await?,
+        Some(Op::CancelEnvironment(r)) => cancel(store, r.environment_id).await?,
+        Some(Op::DeleteEnvironment(r)) => delete(store, r.environment_id).await?,
+        _ => refuse(EnvironmentErrorCode::InvalidArgument, "not an environment operation")?,
+    };
+    Ok(ControlResponse {
+        request_id: request.request_id,
+        result: Some(result),
+    })
+}
+
+/// A key or name: 1 to `max` bytes of letters, digits, `-`, `_` and `.`.
+fn token_ok(s: &str, max: usize) -> bool {
+    !s.is_empty()
+        && s.len() <= max
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// Prefixes of well-known credential formats. A profile names an identity; it
+/// must never be, or carry, a credential.
+const SECRET_PREFIXES: &[&str] = &[
+    "ghp_",
+    "gho_",
+    "ghs_",
+    "ghu_",
+    "github_pat_",
+    "glpat-",
+    "sk-",
+    "xoxb-",
+    "AKIA",
+];
+
+fn looks_like_secret(s: &str) -> bool {
+    SECRET_PREFIXES
+        .iter()
+        .any(|p| s.starts_with(p) && s.len() >= p.len() + 8)
+}
+
+fn validate_spec(spec: &EnvironmentSpec) -> Result<(), String> {
+    if !token_ok(&spec.profile, MAX_PROFILE) {
+        return Err(format!(
+            "profile must be 1 to {MAX_PROFILE} letters, digits, '-', '_' or '.'"
+        ));
+    }
+    if looks_like_secret(&spec.profile) {
+        return Err("profile names an identity profile; it must not look like a credential".to_owned());
+    }
+    if !spec.size.is_empty() && !token_ok(&spec.size, MAX_SIZE) {
+        return Err(format!(
+            "size must be empty or 1 to {MAX_SIZE} letters, digits, '-', '_' or '.'"
+        ));
+    }
+    if spec.task_ref.len() > MAX_TASK_REF || spec.task_ref.chars().any(char::is_control) {
+        return Err(format!(
+            "task_ref must be at most {MAX_TASK_REF} bytes with no control characters"
+        ));
+    }
+    let lifetime = spec.lifetime.as_ref().ok_or("lifetime is required")?;
+    match EnvironmentLifetimeKind::try_from(lifetime.kind) {
+        Ok(EnvironmentLifetimeKind::Ephemeral) if (1..=MAX_TTL_SECS).contains(&lifetime.ttl_secs) => Ok(()),
+        Ok(EnvironmentLifetimeKind::Ephemeral) => Err(format!(
+            "an ephemeral environment needs ttl_secs between 1 and {MAX_TTL_SECS}"
+        )),
+        Ok(EnvironmentLifetimeKind::Persistent) if lifetime.ttl_secs == 0 => Ok(()),
+        Ok(EnvironmentLifetimeKind::Persistent) => Err("a persistent environment has no ttl_secs".to_owned()),
+        _ => Err("lifetime.kind must be EPHEMERAL or PERSISTENT".to_owned()),
+    }
+}
+
+fn to_wire_state(state: EnvironmentState) -> WireState {
+    match state {
+        EnvironmentState::Provisioning => WireState::Provisioning,
+        EnvironmentState::Ready => WireState::Ready,
+        EnvironmentState::Stopped => WireState::Stopped,
+        EnvironmentState::Failed => WireState::Failed,
+        EnvironmentState::Deleted => WireState::Deleted,
+    }
+}
+
+fn from_wire_state(state: WireState) -> Option<EnvironmentState> {
+    match state {
+        WireState::Unspecified => None,
+        WireState::Provisioning => Some(EnvironmentState::Provisioning),
+        WireState::Ready => Some(EnvironmentState::Ready),
+        WireState::Stopped => Some(EnvironmentState::Stopped),
+        WireState::Failed => Some(EnvironmentState::Failed),
+        WireState::Deleted => Some(EnvironmentState::Deleted),
+    }
+}
+
+fn decode_spec(record: &EnvironmentRecord) -> Result<EnvironmentSpec, EnvironmentHandlerError> {
+    EnvironmentSpec::decode(record.spec.as_slice())
+        .map_err(|_| EnvironmentHandlerError::CorruptSpec(record.environment_id.clone()))
+}
+
+fn to_wire(record: EnvironmentRecord) -> Result<EnvironmentResponse, EnvironmentHandlerError> {
+    let spec = decode_spec(&record)?;
+    Ok(EnvironmentResponse {
+        environment_id: record.environment_id,
+        state: to_wire_state(record.state).into(),
+        steps: Vec::new(),
+        failure: record.failure.map(|f| EnvironmentFailure {
+            step: f.step,
+            reason: f.reason,
+        }),
+        // Set by the launch driver (slice C) once the environment is Ready.
+        connection: None,
+        spec: Some(spec),
+    })
+}
+
+fn reply(record: EnvironmentRecord) -> Reply {
+    Ok(control_response::Result::Environment(to_wire(record)?))
+}
+
+async fn create(store: &Arc<EnvironmentStore>, key: String, spec: Option<EnvironmentSpec>) -> Reply {
+    if !token_ok(&key, MAX_KEY) {
+        return refuse(
+            EnvironmentErrorCode::InvalidArgument,
+            format!("idempotency_key must be 1 to {MAX_KEY} letters, digits, '-', '_' or '.'"),
+        );
+    }
+    let Some(spec) = spec else {
+        return refuse(EnvironmentErrorCode::InvalidArgument, "spec is required");
+    };
+    if let Err(why) = validate_spec(&spec) {
+        return refuse(EnvironmentErrorCode::InvalidArgument, why);
+    }
+    let bytes = spec.encode_to_vec();
+    let new_id = format!("env-{}", uuid::Uuid::new_v4().simple());
+    let outcome = blocking(store, move |s| s.create(&key, &new_id, &bytes, SPEC_ENCODING)).await?;
+    match outcome {
+        CreateOutcome::Created(record) | CreateOutcome::Existing(record) => reply(record),
+        CreateOutcome::Conflict => refuse(
+            EnvironmentErrorCode::RequestIdConflict,
+            "this idempotency_key was used with a different spec",
+        ),
+        CreateOutcome::CapExceeded { max } => refuse(
+            EnvironmentErrorCode::QuotaExceeded,
+            format!("the daemon already holds {max} environments"),
+        ),
+        CreateOutcome::IdTaken => Err(EnvironmentHandlerError::IdCollision),
+    }
+}
+
+fn id_ok(id: &str) -> bool {
+    token_ok(id, MAX_KEY)
+}
+
+fn bad_id() -> Reply {
+    refuse(EnvironmentErrorCode::InvalidArgument, "environment_id is required")
+}
+
+fn not_found(id: &str) -> Reply {
+    refuse(EnvironmentErrorCode::NotFound, format!("no environment {id:?}"))
+}
+
+async fn fetch(store: &Arc<EnvironmentStore>, id: &str) -> Result<Option<EnvironmentRecord>, EnvironmentHandlerError> {
+    let id = id.to_owned();
+    blocking(store, move |s| s.get(&id)).await
+}
+
+async fn get(store: &Arc<EnvironmentStore>, id: String) -> Reply {
+    if !id_ok(&id) {
+        return bad_id();
+    }
+    match fetch(store, &id).await? {
+        Some(record) => reply(record),
+        None => not_found(&id),
+    }
+}
+
+async fn list(store: &Arc<EnvironmentStore>, state: i32, task_ref: String) -> Reply {
+    let Ok(wire) = WireState::try_from(state) else {
+        return refuse(EnvironmentErrorCode::InvalidArgument, "unknown state filter");
+    };
+    let records = match from_wire_state(wire) {
+        None => blocking(store, EnvironmentStore::list).await?,
+        Some(s) => blocking(store, move |st| st.list_by_state(s)).await?,
+    };
+    let mut environments = Vec::new();
+    for record in records {
+        let wire = to_wire(record)?;
+        if task_ref.is_empty() || wire.spec.as_ref().is_some_and(|s| s.task_ref == task_ref) {
+            environments.push(wire);
+        }
+    }
+    Ok(control_response::Result::Environments(ListEnvironmentsResponse {
+        environments,
+    }))
+}
+
+/// Applies an [`EnvTransition`] to the reply a client sees.
+async fn finish(store: &Arc<EnvironmentStore>, id: &str, moved: EnvTransition, needs: &str) -> Reply {
+    match moved {
+        EnvTransition::Applied | EnvTransition::Unchanged => match fetch(store, id).await? {
+            Some(record) => reply(record),
+            None => not_found(id),
+        },
+        EnvTransition::NotFound => not_found(id),
+        EnvTransition::Refused(state) => refuse(
+            EnvironmentErrorCode::InvalidState,
+            format!("environment is {}; {needs}", state.as_str()),
+        ),
+    }
+}
+
+async fn stop_or_resume(store: &Arc<EnvironmentStore>, id: String, stop: bool) -> Reply {
+    if !id_ok(&id) {
+        return bad_id();
+    }
+    let Some(record) = fetch(store, &id).await? else {
+        return not_found(&id);
+    };
+    let spec = decode_spec(&record)?;
+    let ephemeral = spec
+        .lifetime
+        .as_ref()
+        .is_some_and(|l| l.kind == i32::from(EnvironmentLifetimeKind::Ephemeral));
+    if ephemeral {
+        return refuse(
+            EnvironmentErrorCode::UnsupportedForLifetime,
+            "an ephemeral environment lives for one task and cannot be stopped or resumed",
+        );
+    }
+    let key = id.clone();
+    let (moved, needs) = if stop {
+        (
+            blocking(store, move |s| s.stop(&key)).await?,
+            "only a ready environment can be stopped",
+        )
+    } else {
+        (
+            blocking(store, move |s| s.resume(&key)).await?,
+            "only a stopped environment can be resumed",
+        )
+    };
+    finish(store, &id, moved, needs).await
+}
+
+async fn cancel(store: &Arc<EnvironmentStore>, id: String) -> Reply {
+    if !id_ok(&id) {
+        return bad_id();
+    }
+    let key = id.clone();
+    let moved = blocking(store, move |s| s.cancel(&key)).await?;
+    finish(
         store,
-        request,
-        EnvironmentError::default(),
-        EnvironmentFailure::default(),
-        EnvironmentResponse::default(),
-        EnvironmentSpec::default(),
-        ListEnvironmentsResponse::default(),
-    );
-    unimplemented!("#587 slice A2: red")
+        &id,
+        moved,
+        "only an environment still provisioning can be cancelled",
+    )
+    .await
+}
+
+async fn delete(store: &Arc<EnvironmentStore>, id: String) -> Reply {
+    if !id_ok(&id) {
+        return bad_id();
+    }
+    let key = id.clone();
+    let moved = blocking(store, move |s| s.delete(&key)).await?;
+    finish(store, &id, moved, "delete applies from every state").await
 }
 
 #[cfg(test)]
@@ -353,7 +663,7 @@ mod tests {
         let ready = ids(call(&s, list(WireState::Ready, ""))
             .await?
             .map_err(|e| anyhow::anyhow!("{e:?}"))?)?;
-        assert_eq!(ready, [b.environment_id.clone()]);
+        assert_eq!(ready, [b.environment_id]);
         let by_task = ids(call(&s, list(WireState::Unspecified, "owner/repo#12"))
             .await?
             .map_err(|e| anyhow::anyhow!("{e:?}"))?)?;

@@ -478,6 +478,20 @@ impl EnvironmentStore {
         self.transition(environment_id, &LIVE, EnvironmentState::Deleted, None)
     }
 
+    /// `Provisioning` to `Deleted`: cancel a launch that has not finished.
+    /// Cancelling a deleted environment is [`EnvTransition::Unchanged`].
+    ///
+    /// # Errors
+    /// As [`EnvironmentStore::create`].
+    pub fn cancel(&self, environment_id: &str) -> Result<EnvTransition, EnvironmentStoreError> {
+        self.transition(
+            environment_id,
+            &[EnvironmentState::Provisioning],
+            EnvironmentState::Deleted,
+            None,
+        )
+    }
+
     /// Move `environment_id` to `to` if it is in one of the `from` states.
     /// Read and write share one IMMEDIATE transaction, so two racing
     /// transitions cannot both pass the same guard.
@@ -710,6 +724,25 @@ mod tests {
             assert_eq!(s.delete(&id)?, EnvTransition::Applied, "from {want:?}");
             assert_eq!(state_of(&s, &id)?, EnvironmentState::Deleted);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn cancel_applies_only_while_provisioning_and_is_idempotent_once_deleted() -> Result<()> {
+        let s = store()?;
+        created(&s)?;
+        assert_eq!(s.cancel("env-1")?, EnvTransition::Applied);
+        assert_eq!(state_of(&s, "env-1")?, EnvironmentState::Deleted);
+        assert_eq!(s.cancel("env-1")?, EnvTransition::Unchanged);
+        s.create("r2", "env-2", SPEC, ENC)?;
+        s.mark_ready("env-2")?;
+        assert_eq!(s.cancel("env-2")?, EnvTransition::Refused(EnvironmentState::Ready));
+        assert_eq!(
+            state_of(&s, "env-2")?,
+            EnvironmentState::Ready,
+            "a refused cancel changes nothing"
+        );
+        assert_eq!(s.cancel("nope")?, EnvTransition::NotFound);
         Ok(())
     }
 
