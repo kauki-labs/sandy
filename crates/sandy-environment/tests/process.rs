@@ -16,6 +16,13 @@ use sandy_environment::{ProcessConfig, ProcessConfigError, ProcessEnvironmentBac
 
 const FAKE: &str = env!("CARGO_BIN_EXE_fake-t3");
 
+/// A temp dir the backend accepts as a state dir: `tempfile` makes 0755 ones here.
+fn private_tempdir() -> Result<tempfile::TempDir> {
+    let dir = tempfile::tempdir()?;
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+    Ok(dir)
+}
+
 fn spec(id: &str) -> EnvironmentSpec {
     EnvironmentSpec {
         environment_id: id.to_owned(),
@@ -65,7 +72,7 @@ fn env_dir(state: &Path, id: &str) -> PathBuf {
 
 #[test]
 fn an_environment_is_starting_while_the_service_answers_503_then_ready_at_its_endpoint() -> Result<()> {
-    let state = tempfile::tempdir()?;
+    let state = private_tempdir()?;
     let b = backend(state.path(), &["--ready-after-ms", "600"])?;
     assert_eq!(b.launch(&spec("env-1"))?, Launch::Started);
     assert!(
@@ -84,7 +91,7 @@ fn an_environment_is_starting_while_the_service_answers_503_then_ready_at_its_en
 
 #[test]
 fn launching_a_running_id_again_starts_no_second_process() -> Result<()> {
-    let state = tempfile::tempdir()?;
+    let state = private_tempdir()?;
     let b = backend(state.path(), &[])?;
     assert_eq!(b.launch(&spec("env-1"))?, Launch::Started);
     assert_eq!(b.launch(&spec("env-1"))?, Launch::AlreadyRunning);
@@ -96,7 +103,7 @@ fn launching_a_running_id_again_starts_no_second_process() -> Result<()> {
 
 #[test]
 fn two_environments_get_their_own_ports_and_directories() -> Result<()> {
-    let state = tempfile::tempdir()?;
+    let state = private_tempdir()?;
     let b = backend(state.path(), &[])?;
     b.launch(&spec("env-1"))?;
     b.launch(&spec("env-2"))?;
@@ -115,7 +122,7 @@ fn two_environments_get_their_own_ports_and_directories() -> Result<()> {
 
 #[test]
 fn a_service_that_exits_early_is_failed_with_its_exit_status() -> Result<()> {
-    let state = tempfile::tempdir()?;
+    let state = private_tempdir()?;
     let b = backend(state.path(), &["--exit-after-ms", "100"])?;
     b.launch(&spec("env-1"))?;
     let p = wait_for(&b, "env-1", |p| matches!(p, Probe::Failed { .. }))?;
@@ -130,7 +137,7 @@ fn a_service_that_exits_early_is_failed_with_its_exit_status() -> Result<()> {
 
 #[test]
 fn a_missing_program_is_a_spawn_error_and_leaves_no_box_or_directory() -> Result<()> {
-    let state = tempfile::tempdir()?;
+    let state = private_tempdir()?;
     let mut c = config(state.path(), &[]);
     c.command = vec!["/nonexistent/sandy-no-such-program".to_owned()];
     let b = ProcessEnvironmentBackend::new(c)?;
@@ -145,7 +152,7 @@ fn a_missing_program_is_a_spawn_error_and_leaves_no_box_or_directory() -> Result
 
 #[test]
 fn an_unknown_or_killed_environment_is_not_running_and_kill_is_idempotent() -> Result<()> {
-    let state = tempfile::tempdir()?;
+    let state = private_tempdir()?;
     let b = backend(state.path(), &[])?;
     assert_eq!(b.probe("env-nope")?, Probe::NotRunning);
     b.launch(&spec("env-1"))?;
@@ -163,7 +170,7 @@ fn an_unknown_or_killed_environment_is_not_running_and_kill_is_idempotent() -> R
 
 #[test]
 fn kill_ends_the_whole_process_group_including_children() -> Result<()> {
-    let state = tempfile::tempdir()?;
+    let state = private_tempdir()?;
     let b = backend(state.path(), &["--spawn-child"])?;
     b.launch(&spec("env-1"))?;
     wait_for(&b, "env-1", |p| matches!(p, Probe::Ready { .. }))?;
@@ -188,7 +195,7 @@ fn kill_ends_the_whole_process_group_including_children() -> Result<()> {
 
 #[test]
 fn the_service_sees_a_clean_environment_with_only_the_passed_variables() -> Result<()> {
-    let state = tempfile::tempdir()?;
+    let state = private_tempdir()?;
     // SAFETY-free way to set a variable for this test process: pass it via the config's pass_env
     // by name only if it exists in the daemon's own environment, so use a name no test sets.
     let mut c = config(state.path(), &["--dump-env"]);
@@ -215,7 +222,7 @@ fn the_service_sees_a_clean_environment_with_only_the_passed_variables() -> Resu
 
 #[test]
 fn the_pair_command_output_goes_to_a_0600_file_and_nowhere_else() -> Result<()> {
-    let state = tempfile::tempdir()?;
+    let state = private_tempdir()?;
     let mut c = config(state.path(), &[]);
     c.pair_command = Some([FAKE, "pair", "--base-dir", "{base_dir}"].map(str::to_owned).to_vec());
     let b = ProcessEnvironmentBackend::new(c)?;
@@ -237,7 +244,7 @@ fn the_pair_command_output_goes_to_a_0600_file_and_nowhere_else() -> Result<()> 
 
 #[test]
 fn a_failing_pair_command_fails_the_environment_without_leaking_its_output() -> Result<()> {
-    let state = tempfile::tempdir()?;
+    let state = private_tempdir()?;
     let mut c = config(state.path(), &[]);
     c.pair_command = Some(
         [FAKE, "pair", "--fail", "--base-dir", "{base_dir}"]
@@ -261,7 +268,7 @@ fn a_failing_pair_command_fails_the_environment_without_leaking_its_output() -> 
 
 #[test]
 fn the_state_and_environment_directories_are_private() -> Result<()> {
-    let state = tempfile::tempdir()?;
+    let state = private_tempdir()?;
     let root = state.path().join("environments");
     let b = backend(&root, &[])?;
     b.launch(&spec("env-1"))?;
@@ -276,7 +283,7 @@ fn the_state_and_environment_directories_are_private() -> Result<()> {
 
 #[test]
 fn an_environment_id_that_could_escape_the_state_dir_is_refused() -> Result<()> {
-    let state = tempfile::tempdir()?;
+    let state = private_tempdir()?;
     let b = backend(state.path(), &[])?;
     for id in ["../x", "a/b", "", ".", "..", "a b", "x\0y"] {
         assert!(matches!(b.launch(&spec(id)), Err(BackendError::Spawn(_))), "id {id:?}");
@@ -292,7 +299,7 @@ fn an_environment_id_that_could_escape_the_state_dir_is_refused() -> Result<()> 
 
 #[test]
 fn an_empty_command_is_refused_at_construction() {
-    let state = tempfile::tempdir().expect("tempdir");
+    let state = private_tempdir().expect("tempdir");
     for command in [vec![], vec![String::new()]] {
         let mut c = config(state.path(), &[]);
         c.command = command;
@@ -303,7 +310,7 @@ fn an_empty_command_is_refused_at_construction() {
 
 #[test]
 fn a_new_backend_removes_a_stale_directory_left_by_an_earlier_daemon() -> Result<()> {
-    let state = tempfile::tempdir()?;
+    let state = private_tempdir()?;
     let stale = env_dir(state.path(), "env-old");
     std::fs::create_dir_all(&stale)?;
     std::fs::write(stale.join("pid"), "999999999")?; // no such process
@@ -321,7 +328,7 @@ fn a_new_backend_removes_a_stale_directory_left_by_an_earlier_daemon() -> Result
 #[cfg(target_os = "linux")]
 #[test]
 fn a_new_backend_kills_the_orphan_process_group_of_a_stale_environment() -> Result<()> {
-    let state = tempfile::tempdir()?;
+    let state = private_tempdir()?;
     let first = backend(state.path(), &["--spawn-child"])?;
     first.launch(&spec("env-1"))?;
     wait_for(&first, "env-1", |p| matches!(p, Probe::Ready { .. }))?;
