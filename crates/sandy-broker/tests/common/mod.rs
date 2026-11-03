@@ -122,7 +122,12 @@ async fn build(
             }
         });
     }
-    let (s, e, r, h) = (Arc::clone(&store), Arc::clone(&environments), Arc::clone(&registry), hosts);
+    let (s, e, r, h) = (
+        Arc::clone(&store),
+        Arc::clone(&environments),
+        Arc::clone(&registry),
+        hosts,
+    );
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             tokio::spawn(sandyd::serve_connection(
