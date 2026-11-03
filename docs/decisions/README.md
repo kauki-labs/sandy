@@ -30,6 +30,7 @@ acceptance matrix, [`../architecture/kpi.md`](../architecture/kpi.md).
 | [journal](journal.md)                             | durable records, reconcile                   |
 | [agent-fabric](agent-fabric.md)                   | fabric seam contracts + test harness         |
 | [sandyd](sandyd.md)                               | control RPC, daemon, job manifest, state     |
+| [broker-api](broker-api.md)                       | HTTP API tier over sandyd                    |
 | [t3-guest-image](t3-guest-image.md)               | guest image with the t3 server and harnesses |
 
 Invariants referenced across these records: **INV-1** secrets never reach
