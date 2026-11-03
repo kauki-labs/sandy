@@ -808,3 +808,81 @@ async fn a_configured_history_lines_env_value_bounds_the_captured_console() -> a
     relay_result(&relay).await??;
     Ok(())
 }
+
+/// Runs the agent with `service` as its spec for a job that exits 0 after `sleep_secs`, and returns the first
+/// service readiness verdict the channel saw plus the run's outcome (#589).
+async fn run_service(
+    service: &str,
+    sleep_secs: u32,
+) -> anyhow::Result<(sandy_fabric_local::agent::ServiceReadiness, Outcome)> {
+    use sandy_fabric_local::agent::ServiceReadiness;
+
+    let (channel, agent_cap, orchestrator_cap) = channel_and_caps().await?;
+    let orchestrator = channel.join(&orchestrator_cap)?;
+    let mut observed = std::pin::pin!(channel.subscribe(&orchestrator)?);
+    let (backend, relay) = backend_relaying(&channel, agent_cap);
+    let env = vec![(sandy_api::agent::SERVICE_ENV.to_string(), service.to_string())];
+    let run = tokio::spawn(run_blocking_with_env(
+        backend,
+        sh(&format!("sleep {sleep_secs}; exit 0")),
+        env,
+    ));
+
+    let verdict = loop {
+        let env = timeout(WAIT, observed.next()).await?.context("channel ended")??;
+        if let Some(verdict) = ServiceReadiness::from_envelope(&env.content_type, &env.payload) {
+            break verdict;
+        }
+    };
+    let outcome = timeout(WAIT, run).await????;
+    relay_result(&relay).await??;
+    Ok((verdict, outcome))
+}
+
+/// #589 positive: a service whose port accepts reports `Ready` over the agent link while it still runs, and
+/// the job's own exit is still reported after it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_service_reports_ready_when_its_probe_passes() -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.context("bind")?;
+    let port = listener.local_addr().context("addr")?.port();
+    let service = format!(r#"{{"user":"dev","probe":{{"check":{{"type":"tcp","port":{port}}}}}}}"#);
+    let (verdict, outcome) = run_service(&service, 3).await?;
+    assert_eq!(verdict, sandy_fabric_local::agent::ServiceReadiness::Ready);
+    assert_eq!(outcome.guest_exit, Some(0), "console: {}", outcome.console);
+    drop(listener);
+    Ok(())
+}
+
+/// #589 adversarial: a probe that never passes reports `ProbeFailed` with the probe's output, and the job's
+/// exit is still reported (INV-11).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_service_whose_probe_never_passes_reports_probe_failed_with_its_output() -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.context("bind")?;
+    let port = listener.local_addr().context("addr")?.port();
+    drop(listener); // nothing listens on `port` now
+    let service = format!(
+        r#"{{"user":"dev","probe":{{"check":{{"type":"tcp","port":{port}}},"interval_secs":1,"timeout_secs":1,"max_attempts":2}}}}"#
+    );
+    let (verdict, outcome) = run_service(&service, 4).await?;
+    let sandy_fabric_local::agent::ServiceReadiness::ProbeFailed { output } = verdict else {
+        anyhow::bail!("expected ProbeFailed, got {verdict:?}");
+    };
+    assert!(output.contains(&format!("127.0.0.1:{port}")), "{output}");
+    assert_eq!(outcome.guest_exit, Some(0), "console: {}", outcome.console);
+    Ok(())
+}
+
+/// #589 adversarial: a mangled `SANDY_SERVICE` refuses the run instead of silently running a plain job whose
+/// probe never happens.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mangled_service_spec_refuses_the_run() -> anyhow::Result<()> {
+    let (channel, agent_cap, _) = channel_and_caps().await?;
+    let (backend, _relay) = backend_relaying(&channel, agent_cap);
+    let env = vec![(sandy_api::agent::SERVICE_ENV.to_string(), "{not json".to_string())];
+    let result = timeout(WAIT, run_blocking_with_env(backend, sh("exit 0"), env)).await??;
+    assert!(
+        result.is_err(),
+        "a service whose spec cannot be read must not run as a plain job: {result:?}"
+    );
+    Ok(())
+}

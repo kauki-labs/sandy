@@ -619,6 +619,50 @@ mod tests {
         Ok(())
     }
 
+    /// CodeRabbit on #632: a `SANDY_SERVICE` JSON value survives the frame byte for byte, and nothing in it
+    /// (double quotes, `$()`, backticks, a newline, single quotes) is executed by the guest shell. Replays
+    /// the guest-side pipeline with a real `sh`, like the multi-word test above.
+    #[test]
+    fn a_service_spec_json_env_value_round_trips_through_the_frame_unexecuted() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let dir = tempfile::tempdir().context("temp dir")?;
+        let marker = dir.path().join("executed");
+        let value = format!(
+            "{{\"user\":\"dev\",\"probe\":{{\"check\":{{\"type\":\"command\",\"argv\":[\"a b\",\"$(touch \
+             {m})\",\"`touch {m}`\",\"it's\\n\"]}}}}}}\n; touch {m}",
+            m = marker.display()
+        );
+        let command = [
+            String::from("env"),
+            format!("SANDY_SERVICE={value}"),
+            String::from("sh"),
+            String::from("-c"),
+            String::from("printf %s \"$SANDY_SERVICE\""),
+        ];
+        let frame = Protocol::build_frame(&test_markers(), &command);
+        let frame_text = String::from_utf8(frame).context("frame is valid UTF-8")?;
+        let prefix = "printf '%s' '";
+        let start = frame_text.find(prefix).context("frame has the printf payload prefix")? + prefix.len();
+        let end = frame_text[start..]
+            .find("' | base64 -d")
+            .context("frame has the base64 marker")?
+            + start;
+        let encoded = &frame_text[start..end];
+
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '%s' '{encoded}' | base64 -d | sh"))
+            .output()
+            .context("replay the guest-side decode pipeline")?;
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            value,
+            "the value must arrive intact"
+        );
+        assert!(!marker.exists(), "the guest shell executed part of the value");
+        Ok(())
+    }
+
     /// The injected frame must not contain a contiguous copy of either sentinel
     /// (the split-literal `printf` defeats the guest tty echo). A direct guard on
     /// [`Protocol::build_frame`], independent of the state machine.

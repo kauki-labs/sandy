@@ -73,6 +73,75 @@ pub const RESIZE_CONTROL: &str = "application/vnd.sandy.resize";
 /// `content_type` is forwarded under on an Output envelope — distinguishes
 /// it from any other `MessageType::Output` traffic sharing the channel.
 pub const ARCHIVE_TRANSCRIPT: &str = "application/vnd.sandy.archive";
+/// `content_type` of the `Output` envelope a [`crate::link::LinkFrame::Ready`] becomes on the orchestrator
+/// channel (#589). Empty payload.
+pub const SERVICE_READY: &str = "application/vnd.sandy.service.ready";
+/// `content_type` of the `Output` envelope a [`crate::link::LinkFrame::ProbeFailed`] becomes (#589). Payload:
+/// the last probe attempt's output, UTF-8, at most [`MAX_PROBE_OUTPUT`] bytes.
+pub const SERVICE_PROBE_FAILED: &str = "application/vnd.sandy.service.probe-failed";
+/// The most probe output bytes the relay keeps.
+pub const MAX_PROBE_OUTPUT: usize = 4096;
+
+/// `output` with every control character except newline and tab replaced by U+FFFD. Probe output is untrusted
+/// guest bytes that API clients and an LLM may read: an ANSI escape, a bare carriage return or a C1 control must
+/// not reach them as control codes.
+#[must_use]
+pub fn sanitize_probe_output(output: &str) -> String {
+    output
+        .chars()
+        .map(|c| {
+            if c.is_control() && c != '\n' && c != '\t' {
+                '\u{FFFD}'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// `output` cut to at most [`MAX_PROBE_OUTPUT`] bytes at a character boundary.
+#[must_use]
+pub fn cut_probe_output(output: &str) -> &str {
+    if output.len() <= MAX_PROBE_OUTPUT {
+        return output;
+    }
+    let cut = (0..=MAX_PROBE_OUTPUT)
+        .rev()
+        .find(|&i| output.is_char_boundary(i))
+        .unwrap_or(0);
+    &output[..cut]
+}
+
+/// A service's readiness verdict, as a host-side reader of the job's channel sees it (#589).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceReadiness {
+    /// The health probe passed.
+    Ready,
+    /// The probe failed `max_attempts` times in a row; `output` is the last attempt's output.
+    ProbeFailed {
+        /// The last attempt's output or connect error.
+        output: String,
+    },
+}
+
+impl ServiceReadiness {
+    /// Reads a channel envelope's `content_type` and payload as a verdict. `None` for any other envelope. A
+    /// non-UTF-8 failure payload is decoded lossily.
+    #[must_use]
+    pub fn from_envelope(content_type: &str, payload: &[u8]) -> Option<Self> {
+        match content_type {
+            SERVICE_READY => Some(Self::Ready),
+            SERVICE_PROBE_FAILED => {
+                // Capped and sanitized here too, so a reader does not depend on who posted the envelope.
+                let head = &payload[..payload.len().min(MAX_PROBE_OUTPUT)];
+                Some(Self::ProbeFailed {
+                    output: sanitize_probe_output(&String::from_utf8_lossy(head)),
+                })
+            }
+            _ => None,
+        }
+    }
+}
 
 /// Encode a resize as [`RESIZE_CONTROL`]'s 4-byte payload.
 #[must_use]
@@ -667,6 +736,25 @@ impl LinkAgent {
     /// [`AgentError::Link`] if the frame cannot be written.
     pub async fn report_exit(&self, code: i32) -> Result<(), AgentError> {
         Ok(write_frame(&mut *self.port.writer.lock().await, &LinkFrame::Exit { code }).await?)
+    }
+
+    /// Report that the service's health probe passed (#589). Send at most once, before the exit.
+    ///
+    /// # Errors
+    /// [`AgentError::Link`] if the frame cannot be written.
+    pub async fn report_ready(&self) -> Result<(), AgentError> {
+        Ok(write_frame(&mut *self.port.writer.lock().await, &LinkFrame::Ready).await?)
+    }
+
+    /// Report that the probe failed for good (#589), with the last attempt's `output`, cut to
+    /// [`MAX_PROBE_OUTPUT`] bytes (so a long, control-byte-heavy output cannot exceed the frame limit). The
+    /// relay cuts again, whatever the agent sends. Send at most once, before the exit.
+    ///
+    /// # Errors
+    /// [`AgentError::Link`] if the frame cannot be written.
+    pub async fn report_probe_failed(&self, output: &str) -> Result<(), AgentError> {
+        let output = cut_probe_output(output).to_owned();
+        Ok(write_frame(&mut *self.port.writer.lock().await, &LinkFrame::ProbeFailed { output }).await?)
     }
 }
 

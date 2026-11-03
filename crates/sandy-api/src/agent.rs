@@ -31,6 +31,10 @@ pub type OnLink = Arc<dyn Fn(&str, OwnedFd, AgentReport) + Send + Sync>;
 /// The vsock port a VM backend's guest agent listens on for its link (#238).
 pub const AGENT_VSOCK_PORT: u32 = 5_000;
 
+/// The job env entry that carries a service's spec (JSON, `ServiceSpec`) to the guest agent (#589). Set only for
+/// a manifest that declares a service.
+pub const SERVICE_ENV: &str = "SANDY_SERVICE";
+
 /// The byte the guest agent writes as soon as it accepts the host's link
 /// connection (#238). A hypervisor's vsock proxy (vfkit) accepts the host's
 /// socket before it dials the guest, so a connected socket alone does not mean

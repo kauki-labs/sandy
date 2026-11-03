@@ -28,6 +28,7 @@ portable-pty.workspace = true
 rustix = { workspace = true, features = ["process", "stdio"] }
 sandy-fabric-local.workspace = true
 sandy-fsutil.workspace = true
+sandy-guest-template.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = [
