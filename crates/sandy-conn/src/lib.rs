@@ -19,6 +19,7 @@ use std::{
 };
 
 pub mod bridge;
+pub mod dial;
 
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 
