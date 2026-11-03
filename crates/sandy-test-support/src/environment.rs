@@ -14,6 +14,16 @@ use sandy_api::{
     environment::{Endpoint, EnvironmentBackend, EnvironmentSpec, Launch, Probe},
 };
 
+/// A callback run at the start of every probe, so a test can change the world
+/// (delete a row, say) between a pass's launch and its probe's result.
+struct ProbeHook(Box<dyn Fn(&str) + Send + Sync>);
+
+impl std::fmt::Debug for ProbeHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ProbeHook")
+    }
+}
+
 /// What a launched box does when probed.
 #[derive(Debug, Clone)]
 enum Script {
@@ -53,6 +63,7 @@ pub struct FakeEnvironmentBackend {
     kill_failing: AtomicBool,
     probe_failing: AtomicBool,
     launch_calls: AtomicUsize,
+    probe_hook: Option<ProbeHook>,
     state: Mutex<State>,
 }
 
@@ -68,6 +79,7 @@ impl Default for FakeEnvironmentBackend {
             kill_failing: AtomicBool::new(false),
             probe_failing: AtomicBool::new(false),
             launch_calls: AtomicUsize::new(0),
+            probe_hook: None,
             state: Mutex::new(State::default()),
         }
     }
@@ -102,6 +114,13 @@ impl FakeEnvironmentBackend {
     #[must_use]
     pub fn with_endpoint(mut self, endpoint: Endpoint) -> Self {
         self.endpoint = endpoint;
+        self
+    }
+
+    /// Run `hook` with the environment id at the start of every probe.
+    #[must_use]
+    pub fn on_probe(mut self, hook: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        self.probe_hook = Some(ProbeHook(Box::new(hook)));
         self
     }
 
@@ -183,6 +202,9 @@ impl EnvironmentBackend for FakeEnvironmentBackend {
     }
 
     fn probe(&self, environment_id: &str) -> Result<Probe, BackendError> {
+        if let Some(hook) = &self.probe_hook {
+            (hook.0)(environment_id);
+        }
         if self.probe_failing.load(Ordering::SeqCst) {
             return Err(BackendError::Transport("probe could not run".to_owned()));
         }

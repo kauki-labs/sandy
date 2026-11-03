@@ -123,6 +123,11 @@ pub struct EnvironmentRecord {
     /// recorded by the launch driver when its probe passes. Meaningful only
     /// while the environment is `Ready`.
     pub endpoint: Option<String>,
+    /// Unix seconds when the launch driver first found a box for this
+    /// provisioning attempt (cleared on resume). The provision timeout runs
+    /// from here, not from the last write, so a row found late is not failed
+    /// before its box has had time to boot.
+    pub launched_at: Option<i64>,
     /// Unix seconds at creation.
     pub created_at: i64,
     /// Unix seconds at the last state change.
@@ -184,12 +189,13 @@ struct RawRow {
     failure_step: Option<String>,
     failure_reason: Option<String>,
     endpoint: Option<String>,
+    launched_at: Option<i64>,
     created_at: i64,
     updated_at: i64,
 }
 
 const COLUMNS: &str = "environment_id, request_id, state, spec, spec_encoding, failure_step, failure_reason, \
-                       created_at, updated_at, endpoint";
+                       created_at, updated_at, endpoint, launched_at";
 
 impl RawRow {
     fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
@@ -204,6 +210,7 @@ impl RawRow {
             created_at: row.get(7)?,
             updated_at: row.get(8)?,
             endpoint: row.get(9)?,
+            launched_at: row.get(10)?,
         })
     }
 
@@ -224,6 +231,7 @@ impl RawRow {
             spec_encoding: self.spec_encoding,
             failure,
             endpoint: self.endpoint,
+            launched_at: self.launched_at,
             created_at: self.created_at,
             updated_at: self.updated_at,
         })
@@ -279,22 +287,25 @@ impl EnvironmentStore {
                 failure_reason  TEXT,
                 created_at      INTEGER NOT NULL,
                 updated_at      INTEGER NOT NULL,
-                endpoint        TEXT
+                endpoint        TEXT,
+                launched_at     INTEGER
             )",
             (),
         )?;
-        // A table created before slice C2 has no endpoint column.
-        let has_endpoint: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('environments') WHERE name = 'endpoint')",
-            (),
-            |row| row.get(0),
-        )?;
-        if !has_endpoint {
-            match conn.execute("ALTER TABLE environments ADD COLUMN endpoint TEXT", ()) {
-                Ok(_) => {}
-                // Another process opening the same old file added it first.
-                Err(rusqlite::Error::SqliteFailure(_, Some(msg))) if msg.contains("duplicate column name") => {}
-                Err(e) => return Err(e.into()),
+        // A table created before these columns existed lacks them.
+        for (column, ddl) in [("endpoint", "TEXT"), ("launched_at", "INTEGER")] {
+            let present: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('environments') WHERE name = ?1)",
+                [column],
+                |row| row.get(0),
+            )?;
+            if !present {
+                match conn.execute(&format!("ALTER TABLE environments ADD COLUMN {column} {ddl}"), ()) {
+                    Ok(_) => {}
+                    // Another process opening the same old file added it first.
+                    Err(rusqlite::Error::SqliteFailure(_, Some(msg))) if msg.contains("duplicate column name") => {}
+                    Err(e) => return Err(e.into()),
+                }
             }
         }
         Ok(Self {
@@ -533,6 +544,22 @@ impl EnvironmentStore {
         self.transition(environment_id, &LIVE, EnvironmentState::Deleted, None)
     }
 
+    /// Record that a box exists for `environment_id`'s current provisioning
+    /// attempt, at unix time `now`. Only the first call per attempt writes: the
+    /// provision timeout runs from this moment. Returns whether it wrote.
+    ///
+    /// # Errors
+    /// As [`EnvironmentStore::create`].
+    pub fn mark_launched(&self, environment_id: &str, now: i64) -> Result<bool, EnvironmentStoreError> {
+        let conn = self.lock();
+        let rows = conn.execute(
+            "UPDATE environments SET launched_at = ?2
+              WHERE environment_id = ?1 AND state = 'provisioning' AND launched_at IS NULL",
+            (environment_id, now),
+        )?;
+        Ok(rows == 1)
+    }
+
     /// `Provisioning` to `Ready`, recording where the environment's service is
     /// reachable (`host:port`) in the same write. The launch driver uses this
     /// when its probe passes, so a row never shows Ready without its endpoint
@@ -637,7 +664,8 @@ impl EnvironmentStore {
             "UPDATE environments
                 SET state = ?2, failure_step = COALESCE(?3, failure_step),
                     failure_reason = COALESCE(?4, failure_reason), updated_at = ?5,
-                    endpoint = COALESCE(?6, endpoint)
+                    endpoint = COALESCE(?6, endpoint),
+                    launched_at = CASE WHEN ?2 = 'provisioning' THEN NULL ELSE launched_at END
               WHERE environment_id = ?1",
             (environment_id, to.as_str(), step, reason, now_unix(), endpoint),
         )?;
@@ -906,7 +934,10 @@ mod tests {
         )?;
         let s = EnvironmentStore::open(&path)?;
         let old = s.get("env-old")?.context("env-old")?;
-        assert_eq!((old.state, old.endpoint), (EnvironmentState::Ready, None));
+        assert_eq!(
+            (old.state, old.endpoint, old.launched_at),
+            (EnvironmentState::Ready, None, None)
+        );
         drop(s);
         // Opening the migrated file again is a no-op, not a duplicate-column error.
         assert!(EnvironmentStore::open(&path).is_ok());
@@ -937,6 +968,31 @@ mod tests {
         s.delete("env-3")?;
         assert_eq!(s.mark_lost("env-3", "x", "y")?, EnvTransition::Refused(Deleted));
         assert_eq!(s.mark_lost("nope", "x", "y")?, EnvTransition::NotFound);
+        Ok(())
+    }
+
+    #[test]
+    fn the_launch_time_is_set_once_per_attempt_and_cleared_by_a_resume() -> Result<()> {
+        let s = store()?;
+        created(&s)?;
+        assert_eq!(s.get("env-1")?.context("env-1")?.launched_at, None);
+        assert!(s.mark_launched("env-1", 100)?);
+        assert!(
+            !s.mark_launched("env-1", 200)?,
+            "only the first call per attempt writes"
+        );
+        assert_eq!(s.get("env-1")?.context("env-1")?.launched_at, Some(100));
+        assert!(!s.mark_launched("env-nope", 1)?);
+        s.mark_ready("env-1")?;
+        assert!(!s.mark_launched("env-1", 300)?, "a Ready row has no attempt to time");
+        s.stop("env-1")?;
+        s.resume("env-1")?;
+        assert_eq!(
+            s.get("env-1")?.context("env-1")?.launched_at,
+            None,
+            "a resume starts a new attempt"
+        );
+        assert!(s.mark_launched("env-1", 400)?);
         Ok(())
     }
 

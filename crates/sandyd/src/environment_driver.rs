@@ -187,8 +187,6 @@ impl EnvironmentDriver {
         report: &mut Report,
     ) -> Result<(), EnvironmentStoreError> {
         let id = row.environment_id.as_str();
-        let waited = now.saturating_sub(row.updated_at);
-        let timed_out = waited > i64::try_from(self.config.provision_timeout.as_secs()).unwrap_or(i64::MAX);
         if !running.contains(id) {
             let Some(spec) = self.to_spec(row) else {
                 return self.fail(id, "spec", "the stored spec does not decode", report);
@@ -204,13 +202,31 @@ impl EnvironmentDriver {
                 Err(e) => return self.fail(id, "launch", &e.to_string(), report),
             }
         }
+        // The provision timeout runs from the moment a box exists for this
+        // attempt, recorded once and kept across passes and restarts, not from
+        // the row's last write: a row found after a long downtime must get its
+        // full boot time.
+        if row.launched_at.is_none() {
+            self.store.mark_launched(id, now)?;
+        }
+        let waited = now.saturating_sub(row.launched_at.unwrap_or(now));
+        let limit = i64::try_from(self.config.provision_timeout.as_secs()).unwrap_or(i64::MAX);
+        let timed_out = waited > limit;
+        // A probe that cannot run is retried, so one transport fault cannot end a
+        // healthy environment; only a probe that stays broken for twice the
+        // timeout fails the row.
+        let hard_timed_out = waited > limit.saturating_mul(2);
         match self.backend.probe(id) {
             Ok(Probe::Ready { endpoint }) => match endpoint_string(&endpoint) {
-                Some(address) => {
-                    if self.store.mark_ready_with_endpoint(id, &address)? == EnvTransition::Applied {
-                        report.readied.push(id.to_owned());
+                Some(address) => match self.store.mark_ready_with_endpoint(id, &address)? {
+                    EnvTransition::Applied => report.readied.push(id.to_owned()),
+                    // A delete (or a failure written by another driver) landed during the
+                    // launch: the box must not outlive it (decision 26).
+                    EnvTransition::Refused(EnvironmentState::Deleted | EnvironmentState::Failed) => {
+                        self.kill(id, running, report);
                     }
-                }
+                    EnvTransition::Unchanged | EnvTransition::NotFound | EnvTransition::Refused(_) => {}
+                },
                 None => {
                     self.kill(id, running, report);
                     self.fail(
@@ -229,8 +245,8 @@ impl EnvironmentDriver {
             Ok(Probe::Starting { .. }) if timed_out => self.time_out(id, waited, running, report)?,
             Ok(Probe::Starting { .. }) => {}
             // The probe itself could not run: not the environment's fault, unless it never recovers.
-            Err(e) if timed_out => {
-                tracing::warn!(environment = id, error = %e, "probe could not run past the provision timeout");
+            Err(e) if hard_timed_out => {
+                tracing::warn!(environment = id, error = %e, "probe could not run past twice the provision timeout");
                 self.time_out(id, waited, running, report)?;
             }
             Err(e) => tracing::warn!(environment = id, error = %e, "probe could not run"),
@@ -790,6 +806,89 @@ mod tests {
             assert_eq!(rec.endpoint, None);
             assert!(r.backend.boxes()?.is_empty());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_row_older_than_the_timeout_gets_its_full_boot_time_after_its_first_launch() -> Result<()> {
+        let r = rig(FakeEnvironmentBackend::new().starting_polls(1))?;
+        let id = add(&r.store, 1)?;
+        let late = now() + 601; // the daemon was down for longer than the timeout
+        let first = r.driver.reconcile_once(late)?;
+        assert_eq!(first.launched, std::slice::from_ref(&id));
+        assert!(
+            first.failed.is_empty(),
+            "the first Starting probe must not fail a row launched just now"
+        );
+        assert_eq!(r.backend.boxes()?.len(), 1, "the box must not be killed");
+        r.driver.reconcile_once(late + 1)?;
+        assert_eq!(state(&r.store, &id)?.state, EnvironmentState::Ready);
+
+        // The clock still runs from the launch: a box that never gets ready is failed, later.
+        let r = rig(FakeEnvironmentBackend::new().starting_polls(usize::MAX))?;
+        let id = add(&r.store, 1)?;
+        r.driver.reconcile_once(late)?;
+        assert_eq!(state(&r.store, &id)?.state, EnvironmentState::Provisioning);
+        let report = r.driver.reconcile_once(late + 601)?;
+        assert_eq!(report.failed, std::slice::from_ref(&id));
+        assert_eq!(state(&r.store, &id)?.failure.context("failure")?.step, "provision");
+        Ok(())
+    }
+
+    #[test]
+    fn a_delete_that_lands_during_the_launch_kills_the_box_in_the_same_pass() -> Result<()> {
+        let store = Arc::new(EnvironmentStore::open_in_memory()?);
+        let hook_store = Arc::clone(&store);
+        let backend = Arc::new(FakeEnvironmentBackend::new().on_probe(move |id| {
+            let _ = hook_store.delete(id);
+        }));
+        let driver = EnvironmentDriver::new(Arc::clone(&store), Arc::clone(&backend) as _, config());
+        let id = add(&store, 1)?;
+        let report = driver.reconcile_once(now())?;
+        assert!(report.readied.is_empty());
+        assert_eq!(
+            report.killed,
+            std::slice::from_ref(&id),
+            "the box must be torn down at once, not on a later pass"
+        );
+        assert!(backend.boxes()?.is_empty());
+        assert_eq!(state(&store, &id)?.state, EnvironmentState::Deleted);
+        Ok(())
+    }
+
+    #[test]
+    fn a_probe_that_cannot_run_is_retried_past_the_timeout_and_fails_only_after_twice_of_it() -> Result<()> {
+        let r = rig(FakeEnvironmentBackend::new())?;
+        let id = add(&r.store, 1)?;
+        r.backend.set_probe_failing(true);
+        let base = now();
+        r.driver.reconcile_once(base)?;
+        let past_timeout = r.driver.reconcile_once(base + 601)?;
+        assert!(
+            past_timeout.failed.is_empty(),
+            "one transport fault past the timeout must not end the environment"
+        );
+        assert_eq!(state(&r.store, &id)?.state, EnvironmentState::Provisioning);
+        r.backend.set_probe_failing(false);
+        r.driver.reconcile_once(base + 602)?;
+        assert_eq!(
+            state(&r.store, &id)?.state,
+            EnvironmentState::Ready,
+            "a recovered probe still readies it"
+        );
+
+        let r = rig(FakeEnvironmentBackend::new())?;
+        let id = add(&r.store, 1)?;
+        r.backend.set_probe_failing(true);
+        r.driver.reconcile_once(base)?;
+        let report = r.driver.reconcile_once(base + 1201)?;
+        assert_eq!(
+            report.failed,
+            std::slice::from_ref(&id),
+            "a probe broken for twice the timeout fails the row"
+        );
+        assert_eq!(state(&r.store, &id)?.failure.context("failure")?.step, "provision");
+        assert!(r.backend.boxes()?.is_empty());
         Ok(())
     }
 }

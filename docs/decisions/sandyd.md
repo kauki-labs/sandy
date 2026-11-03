@@ -2144,8 +2144,10 @@ into a running VM or into `Ready`. `VmBackend::run` is run-to-completion, so a l
 - `EnvironmentDriver` is a level-triggered loop, not a set of handler hooks. Each pass takes the backend's box list,
   then reads every row, and fixes each difference. A `Provisioning` row launches a box unless one already runs, then
   probes it: Ready marks the row `Ready` and records the endpoint in the same write; Failed records the step and reason
-  and kills the box; a probe that is not Ready after the provision timeout fails the row with step `provision` and kills
-  the box. The probe comes first, so a long daemon downtime never fails a row that can still become Ready. A `Ready` row
+  and kills the box; a probe that is not Ready after the provision timeout, counted from the moment a box first existed for this
+  attempt (`launched_at`, kept across passes and restarts, cleared by a resume), fails the row with step `provision`
+  and kills the box; a probe that cannot run is retried and fails the row only after twice the timeout. The probe comes first and the clock starts at the launch, so a long daemon downtime never fails a row that can still
+  become Ready. A `delete` that lands during the launch makes the Ready write refuse; the driver kills the box at once. A `Ready` row
   whose box is gone is marked lost (`Failed`, step `reconcile`); one whose probe fails is marked lost with the probe's
   own step. A `Stopped`, `Failed` or `Deleted` row keeps no box, and a box no row names is an orphan and is killed. The
   same pass is the reconciler after a restart: nothing is held in memory. The box list is read before the rows, so a
