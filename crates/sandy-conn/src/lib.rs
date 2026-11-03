@@ -18,6 +18,9 @@ use std::{
     time::Duration,
 };
 
+pub mod bridge;
+pub mod dial;
+
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 
 /// An address to [`connect`] to or [`listen`] on, naming a tier.
