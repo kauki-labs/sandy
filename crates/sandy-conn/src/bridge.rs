@@ -211,7 +211,7 @@ async fn accept_loop<D: Dialer>(
 
 /// Relay one client: dial the guest relay inside the window, then copy both ways until either side closes. A dial
 /// that never succeeds closes this client only.
-async fn relay_one<D: Dialer>(mut client: TcpStream, dialer: &D, config: BridgeConfig) {
+async fn relay_one<D: Dialer>(client: TcpStream, dialer: &D, config: BridgeConfig) {
     // Dial only after the client's first byte: a connection that sends nothing then costs no relay slot and no dial.
     // `peek` leaves the byte in the socket for the copy to forward.
     let mut first = [0u8; 1];
@@ -222,7 +222,7 @@ async fn relay_one<D: Dialer>(mut client: TcpStream, dialer: &D, config: BridgeC
             return;
         }
     }
-    let Some(mut guest) = dial_within_window(dialer, &config).await else {
+    let Some(guest) = dial_within_window(dialer, &config).await else {
         tracing::debug!("the bridge gave up dialing the guest relay");
         return;
     };
