@@ -2725,6 +2725,7 @@ dependencies = [
 name = "sandy-test-support"
 version = "0.1.1"
 dependencies = [
+ "anyhow",
  "sandy-api",
 ]
 
@@ -2740,6 +2741,7 @@ dependencies = [
  "prost",
  "rusqlite",
  "rustix",
+ "sandy-api",
  "sandy-conn",
  "sandy-control-proto",
  "sandy-executor-proto",
@@ -2748,6 +2750,7 @@ dependencies = [
  "sandy-fsutil",
  "sandy-orchestrator",
  "sandy-proto",
+ "sandy-test-support",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",

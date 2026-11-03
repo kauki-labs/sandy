@@ -119,6 +119,10 @@ pub struct EnvironmentRecord {
     /// Set once provisioning failed; it stays on the row if the environment
     /// is then deleted.
     pub failure: Option<EnvironmentFailure>,
+    /// Where the environment's service is reachable from the host (`host:port`),
+    /// recorded by the launch driver when its probe passes. Meaningful only
+    /// while the environment is `Ready`.
+    pub endpoint: Option<String>,
     /// Unix seconds at creation.
     pub created_at: i64,
     /// Unix seconds at the last state change.
@@ -179,12 +183,13 @@ struct RawRow {
     spec_encoding: String,
     failure_step: Option<String>,
     failure_reason: Option<String>,
+    endpoint: Option<String>,
     created_at: i64,
     updated_at: i64,
 }
 
-const COLUMNS: &str =
-    "environment_id, request_id, state, spec, spec_encoding, failure_step, failure_reason, created_at, updated_at";
+const COLUMNS: &str = "environment_id, request_id, state, spec, spec_encoding, failure_step, failure_reason, \
+                       created_at, updated_at, endpoint";
 
 impl RawRow {
     fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
@@ -198,6 +203,7 @@ impl RawRow {
             failure_reason: row.get(6)?,
             created_at: row.get(7)?,
             updated_at: row.get(8)?,
+            endpoint: row.get(9)?,
         })
     }
 
@@ -217,6 +223,7 @@ impl RawRow {
             spec: self.spec,
             spec_encoding: self.spec_encoding,
             failure,
+            endpoint: self.endpoint,
             created_at: self.created_at,
             updated_at: self.updated_at,
         })
@@ -271,10 +278,20 @@ impl EnvironmentStore {
                 failure_step    TEXT,
                 failure_reason  TEXT,
                 created_at      INTEGER NOT NULL,
-                updated_at      INTEGER NOT NULL
+                updated_at      INTEGER NOT NULL,
+                endpoint        TEXT
             )",
             (),
         )?;
+        // A table created before slice C2 has no endpoint column.
+        let has_endpoint: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('environments') WHERE name = 'endpoint')",
+            (),
+            |row| row.get(0),
+        )?;
+        if !has_endpoint {
+            conn.execute("ALTER TABLE environments ADD COLUMN endpoint TEXT", ())?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
             max_rows: None,
@@ -492,6 +509,41 @@ impl EnvironmentStore {
     /// As [`EnvironmentStore::create`].
     pub fn delete(&self, environment_id: &str) -> Result<EnvTransition, EnvironmentStoreError> {
         self.transition(environment_id, &LIVE, EnvironmentState::Deleted, None)
+    }
+
+    /// Record where `environment_id`'s service is reachable (`host:port`).
+    /// Written by the launch driver before it marks the environment `Ready`.
+    /// Returns whether a row was updated.
+    ///
+    /// # Errors
+    /// As [`EnvironmentStore::create`].
+    pub fn set_endpoint(&self, environment_id: &str, endpoint: &str) -> Result<bool, EnvironmentStoreError> {
+        let conn = self.lock();
+        let rows = conn.execute(
+            "UPDATE environments SET endpoint = ?2, updated_at = ?3 WHERE environment_id = ?1",
+            (environment_id, endpoint, now_unix()),
+        )?;
+        Ok(rows == 1)
+    }
+
+    /// `Provisioning` or `Ready` to `Failed`: the environment's box is gone or
+    /// broken. `mark_failed` covers a provisioning failure; this also covers a
+    /// `Ready` environment whose box died, found by the reconciler.
+    ///
+    /// # Errors
+    /// As [`EnvironmentStore::create`].
+    pub fn mark_lost(
+        &self,
+        environment_id: &str,
+        step: &str,
+        reason: &str,
+    ) -> Result<EnvTransition, EnvironmentStoreError> {
+        self.transition(
+            environment_id,
+            &[EnvironmentState::Provisioning, EnvironmentState::Ready],
+            EnvironmentState::Failed,
+            Some((step, reason)),
+        )
     }
 
     /// `Provisioning` to `Deleted`: cancel a launch that has not finished.
@@ -751,6 +803,77 @@ mod tests {
         assert_eq!(s.get_by_request_id("r1")?, Some(rec));
         assert_eq!(s.get_by_request_id("r2")?, None);
         assert_eq!(s.list()?.len(), 1, "a lookup must write nothing");
+        Ok(())
+    }
+
+    #[test]
+    fn an_endpoint_is_recorded_per_environment_and_survives_reopening() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("env.db");
+        {
+            let s = EnvironmentStore::open(&path)?;
+            created(&s)?;
+            assert_eq!(s.get("env-1")?.context("env-1")?.endpoint, None);
+            assert!(s.set_endpoint("env-1", "127.0.0.1:41000")?);
+            assert!(
+                !s.set_endpoint("env-nope", "127.0.0.1:1")?,
+                "an unknown id updates nothing"
+            );
+        }
+        let s = EnvironmentStore::open(&path)?;
+        assert_eq!(
+            s.get("env-1")?.context("env-1")?.endpoint.as_deref(),
+            Some("127.0.0.1:41000")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_table_from_before_the_endpoint_column_is_migrated() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("env.db");
+        Connection::open(&path)?.execute(
+            "CREATE TABLE environments (
+                environment_id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE, state TEXT NOT NULL,
+                spec BLOB NOT NULL, spec_encoding TEXT NOT NULL, failure_step TEXT, failure_reason TEXT,
+                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)",
+            (),
+        )?;
+        Connection::open(&path)?.execute(
+            "INSERT INTO environments VALUES ('env-old','r-old','ready',x'01','enc',NULL,NULL,1,1)",
+            (),
+        )?;
+        let s = EnvironmentStore::open(&path)?;
+        let old = s.get("env-old")?.context("env-old")?;
+        assert_eq!((old.state, old.endpoint), (EnvironmentState::Ready, None));
+        assert!(s.set_endpoint("env-old", "127.0.0.1:2")?);
+        Ok(())
+    }
+
+    #[test]
+    fn mark_lost_applies_from_provisioning_and_ready_only() -> Result<()> {
+        use EnvironmentState::{Deleted, Stopped};
+        let s = store()?;
+        created(&s)?;
+        assert_eq!(s.mark_lost("env-1", "reconcile", "box gone")?, EnvTransition::Applied);
+        let rec = s.get("env-1")?.context("env-1")?;
+        assert_eq!(rec.state, EnvironmentState::Failed);
+        assert_eq!(
+            rec.failure.map(|f| (f.step, f.reason)),
+            Some(("reconcile".into(), "box gone".into()))
+        );
+
+        s.create("r2", "env-2", SPEC, ENC)?;
+        s.mark_ready("env-2")?;
+        assert_eq!(s.mark_lost("env-2", "reconcile", "box gone")?, EnvTransition::Applied);
+
+        s.create("r3", "env-3", SPEC, ENC)?;
+        s.mark_ready("env-3")?;
+        s.stop("env-3")?;
+        assert_eq!(s.mark_lost("env-3", "x", "y")?, EnvTransition::Refused(Stopped));
+        s.delete("env-3")?;
+        assert_eq!(s.mark_lost("env-3", "x", "y")?, EnvTransition::Refused(Deleted));
+        assert_eq!(s.mark_lost("nope", "x", "y")?, EnvTransition::NotFound);
         Ok(())
     }
 
