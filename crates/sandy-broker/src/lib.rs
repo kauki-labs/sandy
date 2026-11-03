@@ -42,6 +42,9 @@ pub struct Client {
     /// a deleted row for replay, so this bounds the client's share of its table.
     #[serde(default = "default_max_environment_records")]
     pub max_environment_records: usize,
+    /// Profile names the client may put in a spawn. Empty allows none.
+    #[serde(default)]
+    pub profiles: Vec<String>,
     /// Directories the client may name in inputs, outputs and secrets.
     #[serde(default)]
     pub roots: Vec<PathBuf>,
@@ -173,12 +176,17 @@ pub async fn serve(config: BrokerConfig) -> Result<Running, BrokerError> {
         return Err(BrokerError::NonLoopback { addr: config.bind });
     }
     validate_clients(&config.clients)?;
+    let env_create = config
+        .clients
+        .iter()
+        .map(|c| (c.id.clone(), tokio::sync::Mutex::new(())))
+        .collect();
     let state = Arc::new(server::State {
         owners: owners::Owners::open(&config.state_dir)?,
         control_socket: config.control_socket,
         rpc_deadline: config.rpc_deadline,
         clients: config.clients,
-        env_create: tokio::sync::Mutex::new(()),
+        env_create,
     });
     let bind_err = |source| BrokerError::Bind {
         addr: config.bind,

@@ -33,6 +33,7 @@ pub fn client(id: &str, token: &str, max: IsolationClass, roots: Vec<std::path::
         max_isolation_class: max,
         max_environments: 4,
         max_environment_records: 64,
+        profiles: ["dev", "prod", "other"].map(String::from).to_vec(),
         roots,
     }
 }

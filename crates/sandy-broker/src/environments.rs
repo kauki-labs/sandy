@@ -137,15 +137,29 @@ fn detail(e: &EnvironmentResponse) -> Value {
         .as_ref()
         .filter(|f| !f.step.is_empty() || !f.reason.is_empty())
     {
-        // The reason is sandyd's own text and may name a path or a credential once
-        // the launch driver writes it, so it is logged and not relayed.
-        tracing::info!(environment_id = %e.environment_id, step = %f.step, reason = %f.reason, "environment failed");
-        body["failure"] = json!({"step": f.step, "reason": "the step failed; the operator has the details"});
+        // The reason is sandyd's own text and may name a path or a credential once the
+        // launch driver writes it, so it is neither relayed nor logged here. sandyd's
+        // store holds it for the operator. The step is relayed only if it is a plain name.
+        let step = if safe_step(&f.step) { f.step.as_str() } else { "unknown" };
+        body["failure"] = json!({"step": step, "reason": "the step failed; the operator has the details"});
     }
-    if let Some(c) = e.connection.as_ref().filter(|c| !c.url.is_empty()) {
+    // A stopped, failed or deleted environment has no reachable service, so a URL
+    // sandyd still holds for one is not relayed: it could outlive the delete.
+    if e.state == i32::from(EnvironmentState::Ready)
+        && let Some(c) = e.connection.as_ref().filter(|c| !c.url.is_empty())
+    {
         body["connection"] = json!({"url": c.url});
     }
     body
+}
+
+/// A provisioning step name the broker relays: at most 64 characters of letters,
+/// digits, `-`, `_`, `.`.
+fn safe_step(step: &str) -> bool {
+    (1..=64).contains(&step.len())
+        && step
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
 /// sandyd's own refusal text is not relayed; each code has a fixed message.
@@ -195,6 +209,11 @@ pub(crate) async fn spawn(state: &State, client: &Client, req: Request<Incoming>
     if !valid_request_id(&body.request_id) {
         return Err(INVALID);
     }
+    // sandyd owns whether a profile exists (#592). The broker owns which client may
+    // name it. An empty list allows none, so a client is useless until configured.
+    if !client.profiles.contains(&body.profile) {
+        return Err(FORBIDDEN);
+    }
     let lifetime = match body.lifetime {
         LifetimeBody {
             kind: LifetimeKind::Ephemeral,
@@ -212,9 +231,9 @@ pub(crate) async fn spawn(state: &State, client: &Client, req: Request<Incoming>
         },
         _ => return Err(INVALID),
     };
-    // One create at a time per broker, so the quota check and the create cannot
-    // race another create of the same client.
-    let _serial = state.env_create.lock().await;
+    // One create at a time per client, so the quota check and the create cannot race
+    // another create of the same client, and one client cannot hold up another.
+    let _serial = state.env_create.get(&client.id).ok_or(UNAVAILABLE)?.lock().await;
     if !state.owners.has_request(&client.id, &body.request_id) {
         let live = live_owned(state, client).await?;
         if live >= client.max_environments {
@@ -375,6 +394,55 @@ mod tests {
         assert_eq!(list_refusal(REFUSED_FIELDS).code, "unavailable");
         assert_eq!(list_refusal(NOT_FOUND).code, "not_found");
         assert_eq!(list_refusal(QUOTA).code, "quota_exceeded");
+    }
+
+    fn response(state: EnvironmentState, url: &str) -> EnvironmentResponse {
+        EnvironmentResponse {
+            environment_id: "env-1".to_owned(),
+            state: state.into(),
+            connection: Some(sandy_control_proto::v1::EnvironmentConnection { url: url.to_owned() }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_connection_url_is_relayed_only_while_the_environment_is_ready() {
+        let url = "http://127.0.0.1:9000";
+        assert_eq!(
+            detail(&response(EnvironmentState::Ready, url))["connection"]["url"],
+            url
+        );
+        for state in [
+            EnvironmentState::Provisioning,
+            EnvironmentState::Stopped,
+            EnvironmentState::Failed,
+            EnvironmentState::Deleted,
+        ] {
+            let body = detail(&response(state, url));
+            assert!(body.get("connection").is_none(), "{state:?} relayed {body}");
+        }
+    }
+
+    #[test]
+    fn a_failure_step_is_relayed_only_if_it_is_a_plain_name() {
+        for (step, relayed) in [
+            ("clone", "clone"),
+            ("warm.deps-1", "warm.deps-1"),
+            ("/home/daemon/.ssh", "unknown"),
+            ("has space", "unknown"),
+            ("token=ghp_x", "unknown"),
+        ] {
+            let e = EnvironmentResponse {
+                state: EnvironmentState::Failed.into(),
+                failure: Some(sandy_control_proto::v1::EnvironmentFailure {
+                    step: step.to_owned(),
+                    reason: "x".to_owned(),
+                }),
+                ..Default::default()
+            };
+            assert_eq!(detail(&e)["failure"]["step"], relayed, "{step}");
+        }
+        assert!(!safe_step(&"x".repeat(65)));
     }
 
     #[test]

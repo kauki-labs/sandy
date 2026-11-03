@@ -176,7 +176,6 @@ async fn a_malformed_or_credential_shaped_request_is_invalid() -> Result<()> {
         json!({"request_id": "has space", "profile": "dev", "lifetime": {"kind": "persistent"}}),
         json!({"request_id": "ok", "profile": "dev", "lifetime": {"kind": "ephemeral"}}),
         json!({"request_id": "ok", "profile": "dev", "lifetime": {"kind": "persistent"}, "token": "x"}),
-        json!({"request_id": "ok", "profile": "ghp_0123456789abcdef0123456789abcdef0123", "lifetime": {"kind": "persistent"}}),
     ];
     for body in bad {
         let (status, resp) = spawn(&f, TOKEN_A, body.clone()).await?;
@@ -274,5 +273,25 @@ async fn a_list_filter_by_state_and_task_ref_and_a_bad_filter() -> Result<()> {
             "{bad}"
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_profile_the_client_may_not_use_is_forbidden_and_creates_nothing() -> Result<()> {
+    let f = fixture().await?;
+    // An unlisted name, and a credential-shaped one: the allow-list refuses both before
+    // sandyd sees them.
+    for profile in ["admin", "ghp_0123456789abcdef0123456789abcdef0123"] {
+        let mut body = spawn_body("p1");
+        body["profile"] = json!(profile);
+        let (status, resp) = spawn(&f, TOKEN_A, body).await?;
+        assert_eq!(
+            (status, &resp["code"]),
+            (StatusCode::FORBIDDEN, &json!("forbidden")),
+            "{profile}: {resp}"
+        );
+    }
+    let (_, list) = f.call("GET", "/v1/environments", Some(TOKEN_A), None).await?;
+    assert_eq!(list["environments"].as_array().map(Vec::len), Some(0));
     Ok(())
 }

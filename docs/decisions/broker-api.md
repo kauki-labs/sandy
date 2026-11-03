@@ -126,7 +126,8 @@ user's files. Tracked in a follow-up issue.
   the caller's.
 - Per-client quota: `max_environments` in the clients file (default 4) counts the client's
   non-terminal environments. A replay of a request id the client already used skips the check.
-  Creates run one at a time, so the check and the create cannot race.
+  Creates of one client run one at a time, so the check and the create cannot race, and one
+  client cannot hold up another.
 - sandyd's `EnvironmentError` codes map to fixed messages: `NOT_FOUND` 404 `not_found`,
   `REQUEST_ID_CONFLICT` 409, `QUOTA_EXCEEDED` 429, `UNSUPPORTED_FOR_LIFETIME` 409,
   `INVALID_STATE` 409 and `INVALID_ARGUMENT` 400 as `invalid_request`. sandyd's own text is
@@ -140,15 +141,28 @@ user's files. Tracked in a follow-up issue.
   rows and paging its list reply (#633).
 - A create that sandyd answers with an environment another client already owns is refused
   (`TakenOver`), and two clients whose ids share a 16-digit hash prefix are refused at startup.
-- `failure.reason` is logged and not relayed: it is sandyd's text and may name a path or a
-  credential once the launch driver writes it. `failure.step` is relayed.
+- `failure.reason` is neither relayed nor logged by the broker: it is sandyd's text and may name
+  a path or a credential once the launch driver writes it, and sandyd's store holds it for the
+  operator. `failure.step` is relayed only if it is a plain name (at most 64 characters of
+  letters, digits, `-`, `_`, `.`), else as `unknown`.
+- `connection.url` is relayed only while the state is `ready`. A stopped, failed or deleted
+  environment has no reachable service, and a URL sandyd still holds for it could outlive the
+  delete.
+- A client may name only the profiles in its `profiles` list (`forbidden` otherwise). An empty
+  list allows none. sandyd owns whether a profile exists (#592); the broker owns who may use it.
+- `ttl_secs` is bounded by sandyd (1 to 604800). Any client may still ask for a `persistent`
+  lifetime: a per-client lifetime policy is an owner decision (#607).
 - An owner file in the earlier job-only shape fails the load.
 - `steps` is provisional: sandyd sends none until the launch driver (#587 slice C), and each
   name maps to status `pending` until slice C pins the format.
 
 **Residual.** A create whose reply times out and is never retried leaves an environment with
 no owner, which the broker cannot list. sandyd's own row cap and the profile checks still apply
-to it. Closing it is the correlation work in #621.
+to it. Closing it is the correlation work in #621. A create whose owner save fails answers
+`unavailable`; a retry that arrives when the client is at its quota gets `quota_exceeded`
+and does not replay, because the broker has no record of the request. The broker does not
+record the request before the create: a refused request that was then corrected would skip the
+quota check, and a client could exceed the quota by one environment per distinct key.
 
 ## Consequences
 

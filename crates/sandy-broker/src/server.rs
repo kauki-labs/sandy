@@ -26,8 +26,8 @@ pub(crate) struct State {
     pub(crate) rpc_deadline: std::time::Duration,
     pub(crate) clients: Vec<Client>,
     pub(crate) owners: Owners,
-    /// Serializes environment creates, so a quota check and its create are one step.
-    pub(crate) env_create: tokio::sync::Mutex<()>,
+    /// Serializes one client's environment creates, so a quota check and its create are one step.
+    pub(crate) env_create: std::collections::HashMap<String, tokio::sync::Mutex<()>>,
 }
 
 /// A typed API error (the contract's `Error` schema).
