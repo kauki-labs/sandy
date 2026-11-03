@@ -10,7 +10,7 @@ updated: 2026-11-03
 The HTTP tier in front of sandyd (`sandy-broker`, #591). `sandyd.md` decision 7 puts every
 non-CLI client behind it, and decision 25 makes `sandy-mcp` its first caller. The wire
 contract is [`../api/broker.openapi.yaml`](../api/broker.openapi.yaml). This record covers the
-job-endpoint slice. Environment endpoints wait for #587.
+job and environment endpoints (sections 1 to 6). Attach and link are deferred (section 5).
 
 All decisions here are **proposed**. Items marked _owner_ touch security or the public API
 and need ratification on #591.
@@ -106,17 +106,73 @@ user's files. Tracked in a follow-up issue.
 
 - `attach` returns the typed error `unsupported`. The control RPC's data plane is a UDS stream.
   An HTTP bridge is its own design and aligns with #513 (NDJSON).
-- Environment endpoints return `unsupported` until #587 lands.
+- `link` returns `unsupported` until T3 offers an external link interface (#585 open point 1).
 - Rate limiting, quotas, and the audit trail are #596.
 - `SubmitJob` has no `request_id`. Job idempotency is a contract change and is not made here.
+
+## 6. Environment endpoints map onto sandyd's typed environment RPC (#587 A2)
+
+**Decision.**
+
+- Spawn, get, list, stop, resume, cancel and delete each make one control RPC with the typed
+  messages. The broker never forwards client JSON bytes: sandyd compares the create spec
+  byte for byte, so the broker builds the message.
+- sandyd keys idempotency over all callers. The broker sends `idempotency_key` as a 16-digit
+  hash of the client id, a dot, and the client's `request_id` (at most 111 characters of
+  letters, digits, `-`, `_`, `.`). Two clients never collide, and one cannot learn another's
+  environment through a repeated key.
+- The owner table records the environment and the request id per client. Another client's
+  environment, and an unknown one, both give `not_found` on every route, and list shows only
+  the caller's.
+- Per-client quota: `max_environments` in the clients file (default 4) counts the client's
+  non-terminal environments. A replay of a request id the client already used skips the check.
+  Creates of one client run one at a time, so the check and the create cannot race, and one
+  client cannot hold up another.
+- sandyd's `EnvironmentError` codes map to fixed messages: `NOT_FOUND` 404 `not_found`,
+  `REQUEST_ID_CONFLICT` 409, `QUOTA_EXCEEDED` 429, `UNSUPPORTED_FOR_LIFETIME` 409,
+  `INVALID_STATE` 409 and `INVALID_ARGUMENT` 400 as `invalid_request`. sandyd's own text is
+  not relayed.
+- A create whose owner save fails answers `unavailable`. The client's retry replays the create,
+  gets the same environment, and records it, so no orphan outlives a retry.
+- A client may hold `max_environments` non-terminal environments (default 4) and may ever
+  create `max_environment_records` (default 64). sandyd keeps a deleted row for replay and
+  counts it against its own cap, so without the second limit one client could create and
+  delete until sandyd's table is full for everyone. The real fix is sandyd pruning deleted
+  rows and paging its list reply (#633).
+- A create that sandyd answers with an environment another client already owns is refused
+  (`TakenOver`), and two clients whose ids share a 16-digit hash prefix are refused at startup.
+- `failure.reason` is neither relayed nor logged by the broker: it is sandyd's text and may name
+  a path or a credential once the launch driver writes it, and sandyd's store holds it for the
+  operator. `failure.step` is relayed only if it is a plain name (at most 64 characters of
+  letters, digits, `-`, `_`, `.`), else as `unknown`.
+- `connection.url` is relayed only while the state is `ready`. A stopped, failed or deleted
+  environment has no reachable service, and a URL sandyd still holds for it could outlive the
+  delete.
+- A client may name only the profiles in its `profiles` list (`forbidden` otherwise). An empty
+  list allows none. sandyd owns whether a profile exists (#592); the broker owns who may use it.
+- `ttl_secs` is bounded by sandyd (1 to 604800). Any client may still ask for a `persistent`
+  lifetime: a per-client lifetime policy is an owner decision (#607).
+- An owner file in the earlier job-only shape fails the load.
+- `steps` is provisional: sandyd sends none until the launch driver (#587 slice C), and each
+  name maps to status `pending` until slice C pins the format.
+
+**Residual.** A create whose reply times out and is never retried leaves an environment with
+no owner, which the broker cannot list. sandyd's own row cap and the profile checks still apply
+to it. Closing it is the correlation work in #621. A create whose owner save fails answers
+`unavailable`; a retry that arrives when the client is at its quota gets `quota_exceeded`
+and does not replay, because the broker has no record of the request. The broker does not
+record the request before the create: a refused request that was then corrected would skip the
+quota check, and a client could exceed the quota by one environment per distinct key.
 
 ## Consequences
 
 - Every broker refusal is typed (`unauthenticated`, `forbidden`, `not_found`,
-  `invalid_request`, `unsupported`, `unavailable`), so `sandy-mcp` passes them through
-  unchanged. sandyd's own refusal text is never relayed; it becomes `unavailable`.
+  `invalid_request`, `request_id_conflict`, `quota_exceeded`, `unsupported_for_lifetime`,
+  `unsupported`, `unavailable`), so `sandy-mcp` passes them through unchanged. sandyd's own
+  refusal text is never relayed: a `ControlError` becomes `unavailable`, an `EnvironmentError`
+  code gets a fixed message.
 - A broker restart keeps job ownership, so the owner can still cancel.
-- The owner table is rewritten whole on each submit and never pruned. Pruning waits for #596.
+- The owner table is rewritten whole on each submit and each environment create, and never pruned. Pruning waits for #596.
 - A caller on another machine cannot reach the broker until the TLS follow-up lands.
 - sandyd cannot tell two HTTP clients apart. The broker is the only per-client boundary.
 

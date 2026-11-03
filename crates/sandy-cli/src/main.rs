@@ -1055,6 +1055,7 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
                     cpu,
                     mem,
                     timeout_secs: timeout,
+                    service: None,
                 };
                 match sandy_guest_template::manifest::encode_flake_manifest(&manifest) {
                     Ok(bytes) => (
@@ -1205,6 +1206,16 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
         Some(control_response::Result::Error(e)) => {
             eprintln!("sandy: {}", e.message);
             ProcessExit::InvalidPlan.code()
+        }
+        // `sandy daemon` sends no environment operation, so the daemon has no
+        // reason to answer one here: an unexpected reply, not a result to show.
+        Some(
+            control_response::Result::Environment(_)
+            | control_response::Result::Environments(_)
+            | control_response::Result::EnvironmentError(_),
+        ) => {
+            eprintln!("sandy: daemon answered a job request with an environment response");
+            ProcessExit::InfraFault.code()
         }
         None => {
             eprintln!("sandy: daemon sent a response with no result set");

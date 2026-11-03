@@ -15,6 +15,8 @@
 pub mod attach_relay;
 pub mod build_rev;
 pub mod dispatch;
+pub mod environment;
+pub mod environment_driver;
 pub mod environment_store;
 pub mod handler;
 pub mod host_conn;
@@ -31,6 +33,7 @@ mod test_support;
 use std::{future::Future, net::SocketAddr, sync::Arc};
 
 use dispatch::JobRegistry;
+use environment_store::EnvironmentStore;
 use host_registry::HostRegistry;
 use sandy_control_proto::{ControlRequest, read_frame, write_frame};
 use store::JobStore;
@@ -110,6 +113,7 @@ pub fn spawn_gated_accept(
 pub async fn serve_connection(
     mut stream: UnixStream,
     store: Arc<JobStore>,
+    environments: Arc<EnvironmentStore>,
     registry: Arc<JobRegistry>,
     host_registry: Arc<HostRegistry>,
     forward_back_addr: Option<SocketAddr>,
@@ -132,14 +136,25 @@ pub async fn serve_connection(
         };
 
         let request_id = request.request_id;
-        let response =
+        // Environment operations have their own handler and store; every other
+        // request goes to the job handler unchanged.
+        let response = if environment::is_environment_op(&request.op) {
+            match environment::handle(&environments, request).await {
+                Ok(response) => response,
+                Err(e) => {
+                    tracing::error!(error = %e, request_id, "environment store faulted handling a request");
+                    return;
+                }
+            }
+        } else {
             match handler::handle(&store, &registry, &host_registry, forward_back_addr, session, request).await {
                 Ok(response) => response,
                 Err(e) => {
                     tracing::error!(error = %e, request_id, "job store faulted handling a request");
                     return;
                 }
-            };
+            }
+        };
 
         if let Err(e) = write_frame(&mut stream, &response).await {
             tracing::warn!(error = %e, request_id, "control connection faulted writing a response; closing it");
@@ -155,13 +170,105 @@ mod tests {
 
     use super::*;
 
+    /// An environment op is answered by the environment handler over the same
+    /// connection that serves job ops, and neither disturbs the other.
+    #[tokio::test]
+    async fn environment_and_job_operations_share_one_connection() -> anyhow::Result<()> {
+        use sandy_control_proto::v1::{
+            CreateEnvironmentRequest, EnvironmentLifetime, EnvironmentLifetimeKind, EnvironmentSpec, EnvironmentState,
+            GetEnvironmentRequest,
+        };
+
+        let environments = Arc::new(EnvironmentStore::open_in_memory()?);
+        let (client, server) = UnixStream::pair()?;
+        let serving = tokio::spawn(serve_connection(
+            server,
+            Arc::new(JobStore::open_in_memory()?),
+            Arc::clone(&environments),
+            Arc::new(JobRegistry::new()?),
+            Arc::new(HostRegistry::default()),
+            None,
+        ));
+        let mut client = client;
+
+        let create = ControlRequest {
+            request_id: 1,
+            op: Some(control_request::Op::CreateEnvironment(CreateEnvironmentRequest {
+                idempotency_key: "k1".to_owned(),
+                spec: Some(EnvironmentSpec {
+                    profile: "harness".to_owned(),
+                    size: String::new(),
+                    lifetime: Some(EnvironmentLifetime {
+                        kind: EnvironmentLifetimeKind::Ephemeral.into(),
+                        ttl_secs: 600,
+                    }),
+                    task_ref: String::new(),
+                }),
+            })),
+        };
+        write_frame(&mut client, &create).await?;
+        let response: ControlResponse = read_frame(&mut client).await?.context("expected a create reply")?;
+        assert_eq!(response.request_id, 1);
+        let id = match response.result {
+            Some(control_response::Result::Environment(env)) => {
+                assert_eq!(env.state, i32::from(EnvironmentState::Provisioning));
+                env.environment_id
+            }
+            other => anyhow::bail!("expected an environment, got {other:?}"),
+        };
+        assert_eq!(
+            environments.list()?.len(),
+            1,
+            "the create must reach the environment store"
+        );
+
+        // A job op on the same connection still reaches the job handler.
+        write_frame(
+            &mut client,
+            &ControlRequest {
+                request_id: 2,
+                op: Some(control_request::Op::List(sandy_control_proto::ListRequest {})),
+            },
+        )
+        .await?;
+        let response: ControlResponse = read_frame(&mut client).await?.context("expected a list reply")?;
+        assert!(matches!(response.result, Some(control_response::Result::List(_))));
+
+        write_frame(
+            &mut client,
+            &ControlRequest {
+                request_id: 3,
+                op: Some(control_request::Op::GetEnvironment(GetEnvironmentRequest {
+                    environment_id: id.clone(),
+                })),
+            },
+        )
+        .await?;
+        let response: ControlResponse = read_frame(&mut client).await?.context("expected a get reply")?;
+        assert!(matches!(
+            response.result,
+            Some(control_response::Result::Environment(ref e)) if e.environment_id == id
+        ));
+
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(5), serving).await??;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_client_can_submit_and_then_read_back_status() -> anyhow::Result<()> {
         let store = Arc::new(JobStore::open_in_memory()?);
         let (client, server) = UnixStream::pair()?;
         let registry = Arc::new(JobRegistry::new()?);
         let host_registry = Arc::new(HostRegistry::default());
-        let serving = tokio::spawn(serve_connection(server, store, registry, host_registry, None));
+        let serving = tokio::spawn(serve_connection(
+            server,
+            store,
+            Arc::new(EnvironmentStore::open_in_memory()?),
+            registry,
+            host_registry,
+            None,
+        ));
 
         let mut client = client;
         write_frame(
@@ -224,7 +331,14 @@ mod tests {
         let (client, server) = UnixStream::pair()?;
         let registry = Arc::new(JobRegistry::new()?);
         let host_registry = Arc::new(HostRegistry::default());
-        let serving = tokio::spawn(serve_connection(server, store, registry, host_registry, None));
+        let serving = tokio::spawn(serve_connection(
+            server,
+            store,
+            Arc::new(EnvironmentStore::open_in_memory()?),
+            registry,
+            host_registry,
+            None,
+        ));
 
         let mut client = client;
         write_frame(
@@ -285,7 +399,14 @@ mod tests {
         let (client, server) = UnixStream::pair()?;
         let registry = Arc::new(JobRegistry::new()?);
         let host_registry = Arc::new(HostRegistry::default());
-        let serving = tokio::spawn(serve_connection(server, store, registry, host_registry, None));
+        let serving = tokio::spawn(serve_connection(
+            server,
+            store,
+            Arc::new(EnvironmentStore::open_in_memory()?),
+            registry,
+            host_registry,
+            None,
+        ));
 
         use tokio::io::AsyncWriteExt;
         let mut client = client;

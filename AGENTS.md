@@ -81,9 +81,9 @@ version, metadata, dependency versions, and lints through the root `Cargo.toml`
   depends on `sandy-control-proto` (a test enforces it). Contract: `docs/api/broker.openapi.yaml`.
   See `docs/decisions/sandyd.md` decision 25.
 - **`sandy-broker`** — the broker HTTP API tier over sandyd (#591): bearer-token clients, per-client
-  job ownership, the job endpoints of the OpenAPI contract, loopback only. It speaks the control
-  RPC over UDS and keeps each job's attach token. Environment and attach endpoints answer
-  `unsupported` for now. See `docs/decisions/broker-api.md`.
+  job and environment ownership, the job and environment endpoints of the OpenAPI contract,
+  loopback only. It speaks the control RPC over UDS and keeps each job's attach token. Attach
+  and link answer `unsupported` for now. See `docs/decisions/broker-api.md`.
 - **`sandy-egress-proxy`** — the per-run host egress proxy for NIC-less guests
   (#401, epic #360): a pure CONNECT-parse / allow-list / address-filter core and an
   unprivileged binary. `QemuBackend` (#404) and `VfkitBackend` (#405) run one per launch, not yet live-verified. See
@@ -141,7 +141,7 @@ may relay one, but a relay is not authority.
 
 Before coding, understand the surrounding context and existing patterns; for multi-step
 features, plan first. Match the check to the change rather than running the full gate every
-time (the reasoning lives in the `rust-engineer` skill). Concrete commands:
+time (the reasoning lives in the `swe:rust` skill). Concrete commands:
 
 | Change                             | Checks                                                                                                      |
 | ---------------------------------- | ----------------------------------------------------------------------------------------------------------- |
@@ -152,7 +152,7 @@ time (the reasoning lives in the `rust-engineer` skill). Concrete commands:
 | Before opening a PR                | `nix fmt`, then `nix flake check -L` (full gate: build, clippy with deny-warnings, docs, tests, formatting) |
 | Before a PR, on the macOS host     | `scripts/dev/linux-gate.sh` (see below) — your local gate only built `aarch64-darwin`                       |
 
-A change that creates a feature or modifies an existing one goes through `swe-process:implement`;
+A change that creates a feature or modifies an existing one goes through `swe-workflows:implement`;
 its quality-pass step is the change-specific row in the checks table above. The "Before opening a PR"
 row is the full gate.
 
@@ -199,7 +199,7 @@ crates/
   ├─ sandyd/              - the control-plane daemon dispatching jobs into the agent fabric (epic #205)
   ├─ sandy-host-executor/ - the M2 remote executor (#269): declares capabilities, runs dispatched jobs, relays the agent link
   ├─ sandy-mcp/           - MCP stdio server over the broker API: job + environment tools (#585)
-  ├─ sandy-broker/        - the broker HTTP API tier over sandyd: bearer clients, job endpoints (#591)
+  ├─ sandy-broker/        - the broker HTTP API tier over sandyd: bearer clients, job and environment endpoints (#591)
   ├─ sandy-egress-proxy/  - per-run host egress proxy: CONNECT parse, allow-list match, address filter (#401)
   └─ sandy-cli/           - the `sandy` binary (doctor, run/ls/status/wait/kill/gc, cred github …)
 impls/

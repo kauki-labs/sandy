@@ -161,6 +161,7 @@ async fn submit_flake(
         cpu: None,
         mem: None,
         timeout_secs: None,
+        service: None,
     })
     .context("encode flake/v1 manifest")?;
     let response = call(
