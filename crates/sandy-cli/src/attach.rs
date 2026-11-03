@@ -96,19 +96,30 @@ pub fn read_attach_token(job_id: &str) -> Option<Vec<u8>> {
 /// outputs, sourced here from the one built-in transcript rather than a
 /// generic outputs directory (epic #340 phase 3). Best-effort: a write
 /// failure is reported but never turns an otherwise-successful attach into
-/// a failing command — the job already ran to completion. The report goes
-/// to stderr so it never lands inside an `-o json` NDJSON stream (#513).
-pub fn write_archive(job_id: &str, archive: &ArchivePayload) {
+/// a failing command — the job already ran to completion. Under `-o json`
+/// the report goes to stderr so it never lands inside the NDJSON stream (#513);
+/// plain output keeps it on stdout.
+#[allow(
+    clippy::print_stdout,
+    reason = "plain output keeps the archive report on stdout; the NDJSON stream uses stderr"
+)]
+pub fn write_archive(job_id: &str, archive: &ArchivePayload, format: OutputFormat) {
     match create_archive_file(std::path::Path::new("."), job_id) {
         Ok((mut file, path)) => {
             use std::io::Write as _;
             match file.write_all(&archive.bytes) {
-                Ok(()) => eprintln!(
-                    "sandy: wrote {} bytes of archived transcript ({}) to {}",
-                    archive.bytes.len(),
-                    archive.content_type,
-                    path.display()
-                ),
+                Ok(()) => {
+                    let report = format!(
+                        "sandy: wrote {} bytes of archived transcript ({}) to {}",
+                        archive.bytes.len(),
+                        archive.content_type,
+                        path.display()
+                    );
+                    match format {
+                        OutputFormat::Plain => println!("{report}"),
+                        OutputFormat::Json => eprintln!("{report}"),
+                    }
+                }
                 Err(e) => eprintln!(
                     "sandy: could not write the archived transcript to {}: {e}",
                     path.display()
@@ -389,7 +400,8 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let _raw_mode = RawMode::enable();
+    // Raw mode drops output newline translation on a tty, which would stair-step NDJSON lines.
+    let _raw_mode = matches!(format, OutputFormat::Plain).then(RawMode::enable);
     run_interactive_inner(
         read_half,
         write_half,

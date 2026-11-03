@@ -1201,7 +1201,7 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
             match sandy_cli::attach::run_interactive(data_rd, data_wr, Some(status_watch), output).await {
                 Ok(archive) => {
                     if let Some(archive) = archive {
-                        sandy_cli::attach::write_archive(&job_id, &archive);
+                        sandy_cli::attach::write_archive(&job_id, &archive, output);
                     }
                     ProcessExit::Succeeded.code()
                 }
