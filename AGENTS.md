@@ -80,6 +80,10 @@ version, metadata, dependency versions, and lints through the root `Cargo.toml`
   and environment tools, one API request per tool call, no state and no dispatch logic. It never
   depends on `sandy-control-proto` (a test enforces it). Contract: `docs/api/broker.openapi.yaml`.
   See `docs/decisions/sandyd.md` decision 25.
+- **`sandy-broker`** — the broker HTTP API tier over sandyd (#591): bearer-token clients, per-client
+  job ownership, the job endpoints of the OpenAPI contract, loopback only. It speaks the control
+  RPC over UDS and keeps each job's attach token. Environment and attach endpoints answer
+  `unsupported` for now. See `docs/decisions/broker-api.md`.
 - **`sandy-egress-proxy`** — the per-run host egress proxy for NIC-less guests
   (#401, epic #360): a pure CONNECT-parse / allow-list / address-filter core and an
   unprivileged binary. `QemuBackend` (#404) and `VfkitBackend` (#405) run one per launch, not yet live-verified. See
@@ -195,6 +199,7 @@ crates/
   ├─ sandyd/              - the control-plane daemon dispatching jobs into the agent fabric (epic #205)
   ├─ sandy-host-executor/ - the M2 remote executor (#269): declares capabilities, runs dispatched jobs, relays the agent link
   ├─ sandy-mcp/           - MCP stdio server over the broker API: job + environment tools (#585)
+  ├─ sandy-broker/        - the broker HTTP API tier over sandyd: bearer clients, job endpoints (#591)
   ├─ sandy-egress-proxy/  - per-run host egress proxy: CONNECT parse, allow-list match, address filter (#401)
   └─ sandy-cli/           - the `sandy` binary (doctor, run/ls/status/wait/kill/gc, cred github …)
 impls/

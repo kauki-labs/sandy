@@ -995,6 +995,7 @@ dependencies = [
  "http",
  "http-body",
  "httparse",
+ "httpdate",
  "itoa",
  "pin-project-lite",
  "smallvec",
@@ -2384,6 +2385,32 @@ dependencies = [
  "sandy-lib",
  "sandy-test-support",
  "tempfile",
+]
+
+[[package]]
+name = "sandy-broker"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.23.1",
+ "clap",
+ "fs2",
+ "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "reqwest",
+ "sandy-control-proto",
+ "sandy-fsutil",
+ "sandyd",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
