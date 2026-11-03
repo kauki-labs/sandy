@@ -188,6 +188,10 @@
       # protocol before sandy's backend drives it.
       packages.x86_64-linux.guest-runner = qemuGuest.config.microvm.declaredRunner;
       packages.aarch64-darwin.guest-runner-vfkit = vfkitGuest.config.microvm.declaredRunner;
+      # The T3 guest's runners (#608). `sandy run` evaluates a topology but does not build its artifacts, so a
+      # caller builds these first, as the live tests do for the base guest.
+      packages.x86_64-linux.guest-runner-t3 = qemuT3Guest.config.microvm.declaredRunner;
+      packages.aarch64-darwin.guest-runner-vfkit-t3 = vfkitT3Guest.config.microvm.declaredRunner;
 
       # The built guest configs (the topology attrs read kernel/initrd/store off
       # these).
