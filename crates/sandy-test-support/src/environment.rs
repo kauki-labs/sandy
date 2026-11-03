@@ -2,7 +2,10 @@
 
 use std::{
     collections::BTreeMap,
-    sync::{Mutex, PoisonError},
+    sync::{
+        Mutex, PoisonError,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::SystemTime,
 };
 
@@ -29,6 +32,7 @@ struct RunningBox {
 #[derive(Debug, Default)]
 struct State {
     running: BTreeMap<String, RunningBox>,
+    overrides: BTreeMap<String, Probe>,
     launched: Vec<EnvironmentSpec>,
     killed: Vec<String>,
 }
@@ -46,6 +50,9 @@ pub struct FakeEnvironmentBackend {
     script: Script,
     endpoint: Endpoint,
     launch_error: Option<String>,
+    kill_failing: AtomicBool,
+    probe_failing: AtomicBool,
+    launch_calls: AtomicUsize,
     state: Mutex<State>,
 }
 
@@ -58,6 +65,9 @@ impl Default for FakeEnvironmentBackend {
                 port: 3773,
             },
             launch_error: None,
+            kill_failing: AtomicBool::new(false),
+            probe_failing: AtomicBool::new(false),
+            launch_calls: AtomicUsize::new(0),
             state: Mutex::new(State::default()),
         }
     }
@@ -105,7 +115,34 @@ impl FakeEnvironmentBackend {
     /// Remove box `environment_id` as if its VM died on its own: nothing is
     /// recorded in [`FakeEnvironmentBackend::killed`].
     pub fn die(&self, environment_id: &str) {
-        self.lock().running.remove(environment_id);
+        let mut state = self.lock();
+        state.running.remove(environment_id);
+        state.overrides.remove(environment_id);
+    }
+
+    /// Make every probe of box `environment_id` return `result`, whatever the
+    /// script says, for as long as the box runs. Lets a test turn a Ready box
+    /// into a failing one, or make a launched box report `NotRunning`.
+    pub fn set_probe_result(&self, environment_id: &str, result: Probe) {
+        self.lock().overrides.insert(environment_id.to_owned(), result);
+    }
+
+    /// While `failing`, [`EnvironmentBackend::kill`] fails with
+    /// [`BackendError::Transport`] and leaves the box running.
+    pub fn set_kill_failing(&self, failing: bool) {
+        self.kill_failing.store(failing, Ordering::SeqCst);
+    }
+
+    /// While `failing`, [`EnvironmentBackend::probe`] fails with
+    /// [`BackendError::Transport`], as if the probe itself could not run.
+    pub fn set_probe_failing(&self, failing: bool) {
+        self.probe_failing.store(failing, Ordering::SeqCst);
+    }
+
+    /// How many times [`EnvironmentBackend::launch`] was called, including the
+    /// calls that found a box already running or failed.
+    pub fn launch_calls(&self) -> usize {
+        self.launch_calls.load(Ordering::SeqCst)
     }
 
     /// Every spec passed to a successful [`EnvironmentBackend::launch`] that
@@ -126,6 +163,7 @@ impl FakeEnvironmentBackend {
 
 impl EnvironmentBackend for FakeEnvironmentBackend {
     fn launch(&self, spec: &EnvironmentSpec) -> Result<Launch, BackendError> {
+        self.launch_calls.fetch_add(1, Ordering::SeqCst);
         if let Some(message) = &self.launch_error {
             return Err(BackendError::Spawn(message.clone()));
         }
@@ -145,7 +183,13 @@ impl EnvironmentBackend for FakeEnvironmentBackend {
     }
 
     fn probe(&self, environment_id: &str) -> Result<Probe, BackendError> {
+        if self.probe_failing.load(Ordering::SeqCst) {
+            return Err(BackendError::Transport("probe could not run".to_owned()));
+        }
         let mut state = self.lock();
+        if let Some(result) = state.overrides.get(environment_id) {
+            return Ok(result.clone());
+        }
         let Some(running) = state.running.get_mut(environment_id) else {
             return Ok(Probe::NotRunning);
         };
@@ -169,8 +213,12 @@ impl EnvironmentBackend for FakeEnvironmentBackend {
     }
 
     fn kill(&self, environment_id: &str) -> Result<(), BackendError> {
+        if self.kill_failing.load(Ordering::SeqCst) {
+            return Err(BackendError::Transport("kill failed".to_owned()));
+        }
         let mut state = self.lock();
         state.running.remove(environment_id);
+        state.overrides.remove(environment_id);
         state.killed.push(environment_id.to_owned());
         Ok(())
     }
@@ -313,6 +361,36 @@ mod tests {
             "a fresh box starts again"
         );
         assert_eq!(b.launched().len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn a_failing_kill_leaves_the_box_and_a_failing_probe_is_a_transport_error() -> Result<()> {
+        let b = FakeEnvironmentBackend::new();
+        b.launch(&spec("env-1"))?;
+        b.set_kill_failing(true);
+        assert_eq!(b.kill("env-1"), Err(BackendError::Transport("kill failed".to_owned())));
+        assert_eq!(b.boxes()?.len(), 1, "a failed kill leaves the box");
+        assert!(b.killed().is_empty(), "a failed kill is not recorded as a kill");
+        b.set_kill_failing(false);
+        b.kill("env-1")?;
+        assert!(b.boxes()?.is_empty());
+
+        b.launch(&spec("env-2"))?;
+        b.set_probe_failing(true);
+        assert!(matches!(b.probe("env-2"), Err(BackendError::Transport(_))));
+        b.set_probe_failing(false);
+        assert!(matches!(b.probe("env-2")?, Probe::Ready { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn launch_calls_count_every_call_including_the_idempotent_ones() -> Result<()> {
+        let b = FakeEnvironmentBackend::new();
+        b.launch(&spec("env-1"))?;
+        b.launch(&spec("env-1"))?;
+        assert_eq!(b.launch_calls(), 2);
+        assert_eq!(b.launched().len(), 1);
         Ok(())
     }
 }

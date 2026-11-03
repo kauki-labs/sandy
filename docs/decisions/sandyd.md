@@ -2141,15 +2141,25 @@ into a running VM or into `Ready`. `VmBackend::run` is run-to-completion, so a l
   daemon finds its boxes with `boxes()`. `stop` and `resume` are not in the seam: an ephemeral environment cannot be
   stopped, and a real resume needs persistent guest state (#588). `FakeEnvironmentBackend` in `sandy-test-support`
   stands in for tier-2.
-- `EnvironmentDriver` is a level-triggered loop, not a set of handler hooks. Each pass reads every row and every box
-  and fixes each difference: a `Provisioning` row with no box is launched, then probed (Ready records the endpoint and
-  marks the row `Ready`; Failed records the step and reason and kills the box); a `Provisioning` row older than the
-  provision timeout fails with step `provision`; a `Ready` row whose box is gone or failing is marked lost
-  (`Failed`, step `reconcile`); a `Stopped`, `Failed` or `Deleted` row keeps no box; a box with no row is an orphan and
-  is killed. The same pass is the reconciler after a restart: nothing is held in memory.
-- The store gains an `endpoint` column (migrated into an older table), `set_endpoint`, and `mark_lost` (`Provisioning`
-  or `Ready` to `Failed`). `mark_failed` stays `Provisioning` only. `GetEnvironment` reports
-  `connection.url = http://<endpoint>` only while `Ready` and only when an endpoint was recorded, never a made-up one.
+- `EnvironmentDriver` is a level-triggered loop, not a set of handler hooks. Each pass takes the backend's box list,
+  then reads every row, and fixes each difference. A `Provisioning` row launches a box unless one already runs, then
+  probes it: Ready marks the row `Ready` and records the endpoint in the same write; Failed records the step and reason
+  and kills the box; a probe that is not Ready after the provision timeout fails the row with step `provision` and kills
+  the box. The probe comes first, so a long daemon downtime never fails a row that can still become Ready. A `Ready` row
+  whose box is gone is marked lost (`Failed`, step `reconcile`); one whose probe fails is marked lost with the probe's
+  own step. A `Stopped`, `Failed` or `Deleted` row keeps no box, and a box no row names is an orphan and is killed. The
+  same pass is the reconciler after a restart: nothing is held in memory. The box list is read before the rows, so a
+  box in the snapshot always has its row in the listing.
+- A store fault on one row, or a row with an unreadable state, is logged and skipped; the rest of the pass runs, and
+  an unreadable row's box is not killed as an orphan.
+- The endpoint a backend reports becomes `host:port` (brackets around IPv6) only if the host is an IP address or a
+  plain DNS name; anything else (a scheme, path, userinfo, space) fails the environment at step `probe`. The store gains
+  an `endpoint` column (migrated into an older table; two processes opening an old file at once are safe),
+  `mark_ready_with_endpoint` (one guarded `Provisioning` to `Ready` write) and `mark_lost` (`Provisioning` or `Ready` to
+  `Failed`). `mark_failed` stays `Provisioning` only. `GetEnvironment` reports `connection.url = http://<endpoint>` only
+  while `Ready` and only when an endpoint was recorded, never a made-up one.
+- `EnvironmentBackend::boxes` must list only environment boxes the backend launched: the driver kills any listed box no
+  row names, so listing a `VmBackend` job VM would kill it.
 
 **Consequences.**
 

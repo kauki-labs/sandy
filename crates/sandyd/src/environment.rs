@@ -1050,13 +1050,12 @@ mod tests {
         use sandy_control_proto::v1::EnvironmentConnection;
         let s = store()?;
         let env = create(&s, "k1", persistent()).await?;
-        // An endpoint recorded while still Provisioning is not shown.
-        s.set_endpoint(&env.environment_id, "127.0.0.1:41000")?;
+        // Still Provisioning: no endpoint, no connection.
         match call(&s, get(&env.environment_id)).await? {
             Ok(control_response::Result::Environment(got)) => assert_eq!(got.connection, None),
             other => bail!("expected an environment, got {other:?}"),
         }
-        s.mark_ready(&env.environment_id)?;
+        s.mark_ready_with_endpoint(&env.environment_id, "127.0.0.1:41000")?;
         match call(&s, get(&env.environment_id)).await? {
             Ok(control_response::Result::Environment(got)) => assert_eq!(
                 got.connection,
@@ -1066,7 +1065,7 @@ mod tests {
             ),
             other => bail!("expected an environment, got {other:?}"),
         }
-        // A stopped environment shows no connection, even with an endpoint on the row.
+        // A stopped environment shows no connection, even with an endpoint left on the row.
         s.stop(&env.environment_id)?;
         match call(&s, get(&env.environment_id)).await? {
             Ok(control_response::Result::Environment(got)) => assert_eq!(got.connection, None),

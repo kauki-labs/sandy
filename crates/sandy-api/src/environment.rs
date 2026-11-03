@@ -103,9 +103,12 @@ pub trait EnvironmentBackend {
     /// [`BackendError::Transport`] if teardown faulted.
     fn kill(&self, environment_id: &str) -> Result<(), BackendError>;
 
-    /// The boxes running now, keyed by environment id in [`BoxState::box_id`].
-    /// The reconciler uses it to find a box with no live environment, and an
-    /// environment with no box.
+    /// The environment boxes this backend launched and still runs, keyed by
+    /// environment id in [`BoxState::box_id`]. It must not list boxes of other
+    /// kinds (a `VmBackend` job VM): the reconciler kills any box it lists that
+    /// no environment row names.
+    ///
+    /// The reconciler uses it to find a box with no live environment.
     ///
     /// # Errors
     /// [`BackendError::Transport`] if the backend cannot list its boxes.

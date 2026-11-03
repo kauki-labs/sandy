@@ -290,7 +290,12 @@ impl EnvironmentStore {
             |row| row.get(0),
         )?;
         if !has_endpoint {
-            conn.execute("ALTER TABLE environments ADD COLUMN endpoint TEXT", ())?;
+            match conn.execute("ALTER TABLE environments ADD COLUMN endpoint TEXT", ()) {
+                Ok(_) => {}
+                // Another process opening the same old file added it first.
+                Err(rusqlite::Error::SqliteFailure(_, Some(msg))) if msg.contains("duplicate column name") => {}
+                Err(e) => return Err(e.into()),
+            }
         }
         Ok(Self {
             conn: Mutex::new(conn),
@@ -422,6 +427,23 @@ impl EnvironmentStore {
         self.query_many("", ())
     }
 
+    /// Every environment, oldest first, each row decoded on its own: a row with
+    /// an unreadable state is an `Err` entry and does not hide the others. The
+    /// launch driver uses this so one corrupt row cannot stop a pass.
+    ///
+    /// # Errors
+    /// [`EnvironmentStoreError::Sqlite`] if the table cannot be read at all.
+    pub fn list_each(&self) -> Result<Vec<Result<EnvironmentRecord, EnvironmentStoreError>>, EnvironmentStoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM environments ORDER BY created_at, rowid"
+        ))?;
+        let rows = stmt
+            .query_map((), RawRow::read)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows.into_iter().map(RawRow::into_record).collect())
+    }
+
     /// Every environment in `state`, oldest first.
     ///
     /// # Errors
@@ -511,19 +533,25 @@ impl EnvironmentStore {
         self.transition(environment_id, &LIVE, EnvironmentState::Deleted, None)
     }
 
-    /// Record where `environment_id`'s service is reachable (`host:port`).
-    /// Written by the launch driver before it marks the environment `Ready`.
-    /// Returns whether a row was updated.
+    /// `Provisioning` to `Ready`, recording where the environment's service is
+    /// reachable (`host:port`) in the same write. The launch driver uses this
+    /// when its probe passes, so a row never shows Ready without its endpoint
+    /// and an endpoint is never set on a row in another state.
     ///
     /// # Errors
     /// As [`EnvironmentStore::create`].
-    pub fn set_endpoint(&self, environment_id: &str, endpoint: &str) -> Result<bool, EnvironmentStoreError> {
-        let conn = self.lock();
-        let rows = conn.execute(
-            "UPDATE environments SET endpoint = ?2, updated_at = ?3 WHERE environment_id = ?1",
-            (environment_id, endpoint, now_unix()),
-        )?;
-        Ok(rows == 1)
+    pub fn mark_ready_with_endpoint(
+        &self,
+        environment_id: &str,
+        endpoint: &str,
+    ) -> Result<EnvTransition, EnvironmentStoreError> {
+        self.transition_with(
+            environment_id,
+            &[EnvironmentState::Provisioning],
+            EnvironmentState::Ready,
+            None,
+            Some(endpoint),
+        )
     }
 
     /// `Provisioning` or `Ready` to `Failed`: the environment's box is gone or
@@ -570,6 +598,18 @@ impl EnvironmentStore {
         to: EnvironmentState,
         failure: Option<(&str, &str)>,
     ) -> Result<EnvTransition, EnvironmentStoreError> {
+        self.transition_with(environment_id, from, to, failure, None)
+    }
+
+    /// [`EnvironmentStore::transition`] that also sets the endpoint when given.
+    fn transition_with(
+        &self,
+        environment_id: &str,
+        from: &[EnvironmentState],
+        to: EnvironmentState,
+        failure: Option<(&str, &str)>,
+        endpoint: Option<&str>,
+    ) -> Result<EnvTransition, EnvironmentStoreError> {
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let raw: Option<String> = tx
@@ -596,9 +636,10 @@ impl EnvironmentStore {
         tx.execute(
             "UPDATE environments
                 SET state = ?2, failure_step = COALESCE(?3, failure_step),
-                    failure_reason = COALESCE(?4, failure_reason), updated_at = ?5
+                    failure_reason = COALESCE(?4, failure_reason), updated_at = ?5,
+                    endpoint = COALESCE(?6, endpoint)
               WHERE environment_id = ?1",
-            (environment_id, to.as_str(), step, reason, now_unix()),
+            (environment_id, to.as_str(), step, reason, now_unix(), endpoint),
         )?;
         tx.commit()?;
         Ok(EnvTransition::Applied)
@@ -807,23 +848,43 @@ mod tests {
     }
 
     #[test]
-    fn an_endpoint_is_recorded_per_environment_and_survives_reopening() -> Result<()> {
+    fn ready_and_the_endpoint_are_one_guarded_write_that_survives_reopening() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("env.db");
         {
             let s = EnvironmentStore::open(&path)?;
             created(&s)?;
             assert_eq!(s.get("env-1")?.context("env-1")?.endpoint, None);
-            assert!(s.set_endpoint("env-1", "127.0.0.1:41000")?);
-            assert!(
-                !s.set_endpoint("env-nope", "127.0.0.1:1")?,
-                "an unknown id updates nothing"
+            assert_eq!(
+                s.mark_ready_with_endpoint("env-1", "127.0.0.1:41000")?,
+                EnvTransition::Applied
+            );
+            assert_eq!(
+                s.mark_ready_with_endpoint("env-1", "127.0.0.1:9")?,
+                EnvTransition::Refused(EnvironmentState::Ready),
+                "a second write must not replace the endpoint"
+            );
+            assert_eq!(
+                s.mark_ready_with_endpoint("env-nope", "127.0.0.1:1")?,
+                EnvTransition::NotFound
+            );
+            s.create("r2", "env-2", SPEC, ENC)?;
+            s.delete("env-2")?;
+            assert_eq!(
+                s.mark_ready_with_endpoint("env-2", "127.0.0.1:2")?,
+                EnvTransition::Refused(EnvironmentState::Deleted)
+            );
+            assert_eq!(
+                s.get("env-2")?.context("env-2")?.endpoint,
+                None,
+                "no endpoint on a deleted row"
             );
         }
         let s = EnvironmentStore::open(&path)?;
+        let rec = s.get("env-1")?.context("env-1")?;
         assert_eq!(
-            s.get("env-1")?.context("env-1")?.endpoint.as_deref(),
-            Some("127.0.0.1:41000")
+            (rec.state, rec.endpoint.as_deref()),
+            (EnvironmentState::Ready, Some("127.0.0.1:41000"))
         );
         Ok(())
     }
@@ -846,7 +907,9 @@ mod tests {
         let s = EnvironmentStore::open(&path)?;
         let old = s.get("env-old")?.context("env-old")?;
         assert_eq!((old.state, old.endpoint), (EnvironmentState::Ready, None));
-        assert!(s.set_endpoint("env-old", "127.0.0.1:2")?);
+        drop(s);
+        // Opening the migrated file again is a no-op, not a duplicate-column error.
+        assert!(EnvironmentStore::open(&path).is_ok());
         Ok(())
     }
 
@@ -874,6 +937,28 @@ mod tests {
         s.delete("env-3")?;
         assert_eq!(s.mark_lost("env-3", "x", "y")?, EnvTransition::Refused(Deleted));
         assert_eq!(s.mark_lost("nope", "x", "y")?, EnvTransition::NotFound);
+        Ok(())
+    }
+
+    #[test]
+    fn list_each_reports_a_corrupt_row_without_hiding_the_others() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("env.db");
+        {
+            let s = EnvironmentStore::open(&path)?;
+            created(&s)?;
+            s.create("r2", "env-2", SPEC, ENC)?;
+        }
+        Connection::open(&path)?.execute(
+            "UPDATE environments SET state = 'bogus' WHERE environment_id = 'env-1'",
+            (),
+        )?;
+        let rows = EnvironmentStore::open(&path)?.list_each()?;
+        assert_eq!(rows.len(), 2);
+        assert!(
+            matches!(&rows[0], Err(EnvironmentStoreError::CorruptState { environment_id, .. }) if environment_id == "env-1")
+        );
+        assert_eq!(rows[1].as_ref().map(|r| r.environment_id.as_str()).ok(), Some("env-2"));
         Ok(())
     }
 
