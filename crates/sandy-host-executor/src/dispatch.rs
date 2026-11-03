@@ -615,6 +615,12 @@ pub fn handle_dispatch(
         Some(ProtoSandboxKind::Vm) if vm_available => {
             refuse_guest_nic(std::env::var(sandy_api::egress::NETWORK_ENV))?;
             let decoded = decode_flake_dispatch_manifest(&dispatch.manifest_encoding, &dispatch.manifest)?;
+            // Before flake resolution: an oversized or unencodable spec is refused at once, not after the
+            // sequential dispatch loop spent up to FLAKE_RESOLVE_TIMEOUT_SECS on it (CodeRabbit on #632).
+            // The manifest's own env first, the plumbing entries last so they always win a key collision
+            // (see `flake_run_env`) — the same precedence `impls/local/src/process.rs` already establishes for
+            // the process backend's share-dir/passthrough overlays (manifest-parity #480, `sandyd.md` §19).
+            let env = flake_run_env(&decoded)?;
             let resolved = sandy_guest_template::resolve_flake_template(
                 &decoded.flake,
                 decoded.kind.as_deref(),
@@ -657,12 +663,6 @@ pub fn handle_dispatch(
                 program: agent_program,
                 on_link,
             });
-            // The manifest's own env first, the plumbing entry
-            // (`SANDY_HISTORY_LINES`) last so it always wins a key collision
-            // — the same precedence `impls/local/src/process.rs` already
-            // establishes for the process backend's share-dir/passthrough
-            // overlays (manifest-parity #480, `sandyd.md` §19).
-            let env = flake_run_env(&decoded)?;
             let spec = RunSpec {
                 digests: false,
                 egress: None,

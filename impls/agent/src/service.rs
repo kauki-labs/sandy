@@ -161,13 +161,15 @@ async fn probe_loop(probe: &HealthProbe, second: Duration) -> ProbeVerdict {
     let interval = second * probe.interval_secs;
     let mut last = String::new();
     for n in 1..=probe.max_attempts {
+        let started = tokio::time::Instant::now();
         match attempt(&probe.check, timeout).await {
             Ok(()) => return ProbeVerdict::Ready,
             Err(output) => last = output,
         }
-        // No wait after the last attempt: the verdict is final.
+        // No wait after the last attempt: the verdict is final. The wait is the rest of the interval, so a
+        // slow attempt does not stretch the budget past `interval_secs * max_attempts`.
         if n < probe.max_attempts {
-            tokio::time::sleep(interval).await;
+            tokio::time::sleep(interval.saturating_sub(started.elapsed())).await;
         }
     }
     ProbeVerdict::Failed { output: last }
@@ -213,8 +215,33 @@ impl Drop for KillGroupOnDrop {
     }
 }
 
-/// Runs `program args` with stdout and stderr merged into the failure text (capped); `Ok` only on exit 0. The
-/// child dies with this future, so a timeout kills it.
+/// How long the pipes get to drain after the probe command has exited and its process group was killed.
+const PIPE_DRAIN: Duration = Duration::from_millis(500);
+
+/// A command's captured output so far, shared with the task that reads it.
+type SharedOutput = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
+
+/// Reads `stream` to EOF into `kept`, keeping only the first [`ATTEMPT_OUTPUT_CAP`] bytes. It reads on past the
+/// cap so the child never blocks on a full pipe.
+async fn drain_capped(mut stream: impl tokio::io::AsyncRead + Unpin, kept: SharedOutput) {
+    let mut chunk = [0_u8; 4096];
+    loop {
+        match stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => {
+                let mut kept = kept.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let room = ATTEMPT_OUTPUT_CAP.saturating_sub(kept.len());
+                kept.extend_from_slice(&chunk[..n.min(room)]);
+            }
+        }
+    }
+}
+
+/// Runs `program args`; `Ok` only on exit 0. The attempt is decided by the exit status, never by the pipes
+/// closing: a probe that exits 0 but leaves a background child holding stdout open is ready, and its process
+/// group is killed so the child does not outlive the attempt. On failure the text is stderr first, then
+/// stdout, so a long stdout cannot push the diagnostic out of the 4096 bytes the verdict keeps. The child dies
+/// with this future, so a timeout kills it too.
 async fn run_command(program: &str, args: &[String]) -> Result<(), String> {
     let mut child = Command::new(program)
         .args(args)
@@ -226,32 +253,30 @@ async fn run_command(program: &str, args: &[String]) -> Result<(), String> {
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| format!("could not run {program}: {e}"))?;
-    let _group = child.id().and_then(KillGroupOnDrop::new);
-    let (Some(mut out), Some(mut err)) = (child.stdout.take(), child.stderr.take()) else {
+    let group = child.id().and_then(KillGroupOnDrop::new);
+    let (Some(out), Some(err)) = (child.stdout.take(), child.stderr.take()) else {
         return Err(format!("could not capture the output of {program}"));
     };
-    let read_capped = async |stream: &mut (dyn tokio::io::AsyncRead + Unpin + Send)| {
-        let mut kept = Vec::new();
-        // Read to EOF so the child never blocks on a full pipe, but keep only the head.
-        let mut chunk = [0_u8; 4096];
-        loop {
-            match stream.read(&mut chunk).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let room = ATTEMPT_OUTPUT_CAP.saturating_sub(kept.len());
-                    kept.extend_from_slice(&chunk[..n.min(room)]);
-                }
-            }
-        }
-        kept
-    };
-    let (stdout, stderr) = tokio::join!(read_capped(&mut out), read_capped(&mut err));
+    let (stdout, stderr) = (SharedOutput::default(), SharedOutput::default());
+    let mut out_task = tokio::spawn(drain_capped(out, std::sync::Arc::clone(&stdout)));
+    let mut err_task = tokio::spawn(drain_capped(err, std::sync::Arc::clone(&stderr)));
+
     let status = child.wait().await.map_err(|e| format!("waiting for {program}: {e}"))?;
+    // The command is done: end its group now so a background child cannot hold the pipes, then take what was
+    // written, bounded.
+    drop(group);
+    let _ = tokio::time::timeout(PIPE_DRAIN, async {
+        let _ = tokio::join!(&mut out_task, &mut err_task);
+    })
+    .await;
+    out_task.abort();
+    err_task.abort();
     if status.success() {
         return Ok(());
     }
-    let mut text = String::from_utf8_lossy(&stdout).into_owned();
-    text.push_str(&String::from_utf8_lossy(&stderr));
+    let taken = |buffer: &SharedOutput| buffer.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    let mut text = String::from_utf8_lossy(&taken(&stderr)).into_owned();
+    text.push_str(&String::from_utf8_lossy(&taken(&stdout)));
     Err(format!("{program} failed ({status}): {text}"))
 }
 
@@ -467,6 +492,55 @@ mod tests {
             anyhow::bail!("expected a failure, got {verdict:?}");
         };
         assert!(output.contains("/nonexistent/sandy-probe"), "{output}");
+        Ok(())
+    }
+
+    /// CodeRabbit on #632: a command probe is decided by its exit status, not by its pipes closing. A probe
+    /// that exits 0 but leaves a background child holding stdout open is Ready, not a timeout, and the child
+    /// does not outlive the attempt.
+    #[tokio::test]
+    async fn a_probe_that_exits_zero_is_ready_even_with_a_background_child_on_its_pipes() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().context("temp dir")?;
+        let marker = dir.path().join("late");
+        let script = format!("(sleep 0.6; echo late > {}) & exit 0", marker.display());
+        let started = tokio::time::Instant::now();
+        let verdict = probe_loop(&probe(command(&["sh", "-c", &script]), 1), TICK).await;
+        assert_eq!(verdict, ProbeVerdict::Ready);
+        assert!(started.elapsed() < TICK * 8, "the verdict waited for the pipes: {:?}", started.elapsed());
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert!(!marker.exists(), "the probe's background child outlived the attempt");
+        Ok(())
+    }
+
+    /// CodeRabbit on #632: the wait between attempts is the rest of the interval, so a slow attempt does not
+    /// stretch the budget (`interval_secs * max_attempts`) to twice its length. Three 0.3 s failures with a
+    /// 0.4 s interval take about 1.1 s (not 1.7 s).
+    #[tokio::test]
+    async fn a_slow_attempt_shortens_the_wait_to_the_end_of_its_interval() {
+        let slow = HealthProbe {
+            check: command(&["sh", "-c", "sleep 0.3; exit 1"]),
+            interval_secs: 2,
+            timeout_secs: 2,
+            max_attempts: 3,
+        };
+        let started = tokio::time::Instant::now();
+        let verdict = probe_loop(&slow, Duration::from_millis(200)).await;
+        assert!(matches!(verdict, ProbeVerdict::Failed { .. }), "{verdict:?}");
+        let took = started.elapsed();
+        assert!(took < Duration::from_millis(1_450), "the waits did not shrink: {took:?}");
+    }
+
+    /// CodeRabbit on #632: the verdict keeps a failing probe's stderr when stdout is long, since the relay
+    /// keeps only the first 4096 bytes.
+    #[tokio::test]
+    async fn a_failing_probe_keeps_its_stderr_ahead_of_a_long_stdout() -> anyhow::Result<()> {
+        let script = "head -c 5000 /dev/zero | tr '\\0' x; echo the-diagnostic >&2; exit 1";
+        let verdict = probe_loop(&probe(command(&["sh", "-c", script]), 1), TICK * 5).await;
+        let ProbeVerdict::Failed { output } = verdict else {
+            anyhow::bail!("expected a failure, got {verdict:?}");
+        };
+        let head: String = output.chars().take(4096).collect();
+        assert!(head.contains("the-diagnostic"), "stderr fell off the verdict: {} bytes", output.len());
         Ok(())
     }
 
