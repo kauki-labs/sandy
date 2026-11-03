@@ -34,6 +34,9 @@ const MAX_KEY: usize = 128;
 const MAX_PROFILE: usize = 64;
 const MAX_SIZE: usize = 32;
 const MAX_TASK_REF: usize = 256;
+/// The most environments one `ListEnvironments` reply may carry. A row is at
+/// most about 415 bytes on the wire, so this stays under the control frame limit.
+pub const MAX_LIST_ROWS: usize = 1000;
 /// The longest ephemeral lifetime a client may ask for: seven days.
 const MAX_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
@@ -130,17 +133,29 @@ const SECRET_PREFIXES: &[&str] = &[
     "gho_",
     "ghs_",
     "ghu_",
+    "ghr_",
     "github_pat_",
     "glpat-",
+    "glptt-",
     "sk-",
     "xoxb-",
+    "xoxp-",
+    "xapp-",
     "AKIA",
+    "ASIA",
+    "AIza",
+    "npm_",
 ];
 
 fn looks_like_secret(s: &str) -> bool {
     SECRET_PREFIXES
         .iter()
         .any(|p| s.starts_with(p) && s.len() >= p.len() + 8)
+}
+
+/// Unicode direction marks and overrides: invisible, and they reorder text.
+fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
 }
 
 fn validate_spec(spec: &EnvironmentSpec) -> Result<(), String> {
@@ -157,9 +172,9 @@ fn validate_spec(spec: &EnvironmentSpec) -> Result<(), String> {
             "size must be empty or 1 to {MAX_SIZE} letters, digits, '-', '_' or '.'"
         ));
     }
-    if spec.task_ref.len() > MAX_TASK_REF || spec.task_ref.chars().any(char::is_control) {
+    if spec.task_ref.len() > MAX_TASK_REF || spec.task_ref.chars().any(|c| c.is_control() || is_bidi_control(c)) {
         return Err(format!(
-            "task_ref must be at most {MAX_TASK_REF} bytes with no control characters"
+            "task_ref must be at most {MAX_TASK_REF} bytes with no control or bidirectional-override characters"
         ));
     }
     let lifetime = spec.lifetime.as_ref().ok_or("lifetime is required")?;
@@ -230,10 +245,24 @@ async fn create(store: &Arc<EnvironmentStore>, key: String, spec: Option<Environ
     let Some(spec) = spec else {
         return refuse(EnvironmentErrorCode::InvalidArgument, "spec is required");
     };
+    let bytes = spec.encode_to_vec();
+    // A retry is answered from the stored row before any validation: a rule
+    // tightened by a later daemon must not turn an accepted create's replay
+    // into a refusal.
+    let lookup = key.clone();
+    if let Some(existing) = blocking(store, move |s| s.get_by_request_id(&lookup)).await? {
+        return if existing.spec == bytes && existing.spec_encoding == SPEC_ENCODING {
+            reply(existing)
+        } else {
+            refuse(
+                EnvironmentErrorCode::RequestIdConflict,
+                "this idempotency_key was used with a different spec",
+            )
+        };
+    }
     if let Err(why) = validate_spec(&spec) {
         return refuse(EnvironmentErrorCode::InvalidArgument, why);
     }
-    let bytes = spec.encode_to_vec();
     let new_id = format!("env-{}", uuid::Uuid::new_v4().simple());
     let outcome = blocking(store, move |s| s.create(&key, &new_id, &bytes, SPEC_ENCODING)).await?;
     match outcome {
@@ -255,7 +284,10 @@ fn id_ok(id: &str) -> bool {
 }
 
 fn bad_id() -> Reply {
-    refuse(EnvironmentErrorCode::InvalidArgument, "environment_id is required")
+    refuse(
+        EnvironmentErrorCode::InvalidArgument,
+        "environment_id is missing or malformed",
+    )
 }
 
 fn not_found(id: &str) -> Reply {
@@ -285,12 +317,26 @@ async fn list(store: &Arc<EnvironmentStore>, state: i32, task_ref: String) -> Re
         None => blocking(store, EnvironmentStore::list).await?,
         Some(s) => blocking(store, move |st| st.list_by_state(s)).await?,
     };
+    // Without a state filter, deleted rows (kept for replay) stay out of the reply.
+    let hide_deleted = wire == WireState::Unspecified;
     let mut environments = Vec::new();
     for record in records {
+        if hide_deleted && record.state == EnvironmentState::Deleted {
+            continue;
+        }
         let wire = to_wire(record)?;
         if task_ref.is_empty() || wire.spec.as_ref().is_some_and(|s| s.task_ref == task_ref) {
             environments.push(wire);
         }
+    }
+    if environments.len() > MAX_LIST_ROWS {
+        return refuse(
+            EnvironmentErrorCode::InvalidArgument,
+            format!(
+                "{} environments match; narrow the list with a state or task_ref (at most {MAX_LIST_ROWS} per reply)",
+                environments.len()
+            ),
+        );
     }
     Ok(control_response::Result::Environments(ListEnvironmentsResponse {
         environments,
@@ -773,6 +819,221 @@ mod tests {
         let s = store()?;
         for op in [get(""), stop(""), resume(""), cancel(""), delete("")] {
             assert_eq!(refused(&s, op).await?, EnvironmentErrorCode::InvalidArgument);
+        }
+        Ok(())
+    }
+
+    /// Hand-encoded `EnvironmentSpec` bytes: fields in a different order than
+    /// prost writes them, an explicit empty `size`, and an unknown field.
+    fn raw_spec(size: Option<&str>) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend([0x22, 13]); // task_ref (4), written first
+        b.extend(b"owner/repo#12");
+        b.extend([0x78, 0x01]); // unknown field 15
+        b.extend([0x1A, 5, 0x08, 0x01, 0x10, 0xD8, 0x04]); // lifetime: ephemeral, ttl 600
+        b.extend([0x0A, 7]); // profile (1)
+        b.extend(b"harness");
+        if let Some(size) = size {
+            b.push(0x12);
+            b.push(size.len() as u8);
+            b.extend(size.as_bytes());
+        }
+        b
+    }
+
+    #[tokio::test]
+    async fn equal_fields_in_another_wire_order_with_an_unknown_field_are_the_same_request() -> Result<()> {
+        use prost::Message;
+        let s = store()?;
+        let first = create(&s, "k1", ephemeral()).await?;
+        let decoded = EnvironmentSpec::decode(raw_spec(Some("small")).as_slice())?;
+        assert_eq!(
+            decoded,
+            ephemeral(),
+            "the hand-built bytes must decode to the same spec"
+        );
+        let again = create(&s, "k1", decoded).await?;
+        assert_eq!(again.environment_id, first.environment_id);
+        // An explicit empty size and an omitted size are the same request.
+        let explicit = EnvironmentSpec::decode(raw_spec(Some("")).as_slice())?;
+        let omitted = EnvironmentSpec::decode(raw_spec(None).as_slice())?;
+        let a = create(&s, "k2", explicit).await?;
+        let b = create(&s, "k2", omitted).await?;
+        assert_eq!(a.environment_id, b.environment_id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_ttl_boundaries_are_accepted_and_unknown_enum_values_are_refused() -> Result<()> {
+        let s = store()?;
+        create(&s, "k1", spec(EnvironmentLifetimeKind::Ephemeral, 1)).await?;
+        create(&s, "k2", spec(EnvironmentLifetimeKind::Ephemeral, 604_800)).await?;
+        let mut unknown_kind = ephemeral();
+        unknown_kind.lifetime = Some(EnvironmentLifetime {
+            kind: 99,
+            ttl_secs: 600,
+        });
+        let op = control_request::Op::CreateEnvironment(CreateEnvironmentRequest {
+            idempotency_key: "k3".to_owned(),
+            spec: Some(unknown_kind),
+        });
+        assert_eq!(refused(&s, op).await?, EnvironmentErrorCode::InvalidArgument);
+        let op = control_request::Op::ListEnvironments(ListEnvironmentsRequest {
+            state: 99,
+            task_ref: String::new(),
+        });
+        assert_eq!(refused(&s, op).await?, EnvironmentErrorCode::InvalidArgument);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_retry_of_an_accepted_create_survives_tighter_validation() -> Result<()> {
+        // A row an older daemon accepted: its profile now looks like a credential.
+        let s = store()?;
+        let mut old = ephemeral();
+        old.profile = "AIzaSyA1234567890abcdefghijklmnopqrstuv".to_owned();
+        {
+            use prost::Message;
+            s.create("k1", "env-old", &old.encode_to_vec(), SPEC_ENCODING)?;
+        }
+        let again = create(&s, "k1", old.clone()).await?;
+        assert_eq!(
+            again.environment_id, "env-old",
+            "a retry must find its environment, not be re-validated"
+        );
+        // The same key with another spec is still a conflict, and a new key is validated.
+        let op = control_request::Op::CreateEnvironment(CreateEnvironmentRequest {
+            idempotency_key: "k2".to_owned(),
+            spec: Some(old),
+        });
+        assert_eq!(refused(&s, op).await?, EnvironmentErrorCode::InvalidArgument);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn more_credential_formats_are_refused_as_a_profile() -> Result<()> {
+        let s = store()?;
+        for profile in [
+            "AIzaSyA1234567890abcdefghijklmnopqrstuv",
+            "ghr_abcdefghijklmnopqrstuvwxyz0123456789",
+            "ASIAABCDEFGHIJKLMNOP",
+            "xoxp-1234567890-abcdefghij",
+            "xapp-1-A0123456789-abcdefghij",
+            "glptt-abcdefghijklmnopqrstuvwxyz",
+            "npm_abcdefghijklmnopqrstuvwxyz0123456789",
+        ] {
+            let mut bad = ephemeral();
+            bad.profile = profile.to_owned();
+            let op = control_request::Op::CreateEnvironment(CreateEnvironmentRequest {
+                idempotency_key: "k".to_owned(),
+                spec: Some(bad),
+            });
+            assert_eq!(
+                refused(&s, op).await?,
+                EnvironmentErrorCode::InvalidArgument,
+                "{profile}"
+            );
+        }
+        let mut bidi = ephemeral();
+        bidi.task_ref = "ref\u{202E}evil".to_owned();
+        let op = control_request::Op::CreateEnvironment(CreateEnvironmentRequest {
+            idempotency_key: "k".to_owned(),
+            spec: Some(bidi),
+        });
+        assert_eq!(
+            refused(&s, op).await?,
+            EnvironmentErrorCode::InvalidArgument,
+            "bidi override in task_ref"
+        );
+        assert!(s.list()?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_unfiltered_list_leaves_out_deleted_environments_unless_asked() -> Result<()> {
+        let s = store()?;
+        let a = create(&s, "k1", ephemeral()).await?;
+        let b = create(&s, "k2", ephemeral()).await?;
+        s.delete(&b.environment_id)?;
+        let ids = |reply: control_response::Result| -> Result<Vec<String>> {
+            match reply {
+                control_response::Result::Environments(l) => {
+                    Ok(l.environments.into_iter().map(|e| e.environment_id).collect())
+                }
+                other => bail!("expected a list, got {other:?}"),
+            }
+        };
+        let list = |state: WireState| {
+            control_request::Op::ListEnvironments(ListEnvironmentsRequest {
+                state: state.into(),
+                task_ref: String::new(),
+            })
+        };
+        let live = ids(call(&s, list(WireState::Unspecified))
+            .await?
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?)?;
+        assert_eq!(live, [a.environment_id]);
+        let deleted = ids(call(&s, list(WireState::Deleted))
+            .await?
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?)?;
+        assert_eq!(deleted, [b.environment_id]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_list_that_would_overflow_the_frame_is_refused_with_a_typed_error() -> Result<()> {
+        let s = store()?;
+        for n in 0..=MAX_LIST_ROWS {
+            s.create(&format!("k{n}"), &format!("env-{n}"), &ephemeral_bytes(), SPEC_ENCODING)?;
+        }
+        let op = control_request::Op::ListEnvironments(ListEnvironmentsRequest {
+            state: WireState::Unspecified.into(),
+            task_ref: String::new(),
+        });
+        assert_eq!(refused(&s, op).await?, EnvironmentErrorCode::InvalidArgument);
+        // A filter that narrows below the limit still works.
+        let op = control_request::Op::ListEnvironments(ListEnvironmentsRequest {
+            state: WireState::Unspecified.into(),
+            task_ref: "nothing-matches".to_owned(),
+        });
+        assert!(
+            matches!(call(&s, op).await?, Ok(control_response::Result::Environments(l)) if l.environments.is_empty())
+        );
+        Ok(())
+    }
+
+    fn ephemeral_bytes() -> Vec<u8> {
+        use prost::Message;
+        ephemeral().encode_to_vec()
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_deleted_environment_is_an_idempotent_success_and_a_failed_one_is_refused() -> Result<()> {
+        let s = store()?;
+        let a = create(&s, "k1", ephemeral()).await?;
+        assert_eq!(state_after(&s, cancel(&a.environment_id)).await?, WireState::Deleted);
+        assert_eq!(
+            state_after(&s, cancel(&a.environment_id)).await?,
+            WireState::Deleted,
+            "a retried cancel"
+        );
+        let b = create(&s, "k2", ephemeral()).await?;
+        s.mark_failed(&b.environment_id, "boot", "no")?;
+        assert_eq!(
+            refused(&s, cancel(&b.environment_id)).await?,
+            EnvironmentErrorCode::InvalidState
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_malformed_environment_id_says_malformed_not_missing() -> Result<()> {
+        let s = store()?;
+        match call(&s, get("has space")).await? {
+            Err((EnvironmentErrorCode::InvalidArgument, message)) => {
+                assert!(message.contains("malformed"), "{message}")
+            }
+            other => bail!("expected a refusal, got {other:?}"),
         }
         Ok(())
     }

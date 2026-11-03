@@ -2111,6 +2111,14 @@ terminal envelope, so it would need a second record kind and a different reconci
 - The daemon opens the environment store in the same `0600` file as the job store. `SANDY_MAX_ENVIRONMENTS` caps
   its rows.
 
+**Retries and limits.** A retried create is answered from the stored row before any validation, so a rule tightened
+by a later daemon cannot turn an accepted create's replay into a refusal; the same key with another spec is still a
+conflict. An unfiltered `ListEnvironments` leaves out `Deleted` rows (ask for state `DELETED` to see them) and refuses
+a reply of more than 1000 environments with `INVALID_ARGUMENT`, so a reply cannot outgrow the 1 MiB control frame.
+`cancel` of a deleted environment is an idempotent success, a retried cancel; of a failed, ready or stopped one it is
+`INVALID_STATE`. The row cap counts deleted rows, so with `SANDY_MAX_ENVIRONMENTS` set, create and delete churn
+fills it until rows are purged (retention is #614).
+
 **Consequence.** Until the launch driver (slice C) reports back, a created environment stays `Provisioning`, `steps`
 is empty and `connection` is never set; the handler tests move a row to `Ready` through the store directly. Quota per
 client is the API tier's rule (#585 AT-14); the row cap is the daemon's own bound.

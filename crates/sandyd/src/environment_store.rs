@@ -365,6 +365,22 @@ impl EnvironmentStore {
         Ok(CreateOutcome::Created(raw.into_record()?))
     }
 
+    /// The environment `request_id` created, if any. Writes nothing.
+    ///
+    /// # Errors
+    /// As [`EnvironmentStore::create`].
+    pub fn get_by_request_id(&self, request_id: &str) -> Result<Option<EnvironmentRecord>, EnvironmentStoreError> {
+        let conn = self.lock();
+        conn.query_row(
+            &format!("SELECT {COLUMNS} FROM environments WHERE request_id = ?1"),
+            [request_id],
+            RawRow::read,
+        )
+        .optional()?
+        .map(RawRow::into_record)
+        .transpose()
+    }
+
     /// The environment with this id, if any.
     ///
     /// # Errors
@@ -724,6 +740,17 @@ mod tests {
             assert_eq!(s.delete(&id)?, EnvTransition::Applied, "from {want:?}");
             assert_eq!(state_of(&s, &id)?, EnvironmentState::Deleted);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_request_id_finds_its_environment_without_creating_one() -> Result<()> {
+        let s = store()?;
+        assert_eq!(s.get_by_request_id("r1")?, None);
+        let rec = created(&s)?;
+        assert_eq!(s.get_by_request_id("r1")?, Some(rec));
+        assert_eq!(s.get_by_request_id("r2")?, None);
+        assert_eq!(s.list()?.len(), 1, "a lookup must write nothing");
         Ok(())
     }
 
