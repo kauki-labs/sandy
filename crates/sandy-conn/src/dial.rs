@@ -100,6 +100,7 @@ mod tests {
             max_connections: 8,
             dial_window: Duration::from_millis(window_ms),
             dial_retry_interval: Duration::from_millis(20),
+            first_byte_timeout: Duration::from_secs(5),
         }
     }
 
@@ -174,6 +175,7 @@ mod tests {
 
         let bridge = Bridge::start(UnixDialer::new(&path), config(0)).await?;
         let mut first = TcpStream::connect(bridge.addr()).await?;
+        first.write_all(b"x").await?;
         let mut byte = [0u8; 1];
         let closed = timeout(WAIT, first.read(&mut byte)).await.context("read timed out")?;
         assert!(

@@ -57,6 +57,9 @@ pub struct BridgeConfig {
     pub dial_window: Duration,
     /// The pause between dial attempts inside the window.
     pub dial_retry_interval: Duration,
+    /// How long a client may stay silent before the bridge closes it without dialing. The bridge dials the guest
+    /// relay only after the client's first byte, so a connection that sends nothing costs no relay slot and no dial.
+    pub first_byte_timeout: Duration,
 }
 
 impl Default for BridgeConfig {
@@ -65,6 +68,7 @@ impl Default for BridgeConfig {
             max_connections: 256,
             dial_window: Duration::from_secs(10),
             dial_retry_interval: Duration::from_millis(200),
+            first_byte_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -298,7 +302,9 @@ mod tests {
         client.set_nonblocking(true)?;
         let mut buf = [0u8; 1];
         for _ in 0..10 {
-            if matches!(std::io::Read::read(&mut &client, &mut buf), Ok(0)) {
+            if matches!(std::io::Read::read(&mut &client, &mut buf), Ok(0))
+                || matches!(std::io::Read::read(&mut &client, &mut buf), Err(e) if e.kind() == io::ErrorKind::ConnectionReset)
+            {
                 return Ok(true);
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -347,6 +353,7 @@ mod tests {
             max_connections,
             dial_window: Duration::from_millis(window_ms),
             dial_retry_interval: Duration::from_millis(20),
+            first_byte_timeout: Duration::from_secs(5),
         }
     }
 
@@ -360,6 +367,8 @@ mod tests {
 
     /// True when the peer closes without sending a byte.
     async fn closed_unanswered(client: &mut TcpStream) -> anyhow::Result<bool> {
+        // The bridge dials only after the client's first byte.
+        let _ = client.write_all(b"x").await;
         let mut buf = [0u8; 1];
         let read = timeout(WAIT, client.read(&mut buf)).await.context("read timed out")?;
         Ok(matches!(read, Ok(0) | Err(_)))
@@ -572,7 +581,8 @@ mod tests {
         let (guest, _) = flaky_guest(u32::MAX).await?;
         let (dialer, _) = TcpDialer::new(guest);
         let bridge = Bridge::start(dialer, config(8, 5_000)).await?;
-        let waiting = TcpStream::connect(bridge.addr()).await?;
+        let mut waiting = TcpStream::connect(bridge.addr()).await?;
+        waiting.write_all(b"x").await?;
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         bridge.shutdown().await;
@@ -596,6 +606,84 @@ mod tests {
                 "max_connections {max} must be refused, got {started:?}"
             );
         }
+        Ok(())
+    }
+
+    /// A client that sends nothing costs no dial and no relay slot: the bridge dials only after the first byte, and
+    /// closes a silent client when `first_byte_timeout` passes. A client that does send is served as usual.
+    #[tokio::test]
+    async fn a_client_that_sends_nothing_causes_no_dial_and_is_closed_after_the_first_byte_timeout()
+    -> anyhow::Result<()> {
+        let (guest, accepted) = flaky_guest(0).await?;
+        let (dialer, attempts) = TcpDialer::new(guest);
+        let config = BridgeConfig {
+            first_byte_timeout: Duration::from_millis(150),
+            ..config(8, 0)
+        };
+        let bridge = Bridge::start(dialer, config).await?;
+
+        let mut silent = TcpStream::connect(bridge.addr()).await?;
+        let mut byte = [0u8; 1];
+        let closed = timeout(WAIT, silent.read(&mut byte))
+            .await
+            .context("a silent client was never closed")?;
+        assert!(
+            matches!(closed, Ok(0) | Err(_)),
+            "a silent client must be closed, got {closed:?}"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            0,
+            "no dial for a client that sent nothing"
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 0, "the guest relay saw no connection");
+
+        let mut talker = TcpStream::connect(bridge.addr()).await?;
+        assert!(echoes(&mut talker, b"hi").await, "a client that sends is served");
+        Ok(())
+    }
+
+    /// A retry interval of zero with a non-zero window would spin against an instantly failing dialer, so it is an
+    /// error at `start`. A zero window never retries, so a zero interval is harmless there.
+    #[tokio::test]
+    async fn a_zero_retry_interval_with_a_window_is_refused_at_start() -> anyhow::Result<()> {
+        let (guest, _) = flaky_guest(0).await?;
+        let spinning = BridgeConfig {
+            dial_window: Duration::from_secs(1),
+            dial_retry_interval: Duration::ZERO,
+            ..config(8, 0)
+        };
+        let (dialer, _) = TcpDialer::new(guest);
+        let refused = Bridge::start(dialer, spinning).await;
+        assert!(
+            matches!(&refused, Err(e) if e.kind() == io::ErrorKind::InvalidInput),
+            "a zero interval with a window must be refused, got {refused:?}"
+        );
+        let one_shot = BridgeConfig {
+            dial_window: Duration::ZERO,
+            dial_retry_interval: Duration::ZERO,
+            ..config(8, 0)
+        };
+        let (dialer, _) = TcpDialer::new(guest);
+        assert!(
+            Bridge::start(dialer, one_shot).await.is_ok(),
+            "a zero window and interval is one attempt"
+        );
+        Ok(())
+    }
+
+    /// The largest permit count the semaphore allows is accepted and one more is refused.
+    #[tokio::test]
+    async fn the_largest_permit_count_is_accepted_and_one_more_is_refused() -> anyhow::Result<()> {
+        let (guest, _) = flaky_guest(0).await?;
+        let (dialer, _) = TcpDialer::new(guest);
+        assert!(Bridge::start(dialer, config(Semaphore::MAX_PERMITS, 0)).await.is_ok());
+        let (dialer, _) = TcpDialer::new(guest);
+        let refused = Bridge::start(dialer, config(Semaphore::MAX_PERMITS + 1, 0)).await;
+        assert!(
+            matches!(&refused, Err(e) if e.kind() == io::ErrorKind::InvalidInput),
+            "MAX_PERMITS + 1 must be refused, got {refused:?}"
+        );
         Ok(())
     }
 }
