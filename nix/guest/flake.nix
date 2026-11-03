@@ -243,6 +243,13 @@
         # t3, node and two harnesses.
         assert
           config.microvm.mem >= 2048 || throw "the t3 guest boots with ${toString config.microvm.mem} MiB";
+        # The agent runs as root and starts a service manifest's `service.user` through `runuser -u <user>` (#589),
+        # so the guest must define that account: a non-root user with a home directory that it owns.
+        assert
+          (
+            config.users.users ? t3 && config.users.users.t3.home != "" && (config.users.users.t3.uid or 1) != 0
+          )
+          || throw "the t3 guest defines no non-root t3 service user with a home directory";
         pkgs.runCommand "t3-guest-packages" { } "touch $out";
 
       # The readiness probe's behaviour against a throwaway local HTTP server (#608): any status below 500 means the
