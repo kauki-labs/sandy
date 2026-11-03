@@ -142,6 +142,23 @@
       packages.x86_64-linux.sandy-agent = qemuGuest.pkgs.sandy-agent;
       packages.aarch64-linux.sandy-agent = vfkitGuest.pkgs.sandy-agent;
 
+      # Eval-only acceptance for the T3 guest image (#608): the image carries the t3 server at the version the
+      # owner exercised, and a readiness probe. Nothing here builds the 3.7 GB closure.
+      checks.x86_64-linux.t3-guest-packages =
+        let
+          pkgs = nixpkgs.legacyPackages.x86_64-linux;
+          names = map (
+            p: p.name
+          ) self.nixosConfigurations.sandy-guest-qemu-t3.config.environment.systemPackages;
+          wanted = [
+            "t3code-0.1.2"
+            "sandy-t3-ready"
+          ];
+          missing = builtins.filter (w: !(builtins.elem w names)) wanted;
+        in
+        assert missing == [ ] || throw "the t3 guest image lacks: ${builtins.toString missing}";
+        pkgs.runCommand "t3-guest-packages" { } "touch $out";
+
       # sandy's `Topology` per guest: `nix eval --json <flake>#topologies.<sys>.<hv>`.
       topologies = {
         x86_64-linux.qemu = mkTopology qemuGuest;
