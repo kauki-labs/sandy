@@ -14,6 +14,7 @@
 //! | `SANDY_ENV_STATE_DIR` | where environment directories live; default `<runtime dir>/environments` |
 //! | `SANDY_ENV_PASS_ENV` | comma-separated names of daemon variables passed to the service |
 //! | `SANDY_ENV_PATH` | the service's `PATH`; default the daemon's |
+//! | `SANDY_ENV_IDLE_TIMEOUT_SECS` | stop a Ready environment with no owner-visible use for this long; default off |
 //! | `SANDY_ENV_PROVISION_TIMEOUT_SECS` | seconds before a probe that is not Ready fails the environment; default 120 |
 
 use std::{path::PathBuf, time::Duration};
@@ -125,6 +126,18 @@ pub fn from_env(
             }
         },
     };
+    let idle_timeout = match get("SANDY_ENV_IDLE_TIMEOUT_SECS").filter(|v| !v.trim().is_empty()) {
+        None => None,
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(secs) if secs > 0 => Some(Duration::from_secs(secs)),
+            _ => {
+                return Err(E::InvalidNumber {
+                    name: "SANDY_ENV_IDLE_TIMEOUT_SECS",
+                    raw,
+                });
+            }
+        },
+    };
     let state_dir = match get("SANDY_ENV_STATE_DIR").filter(|v| !v.trim().is_empty()) {
         Some(dir) => PathBuf::from(dir),
         None => default_state_dir().map_err(E::StateDir)?,
@@ -146,6 +159,7 @@ pub fn from_env(
             template: "process".to_owned(),
             service_port: None,
             provision_timeout,
+            idle_timeout,
         },
     }))
 }
@@ -239,6 +253,7 @@ mod tests {
             ("SANDY_ENV_PASS_ENV", "ANTHROPIC_API_KEY, OPENAI_API_KEY ,"),
             ("SANDY_ENV_PATH", "/opt/t3/bin:/usr/bin"),
             ("SANDY_ENV_PROVISION_TIMEOUT_SECS", "300"),
+            ("SANDY_ENV_IDLE_TIMEOUT_SECS", "900"),
         ]);
         // The last entry for a key wins in the map.
         let cfg = parse(&pairs)?.ok_or_else(|| anyhow::anyhow!("expected a backend"))?;
@@ -254,6 +269,7 @@ mod tests {
         assert_eq!(cfg.process.pass_env, ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]);
         assert_eq!(cfg.process.path, "/opt/t3/bin:/usr/bin");
         assert_eq!(cfg.driver.provision_timeout, Duration::from_secs(300));
+        assert_eq!(cfg.driver.idle_timeout, Some(Duration::from_secs(900)));
         Ok(())
     }
 
@@ -264,6 +280,7 @@ mod tests {
         assert_eq!(cfg.process.pair_command, None);
         assert!(cfg.process.pass_env.is_empty());
         assert_eq!(cfg.driver.provision_timeout, Duration::from_secs(120));
+        assert_eq!(cfg.driver.idle_timeout, None, "idle stop is off by default");
         assert_eq!(cfg.driver.service_port, None);
         let with_path = parse(&[base(), vec![("PATH", "/usr/local/bin:/usr/bin")]].concat())?
             .ok_or_else(|| anyhow::anyhow!("expected a backend"))?;
@@ -291,6 +308,25 @@ mod tests {
             out.err(),
             Some(EnvironmentBackendConfigError::StateDir("no runtime dir".to_owned()))
         );
+    }
+
+    #[test]
+    fn a_zero_or_non_numeric_idle_timeout_is_refused() {
+        for raw in ["0", "-5", "abc", "1.5"] {
+            let mut pairs = base();
+            pairs.push(("SANDY_ENV_IDLE_TIMEOUT_SECS", raw));
+            let out = parse(&pairs);
+            assert!(
+                matches!(
+                    out,
+                    Err(EnvironmentBackendConfigError::InvalidNumber {
+                        name: "SANDY_ENV_IDLE_TIMEOUT_SECS",
+                        ..
+                    })
+                ),
+                "{raw:?}: {out:?}"
+            );
+        }
     }
 
     #[test]
