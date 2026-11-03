@@ -383,6 +383,52 @@ impl Render for AttachedChannel {
     }
 }
 
+/// One line of `daemon attach -o json`'s NDJSON stream (#513, owner decision on #564): `attached` first, carrying
+/// the join cap, then one `output` per delivered chunk, then `exit` last. The attach stays interactive, so stdin
+/// forwarding and raw mode are the same as `plain`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AttachEvent {
+    /// The channel and cap, before any job output.
+    Attached(AttachedChannel),
+    /// One chunk of the job's console output, base64 (standard alphabet): a chunk may split a UTF-8 sequence, and
+    /// the job's stdout and stderr arrive merged on one stream.
+    Output {
+        /// The chunk's bytes, base64.
+        data: String,
+    },
+    /// The stream's last line. `reason` is `detached`, `closed`, `job_terminal:<STATUS>` or `fault:<message>`.
+    Exit {
+        /// Why the bridge ended.
+        reason: String,
+    },
+}
+
+/// `plain` is only a fallback for the stream writer: the interactive attach writes raw bytes itself.
+impl Render for AttachEvent {
+    fn render_plain(&self, out: &mut dyn io::Write) -> io::Result<()> {
+        match self {
+            Self::Attached(channel) => channel.render_plain(out),
+            Self::Output { data } => out.write_all(
+                &base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .map_err(io::Error::other)?,
+            ),
+            Self::Exit { reason } => write!(out, "exit: {reason}"),
+        }
+    }
+}
+
+impl AttachEvent {
+    /// An `output` event for one delivered chunk.
+    #[must_use]
+    pub fn output(bytes: &[u8]) -> Self {
+        Self::Output {
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        }
+    }
+}
+
 /// `daemon status`'s result: the job id, its lifecycle state, and (once terminal) the exit code and console
 /// tail.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1158,6 +1204,58 @@ mod tests {
             base64::engine::general_purpose::STANDARD.decode(cap_field)?,
             cap,
             "the cap must round-trip through base64"
+        );
+        Ok(())
+    }
+
+    /// The three lines of an attach stream, in order (#513).
+    fn attach_stream() -> Vec<super::AttachEvent> {
+        vec![
+            super::AttachEvent::Attached(AttachedChannel {
+                channel_id: "orchestrator".to_owned(),
+                cap: base64::engine::general_purpose::STANDARD.encode(b"not-a-real-cap"),
+            }),
+            super::AttachEvent::output(b"hi\n"),
+            super::AttachEvent::Exit {
+                reason: "detached".to_owned(),
+            },
+        ]
+    }
+
+    /// #513: every attach event survives a serde round trip, and the wire form is the tagged NDJSON the owner
+    /// decision on #564 names: `attached` (with the cap) first, `output` (base64) per chunk, `exit` last.
+    #[test]
+    fn attach_stream_json_is_one_tagged_compact_object_per_line() -> anyhow::Result<()> {
+        let mut buf = Vec::new();
+        super::emit_stream_to(attach_stream(), OutputFormat::Json, &mut buf).context("emit the stream")?;
+        let text = String::from_utf8(buf).context("NDJSON is UTF-8")?;
+        insta::assert_snapshot!(text, @r#"
+        {"type":"attached","channel_id":"orchestrator","cap":"bm90LWEtcmVhbC1jYXA="}
+        {"type":"output","data":"aGkK"}
+        {"type":"exit","reason":"detached"}
+        "#);
+        for (line, event) in text.lines().zip(attach_stream()) {
+            assert_eq!(serde_json::from_str::<super::AttachEvent>(line)?, event, "{line}");
+        }
+        Ok(())
+    }
+
+    /// #513: the plain rendering of the same events: the `attached` line redacts the cap, `output` is the raw
+    /// bytes, `exit` names the reason.
+    #[test]
+    fn attach_stream_plain_redacts_the_cap_and_decodes_output() -> anyhow::Result<()> {
+        let mut buf = Vec::new();
+        super::emit_stream_to(attach_stream(), OutputFormat::Plain, &mut buf).context("emit the stream")?;
+        let text = String::from_utf8(buf).context("plain is UTF-8 here")?;
+        insta::assert_snapshot!(text, @"
+        channel orchestrator (cap: 14 bytes, redacted — use -o json to retrieve)
+        hi
+
+        exit: detached
+        ");
+        assert!(
+            !text.contains("bm90LWEtcmVhbC1jYXA="),
+            "the plain stream must not print the cap"
         );
         Ok(())
     }

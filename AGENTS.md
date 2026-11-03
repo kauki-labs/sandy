@@ -55,6 +55,9 @@ version, metadata, dependency versions, and lints through the root `Cargo.toml`
 - **`sandy-conn`** — the one stream transport sandyd's control RPC (and later,
   cross-machine channel delivery) rides: UDS locally, vsock into a VM guest,
   TCP/QUIC-over-mesh across machines (#205 B6).
+  Also the host half of the guest service bridge (#590): `bridge` (a loopback listener that splices clients to a
+  `Dialer` stream) and `dial` (`UnixDialer` for vfkit, `VsockDialer` for qemu); see `docs/decisions/agent-fabric.md`
+  10a and 10b.
 - **`sandy-control-proto`** — sandyd's control-plane RPC surface
   (Submit/Cancel/Attach/Status/List) as a protobuf contract + length-prefixed
   framing codec, separate from the fabric's data/event channels.

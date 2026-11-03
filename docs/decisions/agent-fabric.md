@@ -458,9 +458,44 @@ connection (a websocket) works.
   data moves (the agent link's `AGENT_LINK_READY` works the same way). The host bridge counts a dial as successful
   only when it has read that byte, and retries inside its window otherwise. A relay that is not bound yet, or a
   service that is not up, therefore looks like a failed dial, never like a tunnel that opened and reset.
-- **Not yet wired.** The service kind (#589) is expected to start the relay, and nothing does yet. The host half (a
-  loopback listener that dials `CID:P` on qemu, or a `virtio-vsock,port=P,...,connect` device declared at launch
-  on vfkit) is a later slice of #590.
+- **Not yet wired.** The service kind (#589) is expected to start the relay, and nothing does yet (the agent's service
+  supervisor should spawn it as a sibling before any untrusted process, and keep the service from killing or replacing
+  it). The host half is 10b.
+
+### 10b. The host service bridge (#590)
+
+`sandy_conn::bridge::Bridge` is the host half of 10a: it binds `127.0.0.1` on an ephemeral port, reports it with
+`addr()` (the endpoint `Probe::Ready` carries), and splices each client to a stream from a `Dialer`. `UnixDialer`
+reaches the unix socket vfkit exposes for a guest vsock port, and `VsockDialer` (Linux) dials `<guest CID>:1000` over
+vhost-vsock on qemu. The environment backend owns one bridge per environment, so `shutdown()` is how a stopped
+environment refuses connections.
+
+- **Limits.** At most `max_connections` clients at once (64 by default: each client holds two descriptors, and macOS's default soft limit is 256); a client over the cap
+  is closed unanswered.
+  A client waiting in its dial window holds a slot. The bridge dials the guest only after the client's first byte
+  (peeked, so it is still forwarded), and closes a client that sends nothing within `first_byte_timeout` (30 s), so a
+  silent connection costs no relay slot. A dial is retried every `dial_retry_interval` (200 ms) for `dial_window`
+  (10 s), and one attempt, including the wait for the ready byte, is bounded at 5 s, so a client can wait up to the
+  window plus 5 s. A relayed connection that moves no byte in either direction for `idle_timeout` (15 minutes) is
+  closed, so a guest that sends the ready byte and goes silent cannot hold a slot for good; a quiet direction alone
+  is not idle. `start` refuses a cap of 0 or above `Semaphore::MAX_PERMITS`, a zero idle timeout, and a zero retry
+  interval with a non-zero window.
+- **Readiness.** A dial counts only after the guest relay's ready byte (10a). The byte is not forwarded.
+- **Shutdown.** `shutdown()` stops the listener and ends every connection task, including a client still in its dial
+  window, before it returns. Drop sends the same stop and returns at once.
+- **Exposure: an open decision for the owner.** The bridge adds no authentication and no TLS, and a loopback TCP port
+  is reachable by every local user. On qemu that changes nothing (any host process already reaches the guest CID). On
+  **vfkit it widens access**: the unix socket vfkit exposes is gated by file permissions, while a loopback port is
+  open to every user on the machine, who could then reach `t3 serve` without the pairing token that normally guards
+  it (t3's own auth still applies to anything beyond its pre-auth endpoints). The options are a `0600` unix socket for
+  the bridge (the primary or `tailscale serve` would have to accept a unix target), a per-run token that the client or
+  a front proxy presents, or accepting the loopback port as deliberate exposure. Until the owner decides, the bridge
+  is a development aid for a single-user host, and the tailnet exposure is the host's job (`tailscale serve`).
+- **Availability.** A local user can still hold the cap open with connections that keep trickling bytes, and on qemu
+  any host process can hold the relay's own 256 slots. The idle timeout frees silent slots only; authentication is
+  what closes this (10a), and the cap bounds descriptors.
+- **Not covered here.** The `EnvironmentBackend` that starts and stops a bridge per environment (#587 slice C), the
+  vfkit `connect` device in `vfkit_args`, and the live round trip through a real guest.
 
 ## 11. Channel roles are thin wrappers; `EscalationSink` is a new seam
 

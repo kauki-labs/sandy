@@ -4,7 +4,7 @@
 //! verification held `sandyd` itself to.
 
 use std::{
-    io::Write as _,
+    io::{BufRead as _, Write as _},
     os::unix::fs::PermissionsExt as _,
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
@@ -291,6 +291,28 @@ fn attach_surfaces_the_daemons_honest_refusal_not_a_fabricated_channel() -> anyh
     Ok(())
 }
 
+/// #513: under `-o json` a refusal before any channel exists starts no stream: nothing on stdout (no `attached`
+/// line with a fabricated cap, no `exit` line), the refusal on stderr, the same exit band as plain.
+#[test]
+fn attach_json_prints_no_stream_when_the_daemon_refuses() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir().context("temp dir")?;
+    let daemon = spawn_daemon(tmp.path())?;
+
+    let attach = sandy(&daemon, &["daemon", "attach", "some-job", "-o", "json"])?;
+    assert_eq!(attach.status.code(), Some(2), "stderr: {}", stderr_of(&attach));
+    assert!(
+        stderr_of(&attach).contains("no such job"),
+        "stderr must carry the daemon's real refusal: {}",
+        stderr_of(&attach)
+    );
+    assert!(
+        String::from_utf8_lossy(&attach.stdout).is_empty(),
+        "no stream may start on a refusal: {}",
+        String::from_utf8_lossy(&attach.stdout)
+    );
+    Ok(())
+}
+
 /// #540: a cancel the CLI has no attach token for (here, an id this machine never submitted) is
 /// refused by the real daemon with the one refusal message, exit 2, nothing on stdout.
 #[test]
@@ -494,9 +516,23 @@ fn submit_with_a_cap_file_from_a_real_attach_grants_the_requested_subset() -> an
         .context("seed submit json must carry a job_id")?
         .to_owned();
 
-    let attach = sandy(&daemon, &["daemon", "attach", &seed_job_id, "-o", "json"])?;
-    assert_eq!(attach.status.code(), Some(0), "attach stderr: {}", stderr_of(&attach));
-    let attach_json: serde_json::Value = serde_json::from_slice(&attach.stdout).context("parse attach json")?;
+    // `-o json` is an NDJSON stream (#513, owner decision on #564): the first line is `attached` and carries the
+    // cap, written before the data-plane join. The seed job never ends, so read that line and stop the stream.
+    let mut attach = Command::new(env!("CARGO_BIN_EXE_sandy"))
+        .env("SANDY_SOCK", &daemon.sock)
+        .args(["daemon", "attach", &seed_job_id, "-o", "json"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .context("spawning sandy daemon attach")?;
+    let mut first_line = String::new();
+    let read =
+        std::io::BufReader::new(attach.stdout.take().context("attach stdout is piped")?).read_line(&mut first_line);
+    attach.kill().context("stopping the attach stream")?;
+    attach.wait().context("reaping the attach stream")?;
+    read.context("reading the first attach line")?;
+    let attach_json: serde_json::Value =
+        serde_json::from_str(&first_line).with_context(|| format!("first line {first_line:?}"))?;
+    assert_eq!(attach_json["type"], "attached", "{first_line:?}");
     let cap_b64 = attach_json["cap"].as_str().context("attach json must carry a cap")?;
     let cap_file = tmp.path().join("cap.txt");
     write_cap_file(&cap_file, cap_b64)?;
