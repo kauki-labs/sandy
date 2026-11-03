@@ -38,6 +38,12 @@ pub const AGENT_VSOCK_PORT: u32 = 5_000;
 /// cap first, only after this byte arrives.
 pub const AGENT_LINK_READY: u8 = b'S';
 
+/// The byte `sandy-agent port-relay` writes to the host once it has connected to the guest service (#590).
+/// A hypervisor's vsock proxy (vfkit) accepts the host's socket before it dials the guest, and the relay accepts
+/// the host's vsock connection before it dials the service, so a connected socket proves neither. The host bridge
+/// counts a dial as successful only after this byte arrives, and retries otherwise.
+pub const PORT_RELAY_READY: u8 = b'P';
+
 /// How a backend launches the sandbox agent.
 ///
 /// An agent-mode backend runs ONE job: its `on_link` serves one cap on one

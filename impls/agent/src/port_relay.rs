@@ -20,6 +20,7 @@ use std::{
     time::Duration,
 };
 
+use sandy_api::agent::PORT_RELAY_READY;
 use tokio::{
     io::{AsyncRead, AsyncWrite, copy_bidirectional},
     net::TcpStream,
@@ -237,6 +238,16 @@ mod tests {
         Ok((addr, accepted))
     }
 
+    /// A connection the relay accepted and connected to the service: it announces itself with the ready byte, then
+    /// echoes. A host dial that merely connected (vfkit's proxy does this before the guest listens) never sees it.
+    async fn served(host: &mut DuplexStream, word: &[u8]) -> anyhow::Result<bool> {
+        let mut ready = [0u8; 1];
+        match timeout(WAIT, host.read_exact(&mut ready)).await {
+            Ok(Ok(_)) if ready[0] == PORT_RELAY_READY => echoes(host, word).await,
+            _ => Ok(false),
+        }
+    }
+
     async fn echoes(host: &mut DuplexStream, word: &[u8]) -> anyhow::Result<bool> {
         host.write_all(word).await?;
         let mut got = vec![0u8; word.len()];
@@ -255,7 +266,7 @@ mod tests {
         let relay = tokio::spawn(serve(Script(Arc::clone(&queue)), target));
 
         assert!(
-            echoes(&mut host, b"ping").await?,
+            served(&mut host, b"ping").await?,
             "the echo must come back through the relay"
         );
         relay.abort();
@@ -287,7 +298,7 @@ mod tests {
         }
         let mut host = connection(&queue, HOST_CID)?;
         assert!(
-            echoes(&mut host, b"after").await?,
+            served(&mut host, b"after").await?,
             "the host is still served after refusals"
         );
         assert_eq!(
@@ -308,9 +319,9 @@ mod tests {
         let mut second = connection(&queue, HOST_CID)?;
         let relay = tokio::spawn(serve(Script(Arc::clone(&queue)), target));
 
-        assert!(echoes(&mut first, b"one").await?, "first connection");
+        assert!(served(&mut first, b"one").await?, "first connection");
         assert!(
-            echoes(&mut second, b"two").await?,
+            served(&mut second, b"two").await?,
             "second connection while the first is open"
         );
         assert!(echoes(&mut first, b"again").await?, "first connection still open");
@@ -353,7 +364,7 @@ mod tests {
         });
         let mut second = connection(&queue, HOST_CID)?;
         assert!(
-            echoes(&mut second, b"up").await?,
+            served(&mut second, b"up").await?,
             "the relay must serve after one failed dial"
         );
         relay.abort();
@@ -368,7 +379,7 @@ mod tests {
         let queue = Arc::new(Mutex::new(VecDeque::new()));
         let mut first = connection(&queue, HOST_CID)?;
         let relay = tokio::spawn(serve_with_cap(Script(Arc::clone(&queue)), target, 1));
-        assert!(echoes(&mut first, b"one").await?, "the first connection is served");
+        assert!(served(&mut first, b"one").await?, "the first connection is served");
 
         let mut second = connection(&queue, HOST_CID)?;
         let mut buf = [0u8; 1];
@@ -384,7 +395,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let mut third = connection(&queue, HOST_CID)?;
         assert!(
-            echoes(&mut third, b"three").await?,
+            served(&mut third, b"three").await?,
             "a slot freed by a closed connection is reusable"
         );
         relay.abort();
