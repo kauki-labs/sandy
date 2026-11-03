@@ -32,10 +32,7 @@ impl Dialer for UnixDialer {
     type Stream = UnixStream;
 
     async fn dial(&self) -> io::Result<UnixStream> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            format!("not implemented: {}", self.path.display()),
-        ))
+        UnixStream::connect(&self.path).await
     }
 }
 
