@@ -5,12 +5,17 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     microvm.url = "github:microvm-nix/microvm.nix";
     microvm.inputs.nixpkgs.follows = "nixpkgs";
+    # The t3 server and its harnesses (#608) come from their own pin so the base guest (kernel, agent) does not
+    # move with it. This is the root flake's nixpkgs revision, where t3code is 0.1.2, the version the owner
+    # exercised. Older pins carry 0.0.44, which lacks `t3 pair --scope`.
+    nixpkgs-t3.url = "github:NixOS/nixpkgs/31ecbaca1bdefa45dffc409f0250bd8039ea0010";
   };
 
   outputs =
     {
       self,
       nixpkgs,
+      nixpkgs-t3,
       microvm,
     }:
     let
@@ -53,6 +58,37 @@
           environment.systemPackages = [
             pkgs.nftables
             pkgs.glibc.bin
+          ];
+        };
+
+      # The T3 server and the harness binaries it launches (#608). `t3 serve` is started by the service workload
+      # kind (#589), never by the image; provider config dirs (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`) come from the
+      # identity profile (#592), so the image holds no key, token or config. t3's wrapper puts `claude` and `codex`
+      # on its own PATH. `sandy-t3-ready` is the probe: it succeeds only once the server answers HTTP 200 on its
+      # loopback port (it replies 503 while starting), so readiness never rests on console text.
+      #
+      # The closure is about 3.7 GB because nixpkgs builds t3code with electron (1.4 GB) and the codex binary is
+      # 1 GB. The image is built once and shared read-only. A server-only build is a follow-up.
+      t3Module =
+        { pkgs, ... }:
+        let
+          t3pkgs = import nixpkgs-t3 {
+            inherit (pkgs.stdenv.hostPlatform) system;
+            config.allowUnfreePredicate = pkg: builtins.elem (nixpkgs-t3.lib.getName pkg) [ "claude-code" ];
+          };
+          t3 = t3pkgs.t3code.override {
+            enableClaude = true;
+            enableCodex = true;
+          };
+          ready = pkgs.writeShellScriptBin "sandy-t3-ready" ''
+            exec ${pkgs.curl}/bin/curl --fail --silent --show-error --max-time 2 --output /dev/null \
+              "http://127.0.0.1:''${1:-3773}/"
+          '';
+        in
+        {
+          environment.systemPackages = [
+            t3
+            ready
           ];
         };
 
@@ -111,6 +147,28 @@
         ];
       };
 
+      # The same guests with the T3 server and harnesses (#608).
+      qemuT3Guest = mkGuest {
+        system = "x86_64-linux";
+        hypervisor = "qemu";
+        extraModules = [
+          networkingModule
+          credentialModule
+          t3Module
+        ];
+      };
+
+      vfkitT3Guest = mkGuest {
+        system = "aarch64-linux";
+        hypervisor = "vfkit";
+        vmHostPackages = nixpkgs.legacyPackages.aarch64-darwin;
+        extraModules = [
+          networkingModule
+          credentialModule
+          t3Module
+        ];
+      };
+
       # vfkit guest for an Apple-silicon host (aarch64-darwin host, aarch64-linux guest — vfkit
       # requires matching arch), console hvc0. The kernel/initrd/erofs build on
       # the aarch64-linux linux-builder; the runner assembles on darwin.
@@ -135,6 +193,8 @@
       # these).
       nixosConfigurations.sandy-guest-qemu = qemuGuest;
       nixosConfigurations.sandy-guest-vfkit = vfkitGuest;
+      nixosConfigurations.sandy-guest-qemu-t3 = qemuT3Guest;
+      nixosConfigurations.sandy-guest-vfkit-t3 = vfkitT3Guest;
 
       # The guest-side sandy-agent, per guest system (#238) — the same
       # `pkgs.sandy-agent` the guest config itself carries (via the overlay
@@ -163,6 +223,8 @@
       topologies = {
         x86_64-linux.qemu = mkTopology qemuGuest;
         aarch64-linux.vfkit = mkTopology vfkitGuest;
+        x86_64-linux.qemu-t3 = mkTopology qemuT3Guest;
+        aarch64-linux.vfkit-t3 = mkTopology vfkitT3Guest;
       };
     };
 }
