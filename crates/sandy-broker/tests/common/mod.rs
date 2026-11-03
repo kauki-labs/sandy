@@ -32,6 +32,7 @@ pub fn client(id: &str, token: &str, max: IsolationClass, roots: Vec<std::path::
         token_sha256: hex::encode(Sha256::digest(token.as_bytes())),
         max_isolation_class: max,
         max_environments: 4,
+        max_environment_records: 64,
         roots,
     }
 }
@@ -42,6 +43,12 @@ pub async fn fixture() -> Result<Fixture> {
 
 /// A fixture whose client `a` may hold `max_environments` environments.
 pub async fn fixture_with_env_quota(max_environments: usize) -> Result<Fixture> {
+    fixture_with_limits(max_environments, 64).await
+}
+
+/// A fixture whose client `a` may hold `max_environments` live environments and ever
+/// create `max_environment_records`.
+pub async fn fixture_with_limits(max_environments: usize, max_environment_records: usize) -> Result<Fixture> {
     let dir = tempfile::tempdir()?;
     let socket = dir.path().join("sandyd.sock");
     let store = Arc::new(JobStore::open_in_memory()?);
@@ -72,6 +79,7 @@ pub async fn fixture_with_env_quota(max_environments: usize) -> Result<Fixture> 
         clients: vec![
             Client {
                 max_environments,
+                max_environment_records,
                 ..client("a", TOKEN_A, IsolationClass::Trusted, vec![root_a.clone()])
             },
             client("b", TOKEN_B, IsolationClass::Untrusted, vec![]),

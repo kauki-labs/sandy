@@ -207,3 +207,43 @@ async fn link_stays_unsupported_until_t3_offers_an_interface() -> Result<()> {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn one_clients_environments_do_not_use_up_another_clients_quota_and_delete_frees_a_slot() -> Result<()> {
+    let f = common::fixture_with_env_quota(1).await?;
+    let a = spawn_id(&f, TOKEN_A, spawn_body("a1")).await?;
+    // Client b has its own default quota of 4: a's environment does not count against it.
+    for n in 0..4 {
+        spawn_id(&f, TOKEN_B, spawn_body(&format!("b{n}"))).await?;
+    }
+    let (status, body) = spawn(&f, TOKEN_A, spawn_body("a2")).await?;
+    assert_eq!(
+        (status, &body["code"]),
+        (StatusCode::TOO_MANY_REQUESTS, &json!("quota_exceeded"))
+    );
+    f.call("DELETE", &format!("/v1/environments/{a}"), Some(TOKEN_A), None)
+        .await?;
+    spawn_id(&f, TOKEN_A, spawn_body("a2")).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn creating_and_deleting_cannot_grow_sandyds_table_past_the_clients_record_cap() -> Result<()> {
+    let f = common::fixture_with_limits(4, 3).await?;
+    for n in 0..3 {
+        let id = spawn_id(&f, TOKEN_A, spawn_body(&format!("r{n}"))).await?;
+        f.call("DELETE", &format!("/v1/environments/{id}"), Some(TOKEN_A), None)
+            .await?;
+    }
+    let (status, body) = spawn(&f, TOKEN_A, spawn_body("r3")).await?;
+    assert_eq!(
+        (status, &body["code"]),
+        (StatusCode::TOO_MANY_REQUESTS, &json!("quota_exceeded")),
+        "{body}"
+    );
+    // A replay of a request already made is not a new record.
+    spawn_id(&f, TOKEN_A, spawn_body("r0")).await?;
+    // Another client's cap is its own.
+    spawn_id(&f, TOKEN_B, spawn_body("r3")).await?;
+    Ok(())
+}

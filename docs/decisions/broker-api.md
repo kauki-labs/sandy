@@ -133,6 +133,16 @@ user's files. Tracked in a follow-up issue.
   not relayed.
 - A create whose owner save fails answers `unavailable`. The client's retry replays the create,
   gets the same environment, and records it, so no orphan outlives a retry.
+- A client may hold `max_environments` non-terminal environments (default 4) and may ever
+  create `max_environment_records` (default 64). sandyd keeps a deleted row for replay and
+  counts it against its own cap, so without the second limit one client could create and
+  delete until sandyd's table is full for everyone. The real fix is sandyd pruning deleted
+  rows and paging its list reply (#633).
+- A create that sandyd answers with an environment another client already owns is refused
+  (`TakenOver`), and two clients whose ids share a 16-digit hash prefix are refused at startup.
+- `failure.reason` is logged and not relayed: it is sandyd's text and may name a path or a
+  credential once the launch driver writes it. `failure.step` is relayed.
+- An owner file in the earlier job-only shape fails the load.
 - `steps` is provisional: sandyd sends none until the launch driver (#587 slice C), and each
   name maps to status `pending` until slice C pins the format.
 
@@ -143,10 +153,12 @@ to it. Closing it is the correlation work in #621.
 ## Consequences
 
 - Every broker refusal is typed (`unauthenticated`, `forbidden`, `not_found`,
-  `invalid_request`, `unsupported`, `unavailable`), so `sandy-mcp` passes them through
-  unchanged. sandyd's own refusal text is never relayed; it becomes `unavailable`.
+  `invalid_request`, `request_id_conflict`, `quota_exceeded`, `unsupported_for_lifetime`,
+  `unsupported`, `unavailable`), so `sandy-mcp` passes them through unchanged. sandyd's own
+  refusal text is never relayed: a `ControlError` becomes `unavailable`, an `EnvironmentError`
+  code gets a fixed message.
 - A broker restart keeps job ownership, so the owner can still cancel.
-- The owner table is rewritten whole on each submit and never pruned. Pruning waits for #596.
+- The owner table is rewritten whole on each submit and each environment create, and never pruned. Pruning waits for #596.
 - A caller on another machine cannot reach the broker until the TLS follow-up lands.
 - sandyd cannot tell two HTTP clients apart. The broker is the only per-client boundary.
 

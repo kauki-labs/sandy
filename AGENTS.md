@@ -199,7 +199,7 @@ crates/
   ├─ sandyd/              - the control-plane daemon dispatching jobs into the agent fabric (epic #205)
   ├─ sandy-host-executor/ - the M2 remote executor (#269): declares capabilities, runs dispatched jobs, relays the agent link
   ├─ sandy-mcp/           - MCP stdio server over the broker API: job + environment tools (#585)
-  ├─ sandy-broker/        - the broker HTTP API tier over sandyd: bearer clients, job endpoints (#591)
+  ├─ sandy-broker/        - the broker HTTP API tier over sandyd: bearer clients, job and environment endpoints (#591)
   ├─ sandy-egress-proxy/  - per-run host egress proxy: CONNECT parse, allow-list match, address filter (#401)
   └─ sandy-cli/           - the `sandy` binary (doctor, run/ls/status/wait/kill/gc, cred github …)
 impls/

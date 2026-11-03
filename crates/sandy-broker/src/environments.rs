@@ -79,8 +79,12 @@ enum LifetimeKind {
 /// sandyd keys idempotency over all callers, so each client gets its own
 /// namespace: a hash prefix of the client id, then the client's `request_id`.
 fn namespaced(client: &Client, request_id: &str) -> String {
-    let digest = hex::encode(Sha256::digest(client.id.as_bytes()));
-    format!("{}.{request_id}", &digest[..16])
+    format!("{}.{request_id}", namespace_prefix(&client.id))
+}
+
+/// The 16 hex digits that start every idempotency key of `client_id`.
+pub(crate) fn namespace_prefix(client_id: &str) -> String {
+    hex::encode(Sha256::digest(client_id.as_bytes()))[..16].to_owned()
 }
 
 fn valid_request_id(id: &str) -> bool {
@@ -100,12 +104,20 @@ fn state_name(state: i32) -> &'static str {
     }
 }
 
+/// Everything but a known terminal state counts, so a state sandyd adds later
+/// is counted against the quota until this code says otherwise.
 fn is_live(state: i32) -> bool {
-    matches!(
+    !matches!(
         EnvironmentState::try_from(state),
-        Ok(EnvironmentState::Provisioning | EnvironmentState::Ready | EnvironmentState::Stopped)
+        Ok(EnvironmentState::Failed | EnvironmentState::Deleted)
     )
 }
+
+const QUOTA_RECORDS: ApiError = ApiError {
+    status: StatusCode::TOO_MANY_REQUESTS,
+    code: "quota_exceeded",
+    message: "too many environments created",
+};
 
 fn summary(e: &EnvironmentResponse) -> Value {
     json!({"environment_id": e.environment_id, "state": state_name(e.state)})
@@ -125,7 +137,10 @@ fn detail(e: &EnvironmentResponse) -> Value {
         .as_ref()
         .filter(|f| !f.step.is_empty() || !f.reason.is_empty())
     {
-        body["failure"] = json!({"step": f.step, "reason": f.reason});
+        // The reason is sandyd's own text and may name a path or a credential once
+        // the launch driver writes it, so it is logged and not relayed.
+        tracing::info!(environment_id = %e.environment_id, step = %f.step, reason = %f.reason, "environment failed");
+        body["failure"] = json!({"step": f.step, "reason": "the step failed; the operator has the details"});
     }
     if let Some(c) = e.connection.as_ref().filter(|c| !c.url.is_empty()) {
         body["connection"] = json!({"url": c.url});
@@ -193,6 +208,9 @@ pub(crate) async fn spawn(state: &State, client: &Client, req: Request<Incoming>
         let live = live_owned(state, client).await?;
         if live >= client.max_environments {
             return Err(QUOTA);
+        }
+        if state.owners.environment_records(&client.id) >= client.max_environment_records {
+            return Err(QUOTA_RECORDS);
         }
     }
     let op = control_request::Op::CreateEnvironment(CreateEnvironmentRequest {
@@ -319,4 +337,55 @@ pub(crate) async fn act(state: &State, client: &Client, id: &str, action: &str) 
         _ => return Err(FORBIDDEN),
     };
     Ok((StatusCode::OK, summary(&one(state, op).await?)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_request_id_must_be_1_to_111_characters_of_letters_digits_dash_underscore_dot() {
+        assert!(valid_request_id("a"));
+        assert!(valid_request_id("Task-1_2.x"));
+        assert!(valid_request_id(&"x".repeat(111)));
+        assert!(!valid_request_id(""));
+        assert!(!valid_request_id(&"x".repeat(112)));
+        for bad in ["has space", "a\nb", "a/b", "a:b", "tab\t", "\u{e9}"] {
+            assert!(!valid_request_id(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_failure_reason_from_sandyd_is_not_relayed() {
+        let e = EnvironmentResponse {
+            environment_id: "env-1".to_owned(),
+            state: EnvironmentState::Failed.into(),
+            failure: Some(sandy_control_proto::v1::EnvironmentFailure {
+                step: "clone".to_owned(),
+                reason: "cannot read /home/daemon/.ssh/id_ed25519 token=ghp_secret".to_owned(),
+            }),
+            ..Default::default()
+        };
+        let body = detail(&e).to_string();
+        assert!(body.contains("clone"), "the step is relayed: {body}");
+        assert!(!body.contains("ghp_secret") && !body.contains("/home/daemon"), "{body}");
+    }
+
+    #[test]
+    fn an_unknown_state_counts_as_live_and_only_failed_and_deleted_do_not() {
+        assert!(is_live(EnvironmentState::Provisioning.into()));
+        assert!(is_live(EnvironmentState::Ready.into()));
+        assert!(is_live(EnvironmentState::Stopped.into()));
+        assert!(is_live(99));
+        assert!(!is_live(EnvironmentState::Failed.into()));
+        assert!(!is_live(EnvironmentState::Deleted.into()));
+    }
+
+    #[test]
+    fn the_namespace_prefix_is_16_lowercase_hex_digits_and_differs_per_client() {
+        let (a, b) = (namespace_prefix("a"), namespace_prefix("b"));
+        assert_eq!(a.len(), 16);
+        assert!(a.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)));
+        assert_ne!(a, b);
+    }
 }

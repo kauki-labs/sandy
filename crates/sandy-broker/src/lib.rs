@@ -1,6 +1,6 @@
 //! The broker HTTP API tier over sandyd (#591, `docs/decisions/broker-api.md`).
 //!
-//! Serves the job endpoints of `docs/api/broker.openapi.yaml` to bearer-token
+//! Serves the job and environment endpoints of `docs/api/broker.openapi.yaml` to bearer-token
 //! clients and speaks the control RPC to one sandyd over a UDS.
 
 mod auth;
@@ -38,6 +38,10 @@ pub struct Client {
     /// Most non-terminal environments the client may hold at once.
     #[serde(default = "default_max_environments")]
     pub max_environments: usize,
+    /// Most environments the client may ever create, deleted ones included. sandyd keeps
+    /// a deleted row for replay, so this bounds the client's share of its table.
+    #[serde(default = "default_max_environment_records")]
+    pub max_environment_records: usize,
     /// Directories the client may name in inputs, outputs and secrets.
     #[serde(default)]
     pub roots: Vec<PathBuf>,
@@ -47,6 +51,10 @@ const fn default_max_environments() -> usize {
     4
 }
 
+const fn default_max_environment_records() -> usize {
+    64
+}
+
 /// Broker settings.
 #[derive(Clone, Debug)]
 pub struct BrokerConfig {
@@ -54,7 +62,7 @@ pub struct BrokerConfig {
     pub control_socket: PathBuf,
     /// How long one control RPC may take, connect included.
     pub rpc_deadline: std::time::Duration,
-    /// Directory holding the 0600 job-owner table.
+    /// Directory holding the 0600 owner table.
     pub state_dir: PathBuf,
     /// Listen address. Must be loopback.
     pub bind: SocketAddr,
@@ -123,6 +131,7 @@ fn validate_clients(clients: &[Client]) -> Result<(), BrokerError> {
     let bad = |m: String| Err(BrokerError::InvalidClients(m));
     let mut ids = std::collections::HashSet::new();
     let mut hashes = std::collections::HashSet::new();
+    let mut prefixes = std::collections::HashSet::new();
     for c in clients {
         if c.id.is_empty() {
             return bad("a client has an empty id".to_owned());
@@ -139,6 +148,12 @@ fn validate_clients(clients: &[Client]) -> Result<(), BrokerError> {
         }
         if !ids.insert(c.id.as_str()) {
             return bad(format!("duplicate client id {:?}", c.id));
+        }
+        if !prefixes.insert(environments::namespace_prefix(&c.id)) {
+            return bad(format!(
+                "client {:?} has the same idempotency namespace as another client",
+                c.id
+            ));
         }
         if !hashes.insert(c.token_sha256.as_str()) {
             return bad(format!("client {:?} shares a token hash with another client", c.id));

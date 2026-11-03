@@ -22,8 +22,10 @@ struct Owned {
     token: String,
 }
 
-/// Everything the file holds.
+/// Everything the file holds. An unknown top-level key (such as the job-only
+/// format that held bare job ids) fails the load instead of reading as empty.
 #[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Tables {
     #[serde(default)]
     jobs: HashMap<String, Owned>,
@@ -57,6 +59,9 @@ pub enum OwnersError {
     /// Another broker holds this state directory.
     #[error("the state directory is in use by another broker")]
     Locked,
+    /// The environment already belongs to another client.
+    #[error("environment {0} already belongs to another client")]
+    TakenOver(String),
 }
 
 fn key_of(client: &str, request_id: &str) -> String {
@@ -145,10 +150,23 @@ impl Owners {
         client: &str,
         request_id: &str,
     ) -> Result<(), OwnersError> {
+        if self
+            .lock()
+            .environments
+            .get(environment_id)
+            .is_some_and(|c| c != client)
+        {
+            return Err(OwnersError::TakenOver(environment_id.to_owned()));
+        }
         self.update(|t| {
             t.environments.insert(environment_id.to_owned(), client.to_owned());
             t.keys.insert(key_of(client, request_id), environment_id.to_owned());
         })
+    }
+
+    /// How many environments `client` ever created, deleted ones included.
+    pub(crate) fn environment_records(&self, client: &str) -> usize {
+        self.lock().environments.values().filter(|c| *c == client).count()
     }
 
     /// Whether `client` owns `environment_id`.
@@ -198,6 +216,30 @@ mod tests {
         assert!(!reopened.owns("job-2", "a"));
         let mode = std::fs::metadata(state.join(FILE))?.permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+        Ok(())
+    }
+
+    #[test]
+    fn an_old_job_only_file_fails_the_load_instead_of_reading_as_empty() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        drop(Owners::open(dir.path())?);
+        std::fs::write(dir.path().join(FILE), br#"{"job-1":{"client":"a","token":"AA=="}}"#)?;
+        assert!(matches!(Owners::open(dir.path()), Err(OwnersError::Corrupt(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn an_environment_cannot_move_to_another_client() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let owners = Owners::open(dir.path())?;
+        owners.record_environment("env-1", "a", "r")?;
+        assert!(matches!(
+            owners.record_environment("env-1", "b", "r"),
+            Err(OwnersError::TakenOver(_))
+        ));
+        assert!(owners.owns_environment("env-1", "a"));
+        assert_eq!(owners.environment_records("a"), 1);
+        assert_eq!(owners.environment_records("b"), 0);
         Ok(())
     }
 
