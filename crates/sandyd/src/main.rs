@@ -880,7 +880,8 @@ fn max_jobs() -> Result<Option<usize>, std::num::ParseIntError> {
 /// setting stops the daemon, like every other startup setting.
 fn start_environment_driver(environments: &Arc<EnvironmentStore>) -> Option<tokio::task::JoinHandle<()>> {
     let config = match environment_backend::from_env(
-        |name| std::env::var(name).ok(),
+        // A non-UTF-8 value must reach the parser as a refusal, not read as unset.
+        |name| std::env::var_os(name).map(|v| v.to_string_lossy().into_owned()),
         || {
             ensure_runtime_dir()
                 .map(|dir| dir.join("environments"))

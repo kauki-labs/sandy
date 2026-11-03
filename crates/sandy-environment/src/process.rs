@@ -466,8 +466,14 @@ impl EnvironmentBackend for ProcessEnvironmentBackend {
     fn kill(&self, environment_id: &str) -> Result<(), BackendError> {
         let mut running = self.lock();
         if let Some(mut r) = running.remove(environment_id) {
-            // An already-exited group is not an error.
-            let _ = r.child.kill();
+            // An already-gone group (ESRCH) is not an error. Any other failure keeps the entry
+            // and the directory, so a later kill retries instead of orphaning the group.
+            if let Err(e) = r.child.kill()
+                && e.raw_os_error() != Some(rustix::io::Errno::SRCH.raw_os_error())
+            {
+                running.insert(environment_id.to_owned(), r);
+                return Err(BackendError::Transport(format!("kill group of {environment_id}: {e}")));
+            }
             let _ = r.child.wait();
         }
         // Also clears a directory an earlier kill could not remove.
