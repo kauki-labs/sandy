@@ -33,6 +33,8 @@ fi
 work=$(mktemp -d /tmp/slb.XXXXXX)
 chmod 0700 "$work"
 mkdir -p "$work/home"
+printf 'sk-secret-value' >"$work/secret.txt"
+chmod 0600 "$work/secret.txt"
 sandy_pid=""
 cleanup() {
   if [ -n "$sandy_pid" ] && kill -0 "$sandy_pid" 2>/dev/null; then
@@ -53,6 +55,9 @@ echo "SK> agent=$agent"
 sleep 1
 echo "SK> squat-999-as-t3: $(runuser -u t3 -- timeout 3 "$agent" port-relay --vsock-port 999 --to 127.0.0.1:9 2>&1 | head -2 | tr '\n' ' ')"
 echo "SK> bind-2000-as-t3: $(runuser -u t3 -- timeout 3 "$agent" port-relay --vsock-port 2000 --to 127.0.0.1:9 2>&1 | head -2 | tr '\n' ' ')"
+echo "SK> secrets-dir: $(stat -c '%a %U' /run/sandy/secrets 2>&1)"
+echo "SK> secret-as-root: $(cat /run/sandy/secrets/SKSECRET 2>&1)"
+echo "SK> secret-as-t3: $(runuser -u t3 -- cat /run/sandy/secrets/SKSECRET 2>&1 | head -1)"
 mkdir -p /var/lib/t3/data
 chown -R t3:t3 /var/lib/t3
 runuser -u t3 -- t3 serve --host 127.0.0.1 --port 3773 --base-dir /var/lib/t3/data --no-browser >/tmp/t3.log 2>&1 &
@@ -81,7 +86,7 @@ echo "== booting the guest"
     SANDY_EGRESS_PROXY_BIN="$repo_root/target/debug/sandy-egress-proxy" \
     nix shell nixpkgs#qemu nixpkgs#virtiofsd -c \
     "$repo_root/target/debug/sandy" -o json run "$repo_root/nix/guest#topologies.x86_64-linux.qemu-t3" \
-    --timeout 900 --allow example.com:443 --input "$work/guest.sh:guest.sh" -- bash /run/sandy/inputs/guest.sh \
+    --timeout 900 --allow example.com:443 --secret "SKSECRET=@$work/secret.txt" --input "$work/guest.sh:guest.sh" -- bash /run/sandy/inputs/guest.sh \
     >"$work/result.json" 2>"$work/stderr.log"
 ) &
 sandy_pid=$!
@@ -127,6 +132,13 @@ joined = "\n".join(lines)
 # The kernel lets only a process with CAP_NET_BIND_SERVICE bind a vsock port of 1023 or below.
 if not re.search(r"squat-999-as-t3:.*Permission denied", joined):
     print("a non-root process could bind a privileged vsock port", file=sys.stderr)
+    sys.exit(1)
+# The secrets mount belongs to root: the service user must not read a job secret.
+if "sk-secret-value" not in joined.split("secret-as-root:", 1)[-1].split("\n", 1)[0]:
+    print("root could not read the staged secret", file=sys.stderr)
+    sys.exit(1)
+if not re.search(r"secret-as-t3:.*Permission denied", joined):
+    print("the service user could read a job secret", file=sys.stderr)
     sys.exit(1)
 if re.search(r"bind-2000-as-t3:.*(Permission denied|Address already in use)", joined):
     print("an unprivileged vsock port could not be bound as the service user", file=sys.stderr)
