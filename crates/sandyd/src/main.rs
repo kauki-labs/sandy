@@ -879,9 +879,16 @@ fn max_jobs() -> Result<Option<usize>, std::num::ParseIntError> {
 /// (#587). Off by default: environments then stay `Provisioning`. An invalid
 /// setting stops the daemon, like every other startup setting.
 fn start_environment_driver(environments: &Arc<EnvironmentStore>) -> Option<tokio::task::JoinHandle<()>> {
+    // `var(..).ok()` would read a non-UTF-8 value as unset, and a lossy copy would alter a path.
+    if let Some((name, _)) = std::env::vars_os()
+        .filter(|(k, _)| k.to_string_lossy().starts_with("SANDY_ENV_"))
+        .find(|(_, v)| v.to_str().is_none())
+    {
+        tracing::error!(name = %name.to_string_lossy(), "environment backend setting is not valid UTF-8");
+        std::process::exit(1);
+    }
     let config = match environment_backend::from_env(
-        // A non-UTF-8 value must reach the parser as a refusal, not read as unset.
-        |name| std::env::var_os(name).map(|v| v.to_string_lossy().into_owned()),
+        |name| std::env::var(name).ok(),
         || {
             ensure_runtime_dir()
                 .map(|dir| dir.join("environments"))
