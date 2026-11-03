@@ -297,6 +297,11 @@ message ListEnvironmentsRequest {
   EnvironmentState state = 1;
   // Empty lists every task_ref.
   string task_ref = 2;
+  // Rows per page. 0 means the daemon default (100); above 500 is clamped to 500.
+  uint32 page_size = 3;
+  // Continue after this environment id: the `next_page_token` of the previous
+  // page. Empty starts at the first row.
+  string page_token = 4;
 }
 
 message StopEnvironmentRequest {
@@ -340,6 +345,8 @@ message EnvironmentResponse {
 
 message ListEnvironmentsResponse {
   repeated EnvironmentResponse environments = 1;
+  // Pass as `page_token` to read the next page. Empty on the last page.
+  string next_page_token = 2;
 }
 
 enum EnvironmentErrorCode {

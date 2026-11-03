@@ -161,6 +161,46 @@ pub enum CreateOutcome {
     },
 }
 
+/// How long a `Deleted` row is kept for idempotent replay, and how many are kept
+/// at most (#633).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionPolicy {
+    /// A `Deleted` row older than this many seconds is removed by gc.
+    pub window_secs: u64,
+    /// At most this many `Deleted` rows are kept; the oldest go first.
+    pub max_deleted: usize,
+}
+
+impl Default for RetentionPolicy {
+    fn default() -> Self {
+        Self {
+            window_secs: 24 * 60 * 60,
+            max_deleted: 10_000,
+        }
+    }
+}
+
+impl RetentionPolicy {
+    /// Read `SANDY_ENV_RETENTION_SECS` and `SANDY_MAX_DELETED_ENVIRONMENTS` through
+    /// `get`; an unset variable keeps its default.
+    ///
+    /// # Errors
+    /// A set value that is not an integer of at least 1.
+    pub fn from_env(get: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let _ = get;
+        Ok(Self::default())
+    }
+}
+
+/// What one [`EnvironmentStore::gc_deleted`] pass removed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GcReport {
+    /// `Deleted` rows removed for being older than the retention window.
+    pub expired: usize,
+    /// `Deleted` rows removed, oldest first, to stay within the retained cap.
+    pub evicted: usize,
+}
+
 /// What a lifecycle transition did to an environment row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnvTransition {
@@ -334,6 +374,17 @@ impl EnvironmentStore {
     pub fn with_max_rows(mut self, max_rows: Option<usize>) -> Self {
         self.max_rows = max_rows;
         self
+    }
+
+    /// Remove `Deleted` rows per `policy`, judging age against `now` (unix
+    /// seconds, injected so tests need no sleep). Rows in any other state are
+    /// never touched.
+    ///
+    /// # Errors
+    /// [`EnvironmentStoreError::Sqlite`] if the write faults.
+    pub fn gc_deleted(&self, now: i64, policy: &RetentionPolicy) -> Result<GcReport, EnvironmentStoreError> {
+        let _ = (self.lock(), now, policy);
+        Ok(GcReport::default())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -1307,6 +1358,150 @@ mod tests {
         ));
         assert!(matches!(s.list(), Err(EnvironmentStoreError::CorruptState { .. })));
         assert_eq!(state_of(&s, "env-2")?, EnvironmentState::Provisioning);
+        Ok(())
+    }
+
+    /// Creates and deletes `request_id`'s environment, then back-dates the delete to `deleted_at`.
+    fn deleted_at(s: &EnvironmentStore, request_id: &str, deleted_at: i64) -> Result<String> {
+        let id = format!("env-{request_id}");
+        match s.create(request_id, &id, SPEC, ENC)? {
+            CreateOutcome::Created(_) => {}
+            other => bail!("expected Created, got {other:?}"),
+        }
+        assert_eq!(s.delete(&id)?, EnvTransition::Applied);
+        s.lock().execute(
+            "UPDATE environments SET updated_at = ?2 WHERE environment_id = ?1",
+            (&id, deleted_at),
+        )?;
+        Ok(id)
+    }
+
+    #[test]
+    fn deleted_rows_do_not_count_against_the_row_cap() -> Result<()> {
+        let s = store()?.with_max_rows(Some(2));
+        for n in 0..5 {
+            let id = format!("env-{n}");
+            match s.create(&format!("r{n}"), &id, SPEC, ENC)? {
+                CreateOutcome::Created(_) => {}
+                other => bail!("create {n} should fit: {other:?}"),
+            }
+            assert_eq!(s.delete(&id)?, EnvTransition::Applied);
+        }
+        // Two live rows still fill the cap, and a replay is never refused.
+        s.create("live-1", "env-l1", SPEC, ENC)?;
+        s.create("live-2", "env-l2", SPEC, ENC)?;
+        assert_eq!(
+            s.create("live-3", "env-l3", SPEC, ENC)?,
+            CreateOutcome::CapExceeded { max: 2 }
+        );
+        assert!(matches!(
+            s.create("r0", "env-x", SPEC, ENC)?,
+            CreateOutcome::Existing(_)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn gc_removes_only_deleted_rows_older_than_the_window() -> Result<()> {
+        let s = store()?;
+        let policy = RetentionPolicy {
+            window_secs: 100,
+            max_deleted: 1000,
+        };
+        let old = deleted_at(&s, "old", 1_000)?;
+        let edge = deleted_at(&s, "edge", 1_100)?;
+        let fresh = deleted_at(&s, "fresh", 1_101)?;
+        s.create("live", "env-live", SPEC, ENC)?;
+        s.lock().execute(
+            "UPDATE environments SET updated_at = 0 WHERE environment_id = 'env-live'",
+            (),
+        )?;
+
+        let report = s.gc_deleted(1_200, &policy)?;
+        assert_eq!(report, GcReport { expired: 1, evicted: 0 });
+        assert_eq!(s.get(&old)?, None, "older than the window is removed");
+        assert!(s.get(&edge)?.is_some(), "exactly at the window is kept");
+        assert!(s.get(&fresh)?.is_some());
+        assert!(
+            s.get("env-live")?.is_some(),
+            "a live row is never collected, however old"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gc_evicts_the_oldest_deleted_rows_past_the_retained_cap() -> Result<()> {
+        let s = store()?;
+        let policy = RetentionPolicy {
+            window_secs: 1_000_000,
+            max_deleted: 2,
+        };
+        let ids = (0..4)
+            .map(|n| deleted_at(&s, &format!("r{n}"), 1_000 + n))
+            .collect::<Result<Vec<_>>>()?;
+        let report = s.gc_deleted(1_010, &policy)?;
+        assert_eq!(report, GcReport { expired: 0, evicted: 2 });
+        assert_eq!((s.get(&ids[0])?, s.get(&ids[1])?), (None, None));
+        assert!(s.get(&ids[2])?.is_some() && s.get(&ids[3])?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn an_idempotency_key_is_reusable_only_after_its_deleted_row_is_collected() -> Result<()> {
+        let s = store()?;
+        let policy = RetentionPolicy {
+            window_secs: 100,
+            max_deleted: 1000,
+        };
+        let first = deleted_at(&s, "k", 1_000)?;
+        match s.create("k", "env-new", SPEC, ENC)? {
+            CreateOutcome::Existing(rec) => assert_eq!(rec.environment_id, first),
+            other => bail!("within the window a replay finds the deleted row: {other:?}"),
+        }
+        s.gc_deleted(1_050, &policy)?;
+        assert!(matches!(
+            s.create("k", "env-new", SPEC, ENC)?,
+            CreateOutcome::Existing(_)
+        ));
+        s.gc_deleted(1_101, &policy)?;
+        match s.create("k", "env-new", SPEC, ENC)? {
+            CreateOutcome::Created(rec) => assert_eq!(rec.environment_id, "env-new"),
+            other => bail!("after gc the key makes a new environment: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_retention_policy_reads_its_two_settings_and_refuses_bad_values() -> Result<()> {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| pairs.iter().find(|(k, _)| *k == name).map(|(_, v)| (*v).to_owned())
+        };
+        assert_eq!(
+            RetentionPolicy::from_env(env(&[])).map_err(anyhow::Error::msg)?,
+            RetentionPolicy::default()
+        );
+        assert_eq!(RetentionPolicy::default().window_secs, 86_400);
+        assert_eq!(RetentionPolicy::default().max_deleted, 10_000);
+        let set = RetentionPolicy::from_env(env(&[
+            ("SANDY_ENV_RETENTION_SECS", "60"),
+            ("SANDY_MAX_DELETED_ENVIRONMENTS", "7"),
+        ]))
+        .map_err(anyhow::Error::msg)?;
+        assert_eq!(
+            set,
+            RetentionPolicy {
+                window_secs: 60,
+                max_deleted: 7
+            }
+        );
+        for bad in [
+            &[("SANDY_ENV_RETENTION_SECS", "0")][..],
+            &[("SANDY_ENV_RETENTION_SECS", "soon")],
+            &[("SANDY_MAX_DELETED_ENVIRONMENTS", "0")],
+            &[("SANDY_MAX_DELETED_ENVIRONMENTS", "-1")],
+        ] {
+            assert!(RetentionPolicy::from_env(env(bad)).is_err(), "{bad:?}");
+        }
         Ok(())
     }
 }

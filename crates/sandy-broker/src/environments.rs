@@ -330,6 +330,7 @@ pub(crate) async fn list(state: &State, client: &Client, query: Option<&str>) ->
     let op = control_request::Op::ListEnvironments(ListEnvironmentsRequest {
         state: wanted.into(),
         task_ref,
+        ..Default::default()
     });
     let control_response::Result::Environments(all) = call(state, op).await.map_err(list_refusal)? else {
         return Err(UNAVAILABLE);

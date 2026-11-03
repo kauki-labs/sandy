@@ -295,3 +295,64 @@ async fn a_profile_the_client_may_not_use_is_forbidden_and_creates_nothing() -> 
     assert_eq!(list["environments"].as_array().map(Vec::len), Some(0));
     Ok(())
 }
+
+/// Rows owned by nobody the broker knows, enough to need several sandyd list pages.
+fn fill_foreign_rows(f: &common::Fixture, n: usize) -> Result<()> {
+    for i in 0..n {
+        f.environments.create(
+            &format!("foreign-{i}"),
+            &format!("env-foreign-{i:06}"),
+            b"spec",
+            "other",
+        )?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_broker_list_and_quota_check_keep_working_over_more_rows_than_one_page() -> Result<()> {
+    let f = common::fixture_with_limits(200, 200).await?;
+    fill_foreign_rows(&f, 1100)?;
+    let a = spawn_id(&f, TOKEN_A, spawn_body("p1")).await?;
+    let (status, list) = f.call("GET", "/v1/environments", Some(TOKEN_A), None).await?;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let ids: Vec<&str> = list["environments"]
+        .as_array()
+        .context("environments")?
+        .iter()
+        .filter_map(|e| e["environment_id"].as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        [a.as_str()],
+        "only the caller's environment, found past the first page"
+    );
+    // The quota check lists everything too, so a second spawn proves it works.
+    spawn_id(&f, TOKEN_A, spawn_body("p2")).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_daemon_with_more_rows_than_the_broker_will_scan_is_unavailable_not_truncated() -> Result<()> {
+    let f = common::fixture_with_limits(200, 200).await?;
+    fill_foreign_rows(&f, 10_001)?;
+    let (status, body) = f.call("GET", "/v1/environments", Some(TOKEN_A), None).await?;
+    assert_eq!(
+        (status, &body["code"]),
+        (StatusCode::SERVICE_UNAVAILABLE, &json!("unavailable")),
+        "{body}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn churn_by_fresh_keys_cannot_fill_sandyds_row_cap_for_other_clients() -> Result<()> {
+    let f = common::fixture_with_row_cap(4, 64, Some(2)).await?;
+    for n in 0..6 {
+        let id = spawn_id(&f, TOKEN_A, spawn_body(&format!("c{n}"))).await?;
+        f.call("DELETE", &format!("/v1/environments/{id}"), Some(TOKEN_A), None)
+            .await?;
+    }
+    spawn_id(&f, TOKEN_B, spawn_body("b1")).await?;
+    Ok(())
+}
