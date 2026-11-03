@@ -11,12 +11,24 @@
 //! The bridge parses nothing and adds no TLS or auth. Tailnet exposure is the host's job (`tailscale serve`), and the
 //! service authenticates its own clients (t3's pairing token).
 
-use std::{future::Future, io, net::SocketAddr, time::Duration};
+use std::{
+    future::Future,
+    io,
+    net::{Ipv4Addr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use tokio::{
-    io::{AsyncRead, AsyncWrite},
-    task::JoinHandle,
+    io::{AsyncRead, AsyncWrite, copy_bidirectional},
+    net::{TcpListener, TcpStream},
+    sync::Semaphore,
+    task::{JoinHandle, JoinSet},
+    time::{Instant, sleep, timeout},
 };
+
+/// One dial attempt may not take longer than this. The window bounds the retries, not a single hung attempt.
+const DIAL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Opens one stream to the guest relay.
 pub trait Dialer: Send + Sync + 'static {
@@ -60,13 +72,10 @@ impl Bridge {
     ///
     /// # Errors
     /// Returns the bind error.
-    pub async fn start<D: Dialer>(_dialer: D, _config: BridgeConfig) -> io::Result<Self> {
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+    pub async fn start<D: Dialer>(dialer: D, config: BridgeConfig) -> io::Result<Self> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let addr = listener.local_addr()?;
-        let task = tokio::spawn(async move {
-            let _listener = listener;
-            std::future::pending::<()>().await;
-        });
+        let task = tokio::spawn(accept_loop(listener, Arc::new(dialer), config));
         Ok(Self { addr, task: Some(task) })
     }
 
@@ -90,6 +99,57 @@ impl Drop for Bridge {
         if let Some(task) = self.task.take() {
             task.abort();
         }
+    }
+}
+
+/// Accept clients until the task is aborted. Dropping the task drops `live`, which aborts every relayed
+/// connection, and drops the listener, which refuses new ones.
+async fn accept_loop<D: Dialer>(listener: TcpListener, dialer: Arc<D>, config: BridgeConfig) {
+    let slots = Arc::new(Semaphore::new(config.max_connections));
+    let mut live = JoinSet::new();
+    loop {
+        // Reap finished connections so the set does not grow with every client ever served.
+        while live.try_join_next().is_some() {}
+        let client = match listener.accept().await {
+            Ok((client, _)) => client,
+            Err(_) => {
+                // EMFILE and friends are not a listener failure: back off and keep serving.
+                sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
+            drop(client);
+            continue;
+        };
+        let dialer = Arc::clone(&dialer);
+        live.spawn(async move {
+            relay_one(client, &*dialer, config).await;
+            drop(slot);
+        });
+    }
+}
+
+/// Relay one client: dial the guest relay inside the window, then copy both ways until either side closes. A dial
+/// that never succeeds closes this client only.
+async fn relay_one<D: Dialer>(mut client: TcpStream, dialer: &D, config: BridgeConfig) {
+    let Some(mut guest) = dial_within_window(dialer, &config).await else {
+        return;
+    };
+    // Copies both ways, and half-closes the far side when one side reaches EOF.
+    let _ = copy_bidirectional(&mut client, &mut guest).await;
+}
+
+async fn dial_within_window<D: Dialer>(dialer: &D, config: &BridgeConfig) -> Option<D::Stream> {
+    let started = Instant::now();
+    loop {
+        if let Ok(Ok(stream)) = timeout(DIAL_ATTEMPT_TIMEOUT, dialer.dial()).await {
+            return Some(stream);
+        }
+        if started.elapsed() + config.dial_retry_interval >= config.dial_window {
+            return None;
+        }
+        sleep(config.dial_retry_interval).await;
     }
 }
 
