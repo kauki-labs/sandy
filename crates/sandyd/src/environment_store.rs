@@ -153,7 +153,7 @@ pub enum CreateOutcome {
     /// `new_id` already names another request's environment, so nothing was
     /// written. The caller mints ids, so this is a minting fault, not a retry.
     IdTaken,
-    /// The table already holds `max` rows (see
+    /// The table already holds `max` rows that are not `Deleted` (see
     /// [`EnvironmentStore::with_max_rows`]); the insert was refused.
     CapExceeded {
         /// The configured cap that would have been exceeded.
@@ -187,8 +187,20 @@ impl RetentionPolicy {
     /// # Errors
     /// A set value that is not an integer of at least 1.
     pub fn from_env(get: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
-        let _ = get;
-        Ok(Self::default())
+        let default = Self::default();
+        let read = |name: &str| -> Result<Option<u64>, String> {
+            get(name)
+                .map(|v| match v.trim().parse::<u64>() {
+                    Ok(n) if n >= 1 => Ok(n),
+                    _ => Err(format!("{name} must be an integer of at least 1, got {v:?}")),
+                })
+                .transpose()
+        };
+        Ok(Self {
+            window_secs: read("SANDY_ENV_RETENTION_SECS")?.unwrap_or(default.window_secs),
+            max_deleted: read("SANDY_MAX_DELETED_ENVIRONMENTS")?
+                .map_or(default.max_deleted, |n| usize::try_from(n).unwrap_or(usize::MAX)),
+        })
     }
 }
 
@@ -285,7 +297,8 @@ impl RawRow {
     }
 }
 
-fn now_unix() -> i64 {
+/// The current time in unix seconds, the clock the store stamps rows with.
+pub fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -366,8 +379,9 @@ impl EnvironmentStore {
         })
     }
 
-    /// Cap the table at `max_rows` rows in total (every state counts, since
-    /// deleted rows are kept for replay): once reached, `create` refuses a new
+    /// Cap the table at `max_rows` rows that are not `Deleted` (a `Failed` row
+    /// still counts until it is deleted; deleted rows are bounded by
+    /// [`RetentionPolicy`] instead): once reached, `create` refuses a new
     /// environment. A retry of a stored `request_id` needs no new row and is
     /// never refused.
     #[must_use]
@@ -383,8 +397,23 @@ impl EnvironmentStore {
     /// # Errors
     /// [`EnvironmentStoreError::Sqlite`] if the write faults.
     pub fn gc_deleted(&self, now: i64, policy: &RetentionPolicy) -> Result<GcReport, EnvironmentStoreError> {
-        let _ = (self.lock(), now, policy);
-        Ok(GcReport::default())
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Age is judged by `updated_at`: a `Deleted` row is written once, by the delete.
+        let cutoff = now.saturating_sub(i64::try_from(policy.window_secs).unwrap_or(i64::MAX));
+        let expired = tx.execute(
+            "DELETE FROM environments WHERE state = 'deleted' AND updated_at < ?1",
+            [cutoff],
+        )?;
+        let keep = i64::try_from(policy.max_deleted).unwrap_or(i64::MAX);
+        let evicted = tx.execute(
+            "DELETE FROM environments WHERE environment_id IN (
+                 SELECT environment_id FROM environments WHERE state = 'deleted'
+                  ORDER BY updated_at DESC, rowid DESC LIMIT -1 OFFSET ?1)",
+            [keep],
+        )?;
+        tx.commit()?;
+        Ok(GcReport { expired, evicted })
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -425,7 +454,11 @@ impl EnvironmentStore {
             });
         }
         if let Some(max) = self.max_rows {
-            let count: i64 = tx.query_row("SELECT COUNT(*) FROM environments", (), |row| row.get(0))?;
+            let count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM environments WHERE state != 'deleted'",
+                (),
+                |row| row.get(0),
+            )?;
             if count as usize >= max {
                 return Ok(CreateOutcome::CapExceeded { max });
             }
@@ -516,6 +549,45 @@ impl EnvironmentStore {
             .query_map((), RawRow::read)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows.into_iter().map(RawRow::into_record).collect())
+    }
+
+    /// One page of environments in `environment_id` order, the ids strictly after
+    /// `after` (`None` starts at the first), at most `limit` rows. `Some(state)`
+    /// selects that state; `None` selects every state but `Deleted`.
+    ///
+    /// The id is the order key because it is unique and never changes, so a
+    /// cursor stays valid when its own row is deleted or collected.
+    ///
+    /// # Errors
+    /// As [`EnvironmentStore::create`].
+    pub fn list_page(
+        &self,
+        state: Option<EnvironmentState>,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<EnvironmentRecord>, EnvironmentStoreError> {
+        let conn = self.lock();
+        let filter = if state.is_some() {
+            "state = ?1"
+        } else {
+            "state != 'deleted'"
+        };
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM environments WHERE {filter} AND environment_id > ?2
+              ORDER BY environment_id LIMIT ?3"
+        ))?;
+        // `?1` is unused without a state filter: SQLite still counts it, so all three bind.
+        let rows = stmt
+            .query_map(
+                (
+                    state.map_or("", EnvironmentState::as_str),
+                    after.unwrap_or(""),
+                    i64::try_from(limit).unwrap_or(i64::MAX),
+                ),
+                RawRow::read,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter().map(RawRow::into_record).collect()
     }
 
     /// Every environment in `state`, oldest first.

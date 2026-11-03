@@ -296,14 +296,15 @@ async fn a_profile_the_client_may_not_use_is_forbidden_and_creates_nothing() -> 
     Ok(())
 }
 
-/// Rows owned by nobody the broker knows, enough to need several sandyd list pages.
+/// Rows owned by nobody the broker knows, enough to need several sandyd list pages. The spec bytes are a
+/// valid `EnvironmentSpec` (field 1, `profile`, set to `p`).
 fn fill_foreign_rows(f: &common::Fixture, n: usize) -> Result<()> {
     for i in 0..n {
         f.environments.create(
             &format!("foreign-{i}"),
             &format!("env-foreign-{i:06}"),
-            b"spec",
-            "other",
+            b"\x0a\x01p",
+            sandyd::environment::SPEC_ENCODING,
         )?;
     }
     Ok(())

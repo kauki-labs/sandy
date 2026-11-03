@@ -13,7 +13,7 @@ use sandyd::{
     dispatch::JobRegistry,
     environment_backend,
     environment_driver::EnvironmentDriver,
-    environment_store::EnvironmentStore,
+    environment_store::{EnvironmentStore, RetentionPolicy},
     gate_spawn,
     host_registry::{ExecutorAllowlist, HostRegistry},
     mesh_config::{parse_mesh_allowlist, parse_mesh_listen_addr},
@@ -161,6 +161,21 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    let retention = match RetentionPolicy::from_env(|name| std::env::var(name).ok()) {
+        Ok(retention) => retention,
+        Err(e) => {
+            tracing::error!(error = %e, "invalid environment retention setting");
+            std::process::exit(1);
+        }
+    };
+    // Independent of the launch driver: a deleted row is collected even with no backend configured.
+    let _environment_retention = tokio::spawn(sandyd::environment::run_retention(
+        Arc::clone(&environments),
+        retention,
+        sandyd::environment::RETENTION_INTERVAL,
+        sandyd::environment_store::now_unix,
+    ));
 
     let (listener, _lock) = match bind_unix_listener(&socket_path) {
         Ok(bound) => bound,

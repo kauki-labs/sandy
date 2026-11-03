@@ -28,6 +28,7 @@ use crate::{
     environment_driver::now_unix,
     environment_store::{
         CreateOutcome, EnvTransition, EnvironmentRecord, EnvironmentState, EnvironmentStore, EnvironmentStoreError,
+        GcReport, RetentionPolicy,
     },
 };
 
@@ -48,6 +49,9 @@ pub const PAGE_BYTE_BUDGET: usize = 512 * 1024;
 /// The longest ephemeral lifetime a client may ask for: seven days.
 const MAX_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
+/// How often [`run_retention`] sweeps in the daemon.
+pub const RETENTION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// A fault the handler cannot turn into a typed refusal. The connection is
 /// closed and the fault logged, like a job-store fault.
 #[derive(Debug, thiserror::Error)]
@@ -64,6 +68,30 @@ pub enum EnvironmentHandlerError {
     /// A freshly minted id already names another environment.
     #[error("a freshly minted environment id collided with an existing one")]
     IdCollision,
+}
+
+/// Sweep `Deleted` rows per `policy` once at once, then every `interval`, for the
+/// life of the task (#633). `clock` supplies unix seconds, injected so tests
+/// need no sleep. A faulting sweep is logged and retried on the next tick.
+pub async fn run_retention(
+    store: Arc<EnvironmentStore>,
+    policy: RetentionPolicy,
+    interval: std::time::Duration,
+    clock: impl Fn() -> i64 + Send + 'static,
+) {
+    let mut tick = tokio::time::interval(interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tick.tick().await;
+        let now = clock();
+        match blocking(&store, move |s| s.gc_deleted(now, &policy)).await {
+            Ok(GcReport { expired: 0, evicted: 0 }) => {}
+            Ok(GcReport { expired, evicted }) => {
+                tracing::info!(expired, evicted, "removed deleted environment rows");
+            }
+            Err(e) => tracing::warn!(error = %e, "environment retention sweep failed"),
+        }
+    }
 }
 
 /// Whether `op` is an environment operation this module serves.
@@ -335,40 +363,67 @@ async fn get(store: &Arc<EnvironmentStore>, id: String) -> Reply {
 /// The page size a request asks for, made valid: 0 is the default, and anything
 /// above the maximum is the maximum.
 fn clamp_page_size(requested: u32) -> usize {
-    requested as usize
+    match requested as usize {
+        0 => DEFAULT_PAGE_SIZE,
+        n => n.min(MAX_PAGE_SIZE),
+    }
 }
 
-async fn list(store: &Arc<EnvironmentStore>, request: ListEnvironmentsRequest, _budget: usize) -> Reply {
+/// Rows read from the store per round while a page is filled; a `task_ref` filter
+/// can skip rows, so one page may take several rounds.
+const SCAN_CHUNK: usize = 200;
+
+/// One page of `ListEnvironments`, in `environment_id` order. A page ends at the
+/// page size or when the next row would push its encoded rows past `budget`
+/// bytes (so a page always fits a control frame), and `next_page_token` is the
+/// id of its last row, or empty when no later row matches.
+async fn list(store: &Arc<EnvironmentStore>, request: ListEnvironmentsRequest, budget: usize) -> Reply {
     let ListEnvironmentsRequest {
         state,
         task_ref,
-        page_size: _,
-        page_token: _,
+        page_size,
+        page_token,
     } = request;
     let Ok(wire) = WireState::try_from(state) else {
         return refuse(EnvironmentErrorCode::InvalidArgument, "unknown state filter");
     };
-    let records = match from_wire_state(wire) {
-        None => blocking(store, EnvironmentStore::list).await?,
-        Some(s) => blocking(store, move |st| st.list_by_state(s)).await?,
-    };
-    // Without a state filter, deleted rows (kept for replay) stay out of the reply.
-    let hide_deleted = wire == WireState::Unspecified;
-    let mut environments = Vec::new();
-    for record in records {
-        if hide_deleted && record.state == EnvironmentState::Deleted {
-            continue;
+    if !page_token.is_empty() && !id_ok(&page_token) {
+        return refuse(EnvironmentErrorCode::InvalidArgument, "page_token is malformed");
+    }
+    let limit = clamp_page_size(page_size);
+    let filter = from_wire_state(wire);
+    let mut after = page_token;
+    let mut environments: Vec<EnvironmentResponse> = Vec::new();
+    let mut bytes = 0;
+    loop {
+        let cursor = after.clone();
+        let chunk = blocking(store, move |s| s.list_page(filter, Some(&cursor), SCAN_CHUNK)).await?;
+        let exhausted = chunk.len() < SCAN_CHUNK;
+        for record in chunk {
+            let id = record.environment_id.clone();
+            let row = to_wire(record)?;
+            if task_ref.is_empty() || row.spec.as_ref().is_some_and(|s| s.task_ref == task_ref) {
+                let size = row.encoded_len();
+                if !environments.is_empty() && (environments.len() >= limit || bytes + size > budget) {
+                    // A matching row is waiting, so there is a next page.
+                    return Ok(page(environments, after));
+                }
+                bytes += size;
+                environments.push(row);
+            }
+            after = id;
         }
-        let wire = to_wire(record)?;
-        if task_ref.is_empty() || wire.spec.as_ref().is_some_and(|s| s.task_ref == task_ref) {
-            environments.push(wire);
+        if exhausted {
+            return Ok(page(environments, String::new()));
         }
     }
-    let _ = (MAX_PAGE_SIZE, DEFAULT_PAGE_SIZE);
-    Ok(control_response::Result::Environments(ListEnvironmentsResponse {
+}
+
+fn page(environments: Vec<EnvironmentResponse>, next_page_token: String) -> control_response::Result {
+    control_response::Result::Environments(ListEnvironmentsResponse {
         environments,
-        next_page_token: String::new(),
-    }))
+        next_page_token,
+    })
 }
 
 /// Applies an [`EnvTransition`] to the reply a client sees.
@@ -455,7 +510,6 @@ mod tests {
     };
 
     use super::*;
-    use crate::environment_store::RetentionPolicy;
 
     fn lifetime(kind: EnvironmentLifetimeKind, ttl_secs: u64) -> Option<EnvironmentLifetime> {
         Some(EnvironmentLifetime {
@@ -748,7 +802,10 @@ mod tests {
         let all = ids(call(&s, list(WireState::Unspecified, ""))
             .await?
             .map_err(|e| anyhow::anyhow!("{e:?}"))?)?;
-        assert_eq!(all, [a.environment_id.clone(), b.environment_id.clone()]);
+        // Pages are in id order, and ids are random.
+        let mut both = [a.environment_id.clone(), b.environment_id.clone()];
+        both.sort();
+        assert_eq!(all, both);
         let ready = ids(call(&s, list(WireState::Ready, ""))
             .await?
             .map_err(|e| anyhow::anyhow!("{e:?}"))?)?;
@@ -1254,9 +1311,32 @@ mod tests {
         Ok(())
     }
 
-    fn ephemeral_bytes() -> Vec<u8> {
-        use prost::Message;
-        ephemeral().encode_to_vec()
+    #[tokio::test]
+    async fn the_retention_task_sweeps_at_start_without_waiting_a_tick() -> Result<()> {
+        let s = store()?;
+        let env = create(&s, "old", ephemeral()).await?;
+        s.delete(&env.environment_id)?;
+        let policy = RetentionPolicy {
+            window_secs: 60,
+            max_deleted: 100,
+        };
+        let task = tokio::spawn(run_retention(
+            Arc::clone(&s),
+            policy,
+            std::time::Duration::from_secs(3600),
+            || i64::MAX / 2,
+        ));
+        let gone = async {
+            while s.get(&env.environment_id)?.is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            anyhow::Ok(())
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), gone)
+            .await
+            .context("the first sweep must run at start")??;
+        task.abort();
+        Ok(())
     }
 
     #[tokio::test]

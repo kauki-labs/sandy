@@ -185,9 +185,8 @@ async fn call(state: &State, op: control_request::Op) -> Result<control_response
     }
 }
 
-/// sandyd refuses a list that matches too many rows with `INVALID_ARGUMENT`. The
-/// caller's own arguments were already checked, so that refusal is the daemon's
-/// limit, not a bad request.
+/// sandyd refuses a list with `INVALID_ARGUMENT` only for an argument the broker built
+/// itself, so that refusal is the daemon's limit, not a bad request.
 fn list_refusal(e: ApiError) -> ApiError {
     if e.status == StatusCode::BAD_REQUEST && e.code == "invalid_request" {
         UNAVAILABLE
@@ -265,17 +264,63 @@ pub(crate) async fn spawn(state: &State, client: &Client, req: Request<Incoming>
     Ok((StatusCode::ACCEPTED, summary(&created)))
 }
 
+/// The most rows the broker reads from sandyd for one request, across pages. A daemon
+/// holding more makes the request `unavailable` rather than answer from a truncated view.
+const MAX_SCANNED_ROWS: usize = 10_000;
+/// Rows asked per page: sandyd's own page maximum.
+const SCAN_PAGE_SIZE: u32 = 500;
+
+/// Every row of sandyd's list for `state` and `task_ref` that `keep` accepts, read
+/// page by page. More than [`MAX_SCANNED_ROWS`] rows, or a page that makes no
+/// progress, is `unavailable`.
+async fn list_all(
+    state: &State,
+    wanted: EnvironmentState,
+    task_ref: &str,
+    keep: impl Fn(&EnvironmentResponse) -> bool,
+) -> Result<Vec<EnvironmentResponse>, ApiError> {
+    let mut kept = Vec::new();
+    let mut scanned = 0usize;
+    let mut page_token = String::new();
+    loop {
+        let op = control_request::Op::ListEnvironments(ListEnvironmentsRequest {
+            state: wanted.into(),
+            task_ref: task_ref.to_owned(),
+            page_size: SCAN_PAGE_SIZE,
+            page_token,
+        });
+        let control_response::Result::Environments(page) = call(state, op).await.map_err(list_refusal)? else {
+            return Err(UNAVAILABLE);
+        };
+        scanned += page.environments.len();
+        if scanned > MAX_SCANNED_ROWS {
+            tracing::warn!(
+                scanned,
+                max = MAX_SCANNED_ROWS,
+                "sandyd holds more environments than the broker will scan"
+            );
+            return Err(UNAVAILABLE);
+        }
+        let empty = page.environments.is_empty();
+        kept.extend(page.environments.into_iter().filter(&keep));
+        if page.next_page_token.is_empty() {
+            return Ok(kept);
+        }
+        if empty {
+            tracing::error!("sandyd returned an empty environment page with a next token");
+            return Err(UNAVAILABLE);
+        }
+        page_token = page.next_page_token;
+    }
+}
+
 /// How many non-terminal environments `client` holds.
 async fn live_owned(state: &State, client: &Client) -> Result<usize, ApiError> {
-    let op = control_request::Op::ListEnvironments(ListEnvironmentsRequest::default());
-    let control_response::Result::Environments(all) = call(state, op).await.map_err(list_refusal)? else {
-        return Err(UNAVAILABLE);
-    };
-    Ok(all
-        .environments
-        .iter()
-        .filter(|e| is_live(e.state) && state.owners.owns_environment(&e.environment_id, &client.id))
-        .count())
+    let owned = list_all(state, EnvironmentState::Unspecified, "", |e| {
+        is_live(e.state) && state.owners.owns_environment(&e.environment_id, &client.id)
+    })
+    .await?;
+    Ok(owned.len())
 }
 
 /// A query parameter, percent-decoded. `None` when absent.
@@ -327,20 +372,11 @@ pub(crate) async fn list(state: &State, client: &Client, query: Option<&str>) ->
     if task_ref.len() > 256 || task_ref.chars().any(char::is_control) {
         return Err(INVALID);
     }
-    let op = control_request::Op::ListEnvironments(ListEnvironmentsRequest {
-        state: wanted.into(),
-        task_ref,
-        ..Default::default()
-    });
-    let control_response::Result::Environments(all) = call(state, op).await.map_err(list_refusal)? else {
-        return Err(UNAVAILABLE);
-    };
-    let environments: Vec<Value> = all
-        .environments
-        .iter()
-        .filter(|e| state.owners.owns_environment(&e.environment_id, &client.id))
-        .map(summary)
-        .collect();
+    let owned = list_all(state, wanted, &task_ref, |e| {
+        state.owners.owns_environment(&e.environment_id, &client.id)
+    })
+    .await?;
+    let environments: Vec<Value> = owned.iter().map(summary).collect();
     Ok((StatusCode::OK, json!({"environments": environments})))
 }
 
