@@ -427,13 +427,27 @@ demonstrated for the process backend; it is deferred to the VM-backed
 ### 10a. The guest port relay (#590)
 
 `sandy-agent port-relay --vsock-port P --to 127.0.0.1:T` is the guest half of the host-side bridge to a guest
-service port (for example `t3 serve`, which listens on guest loopback only). It listens on vsock port `P`, admits
-only the host (CID 2, the same check as the agent link), and splices each connection to `127.0.0.1:T`. It parses
-nothing, so a service that holds a long-lived connection (a websocket) works, and TLS and auth stay with the host
-half. A peer that is not the host is closed without a dial, a dead service closes that one connection, and the
-target must be an IPv4 loopback address, so the relay cannot forward off the guest. The service kind (#589) starts
-it. The host half (a loopback listener that dials `CID:P` on qemu, or a `virtio-vsock,port=P,...,connect` device
-declared at launch on vfkit) is a later slice of #590.
+service port (for example `t3 serve`, which listens on guest loopback only). It listens on vsock port `P` and
+splices each connection from the host to `127.0.0.1:T`. It parses nothing, so a service that holds a long-lived
+connection (a websocket) works.
+
+- **Who may connect.** The relay admits only vsock peers that report the host CID (2), the same check as the agent
+  link, and closes any other peer without a dial (CID 0, the loopback CID 1 and a guest CID included). It is not an
+  auth boundary. On qemu (vhost-vsock) every host process, of any uid, reaches the guest as CID 2, so any host
+  process can open a raw connection to `<guest CID>:P`. On vfkit the host reaches the guest only through a unix
+  socket, so its file permissions gate access. The service must authenticate its own clients (t3's pairing token),
+  and the host half must not expose the port to anything but its own authenticated listener. A per-run secret
+  handshake in the relay is an open question for the owner.
+- **Limits.** At most 256 connections are relayed at once, and a connection over the cap is closed unanswered. A
+  dial to the target that takes more than 5 seconds closes that connection only. A target that is down closes that
+  one connection, and the relay keeps accepting. The target must be an IPv4 loopback address with a real port, so
+  the relay cannot forward off the guest, and a service that binds only `::1` cannot be relayed.
+- **Readiness.** The relay binds its vsock port at once, whether or not the service is listening. A host dial
+  before the relay binds is refused. A host dial before the service is up connects and is then closed with no
+  bytes. The host half must retry both cases.
+- **Not yet wired.** The service kind (#589) is expected to start the relay, and nothing does yet. The host half (a
+  loopback listener that dials `CID:P` on qemu, or a `virtio-vsock,port=P,...,connect` device declared at launch
+  on vfkit) is a later slice of #590.
 
 ## 11. Channel roles are thin wrappers; `EscalationSink` is a new seam
 

@@ -16,12 +16,15 @@ use std::{
     ffi::OsString,
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
     time::Duration,
 };
 
 use tokio::{
     io::{AsyncRead, AsyncWrite, copy_bidirectional},
     net::TcpStream,
+    sync::Semaphore,
+    time::timeout,
 };
 
 use crate::link_source::{Acceptor, HOST_CID};
@@ -51,8 +54,13 @@ pub fn parse_args(args: &[OsString]) -> Result<(u32, SocketAddr), String> {
     Ok((port, target))
 }
 
-/// The most host connections relayed at once.
+/// The most host connections relayed at once. Over the cap a connection is closed unanswered, so a flood from the
+/// host cannot exhaust the relay's descriptors or the service's.
 pub const MAX_CONNECTIONS: usize = 256;
+
+/// How long one dial to the target may take. Loopback answers at once, so a longer wait means the service's accept
+/// backlog is full, and the connection is closed instead of holding a task and a descriptor for minutes.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Accept connections on `acceptor` and relay each host connection to `target`. Runs until its task is dropped.
 pub async fn serve<A>(acceptor: A, target: SocketAddr)
@@ -64,15 +72,28 @@ where
 }
 
 /// [`serve`] with an explicit cap on concurrent connections.
-pub async fn serve_with_cap<A>(mut acceptor: A, target: SocketAddr, _cap: usize)
+///
+/// A peer that is not the host is closed at once and the target is never dialed for it, so a guest-local process
+/// on vsock loopback cannot use the relay. Each connection runs in its own task, so a long-lived one (a websocket)
+/// does not block the next.
+pub async fn serve_with_cap<A>(mut acceptor: A, target: SocketAddr, cap: usize)
 where
     A: Acceptor + Send + 'static,
     A::Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let slots = Arc::new(Semaphore::new(cap));
     loop {
         match acceptor.accept().await {
             Ok((stream, HOST_CID)) => {
-                tokio::spawn(relay_one(stream, target));
+                let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
+                    drop(stream);
+                    eprintln!("sandy-agent: port-relay is at its {cap} connection cap; closed a connection");
+                    continue;
+                };
+                tokio::spawn(async move {
+                    relay_one(stream, target).await;
+                    drop(slot);
+                });
             }
             Ok((stream, cid)) => {
                 drop(stream);
@@ -91,10 +112,14 @@ async fn relay_one<S>(mut host: S, target: SocketAddr)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut service = match TcpStream::connect(target).await {
-        Ok(service) => service,
-        Err(e) => {
+    let mut service = match timeout(DIAL_TIMEOUT, TcpStream::connect(target)).await {
+        Ok(Ok(service)) => service,
+        Ok(Err(e)) => {
             eprintln!("sandy-agent: port-relay cannot reach {target}: {e}");
+            return;
+        }
+        Err(_) => {
+            eprintln!("sandy-agent: port-relay timed out dialing {target}");
             return;
         }
     };
