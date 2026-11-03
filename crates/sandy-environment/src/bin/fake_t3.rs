@@ -1,10 +1,12 @@
 //! A stand-in for `t3 serve` and `t3 pair`, used by the tests.
 //!
 //! `fake-t3 serve --port P --base-dir D [--ready-after-ms N] [--exit-after-ms N]
-//! [--spawn-child] [--dump-env]` answers `503` until N ms after start and `200`
+//! [--child-beat-file F] [--split-status] [--dump-env]` answers `503` until N ms after start and `200`
 //! after, optionally exits on its own, optionally starts a child that beats into
-//! `D/child.beat`, and optionally writes its environment to `D/env.txt`.
+//! the file F (outside the environment directory, so a test can tell a live child
+//! from a removed directory), and optionally writes its environment to `D/env.txt`.
 //! `fake-t3 pair --base-dir D [--fail]` prints a pairing code (or fails).
+//! `fake-t3 pair-hang [--beat-file F]` starts a beating child and then hangs.
 //! `fake-t3 beat --file F` rewrites F with a counter every 20 ms.
 
 use std::{
@@ -41,6 +43,15 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("beat") => beat(&args),
+        Some("pair-hang") => {
+            if let Some(file) = flag(&args, "--beat-file") {
+                let me = std::env::current_exe().unwrap_or_default();
+                let _ = Command::new(me).arg("beat").arg("--file").arg(file).spawn();
+            }
+            loop {
+                std::thread::sleep(Duration::from_secs(60));
+            }
+        }
         _ => ExitCode::from(2),
     }
 }
@@ -70,14 +81,11 @@ fn serve(args: &[String]) -> ExitCode {
         let env: String = std::env::vars().map(|(k, v)| format!("{k}={v}\n")).collect();
         let _ = std::fs::write(dir.join("env.txt"), env);
     }
-    if has(args, "--spawn-child") {
+    if let Some(file) = flag(args, "--child-beat-file") {
         let me = std::env::current_exe().unwrap_or_default();
-        let _ = Command::new(me)
-            .arg("beat")
-            .arg("--file")
-            .arg(dir.join("child.beat"))
-            .spawn();
+        let _ = Command::new(me).arg("beat").arg("--file").arg(file).spawn();
     }
+    let split_status = has(args, "--split-status");
     let Ok(listener) = TcpListener::bind(format!("127.0.0.1:{port}")) else {
         return ExitCode::from(3);
     };
@@ -97,10 +105,17 @@ fn serve(args: &[String]) -> ExitCode {
                 } else {
                     "503 Service Unavailable"
                 };
-                let _ = write!(
-                    stream,
-                    "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                );
+                if split_status {
+                    let _ = stream.write_all(b"HTTP/1.");
+                    let _ = stream.flush();
+                    std::thread::sleep(Duration::from_millis(150));
+                    let _ = write!(stream, "1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                } else {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                }
             }
             Err(_) => std::thread::sleep(Duration::from_millis(10)),
         }

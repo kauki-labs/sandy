@@ -60,6 +60,9 @@ pub enum EnvironmentBackendConfigError {
     /// A passed-through variable name is not `[A-Z0-9_]+`.
     #[error("SANDY_ENV_PASS_ENV name {0:?} is not an upper-case variable name")]
     InvalidName(String),
+    /// A passed-through variable name is one the backend sets itself.
+    #[error("SANDY_ENV_PASS_ENV name {0:?} is set by the backend and cannot be passed through")]
+    ReservedName(String),
     /// The default state dir could not be prepared.
     #[error("state dir: {0}")]
     StateDir(String),
@@ -104,6 +107,9 @@ pub fn from_env(
             .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
         {
             return Err(E::InvalidName(name.to_owned()));
+        }
+        if ["HOME", "PATH", "TMPDIR", "LANG"].contains(&name) {
+            return Err(E::ReservedName(name.to_owned()));
         }
         pass_env.push(name.to_owned());
     }
@@ -302,6 +308,19 @@ mod tests {
                     })
                 ),
                 "{raw:?}: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_passed_variable_cannot_override_one_the_backend_sets() {
+        for bad in ["HOME", "PATH", "TMPDIR", "LANG"] {
+            let mut pairs = base();
+            pairs.push(("SANDY_ENV_PASS_ENV", bad));
+            let out = parse(&pairs);
+            assert!(
+                matches!(out, Err(EnvironmentBackendConfigError::ReservedName(_))),
+                "{bad:?}: {out:?}"
             );
         }
     }

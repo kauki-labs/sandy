@@ -12,14 +12,19 @@
 //!
 //! A hard-killed daemon cannot clean up. The next [`ProcessEnvironmentBackend::new`]
 //! removes the stale directories and, on Linux, kills a recorded process group
-//! only after checking that its command line names the directory.
+//! only when the pid file's start time still matches the live process, so a
+//! reused pid is never hit. A service that leaves its process group (`setsid`)
+//! is not reached: there is no isolation here.
+//!
+//! One daemon owns a state dir at a time: `new` takes an exclusive lock on
+//! `<state_dir>/.lock` before it sweeps, and refuses when it is held.
 
 use std::{
     collections::BTreeMap,
     fs,
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
     sync::{Mutex, MutexGuard, PoisonError},
@@ -27,13 +32,18 @@ use std::{
 };
 
 use command_group::{CommandGroup, GroupChild};
+use fs2::FileExt;
 use sandy_api::{
     backend::{BackendError, BoxState},
     environment::{Endpoint, EnvironmentBackend, EnvironmentSpec, Launch, Probe},
 };
+use sandy_fsutil::OwnedDir;
 
 /// The longest environment id accepted.
 const MAX_ID: usize = 64;
+
+/// Variables the backend sets itself; `pass_env` cannot override them.
+const RESERVED_ENV: [&str; 4] = ["HOME", "PATH", "TMPDIR", "LANG"];
 
 /// Why a [`ProcessConfig`] is unusable.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -41,6 +51,9 @@ pub enum ProcessConfigError {
     /// No service command was given, or its program is blank.
     #[error("the service command is empty")]
     Empty,
+    /// A passed-through variable name is one the backend sets itself.
+    #[error("{0} is set by the backend and cannot be passed through")]
+    ReservedEnv(String),
 }
 
 /// How to run the service.
@@ -67,11 +80,16 @@ impl ProcessConfig {
     /// Checks the config.
     ///
     /// # Errors
-    /// [`ProcessConfigError::Empty`] when `command` is empty or its program is blank.
+    /// [`ProcessConfigError::Empty`] when `command` is empty or its program is blank;
+    /// [`ProcessConfigError::ReservedEnv`] when `pass_env` names a variable the backend sets.
     pub fn validate(&self) -> Result<(), ProcessConfigError> {
         match self.command.first() {
-            Some(program) if !program.trim().is_empty() => Ok(()),
-            _ => Err(ProcessConfigError::Empty),
+            Some(program) if !program.trim().is_empty() => {}
+            _ => return Err(ProcessConfigError::Empty),
+        }
+        match self.pass_env.iter().find(|n| RESERVED_ENV.contains(&n.as_str())) {
+            Some(name) => Err(ProcessConfigError::ReservedEnv(name.clone())),
+            None => Ok(()),
         }
     }
 }
@@ -87,6 +105,9 @@ struct Running {
 /// Runs each environment as a host process group.
 pub struct ProcessEnvironmentBackend {
     config: ProcessConfig,
+    base: OwnedDir,
+    /// Holds the state dir's exclusive lock for this backend's life.
+    _lock: fs::File,
     running: Mutex<BTreeMap<String, Running>>,
 }
 
@@ -135,32 +156,39 @@ fn http_status(port: u16) -> Option<u16> {
     stream
         .write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         .ok()?;
-    let mut buf = [0u8; 32];
-    let n = stream.read(&mut buf).ok()?;
-    let line = std::str::from_utf8(&buf[..n]).ok()?;
+    // "HTTP/1.x NNN" is 12 bytes; a service may send it in several segments.
+    let mut buf = [0u8; 12];
+    let mut filled = 0;
+    while filled < buf.len() {
+        match stream.read(&mut buf[filled..]) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => filled += n,
+        }
+    }
+    let line = std::str::from_utf8(&buf[..filled]).ok()?;
     let rest = line.strip_prefix("HTTP/1.")?;
     rest.get(2..5)?.parse().ok()
 }
 
-fn private_dir(path: &Path) -> Result<(), BackendError> {
-    match fs::metadata(path) {
-        Ok(meta) if meta.is_dir() => {
-            if meta.permissions().mode() & 0o077 != 0 {
-                return Err(spawn_err(format!(
-                    "state dir {} must be private (mode 0700), not {:o}",
-                    path.display(),
-                    meta.permissions().mode() & 0o777
-                )));
-            }
-            Ok(())
-        }
-        Ok(_) => Err(spawn_err(format!("state dir {} is not a directory", path.display()))),
-        Err(_) => fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(path)
-            .map_err(|e| spawn_err(format!("create state dir {}: {e}", path.display()))),
-    }
+/// Takes the state dir's exclusive lock, or says another daemon holds it.
+fn lock_state_dir(base: &OwnedDir) -> Result<fs::File, BackendError> {
+    let path = base.path().join(".lock");
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
+        .open(&path)
+        .map_err(|e| spawn_err(format!("open {}: {e}", path.display())))?;
+    file.try_lock_exclusive().map_err(|_| {
+        spawn_err(format!(
+            "state dir {} is in use by another process",
+            base.path().display()
+        ))
+    })?;
+    Ok(file)
 }
 
 impl ProcessEnvironmentBackend {
@@ -172,10 +200,13 @@ impl ProcessEnvironmentBackend {
     /// [`BackendError::Spawn`] if the config is invalid or the state dir cannot be prepared.
     pub fn new(config: ProcessConfig) -> Result<Self, BackendError> {
         config.validate().map_err(|e| spawn_err(e.to_string()))?;
-        private_dir(&config.state_dir)?;
-        sweep_stale(&config.state_dir);
+        let base = OwnedDir::open_or_create(&config.state_dir).map_err(|e| spawn_err(format!("state dir: {e}")))?;
+        let lock = lock_state_dir(&base)?;
+        sweep_stale(base.path());
         Ok(Self {
             config,
+            base,
+            _lock: lock,
             running: Mutex::new(BTreeMap::new()),
         })
     }
@@ -207,24 +238,28 @@ impl ProcessEnvironmentBackend {
     /// The error text never carries the command's output.
     fn pair(&self, running: &Running, argv: &[String], id: &str) -> Result<(), String> {
         let argv = substitute(argv, running.port, &running.dir, id);
-        let Some(program) = argv.first().filter(|p| !p.trim().is_empty()) else {
+        if argv.first().is_none_or(|p| p.trim().is_empty()) {
             return Err("the pairing command is empty".to_owned());
-        };
-        let _ = program;
+        }
         let path = running.dir.join("pairing");
         let out = fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
             .open(&path)
             .map_err(|e| format!("could not create the pairing file: {e}"))?;
-        let mut child = self
+        let mut child = match self
             .command(&argv, &running.dir)
             .stdout(Stdio::from(out))
             .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("could not start the pairing command: {e}"))?;
+            .group_spawn()
+        {
+            Ok(child) => child,
+            Err(e) => {
+                let _ = fs::remove_file(&path);
+                return Err(format!("could not start the pairing command: {e}"));
+            }
+        };
         let deadline = Instant::now() + self.config.pair_timeout;
         let status: ExitStatus = loop {
             match child.try_wait() {
@@ -236,7 +271,12 @@ impl ProcessEnvironmentBackend {
                     let _ = fs::remove_file(&path);
                     return Err("the pairing command timed out".to_owned());
                 }
-                Err(e) => return Err(format!("could not wait for the pairing command: {e}")),
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = fs::remove_file(&path);
+                    return Err(format!("could not wait for the pairing command: {e}"));
+                }
             }
         };
         if status.success() {
@@ -259,27 +299,56 @@ impl Drop for ProcessEnvironmentBackend {
     }
 }
 
-/// Remove stale environment directories. A recorded process group is killed
-/// only on Linux and only when its command line names the directory, so a
-/// reused pid is never hit.
+/// The start time (clock ticks since boot) of `pid`, from `/proc/<pid>/stat`.
+/// It tells a live process from a later one that reused the pid.
+#[cfg(target_os = "linux")]
+fn start_time(pid: i32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Field 2 (comm) may hold spaces and parentheses; the fields after the last ')' start at field 3.
+    let after = &stat[stat.rfind(')')? + 1..];
+    after.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// What the pid file records: the leader pid and, on Linux, its start time.
+fn pid_record(pid: u32) -> String {
+    #[cfg(target_os = "linux")]
+    if let Some(start) = i32::try_from(pid).ok().and_then(start_time) {
+        return format!("{pid} {start}");
+    }
+    pid.to_string()
+}
+
+/// Kills the process group a pid file names, only when the file's start time
+/// still matches the live process.
+#[cfg(target_os = "linux")]
+fn kill_recorded_group(record: &str) {
+    let mut fields = record.split_whitespace();
+    let (Some(pid), Some(start), None) = (fields.next(), fields.next(), fields.nth(0)) else {
+        return;
+    };
+    let (Ok(pid), Ok(start)) = (pid.parse::<i32>(), start.parse::<u64>()) else {
+        return;
+    };
+    if pid <= 1 || start_time(pid) != Some(start) {
+        return;
+    }
+    if let Some(pid) = rustix::process::Pid::from_raw(pid) {
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    }
+}
+
+/// Remove stale environment directories, killing a recorded process group first
+/// (Linux only; see [`kill_recorded_group`]). Symlinks and plain files are left alone.
 fn sweep_stale(state_dir: &Path) {
     let Ok(entries) = fs::read_dir(state_dir) else { return };
     for entry in entries.flatten() {
-        let dir = entry.path();
-        if !dir.is_dir() {
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
+        let dir = entry.path();
         #[cfg(target_os = "linux")]
-        if let Some(pid) = fs::read_to_string(dir.join("pid"))
-            .ok()
-            .and_then(|s| s.trim().parse::<i32>().ok())
-        {
-            let ours = fs::read(format!("/proc/{pid}/cmdline"))
-                .map(|raw| String::from_utf8_lossy(&raw).contains(&dir.display().to_string()))
-                .unwrap_or(false);
-            if let (true, Some(pid)) = (ours, rustix::process::Pid::from_raw(pid)) {
-                let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-            }
+        if let Ok(record) = fs::read_to_string(dir.join("pid")) {
+            kill_recorded_group(&record);
         }
         if let Err(e) = fs::remove_dir_all(&dir) {
             tracing::warn!(dir = %dir.display(), error = %e, "could not remove a stale environment directory");
@@ -297,34 +366,36 @@ impl EnvironmentBackend for ProcessEnvironmentBackend {
         if running.contains_key(id) {
             return Ok(Launch::AlreadyRunning);
         }
-        let dir = self.config.state_dir.join(id);
+        let dir = self.base.path().join(id);
         // A directory left by an earlier attempt that could not clean up.
         let _ = fs::remove_dir_all(&dir);
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&dir)
-            .map_err(|e| spawn_err(format!("create {}: {e}", dir.display())))?;
+        let owned = self
+            .base
+            .create_private_dir(id)
+            .map_err(|e| spawn_err(format!("create the environment dir: {e}")))?;
         let started = (|| -> Result<(GroupChild, u16), BackendError> {
             let port = free_port().map_err(|e| spawn_err(format!("no free port: {e}")))?;
             let argv = substitute(&self.config.command, port, &dir, id);
             let log = fs::OpenOptions::new()
                 .write(true)
-                .create(true)
-                .truncate(true)
+                .create_new(true)
                 .mode(0o600)
                 .open(dir.join("service.log"))
                 .map_err(|e| spawn_err(format!("create the service log: {e}")))?;
             let log_err = log
                 .try_clone()
                 .map_err(|e| spawn_err(format!("clone the service log: {e}")))?;
-            let child = self
+            let mut child = self
                 .command(&argv, &dir)
                 .stdout(Stdio::from(log))
                 .stderr(Stdio::from(log_err))
                 .group_spawn()
                 .map_err(|e| spawn_err(format!("spawn `{}`: {e}", argv[0])))?;
-            fs::write(dir.join("pid"), child.id().to_string())
-                .map_err(|e| spawn_err(format!("record the pid: {e}")))?;
+            if let Err(e) = owned.write_secret("pid", pid_record(child.id()).as_bytes()) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(spawn_err(format!("record the pid: {e}")));
+            }
             Ok((child, port))
         })();
         match started {
@@ -393,13 +464,20 @@ impl EnvironmentBackend for ProcessEnvironmentBackend {
     }
 
     fn kill(&self, environment_id: &str) -> Result<(), BackendError> {
-        let removed = self.lock().remove(environment_id);
-        if let Some(mut r) = removed {
+        let mut running = self.lock();
+        if let Some(mut r) = running.remove(environment_id) {
             // An already-exited group is not an error.
             let _ = r.child.kill();
             let _ = r.child.wait();
-            fs::remove_dir_all(&r.dir)
-                .map_err(|e| BackendError::Transport(format!("remove {}: {e}", r.dir.display())))?;
+        }
+        // Also clears a directory an earlier kill could not remove.
+        if valid_id(environment_id) {
+            let dir = self.base.path().join(environment_id);
+            match fs::remove_dir_all(&dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(BackendError::Transport(format!("remove {}: {e}", dir.display()))),
+            }
         }
         Ok(())
     }

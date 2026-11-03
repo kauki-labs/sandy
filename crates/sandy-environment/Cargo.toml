@@ -16,8 +16,10 @@ workspace = true
 
 [dependencies]
 command-group.workspace = true
-rustix = { workspace = true, features = ["process"] }
+fs2.workspace = true
+rustix = { workspace = true, features = ["fs", "process"] }
 sandy-api.workspace = true
+sandy-fsutil.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

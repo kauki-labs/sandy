@@ -170,9 +170,6 @@ async fn main() {
         }
     };
 
-    // The launch driver runs only when a backend is configured (#587).
-    let _environment_driver = start_environment_driver(&environments);
-
     // `sandyd cancel` locks the store, not the socket, so hold the store's lock too (the same file as
     // the socket's under the default paths, which is then already held).
     let _store_lock = if sandyd::operator::daemon_lock_path(&db_path) == socket_path.with_extension("lock") {
@@ -358,6 +355,11 @@ async fn main() {
     } else {
         None
     };
+
+    // The launch driver runs only when a backend is configured (#587). It starts after every lock and
+    // bind above: the backend sweeps stale environment directories, which a second daemon that lost
+    // a lock must never do.
+    let _environment_driver = start_environment_driver(&environments);
 
     let mut connections = tokio::task::JoinSet::new();
     let mut backoff = AcceptBackoff::new();

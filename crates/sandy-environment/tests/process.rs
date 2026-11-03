@@ -168,38 +168,55 @@ fn an_unknown_or_killed_environment_is_not_running_and_kill_is_idempotent() -> R
     Ok(())
 }
 
+/// The counter in `beat` advances while its writer lives.
+fn is_beating(beat: &Path) -> bool {
+    let read = || std::fs::read_to_string(beat).unwrap_or_default();
+    let first = read();
+    std::thread::sleep(Duration::from_millis(250));
+    !first.is_empty() && first != read()
+}
+
 #[test]
 fn kill_ends_the_whole_process_group_including_children() -> Result<()> {
     let state = private_tempdir()?;
-    let b = backend(state.path(), &["--spawn-child"])?;
+    let outside = tempfile::tempdir()?; // not removed by kill, so a live child can still write here
+    let beat = outside.path().join("child.beat");
+    let b = backend(state.path(), &["--child-beat-file", beat.to_str().context("utf8")?])?;
     b.launch(&spec("env-1"))?;
     wait_for(&b, "env-1", |p| matches!(p, Probe::Ready { .. }))?;
-    let beat = env_dir(state.path(), "env-1").join("child.beat");
-    let read = || std::fs::read_to_string(&beat).unwrap_or_default();
-    // The child is alive: its counter advances.
-    let first = read();
-    std::thread::sleep(Duration::from_millis(200));
-    assert_ne!(first, read(), "the child must be beating before the kill");
-    // Copy the file's path out: the directory is removed by kill, so read before.
+    assert!(is_beating(&beat), "the child must be beating before the kill");
     b.kill("env-1")?;
     std::thread::sleep(Duration::from_millis(300));
     assert!(
-        !beat.exists() || read() == read(),
-        "the child must have stopped beating"
+        !is_beating(&beat),
+        "the child must stop beating once its group is killed"
     );
-    // A beat file that reappears would mean a surviving writer.
-    std::thread::sleep(Duration::from_millis(200));
-    assert!(!beat.exists(), "no process may still write into the removed directory");
+    Ok(())
+}
+
+#[test]
+fn dropping_the_backend_kills_every_environment() -> Result<()> {
+    let state = private_tempdir()?;
+    let outside = tempfile::tempdir()?;
+    let beat = outside.path().join("child.beat");
+    let b = backend(state.path(), &["--child-beat-file", beat.to_str().context("utf8")?])?;
+    b.launch(&spec("env-1"))?;
+    wait_for(&b, "env-1", |p| matches!(p, Probe::Ready { .. }))?;
+    assert!(is_beating(&beat));
+    drop(b);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!is_beating(&beat), "a graceful exit must not leave the service running");
+    assert!(!env_dir(state.path(), "env-1").exists());
     Ok(())
 }
 
 #[test]
 fn the_service_sees_a_clean_environment_with_only_the_passed_variables() -> Result<()> {
     let state = private_tempdir()?;
-    // SAFETY-free way to set a variable for this test process: pass it via the config's pass_env
-    // by name only if it exists in the daemon's own environment, so use a name no test sets.
+    // Cargo (and nextest) set this for every test run, so it is a real variable to pass through.
+    let passed_value = std::env::var("CARGO_MANIFEST_DIR").context("CARGO_MANIFEST_DIR")?;
     let mut c = config(state.path(), &["--dump-env"]);
-    c.pass_env = vec!["SANDY_ENV_TEST_PASSED".to_owned()];
+    c.pass_env = vec!["CARGO_MANIFEST_DIR".to_owned(), "SANDY_ENV_TEST_UNSET".to_owned()];
     let b = ProcessEnvironmentBackend::new(c)?;
     b.launch(&spec("env-1"))?;
     wait_for(&b, "env-1", |p| matches!(p, Probe::Ready { .. }))?;
@@ -208,10 +225,16 @@ fn the_service_sees_a_clean_environment_with_only_the_passed_variables() -> Resu
     let keys: Vec<&str> = dumped.lines().filter_map(|l| l.split('=').next()).collect();
     for key in &keys {
         assert!(
-            ["PATH", "HOME", "LANG", "TMPDIR"].contains(key),
+            ["PATH", "HOME", "LANG", "TMPDIR", "CARGO_MANIFEST_DIR"].contains(key),
             "unexpected variable {key} reached the service"
         );
     }
+    assert!(
+        dumped
+            .lines()
+            .any(|l| l == format!("CARGO_MANIFEST_DIR={passed_value}")),
+        "the named variable passes through"
+    );
     assert!(
         dumped.lines().any(|l| l == format!("HOME={}", dir.display())),
         "HOME must be the environment directory"
@@ -290,7 +313,10 @@ fn an_environment_id_that_could_escape_the_state_dir_is_refused() -> Result<()> 
     }
     assert!(b.boxes()?.is_empty());
     assert_eq!(
-        std::fs::read_dir(state.path())?.count(),
+        std::fs::read_dir(state.path())?
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name() != ".lock")
+            .count(),
         0,
         "nothing may be created for a refused id"
     );
@@ -329,20 +355,185 @@ fn a_new_backend_removes_a_stale_directory_left_by_an_earlier_daemon() -> Result
 #[test]
 fn a_new_backend_kills_the_orphan_process_group_of_a_stale_environment() -> Result<()> {
     let state = private_tempdir()?;
-    let first = backend(state.path(), &["--spawn-child"])?;
+    let outside = tempfile::tempdir()?;
+    let beat = outside.path().join("child.beat");
+    let first = backend(state.path(), &["--child-beat-file", beat.to_str().context("utf8")?])?;
     first.launch(&spec("env-1"))?;
     wait_for(&first, "env-1", |p| matches!(p, Probe::Ready { .. }))?;
+    assert!(is_beating(&beat));
     let dir = env_dir(state.path(), "env-1");
-    let beat = dir.join("child.beat");
-    // The daemon dies without cleanup: forget the backend without dropping it.
+    // The daemon dies without cleanup: forget the backend and release its lock, as a dead process would.
+    let lock_path = state.path().join(".lock");
     std::mem::forget(first);
+    release_lock(&lock_path)?;
     let second = backend(state.path(), &[])?;
     std::thread::sleep(Duration::from_millis(300));
     assert!(!dir.exists(), "the stale directory is removed");
     assert!(
-        !beat.exists(),
-        "the orphan's child must be dead, or it would rewrite its beat file"
+        !is_beating(&beat),
+        "the orphan's child must be dead: only a group kill stops it"
     );
     assert!(second.boxes()?.is_empty());
+    Ok(())
+}
+
+/// Stand-in for a crashed daemon dropping its flock: the forgotten backend still holds the
+/// descriptor in this process, so take the lock over by unlinking the file; a new one is created.
+#[cfg(target_os = "linux")]
+fn release_lock(path: &Path) -> Result<()> {
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn an_unrelated_process_named_by_a_stale_pid_file_is_never_killed() -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let state = private_tempdir()?;
+    let outside = tempfile::tempdir()?;
+    let beat = outside.path().join("other.beat");
+    let mut other = std::process::Command::new(FAKE)
+        .args(["beat", "--file"])
+        .arg(&beat)
+        .process_group(0)
+        .spawn()?;
+    let pid = other.id();
+    for (name, contents) in [
+        ("env-a", format!("{pid}")),   // no start time recorded
+        ("env-b", format!("{pid} 1")), // a start time that is not this process's
+        ("env-c", "-1".to_owned()),    // not a pid
+        ("env-d", "0".to_owned()),
+        ("env-e", "1 1".to_owned()), // init
+        ("env-f", "not a pid".to_owned()),
+        ("env-g", String::new()),
+    ] {
+        let dir = state.path().join(name);
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("pid"), contents)?;
+    }
+    let b = backend(state.path(), &[])?;
+    assert!(
+        is_beating(&beat),
+        "a process the pid file does not truly identify must survive the sweep"
+    );
+    for name in ["env-a", "env-b", "env-c", "env-d", "env-e", "env-f", "env-g"] {
+        assert!(!state.path().join(name).exists(), "{name} is stale and must be removed");
+    }
+    drop(b);
+    other.kill()?;
+    other.wait()?;
+    Ok(())
+}
+
+#[test]
+fn a_second_backend_on_the_same_state_dir_is_refused_until_the_first_is_gone() -> Result<()> {
+    let state = private_tempdir()?;
+    let first = backend(state.path(), &[])?;
+    assert!(
+        backend(state.path(), &[]).is_err(),
+        "two daemons must not sweep each other's live directories"
+    );
+    drop(first);
+    assert!(backend(state.path(), &[]).is_ok());
+    Ok(())
+}
+
+#[test]
+fn a_state_dir_that_is_a_symlink_or_writable_by_others_is_refused() -> Result<()> {
+    use std::os::unix::fs::symlink;
+    let root = private_tempdir()?;
+    let real = root.path().join("real");
+    std::fs::create_dir(&real)?;
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700))?;
+    let link = root.path().join("link");
+    symlink(&real, &link)?;
+    assert!(
+        ProcessEnvironmentBackend::new(config(&link, &[])).is_err(),
+        "a symlinked state dir"
+    );
+    let open = root.path().join("open");
+    std::fs::create_dir(&open)?;
+    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777))?;
+    assert!(
+        ProcessEnvironmentBackend::new(config(&open, &[])).is_err(),
+        "a world-writable state dir"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_pair_command_that_hangs_is_killed_with_its_children_and_fails_the_environment() -> Result<()> {
+    let state = private_tempdir()?;
+    let outside = tempfile::tempdir()?;
+    let beat = outside.path().join("pair.beat");
+    let mut c = config(state.path(), &[]);
+    c.pair_command = Some(
+        [FAKE, "pair-hang", "--beat-file", beat.to_str().context("utf8")?]
+            .map(str::to_owned)
+            .to_vec(),
+    );
+    c.pair_timeout = Duration::from_millis(600);
+    let b = ProcessEnvironmentBackend::new(c)?;
+    b.launch(&spec("env-1"))?;
+    let p = wait_for(&b, "env-1", |p| matches!(p, Probe::Failed { .. }))?;
+    let Probe::Failed { step, reason } = p else {
+        bail!("not failed")
+    };
+    assert_eq!(step, "pair");
+    assert!(reason.contains("timed out"), "{reason}");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!is_beating(&beat), "the hung pair command's children must die with it");
+    b.kill("env-1")?;
+    Ok(())
+}
+
+#[test]
+fn a_pair_command_that_cannot_start_leaves_no_pairing_file() -> Result<()> {
+    let state = private_tempdir()?;
+    let mut c = config(state.path(), &[]);
+    c.pair_command = Some(vec!["/nonexistent/sandy-no-such-pair".to_owned()]);
+    let b = ProcessEnvironmentBackend::new(c)?;
+    b.launch(&spec("env-1"))?;
+    let p = wait_for(&b, "env-1", |p| matches!(p, Probe::Failed { .. }))?;
+    assert!(matches!(p, Probe::Failed { ref step, .. } if step == "pair"));
+    assert!(!env_dir(state.path(), "env-1").join("pairing").exists());
+    b.kill("env-1")?;
+    Ok(())
+}
+
+#[test]
+fn reserved_variable_names_cannot_be_passed_through() -> Result<()> {
+    let state = private_tempdir()?;
+    for name in ["HOME", "PATH", "TMPDIR", "LANG"] {
+        let mut c = config(state.path(), &[]);
+        c.pass_env = vec![name.to_owned()];
+        assert_eq!(c.validate(), Err(ProcessConfigError::ReservedEnv(name.to_owned())));
+        assert!(ProcessEnvironmentBackend::new(c).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn a_status_line_split_across_tcp_segments_is_still_read() -> Result<()> {
+    let state = private_tempdir()?;
+    let b = backend(state.path(), &["--split-status"])?;
+    b.launch(&spec("env-1"))?;
+    wait_for(&b, "env-1", |p| matches!(p, Probe::Ready { .. }))?;
+    b.kill("env-1")?;
+    Ok(())
+}
+
+#[test]
+fn a_second_kill_removes_a_directory_the_first_could_not() -> Result<()> {
+    let state = private_tempdir()?;
+    let b = backend(state.path(), &[])?;
+    b.launch(&spec("env-1"))?;
+    b.kill("env-1")?;
+    // A leftover directory for an id the backend no longer tracks.
+    let leftover = env_dir(state.path(), "env-1");
+    std::fs::create_dir(&leftover)?;
+    std::fs::write(leftover.join("pairing"), "stale")?;
+    b.kill("env-1")?;
+    assert!(!leftover.exists(), "a retried kill must clear a leftover directory");
     Ok(())
 }

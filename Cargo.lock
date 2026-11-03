@@ -2509,8 +2509,10 @@ version = "0.1.1"
 dependencies = [
  "anyhow",
  "command-group",
+ "fs2",
  "rustix",
  "sandy-api",
+ "sandy-fsutil",
  "tempfile",
  "thiserror 2.0.21",
  "tracing",
