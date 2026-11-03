@@ -44,6 +44,8 @@ pub struct Client {
 pub struct BrokerConfig {
     /// sandyd's control socket.
     pub control_socket: PathBuf,
+    /// How long one control RPC may take, connect included.
+    pub rpc_deadline: std::time::Duration,
     /// Directory holding the 0600 job-owner table.
     pub state_dir: PathBuf,
     /// Listen address. Must be loopback.
@@ -151,6 +153,7 @@ pub async fn serve(config: BrokerConfig) -> Result<Running, BrokerError> {
     let state = Arc::new(server::State {
         owners: owners::Owners::open(&config.state_dir)?,
         control_socket: config.control_socket,
+        rpc_deadline: config.rpc_deadline,
         clients: config.clients,
     });
     let bind_err = |source| BrokerError::Bind {

@@ -67,8 +67,9 @@ belongs to the owner, and `sandy-mcp` accepts only loopback `http` today.
   as in decision 23. The operator path `sandyd cancel` still works.
 - One broker per state directory: the broker holds an exclusive lock on `owners.lock` for as
   long as any handler holds the table, so a second instance cannot clobber it.
-- **Residual: a crash between sandyd accepting `Submit` and the table write** leaves a job
-  with no owner. `SubmitRequest` has no correlation key and `ListResponse` carries no token,
+- **Residual: a crash, or a reply timeout, between sandyd accepting `Submit` and the table write**
+  leaves a job with no owner. On a timeout the broker never learns the job id, so it cannot
+  cancel it. `SubmitRequest` has no correlation key and `ListResponse` carries no token,
   so a restarted broker can neither link nor cancel it. Closing it needs a control-RPC
   change (a client-chosen key echoed durably, and a recoverable cancel authority). The
   operator path `sandyd cancel` still works. Tracked in #621.

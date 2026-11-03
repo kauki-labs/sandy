@@ -56,6 +56,7 @@ async fn fixture() -> Result<Fixture> {
     std::fs::create_dir(&root_a)?;
     let broker = serve(BrokerConfig {
         control_socket: socket,
+        rpc_deadline: std::time::Duration::from_secs(30),
         state_dir: dir.path().join("state"),
         bind: "127.0.0.1:0".parse()?,
         clients: vec![
@@ -297,6 +298,7 @@ async fn an_ambiguous_clients_list_is_refused_at_startup() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let mk = |clients| BrokerConfig {
         control_socket: Path::new("/nonexistent").to_path_buf(),
+        rpc_deadline: std::time::Duration::from_secs(30),
         state_dir: dir.path().join("state"),
         bind: "127.0.0.1:0".parse().expect("literal"),
         clients,
@@ -348,11 +350,47 @@ async fn a_non_loopback_bind_is_refused_at_startup() -> Result<()> {
     let bind: SocketAddr = "0.0.0.0:0".parse()?;
     let result = serve(BrokerConfig {
         control_socket: Path::new("/nonexistent").to_path_buf(),
+        rpc_deadline: std::time::Duration::from_secs(30),
         state_dir: dir.path().join("state"),
         bind,
         clients: vec![],
     })
     .await;
     assert!(matches!(result, Err(BrokerError::NonLoopback { .. })), "got {result:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_sandyd_that_never_answers_gives_unavailable_within_the_deadline() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let socket = dir.path().join("silent.sock");
+    let listener = UnixListener::bind(&socket)?;
+    // Reads the request and then holds the connection open without a reply.
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    let broker = serve(BrokerConfig {
+        control_socket: socket,
+        rpc_deadline: std::time::Duration::from_millis(200),
+        state_dir: dir.path().join("state"),
+        bind: "127.0.0.1:0".parse()?,
+        clients: vec![client("a", TOKEN_A, IsolationClass::Trusted, vec![])],
+    })
+    .await?;
+    let started = std::time::Instant::now();
+    let resp = Http::new()
+        .get(format!("http://{}/v1/jobs", broker.addr))
+        .bearer_auth(TOKEN_A)
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(resp.json::<Value>().await?["code"], "unavailable");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the deadline did not fire"
+    );
     Ok(())
 }

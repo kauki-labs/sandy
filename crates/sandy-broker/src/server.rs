@@ -20,11 +20,10 @@ use tokio::net::UnixStream;
 use crate::{Client, IsolationClass, auth::authenticate, owners::Owners, paths::within_roots};
 
 const MAX_BODY: usize = 1024 * 1024;
-/// How long one control RPC may take, connect included.
-const RPC_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub(crate) struct State {
     pub(crate) control_socket: PathBuf,
+    pub(crate) rpc_deadline: std::time::Duration,
     pub(crate) clients: Vec<Client>,
     pub(crate) owners: Owners,
 }
@@ -123,7 +122,7 @@ type Reply = Result<(StatusCode, Value), ApiError>;
 /// One control-RPC call over a fresh UDS connection. Any transport fault or
 /// `ControlError` becomes `unavailable`: sandyd's own message is not relayed.
 async fn rpc(state: &State, op: control_request::Op) -> Result<control_response::Result, ApiError> {
-    tokio::time::timeout(RPC_DEADLINE, rpc_inner(state, op))
+    tokio::time::timeout(state.rpc_deadline, rpc_inner(state, op))
         .await
         .unwrap_or_else(|_| {
             tracing::warn!("control call timed out");
