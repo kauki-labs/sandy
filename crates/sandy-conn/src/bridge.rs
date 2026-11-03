@@ -289,13 +289,21 @@ mod tests {
         Ok((addr, accepted))
     }
 
-    /// True when the peer has already closed: a non-blocking read sees EOF without waiting. Used right after
-    /// `shutdown().await`, where "eventually closed" is not good enough.
+    /// True when the peer closed within 100 ms: non-blocking reads see EOF without any await. Used right after
+    /// `shutdown().await`, where "eventually closed" (the 5 s `closed_unanswered`) is not good enough. Linux
+    /// loopback delivers the FIN inside `close()`, so the first read already sees it; macOS delivers it a moment
+    /// later, hence the short bound instead of a single read.
     fn already_closed(client: TcpStream) -> anyhow::Result<bool> {
         let client = client.into_std()?;
         client.set_nonblocking(true)?;
         let mut buf = [0u8; 1];
-        Ok(matches!(std::io::Read::read(&mut &client, &mut buf), Ok(0)))
+        for _ in 0..10 {
+            if matches!(std::io::Read::read(&mut &client, &mut buf), Ok(0)) {
+                return Ok(true);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(false)
     }
 
     /// Dials a TCP address, after failing `failures` times first, and counts every attempt.
