@@ -3,8 +3,8 @@
 //! - [`UnixDialer`] connects to a unix socket. vfkit exposes a guest vsock port to the host as one: the
 //!   `virtio-vsock,port=P,socketURL=<path>,connect` device makes vfkit own the socket, so the path exists from the
 //!   moment vfkit runs, and a connect succeeds before the guest listens. The bridge's ready byte covers that gap.
-//! - `VsockDialer` (Linux only) connects to `<guest CID>:<port>` over vhost-vsock, which is how qemu's host reaches
-//!   a guest.
+//! - `VsockDialer` (Linux only) connects to `<guest CID>:<port>` over vhost-vsock, which is how qemu's host reaches a
+//!   guest.
 //!
 //! Neither opens a stream the bridge trusts until the relay has announced readiness (see [`crate::bridge`]).
 
@@ -139,7 +139,10 @@ mod tests {
 
         let bridge = Bridge::start(UnixDialer::new(&path), config(0)).await?;
         let mut client = TcpStream::connect(bridge.addr()).await?;
-        assert!(echoes(&mut client, b"ping").await, "the echo must come back through the unix socket");
+        assert!(
+            echoes(&mut client, b"ping").await,
+            "the echo must come back through the unix socket"
+        );
         Ok(())
     }
 
@@ -156,7 +159,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         serve_relay(UnixListener::bind(&path).context("bind relay socket late")?);
 
-        assert!(echoes(&mut client, b"late").await, "the client waiting in its window is served");
+        assert!(
+            echoes(&mut client, b"late").await,
+            "the client waiting in its window is served"
+        );
         Ok(())
     }
 
@@ -170,11 +176,17 @@ mod tests {
         let mut first = TcpStream::connect(bridge.addr()).await?;
         let mut byte = [0u8; 1];
         let closed = timeout(WAIT, first.read(&mut byte)).await.context("read timed out")?;
-        assert!(matches!(closed, Ok(0) | Err(_)), "a missing socket must close the client, got {closed:?}");
+        assert!(
+            matches!(closed, Ok(0) | Err(_)),
+            "a missing socket must close the client, got {closed:?}"
+        );
 
         serve_relay(UnixListener::bind(&path).context("bind relay socket")?);
         let mut second = TcpStream::connect(bridge.addr()).await?;
-        assert!(echoes(&mut second, b"ok").await, "the bridge serves once the socket exists");
+        assert!(
+            echoes(&mut second, b"ok").await,
+            "the bridge serves once the socket exists"
+        );
         Ok(())
     }
 
