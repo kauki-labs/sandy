@@ -38,6 +38,13 @@ pub const AGENT_VSOCK_PORT: u32 = 5_000;
 /// cap first, only after this byte arrives.
 pub const AGENT_LINK_READY: u8 = b'S';
 
+/// The vsock port `sandy-agent port-relay` listens on in a guest (#590): one service relay per environment. The host
+/// bridge reaches it as `<guest CID>:5100` over vhost-vsock on qemu, and through a
+/// `virtio-vsock,port=5100,socketURL=<path>,connect` device declared before boot on vfkit. A vsock port is per guest,
+/// so one fixed number serves every environment. It differs from [`AGENT_VSOCK_PORT`] (5000) and the egress proxy's
+/// port (5001).
+pub const PORT_RELAY_VSOCK_PORT: u32 = 5_100;
+
 /// The byte `sandy-agent port-relay` writes to the host once it has connected to the guest service (#590).
 /// A hypervisor's vsock proxy (vfkit) accepts the host's socket before it dials the guest, and the relay accepts
 /// the host's vsock connection before it dials the service, so a connected socket proves neither. The host bridge
@@ -106,6 +113,21 @@ mod tests {
     use std::sync::mpsc::RecvError;
 
     use super::*;
+
+    /// A vsock port is per guest, so the service relay needs one number, but it must not collide with the other
+    /// ports the host and guest agree on: the agent link (5000) and the egress proxy (5001).
+    #[test]
+    fn the_service_relay_port_collides_with_no_other_guest_port() {
+        assert_eq!(PORT_RELAY_VSOCK_PORT, 5_100);
+        for other in [AGENT_VSOCK_PORT, 5_001] {
+            assert_ne!(PORT_RELAY_VSOCK_PORT, other);
+        }
+        assert_ne!(
+            PORT_RELAY_VSOCK_PORT,
+            u32::MAX,
+            "u32::MAX is VMADDR_PORT_ANY, not a port"
+        );
+    }
 
     #[test]
     fn a_report_reaches_the_backend_once() {
