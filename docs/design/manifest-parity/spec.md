@@ -101,6 +101,8 @@ is `agent`.
 
 ## Out of scope
 
+- The `service` field (#589): a declared long-running service with a health probe is specified in
+  `docs/decisions/run-plane.md` §5, not here.
 - Moving the CLI verbs (`ls`, `wait`, `kill`, `gc`) and unifying job ids. Those are the later
   steps of #221 and depend on this work.
 - The egress proxy itself (#401 to #408). This spec only needs a field to carry the policy.
