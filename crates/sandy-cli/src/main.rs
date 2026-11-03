@@ -17,8 +17,8 @@ use sandy_cli::{
     app_register::{self, Owner},
     doctor,
     output::{
-        AttachedChannel, CancelledJob, JobRecords, JobStatusReport, JobSummaries, MeshFingerprint, OutputFormat,
-        Render, SubmittedJob, emit,
+        AttachEvent, AttachedChannel, CancelledJob, JobRecords, JobStatusReport, JobSummaries, MeshFingerprint,
+        OutputFormat, Render, SubmittedJob, emit,
     },
     plan::{JobPlan, RunArgs, parse_run},
     supervisor,
@@ -1130,25 +1130,37 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
         Some(control_response::Result::Cancel(_)) => {
             succeed_or(emit(&CancelledJob::new(cancel_echo.as_deref().unwrap_or("?")), output))
         }
-        // `-o json` keeps today's one-shot machine path (print the channel id
-        // + cap, exit) — an automation caller wants the cap's bytes, not a
-        // terminal bridge. Plain (the default, every sandbox attachable, no
-        // flag) redeems the cap on `sandyd`'s separate attach data-plane
-        // socket instead (#327) and goes interactive.
-        Some(control_response::Result::Attach(r)) if output == OutputFormat::Json => {
-            succeed_or(emit(&AttachedChannel::from(&r), output))
-        }
+        // Both formats redeem the cap on `sandyd`'s separate attach data-plane
+        // socket (#327) and go interactive. `-o json` (#513, owner decision on
+        // #564) wraps the console in an NDJSON stream whose first line is the
+        // cap, written before the join so cap retrieval does not depend on the
+        // job being joinable; every later failure still ends it with `exit`.
         Some(control_response::Result::Attach(r)) => {
+            let json = output == OutputFormat::Json;
+            if json {
+                emit_attach_line(&AttachEvent::Attached(AttachedChannel::from(&r)));
+            }
+            let fault = |message: String, code: ProcessExit| {
+                eprintln!("sandy: {message}");
+                if json {
+                    emit_attach_line(&AttachEvent::Exit {
+                        reason: format!("fault:{message}"),
+                    });
+                }
+                code.code()
+            };
             let job_id = attach_job_id.unwrap_or_default();
             let attach_sock = sandy_control_proto::attach_socket_path(&socket);
             let data_stream = match tokio::net::UnixStream::connect(&attach_sock).await {
                 Ok(data_stream) => data_stream,
                 Err(e) => {
-                    eprintln!(
-                        "sandy: could not connect to the attach data plane at {}: {e}",
-                        attach_sock.display()
+                    return fault(
+                        format!(
+                            "could not connect to the attach data plane at {}: {e}",
+                            attach_sock.display()
+                        ),
+                        ProcessExit::InfraFault,
                     );
-                    return ProcessExit::InfraFault.code();
                 }
             };
             let (mut data_rd, mut data_wr) = tokio::io::split(data_stream);
@@ -1160,22 +1172,24 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
                 rows,
             };
             if let Err(e) = sandy_fabric_local::link::write_frame(&mut data_wr, &join).await {
-                eprintln!("sandy: could not present the attach cap: {e}");
-                return ProcessExit::InfraFault.code();
+                return fault(
+                    format!("could not present the attach cap: {e}"),
+                    ProcessExit::InfraFault,
+                );
             }
             match sandy_fabric_local::link::read_frame(&mut data_rd).await {
                 Ok(Some(sandy_fabric_local::link::LinkFrame::Joined { .. })) => {}
                 Ok(Some(sandy_fabric_local::link::LinkFrame::Refused { reason })) => {
-                    eprintln!("sandy: attach refused: {reason}");
-                    return ProcessExit::InvalidPlan.code();
+                    return fault(format!("attach refused: {reason}"), ProcessExit::InvalidPlan);
                 }
                 Ok(other) => {
-                    eprintln!("sandy: attach: unexpected handshake response: {other:?}");
-                    return ProcessExit::InfraFault.code();
+                    return fault(
+                        format!("attach: unexpected handshake response: {other:?}"),
+                        ProcessExit::InfraFault,
+                    );
                 }
                 Err(e) => {
-                    eprintln!("sandy: attach: handshake failed: {e}");
-                    return ProcessExit::InfraFault.code();
+                    return fault(format!("attach: handshake failed: {e}"), ProcessExit::InfraFault);
                 }
             }
 
@@ -1184,7 +1198,7 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
             // the data plane (above) carries the bridge.
             let status_watch =
                 sandy_cli::attach::spawn_status_watch(stream, job_id.clone(), ATTACH_STATUS_POLL_INTERVAL);
-            match sandy_cli::attach::run_interactive(data_rd, data_wr, Some(status_watch)).await {
+            match sandy_cli::attach::run_interactive(data_rd, data_wr, Some(status_watch), output).await {
                 Ok(archive) => {
                     if let Some(archive) = archive {
                         sandy_cli::attach::write_archive(&job_id, &archive);
@@ -1508,6 +1522,13 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
             Err(e) => report_error(&e),
         },
     }
+}
+
+/// Writes one line of `daemon attach -o json`'s NDJSON stream (#513). A failed
+/// stdout write here has nowhere to go, so it is dropped: the bridge's own
+/// writes surface it.
+fn emit_attach_line(event: &AttachEvent) {
+    let _ = sandy_cli::output::emit_stream_to([event.clone()], OutputFormat::Json, &mut std::io::stdout().lock());
 }
 
 /// Map an [`emit`] result to a process band: success (band 0) or

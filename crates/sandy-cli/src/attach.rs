@@ -30,6 +30,8 @@ use sandy_fabric_local::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 
+use crate::output::{AttachEvent, OutputFormat};
+
 /// The largest chunk read from local stdin per posted frame.
 const STDIN_CHUNK: usize = 4096;
 
@@ -94,17 +96,14 @@ pub fn read_attach_token(job_id: &str) -> Option<Vec<u8>> {
 /// outputs, sourced here from the one built-in transcript rather than a
 /// generic outputs directory (epic #340 phase 3). Best-effort: a write
 /// failure is reported but never turns an otherwise-successful attach into
-/// a failing command — the job already ran to completion.
-#[allow(
-    clippy::print_stdout,
-    reason = "attach's own output migration is tracked in a follow-up item (#513)"
-)]
+/// a failing command — the job already ran to completion. The report goes
+/// to stderr so it never lands inside an `-o json` NDJSON stream (#513).
 pub fn write_archive(job_id: &str, archive: &ArchivePayload) {
     match create_archive_file(std::path::Path::new("."), job_id) {
         Ok((mut file, path)) => {
             use std::io::Write as _;
             match file.write_all(&archive.bytes) {
-                Ok(()) => println!(
+                Ok(()) => eprintln!(
                     "sandy: wrote {} bytes of archived transcript ({}) to {}",
                     archive.bytes.len(),
                     archive.content_type,
@@ -373,12 +372,18 @@ pub struct ArchivePayload {
 /// `status_watch` reports the job reached a terminal state. Returns any
 /// `Archive` frame the daemon delivered along the way.
 ///
+/// With `format` [`OutputFormat::Json`] stdout carries NDJSON instead of raw
+/// bytes: one `output` line per chunk, `exit` last (#513). The caller writes
+/// the `attached` line before the join. Stdin forwarding and raw mode do not
+/// change.
+///
 /// # Errors
 /// An I/O fault reading or writing the connection or the local terminal.
 pub async fn run_interactive<R, W>(
     read_half: R,
     write_half: W,
     status_watch: Option<tokio::sync::oneshot::Receiver<String>>,
+    format: OutputFormat,
 ) -> std::io::Result<Option<ArchivePayload>>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -391,6 +396,8 @@ where
         status_watch,
         spawn_stdin_reader(),
         spawn_resize_watcher(),
+        format,
+        tokio::io::stdout(),
     )
     .await
 }
@@ -482,16 +489,23 @@ async fn drain_for_archive(
 /// test can drive it with synthetic chunks (`tokio::io::duplex` standing in
 /// for the connection) without a tty. Split out for exactly that reason;
 /// production code has only the one caller above.
-async fn run_interactive_inner<R, W>(
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the test seams (feeds, sink) sit beside the connection halves"
+)]
+async fn run_interactive_inner<R, W, O>(
     read_half: R,
     write_half: W,
     mut status_watch: Option<tokio::sync::oneshot::Receiver<String>>,
     mut stdin_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     mut resize_rx: tokio::sync::mpsc::Receiver<(u16, u16)>,
+    format: OutputFormat,
+    mut stdout: O,
 ) -> std::io::Result<Option<ArchivePayload>>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
+    O: AsyncWrite + Unpin,
 {
     let mut frame_rx = spawn_frame_reader(read_half);
     let write_half = std::sync::Arc::new(tokio::sync::Mutex::new(write_half));
@@ -557,34 +571,36 @@ where
         })
     };
 
-    let mut stdout = tokio::io::stdout();
     let mut archive = None;
     let result = loop {
         let delivered = if let Some(watch) = status_watch.as_mut() {
             tokio::select! {
                 frame = frame_rx.recv() => frame.unwrap_or(Ok(None)),
                 status = watch => {
-                    if let Ok(status) = status {
+                    let reason = if let Ok(status) = status {
                         print_status(&format!("sandy: job reached a terminal state ({status}); detaching"));
-                    }
+                        format!("job_terminal:{status}")
+                    } else {
+                        "closed".to_owned()
+                    };
                     // The status poll and the agent's own Archive send are
                     // two independent races (CodeRabbit finding on this PR)
                     // — "terminal state observed" doesn't guarantee the
                     // transcript already arrived on the data plane. Give it
                     // a short bounded window before giving up on it.
                     drain_for_archive(&mut frame_rx, &mut archive).await;
-                    break Ok(());
+                    break Ok(reason);
                 }
                 // A manual detach ends the bridge immediately, with no
                 // archive drain: the job is still running (detaching never
                 // touches it), so there is no trailing transcript to wait
                 // for yet.
-                () = detach.notified() => break Ok(()),
+                () = detach.notified() => break Ok("detached".to_owned()),
             }
         } else {
             tokio::select! {
                 frame = frame_rx.recv() => frame.unwrap_or(Ok(None)),
-                () = detach.notified() => break Ok(()),
+                () = detach.notified() => break Ok("detached".to_owned()),
             }
         };
         match delivered {
@@ -594,7 +610,11 @@ where
                 let Ok(bytes) = hex::decode(&payload) else {
                     break Err(std::io::Error::other("delivered frame payload was not valid hex"));
                 };
-                if let Err(e) = stdout.write_all(&bytes).await {
+                let written = match format {
+                    OutputFormat::Plain => stdout.write_all(&bytes).await,
+                    OutputFormat::Json => write_event(&mut stdout, &AttachEvent::output(&bytes)).await,
+                };
+                if let Err(e) = written {
                     break Err(e);
                 }
                 if let Err(e) = stdout.flush().await {
@@ -616,14 +636,30 @@ where
                 // not fatal to an otherwise-working bridge either.
                 print_status("sandy: attach: unexpected frame from the daemon");
             }
-            Ok(None) => break Ok(()), // clean close
+            Ok(None) => break Ok("closed".to_owned()), // clean close
             Err(e) => break Err(std::io::Error::other(e)),
         }
     };
 
     stdin_task.abort();
     resize_task.abort();
-    result.map(|()| archive)
+    if format == OutputFormat::Json {
+        // The stream always ends with an `exit` line, a fault included; a failed write here has nowhere to go.
+        let reason = match &result {
+            Ok(reason) => reason.clone(),
+            Err(e) => format!("fault:{e}"),
+        };
+        let _ = write_event(&mut stdout, &AttachEvent::Exit { reason }).await;
+        let _ = stdout.flush().await;
+    }
+    result.map(|_| archive)
+}
+
+/// Writes `event` as one compact NDJSON line (not flushed: the caller flushes).
+async fn write_event<O: AsyncWrite + Unpin>(out: &mut O, event: &AttachEvent) -> std::io::Result<()> {
+    let mut line = serde_json::to_vec(event).map_err(std::io::Error::other)?;
+    line.push(b'\n');
+    out.write_all(&line).await
 }
 
 /// Poll `job_id`'s status on `control_connection` (the control-RPC connection
@@ -785,6 +821,100 @@ mod tests {
         rx
     }
 
+    /// Runs the bridge over in-memory halves: `frames` arrive on the connection, then it closes (or `stdin`
+    /// feeds `~.` first). Returns everything written to the bridge's stdout sink.
+    async fn bridge_stdout(format: OutputFormat, frames: Vec<LinkFrame>, detach: bool) -> anyhow::Result<Vec<u8>> {
+        let (conn_read, mut conn_read_peer) = tokio::io::duplex(65536);
+        let (conn_write, _conn_write_peer) = tokio::io::duplex(65536);
+        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::channel(8);
+        let (out_w, mut out_r) = tokio::io::duplex(65536);
+        for frame in &frames {
+            write_frame(&mut conn_read_peer, frame).await.context("queue a frame")?;
+        }
+        let task = tokio::spawn(run_interactive_inner(
+            conn_read,
+            conn_write,
+            None,
+            stdin_rx,
+            no_resize_feed(),
+            format,
+            out_w,
+        ));
+        if detach {
+            stdin_tx.send(b"~.".to_vec()).await.context("feed ~.")?;
+        } else {
+            drop(conn_read_peer); // clean close ends the bridge
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .context("the bridge did not end")?
+            .context("the bridge task panicked")?
+            .context("the bridge returned an error")?;
+        let mut out = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut out_r, &mut out)
+            .await
+            .context("read the sink")?;
+        Ok(out)
+    }
+
+    fn deliver(content_type: &str, bytes: &[u8]) -> LinkFrame {
+        LinkFrame::Deliver {
+            content_type: content_type.to_owned(),
+            payload: hex::encode(bytes),
+            channel: None,
+        }
+    }
+
+    /// #513: `-o json` turns every delivered chunk into one tagged line and ends with an `exit` line. A chunk
+    /// that is not valid UTF-8 survives byte for byte, stdout and stderr chunks both arrive.
+    #[tokio::test]
+    async fn json_mode_streams_one_tagged_line_per_chunk_and_ends_with_exit() -> anyhow::Result<()> {
+        let out = bridge_stdout(
+            OutputFormat::Json,
+            vec![deliver(TTY_STDOUT, b"hi \xff\xfe"), deliver(TTY_STDERR, b"warn\n")],
+            false,
+        )
+        .await?;
+
+        let events = String::from_utf8(out)
+            .context("NDJSON is UTF-8")?
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<AttachEvent>(line).with_context(|| format!("line {line:?} parses alone"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        assert_eq!(
+            events,
+            vec![
+                AttachEvent::output(b"hi \xff\xfe"),
+                AttachEvent::output(b"warn\n"),
+                AttachEvent::Exit {
+                    reason: "closed".to_owned()
+                },
+            ]
+        );
+        Ok(())
+    }
+
+    /// #513: a manual detach still ends the stream with an `exit` line, and no raw byte reaches stdout.
+    #[tokio::test]
+    async fn json_mode_ends_with_exit_detached_on_a_manual_detach() -> anyhow::Result<()> {
+        let out = bridge_stdout(OutputFormat::Json, vec![], true).await?;
+        assert_eq!(
+            String::from_utf8(out).context("NDJSON is UTF-8")?,
+            "{\"type\":\"exit\",\"reason\":\"detached\"}\n"
+        );
+        Ok(())
+    }
+
+    /// Regression: `plain` stays raw bytes, byte-identical to before #513.
+    #[tokio::test]
+    async fn plain_mode_still_writes_raw_bytes() -> anyhow::Result<()> {
+        let out = bridge_stdout(OutputFormat::Plain, vec![deliver(TTY_STDOUT, b"hi \xff")], false).await?;
+        assert_eq!(out, b"hi \xff");
+        Ok(())
+    }
+
     /// Epic #340 phase 3: a real Ctrl-D now reaches the guest (real EOF for
     /// shells and TUIs), so it must NOT detach by itself — only the ssh-style
     /// `~.` sequence, right after a newline, does.
@@ -800,6 +930,8 @@ mod tests {
             None,
             stdin_rx,
             no_resize_feed(),
+            OutputFormat::Plain,
+            tokio::io::stdout(),
         ));
         // Session start counts as "just after a newline" — detach fires
         // without needing a real newline byte first.
@@ -834,6 +966,8 @@ mod tests {
             None,
             stdin_rx,
             no_resize_feed(),
+            OutputFormat::Plain,
+            tokio::io::stdout(),
         ));
 
         let still_running = tokio::time::timeout(std::time::Duration::from_millis(200), &mut task).await;
@@ -870,6 +1004,8 @@ mod tests {
             Some(status_rx),
             stdin_rx,
             no_resize_feed(),
+            OutputFormat::Plain,
+            tokio::io::stdout(),
         ));
 
         status_tx
@@ -929,6 +1065,8 @@ mod tests {
             Some(status_rx),
             stdin_rx,
             no_resize_feed(),
+            OutputFormat::Plain,
+            tokio::io::stdout(),
         ));
 
         // Build the Archive frame's raw wire bytes by hand (length prefix +

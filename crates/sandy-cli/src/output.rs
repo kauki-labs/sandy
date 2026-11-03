@@ -383,6 +383,52 @@ impl Render for AttachedChannel {
     }
 }
 
+/// One line of `daemon attach -o json`'s NDJSON stream (#513, owner decision on #564): `attached` first, carrying
+/// the join cap, then one `output` per delivered chunk, then `exit` last. The attach stays interactive, so stdin
+/// forwarding and raw mode are the same as `plain`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AttachEvent {
+    /// The channel and cap, before any job output.
+    Attached(AttachedChannel),
+    /// One chunk of the job's console output, base64 (standard alphabet): a chunk may split a UTF-8 sequence, and
+    /// the job's stdout and stderr arrive merged on one stream.
+    Output {
+        /// The chunk's bytes, base64.
+        data: String,
+    },
+    /// The stream's last line. `reason` is `detached`, `closed`, `job_terminal:<STATUS>` or `fault:<message>`.
+    Exit {
+        /// Why the bridge ended.
+        reason: String,
+    },
+}
+
+/// `plain` is only a fallback for the stream writer: the interactive attach writes raw bytes itself.
+impl Render for AttachEvent {
+    fn render_plain(&self, out: &mut dyn io::Write) -> io::Result<()> {
+        match self {
+            Self::Attached(channel) => channel.render_plain(out),
+            Self::Output { data } => out.write_all(
+                &base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .map_err(io::Error::other)?,
+            ),
+            Self::Exit { reason } => write!(out, "exit: {reason}"),
+        }
+    }
+}
+
+impl AttachEvent {
+    /// An `output` event for one delivered chunk.
+    #[must_use]
+    pub fn output(bytes: &[u8]) -> Self {
+        Self::Output {
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        }
+    }
+}
+
 /// `daemon status`'s result: the job id, its lifecycle state, and (once terminal) the exit code and console
 /// tail.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
