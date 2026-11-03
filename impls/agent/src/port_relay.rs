@@ -12,37 +12,119 @@
     allow(dead_code, reason = "the relay runs only in a Linux guest; tests drive the seam")
 )]
 
-use std::{ffi::OsString, net::SocketAddr};
+use std::{
+    ffi::OsString,
+    io,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    time::Duration,
+};
 
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, copy_bidirectional},
+    net::TcpStream,
+};
 
-use crate::link_source::Acceptor;
+use crate::link_source::{Acceptor, HOST_CID};
 
-/// Parse `--vsock-port PORT --to ADDR` (the arguments after `port-relay`).
-pub fn parse_args(_args: &[OsString]) -> Result<(u32, SocketAddr), String> {
-    Err("not implemented".to_string())
+const USAGE: &str = "usage: sandy-agent port-relay --vsock-port PORT --to 127.0.0.1:PORT";
+
+/// Parse `--vsock-port PORT --to ADDR` (the arguments after `port-relay`). The target must be an IPv4 loopback
+/// address with a real port: the relay never forwards off the guest's loopback.
+pub fn parse_args(args: &[OsString]) -> Result<(u32, SocketAddr), String> {
+    let [port_flag, port, to_flag, target] = args else {
+        return Err(USAGE.to_string());
+    };
+    if port_flag != "--vsock-port" || to_flag != "--to" {
+        return Err(USAGE.to_string());
+    }
+    // u32::MAX is VMADDR_PORT_ANY: the kernel would bind some other port, and the host could never reach the relay.
+    let port = port
+        .to_str()
+        .and_then(|p| p.parse::<u32>().ok())
+        .filter(|&p| p != u32::MAX)
+        .ok_or_else(|| format!("--vsock-port needs a port number below {}; {USAGE}", u32::MAX))?;
+    let target = target
+        .to_str()
+        .and_then(|t| t.parse::<SocketAddr>().ok())
+        .filter(|t| t.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST) && t.port() != 0)
+        .ok_or_else(|| format!("--to needs a 127.0.0.1 address with a port; {USAGE}"))?;
+    Ok((port, target))
 }
 
 /// Accept connections on `acceptor` and relay each host connection to `target`. Runs until its task is dropped.
-pub async fn serve<A>(_acceptor: A, _target: SocketAddr)
+///
+/// A peer that is not the host is closed at once and the target is never dialed for it, so a guest-local process
+/// on vsock loopback cannot use the relay. Each connection runs in its own task, so a long-lived one (a websocket)
+/// does not block the next.
+pub async fn serve<A>(mut acceptor: A, target: SocketAddr)
 where
     A: Acceptor + Send + 'static,
     A::Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    loop {
+        match acceptor.accept().await {
+            Ok((stream, HOST_CID)) => {
+                tokio::spawn(relay_one(stream, target));
+            }
+            Ok((stream, cid)) => {
+                drop(stream);
+                eprintln!(
+                    "sandy-agent: port-relay refused a connection from vsock cid {cid}; only the host may connect"
+                );
+            }
+            Err(e) => {
+                // EMFILE and friends are not a listener failure: stop serving and every tunnel dies with it.
+                eprintln!("sandy-agent: port-relay accept failed: {e}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
 }
 
-/// The `port-relay` entry point: bind the vsock listener, then relay until killed.
+/// Relay one host connection. A target that is down closes this connection only.
+async fn relay_one<S>(mut host: S, target: SocketAddr)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut service = match TcpStream::connect(target).await {
+        Ok(service) => service,
+        Err(e) => {
+            eprintln!("sandy-agent: port-relay cannot reach {target}: {e}");
+            return;
+        }
+    };
+    // Copies both ways, and half-closes the far side when one side reaches EOF.
+    if let Err(e) = copy_bidirectional(&mut host, &mut service).await
+        && e.kind() != io::ErrorKind::ConnectionReset
+    {
+        eprintln!("sandy-agent: port-relay connection ended: {e}");
+    }
+}
+
+/// The `port-relay` entry point: bind the vsock listener, then relay until killed. A usage or bind failure aborts
+/// like any agent-internal failure, so the backend reports an infra fault.
 #[cfg(target_os = "linux")]
 pub fn cli(args: &[OsString]) -> std::process::ExitCode {
-    let _ = parse_args(args);
-    crate::fail("port-relay is not implemented")
+    let (port, target) = parse_args(args).unwrap_or_else(|usage| crate::fail(&usage));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|e| crate::fail(&format!("starting the runtime: {e}")));
+    runtime.block_on(async {
+        let acceptor = crate::link_source::VsockAcceptor::bind(port)
+            .unwrap_or_else(|e| crate::fail(&format!("binding vsock port {port} for the port relay: {e}")));
+        serve(acceptor, target).await;
+    });
+    std::process::ExitCode::SUCCESS
 }
 
 /// vsock exists only inside a Linux guest.
 #[cfg(not(target_os = "linux"))]
 pub fn cli(args: &[OsString]) -> std::process::ExitCode {
-    let _ = parse_args(args);
-    crate::fail("port-relay: vsock is only available inside a Linux guest")
+    let (port, _target) = parse_args(args).unwrap_or_else(|usage| crate::fail(&usage));
+    crate::fail(&format!(
+        "port-relay --vsock-port {port}: vsock is only available inside a Linux guest"
+    ))
 }
 
 #[cfg(test)]

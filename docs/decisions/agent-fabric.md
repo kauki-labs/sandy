@@ -424,6 +424,17 @@ demonstrated for the process backend; it is deferred to the VM-backed
 - Wiring `sandy_api::console::Transport` into `RawConsole` now: no VM-backed agent
   exists yet to wire it to.
 
+### 10a. The guest port relay (#590)
+
+`sandy-agent port-relay --vsock-port P --to 127.0.0.1:T` is the guest half of the host-side bridge to a guest
+service port (for example `t3 serve`, which listens on guest loopback only). It listens on vsock port `P`, admits
+only the host (CID 2, the same check as the agent link), and splices each connection to `127.0.0.1:T`. It parses
+nothing, so a service that holds a long-lived connection (a websocket) works, and TLS and auth stay with the host
+half. A peer that is not the host is closed without a dial, a dead service closes that one connection, and the
+target must be an IPv4 loopback address, so the relay cannot forward off the guest. The service kind (#589) starts
+it. The host half (a loopback listener that dials `CID:P` on qemu, or a `virtio-vsock,port=P,...,connect` device
+declared at launch on vfkit) is a later slice of #590.
+
 ## 11. Channel roles are thin wrappers; `EscalationSink` is a new seam
 
 **Status:** accepted.
