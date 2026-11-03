@@ -211,9 +211,8 @@
       checks.x86_64-linux.t3-guest-packages =
         let
           pkgs = nixpkgs.legacyPackages.x86_64-linux;
-          names = map (
-            p: p.name
-          ) self.nixosConfigurations.sandy-guest-qemu-t3.config.environment.systemPackages;
+          config = self.nixosConfigurations.sandy-guest-qemu-t3.config;
+          names = map (p: p.name) config.environment.systemPackages;
           wanted = [
             "t3code-0.1.2"
             "sandy-t3-ready"
@@ -221,7 +220,56 @@
           missing = builtins.filter (w: !(builtins.elem w names)) wanted;
         in
         assert missing == [ ] || throw "the t3 guest image lacks: ${builtins.toString missing}";
+        # A caller that omits `--mem` gets the topology's value, so the image must carry enough for electron-built
+        # t3, node and two harnesses.
+        assert
+          config.microvm.mem >= 2048 || throw "the t3 guest boots with ${toString config.microvm.mem} MiB";
         pkgs.runCommand "t3-guest-packages" { } "touch $out";
+
+      # The readiness probe's behaviour against a throwaway local HTTP server (#608): any status below 500 means the
+      # server answers (t3 answers 503 while it starts, and 401 once auth is on), 5xx and a closed port do not, and a
+      # port argument that is not digits is refused.
+      checks.x86_64-linux.t3-ready-probe =
+        let
+          pkgs = nixpkgs.legacyPackages.x86_64-linux;
+        in
+        pkgs.runCommand "t3-ready-probe"
+          {
+            nativeBuildInputs = [
+              pkgs.python3
+              (readyProbe pkgs)
+            ];
+          }
+          ''
+            cat > server.py <<'PY'
+            import http.server, sys
+            code, port = int(sys.argv[1]), int(sys.argv[2])
+            class H(http.server.BaseHTTPRequestHandler):
+                def do_GET(self):
+                    self.send_response(code)
+                    self.end_headers()
+                def log_message(self, *args):
+                    pass
+            http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()
+            PY
+            expect() { # expect <want: ok|fail> <label> <probe args...>
+              want=$1; label=$2; shift 2
+              if sandy-t3-ready "$@" 2>/dev/null; then got=ok; else got=fail; fi
+              [ "$got" = "$want" ] || { echo "$label: wanted $want, got $got" >&2; exit 1; }
+            }
+            n=0
+            for case in 200:ok 302:ok 401:ok 503:fail 500:fail; do
+              code=''${case%%:*}; want=''${case##*:}; port=$((18700 + n)); n=$((n + 1))
+              python3 server.py "$code" "$port" & pid=$!
+              for _ in $(seq 50); do (echo > /dev/tcp/127.0.0.1/$port) 2>/dev/null && break; sleep 0.1; done
+              expect "$want" "status $code" "$port"
+              kill "$pid"; wait "$pid" 2>/dev/null || true
+            done
+            expect fail "nothing listening" 18799
+            expect fail "port with userinfo" "18700@otherhost"
+            expect fail "port with a command" "18700; true"
+            touch $out
+          '';
 
       # sandy's `Topology` per guest: `nix eval --json <flake>#topologies.<sys>.<hv>`.
       topologies = {
