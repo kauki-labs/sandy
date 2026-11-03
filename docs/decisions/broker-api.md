@@ -113,7 +113,7 @@ user's files. Tracked in a follow-up issue.
 
 **Decision.**
 
-- Spawn, get, list, stop, resume, cancel and delete each make one control RPC with the typed
+- Spawn, get, stop, resume, cancel and delete each make one control RPC with the typed
   messages. The broker never forwards client JSON bytes: sandyd compares the create spec
   byte for byte, so the broker builds the message.
 - sandyd keys idempotency over all callers. The broker sends `idempotency_key` as a 16-digit
@@ -127,6 +127,11 @@ user's files. Tracked in a follow-up issue.
   non-terminal environments. A replay of a request id the client already used skips the check only while sandyd still
   holds that environment: the broker asks sandyd (`GetEnvironment`), and if retention has
   collected it (`NOT_FOUND`) the replay would create a new environment, so both checks run.
+  The sweep can also collect the row between that lookup and the create. When a replay
+  that skipped the checks gets back an id other than the recorded one, the broker runs both
+  checks then; over quota, it deletes the new environment, does not record it, and answers
+  `quota_exceeded`. A replay that returns the recorded id, even a deleted one inside the
+  window, is never checked.
   Creates of one client run one at a time, so the check and the create cannot race, and one
   client cannot hold up another.
 - sandyd's `EnvironmentError` codes map to fixed messages: `NOT_FOUND` 404 `not_found`,
