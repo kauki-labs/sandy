@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use sandy_api::agent::SERVICE_ENV;
-use sandy_guest_template::manifest::{HealthProbe, ProbeCheck, ServiceSpec, validate_service_spec};
+use sandy_guest_template::manifest::{HealthProbe, ProbeCheck, RestartPolicy, ServiceSpec, validate_service_spec};
 use tokio::{io::AsyncReadExt, net::TcpStream, process::Command};
 
 /// The service this agent supervises, from [`SERVICE_ENV`]. `None` for a plain job.
@@ -29,6 +29,12 @@ fn parse(json: &str) -> Result<ServiceSpec, String> {
     let spec: ServiceSpec =
         serde_json::from_str(json).map_err(|e| format!("{SERVICE_ENV} is not a service spec: {e}"))?;
     validate_service_spec(&spec).map_err(|e| format!("{SERVICE_ENV} is not a runnable service spec: {e}"))?;
+    if spec.restart != RestartPolicy::Never {
+        return Err(format!(
+            "{SERVICE_ENV}: restart policy {:?} is not implemented; refused rather than ignored",
+            spec.restart
+        ));
+    }
     Ok(spec)
 }
 
@@ -49,52 +55,95 @@ pub enum ProbeVerdict {
 
 /// The account database the agent resolves a service's `user` against.
 pub const PASSWD_PATH: &str = "/etc/passwd";
+/// The group database, read for the groups that mean root.
+pub const GROUP_PATH: &str = "/etc/group";
 
-/// The uid `user` has in `passwd` (the text of `/etc/passwd`), never 0.
+/// Refuses an account that is root by another name: `user` must exist in `passwd` (the text of `/etc/passwd`),
+/// resolve to a uid and a primary gid other than 0, and not be a member of a group with gid 0 or of `wheel`
+/// (the text of `/etc/group`).
 ///
-/// The manifest names an account, and another account can share uid 0 (`toor`): the name is only checked
-/// for shape at decode, so the uid it resolves to is checked here, in the guest, where the account database is.
+/// The manifest names an account and only its shape is checked at decode: another account can share uid 0
+/// (`toor`), have gid 0, or sit in `wheel` (passwordless sudo on many images). The guest is where the account
+/// database is, so the check is here.
 ///
 /// # Errors
-/// `user` is absent, its entry is malformed, or it resolves to uid 0.
-pub fn resolve_uid(passwd: &str, user: &str) -> Result<u32, String> {
+/// `user` is absent, its entry is malformed, or it is root by uid, primary gid or group membership.
+pub fn check_account(passwd: &str, group: &str, user: &str) -> Result<(), String> {
     let entry = passwd
         .lines()
         .filter(|line| !line.trim_start().starts_with('#'))
         .find(|line| line.split(':').next() == Some(user))
         .ok_or_else(|| format!("no such account {user:?} in {PASSWD_PATH}"))?;
-    let uid = entry
-        .split(':')
-        .nth(2)
-        .and_then(|field| field.parse::<u32>().ok())
-        .ok_or_else(|| format!("the {PASSWD_PATH} entry for {user:?} has no numeric uid"))?;
-    if uid == 0 {
+    let id = |index: usize, what: &str| {
+        entry
+            .split(':')
+            .nth(index)
+            .and_then(|field| field.parse::<u32>().ok())
+            .ok_or_else(|| format!("the {PASSWD_PATH} entry for {user:?} has no numeric {what}"))
+    };
+    if id(2, "uid")? == 0 {
         return Err(format!("account {user:?} has uid 0: a service must not run as root"));
     }
-    Ok(uid)
+    if id(3, "gid")? == 0 {
+        return Err(format!(
+            "account {user:?} has primary gid 0: a service must not run as root"
+        ));
+    }
+    for line in group.lines().filter(|line| !line.trim_start().starts_with('#')) {
+        let mut fields = line.split(':');
+        let (name, gid) = (fields.next().unwrap_or(""), fields.nth(1).unwrap_or(""));
+        let members = fields.next().unwrap_or("");
+        if (gid == "0" || name == "wheel" || name == "root") && members.split(',').any(|member| member == user) {
+            return Err(format!(
+                "account {user:?} is a member of group {name:?}: a service must not run as root"
+            ));
+        }
+    }
+    Ok(())
 }
 
-/// `job` run as `user`: `runuser -u <user> -- <job>`. The agent stays root; only the service drops privilege.
+/// `job` run as `user`, with no way back up: `setpriv --no-new-privs -- runuser -u <user> -- env -u SANDY_SERVICE
+/// -u TMUX <job>`. `no_new_privs` makes setuid wrappers (`sudo`) useless to the service, `runuser` drops the
+/// uid and gids and sets HOME, and the two variables the agent's environment holds are removed (the probe's
+/// own argv in `SANDY_SERVICE`, and the tmux socket of root's session). The agent stays root; only the
+/// service drops privilege.
 #[must_use]
 pub fn as_user(user: &str, job: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
-    let mut argv: Vec<std::ffi::OsString> = vec!["runuser".into(), "-u".into(), user.into(), "--".into()];
+    let mut argv: Vec<std::ffi::OsString> = [
+        "setpriv",
+        "--no-new-privs",
+        "--",
+        "runuser",
+        "-u",
+        user,
+        "--",
+        "env",
+        "-u",
+        SERVICE_ENV,
+        "-u",
+        "TMUX",
+    ]
+    .into_iter()
+    .map(Into::into)
+    .collect();
     argv.extend(job);
     argv
 }
 
-/// The argv the service runs as. When the agent is root (in a guest), the account must resolve to a non-zero
-/// uid and the job runs through `runuser`. When the agent is not root (the process backend on a host) there is
-/// no privilege to drop, so the job runs as the agent's own user: never with more privilege than declared.
+/// The account a service runs as, checked: `Some(user)` when the agent is root (in a guest) and the account
+/// passes [`check_account`], `None` when the agent is not root (the process backend on a host: no privilege to
+/// drop, so the job runs as the agent's own user, never with more than declared).
 ///
 /// # Errors
-/// The agent is root and [`resolve_uid`] refuses the account, or the account database cannot be read.
-pub fn service_argv(user: &str, job: Vec<std::ffi::OsString>) -> Result<Vec<std::ffi::OsString>, String> {
+/// The agent is root and the account is refused, or the account databases cannot be read.
+pub fn service_account(user: &str) -> Result<Option<String>, String> {
     if !rustix::process::geteuid().is_root() {
-        return Ok(job);
+        return Ok(None);
     }
     let passwd = std::fs::read_to_string(PASSWD_PATH).map_err(|e| format!("reading {PASSWD_PATH}: {e}"))?;
-    resolve_uid(&passwd, user)?;
-    Ok(as_user(user, job))
+    let group = std::fs::read_to_string(GROUP_PATH).map_err(|e| format!("reading {GROUP_PATH}: {e}"))?;
+    check_account(&passwd, &group, user)?;
+    Ok(Some(user.to_owned()))
 }
 
 /// The running readiness probe: reports one verdict over the agent link, or is ended by [`Self::finish`].
@@ -104,11 +153,15 @@ pub struct Readiness {
 }
 
 /// Starts `probe` in the background; its verdict goes to the host as `Ready` or `ProbeFailed`.
-pub fn spawn_readiness(agent: std::sync::Arc<sandy_fabric_local::agent::LinkAgent>, probe: HealthProbe) -> Readiness {
+pub fn spawn_readiness(
+    agent: std::sync::Arc<sandy_fabric_local::agent::LinkAgent>,
+    probe: HealthProbe,
+    user: Option<String>,
+) -> Readiness {
     let (cancel, cancelled) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
         let verdict = tokio::select! {
-            verdict = probe_until_ready(&probe) => verdict,
+            verdict = probe_loop_as(&probe, Duration::from_secs(1), user.as_deref()) => verdict,
             _ = cancelled => return,
         };
         // Past the select, the write is never cancelled: a torn frame would corrupt the exit report after it.
@@ -149,20 +202,16 @@ impl Readiness {
     }
 }
 
-/// Runs `probe` until it passes or its attempts run out. One manifest second is one real second.
-pub async fn probe_until_ready(probe: &HealthProbe) -> ProbeVerdict {
-    probe_loop(probe, Duration::from_secs(1)).await
-}
-
-/// [`probe_until_ready`] with `second` as the length of one manifest second, so tests need not wait in real
-/// seconds.
-async fn probe_loop(probe: &HealthProbe, second: Duration) -> ProbeVerdict {
+/// Runs `probe` until it passes or its attempts run out, with `second` as the length of one manifest second so
+/// tests need not wait in real seconds. A command probe runs as `user` when one is given (the service's own
+/// account), so a service that can influence the probe's program cannot make the root agent run it.
+async fn probe_loop_as(probe: &HealthProbe, second: Duration, user: Option<&str>) -> ProbeVerdict {
     let timeout = second * probe.timeout_secs;
     let interval = second * probe.interval_secs;
     let mut last = String::new();
     for n in 1..=probe.max_attempts {
         let started = tokio::time::Instant::now();
-        match attempt(&probe.check, timeout).await {
+        match attempt(&probe.check, timeout, user).await {
             Ok(()) => return ProbeVerdict::Ready,
             Err(output) => last = output,
         }
@@ -175,8 +224,14 @@ async fn probe_loop(probe: &HealthProbe, second: Duration) -> ProbeVerdict {
     ProbeVerdict::Failed { output: last }
 }
 
+/// [`probe_loop_as`] as the agent's own user.
+#[cfg(test)]
+async fn probe_loop(probe: &HealthProbe, second: Duration) -> ProbeVerdict {
+    probe_loop_as(probe, second, None).await
+}
+
 /// One attempt of `check`, bounded by `timeout`. `Err` carries the failure's output.
-async fn attempt(check: &ProbeCheck, timeout: Duration) -> Result<(), String> {
+async fn attempt(check: &ProbeCheck, timeout: Duration, user: Option<&str>) -> Result<(), String> {
     match check {
         ProbeCheck::Tcp { port } => {
             let addr = ("127.0.0.1", *port);
@@ -187,6 +242,7 @@ async fn attempt(check: &ProbeCheck, timeout: Duration) -> Result<(), String> {
             }
         }
         ProbeCheck::Command { argv } => {
+            let argv = probe_argv(user, argv);
             let (program, args) = argv.split_first().ok_or("the probe command is empty")?;
             tokio::time::timeout(timeout, run_command(program, args))
                 .await
@@ -212,6 +268,17 @@ impl Drop for KillGroupOnDrop {
     fn drop(&mut self) {
         // ESRCH (the group is already gone) is the common case and fine.
         let _ = rustix::process::kill_process_group(self.0, rustix::process::Signal::KILL);
+    }
+}
+
+/// The argv a command probe runs: as `user` through [`as_user`] when one is given.
+fn probe_argv(user: Option<&str>, argv: &[String]) -> Vec<String> {
+    match user {
+        Some(user) => as_user(user, argv.iter().map(Into::into).collect())
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect(),
+        None => argv.to_vec(),
     }
 }
 
@@ -355,36 +422,96 @@ mod tests {
     }
 
     const PASSWD: &str = "root:x:0:0:root:/root:/bin/sh\n# a comment\ntoor:x:0:0:also \
-                          root:/root:/bin/sh\ndev:x:1000:100:dev:/home/dev:/bin/sh\nbroken:x:abc:100::/:/bin/sh\\
-                          nshort:x\n";
+                          root:/root:/bin/sh\ndev:x:1000:100:dev:/home/dev:/bin/sh\ngid0:x:1001:0:primary gid \
+                          0:/home/gid0:/bin/sh\nadmin:x:1002:100:admin:/home/admin:/bin/sh\nrooty:x:1003:100:in the \
+                          root group:/home/rooty:/bin/sh\nbroken:x:abc:100::/:/bin/sh\nnogid:x:1004::/:/bin/sh\nshort:\
+                          x\n";
 
-    /// A named account resolves to its uid.
+    const GROUP: &str = "root:x:0:rooty\nusers:x:100:dev,admin\nwheel:x:10:admin\n";
+
+    /// A plain account passes.
     #[test]
-    fn a_named_account_resolves_to_its_uid() {
-        assert_eq!(resolve_uid(PASSWD, "dev"), Ok(1000));
+    fn a_plain_account_is_accepted() {
+        assert_eq!(check_account(PASSWD, GROUP, "dev"), Ok(()));
     }
 
-    /// Adversarial (#589): the uid, not the name, decides. `toor` shares uid 0 with root and is refused, as is
-    /// root itself, an unknown account and a malformed entry. A name that is only a prefix of another is not a hit.
+    /// Adversarial (#589): the ids and groups decide, not the name. `toor` shares uid 0, `gid0` has primary
+    /// gid 0, `admin` is in `wheel`, `rooty` is in the gid-0 group; an unknown account, a malformed entry and a
+    /// name that is only a prefix of another are refused too.
     #[test]
-    fn an_account_that_is_root_or_unknown_or_malformed_is_refused() {
-        for user in ["toor", "root", "nobody", "broken", "short", "de", ""] {
-            let err = resolve_uid(PASSWD, user).expect_err(user);
-            assert!(!err.is_empty(), "{user}");
+    fn an_account_that_is_root_by_another_name_or_unknown_is_refused() {
+        for (user, reason) in [
+            ("toor", "uid 0"),
+            ("root", "uid 0"),
+            ("gid0", "primary gid 0"),
+            ("admin", "wheel"),
+            ("rooty", "root"),
+            ("nobody", "no such"),
+            ("broken", "uid"),
+            ("nogid", "gid"),
+            ("short", "uid"),
+            ("de", "no such"),
+            ("", "no such"),
+        ] {
+            let err = check_account(PASSWD, GROUP, user).expect_err(user);
+            assert!(err.contains(reason), "{user}: {err}");
         }
-        assert!(resolve_uid(PASSWD, "toor").expect_err("toor").contains("uid 0"));
-        assert!(resolve_uid(PASSWD, "nobody").expect_err("nobody").contains("no such"));
     }
 
-    /// The service argv is `runuser -u <user> -- <job...>`, the job's own arguments untouched.
+    /// The service argv drops privilege with no way back: no_new_privs first, then runuser, then the two
+    /// variables that must not reach the service, then the job with its arguments untouched.
     #[test]
-    fn the_job_is_wrapped_to_run_as_the_service_user() {
+    fn the_job_runs_as_the_service_user_with_no_new_privs_and_a_clean_env() {
         let job = vec!["t3".into(), "serve".into(), "--port".into(), "3773".into()];
         let wrapped: Vec<String> = as_user("dev", job)
             .into_iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(wrapped, ["runuser", "-u", "dev", "--", "t3", "serve", "--port", "3773"]);
+        assert_eq!(
+            wrapped,
+            [
+                "setpriv",
+                "--no-new-privs",
+                "--",
+                "runuser",
+                "-u",
+                "dev",
+                "--",
+                "env",
+                "-u",
+                "SANDY_SERVICE",
+                "-u",
+                "TMUX",
+                "t3",
+                "serve",
+                "--port",
+                "3773"
+            ]
+        );
+    }
+
+    /// #589 review: a command probe runs as the service user (so a service that can influence the probe's
+    /// program cannot make the root agent run it); with no user it runs as given.
+    #[test]
+    fn a_command_probe_runs_as_the_service_user_when_there_is_one() {
+        let argv = vec!["sandy-t3-ready".to_owned(), "3773".to_owned()];
+        assert_eq!(probe_argv(None, &argv), argv);
+        let wrapped = probe_argv(Some("t3"), &argv);
+        assert_eq!(wrapped[..6], ["setpriv", "--no-new-privs", "--", "runuser", "-u", "t3"]);
+        assert_eq!(wrapped[wrapped.len() - 2..], argv);
+    }
+
+    /// A restart policy is accepted by the manifest but not implemented: the agent refuses it instead of
+    /// silently running a service that is never restarted.
+    #[test]
+    fn a_restart_policy_the_agent_cannot_honour_is_refused() {
+        for policy in ["on_failure", "always"] {
+            let json =
+                format!(r#"{{"user":"dev","probe":{{"check":{{"type":"tcp","port":1}}}},"restart":"{policy}"}}"#);
+            let err = parse(&json).expect_err(policy);
+            assert!(err.contains("restart"), "{policy}: {err}");
+        }
+        assert!(parse(r#"{"user":"dev","probe":{"check":{"type":"tcp","port":1}},"restart":"never"}"#).is_ok());
     }
 
     #[test]

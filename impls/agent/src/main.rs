@@ -289,13 +289,17 @@ where
     // before the job starts so a mangled spec refuses the run instead of skipping the probe.
     let service = service::from_env()?;
     // A service runs as its declared non-root user (#589); the account is checked before anything starts.
-    let job = match &service {
-        Some(spec) => service::service_argv(&spec.user, job)?,
+    let service_user = match &service {
+        Some(spec) => service::service_account(&spec.user)?,
+        None => None,
+    };
+    let job = match &service_user {
+        Some(user) => service::as_user(user, job),
         None => job,
     };
     let tmux_job =
         TmuxJob::start(&job, peer_env, history_lines).map_err(|e| format!("starting the tmux job session: {e}"))?;
-    let readiness = service.map(|spec| service::spawn_readiness(Arc::clone(&agent), spec.probe));
+    let readiness = service.map(|spec| service::spawn_readiness(Arc::clone(&agent), spec.probe, service_user));
     let (pty_read, pty_write, resizer, mut attach_child) = tmux_job
         .open_attach()
         .map_err(|e| format!("opening the attach pty: {e}"))?;

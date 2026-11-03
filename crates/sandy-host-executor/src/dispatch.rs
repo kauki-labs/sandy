@@ -85,11 +85,6 @@ pub enum DispatchError {
     /// `argv[0]` is required; nothing can run without it.
     #[error("manifest names no command (empty argv)")]
     EmptyCommand,
-    /// A `flake/v1` manifest declares a `service` (#589), but this executor cannot run one yet: running it as
-    /// an ordinary job would start the declared service as the default account instead of its own non-root
-    /// user. Refused rather than run wrong; removed once the guest agent supervises services.
-    #[error("this executor cannot run a service manifest yet")]
-    ServiceNotSupported,
     /// Resolving a `flake/v1` manifest's flake reference against this host
     /// failed — a `nix build`/`nix eval` fault, an unresolvable flake ref, or
     /// a template kind this host could not detect. Carries
@@ -218,8 +213,10 @@ fn history_lines_env(history_lines: u32) -> [(String, String); 1] {
 }
 
 /// The longest `SANDY_SERVICE` value the executor sends. The guest console takes the agent's command as one
-/// typed line (about 4095 bytes in canonical mode), so a larger spec could be cut mid-argument.
-const MAX_SERVICE_ENV_BYTES: usize = 2048;
+/// line, shell-quoted and base64-encoded (about 4095 bytes in canonical mode), and quoting and encoding grow a
+/// value by up to a factor of 4, so a larger spec plus the job's own argv could be cut mid-argument. A typical
+/// spec is a few hundred bytes.
+const MAX_SERVICE_ENV_BYTES: usize = 1024;
 
 /// The env a flake/v1 run carries: the submitter's own entries, then the plumbing entries the executor owns.
 ///
@@ -240,6 +237,14 @@ fn flake_run_env(
         .cloned()
         .collect();
     env.extend(history_lines_env(decoded.history_lines));
+    if let Some(service) = &decoded.service
+        && service.restart != sandy_guest_template::manifest::RestartPolicy::Never
+    {
+        return Err(DispatchError::MalformedManifest(format!(
+            "service restart policy {:?} is not implemented yet; refused rather than ignored",
+            service.restart
+        )));
+    }
     let service = service_env(decoded.service.as_ref())
         .map_err(|e| DispatchError::MalformedManifest(format!("the service spec: {e}")))?;
     if let Some((_, value)) = &service
@@ -376,12 +381,8 @@ fn decode_flake_dispatch_manifest(
             manifest_encoding.to_owned(),
         ));
     }
-    let decoded = sandy_guest_template::manifest::decode_flake_manifest(manifest)
-        .map_err(|e| DispatchError::MalformedManifest(e.to_string()))?;
-    if decoded.service.is_some() {
-        return Err(DispatchError::ServiceNotSupported);
-    }
-    Ok(decoded)
+    sandy_guest_template::manifest::decode_flake_manifest(manifest)
+        .map_err(|e| DispatchError::MalformedManifest(e.to_string()))
 }
 
 /// Re-check the dispatch's required isolation class against this host's
@@ -800,46 +801,6 @@ mod tests {
         assert_eq!(clamp_timeout_secs(None), STAGE1_TIMEOUT_SECS);
     }
 
-    /// #589 review: until the agent runs the service (its own non-root user, its probe), an executor must not
-    /// run a `service` manifest as an ordinary job: that would run the declared service as the default
-    /// account, failing open on the non-root promise.
-    #[test]
-    fn a_service_manifest_is_refused_until_the_runtime_supports_it() -> Result<(), serde_json::Error> {
-        use sandy_guest_template::manifest::{
-            HealthProbe, MANIFEST_ENCODING_FLAKE_V1, ProbeCheck, RestartPolicy, ServiceSpec, encode_flake_manifest,
-        };
-
-        let manifest = |service| sandy_guest_template::manifest::FlakeManifestV1 {
-            flake: ".".to_owned(),
-            kind: None,
-            attr: None,
-            command: vec!["t3".to_owned(), "serve".to_owned()],
-            history_lines: 5_000,
-            env: Vec::new(),
-            cpu: None,
-            mem: None,
-            timeout_secs: None,
-            service,
-        };
-        let spec = ServiceSpec {
-            user: "dev".to_owned(),
-            probe: HealthProbe {
-                check: ProbeCheck::Tcp { port: 3773 },
-                interval_secs: 2,
-                timeout_secs: 1,
-                max_attempts: 30,
-            },
-            restart: RestartPolicy::Never,
-            port: None,
-        };
-        let with = encode_flake_manifest(&manifest(Some(spec)))?;
-        let err = decode_flake_dispatch_manifest(MANIFEST_ENCODING_FLAKE_V1, &with).expect_err("must be refused");
-        assert!(matches!(err, DispatchError::ServiceNotSupported), "{err:?}");
-        let without = encode_flake_manifest(&manifest(None))?;
-        decode_flake_dispatch_manifest(MANIFEST_ENCODING_FLAKE_V1, &without).expect("a plain job still decodes");
-        Ok(())
-    }
-
     #[test]
     fn history_lines_env_carries_the_submitter_requested_bound() {
         assert_eq!(
@@ -863,6 +824,7 @@ mod tests {
                 max_attempts: 30,
             },
             restart: RestartPolicy::Never,
+            port: Some(3773),
         };
         let (key, value) = service_env(Some(&spec))?.expect("a service sets the env entry");
         assert_eq!(key, sandy_api::agent::SERVICE_ENV);
@@ -899,6 +861,7 @@ mod tests {
                 max_attempts: 30,
             },
             restart: RestartPolicy::Never,
+            port: None,
         }
     }
 
@@ -928,6 +891,24 @@ mod tests {
         assert_eq!(services.len(), 1, "exactly the executor's entry: {service:?}");
         assert_ne!(services[0].1, forged);
         Ok(())
+    }
+
+    /// A restart policy the agent cannot honour is refused at dispatch, not accepted and ignored.
+    #[test]
+    fn a_restart_policy_is_refused_until_it_is_implemented() {
+        for policy in [
+            sandy_guest_template::manifest::RestartPolicy::OnFailure,
+            sandy_guest_template::manifest::RestartPolicy::Always,
+        ] {
+            let mut spec = t3_spec();
+            spec.restart = policy;
+            let err = flake_run_env(&flake_manifest(Vec::new(), Some(spec))).expect_err("must be refused");
+            assert!(
+                matches!(err, DispatchError::MalformedManifest(ref m) if m.contains("restart")),
+                "{err:?}"
+            );
+        }
+        assert!(flake_run_env(&flake_manifest(Vec::new(), Some(t3_spec()))).is_ok());
     }
 
     /// A spec too large for one console line is refused, not sent to be cut mid-argument.
