@@ -18,8 +18,8 @@ use prost::Message;
 use sandy_control_proto::{
     ControlRequest, ControlResponse, control_request, control_response,
     v1::{
-        EnvironmentError, EnvironmentErrorCode, EnvironmentFailure, EnvironmentLifetimeKind, EnvironmentResponse,
-        EnvironmentSpec, EnvironmentState as WireState, ListEnvironmentsResponse,
+        EnvironmentConnection, EnvironmentError, EnvironmentErrorCode, EnvironmentFailure, EnvironmentLifetimeKind,
+        EnvironmentResponse, EnvironmentSpec, EnvironmentState as WireState, ListEnvironmentsResponse,
     },
 };
 
@@ -225,8 +225,15 @@ fn to_wire(record: EnvironmentRecord) -> Result<EnvironmentResponse, Environment
             step: f.step,
             reason: f.reason,
         }),
-        // Set by the launch driver (slice C) once the environment is Ready.
-        connection: None,
+        // The launch driver records the endpoint when its probe passes. Shown
+        // only while Ready: any other state has no service to reach.
+        connection: record
+            .endpoint
+            .as_ref()
+            .filter(|_| record.state == EnvironmentState::Ready)
+            .map(|endpoint| EnvironmentConnection {
+                url: format!("http://{endpoint}"),
+            }),
         spec: Some(spec),
     })
 }

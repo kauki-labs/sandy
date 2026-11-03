@@ -14,15 +14,18 @@
 //!
 //! The backend calls block, so a pass runs under `spawn_blocking`.
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
+use prost::Message;
 use sandy_api::{
     backend::BackendError,
-    environment::{Endpoint, EnvironmentBackend, EnvironmentSpec, Launch, Probe},
+    environment::{EnvironmentBackend, EnvironmentSpec, Launch, Probe},
 };
 use sandy_control_proto::v1::EnvironmentSpec as WireSpec;
 
-use crate::environment_store::{EnvironmentRecord, EnvironmentState, EnvironmentStore, EnvironmentStoreError};
+use crate::environment_store::{
+    EnvTransition, EnvironmentRecord, EnvironmentState, EnvironmentStore, EnvironmentStoreError,
+};
 
 /// What the driver launches and how long it waits.
 #[derive(Debug, Clone)]
@@ -60,6 +63,12 @@ pub struct Report {
     pub killed: Vec<String>,
 }
 
+impl Report {
+    fn is_empty(&self) -> bool {
+        self.launched.is_empty() && self.readied.is_empty() && self.failed.is_empty() && self.killed.is_empty()
+    }
+}
+
 /// Converges backend boxes to store rows.
 pub struct EnvironmentDriver {
     store: Arc<EnvironmentStore>,
@@ -84,30 +93,150 @@ impl EnvironmentDriver {
     /// A failure of one environment's backend call fails that environment, not
     /// the pass.
     pub fn reconcile_once(&self, now: i64) -> Result<Report, DriverError> {
-        let _ = (
-            now,
-            &self.store,
-            &self.backend,
-            &self.config,
-            Report::default(),
-            Endpoint {
-                host: String::new(),
-                port: 0,
-            },
-            Launch::Started,
-            Probe::NotRunning,
-            EnvironmentState::Ready,
-        );
-        let _: Option<(EnvironmentRecord, EnvironmentSpec, WireSpec)> = None;
-        unimplemented!("#587 slice C2: red")
+        let mut report = Report::default();
+        let rows = self.store.list()?;
+        let mut running: BTreeSet<String> = self.backend.boxes()?.into_iter().map(|b| b.box_id).collect();
+        for row in &rows {
+            match row.state {
+                EnvironmentState::Provisioning => self.provision(row, now, &mut running, &mut report)?,
+                EnvironmentState::Ready => self.check_ready(row, &mut running, &mut report)?,
+                EnvironmentState::Stopped | EnvironmentState::Failed | EnvironmentState::Deleted => {
+                    if running.contains(&row.environment_id) {
+                        self.kill(&row.environment_id, &mut running, &mut report);
+                    }
+                }
+            }
+        }
+        // A box no environment row names is an orphan: the row was never written or is gone.
+        let known: BTreeSet<&str> = rows.iter().map(|r| r.environment_id.as_str()).collect();
+        let orphans: Vec<String> = running
+            .iter()
+            .filter(|id| !known.contains(id.as_str()))
+            .cloned()
+            .collect();
+        for id in orphans {
+            self.kill(&id, &mut running, &mut report);
+        }
+        Ok(report)
+    }
+
+    fn kill(&self, id: &str, running: &mut BTreeSet<String>, report: &mut Report) {
+        match self.backend.kill(id) {
+            Ok(()) => {
+                running.remove(id);
+                report.killed.push(id.to_owned());
+            }
+            // Left in `running`; the next pass tries again.
+            Err(e) => tracing::warn!(environment = id, error = %e, "could not kill a box"),
+        }
+    }
+
+    fn fail(&self, id: &str, step: &str, reason: &str, report: &mut Report) -> Result<(), DriverError> {
+        if self.store.mark_lost(id, step, reason)? == EnvTransition::Applied {
+            report.failed.push(id.to_owned());
+        }
+        Ok(())
+    }
+
+    fn to_spec(&self, row: &EnvironmentRecord) -> Option<EnvironmentSpec> {
+        let wire = WireSpec::decode(row.spec.as_slice()).ok()?;
+        Some(EnvironmentSpec {
+            environment_id: row.environment_id.clone(),
+            template: self.config.template.clone(),
+            size: (!wire.size.is_empty()).then_some(wire.size),
+            env: Vec::new(),
+            service_port: self.config.service_port,
+        })
+    }
+
+    fn provision(
+        &self,
+        row: &EnvironmentRecord,
+        now: i64,
+        running: &mut BTreeSet<String>,
+        report: &mut Report,
+    ) -> Result<(), DriverError> {
+        let id = row.environment_id.as_str();
+        let waited = now.saturating_sub(row.updated_at);
+        if waited > i64::try_from(self.config.provision_timeout.as_secs()).unwrap_or(i64::MAX) {
+            if running.contains(id) {
+                self.kill(id, running, report);
+            }
+            return self.fail(id, "provision", &format!("not ready after {waited}s"), report);
+        }
+        let Some(spec) = self.to_spec(row) else {
+            return self.fail(id, "spec", "the stored spec does not decode", report);
+        };
+        match self.backend.launch(&spec) {
+            Ok(Launch::Started) => {
+                running.insert(id.to_owned());
+                report.launched.push(id.to_owned());
+            }
+            Ok(Launch::AlreadyRunning) => {}
+            Err(e) => return self.fail(id, "launch", &e.to_string(), report),
+        }
+        match self.backend.probe(id) {
+            Ok(Probe::Ready { endpoint }) => {
+                self.store
+                    .set_endpoint(id, &format!("{}:{}", endpoint.host, endpoint.port))?;
+                if self.store.mark_ready(id)? == EnvTransition::Applied {
+                    report.readied.push(id.to_owned());
+                }
+            }
+            Ok(Probe::Failed { step, reason }) => {
+                self.kill(id, running, report);
+                self.fail(id, &step, &reason, report)?;
+            }
+            Ok(Probe::NotRunning) => self.fail(id, "launch", "the box is not running after launch", report)?,
+            Ok(Probe::Starting { .. }) => {}
+            // The probe itself could not run: not the environment's fault, try again next pass.
+            Err(e) => tracing::warn!(environment = id, error = %e, "probe could not run"),
+        }
+        Ok(())
+    }
+
+    fn check_ready(
+        &self,
+        row: &EnvironmentRecord,
+        running: &mut BTreeSet<String>,
+        report: &mut Report,
+    ) -> Result<(), DriverError> {
+        let id = row.environment_id.as_str();
+        match self.backend.probe(id) {
+            Ok(Probe::Ready { .. } | Probe::Starting { .. }) => {}
+            Ok(Probe::Failed { step, reason }) => {
+                self.kill(id, running, report);
+                self.fail(id, &step, &reason, report)?;
+            }
+            Ok(Probe::NotRunning) => self.fail(id, "reconcile", "the box is not running", report)?,
+            Err(e) => tracing::warn!(environment = id, error = %e, "probe could not run"),
+        }
+        Ok(())
     }
 
     /// Run [`EnvironmentDriver::reconcile_once`] every `interval` until the
     /// returned future is dropped. A failed pass is logged and retried.
     pub async fn run(self: Arc<Self>, interval: Duration) {
-        let _ = (self, interval);
-        unimplemented!("#587 slice C2: red")
+        let mut tick = tokio::time::interval(interval);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            let me = Arc::clone(&self);
+            match tokio::task::spawn_blocking(move || me.reconcile_once(now_unix())).await {
+                Ok(Ok(report)) if !report.is_empty() => tracing::info!(?report, "environment driver pass"),
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::error!(error = %e, "environment driver pass failed"),
+                Err(e) => tracing::error!(error = %e, "environment driver pass panicked"),
+            }
+        }
     }
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as i64
 }
 
 #[cfg(test)]
@@ -185,12 +314,12 @@ mod tests {
         let id = add(&r.store, 1)?;
 
         let first = r.driver.reconcile_once(now())?;
-        assert_eq!(first.launched, [id.clone()]);
+        assert_eq!(first.launched, std::slice::from_ref(&id));
         assert!(first.readied.is_empty(), "the first probe still says Starting");
         assert_eq!(state(&r.store, &id)?.state, EnvironmentState::Provisioning);
 
         let second = r.driver.reconcile_once(now())?;
-        assert_eq!(second.readied, [id.clone()]);
+        assert_eq!(second.readied, std::slice::from_ref(&id));
         let rec = state(&r.store, &id)?;
         assert_eq!(rec.state, EnvironmentState::Ready);
         assert_eq!(rec.endpoint.as_deref(), Some("127.0.0.1:41000"));
@@ -221,7 +350,7 @@ mod tests {
         let r = rig(FakeEnvironmentBackend::new().failing_at(0, "probe", "connection refused"))?;
         let id = add(&r.store, 1)?;
         let report = r.driver.reconcile_once(now())?;
-        assert_eq!(report.failed, [id.clone()]);
+        assert_eq!(report.failed, std::slice::from_ref(&id));
         let rec = state(&r.store, &id)?;
         assert_eq!(rec.state, EnvironmentState::Failed);
         let failure = rec.failure.context("a failure must be recorded")?;
@@ -254,7 +383,7 @@ mod tests {
         assert!(!r.backend.boxes()?.is_empty());
         // 601 s later the environment is still Provisioning.
         let report = r.driver.reconcile_once(now() + 601)?;
-        assert_eq!(report.failed, [id.clone()]);
+        assert_eq!(report.failed, std::slice::from_ref(&id));
         let rec = state(&r.store, &id)?;
         assert_eq!(rec.state, EnvironmentState::Failed);
         assert_eq!(rec.failure.context("failure")?.step, "provision");
@@ -329,7 +458,7 @@ mod tests {
         assert_eq!(state(&r.store, &id)?.state, EnvironmentState::Ready);
         r.backend.die(&id);
         let report = r.driver.reconcile_once(now())?;
-        assert_eq!(report.failed, [id.clone()]);
+        assert_eq!(report.failed, std::slice::from_ref(&id));
         let rec = state(&r.store, &id)?;
         assert_eq!(rec.state, EnvironmentState::Failed);
         assert_eq!(rec.failure.context("failure")?.step, "reconcile");
@@ -343,7 +472,7 @@ mod tests {
         r.driver.reconcile_once(now())?;
         r.store.stop(&id)?;
         let report = r.driver.reconcile_once(now())?;
-        assert_eq!(report.killed, [id.clone()]);
+        assert_eq!(report.killed, std::slice::from_ref(&id));
         assert!(r.backend.boxes()?.is_empty());
         // Resuming sends it back through Provisioning and a fresh box.
         r.store.resume(&id)?;
@@ -360,7 +489,11 @@ mod tests {
         let b = add(&r.store, 2)?;
         r.store.delete(&b)?;
         let report = r.driver.reconcile_once(now())?;
-        assert_eq!(report.launched, [a.clone()], "a deleted row is never launched");
+        assert_eq!(
+            report.launched,
+            std::slice::from_ref(&a),
+            "a deleted row is never launched"
+        );
         assert_eq!(state(&r.store, &a)?.state, EnvironmentState::Ready);
         assert_eq!(state(&r.store, &b)?.state, EnvironmentState::Deleted);
         Ok(())

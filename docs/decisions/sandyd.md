@@ -2125,3 +2125,41 @@ client is the API tier's rule (#585 AT-14); the row cap is the daemon's own boun
 
 **Alternative set aside.** A `code` field on `ControlError`: it would touch every job-handler literal for no gain to
 the job operations.
+
+## 28. A level-triggered launch driver converges boxes to environment rows; the backend seam is `EnvironmentBackend` (#587)
+
+**Status:** accepted (owner decisions on #587, 2026-11-03: a sibling trait beside `VmBackend`). **Upholds:** INV-6.
+
+**Context.** Decision 26 records environments and decision 27 puts them on the wire, but nothing turns `Provisioning`
+into a running VM or into `Ready`. `VmBackend::run` is run-to-completion, so a long-lived box needs its own seam.
+
+**Decision.**
+
+- `sandy_api::environment::EnvironmentBackend` has four methods: `launch` (returns once the hypervisor process runs,
+  idempotent per environment id), `probe` (`Starting`, `Ready{endpoint}`, `Failed{step, reason}` or `NotRunning`),
+  `kill` (idempotent) and `boxes`. A box is keyed by the environment id, never by an in-memory handle, so a restarted
+  daemon finds its boxes with `boxes()`. `stop` and `resume` are not in the seam: an ephemeral environment cannot be
+  stopped, and a real resume needs persistent guest state (#588). `FakeEnvironmentBackend` in `sandy-test-support`
+  stands in for tier-2.
+- `EnvironmentDriver` is a level-triggered loop, not a set of handler hooks. Each pass reads every row and every box
+  and fixes each difference: a `Provisioning` row with no box is launched, then probed (Ready records the endpoint and
+  marks the row `Ready`; Failed records the step and reason and kills the box); a `Provisioning` row older than the
+  provision timeout fails with step `provision`; a `Ready` row whose box is gone or failing is marked lost
+  (`Failed`, step `reconcile`); a `Stopped`, `Failed` or `Deleted` row keeps no box; a box with no row is an orphan and
+  is killed. The same pass is the reconciler after a restart: nothing is held in memory.
+- The store gains an `endpoint` column (migrated into an older table), `set_endpoint`, and `mark_lost` (`Provisioning`
+  or `Ready` to `Failed`). `mark_failed` stays `Provisioning` only. `GetEnvironment` reports
+  `connection.url = http://<endpoint>` only while `Ready` and only when an endpoint was recorded, never a made-up one.
+
+**Consequences.**
+
+- A launch error fails the environment (step `launch`); there is no retry, so a transient backend fault costs one
+  environment. A probe that cannot run is logged and retried on the next pass.
+- Latency from `Provisioning` to `Ready` includes up to one pass interval after the probe passes.
+- A box that dies between two passes is seen at the next pass, not at once.
+- The driver is not started by `sandyd` yet: no real `EnvironmentBackend` exists until slice C3 (qemu and vfkit in
+  `impls/vm`), which also adds the wiring. Until then environments created over the RPC stay `Provisioning`.
+
+**Alternative set aside.** Starting a task from the create handler: it would lose the launch on a crash between the
+store write and the spawn, which the level-triggered pass makes impossible (a row with no box is launched on the next
+pass).
