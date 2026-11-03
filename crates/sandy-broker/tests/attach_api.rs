@@ -195,10 +195,26 @@ async fn a_dropped_client_leaves_the_job_running_and_it_can_be_attached_again() 
     assert_eq!(lines.output_bytes(5).await?, b"first");
     drop(lines);
 
+    // Three idle tickets leave one slot, which frees once the broker notices the hang-up.
+    for _ in 0..3 {
+        f.attach(&id, TOKEN_A).await?;
+    }
+    let mut again = None;
+    for _ in 0..50 {
+        let (status, body) = f
+            .call("POST", &format!("/v1/jobs/{id}/attach"), Some(TOKEN_A), Some(json!({})))
+            .await?;
+        if status == StatusCode::OK {
+            again = body["stream_url"].as_str().map(str::to_owned);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let again = again.context("the broker never noticed the dropped client")?;
+
     let (_, got) = f.call("GET", &format!("/v1/jobs/{id}"), Some(TOKEN_A), None).await?;
     assert_eq!(got["state"], "pending", "a dropped stream must not touch the job");
     agent.stdout(b"second").await?;
-    let again = f.attach(&id, TOKEN_A).await?;
     let mut lines = Lines::new(f.open_stream(&again, Some(TOKEN_A)).await?);
     // Replay from the start is accepted: the new stream sees everything.
     assert_eq!(lines.output_bytes(11).await?, b"firstsecond");

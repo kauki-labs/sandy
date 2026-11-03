@@ -185,26 +185,30 @@ quota check, and a client could exceed the quota by one environment per distinct
 - The response is `200`, `application/x-ndjson`, `Cache-Control: no-store`, chunked. Each
   delivered stdout or stderr chunk is `{"type":"output","data":"<base64>"}` (bytes opaque,
   streams merged). The last line is `{"type":"exit","reason":...}` with `closed`,
-  `job_terminal:<JOB_STATUS_*>` or a fixed `fault:` text. The shape follows the CLI's
+  `job_terminal:<JOB_STATUS_*>`, `job_terminal_truncated:<JOB_STATUS_*>` or a fixed `fault:` text. The shape follows the CLI's
   `daemon attach -o json` (#513) minus its `attached` line, which carries the cap.
-- The token and the cap never appear in a response, header, URL or log line. The broker never
-  logs the stream URL.
+- The token and the cap never appear in a response, header, URL or log line (a test scans the
+  captured logs). The broker never logs the stream URL or a ticket.
 - The stream is read-only. The broker never writes to the data-plane connection and never
   closes its write half: a client EOF makes sandyd's relay leave. Archive frames are dropped.
 - sandyd replays the channel from sequence 0 on every join. A second stream for the same job
   sees the output again. Accepted.
-- The broker polls job status about once a second. On a terminal status it drains for up to
-  2 seconds, then sends `exit`. If the HTTP client goes away the broker drops the data-plane
-  connection at once and sends nothing; the job is untouched.
+- The broker polls job status about once a second, the first poll one period after the join (the
+  replay is already flowing). On a terminal status it keeps forwarding until the data plane has
+  been quiet for 500 ms, then sends `exit` `job_terminal:<STATUS>`. If frames still arrive 30
+  seconds after the job ended, it sends `job_terminal_truncated:<STATUS>`: the output is
+  incomplete and the client can open a new stream to replay it. An unknown job status reads as
+  `JOB_STATUS_FAILED`, as the status route does.
+- Every write to the client waits at most 30 seconds. A client that stops reading loses its
+  stream and frees its slot; the data-plane buffer is two frames. If the HTTP client goes away,
+  the broker drops the data-plane connection at once, even while a status call is outstanding,
+  and sends nothing. The job is untouched.
 - The stream's producer task has its own cap: the handler slot is free once the response head
   is out, so the ticket and stream caps above bound the producers.
 
 **Side effect.** An open broker stream is an attach to sandyd. On a remote host that keeps the
 job attached and lifts the unlimited-while-attached policy (#340, `sandyd.md` decision 17) for as
 long as the stream is open, up to the client's four. Closing the stream restores it.
-
-**Residual.** A client that opens a stream and stops reading holds its slot until the TCP
-connection dies. The caps bound the cost, there is no idle timeout.
 
 ## Consequences
 

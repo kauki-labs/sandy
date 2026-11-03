@@ -118,7 +118,7 @@ paths:
                     required: [type, reason]
                     properties:
                       type: {type: string, enum: [exit]}
-                      reason: {type: string, description: "closed, job_terminal:<JOB_STATUS_*>, or fault:<fixed text>."}
+                      reason: {type: string, description: "closed, job_terminal:<JOB_STATUS_*>, job_terminal_truncated:<JOB_STATUS_*> (the job ended but output was still arriving after 30 s, so it is incomplete; open a new stream to replay), or fault:<fixed text>."}
         default: {$ref: "#/components/responses/Error"}
   /v1/environments:
     post:

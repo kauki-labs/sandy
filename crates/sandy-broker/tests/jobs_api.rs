@@ -3,11 +3,15 @@
 
 mod common;
 
-use std::{net::SocketAddr, path::Path};
+use std::{
+    net::SocketAddr,
+    path::Path,
+    sync::{Arc, Mutex, OnceLock, PoisonError},
+};
 
 use anyhow::{Context, Result};
 use base64::Engine;
-use common::{TOKEN_A, TOKEN_B, client, fixture, submit_body};
+use common::{Opts, TOKEN_A, TOKEN_B, client, fixture, fixture_with_opts, submit_body};
 use reqwest::{Client as Http, StatusCode};
 use sandy_broker::{BrokerConfig, BrokerError, Client, IsolationClass, serve};
 use serde_json::{Value, json};
@@ -79,8 +83,54 @@ async fn the_owner_cancels_with_the_token_the_broker_holds() -> Result<()> {
     Ok(())
 }
 
+struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Routes every tracing event of this process into a buffer.
+fn capture_logs() -> Arc<Mutex<Vec<u8>>> {
+    static LOGS: OnceLock<Arc<Mutex<Vec<u8>>>> = OnceLock::new();
+    Arc::clone(LOGS.get_or_init(|| {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&buf);
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(move || LogWriter(Arc::clone(&sink)))
+            .try_init();
+        buf
+    }))
+}
+
+/// Every encoding `bytes` could leak in: hex (both cases), and standard and URL-safe base64,
+/// padded and not.
+fn encodings(bytes: &[u8]) -> Vec<String> {
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+    vec![
+        hex::encode(bytes),
+        hex::encode_upper(bytes),
+        STANDARD.encode(bytes),
+        STANDARD_NO_PAD.encode(bytes),
+        URL_SAFE.encode(bytes),
+        URL_SAFE_NO_PAD.encode(bytes),
+    ]
+}
+
 #[tokio::test]
 async fn no_response_carries_the_attach_token() -> Result<()> {
+    let logs = capture_logs();
     let f = fixture().await?;
     let (_, submitted) = f.call("POST", "/v1/jobs", Some(TOKEN_A), Some(submit_body())).await?;
     let id = submitted["job_id"].as_str().context("job_id")?.to_owned();
@@ -113,8 +163,9 @@ async fn no_response_carries_the_attach_token() -> Result<()> {
         );
     }
 
-    // The attach bridge: its response, the stream URL, the stream's headers and content carry
-    // neither the token nor the cap the broker presented on sandyd's attach socket.
+    // The attach bridge: its responses, the stream URL, the stream's headers, lines and error
+    // bodies, and the broker's logs carry neither the token nor the cap the broker presented on
+    // sandyd's attach socket.
     // The job above was cancelled; attach needs a live one.
     let live = f.submit(TOKEN_A).await?;
     let agent = f.agent(&live)?;
@@ -129,29 +180,61 @@ async fn no_response_carries_the_attach_token() -> Result<()> {
     let attach_body: Value = attach.json().await?;
     seen.push_str(&attach_body.to_string());
     let stream_url = attach_body["stream_url"].as_str().context("stream_url")?.to_owned();
+    let ticket = stream_url.rsplit('/').next().context("ticket")?.to_owned();
     let resp = f.open_stream(&stream_url, Some(TOKEN_A)).await?;
     seen.push_str(&format!("{:?}", resp.headers()));
     let mut lines = common::Lines::new(resp);
     lines.output_bytes(5).await?;
     f.finish(&live, sandy_control_proto::JobStatus::Succeeded)?;
     seen.push_str(&lines.last().await?.to_string());
+    // A spent ticket gives the stream route's 404 body.
+    let spent = f.open_stream(&stream_url, Some(TOKEN_A)).await?;
+    seen.push_str(&spent.text().await?);
     let caps = f.caps.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.clone();
     assert!(
         !caps.is_empty(),
         "the broker never presented a cap, so there is no needle"
     );
-    let mut needles = needles.to_vec();
-    for cap_hex in caps {
-        let raw = hex::decode(&cap_hex)?;
-        needles.extend([
-            cap_hex,
-            base64::engine::general_purpose::STANDARD.encode(&raw),
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&raw),
-        ]);
+    let mut cap_needles = Vec::new();
+    for cap_hex in &caps {
+        cap_needles.extend(encodings(&hex::decode(cap_hex)?));
     }
+    let token_needles = encodings(&token);
+    let all: Vec<&String> = token_needles.iter().chain(&cap_needles).collect();
     assert!(
-        needles.iter().all(|n| !seen.contains(n.as_str())),
+        all.iter().all(|n| !seen.contains(n.as_str())),
         "the attach bridge leaked the token or the cap"
+    );
+
+    // The stream route's 503 body, from a broker whose sandyd has no attach socket.
+    let g = fixture_with_opts(Opts {
+        attach_socket: false,
+        ..Opts::default()
+    })
+    .await?;
+    let gid = g.submit(TOKEN_A).await?;
+    let gtoken = g.store.attach_token(&gid)?.context("sandyd stored no attach token")?;
+    let url = g.attach(&gid, TOKEN_A).await?;
+    let unavailable = g.open_stream(&url, Some(TOKEN_A)).await?;
+    assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = unavailable.text().await?;
+    assert!(
+        encodings(&gtoken).iter().all(|n| !body.contains(n.as_str())),
+        "the 503 body leaked the token"
+    );
+
+    // The broker's logs, for both brokers, hold no token, cap or ticket in any encoding.
+    let logs = String::from_utf8_lossy(&logs.lock().map_err(|_| anyhow::anyhow!("poisoned"))?).into_owned();
+    assert!(!logs.is_empty(), "no log line was captured, so the scan proves nothing");
+    let log_needles: Vec<String> = all
+        .into_iter()
+        .cloned()
+        .chain(encodings(&gtoken))
+        .chain([ticket, url.rsplit('/').next().context("ticket")?.to_owned()])
+        .collect();
+    assert!(
+        log_needles.iter().all(|n| !logs.contains(n.as_str())),
+        "a log line carried a token, cap or ticket"
     );
     Ok(())
 }
