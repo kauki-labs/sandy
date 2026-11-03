@@ -442,9 +442,12 @@ connection (a websocket) works.
   dial to the target that takes more than 5 seconds closes that connection only. A target that is down closes that
   one connection, and the relay keeps accepting. The target must be an IPv4 loopback address with a real port, so
   the relay cannot forward off the guest, and a service that binds only `::1` cannot be relayed.
-- **Readiness.** The relay binds its vsock port at once, whether or not the service is listening. A host dial
-  before the relay binds is refused. A host dial before the service is up connects and is then closed with no
-  bytes. The host half must retry both cases.
+- **Readiness.** A connected socket proves nothing: vfkit's proxy accepts the host's connection before the guest
+  listens, and the relay accepts the host's vsock connection before it dials the service. So the relay writes one
+  byte, `sandy_api::agent::PORT_RELAY_READY`, to the host only after it has connected to the service, and before any
+  data moves (the agent link's `AGENT_LINK_READY` works the same way). The host bridge counts a dial as successful
+  only when it has read that byte, and retries inside its window otherwise. A relay that is not bound yet, or a
+  service that is not up, therefore looks like a failed dial, never like a tunnel that opened and reset.
 - **Not yet wired.** The service kind (#589) is expected to start the relay, and nothing does yet. The host half (a
   loopback listener that dials `CID:P` on qemu, or a `virtio-vsock,port=P,...,connect` device declared at launch
   on vfkit) is a later slice of #590.

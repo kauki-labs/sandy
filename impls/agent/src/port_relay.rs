@@ -22,7 +22,7 @@ use std::{
 
 use sandy_api::agent::PORT_RELAY_READY;
 use tokio::{
-    io::{AsyncRead, AsyncWrite, copy_bidirectional},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt, copy_bidirectional},
     net::TcpStream,
     sync::Semaphore,
     time::timeout,
@@ -124,6 +124,11 @@ where
             return;
         }
     };
+    // Tell the host the service is there before any data moves: its dial counts as successful only on this byte.
+    if let Err(e) = host.write_all(&[PORT_RELAY_READY]).await {
+        eprintln!("sandy-agent: port-relay could not announce readiness: {e}");
+        return;
+    }
     // Copies both ways, and half-closes the far side when one side reaches EOF.
     if let Err(e) = copy_bidirectional(&mut host, &mut service).await
         && e.kind() != io::ErrorKind::ConnectionReset
