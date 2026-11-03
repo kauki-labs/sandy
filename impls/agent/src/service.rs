@@ -506,7 +506,11 @@ mod tests {
         let started = tokio::time::Instant::now();
         let verdict = probe_loop(&probe(command(&["sh", "-c", &script]), 1), TICK).await;
         assert_eq!(verdict, ProbeVerdict::Ready);
-        assert!(started.elapsed() < TICK * 8, "the verdict waited for the pipes: {:?}", started.elapsed());
+        assert!(
+            started.elapsed() < TICK * 8,
+            "the verdict waited for the pipes: {:?}",
+            started.elapsed()
+        );
         tokio::time::sleep(Duration::from_millis(1_200)).await;
         assert!(!marker.exists(), "the probe's background child outlived the attempt");
         Ok(())
@@ -527,7 +531,10 @@ mod tests {
         let verdict = probe_loop(&slow, Duration::from_millis(200)).await;
         assert!(matches!(verdict, ProbeVerdict::Failed { .. }), "{verdict:?}");
         let took = started.elapsed();
-        assert!(took < Duration::from_millis(1_450), "the waits did not shrink: {took:?}");
+        assert!(
+            took < Duration::from_millis(1_450),
+            "the waits did not shrink: {took:?}"
+        );
     }
 
     /// CodeRabbit on #632: the verdict keeps a failing probe's stderr when stdout is long, since the relay
@@ -540,7 +547,11 @@ mod tests {
             anyhow::bail!("expected a failure, got {verdict:?}");
         };
         let head: String = output.chars().take(4096).collect();
-        assert!(head.contains("the-diagnostic"), "stderr fell off the verdict: {} bytes", output.len());
+        assert!(
+            head.contains("the-diagnostic"),
+            "stderr fell off the verdict: {} bytes",
+            output.len()
+        );
         Ok(())
     }
 

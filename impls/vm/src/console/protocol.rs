@@ -628,7 +628,8 @@ mod tests {
         let dir = tempfile::tempdir().context("temp dir")?;
         let marker = dir.path().join("executed");
         let value = format!(
-            "{{\"user\":\"dev\",\"probe\":{{\"check\":{{\"type\":\"command\",\"argv\":[\"a b\",\"$(touch {m})\",\"`touch {m}`\",\"it's\\n\"]}}}}}}\n; touch {m}",
+            "{{\"user\":\"dev\",\"probe\":{{\"check\":{{\"type\":\"command\",\"argv\":[\"a b\",\"$(touch \
+             {m})\",\"`touch {m}`\",\"it's\\n\"]}}}}}}\n; touch {m}",
             m = marker.display()
         );
         let command = [
@@ -653,7 +654,11 @@ mod tests {
             .arg(format!("printf '%s' '{encoded}' | base64 -d | sh"))
             .output()
             .context("replay the guest-side decode pipeline")?;
-        assert_eq!(String::from_utf8_lossy(&output.stdout), value, "the value must arrive intact");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            value,
+            "the value must arrive intact"
+        );
         assert!(!marker.exists(), "the guest shell executed part of the value");
         Ok(())
     }
