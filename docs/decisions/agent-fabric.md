@@ -424,6 +424,44 @@ demonstrated for the process backend; it is deferred to the VM-backed
 - Wiring `sandy_api::console::Transport` into `RawConsole` now: no VM-backed agent
   exists yet to wire it to.
 
+### 10a. The guest port relay (#590)
+
+`sandy-agent port-relay --vsock-port P --to 127.0.0.1:T` is the guest half of the host-side bridge to a guest
+service port (for example `t3 serve`, which listens on guest loopback only). It listens on vsock port `P` and
+splices each connection from the host to `127.0.0.1:T`. It parses nothing, so a service that holds a long-lived
+connection (a websocket) works.
+
+- **Who may connect.** The relay admits only vsock peers that report the host CID (2), the same check as the agent
+  link, and closes any other peer without a dial (CID 0, the loopback CID 1 and a guest CID included). That is a
+  reachability check, not an auth boundary. On qemu (vhost-vsock) every host process, of any uid, reaches the guest
+  as CID 2, so any host process can open a raw connection to `<guest CID>:1000`. On vfkit the host reaches the guest
+  only through a unix socket whose file permissions gate access, until a bridge puts a TCP port in front of it (see
+  the host bridge's exposure note). The service must authenticate its own clients (t3's pairing token).
+- **Port identity.** The relay listens on vsock port 1000 (`PORT_RELAY_VSOCK_PORT`), a privileged port on purpose:
+  the kernel lets only a process with `CAP_NET_BIND_SERVICE` bind a vsock port of 1023 or below, so a harness running
+  as the unprivileged service user cannot bind it before the relay and answer the bridge's dial with the ready byte.
+  A root process in the guest still can, so the ready byte proves reachability, not identity. The agent must start the
+  relay before any untrusted process, and a per-run shared secret that both halves prove (not just a ready byte) is the
+  fix for identity and for availability, and is an open question for the owner.
+- **Availability.** The cap bounds descriptors, not availability: any host process can dial the relay and hold its
+  256 connections open, which starves the bridge's own dials. Nothing in the relay can tell the bridge from another
+  host process, so only authentication closes this.
+- **Limits.** At most 256 connections are relayed at once, and a connection over the cap is closed unanswered. A
+  connection that moves no byte in either direction for 15 minutes is closed, so a peer that sends the ready byte
+  and goes silent cannot hold a slot for good (a quiet direction alone is not idle). A
+  dial to the target that takes more than 5 seconds closes that connection only. A target that is down closes that
+  one connection, and the relay keeps accepting. The target must be an IPv4 loopback address with a real port, so
+  the relay cannot forward off the guest, and a service that binds only `::1` cannot be relayed.
+- **Readiness.** A connected socket proves nothing: vfkit's proxy accepts the host's connection before the guest
+  listens, and the relay accepts the host's vsock connection before it dials the service. So the relay writes one
+  byte, `sandy_api::agent::PORT_RELAY_READY`, to the host only after it has connected to the service, and before any
+  data moves (the agent link's `AGENT_LINK_READY` works the same way). The host bridge counts a dial as successful
+  only when it has read that byte, and retries inside its window otherwise. A relay that is not bound yet, or a
+  service that is not up, therefore looks like a failed dial, never like a tunnel that opened and reset.
+- **Not yet wired.** The service kind (#589) is expected to start the relay, and nothing does yet. The host half (a
+  loopback listener that dials `CID:P` on qemu, or a `virtio-vsock,port=P,...,connect` device declared at launch
+  on vfkit) is a later slice of #590.
+
 ## 11. Channel roles are thin wrappers; `EscalationSink` is a new seam
 
 **Status:** accepted.
