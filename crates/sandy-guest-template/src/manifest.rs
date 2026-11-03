@@ -314,7 +314,9 @@ mod tests {
     /// hanging the environment in Starting. Each case names the message it must produce.
     #[test]
     fn an_unrunnable_probe_is_refused_with_its_reason() -> Result<(), serde_json::Error> {
-        let cases: [(&str, fn(&mut ServiceSpec), &str); 8] = [
+        // A case name, how it mutates the fixture, and the message its refusal must contain.
+        type Case = (&'static str, fn(&mut ServiceSpec), &'static str);
+        let cases: [Case; 8] = [
             (
                 "port 0",
                 |s| s.probe.check = ProbeCheck::Tcp { port: 0 },
