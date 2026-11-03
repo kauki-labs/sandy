@@ -323,7 +323,7 @@ fn pid_record(pid: u32) -> String {
 #[cfg(target_os = "linux")]
 fn kill_recorded_group(record: &str) {
     let mut fields = record.split_whitespace();
-    let (Some(pid), Some(start), None) = (fields.next(), fields.next(), fields.nth(0)) else {
+    let (Some(pid), Some(start), None) = (fields.next(), fields.next(), fields.next()) else {
         return;
     };
     let (Ok(pid), Ok(start)) = (pid.parse::<i32>(), start.parse::<u64>()) else {
