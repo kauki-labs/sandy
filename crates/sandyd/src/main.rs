@@ -11,6 +11,8 @@ use sandy_conn::{Listener as MeshListener, TlsIdentity};
 use sandyd::{
     build_rev::{log_startup, resolve_rev, version_line, wants_version},
     dispatch::JobRegistry,
+    environment_backend,
+    environment_driver::EnvironmentDriver,
     environment_store::EnvironmentStore,
     gate_spawn,
     host_registry::{ExecutorAllowlist, HostRegistry},
@@ -353,6 +355,11 @@ async fn main() {
     } else {
         None
     };
+
+    // The launch driver runs only when a backend is configured (#587). It starts after every lock and
+    // bind above: the backend sweeps stale environment directories, which a second daemon that lost
+    // a lock must never do.
+    let _environment_driver = start_environment_driver(&environments);
 
     let mut connections = tokio::task::JoinSet::new();
     let mut backoff = AcceptBackoff::new();
@@ -866,6 +873,57 @@ fn db_path() -> std::io::Result<PathBuf> {
 /// The env var is set but is not a valid non-negative integer.
 fn max_jobs() -> Result<Option<usize>, std::num::ParseIntError> {
     std::env::var("SANDY_MAX_JOBS").ok().map(|v| v.parse()).transpose()
+}
+
+/// Start the environment launch driver if `SANDY_ENV_BACKEND` selects a backend
+/// (#587). Off by default: environments then stay `Provisioning`. An invalid
+/// setting stops the daemon, like every other startup setting.
+fn start_environment_driver(environments: &Arc<EnvironmentStore>) -> Option<tokio::task::JoinHandle<()>> {
+    // `var(..).ok()` would read a non-UTF-8 value as unset, and a lossy copy would alter a path.
+    if let Some((name, _)) = std::env::vars_os()
+        .filter(|(k, _)| k.to_string_lossy().starts_with("SANDY_ENV_"))
+        .find(|(_, v)| v.to_str().is_none())
+    {
+        tracing::error!(name = %name.to_string_lossy(), "environment backend setting is not valid UTF-8");
+        std::process::exit(1);
+    }
+    let config = match environment_backend::from_env(
+        |name| std::env::var(name).ok(),
+        || {
+            ensure_runtime_dir()
+                .map(|dir| dir.join("environments"))
+                .map_err(|e| e.to_string())
+        },
+    ) {
+        Ok(Some(config)) => config,
+        Ok(None) => {
+            tracing::info!(
+                "environment launch driver off: SANDY_ENV_BACKEND is not set, environments stay Provisioning"
+            );
+            return None;
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "invalid environment backend settings");
+            std::process::exit(1);
+        }
+    };
+    tracing::warn!(
+        "SANDY_ENV_BACKEND=process-insecure: environments run as host processes as this user with NO isolation; for \
+         trusted, local development only"
+    );
+    let backend = match sandy_environment::ProcessEnvironmentBackend::new(config.process) {
+        Ok(backend) => backend,
+        Err(e) => {
+            tracing::error!(error = %e, "could not start the process environment backend");
+            std::process::exit(1);
+        }
+    };
+    let driver = Arc::new(EnvironmentDriver::new(
+        Arc::clone(environments),
+        Arc::new(backend),
+        config.driver,
+    ));
+    Some(tokio::spawn(driver.run(environment_backend::DRIVER_INTERVAL)))
 }
 
 /// Parse `$SANDY_MAX_ENVIRONMENTS`: the row cap [`EnvironmentStore::with_max_rows`]
