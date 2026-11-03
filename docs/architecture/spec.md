@@ -629,7 +629,7 @@ owner.
 - A level-triggered `EnvironmentDriver` converges the boxes an `EnvironmentBackend` runs to the rows: launch, probe to `Ready`, fail on a failed probe or a timeout, and kill any box that no live row names. It is also the restart reconciler (decision 28).
 - An opt-in, trusted-only process backend (`SANDY_ENV_BACKEND=process-insecure`, decision 29) runs the service as a host process group with a cleared environment and no isolation. A failed group kill keeps the entry so a later kill retries.
 
-**KPI:** rows KENV1 to KENV8 in [`kpi.md`](kpi.md).
+**KPI:** rows KENV1 to KENV9 in [`kpi.md`](kpi.md).
 
 ## Testing: integration vs end-to-end
 
