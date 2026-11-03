@@ -16,6 +16,7 @@ pub mod attach_relay;
 pub mod build_rev;
 pub mod dispatch;
 pub mod environment;
+pub mod environment_backend;
 pub mod environment_driver;
 pub mod environment_store;
 pub mod handler;

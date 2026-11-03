@@ -2757,6 +2757,7 @@ dependencies = [
  "sandy-api",
  "sandy-conn",
  "sandy-control-proto",
+ "sandy-environment",
  "sandy-executor-proto",
  "sandy-fabric",
  "sandy-fabric-local",

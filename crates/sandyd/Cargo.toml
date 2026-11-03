@@ -23,6 +23,7 @@ workspace = true
 [dependencies]
 sandy-api.workspace = true
 sandy-control-proto.workspace = true
+sandy-environment.workspace = true
 sandy-executor-proto.workspace = true
 sandy-conn.workspace = true
 sandy-fabric.workspace = true
