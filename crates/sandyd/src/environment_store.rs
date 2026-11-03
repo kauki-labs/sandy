@@ -588,6 +588,25 @@ impl EnvironmentStore {
         Ok(rows == 1)
     }
 
+    /// `Ready` to `Stopped` only if the lease has run out at unix time `now`: at
+    /// least `limit_secs` since the last renewal. The check and the write are one
+    /// statement, so a renewal that lands after the caller read the row wins and
+    /// nothing is stopped. Returns whether it stopped the environment.
+    ///
+    /// # Errors
+    /// As [`EnvironmentStore::create`].
+    pub fn stop_if_idle(&self, environment_id: &str, now: i64, limit_secs: i64) -> Result<bool, EnvironmentStoreError> {
+        let conn = self.lock();
+        let rows = conn.execute(
+            "UPDATE environments
+                SET state = 'stopped', updated_at = ?4, last_activity_at = NULL
+              WHERE environment_id = ?1 AND state = 'ready'
+                AND ?2 - COALESCE(last_activity_at, updated_at) >= ?3",
+            (environment_id, now, limit_secs, now_unix()),
+        )?;
+        Ok(rows == 1)
+    }
+
     /// `Provisioning` to `Ready`, recording where the environment's service is
     /// reachable (`host:port`) in the same write. The launch driver uses this
     /// when its probe passes, so a row never shows Ready without its endpoint
@@ -1014,6 +1033,32 @@ mod tests {
         assert!(!s.touch("env-1", 200)?, "a Stopped environment is not renewed");
         s.resume("env-1")?;
         assert_eq!(s.get("env-1")?.context("env-1")?.last_activity_at, None);
+        Ok(())
+    }
+
+    #[test]
+    fn an_idle_stop_loses_to_a_renewal_and_holds_at_the_exact_limit() -> Result<()> {
+        let s = store()?;
+        created(&s)?;
+        s.mark_ready("env-1")?;
+        s.touch("env-1", 1_000)?;
+        assert!(
+            !s.stop_if_idle("env-1", 1_299, 300)?,
+            "299 s idle is inside a 300 s lease"
+        );
+        // A stale read said the lease was out; a renewal landed since.
+        s.touch("env-1", 1_400)?;
+        assert!(
+            !s.stop_if_idle("env-1", 1_450, 300)?,
+            "a renewal after the read must win"
+        );
+        assert_eq!(s.get("env-1")?.context("env-1")?.state, EnvironmentState::Ready);
+        assert!(s.stop_if_idle("env-1", 1_700, 300)?, "exactly the limit stops");
+        assert_eq!(s.get("env-1")?.context("env-1")?.state, EnvironmentState::Stopped);
+        assert!(
+            !s.stop_if_idle("env-1", 9_999, 300)?,
+            "a Stopped row is not stopped again"
+        );
         Ok(())
     }
 

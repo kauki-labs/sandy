@@ -306,10 +306,13 @@ impl EnvironmentDriver {
         let Some(limit) = self.config.idle_timeout else {
             return Ok(());
         };
-        let since = row.last_activity_at.unwrap_or(row.updated_at);
-        if now.saturating_sub(since) >= i64::try_from(limit.as_secs()).unwrap_or(i64::MAX)
-            && self.store.stop(&row.environment_id)? == EnvTransition::Applied
-        {
+        // Conditional in the store: `row` is a snapshot, and a renewal that landed after
+        // it (the probe can be slow) must win.
+        if self.store.stop_if_idle(
+            &row.environment_id,
+            now,
+            i64::try_from(limit.as_secs()).unwrap_or(i64::MAX),
+        )? {
             report.idle_stopped.push(row.environment_id.clone());
         }
         Ok(())
@@ -638,9 +641,13 @@ mod tests {
         let id = add(&store, 1)?;
         driver.reconcile_once(now())?;
         store.touch(&id, now() + 10)?;
-        driver.reconcile_once(now() + 400)?; // idle-stopped
+        let stopped = driver.reconcile_once(now() + 400)?;
+        assert_eq!(stopped.idle_stopped, std::slice::from_ref(&id));
         driver.reconcile_once(now())?; // box killed
-        store.resume(&id)?;
+        assert!(
+            matches!(store.resume(&id)?, EnvTransition::Applied),
+            "resume must apply"
+        );
         driver.reconcile_once(now())?; // relaunch to Ready (the store stamps real time, so no offset)
         assert_eq!(state(&store, &id)?.state, EnvironmentState::Ready);
         let rec = state(&store, &id)?;
