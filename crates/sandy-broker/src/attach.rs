@@ -44,8 +44,10 @@ const TICKET_BYTES: usize = 32;
 const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often a stream checks whether the job ended.
 const POLL: Duration = Duration::from_secs(1);
-/// How long a stream drains trailing output after it sees the job end.
-const DRAIN: Duration = Duration::from_secs(2);
+/// After the job ended, a stream ends once the data plane is quiet this long.
+const QUIET: Duration = Duration::from_millis(500);
+/// The most a stream drains after the job ended, however much keeps arriving.
+const DRAIN_CAP: Duration = Duration::from_secs(30);
 /// Chunks buffered between the producer and the HTTP body.
 const CHUNK_DEPTH: usize = 8;
 
@@ -285,11 +287,23 @@ impl Drop for AbortOnDrop {
 
 type Frames = mpsc::Receiver<Result<Option<LinkFrame>, ()>>;
 
+/// Frames buffered between the data-plane reader and the pump. Small, so a stalled client pins
+/// little memory (a frame can be 1 MiB).
+const FRAME_DEPTH: usize = 2;
+
+/// How a stream ended.
+enum End {
+    /// The client went away or stopped reading: send nothing more.
+    ClientGone,
+    /// Send this `exit` reason.
+    Exit(String),
+}
+
 /// Runs one stream to its end. The write half of the connection is held but never written or
 /// shut down: a client EOF makes sandyd's relay leave the channel.
 async fn pump(state: Arc<State>, id: String, conn: UnixStream, tx: mpsc::Sender<Bytes>, _slot: StreamSlot) {
     let (mut read_half, _write_half) = tokio::io::split(conn);
-    let (frames_tx, mut frames): (_, Frames) = mpsc::channel(16);
+    let (frames_tx, mut frames): (_, Frames) = mpsc::channel(FRAME_DEPTH);
     let _reader = AbortOnDrop(tokio::spawn(async move {
         loop {
             let next = match read_frame(&mut read_half).await {
@@ -303,45 +317,69 @@ async fn pump(state: Arc<State>, id: String, conn: UnixStream, tx: mpsc::Sender<
             }
         }
     }));
-    // `None` means the client hung up: nothing more to send.
-    if let Some(reason) = run(&state, &id, &tx, &mut frames).await {
-        let _ = tx.send(line(&Event::Exit { reason })).await;
+    if let End::Exit(reason) = run(&state, &id, &tx, &mut frames).await {
+        let _ = tokio::time::timeout(state.send_timeout, tx.send(line(&Event::Exit { reason }))).await;
     }
 }
 
-async fn run(state: &State, id: &str, tx: &mpsc::Sender<Bytes>, frames: &mut Frames) -> Option<String> {
-    let mut tick = tokio::time::interval(POLL);
+async fn run(state: &State, id: &str, tx: &mpsc::Sender<Bytes>, frames: &mut Frames) -> End {
+    // The first poll waits a full period: the job's replay is already flowing by then.
+    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + POLL, POLL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
-            () = tx.closed() => return None,
+            () = tx.closed() => return End::ClientGone,
             frame = frames.recv() => match frame {
                 Some(Ok(Some(frame))) => {
-                    if !forward(tx, frame).await {
-                        return None;
+                    if !forward(tx, frame, state.send_timeout).await {
+                        return End::ClientGone;
                     }
                 }
-                Some(Ok(None)) | None => return Some("closed".to_owned()),
-                Some(Err(())) => return Some("fault:data plane error".to_owned()),
+                Some(Ok(None)) | None => return End::Exit("closed".to_owned()),
+                Some(Err(())) => return End::Exit("fault:data plane error".to_owned()),
             },
             _ = tick.tick() => {
-                if let Some(status) = terminal_status(state, id).await {
-                    let deadline = tokio::time::Instant::now() + DRAIN;
-                    while let Ok(Some(Ok(Some(frame)))) = tokio::time::timeout_at(deadline, frames.recv()).await {
-                        if !forward(tx, frame).await {
-                            return None;
-                        }
-                    }
-                    return Some(format!("job_terminal:{status}"));
+                let status = tokio::select! {
+                    () = tx.closed() => return End::ClientGone,
+                    status = terminal_status(state, id) => status,
+                };
+                if let Some(status) = status {
+                    return drain(state, tx, frames, status).await;
                 }
             }
         }
     }
 }
 
-/// Sends a delivered chunk as an `output` line. `false` when the client is gone. Archive frames
-/// and anything else are dropped.
-async fn forward(tx: &mpsc::Sender<Bytes>, frame: LinkFrame) -> bool {
+/// After the job ended: keeps forwarding until the data plane is quiet for [`QUIET`], or ends
+/// with `job_terminal_truncated` if frames still flow at [`DRAIN_CAP`].
+async fn drain(state: &State, tx: &mpsc::Sender<Bytes>, frames: &mut Frames, status: &str) -> End {
+    let deadline = tokio::time::Instant::now() + DRAIN_CAP;
+    loop {
+        let next = tokio::select! {
+            () = tx.closed() => return End::ClientGone,
+            next = tokio::time::timeout(QUIET, frames.recv()) => next,
+        };
+        match next {
+            // Quiet, or the data plane ended: everything sandyd had is out.
+            Err(_) | Ok(None | Some(Ok(None) | Err(()))) => return End::Exit(format!("job_terminal:{status}")),
+            Ok(Some(Ok(Some(frame)))) => {
+                match tokio::time::timeout_at(deadline, forward(tx, frame, state.send_timeout)).await {
+                    Ok(true) => {}
+                    Ok(false) => return End::ClientGone,
+                    Err(_) => return End::Exit(format!("job_terminal_truncated:{status}")),
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return End::Exit(format!("job_terminal_truncated:{status}"));
+                }
+            }
+        }
+    }
+}
+
+/// Sends a delivered chunk as an `output` line, waiting at most `send_timeout` for room. `false`
+/// when the client is gone or stopped reading. Archive frames and anything else are dropped.
+async fn forward(tx: &mpsc::Sender<Bytes>, frame: LinkFrame, send_timeout: Duration) -> bool {
     let LinkFrame::Deliver {
         content_type, payload, ..
     } = frame
@@ -356,7 +394,23 @@ async fn forward(tx: &mpsc::Sender<Bytes>, frame: LinkFrame) -> bool {
         return true;
     };
     let data = STANDARD.encode(bytes);
-    tx.send(line(&Event::Output { data })).await.is_ok()
+    match tokio::time::timeout(send_timeout, tx.send(line(&Event::Output { data }))).await {
+        Ok(sent) => sent.is_ok(),
+        Err(_) => {
+            tracing::info!("an attach client stopped reading; ending its stream");
+            false
+        }
+    }
+}
+
+/// The `STATUS` name once a job left `Pending` and `Running`. An unknown or unspecified number
+/// reads as failed, as the status route does.
+fn terminal_name(status: i32) -> Option<&'static str> {
+    match JobStatus::try_from(status) {
+        Ok(JobStatus::Pending | JobStatus::Running) => None,
+        Ok(s @ (JobStatus::Succeeded | JobStatus::Failed | JobStatus::Cancelled)) => Some(s.as_str_name()),
+        _ => Some(JobStatus::Failed.as_str_name()),
+    }
 }
 
 /// The job's status name once it left `Pending` and `Running`. A failed status call reads as
@@ -366,8 +420,7 @@ async fn terminal_status(state: &State, id: &str) -> Option<&'static str> {
     let Ok(control_response::Result::Status(status)) = rpc(state, op).await else {
         return None;
     };
-    let status = JobStatus::try_from(status.status).unwrap_or(JobStatus::Unspecified);
-    (!matches!(status, JobStatus::Pending | JobStatus::Running)).then(|| status.as_str_name())
+    terminal_name(status.status)
 }
 
 #[cfg(test)]
@@ -400,6 +453,7 @@ mod tests {
             clients: Vec::new(),
             owners: crate::owners::Owners::open(&dir.join("state"))?,
             tickets: Tickets::new(Duration::from_secs(30)),
+            send_timeout: Duration::from_secs(30),
             env_create: HashMap::new(),
         })
     }
@@ -415,8 +469,19 @@ mod tests {
         tokio::time::sleep(POLL + Duration::from_millis(300)).await;
         drop(rx);
         let ended = tokio::time::timeout(Duration::from_millis(500), running).await;
-        assert!(ended.is_ok(), "the hang-up was not noticed while the status call hung");
+        assert!(
+            matches!(ended, Ok(Ok(End::ClientGone))),
+            "the hang-up was not noticed while the status call hung"
+        );
         Ok(())
+    }
+
+    #[test]
+    fn an_unknown_or_unspecified_status_reads_as_failed() {
+        assert_eq!(terminal_name(0), Some("JOB_STATUS_FAILED"));
+        assert_eq!(terminal_name(99), Some("JOB_STATUS_FAILED"));
+        assert_eq!(terminal_name(JobStatus::Running as i32), None);
+        assert_eq!(terminal_name(JobStatus::Cancelled as i32), Some("JOB_STATUS_CANCELLED"));
     }
 
     #[test]

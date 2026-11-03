@@ -215,6 +215,7 @@ pub async fn serve_with_tuning(config: BrokerConfig, tuning: Tuning) -> Result<R
     let state = Arc::new(server::State {
         owners: owners::Owners::open(&config.state_dir)?,
         tickets: attach::Tickets::new(ticket_ttl),
+        send_timeout: tuning.send_timeout,
         control_socket: config.control_socket,
         rpc_deadline: config.rpc_deadline,
         clients: config.clients,

@@ -29,6 +29,8 @@ pub(crate) struct State {
     pub(crate) clients: Vec<Client>,
     pub(crate) owners: Owners,
     pub(crate) tickets: attach::Tickets,
+    /// How long one write to a stalled attach client may block.
+    pub(crate) send_timeout: std::time::Duration,
     /// Serializes one client's environment creates, so a quota check and its create are one step.
     pub(crate) env_create: std::collections::HashMap<String, tokio::sync::Mutex<()>>,
 }
