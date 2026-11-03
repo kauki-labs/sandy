@@ -115,18 +115,20 @@ mod tests {
     use super::*;
 
     /// A vsock port is per guest, so the service relay needs one number, but it must not collide with the other
-    /// ports the host and guest agree on: the agent link (5000) and the egress proxy (5001).
+    /// ports the host and guest agree on (the agent link on 5000, the egress proxy on 5001). It must also be a
+    /// privileged port: the kernel lets only a process with `CAP_NET_BIND_SERVICE` bind a vsock port of 1023 or
+    /// below, so a harness running as the unprivileged service user cannot squat the relay's port and answer the
+    /// bridge's dial with the ready byte.
     #[test]
-    fn the_service_relay_port_collides_with_no_other_guest_port() {
-        assert_eq!(PORT_RELAY_VSOCK_PORT, 5_100);
+    fn the_service_relay_port_is_privileged_and_collides_with_no_other_guest_port() {
+        assert_eq!(PORT_RELAY_VSOCK_PORT, 1_000);
+        assert!(
+            PORT_RELAY_VSOCK_PORT <= 1_023,
+            "a port above 1023 can be bound by any guest process"
+        );
         for other in [AGENT_VSOCK_PORT, 5_001] {
             assert_ne!(PORT_RELAY_VSOCK_PORT, other);
         }
-        assert_ne!(
-            PORT_RELAY_VSOCK_PORT,
-            u32::MAX,
-            "u32::MAX is VMADDR_PORT_ANY, not a port"
-        );
     }
 
     #[test]
