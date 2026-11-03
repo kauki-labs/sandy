@@ -158,11 +158,12 @@ where
     let last = AtomicU64::new(0);
     let (a_read, a_write) = split(a);
     let (b_read, b_write) = split(b);
-    let (up, down) = tokio::join!(
+    // try_join: one direction's error drops the other, closing the connection instead of holding it to the idle limit.
+    tokio::try_join!(
         pump(a_read, b_write, start, &last, idle),
         pump(b_read, a_write, start, &last, idle)
-    );
-    up.and(down)
+    )
+    .map(|_| ())
 }
 
 /// One direction of [`copy_until_idle`]. A read that times out is idle only if the other direction also moved
@@ -178,7 +179,10 @@ where
         match timeout(idle, from.read(&mut buf)).await {
             Ok(Ok(0)) => return to.shutdown().await,
             Ok(Ok(n)) => {
-                to.write_all(&buf[..n]).await?;
+                // A peer that stopped reading blocks the write, and a blocked write never reaches the read timeout.
+                timeout(idle, to.write_all(&buf[..n]))
+                    .await
+                    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write stalled"))??;
                 last.store(elapsed_ms(start), Ordering::Relaxed);
             }
             Ok(Err(e)) => return Err(e),
@@ -462,6 +466,39 @@ mod tests {
             "a slot freed by a closed connection is reusable"
         );
         relay.abort();
+        Ok(())
+    }
+
+    /// A peer that stopped reading must not pin the connection: the other direction's idle error ends it.
+    #[tokio::test]
+    async fn a_direction_that_ends_in_error_closes_the_other() -> anyhow::Result<()> {
+        let (a, mut a_peer) = duplex(64);
+        let (b, _b_peer) = duplex(64);
+        tokio::spawn(async move {
+            let _ = a_peer.write_all(&[7u8; 1 << 20]).await;
+        });
+        let ended = timeout(WAIT, copy_until_idle(a, b, Duration::from_millis(200)))
+            .await
+            .context("a stalled write kept the connection open")?;
+        assert_eq!(ended.err().map(|e| e.kind()), Some(io::ErrorKind::TimedOut));
+        Ok(())
+    }
+
+    /// Both peers send and neither reads: each pump blocks in a write, so the read timeout never runs.
+    #[tokio::test]
+    async fn a_write_to_a_peer_that_never_reads_times_out() -> anyhow::Result<()> {
+        let (a, mut a_peer) = duplex(64);
+        let (b, mut b_peer) = duplex(64);
+        tokio::spawn(async move {
+            let _ = a_peer.write_all(&[1u8; 1 << 20]).await;
+        });
+        tokio::spawn(async move {
+            let _ = b_peer.write_all(&[2u8; 1 << 20]).await;
+        });
+        let ended = timeout(WAIT, copy_until_idle(a, b, Duration::from_millis(200)))
+            .await
+            .context("two stalled writes kept the connection open")?;
+        assert_eq!(ended.err().map(|e| e.kind()), Some(io::ErrorKind::TimedOut));
         Ok(())
     }
 
