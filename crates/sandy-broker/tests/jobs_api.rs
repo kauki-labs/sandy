@@ -1,113 +1,17 @@
 //! Tier-2 acceptance for the broker's job endpoints (#591): the broker runs over
 //! an in-process sandyd on a real UDS, and a real HTTP client drives it.
 
-use std::{net::SocketAddr, path::Path, sync::Arc};
+mod common;
+
+use std::{net::SocketAddr, path::Path};
 
 use anyhow::{Context, Result};
 use base64::Engine;
+use common::{TOKEN_A, TOKEN_B, client, fixture, submit_body};
 use reqwest::{Client as Http, StatusCode};
-use sandy_broker::{BrokerConfig, BrokerError, Client, IsolationClass, Running, serve};
-use sandyd::{dispatch::JobRegistry, host_registry::HostRegistry, store::JobStore};
+use sandy_broker::{BrokerConfig, BrokerError, Client, IsolationClass, serve};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use tokio::net::UnixListener;
-
-const TOKEN_A: &str = "token-of-client-a";
-const TOKEN_B: &str = "token-of-client-b";
-
-struct Fixture {
-    base: String,
-    store: Arc<JobStore>,
-    http: Http,
-    _broker: Running,
-    _dir: tempfile::TempDir,
-    root_a: std::path::PathBuf,
-}
-
-fn client(id: &str, token: &str, max: IsolationClass, roots: Vec<std::path::PathBuf>) -> Client {
-    Client {
-        id: id.to_owned(),
-        token_sha256: hex::encode(Sha256::digest(token.as_bytes())),
-        max_isolation_class: max,
-        roots,
-    }
-}
-
-async fn fixture() -> Result<Fixture> {
-    let dir = tempfile::tempdir()?;
-    let socket = dir.path().join("sandyd.sock");
-    let store = Arc::new(JobStore::open_in_memory()?);
-    let registry = Arc::new(JobRegistry::new()?);
-    let hosts = Arc::new(HostRegistry::default());
-    let listener = UnixListener::bind(&socket)?;
-    let environments = Arc::new(sandyd::environment_store::EnvironmentStore::open_in_memory()?);
-    let (s, e, r, h) = (Arc::clone(&store), environments, registry, hosts);
-    tokio::spawn(async move {
-        while let Ok((stream, _)) = listener.accept().await {
-            tokio::spawn(sandyd::serve_connection(
-                stream,
-                Arc::clone(&s),
-                Arc::clone(&e),
-                Arc::clone(&r),
-                Arc::clone(&h),
-                None,
-            ));
-        }
-    });
-    let root_a = dir.path().join("root-a");
-    std::fs::create_dir(&root_a)?;
-    let broker = serve(BrokerConfig {
-        control_socket: socket,
-        rpc_deadline: std::time::Duration::from_secs(30),
-        state_dir: dir.path().join("state"),
-        bind: "127.0.0.1:0".parse()?,
-        clients: vec![
-            client("a", TOKEN_A, IsolationClass::Trusted, vec![root_a.clone()]),
-            client("b", TOKEN_B, IsolationClass::Untrusted, vec![]),
-        ],
-    })
-    .await?;
-    Ok(Fixture {
-        base: format!("http://{}", broker.addr),
-        store,
-        http: Http::new(),
-        _broker: broker,
-        _dir: dir,
-        root_a,
-    })
-}
-
-fn submit_body() -> Value {
-    json!({"manifest": "bQ==", "manifest_encoding": "test/v1", "required_isolation_class": "trusted"})
-}
-
-impl Fixture {
-    async fn call(
-        &self,
-        method: &str,
-        path: &str,
-        token: Option<&str>,
-        body: Option<Value>,
-    ) -> Result<(StatusCode, Value)> {
-        let mut req = self.http.request(method.parse()?, format!("{}{path}", self.base));
-        if let Some(t) = token {
-            req = req.bearer_auth(t);
-        }
-        if let Some(b) = body {
-            req = req.json(&b);
-        }
-        let resp = req.send().await?;
-        let status = resp.status();
-        let text = resp.text().await?;
-        Ok((status, serde_json::from_str(&text).unwrap_or(Value::String(text))))
-    }
-
-    async fn submit(&self, token: &str) -> Result<String> {
-        let (status, body) = self.call("POST", "/v1/jobs", Some(token), Some(submit_body())).await?;
-        assert_eq!(status, StatusCode::ACCEPTED, "submit failed: {body}");
-        Ok(body["job_id"].as_str().context("job_id")?.to_owned())
-    }
-}
 
 #[tokio::test]
 async fn a_request_without_a_valid_token_is_unauthenticated() -> Result<()> {
@@ -328,21 +232,16 @@ async fn an_ambiguous_clients_list_is_refused_at_startup() -> Result<()> {
 }
 
 #[tokio::test]
-async fn attach_and_environments_are_typed_unsupported() -> Result<()> {
+async fn attach_is_typed_unsupported() -> Result<()> {
     let f = fixture().await?;
     let id = f.submit(TOKEN_A).await?;
-    for (method, path) in [
-        ("POST", format!("/v1/jobs/{id}/attach")),
-        ("GET", "/v1/environments".to_owned()),
-        ("POST", "/v1/environments".to_owned()),
-    ] {
-        let (status, body) = f.call(method, &path, Some(TOKEN_A), Some(json!({}))).await?;
-        assert_eq!(
-            (status, &body["code"]),
-            (StatusCode::NOT_IMPLEMENTED, &json!("unsupported")),
-            "{path}"
-        );
-    }
+    let (status, body) = f
+        .call("POST", &format!("/v1/jobs/{id}/attach"), Some(TOKEN_A), Some(json!({})))
+        .await?;
+    assert_eq!(
+        (status, &body["code"]),
+        (StatusCode::NOT_IMPLEMENTED, &json!("unsupported"))
+    );
     Ok(())
 }
 
