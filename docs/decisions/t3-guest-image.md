@@ -20,16 +20,21 @@ nixpkgs pin carries t3code 0.0.44, which lacks `t3 pair --scope`. The owner exer
 
 **Decision.** `nix/guest/flake.nix` adds two guests, `qemu-t3` and `vfkit-t3` (topologies, `nixosConfigurations` and
 `guest-runner-t3` packages), that add a `t3Module` to the base modules. t3 comes from a second input, `nixpkgs-t3`,
-pinned to the root flake's nixpkgs revision, where it is 0.1.2. Only that package uses the second pin, so the base
+pinned to the root flake's nixpkgs revision as of 2026-11-03, where it is 0.1.2. The pin does not follow later
+root bumps (#631). Only that package uses the second pin, so the base
 guest's kernel, agent and topology do not change (the base `qemu` topology is byte-identical to `main`).
 
 The module installs `t3code` built with `enableClaude` and `enableCodex`, so `claude` and `codex` sit on t3's own
-PATH, and `sandy-t3-ready`, a probe that succeeds only when `127.0.0.1:<port>` answers HTTP 200. t3 answers 503 while
-it starts, so readiness never rests on console text. claude-code is unfree, so the module allows that one package.
+PATH, and `sandy-t3-ready`, a probe that succeeds when `127.0.0.1:<port>` answers HTTP with a status below 500. t3 answers
+503 while it starts and 401 once auth is on, so readiness never rests on console text. It proves an HTTP listener, not
+that t3's API or websocket is up. It refuses a port argument that is not digits and bypasses any proxy variable. claude-code is unfree, so the module allows that one package.
 
 **Consequences.**
 
-- The image holds no key, token or config. Provider config dirs and the pairing scope come at run time.
+- The guest has 2 GiB (`microvm.mem`, forced over the base guest's 512 MiB), because the topology's value is what a
+  caller that omits `--mem` boots with.
+- The image holds no key, token or config. The credential module exports every staged secret into the login shell,
+  so `t3 serve` and the harnesses it launches inherit them: #589 and #592 own that threat model. Provider config dirs and the pairing scope come at run time.
 - The closure is about 3.7 GB: nixpkgs builds t3code with electron (1.4 GB, plus gtk and gstreamer) and codex is
   1 GB. The image is built once and shared read-only. A server-only build is a follow-up.
 - A bump of the t3 version is a change to the `nixpkgs-t3` pin, independent of the base guest.

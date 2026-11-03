@@ -6,8 +6,9 @@
     microvm.url = "github:microvm-nix/microvm.nix";
     microvm.inputs.nixpkgs.follows = "nixpkgs";
     # The t3 server and its harnesses (#608) come from their own pin so the base guest (kernel, agent) does not
-    # move with it. This is the root flake's nixpkgs revision, where t3code is 0.1.2, the version the owner
-    # exercised. Older pins carry 0.0.44, which lacks `t3 pair --scope`.
+    # move with it. This is the root flake's nixpkgs revision as of 2026-11-03, where t3code is 0.1.2, the version
+    # the owner exercised. It does not follow later root bumps (#631). Older pins carry 0.0.44, which lacks
+    # `t3 pair --scope`.
     nixpkgs-t3.url = "github:NixOS/nixpkgs/31ecbaca1bdefa45dffc409f0250bd8039ea0010";
   };
 
@@ -64,13 +65,34 @@
       # The T3 server and the harness binaries it launches (#608). `t3 serve` is started by the service workload
       # kind (#589), never by the image; provider config dirs (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`) come from the
       # identity profile (#592), so the image holds no key, token or config. t3's wrapper puts `claude` and `codex`
-      # on its own PATH. `sandy-t3-ready` is the probe: it succeeds only once the server answers HTTP 200 on its
-      # loopback port (it replies 503 while starting), so readiness never rests on console text.
+      # on its own PATH. `sandy-t3-ready` is the probe: it succeeds once an HTTP server answers on the loopback port
+      # with a status below 500 (t3 replies 503 while it starts, and 401 once auth is on), so readiness never rests
+      # on console text. It proves an HTTP listener, not that t3's API or websocket is up. The guest gets 2 GiB: the
+      # topology's memory is what a caller that omits `--mem` boots with, and electron-built t3, node and two
+      # harnesses do not fit in the base guest's 512 MiB.
+      #
+      # The image bakes no `HOME` or config dir, but the credential module exports every staged secret into the
+      # login shell, so `t3 serve` and the harnesses it launches inherit them (#589 and #592 own that threat model).
       #
       # The closure is about 3.7 GB because nixpkgs builds t3code with electron (1.4 GB) and the codex binary is
-      # 1 GB. The image is built once and shared read-only. A server-only build is a follow-up.
+      # 1 GB. The image is built once and shared read-only. A server-only build is a follow-up (#628).
+      readyProbe =
+        pkgs:
+        pkgs.writeShellScriptBin "sandy-t3-ready" ''
+          port=''${1:-3773}
+          case "$port" in
+            "" | *[!0-9]*)
+              echo "sandy-t3-ready: the port must be digits, got: $port" >&2
+              exit 2
+              ;;
+          esac
+          code=$(${pkgs.curl}/bin/curl --silent --noproxy '*' --max-time 2 --output /dev/null \
+            --write-out '%{http_code}' "http://127.0.0.1:$port/") || exit 1
+          [ "$code" -ge 100 ] && [ "$code" -lt 500 ]
+        '';
+
       t3Module =
-        { pkgs, ... }:
+        { lib, pkgs, ... }:
         let
           t3pkgs = import nixpkgs-t3 {
             inherit (pkgs.stdenv.hostPlatform) system;
@@ -80,15 +102,12 @@
             enableClaude = true;
             enableCodex = true;
           };
-          ready = pkgs.writeShellScriptBin "sandy-t3-ready" ''
-            exec ${pkgs.curl}/bin/curl --fail --silent --show-error --max-time 2 --output /dev/null \
-              "http://127.0.0.1:''${1:-3773}/"
-          '';
         in
         {
+          microvm.mem = lib.mkForce 2048;
           environment.systemPackages = [
             t3
-            ready
+            (readyProbe pkgs)
           ];
         };
 
