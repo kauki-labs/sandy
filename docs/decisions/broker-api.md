@@ -10,7 +10,7 @@ updated: 2026-11-03
 The HTTP tier in front of sandyd (`sandy-broker`, #591). `sandyd.md` decision 7 puts every
 non-CLI client behind it, and decision 25 makes `sandy-mcp` its first caller. The wire
 contract is [`../api/broker.openapi.yaml`](../api/broker.openapi.yaml). This record covers the
-job-endpoint slice. Environment endpoints wait for #587.
+job and environment endpoints (sections 1 to 6). Attach and link are deferred (section 5).
 
 All decisions here are **proposed**. Items marked _owner_ touch security or the public API
 and need ratification on #591.
@@ -106,9 +106,39 @@ user's files. Tracked in a follow-up issue.
 
 - `attach` returns the typed error `unsupported`. The control RPC's data plane is a UDS stream.
   An HTTP bridge is its own design and aligns with #513 (NDJSON).
-- Environment endpoints return `unsupported` until #587 lands.
+- `link` returns `unsupported` until T3 offers an external link interface (#585 open point 1).
 - Rate limiting, quotas, and the audit trail are #596.
 - `SubmitJob` has no `request_id`. Job idempotency is a contract change and is not made here.
+
+## 6. Environment endpoints map onto sandyd's typed environment RPC (#587 A2)
+
+**Decision.**
+
+- Spawn, get, list, stop, resume, cancel and delete each make one control RPC with the typed
+  messages. The broker never forwards client JSON bytes: sandyd compares the create spec
+  byte for byte, so the broker builds the message.
+- sandyd keys idempotency over all callers. The broker sends `idempotency_key` as a 16-digit
+  hash of the client id, a dot, and the client's `request_id` (at most 111 characters of
+  letters, digits, `-`, `_`, `.`). Two clients never collide, and one cannot learn another's
+  environment through a repeated key.
+- The owner table records the environment and the request id per client. Another client's
+  environment, and an unknown one, both give `not_found` on every route, and list shows only
+  the caller's.
+- Per-client quota: `max_environments` in the clients file (default 4) counts the client's
+  non-terminal environments. A replay of a request id the client already used skips the check.
+  Creates run one at a time, so the check and the create cannot race.
+- sandyd's `EnvironmentError` codes map to fixed messages: `NOT_FOUND` 404 `not_found`,
+  `REQUEST_ID_CONFLICT` 409, `QUOTA_EXCEEDED` 429, `UNSUPPORTED_FOR_LIFETIME` 409,
+  `INVALID_STATE` 409 and `INVALID_ARGUMENT` 400 as `invalid_request`. sandyd's own text is
+  not relayed.
+- A create whose owner save fails answers `unavailable`. The client's retry replays the create,
+  gets the same environment, and records it, so no orphan outlives a retry.
+- `steps` is provisional: sandyd sends none until the launch driver (#587 slice C), and each
+  name maps to status `pending` until slice C pins the format.
+
+**Residual.** A create whose reply times out and is never retried leaves an environment with
+no owner, which the broker cannot list. sandyd's own row cap and the profile checks still apply
+to it. Closing it is the correlation work in #621.
 
 ## Consequences
 

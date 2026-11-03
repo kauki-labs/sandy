@@ -4,6 +4,7 @@
 //! clients and speaks the control RPC to one sandyd over a UDS.
 
 mod auth;
+mod environments;
 mod owners;
 mod paths;
 mod server;
@@ -162,6 +163,7 @@ pub async fn serve(config: BrokerConfig) -> Result<Running, BrokerError> {
         control_socket: config.control_socket,
         rpc_deadline: config.rpc_deadline,
         clients: config.clients,
+        env_create: tokio::sync::Mutex::new(()),
     });
     let bind_err = |source| BrokerError::Bind {
         addr: config.bind,

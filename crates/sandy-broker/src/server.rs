@@ -17,7 +17,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::net::UnixStream;
 
-use crate::{Client, IsolationClass, auth::authenticate, owners::Owners, paths::within_roots};
+use crate::{Client, IsolationClass, auth::authenticate, environments, owners::Owners, paths::within_roots};
 
 const MAX_BODY: usize = 1024 * 1024;
 
@@ -26,13 +26,15 @@ pub(crate) struct State {
     pub(crate) rpc_deadline: std::time::Duration,
     pub(crate) clients: Vec<Client>,
     pub(crate) owners: Owners,
+    /// Serializes environment creates, so a quota check and its create are one step.
+    pub(crate) env_create: tokio::sync::Mutex<()>,
 }
 
 /// A typed API error (the contract's `Error` schema).
-struct ApiError {
-    status: StatusCode,
-    code: &'static str,
-    message: &'static str,
+pub(crate) struct ApiError {
+    pub(crate) status: StatusCode,
+    pub(crate) code: &'static str,
+    pub(crate) message: &'static str,
 }
 
 const UNAUTHENTICATED: ApiError = ApiError {
@@ -40,17 +42,17 @@ const UNAUTHENTICATED: ApiError = ApiError {
     code: "unauthenticated",
     message: "missing or unknown bearer token",
 };
-const NOT_FOUND: ApiError = ApiError {
+pub(crate) const NOT_FOUND: ApiError = ApiError {
     status: StatusCode::NOT_FOUND,
     code: "not_found",
     message: "no such resource",
 };
-const FORBIDDEN: ApiError = ApiError {
+pub(crate) const FORBIDDEN: ApiError = ApiError {
     status: StatusCode::FORBIDDEN,
     code: "forbidden",
     message: "the request exceeds what this client may do",
 };
-const INVALID: ApiError = ApiError {
+pub(crate) const INVALID: ApiError = ApiError {
     status: StatusCode::BAD_REQUEST,
     code: "invalid_request",
     message: "the request body is not valid",
@@ -60,7 +62,7 @@ const UNSUPPORTED: ApiError = ApiError {
     code: "unsupported",
     message: "not supported by this broker yet",
 };
-const UNAVAILABLE: ApiError = ApiError {
+pub(crate) const UNAVAILABLE: ApiError = ApiError {
     status: StatusCode::SERVICE_UNAVAILABLE,
     code: "unavailable",
     message: "sandyd refused or could not be reached",
@@ -108,7 +110,14 @@ pub(crate) async fn handle(state: Arc<State>, req: Request<Incoming>) -> Respons
         (&Method::GET, ["v1", "jobs"]) => list(&state, client).await,
         (&Method::GET, ["v1", "jobs", id]) => get(&state, client, id).await,
         (&Method::POST, ["v1", "jobs", id, "cancel"]) => cancel(&state, client, id).await,
-        (&Method::POST, ["v1", "jobs", _, "attach"]) | (_, ["v1", "environments", ..]) => Err(UNSUPPORTED),
+        (&Method::POST, ["v1", "environments"]) => environments::spawn(&state, client, req).await,
+        (&Method::GET, ["v1", "environments"]) => environments::list(&state, client, req.uri().query()).await,
+        (&Method::GET, ["v1", "environments", id]) => environments::get(&state, client, id).await,
+        (&Method::DELETE, ["v1", "environments", id]) => environments::act(&state, client, id, "delete").await,
+        (&Method::POST, ["v1", "environments", id, action @ ("cancel" | "stop" | "resume")]) => {
+            environments::act(&state, client, id, action).await
+        }
+        (&Method::POST, ["v1", "jobs", _, "attach"] | ["v1", "environments", _, "link"]) => Err(UNSUPPORTED),
         _ => Err(NOT_FOUND),
     };
     match result {
@@ -117,11 +126,20 @@ pub(crate) async fn handle(state: Arc<State>, req: Request<Incoming>) -> Respons
     }
 }
 
-type Reply = Result<(StatusCode, Value), ApiError>;
+pub(crate) type Reply = Result<(StatusCode, Value), ApiError>;
+
+/// The request body, at most [`MAX_BODY`] bytes.
+pub(crate) async fn read_body(req: Request<Incoming>) -> Result<Bytes, ApiError> {
+    Ok(Limited::new(req.into_body(), MAX_BODY)
+        .collect()
+        .await
+        .map_err(|_| INVALID)?
+        .to_bytes())
+}
 
 /// One control-RPC call over a fresh UDS connection. Any transport fault or
 /// `ControlError` becomes `unavailable`: sandyd's own message is not relayed.
-async fn rpc(state: &State, op: control_request::Op) -> Result<control_response::Result, ApiError> {
+pub(crate) async fn rpc(state: &State, op: control_request::Op) -> Result<control_response::Result, ApiError> {
     tokio::time::timeout(state.rpc_deadline, rpc_inner(state, op))
         .await
         .unwrap_or_else(|_| {

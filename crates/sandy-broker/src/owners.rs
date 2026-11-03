@@ -1,7 +1,12 @@
-//! The job-owner table: which client submitted which job, and the attach token
-//! sandyd issued for it. The token never leaves this process (decision 3).
+//! The owner table: which client submitted which job (with the attach token sandyd
+//! issued for it) and which client created which environment. The attach token
+//! never leaves this process (decision 3).
 
-use std::{collections::HashMap, path::Path, sync::Mutex};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Mutex, MutexGuard, PoisonError},
+};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use sandy_fsutil::OwnedDir;
@@ -17,10 +22,23 @@ struct Owned {
     token: String,
 }
 
+/// Everything the file holds.
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct Tables {
+    #[serde(default)]
+    jobs: HashMap<String, Owned>,
+    /// Environment id to owning client.
+    #[serde(default)]
+    environments: HashMap<String, String>,
+    /// `client` and request id to the environment that request created.
+    #[serde(default)]
+    keys: HashMap<String, String>,
+}
+
 /// The persisted owner table. The file is 0600 and replaced atomically.
 pub(crate) struct Owners {
     dir: OwnedDir,
-    table: Mutex<HashMap<String, Owned>>,
+    tables: Mutex<Tables>,
     _lock: std::fs::File,
 }
 
@@ -41,6 +59,12 @@ pub enum OwnersError {
     Locked,
 }
 
+fn key_of(client: &str, request_id: &str) -> String {
+    // Client ids are plain names and request ids never hold a newline, so the
+    // join is unambiguous.
+    format!("{client}\n{request_id}")
+}
+
 impl Owners {
     pub(crate) fn open(state_dir: &Path) -> Result<Self, OwnersError> {
         use std::os::unix::fs::OpenOptionsExt;
@@ -58,49 +82,86 @@ impl Owners {
             .open(dir.path().join(LOCK_FILE))
             .map_err(OwnersError::Read)?;
         lock.try_lock_exclusive().map_err(|_| OwnersError::Locked)?;
-        let table = match std::fs::read(dir.path().join(FILE)) {
+        let tables = match std::fs::read(dir.path().join(FILE)) {
             Ok(bytes) => serde_json::from_slice(&bytes)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Tables::default(),
             Err(e) => return Err(OwnersError::Read(e)),
         };
         Ok(Self {
             dir,
-            table: Mutex::new(table),
+            tables: Mutex::new(tables),
             _lock: lock,
         })
     }
 
-    /// Records `job_id` as owned by `client` with `token`, and saves the table.
-    pub(crate) fn insert(&self, job_id: &str, client: &str, token: &[u8]) -> Result<(), OwnersError> {
-        let mut table = self.table.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        table.insert(
-            job_id.to_owned(),
-            Owned {
-                client: client.to_owned(),
-                token: STANDARD.encode(token),
-            },
-        );
-        let saved = serde_json::to_vec(&*table)
+    fn lock(&self) -> MutexGuard<'_, Tables> {
+        self.tables.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Applies `change` and saves. On a failed save the in-memory table goes back to
+    /// what it was, so a later save cannot persist the failed change.
+    fn update(&self, change: impl FnOnce(&mut Tables)) -> Result<(), OwnersError> {
+        let mut tables = self.lock();
+        let before = tables.clone();
+        change(&mut tables);
+        let saved = serde_json::to_vec(&*tables)
             .map_err(OwnersError::from)
             .and_then(|bytes| self.dir.write_secret(FILE, &bytes).map(drop).map_err(OwnersError::from));
         if saved.is_err() {
-            // Keep memory and disk equal: a later insert must not persist this entry.
-            table.remove(job_id);
+            *tables = before;
         }
         saved
     }
 
+    /// Records `job_id` as owned by `client` with `token`, and saves the table.
+    pub(crate) fn insert(&self, job_id: &str, client: &str, token: &[u8]) -> Result<(), OwnersError> {
+        self.update(|t| {
+            t.jobs.insert(
+                job_id.to_owned(),
+                Owned {
+                    client: client.to_owned(),
+                    token: STANDARD.encode(token),
+                },
+            );
+        })
+    }
+
     /// The attach token of `job_id`, only when `client` owns it.
     pub(crate) fn token_for(&self, job_id: &str, client: &str) -> Option<Vec<u8>> {
-        let table = self.table.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let owned = table.get(job_id).filter(|o| o.client == client)?;
+        let tables = self.lock();
+        let owned = tables.jobs.get(job_id).filter(|o| o.client == client)?;
         STANDARD.decode(&owned.token).ok()
     }
 
     /// Whether `client` owns `job_id`.
     pub(crate) fn owns(&self, job_id: &str, client: &str) -> bool {
-        let table = self.table.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        table.get(job_id).is_some_and(|o| o.client == client)
+        self.lock().jobs.get(job_id).is_some_and(|o| o.client == client)
+    }
+
+    /// Records `environment_id` as created by `client` for `request_id`.
+    pub(crate) fn record_environment(
+        &self,
+        environment_id: &str,
+        client: &str,
+        request_id: &str,
+    ) -> Result<(), OwnersError> {
+        self.update(|t| {
+            t.environments.insert(environment_id.to_owned(), client.to_owned());
+            t.keys.insert(key_of(client, request_id), environment_id.to_owned());
+        })
+    }
+
+    /// Whether `client` owns `environment_id`.
+    pub(crate) fn owns_environment(&self, environment_id: &str, client: &str) -> bool {
+        self.lock()
+            .environments
+            .get(environment_id)
+            .is_some_and(|c| c == client)
+    }
+
+    /// Whether `client` already created an environment for `request_id`.
+    pub(crate) fn has_request(&self, client: &str, request_id: &str) -> bool {
+        self.lock().keys.contains_key(&key_of(client, request_id))
     }
 }
 
@@ -137,6 +198,18 @@ mod tests {
         assert!(!reopened.owns("job-2", "a"));
         let mode = std::fs::metadata(state.join(FILE))?.permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+        Ok(())
+    }
+
+    #[test]
+    fn environment_ownership_and_request_ids_survive_a_restart_per_client() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        Owners::open(dir.path())?.record_environment("env-1", "a", "req")?;
+        let reopened = Owners::open(dir.path())?;
+        assert!(reopened.owns_environment("env-1", "a"));
+        assert!(!reopened.owns_environment("env-1", "b"));
+        assert!(reopened.has_request("a", "req"));
+        assert!(!reopened.has_request("b", "req"), "request ids are per client");
         Ok(())
     }
 }
