@@ -12,21 +12,26 @@
 //! relay accepts before it dials the service), so the bridge counts a dial as successful only after it has read
 //! [`PORT_RELAY_READY`], and does not forward that byte.
 //!
-//! The bridge parses nothing and adds no TLS or auth. Any local user can connect to a loopback port, so the service
-//! authenticates its own clients (t3's pairing token), and tailnet exposure is the host's job (`tailscale serve`).
+//! The bridge parses nothing and adds no TLS or auth. Any local user can connect to a loopback port, so until the
+//! owner decides the exposure (`docs/decisions/agent-fabric.md` decision 10b) it is a development aid for a
+//! single-user host: the service authenticates its own clients (t3's pairing token), and tailnet exposure is the
+//! host's job (`tailscale serve`).
 //! It must run inside a tokio runtime.
 
 use std::{
     future::Future,
     io,
     net::{Ipv4Addr, SocketAddr},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
 use sandy_api::agent::PORT_RELAY_READY;
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, copy_bidirectional},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, split},
     net::{TcpListener, TcpStream},
     sync::{Semaphore, oneshot},
     task::{JoinHandle, JoinSet},
@@ -62,15 +67,21 @@ pub struct BridgeConfig {
     /// How long a client may stay silent before the bridge closes it without dialing. The bridge dials the guest
     /// relay only after the client's first byte, so a connection that sends nothing costs no relay slot and no dial.
     pub first_byte_timeout: Duration,
+    /// How long a relayed connection may carry no byte in either direction before the bridge closes it. A guest
+    /// that sends the ready byte and then goes silent would otherwise pin a slot and two descriptors for good. A
+    /// quiet direction alone is not idle, so a long download or an idle upload keeps the connection open.
+    pub idle_timeout: Duration,
 }
 
 impl Default for BridgeConfig {
     fn default() -> Self {
         Self {
-            max_connections: 256,
+            // Each relayed connection holds two descriptors, and macOS's default soft limit is 256.
+            max_connections: 64,
             dial_window: Duration::from_secs(10),
             dial_retry_interval: Duration::from_millis(200),
             first_byte_timeout: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(15 * 60),
         }
     }
 }
@@ -99,6 +110,12 @@ impl Bridge {
                     Semaphore::MAX_PERMITS,
                     config.max_connections
                 ),
+            ));
+        }
+        if config.idle_timeout.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "idle_timeout must be non-zero: zero would close every connection at once",
             ));
         }
         if !config.dial_window.is_zero() && config.dial_retry_interval.is_zero() {
@@ -196,7 +213,7 @@ async fn accept_loop<D: Dialer>(
 /// that never succeeds closes this client only.
 async fn relay_one<D: Dialer>(mut client: TcpStream, dialer: &D, config: BridgeConfig) {
     // Dial only after the client's first byte: a connection that sends nothing then costs no relay slot and no dial.
-    // `peek` leaves the byte in the socket for `copy_bidirectional` to forward.
+    // `peek` leaves the byte in the socket for the copy to forward.
     let mut first = [0u8; 1];
     match timeout(config.first_byte_timeout, client.peek(&mut first)).await {
         Ok(Ok(n)) if n > 0 => {}
@@ -209,8 +226,55 @@ async fn relay_one<D: Dialer>(mut client: TcpStream, dialer: &D, config: BridgeC
         tracing::debug!("the bridge gave up dialing the guest relay");
         return;
     };
-    // Copies both ways, and half-closes the far side when one side reaches EOF.
-    let _ = copy_bidirectional(&mut client, &mut guest).await;
+    let _ = copy_until_idle(client, guest, config.idle_timeout).await;
+}
+
+/// Copy both ways, half-closing the far side when one side reaches EOF, until both directions end or neither
+/// moves a byte for `idle` ([`io::ErrorKind::TimedOut`]).
+async fn copy_until_idle<A, B>(a: A, b: B, idle: Duration) -> io::Result<()>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let start = Instant::now();
+    let last = AtomicU64::new(0);
+    let (a_read, a_write) = split(a);
+    let (b_read, b_write) = split(b);
+    let (up, down) = tokio::join!(
+        pump(a_read, b_write, start, &last, idle),
+        pump(b_read, a_write, start, &last, idle)
+    );
+    up.and(down)
+}
+
+/// One direction of [`copy_until_idle`]. A read that times out is idle only if the other direction also moved
+/// nothing for `idle`; the shared `last` holds the millisecond of the latest byte either way.
+async fn pump<R, W>(mut from: R, mut to: W, start: Instant, last: &AtomicU64, idle: Duration) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let idle_ms = u64::try_from(idle.as_millis()).unwrap_or(u64::MAX);
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        match timeout(idle, from.read(&mut buf)).await {
+            Ok(Ok(0)) => return to.shutdown().await,
+            Ok(Ok(n)) => {
+                to.write_all(&buf[..n]).await?;
+                last.store(elapsed_ms(start), Ordering::Relaxed);
+            }
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                if elapsed_ms(start).saturating_sub(last.load(Ordering::Relaxed)) >= idle_ms {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "connection idle"));
+                }
+            }
+        }
+    }
+}
+
+fn elapsed_ms(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Dial until the guest relay answers with [`PORT_RELAY_READY`], or the window ends.
@@ -379,6 +443,7 @@ mod tests {
             dial_window: Duration::from_millis(window_ms),
             dial_retry_interval: Duration::from_millis(20),
             first_byte_timeout: Duration::from_secs(5),
+            idle_timeout: Duration::from_secs(60),
         }
     }
 
@@ -665,6 +730,78 @@ mod tests {
 
         let mut talker = TcpStream::connect(bridge.addr()).await?;
         assert!(echoes(&mut talker, b"hi").await, "a client that sends is served");
+        Ok(())
+    }
+
+    /// A guest that announces readiness and then goes silent must not hold a slot for good.
+    #[tokio::test]
+    async fn a_silent_relayed_connection_is_closed_after_the_idle_timeout() -> anyhow::Result<()> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .context("bind silent guest")?;
+        let guest = listener.local_addr()?;
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let _ = socket.write_all(&[PORT_RELAY_READY]).await;
+                held.push(socket);
+            }
+        });
+        let (dialer, _) = TcpDialer::new(guest);
+        let config = BridgeConfig {
+            idle_timeout: Duration::from_millis(300),
+            ..config(1, 0)
+        };
+        let bridge = Bridge::start(dialer, config).await?;
+
+        let mut client = TcpStream::connect(bridge.addr()).await?;
+        client.write_all(b"x").await?;
+        let mut byte = [0u8; 1];
+        let closed = timeout(WAIT, client.read(&mut byte))
+            .await
+            .context("a silent relayed connection was never closed")?;
+        assert!(
+            matches!(closed, Ok(0) | Err(_)),
+            "a silent connection must be closed, got {closed:?}"
+        );
+        Ok(())
+    }
+
+    /// Traffic in either direction is activity: a connection that keeps talking outlives the idle timeout.
+    #[tokio::test]
+    async fn a_connection_with_traffic_outlives_the_idle_timeout() -> anyhow::Result<()> {
+        let guest = echo_guest().await?;
+        let (dialer, _) = TcpDialer::new(guest);
+        let config = BridgeConfig {
+            idle_timeout: Duration::from_millis(400),
+            ..config(4, 0)
+        };
+        let bridge = Bridge::start(dialer, config).await?;
+        let mut client = TcpStream::connect(bridge.addr()).await?;
+        for i in 0..6u8 {
+            assert!(
+                echoes(&mut client, &[b'a' + i]).await,
+                "an active connection must stay open past the idle timeout"
+            );
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        Ok(())
+    }
+
+    /// A zero idle timeout would close every connection at once, so it is an error at `start`.
+    #[tokio::test]
+    async fn a_zero_idle_timeout_is_refused_at_start() -> anyhow::Result<()> {
+        let (guest, _) = flaky_guest(0).await?;
+        let (dialer, _) = TcpDialer::new(guest);
+        let zero = BridgeConfig {
+            idle_timeout: Duration::ZERO,
+            ..config(8, 0)
+        };
+        let refused = Bridge::start(dialer, zero).await;
+        assert!(
+            matches!(&refused, Err(e) if e.kind() == io::ErrorKind::InvalidInput),
+            "a zero idle timeout must be refused, got {refused:?}"
+        );
         Ok(())
     }
 

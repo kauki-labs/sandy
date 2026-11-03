@@ -470,13 +470,16 @@ reaches the unix socket vfkit exposes for a guest vsock port, and `VsockDialer` 
 vhost-vsock on qemu. The environment backend owns one bridge per environment, so `shutdown()` is how a stopped
 environment refuses connections.
 
-- **Limits.** At most `max_connections` clients at once (256 by default); a client over the cap is closed unanswered.
+- **Limits.** At most `max_connections` clients at once (64 by default: each client holds two descriptors, and macOS's default soft limit is 256); a client over the cap
+  is closed unanswered.
   A client waiting in its dial window holds a slot. The bridge dials the guest only after the client's first byte
   (peeked, so it is still forwarded), and closes a client that sends nothing within `first_byte_timeout` (30 s), so a
   silent connection costs no relay slot. A dial is retried every `dial_retry_interval` (200 ms) for `dial_window`
   (10 s), and one attempt, including the wait for the ready byte, is bounded at 5 s, so a client can wait up to the
-  window plus 5 s. There is no idle timeout once data has moved. `start` refuses a cap of 0 or above
-  `Semaphore::MAX_PERMITS`, and a zero retry interval with a non-zero window.
+  window plus 5 s. A relayed connection that moves no byte in either direction for `idle_timeout` (15 minutes) is
+  closed, so a guest that sends the ready byte and goes silent cannot hold a slot for good; a quiet direction alone
+  is not idle. `start` refuses a cap of 0 or above `Semaphore::MAX_PERMITS`, a zero idle timeout, and a zero retry
+  interval with a non-zero window.
 - **Readiness.** A dial counts only after the guest relay's ready byte (10a). The byte is not forwarded.
 - **Shutdown.** `shutdown()` stops the listener and ends every connection task, including a client still in its dial
   window, before it returns. Drop sends the same stop and returns at once.
@@ -488,8 +491,9 @@ environment refuses connections.
   the bridge (the primary or `tailscale serve` would have to accept a unix target), a per-run token that the client or
   a front proxy presents, or accepting the loopback port as deliberate exposure. Until the owner decides, the bridge
   is a development aid for a single-user host, and the tailnet exposure is the host's job (`tailscale serve`).
-- **Availability.** A local user can hold the cap open (idle connections after their first byte), and on qemu any host
-  process can hold the relay's own 256 slots. Only authentication closes this (10a); the cap bounds descriptors.
+- **Availability.** A local user can still hold the cap open with connections that keep trickling bytes, and on qemu
+  any host process can hold the relay's own 256 slots. The idle timeout frees silent slots only; authentication is
+  what closes this (10a), and the cap bounds descriptors.
 - **Not covered here.** The `EnvironmentBackend` that starts and stops a bridge per environment (#587 slice C), the
   vfkit `connect` device in `vfkit_args`, and the live round trip through a real guest.
 

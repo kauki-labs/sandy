@@ -101,6 +101,7 @@ mod tests {
             dial_window: Duration::from_millis(window_ms),
             dial_retry_interval: Duration::from_millis(20),
             first_byte_timeout: Duration::from_secs(5),
+            idle_timeout: Duration::from_secs(60),
         }
     }
 
