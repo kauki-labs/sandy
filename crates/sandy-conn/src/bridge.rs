@@ -8,8 +8,13 @@
 //! a dial for a short window while the relay comes up, and, when shut down or dropped, closes every live connection
 //! and stops listening. That last part is how a stopped environment refuses connections.
 //!
-//! The bridge parses nothing and adds no TLS or auth. Tailnet exposure is the host's job (`tailscale serve`), and the
-//! service authenticates its own clients (t3's pairing token).
+//! A connected stream does not mean the guest is ready (vfkit's proxy accepts before the guest listens, and the
+//! relay accepts before it dials the service), so the bridge counts a dial as successful only after it has read
+//! [`PORT_RELAY_READY`], and does not forward that byte.
+//!
+//! The bridge parses nothing and adds no TLS or auth. Any local user can connect to a loopback port, so the service
+//! authenticates its own clients (t3's pairing token), and tailnet exposure is the host's job (`tailscale serve`).
+//! It must run inside a tokio runtime.
 
 use std::{
     future::Future,
@@ -19,15 +24,17 @@ use std::{
     time::Duration,
 };
 
+use sandy_api::agent::PORT_RELAY_READY;
 use tokio::{
-    io::{AsyncRead, AsyncWrite, copy_bidirectional},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, copy_bidirectional},
     net::{TcpListener, TcpStream},
-    sync::Semaphore,
+    sync::{Semaphore, oneshot},
     task::{JoinHandle, JoinSet},
     time::{Instant, sleep, timeout},
 };
 
-/// One dial attempt may not take longer than this. The window bounds the retries, not a single hung attempt.
+/// One dial attempt, readiness byte included, may not take longer than this. The window bounds the retries, not
+/// a single hung attempt.
 const DIAL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Opens one stream to the guest relay.
@@ -35,14 +42,16 @@ pub trait Dialer: Send + Sync + 'static {
     /// One stream to the guest relay.
     type Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static;
 
-    /// Open a new stream to the guest relay.
+    /// Open a new stream to the guest relay. Return as soon as the stream is connected: the bridge itself waits for
+    /// the relay's [`PORT_RELAY_READY`] byte.
     fn dial(&self) -> impl Future<Output = io::Result<Self::Stream>> + Send;
 }
 
 /// How a [`Bridge`] limits and retries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BridgeConfig {
-    /// The most connections relayed at once. A connection over the cap is closed unanswered.
+    /// The most connections relayed at once, from 1 to [`Semaphore::MAX_PERMITS`]. A client over the cap is closed
+    /// unanswered. A client waiting in its dial window holds a slot.
     pub max_connections: usize,
     /// How long a failing dial is retried before the client's connection is closed. Zero means one attempt.
     pub dial_window: Duration,
@@ -61,9 +70,11 @@ impl Default for BridgeConfig {
 }
 
 /// A running bridge. Dropping it closes it.
+#[must_use = "dropping the bridge closes it"]
 #[derive(Debug)]
 pub struct Bridge {
     addr: SocketAddr,
+    stop: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<()>>,
 }
 
@@ -71,12 +82,28 @@ impl Bridge {
     /// Bind `127.0.0.1` on an ephemeral port and start relaying to `dialer`.
     ///
     /// # Errors
-    /// Returns the bind error.
+    /// [`io::ErrorKind::InvalidInput`] when `config.max_connections` is 0 or above [`Semaphore::MAX_PERMITS`]
+    /// (a bridge that can never serve is an error here, not a silent refusal of every client), and the bind error.
     pub async fn start<D: Dialer>(dialer: D, config: BridgeConfig) -> io::Result<Self> {
+        if config.max_connections == 0 || config.max_connections > Semaphore::MAX_PERMITS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "max_connections must be between 1 and {}, got {}",
+                    Semaphore::MAX_PERMITS,
+                    config.max_connections
+                ),
+            ));
+        }
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let addr = listener.local_addr()?;
-        let task = tokio::spawn(accept_loop(listener, Arc::new(dialer), config));
-        Ok(Self { addr, task: Some(task) })
+        let (stop, stopped) = oneshot::channel();
+        let task = tokio::spawn(accept_loop(listener, Arc::new(dialer), config, stopped));
+        Ok(Self {
+            addr,
+            stop: Some(stop),
+            task: Some(task),
+        })
     }
 
     /// The loopback address clients connect to.
@@ -85,49 +112,66 @@ impl Bridge {
         self.addr
     }
 
-    /// Stop listening and close every live connection. Returns once they are closed.
+    /// Stop listening and close every live connection, including a client still waiting in its dial window.
+    /// Returns once the listener is closed and every connection task has ended, so nothing is forwarded after it.
     pub async fn shutdown(mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
         if let Some(task) = self.task.take() {
-            task.abort();
             let _ = task.await;
         }
     }
 }
 
 impl Drop for Bridge {
+    /// Signals the same stop as [`Bridge::shutdown`] and returns at once: the listener and the connections close a
+    /// moment later, when the bridge's task runs. Call `shutdown` where the close must be complete.
     fn drop(&mut self) {
-        if let Some(task) = self.task.take() {
-            task.abort();
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
         }
     }
 }
 
-/// Accept clients until the task is aborted. Dropping the task drops `live`, which aborts every relayed
-/// connection, and drops the listener, which refuses new ones.
-async fn accept_loop<D: Dialer>(listener: TcpListener, dialer: Arc<D>, config: BridgeConfig) {
+/// Accept clients until `stopped` fires (or its sender is dropped), then close the listener and end every relayed
+/// connection before returning.
+async fn accept_loop<D: Dialer>(
+    listener: TcpListener,
+    dialer: Arc<D>,
+    config: BridgeConfig,
+    mut stopped: oneshot::Receiver<()>,
+) {
     let slots = Arc::new(Semaphore::new(config.max_connections));
     let mut live = JoinSet::new();
     loop {
         // Reap finished connections so the set does not grow with every client ever served.
         while live.try_join_next().is_some() {}
-        let client = match listener.accept().await {
-            Ok((client, _)) => client,
-            Err(_) => {
-                // EMFILE and friends are not a listener failure: back off and keep serving.
-                sleep(Duration::from_millis(100)).await;
-                continue;
-            }
+        let client = tokio::select! {
+            _ = &mut stopped => break,
+            accepted = listener.accept() => match accepted {
+                Ok((client, _)) => client,
+                Err(_) => {
+                    // EMFILE and friends are not a listener failure: back off and keep serving.
+                    sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            },
         };
         let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
             drop(client);
             continue;
         };
+        // Small interactive frames (a websocket) must not wait on Nagle.
+        let _ = client.set_nodelay(true);
         let dialer = Arc::clone(&dialer);
         live.spawn(async move {
             relay_one(client, &*dialer, config).await;
             drop(slot);
         });
     }
+    drop(listener);
+    live.shutdown().await;
 }
 
 /// Relay one client: dial the guest relay inside the window, then copy both ways until either side closes. A dial
@@ -140,16 +184,32 @@ async fn relay_one<D: Dialer>(mut client: TcpStream, dialer: &D, config: BridgeC
     let _ = copy_bidirectional(&mut client, &mut guest).await;
 }
 
+/// Dial until the guest relay answers with [`PORT_RELAY_READY`], or the window ends.
 async fn dial_within_window<D: Dialer>(dialer: &D, config: &BridgeConfig) -> Option<D::Stream> {
     let started = Instant::now();
     loop {
-        if let Ok(Ok(stream)) = timeout(DIAL_ATTEMPT_TIMEOUT, dialer.dial()).await {
+        if let Ok(Ok(stream)) = timeout(DIAL_ATTEMPT_TIMEOUT, dial_ready(dialer)).await {
             return Some(stream);
         }
-        if started.elapsed() + config.dial_retry_interval >= config.dial_window {
+        if started.elapsed().saturating_add(config.dial_retry_interval) >= config.dial_window {
             return None;
         }
         sleep(config.dial_retry_interval).await;
+    }
+}
+
+/// One attempt: connect, then wait for the ready byte. Anything else, or a close before it, is a failed attempt.
+async fn dial_ready<D: Dialer>(dialer: &D) -> io::Result<D::Stream> {
+    let mut stream = dialer.dial().await?;
+    let mut ready = [0u8; 1];
+    stream.read_exact(&mut ready).await?;
+    if ready[0] == PORT_RELAY_READY {
+        Ok(stream)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the guest relay did not announce readiness",
+        ))
     }
 }
 
