@@ -43,6 +43,11 @@ cleanup() {
   fi
   # qemu and virtiofsd are plain children of sandy; every one of them carries this run's private work dir.
   pkill -f -- "$work/" 2>/dev/null || true
+  for _ in $(seq 20); do
+    pgrep -f -- "$work/" >/dev/null 2>&1 || break
+    sleep 0.5
+  done
+  pkill -9 -f -- "$work/" 2>/dev/null || true
   rm -rf "$work"
 }
 trap cleanup EXIT
@@ -56,9 +61,13 @@ echo "SK> agent=$agent"
 "$agent" port-relay --vsock-port 1000 --to 127.0.0.1:3773 >/tmp/relay.log 2>&1 &
 sleep 1
 echo "SK> squat-999-as-t3: $(runuser -u t3 -- timeout 3 "$agent" port-relay --vsock-port 999 --to 127.0.0.1:9 2>&1 | head -2 | tr '\n' ' ')"
-# timeout exits 124 when the relay was still running at 3 s, which means the bind succeeded.
-runuser -u t3 -- timeout 3 "$agent" port-relay --vsock-port 2000 --to 127.0.0.1:9 >/tmp/bind2000.log 2>&1
-echo "SK> bind-2000-as-t3: rc=$? $(head -2 /tmp/bind2000.log | tr '\n' ' ')"
+# The service user binds an unprivileged port; a second bind of it by root must then fail with EADDRINUSE,
+# which proves the first bind happened (the relay prints nothing after a successful bind).
+runuser -u t3 -- "$agent" port-relay --vsock-port 2000 --to 127.0.0.1:9 >/tmp/bind2000.log 2>&1 &
+bind_pid=$!
+sleep 1
+echo "SK> bind-2000-as-t3: alive=$(kill -0 "$bind_pid" 2>/dev/null && echo yes || echo no) second-bind: $(timeout 3 "$agent" port-relay --vsock-port 2000 --to 127.0.0.1:9 2>&1 | head -1)"
+pkill -f -- "port-relay --vsock-port 2000" 2>/dev/null || true
 echo "SK> secrets-dir: $(stat -c '%a %U' /run/sandy/secrets 2>&1)"
 echo "SK> secret-as-root: $(cat /run/sandy/secrets/SKSECRET 2>&1)"
 echo "SK> secret-as-t3: $(runuser -u t3 -- cat /run/sandy/secrets/SKSECRET 2>&1 | head -1)"
@@ -139,13 +148,16 @@ if not re.search(r"squat-999-as-t3:.*Permission denied", joined):
     print("a non-root process could bind a privileged vsock port", file=sys.stderr)
     sys.exit(1)
 # The secrets mount belongs to root: the service user must not read a job secret.
+if not re.search(r"secrets-dir: 700 ", joined):
+    print("/run/sandy/secrets is not mode 0700", file=sys.stderr)
+    sys.exit(1)
 if "sk-secret-value" not in joined.split("secret-as-root:", 1)[-1].split("\n", 1)[0]:
     print("root could not read the staged secret", file=sys.stderr)
     sys.exit(1)
 if not re.search(r"secret-as-t3:.*Permission denied", joined):
     print("the service user could read a job secret", file=sys.stderr)
     sys.exit(1)
-if not re.search(r"bind-2000-as-t3: rc=124\b", joined):
+if not re.search(r"bind-2000-as-t3: alive=yes second-bind:.*Address already in use", joined):
     print("an unprivileged vsock port could not be bound as the service user", file=sys.stderr)
     sys.exit(1)
 PY
