@@ -368,7 +368,7 @@ where
     // The exit is the link's last frame: end the probe (finishing a verdict write already begun, never
     // tearing it) before anything else is written.
     if let Some(readiness) = readiness {
-        readiness.finish().await;
+        readiness.finish().await?;
     }
 
     // The live attach bridge above only reliably carries output for a job

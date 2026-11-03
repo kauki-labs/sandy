@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use sandy_api::agent::SERVICE_ENV;
-use sandy_guest_template::manifest::{HealthProbe, ProbeCheck, ServiceSpec};
+use sandy_guest_template::manifest::{HealthProbe, ProbeCheck, ServiceSpec, validate_service_spec};
 use tokio::{io::AsyncReadExt, net::TcpStream, process::Command};
 
 /// The service this agent supervises, from [`SERVICE_ENV`]. `None` for a plain job.
@@ -23,8 +23,13 @@ pub fn from_env() -> Result<Option<ServiceSpec>, String> {
     }
 }
 
+/// Parses and re-validates the spec. The executor validated it at decode, but the agent does not trust the
+/// env it is given: a spec that reached it by another route (a submitter's own env entry) is checked here too.
 fn parse(json: &str) -> Result<ServiceSpec, String> {
-    serde_json::from_str(json).map_err(|e| format!("{SERVICE_ENV} is not a service spec: {e}"))
+    let spec: ServiceSpec =
+        serde_json::from_str(json).map_err(|e| format!("{SERVICE_ENV} is not a service spec: {e}"))?;
+    validate_service_spec(&spec).map_err(|e| format!("{SERVICE_ENV} is not a runnable service spec: {e}"))?;
+    Ok(spec)
 }
 
 /// The longest probe command output kept per attempt.
@@ -68,11 +73,29 @@ pub fn spawn_readiness(agent: std::sync::Arc<sandy_fabric_local::agent::LinkAgen
     Readiness { cancel, task }
 }
 
+/// How long [`Readiness::finish`] waits for a verdict write already in progress.
+const VERDICT_WRITE_BUDGET: Duration = Duration::from_secs(10);
+
 impl Readiness {
     /// Ends the probe and waits for a verdict write already in progress. Call before the exit report.
-    pub async fn finish(self) {
+    ///
+    /// # Errors
+    /// The write did not finish within [`VERDICT_WRITE_BUDGET`] (a peer that stopped reading). The link may
+    /// then hold a torn frame, so the caller must not write the exit report over it: the missing `Exit` frame
+    /// already means "the agent failed" (INV-11), the same rule `serve()` applies to a stuck archive send.
+    pub async fn finish(self) -> Result<(), String> {
+        self.finish_within(VERDICT_WRITE_BUDGET).await
+    }
+
+    async fn finish_within(self, budget: Duration) -> Result<(), String> {
         let _ = self.cancel.send(());
-        let _ = self.task.await;
+        match tokio::time::timeout(budget, self.task).await {
+            Ok(_) => Ok(()),
+            Err(_) => Err(format!(
+                "writing the service readiness verdict timed out after {budget:?}; the link may be mid-frame, so the \
+                 job's exit cannot be safely reported over it"
+            )),
+        }
     }
 }
 
@@ -120,6 +143,26 @@ async fn attempt(check: &ProbeCheck, timeout: Duration) -> Result<(), String> {
     }
 }
 
+/// Kills the probe command's whole process group when dropped (a timeout drops the future), and also after a
+/// normal exit so a probe leaves no background process behind. The group id is the child's pid.
+struct KillGroupOnDrop(rustix::process::Pid);
+
+impl KillGroupOnDrop {
+    fn new(pid: u32) -> Option<Self> {
+        i32::try_from(pid)
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+            .map(Self)
+    }
+}
+
+impl Drop for KillGroupOnDrop {
+    fn drop(&mut self) {
+        // ESRCH (the group is already gone) is the common case and fine.
+        let _ = rustix::process::kill_process_group(self.0, rustix::process::Signal::KILL);
+    }
+}
+
 /// Runs `program args` with stdout and stderr merged into the failure text (capped); `Ok` only on exit 0. The
 /// child dies with this future, so a timeout kills it.
 async fn run_command(program: &str, args: &[String]) -> Result<(), String> {
@@ -128,9 +171,12 @@ async fn run_command(program: &str, args: &[String]) -> Result<(), String> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        // Its own process group, so a timeout or cancel kills the probe's children too (`sh -c 'sleep 30'`).
+        .process_group(0)
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| format!("could not run {program}: {e}"))?;
+    let _group = child.id().and_then(KillGroupOnDrop::new);
     let (Some(mut out), Some(mut err)) = (child.stdout.take(), child.stderr.take()) else {
         return Err(format!("could not capture the output of {program}"));
     };
@@ -189,6 +235,48 @@ mod tests {
     async fn closed_port() -> anyhow::Result<u16> {
         let listener = TcpListener::bind("127.0.0.1:0").await.context("bind")?;
         Ok(listener.local_addr().context("addr")?.port())
+    }
+
+    /// #589 review: a spec that skipped the executor's decode must not run a probe `validate_service` rejects.
+    /// Zero interval and timeout with `u32::MAX` attempts would be a tight loop in the guest.
+    #[test]
+    fn a_spec_that_fails_validation_is_refused_by_the_agent() {
+        for bad in [
+            r#"{"user":"x","probe":{"check":{"type":"tcp","port":1},"interval_secs":0,"timeout_secs":0,"max_attempts":4294967295}}"#,
+            r#"{"user":"root","probe":{"check":{"type":"tcp","port":1}}}"#,
+            r#"{"user":"dev","probe":{"check":{"type":"tcp","port":0}}}"#,
+        ] {
+            let err = parse(bad).expect_err("must be refused");
+            assert!(err.contains("not a runnable service spec"), "{bad}: {err}");
+        }
+    }
+
+    /// Adversarial (#589 review): a stuck verdict write must not hold the exit report forever. The caller
+    /// gets an error (and sends no `Exit`) once the budget passes.
+    #[tokio::test]
+    async fn a_verdict_write_that_never_finishes_is_bounded() {
+        let (cancel, _cancelled) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(std::future::pending::<()>());
+        let readiness = Readiness { cancel, task };
+        let err = readiness
+            .finish_within(Duration::from_millis(50))
+            .await
+            .expect_err("a write that never ends must time out");
+        assert!(err.contains("timed out"), "{err}");
+    }
+
+    /// Adversarial (#589 review): killing a timed-out probe kills its children too. The probe's background
+    /// child would write `late` after 0.6 s; the probe times out after 0.1 s; nothing may be written.
+    #[tokio::test]
+    async fn a_timed_out_probe_leaves_no_background_process() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().context("temp dir")?;
+        let marker = dir.path().join("late");
+        let script = format!("(sleep 0.6; echo late > {}) & wait", marker.display());
+        let verdict = probe_loop(&probe(command(&["sh", "-c", &script]), 1), TICK).await;
+        assert!(matches!(verdict, ProbeVerdict::Failed { .. }), "{verdict:?}");
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert!(!marker.exists(), "the probe's background child outlived the timeout");
+        Ok(())
     }
 
     #[test]
