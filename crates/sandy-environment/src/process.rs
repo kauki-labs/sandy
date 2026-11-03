@@ -372,13 +372,13 @@ impl EnvironmentBackend for ProcessEnvironmentBackend {
             }),
             Some(_) => {
                 if !r.paired {
-                    if let Some(pair) = &self.config.pair_command {
-                        if let Err(reason) = self.pair(r, pair, environment_id) {
-                            return Ok(Probe::Failed {
-                                step: "pair".to_owned(),
-                                reason,
-                            });
-                        }
+                    if let Some(pair) = &self.config.pair_command
+                        && let Err(reason) = self.pair(r, pair, environment_id)
+                    {
+                        return Ok(Probe::Failed {
+                            step: "pair".to_owned(),
+                            reason,
+                        });
                     }
                     r.paired = true;
                 }

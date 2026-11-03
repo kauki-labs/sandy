@@ -84,6 +84,10 @@ version, metadata, dependency versions, and lints through the root `Cargo.toml`
   job ownership, the job endpoints of the OpenAPI contract, loopback only. It speaks the control
   RPC over UDS and keeps each job's attach token. Environment and attach endpoints answer
   `unsupported` for now. See `docs/decisions/broker-api.md`.
+- **`sandy-environment`** — `EnvironmentBackend` implementations for `sandyd` (#587). Today the
+  opt-in, trusted-only `ProcessEnvironmentBackend`: a service such as `t3 serve` as a host process
+  group with a cleared environment and no isolation, selected by `SANDY_ENV_BACKEND=process-insecure`.
+  See `docs/decisions/sandyd.md` decision 29.
 - **`sandy-egress-proxy`** — the per-run host egress proxy for NIC-less guests
   (#401, epic #360): a pure CONNECT-parse / allow-list / address-filter core and an
   unprivileged binary. `QemuBackend` (#404) and `VfkitBackend` (#405) run one per launch, not yet live-verified. See
@@ -200,6 +204,7 @@ crates/
   ├─ sandy-host-executor/ - the M2 remote executor (#269): declares capabilities, runs dispatched jobs, relays the agent link
   ├─ sandy-mcp/           - MCP stdio server over the broker API: job + environment tools (#585)
   ├─ sandy-broker/        - the broker HTTP API tier over sandyd: bearer clients, job endpoints (#591)
+  ├─ sandy-environment/   - EnvironmentBackend impls: the opt-in process backend (no isolation) (#587)
   ├─ sandy-egress-proxy/  - per-run host egress proxy: CONNECT parse, allow-list match, address filter (#401)
   └─ sandy-cli/           - the `sandy` binary (doctor, run/ls/status/wait/kill/gc, cred github …)
 impls/

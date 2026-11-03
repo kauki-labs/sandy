@@ -74,14 +74,74 @@ pub fn from_env(
     get: impl Fn(&str) -> Option<String>,
     default_state_dir: impl FnOnce() -> Result<PathBuf, String>,
 ) -> Result<Option<EnvironmentBackendConfig>, EnvironmentBackendConfigError> {
-    let _ = (
-        &get,
-        default_state_dir,
-        Duration::ZERO,
-        PROCESS_INSECURE,
-        DRIVER_INTERVAL,
-    );
-    unimplemented!("#587 environment backend config: red")
+    use EnvironmentBackendConfigError as E;
+    let Some(backend) = get("SANDY_ENV_BACKEND").filter(|v| !v.trim().is_empty()) else {
+        return Ok(None);
+    };
+    if backend != PROCESS_INSECURE {
+        return Err(E::UnknownBackend(backend));
+    }
+    let argv = |name: &'static str| -> Vec<String> {
+        get(name)
+            .map(|raw| raw.split_whitespace().map(str::to_owned).collect())
+            .unwrap_or_default()
+    };
+    let command = argv("SANDY_ENV_PROCESS_COMMAND");
+    if command.is_empty() {
+        return Err(E::Missing("SANDY_ENV_PROCESS_COMMAND"));
+    }
+    if !command.iter().any(|a| a.contains("{port}")) {
+        return Err(E::MissingPort);
+    }
+    let pair_command = Some(argv("SANDY_ENV_PAIR_COMMAND")).filter(|a| !a.is_empty());
+    let mut pass_env = Vec::new();
+    for name in get("SANDY_ENV_PASS_ENV").unwrap_or_default().split(',').map(str::trim) {
+        if name.is_empty() {
+            continue;
+        }
+        if !name
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+        {
+            return Err(E::InvalidName(name.to_owned()));
+        }
+        pass_env.push(name.to_owned());
+    }
+    let provision_timeout = match get("SANDY_ENV_PROVISION_TIMEOUT_SECS") {
+        None => Duration::from_secs(120),
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(secs) if secs > 0 => Duration::from_secs(secs),
+            _ => {
+                return Err(E::InvalidNumber {
+                    name: "SANDY_ENV_PROVISION_TIMEOUT_SECS",
+                    raw,
+                });
+            }
+        },
+    };
+    let state_dir = match get("SANDY_ENV_STATE_DIR").filter(|v| !v.trim().is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => default_state_dir().map_err(E::StateDir)?,
+    };
+    let path = get("SANDY_ENV_PATH")
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| get("PATH"))
+        .unwrap_or_else(|| "/usr/bin:/bin".to_owned());
+    Ok(Some(EnvironmentBackendConfig {
+        process: ProcessConfig {
+            command,
+            pair_command,
+            state_dir,
+            path,
+            pass_env,
+            pair_timeout: Duration::from_secs(30),
+        },
+        driver: DriverConfig {
+            template: "process".to_owned(),
+            service_port: None,
+            provision_timeout,
+        },
+    }))
 }
 
 #[cfg(test)]
@@ -140,8 +200,8 @@ mod tests {
     #[test]
     fn the_process_backend_needs_a_command_with_a_port() {
         assert_eq!(
-            parse(&[("SANDY_ENV_BACKEND", "process-insecure")]).unwrap_err(),
-            EnvironmentBackendConfigError::Missing("SANDY_ENV_PROCESS_COMMAND")
+            parse(&[("SANDY_ENV_BACKEND", "process-insecure")]).err(),
+            Some(EnvironmentBackendConfigError::Missing("SANDY_ENV_PROCESS_COMMAND"))
         );
         for blank in ["", "   "] {
             let out = parse(&[
@@ -149,15 +209,15 @@ mod tests {
                 ("SANDY_ENV_PROCESS_COMMAND", blank),
             ]);
             assert_eq!(
-                out.unwrap_err(),
-                EnvironmentBackendConfigError::Missing("SANDY_ENV_PROCESS_COMMAND")
+                out.err(),
+                Some(EnvironmentBackendConfigError::Missing("SANDY_ENV_PROCESS_COMMAND"))
             );
         }
         let no_port = parse(&[
             ("SANDY_ENV_BACKEND", "process-insecure"),
             ("SANDY_ENV_PROCESS_COMMAND", "t3 serve --base-dir {base_dir}"),
         ]);
-        assert_eq!(no_port.unwrap_err(), EnvironmentBackendConfigError::MissingPort);
+        assert_eq!(no_port.err(), Some(EnvironmentBackendConfigError::MissingPort));
     }
 
     #[test]
@@ -222,8 +282,8 @@ mod tests {
     fn a_failing_default_state_dir_is_a_state_dir_error() {
         let out = from_env(getter(&base()), || Err("no runtime dir".to_owned()));
         assert_eq!(
-            out.unwrap_err(),
-            EnvironmentBackendConfigError::StateDir("no runtime dir".to_owned())
+            out.err(),
+            Some(EnvironmentBackendConfigError::StateDir("no runtime dir".to_owned()))
         );
     }
 

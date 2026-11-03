@@ -2175,3 +2175,22 @@ into a running VM or into `Ready`. `VmBackend::run` is run-to-completion, so a l
 **Alternative set aside.** Starting a task from the create handler: it would lose the launch on a crash between the
 store write and the spawn, which the level-triggered pass makes impossible (a row with no box is launched on the next
 pass).
+
+## 29. An opt-in, trusted-only process backend runs environments as host processes, with no isolation (#587)
+
+**Status:** accepted (owner decision on #597, 2026-11-03). **Upholds:** INV-1 for the pairing code only; it upholds no isolation invariant.
+
+**Context.** The VM backend (slice C3) waits on the guest relay, the host bridge and the service workload kind. The owner wants the whole chain, T3 to `sandy-mcp` to the broker to `sandyd` to the launch driver to a backend, to run as soon as possible.
+
+**Decision.**
+
+- `sandy-environment::ProcessEnvironmentBackend` implements `EnvironmentBackend` by starting a configured argv (for example `t3 serve`) as one host process group per environment, in its own `0700` directory under a `0700` state dir. `SANDY_ENV_BACKEND=process-insecure` turns it on (and the launch driver with it); an unset or blank value leaves the driver off, and any other value is a startup error, never a silent off. The daemon logs a warning at startup.
+- It gives **no isolation**. The service runs as the daemon's user, with the daemon's filesystem and network. It is for trusted, local development only. The `SANDY_ENV_PASS_ENV` variables, which may be provider credentials, are passed into the service by design.
+- What it does guarantee: the service gets a cleared environment (`PATH`, `HOME`, `LANG`, `TMPDIR` and only the named variables); the service command must contain `{port}` (the backend picks a free loopback port); readiness is the HTTP status on that port (a refused connection or a 5xx is `Starting`); an environment id cannot name a path outside the state dir; `kill` ends the whole process group and removes the directory; a service that exits is `Failed` with its exit status.
+- Pairing (owner decision, option 1): an optional `SANDY_ENV_PAIR_COMMAND` runs once after the service first answers. Its stdout goes only to `<base_dir>/pairing` (mode `0600`). The code never appears in a probe, an error, a log or the pair command's stderr, so it never reaches a tool result (#585 O8). The operator reads the file and links the primary out of band.
+- Restart: environments do not survive a daemon restart. A graceful exit kills every process group. After a hard kill the next start removes the stale directories and, on Linux only, kills a recorded process group when its command line names the directory (a reused pid is never hit). On macOS an orphan may keep running until the operator kills it.
+- Settings (`crates/sandyd/src/environment_backend.rs`): `SANDY_ENV_BACKEND`, `SANDY_ENV_PROCESS_COMMAND` (split on whitespace; `{port}`, `{base_dir}`, `{environment_id}` expand), `SANDY_ENV_PAIR_COMMAND`, `SANDY_ENV_STATE_DIR` (default `<runtime dir>/environments`), `SANDY_ENV_PASS_ENV`, `SANDY_ENV_PATH`, `SANDY_ENV_PROVISION_TIMEOUT_SECS` (default 120).
+
+**Consequences.** Environments created over the RPC now reach `Ready` with `connection.url` set, so the broker and the MCP tools can be driven end to end. One daemon runs at most the environments its host can hold, with no resource limit per environment. The pairing file and the service log live in the environment directory and go with it on `kill`.
+
+**Alternative set aside.** Running the service through `impls/local`'s `ProcessBackend`: it is run-to-completion and tied to one job, and it would not give the driver a long-lived box it can probe and kill by environment id.
