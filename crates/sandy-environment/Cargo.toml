@@ -1,0 +1,34 @@
+[package]
+name = "sandy-environment"
+description = "EnvironmentBackend implementations for sandyd: today the opt-in, trusted-only process backend that runs a service such as `t3 serve` as a host process with no VM isolation (#587)"
+version = "0.1.1"
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+command-group.workspace = true
+fs2.workspace = true
+rustix = { workspace = true, features = ["fs", "process"] }
+sandy-api.workspace = true
+sandy-fsutil.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+tempfile.workspace = true
+
+# A stand-in for `t3 serve` and `t3 pair`, so the tests drive real processes.
+[[bin]]
+name = "fake-t3"
+path = "src/bin/fake_t3.rs"
+test = false
+doc = false

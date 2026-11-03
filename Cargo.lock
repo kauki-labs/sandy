@@ -2507,6 +2507,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandy-environment"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "command-group",
+ "fs2",
+ "rustix",
+ "sandy-api",
+ "sandy-fsutil",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
 name = "sandy-executor-proto"
 version = "0.1.1"
 dependencies = [
@@ -2747,6 +2762,7 @@ dependencies = [
  "sandy-api",
  "sandy-conn",
  "sandy-control-proto",
+ "sandy-environment",
  "sandy-executor-proto",
  "sandy-fabric",
  "sandy-fabric-local",
