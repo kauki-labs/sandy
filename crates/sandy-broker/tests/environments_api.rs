@@ -412,3 +412,46 @@ async fn the_broker_scan_ceiling_is_exactly_10000_rows() -> Result<()> {
     );
     Ok(())
 }
+
+/// The retention sweep can collect a replayed key's row between the broker's lookup and the create.
+/// The owner table here names `env-seed`, which sandyd still holds under another key, so the lookup
+/// succeeds while sandyd has never seen this request's key: the create makes a new environment.
+#[tokio::test]
+async fn a_replay_that_creates_a_new_environment_after_the_lookup_is_quota_checked_and_undone() -> Result<()> {
+    let f = common::fixture_with_owner_table(1, 64, |store| {
+        let spec = b"\x0a\x01p";
+        store.create("seed-key", "env-seed", spec, sandyd::environment::SPEC_ENCODING)?;
+        store.delete("env-seed")?;
+        Ok(json!({"environments": {"env-seed": "a"}, "keys": {"a\nrace": "env-seed"}}).to_string())
+    })
+    .await?;
+    let live = spawn_id(&f, TOKEN_A, spawn_body("f1")).await?; // the client is now at quota
+    let (status, body) = spawn(&f, TOKEN_A, spawn_body("race")).await?;
+    assert_eq!(
+        (status, &body["code"]),
+        (StatusCode::TOO_MANY_REQUESTS, &json!("quota_exceeded")),
+        "{body}"
+    );
+    // The environment sandyd created for the refused request is deleted, and the broker does not own it.
+    let rows = f.environments.list()?;
+    let undone: Vec<_> = rows
+        .iter()
+        .filter(|r| r.environment_id != "env-seed" && r.environment_id != live)
+        .collect();
+    assert_eq!(undone.len(), 1, "{rows:?}");
+    assert_eq!(undone[0].state, sandyd::environment_store::EnvironmentState::Deleted);
+    let (_, list) = f
+        .call("GET", "/v1/environments?state=deleted", Some(TOKEN_A), None)
+        .await?;
+    let ids: Vec<&str> = list["environments"]
+        .as_array()
+        .context("environments")?
+        .iter()
+        .filter_map(|e| e["environment_id"].as_str())
+        .collect();
+    assert!(
+        !ids.contains(&undone[0].environment_id.as_str()),
+        "the undone row is not the client's"
+    );
+    Ok(())
+}
