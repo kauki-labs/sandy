@@ -183,8 +183,8 @@ pub fn validate_service(manifest: &FlakeManifestV1) -> Result<(), String> {
     let Some(service) = &manifest.service else {
         return Ok(());
     };
-    if manifest.command.is_empty() {
-        return Err("a service needs a command to run".to_owned());
+    if manifest.command.first().is_none_or(|program| program.trim().is_empty()) {
+        return Err("a service needs a command to run, with a program name".to_owned());
     }
     validate_service_spec(service)
 }
@@ -441,6 +441,19 @@ mod tests {
         let mut root = t3_service();
         root.user = "root".to_owned();
         assert!(validate_service_spec(&root).is_err());
+    }
+
+    /// CodeRabbit on #632: a service command whose program is empty or blank cannot start, so decode refuses it
+    /// like a missing command.
+    #[test]
+    fn a_service_command_with_a_blank_program_is_refused() -> Result<(), serde_json::Error> {
+        for program in ["", "   "] {
+            let mut manifest = decode_flake_manifest(&service_manifest_bytes(|_| {})?)?;
+            manifest.command = vec![program.to_owned(), "serve".to_owned()];
+            let bytes = encode_flake_manifest(&manifest)?;
+            assert!(refusal(&bytes).contains("needs a command"), "program {program:?}");
+        }
+        Ok(())
     }
 
     /// The T3 shape decodes, and an omitted restart policy and probe timing take their defaults.
