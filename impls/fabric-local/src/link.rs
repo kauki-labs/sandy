@@ -31,8 +31,8 @@ use tokio::{
 
 use crate::{
     agent::{
-        ARCHIVE_TRANSCRIPT, AbortOnDrop, MAX_PROBE_OUTPUT, RESIZE_CONTROL, SERVICE_PROBE_FAILED, SERVICE_READY,
-        TTY_STDERR, TTY_STDIN, TTY_STDOUT, decode_resize,
+        ARCHIVE_TRANSCRIPT, AbortOnDrop, RESIZE_CONTROL, SERVICE_PROBE_FAILED, SERVICE_READY, TTY_STDERR, TTY_STDIN,
+        TTY_STDOUT, cut_probe_output, decode_resize, sanitize_probe_output,
     },
     channel::{Channel, ChannelError, MembershipId},
 };
@@ -197,18 +197,6 @@ impl std::fmt::Debug for LinkFrame {
             Self::ProbeFailed { output } => write!(f, "LinkFrame::ProbeFailed({} bytes)", output.len()),
         }
     }
-}
-
-/// A probe failure's output as the bytes the relay keeps: at most `MAX_PROBE_OUTPUT`, cut at a character boundary.
-fn cut_probe_output(mut output: String) -> Vec<u8> {
-    if output.len() > MAX_PROBE_OUTPUT {
-        let cut = (0..=MAX_PROBE_OUTPUT)
-            .rev()
-            .find(|&i| output.is_char_boundary(i))
-            .unwrap_or(0);
-        output.truncate(cut);
-    }
-    output.into_bytes()
 }
 
 /// `skip_serializing_if` helper: the first-frame-only `peers` count is omitted
@@ -651,9 +639,14 @@ where
                         "the agent holds no membership on peer channel {name}"
                     )));
                 };
-                if [TTY_STDIN, TTY_STDOUT, TTY_STDERR].contains(&content_type.as_str()) {
+                // Service readiness verdicts (#589) are orchestrator-channel traffic too: a peer post with that
+                // content type would look like a real verdict to any reader that matches on content type.
+                if [TTY_STDIN, TTY_STDOUT, TTY_STDERR, SERVICE_READY, SERVICE_PROBE_FAILED]
+                    .contains(&content_type.as_str())
+                {
                     return Err(LinkError::Protocol(format!(
-                        "TTY traffic ({content_type}) belongs on the orchestrator channel, not peer channel {name}"
+                        "TTY and service traffic ({content_type}) belongs on the orchestrator channel, not peer \
+                         channel {name}"
                     )));
                 }
                 let bytes = unhex(&payload, "a peer post payload")?;
@@ -737,11 +730,20 @@ where
                 // One verdict per link (#589): a repeat is ignored, like a duplicate archive, so a reader that
                 // already acted on the first verdict never sees it flip, and the exit report survives.
                 if readiness_seen {
-                    tracing::warn!("duplicate service readiness frame ignored");
+                    // Debug, not warn: a guest that floods verdict frames must not flood the host's logs.
+                    tracing::debug!("duplicate service readiness frame ignored");
                     continue;
                 }
+                // Latched before the post: the first verdict is final even if its post is refused, so a refused
+                // `ProbeFailed` followed by a `Ready` cannot become `Ready`.
+                readiness_seen = true;
                 let (content_type, bytes) = match verdict {
-                    LinkFrame::ProbeFailed { output } => (SERVICE_PROBE_FAILED, cut_probe_output(output)),
+                    LinkFrame::ProbeFailed { output } => (
+                        SERVICE_PROBE_FAILED,
+                        cut_probe_output(&sanitize_probe_output(cut_probe_output(&output)))
+                            .as_bytes()
+                            .to_vec(),
+                    ),
                     _ => (SERVICE_READY, Vec::new()),
                 };
                 // A refused post loses only the verdict; a backend fault still ends the relay (as for archive).
@@ -755,13 +757,11 @@ where
                     )
                     .await
                 {
-                    Ok(_) => readiness_seen = true,
+                    Ok(_) => {}
                     Err(e @ ChannelError::Backend(_)) => return Err(e.into()),
-                    Err(e) => {
-                        let reason = format!("the service readiness verdict was refused: {e}");
-                        tracing::warn!("{reason}");
-                        refusals.push(reason);
-                    }
+                    // Logged, not sent back: the agent counts every `Refused` frame as a refused peer post, and a
+                    // lost verdict is not one (CodeRabbit on #622).
+                    Err(e) => tracing::warn!("the service readiness verdict was refused: {e}"),
                 }
             }
             Some(other) => {
@@ -996,6 +996,21 @@ mod tests {
         Ok(())
     }
 
+    /// `cut_probe_output` never splits a character and keeps as much as fits, for 1-, 3- and 4-byte characters.
+    #[test]
+    fn cut_probe_output_keeps_whole_characters_up_to_the_limit() {
+        use crate::agent::{MAX_PROBE_OUTPUT, cut_probe_output};
+
+        for (unit, width) in [("a", 1), ("€", 3), ("😀", 4)] {
+            let input = unit.repeat(MAX_PROBE_OUTPUT);
+            let cut = cut_probe_output(&input);
+            assert_eq!(cut.len(), MAX_PROBE_OUTPUT / width * width, "{unit:?}");
+            assert!(cut.chars().all(|c| c.to_string() == unit), "{unit:?}");
+        }
+        assert_eq!(cut_probe_output("short"), "short");
+        assert_eq!(cut_probe_output(""), "");
+    }
+
     /// Runs a relay, has the agent send `frames` through `send`, then exit 0, and returns the `Output` envelopes
     /// the orchestrator channel saw, plus the relay's result.
     async fn service_envelopes(
@@ -1097,6 +1112,143 @@ mod tests {
         assert_eq!(result?, Some(0), "the exit report survives the extra verdicts");
         assert_eq!(seen, vec![(SERVICE_READY.to_owned(), Vec::new())]);
         Ok(())
+    }
+
+    /// Like [`service_envelopes`], but the "agent" writes raw `frames` after the handshake (no `LinkAgent`, so
+    /// no agent-side cut), then `Exit(0)` and closes. Returns the `Output` envelopes the channel saw.
+    async fn raw_service_envelopes(frames: Vec<LinkFrame>) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+        let (channel, agent_cap, orchestrator_cap) = channel_and_caps().await?;
+        let orchestrator = channel.join(&orchestrator_cap)?;
+        let mut observed = std::pin::pin!(channel.subscribe(&orchestrator)?);
+        let (mut agent_end, host_end) = tokio::io::duplex(2 * 1024 * 1024);
+        let relay = tokio::spawn({
+            let channel = Arc::clone(&channel);
+            async move { serve_agent_link(channel, &agent_cap, host_end).await }
+        });
+        let Some(LinkFrame::Cap { cap, .. }) = timeout(WAIT, read_frame(&mut agent_end)).await?? else {
+            anyhow::bail!("the relay's first frame must be the cap");
+        };
+        write_frame(
+            &mut agent_end,
+            &LinkFrame::Join {
+                cap,
+                channel: None,
+                cols: None,
+                rows: None,
+            },
+        )
+        .await?;
+        anyhow::ensure!(
+            timeout(WAIT, read_frame(&mut agent_end)).await?? == Some(LinkFrame::Joined { channel: None }),
+            "the join must succeed"
+        );
+        for frame in &frames {
+            write_frame(&mut agent_end, frame).await?;
+        }
+        write_frame(&mut agent_end, &LinkFrame::Exit { code: 0 }).await?;
+        drop(agent_end);
+        anyhow::ensure!(
+            timeout(WAIT, relay).await??? == Some(0),
+            "the exit report must survive the verdict frames"
+        );
+        let mut seen = Vec::new();
+        while let Ok(Some(item)) = timeout(Duration::from_millis(100), observed.next()).await {
+            let env = item?;
+            if matches!(env.message_type, Some(MessageType::Output(_))) {
+                seen.push((env.content_type, env.payload));
+            }
+        }
+        Ok(seen)
+    }
+
+    /// Adversarial (#589): the relay cuts a probe output itself, whatever the agent sent: 50 000 three-byte
+    /// characters (150 KB, under the frame limit) end as at most 4096 valid UTF-8 bytes, cut on a boundary.
+    #[tokio::test]
+    async fn the_relay_cuts_an_oversized_probe_output_the_agent_did_not() -> anyhow::Result<()> {
+        use crate::agent::MAX_PROBE_OUTPUT;
+
+        let seen = raw_service_envelopes(vec![LinkFrame::ProbeFailed {
+            output: "€".repeat(50_000),
+        }])
+        .await?;
+        let payload = &seen.first().context("a probe-failed envelope")?.1;
+        assert!(payload.len() <= MAX_PROBE_OUTPUT, "kept {} bytes", payload.len());
+        assert!(
+            payload.len() > MAX_PROBE_OUTPUT - 3,
+            "cut too early: {} bytes",
+            payload.len()
+        );
+        std::str::from_utf8(payload).context("the kept output is valid UTF-8")?;
+        Ok(())
+    }
+
+    /// CodeRabbit on #622: output above `MAX_FRAME` is cut by the agent before the frame is written. Without
+    /// that cut `write_frame` refuses the frame and no verdict is sent at all.
+    #[tokio::test]
+    async fn a_probe_output_above_the_frame_limit_is_cut_before_it_is_written() -> anyhow::Result<()> {
+        use crate::agent::MAX_PROBE_OUTPUT;
+
+        let huge = "x".repeat(MAX_FRAME + 1);
+        let (seen, result) = service_envelopes(async |agent| agent.report_probe_failed(&huge).await).await?;
+        assert_eq!(result?, Some(0));
+        assert_eq!(
+            seen.first().context("a probe-failed envelope")?.1.len(),
+            MAX_PROBE_OUTPUT
+        );
+        Ok(())
+    }
+
+    /// Adversarial (#589): the first verdict wins whichever it is. `ProbeFailed` then `Ready` keeps the
+    /// failure, and the exit report survives.
+    #[tokio::test]
+    async fn a_ready_after_a_probe_failure_does_not_flip_the_verdict() -> anyhow::Result<()> {
+        use crate::agent::SERVICE_PROBE_FAILED;
+
+        let seen = raw_service_envelopes(vec![
+            LinkFrame::ProbeFailed {
+                output: "refused".to_owned(),
+            },
+            LinkFrame::Ready,
+        ])
+        .await?;
+        assert_eq!(seen, vec![(SERVICE_PROBE_FAILED.to_owned(), b"refused".to_vec())]);
+        Ok(())
+    }
+
+    /// #589 review: probe output is untrusted guest bytes that API clients and an LLM may read, so control
+    /// characters (ANSI escapes, C0, DEL, C1, a bare CR) are replaced before it is stored. Newline and tab stay.
+    #[tokio::test]
+    async fn the_relay_strips_control_characters_from_probe_output() -> anyhow::Result<()> {
+        let seen = raw_service_envelopes(vec![LinkFrame::ProbeFailed {
+            output: "ok\x1b[31mred\x1b[0m\u{9b}2J\0\r\x7f line1\n\tline2".to_owned(),
+        }])
+        .await?;
+        let text = String::from_utf8(seen.first().context("a probe-failed envelope")?.1.clone())?;
+        assert!(
+            text.chars().all(|c| !c.is_control() || c == '\n' || c == '\t'),
+            "control characters survived: {text:?}"
+        );
+        assert!(
+            text.contains("red") && text.contains("line1\n\tline2"),
+            "the readable text must survive: {text:?}"
+        );
+        Ok(())
+    }
+
+    /// `from_envelope` is capped and sanitized on its own too, so a reader never depends on who posted.
+    #[test]
+    fn from_envelope_caps_and_sanitizes_what_it_reads() {
+        use crate::agent::{MAX_PROBE_OUTPUT, SERVICE_PROBE_FAILED, ServiceReadiness};
+
+        let mut payload = b"\x1b[31mbad".to_vec();
+        payload.extend(std::iter::repeat_n(b'x', MAX_PROBE_OUTPUT * 4));
+        let Some(ServiceReadiness::ProbeFailed { output }) =
+            ServiceReadiness::from_envelope(SERVICE_PROBE_FAILED, &payload)
+        else {
+            panic!("expected ProbeFailed");
+        };
+        assert!(output.len() <= MAX_PROBE_OUTPUT * 3, "uncapped: {} bytes", output.len());
+        assert!(!output.contains('\u{1b}'), "{output:?}");
     }
 
     /// `from_envelope` reads only the two service content types.
@@ -1940,7 +2092,12 @@ mod tests {
     async fn a_post_to_a_channel_the_link_did_not_join_is_refused() -> anyhow::Result<()> {
         let (group_a, agent_a, _) = peer_channel("group-a").await?;
         let (group_b, _, sibling_b) = peer_channel("group-b").await?;
-        for (target, content_type) in [("group-b", "application/json"), ("group-a", TTY_STDOUT)] {
+        for (target, content_type) in [
+            ("group-b", "application/json"),
+            ("group-a", TTY_STDOUT),
+            ("group-a", SERVICE_READY),
+            ("group-a", SERVICE_PROBE_FAILED),
+        ] {
             let grants = vec![PeerGrant {
                 channel: Arc::clone(&group_a),
                 cap: agent_a.clone(),
