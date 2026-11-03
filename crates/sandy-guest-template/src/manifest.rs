@@ -60,6 +60,82 @@ pub struct FlakeManifestV1 {
     /// default.
     #[serde(default)]
     pub timeout_secs: Option<u32>,
+    /// Declares `command` a long-running service (#589): it reaches Ready only once its health probe
+    /// passes, instead of ending when the command exits. `None` is an ordinary job.
+    #[serde(default)]
+    pub service: Option<ServiceSpec>,
+}
+
+/// How a service runs and when it counts as Ready (#589).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceSpec {
+    /// The account the service runs as. Required and never root, so a service cannot read the root-only
+    /// secret share by default.
+    pub user: String,
+    /// The readiness check.
+    pub probe: HealthProbe,
+    /// What the agent does when the service exits.
+    #[serde(default)]
+    pub restart: RestartPolicy,
+}
+
+/// A readiness check, run by `sandy-agent` inside the guest every `interval_secs` until it passes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HealthProbe {
+    /// What to check.
+    pub check: ProbeCheck,
+    /// Seconds between attempts.
+    #[serde(default = "default_probe_interval_secs")]
+    pub interval_secs: u32,
+    /// Seconds one attempt may take before it counts as failed.
+    #[serde(default = "default_probe_timeout_secs")]
+    pub timeout_secs: u32,
+    /// Failed attempts in a row after which the service is Failed, with the last attempt's output.
+    #[serde(default = "default_probe_max_attempts")]
+    pub max_attempts: u32,
+}
+
+/// The two readiness checks a service can declare.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProbeCheck {
+    /// A TCP connect to `127.0.0.1:<port>` inside the guest succeeds.
+    Tcp {
+        /// The guest-local port.
+        port: u16,
+    },
+    /// The command exits 0 (argv, no shell).
+    Command {
+        /// The program and its arguments.
+        argv: Vec<String>,
+    },
+}
+
+/// What `sandy-agent` does when a service exits.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestartPolicy {
+    /// Report the exit and stop.
+    #[default]
+    Never,
+    /// Restart after a non-zero exit; a zero exit is reported and ends the service.
+    OnFailure,
+    /// Restart after any exit.
+    Always,
+}
+
+const fn default_probe_interval_secs() -> u32 {
+    2
+}
+
+const fn default_probe_timeout_secs() -> u32 {
+    2
+}
+
+const fn default_probe_max_attempts() -> u32 {
+    30
 }
 
 /// [`FlakeManifestV1::history_lines`]'s default (10,000) — also `sandy
@@ -84,10 +160,73 @@ pub fn encode_flake_manifest(manifest: &FlakeManifestV1) -> Result<Vec<u8>, serd
 /// Decode a `flake/v1` manifest's bytes back into a [`FlakeManifestV1`].
 ///
 /// # Errors
-/// `serde_json`'s own error if the bytes are not valid JSON, or not this
-/// shape.
+/// `serde_json`'s own error if the bytes are not valid JSON, not this
+/// shape, or declare a [`ServiceSpec`] that cannot run (see [`validate_service`]).
 pub fn decode_flake_manifest(bytes: &[u8]) -> Result<FlakeManifestV1, serde_json::Error> {
-    serde_json::from_slice(bytes)
+    let manifest: FlakeManifestV1 = serde_json::from_slice(bytes)?;
+    validate_service(&manifest).map_err(serde::de::Error::custom)?;
+    Ok(manifest)
+}
+
+/// The longest a service may take to become Ready: `interval_secs * max_attempts`, one hour.
+pub const MAX_PROBE_BUDGET_SECS: u64 = 3_600;
+
+/// Refuses a `service` that could never become Ready or would run as root. `decode_flake_manifest` calls it, so
+/// the executor enforces it on every dispatch; a submitter that wants to fail early calls it too.
+///
+/// `user` is an account name (`[a-z_][a-z0-9_-]*`, at most 32 characters), never a uid, and never `root`. The
+/// agent must still check the uid the name resolves to: another account can share uid 0.
+///
+/// # Errors
+/// The first problem found, as a message.
+pub fn validate_service(manifest: &FlakeManifestV1) -> Result<(), String> {
+    let Some(service) = &manifest.service else {
+        return Ok(());
+    };
+    if manifest.command.is_empty() {
+        return Err("a service needs a command to run".to_owned());
+    }
+    if !is_service_account_name(&service.user) || service.user == "root" {
+        return Err(format!(
+            "a service must name a non-root user account ([a-z_][a-z0-9_-]*, at most 32 characters), got {:?}",
+            service.user
+        ));
+    }
+    let probe = &service.probe;
+    match &probe.check {
+        ProbeCheck::Tcp { port: 0 } => return Err("the probe port must not be 0".to_owned()),
+        ProbeCheck::Command { argv }
+            if argv
+                .first()
+                .is_none_or(|program| program.trim().is_empty() || argv.iter().any(|arg| arg.contains('\0'))) =>
+        {
+            return Err("the probe command needs a program and no NUL in its arguments".to_owned());
+        }
+        ProbeCheck::Tcp { .. } | ProbeCheck::Command { .. } => {}
+    }
+    if probe.interval_secs == 0 || probe.timeout_secs == 0 || probe.max_attempts == 0 {
+        return Err("the probe interval, timeout and max attempts must be at least 1".to_owned());
+    }
+    if probe.timeout_secs > probe.interval_secs {
+        return Err(format!(
+            "the probe timeout ({}s) must not exceed its interval ({}s); both default to 2s",
+            probe.timeout_secs, probe.interval_secs
+        ));
+    }
+    if u64::from(probe.interval_secs) * u64::from(probe.max_attempts) > MAX_PROBE_BUDGET_SECS {
+        return Err(format!(
+            "the probe budget (interval * max attempts) must not exceed {MAX_PROBE_BUDGET_SECS}s"
+        ));
+    }
+    Ok(())
+}
+
+/// A conservative POSIX account name: the shape every guest user the image defines will have.
+fn is_service_account_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+        && name.len() <= 32
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
 #[cfg(test)]
@@ -106,9 +245,198 @@ mod tests {
             cpu: Some(4),
             mem: Some(2_048),
             timeout_secs: Some(120),
+            service: Some(t3_service()),
         };
         let bytes = encode_flake_manifest(&manifest)?;
         assert_eq!(decode_flake_manifest(&bytes)?, manifest);
+        Ok(())
+    }
+
+    fn t3_service() -> ServiceSpec {
+        ServiceSpec {
+            user: "dev".to_owned(),
+            probe: HealthProbe {
+                check: ProbeCheck::Tcp { port: 3773 },
+                interval_secs: 2,
+                timeout_secs: 1,
+                max_attempts: 60,
+            },
+            restart: RestartPolicy::OnFailure,
+        }
+    }
+
+    /// A service manifest with `change` applied, encoded the way a submitter would send it.
+    fn service_manifest_bytes(change: impl FnOnce(&mut ServiceSpec)) -> Result<Vec<u8>, serde_json::Error> {
+        let mut service = t3_service();
+        change(&mut service);
+        encode_flake_manifest(&FlakeManifestV1 {
+            flake: "./fixture".to_owned(),
+            kind: None,
+            attr: None,
+            command: vec!["t3".to_owned(), "serve".to_owned()],
+            history_lines: default_history_lines(),
+            env: Vec::new(),
+            cpu: None,
+            mem: None,
+            timeout_secs: None,
+            service: Some(service),
+        })
+    }
+
+    /// Decodes `bytes`, which must be refused, and returns the refusal's text.
+    fn refusal(bytes: &[u8]) -> String {
+        decode_flake_manifest(bytes)
+            .expect_err("this manifest must be refused")
+            .to_string()
+    }
+
+    /// Adversarial (#589): a service runs as a named, non-root account. Every spelling of uid 0, and any name
+    /// that is not a plain account name, is refused.
+    #[test]
+    fn a_service_user_that_is_not_a_plain_non_root_account_is_refused() -> Result<(), serde_json::Error> {
+        let too_long = "a".repeat(33);
+        for user in [
+            "root", "0", "00", "+0", "", " root", "root ", "root\0", "ROOT", "-x", "a/b", "1abc", "a b", &too_long,
+        ] {
+            let bytes = service_manifest_bytes(|s| s.user = user.to_owned())?;
+            assert!(
+                refusal(&bytes).contains("non-root user account"),
+                "user {user:?} must be refused as a bad account"
+            );
+        }
+        for user in ["dev", "_t3", "t3-user", "svc_1"] {
+            decode_flake_manifest(&service_manifest_bytes(|s| s.user = user.to_owned())?)?;
+        }
+        Ok(())
+    }
+
+    /// Adversarial (#589): a probe that can never pass, or never time out, is refused at submit time instead of
+    /// hanging the environment in Starting. Each case names the message it must produce.
+    #[test]
+    fn an_unrunnable_probe_is_refused_with_its_reason() -> Result<(), serde_json::Error> {
+        let cases: [(&str, fn(&mut ServiceSpec), &str); 8] = [
+            (
+                "port 0",
+                |s| s.probe.check = ProbeCheck::Tcp { port: 0 },
+                "port must not be 0",
+            ),
+            (
+                "empty argv",
+                |s| s.probe.check = ProbeCheck::Command { argv: Vec::new() },
+                "needs a program",
+            ),
+            (
+                "blank program",
+                |s| {
+                    s.probe.check = ProbeCheck::Command {
+                        argv: vec!["  ".to_owned()],
+                    }
+                },
+                "needs a program",
+            ),
+            (
+                "NUL in an argument",
+                |s| {
+                    s.probe.check = ProbeCheck::Command {
+                        argv: vec!["true".to_owned(), "a\0b".to_owned()],
+                    }
+                },
+                "no NUL",
+            ),
+            ("zero interval", |s| s.probe.interval_secs = 0, "at least 1"),
+            ("zero timeout", |s| s.probe.timeout_secs = 0, "at least 1"),
+            ("zero attempts", |s| s.probe.max_attempts = 0, "at least 1"),
+            (
+                "an hour and a second of budget",
+                |s| {
+                    s.probe.interval_secs = 3_601;
+                    s.probe.timeout_secs = 1;
+                    s.probe.max_attempts = 1;
+                },
+                "probe budget",
+            ),
+        ];
+        for (name, change, message) in cases {
+            let text = refusal(&service_manifest_bytes(change)?);
+            assert!(text.contains(message), "{name}: {text}");
+        }
+        Ok(())
+    }
+
+    /// The budget is checked in u64: a huge interval and attempt count is refused, not wrapped.
+    #[test]
+    fn a_probe_budget_that_overflows_u32_is_refused() -> Result<(), serde_json::Error> {
+        let bytes = service_manifest_bytes(|s| {
+            s.probe.interval_secs = u32::MAX;
+            s.probe.max_attempts = u32::MAX;
+        })?;
+        assert!(refusal(&bytes).contains("probe budget"));
+        Ok(())
+    }
+
+    /// Adversarial (#589): a probe timeout longer than its interval would overlap attempts, and the message
+    /// names both values since either may come from a default.
+    #[test]
+    fn a_probe_timeout_beyond_its_interval_is_refused() -> Result<(), serde_json::Error> {
+        let bytes = service_manifest_bytes(|s| {
+            s.probe.interval_secs = 1;
+            s.probe.timeout_secs = 5;
+        })?;
+        let text = refusal(&bytes);
+        assert!(text.contains("(5s)") && text.contains("(1s)"), "{text}");
+        Ok(())
+    }
+
+    /// A service needs a command to run: the template's default command is not a service.
+    #[test]
+    fn a_service_without_a_command_is_refused() -> Result<(), serde_json::Error> {
+        let mut manifest = decode_flake_manifest(&service_manifest_bytes(|_| {})?)?;
+        manifest.command.clear();
+        let bytes = encode_flake_manifest(&manifest)?;
+        assert!(refusal(&bytes).contains("needs a command"));
+        Ok(())
+    }
+
+    /// Schema holes: an unknown field in `service`, `probe` or `check`, and an unknown check type, are refused
+    /// like an unknown top-level field; `"service": null` is an ordinary job.
+    #[test]
+    fn the_service_schema_refuses_unknown_shapes() -> Result<(), serde_json::Error> {
+        let base = |service: &str| {
+            format!(r#"{{"flake":".","kind":null,"attr":null,"command":["t3","serve"],"service":{service}}}"#)
+        };
+        for service in [
+            r#"{"user":"dev","probe":{"check":{"type":"tcp","port":1}},"extra":1}"#,
+            r#"{"user":"dev","probe":{"check":{"type":"tcp","port":1},"extra":1}}"#,
+            r#"{"user":"dev","probe":{"check":{"type":"tcp","port":1,"extra":1}}}"#,
+            r#"{"user":"dev","probe":{"check":{"type":"http","port":1}}}"#,
+            r#"{"user":"dev","probe":{"check":{"type":"tcp","port":1}},"restart":"sometimes"}"#,
+        ] {
+            assert!(
+                decode_flake_manifest(base(service).as_bytes()).is_err(),
+                "{service} must be refused"
+            );
+        }
+        assert_eq!(decode_flake_manifest(base("null").as_bytes())?.service, None);
+        Ok(())
+    }
+
+    /// The T3 shape decodes, and an omitted restart policy and probe timing take their defaults.
+    #[test]
+    fn a_minimal_service_takes_the_defaults() -> Result<(), serde_json::Error> {
+        let json = r#"{"flake":".","kind":null,"attr":null,"command":["t3","serve"],
+            "service":{"user":"dev","probe":{"check":{"type":"tcp","port":3773}}}}"#;
+        let service = decode_flake_manifest(json.as_bytes())?
+            .service
+            .expect("service present");
+        assert_eq!(service.restart, RestartPolicy::Never);
+        assert_eq!(
+            (
+                service.probe.interval_secs,
+                service.probe.timeout_secs,
+                service.probe.max_attempts
+            ),
+            (2, 2, 30)
+        );
         Ok(())
     }
 
@@ -127,6 +455,7 @@ mod tests {
             cpu: None,
             mem: None,
             timeout_secs: None,
+            service: None,
         };
         let bytes = encode_flake_manifest(&manifest)?;
         assert_eq!(decode_flake_manifest(&bytes)?, manifest);
