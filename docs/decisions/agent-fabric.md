@@ -447,6 +447,8 @@ connection (a websocket) works.
   256 connections open, which starves the bridge's own dials. Nothing in the relay can tell the bridge from another
   host process, so only authentication closes this.
 - **Limits.** At most 256 connections are relayed at once, and a connection over the cap is closed unanswered. A
+  connection that moves no byte in either direction for 15 minutes is closed, so a peer that sends the ready byte
+  and goes silent cannot hold a slot for good (a quiet direction alone is not idle). A
   dial to the target that takes more than 5 seconds closes that connection only. A target that is down closes that
   one connection, and the relay keeps accepting. The target must be an IPv4 loopback address with a real port, so
   the relay cannot forward off the guest, and a service that binds only `::1` cannot be relayed.
