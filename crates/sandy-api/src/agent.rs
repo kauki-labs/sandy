@@ -126,10 +126,13 @@ mod tests {
     #[test]
     fn the_service_relay_port_is_privileged_and_collides_with_no_other_guest_port() {
         assert_eq!(PORT_RELAY_VSOCK_PORT, 1_000);
-        assert!(
-            PORT_RELAY_VSOCK_PORT <= 1_023,
-            "a port above 1023 can be bound by any guest process"
-        );
+        // A compile-time check: raising the port above 1023 would let any guest process bind it.
+        const {
+            assert!(
+                PORT_RELAY_VSOCK_PORT <= 1_023,
+                "a port above 1023 can be bound by any guest process"
+            );
+        }
         for other in [AGENT_VSOCK_PORT, 5_001] {
             assert_ne!(PORT_RELAY_VSOCK_PORT, other);
         }
