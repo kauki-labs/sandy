@@ -24,7 +24,9 @@ the daemon's uid. A broker that serves HTTP clients is a UDS peer of sandyd.
 
 - `sandy-broker` is its own binary and crate. It depends on `sandy-control-proto` for the
   frame codec and never on `sandyd`. It runs as the daemon's user and opens one UDS
-  connection per request.
+  connection per control RPC, each with a 30 s deadline. Submit, list and get make one RPC.
+  Cancel makes one. A submit makes a second RPC only when the owner-table save fails and the
+  job is cancelled.
 - The HTTP server is `hyper` 1 with hand-routed paths. The lockfile already holds it through
   `reqwest`. No web framework is added.
 
@@ -63,6 +65,13 @@ belongs to the owner, and `sandy-mcp` accepts only loopback `http` today.
   Cancel presents the stored token to sandyd.
 - A job with no stored token (a restart that lost the file) is uncancellable through the API,
   as in decision 23. The operator path `sandyd cancel` still works.
+- One broker per state directory: the broker holds an exclusive lock on `owners.lock` for as
+  long as any handler holds the table, so a second instance cannot clobber it.
+- **Residual: a crash between sandyd accepting `Submit` and the table write** leaves a job
+  with no owner. `SubmitRequest` has no correlation key and `ListResponse` carries no token,
+  so a restarted broker can neither link nor cancel it. Closing it needs a control-RPC
+  change (a client-chosen key echoed durably, and a recoverable cancel authority). The
+  operator path `sandyd cancel` still works. Tracked in #621.
 
 ## 4. Host paths in a submit body fail closed (_owner_)
 

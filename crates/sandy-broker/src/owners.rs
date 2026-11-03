@@ -8,6 +8,7 @@ use sandy_fsutil::OwnedDir;
 use serde::{Deserialize, Serialize};
 
 const FILE: &str = "owners.json";
+const LOCK_FILE: &str = "owners.lock";
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Owned {
@@ -20,6 +21,7 @@ struct Owned {
 pub(crate) struct Owners {
     dir: OwnedDir,
     table: Mutex<HashMap<String, Owned>>,
+    _lock: std::fs::File,
 }
 
 /// The table could not be loaded or saved.
@@ -34,11 +36,28 @@ pub enum OwnersError {
     /// Reading the file failed.
     #[error("read owner table: {0}")]
     Read(std::io::Error),
+    /// Another broker holds this state directory.
+    #[error("the state directory is in use by another broker")]
+    Locked,
 }
 
 impl Owners {
     pub(crate) fn open(state_dir: &Path) -> Result<Self, OwnersError> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        use fs2::FileExt;
+
         let dir = OwnedDir::open_or_create(state_dir)?;
+        // One broker per state dir: a second writer would clobber the table. The
+        // lock lives as long as this value, and handlers hold it through their Arc.
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(dir.path().join(LOCK_FILE))
+            .map_err(OwnersError::Read)?;
+        lock.try_lock_exclusive().map_err(|_| OwnersError::Locked)?;
         let table = match std::fs::read(dir.path().join(FILE)) {
             Ok(bytes) => serde_json::from_slice(&bytes)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
@@ -47,6 +66,7 @@ impl Owners {
         Ok(Self {
             dir,
             table: Mutex::new(table),
+            _lock: lock,
         })
     }
 
@@ -89,6 +109,16 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+
+    #[test]
+    fn a_second_broker_on_the_same_state_dir_is_refused_until_the_first_is_gone() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let first = Owners::open(dir.path())?;
+        assert!(matches!(Owners::open(dir.path()), Err(OwnersError::Locked)));
+        drop(first);
+        Owners::open(dir.path())?;
+        Ok(())
+    }
 
     #[test]
     fn ownership_and_the_token_survive_a_restart_and_the_file_is_private() -> anyhow::Result<()> {

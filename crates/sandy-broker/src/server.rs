@@ -20,6 +20,8 @@ use tokio::net::UnixStream;
 use crate::{Client, IsolationClass, auth::authenticate, owners::Owners, paths::within_roots};
 
 const MAX_BODY: usize = 1024 * 1024;
+/// How long one control RPC may take, connect included.
+const RPC_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub(crate) struct State {
     pub(crate) control_socket: PathBuf,
@@ -79,6 +81,14 @@ fn error(e: &ApiError) -> Response<Full<Bytes>> {
     respond(e.status, &json!({"code": e.code, "message": e.message}))
 }
 
+pub(crate) fn busy() -> Response<Full<Bytes>> {
+    error(&ApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        code: "unavailable",
+        message: "too many requests in flight",
+    })
+}
+
 pub(crate) fn internal_error() -> Response<Full<Bytes>> {
     respond(
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -113,6 +123,15 @@ type Reply = Result<(StatusCode, Value), ApiError>;
 /// One control-RPC call over a fresh UDS connection. Any transport fault or
 /// `ControlError` becomes `unavailable`: sandyd's own message is not relayed.
 async fn rpc(state: &State, op: control_request::Op) -> Result<control_response::Result, ApiError> {
+    tokio::time::timeout(RPC_DEADLINE, rpc_inner(state, op))
+        .await
+        .unwrap_or_else(|_| {
+            tracing::warn!("control call timed out");
+            Err(UNAVAILABLE)
+        })
+}
+
+async fn rpc_inner(state: &State, op: control_request::Op) -> Result<control_response::Result, ApiError> {
     let mut stream = UnixStream::connect(&state.control_socket).await.map_err(|e| {
         tracing::warn!(error = %e, "cannot reach sandyd");
         UNAVAILABLE
@@ -244,7 +263,16 @@ async fn submit(state: &State, client: &Client, req: Request<Incoming>) -> Reply
             job_id: done.job_id.clone(),
             attach_token: Some(done.attach_token.clone()),
         };
-        let _ = rpc(state, control_request::Op::Cancel(cancel)).await;
+        match rpc(state, control_request::Op::Cancel(cancel)).await {
+            Ok(control_response::Result::Cancel(_)) => {
+                tracing::info!(job_id = %done.job_id, "cancelled the job that has no recorded owner");
+            }
+            other => tracing::error!(
+                job_id = %done.job_id,
+                cancelled = other.is_ok(),
+                "the job has no recorded owner and was NOT cancelled; it runs until its deadline"
+            ),
+        }
         return Err(UNAVAILABLE);
     }
     Ok((StatusCode::ACCEPTED, json!({"job_id": done.job_id, "state": "pending"})))
@@ -292,6 +320,6 @@ async fn cancel(state: &State, client: &Client, id: &str) -> Reply {
         attach_token: Some(token),
     });
     rpc(state, op).await?;
-    let body = status_of(state, id).await?;
-    Ok((StatusCode::OK, json!({"job_id": id, "state": body["state"]})))
+    // sandyd applied the cancel. Report that, whatever the status read says.
+    Ok((StatusCode::OK, json!({"job_id": id, "state": "cancelled"})))
 }

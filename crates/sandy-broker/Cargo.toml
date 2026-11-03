@@ -17,6 +17,7 @@ workspace = true
 [dependencies]
 base64.workspace = true
 clap.workspace = true
+fs2.workspace = true
 hex.workspace = true
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }

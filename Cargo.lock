@@ -2394,6 +2394,7 @@ dependencies = [
  "anyhow",
  "base64 0.23.1",
  "clap",
+ "fs2",
  "hex",
  "http-body-util",
  "hyper",

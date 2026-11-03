@@ -101,6 +101,9 @@ pub enum BrokerError {
 /// Most connections served at once. A connection over the cap waits in the
 /// accept queue instead of holding a task.
 const MAX_CONNECTIONS: usize = 128;
+/// Most requests in flight at once, detached ones included. One over the cap
+/// gets `unavailable` at once.
+const MAX_HANDLERS: usize = 64;
 /// How long a client may take to send its request headers.
 const HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -157,6 +160,7 @@ pub async fn serve(config: BrokerConfig) -> Result<Running, BrokerError> {
     let listener = TcpListener::bind(config.bind).await.map_err(bind_err)?;
     let addr = listener.local_addr().map_err(bind_err)?;
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+    let handlers = Arc::new(tokio::sync::Semaphore::new(MAX_HANDLERS));
     let task = tokio::spawn(async move {
         loop {
             let Ok(permit) = Arc::clone(&slots).acquire_owned().await else {
@@ -172,17 +176,28 @@ pub async fn serve(config: BrokerConfig) -> Result<Running, BrokerError> {
                 }
             };
             let state = Arc::clone(&state);
+            let handlers = Arc::clone(&handlers);
             tokio::spawn(async move {
                 let _permit = permit;
                 let service = service_fn(move |req| {
                     let state = Arc::clone(&state);
+                    let handlers = Arc::clone(&handlers);
                     async move {
+                        // A handler slot is taken before spawning and moved into the
+                        // task, so detached handlers stay bounded even after their
+                        // connection is gone.
+                        let Ok(slot) = handlers.try_acquire_owned() else {
+                            return Ok(server::busy());
+                        };
                         // Run the request on its own task: a client that hangs up
                         // mid-submit must not cancel the handler between sandyd
                         // accepting a job and the broker recording its owner.
-                        let response = tokio::spawn(server::handle(state, req))
-                            .await
-                            .unwrap_or_else(|_| server::internal_error());
+                        let response = tokio::spawn(async move {
+                            let _slot = slot;
+                            server::handle(state, req).await
+                        })
+                        .await
+                        .unwrap_or_else(|_| server::internal_error());
                         Ok::<_, std::convert::Infallible>(response)
                     }
                 });
