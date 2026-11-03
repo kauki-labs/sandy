@@ -10,10 +10,12 @@ mod backend;
 mod containment;
 mod cred;
 mod egress;
+mod environment;
 mod trust_root;
 
 pub use backend::FakeBackend;
 pub use containment::FakeContainment;
 pub use cred::FakeProvider;
 pub use egress::FakeApplier;
+pub use environment::FakeEnvironmentBackend;
 pub use trust_root::FakeProvisioner;

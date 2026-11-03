@@ -244,6 +244,7 @@ fn submit(
                 cpu: None,
                 mem: None,
                 timeout_secs: None,
+                service: None,
             })
             .context("encode the flake/v1 manifest")?,
         ),
