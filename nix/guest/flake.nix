@@ -81,11 +81,15 @@
         pkgs.writeShellScriptBin "sandy-t3-ready" ''
           port=''${1:-3773}
           case "$port" in
-            "" | *[!0-9]*)
-              echo "sandy-t3-ready: the port must be digits, got: $port" >&2
+            "" | *[!0-9]* | ??????*)
+              echo "sandy-t3-ready: the port must be 1 to 5 digits, got: $port" >&2
               exit 2
               ;;
           esac
+          if [ "$port" -gt 65535 ]; then
+            echo "sandy-t3-ready: the port must be at most 65535, got: $port" >&2
+            exit 2
+          fi
           code=$(${pkgs.curl}/bin/curl --silent --noproxy '*' --max-time 2 --output /dev/null \
             --write-out '%{http_code}' "http://127.0.0.1:$port/") || exit 1
           [ "$code" -ge 100 ] && [ "$code" -lt 500 ]
@@ -259,9 +263,14 @@
         # so the guest must define that account: a non-root user with a home directory that it owns.
         assert
           (
-            config.users.users ? t3 && config.users.users.t3.home != "" && (config.users.users.t3.uid or 1) != 0
+            config.users.users ? t3
+            && config.users.users.t3.isSystemUser
+            && config.users.users.t3.group == "t3"
+            && config.users.users.t3.home == "/var/lib/t3"
+            && config.users.users.t3.createHome
+            && pkgs.lib.hasSuffix "/nologin" (toString config.users.users.t3.shell)
           )
-          || throw "the t3 guest defines no non-root t3 service user with a home directory";
+          || throw "the t3 guest defines no t3 system user with a home directory, its own group and no login shell";
         pkgs.runCommand "t3-guest-packages" { } "touch $out";
 
       # The readiness probe's behaviour against a throwaway local HTTP server (#608): any status below 500 means the
@@ -290,6 +299,11 @@
                     pass
             http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()
             PY
+            refuses() { # refuses <label> <probe args...>: a bad argument is a usage error (2), not a failed probe (1)
+              label=$1; shift
+              rc=0; sandy-t3-ready "$@" 2>/dev/null || rc=$?
+              [ "$rc" = 2 ] || { echo "$label: wanted exit 2, got $rc" >&2; exit 1; }
+            }
             expect() { # expect <want: ok|fail> <label> <probe args...>
               want=$1; label=$2; shift 2
               if sandy-t3-ready "$@" 2>/dev/null; then got=ok; else got=fail; fi
@@ -304,8 +318,10 @@
               kill "$pid"; wait "$pid" 2>/dev/null || true
             done
             expect fail "nothing listening" 18799
-            expect fail "port with userinfo" "18700@otherhost"
-            expect fail "port with a command" "18700; true"
+            refuses "port with userinfo" "18700@otherhost"
+            refuses "port with a command" "18700; true"
+            refuses "port above 65535" 65536
+            refuses "huge port" 99999999999999999999
             touch $out
           '';
 
