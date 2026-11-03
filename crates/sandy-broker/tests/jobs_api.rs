@@ -186,7 +186,8 @@ async fn no_response_carries_the_attach_token() -> Result<()> {
     let mut lines = common::Lines::new(resp);
     lines.output_bytes(5).await?;
     f.finish(&live, sandy_control_proto::JobStatus::Succeeded)?;
-    seen.push_str(&lines.last().await?.to_string());
+    lines.last().await?;
+    seen.push_str(&lines.transcript);
     // A spent ticket gives the stream route's 404 body.
     let spent = f.open_stream(&stream_url, Some(TOKEN_A)).await?;
     seen.push_str(&spent.text().await?);

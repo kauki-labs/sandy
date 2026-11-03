@@ -185,7 +185,7 @@ quota check, and a client could exceed the quota by one environment per distinct
 - The response is `200`, `application/x-ndjson`, `Cache-Control: no-store`, chunked. Each
   delivered stdout or stderr chunk is `{"type":"output","data":"<base64>"}` (bytes opaque,
   streams merged). The last line is `{"type":"exit","reason":...}` with `closed`,
-  `job_terminal:<JOB_STATUS_*>`, `job_terminal_truncated:<JOB_STATUS_*>` or a fixed `fault:` text. The shape follows the CLI's
+  `job_terminal:<JOB_STATUS_*>`, `job_terminal_truncated:<JOB_STATUS_*>` or a fixed `fault:` text (`fault:data plane error`, `fault:status unavailable` after 5 failed status polls in a row). The shape follows the CLI's
   `daemon attach -o json` (#513) minus its `attached` line, which carries the cap.
 - The token and the cap never appear in a response, header, URL or log line (a test scans the
   captured logs). The broker never logs the stream URL or a ticket.

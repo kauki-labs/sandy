@@ -46,6 +46,8 @@ const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_secs(1);
 /// After the job ended, a stream ends once the data plane is quiet this long.
 const QUIET: Duration = Duration::from_millis(500);
+/// Consecutive failed status polls after which a stream ends with `fault:status unavailable`.
+const MAX_FAILED_POLLS: u32 = 5;
 /// The most a stream drains after the job ended, however much keeps arriving.
 const DRAIN_CAP: Duration = Duration::from_secs(30);
 /// Chunks buffered between the producer and the HTTP body.
@@ -326,6 +328,7 @@ async fn run(state: &State, id: &str, tx: &mpsc::Sender<Bytes>, frames: &mut Fra
     // The first poll waits a full period: the job's replay is already flowing by then.
     let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + POLL, POLL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut failed_polls = 0_u32;
     loop {
         tokio::select! {
             () = tx.closed() => return End::ClientGone,
@@ -343,8 +346,15 @@ async fn run(state: &State, id: &str, tx: &mpsc::Sender<Bytes>, frames: &mut Fra
                     () = tx.closed() => return End::ClientGone,
                     status = terminal_status(state, id) => status,
                 };
-                if let Some(status) = status {
-                    return drain(state, tx, frames, status).await;
+                match status {
+                    Ok(Some(status)) => return drain(state, tx, frames, status).await,
+                    Ok(None) => failed_polls = 0,
+                    Err(()) => {
+                        failed_polls += 1;
+                        if failed_polls >= MAX_FAILED_POLLS {
+                            return End::Exit("fault:status unavailable".to_owned());
+                        }
+                    }
                 }
             }
         }
@@ -361,8 +371,10 @@ async fn drain(state: &State, tx: &mpsc::Sender<Bytes>, frames: &mut Frames, sta
             next = tokio::time::timeout(QUIET, frames.recv()) => next,
         };
         match next {
-            // Quiet, or the data plane ended: everything sandyd had is out.
-            Err(_) | Ok(None | Some(Ok(None) | Err(()))) => return End::Exit(format!("job_terminal:{status}")),
+            // Quiet, or the data plane closed cleanly: everything sandyd had is out.
+            Err(_) | Ok(None | Some(Ok(None))) => return End::Exit(format!("job_terminal:{status}")),
+            // A read error may have cost output.
+            Ok(Some(Err(()))) => return End::Exit("fault:data plane error".to_owned()),
             Ok(Some(Ok(Some(frame)))) => {
                 match tokio::time::timeout_at(deadline, forward(tx, frame, state.send_timeout)).await {
                     Ok(true) => {}
@@ -413,14 +425,15 @@ fn terminal_name(status: i32) -> Option<&'static str> {
     }
 }
 
-/// The job's status name once it left `Pending` and `Running`. A failed status call reads as
-/// "not terminal": the data plane closing ends the stream in that case.
-async fn terminal_status(state: &State, id: &str) -> Option<&'static str> {
+/// The job's status name once it left `Pending` and `Running`, `None` while it runs, `Err` when
+/// the status call failed. sandyd's relay does not close the data plane when a job ends, so the
+/// caller counts failures instead of waiting for it.
+async fn terminal_status(state: &State, id: &str) -> Result<Option<&'static str>, ()> {
     let op = control_request::Op::Status(StatusRequest { job_id: id.to_owned() });
     let Ok(control_response::Result::Status(status)) = rpc(state, op).await else {
-        return None;
+        return Err(());
     };
-    terminal_name(status.status)
+    Ok(terminal_name(status.status))
 }
 
 #[cfg(test)]

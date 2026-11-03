@@ -275,11 +275,17 @@ impl Fixture {
 pub struct Lines {
     resp: reqwest::Response,
     buf: Vec<u8>,
+    /// Every line read so far, raw, for leak scans.
+    pub transcript: String,
 }
 
 impl Lines {
     pub fn new(resp: reqwest::Response) -> Self {
-        Self { resp, buf: Vec::new() }
+        Self {
+            resp,
+            buf: Vec::new(),
+            transcript: String::new(),
+        }
     }
 
     /// The next line as JSON, or `None` when the body ended. Fails after 15 s of silence.
@@ -287,6 +293,7 @@ impl Lines {
         loop {
             if let Some(end) = self.buf.iter().position(|b| *b == b'\n') {
                 let line: Vec<u8> = self.buf.drain(..=end).collect();
+                self.transcript.push_str(&String::from_utf8_lossy(&line));
                 return Ok(Some(
                     serde_json::from_slice(&line[..line.len() - 1]).context("a line is JSON")?,
                 ));
