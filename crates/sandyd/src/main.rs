@@ -162,7 +162,13 @@ async fn main() {
         }
     };
 
-    let retention = match RetentionPolicy::from_env(|name| std::env::var(name).ok()) {
+    // `var(..).ok()` would read a non-UTF-8 value as unset and silently take the default.
+    let retention_setting = |name: &str| match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} is not valid UTF-8")),
+    };
+    let retention = match RetentionPolicy::from_env(retention_setting) {
         Ok(retention) => retention,
         Err(e) => {
             tracing::error!(error = %e, "invalid environment retention setting");

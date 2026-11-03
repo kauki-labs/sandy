@@ -235,10 +235,13 @@ pub(crate) async fn spawn(state: &State, client: &Client, req: Request<Incoming>
     let _serial = state.env_create.get(&client.id).ok_or(UNAVAILABLE)?.lock().await;
     // A replay of a request id skips the quota checks only while sandyd still holds that
     // environment. After sandyd's retention gc (#633) the same key would create a new one.
-    let replay = match state.owners.environment_for(&client.id, &body.request_id) {
+    let recorded = state.owners.environment_for(&client.id, &body.request_id);
+    let replay = match &recorded {
         None => false,
         Some(environment_id) => {
-            let op = control_request::Op::GetEnvironment(GetEnvironmentRequest { environment_id });
+            let op = control_request::Op::GetEnvironment(GetEnvironmentRequest {
+                environment_id: environment_id.clone(),
+            });
             match one(state, op).await {
                 Ok(_) => true,
                 Err(e) if e.status == StatusCode::NOT_FOUND => false,
@@ -247,13 +250,7 @@ pub(crate) async fn spawn(state: &State, client: &Client, req: Request<Incoming>
         }
     };
     if !replay {
-        let live = live_owned(state, client).await?;
-        if live >= client.max_environments {
-            return Err(QUOTA);
-        }
-        if state.owners.environment_records(&client.id) >= client.max_environment_records {
-            return Err(QUOTA_RECORDS);
-        }
+        quota_check(state, client).await?;
     }
     let op = control_request::Op::CreateEnvironment(CreateEnvironmentRequest {
         idempotency_key: namespaced(client, &body.request_id),
@@ -265,6 +262,27 @@ pub(crate) async fn spawn(state: &State, client: &Client, req: Request<Incoming>
         }),
     });
     let created = one(state, op).await?;
+    // The sweep may have collected the replayed row after the lookup above, so the create made
+    // a new environment that was never checked. Check now, and undo it if over quota. The
+    // per-client lock is held, and the new row is not recorded yet, so the counts are this
+    // client's other environments.
+    if replay
+        && recorded.as_deref() != Some(created.environment_id.as_str())
+        && let Err(over) = quota_check(state, client).await
+    {
+        let op = control_request::Op::DeleteEnvironment(DeleteEnvironmentRequest {
+            environment_id: created.environment_id.clone(),
+        });
+        match call(state, op).await {
+            Ok(_) => {
+                tracing::info!(environment_id = %created.environment_id, "deleted an environment created over quota by a replay after gc");
+            }
+            Err(e) => {
+                tracing::error!(code = e.code, environment_id = %created.environment_id, "could not delete an environment created over quota by a replay after gc");
+            }
+        }
+        return Err(over);
+    }
     // A failed save leaves the environment unowned for now. The client's retry
     // replays this create, gets the same environment back, and records it.
     if let Err(e) = state
@@ -275,6 +293,18 @@ pub(crate) async fn spawn(state: &State, client: &Client, req: Request<Incoming>
         return Err(UNAVAILABLE);
     }
     Ok((StatusCode::ACCEPTED, summary(&created)))
+}
+
+/// Refuses when `client` holds `max_environments` non-terminal environments or has ever
+/// created `max_environment_records`.
+async fn quota_check(state: &State, client: &Client) -> Result<(), ApiError> {
+    if live_owned(state, client).await? >= client.max_environments {
+        return Err(QUOTA);
+    }
+    if state.owners.environment_records(&client.id) >= client.max_environment_records {
+        return Err(QUOTA_RECORDS);
+    }
+    Ok(())
 }
 
 /// The most rows the broker reads from sandyd for one request, across pages. A daemon

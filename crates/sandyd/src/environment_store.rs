@@ -182,14 +182,15 @@ impl Default for RetentionPolicy {
 
 impl RetentionPolicy {
     /// Read `SANDY_ENV_RETENTION_SECS` and `SANDY_MAX_DELETED_ENVIRONMENTS` through
-    /// `get`; an unset variable keeps its default.
+    /// `get` (`Ok(None)` is unset and keeps the default).
     ///
     /// # Errors
-    /// A set value that is not an integer of at least 1.
-    pub fn from_env(get: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+    /// A set value that is not an integer of at least 1, or an error from `get` (the caller
+    /// reports a value it cannot read as text).
+    pub fn from_env(get: impl Fn(&str) -> Result<Option<String>, String>) -> Result<Self, String> {
         let default = Self::default();
         let read = |name: &str| -> Result<Option<u64>, String> {
-            get(name)
+            get(name)?
                 .map(|v| match v.trim().parse::<u64>() {
                     Ok(n) if n >= 1 => Ok(n),
                     _ => Err(format!("{name} must be an integer of at least 1, got {v:?}")),
@@ -1546,7 +1547,7 @@ mod tests {
     #[test]
     fn the_retention_policy_reads_its_two_settings_and_refuses_bad_values() -> Result<()> {
         let env = |pairs: &'static [(&'static str, &'static str)]| {
-            move |name: &str| pairs.iter().find(|(k, _)| *k == name).map(|(_, v)| (*v).to_owned())
+            move |name: &str| Ok(pairs.iter().find(|(k, _)| *k == name).map(|(_, v)| (*v).to_owned()))
         };
         assert_eq!(
             RetentionPolicy::from_env(env(&[])).map_err(anyhow::Error::msg)?,
@@ -1565,6 +1566,11 @@ mod tests {
                 window_secs: 60,
                 max_deleted: 7
             }
+        );
+        let unreadable = |_: &str| Err("SANDY_ENV_RETENTION_SECS is not valid UTF-8".to_owned());
+        assert!(
+            RetentionPolicy::from_env(unreadable).is_err(),
+            "an unreadable value is refused, not defaulted"
         );
         for bad in [
             &[("SANDY_ENV_RETENTION_SECS", "0")][..],
