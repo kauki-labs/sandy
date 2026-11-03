@@ -131,7 +131,9 @@ to end — see `kpi.md`'s KA3), the detach key is SSH's own `~.` sequence
 (recognized only right after a newline, so it rarely collides with real
 input), and a durable per-job attach token lets a genuinely separate
 `attach` process reattach later with post rights, not just a fresh
-session's own observer rights. Detaching does not end the job: `sandyd`'s
+session's own observer rights. `attach -o json` writes an NDJSON stream for
+agent callers: an `attached` line first (with the cap), `output` lines
+(base64), and an `exit` line last (#513). Detaching does not end the job: `sandyd`'s
 `attach_relay` (`crates/sandyd/src/attach_relay.rs`) keeps relaying the live
 process over the job's own channel, and, for process-backed jobs, a detached
 job's deadline falls back to a shorter grace period rather than running

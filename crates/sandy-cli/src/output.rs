@@ -1208,6 +1208,58 @@ mod tests {
         Ok(())
     }
 
+    /// The three lines of an attach stream, in order (#513).
+    fn attach_stream() -> Vec<super::AttachEvent> {
+        vec![
+            super::AttachEvent::Attached(AttachedChannel {
+                channel_id: "orchestrator".to_owned(),
+                cap: base64::engine::general_purpose::STANDARD.encode(b"not-a-real-cap"),
+            }),
+            super::AttachEvent::output(b"hi\n"),
+            super::AttachEvent::Exit {
+                reason: "detached".to_owned(),
+            },
+        ]
+    }
+
+    /// #513: every attach event survives a serde round trip, and the wire form is the tagged NDJSON the owner
+    /// decision on #564 names: `attached` (with the cap) first, `output` (base64) per chunk, `exit` last.
+    #[test]
+    fn attach_stream_json_is_one_tagged_compact_object_per_line() -> anyhow::Result<()> {
+        let mut buf = Vec::new();
+        super::emit_stream_to(attach_stream(), OutputFormat::Json, &mut buf).context("emit the stream")?;
+        let text = String::from_utf8(buf).context("NDJSON is UTF-8")?;
+        insta::assert_snapshot!(text, @r#"
+        {"type":"attached","channel_id":"orchestrator","cap":"bm90LWEtcmVhbC1jYXA="}
+        {"type":"output","data":"aGkK"}
+        {"type":"exit","reason":"detached"}
+        "#);
+        for (line, event) in text.lines().zip(attach_stream()) {
+            assert_eq!(serde_json::from_str::<super::AttachEvent>(line)?, event, "{line}");
+        }
+        Ok(())
+    }
+
+    /// #513: the plain rendering of the same events: the `attached` line redacts the cap, `output` is the raw
+    /// bytes, `exit` names the reason.
+    #[test]
+    fn attach_stream_plain_redacts_the_cap_and_decodes_output() -> anyhow::Result<()> {
+        let mut buf = Vec::new();
+        super::emit_stream_to(attach_stream(), OutputFormat::Plain, &mut buf).context("emit the stream")?;
+        let text = String::from_utf8(buf).context("plain is UTF-8 here")?;
+        insta::assert_snapshot!(text, @"
+        channel orchestrator (cap: 14 bytes, redacted — use -o json to retrieve)
+        hi
+
+        exit: detached
+        ");
+        assert!(
+            !text.contains("bm90LWEtcmVhbC1jYXA="),
+            "the plain stream must not print the cap"
+        );
+        Ok(())
+    }
+
     #[test]
     fn status_names_the_job_and_its_lifecycle_state_in_both_formats() -> anyhow::Result<()> {
         let response = StatusResponse {
