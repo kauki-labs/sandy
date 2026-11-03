@@ -70,13 +70,27 @@ belongs to the owner, and `sandy-mcp` accepts only loopback `http` today.
 paths that sandyd reads or writes as its user. Over HTTP that lets any client make the daemon
 touch any path of that user: a confused deputy.
 
-**Decision.** The broker refuses a path outside the client's configured `roots` (canonical
-path, symlinks resolved, `..` refused). A client with no `roots` may not send inputs,
-outputs, or secrets. A request for an isolation class above the client's
-`max_isolation_class` is `forbidden`. The default class is `untrusted` (#596).
+**Decision.** The broker refuses a path outside the client's configured `roots`: it must be
+absolute, contain no `..`, and reach its target through no symlink below the root (a dangling
+link and a link that stays inside the root are refused too). A client with no `roots` may not
+send inputs, outputs, or secrets. A request for an isolation class above the client's
+`max_isolation_class` is `forbidden`. `required_isolation_class` has no default: a missing
+field is `invalid_request`, as in the contract.
+
+The broker also refuses a clients list with a duplicate id, a duplicate token hash, an empty
+id, or a hash that is not 64 lowercase hex digits. It caps open connections, times out slow
+request headers, and runs each request on its own task, so a client that hangs up mid-submit
+cannot leave a job without an owner.
 
 **Consequence.** The contract is unchanged on the wire. These are new refusals, so `sandy-mcp`
 tests keep passing.
+
+**Residual risk (_owner_).** The check is a point in time. A client that can write inside its
+root can swap a directory for a symlink after the check, and sandyd then follows it as its
+own user (`crates/sandy/src/stage/inputs.rs` and `outputs.rs` open by path). Only an fd-based
+open in sandyd closes this. Until then, `roots` must be directories that the HTTP client
+cannot write to concurrently with a submit, or the client must be trusted with the daemon
+user's files. Tracked in a follow-up issue.
 
 ## 5. Deferred in this slice
 
@@ -88,9 +102,11 @@ tests keep passing.
 
 ## Consequences
 
-- Every broker refusal is typed (`unauthenticated`, `forbidden`, `not_found`, `unsupported`),
-  so `sandy-mcp` passes them through unchanged.
+- Every broker refusal is typed (`unauthenticated`, `forbidden`, `not_found`,
+  `invalid_request`, `unsupported`, `unavailable`), so `sandy-mcp` passes them through
+  unchanged. sandyd's own refusal text is never relayed; it becomes `unavailable`.
 - A broker restart keeps job ownership, so the owner can still cancel.
+- The owner table is rewritten whole on each submit and never pruned. Pruning waits for #596.
 - A caller on another machine cannot reach the broker until the TLS follow-up lands.
 - sandyd cannot tell two HTTP clients apart. The broker is the only per-client boundary.
 

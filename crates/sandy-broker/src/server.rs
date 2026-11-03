@@ -79,6 +79,13 @@ fn error(e: &ApiError) -> Response<Full<Bytes>> {
     respond(e.status, &json!({"code": e.code, "message": e.message}))
 }
 
+pub(crate) fn internal_error() -> Response<Full<Bytes>> {
+    respond(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        &json!({"code": "unavailable", "message": "internal error"}),
+    )
+}
+
 pub(crate) async fn handle(state: Arc<State>, req: Request<Incoming>) -> Response<Full<Bytes>> {
     let authorization = req.headers().get(AUTHORIZATION).and_then(|v| v.to_str().ok());
     let Some(client) = authenticate(&state.clients, authorization) else {

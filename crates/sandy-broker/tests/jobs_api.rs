@@ -4,6 +4,7 @@
 use std::{net::SocketAddr, path::Path, sync::Arc};
 
 use anyhow::{Context, Result};
+use base64::Engine;
 use reqwest::{Client as Http, StatusCode};
 use sandy_broker::{BrokerConfig, BrokerError, Client, IsolationClass, Running, serve};
 use sandyd::{dispatch::JobRegistry, host_registry::HostRegistry, store::JobStore};
@@ -174,19 +175,34 @@ async fn the_owner_cancels_with_the_token_the_broker_holds() -> Result<()> {
 #[tokio::test]
 async fn no_response_carries_the_attach_token() -> Result<()> {
     let f = fixture().await?;
-    let id = f.submit(TOKEN_A).await?;
+    let (_, submitted) = f.call("POST", "/v1/jobs", Some(TOKEN_A), Some(submit_body())).await?;
+    let id = submitted["job_id"].as_str().context("job_id")?.to_owned();
     let token = f.store.attach_token(&id)?.context("sandyd stored no attach token")?;
-    let needles = [hex::encode(&token), String::from_utf8_lossy(&token).into_owned()];
-    for (method, path) in [
-        ("GET", "/v1/jobs".to_owned()),
-        ("GET", format!("/v1/jobs/{id}")),
-        ("POST", format!("/v1/jobs/{id}/cancel")),
+    // The token is random bytes, so match the encodings it could leak in.
+    let needles = [
+        hex::encode(&token),
+        base64::engine::general_purpose::STANDARD.encode(&token),
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&token),
+    ];
+    let mut bodies = vec![("submit".to_owned(), submitted)];
+    for (method, path, bearer) in [
+        ("GET", "/v1/jobs".to_owned(), TOKEN_A),
+        ("GET", format!("/v1/jobs/{id}"), TOKEN_A),
+        ("GET", format!("/v1/jobs/{id}"), TOKEN_B),
+        ("POST", format!("/v1/jobs/{id}/cancel"), TOKEN_B),
+        ("POST", format!("/v1/jobs/{id}/attach"), TOKEN_A),
+        ("POST", format!("/v1/jobs/{id}/cancel"), TOKEN_A),
+        ("POST", format!("/v1/jobs/{id}/cancel"), TOKEN_A),
     ] {
-        let (_, body) = f.call(method, &path, Some(TOKEN_A), None).await?;
+        let (_, body) = f.call(method, &path, Some(bearer), None).await?;
+        bodies.push((path, body));
+    }
+    assert!(token.len() >= 16, "the token must be long enough to be a real needle");
+    for (what, body) in bodies {
         let text = body.to_string();
         assert!(
-            needles.iter().all(|n| n.is_empty() || !text.contains(n.as_str())),
-            "{path} leaked the attach token"
+            needles.iter().all(|n| !text.contains(n.as_str())),
+            "{what} leaked the attach token"
         );
     }
     Ok(())
@@ -227,12 +243,83 @@ async fn a_host_path_outside_the_clients_roots_is_forbidden() -> Result<()> {
     ok["inputs"] = json!([{"host": inside.to_string_lossy(), "name": "n"}]);
     let (status, resp) = f.call("POST", "/v1/jobs", Some(TOKEN_A), Some(ok)).await?;
     // sandyd refuses path fields without a local-dispatch host (decision 21), so
-    // 503 is expected here. The broker's own boundary is: not 403.
-    assert_ne!(
-        status,
-        StatusCode::FORBIDDEN,
-        "a path inside the root must pass the broker: {resp}"
+    // 503 is expected here. The broker's own boundary is: it forwards, not 403.
+    assert!(
+        matches!(status, StatusCode::ACCEPTED | StatusCode::SERVICE_UNAVAILABLE),
+        "a path inside the root must pass the broker: {status} {resp}"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_planted_symlink_under_the_root_cannot_redirect_a_path() -> Result<()> {
+    let f = fixture().await?;
+    let outside = f._dir.path().join("outside");
+    std::fs::create_dir(&outside)?;
+    std::os::unix::fs::symlink(&outside, f.root_a.join("out"))?;
+    std::os::unix::fs::symlink(f._dir.path().join("absent"), f.root_a.join("dangling"))?;
+    for dest in [f.root_a.join("out").join("x"), f.root_a.join("dangling")] {
+        let mut body = submit_body();
+        body["outputs"] = json!([{"dest": dest.to_string_lossy()}]);
+        let (status, resp) = f.call("POST", "/v1/jobs", Some(TOKEN_A), Some(body)).await?;
+        assert_eq!(
+            (status, &resp["code"]),
+            (StatusCode::FORBIDDEN, &json!("forbidden")),
+            "{dest:?}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_client_with_no_roots_may_name_no_host_path() -> Result<()> {
+    let f = fixture().await?;
+    let mut body = submit_body();
+    body["required_isolation_class"] = json!("untrusted");
+    body["inputs"] = json!([{"host": f.root_a.join("any").to_string_lossy(), "name": "n"}]);
+    let (status, resp) = f.call("POST", "/v1/jobs", Some(TOKEN_B), Some(body)).await?;
+    assert_eq!((status, &resp["code"]), (StatusCode::FORBIDDEN, &json!("forbidden")));
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_unknown_job_id_is_not_found_for_get_and_cancel() -> Result<()> {
+    let f = fixture().await?;
+    for (method, path) in [("GET", "/v1/jobs/nope"), ("POST", "/v1/jobs/nope/cancel")] {
+        let (status, body) = f.call(method, path, Some(TOKEN_A), None).await?;
+        assert_eq!((status, &body["code"]), (StatusCode::NOT_FOUND, &json!("not_found")));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_ambiguous_clients_list_is_refused_at_startup() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mk = |clients| BrokerConfig {
+        control_socket: Path::new("/nonexistent").to_path_buf(),
+        state_dir: dir.path().join("state"),
+        bind: "127.0.0.1:0".parse().expect("literal"),
+        clients,
+    };
+    let a = client("a", "same", IsolationClass::Trusted, vec![]);
+    let dup_hash = serve(mk(vec![
+        a.clone(),
+        client("b", "same", IsolationClass::Trusted, vec![]),
+    ]))
+    .await;
+    assert!(matches!(dup_hash, Err(BrokerError::InvalidClients(_))), "{dup_hash:?}");
+    let dup_id = serve(mk(vec![
+        a.clone(),
+        client("a", "other", IsolationClass::Trusted, vec![]),
+    ]))
+    .await;
+    assert!(matches!(dup_id, Err(BrokerError::InvalidClients(_))), "{dup_id:?}");
+    let upper = Client {
+        token_sha256: a.token_sha256.to_uppercase(),
+        ..a
+    };
+    let r = serve(mk(vec![upper])).await;
+    assert!(matches!(r, Err(BrokerError::InvalidClients(_))), "{r:?}");
     Ok(())
 }
 

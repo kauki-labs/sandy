@@ -60,9 +60,14 @@ impl Owners {
                 token: STANDARD.encode(token),
             },
         );
-        let bytes = serde_json::to_vec(&*table)?;
-        self.dir.write_secret(FILE, &bytes)?;
-        Ok(())
+        let saved = serde_json::to_vec(&*table)
+            .map_err(OwnersError::from)
+            .and_then(|bytes| self.dir.write_secret(FILE, &bytes).map(drop).map_err(OwnersError::from));
+        if saved.is_err() {
+            // Keep memory and disk equal: a later insert must not persist this entry.
+            table.remove(job_id);
+        }
+        saved
     }
 
     /// The attach token of `job_id`, only when `client` owns it.
@@ -76,5 +81,32 @@ impl Owners {
     pub(crate) fn owns(&self, job_id: &str, client: &str) -> bool {
         let table = self.table.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         table.get(job_id).is_some_and(|o| o.client == client)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[test]
+    fn ownership_and_the_token_survive_a_restart_and_the_file_is_private() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = dir.path().join("state");
+        Owners::open(&state)?.insert("job-1", "a", b"\x00\xffsecret")?;
+        let reopened = Owners::open(&state)?;
+        assert_eq!(
+            reopened.token_for("job-1", "a").as_deref(),
+            Some(&b"\x00\xffsecret"[..])
+        );
+        assert!(
+            reopened.token_for("job-1", "b").is_none(),
+            "another client must not get the token"
+        );
+        assert!(!reopened.owns("job-2", "a"));
+        let mode = std::fs::metadata(state.join(FILE))?.permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        Ok(())
     }
 }
