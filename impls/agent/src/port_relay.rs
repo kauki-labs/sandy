@@ -124,6 +124,8 @@ where
             return;
         }
     };
+    // Small interactive frames (a websocket) must not wait on Nagle.
+    let _ = service.set_nodelay(true);
     // Tell the host the service is there before any data moves: its dial counts as successful only on this byte.
     if let Err(e) = host.write_all(&[PORT_RELAY_READY]).await {
         eprintln!("sandy-agent: port-relay could not announce readiness: {e}");

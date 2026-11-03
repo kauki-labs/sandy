@@ -432,12 +432,20 @@ splices each connection from the host to `127.0.0.1:T`. It parses nothing, so a 
 connection (a websocket) works.
 
 - **Who may connect.** The relay admits only vsock peers that report the host CID (2), the same check as the agent
-  link, and closes any other peer without a dial (CID 0, the loopback CID 1 and a guest CID included). It is not an
-  auth boundary. On qemu (vhost-vsock) every host process, of any uid, reaches the guest as CID 2, so any host
-  process can open a raw connection to `<guest CID>:P`. On vfkit the host reaches the guest only through a unix
-  socket, so its file permissions gate access. The service must authenticate its own clients (t3's pairing token),
-  and the host half must not expose the port to anything but its own authenticated listener. A per-run secret
-  handshake in the relay is an open question for the owner.
+  link, and closes any other peer without a dial (CID 0, the loopback CID 1 and a guest CID included). That is a
+  reachability check, not an auth boundary. On qemu (vhost-vsock) every host process, of any uid, reaches the guest
+  as CID 2, so any host process can open a raw connection to `<guest CID>:1000`. On vfkit the host reaches the guest
+  only through a unix socket whose file permissions gate access, until a bridge puts a TCP port in front of it (see
+  the host bridge's exposure note). The service must authenticate its own clients (t3's pairing token).
+- **Port identity.** The relay listens on vsock port 1000 (`PORT_RELAY_VSOCK_PORT`), a privileged port on purpose:
+  the kernel lets only a process with `CAP_NET_BIND_SERVICE` bind a vsock port of 1023 or below, so a harness running
+  as the unprivileged service user cannot bind it before the relay and answer the bridge's dial with the ready byte.
+  A root process in the guest still can, so the ready byte proves reachability, not identity. The agent must start the
+  relay before any untrusted process, and a per-run shared secret that both halves prove (not just a ready byte) is the
+  fix for identity and for availability, and is an open question for the owner.
+- **Availability.** The cap bounds descriptors, not availability: any host process can dial the relay and hold its
+  256 connections open, which starves the bridge's own dials. Nothing in the relay can tell the bridge from another
+  host process, so only authentication closes this.
 - **Limits.** At most 256 connections are relayed at once, and a connection over the cap is closed unanswered. A
   dial to the target that takes more than 5 seconds closes that connection only. A target that is down closes that
   one connection, and the relay keeps accepting. The target must be an IPv4 loopback address with a real port, so

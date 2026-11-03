@@ -39,11 +39,15 @@ pub const AGENT_VSOCK_PORT: u32 = 5_000;
 pub const AGENT_LINK_READY: u8 = b'S';
 
 /// The vsock port `sandy-agent port-relay` listens on in a guest (#590): one service relay per environment. The host
-/// bridge reaches it as `<guest CID>:5100` over vhost-vsock on qemu, and through a
-/// `virtio-vsock,port=5100,socketURL=<path>,connect` device declared before boot on vfkit. A vsock port is per guest,
+/// bridge reaches it as `<guest CID>:1000` over vhost-vsock on qemu, and through a
+/// `virtio-vsock,port=1000,socketURL=<path>,connect` device declared before boot on vfkit. A vsock port is per guest,
 /// so one fixed number serves every environment. It differs from [`AGENT_VSOCK_PORT`] (5000) and the egress proxy's
 /// port (5001).
-pub const PORT_RELAY_VSOCK_PORT: u32 = 5_100;
+///
+/// It is a privileged port on purpose: the kernel lets only a process with `CAP_NET_BIND_SERVICE` bind a vsock port of
+/// 1023 or below, so a harness running as the unprivileged service user cannot bind it first and answer the bridge's
+/// dial with the ready byte. A root process in the guest still can: the ready byte proves reachability, not identity.
+pub const PORT_RELAY_VSOCK_PORT: u32 = 1_000;
 
 /// The byte `sandy-agent port-relay` writes to the host once it has connected to the guest service (#590).
 /// A hypervisor's vsock proxy (vfkit) accepts the host's socket before it dials the guest, and the relay accepts
