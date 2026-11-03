@@ -105,9 +105,21 @@
         in
         {
           microvm.mem = lib.mkForce 2048;
+          # The service account (#589): the agent runs as root and starts a service manifest's `service.user` through
+          # `runuser -u <user> --`. A system user with its own home, so t3's state and the harnesses' config dirs
+          # belong to it, and no login shell.
+          users.groups.t3 = { };
+          users.users.t3 = {
+            isSystemUser = true;
+            group = "t3";
+            home = "/var/lib/t3";
+            createHome = true;
+            shell = "${pkgs.shadow}/bin/nologin";
+          };
           environment.systemPackages = [
             t3
             (readyProbe pkgs)
+            pkgs.util-linux # runuser
           ];
         };
 
