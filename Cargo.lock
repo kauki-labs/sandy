@@ -2504,6 +2504,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandy-environment"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "command-group",
+ "rustix",
+ "sandy-api",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
 name = "sandy-executor-proto"
 version = "0.1.1"
 dependencies = [
