@@ -177,6 +177,7 @@ fn bytecount_newlines(buf: &[u8]) -> usize {
 mod egress_relay;
 mod link_source;
 mod peer;
+mod port_relay;
 mod service;
 mod tmux_pty;
 
@@ -192,6 +193,10 @@ fn main() -> ExitCode {
     // `sandy-agent egress-relay …` wraps the job in the guest-side egress relay (#402).
     if args.first().is_some_and(|first| first == "egress-relay") {
         return egress_relay::cli(&args[1..]);
+    }
+    // `sandy-agent port-relay …` relays host vsock connections to a guest loopback service (#590).
+    if args.first().is_some_and(|first| first == "port-relay") {
+        return port_relay::cli(&args[1..]);
     }
     let (source, job) = match link_source::parse_args(args) {
         Ok(parsed) => parsed,

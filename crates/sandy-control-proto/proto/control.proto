@@ -30,6 +30,15 @@ message ControlRequest {
     AttachRequest attach = 12;
     StatusRequest status = 13;
     ListRequest list = 14;
+    // Environment operations (#587, slice A2). Served by sandyd's environment
+    // handler, separate from the job operations above.
+    CreateEnvironmentRequest create_environment = 20;
+    GetEnvironmentRequest get_environment = 21;
+    ListEnvironmentsRequest list_environments = 22;
+    StopEnvironmentRequest stop_environment = 23;
+    ResumeEnvironmentRequest resume_environment = 24;
+    CancelEnvironmentRequest cancel_environment = 25;
+    DeleteEnvironmentRequest delete_environment = 26;
   }
 }
 
@@ -48,6 +57,11 @@ message ControlResponse {
     StatusResponse status = 13;
     ListResponse list = 14;
     ControlError error = 15;
+    EnvironmentResponse environment = 20;
+    ListEnvironmentsResponse environments = 21;
+    // A typed refusal of an environment operation. Kept apart from
+    // `ControlError` so the job operations' error shape is untouched.
+    EnvironmentError environment_error = 22;
   }
 }
 
@@ -225,4 +239,120 @@ message ListResponse {
 // …). Never silently folded into a success response with default fields.
 message ControlError {
   string message = 1;
+}
+
+// ---- Environments (#587, slice A2) ----------------------------------------
+
+// What an environment is, independent of who asked for it. The store keeps
+// the prost encoding of this message as the create payload, so two retries
+// with equal fields are byte-equal whatever order a client wrote them in.
+message EnvironmentSpec {
+  // A credential identity profile name (#592). Never a secret.
+  string profile = 1;
+  // A size class name; empty means the daemon's default.
+  string size = 2;
+  EnvironmentLifetime lifetime = 3;
+  // An opaque caller reference for the task this environment serves.
+  string task_ref = 4;
+}
+
+message EnvironmentLifetime {
+  EnvironmentLifetimeKind kind = 1;
+  // Seconds until the daemon deletes an ephemeral environment. Required (>= 1)
+  // for EPHEMERAL, forbidden for PERSISTENT.
+  uint64 ttl_secs = 2;
+}
+
+enum EnvironmentLifetimeKind {
+  ENVIRONMENT_LIFETIME_KIND_UNSPECIFIED = 0;
+  // Lives for one task: has a TTL and cannot be stopped or resumed.
+  ENVIRONMENT_LIFETIME_KIND_EPHEMERAL = 1;
+  ENVIRONMENT_LIFETIME_KIND_PERSISTENT = 2;
+}
+
+// An environment's lifecycle state.
+enum EnvironmentState {
+  ENVIRONMENT_STATE_UNSPECIFIED = 0;
+  ENVIRONMENT_STATE_PROVISIONING = 1;
+  ENVIRONMENT_STATE_READY = 2;
+  ENVIRONMENT_STATE_STOPPED = 3;
+  ENVIRONMENT_STATE_FAILED = 4;
+  ENVIRONMENT_STATE_DELETED = 5;
+}
+
+// Create an environment. Idempotent by `idempotency_key`: the same key and
+// spec return the same environment, another spec under the same key is
+// refused with REQUEST_ID_CONFLICT.
+message CreateEnvironmentRequest {
+  string idempotency_key = 1;
+  EnvironmentSpec spec = 2;
+}
+
+message GetEnvironmentRequest {
+  string environment_id = 1;
+}
+
+message ListEnvironmentsRequest {
+  // Unset (UNSPECIFIED) lists every state.
+  EnvironmentState state = 1;
+  // Empty lists every task_ref.
+  string task_ref = 2;
+}
+
+message StopEnvironmentRequest {
+  string environment_id = 1;
+}
+
+message ResumeEnvironmentRequest {
+  string environment_id = 1;
+}
+
+// Cancel provisioning: only valid while PROVISIONING; ends DELETED.
+message CancelEnvironmentRequest {
+  string environment_id = 1;
+}
+
+// Delete: valid from every state but DELETED, idempotent.
+message DeleteEnvironmentRequest {
+  string environment_id = 1;
+}
+
+message EnvironmentFailure {
+  string step = 1;
+  string reason = 2;
+}
+
+message EnvironmentConnection {
+  // Where a client reaches the environment's service. Present only when READY.
+  string url = 1;
+}
+
+message EnvironmentResponse {
+  string environment_id = 1;
+  EnvironmentState state = 2;
+  // Ordered provisioning step names with their status. Empty until the
+  // launch driver (slice C) reports steps.
+  repeated string steps = 3;
+  EnvironmentFailure failure = 4;
+  EnvironmentConnection connection = 5;
+  EnvironmentSpec spec = 6;
+}
+
+message ListEnvironmentsResponse {
+  repeated EnvironmentResponse environments = 1;
+}
+
+enum EnvironmentErrorCode {
+  ENVIRONMENT_ERROR_CODE_UNSPECIFIED = 0;
+  ENVIRONMENT_ERROR_CODE_NOT_FOUND = 1;
+  ENVIRONMENT_ERROR_CODE_REQUEST_ID_CONFLICT = 2;
+  ENVIRONMENT_ERROR_CODE_QUOTA_EXCEEDED = 3;
+  ENVIRONMENT_ERROR_CODE_UNSUPPORTED_FOR_LIFETIME = 4;
+  ENVIRONMENT_ERROR_CODE_INVALID_STATE = 5;
+  ENVIRONMENT_ERROR_CODE_INVALID_ARGUMENT = 6;
+}
+
+message EnvironmentError {
+  EnvironmentErrorCode code = 1;
+  string message = 2;
 }

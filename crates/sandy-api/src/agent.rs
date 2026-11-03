@@ -42,6 +42,23 @@ pub const SERVICE_ENV: &str = "SANDY_SERVICE";
 /// cap first, only after this byte arrives.
 pub const AGENT_LINK_READY: u8 = b'S';
 
+/// The vsock port `sandy-agent port-relay` listens on in a guest (#590): one service relay per environment. The host
+/// bridge reaches it as `<guest CID>:1000` over vhost-vsock on qemu, and through a
+/// `virtio-vsock,port=1000,socketURL=<path>,connect` device declared before boot on vfkit. A vsock port is per guest,
+/// so one fixed number serves every environment. It differs from [`AGENT_VSOCK_PORT`] (5000) and the egress proxy's
+/// port (5001).
+///
+/// It is a privileged port on purpose: the kernel lets only a process with `CAP_NET_BIND_SERVICE` bind a vsock port of
+/// 1023 or below, so a harness running as the unprivileged service user cannot bind it first and answer the bridge's
+/// dial with the ready byte. A root process in the guest still can: the ready byte proves reachability, not identity.
+pub const PORT_RELAY_VSOCK_PORT: u32 = 1_000;
+
+/// The byte `sandy-agent port-relay` writes to the host once it has connected to the guest service (#590).
+/// A hypervisor's vsock proxy (vfkit) accepts the host's socket before it dials the guest, and the relay accepts
+/// the host's vsock connection before it dials the service, so a connected socket proves neither. The host bridge
+/// counts a dial as successful only after this byte arrives, and retries otherwise.
+pub const PORT_RELAY_READY: u8 = b'P';
+
 /// How a backend launches the sandbox agent.
 ///
 /// An agent-mode backend runs ONE job: its `on_link` serves one cap on one
@@ -104,6 +121,26 @@ mod tests {
     use std::sync::mpsc::RecvError;
 
     use super::*;
+
+    /// A vsock port is per guest, so the service relay needs one number, but it must not collide with the other
+    /// ports the host and guest agree on (the agent link on 5000, the egress proxy on 5001). It must also be a
+    /// privileged port: the kernel lets only a process with `CAP_NET_BIND_SERVICE` bind a vsock port of 1023 or
+    /// below, so a harness running as the unprivileged service user cannot squat the relay's port and answer the
+    /// bridge's dial with the ready byte.
+    #[test]
+    fn the_service_relay_port_is_privileged_and_collides_with_no_other_guest_port() {
+        assert_eq!(PORT_RELAY_VSOCK_PORT, 1_000);
+        // A compile-time check: raising the port above 1023 would let any guest process bind it.
+        const {
+            assert!(
+                PORT_RELAY_VSOCK_PORT <= 1_023,
+                "a port above 1023 can be bound by any guest process"
+            );
+        }
+        for other in [AGENT_VSOCK_PORT, 5_001] {
+            assert_ne!(PORT_RELAY_VSOCK_PORT, other);
+        }
+    }
 
     #[test]
     fn a_report_reaches_the_backend_once() {

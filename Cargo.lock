@@ -995,6 +995,7 @@ dependencies = [
  "http",
  "http-body",
  "httparse",
+ "httpdate",
  "itoa",
  "pin-project-lite",
  "smallvec",
@@ -2388,6 +2389,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandy-broker"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.23.1",
+ "clap",
+ "fs2",
+ "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "reqwest",
+ "sandy-control-proto",
+ "sandy-fsutil",
+ "sandyd",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "sandy-cli"
 version = "0.2.2"
 dependencies = [
@@ -2699,6 +2726,7 @@ dependencies = [
 name = "sandy-test-support"
 version = "0.1.1"
 dependencies = [
+ "anyhow",
  "sandy-api",
 ]
 
@@ -2711,8 +2739,10 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "hex",
+ "prost",
  "rusqlite",
  "rustix",
+ "sandy-api",
  "sandy-conn",
  "sandy-control-proto",
  "sandy-executor-proto",
@@ -2721,6 +2751,7 @@ dependencies = [
  "sandy-fsutil",
  "sandy-orchestrator",
  "sandy-proto",
+ "sandy-test-support",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
