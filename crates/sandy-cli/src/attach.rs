@@ -467,33 +467,57 @@ where
 /// this PR): "terminal state observed" doesn't guarantee the transcript
 /// already arrived. Stops early on a clean close, a fault, or the channel
 /// closing (nothing more to drain either way); anything other than `Archive`
-/// is ignored and does not reset the budget. Never fails
-/// `run_interactive_inner` itself — worst case, the caller just doesn't get a
-/// transcript this time.
-async fn drain_for_archive(
+/// is ignored and does not reset the budget, except console output, which is
+/// still written to `stdout` so the job's last bytes are not lost. A missing
+/// transcript never fails `run_interactive_inner`: worst case, the caller just
+/// doesn't get one this time. Only a failed write of that console output does.
+///
+/// # Errors
+/// A failed write of console output to `stdout`.
+async fn drain_for_archive<O: AsyncWrite + Unpin>(
     frame_rx: &mut tokio::sync::mpsc::Receiver<FrameResult>,
     archive: &mut Option<ArchivePayload>,
-) {
+    format: OutputFormat,
+    stdout: &mut O,
+) -> std::io::Result<()> {
     let deadline = tokio::time::Instant::now() + ARCHIVE_DRAIN_BUDGET;
     while archive.is_none() {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return;
+            return Ok(());
         }
         let Ok(frame) = tokio::time::timeout(remaining, frame_rx.recv()).await else {
-            return; // drain budget exhausted
+            return Ok(()); // drain budget exhausted
         };
         match frame {
             Some(Ok(Some(LinkFrame::Archive { content_type, payload }))) => {
                 if let Ok(bytes) = hex::decode(&payload) {
                     *archive = Some(ArchivePayload { content_type, bytes });
                 }
-                return;
+                return Ok(());
+            }
+            Some(Ok(Some(LinkFrame::Deliver {
+                content_type, payload, ..
+            }))) if content_type == TTY_STDOUT || content_type == TTY_STDERR => {
+                if let Ok(bytes) = hex::decode(&payload) {
+                    write_console(stdout, format, &bytes).await?;
+                }
             }
             Some(Ok(Some(_))) => {} // ignore anything else during the drain window
-            Some(Ok(None)) | Some(Err(_)) | None => return, // clean close, fault, or channel closed
+            Some(Ok(None)) | Some(Err(_)) | None => return Ok(()), // clean close, fault, or channel closed
         }
     }
+    Ok(())
+}
+
+/// Writes one chunk of job console output and flushes: raw bytes for plain
+/// output, one `output` NDJSON line under `-o json`.
+async fn write_console<O: AsyncWrite + Unpin>(out: &mut O, format: OutputFormat, bytes: &[u8]) -> std::io::Result<()> {
+    match format {
+        OutputFormat::Plain => out.write_all(bytes).await?,
+        OutputFormat::Json => write_event(out, &AttachEvent::output(bytes)).await?,
+    }
+    out.flush().await
 }
 
 /// [`run_interactive`]'s bridge loop, taking its stdin and resize feeds as
@@ -593,14 +617,17 @@ where
                         print_status(&format!("sandy: job reached a terminal state ({status}); detaching"));
                         format!("job_terminal:{status}")
                     } else {
-                        "closed".to_owned()
+                        // The poll connection died; the data plane may still be open and the job running.
+                        "fault:status watch lost".to_owned()
                     };
                     // The status poll and the agent's own Archive send are
                     // two independent races (CodeRabbit finding on this PR)
                     // — "terminal state observed" doesn't guarantee the
                     // transcript already arrived on the data plane. Give it
                     // a short bounded window before giving up on it.
-                    drain_for_archive(&mut frame_rx, &mut archive).await;
+                    if let Err(e) = drain_for_archive(&mut frame_rx, &mut archive, format, &mut stdout).await {
+                        break Err(e);
+                    }
                     break Ok(reason);
                 }
                 // A manual detach ends the bridge immediately, with no
@@ -622,14 +649,7 @@ where
                 let Ok(bytes) = hex::decode(&payload) else {
                     break Err(std::io::Error::other("delivered frame payload was not valid hex"));
                 };
-                let written = match format {
-                    OutputFormat::Plain => stdout.write_all(&bytes).await,
-                    OutputFormat::Json => write_event(&mut stdout, &AttachEvent::output(&bytes)).await,
-                };
-                if let Err(e) = written {
-                    break Err(e);
-                }
-                if let Err(e) = stdout.flush().await {
+                if let Err(e) = write_console(&mut stdout, format, &bytes).await {
                     break Err(e);
                 }
             }
@@ -655,16 +675,21 @@ where
 
     stdin_task.abort();
     resize_task.abort();
-    if format == OutputFormat::Json {
-        // The stream always ends with an `exit` line, a fault included; a failed write here has nowhere to go.
+    let exit_written = if format == OutputFormat::Json {
+        // The stream always ends with an `exit` line, a fault included.
         let reason = match &result {
             Ok(reason) => reason.clone(),
             Err(e) => format!("fault:{e}"),
         };
-        let _ = write_event(&mut stdout, &AttachEvent::Exit { reason }).await;
-        let _ = stdout.flush().await;
-    }
-    result.map(|_| archive)
+        match write_event(&mut stdout, &AttachEvent::Exit { reason }).await {
+            Ok(()) => stdout.flush().await,
+            Err(e) => Err(e),
+        }
+    } else {
+        Ok(())
+    };
+    // An earlier bridge error wins; otherwise a lost `exit` line fails the run, not a clean exit.
+    result.and(exit_written).map(|()| archive)
 }
 
 /// Writes `event` as one compact NDJSON line (not flushed: the caller flushes).
@@ -875,6 +900,64 @@ mod tests {
             payload: hex::encode(bytes),
             channel: None,
         }
+    }
+
+    /// #513 review: console output that arrives while the bridge waits for the archive is written, not
+    /// dropped, and the archive still lands.
+    #[tokio::test]
+    async fn the_archive_drain_writes_console_output_it_reads() -> anyhow::Result<()> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        tx.send(Ok(Some(deliver(TTY_STDOUT, b"last words\n"))))
+            .await
+            .context("queue deliver")?;
+        tx.send(Ok(Some(LinkFrame::Archive {
+            content_type: "text/plain".to_owned(),
+            payload: hex::encode(b"log"),
+        })))
+        .await
+        .context("queue archive")?;
+        let mut archive = None;
+        let mut sink = Vec::new();
+
+        drain_for_archive(&mut rx, &mut archive, OutputFormat::Json, &mut sink)
+            .await
+            .context("drain")?;
+
+        assert_eq!(
+            String::from_utf8(sink).context("NDJSON is UTF-8")?,
+            format!("{}\n", serde_json::to_string(&AttachEvent::output(b"last words\n"))?)
+        );
+        assert_eq!(archive.map(|a| a.bytes), Some(b"log".to_vec()));
+        Ok(())
+    }
+
+    /// #513 review: an `exit` line that cannot be written fails the run instead of exiting clean.
+    #[tokio::test]
+    async fn a_lost_exit_line_fails_the_bridge() -> anyhow::Result<()> {
+        let (conn_read, _conn_read_peer) = tokio::io::duplex(1024);
+        let (conn_write, _conn_write_peer) = tokio::io::duplex(1024);
+        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::channel(8);
+        let (out_w, out_r) = tokio::io::duplex(1024);
+        drop(out_r); // stdout is closed: the `exit` write fails
+        stdin_tx.send(b"~.".to_vec()).await.context("feed ~.")?;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            run_interactive_inner(
+                conn_read,
+                conn_write,
+                None,
+                stdin_rx,
+                no_resize_feed(),
+                OutputFormat::Json,
+                out_w,
+            ),
+        )
+        .await
+        .context("the bridge did not end")?;
+
+        assert!(result.is_err(), "a lost exit line must not be a clean exit");
+        Ok(())
     }
 
     /// #513: `-o json` turns every delivered chunk into one tagged line and ends with an `exit` line. A chunk

@@ -1137,13 +1137,16 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
         // job being joinable; every later failure still ends it with `exit`.
         Some(control_response::Result::Attach(r)) => {
             let json = output == OutputFormat::Json;
-            if json {
-                emit_attach_line(&AttachEvent::Attached(AttachedChannel::from(&r)));
+            if json && !emit_attach_line(&AttachEvent::Attached(AttachedChannel::from(&r))) {
+                // The caller never got the cap, so joining the job would only strand it.
+                eprintln!("sandy: could not write the attached line to stdout");
+                return ProcessExit::InfraFault.code();
             }
             let fault = |message: String, code: ProcessExit| {
                 eprintln!("sandy: {message}");
                 if json {
-                    emit_attach_line(&AttachEvent::Exit {
+                    // The write already failed if stdout is broken; the message is on stderr.
+                    let _ = emit_attach_line(&AttachEvent::Exit {
                         reason: format!("fault:{message}"),
                     });
                 }
@@ -1534,11 +1537,10 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
     }
 }
 
-/// Writes one line of `daemon attach -o json`'s NDJSON stream (#513). A failed
-/// stdout write here has nowhere to go, so it is dropped: the bridge's own
-/// writes surface it.
-fn emit_attach_line(event: &AttachEvent) {
-    let _ = sandy_cli::output::emit_stream_to([event.clone()], OutputFormat::Json, &mut std::io::stdout().lock());
+/// Writes one line of `daemon attach -o json`'s NDJSON stream (#513); `false`
+/// when the write failed.
+fn emit_attach_line(event: &AttachEvent) -> bool {
+    sandy_cli::output::emit_stream_to([event.clone()], OutputFormat::Json, &mut std::io::stdout().lock()).is_ok()
 }
 
 /// Map an [`emit`] result to a process band: success (band 0) or
