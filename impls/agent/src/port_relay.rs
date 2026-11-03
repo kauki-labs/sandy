@@ -121,7 +121,7 @@ async fn relay_one<S>(mut host: S, target: SocketAddr, idle: Duration)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut service = match timeout(DIAL_TIMEOUT, TcpStream::connect(target)).await {
+    let service = match timeout(DIAL_TIMEOUT, TcpStream::connect(target)).await {
         Ok(Ok(service)) => service,
         Ok(Err(e)) => {
             eprintln!("sandy-agent: port-relay cannot reach {target}: {e}");
