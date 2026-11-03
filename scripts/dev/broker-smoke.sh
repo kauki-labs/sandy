@@ -37,12 +37,15 @@ cleanup() {
   for pid in "${pids[@]:-}"; do
     [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
   done
+  wait 2>/dev/null || true
   rm -rf "$work"
 }
 trap cleanup EXIT
 
 token=$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')
 umask 077
+# The token goes to curl through a header file, not argv, so `ps` never shows it.
+printf 'Authorization: Bearer %s\n' "$token" >"$work/auth"
 printf '[{"id":"smoke","token_sha256":"%s","max_isolation_class":"untrusted","profiles":["dev"]}]' \
   "$(sha256_hex "$token")" >"$work/clients.json"
 
@@ -58,14 +61,6 @@ done
   exit 1
 }
 
-"$broker_bin" --control-socket "$work/sandyd.sock" --state-dir "$work/broker" \
-  --clients-file "$work/clients.json" --bind "127.0.0.1:${port}" >"$work/broker.log" 2>&1 &
-pids+=($!)
-for _ in $(seq 1 50); do
-  curl -s -o /dev/null "$base/v1/jobs" && break
-  sleep 0.1
-done
-
 fail() {
   echo "broker-smoke: FAIL: $1" >&2
   echo "--- broker.log" >&2
@@ -73,35 +68,53 @@ fail() {
   exit 1
 }
 
+"$broker_bin" --control-socket "$work/sandyd.sock" --state-dir "$work/broker" \
+  --clients-file "$work/clients.json" --bind "127.0.0.1:${port}" >"$work/broker.log" 2>&1 &
+broker_pid=$!
+pids+=("$broker_pid")
+ready=0
+for _ in $(seq 1 50); do
+  kill -0 "$broker_pid" 2>/dev/null || fail "sandy-broker exited during startup"
+  if curl -s -o /dev/null --max-time 2 "$base/v1/jobs"; then
+    ready=1
+    break
+  fi
+  sleep 0.1
+done
+[ "$ready" = 1 ] || fail "sandy-broker did not answer on $base"
+# A process already on the port can answer the probe; a broker that lost the bind exits soon after.
+sleep 0.3
+kill -0 "$broker_pid" 2>/dev/null || fail "sandy-broker exited during startup"
+
 call() { # method path [json-body] -> prints "<status> <body>"
   local method=$1 path=$2 body=${3:-}
   if [ -n "$body" ]; then
-    curl -s -w ' %{http_code}' -X "$method" -H "Authorization: Bearer $token" \
+    curl -sS --max-time 10 -w ' %{http_code}' -X "$method" -H "@$work/auth" \
       -H 'Content-Type: application/json' -d "$body" "$base$path"
   else
-    curl -s -w ' %{http_code}' -X "$method" -H "Authorization: Bearer $token" "$base$path"
+    curl -sS --max-time 10 -w ' %{http_code}' -X "$method" -H "@$work/auth" "$base$path"
   fi
 }
 
 status_of() { echo "${1##* }"; }
 field() { echo "$1" | sed -n "s/.*\"$2\":\"\([^\"]*\)\".*/\1/p"; }
 
-anon=$(curl -s -o /dev/null -w '%{http_code}' "$base/v1/environments")
+anon=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' "$base/v1/environments") || fail "unauthenticated probe failed"
 [ "$anon" = 401 ] || fail "an unauthenticated call gave $anon, not 401"
 
 spec='{"request_id":"smoke-1","profile":"dev","lifetime":{"kind":"persistent"}}'
-first=$(call POST /v1/environments "$spec")
+first=$(call POST /v1/environments "$spec") || fail "spawn call failed"
 [ "$(status_of "$first")" = 202 ] || fail "spawn gave: $first"
 id=$(field "$first" environment_id)
 [ -n "$id" ] || fail "spawn returned no environment_id: $first"
 
-second=$(call POST /v1/environments "$spec")
-[ "$(field "$second" environment_id)" = "$id" ] || fail "a retried spawn gave a different environment: $second"
+second=$(call POST /v1/environments "$spec") || fail "retried spawn call failed"
+[ "$(status_of "$second")" = 202 ] && [ "$(field "$second" environment_id)" = "$id" ] || fail "a retried spawn gave a different environment: $second"
 
-got=$(call GET "/v1/environments/$id")
+got=$(call GET "/v1/environments/$id") || fail "get call failed"
 [ "$(field "$got" state)" = provisioning ] || fail "get did not show provisioning: $got"
 
-deleted=$(call DELETE "/v1/environments/$id")
+deleted=$(call DELETE "/v1/environments/$id") || fail "delete call failed"
 [ "$(field "$deleted" state)" = deleted ] || fail "delete did not end deleted: $deleted"
 
 echo "broker-smoke: OK (environment $id spawned, retried idempotently, read back, deleted)"

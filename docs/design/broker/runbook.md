@@ -23,11 +23,12 @@ broker and stores jobs and environments.
    ```bash
    token=$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')
    printf %s "$token" | shasum -a 256 | cut -d' ' -f1   # sha256sum on Linux
-   umask 077; mkdir -p ~/.config/sandy; printf %s "$token" > ~/.config/sandy/broker.token
+   (umask 077; mkdir -p ~/.config/sandy; printf %s "$token" > ~/.config/sandy/broker.token)
    ```
 
-3. Write the clients file. The broker refuses to start if group or others can read it
-   (use mode 0600).
+3. Write the clients file. The broker refuses to start if any group or other
+   permission bit is set (use mode 0600). Field names are not checked: a misspelt `profiles`
+   is ignored and every spawn gets `forbidden`.
 
    ```json
    [
@@ -65,8 +66,12 @@ broker and stores jobs and environments.
    The bind address must be loopback. There is no TLS yet. Run one broker per state
    directory.
 
-6. Point `sandy-mcp` at it: `sandy-mcp --api-url http://127.0.0.1:8787 --credential-file
-~/.config/sandy/broker.token`.
+6. Point `sandy-mcp` at it:
+
+   ```bash
+   sandy-mcp --api-url http://127.0.0.1:8787 --credential-file ~/.config/sandy/broker.token
+   ```
+
 7. Check the wiring without a client: `scripts/dev/broker-smoke.sh` starts its own sandyd
    and broker in a temp directory, spawns an environment, retries it, reads it back and
    deletes it.
@@ -86,10 +91,12 @@ broker and stores jobs and environments.
 | Response                                  | Cause                                                                                                                    |
 | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
 | 401 `unauthenticated`                     | No bearer token, or its hash is not in the clients file.                                                                 |
+| 400 `invalid_request`                     | The body is malformed or has unknown fields, `ttl_secs` does not fit the lifetime kind, or sandyd refused the fields.    |
 | 403 `forbidden`                           | The profile is not in `profiles`, a host path is outside `roots`, or the isolation class is above `max_isolation_class`. |
 | 404 `not_found`                           | The id does not exist, or belongs to another client. The two look the same.                                              |
 | 409 `request_id_conflict`                 | The same `request_id` was used with a different payload.                                                                 |
+| 409 `unsupported_for_lifetime`            | The action does not apply to this environment's lifetime or state.                                                       |
 | 429 `quota_exceeded`                      | At `max_environments` or `max_environment_records`.                                                                      |
-| 503 `unavailable`                         | sandyd is unreachable, refused, or took over 30 s. Check the sandyd socket path.                                         |
+| 503 `unavailable`                         | sandyd is unreachable, refused, took over 30 s, or 64 requests are already in flight. Check the socket path.             |
 | broker exits: "state directory is in use" | Another broker holds the state directory's `owners.lock`.                                                                |
-| broker exits: "invalid clients"           | A duplicate id or token hash, or a hash that is not 64 lowercase hex digits.                                             |
+| broker exits: "invalid clients"           | An empty or duplicate id, a duplicate token hash, or a hash that is not 64 lowercase hex digits.                         |
