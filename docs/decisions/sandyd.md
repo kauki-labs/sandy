@@ -2058,9 +2058,12 @@ are later slices.
   move is refused with the state the row holds. Each move is one `IMMEDIATE` transaction, so racing moves cannot
   both pass one guard.
 - `request_id` is unique and kept as long as the row exists, `Deleted` rows included. The same payload returns the
-  same environment, even after delete (never a new one). Another payload under the same id is a `Conflict`. No
-  clock is involved. The payload is opaque bytes plus an encoding name, compared byte for byte.
-- A row cap refuses a new environment but never the retry of a stored `request_id`.
+  same environment, even after delete (never a new one) while the row is kept; retention (decision 27) removes a
+  deleted row after a window, and a replay after that makes a new environment. Another payload under the same id is
+  a `Conflict`. `create` itself reads no clock. The payload is opaque bytes plus an encoding name, compared byte for
+  byte.
+- A row cap refuses a new environment but never the retry of a stored `request_id`. It counts rows that are not
+  `Deleted` (#633).
 
 **Deviations from #587's text.** `resume` goes back through `Provisioning`, not straight to `Ready`: a resumed
 environment is Ready only after its health probe passes again (#585 O2). `Archive` is not implemented: its
@@ -2113,11 +2116,34 @@ terminal envelope, so it would need a second record kind and a different reconci
 
 **Retries and limits.** A retried create is answered from the stored row before any validation, so a rule tightened
 by a later daemon cannot turn an accepted create's replay into a refusal; the same key with another spec is still a
-conflict. An unfiltered `ListEnvironments` leaves out `Deleted` rows (ask for state `DELETED` to see them) and refuses
-a reply of more than 1000 environments with `INVALID_ARGUMENT`, so a reply cannot outgrow the 1 MiB control frame.
+conflict. An unfiltered `ListEnvironments` leaves out `Deleted` rows (ask for state `DELETED` to see them).
 `cancel` of a deleted environment is an idempotent success, a retried cancel; of a failed, ready or stopped one it is
-`INVALID_STATE`. The row cap counts deleted rows, so with `SANDY_MAX_ENVIRONMENTS` set, create and delete churn
-fills it until rows are purged (retention is #614).
+`INVALID_STATE`.
+
+**Paging (#633).** `ListEnvironments` returns one page. The request carries `page_size` (0 means 100, above 500 is 500) and `page_token`; the reply carries `next_page_token`, empty on the last page. Rows are ordered by
+`environment_id` (unique and immutable, so a cursor survives the delete or gc of its own row), and the token is the
+id of the page's last row, which a client passes back unchanged. A malformed token is `INVALID_ARGUMENT`. A page also
+stops when its encoded rows reach 512 KiB, half the 1 MiB control frame, so a page always fits a frame whatever the
+row sizes. The old refusal of a reply of more than 1000 rows is gone. The three new fields are additive proto3
+fields, so an older client keeps working but sees only the first page; the broker follows pages (broker-api
+decision 6). The order changed from creation order to id order, and no caller relied on it.
+
+**Retention (#633; implements the owner decision on #587, "deleted rows included until gc").** A `Deleted` row is kept
+so a retry of its `idempotency_key` finds the same environment. It is not kept forever:
+
+- A `Deleted` row whose delete is older than `SANDY_ENV_RETENTION_SECS` (default 86400, one day, minimum 1) is
+  removed, and its key may be used again: a replay after that creates a new environment with a new id. A client that
+  retries a create longer than a day after its delete gets a new environment, not the deleted one.
+- At most `SANDY_MAX_DELETED_ENVIRONMENTS` (default 10000, minimum 1) `Deleted` rows are kept; the oldest delete
+  goes first, even inside the window, so one caller cannot grow the table without bound by churn.
+- Age is the row's `updated_at`, which a `Deleted` row writes once, at the delete. No new column.
+- The sweep runs once at startup and then every 60 seconds, in its own task that does not depend on
+  `SANDY_ENV_BACKEND`. The clock is injected, so tests do not sleep.
+- `SANDY_MAX_ENVIRONMENTS` counts only rows that are not `Deleted`, so create and delete churn can no longer fill
+  it. A `Failed` row still counts until it is deleted. That is a residual: a caller that makes failing creates
+  and never deletes them can still fill the cap, and the broker's per-client record cap bounds that.
+
+The window and the cap are one decision to ratify on #607 (default 1 day, 10000).
 
 **Consequence.** Until the launch driver (slice C) reports back, a created environment stays `Provisioning`, `steps`
 is empty and `connection` is never set; the handler tests move a row to `Ready` through the store directly. Quota per

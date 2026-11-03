@@ -103,7 +103,7 @@ stops the process on the driver's next tick (about a second).
 - `link` returns `unsupported` until T3 offers an external link interface.
 - No TLS or remote callers. mTLS client auth is an owner decision (#607).
 - A create whose reply times out and is never retried leaves an environment with no owner
-  (#621). sandyd keeps deleted rows forever (#633).
+  (#621). sandyd collects deleted rows after `SANDY_ENV_RETENTION_SECS` (default one day) (#633).
 
 ## When a call fails
 

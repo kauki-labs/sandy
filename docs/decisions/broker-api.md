@@ -134,10 +134,15 @@ user's files. Tracked in a follow-up issue.
 - A create whose owner save fails answers `unavailable`. The client's retry replays the create,
   gets the same environment, and records it, so no orphan outlives a retry.
 - A client may hold `max_environments` non-terminal environments (default 4) and may ever
-  create `max_environment_records` (default 64). sandyd keeps a deleted row for replay and
-  counts it against its own cap, so without the second limit one client could create and
-  delete until sandyd's table is full for everyone. The real fix is sandyd pruning deleted
-  rows and paging its list reply (#633).
+  create `max_environment_records` (default 64). sandyd keeps a deleted row for replay, so without
+  the second limit one client could create and delete many rows. sandyd now collects deleted rows
+  after a retention window and counts only rows that are not deleted against its cap (#633,
+  sandyd decision 27), so the record cap is a per-client bound, not the only defence.
+- List and the quota check read sandyd's list page by page (500 rows a page, following
+  `next_page_token`) and filter to the caller's rows. The broker reads at most 10000 rows for one
+  request; a daemon holding more answers `unavailable` and logs it, never a truncated list or
+  quota count. The broker's own list is not paged: a client sees only its own rows, which
+  `max_environment_records` bounds.
 - A create that sandyd answers with an environment another client already owns is refused
   (`TakenOver`), and two clients whose ids share a 16-digit hash prefix are refused at startup.
 - `failure.reason` is neither relayed nor logged by the broker: it is sandyd's text and may name
