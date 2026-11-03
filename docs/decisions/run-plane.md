@@ -96,7 +96,11 @@ to 4096 bytes in the agent and again in the relay.
   the host-executor decodes `flake/v1`, so refusing at Submit is a follow-up.
 - An older relay or forwarder rejects the new frames and loses the exit report (INV-11). Deploy sandyd and
   `sandy-host-executor` before a guest image whose agent sends them.
-- Not yet done: launching the service as `user` (non-root) and the restart policy. Until then the declared
-  `user` is validated and carried but not applied.
+- When the agent is root (in a guest) the service runs as `user` through `runuser`, after the account is
+  resolved in `/etc/passwd` to a uid other than 0 (another account such as `toor` can share uid 0). A refused
+  account fails the run before the job starts. When the agent is not root (the process backend on a host)
+  there is no privilege to drop, so the job runs as the agent's own user, never with more privilege than
+  declared. The guest image must define the account (#608 does not yet).
+- Not yet done: the restart policy. The agent reports the first exit; a crashed service is not restarted.
 
 **Set aside.** Scraping the console for a ready line: it is not a contract.

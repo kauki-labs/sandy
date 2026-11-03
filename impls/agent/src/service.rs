@@ -47,6 +47,56 @@ pub enum ProbeVerdict {
     },
 }
 
+/// The account database the agent resolves a service's `user` against.
+pub const PASSWD_PATH: &str = "/etc/passwd";
+
+/// The uid `user` has in `passwd` (the text of `/etc/passwd`), never 0.
+///
+/// The manifest names an account, and another account can share uid 0 (`toor`): the name is only checked
+/// for shape at decode, so the uid it resolves to is checked here, in the guest, where the account database is.
+///
+/// # Errors
+/// `user` is absent, its entry is malformed, or it resolves to uid 0.
+pub fn resolve_uid(passwd: &str, user: &str) -> Result<u32, String> {
+    let entry = passwd
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .find(|line| line.split(':').next() == Some(user))
+        .ok_or_else(|| format!("no such account {user:?} in {PASSWD_PATH}"))?;
+    let uid = entry
+        .split(':')
+        .nth(2)
+        .and_then(|field| field.parse::<u32>().ok())
+        .ok_or_else(|| format!("the {PASSWD_PATH} entry for {user:?} has no numeric uid"))?;
+    if uid == 0 {
+        return Err(format!("account {user:?} has uid 0: a service must not run as root"));
+    }
+    Ok(uid)
+}
+
+/// `job` run as `user`: `runuser -u <user> -- <job>`. The agent stays root; only the service drops privilege.
+#[must_use]
+pub fn as_user(user: &str, job: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    let mut argv: Vec<std::ffi::OsString> = vec!["runuser".into(), "-u".into(), user.into(), "--".into()];
+    argv.extend(job);
+    argv
+}
+
+/// The argv the service runs as. When the agent is root (in a guest), the account must resolve to a non-zero
+/// uid and the job runs through `runuser`. When the agent is not root (the process backend on a host) there is
+/// no privilege to drop, so the job runs as the agent's own user: never with more privilege than declared.
+///
+/// # Errors
+/// The agent is root and [`resolve_uid`] refuses the account, or the account database cannot be read.
+pub fn service_argv(user: &str, job: Vec<std::ffi::OsString>) -> Result<Vec<std::ffi::OsString>, String> {
+    if !rustix::process::geteuid().is_root() {
+        return Ok(job);
+    }
+    let passwd = std::fs::read_to_string(PASSWD_PATH).map_err(|e| format!("reading {PASSWD_PATH}: {e}"))?;
+    resolve_uid(&passwd, user)?;
+    Ok(as_user(user, job))
+}
+
 /// The running readiness probe: reports one verdict over the agent link, or is ended by [`Self::finish`].
 pub struct Readiness {
     cancel: tokio::sync::oneshot::Sender<()>,
@@ -277,6 +327,39 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1_200)).await;
         assert!(!marker.exists(), "the probe's background child outlived the timeout");
         Ok(())
+    }
+
+    const PASSWD: &str = "root:x:0:0:root:/root:/bin/sh\n# a comment\ntoor:x:0:0:also \
+                          root:/root:/bin/sh\ndev:x:1000:100:dev:/home/dev:/bin/sh\nbroken:x:abc:100::/:/bin/sh\\
+                          nshort:x\n";
+
+    /// A named account resolves to its uid.
+    #[test]
+    fn a_named_account_resolves_to_its_uid() {
+        assert_eq!(resolve_uid(PASSWD, "dev"), Ok(1000));
+    }
+
+    /// Adversarial (#589): the uid, not the name, decides. `toor` shares uid 0 with root and is refused, as is
+    /// root itself, an unknown account and a malformed entry. A name that is only a prefix of another is not a hit.
+    #[test]
+    fn an_account_that_is_root_or_unknown_or_malformed_is_refused() {
+        for user in ["toor", "root", "nobody", "broken", "short", "de", ""] {
+            let err = resolve_uid(PASSWD, user).expect_err(user);
+            assert!(!err.is_empty(), "{user}");
+        }
+        assert!(resolve_uid(PASSWD, "toor").expect_err("toor").contains("uid 0"));
+        assert!(resolve_uid(PASSWD, "nobody").expect_err("nobody").contains("no such"));
+    }
+
+    /// The service argv is `runuser -u <user> -- <job...>`, the job's own arguments untouched.
+    #[test]
+    fn the_job_is_wrapped_to_run_as_the_service_user() {
+        let job = vec!["t3".into(), "serve".into(), "--port".into(), "3773".into()];
+        let wrapped: Vec<String> = as_user("dev", job)
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(wrapped, ["runuser", "-u", "dev", "--", "t3", "serve", "--port", "3773"]);
     }
 
     #[test]
