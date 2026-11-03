@@ -34,9 +34,16 @@ pub struct Client {
     pub token_sha256: String,
     /// The highest isolation class the client may request.
     pub max_isolation_class: IsolationClass,
+    /// Most non-terminal environments the client may hold at once.
+    #[serde(default = "default_max_environments")]
+    pub max_environments: usize,
     /// Directories the client may name in inputs, outputs and secrets.
     #[serde(default)]
     pub roots: Vec<PathBuf>,
+}
+
+const fn default_max_environments() -> usize {
+    4
 }
 
 /// Broker settings.
