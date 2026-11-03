@@ -376,7 +376,8 @@ const SCAN_CHUNK: usize = 200;
 /// One page of `ListEnvironments`, in `environment_id` order. A page ends at the
 /// page size or when the next row would push its encoded rows past `budget`
 /// bytes (so a page always fits a control frame), and `next_page_token` is the
-/// id of its last row, or empty when no later row matches.
+/// id of the last row scanned (it advances past rows a `task_ref` filter skipped),
+/// or empty when no later row matches.
 async fn list(store: &Arc<EnvironmentStore>, request: ListEnvironmentsRequest, budget: usize) -> Reply {
     let ListEnvironmentsRequest {
         state,
@@ -1308,6 +1309,63 @@ mod tests {
             "after gc: a new environment"
         );
         assert_eq!(WireState::try_from(fresh.state)?, WireState::Provisioning);
+        Ok(())
+    }
+
+    /// 450 rows, of which only the ones at `300..305` carry the `task_ref` `needle`, so the
+    /// first match lies beyond the first `SCAN_CHUNK` rows. Returns the matching ids.
+    fn fill_with_needles(s: &EnvironmentStore) -> Result<Vec<String>> {
+        let mut needles = Vec::new();
+        for i in 0..450 {
+            let mut spec = ephemeral();
+            if (300..305).contains(&i) {
+                spec.task_ref = "needle".to_owned();
+            }
+            let id = format!("env-{i:05}");
+            match s.create(&format!("k{i}"), &id, &spec.encode_to_vec(), SPEC_ENCODING)? {
+                CreateOutcome::Created(_) => {}
+                other => bail!("row {i}: {other:?}"),
+            }
+            if spec.task_ref == "needle" {
+                needles.push(id);
+            }
+        }
+        Ok(needles)
+    }
+
+    fn needle_op(page_size: u32, page_token: &str) -> control_request::Op {
+        control_request::Op::ListEnvironments(ListEnvironmentsRequest {
+            task_ref: "needle".to_owned(),
+            page_size,
+            page_token: page_token.to_owned(),
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn a_task_ref_filter_pages_over_matches_found_beyond_the_first_scan_chunk() -> Result<()> {
+        let s = store()?;
+        let needles = fill_with_needles(&s)?;
+        let (first, _, token) = page(&s, needle_op(3, "")).await?;
+        assert_eq!(
+            first,
+            needles[..3],
+            "the first match is row 300, past the first 200 scanned"
+        );
+        assert_eq!(
+            token, needles[2],
+            "the token is the last row scanned, here the third match"
+        );
+        let (rest, _, last) = page(&s, needle_op(3, &token)).await?;
+        assert_eq!((rest, last.as_str()), (needles[3..].to_vec(), ""));
+        // A page that fills exactly with the last match has nothing after it, so no token.
+        let (all, _, none) = page(&s, needle_op(5, "")).await?;
+        assert_eq!((all, none.as_str()), (needles.clone(), ""));
+        // A full page with matches still to come carries a token that skips the filtered rows.
+        let (two, _, token) = page(&s, needle_op(2, "")).await?;
+        assert_eq!(two, needles[..2]);
+        let (next, ..) = page(&s, needle_op(2, &token)).await?;
+        assert_eq!(next, needles[2..4]);
         Ok(())
     }
 

@@ -233,7 +233,20 @@ pub(crate) async fn spawn(state: &State, client: &Client, req: Request<Incoming>
     // One create at a time per client, so the quota check and the create cannot race
     // another create of the same client, and one client cannot hold up another.
     let _serial = state.env_create.get(&client.id).ok_or(UNAVAILABLE)?.lock().await;
-    if !state.owners.has_request(&client.id, &body.request_id) {
+    // A replay of a request id skips the quota checks only while sandyd still holds that
+    // environment. After sandyd's retention gc (#633) the same key would create a new one.
+    let replay = match state.owners.environment_for(&client.id, &body.request_id) {
+        None => false,
+        Some(environment_id) => {
+            let op = control_request::Op::GetEnvironment(GetEnvironmentRequest { environment_id });
+            match one(state, op).await {
+                Ok(_) => true,
+                Err(e) if e.status == StatusCode::NOT_FOUND => false,
+                Err(e) => return Err(e),
+            }
+        }
+    };
+    if !replay {
         let live = live_owned(state, client).await?;
         if live >= client.max_environments {
             return Err(QUOTA);

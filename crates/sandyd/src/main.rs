@@ -169,14 +169,6 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    // Independent of the launch driver: a deleted row is collected even with no backend configured.
-    let _environment_retention = tokio::spawn(sandyd::environment::run_retention(
-        Arc::clone(&environments),
-        retention,
-        sandyd::environment::RETENTION_INTERVAL,
-        sandyd::environment_store::now_unix,
-    ));
-
     let (listener, _lock) = match bind_unix_listener(&socket_path) {
         Ok(bound) => bound,
         Err(e) => {
@@ -374,6 +366,16 @@ async fn main() {
     // The launch driver runs only when a backend is configured (#587). It starts after every lock and
     // bind above: the backend sweeps stale environment directories, which a second daemon that lost
     // a lock must never do.
+    // Started only after every lock and bind above, so a second daemon on the same store, which
+    // fails to bind, never sweeps with its own settings. Independent of the launch driver: a
+    // deleted row is collected even with no backend configured.
+    let _environment_retention = tokio::spawn(sandyd::environment::run_retention(
+        Arc::clone(&environments),
+        retention,
+        sandyd::environment::RETENTION_INTERVAL,
+        sandyd::environment_store::now_unix,
+    ));
+
     let _environment_driver = start_environment_driver(&environments);
 
     let mut connections = tokio::task::JoinSet::new();

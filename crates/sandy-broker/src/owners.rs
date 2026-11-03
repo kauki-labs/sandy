@@ -177,9 +177,10 @@ impl Owners {
             .is_some_and(|c| c == client)
     }
 
-    /// Whether `client` already created an environment for `request_id`.
-    pub(crate) fn has_request(&self, client: &str, request_id: &str) -> bool {
-        self.lock().keys.contains_key(&key_of(client, request_id))
+    /// The environment `client` created for `request_id`, if any. sandyd may have
+    /// collected it since, so a caller that skips a check on it must ask sandyd.
+    pub(crate) fn environment_for(&self, client: &str, request_id: &str) -> Option<String> {
+        self.lock().keys.get(&key_of(client, request_id)).cloned()
     }
 }
 
@@ -250,8 +251,11 @@ mod tests {
         let reopened = Owners::open(dir.path())?;
         assert!(reopened.owns_environment("env-1", "a"));
         assert!(!reopened.owns_environment("env-1", "b"));
-        assert!(reopened.has_request("a", "req"));
-        assert!(!reopened.has_request("b", "req"), "request ids are per client");
+        assert!(reopened.environment_for("a", "req").is_some());
+        assert!(
+            reopened.environment_for("b", "req").is_none(),
+            "request ids are per client"
+        );
         Ok(())
     }
 }
