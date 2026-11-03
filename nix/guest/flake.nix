@@ -5,12 +5,18 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     microvm.url = "github:microvm-nix/microvm.nix";
     microvm.inputs.nixpkgs.follows = "nixpkgs";
+    # The t3 server and its harnesses (#608) come from their own pin so the base guest (kernel, agent) does not
+    # move with it. This is the root flake's nixpkgs revision as of 2026-11-03, where t3code is 0.1.2, the version
+    # the owner exercised. It does not follow later root bumps (#631). Older pins carry 0.0.44, which lacks
+    # `t3 pair --scope`.
+    nixpkgs-t3.url = "github:NixOS/nixpkgs/31ecbaca1bdefa45dffc409f0250bd8039ea0010";
   };
 
   outputs =
     {
       self,
       nixpkgs,
+      nixpkgs-t3,
       microvm,
     }:
     let
@@ -53,6 +59,71 @@
           environment.systemPackages = [
             pkgs.nftables
             pkgs.glibc.bin
+          ];
+        };
+
+      # The T3 server and the harness binaries it launches (#608). `t3 serve` is started by the service workload
+      # kind (#589), never by the image; provider config dirs (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`) come from the
+      # identity profile (#592), so the image holds no key, token or config. t3's wrapper puts `claude` and `codex`
+      # on its own PATH. `sandy-t3-ready` is the probe: it succeeds once an HTTP server answers on the loopback port
+      # with a status below 500 (t3 replies 503 while it starts, and 401 once auth is on), so readiness never rests
+      # on console text. It proves an HTTP listener, not that t3's API or websocket is up. The guest gets 2 GiB: the
+      # topology's memory is what a caller that omits `--mem` boots with, and electron-built t3, node and two
+      # harnesses do not fit in the base guest's 512 MiB.
+      #
+      # The image bakes no `HOME` or config dir, but the credential module exports every staged secret into the
+      # login shell, so `t3 serve` and the harnesses it launches inherit them (#589 and #592 own that threat model).
+      #
+      # The closure is about 3.7 GB because nixpkgs builds t3code with electron (1.4 GB) and the codex binary is
+      # 1 GB. The image is built once and shared read-only. A server-only build is a follow-up (#628).
+      readyProbe =
+        pkgs:
+        pkgs.writeShellScriptBin "sandy-t3-ready" ''
+          port=''${1:-3773}
+          case "$port" in
+            "" | *[!0-9]* | ??????*)
+              echo "sandy-t3-ready: the port must be 1 to 5 digits, got: $port" >&2
+              exit 2
+              ;;
+          esac
+          if [ "$port" -gt 65535 ]; then
+            echo "sandy-t3-ready: the port must be at most 65535, got: $port" >&2
+            exit 2
+          fi
+          code=$(${pkgs.curl}/bin/curl --silent --noproxy '*' --max-time 2 --output /dev/null \
+            --write-out '%{http_code}' "http://127.0.0.1:$port/") || exit 1
+          [ "$code" -ge 100 ] && [ "$code" -lt 500 ]
+        '';
+
+      t3Module =
+        { lib, pkgs, ... }:
+        let
+          t3pkgs = import nixpkgs-t3 {
+            inherit (pkgs.stdenv.hostPlatform) system;
+            config.allowUnfreePredicate = pkg: builtins.elem (nixpkgs-t3.lib.getName pkg) [ "claude-code" ];
+          };
+          t3 = t3pkgs.t3code.override {
+            enableClaude = true;
+            enableCodex = true;
+          };
+        in
+        {
+          microvm.mem = lib.mkForce 2048;
+          # The service account (#589): the agent runs as root and starts a service manifest's `service.user` through
+          # `runuser -u <user> --`. A system user with its own home, so t3's state and the harnesses' config dirs
+          # belong to it, and no login shell.
+          users.groups.t3 = { };
+          users.users.t3 = {
+            isSystemUser = true;
+            group = "t3";
+            home = "/var/lib/t3";
+            createHome = true;
+            shell = "${pkgs.shadow}/bin/nologin";
+          };
+          environment.systemPackages = [
+            t3
+            (readyProbe pkgs)
+            pkgs.util-linux # runuser
           ];
         };
 
@@ -111,6 +182,28 @@
         ];
       };
 
+      # The same guests with the T3 server and harnesses (#608).
+      qemuT3Guest = mkGuest {
+        system = "x86_64-linux";
+        hypervisor = "qemu";
+        extraModules = [
+          networkingModule
+          credentialModule
+          t3Module
+        ];
+      };
+
+      vfkitT3Guest = mkGuest {
+        system = "aarch64-linux";
+        hypervisor = "vfkit";
+        vmHostPackages = nixpkgs.legacyPackages.aarch64-darwin;
+        extraModules = [
+          networkingModule
+          credentialModule
+          t3Module
+        ];
+      };
+
       # vfkit guest for an Apple-silicon host (aarch64-darwin host, aarch64-linux guest — vfkit
       # requires matching arch), console hvc0. The kernel/initrd/erofs build on
       # the aarch64-linux linux-builder; the runner assembles on darwin.
@@ -130,11 +223,17 @@
       # protocol before sandy's backend drives it.
       packages.x86_64-linux.guest-runner = qemuGuest.config.microvm.declaredRunner;
       packages.aarch64-darwin.guest-runner-vfkit = vfkitGuest.config.microvm.declaredRunner;
+      # The T3 guest's runners (#608). `sandy run` evaluates a topology but does not build its artifacts, so a
+      # caller builds these first, as the live tests do for the base guest.
+      packages.x86_64-linux.guest-runner-t3 = qemuT3Guest.config.microvm.declaredRunner;
+      packages.aarch64-darwin.guest-runner-vfkit-t3 = vfkitT3Guest.config.microvm.declaredRunner;
 
       # The built guest configs (the topology attrs read kernel/initrd/store off
       # these).
       nixosConfigurations.sandy-guest-qemu = qemuGuest;
       nixosConfigurations.sandy-guest-vfkit = vfkitGuest;
+      nixosConfigurations.sandy-guest-qemu-t3 = qemuT3Guest;
+      nixosConfigurations.sandy-guest-vfkit-t3 = vfkitT3Guest;
 
       # The guest-side sandy-agent, per guest system (#238) — the same
       # `pkgs.sandy-agent` the guest config itself carries (via the overlay
@@ -142,10 +241,96 @@
       packages.x86_64-linux.sandy-agent = qemuGuest.pkgs.sandy-agent;
       packages.aarch64-linux.sandy-agent = vfkitGuest.pkgs.sandy-agent;
 
+      # Eval-only acceptance for the T3 guest image (#608): the image carries the t3 server at the version the
+      # owner exercised, and a readiness probe. Nothing here builds the 3.7 GB closure.
+      checks.x86_64-linux.t3-guest-packages =
+        let
+          pkgs = nixpkgs.legacyPackages.x86_64-linux;
+          config = self.nixosConfigurations.sandy-guest-qemu-t3.config;
+          names = map (p: p.name) config.environment.systemPackages;
+          wanted = [
+            "t3code-0.1.2"
+            "sandy-t3-ready"
+          ];
+          missing = builtins.filter (w: !(builtins.elem w names)) wanted;
+        in
+        assert missing == [ ] || throw "the t3 guest image lacks: ${builtins.toString missing}";
+        # A caller that omits `--mem` gets the topology's value, so the image must carry enough for electron-built
+        # t3, node and two harnesses.
+        assert
+          config.microvm.mem >= 2048 || throw "the t3 guest boots with ${toString config.microvm.mem} MiB";
+        # The agent runs as root and starts a service manifest's `service.user` through `runuser -u <user>` (#589),
+        # so the guest must define that account: a non-root user with a home directory that it owns.
+        assert
+          (
+            config.users.users ? t3
+            && config.users.users.t3.isSystemUser
+            && config.users.users.t3.group == "t3"
+            && config.users.users.t3.home == "/var/lib/t3"
+            && config.users.users.t3.createHome
+            && pkgs.lib.hasSuffix "/nologin" (toString config.users.users.t3.shell)
+          )
+          || throw "the t3 guest defines no t3 system user with a home directory, its own group and no login shell";
+        pkgs.runCommand "t3-guest-packages" { } "touch $out";
+
+      # The readiness probe's behaviour against a throwaway local HTTP server (#608): any status below 500 means the
+      # server answers (t3 answers 503 while it starts, and 401 once auth is on), 5xx and a closed port do not, and a
+      # port argument that is not digits is refused.
+      checks.x86_64-linux.t3-ready-probe =
+        let
+          pkgs = nixpkgs.legacyPackages.x86_64-linux;
+        in
+        pkgs.runCommand "t3-ready-probe"
+          {
+            nativeBuildInputs = [
+              pkgs.python3
+              (readyProbe pkgs)
+            ];
+          }
+          ''
+            cat > server.py <<'PY'
+            import http.server, sys
+            code, port = int(sys.argv[1]), int(sys.argv[2])
+            class H(http.server.BaseHTTPRequestHandler):
+                def do_GET(self):
+                    self.send_response(code)
+                    self.end_headers()
+                def log_message(self, *args):
+                    pass
+            http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()
+            PY
+            refuses() { # refuses <label> <probe args...>: a bad argument is a usage error (2), not a failed probe (1)
+              label=$1; shift
+              rc=0; sandy-t3-ready "$@" 2>/dev/null || rc=$?
+              [ "$rc" = 2 ] || { echo "$label: wanted exit 2, got $rc" >&2; exit 1; }
+            }
+            expect() { # expect <want: ok|fail> <label> <probe args...>
+              want=$1; label=$2; shift 2
+              if sandy-t3-ready "$@" 2>/dev/null; then got=ok; else got=fail; fi
+              [ "$got" = "$want" ] || { echo "$label: wanted $want, got $got" >&2; exit 1; }
+            }
+            n=0
+            for case in 200:ok 302:ok 401:ok 503:fail 500:fail; do
+              code=''${case%%:*}; want=''${case##*:}; port=$((18700 + n)); n=$((n + 1))
+              python3 server.py "$code" "$port" & pid=$!
+              for _ in $(seq 50); do (echo > /dev/tcp/127.0.0.1/$port) 2>/dev/null && break; sleep 0.1; done
+              expect "$want" "status $code" "$port"
+              kill "$pid"; wait "$pid" 2>/dev/null || true
+            done
+            expect fail "nothing listening" 18799
+            refuses "port with userinfo" "18700@otherhost"
+            refuses "port with a command" "18700; true"
+            refuses "port above 65535" 65536
+            refuses "huge port" 99999999999999999999
+            touch $out
+          '';
+
       # sandy's `Topology` per guest: `nix eval --json <flake>#topologies.<sys>.<hv>`.
       topologies = {
         x86_64-linux.qemu = mkTopology qemuGuest;
         aarch64-linux.vfkit = mkTopology vfkitGuest;
+        x86_64-linux.qemu-t3 = mkTopology qemuT3Guest;
+        aarch64-linux.vfkit-t3 = mkTopology vfkitT3Guest;
       };
     };
 }
