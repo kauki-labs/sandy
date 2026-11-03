@@ -172,6 +172,18 @@ fn validate_clients(clients: &[Client]) -> Result<(), BrokerError> {
 /// when the address cannot be bound, [`BrokerError::Owners`] when the state
 /// directory is unsafe or its table is unreadable.
 pub async fn serve(config: BrokerConfig) -> Result<Running, BrokerError> {
+    serve_with_ticket_ttl(config, std::time::Duration::from_secs(30)).await
+}
+
+/// [`serve`] with a chosen stream-ticket lifetime. Tests use a short one.
+///
+/// # Errors
+/// As [`serve`].
+#[doc(hidden)]
+pub async fn serve_with_ticket_ttl(
+    config: BrokerConfig,
+    _ticket_ttl: std::time::Duration,
+) -> Result<Running, BrokerError> {
     if !config.bind.ip().is_loopback() {
         return Err(BrokerError::NonLoopback { addr: config.bind });
     }

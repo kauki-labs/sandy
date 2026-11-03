@@ -112,6 +112,45 @@ async fn no_response_carries_the_attach_token() -> Result<()> {
             "{what} leaked the attach token"
         );
     }
+
+    // The attach bridge: its response, the stream URL, the stream's headers and content carry
+    // neither the token nor the cap the broker presented on sandyd's attach socket.
+    let agent = f.agent(&id)?;
+    agent.stdout(b"hello").await?;
+    let attach = f
+        .http
+        .post(format!("{}/v1/jobs/{id}/attach", f.base))
+        .bearer_auth(TOKEN_A)
+        .send()
+        .await?;
+    let mut seen = format!("{:?}", attach.headers());
+    let attach_body: Value = attach.json().await?;
+    seen.push_str(&attach_body.to_string());
+    let stream_url = attach_body["stream_url"].as_str().context("stream_url")?.to_owned();
+    let resp = f.open_stream(&stream_url, Some(TOKEN_A)).await?;
+    seen.push_str(&format!("{:?}", resp.headers()));
+    let mut lines = common::Lines::new(resp);
+    lines.output_bytes(5).await?;
+    f.finish(&id, sandy_control_proto::JobStatus::Succeeded)?;
+    seen.push_str(&lines.last().await?.to_string());
+    let caps = f.caps.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.clone();
+    assert!(
+        !caps.is_empty(),
+        "the broker never presented a cap, so there is no needle"
+    );
+    let mut needles = needles.to_vec();
+    for cap_hex in caps {
+        let raw = hex::decode(&cap_hex)?;
+        needles.extend([
+            cap_hex,
+            base64::engine::general_purpose::STANDARD.encode(&raw),
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&raw),
+        ]);
+    }
+    assert!(
+        needles.iter().all(|n| !seen.contains(n.as_str())),
+        "the attach bridge leaked the token or the cap"
+    );
     Ok(())
 }
 
@@ -228,20 +267,6 @@ async fn an_ambiguous_clients_list_is_refused_at_startup() -> Result<()> {
     };
     let r = serve(mk(vec![upper])).await;
     assert!(matches!(r, Err(BrokerError::InvalidClients(_))), "{r:?}");
-    Ok(())
-}
-
-#[tokio::test]
-async fn attach_is_typed_unsupported() -> Result<()> {
-    let f = fixture().await?;
-    let id = f.submit(TOKEN_A).await?;
-    let (status, body) = f
-        .call("POST", &format!("/v1/jobs/{id}/attach"), Some(TOKEN_A), Some(json!({})))
-        .await?;
-    assert_eq!(
-        (status, &body["code"]),
-        (StatusCode::NOT_IMPLEMENTED, &json!("unsupported"))
-    );
     Ok(())
 }
 
