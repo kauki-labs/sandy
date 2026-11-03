@@ -92,7 +92,7 @@ SANDY_SOCK=/path/sandyd.sock SANDY_DB=/path/sandyd.db sandyd
 ```
 
 A spawn then moves `provisioning` to `ready`, and `GET /v1/environments/{id}` shows `connection.url`. Delete
-stops the process within a second or two.
+stops the process on the driver's next tick (about a second).
 `BROKER_SMOKE_READY=1 scripts/dev/broker-smoke.sh` runs this with a stand-in HTTP service
 (it needs `python3`).
 

@@ -19,6 +19,10 @@ sandyd_bin=${SANDYD_BIN:-target/debug/sandyd}
 broker_bin=${BROKER_BIN:-target/debug/sandy-broker}
 port=${BROKER_PORT:-18787}
 ready_mode=${BROKER_SMOKE_READY:-0}
+if [ "$ready_mode" = 1 ] && ! command -v python3 >/dev/null 2>&1; then
+  echo "broker-smoke: BROKER_SMOKE_READY=1 needs python3 for the stand-in service" >&2
+  exit 2
+fi
 base="http://127.0.0.1:${port}"
 
 for bin in "$sandyd_bin" "$broker_bin"; do
@@ -79,6 +83,13 @@ fail() {
   echo "broker-smoke: FAIL: $1" >&2
   echo "--- broker.log" >&2
   cat "$work/broker.log" >&2
+  echo "--- sandyd.log" >&2
+  cat "$work/sandyd.log" >&2
+  for log in "$work"/environments/*/service.log; do
+    [ -f "$log" ] || continue
+    echo "--- $log" >&2
+    cat "$log" >&2
+  done
   exit 1
 }
 
@@ -128,7 +139,11 @@ second=$(call POST /v1/environments "$spec") || fail "retried spawn call failed"
 got=$(call GET "/v1/environments/$id") || fail "get call failed"
 if [ "$ready_mode" = 1 ]; then
   for _ in $(seq 1 90); do
-    [ "$(field "$got" state)" = ready ] && break
+    case "$(field "$got" state)" in
+    ready) break ;;
+    failed | stopped | deleted) fail "the environment ended in state $(field "$got" state) before ready: $got" ;;
+    esac
+    [ "$(status_of "$got")" = 200 ] || fail "get gave: $got"
     sleep 1
     got=$(call GET "/v1/environments/$id") || fail "get call failed"
   done
