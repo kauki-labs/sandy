@@ -36,6 +36,10 @@ impl Dialer for UnixDialer {
     }
 }
 
+/// The lowest CID a guest can have: 0 is the hypervisor, 1 the local loopback and 2 the host.
+#[cfg(target_os = "linux")]
+const FIRST_GUEST_CID: u32 = 3;
+
 /// Dials `<guest CID>:<port>` over vhost-vsock. qemu's host reaches a guest this way, at runtime, with no device
 /// declared for the port.
 #[cfg(target_os = "linux")]
@@ -54,6 +58,13 @@ impl VsockDialer {
     /// itself: dialing them from the host would reach the host's own vsock listeners, not a guest) or the wildcard
     /// CID, and for the wildcard port.
     pub fn new(cid: u32, port: u32) -> io::Result<Self> {
+        // VMADDR_CID_ANY and VMADDR_PORT_ANY are both u32::MAX: wildcards for a listener, not targets.
+        if cid < FIRST_GUEST_CID || cid == u32::MAX || port == u32::MAX {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("vsock {cid}:{port} is not a guest target (guest CIDs start at {FIRST_GUEST_CID})"),
+            ));
+        }
         Ok(Self { cid, port })
     }
 }
