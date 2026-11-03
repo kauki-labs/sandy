@@ -53,7 +53,9 @@ pub struct BridgeConfig {
     /// The most connections relayed at once, from 1 to [`Semaphore::MAX_PERMITS`]. A client over the cap is closed
     /// unanswered. A client waiting in its dial window holds a slot.
     pub max_connections: usize,
-    /// How long a failing dial is retried before the client's connection is closed. Zero means one attempt.
+    /// How long a failing dial is retried before the client's connection is closed. Zero means one attempt. The
+    /// window is measured between attempts, and one attempt can take up to 5 s (a hung dial or a guest that never
+    /// sends the ready byte), so a client can wait up to the window plus 5 s.
     pub dial_window: Duration,
     /// The pause between dial attempts inside the window.
     pub dial_retry_interval: Duration,
@@ -99,6 +101,12 @@ impl Bridge {
                 ),
             ));
         }
+        if !config.dial_window.is_zero() && config.dial_retry_interval.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "dial_retry_interval must be above zero when dial_window is, or a failing dial would spin",
+            ));
+        }
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let addr = listener.local_addr()?;
         let (stop, stopped) = oneshot::channel();
@@ -110,7 +118,8 @@ impl Bridge {
         })
     }
 
-    /// The loopback address clients connect to.
+    /// The loopback address clients connect to. It is the literal `127.0.0.1:<port>`: a caller that rewrites it to
+    /// `localhost` can resolve `[::1]` and reach whatever else listens on that port.
     #[must_use]
     pub fn addr(&self) -> SocketAddr {
         self.addr
@@ -155,7 +164,8 @@ async fn accept_loop<D: Dialer>(
             _ = &mut stopped => break,
             accepted = listener.accept() => match accepted {
                 Ok((client, _)) => client,
-                Err(_) => {
+                Err(e) => {
+                    tracing::warn!(%e, "the bridge could not accept a client");
                     // EMFILE and friends are not a listener failure: back off and keep serving.
                     sleep(Duration::from_millis(100)).await;
                     continue;
@@ -164,6 +174,10 @@ async fn accept_loop<D: Dialer>(
         };
         let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
             drop(client);
+            tracing::debug!(
+                cap = config.max_connections,
+                "the bridge is at its connection cap; closed a client"
+            );
             continue;
         };
         // Small interactive frames (a websocket) must not wait on Nagle.
@@ -181,7 +195,18 @@ async fn accept_loop<D: Dialer>(
 /// Relay one client: dial the guest relay inside the window, then copy both ways until either side closes. A dial
 /// that never succeeds closes this client only.
 async fn relay_one<D: Dialer>(mut client: TcpStream, dialer: &D, config: BridgeConfig) {
+    // Dial only after the client's first byte: a connection that sends nothing then costs no relay slot and no dial.
+    // `peek` leaves the byte in the socket for `copy_bidirectional` to forward.
+    let mut first = [0u8; 1];
+    match timeout(config.first_byte_timeout, client.peek(&mut first)).await {
+        Ok(Ok(n)) if n > 0 => {}
+        _ => {
+            tracing::debug!("the bridge closed a client that sent no first byte");
+            return;
+        }
+    }
     let Some(mut guest) = dial_within_window(dialer, &config).await else {
+        tracing::debug!("the bridge gave up dialing the guest relay");
         return;
     };
     // Copies both ways, and half-closes the far side when one side reaches EOF.

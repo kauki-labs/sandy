@@ -2470,6 +2470,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-vsock",
+ "tracing",
 ]
 
 [[package]]
