@@ -35,6 +35,10 @@ tokio = { workspace = true, features = [
 ] }
 tokio-rustls.workspace = true
 
+# qemu's host dials a guest over vhost-vsock (#590).
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-vsock.workspace = true
+
 [dev-dependencies]
 anyhow.workspace = true
 sandy-control-proto.workspace = true

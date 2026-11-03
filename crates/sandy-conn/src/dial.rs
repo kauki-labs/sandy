@@ -36,6 +36,37 @@ impl Dialer for UnixDialer {
     }
 }
 
+/// Dials `<guest CID>:<port>` over vhost-vsock. qemu's host reaches a guest this way, at runtime, with no device
+/// declared for the port.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VsockDialer {
+    cid: u32,
+    port: u32,
+}
+
+#[cfg(target_os = "linux")]
+impl VsockDialer {
+    /// A dialer for `port` on the guest with CID `cid`.
+    ///
+    /// # Errors
+    /// [`io::ErrorKind::InvalidInput`] for a CID below 3 (0 is the hypervisor, 1 the local loopback, 2 the host
+    /// itself: dialing them from the host would reach the host's own vsock listeners, not a guest) or the wildcard
+    /// CID, and for the wildcard port.
+    pub fn new(cid: u32, port: u32) -> io::Result<Self> {
+        Ok(Self { cid, port })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Dialer for VsockDialer {
+    type Stream = tokio_vsock::VsockStream;
+
+    async fn dial(&self) -> io::Result<tokio_vsock::VsockStream> {
+        tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(self.cid, self.port)).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -134,5 +165,31 @@ mod tests {
         let mut second = TcpStream::connect(bridge.addr()).await?;
         assert!(echoes(&mut second, b"ok").await, "the bridge serves once the socket exists");
         Ok(())
+    }
+
+    /// A host-side dial must target a guest: CIDs 0 (hypervisor), 1 (local loopback), 2 (the host) and the wildcard
+    /// are refused, and so is the wildcard port. The first guest CID is 3.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_vsock_dialer_refuses_a_target_that_is_not_a_guest() {
+        for cid in [0, 1, 2, u32::MAX] {
+            let refused = VsockDialer::new(cid, 5100);
+            assert!(
+                matches!(&refused, Err(e) if e.kind() == io::ErrorKind::InvalidInput),
+                "cid {cid} must be refused, got {refused:?}"
+            );
+        }
+        let refused = VsockDialer::new(3, u32::MAX);
+        assert!(
+            matches!(&refused, Err(e) if e.kind() == io::ErrorKind::InvalidInput),
+            "the wildcard port must be refused, got {refused:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_vsock_dialer_accepts_a_guest_cid_and_a_port() {
+        assert!(VsockDialer::new(3, 5100).is_ok());
+        assert!(VsockDialer::new(4_000_000, 1).is_ok());
     }
 }
