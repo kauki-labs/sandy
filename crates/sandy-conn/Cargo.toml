@@ -16,6 +16,11 @@ categories = ["network-programming"]
 [lints]
 workspace = true
 
+[features]
+# The live vsock bridge gate (tier-3, #590): needs a Linux host and a running guest. Off by default so CI and
+# `nix flake check` never try to reach one.
+live = []
+
 [dependencies]
 fs2.workspace = true
 rcgen.workspace = true
