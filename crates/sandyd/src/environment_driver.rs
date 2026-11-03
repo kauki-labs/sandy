@@ -41,6 +41,10 @@ pub struct DriverConfig {
     /// How long a row may stay `Provisioning` without a passing probe before it
     /// is failed.
     pub provision_timeout: Duration,
+    /// Stop a `Ready` environment with no owner-visible use for this long. `None`
+    /// never stops one. The environment is stopped, not deleted, and resumes under
+    /// the same id.
+    pub idle_timeout: Option<Duration>,
 }
 
 /// A failure that stops a whole pass.
@@ -65,11 +69,17 @@ pub struct Report {
     pub failed: Vec<String>,
     /// Box ids that were killed.
     pub killed: Vec<String>,
+    /// Environment ids stopped because their idle-stop lease ran out.
+    pub idle_stopped: Vec<String>,
 }
 
 impl Report {
     fn is_empty(&self) -> bool {
-        self.launched.is_empty() && self.readied.is_empty() && self.failed.is_empty() && self.killed.is_empty()
+        self.launched.is_empty()
+            && self.readied.is_empty()
+            && self.failed.is_empty()
+            && self.killed.is_empty()
+            && self.idle_stopped.is_empty()
     }
 }
 
@@ -140,7 +150,7 @@ impl EnvironmentDriver {
     ) -> Result<(), EnvironmentStoreError> {
         match row.state {
             EnvironmentState::Provisioning => self.provision(row, now, running, report),
-            EnvironmentState::Ready => self.check_ready(row, running, report),
+            EnvironmentState::Ready => self.check_ready(row, now, running, report),
             EnvironmentState::Stopped | EnvironmentState::Failed | EnvironmentState::Deleted => {
                 if running.contains(&row.environment_id) {
                     self.kill(&row.environment_id, running, report);
@@ -268,18 +278,42 @@ impl EnvironmentDriver {
     fn check_ready(
         &self,
         row: &EnvironmentRecord,
+        now: i64,
         running: &mut BTreeSet<String>,
         report: &mut Report,
     ) -> Result<(), EnvironmentStoreError> {
         let id = row.environment_id.as_str();
         match self.backend.probe(id) {
-            Ok(Probe::Ready { .. } | Probe::Starting { .. }) => {}
+            Ok(Probe::Ready { .. } | Probe::Starting { .. }) => self.stop_if_idle(row, now, report)?,
             Ok(Probe::Failed { step, reason }) => {
                 self.kill(id, running, report);
                 self.fail(id, &step, &reason, report)?;
             }
             Ok(Probe::NotRunning) => self.fail(id, "reconcile", "the box is not running", report)?,
             Err(e) => tracing::warn!(environment = id, error = %e, "probe could not run"),
+        }
+        Ok(())
+    }
+
+    /// Stop `row` once its lease has run out. The next pass sees `Stopped` and
+    /// kills the box, the same path as an owner's stop.
+    fn stop_if_idle(
+        &self,
+        row: &EnvironmentRecord,
+        now: i64,
+        report: &mut Report,
+    ) -> Result<(), EnvironmentStoreError> {
+        let Some(limit) = self.config.idle_timeout else {
+            return Ok(());
+        };
+        // Conditional in the store: `row` is a snapshot, and a renewal that landed after
+        // it (the probe can be slow) must win.
+        if self.store.stop_if_idle(
+            &row.environment_id,
+            now,
+            i64::try_from(limit.as_secs()).unwrap_or(i64::MAX),
+        )? {
+            report.idle_stopped.push(row.environment_id.clone());
         }
         Ok(())
     }
@@ -326,7 +360,7 @@ fn endpoint_string(endpoint: &Endpoint) -> Option<String> {
     plain.then(|| format!("{}:{}", endpoint.host, endpoint.port))
 }
 
-fn now_unix() -> i64 {
+pub(crate) fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -348,6 +382,14 @@ mod tests {
             template: "t3".to_owned(),
             service_port: Some(3773),
             provision_timeout: Duration::from_secs(600),
+            idle_timeout: None,
+        }
+    }
+
+    fn idle_config(secs: u64) -> DriverConfig {
+        DriverConfig {
+            idle_timeout: Some(Duration::from_secs(secs)),
+            ..config()
         }
     }
 
@@ -541,6 +583,80 @@ mod tests {
         restarted.reconcile_once(now())?;
         assert_eq!(state(&r.store, &id)?.state, EnvironmentState::Ready);
         assert_eq!(r.backend.launched().len(), 1, "the restart must not start a second VM");
+        Ok(())
+    }
+
+    #[test]
+    fn an_idle_ready_environment_is_stopped_then_its_box_killed_and_the_row_survives() -> Result<()> {
+        let store = Arc::new(EnvironmentStore::open_in_memory()?);
+        let backend = Arc::new(FakeEnvironmentBackend::new());
+        let driver = EnvironmentDriver::new(Arc::clone(&store), Arc::clone(&backend) as _, idle_config(300));
+        let id = add(&store, 1)?;
+        driver.reconcile_once(now())?;
+        assert_eq!(state(&store, &id)?.state, EnvironmentState::Ready);
+        let report = driver.reconcile_once(now() + 301)?;
+        assert_eq!(report.idle_stopped, std::slice::from_ref(&id));
+        assert_eq!(
+            state(&store, &id)?.state,
+            EnvironmentState::Stopped,
+            "stopped, not deleted"
+        );
+        driver.reconcile_once(now() + 302)?;
+        assert!(backend.boxes()?.is_empty(), "the stop must end the box");
+        Ok(())
+    }
+
+    #[test]
+    fn use_renews_the_lease_and_inactivity_alone_does_not() -> Result<()> {
+        let store = Arc::new(EnvironmentStore::open_in_memory()?);
+        let backend = Arc::new(FakeEnvironmentBackend::new());
+        let driver = EnvironmentDriver::new(Arc::clone(&store), Arc::clone(&backend) as _, idle_config(300));
+        let id = add(&store, 1)?;
+        driver.reconcile_once(now())?;
+        assert!(store.touch(&id, now() + 250)?);
+        let report = driver.reconcile_once(now() + 400)?; // 150 s after the touch
+        assert!(report.idle_stopped.is_empty(), "a renewed lease must hold");
+        assert_eq!(state(&store, &id)?.state, EnvironmentState::Ready);
+        let report = driver.reconcile_once(now() + 560)?; // 310 s after the touch
+        assert_eq!(report.idle_stopped, std::slice::from_ref(&id));
+        Ok(())
+    }
+
+    #[test]
+    fn no_idle_timeout_never_stops_an_environment() -> Result<()> {
+        let r = rig(FakeEnvironmentBackend::new())?;
+        let id = add(&r.store, 1)?;
+        r.driver.reconcile_once(now())?;
+        let report = r.driver.reconcile_once(now() + 10_000_000)?;
+        assert!(report.idle_stopped.is_empty());
+        assert_eq!(state(&r.store, &id)?.state, EnvironmentState::Ready);
+        Ok(())
+    }
+
+    #[test]
+    fn a_resumed_environment_starts_a_fresh_lease() -> Result<()> {
+        let store = Arc::new(EnvironmentStore::open_in_memory()?);
+        let backend = Arc::new(FakeEnvironmentBackend::new());
+        let driver = EnvironmentDriver::new(Arc::clone(&store), Arc::clone(&backend) as _, idle_config(300));
+        let id = add(&store, 1)?;
+        driver.reconcile_once(now())?;
+        store.touch(&id, now() + 10)?;
+        let stopped = driver.reconcile_once(now() + 400)?;
+        assert_eq!(stopped.idle_stopped, std::slice::from_ref(&id));
+        driver.reconcile_once(now())?; // box killed
+        assert!(
+            matches!(store.resume(&id)?, EnvTransition::Applied),
+            "resume must apply"
+        );
+        driver.reconcile_once(now())?; // relaunch to Ready (the store stamps real time, so no offset)
+        assert_eq!(state(&store, &id)?.state, EnvironmentState::Ready);
+        let rec = state(&store, &id)?;
+        assert_eq!(rec.last_activity_at, None, "the old lease must not carry over");
+        let report = driver.reconcile_once(now())?;
+        assert!(
+            report.idle_stopped.is_empty(),
+            "a resumed environment must not start idle"
+        );
         Ok(())
     }
 

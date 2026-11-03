@@ -23,8 +23,11 @@ use sandy_control_proto::{
     },
 };
 
-use crate::environment_store::{
-    CreateOutcome, EnvTransition, EnvironmentRecord, EnvironmentState, EnvironmentStore, EnvironmentStoreError,
+use crate::{
+    environment_driver::now_unix,
+    environment_store::{
+        CreateOutcome, EnvTransition, EnvironmentRecord, EnvironmentState, EnvironmentStore, EnvironmentStoreError,
+    },
 };
 
 /// The create payload's encoding name, stored beside the spec bytes.
@@ -311,7 +314,15 @@ async fn get(store: &Arc<EnvironmentStore>, id: String) -> Reply {
         return bad_id();
     }
     match fetch(store, &id).await? {
-        Some(record) => reply(record),
+        Some(record) => {
+            // Reading an environment renews its idle-stop lease (decision 30). A failed
+            // renewal must not fail the read.
+            let (s, touched) = (Arc::clone(store), id.clone());
+            if let Ok(Err(e)) = tokio::task::spawn_blocking(move || s.touch(&touched, now_unix())).await {
+                tracing::warn!(environment = %id, error = %e, "could not renew an idle-stop lease");
+            }
+            reply(record)
+        }
         None => not_found(&id),
     }
 }
@@ -650,6 +661,19 @@ mod tests {
         });
         assert_eq!(refused(&s, no_spec).await?, EnvironmentErrorCode::InvalidArgument);
         assert!(s.list()?.is_empty(), "a refused create must leave no row");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reading_a_ready_environment_renews_its_idle_lease() -> Result<()> {
+        let s = store()?;
+        let env = create(&s, "k1", ephemeral()).await?;
+        s.mark_ready(&env.environment_id)?;
+        assert_eq!(s.get(&env.environment_id)?.context("row")?.last_activity_at, None);
+        call(&s, get(&env.environment_id))
+            .await?
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        assert!(s.get(&env.environment_id)?.context("row")?.last_activity_at.is_some());
         Ok(())
     }
 

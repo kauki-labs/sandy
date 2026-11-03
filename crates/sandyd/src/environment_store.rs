@@ -128,6 +128,10 @@ pub struct EnvironmentRecord {
     /// from here, not from the last write, so a row found late is not failed
     /// before its box has had time to boot.
     pub launched_at: Option<i64>,
+    /// Unix seconds of the last owner-visible use (see [`EnvironmentStore::touch`]),
+    /// cleared by every state change. The idle-stop lease runs from here, or from
+    /// `updated_at` when it is unset.
+    pub last_activity_at: Option<i64>,
     /// Unix seconds at creation.
     pub created_at: i64,
     /// Unix seconds at the last state change.
@@ -190,12 +194,13 @@ struct RawRow {
     failure_reason: Option<String>,
     endpoint: Option<String>,
     launched_at: Option<i64>,
+    last_activity_at: Option<i64>,
     created_at: i64,
     updated_at: i64,
 }
 
 const COLUMNS: &str = "environment_id, request_id, state, spec, spec_encoding, failure_step, failure_reason, \
-                       created_at, updated_at, endpoint, launched_at";
+                       created_at, updated_at, endpoint, launched_at, last_activity_at";
 
 impl RawRow {
     fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
@@ -211,6 +216,7 @@ impl RawRow {
             updated_at: row.get(8)?,
             endpoint: row.get(9)?,
             launched_at: row.get(10)?,
+            last_activity_at: row.get(11)?,
         })
     }
 
@@ -232,6 +238,7 @@ impl RawRow {
             failure,
             endpoint: self.endpoint,
             launched_at: self.launched_at,
+            last_activity_at: self.last_activity_at,
             created_at: self.created_at,
             updated_at: self.updated_at,
         })
@@ -288,12 +295,17 @@ impl EnvironmentStore {
                 created_at      INTEGER NOT NULL,
                 updated_at      INTEGER NOT NULL,
                 endpoint        TEXT,
-                launched_at     INTEGER
+                launched_at     INTEGER,
+                last_activity_at INTEGER
             )",
             (),
         )?;
         // A table created before these columns existed lacks them.
-        for (column, ddl) in [("endpoint", "TEXT"), ("launched_at", "INTEGER")] {
+        for (column, ddl) in [
+            ("endpoint", "TEXT"),
+            ("launched_at", "INTEGER"),
+            ("last_activity_at", "INTEGER"),
+        ] {
             let present: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM pragma_table_info('environments') WHERE name = ?1)",
                 [column],
@@ -560,6 +572,41 @@ impl EnvironmentStore {
         Ok(rows == 1)
     }
 
+    /// Renew `environment_id`'s idle-stop lease at unix time `now`. Only a `Ready`
+    /// environment is renewed: any state change clears the lease, so a stopped or
+    /// resuming environment never starts idle. Returns whether it wrote.
+    ///
+    /// # Errors
+    /// As [`EnvironmentStore::create`].
+    pub fn touch(&self, environment_id: &str, now: i64) -> Result<bool, EnvironmentStoreError> {
+        let conn = self.lock();
+        let rows = conn.execute(
+            "UPDATE environments SET last_activity_at = ?2
+              WHERE environment_id = ?1 AND state = 'ready'",
+            (environment_id, now),
+        )?;
+        Ok(rows == 1)
+    }
+
+    /// `Ready` to `Stopped` only if the lease has run out at unix time `now`: at
+    /// least `limit_secs` since the last renewal. The check and the write are one
+    /// statement, so a renewal that lands after the caller read the row wins and
+    /// nothing is stopped. Returns whether it stopped the environment.
+    ///
+    /// # Errors
+    /// As [`EnvironmentStore::create`].
+    pub fn stop_if_idle(&self, environment_id: &str, now: i64, limit_secs: i64) -> Result<bool, EnvironmentStoreError> {
+        let conn = self.lock();
+        let rows = conn.execute(
+            "UPDATE environments
+                SET state = 'stopped', updated_at = ?4, last_activity_at = NULL
+              WHERE environment_id = ?1 AND state = 'ready'
+                AND ?2 - COALESCE(last_activity_at, updated_at) >= ?3",
+            (environment_id, now, limit_secs, now_unix()),
+        )?;
+        Ok(rows == 1)
+    }
+
     /// `Provisioning` to `Ready`, recording where the environment's service is
     /// reachable (`host:port`) in the same write. The launch driver uses this
     /// when its probe passes, so a row never shows Ready without its endpoint
@@ -665,7 +712,8 @@ impl EnvironmentStore {
                 SET state = ?2, failure_step = COALESCE(?3, failure_step),
                     failure_reason = COALESCE(?4, failure_reason), updated_at = ?5,
                     endpoint = COALESCE(?6, endpoint),
-                    launched_at = CASE WHEN ?2 = 'provisioning' THEN NULL ELSE launched_at END
+                    launched_at = CASE WHEN ?2 = 'provisioning' THEN NULL ELSE launched_at END,
+                    last_activity_at = NULL
               WHERE environment_id = ?1",
             (environment_id, to.as_str(), step, reason, now_unix(), endpoint),
         )?;
@@ -968,6 +1016,49 @@ mod tests {
         s.delete("env-3")?;
         assert_eq!(s.mark_lost("env-3", "x", "y")?, EnvTransition::Refused(Deleted));
         assert_eq!(s.mark_lost("nope", "x", "y")?, EnvTransition::NotFound);
+        Ok(())
+    }
+
+    #[test]
+    fn the_idle_lease_is_renewed_only_while_ready_and_cleared_by_every_state_change() -> Result<()> {
+        let s = store()?;
+        created(&s)?;
+        assert!(!s.touch("env-1", 100)?, "a Provisioning environment has no lease");
+        s.mark_ready("env-1")?;
+        assert!(s.touch("env-1", 100)?);
+        assert_eq!(s.get("env-1")?.context("env-1")?.last_activity_at, Some(100));
+        assert!(!s.touch("env-nope", 1)?);
+        s.stop("env-1")?;
+        assert_eq!(s.get("env-1")?.context("env-1")?.last_activity_at, None);
+        assert!(!s.touch("env-1", 200)?, "a Stopped environment is not renewed");
+        s.resume("env-1")?;
+        assert_eq!(s.get("env-1")?.context("env-1")?.last_activity_at, None);
+        Ok(())
+    }
+
+    #[test]
+    fn an_idle_stop_loses_to_a_renewal_and_holds_at_the_exact_limit() -> Result<()> {
+        let s = store()?;
+        created(&s)?;
+        s.mark_ready("env-1")?;
+        s.touch("env-1", 1_000)?;
+        assert!(
+            !s.stop_if_idle("env-1", 1_299, 300)?,
+            "299 s idle is inside a 300 s lease"
+        );
+        // A stale read said the lease was out; a renewal landed since.
+        s.touch("env-1", 1_400)?;
+        assert!(
+            !s.stop_if_idle("env-1", 1_450, 300)?,
+            "a renewal after the read must win"
+        );
+        assert_eq!(s.get("env-1")?.context("env-1")?.state, EnvironmentState::Ready);
+        assert!(s.stop_if_idle("env-1", 1_700, 300)?, "exactly the limit stops");
+        assert_eq!(s.get("env-1")?.context("env-1")?.state, EnvironmentState::Stopped);
+        assert!(
+            !s.stop_if_idle("env-1", 9_999, 300)?,
+            "a Stopped row is not stopped again"
+        );
         Ok(())
     }
 

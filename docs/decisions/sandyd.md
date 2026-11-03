@@ -2194,3 +2194,24 @@ pass).
 **Consequences.** Environments created over the RPC now reach `Ready` with `connection.url` set, so the broker and the MCP tools can be driven end to end. One daemon runs at most the environments its host can hold, with no resource limit per environment. The pairing file and the service log live in the environment directory and go with it on `kill`.
 
 **Alternative set aside.** Running the service through `impls/local`'s `ProcessBackend`: it is run-to-completion and tied to one job, and it would not give the driver a long-lived box it can probe and kill by environment id.
+
+## 30. The idle-stop lease: a `Ready` environment with no owner-visible use is stopped, not deleted (#587)
+
+**Status:** accepted (owner decisions on #587, 2026-11-03). **Upholds:** INV-6.
+
+**Context.** #587 asks that an environment with no attach and no activity for a configured period is stopped. A stopped environment keeps its row and resumes under the same id.
+
+**Decision.**
+
+- The store keeps `last_activity_at` per row. `EnvironmentStore::touch(id, now)` renews it and writes only while the row is `Ready`. Every state change clears it, so a resumed environment starts a fresh lease from `updated_at`.
+- The lease runs from `last_activity_at`, or from `updated_at` when it is unset. `SANDY_ENV_IDLE_TIMEOUT_SECS` sets the limit. Unset means off, today's behavior.
+- The driver's `Ready` pass stops a row whose lease ran out, through the same `stop` an owner uses. The next pass sees `Stopped` and kills the box, so there is one kill path and a daemon restart changes nothing.
+- The stop is one conditional statement in the store (`stop_if_idle`), not a read then a stop, so a renewal that lands between the driver's snapshot and its write wins.
+- Owner-visible use renews the lease: today a `GetEnvironment` call, and attach when it lands. A failed renewal never fails the read.
+- Rows that were `Ready` before the column existed have no renewal, so their lease runs from `updated_at`. Enabling the limit on an existing store stops every environment older than the limit at the first pass.
+
+**Consequences.** A client that connects straight to the service endpoint, as a T3 client does after pairing, is invisible to `sandyd`, so it does not renew the lease. Set the limit long enough for that, or leave it off. A backend-reported activity signal (connections through the bridge) is the follow-up that closes this gap.
+
+A client that polls `GetEnvironment` renews the lease for as long as it polls, and `sandyd` does not check who the caller is, so any local caller can renew. A status poller therefore keeps an environment alive on purpose. Narrowing renewal to attach is the follow-up once attach exists.
+
+**Alternative set aside.** Counting every RPC on the id as activity, including list and cancel: it widens the poller problem and adds no owner signal.
