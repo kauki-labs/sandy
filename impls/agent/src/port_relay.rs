@@ -16,16 +16,19 @@ use std::{
     ffi::OsString,
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
 use sandy_api::agent::PORT_RELAY_READY;
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt, copy_bidirectional},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, split},
     net::TcpStream,
     sync::Semaphore,
-    time::timeout,
+    time::{Instant, timeout},
 };
 
 use crate::link_source::{Acceptor, HOST_CID};
@@ -63,21 +66,26 @@ pub const MAX_CONNECTIONS: usize = 256;
 /// backlog is full, and the connection is closed instead of holding a task and a descriptor for minutes.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a connection may carry no byte in either direction before it is closed. Without it a peer that sends
+/// the ready byte and then goes silent pins a slot and two descriptors for good, and enough of them refuse everyone.
+/// Fifteen minutes is far above a websocket's keepalive interval.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
 /// Accept connections on `acceptor` and relay each host connection to `target`. Runs until its task is dropped.
 pub async fn serve<A>(acceptor: A, target: SocketAddr)
 where
     A: Acceptor + Send + 'static,
     A::Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    serve_with_cap(acceptor, target, MAX_CONNECTIONS).await;
+    serve_with_cap(acceptor, target, MAX_CONNECTIONS, IDLE_TIMEOUT).await;
 }
 
-/// [`serve`] with an explicit cap on concurrent connections.
+/// [`serve`] with an explicit cap on concurrent connections and an idle limit per connection.
 ///
 /// A peer that is not the host is closed at once and the target is never dialed for it, so a guest-local process
 /// on vsock loopback cannot use the relay. Each connection runs in its own task, so a long-lived one (a websocket)
 /// does not block the next.
-pub async fn serve_with_cap<A>(mut acceptor: A, target: SocketAddr, cap: usize)
+pub async fn serve_with_cap<A>(mut acceptor: A, target: SocketAddr, cap: usize, idle: Duration)
 where
     A: Acceptor + Send + 'static,
     A::Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -92,7 +100,7 @@ where
                     continue;
                 };
                 tokio::spawn(async move {
-                    relay_one(stream, target).await;
+                    relay_one(stream, target, idle).await;
                     drop(slot);
                 });
             }
@@ -109,7 +117,7 @@ where
 }
 
 /// Relay one host connection. A target that is down closes this connection only.
-async fn relay_one<S>(mut host: S, target: SocketAddr)
+async fn relay_one<S>(mut host: S, target: SocketAddr, idle: Duration)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -131,12 +139,60 @@ where
         eprintln!("sandy-agent: port-relay could not announce readiness: {e}");
         return;
     }
-    // Copies both ways, and half-closes the far side when one side reaches EOF.
-    if let Err(e) = copy_bidirectional(&mut host, &mut service).await
+    if let Err(e) = copy_until_idle(host, service, idle).await
         && e.kind() != io::ErrorKind::ConnectionReset
     {
         eprintln!("sandy-agent: port-relay connection ended: {e}");
     }
+}
+
+/// Copy both ways, half-closing the far side when one side reaches EOF, until both directions end or neither
+/// moves a byte for `idle` ([`io::ErrorKind::TimedOut`]). A quiet direction alone is not idle: a download with no
+/// upload keeps the connection open.
+async fn copy_until_idle<A, B>(a: A, b: B, idle: Duration) -> io::Result<()>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let start = Instant::now();
+    let last = AtomicU64::new(0);
+    let (a_read, a_write) = split(a);
+    let (b_read, b_write) = split(b);
+    let (up, down) = tokio::join!(
+        pump(a_read, b_write, start, &last, idle),
+        pump(b_read, a_write, start, &last, idle)
+    );
+    up.and(down)
+}
+
+/// One direction of [`copy_until_idle`]. A read that times out is idle only if the other direction also moved
+/// nothing for `idle`; the shared `last` holds the millisecond of the latest byte either way.
+async fn pump<R, W>(mut from: R, mut to: W, start: Instant, last: &AtomicU64, idle: Duration) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let idle_ms = u64::try_from(idle.as_millis()).unwrap_or(u64::MAX);
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        match timeout(idle, from.read(&mut buf)).await {
+            Ok(Ok(0)) => return to.shutdown().await,
+            Ok(Ok(n)) => {
+                to.write_all(&buf[..n]).await?;
+                last.store(elapsed_ms(start), Ordering::Relaxed);
+            }
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                if elapsed_ms(start).saturating_sub(last.load(Ordering::Relaxed)) >= idle_ms {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "connection idle"));
+                }
+            }
+        }
+    }
+}
+
+fn elapsed_ms(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// The `port-relay` entry point: bind the vsock listener, then relay until killed. A usage or bind failure aborts
@@ -385,7 +441,7 @@ mod tests {
         let (target, _) = echo_target().await?;
         let queue = Arc::new(Mutex::new(VecDeque::new()));
         let mut first = connection(&queue, HOST_CID)?;
-        let relay = tokio::spawn(serve_with_cap(Script(Arc::clone(&queue)), target, 1));
+        let relay = tokio::spawn(serve_with_cap(Script(Arc::clone(&queue)), target, 1, IDLE_TIMEOUT));
         assert!(served(&mut first, b"one").await?, "the first connection is served");
 
         let mut second = connection(&queue, HOST_CID)?;
@@ -405,6 +461,75 @@ mod tests {
             served(&mut third, b"three").await?,
             "a slot freed by a closed connection is reusable"
         );
+        relay.abort();
+        Ok(())
+    }
+
+    /// A silent connection must not hold a slot forever: a host process that sends nothing after the ready byte,
+    /// against a service that also stays silent, is closed once the idle limit passes, and its slot is reusable.
+    #[tokio::test]
+    async fn a_silent_connection_is_closed_after_the_idle_limit() -> anyhow::Result<()> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .context("bind silent")?;
+        let target = listener.local_addr()?;
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let mut host = connection(&queue, HOST_CID)?;
+        let relay = tokio::spawn(serve_with_cap(
+            Script(Arc::clone(&queue)),
+            target,
+            1,
+            Duration::from_millis(300),
+        ));
+        let mut ready = [0u8; 1];
+        timeout(WAIT, host.read_exact(&mut ready))
+            .await
+            .context("ready byte")??;
+
+        let mut byte = [0u8; 1];
+        let closed = timeout(WAIT, host.read(&mut byte))
+            .await
+            .context("a silent connection was never closed")?;
+        assert!(
+            matches!(closed, Ok(0) | Err(_)),
+            "a silent connection must be closed, got {closed:?}"
+        );
+
+        let mut next = connection(&queue, HOST_CID)?;
+        let mut ready = [0u8; 1];
+        timeout(WAIT, next.read_exact(&mut ready))
+            .await
+            .context("the freed slot was not reusable")??;
+        relay.abort();
+        Ok(())
+    }
+
+    /// Traffic in either direction counts as activity: a connection that keeps talking outlives the idle limit.
+    #[tokio::test]
+    async fn a_connection_with_traffic_outlives_the_idle_limit() -> anyhow::Result<()> {
+        let (target, _) = echo_target().await?;
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let mut host = connection(&queue, HOST_CID)?;
+        let relay = tokio::spawn(serve_with_cap(
+            Script(Arc::clone(&queue)),
+            target,
+            4,
+            Duration::from_millis(400),
+        ));
+        assert!(served(&mut host, b"0").await?, "the first echo comes back");
+        for i in 1..=6u8 {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            assert!(
+                echoes(&mut host, &[b'0' + i]).await?,
+                "an active connection must stay open past the idle limit"
+            );
+        }
         relay.abort();
         Ok(())
     }
