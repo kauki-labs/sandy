@@ -62,7 +62,7 @@ pub struct FlakeManifestV1 {
     pub timeout_secs: Option<u32>,
     /// Declares `command` a long-running service (#589): it reaches Ready only once its health probe
     /// passes, instead of ending when the command exits. `None` is an ordinary job.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service: Option<ServiceSpec>,
 }
 
@@ -78,6 +78,11 @@ pub struct ServiceSpec {
     /// What the agent does when the service exits.
     #[serde(default)]
     pub restart: RestartPolicy,
+    /// The guest loopback port the host-side bridge reaches (#590, #620): the agent starts the guest half of
+    /// the bridge for it. `None` means the service has no host-reachable port. Separate from the probe because a
+    /// command probe has no port.
+    #[serde(default)]
+    pub port: Option<u16>,
 }
 
 /// A readiness check, run by `sandy-agent` inside the guest every `interval_secs` until it passes.
@@ -195,6 +200,9 @@ pub fn validate_service(manifest: &FlakeManifestV1) -> Result<(), String> {
 /// # Errors
 /// The first problem found, as a message.
 pub fn validate_service_spec(service: &ServiceSpec) -> Result<(), String> {
+    if service.port == Some(0) {
+        return Err("the service port must not be 0".to_owned());
+    }
     if !is_service_account_name(&service.user) || service.user == "root" {
         return Err(format!(
             "a service must name a non-root user account ([a-z_][a-z0-9_-]*, at most 32 characters), got {:?}",
@@ -271,6 +279,7 @@ mod tests {
                 max_attempts: 60,
             },
             restart: RestartPolicy::OnFailure,
+            port: Some(3773),
         }
     }
 
@@ -428,6 +437,37 @@ mod tests {
             );
         }
         assert_eq!(decode_flake_manifest(base("null").as_bytes())?.service, None);
+        Ok(())
+    }
+
+    /// #589 review: a manifest without a service encodes without a `service` key at all. An older executor
+    /// (`deny_unknown_fields`) would otherwise refuse every new manifest, service or not, over `"service":null`.
+    #[test]
+    fn a_plain_manifest_encodes_without_a_service_key() -> Result<(), serde_json::Error> {
+        let manifest = FlakeManifestV1 {
+            flake: ".".to_owned(),
+            kind: None,
+            attr: None,
+            command: Vec::new(),
+            history_lines: default_history_lines(),
+            env: Vec::new(),
+            cpu: None,
+            mem: None,
+            timeout_secs: None,
+            service: None,
+        };
+        let json = String::from_utf8(encode_flake_manifest(&manifest)?).expect("JSON is UTF-8");
+        assert!(!json.contains("service"), "{json}");
+        Ok(())
+    }
+
+    /// #590: a service port of 0 cannot be reached, so it is refused; an absent port is fine.
+    #[test]
+    fn a_service_port_of_zero_is_refused_and_an_absent_one_is_allowed() -> Result<(), serde_json::Error> {
+        let bytes = service_manifest_bytes(|s| s.port = Some(0))?;
+        assert!(refusal(&bytes).contains("service port"));
+        let bytes = service_manifest_bytes(|s| s.port = None)?;
+        assert_eq!(decode_flake_manifest(&bytes)?.service.map(|s| s.port), Some(None));
         Ok(())
     }
 
