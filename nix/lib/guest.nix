@@ -25,7 +25,12 @@ let
   # vfkit (macOS, console hvc0). `vmHostPackages` is the host (darwin) pkgs
   # the vfkit runner needs so its isDarwin check passes; null for qemu.
   commonModule =
-    { lib, pkgs, ... }:
+    {
+      lib,
+      pkgs,
+      options,
+      ...
+    }:
     {
       # #325: `lib.mkForce` on every option below that NixOS's module system
       # would otherwise raise a conflicting-definitions eval error on, once an
@@ -168,7 +173,13 @@ let
 
       # Keep the guest tiny and fast to boot.
       documentation.enable = lib.mkForce false;
-      boot.initrd.systemd.enable = lib.mkForce false;
+      # Newer nixpkgs removed the scripted initrd: the option is then a hidden
+      # stub that asserts when defined. Older pins default it to true, so force
+      # it off only where it is still a real option. A renamed or hidden option
+      # that still works reads as invisible too, and is skipped.
+      boot.initrd.systemd.enable = lib.mkIf (options.boot.initrd.systemd.enable.visible or true) (
+        lib.mkForce false
+      );
     };
 in
 {

@@ -88,7 +88,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
   "tls12",
   "ring",
 ] }
-rcgen = { version = "0.13", default-features = false, features = ["ring"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring"] }
 
 # sandyd's job state store (#212, B1): vendored SQLite, no system dependency,
 # synchronous API wrapped in spawn_blocking (docs/decisions/sandyd.md §4).

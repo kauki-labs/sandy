@@ -11,6 +11,7 @@ use sandy_conn::{Listener as MeshListener, TlsIdentity};
 use sandyd::{
     build_rev::{log_startup, resolve_rev, version_line, wants_version},
     dispatch::JobRegistry,
+    environment_store::EnvironmentStore,
     gate_spawn,
     host_registry::{ExecutorAllowlist, HostRegistry},
     mesh_config::{parse_mesh_allowlist, parse_mesh_listen_addr},
@@ -138,6 +139,23 @@ async fn main() {
         Ok(store) => Arc::new(store.with_max_rows(max_jobs)),
         Err(e) => {
             tracing::error!(error = %e, db = %db_path.display(), "could not open the job store");
+            std::process::exit(1);
+        }
+    };
+
+    let max_environments = match max_environments() {
+        Ok(max_environments) => max_environments,
+        Err(e) => {
+            tracing::error!(error = %e, "SANDY_MAX_ENVIRONMENTS is not a valid non-negative integer");
+            std::process::exit(1);
+        }
+    };
+
+    // Same file as the job store: one durable, 0600 database for the daemon.
+    let environments = match EnvironmentStore::open(&db_path) {
+        Ok(environments) => Arc::new(environments.with_max_rows(max_environments)),
+        Err(e) => {
+            tracing::error!(error = %e, db = %db_path.display(), "could not open the environment store");
             std::process::exit(1);
         }
     };
@@ -359,11 +377,12 @@ async fn main() {
                             continue;
                         }
                         let store = Arc::clone(&store);
+                        let environments = Arc::clone(&environments);
                         let registry = Arc::clone(&registry);
                         let host_registry = Arc::clone(&host_registry);
                         connections.spawn(async move {
                             let _permit = permit; // held for the connection's lifetime, released on drop
-                            sandyd::serve_connection(stream, store, registry, host_registry, forward_back_addr).await;
+                            sandyd::serve_connection(stream, store, environments, registry, host_registry, forward_back_addr).await;
                         });
                     }
                     Err(e) => {
@@ -847,6 +866,18 @@ fn db_path() -> std::io::Result<PathBuf> {
 /// The env var is set but is not a valid non-negative integer.
 fn max_jobs() -> Result<Option<usize>, std::num::ParseIntError> {
     std::env::var("SANDY_MAX_JOBS").ok().map(|v| v.parse()).transpose()
+}
+
+/// Parse `$SANDY_MAX_ENVIRONMENTS`: the row cap [`EnvironmentStore::with_max_rows`]
+/// enforces. `Ok(None)` if unset, which is uncapped.
+///
+/// # Errors
+/// The env var is set but is not a valid non-negative integer.
+fn max_environments() -> Result<Option<usize>, std::num::ParseIntError> {
+    std::env::var("SANDY_MAX_ENVIRONMENTS")
+        .ok()
+        .map(|v| v.parse())
+        .transpose()
 }
 
 /// A `sandyd`-owned directory to default the control socket and job store

@@ -928,6 +928,19 @@ pub async fn handle(
                     .collect(),
             })
         }
+        // Environment operations are routed to `crate::environment` by
+        // `serve_connection` before this function is called.
+        Some(
+            control_request::Op::CreateEnvironment(_)
+            | control_request::Op::GetEnvironment(_)
+            | control_request::Op::ListEnvironments(_)
+            | control_request::Op::StopEnvironment(_)
+            | control_request::Op::ResumeEnvironment(_)
+            | control_request::Op::CancelEnvironment(_)
+            | control_request::Op::DeleteEnvironment(_),
+        ) => control_response::Result::Error(ControlError {
+            message: "environment operations are served by the environment handler, not the job handler".to_owned(),
+        }),
         None => control_response::Result::Error(ControlError {
             message: "request carried no operation".to_owned(),
         }),

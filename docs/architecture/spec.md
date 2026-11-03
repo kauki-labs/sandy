@@ -619,6 +619,17 @@ owner.
 
 **KPI:** rows KMCP1 to KMCP8 in [`kpi.md`](kpi.md).
 
+## 9. Environments (`EnvironmentStore`)
+
+**Decisions** ([`sandyd.md`](../decisions/sandyd.md) decision 26, #587):
+
+- An environment outlives any boot, so its state lives in a `sandyd` SQLite table beside `jobs`, not in the per-job journal. Invariant: INV-6 (nothing launches before a record exists).
+- The store only records state and refuses illegal moves (`Provisioning`, `Ready`, `Stopped`, `Failed`, `Deleted`). A driver turns a move into a VM action. Resume re-enters `Provisioning`, so Ready always means a probe passed.
+- `request_id` lives as long as the row, deleted rows included: a retry returns the same environment, never a new one.
+- A level-triggered `EnvironmentDriver` converges the boxes an `EnvironmentBackend` runs to the rows: launch, probe to `Ready`, fail on a failed probe or a timeout, and kill any box that no live row names. It is also the restart reconciler (decision 28).
+
+**KPI:** rows KENV1 to KENV7 in [`kpi.md`](kpi.md).
+
 ## Testing: integration vs end-to-end
 
 The two tiers are deliberately separate, and a subsystem's KPI names tests from each.

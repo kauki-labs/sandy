@@ -379,9 +379,10 @@ impl TlsIdentity {
     /// # Errors
     /// [`ConnError::Tls`] if key generation or self-signing fails.
     pub fn generate() -> Result<Self, ConnError> {
-        let rcgen::CertifiedKey { cert, key_pair } = rcgen::generate_simple_self_signed(vec!["sandy-mesh".to_owned()])
-            .map_err(|err| ConnError::Tls(format!("generating a self-signed identity: {err}")))?;
-        let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(key_pair.serialize_der().into());
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["sandy-mesh".to_owned()])
+                .map_err(|err| ConnError::Tls(format!("generating a self-signed identity: {err}")))?;
+        let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(signing_key.serialize_der().into());
         Ok(TlsIdentity {
             cert: cert.der().clone(),
             key: key_der,

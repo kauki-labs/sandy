@@ -140,6 +140,32 @@ fn tighten_existing_file_and_sidecars(path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Open the SQLite file at `path` as a private store: a brand-new file is
+/// created at `0600` atomically, an existing file and any journal/WAL sidecar
+/// are tightened to `0600` before anything reopens or migrates them (CF-M-7).
+/// Shared by every sandyd store so they all get the same floor.
+pub(crate) fn open_private_connection(path: &Path) -> Result<Connection, StoreError> {
+    // A brand-new file is created at 0600 ourselves, atomically, so it's
+    // never briefly wide-open between SQLite's own create (whatever the
+    // umask leaves it) and a chmod. `AlreadyExists` means a prior run
+    // already owns the file (or a journal/WAL sidecar it left behind,
+    // possibly pre-dating this fix, or created under a looser umask):
+    // tighten the file and every sidecar SQLite may have left before
+    // anything reopens or migrates them.
+    use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => tighten_existing_file_and_sidecars(path)?,
+        Err(e) => return Err(e.into()),
+    }
+    Ok(Connection::open(path)?)
+}
+
 impl JobStore {
     /// Open (creating if needed) the job store at `path`, tighten it (and any
     /// journal/WAL sidecar) to `0600` (CF-M-7), then ensure its schema exists
@@ -159,25 +185,7 @@ impl JobStore {
     /// cannot be created; [`StoreError::Io`] if the permissions cannot be
     /// set.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        // A brand-new file is created at 0600 ourselves, atomically, so it's
-        // never briefly wide-open between SQLite's own create (whatever the
-        // umask leaves it) and a chmod. `AlreadyExists` means a prior run
-        // already owns the file (or a journal/WAL sidecar it left behind,
-        // possibly pre-dating this fix, or created under a looser umask):
-        // tighten the file and every sidecar SQLite may have left before
-        // anything reopens or migrates them.
-        use std::os::unix::fs::OpenOptionsExt;
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)
-        {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => tighten_existing_file_and_sidecars(path)?,
-            Err(e) => return Err(e.into()),
-        }
-        let conn = Connection::open(path)?;
+        let conn = open_private_connection(path)?;
         Self::from_connection(conn)
     }
 
