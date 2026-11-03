@@ -111,6 +111,11 @@ to 4096 bytes in the agent and again in the relay.
   other than newline and tab.
 - A restart policy other than `never` is refused at dispatch and by the agent: the agent reports the first
   exit and does not restart, so accepting the field would be a silent no-op.
+- Secrets: the service inherits the secret-channel exports of the guest's root login shell, as a plain job does;
+  that is how provider keys reach the harnesses (#592). The agent removes only `SANDY_SERVICE` and `TMUX`.
+  An env allowlist would drop the keys the harnesses need and the manifest's own `env` does not cross into the
+  guest (#527), so scoping which secret names reach the service is #592's job (the identity profile), and
+  `/run/sandy/secrets` stays 0700 root so the service reads env, never the files.
 - Not covered: the service's own peer channels. The agent's peer socket is a root-owned 0700 directory, so a
   service running as another user cannot use `SANDY_PEER_SOCKET`.
 - Not proven by a test in CI: that the guest's `setpriv`, `runuser` and PAM setup really drop to the account.
