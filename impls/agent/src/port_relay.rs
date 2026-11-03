@@ -51,12 +51,20 @@ pub fn parse_args(args: &[OsString]) -> Result<(u32, SocketAddr), String> {
     Ok((port, target))
 }
 
+/// The most host connections relayed at once.
+pub const MAX_CONNECTIONS: usize = 256;
+
 /// Accept connections on `acceptor` and relay each host connection to `target`. Runs until its task is dropped.
-///
-/// A peer that is not the host is closed at once and the target is never dialed for it, so a guest-local process
-/// on vsock loopback cannot use the relay. Each connection runs in its own task, so a long-lived one (a websocket)
-/// does not block the next.
-pub async fn serve<A>(mut acceptor: A, target: SocketAddr)
+pub async fn serve<A>(acceptor: A, target: SocketAddr)
+where
+    A: Acceptor + Send + 'static,
+    A::Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    serve_with_cap(acceptor, target, MAX_CONNECTIONS).await;
+}
+
+/// [`serve`] with an explicit cap on concurrent connections.
+pub async fn serve_with_cap<A>(mut acceptor: A, target: SocketAddr, _cap: usize)
 where
     A: Acceptor + Send + 'static,
     A::Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -68,12 +76,9 @@ where
             }
             Ok((stream, cid)) => {
                 drop(stream);
-                eprintln!(
-                    "sandy-agent: port-relay refused a connection from vsock cid {cid}; only the host may connect"
-                );
+                eprintln!("sandy-agent: port-relay refused a connection from vsock cid {cid}");
             }
             Err(e) => {
-                // EMFILE and friends are not a listener failure: stop serving and every tunnel dies with it.
                 eprintln!("sandy-agent: port-relay accept failed: {e}");
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
@@ -233,32 +238,37 @@ mod tests {
     }
 
     /// The "second environment cannot reach this port" row: a peer that is not the host is closed unanswered and
-    /// never causes a dial to the service. The host connection behind it is still served.
+    /// never causes a dial to the service, whichever non-host CID it reports (0, the loopback CID 1, a guest, the
+    /// maximum). The host connection behind each is still served, and the target saw exactly that one dial.
     #[tokio::test]
     async fn a_peer_that_is_not_the_host_is_closed_and_never_dials_the_target() -> anyhow::Result<()> {
         let (target, accepted) = echo_target().await?;
         let queue = Arc::new(Mutex::new(VecDeque::new()));
-        let mut intruder = connection(&queue, HOST_CID + 1)?;
+        let mut intruders = Vec::new();
+        for cid in [0, 1, HOST_CID + 1, u32::MAX] {
+            intruders.push(connection(&queue, cid)?);
+        }
         let relay = tokio::spawn(serve(Script(Arc::clone(&queue)), target));
 
-        let mut buf = [0u8; 1];
-        let closed = timeout(WAIT, intruder.read(&mut buf))
-            .await
-            .context("intruder read timed out")?;
-        assert!(
-            matches!(closed, Ok(0) | Err(_)),
-            "a non-host peer must be closed, got {closed:?}"
-        );
-        assert_eq!(
-            *accepted.lock().map_err(|_| anyhow::anyhow!("poisoned"))?,
-            0,
-            "no dial for a non-host peer"
-        );
-
+        for (i, intruder) in intruders.iter_mut().enumerate() {
+            let mut buf = [0u8; 1];
+            let closed = timeout(WAIT, intruder.read(&mut buf))
+                .await
+                .with_context(|| format!("intruder {i} read timed out"))?;
+            assert!(
+                matches!(closed, Ok(0) | Err(_)),
+                "a non-host peer must be closed, got {closed:?}"
+            );
+        }
         let mut host = connection(&queue, HOST_CID)?;
         assert!(
             echoes(&mut host, b"after").await?,
-            "the host is still served after a refusal"
+            "the host is still served after refusals"
+        );
+        assert_eq!(
+            *accepted.lock().map_err(|_| anyhow::anyhow!("poisoned"))?,
+            1,
+            "only the host connection may dial the target"
         );
         relay.abort();
         Ok(())
@@ -283,7 +293,8 @@ mod tests {
         Ok(())
     }
 
-    /// A service that is down closes that connection only; the relay keeps accepting.
+    /// A service that is down closes that connection only: the relay keeps accepting, and once the service is up
+    /// the next connection is served through the same relay.
     #[tokio::test]
     async fn an_unreachable_target_closes_only_that_connection() -> anyhow::Result<()> {
         let dead = {
@@ -291,18 +302,65 @@ mod tests {
             listener.local_addr()?
         };
         let queue = Arc::new(Mutex::new(VecDeque::new()));
-        let mut host = connection(&queue, HOST_CID)?;
+        let mut first = connection(&queue, HOST_CID)?;
         let relay = tokio::spawn(serve(Script(Arc::clone(&queue)), dead));
 
         let mut buf = [0u8; 1];
-        let closed = timeout(WAIT, host.read(&mut buf)).await.context("read timed out")?;
+        let closed = timeout(WAIT, first.read(&mut buf)).await.context("read timed out")?;
         assert!(
             matches!(closed, Ok(0) | Err(_)),
             "a dead target must close the connection, got {closed:?}"
         );
+
+        // The service comes up on the same port; a later connection works through the same relay.
+        let listener = TcpListener::bind(dead).await.context("rebind the target port")?;
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 64];
+                    while let Ok(n) = socket.read(&mut buf).await {
+                        if n == 0 || socket.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        let mut second = connection(&queue, HOST_CID)?;
         assert!(
-            !relay.is_finished(),
-            "the relay must keep serving after one failed dial"
+            echoes(&mut second, b"up").await?,
+            "the relay must serve after one failed dial"
+        );
+        relay.abort();
+        Ok(())
+    }
+
+    /// The cap bounds concurrent connections: with one allowed, a second host connection is closed unanswered while
+    /// the first is open, and is served once the first closes.
+    #[tokio::test]
+    async fn connections_beyond_the_cap_are_closed() -> anyhow::Result<()> {
+        let (target, _) = echo_target().await?;
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let mut first = connection(&queue, HOST_CID)?;
+        let relay = tokio::spawn(serve_with_cap(Script(Arc::clone(&queue)), target, 1));
+        assert!(echoes(&mut first, b"one").await?, "the first connection is served");
+
+        let mut second = connection(&queue, HOST_CID)?;
+        let mut buf = [0u8; 1];
+        let closed = timeout(WAIT, second.read(&mut buf))
+            .await
+            .context("over-cap read timed out")?;
+        assert!(
+            matches!(closed, Ok(0) | Err(_)),
+            "an over-cap connection must be closed, got {closed:?}"
+        );
+
+        drop(first);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut third = connection(&queue, HOST_CID)?;
+        assert!(
+            echoes(&mut third, b"three").await?,
+            "a slot freed by a closed connection is reusable"
         );
         relay.abort();
         Ok(())
@@ -327,6 +385,9 @@ mod tests {
             &["--vsock-port", "5100", "--to", "0.0.0.0:3773"][..],
             &["--vsock-port", "5100", "--to", "[::1]:3773"][..],
             &["--vsock-port", "5100", "--to", "127.0.0.1:0"][..],
+            &["--vsock-port", "5100", "--to", "127.0.0.2:3773"][..],
+            &["--vsock-port", "5100", "--to", "[::ffff:127.0.0.1]:3773"][..],
+            &["--to", "127.0.0.1:3773", "--vsock-port", "5100"][..],
             &["--vsock-port", "5100", "--to", "127.0.0.1:3773", "extra"][..],
         ] {
             assert!(parse_args(&args(bad)).is_err(), "{bad:?} must be refused");
