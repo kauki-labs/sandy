@@ -32,7 +32,7 @@ use tokio::{
 use crate::{
     agent::{
         ARCHIVE_TRANSCRIPT, AbortOnDrop, RESIZE_CONTROL, SERVICE_PROBE_FAILED, SERVICE_READY, TTY_STDERR, TTY_STDIN,
-        TTY_STDOUT, cut_probe_output, decode_resize,
+        TTY_STDOUT, cut_probe_output, decode_resize, sanitize_probe_output,
     },
     channel::{Channel, ChannelError, MembershipId},
 };
@@ -730,13 +730,20 @@ where
                 // One verdict per link (#589): a repeat is ignored, like a duplicate archive, so a reader that
                 // already acted on the first verdict never sees it flip, and the exit report survives.
                 if readiness_seen {
-                    tracing::warn!("duplicate service readiness frame ignored");
+                    // Debug, not warn: a guest that floods verdict frames must not flood the host's logs.
+                    tracing::debug!("duplicate service readiness frame ignored");
                     continue;
                 }
+                // Latched before the post: the first verdict is final even if its post is refused, so a refused
+                // `ProbeFailed` followed by a `Ready` cannot become `Ready`.
+                readiness_seen = true;
                 let (content_type, bytes) = match verdict {
-                    LinkFrame::ProbeFailed { output } => {
-                        (SERVICE_PROBE_FAILED, cut_probe_output(&output).as_bytes().to_vec())
-                    }
+                    LinkFrame::ProbeFailed { output } => (
+                        SERVICE_PROBE_FAILED,
+                        cut_probe_output(&sanitize_probe_output(cut_probe_output(&output)))
+                            .as_bytes()
+                            .to_vec(),
+                    ),
                     _ => (SERVICE_READY, Vec::new()),
                 };
                 // A refused post loses only the verdict; a backend fault still ends the relay (as for archive).
@@ -750,7 +757,7 @@ where
                     )
                     .await
                 {
-                    Ok(_) => readiness_seen = true,
+                    Ok(_) => {}
                     Err(e @ ChannelError::Backend(_)) => return Err(e.into()),
                     // Logged, not sent back: the agent counts every `Refused` frame as a refused peer post, and a
                     // lost verdict is not one (CodeRabbit on #622).
@@ -1206,6 +1213,42 @@ mod tests {
         .await?;
         assert_eq!(seen, vec![(SERVICE_PROBE_FAILED.to_owned(), b"refused".to_vec())]);
         Ok(())
+    }
+
+    /// #589 review: probe output is untrusted guest bytes that API clients and an LLM may read, so control
+    /// characters (ANSI escapes, C0, DEL, C1, a bare CR) are replaced before it is stored. Newline and tab stay.
+    #[tokio::test]
+    async fn the_relay_strips_control_characters_from_probe_output() -> anyhow::Result<()> {
+        let seen = raw_service_envelopes(vec![LinkFrame::ProbeFailed {
+            output: "ok\x1b[31mred\x1b[0m\u{9b}2J\0\r\x7f line1\n\tline2".to_owned(),
+        }])
+        .await?;
+        let text = String::from_utf8(seen.first().context("a probe-failed envelope")?.1.clone())?;
+        assert!(
+            text.chars().all(|c| !c.is_control() || c == '\n' || c == '\t'),
+            "control characters survived: {text:?}"
+        );
+        assert!(
+            text.contains("red") && text.contains("line1\n\tline2"),
+            "the readable text must survive: {text:?}"
+        );
+        Ok(())
+    }
+
+    /// `from_envelope` is capped and sanitized on its own too, so a reader never depends on who posted.
+    #[test]
+    fn from_envelope_caps_and_sanitizes_what_it_reads() {
+        use crate::agent::{MAX_PROBE_OUTPUT, SERVICE_PROBE_FAILED, ServiceReadiness};
+
+        let mut payload = b"\x1b[31mbad".to_vec();
+        payload.extend(std::iter::repeat_n(b'x', MAX_PROBE_OUTPUT * 4));
+        let Some(ServiceReadiness::ProbeFailed { output }) =
+            ServiceReadiness::from_envelope(SERVICE_PROBE_FAILED, &payload)
+        else {
+            panic!("expected ProbeFailed");
+        };
+        assert!(output.len() <= MAX_PROBE_OUTPUT * 3, "uncapped: {} bytes", output.len());
+        assert!(!output.contains('\u{1b}'), "{output:?}");
     }
 
     /// `from_envelope` reads only the two service content types.
