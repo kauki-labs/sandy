@@ -1,8 +1,9 @@
 # Broker runbook: run sandyd, the broker and sandy-mcp together
 
 Status: the wiring below is proven by `scripts/dev/broker-smoke.sh` against the real
-binaries. An environment stays `provisioning` until a launch backend makes it `ready`
-(#587 slice C). Design: [`../../decisions/broker-api.md`](../../decisions/broker-api.md).
+binaries. An environment stays `provisioning` until a launch backend makes it `ready`: the
+opt-in process backend does that today (see "Run an environment end to end"), the VM backend
+is #587 slice C. Design: [`../../decisions/broker-api.md`](../../decisions/broker-api.md).
 Contract: [`../../api/broker.openapi.yaml`](../../api/broker.openapi.yaml).
 
 ## What runs
@@ -74,12 +75,31 @@ broker and stores jobs and environments.
 
 7. Check the wiring without a client: `scripts/dev/broker-smoke.sh` starts its own sandyd
    and broker in a temp directory, spawns an environment, retries it, reads it back and
-   deletes it.
+   deletes it. `BROKER_SMOKE_READY=1` adds the process backend and checks the full path.
+
+## Run an environment end to end
+
+`SANDY_ENV_BACKEND=process-insecure` makes sandyd run each environment's service as a host
+process. It has no isolation and nothing yet limits it to trusted clients (#641): use it on a
+dev machine with a clients file you trust. Set the
+variables on sandyd (names and meanings in `crates/sandyd/src/environment_backend.rs`):
+
+```bash
+SANDY_ENV_BACKEND=process-insecure \
+SANDY_ENV_PROCESS_COMMAND='t3 serve --port {port} --base-dir {base_dir}' \
+SANDY_ENV_STATE_DIR=/path/environments \
+SANDY_SOCK=/path/sandyd.sock SANDY_DB=/path/sandyd.db sandyd
+```
+
+A spawn then moves `provisioning` to `ready`, and `GET /v1/environments/{id}` shows `connection.url`. Delete
+stops the process on the driver's next tick (about a second).
+`BROKER_SMOKE_READY=1 scripts/dev/broker-smoke.sh` runs this with a stand-in HTTP service
+(it needs `python3`).
 
 ## What does not work yet
 
-- No environment becomes `ready` until a launch backend exists (#587 slice C). Today a
-  spawn stays `provisioning` and `connection` is absent.
+- Without `SANDY_ENV_BACKEND` a spawn stays `provisioning` and `connection` is absent. The
+  isolated VM backend is #587 slice C.
 - `link` returns `unsupported` until T3 offers an external link interface.
 - No TLS or remote callers. mTLS client auth is an owner decision (#607).
 - A create whose reply times out and is never retried leaves an environment with no owner
