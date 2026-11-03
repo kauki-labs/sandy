@@ -47,13 +47,17 @@ claude=$(ls -d /nix/store/*-claude-code-*/bin/claude 2>/dev/null | head -1)
 codex=$(ls -d /nix/store/*-codex-*/bin/codex 2>/dev/null | head -1)
 mkdir -p /tmp/h/c /tmp/h/x
 echo "SK> env: HTTPS_PROXY=${HTTPS_PROXY:-unset}"
+# No NIC: the only way out is the proxy relay, which is what makes a provider reply a proof of the proxy.
+echo "SK> netdevs: $(ls /sys/class/net | tr '\n' ' ')"
 echo "SK> binaries: claude=${claude:+yes} codex=${codex:+yes}"
 echo "SK> curl-allowed: $(timeout 30 curl -sS -o /dev/null -w '%{http_code}' https://api.anthropic.com/ 2>&1 | tail -c 200)"
 echo "SK> curl-denied: $(timeout 30 curl -sS -o /dev/null -w '%{http_code}' https://example.org/ 2>&1 | tail -c 200)"
 echo "SK> claude-allowed: $(cd /tmp && HOME=/tmp/h CLAUDE_CONFIG_DIR=/tmp/h/c ANTHROPIC_API_KEY=sk-ant-fake timeout 60 "$claude" -p hi 2>&1 | tail -c 300 | tr '\n' ' ')"
 echo "SK> codex-allowed: $(cd /tmp && HOME=/tmp/h CODEX_HOME=/tmp/h/x OPENAI_API_KEY=sk-fake timeout 60 "$codex" exec --skip-git-repo-check hi 2>&1 | tail -c 300 | tr '\n' ' ')"
-echo "SK> claude-denied: $(cd /tmp && HOME=/tmp/h CLAUDE_CONFIG_DIR=/tmp/h/c ANTHROPIC_API_KEY=sk-ant-fake ANTHROPIC_BASE_URL=https://example.org timeout 60 "$claude" -p hi 2>&1 | tail -c 300 | tr '\n' ' ')"
-echo "SK> done"
+(cd /tmp && HOME=/tmp/h CLAUDE_CONFIG_DIR=/tmp/h/c ANTHROPIC_API_KEY=sk-ant-fake ANTHROPIC_BASE_URL=https://example.org timeout 60 "$claude" -p hi >/tmp/denied.log 2>&1)
+denied_rc=$?
+echo "SK> claude-denied: rc=$denied_rc $(tail -c 300 /tmp/denied.log | tr '\n' ' ')"
+echo "SK> done: yes"
 GUEST
 
 echo "== building sandy and the egress proxy"
@@ -99,14 +103,21 @@ def check(ok, what):
     if not ok:
         failures.append(what)
 
+expected = ["env", "netdevs", "binaries", "curl-allowed", "curl-denied", "claude-allowed", "codex-allowed", "claude-denied", "done"]
+check(all(k in lines for k in expected), "the guest output is incomplete: " + ", ".join(k for k in expected if k not in lines))
+check(lines.get("netdevs", "").split() == ["lo"], "the guest has a network device besides lo, so a provider reply proves nothing about the proxy")
 check(lines.get("env") == "HTTPS_PROXY=http://127.0.0.1:3128", "the job env does not carry the proxy")
 check(lines.get("binaries") == "claude=yes codex=yes", "claude or codex is missing from the image")
 check(re.fullmatch(r"[1-5]\d\d", lines.get("curl-allowed", "")), "curl did not reach an allow-listed host")
 check("response 403" in lines.get("curl-denied", ""), "a host off the allow-list was not refused with 403")
 check("Invalid API key" in lines.get("claude-allowed", ""), "claude did not reach its provider through the proxy")
-check("401" in lines.get("codex-allowed", "") and "api.openai.com" in lines.get("codex-allowed", ""),
+check(re.search(r"\b401 Unauthorized\b", lines.get("codex-allowed", "")) and "api.openai.com" in lines.get("codex-allowed", ""),
       "codex did not reach its provider through the proxy")
-check("Invalid API key" not in lines.get("claude-denied", ""), "claude reached a host off the allow-list")
+# The 403 itself is shown by curl-denied. claude must not succeed against a host off the allow-list: a clean exit or
+# the provider's reply means the request got through.
+denied = lines.get("claude-denied", "")
+check(denied.startswith("rc=") and not denied.startswith("rc=0 ") and "Invalid API key" not in denied,
+      "claude got a reply from a host off the allow-list")
 for what in failures:
     print("FAIL:", what, file=sys.stderr)
 sys.exit(1 if failures else 0)
