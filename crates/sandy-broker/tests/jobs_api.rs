@@ -40,12 +40,14 @@ async fn fixture() -> Result<Fixture> {
     let registry = Arc::new(JobRegistry::new()?);
     let hosts = Arc::new(HostRegistry::default());
     let listener = UnixListener::bind(&socket)?;
-    let (s, r, h) = (Arc::clone(&store), registry, hosts);
+    let environments = Arc::new(sandyd::environment_store::EnvironmentStore::open_in_memory()?);
+    let (s, e, r, h) = (Arc::clone(&store), environments, registry, hosts);
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             tokio::spawn(sandyd::serve_connection(
                 stream,
                 Arc::clone(&s),
+                Arc::clone(&e),
                 Arc::clone(&r),
                 Arc::clone(&h),
                 None,
