@@ -30,6 +30,7 @@ acceptance matrix, [`../architecture/kpi.md`](../architecture/kpi.md).
 | [journal](journal.md)                             | durable records, reconcile                 |
 | [agent-fabric](agent-fabric.md)                   | fabric seam contracts + test harness       |
 | [sandyd](sandyd.md)                               | control RPC, daemon, job manifest, state   |
+| [broker-api](broker-api.md)                       | HTTP API tier over sandyd                  |
 
 Invariants referenced across these records: **INV-1** secrets never reach
 argv/env/the store; **INV-3** liveness only through `VmBackend::boxes` + the job

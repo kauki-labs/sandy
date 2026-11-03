@@ -1,0 +1,45 @@
+[package]
+name = "sandy-broker"
+description = "The broker HTTP API tier over sandyd: bearer-token clients, per-client job ownership, the job endpoints of docs/api/broker.openapi.yaml (#591)"
+version = "0.1.0"
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+base64.workspace = true
+clap.workspace = true
+hex.workspace = true
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+prost.workspace = true
+sandy-control-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = [
+  "net",
+  "io-util",
+  "rt",
+  "macros",
+  "signal",
+] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+sandyd = { path = "../sandyd" }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net"] }
