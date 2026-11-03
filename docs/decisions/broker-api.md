@@ -124,7 +124,9 @@ user's files. Tracked in a follow-up issue.
   environment, and an unknown one, both give `not_found` on every route, and list shows only
   the caller's.
 - Per-client quota: `max_environments` in the clients file (default 4) counts the client's
-  non-terminal environments. A replay of a request id the client already used skips the check.
+  non-terminal environments. A replay of a request id the client already used skips the check only while sandyd still
+  holds that environment: the broker asks sandyd (`GetEnvironment`), and if retention has
+  collected it (`NOT_FOUND`) the replay would create a new environment, so both checks run.
   Creates of one client run one at a time, so the check and the create cannot race, and one
   client cannot hold up another.
 - sandyd's `EnvironmentError` codes map to fixed messages: `NOT_FOUND` 404 `not_found`,

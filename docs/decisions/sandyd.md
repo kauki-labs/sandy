@@ -2076,8 +2076,8 @@ meaning for an environment is undefined (a job's archive is a transcript), so it
 - A `delete` while a launch is in flight makes the driver's late `mark_ready` return `Refused(Deleted)`. The driver
   must treat that as "tear the box down", not as an ignorable refusal.
 - A failed resume (`Stopped` to `Provisioning` to `Failed`) leaves a once-good environment with only `delete` left.
-- Deleted rows stay for replay, and the row cap counts them, so once the table holds `max` rows every new create is
-  refused until rows are cleared. Slice A has no purge; retention is tracked as a follow-up.
+- Deleted rows stay for replay until retention collects them (decision 27, #633). The row cap counts only rows that
+  are not `Deleted`, so create and delete churn cannot fill it.
 - A row with an unreadable state fails every read of that row, `delete` of it and `list` as a whole, and no other
   `get`. It is surfaced, not skipped, so a corrupt row is noticed.
 - `create` and every move run in one `IMMEDIATE` transaction on their own connection, so two processes sharing the
@@ -2122,7 +2122,8 @@ conflict. An unfiltered `ListEnvironments` leaves out `Deleted` rows (ask for st
 
 **Paging (#633).** `ListEnvironments` returns one page. The request carries `page_size` (0 means 100, above 500 is 500) and `page_token`; the reply carries `next_page_token`, empty on the last page. Rows are ordered by
 `environment_id` (unique and immutable, so a cursor survives the delete or gc of its own row), and the token is the
-id of the page's last row, which a client passes back unchanged. A malformed token is `INVALID_ARGUMENT`. A page also
+id of the last row scanned (it advances past rows a `task_ref` filter skipped), which a client passes back
+unchanged. A malformed token is `INVALID_ARGUMENT`. A page also
 stops when its encoded rows reach 512 KiB, half the 1 MiB control frame, so a page always fits a frame whatever the
 row sizes. The old refusal of a reply of more than 1000 rows is gone. The three new fields are additive proto3
 fields, so an older client keeps working but sees only the first page; the broker follows pages (broker-api
@@ -2135,13 +2136,18 @@ so a retry of its `idempotency_key` finds the same environment. It is not kept f
   removed, and its key may be used again: a replay after that creates a new environment with a new id. A client that
   retries a create longer than a day after its delete gets a new environment, not the deleted one.
 - At most `SANDY_MAX_DELETED_ENVIRONMENTS` (default 10000, minimum 1) `Deleted` rows are kept; the oldest delete
-  goes first, even inside the window, so one caller cannot grow the table without bound by churn.
+  goes first (by `updated_at`, which has one-second resolution; ties go in creation order), even inside the window, so one caller cannot grow the table without bound by churn.
 - Age is the row's `updated_at`, which a `Deleted` row writes once, at the delete. No new column.
 - The sweep runs once at startup and then every 60 seconds, in its own task that does not depend on
   `SANDY_ENV_BACKEND`. The clock is injected, so tests do not sleep.
 - `SANDY_MAX_ENVIRONMENTS` counts only rows that are not `Deleted`, so create and delete churn can no longer fill
   it. A `Failed` row still counts until it is deleted. That is a residual: a caller that makes failing creates
   and never deletes them can still fill the cap, and the broker's per-client record cap bounds that.
+
+Upgrade sandyd and the broker together: a broker that predates paging ignores `next_page_token`, sees only the first
+100 rows and undercounts a client's quota. Set `SANDY_MAX_ENVIRONMENTS` at or below 10000, because the broker's scan
+ceiling counts rows before its ownership filter, and `Failed` rows count toward the cap (each client can hold up to
+`max_environment_records` of them).
 
 The window and the cap are one decision to ratify on #607 (default 1 day, 10000).
 
