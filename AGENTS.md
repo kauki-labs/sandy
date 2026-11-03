@@ -141,7 +141,7 @@ may relay one, but a relay is not authority.
 
 Before coding, understand the surrounding context and existing patterns; for multi-step
 features, plan first. Match the check to the change rather than running the full gate every
-time (the reasoning lives in the `rust-engineer` skill). Concrete commands:
+time (the reasoning lives in the `swe:rust` skill). Concrete commands:
 
 | Change                             | Checks                                                                                                      |
 | ---------------------------------- | ----------------------------------------------------------------------------------------------------------- |
@@ -152,7 +152,7 @@ time (the reasoning lives in the `rust-engineer` skill). Concrete commands:
 | Before opening a PR                | `nix fmt`, then `nix flake check -L` (full gate: build, clippy with deny-warnings, docs, tests, formatting) |
 | Before a PR, on the macOS host     | `scripts/dev/linux-gate.sh` (see below) — your local gate only built `aarch64-darwin`                       |
 
-A change that creates a feature or modifies an existing one goes through `swe-process:implement`;
+A change that creates a feature or modifies an existing one goes through `swe-workflows:implement`;
 its quality-pass step is the change-specific row in the checks table above. The "Before opening a PR"
 row is the full gate.
 
