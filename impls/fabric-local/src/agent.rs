@@ -73,6 +73,41 @@ pub const RESIZE_CONTROL: &str = "application/vnd.sandy.resize";
 /// `content_type` is forwarded under on an Output envelope — distinguishes
 /// it from any other `MessageType::Output` traffic sharing the channel.
 pub const ARCHIVE_TRANSCRIPT: &str = "application/vnd.sandy.archive";
+/// `content_type` of the `Output` envelope a [`crate::link::LinkFrame::Ready`] becomes on the orchestrator
+/// channel (#589). Empty payload.
+pub const SERVICE_READY: &str = "application/vnd.sandy.service.ready";
+/// `content_type` of the `Output` envelope a [`crate::link::LinkFrame::ProbeFailed`] becomes (#589). Payload:
+/// the last probe attempt's output, UTF-8, at most [`MAX_PROBE_OUTPUT`] bytes.
+pub const SERVICE_PROBE_FAILED: &str = "application/vnd.sandy.service.probe-failed";
+/// The most probe output bytes the relay keeps.
+pub const MAX_PROBE_OUTPUT: usize = 4096;
+
+/// A service's readiness verdict, as a host-side reader of the job's channel sees it (#589).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceReadiness {
+    /// The health probe passed.
+    Ready,
+    /// The probe failed `max_attempts` times in a row; `output` is the last attempt's output.
+    ProbeFailed {
+        /// The last attempt's output or connect error.
+        output: String,
+    },
+}
+
+impl ServiceReadiness {
+    /// Reads a channel envelope's `content_type` and payload as a verdict. `None` for any other envelope. A
+    /// non-UTF-8 failure payload is decoded lossily.
+    #[must_use]
+    pub fn from_envelope(content_type: &str, payload: &[u8]) -> Option<Self> {
+        match content_type {
+            SERVICE_READY => Some(Self::Ready),
+            SERVICE_PROBE_FAILED => Some(Self::ProbeFailed {
+                output: String::from_utf8_lossy(payload).into_owned(),
+            }),
+            _ => None,
+        }
+    }
+}
 
 /// Encode a resize as [`RESIZE_CONTROL`]'s 4-byte payload.
 #[must_use]
@@ -667,6 +702,25 @@ impl LinkAgent {
     /// [`AgentError::Link`] if the frame cannot be written.
     pub async fn report_exit(&self, code: i32) -> Result<(), AgentError> {
         Ok(write_frame(&mut *self.port.writer.lock().await, &LinkFrame::Exit { code }).await?)
+    }
+
+    /// Report that the service's health probe passed (#589). Send at most once, before the exit.
+    ///
+    /// # Errors
+    /// [`AgentError::Link`] if the frame cannot be written.
+    pub async fn report_ready(&self) -> Result<(), AgentError> {
+        Ok(write_frame(&mut *self.port.writer.lock().await, &LinkFrame::Ready).await?)
+    }
+
+    /// Report that the probe failed for good (#589), with the last attempt's `output`. The relay keeps at most
+    /// [`MAX_PROBE_OUTPUT`] bytes of it (cut at a character boundary), whatever the agent sends. Send at most
+    /// once, before the exit.
+    ///
+    /// # Errors
+    /// [`AgentError::Link`] if the frame cannot be written.
+    pub async fn report_probe_failed(&self, output: &str) -> Result<(), AgentError> {
+        let output = output.to_owned();
+        Ok(write_frame(&mut *self.port.writer.lock().await, &LinkFrame::ProbeFailed { output }).await?)
     }
 }
 

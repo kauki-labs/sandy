@@ -30,7 +30,10 @@ use tokio::{
 };
 
 use crate::{
-    agent::{ARCHIVE_TRANSCRIPT, AbortOnDrop, RESIZE_CONTROL, TTY_STDERR, TTY_STDIN, TTY_STDOUT, decode_resize},
+    agent::{
+        ARCHIVE_TRANSCRIPT, AbortOnDrop, MAX_PROBE_OUTPUT, RESIZE_CONTROL, SERVICE_PROBE_FAILED, SERVICE_READY,
+        TTY_STDERR, TTY_STDIN, TTY_STDOUT, decode_resize,
+    },
     channel::{Channel, ChannelError, MembershipId},
 };
 
@@ -137,6 +140,14 @@ pub enum LinkFrame {
         /// The hex of the bytes.
         payload: String,
     },
+    /// Agent to relay (#589): the service's health probe passed. At most one readiness verdict (this or
+    /// `ProbeFailed`) per link, before `Exit`.
+    Ready,
+    /// Agent to relay (#589): the service's probe failed `max_attempts` times in a row.
+    ProbeFailed {
+        /// The last attempt's output or connect error.
+        output: String,
+    },
 }
 
 impl LinkFrame {
@@ -153,6 +164,8 @@ impl LinkFrame {
             Self::Exit { .. } => "exit",
             Self::Resize { .. } => "resize",
             Self::Archive { .. } => "archive",
+            Self::Ready => "ready",
+            Self::ProbeFailed { .. } => "probe_failed",
         }
     }
 }
@@ -180,8 +193,22 @@ impl std::fmt::Debug for LinkFrame {
                 payload.len() / 2
             ),
             Self::Resize { cols, rows } => write!(f, "LinkFrame::Resize({cols}x{rows})"),
+            Self::Ready => write!(f, "LinkFrame::Ready"),
+            Self::ProbeFailed { output } => write!(f, "LinkFrame::ProbeFailed({} bytes)", output.len()),
         }
     }
+}
+
+/// A probe failure's output as the bytes the relay keeps: at most `MAX_PROBE_OUTPUT`, cut at a character boundary.
+fn cut_probe_output(mut output: String) -> Vec<u8> {
+    if output.len() > MAX_PROBE_OUTPUT {
+        let cut = (0..=MAX_PROBE_OUTPUT)
+            .rev()
+            .find(|&i| output.is_char_boundary(i))
+            .unwrap_or(0);
+        output.truncate(cut);
+    }
+    output.into_bytes()
 }
 
 /// `skip_serializing_if` helper: the first-frame-only `peers` count is omitted
@@ -589,6 +616,7 @@ where
 
     let mut exit = None;
     let mut archive_seen = false;
+    let mut readiness_seen = false;
     loop {
         match read_frame(rd).await? {
             None => return Ok(exit),
@@ -700,6 +728,37 @@ where
                     Err(e @ ChannelError::Backend(_)) => return Err(e.into()),
                     Err(e) => {
                         let reason = format!("the archive was refused: {e}");
+                        tracing::warn!("{reason}");
+                        refusals.push(reason);
+                    }
+                }
+            }
+            Some(verdict @ (LinkFrame::Ready | LinkFrame::ProbeFailed { .. })) => {
+                // One verdict per link (#589): a repeat is ignored, like a duplicate archive, so a reader that
+                // already acted on the first verdict never sees it flip, and the exit report survives.
+                if readiness_seen {
+                    tracing::warn!("duplicate service readiness frame ignored");
+                    continue;
+                }
+                let (content_type, bytes) = match verdict {
+                    LinkFrame::ProbeFailed { output } => (SERVICE_PROBE_FAILED, cut_probe_output(output)),
+                    _ => (SERVICE_READY, Vec::new()),
+                };
+                // A refused post loses only the verdict; a backend fault still ends the relay (as for archive).
+                match membership
+                    .channel
+                    .post(
+                        &membership.id,
+                        Some(MessageType::Output(Output {})),
+                        content_type,
+                        bytes,
+                    )
+                    .await
+                {
+                    Ok(_) => readiness_seen = true,
+                    Err(e @ ChannelError::Backend(_)) => return Err(e.into()),
+                    Err(e) => {
+                        let reason = format!("the service readiness verdict was refused: {e}");
                         tracing::warn!("{reason}");
                         refusals.push(reason);
                     }
@@ -935,6 +994,118 @@ mod tests {
         drop(agent);
         timeout(WAIT, relay).await???;
         Ok(())
+    }
+
+    /// Runs a relay, has the agent send `frames` through `send`, then exit 0, and returns the `Output` envelopes
+    /// the orchestrator channel saw, plus the relay's result.
+    async fn service_envelopes(
+        send: impl AsyncFnOnce(&LinkAgent) -> Result<(), AgentError>,
+    ) -> anyhow::Result<(Vec<(String, Vec<u8>)>, Result<Option<i32>, LinkError>)> {
+        let (channel, agent_cap, orchestrator_cap) = channel_and_caps().await?;
+        let orchestrator = channel.join(&orchestrator_cap)?;
+        let mut observed = std::pin::pin!(channel.subscribe(&orchestrator)?);
+        let (agent_end, host_end) = tokio::io::duplex(64 * 1024);
+        let relay = tokio::spawn({
+            let channel = Arc::clone(&channel);
+            async move { serve_agent_link(channel, &agent_cap, host_end).await }
+        });
+        let agent = timeout(WAIT, LinkAgent::bootstrap(agent_end)).await??;
+        send(&agent).await?;
+        agent.report_exit(0).await?;
+        drop(agent); // the relay ends when the agent closes the link
+        let result = timeout(WAIT, relay).await??;
+        let mut seen = Vec::new();
+        while let Ok(Some(item)) = timeout(Duration::from_millis(100), observed.next()).await {
+            let env = item?;
+            if matches!(env.message_type, Some(MessageType::Output(_))) {
+                seen.push((env.content_type, env.payload));
+            }
+        }
+        Ok((seen, result))
+    }
+
+    /// #589: `report_ready` reaches the orchestrator channel as one `SERVICE_READY` envelope, and
+    /// `ServiceReadiness::from_envelope` reads it back.
+    #[tokio::test]
+    async fn a_ready_frame_reaches_the_channel_as_a_service_ready_envelope() -> anyhow::Result<()> {
+        use crate::agent::{SERVICE_READY, ServiceReadiness};
+
+        let (seen, result) = service_envelopes(async |agent| agent.report_ready().await).await?;
+        assert_eq!(result?, Some(0));
+        assert_eq!(seen, vec![(SERVICE_READY.to_owned(), Vec::new())]);
+        assert_eq!(
+            ServiceReadiness::from_envelope(&seen[0].0, &seen[0].1),
+            Some(ServiceReadiness::Ready)
+        );
+        Ok(())
+    }
+
+    /// #589: a failed probe carries its output to the channel and back through `from_envelope`.
+    #[tokio::test]
+    async fn a_probe_failed_frame_carries_its_output() -> anyhow::Result<()> {
+        use crate::agent::{SERVICE_PROBE_FAILED, ServiceReadiness};
+
+        let (seen, result) =
+            service_envelopes(async |agent| agent.report_probe_failed("connection refused").await).await?;
+        assert_eq!(result?, Some(0));
+        assert_eq!(
+            seen,
+            vec![(SERVICE_PROBE_FAILED.to_owned(), b"connection refused".to_vec())]
+        );
+        assert_eq!(
+            ServiceReadiness::from_envelope(&seen[0].0, &seen[0].1),
+            Some(ServiceReadiness::ProbeFailed {
+                output: "connection refused".to_owned()
+            })
+        );
+        Ok(())
+    }
+
+    /// Adversarial (#589): the relay never trusts the agent's output size. 10 000 bytes of two-byte characters
+    /// is cut to at most `MAX_PROBE_OUTPUT` bytes, still valid UTF-8.
+    #[tokio::test]
+    async fn an_oversized_probe_output_is_cut_at_a_character_boundary() -> anyhow::Result<()> {
+        use crate::agent::MAX_PROBE_OUTPUT;
+
+        let huge = "é".repeat(5_000);
+        let (seen, result) = service_envelopes(async |agent| agent.report_probe_failed(&huge).await).await?;
+        assert_eq!(result?, Some(0));
+        let payload = &seen.first().context("a probe-failed envelope")?.1;
+        assert!(payload.len() <= MAX_PROBE_OUTPUT, "kept {} bytes", payload.len());
+        assert!(
+            payload.len() > MAX_PROBE_OUTPUT - 2,
+            "cut too early: {} bytes",
+            payload.len()
+        );
+        std::str::from_utf8(payload).context("the kept output is valid UTF-8")?;
+        Ok(())
+    }
+
+    /// Adversarial (#589): one readiness verdict per link. A second `Ready`, or a `ProbeFailed` after `Ready`,
+    /// is ignored with a log: it must not flip a verdict a reader already acted on, and must not cost the exit
+    /// report.
+    #[tokio::test]
+    async fn only_the_first_readiness_verdict_is_kept() -> anyhow::Result<()> {
+        use crate::agent::SERVICE_READY;
+
+        let (seen, result) = service_envelopes(async |agent| {
+            agent.report_ready().await?;
+            agent.report_ready().await?;
+            agent.report_probe_failed("late").await
+        })
+        .await?;
+        assert_eq!(result?, Some(0), "the exit report survives the extra verdicts");
+        assert_eq!(seen, vec![(SERVICE_READY.to_owned(), Vec::new())]);
+        Ok(())
+    }
+
+    /// `from_envelope` reads only the two service content types.
+    #[test]
+    fn from_envelope_ignores_other_content_types() {
+        use crate::agent::{ARCHIVE_TRANSCRIPT, ServiceReadiness};
+
+        assert_eq!(ServiceReadiness::from_envelope(ARCHIVE_TRANSCRIPT, b"x"), None);
+        assert_eq!(ServiceReadiness::from_envelope("", b""), None);
     }
 
     /// CodeRabbit on #345: `send_archive` must not be able to hang forever
