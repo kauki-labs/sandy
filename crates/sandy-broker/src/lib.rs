@@ -3,15 +3,16 @@
 //! Serves the job endpoints of `docs/api/broker.openapi.yaml` to bearer-token
 //! clients and speaks the control RPC to one sandyd over a UDS.
 
-use std::{convert::Infallible, net::SocketAddr, path::PathBuf};
+mod auth;
+mod owners;
+mod paths;
+mod server;
 
-use http_body_util::Full;
-use hyper::{
-    Request, Response, StatusCode,
-    body::{Bytes, Incoming},
-    service::service_fn,
-};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+
+use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
+pub use owners::OwnersError;
 use tokio::net::TcpListener;
 
 /// The isolation class a client may request, lowest first.
@@ -51,12 +52,19 @@ pub struct BrokerConfig {
     pub clients: Vec<Client>,
 }
 
-/// A running broker.
+/// A running broker. Dropping it stops the listener.
 #[derive(Debug)]
 pub struct Running {
     /// The bound address.
     pub addr: SocketAddr,
     task: tokio::task::JoinHandle<()>,
+}
+
+impl Running {
+    /// Waits for the listener task, which only ends if it is aborted.
+    pub async fn wait(&mut self) {
+        let _ = (&mut self.task).await;
+    }
 }
 
 impl Drop for Running {
@@ -82,40 +90,49 @@ pub enum BrokerError {
         /// The OS error.
         source: std::io::Error,
     },
+    /// The owner table could not be opened.
+    #[error(transparent)]
+    Owners(#[from] OwnersError),
 }
 
 /// Binds the listener and serves until the returned [`Running`] drops.
 ///
 /// # Errors
-/// Returns [`BrokerError::Bind`] when the address cannot be bound.
+/// [`BrokerError::NonLoopback`] for a non-loopback address, [`BrokerError::Bind`]
+/// when the address cannot be bound, [`BrokerError::Owners`] when the state
+/// directory is unsafe or its table is unreadable.
 pub async fn serve(config: BrokerConfig) -> Result<Running, BrokerError> {
-    let listener = TcpListener::bind(config.bind)
-        .await
-        .map_err(|source| BrokerError::Bind {
-            addr: config.bind,
-            source,
-        })?;
-    let addr = listener.local_addr().map_err(|source| BrokerError::Bind {
+    if !config.bind.ip().is_loopback() {
+        return Err(BrokerError::NonLoopback { addr: config.bind });
+    }
+    let state = Arc::new(server::State {
+        owners: owners::Owners::open(&config.state_dir)?,
+        control_socket: config.control_socket,
+        clients: config.clients,
+    });
+    let bind_err = |source| BrokerError::Bind {
         addr: config.bind,
         source,
-    })?;
+    };
+    let listener = TcpListener::bind(config.bind).await.map_err(bind_err)?;
+    let addr = listener.local_addr().map_err(bind_err)?;
     let task = tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 continue;
             };
+            let state = Arc::clone(&state);
             tokio::spawn(async move {
-                let service = service_fn(|_req: Request<Incoming>| async {
-                    Ok::<_, Infallible>(
-                        Response::builder()
-                            .status(StatusCode::NOT_IMPLEMENTED)
-                            .body(Full::new(Bytes::new()))
-                            .unwrap_or_default(),
-                    )
+                let service = service_fn(move |req| {
+                    let state = Arc::clone(&state);
+                    async move { Ok::<_, std::convert::Infallible>(server::handle(state, req).await) }
                 });
-                let _ = hyper::server::conn::http1::Builder::new()
+                if let Err(e) = hyper::server::conn::http1::Builder::new()
                     .serve_connection(TokioIo::new(stream), service)
-                    .await;
+                    .await
+                {
+                    tracing::debug!(error = %e, "connection ended with an error");
+                }
             });
         }
     });

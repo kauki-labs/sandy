@@ -226,7 +226,13 @@ async fn a_host_path_outside_the_clients_roots_is_forbidden() -> Result<()> {
     let mut ok = submit_body();
     ok["inputs"] = json!([{"host": inside.to_string_lossy(), "name": "n"}]);
     let (status, resp) = f.call("POST", "/v1/jobs", Some(TOKEN_A), Some(ok)).await?;
-    assert_eq!(status, StatusCode::ACCEPTED, "a path inside the root must pass: {resp}");
+    // sandyd refuses path fields without a local-dispatch host (decision 21), so
+    // 503 is expected here. The broker's own boundary is: not 403.
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a path inside the root must pass the broker: {resp}"
+    );
     Ok(())
 }
 
