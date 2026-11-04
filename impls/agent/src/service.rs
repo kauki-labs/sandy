@@ -230,6 +230,34 @@ async fn probe_loop(probe: &HealthProbe, second: Duration) -> ProbeVerdict {
     probe_loop_as(probe, second, None).await
 }
 
+/// The argv (after the program) of the sibling `port-relay` process that bridges the host to a service on guest
+/// loopback `port` (#590): the agreed vsock port, and the service's loopback address as the only target.
+#[must_use]
+pub fn port_relay_argv(port: u16) -> Vec<std::ffi::OsString> {
+    vec![
+        "port-relay".into(),
+        "--vsock-port".into(),
+        sandy_api::agent::PORT_RELAY_VSOCK_PORT.to_string().into(),
+        "--to".into(),
+        format!("127.0.0.1:{port}").into(),
+    ]
+}
+
+/// Start the guest half of the host bridge for a service that declares a `port` (#589, #590). The relay is a
+/// child of the agent, so it stops with the agent; it runs as the agent's user (root) because it binds vsock.
+/// It parses nothing and admits only the host (see `port_relay`).
+///
+/// # Errors
+/// The agent's own binary cannot be found or started.
+pub fn spawn_port_relay(port: u16) -> Result<tokio::process::Child, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("locating the agent binary for the port relay: {e}"))?;
+    Command::new(exe)
+        .args(port_relay_argv(port))
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("starting the port relay for service port {port}: {e}"))
+}
+
 /// One attempt of `check`, bounded by `timeout`. `Err` carries the failure's output.
 async fn attempt(check: &ProbeCheck, timeout: Duration, user: Option<&str>) -> Result<(), String> {
     match check {
@@ -354,6 +382,18 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
+
+    /// #589/#590: the relay argv a service's `port` produces is exactly what `port-relay` accepts, aimed at the
+    /// agreed vsock port and the service's own loopback port, and nothing else.
+    #[test]
+    fn the_port_relay_argv_parses_to_the_agreed_vsock_port_and_the_service_port() -> anyhow::Result<()> {
+        let argv = port_relay_argv(3773);
+        assert_eq!(argv.first().and_then(|a| a.to_str()), Some("port-relay"));
+        let (vsock, target) = crate::port_relay::parse_args(&argv[1..]).map_err(anyhow::Error::msg)?;
+        assert_eq!(vsock, sandy_api::agent::PORT_RELAY_VSOCK_PORT);
+        assert_eq!(target, "127.0.0.1:3773".parse()?);
+        Ok(())
+    }
 
     /// 100 ms per manifest second: slow enough that a spawn fits in one timeout, fast enough for a test.
     const TICK: Duration = Duration::from_millis(100);
@@ -631,7 +671,13 @@ mod tests {
         let marker = dir.path().join("late");
         let script = format!("(sleep 0.6; echo late > {}) & exit 0", marker.display());
         let started = tokio::time::Instant::now();
-        let verdict = probe_loop(&probe(command(&["sh", "-c", &script]), 1), TICK).await;
+        // A 4-tick timeout (0.4 s) leaves the shell room to start under parallel test load, yet stays below the
+        // background child's 0.6 s: a probe that waited for the pipes would still time out here.
+        let slow_to_start = HealthProbe {
+            timeout_secs: 4,
+            ..probe(command(&["sh", "-c", &script]), 1)
+        };
+        let verdict = probe_loop(&slow_to_start, TICK).await;
         assert_eq!(verdict, ProbeVerdict::Ready);
         assert!(
             started.elapsed() < TICK * 8,
