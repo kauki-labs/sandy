@@ -69,7 +69,8 @@ fn qemu_pids() -> anyhow::Result<BTreeSet<u32>> {
             continue;
         };
         if let Ok(comm) = std::fs::read_to_string(entry.path().join("comm"))
-            && comm.trim().starts_with("qemu")
+            // The nix-wrapped binary reports `.qemu-system-x8`.
+            && comm.trim().trim_start_matches('.').starts_with("qemu")
         {
             pids.insert(pid);
         }
@@ -165,6 +166,7 @@ async fn a_vm_environment_becomes_ready_answers_http_and_leaves_nothing_after_de
         control_request::Op::CreateEnvironment(CreateEnvironmentRequest {
             idempotency_key: "live-vm-environment".to_owned(),
             spec: Some(EnvironmentSpec {
+                profile: "live".to_owned(),
                 lifetime: Some(EnvironmentLifetime {
                     kind: EnvironmentLifetimeKind::Ephemeral as i32,
                     ttl_secs: 3600,
