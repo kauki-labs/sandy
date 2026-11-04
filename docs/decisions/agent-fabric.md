@@ -495,7 +495,9 @@ environment refuses connections.
   any host process can hold the relay's own 256 slots. The idle timeout frees silent slots only; authentication is
   what closes this (10a), and the cap bounds descriptors.
 - **Not covered here.** The `EnvironmentBackend` that starts and stops a bridge per environment (#587 slice C), the
-  vfkit `connect` device in `vfkit_args`, and the live round trip through a real guest.
+  live round trip through a real guest. The vfkit `connect` device is `VfkitBackend::with_service_socket`: the caller
+  picks the socket path, and the backend checks its length and clears a stale file (vfkit is killed at teardown and
+  cannot unlink it).
 
 ## 11. Channel roles are thin wrappers; `EscalationSink` is a new seam
 

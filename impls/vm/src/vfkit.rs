@@ -113,6 +113,8 @@ impl StagedArgs {
 ///   the secret share), via the [`VirtioFsTransport`]. Each `--device` and its descriptor are separate argv tokens;
 ///   read-only is enforced by the guest mount (vfkit's virtio-fs device rejects a `,ro` option).
 /// - `--device virtio-vsock,…` when [`Topology::vsock_cid`] is `Some` (absent in the aarch64 fixture).
+/// - service bridge ([`StagedArgs::service_vsock`], #590): `--device
+///   virtio-vsock,port=1000,socketURL=<socket>,connect`, the guest port relay's port, with the host connecting.
 /// - proxy mode ([`StagedArgs::egress_socket`], #405): `--device virtio-vsock,port=5001,socketURL=<socket>,listen`, so
 ///   vfkit dials the proxy's unix socket for each guest-initiated connection. It coexists with the agent link's
 ///   `connect` device on port 5000. No `virtio-net` is emitted in either mode: the guest has no NIC unless
@@ -324,8 +326,11 @@ impl VfkitBackend {
         if let Some(agent) = agent {
             staged.agent_vsock = Some((AGENT_VSOCK_PORT, agent.socket.clone()));
         }
+        // Service bridge: a stale socket from a killed run would make vfkit's bind fail, so clear it first.
+        if let Some(socket) = &self.service_socket {
+            staged.service_vsock = Some(prepare_service_socket(socket)?);
+        }
         // Proxy mode: vfkit dials the proxy's unix socket for the egress port.
-        staged.service_vsock.clone_from(&self.service_socket);
         staged.egress_socket = egress.and_then(EgressLaunch::unix_socket).map(Path::to_path_buf);
         staged.network = network_from_env()?;
         let args = vfkit_args(topology, spec, &staged)?;
@@ -414,6 +419,30 @@ impl VfkitBackend {
             .lock()
             .map_err(|_| BackendError::Spawn("vfkit instance registry lock poisoned".to_string()))
     }
+}
+
+/// The service socket path, checked against `sun_path` and cleared of a stale file (#590).
+///
+/// vfkit is SIGKILLed at teardown and cannot unlink its own socket, so a file left by an earlier run would make the
+/// next bind fail. One backend serves one service socket, so concurrent runs must not share a backend.
+fn prepare_service_socket(socket: &Path) -> Result<PathBuf, BackendError> {
+    if socket.as_os_str().len() > MAX_SOCKET_PATH {
+        return Err(BackendError::Spawn(format!(
+            "the service socket path {} is longer than a unix socket allows ({MAX_SOCKET_PATH} bytes)",
+            socket.display()
+        )));
+    }
+    match std::fs::remove_file(socket) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(BackendError::Spawn(format!(
+                "clear the stale service socket {}: {err}",
+                socket.display()
+            )));
+        }
+    }
+    Ok(socket.to_path_buf())
 }
 
 /// One agent-mode run: the image's agent and the host socket vfkit exposes its
@@ -560,7 +589,8 @@ impl VfkitBackend {
             .as_ref()
             .map(|agent| agent.socket.as_path())
             .into_iter()
-            .chain(egress.as_ref().and_then(EgressLaunch::unix_socket));
+            .chain(egress.as_ref().and_then(EgressLaunch::unix_socket))
+            .chain(self.service_socket.as_deref());
         for socket in sockets {
             if let Err(err) = std::fs::remove_file(socket)
                 && err.kind() != std::io::ErrorKind::NotFound
@@ -1190,6 +1220,21 @@ mod tests {
             "{}",
             args.join(" ")
         );
+        Ok(())
+    }
+
+    /// #590: an over-long service socket path is refused before vfkit starts, and a stale file is cleared.
+    #[test]
+    fn a_service_socket_is_length_checked_and_cleared_of_a_stale_file() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!("sv-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).context("create dir")?;
+        let socket = dir.join("s.sock");
+        std::fs::write(&socket, b"stale").context("write stale")?;
+        assert_eq!(prepare_service_socket(&socket)?, socket);
+        assert!(!socket.exists(), "the stale socket must be removed");
+        let too_long = dir.join("x".repeat(MAX_SOCKET_PATH));
+        assert!(matches!(prepare_service_socket(&too_long), Err(BackendError::Spawn(why)) if why.contains("longer")));
+        std::fs::remove_dir_all(&dir).context("cleanup")?;
         Ok(())
     }
 
