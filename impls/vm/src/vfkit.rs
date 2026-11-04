@@ -249,6 +249,9 @@ pub struct VfkitBackend {
     agent_used: AtomicBool,
     /// When set, vfkit exposes the guest port relay at this host socket (#590).
     service_socket: Option<PathBuf>,
+    /// Set by a service-socket backend's one run: the socket path serves one VM, so a second run would unlink the
+    /// first one's live socket.
+    service_used: AtomicBool,
 }
 
 impl VfkitBackend {
@@ -262,6 +265,7 @@ impl VfkitBackend {
             agent: None,
             agent_used: AtomicBool::new(false),
             service_socket: None,
+            service_used: AtomicBool::new(false),
         }
     }
 
@@ -281,8 +285,9 @@ impl VfkitBackend {
     /// Expose the guest port relay (#590) at the host unix socket `socket`.
     ///
     /// vfkit must declare the vsock device before boot, so the caller picks the path (short enough for
-    /// `sun_path`, in a private directory) and dials it with `sandy-conn`'s `UnixDialer`. Without it the guest
-    /// has no service channel.
+    /// `sun_path`, no comma, in a private directory such as `sandy_fsutil`'s staging base: the backend does not check
+    /// who else can write there) and dials it with `sandy-conn`'s `UnixDialer`. Without it the guest has no service
+    /// channel. The backend serves ONE run, like agent mode: build one per environment.
     #[must_use]
     pub fn with_service_socket(mut self, socket: impl Into<PathBuf>) -> Self {
         self.service_socket = Some(socket.into());
@@ -315,6 +320,7 @@ impl VfkitBackend {
         shares: Vec<ShareSpec>,
         agent: Option<&AgentRun>,
         egress: Option<&EgressLaunch<'_>>,
+        service: Option<&Path>,
     ) -> Result<Outcome, BackendError> {
         // The shares (secret/input/output, their read-only flags, the #49 secret_dir
         // rule) are staged by `plan_shares` in `run`; here they only become argv. The
@@ -327,9 +333,7 @@ impl VfkitBackend {
             staged.agent_vsock = Some((AGENT_VSOCK_PORT, agent.socket.clone()));
         }
         // Service bridge: a stale socket from a killed run would make vfkit's bind fail, so clear it first.
-        if let Some(socket) = &self.service_socket {
-            staged.service_vsock = Some(prepare_service_socket(socket)?);
-        }
+        staged.service_vsock = service.map(Path::to_path_buf);
         // Proxy mode: vfkit dials the proxy's unix socket for the egress port.
         staged.egress_socket = egress.and_then(EgressLaunch::unix_socket).map(Path::to_path_buf);
         staged.network = network_from_env()?;
@@ -421,24 +425,38 @@ impl VfkitBackend {
     }
 }
 
-/// The service socket path, checked against `sun_path` and cleared of a stale file (#590).
+/// The service socket path, checked and cleared of a stale socket (#590).
 ///
-/// vfkit is SIGKILLed at teardown and cannot unlink its own socket, so a file left by an earlier run would make the
-/// next bind fail. One backend serves one service socket, so concurrent runs must not share a backend.
+/// The path must fit `sun_path` and hold no comma (vfkit splits its option string on commas). vfkit is SIGKILLed at
+/// teardown and cannot unlink its own socket, so a socket left by an earlier run would make the next bind fail: that
+/// one file type is removed. Anything else at the path (a file, directory or symlink) is refused, never deleted.
 fn prepare_service_socket(socket: &Path) -> Result<PathBuf, BackendError> {
+    use std::os::unix::fs::FileTypeExt as _;
+
+    let shown = socket.display();
     if socket.as_os_str().len() > MAX_SOCKET_PATH {
         return Err(BackendError::Spawn(format!(
-            "the service socket path {} is longer than a unix socket allows ({MAX_SOCKET_PATH} bytes)",
-            socket.display()
+            "the service socket path {shown} is longer than a unix socket allows ({MAX_SOCKET_PATH} bytes)"
         )));
     }
-    match std::fs::remove_file(socket) {
-        Ok(()) => {}
+    if socket.to_string_lossy().chars().any(|c| c == ',' || c.is_control()) {
+        return Err(BackendError::Spawn(format!(
+            "the service socket path {shown} holds a comma or a control character, which vfkit's option parser would \
+             split"
+        )));
+    }
+    match std::fs::symlink_metadata(socket) {
+        Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(socket)
+            .map_err(|err| BackendError::Spawn(format!("clear the stale service socket {shown}: {err}")))?,
+        Ok(_) => {
+            return Err(BackendError::Spawn(format!(
+                "the service socket path {shown} holds something that is not a socket; refusing to remove it"
+            )));
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => {
             return Err(BackendError::Spawn(format!(
-                "clear the stale service socket {}: {err}",
-                socket.display()
+                "inspect the service socket path {shown}: {err}"
             )));
         }
     }
@@ -506,6 +524,11 @@ impl VfkitBackend {
                 "this agent-mode backend already ran its one job; build one per sandbox run".to_string(),
             ));
         }
+        if self.service_socket.is_some() && self.service_used.swap(true, Ordering::SeqCst) {
+            return Err(BackendError::Spawn(
+                "this service-socket backend already ran its one job; build one per environment".to_string(),
+            ));
+        }
         let topology = topology(spec.template)?;
         let run_id = Uuid::new_v4();
         let box_id = format!("inst-{run_id}");
@@ -550,6 +573,7 @@ impl VfkitBackend {
         // Stage the shares via the shared policy, then boot on them. A staging
         // failure skips the boot but still wipes below (INV-1).
         let mut input_digests = None;
+        let mut service_prepared: Option<PathBuf> = None;
         let outcome = plan_shares(
             spec,
             &ShareDirs {
@@ -560,6 +584,9 @@ impl VfkitBackend {
         )
         .and_then(|plan| {
             input_digests = plan.input_digests;
+            // Prepared only now: teardown removes a service socket only when this run cleared its path, so a run that
+            // failed earlier never deletes what sits there.
+            service_prepared = self.service_socket.as_deref().map(prepare_service_socket).transpose()?;
             self.boot(
                 &topology,
                 spec,
@@ -568,6 +595,7 @@ impl VfkitBackend {
                 plan.shares,
                 agent.as_ref(),
                 egress.as_ref(),
+                service_prepared.as_deref(),
             )
         });
 
@@ -590,7 +618,7 @@ impl VfkitBackend {
             .map(|agent| agent.socket.as_path())
             .into_iter()
             .chain(egress.as_ref().and_then(EgressLaunch::unix_socket))
-            .chain(self.service_socket.as_deref());
+            .chain(service_prepared.as_deref());
         for socket in sockets {
             if let Err(err) = std::fs::remove_file(socket)
                 && err.kind() != std::io::ErrorKind::NotFound
@@ -1223,22 +1251,96 @@ mod tests {
         Ok(())
     }
 
-    /// #590: an over-long service socket path is refused before vfkit starts, and a stale file is cleared.
+    /// #590: the service socket path is checked at the limit, refused when it could split vfkit's options, and only a
+    /// stale socket is removed.
     #[test]
-    fn a_service_socket_is_length_checked_and_cleared_of_a_stale_file() -> anyhow::Result<()> {
+    fn a_service_socket_path_is_checked_and_only_a_stale_socket_is_cleared() -> anyhow::Result<()> {
+        use std::os::unix::net::UnixListener;
+
         let dir = std::env::temp_dir().join(format!("sv-{}", Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).context("create dir")?;
+        let refused = |path: &Path, why: &str| {
+            assert!(
+                matches!(prepare_service_socket(path), Err(BackendError::Spawn(m)) if m.contains(why)),
+                "{path:?} should be refused with {why:?}"
+            );
+        };
+
+        // A socket left by a killed run is removed.
         let socket = dir.join("s.sock");
-        std::fs::write(&socket, b"stale").context("write stale")?;
+        drop(UnixListener::bind(&socket).context("bind stale socket")?);
         assert_eq!(prepare_service_socket(&socket)?, socket);
         assert!(!socket.exists(), "the stale socket must be removed");
-        let too_long = dir.join("x".repeat(MAX_SOCKET_PATH));
-        assert!(matches!(prepare_service_socket(&too_long), Err(BackendError::Spawn(why)) if why.contains("longer")));
+        // A missing path is fine.
+        assert_eq!(prepare_service_socket(&socket)?, socket);
+
+        // Anything else is kept and refused.
+        let regular = dir.join("regular");
+        std::fs::write(&regular, b"data").context("write regular")?;
+        refused(&regular, "not a socket");
+        assert!(regular.exists());
+        let sub = dir.join("sub");
+        std::fs::create_dir(&sub).context("create dir")?;
+        refused(&sub, "not a socket");
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&regular, &link).context("symlink")?;
+        refused(&link, "not a socket");
+        assert!(regular.exists() && link.symlink_metadata().is_ok());
+
+        // The exact limit passes and one byte more fails.
+        let pad = MAX_SOCKET_PATH - dir.as_os_str().len() - 1;
+        let at_limit = dir.join("x".repeat(pad));
+        assert_eq!(at_limit.as_os_str().len(), MAX_SOCKET_PATH);
+        assert_eq!(prepare_service_socket(&at_limit)?, at_limit);
+        refused(&dir.join("x".repeat(pad + 1)), "longer");
+
+        // A comma would split vfkit's option string.
+        refused(&dir.join("a,b"), "comma");
         std::fs::remove_dir_all(&dir).context("cleanup")?;
         Ok(())
     }
 
-    /// #587: a service socket declares the relay's vsock port for the host to connect, and no socket declares none.
+    /// #590: one service-socket backend runs one job.
+    #[test]
+    fn a_service_socket_backend_refuses_a_second_run() {
+        let backend = VfkitBackend::new("/nonexistent/vfkit").with_service_socket("/tmp/sandy/sv-x.sock");
+        let template = fixture_path("topology-aarch64.json");
+        let command = ["true".to_string()];
+        let grants = grants();
+        let spec = spec_for(&template, &command, &grants);
+        let _first = backend.run(&spec);
+        assert!(
+            matches!(backend.run(&spec), Err(BackendError::Spawn(why)) if why.contains("already ran its one job")),
+            "the second run must be refused"
+        );
+    }
+
+    /// #590: agent, service and egress devices coexist on distinct ports.
+    #[test]
+    fn vfkit_args_carry_the_agent_service_and_egress_devices_together() -> anyhow::Result<()> {
+        let topology = parse_topology(AARCH64_FIXTURE).context("parse aarch64 fixture")?;
+        let command = ["true".to_string()];
+        let grants = grants();
+        let staged = StagedArgs {
+            agent_vsock: Some((5000, PathBuf::from("/tmp/sandy/ag.sock"))),
+            service_vsock: Some(PathBuf::from("/tmp/sandy/sv.sock")),
+            egress_socket: Some(PathBuf::from("/tmp/sandy/eg.sock")),
+            ..StagedArgs::default()
+        };
+        let args = vfkit_args(&topology, &spec_for("demo", &command, &grants), &staged)?;
+        let devices: Vec<&String> = args.iter().filter(|a| a.starts_with("virtio-vsock,port=")).collect();
+        assert_eq!(
+            devices,
+            [
+                "virtio-vsock,port=5000,socketURL=/tmp/sandy/ag.sock,connect",
+                "virtio-vsock,port=1000,socketURL=/tmp/sandy/sv.sock,connect",
+                "virtio-vsock,port=5001,socketURL=/tmp/sandy/eg.sock,listen"
+            ]
+        );
+        Ok(())
+    }
+
+    /// #590: a service socket declares the relay's vsock port for the host to connect, and no socket declares none.
     #[test]
     fn vfkit_args_expose_the_service_relay_port_only_when_a_socket_is_set() -> anyhow::Result<()> {
         let topology = parse_topology(AARCH64_FIXTURE).context("parse aarch64 fixture")?;
