@@ -622,10 +622,9 @@ impl std::fmt::Debug for HookCell {
 fn report_cid_on_connect<S>(
     mut connect: impl FnMut() -> std::io::Result<S>,
     hook: Option<GuestCidHook>,
-    box_id: &str,
+    box_id: String,
     cid: u32,
 ) -> impl FnMut() -> std::io::Result<S> {
-    let box_id = box_id.to_string();
     move || {
         let stream = connect()?;
         if let Some(hook) = &hook {
@@ -656,7 +655,7 @@ fn spawn_vsock_connector(
         report_cid_on_connect(
             move || vsock::VsockStream::connect_with_cid_port(cid, AGENT_VSOCK_PORT),
             hook,
-            box_id,
+            box_id.to_string(),
             cid,
         ),
         box_id,
@@ -924,7 +923,7 @@ mod tests {
                 }
             },
             Some(hook),
-            "box-1",
+            "box-1".to_string(),
             77,
         );
         assert!(connect().is_err());
@@ -944,7 +943,12 @@ mod tests {
             let seen = Arc::clone(&seen);
             Arc::new(move |_, _| *seen.lock().unwrap() += 1)
         };
-        let mut connect = report_cid_on_connect(|| Err::<(), _>(std::io::Error::other("refused")), Some(hook), "b", 5);
+        let mut connect = report_cid_on_connect(
+            || Err::<(), _>(std::io::Error::other("refused")),
+            Some(hook),
+            "b".to_string(),
+            5,
+        );
         for _ in 0..5 {
             assert!(connect().is_err());
         }
