@@ -243,19 +243,36 @@ pub fn port_relay_argv(port: u16) -> Vec<std::ffi::OsString> {
     ]
 }
 
+/// How long a fresh port relay gets to show it died. Its failures (no vsock device, the port already bound, a
+/// platform without vsock) all abort within milliseconds of the start; a relay that survives this is serving.
+const RELAY_STARTUP_GRACE: Duration = Duration::from_millis(300);
+
 /// Start the guest half of the host bridge for a service that declares a `port` (#589, #590). The relay is a
 /// child of the agent, so it stops with the agent; it runs as the agent's user (root) because it binds vsock.
 /// It parses nothing and admits only the host (see `port_relay`).
 ///
 /// # Errors
-/// The agent's own binary cannot be found or started.
-pub fn spawn_port_relay(port: u16) -> Result<tokio::process::Child, String> {
+/// The agent's own binary cannot be found or started, or the relay exits during its startup grace: the run
+/// fails then, instead of a service reporting Ready with no bridge to the host.
+pub async fn spawn_port_relay(port: u16) -> Result<tokio::process::Child, String> {
     let exe = std::env::current_exe().map_err(|e| format!("locating the agent binary for the port relay: {e}"))?;
-    Command::new(exe)
+    let child = Command::new(exe)
         .args(port_relay_argv(port))
         .kill_on_drop(true)
         .spawn()
-        .map_err(|e| format!("starting the port relay for service port {port}: {e}"))
+        .map_err(|e| format!("starting the port relay for service port {port}: {e}"))?;
+    survive_startup(child, RELAY_STARTUP_GRACE).await
+}
+
+/// `child` if it is still running after `grace`; an error naming how it ended if it was not.
+async fn survive_startup(mut child: tokio::process::Child, grace: Duration) -> Result<tokio::process::Child, String> {
+    match tokio::time::timeout(grace, child.wait()).await {
+        Err(_) => Ok(child),
+        Ok(Ok(status)) => Err(format!(
+            "the port relay exited at startup ({status}); see its message above"
+        )),
+        Ok(Err(e)) => Err(format!("waiting on the port relay: {e}")),
+    }
 }
 
 /// One attempt of `check`, bounded by `timeout`. `Err` carries the failure's output.
@@ -382,6 +399,31 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
+
+    /// #589 review: a relay that dies at startup (no vsock, port taken) fails the run; one that keeps running is
+    /// kept.
+    #[tokio::test]
+    async fn a_relay_that_exits_at_startup_fails_the_run_and_one_that_serves_is_kept() -> anyhow::Result<()> {
+        let dying = Command::new("sh")
+            .args(["-c", "exit 3"])
+            .kill_on_drop(true)
+            .spawn()
+            .context("spawn")?;
+        let err = survive_startup(dying, Duration::from_secs(2)).await.err();
+        assert!(
+            err.is_some_and(|e| e.contains("exited at startup")),
+            "a dead relay must be an error"
+        );
+
+        let serving = Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .context("spawn")?;
+        let kept = survive_startup(serving, Duration::from_millis(100)).await;
+        assert!(kept.is_ok(), "a running relay must be kept");
+        Ok(())
+    }
 
     /// #589/#590: the relay argv a service's `port` produces is exactly what `port-relay` accepts, aimed at the
     /// agreed vsock port and the service's own loopback port, and nothing else.

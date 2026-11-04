@@ -307,7 +307,7 @@ where
     // #590: a service with a host-reachable `port` gets the guest half of the host bridge, a child that stops
     // with the agent. Held until `serve` returns.
     let _port_relay = match service.as_ref().and_then(|spec| spec.port) {
-        Some(port) => Some(service::spawn_port_relay(port)?),
+        Some(port) => Some(service::spawn_port_relay(port).await?),
         None => None,
     };
     let readiness = service.map(|spec| service::spawn_readiness(Arc::clone(&agent), spec.probe, service_user));
