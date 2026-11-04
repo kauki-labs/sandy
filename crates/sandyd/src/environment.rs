@@ -1527,9 +1527,12 @@ mod tests {
         assert_eq!(refused(&store, unknown).await?, EnvironmentErrorCode::Forbidden);
         assert_eq!(store.list()?.len(), 0, "a refused create leaves no row");
         match call(&store, create_as("t", IsolationClass::Trusted)).await? {
-            Ok(control_response::Result::Environment(_)) => Ok(()),
+            Ok(control_response::Result::Environment(_)) => {}
             other => bail!("a trusted create must succeed, got {other:?}"),
         }
+        let row = store.get_by_request_id("t")?.context("the trusted row")?;
+        assert!(row.submitter_trusted, "the row must record its trusted submitter");
+        Ok(())
     }
 
     #[tokio::test]

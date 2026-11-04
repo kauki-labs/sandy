@@ -1152,6 +1152,7 @@ mod tests {
             (old.state, old.endpoint, old.launched_at),
             (EnvironmentState::Ready, None, None)
         );
+        assert!(!old.submitter_trusted, "a row from before the column is not trusted");
         drop(s);
         // Opening the migrated file again is a no-op, not a duplicate-column error.
         assert!(EnvironmentStore::open(&path).is_ok());
