@@ -98,10 +98,17 @@ echo "== service socket $socket; running the live test"
 status=0
 SANDY_LIVE_GUEST_SOCKET="$socket" cargo nextest run -p sandy-conn --features live --test live_vsock_bridge --no-capture || status=$?
 
-wait "$sandy_pid" || true
+# The driver's own exit decides too: a guest job that fails after the host test passed (t3 never ready, a crash)
+# must not read as green.
+driver=0
+wait "$sandy_pid" || driver=$?
 sandy_pid=""
 
 echo "== guest output"
 grep -a "SK>" "$work/outcome.log" || echo "(no SK> lines in the outcome)"
 tail -n 5 "$work/stderr.log" >&2 || true
+if [ "$driver" -ne 0 ]; then
+  echo "the guest driver exited $driver" >&2
+  status=1
+fi
 exit "$status"
