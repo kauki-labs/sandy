@@ -442,6 +442,30 @@ mod tests {
     }
 
     #[test]
+    fn a_trusted_only_driver_fails_a_row_that_was_not_created_by_a_trusted_submitter() -> Result<()> {
+        let r = rig(FakeEnvironmentBackend::new())?;
+        r.store.require_trusted_submitter();
+        let untrusted = add(&r.store, 1)?;
+        let trusted = "env-2";
+        r.store.create_for(
+            "r2",
+            trusted,
+            &spec_bytes("small"),
+            "sandy.control.v1.EnvironmentSpec",
+            true,
+        )?;
+
+        let report = r.driver.reconcile_once(now())?;
+        assert_eq!(report.failed, std::slice::from_ref(&untrusted));
+        assert_eq!(report.launched, [trusted.to_owned()], "only the trusted row launches");
+        let rec = state(&r.store, &untrusted)?;
+        assert_eq!(rec.state, EnvironmentState::Failed);
+        assert_eq!(rec.failure.map(|f| f.step).as_deref(), Some("admission"));
+        assert_eq!(r.backend.launched().len(), 1, "the backend never saw the untrusted row");
+        Ok(())
+    }
+
+    #[test]
     fn a_provisioning_environment_is_launched_then_ready_with_its_endpoint() -> Result<()> {
         let r = rig(FakeEnvironmentBackend::new().starting_polls(1).with_endpoint(Endpoint {
             host: "127.0.0.1".to_owned(),

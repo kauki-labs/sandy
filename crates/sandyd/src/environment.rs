@@ -284,9 +284,10 @@ async fn create(
     spec: Option<EnvironmentSpec>,
     submitter_class: i32,
 ) -> Reply {
+    let trusted = IsolationClass::try_from(submitter_class) == Ok(IsolationClass::Trusted);
     // Before the replay lookup: a client whose class was lowered must not reach its old row's
     // answer either. UNSPECIFIED and unknown values are not TRUSTED.
-    if store.trusted_submitter_required() && IsolationClass::try_from(submitter_class) != Ok(IsolationClass::Trusted) {
+    if store.trusted_submitter_required() && !trusted {
         return refuse(
             EnvironmentErrorCode::Forbidden,
             "the environment backend runs without isolation and serves trusted submitters only",
@@ -320,7 +321,10 @@ async fn create(
         return refuse(EnvironmentErrorCode::InvalidArgument, why);
     }
     let new_id = format!("env-{}", uuid::Uuid::new_v4().simple());
-    let outcome = blocking(store, move |s| s.create(&key, &new_id, &bytes, SPEC_ENCODING)).await?;
+    let outcome = blocking(store, move |s| {
+        s.create_for(&key, &new_id, &bytes, SPEC_ENCODING, trusted)
+    })
+    .await?;
     match outcome {
         CreateOutcome::Created(record) | CreateOutcome::Existing(record) => reply(record),
         CreateOutcome::Conflict => refuse(

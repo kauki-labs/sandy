@@ -135,6 +135,9 @@ pub struct EnvironmentRecord {
     /// cleared by every state change. The idle-stop lease runs from here, or from
     /// `updated_at` when it is unset.
     pub last_activity_at: Option<i64>,
+    /// Whether the create came from a `TRUSTED` submitter. A row from before this
+    /// column, or from a create that did not say, is not trusted.
+    pub submitter_trusted: bool,
     /// Unix seconds at creation.
     pub created_at: i64,
     /// Unix seconds at the last state change.
@@ -253,12 +256,13 @@ struct RawRow {
     endpoint: Option<String>,
     launched_at: Option<i64>,
     last_activity_at: Option<i64>,
+    submitter_trusted: Option<i64>,
     created_at: i64,
     updated_at: i64,
 }
 
 const COLUMNS: &str = "environment_id, request_id, state, spec, spec_encoding, failure_step, failure_reason, \
-                       created_at, updated_at, endpoint, launched_at, last_activity_at";
+                       created_at, updated_at, endpoint, launched_at, last_activity_at, submitter_trusted";
 
 impl RawRow {
     fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
@@ -275,6 +279,7 @@ impl RawRow {
             endpoint: row.get(9)?,
             launched_at: row.get(10)?,
             last_activity_at: row.get(11)?,
+            submitter_trusted: row.get(12)?,
         })
     }
 
@@ -297,6 +302,7 @@ impl RawRow {
             endpoint: self.endpoint,
             launched_at: self.launched_at,
             last_activity_at: self.last_activity_at,
+            submitter_trusted: self.submitter_trusted == Some(1),
             created_at: self.created_at,
             updated_at: self.updated_at,
         })
@@ -355,7 +361,8 @@ impl EnvironmentStore {
                 updated_at      INTEGER NOT NULL,
                 endpoint        TEXT,
                 launched_at     INTEGER,
-                last_activity_at INTEGER
+                last_activity_at INTEGER,
+                submitter_trusted INTEGER
             )",
             (),
         )?;
@@ -364,6 +371,7 @@ impl EnvironmentStore {
             ("endpoint", "TEXT"),
             ("launched_at", "INTEGER"),
             ("last_activity_at", "INTEGER"),
+            ("submitter_trusted", "INTEGER"),
         ] {
             let present: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM pragma_table_info('environments') WHERE name = ?1)",
@@ -452,6 +460,21 @@ impl EnvironmentStore {
         spec: &[u8],
         spec_encoding: &str,
     ) -> Result<CreateOutcome, EnvironmentStoreError> {
+        self.create_for(request_id, new_id, spec, spec_encoding, false)
+    }
+
+    /// [`EnvironmentStore::create`], recording whether the submitter was `TRUSTED`.
+    ///
+    /// # Errors
+    /// As [`EnvironmentStore::create`].
+    pub fn create_for(
+        &self,
+        request_id: &str,
+        new_id: &str,
+        spec: &[u8],
+        spec_encoding: &str,
+        trusted: bool,
+    ) -> Result<CreateOutcome, EnvironmentStoreError> {
         let mut conn = self.lock();
         // IMMEDIATE takes the write lock up front, so the lookup, the cap check
         // and the insert are one step even across processes sharing the file.
@@ -492,8 +515,9 @@ impl EnvironmentStore {
         let now = now_unix();
         tx.execute(
             "INSERT INTO environments
-                 (environment_id, request_id, state, spec, spec_encoding, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+                 (environment_id, request_id, state, spec, spec_encoding, created_at, updated_at,
+                  submitter_trusted)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7)",
             (
                 new_id,
                 request_id,
@@ -501,6 +525,7 @@ impl EnvironmentStore {
                 spec,
                 spec_encoding,
                 now,
+                i64::from(trusted),
             ),
         )?;
         let raw = tx.query_row(
