@@ -233,11 +233,12 @@ async fn a_vm_environment_becomes_ready_answers_http_and_leaves_nothing_after_de
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    // The endpoint is closed with the run.
-    ensure!(
-        TcpStream::connect((host, port)).is_err(),
-        "the bridge still listens after delete"
-    );
+    // The endpoint closes with the run, a moment later: dropping the bridge only signals its stop.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while TcpStream::connect((host, port)).is_ok() {
+        ensure!(Instant::now() < deadline, "the bridge still listens after delete");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     // A new staging base is the only thing a first run may add: no run directory under it, no stray entry.
     let new_entries: Vec<_> = sandy_tmp_entries().difference(&tmp_before).cloned().collect();
     let strays: Vec<_> = new_entries

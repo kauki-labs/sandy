@@ -14,7 +14,7 @@
 //! | `SANDY_ENV_PASS_ENV` | comma-separated names of daemon variables passed to the service |
 //! | `SANDY_ENV_PATH` | the service's `PATH`; default the daemon's |
 //! | `SANDY_ENV_IDLE_TIMEOUT_SECS` | stop a Ready environment with no owner-visible use for this long; default off |
-//! | `SANDY_ENV_PROVISION_TIMEOUT_SECS` | seconds before a probe that is not Ready fails the environment; default 120 |
+//! | `SANDY_ENV_PROVISION_TIMEOUT_SECS` | seconds before a probe that is not Ready fails the environment; default 120; `vm-qemu`: its boot budget plus 300, and a value below the boot budget is refused |
 //!
 //! `vm-qemu` reads these as well (and only these of the process settings: the timeouts above):
 //!
@@ -37,6 +37,10 @@ pub const PROCESS_INSECURE: &str = "process-insecure";
 
 /// The qemu microVM backend, Linux only.
 pub const VM_QEMU: &str = "vm-qemu";
+
+/// Seconds added to the boot budget for the `vm-qemu` provision timeout when none is set: the guest probe and the
+/// host bridge need time after the guest has booted.
+const VM_PROVISION_MARGIN_SECS: u64 = 300;
 
 /// The longest `SANDY_SERVICE` value the guest console takes (the executor's bound; the agent command is one
 /// shell-quoted, base64-encoded console line).
@@ -97,6 +101,17 @@ pub enum EnvironmentBackendConfigError {
     /// The service spec the settings describe is not one the guest agent accepts.
     #[error("service settings: {0}")]
     Service(String),
+    /// The provision timeout would fail a cold boot before the boot budget ends.
+    #[error(
+        "SANDY_ENV_PROVISION_TIMEOUT_SECS={provision} is below SANDY_ENV_VM_BOOT_TIMEOUT_SECS={boot}: a cold boot \
+         would be failed before it can finish"
+    )]
+    ProvisionBelowBoot {
+        /// The configured provision timeout.
+        provision: u64,
+        /// The boot budget.
+        boot: u64,
+    },
     /// A number could not be parsed or was zero.
     #[error("{name}={raw:?} is not a positive whole number")]
     InvalidNumber {
@@ -149,16 +164,25 @@ fn from_env_on(
         }
         _ => return Err(E::UnknownBackend(backend)),
     };
-    let provision_timeout = match get("SANDY_ENV_PROVISION_TIMEOUT_SECS") {
-        None => Duration::from_secs(120),
-        Some(raw) => Duration::from_secs(positive_secs("SANDY_ENV_PROVISION_TIMEOUT_SECS", raw)?),
+    let explicit_provision = match get("SANDY_ENV_PROVISION_TIMEOUT_SECS") {
+        None => None,
+        Some(raw) => Some(positive_secs("SANDY_ENV_PROVISION_TIMEOUT_SECS", raw)?),
     };
     let idle_timeout = match get("SANDY_ENV_IDLE_TIMEOUT_SECS").filter(|v| !v.trim().is_empty()) {
         None => None,
         Some(raw) => Some(Duration::from_secs(positive_secs("SANDY_ENV_IDLE_TIMEOUT_SECS", raw)?)),
     };
+    let mut provision_secs = explicit_provision.unwrap_or(120);
     let (backend, template, service_port) = if vm {
         let (settings, template, port) = vm_settings(&get)?;
+        let boot = u64::from(settings.boot_timeout_secs);
+        match explicit_provision {
+            Some(provision) if provision < boot => {
+                return Err(E::ProvisionBelowBoot { provision, boot });
+            }
+            Some(_) => {}
+            None => provision_secs = boot + VM_PROVISION_MARGIN_SECS,
+        }
         (BackendSettings::VmQemu(settings), template, Some(port))
     } else {
         (
@@ -172,7 +196,7 @@ fn from_env_on(
         driver: DriverConfig {
             template,
             service_port,
-            provision_timeout,
+            provision_timeout: Duration::from_secs(provision_secs),
             idle_timeout,
         },
     }))
@@ -563,7 +587,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_backend_still_errors_on_linux_and_names_both_choices() {
+    fn vm_an_unknown_backend_still_errors_on_linux_and_names_both_choices() {
         let out = parse_on("linux", &[("SANDY_ENV_BACKEND", "vm")]);
         let Err(e @ EnvironmentBackendConfigError::UnknownBackend(_)) = out else {
             panic!("expected UnknownBackend, got {out:?}");
@@ -623,7 +647,7 @@ mod tests {
     }
 
     #[test]
-    fn a_service_user_the_guest_agent_would_refuse_fails_at_startup() {
+    fn vm_a_service_user_the_guest_agent_would_refuse_fails_at_startup() {
         for user in ["root", "Bad User", "1abc"] {
             let mut pairs = vm_base();
             pairs.push(("SANDY_ENV_VM_SERVICE_USER", user));
@@ -641,7 +665,7 @@ mod tests {
         let mut pairs = vm_base();
         pairs.extend([
             ("SANDY_ENV_VM_BOOT_TIMEOUT_SECS", "900"),
-            ("SANDY_ENV_PROVISION_TIMEOUT_SECS", "400"),
+            ("SANDY_ENV_PROVISION_TIMEOUT_SECS", "1000"),
         ]);
         let cfg = parse_on("linux", &pairs)?.context("expected a backend")?;
         let BackendSettings::VmQemu(vm) = &cfg.backend else {
@@ -651,7 +675,7 @@ mod tests {
         assert_eq!(vm.boot_timeout_secs, 900);
         assert_eq!(cfg.driver.template, "/srv/guest#topologies.x86_64-linux.qemu-t3");
         assert_eq!(cfg.driver.service_port, Some(3773));
-        assert_eq!(cfg.driver.provision_timeout, Duration::from_secs(400));
+        assert_eq!(cfg.driver.provision_timeout, Duration::from_secs(1000));
         let spec: sandy_guest_template::manifest::ServiceSpec = serde_json::from_str(&vm.service_env)?;
         assert_eq!(spec.user, "t3", "the default service user is the image's t3 account");
         assert_eq!(spec.port, Some(3773));
@@ -673,7 +697,39 @@ mod tests {
             anyhow::bail!("expected the vm backend");
         };
         assert_eq!(vm.boot_timeout_secs, 600);
-        assert_eq!(cfg.driver.provision_timeout, Duration::from_secs(120));
+        assert_eq!(
+            cfg.driver.provision_timeout,
+            Duration::from_secs(900),
+            "a cold boot gets its whole budget plus a margin, not the process backend's 120 s"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn vm_a_provision_timeout_below_the_boot_budget_is_refused_and_one_at_it_is_not() -> anyhow::Result<()> {
+        let mut low = vm_base();
+        low.extend([
+            ("SANDY_ENV_VM_BOOT_TIMEOUT_SECS", "600"),
+            ("SANDY_ENV_PROVISION_TIMEOUT_SECS", "599"),
+        ]);
+        assert_eq!(
+            parse_on("linux", &low).err(),
+            Some(EnvironmentBackendConfigError::ProvisionBelowBoot {
+                provision: 599,
+                boot: 600
+            })
+        );
+        let mut at = vm_base();
+        at.extend([
+            ("SANDY_ENV_VM_BOOT_TIMEOUT_SECS", "600"),
+            ("SANDY_ENV_PROVISION_TIMEOUT_SECS", "600"),
+        ]);
+        assert!(parse_on("linux", &at)?.is_some());
+        // The process backend keeps its own 120 s default.
+        assert_eq!(
+            parse(&base())?.map(|c| c.driver.provision_timeout),
+            Some(Duration::from_secs(120))
+        );
         Ok(())
     }
 }

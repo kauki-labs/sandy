@@ -19,7 +19,7 @@ use std::{io, sync::Arc, time::Duration};
 
 use sandy_api::agent::OnLink;
 use sandy_conn::bridge::{Bridge, BridgeConfig, Dialer};
-use sandy_environment::{HttpServiceProbe, RunGuard, RunGuards};
+use sandy_environment::{HttpServiceProbe, RunGuards};
 use sandy_fabric::{
     capauth::{CapAuthority, CapRights, CapScope},
     types::{ChannelId, PeerId},
@@ -93,8 +93,15 @@ pub fn cid_hook<D: Dialer>(
         let (probe, guards, environment_id) = (Arc::clone(&probe), guards.clone(), environment_id.clone());
         let dialer = dialer_for(cid);
         rt.spawn(async move {
-            match start_bridge(&probe, &environment_id, dialer).await {
-                Ok(guard) => guards.hold(guard),
+            match start_bridge(dialer).await {
+                Ok(bridge) => {
+                    // Registered under the slot's lock, so a run that already ended registers nothing, and the
+                    // bridge drops here instead.
+                    guards.hold_if_open(|| {
+                        let registration = probe.register(&environment_id, bridge.addr());
+                        Box::new((registration, bridge))
+                    });
+                }
                 Err(e) => {
                     tracing::warn!(environment = %environment_id, error = %e, "could not start the service bridge");
                 }
@@ -103,16 +110,10 @@ pub fn cid_hook<D: Dialer>(
     }
 }
 
-/// Start the bridge and register its address. The registration drops first, so the environment stops reading
-/// Ready before the port closes.
-async fn start_bridge<D: Dialer>(
-    probe: &HttpServiceProbe,
-    environment_id: &str,
-    dialer: io::Result<D>,
-) -> io::Result<RunGuard> {
-    let bridge = Bridge::start(dialer?, BridgeConfig::default()).await?;
-    let registration = probe.register(environment_id, bridge.addr());
-    Ok(Box::new((registration, bridge)))
+/// Start the bridge to the guest's port relay. The caller registers it, so the registration drops before the bridge
+/// and Ready is withdrawn before the port closes.
+async fn start_bridge<D: Dialer>(dialer: io::Result<D>) -> io::Result<Bridge> {
+    Bridge::start(dialer?, BridgeConfig::default()).await
 }
 
 /// The environment backend that boots each environment as a qemu microVM.
@@ -155,7 +156,10 @@ pub fn backend(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Instant,
+    };
 
     use anyhow::Context;
     use sandy_api::{
@@ -240,6 +244,9 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        // Ready is withdrawn with the bridge: the probe is back to Starting, not Ready at a dead port.
+        let got = probe_off_runtime(&probe, "env-1").await?;
+        assert!(matches!(got, Probe::Starting { .. }), "{got:?}");
         Ok(())
     }
 
@@ -248,18 +255,23 @@ mod tests {
     async fn a_hook_that_fires_after_the_run_ended_leaves_nothing_registered() -> anyhow::Result<()> {
         let probe = Arc::new(HttpServiceProbe::new());
         let guards = RunGuards::new();
-        let late = guards.clone();
+        let dialed = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&dialed);
         let hook = cid_hook(
             tokio::runtime::Handle::current(),
             Arc::clone(&probe),
-            late,
+            guards.clone(),
             "env-2".to_owned(),
-            |_| Ok(FakeRelay),
+            move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(FakeRelay)
+            },
         );
         // `guarded` closes the slot when the run returns; mirror that, then fire the hook.
         drop(sandy_environment::guarded(NullBackend, &guards));
         hook("env-2", 5);
         tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(dialed.load(Ordering::SeqCst), 1, "the hook must have run");
         assert!(
             matches!(probe_off_runtime(&probe, "env-2").await?, Probe::Starting { .. }),
             "a late hook's registration must be dropped"
@@ -267,19 +279,63 @@ mod tests {
         Ok(())
     }
 
+    /// A late hook of an ended run must not replace or withdraw the registration of the run that replaced it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_late_hook_of_an_old_run_leaves_the_new_runs_registration_alone() -> anyhow::Result<()> {
+        let probe = Arc::new(HttpServiceProbe::new());
+        let rt = tokio::runtime::Handle::current();
+        let (old, new) = (RunGuards::new(), RunGuards::new());
+        let hook = |guards: &RunGuards| {
+            cid_hook(
+                rt.clone(),
+                Arc::clone(&probe),
+                guards.clone(),
+                "env-5".to_owned(),
+                |_| Ok(FakeRelay),
+            )
+        };
+        let (old_hook, new_hook) = (hook(&old), hook(&new));
+        // The old run was killed, the id relaunched, and the new run's bridge is up.
+        drop(sandy_environment::guarded(NullBackend, &old));
+        new_hook("env-5", 6);
+        let Probe::Ready { endpoint } = until_ready(&probe, "env-5").await? else {
+            anyhow::bail!("the new run never became Ready");
+        };
+        // The old run's hook fires late.
+        old_hook("env-5", 5);
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(500) {
+            let got = probe_off_runtime(&probe, "env-5").await?;
+            anyhow::ensure!(
+                got == Probe::Ready {
+                    endpoint: endpoint.clone()
+                },
+                "the late hook disturbed the new run: {got:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Ok(())
+    }
+
     /// A CID the dialer refuses starts no bridge, and the environment stays Starting.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_refused_cid_starts_no_bridge() -> anyhow::Result<()> {
         let probe = Arc::new(HttpServiceProbe::new());
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&asked);
         let hook = cid_hook::<FakeRelay>(
             tokio::runtime::Handle::current(),
             Arc::clone(&probe),
             RunGuards::new(),
             "env-3".to_owned(),
-            |_| Err(io::Error::new(io::ErrorKind::InvalidInput, "not a guest CID")),
+            move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Err(io::Error::new(io::ErrorKind::InvalidInput, "not a guest CID"))
+            },
         );
         hook("env-3", 1);
         tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(asked.load(Ordering::SeqCst), 1, "the hook must have run");
         assert!(matches!(
             probe_off_runtime(&probe, "env-3").await?,
             Probe::Starting { .. }
