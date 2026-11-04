@@ -334,6 +334,8 @@ fn kernel_cmdline(cmdline: &str) -> String {
 /// [`sandy::VmBackend`]. Construct with [`QemuBackend::new`].
 #[derive(Debug, Default)]
 pub struct QemuBackend {
+    /// Called once per run with `(box_id, cid)` after the agent link connects (#587).
+    guest_cid_hook: HookCell,
     /// The boxes this backend has launched and not yet reaped, read by
     /// [`boxes`](VmBackend::boxes) and pruned by [`kill`](VmBackend::kill).
     instances: Mutex<Vec<BoxState>>,
@@ -348,6 +350,17 @@ impl QemuBackend {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Tell `hook` the vsock CID a guest holds, once per run, with the run's box id (#587).
+    ///
+    /// It fires only after the host has connected to the guest agent. A CID that collided with another VM and was
+    /// retried never reaches it, so a consumer that dials the CID (the service bridge) cannot reach a foreign VM.
+    /// Agent mode only: a run without [`with_agent`](Self::with_agent) never calls it.
+    #[must_use]
+    pub fn with_guest_cid_hook(mut self, hook: impl Fn(&str, u32) + Send + Sync + 'static) -> Self {
+        self.guest_cid_hook = HookCell(Some(Arc::new(hook)));
+        self
     }
 
     /// Run the job behind the guest's sandbox agent (#238). The console launches
@@ -487,9 +500,16 @@ impl QemuBackend {
         };
         let console_spec = &console_spec;
         let stop = Arc::new(AtomicBool::new(false));
+        let report = self
+            .guest_cid_hook
+            .0
+            .clone()
+            .zip(agent)
+            .map(|(hook, (_, cid))| Arc::new(CidReport::new(hook, &box_id, cid)));
         let connector = self.agent.as_ref().zip(agent).and_then(|(launch, (_, cid))| {
             spawn_vsock_connector(
                 launch,
+                report.clone(),
                 cid,
                 &box_id,
                 // The console's command budget only starts once the guest has
@@ -500,7 +520,7 @@ impl QemuBackend {
             )
         });
 
-        let mut outcome = drive_console(console_spec, run_id, &sock);
+        let mut outcome = drive_console(console_spec, run_id, &sock, report);
         stop.store(true, Ordering::SeqCst);
         let verdict = connector.map(|(verdict, thread)| (verdict, thread.join().unwrap_or(false)));
 
@@ -580,6 +600,119 @@ pub(crate) fn cid_in_use(outcome: &Outcome) -> bool {
     !outcome.booted && outcome.console.contains("unable to set guest cid") && outcome.console.contains("in use")
 }
 
+/// A callback told which vsock CID a launched guest holds, see [`QemuBackend::with_guest_cid_hook`].
+pub type GuestCidHook = Arc<dyn Fn(&str, u32) + Send + Sync>;
+
+/// A [`GuestCidHook`] slot; a closure has no `Debug`, so the backend's derive needs this.
+#[derive(Default)]
+struct HookCell(Option<GuestCidHook>);
+
+impl std::fmt::Debug for HookCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "GuestCidHook(set)"
+        } else {
+            "GuestCidHook(none)"
+        })
+    }
+}
+
+/// Fires a [`GuestCidHook`] once, when the host holds the agent link AND this attempt's own guest has booted.
+///
+/// The link alone proves nothing: on a CID collision the connect reaches the VM that holds the CID, and that VM's agent
+/// may accept it. The boot is the proof: the console's ready marker carries this run's id, which only this attempt's
+/// guest prints, and a qemu that lost the CID never boots. A consumer that dials the CID therefore never reaches a
+/// foreign VM.
+struct CidReport {
+    hook: GuestCidHook,
+    box_id: String,
+    cid: u32,
+    state: Mutex<ReportState>,
+}
+
+#[derive(Default)]
+struct ReportState {
+    linked: bool,
+    booted: bool,
+    fired: bool,
+}
+
+impl CidReport {
+    fn new(hook: GuestCidHook, box_id: &str, cid: u32) -> Self {
+        Self {
+            hook,
+            box_id: box_id.to_string(),
+            cid,
+            state: Mutex::new(ReportState::default()),
+        }
+    }
+
+    /// The host connected to the agent at the CID.
+    fn linked(&self) {
+        self.step(|state| state.linked = true);
+    }
+
+    /// The guest answered the console with this run's marker.
+    fn booted(&self) {
+        self.step(|state| state.booted = true);
+    }
+
+    fn step(&self, set: impl FnOnce(&mut ReportState)) {
+        let fire = {
+            let Ok(mut state) = self.state.lock() else { return };
+            set(&mut state);
+            let fire = state.linked && state.booted && !state.fired;
+            state.fired |= fire;
+            fire
+        };
+        // A panicking hook must not unwind the connector thread or the console driver: the run is not its fault.
+        if fire
+            && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.hook)(&self.box_id, self.cid))).is_err()
+        {
+            tracing::warn!(box_id = self.box_id, "the guest CID hook panicked");
+        }
+    }
+}
+
+/// Wrap `connect` so a success marks the link in `report`.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only the Linux vsock connector calls it")
+)]
+fn mark_link_on_connect<S>(
+    mut connect: impl FnMut() -> std::io::Result<S>,
+    report: Option<Arc<CidReport>>,
+) -> impl FnMut() -> std::io::Result<S> {
+    move || {
+        let stream = connect()?;
+        if let Some(report) = &report {
+            report.linked();
+        }
+        Ok(stream)
+    }
+}
+
+/// A console [`Transport`](sandy_api::console::Transport) that tells `report` the guest booted when the command frame
+/// goes out: the protocol writes it only after the run's own ready marker.
+struct BootWatch<T> {
+    inner: T,
+    report: Option<Arc<CidReport>>,
+}
+
+impl<T: sandy_api::console::Transport> sandy_api::console::Transport for BootWatch<T> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<sandy_api::console::ReadEvent, BackendError> {
+        self.inner.read(buf)
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> Result<(), BackendError> {
+        self.inner.write(bytes)?;
+        if let Some(report) = &self.report {
+            report.booted();
+        }
+        Ok(())
+    }
+}
+
 /// How many fresh CIDs an agent-mode run tries before giving up.
 const CID_ATTEMPTS: usize = 8;
 
@@ -587,6 +720,7 @@ const CID_ATTEMPTS: usize = 8;
 #[cfg(target_os = "linux")]
 fn spawn_vsock_connector(
     launch: &AgentLaunch,
+    report: Option<Arc<CidReport>>,
     cid: u32,
     box_id: &str,
     deadline: Instant,
@@ -597,7 +731,10 @@ fn spawn_vsock_connector(
 )> {
     Some(crate::agent::spawn_connector(
         launch,
-        move || vsock::VsockStream::connect_with_cid_port(cid, AGENT_VSOCK_PORT),
+        mark_link_on_connect(
+            move || vsock::VsockStream::connect_with_cid_port(cid, AGENT_VSOCK_PORT),
+            report,
+        ),
         box_id,
         deadline,
         stop,
@@ -608,6 +745,7 @@ fn spawn_vsock_connector(
 #[cfg(not(target_os = "linux"))]
 fn spawn_vsock_connector(
     _launch: &AgentLaunch,
+    _report: Option<Arc<CidReport>>,
     _cid: u32,
     _box_id: &str,
     _deadline: Instant,
@@ -678,7 +816,7 @@ fn connect_serial(sock: &Path, budget: Duration) -> Result<UnixStream, BackendEr
 /// deadline: `run_console` enforces the deadline (and `spec.control`'s live
 /// cancellation/suspension, #340/#185) itself on every idle tick, so a silent
 /// guest resolves through its timeout path rather than blocking.
-fn drive_console(spec: &RunSpec, run_id: Uuid, sock: &Path) -> Outcome {
+fn drive_console(spec: &RunSpec, run_id: Uuid, sock: &Path, report: Option<Arc<CidReport>>) -> Outcome {
     let connect_budget = Duration::from_secs(u64::from(spec.timeout_secs.max(1)));
     let stream = match connect_serial(sock, connect_budget) {
         Ok(stream) => stream,
@@ -691,7 +829,10 @@ fn drive_console(spec: &RunSpec, run_id: Uuid, sock: &Path) -> Outcome {
         Ok(reader) => reader,
         Err(err) => return transport_outcome(&BackendError::Transport(format!("clone serial socket: {err}"))),
     };
-    let mut transport = PipeTransport::new(Box::new(reader), Box::new(stream));
+    let mut transport = BootWatch {
+        inner: PipeTransport::new(Box::new(reader), Box::new(stream)),
+        report,
+    };
     let markers = Markers::for_run(READY_MARKER, run_id);
     run_console(&mut transport, spec, &markers)
 }
@@ -843,6 +984,70 @@ mod tests {
     use sandy::{Grants, Hypervisor, Input, SECRET_MOUNT_TAG, SecretRef, SecretSource, parse_topology};
 
     use super::*;
+
+    type Seen = Arc<Mutex<Vec<(String, u32)>>>;
+
+    fn counting_report() -> (Arc<CidReport>, Seen) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let hook: GuestCidHook = {
+            let seen = Arc::clone(&seen);
+            Arc::new(move |box_id, cid| seen.lock().expect("seen").push((box_id.to_string(), cid)))
+        };
+        (Arc::new(CidReport::new(hook, "box-1", 77)), seen)
+    }
+
+    /// A guest that holds the CID's agent answers the link but never boots under this run's marker (a collision).
+    #[test]
+    fn a_link_without_a_boot_never_reports_the_cid() {
+        let (report, seen) = counting_report();
+        let mut connect = mark_link_on_connect(|| Ok::<_, std::io::Error>(()), Some(Arc::clone(&report)));
+        assert!(connect().is_ok());
+        assert!(connect().is_ok());
+        assert!(seen.lock().expect("seen").is_empty());
+    }
+
+    #[test]
+    fn a_boot_without_a_link_never_reports_the_cid() {
+        let (report, seen) = counting_report();
+        report.booted();
+        assert!(seen.lock().expect("seen").is_empty());
+    }
+
+    #[test]
+    fn the_cid_is_reported_once_whatever_the_order() {
+        for boot_first in [true, false] {
+            let (report, seen) = counting_report();
+            if boot_first {
+                report.booted();
+                report.linked();
+            } else {
+                report.linked();
+                report.booted();
+            }
+            report.linked();
+            report.booted();
+            assert_eq!(*seen.lock().expect("seen"), vec![("box-1".to_string(), 77)]);
+        }
+    }
+
+    #[test]
+    fn a_failed_connect_does_not_mark_the_link() {
+        let (report, seen) = counting_report();
+        let mut connect = mark_link_on_connect(
+            || Err::<(), _>(std::io::Error::other("refused")),
+            Some(Arc::clone(&report)),
+        );
+        assert!(connect().is_err());
+        report.booted();
+        assert!(seen.lock().expect("seen").is_empty());
+    }
+
+    #[test]
+    fn a_panicking_hook_does_not_unwind_the_caller() {
+        let report = CidReport::new(Arc::new(|_, _| panic!("hook bug")), "b", 1);
+        report.linked();
+        report.booted();
+    }
 
     /// A complete microvm.nix topology JSON (x86_64, qemu, erofs store).
     const X86_64_FIXTURE: &[u8] = include_bytes!("../tests/fixtures/topology-x86_64.json");
