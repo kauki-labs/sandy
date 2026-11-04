@@ -29,7 +29,7 @@ use sandy::{
     collect_outputs, ensure_sandy_staging_base, plan_shares, topology, wipe, with_digests,
 };
 use sandy_api::{
-    agent::{AGENT_VSOCK_PORT, AgentLaunch},
+    agent::{AGENT_VSOCK_PORT, AgentLaunch, PORT_RELAY_VSOCK_PORT},
     egress::NetworkMode,
     share::{GuestShareTransport, ShareSpec},
 };
@@ -69,6 +69,9 @@ pub struct StagedArgs {
     /// Egress-proxy mode (#405): the host unix socket vfkit dials for each guest
     /// connection to the fixed egress vsock port. The proxy listens there.
     pub egress_socket: Option<PathBuf>,
+    /// Service bridge (#590): the host unix socket vfkit exposes the guest port relay's vsock port at, for the host
+    /// to connect to.
+    pub service_vsock: Option<PathBuf>,
     /// The guest network profile (#602). [`NetworkMode::Nic`] adds a NAT `virtio-net` with no egress
     /// boundary, and is refused beside an egress policy; the default emits none.
     pub network: NetworkMode,
@@ -82,6 +85,7 @@ impl StagedArgs {
             shares,
             agent_vsock: None,
             egress_socket: None,
+            service_vsock: None,
             network: NetworkMode::None,
         }
     }
@@ -184,6 +188,15 @@ pub fn vfkit_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> R
         ));
     }
 
+    // Service bridge (#590): the same `connect` shape as the agent port, for the guest port relay.
+    if let Some(socket) = &staged.service_vsock {
+        args.push("--device".to_string());
+        args.push(format!(
+            "virtio-vsock,port={PORT_RELAY_VSOCK_PORT},socketURL={},connect",
+            socket.display()
+        ));
+    }
+
     // Proxy mode (#405): `listen` makes vfkit the dialer: it connects to the proxy's unix socket for each
     // guest-initiated connection to the egress port.
     if let Some(socket) = &staged.egress_socket {
@@ -232,6 +245,8 @@ pub struct VfkitBackend {
     agent: Option<AgentLaunch>,
     /// Set by an agent-mode backend's one run: its cap and channel serve one job.
     agent_used: AtomicBool,
+    /// When set, vfkit exposes the guest port relay at this host socket (#590).
+    service_socket: Option<PathBuf>,
 }
 
 impl VfkitBackend {
@@ -244,6 +259,7 @@ impl VfkitBackend {
             instances: Mutex::new(Vec::new()),
             agent: None,
             agent_used: AtomicBool::new(false),
+            service_socket: None,
         }
     }
 
@@ -257,6 +273,17 @@ impl VfkitBackend {
     #[must_use]
     pub fn with_agent(mut self, agent: AgentLaunch) -> Self {
         self.agent = Some(agent);
+        self
+    }
+
+    /// Expose the guest port relay (#590) at the host unix socket `socket`.
+    ///
+    /// vfkit must declare the vsock device before boot, so the caller picks the path (short enough for
+    /// `sun_path`, in a private directory) and dials it with `sandy-conn`'s `UnixDialer`. Without it the guest
+    /// has no service channel.
+    #[must_use]
+    pub fn with_service_socket(mut self, socket: impl Into<PathBuf>) -> Self {
+        self.service_socket = Some(socket.into());
         self
     }
 }
@@ -298,6 +325,7 @@ impl VfkitBackend {
             staged.agent_vsock = Some((AGENT_VSOCK_PORT, agent.socket.clone()));
         }
         // Proxy mode: vfkit dials the proxy's unix socket for the egress port.
+        staged.service_vsock.clone_from(&self.service_socket);
         staged.egress_socket = egress.and_then(EgressLaunch::unix_socket).map(Path::to_path_buf);
         staged.network = network_from_env()?;
         let args = vfkit_args(topology, spec, &staged)?;
@@ -1161,6 +1189,38 @@ mod tests {
             ),
             "{}",
             args.join(" ")
+        );
+        Ok(())
+    }
+
+    /// #587: a service socket declares the relay's vsock port for the host to connect, and no socket declares none.
+    #[test]
+    fn vfkit_args_expose_the_service_relay_port_only_when_a_socket_is_set() -> anyhow::Result<()> {
+        let topology = parse_topology(AARCH64_FIXTURE).context("parse aarch64 fixture")?;
+        let command = ["true".to_string()];
+        let grants = grants();
+        let spec = spec_for("demo", &command, &grants);
+        let with_socket = StagedArgs {
+            service_vsock: Some(PathBuf::from("/tmp/sandy/sv-0123456789ab.sock")),
+            ..StagedArgs::default()
+        };
+        let args = vfkit_args(&topology, &spec, &with_socket)?;
+        assert!(
+            has_token_run(
+                &args,
+                &[
+                    "--device",
+                    "virtio-vsock,port=1000,socketURL=/tmp/sandy/sv-0123456789ab.sock,connect"
+                ]
+            ),
+            "{}",
+            args.join(" ")
+        );
+        let without = vfkit_args(&topology, &spec, &StagedArgs::default())?;
+        assert!(
+            !without.iter().any(|a| a.starts_with("virtio-vsock,port=1000")),
+            "{}",
+            without.join(" ")
         );
         Ok(())
     }
