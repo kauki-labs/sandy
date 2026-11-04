@@ -217,6 +217,15 @@ fn history_lines_env(history_lines: u32) -> [(String, String); 1] {
     [("SANDY_HISTORY_LINES".to_owned(), history_lines.to_string())]
 }
 
+/// The env an argv/v1 run carries: the submitter's entries without `SANDY_SERVICE`. The argv manifest has no
+/// service, so a submitter-set key would reach the agent's probe and port relay unvalidated (#589 review).
+fn process_run_env(env: &[(String, String)]) -> Vec<(String, String)> {
+    env.iter()
+        .filter(|(key, _)| key != sandy_api::agent::SERVICE_ENV)
+        .cloned()
+        .collect()
+}
+
 /// The longest `SANDY_SERVICE` value the executor sends. The guest console takes the agent's command as one
 /// line, shell-quoted and base64-encoded (about 4095 bytes in canonical mode), and quoting and encoding grow a
 /// value by up to a factor of 4, so a larger spec plus the job's own argv could be cut mid-argument. A typical
@@ -610,7 +619,7 @@ pub fn handle_dispatch(
                 inputs: &path_inputs,
                 outputs: &path_outputs,
                 secrets: &path_secrets,
-                env: &decoded.env,
+                env: &process_run_env(&decoded.env),
                 cpu: decoded.cpu,
                 mem: decoded.mem,
                 timeout_secs,
@@ -972,6 +981,15 @@ mod tests {
             matches!(err, DispatchError::MalformedManifest(ref m) if m.contains("byte limit")),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn an_argv_run_drops_a_submitter_set_service_env_and_keeps_the_rest() {
+        let env = vec![
+            ("FOO".to_owned(), "bar".to_owned()),
+            (sandy_api::agent::SERVICE_ENV.to_owned(), "{}".to_owned()),
+        ];
+        assert_eq!(process_run_env(&env), [("FOO".to_owned(), "bar".to_owned())]);
     }
 
     #[test]
