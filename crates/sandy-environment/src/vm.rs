@@ -54,6 +54,24 @@ pub trait ServiceProbe: Send + Sync {
 pub struct VmEnvironmentConfig {
     /// The guest command the agent runs as its job: the service.
     pub command: Vec<String>,
+    /// Guest environment added after the environment spec's own, so an entry here wins. The service spec
+    /// (`SANDY_SERVICE`) goes here: without it the agent runs `command` as a plain job and never probes.
+    pub env: Vec<(String, String)>,
+    /// Seconds a boot may take. The deadline is suspended once the run starts, but the hypervisor backend sizes its
+    /// serial-connect and link-connect budgets from this, so zero would give a real qemu one second to boot.
+    pub boot_timeout_secs: u32,
+}
+
+impl VmEnvironmentConfig {
+    /// A config that runs `command`, with no extra environment and a ten-minute boot budget.
+    #[must_use]
+    pub fn new(command: Vec<String>) -> Self {
+        Self {
+            command,
+            env: Vec::new(),
+            boot_timeout_secs: 600,
+        }
+    }
 }
 
 struct Held {
@@ -121,21 +139,22 @@ impl VmEnvironmentBackend {
 fn hold(
     backend: &HeldBackend,
     spec: &EnvironmentSpec,
-    command: &[String],
+    config: &VmEnvironmentConfig,
     control: &RunControl,
 ) -> Result<(), BackendError> {
     control.suspend_deadline();
+    let env: Vec<(String, String)> = spec.env.iter().chain(&config.env).cloned().collect();
     let run = RunSpec {
         digests: false,
         template: &spec.template,
-        command,
+        command: &config.command,
         inputs: &[],
         outputs: &[],
         secrets: &[],
-        env: &spec.env,
+        env: &env,
         cpu: None,
         mem: None,
-        timeout_secs: 0,
+        timeout_secs: config.boot_timeout_secs,
         control,
         grants: &Grants {
             secrets: false,
@@ -154,6 +173,15 @@ fn hold(
         "an environment's held run returned"
     );
     Ok(())
+}
+
+/// Sets its flag when dropped, so the flag is set on a panic unwind too.
+struct SetOnDrop(Arc<AtomicBool>);
+
+impl Drop for SetOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 impl EnvironmentBackend for VmEnvironmentBackend {
@@ -177,19 +205,16 @@ impl EnvironmentBackend for VmEnvironmentBackend {
         }
         let control = RunControl::new(Instant::now());
         let done = Arc::new(AtomicBool::new(false));
-        let (thread_control, thread_done, thread_spec, command) = (
-            control.clone(),
-            Arc::clone(&done),
-            spec.clone(),
-            self.config.command.clone(),
-        );
+        let (thread_control, thread_done, thread_spec, config) =
+            (control.clone(), Arc::clone(&done), spec.clone(), self.config.clone());
         let thread = std::thread::Builder::new()
             .name(format!("env-run-{}", spec.environment_id))
             .spawn(move || {
-                if let Err(e) = hold(&backend, &thread_spec, &command, &thread_control) {
+                // Set on every exit, a panic included: a box whose thread died must not look up forever.
+                let _done = SetOnDrop(thread_done);
+                if let Err(e) = hold(&backend, &thread_spec, &config, &thread_control) {
                     tracing::warn!(environment = %thread_spec.environment_id, error = %e, "an environment's held run failed");
                 }
-                thread_done.store(true, Ordering::SeqCst);
             })
             .map_err(|e| BackendError::Spawn(format!("start the run thread: {e}")))?;
         held.insert(

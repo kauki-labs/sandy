@@ -2261,6 +2261,8 @@ A client that polls `GetEnvironment` renews the lease for as long as it polls, a
 - `boxes()` lists only runs still up. A run that returned is `NotRunning`, and a launch for that id starts a fresh box.
 - Readiness is not decided here. A `ServiceProbe` (the host bridge, slice C3b) is asked while the run is up; with none set, the probe reports `Starting`.
 - Dropping the backend cancels and joins every run.
+- The guest env and the boot budget come from `VmEnvironmentConfig`: its `env` is appended after the spec's own (the service spec, `SANDY_SERVICE`, goes there, or the agent runs the command as a plain job and never probes), and `boot_timeout_secs` is the `timeout_secs` the hypervisor backend sizes its serial and link connect budgets from, so a real qemu is not given one second to boot. The deadline stays suspended.
+- What a CID hook starts (the host bridge and its probe registration) is held in `RunGuards` and released when `run()` returns, however it ends, through `GuardedBackend`. A hook that fires after that has its guard dropped at once. A run thread that panics is not running: its done flag is set on unwind.
 
 **Consequences.** The backend is generic over `VmBackend`, so it is tier-2 testable with a double that holds until cancelled. It is not wired into `sandyd` yet: that needs the two `impls/vm` hooks (the qemu CID, the vfkit port-5100 device) and the bridge probe (C3b). VMs do not survive a daemon restart in this slice, because the threads die with the process. A restart policy is open on #587.
 

@@ -21,6 +21,7 @@ struct Seen {
     runs: AtomicUsize,
     commands: Mutex<Vec<Vec<String>>>,
     deadline_suspended: Mutex<Vec<bool>>,
+    timeouts: Mutex<Vec<u32>>,
     agent_grant: Mutex<Vec<bool>>,
     envs: Mutex<Vec<Vec<(String, String)>>>,
 }
@@ -49,6 +50,7 @@ impl VmBackend for Holding {
             .unwrap()
             .push(spec.grants.agent && !spec.grants.secrets);
         self.seen.envs.lock().unwrap().push(spec.env.to_vec());
+        self.seen.timeouts.lock().unwrap().push(spec.timeout_secs);
         let start = Instant::now();
         while let Some(stuck) = self.stubborn.as_ref().filter(|s| s.load(Ordering::SeqCst)) {
             let _ = stuck;
@@ -110,9 +112,7 @@ fn stubborn_backend(
                 stubborn: stubborn.clone(),
             }))
         }),
-        VmEnvironmentConfig {
-            command: vec!["t3".to_owned(), "serve".to_owned()],
-        },
+        VmEnvironmentConfig::new(vec!["t3".to_owned(), "serve".to_owned()]),
     );
     (b, seen)
 }
@@ -195,7 +195,7 @@ fn a_run_that_returns_by_itself_is_not_running_and_can_be_launched_again() -> Re
 fn a_factory_failure_is_a_spawn_error_and_leaves_no_box() -> Result<()> {
     let b = VmEnvironmentBackend::new(
         Box::new(|_| Err(BackendError::Spawn("no qemu".to_owned()))),
-        VmEnvironmentConfig { command: vec![] },
+        VmEnvironmentConfig::new(vec![]),
     );
     let err = b.launch(&spec("env-a")).err().context("expected an error")?;
     assert!(matches!(err, BackendError::Spawn(_)));
@@ -342,5 +342,77 @@ fn dropping_the_backend_does_not_hang_on_a_run_that_ignores_cancel() -> Result<(
     drop(b);
     assert!(start.elapsed() < Duration::from_secs(3), "drop must give up, not hang");
     stuck.store(false, Ordering::SeqCst);
+    Ok(())
+}
+
+#[test]
+fn the_config_env_follows_the_spec_env_and_the_boot_budget_reaches_the_run() -> Result<()> {
+    let seen = Arc::new(Seen::default());
+    let s = Arc::clone(&seen);
+    let mut config = VmEnvironmentConfig::new(vec!["t3".to_owned()]);
+    config.env = vec![
+        ("SANDY_SERVICE".to_owned(), "{}".to_owned()),
+        ("K".to_owned(), "config-wins".to_owned()),
+    ];
+    config.boot_timeout_secs = 321;
+    let b = VmEnvironmentBackend::new(
+        Box::new(move |_| {
+            Ok(Box::new(Holding {
+                seen: Arc::clone(&s),
+                die_after: None,
+                teardown: Duration::ZERO,
+                stubborn: None,
+            }))
+        }),
+        config,
+    );
+    b.launch(&spec("env-a"))?;
+    wait_for("the run to start", || seen.runs.load(Ordering::SeqCst) == 1)?;
+    let env = seen.envs.lock().unwrap()[0].clone();
+    assert_eq!(
+        env,
+        [
+            ("K".to_owned(), "V".to_owned()),
+            ("SANDY_SERVICE".to_owned(), "{}".to_owned()),
+            ("K".to_owned(), "config-wins".to_owned()),
+        ],
+        "the config env comes last, so a consumer reading the last entry sees it win"
+    );
+    assert_eq!(seen.timeouts.lock().unwrap()[0], 321, "a real boot budget, not zero");
+    Ok(())
+}
+
+/// A hypervisor backend whose run panics at once.
+struct Panicking;
+impl VmBackend for Panicking {
+    fn run(&self, _spec: &RunSpec) -> Result<Outcome, BackendError> {
+        panic!("the hypervisor backend panicked");
+    }
+
+    fn kill(&self, _box_id: &str) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    fn boxes(&self) -> Result<Vec<BoxState>, BackendError> {
+        Ok(Vec::new())
+    }
+}
+
+#[test]
+fn a_run_that_panics_is_not_running_and_does_not_make_drop_wait() -> Result<()> {
+    let b = VmEnvironmentBackend::new(Box::new(|_| Ok(Box::new(Panicking))), VmEnvironmentConfig::new(vec![]))
+        .with_kill_wait(Duration::from_secs(20));
+    b.launch(&spec("env-a"))?;
+    wait_for("the dead box to read as not running", || {
+        matches!(b.probe("env-a"), Ok(Probe::NotRunning))
+    })?;
+    assert!(b.boxes()?.is_empty(), "a panicked run must not stay listed");
+    let start = Instant::now();
+    drop(b);
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "drop waited {:?} on a dead thread",
+        start.elapsed()
+    );
     Ok(())
 }

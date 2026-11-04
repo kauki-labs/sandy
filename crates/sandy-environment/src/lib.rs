@@ -8,8 +8,10 @@
 //!
 //! [`VmEnvironmentBackend`] is the isolated one: a held agent-mode `VmBackend::run` per environment.
 
+mod lifecycle;
 mod process;
 mod vm;
 
+pub use lifecycle::{GuardedBackend, RunGuard, RunGuards, guarded};
 pub use process::{ProcessConfig, ProcessConfigError, ProcessEnvironmentBackend};
 pub use vm::{BackendFactory, HeldBackend, ServiceProbe, VmEnvironmentBackend, VmEnvironmentConfig};
