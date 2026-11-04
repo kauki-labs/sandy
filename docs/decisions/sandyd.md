@@ -2267,3 +2267,22 @@ A client that polls `GetEnvironment` renews the lease for as long as it polls, a
 **Consequences.** The backend is generic over `VmBackend`, so it is tier-2 testable with a double that holds until cancelled. It is not wired into `sandyd` yet: that needs the two `impls/vm` hooks (the qemu CID, the vfkit port-5100 device) and the bridge probe (C3b). VMs do not survive a daemon restart in this slice, because the threads die with the process. A restart policy is open on #587.
 
 **Alternative set aside.** A new launch path in `impls/vm`: it would fork boot and teardown logic across two backends.
+
+## 32. `SANDY_ENV_BACKEND=vm-qemu` composes the VM environment backend in `sandyd` (#587, C3b)
+
+**Status:** accepted (design posted on #587). **Upholds:** INV-6, INV-11.
+
+**Context.** Decision 31 holds one agent-mode run per environment but nothing wires it into the daemon. The run needs an agent-link relay, a host bridge to the guest service, and a probe that turns the bridge into Ready.
+
+**Decision.**
+
+- `SANDY_ENV_BACKEND=vm-qemu` selects `VmEnvironmentBackend` over `QemuBackend`. It is Linux only: elsewhere `from_env` returns `UnsupportedPlatform` naming the platform, so the daemon stops at startup rather than launching nothing. An unknown value is still an error.
+- Settings are `SANDY_ENV_VM_TEMPLATE` (the guest topology: a flake attr such as `<flake>#topologies.x86_64-linux.qemu-t3`, or a prebuilt topology JSON), `SANDY_ENV_VM_COMMAND` (guest argv, must contain `{port}`), `SANDY_ENV_VM_SERVICE_PORT`, `SANDY_ENV_VM_SERVICE_USER` (default `t3`, never root) and `SANDY_ENV_VM_BOOT_TIMEOUT_SECS` (default 600, a connect budget, not a deadline). The provision and idle timeouts are shared with the process backend.
+- The service spec is built once from those settings, validated with `validate_service_spec` and sent as `SANDY_SERVICE` in the run's env. A bad user or port stops the daemon at startup, not at the first boot. The guest probe is a TCP connect; the host probe (`HttpServiceProbe`) decides Ready.
+- The factory builds one `QemuBackend` per environment with the agent launch and the CID hook, wrapped in `guarded` so the hook's work ends with the run.
+- `on_link` serves the host end of the agent link with `serve_agent_link` on the daemon's runtime, over a per-environment `InMem` channel and a `LocalCapAuthority` whose cap outlives any run. Its verdict goes through `AgentReport`, so a link that closes without an exit frame is an agent failure (INV-11).
+- The CID hook starts a `Bridge` to the guest's port relay (`VsockDialer`, port 1000) on a loopback port and registers that address with the probe. Both sit in `RunGuards`; the registration drops first, so Ready is withdrawn before the port closes. A hook failure leaves the environment `Starting` until the provision timeout.
+
+**Consequences.** A Ready VM environment cannot be linked yet: pairing in VM mode has no owner (#590, last mile), so `SANDY_ENV_PAIR_COMMAND` has no VM counterpart and a client reaches the service only if it needs no pairing. VMs do not survive a daemon restart. Nothing reads the channel the agent's TTY output lands in, and `InMem` keeps every envelope, so a service that prints forever grows the daemon's memory for the life of the environment. The bridge is a loopback port any local user can reach (decision 10b of `agent-fabric.md`). vfkit and macOS are not wired.
+
+**Alternative set aside.** Reading the topology in the daemon and passing the paths to the backend: `QemuBackend::run` already evaluates the template, so a second reader would drift from it.
