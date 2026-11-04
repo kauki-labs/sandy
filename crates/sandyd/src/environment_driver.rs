@@ -198,6 +198,15 @@ impl EnvironmentDriver {
     ) -> Result<(), EnvironmentStoreError> {
         let id = row.environment_id.as_str();
         if !running.contains(id) {
+            // Covers a row made while the gate was off, and a resume: the create gate alone does not.
+            if self.store.trusted_submitter_required() && !row.submitter_trusted {
+                return self.fail(
+                    id,
+                    "admission",
+                    "the backend serves trusted submitters only and this environment was not created by one",
+                    report,
+                );
+            }
             let Some(spec) = self.to_spec(row) else {
                 return self.fail(id, "spec", "the stored spec does not decode", report);
             };

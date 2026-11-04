@@ -82,7 +82,7 @@ broker and stores jobs and environments.
 `SANDY_ENV_BACKEND=process-insecure` makes sandyd run each environment's service as a host
 process. It has no isolation. While it is on, sandyd refuses an environment create from a client
 whose `max_isolation_class` is not `trusted` (`forbidden`, #641): give the `t3` client
-`"max_isolation_class": "trusted"` and use it on a dev machine only. Set the
+`"max_isolation_class": "trusted"` and use it on a dev machine only. Upgrade sandyd and the broker together: a broker that does not send the class gets every create refused. Set the
 variables on sandyd (names and meanings in `crates/sandyd/src/environment_backend.rs`):
 
 ```bash
