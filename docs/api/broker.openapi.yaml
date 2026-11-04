@@ -125,7 +125,7 @@ paths:
       operationId: spawnEnvironment
       summary: Create an environment. Idempotent by request_id (O1).
       description: >-
-        The same request_id with the same payload returns the same environment. The same request_id with a different payload fails with request_id_conflict.
+        The same request_id with the same payload returns the same environment. The same request_id with a different payload fails with request_id_conflict. A client whose max_isolation_class is below trusted gets forbidden while sandyd runs a trusted-only backend (the process backend).
       requestBody:
         required: true
         content:

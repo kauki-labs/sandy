@@ -19,7 +19,7 @@ use sandy_control_proto::{
     ControlRequest, ControlResponse, control_request, control_response,
     v1::{
         EnvironmentConnection, EnvironmentError, EnvironmentErrorCode, EnvironmentFailure, EnvironmentLifetimeKind,
-        EnvironmentResponse, EnvironmentSpec, EnvironmentState as WireState, ListEnvironmentsRequest,
+        EnvironmentResponse, EnvironmentSpec, EnvironmentState as WireState, IsolationClass, ListEnvironmentsRequest,
         ListEnvironmentsResponse,
     },
 };
@@ -139,7 +139,7 @@ pub async fn handle(
 ) -> Result<ControlResponse, EnvironmentHandlerError> {
     use control_request::Op;
     let result = match request.op {
-        Some(Op::CreateEnvironment(r)) => create(store, r.idempotency_key, r.spec).await?,
+        Some(Op::CreateEnvironment(r)) => create(store, r.idempotency_key, r.spec, r.submitter_class).await?,
         Some(Op::GetEnvironment(r)) => get(store, r.environment_id).await?,
         Some(Op::ListEnvironments(r)) => list(store, r, PAGE_BYTE_BUDGET).await?,
         Some(Op::StopEnvironment(r)) => stop_or_resume(store, r.environment_id, true).await?,
@@ -278,7 +278,20 @@ fn reply(record: EnvironmentRecord) -> Reply {
     Ok(control_response::Result::Environment(to_wire(record)?))
 }
 
-async fn create(store: &Arc<EnvironmentStore>, key: String, spec: Option<EnvironmentSpec>) -> Reply {
+async fn create(
+    store: &Arc<EnvironmentStore>,
+    key: String,
+    spec: Option<EnvironmentSpec>,
+    submitter_class: i32,
+) -> Reply {
+    // Before the replay lookup: a client whose class was lowered must not reach its old row's
+    // answer either. UNSPECIFIED and unknown values are not TRUSTED.
+    if store.trusted_submitter_required() && IsolationClass::try_from(submitter_class) != Ok(IsolationClass::Trusted) {
+        return refuse(
+            EnvironmentErrorCode::Forbidden,
+            "the environment backend runs without isolation and serves trusted submitters only",
+        );
+    }
     if !token_ok(&key, MAX_KEY) {
         return refuse(
             EnvironmentErrorCode::InvalidArgument,
@@ -1479,6 +1492,71 @@ mod tests {
                 assert_eq!(got.connection, None, "never a made-up address");
             }
             other => bail!("expected an environment, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    fn create_as(key: &str, class: IsolationClass) -> control_request::Op {
+        control_request::Op::CreateEnvironment(CreateEnvironmentRequest {
+            idempotency_key: key.to_owned(),
+            spec: Some(persistent()),
+            submitter_class: class.into(),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_trusted_only_store_refuses_every_class_but_trusted_and_keeps_no_row() -> Result<()> {
+        let store = store()?;
+        store.require_trusted_submitter();
+        for (key, class) in [("u", IsolationClass::Untrusted), ("x", IsolationClass::Unspecified)] {
+            assert_eq!(
+                refused(&store, create_as(key, class)).await?,
+                EnvironmentErrorCode::Forbidden,
+                "{class:?} must be refused"
+            );
+        }
+        let unknown = control_request::Op::CreateEnvironment(CreateEnvironmentRequest {
+            idempotency_key: "n".to_owned(),
+            spec: Some(persistent()),
+            submitter_class: 99,
+        });
+        assert_eq!(refused(&store, unknown).await?, EnvironmentErrorCode::Forbidden);
+        assert_eq!(store.list()?.len(), 0, "a refused create leaves no row");
+        match call(&store, create_as("t", IsolationClass::Trusted)).await? {
+            Ok(control_response::Result::Environment(_)) => Ok(()),
+            other => bail!("a trusted create must succeed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_client_lowered_to_untrusted_cannot_replay_its_old_create_under_a_trusted_only_store() -> Result<()> {
+        let store = store()?;
+        store.require_trusted_submitter();
+        let first = call(&store, create_as("k", IsolationClass::Trusted)).await?;
+        assert!(
+            matches!(first, Ok(control_response::Result::Environment(_))),
+            "{first:?}"
+        );
+        assert_eq!(
+            refused(&store, create_as("k", IsolationClass::Untrusted)).await?,
+            EnvironmentErrorCode::Forbidden
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn without_a_trusted_only_backend_any_class_may_create() -> Result<()> {
+        let store = store()?;
+        for (key, class) in [
+            ("u", IsolationClass::Untrusted),
+            ("x", IsolationClass::Unspecified),
+            ("t", IsolationClass::Trusted),
+        ] {
+            let reply = call(&store, create_as(key, class)).await?;
+            assert!(
+                matches!(reply, Ok(control_response::Result::Environment(_))),
+                "{class:?}: {reply:?}"
+            );
         }
         Ok(())
     }
