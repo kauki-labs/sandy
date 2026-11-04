@@ -39,7 +39,9 @@ pub(crate) fn http_status(addr: SocketAddr) -> Option<u16> {
     while filled < buf.len() {
         stream.set_read_timeout(Some(left()?)).ok()?;
         match stream.read(&mut buf[filled..]) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
+            // A timeout is not end of input: a stalled, incomplete status line is no answer.
+            Err(_) => return None,
             Ok(n) => filled += n,
         }
     }

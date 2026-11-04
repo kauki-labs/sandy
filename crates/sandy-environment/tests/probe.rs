@@ -181,6 +181,38 @@ fn a_server_that_never_answers_or_trickles_cannot_hold_the_probe_past_its_budget
 }
 
 #[test]
+fn a_status_line_that_stalls_before_its_delimiter_is_starting_not_ready() -> Result<()> {
+    // Exactly "HTTP/1.1 200", then silence past the probe's budget: a read timeout, not an end of input.
+    let (addr, t) = serve_slowly_after(b"HTTP/1.1 200", Duration::from_secs(3))?;
+    let start = Instant::now();
+    let out = probe_at(addr)?;
+    assert!(matches!(&out, Probe::Starting { step } if step == "boot"), "{out:?}");
+    assert!(
+        start.elapsed() < Duration::from_millis(2000),
+        "took {:?}",
+        start.elapsed()
+    );
+    drop(t);
+    Ok(())
+}
+
+/// Accepts, writes `head`, then holds the connection open and silent for `hold`.
+fn serve_slowly_after(head: &'static [u8], hold: Duration) -> Result<(SocketAddr, JoinHandle<()>)> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?;
+    let t = std::thread::spawn(move || {
+        if let Ok((mut s, _)) = listener.accept() {
+            let mut buf = [0u8; 256];
+            let _ = s.read(&mut buf);
+            let _ = s.write_all(head);
+            let _ = s.flush();
+            std::thread::sleep(hold);
+        }
+    });
+    Ok((addr, t))
+}
+
+#[test]
 fn the_probe_is_usable_as_a_vm_backends_service_probe() -> Result<()> {
     let p: std::sync::Arc<dyn ServiceProbe> = std::sync::Arc::new(HttpServiceProbe::new());
     let _ = p.probe("env-a").context("probe")?;
