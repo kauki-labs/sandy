@@ -35,12 +35,20 @@ use crate::{
 /// `sandy_host_executor::dispatch`/`sandy_guest_template::manifest`'s own
 /// `MANIFEST_ENCODING_FLAKE_V1`, duplicated here (not imported) for the same
 /// reason `link_auth::LINK_TOKEN_LEN` duplicates
-/// `sandy_executor_proto::REMOTE_LINK_TOKEN_LEN`: this daemon never resolves
-/// or decodes a flake manifest itself, only classifies the tag, so it has no
-/// real need for that crate's `nix`-shelling resolution logic as a
-/// dependency. The two constants name the same wire tag and must stay in
-/// sync if either changes.
+/// `sandy_executor_proto::REMOTE_LINK_TOKEN_LEN`. The daemon classifies the tag and, since #589, runs the
+/// manifest's decode-time validation at Submit; it still resolves and builds nothing. The two constants name
+/// the same wire tag and must stay in sync if either changes.
 const MANIFEST_ENCODING_FLAKE_V1: &str = "flake/v1";
+
+/// The reason a `flake/v1` manifest would be refused by the executor's own decode, `None` for any other encoding
+/// or a manifest that decodes (#589). Run at Submit so a bad `service` fails in the reply, not after placement
+/// as a `MalformedManifest`. Only `flake/v1` is checked: this daemon still resolves and builds nothing.
+fn flake_manifest_refusal(manifest_encoding: &str, manifest: &[u8]) -> Option<String> {
+    (manifest_encoding == MANIFEST_ENCODING_FLAKE_V1)
+        .then(|| sandy_guest_template::manifest::decode_flake_manifest(manifest).err())
+        .flatten()
+        .map(|e| format!("the flake/v1 manifest is refused: {e}"))
+}
 
 /// The one refusal text for a `Cancel` that is not authorized (#540): it must not say whether the job
 /// exists, what state it is in, or which part of the credential was wrong.
@@ -349,6 +357,13 @@ pub async fn handle(
             // that can never run, with no distinct status a caller could
             // ever notice (item 5's "never silently" bar).
             let required_sandbox_kind = required_sandbox_kind_for(&submit.manifest_encoding);
+
+            if let Some(message) = flake_manifest_refusal(&submit.manifest_encoding, &submit.manifest) {
+                return Ok(ControlResponse {
+                    request_id: request.request_id,
+                    result: Some(control_response::Result::Error(ControlError { message })),
+                });
+            }
 
             // #381 (CodeRabbit on this PR): the process kind never admits an
             // untrusted job (`process-containment.md` decision 6) — refuse
@@ -2845,13 +2860,46 @@ mod tests {
 
     // ---- Sandbox-kind placement dimension (#332) ----
 
+    /// A `flake/v1` manifest as a submitter sends it, with `service` as given.
+    fn flake_manifest_bytes(service: Option<sandy_guest_template::manifest::ServiceSpec>) -> Vec<u8> {
+        sandy_guest_template::manifest::encode_flake_manifest(&sandy_guest_template::manifest::FlakeManifestV1 {
+            flake: "github:example/guest".to_owned(),
+            kind: None,
+            attr: None,
+            command: vec!["serve".to_owned()],
+            history_lines: sandy_guest_template::manifest::default_history_lines(),
+            env: Vec::new(),
+            cpu: None,
+            mem: None,
+            timeout_secs: None,
+            service,
+        })
+        .expect("a flake manifest encodes")
+    }
+
+    fn service_spec(user: &str) -> sandy_guest_template::manifest::ServiceSpec {
+        sandy_guest_template::manifest::ServiceSpec {
+            user: user.to_owned(),
+            probe: sandy_guest_template::manifest::HealthProbe {
+                check: sandy_guest_template::manifest::ProbeCheck::Tcp { port: 8080 },
+                interval_secs: 1,
+                timeout_secs: 1,
+                max_attempts: 5,
+            },
+            restart: sandy_guest_template::manifest::RestartPolicy::Never,
+            port: Some(8080),
+        }
+    }
+
     fn submit_req_flake(id: u64) -> ControlRequest {
+        submit_req_flake_with(id, flake_manifest_bytes(None))
+    }
+
+    fn submit_req_flake_with(id: u64, manifest: Vec<u8>) -> ControlRequest {
         req(
             id,
             control_request::Op::Submit(SubmitRequest {
-                // Opaque to `handle` at placement time — it never decodes a
-                // flake manifest itself, only classifies the encoding tag.
-                manifest: b"irrelevant-to-placement".to_vec(),
+                manifest,
                 manifest_encoding: "flake/v1".to_owned(),
                 submitter_caps: Vec::new(),
                 required_isolation_class: sandy_control_proto::IsolationClass::Trusted.into(),
@@ -3043,13 +3091,70 @@ mod tests {
         Ok(())
     }
 
+    /// #589: a `flake/v1` service the executor would refuse (a root user) is refused at Submit, before placement,
+    /// so the caller sees the reason in the Submit reply and no dispatch is sent.
+    #[tokio::test]
+    async fn a_flake_submit_naming_a_root_service_is_refused_at_submit() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let mut dispatch_rx = register_test_host(&host_registry, "remote-host", peer_ip, vm_host_capabilities());
+        let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            submit_req_flake_with(1, flake_manifest_bytes(Some(service_spec("root")))),
+        )
+        .await?;
+        match response.result {
+            Some(control_response::Result::Error(ControlError { message })) => {
+                assert!(message.contains("non-root"), "got {message:?}");
+            }
+            other => anyhow::bail!("expected a refusal, got {other:?}"),
+        }
+        assert!(dispatch_rx.try_recv().is_err(), "a refused submit must not dispatch");
+        Ok(())
+    }
+
+    /// #589: a well-formed service manifest passes the Submit check and is placed.
+    #[tokio::test]
+    async fn a_flake_submit_naming_a_valid_service_is_placed() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let mut dispatch_rx = register_test_host(&host_registry, "remote-host", peer_ip, vm_host_capabilities());
+        let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            submit_req_flake_with(1, flake_manifest_bytes(Some(service_spec("svc")))),
+        )
+        .await?;
+        assert!(
+            matches!(response.result, Some(control_response::Result::Submit(_))),
+            "got {:?}",
+            response.result
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_rx.recv())
+            .await
+            .context("timed out waiting for the dispatch")?
+            .context("the dispatch channel closed")?;
+        Ok(())
+    }
+
     // ---- Isolation-class placement dimension (#381) ----
 
     fn submit_req_untrusted_flake(id: u64) -> ControlRequest {
         req(
             id,
             control_request::Op::Submit(SubmitRequest {
-                manifest: b"irrelevant-to-placement".to_vec(),
+                manifest: flake_manifest_bytes(None),
                 manifest_encoding: "flake/v1".to_owned(),
                 submitter_caps: Vec::new(),
                 required_isolation_class: sandy_control_proto::IsolationClass::Untrusted.into(),
