@@ -54,11 +54,14 @@ pub trait ServiceProbe: Send + Sync {
 pub struct VmEnvironmentConfig {
     /// The guest command the agent runs as its job: the service.
     pub command: Vec<String>,
-    /// Guest environment added after the environment spec's own, so an entry here wins. The service spec
-    /// (`SANDY_SERVICE`) goes here: without it the agent runs `command` as a plain job and never probes.
+    /// Guest environment added after the environment spec's own, so a repeated key here wins. In agent mode only
+    /// `SANDY_SERVICE` and `SANDY_HISTORY_LINES` reach the guest (`impls/vm`'s `agent_command_argv`); every other key
+    /// is dropped there. The service spec (`SANDY_SERVICE`) goes here: without it the agent runs `command` as a
+    /// plain job and never probes.
     pub env: Vec<(String, String)>,
-    /// Seconds a boot may take. The deadline is suspended once the run starts, but the hypervisor backend sizes its
-    /// serial-connect and link-connect budgets from this, so zero would give a real qemu one second to boot.
+    /// Sizes the hypervisor backend's connect budgets (the serial connect, capped at 10 s, and the vsock link
+    /// connector, twice this plus 120 s), so zero would give a real qemu one second. It is not a boot timeout: the
+    /// run's deadline is suspended, and the driver's provision timeout bounds a boot that never gets Ready.
     pub boot_timeout_secs: u32,
 }
 
@@ -212,6 +215,9 @@ impl EnvironmentBackend for VmEnvironmentBackend {
             .spawn(move || {
                 // Set on every exit, a panic included: a box whose thread died must not look up forever.
                 let _done = SetOnDrop(thread_done);
+                // Declared after `_done`, so it drops first: what the backend's guards hold (a bridge, a probe
+                // registration) is released before the id reads as free and a relaunch can register again.
+                let backend = backend;
                 if let Err(e) = hold(&backend, &thread_spec, &config, &thread_control) {
                     tracing::warn!(environment = %thread_spec.environment_id, error = %e, "an environment's held run failed");
                 }

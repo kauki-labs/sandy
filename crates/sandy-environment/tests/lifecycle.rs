@@ -2,7 +2,7 @@
 
 use std::{
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -180,5 +180,36 @@ fn a_second_guard_replaces_the_first_and_drops_it() {
     guards.hold(Box::new(Bridge(Arc::clone(&second))));
     assert!(first.load(Ordering::SeqCst), "the replaced guard is dropped");
     assert!(!second.load(Ordering::SeqCst));
-    let _ = Mutex::new(());
+}
+
+/// A guard whose `Drop` panics.
+struct Exploding;
+impl Drop for Exploding {
+    fn drop(&mut self) {
+        panic!("a guard panicked on drop");
+    }
+}
+
+#[test]
+fn a_guard_that_panics_on_drop_does_not_take_the_caller_down() {
+    let guards = RunGuards::new();
+    guards.hold(Box::new(Exploding));
+    guards.hold(Box::new(Exploding)); // replaces, and so drops, the first
+    drop(guarded(NoRun, &guards)); // closes, and so drops, the second
+    guards.hold(Box::new(Exploding)); // a late hook on a closed slot
+}
+
+struct NoRun;
+impl VmBackend for NoRun {
+    fn run(&self, _spec: &RunSpec) -> Result<Outcome, BackendError> {
+        Ok(outcome())
+    }
+
+    fn kill(&self, _box_id: &str) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    fn boxes(&self) -> Result<Vec<BoxState>, BackendError> {
+        Ok(Vec::new())
+    }
 }

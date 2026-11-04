@@ -37,7 +37,6 @@ struct Holding {
 
 impl VmBackend for Holding {
     fn run(&self, spec: &RunSpec) -> Result<Outcome, BackendError> {
-        self.seen.runs.fetch_add(1, Ordering::SeqCst);
         self.seen.commands.lock().unwrap().push(spec.command.to_vec());
         self.seen
             .deadline_suspended
@@ -51,6 +50,8 @@ impl VmBackend for Holding {
             .push(spec.grants.agent && !spec.grants.secrets);
         self.seen.envs.lock().unwrap().push(spec.env.to_vec());
         self.seen.timeouts.lock().unwrap().push(spec.timeout_secs);
+        // Last, so a test that waits for the count reads every record below.
+        self.seen.runs.fetch_add(1, Ordering::SeqCst);
         let start = Instant::now();
         while let Some(stuck) = self.stubborn.as_ref().filter(|s| s.load(Ordering::SeqCst)) {
             let _ = stuck;

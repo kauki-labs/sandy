@@ -42,7 +42,7 @@ impl RunGuards {
                 slot.guard.replace(guard)
             }
         };
-        drop(dropped); // outside the lock: a guard's drop may take other locks
+        release(dropped); // outside the lock: a guard's drop may take other locks
     }
 
     /// Close the slot and drop what it holds.
@@ -52,7 +52,15 @@ impl RunGuards {
             slot.closed = true;
             slot.guard.take()
         };
-        drop(dropped);
+        release(dropped);
+    }
+}
+
+/// Drops a guard, containing a panic in its `Drop`: this can run during an unwind, where a second panic aborts
+/// the daemon.
+fn release(guard: Option<RunGuard>) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(guard))).is_err() {
+        tracing::error!("a run guard panicked while it was released");
     }
 }
 
