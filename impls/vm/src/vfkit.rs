@@ -287,7 +287,8 @@ impl VfkitBackend {
     /// vfkit must declare the vsock device before boot, so the caller picks the path (short enough for
     /// `sun_path`, no comma, in a private directory such as `sandy_fsutil`'s staging base: the backend does not check
     /// who else can write there) and dials it with `sandy-conn`'s `UnixDialer`. Without it the guest has no service
-    /// channel. The backend serves ONE run, like agent mode: build one per environment.
+    /// channel. The backend serves ONE run, like agent mode: build one per environment. The path must be unique per
+    /// environment: a second backend on the same path would find the first run's live socket and unlink it.
     #[must_use]
     pub fn with_service_socket(mut self, socket: impl Into<PathBuf>) -> Self {
         self.service_socket = Some(socket.into());
@@ -1257,7 +1258,7 @@ mod tests {
     fn a_service_socket_path_is_checked_and_only_a_stale_socket_is_cleared() -> anyhow::Result<()> {
         use std::os::unix::net::UnixListener;
 
-        let dir = std::env::temp_dir().join(format!("sv-{}", Uuid::new_v4().simple()));
+        let dir = PathBuf::from(format!("/tmp/sv-{}", &Uuid::new_v4().simple().to_string()[..8]));
         std::fs::create_dir_all(&dir).context("create dir")?;
         let refused = |path: &Path, why: &str| {
             assert!(
@@ -1294,8 +1295,17 @@ mod tests {
         assert_eq!(prepare_service_socket(&at_limit)?, at_limit);
         refused(&dir.join("x".repeat(pad + 1)), "longer");
 
-        // A comma would split vfkit's option string.
+        // A comma or a control character would split or corrupt vfkit's option string.
         refused(&dir.join("a,b"), "comma");
+        refused(&dir.join("a\tb"), "control character");
+
+        // A symlink to a live socket is refused and left in place.
+        let live = dir.join("live.sock");
+        let _listener = UnixListener::bind(&live).context("bind live socket")?;
+        let to_live = dir.join("to-live");
+        std::os::unix::fs::symlink(&live, &to_live).context("symlink to socket")?;
+        refused(&to_live, "not a socket");
+        assert!(live.exists() && to_live.symlink_metadata().is_ok());
         std::fs::remove_dir_all(&dir).context("cleanup")?;
         Ok(())
     }
@@ -1303,7 +1313,8 @@ mod tests {
     /// #590: one service-socket backend runs one job.
     #[test]
     fn a_service_socket_backend_refuses_a_second_run() {
-        let backend = VfkitBackend::new("/nonexistent/vfkit").with_service_socket("/tmp/sandy/sv-x.sock");
+        let backend = VfkitBackend::new("/nonexistent/vfkit")
+            .with_service_socket(format!("/tmp/sv-{}.sock", &Uuid::new_v4().simple().to_string()[..8]));
         let template = fixture_path("topology-aarch64.json");
         let command = ["true".to_string()];
         let grants = grants();
