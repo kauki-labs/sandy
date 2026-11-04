@@ -24,7 +24,10 @@
 
 use std::{
     path::Path,
-    sync::{Mutex, PoisonError},
+    sync::{
+        Mutex, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -234,6 +237,8 @@ pub struct EnvironmentStore {
     conn: Mutex<Connection>,
     /// The row cap `create` enforces; `None` is uncapped.
     max_rows: Option<usize>,
+    /// Set once a trusted-only backend runs: `create` then needs a `TRUSTED` submitter.
+    trusted_only: AtomicBool,
 }
 
 /// A raw `environments` row, read before its `state` string is validated.
@@ -377,7 +382,19 @@ impl EnvironmentStore {
         Ok(Self {
             conn: Mutex::new(conn),
             max_rows: None,
+            trusted_only: AtomicBool::new(false),
         })
+    }
+
+    /// Refuse a create from any submitter not cleared as `TRUSTED`. Called when a
+    /// trusted-only backend (the process backend) starts; it is never switched off.
+    pub fn require_trusted_submitter(&self) {
+        self.trusted_only.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether [`EnvironmentStore::require_trusted_submitter`] was called.
+    pub fn trusted_submitter_required(&self) -> bool {
+        self.trusted_only.load(Ordering::Relaxed)
     }
 
     /// Cap the table at `max_rows` rows that are not `Deleted` (a `Failed` row

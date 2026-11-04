@@ -567,6 +567,7 @@ mod tests {
         let op = control_request::Op::CreateEnvironment(CreateEnvironmentRequest {
             idempotency_key: key.to_owned(),
             spec: Some(spec),
+            ..Default::default()
         });
         match call(store, op).await? {
             Ok(control_response::Result::Environment(env)) => Ok(env),
@@ -654,6 +655,7 @@ mod tests {
         let op = control_request::Op::CreateEnvironment(CreateEnvironmentRequest {
             idempotency_key: "k1".to_owned(),
             spec: Some(other),
+            ..Default::default()
         });
         assert_eq!(refused(&s, op).await?, EnvironmentErrorCode::RequestIdConflict);
         assert_eq!(s.list()?.len(), 1, "a conflict must write nothing");
@@ -674,6 +676,7 @@ mod tests {
             let op = control_request::Op::CreateEnvironment(CreateEnvironmentRequest {
                 idempotency_key: key.to_owned(),
                 spec: Some(ephemeral()),
+                ..Default::default()
             });
             assert_eq!(
                 refused(&s, op).await?,
@@ -718,12 +721,14 @@ mod tests {
             let op = control_request::Op::CreateEnvironment(CreateEnvironmentRequest {
                 idempotency_key: "k".to_owned(),
                 spec: Some(bad),
+                ..Default::default()
             });
             assert_eq!(refused(&s, op).await?, EnvironmentErrorCode::InvalidArgument, "{what}");
         }
         let no_spec = control_request::Op::CreateEnvironment(CreateEnvironmentRequest {
             idempotency_key: "k".to_owned(),
             spec: None,
+            ..Default::default()
         });
         assert_eq!(refused(&s, no_spec).await?, EnvironmentErrorCode::InvalidArgument);
         assert!(s.list()?.is_empty(), "a refused create must leave no row");
@@ -909,6 +914,7 @@ mod tests {
         let op = control_request::Op::CreateEnvironment(CreateEnvironmentRequest {
             idempotency_key: "k2".to_owned(),
             spec: Some(ephemeral()),
+            ..Default::default()
         });
         assert_eq!(refused(&s, op).await?, EnvironmentErrorCode::QuotaExceeded);
         create(&s, "k1", ephemeral()).await?;
@@ -977,6 +983,7 @@ mod tests {
         let op = control_request::Op::CreateEnvironment(CreateEnvironmentRequest {
             idempotency_key: "k3".to_owned(),
             spec: Some(unknown_kind),
+            ..Default::default()
         });
         assert_eq!(refused(&s, op).await?, EnvironmentErrorCode::InvalidArgument);
         let op = control_request::Op::ListEnvironments(ListEnvironmentsRequest {
@@ -1006,6 +1013,7 @@ mod tests {
         let op = control_request::Op::CreateEnvironment(CreateEnvironmentRequest {
             idempotency_key: "k2".to_owned(),
             spec: Some(old),
+            ..Default::default()
         });
         assert_eq!(refused(&s, op).await?, EnvironmentErrorCode::InvalidArgument);
         Ok(())
@@ -1028,6 +1036,7 @@ mod tests {
             let op = control_request::Op::CreateEnvironment(CreateEnvironmentRequest {
                 idempotency_key: "k".to_owned(),
                 spec: Some(bad),
+                ..Default::default()
             });
             assert_eq!(
                 refused(&s, op).await?,
@@ -1040,6 +1049,7 @@ mod tests {
         let op = control_request::Op::CreateEnvironment(CreateEnvironmentRequest {
             idempotency_key: "k".to_owned(),
             spec: Some(bidi),
+            ..Default::default()
         });
         assert_eq!(
             refused(&s, op).await?,
@@ -1274,6 +1284,7 @@ mod tests {
         let over = control_request::Op::CreateEnvironment(CreateEnvironmentRequest {
             idempotency_key: "live-3".to_owned(),
             spec: Some(ephemeral()),
+            ..Default::default()
         });
         assert_eq!(refused(&s, over).await?, EnvironmentErrorCode::QuotaExceeded);
         // Deleting a live row frees its slot at once, with no wait for the retention window.

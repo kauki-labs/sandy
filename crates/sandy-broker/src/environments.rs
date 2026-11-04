@@ -260,6 +260,7 @@ pub(crate) async fn spawn(state: &State, client: &Client, req: Request<Incoming>
             lifetime: Some(lifetime),
             task_ref: body.task_ref,
         }),
+        ..Default::default()
     });
     let created = one(state, op).await?;
     // The sweep may have collected the replayed row after the lookup above, so the create made
