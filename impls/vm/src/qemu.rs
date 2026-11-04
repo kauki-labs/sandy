@@ -334,6 +334,8 @@ fn kernel_cmdline(cmdline: &str) -> String {
 /// [`sandy::VmBackend`]. Construct with [`QemuBackend::new`].
 #[derive(Debug, Default)]
 pub struct QemuBackend {
+    /// Called once per run with `(box_id, cid)` after the agent link connects (#587).
+    guest_cid_hook: HookCell,
     /// The boxes this backend has launched and not yet reaped, read by
     /// [`boxes`](VmBackend::boxes) and pruned by [`kill`](VmBackend::kill).
     instances: Mutex<Vec<BoxState>>,
@@ -348,6 +350,17 @@ impl QemuBackend {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Tell `hook` the vsock CID a guest holds, once per run, with the run's box id (#587).
+    ///
+    /// It fires only after the host has connected to the guest agent. A CID that collided with another VM and was
+    /// retried never reaches it, so a consumer that dials the CID (the service bridge) cannot reach a foreign VM.
+    /// Agent mode only: a run without [`with_agent`](Self::with_agent) never calls it.
+    #[must_use]
+    pub fn with_guest_cid_hook(mut self, hook: impl Fn(&str, u32) + Send + Sync + 'static) -> Self {
+        self.guest_cid_hook = HookCell(Some(Arc::new(hook)));
+        self
     }
 
     /// Run the job behind the guest's sandbox agent (#238). The console launches
@@ -490,6 +503,7 @@ impl QemuBackend {
         let connector = self.agent.as_ref().zip(agent).and_then(|(launch, (_, cid))| {
             spawn_vsock_connector(
                 launch,
+                self.guest_cid_hook.0.clone(),
                 cid,
                 &box_id,
                 // The console's command budget only starts once the guest has
@@ -580,6 +594,47 @@ pub(crate) fn cid_in_use(outcome: &Outcome) -> bool {
     !outcome.booted && outcome.console.contains("unable to set guest cid") && outcome.console.contains("in use")
 }
 
+/// A callback told which vsock CID a launched guest holds, see [`QemuBackend::with_guest_cid_hook`].
+pub type GuestCidHook = Arc<dyn Fn(&str, u32) + Send + Sync>;
+
+/// A [`GuestCidHook`] slot; a closure has no `Debug`, so the backend's derive needs this.
+#[derive(Default)]
+struct HookCell(Option<GuestCidHook>);
+
+impl std::fmt::Debug for HookCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "GuestCidHook(set)"
+        } else {
+            "GuestCidHook(none)"
+        })
+    }
+}
+
+/// Wrap `connect` so `hook` runs when it first succeeds.
+///
+/// A connect that fails or is retried never reports: a CID another VM holds (retried by the launch loop) must not
+/// reach a consumer that would dial it.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only the Linux vsock connector calls it")
+)]
+fn report_cid_on_connect<S>(
+    mut connect: impl FnMut() -> std::io::Result<S>,
+    hook: Option<GuestCidHook>,
+    box_id: &str,
+    cid: u32,
+) -> impl FnMut() -> std::io::Result<S> {
+    let box_id = box_id.to_string();
+    move || {
+        let stream = connect()?;
+        if let Some(hook) = &hook {
+            hook(&box_id, cid);
+        }
+        Ok(stream)
+    }
+}
+
 /// How many fresh CIDs an agent-mode run tries before giving up.
 const CID_ATTEMPTS: usize = 8;
 
@@ -587,6 +642,7 @@ const CID_ATTEMPTS: usize = 8;
 #[cfg(target_os = "linux")]
 fn spawn_vsock_connector(
     launch: &AgentLaunch,
+    hook: Option<GuestCidHook>,
     cid: u32,
     box_id: &str,
     deadline: Instant,
@@ -597,7 +653,12 @@ fn spawn_vsock_connector(
 )> {
     Some(crate::agent::spawn_connector(
         launch,
-        move || vsock::VsockStream::connect_with_cid_port(cid, AGENT_VSOCK_PORT),
+        report_cid_on_connect(
+            move || vsock::VsockStream::connect_with_cid_port(cid, AGENT_VSOCK_PORT),
+            hook,
+            box_id,
+            cid,
+        ),
         box_id,
         deadline,
         stop,
@@ -608,6 +669,7 @@ fn spawn_vsock_connector(
 #[cfg(not(target_os = "linux"))]
 fn spawn_vsock_connector(
     _launch: &AgentLaunch,
+    _hook: Option<GuestCidHook>,
     _cid: u32,
     _box_id: &str,
     _deadline: Instant,
@@ -843,6 +905,51 @@ mod tests {
     use sandy::{Grants, Hypervisor, Input, SECRET_MOUNT_TAG, SecretRef, SecretSource, parse_topology};
 
     use super::*;
+
+    #[test]
+    fn the_cid_is_reported_once_the_connect_succeeds() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let hook: GuestCidHook = {
+            let seen = Arc::clone(&seen);
+            Arc::new(move |box_id, cid| seen.lock().unwrap().push((box_id.to_string(), cid)))
+        };
+        let mut attempts = 0;
+        let mut connect = report_cid_on_connect(
+            move || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(std::io::Error::other("not yet"))
+                } else {
+                    Ok(attempts)
+                }
+            },
+            Some(hook),
+            "box-1",
+            77,
+        );
+        assert!(connect().is_err());
+        assert!(connect().is_err());
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a failed attempt must not report the CID"
+        );
+        assert_eq!(connect().unwrap(), 3);
+        assert_eq!(*seen.lock().unwrap(), vec![("box-1".to_string(), 77)]);
+    }
+
+    #[test]
+    fn a_connect_that_never_succeeds_never_reports_the_cid() {
+        let seen = Arc::new(Mutex::new(0));
+        let hook: GuestCidHook = {
+            let seen = Arc::clone(&seen);
+            Arc::new(move |_, _| *seen.lock().unwrap() += 1)
+        };
+        let mut connect = report_cid_on_connect(|| Err::<(), _>(std::io::Error::other("refused")), Some(hook), "b", 5);
+        for _ in 0..5 {
+            assert!(connect().is_err());
+        }
+        assert_eq!(*seen.lock().unwrap(), 0);
+    }
 
     /// A complete microvm.nix topology JSON (x86_64, qemu, erofs store).
     const X86_64_FIXTURE: &[u8] = include_bytes!("../tests/fixtures/topology-x86_64.json");
