@@ -494,6 +494,12 @@ environment refuses connections.
 - **Availability.** A local user can still hold the cap open with connections that keep trickling bytes, and on qemu
   any host process can hold the relay's own 256 slots. The idle timeout frees silent slots only; authentication is
   what closes this (10a), and the cap bounds descriptors.
+- **Guest CID source (qemu).** `QemuBackend::with_guest_cid_hook` tells the consumer the CID once, when the host holds
+  the agent link and this attempt's own guest has booted (the console command frame goes out only after the run's own
+  ready marker). The link alone is not enough: on a CID collision the connect reaches the VM that holds the CID, whose
+  agent may accept it, while the qemu that lost the CID never boots. A consumer that dials the hook's CID therefore
+  never reaches a foreign VM. Residual: `on_link` can still take a foreign agent's link in that collision window (#238,
+  not changed here).
 - **Not covered here.** The `EnvironmentBackend` that starts and stops a bridge per environment (#587 slice C), the
   live round trip through a real guest. The vfkit `connect` device is `VfkitBackend::with_service_socket`: the caller
   picks the socket path, and the backend checks its length and clears a stale file (vfkit is killed at teardown and
