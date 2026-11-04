@@ -54,6 +54,27 @@ pub trait ServiceProbe: Send + Sync {
 pub struct VmEnvironmentConfig {
     /// The guest command the agent runs as its job: the service.
     pub command: Vec<String>,
+    /// Guest environment added after the environment spec's own, so a repeated key here wins. In agent mode only
+    /// `SANDY_SERVICE` and `SANDY_HISTORY_LINES` reach the guest (`impls/vm`'s `agent_command_argv`); every other key
+    /// is dropped there. The service spec (`SANDY_SERVICE`) goes here: without it the agent runs `command` as a
+    /// plain job and never probes.
+    pub env: Vec<(String, String)>,
+    /// Sizes the hypervisor backend's connect budgets (the serial connect, capped at 10 s, and the vsock link
+    /// connector, twice this plus 120 s), so zero would give a real qemu one second. It is not a boot timeout: the
+    /// run's deadline is suspended, and the driver's provision timeout bounds a boot that never gets Ready.
+    pub boot_timeout_secs: u32,
+}
+
+impl VmEnvironmentConfig {
+    /// A config that runs `command`, with no extra environment and a ten-minute boot budget.
+    #[must_use]
+    pub fn new(command: Vec<String>) -> Self {
+        Self {
+            command,
+            env: Vec::new(),
+            boot_timeout_secs: 600,
+        }
+    }
 }
 
 struct Held {
@@ -121,21 +142,22 @@ impl VmEnvironmentBackend {
 fn hold(
     backend: &HeldBackend,
     spec: &EnvironmentSpec,
-    command: &[String],
+    config: &VmEnvironmentConfig,
     control: &RunControl,
 ) -> Result<(), BackendError> {
     control.suspend_deadline();
+    let env: Vec<(String, String)> = spec.env.iter().chain(&config.env).cloned().collect();
     let run = RunSpec {
         digests: false,
         template: &spec.template,
-        command,
+        command: &config.command,
         inputs: &[],
         outputs: &[],
         secrets: &[],
-        env: &spec.env,
+        env: &env,
         cpu: None,
         mem: None,
-        timeout_secs: 0,
+        timeout_secs: config.boot_timeout_secs,
         control,
         grants: &Grants {
             secrets: false,
@@ -154,6 +176,15 @@ fn hold(
         "an environment's held run returned"
     );
     Ok(())
+}
+
+/// Sets its flag when dropped, so the flag is set on a panic unwind too.
+struct SetOnDrop(Arc<AtomicBool>);
+
+impl Drop for SetOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 impl EnvironmentBackend for VmEnvironmentBackend {
@@ -177,19 +208,19 @@ impl EnvironmentBackend for VmEnvironmentBackend {
         }
         let control = RunControl::new(Instant::now());
         let done = Arc::new(AtomicBool::new(false));
-        let (thread_control, thread_done, thread_spec, command) = (
-            control.clone(),
-            Arc::clone(&done),
-            spec.clone(),
-            self.config.command.clone(),
-        );
+        let (thread_control, thread_done, thread_spec, config) =
+            (control.clone(), Arc::clone(&done), spec.clone(), self.config.clone());
         let thread = std::thread::Builder::new()
             .name(format!("env-run-{}", spec.environment_id))
             .spawn(move || {
-                if let Err(e) = hold(&backend, &thread_spec, &command, &thread_control) {
+                // Set on every exit, a panic included: a box whose thread died must not look up forever.
+                let _done = SetOnDrop(thread_done);
+                // Declared after `_done`, so it drops first: what the backend's guards hold (a bridge, a probe
+                // registration) is released before the id reads as free and a relaunch can register again.
+                let backend = backend;
+                if let Err(e) = hold(&backend, &thread_spec, &config, &thread_control) {
                     tracing::warn!(environment = %thread_spec.environment_id, error = %e, "an environment's held run failed");
                 }
-                thread_done.store(true, Ordering::SeqCst);
             })
             .map_err(|e| BackendError::Spawn(format!("start the run thread: {e}")))?;
         held.insert(
