@@ -8,8 +8,10 @@
 //!
 //! [`VmEnvironmentBackend`] is the isolated one: a held agent-mode `VmBackend::run` per environment.
 
+mod probe;
 mod process;
 mod vm;
 
+pub use probe::HttpServiceProbe;
 pub use process::{ProcessConfig, ProcessConfigError, ProcessEnvironmentBackend};
 pub use vm::{BackendFactory, HeldBackend, ServiceProbe, VmEnvironmentBackend, VmEnvironmentConfig};
