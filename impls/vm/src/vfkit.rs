@@ -1033,7 +1033,7 @@ mod tests {
     #[test]
     fn a_proxy_that_never_becomes_ready_fails_before_vfkit_and_leaves_nothing() -> anyhow::Result<()> {
         let stub = StubRun::new("exec sleep 30")?;
-        let result = stub.run(Duration::from_millis(300));
+        let result = stub.run(crate::egress_proxy::tests::NEVER_READY);
         let Err(BackendError::Spawn(message)) = result else {
             anyhow::bail!("expected Spawn, got {result:?}");
         };
@@ -1054,7 +1054,7 @@ mod tests {
     #[test]
     fn a_proxy_that_exits_early_makes_the_run_egress_proxy_died() -> anyhow::Result<()> {
         let stub = StubRun::new("echo READY; exit 3")?;
-        let result = stub.run(Duration::from_secs(5));
+        let result = stub.run(crate::egress_proxy::tests::PROXY_STARTS);
         anyhow::ensure!(
             matches!(
                 result,
@@ -1079,7 +1079,7 @@ mod tests {
     fn a_live_proxy_is_not_a_death_and_its_socket_is_staged_then_removed() -> anyhow::Result<()> {
         let stub = StubRun::new("echo READY; exec sleep 30")?;
         let outcome = stub
-            .run(Duration::from_secs(5))
+            .run(crate::egress_proxy::tests::PROXY_STARTS)
             .context("a live proxy must not fail the run")?;
         anyhow::ensure!(!outcome.booted, "the stub vfkit never boots: {outcome:?}");
         let socket = stub.proxy_socket()?;
