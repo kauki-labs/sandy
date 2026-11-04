@@ -12,6 +12,6 @@ mod probe;
 mod process;
 mod vm;
 
-pub use probe::HttpServiceProbe;
+pub use probe::{HttpServiceProbe, Registration};
 pub use process::{ProcessConfig, ProcessConfigError, ProcessEnvironmentBackend};
 pub use vm::{BackendFactory, HeldBackend, ServiceProbe, VmEnvironmentBackend, VmEnvironmentConfig};

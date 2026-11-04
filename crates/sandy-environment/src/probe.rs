@@ -9,8 +9,8 @@ use std::{
     collections::BTreeMap,
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
-    sync::{Mutex, PoisonError},
-    time::Duration,
+    sync::{Arc, Mutex, PoisonError},
+    time::{Duration, Instant},
 };
 
 use sandy_api::{
@@ -20,11 +20,16 @@ use sandy_api::{
 
 use crate::ServiceProbe;
 
-/// The HTTP status a service answers on `/`, or `None` if nothing answers.
+/// The whole probe, connect to last byte, gives up after this. A server that trickles one byte at a time cannot
+/// hold the driver's pass longer.
+const PROBE_BUDGET: Duration = Duration::from_millis(1500);
+
+/// The HTTP status a service answers on `/`, or `None` if nothing answers or the answer is not `HTTP/1.x NNN`.
 pub(crate) fn http_status(addr: SocketAddr) -> Option<u16> {
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(500)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
-    stream.set_write_timeout(Some(Duration::from_secs(1))).ok()?;
+    let start = Instant::now();
+    let left = || PROBE_BUDGET.checked_sub(start.elapsed()).filter(|d| !d.is_zero());
+    let mut stream = TcpStream::connect_timeout(&addr, left()?.min(Duration::from_millis(500))).ok()?;
+    stream.set_write_timeout(Some(left()?)).ok()?;
     stream
         .write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         .ok()?;
@@ -32,23 +37,45 @@ pub(crate) fn http_status(addr: SocketAddr) -> Option<u16> {
     let mut buf = [0u8; 12];
     let mut filled = 0;
     while filled < buf.len() {
+        stream.set_read_timeout(Some(left()?)).ok()?;
         match stream.read(&mut buf[filled..]) {
             Ok(0) | Err(_) => break,
             Ok(n) => filled += n,
         }
     }
-    let line = std::str::from_utf8(&buf[..filled]).ok()?;
-    let rest = line.strip_prefix("HTTP/1.")?;
-    rest.get(2..5)?.parse().ok()
+    let line = &buf[..filled];
+    let rest = line.strip_prefix(b"HTTP/1.")?;
+    // "<digit> NNN": one version digit, a space, then exactly three digits.
+    match rest {
+        [v, b' ', a, b, c, ..] if v.is_ascii_digit() && [a, b, c].iter().all(|d| d.is_ascii_digit()) => {
+            std::str::from_utf8(&[*a, *b, *c]).ok()?.parse().ok()
+        }
+        _ => None,
+    }
 }
+
+type Registry = Arc<Mutex<BTreeMap<String, (u64, SocketAddr)>>>;
 
 /// Reads readiness from an HTTP service behind a registered loopback address.
 ///
 /// A status below 500 is Ready: t3 answers 503 while it starts and 401 once auth is on, so Ready proves an HTTP
-/// listener, not that t3's API is up (as `sandy-t3-ready` in the guest image).
+/// listener, not that t3's API is up (as `sandy-t3-ready` in the guest image). Any HTTP answer counts, a 404 too,
+/// so an address must only stay registered while the bridge that owns it lives: see [`Registration`].
 #[derive(Debug, Default)]
 pub struct HttpServiceProbe {
-    addrs: Mutex<BTreeMap<String, SocketAddr>>,
+    addrs: Registry,
+    next: Mutex<u64>,
+}
+
+/// Keeps one environment's address registered. Dropping it unregisters the address, so a bridge that closes cannot
+/// leave its port behind for another local process to reuse and be reported Ready. A later registration for the
+/// same environment is not undone by an older guard dropping.
+#[must_use = "dropping the registration unregisters the address"]
+#[derive(Debug)]
+pub struct Registration {
+    addrs: Registry,
+    environment_id: String,
+    generation: u64,
 }
 
 impl HttpServiceProbe {
@@ -58,20 +85,35 @@ impl HttpServiceProbe {
         Self::default()
     }
 
-    /// Probe environment `environment_id` at `addr` from now on.
-    pub fn register(&self, environment_id: &str, addr: SocketAddr) {
+    /// Probe environment `environment_id` at `addr` for as long as the returned guard lives. Hold it with the
+    /// bridge that listens on `addr`.
+    pub fn register(&self, environment_id: &str, addr: SocketAddr) -> Registration {
+        let generation = {
+            let mut next = self.next.lock().unwrap_or_else(PoisonError::into_inner);
+            *next += 1;
+            *next
+        };
         self.addrs
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(environment_id.to_owned(), addr);
+            .insert(environment_id.to_owned(), (generation, addr));
+        Registration {
+            addrs: Arc::clone(&self.addrs),
+            environment_id: environment_id.to_owned(),
+            generation,
+        }
     }
+}
 
-    /// Forget `environment_id`: its probe is `Starting` again until a new address is registered.
-    pub fn unregister(&self, environment_id: &str) {
-        self.addrs
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(environment_id);
+impl Drop for Registration {
+    fn drop(&mut self) {
+        let mut addrs = self.addrs.lock().unwrap_or_else(PoisonError::into_inner);
+        if addrs
+            .get(&self.environment_id)
+            .is_some_and(|(g, _)| *g == self.generation)
+        {
+            addrs.remove(&self.environment_id);
+        }
     }
 }
 
@@ -82,7 +124,7 @@ impl ServiceProbe for HttpServiceProbe {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(environment_id)
-            .copied();
+            .map(|(_, addr)| *addr);
         Ok(match addr {
             None => Probe::Starting {
                 step: "waiting for the guest link".to_owned(),
