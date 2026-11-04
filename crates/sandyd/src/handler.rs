@@ -21,6 +21,7 @@ use sandy_fabric::{
     capauth::{Cap, CapAuthority, CapCodecError, CapRights, CapScope, decode_cap, encode_cap},
     types::{ChannelId, PeerId},
 };
+use sandy_guest_template::manifest::MANIFEST_ENCODING_FLAKE_V1;
 use sandy_orchestrator::{JobManifest, MANIFEST_ENCODING_JSON, derive_job_caps};
 use uuid::Uuid;
 
@@ -31,23 +32,22 @@ use crate::{
     store::{CancelOutcome, InsertOutcome, JobStore, StoreError, Transition},
 };
 
-/// The `manifest_encoding` tag a flake-templated VM job uses (#332) —
-/// `sandy_host_executor::dispatch`/`sandy_guest_template::manifest`'s own
-/// `MANIFEST_ENCODING_FLAKE_V1`, duplicated here (not imported) for the same
-/// reason `link_auth::LINK_TOKEN_LEN` duplicates
-/// `sandy_executor_proto::REMOTE_LINK_TOKEN_LEN`. The daemon classifies the tag and, since #589, runs the
-/// manifest's decode-time validation at Submit; it still resolves and builds nothing. The two constants name
-/// the same wire tag and must stay in sync if either changes.
-const MANIFEST_ENCODING_FLAKE_V1: &str = "flake/v1";
-
-/// The reason a `flake/v1` manifest would be refused by the executor's own decode, `None` for any other encoding
-/// or a manifest that decodes (#589). Run at Submit so a bad `service` fails in the reply, not after placement
-/// as a `MalformedManifest`. Only `flake/v1` is checked: this daemon still resolves and builds nothing.
+/// The reason a `flake/v1` manifest fails `decode_flake_manifest`, `None` for any other encoding or a manifest
+/// that decodes (#589). Run at Submit so a malformed manifest or an invalid `service` (root user, zero port,
+/// unrunnable probe) fails in the reply, not after placement as a `MalformedManifest`. It does not mirror the
+/// executor's temporary `ServiceNotSupported` guard: a valid service still reaches the executor. Only `flake/v1`
+/// is checked: this daemon still resolves and builds nothing. The error text can echo submitter bytes (an unknown
+/// field name), so control characters are replaced before it is returned or logged.
 fn flake_manifest_refusal(manifest_encoding: &str, manifest: &[u8]) -> Option<String> {
     (manifest_encoding == MANIFEST_ENCODING_FLAKE_V1)
         .then(|| sandy_guest_template::manifest::decode_flake_manifest(manifest).err())
         .flatten()
-        .map(|e| format!("the flake/v1 manifest is refused: {e}"))
+        .map(|e| {
+            format!("the flake/v1 manifest is refused: {e}")
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect()
+        })
 }
 
 /// The one refusal text for a `Cancel` that is not authorized (#540): it must not say whether the job
@@ -3116,12 +3116,54 @@ mod tests {
             other => anyhow::bail!("expected a refusal, got {other:?}"),
         }
         assert!(dispatch_rx.try_recv().is_err(), "a refused submit must not dispatch");
+        let list = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            req(2, control_request::Op::List(ListRequest {})),
+        )
+        .await?;
+        match list.result {
+            Some(control_response::Result::List(ListResponse { jobs })) => {
+                assert!(jobs.is_empty(), "a refused submit must create no job: {jobs:?}");
+            }
+            other => anyhow::bail!("expected a List response, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// #589: the refusal covers the rest of decode too, and a submitter-chosen field name cannot carry a newline
+    /// into the reply (and so into the broker's log).
+    #[tokio::test]
+    async fn a_malformed_flake_manifest_is_refused_without_control_characters() -> anyhow::Result<()> {
+        let malformed: [&[u8]; 2] = [b"not json", br#"{"flake":"x","command":[],"\n2026 INFO forged":1}"#];
+        for manifest in malformed {
+            let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+            let response = handle(
+                &store,
+                &registry,
+                &host_registry,
+                None,
+                test_session(),
+                submit_req_flake_with(1, manifest.to_vec()),
+            )
+            .await?;
+            match response.result {
+                Some(control_response::Result::Error(ControlError { message })) => {
+                    assert!(message.contains("flake/v1 manifest is refused"), "got {message:?}");
+                    assert!(!message.chars().any(char::is_control), "got {message:?}");
+                }
+                other => anyhow::bail!("expected a refusal, got {other:?}"),
+            }
+        }
         Ok(())
     }
 
     /// #589: a well-formed service manifest passes the Submit check and is placed.
     #[tokio::test]
-    async fn a_flake_submit_naming_a_valid_service_is_placed() -> anyhow::Result<()> {
+    async fn a_flake_submit_naming_a_valid_service_passes_the_submit_check() -> anyhow::Result<()> {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
         let mut dispatch_rx = register_test_host(&host_registry, "remote-host", peer_ip, vm_host_capabilities());
