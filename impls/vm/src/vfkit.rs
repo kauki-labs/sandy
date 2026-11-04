@@ -440,7 +440,12 @@ fn prepare_service_socket(socket: &Path) -> Result<PathBuf, BackendError> {
             "the service socket path {shown} is longer than a unix socket allows ({MAX_SOCKET_PATH} bytes)"
         )));
     }
-    if socket.to_string_lossy().chars().any(|c| c == ',' || c.is_control()) {
+    let Some(text) = socket.to_str() else {
+        return Err(BackendError::Spawn(format!(
+            "the service socket path {shown} is not UTF-8, so vfkit's argument would name another path"
+        )));
+    };
+    if text.chars().any(|c| c == ',' || c.is_control()) {
         return Err(BackendError::Spawn(format!(
             "the service socket path {shown} holds a comma or a control character, which vfkit's option parser would \
              split"
@@ -1298,6 +1303,11 @@ mod tests {
         // A comma or a control character would split or corrupt vfkit's option string.
         refused(&dir.join("a,b"), "comma");
         refused(&dir.join("a\tb"), "control character");
+        // A non-UTF-8 name would reach vfkit's argument with U+FFFD in place of the bytes, naming another path.
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            refused(&dir.join(std::ffi::OsStr::from_bytes(b"a\xffb")), "UTF-8");
+        }
 
         // A symlink to a live socket is refused and left in place.
         let live = dir.join("live.sock");
