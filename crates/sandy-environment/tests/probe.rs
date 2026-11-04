@@ -128,6 +128,10 @@ fn the_500_boundary_and_other_statuses() -> Result<()> {
         ("HTTP/1.1 +99 X\r\n\r\n", false),
         ("HTTP/1.1 2xx X\r\n\r\n", false),
         ("HTTP/1.1200 OK\r\n\r\n", false),
+        ("HTTP/1.1 2000 X\r\n\r\n", false),
+        ("HTTP/1.1 200garbage\r\n\r\n", false),
+        ("HTTP/1.1 200\r\n\r\n", true),
+        ("HTTP/1.1 200", true), // the status at the very end of input
         ("HTTP/2 200\r\n\r\n", false),
         ("HTTP/1.", false), // early EOF
     ] {
@@ -167,7 +171,7 @@ fn a_server_that_never_answers_or_trickles_cannot_hold_the_probe_past_its_budget
         let out = probe_at(addr)?;
         assert!(matches!(&out, Probe::Starting { .. }), "{byte:?}: {out:?}");
         assert!(
-            start.elapsed() < Duration::from_millis(2500),
+            start.elapsed() < Duration::from_millis(2000),
             "{byte:?}: the probe took {:?}",
             start.elapsed()
         );

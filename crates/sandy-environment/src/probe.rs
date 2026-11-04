@@ -33,8 +33,8 @@ pub(crate) fn http_status(addr: SocketAddr) -> Option<u16> {
     stream
         .write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         .ok()?;
-    // "HTTP/1.x NNN" is 12 bytes; a service may send it in segments.
-    let mut buf = [0u8; 12];
+    // "HTTP/1.x NNN" plus one delimiter byte; a service may send it in segments.
+    let mut buf = [0u8; 13];
     let mut filled = 0;
     while filled < buf.len() {
         stream.set_read_timeout(Some(left()?)).ok()?;
@@ -47,7 +47,11 @@ pub(crate) fn http_status(addr: SocketAddr) -> Option<u16> {
     let rest = line.strip_prefix(b"HTTP/1.")?;
     // "<digit> NNN": one version digit, a space, then exactly three digits.
     match rest {
-        [v, b' ', a, b, c, ..] if v.is_ascii_digit() && [a, b, c].iter().all(|d| d.is_ascii_digit()) => {
+        [v, b' ', a, b, c, delim @ ..]
+            if v.is_ascii_digit()
+                && [a, b, c].iter().all(|d| d.is_ascii_digit())
+                && delim.first().is_none_or(|&d| matches!(d, b' ' | b'\r' | b'\n')) =>
+        {
             std::str::from_utf8(&[*a, *b, *c]).ok()?.parse().ok()
         }
         _ => None,
