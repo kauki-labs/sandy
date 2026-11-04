@@ -4,7 +4,7 @@
 use std::{
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -21,6 +21,8 @@ struct Seen {
     runs: AtomicUsize,
     commands: Mutex<Vec<Vec<String>>>,
     deadline_suspended: Mutex<Vec<bool>>,
+    agent_grant: Mutex<Vec<bool>>,
+    envs: Mutex<Vec<Vec<(String, String)>>>,
 }
 
 /// Holds `run` until cancelled, like a booted VM; `die_after` makes it return by itself.
@@ -28,6 +30,8 @@ struct Holding {
     seen: Arc<Seen>,
     die_after: Option<Duration>,
     teardown: Duration,
+    /// While set, `run` ignores cancel, like a hung hypervisor.
+    stubborn: Option<Arc<AtomicBool>>,
 }
 
 impl VmBackend for Holding {
@@ -39,7 +43,17 @@ impl VmBackend for Holding {
             .lock()
             .unwrap()
             .push(spec.control.deadline().is_none());
+        self.seen
+            .agent_grant
+            .lock()
+            .unwrap()
+            .push(spec.grants.agent && !spec.grants.secrets);
+        self.seen.envs.lock().unwrap().push(spec.env.to_vec());
         let start = Instant::now();
+        while let Some(stuck) = self.stubborn.as_ref().filter(|s| s.load(Ordering::SeqCst)) {
+            let _ = stuck;
+            std::thread::sleep(Duration::from_millis(5));
+        }
         while !spec.control.is_cancelled() {
             if self.die_after.is_some_and(|d| start.elapsed() >= d) {
                 break;
@@ -77,6 +91,14 @@ fn spec(id: &str) -> EnvironmentSpec {
 }
 
 fn backend(die_after: Option<Duration>, teardown: Duration) -> (VmEnvironmentBackend, Arc<Seen>) {
+    stubborn_backend(die_after, teardown, None)
+}
+
+fn stubborn_backend(
+    die_after: Option<Duration>,
+    teardown: Duration,
+    stubborn: Option<Arc<AtomicBool>>,
+) -> (VmEnvironmentBackend, Arc<Seen>) {
     let seen = Arc::new(Seen::default());
     let s = Arc::clone(&seen);
     let b = VmEnvironmentBackend::new(
@@ -85,6 +107,7 @@ fn backend(die_after: Option<Duration>, teardown: Duration) -> (VmEnvironmentBac
                 seen: Arc::clone(&s),
                 die_after,
                 teardown,
+                stubborn: stubborn.clone(),
             }))
         }),
         VmEnvironmentConfig {
@@ -121,6 +144,11 @@ fn the_run_gets_the_service_command_and_no_deadline() -> Result<()> {
     b.launch(&spec("env-a"))?;
     wait_for("the run to start", || seen.runs.load(Ordering::SeqCst) == 1)?;
     assert_eq!(seen.commands.lock().unwrap()[0], ["t3", "serve"]);
+    assert!(
+        seen.agent_grant.lock().unwrap()[0],
+        "agent mode: the agent grant on, secrets off"
+    );
+    assert_eq!(seen.envs.lock().unwrap()[0], [("K".to_owned(), "V".to_owned())]);
     assert!(
         seen.deadline_suspended.lock().unwrap()[0],
         "an environment must not time out"
@@ -231,5 +259,88 @@ fn dropping_the_backend_cancels_every_run() -> Result<()> {
     b.launch(&spec("env-a"))?;
     wait_for("the run to start", || seen.runs.load(Ordering::SeqCst) == 1)?;
     drop(b); // joins the run thread: it returns only because it was cancelled
+    Ok(())
+}
+
+#[test]
+fn a_launch_during_a_slow_kill_is_refused_and_starts_no_second_vm() -> Result<()> {
+    let (b, seen) = backend(None, Duration::from_millis(500));
+    let b = Arc::new(b);
+    b.launch(&spec("env-a"))?;
+    wait_for("the run to start", || seen.runs.load(Ordering::SeqCst) == 1)?;
+    let killer = Arc::clone(&b);
+    let t = std::thread::spawn(move || killer.kill("env-a"));
+    // The box is still alive while it tears down, so it stays listed and the id is not free.
+    wait_for("the kill to mark the entry", || {
+        matches!(b.probe("env-a"), Ok(Probe::NotRunning))
+    })?;
+    assert_eq!(b.boxes()?.len(), 1, "a box that is tearing down is still a box");
+    let err = b
+        .launch(&spec("env-a"))
+        .err()
+        .context("a launch during a kill must be refused")?;
+    assert!(matches!(err, BackendError::Spawn(_)));
+    t.join().map_err(|_| anyhow::anyhow!("kill thread panicked"))??;
+    assert_eq!(
+        seen.runs.load(Ordering::SeqCst),
+        1,
+        "no second VM while the first tears down"
+    );
+    assert_eq!(
+        b.launch(&spec("env-a"))?,
+        Launch::Started,
+        "the id is free after the kill"
+    );
+    wait_for("the second run", || seen.runs.load(Ordering::SeqCst) == 2)?;
+    Ok(())
+}
+
+#[test]
+fn two_concurrent_kills_both_return_only_after_the_run_ended() -> Result<()> {
+    let (b, seen) = backend(None, Duration::from_millis(300));
+    let b = Arc::new(b);
+    b.launch(&spec("env-a"))?;
+    wait_for("the run to start", || seen.runs.load(Ordering::SeqCst) == 1)?;
+    let (k1, k2) = (Arc::clone(&b), Arc::clone(&b));
+    let t1 = std::thread::spawn(move || k1.kill("env-a"));
+    std::thread::sleep(Duration::from_millis(50));
+    let t2 = std::thread::spawn(move || k2.kill("env-a"));
+    t1.join().map_err(|_| anyhow::anyhow!("kill 1 panicked"))??;
+    t2.join().map_err(|_| anyhow::anyhow!("kill 2 panicked"))??;
+    assert!(b.boxes()?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn a_kill_that_times_out_keeps_the_box_so_a_retry_ends_it() -> Result<()> {
+    let stuck = Arc::new(AtomicBool::new(true));
+    let (b, seen) = stubborn_backend(None, Duration::ZERO, Some(Arc::clone(&stuck)));
+    let b = b.with_kill_wait(Duration::from_millis(150));
+    b.launch(&spec("env-a"))?;
+    wait_for("the run to start", || seen.runs.load(Ordering::SeqCst) == 1)?;
+    assert!(matches!(b.kill("env-a"), Err(BackendError::Transport(_))));
+    assert_eq!(b.boxes()?.len(), 1, "a VM that did not stop must stay listed");
+    assert_eq!(
+        b.launch(&spec("env-a"))?,
+        Launch::AlreadyRunning,
+        "and must not be replaced"
+    );
+    stuck.store(false, Ordering::SeqCst);
+    b.kill("env-a")?;
+    assert!(b.boxes()?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn dropping_the_backend_does_not_hang_on_a_run_that_ignores_cancel() -> Result<()> {
+    let stuck = Arc::new(AtomicBool::new(true));
+    let (b, seen) = stubborn_backend(None, Duration::ZERO, Some(Arc::clone(&stuck)));
+    let b = b.with_kill_wait(Duration::from_millis(150));
+    b.launch(&spec("env-a"))?;
+    wait_for("the run to start", || seen.runs.load(Ordering::SeqCst) == 1)?;
+    let start = Instant::now();
+    drop(b);
+    assert!(start.elapsed() < Duration::from_secs(3), "drop must give up, not hang");
+    stuck.store(false, Ordering::SeqCst);
     Ok(())
 }

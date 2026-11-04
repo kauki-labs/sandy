@@ -16,7 +16,10 @@
 
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{
+        Arc, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     thread::JoinHandle,
     time::{Duration, Instant, SystemTime},
 };
@@ -55,8 +58,20 @@ pub struct VmEnvironmentConfig {
 
 struct Held {
     control: RunControl,
+    /// Set by the run thread when `run()` returns, however it ends.
+    done: Arc<AtomicBool>,
+    /// Taken by the kill that owns the teardown.
     thread: Option<JoinHandle<()>>,
+    /// A kill is tearing the box down: the id is not free until it finishes.
+    killing: bool,
+    generation: u64,
     started: SystemTime,
+}
+
+impl Held {
+    fn up(&self) -> bool {
+        !self.done.load(Ordering::SeqCst)
+    }
 }
 
 /// An [`EnvironmentBackend`] over a hypervisor [`VmBackend`].
@@ -64,6 +79,8 @@ pub struct VmEnvironmentBackend {
     factory: BackendFactory,
     config: VmEnvironmentConfig,
     service: Option<Arc<dyn ServiceProbe>>,
+    kill_wait: Duration,
+    next_generation: AtomicU64,
     held: Mutex<BTreeMap<String, Held>>,
 }
 
@@ -75,6 +92,8 @@ impl VmEnvironmentBackend {
             factory,
             config,
             service: None,
+            kill_wait: KILL_WAIT,
+            next_generation: AtomicU64::new(0),
             held: Mutex::new(BTreeMap::new()),
         }
     }
@@ -83,6 +102,13 @@ impl VmEnvironmentBackend {
     #[must_use]
     pub fn with_service_probe(mut self, service: Arc<dyn ServiceProbe>) -> Self {
         self.service = Some(service);
+        self
+    }
+
+    /// How long `kill` and drop wait for a cancelled run to return.
+    #[must_use]
+    pub fn with_kill_wait(mut self, wait: Duration) -> Self {
+        self.kill_wait = wait;
         self
     }
 
@@ -132,31 +158,48 @@ fn hold(
 
 impl EnvironmentBackend for VmEnvironmentBackend {
     fn launch(&self, spec: &EnvironmentSpec) -> Result<Launch, BackendError> {
+        if let Some(outcome) = self.existing(&spec.environment_id)? {
+            return Ok(outcome);
+        }
+        // Built outside the lock: a slow factory must not block other environments.
+        let backend = (self.factory)(spec)?;
         let mut held = self.lock();
+        // Another launch may have won the id while the factory ran.
         if let Some(entry) = held.get(&spec.environment_id) {
-            if entry.thread.as_ref().is_some_and(|t| !t.is_finished()) {
-                return Ok(Launch::AlreadyRunning);
+            if entry.up() {
+                return if entry.killing {
+                    Err(still_stopping(&spec.environment_id))
+                } else {
+                    Ok(Launch::AlreadyRunning)
+                };
             }
-            // The run returned on its own: the box is gone, so this launch starts a fresh one.
             held.remove(&spec.environment_id);
         }
-        let backend = (self.factory)(spec)?;
         let control = RunControl::new(Instant::now());
-        let (thread_control, thread_spec, command) = (control.clone(), spec.clone(), self.config.command.clone());
-        let id = spec.environment_id.clone();
+        let done = Arc::new(AtomicBool::new(false));
+        let (thread_control, thread_done, thread_spec, command) = (
+            control.clone(),
+            Arc::clone(&done),
+            spec.clone(),
+            self.config.command.clone(),
+        );
         let thread = std::thread::Builder::new()
-            .name(format!("env-run-{id}"))
+            .name(format!("env-run-{}", spec.environment_id))
             .spawn(move || {
                 if let Err(e) = hold(&backend, &thread_spec, &command, &thread_control) {
                     tracing::warn!(environment = %thread_spec.environment_id, error = %e, "an environment's held run failed");
                 }
+                thread_done.store(true, Ordering::SeqCst);
             })
             .map_err(|e| BackendError::Spawn(format!("start the run thread: {e}")))?;
         held.insert(
-            id,
+            spec.environment_id.clone(),
             Held {
                 control,
+                done,
                 thread: Some(thread),
+                killing: false,
+                generation: self.next_generation.fetch_add(1, Ordering::SeqCst),
                 started: SystemTime::now(),
             },
         );
@@ -164,10 +207,7 @@ impl EnvironmentBackend for VmEnvironmentBackend {
     }
 
     fn probe(&self, environment_id: &str) -> Result<Probe, BackendError> {
-        let up = self
-            .lock()
-            .get(environment_id)
-            .is_some_and(|h| h.thread.as_ref().is_some_and(|t| !t.is_finished()));
+        let up = self.lock().get(environment_id).is_some_and(|h| h.up() && !h.killing);
         if !up {
             return Ok(Probe::NotRunning);
         }
@@ -180,40 +220,50 @@ impl EnvironmentBackend for VmEnvironmentBackend {
     }
 
     fn kill(&self, environment_id: &str) -> Result<(), BackendError> {
-        // Take the thread out under the lock and wait without it, so a slow teardown does not block other environments.
-        let (control, thread) = {
+        // Mark the entry and take the thread under the lock; wait without it, so a slow teardown blocks only this id.
+        let (control, done, generation, thread) = {
             let mut held = self.lock();
-            match held.get_mut(environment_id) {
-                None => return Ok(()),
-                Some(h) => (h.control.clone(), h.thread.take()),
-            }
+            let Some(h) = held.get_mut(environment_id) else {
+                return Ok(());
+            };
+            h.killing = true;
+            (h.control.clone(), Arc::clone(&h.done), h.generation, h.thread.take())
         };
         control.cancel();
-        if let Some(thread) = thread {
-            let start = Instant::now();
-            while !thread.is_finished() {
-                if start.elapsed() >= KILL_WAIT {
-                    // Keep the entry and the thread, so a later kill retries instead of orphaning the VM.
-                    if let Some(h) = self.lock().get_mut(environment_id) {
-                        h.thread = Some(thread);
+        let start = Instant::now();
+        while !done.load(Ordering::SeqCst) {
+            if start.elapsed() >= self.kill_wait {
+                // Keep the entry, still marked up, so a later kill retries and no launch starts a second VM.
+                let mut held = self.lock();
+                if let Some(h) = held.get_mut(environment_id).filter(|h| h.generation == generation) {
+                    h.killing = false;
+                    if h.thread.is_none() {
+                        h.thread = thread;
                     }
-                    return Err(BackendError::Transport(format!(
-                        "the run of {environment_id} did not return after cancel"
-                    )));
                 }
-                std::thread::sleep(Duration::from_millis(20));
+                return Err(BackendError::Transport(format!(
+                    "the run of {environment_id} did not return after cancel"
+                )));
             }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if let Some(thread) = thread {
             let _ = thread.join();
         }
-        self.lock().remove(environment_id);
+        let mut held = self.lock();
+        // Only this generation's entry: a launch that replaced it must stay.
+        if held.get(environment_id).is_some_and(|h| h.generation == generation) {
+            held.remove(environment_id);
+        }
         Ok(())
     }
 
     fn boxes(&self) -> Result<Vec<BoxState>, BackendError> {
+        // A box that is mid-kill is still alive, so it is still listed.
         Ok(self
             .lock()
             .iter()
-            .filter(|(_, h)| h.thread.as_ref().is_some_and(|t| !t.is_finished()))
+            .filter(|(_, h)| h.up())
             .map(|(id, h)| BoxState {
                 box_id: id.clone(),
                 box_name: id.clone(),
@@ -225,16 +275,46 @@ impl EnvironmentBackend for VmEnvironmentBackend {
     }
 }
 
+fn still_stopping(id: &str) -> BackendError {
+    BackendError::Spawn(format!("the previous box of {id} is still stopping"))
+}
+
+impl VmEnvironmentBackend {
+    /// `Some` when the id already decides a launch: a run that is up, or one being torn down.
+    fn existing(&self, id: &str) -> Result<Option<Launch>, BackendError> {
+        let mut held = self.lock();
+        match held.get(id) {
+            Some(h) if h.up() && h.killing => Err(still_stopping(id)),
+            Some(h) if h.up() => Ok(Some(Launch::AlreadyRunning)),
+            Some(_) => {
+                // The run returned on its own: the box is gone, so this launch starts a fresh one.
+                held.remove(id);
+                Ok(None)
+            }
+            None => Ok(None),
+        }
+    }
+}
+
 impl Drop for VmEnvironmentBackend {
     fn drop(&mut self) {
-        // A dropped backend must not leave a VM running with nobody to kill it.
+        // A dropped backend must not leave a VM running with nobody to kill it, and must not hang shutdown.
         let held = std::mem::take(&mut *self.lock());
         for h in held.values() {
             h.control.cancel();
         }
-        for (_, mut h) in held {
-            if let Some(thread) = h.thread.take() {
-                let _ = thread.join();
+        let start = Instant::now();
+        for (id, mut h) in held {
+            while h.up() && start.elapsed() < self.kill_wait {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            match h.thread.take() {
+                Some(thread) if !h.up() => {
+                    let _ = thread.join();
+                }
+                _ => {
+                    tracing::error!(environment = %id, "a run did not return after cancel; its VM may outlive the daemon")
+                }
             }
         }
     }

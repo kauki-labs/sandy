@@ -2256,7 +2256,7 @@ A client that polls `GetEnvironment` renews the lease for as long as it polls, a
 
 **Decision.**
 
-- `sandy-environment::VmEnvironmentBackend` runs one `VmBackend::run` per environment on its own thread, with the deadline suspended. `launch` returns once the thread starts. `kill` cancels the run's `RunControl` and waits up to 30 s for `run()` to return. A run that does not return keeps its entry, so a later kill retries.
+- `sandy-environment::VmEnvironmentBackend` runs one `VmBackend::run` per environment on its own thread, with the deadline suspended. `launch` returns once the thread starts. `kill` marks the entry as stopping, cancels the run's `RunControl` and waits up to 30 s for `run()` to return. While it waits the box stays listed and a launch for that id is refused, so no second VM starts before the first is gone. Concurrent kills wait on the same run. A run that does not return keeps its entry, so a later kill retries. Dropping the backend waits the same bounded time, then logs and gives up instead of hanging shutdown.
 - One hypervisor backend serves one environment, because agent mode runs one job per backend. The caller supplies a factory.
 - `boxes()` lists only runs still up. A run that returned is `NotRunning`, and a launch for that id starts a fresh box.
 - Readiness is not decided here. A `ServiceProbe` (the host bridge, slice C3b) is asked while the run is up; with none set, the probe reports `Starting`.
