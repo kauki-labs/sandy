@@ -2,21 +2,21 @@
 //!
 //! The launch driver runs only when a backend is configured. The process backend has NO isolation, so it is
 //! opt-in under a name that says so: `SANDY_ENV_BACKEND=process-insecure`. `vm-qemu` runs each environment as a
-//! qemu microVM (Linux only; another platform is an error). An unknown value is an error, never a silent "off", so
-//! a typo cannot hide a misconfiguration.
+//! qemu microVM (Linux only) and `vm-vfkit` as a vfkit microVM (macOS only); another platform is an error. An unknown
+//! value is an error, never a silent "off", so a typo cannot hide a misconfiguration.
 //!
 //! | variable | meaning |
 //! | --- | --- |
-//! | `SANDY_ENV_BACKEND` | unset or empty: no driver. `process-insecure`: host processes. `vm-qemu`: qemu microVMs (Linux). |
+//! | `SANDY_ENV_BACKEND` | unset or empty: no driver. `process-insecure`: host processes. `vm-qemu`: qemu microVMs (Linux). `vm-vfkit`: vfkit microVMs (macOS). |
 //! | `SANDY_ENV_PROCESS_COMMAND` | the service argv, split on whitespace; must contain `{port}`; `{base_dir}` and `{environment_id}` also expand |
 //! | `SANDY_ENV_PAIR_COMMAND` | optional argv run once after the service answers; stdout goes to `<base_dir>/pairing` (0600) |
 //! | `SANDY_ENV_STATE_DIR` | where environment directories live; default `<runtime dir>/environments` |
 //! | `SANDY_ENV_PASS_ENV` | comma-separated names of daemon variables passed to the service |
 //! | `SANDY_ENV_PATH` | the service's `PATH`; default the daemon's |
 //! | `SANDY_ENV_IDLE_TIMEOUT_SECS` | stop a Ready environment with no owner-visible use for this long; default off |
-//! | `SANDY_ENV_PROVISION_TIMEOUT_SECS` | seconds before a probe that is not Ready fails the environment; default 120; `vm-qemu`: its boot budget plus 300, and a value below the boot budget is refused |
+//! | `SANDY_ENV_PROVISION_TIMEOUT_SECS` | seconds before a probe that is not Ready fails the environment; default 120; `vm-qemu` and `vm-vfkit`: its boot budget plus 300, and a value below the boot budget is refused |
 //!
-//! `vm-qemu` reads these as well (and only these of the process settings: the timeouts above):
+//! `vm-qemu` and `vm-vfkit` read these as well (and only these of the process settings: the timeouts above):
 //!
 //! | variable | meaning |
 //! | --- | --- |
@@ -37,6 +37,9 @@ pub const PROCESS_INSECURE: &str = "process-insecure";
 
 /// The qemu microVM backend, Linux only.
 pub const VM_QEMU: &str = "vm-qemu";
+
+/// The vfkit microVM backend, macOS only.
+pub const VM_VFKIT: &str = "vm-vfkit";
 
 /// Seconds added to the boot budget for the `vm-qemu` provision timeout when none is set: the guest probe and the
 /// host bridge need time after the guest has booted.
@@ -64,12 +67,14 @@ pub enum BackendSettings {
     /// Host processes, no isolation.
     Process(ProcessConfig),
     /// One qemu microVM per environment.
-    VmQemu(VmQemuSettings),
+    VmQemu(VmSettings),
+    /// One vfkit microVM per environment.
+    VmVfkit(VmSettings),
 }
 
-/// How the `vm-qemu` backend runs a service. The guest topology is [`DriverConfig::template`].
+/// How a VM backend (`vm-qemu`, `vm-vfkit`) runs a service. The guest topology is [`DriverConfig::template`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VmQemuSettings {
+pub struct VmSettings {
     /// The service argv the guest agent runs, with `{port}` already expanded.
     pub command: Vec<String>,
     /// The `SANDY_SERVICE` value (JSON `ServiceSpec`) that makes the agent run `command` as a probed service.
@@ -82,10 +87,15 @@ pub struct VmQemuSettings {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EnvironmentBackendConfigError {
     /// `SANDY_ENV_BACKEND` names no known backend.
-    #[error("SANDY_ENV_BACKEND={0:?} is not a known backend (expected `{PROCESS_INSECURE}` or `{VM_QEMU}`)")]
+    #[error(
+        "SANDY_ENV_BACKEND={0:?} is not a known backend (expected `{PROCESS_INSECURE}`, `{VM_QEMU}` or `{VM_VFKIT}`)"
+    )]
     UnknownBackend(String),
     /// The backend exists but not on this platform.
-    #[error("SANDY_ENV_BACKEND={backend} is not available on {os}: it needs Linux with KVM and vhost-vsock")]
+    #[error(
+        "SANDY_ENV_BACKEND={backend} is not available on {os}: it needs {}",
+        platform_needs(backend)
+    )]
     UnsupportedPlatform {
         /// The selected backend.
         backend: &'static str,
@@ -131,6 +141,14 @@ pub enum EnvironmentBackendConfigError {
     StateDir(String),
 }
 
+fn platform_needs(backend: &str) -> &'static str {
+    if backend == VM_VFKIT {
+        "macOS with vfkit"
+    } else {
+        "Linux with KVM and vhost-vsock"
+    }
+}
+
 /// Reads the backend settings through `get`. `default_state_dir` is called only
 /// when a backend is on and `SANDY_ENV_STATE_DIR` is unset.
 ///
@@ -153,12 +171,13 @@ fn from_env_on(
     let Some(backend) = get("SANDY_ENV_BACKEND").filter(|v| !v.trim().is_empty()) else {
         return Ok(None);
     };
-    let vm = match backend.as_str() {
-        PROCESS_INSECURE => false,
-        VM_QEMU if os == "linux" => true,
-        VM_QEMU => {
+    let vm: Option<fn(VmSettings) -> BackendSettings> = match backend.as_str() {
+        PROCESS_INSECURE => None,
+        VM_QEMU if os == "linux" => Some(BackendSettings::VmQemu),
+        VM_VFKIT if os == "macos" => Some(BackendSettings::VmVfkit),
+        VM_QEMU | VM_VFKIT => {
             return Err(E::UnsupportedPlatform {
-                backend: VM_QEMU,
+                backend: if backend == VM_QEMU { VM_QEMU } else { VM_VFKIT },
                 os: os.to_owned(),
             });
         }
@@ -173,7 +192,7 @@ fn from_env_on(
         Some(raw) => Some(Duration::from_secs(positive_secs("SANDY_ENV_IDLE_TIMEOUT_SECS", raw)?)),
     };
     let mut provision_secs = explicit_provision.unwrap_or(120);
-    let (backend, template, service_port) = if vm {
+    let (backend, template, service_port) = if let Some(wrap) = vm {
         let (settings, template, port) = vm_settings(&get)?;
         let boot = u64::from(settings.boot_timeout_secs);
         match explicit_provision {
@@ -183,7 +202,7 @@ fn from_env_on(
             Some(_) => {}
             None => provision_secs = boot + VM_PROVISION_MARGIN_SECS,
         }
-        (BackendSettings::VmQemu(settings), template, Some(port))
+        (wrap(settings), template, Some(port))
     } else {
         (
             BackendSettings::Process(process_settings(&get, default_state_dir)?),
@@ -262,10 +281,10 @@ fn process_settings(
     })
 }
 
-/// The `vm-qemu` settings, the guest topology (the driver's template) and the service port.
+/// The VM settings, the guest topology (the driver's template) and the service port.
 fn vm_settings(
     get: &impl Fn(&str) -> Option<String>,
-) -> Result<(VmQemuSettings, String, u16), EnvironmentBackendConfigError> {
+) -> Result<(VmSettings, String, u16), EnvironmentBackendConfigError> {
     use EnvironmentBackendConfigError as E;
     use sandy_guest_template::manifest::{HealthProbe, ProbeCheck, RestartPolicy, ServiceSpec, validate_service_spec};
     let template = get("SANDY_ENV_VM_TEMPLATE")
@@ -325,7 +344,7 @@ fn vm_settings(
         )));
     }
     Ok((
-        VmQemuSettings {
+        VmSettings {
             command,
             service_env,
             boot_timeout_secs,
@@ -349,7 +368,7 @@ mod tests {
     fn process_of(cfg: &EnvironmentBackendConfig) -> &ProcessConfig {
         match &cfg.backend {
             BackendSettings::Process(p) => p,
-            BackendSettings::VmQemu(_) => panic!("expected the process backend"),
+            BackendSettings::VmQemu(_) | BackendSettings::VmVfkit(_) => panic!("expected the process backend"),
         }
     }
 
@@ -584,6 +603,66 @@ mod tests {
             );
             assert!(out.err().is_some_and(|e| e.to_string().contains(os)));
         }
+    }
+
+    fn vfkit_base() -> Vec<(&'static str, &'static str)> {
+        vm_base()
+            .into_iter()
+            .map(|(k, v)| {
+                if k == "SANDY_ENV_BACKEND" {
+                    (k, "vm-vfkit")
+                } else {
+                    (k, v)
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn vm_vfkit_off_macos_is_a_typed_error_naming_the_platform() {
+        for os in ["linux", "windows", "freebsd"] {
+            let out = parse_on(os, &vfkit_base());
+            assert_eq!(
+                out.as_ref().err(),
+                Some(&EnvironmentBackendConfigError::UnsupportedPlatform {
+                    backend: "vm-vfkit",
+                    os: os.to_owned()
+                }),
+                "{os}: {out:?}"
+            );
+            assert!(out.err().is_some_and(|e| e.to_string().contains("macOS")));
+        }
+    }
+
+    #[test]
+    fn vm_qemu_on_macos_is_still_refused() {
+        assert_eq!(
+            parse_on("macos", &vm_base()).err(),
+            Some(EnvironmentBackendConfigError::UnsupportedPlatform {
+                backend: "vm-qemu",
+                os: "macos".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn a_valid_vm_vfkit_configuration_reads_the_vm_settings_on_macos() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let cfg = parse_on("macos", &vfkit_base())?.context("a backend")?;
+        let BackendSettings::VmVfkit(vm) = &cfg.backend else {
+            anyhow::bail!("expected the vfkit backend, got {:?}", cfg.backend);
+        };
+        assert_eq!(vm.command, ["t3", "serve", "--port", "3773"]);
+        assert_eq!(cfg.driver.service_port, Some(3773));
+        // Same defaults as vm-qemu: the boot budget plus 300 s.
+        assert_eq!(cfg.driver.provision_timeout, Duration::from_secs(900));
+        let mut missing = vfkit_base();
+        missing.retain(|(k, _)| *k != "SANDY_ENV_VM_TEMPLATE");
+        assert_eq!(
+            parse_on("macos", &missing).err(),
+            Some(EnvironmentBackendConfigError::Missing("SANDY_ENV_VM_TEMPLATE"))
+        );
+        Ok(())
     }
 
     #[test]

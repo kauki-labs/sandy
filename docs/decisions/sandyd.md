@@ -2283,6 +2283,23 @@ A client that polls `GetEnvironment` renews the lease for as long as it polls, a
 - `on_link` serves the host end of the agent link with `serve_agent_link` on the daemon's runtime, over a per-environment `InMem` channel and a `LocalCapAuthority` whose cap outlives any run. Its verdict goes through `AgentReport`, so a link that closes without an exit frame is an agent failure (INV-11).
 - The CID hook starts a `Bridge` to the guest's port relay (`VsockDialer`, port 1000) on a loopback port and registers that address with the probe. Both sit in `RunGuards`; the registration drops first, so Ready is withdrawn before the port closes. The registration happens under the `RunGuards` slot's lock and only while the slot is open, so a hook of an ended run registers nothing and cannot replace or withdraw the registration of the run that replaced it. A hook failure leaves the environment `Starting` until the provision timeout.
 
-**Consequences.** A Ready VM environment cannot be linked yet: pairing in VM mode has no owner (#590, last mile), so `SANDY_ENV_PAIR_COMMAND` has no VM counterpart and a client reaches the service only if it needs no pairing. VMs do not survive a clean daemon restart. A hard kill of the daemon (SIGKILL) leaves the qemu process running with parent 1: the live test left one behind when it failed, and `sandyd` has no start-up sweep for VMs yet, so an operator kills it. Nothing reads the channel the agent's TTY output lands in, and `InMem` keeps every envelope, so a service that prints forever grows the daemon's memory for the life of the environment. The bridge is a loopback port any local user can reach (decision 10b of `agent-fabric.md`). vfkit and macOS are not wired.
+**Consequences.** A Ready VM environment cannot be linked yet: pairing in VM mode has no owner (#590, last mile), so `SANDY_ENV_PAIR_COMMAND` has no VM counterpart and a client reaches the service only if it needs no pairing. VMs do not survive a clean daemon restart. A hard kill of the daemon (SIGKILL) leaves the qemu process running with parent 1: the live test left one behind when it failed, and `sandyd` has no start-up sweep for VMs yet, so an operator kills it. Nothing reads the channel the agent's TTY output lands in, and `InMem` keeps every envelope, so a service that prints forever grows the daemon's memory for the life of the environment. The bridge is a loopback port any local user can reach (decision 10b of `agent-fabric.md`). vfkit and macOS are wired by decision 33.
 
 **Alternative set aside.** Reading the topology in the daemon and passing the paths to the backend: `QemuBackend::run` already evaluates the template, so a second reader would drift from it.
+
+## 33. `SANDY_ENV_BACKEND=vm-vfkit` composes the same environment backend over vfkit on macOS (#587, C3c)
+
+**Status:** accepted. **Upholds:** INV-6, INV-11.
+
+**Context.** Decision 32 wires `QemuBackend`, which tells the host the guest CID once the guest has booted and linked. vfkit has no CID and no hook: it exposes a guest vsock port as a host unix socket that exists from the moment vfkit runs (`VfkitBackend::with_service_socket`, #653).
+
+**Decision.**
+
+- `SANDY_ENV_BACKEND=vm-vfkit` is macOS only; elsewhere `from_env` returns `UnsupportedPlatform` naming the platform, and `vm-qemu` on macOS stays refused. It reads the same `SANDY_ENV_VM_*` variables and the same provision-timeout rule as `vm-qemu`. `SANDY_VFKIT_BIN` names the vfkit binary, else `vfkit` from `PATH`.
+- Each environment gets one `VfkitBackend` with its own socket under the private staging base (`ensure_sandy_staging_base`). The file name is `env-svc-` plus 24 hex characters of the SHA-256 of the environment id: short, safe for any id, stable across daemon restarts so a stale socket is cleared, and unique per environment (two backends on one path would unlink each other). A path over 103 bytes is refused before vfkit starts.
+- The bridge dials that socket with `UnixDialer` and starts when the agent link comes up (`bridge_on_link`), not at a hook. This is safe because the bridge dials the guest only after a client's first byte, and the relay's ready byte covers a guest that is not listening yet. Registration goes through `RunGuards::hold_if_open`, so a link that comes up after the run ended registers nothing, as in decision 32.
+- `vm-qemu` also calls `QemuBackend::sweep_orphans()` once when the backend is built, so a VM that a killed daemon left behind is stopped at start-up. It is not called per launch. The report is logged only when it is not empty.
+
+**Consequences.** Ready depends on the guest relay answering, not on the link alone, because the probe goes through the bridge. A vfkit process left by a killed daemon is not swept: the sweep is Linux only. The pairing gap of decision 32 applies here too.
+
+**Alternative set aside.** Polling the socket from the factory until vfkit creates it: the link event is already there and carries the same signal.

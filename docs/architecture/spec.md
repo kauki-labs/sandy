@@ -630,8 +630,9 @@ owner.
 - An opt-in, trusted-only process backend (`SANDY_ENV_BACKEND=process-insecure`, decision 29) runs the service as a host process group with a cleared environment and no isolation. A failed group kill keeps the entry so a later kill retries.
 - An idle-stop lease (decision 30) stops a `Ready` environment with no owner-visible use for `SANDY_ENV_IDLE_TIMEOUT_SECS`; off by default.
 - The VM backend (decision 31) holds one agent-mode `VmBackend::run` per environment. `SANDY_ENV_BACKEND=vm-qemu` (decision 32, Linux only) wires it into `sandyd` with an agent-link relay and a loopback bridge that makes the environment Ready. A Ready VM environment cannot be linked yet: pairing in VM mode has no owner (#590).
+- `SANDY_ENV_BACKEND=vm-vfkit` (decision 33, macOS only) composes the same backend over `VfkitBackend::with_service_socket`: one hashed socket path per environment under the private staging base, and the bridge starts when the agent link comes up. `vm-qemu` sweeps orphaned VMs once at construction.
 
-**KPI:** rows KENV1 to KENV18 in [`kpi.md`](kpi.md).
+**KPI:** rows KENV1 to KENV20 in [`kpi.md`](kpi.md).
 
 ## Testing: integration vs end-to-end
 
