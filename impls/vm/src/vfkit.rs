@@ -1695,4 +1695,41 @@ mod tests {
         );
         Ok(())
     }
+
+    /// #666: a run records its owner before staging and each process it starts as it spawns (the proxy, then vfkit), so
+    /// a restart can find them after a SIGKILL. The recording vfkit stub waits until a record under the staging base
+    /// names its own pid, keeps a copy, and the run then fails because the stub never boots; only the record matters.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_run_records_its_owner_and_every_process_it_starts() -> anyhow::Result<()> {
+        let mut stub = StubRun::new("echo READY; exec sleep 30")?;
+        let base = ensure_sandy_staging_base()?;
+        let capture = stub.path("record-seen");
+        stub.vfkit = crate::egress_proxy::tests::stub(
+            stub.dir.path(),
+            "vfkit-recording",
+            &format!(
+                "i=0; while :; do for f in {base}/inst-*/box.json; do if [ -f \"$f\" ] && grep -q \"\\\"pid\\\":$$\" \
+                 \"$f\"; then cp \"$f\" {capture}; exec sleep 30; fi; done; i=$((i+1)); [ \"$i\" -gt 100 ] && exit 9; \
+                 sleep 0.05; done",
+                base = quote(&base),
+                capture = quote(&capture),
+            ),
+        )?;
+
+        let _ = stub.run(crate::egress_proxy::tests::PROXY_STARTS);
+
+        let seen = std::fs::read(&capture).context("the stub vfkit never saw its own pid in a record")?;
+        let record: crate::orphans::BoxRecord = serde_json::from_slice(&seen).context("decode the record")?;
+        assert_eq!(
+            record.owner.pid,
+            std::process::id(),
+            "the owner is the launching process"
+        );
+        let proxy_pid: u32 = std::fs::read_to_string(stub.path("proxy-pid"))?.trim().parse()?;
+        let pids: Vec<u32> = record.procs.iter().map(|p| p.pid).collect();
+        assert_eq!(pids.len(), 2, "the proxy and vfkit: {pids:?}");
+        assert!(pids.contains(&proxy_pid), "{pids:?} lacks the proxy {proxy_pid}");
+        Ok(())
+    }
 }
