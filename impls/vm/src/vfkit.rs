@@ -39,7 +39,7 @@ use crate::{
     agent::{agent_outcome, spawn_connector},
     console::{Markers, PtyTransport, run_console},
     egress_proxy::{EGRESS_VSOCK_PORT, EgressLaunch, ProxyHandle, console_command},
-    orphans::{BoxRecorder, SweepReport},
+    orphans::{BoxRecorder, SweepReport, unrecorded, wipe_staging},
     share::VirtioFsTransport,
 };
 
@@ -355,7 +355,7 @@ impl VfkitBackend {
         // drop, so every early return below stops it too.
         // Each helper process is recorded as it spawns, before any wait: a kill during the proxy's READY wait must
         // still leave a record of it (#666). `run_with` wrote the owner before staging; this adopts that record.
-        let mut record = BoxRecorder::open(inst_dir);
+        let mut record = BoxRecorder::open(inst_dir).map_err(|err| unrecorded(&err))?;
         let mut proxy = egress
             .map(|launch| launch.start_recorded(&mut |pid| record.add(pid)))
             .transpose()?;
@@ -381,7 +381,10 @@ impl VfkitBackend {
         // the driver for the whole run.
         transport.set_read_timeout(crate::console::POLL_QUANTUM);
         let pid = transport.spawn(&self.vfkit_bin, &args)?;
-        record.add(pid);
+        if let Err(err) = record.add(pid) {
+            transport.shutdown();
+            return Err(unrecorded(&err));
+        }
         tracing::info!(box_id, pid, "spawned vfkit under PTY console");
         self.lock_registry()?.push(BoxState {
             box_id: box_id.to_string(),
@@ -598,7 +601,11 @@ impl VfkitBackend {
         // `boot` adds each process it starts.
         sandy_fsutil::OwnedDir::open_or_create(&inst_dir)
             .map_err(|err| BackendError::Spawn(format!("create instance dir {}: {err}", inst_dir.display())))?;
-        let _owner_record = BoxRecorder::open(&inst_dir);
+        let _owner_record = BoxRecorder::open(&inst_dir).map_err(|err| {
+            // Nothing sensitive is staged yet.
+            let _ = wipe(&inst_dir);
+            unrecorded(&err)
+        })?;
 
         // Stage the shares via the shared policy, then boot on them. A staging
         // failure skips the boot but still wipes below (INV-1).
@@ -639,11 +646,7 @@ impl VfkitBackend {
         };
 
         // Wipe staging on every path so secret bytes never outlive the run (INV-1).
-        for dir in [&inst_dir, &inputs_dir, &outputs_dir] {
-            if let Err(err) = wipe(dir) {
-                tracing::warn!(dir = %dir.display(), %err, "failed to wipe staging on teardown");
-            }
-        }
+        wipe_staging(&inst_dir, &inputs_dir, &outputs_dir, "on teardown");
         let sockets = agent
             .as_ref()
             .map(|agent| agent.socket.as_path())

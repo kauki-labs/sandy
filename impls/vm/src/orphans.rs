@@ -672,8 +672,8 @@ pub(crate) type Host = Procfs;
 #[cfg(target_os = "macos")]
 pub(crate) type Host = Ps;
 
-/// The box's record of the processes it started (#666). Best effort: a run must not fail because its record could not
-/// be written, so a failure is logged and the box simply goes unrecorded.
+/// The box's record of the processes it started (#666). A process the record does not name outlives a killed host, so
+/// a write that fails is an error the launch acts on: it stops the process it just started and fails the run (#676).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) struct BoxRecorder(Option<RecordWriter>);
 
@@ -683,34 +683,72 @@ pub(crate) struct BoxRecorder;
 
 impl BoxRecorder {
     /// Open the record in `dir`, adopting what an earlier stage of the launch wrote.
+    ///
+    /// # Errors
+    ///
+    /// When the record cannot be created or read.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    pub(crate) fn open(dir: &Path) -> Self {
+    pub(crate) fn open(dir: &Path) -> io::Result<Self> {
         match RecordWriter::open_or_create(dir, &Host::default(), std::process::id()) {
-            Ok(writer) => Self(Some(writer)),
+            Ok(writer) => Ok(Self(Some(writer))),
             Err(err) => {
                 tracing::warn!(%err, "could not write the box record; a killed host would leave this VM behind");
-                Self(None)
+                Ok(Self(None))
             }
         }
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    pub(crate) fn open(_dir: &Path) -> Self {
-        Self
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "same signature as the hosts with a process table"
+    )]
+    pub(crate) fn open(_dir: &Path) -> io::Result<Self> {
+        Ok(Self)
     }
 
     /// Add a process the launch just started.
+    ///
+    /// # Errors
+    ///
+    /// When the process cannot be identified (it already exited, or the table cannot read it) or the record cannot be
+    /// written.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    pub(crate) fn add(&mut self, pid: u32) {
+    pub(crate) fn add(&mut self, pid: u32) -> io::Result<()> {
         if let Some(writer) = &mut self.0
             && let Err(err) = writer.add(&Host::default(), pid)
         {
             tracing::warn!(pid, %err, "could not record a started process; it would outlive a killed host");
         }
+        Ok(())
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    pub(crate) fn add(&mut self, _pid: u32) {}
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "same signature as the hosts with a process table"
+    )]
+    pub(crate) fn add(&mut self, _pid: u32) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The run error for a process the box record could not take: the caller has already stopped the process.
+pub(crate) fn unrecorded(err: &io::Error) -> sandy::BackendError {
+    sandy::BackendError::Spawn(format!(
+        "could not record the box's processes, so a killed host would leave them running: {err}"
+    ))
+}
+
+/// Remove the staging of one box when its run ends (INV-1): the `-inputs` and `-outputs` directories first, the run
+/// directory last. A sibling that cannot be removed keeps the record, so the next sweep still finds the box and
+/// finishes the job (#676).
+pub(crate) fn wipe_staging(inst_dir: &Path, inputs_dir: &Path, outputs_dir: &Path, when: &str) {
+    for dir in [inst_dir, inputs_dir, outputs_dir] {
+        if let Err(err) = sandy::wipe(dir) {
+            tracing::warn!(dir = %dir.display(), %err, "failed to wipe staging {when}");
+        }
+    }
 }
 
 /// Stop the VMs that a killed host process (`sandyd` or a `sandy run`) left behind, and remove their staging
@@ -924,6 +962,106 @@ mod tests {
             "123 ({comm}) {state} 1 123 123 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 {start} 1000 200 \
              18446744073709551615"
         )
+    }
+
+    /// #676: a box record that cannot be opened is an error. The run must not go on with a box nothing names.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_box_record_that_cannot_be_opened_is_an_error() -> anyhow::Result<()> {
+        let base = tempfile::tempdir().context("tempdir")?;
+        let missing = base.path().join("no-such-run");
+
+        assert!(
+            BoxRecorder::open(&missing).is_err(),
+            "the record directory does not exist"
+        );
+        Ok(())
+    }
+
+    /// #676: a process the table cannot identify (it already exited) cannot be recorded, so the launch is told.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_process_that_already_exited_is_an_error_to_record() -> anyhow::Result<()> {
+        let base = tempfile::tempdir().context("tempdir")?;
+        let mut record = BoxRecorder::open(base.path()).context("open")?;
+        let mut child = std::process::Command::new("true").spawn().context("spawn")?;
+        let pid = child.id();
+        child.wait().context("wait")?;
+
+        assert!(record.add(pid).is_err(), "pid {pid} is gone");
+        Ok(())
+    }
+
+    /// #676: the secret goes on every teardown, but a sibling that cannot be removed keeps the record, so the next
+    /// sweep finds the box and removes it.
+    #[cfg(unix)]
+    #[test]
+    fn a_sibling_that_cannot_be_wiped_keeps_the_record_and_loses_the_secret() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        if rustix::process::geteuid().is_root() {
+            return Ok(()); // root removes anything, so there is no failure to inject
+        }
+        let base = tempfile::tempdir().context("tempdir")?;
+        lay_out(base.path(), RUN1, &record())?;
+        let inputs = base.path().join(format!("{RUN1}-inputs"));
+        // A directory without write permission cannot have its entries removed.
+        let locked = inputs.join("locked");
+        fs::create_dir(&locked).context("mkdir")?;
+        fs::write(locked.join("file"), b"x").context("write")?;
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).context("chmod")?;
+
+        wipe_staging(
+            &base.path().join(RUN1),
+            &inputs,
+            &base.path().join(format!("{RUN1}-outputs")),
+            "in a test",
+        );
+
+        let inst = base.path().join(RUN1);
+        assert!(
+            inst.join(RECORD_FILE).exists(),
+            "the record must stay while a sibling is left"
+        );
+        assert!(
+            !inst.join("data").exists(),
+            "the secret must go whatever happens to a sibling"
+        );
+        assert!(
+            !exists(base.path(), &format!("{RUN1}-outputs")),
+            "the other sibling is removed"
+        );
+        assert!(inputs.exists(), "the sibling that cannot be removed is still there");
+
+        // Later the obstacle is gone. The sweep finishes the job: the owner is dead, its children still run.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).context("chmod back")?;
+        let table = orphaned();
+        let report = sweep_orphans(base.path(), &table);
+
+        assert_eq!(report.wiped, 1, "{report:?}");
+        for name in [RUN1.to_owned(), format!("{RUN1}-inputs"), format!("{RUN1}-outputs")] {
+            assert!(!exists(base.path(), &name), "{name} must be removed by the sweep");
+        }
+        Ok(())
+    }
+
+    /// #676: with every directory removable, teardown removes all three.
+    #[test]
+    fn teardown_removes_the_run_directory_and_both_siblings() -> anyhow::Result<()> {
+        let base = tempfile::tempdir().context("tempdir")?;
+        lay_out(base.path(), RUN1, &record())?;
+
+        wipe_staging(
+            &base.path().join(RUN1),
+            &base.path().join(format!("{RUN1}-inputs")),
+            &base.path().join(format!("{RUN1}-outputs")),
+            "in a test",
+        );
+
+        for name in [RUN1.to_owned(), format!("{RUN1}-inputs"), format!("{RUN1}-outputs")] {
+            assert!(!exists(base.path(), &name), "{name} must be removed");
+        }
+        Ok(())
     }
 
     #[test]
