@@ -1,8 +1,8 @@
 //! Established client connections to a local TCP port, for the idle-stop lease (#645).
 //!
-//! Linux reads `/proc/net/tcp` and `/proc/net/tcp6`; other Unix hosts parse `netstat -an -p tcp`.
-//! Only sockets whose local port is the service port count, so the service's own outbound
-//! connections never read as use.
+//! Linux reads `/proc/net/tcp` and `/proc/net/tcp6`; other Unix hosts parse `/usr/sbin/netstat -an -p tcp` (an absolute
+//! path, so a daemon with a minimal PATH still finds it). Only sockets whose local port is the service port count, so
+//! the service's own outbound connections never read as use.
 
 use std::process::Command;
 
@@ -17,13 +17,13 @@ pub(crate) fn established_to(port: u16) -> Result<usize, String> {
             match std::fs::read_to_string(table) {
                 Ok(text) => total += count_proc_net_tcp(&text, port),
                 // An IPv6-less kernel has no tcp6 table.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) if table.ends_with("tcp6") && e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(format!("read {table}: {e}")),
             }
         }
         Ok(total)
     } else {
-        let out = Command::new("netstat")
+        let out = Command::new("/usr/sbin/netstat")
             .args(["-an", "-p", "tcp"])
             .output()
             .map_err(|e| format!("run netstat: {e}"))?;
