@@ -43,13 +43,11 @@ use sandy_api::{
 };
 use uuid::Uuid;
 
-#[cfg(target_os = "linux")]
-use crate::orphans::{Procfs, RecordWriter};
 use crate::{
     agent::agent_outcome,
     console::{Markers, PipeTransport, run_console},
     egress_proxy::{EgressLaunch, ProxyHandle, console_command},
-    orphans::SweepReport,
+    orphans::{BoxRecorder, SweepReport},
     share::VirtiofsdTransport,
 };
 
@@ -348,68 +346,15 @@ pub struct QemuBackend {
     agent_used: AtomicBool,
 }
 
-/// The box's record of the processes it started (#666). Best effort: a run must not fail because its record could not
-/// be written, so a failure is logged and the box simply goes unrecorded.
-#[cfg(target_os = "linux")]
-struct BoxRecorder(Option<RecordWriter>);
-
-/// Off Linux there is no process table to read, so nothing is recorded (the vfkit backend follows, #666).
-#[cfg(not(target_os = "linux"))]
-struct BoxRecorder;
-
-impl BoxRecorder {
-    #[cfg(target_os = "linux")]
-    fn open(dir: &Path) -> Self {
-        match RecordWriter::open_or_create(dir, &Procfs, std::process::id()) {
-            Ok(writer) => Self(Some(writer)),
-            Err(err) => {
-                tracing::warn!(%err, "could not write the box record; a killed host would leave this VM behind");
-                Self(None)
-            }
-        }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn open(_dir: &Path) -> Self {
-        Self
-    }
-
-    #[cfg(target_os = "linux")]
-    fn add(&mut self, pid: u32) {
-        if let Some(writer) = &mut self.0
-            && let Err(err) = writer.add(&Procfs, pid)
-        {
-            tracing::warn!(pid, %err, "could not record a started process; it would outlive a killed host");
-        }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn add(&mut self, _pid: u32) {}
-}
-
 impl QemuBackend {
     /// Stop the VMs that a killed host process (`sandyd` or a `sandy run`) left behind, and remove their staging
     /// directories (#666). Call it once at start-up, before launching. It stops only a process that a box record
     /// proves is ours, and only for a box whose owner is gone, so a running daemon or CLI is never touched. A
-    /// no-op off Linux.
+    /// no-op on a host with no process table. It reads the records under the staging base, so it sweeps a box whichever
+    /// hypervisor wrote it.
     #[must_use]
     pub fn sweep_orphans() -> SweepReport {
-        #[cfg(target_os = "linux")]
-        match ensure_sandy_staging_base() {
-            Ok(base) => {
-                let report = crate::orphans::sweep_orphans(&base, &Procfs);
-                if report != SweepReport::default() {
-                    tracing::info!(?report, "swept the VMs a killed host left behind");
-                }
-                report
-            }
-            Err(err) => {
-                tracing::warn!(%err, "could not open the staging base to sweep for orphaned VMs");
-                SweepReport::default()
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        SweepReport::default()
+        crate::orphans::sweep_orphaned_vms()
     }
 
     /// A backend with an empty instance registry.

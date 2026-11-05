@@ -17,5 +17,5 @@ pub use sandy_impls_local::{LocalDirTransport, NoEgress, ProcessBackend, Systemd
 #[cfg(feature = "impl-vm")]
 pub use sandy_impls_vm::{
     QemuBackend, QemuStagedArgs, SweepReport, VfkitBackend, VfkitStagedArgs, VirtioFsTransport, VirtiofsdTransport,
-    qemu_args, vfkit_args, virtiofsd_args,
+    qemu_args, sweep_orphaned_vms, vfkit_args, virtiofsd_args,
 };

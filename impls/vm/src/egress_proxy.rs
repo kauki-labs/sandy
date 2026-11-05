@@ -113,6 +113,7 @@ impl<'a> EgressLaunch<'a> {
     ///
     /// # Errors
     /// [`BackendError::Spawn`] (band 3) when the proxy does not reach `READY`.
+    #[cfg(test)]
     pub(crate) fn start(&self) -> Result<ProxyHandle, BackendError> {
         self.start_recorded(&mut |_| {})
     }

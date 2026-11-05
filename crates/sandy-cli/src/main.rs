@@ -1520,8 +1520,9 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
             };
             // Stop the VMs a killed `sandy` or `sandyd` left behind before this run boots another (#666). It touches
             // only a box whose owner is verifiably gone, so a daemon or a CLI run that is alive is never hit. Here and
-            // not in `host_backend()`, which read-only commands (`ls`, `status`) share. A no-op off Linux.
-            if let Some(notice) = sweep_notice(&sandy_backend::QemuBackend::sweep_orphans()) {
+            // not in `host_backend()`, which read-only commands (`ls`, `status`) share. It sweeps by the records a run
+            // writes, so it covers qemu on Linux and vfkit on macOS.
+            if let Some(notice) = sweep_notice(&sandy_backend::sweep_orphaned_vms()) {
                 eprintln!("sandy: {notice}");
             }
             // The composition root: select the run profile here and inject it. Today

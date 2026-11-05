@@ -201,10 +201,10 @@ to 4096 bytes in the agent and again in the relay.
 
 ## 6. A killed host process leaves a record, and the next start sweeps it (#666)
 
-**Status:** accepted for qemu on Linux (epic #597). `sandy run` calls `QemuBackend::sweep_orphans()` before it
-launches, in the `run` command only: `ls`, `status`, `wait` and `kill` share `host_backend()` and must never sweep. `sandyd`
-is to call it once at backend construction (separate work on the environment backend); until it does, a killed
-daemon's VMs are swept by the next `sandy run`. The vfkit backend follows.
+**Status:** accepted for qemu on Linux and vfkit on macOS (epic #597). `sandy run` calls the sweep before it
+launches, in the `run` command only: `ls`, `status`, `wait` and `kill` share `host_backend()` and must never sweep.
+`sandyd` is to call it once at backend construction (separate work on the environment backend); until it does, a
+killed daemon's VMs are swept by the next `sandy run`.
 
 **Context.** A VM backend keeps its running boxes in memory. A `SIGKILL` of the host process (the `sandyd` daemon or
 a `sandy run`) leaves qemu, its virtiofsd daemons and its egress proxy running with ppid 1, still holding the guest
@@ -259,8 +259,18 @@ gone, it kills every recorded process that is still alive, waits for each to exi
   costs up to 3 s per run until the process is gone, and a box left undecided is tried again on every run. A run
   that stopped or removed anything, or left a box for the next run, prints one line on stderr; a box left alone because
   its owner is alive is not reported. The sweep cannot fail the run: it returns a report, never an error.
-- The sweep reads `/proc` on Linux. Off Linux it is a no-op until the vfkit backend writes records with a macOS
-  start-time source.
+- The sweep reads `/proc` on Linux and `ps` on macOS (the crate forbids `unsafe`, so there is no `proc_pidinfo`). On
+  macOS the start time is the five `lstart` fields of `ps`, hashed, and a zombie is the state `Z`. An empty answer
+  from `ps` means "no such process" only when it exited 1 with nothing on stderr; any other failure is unknown, so a
+  broken `ps` never reads as an owner that is gone. `ps` runs with `LC_ALL=C` and `TZ=UTC`, because `lstart` prints
+  local time and a zone or DST change between recording and sweeping would change the identity. A "gone" is believed
+  only if the same `ps` can see the sweeping process itself; a `ps` denied process information prints nothing for every
+  pid and would otherwise read every owner as dead. The boot id is `kern.bootsessionuuid`, and macOS has no pid
+  namespaces. There is no pidfd on macOS, so the kill is check then kill, with a window of one `ps` call. A process that took the pid in it
+  would also have to have started in the recorded second (the identity has one-second resolution), which needs the
+  pid counter to wrap within a second: unlikely, not impossible. vfkit runs on a PTY slave whose master the owner holds, so it exits when the owner is killed (live-verified,
+  KOS9): the orphans of a killed macOS run are the egress proxy and the run directory. The agent, egress and service sockets of a killed vfkit run are not
+  removed by the sweep; they hold no data.
 
 **Set aside.** Scanning command lines for qemu: it can hit a process we did not start. A process group kill (above).
 A daemon-lifetime lock on the staging base (above). Comparing the executable (above).

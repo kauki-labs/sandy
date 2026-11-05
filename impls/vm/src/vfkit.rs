@@ -39,6 +39,7 @@ use crate::{
     agent::{agent_outcome, spawn_connector},
     console::{Markers, PtyTransport, run_console},
     egress_proxy::{EGRESS_VSOCK_PORT, EgressLaunch, ProxyHandle, console_command},
+    orphans::{BoxRecorder, SweepReport},
     share::VirtioFsTransport,
 };
 
@@ -255,6 +256,15 @@ pub struct VfkitBackend {
 }
 
 impl VfkitBackend {
+    /// Stop the VMs that a killed host process (`sandyd` or a `sandy run`) left behind, and remove their staging
+    /// directories (#666). Call it once at start-up, before launching. It reads the records under the staging base, so
+    /// it sweeps a box whichever hypervisor wrote it, and it stops only a process that a record proves is ours, for a
+    /// box whose owner is gone. See [`sweep_orphaned_vms`](crate::sweep_orphaned_vms).
+    #[must_use]
+    pub fn sweep_orphans() -> SweepReport {
+        crate::orphans::sweep_orphaned_vms()
+    }
+
     /// A backend that launches the `vfkit` binary at `vfkit_bin`, with an empty
     /// instance registry.
     #[must_use]
@@ -318,6 +328,7 @@ impl VfkitBackend {
         spec: &RunSpec,
         run_id: Uuid,
         box_id: &str,
+        inst_dir: &Path,
         shares: Vec<ShareSpec>,
         agent: Option<&AgentRun>,
         egress: Option<&EgressLaunch<'_>>,
@@ -342,7 +353,12 @@ impl VfkitBackend {
 
         // The proxy belongs to this attempt and starts before vfkit. `ProxyHandle` kills on
         // drop, so every early return below stops it too.
-        let mut proxy = egress.map(EgressLaunch::start).transpose()?;
+        // Each helper process is recorded as it spawns, before any wait: a kill during the proxy's READY wait must
+        // still leave a record of it (#666). `run_with` wrote the owner before staging; this adopts that record.
+        let mut record = BoxRecorder::open(inst_dir);
+        let mut proxy = egress
+            .map(|launch| launch.start_recorded(&mut |pid| record.add(pid)))
+            .transpose()?;
         // The console launches the image's agent around the job (agent mode) and the egress
         // relay around that (proxy mode).
         let console_command = console_command(
@@ -365,6 +381,7 @@ impl VfkitBackend {
         // the driver for the whole run.
         transport.set_read_timeout(crate::console::POLL_QUANTUM);
         let pid = transport.spawn(&self.vfkit_bin, &args)?;
+        record.add(pid);
         tracing::info!(box_id, pid, "spawned vfkit under PTY console");
         self.lock_registry()?.push(BoxState {
             box_id: box_id.to_string(),
@@ -576,6 +593,13 @@ impl VfkitBackend {
         let inputs_dir = base.join(format!("{box_id}-inputs"));
         let outputs_dir = base.join(format!("{box_id}-outputs"));
 
+        // Record the owner before anything sensitive exists. Staging writes the secret share into `inst_dir`, so a kill
+        // from here on must leave a record that names this process, or the next sweep never finds the directory (#666).
+        // `boot` adds each process it starts.
+        sandy_fsutil::OwnedDir::open_or_create(&inst_dir)
+            .map_err(|err| BackendError::Spawn(format!("create instance dir {}: {err}", inst_dir.display())))?;
+        let _owner_record = BoxRecorder::open(&inst_dir);
+
         // Stage the shares via the shared policy, then boot on them. A staging
         // failure skips the boot but still wipes below (INV-1).
         let mut input_digests = None;
@@ -598,6 +622,7 @@ impl VfkitBackend {
                 spec,
                 run_id,
                 &box_id,
+                &inst_dir,
                 plan.shares,
                 agent.as_ref(),
                 egress.as_ref(),
@@ -1693,6 +1718,43 @@ mod tests {
             start.elapsed() < Duration::from_secs(60),
             "cancellation must end the run promptly, not wait near the 120s budget"
         );
+        Ok(())
+    }
+
+    /// #666: a run records its owner before staging and each process it starts as it spawns (the proxy, then vfkit), so
+    /// a restart can find them after a SIGKILL. The recording vfkit stub waits until a record under the staging base
+    /// names its own pid, keeps a copy, and the run then fails because the stub never boots; only the record matters.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_run_records_its_owner_and_every_process_it_starts() -> anyhow::Result<()> {
+        let mut stub = StubRun::new("echo READY; exec sleep 30")?;
+        let base = ensure_sandy_staging_base()?;
+        let capture = stub.path("record-seen");
+        stub.vfkit = crate::egress_proxy::tests::stub(
+            stub.dir.path(),
+            "vfkit-recording",
+            &format!(
+                "i=0; while :; do for f in {base}/inst-*/box.json; do if [ -f \"$f\" ] && grep -q \"\\\"pid\\\":$$\" \
+                 \"$f\"; then cp \"$f\" {capture}; exec sleep 30; fi; done; i=$((i+1)); [ \"$i\" -gt 100 ] && exit 9; \
+                 sleep 0.05; done",
+                base = quote(&base),
+                capture = quote(&capture),
+            ),
+        )?;
+
+        let _ = stub.run(crate::egress_proxy::tests::PROXY_STARTS);
+
+        let seen = std::fs::read(&capture).context("the stub vfkit never saw its own pid in a record")?;
+        let record: crate::orphans::BoxRecord = serde_json::from_slice(&seen).context("decode the record")?;
+        assert_eq!(
+            record.owner.pid,
+            std::process::id(),
+            "the owner is the launching process"
+        );
+        let proxy_pid: u32 = std::fs::read_to_string(stub.path("proxy-pid"))?.trim().parse()?;
+        let pids: Vec<u32> = record.procs.iter().map(|p| p.pid).collect();
+        assert_eq!(pids.len(), 2, "the proxy and vfkit: {pids:?}");
+        assert!(pids.contains(&proxy_pid), "{pids:?} lacks the proxy {proxy_pid}");
         Ok(())
     }
 }
