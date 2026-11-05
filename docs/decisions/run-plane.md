@@ -201,9 +201,10 @@ to 4096 bytes in the agent and again in the relay.
 
 ## 6. A killed host process leaves a record, and the next start sweeps it (#666)
 
-**Status:** accepted for qemu on Linux (epic #597). Not yet called by a shipped binary: `sandyd` and `sandy run` have to
-call `QemuBackend::sweep_orphans()` once at start-up, and until they do only the live gate and the
-`sweep_orphans` example run it. The vfkit backend follows.
+**Status:** accepted for qemu on Linux (epic #597). `sandy run` calls `QemuBackend::sweep_orphans()` before it
+launches, in the `run` command only: `ls`, `status`, `wait` and `kill` share `host_backend()` and must never sweep. `sandyd`
+is to call it once at backend construction (separate work on the environment backend); until it does, a killed
+daemon's VMs are swept by the next `sandy run`. The vfkit backend follows.
 
 **Context.** A VM backend keeps its running boxes in memory. A `SIGKILL` of the host process (the `sandyd` daemon or
 a `sandy run`) leaves qemu, its virtiofsd daemons and its egress proxy running with ppid 1, still holding the guest
@@ -254,6 +255,10 @@ gone, it kills every recorded process that is still alive, waits for each to exi
   and its report, in which a kill leaves that one process unrecorded.
 - A failed record write is logged and does not fail the run. That box goes unrecorded and would still be orphaned by
   a kill.
+- `sandy run` sweeps inline, before its job starts, and `--timeout` does not cover it. A box with a stubborn process
+  costs up to 3 s per run until the process is gone, and a box left undecided is tried again on every run. A run
+  that stopped or removed anything, or left a box for the next run, prints one line on stderr; a box left alone because
+  its owner is alive is not reported. The sweep cannot fail the run: it returns a report, never an error.
 - The sweep reads `/proc` on Linux. Off Linux it is a no-op until the vfkit backend writes records with a macOS
   start-time source.
 
