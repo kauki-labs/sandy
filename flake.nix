@@ -381,6 +381,7 @@
                     clone = {
                       script = "true";
                       description = "clone";
+                      timeoutSecs = 30;
                     };
                     deps = {
                       script = "true";
@@ -395,9 +396,29 @@
                       after = [ "missing" ];
                     };
                   }).config;
+                badName =
+                  (guest {
+                    "a.b" = {
+                      script = "true";
+                    };
+                  }).config;
+                selfAfter =
+                  (guest {
+                    loop = {
+                      script = "true";
+                      after = [ "loop" ];
+                    };
+                  }).config;
+                cloneText = good.systemd.units."sandy-setup-clone.service".text;
+                gettyText = good.systemd.units."serial-getty@.service".text;
                 clone = good.systemd.services.sandy-setup-clone;
                 deps = good.systemd.services.sandy-setup-deps;
                 getty = good.systemd.services."serial-getty@";
+                mounts = [
+                  "run-sandy-secrets.mount"
+                  "run-sandy-inputs.mount"
+                  "run-sandy-outputs.mount"
+                ];
                 failing = c: builtins.filter (a: !a.assertion) c.assertions;
                 checks = {
                   cloneBeforeReady = clone.before == [ "sandy-ready.target" ];
@@ -409,6 +430,19 @@
                   oneshot = clone.serviceConfig.Type == "oneshot";
                   gettyGatedOnReady =
                     getty.requires == [ "sandy-ready.target" ] && getty.after == [ "sandy-ready.target" ];
+                  cloneTimeout = clone.serviceConfig.TimeoutStartSec == 30;
+                  cloneWantsShares = clone.wants == mounts;
+                  cloneAfterShares = lib.all (m: builtins.elem m clone.after) mounts;
+                  cloneNeverRequiresShares = !(lib.any (m: builtins.elem m (clone.requires or [ ])) mounts);
+                  # The generated unit text, not just the option attrset.
+                  unitTextOrdersBeforeReady = lib.hasInfix "Before=sandy-ready.target" cloneText;
+                  unitTextTimeout = lib.hasInfix "TimeoutStartSec=30" cloneText;
+                  unitTextWantsShares = lib.hasInfix "Wants=${lib.concatStringsSep " " mounts}" cloneText;
+                  unitTextAfterShares = lib.all (m: lib.hasInfix m cloneText) mounts;
+                  gettyTextRequiresReady = lib.hasInfix "Requires=sandy-ready.target" gettyText;
+                  gettyTextAfterReady = lib.hasInfix "After=sandy-ready.target" gettyText;
+                  badNameIsRefused = builtins.length (failing badName) == 1;
+                  selfAfterIsRefused = builtins.length (failing selfAfter) == 1;
                   goodHasNoFailedAssertion = failing good == [ ];
                   danglingAfterIsRefused = builtins.length (failing bad) == 1;
                 };

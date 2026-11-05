@@ -1,15 +1,32 @@
 # The guest setup sequence (#670): `sandy.setup.<name>` declares a step that runs inside the guest before the
-# SANDY-READY marker, so a failed step means no marker and the run fails.
+# SANDY-READY marker. A failed step blocks the marker by design; this is eval-checked only, not live-verified.
 #
 # Mechanism: each step is a systemd oneshot ordered `Before=` and `RequiredBy=` `sandy-ready.target`. The serial
 # getty that autologins root and prints the marker (via bash `loginShellInit`, see guest.nix) `Requires=` and
 # `After=` that target, so it does not start when a step fails. `after` orders one step behind another; steps
-# without it run in parallel.
+# without it run in parallel. A cycle in `after` is not detected: it fails closed as a boot timeout.
+#
+# What a step does NOT get:
+#   - the staged secrets as env vars, or the input symlinks: both are made in bash `loginShellInit`, after setup.
+#     A step may read /run/sandy/secrets and /run/sandy/inputs directly (ordered after those mounts, see below).
+#   - a network in default/proxy mode (the guest has no NIC; the egress relay wraps only the injected job), and no
+#     ordering after network-online in NIC mode.
+# Setup counts against the host's `timeout_secs` boot budget, and a failed step shows as a boot timeout: there is
+# no separate signal. `timeoutSecs` bounds one step so a hung step cannot eat the whole budget unnoticed.
+#
+# The share mounts are `nofail`, so `local-fs.target` does not wait for them. A step is ordered `After=` and
+# `Wants=` them (not `Requires=`, not RequiresMountsFor): a run without inputs has no `sandy-inputs` share, that
+# mount fails, and it must not fail the step.
 #
 # Setup runs inside the guest only: the steps are guest code, never run on the host.
 { lib, config, ... }:
 let
   unitOf = name: "sandy-setup-${name}.service";
+  shareMounts = [
+    "run-sandy-secrets.mount"
+    "run-sandy-inputs.mount"
+    "run-sandy-outputs.mount"
+  ];
 in
 {
   options.sandy.setup = lib.mkOption {
@@ -32,6 +49,11 @@ in
             default = "";
             description = "What the step does; shown in the unit's description and in systemd's failure message.";
           };
+          timeoutSecs = lib.mkOption {
+            type = lib.types.ints.positive;
+            default = 120;
+            description = "Seconds the step may run before systemd fails it (a oneshot has no start timeout otherwise).";
+          };
           after = lib.mkOption {
             type = lib.types.listOf lib.types.str;
             default = [ ];
@@ -46,7 +68,17 @@ in
     assertions = lib.concatLists (
       lib.mapAttrsToList (
         name: step:
-        map (dep: {
+        [
+          {
+            assertion = builtins.match "[a-zA-Z0-9_-]+" name != null;
+            message = "sandy.setup step name \"${name}\" must match [a-zA-Z0-9_-]+ (it becomes a systemd unit name)";
+          }
+          {
+            assertion = !(builtins.elem name step.after);
+            message = "sandy.setup.${name}.after lists the step itself";
+          }
+        ]
+        ++ map (dep: {
           assertion = config.sandy.setup ? ${dep};
           message = "sandy.setup.${name}.after names \"${dep}\", which is not a sandy.setup step";
         }) step.after
@@ -65,12 +97,14 @@ in
           description = "sandy setup: ${if step.description == "" then name else step.description}";
           before = [ "sandy-ready.target" ];
           requiredBy = [ "sandy-ready.target" ];
-          after = [ "local-fs.target" ] ++ map unitOf step.after;
+          after = [ "local-fs.target" ] ++ shareMounts ++ map unitOf step.after;
+          wants = shareMounts;
           requires = map unitOf step.after;
           serviceConfig = {
             Type = "oneshot";
             RemainAfterExit = true;
             User = step.user;
+            TimeoutStartSec = step.timeoutSecs;
           };
           inherit (step) script;
         }
