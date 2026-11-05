@@ -134,6 +134,11 @@ enum StartFailure {
 }
 
 impl ProxyHandle {
+    /// The proxy's process id, for the box record (#666).
+    pub(crate) fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// The vsock port the guest relay dials: the random host port (qemu) or [`EGRESS_VSOCK_PORT`] (vfkit).
     pub(crate) fn port(&self) -> u32 {
         self.port
