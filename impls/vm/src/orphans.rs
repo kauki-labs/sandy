@@ -207,10 +207,8 @@ fn identify(table: &dyn ProcessTable, pid: u32) -> io::Result<ProcId> {
             start,
             exe: table.exe(pid).unwrap_or_default(),
         }),
-        ProcState::Gone | ProcState::Unknown => Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "the process is not visible in the process table",
-        )),
+        ProcState::Gone => Err(io::Error::new(io::ErrorKind::NotFound, Unnameable::Gone)),
+        ProcState::Unknown => Err(io::Error::other(Unnameable::Blind)),
     }
 }
 
@@ -259,19 +257,24 @@ fn read_record(path: &Path) -> Result<Option<BoxRecord>, ()> {
 
 /// Remove a run directory, and the `-inputs` and `-outputs` directories beside it. A symlink is left alone.
 fn wipe_box(base: &Path, name: &str) -> bool {
+    wipe_box_with(base, name, &force_remove_dir_all)
+}
+
+/// [`wipe_box`] with the removal of one directory given, so a test can make one fail.
+fn wipe_box_with(base: &Path, name: &str, remove: &dyn Fn(&Path) -> io::Result<()>) -> bool {
     // The record lives in the run directory, so it goes last: while any sibling is left, the next sweep still finds
     // the record and finishes the job.
     for dir in [format!("{name}-inputs"), format!("{name}-outputs")] {
-        if !remove_orphan_dir(base, &dir) {
+        if !remove_orphan_dir(base, &dir, remove) {
             return false;
         }
     }
-    remove_orphan_dir(base, name)
+    remove_orphan_dir(base, name, remove)
 }
 
 /// Remove one directory of a box. A missing path or a non-directory (a symlink is left alone) counts as removed;
 /// `false` means the directory is still there.
-fn remove_orphan_dir(base: &Path, dir: &str) -> bool {
+fn remove_orphan_dir(base: &Path, dir: &str, remove: &dyn Fn(&Path) -> io::Result<()>) -> bool {
     let path = base.join(dir);
     match fs::symlink_metadata(&path) {
         Ok(meta) if meta.file_type().is_dir() => {}
@@ -282,7 +285,7 @@ fn remove_orphan_dir(base: &Path, dir: &str) -> bool {
             return false;
         }
     }
-    match fs::remove_dir_all(&path) {
+    match remove(&path) {
         Ok(()) => true,
         Err(err) if err.kind() == io::ErrorKind::NotFound => true,
         Err(err) => {
@@ -702,7 +705,7 @@ pub(crate) type Host = Ps;
 /// The box's record of the processes it started (#666). A process the record does not name outlives a killed host, so
 /// a write that fails is an error the launch acts on: it stops the process it just started and fails the run (#676).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) struct BoxRecorder(RecordWriter);
+pub(crate) struct BoxRecorder(Option<RecordWriter>);
 
 /// A host with no process table to read records nothing.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -716,7 +719,16 @@ impl BoxRecorder {
     /// When the record cannot be created or read.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn open(dir: &Path) -> io::Result<Self> {
-        RecordWriter::open_or_create(dir, &Host::default(), std::process::id()).map(Self)
+        match RecordWriter::open_or_create(dir, &Host::default(), std::process::id()) {
+            Ok(writer) => Ok(Self(Some(writer))),
+            // This host cannot read its own process table, so its sweep cannot act on any record either: the run goes
+            // on unrecorded, as it always did here.
+            Err(err) if unnameable(&err).is_some() => {
+                tracing::warn!(%err, "cannot record this box: the process table is unreadable; a killed host would leave this VM behind");
+                Ok(Self(None))
+            }
+            Err(err) => Err(err),
+        }
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -736,7 +748,21 @@ impl BoxRecorder {
     /// written.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn add(&mut self, pid: u32) -> io::Result<()> {
-        self.0.add(&Host::default(), pid)
+        let Some(writer) = &mut self.0 else {
+            return Ok(());
+        };
+        match writer.add(&Host::default(), pid) {
+            // Gone (or a zombie): it can outlive nothing, and the launch reports why it died.
+            Err(err) if unnameable(&err) == Some(Unnameable::Gone) => {
+                tracing::debug!(pid, "a started process exited before it could be recorded");
+                Ok(())
+            }
+            Err(err) if unnameable(&err) == Some(Unnameable::Blind) => {
+                tracing::warn!(pid, %err, "could not record a started process; it would outlive a killed host");
+                Ok(())
+            }
+            other => other,
+        }
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -749,9 +775,10 @@ impl BoxRecorder {
     }
 }
 
-/// Why a run stopped because the box record could not take a process: the caller has already stopped the process.
+/// Why a run stopped because the box record could not take a process: a process left running unrecorded would outlive
+/// a killed host. The caller has already stopped it.
 pub(crate) fn unrecorded_message(err: &io::Error) -> String {
-    format!("could not record the box's processes, so a killed host would leave them running: {err}")
+    format!("could not record a process of this box, so it was stopped and the run refused: {err}")
 }
 
 /// [`unrecorded_message`] as the run error.
@@ -763,7 +790,7 @@ pub(crate) fn unrecorded(err: &io::Error) -> sandy::BackendError {
 /// directory last. A sibling that cannot be removed keeps the record, so the next sweep still finds the box and
 /// finishes the job (#676).
 pub(crate) fn wipe_staging(inst_dir: &Path, inputs_dir: &Path, outputs_dir: &Path, when: &str) {
-    wipe_staging_with(inst_dir, inputs_dir, outputs_dir, when, &|dir| sandy::wipe(dir));
+    wipe_staging_with(inst_dir, inputs_dir, outputs_dir, when, &force_remove_dir_all);
 }
 
 /// [`wipe_staging`] with the removal of one directory given, so a test can make one fail.
@@ -772,50 +799,91 @@ fn wipe_staging_with(
     inputs_dir: &Path,
     outputs_dir: &Path,
     when: &str,
-    _remove: &dyn Fn(&Path) -> io::Result<()>,
+    remove: &dyn Fn(&Path) -> io::Result<()>,
 ) {
-    let mut sibling_left = false;
+    let mut left = false;
     for dir in [inputs_dir, outputs_dir] {
-        if let Err(err) = sandy::wipe(dir) {
+        if let Err(err) = remove(dir) {
             tracing::warn!(dir = %dir.display(), %err, "failed to wipe staging {when}; the next sweep retries it");
-            sibling_left = true;
+            left = true;
         }
     }
-    if !sibling_left {
-        if let Err(err) = sandy::wipe(inst_dir) {
-            tracing::warn!(dir = %inst_dir.display(), %err, "failed to wipe staging {when}");
-        }
-        return;
+    // The run directory holds the secret share and the record. The share goes whatever happens. The record goes last,
+    // and only when nothing else is left: it is the only thing that lets the next sweep find what is.
+    left |= !empty_except_record(inst_dir, when, remove);
+    if !left && let Err(err) = remove(inst_dir) {
+        tracing::warn!(dir = %inst_dir.display(), %err, "failed to wipe staging {when}");
     }
-    // The secret share lives in the run directory and goes on every path. The record stays: it is the only thing that
-    // lets the next sweep find the sibling.
-    let entries = match fs::read_dir(inst_dir) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return,
+}
+
+/// Remove everything in `dir` but the record. `false` when something is left. A path that is not a directory (a
+/// symlink) is left alone.
+fn empty_except_record(dir: &Path, when: &str, remove: &dyn Fn(&Path) -> io::Result<()>) -> bool {
+    match fs::symlink_metadata(dir) {
+        Ok(meta) if meta.file_type().is_dir() => {}
+        Ok(_) => return true,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return true,
         Err(err) => {
-            tracing::warn!(dir = %inst_dir.display(), %err, "failed to list staging {when}");
-            return;
+            tracing::warn!(dir = %dir.display(), %err, "failed to inspect staging {when}");
+            return false;
+        }
+    }
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            tracing::warn!(dir = %dir.display(), %err, "failed to list staging {when}");
+            return false;
         }
     };
+    let mut clean = true;
     for entry in entries {
         let entry = match entry {
             Ok(entry) if entry.file_name() == RECORD_FILE => continue,
             Ok(entry) => entry,
             Err(err) => {
-                tracing::warn!(dir = %inst_dir.display(), %err, "failed to list staging {when}");
+                tracing::warn!(dir = %dir.display(), %err, "failed to list staging {when}");
+                clean = false;
                 continue;
             }
         };
         let path = entry.path();
         let removed = match entry.file_type() {
-            Ok(kind) if kind.is_dir() => fs::remove_dir_all(&path),
+            Ok(kind) if kind.is_dir() => remove(&path),
             _ => fs::remove_file(&path),
         };
         if let Err(err) = removed
             && err.kind() != io::ErrorKind::NotFound
         {
             tracing::warn!(path = %path.display(), %err, "failed to wipe staging {when}");
+            clean = false;
         }
+    }
+    clean
+}
+
+/// `remove_dir_all`, but a tree the guest made read-only (a module cache, a copy from the nix store) is made writable
+/// first: sandy owns these directories, and a mode it cannot remove would keep a box for good. Symlinks are never
+/// followed, and a missing path is removed.
+pub(crate) fn force_remove_dir_all(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    match fs::remove_dir_all(path) {
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+            let mut dirs = vec![path.to_path_buf()];
+            while let Some(dir) = dirs.pop() {
+                let Ok(meta) = fs::symlink_metadata(&dir) else { continue };
+                if !meta.file_type().is_dir() {
+                    continue;
+                }
+                let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(meta.permissions().mode() | 0o700));
+                if let Ok(entries) = fs::read_dir(&dir) {
+                    dirs.extend(entries.flatten().map(|entry| entry.path()));
+                }
+            }
+            fs::remove_dir_all(path)
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
     }
 }
 
@@ -1043,20 +1111,6 @@ mod tests {
             BoxRecorder::open(&missing).is_err(),
             "the record directory does not exist"
         );
-        Ok(())
-    }
-
-    /// #676: a process the table cannot identify (it already exited) cannot be recorded, so the launch is told.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn a_process_that_already_exited_is_an_error_to_record() -> anyhow::Result<()> {
-        let base = tempfile::tempdir().context("tempdir")?;
-        let mut record = BoxRecorder::open(base.path()).context("open")?;
-        let mut child = std::process::Command::new("true").spawn().context("spawn")?;
-        let pid = child.id();
-        child.wait().context("wait")?;
-
-        assert!(record.add(pid).is_err(), "pid {pid} is gone");
         Ok(())
     }
 
@@ -1764,37 +1818,24 @@ mod tests {
     /// removed must leave the run directory and its record for the next sweep, not strand a directory with no record.
     #[test]
     fn a_sibling_that_cannot_be_removed_keeps_the_record() -> anyhow::Result<()> {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let base = tempfile::tempdir().context("tempdir")?;
         lay_out(base.path(), RUN1, &record())?;
-        let locked = base.path().join(format!("{RUN1}-inputs")).join("locked");
-        fs::create_dir_all(&locked).context("locked dir")?;
-        fs::write(locked.join("file"), b"x").context("file")?;
-        // A directory that cannot be written to cannot lose its entries.
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).context("chmod")?;
-        if fs::File::create(locked.join("probe")).is_ok() {
-            // Running as root: permissions do not stop the removal, so there is nothing to test here.
-            fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).context("restore")?;
-            return Ok(());
-        }
-        let table = orphaned();
+        let inputs = base.path().join(format!("{RUN1}-inputs"));
 
-        let report = sweep_orphans(base.path(), &table);
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).context("restore")?;
-
-        assert_eq!(
-            report,
-            SweepReport {
-                killed: 2,
-                undecided: 1,
-                ..SweepReport::default()
+        let done = wipe_box_with(base.path(), RUN1, &|dir| {
+            if dir == inputs {
+                Err(io::Error::other("busy"))
+            } else {
+                force_remove_dir_all(dir)
             }
-        );
+        });
+
+        assert!(!done, "a sibling is left");
         assert!(
             base.path().join(RUN1).join(RECORD_FILE).exists(),
             "the record stays so the next sweep can finish"
         );
+        assert!(inputs.exists());
         Ok(())
     }
 

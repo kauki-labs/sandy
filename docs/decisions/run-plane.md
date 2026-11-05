@@ -272,13 +272,18 @@ gone, it kills every recorded process that is still alive, waits for each to exi
   KOS9): the orphans of a killed macOS run are the egress proxy and the run directory. The agent, egress and service sockets of a killed vfkit run are not
   removed by the sweep; they hold no data.
 
-- A process the box record cannot take is not left running unrecorded (#676). The launch stops the process it just
-  started (virtiofsd, the egress proxy, qemu, vfkit) and fails the run, and a record that cannot be opened fails the
-  run before anything is staged. A run that goes on without a record would leave its VMs behind after a kill, with
-  nothing for the sweep to find.
-- Teardown removes `-inputs` and `-outputs` first, then the run directory. A sibling that cannot be removed keeps
-  `box.json`: the rest of the run directory (the secret share) is still removed, and the next sweep finds the box and
-  removes the sibling.
+- A process the box record cannot take is not left running unrecorded (#676). When the record cannot be written, the
+  launch stops the process it just started (virtiofsd, the egress proxy, qemu, vfkit) and fails the run, and a
+  record that cannot be opened fails the run before anything is staged. Two cases are not failures: a process that
+  is already gone (it can outlive nothing, and the launch reports why it died, so the qemu CID retry still sees a
+  qemu that exits at once), and a host whose process table cannot be read at all (the sweep is blind there too, so
+  the run goes on unrecorded with a warning).
+- Teardown removes `-inputs` and `-outputs` first. In the run directory it removes everything but `box.json`, then
+  `box.json` last, and only when nothing else is left. A sibling or entry that cannot be removed keeps the record, so
+  the next sweep finds the box. A directory the guest made read-only is made writable first (sandy owns these
+  directories, symlinks are never followed), so a read-only module cache does not keep a box for good. Under
+  `sandyd` a retained record names `sandyd` as the live owner, so the sweep removes the leftovers when `sandyd` next
+  starts, not sooner.
 
 **Set aside.** Scanning command lines for qemu: it can hit a process we did not start. A process group kill (above).
 A daemon-lifetime lock on the staging base (above). Comparing the executable (above).
