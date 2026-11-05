@@ -2672,6 +2672,7 @@ dependencies = [
  "sandy-api",
  "sandy-fsutil",
  "sandy-lib",
+ "serde",
  "serde_json",
  "tempfile",
  "tracing",
