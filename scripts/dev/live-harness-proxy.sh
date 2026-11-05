@@ -2,8 +2,8 @@
 # Live gate for #609 (epic #597), tier-3, never counted green from a fake (INV-S9).
 #
 # Boots the T3 guest (nix/guest, topology qemu-t3 on a Linux KVM host, vfkit-t3 on Apple silicon) in egress-proxy
-# mode and shows that the
-# harness binaries t3 launches (`claude`, `codex`) reach their provider through the guest's proxy relay
+# mode and shows that the harness binaries t3 launches (`claude`, `codex`) reach their provider through the guest's
+# proxy relay
 # (`HTTPS_PROXY=http://127.0.0.1:3128`), and that a host off the allow-list does not get through. The guest has no NIC,
 # so a request that reaches the provider can only have gone through the proxy. The harnesses get a fake key: the
 # provider's own 401 is the proof that the request arrived.
@@ -49,8 +49,9 @@ chmod 0700 "$work"
 mkdir -p "$work/home"
 sandy_pgid=""
 cleanup() {
-  # sandy runs in its own session, so its qemu, virtiofsd and egress proxy share one process group. The qemu
+  # Linux: sandy runs in its own session, so its qemu, virtiofsd and egress proxy share one process group. The qemu
   # proxy's command line holds no work dir (it is given a vsock port and a peer cid), so only the group finds it.
+  # macOS: there is no group; the path sweep below finds vfkit and the proxy, whose socket paths hold the work dir.
   if [ -n "$sandy_pgid" ]; then
     kill -- "-$sandy_pgid" 2>/dev/null || true
   fi
