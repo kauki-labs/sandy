@@ -202,8 +202,6 @@ mod tests {
 
     use super::*;
 
-    /// #666: each daemon is reported when it spawns, before the wait for its socket, so a kill during that wait still
-    /// leaves a record of it. The stub only creates its socket after a delay, so the socket is absent at the report.
     /// #676: a daemon the box record cannot take is stopped and fails the launch. Left running, it would outlive a
     /// killed host with nothing naming it.
     #[test]
@@ -242,6 +240,8 @@ exec sleep 30"#,
         Ok(())
     }
 
+    /// #666: each daemon is reported when it spawns, before the wait for its socket, so a kill during that wait still
+    /// leaves a record of it. The stub only creates its socket after a delay, so the socket is absent at the report.
     #[test]
     fn a_daemon_is_reported_when_it_spawns_before_its_socket_is_awaited() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;

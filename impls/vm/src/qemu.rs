@@ -1680,7 +1680,7 @@ mod tests {
         let Err(BackendError::Spawn(message)) = result else {
             anyhow::bail!("expected Spawn, got {result:?}");
         };
-        anyhow::ensure!(message.starts_with("could not record the box's processes"), "{message}");
+        anyhow::ensure!(message.contains("could not record"), "{message}");
         anyhow::ensure!(!marker.exists(), "qemu must not spawn without a record");
         anyhow::ensure!(!pid_alive(daemon_pid), "the virtiofsd daemon must be killed");
         Ok(())

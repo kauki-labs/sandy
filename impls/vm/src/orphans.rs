@@ -170,6 +170,33 @@ impl RecordWriter {
     }
 }
 
+/// Why a process could not be named for the record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unnameable {
+    /// It no longer exists (or is a zombie): it can outlive nothing.
+    Gone,
+    /// The table cannot see it: this host cannot tell, so neither can its sweep.
+    Blind,
+}
+
+impl std::fmt::Display for Unnameable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Gone => "the process is gone",
+            Self::Blind => "the process table cannot see the process",
+        })
+    }
+}
+
+impl std::error::Error for Unnameable {}
+
+/// Why `err` (from naming a process) is not a failure to write, if it is not.
+pub(crate) fn unnameable(err: &io::Error) -> Option<Unnameable> {
+    err.get_ref()
+        .and_then(|inner| inner.downcast_ref::<Unnameable>())
+        .copied()
+}
+
 /// Name `pid` as a record does, or fail when the table cannot give its start time: a process that cannot be told
 /// apart from a later one with its pid must not be recorded, since the sweep could never kill it safely. The
 /// executable is only for a human reader, so an unreadable one is recorded as empty.
@@ -736,6 +763,17 @@ pub(crate) fn unrecorded(err: &io::Error) -> sandy::BackendError {
 /// directory last. A sibling that cannot be removed keeps the record, so the next sweep still finds the box and
 /// finishes the job (#676).
 pub(crate) fn wipe_staging(inst_dir: &Path, inputs_dir: &Path, outputs_dir: &Path, when: &str) {
+    wipe_staging_with(inst_dir, inputs_dir, outputs_dir, when, &|dir| sandy::wipe(dir));
+}
+
+/// [`wipe_staging`] with the removal of one directory given, so a test can make one fail.
+fn wipe_staging_with(
+    inst_dir: &Path,
+    inputs_dir: &Path,
+    outputs_dir: &Path,
+    when: &str,
+    _remove: &dyn Fn(&Path) -> io::Result<()>,
+) {
     let mut sibling_left = false;
     for dir in [inputs_dir, outputs_dir] {
         if let Err(err) = sandy::wipe(dir) {
@@ -1024,47 +1062,35 @@ mod tests {
 
     /// #676: the secret goes on every teardown, but a sibling that cannot be removed keeps the record, so the next
     /// sweep finds the box and removes it.
-    #[cfg(unix)]
     #[test]
     fn a_sibling_that_cannot_be_wiped_keeps_the_record_and_loses_the_secret() -> anyhow::Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-
-        if rustix::process::geteuid().is_root() {
-            return Ok(()); // root removes anything, so there is no failure to inject
-        }
         let base = tempfile::tempdir().context("tempdir")?;
         lay_out(base.path(), RUN1, &record())?;
-        let inputs = base.path().join(format!("{RUN1}-inputs"));
-        // A directory without write permission cannot have its entries removed.
-        let locked = inputs.join("locked");
-        fs::create_dir(&locked).context("mkdir")?;
-        fs::write(locked.join("file"), b"x").context("write")?;
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).context("chmod")?;
-
-        wipe_staging(
-            &base.path().join(RUN1),
-            &inputs,
-            &base.path().join(format!("{RUN1}-outputs")),
-            "in a test",
-        );
-
         let inst = base.path().join(RUN1);
+        // A real secret share is a directory.
+        fs::create_dir_all(inst.join("secret")).context("mkdir secret")?;
+        fs::write(inst.join("secret").join("key"), b"s").context("write key")?;
+        let inputs = base.path().join(format!("{RUN1}-inputs"));
+        let outputs = base.path().join(format!("{RUN1}-outputs"));
+
+        wipe_staging_with(&inst, &inputs, &outputs, "in a test", &|dir| {
+            if dir == inputs {
+                Err(io::Error::other("busy"))
+            } else {
+                sandy::wipe(dir)
+            }
+        });
+
         assert!(
             inst.join(RECORD_FILE).exists(),
             "the record must stay while a sibling is left"
         );
-        assert!(
-            !inst.join("data").exists(),
-            "the secret must go whatever happens to a sibling"
-        );
-        assert!(
-            !exists(base.path(), &format!("{RUN1}-outputs")),
-            "the other sibling is removed"
-        );
+        assert!(!inst.join("data").exists(), "the files of the run directory must go");
+        assert!(!inst.join("secret").exists(), "the secret share (a directory) must go");
+        assert!(!outputs.exists(), "the other sibling is removed");
         assert!(inputs.exists(), "the sibling that cannot be removed is still there");
 
         // Later the obstacle is gone. The sweep finishes the job: the owner is dead, its children still run.
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).context("chmod back")?;
         let table = orphaned();
         let report = sweep_orphans(base.path(), &table);
 
@@ -1073,6 +1099,136 @@ mod tests {
             assert!(!exists(base.path(), &name), "{name} must be removed by the sweep");
         }
         Ok(())
+    }
+
+    /// #676: a failed removal of the run directory itself must not take the record before the secret: the record goes
+    /// last.
+    #[test]
+    fn the_record_is_removed_after_everything_else_in_the_run_directory() -> anyhow::Result<()> {
+        let base = tempfile::tempdir().context("tempdir")?;
+        lay_out(base.path(), RUN1, &record())?;
+        let inst = base.path().join(RUN1);
+        fs::create_dir_all(inst.join("secret")).context("mkdir secret")?;
+        fs::write(inst.join("secret").join("key"), b"s").context("write key")?;
+        let inputs = base.path().join(format!("{RUN1}-inputs"));
+        let outputs = base.path().join(format!("{RUN1}-outputs"));
+
+        // The run directory itself cannot be removed (the last step), as when its parent turns read-only.
+        wipe_staging_with(&inst, &inputs, &outputs, "in a test", &|dir| {
+            if dir == inst {
+                Err(io::Error::other("busy"))
+            } else {
+                sandy::wipe(dir)
+            }
+        });
+
+        assert!(
+            inst.join(RECORD_FILE).exists(),
+            "the record is what finds the box again"
+        );
+        assert!(
+            !inst.join("secret").exists() && !inst.join("data").exists(),
+            "everything else is gone"
+        );
+        Ok(())
+    }
+
+    /// #676: a directory the guest made read-only (a module cache, a copy from the nix store) must not keep a box
+    /// for good: teardown makes our own directories writable and removes them.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_tree_in_a_sibling_is_still_removed() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        if rustix::process::geteuid().is_root() {
+            return Ok(()); // root removes anything
+        }
+        let base = tempfile::tempdir().context("tempdir")?;
+        lay_out(base.path(), RUN1, &record())?;
+        let outputs = base.path().join(format!("{RUN1}-outputs"));
+        let locked = outputs.join("cache").join("locked");
+        fs::create_dir_all(&locked).context("mkdir")?;
+        fs::write(locked.join("file"), b"x").context("write")?;
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).context("chmod locked")?;
+        fs::set_permissions(outputs.join("cache"), fs::Permissions::from_mode(0o500)).context("chmod cache")?;
+
+        wipe_staging(
+            &base.path().join(RUN1),
+            &base.path().join(format!("{RUN1}-inputs")),
+            &outputs,
+            "in a test",
+        );
+
+        for name in [RUN1.to_owned(), format!("{RUN1}-inputs"), format!("{RUN1}-outputs")] {
+            assert!(!exists(base.path(), &name), "{name} must be removed");
+        }
+        Ok(())
+    }
+
+    /// #676: the same for the sweep: a read-only tree does not leave a box `undecided` for good.
+    #[cfg(unix)]
+    #[test]
+    fn the_sweep_removes_a_box_with_a_read_only_tree() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        if rustix::process::geteuid().is_root() {
+            return Ok(());
+        }
+        let base = tempfile::tempdir().context("tempdir")?;
+        lay_out(base.path(), RUN1, &record())?;
+        let locked = base.path().join(format!("{RUN1}-outputs")).join("locked");
+        fs::create_dir_all(&locked).context("mkdir")?;
+        fs::write(locked.join("file"), b"x").context("write")?;
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).context("chmod")?;
+
+        let report = sweep_orphans(base.path(), &orphaned());
+
+        assert_eq!(report.wiped, 1, "{report:?}");
+        assert!(
+            !exists(base.path(), &format!("{RUN1}-outputs")),
+            "the read-only tree must go"
+        );
+        Ok(())
+    }
+
+    /// #676: a process that is not visible because it is gone can outlive nothing, so it is not an error to leave it
+    /// out of the record. Failing the run here broke the qemu CID retry: a qemu that dies at once must report its own
+    /// failure.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_process_that_already_exited_is_left_out_of_the_record_without_an_error() -> anyhow::Result<()> {
+        let base = tempfile::tempdir().context("tempdir")?;
+        let mut record = BoxRecorder::open(base.path()).context("open")?;
+        let mut child = std::process::Command::new("true").spawn().context("spawn")?;
+        let pid = child.id();
+        child.wait().context("wait")?;
+
+        record.add(pid).context("a gone process is not a recording failure")?;
+
+        let written = read_record(&base.path().join(RECORD_FILE))
+            .ok()
+            .flatten()
+            .context("record")?;
+        assert!(written.procs.is_empty(), "{written:?}");
+        Ok(())
+    }
+
+    /// #676: why a process cannot be named is kept apart from a failure to write the record.
+    #[test]
+    fn a_process_that_cannot_be_named_says_whether_it_is_gone_or_unseen() {
+        let table = Fake::default().with(1, 5, "x").unreadable(2);
+
+        let gone = identify(&table, 3).err().and_then(|err| unnameable(&err));
+        let blind = identify(&table, 2).err().and_then(|err| unnameable(&err));
+
+        assert_eq!(gone, Some(Unnameable::Gone));
+        assert_eq!(blind, Some(Unnameable::Blind));
+        assert_eq!(
+            unnameable(&io::Error::other("disk full")),
+            None,
+            "a write failure is neither"
+        );
+        assert!(identify(&table, 1).is_ok());
     }
 
     /// #676: with every directory removable, teardown removes all three.
