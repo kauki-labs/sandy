@@ -47,9 +47,11 @@ set -u
 agent=$(ls -d /nix/store/*-sandy-agent-*/bin/sandy-agent 2>/dev/null | head -1)
 echo "SK> agent=$agent"
 "$agent" port-relay --vsock-port 1000 --to 127.0.0.1:3773 >/tmp/relay.log 2>&1 &
+relay_pid=$!
 mkdir -p /var/lib/t3/data
 chown -R t3:t3 /var/lib/t3
 runuser -u t3 -- t3 serve --host 127.0.0.1 --port 3773 --base-dir /var/lib/t3/data --no-browser >/tmp/t3.log 2>&1 &
+t3_pid=$!
 i=0
 until sandy-t3-ready; do
   i=$((i + 1))
@@ -57,11 +59,18 @@ until sandy-t3-ready; do
   sleep 1
 done
 echo "SK> t3 ready after ${i}s"
-sleep 180
+# Hold the guest open, and fail if the relay or t3 dies while the host test may still be using them.
+for _ in $(seq 180); do
+  kill -0 "$relay_pid" 2>/dev/null || { echo "SK> relay exited"; exit 4; }
+  kill -0 "$t3_pid" 2>/dev/null || { echo "SK> t3 exited"; exit 5; }
+  sleep 1
+done
 echo "SK> done"
 GUEST
 
 echo "== building the driver and the live test"
+# Cargo's target directory may be overridden (CARGO_TARGET_DIR, build.target-dir); run the binary just built.
+target_dir=$(cargo metadata --format-version 1 --no-deps | python3 -I -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')
 cargo build -q -p sandy-cli --features live --bin live-vfkit-guest
 cargo nextest run -p sandy-conn --features live --test live_vsock_bridge --no-run
 
@@ -73,7 +82,7 @@ socket="$work/svc.sock"
 (
   TMPDIR="$work" SANDY_LIVE=1 \
     nix shell nixpkgs#vfkit -c \
-    "$repo_root/target/debug/live-vfkit-guest" "$socket" "$work/guest.sh" \
+    "$target_dir/debug/live-vfkit-guest" "$socket" "$work/guest.sh" \
     >"$work/outcome.log" 2>"$work/stderr.log"
 ) &
 sandy_pid=$!

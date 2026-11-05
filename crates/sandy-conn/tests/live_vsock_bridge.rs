@@ -54,9 +54,10 @@ async fn get(addr: std::net::SocketAddr) -> anyhow::Result<u16> {
         .write_all(b"GET / HTTP/1.0\r\nHost: guest\r\nConnection: close\r\n\r\n")
         .await?;
     let mut response = Vec::new();
-    timeout(Duration::from_secs(60), client.read_to_end(&mut response))
+    // The bridge accepts at once and dials for up to its window (180 s) plus one attempt bound (5 s).
+    timeout(Duration::from_secs(185), client.read_to_end(&mut response))
         .await
-        .context("no answer from the guest service within 60 s")??;
+        .context("no answer from the guest service within 185 s")??;
     status_of(&response)
 }
 
