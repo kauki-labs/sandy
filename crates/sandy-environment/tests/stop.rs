@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::{Result, bail};
 use sandy_api::{
-    backend::{BackendError, BoxState, Outcome, RunControl, RunSpec, VmBackend},
+    backend::{BackendError, BoxState, Outcome, RunSpec, VmBackend},
     environment::{EnvironmentBackend, EnvironmentSpec},
 };
 use sandy_environment::{StopRequest, VmEnvironmentBackend, VmEnvironmentConfig};
