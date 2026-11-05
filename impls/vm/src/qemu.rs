@@ -2006,4 +2006,50 @@ mod tests {
         );
         Ok(())
     }
+
+    /// #666: a launch records its owner and every process it starts, so a restart can find them after a SIGKILL.
+    /// The stub qemu finds its run dir in the chardev argument, waits until the record names it, and keeps a copy.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_launch_records_its_owner_and_every_process_it_starts() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let capture = dir.path().join("record-seen");
+        let script = format!(
+            r#"for a in "$@"; do case "$a" in socket,*path=*) p="${{a#*path=}}"; p="${{p%%,*}}"; d="$(dirname "$p")";; esac; done
+i=0
+while ! grep -q "\"pid\":$$" "$d/box.json" 2>/dev/null; do i=$((i+1)); [ "$i" -gt 100 ] && exit 9; sleep 0.05; done
+cp "$d/box.json" {}
+exec sleep 30"#,
+            capture.display()
+        );
+        let qemu = crate::egress_proxy::tests::stub(dir.path(), "qemu", &script)?;
+        let command = ["true".to_string()];
+        let spec = RunSpec {
+            timeout_secs: 1,
+            ..demo_spec(&command)
+        };
+        let daemon = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .context("spawn stand-in virtiofsd")?;
+        let daemon_pid = daemon.id();
+        let inst = dir.path().join("inst");
+        sandy_fsutil::OwnedDir::open_or_create(&inst).context("inst dir")?;
+        let args = vec![qemu.display().to_string()];
+
+        // The run fails (the stub never opens the serial socket); only the record matters here.
+        let _ = QemuBackend::new().launch(&spec, &args, Uuid::new_v4(), &inst, None, None, vec![daemon]);
+
+        let seen = std::fs::read(&capture).context("the stub qemu never saw its own pid in the record")?;
+        let record: crate::orphans::BoxRecord = serde_json::from_slice(&seen).context("decode the record")?;
+        assert_eq!(
+            record.owner.pid,
+            std::process::id(),
+            "the owner is the launching process"
+        );
+        let pids: Vec<u32> = record.procs.iter().map(|p| p.pid).collect();
+        assert_eq!(pids.len(), 2, "the stand-in virtiofsd and qemu: {pids:?}");
+        assert!(pids.contains(&daemon_pid), "{pids:?} lacks the virtiofsd {daemon_pid}");
+        Ok(())
+    }
 }
