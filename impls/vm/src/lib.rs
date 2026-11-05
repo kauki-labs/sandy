@@ -27,8 +27,11 @@ pub use console::{
 };
 #[cfg(target_os = "linux")]
 pub use orphans::Procfs;
+#[cfg(target_os = "macos")]
+pub use orphans::Ps;
 pub use orphans::{
-    BoxRecord, Kill, ProcId, ProcState, ProcessTable, RECORD_FILE, RecordWriter, SweepReport, sweep_orphans,
+    BoxRecord, Kill, ProcId, ProcState, ProcessTable, RECORD_FILE, RecordWriter, SweepReport, sweep_orphaned_vms,
+    sweep_orphans,
 };
 pub use qemu::{QemuBackend, StagedArgs as QemuStagedArgs, qemu_args, qemu_bin_override};
 pub use share::{VirtioFsTransport, VirtiofsdTransport, virtiofsd_args};

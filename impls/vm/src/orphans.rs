@@ -512,6 +512,174 @@ fn is_srch(err: &io::Error) -> bool {
     err.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error())
 }
 
+/// What `ps -o state=,lstart=` printed for one pid, as a [`ProcState`]. `ps` prints nothing for a pid that does not
+/// exist. The state letter is only for telling a zombie (`Z`) or dead (`X`) process, which has exited, from a running
+/// one. The start time is the five fields of `lstart` (`Wed Nov  5 10:23:45 2026`), hashed: it is only ever compared
+/// for equality, and a process that took the pid later started later, so it never matches.
+#[cfg(any(target_os = "macos", test))]
+fn parse_ps_state(_stdout: &str) -> ProcState {
+    ProcState::Unknown
+}
+
+/// FNV-1a over `text`: a stable 64 bit identity for a start time string.
+#[cfg(any(target_os = "macos", test))]
+fn fnv1a(text: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
+/// The process table of a macOS host, read through `ps`. The crate forbids `unsafe`, so there is no `proc_pidinfo`.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Ps;
+
+#[cfg(target_os = "macos")]
+impl Ps {
+    /// Run `/bin/ps` and `/usr/sbin/sysctl`: a fixed locale, no input.
+    fn run(program: &str, args: &[&str]) -> Option<std::process::Output> {
+        std::process::Command::new(program)
+            .env("LC_ALL", "C")
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl ProcessTable for Ps {
+    fn state(&self, pid: u32) -> ProcState {
+        let Some(out) = Self::run("/bin/ps", &["-o", "state=,lstart=", "-p", &pid.to_string()]) else {
+            return ProcState::Unknown;
+        };
+        // `ps` exits 1 and prints nothing at all for a pid that does not exist. Any other failure, or a failure that
+        // says something on stderr (a bad option, a refused call), tells nothing about the process.
+        match out.status.code() {
+            Some(0) => parse_ps_state(&String::from_utf8_lossy(&out.stdout)),
+            Some(1) if out.stderr.is_empty() => parse_ps_state(&String::from_utf8_lossy(&out.stdout)),
+            _ => ProcState::Unknown,
+        }
+    }
+
+    fn exe(&self, pid: u32) -> Option<String> {
+        let out = Self::run("/bin/ps", &["-o", "comm=", "-p", &pid.to_string()])?;
+        let comm = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        (out.status.success() && !comm.is_empty()).then_some(comm)
+    }
+
+    fn kill_started(&self, pid: u32, start: u64) -> Kill {
+        use rustix::{
+            io::Errno,
+            process::{Pid, Signal, kill_process},
+        };
+
+        let Some(raw) = i32::try_from(pid).ok().and_then(Pid::from_raw) else {
+            return Kill::Failed;
+        };
+        // macOS has no pidfd, so this is check then kill: the window is one `ps` call. A process that took the pid in
+        // it would also have to have started at exactly the recorded second, which a process that is not the recorded
+        // one cannot (it started later).
+        match self.state(pid) {
+            ProcState::Started(found) if found == start => {}
+            ProcState::Gone | ProcState::Started(_) => return Kill::Gone,
+            ProcState::Unknown => return Kill::Failed,
+        }
+        match kill_process(raw, Signal::KILL) {
+            Ok(()) => Kill::Signalled,
+            Err(errno) if errno == Errno::SRCH => Kill::Gone,
+            Err(_) => Kill::Failed,
+        }
+    }
+
+    fn boot_id(&self) -> Option<String> {
+        let out = Self::run("/usr/sbin/sysctl", &["-n", "kern.bootsessionuuid"])?;
+        let id = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        (out.status.success() && !id.is_empty()).then_some(id)
+    }
+
+    /// macOS has no pid namespaces.
+    fn pid_namespace(&self) -> Option<String> {
+        None
+    }
+}
+
+/// The process table of this host.
+#[cfg(target_os = "linux")]
+pub(crate) type Host = Procfs;
+
+/// The process table of this host.
+#[cfg(target_os = "macos")]
+pub(crate) type Host = Ps;
+
+/// The box's record of the processes it started (#666). Best effort: a run must not fail because its record could not
+/// be written, so a failure is logged and the box simply goes unrecorded.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) struct BoxRecorder(Option<RecordWriter>);
+
+/// A host with no process table to read records nothing.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) struct BoxRecorder;
+
+impl BoxRecorder {
+    /// Open the record in `dir`, adopting what an earlier stage of the launch wrote.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn open(dir: &Path) -> Self {
+        match RecordWriter::open_or_create(dir, &Host::default(), std::process::id()) {
+            Ok(writer) => Self(Some(writer)),
+            Err(err) => {
+                tracing::warn!(%err, "could not write the box record; a killed host would leave this VM behind");
+                Self(None)
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn open(_dir: &Path) -> Self {
+        Self
+    }
+
+    /// Add a process the launch just started.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn add(&mut self, pid: u32) {
+        if let Some(writer) = &mut self.0
+            && let Err(err) = writer.add(&Host::default(), pid)
+        {
+            tracing::warn!(pid, %err, "could not record a started process; it would outlive a killed host");
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn add(&mut self, _pid: u32) {}
+}
+
+/// Stop the VMs that a killed host process (`sandyd` or a `sandy run`) left behind, and remove their staging
+/// directories (#666). It reads the records under the staging base, so it sweeps a box whichever hypervisor wrote it.
+/// Call it once at start-up, before launching. It stops only a process that a box record proves is ours, and only for a
+/// box whose owner is gone, so a running daemon or CLI is never touched. A no-op on a host with no process table.
+#[must_use]
+pub fn sweep_orphaned_vms() -> SweepReport {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    match sandy::ensure_sandy_staging_base() {
+        Ok(base) => {
+            let report = sweep_orphans(&base, &Host::default());
+            if report != SweepReport::default() {
+                tracing::info!(?report, "swept the VMs a killed host left behind");
+            }
+            report
+        }
+        Err(err) => {
+            tracing::warn!(%err, "could not open the staging base to sweep for orphaned VMs");
+            SweepReport::default()
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    SweepReport::default()
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1506,6 +1674,110 @@ mod tests {
         let status = child.wait().context("wait")?;
         assert!(!status.success(), "{status:?}");
         // Once reaped, the same pid and start reads as gone.
+        assert_eq!(table.kill_started(pid, start), Kill::Gone);
+        Ok(())
+    }
+
+    #[test]
+    fn a_ps_line_gives_a_start_that_identifies_the_process() {
+        let started = parse_ps_state("S    Wed Nov  5 10:23:45 2026\n");
+        assert!(matches!(started, ProcState::Started(_)), "{started:?}");
+        // The state letter is not part of the identity: a process changes state, never its start.
+        assert_eq!(started, parse_ps_state("R+   Wed Nov  5 10:23:45 2026\n"));
+        // Nor is the padding `ps` puts in the day.
+        assert_eq!(started, parse_ps_state("S Wed Nov 5 10:23:45 2026"));
+        // A different second, or a different day, is a different process.
+        assert_ne!(started, parse_ps_state("S    Wed Nov  5 10:23:46 2026\n"));
+        assert_ne!(started, parse_ps_state("S    Thu Nov  6 10:23:45 2026\n"));
+    }
+
+    /// A zombie or dead process has exited and only awaits reaping.
+    #[test]
+    fn a_zombie_or_dead_process_reads_as_gone_in_ps() {
+        for line in [
+            "Z    Wed Nov  5 10:23:45 2026",
+            "Z+   Wed Nov  5 10:23:45 2026",
+            "X    Wed Nov  5 10:23:45 2026",
+        ] {
+            assert_eq!(parse_ps_state(line), ProcState::Gone, "{line}");
+        }
+    }
+
+    /// `ps` prints nothing for a pid that does not exist.
+    #[test]
+    fn an_empty_ps_answer_means_no_such_process() {
+        assert_eq!(parse_ps_state(""), ProcState::Gone);
+        assert_eq!(parse_ps_state("\n"), ProcState::Gone);
+    }
+
+    /// Anything that is not a state and a start time says nothing about the process, and must not read as one that is
+    /// gone.
+    #[test]
+    fn a_ps_answer_that_does_not_parse_is_unknown() {
+        for text in ["S", "S Wed Nov", "garbage", "ps: Invalid process id: 99999999999"] {
+            assert_eq!(parse_ps_state(text), ProcState::Unknown, "{text:?}");
+        }
+    }
+
+    /// The real macOS table reads this very process, a finished child, and a live one.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ps_identifies_the_running_process_and_a_finished_one() -> anyhow::Result<()> {
+        let table = Ps;
+        let pid = std::process::id();
+        assert!(matches!(table.state(pid), ProcState::Started(_)));
+        assert_eq!(table.state(pid), table.state(pid), "the start time is stable");
+        assert!(table.exe(pid).is_some_and(|exe| !exe.is_empty()));
+        assert!(
+            table.boot_id().is_some_and(|id| !id.is_empty()),
+            "a macOS host has a boot session id"
+        );
+        assert_eq!(table.pid_namespace(), None);
+
+        let mut finished = std::process::Command::new("true").spawn().context("spawn true")?;
+        let gone = finished.id();
+        finished.wait().context("wait")?;
+        assert_eq!(table.state(gone), ProcState::Gone);
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ps_refuses_a_pid_it_cannot_signal() {
+        let table = Ps;
+        assert_eq!(table.kill_started(0, 1), Kill::Failed, "pid 0");
+        assert_eq!(table.kill_started(u32::MAX, 1), Kill::Failed, "u32::MAX wraps to -1");
+        assert_eq!(
+            table.kill_started(i32::MAX as u32 + 1, 1),
+            Kill::Failed,
+            "above i32::MAX"
+        );
+    }
+
+    /// The kill is bound to the process that started at the recorded time: a live process with another start time gets
+    /// no signal. A child `sleep` is the stand-in.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ps_signals_only_the_process_that_started_at_the_recorded_time() -> anyhow::Result<()> {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .context("spawn sleep")?;
+        let pid = child.id();
+        let table = Ps;
+        let ProcState::Started(start) = table.state(pid) else {
+            anyhow::bail!("the child must be visible");
+        };
+
+        assert_eq!(table.kill_started(pid, start.wrapping_add(1)), Kill::Gone);
+        assert!(
+            child.try_wait().context("try_wait")?.is_none(),
+            "the child must be untouched"
+        );
+
+        assert_eq!(table.kill_started(pid, start), Kill::Signalled);
+        let status = child.wait().context("wait")?;
+        assert!(!status.success(), "{status:?}");
         assert_eq!(table.kill_started(pid, start), Kill::Gone);
         Ok(())
     }
