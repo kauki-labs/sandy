@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Live gate for #609 (epic #597), tier-3, never counted green from a fake (INV-S9).
 #
-# Boots the T3 guest (nix/guest, topology qemu-t3) on a Linux KVM host in egress-proxy mode and shows that the
+# Boots the T3 guest (nix/guest, topology qemu-t3 on a Linux KVM host, vfkit-t3 on Apple silicon) in egress-proxy
+# mode and shows that the
 # harness binaries t3 launches (`claude`, `codex`) reach their provider through the guest's proxy relay
 # (`HTTPS_PROXY=http://127.0.0.1:3128`), and that a host off the allow-list does not get through. The guest has no NIC,
 # so a request that reaches the provider can only have gone through the proxy. The harnesses get a fake key: the
 # provider's own 401 is the proof that the request arrived.
 #
-# Needs: a Linux host with KVM and /dev/vhost-vsock access, nix. No root, tap or nft, no real credential. Run from the
-# repo root:
+# Needs: a Linux host with KVM and /dev/vhost-vsock access, or an Apple silicon macOS host with the aarch64-linux
+# builder (`sandy doctor` names what is missing); nix. No root, tap or nft, no real credential. Run from the repo root:
 #
 #   scripts/dev/live-harness-proxy.sh
 set -euo pipefail
@@ -16,14 +17,31 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$repo_root"
 
-if [ "$(uname -s)" != "Linux" ]; then
-  echo "refusing: the harness proxy gate needs a Linux KVM host" >&2
+case "$(uname -s)" in
+Linux)
+  if [ ! -r /dev/vhost-vsock ] || [ ! -w /dev/vhost-vsock ]; then
+    echo "refusing: /dev/vhost-vsock is not accessible to this user" >&2
+    exit 2
+  fi
+  topology=topologies.x86_64-linux.qemu-t3
+  guest_runner=packages.x86_64-linux.guest-runner-t3
+  hypervisor_tools=(nixpkgs#qemu nixpkgs#virtiofsd)
+  # sandy runs in its own session, so its qemu, virtiofsd and egress proxy share one process group.
+  isolate=(setsid)
+  ;;
+Darwin)
+  # The vfkit leg (KHE5): the same checks on an Apple silicon guest. vfkit needs no privileges.
+  topology=topologies.aarch64-linux.vfkit-t3
+  guest_runner=packages.aarch64-darwin.guest-runner-vfkit-t3
+  hypervisor_tools=(nixpkgs#vfkit)
+  # macOS has no setsid; the vfkit proxy listens on a socket under the run's work dir, which the path sweep finds.
+  isolate=()
+  ;;
+*)
+  echo "refusing: the harness proxy gate needs a Linux KVM host or an Apple silicon macOS host" >&2
   exit 2
-fi
-if [ ! -r /dev/vhost-vsock ] || [ ! -w /dev/vhost-vsock ]; then
-  echo "refusing: /dev/vhost-vsock is not accessible to this user" >&2
-  exit 2
-fi
+  ;;
+esac
 
 # Short, fixed base: a unix socket path holds at most 108 bytes (see live-vsock-bridge.sh).
 work=$(mktemp -d /tmp/slb.XXXXXX)
@@ -74,14 +92,14 @@ cargo build -q -p sandy-cli --bin sandy
 cargo build -q -p sandy-egress-proxy
 
 echo "== building the T3 guest"
-nix build --no-link "$repo_root/nix/guest#packages.x86_64-linux.guest-runner-t3"
+nix build --no-link "$repo_root/nix/guest#$guest_runner"
 
 echo "== running the guest"
 status=0
 TMPDIR="$work" SANDY_HOME="$work/home" SANDY_EGRESS=proxy \
   SANDY_EGRESS_PROXY_BIN="$repo_root/target/debug/sandy-egress-proxy" \
-  setsid nix shell nixpkgs#qemu nixpkgs#virtiofsd -c \
-  "$repo_root/target/debug/sandy" -o json run "$repo_root/nix/guest#topologies.x86_64-linux.qemu-t3" \
+  ${isolate[@]+"${isolate[@]}"} nix shell "${hypervisor_tools[@]}" -c \
+  "$repo_root/target/debug/sandy" -o json run "$repo_root/nix/guest#$topology" \
   --timeout 600 --allow api.anthropic.com:443 --allow api.openai.com:443 \
   --input "$work/guest.sh:guest.sh" -- bash /run/sandy/inputs/guest.sh \
   >"$work/result.json" 2>"$work/stderr.log" &
