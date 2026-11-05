@@ -309,6 +309,80 @@ mod tests {
         Ok(())
     }
 
+    /// #618: a symlink at the destination of a collected directory is refused, not followed. Followed, the files
+    /// would land in whatever the link names, written as the daemon's user.
+    #[test]
+    fn a_symlink_at_the_destination_is_refused() -> anyhow::Result<()> {
+        let run = tempfile::TempDir::new()?;
+        let outputs_dir = run.path().join("outputs");
+        let victim = run.path().join("victim-dir");
+        fs::create_dir(&victim)?;
+        let dest = run.path().join("collected");
+        std::os::unix::fs::symlink(&victim, &dest)?;
+        let outputs = [Output {
+            name: Some("o".to_string()),
+            dest,
+        }];
+        prepare_outputs(&outputs, &outputs_dir)?;
+        fs::write(outputs_dir.join("o").join("f"), b"produced")?;
+
+        let result = collect_outputs(&outputs, &outputs_dir, false);
+
+        assert!(result.is_err(), "a symlinked destination must be refused");
+        assert!(!victim.join("f").exists(), "nothing was written through the link");
+        Ok(())
+    }
+
+    /// #618: the same for a file: a link at its destination must not let the daemon overwrite the file it names.
+    #[test]
+    fn a_symlink_at_a_destination_file_is_refused() -> anyhow::Result<()> {
+        let run = tempfile::TempDir::new()?;
+        let outputs_dir = run.path().join("outputs");
+        let victim = run.path().join("victim-file");
+        fs::write(&victim, b"HOST-FILE")?;
+        let dest = run.path().join("out.txt");
+        std::os::unix::fs::symlink(&victim, &dest)?;
+        let outputs = [Output {
+            name: Some("o".to_string()),
+            dest,
+        }];
+        prepare_outputs(&outputs, &outputs_dir)?;
+        // The guest replaces the output directory with a file.
+        fs::remove_dir(outputs_dir.join("o"))?;
+        fs::write(outputs_dir.join("o"), b"produced")?;
+
+        let result = collect_outputs(&outputs, &outputs_dir, false);
+
+        assert!(result.is_err(), "a symlinked destination file must be refused");
+        assert_eq!(fs::read(&victim)?, b"HOST-FILE", "the file the link names is untouched");
+        Ok(())
+    }
+
+    /// #618: a link planted inside the destination tree (a subdirectory swapped for a link) is refused, not followed.
+    #[test]
+    fn a_symlink_inside_the_destination_tree_is_refused() -> anyhow::Result<()> {
+        let run = tempfile::TempDir::new()?;
+        let outputs_dir = run.path().join("outputs");
+        let victim = run.path().join("victim-dir");
+        fs::create_dir(&victim)?;
+        let dest = run.path().join("collected");
+        fs::create_dir(&dest)?;
+        std::os::unix::fs::symlink(&victim, dest.join("sub"))?;
+        let outputs = [Output {
+            name: Some("o".to_string()),
+            dest,
+        }];
+        prepare_outputs(&outputs, &outputs_dir)?;
+        fs::create_dir(outputs_dir.join("o").join("sub"))?;
+        fs::write(outputs_dir.join("o").join("sub").join("g"), b"produced")?;
+
+        let result = collect_outputs(&outputs, &outputs_dir, false);
+
+        assert!(result.is_err(), "a link inside the destination must be refused");
+        assert!(!victim.join("g").exists(), "nothing was written through the link");
+        Ok(())
+    }
+
     /// #373: with digests off nothing is hashed and there is no report.
     #[test]
     fn digests_off_returns_no_report() -> anyhow::Result<()> {

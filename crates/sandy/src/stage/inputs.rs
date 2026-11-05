@@ -190,6 +190,64 @@ mod tests {
         Ok(())
     }
 
+    /// #618: a symlink inside an input tree is staged as a link. The host never reads it, so the bytes of the host
+    /// file it names cannot reach the guest.
+    #[test]
+    fn a_symlink_inside_an_input_tree_is_not_copied_by_value() -> anyhow::Result<()> {
+        let src = tempfile::TempDir::new()?;
+        let victim = src.path().join("victim");
+        fs::write(&victim, b"HOST-SECRET")?;
+        let tree = src.path().join("tree");
+        fs::create_dir(&tree)?;
+        fs::write(tree.join("real"), b"ok")?;
+        std::os::unix::fs::symlink(&victim, tree.join("leak"))?;
+        std::os::unix::fs::symlink(src.path(), tree.join("dir-leak"))?;
+        let out = tempfile::TempDir::new()?;
+        let inputs_dir = out.path().join("inputs");
+        let inputs = [Input {
+            host: tree,
+            name: "dir".to_string(),
+            guest_path: None,
+        }];
+
+        stage_inputs(&inputs, &inputs_dir)?;
+
+        assert_eq!(fs::read(inputs_dir.join("dir").join("real"))?, b"ok");
+        for link in ["leak", "dir-leak"] {
+            let staged = inputs_dir.join("dir").join(link);
+            assert!(
+                fs::symlink_metadata(&staged)?.file_type().is_symlink(),
+                "{link} must be staged as a link, not as the bytes it names"
+            );
+        }
+        assert_eq!(fs::read_link(inputs_dir.join("dir").join("leak"))?, victim);
+        Ok(())
+    }
+
+    /// #618: an input that is itself a symlink is refused, whatever it names: the host path may have been swapped
+    /// for a link after a caller checked it.
+    #[test]
+    fn a_symlinked_input_is_refused() -> anyhow::Result<()> {
+        let src = tempfile::TempDir::new()?;
+        let victim = src.path().join("victim");
+        fs::write(&victim, b"HOST-SECRET")?;
+        let link = src.path().join("link");
+        std::os::unix::fs::symlink(&victim, &link)?;
+        let out = tempfile::TempDir::new()?;
+        let inputs_dir = out.path().join("inputs");
+        let inputs = [Input {
+            host: link,
+            name: "in".to_string(),
+            guest_path: None,
+        }];
+
+        let err = stage_inputs(&inputs, &inputs_dir).expect_err("a symlinked input must be refused");
+
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert!(!inputs_dir.join("in").exists(), "nothing of the target is staged");
+        Ok(())
+    }
+
     /// An input with a guest path is staged under its internal name and recorded
     /// in the manifest with the reserved `source`/`hash` slots, so the guest step
     /// can symlink the path to the staged entry.
