@@ -799,4 +799,53 @@ mod tests {
         }
         Ok(())
     }
+
+    /// A profile must be able to name every trust root registration creates (a single file name), or an operator
+    /// could not use a root that `sandy cred ... register` accepted.
+    #[test]
+    fn a_credential_may_be_any_name_trust_root_registration_accepts() -> anyhow::Result<()> {
+        for credential in [
+            "_github-main",
+            "My App",
+            "github.main",
+            ".hidden",
+            "-lead",
+            "\u{fc}n\u{ef}code",
+        ] {
+            let mut entry = valid_entry();
+            entry["credential"] = json!(credential);
+            let profiles = IdentityProfiles::parse(&registry(&entry))
+                .with_context(|| format!("{credential:?} must be accepted"))?;
+            assert_eq!(profiles.resolve("dev").context("dev")?.credential(), credential);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_credential_that_is_not_a_single_safe_file_name_is_refused() -> anyhow::Result<()> {
+        let too_long = "x".repeat(65);
+        for credential in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "/abs",
+            "a\0b",
+            "a\u{7}b",
+            "a\u{202e}b",
+            too_long.as_str(),
+            SECRET,
+        ] {
+            let mut entry = valid_entry();
+            entry["credential"] = json!(credential);
+            match refused(&registry(&entry))? {
+                IdentityProfileError::Invalid { reason, .. } => {
+                    assert!(reason.contains("credential must name"), "{credential:?}: {reason}");
+                    assert!(!reason.contains(SECRET), "{reason}");
+                }
+                other => anyhow::bail!("{credential:?}: expected Invalid, got {other:?}"),
+            }
+        }
+        Ok(())
+    }
 }
