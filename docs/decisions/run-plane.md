@@ -198,3 +198,39 @@ to 4096 bytes in the agent and again in the relay.
 - Not yet done: the restart policy. The agent reports the first exit; a crashed service is not restarted.
 
 **Set aside.** Scraping the console for a ready line: it is not a contract.
+
+## 6. A killed host process leaves a record, and the next start sweeps it (#666)
+
+**Status:** accepted for qemu on Linux; the vfkit backend follows (epic #597).
+
+**Context.** A VM backend keeps its running boxes in memory. A `SIGKILL` of the host process (the `sandyd` daemon or
+a `sandy run`) leaves qemu, its virtiofsd daemons and its egress proxy running with ppid 1, still holding the guest
+CID and a staging directory that contains a secret share. A restart starts with an empty registry, so `boxes()` and
+the driver's orphan check cannot see them.
+
+**Decision.** `launch` writes `<run dir>/box.json`: the launching process (the owner) and each process the box starts,
+each with its pid, start time and executable, rewritten atomically as processes are added. `QemuBackend::sweep_orphans()`
+reads the records under the staging base at start-up. For each box whose owner is gone, it kills every recorded
+process that is still alive, then removes the run directory and its `-inputs` and `-outputs` siblings.
+
+**Consequences.**
+
+- A process is identified by its pid and its start time. The start time survives an `exec`, and a later process that
+  reuses the pid always started later, so it never matches. The executable is recorded for a human reader and never
+  compared: the live gate showed that nix's qemu execs the real binary after `spawn` returns, so a rule that
+  required the recorded executable to match left qemu running.
+- A box is swept only when its owner is gone (no such pid, or a different start time). The staging base is shared
+  by the daemon and by `sandy run`, so a daemon-lifetime lock was set aside: a live owner protects its box, and
+  a second daemon or a running CLI is never touched. Two sweeps that race are harmless: each kill re-checks the start
+  time and the wipe ignores a missing directory.
+- The processes are plain children of the host, in the host's process group, so the sweep kills each pid and never a
+  group. A group kill would hit the host or an unrelated group.
+- Nothing without a record is touched. Pid 0 and 1 are never killed, a record that is not a plain file, is over
+  64 KiB or has an unknown field leaves its directory alone, and a symlink is never followed.
+- A failed record write is logged and does not fail the run. That box goes unrecorded and would still be orphaned by
+  a kill.
+- The sweep reads `/proc` on Linux. Off Linux it is a no-op until the vfkit backend writes records with a macOS
+  start-time source.
+
+**Set aside.** Scanning command lines for qemu: it can hit a process we did not start. A process group kill (above).
+A daemon-lifetime lock on the staging base (above). Comparing the executable (above).
