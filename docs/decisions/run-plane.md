@@ -262,7 +262,10 @@ gone, it kills every recorded process that is still alive, waits for each to exi
 - The sweep reads `/proc` on Linux and `ps` on macOS (the crate forbids `unsafe`, so there is no `proc_pidinfo`). On
   macOS the start time is the five `lstart` fields of `ps`, hashed, and a zombie is the state `Z`. An empty answer
   from `ps` means "no such process" only when it exited 1 with nothing on stderr; any other failure is unknown, so a
-  broken `ps` never reads as an owner that is gone. The boot id is `kern.bootsessionuuid`, and macOS has no pid
+  broken `ps` never reads as an owner that is gone. `ps` runs with `LC_ALL=C` and `TZ=UTC`, because `lstart` prints
+  local time and a zone or DST change between recording and sweeping would change the identity. A "gone" is believed
+  only if the same `ps` can see the sweeping process itself; a `ps` denied process information prints nothing for every
+  pid and would otherwise read every owner as dead. The boot id is `kern.bootsessionuuid`, and macOS has no pid
   namespaces. There is no pidfd on macOS, so the kill is check then kill, with a window of one `ps` call: a process
   that took the pid in it would also have to have started in exactly the recorded second, which a process that is
   not the recorded one cannot (it started later). The agent, egress and service sockets of a killed vfkit run are not

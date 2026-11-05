@@ -517,8 +517,12 @@ fn is_srch(err: &io::Error) -> bool {
 /// believed only if `control`, the same question asked about this very process, saw it: a `ps` that cannot see the
 /// process asking cannot say that another one is gone.
 #[cfg(any(target_os = "macos", test))]
-fn gone_or_blind(parsed: ProcState, _control: ProcState) -> ProcState {
-    parsed
+fn gone_or_blind(parsed: ProcState, control: ProcState) -> ProcState {
+    match (parsed, control) {
+        (ProcState::Gone, ProcState::Started(_)) => ProcState::Gone,
+        (ProcState::Gone, _) => ProcState::Unknown,
+        (other, _) => other,
+    }
 }
 
 /// What `ps -o state=,lstart=` printed for one pid, as a [`ProcState`]. `ps` prints nothing for a pid that does not
@@ -565,21 +569,24 @@ pub struct Ps;
 
 #[cfg(target_os = "macos")]
 impl Ps {
-    /// The command for `/bin/ps` and `/usr/sbin/sysctl`: a fixed locale, no input.
+    /// The command for `/bin/ps` and `/usr/sbin/sysctl`: a fixed locale and time zone (`lstart` prints local time), no
+    /// input.
     fn command(program: &str, args: &[&str]) -> std::process::Command {
         let mut command = std::process::Command::new(program);
-        command.env("LC_ALL", "C").args(args).stdin(std::process::Stdio::null());
+        command
+            .env("LC_ALL", "C")
+            .env("TZ", "UTC")
+            .args(args)
+            .stdin(std::process::Stdio::null());
         command
     }
 
     fn run(program: &str, args: &[&str]) -> Option<std::process::Output> {
         Self::command(program, args).output().ok()
     }
-}
 
-#[cfg(target_os = "macos")]
-impl ProcessTable for Ps {
-    fn state(&self, pid: u32) -> ProcState {
+    /// What `ps` says about one pid, taken at face value.
+    fn raw_state(pid: u32) -> ProcState {
         let Some(out) = Self::run("/bin/ps", &["-o", "state=,lstart=", "-p", &pid.to_string()]) else {
             return ProcState::Unknown;
         };
@@ -589,6 +596,17 @@ impl ProcessTable for Ps {
             Some(0) => parse_ps_state(&String::from_utf8_lossy(&out.stdout)),
             Some(1) if out.stderr.is_empty() => parse_ps_state(&String::from_utf8_lossy(&out.stdout)),
             _ => ProcState::Unknown,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl ProcessTable for Ps {
+    fn state(&self, pid: u32) -> ProcState {
+        match Self::raw_state(pid) {
+            // The control is only asked for a "gone": that is the one answer a blind `ps` also gives.
+            ProcState::Gone => gone_or_blind(ProcState::Gone, Self::raw_state(std::process::id())),
+            other => other,
         }
     }
 
