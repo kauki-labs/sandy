@@ -424,17 +424,21 @@ mod tests {
         Ok(())
     }
 
+    /// Found live (#666): nix's qemu is a wrapper that execs the real binary after `spawn` returns, so the executable
+    /// recorded at launch is not the one the sweep sees. The start time survives an exec; the process must still be
+    /// stopped.
     #[test]
-    fn a_pid_running_a_different_executable_is_not_killed() -> anyhow::Result<()> {
+    fn a_process_that_exec_d_another_binary_after_it_was_recorded_is_still_stopped() -> anyhow::Result<()> {
         let base = tempfile::tempdir().context("tempdir")?;
         lay_out(base.path(), "run1", &record())?;
         let table = Fake::default()
-            .with(200, 2000, "/usr/bin/bash")
+            .with(200, 2000, "/nix/store/x-qemu/bin/.qemu-system-x86_64-wrapped")
             .with(201, 2001, VIRTIOFSD);
 
-        sweep_orphans(base.path(), &table);
+        let report = sweep_orphans(base.path(), &table);
 
-        assert_eq!(table.killed(), vec![201], "only the process that matches in full");
+        assert_eq!(table.killed(), vec![200, 201]);
+        assert_eq!(report.killed, 2);
         Ok(())
     }
 
