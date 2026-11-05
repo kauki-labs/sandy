@@ -2248,3 +2248,23 @@ pass).
 A client that polls `GetEnvironment` renews the lease for as long as it polls, and `sandyd` does not check who the caller is, so any local caller can renew. A status poller therefore keeps an environment alive on purpose. Narrowing renewal to attach is the follow-up once attach exists.
 
 **Alternative set aside.** Counting every RPC on the id as activity, including list and cancel: it widens the poller problem and adds no owner signal.
+
+## 31. The VM environment backend holds one agent-mode `VmBackend::run` per environment (#587, C3a)
+
+**Status:** accepted (design posted on #587, 2026-11-03). **Upholds:** INV-6.
+
+**Context.** The real `EnvironmentBackend` must boot a guest with the service in it and keep it up. A new qemu or vfkit launch path would duplicate boot, shares, the egress proxy and teardown.
+
+**Decision.**
+
+- `sandy-environment::VmEnvironmentBackend` runs one `VmBackend::run` per environment on its own thread, with the deadline suspended. `launch` returns once the thread starts. `kill` marks the entry as stopping, cancels the run's `RunControl` and waits up to 30 s for `run()` to return. While it waits the box stays listed and a launch for that id is refused, so no second VM starts before the first is gone. Concurrent kills wait on the same run. A run that does not return keeps its entry, so a later kill retries. Dropping the backend waits the same bounded time, then logs and gives up instead of hanging shutdown.
+- One hypervisor backend serves one environment, because agent mode runs one job per backend. The caller supplies a factory.
+- `boxes()` lists only runs still up. A run that returned is `NotRunning`, and a launch for that id starts a fresh box.
+- Readiness is not decided here. A `ServiceProbe` (the host bridge, slice C3b) is asked while the run is up; with none set, the probe reports `Starting`.
+- Dropping the backend cancels and joins every run.
+- The guest env and the boot budget come from `VmEnvironmentConfig`: its `env` is appended after the spec's own (the service spec, `SANDY_SERVICE`, goes there, or the agent runs the command as a plain job and never probes), and `boot_timeout_secs` is the `timeout_secs` the hypervisor backend sizes its serial and link connect budgets from, so a real qemu is not given one second to boot. The deadline stays suspended.
+- What a CID hook starts (the host bridge and its probe registration) is held in `RunGuards` and released when `run()` returns, however it ends, through `GuardedBackend`. A hook that fires after that has its guard dropped at once. A run thread that panics is not running: its done flag is set on unwind.
+
+**Consequences.** The backend is generic over `VmBackend`, so it is tier-2 testable with a double that holds until cancelled. It is not wired into `sandyd` yet: that needs the two `impls/vm` hooks (the qemu CID, the vfkit port-5100 device) and the bridge probe (C3b). VMs do not survive a daemon restart in this slice, because the threads die with the process. A restart policy is open on #587.
+
+**Alternative set aside.** A new launch path in `impls/vm`: it would fork boot and teardown logic across two backends.

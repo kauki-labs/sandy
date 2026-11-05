@@ -29,6 +29,7 @@ sandy-conn.workspace = true
 sandy-fabric.workspace = true
 sandy-fabric-local.workspace = true
 sandy-fsutil.workspace = true
+sandy-guest-template.workspace = true
 sandy-orchestrator.workspace = true
 sandy-proto.workspace = true
 fs2.workspace = true
