@@ -967,6 +967,13 @@ impl VmBackend for QemuBackend {
         let inputs_dir = base.join(format!("{run_id}-inputs"));
         let outputs_dir = base.join(format!("{run_id}-outputs"));
 
+        // Record the owner before anything sensitive exists. Staging writes the secret share into `inst_dir`, so a
+        // kill from here on must leave a record that names this process, or the next sweep never finds the
+        // directory (#666). Each launch attempt below rewrites the record with the processes it starts.
+        sandy_fsutil::OwnedDir::open_or_create(&inst_dir)
+            .map_err(|err| BackendError::Spawn(format!("create instance dir {}: {err}", inst_dir.display())))?;
+        let _owner_record = BoxRecorder::open(&inst_dir);
+
         // Stage the shares via the shared policy (secret/input/output, read-only
         // flags, the #49 secret_dir rule). Each virtiofsd socket lives in inst_dir
         // (sandy-owned, created in `boot`); the read-only flag is enforced at the
@@ -2128,6 +2135,51 @@ exec sleep 30"#,
         let pids: Vec<u32> = record.procs.iter().map(|p| p.pid).collect();
         assert_eq!(pids.len(), 2, "the stand-in virtiofsd and qemu: {pids:?}");
         assert!(pids.contains(&daemon_pid), "{pids:?} lacks the virtiofsd {daemon_pid}");
+        Ok(())
+    }
+
+    /// #666: with an egress proxy in the launch, the record also names the proxy, or the next sweep would leave it
+    /// running. The stub qemu is recorded last, so it sees the stand-in virtiofsd, the proxy and itself.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_launch_with_an_egress_proxy_records_the_proxy_too() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let capture = dir.path().join("record-seen");
+        let script = format!(
+            r#"for a in "$@"; do case "$a" in socket,*path=*) p="${{a#*path=}}"; p="${{p%%,*}}"; d="$(dirname "$p")";; esac; done
+i=0
+while ! grep -q "\"pid\":$$" "$d/box.json" 2>/dev/null; do i=$((i+1)); [ "$i" -gt 100 ] && exit 9; sleep 0.05; done
+cp "$d/box.json" {}
+exec sleep 30"#,
+            capture.display()
+        );
+        let qemu = crate::egress_proxy::tests::stub(dir.path(), "qemu", &script)?;
+        let proxy_bin =
+            crate::egress_proxy::tests::stub(dir.path(), "proxy", "cat >/dev/null; echo READY; exec sleep 30")?;
+        let allow = allow_all_github();
+        let command = ["true".to_string()];
+        let spec = quick_spec(&command, &allow);
+        let program = PathBuf::from("/nix/store/a-sandy-agent/bin/sandy-agent");
+        let mut egress = EgressLaunch::new(&allow, 77, &program);
+        egress.bin = proxy_bin;
+        let daemon = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .context("spawn stand-in virtiofsd")?;
+        let inst = dir.path().join("inst");
+        sandy_fsutil::OwnedDir::open_or_create(&inst).context("inst dir")?;
+        let args = vec![qemu.display().to_string()];
+
+        let _ = QemuBackend::new().launch(&spec, &args, Uuid::new_v4(), &inst, None, Some(&egress), vec![daemon]);
+
+        let seen = std::fs::read(&capture).context("the stub qemu never saw its own pid in the record")?;
+        let record: crate::orphans::BoxRecord = serde_json::from_slice(&seen).context("decode the record")?;
+        assert_eq!(
+            record.procs.len(),
+            3,
+            "the stand-in virtiofsd, the proxy and qemu: {:?}",
+            record.procs
+        );
         Ok(())
     }
 }

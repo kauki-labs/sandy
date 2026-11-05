@@ -250,27 +250,58 @@ pub fn sweep_orphans(base: &Path, table: &dyn ProcessTable) -> SweepReport {
                 continue;
             }
         };
-        if is_alive(table, &record.owner) {
-            report.live_owner += 1;
+        // A reboot ends every process, so a record from an earlier boot names none that runs. Nothing is killed (a
+        // pid and start time from that boot could match an unrelated process of this one); only the directories go.
+        let rebooted = !record.boot_id.is_empty() && table.boot_id().is_some_and(|boot| boot != record.boot_id);
+        if rebooted {
+            if wipe_box(base, &name) {
+                report.wiped += 1;
+            }
             continue;
         }
+        // Pids mean nothing in another pid namespace, so the box cannot be judged from here.
+        if !record.pid_ns.is_empty() && table.pid_namespace().is_some_and(|ns| ns != record.pid_ns) {
+            report.undecided += 1;
+            continue;
+        }
+        match table.state(record.owner.pid) {
+            ProcState::Started(start) if start == record.owner.start => {
+                report.live_owner += 1;
+                continue;
+            }
+            // Could not tell: never read a failed read as a dead owner, or a live box is wiped.
+            ProcState::Unknown => {
+                report.undecided += 1;
+                continue;
+            }
+            ProcState::Gone | ProcState::Started(_) => {}
+        }
+        let mut undecided = false;
         for process in &record.procs {
             // Pid 0 and 1 are never ours, whatever a record says.
-            if process.pid > 1 && is_alive(table, process) {
-                table.kill(process.pid);
-                report.killed += 1;
+            if process.pid <= 1 {
+                continue;
+            }
+            match table.state(process.pid) {
+                ProcState::Started(start) if start == process.start => {
+                    if table.kill(process.pid) {
+                        report.killed += 1;
+                    } else {
+                        undecided = true;
+                    }
+                }
+                ProcState::Unknown => undecided = true,
+                ProcState::Gone | ProcState::Started(_) => {}
             }
         }
-        if wipe_box(base, &name) {
+        // A process that could not be read or stopped keeps its box (and the secret share in it) for the next sweep.
+        if undecided {
+            report.undecided += 1;
+        } else if wipe_box(base, &name) {
             report.wiped += 1;
         }
     }
     report
-}
-
-/// Whether `process` is still the process the record named: same pid and same start time.
-fn is_alive(table: &dyn ProcessTable, process: &ProcId) -> bool {
-    table.state(process.pid) == ProcState::Started(process.start)
 }
 
 /// The process table of a Linux host, read from `/proc`.
@@ -281,8 +312,12 @@ pub struct Procfs;
 #[cfg(target_os = "linux")]
 impl ProcessTable for Procfs {
     fn state(&self, pid: u32) -> ProcState {
-        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
-            return ProcState::Gone;
+        let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat,
+            // No such process (ENOENT, or ESRCH when it exits mid-read).
+            Err(err) if err.kind() == io::ErrorKind::NotFound || is_srch(&err) => return ProcState::Gone,
+            // Anything else (no descriptors left, `hidepid`, `/proc` not mounted) says nothing about the process.
+            Err(_) => return ProcState::Unknown,
         };
         // Field 2 (the command name) may hold spaces and parentheses; field 3 starts after the last `)`. Field 22,
         // the start time in clock ticks since boot, is the 20th after it.
@@ -298,19 +333,33 @@ impl ProcessTable for Procfs {
     }
 
     fn kill(&self, pid: u32) -> bool {
-        if let Some(pid) = i32::try_from(pid).ok().and_then(rustix::process::Pid::from_raw) {
-            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+        // `Pid::from_raw` refuses 0, and a pid above `i32::MAX` is refused here instead of wrapping negative, which
+        // would signal a process group or every process.
+        let Some(pid) = i32::try_from(pid).ok().and_then(rustix::process::Pid::from_raw) else {
+            return false;
+        };
+        match rustix::process::kill_process(pid, rustix::process::Signal::KILL) {
+            Ok(()) => true,
+            Err(errno) => errno == rustix::io::Errno::SRCH,
         }
-        true
     }
 
     fn boot_id(&self) -> Option<String> {
-        None
+        let id = fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+        Some(id.trim().to_owned()).filter(|id| !id.is_empty())
     }
 
     fn pid_namespace(&self) -> Option<String> {
-        None
+        fs::read_link("/proc/self/ns/pid")
+            .ok()
+            .map(|link| link.to_string_lossy().into_owned())
     }
+}
+
+/// Whether `err` is ESRCH, which a `/proc/<pid>` read returns when the process exits while it is read.
+#[cfg(target_os = "linux")]
+fn is_srch(err: &io::Error) -> bool {
+    err.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error())
 }
 
 #[cfg(test)]
