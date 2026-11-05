@@ -1341,7 +1341,7 @@ fn sweep_notice(report: &sandy_backend::SweepReport) -> Option<String> {
         return None;
     }
     let mut notice = format!(
-        "swept the VMs a killed host left behind: {} process(es) stopped, {} box(es) removed",
+        "swept the VMs a killed host left behind: {} process(es) signalled, {} box(es) removed",
         report.killed, report.wiped
     );
     if left > 0 {
@@ -1824,7 +1824,7 @@ mod tests {
         };
         assert_eq!(
             sweep_notice(&swept).as_deref(),
-            Some("swept the VMs a killed host left behind: 3 process(es) stopped, 1 box(es) removed")
+            Some("swept the VMs a killed host left behind: 3 process(es) signalled, 1 box(es) removed")
         );
     }
 
@@ -1839,7 +1839,7 @@ mod tests {
         assert_eq!(
             sweep_notice(&swept).as_deref(),
             Some(
-                "swept the VMs a killed host left behind: 1 process(es) stopped, 0 box(es) removed, 3 left for the \
+                "swept the VMs a killed host left behind: 1 process(es) signalled, 0 box(es) removed, 3 left for the \
                  next run"
             )
         );

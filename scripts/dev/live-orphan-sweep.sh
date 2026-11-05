@@ -165,7 +165,7 @@ ran_past_the_sweep || {
   exit 1
 }
 # The run itself says what it did: the three processes (qemu, virtiofsd, the proxy) and the one box.
-grep -q 'swept the VMs a killed host left behind: 3 process(es) stopped, 1 box(es) removed' "$work/sweep-run.log" || {
+grep -q 'swept the VMs a killed host left behind: 3 process(es) signalled, 1 box(es) removed' "$work/sweep-run.log" || {
   echo "FAIL: sandy run did not report its sweep: $(cat "$work/sweep-run.log")" >&2
   exit 1
 }
