@@ -1333,6 +1333,23 @@ fn run_credentialed(
     })
 }
 
+/// What `sandy run` says about the sweep it made, or nothing when it found nothing to do. A box left alone because
+/// its owner is alive is not news.
+fn sweep_notice(report: &sandy_backend::SweepReport) -> Option<String> {
+    let left = report.undecided + report.unreadable;
+    if report.killed + report.wiped + left == 0 {
+        return None;
+    }
+    let mut notice = format!(
+        "swept the VMs a killed host left behind: {} process(es) signalled, {} box(es) removed",
+        report.killed, report.wiped
+    );
+    if left > 0 {
+        notice.push_str(&format!(", {left} left for the next run"));
+    }
+    Some(notice)
+}
+
 /// Dispatch `sandy run`: parse the plan, bracket the boot with egress and an
 /// optional credential, print the result envelope, and return the process exit
 /// band (INV-11).
@@ -1501,6 +1518,12 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
                 digests,
                 command,
             };
+            // Stop the VMs a killed `sandy` or `sandyd` left behind before this run boots another (#666). It touches
+            // only a box whose owner is verifiably gone, so a daemon or a CLI run that is alive is never hit. Here and
+            // not in `host_backend()`, which read-only commands (`ls`, `status`) share. A no-op off Linux.
+            if let Some(notice) = sweep_notice(&sandy_backend::QemuBackend::sweep_orphans()) {
+                eprintln!("sandy: {notice}");
+            }
             // The composition root: select the run profile here and inject it. Today
             // only the host profile exists; a different profile (all-local) is a swap
             // at this one call site, not a change to dispatch_run.
@@ -1789,5 +1812,47 @@ mod tests {
             .expect_err("a missing --cap-file must be refused");
         assert!(err.contains("/nonexistent/cap/path"), "got: {err}");
         assert!(err.contains("could not be read"), "got: {err}");
+    }
+
+    /// #666: a run that stopped a killed host's VMs says so, or the user never learns that it killed anything.
+    #[test]
+    fn a_sweep_that_did_something_is_reported() {
+        let swept = sandy_backend::SweepReport {
+            killed: 3,
+            wiped: 1,
+            ..sandy_backend::SweepReport::default()
+        };
+        assert_eq!(
+            sweep_notice(&swept).as_deref(),
+            Some("swept the VMs a killed host left behind: 3 process(es) signalled, 1 box(es) removed")
+        );
+    }
+
+    #[test]
+    fn a_box_that_could_not_be_swept_is_reported_as_left_for_the_next_run() {
+        let swept = sandy_backend::SweepReport {
+            killed: 1,
+            undecided: 2,
+            unreadable: 1,
+            ..sandy_backend::SweepReport::default()
+        };
+        assert_eq!(
+            sweep_notice(&swept).as_deref(),
+            Some(
+                "swept the VMs a killed host left behind: 1 process(es) signalled, 0 box(es) removed, 3 left for the \
+                 next run"
+            )
+        );
+    }
+
+    #[test]
+    fn a_sweep_that_found_nothing_to_do_says_nothing() {
+        assert_eq!(sweep_notice(&sandy_backend::SweepReport::default()), None);
+        // A live owner's box is left alone, and that is not news.
+        let alive = sandy_backend::SweepReport {
+            live_owner: 2,
+            ..sandy_backend::SweepReport::default()
+        };
+        assert_eq!(sweep_notice(&alive), None);
     }
 }
