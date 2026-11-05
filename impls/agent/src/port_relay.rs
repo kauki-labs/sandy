@@ -24,6 +24,10 @@ use std::{
 };
 
 use sandy_api::agent::PORT_RELAY_READY;
+
+/// The byte `cli` writes to stdout once the vsock listener is bound (#657). The agent that spawned the relay waits
+/// for it before it lets a service report Ready.
+pub const RELAY_BOUND: u8 = b'B';
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, split},
     net::TcpStream,
@@ -211,6 +215,11 @@ pub fn cli(args: &[OsString]) -> std::process::ExitCode {
     runtime.block_on(async {
         let acceptor = crate::link_source::VsockAcceptor::bind(port)
             .unwrap_or_else(|e| crate::fail(&format!("binding vsock port {port} for the port relay: {e}")));
+        if let Err(e) = std::io::Write::write_all(&mut std::io::stdout(), &[RELAY_BOUND])
+            .and_then(|()| std::io::Write::flush(&mut std::io::stdout()))
+        {
+            crate::fail(&format!("telling the agent the port relay is bound: {e}"));
+        }
         serve(acceptor, target).await;
     });
     std::process::ExitCode::SUCCESS
