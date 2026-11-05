@@ -14,7 +14,7 @@
 use std::{
     fs, io,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -201,24 +201,37 @@ fn read_record(path: &Path) -> Result<Option<BoxRecord>, ()> {
 
 /// Remove a run directory, and the `-inputs` and `-outputs` directories beside it. A symlink is left alone.
 fn wipe_box(base: &Path, name: &str) -> bool {
-    let mut removed = true;
-    for (dir, is_box) in [
-        (name.to_owned(), true),
-        (format!("{name}-inputs"), false),
-        (format!("{name}-outputs"), false),
-    ] {
-        let path = base.join(dir);
-        if !fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_dir()) {
-            continue;
-        }
-        if let Err(err) = fs::remove_dir_all(&path)
-            && err.kind() != io::ErrorKind::NotFound
-        {
-            tracing::warn!(dir = %path.display(), %err, "could not remove an orphaned box directory");
-            removed &= !is_box;
+    // The record lives in the run directory, so it goes last: while any sibling is left, the next sweep still finds
+    // the record and finishes the job.
+    for dir in [format!("{name}-inputs"), format!("{name}-outputs")] {
+        if !remove_orphan_dir(base, &dir) {
+            return false;
         }
     }
-    removed
+    remove_orphan_dir(base, name)
+}
+
+/// Remove one directory of a box. A missing path or a non-directory (a symlink is left alone) counts as removed;
+/// `false` means the directory is still there.
+fn remove_orphan_dir(base: &Path, dir: &str) -> bool {
+    let path = base.join(dir);
+    match fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_dir() => {}
+        Ok(_) => return true,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return true,
+        Err(err) => {
+            tracing::warn!(dir = %path.display(), %err, "could not inspect an orphaned box directory");
+            return false;
+        }
+    }
+    match fs::remove_dir_all(&path) {
+        Ok(()) => true,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => true,
+        Err(err) => {
+            tracing::warn!(dir = %path.display(), %err, "could not remove an orphaned box directory");
+            false
+        }
+    }
 }
 
 /// What one sweep did. Counts only: nothing here repeats text from a record.
@@ -249,7 +262,7 @@ pub fn sweep_orphans(base: &Path, table: &dyn ProcessTable) -> SweepReport {
 const STOP_WAIT: Duration = Duration::from_secs(3);
 
 /// [`sweep_orphans`] with the exit wait given, so a test does not wait for seconds.
-fn sweep_within(base: &Path, table: &dyn ProcessTable, _wait: Duration) -> SweepReport {
+fn sweep_within(base: &Path, table: &dyn ProcessTable, wait: Duration) -> SweepReport {
     let mut report = SweepReport::default();
     let Ok(entries) = fs::read_dir(base) else {
         return report;
@@ -259,7 +272,14 @@ fn sweep_within(base: &Path, table: &dyn ProcessTable, _wait: Duration) -> Sweep
         if !entry.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+        // Only a directory a run creates holds a record. `<run>-outputs` is writable by the guest and the base holds
+        // other directories, so a record found anywhere else could name a host process to kill.
+        let Some(name) = entry
+            .file_name()
+            .to_str()
+            .filter(|n| is_run_dir_name(n))
+            .map(str::to_owned)
+        else {
             continue;
         };
         let record = match read_record(&entry.path().join(RECORD_FILE)) {
@@ -277,11 +297,14 @@ fn sweep_within(base: &Path, table: &dyn ProcessTable, _wait: Duration) -> Sweep
         if rebooted {
             if wipe_box(base, &name) {
                 report.wiped += 1;
+            } else {
+                report.undecided += 1;
             }
             continue;
         }
-        // Pids mean nothing in another pid namespace, so the box cannot be judged from here.
-        if !record.pid_ns.is_empty() && table.pid_namespace().is_some_and(|ns| ns != record.pid_ns) {
+        // Pids mean nothing in another pid namespace, so the box cannot be judged from here. A namespace that cannot
+        // be read cannot be compared either, so it is not taken to match.
+        if !record.pid_ns.is_empty() && table.pid_namespace().is_none_or(|ns| ns != record.pid_ns) {
             report.undecided += 1;
             continue;
         }
@@ -298,44 +321,88 @@ fn sweep_within(base: &Path, table: &dyn ProcessTable, _wait: Duration) -> Sweep
             ProcState::Gone | ProcState::Started(_) => {}
         }
         let mut undecided = false;
+        let mut signalled = Vec::new();
         for process in &record.procs {
             // Pid 0 and 1 are never ours, whatever a record says.
             if process.pid <= 1 {
                 continue;
             }
             match table.kill_started(process.pid, process.start) {
-                Kill::Signalled => report.killed += 1,
+                Kill::Signalled => {
+                    report.killed += 1;
+                    signalled.push(process);
+                }
                 Kill::Gone => {}
                 Kill::Failed => undecided = true,
             }
         }
-        // A process that could not be read or stopped keeps its box (and the secret share in it) for the next sweep.
-        if undecided {
+        // A signal that was sent is not an exit: a process stuck in uninterruptible I/O survives it. Its box, and the
+        // secret share in it, stay until every signalled process is gone.
+        if !signalled.is_empty() && !all_exited(table, &signalled, wait) {
+            undecided = true;
+        }
+        // A process that could not be read or stopped, or a directory that could not be removed, leaves the box (and
+        // its record) for the next sweep.
+        if undecided || !wipe_box(base, &name) {
             report.undecided += 1;
-        } else if wipe_box(base, &name) {
+        } else {
             report.wiped += 1;
         }
     }
     report
 }
 
+/// Whether every one of `processes` has exited, polling for up to `wait`. A process that cannot be read has not been
+/// shown to have exited.
+fn all_exited(table: &dyn ProcessTable, processes: &[&ProcId], wait: Duration) -> bool {
+    let deadline = Instant::now() + wait;
+    loop {
+        let exited = |p: &&ProcId| match table.state(p.pid) {
+            ProcState::Gone => true,
+            ProcState::Started(start) => start != p.start,
+            ProcState::Unknown => false,
+        };
+        if processes.iter().all(exited) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// Whether a directory name is one a run creates: a UUID, or `inst-` and a UUID.
-fn is_run_dir_name(_name: &str) -> bool {
-    true
+fn is_run_dir_name(name: &str) -> bool {
+    let id = name.strip_prefix("inst-").unwrap_or(name);
+    // `parse_str` also takes the simple, braced and upper case forms; a run makes only the hyphenated lower case one.
+    uuid::Uuid::parse_str(id).is_ok_and(|uuid| uuid.hyphenated().to_string() == id)
 }
 
 /// What a `/proc/<pid>/stat` text says about the process, or `Unknown` when it does not parse.
 fn parse_stat(stat: &str) -> ProcState {
-    // Field 2 (the command name) may hold spaces and parentheses; field 3 starts after the last `)`. Field 22, the
-    // start time in clock ticks since boot, is the 20th after it.
-    stat.rfind(')')
-        .and_then(|end| stat[end + 1..].split_whitespace().nth(19)?.parse().ok())
+    // Field 2 (the command name) may hold spaces and parentheses; field 3, the state, starts after the last `)`.
+    let Some(end) = stat.rfind(')') else {
+        return ProcState::Unknown;
+    };
+    let mut fields = stat[end + 1..].split_whitespace();
+    // `Z` (zombie) and `X` (dead) have exited and only await reaping: a killed process whose parent has not reaped it
+    // keeps its `/proc` entry, and must not read as running.
+    if matches!(fields.next(), Some("Z" | "X")) {
+        return ProcState::Gone;
+    }
+    // Field 22, the start time in clock ticks since boot, is the 19th after the state.
+    fields
+        .nth(18)
+        .and_then(|start| start.parse().ok())
         .map_or(ProcState::Unknown, ProcState::Started)
 }
 
 /// What a failed `/proc/<pid>/stat` read says about the process.
-fn classify_missing(not_found: bool, srch: bool, _proc_mounted: bool) -> ProcState {
-    if not_found || srch {
+fn classify_missing(not_found: bool, srch: bool, proc_mounted: bool) -> ProcState {
+    // ESRCH: the process exited while it was read. ENOENT means "no such process" only while `/proc` is mounted:
+    // without it every pid reads ENOENT, and every process would read as gone.
+    if srch || (not_found && proc_mounted) {
         ProcState::Gone
     } else {
         ProcState::Unknown
@@ -367,15 +434,31 @@ impl ProcessTable for Procfs {
     }
 
     fn kill_started(&self, pid: u32, start: u64) -> Kill {
-        let Some(pid) = i32::try_from(pid).ok().and_then(rustix::process::Pid::from_raw) else {
+        use rustix::{
+            io::Errno,
+            process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal},
+        };
+
+        // `Pid::from_raw` refuses 0, and a pid above `i32::MAX` is refused here instead of wrapping negative, which
+        // would signal a process group or every process.
+        let Some(raw) = i32::try_from(pid).ok().and_then(Pid::from_raw) else {
             return Kill::Failed;
         };
-        if self.state(pid.as_raw_nonzero().get() as u32) != ProcState::Started(start) {
-            return Kill::Gone;
+        // A pidfd names one process for good. The start time is read after it is open and the signal goes through it,
+        // so a process that takes the pid after the check cannot receive the kill. Never a fall back to the bare pid.
+        let fd = match pidfd_open(raw, PidfdFlags::empty()) {
+            Ok(fd) => fd,
+            Err(errno) if errno == Errno::SRCH => return Kill::Gone,
+            Err(_) => return Kill::Failed,
+        };
+        match self.state(pid) {
+            ProcState::Started(found) if found == start => {}
+            ProcState::Gone | ProcState::Started(_) => return Kill::Gone,
+            ProcState::Unknown => return Kill::Failed,
         }
-        match rustix::process::kill_process(pid, rustix::process::Signal::KILL) {
+        match pidfd_send_signal(&fd, Signal::KILL) {
             Ok(()) => Kill::Signalled,
-            Err(errno) if errno == rustix::io::Errno::SRCH => Kill::Gone,
+            Err(errno) if errno == Errno::SRCH => Kill::Gone,
             Err(_) => Kill::Failed,
         }
     }
