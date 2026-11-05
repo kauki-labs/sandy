@@ -16,7 +16,9 @@ use sandy_api::{
 };
 use sandy_environment::{StopRequest, VmEnvironmentBackend, VmEnvironmentConfig};
 
-const GRACE: Duration = Duration::from_millis(600);
+/// Whole seconds, since the wire carries a `u32`; a smaller value would be rounded up to it.
+const GRACE: Duration = Duration::from_secs(1);
+const MARGIN: Duration = Duration::from_millis(300);
 
 /// A run held until it is cancelled or the guest "stops": it records whether its control had been cancelled when
 /// it returned, which tells a guest-driven exit from a forced one.
@@ -98,6 +100,7 @@ fn fixture(obeys: bool, fails: bool) -> Fixture {
         }),
         VmEnvironmentConfig::new(vec![]),
     )
+    .with_stop_margin(MARGIN)
     .with_graceful_stop(
         Arc::new(Stopper {
             stopped,
@@ -199,5 +202,40 @@ fn a_stop_that_cannot_be_sent_falls_back_to_the_cancel_at_once() -> Result<()> {
         start.elapsed()
     );
     assert_eq!(exit_state(&fixture), Some(true));
+    Ok(())
+}
+
+#[test]
+fn a_sub_second_grace_is_asked_as_whole_seconds() -> Result<()> {
+    let stopped = Arc::new(AtomicBool::new(false));
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let (vm_stopped, cancelled) = (Arc::clone(&stopped), Arc::new(Mutex::new(None)));
+    let backend = VmEnvironmentBackend::new(
+        Box::new(move |_| {
+            Ok(Box::new(Vm {
+                stopped: Arc::clone(&vm_stopped),
+                cancelled_at_exit: Arc::clone(&cancelled),
+            }))
+        }),
+        VmEnvironmentConfig::new(vec![]),
+    )
+    .with_graceful_stop(
+        Arc::new(Stopper {
+            stopped,
+            obeys: true,
+            fails: false,
+            asked: Arc::clone(&asked),
+        }),
+        Duration::from_millis(1),
+    );
+    backend.launch(&spec())?;
+    wait_until_up(&backend)?;
+    backend.kill("env-a")?;
+    let asked = asked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    assert_eq!(
+        asked,
+        vec![("env-a".to_owned(), Duration::from_secs(1))],
+        "1 ms asks for 1 s, not 0"
+    );
     Ok(())
 }
