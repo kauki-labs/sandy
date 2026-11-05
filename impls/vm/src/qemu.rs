@@ -354,9 +354,14 @@ impl QemuBackend {
 
     /// Tell `hook` the vsock CID a guest holds, once per run, with the run's box id (#587).
     ///
-    /// It fires only after the host has connected to the guest agent. A CID that collided with another VM and was
-    /// retried never reaches it, so a consumer that dials the CID (the service bridge) cannot reach a foreign VM.
-    /// Agent mode only: a run without [`with_agent`](Self::with_agent) never calls it.
+    /// It fires only when the host holds the agent link AND this attempt's own guest has booted. A CID that collided
+    /// with another VM and was retried never reaches it, so a consumer that dials the CID (the service bridge) cannot
+    /// reach a foreign VM. Agent mode only: a run without [`with_agent`](Self::with_agent) never calls it.
+    ///
+    /// The hook runs on the console thread (inside the boot read loop) or the connector thread, so it must hand off
+    /// and not block: a blocked hook stalls the run's deadline, cancel and serial reads, or the agent link. The
+    /// consumer must stop using the CID when [`run`](VmBackend::run) returns: qemu is gone by then, and a later VM
+    /// can take the same CID.
     #[must_use]
     pub fn with_guest_cid_hook(mut self, hook: impl Fn(&str, u32) + Send + Sync + 'static) -> Self {
         self.guest_cid_hook = HookCell(Some(Arc::new(hook)));
@@ -620,9 +625,9 @@ impl std::fmt::Debug for HookCell {
 /// Fires a [`GuestCidHook`] once, when the host holds the agent link AND this attempt's own guest has booted.
 ///
 /// The link alone proves nothing: on a CID collision the connect reaches the VM that holds the CID, and that VM's agent
-/// may accept it. The boot is the proof: the console's ready marker carries this run's id, which only this attempt's
-/// guest prints, and a qemu that lost the CID never boots. A consumer that dials the CID therefore never reaches a
-/// foreign VM.
+/// may accept it. The boot is the proof: this attempt reads its own serial socket, so the ready marker it sees comes
+/// from the guest it launched, and a qemu that lost the CID never boots. A consumer that dials the CID therefore
+/// never reaches a foreign VM.
 struct CidReport {
     hook: GuestCidHook,
     box_id: String,
@@ -1004,6 +1009,81 @@ mod tests {
         assert!(connect().is_ok());
         assert!(connect().is_ok());
         assert!(seen.lock().expect("seen").is_empty());
+    }
+
+    /// A console that replays `chunks`, then reports it closed; every write is kept.
+    struct ReplayConsole {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+        written: Vec<Vec<u8>>,
+    }
+
+    impl ReplayConsole {
+        fn new(chunks: &[&str]) -> Self {
+            Self {
+                chunks: chunks.iter().map(|c| c.as_bytes().to_vec()).collect(),
+                written: Vec::new(),
+            }
+        }
+    }
+
+    impl sandy_api::console::Transport for ReplayConsole {
+        fn read(&mut self, buf: &mut [u8]) -> Result<sandy_api::console::ReadEvent, BackendError> {
+            let Some(chunk) = self.chunks.pop_front() else {
+                return Ok(sandy_api::console::ReadEvent::Closed);
+            };
+            buf[..chunk.len()].copy_from_slice(&chunk);
+            Ok(sandy_api::console::ReadEvent::Data(chunk.len()))
+        }
+
+        fn write(&mut self, bytes: &[u8]) -> Result<(), BackendError> {
+            self.written.push(bytes.to_vec());
+            Ok(())
+        }
+    }
+
+    /// The wiring, not only the state machine: the console driver writes the command frame once the run's ready marker
+    /// arrives, and that write is what marks the boot.
+    #[test]
+    fn a_console_that_reaches_the_ready_marker_reports_the_cid() -> anyhow::Result<()> {
+        let (report, seen) = counting_report();
+        report.linked();
+        let command = ["true".to_string()];
+        let mut console = BootWatch {
+            inner: ReplayConsole::new(&[&format!("{READY_MARKER}\n")]),
+            report: Some(report),
+        };
+        let outcome = run_console(
+            &mut console,
+            &demo_spec(&command),
+            &Markers::for_run(READY_MARKER, Uuid::new_v4()),
+        );
+        assert!(outcome.booted, "{outcome:?}");
+        assert_eq!(
+            *seen.lock().ok().context("the seen list lock is poisoned")?,
+            vec![("box-1".to_string(), 77)]
+        );
+        Ok(())
+    }
+
+    /// A qemu that lost the CID never prints the ready marker, so its console closes unbooted and nothing is reported
+    /// even though the connect reached another VM.
+    #[test]
+    fn a_console_that_never_boots_does_not_report_the_cid() -> anyhow::Result<()> {
+        let (report, seen) = counting_report();
+        report.linked();
+        let command = ["true".to_string()];
+        let mut console = BootWatch {
+            inner: ReplayConsole::new(&["qemu: unable to set guest cid: in use\n"]),
+            report: Some(report),
+        };
+        let outcome = run_console(
+            &mut console,
+            &demo_spec(&command),
+            &Markers::for_run(READY_MARKER, Uuid::new_v4()),
+        );
+        assert!(!outcome.booted, "{outcome:?}");
+        assert!(seen.lock().ok().context("the seen list lock is poisoned")?.is_empty());
+        Ok(())
     }
 
     #[test]
