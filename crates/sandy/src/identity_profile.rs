@@ -2,9 +2,10 @@
 //! request may pick. A profile holds names only, never a value: the trust root to mint from, the credential
 //! [`Scope`], and the secret names the service may read. See `docs/design/credential-seam/identity-profiles.md`.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt};
 
 use sandy_api::cred::{Capability, Scope, Target};
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
 
 /// The longest profile or trust root name. The same bound sandyd applies to a request's `profile` field.
@@ -12,6 +13,10 @@ const MAX_NAME: usize = 64;
 
 /// The longest repository path.
 const MAX_TARGET: usize = 256;
+
+/// The most profiles in a registry, and the most entries in one list of a profile.
+const MAX_PROFILES: usize = 1024;
+const MAX_LIST: usize = 256;
 
 /// The keys of a profile entry.
 const FIELDS: &[&str] = &["name", "credential", "targets", "capabilities", "service_secrets"];
@@ -116,7 +121,15 @@ impl IdentityProfiles {
     /// The first problem found, as an [`IdentityProfileError`].
     pub fn parse(text: &str) -> Result<Self, IdentityProfileError> {
         // Walk a `Value` by hand: serde's own messages repeat the offending value, and this text reaches logs.
-        let value: Value = serde_json::from_str(text).map_err(|err| {
+        let Strict(value) = serde_json::from_str(text).map_err(|err| {
+            // Only the text this module chose: serde's own message may repeat a value.
+            if err.to_string().starts_with(DUPLICATE_KEY) {
+                return IdentityProfileError::Malformed(format!(
+                    "{DUPLICATE_KEY} at line {} column {}",
+                    err.line(),
+                    err.column()
+                ));
+            }
             let what = match err.classify() {
                 serde_json::error::Category::Syntax => "syntax error",
                 serde_json::error::Category::Eof => "unexpected end of input",
@@ -140,6 +153,11 @@ impl IdentityProfiles {
                 "`profiles` must be an array".to_owned(),
             ));
         };
+        if entries.len() > MAX_PROFILES {
+            return Err(IdentityProfileError::Malformed(format!(
+                "too many profiles (at most {MAX_PROFILES})"
+            )));
+        }
         let mut seen: BTreeMap<String, usize> = BTreeMap::new();
         let mut profiles = Vec::with_capacity(entries.len());
         for (index, entry) in entries.iter().enumerate() {
@@ -165,6 +183,72 @@ impl IdentityProfiles {
     }
 }
 
+/// The text of the error a repeated key raises. [`IdentityProfiles::parse`] matches on it, so it is fixed here.
+const DUPLICATE_KEY: &str = "duplicate key";
+
+/// A JSON value that refuses a repeated key in any object. `serde_json::Value` keeps the last of two equal keys, so
+/// the file a reviewer reads could differ from the registry that loads.
+struct Strict(Value);
+
+impl<'de> de::Deserialize<'de> for Strict {
+    fn deserialize<D: de::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Walk;
+
+        impl<'de> Visitor<'de> for Walk {
+            type Value = Value;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a JSON value")
+            }
+
+            fn visit_bool<E>(self, v: bool) -> Result<Value, E> {
+                Ok(Value::Bool(v))
+            }
+
+            fn visit_i64<E>(self, v: i64) -> Result<Value, E> {
+                Ok(Value::from(v))
+            }
+
+            fn visit_u64<E>(self, v: u64) -> Result<Value, E> {
+                Ok(Value::from(v))
+            }
+
+            fn visit_f64<E>(self, v: f64) -> Result<Value, E> {
+                Ok(Value::from(v))
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Value, E> {
+                Ok(Value::String(v.to_owned()))
+            }
+
+            fn visit_unit<E>(self) -> Result<Value, E> {
+                Ok(Value::Null)
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+                let mut items = Vec::new();
+                while let Some(Strict(item)) = seq.next_element()? {
+                    items.push(item);
+                }
+                Ok(Value::Array(items))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+                let mut object = serde_json::Map::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    let Strict(value) = map.next_value()?;
+                    if object.insert(key, value).is_some() {
+                        return Err(de::Error::custom(DUPLICATE_KEY));
+                    }
+                }
+                Ok(Value::Object(object))
+            }
+        }
+
+        deserializer.deserialize_any(Walk).map(Strict)
+    }
+}
+
 fn invalid(at: &str, reason: impl Into<String>) -> IdentityProfileError {
     IdentityProfileError::Invalid {
         at: at.to_owned(),
@@ -172,12 +256,23 @@ fn invalid(at: &str, reason: impl Into<String>) -> IdentityProfileError {
     }
 }
 
-/// A name for a trust root or a profile: letters, digits, `-`, `_` and `.`.
+/// A name for a trust root or a profile: letters, digits, `-`, `_` and `.`, starting with a letter or digit so
+/// that `.` and `..` are never a name.
 fn name_ok(s: &str) -> bool {
-    !s.is_empty()
+    s.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric())
         && s.len() <= MAX_NAME
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// A repository or project path as a provider names it: `owner/repo`, or nested groups. ASCII only, so a visible
+/// path is the path that is allowed, and no `.` or `..` segment.
+fn target_ok(s: &str) -> bool {
+    s.len() <= MAX_TARGET
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'/'))
+        && s.contains('/')
+        && s.split('/').all(|seg| !seg.is_empty() && seg != "." && seg != "..")
 }
 
 fn looks_like_secret(s: &str) -> bool {
@@ -194,15 +289,6 @@ fn secret_name_ok(s: &str) -> bool {
         && bytes.all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
 }
 
-/// A field name safe to show: short and name-shaped, so a pasted secret used as a key is not echoed.
-fn field_label(key: &str) -> String {
-    if key.len() <= 32 && name_ok(key) && !looks_like_secret(key) {
-        format!("`{key}`")
-    } else {
-        "(name not shown)".to_owned()
-    }
-}
-
 /// The strings of an array, or `None` when the value is not an array of strings.
 fn strings(value: &Value) -> Option<Vec<&str>> {
     value.as_array()?.iter().map(Value::as_str).collect()
@@ -215,7 +301,11 @@ fn parse_entry(index: usize, entry: &Value) -> Result<IdentityProfile, IdentityP
     };
     for key in fields.keys() {
         if !FIELDS.contains(&key.as_str()) {
-            return Err(invalid(&at, format!("unknown field {}", field_label(key))));
+            // The key is not shown: a pasted secret may sit where a key belongs, in a shape no prefix list knows.
+            return Err(invalid(
+                &at,
+                format!("unknown field (expected only {})", FIELDS.join(", ")),
+            ));
         }
     }
     let name = fields.get("name").and_then(Value::as_str).unwrap_or_default();
@@ -237,14 +327,13 @@ fn parse_entry(index: usize, entry: &Value) -> Result<IdentityProfile, IdentityP
     }
 
     let targets = fields.get("targets").and_then(strings).unwrap_or_default();
-    if targets.is_empty()
-        || targets
-            .iter()
-            .any(|t| t.is_empty() || t.len() > MAX_TARGET || t.chars().any(|c| c.is_whitespace() || c.is_control()))
-    {
+    if targets.is_empty() || targets.len() > MAX_LIST || !targets.iter().all(|t| target_ok(t)) {
         return Err(invalid(
             &at,
-            "targets must be a non-empty list of repository paths without whitespace",
+            format!(
+                "targets must be 1 to {MAX_LIST} owner/repo paths of ASCII letters, digits, '-', '_' and '.', with no \
+                 '.' or '..' segment"
+            ),
         ));
     }
 
@@ -255,7 +344,11 @@ fn parse_entry(index: usize, entry: &Value) -> Result<IdentityProfile, IdentityP
         )
     };
     let mut capabilities = Vec::new();
-    for raw in fields.get("capabilities").and_then(strings).unwrap_or_default() {
+    let raw_capabilities = fields.get("capabilities").and_then(strings).unwrap_or_default();
+    if raw_capabilities.len() > MAX_LIST {
+        return Err(capability_error());
+    }
+    for raw in raw_capabilities {
         capabilities
             .push(serde_json::from_value::<Capability>(Value::String(raw.to_owned())).map_err(|_| capability_error())?);
     }
@@ -267,11 +360,14 @@ fn parse_entry(index: usize, entry: &Value) -> Result<IdentityProfile, IdentityP
 
     let mut service_secrets: Vec<String> = Vec::new();
     if let Some(raw) = fields.get("service_secrets") {
-        let Some(names) = strings(raw) else {
-            return Err(invalid(&at, "service_secrets must be a list of secret names"));
+        let Some(names) = strings(raw).filter(|n| n.len() <= MAX_LIST) else {
+            return Err(invalid(
+                &at,
+                format!("service_secrets must be a list of at most {MAX_LIST} secret names"),
+            ));
         };
         for secret in names {
-            if !secret_name_ok(secret) {
+            if !secret_name_ok(secret) || looks_like_secret(secret) {
                 return Err(invalid(
                     &at,
                     format!("a service secret name must be upper case letters, digits and '_' (1 to {MAX_NAME})"),

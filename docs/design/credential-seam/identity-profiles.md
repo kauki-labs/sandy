@@ -35,13 +35,18 @@ The operator writes the registry. It is a JSON file read at daemon start. It hol
 
 ### Valid inputs
 
-- A profile name has 1 to 64 characters from `A-Za-z0-9`, `-`, `_`, `.`. It does not look like a credential.
-  This is the rule sandyd applies to the request's `profile` field, so a registry name always passes the request check.
-- `credential` is a name of the same character set and the same length bound.
-- `targets` has 1 or more entries. Each entry is a non-empty provider path with no whitespace or control
-  character.
-- `capabilities` has 1 or more entries, each a `Capability`. Duplicates are removed.
-- `service_secrets` is a list of names that match `[A-Z][A-Z0-9_]{0,63}`.
+- A profile name has 1 to 64 characters from `A-Za-z0-9`, `-`, `_`, `.`, and starts with a letter or digit, so `.`
+  and `..` are never a name. It does not look like a credential. This is sandyd's rule for the request's `profile`
+  field, plus the leading character, so a registry name always passes the request check. Names that differ only in
+  ASCII case are one name.
+- `credential` is a name of the same character set and the same length bound. It does not look like a credential.
+- `targets` has 1 to 256 entries. Each entry is an `owner/repo` path (nested groups allowed) of ASCII letters, digits,
+  `-`, `_`, `.` and `/`, up to 256 bytes, with no empty segment and no `.` or `..` segment. A URL, a leading `/`, a
+  bare name and any non-ASCII character are refused, so the visible path is the path that is allowed.
+- `capabilities` has 1 to 256 entries, each a `Capability`. Duplicates are removed.
+- `service_secrets` has up to 256 names that match `[A-Z][A-Z0-9_]{0,63}` and do not look like a credential.
+  Duplicates are removed, in order.
+- A registry has at most 1024 profiles.
 
 ### Expected outputs
 
@@ -49,21 +54,26 @@ The operator writes the registry. It is a JSON file read at daemon start. It hol
 - `IdentityProfiles::resolve(name)` returns the `IdentityProfile` for a known name.
 - `IdentityProfile::scope()` returns the `Scope`. `IdentityProfile::credential()` returns the trust root name.
   `IdentityProfile::service_secrets()` returns the names.
-- The registry is an array, so a duplicate name is detectable (a JSON object keeps the last of two equal keys).
+- The registry is an array of named entries, so a duplicate profile name is detectable. A repeated key inside an
+  object is refused too (`serde_json::Value` would keep the last one, and the file a reviewer reads would differ from
+  the registry that loads).
 
 ### Failure definition
 
-- An unknown field is an error (`deny_unknown_fields`). A key named `token`, `secret` or `password` therefore
-  fails the parse. The error names the field when its name is short and name-shaped, never a value.
-- An empty list, a malformed name or a malformed entry is an error that gives the entry's position, and its
-  name when the name is valid. A duplicate profile name is an error that names the profile.
-- `resolve` of an unknown name returns `Unknown`. It does not list the known names.
-- No error text contains a value taken from the file, except the profile name the caller asked for.
+- An unknown field is an error. A key named `token`, `secret` or `password` therefore fails the parse. The error
+  says a field is unknown and lists the allowed fields. It never shows the key, because a pasted secret can sit
+  where a key belongs in a shape no prefix list knows.
+- An empty list, a malformed name or a malformed entry is an error that gives the entry's position and the rule it
+  broke. A duplicate profile name is an error that gives both positions. No error shows a name.
+- A repeated key is a `Malformed` error with the line and column.
+- `resolve` of an unknown name returns `Unknown`. The error shows neither the asked name nor the known names.
+- No error text contains any string taken from the file or from the caller. The only text is a fixed message with
+  an entry position or a line and column.
 - A registry that fails to parse stops the daemon start. It never starts with a partial registry.
 
 ### Performance and scale
 
-The registry has tens of profiles and is read once. `resolve` is a map lookup.
+The registry has tens of profiles and is read once. `resolve` is a linear scan, which is enough at that size.
 
 ### Dependency behaviour
 
@@ -83,14 +93,20 @@ The registry has tens of profiles and is read once. `resolve` is a map lookup.
 If an agent built this, passed the tests and still behaved wrong, the gap would be one of:
 
 - A profile with a `token` key parses because unknown keys are ignored. The tests parse such a file.
+- A secret pasted as a key, a name or a value is echoed because the "safe to show" check knows only some
+  prefixes. The tests put seven shapes of secret in a key and one in every known field, and no error shows one.
+- Two keys in one object load as the last one. The tests parse duplicates inside an entry and at the top level.
+- A target such as `../x` or a URL is accepted and later widens a scope. The tests refuse them.
 - `service_secrets` defaults to "all secrets". The tests assert that the default is empty.
 - An error echoes a rejected value into a log. The tests assert that the error text omits the value.
 
 ## Acceptance tests (tier-2)
 
 1. A valid registry resolves a profile to the expected scope, trust root and service secrets.
-2. A key named `token` fails the parse and the error does not contain the value.
-3. An unknown profile name returns `Unknown` and the error lists no other name.
-4. An empty `targets`, an empty `capabilities`, a bad secret name and a duplicate profile name each fail.
-5. `service_secrets` absent means the empty list.
-6. A profile name that looks like a credential is refused.
+2. An unknown key, in seven shapes, fails the parse and the error does not contain the key.
+3. A secret in any known field fails or is refused and the error does not contain it.
+4. An unknown profile name returns `Unknown` and the error shows neither it nor another name.
+5. Each broken entry fails with the stated reason: empty or traversing targets, a bad capability, a bad name or
+   credential, a bad secret name, a list over its bound. A missing field is refused for that field.
+6. A repeated key, a duplicate profile name (also differing in case) and more than 1024 profiles are refused.
+7. `service_secrets` absent means the empty list. Repeats are removed in order.

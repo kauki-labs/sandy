@@ -319,12 +319,13 @@ An environment request names an identity profile and never carries a secret. The
 profiles. A profile holds the name of a registered trust root, the credential `Scope` (the repository allow-list and
 the capabilities) and the secret names the service may read. It holds no value. The registry is JSON, an array of
 named entries, so a duplicate name is detectable. The parse refuses an unknown key, a name that looks like a
-credential and any malformed entry, and no error repeats a value from the file.
+credential, a repeated key and any malformed entry, and no error shows a key, a name or a value from the file or the caller.
 
 `service_secrets` defaults to none. The T3 service runs as a non-root user and inherits the secret exports of the
 root login shell (#632), so the profile says which names reach it and staging exports only those. The secret directory
 stays root-only. An allowlist in the agent was set aside: it would drop the keys the harnesses need.
 
-**Set aside:** reading the registry through `serde` derive. Its error text repeats the offending value, and the text
-reaches logs. **Open:** one shared name rule for this registry and sandyd's request check (they match today, but are
+**Set aside:** reading the registry through `serde` derive, and a prefix list to decide which text is safe to show. A
+derive error repeats the offending value, and the text reaches logs. A prefix list knows only some secret formats, so
+no key or name is shown at all (review of #592). **Open:** one shared name rule for this registry and sandyd's request check (they match today, but are
 two copies). Spec: `docs/design/credential-seam/identity-profiles.md`.
