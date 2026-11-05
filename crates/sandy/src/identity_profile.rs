@@ -2,7 +2,7 @@
 //! request may pick. A profile holds names only, never a value: the trust root to mint from, the credential
 //! [`Scope`], and the secret names the service may read. See `docs/design/credential-seam/identity-profiles.md`.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 use sandy_api::cred::{Capability, Scope, Target};
 use serde_json::Value;
@@ -52,12 +52,19 @@ pub enum IdentityProfileError {
         /// What is wrong, without the offending value.
         reason: String,
     },
-    /// Two entries share a name.
-    #[error("identity profile {0:?} is defined twice")]
-    Duplicate(String),
-    /// A lookup named no profile in the registry.
-    #[error("unknown identity profile {0:?}")]
-    Unknown(String),
+    /// Two entries share a name, compared without regard to case. Positions only: a name from the file may be a
+    /// pasted secret, so the text never repeats it.
+    #[error("identity profiles #{first} and #{second} share a name")]
+    Duplicate {
+        /// The earlier entry's position.
+        first: usize,
+        /// The later entry's position.
+        second: usize,
+    },
+    /// A lookup named no profile in the registry. The text omits the name: the caller may have been handed a
+    /// secret, and the known names stay private.
+    #[error("unknown identity profile")]
+    Unknown,
 }
 
 /// One named identity.
@@ -133,12 +140,12 @@ impl IdentityProfiles {
                 "`profiles` must be an array".to_owned(),
             ));
         };
-        let mut seen = BTreeSet::new();
+        let mut seen: BTreeMap<String, usize> = BTreeMap::new();
         let mut profiles = Vec::with_capacity(entries.len());
         for (index, entry) in entries.iter().enumerate() {
             let profile = parse_entry(index, entry)?;
-            if !seen.insert(profile.name.clone()) {
-                return Err(IdentityProfileError::Duplicate(profile.name));
+            if let Some(first) = seen.insert(profile.name.to_ascii_lowercase(), index) {
+                return Err(IdentityProfileError::Duplicate { first, second: index });
             }
             profiles.push(profile);
         }
@@ -154,7 +161,7 @@ impl IdentityProfiles {
         self.profiles
             .iter()
             .find(|p| p.name == name)
-            .ok_or_else(|| IdentityProfileError::Unknown(name.to_owned()))
+            .ok_or(IdentityProfileError::Unknown)
     }
 }
 
@@ -221,8 +228,6 @@ fn parse_entry(index: usize, entry: &Value) -> Result<IdentityProfile, IdentityP
     if looks_like_secret(name) {
         return Err(invalid(&at, "name must not look like a credential"));
     }
-    let at = format!("#{index} ({name})");
-
     let credential = fields.get("credential").and_then(Value::as_str).unwrap_or_default();
     if !name_ok(credential) || looks_like_secret(credential) {
         return Err(invalid(
@@ -293,6 +298,7 @@ fn parse_entry(index: usize, entry: &Value) -> Result<IdentityProfile, IdentityP
 mod tests {
     use anyhow::Context;
     use sandy_api::cred::{Capability, Target};
+    use serde_json::json;
 
     use super::*;
 
@@ -311,6 +317,14 @@ mod tests {
 
     /// A well-formed token-shaped value no error text may repeat.
     const SECRET: &str = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+
+    fn valid_entry() -> Value {
+        json!({"name": "dev", "credential": "c", "targets": ["o/r"], "capabilities": ["read_code"]})
+    }
+
+    fn registry(entry: &Value) -> String {
+        json!({ "profiles": [entry] }).to_string()
+    }
 
     fn refused(text: &str) -> anyhow::Result<IdentityProfileError> {
         IdentityProfiles::parse(text)
@@ -346,97 +360,178 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_profile_is_refused_without_listing_the_known_ones() -> anyhow::Result<()> {
+    fn an_unknown_profile_is_refused_without_naming_it_or_listing_the_known_ones() -> anyhow::Result<()> {
         let profiles = IdentityProfiles::parse(VALID).context("parse")?;
-        let err = profiles.resolve("prod").err().context("prod is not in the registry")?;
-        assert_eq!(err, IdentityProfileError::Unknown("prod".to_owned()));
-        let text = err.to_string();
-        assert!(!text.contains("dev") && !text.contains("readonly"), "{text}");
+        for asked in ["prod", SECRET] {
+            let err = profiles.resolve(asked).err().context("not in the registry")?;
+            assert_eq!(err, IdentityProfileError::Unknown);
+            let text = err.to_string();
+            assert!(
+                !text.contains(asked) && !text.contains("dev") && !text.contains("readonly"),
+                "{text}"
+            );
+        }
         Ok(())
     }
 
+    /// Every shape of key a pasted secret could take, including formats no prefix list knows.
     #[test]
-    fn a_secret_in_the_registry_is_refused_and_never_echoed() -> anyhow::Result<()> {
-        for key in ["token", "secret", "password", "anything_else"] {
-            let text = format!(
-                r#"{{"profiles":[{{"name":"dev","credential":"c","targets":["o/r"],"capabilities":["read_code"],"{key}":"{SECRET}"}}]}}"#
-            );
-            let err = refused(&text)?.to_string();
-            assert!(!err.contains(SECRET), "{key}: {err}");
+    fn an_unknown_key_is_refused_and_never_echoed() -> anyhow::Result<()> {
+        let keys = [
+            "token",
+            "hunter2hunter2",
+            "0123456789abcdef0123456789abcdef",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0",
+            "sk_live_abcdefghijklmnop",
+            "ya29.a0AfH6SMBxxxxxxxx",
+            SECRET,
+        ];
+        for key in keys {
+            let mut entry = valid_entry();
+            entry[key] = json!("x");
+            let err = refused(&registry(&entry))?.to_string();
+            assert!(!err.contains(key), "{key}: {err}");
             assert!(err.contains("unknown field"), "{key}: {err}");
         }
         Ok(())
     }
 
     #[test]
-    fn a_value_of_the_wrong_type_is_refused_and_never_echoed() -> anyhow::Result<()> {
-        let text = format!(
-            r#"{{"profiles":[{{"name":"dev","credential":"c","targets":"{SECRET}","capabilities":["read_code"]}}]}}"#
-        );
-        let err = refused(&text)?.to_string();
-        assert!(!err.contains(SECRET), "{err}");
+    fn a_secret_in_a_known_field_is_refused_and_never_echoed() -> anyhow::Result<()> {
+        for (field, value) in [
+            ("name", json!(SECRET)),
+            ("credential", json!(SECRET)),
+            ("targets", json!(SECRET)),
+            ("targets", json!([SECRET])),
+            ("capabilities", json!(SECRET)),
+            ("capabilities", json!([SECRET])),
+            ("service_secrets", json!(SECRET)),
+            ("service_secrets", json!([SECRET])),
+        ] {
+            let mut entry = valid_entry();
+            entry[field] = value;
+            let err = refused(&registry(&entry))?.to_string();
+            assert!(!err.contains(SECRET), "{field}: {err}");
+        }
         Ok(())
     }
 
     #[test]
-    fn a_broken_entry_is_refused() {
-        let entry = |fields: &str| format!(r#"{{"profiles":[{{"name":"dev",{fields}}}]}}"#);
-        let cases = [
-            (
-                "empty targets",
-                entry(r#""credential":"c","targets":[],"capabilities":["read_code"]"#),
-            ),
-            (
-                "empty capabilities",
-                entry(r#""credential":"c","targets":["o/r"],"capabilities":[]"#),
-            ),
-            (
-                "unknown capability",
-                entry(r#""credential":"c","targets":["o/r"],"capabilities":["root"]"#),
-            ),
-            (
-                "blank target",
-                entry(r#""credential":"c","targets":["o r"],"capabilities":["read_code"]"#),
-            ),
-            (
-                "empty credential",
-                entry(r#""credential":"","targets":["o/r"],"capabilities":["read_code"]"#),
-            ),
-            (
-                "missing credential",
-                entry(r#""targets":["o/r"],"capabilities":["read_code"]"#),
-            ),
+    fn a_broken_entry_is_refused_for_the_stated_reason() -> anyhow::Result<()> {
+        let long_name = "a".repeat(65);
+        let many_targets: Vec<String> = (0..257).map(|i| format!("o/r{i}")).collect();
+        let cases: Vec<(&str, &str, Value, &str)> = vec![
+            ("empty targets", "targets", json!([]), "targets"),
+            ("empty capabilities", "capabilities", json!([]), "capabilities"),
+            ("unknown capability", "capabilities", json!(["root"]), "capabilities"),
+            ("blank in a target", "targets", json!(["o r"]), "targets"),
+            ("parent segment", "targets", json!(["../x"]), "targets"),
+            ("inner parent segment", "targets", json!(["a/../b"]), "targets"),
+            ("absolute path", "targets", json!(["/abs"]), "targets"),
+            ("url", "targets", json!(["https://evil/x"]), "targets"),
+            ("empty segment", "targets", json!(["a//b"]), "targets"),
+            ("zero width character", "targets", json!(["o/r\u{200b}"]), "targets"),
+            ("non-ASCII lookalike", "targets", json!(["\u{0430}/r"]), "targets"),
+            ("too many targets", "targets", json!(many_targets), "targets"),
+            ("empty credential", "credential", json!(""), "credential"),
+            ("dot dot credential", "credential", json!(".."), "credential"),
+            ("dot dot name", "name", json!(".."), "name"),
+            ("leading dot name", "name", json!(".x"), "name"),
+            ("empty name", "name", json!(""), "name"),
+            ("name over the bound", "name", json!(long_name), "name"),
             (
                 "lowercase secret name",
-                entry(
-                    r#""credential":"c","targets":["o/r"],"capabilities":["read_code"],"service_secrets":["github_token"]"#,
-                ),
+                "service_secrets",
+                json!(["github_token"]),
+                "service secret",
             ),
             (
                 "secret name with a dash",
-                entry(r#""credential":"c","targets":["o/r"],"capabilities":["read_code"],"service_secrets":["A-B"]"#),
+                "service_secrets",
+                json!(["A-B"]),
+                "service secret",
+            ),
+            (
+                "a credential as a secret name",
+                "service_secrets",
+                json!(["AKIAIOSFODNN7EXAMPLE"]),
+                "service secret",
+            ),
+            (
+                "service_secrets not a list",
+                "service_secrets",
+                json!("GITHUB_TOKEN"),
+                "service_secrets",
             ),
         ];
-        for (what, text) in cases {
-            assert!(IdentityProfiles::parse(&text).is_err(), "{what} must be refused");
+        for (what, field, value, reason) in cases {
+            let mut entry = valid_entry();
+            entry[field] = value;
+            match refused(&registry(&entry))? {
+                IdentityProfileError::Invalid { reason: got, .. } => {
+                    assert!(got.contains(reason), "{what}: {got}");
+                }
+                other => anyhow::bail!("{what}: expected Invalid, got {other:?}"),
+            }
         }
-    }
-
-    #[test]
-    fn a_duplicate_profile_name_is_refused() -> anyhow::Result<()> {
-        let one = r#"{"name":"dev","credential":"c","targets":["o/r"],"capabilities":["read_code"]}"#;
-        let err = refused(&format!(r#"{{"profiles":[{one},{one}]}}"#))?;
-        assert_eq!(err, IdentityProfileError::Duplicate("dev".to_owned()));
+        // A missing field is refused for that field.
+        for field in ["credential", "targets", "capabilities", "name"] {
+            let mut entry = valid_entry();
+            entry.as_object_mut().context("entry is an object")?.remove(field);
+            match refused(&registry(&entry))? {
+                IdentityProfileError::Invalid { reason, .. } => assert!(reason.contains(field), "{field}: {reason}"),
+                other => anyhow::bail!("missing {field}: expected Invalid, got {other:?}"),
+            }
+        }
         Ok(())
     }
 
     #[test]
-    fn a_profile_name_that_looks_like_a_credential_is_refused_and_never_echoed() -> anyhow::Result<()> {
-        let text = format!(
-            r#"{{"profiles":[{{"name":"{SECRET}","credential":"c","targets":["o/r"],"capabilities":["read_code"]}}]}}"#
-        );
-        let err = refused(&text)?.to_string();
-        assert!(!err.contains(SECRET), "{err}");
+    fn a_duplicate_key_is_refused_not_resolved_by_last_wins() -> anyhow::Result<()> {
+        let entry = r#""name":"dev","credential":"c","targets":["o/r"]"#;
+        let inside =
+            format!(r#"{{"profiles":[{{{entry},"capabilities":["read_code"],"capabilities":["write_code"]}}]}}"#);
+        let top = format!(r#"{{"profiles":[],"profiles":[{{{entry},"capabilities":["read_code"]}}]}}"#);
+        for (what, text) in [("inside an entry", inside), ("at the top level", top)] {
+            let err = refused(&text)?.to_string();
+            assert!(err.contains("duplicate key"), "{what}: {err}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_duplicate_profile_name_is_refused_by_position_ignoring_case() -> anyhow::Result<()> {
+        for second in ["dev", "Dev", "DEV"] {
+            let mut other = valid_entry();
+            other["name"] = json!(second);
+            let text = json!({"profiles": [valid_entry(), other]}).to_string();
+            let err = refused(&text)?;
+            assert_eq!(err, IdentityProfileError::Duplicate { first: 0, second: 1 });
+            assert!(!err.to_string().to_lowercase().contains("dev"), "{err}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn too_many_profiles_are_refused() -> anyhow::Result<()> {
+        let entries: Vec<Value> = (0..1025)
+            .map(|i| {
+                let mut e = valid_entry();
+                e["name"] = json!(format!("p{i}"));
+                e
+            })
+            .collect();
+        let err = refused(&json!({ "profiles": entries }).to_string())?;
+        assert!(matches!(err, IdentityProfileError::Malformed(_)), "{err:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn service_secrets_are_deduplicated_in_order() -> anyhow::Result<()> {
+        let mut entry = valid_entry();
+        entry["service_secrets"] = json!(["B", "A", "B", "A"]);
+        let profiles = IdentityProfiles::parse(&registry(&entry)).context("parse")?;
+        assert_eq!(profiles.resolve("dev").context("dev")?.service_secrets(), ["B", "A"]);
         Ok(())
     }
 
@@ -448,9 +543,9 @@ mod tests {
             format!(r#"{{"profiles": [{{"name": "{SECRET}"#),
             format!(r#"{{"profiles": "{SECRET}"}}"#),
             format!(r#"{{"profiles": [], "{SECRET}": 1}}"#),
+            format!(r#"["{SECRET}"]"#),
         ] {
-            let err = IdentityProfiles::parse(&text);
-            let message = match err {
+            let message = match IdentityProfiles::parse(&text) {
                 Ok(profiles) => panic!("{text:?} parsed as {profiles:?}"),
                 Err(e) => e.to_string(),
             };
