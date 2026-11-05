@@ -58,8 +58,15 @@ nix build --no-link "$repo_root/nix/guest#packages.x86_64-linux.guest-runner-t3"
 # The sweep as `sandy run` makes it (#666): the first thing a run does, before it goes on with its template. A template
 # that does not exist ends the run within seconds, so only the sweep has any effect.
 sweep_by_run() {
+  run_rc=0
   TMPDIR="$work" SANDY_HOME="$work/home" "$target_dir/debug/sandy" -o json run no-such-template --timeout 5 -- true \
-    >"$work/sweep-run.json" 2>"$work/sweep-run.log" || true
+    >"$work/sweep-run.json" 2>"$work/sweep-run.log" || run_rc=$?
+}
+
+# The run must have got past its sweep and failed at its template (exit 3, an infra fault naming the nix eval), not
+# crashed before or inside the sweep. Without this, a run that never reached the sweep would pass step 1.
+ran_past_the_sweep() {
+  [ "$run_rc" -eq 3 ] && grep -q 'nix eval no-such-template' "$work/sweep-run.json"
 }
 
 sweep() {
@@ -118,6 +125,14 @@ for pid in $pids; do alive "$pid" || {
   exit 1
 }
 sweep_by_run
+ran_past_the_sweep || {
+  echo "FAIL: sandy run did not get past its sweep (exit $run_rc): $(head -c 300 "$work/sweep-run.log")" >&2
+  exit 1
+}
+if grep -q 'swept the VMs' "$work/sweep-run.log"; then
+  echo "FAIL: sandy run reported a sweep while the owner was alive: $(cat "$work/sweep-run.log")" >&2
+  exit 1
+fi
 for pid in $pids; do alive "$pid" || {
   echo "FAIL: pid $pid died when sandy run swept with a live owner" >&2
   exit 1
@@ -145,6 +160,16 @@ for pid in $pids; do alive "$pid" || {
 
 echo "== 3. sandy run sweeps: it stops them and removes the run directory"
 sweep_by_run
+ran_past_the_sweep || {
+  echo "FAIL: sandy run did not get past its sweep (exit $run_rc): $(head -c 300 "$work/sweep-run.log")" >&2
+  exit 1
+}
+# The run itself says what it did: the three processes (qemu, virtiofsd, the proxy) and the one box.
+grep -q 'swept the VMs a killed host left behind: 3 process(es) stopped, 1 box(es) removed' "$work/sweep-run.log" || {
+  echo "FAIL: sandy run did not report its sweep: $(cat "$work/sweep-run.log")" >&2
+  exit 1
+}
+echo "$(grep 'swept the VMs' "$work/sweep-run.log")"
 for _ in $(seq 20); do
   left=""
   for pid in $pids; do alive "$pid" && left="$left $pid"; done
