@@ -268,7 +268,8 @@ gone, it kills every recorded process that is still alive, waits for each to exi
   pid and would otherwise read every owner as dead. The boot id is `kern.bootsessionuuid`, and macOS has no pid
   namespaces. There is no pidfd on macOS, so the kill is check then kill, with a window of one `ps` call: a process
   that took the pid in it would also have to have started in exactly the recorded second, which a process that is
-  not the recorded one cannot (it started later). The agent, egress and service sockets of a killed vfkit run are not
+  not the recorded one cannot (it started later). vfkit runs on a PTY slave whose master the owner holds, so it exits when the owner is killed (live-verified,
+  KOS9): the orphans of a killed macOS run are the egress proxy and the run directory. The agent, egress and service sockets of a killed vfkit run are not
   removed by the sweep; they hold no data.
 
 **Set aside.** Scanning command lines for qemu: it can hit a process we did not start. A process group kill (above).

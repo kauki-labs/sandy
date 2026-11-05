@@ -165,10 +165,26 @@ alive "$owner" && {
   echo "FAIL: the owner survived SIGKILL" >&2
   exit 1
 }
-for pid in $pids; do alive "$pid" || {
-  echo "FAIL: pid $pid exited with its owner, so there was no orphan to sweep" >&2
+# On macOS vfkit runs on a PTY slave the owner holds the master of, so it exits with its owner (SIGHUP/EIO): the box's
+# orphans there are the egress proxy and the run directory. Every other recorded process must outlive the owner.
+survivors=""
+for pid in $pids; do
+  exe=$(python3 -I -c 'import json, sys; print(next(p.get("exe") for p in json.load(open(sys.argv[1]))["procs"] if str(p["pid"]) == sys.argv[2]))' "$record" "$pid")
+  if alive "$pid"; then
+    survivors="$survivors $pid"
+  elif [ "$(uname -s)" = Darwin ] && [ "$exe" = vfkit ]; then
+    echo "note: vfkit (pid $pid) exited with its owner, as it holds the PTY the owner opened"
+  else
+    echo "FAIL: pid $pid ($exe) exited with its owner, so there was no orphan to sweep" >&2
+    exit 1
+  fi
+done
+[ -n "$survivors" ] || {
+  echo "FAIL: no recorded process outlived the owner" >&2
   exit 1
-}; done
+}
+pids=$survivors
+expect_procs=$(echo $pids | wc -w | tr -d ' ')
 [ -d "$rundir" ] || {
   echo "FAIL: the run directory vanished with its owner" >&2
   exit 1
