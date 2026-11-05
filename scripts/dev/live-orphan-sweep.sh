@@ -8,7 +8,7 @@
 #   2. SIGKILLs the host process and checks that qemu, virtiofsd and the proxy are still running (the orphans);
 #   3. starts another `sandy run` and checks that its sweep stops every one of them and removes the run directory.
 #
-# Needs: a Linux host with KVM and /dev/vhost-vsock access, nix. No root, tap or nft. Run from the repo root:
+# Needs: a Linux host with KVM and /dev/vhost-vsock access, or an Apple silicon macOS host with the aarch64-linux builder; nix. No root, tap or nft. Run from the repo root:
 #
 #   scripts/dev/live-orphan-sweep.sh
 set -euo pipefail
@@ -16,14 +16,30 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$repo_root"
 
-if [ "$(uname -s)" != "Linux" ]; then
-  echo "refusing: the orphan sweep gate needs a Linux KVM host" >&2
+# What each host runs: the guest, the hypervisor tools, and how many processes a box starts. Linux: qemu, virtiofsd and
+# the egress proxy. macOS (vfkit): vfkit and the egress proxy; virtio-fs is built into vfkit.
+case "$(uname -s)" in
+Linux)
+  if [ ! -r /dev/vhost-vsock ] || [ ! -w /dev/vhost-vsock ]; then
+    echo "refusing: /dev/vhost-vsock is not accessible to this user" >&2
+    exit 2
+  fi
+  guest_runner=packages.x86_64-linux.guest-runner-t3
+  topology=topologies.x86_64-linux.qemu-t3
+  tools=(nixpkgs#qemu nixpkgs#virtiofsd)
+  expect_procs=3
+  ;;
+Darwin)
+  guest_runner=packages.aarch64-darwin.guest-runner-vfkit-t3
+  topology=topologies.aarch64-linux.vfkit-t3
+  tools=(nixpkgs#vfkit)
+  expect_procs=2
+  ;;
+*)
+  echo "refusing: the orphan sweep gate needs a Linux KVM host or an Apple silicon macOS host" >&2
   exit 2
-fi
-if [ ! -r /dev/vhost-vsock ] || [ ! -w /dev/vhost-vsock ]; then
-  echo "refusing: /dev/vhost-vsock is not accessible to this user" >&2
-  exit 2
-fi
+  ;;
+esac
 
 # Short, fixed base: a unix socket path holds at most 108 bytes.
 work=$(mktemp -d /tmp/slo.XXXXXX)
@@ -39,7 +55,7 @@ cleanup() {
   fi
   for pid in $pids; do
     case "$(ps -o comm= -p "$pid" 2>/dev/null || true)" in
-    qemu-system* | virtiofsd | sandy-egress-pr*) kill -9 "$pid" 2>/dev/null || true ;;
+    qemu-system* | virtiofsd | sandy-egress-pr* | */vfkit | */sandy-egress-proxy) kill -9 "$pid" 2>/dev/null || true ;;
     esac
   done
   pkill -9 -f -- "$work/" 2>/dev/null || true
@@ -53,7 +69,7 @@ cargo build -q -p sandy-cli --bin sandy
 cargo build -q -p sandy-egress-proxy
 cargo build -q -p sandy-impls-vm --example sweep_orphans
 echo "== building the T3 guest"
-nix build --no-link "$repo_root/nix/guest#packages.x86_64-linux.guest-runner-t3"
+nix build --no-link "$repo_root/nix/guest#$guest_runner"
 
 # The sweep as `sandy run` makes it (#666): the first thing a run does, before it goes on with its template. A template
 # that does not exist ends the run within seconds, so only the sweep has any effect.
@@ -79,8 +95,8 @@ echo "== starting the guest"
   # live with the real one (INV-S9).
   env -u SANDY_QEMU_BIN -u SANDY_VIRTIOFSD_BIN TMPDIR="$work" SANDY_HOME="$work/home" SANDY_EGRESS=proxy \
     SANDY_EGRESS_PROXY_BIN="$target_dir/debug/sandy-egress-proxy" \
-    nix shell nixpkgs#qemu nixpkgs#virtiofsd -c \
-    "$target_dir/debug/sandy" -o json run "$repo_root/nix/guest#topologies.x86_64-linux.qemu-t3" \
+    nix shell "${tools[@]}" -c \
+    "$target_dir/debug/sandy" -o json run "$repo_root/nix/guest#$topology" \
     --timeout 900 --allow example.com:443 --input "$work/in.txt:in.txt" -- sleep 600 \
     >"$work/result.json" 2>"$work/stderr.log"
 ) &
@@ -92,12 +108,12 @@ for _ in $(seq 150); do
   record=$(ls "$work"/sandy/*/box.json 2>/dev/null | head -1 || true)
   if [ -n "$record" ]; then
     count=$(python3 -I -c 'import json, sys; print(len(json.load(open(sys.argv[1]))["procs"]))' "$record" 2>/dev/null || echo 0)
-    [ "$count" -ge 3 ] && break
+    [ "$count" -ge "$expect_procs" ] && break
   fi
   sleep 2
 done
-if [ -z "$record" ] || [ "${count:-0}" -lt 3 ]; then
-  echo "no box record naming qemu, virtiofsd and the proxy appeared within 300 s" >&2
+if [ -z "$record" ] || [ "${count:-0}" -lt "$expect_procs" ]; then
+  echo "no box record naming its $expect_procs processes appeared within 300 s" >&2
   tail -n 12 "$work/stderr.log" >&2 || true
   exit 1
 fi
@@ -164,8 +180,9 @@ ran_past_the_sweep || {
   echo "FAIL: sandy run did not get past its sweep (exit $run_rc): $(head -c 300 "$work/sweep-run.log")" >&2
   exit 1
 }
-# The run itself says what it did: the three processes (qemu, virtiofsd, the proxy) and the one box.
-grep -q 'swept the VMs a killed host left behind: 3 process(es) signalled, 1 box(es) removed' "$work/sweep-run.log" || {
+# The run itself says what it did: every process the box started (qemu, virtiofsd and the proxy; or vfkit and the
+# proxy) and the one box.
+grep -q "swept the VMs a killed host left behind: $expect_procs process(es) signalled, 1 box(es) removed" "$work/sweep-run.log" || {
   echo "FAIL: sandy run did not report its sweep: $(cat "$work/sweep-run.log")" >&2
   exit 1
 }
