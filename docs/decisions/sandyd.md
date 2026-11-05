@@ -2058,9 +2058,12 @@ are later slices.
   move is refused with the state the row holds. Each move is one `IMMEDIATE` transaction, so racing moves cannot
   both pass one guard.
 - `request_id` is unique and kept as long as the row exists, `Deleted` rows included. The same payload returns the
-  same environment, even after delete (never a new one). Another payload under the same id is a `Conflict`. No
-  clock is involved. The payload is opaque bytes plus an encoding name, compared byte for byte.
-- A row cap refuses a new environment but never the retry of a stored `request_id`.
+  same environment, even after delete (never a new one) while the row is kept; retention (decision 27) removes a
+  deleted row after a window, and a replay after that makes a new environment. Another payload under the same id is
+  a `Conflict`. `create` itself reads no clock. The payload is opaque bytes plus an encoding name, compared byte for
+  byte.
+- A row cap refuses a new environment but never the retry of a stored `request_id`. It counts rows that are not
+  `Deleted` (#633).
 
 **Deviations from #587's text.** `resume` goes back through `Provisioning`, not straight to `Ready`: a resumed
 environment is Ready only after its health probe passes again (#585 O2). `Archive` is not implemented: its
@@ -2073,8 +2076,8 @@ meaning for an environment is undefined (a job's archive is a transcript), so it
 - A `delete` while a launch is in flight makes the driver's late `mark_ready` return `Refused(Deleted)`. The driver
   must treat that as "tear the box down", not as an ignorable refusal.
 - A failed resume (`Stopped` to `Provisioning` to `Failed`) leaves a once-good environment with only `delete` left.
-- Deleted rows stay for replay, and the row cap counts them, so once the table holds `max` rows every new create is
-  refused until rows are cleared. Slice A has no purge; retention is tracked as a follow-up.
+- Deleted rows stay for replay until retention collects them (decision 27, #633). The row cap counts only rows that
+  are not `Deleted`, so create and delete churn cannot fill it.
 - A row with an unreadable state fails every read of that row, `delete` of it and `list` as a whole, and no other
   `get`. It is surfaced, not skipped, so a corrupt row is noticed.
 - `create` and every move run in one `IMMEDIATE` transaction on their own connection, so two processes sharing the
@@ -2113,11 +2116,40 @@ terminal envelope, so it would need a second record kind and a different reconci
 
 **Retries and limits.** A retried create is answered from the stored row before any validation, so a rule tightened
 by a later daemon cannot turn an accepted create's replay into a refusal; the same key with another spec is still a
-conflict. An unfiltered `ListEnvironments` leaves out `Deleted` rows (ask for state `DELETED` to see them) and refuses
-a reply of more than 1000 environments with `INVALID_ARGUMENT`, so a reply cannot outgrow the 1 MiB control frame.
+conflict. An unfiltered `ListEnvironments` leaves out `Deleted` rows (ask for state `DELETED` to see them).
 `cancel` of a deleted environment is an idempotent success, a retried cancel; of a failed, ready or stopped one it is
-`INVALID_STATE`. The row cap counts deleted rows, so with `SANDY_MAX_ENVIRONMENTS` set, create and delete churn
-fills it until rows are purged (retention is #614).
+`INVALID_STATE`.
+
+**Paging (#633).** `ListEnvironments` returns one page. The request carries `page_size` (0 means 100, above 500 is 500) and `page_token`; the reply carries `next_page_token`, empty on the last page. Rows are ordered by
+`environment_id` (unique and immutable, so a cursor survives the delete or gc of its own row), and the token is the
+id of the last row scanned (it advances past rows a `task_ref` filter skipped), which a client passes back
+unchanged. A malformed token is `INVALID_ARGUMENT`. A page also
+stops when its encoded rows reach 512 KiB, half the 1 MiB control frame, so a page always fits a frame whatever the
+row sizes. The old refusal of a reply of more than 1000 rows is gone. The three new fields are additive proto3
+fields, so an older client keeps working but sees only the first page; the broker follows pages (broker-api
+decision 6). The order changed from creation order to id order, and no caller relied on it.
+
+**Retention (#633; implements the owner decision on #587, "deleted rows included until gc").** A `Deleted` row is kept
+so a retry of its `idempotency_key` finds the same environment. It is not kept forever:
+
+- A `Deleted` row whose delete is older than `SANDY_ENV_RETENTION_SECS` (default 86400, one day, minimum 1) is
+  removed, and its key may be used again: a replay after that creates a new environment with a new id. A client that
+  retries a create longer than a day after its delete gets a new environment, not the deleted one.
+- At most `SANDY_MAX_DELETED_ENVIRONMENTS` (default 10000, minimum 1) `Deleted` rows are kept; the oldest delete
+  goes first (by `updated_at`, which has one-second resolution; ties go in creation order), even inside the window, so one caller cannot grow the table without bound by churn.
+- Age is the row's `updated_at`, which a `Deleted` row writes once, at the delete. No new column.
+- The sweep runs once at startup and then every 60 seconds, in its own task that does not depend on
+  `SANDY_ENV_BACKEND`. The clock is injected, so tests do not sleep.
+- `SANDY_MAX_ENVIRONMENTS` counts only rows that are not `Deleted`, so create and delete churn can no longer fill
+  it. A `Failed` row still counts until it is deleted. That is a residual: a caller that makes failing creates
+  and never deletes them can still fill the cap, and the broker's per-client record cap bounds that.
+
+Upgrade sandyd and the broker together: a broker that predates paging ignores `next_page_token`, sees only the first
+100 rows and undercounts a client's quota. Set `SANDY_MAX_ENVIRONMENTS` at or below 10000, because the broker's scan
+ceiling counts rows before its ownership filter, and `Failed` rows count toward the cap (each client can hold up to
+`max_environment_records` of them).
+
+The window and the cap are one decision to ratify on #607 (default 1 day, 10000).
 
 **Consequence.** Until the launch driver (slice C) reports back, a created environment stays `Provisioning`, `steps`
 is empty and `connection` is never set; the handler tests move a row to `Ready` through the store directly. Quota per
@@ -2194,3 +2226,44 @@ pass).
 **Consequences.** Environments created over the RPC now reach `Ready` with `connection.url` set, so the broker and the MCP tools can be driven end to end. One daemon runs at most the environments its host can hold, with no resource limit per environment. The pairing file and the service log live in the environment directory and go with it on `kill`.
 
 **Alternative set aside.** Running the service through `impls/local`'s `ProcessBackend`: it is run-to-completion and tied to one job, and it would not give the driver a long-lived box it can probe and kill by environment id.
+
+## 30. The idle-stop lease: a `Ready` environment with no owner-visible use is stopped, not deleted (#587)
+
+**Status:** accepted (owner decisions on #587, 2026-11-03). **Upholds:** INV-6.
+
+**Context.** #587 asks that an environment with no attach and no activity for a configured period is stopped. A stopped environment keeps its row and resumes under the same id.
+
+**Decision.**
+
+- The store keeps `last_activity_at` per row. `EnvironmentStore::touch(id, now)` renews it and writes only while the row is `Ready`. Every state change clears it, so a resumed environment starts a fresh lease from `updated_at`.
+- The lease runs from `last_activity_at`, or from `updated_at` when it is unset. `SANDY_ENV_IDLE_TIMEOUT_SECS` sets the limit. Unset means off, today's behavior.
+- The driver's `Ready` pass stops a row whose lease ran out, through the same `stop` an owner uses. The next pass sees `Stopped` and kills the box, so there is one kill path and a daemon restart changes nothing.
+- The stop is one conditional statement in the store (`stop_if_idle`), not a read then a stop, so a renewal that lands between the driver's snapshot and its write wins.
+- Owner-visible use renews the lease: today a `GetEnvironment` call, and attach when it lands. A failed renewal never fails the read.
+- Rows that were `Ready` before the column existed have no renewal, so their lease runs from `updated_at`. Enabling the limit on an existing store stops every environment older than the limit at the first pass.
+
+**Consequences.** A client that connects straight to the service endpoint, as a T3 client does after pairing, is invisible to `sandyd`, so it does not renew the lease. Set the limit long enough for that, or leave it off. A backend-reported activity signal (connections through the bridge) is the follow-up that closes this gap.
+
+A client that polls `GetEnvironment` renews the lease for as long as it polls, and `sandyd` does not check who the caller is, so any local caller can renew. A status poller therefore keeps an environment alive on purpose. Narrowing renewal to attach is the follow-up once attach exists.
+
+**Alternative set aside.** Counting every RPC on the id as activity, including list and cancel: it widens the poller problem and adds no owner signal.
+
+## 31. The VM environment backend holds one agent-mode `VmBackend::run` per environment (#587, C3a)
+
+**Status:** accepted (design posted on #587, 2026-11-03). **Upholds:** INV-6.
+
+**Context.** The real `EnvironmentBackend` must boot a guest with the service in it and keep it up. A new qemu or vfkit launch path would duplicate boot, shares, the egress proxy and teardown.
+
+**Decision.**
+
+- `sandy-environment::VmEnvironmentBackend` runs one `VmBackend::run` per environment on its own thread, with the deadline suspended. `launch` returns once the thread starts. `kill` marks the entry as stopping, cancels the run's `RunControl` and waits up to 30 s for `run()` to return. While it waits the box stays listed and a launch for that id is refused, so no second VM starts before the first is gone. Concurrent kills wait on the same run. A run that does not return keeps its entry, so a later kill retries. Dropping the backend waits the same bounded time, then logs and gives up instead of hanging shutdown.
+- One hypervisor backend serves one environment, because agent mode runs one job per backend. The caller supplies a factory.
+- `boxes()` lists only runs still up. A run that returned is `NotRunning`, and a launch for that id starts a fresh box.
+- Readiness is not decided here. A `ServiceProbe` (the host bridge, slice C3b) is asked while the run is up; with none set, the probe reports `Starting`.
+- Dropping the backend cancels and joins every run.
+- The guest env and the boot budget come from `VmEnvironmentConfig`: its `env` is appended after the spec's own (the service spec, `SANDY_SERVICE`, goes there, or the agent runs the command as a plain job and never probes), and `boot_timeout_secs` is the `timeout_secs` the hypervisor backend sizes its serial and link connect budgets from, so a real qemu is not given one second to boot. The deadline stays suspended.
+- What a CID hook starts (the host bridge and its probe registration) is held in `RunGuards` and released when `run()` returns, however it ends, through `GuardedBackend`. A hook that fires after that has its guard dropped at once. A run thread that panics is not running: its done flag is set on unwind.
+
+**Consequences.** The backend is generic over `VmBackend`, so it is tier-2 testable with a double that holds until cancelled. It is not wired into `sandyd` yet: that needs the two `impls/vm` hooks (the qemu CID, the vfkit port-5100 device) and the bridge probe (C3b). VMs do not survive a daemon restart in this slice, because the threads die with the process. A restart policy is open on #587.
+
+**Alternative set aside.** A new launch path in `impls/vm`: it would fork boot and teardown logic across two backends.

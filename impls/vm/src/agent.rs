@@ -21,7 +21,7 @@ use std::{
 };
 
 use sandy::{BackendError, Outcome};
-use sandy_api::agent::{AGENT_LINK_READY, AgentLaunch, AgentReport, AgentVerdict};
+use sandy_api::agent::{AGENT_LINK_READY, AgentLaunch, AgentReport, AgentVerdict, SERVICE_ENV};
 
 /// Agent mode: how long after the guest finishes to wait for the relay's
 /// verdict (as on the process backend, it follows the link closing at once).
@@ -49,11 +49,20 @@ const READY_WAIT: Duration = Duration::from_secs(2);
 /// re-tokenized) — the same bug class #116 found live in the plain path.
 pub(crate) fn agent_command_argv(program: &Path, port: u32, job: &[String], env: &[(String, String)]) -> Vec<String> {
     let mut argv = Vec::new();
-    // Only the history bound crosses: no host variable enters the guest (#527). The
-    // guest's `env` sets it for the agent, which reads it at startup (#378). The last entry
+    // Only the history bound and the service spec cross: no host variable enters the guest (#527). The
+    // guest's `env` sets them for the agent, which reads them at startup (#378, #589). The last entry
     // wins, as in the process backend's overlay: the executor appends its own value last.
-    if let Some((key, value)) = env.iter().rfind(|(key, _)| key == HISTORY_LINES_ENV) {
-        argv.extend(["env".to_owned(), format!("{key}={value}")]);
+    let forwarded: Vec<String> = [HISTORY_LINES_ENV, SERVICE_ENV]
+        .into_iter()
+        .filter_map(|name| {
+            env.iter()
+                .rfind(|(key, _)| key == name)
+                .map(|(key, value)| format!("{key}={value}"))
+        })
+        .collect();
+    if !forwarded.is_empty() {
+        argv.push("env".to_owned());
+        argv.extend(forwarded);
     }
     argv.extend([
         program.to_string_lossy().into_owned(),
@@ -282,6 +291,20 @@ mod tests {
             agent_command_argv(program, 5000, &["true".to_string()], &duplicated)[1],
             "SANDY_HISTORY_LINES=250",
             "a repeated key resolves last-wins, so the executor's value beats the manifest's"
+        );
+        let service = r#"{"user":"dev"}"#;
+        let with_service = [
+            ("HOME".to_string(), "/host/home".to_string()),
+            (SERVICE_ENV.to_string(), service.to_string()),
+        ];
+        assert_eq!(
+            agent_command_argv(program, 5000, &["t3".to_string()], &with_service)[..3],
+            [
+                "env".to_string(),
+                format!("{SERVICE_ENV}={service}"),
+                program.to_string_lossy().into_owned()
+            ],
+            "the service spec crosses to the agent too, and no other host variable does"
         );
         let other = [("HOME".to_string(), "/host/home".to_string())];
         assert_eq!(

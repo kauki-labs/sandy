@@ -74,7 +74,7 @@ paths:
       operationId: attachJob
       summary: Open the job's output stream.
       description: >-
-        Returns a stream location. The channel-join cap is redeemed by the API tier, not returned to the caller.
+        Returns a single-use stream location, valid for expires_in_s seconds. The attach token and the channel-join cap stay in the API tier. A client holds at most 4 outstanding tickets plus open streams (quota_exceeded beyond that). A finished job is unavailable.
       responses:
         "200":
           description: Stream location.
@@ -82,9 +82,43 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [stream_url]
+                required: [stream_url, expires_in_s]
                 properties:
-                  stream_url: {type: string, format: uri}
+                  stream_url:
+                    type: string
+                    description: Path relative to the API URL, /v1/jobs/{job_id}/stream/{ticket}.
+                  expires_in_s: {type: integer}
+        default: {$ref: "#/components/responses/Error"}
+  /v1/jobs/{job_id}/stream/{ticket}:
+    parameters:
+      - {$ref: "#/components/parameters/JobId"}
+      - name: ticket
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      operationId: streamJob
+      summary: Read the job's output as NDJSON.
+      description: >-
+        Needs the same bearer as every route. The ticket works once. An unknown, expired, malformed, other-client or other-job ticket is not_found. The output replays from the start of the job on every stream. The stream is read-only.
+      responses:
+        "200":
+          description: >-
+            Newline-delimited JSON, chunked. Zero or more output lines, then one exit line. A client that disconnects does not affect the job.
+          content:
+            application/x-ndjson:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [type, data]
+                    properties:
+                      type: {type: string, enum: [output]}
+                      data: {type: string, contentEncoding: base64, description: "A chunk of stdout or stderr, merged. Bytes are opaque and may split a UTF-8 sequence."}
+                  - type: object
+                    required: [type, reason]
+                    properties:
+                      type: {type: string, enum: [exit]}
+                      reason: {type: string, description: "closed, job_terminal:<JOB_STATUS_*>, job_terminal_truncated:<JOB_STATUS_*> (the job ended but output was still arriving after 30 s, so it is incomplete; open a new stream to replay), or fault:<fixed text>, one of fault:data plane error and fault:status unavailable."}
         default: {$ref: "#/components/responses/Error"}
   /v1/environments:
     post:

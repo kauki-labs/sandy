@@ -86,11 +86,13 @@ version, metadata, dependency versions, and lints through the root `Cargo.toml`
 - **`sandy-broker`** — the broker HTTP API tier over sandyd (#591): bearer-token clients, per-client
   job and environment ownership, the job and environment endpoints of the OpenAPI contract,
   loopback only. It speaks the control RPC over UDS and keeps each job's attach token. Attach
-  and link answer `unsupported` for now. See `docs/decisions/broker-api.md`.
-- **`sandy-environment`** — `EnvironmentBackend` implementations for `sandyd` (#587). Today the
-  opt-in, trusted-only `ProcessEnvironmentBackend`: a service such as `t3 serve` as a host process
-  group with a cleared environment and no isolation, selected by `SANDY_ENV_BACKEND=process-insecure`.
-  See `docs/decisions/sandyd.md` decision 29.
+  bridges sandyd's attach socket to an NDJSON stream behind a single-use ticket (#616); link
+  answers `unsupported` for now. See `docs/decisions/broker-api.md`.
+- **`sandy-environment`** — `EnvironmentBackend` implementations for `sandyd` (#587): the opt-in,
+  trusted-only `ProcessEnvironmentBackend` (a service such as `t3 serve` as a host process group,
+  cleared environment, no isolation, `SANDY_ENV_BACKEND=process-insecure`, decision 29), and
+  `VmEnvironmentBackend`, one held agent-mode `VmBackend::run` per environment (decision 31, not yet
+  wired into `sandyd`).
 - **`sandy-egress-proxy`** — the per-run host egress proxy for NIC-less guests
   (#401, epic #360): a pure CONNECT-parse / allow-list / address-filter core and an
   unprivileged binary. `QemuBackend` (#404) and `VfkitBackend` (#405) run one per launch, not yet live-verified. See

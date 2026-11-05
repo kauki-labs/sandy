@@ -217,6 +217,75 @@ fn history_lines_env(history_lines: u32) -> [(String, String); 1] {
     [("SANDY_HISTORY_LINES".to_owned(), history_lines.to_string())]
 }
 
+/// The env an argv/v1 run carries: the submitter's entries without `SANDY_SERVICE`. The argv manifest has no
+/// service, so a submitter-set key would reach the agent's probe and port relay unvalidated (#589 review).
+fn process_run_env(env: &[(String, String)]) -> Vec<(String, String)> {
+    env.iter()
+        .filter(|(key, _)| key != sandy_api::agent::SERVICE_ENV)
+        .cloned()
+        .collect()
+}
+
+/// The longest `SANDY_SERVICE` value the executor sends. The guest console takes the agent's command as one
+/// line, shell-quoted and base64-encoded (about 4095 bytes in canonical mode), and quoting and encoding grow a
+/// value by up to a factor of 4, so a larger spec plus the job's own argv could be cut mid-argument. A typical
+/// spec is a few hundred bytes.
+const MAX_SERVICE_ENV_BYTES: usize = 1024;
+
+/// The env a flake/v1 run carries: the submitter's own entries, then the plumbing entries the executor owns.
+///
+/// The executor's keys (`SANDY_HISTORY_LINES`, `SANDY_SERVICE`) are removed from the submitter's entries first:
+/// without that, a manifest with `service: None` could set `SANDY_SERVICE` itself and reach the agent's probe
+/// with a spec `validate_service` never saw (#589 review).
+///
+/// # Errors
+/// [`DispatchError::MalformedManifest`] if the service spec cannot be encoded or exceeds
+/// [`MAX_SERVICE_ENV_BYTES`].
+fn flake_run_env(
+    decoded: &sandy_guest_template::manifest::FlakeManifestV1,
+) -> Result<Vec<(String, String)>, DispatchError> {
+    let mut env: Vec<(String, String)> = decoded
+        .env
+        .iter()
+        .filter(|(key, _)| key != "SANDY_HISTORY_LINES" && key != sandy_api::agent::SERVICE_ENV)
+        .cloned()
+        .collect();
+    env.extend(history_lines_env(decoded.history_lines));
+    if let Some(service) = &decoded.service
+        && service.restart != sandy_guest_template::manifest::RestartPolicy::Never
+    {
+        return Err(DispatchError::MalformedManifest(format!(
+            "service restart policy {:?} is not implemented yet; refused rather than ignored",
+            service.restart
+        )));
+    }
+    let service = service_env(decoded.service.as_ref())
+        .map_err(|e| DispatchError::MalformedManifest(format!("the service spec: {e}")))?;
+    if let Some((_, value)) = &service
+        && value.len() > MAX_SERVICE_ENV_BYTES
+    {
+        return Err(DispatchError::MalformedManifest(format!(
+            "the service spec is {} bytes, over the {MAX_SERVICE_ENV_BYTES} byte limit",
+            value.len()
+        )));
+    }
+    env.extend(service);
+    Ok(env)
+}
+
+/// The `SANDY_SERVICE` env entry for a flake/v1 dispatch that declares a service (#589): the spec as JSON for
+/// the guest agent's probe loop. `None` for a plain job. `impls/vm` forwards this entry like the history bound.
+///
+/// # Errors
+/// `serde_json`'s error if the spec cannot be serialized (it cannot in practice).
+fn service_env(
+    service: Option<&sandy_guest_template::manifest::ServiceSpec>,
+) -> Result<Option<(String, String)>, serde_json::Error> {
+    service
+        .map(|spec| Ok((sandy_api::agent::SERVICE_ENV.to_owned(), serde_json::to_string(spec)?)))
+        .transpose()
+}
+
 /// An `argv/v1` manifest's decoded shape (manifest-parity #480, `sandyd.md`
 /// §19): a bare `["cmd", "arg", ...]` array still decodes, with every field
 /// but `command` absent — the backward-compat form `scripts/cross-machine-
@@ -550,7 +619,7 @@ pub fn handle_dispatch(
                 inputs: &path_inputs,
                 outputs: &path_outputs,
                 secrets: &path_secrets,
-                env: &decoded.env,
+                env: &process_run_env(&decoded.env),
                 cpu: decoded.cpu,
                 mem: decoded.mem,
                 timeout_secs,
@@ -574,6 +643,12 @@ pub fn handle_dispatch(
         Some(ProtoSandboxKind::Vm) if vm_available => {
             refuse_guest_nic(std::env::var(sandy_api::egress::NETWORK_ENV))?;
             let decoded = decode_flake_dispatch_manifest(&dispatch.manifest_encoding, &dispatch.manifest)?;
+            // Before flake resolution: an oversized or unencodable spec is refused at once, not after the
+            // sequential dispatch loop spent up to FLAKE_RESOLVE_TIMEOUT_SECS on it (CodeRabbit on #632).
+            // The manifest's own env first, the plumbing entries last so they always win a key collision
+            // (see `flake_run_env`) — the same precedence `impls/local/src/process.rs` already establishes for
+            // the process backend's share-dir/passthrough overlays (manifest-parity #480, `sandyd.md` §19).
+            let env = flake_run_env(&decoded)?;
             let resolved = sandy_guest_template::resolve_flake_template(
                 &decoded.flake,
                 decoded.kind.as_deref(),
@@ -616,13 +691,6 @@ pub fn handle_dispatch(
                 program: agent_program,
                 on_link,
             });
-            // The manifest's own env first, the plumbing entry
-            // (`SANDY_HISTORY_LINES`) last so it always wins a key collision
-            // — the same precedence `impls/local/src/process.rs` already
-            // establishes for the process backend's share-dir/passthrough
-            // overlays (manifest-parity #480, `sandyd.md` §19).
-            let mut env = decoded.env.clone();
-            env.extend(history_lines_env(decoded.history_lines));
             let spec = RunSpec {
                 digests: false,
                 egress: None,
@@ -797,6 +865,131 @@ mod tests {
             history_lines_env(5_000),
             [("SANDY_HISTORY_LINES".to_owned(), "5000".to_owned())]
         );
+    }
+
+    /// #589: a service manifest reaches the guest agent as one JSON env entry; a plain job adds none.
+    #[test]
+    fn service_env_carries_the_spec_and_is_absent_for_a_plain_job() -> Result<(), serde_json::Error> {
+        use sandy_guest_template::manifest::{HealthProbe, ProbeCheck, RestartPolicy, ServiceSpec};
+
+        assert_eq!(service_env(None)?, None);
+        let spec = ServiceSpec {
+            user: "dev".to_owned(),
+            probe: HealthProbe {
+                check: ProbeCheck::Tcp { port: 3773 },
+                interval_secs: 2,
+                timeout_secs: 1,
+                max_attempts: 30,
+            },
+            restart: RestartPolicy::Never,
+            port: Some(3773),
+        };
+        let (key, value) = service_env(Some(&spec))?.expect("a service sets the env entry");
+        assert_eq!(key, sandy_api::agent::SERVICE_ENV);
+        assert_eq!(serde_json::from_str::<ServiceSpec>(&value)?, spec);
+        Ok(())
+    }
+
+    fn flake_manifest(
+        env: Vec<(String, String)>,
+        service: Option<sandy_guest_template::manifest::ServiceSpec>,
+    ) -> sandy_guest_template::manifest::FlakeManifestV1 {
+        sandy_guest_template::manifest::FlakeManifestV1 {
+            flake: ".".to_owned(),
+            kind: None,
+            attr: None,
+            command: vec!["t3".to_owned(), "serve".to_owned()],
+            history_lines: 5_000,
+            env,
+            cpu: None,
+            mem: None,
+            timeout_secs: None,
+            service,
+        }
+    }
+
+    fn t3_spec() -> sandy_guest_template::manifest::ServiceSpec {
+        use sandy_guest_template::manifest::{HealthProbe, ProbeCheck, RestartPolicy, ServiceSpec};
+        ServiceSpec {
+            user: "dev".to_owned(),
+            probe: HealthProbe {
+                check: ProbeCheck::Tcp { port: 3773 },
+                interval_secs: 2,
+                timeout_secs: 1,
+                max_attempts: 30,
+            },
+            restart: RestartPolicy::Never,
+            port: None,
+        }
+    }
+
+    /// #589 review: a submitter's own `SANDY_SERVICE` (or history bound) never reaches the agent. A plain job
+    /// gets no service entry at all, and a service job gets only the executor's.
+    #[test]
+    fn a_submitter_cannot_set_the_executors_plumbing_env() -> Result<(), DispatchError> {
+        let forged = r#"{"user":"x","probe":{"check":{"type":"tcp","port":1},"interval_secs":0}}"#;
+        let env = vec![
+            ("KEEP".to_owned(), "yes".to_owned()),
+            ("SANDY_SERVICE".to_owned(), forged.to_owned()),
+            ("SANDY_HISTORY_LINES".to_owned(), "1".to_owned()),
+        ];
+
+        let plain = flake_run_env(&flake_manifest(env.clone(), None))?;
+        assert_eq!(
+            plain,
+            [
+                ("KEEP".to_owned(), "yes".to_owned()),
+                ("SANDY_HISTORY_LINES".to_owned(), "5000".to_owned())
+            ],
+            "a plain job carries no SANDY_SERVICE and the executor's history bound"
+        );
+
+        let service = flake_run_env(&flake_manifest(env, Some(t3_spec())))?;
+        let services: Vec<_> = service.iter().filter(|(key, _)| key == "SANDY_SERVICE").collect();
+        assert_eq!(services.len(), 1, "exactly the executor's entry: {service:?}");
+        assert_ne!(services[0].1, forged);
+        Ok(())
+    }
+
+    /// A restart policy the agent cannot honour is refused at dispatch, not accepted and ignored.
+    #[test]
+    fn a_restart_policy_is_refused_until_it_is_implemented() {
+        for policy in [
+            sandy_guest_template::manifest::RestartPolicy::OnFailure,
+            sandy_guest_template::manifest::RestartPolicy::Always,
+        ] {
+            let mut spec = t3_spec();
+            spec.restart = policy;
+            let err = flake_run_env(&flake_manifest(Vec::new(), Some(spec))).expect_err("must be refused");
+            assert!(
+                matches!(err, DispatchError::MalformedManifest(ref m) if m.contains("restart")),
+                "{err:?}"
+            );
+        }
+        assert!(flake_run_env(&flake_manifest(Vec::new(), Some(t3_spec()))).is_ok());
+    }
+
+    /// A spec too large for one console line is refused, not sent to be cut mid-argument.
+    #[test]
+    fn an_oversized_service_spec_is_refused() {
+        let mut spec = t3_spec();
+        spec.probe.check = sandy_guest_template::manifest::ProbeCheck::Command {
+            argv: vec!["x".repeat(MAX_SERVICE_ENV_BYTES)],
+        };
+        let err = flake_run_env(&flake_manifest(Vec::new(), Some(spec))).expect_err("must be refused");
+        assert!(
+            matches!(err, DispatchError::MalformedManifest(ref m) if m.contains("byte limit")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_argv_run_drops_a_submitter_set_service_env_and_keeps_the_rest() {
+        let env = vec![
+            ("FOO".to_owned(), "bar".to_owned()),
+            (sandy_api::agent::SERVICE_ENV.to_owned(), "{}".to_owned()),
+        ];
+        assert_eq!(process_run_env(&env), [("FOO".to_owned(), "bar".to_owned())]);
     }
 
     #[test]

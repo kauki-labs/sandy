@@ -17,7 +17,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::net::UnixStream;
 
-use crate::{Client, IsolationClass, auth::authenticate, environments, owners::Owners, paths::within_roots};
+use crate::{
+    Client, IsolationClass, attach, auth::authenticate, body::Body, environments, owners::Owners, paths::within_roots,
+};
 
 const MAX_BODY: usize = 1024 * 1024;
 
@@ -26,6 +28,9 @@ pub(crate) struct State {
     pub(crate) rpc_deadline: std::time::Duration,
     pub(crate) clients: Vec<Client>,
     pub(crate) owners: Owners,
+    pub(crate) tickets: attach::Tickets,
+    /// How long one write to a stalled attach client may block.
+    pub(crate) send_timeout: std::time::Duration,
     /// Serializes one client's environment creates, so a quota check and its create are one step.
     pub(crate) env_create: std::collections::HashMap<String, tokio::sync::Mutex<()>>,
 }
@@ -68,8 +73,8 @@ pub(crate) const UNAVAILABLE: ApiError = ApiError {
     message: "sandyd refused or could not be reached",
 };
 
-fn respond(status: StatusCode, body: &Value) -> Response<Full<Bytes>> {
-    let mut response = Response::new(Full::new(Bytes::from(body.to_string())));
+fn respond(status: StatusCode, body: &Value) -> Response<Body> {
+    let mut response = Response::new(Body::Full(Full::new(Bytes::from(body.to_string()))));
     *response.status_mut() = status;
     response.headers_mut().insert(
         CONTENT_TYPE,
@@ -78,11 +83,11 @@ fn respond(status: StatusCode, body: &Value) -> Response<Full<Bytes>> {
     response
 }
 
-fn error(e: &ApiError) -> Response<Full<Bytes>> {
+pub(crate) fn error(e: &ApiError) -> Response<Body> {
     respond(e.status, &json!({"code": e.code, "message": e.message}))
 }
 
-pub(crate) fn busy() -> Response<Full<Bytes>> {
+pub(crate) fn busy() -> Response<Body> {
     error(&ApiError {
         status: StatusCode::SERVICE_UNAVAILABLE,
         code: "unavailable",
@@ -90,14 +95,14 @@ pub(crate) fn busy() -> Response<Full<Bytes>> {
     })
 }
 
-pub(crate) fn internal_error() -> Response<Full<Bytes>> {
+pub(crate) fn internal_error() -> Response<Body> {
     respond(
         StatusCode::INTERNAL_SERVER_ERROR,
         &json!({"code": "unavailable", "message": "internal error"}),
     )
 }
 
-pub(crate) async fn handle(state: Arc<State>, req: Request<Incoming>) -> Response<Full<Bytes>> {
+pub(crate) async fn handle(state: Arc<State>, req: Request<Incoming>) -> Response<Body> {
     let authorization = req.headers().get(AUTHORIZATION).and_then(|v| v.to_str().ok());
     let Some(client) = authenticate(&state.clients, authorization) else {
         return error(&UNAUTHENTICATED);
@@ -117,7 +122,11 @@ pub(crate) async fn handle(state: Arc<State>, req: Request<Incoming>) -> Respons
         (&Method::POST, ["v1", "environments", id, action @ ("cancel" | "stop" | "resume")]) => {
             environments::act(&state, client, id, action).await
         }
-        (&Method::POST, ["v1", "jobs", _, "attach"] | ["v1", "environments", _, "link"]) => Err(UNSUPPORTED),
+        (&Method::POST, ["v1", "jobs", id, "attach"]) => attach::issue(&state, client, id).await,
+        (&Method::GET, ["v1", "jobs", id, "stream", ticket]) => {
+            return attach::stream(Arc::clone(&state), client, id, ticket).await;
+        }
+        (&Method::POST, ["v1", "environments", _, "link"]) => Err(UNSUPPORTED),
         _ => Err(NOT_FOUND),
     };
     match result {
@@ -308,7 +317,7 @@ async fn list(state: &State, client: &Client) -> Reply {
     Ok((StatusCode::OK, json!({"jobs": jobs})))
 }
 
-async fn status_of(state: &State, id: &str) -> Result<Value, ApiError> {
+pub(crate) async fn status_of(state: &State, id: &str) -> Result<Value, ApiError> {
     let op = control_request::Op::Status(StatusRequest { job_id: id.to_owned() });
     let control_response::Result::Status(s) = rpc(state, op).await? else {
         return Err(UNAVAILABLE);

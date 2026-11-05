@@ -104,8 +104,7 @@ user's files. Tracked in a follow-up issue.
 
 ## 5. Deferred in this slice
 
-- `attach` returns the typed error `unsupported`. The control RPC's data plane is a UDS stream.
-  An HTTP bridge is its own design and aligns with #513 (NDJSON).
+- `attach` is no longer deferred: decision 7 bridges it (#616).
 - `link` returns `unsupported` until T3 offers an external link interface (#585 open point 1).
 - Rate limiting, quotas, and the audit trail are #596.
 - `SubmitJob` has no `request_id`. Job idempotency is a contract change and is not made here.
@@ -114,7 +113,7 @@ user's files. Tracked in a follow-up issue.
 
 **Decision.**
 
-- Spawn, get, list, stop, resume, cancel and delete each make one control RPC with the typed
+- Spawn, get, stop, resume, cancel and delete each make one control RPC with the typed
   messages. The broker never forwards client JSON bytes: sandyd compares the create spec
   byte for byte, so the broker builds the message.
 - sandyd keys idempotency over all callers. The broker sends `idempotency_key` as a 16-digit
@@ -125,7 +124,14 @@ user's files. Tracked in a follow-up issue.
   environment, and an unknown one, both give `not_found` on every route, and list shows only
   the caller's.
 - Per-client quota: `max_environments` in the clients file (default 4) counts the client's
-  non-terminal environments. A replay of a request id the client already used skips the check.
+  non-terminal environments. A replay of a request id the client already used skips the check only while sandyd still
+  holds that environment: the broker asks sandyd (`GetEnvironment`), and if retention has
+  collected it (`NOT_FOUND`) the replay would create a new environment, so both checks run.
+  The sweep can also collect the row between that lookup and the create. When a replay
+  that skipped the checks gets back an id other than the recorded one, the broker runs both
+  checks then; over quota, it deletes the new environment, does not record it, and answers
+  `quota_exceeded`. A replay that returns the recorded id, even a deleted one inside the
+  window, is never checked.
   Creates of one client run one at a time, so the check and the create cannot race, and one
   client cannot hold up another.
 - sandyd's `EnvironmentError` codes map to fixed messages: `NOT_FOUND` 404 `not_found`,
@@ -135,10 +141,15 @@ user's files. Tracked in a follow-up issue.
 - A create whose owner save fails answers `unavailable`. The client's retry replays the create,
   gets the same environment, and records it, so no orphan outlives a retry.
 - A client may hold `max_environments` non-terminal environments (default 4) and may ever
-  create `max_environment_records` (default 64). sandyd keeps a deleted row for replay and
-  counts it against its own cap, so without the second limit one client could create and
-  delete until sandyd's table is full for everyone. The real fix is sandyd pruning deleted
-  rows and paging its list reply (#633).
+  create `max_environment_records` (default 64). sandyd keeps a deleted row for replay, so without
+  the second limit one client could create and delete many rows. sandyd now collects deleted rows
+  after a retention window and counts only rows that are not deleted against its cap (#633,
+  sandyd decision 27), so the record cap is a per-client bound, not the only defence.
+- List and the quota check read sandyd's list page by page (500 rows a page, following
+  `next_page_token`) and filter to the caller's rows. The broker reads at most 10000 rows for one
+  request; a daemon holding more answers `unavailable` and logs it, never a truncated list or
+  quota count. The broker's own list is not paged: a client sees only its own rows, which
+  `max_environment_records` bounds.
 - A create that sandyd answers with an environment another client already owns is refused
   (`TakenOver`), and two clients whose ids share a 16-digit hash prefix are refused at startup.
 - `failure.reason` is neither relayed nor logged by the broker: it is sandyd's text and may name
@@ -163,6 +174,53 @@ to it. Closing it is the correlation work in #621. A create whose owner save fai
 and does not replay, because the broker has no record of the request. The broker does not
 record the request before the create: a refused request that was then corrected would skip the
 quota check, and a client could exceed the quota by one environment per distinct key.
+
+## 7. Attach is a ticket plus a bearer-gated NDJSON stream (#616)
+
+**Decision.**
+
+- `POST /v1/jobs/{id}/attach` (bearer) mints a random 256-bit single-use ticket for the caller's
+  own live job and answers `{"stream_url": "/v1/jobs/{id}/stream/{ticket}", "expires_in_s": 30}`.
+  `stream_url` is a relative path: the client resolves it against the API URL it already uses.
+  A foreign or unknown job is `not_found`; a finished job is `unavailable`. This call does no
+  attach RPC and no join.
+- Tickets live in broker memory only, never on disk, and expire after 30 seconds. A client holds
+  at most 4 tickets plus open streams, and the broker at most 32. Over a cap answers
+  `quota_exceeded` (429). No new public error code.
+- `GET /v1/jobs/{id}/stream/{ticket}` needs the bearer too, so a leaked URL alone gives
+  nothing. An unknown, expired, malformed, other-client or other-job ticket gives one identical
+  `not_found`; a mismatched presenter does not spend the ticket. A valid ticket is removed
+  before anything else, so it works once.
+- The broker then makes the attach RPC with the stored attach token, connects to sandyd's attach
+  socket and sends `Join` with the cap. `Refused`, a timeout (10 s) or any fault gives a fixed
+  `unavailable`; sandyd's text is not relayed.
+- The response is `200`, `application/x-ndjson`, `Cache-Control: no-store`, chunked. Each
+  delivered stdout or stderr chunk is `{"type":"output","data":"<base64>"}` (bytes opaque,
+  streams merged). The last line is `{"type":"exit","reason":...}` with `closed`,
+  `job_terminal:<JOB_STATUS_*>`, `job_terminal_truncated:<JOB_STATUS_*>` or a fixed `fault:` text (`fault:data plane error`, `fault:status unavailable` after 5 failed status polls in a row). The shape follows the CLI's
+  `daemon attach -o json` (#513) minus its `attached` line, which carries the cap.
+- The token and the cap never appear in a response, header, URL or log line (a test scans the
+  captured logs). The broker never logs the stream URL or a ticket.
+- The stream is read-only. The broker never writes to the data-plane connection and never
+  closes its write half: a client EOF makes sandyd's relay leave. Archive frames are dropped.
+- sandyd replays the channel from sequence 0 on every join. A second stream for the same job
+  sees the output again. Accepted.
+- The broker polls job status about once a second, the first poll one period after the join (the
+  replay is already flowing). On a terminal status it keeps forwarding until the data plane has
+  been quiet for 500 ms, then sends `exit` `job_terminal:<STATUS>`. If frames still arrive 30
+  seconds after the job ended, it sends `job_terminal_truncated:<STATUS>`: the output is
+  incomplete and the client can open a new stream to replay it. An unknown job status reads as
+  `JOB_STATUS_FAILED`, as the status route does.
+- Every write to the client waits at most 30 seconds. A client that stops reading loses its
+  stream and frees its slot; the data-plane buffer is two frames. If the HTTP client goes away,
+  the broker drops the data-plane connection at once, even while a status call is outstanding,
+  and sends nothing. The job is untouched.
+- The stream's producer task has its own cap: the handler slot is free once the response head
+  is out, so the ticket and stream caps above bound the producers.
+
+**Side effect.** An open broker stream is an attach to sandyd. On a remote host that keeps the
+job attached and lifts the unlimited-while-attached policy (#340, `sandyd.md` decision 17) for as
+long as the stream is open, up to the client's four. Closing the stream restores it.
 
 ## Consequences
 

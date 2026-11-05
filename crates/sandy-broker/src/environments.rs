@@ -185,9 +185,8 @@ async fn call(state: &State, op: control_request::Op) -> Result<control_response
     }
 }
 
-/// sandyd refuses a list that matches too many rows with `INVALID_ARGUMENT`. The
-/// caller's own arguments were already checked, so that refusal is the daemon's
-/// limit, not a bad request.
+/// sandyd refuses a list with `INVALID_ARGUMENT` only for an argument the broker built
+/// itself, so that refusal is the daemon's limit, not a bad request.
 fn list_refusal(e: ApiError) -> ApiError {
     if e.status == StatusCode::BAD_REQUEST && e.code == "invalid_request" {
         UNAVAILABLE
@@ -234,14 +233,24 @@ pub(crate) async fn spawn(state: &State, client: &Client, req: Request<Incoming>
     // One create at a time per client, so the quota check and the create cannot race
     // another create of the same client, and one client cannot hold up another.
     let _serial = state.env_create.get(&client.id).ok_or(UNAVAILABLE)?.lock().await;
-    if !state.owners.has_request(&client.id, &body.request_id) {
-        let live = live_owned(state, client).await?;
-        if live >= client.max_environments {
-            return Err(QUOTA);
+    // A replay of a request id skips the quota checks only while sandyd still holds that
+    // environment. After sandyd's retention gc (#633) the same key would create a new one.
+    let recorded = state.owners.environment_for(&client.id, &body.request_id);
+    let replay = match &recorded {
+        None => false,
+        Some(environment_id) => {
+            let op = control_request::Op::GetEnvironment(GetEnvironmentRequest {
+                environment_id: environment_id.clone(),
+            });
+            match one(state, op).await {
+                Ok(_) => true,
+                Err(e) if e.status == StatusCode::NOT_FOUND => false,
+                Err(e) => return Err(e),
+            }
         }
-        if state.owners.environment_records(&client.id) >= client.max_environment_records {
-            return Err(QUOTA_RECORDS);
-        }
+    };
+    if !replay {
+        quota_check(state, client).await?;
     }
     let op = control_request::Op::CreateEnvironment(CreateEnvironmentRequest {
         idempotency_key: namespaced(client, &body.request_id),
@@ -253,6 +262,27 @@ pub(crate) async fn spawn(state: &State, client: &Client, req: Request<Incoming>
         }),
     });
     let created = one(state, op).await?;
+    // The sweep may have collected the replayed row after the lookup above, so the create made
+    // a new environment that was never checked. Check now, and undo it if over quota. The
+    // per-client lock is held, and the new row is not recorded yet, so the counts are this
+    // client's other environments.
+    if replay
+        && recorded.as_deref() != Some(created.environment_id.as_str())
+        && let Err(over) = quota_check(state, client).await
+    {
+        let op = control_request::Op::DeleteEnvironment(DeleteEnvironmentRequest {
+            environment_id: created.environment_id.clone(),
+        });
+        match call(state, op).await {
+            Ok(_) => {
+                tracing::info!(environment_id = %created.environment_id, "deleted an environment created over quota by a replay after gc");
+            }
+            Err(e) => {
+                tracing::error!(code = e.code, environment_id = %created.environment_id, "could not delete an environment created over quota by a replay after gc");
+            }
+        }
+        return Err(over);
+    }
     // A failed save leaves the environment unowned for now. The client's retry
     // replays this create, gets the same environment back, and records it.
     if let Err(e) = state
@@ -265,17 +295,75 @@ pub(crate) async fn spawn(state: &State, client: &Client, req: Request<Incoming>
     Ok((StatusCode::ACCEPTED, summary(&created)))
 }
 
+/// Refuses when `client` holds `max_environments` non-terminal environments or has ever
+/// created `max_environment_records`.
+async fn quota_check(state: &State, client: &Client) -> Result<(), ApiError> {
+    if live_owned(state, client).await? >= client.max_environments {
+        return Err(QUOTA);
+    }
+    if state.owners.environment_records(&client.id) >= client.max_environment_records {
+        return Err(QUOTA_RECORDS);
+    }
+    Ok(())
+}
+
+/// The most rows the broker reads from sandyd for one request, across pages. A daemon
+/// holding more makes the request `unavailable` rather than answer from a truncated view.
+const MAX_SCANNED_ROWS: usize = 10_000;
+/// Rows asked per page: sandyd's own page maximum.
+const SCAN_PAGE_SIZE: u32 = 500;
+
+/// Every row of sandyd's list for `state` and `task_ref` that `keep` accepts, read
+/// page by page. More than [`MAX_SCANNED_ROWS`] rows, or a page that makes no
+/// progress, is `unavailable`.
+async fn list_all(
+    state: &State,
+    wanted: EnvironmentState,
+    task_ref: &str,
+    keep: impl Fn(&EnvironmentResponse) -> bool,
+) -> Result<Vec<EnvironmentResponse>, ApiError> {
+    let mut kept = Vec::new();
+    let mut scanned = 0usize;
+    let mut page_token = String::new();
+    loop {
+        let op = control_request::Op::ListEnvironments(ListEnvironmentsRequest {
+            state: wanted.into(),
+            task_ref: task_ref.to_owned(),
+            page_size: SCAN_PAGE_SIZE,
+            page_token,
+        });
+        let control_response::Result::Environments(page) = call(state, op).await.map_err(list_refusal)? else {
+            return Err(UNAVAILABLE);
+        };
+        scanned += page.environments.len();
+        if scanned > MAX_SCANNED_ROWS {
+            tracing::warn!(
+                scanned,
+                max = MAX_SCANNED_ROWS,
+                "sandyd holds more environments than the broker will scan"
+            );
+            return Err(UNAVAILABLE);
+        }
+        let empty = page.environments.is_empty();
+        kept.extend(page.environments.into_iter().filter(&keep));
+        if page.next_page_token.is_empty() {
+            return Ok(kept);
+        }
+        if empty {
+            tracing::error!("sandyd returned an empty environment page with a next token");
+            return Err(UNAVAILABLE);
+        }
+        page_token = page.next_page_token;
+    }
+}
+
 /// How many non-terminal environments `client` holds.
 async fn live_owned(state: &State, client: &Client) -> Result<usize, ApiError> {
-    let op = control_request::Op::ListEnvironments(ListEnvironmentsRequest::default());
-    let control_response::Result::Environments(all) = call(state, op).await.map_err(list_refusal)? else {
-        return Err(UNAVAILABLE);
-    };
-    Ok(all
-        .environments
-        .iter()
-        .filter(|e| is_live(e.state) && state.owners.owns_environment(&e.environment_id, &client.id))
-        .count())
+    let owned = list_all(state, EnvironmentState::Unspecified, "", |e| {
+        is_live(e.state) && state.owners.owns_environment(&e.environment_id, &client.id)
+    })
+    .await?;
+    Ok(owned.len())
 }
 
 /// A query parameter, percent-decoded. `None` when absent.
@@ -327,19 +415,11 @@ pub(crate) async fn list(state: &State, client: &Client, query: Option<&str>) ->
     if task_ref.len() > 256 || task_ref.chars().any(char::is_control) {
         return Err(INVALID);
     }
-    let op = control_request::Op::ListEnvironments(ListEnvironmentsRequest {
-        state: wanted.into(),
-        task_ref,
-    });
-    let control_response::Result::Environments(all) = call(state, op).await.map_err(list_refusal)? else {
-        return Err(UNAVAILABLE);
-    };
-    let environments: Vec<Value> = all
-        .environments
-        .iter()
-        .filter(|e| state.owners.owns_environment(&e.environment_id, &client.id))
-        .map(summary)
-        .collect();
+    let owned = list_all(state, wanted, &task_ref, |e| {
+        state.owners.owns_environment(&e.environment_id, &client.id)
+    })
+    .await?;
+    let environments: Vec<Value> = owned.iter().map(summary).collect();
     Ok((StatusCode::OK, json!({"environments": environments})))
 }
 

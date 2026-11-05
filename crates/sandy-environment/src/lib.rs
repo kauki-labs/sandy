@@ -5,7 +5,13 @@
 //! service runs as the daemon's user with the daemon's filesystem. It exists so
 //! the whole chain (T3, MCP, broker, `sandyd`, driver, backend) can run before
 //! the VM backend lands, and must stay off by default.
+//!
+//! [`VmEnvironmentBackend`] is the isolated one: a held agent-mode `VmBackend::run` per environment.
 
+mod lifecycle;
 mod process;
+mod vm;
 
+pub use lifecycle::{GuardedBackend, RunGuard, RunGuards, guarded};
 pub use process::{ProcessConfig, ProcessConfigError, ProcessEnvironmentBackend};
+pub use vm::{BackendFactory, HeldBackend, ServiceProbe, VmEnvironmentBackend, VmEnvironmentConfig};

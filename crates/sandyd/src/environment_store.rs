@@ -128,6 +128,10 @@ pub struct EnvironmentRecord {
     /// from here, not from the last write, so a row found late is not failed
     /// before its box has had time to boot.
     pub launched_at: Option<i64>,
+    /// Unix seconds of the last owner-visible use (see [`EnvironmentStore::touch`]),
+    /// cleared by every state change. The idle-stop lease runs from here, or from
+    /// `updated_at` when it is unset.
+    pub last_activity_at: Option<i64>,
     /// Unix seconds at creation.
     pub created_at: i64,
     /// Unix seconds at the last state change.
@@ -149,12 +153,65 @@ pub enum CreateOutcome {
     /// `new_id` already names another request's environment, so nothing was
     /// written. The caller mints ids, so this is a minting fault, not a retry.
     IdTaken,
-    /// The table already holds `max` rows (see
+    /// The table already holds `max` rows that are not `Deleted` (see
     /// [`EnvironmentStore::with_max_rows`]); the insert was refused.
     CapExceeded {
         /// The configured cap that would have been exceeded.
         max: usize,
     },
+}
+
+/// How long a `Deleted` row is kept for idempotent replay, and how many are kept
+/// at most (#633).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionPolicy {
+    /// A `Deleted` row older than this many seconds is removed by gc.
+    pub window_secs: u64,
+    /// At most this many `Deleted` rows are kept; the oldest go first.
+    pub max_deleted: usize,
+}
+
+impl Default for RetentionPolicy {
+    fn default() -> Self {
+        Self {
+            window_secs: 24 * 60 * 60,
+            max_deleted: 10_000,
+        }
+    }
+}
+
+impl RetentionPolicy {
+    /// Read `SANDY_ENV_RETENTION_SECS` and `SANDY_MAX_DELETED_ENVIRONMENTS` through
+    /// `get` (`Ok(None)` is unset and keeps the default).
+    ///
+    /// # Errors
+    /// A set value that is not an integer of at least 1, or an error from `get` (the caller
+    /// reports a value it cannot read as text).
+    pub fn from_env(get: impl Fn(&str) -> Result<Option<String>, String>) -> Result<Self, String> {
+        let default = Self::default();
+        let read = |name: &str| -> Result<Option<u64>, String> {
+            get(name)?
+                .map(|v| match v.trim().parse::<u64>() {
+                    Ok(n) if n >= 1 => Ok(n),
+                    _ => Err(format!("{name} must be an integer of at least 1, got {v:?}")),
+                })
+                .transpose()
+        };
+        Ok(Self {
+            window_secs: read("SANDY_ENV_RETENTION_SECS")?.unwrap_or(default.window_secs),
+            max_deleted: read("SANDY_MAX_DELETED_ENVIRONMENTS")?
+                .map_or(default.max_deleted, |n| usize::try_from(n).unwrap_or(usize::MAX)),
+        })
+    }
+}
+
+/// What one [`EnvironmentStore::gc_deleted`] pass removed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GcReport {
+    /// `Deleted` rows removed for being older than the retention window.
+    pub expired: usize,
+    /// `Deleted` rows removed, oldest first, to stay within the retained cap.
+    pub evicted: usize,
 }
 
 /// What a lifecycle transition did to an environment row.
@@ -190,12 +247,13 @@ struct RawRow {
     failure_reason: Option<String>,
     endpoint: Option<String>,
     launched_at: Option<i64>,
+    last_activity_at: Option<i64>,
     created_at: i64,
     updated_at: i64,
 }
 
 const COLUMNS: &str = "environment_id, request_id, state, spec, spec_encoding, failure_step, failure_reason, \
-                       created_at, updated_at, endpoint, launched_at";
+                       created_at, updated_at, endpoint, launched_at, last_activity_at";
 
 impl RawRow {
     fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
@@ -211,6 +269,7 @@ impl RawRow {
             updated_at: row.get(8)?,
             endpoint: row.get(9)?,
             launched_at: row.get(10)?,
+            last_activity_at: row.get(11)?,
         })
     }
 
@@ -232,13 +291,15 @@ impl RawRow {
             failure,
             endpoint: self.endpoint,
             launched_at: self.launched_at,
+            last_activity_at: self.last_activity_at,
             created_at: self.created_at,
             updated_at: self.updated_at,
         })
     }
 }
 
-fn now_unix() -> i64 {
+/// The current time in unix seconds, the clock the store stamps rows with.
+pub fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -288,12 +349,17 @@ impl EnvironmentStore {
                 created_at      INTEGER NOT NULL,
                 updated_at      INTEGER NOT NULL,
                 endpoint        TEXT,
-                launched_at     INTEGER
+                launched_at     INTEGER,
+                last_activity_at INTEGER
             )",
             (),
         )?;
         // A table created before these columns existed lacks them.
-        for (column, ddl) in [("endpoint", "TEXT"), ("launched_at", "INTEGER")] {
+        for (column, ddl) in [
+            ("endpoint", "TEXT"),
+            ("launched_at", "INTEGER"),
+            ("last_activity_at", "INTEGER"),
+        ] {
             let present: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM pragma_table_info('environments') WHERE name = ?1)",
                 [column],
@@ -314,14 +380,41 @@ impl EnvironmentStore {
         })
     }
 
-    /// Cap the table at `max_rows` rows in total (every state counts, since
-    /// deleted rows are kept for replay): once reached, `create` refuses a new
+    /// Cap the table at `max_rows` rows that are not `Deleted` (a `Failed` row
+    /// still counts until it is deleted; deleted rows are bounded by
+    /// [`RetentionPolicy`] instead): once reached, `create` refuses a new
     /// environment. A retry of a stored `request_id` needs no new row and is
     /// never refused.
     #[must_use]
     pub fn with_max_rows(mut self, max_rows: Option<usize>) -> Self {
         self.max_rows = max_rows;
         self
+    }
+
+    /// Remove `Deleted` rows per `policy`, judging age against `now` (unix
+    /// seconds, injected so tests need no sleep). Rows in any other state are
+    /// never touched.
+    ///
+    /// # Errors
+    /// [`EnvironmentStoreError::Sqlite`] if the write faults.
+    pub fn gc_deleted(&self, now: i64, policy: &RetentionPolicy) -> Result<GcReport, EnvironmentStoreError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Age is judged by `updated_at`: a `Deleted` row is written once, by the delete.
+        let cutoff = now.saturating_sub(i64::try_from(policy.window_secs).unwrap_or(i64::MAX));
+        let expired = tx.execute(
+            "DELETE FROM environments WHERE state = 'deleted' AND updated_at < ?1",
+            [cutoff],
+        )?;
+        let keep = i64::try_from(policy.max_deleted).unwrap_or(i64::MAX);
+        let evicted = tx.execute(
+            "DELETE FROM environments WHERE environment_id IN (
+                 SELECT environment_id FROM environments WHERE state = 'deleted'
+                  ORDER BY updated_at DESC, rowid DESC LIMIT -1 OFFSET ?1)",
+            [keep],
+        )?;
+        tx.commit()?;
+        Ok(GcReport { expired, evicted })
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -362,7 +455,11 @@ impl EnvironmentStore {
             });
         }
         if let Some(max) = self.max_rows {
-            let count: i64 = tx.query_row("SELECT COUNT(*) FROM environments", (), |row| row.get(0))?;
+            let count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM environments WHERE state != 'deleted'",
+                (),
+                |row| row.get(0),
+            )?;
             if count as usize >= max {
                 return Ok(CreateOutcome::CapExceeded { max });
             }
@@ -453,6 +550,45 @@ impl EnvironmentStore {
             .query_map((), RawRow::read)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows.into_iter().map(RawRow::into_record).collect())
+    }
+
+    /// One page of environments in `environment_id` order, the ids strictly after
+    /// `after` (`None` starts at the first), at most `limit` rows. `Some(state)`
+    /// selects that state; `None` selects every state but `Deleted`.
+    ///
+    /// The id is the order key because it is unique and never changes, so a
+    /// cursor stays valid when its own row is deleted or collected.
+    ///
+    /// # Errors
+    /// As [`EnvironmentStore::create`].
+    pub fn list_page(
+        &self,
+        state: Option<EnvironmentState>,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<EnvironmentRecord>, EnvironmentStoreError> {
+        let conn = self.lock();
+        let filter = if state.is_some() {
+            "state = ?1"
+        } else {
+            "state != 'deleted'"
+        };
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM environments WHERE {filter} AND environment_id > ?2
+              ORDER BY environment_id LIMIT ?3"
+        ))?;
+        // `?1` is unused without a state filter: SQLite still counts it, so all three bind.
+        let rows = stmt
+            .query_map(
+                (
+                    state.map_or("", EnvironmentState::as_str),
+                    after.unwrap_or(""),
+                    i64::try_from(limit).unwrap_or(i64::MAX),
+                ),
+                RawRow::read,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter().map(RawRow::into_record).collect()
     }
 
     /// Every environment in `state`, oldest first.
@@ -556,6 +692,41 @@ impl EnvironmentStore {
             "UPDATE environments SET launched_at = ?2
               WHERE environment_id = ?1 AND state = 'provisioning' AND launched_at IS NULL",
             (environment_id, now),
+        )?;
+        Ok(rows == 1)
+    }
+
+    /// Renew `environment_id`'s idle-stop lease at unix time `now`. Only a `Ready`
+    /// environment is renewed: any state change clears the lease, so a stopped or
+    /// resuming environment never starts idle. Returns whether it wrote.
+    ///
+    /// # Errors
+    /// As [`EnvironmentStore::create`].
+    pub fn touch(&self, environment_id: &str, now: i64) -> Result<bool, EnvironmentStoreError> {
+        let conn = self.lock();
+        let rows = conn.execute(
+            "UPDATE environments SET last_activity_at = ?2
+              WHERE environment_id = ?1 AND state = 'ready'",
+            (environment_id, now),
+        )?;
+        Ok(rows == 1)
+    }
+
+    /// `Ready` to `Stopped` only if the lease has run out at unix time `now`: at
+    /// least `limit_secs` since the last renewal. The check and the write are one
+    /// statement, so a renewal that lands after the caller read the row wins and
+    /// nothing is stopped. Returns whether it stopped the environment.
+    ///
+    /// # Errors
+    /// As [`EnvironmentStore::create`].
+    pub fn stop_if_idle(&self, environment_id: &str, now: i64, limit_secs: i64) -> Result<bool, EnvironmentStoreError> {
+        let conn = self.lock();
+        let rows = conn.execute(
+            "UPDATE environments
+                SET state = 'stopped', updated_at = ?4, last_activity_at = NULL
+              WHERE environment_id = ?1 AND state = 'ready'
+                AND ?2 - COALESCE(last_activity_at, updated_at) >= ?3",
+            (environment_id, now, limit_secs, now_unix()),
         )?;
         Ok(rows == 1)
     }
@@ -665,7 +836,8 @@ impl EnvironmentStore {
                 SET state = ?2, failure_step = COALESCE(?3, failure_step),
                     failure_reason = COALESCE(?4, failure_reason), updated_at = ?5,
                     endpoint = COALESCE(?6, endpoint),
-                    launched_at = CASE WHEN ?2 = 'provisioning' THEN NULL ELSE launched_at END
+                    launched_at = CASE WHEN ?2 = 'provisioning' THEN NULL ELSE launched_at END,
+                    last_activity_at = NULL
               WHERE environment_id = ?1",
             (environment_id, to.as_str(), step, reason, now_unix(), endpoint),
         )?;
@@ -972,6 +1144,49 @@ mod tests {
     }
 
     #[test]
+    fn the_idle_lease_is_renewed_only_while_ready_and_cleared_by_every_state_change() -> Result<()> {
+        let s = store()?;
+        created(&s)?;
+        assert!(!s.touch("env-1", 100)?, "a Provisioning environment has no lease");
+        s.mark_ready("env-1")?;
+        assert!(s.touch("env-1", 100)?);
+        assert_eq!(s.get("env-1")?.context("env-1")?.last_activity_at, Some(100));
+        assert!(!s.touch("env-nope", 1)?);
+        s.stop("env-1")?;
+        assert_eq!(s.get("env-1")?.context("env-1")?.last_activity_at, None);
+        assert!(!s.touch("env-1", 200)?, "a Stopped environment is not renewed");
+        s.resume("env-1")?;
+        assert_eq!(s.get("env-1")?.context("env-1")?.last_activity_at, None);
+        Ok(())
+    }
+
+    #[test]
+    fn an_idle_stop_loses_to_a_renewal_and_holds_at_the_exact_limit() -> Result<()> {
+        let s = store()?;
+        created(&s)?;
+        s.mark_ready("env-1")?;
+        s.touch("env-1", 1_000)?;
+        assert!(
+            !s.stop_if_idle("env-1", 1_299, 300)?,
+            "299 s idle is inside a 300 s lease"
+        );
+        // A stale read said the lease was out; a renewal landed since.
+        s.touch("env-1", 1_400)?;
+        assert!(
+            !s.stop_if_idle("env-1", 1_450, 300)?,
+            "a renewal after the read must win"
+        );
+        assert_eq!(s.get("env-1")?.context("env-1")?.state, EnvironmentState::Ready);
+        assert!(s.stop_if_idle("env-1", 1_700, 300)?, "exactly the limit stops");
+        assert_eq!(s.get("env-1")?.context("env-1")?.state, EnvironmentState::Stopped);
+        assert!(
+            !s.stop_if_idle("env-1", 9_999, 300)?,
+            "a Stopped row is not stopped again"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn the_launch_time_is_set_once_per_attempt_and_cleared_by_a_resume() -> Result<()> {
         let s = store()?;
         created(&s)?;
@@ -1216,6 +1431,155 @@ mod tests {
         ));
         assert!(matches!(s.list(), Err(EnvironmentStoreError::CorruptState { .. })));
         assert_eq!(state_of(&s, "env-2")?, EnvironmentState::Provisioning);
+        Ok(())
+    }
+
+    /// Creates and deletes `request_id`'s environment, then back-dates the delete to `deleted_at`.
+    fn deleted_at(s: &EnvironmentStore, request_id: &str, deleted_at: i64) -> Result<String> {
+        let id = format!("env-{request_id}");
+        match s.create(request_id, &id, SPEC, ENC)? {
+            CreateOutcome::Created(_) => {}
+            other => bail!("expected Created, got {other:?}"),
+        }
+        assert_eq!(s.delete(&id)?, EnvTransition::Applied);
+        s.lock().execute(
+            "UPDATE environments SET updated_at = ?2 WHERE environment_id = ?1",
+            (&id, deleted_at),
+        )?;
+        Ok(id)
+    }
+
+    #[test]
+    fn deleted_rows_do_not_count_against_the_row_cap() -> Result<()> {
+        let s = store()?.with_max_rows(Some(2));
+        for n in 0..5 {
+            let id = format!("env-{n}");
+            match s.create(&format!("r{n}"), &id, SPEC, ENC)? {
+                CreateOutcome::Created(_) => {}
+                other => bail!("create {n} should fit: {other:?}"),
+            }
+            assert_eq!(s.delete(&id)?, EnvTransition::Applied);
+        }
+        // Two live rows still fill the cap, and a replay is never refused.
+        s.create("live-1", "env-l1", SPEC, ENC)?;
+        s.create("live-2", "env-l2", SPEC, ENC)?;
+        assert_eq!(
+            s.create("live-3", "env-l3", SPEC, ENC)?,
+            CreateOutcome::CapExceeded { max: 2 }
+        );
+        assert!(matches!(
+            s.create("r0", "env-x", SPEC, ENC)?,
+            CreateOutcome::Existing(_)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn gc_removes_only_deleted_rows_older_than_the_window() -> Result<()> {
+        let s = store()?;
+        let policy = RetentionPolicy {
+            window_secs: 100,
+            max_deleted: 1000,
+        };
+        let old = deleted_at(&s, "old", 1_000)?;
+        let edge = deleted_at(&s, "edge", 1_100)?;
+        let fresh = deleted_at(&s, "fresh", 1_101)?;
+        s.create("live", "env-live", SPEC, ENC)?;
+        s.lock().execute(
+            "UPDATE environments SET updated_at = 0 WHERE environment_id = 'env-live'",
+            (),
+        )?;
+
+        let report = s.gc_deleted(1_200, &policy)?;
+        assert_eq!(report, GcReport { expired: 1, evicted: 0 });
+        assert_eq!(s.get(&old)?, None, "older than the window is removed");
+        assert!(s.get(&edge)?.is_some(), "exactly at the window is kept");
+        assert!(s.get(&fresh)?.is_some());
+        assert!(
+            s.get("env-live")?.is_some(),
+            "a live row is never collected, however old"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gc_evicts_the_oldest_deleted_rows_past_the_retained_cap() -> Result<()> {
+        let s = store()?;
+        let policy = RetentionPolicy {
+            window_secs: 1_000_000,
+            max_deleted: 2,
+        };
+        let ids = (0..4)
+            .map(|n| deleted_at(&s, &format!("r{n}"), 1_000 + n))
+            .collect::<Result<Vec<_>>>()?;
+        let report = s.gc_deleted(1_010, &policy)?;
+        assert_eq!(report, GcReport { expired: 0, evicted: 2 });
+        assert_eq!((s.get(&ids[0])?, s.get(&ids[1])?), (None, None));
+        assert!(s.get(&ids[2])?.is_some() && s.get(&ids[3])?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn an_idempotency_key_is_reusable_only_after_its_deleted_row_is_collected() -> Result<()> {
+        let s = store()?;
+        let policy = RetentionPolicy {
+            window_secs: 100,
+            max_deleted: 1000,
+        };
+        let first = deleted_at(&s, "k", 1_000)?;
+        match s.create("k", "env-new", SPEC, ENC)? {
+            CreateOutcome::Existing(rec) => assert_eq!(rec.environment_id, first),
+            other => bail!("within the window a replay finds the deleted row: {other:?}"),
+        }
+        s.gc_deleted(1_050, &policy)?;
+        assert!(matches!(
+            s.create("k", "env-new", SPEC, ENC)?,
+            CreateOutcome::Existing(_)
+        ));
+        s.gc_deleted(1_101, &policy)?;
+        match s.create("k", "env-new", SPEC, ENC)? {
+            CreateOutcome::Created(rec) => assert_eq!(rec.environment_id, "env-new"),
+            other => bail!("after gc the key makes a new environment: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_retention_policy_reads_its_two_settings_and_refuses_bad_values() -> Result<()> {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| Ok(pairs.iter().find(|(k, _)| *k == name).map(|(_, v)| (*v).to_owned()))
+        };
+        assert_eq!(
+            RetentionPolicy::from_env(env(&[])).map_err(anyhow::Error::msg)?,
+            RetentionPolicy::default()
+        );
+        assert_eq!(RetentionPolicy::default().window_secs, 86_400);
+        assert_eq!(RetentionPolicy::default().max_deleted, 10_000);
+        let set = RetentionPolicy::from_env(env(&[
+            ("SANDY_ENV_RETENTION_SECS", "60"),
+            ("SANDY_MAX_DELETED_ENVIRONMENTS", "7"),
+        ]))
+        .map_err(anyhow::Error::msg)?;
+        assert_eq!(
+            set,
+            RetentionPolicy {
+                window_secs: 60,
+                max_deleted: 7
+            }
+        );
+        let unreadable = |_: &str| Err("SANDY_ENV_RETENTION_SECS is not valid UTF-8".to_owned());
+        assert!(
+            RetentionPolicy::from_env(unreadable).is_err(),
+            "an unreadable value is refused, not defaulted"
+        );
+        for bad in [
+            &[("SANDY_ENV_RETENTION_SECS", "0")][..],
+            &[("SANDY_ENV_RETENTION_SECS", "soon")],
+            &[("SANDY_MAX_DELETED_ENVIRONMENTS", "0")],
+            &[("SANDY_MAX_DELETED_ENVIRONMENTS", "-1")],
+        ] {
+            assert!(RetentionPolicy::from_env(env(bad)).is_err(), "{bad:?}");
+        }
         Ok(())
     }
 }

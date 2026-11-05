@@ -178,6 +178,7 @@ mod egress_relay;
 mod link_source;
 mod peer;
 mod port_relay;
+mod service;
 mod tmux_pty;
 
 use link_source::LinkSource;
@@ -289,8 +290,27 @@ where
     // the live tmux session's own `history-limit` and the archived
     // transcript's cap below.
     let history_lines = configured_history_lines();
+    // #589: a declared service reports readiness from its health probe, never from console text. Parsed
+    // before the job starts so a mangled spec refuses the run instead of skipping the probe.
+    let service = service::from_env()?;
+    // A service runs as its declared non-root user (#589); the account is checked before anything starts.
+    let service_user = match &service {
+        Some(spec) => service::service_account(&spec.user)?,
+        None => None,
+    };
+    let job = match &service_user {
+        Some(user) => service::as_user(user, job),
+        None => job,
+    };
     let tmux_job =
         TmuxJob::start(&job, peer_env, history_lines).map_err(|e| format!("starting the tmux job session: {e}"))?;
+    // #590: a service with a host-reachable `port` gets the guest half of the host bridge, a child that stops
+    // with the agent. Held until `serve` returns.
+    let _port_relay = match service.as_ref().and_then(|spec| spec.port) {
+        Some(port) => Some(service::spawn_port_relay(port).await?),
+        None => None,
+    };
+    let readiness = service.map(|spec| service::spawn_readiness(Arc::clone(&agent), spec.probe, service_user));
     let (pty_read, pty_write, resizer, mut attach_child) = tmux_job
         .open_attach()
         .map_err(|e| format!("opening the attach pty: {e}"))?;
@@ -364,6 +384,11 @@ where
         Ok(Ok(())) => {}
         Ok(Err(e)) => return Err(format!("bridging the job's stdio: {e}")),
         Err(e) => return Err(format!("the stdio bridge task panicked: {e}")),
+    }
+    // The exit is the link's last frame: end the probe (finishing a verdict write already begun, never
+    // tearing it) before anything else is written.
+    if let Some(readiness) = readiness {
+        readiness.finish().await?;
     }
 
     // The live attach bridge above only reliably carries output for a job

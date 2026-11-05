@@ -13,7 +13,7 @@ use sandyd::{
     dispatch::JobRegistry,
     environment_backend,
     environment_driver::EnvironmentDriver,
-    environment_store::EnvironmentStore,
+    environment_store::{EnvironmentStore, RetentionPolicy},
     gate_spawn,
     host_registry::{ExecutorAllowlist, HostRegistry},
     mesh_config::{parse_mesh_allowlist, parse_mesh_listen_addr},
@@ -162,6 +162,19 @@ async fn main() {
         }
     };
 
+    // `var(..).ok()` would read a non-UTF-8 value as unset and silently take the default.
+    let retention_setting = |name: &str| match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} is not valid UTF-8")),
+    };
+    let retention = match RetentionPolicy::from_env(retention_setting) {
+        Ok(retention) => retention,
+        Err(e) => {
+            tracing::error!(error = %e, "invalid environment retention setting");
+            std::process::exit(1);
+        }
+    };
     let (listener, _lock) = match bind_unix_listener(&socket_path) {
         Ok(bound) => bound,
         Err(e) => {
@@ -359,6 +372,16 @@ async fn main() {
     // The launch driver runs only when a backend is configured (#587). It starts after every lock and
     // bind above: the backend sweeps stale environment directories, which a second daemon that lost
     // a lock must never do.
+    // Started only after every lock and bind above, so a second daemon on the same store, which
+    // fails to bind, never sweeps with its own settings. Independent of the launch driver: a
+    // deleted row is collected even with no backend configured.
+    let _environment_retention = tokio::spawn(sandyd::environment::run_retention(
+        Arc::clone(&environments),
+        retention,
+        sandyd::environment::RETENTION_INTERVAL,
+        sandyd::environment_store::now_unix,
+    ));
+
     let _environment_driver = start_environment_driver(&environments);
 
     let mut connections = tokio::task::JoinSet::new();
