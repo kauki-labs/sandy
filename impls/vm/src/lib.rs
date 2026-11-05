@@ -25,6 +25,8 @@ pub use console::{
     Markers, PipeTransport, Protocol, ProtocolStep, PtyTransport, ReadEvent, TimeoutPolicy, Transport, parse_exit,
     run_console,
 };
+#[cfg(target_os = "linux")]
+pub use orphans::Procfs;
 pub use orphans::{BoxRecord, ProcId, ProcessTable, RECORD_FILE, RecordWriter, SweepReport, sweep_orphans};
 pub use qemu::{QemuBackend, StagedArgs as QemuStagedArgs, qemu_args, qemu_bin_override};
 pub use share::{VirtioFsTransport, VirtiofsdTransport, virtiofsd_args};

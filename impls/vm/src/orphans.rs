@@ -71,8 +71,15 @@ impl RecordWriter {
     ///
     /// When `owner_pid` cannot be identified through `table`, or the record cannot be written.
     pub fn create(dir: &Path, table: &dyn ProcessTable, owner_pid: u32) -> io::Result<Self> {
-        let _ = (dir, table, owner_pid);
-        Err(io::Error::other("not implemented"))
+        let writer = Self {
+            path: dir.join(RECORD_FILE),
+            record: BoxRecord {
+                owner: identify(table, owner_pid)?,
+                procs: Vec::new(),
+            },
+        };
+        write_record(&writer.path, &writer.record)?;
+        Ok(writer)
     }
 
     /// Add a started process to the record and rewrite it.
@@ -82,9 +89,98 @@ impl RecordWriter {
     /// When `pid` cannot be identified through `table`, or the record cannot be written. The file keeps its
     /// previous content then.
     pub fn add(&mut self, table: &dyn ProcessTable, pid: u32) -> io::Result<()> {
-        let _ = (table, pid);
-        Err(io::Error::other("not implemented"))
+        let mut next = self.record.clone();
+        next.procs.push(identify(table, pid)?);
+        write_record(&self.path, &next)?;
+        self.record = next;
+        Ok(())
     }
+}
+
+/// Name `pid` as a record does, or fail when the table cannot: a process that cannot be told apart from a later one
+/// with its pid must not be recorded, since the sweep could never kill it safely.
+fn identify(table: &dyn ProcessTable, pid: u32) -> io::Result<ProcId> {
+    let unknown = || {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "the process is not visible in the process table",
+        )
+    };
+    Ok(ProcId {
+        pid,
+        start: table.start_time(pid).ok_or_else(unknown)?,
+        exe: table.exe(pid).ok_or_else(unknown)?,
+    })
+}
+
+/// Replace the record file in one step: write a private temp file beside it, then rename over it. A failure leaves
+/// the old file as it was.
+fn write_record(path: &Path, record: &BoxRecord) -> io::Result<()> {
+    use std::{io::Write as _, os::unix::fs::OpenOptionsExt as _};
+
+    let temp = path.with_extension("json.tmp");
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&temp)?;
+        file.write_all(&serde_json::to_vec(record).map_err(io::Error::other)?)?;
+        file.sync_all()?;
+        fs::rename(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+/// Whether `process` is still the process the record named: same pid, same start time, same executable.
+fn is_alive(table: &dyn ProcessTable, process: &ProcId) -> bool {
+    table.start_time(process.pid) == Some(process.start) && table.exe(process.pid).as_deref() == Some(&process.exe)
+}
+
+/// Read a box's record. `Ok(None)` when the directory has none; `Err` when there is one that is not ours to trust: a
+/// symlink, not a plain file, too large, or not the expected shape.
+fn read_record(path: &Path) -> Result<Option<BoxRecord>, ()> {
+    use std::io::Read as _;
+
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    if !meta.file_type().is_file() || meta.len() > MAX_RECORD_BYTES {
+        return Err(());
+    }
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .and_then(|file| file.take(MAX_RECORD_BYTES + 1).read_to_end(&mut bytes))
+        .map_err(|_| ())?;
+    serde_json::from_slice(&bytes).map(Some).map_err(|_| ())
+}
+
+/// Remove a run directory, and the `-inputs` and `-outputs` directories beside it. A symlink is left alone.
+fn wipe_box(base: &Path, name: &str) -> bool {
+    let mut removed = true;
+    for (dir, is_box) in [
+        (name.to_owned(), true),
+        (format!("{name}-inputs"), false),
+        (format!("{name}-outputs"), false),
+    ] {
+        let path = base.join(dir);
+        if !fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_dir()) {
+            continue;
+        }
+        if let Err(err) = fs::remove_dir_all(&path)
+            && err.kind() != io::ErrorKind::NotFound
+        {
+            tracing::warn!(dir = %path.display(), %err, "could not remove an orphaned box directory");
+            removed &= !is_box;
+        }
+    }
+    removed
 }
 
 /// What one sweep did. Counts only: nothing here repeats text from a record.
@@ -105,8 +201,71 @@ pub struct SweepReport {
 /// Only a directory that holds a [`RECORD_FILE`] is considered. A record that cannot be read leaves its directory
 /// as it is. The sweep never follows a symlink.
 pub fn sweep_orphans(base: &Path, table: &dyn ProcessTable) -> SweepReport {
-    let _ = (base, table);
-    SweepReport::default()
+    let mut report = SweepReport::default();
+    let Ok(entries) = fs::read_dir(base) else {
+        return report;
+    };
+    for entry in entries.flatten() {
+        // `DirEntry::file_type` does not follow a symlink, so a link to a directory is skipped here.
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let record = match read_record(&entry.path().join(RECORD_FILE)) {
+            Ok(Some(record)) => record,
+            Ok(None) => continue,
+            Err(()) => {
+                tracing::warn!(dir = %entry.path().display(), "a box record could not be read; leaving the directory");
+                report.unreadable += 1;
+                continue;
+            }
+        };
+        if is_alive(table, &record.owner) {
+            report.live_owner += 1;
+            continue;
+        }
+        for process in &record.procs {
+            // Pid 0 and 1 are never ours, whatever a record says.
+            if process.pid > 1 && is_alive(table, process) {
+                table.kill(process.pid);
+                report.killed += 1;
+            }
+        }
+        if wipe_box(base, &name) {
+            report.wiped += 1;
+        }
+    }
+    report
+}
+
+/// The process table of a Linux host, read from `/proc`.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Procfs;
+
+#[cfg(target_os = "linux")]
+impl ProcessTable for Procfs {
+    fn start_time(&self, pid: u32) -> Option<u64> {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // Field 2 (the command name) may hold spaces and parentheses; field 3 starts after the last `)`. Field 22,
+        // the start time in clock ticks since boot, is the 20th after it.
+        let after = &stat[stat.rfind(')')? + 1..];
+        after.split_whitespace().nth(19)?.parse().ok()
+    }
+
+    fn exe(&self, pid: u32) -> Option<String> {
+        fs::read_link(format!("/proc/{pid}/exe"))
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned())
+    }
+
+    fn kill(&self, pid: u32) {
+        if let Some(pid) = i32::try_from(pid).ok().and_then(rustix::process::Pid::from_raw) {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+        }
+    }
 }
 
 #[cfg(test)]
