@@ -37,6 +37,7 @@ mod discovery;
 mod egress;
 mod error;
 mod gc;
+mod identity_profile;
 mod journal;
 mod metrics;
 mod nix;
@@ -73,6 +74,7 @@ pub use egress::{
 };
 pub use error::CoreError;
 pub use gc::{StagedImage, plan_eviction};
+pub use identity_profile::{IdentityProfile, IdentityProfileError, IdentityProfiles};
 pub use journal::{JobLock, Journal, detect_fs_type, ensure_local_posix_fs, is_networked_fs, new_job_id};
 pub use metrics::{RunMetrics, RunPhase};
 pub use nix::{Hypervisor, Share, StoreBacking, Topology, parse_topology, topology};
