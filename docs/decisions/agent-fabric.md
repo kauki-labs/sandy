@@ -501,7 +501,9 @@ environment refuses connections.
   never reaches a foreign VM. Residual: `on_link` can still take a foreign agent's link in that collision window (#238,
   not changed here).
 - **Not covered here.** The `EnvironmentBackend` that starts and stops a bridge per environment (#587 slice C), the
-  vfkit `connect` device in `vfkit_args`, and the live round trip through a real guest.
+  live round trip through a real guest. The vfkit `connect` device is `VfkitBackend::with_service_socket`: the caller
+  picks the socket path, and the backend checks its length and clears a stale file (vfkit is killed at teardown and
+  cannot unlink it).
 
 ## 11. Channel roles are thin wrappers; `EscalationSink` is a new seam
 
