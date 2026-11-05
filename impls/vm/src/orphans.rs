@@ -512,6 +512,15 @@ fn is_srch(err: &io::Error) -> bool {
     err.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error())
 }
 
+/// What an answer of "no such process" is worth. `ps` prints nothing for a pid that does not exist, but it also prints
+/// nothing when it is denied access to process information (a sandbox, a restricted launch context). So a "gone" is
+/// believed only if `control`, the same question asked about this very process, saw it: a `ps` that cannot see the
+/// process asking cannot say that another one is gone.
+#[cfg(any(target_os = "macos", test))]
+fn gone_or_blind(parsed: ProcState, _control: ProcState) -> ProcState {
+    parsed
+}
+
 /// What `ps -o state=,lstart=` printed for one pid, as a [`ProcState`]. `ps` prints nothing for a pid that does not
 /// exist. The state letter is only for telling a zombie (`Z`) or dead (`X`) process, which has exited, from a running
 /// one. The start time is the five fields of `lstart` (`Wed Nov  5 10:23:45 2026`), hashed: it is only ever compared
@@ -556,14 +565,15 @@ pub struct Ps;
 
 #[cfg(target_os = "macos")]
 impl Ps {
-    /// Run `/bin/ps` and `/usr/sbin/sysctl`: a fixed locale, no input.
+    /// The command for `/bin/ps` and `/usr/sbin/sysctl`: a fixed locale, no input.
+    fn command(program: &str, args: &[&str]) -> std::process::Command {
+        let mut command = std::process::Command::new(program);
+        command.env("LC_ALL", "C").args(args).stdin(std::process::Stdio::null());
+        command
+    }
+
     fn run(program: &str, args: &[&str]) -> Option<std::process::Output> {
-        std::process::Command::new(program)
-            .env("LC_ALL", "C")
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .ok()
+        Self::command(program, args).output().ok()
     }
 }
 
@@ -1734,6 +1744,82 @@ mod tests {
         for text in ["S", "S Wed Nov", "garbage", "ps: Invalid process id: 99999999999"] {
             assert_eq!(parse_ps_state(text), ProcState::Unknown, "{text:?}");
         }
+    }
+
+    /// Review of #666: a `ps` that cannot see this very process cannot say another one is gone, or every owner would
+    /// read as dead and a live box would be wiped.
+    #[test]
+    fn a_ps_that_cannot_see_this_process_does_not_say_another_is_gone() {
+        let seen = ProcState::Started(7);
+        assert_eq!(
+            gone_or_blind(ProcState::Gone, seen),
+            ProcState::Gone,
+            "a sighted ps is believed"
+        );
+        assert_eq!(
+            gone_or_blind(ProcState::Gone, ProcState::Gone),
+            ProcState::Unknown,
+            "blind"
+        );
+        assert_eq!(
+            gone_or_blind(ProcState::Gone, ProcState::Unknown),
+            ProcState::Unknown,
+            "unclear"
+        );
+        // Only a "gone" needs the control: a process that was seen is seen, and an unknown stays unknown.
+        assert_eq!(
+            gone_or_blind(ProcState::Started(1), ProcState::Gone),
+            ProcState::Started(1)
+        );
+        assert_eq!(gone_or_blind(ProcState::Unknown, seen), ProcState::Unknown);
+    }
+
+    /// Review of #666: `ps -o lstart` prints LOCAL time. A different `TZ` in the recording process and the sweeping
+    /// process, or a DST change between them, would print another string for the same process: a live owner would read
+    /// as another process and its box would be wiped. Every `ps` call runs in a fixed time zone.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ps_runs_in_a_fixed_locale_and_time_zone() {
+        let command = Ps::command("/bin/ps", &["-p", "1"]);
+        let env = |key: &str| {
+            command
+                .get_envs()
+                .find(|(name, _)| *name == key)
+                .and_then(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+        };
+        assert_eq!(env("LC_ALL").as_deref(), Some("C"));
+        assert_eq!(env("TZ").as_deref(), Some("UTC"));
+    }
+
+    /// The same, by outcome: the identity this table gives a process is the one `ps` prints in UTC, whatever zone the
+    /// host is in, and a zone 14 hours ahead prints another time (so the pin matters).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_start_identity_does_not_depend_on_the_hosts_time_zone() -> anyhow::Result<()> {
+        let pid = std::process::id();
+        let lstart = |tz: &str| -> anyhow::Result<String> {
+            let out = std::process::Command::new("/bin/ps")
+                .env("LC_ALL", "C")
+                .env("TZ", tz)
+                .args(["-o", "lstart=", "-p", &pid.to_string()])
+                .output()
+                .context("run ps")?;
+            Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        };
+        assert_ne!(
+            lstart("UTC")?,
+            lstart("Pacific/Kiritimati")?,
+            "a zone 14 hours ahead prints another time"
+        );
+
+        let in_utc = parse_ps_state(&format!("S {}", lstart("UTC")?));
+        assert!(matches!(in_utc, ProcState::Started(_)), "{in_utc:?}");
+        assert_eq!(
+            Ps.state(pid),
+            in_utc,
+            "the table must identify the process by its UTC start"
+        );
+        Ok(())
     }
 
     /// The real macOS table reads this very process, a finished child, and a live one.
