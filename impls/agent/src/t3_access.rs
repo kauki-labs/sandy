@@ -18,46 +18,67 @@ const TOKEN_FRAGMENT: &str = "#token=";
 /// File name under the access directory.
 pub const ACCESS_FILE: &str = "t3-access.json";
 
-/// A pairing URL and the token inside it.
+/// The pairing token. Only the token is kept: the host in the printed URL is the guest's own view of itself,
+/// and a consumer builds the URL it hands out from the host-side bridge, never from this file.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Access {
-    /// The full pairing URL as printed, fragment included.
-    pub url: String,
     /// The token from the URL fragment.
     pub token: String,
 }
 
 impl std::fmt::Debug for Access {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Access")
-            .field("url", &"<redacted>")
-            .field("token", &"<redacted>")
-            .finish()
+        f.debug_struct("Access").field("token", &"<redacted>").finish()
     }
 }
 
-/// The first `http(s)://…#token=<token>` word in `output`, or `None`.
-///
-/// Terminal escapes and quotes around the URL are not part of it: a word ends at whitespace,
-/// a control character or a quote.
-#[must_use]
-pub fn scan_startup_credential(output: &str) -> Option<Access> {
-    output
-        .split(|c: char| c.is_whitespace() || c.is_control() || matches!(c, '"' | '\'' | '<' | '>'))
-        .find_map(|word| {
-            let start = word.find("http://").or_else(|| word.find("https://"))?;
-            let url = &word[start..];
-            let (_, token) = url.split_once(TOKEN_FRAGMENT)?;
-            (!token.is_empty()).then(|| Access {
-                url: url.to_owned(),
-                token: token.to_owned(),
-            })
-        })
+/// The bytes of the transcript scanned. The credential is printed at startup; a longer prefix only costs
+/// memory on a job that floods its output.
+const SCAN_CAP: u64 = 1 << 20;
+
+/// What replaces a token in output the agent forwards.
+const REDACTED: &str = "<redacted>";
+
+/// Characters that end a URL word: whitespace, controls, quotes, brackets and sentence punctuation.
+fn ends_word(c: char) -> bool {
+    c.is_whitespace() || c.is_control() || matches!(c, '"' | '\'' | '<' | '>' | ')' | ']' | ',' | ';')
 }
 
-/// Env var naming the directory the credential file goes in. Set on the agent by the guest image, never on
-/// the job. Unset: no capture.
-pub const ACCESS_DIR_ENV: &str = "SANDY_T3_ACCESS_DIR";
+/// The first `http(s)://…#token=<token>` word in `output`, or `None`.
+#[must_use]
+pub fn scan_startup_credential(output: &str) -> Option<Access> {
+    output.split(ends_word).find_map(|word| {
+        let start = word.find("http://").or_else(|| word.find("https://"))?;
+        let (_, token) = word[start..].split_once(TOKEN_FRAGMENT)?;
+        let token = token.trim_end_matches('.');
+        (!token.is_empty()).then(|| Access {
+            token: token.to_owned(),
+        })
+    })
+}
+
+/// `output` with every `#token=<token>` fragment's token replaced, so the credential does not leave through the
+/// job console or the archive. Anything else is kept byte for byte.
+#[must_use]
+pub fn redact(output: &[u8]) -> Vec<u8> {
+    const KEY: &[u8] = TOKEN_FRAGMENT.as_bytes();
+    let mut out = Vec::with_capacity(output.len());
+    let mut i = 0;
+    while i < output.len() {
+        if output[i..].starts_with(KEY) {
+            out.extend_from_slice(KEY);
+            i += KEY.len();
+            out.extend_from_slice(REDACTED.as_bytes());
+            while i < output.len() && !ends_word(char::from(output[i])) && output[i] < 0x80 {
+                i += 1;
+            }
+        } else {
+            out.push(output[i]);
+            i += 1;
+        }
+    }
+    out
+}
 
 /// How often the transcript is re-read.
 const POLL: Duration = Duration::from_millis(250);
@@ -74,8 +95,8 @@ pub async fn capture(log: &Path, file: &AccessFile, timeout: Duration) -> Result
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         // Not yet created, or mid-write: try again next tick.
-        if let Ok(bytes) = tokio::fs::read(log).await
-            && let Some(access) = scan_startup_credential(&String::from_utf8_lossy(&bytes))
+        if let Some(head) = read_head(log).await
+            && let Some(access) = scan_startup_credential(&String::from_utf8_lossy(&head))
         {
             file.write(&access)?;
             return Ok(true);
@@ -85,6 +106,20 @@ pub async fn capture(log: &Path, file: &AccessFile, timeout: Duration) -> Result
         }
         tokio::time::sleep(POLL).await;
     }
+}
+
+/// The first [`SCAN_CAP`] bytes of `path`; `None` if it cannot be read yet.
+async fn read_head(path: &Path) -> Option<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut head = Vec::new();
+    tokio::fs::File::open(path)
+        .await
+        .ok()?
+        .take(SCAN_CAP)
+        .read_to_end(&mut head)
+        .await
+        .ok()?;
+    Some(head)
 }
 
 /// Why the credential file could not be written or read.
@@ -178,14 +213,13 @@ mod tests {
     fn a_pairing_url_in_server_output_is_found_with_its_token() {
         let out = format!("t3 serve ready\nPair a client: {URL}\nlistening\n");
         let access = scan_startup_credential(&out).expect("credential");
-        assert_eq!(access.url, URL);
         assert_eq!(access.token, "abc123DEF-_");
     }
 
     #[test]
     fn a_url_wrapped_in_quotes_or_escapes_is_found_without_them() {
         let out = format!("\u{1b}[32m\"{URL}\"\u{1b}[0m");
-        assert_eq!(scan_startup_credential(&out).expect("credential").url, URL);
+        assert_eq!(scan_startup_credential(&out).expect("credential").token, "abc123DEF-_");
     }
 
     #[test]
@@ -204,6 +238,40 @@ mod tests {
     fn the_first_credential_wins() {
         let out = format!("{URL}\nhttp://x/pair#token=second");
         assert_eq!(scan_startup_credential(&out).expect("credential").token, "abc123DEF-_");
+    }
+
+    #[test]
+    fn punctuation_after_the_url_is_not_part_of_the_token() {
+        for out in [format!("({URL})"), format!("see {URL}."), format!("[{URL}], next")] {
+            assert_eq!(
+                scan_startup_credential(&out).expect("credential").token,
+                "abc123DEF-_",
+                "{out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn redaction_replaces_the_token_and_keeps_everything_else() {
+        let out = format!("before\n\u{1b}[32mPair: {URL}\u{1b}[0m after\nnon-ascii é ok\n");
+        let redacted = String::from_utf8(redact(out.as_bytes())).expect("utf8");
+        assert!(!redacted.contains("abc123"), "{redacted:?}");
+        assert!(redacted.contains("/pair#token=<redacted>"), "{redacted:?}");
+        assert!(
+            redacted.contains("before\n") && redacted.contains("non-ascii é ok"),
+            "{redacted:?}"
+        );
+        assert_eq!(redact(b"no credential here"), b"no credential here");
+    }
+
+    #[test]
+    fn redaction_covers_every_occurrence() {
+        let out = format!("{URL} and again {URL}");
+        assert!(
+            !String::from_utf8(redact(out.as_bytes()))
+                .expect("utf8")
+                .contains("abc123")
+        );
     }
 
     #[test]
@@ -287,7 +355,24 @@ mod tests {
         let found = capture(tmux_job.log_path(), &file, Duration::from_secs(10)).await;
         tmux_job.kill();
         assert!(found.context("capture")?);
-        assert_eq!(file.read()?.url, URL);
+        assert_eq!(file.read()?.token, "abc123DEF-_");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn capture_ignores_a_credential_past_the_scan_cap() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let log = tmp.path().join("job.log");
+        let mut flood = vec![b'x'; usize::try_from(SCAN_CAP)? + 16];
+        flood.push(b'\n');
+        flood.extend_from_slice(URL.as_bytes());
+        std::fs::write(&log, flood)?;
+        let file = AccessFile::open(&tmp.path().join("access"))?;
+        assert!(
+            !capture(&log, &file, Duration::from_millis(300))
+                .await
+                .context("capture")?
+        );
         Ok(())
     }
 

@@ -35,6 +35,10 @@ pub const AGENT_VSOCK_PORT: u32 = 5_000;
 /// a manifest that declares a service.
 pub const SERVICE_ENV: &str = "SANDY_SERVICE";
 
+/// The agent env entry naming the directory the t3 pairing credential file goes in (#669). Set by the guest
+/// image on the agent, never by a submitter: the executor drops a submitter's entry of this name.
+pub const T3_ACCESS_DIR_ENV: &str = "SANDY_T3_ACCESS_DIR";
+
 /// The byte the guest agent writes as soon as it accepts the host's link
 /// connection (#238). A hypervisor's vsock proxy (vfkit) accepts the host's
 /// socket before it dials the guest, so a connected socket alone does not mean

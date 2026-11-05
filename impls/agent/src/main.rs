@@ -307,6 +307,15 @@ where
         Some(user) => service::as_user(user, job),
         None => job,
     };
+    // #669: a declared access directory makes the agent lift t3's startup pairing credential from the
+    // transcript into a 0600 file. Opened before the job starts so the job cannot pre-create it.
+    let access_file = match std::env::var_os(sandy_api::agent::T3_ACCESS_DIR_ENV) {
+        Some(dir) => Some(
+            t3_access::AccessFile::open(std::path::Path::new(&dir))
+                .map_err(|e| format!("opening the t3 access directory: {e}"))?,
+        ),
+        None => None,
+    };
     let tmux_job =
         TmuxJob::start(&job, peer_env, history_lines).map_err(|e| format!("starting the tmux job session: {e}"))?;
     // #590: a service with a host-reachable `port` gets the guest half of the host bridge, a child that stops
@@ -315,23 +324,18 @@ where
         Some(port) => Some(service::spawn_port_relay(port).await?),
         None => None,
     };
-    // #669: a declared access directory makes the agent lift t3's startup pairing credential from the
-    // transcript into a 0600 file. The capture never logs the credential; a failure is named without it.
-    let access_task = match std::env::var_os(t3_access::ACCESS_DIR_ENV) {
-        Some(dir) => {
-            let file = t3_access::AccessFile::open(std::path::Path::new(&dir))
-                .map_err(|e| format!("opening the t3 access directory: {e}"))?;
-            let log = tmux_job.log_path().to_path_buf();
-            Some(tokio::spawn(async move {
-                match t3_access::capture(&log, &file, T3_ACCESS_WINDOW).await {
-                    Ok(true) => {}
-                    Ok(false) => eprintln!("sandy-agent: no t3 pairing credential appeared within the window"),
-                    Err(e) => eprintln!("sandy-agent: capturing the t3 pairing credential: {e}"),
-                }
-            }))
-        }
-        None => None,
-    };
+    // #669: the capture task, opened above before the job started.
+    let access_declared = access_file.is_some();
+    let access_task = access_file.map(|file| {
+        let log = tmux_job.log_path().to_path_buf();
+        tokio::spawn(async move {
+            match t3_access::capture(&log, &file, T3_ACCESS_WINDOW).await {
+                Ok(true) => {}
+                Ok(false) => eprintln!("sandy-agent: no t3 pairing credential appeared within the window"),
+                Err(e) => eprintln!("sandy-agent: capturing the t3 pairing credential: {e}"),
+            }
+        })
+    });
     let readiness = service.map(|spec| service::spawn_readiness(Arc::clone(&agent), spec.probe, service_user));
     let (pty_read, pty_write, resizer, mut attach_child) = tmux_job
         .open_attach()
@@ -460,6 +464,12 @@ where
     // exactly that contract, not a new failure mode.
     match read_tail_lines(tmux_job.log_path(), history_lines, ARCHIVE_BYTE_CEILING).await {
         Ok(transcript) => {
+            // #669: the pairing token lives in the 0600 file only, not in the console or the archive.
+            let transcript = if access_declared {
+                t3_access::redact(&transcript)
+            } else {
+                transcript
+            };
             to_stdout(&transcript);
             match tokio::time::timeout(ARCHIVE_SEND_TIMEOUT, agent.send_archive(ARCHIVE_TRANSCRIPT, transcript)).await {
                 Ok(Ok(())) => {}

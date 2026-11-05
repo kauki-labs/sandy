@@ -79,8 +79,18 @@ can write the directory can swap the file after any check on it.
 
 ## 4. The t3 access credential stays in a `0600` file (#669)
 
-The guest agent lifts the pairing credential `t3 serve` prints at startup (`<url>#token=<token>`) out of the job
+The guest agent lifts the pairing token `t3 serve` prints at startup (`<url>#token=<token>`) out of the job
 transcript and writes it to `t3-access.json` in the directory named by `SANDY_T3_ACCESS_DIR`, through the one
-`0600` writer of section 3. The credential is valid only for a window after the server starts, so the capture
-runs from the first transcript byte and gives up after five minutes. It never reaches a log, a `Debug` print or
-a tool result. Reading it back over the agent link, and the seeded-token source, are later slices of #669.
+`0600` writer of section 3. Only the token is kept: a consumer builds the URL it hands out from the host-side
+bridge, never from the guest's printed host. The directory is opened before the job starts, and the executor
+drops a submitter's `SANDY_T3_ACCESS_DIR`.
+
+The token is valid only for a window after the server starts, so the capture runs from the first transcript
+byte, scans the first 1 MiB, and gives up after five minutes. It never reaches a log or a `Debug` print. The
+agent redacts it from the job console and the archive, and the `pipe-pane` transcript file is `0600` and removed
+when the job's tmux session is dropped.
+
+Open: the live attach stream still shows the printed line to an attached viewer during the token's window.
+Closing that needs t3 not to print the URL to its tty, which is an upstream change, or an owner decision to
+accept the exposure for an attach that already carries the same authority. Reading the file back over the agent
+link and the seeded-token source are later slices of #669.
