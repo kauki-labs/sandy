@@ -287,8 +287,11 @@ fn start_once(
         .spawn()
         .map_err(|err| StartFailure::Other(format!("spawn `{}`: {err}", launch.bin.display())))?;
     // Reported before the wait for READY below: a kill during it must still leave a record of the proxy.
-    let _ = on_spawn(child.id());
     let mut handle = ProxyHandle { child, port };
+    // A record that cannot take the proxy stops it (the handle kills on drop) and fails the start (#676).
+    if let Err(err) = on_spawn(handle.child.id()) {
+        return Err(StartFailure::Other(crate::orphans::unrecorded_message(&err)));
+    }
 
     // The policy goes on stdin, then stdin closes (the thread owns it and drops it): the proxy waits
     // for EOF. The write runs on a thread so the READY deadline bounds a proxy that never reads it:

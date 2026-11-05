@@ -44,9 +44,11 @@ impl VirtiofsdTransport {
         let mut children = Vec::with_capacity(shares.len());
         for share in shares {
             let launched = spawn_virtiofsd(bin, share).and_then(|child| {
-                // Reported before the wait below: a kill during it must still leave a record of this daemon.
-                let _ = on_spawn(child.id());
+                let pid = child.id();
+                // Held before it is reported, so a record that cannot take it still stops it below (#676).
                 children.push(child);
+                // Reported before the wait below: a kill during it must still leave a record of this daemon.
+                on_spawn(pid).map_err(|err| crate::orphans::unrecorded(&err))?;
                 wait_for_socket(&share.socket, Duration::from_secs(5))
             });
             if let Err(err) = launched {

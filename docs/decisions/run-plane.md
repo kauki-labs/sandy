@@ -272,5 +272,13 @@ gone, it kills every recorded process that is still alive, waits for each to exi
   KOS9): the orphans of a killed macOS run are the egress proxy and the run directory. The agent, egress and service sockets of a killed vfkit run are not
   removed by the sweep; they hold no data.
 
+- A process the box record cannot take is not left running unrecorded (#676). The launch stops the process it just
+  started (virtiofsd, the egress proxy, qemu, vfkit) and fails the run, and a record that cannot be opened fails the
+  run before anything is staged. A run that goes on without a record would leave its VMs behind after a kill, with
+  nothing for the sweep to find.
+- Teardown removes `-inputs` and `-outputs` first, then the run directory. A sibling that cannot be removed keeps
+  `box.json`: the rest of the run directory (the secret share) is still removed, and the next sweep finds the box and
+  removes the sibling.
+
 **Set aside.** Scanning command lines for qemu: it can hit a process we did not start. A process group kill (above).
 A daemon-lifetime lock on the staging base (above). Comparing the executable (above).

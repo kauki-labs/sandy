@@ -1643,7 +1643,9 @@ mod tests {
             .context("spawn stand-in virtiofsd")?;
         let daemon_pid = daemon.id();
         let backend = QemuBackend::new();
+        // `run` creates the instance directory before it boots; the box record lives in it.
         let inst = dir.path().join("inst");
+        std::fs::create_dir(&inst).context("create the instance dir")?;
         let args = vec![qemu.display().to_string()];
         let result = backend.launch(&spec, &args, Uuid::new_v4(), &inst, None, Some(&egress), vec![daemon]);
         let Err(BackendError::Spawn(message)) = result else {
@@ -1651,6 +1653,35 @@ mod tests {
         };
         anyhow::ensure!(message.starts_with("egress proxy did not start"), "{message}");
         anyhow::ensure!(!marker.exists(), "qemu must not spawn after a proxy start failure");
+        anyhow::ensure!(!pid_alive(daemon_pid), "the virtiofsd daemon must be killed");
+        Ok(())
+    }
+
+    /// #676: a launch whose box record cannot be opened kills the daemons it was handed and never starts qemu. Left
+    /// running, they would outlive a killed host with nothing naming them.
+    #[test]
+    fn a_launch_whose_box_record_cannot_be_opened_kills_the_daemons() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let marker = dir.path().join("qemu-ran");
+        let qemu = stub_qemu(dir.path(), &marker)?;
+        let allow = allow_all_github();
+        let command = ["true".to_string()];
+        let spec = quick_spec(&command, &allow);
+        let daemon = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .context("spawn stand-in virtiofsd")?;
+        let daemon_pid = daemon.id();
+        let inst = dir.path().join("no-such-inst");
+        let args = vec![qemu.display().to_string()];
+
+        let result = QemuBackend::new().launch(&spec, &args, Uuid::new_v4(), &inst, None, None, vec![daemon]);
+
+        let Err(BackendError::Spawn(message)) = result else {
+            anyhow::bail!("expected Spawn, got {result:?}");
+        };
+        anyhow::ensure!(message.starts_with("could not record the box's processes"), "{message}");
+        anyhow::ensure!(!marker.exists(), "qemu must not spawn without a record");
         anyhow::ensure!(!pid_alive(daemon_pid), "the virtiofsd daemon must be killed");
         Ok(())
     }

@@ -675,7 +675,7 @@ pub(crate) type Host = Ps;
 /// The box's record of the processes it started (#666). A process the record does not name outlives a killed host, so
 /// a write that fails is an error the launch acts on: it stops the process it just started and fails the run (#676).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) struct BoxRecorder(Option<RecordWriter>);
+pub(crate) struct BoxRecorder(RecordWriter);
 
 /// A host with no process table to read records nothing.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -689,13 +689,7 @@ impl BoxRecorder {
     /// When the record cannot be created or read.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn open(dir: &Path) -> io::Result<Self> {
-        match RecordWriter::open_or_create(dir, &Host::default(), std::process::id()) {
-            Ok(writer) => Ok(Self(Some(writer))),
-            Err(err) => {
-                tracing::warn!(%err, "could not write the box record; a killed host would leave this VM behind");
-                Ok(Self(None))
-            }
-        }
+        RecordWriter::open_or_create(dir, &Host::default(), std::process::id()).map(Self)
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -715,12 +709,7 @@ impl BoxRecorder {
     /// written.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn add(&mut self, pid: u32) -> io::Result<()> {
-        if let Some(writer) = &mut self.0
-            && let Err(err) = writer.add(&Host::default(), pid)
-        {
-            tracing::warn!(pid, %err, "could not record a started process; it would outlive a killed host");
-        }
-        Ok(())
+        self.0.add(&Host::default(), pid)
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -733,20 +722,61 @@ impl BoxRecorder {
     }
 }
 
-/// The run error for a process the box record could not take: the caller has already stopped the process.
+/// Why a run stopped because the box record could not take a process: the caller has already stopped the process.
+pub(crate) fn unrecorded_message(err: &io::Error) -> String {
+    format!("could not record the box's processes, so a killed host would leave them running: {err}")
+}
+
+/// [`unrecorded_message`] as the run error.
 pub(crate) fn unrecorded(err: &io::Error) -> sandy::BackendError {
-    sandy::BackendError::Spawn(format!(
-        "could not record the box's processes, so a killed host would leave them running: {err}"
-    ))
+    sandy::BackendError::Spawn(unrecorded_message(err))
 }
 
 /// Remove the staging of one box when its run ends (INV-1): the `-inputs` and `-outputs` directories first, the run
 /// directory last. A sibling that cannot be removed keeps the record, so the next sweep still finds the box and
 /// finishes the job (#676).
 pub(crate) fn wipe_staging(inst_dir: &Path, inputs_dir: &Path, outputs_dir: &Path, when: &str) {
-    for dir in [inst_dir, inputs_dir, outputs_dir] {
+    let mut sibling_left = false;
+    for dir in [inputs_dir, outputs_dir] {
         if let Err(err) = sandy::wipe(dir) {
-            tracing::warn!(dir = %dir.display(), %err, "failed to wipe staging {when}");
+            tracing::warn!(dir = %dir.display(), %err, "failed to wipe staging {when}; the next sweep retries it");
+            sibling_left = true;
+        }
+    }
+    if !sibling_left {
+        if let Err(err) = sandy::wipe(inst_dir) {
+            tracing::warn!(dir = %inst_dir.display(), %err, "failed to wipe staging {when}");
+        }
+        return;
+    }
+    // The secret share lives in the run directory and goes on every path. The record stays: it is the only thing that
+    // lets the next sweep find the sibling.
+    let entries = match fs::read_dir(inst_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return,
+        Err(err) => {
+            tracing::warn!(dir = %inst_dir.display(), %err, "failed to list staging {when}");
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) if entry.file_name() == RECORD_FILE => continue,
+            Ok(entry) => entry,
+            Err(err) => {
+                tracing::warn!(dir = %inst_dir.display(), %err, "failed to list staging {when}");
+                continue;
+            }
+        };
+        let path = entry.path();
+        let removed = match entry.file_type() {
+            Ok(kind) if kind.is_dir() => fs::remove_dir_all(&path),
+            _ => fs::remove_file(&path),
+        };
+        if let Err(err) = removed
+            && err.kind() != io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %path.display(), %err, "failed to wipe staging {when}");
         }
     }
 }
