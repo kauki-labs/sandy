@@ -124,6 +124,17 @@ impl RecordWriter {
         Ok(writer)
     }
 
+    /// The writer for the box whose run directory is `dir`: the record already there when it names the same owner
+    /// (it is adopted, with the processes it already lists), else a new one. Each stage of a launch opens the record
+    /// this way, so a process recorded by an earlier stage is not lost.
+    ///
+    /// # Errors
+    ///
+    /// As [`create`](Self::create).
+    pub fn open_or_create(dir: &Path, table: &dyn ProcessTable, owner_pid: u32) -> io::Result<Self> {
+        Self::create(dir, table, owner_pid)
+    }
+
     /// Add a started process to the record and rewrite it.
     ///
     /// # Errors
@@ -1354,6 +1365,61 @@ mod tests {
             ProcState::Unknown,
             "any other error"
         );
+    }
+
+    /// Each stage of a launch opens the same record (the run writes the owner before staging, the share transport
+    /// adds each daemon as it spawns, `launch` adds the proxy and qemu), so opening must keep what is already there.
+    #[test]
+    fn an_existing_record_of_the_same_owner_is_adopted_with_its_processes() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().context("tempdir")?;
+        let table = Fake::default()
+            .with(100, 1000, DAEMON)
+            .with(200, 2000, QEMU)
+            .with(201, 2001, VIRTIOFSD);
+        let mut first = RecordWriter::open_or_create(dir.path(), &table, 100).context("first")?;
+        first.add(&table, 201).context("add virtiofsd")?;
+
+        let mut second = RecordWriter::open_or_create(dir.path(), &table, 100).context("second")?;
+        second.add(&table, 200).context("add qemu")?;
+
+        let record: BoxRecord =
+            serde_json::from_slice(&fs::read(dir.path().join(RECORD_FILE)).context("read")?).context("decode")?;
+        assert_eq!(record.procs, vec![id(201, 2001, VIRTIOFSD), id(200, 2000, QEMU)]);
+        Ok(())
+    }
+
+    /// A record of another owner is not ours to extend: it is replaced.
+    #[test]
+    fn a_record_of_another_owner_is_replaced() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().context("tempdir")?;
+        let table = Fake::default()
+            .with(100, 1000, DAEMON)
+            .with(101, 1001, DAEMON)
+            .with(200, 2000, QEMU);
+        let mut other = RecordWriter::create(dir.path(), &table, 101).context("other owner")?;
+        other.add(&table, 200).context("add")?;
+
+        RecordWriter::open_or_create(dir.path(), &table, 100).context("open")?;
+
+        let record: BoxRecord =
+            serde_json::from_slice(&fs::read(dir.path().join(RECORD_FILE)).context("read")?).context("decode")?;
+        assert_eq!(record.owner.pid, 100);
+        assert!(record.procs.is_empty(), "{:?}", record.procs);
+        Ok(())
+    }
+
+    #[test]
+    fn a_process_recorded_twice_is_listed_once() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().context("tempdir")?;
+        let table = Fake::default().with(100, 1000, DAEMON).with(200, 2000, QEMU);
+        let mut writer = RecordWriter::create(dir.path(), &table, 100).context("create")?;
+
+        writer.add(&table, 200).context("first")?;
+        let once = fs::read(dir.path().join(RECORD_FILE)).context("read")?;
+        writer.add(&table, 200).context("second")?;
+
+        assert_eq!(fs::read(dir.path().join(RECORD_FILE)).context("read")?, once);
+        Ok(())
     }
 
     /// The real process table reads this very process: it is alive, started, runs the test binary, and has a boot id

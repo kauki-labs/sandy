@@ -31,11 +31,19 @@ const VIRTIOFS_MEM_ID: &str = "sandy-mem";
 #[derive(Debug, Clone, Copy, Default)]
 pub struct VirtiofsdTransport;
 
-impl GuestShareTransport for VirtiofsdTransport {
-    fn activate(&self, shares: &[ShareSpec]) -> Result<Vec<Child>, BackendError> {
+impl VirtiofsdTransport {
+    /// [`activate`](GuestShareTransport::activate) with the `virtiofsd` binary given, and each daemon's pid reported to
+    /// `on_spawn` as soon as it spawns, before the wait for its socket (up to 5 s). A box record that is written only
+    /// after the wait would miss a daemon when the host is killed during it (#666).
+    pub(crate) fn activate_with(
+        &self,
+        bin: &str,
+        shares: &[ShareSpec],
+        _on_spawn: &mut dyn FnMut(u32),
+    ) -> Result<Vec<Child>, BackendError> {
         let mut children = Vec::with_capacity(shares.len());
         for share in shares {
-            let launched = spawn_virtiofsd(share).and_then(|child| {
+            let launched = spawn_virtiofsd(bin, share).and_then(|child| {
                 children.push(child);
                 wait_for_socket(&share.socket, Duration::from_secs(5))
             });
@@ -45,6 +53,22 @@ impl GuestShareTransport for VirtiofsdTransport {
             }
         }
         Ok(children)
+    }
+
+    /// [`activate_with`](Self::activate_with) with the binary from `$SANDY_VIRTIOFSD_BIN`, else `virtiofsd` on `PATH`.
+    pub(crate) fn activate_recorded(
+        &self,
+        shares: &[ShareSpec],
+        on_spawn: &mut dyn FnMut(u32),
+    ) -> Result<Vec<Child>, BackendError> {
+        let bin = std::env::var("SANDY_VIRTIOFSD_BIN").unwrap_or_else(|_| "virtiofsd".to_string());
+        self.activate_with(&bin, shares, on_spawn)
+    }
+}
+
+impl GuestShareTransport for VirtiofsdTransport {
+    fn activate(&self, shares: &[ShareSpec]) -> Result<Vec<Child>, BackendError> {
+        self.activate_recorded(shares, &mut |_| {})
     }
 
     fn plan(&self, shares: &[ShareSpec], mem_mib: u32) -> Presentation {
@@ -136,8 +160,7 @@ pub fn virtiofsd_args(share: &ShareSpec) -> Vec<String> {
 ///
 /// # Errors
 /// [`BackendError::Spawn`] if the `virtiofsd` process cannot be spawned.
-fn spawn_virtiofsd(share: &ShareSpec) -> Result<Child, BackendError> {
-    let bin = std::env::var("SANDY_VIRTIOFSD_BIN").unwrap_or_else(|_| "virtiofsd".to_string());
+fn spawn_virtiofsd(bin: &str, share: &ShareSpec) -> Result<Child, BackendError> {
     // Clear any stale socket so wait_for_socket can't observe a previous run's.
     let _ = std::fs::remove_file(&share.socket);
     Command::new(&bin)
@@ -167,4 +190,48 @@ fn wait_for_socket(socket: &Path, budget: Duration) -> Result<(), BackendError> 
         std::thread::sleep(Duration::from_millis(50));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Context as _;
+
+    use super::*;
+
+    /// #666: each daemon is reported when it spawns, before the wait for its socket, so a kill during that wait still
+    /// leaves a record of it. The stub only creates its socket after a delay, so the socket is absent at the report.
+    #[test]
+    fn a_daemon_is_reported_when_it_spawns_before_its_socket_is_awaited() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let socket = dir.path().join("vfsd.sock");
+        let stub = crate::egress_proxy::tests::stub(
+            dir.path(),
+            "virtiofsd",
+            r#"for a in "$@"; do case "$a" in --socket-path=*) s="${a#--socket-path=}";; esac; done
+sleep 0.4
+: > "$s"
+exec sleep 30"#,
+        )?;
+        let share = ShareSpec {
+            host_dir: dir.path().to_path_buf(),
+            tag: "t".to_owned(),
+            readonly: false,
+            socket: socket.clone(),
+        };
+        let mut reported = Vec::new();
+        let mut socket_was_there = true;
+
+        let mut children = VirtiofsdTransport
+            .activate_with(stub.to_str().context("utf8 path")?, &[share], &mut |pid| {
+                reported.push(pid);
+                socket_was_there = socket.exists();
+            })
+            .context("activate")?;
+        let pids: Vec<u32> = children.iter().map(Child::id).collect();
+        kill_children(&mut children);
+
+        assert_eq!(reported, pids, "one report per daemon, with its pid");
+        assert!(!socket_was_there, "the report came before the socket existed");
+        Ok(())
+    }
 }

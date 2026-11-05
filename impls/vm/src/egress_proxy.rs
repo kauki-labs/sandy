@@ -114,6 +114,16 @@ impl<'a> EgressLaunch<'a> {
     /// # Errors
     /// [`BackendError::Spawn`] (band 3) when the proxy does not reach `READY`.
     pub(crate) fn start(&self) -> Result<ProxyHandle, BackendError> {
+        self.start_recorded(&mut |_| {})
+    }
+
+    /// [`start`](Self::start), reporting the proxy's pid to `on_spawn` as soon as it spawns, before the wait for
+    /// `READY`. A box record that is written only after the wait would miss the proxy when the host is killed during
+    /// it (#666).
+    ///
+    /// # Errors
+    /// As [`start`](Self::start).
+    pub(crate) fn start_recorded(&self, _on_spawn: &mut dyn FnMut(u32)) -> Result<ProxyHandle, BackendError> {
         ProxyHandle::start(self)
     }
 }
@@ -402,6 +412,37 @@ pub(crate) mod tests {
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).context("write stub")?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).context("chmod stub")?;
         Ok(path)
+    }
+
+    /// #666: the proxy's pid is reported as soon as it spawns, before the wait for `READY`, so a kill during that wait
+    /// still leaves a record of it. The stub marks the moment it is about to print `READY`.
+    #[test]
+    fn the_proxy_is_reported_when_it_spawns_before_it_is_ready() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let about_to_be_ready = dir.path().join("about-to-be-ready");
+        let bin = stub(
+            dir.path(),
+            "proxy",
+            &format!(
+                "cat >/dev/null; sleep 0.4; : > {}; echo READY; exec sleep 30",
+                about_to_be_ready.display()
+            ),
+        )?;
+        let allow = policy();
+        let launch = launch(&allow, bin, PROXY_STARTS);
+        let mut reported = Vec::new();
+        let mut ready_was_near = true;
+
+        let handle = launch
+            .start_recorded(&mut |pid| {
+                reported.push(pid);
+                ready_was_near = about_to_be_ready.exists();
+            })
+            .context("start")?;
+
+        assert_eq!(reported, vec![handle.pid()], "one report, with the proxy's pid");
+        assert!(!ready_was_near, "the report came before the proxy was ready");
+        Ok(())
     }
 
     fn policy() -> AllowList {
