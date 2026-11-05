@@ -122,7 +122,9 @@ check(lines.get("binaries") == "claude=yes codex=yes", "claude or codex is missi
 check(re.fullmatch(r"[1-5]\d\d", lines.get("curl-allowed", "")), "curl did not reach an allow-listed host")
 check("response 403" in lines.get("curl-denied", ""), "a host off the allow-list was not refused with 403")
 check("Invalid API key" in lines.get("claude-allowed", ""), "claude did not reach its provider through the proxy")
-check(re.search(r"\b401 Unauthorized\b", lines.get("codex-allowed", "")) and "api.openai.com" in lines.get("codex-allowed", ""),
+# With CODEX_API_KEY set, OpenAI names the fake key it received, which also shows the key reached the provider.
+codex = lines.get("codex-allowed", "")
+check("Incorrect API key provided: sk-fake" in codex and "api.openai.com" in codex and "auth error: 401" in codex,
       "codex did not reach its provider through the proxy")
 # The 403 itself is shown by curl-denied. claude must not succeed against a host off the allow-list: a clean exit or
 # the provider's reply means the request got through.
