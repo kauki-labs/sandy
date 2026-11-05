@@ -26,9 +26,15 @@ use std::{
     time::Duration,
 };
 
-use sandy_api::agent::OnLink;
+use sandy_api::{
+    agent::{OnLink, SERVICE_ENV},
+    backend::BackendError,
+    environment::EnvironmentSpec,
+};
 use sandy_conn::bridge::{Bridge, BridgeConfig, Dialer};
-use sandy_environment::{HttpServiceProbe, RunGuards};
+use sandy_environment::{
+    BackendFactory, HeldBackend, HttpServiceProbe, RunGuards, VmEnvironmentBackend, VmEnvironmentConfig,
+};
 use sandy_fabric::{
     capauth::{CapAuthority, CapRights, CapScope},
     types::{ChannelId, PeerId},
@@ -98,17 +104,18 @@ pub fn cid_hook<D: Dialer>(
     environment_id: String,
     dialer_for: impl Fn(u32) -> io::Result<D> + Send + Sync + 'static,
 ) -> impl Fn(&str, u32) + Send + Sync + 'static {
-    move |_box_id, cid| spawn_bridge(&rt, &probe, &guards, &environment_id, dialer_for(cid))
+    move |_box_id, cid| drop(spawn_bridge(&rt, &probe, &guards, &environment_id, dialer_for(cid)))
 }
 
-/// Start the bridge on `rt` and, if the run is still open, hold it and its probe registration in `guards`.
+/// Start the bridge on `rt` and, if the run is still open, hold it and its probe registration in `guards`. The task
+/// resolves to whether it registered: `false` for a run that ended first or a bridge that did not start.
 fn spawn_bridge<D: Dialer>(
     rt: &tokio::runtime::Handle,
     probe: &Arc<HttpServiceProbe>,
     guards: &RunGuards,
     environment_id: &str,
     dialer: io::Result<D>,
-) {
+) -> tokio::task::JoinHandle<bool> {
     let (probe, guards, environment_id) = (Arc::clone(probe), guards.clone(), environment_id.to_owned());
     rt.spawn(async move {
         match start_bridge(dialer).await {
@@ -118,13 +125,14 @@ fn spawn_bridge<D: Dialer>(
                 guards.hold_if_open(|| {
                     let registration = probe.register(&environment_id, bridge.addr());
                     Box::new((registration, bridge))
-                });
+                })
             }
             Err(e) => {
                 tracing::warn!(environment = %environment_id, error = %e, "could not start the service bridge");
+                false
             }
         }
-    });
+    })
 }
 
 /// [`relay_link`] plus the service bridge, for a backend with no CID hook (vfkit): the bridge starts when the
@@ -138,7 +146,7 @@ pub fn bridge_on_link<D: Dialer>(
 ) -> OnLink {
     let relay = relay_link(rt.clone(), environment_id.clone());
     Arc::new(move |box_id, link, report| {
-        spawn_bridge(&rt, &probe, &guards, &environment_id, dialer());
+        drop(spawn_bridge(&rt, &probe, &guards, &environment_id, dialer()));
         relay(box_id, link, report);
     })
 }
@@ -186,31 +194,40 @@ async fn start_bridge<D: Dialer>(dialer: io::Result<D>) -> io::Result<Bridge> {
     Bridge::start(dialer?, BridgeConfig::default()).await
 }
 
+/// Compose the environment backend: run `sweep` once, now, then build each environment's backend with `per_env`.
+///
+/// The sweep belongs here and not in `per_env`: it stops what a killed host left behind, and a launch must never
+/// run it (it can block for seconds per box).
+pub fn assemble(
+    settings: &crate::environment_backend::VmSettings,
+    probe: Arc<HttpServiceProbe>,
+    sweep: impl FnOnce(),
+    per_env: impl Fn(&EnvironmentSpec, &RunGuards) -> Result<HeldBackend, BackendError> + Send + Sync + 'static,
+) -> VmEnvironmentBackend {
+    sweep();
+    let factory: BackendFactory = Box::new(move |spec| per_env(spec, &RunGuards::new()));
+    let mut config = VmEnvironmentConfig::new(settings.command.clone());
+    config.env = vec![(SERVICE_ENV.to_owned(), settings.service_env.clone())];
+    config.boot_timeout_secs = settings.boot_timeout_secs;
+    VmEnvironmentBackend::new(factory, config).with_service_probe(probe)
+}
+
 /// The environment backend that boots each environment as a qemu microVM.
 #[cfg(target_os = "linux")]
-pub fn backend(
-    settings: &crate::environment_backend::VmSettings,
-    rt: tokio::runtime::Handle,
-) -> sandy_environment::VmEnvironmentBackend {
-    use sandy_api::agent::{AgentLaunch, PORT_RELAY_VSOCK_PORT, SERVICE_ENV};
+pub fn backend(settings: &crate::environment_backend::VmSettings, rt: tokio::runtime::Handle) -> VmEnvironmentBackend {
+    use sandy_api::agent::{AgentLaunch, PORT_RELAY_VSOCK_PORT};
     use sandy_backend::QemuBackend;
     use sandy_conn::dial::VsockDialer;
-    use sandy_environment::{BackendFactory, HeldBackend, VmEnvironmentBackend, VmEnvironmentConfig, guarded};
+    use sandy_environment::guarded;
 
-    // Once, at construction: stops the VMs a killed host left behind. Safe beside a live daemon or CLI run.
-    let report = QemuBackend::sweep_orphans();
-    if report != Default::default() {
-        tracing::warn!(?report, "stopped or removed the VMs a killed host left behind");
-    }
     let probe = Arc::new(HttpServiceProbe::new());
-    let factory: BackendFactory = {
+    let per_env = {
         let probe = Arc::clone(&probe);
-        Box::new(move |spec| {
-            let guards = RunGuards::new();
+        move |spec: &EnvironmentSpec, guards: &RunGuards| {
             let qemu = QemuBackend::new()
                 .with_agent(AgentLaunch {
                     // A VM backend takes the agent's path from the topology.
-                    program: std::path::PathBuf::new(),
+                    program: PathBuf::new(),
                     on_link: relay_link(rt.clone(), spec.environment_id.clone()),
                 })
                 .with_guest_cid_hook(cid_hook(
@@ -220,62 +237,211 @@ pub fn backend(
                     spec.environment_id.clone(),
                     |cid| VsockDialer::new(cid, PORT_RELAY_VSOCK_PORT),
                 ));
-            Ok(Box::new(guarded(qemu, &guards)) as HeldBackend)
-        })
+            Ok(Box::new(guarded(qemu, guards)) as HeldBackend)
+        }
     };
-    let mut config = VmEnvironmentConfig::new(settings.command.clone());
-    config.env = vec![(SERVICE_ENV.to_owned(), settings.service_env.clone())];
-    config.boot_timeout_secs = settings.boot_timeout_secs;
-    VmEnvironmentBackend::new(factory, config).with_service_probe(probe)
+    // `sweep_orphans` logs its own report. Safe beside a live daemon or CLI run.
+    assemble(
+        settings,
+        probe,
+        || {
+            let _ = QemuBackend::sweep_orphans();
+        },
+        per_env,
+    )
+}
+
+/// Why the vfkit backend cannot start. Each one stops the daemon at start-up, not at the first environment.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum VfkitSetupError {
+    /// `SANDY_VFKIT_BIN` holds bytes that are not UTF-8.
+    #[error("SANDY_VFKIT_BIN is not valid UTF-8")]
+    BinNotUtf8,
+    /// `SANDY_VFKIT_BIN` is set but blank.
+    #[error("SANDY_VFKIT_BIN is set but empty")]
+    BinEmpty,
+    /// No executable `vfkit` was found.
+    #[error("the vfkit binary {0:?} is not an executable file{1}")]
+    BinNotFound(String, &'static str),
+    /// The staging base is too deep for a socket path.
+    #[error(transparent)]
+    SocketPath(#[from] SocketPathTooLong),
+}
+
+/// Resolve the vfkit binary from `SANDY_VFKIT_BIN` (`var`; unset means `vfkit`) and `PATH` (`path`).
+///
+/// A name with a `/` must be an executable file; a bare name is searched for in `path`.
+///
+/// # Errors
+/// [`VfkitSetupError`] for a non-UTF-8, blank or unresolvable value.
+pub fn resolve_vfkit_bin(
+    var: Option<std::ffi::OsString>,
+    path: Option<std::ffi::OsString>,
+) -> Result<PathBuf, VfkitSetupError> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let name = match var {
+        None => "vfkit".to_owned(),
+        Some(v) => v.into_string().map_err(|_| VfkitSetupError::BinNotUtf8)?,
+    };
+    if name.trim().is_empty() {
+        return Err(VfkitSetupError::BinEmpty);
+    }
+    let executable = |p: &Path| {
+        p.metadata()
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    };
+    if name.contains('/') {
+        let p = PathBuf::from(&name);
+        return if executable(&p) {
+            Ok(p)
+        } else {
+            Err(VfkitSetupError::BinNotFound(name, ""))
+        };
+    }
+    path.iter()
+        .flat_map(std::env::split_paths)
+        .map(|dir| dir.join(&name))
+        .find(|p| executable(p))
+        .ok_or(VfkitSetupError::BinNotFound(name, " on PATH"))
+}
+
+/// The vfkit binary and staging base the backend runs with, checked once.
+#[derive(Debug, PartialEq, Eq)]
+pub struct VfkitSetup {
+    /// The resolved `vfkit` binary.
+    pub bin: PathBuf,
+    /// The private staging base the service sockets live under.
+    pub base: PathBuf,
+}
+
+/// Check what every environment will need, so a bad setting stops the daemon instead of failing each environment:
+/// the binary resolves, and a service socket path under `base` fits `sun_path` (the name has the same length for
+/// every id).
+///
+/// # Errors
+/// [`VfkitSetupError`].
+pub fn check_vfkit_setup(
+    bin_var: Option<std::ffi::OsString>,
+    path_var: Option<std::ffi::OsString>,
+    base: PathBuf,
+) -> Result<VfkitSetup, VfkitSetupError> {
+    let bin = resolve_vfkit_bin(bin_var, path_var)?;
+    service_socket_path(&base, "probe")?;
+    Ok(VfkitSetup { bin, base })
+}
+
+/// Remove the service sockets in `base` that no VM answers on, and return how many. A daemon killed with SIGKILL
+/// leaves a socket for each environment that never ran again (its row went `Failed`, so nothing relaunches it and
+/// clears the path). A socket that answers belongs to a live VM and stays.
+pub fn sweep_stale_service_sockets(base: &Path) -> usize {
+    use std::os::unix::{fs::FileTypeExt as _, net::UnixStream};
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let ours = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with(SOCKET_PREFIX) && n.ends_with(".sock"));
+        let is_socket = std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_socket());
+        if !ours || !is_socket {
+            continue;
+        }
+        let stale = matches!(
+            UnixStream::connect(&path),
+            Err(e) if matches!(e.kind(), io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound)
+        );
+        if stale && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    tracing::debug!(removed, "removed the stale vfkit service sockets");
+    removed
+}
+
+/// What one vfkit environment's backend needs: the service socket and the link hook that dials that same socket.
+pub struct VfkitWiring {
+    /// Where vfkit exposes the guest relay.
+    pub socket: PathBuf,
+    /// The agent-link hook: serves the link and starts the bridge to `socket`.
+    pub on_link: OnLink,
+}
+
+/// Wire environment `environment_id` under `base`. `dialer_at` builds the dialer for the socket path; the same path
+/// is returned for the backend, so the bridge cannot dial another socket than the one vfkit binds.
+///
+/// # Errors
+/// [`SocketPathTooLong`] when the path would not fit `sun_path`.
+pub fn vfkit_wiring<D: Dialer>(
+    rt: tokio::runtime::Handle,
+    probe: Arc<HttpServiceProbe>,
+    guards: RunGuards,
+    base: &Path,
+    environment_id: &str,
+    dialer_at: impl Fn(&Path) -> io::Result<D> + Send + Sync + 'static,
+) -> Result<VfkitWiring, SocketPathTooLong> {
+    let socket = service_socket_path(base, environment_id)?;
+    let dial_path = socket.clone();
+    let on_link = bridge_on_link(rt, probe, guards, environment_id.to_owned(), move || {
+        dialer_at(&dial_path)
+    });
+    Ok(VfkitWiring { socket, on_link })
 }
 
 /// The environment backend that boots each environment as a vfkit microVM.
 ///
 /// Each environment gets its own service socket under the private staging base ([`service_socket_path`]); vfkit
-/// owns it and the bridge dials it. The `vfkit` binary is `SANDY_VFKIT_BIN`, else `vfkit` from `PATH`.
+/// owns it and the bridge dials it. Stale sockets of a killed daemon are removed first.
+///
+/// # Errors
+/// The reason, as text, when the staging base cannot be opened or the vfkit binary or a socket path is unusable.
 #[cfg(target_os = "macos")]
 pub fn vfkit_backend(
     settings: &crate::environment_backend::VmSettings,
     rt: tokio::runtime::Handle,
-) -> sandy_environment::VmEnvironmentBackend {
-    use sandy_api::{
-        agent::{AgentLaunch, SERVICE_ENV},
-        backend::BackendError,
-    };
+) -> Result<VmEnvironmentBackend, String> {
+    use sandy_api::agent::AgentLaunch;
     use sandy_backend::VfkitBackend;
     use sandy_conn::dial::UnixDialer;
-    use sandy_environment::{BackendFactory, HeldBackend, VmEnvironmentBackend, VmEnvironmentConfig, guarded};
+    use sandy_environment::guarded;
 
-    let vfkit_bin = std::env::var("SANDY_VFKIT_BIN").unwrap_or_else(|_| "vfkit".to_owned());
+    let base = sandy_fsutil::ensure_sandy_staging_base().map_err(|e| format!("the staging base: {e}"))?;
+    let setup = check_vfkit_setup(std::env::var_os("SANDY_VFKIT_BIN"), std::env::var_os("PATH"), base)
+        .map_err(|e| e.to_string())?;
     let probe = Arc::new(HttpServiceProbe::new());
-    let factory: BackendFactory = {
+    let sweep_base = setup.base.clone();
+    let per_env = {
         let probe = Arc::clone(&probe);
-        Box::new(move |spec| {
-            let base = sandy_fsutil::ensure_sandy_staging_base()
-                .map_err(|e| BackendError::Spawn(format!("the staging base for the service socket: {e}")))?;
-            let socket =
-                service_socket_path(&base, &spec.environment_id).map_err(|e| BackendError::Spawn(e.to_string()))?;
-            let guards = RunGuards::new();
-            let vfkit = VfkitBackend::new(vfkit_bin.clone())
-                .with_service_socket(socket.clone())
+        move |spec: &EnvironmentSpec, guards: &RunGuards| {
+            let wiring = vfkit_wiring(
+                rt.clone(),
+                Arc::clone(&probe),
+                guards.clone(),
+                &setup.base,
+                &spec.environment_id,
+                |socket| Ok(UnixDialer::new(socket)),
+            )
+            .map_err(|e| BackendError::Spawn(e.to_string()))?;
+            let vfkit = VfkitBackend::new(setup.bin.clone())
+                .with_service_socket(wiring.socket)
                 .with_agent(AgentLaunch {
                     // A VM backend takes the agent's path from the topology.
                     program: PathBuf::new(),
-                    on_link: bridge_on_link(
-                        rt.clone(),
-                        Arc::clone(&probe),
-                        guards.clone(),
-                        spec.environment_id.clone(),
-                        move || Ok(UnixDialer::new(socket.clone())),
-                    ),
+                    on_link: wiring.on_link,
                 });
-            Ok(Box::new(guarded(vfkit, &guards)) as HeldBackend)
-        })
+            Ok(Box::new(guarded(vfkit, guards)) as HeldBackend)
+        }
     };
-    let mut config = VmEnvironmentConfig::new(settings.command.clone());
-    config.env = vec![(SERVICE_ENV.to_owned(), settings.service_env.clone())];
-    config.boot_timeout_secs = settings.boot_timeout_secs;
-    VmEnvironmentBackend::new(factory, config).with_service_probe(probe)
+    Ok(assemble(
+        settings,
+        probe,
+        || {
+            let _ = sweep_stale_service_sockets(&sweep_base);
+        },
+        per_env,
+    ))
 }
 
 #[cfg(test)]
@@ -477,36 +643,228 @@ mod tests {
         Ok(())
     }
 
-    /// A link that comes up after the run ended must not leave a bridge or a registration behind.
+    /// A bridge that finishes starting after the run ended must never have registered with the probe: the task
+    /// reports it did not, which a hold that registers first and drops after cannot say.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bridge_that_starts_after_the_run_ended_is_never_registered() -> anyhow::Result<()> {
+        let probe = Arc::new(HttpServiceProbe::new());
+        let rt = tokio::runtime::Handle::current();
+        let ended = RunGuards::new();
+        drop(sandy_environment::guarded(NullBackend, &ended));
+        assert!(
+            !spawn_bridge(&rt, &probe, &ended, "env-7", Ok(FakeRelay)).await?,
+            "a closed run must not register"
+        );
+        assert!(matches!(
+            probe_off_runtime(&probe, "env-7").await?,
+            Probe::Starting { .. }
+        ));
+        // The same call on a run that is up registers, so the assertion above is not a no-op.
+        let up = RunGuards::new();
+        assert!(spawn_bridge(&rt, &probe, &up, "env-8", Ok(FakeRelay)).await?);
+        assert!(matches!(until_ready(&probe, "env-8").await?, Probe::Ready { .. }));
+        Ok(())
+    }
+
+    /// The agent link coming up after the run ended starts nothing that stays.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_link_that_comes_up_after_the_run_ended_leaves_nothing_registered() -> anyhow::Result<()> {
         let probe = Arc::new(HttpServiceProbe::new());
         let guards = RunGuards::new();
-        let dialed = Arc::new(AtomicUsize::new(0));
-        let counter = Arc::clone(&dialed);
         let on_link = bridge_on_link(
             tokio::runtime::Handle::current(),
             Arc::clone(&probe),
             guards.clone(),
-            "env-7".to_owned(),
-            move || {
-                counter.fetch_add(1, Ordering::SeqCst);
-                Ok(FakeRelay)
-            },
+            "env-9".to_owned(),
+            || Ok(FakeRelay),
         );
         drop(sandy_environment::guarded(NullBackend, &guards));
         let (host, _guest) = std::os::unix::net::UnixStream::pair().context("socket pair")?;
-        on_link("env-7", host.into(), AgentReport::channel().0);
+        on_link("env-9", host.into(), AgentReport::channel().0);
         tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(matches!(
+            probe_off_runtime(&probe, "env-9").await?,
+            Probe::Starting { .. }
+        ));
+        Ok(())
+    }
+
+    fn vm_settings() -> crate::environment_backend::VmSettings {
+        crate::environment_backend::VmSettings {
+            command: vec!["t3".to_owned()],
+            service_env: "{}".to_owned(),
+            boot_timeout_secs: 5,
+        }
+    }
+
+    /// The orphan sweep runs once when the backend is composed, before any launch, and the per-environment factory
+    /// never runs it.
+    #[test]
+    fn the_orphan_sweep_runs_once_at_construction_and_not_per_launch() {
+        let (swept, built) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (s, b) = (Arc::clone(&swept), Arc::clone(&built));
+        let backend = assemble(
+            &vm_settings(),
+            Arc::new(HttpServiceProbe::new()),
+            move || {
+                assert_eq!(
+                    b.load(Ordering::SeqCst),
+                    0,
+                    "the sweep must run before any backend is built"
+                );
+                s.fetch_add(1, Ordering::SeqCst);
+            },
+            move |_, _| {
+                built.fetch_add(1, Ordering::SeqCst);
+                Err(sandy_api::backend::BackendError::Spawn("unused".to_owned()))
+            },
+        );
+        assert_eq!(swept.load(Ordering::SeqCst), 1);
+        drop(backend);
         assert_eq!(
-            dialed.load(Ordering::SeqCst),
+            swept.load(Ordering::SeqCst),
             1,
-            "the link must have started the bridge"
+            "dropping or using it must not sweep again"
         );
-        assert!(
-            matches!(probe_off_runtime(&probe, "env-7").await?, Probe::Starting { .. }),
-            "a late link's registration must be dropped"
+    }
+
+    fn executable(dir: &Path, name: &str, mode: u32) -> anyhow::Result<PathBuf> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join(name);
+        std::fs::write(&path, b"#!/bin/sh\n").context("write")?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).context("chmod")?;
+        Ok(path)
+    }
+
+    /// A vfkit binary the daemon cannot use stops it at start-up, whatever form the setting has.
+    #[test]
+    fn an_unusable_vfkit_binary_setting_is_refused_at_startup() -> anyhow::Result<()> {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
+        let dir = tempfile::tempdir().context("tempdir")?;
+        let path = Some(OsString::from(dir.path()));
+        let os = |s: &str| Some(OsString::from(s));
+        assert_eq!(
+            resolve_vfkit_bin(Some(OsString::from_vec(b"vf\xffkit".to_vec())), path.clone()),
+            Err(VfkitSetupError::BinNotUtf8)
         );
+        for blank in ["", "  "] {
+            assert_eq!(
+                resolve_vfkit_bin(os(blank), path.clone()),
+                Err(VfkitSetupError::BinEmpty)
+            );
+        }
+        assert!(matches!(
+            resolve_vfkit_bin(os("/nonexistent/vfkit"), path.clone()),
+            Err(VfkitSetupError::BinNotFound(..))
+        ));
+        assert!(matches!(
+            resolve_vfkit_bin(None, path.clone()),
+            Err(VfkitSetupError::BinNotFound(_, " on PATH"))
+        ));
+        // A file without the execute bit is no binary.
+        let plain = executable(dir.path(), "plain", 0o644)?;
+        assert!(matches!(
+            resolve_vfkit_bin(Some(plain.into_os_string()), path.clone()),
+            Err(VfkitSetupError::BinNotFound(..))
+        ));
+        // A bare name resolves on PATH, and an explicit path to an executable is taken as it is.
+        let vfkit = executable(dir.path(), "vfkit", 0o755)?;
+        assert_eq!(resolve_vfkit_bin(None, path.clone())?, vfkit);
+        assert_eq!(resolve_vfkit_bin(Some(vfkit.clone().into_os_string()), None)?, vfkit);
+        Ok(())
+    }
+
+    /// A staging base too deep for a socket path stops the daemon once, not each environment.
+    #[test]
+    fn a_staging_base_too_deep_for_a_socket_fails_the_setup() -> anyhow::Result<()> {
+        use std::ffi::OsString;
+        let dir = tempfile::tempdir().context("tempdir")?;
+        let vfkit = executable(dir.path(), "vfkit", 0o755)?;
+        let bin = Some(vfkit.clone().into_os_string());
+        let ok = check_vfkit_setup(bin.clone(), None, PathBuf::from("/tmp/sandy")).context("short base")?;
+        assert_eq!(
+            ok,
+            VfkitSetup {
+                bin: vfkit,
+                base: PathBuf::from("/tmp/sandy")
+            }
+        );
+        let deep = PathBuf::from(format!("/{}", "d".repeat(MAX_SOCKET_PATH)));
+        assert!(matches!(
+            check_vfkit_setup(bin, Some(OsString::new()), deep),
+            Err(VfkitSetupError::SocketPath(_))
+        ));
+        Ok(())
+    }
+
+    /// A fresh short directory: a unix socket path must fit `sun_path`, which a tempdir under `$TMPDIR` may not.
+    fn short_dir() -> anyhow::Result<PathBuf> {
+        let dir = PathBuf::from(format!("/tmp/sv-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
+        std::fs::create_dir_all(&dir).context("create dir")?;
+        Ok(dir)
+    }
+
+    /// The start-up sweep removes the service sockets nothing answers on, and only those.
+    #[test]
+    fn the_start_up_sweep_removes_only_stale_service_sockets() -> anyhow::Result<()> {
+        use std::os::unix::net::UnixListener;
+        let dir = short_dir()?;
+        let named = |id: &str| service_socket_path(&dir, id).context("path");
+        let stale = named("stale")?;
+        drop(UnixListener::bind(&stale).context("bind stale")?);
+        let live = named("live")?;
+        let _listener = UnixListener::bind(&live).context("bind live")?;
+        // A stale socket that is not ours by name, and a regular file that is, stay.
+        let foreign = dir.join("other.sock");
+        drop(UnixListener::bind(&foreign).context("bind foreign")?);
+        let file = named("file")?;
+        std::fs::write(&file, b"x").context("write")?;
+
+        assert_eq!(sweep_stale_service_sockets(&dir), 1);
+        assert!(!stale.exists(), "a socket nothing answers on is removed");
+        assert!(live.exists(), "a socket that answers is a live VM and stays");
+        assert!(foreign.exists() && file.exists(), "only our own sockets are touched");
+        assert_eq!(sweep_stale_service_sockets(&dir), 0, "a second sweep finds nothing");
+        assert_eq!(sweep_stale_service_sockets(&dir.join("missing")), 0);
+        std::fs::remove_dir_all(&dir).context("cleanup")?;
+        Ok(())
+    }
+
+    /// The bridge dials the socket the backend is told to bind, and a path too long for a socket is the typed error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_bridge_dials_the_socket_the_backend_binds() -> anyhow::Result<()> {
+        let rt = tokio::runtime::Handle::current();
+        let probe = Arc::new(HttpServiceProbe::new());
+        let dialed = Arc::new(std::sync::Mutex::new(Vec::<PathBuf>::new()));
+        let record = Arc::clone(&dialed);
+        let wiring = vfkit_wiring(
+            rt.clone(),
+            Arc::clone(&probe),
+            RunGuards::new(),
+            Path::new("/tmp/sandy"),
+            "env-10",
+            move |path| {
+                record
+                    .lock()
+                    .map_err(|_| io::Error::other("poisoned"))?
+                    .push(path.to_path_buf());
+                Ok(FakeRelay)
+            },
+        )
+        .context("short base")?;
+        assert_eq!(
+            Some(wiring.socket.as_path()),
+            service_socket_path(Path::new("/tmp/sandy"), "env-10").ok().as_deref()
+        );
+        let (host, _guest) = std::os::unix::net::UnixStream::pair().context("socket pair")?;
+        (wiring.on_link)("env-10", host.into(), AgentReport::channel().0);
+        let _ = until_ready(&probe, "env-10").await?;
+        let seen = dialed.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.clone();
+        assert_eq!(seen, [wiring.socket], "the dialer must get the path the backend binds");
+
+        let deep = PathBuf::from(format!("/{}", "d".repeat(MAX_SOCKET_PATH)));
+        let long = vfkit_wiring(rt, probe, RunGuards::new(), &deep, "env-11", |_| Ok(FakeRelay));
+        assert!(matches!(long, Err(SocketPathTooLong { .. })));
         Ok(())
     }
 

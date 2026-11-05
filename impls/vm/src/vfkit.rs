@@ -430,7 +430,9 @@ impl VfkitBackend {
 ///
 /// The path must fit `sun_path` and hold no comma (vfkit splits its option string on commas). vfkit is SIGKILLed at
 /// teardown and cannot unlink its own socket, so a socket left by an earlier run would make the next bind fail: that
-/// one file type is removed. Anything else at the path (a file, directory or symlink) is refused, never deleted.
+/// one file type is removed, but only when nothing answers on it. A socket that answers belongs to a live VM (such as
+/// an orphan of a killed host) and is refused, so a second VM never replaces it. Anything else at the path (a file,
+/// directory or symlink) is refused, never deleted.
 fn prepare_service_socket(socket: &Path) -> Result<PathBuf, BackendError> {
     use std::os::unix::fs::FileTypeExt as _;
 
@@ -452,8 +454,27 @@ fn prepare_service_socket(socket: &Path) -> Result<PathBuf, BackendError> {
         )));
     }
     match std::fs::symlink_metadata(socket) {
-        Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(socket)
-            .map_err(|err| BackendError::Spawn(format!("clear the stale service socket {shown}: {err}")))?,
+        Ok(meta) if meta.file_type().is_socket() => {
+            match std::os::unix::net::UnixStream::connect(socket) {
+                Ok(_) => {
+                    return Err(BackendError::Spawn(format!(
+                        "the service socket {shown} answers: a VM of this environment is still running"
+                    )));
+                }
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                    ) => {}
+                Err(err) => {
+                    return Err(BackendError::Spawn(format!(
+                        "could not tell whether the service socket {shown} is stale: {err}"
+                    )));
+                }
+            }
+            std::fs::remove_file(socket)
+                .map_err(|err| BackendError::Spawn(format!("clear the stale service socket {shown}: {err}")))?;
+        }
         Ok(_) => {
             return Err(BackendError::Spawn(format!(
                 "the service socket path {shown} holds something that is not a socket; refusing to remove it"
@@ -1316,6 +1337,30 @@ mod tests {
         std::os::unix::fs::symlink(&live, &to_live).context("symlink to socket")?;
         refused(&to_live, "not a socket");
         assert!(live.exists() && to_live.symlink_metadata().is_ok());
+        std::fs::remove_dir_all(&dir).context("cleanup")?;
+        Ok(())
+    }
+
+    /// A socket that answers belongs to a live VM (an orphan of a killed host, or another run): it is refused and
+    /// kept, never unlinked from under the VM.
+    #[test]
+    fn a_service_socket_that_answers_is_refused_and_kept() -> anyhow::Result<()> {
+        use std::os::unix::net::UnixListener;
+
+        let dir = PathBuf::from(format!("/tmp/sv-{}", &Uuid::new_v4().simple().to_string()[..8]));
+        std::fs::create_dir_all(&dir).context("create dir")?;
+        let socket = dir.join("live.sock");
+        let listener = UnixListener::bind(&socket).context("bind live socket")?;
+        let got = prepare_service_socket(&socket);
+        assert!(
+            matches!(&got, Err(BackendError::Spawn(m)) if m.contains("answers") && m.contains("live.sock")),
+            "{got:?}"
+        );
+        assert!(socket.exists(), "a live socket must not be unlinked");
+        // Once nothing listens, the same path is stale and is cleared.
+        drop(listener);
+        assert_eq!(prepare_service_socket(&socket)?, socket);
+        assert!(!socket.exists());
         std::fs::remove_dir_all(&dir).context("cleanup")?;
         Ok(())
     }

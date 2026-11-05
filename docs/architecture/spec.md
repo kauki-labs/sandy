@@ -632,7 +632,7 @@ owner.
 - The VM backend (decision 31) holds one agent-mode `VmBackend::run` per environment. `SANDY_ENV_BACKEND=vm-qemu` (decision 32, Linux only) wires it into `sandyd` with an agent-link relay and a loopback bridge that makes the environment Ready. A Ready VM environment cannot be linked yet: pairing in VM mode has no owner (#590).
 - `SANDY_ENV_BACKEND=vm-vfkit` (decision 33, macOS only) composes the same backend over `VfkitBackend::with_service_socket`: one hashed socket path per environment under the private staging base, and the bridge starts when the agent link comes up. `vm-qemu` sweeps orphaned VMs once at construction.
 
-**KPI:** rows KENV1 to KENV20 in [`kpi.md`](kpi.md).
+**KPI:** rows KENV1 to KENV22 in [`kpi.md`](kpi.md).
 
 ## Testing: integration vs end-to-end
 

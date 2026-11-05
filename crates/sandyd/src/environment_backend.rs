@@ -41,7 +41,7 @@ pub const VM_QEMU: &str = "vm-qemu";
 /// The vfkit microVM backend, macOS only.
 pub const VM_VFKIT: &str = "vm-vfkit";
 
-/// Seconds added to the boot budget for the `vm-qemu` provision timeout when none is set: the guest probe and the
+/// Seconds added to the boot budget for a VM backend's provision timeout when none is set: the guest probe and the
 /// host bridge need time after the guest has booted.
 const VM_PROVISION_MARGIN_SECS: u64 = 300;
 
@@ -635,7 +635,7 @@ mod tests {
     }
 
     #[test]
-    fn vm_qemu_on_macos_is_still_refused() {
+    fn vm_vfkit_leaves_vm_qemu_on_macos_refused() {
         assert_eq!(
             parse_on("macos", &vm_base()).err(),
             Some(EnvironmentBackendConfigError::UnsupportedPlatform {

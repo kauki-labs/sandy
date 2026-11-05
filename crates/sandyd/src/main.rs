@@ -972,10 +972,13 @@ fn vm_environment_backend(
 fn vfkit_environment_backend(
     vm: &environment_backend::VmSettings,
 ) -> Arc<dyn sandy_api::environment::EnvironmentBackend + Send + Sync> {
-    Arc::new(sandyd::environment_vm::vfkit_backend(
-        vm,
-        tokio::runtime::Handle::current(),
-    ))
+    match sandyd::environment_vm::vfkit_backend(vm, tokio::runtime::Handle::current()) {
+        Ok(backend) => Arc::new(backend),
+        Err(e) => {
+            tracing::error!(error = %e, "could not start the vfkit environment backend");
+            std::process::exit(1);
+        }
+    }
 }
 
 #[cfg(not(target_os = "macos"))]

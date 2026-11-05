@@ -201,9 +201,9 @@ to 4096 bytes in the agent and again in the relay.
 
 ## 6. A killed host process leaves a record, and the next start sweeps it (#666)
 
-**Status:** accepted for qemu on Linux (epic #597). Not yet called by a shipped binary: `sandyd` and `sandy run` have to
-call `QemuBackend::sweep_orphans()` once at start-up, and until they do only the live gate and the
-`sweep_orphans` example run it. The vfkit backend follows.
+**Status:** accepted for qemu on Linux (epic #597). `sandyd` calls `QemuBackend::sweep_orphans()` once when it builds
+the `vm-qemu` environment backend (decision 32 of `sandyd.md`). `sandy run` is wired separately (#668). The live gate and
+the `sweep_orphans` example also run it. The vfkit backend follows.
 
 **Context.** A VM backend keeps its running boxes in memory. A `SIGKILL` of the host process (the `sandyd` daemon or
 a `sandy run`) leaves qemu, its virtiofsd daemons and its egress proxy running with ppid 1, still holding the guest
