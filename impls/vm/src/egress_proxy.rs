@@ -114,7 +114,17 @@ impl<'a> EgressLaunch<'a> {
     /// # Errors
     /// [`BackendError::Spawn`] (band 3) when the proxy does not reach `READY`.
     pub(crate) fn start(&self) -> Result<ProxyHandle, BackendError> {
-        ProxyHandle::start(self)
+        self.start_recorded(&mut |_| {})
+    }
+
+    /// [`start`](Self::start), reporting the proxy's pid to `on_spawn` as soon as it spawns, before the wait for
+    /// `READY`. A box record that is written only after the wait would miss the proxy when the host is killed during
+    /// it (#666).
+    ///
+    /// # Errors
+    /// As [`start`](Self::start).
+    pub(crate) fn start_recorded(&self, on_spawn: &mut dyn FnMut(u32)) -> Result<ProxyHandle, BackendError> {
+        ProxyHandle::start(self, on_spawn)
     }
 }
 
@@ -134,6 +144,12 @@ enum StartFailure {
 }
 
 impl ProxyHandle {
+    /// The proxy's process id.
+    #[cfg(test)]
+    pub(crate) fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// The vsock port the guest relay dials: the random host port (qemu) or [`EGRESS_VSOCK_PORT`] (vfkit).
     pub(crate) fn port(&self) -> u32 {
         self.port
@@ -154,7 +170,7 @@ impl ProxyHandle {
         let _ = self.child.wait();
     }
 
-    fn start(launch: &EgressLaunch<'_>) -> Result<Self, BackendError> {
+    fn start(launch: &EgressLaunch<'_>, on_spawn: &mut dyn FnMut(u32)) -> Result<Self, BackendError> {
         let policy = serde_json::to_vec(launch.policy)
             .map_err(|err| BackendError::Spawn(format!("egress proxy did not start: encode policy: {err}")))?;
         let cid = match &launch.listen {
@@ -162,7 +178,7 @@ impl ProxyHandle {
             // A bind failure on the unix socket is not a port clash: no retry.
             ProxyListen::Unix { socket } => {
                 let args = ["--unix".to_owned(), socket.to_string_lossy().into_owned()];
-                return match start_once(launch, &args, EGRESS_VSOCK_PORT, &policy) {
+                return match start_once(launch, &args, EGRESS_VSOCK_PORT, &policy, on_spawn) {
                     Ok(handle) => Ok(handle),
                     Err(StartFailure::AddrInUse(why) | StartFailure::Other(why)) => {
                         Err(BackendError::Spawn(format!("egress proxy did not start: {why}")))
@@ -179,7 +195,7 @@ impl ProxyHandle {
                 "--peer-cid".to_owned(),
                 cid.to_string(),
             ];
-            match start_once(launch, &args, port, &policy) {
+            match start_once(launch, &args, port, &policy, on_spawn) {
                 Ok(handle) => return Ok(handle),
                 Err(StartFailure::AddrInUse(why)) => {
                     tracing::debug!(attempt, port, "egress proxy port in use; retrying");
@@ -248,6 +264,7 @@ fn start_once(
     args: &[String],
     port: u32,
     policy: &[u8],
+    on_spawn: &mut dyn FnMut(u32),
 ) -> Result<ProxyHandle, StartFailure> {
     let mut command = Command::new(&launch.bin);
     // Sanitized environment: PATH only, never the forge token or any other secret.
@@ -262,6 +279,8 @@ fn start_once(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|err| StartFailure::Other(format!("spawn `{}`: {err}", launch.bin.display())))?;
+    // Reported before the wait for READY below: a kill during it must still leave a record of the proxy.
+    on_spawn(child.id());
     let mut handle = ProxyHandle { child, port };
 
     // The policy goes on stdin, then stdin closes (the thread owns it and drops it): the proxy waits
@@ -397,6 +416,37 @@ pub(crate) mod tests {
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).context("write stub")?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).context("chmod stub")?;
         Ok(path)
+    }
+
+    /// #666: the proxy's pid is reported as soon as it spawns, before the wait for `READY`, so a kill during that wait
+    /// still leaves a record of it. The stub marks the moment it is about to print `READY`.
+    #[test]
+    fn the_proxy_is_reported_when_it_spawns_before_it_is_ready() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let about_to_be_ready = dir.path().join("about-to-be-ready");
+        let bin = stub(
+            dir.path(),
+            "proxy",
+            &format!(
+                "cat >/dev/null; sleep 0.4; : > {}; echo READY; exec sleep 30",
+                about_to_be_ready.display()
+            ),
+        )?;
+        let allow = policy();
+        let launch = launch(&allow, bin, PROXY_STARTS);
+        let mut reported = Vec::new();
+        let mut ready_was_near = true;
+
+        let handle = launch
+            .start_recorded(&mut |pid| {
+                reported.push(pid);
+                ready_was_near = about_to_be_ready.exists();
+            })
+            .context("start")?;
+
+        assert_eq!(reported, vec![handle.pid()], "one report, with the proxy's pid");
+        assert!(!ready_was_near, "the report came before the proxy was ready");
+        Ok(())
     }
 
     fn policy() -> AllowList {
