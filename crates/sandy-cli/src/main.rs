@@ -1501,6 +1501,10 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
                 digests,
                 command,
             };
+            // Stop the VMs a killed `sandy` or `sandyd` left behind before this run boots another (#666). It touches
+            // only a box whose owner is verifiably gone, so a daemon or a CLI run that is alive is never hit. Here and
+            // not in `host_backend()`, which read-only commands (`ls`, `status`) share. A no-op off Linux.
+            let _ = sandy_backend::QemuBackend::sweep_orphans();
             // The composition root: select the run profile here and inject it. Today
             // only the host profile exists; a different profile (all-local) is a swap
             // at this one call site, not a change to dispatch_run.
