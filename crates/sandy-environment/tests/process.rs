@@ -2,6 +2,7 @@
 //! processes (`fake-t3`, a stand-in for `t3 serve` and `t3 pair`).
 
 use std::{
+    io::Write,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -552,7 +553,8 @@ fn a_client_connected_to_the_service_makes_the_environment_active_until_it_disco
         bail!("not ready")
     };
     assert!(!b.active("env-1")?, "no client is connected yet");
-    let client = std::net::TcpStream::connect((endpoint.host.as_str(), endpoint.port))?;
+    let mut client = std::net::TcpStream::connect((endpoint.host.as_str(), endpoint.port))?;
+    client.write_all(b"HOLD")?;
     let deadline = Instant::now() + Duration::from_secs(5);
     while !b.active("env-1")? {
         assert!(

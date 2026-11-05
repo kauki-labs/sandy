@@ -39,6 +39,8 @@ use sandy_api::{
 };
 use sandy_fsutil::OwnedDir;
 
+use crate::connections;
+
 /// The longest environment id accepted.
 const MAX_ID: usize = 64;
 
@@ -461,6 +463,17 @@ impl EnvironmentBackend for ProcessEnvironmentBackend {
                 })
             }
         }
+    }
+
+    fn active(&self, environment_id: &str) -> Result<bool, BackendError> {
+        let port = match self.lock().get(environment_id) {
+            Some(r) => r.port,
+            None => return Ok(false),
+        };
+        // The lock is released: reading the socket table can be slow and must not stall a probe.
+        connections::established_to(port)
+            .map(|n| n > 0)
+            .map_err(BackendError::Transport)
     }
 
     fn kill(&self, environment_id: &str) -> Result<(), BackendError> {

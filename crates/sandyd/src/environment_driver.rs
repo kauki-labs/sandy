@@ -306,6 +306,17 @@ impl EnvironmentDriver {
         let Some(limit) = self.config.idle_timeout else {
             return Ok(());
         };
+        // A client connected straight to the service is invisible to the RPC surface.
+        match self.backend.active(&row.environment_id) {
+            Ok(true) => {
+                if let Err(e) = self.store.touch(&row.environment_id, now) {
+                    tracing::warn!(environment = %row.environment_id, error = %e, "could not renew an idle-stop lease");
+                }
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(e) => tracing::warn!(environment = %row.environment_id, error = %e, "activity check could not run"),
+        }
         // Conditional in the store: `row` is a snapshot, and a renewal that landed after
         // it (the probe can be slow) must win.
         if self.store.stop_if_idle(

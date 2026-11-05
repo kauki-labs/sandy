@@ -36,14 +36,30 @@ pub(crate) fn established_to(port: u16) -> Result<usize, String> {
 
 /// Counts `ESTABLISHED` rows (state `01`) of a `/proc/net/tcp{,6}` table with local port `port`.
 fn count_proc_net_tcp(text: &str, port: u16) -> usize {
-    let _ = (text, port);
-    0
+    text.lines()
+        .skip(1)
+        .filter(|line| {
+            let mut cols = line.split_whitespace();
+            let (Some(local), Some(state)) = (cols.nth(1), cols.nth(1)) else {
+                return false;
+            };
+            let local_port = local.rsplit_once(':').map(|(_, p)| p);
+            state == "01" && local_port.and_then(|p| u16::from_str_radix(p, 16).ok()) == Some(port)
+        })
+        .count()
 }
 
 /// Counts `ESTABLISHED` rows of BSD `netstat -an` output with local port `port`.
 fn count_netstat(text: &str, port: u16) -> usize {
-    let _ = (text, port);
-    0
+    let suffix = format!(".{port}");
+    text.lines()
+        .filter(|line| line.starts_with("tcp") && line.trim_end().ends_with("ESTABLISHED"))
+        .filter(|line| {
+            line.split_whitespace()
+                .nth(3)
+                .is_some_and(|local| local.ends_with(&suffix))
+        })
+        .count()
 }
 
 #[cfg(test)]
