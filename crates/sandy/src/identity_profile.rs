@@ -274,6 +274,21 @@ fn name_ok(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
+/// Unicode direction marks and overrides: invisible, and they reorder text.
+fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
+/// The name of the trust root a profile mints from. It must be a name registration accepts
+/// ([`validate_trust_root_name`](crate::trust_root::validate_trust_root_name): a single file name), or an operator
+/// could not use a root the registration commands created. On top of that: bounded, and no control or bidi character,
+/// so the name is safe wherever it is later shown.
+fn credential_ok(s: &str) -> bool {
+    s.len() <= MAX_NAME
+        && !s.chars().any(|c| c.is_control() || is_bidi_control(c))
+        && crate::trust_root::validate_trust_root_name(s).is_ok()
+}
+
 /// A repository or project path as a provider names it: `owner/repo`, or nested groups. ASCII only, so a visible
 /// path is the path that is allowed, and no `.` or `..` segment.
 fn target_ok(s: &str) -> bool {
@@ -331,10 +346,13 @@ fn parse_entry(index: usize, entry: &Value) -> Result<IdentityProfile, IdentityP
         return Err(invalid(&at, "name must not look like a credential"));
     }
     let credential = fields.get("credential").and_then(Value::as_str).unwrap_or_default();
-    if !name_ok(credential) || looks_like_secret(credential) {
+    if !credential_ok(credential) || looks_like_secret(credential) {
         return Err(invalid(
             &at,
-            format!("credential must name a trust root: 1 to {MAX_NAME} letters, digits, '-', '_' or '.'"),
+            format!(
+                "credential must name a registered trust root: a single file name of at most {MAX_NAME} bytes, with \
+                 no '/', no control character, and not '.' or '..'"
+            ),
         ));
     }
 

@@ -40,7 +40,10 @@ The operator writes the registry. It is a JSON file read at daemon start. It hol
   more hex digits; see the limit below). This is sandyd's rule for the request's `profile`
   field, plus the leading character, so a registry name always passes the request check. Names that differ only in
   ASCII case are one name when the registry loads, but `resolve` compares the exact name, as sandyd does.
-- `credential` is a name of the same character set and the same length bound. It does not look like a credential.
+- `credential` is the name of a registered trust root: any single file name that trust-root registration accepts (not
+  empty, not `.` or `..`, no `/` or NUL), up to 64 bytes, with no control or bidi character. It does not look like a
+  credential. It is looser than a profile name on purpose: a profile must be able to name every root registration
+  creates, such as `_github-main`.
 - `targets` has 1 to 256 entries. Each entry is an `owner/repo` path (nested groups allowed) of ASCII letters, digits,
   `-`, `_`, `.` and `/`, up to 256 bytes, with no empty segment and no `.` or `..` segment. A URL, a leading `/`, a
   bare name and any non-ASCII character are refused, so the visible path is the path that is allowed. A repeated
@@ -65,8 +68,8 @@ The operator writes the registry. It is a JSON file read at daemon start. It hol
 - An unknown field is an error. A key named `token`, `secret` or `password` therefore fails the parse. The error
   says a field is unknown and lists the allowed fields. It never shows the key, because a pasted secret can sit
   where a key belongs in a shape no prefix list knows.
-- An empty list, a malformed name or a malformed entry is an error that gives the entry's position and the rule it
-  broke. A duplicate profile name is an error that gives both positions. No error shows a name.
+- An empty `targets` or `capabilities` list, a malformed name or a malformed entry is an error that gives the entry's
+  position and the rule it broke. A duplicate profile name is an error that gives both positions. No error shows a name.
 - A repeated key is a `Malformed` error with the line and column.
 - `resolve` of an unknown name returns `Unknown`. The error shows neither the asked name nor the known names.
 - No error text contains any string taken from the file or from the caller. The only text is a fixed message with

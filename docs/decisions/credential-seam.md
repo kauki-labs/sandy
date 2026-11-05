@@ -313,7 +313,9 @@ about guarding the one remaining write against _another_ writer's result.
 ## 8. A profile names an identity; the registry holds names only (#592)
 
 **Status:** accepted for slice 1 (the registry). Re-injection, renewal and revoke per environment are later slices.
-**Upholds:** INV-1.
+**Upholds:** INV-1 for the registry and the request, which hold no secret value. The values that a `service_secrets` name
+selects still reach the guest's environment, the interim exception that decision 2 states; the profile only narrows
+which names get there.
 
 An environment request names an identity profile and never carries a secret. The operator keeps a registry of
 profiles. A profile holds the name of a registered trust root, the credential `Scope` (the repository allow-list and
