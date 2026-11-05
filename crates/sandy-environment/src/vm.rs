@@ -49,6 +49,17 @@ pub trait ServiceProbe: Send + Sync {
     fn probe(&self, environment_id: &str) -> Result<Probe, BackendError>;
 }
 
+/// Asks a running guest to stop its job gracefully (#670): the agent interrupts it, gives it the grace, then ends
+/// it. Implemented by whoever holds the environment's agent link and can post the stop on its channel.
+pub trait StopRequest: Send + Sync {
+    /// Ask environment `environment_id`'s guest to stop, with `grace` for the job to exit on its own. Returns once
+    /// the request is sent, not once the guest has stopped.
+    ///
+    /// # Errors
+    /// [`BackendError::Transport`] if the request could not be sent; `kill` then cancels the run at once.
+    fn request_stop(&self, environment_id: &str, grace: Duration) -> Result<(), BackendError>;
+}
+
 /// What the held run is told about every environment.
 #[derive(Debug, Clone)]
 pub struct VmEnvironmentConfig {
@@ -100,6 +111,8 @@ pub struct VmEnvironmentBackend {
     factory: BackendFactory,
     config: VmEnvironmentConfig,
     service: Option<Arc<dyn ServiceProbe>>,
+    /// Asked to stop the guest before `kill` cancels the run, with the grace it gets (#670).
+    graceful_stop: Option<(Arc<dyn StopRequest>, Duration)>,
     kill_wait: Duration,
     next_generation: AtomicU64,
     held: Mutex<BTreeMap<String, Held>>,
@@ -113,6 +126,7 @@ impl VmEnvironmentBackend {
             factory,
             config,
             service: None,
+            graceful_stop: None,
             kill_wait: KILL_WAIT,
             next_generation: AtomicU64::new(0),
             held: Mutex::new(BTreeMap::new()),
@@ -126,11 +140,32 @@ impl VmEnvironmentBackend {
         self
     }
 
+    /// Have `kill` ask the guest to stop through `stop` and wait up to `grace` for the run to return before it
+    /// cancels (#670). Without this, `kill` cancels at once: the guest never gets to run its teardown.
+    #[must_use]
+    pub fn with_graceful_stop(mut self, stop: Arc<dyn StopRequest>, grace: Duration) -> Self {
+        self.graceful_stop = Some((stop, grace));
+        self
+    }
+
     /// How long `kill` and drop wait for a cancelled run to return.
     #[must_use]
     pub fn with_kill_wait(mut self, wait: Duration) -> Self {
         self.kill_wait = wait;
         self
+    }
+
+    /// Ask the guest to stop and give the run up to `grace` to return on its own. A request that cannot be sent
+    /// ends the wait at once: nothing is going to stop the guest.
+    fn stop_gracefully(&self, stop: &dyn StopRequest, environment_id: &str, grace: Duration, done: &AtomicBool) {
+        if let Err(e) = stop.request_stop(environment_id, grace) {
+            tracing::warn!(environment = %environment_id, error = %e, "asking the guest to stop failed; cancelling the run");
+            return;
+        }
+        let start = Instant::now();
+        while !done.load(Ordering::SeqCst) && start.elapsed() < grace {
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, BTreeMap<String, Held>> {
@@ -260,6 +295,9 @@ impl EnvironmentBackend for VmEnvironmentBackend {
             h.killing = true;
             (h.control.clone(), Arc::clone(&h.done), h.generation, h.thread.take())
         };
+        if let Some((stop, grace)) = &self.graceful_stop {
+            self.stop_gracefully(stop.as_ref(), environment_id, *grace, &done);
+        }
         control.cancel();
         let start = Instant::now();
         while !done.load(Ordering::SeqCst) {

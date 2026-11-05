@@ -14,4 +14,4 @@ mod vm;
 
 pub use lifecycle::{GuardedBackend, RunGuard, RunGuards, guarded};
 pub use process::{ProcessConfig, ProcessConfigError, ProcessEnvironmentBackend};
-pub use vm::{BackendFactory, HeldBackend, ServiceProbe, VmEnvironmentBackend, VmEnvironmentConfig};
+pub use vm::{BackendFactory, HeldBackend, ServiceProbe, StopRequest, VmEnvironmentBackend, VmEnvironmentConfig};

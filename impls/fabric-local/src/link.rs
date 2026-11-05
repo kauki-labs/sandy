@@ -31,8 +31,8 @@ use tokio::{
 
 use crate::{
     agent::{
-        ARCHIVE_TRANSCRIPT, AbortOnDrop, RESIZE_CONTROL, SERVICE_PROBE_FAILED, SERVICE_READY, TTY_STDERR, TTY_STDIN,
-        TTY_STDOUT, cut_probe_output, decode_resize, sanitize_probe_output,
+        ARCHIVE_TRANSCRIPT, AbortOnDrop, RESIZE_CONTROL, SERVICE_PROBE_FAILED, SERVICE_READY, STOP_CONTROL, TTY_STDERR,
+        TTY_STDIN, TTY_STDOUT, cut_probe_output, decode_resize, decode_stop, sanitize_probe_output,
     },
     channel::{Channel, ChannelError, MembershipId},
 };
@@ -148,6 +148,12 @@ pub enum LinkFrame {
         /// The last attempt's output or connect error.
         output: String,
     },
+    /// Relay to agent (#670): stop the job gracefully. The agent interrupts it, waits up to `grace_secs` for it to
+    /// exit on its own, then ends it. Carried as its own frame like `Resize`: a control signal, never job input.
+    Stop {
+        /// How long the job gets to exit after the interrupt, in seconds.
+        grace_secs: u32,
+    },
 }
 
 impl LinkFrame {
@@ -166,6 +172,7 @@ impl LinkFrame {
             Self::Archive { .. } => "archive",
             Self::Ready => "ready",
             Self::ProbeFailed { .. } => "probe_failed",
+            Self::Stop { .. } => "stop",
         }
     }
 }
@@ -195,6 +202,7 @@ impl std::fmt::Debug for LinkFrame {
             Self::Resize { cols, rows } => write!(f, "LinkFrame::Resize({cols}x{rows})"),
             Self::Ready => write!(f, "LinkFrame::Ready"),
             Self::ProbeFailed { output } => write!(f, "LinkFrame::ProbeFailed({} bytes)", output.len()),
+            Self::Stop { grace_secs } => write!(f, "LinkFrame::Stop({grace_secs}s)"),
         }
     }
 }
@@ -555,6 +563,13 @@ where
                         continue;
                     };
                     LinkFrame::Resize { cols, rows }
+                } else if matches!(env.message_type, Some(MessageType::Control(_))) && env.content_type == STOP_CONTROL
+                {
+                    let Some(grace_secs) = decode_stop(&env.payload) else {
+                        tracing::warn!("agent relay: malformed stop payload; dropped");
+                        continue;
+                    };
+                    LinkFrame::Stop { grace_secs }
                 } else {
                     continue;
                 };
@@ -957,6 +972,40 @@ mod tests {
             .context("timed out waiting for the resize")?
             .context("the resize channel closed")?;
         assert_eq!((cols, rows), (100, 30));
+
+        drop(agent);
+        timeout(WAIT, relay).await???;
+        Ok(())
+    }
+
+    /// #670: a stop posted on the orchestrator channel reaches the agent as a `LinkFrame::Stop` with its grace, and
+    /// a payload that is not 4 bytes is dropped without ending the link.
+    #[tokio::test]
+    async fn a_channel_stop_reaches_the_agent_as_a_stop_request() -> anyhow::Result<()> {
+        use crate::agent::{STOP_CONTROL, encode_stop};
+
+        let (channel, agent_cap, orchestrator_cap) = channel_and_caps().await?;
+        let orchestrator = channel.join(&orchestrator_cap)?;
+        let (agent_end, host_end) = tokio::io::duplex(64 * 1024);
+        let relay = tokio::spawn({
+            let channel = Arc::clone(&channel);
+            async move { serve_agent_link(channel, &agent_cap, host_end).await }
+        });
+        let agent = timeout(WAIT, LinkAgent::bootstrap(agent_end)).await??;
+        let mut stops = agent.take_stops().context("stops taken once")?;
+
+        let control = || Some(MessageType::Control(sandy_proto::Control {}));
+        channel
+            .post(&orchestrator, control(), STOP_CONTROL, vec![1, 2, 3])
+            .await?;
+        channel
+            .post(&orchestrator, control(), STOP_CONTROL, encode_stop(7))
+            .await?;
+        let grace = timeout(WAIT, stops.recv())
+            .await
+            .context("timed out waiting for the stop")?
+            .context("the stop channel closed")?;
+        assert_eq!(grace, 7, "the malformed request is dropped, the next one arrives");
 
         drop(agent);
         timeout(WAIT, relay).await???;
