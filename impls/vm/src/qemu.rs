@@ -43,10 +43,13 @@ use sandy_api::{
 };
 use uuid::Uuid;
 
+#[cfg(target_os = "linux")]
+use crate::orphans::{Procfs, RecordWriter};
 use crate::{
     agent::agent_outcome,
     console::{Markers, PipeTransport, run_console},
     egress_proxy::{EgressLaunch, ProxyHandle, console_command},
+    orphans::SweepReport,
     share::VirtiofsdTransport,
 };
 
@@ -345,7 +348,70 @@ pub struct QemuBackend {
     agent_used: AtomicBool,
 }
 
+/// The box's record of the processes it started (#666). Best effort: a run must not fail because its record could not
+/// be written, so a failure is logged and the box simply goes unrecorded.
+#[cfg(target_os = "linux")]
+struct BoxRecorder(Option<RecordWriter>);
+
+/// Off Linux there is no process table to read, so nothing is recorded (the vfkit backend follows, #666).
+#[cfg(not(target_os = "linux"))]
+struct BoxRecorder;
+
+impl BoxRecorder {
+    #[cfg(target_os = "linux")]
+    fn open(dir: &Path) -> Self {
+        match RecordWriter::open_or_create(dir, &Procfs, std::process::id()) {
+            Ok(writer) => Self(Some(writer)),
+            Err(err) => {
+                tracing::warn!(%err, "could not write the box record; a killed host would leave this VM behind");
+                Self(None)
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn open(_dir: &Path) -> Self {
+        Self
+    }
+
+    #[cfg(target_os = "linux")]
+    fn add(&mut self, pid: u32) {
+        if let Some(writer) = &mut self.0
+            && let Err(err) = writer.add(&Procfs, pid)
+        {
+            tracing::warn!(pid, %err, "could not record a started process; it would outlive a killed host");
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn add(&mut self, _pid: u32) {}
+}
+
 impl QemuBackend {
+    /// Stop the VMs that a killed host process (`sandyd` or a `sandy run`) left behind, and remove their staging
+    /// directories (#666). Call it once at start-up, before launching. It stops only a process that a box record
+    /// proves is ours, and only for a box whose owner is gone, so a running daemon or CLI is never touched. A
+    /// no-op off Linux.
+    #[must_use]
+    pub fn sweep_orphans() -> SweepReport {
+        #[cfg(target_os = "linux")]
+        match ensure_sandy_staging_base() {
+            Ok(base) => {
+                let report = crate::orphans::sweep_orphans(&base, &Procfs);
+                if report != SweepReport::default() {
+                    tracing::info!(?report, "swept the VMs a killed host left behind");
+                }
+                report
+            }
+            Err(err) => {
+                tracing::warn!(%err, "could not open the staging base to sweep for orphaned VMs");
+                SweepReport::default()
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        SweepReport::default()
+    }
+
     /// A backend with an empty instance registry.
     #[must_use]
     pub fn new() -> Self {
@@ -354,9 +420,14 @@ impl QemuBackend {
 
     /// Tell `hook` the vsock CID a guest holds, once per run, with the run's box id (#587).
     ///
-    /// It fires only after the host has connected to the guest agent. A CID that collided with another VM and was
-    /// retried never reaches it, so a consumer that dials the CID (the service bridge) cannot reach a foreign VM.
-    /// Agent mode only: a run without [`with_agent`](Self::with_agent) never calls it.
+    /// It fires only when the host holds the agent link AND this attempt's own guest has booted. A CID that collided
+    /// with another VM and was retried never reaches it, so a consumer that dials the CID (the service bridge) cannot
+    /// reach a foreign VM. Agent mode only: a run without [`with_agent`](Self::with_agent) never calls it.
+    ///
+    /// The hook runs on the console thread (inside the boot read loop) or the connector thread, so it must hand off
+    /// and not block: a blocked hook stalls the run's deadline, cancel and serial reads, or the agent link. The
+    /// consumer must stop using the CID when [`run`](VmBackend::run) returns: qemu is gone by then, and a later VM
+    /// can take the same CID.
     #[must_use]
     pub fn with_guest_cid_hook(mut self, hook: impl Fn(&str, u32) + Send + Sync + 'static) -> Self {
         self.guest_cid_hook = HookCell(Some(Arc::new(hook)));
@@ -410,7 +481,10 @@ impl QemuBackend {
         // Launch a virtiofsd per share and wait for its socket before qemu starts:
         // qemu connects to each as a client chardev, so the socket must exist first.
         // A launch or socket fault kills any daemon already up and fails the boot.
-        let virtiofsds = VirtiofsdTransport.activate(shares)?;
+        // Record each daemon as it spawns: `activate` waits up to 5 s per daemon for its socket, and a kill during that
+        // wait must still leave a record of it (#666).
+        let mut record = BoxRecorder::open(inst_dir);
+        let virtiofsds = VirtiofsdTransport.activate_recorded(shares, &mut |pid| record.add(pid))?;
         self.launch(spec, args, run_id, inst_dir, agent, egress, virtiofsds)
     }
 
@@ -435,16 +509,23 @@ impl QemuBackend {
     ) -> Result<Outcome, BackendError> {
         let sock = inst_dir.join("serial.sock");
 
+        // Record every process this launch starts, so a restart can stop them if this process is killed (#666).
+        let mut record = BoxRecorder::open(inst_dir);
+        for daemon in &virtiofsds {
+            record.add(daemon.id());
+        }
+
         // The proxy belongs to this attempt. A start failure kills the daemons
         // already up and returns before qemu launches. `ProxyHandle` kills on drop,
         // so every later exit path stops it too.
-        let mut proxy: Option<ProxyHandle> = match egress.map(EgressLaunch::start).transpose() {
-            Ok(proxy) => proxy,
-            Err(err) => {
-                kill_children(&mut virtiofsds);
-                return Err(err);
-            }
-        };
+        let mut proxy: Option<ProxyHandle> =
+            match egress.map(|e| e.start_recorded(&mut |pid| record.add(pid))).transpose() {
+                Ok(proxy) => proxy,
+                Err(err) => {
+                    kill_children(&mut virtiofsds);
+                    return Err(err);
+                }
+            };
 
         // qemu_args emits `-serial chardev:<id>`; bind that id to a Unix-socket
         // chardev qemu creates (server=on, wait=off so the spawn doesn't block).
@@ -469,6 +550,8 @@ impl QemuBackend {
                 return Err(BackendError::Spawn(format!("spawn qemu `{}`: {err}", argv[0])));
             }
         };
+
+        record.add(child.id());
 
         // Drain qemu's stderr on a thread. An un-read `piped` stderr deadlocks the
         // boot: once qemu writes past the pipe buffer it blocks, never opens the
@@ -620,9 +703,9 @@ impl std::fmt::Debug for HookCell {
 /// Fires a [`GuestCidHook`] once, when the host holds the agent link AND this attempt's own guest has booted.
 ///
 /// The link alone proves nothing: on a CID collision the connect reaches the VM that holds the CID, and that VM's agent
-/// may accept it. The boot is the proof: the console's ready marker carries this run's id, which only this attempt's
-/// guest prints, and a qemu that lost the CID never boots. A consumer that dials the CID therefore never reaches a
-/// foreign VM.
+/// may accept it. The boot is the proof: this attempt reads its own serial socket, so the ready marker it sees comes
+/// from the guest it launched, and a qemu that lost the CID never boots. A consumer that dials the CID therefore
+/// never reaches a foreign VM.
 struct CidReport {
     hook: GuestCidHook,
     box_id: String,
@@ -884,6 +967,13 @@ impl VmBackend for QemuBackend {
         let inputs_dir = base.join(format!("{run_id}-inputs"));
         let outputs_dir = base.join(format!("{run_id}-outputs"));
 
+        // Record the owner before anything sensitive exists. Staging writes the secret share into `inst_dir`, so a
+        // kill from here on must leave a record that names this process, or the next sweep never finds the
+        // directory (#666). Each launch attempt below rewrites the record with the processes it starts.
+        sandy_fsutil::OwnedDir::open_or_create(&inst_dir)
+            .map_err(|err| BackendError::Spawn(format!("create instance dir {}: {err}", inst_dir.display())))?;
+        let _owner_record = BoxRecorder::open(&inst_dir);
+
         // Stage the shares via the shared policy (secret/input/output, read-only
         // flags, the #49 secret_dir rule). Each virtiofsd socket lives in inst_dir
         // (sandy-owned, created in `boot`); the read-only flag is enforced at the
@@ -1004,6 +1094,81 @@ mod tests {
         assert!(connect().is_ok());
         assert!(connect().is_ok());
         assert!(seen.lock().expect("seen").is_empty());
+    }
+
+    /// A console that replays `chunks`, then reports it closed; every write is kept.
+    struct ReplayConsole {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+        written: Vec<Vec<u8>>,
+    }
+
+    impl ReplayConsole {
+        fn new(chunks: &[&str]) -> Self {
+            Self {
+                chunks: chunks.iter().map(|c| c.as_bytes().to_vec()).collect(),
+                written: Vec::new(),
+            }
+        }
+    }
+
+    impl sandy_api::console::Transport for ReplayConsole {
+        fn read(&mut self, buf: &mut [u8]) -> Result<sandy_api::console::ReadEvent, BackendError> {
+            let Some(chunk) = self.chunks.pop_front() else {
+                return Ok(sandy_api::console::ReadEvent::Closed);
+            };
+            buf[..chunk.len()].copy_from_slice(&chunk);
+            Ok(sandy_api::console::ReadEvent::Data(chunk.len()))
+        }
+
+        fn write(&mut self, bytes: &[u8]) -> Result<(), BackendError> {
+            self.written.push(bytes.to_vec());
+            Ok(())
+        }
+    }
+
+    /// The wiring, not only the state machine: the console driver writes the command frame once the run's ready marker
+    /// arrives, and that write is what marks the boot.
+    #[test]
+    fn a_console_that_reaches_the_ready_marker_reports_the_cid() -> anyhow::Result<()> {
+        let (report, seen) = counting_report();
+        report.linked();
+        let command = ["true".to_string()];
+        let mut console = BootWatch {
+            inner: ReplayConsole::new(&[&format!("{READY_MARKER}\n")]),
+            report: Some(report),
+        };
+        let outcome = run_console(
+            &mut console,
+            &demo_spec(&command),
+            &Markers::for_run(READY_MARKER, Uuid::new_v4()),
+        );
+        assert!(outcome.booted, "{outcome:?}");
+        assert_eq!(
+            *seen.lock().ok().context("the seen list lock is poisoned")?,
+            vec![("box-1".to_string(), 77)]
+        );
+        Ok(())
+    }
+
+    /// A qemu that lost the CID never prints the ready marker, so its console closes unbooted and nothing is reported
+    /// even though the connect reached another VM.
+    #[test]
+    fn a_console_that_never_boots_does_not_report_the_cid() -> anyhow::Result<()> {
+        let (report, seen) = counting_report();
+        report.linked();
+        let command = ["true".to_string()];
+        let mut console = BootWatch {
+            inner: ReplayConsole::new(&["qemu: unable to set guest cid: in use\n"]),
+            report: Some(report),
+        };
+        let outcome = run_console(
+            &mut console,
+            &demo_spec(&command),
+            &Markers::for_run(READY_MARKER, Uuid::new_v4()),
+        );
+        assert!(!outcome.booted, "{outcome:?}");
+        assert!(seen.lock().ok().context("the seen list lock is poisoned")?.is_empty());
+        Ok(())
     }
 
     #[test]
@@ -1923,6 +2088,97 @@ mod tests {
         assert!(
             captured.bytes().all(|b| b == b'x'),
             "the captured bytes are the stderr flood"
+        );
+        Ok(())
+    }
+
+    /// #666: a launch records its owner and every process it starts, so a restart can find them after a SIGKILL.
+    /// The stub qemu finds its run dir in the chardev argument, waits until the record names it, and keeps a copy.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_launch_records_its_owner_and_every_process_it_starts() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let capture = dir.path().join("record-seen");
+        let script = format!(
+            r#"for a in "$@"; do case "$a" in socket,*path=*) p="${{a#*path=}}"; p="${{p%%,*}}"; d="$(dirname "$p")";; esac; done
+i=0
+while ! grep -q "\"pid\":$$" "$d/box.json" 2>/dev/null; do i=$((i+1)); [ "$i" -gt 100 ] && exit 9; sleep 0.05; done
+cp "$d/box.json" {}
+exec sleep 30"#,
+            capture.display()
+        );
+        let qemu = crate::egress_proxy::tests::stub(dir.path(), "qemu", &script)?;
+        let command = ["true".to_string()];
+        let spec = RunSpec {
+            timeout_secs: 1,
+            ..demo_spec(&command)
+        };
+        let daemon = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .context("spawn stand-in virtiofsd")?;
+        let daemon_pid = daemon.id();
+        let inst = dir.path().join("inst");
+        sandy_fsutil::OwnedDir::open_or_create(&inst).context("inst dir")?;
+        let args = vec![qemu.display().to_string()];
+
+        // The run fails (the stub never opens the serial socket); only the record matters here.
+        let _ = QemuBackend::new().launch(&spec, &args, Uuid::new_v4(), &inst, None, None, vec![daemon]);
+
+        let seen = std::fs::read(&capture).context("the stub qemu never saw its own pid in the record")?;
+        let record: crate::orphans::BoxRecord = serde_json::from_slice(&seen).context("decode the record")?;
+        assert_eq!(
+            record.owner.pid,
+            std::process::id(),
+            "the owner is the launching process"
+        );
+        let pids: Vec<u32> = record.procs.iter().map(|p| p.pid).collect();
+        assert_eq!(pids.len(), 2, "the stand-in virtiofsd and qemu: {pids:?}");
+        assert!(pids.contains(&daemon_pid), "{pids:?} lacks the virtiofsd {daemon_pid}");
+        Ok(())
+    }
+
+    /// #666: with an egress proxy in the launch, the record also names the proxy, or the next sweep would leave it
+    /// running. The stub qemu is recorded last, so it sees the stand-in virtiofsd, the proxy and itself.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_launch_with_an_egress_proxy_records_the_proxy_too() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let capture = dir.path().join("record-seen");
+        let script = format!(
+            r#"for a in "$@"; do case "$a" in socket,*path=*) p="${{a#*path=}}"; p="${{p%%,*}}"; d="$(dirname "$p")";; esac; done
+i=0
+while ! grep -q "\"pid\":$$" "$d/box.json" 2>/dev/null; do i=$((i+1)); [ "$i" -gt 100 ] && exit 9; sleep 0.05; done
+cp "$d/box.json" {}
+exec sleep 30"#,
+            capture.display()
+        );
+        let qemu = crate::egress_proxy::tests::stub(dir.path(), "qemu", &script)?;
+        let proxy_bin =
+            crate::egress_proxy::tests::stub(dir.path(), "proxy", "cat >/dev/null; echo READY; exec sleep 30")?;
+        let allow = allow_all_github();
+        let command = ["true".to_string()];
+        let spec = quick_spec(&command, &allow);
+        let program = PathBuf::from("/nix/store/a-sandy-agent/bin/sandy-agent");
+        let mut egress = EgressLaunch::new(&allow, 77, &program);
+        egress.bin = proxy_bin;
+        let daemon = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .context("spawn stand-in virtiofsd")?;
+        let inst = dir.path().join("inst");
+        sandy_fsutil::OwnedDir::open_or_create(&inst).context("inst dir")?;
+        let args = vec![qemu.display().to_string()];
+
+        let _ = QemuBackend::new().launch(&spec, &args, Uuid::new_v4(), &inst, None, Some(&egress), vec![daemon]);
+
+        let seen = std::fs::read(&capture).context("the stub qemu never saw its own pid in the record")?;
+        let record: crate::orphans::BoxRecord = serde_json::from_slice(&seen).context("decode the record")?;
+        assert_eq!(
+            record.procs.len(),
+            3,
+            "the stand-in virtiofsd, the proxy and qemu: {:?}",
+            record.procs
         );
         Ok(())
     }

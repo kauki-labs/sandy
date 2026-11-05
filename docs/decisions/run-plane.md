@@ -198,3 +198,64 @@ to 4096 bytes in the agent and again in the relay.
 - Not yet done: the restart policy. The agent reports the first exit; a crashed service is not restarted.
 
 **Set aside.** Scraping the console for a ready line: it is not a contract.
+
+## 6. A killed host process leaves a record, and the next start sweeps it (#666)
+
+**Status:** accepted for qemu on Linux (epic #597). Not yet called by a shipped binary: `sandyd` and `sandy run` have to
+call `QemuBackend::sweep_orphans()` once at start-up, and until they do only the live gate and the
+`sweep_orphans` example run it. The vfkit backend follows.
+
+**Context.** A VM backend keeps its running boxes in memory. A `SIGKILL` of the host process (the `sandyd` daemon or
+a `sandy run`) leaves qemu, its virtiofsd daemons and its egress proxy running with ppid 1, still holding the guest
+CID and a staging directory that contains a secret share. A restart starts with an empty registry, so `boxes()` and
+the driver's orphan check cannot see them.
+
+**Decision.** `run` writes `<run dir>/box.json` with the launching process (the owner) before any secret is staged.
+Each process the box starts is added to it, with its pid, start time and executable, in an atomic rewrite, as soon as it
+spawns: the share transport reports each virtiofsd and the proxy start reports the proxy before their waits (a
+virtiofsd socket wait lasts up to 5 s), and `launch` adds qemu. The record also holds the boot id and pid namespace.
+`QemuBackend::sweep_orphans()` reads the records under the staging base at start-up. For each box whose owner is
+gone, it kills every recorded process that is still alive, waits for each to exit, then removes the `-inputs` and
+`-outputs` directories and, last, the run directory with the record.
+
+**Consequences.**
+
+- A process is identified by its pid and its start time. The start time survives an `exec`, and a later process that
+  reuses the pid always started later, so it never matches. The executable is recorded for a human reader and never
+  compared: the live gate showed that nix's qemu execs the real binary after `spawn` returns, so a rule that
+  required the recorded executable to match left qemu running.
+- On Linux the start-time check and the kill go through one pidfd: it is opened first, the start time is read after,
+  and the signal is sent through it. A process that takes the pid after the check cannot receive the kill, and the
+  kill never falls back to the bare pid. A pid that cannot be signalled (0, or above `i32::MAX`, which would wrap to a
+  process group or every process) is refused.
+- A box is swept only when its owner is gone (no such pid, or a different start time). The staging base is shared
+  by the daemon and by `sandy run`, so a daemon-lifetime lock was set aside: a live owner protects its box, and
+  a second daemon or a running CLI is never touched. Two sweeps that race are harmless: each kill is bound to the
+  recorded start time and the wipe ignores a missing directory.
+- The processes are plain children of the host, in the host's process group, so the sweep kills each pid and never a
+  group. A group kill would hit the host or an unrelated group.
+- Nothing without a record is touched. Only a directory a run creates (a UUID, or `inst-` and a UUID) is read for a
+  record. `<run>-outputs` is writable by the guest, and a record found elsewhere could name a host process to kill, so
+  a forged record there is never read. Pid 0 and 1 are never killed, a record that is not a plain file, is over
+  64 KiB or has an unknown field leaves its directory alone, and a symlink is never followed.
+- When the table cannot tell whether a process exists (a `/proc` read failed for a reason other than "no such process"),
+  the box is left for the next sweep. An unreadable owner never reads as a dead one: that would delete a running VM's
+  secret share. ENOENT counts as "no such process" only while `/proc` is mounted; a zombie (state `Z` or `X`) has
+  exited and reads as gone. A kill that cannot be sent (no permission) leaves the box too, and is not counted as
+  killed. A signal is not an exit: a process stuck in uninterruptible I/O survives it, so the box and its secret share
+  stay until every signalled process is seen gone, for up to 3 s, else for the next sweep. A directory that cannot be
+  removed keeps the record, which is removed last, so the next sweep finishes the job.
+- A record from an earlier boot names no running process (a reboot ends them all), so its directories are removed and
+  nothing is killed: a pid and start time from that boot could match an unrelated process of this one. A record from
+  another pid namespace is left alone, since its pids mean nothing here, and so is a record when the sweep cannot read
+  its own namespace to compare.
+- The owner is recorded before staging, so a kill at any point after the secret share exists leaves a record, and each
+  helper process is recorded when it spawns, before its wait. What remains is the instant between a process's spawn
+  and its report, in which a kill leaves that one process unrecorded.
+- A failed record write is logged and does not fail the run. That box goes unrecorded and would still be orphaned by
+  a kill.
+- The sweep reads `/proc` on Linux. Off Linux it is a no-op until the vfkit backend writes records with a macOS
+  start-time source.
+
+**Set aside.** Scanning command lines for qemu: it can hit a process we did not start. A process group kill (above).
+A daemon-lifetime lock on the staging base (above). Comparing the executable (above).
