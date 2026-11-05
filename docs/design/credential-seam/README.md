@@ -14,6 +14,8 @@ proxy tier).
 1. `credential-seam-proposal.md`: what and why, the two-candidate design, the self-adversarial pass.
 2. `decision-log.md`: the verified facts and every load-bearing decision (D1–D6).
 3. `credential-seam-spec.md`: how, as seven test-gated blocks with positive and adversarial tests.
+4. `identity-profiles.md`: the operator's profile registry above the seam (#592): what an environment request
+   may name, and the secret names the service may read.
 
 Small tier: `research-notes.md` and `development-graph.md` are not written. The grounding lives in
 the proposal (§2 current state, §Sources) and the decision log's verified-facts table; the build

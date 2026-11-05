@@ -54,9 +54,10 @@ The operator writes the registry. It is a JSON file read at daemon start. It hol
 ### Failure definition
 
 - An unknown field is an error (`deny_unknown_fields`). A key named `token`, `secret` or `password` therefore
-  fails the parse. The error names the field, never a value.
-- An empty list, a malformed name or a duplicate profile name is an error that names the profile.
-- `resolve` of an unknown name returns `UnknownProfile`. It does not list the known names.
+  fails the parse. The error names the field when its name is short and name-shaped, never a value.
+- An empty list, a malformed name or a malformed entry is an error that gives the entry's position, and its
+  name when the name is valid. A duplicate profile name is an error that names the profile.
+- `resolve` of an unknown name returns `Unknown`. It does not list the known names.
 - No error text contains a value taken from the file, except the profile name the caller asked for.
 - A registry that fails to parse stops the daemon start. It never starts with a partial registry.
 
@@ -89,7 +90,7 @@ If an agent built this, passed the tests and still behaved wrong, the gap would 
 
 1. A valid registry resolves a profile to the expected scope, trust root and service secrets.
 2. A key named `token` fails the parse and the error does not contain the value.
-3. An unknown profile name returns `UnknownProfile` and the error lists no other name.
+3. An unknown profile name returns `Unknown` and the error lists no other name.
 4. An empty `targets`, an empty `capabilities`, a bad secret name and a duplicate profile name each fail.
 5. `service_secrets` absent means the empty list.
 6. A profile name that looks like a credential is refused.

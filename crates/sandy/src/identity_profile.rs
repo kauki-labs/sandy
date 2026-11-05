@@ -2,7 +2,40 @@
 //! request may pick. A profile holds names only, never a value: the trust root to mint from, the credential
 //! [`Scope`], and the secret names the service may read. See `docs/design/credential-seam/identity-profiles.md`.
 
-use sandy_api::cred::Scope;
+use std::collections::BTreeSet;
+
+use sandy_api::cred::{Capability, Scope, Target};
+use serde_json::Value;
+
+/// The longest profile or trust root name. The same bound sandyd applies to a request's `profile` field.
+const MAX_NAME: usize = 64;
+
+/// The longest repository path.
+const MAX_TARGET: usize = 256;
+
+/// The keys of a profile entry.
+const FIELDS: &[&str] = &["name", "credential", "targets", "capabilities", "service_secrets"];
+
+/// Prefixes of well-known credential formats. A name must never be, or carry, a credential. Mirrors the list in
+/// `crates/sandyd/src/environment.rs`, which checks a request's `profile`; one shared rule is a follow-up.
+const SECRET_PREFIXES: &[&str] = &[
+    "ghp_",
+    "gho_",
+    "ghs_",
+    "ghu_",
+    "ghr_",
+    "github_pat_",
+    "glpat-",
+    "glptt-",
+    "sk-",
+    "xoxb-",
+    "xoxp-",
+    "xapp-",
+    "AKIA",
+    "ASIA",
+    "AIza",
+    "npm_",
+];
 
 /// Why a registry or a profile lookup was refused. No variant carries a value read from the registry file:
 /// the text is safe to log (INV-1).
@@ -74,8 +107,42 @@ impl IdentityProfiles {
     /// # Errors
     ///
     /// The first problem found, as an [`IdentityProfileError`].
-    pub fn parse(_text: &str) -> Result<Self, IdentityProfileError> {
-        Ok(Self::default())
+    pub fn parse(text: &str) -> Result<Self, IdentityProfileError> {
+        // Walk a `Value` by hand: serde's own messages repeat the offending value, and this text reaches logs.
+        let value: Value = serde_json::from_str(text).map_err(|err| {
+            let what = match err.classify() {
+                serde_json::error::Category::Syntax => "syntax error",
+                serde_json::error::Category::Eof => "unexpected end of input",
+                serde_json::error::Category::Data => "unexpected data",
+                serde_json::error::Category::Io => "read error",
+            };
+            IdentityProfileError::Malformed(format!("{what} at line {} column {}", err.line(), err.column()))
+        })?;
+        let Some(top) = value.as_object() else {
+            return Err(IdentityProfileError::Malformed(
+                "the top level must be an object".to_owned(),
+            ));
+        };
+        if top.len() != 1 || !top.contains_key("profiles") {
+            return Err(IdentityProfileError::Malformed(
+                "the top level must hold only `profiles`".to_owned(),
+            ));
+        }
+        let Some(entries) = top["profiles"].as_array() else {
+            return Err(IdentityProfileError::Malformed(
+                "`profiles` must be an array".to_owned(),
+            ));
+        };
+        let mut seen = BTreeSet::new();
+        let mut profiles = Vec::with_capacity(entries.len());
+        for (index, entry) in entries.iter().enumerate() {
+            let profile = parse_entry(index, entry)?;
+            if !seen.insert(profile.name.clone()) {
+                return Err(IdentityProfileError::Duplicate(profile.name));
+            }
+            profiles.push(profile);
+        }
+        Ok(Self { profiles })
     }
 
     /// The profile called `name`.
@@ -89,6 +156,137 @@ impl IdentityProfiles {
             .find(|p| p.name == name)
             .ok_or_else(|| IdentityProfileError::Unknown(name.to_owned()))
     }
+}
+
+fn invalid(at: &str, reason: impl Into<String>) -> IdentityProfileError {
+    IdentityProfileError::Invalid {
+        at: at.to_owned(),
+        reason: reason.into(),
+    }
+}
+
+/// A name for a trust root or a profile: letters, digits, `-`, `_` and `.`.
+fn name_ok(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= MAX_NAME
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+fn looks_like_secret(s: &str) -> bool {
+    SECRET_PREFIXES
+        .iter()
+        .any(|p| s.starts_with(p) && s.len() >= p.len() + 8)
+}
+
+/// An environment variable name for a secret the service may read: upper case, digits and `_`.
+fn secret_name_ok(s: &str) -> bool {
+    let mut bytes = s.bytes();
+    s.len() <= MAX_NAME
+        && bytes.next().is_some_and(|b| b.is_ascii_uppercase())
+        && bytes.all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// A field name safe to show: short and name-shaped, so a pasted secret used as a key is not echoed.
+fn field_label(key: &str) -> String {
+    if key.len() <= 32 && name_ok(key) && !looks_like_secret(key) {
+        format!("`{key}`")
+    } else {
+        "(name not shown)".to_owned()
+    }
+}
+
+/// The strings of an array, or `None` when the value is not an array of strings.
+fn strings(value: &Value) -> Option<Vec<&str>> {
+    value.as_array()?.iter().map(Value::as_str).collect()
+}
+
+fn parse_entry(index: usize, entry: &Value) -> Result<IdentityProfile, IdentityProfileError> {
+    let at = format!("#{index}");
+    let Some(fields) = entry.as_object() else {
+        return Err(invalid(&at, "an entry must be an object"));
+    };
+    for key in fields.keys() {
+        if !FIELDS.contains(&key.as_str()) {
+            return Err(invalid(&at, format!("unknown field {}", field_label(key))));
+        }
+    }
+    let name = fields.get("name").and_then(Value::as_str).unwrap_or_default();
+    if !name_ok(name) {
+        return Err(invalid(
+            &at,
+            format!("name must be 1 to {MAX_NAME} letters, digits, '-', '_' or '.'"),
+        ));
+    }
+    if looks_like_secret(name) {
+        return Err(invalid(&at, "name must not look like a credential"));
+    }
+    let at = format!("#{index} ({name})");
+
+    let credential = fields.get("credential").and_then(Value::as_str).unwrap_or_default();
+    if !name_ok(credential) || looks_like_secret(credential) {
+        return Err(invalid(
+            &at,
+            format!("credential must name a trust root: 1 to {MAX_NAME} letters, digits, '-', '_' or '.'"),
+        ));
+    }
+
+    let targets = fields.get("targets").and_then(strings).unwrap_or_default();
+    if targets.is_empty()
+        || targets
+            .iter()
+            .any(|t| t.is_empty() || t.len() > MAX_TARGET || t.chars().any(|c| c.is_whitespace() || c.is_control()))
+    {
+        return Err(invalid(
+            &at,
+            "targets must be a non-empty list of repository paths without whitespace",
+        ));
+    }
+
+    let capability_error = || {
+        invalid(
+            &at,
+            "capabilities must be a non-empty list of read_code, write_code, read_pr, write_pr",
+        )
+    };
+    let mut capabilities = Vec::new();
+    for raw in fields.get("capabilities").and_then(strings).unwrap_or_default() {
+        capabilities
+            .push(serde_json::from_value::<Capability>(Value::String(raw.to_owned())).map_err(|_| capability_error())?);
+    }
+    if capabilities.is_empty() {
+        return Err(capability_error());
+    }
+    capabilities.sort();
+    capabilities.dedup();
+
+    let mut service_secrets: Vec<String> = Vec::new();
+    if let Some(raw) = fields.get("service_secrets") {
+        let Some(names) = strings(raw) else {
+            return Err(invalid(&at, "service_secrets must be a list of secret names"));
+        };
+        for secret in names {
+            if !secret_name_ok(secret) {
+                return Err(invalid(
+                    &at,
+                    format!("a service secret name must be upper case letters, digits and '_' (1 to {MAX_NAME})"),
+                ));
+            }
+            if !service_secrets.iter().any(|s| s == secret) {
+                service_secrets.push(secret.to_owned());
+            }
+        }
+    }
+
+    Ok(IdentityProfile {
+        name: name.to_owned(),
+        credential: credential.to_owned(),
+        scope: Scope {
+            targets: targets.into_iter().map(|t| Target(t.to_owned())).collect(),
+            capabilities,
+        },
+        service_secrets,
+    })
 }
 
 #[cfg(test)]
