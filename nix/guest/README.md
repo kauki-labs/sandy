@@ -70,3 +70,11 @@ the stream):
 protocol against a built runner (`protocol_probe.py <runner>/bin/microvm-run "echo hi"`)
 and reports the captured output and exit code. It is a spike artifact, not shipped
 in the binary.
+
+## Setup steps (`sandy.setup`)
+
+A guest module declares `sandy.setup.<name> = { script; user ? "root"; description ? ""; after ? [ ]; }`
+(`nix/lib/guest-setup.nix`, imported by `commonModule`). Each step is a systemd oneshot ordered before and
+required by `sandy-ready.target`; the serial getty that prints `SANDY-READY` requires that target. A failed
+step leaves no marker, so the run fails. A devshell `shellHook` stays in `loginShellInit` (it needs the
+exported secrets), so it is not a `sandy.setup` step.
