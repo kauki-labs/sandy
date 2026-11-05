@@ -36,17 +36,19 @@ The operator writes the registry. It is a JSON file read at daemon start. It hol
 ### Valid inputs
 
 - A profile name has 1 to 64 characters from `A-Za-z0-9`, `-`, `_`, `.`, and starts with a letter or digit, so `.`
-  and `..` are never a name. It does not look like a credential. This is sandyd's rule for the request's `profile`
+  and `..` are never a name. It does not look like a credential (a known prefix such as `ghp_` or `sk_`, or 32 or
+  more hex digits; see the limit below). This is sandyd's rule for the request's `profile`
   field, plus the leading character, so a registry name always passes the request check. Names that differ only in
-  ASCII case are one name.
+  ASCII case are one name when the registry loads, but `resolve` compares the exact name, as sandyd does.
 - `credential` is a name of the same character set and the same length bound. It does not look like a credential.
 - `targets` has 1 to 256 entries. Each entry is an `owner/repo` path (nested groups allowed) of ASCII letters, digits,
   `-`, `_`, `.` and `/`, up to 256 bytes, with no empty segment and no `.` or `..` segment. A URL, a leading `/`, a
-  bare name and any non-ASCII character are refused, so the visible path is the path that is allowed.
+  bare name and any non-ASCII character are refused, so the visible path is the path that is allowed. A repeated
+  entry is kept once.
 - `capabilities` has 1 to 256 entries, each a `Capability`. Duplicates are removed.
 - `service_secrets` has up to 256 names that match `[A-Z][A-Z0-9_]{0,63}` and do not look like a credential.
   Duplicates are removed, in order.
-- A registry has at most 1024 profiles.
+- A registry file is at most 1 MiB and holds at most 1024 profiles. The size is checked before the parse.
 
 ### Expected outputs
 
@@ -70,6 +72,13 @@ The operator writes the registry. It is a JSON file read at daemon start. It hol
 - No error text contains any string taken from the file or from the caller. The only text is a fixed message with
   an entry position or a line and column.
 - A registry that fails to parse stops the daemon start. It never starts with a partial registry.
+
+### The limit of the credential-shape check
+
+The check that refuses a name that "looks like a credential" knows a list of prefixes and one generic shape (long hex).
+It is a best-effort guard against a paste, not a guarantee: a secret in another shape passes it. The contract is that
+the registry holds names only. The error texts never show a key, a name or a value, so a pasted secret does not reach a
+log through them. The types derive `Debug`, which prints the names that were accepted, so no caller logs a profile.
 
 ### Performance and scale
 

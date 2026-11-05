@@ -327,5 +327,6 @@ stays root-only. An allowlist in the agent was set aside: it would drop the keys
 
 **Set aside:** reading the registry through `serde` derive, and a prefix list to decide which text is safe to show. A
 derive error repeats the offending value, and the text reaches logs. A prefix list knows only some secret formats, so
-no key or name is shown at all (review of #592). **Open:** one shared name rule for this registry and sandyd's request check (they match today, but are
+no key or name is shown at all (review of #592). The same limit holds for the "looks like a credential" check on
+names: it is best-effort, and the contract is names only. **Open:** one shared name rule for this registry and sandyd's request check (they match today, but are
 two copies). Spec: `docs/design/credential-seam/identity-profiles.md`.

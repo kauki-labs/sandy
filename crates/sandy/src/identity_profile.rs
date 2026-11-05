@@ -14,6 +14,9 @@ const MAX_NAME: usize = 64;
 /// The longest repository path.
 const MAX_TARGET: usize = 256;
 
+/// The largest registry file, in bytes. The caps below run after a parse, so this bounds the parse itself.
+const MAX_REGISTRY_BYTES: usize = 1024 * 1024;
+
 /// The most profiles in a registry, and the most entries in one list of a profile.
 const MAX_PROFILES: usize = 1024;
 const MAX_LIST: usize = 256;
@@ -40,6 +43,7 @@ const SECRET_PREFIXES: &[&str] = &[
     "ASIA",
     "AIza",
     "npm_",
+    "sk_",
 ];
 
 /// Why a registry or a profile lookup was refused. No variant carries a value read from the registry file:
@@ -49,7 +53,7 @@ pub enum IdentityProfileError {
     /// The registry is not valid JSON of the expected shape.
     #[error("the identity profile registry is malformed ({0})")]
     Malformed(String),
-    /// A profile entry is refused; `at` is its position and, when it has a valid name, the name.
+    /// A profile entry is refused; `at` is its position in the file (`#0` is the first), never its name.
     #[error("identity profile {at}: {reason}")]
     Invalid {
         /// Where the entry sits in the file.
@@ -120,6 +124,11 @@ impl IdentityProfiles {
     ///
     /// The first problem found, as an [`IdentityProfileError`].
     pub fn parse(text: &str) -> Result<Self, IdentityProfileError> {
+        if text.len() > MAX_REGISTRY_BYTES {
+            return Err(IdentityProfileError::Malformed(format!(
+                "the registry is too large (at most {MAX_REGISTRY_BYTES} bytes)"
+            )));
+        }
         // Walk a `Value` by hand: serde's own messages repeat the offending value, and this text reaches logs.
         let Strict(value) = serde_json::from_str(text).map_err(|err| {
             // Only the text this module chose: serde's own message may repeat a value.
@@ -275,10 +284,13 @@ fn target_ok(s: &str) -> bool {
         && s.split('/').all(|seg| !seg.is_empty() && seg != "." && seg != "..")
 }
 
+/// Whether `s` has the shape of a credential: a well-known prefix, or a long run of hex digits. A best-effort check,
+/// not a guarantee: a secret in a shape this does not know passes, so the registry file must hold names only.
 fn looks_like_secret(s: &str) -> bool {
-    SECRET_PREFIXES
+    let known_prefix = SECRET_PREFIXES
         .iter()
-        .any(|p| s.starts_with(p) && s.len() >= p.len() + 8)
+        .any(|p| s.starts_with(p) && s.len() >= p.len() + 8);
+    known_prefix || (s.len() >= 32 && s.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// An environment variable name for a secret the service may read: upper case, digits and `_`.
@@ -379,11 +391,18 @@ fn parse_entry(index: usize, entry: &Value) -> Result<IdentityProfile, IdentityP
         }
     }
 
+    let mut unique_targets: Vec<&str> = Vec::with_capacity(targets.len());
+    for target in targets {
+        if !unique_targets.contains(&target) {
+            unique_targets.push(target);
+        }
+    }
+
     Ok(IdentityProfile {
         name: name.to_owned(),
         credential: credential.to_owned(),
         scope: Scope {
-            targets: targets.into_iter().map(|t| Target(t.to_owned())).collect(),
+            targets: unique_targets.into_iter().map(|t| Target(t.to_owned())).collect(),
             capabilities,
         },
         service_secrets,
@@ -716,7 +735,8 @@ mod tests {
 
     #[test]
     fn a_name_of_exactly_the_bound_is_accepted() -> anyhow::Result<()> {
-        let name = "a".repeat(64);
+        // Not "a": 64 hex digits would look like a credential.
+        let name = "p".repeat(64);
         let mut entry = valid_entry();
         entry["name"] = json!(name);
         let profiles = IdentityProfiles::parse(&registry(&entry)).context("parse")?;
