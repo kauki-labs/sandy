@@ -1044,7 +1044,7 @@ mod tests {
     /// The wiring, not only the state machine: the console driver writes the command frame once the run's ready marker
     /// arrives, and that write is what marks the boot.
     #[test]
-    fn a_console_that_reaches_the_ready_marker_reports_the_cid() {
+    fn a_console_that_reaches_the_ready_marker_reports_the_cid() -> anyhow::Result<()> {
         let (report, seen) = counting_report();
         report.linked();
         let command = ["true".to_string()];
@@ -1058,13 +1058,17 @@ mod tests {
             &Markers::for_run(READY_MARKER, Uuid::new_v4()),
         );
         assert!(outcome.booted, "{outcome:?}");
-        assert_eq!(*seen.lock().expect("seen"), vec![("box-1".to_string(), 77)]);
+        assert_eq!(
+            *seen.lock().ok().context("the seen list lock is poisoned")?,
+            vec![("box-1".to_string(), 77)]
+        );
+        Ok(())
     }
 
     /// A qemu that lost the CID never prints the ready marker, so its console closes unbooted and nothing is reported
     /// even though the connect reached another VM.
     #[test]
-    fn a_console_that_never_boots_does_not_report_the_cid() {
+    fn a_console_that_never_boots_does_not_report_the_cid() -> anyhow::Result<()> {
         let (report, seen) = counting_report();
         report.linked();
         let command = ["true".to_string()];
@@ -1078,7 +1082,8 @@ mod tests {
             &Markers::for_run(READY_MARKER, Uuid::new_v4()),
         );
         assert!(!outcome.booted, "{outcome:?}");
-        assert!(seen.lock().expect("seen").is_empty());
+        assert!(seen.lock().ok().context("the seen list lock is poisoned")?.is_empty());
+        Ok(())
     }
 
     #[test]
