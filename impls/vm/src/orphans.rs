@@ -6,9 +6,9 @@
 //! owns them. [`sweep_orphans`] reads the records at start-up and stops only what a record proves is ours and
 //! orphaned. See `docs/decisions/run-plane.md` decision 6.
 //!
-//! Safety rests on three rules. A process is stopped only when its pid, its start time and its executable all match
-//! the record, so a reused pid is never hit. A box is swept only when its owner is verifiably gone, so a second
-//! daemon or a running CLI is never touched. Nothing without a record is ever touched.
+//! Safety rests on three rules. A process is stopped only when its pid and its start time both match the record, so a
+//! reused pid is never hit. A box is swept only when its owner is verifiably gone, so a second daemon or a running CLI
+//! is never touched. Nothing without a record is ever touched.
 
 use std::{
     fs, io,
@@ -28,13 +28,15 @@ const MAX_RECORD_BYTES: u64 = 64 * 1024;
 pub trait ProcessTable {
     /// When `pid` started, in the table's own units, or `None` when no such process exists.
     fn start_time(&self, pid: u32) -> Option<u64>;
-    /// The path of `pid`'s executable, or `None` when it cannot be read.
+    /// The path of `pid`'s executable, or `None` when it cannot be read. Recorded for a human reading the record; the
+    /// sweep never compares it, because a wrapper execs another binary after the process is recorded.
     fn exe(&self, pid: u32) -> Option<String>;
     /// Send `pid` an unblockable kill. Best effort: the process may already be gone.
     fn kill(&self, pid: u32);
 }
 
-/// A process as a record names it. The three fields together tell it from a later process that reused its pid.
+/// A process as a record names it. The pid and the start time together tell it from a later process that reused
+/// its pid.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcId {
@@ -42,7 +44,7 @@ pub struct ProcId {
     pub pid: u32,
     /// The start time, in the units of the [`ProcessTable`] that wrote it.
     pub start: u64,
-    /// The executable path.
+    /// The executable path when the process was recorded. Informational: it can change by an `exec`.
     pub exe: String,
 }
 
@@ -136,9 +138,12 @@ fn write_record(path: &Path, record: &BoxRecord) -> io::Result<()> {
     result
 }
 
-/// Whether `process` is still the process the record named: same pid, same start time, same executable.
+/// Whether `process` is still the process the record named: same pid and same start time. The executable is not
+/// compared: a wrapper execs the real binary after `spawn` returns (nix's qemu does), so the executable recorded at
+/// launch is not stable. The start time survives an exec, and a later process that reuses the pid always started
+/// later, so it can never match.
 fn is_alive(table: &dyn ProcessTable, process: &ProcId) -> bool {
-    table.start_time(process.pid) == Some(process.start) && table.exe(process.pid).as_deref() == Some(&process.exe)
+    table.start_time(process.pid) == Some(process.start)
 }
 
 /// Read a box's record. `Ok(None)` when the directory has none; `Err` when there is one that is not ours to trust: a
