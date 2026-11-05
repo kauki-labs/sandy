@@ -3,9 +3,10 @@
 #
 # Boots the T3 guest under `sandy run` with an input share and the egress proxy, so qemu, virtiofsd and the proxy all
 # run. Then it:
-#   1. runs the start-up sweep while the host process is alive and checks that it touches nothing;
+#   1. runs the start-up sweep while the host process is alive, both directly and as `sandy run` makes it, and checks
+#      that it touches nothing;
 #   2. SIGKILLs the host process and checks that qemu, virtiofsd and the proxy are still running (the orphans);
-#   3. runs the sweep again and checks that every one of them is gone, with the run directory.
+#   3. starts another `sandy run` and checks that its sweep stops every one of them and removes the run directory.
 #
 # Needs: a Linux host with KVM and /dev/vhost-vsock access, nix. No root, tap or nft. Run from the repo root:
 #
@@ -53,6 +54,13 @@ cargo build -q -p sandy-egress-proxy
 cargo build -q -p sandy-impls-vm --example sweep_orphans
 echo "== building the T3 guest"
 nix build --no-link "$repo_root/nix/guest#packages.x86_64-linux.guest-runner-t3"
+
+# The sweep as `sandy run` makes it (#666): the first thing a run does, before it goes on with its template. A template
+# that does not exist ends the run within seconds, so only the sweep has any effect.
+sweep_by_run() {
+  TMPDIR="$work" SANDY_HOME="$work/home" "$target_dir/debug/sandy" -o json run no-such-template --timeout 5 -- true \
+    >"$work/sweep-run.json" 2>"$work/sweep-run.log" || true
+}
 
 sweep() {
   TMPDIR="$work" "$target_dir/debug/examples/sweep_orphans"
@@ -109,6 +117,15 @@ for pid in $pids; do alive "$pid" || {
   echo "FAIL: the run directory was removed during a sweep with a live owner" >&2
   exit 1
 }
+sweep_by_run
+for pid in $pids; do alive "$pid" || {
+  echo "FAIL: pid $pid died when sandy run swept with a live owner" >&2
+  exit 1
+}; done
+[ -d "$rundir" ] || {
+  echo "FAIL: sandy run removed the run directory of a box whose owner is alive" >&2
+  exit 1
+}
 
 echo "== 2. SIGKILL the owner: its VM is orphaned"
 kill -9 "$owner"
@@ -126,9 +143,8 @@ for pid in $pids; do alive "$pid" || {
   exit 1
 }
 
-echo "== 3. the sweep stops them and removes the run directory"
-report=$(sweep)
-echo "$report"
+echo "== 3. sandy run sweeps: it stops them and removes the run directory"
+sweep_by_run
 for _ in $(seq 20); do
   left=""
   for pid in $pids; do alive "$pid" && left="$left $pid"; done
@@ -143,8 +159,11 @@ done
   echo "FAIL: the run directory is still there after the sweep" >&2
   exit 1
 }
-case "$report" in *"wiped: 1"*) ;; *)
-  echo "FAIL: the sweep did not report wiping the box" >&2
+# Nothing is left for the direct sweep to find.
+report=$(sweep)
+echo "$report"
+case "$report" in *"killed: 0, wiped: 0, live_owner: 0, unreadable: 0, undecided: 0"*) ;; *)
+  echo "FAIL: a sweep after sandy run's still found something: $report" >&2
   exit 1
   ;;
 esac
