@@ -29,13 +29,22 @@ fi
 work=$(mktemp -d /tmp/slb.XXXXXX)
 chmod 0700 "$work"
 mkdir -p "$work/home"
+sandy_pgid=""
 cleanup() {
-  # qemu and virtiofsd are plain children of sandy; every one of them carries this run's private work dir.
+  # sandy runs in its own session, so its qemu, virtiofsd and egress proxy share one process group. The qemu
+  # proxy's command line holds no work dir (it is given a vsock port and a peer cid), so only the group finds it.
+  if [ -n "$sandy_pgid" ]; then
+    kill -- "-$sandy_pgid" 2>/dev/null || true
+  fi
+  # qemu and virtiofsd also carry this run's private work dir.
   pkill -f -- "$work/" 2>/dev/null || true
   for _ in $(seq 20); do
     pgrep -f -- "$work/" >/dev/null 2>&1 || break
     sleep 0.5
   done
+  if [ -n "$sandy_pgid" ]; then
+    kill -9 -- "-$sandy_pgid" 2>/dev/null || true
+  fi
   pkill -9 -f -- "$work/" 2>/dev/null || true
   rm -rf "$work"
 }
@@ -53,7 +62,7 @@ echo "SK> binaries: claude=${claude:+yes} codex=${codex:+yes}"
 echo "SK> curl-allowed: $(timeout 30 curl -sS -o /dev/null -w '%{http_code}' https://api.anthropic.com/ 2>&1 | tail -c 200)"
 echo "SK> curl-denied: $(timeout 30 curl -sS -o /dev/null -w '%{http_code}' https://example.org/ 2>&1 | tail -c 200)"
 echo "SK> claude-allowed: $(cd /tmp && HOME=/tmp/h CLAUDE_CONFIG_DIR=/tmp/h/c ANTHROPIC_API_KEY=sk-ant-fake timeout 60 "$claude" -p hi 2>&1 | tail -c 300 | tr '\n' ' ')"
-echo "SK> codex-allowed: $(cd /tmp && HOME=/tmp/h CODEX_HOME=/tmp/h/x OPENAI_API_KEY=sk-fake timeout 60 "$codex" exec --skip-git-repo-check hi 2>&1 | tail -c 300 | tr '\n' ' ')"
+echo "SK> codex-allowed: $(cd /tmp && HOME=/tmp/h CODEX_HOME=/tmp/h/x CODEX_API_KEY=sk-fake timeout 60 "$codex" exec --skip-git-repo-check hi 2>&1 | tail -c 300 | tr '\n' ' ')"
 (cd /tmp && HOME=/tmp/h CLAUDE_CONFIG_DIR=/tmp/h/c ANTHROPIC_API_KEY=sk-ant-fake ANTHROPIC_BASE_URL=https://example.org timeout 60 "$claude" -p hi >/tmp/denied.log 2>&1)
 denied_rc=$?
 echo "SK> claude-denied: rc=$denied_rc $(tail -c 300 /tmp/denied.log | tr '\n' ' ')"
@@ -71,11 +80,13 @@ echo "== running the guest"
 status=0
 TMPDIR="$work" SANDY_HOME="$work/home" SANDY_EGRESS=proxy \
   SANDY_EGRESS_PROXY_BIN="$repo_root/target/debug/sandy-egress-proxy" \
-  nix shell nixpkgs#qemu nixpkgs#virtiofsd -c \
+  setsid nix shell nixpkgs#qemu nixpkgs#virtiofsd -c \
   "$repo_root/target/debug/sandy" -o json run "$repo_root/nix/guest#topologies.x86_64-linux.qemu-t3" \
   --timeout 600 --allow api.anthropic.com:443 --allow api.openai.com:443 \
   --input "$work/guest.sh:guest.sh" -- bash /run/sandy/inputs/guest.sh \
-  >"$work/result.json" 2>"$work/stderr.log" || status=$?
+  >"$work/result.json" 2>"$work/stderr.log" &
+sandy_pgid=$!
+wait "$sandy_pgid" || status=$?
 if [ ! -s "$work/result.json" ]; then
   echo "sandy produced no result (exit $status):" >&2
   tail -n 12 "$work/stderr.log" >&2
