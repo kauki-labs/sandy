@@ -517,8 +517,25 @@ fn is_srch(err: &io::Error) -> bool {
 /// one. The start time is the five fields of `lstart` (`Wed Nov  5 10:23:45 2026`), hashed: it is only ever compared
 /// for equality, and a process that took the pid later started later, so it never matches.
 #[cfg(any(target_os = "macos", test))]
-fn parse_ps_state(_stdout: &str) -> ProcState {
-    ProcState::Unknown
+fn parse_ps_state(stdout: &str) -> ProcState {
+    let line = stdout.trim();
+    if line.is_empty() {
+        return ProcState::Gone;
+    }
+    let mut fields = line.split_whitespace();
+    let Some(state) = fields.next() else {
+        return ProcState::Unknown;
+    };
+    if state.starts_with(['Z', 'X']) {
+        return ProcState::Gone;
+    }
+    // `lstart` is five fields: a weekday, a month, a day, a time and a year. Anything else (an error line, a cut
+    // answer) says nothing about the process.
+    let started: Vec<&str> = fields.collect();
+    if started.len() != 5 {
+        return ProcState::Unknown;
+    }
+    ProcState::Started(fnv1a(&started.join(" ")))
 }
 
 /// FNV-1a over `text`: a stable 64 bit identity for a start time string.
