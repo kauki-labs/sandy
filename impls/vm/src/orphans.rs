@@ -56,8 +56,10 @@ pub trait ProcessTable {
     /// The path of `pid`'s executable, or `None` when it cannot be read. Recorded for a human reading the record; the
     /// sweep never compares it, because a wrapper execs another binary after the process is recorded.
     fn exe(&self, pid: u32) -> Option<String>;
-    /// Send an unblockable kill to the process `pid` that started at `start`, and to that process only. The check and
-    /// the signal are bound to one process, so a process that takes the pid after the check cannot receive the signal.
+    /// Send an unblockable kill to the process `pid` that started at `start`. Where the platform gives a process
+    /// handle (a pidfd on Linux), the check and the signal are bound to one process, so a process that takes the pid
+    /// after the check cannot receive the signal. Without one (macOS) the pid is checked and then signalled, and a
+    /// process that takes the pid in between can receive it.
     fn kill_started(&self, pid: u32, start: u64) -> Kill;
     /// An id of the current boot, or `None` when the host has none. Processes do not survive a reboot.
     fn boot_id(&self) -> Option<String>;
@@ -512,6 +514,18 @@ fn is_srch(err: &io::Error) -> bool {
     err.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error())
 }
 
+/// What one `ps -o state=,lstart= -p PID` run says about the process. `ps` exits 1 and prints nothing at all for a pid
+/// that does not exist: that is the only empty answer that means "gone". Any other failure, an empty answer with exit
+/// 0, or a failure that says something on stderr (a bad option, a refused call), tells nothing about the process.
+#[cfg(any(target_os = "macos", test))]
+fn ps_answer(code: Option<i32>, stdout: &str, stderr_empty: bool) -> ProcState {
+    match code {
+        Some(0) if !stdout.trim().is_empty() => parse_ps_state(stdout),
+        Some(1) if stderr_empty => parse_ps_state(stdout),
+        _ => ProcState::Unknown,
+    }
+}
+
 /// What an answer of "no such process" is worth. `ps` prints nothing for a pid that does not exist, but it also prints
 /// nothing when it is denied access to process information (a sandbox, a restricted launch context). So a "gone" is
 /// believed only if `control`, the same question asked about this very process, saw it: a `ps` that cannot see the
@@ -590,13 +604,11 @@ impl Ps {
         let Some(out) = Self::run("/bin/ps", &["-o", "state=,lstart=", "-p", &pid.to_string()]) else {
             return ProcState::Unknown;
         };
-        // `ps` exits 1 and prints nothing at all for a pid that does not exist. Any other failure, or a failure that
-        // says something on stderr (a bad option, a refused call), tells nothing about the process.
-        match out.status.code() {
-            Some(0) => parse_ps_state(&String::from_utf8_lossy(&out.stdout)),
-            Some(1) if out.stderr.is_empty() => parse_ps_state(&String::from_utf8_lossy(&out.stdout)),
-            _ => ProcState::Unknown,
-        }
+        ps_answer(
+            out.status.code(),
+            &String::from_utf8_lossy(&out.stdout),
+            out.stderr.is_empty(),
+        )
     }
 }
 
@@ -626,8 +638,8 @@ impl ProcessTable for Ps {
             return Kill::Failed;
         };
         // macOS has no pidfd, so this is check then kill: the window is one `ps` call. A process that took the pid in
-        // it would also have to have started at exactly the recorded second, which a process that is not the recorded
-        // one cannot (it started later).
+        // it would also have to have started in the recorded second (the identity has one-second resolution), which
+        // needs the pid counter to wrap within a second. That is unlikely, not impossible.
         match self.state(pid) {
             ProcState::Started(found) if found == start => {}
             ProcState::Gone | ProcState::Started(_) => return Kill::Gone,
@@ -1762,6 +1774,23 @@ mod tests {
         for text in ["S", "S Wed Nov", "garbage", "ps: Invalid process id: 99999999999"] {
             assert_eq!(parse_ps_state(text), ProcState::Unknown, "{text:?}");
         }
+    }
+
+    /// Review of #675: only exit 1 with nothing on stderr and nothing on stdout is "no such process". An empty answer
+    /// with exit 0 is not a statement about the pid.
+    #[test]
+    fn only_a_ps_exit_of_one_with_nothing_said_means_no_such_process() {
+        let line = "S Mon Nov  3 10:00:00 2026";
+        assert_eq!(ps_answer(Some(1), "", true), ProcState::Gone);
+        assert_eq!(ps_answer(Some(0), "", true), ProcState::Unknown, "empty with exit 0");
+        assert_eq!(
+            ps_answer(Some(0), "  \n", true),
+            ProcState::Unknown,
+            "blank with exit 0"
+        );
+        assert_eq!(ps_answer(Some(1), "", false), ProcState::Unknown, "exit 1 with stderr");
+        assert_eq!(ps_answer(None, "", true), ProcState::Unknown, "killed by a signal");
+        assert!(matches!(ps_answer(Some(0), line, true), ProcState::Started(_)));
     }
 
     /// Review of #666: a `ps` that cannot see this very process cannot say another one is gone, or every owner would

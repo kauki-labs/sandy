@@ -266,9 +266,9 @@ gone, it kills every recorded process that is still alive, waits for each to exi
   local time and a zone or DST change between recording and sweeping would change the identity. A "gone" is believed
   only if the same `ps` can see the sweeping process itself; a `ps` denied process information prints nothing for every
   pid and would otherwise read every owner as dead. The boot id is `kern.bootsessionuuid`, and macOS has no pid
-  namespaces. There is no pidfd on macOS, so the kill is check then kill, with a window of one `ps` call: a process
-  that took the pid in it would also have to have started in exactly the recorded second, which a process that is
-  not the recorded one cannot (it started later). vfkit runs on a PTY slave whose master the owner holds, so it exits when the owner is killed (live-verified,
+  namespaces. There is no pidfd on macOS, so the kill is check then kill, with a window of one `ps` call. A process that took the pid in it
+  would also have to have started in the recorded second (the identity has one-second resolution), which needs the
+  pid counter to wrap within a second: unlikely, not impossible. vfkit runs on a PTY slave whose master the owner holds, so it exits when the owner is killed (live-verified,
   KOS9): the orphans of a killed macOS run are the egress proxy and the run directory. The agent, egress and service sockets of a killed vfkit run are not
   removed by the sweep; they hold no data.
 

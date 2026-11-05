@@ -93,7 +93,7 @@ echo "== starting the guest"
 (
   # A stub named by SANDY_QEMU_BIN or SANDY_VIRTIOFSD_BIN must never stand in for the hypervisor: this gate is only
   # live with the real one (INV-S9).
-  env -u SANDY_QEMU_BIN -u SANDY_VIRTIOFSD_BIN TMPDIR="$work" SANDY_HOME="$work/home" SANDY_EGRESS=proxy \
+  env -u SANDY_QEMU_BIN -u SANDY_VIRTIOFSD_BIN -u SANDY_VFKIT_BIN TMPDIR="$work" SANDY_HOME="$work/home" SANDY_EGRESS=proxy \
     SANDY_EGRESS_PROXY_BIN="$target_dir/debug/sandy-egress-proxy" \
     nix shell "${tools[@]}" -c \
     "$target_dir/debug/sandy" -o json run "$repo_root/nix/guest#$topology" \
@@ -167,6 +167,18 @@ alive "$owner" && {
 }
 # On macOS vfkit runs on a PTY slave the owner holds the master of, so it exits with its owner (SIGHUP/EIO): the box's
 # orphans there are the egress proxy and the run directory. Every other recorded process must outlive the owner.
+# vfkit may take a moment to see the hangup: wait for it, so the survivors (and the count the sweep must report) are
+# settled before the sweep runs.
+if [ "$(uname -s)" = Darwin ]; then
+  for _ in $(seq 20); do
+    vfkit_alive=""
+    for pid in $pids; do
+      [ "$(python3 -I -c 'import json, sys; print(next(p.get("exe") for p in json.load(open(sys.argv[1]))["procs"] if str(p["pid"]) == sys.argv[2]))' "$record" "$pid")" = vfkit ] && alive "$pid" && vfkit_alive=1
+    done
+    [ -z "$vfkit_alive" ] && break
+    sleep 0.5
+  done
+fi
 survivors=""
 for pid in $pids; do
   exe=$(python3 -I -c 'import json, sys; print(next(p.get("exe") for p in json.load(open(sys.argv[1]))["procs"] if str(p["pid"]) == sys.argv[2]))' "$record" "$pid")
