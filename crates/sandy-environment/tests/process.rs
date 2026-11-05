@@ -169,16 +169,29 @@ fn an_unknown_or_killed_environment_is_not_running_and_kill_is_idempotent() -> R
 }
 
 /// The counter in `beat` advances while its writer lives.
+///
+/// The writer truncates and rewrites the file every 20 ms, so any single read can see it empty. Every read here
+/// retries until it gets a number, and the file is compared as numbers, so a read inside the truncation window is
+/// never mistaken for a dead writer.
 fn is_beating(beat: &Path) -> bool {
-    let read = || std::fs::read_to_string(beat).unwrap_or_default();
+    let read_count = |within: Duration| -> Option<u64> {
+        let deadline = Instant::now() + within;
+        loop {
+            if let Some(n) = std::fs::read_to_string(beat).ok().and_then(|s| s.trim().parse().ok()) {
+                return Some(n);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
     // A freshly started writer may not have written yet, most of all on a loaded host.
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while read().is_empty() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let first = read();
+    let Some(first) = read_count(Duration::from_secs(3)) else {
+        return false;
+    };
     std::thread::sleep(Duration::from_millis(250));
-    !first.is_empty() && first != read()
+    read_count(Duration::from_secs(1)).is_some_and(|later| later > first)
 }
 
 #[test]
