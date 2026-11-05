@@ -76,3 +76,11 @@ is already `0700` and `/proc` is not needed.
 
 **Set aside.** Checking the file rather than the directory: another principal who
 can write the directory can swap the file after any check on it.
+
+## 4. The t3 access credential stays in a `0600` file (#669)
+
+The guest agent lifts the pairing credential `t3 serve` prints at startup (`<url>#token=<token>`) out of the job
+transcript and writes it to `t3-access.json` in the directory named by `SANDY_T3_ACCESS_DIR`, through the one
+`0600` writer of section 3. The credential is valid only for a window after the server starts, so the capture
+runs from the first transcript byte and gives up after five minutes. It never reaches a log, a `Debug` print or
+a tool result. Reading it back over the agent link, and the seeded-token source, are later slices of #669.

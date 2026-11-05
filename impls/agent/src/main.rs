@@ -49,6 +49,10 @@ const ARCHIVE_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 /// `SANDY_HISTORY_LINES`.
 const DEFAULT_HISTORY_LINES: u32 = 10_000;
 
+/// How long the agent waits for t3's startup pairing credential (#669). The credential is only valid for a
+/// window after the server starts, so a server that prints none by now never will.
+const T3_ACCESS_WINDOW: Duration = Duration::from_secs(300);
+
 /// The env var `history_lines_env` (`sandy-host-executor/src/dispatch.rs`)
 /// sets on `RunSpec.env` for a flake/v1 (VM) dispatch (epic #340 phase 6).
 /// Read directly from this process's own environment rather than threaded
@@ -179,6 +183,7 @@ mod link_source;
 mod peer;
 mod port_relay;
 mod service;
+mod t3_access;
 mod tmux_pty;
 
 use link_source::LinkSource;
@@ -310,6 +315,23 @@ where
         Some(port) => Some(service::spawn_port_relay(port).await?),
         None => None,
     };
+    // #669: a declared access directory makes the agent lift t3's startup pairing credential from the
+    // transcript into a 0600 file. The capture never logs the credential; a failure is named without it.
+    let access_task = match std::env::var_os(t3_access::ACCESS_DIR_ENV) {
+        Some(dir) => {
+            let file = t3_access::AccessFile::open(std::path::Path::new(&dir))
+                .map_err(|e| format!("opening the t3 access directory: {e}"))?;
+            let log = tmux_job.log_path().to_path_buf();
+            Some(tokio::spawn(async move {
+                match t3_access::capture(&log, &file, T3_ACCESS_WINDOW).await {
+                    Ok(true) => {}
+                    Ok(false) => eprintln!("sandy-agent: no t3 pairing credential appeared within the window"),
+                    Err(e) => eprintln!("sandy-agent: capturing the t3 pairing credential: {e}"),
+                }
+            }))
+        }
+        None => None,
+    };
     let readiness = service.map(|spec| service::spawn_readiness(Arc::clone(&agent), spec.probe, service_user));
     let (pty_read, pty_write, resizer, mut attach_child) = tmux_job
         .open_attach()
@@ -368,6 +390,9 @@ where
             if let Some(resize_task) = resize_task {
                 resize_task.abort();
             }
+            if let Some(access_task) = access_task {
+                access_task.abort();
+            }
             return Err(format!("reading the job's real exit code: {e}"));
         }
     };
@@ -378,6 +403,9 @@ where
     let _ = attach_child.wait();
     if let Some(resize_task) = resize_task {
         resize_task.abort();
+    }
+    if let Some(access_task) = access_task {
+        access_task.abort();
     }
 
     match bridge_task.await {
