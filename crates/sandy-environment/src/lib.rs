@@ -8,6 +8,7 @@
 //!
 //! [`VmEnvironmentBackend`] is the isolated one: a held agent-mode `VmBackend::run` per environment.
 
+mod connections;
 mod lifecycle;
 mod process;
 mod vm;
