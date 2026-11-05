@@ -203,6 +203,13 @@ fn elapsed_ms(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+/// Tell the agent that spawned this relay that the vsock listener is bound (#657): one [`RELAY_BOUND`] byte,
+/// flushed, and nothing after it.
+fn announce_bound(out: &mut impl std::io::Write) -> std::io::Result<()> {
+    out.write_all(&[RELAY_BOUND])?;
+    out.flush()
+}
+
 /// The `port-relay` entry point: bind the vsock listener, then relay until killed. A usage or bind failure aborts
 /// like any agent-internal failure, so the backend reports an infra fault.
 #[cfg(target_os = "linux")]
@@ -215,9 +222,7 @@ pub fn cli(args: &[OsString]) -> std::process::ExitCode {
     runtime.block_on(async {
         let acceptor = crate::link_source::VsockAcceptor::bind(port)
             .unwrap_or_else(|e| crate::fail(&format!("binding vsock port {port} for the port relay: {e}")));
-        if let Err(e) = std::io::Write::write_all(&mut std::io::stdout(), &[RELAY_BOUND])
-            .and_then(|()| std::io::Write::flush(&mut std::io::stdout()))
-        {
+        if let Err(e) = announce_bound(&mut std::io::stdout()) {
             crate::fail(&format!("telling the agent the port relay is bound: {e}"));
         }
         serve(acceptor, target).await;
@@ -236,6 +241,33 @@ pub fn cli(args: &[OsString]) -> std::process::ExitCode {
 
 #[cfg(test)]
 mod tests {
+    /// #657: the relay's half of the bind handshake is exactly one `RELAY_BOUND` byte, flushed. The agent's
+    /// `await_bound` tests use stand-in children, so this is what pins the byte the real relay writes.
+    #[test]
+    fn announcing_the_bind_writes_exactly_one_flushed_bound_byte() -> anyhow::Result<()> {
+        #[derive(Default)]
+        struct Probe {
+            written: Vec<u8>,
+            flushed: bool,
+        }
+        impl std::io::Write for Probe {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.written.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.flushed = true;
+                Ok(())
+            }
+        }
+        let mut out = Probe::default();
+        super::announce_bound(&mut out)?;
+        assert_eq!(out.written, [super::RELAY_BOUND]);
+        assert!(out.flushed, "an unflushed byte may never reach the agent");
+        Ok(())
+    }
+
     use std::{
         collections::VecDeque,
         net::Ipv4Addr,
