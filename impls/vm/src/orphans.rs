@@ -6,9 +6,10 @@
 //! owns them. [`sweep_orphans`] reads the records at start-up and stops only what a record proves is ours and
 //! orphaned. See `docs/decisions/run-plane.md` decision 6.
 //!
-//! Safety rests on three rules. A process is stopped only when its pid and its start time both match the record, so a
+//! Safety rests on four rules. A process is stopped only when its pid and its start time both match the record, so a
 //! reused pid is never hit. A box is swept only when its owner is verifiably gone, so a second daemon or a running CLI
-//! is never touched. Nothing without a record is ever touched.
+//! is never touched. When the table cannot tell whether a process is there (a read failed), the box is left for the
+//! next sweep: an unreadable owner never reads as a dead one. Nothing without a record is ever touched.
 
 use std::{
     fs, io,
@@ -23,16 +24,33 @@ pub const RECORD_FILE: &str = "box.json";
 /// The largest record the sweep reads, in bytes. A record is a few lines; a bigger file is not ours.
 const MAX_RECORD_BYTES: u64 = 64 * 1024;
 
+/// What a [`ProcessTable`] knows about one pid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcState {
+    /// There is no such process.
+    Gone,
+    /// The table could not tell (a read failed for a reason other than "no such process"). Never read as gone.
+    Unknown,
+    /// The process exists and started at this time, in the table's own units.
+    Started(u64),
+}
+
 /// What the sweep needs to know about the host's processes, and the one thing it does to them. A trait so tests
 /// use a table of invented processes on any host; [`Procfs`] is the Linux implementation.
 pub trait ProcessTable {
-    /// When `pid` started, in the table's own units, or `None` when no such process exists.
-    fn start_time(&self, pid: u32) -> Option<u64>;
+    /// Whether `pid` exists and when it started.
+    fn state(&self, pid: u32) -> ProcState;
     /// The path of `pid`'s executable, or `None` when it cannot be read. Recorded for a human reading the record; the
     /// sweep never compares it, because a wrapper execs another binary after the process is recorded.
     fn exe(&self, pid: u32) -> Option<String>;
-    /// Send `pid` an unblockable kill. Best effort: the process may already be gone.
-    fn kill(&self, pid: u32);
+    /// Send `pid` an unblockable kill. `true` when the signal was delivered or the process was already gone, `false`
+    /// when it could not be sent (no permission, an invalid pid).
+    fn kill(&self, pid: u32) -> bool;
+    /// An id of the current boot, or `None` when the host has none. Processes do not survive a reboot.
+    fn boot_id(&self) -> Option<String>;
+    /// An id of the pid namespace this process reads pids in, or `None` when the host has none. A pid means nothing
+    /// in another namespace.
+    fn pid_namespace(&self) -> Option<String>;
 }
 
 /// A process as a record names it. The pid and the start time together tell it from a later process that reused
@@ -44,7 +62,8 @@ pub struct ProcId {
     pub pid: u32,
     /// The start time, in the units of the [`ProcessTable`] that wrote it.
     pub start: u64,
-    /// The executable path when the process was recorded. Informational: it can change by an `exec`.
+    /// The executable path when the process was recorded, or empty when it could not be read. Informational: it can
+    /// change by an `exec`.
     pub exe: String,
 }
 
@@ -56,6 +75,12 @@ pub struct BoxRecord {
     pub owner: ProcId,
     /// Every process the box started: the hypervisor, each virtiofsd, the egress proxy.
     pub procs: Vec<ProcId>,
+    /// The boot this record was written in. A record from an earlier boot names no live process.
+    #[serde(default)]
+    pub boot_id: String,
+    /// The pid namespace this record was written in. A sweep in another namespace cannot read its pids.
+    #[serde(default)]
+    pub pid_ns: String,
 }
 
 /// Writes a box's record, rewriting it each time a process is added so that a kill between two spawns still leaves
@@ -78,6 +103,8 @@ impl RecordWriter {
             record: BoxRecord {
                 owner: identify(table, owner_pid)?,
                 procs: Vec::new(),
+                boot_id: table.boot_id().unwrap_or_default(),
+                pid_ns: table.pid_namespace().unwrap_or_default(),
             },
         };
         write_record(&writer.path, &writer.record)?;
@@ -99,20 +126,21 @@ impl RecordWriter {
     }
 }
 
-/// Name `pid` as a record does, or fail when the table cannot: a process that cannot be told apart from a later one
-/// with its pid must not be recorded, since the sweep could never kill it safely.
+/// Name `pid` as a record does, or fail when the table cannot give its start time: a process that cannot be told
+/// apart from a later one with its pid must not be recorded, since the sweep could never kill it safely. The
+/// executable is only for a human reader, so an unreadable one is recorded as empty.
 fn identify(table: &dyn ProcessTable, pid: u32) -> io::Result<ProcId> {
-    let unknown = || {
-        io::Error::new(
+    match table.state(pid) {
+        ProcState::Started(start) => Ok(ProcId {
+            pid,
+            start,
+            exe: table.exe(pid).unwrap_or_default(),
+        }),
+        ProcState::Gone | ProcState::Unknown => Err(io::Error::new(
             io::ErrorKind::NotFound,
             "the process is not visible in the process table",
-        )
-    };
-    Ok(ProcId {
-        pid,
-        start: table.start_time(pid).ok_or_else(unknown)?,
-        exe: table.exe(pid).ok_or_else(unknown)?,
-    })
+        )),
+    }
 }
 
 /// Replace the record file in one step: write a private temp file beside it, then rename over it. A failure leaves
@@ -136,14 +164,6 @@ fn write_record(path: &Path, record: &BoxRecord) -> io::Result<()> {
         let _ = fs::remove_file(&temp);
     }
     result
-}
-
-/// Whether `process` is still the process the record named: same pid and same start time. The executable is not
-/// compared: a wrapper execs the real binary after `spawn` returns (nix's qemu does), so the executable recorded at
-/// launch is not stable. The start time survives an exec, and a later process that reuses the pid always started
-/// later, so it can never match.
-fn is_alive(table: &dyn ProcessTable, process: &ProcId) -> bool {
-    table.start_time(process.pid) == Some(process.start)
 }
 
 /// Read a box's record. `Ok(None)` when the directory has none; `Err` when there is one that is not ours to trust: a
@@ -199,6 +219,9 @@ pub struct SweepReport {
     pub live_owner: usize,
     /// Directories whose record could not be read or understood, left untouched.
     pub unreadable: usize,
+    /// Boxes left for the next sweep: a process could not be read or killed, or the record is from another pid
+    /// namespace.
+    pub undecided: usize,
 }
 
 /// Stop the processes of every box under `base` whose owner is gone, and remove its run directories.
@@ -245,6 +268,11 @@ pub fn sweep_orphans(base: &Path, table: &dyn ProcessTable) -> SweepReport {
     report
 }
 
+/// Whether `process` is still the process the record named: same pid and same start time.
+fn is_alive(table: &dyn ProcessTable, process: &ProcId) -> bool {
+    table.state(process.pid) == ProcState::Started(process.start)
+}
+
 /// The process table of a Linux host, read from `/proc`.
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, Default)]
@@ -252,12 +280,15 @@ pub struct Procfs;
 
 #[cfg(target_os = "linux")]
 impl ProcessTable for Procfs {
-    fn start_time(&self, pid: u32) -> Option<u64> {
-        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    fn state(&self, pid: u32) -> ProcState {
+        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return ProcState::Gone;
+        };
         // Field 2 (the command name) may hold spaces and parentheses; field 3 starts after the last `)`. Field 22,
         // the start time in clock ticks since boot, is the 20th after it.
-        let after = &stat[stat.rfind(')')? + 1..];
-        after.split_whitespace().nth(19)?.parse().ok()
+        stat.rfind(')')
+            .and_then(|end| stat[end + 1..].split_whitespace().nth(19)?.parse().ok())
+            .map_or(ProcState::Unknown, ProcState::Started)
     }
 
     fn exe(&self, pid: u32) -> Option<String> {
@@ -266,16 +297,28 @@ impl ProcessTable for Procfs {
             .map(|path| path.to_string_lossy().into_owned())
     }
 
-    fn kill(&self, pid: u32) {
+    fn kill(&self, pid: u32) -> bool {
         if let Some(pid) = i32::try_from(pid).ok().and_then(rustix::process::Pid::from_raw) {
             let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
         }
+        true
+    }
+
+    fn boot_id(&self) -> Option<String> {
+        None
+    }
+
+    fn pid_namespace(&self) -> Option<String> {
+        None
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, collections::BTreeMap};
+    use std::{
+        cell::RefCell,
+        collections::{BTreeMap, BTreeSet},
+    };
 
     use anyhow::Context;
 
@@ -285,6 +328,11 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         procs: BTreeMap<u32, (u64, String)>,
+        unreadable: BTreeSet<u32>,
+        hidden_exe: BTreeSet<u32>,
+        kill_fails: BTreeSet<u32>,
+        boot: Option<String>,
+        namespace: Option<String>,
         killed: RefCell<Vec<u32>>,
     }
 
@@ -294,22 +342,67 @@ mod tests {
             self
         }
 
+        /// `pid` exists but the table cannot read its state (a `/proc` read failed).
+        fn unreadable(mut self, pid: u32) -> Self {
+            self.unreadable.insert(pid);
+            self
+        }
+
+        /// The table cannot read `pid`'s executable.
+        fn hidden_exe(mut self, pid: u32) -> Self {
+            self.hidden_exe.insert(pid);
+            self
+        }
+
+        /// A kill signal to `pid` cannot be sent.
+        fn kill_fails(mut self, pid: u32) -> Self {
+            self.kill_fails.insert(pid);
+            self
+        }
+
+        fn booted(mut self, boot: &str) -> Self {
+            self.boot = Some(boot.to_owned());
+            self
+        }
+
+        fn in_namespace(mut self, namespace: &str) -> Self {
+            self.namespace = Some(namespace.to_owned());
+            self
+        }
+
         fn killed(&self) -> Vec<u32> {
             self.killed.borrow().clone()
         }
     }
 
     impl ProcessTable for Fake {
-        fn start_time(&self, pid: u32) -> Option<u64> {
-            self.procs.get(&pid).map(|p| p.0)
+        fn state(&self, pid: u32) -> ProcState {
+            if self.unreadable.contains(&pid) {
+                return ProcState::Unknown;
+            }
+            self.procs
+                .get(&pid)
+                .map_or(ProcState::Gone, |p| ProcState::Started(p.0))
         }
 
         fn exe(&self, pid: u32) -> Option<String> {
+            if self.hidden_exe.contains(&pid) {
+                return None;
+            }
             self.procs.get(&pid).map(|p| p.1.clone())
         }
 
-        fn kill(&self, pid: u32) {
+        fn kill(&self, pid: u32) -> bool {
             self.killed.borrow_mut().push(pid);
+            !self.kill_fails.contains(&pid)
+        }
+
+        fn boot_id(&self) -> Option<String> {
+            self.boot.clone()
+        }
+
+        fn pid_namespace(&self) -> Option<String> {
+            self.namespace.clone()
         }
     }
 
@@ -325,11 +418,14 @@ mod tests {
         }
     }
 
-    /// A box as the daemon (pid 100, start 1000) launched it: qemu 200, virtiofsd 201.
+    /// A box as the daemon (pid 100, start 1000) launched it: qemu 200, virtiofsd 201. No boot or namespace is
+    /// named, so the sweep takes the current ones to be the same.
     fn record() -> BoxRecord {
         BoxRecord {
             owner: id(100, 1000, DAEMON),
             procs: vec![id(200, 2000, QEMU), id(201, 2001, VIRTIOFSD)],
+            boot_id: String::new(),
+            pid_ns: String::new(),
         }
     }
 
@@ -464,8 +560,8 @@ mod tests {
     fn pid_zero_and_one_are_never_killed() -> anyhow::Result<()> {
         let base = tempfile::tempdir().context("tempdir")?;
         let record = BoxRecord {
-            owner: id(100, 1000, DAEMON),
             procs: vec![id(0, 1, "/sbin/init"), id(1, 1, "/sbin/init")],
+            ..record()
         };
         lay_out(base.path(), "run1", &record)?;
         let table = Fake::default().with(0, 1, "/sbin/init").with(1, 1, "/sbin/init");
@@ -473,6 +569,144 @@ mod tests {
         sweep_orphans(base.path(), &table);
 
         assert!(table.killed().is_empty(), "{:?}", table.killed());
+        Ok(())
+    }
+
+    /// Review of #666: a failed `/proc` read (no descriptors left, a `hidepid` mount) must not read as "the owner is
+    /// gone", or a live box's secret directory is deleted under a running VM.
+    #[test]
+    fn an_owner_that_cannot_be_read_leaves_its_box_alone() -> anyhow::Result<()> {
+        let base = tempfile::tempdir().context("tempdir")?;
+        lay_out(base.path(), "run1", &record())?;
+        let table = orphaned().unreadable(100);
+
+        let report = sweep_orphans(base.path(), &table);
+
+        assert!(table.killed().is_empty(), "{:?}", table.killed());
+        assert_eq!(
+            report,
+            SweepReport {
+                undecided: 1,
+                ..SweepReport::default()
+            }
+        );
+        assert!(exists(base.path(), "run1") && exists(base.path(), "run1-inputs"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_process_that_cannot_be_read_leaves_the_box_for_the_next_sweep() -> anyhow::Result<()> {
+        let base = tempfile::tempdir().context("tempdir")?;
+        lay_out(base.path(), "run1", &record())?;
+        let table = orphaned().unreadable(201);
+
+        let report = sweep_orphans(base.path(), &table);
+
+        assert_eq!(
+            table.killed(),
+            vec![200],
+            "the process that can be read is still stopped"
+        );
+        assert_eq!(
+            report,
+            SweepReport {
+                killed: 1,
+                undecided: 1,
+                ..SweepReport::default()
+            }
+        );
+        assert!(
+            exists(base.path(), "run1"),
+            "the box stays until every process is accounted for"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_kill_is_not_counted_and_leaves_the_box_for_the_next_sweep() -> anyhow::Result<()> {
+        let base = tempfile::tempdir().context("tempdir")?;
+        lay_out(base.path(), "run1", &record())?;
+        let table = orphaned().kill_fails(200);
+
+        let report = sweep_orphans(base.path(), &table);
+
+        assert_eq!(
+            report,
+            SweepReport {
+                killed: 1,
+                undecided: 1,
+                ..SweepReport::default()
+            }
+        );
+        assert!(exists(base.path(), "run1"));
+        Ok(())
+    }
+
+    /// A reboot ends every recorded process, so nothing is killed; a pid and start time from an earlier boot could
+    /// match an unrelated process of this one. The directories are only removed.
+    #[test]
+    fn a_box_from_an_earlier_boot_is_wiped_and_nothing_is_killed() -> anyhow::Result<()> {
+        let base = tempfile::tempdir().context("tempdir")?;
+        let record = BoxRecord {
+            boot_id: "boot-1".to_owned(),
+            ..record()
+        };
+        lay_out(base.path(), "run1", &record)?;
+        // Processes of this boot that happen to share the recorded pids and start times.
+        let table = orphaned().booted("boot-2");
+
+        let report = sweep_orphans(base.path(), &table);
+
+        assert!(table.killed().is_empty(), "{:?}", table.killed());
+        assert_eq!(
+            report,
+            SweepReport {
+                wiped: 1,
+                ..SweepReport::default()
+            }
+        );
+        assert!(!exists(base.path(), "run1"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_box_from_the_same_boot_is_swept_as_usual() -> anyhow::Result<()> {
+        let base = tempfile::tempdir().context("tempdir")?;
+        let record = BoxRecord {
+            boot_id: "boot-1".to_owned(),
+            ..record()
+        };
+        lay_out(base.path(), "run1", &record)?;
+        let table = orphaned().booted("boot-1");
+
+        sweep_orphans(base.path(), &table);
+
+        assert_eq!(table.killed(), vec![200, 201]);
+        Ok(())
+    }
+
+    /// Pids mean nothing in another pid namespace (a container sharing the base): the sweep cannot judge the box.
+    #[test]
+    fn a_box_from_another_pid_namespace_is_left_alone() -> anyhow::Result<()> {
+        let base = tempfile::tempdir().context("tempdir")?;
+        let record = BoxRecord {
+            pid_ns: "pid:[1]".to_owned(),
+            ..record()
+        };
+        lay_out(base.path(), "run1", &record)?;
+        let table = orphaned().in_namespace("pid:[2]");
+
+        let report = sweep_orphans(base.path(), &table);
+
+        assert!(table.killed().is_empty(), "{:?}", table.killed());
+        assert_eq!(
+            report,
+            SweepReport {
+                undecided: 1,
+                ..SweepReport::default()
+            }
+        );
+        assert!(exists(base.path(), "run1"));
         Ok(())
     }
 
@@ -516,6 +750,38 @@ mod tests {
         Ok(())
     }
 
+    /// A record that is itself a symlink is not ours to trust, even when it points at a well-formed one.
+    #[test]
+    fn a_symlinked_record_is_not_read() -> anyhow::Result<()> {
+        let base = tempfile::tempdir().context("tempdir")?;
+        let elsewhere = tempfile::tempdir().context("tempdir")?;
+        fs::create_dir_all(base.path().join("run1")).context("dir")?;
+        fs::write(
+            elsewhere.path().join("real.json"),
+            serde_json::to_vec(&record()).context("encode")?,
+        )
+        .context("write")?;
+        std::os::unix::fs::symlink(
+            elsewhere.path().join("real.json"),
+            base.path().join("run1").join(RECORD_FILE),
+        )
+        .context("symlink")?;
+        let table = orphaned();
+
+        let report = sweep_orphans(base.path(), &table);
+
+        assert_eq!(
+            report,
+            SweepReport {
+                unreadable: 1,
+                ..SweepReport::default()
+            }
+        );
+        assert!(table.killed().is_empty());
+        assert!(exists(base.path(), "run1"));
+        Ok(())
+    }
+
     #[test]
     fn a_directory_without_a_record_is_never_touched() -> anyhow::Result<()> {
         let base = tempfile::tempdir().context("tempdir")?;
@@ -546,6 +812,30 @@ mod tests {
         Ok(())
     }
 
+    /// The `-inputs` and `-outputs` directories are removed with the box; a symlink standing in for one is not
+    /// followed, and its target is untouched.
+    #[test]
+    fn a_symlinked_sibling_directory_is_not_followed() -> anyhow::Result<()> {
+        let base = tempfile::tempdir().context("tempdir")?;
+        let elsewhere = tempfile::tempdir().context("tempdir")?;
+        lay_out(base.path(), "run1", &record())?;
+        fs::remove_dir_all(base.path().join("run1-inputs")).context("remove")?;
+        fs::write(elsewhere.path().join("precious"), b"keep").context("write")?;
+        std::os::unix::fs::symlink(elsewhere.path(), base.path().join("run1-inputs")).context("symlink")?;
+        let table = orphaned();
+
+        let report = sweep_orphans(base.path(), &table);
+
+        assert_eq!(report.wiped, 1);
+        assert!(!exists(base.path(), "run1") && !exists(base.path(), "run1-outputs"));
+        assert!(
+            fs::symlink_metadata(base.path().join("run1-inputs")).is_ok(),
+            "the link is left in place"
+        );
+        assert!(elsewhere.path().join("precious").exists(), "its target is untouched");
+        Ok(())
+    }
+
     #[test]
     fn a_missing_base_is_an_empty_sweep() {
         let table = orphaned();
@@ -559,7 +849,9 @@ mod tests {
         let table = Fake::default()
             .with(100, 1000, DAEMON)
             .with(200, 2000, QEMU)
-            .with(201, 2001, VIRTIOFSD);
+            .with(201, 2001, VIRTIOFSD)
+            .booted("boot-1")
+            .in_namespace("pid:[1]");
 
         let mut writer = RecordWriter::create(dir.path(), &table, 100).context("create")?;
         let read = |dir: &Path| -> anyhow::Result<BoxRecord> {
@@ -569,7 +861,9 @@ mod tests {
             read(dir.path())?,
             BoxRecord {
                 owner: id(100, 1000, DAEMON),
-                procs: vec![]
+                procs: vec![],
+                boot_id: "boot-1".to_owned(),
+                pid_ns: "pid:[1]".to_owned(),
             }
         );
         writer.add(&table, 201).context("add virtiofsd")?;
@@ -584,7 +878,7 @@ mod tests {
     #[test]
     fn a_process_that_cannot_be_identified_is_not_recorded() -> anyhow::Result<()> {
         let dir = tempfile::tempdir().context("tempdir")?;
-        let table = Fake::default().with(100, 1000, DAEMON);
+        let table = Fake::default().with(100, 1000, DAEMON).unreadable(300);
         assert!(
             RecordWriter::create(dir.path(), &Fake::default(), 100).is_err(),
             "unknown owner"
@@ -593,20 +887,65 @@ mod tests {
         let mut writer = RecordWriter::create(dir.path(), &table, 100).context("create")?;
         let before = fs::read(dir.path().join(RECORD_FILE)).context("read")?;
         assert!(writer.add(&table, 999).is_err(), "unknown process");
+        assert!(writer.add(&table, 300).is_err(), "a process whose state cannot be read");
         assert_eq!(fs::read(dir.path().join(RECORD_FILE)).context("read")?, before);
         Ok(())
     }
 
-    /// The real process table reads this very process: it is alive, started, and runs the test binary.
+    /// The executable is only for a human reader and is never compared, so a process whose executable cannot be read
+    /// is still recorded, and can still be stopped.
+    #[test]
+    fn a_process_whose_executable_cannot_be_read_is_still_recorded() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().context("tempdir")?;
+        let table = Fake::default()
+            .with(100, 1000, DAEMON)
+            .with(200, 2000, QEMU)
+            .hidden_exe(200);
+
+        let mut writer = RecordWriter::create(dir.path(), &table, 100).context("create")?;
+        writer
+            .add(&table, 200)
+            .context("a hidden executable must not stop the record")?;
+
+        let record: BoxRecord =
+            serde_json::from_slice(&fs::read(dir.path().join(RECORD_FILE)).context("read")?).context("decode")?;
+        assert_eq!(record.procs, vec![id(200, 2000, "")]);
+        Ok(())
+    }
+
+    /// The real process table reads this very process: it is alive, started, runs the test binary, and has a boot id
+    /// and a pid namespace.
     #[cfg(target_os = "linux")]
     #[test]
     fn procfs_identifies_the_running_process() -> anyhow::Result<()> {
         let pid = std::process::id();
         let table = Procfs;
-        assert!(table.start_time(pid).is_some());
+        assert!(matches!(table.state(pid), ProcState::Started(_)));
         let exe = table.exe(pid).context("exe")?;
         assert_eq!(Path::new(&exe), std::env::current_exe().context("current_exe")?);
-        assert_eq!(table.start_time(u32::MAX - 1), None);
+        assert_eq!(table.state(u32::MAX - 1), ProcState::Gone);
+        assert!(
+            table.boot_id().is_some_and(|id| !id.is_empty()),
+            "a Linux host has a boot id"
+        );
+        assert!(
+            table.pid_namespace().is_some_and(|ns| ns.starts_with("pid:[")),
+            "and a pid namespace"
+        );
         Ok(())
+    }
+
+    /// A pid that cannot be signalled is reported, not ignored: pid 1 is never ours, and a pid above `i32::MAX`
+    /// would wrap to a negative one (a process group or every process) if it were not refused.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn procfs_refuses_a_pid_it_cannot_signal() {
+        let table = Procfs;
+        assert!(!table.kill(0), "pid 0 would signal this process's group");
+        assert!(!table.kill(u32::MAX), "u32::MAX wraps to -1, every process");
+        assert!(
+            !table.kill(i32::MAX as u32 + 1),
+            "above i32::MAX wraps negative, a process group"
+        );
     }
 }
