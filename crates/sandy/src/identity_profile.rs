@@ -517,24 +517,82 @@ mod tests {
         let long_name = "a".repeat(65);
         let many_targets: Vec<String> = (0..257).map(|i| format!("o/r{i}")).collect();
         let cases: Vec<(&str, &str, Value, &str)> = vec![
-            ("empty targets", "targets", json!([]), "targets"),
-            ("empty capabilities", "capabilities", json!([]), "capabilities"),
-            ("unknown capability", "capabilities", json!(["root"]), "capabilities"),
-            ("blank in a target", "targets", json!(["o r"]), "targets"),
-            ("parent segment", "targets", json!(["../x"]), "targets"),
-            ("inner parent segment", "targets", json!(["a/../b"]), "targets"),
-            ("absolute path", "targets", json!(["/abs"]), "targets"),
-            ("url", "targets", json!(["https://evil/x"]), "targets"),
-            ("empty segment", "targets", json!(["a//b"]), "targets"),
-            ("zero width character", "targets", json!(["o/r\u{200b}"]), "targets"),
-            ("non-ASCII lookalike", "targets", json!(["\u{0430}/r"]), "targets"),
-            ("too many targets", "targets", json!(many_targets), "targets"),
-            ("empty credential", "credential", json!(""), "credential"),
-            ("dot dot credential", "credential", json!(".."), "credential"),
-            ("dot dot name", "name", json!(".."), "name"),
-            ("leading dot name", "name", json!(".x"), "name"),
-            ("empty name", "name", json!(""), "name"),
-            ("name over the bound", "name", json!(long_name), "name"),
+            ("empty targets", "targets", json!([]), "targets must be"),
+            ("empty capabilities", "capabilities", json!([]), "capabilities must be"),
+            (
+                "unknown capability",
+                "capabilities",
+                json!(["root"]),
+                "capabilities must be",
+            ),
+            ("blank in a target", "targets", json!(["o r"]), "targets must be"),
+            ("parent segment", "targets", json!(["../x"]), "targets must be"),
+            ("inner parent segment", "targets", json!(["a/../b"]), "targets must be"),
+            ("absolute path", "targets", json!(["/abs"]), "targets must be"),
+            ("url", "targets", json!(["https://evil/x"]), "targets must be"),
+            ("empty segment", "targets", json!(["a//b"]), "targets must be"),
+            (
+                "zero width character",
+                "targets",
+                json!(["o/r\u{200b}"]),
+                "targets must be",
+            ),
+            (
+                "non-ASCII lookalike",
+                "targets",
+                json!(["\u{0430}/r"]),
+                "targets must be",
+            ),
+            ("too many targets", "targets", json!(many_targets), "targets must be"),
+            ("non-ASCII name", "name", json!("d\u{0435}v"), "name must be"),
+            (
+                "a hex string as a name",
+                "name",
+                json!("0123456789abcdef0123456789abcdef"),
+                "must not look like a credential",
+            ),
+            (
+                "an sk_ token as a name",
+                "name",
+                json!("sk_live_abcdefghijklmnop"),
+                "must not look like a credential",
+            ),
+            (
+                "a token as a credential",
+                "credential",
+                json!(SECRET),
+                "credential must name",
+            ),
+            (
+                "a hex string as a credential",
+                "credential",
+                json!("0123456789abcdef0123456789abcdef"),
+                "credential must name",
+            ),
+            (
+                "a bare name without an owner",
+                "targets",
+                json!(["repo"]),
+                "targets must be",
+            ),
+            (
+                "too many capabilities",
+                "capabilities",
+                json!(vec!["read_code"; 257]),
+                "capabilities must be",
+            ),
+            (
+                "too many service secrets",
+                "service_secrets",
+                json!(vec!["A"; 257]),
+                "service_secrets must be",
+            ),
+            ("empty credential", "credential", json!(""), "credential must name"),
+            ("dot dot credential", "credential", json!(".."), "credential must name"),
+            ("dot dot name", "name", json!(".."), "name must be"),
+            ("leading dot name", "name", json!(".x"), "name must be"),
+            ("empty name", "name", json!(""), "name must be"),
+            ("name over the bound", "name", json!(long_name), "name must be"),
             (
                 "lowercase secret name",
                 "service_secrets",
@@ -653,6 +711,72 @@ mod tests {
     fn an_empty_registry_is_valid_and_resolves_nothing() -> anyhow::Result<()> {
         let profiles = IdentityProfiles::parse(r#"{"profiles":[]}"#).context("parse")?;
         assert!(profiles.resolve("dev").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_name_of_exactly_the_bound_is_accepted() -> anyhow::Result<()> {
+        let name = "a".repeat(64);
+        let mut entry = valid_entry();
+        entry["name"] = json!(name);
+        let profiles = IdentityProfiles::parse(&registry(&entry)).context("parse")?;
+        profiles.resolve(&name).context("resolve the 64 character name")?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_name_collision_is_found_between_entries_that_are_not_adjacent() -> anyhow::Result<()> {
+        let named = |name: &str| {
+            let mut entry = valid_entry();
+            entry["name"] = json!(name);
+            entry
+        };
+        let text = json!({"profiles": [named("dev"), named("ops"), named("DEV")]}).to_string();
+        assert_eq!(refused(&text)?, IdentityProfileError::Duplicate { first: 0, second: 2 });
+        Ok(())
+    }
+
+    #[test]
+    fn a_repeated_target_is_kept_once() -> anyhow::Result<()> {
+        let mut entry = valid_entry();
+        entry["targets"] = json!(["o/r", "o/s", "o/r"]);
+        let profiles = IdentityProfiles::parse(&registry(&entry)).context("parse")?;
+        let targets = &profiles.resolve("dev").context("dev")?.scope().targets;
+        assert_eq!(targets, &[Target("o/r".to_owned()), Target("o/s".to_owned())]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_file_over_the_size_bound_is_refused_before_it_is_parsed() -> anyhow::Result<()> {
+        let padding = " ".repeat(1024 * 1024);
+        let err = refused(&format!(r#"{{"profiles":[]{padding}}}"#))?;
+        assert!(
+            matches!(err, IdentityProfileError::Malformed(ref m) if m.contains("too large")),
+            "{err:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn deeply_nested_input_is_refused_as_malformed() -> anyhow::Result<()> {
+        let text = format!("{}{}", "[".repeat(5000), "]".repeat(5000));
+        let err = refused(&text)?;
+        assert!(matches!(err, IdentityProfileError::Malformed(_)), "{err:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_wrong_shape_at_the_top_is_malformed() -> anyhow::Result<()> {
+        for text in [
+            r#"{"profiles":[],"extra":1}"#.to_owned(),
+            format!(r#"{{"profiles":[],"{SECRET}":1}}"#),
+            r#"{"other":[]}"#.to_owned(),
+            r#"[]"#.to_owned(),
+            r#"{"profiles":{}}"#.to_owned(),
+        ] {
+            let err = refused(&text)?;
+            assert!(matches!(err, IdentityProfileError::Malformed(_)), "{text}: {err:?}");
+        }
         Ok(())
     }
 }
