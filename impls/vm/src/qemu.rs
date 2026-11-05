@@ -360,7 +360,7 @@ struct BoxRecorder;
 impl BoxRecorder {
     #[cfg(target_os = "linux")]
     fn open(dir: &Path) -> Self {
-        match RecordWriter::create(dir, &Procfs, std::process::id()) {
+        match RecordWriter::open_or_create(dir, &Procfs, std::process::id()) {
             Ok(writer) => Self(Some(writer)),
             Err(err) => {
                 tracing::warn!(%err, "could not write the box record; a killed host would leave this VM behind");
@@ -481,7 +481,10 @@ impl QemuBackend {
         // Launch a virtiofsd per share and wait for its socket before qemu starts:
         // qemu connects to each as a client chardev, so the socket must exist first.
         // A launch or socket fault kills any daemon already up and fails the boot.
-        let virtiofsds = VirtiofsdTransport.activate(shares)?;
+        // Record each daemon as it spawns: `activate` waits up to 5 s per daemon for its socket, and a kill during that
+        // wait must still leave a record of it (#666).
+        let mut record = BoxRecorder::open(inst_dir);
+        let virtiofsds = VirtiofsdTransport.activate_recorded(shares, &mut |pid| record.add(pid))?;
         self.launch(spec, args, run_id, inst_dir, agent, egress, virtiofsds)
     }
 
@@ -515,17 +518,14 @@ impl QemuBackend {
         // The proxy belongs to this attempt. A start failure kills the daemons
         // already up and returns before qemu launches. `ProxyHandle` kills on drop,
         // so every later exit path stops it too.
-        let mut proxy: Option<ProxyHandle> = match egress.map(EgressLaunch::start).transpose() {
-            Ok(proxy) => proxy,
-            Err(err) => {
-                kill_children(&mut virtiofsds);
-                return Err(err);
-            }
-        };
-
-        if let Some(proxy) = &proxy {
-            record.add(proxy.pid());
-        }
+        let mut proxy: Option<ProxyHandle> =
+            match egress.map(|e| e.start_recorded(&mut |pid| record.add(pid))).transpose() {
+                Ok(proxy) => proxy,
+                Err(err) => {
+                    kill_children(&mut virtiofsds);
+                    return Err(err);
+                }
+            };
 
         // qemu_args emits `-serial chardev:<id>`; bind that id to a Unix-socket
         // chardev qemu creates (server=on, wait=off so the spawn doesn't block).

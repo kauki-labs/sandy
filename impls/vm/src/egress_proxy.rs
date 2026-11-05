@@ -123,8 +123,8 @@ impl<'a> EgressLaunch<'a> {
     ///
     /// # Errors
     /// As [`start`](Self::start).
-    pub(crate) fn start_recorded(&self, _on_spawn: &mut dyn FnMut(u32)) -> Result<ProxyHandle, BackendError> {
-        ProxyHandle::start(self)
+    pub(crate) fn start_recorded(&self, on_spawn: &mut dyn FnMut(u32)) -> Result<ProxyHandle, BackendError> {
+        ProxyHandle::start(self, on_spawn)
     }
 }
 
@@ -144,7 +144,8 @@ enum StartFailure {
 }
 
 impl ProxyHandle {
-    /// The proxy's process id, for the box record (#666).
+    /// The proxy's process id.
+    #[cfg(test)]
     pub(crate) fn pid(&self) -> u32 {
         self.child.id()
     }
@@ -169,7 +170,7 @@ impl ProxyHandle {
         let _ = self.child.wait();
     }
 
-    fn start(launch: &EgressLaunch<'_>) -> Result<Self, BackendError> {
+    fn start(launch: &EgressLaunch<'_>, on_spawn: &mut dyn FnMut(u32)) -> Result<Self, BackendError> {
         let policy = serde_json::to_vec(launch.policy)
             .map_err(|err| BackendError::Spawn(format!("egress proxy did not start: encode policy: {err}")))?;
         let cid = match &launch.listen {
@@ -177,7 +178,7 @@ impl ProxyHandle {
             // A bind failure on the unix socket is not a port clash: no retry.
             ProxyListen::Unix { socket } => {
                 let args = ["--unix".to_owned(), socket.to_string_lossy().into_owned()];
-                return match start_once(launch, &args, EGRESS_VSOCK_PORT, &policy) {
+                return match start_once(launch, &args, EGRESS_VSOCK_PORT, &policy, on_spawn) {
                     Ok(handle) => Ok(handle),
                     Err(StartFailure::AddrInUse(why) | StartFailure::Other(why)) => {
                         Err(BackendError::Spawn(format!("egress proxy did not start: {why}")))
@@ -194,7 +195,7 @@ impl ProxyHandle {
                 "--peer-cid".to_owned(),
                 cid.to_string(),
             ];
-            match start_once(launch, &args, port, &policy) {
+            match start_once(launch, &args, port, &policy, on_spawn) {
                 Ok(handle) => return Ok(handle),
                 Err(StartFailure::AddrInUse(why)) => {
                     tracing::debug!(attempt, port, "egress proxy port in use; retrying");
@@ -263,6 +264,7 @@ fn start_once(
     args: &[String],
     port: u32,
     policy: &[u8],
+    on_spawn: &mut dyn FnMut(u32),
 ) -> Result<ProxyHandle, StartFailure> {
     let mut command = Command::new(&launch.bin);
     // Sanitized environment: PATH only, never the forge token or any other secret.
@@ -277,6 +279,8 @@ fn start_once(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|err| StartFailure::Other(format!("spawn `{}`: {err}", launch.bin.display())))?;
+    // Reported before the wait for READY below: a kill during it must still leave a record of the proxy.
+    on_spawn(child.id());
     let mut handle = ProxyHandle { child, port };
 
     // The policy goes on stdin, then stdin closes (the thread owns it and drops it): the proxy waits

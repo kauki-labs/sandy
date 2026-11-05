@@ -132,6 +132,14 @@ impl RecordWriter {
     ///
     /// As [`create`](Self::create).
     pub fn open_or_create(dir: &Path, table: &dyn ProcessTable, owner_pid: u32) -> io::Result<Self> {
+        let path = dir.join(RECORD_FILE);
+        let owner = identify(table, owner_pid)?;
+        if let Ok(Some(record)) = read_record(&path)
+            && record.owner.pid == owner.pid
+            && record.owner.start == owner.start
+        {
+            return Ok(Self { path, record });
+        }
         Self::create(dir, table, owner_pid)
     }
 
@@ -142,8 +150,18 @@ impl RecordWriter {
     /// When `pid` cannot be identified through `table`, or the record cannot be written. The file keeps its
     /// previous content then.
     pub fn add(&mut self, table: &dyn ProcessTable, pid: u32) -> io::Result<()> {
+        let process = identify(table, pid)?;
+        // A process the record already names (an earlier stage recorded it) is not listed again.
+        if self
+            .record
+            .procs
+            .iter()
+            .any(|p| p.pid == process.pid && p.start == process.start)
+        {
+            return Ok(());
+        }
         let mut next = self.record.clone();
-        next.procs.push(identify(table, pid)?);
+        next.procs.push(process);
         write_record(&self.path, &next)?;
         self.record = next;
         Ok(())
@@ -391,6 +409,7 @@ fn is_run_dir_name(name: &str) -> bool {
 }
 
 /// What a `/proc/<pid>/stat` text says about the process, or `Unknown` when it does not parse.
+#[cfg(any(target_os = "linux", test))]
 fn parse_stat(stat: &str) -> ProcState {
     // Field 2 (the command name) may hold spaces and parentheses; field 3, the state, starts after the last `)`.
     let Some(end) = stat.rfind(')') else {
@@ -410,6 +429,7 @@ fn parse_stat(stat: &str) -> ProcState {
 }
 
 /// What a failed `/proc/<pid>/stat` read says about the process.
+#[cfg(any(target_os = "linux", test))]
 fn classify_missing(not_found: bool, srch: bool, proc_mounted: bool) -> ProcState {
     // ESRCH: the process exited while it was read. ENOENT means "no such process" only while `/proc` is mounted:
     // without it every pid reads ENOENT, and every process would read as gone.

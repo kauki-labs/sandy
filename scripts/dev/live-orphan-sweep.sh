@@ -31,7 +31,11 @@ mkdir -p "$work/home"
 printf 'data' >"$work/in.txt"
 pids=""
 cleanup() {
-  # Whatever the gate left running: only a recorded pid whose command is one of ours.
+  # Whatever the gate left running: only a recorded pid whose command is one of ours. Before the gate has read a record
+  # (an early exit), take the pids from whatever records exist: the proxy's command line holds no work dir to match.
+  if [ -z "$pids" ]; then
+    pids=$(python3 -I -c 'import json, sys; print(" ".join(str(p["pid"]) for f in sys.argv[1:] for p in json.load(open(f))["procs"]))' "$work"/sandy/*/box.json 2>/dev/null || true)
+  fi
   for pid in $pids; do
     case "$(ps -o comm= -p "$pid" 2>/dev/null || true)" in
     qemu-system* | virtiofsd | sandy-egress-pr*) kill -9 "$pid" 2>/dev/null || true ;;
@@ -56,7 +60,9 @@ sweep() {
 
 echo "== starting the guest"
 (
-  TMPDIR="$work" SANDY_HOME="$work/home" SANDY_EGRESS=proxy \
+  # A stub named by SANDY_QEMU_BIN or SANDY_VIRTIOFSD_BIN must never stand in for the hypervisor: this gate is only
+  # live with the real one (INV-S9).
+  env -u SANDY_QEMU_BIN -u SANDY_VIRTIOFSD_BIN TMPDIR="$work" SANDY_HOME="$work/home" SANDY_EGRESS=proxy \
     SANDY_EGRESS_PROXY_BIN="$target_dir/debug/sandy-egress-proxy" \
     nix shell nixpkgs#qemu nixpkgs#virtiofsd -c \
     "$target_dir/debug/sandy" -o json run "$repo_root/nix/guest#topologies.x86_64-linux.qemu-t3" \

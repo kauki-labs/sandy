@@ -39,11 +39,13 @@ impl VirtiofsdTransport {
         &self,
         bin: &str,
         shares: &[ShareSpec],
-        _on_spawn: &mut dyn FnMut(u32),
+        on_spawn: &mut dyn FnMut(u32),
     ) -> Result<Vec<Child>, BackendError> {
         let mut children = Vec::with_capacity(shares.len());
         for share in shares {
             let launched = spawn_virtiofsd(bin, share).and_then(|child| {
+                // Reported before the wait below: a kill during it must still leave a record of this daemon.
+                on_spawn(child.id());
                 children.push(child);
                 wait_for_socket(&share.socket, Duration::from_secs(5))
             });
@@ -163,7 +165,7 @@ pub fn virtiofsd_args(share: &ShareSpec) -> Vec<String> {
 fn spawn_virtiofsd(bin: &str, share: &ShareSpec) -> Result<Child, BackendError> {
     // Clear any stale socket so wait_for_socket can't observe a previous run's.
     let _ = std::fs::remove_file(&share.socket);
-    Command::new(&bin)
+    Command::new(bin)
         .args(virtiofsd_args(share))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
