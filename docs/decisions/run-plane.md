@@ -201,15 +201,18 @@ to 4096 bytes in the agent and again in the relay.
 
 ## 6. A killed host process leaves a record, and the next start sweeps it (#666)
 
-**Status:** accepted for qemu on Linux; the vfkit backend follows (epic #597).
+**Status:** accepted for qemu on Linux (epic #597). Not yet called by a shipped binary: `sandyd` and `sandy run` have to
+call `QemuBackend::sweep_orphans()` once at start-up, and until they do only the live gate and the
+`sweep_orphans` example run it. The vfkit backend follows.
 
 **Context.** A VM backend keeps its running boxes in memory. A `SIGKILL` of the host process (the `sandyd` daemon or
 a `sandy run`) leaves qemu, its virtiofsd daemons and its egress proxy running with ppid 1, still holding the guest
 CID and a staging directory that contains a secret share. A restart starts with an empty registry, so `boxes()` and
 the driver's orphan check cannot see them.
 
-**Decision.** `launch` writes `<run dir>/box.json`: the launching process (the owner) and each process the box starts,
-each with its pid, start time and executable, rewritten atomically as processes are added. `QemuBackend::sweep_orphans()`
+**Decision.** `run` writes `<run dir>/box.json` with the launching process (the owner) before any secret is staged, and
+`launch` rewrites it with each process the box starts, each with its pid, start time and executable, atomically as
+processes are added, plus the boot id and pid namespace. `QemuBackend::sweep_orphans()`
 reads the records under the staging base at start-up. For each box whose owner is gone, it kills every recorded
 process that is still alive, then removes the run directory and its `-inputs` and `-outputs` siblings.
 
@@ -227,6 +230,14 @@ process that is still alive, then removes the run directory and its `-inputs` an
   group. A group kill would hit the host or an unrelated group.
 - Nothing without a record is touched. Pid 0 and 1 are never killed, a record that is not a plain file, is over
   64 KiB or has an unknown field leaves its directory alone, and a symlink is never followed.
+- When the table cannot tell whether a process exists (a `/proc` read failed for a reason other than "no such process"),
+  the box is left for the next sweep. An unreadable owner never reads as a dead one: that would delete a running VM's
+  secret share. A kill that cannot be sent (no permission) leaves the box too, and is not counted as killed.
+- A record from an earlier boot names no running process (a reboot ends them all), so its directories are removed and
+  nothing is killed: a pid and start time from that boot could match an unrelated process of this one. A record from
+  another pid namespace is left alone, since its pids mean nothing here.
+- The owner is recorded before staging, so a kill at any point after the secret share exists leaves a record. A kill in
+  the few microseconds between a virtiofsd spawn and its entry in the record leaves that one daemon unrecorded.
 - A failed record write is logged and does not fail the run. That box goes unrecorded and would still be orphaned by
   a kill.
 - The sweep reads `/proc` on Linux. Off Linux it is a no-op until the vfkit backend writes records with a macOS
