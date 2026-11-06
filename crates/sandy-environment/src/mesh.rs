@@ -49,7 +49,20 @@ impl fmt::Display for JoinKey {
 /// Mask `hskey-auth-...` and `tskey-...` tokens in `text`.
 #[must_use]
 pub fn redact(text: &str) -> String {
-    unimplemented!("redact({text})")
+    const PREFIXES: [&str; 2] = ["hskey-auth-", "tskey-"];
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = PREFIXES.iter().filter_map(|p| rest.find(p)).min() {
+        out.push_str(&rest[..at]);
+        out.push_str(REDACTED);
+        let tail = &rest[at..];
+        let end = tail
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+            .unwrap_or(tail.len());
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// A seam failure. The message is redacted when the value is built.
@@ -72,8 +85,10 @@ pub trait RandomBytes {
 
 /// `sandbox-<16 hex>` from 8 random bytes.
 pub fn sandbox_name(rng: &mut impl RandomBytes) -> String {
-    let _ = rng;
-    unimplemented!("sandbox_name")
+    let mut bytes = [0u8; 8];
+    rng.fill(&mut bytes);
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!("sandbox-{hex}")
 }
 
 /// The coordination server (headscale) the guest joins.
@@ -145,15 +160,27 @@ impl<S: FileSink> SecretsDir<S> {
 
 impl<S: FileSink> GuestDelivery for SecretsDir<S> {
     async fn prepare(&self) -> Result<(), SeamError> {
-        unimplemented!("prepare {}", std::any::type_name::<S>())
+        self.0.ensure_dir()
     }
 
     async fn deliver(&self, files: &[(&str, &[u8])]) -> Result<(), SeamError> {
-        unimplemented!("deliver {}", files.len())
+        if !files.iter().any(|(n, _)| *n == HOSTNAME_FILE) {
+            return Err(SeamError::new(
+                "missing hostname file: the guest would keep its default name",
+            ));
+        }
+        if files.iter().any(|(n, _)| *n == READY_FILE) {
+            return Err(SeamError::new("the ready marker is written by delivery, not passed in"));
+        }
+        self.0.remove_file(READY_FILE)?;
+        for (name, bytes) in files {
+            self.0.write_file(name, bytes)?;
+        }
+        self.0.write_file(READY_FILE, b"")
     }
 
     async fn remove_secrets(&self) -> Result<(), SeamError> {
-        unimplemented!("remove_secrets")
+        self.0.remove_dir_all()
     }
 }
 
@@ -261,8 +288,93 @@ where
     B: VmBoot,
     S: ServiceReady,
 {
-    let _ = (coord, guest, vm, service, rng, cfg);
-    unimplemented!("setup")
+    let name = sandbox_name(rng);
+    let fail = |step, e: SeamError, key_burned| SetupError {
+        step,
+        name: name.clone(),
+        reason: e.to_string(),
+        key_burned,
+    };
+    guest.prepare().await.map_err(|e| fail(SetupStep::Prepare, e, false))?;
+    let key = coord
+        .mint_join_key(cfg.tag, cfg.key_ttl)
+        .await
+        .map_err(|e| fail(SetupStep::MintKey, e, false))?;
+    // From here the key is burned on any failure: expire it and never hand it out again.
+    let joined = join(coord, guest, vm, service, &name, &key, cfg).await;
+    if let Err((step, e)) = joined {
+        if let Err(expire) = coord.expire_key(&key).await {
+            tracing::warn!(error = %expire, "could not expire a burned join key");
+        }
+        return Err(fail(
+            step,
+            SeamError::new(e.to_string().replace(key.expose(), REDACTED)),
+            true,
+        ));
+    }
+    Ok(Provisioned { name, key })
+}
+
+async fn join<C, G, B, S>(
+    coord: &C,
+    guest: &G,
+    vm: &B,
+    service: &S,
+    name: &str,
+    key: &JoinKey,
+    cfg: &SetupConfig<'_>,
+) -> Result<(), (SetupStep, SeamError)>
+where
+    C: Coordination,
+    G: GuestDelivery,
+    B: VmBoot,
+    S: ServiceReady,
+{
+    vm.boot(name).await.map_err(|e| (SetupStep::Boot, e))?;
+    let files: [(&str, &[u8]); 2] = [(KEY_FILE, key.expose().as_bytes()), (HOSTNAME_FILE, name.as_bytes())];
+    guest.deliver(&files).await.map_err(|e| (SetupStep::Deliver, e))?;
+    if !poll(cfg, || coord.node_online(name))
+        .await
+        .map_err(|e| (SetupStep::JoinOnline, e))?
+    {
+        return Err((
+            SetupStep::JoinOnline,
+            SeamError::new(format!(
+                "node {name} not online after {} probes: the key may be expired, reused or refused",
+                cfg.poll_attempts
+            )),
+        ));
+    }
+    if !poll(cfg, || service.ready(name))
+        .await
+        .map_err(|e| (SetupStep::ServiceReady, e))?
+    {
+        return Err((
+            SetupStep::ServiceReady,
+            SeamError::new(format!(
+                "service on {name} did not answer below 500 after {} probes",
+                cfg.poll_attempts
+            )),
+        ));
+    }
+    Ok(())
+}
+
+/// Probe until `f` answers `true` or the attempts run out.
+async fn poll<F, Fut>(cfg: &SetupConfig<'_>, mut f: F) -> Result<bool, SeamError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<bool, SeamError>>,
+{
+    for attempt in 0..cfg.poll_attempts {
+        if attempt > 0 {
+            tokio::time::sleep(cfg.poll_interval).await;
+        }
+        if f().await? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Teardown did not finish cleanly. The caller keeps the environment record.
@@ -304,8 +416,38 @@ where
     G: GuestDelivery,
     T: TeardownSteps,
 {
-    let _ = (coord, guest, steps, name, key);
-    unimplemented!("teardown")
+    for (step, result) in [
+        ("unlink", steps.unlink().await),
+        ("revoke sessions", steps.revoke_sessions().await),
+        ("tailscale logout", steps.tailscale_logout().await),
+    ] {
+        if let Err(e) = result {
+            tracing::warn!(error = %e, "teardown step {step} failed, continuing");
+        }
+    }
+    let node = coord.delete_node(name).await;
+    let mut residue = Vec::new();
+    if let Some(key) = key
+        && let Err(e) = coord.expire_key(key).await
+    {
+        residue.push(format!("key: {e}"));
+    }
+    if let Err(e) = guest.remove_secrets().await {
+        residue.push(format!("secrets: {e}"));
+    }
+    if let Err(e) = node {
+        return Err(TeardownError::NodeStillPresent {
+            name: name.to_owned(),
+            reason: e.to_string(),
+        });
+    }
+    if residue.is_empty() {
+        return Ok(());
+    }
+    Err(TeardownError::Residue {
+        name: name.to_owned(),
+        reason: redact(&residue.join("; ")),
+    })
 }
 
 /// Access mode of the delegator link (`t3 environment link --access`).
@@ -336,8 +478,10 @@ pub struct LinkModeError(pub LinkAccess);
 /// # Errors
 /// [`LinkModeError`] for any mode but [`LinkAccess::FullAccess`].
 pub fn check_link_access(access: LinkAccess) -> Result<(), LinkModeError> {
-    let _ = access;
-    unimplemented!("check_link_access")
+    if access == LinkAccess::FullAccess {
+        return Ok(());
+    }
+    Err(LinkModeError(access))
 }
 
 #[cfg(test)]
