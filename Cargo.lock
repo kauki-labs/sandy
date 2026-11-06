@@ -2766,6 +2766,7 @@ dependencies = [
  "rusqlite",
  "rustix",
  "sandy-api",
+ "sandy-backend",
  "sandy-conn",
  "sandy-control-proto",
  "sandy-environment",

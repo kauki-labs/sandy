@@ -11,7 +11,7 @@ use sandy_conn::{Listener as MeshListener, TlsIdentity};
 use sandyd::{
     build_rev::{log_startup, resolve_rev, version_line, wants_version},
     dispatch::JobRegistry,
-    environment_backend,
+    environment_backend::{self, BackendSettings},
     environment_driver::EnvironmentDriver,
     environment_store::{EnvironmentStore, RetentionPolicy},
     gate_spawn,
@@ -930,23 +930,40 @@ fn start_environment_driver(environments: &Arc<EnvironmentStore>) -> Option<toki
             std::process::exit(1);
         }
     };
-    tracing::warn!(
-        "SANDY_ENV_BACKEND=process-insecure: environments run as host processes as this user with NO isolation; for \
-         trusted, local development only"
-    );
-    let backend = match sandy_environment::ProcessEnvironmentBackend::new(config.process) {
-        Ok(backend) => backend,
-        Err(e) => {
-            tracing::error!(error = %e, "could not start the process environment backend");
-            std::process::exit(1);
+    let backend: Arc<dyn sandy_api::environment::EnvironmentBackend + Send + Sync> = match config.backend {
+        BackendSettings::Process(process) => {
+            tracing::warn!(
+                "SANDY_ENV_BACKEND=process-insecure: environments run as host processes as this user with NO \
+                 isolation; for trusted, local development only"
+            );
+            match sandy_environment::ProcessEnvironmentBackend::new(process) {
+                Ok(backend) => Arc::new(backend),
+                Err(e) => {
+                    tracing::error!(error = %e, "could not start the process environment backend");
+                    std::process::exit(1);
+                }
+            }
         }
+        BackendSettings::VmQemu(vm) => vm_environment_backend(&vm),
     };
-    let driver = Arc::new(EnvironmentDriver::new(
-        Arc::clone(environments),
-        Arc::new(backend),
-        config.driver,
-    ));
+    let driver = Arc::new(EnvironmentDriver::new(Arc::clone(environments), backend, config.driver));
     Some(tokio::spawn(driver.run(environment_backend::DRIVER_INTERVAL)))
+}
+
+/// The qemu microVM environment backend. Only Linux can run one, and `from_env` refuses `vm-qemu` elsewhere.
+#[cfg(target_os = "linux")]
+fn vm_environment_backend(
+    vm: &environment_backend::VmQemuSettings,
+) -> Arc<dyn sandy_api::environment::EnvironmentBackend + Send + Sync> {
+    Arc::new(sandyd::environment_vm::backend(vm, tokio::runtime::Handle::current()))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn vm_environment_backend(
+    _vm: &environment_backend::VmQemuSettings,
+) -> Arc<dyn sandy_api::environment::EnvironmentBackend + Send + Sync> {
+    tracing::error!("SANDY_ENV_BACKEND=vm-qemu needs Linux");
+    std::process::exit(1);
 }
 
 /// Parse `$SANDY_MAX_ENVIRONMENTS`: the row cap [`EnvironmentStore::with_max_rows`]

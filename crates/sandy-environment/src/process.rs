@@ -22,8 +22,7 @@
 use std::{
     collections::BTreeMap,
     fs,
-    io::{Read, Write},
-    net::{SocketAddr, TcpListener, TcpStream},
+    net::{SocketAddr, TcpListener},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
@@ -38,6 +37,8 @@ use sandy_api::{
     environment::{Endpoint, EnvironmentBackend, EnvironmentSpec, Launch, Probe},
 };
 use sandy_fsutil::OwnedDir;
+
+use crate::probe::http_status;
 
 /// The longest environment id accepted.
 const MAX_ID: usize = 64;
@@ -145,29 +146,6 @@ fn substitute(argv: &[String], port: u16, dir: &Path, id: &str) -> Vec<String> {
 
 fn free_port() -> std::io::Result<u16> {
     Ok(TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port())
-}
-
-/// The HTTP status the service answers on `/`, or `None` if nothing answers.
-fn http_status(port: u16) -> Option<u16> {
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(500)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
-    stream.set_write_timeout(Some(Duration::from_secs(1))).ok()?;
-    stream
-        .write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        .ok()?;
-    // "HTTP/1.x NNN" is 12 bytes; a service may send it in several segments.
-    let mut buf = [0u8; 12];
-    let mut filled = 0;
-    while filled < buf.len() {
-        match stream.read(&mut buf[filled..]) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => filled += n,
-        }
-    }
-    let line = std::str::from_utf8(&buf[..filled]).ok()?;
-    let rest = line.strip_prefix("HTTP/1.")?;
-    rest.get(2..5)?.parse().ok()
 }
 
 /// Takes the state dir's exclusive lock, or says another daemon holds it.
@@ -434,7 +412,7 @@ impl EnvironmentBackend for ProcessEnvironmentBackend {
             Ok(None) => {}
             Err(e) => return Err(BackendError::Transport(format!("wait for the service: {e}"))),
         }
-        match http_status(r.port) {
+        match http_status(SocketAddr::from(([127, 0, 0, 1], r.port))) {
             None => Ok(Probe::Starting {
                 step: "boot".to_owned(),
             }),
