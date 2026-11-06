@@ -737,6 +737,44 @@ mod tests {
         Ok(())
     }
 
+    /// #627: loopback clients that hold every slot without sending a byte free them after `first_byte_timeout`, so a
+    /// real client is served again (a full cap of idle clients must not lock the bridge for good).
+    #[tokio::test]
+    async fn a_cap_full_of_silent_clients_serves_a_new_client_after_the_first_byte_timeout() -> anyhow::Result<()> {
+        let (dialer, _) = TcpDialer::new(echo_guest().await?);
+        let config = BridgeConfig {
+            first_byte_timeout: Duration::from_millis(300),
+            ..config(2, 0)
+        };
+        let bridge = Bridge::start(dialer, config).await?;
+
+        let mut silent = Vec::new();
+        for _ in 0..2 {
+            silent.push(TcpStream::connect(bridge.addr()).await?);
+        }
+        let mut over = TcpStream::connect(bridge.addr()).await?;
+        assert!(
+            closed_unanswered(&mut over).await?,
+            "with the cap held by silent clients, a new client is refused"
+        );
+
+        let mut served = false;
+        for _ in 0..50 {
+            let mut late = TcpStream::connect(bridge.addr()).await?;
+            if echoes(&mut late, b"late").await {
+                served = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            served,
+            "the silent clients' slots are freed after the first-byte timeout"
+        );
+        drop(silent);
+        Ok(())
+    }
+
     /// A peer that stopped reading must not pin the connection: the other direction's idle error ends it.
     #[tokio::test]
     async fn a_direction_that_ends_in_error_closes_the_other() -> anyhow::Result<()> {
