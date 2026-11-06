@@ -4,7 +4,14 @@
 //! path, so a daemon with a minimal PATH still finds it). Only sockets whose local port is the service port count, so
 //! the service's own outbound connections never read as use.
 
-use std::process::Command;
+use std::{
+    io::Read,
+    process::{Command, Stdio},
+    time::{Duration, Instant},
+};
+
+/// The longest a `netstat` run may take. The driver's pass waits on it.
+const NETSTAT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Number of established connections whose local port is `port`.
 ///
@@ -23,14 +30,47 @@ pub(crate) fn established_to(port: u16) -> Result<usize, String> {
         }
         Ok(total)
     } else {
-        let out = Command::new("/usr/sbin/netstat")
-            .args(["-an", "-p", "tcp"])
-            .output()
-            .map_err(|e| format!("run netstat: {e}"))?;
-        if !out.status.success() {
-            return Err(format!("netstat exited with {}", out.status));
+        let out = run_bounded(
+            Command::new("/usr/sbin/netstat").args(["-an", "-p", "tcp"]),
+            NETSTAT_TIMEOUT,
+        )?;
+        Ok(count_netstat(&out, port))
+    }
+}
+
+/// Runs `cmd` and returns its stdout, killing and reaping it after `timeout`.
+fn run_bounded(cmd: &mut Command, timeout: Duration) -> Result<String, String> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("run {:?}: {e}", cmd.get_program()))?;
+    let mut stdout = child.stdout.take().ok_or("no stdout pipe")?;
+    // A reader thread keeps a full pipe from blocking the child while we wait on it.
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stdout.read_to_string(&mut text);
+        text
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{:?} timed out after {timeout:?}", cmd.get_program()));
+            }
+            Err(e) => return Err(format!("wait for {:?}: {e}", cmd.get_program())),
         }
-        Ok(count_netstat(&String::from_utf8_lossy(&out.stdout), port))
+    };
+    let text = reader.join().map_err(|_| "reader thread panicked".to_owned())?;
+    if status.success() {
+        Ok(text)
+    } else {
+        Err(format!("{:?} exited with {status}", cmd.get_program()))
     }
 }
 
@@ -73,6 +113,21 @@ mod tests {
          0100007F:0ECD 0100007F:C351 01 00000000:00000000 00:00000000 00000000  1000        0 3 1 0\n   3: \
          0100007F:C350 0100007F:0ECD 01 00000000:00000000 00:00000000 00000000  1000        0 4 1 0\n   4: \
          0100007F:0ECD 0100007F:C352 06 00000000:00000000 00:00000000 00000000  1000        0 5 1 0\n";
+
+    #[test]
+    fn a_command_that_outlives_its_timeout_is_killed_and_reported() {
+        let started = Instant::now();
+        let err = run_bounded(Command::new("sleep").arg("30"), Duration::from_millis(200)).unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the child must be killed, not awaited"
+        );
+        assert_eq!(
+            run_bounded(Command::new("echo").arg("hi"), Duration::from_secs(5)).as_deref(),
+            Ok("hi\n")
+        );
+    }
 
     #[test]
     fn proc_rows_count_only_established_sockets_on_the_local_port() {
