@@ -256,7 +256,8 @@ pub fn parse_input(raw: &str, index: usize) -> Result<Input, PlanError> {
 /// `result`, is resolved here, once, by the user's own command. A path that is not a link, or whose link does not
 /// resolve, is returned as given (the stage then refuses a dangling link by name).
 fn resolve_input_host(host: &str) -> PathBuf {
-    let path = PathBuf::from(host);
+    // `components` drops a trailing `/` and `/.`, which would make the check below follow the link.
+    let path: PathBuf = PathBuf::from(host).components().collect();
     match std::fs::symlink_metadata(&path) {
         Ok(meta) if meta.file_type().is_symlink() => std::fs::canonicalize(&path).unwrap_or(path),
         _ => path,

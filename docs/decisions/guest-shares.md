@@ -380,20 +380,37 @@ so the bytes of the host file it named reached the guest with no race at all.
 
 **Decision.** Each host path is opened once, without following a link, and everything below it goes through that
 directory handle (`sandy_fsutil::Beneath`: `openat`, `mkdirat` and `fstat` on the opened fd, `O_NOFOLLOW` on every
-component under the leaf). Inputs: an input that is itself a symlink is refused; inside a tree a symlink is staged as
-a link and never read, so no host bytes cross and a relative link between staged entries keeps working; a fifo,
-socket or device is skipped. `sandy run --input` resolves a link the user typed (a nix `result`) itself, once, so
-that still works. Outputs: a symlink at the destination, or planted inside it, is refused with an error, not written
-through; the guest-written source is read the same way. Secrets already refused a symlink at the leaf (#174).
+component under the leaf). A trailing `/` or `/.` is dropped first, because the kernel follows a link in the last
+component when the path ends that way.
 
-**Consequences.** A directory swapped for a link after it was opened changes nothing (`a_directory_swapped_for_a_symlink_after_it_was_opened_is_not_followed`).
-A link inside an input tree is no longer copied by value: that is a behaviour change for a tree that relied on it.
+- Inputs: an input that is itself a symlink is refused. Inside a tree a symlink is staged as a link and never read,
+  so no host bytes cross. A fifo, socket or device inside a tree is skipped (as the top-level input, it is an error).
+  Staged entries are created new, never through an existing entry, and a repeated input name is refused, so a link
+  staged earlier is never written through. `sandy run --input` resolves a link the user typed (a nix `result`) itself,
+  once, so that still works.
+- Outputs: a symlink at the destination, or planted inside it, is refused with an error, not written through; the
+  guest-written source is read the same way. A dangling link at the top of an output source is now recorded as a
+  skipped symlink, where it used to vanish without a trace.
+- Secrets already refused a symlink at the leaf (#174).
+
+**Consequences.** A directory swapped for a link after it was opened changes nothing
+(`a_directory_swapped_for_a_symlink_after_it_was_opened_is_not_followed`). Two behaviour changes for inputs:
+
+- A link inside an input tree is no longer copied by value. A tree whose links are absolute (a nix `buildEnv` or
+  `symlinkJoin` result, a venv, `node_modules/.bin`) now has links that dangle in the guest, whose store is a separate
+  image. Pass the resolved path, or a tree without such links.
+- The share directory can now hold host symlinks. virtiofsd looks entries up without following them, so the guest
+  resolves them in its own namespace; the vfkit (Apple Virtualization) server's behaviour on a host link is not
+  verified here.
 
 **Residual.** The components above the leaf still resolve as the OS resolves them, so a swap of a parent directory is
-not closed. Closing it needs a trusted root to open beneath, and sandyd has none: the broker's per-client `roots` do
-not reach the control RPC. That is a public-API change (an optional base on the submit message and on `Input`,
-`Output` and `SecretRef`), proposed on #618 and #607. A write through a hard link, or a leaf swapped for a hard
-link, is not closed either (writing a temp file and renaming it over the name would).
+not closed. A client that picks the path can always give `root/a/leaf` and swap `root/a`, so this change does **not**
+protect the daemon from a hostile broker client; it narrows the window for a concurrent swap at the leaf and removes
+the by-value copy of links. Closing the rest needs a trusted root to open beneath, and sandyd has none: the broker's
+per-client `roots` do not reach the control RPC. That is a public-API change (an optional base on the submit message
+and on `Input`, `Output` and `SecretRef`), proposed on #618 and #607. Also open: a write through a hard link, or a leaf
+swapped for one (writing a temp file and renaming it over the name would close it), and reading a hard-linked file
+inside an input tree (macOS has no protected hardlinks).
 
 **Set aside.** `canonicalize`, then walk: `canonicalize` follows a link swapped in after the check, so the walk would
 open the attacker's target cleanly. Walking the raw path from `/` with no-follow on every component: it refuses

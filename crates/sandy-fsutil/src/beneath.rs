@@ -61,12 +61,13 @@ impl Beneath {
     ///
     /// [`FsError::Unsafe`] when the leaf is a symlink or not a directory, else [`FsError::Io`].
     pub fn open_dir(path: &Path) -> Result<Self, FsError> {
-        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-        let fd = rustix::fs::open(path, flags, Mode::empty()).map_err(|e| refused("open directory", path, e, true))?;
-        Ok(Self {
-            fd,
-            path: path.to_owned(),
-        })
+        // A trailing `/` or `/.` makes the kernel resolve a link in the last component even with `O_NOFOLLOW`, so the
+        // leaf is opened by name below its parent, which `Path` normalizes. A path with no final name (`.`, `..`,
+        // `/`) names no link.
+        match split(path) {
+            Ok((parent, name)) => Self::open_dir_following_leaf(parent)?.open_subdir(name),
+            Err(_) => Self::open_dir_following_leaf(path),
+        }
     }
 
     /// Create the directory at `path` (its parents by path, as `create_dir_all` does) and open it. The leaf is
@@ -78,7 +79,7 @@ impl Beneath {
     pub fn create_dir_at(path: &Path) -> Result<Self, FsError> {
         let (parent, name) = split(path)?;
         std::fs::create_dir_all(parent).map_err(|e| FsError::io("create parent directories", parent, e))?;
-        Self::open_dir(parent)?.create_dir(name)
+        Self::open_dir_following_leaf(parent)?.create_dir(name)
     }
 
     /// The path this handle was opened at, for messages. It is never resolved again.
@@ -163,6 +164,41 @@ impl Beneath {
         regular(fd, &path)
     }
 
+    /// Create the regular file `name` for writing. It must not exist: an existing entry, a symlink included, is
+    /// refused, so staging never writes through a link. The file is `0600`; the caller sets its final mode through
+    /// the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// [`FsError::Unsafe`] when `name` exists (as a symlink or anything else), else [`FsError::Io`].
+    pub fn create_new_file(&self, name: &OsStr) -> Result<File, FsError> {
+        let name = component(name, &self.path)?;
+        let path = self.path.join(name);
+        let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let fd = rustix::fs::openat(&self.fd, name, flags, Mode::from_raw_mode(0o600)).map_err(|e| {
+            if e == Errno::EXIST {
+                FsError::Unsafe {
+                    path: path.clone(),
+                    reason: "already exists; refusing to write through it".to_owned(),
+                }
+            } else {
+                refused("create file", &path, e, false)
+            }
+        })?;
+        Ok(File::from(fd))
+    }
+
+    /// Create the symlink `name` pointing at `target`. It must not exist. The host never follows it.
+    ///
+    /// # Errors
+    ///
+    /// [`FsError::Io`] when `name` exists or the link cannot be created.
+    pub fn create_symlink(&self, name: &OsStr, target: &Path) -> Result<(), FsError> {
+        let name = component(name, &self.path)?;
+        rustix::fs::symlinkat(target, &self.fd, name)
+            .map_err(|e| FsError::io("create symlink", &self.path.join(name), e))
+    }
+
     /// Create the regular file `name` for writing, or truncate it when it already is one. A symlink there is
     /// refused, so the daemon never writes through a link.
     ///
@@ -237,6 +273,10 @@ fn regular(fd: std::os::fd::OwnedFd, path: &Path) -> Result<File, FsError> {
             path: path.to_owned(),
             reason: "is not a regular file".to_owned(),
         });
+    }
+    // NONBLOCK only guarded the open against a fifo; a regular file does not need it.
+    if let Ok(flags) = rustix::fs::fcntl_getfl(&fd) {
+        let _ = rustix::fs::fcntl_setfl(&fd, flags & !OFlags::NONBLOCK);
     }
     Ok(File::from(fd))
 }
@@ -400,6 +440,84 @@ mod tests {
                 (OsString::from("f"), EntryKind::File),
                 (OsString::from("l"), EntryKind::Symlink),
             ]
+        );
+        Ok(())
+    }
+
+    /// #618 (review): a trailing `/` or `/.` must not make the kernel follow a link in the last component.
+    #[test]
+    fn a_trailing_slash_or_dot_does_not_make_a_symlink_followable() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let real = dir.path().join("real");
+        fs::create_dir(&real)?;
+        let link = dir.path().join("link");
+        symlink(&real, &link)?;
+
+        for suffix in ["", "/", "/."] {
+            let path = PathBuf::from(format!("{}{suffix}", link.display()));
+            assert!(
+                matches!(Beneath::open_dir(&path), Err(FsError::Unsafe { .. })),
+                "{suffix:?}"
+            );
+        }
+        // A real directory still opens, however it is spelled, and `.` names no link.
+        for suffix in ["", "/", "/."] {
+            Beneath::open_dir(&PathBuf::from(format!("{}{suffix}", real.display()))).context("a real directory")?;
+        }
+        Beneath::open_dir(Path::new(".")).context("the current directory")?;
+        Ok(())
+    }
+
+    /// #618 (review): only the destination is not followed; a link above it (macOS `/tmp`) resolves as usual.
+    #[test]
+    fn create_dir_at_resolves_a_link_above_the_destination() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let real = dir.path().join("real");
+        fs::create_dir(&real)?;
+        symlink(&real, dir.path().join("via"))?;
+
+        Beneath::create_dir_at(&dir.path().join("via").join("out")).context("a link above the leaf")?;
+
+        assert!(real.join("out").is_dir());
+        Ok(())
+    }
+
+    /// #618 (review): a new file is refused when the name exists, a symlink included, and the target is untouched.
+    #[test]
+    fn create_new_file_never_writes_through_an_existing_entry() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let victim = dir.path().join("victim");
+        fs::write(&victim, b"HOST-FILE")?;
+        symlink(&victim, dir.path().join("link"))?;
+        fs::write(dir.path().join("plain"), b"x")?;
+        let held = Beneath::open_dir(dir.path())?;
+
+        assert!(matches!(
+            held.create_new_file(name("link")),
+            Err(FsError::Unsafe { .. })
+        ));
+        assert!(matches!(
+            held.create_new_file(name("plain")),
+            Err(FsError::Unsafe { .. })
+        ));
+        io::Write::write_all(&mut held.create_new_file(name("fresh"))?, b"ok")?;
+        assert_eq!(fs::read(&victim)?, b"HOST-FILE");
+        assert_eq!(fs::read(dir.path().join("fresh"))?, b"ok");
+        Ok(())
+    }
+
+    /// A staged symlink keeps its text and is not followed to create it.
+    #[test]
+    fn create_symlink_keeps_the_target_text() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let held = Beneath::open_dir(dir.path())?;
+
+        held.create_symlink(name("l"), Path::new("/no/such/target"))?;
+
+        assert_eq!(fs::read_link(dir.path().join("l"))?, Path::new("/no/such/target"));
+        assert!(
+            held.create_symlink(name("l"), Path::new("/x")).is_err(),
+            "it must not exist"
         );
         Ok(())
     }
