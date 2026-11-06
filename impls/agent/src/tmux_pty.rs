@@ -180,6 +180,16 @@ impl TmuxJob {
         let session = format!("sandy-job-{unique}");
         let log = tmp.join(format!("sandy-job-{unique}.log"));
         let _ = std::fs::remove_file(&log);
+        // 0600, created here: `pipe-pane`'s `cat >>` keeps the mode of an existing file, and a job's output
+        // can carry a credential (#669) that another local user must not read from the temp dir.
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .create_new(true)
+                .append(true)
+                .mode(0o600)
+                .open(&log)?;
+        }
 
         // Printed to stdout, not a separate file: this marker rides the same
         // pty -> pipe-pane -> log stream `wait_for_exit` tails, so observing
@@ -575,6 +585,8 @@ impl Drop for TmuxJob {
     /// once here) is harmless.
     fn drop(&mut self) {
         self.kill();
+        // The transcript can hold a credential (#669); it does not outlive the job.
+        let _ = std::fs::remove_file(&self.log);
     }
 }
 
