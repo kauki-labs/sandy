@@ -2240,9 +2240,10 @@ pass).
 - The driver's `Ready` pass stops a row whose lease ran out, through the same `stop` an owner uses. The next pass sees `Stopped` and kills the box, so there is one kill path and a daemon restart changes nothing.
 - The stop is one conditional statement in the store (`stop_if_idle`), not a read then a stop, so a renewal that lands between the driver's snapshot and its write wins.
 - Owner-visible use renews the lease: today a `GetEnvironment` call, and attach when it lands. A failed renewal never fails the read.
+- Backend-reported use renews it too (#645). `EnvironmentBackend::active` says whether a client uses the service now; the default is `false`. The driver touches the row on each `Ready` pass while it answers `true`. The process backend counts established connections whose local port is the service port (`/proc/net/tcp{,6}` on Linux, `netstat -an -p tcp` elsewhere). A failed check is logged and counts as not active. The VM backend reports nothing until the host bridge (C3b) can count connections.
 - Rows that were `Ready` before the column existed have no renewal, so their lease runs from `updated_at`. Enabling the limit on an existing store stops every environment older than the limit at the first pass.
 
-**Consequences.** A client that connects straight to the service endpoint, as a T3 client does after pairing, is invisible to `sandyd`, so it does not renew the lease. Set the limit long enough for that, or leave it off. A backend-reported activity signal (connections through the bridge) is the follow-up that closes this gap.
+**Consequences.** Under the process backend a client that connects straight to the service endpoint, as a T3 client does after pairing, holds the lease while the connection stays open. An idle connection held open (a browser tab) also holds it; the limit measures connections, not traffic. Under the VM backend such a client is still invisible until the bridge reports connections; set the limit long enough for that, or leave it off.
 
 A client that polls `GetEnvironment` renews the lease for as long as it polls, and `sandyd` does not check who the caller is, so any local caller can renew. A status poller therefore keeps an environment alive on purpose. Narrowing renewal to attach is the follow-up once attach exists.
 

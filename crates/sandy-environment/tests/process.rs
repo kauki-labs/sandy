@@ -2,6 +2,7 @@
 //! processes (`fake-t3`, a stand-in for `t3 serve` and `t3 pair`).
 
 use std::{
+    io::Write,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -540,5 +541,35 @@ fn a_second_kill_removes_a_directory_the_first_could_not() -> Result<()> {
     std::fs::write(leftover.join("pairing"), "stale")?;
     b.kill("env-1")?;
     assert!(!leftover.exists(), "a retried kill must clear a leftover directory");
+    Ok(())
+}
+
+#[test]
+fn a_client_connected_to_the_service_makes_the_environment_active_until_it_disconnects() -> Result<()> {
+    let state = private_tempdir()?;
+    let b = backend(state.path(), &[])?;
+    b.launch(&spec("env-1"))?;
+    let Probe::Ready { endpoint } = wait_for(&b, "env-1", |p| matches!(p, Probe::Ready { .. }))? else {
+        bail!("not ready")
+    };
+    assert!(!b.active("env-1")?, "no client is connected yet");
+    let mut client = std::net::TcpStream::connect((endpoint.host.as_str(), endpoint.port))?;
+    client.write_all(b"HOLD")?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !b.active("env-1")? {
+        assert!(
+            Instant::now() < deadline,
+            "a connected client was never seen as activity"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    drop(client);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while b.active("env-1")? {
+        assert!(Instant::now() < deadline, "a closed connection still reads as activity");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!b.active("no-such-env")?, "an unknown environment is not active");
+    b.kill("env-1")?;
     Ok(())
 }
