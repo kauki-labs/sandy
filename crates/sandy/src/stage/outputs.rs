@@ -449,6 +449,30 @@ mod tests {
         Ok(())
     }
 
+    /// #680 (review): every entry scanned counts against the ceiling, a skipped symlink included, so a guest cannot
+    /// make the host walk an unbounded directory of links.
+    #[test]
+    fn skipped_symlinks_count_against_the_entry_ceiling() -> anyhow::Result<()> {
+        let run = tempfile::TempDir::new()?;
+        let src = run.path().join("src");
+        fs::create_dir(&src)?;
+        for i in 0..5 {
+            std::os::unix::fs::symlink("/nonexistent", src.join(format!("l{i}")))?;
+        }
+        let dest = run.path().join("dest");
+        let from = Beneath::open_dir(&src)?;
+        let to = Beneath::create_dir_at(&dest)?;
+        let mut budget = Budget {
+            bytes: u64::MAX,
+            entries: 3,
+        };
+
+        let result = copy_dir(&from, &to, "", &mut budget, None);
+
+        assert!(result.is_err(), "5 links must exceed a ceiling of 3 entries");
+        Ok(())
+    }
+
     /// #373: with digests off nothing is hashed and there is no report.
     #[test]
     fn digests_off_returns_no_report() -> anyhow::Result<()> {

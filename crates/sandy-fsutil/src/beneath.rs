@@ -468,6 +468,50 @@ mod tests {
         Ok(())
     }
 
+    /// #680 (review): `--out .` names the current directory, and `/.` after an existing directory names that
+    /// directory. Neither is a link, so both open.
+    #[test]
+    fn create_dir_at_accepts_a_destination_without_a_final_name() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+
+        Beneath::create_dir_at(Path::new(".")).context("the current directory")?;
+        Beneath::create_dir_at(&PathBuf::from(format!("{}/.", dir.path().display())))
+            .context("an existing directory, spelled with /.")?;
+        Ok(())
+    }
+
+    /// #680 (review): a parent above the leaf only needs search (execute) permission, not read: an input file under an
+    /// execute-only directory still opens, and a destination under a write-and-execute-only one is still created.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_parent_without_read_permission_is_still_usable() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if rustix::process::geteuid().is_root() {
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let exec_only = dir.path().join("exec-only");
+        fs::create_dir(&exec_only)?;
+        fs::write(exec_only.join("f"), b"x")?;
+        let write_exec = dir.path().join("write-exec");
+        fs::create_dir(&write_exec)?;
+        fs::set_permissions(&exec_only, fs::Permissions::from_mode(0o100))?;
+        fs::set_permissions(&write_exec, fs::Permissions::from_mode(0o300))?;
+
+        let opened = open_file(&exec_only.join("f"));
+        let created = create_file_at(&write_exec.join("new"));
+        let dest = Beneath::create_dir_at(&write_exec.join("sub"));
+
+        fs::set_permissions(&exec_only, fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(&write_exec, fs::Permissions::from_mode(0o700))?;
+        opened.context("a file under an execute-only parent")?;
+        created.context("a file under a write-and-execute-only parent")?;
+        dest.context("a directory under a write-and-execute-only parent")?;
+        assert!(write_exec.join("new").exists() && write_exec.join("sub").is_dir());
+        Ok(())
+    }
+
     /// #618 (review): only the destination is not followed; a link above it (macOS `/tmp`) resolves as usual.
     #[test]
     fn create_dir_at_resolves_a_link_above_the_destination() -> anyhow::Result<()> {
