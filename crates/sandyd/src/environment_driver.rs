@@ -198,6 +198,15 @@ impl EnvironmentDriver {
     ) -> Result<(), EnvironmentStoreError> {
         let id = row.environment_id.as_str();
         if !running.contains(id) {
+            // Covers a row made while the gate was off, and a resume: the create gate alone does not.
+            if self.store.trusted_submitter_required() && !row.submitter_trusted {
+                return self.fail(
+                    id,
+                    "admission",
+                    "the backend serves trusted submitters only and this environment was not created by one",
+                    report,
+                );
+            }
             let Some(spec) = self.to_spec(row) else {
                 return self.fail(id, "spec", "the stored spec does not decode", report);
             };
@@ -450,6 +459,30 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0)
+    }
+
+    #[test]
+    fn a_trusted_only_driver_fails_a_row_that_was_not_created_by_a_trusted_submitter() -> Result<()> {
+        let r = rig(FakeEnvironmentBackend::new())?;
+        r.store.require_trusted_submitter();
+        let untrusted = add(&r.store, 1)?;
+        let trusted = "env-2";
+        r.store.create_for(
+            "r2",
+            trusted,
+            &spec_bytes("small"),
+            "sandy.control.v1.EnvironmentSpec",
+            true,
+        )?;
+
+        let report = r.driver.reconcile_once(now())?;
+        assert_eq!(report.failed, std::slice::from_ref(&untrusted));
+        assert_eq!(report.launched, [trusted.to_owned()], "only the trusted row launches");
+        let rec = state(&r.store, &untrusted)?;
+        assert_eq!(rec.state, EnvironmentState::Failed);
+        assert_eq!(rec.failure.map(|f| f.step).as_deref(), Some("admission"));
+        assert_eq!(r.backend.launched().len(), 1, "the backend never saw the untrusted row");
+        Ok(())
     }
 
     #[test]
