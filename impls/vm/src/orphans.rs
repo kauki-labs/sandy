@@ -1839,6 +1839,69 @@ mod tests {
         Ok(())
     }
 
+    /// Review of #678: removing the run directory can fail part way, after it has deleted `box.json` (read-only
+    /// staging parent, a busy entry). Everything the record guards must already be gone by then, so the failure never
+    /// strands a secret share with no record to find it.
+    #[test]
+    fn a_failed_removal_of_the_run_directory_leaves_nothing_the_record_guarded() -> anyhow::Result<()> {
+        let base = tempfile::tempdir().context("tempdir")?;
+        lay_out(base.path(), RUN1, &record())?;
+        let run = base.path().join(RUN1);
+        fs::create_dir_all(run.join("secret")).context("mkdir secret")?;
+        fs::write(run.join("secret").join("key"), b"s").context("write key")?;
+
+        let done = wipe_box_with(base.path(), RUN1, &|dir| {
+            if dir == run {
+                // A removal that takes the record first and then fails.
+                let _ = fs::remove_file(dir.join(RECORD_FILE));
+                Err(io::Error::other("busy"))
+            } else {
+                force_remove_dir_all(dir)
+            }
+        });
+
+        assert!(!done, "the run directory is still there");
+        assert!(
+            !run.join("secret").exists(),
+            "the secret share must be gone before the record is touched"
+        );
+        assert!(!run.join("data").exists(), "so must the rest of the run directory");
+        Ok(())
+    }
+
+    /// Review of #678: making a read-only tree writable must not follow a link: the link's target keeps its mode and
+    /// its content, and the tree still goes.
+    #[cfg(unix)]
+    #[test]
+    fn making_a_tree_writable_does_not_follow_a_symlink() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if rustix::process::geteuid().is_root() {
+            return Ok(());
+        }
+        let base = tempfile::tempdir().context("tempdir")?;
+        let victim = base.path().join("victim");
+        fs::create_dir(&victim)?;
+        fs::write(victim.join("f"), b"x")?;
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o500))?;
+        let tree = base.path().join("tree");
+        fs::create_dir_all(tree.join("sub"))?;
+        fs::write(tree.join("sub").join("g"), b"y")?;
+        std::os::unix::fs::symlink(&victim, tree.join("link"))?;
+        fs::set_permissions(tree.join("sub"), fs::Permissions::from_mode(0o500))?;
+        fs::set_permissions(&tree, fs::Permissions::from_mode(0o500))?;
+
+        let removed = force_remove_dir_all(&tree);
+        let mode = fs::metadata(&victim)?.permissions().mode() & 0o777;
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o700))?;
+
+        removed.context("the tree goes")?;
+        assert!(!tree.exists());
+        assert_eq!(mode, 0o500, "the link's target must keep its mode, got {mode:#o}");
+        assert!(victim.join("f").exists(), "and its content");
+        Ok(())
+    }
+
     #[test]
     fn a_missing_base_is_an_empty_sweep() {
         let table = orphaned();
