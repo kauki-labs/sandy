@@ -391,6 +391,10 @@ component when the path ends that way.
 - Outputs: a symlink at the destination, or planted inside it, is refused with an error, not written through; the
   guest-written source is read the same way. A dangling link at the top of an output source is now recorded as a
   skipped symlink, where it used to vanish without a trace.
+- Every entry scanned in a collected output counts against the entry ceiling, a skipped symlink included, and a
+  directory is read one entry at a time, so a guest cannot make the host walk or hold an unbounded directory.
+- The parent above a leaf is opened only to search it: `O_PATH` on Linux (search permission, not read), a plain read
+  open elsewhere. A destination without a final name (`.`, `..`) names an existing directory and no link.
 - Secrets already refused a symlink at the leaf (#174).
 
 **Consequences.** A directory swapped for a link after it was opened changes nothing

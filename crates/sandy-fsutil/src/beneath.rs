@@ -65,7 +65,7 @@ impl Beneath {
         // leaf is opened by name below its parent, which `Path` normalizes. A path with no final name (`.`, `..`,
         // `/`) names no link.
         match split(path) {
-            Ok((parent, name)) => Self::open_dir_following_leaf(parent)?.open_subdir(name),
+            Ok((parent, name)) => Self::open_parent(parent)?.open_subdir(name),
             Err(_) => Self::open_dir_following_leaf(path),
         }
     }
@@ -77,9 +77,17 @@ impl Beneath {
     ///
     /// [`FsError::Unsafe`] when the leaf is a symlink or not a directory, else [`FsError::Io`].
     pub fn create_dir_at(path: &Path) -> Result<Self, FsError> {
-        let (parent, name) = split(path)?;
-        std::fs::create_dir_all(parent).map_err(|e| FsError::io("create parent directories", parent, e))?;
-        Self::open_dir_following_leaf(parent)?.create_dir(name)
+        match split(path) {
+            Ok((parent, name)) => {
+                std::fs::create_dir_all(parent).map_err(|e| FsError::io("create parent directories", parent, e))?;
+                Self::open_parent(parent)?.create_dir(name)
+            }
+            // `.`, `..` and `/` name an existing directory and no link.
+            Err(_) => {
+                std::fs::create_dir_all(path).map_err(|e| FsError::io("create directories", path, e))?;
+                Self::open_dir_following_leaf(path)
+            }
+        }
     }
 
     /// The path this handle was opened at, for messages. It is never resolved again.
@@ -88,25 +96,15 @@ impl Beneath {
         &self.path
     }
 
-    /// The entries of the directory, without `.` and `..`, each with what it is (a link is a link).
+    /// The entries of the directory, without `.` and `..`, each with what it is (a link is a link). They are read one
+    /// at a time, so a caller that enforces a ceiling stops the scan of a huge directory early.
     ///
     /// # Errors
     ///
-    /// [`FsError::Io`] when the directory cannot be read.
-    pub fn entries(&self) -> Result<Vec<(OsString, EntryKind)>, FsError> {
+    /// [`FsError::Io`] when the directory cannot be read. Each item can fail on its own.
+    pub fn entries(&self) -> Result<Entries<'_>, FsError> {
         let dir = Dir::read_from(&self.fd).map_err(|e| FsError::io("read directory", &self.path, e))?;
-        let mut entries = Vec::new();
-        for entry in dir {
-            let entry = entry.map_err(|e| FsError::io("read directory entry", &self.path, e))?;
-            let name = entry.file_name().to_bytes();
-            if name == b"." || name == b".." {
-                continue;
-            }
-            let name = OsStr::from_bytes(name).to_owned();
-            let kind = self.kind(&name)?;
-            entries.push((name, kind));
-        }
-        Ok(entries)
+        Ok(Entries { dir, owner: self })
     }
 
     /// What the entry `name` is, without following it.
@@ -236,8 +234,7 @@ impl Beneath {
 /// [`FsError::Unsafe`] when it is a symlink or not a regular file, else [`FsError::Io`].
 pub fn open_file(path: &Path) -> Result<File, FsError> {
     let (parent, name) = split(path)?;
-    let parent = Beneath::open_dir_following_leaf(parent)?;
-    parent.open_file(name)
+    Beneath::open_parent(parent)?.open_file(name)
 }
 
 /// Create (or truncate) the regular file at `path` for writing, with its parents created by path. The leaf is not
@@ -249,10 +246,51 @@ pub fn open_file(path: &Path) -> Result<File, FsError> {
 pub fn create_file_at(path: &Path) -> Result<File, FsError> {
     let (parent, name) = split(path)?;
     std::fs::create_dir_all(parent).map_err(|e| FsError::io("create parent directories", parent, e))?;
-    Beneath::open_dir_following_leaf(parent)?.create_file(name)
+    Beneath::open_parent(parent)?.create_file(name)
+}
+
+/// The entries of a directory, produced lazily by [`Beneath::entries`].
+pub struct Entries<'a> {
+    dir: Dir,
+    owner: &'a Beneath,
+}
+
+impl Iterator for Entries<'_> {
+    type Item = Result<(OsString, EntryKind), FsError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let entry = match self.dir.next()? {
+                Ok(entry) => entry,
+                Err(e) => return Some(Err(FsError::io("read directory entry", &self.owner.path, e))),
+            };
+            let name = entry.file_name().to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            let name = OsStr::from_bytes(name).to_owned();
+            return Some(self.owner.kind(&name).map(|kind| (name, kind)));
+        }
+    }
 }
 
 impl Beneath {
+    /// Open `dir`, the parent of a leaf a caller is about to open, only to search it. On Linux that is an `O_PATH`
+    /// handle, which needs search (execute) permission and not read, so a file under an execute-only directory, or a
+    /// destination under a write-and-execute-only one, still works. Elsewhere it is a plain read open. The parent
+    /// resolves as the OS resolves it, links included: the leaf is what the callers refuse to follow.
+    fn open_parent(dir: &Path) -> Result<Self, FsError> {
+        #[cfg(target_os = "linux")]
+        let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC;
+        #[cfg(not(target_os = "linux"))]
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+        let fd = rustix::fs::open(dir, flags, Mode::empty()).map_err(|e| refused("open directory", dir, e, true))?;
+        Ok(Self {
+            fd,
+            path: dir.to_owned(),
+        })
+    }
+
     /// Open `dir`, which holds the leaf a caller is about to open. The parent of a leaf resolves as the OS resolves
     /// it, links included: the leaf itself is what [`open_file`] and [`create_file_at`] refuse to follow.
     fn open_dir_following_leaf(dir: &Path) -> Result<Self, FsError> {
@@ -400,7 +438,10 @@ mod tests {
         fs::rename(&target, dir.path().join("target.moved"))?;
         symlink(&victim, &target)?;
 
-        let entries: Vec<_> = held.entries()?.into_iter().map(|(n, _)| n).collect();
+        let entries = held
+            .entries()?
+            .map(|e| e.map(|(n, _)| n))
+            .collect::<Result<Vec<_>, _>>()?;
         assert_eq!(
             entries,
             [OsString::from("mine")],
@@ -430,7 +471,9 @@ mod tests {
         fs::create_dir(dir.path().join("d"))?;
         symlink("/nonexistent", dir.path().join("l"))?;
 
-        let mut entries = Beneath::open_dir(dir.path())?.entries()?;
+        let mut entries = Beneath::open_dir(dir.path())?
+            .entries()?
+            .collect::<Result<Vec<_>, _>>()?;
         entries.sort();
 
         assert_eq!(

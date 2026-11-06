@@ -209,11 +209,15 @@ fn copy_dir(
     budget: &mut Budget,
     mut report: Option<&mut ContentDigests>,
 ) -> Result<(), BackendError> {
-    for (name, kind) in from.entries().map_err(fs_err)? {
+    for entry in from.entries().map_err(fs_err)? {
+        let (name, kind) = entry.map_err(fs_err)?;
         let path = from.path().join(&name);
         let entry_logical = join_logical(logical, &name.to_string_lossy());
         match kind {
             EntryKind::Symlink => {
+                // Counted though skipped: every entry scanned costs the ceiling, so a guest cannot make the host walk
+                // an unbounded directory of links.
+                budget.charge(0, &path)?;
                 tracing::warn!(path = %path.display(), "skipping symlink in collected output (host-escape guard)");
                 record_skipped(report.as_deref_mut(), &entry_logical, SkipReason::Symlink);
             }

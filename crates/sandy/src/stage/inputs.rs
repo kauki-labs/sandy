@@ -167,7 +167,8 @@ fn copy_input(host: &Path, root: &Beneath, name: &OsStr) -> Result<(), BackendEr
 
 /// Copy the entries of `src` into the directory `to`, one level at a time through the two handles.
 fn copy_dir(src: &Beneath, to: &Beneath) -> Result<(), BackendError> {
-    for (name, kind) in src.entries().map_err(fs_err)? {
+    for entry in src.entries().map_err(fs_err)? {
+        let (name, kind) = entry.map_err(fs_err)?;
         match kind {
             EntryKind::Dir => {
                 let sub = src.open_subdir(&name).map_err(fs_err)?;
