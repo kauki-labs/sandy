@@ -306,6 +306,17 @@ impl EnvironmentDriver {
         let Some(limit) = self.config.idle_timeout else {
             return Ok(());
         };
+        // A client connected straight to the service is invisible to the RPC surface.
+        match self.backend.active(&row.environment_id) {
+            Ok(true) => {
+                if let Err(e) = self.store.touch(&row.environment_id, now) {
+                    tracing::warn!(environment = %row.environment_id, error = %e, "could not renew an idle-stop lease");
+                }
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(e) => tracing::warn!(environment = %row.environment_id, error = %e, "activity check could not run"),
+        }
         // Conditional in the store: `row` is a snapshot, and a renewal that landed after
         // it (the probe can be slow) must win.
         if self.store.stop_if_idle(
@@ -618,6 +629,28 @@ mod tests {
         assert!(report.idle_stopped.is_empty(), "a renewed lease must hold");
         assert_eq!(state(&store, &id)?.state, EnvironmentState::Ready);
         let report = driver.reconcile_once(now() + 560)?; // 310 s after the touch
+        assert_eq!(report.idle_stopped, std::slice::from_ref(&id));
+        Ok(())
+    }
+
+    #[test]
+    fn a_backend_reported_connection_renews_the_lease_and_its_absence_does_not() -> Result<()> {
+        let store = Arc::new(EnvironmentStore::open_in_memory()?);
+        let backend = Arc::new(FakeEnvironmentBackend::new());
+        let driver = EnvironmentDriver::new(Arc::clone(&store), Arc::clone(&backend) as _, idle_config(300));
+        let id = add(&store, 1)?;
+        driver.reconcile_once(now())?;
+        // A client connected straight to the service the whole time: no GetEnvironment, no touch.
+        backend.set_active(&id, true);
+        let report = driver.reconcile_once(now() + 250)?;
+        assert!(report.idle_stopped.is_empty());
+        let report = driver.reconcile_once(now() + 400)?; // 400 s after Ready, 150 s after the last use
+        assert!(report.idle_stopped.is_empty(), "a connected client must hold the lease");
+        // The client disconnects; the lease runs from the last observed use.
+        backend.set_active(&id, false);
+        let report = driver.reconcile_once(now() + 650)?; // 250 s after the last use
+        assert!(report.idle_stopped.is_empty(), "inside the lease after disconnect");
+        let report = driver.reconcile_once(now() + 710)?; // 310 s after the last use
         assert_eq!(report.idle_stopped, std::slice::from_ref(&id));
         Ok(())
     }

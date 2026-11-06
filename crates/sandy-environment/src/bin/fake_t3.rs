@@ -98,8 +98,17 @@ fn serve(args: &[String]) -> ExitCode {
         match listener.accept() {
             Ok((mut stream, _)) => {
                 let mut buf = [0u8; 512];
-                let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
-                let _ = stream.read(&mut buf);
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let n = stream.read(&mut buf).unwrap_or(0);
+                // A client that sends `HOLD` keeps its connection open until it closes it, like a
+                // paired T3 client.
+                if buf[..n].starts_with(b"HOLD") {
+                    std::thread::spawn(move || {
+                        let _ = stream.set_read_timeout(None);
+                        while stream.read(&mut buf).is_ok_and(|n| n > 0) {}
+                    });
+                    continue;
+                }
                 let status = if started.elapsed() >= ready_after {
                     "200 OK"
                 } else {
