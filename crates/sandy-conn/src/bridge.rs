@@ -65,7 +65,9 @@ pub struct BridgeConfig {
     /// The pause between dial attempts inside the window.
     pub dial_retry_interval: Duration,
     /// How long a client may stay silent before the bridge closes it without dialing. The bridge dials the guest
-    /// relay only after the client's first byte, so a connection that sends nothing costs no relay slot and no dial.
+    /// relay only after the client's first byte, so a connection that sends nothing costs no guest connection and no
+    /// dial. It does hold one of `max_connections` until this timeout, so the timeout bounds how long silent clients
+    /// can keep the cap full.
     pub first_byte_timeout: Duration,
     /// How long a relayed connection may carry no byte in either direction before the bridge closes it. A guest
     /// that sends the ready byte and then goes silent would otherwise pin a slot and two descriptors for good. A
@@ -212,8 +214,8 @@ async fn accept_loop<D: Dialer>(
 /// Relay one client: dial the guest relay inside the window, then copy both ways until either side closes. A dial
 /// that never succeeds closes this client only.
 async fn relay_one<D: Dialer>(client: TcpStream, dialer: &D, config: BridgeConfig) {
-    // Dial only after the client's first byte: a connection that sends nothing then costs no relay slot and no dial.
-    // `peek` leaves the byte in the socket for the copy to forward.
+    // Dial only after the client's first byte: a connection that sends nothing then costs no guest connection and no
+    // dial. `peek` leaves the byte in the socket for the copy to forward.
     let mut first = [0u8; 1];
     match timeout(config.first_byte_timeout, client.peek(&mut first)).await {
         Ok(Ok(n)) if n > 0 => {}
@@ -325,7 +327,7 @@ mod tests {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt, duplex},
         net::{TcpListener, TcpStream},
-        time::timeout,
+        time::{Instant, timeout},
     };
 
     use super::*;
@@ -703,8 +705,8 @@ mod tests {
         Ok(())
     }
 
-    /// A client that sends nothing costs no dial and no relay slot: the bridge dials only after the first byte, and
-    /// closes a silent client when `first_byte_timeout` passes. A client that does send is served as usual.
+    /// A client that sends nothing costs no dial and no guest connection: the bridge dials only after the first byte,
+    /// and closes a silent client when `first_byte_timeout` passes. A client that does send is served as usual.
     #[tokio::test]
     async fn a_client_that_sends_nothing_causes_no_dial_and_is_closed_after_the_first_byte_timeout()
     -> anyhow::Result<()> {
@@ -743,7 +745,7 @@ mod tests {
     async fn a_cap_full_of_silent_clients_serves_a_new_client_after_the_first_byte_timeout() -> anyhow::Result<()> {
         let (dialer, _) = TcpDialer::new(echo_guest().await?);
         let config = BridgeConfig {
-            first_byte_timeout: Duration::from_millis(300),
+            first_byte_timeout: Duration::from_secs(1),
             ..config(2, 0)
         };
         let bridge = Bridge::start(dialer, config).await?;
@@ -759,7 +761,8 @@ mod tests {
         );
 
         let mut served = false;
-        for _ in 0..50 {
+        let deadline = Instant::now() + Duration::from_secs(1) + WAIT;
+        while Instant::now() < deadline {
             let mut late = TcpStream::connect(bridge.addr()).await?;
             if echoes(&mut late, b"late").await {
                 served = true;
