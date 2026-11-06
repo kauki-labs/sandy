@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2](https://github.com/kauki-labs/sandy/compare/sandyd-v0.2.1...sandyd-v0.2.2) - 2026-11-06
+
+### Added
+
+- _(environment)_ a connected client renews the idle-stop lease ([#645](https://github.com/kauki-labs/sandy/pull/645)) ([#681](https://github.com/kauki-labs/sandy/pull/681))
+- _(sandyd)_ refuse an invalid flake/v1 service manifest at Submit ([#589](https://github.com/kauki-labs/sandy/pull/589)) ([#660](https://github.com/kauki-labs/sandy/pull/660))
+- _(sandyd)_ gc deleted environment rows and page ListEnvironments ([#633](https://github.com/kauki-labs/sandy/pull/633)) ([#648](https://github.com/kauki-labs/sandy/pull/648))
+- _(sandyd)_ idle-stop lease for Ready environments ([#587](https://github.com/kauki-labs/sandy/pull/587)) ([#646](https://github.com/kauki-labs/sandy/pull/646))
+- _(sandyd)_ opt-in process backend so environments run end to end ([#587](https://github.com/kauki-labs/sandy/pull/587)) ([#636](https://github.com/kauki-labs/sandy/pull/636))
+- _(sandyd)_ environment launch driver over a new EnvironmentBackend seam ([#587](https://github.com/kauki-labs/sandy/pull/587)) ([#635](https://github.com/kauki-labs/sandy/pull/635))
+- _(sandyd)_ environment operations over the control RPC ([#587](https://github.com/kauki-labs/sandy/pull/587)) ([#623](https://github.com/kauki-labs/sandy/pull/623))
+- _(sandyd)_ environment store and state machine ([#587](https://github.com/kauki-labs/sandy/pull/587)) ([#613](https://github.com/kauki-labs/sandy/pull/613))
+- _(sandyd)_ refuse UDS peers whose uid differs from the daemon's ([#533](https://github.com/kauki-labs/sandy/pull/533)) ([#571](https://github.com/kauki-labs/sandy/pull/571))
+- _(sandyd)_ add sandyd cancel <job-id> for jobs the RPC cannot cancel ([#545](https://github.com/kauki-labs/sandy/pull/545)) ([#572](https://github.com/kauki-labs/sandy/pull/572))
+- _(sandyd)_ report the git build revision in --version and the startup log ([#559](https://github.com/kauki-labs/sandy/pull/559))
+- _(sandyd)_ Cancel requires the job attach token ([#540](https://github.com/kauki-labs/sandy/pull/540)) ([#543](https://github.com/kauki-labs/sandy/pull/543))
+- _(sandyd)_ wire mesh-TLS into host_conn and mesh_accept listeners ([#504](https://github.com/kauki-labs/sandy/pull/504)) ([#519](https://github.com/kauki-labs/sandy/pull/519))
+- _(sandy-conn)_ mutual-TLS mesh transport tier ([#495](https://github.com/kauki-labs/sandy/pull/495)) ([#506](https://github.com/kauki-labs/sandy/pull/506))
+- _(sandyd)_ path fields for local dispatch, gated on a declared locality flag ([#496](https://github.com/kauki-labs/sandy/pull/496)) ([#508](https://github.com/kauki-labs/sandy/pull/508))
+
+### Other
+
+- _(privacy)_ scrub the Linux host's nickname to role language ([#581](https://github.com/kauki-labs/sandy/pull/581))
+- split the instrumented coverage build out of the PR gate ([#561](https://github.com/kauki-labs/sandy/pull/561))
+- _(sandyd)_ renumber the duplicate §20 ([#532](https://github.com/kauki-labs/sandy/pull/532))
+
 ## [0.2.1](https://github.com/kauki-labs/sandy/compare/sandyd-v0.2.0...sandyd-v0.2.1) - 2026-10-28
 
 ### Added
