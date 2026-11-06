@@ -39,14 +39,16 @@ impl VirtiofsdTransport {
         &self,
         bin: &str,
         shares: &[ShareSpec],
-        on_spawn: &mut dyn FnMut(u32),
+        on_spawn: &mut dyn FnMut(u32) -> std::io::Result<()>,
     ) -> Result<Vec<Child>, BackendError> {
         let mut children = Vec::with_capacity(shares.len());
         for share in shares {
             let launched = spawn_virtiofsd(bin, share).and_then(|child| {
-                // Reported before the wait below: a kill during it must still leave a record of this daemon.
-                on_spawn(child.id());
+                let pid = child.id();
+                // Held before it is reported, so a record that cannot take it still stops it below (#676).
                 children.push(child);
+                // Reported before the wait below: a kill during it must still leave a record of this daemon.
+                on_spawn(pid).map_err(|err| crate::orphans::unrecorded(&err))?;
                 wait_for_socket(&share.socket, Duration::from_secs(5))
             });
             if let Err(err) = launched {
@@ -61,7 +63,7 @@ impl VirtiofsdTransport {
     pub(crate) fn activate_recorded(
         &self,
         shares: &[ShareSpec],
-        on_spawn: &mut dyn FnMut(u32),
+        on_spawn: &mut dyn FnMut(u32) -> std::io::Result<()>,
     ) -> Result<Vec<Child>, BackendError> {
         let bin = std::env::var("SANDY_VIRTIOFSD_BIN").unwrap_or_else(|_| "virtiofsd".to_string());
         self.activate_with(&bin, shares, on_spawn)
@@ -70,7 +72,7 @@ impl VirtiofsdTransport {
 
 impl GuestShareTransport for VirtiofsdTransport {
     fn activate(&self, shares: &[ShareSpec]) -> Result<Vec<Child>, BackendError> {
-        self.activate_recorded(shares, &mut |_| {})
+        self.activate_recorded(shares, &mut |_| Ok(()))
     }
 
     fn plan(&self, shares: &[ShareSpec], mem_mib: u32) -> Presentation {
@@ -200,6 +202,44 @@ mod tests {
 
     use super::*;
 
+    /// #676: a daemon the box record cannot take is stopped and fails the launch. Left running, it would outlive a
+    /// killed host with nothing naming it.
+    #[test]
+    fn a_daemon_that_cannot_be_recorded_is_stopped_and_fails_the_launch() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let socket = dir.path().join("vfsd.sock");
+        let stub = crate::egress_proxy::tests::stub(
+            dir.path(),
+            "virtiofsd",
+            r#"for a in "$@"; do case "$a" in --socket-path=*) s="${a#--socket-path=}";; esac; done
+: > "$s"
+exec sleep 30"#,
+        )?;
+        let share = ShareSpec {
+            host_dir: dir.path().to_path_buf(),
+            tag: "t".to_owned(),
+            readonly: false,
+            socket,
+        };
+        let mut reported = None;
+
+        let result = VirtiofsdTransport.activate_with(stub.to_str().context("utf8 path")?, &[share], &mut |pid| {
+            reported = Some(pid);
+            Err(std::io::Error::other("disk full"))
+        });
+
+        let err = result
+            .err()
+            .context("a daemon that cannot be recorded must fail the launch")?;
+        assert!(err.to_string().contains("disk full"), "{err}");
+        let pid = reported.context("the daemon was reported")?;
+        assert!(
+            crate::egress_proxy::tests::gone_within_two_seconds(pid),
+            "daemon {pid} must be stopped"
+        );
+        Ok(())
+    }
+
     /// #666: each daemon is reported when it spawns, before the wait for its socket, so a kill during that wait still
     /// leaves a record of it. The stub only creates its socket after a delay, so the socket is absent at the report.
     #[test]
@@ -227,6 +267,7 @@ exec sleep 30"#,
             .activate_with(stub.to_str().context("utf8 path")?, &[share], &mut |pid| {
                 reported.push(pid);
                 socket_was_there = socket.exists();
+                Ok(())
             })
             .context("activate")?;
         let pids: Vec<u32> = children.iter().map(Child::id).collect();

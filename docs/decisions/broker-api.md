@@ -95,12 +95,13 @@ cannot leave a job without an owner.
 **Consequence.** The contract is unchanged on the wire. These are new refusals, so `sandy-mcp`
 tests keep passing.
 
-**Residual risk (_owner_).** The check is a point in time. A client that can write inside its
-root can swap a directory for a symlink after the check, and sandyd then follows it as its
-own user (`crates/sandy/src/stage/inputs.rs` and `outputs.rs` open by path). Only an fd-based
-open in sandyd closes this. Until then, `roots` must be directories that the HTTP client
-cannot write to concurrently with a submit, or the client must be trusted with the daemon
-user's files. Tracked in a follow-up issue.
+**Residual risk (_owner_).** The check is a point in time. sandyd now opens the leaf of each input, output and
+secret path without following a link and works below it through that handle (guest-shares decision 14, #618), and no
+longer copies a link inside an input tree by value. That does not stop a hostile client: the client picks the path
+depth, so it can submit `root/a/leaf` and swap `root/a`, which is above the leaf and still followed. Closing that
+needs the client's root to reach sandyd, a public-API change tracked on #618 and #607. Until then, `roots` must be
+directories that the HTTP client cannot write to concurrently with a submit, or the client must be trusted with the
+daemon user's files.
 
 ## 5. Deferred in this slice
 
