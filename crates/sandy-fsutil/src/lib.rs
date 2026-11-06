@@ -2,6 +2,7 @@
 //! (the core, the backends, the light fabric impls) uses the same code (#174).
 //!
 //! - [`staging`]: the sandy-owned staging base under the OS temp dir (CWE-732, #138, #141).
+//! - [`beneath`]: opening a host path without following a symlink at or below its leaf (#618).
 //! - [`secret`]: an [`OwnedDir`] handle and the `0600` secret writer every secret staged for a job goes through
 //!   (INV-1).
 //!
@@ -14,9 +15,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub mod beneath;
 pub mod secret;
 pub mod staging;
 
+pub use beneath::{Beneath, EntryKind};
 pub use secret::{OwnedDir, private_staging_dir};
 pub use staging::{
     STALE_STAGING_PREFIXES, ensure_sandy_staging_base, ensure_staging_base_in, sweep_stale_staging_dirs,
