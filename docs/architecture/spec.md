@@ -630,8 +630,9 @@ owner.
 - An opt-in, trusted-only process backend (`SANDY_ENV_BACKEND=process-insecure`, decision 29) runs the service as a host process group with a cleared environment and no isolation. A failed group kill keeps the entry so a later kill retries.
 - An idle-stop lease (decision 30) stops a `Ready` environment with no owner-visible use or backend-reported connection (#645) for `SANDY_ENV_IDLE_TIMEOUT_SECS`; off by default.
 - The VM backend (decision 31) holds one agent-mode `VmBackend::run` per environment; it is not wired into `sandyd` until the bridge probe lands (C3b).
+- Mesh join (decision 34, proposed, #671) is an alternative to the host bridge. `sandy-environment::mesh` sequences setup and teardown over seams: the caller picks the name, the key is minted just before boot, `.ready` is written last, a failed step expires the key (a failed expiry is carried, not reported burned), teardown expires the key before the node delete and a failed node delete keeps the record, and no key text reaches an error or log. Sequencer only; nothing is wired into `sandyd`.
 
-**KPI:** rows KENV1 to KENV15 in [`kpi.md`](kpi.md).
+**KPI:** rows KENV1 to KENV24 in [`kpi.md`](kpi.md).
 
 ## Testing: integration vs end-to-end
 
