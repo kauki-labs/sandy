@@ -10,6 +10,7 @@
 
 mod connections;
 mod lifecycle;
+pub mod mesh;
 mod process;
 mod vm;
 

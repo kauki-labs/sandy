@@ -20,6 +20,7 @@ rustix = { workspace = true, features = ["fs", "process"] }
 sandy-api.workspace = true
 sandy-fsutil.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["time"] }
 tracing.workspace = true
 
 [dev-dependencies]
