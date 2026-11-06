@@ -269,6 +269,14 @@ fn wipe_box_with(base: &Path, name: &str, remove: &dyn Fn(&Path) -> io::Result<(
             return false;
         }
     }
+    // The run directory goes like a teardown's: everything but the record first, so a removal that fails part way (a
+    // read-only parent, a busy entry) never strands a secret share with no record to find it.
+    let run = base.join(name);
+    if fs::symlink_metadata(&run).is_ok_and(|meta| meta.file_type().is_dir())
+        && !empty_except_record(&run, "in the sweep", remove)
+    {
+        return false;
+    }
     remove_orphan_dir(base, name, remove)
 }
 
@@ -865,25 +873,45 @@ fn empty_except_record(dir: &Path, when: &str, remove: &dyn Fn(&Path) -> io::Res
 /// first: sandy owns these directories, and a mode it cannot remove would keep a box for good. Symlinks are never
 /// followed, and a missing path is removed.
 pub(crate) fn force_remove_dir_all(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-
     match fs::remove_dir_all(path) {
         Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
-            let mut dirs = vec![path.to_path_buf()];
-            while let Some(dir) = dirs.pop() {
-                let Ok(meta) = fs::symlink_metadata(&dir) else { continue };
-                if !meta.file_type().is_dir() {
-                    continue;
-                }
-                let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(meta.permissions().mode() | 0o700));
-                if let Ok(entries) = fs::read_dir(&dir) {
-                    dirs.extend(entries.flatten().map(|entry| entry.path()));
-                }
-            }
+            make_tree_writable(path);
             fs::remove_dir_all(path)
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
         other => other,
+    }
+}
+
+/// Add owner read, write and search to every directory of the tree at `path`. It works through directory handles
+/// opened without following a link: a directory swapped for a link while this runs is skipped, never changed or
+/// walked, and `fchmod` acts on the opened directory, not on a path.
+fn make_tree_writable(path: &Path) {
+    use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
+
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let Ok(root) = rustix::fs::open(path, flags, Mode::empty()) else {
+        return;
+    };
+    let mut handles = vec![root];
+    while let Some(handle) = handles.pop() {
+        if let Ok(stat) = rustix::fs::fstat(&handle) {
+            let _ = rustix::fs::fchmod(&handle, Mode::from_raw_mode((stat.st_mode & 0o7777) | 0o700));
+        }
+        let Ok(entries) = Dir::read_from(&handle) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name == c"." || name == c".." {
+                continue;
+            }
+            let is_dir = rustix::fs::statat(&handle, name, AtFlags::SYMLINK_NOFOLLOW)
+                .is_ok_and(|stat| FileType::from_raw_mode(stat.st_mode) == FileType::Directory);
+            if is_dir && let Ok(child) = rustix::fs::openat(&handle, name, flags, Mode::empty()) {
+                handles.push(child);
+            }
+        }
     }
 }
 
