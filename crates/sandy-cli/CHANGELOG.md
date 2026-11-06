@@ -11,39 +11,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- *(cli)* NDJSON stream for daemon attach -o json ([#513](https://github.com/kauki-labs/sandy/pull/513)) ([#639](https://github.com/kauki-labs/sandy/pull/639))
-- *(guest-template)* service workload kind in the flake/v1 manifest ([#589](https://github.com/kauki-labs/sandy/pull/589)) ([#617](https://github.com/kauki-labs/sandy/pull/617))
-- *(sandyd)* environment operations over the control RPC ([#587](https://github.com/kauki-labs/sandy/pull/587)) ([#623](https://github.com/kauki-labs/sandy/pull/623))
-- *(vm)* opt-in NIC guest profile via SANDY_NETWORK ([#602](https://github.com/kauki-labs/sandy/pull/602)) ([#605](https://github.com/kauki-labs/sandy/pull/605))
-- *(sandy-cli)* typed output objects for the daemon commands ([#513](https://github.com/kauki-labs/sandy/pull/513)) ([#547](https://github.com/kauki-labs/sandy/pull/547))
-- *(sandyd)* Cancel requires the job attach token ([#540](https://github.com/kauki-labs/sandy/pull/540)) ([#543](https://github.com/kauki-labs/sandy/pull/543))
-- *(sandy-cli)* typed outputs for the cred github commands ([#514](https://github.com/kauki-labs/sandy/pull/514)) ([#548](https://github.com/kauki-labs/sandy/pull/548))
-- *(sandyd)* wire mesh-TLS into host_conn and mesh_accept listeners ([#504](https://github.com/kauki-labs/sandy/pull/504)) ([#519](https://github.com/kauki-labs/sandy/pull/519))
-- *(sandy-cli)* typed output pipeline — Render/emit/NDJSON streaming ([#512](https://github.com/kauki-labs/sandy/pull/512)) ([#518](https://github.com/kauki-labs/sandy/pull/518))
-- *(sandyd)* path fields for local dispatch, gated on a declared locality flag ([#496](https://github.com/kauki-labs/sandy/pull/496)) ([#508](https://github.com/kauki-labs/sandy/pull/508))
+- _(cli)_ NDJSON stream for daemon attach -o json ([#513](https://github.com/kauki-labs/sandy/pull/513)) ([#639](https://github.com/kauki-labs/sandy/pull/639))
+- _(guest-template)_ service workload kind in the flake/v1 manifest ([#589](https://github.com/kauki-labs/sandy/pull/589)) ([#617](https://github.com/kauki-labs/sandy/pull/617))
+- _(sandyd)_ environment operations over the control RPC ([#587](https://github.com/kauki-labs/sandy/pull/587)) ([#623](https://github.com/kauki-labs/sandy/pull/623))
+- _(vm)_ opt-in NIC guest profile via SANDY_NETWORK ([#602](https://github.com/kauki-labs/sandy/pull/602)) ([#605](https://github.com/kauki-labs/sandy/pull/605))
+- _(sandy-cli)_ typed output objects for the daemon commands ([#513](https://github.com/kauki-labs/sandy/pull/513)) ([#547](https://github.com/kauki-labs/sandy/pull/547))
+- _(sandyd)_ Cancel requires the job attach token ([#540](https://github.com/kauki-labs/sandy/pull/540)) ([#543](https://github.com/kauki-labs/sandy/pull/543))
+- _(sandy-cli)_ typed outputs for the cred github commands ([#514](https://github.com/kauki-labs/sandy/pull/514)) ([#548](https://github.com/kauki-labs/sandy/pull/548))
+- _(sandyd)_ wire mesh-TLS into host_conn and mesh_accept listeners ([#504](https://github.com/kauki-labs/sandy/pull/504)) ([#519](https://github.com/kauki-labs/sandy/pull/519))
+- _(sandy-cli)_ typed output pipeline — Render/emit/NDJSON streaming ([#512](https://github.com/kauki-labs/sandy/pull/512)) ([#518](https://github.com/kauki-labs/sandy/pull/518))
+- _(sandyd)_ path fields for local dispatch, gated on a declared locality flag ([#496](https://github.com/kauki-labs/sandy/pull/496)) ([#508](https://github.com/kauki-labs/sandy/pull/508))
 
 ### Fixed
 
-- *(stage)* never follow a symlink at or below a host input or output path (refs #618) ([#680](https://github.com/kauki-labs/sandy/pull/680))
-- *(vm)* sweep the VMs a killed host left behind on macOS (vfkit) (refs #666) ([#675](https://github.com/kauki-labs/sandy/pull/675))
-- *(cli)* sandy run sweeps the VMs a killed host left behind ([#666](https://github.com/kauki-labs/sandy/pull/666)) ([#668](https://github.com/kauki-labs/sandy/pull/668))
-- *(sandy-cli)* refuse a non-x86_64 Linux host in require_live ([#447](https://github.com/kauki-labs/sandy/pull/447)) ([#567](https://github.com/kauki-labs/sandy/pull/567))
-- *(vm)* run qemu under -sandbox on (seccomp) ([#392](https://github.com/kauki-labs/sandy/pull/392)) ([#520](https://github.com/kauki-labs/sandy/pull/520))
+- _(stage)_ never follow a symlink at or below a host input or output path (refs #618) ([#680](https://github.com/kauki-labs/sandy/pull/680))
+- _(vm)_ sweep the VMs a killed host left behind on macOS (vfkit) (refs #666) ([#675](https://github.com/kauki-labs/sandy/pull/675))
+- _(cli)_ sandy run sweeps the VMs a killed host left behind ([#666](https://github.com/kauki-labs/sandy/pull/666)) ([#668](https://github.com/kauki-labs/sandy/pull/668))
+- _(sandy-cli)_ refuse a non-x86_64 Linux host in require_live ([#447](https://github.com/kauki-labs/sandy/pull/447)) ([#567](https://github.com/kauki-labs/sandy/pull/567))
+- _(vm)_ run qemu under -sandbox on (seccomp) ([#392](https://github.com/kauki-labs/sandy/pull/392)) ([#520](https://github.com/kauki-labs/sandy/pull/520))
 
 ### Other
 
-- *(vm)* live gate for the guest service bridge on vfkit ([#590](https://github.com/kauki-labs/sandy/pull/590)) ([#662](https://github.com/kauki-labs/sandy/pull/662))
-- *(egress)* qemu parity rows, a wrong-CID peer and a raw vsock stream ([#406](https://github.com/kauki-labs/sandy/pull/406)) ([#586](https://github.com/kauki-labs/sandy/pull/586))
-- *(egress)* vfkit KP7 and a host-side KP2 no-dial check ([#406](https://github.com/kauki-labs/sandy/pull/406)) ([#583](https://github.com/kauki-labs/sandy/pull/583))
-- *(privacy)* scrub the Linux host's nickname to role language ([#581](https://github.com/kauki-labs/sandy/pull/581))
+- _(vm)_ live gate for the guest service bridge on vfkit ([#590](https://github.com/kauki-labs/sandy/pull/590)) ([#662](https://github.com/kauki-labs/sandy/pull/662))
+- _(egress)_ qemu parity rows, a wrong-CID peer and a raw vsock stream ([#406](https://github.com/kauki-labs/sandy/pull/406)) ([#586](https://github.com/kauki-labs/sandy/pull/586))
+- _(egress)_ vfkit KP7 and a host-side KP2 no-dial check ([#406](https://github.com/kauki-labs/sandy/pull/406)) ([#583](https://github.com/kauki-labs/sandy/pull/583))
+- _(privacy)_ scrub the Linux host's nickname to role language ([#581](https://github.com/kauki-labs/sandy/pull/581))
 - split the instrumented coverage build out of the PR gate ([#561](https://github.com/kauki-labs/sandy/pull/561))
-- *(agent-fabric)* VM env contract decision ([#509](https://github.com/kauki-labs/sandy/pull/509)); the real live test ([#536](https://github.com/kauki-labs/sandy/pull/536))
-- *(vm)* correct decision 3 (virtiofsd keeps --sandbox=none), guard its seccomp, probe qemu under the unit ([#523](https://github.com/kauki-labs/sandy/pull/523)) ([#542](https://github.com/kauki-labs/sandy/pull/542))
-- *(sandyd)* renumber the duplicate §20 ([#532](https://github.com/kauki-labs/sandy/pull/532))
-- *(live)* correct the stale probe comment in live_boot (#516 nit) ([#524](https://github.com/kauki-labs/sandy/pull/524))
-- *(sandyd)* declare shares_submitter_filesystem in the untrusted e2e host (fix red main) ([#526](https://github.com/kauki-labs/sandy/pull/526))
-- *(live)* pass shell-string jobs as sh -c, not one argv element ([#511](https://github.com/kauki-labs/sandy/pull/511)) ([#516](https://github.com/kauki-labs/sandy/pull/516))
-- *(sandyd)* refuse an untrusted job end to end on a real sandyd ([#517](https://github.com/kauki-labs/sandy/pull/517))
+- _(agent-fabric)_ VM env contract decision ([#509](https://github.com/kauki-labs/sandy/pull/509)); the real live test ([#536](https://github.com/kauki-labs/sandy/pull/536))
+- _(vm)_ correct decision 3 (virtiofsd keeps --sandbox=none), guard its seccomp, probe qemu under the unit ([#523](https://github.com/kauki-labs/sandy/pull/523)) ([#542](https://github.com/kauki-labs/sandy/pull/542))
+- _(sandyd)_ renumber the duplicate §20 ([#532](https://github.com/kauki-labs/sandy/pull/532))
+- _(live)_ correct the stale probe comment in live_boot (#516 nit) ([#524](https://github.com/kauki-labs/sandy/pull/524))
+- _(sandyd)_ declare shares_submitter_filesystem in the untrusted e2e host (fix red main) ([#526](https://github.com/kauki-labs/sandy/pull/526))
+- _(live)_ pass shell-string jobs as sh -c, not one argv element ([#511](https://github.com/kauki-labs/sandy/pull/511)) ([#516](https://github.com/kauki-labs/sandy/pull/516))
+- _(sandyd)_ refuse an untrusted job end to end on a real sandyd ([#517](https://github.com/kauki-labs/sandy/pull/517))
 
 ## [0.2.2](https://github.com/kauki-labs/sandy/compare/sandy-cli-v0.2.1...sandy-cli-v0.2.2) - 2026-10-28
 

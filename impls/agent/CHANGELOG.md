@@ -11,20 +11,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- *(agent)* start the port relay for a service that declares a port ([#589](https://github.com/kauki-labs/sandy/pull/589)) ([#649](https://github.com/kauki-labs/sandy/pull/649))
-- *(agent)* probe a declared service and report readiness over the link ([#589](https://github.com/kauki-labs/sandy/pull/589)) ([#632](https://github.com/kauki-labs/sandy/pull/632))
-- *(agent)* guest port relay for the service bridge ([#590](https://github.com/kauki-labs/sandy/pull/590)) ([#620](https://github.com/kauki-labs/sandy/pull/620))
+- _(agent)_ start the port relay for a service that declares a port ([#589](https://github.com/kauki-labs/sandy/pull/589)) ([#649](https://github.com/kauki-labs/sandy/pull/649))
+- _(agent)_ probe a declared service and report readiness over the link ([#589](https://github.com/kauki-labs/sandy/pull/589)) ([#632](https://github.com/kauki-labs/sandy/pull/632))
+- _(agent)_ guest port relay for the service bridge ([#590](https://github.com/kauki-labs/sandy/pull/590)) ([#620](https://github.com/kauki-labs/sandy/pull/620))
 
 ### Fixed
 
-- *(vm)* pass SANDY_HISTORY_LINES to the guest agent ([#398](https://github.com/kauki-labs/sandy/pull/398)) ([#570](https://github.com/kauki-labs/sandy/pull/570))
+- _(vm)_ pass SANDY_HISTORY_LINES to the guest agent ([#398](https://github.com/kauki-labs/sandy/pull/398)) ([#570](https://github.com/kauki-labs/sandy/pull/570))
 
 ### Other
 
-- *(privacy)* scrub the Linux host's nickname to role language ([#581](https://github.com/kauki-labs/sandy/pull/581))
+- _(privacy)_ scrub the Linux host's nickname to role language ([#581](https://github.com/kauki-labs/sandy/pull/581))
 - split the instrumented coverage build out of the PR gate ([#561](https://github.com/kauki-labs/sandy/pull/561))
-- *(agent)* widen every real-spawn wait in this file, not just one ([#297](https://github.com/kauki-labs/sandy/pull/297)) ([#552](https://github.com/kauki-labs/sandy/pull/552))
-- *(agent)* give the sibling-channel test's startup wait its own, longer budget ([#297](https://github.com/kauki-labs/sandy/pull/297)) ([#550](https://github.com/kauki-labs/sandy/pull/550))
+- _(agent)_ widen every real-spawn wait in this file, not just one ([#297](https://github.com/kauki-labs/sandy/pull/297)) ([#552](https://github.com/kauki-labs/sandy/pull/552))
+- _(agent)_ give the sibling-channel test's startup wait its own, longer budget ([#297](https://github.com/kauki-labs/sandy/pull/297)) ([#550](https://github.com/kauki-labs/sandy/pull/550))
 
 ## [0.2.1](https://github.com/kauki-labs/sandy/compare/sandy-agent-v0.2.0...sandy-agent-v0.2.1) - 2026-10-28
 
