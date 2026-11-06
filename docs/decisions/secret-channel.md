@@ -90,7 +90,13 @@ byte, scans the first 1 MiB, and gives up after five minutes. It never reaches a
 agent redacts it from the job console and the archive, and the `pipe-pane` transcript file is `0600` and removed
 when the job's tmux session is dropped.
 
+On demand, a Control envelope `application/vnd.sandy.t3-access.request` on the orchestrator channel becomes a
+`LinkFrame::AccessRequest`. The agent answers with `AccessGranted { token }` or `AccessUnavailable { reason }`,
+which the relay posts as an `Output` envelope (`...t3-access.granted` or `...unavailable`). The token rides the
+link and that envelope only: `Debug` of the frame and of `AccessAnswer` redacts it, the relay drops an empty or
+over-1 KiB token, and a peer channel cannot post either answer type.
+
 Open: the live attach stream still shows the printed line to an attached viewer during the token's window.
 Closing that needs t3 not to print the URL to its tty, which is an upstream change, or an owner decision to
-accept the exposure for an attach that already carries the same authority. Reading the file back over the agent
-link and the seeded-token source are later slices of #669.
+accept the exposure for an attach that already carries the same authority. The seeded-token source and teardown
+revocation are later slices of #669.

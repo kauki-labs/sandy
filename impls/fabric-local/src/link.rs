@@ -31,8 +31,9 @@ use tokio::{
 
 use crate::{
     agent::{
-        ARCHIVE_TRANSCRIPT, AbortOnDrop, RESIZE_CONTROL, SERVICE_PROBE_FAILED, SERVICE_READY, STOP_CONTROL, TTY_STDERR,
-        TTY_STDIN, TTY_STDOUT, cut_probe_output, decode_resize, decode_stop, sanitize_probe_output,
+        ACCESS_GRANTED, ACCESS_REQUEST_CONTROL, ACCESS_UNAVAILABLE, ARCHIVE_TRANSCRIPT, AbortOnDrop, MAX_ACCESS_TOKEN,
+        RESIZE_CONTROL, SERVICE_PROBE_FAILED, SERVICE_READY, STOP_CONTROL, TTY_STDERR, TTY_STDIN, TTY_STDOUT,
+        cut_probe_output, decode_resize, decode_stop, sanitize_probe_output,
     },
     channel::{Channel, ChannelError, MembershipId},
 };
@@ -154,6 +155,18 @@ pub enum LinkFrame {
         /// How long the job gets to exit after the interrupt, in seconds.
         grace_secs: u32,
     },
+    /// Relay to agent (#669): send the t3 access token.
+    AccessRequest,
+    /// Agent to relay (#669): the t3 access token. Its `Debug` redacts it.
+    AccessGranted {
+        /// The token.
+        token: String,
+    },
+    /// Agent to relay (#669): there is no token to give.
+    AccessUnavailable {
+        /// Why, for the requester.
+        reason: String,
+    },
 }
 
 impl LinkFrame {
@@ -173,6 +186,9 @@ impl LinkFrame {
             Self::Ready => "ready",
             Self::ProbeFailed { .. } => "probe_failed",
             Self::Stop { .. } => "stop",
+            Self::AccessRequest => "access_request",
+            Self::AccessGranted { .. } => "access_granted",
+            Self::AccessUnavailable { .. } => "access_unavailable",
         }
     }
 }
@@ -203,6 +219,9 @@ impl std::fmt::Debug for LinkFrame {
             Self::Ready => write!(f, "LinkFrame::Ready"),
             Self::ProbeFailed { output } => write!(f, "LinkFrame::ProbeFailed({} bytes)", output.len()),
             Self::Stop { grace_secs } => write!(f, "LinkFrame::Stop({grace_secs}s)"),
+            Self::AccessRequest => write!(f, "LinkFrame::AccessRequest"),
+            Self::AccessGranted { .. } => write!(f, "LinkFrame::AccessGranted(<redacted>)"),
+            Self::AccessUnavailable { reason } => write!(f, "LinkFrame::AccessUnavailable({} bytes)", reason.len()),
         }
     }
 }
@@ -570,6 +589,10 @@ where
                         continue;
                     };
                     LinkFrame::Stop { grace_secs }
+                } else if matches!(env.message_type, Some(MessageType::Control(_)))
+                    && env.content_type == ACCESS_REQUEST_CONTROL
+                {
+                    LinkFrame::AccessRequest
                 } else {
                     continue;
                 };
@@ -656,8 +679,16 @@ where
                 };
                 // Service readiness verdicts (#589) are orchestrator-channel traffic too: a peer post with that
                 // content type would look like a real verdict to any reader that matches on content type.
-                if [TTY_STDIN, TTY_STDOUT, TTY_STDERR, SERVICE_READY, SERVICE_PROBE_FAILED]
-                    .contains(&content_type.as_str())
+                if [
+                    TTY_STDIN,
+                    TTY_STDOUT,
+                    TTY_STDERR,
+                    SERVICE_READY,
+                    SERVICE_PROBE_FAILED,
+                    ACCESS_GRANTED,
+                    ACCESS_UNAVAILABLE,
+                ]
+                .contains(&content_type.as_str())
                 {
                     return Err(LinkError::Protocol(format!(
                         "TTY and service traffic ({content_type}) belongs on the orchestrator channel, not peer \
@@ -777,6 +808,39 @@ where
                     // Logged, not sent back: the agent counts every `Refused` frame as a refused peer post, and a
                     // lost verdict is not one (CodeRabbit on #622).
                     Err(e) => tracing::warn!("the service readiness verdict was refused: {e}"),
+                }
+            }
+            Some(answer @ (LinkFrame::AccessGranted { .. } | LinkFrame::AccessUnavailable { .. })) => {
+                // On demand, so no latch: every answer is posted. A refused post loses only that answer.
+                let (content_type, bytes) = match answer {
+                    LinkFrame::AccessGranted { token } => {
+                        if token.is_empty() || token.len() > MAX_ACCESS_TOKEN {
+                            tracing::warn!("an out-of-range access token was dropped");
+                            continue;
+                        }
+                        (ACCESS_GRANTED, token.into_bytes())
+                    }
+                    LinkFrame::AccessUnavailable { reason } => (
+                        ACCESS_UNAVAILABLE,
+                        cut_probe_output(&sanitize_probe_output(cut_probe_output(&reason)))
+                            .as_bytes()
+                            .to_vec(),
+                    ),
+                    _ => continue,
+                };
+                match membership
+                    .channel
+                    .post(
+                        &membership.id,
+                        Some(MessageType::Output(Output {})),
+                        content_type,
+                        bytes,
+                    )
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(e @ ChannelError::Backend(_)) => return Err(e.into()),
+                    Err(e) => tracing::warn!("the access answer was refused: {e}"),
                 }
             }
             Some(other) => {
@@ -1006,6 +1070,104 @@ mod tests {
             .context("timed out waiting for the stop")?
             .context("the stop channel closed")?;
         assert_eq!(grace, 7, "the malformed request is dropped, the next one arrives");
+
+        drop(agent);
+        timeout(WAIT, relay).await???;
+        Ok(())
+    }
+
+    /// #669: an access request posted on the orchestrator channel reaches the agent, its token answer comes back
+    /// as one `ACCESS_GRANTED` envelope, and neither the frame nor the answer shows the token in `Debug`.
+    #[tokio::test]
+    async fn an_access_request_is_answered_with_the_token_and_never_debug_prints_it() -> anyhow::Result<()> {
+        use crate::agent::{ACCESS_GRANTED, ACCESS_REQUEST_CONTROL, AccessAnswer};
+
+        let (channel, agent_cap, orchestrator_cap) = channel_and_caps().await?;
+        let orchestrator = channel.join(&orchestrator_cap)?;
+        let mut inbound = std::pin::pin!(channel.subscribe(&orchestrator)?);
+        let (agent_end, host_end) = tokio::io::duplex(64 * 1024);
+        let relay = tokio::spawn({
+            let channel = Arc::clone(&channel);
+            async move { serve_agent_link(channel, &agent_cap, host_end).await }
+        });
+        let agent = timeout(WAIT, LinkAgent::bootstrap(agent_end)).await??;
+        let mut requests = agent.take_access_requests().context("requests taken once")?;
+
+        let control = || Some(MessageType::Control(sandy_proto::Control {}));
+        channel
+            .post(&orchestrator, control(), ACCESS_REQUEST_CONTROL, Vec::new())
+            .await?;
+        timeout(WAIT, requests.recv())
+            .await
+            .context("timed out waiting for the request")?
+            .context("the request channel closed")?;
+        agent.grant_access("tok-SECRET-123".to_owned()).await?;
+
+        let answer = loop {
+            let env = timeout(WAIT, inbound.next())
+                .await
+                .context("timed out waiting for the answer")?
+                .context("channel closed")??;
+            if let Some(answer) = AccessAnswer::from_envelope(&env.content_type, &env.payload) {
+                assert_eq!(env.content_type, ACCESS_GRANTED);
+                break answer;
+            }
+        };
+        assert_eq!(answer, AccessAnswer::Granted("tok-SECRET-123".to_owned()));
+        for shown in [
+            format!("{answer:?}"),
+            format!(
+                "{:?}",
+                LinkFrame::AccessGranted {
+                    token: "tok-SECRET-123".to_owned()
+                }
+            ),
+        ] {
+            assert!(!shown.contains("SECRET"), "{shown}");
+        }
+
+        drop(agent);
+        timeout(WAIT, relay).await???;
+        Ok(())
+    }
+
+    /// #669: an unavailable answer is sanitized, and a peer-channel post cannot forge either answer type.
+    #[tokio::test]
+    async fn an_unavailable_answer_is_sanitized_and_out_of_range_tokens_are_dropped() -> anyhow::Result<()> {
+        use crate::agent::{ACCESS_UNAVAILABLE, AccessAnswer, MAX_ACCESS_TOKEN};
+
+        let (channel, agent_cap, orchestrator_cap) = channel_and_caps().await?;
+        let orchestrator = channel.join(&orchestrator_cap)?;
+        let mut inbound = std::pin::pin!(channel.subscribe(&orchestrator)?);
+        let (agent_end, host_end) = tokio::io::duplex(64 * 1024);
+        let relay = tokio::spawn({
+            let channel = Arc::clone(&channel);
+            async move { serve_agent_link(channel, &agent_cap, host_end).await }
+        });
+        let agent = timeout(WAIT, LinkAgent::bootstrap(agent_end)).await??;
+
+        agent.grant_access("x".repeat(MAX_ACCESS_TOKEN + 1)).await?;
+        agent.grant_access(String::new()).await?;
+        agent.deny_access("no token\u{1b}[31m yet").await?;
+
+        let env = loop {
+            let env = timeout(WAIT, inbound.next())
+                .await
+                .context("timed out waiting for the answer")?
+                .context("channel closed")??;
+            if env.content_type.starts_with("application/vnd.sandy.t3-access") {
+                break env;
+            }
+        };
+        assert_eq!(
+            env.content_type, ACCESS_UNAVAILABLE,
+            "the oversized and empty tokens are dropped"
+        );
+        let Some(AccessAnswer::Unavailable(reason)) = AccessAnswer::from_envelope(&env.content_type, &env.payload)
+        else {
+            anyhow::bail!("expected Unavailable");
+        };
+        assert!(!reason.contains('\u{1b}'), "{reason:?}");
 
         drop(agent);
         timeout(WAIT, relay).await???;

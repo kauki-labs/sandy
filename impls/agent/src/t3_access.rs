@@ -133,13 +133,6 @@ pub enum AccessFileError {
     Invalid,
     /// Reading the file failed.
     #[error("access file read failed: {0}")]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "built by `AccessFile::read`, whose caller is the on-demand link frame (#669)"
-        )
-    )]
     Read(std::io::Error),
 }
 
@@ -163,10 +156,6 @@ impl AccessFile {
 
     /// Path of the file, written or not.
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the on-demand link frame (#669), not yet landed")
-    )]
     pub fn path(&self) -> PathBuf {
         self.dir.path().join(ACCESS_FILE)
     }
@@ -189,10 +178,6 @@ impl AccessFile {
     ///
     /// [`AccessFileError::Read`] when the file is absent or unreadable, [`AccessFileError::Invalid`]
     /// when it is malformed.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the on-demand link frame (#669), not yet landed")
-    )]
     pub fn read(&self) -> Result<Access, AccessFileError> {
         let bytes = std::fs::read(self.path()).map_err(AccessFileError::Read)?;
         serde_json::from_slice(&bytes).map_err(|_| AccessFileError::Invalid)

@@ -324,9 +324,11 @@ where
         Some(port) => Some(service::spawn_port_relay(port).await?),
         None => None,
     };
-    // #669: the capture task, opened above before the job started.
+    // #669: the capture task and the on-demand answer, both over the file opened above.
     let access_declared = access_file.is_some();
-    let access_task = access_file.map(|file| {
+    let access_file = access_file.map(Arc::new);
+    let access_task = access_file.as_ref().map(|file| {
+        let file = Arc::clone(file);
         let log = tmux_job.log_path().to_path_buf();
         tokio::spawn(async move {
             match t3_access::capture(&log, &file, T3_ACCESS_WINDOW).await {
@@ -336,6 +338,22 @@ where
             }
         })
     });
+    let access_answer_task = access_file
+        .zip(agent.take_access_requests())
+        .map(|(file, mut requests)| {
+            let agent = Arc::clone(&agent);
+            tokio::spawn(async move {
+                while requests.recv().await.is_some() {
+                    let sent = match file.read() {
+                        Ok(access) => agent.grant_access(access.token).await,
+                        Err(_) => agent.deny_access("no t3 access token yet").await,
+                    };
+                    if let Err(e) = sent {
+                        eprintln!("sandy-agent: answering a t3 access request: {e}");
+                    }
+                }
+            })
+        });
     let readiness = service.map(|spec| service::spawn_readiness(Arc::clone(&agent), spec.probe, service_user));
     let (pty_read, pty_write, resizer, mut attach_child) = tmux_job
         .open_attach()
@@ -410,6 +428,9 @@ where
             if let Some(access_task) = access_task {
                 access_task.abort();
             }
+            if let Some(task) = access_answer_task {
+                task.abort();
+            }
             return Err(format!("reading the job's real exit code: {e}"));
         }
     };
@@ -426,6 +447,9 @@ where
     }
     if let Some(access_task) = access_task {
         access_task.abort();
+    }
+    if let Some(task) = access_answer_task {
+        task.abort();
     }
 
     match bridge_task.await {

@@ -73,6 +73,57 @@ pub const RESIZE_CONTROL: &str = "application/vnd.sandy.resize";
 /// the grace, then end it. Payload: 4 bytes, the grace in seconds as a big-endian `u32`. Posted on the
 /// orchestrator channel; the relay turns it into a [`crate::link::LinkFrame::Stop`].
 pub const STOP_CONTROL: &str = "application/vnd.sandy.stop";
+/// `content_type` for a Control envelope asking the agent for the t3 access token (#669). Empty payload. Posted
+/// on the orchestrator channel; the relay turns it into a [`crate::link::LinkFrame::AccessRequest`].
+pub const ACCESS_REQUEST_CONTROL: &str = "application/vnd.sandy.t3-access.request";
+/// `content_type` of the `Output` envelope a [`crate::link::LinkFrame::AccessGranted`] becomes (#669). Payload:
+/// the token, UTF-8.
+pub const ACCESS_GRANTED: &str = "application/vnd.sandy.t3-access.granted";
+/// `content_type` of the `Output` envelope a [`crate::link::LinkFrame::AccessUnavailable`] becomes (#669).
+/// Payload: the reason, UTF-8, at most [`MAX_PROBE_OUTPUT`] bytes.
+pub const ACCESS_UNAVAILABLE: &str = "application/vnd.sandy.t3-access.unavailable";
+/// The longest token the relay forwards. A pairing token is a few dozen bytes.
+pub const MAX_ACCESS_TOKEN: usize = 1024;
+/// How many access requests wait for the agent before newer ones are dropped.
+pub(crate) const ACCESS_REQUESTS: usize = 8;
+
+/// The agent's answer to an access request, as a host-side reader of the job's channel sees it (#669).
+#[derive(Clone, PartialEq, Eq)]
+pub enum AccessAnswer {
+    /// The token. Its `Debug` is redacted.
+    Granted(String),
+    /// No token is available; the reason is sanitized and capped.
+    Unavailable(String),
+}
+
+impl std::fmt::Debug for AccessAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Granted(_) => write!(f, "AccessAnswer::Granted(<redacted>)"),
+            Self::Unavailable(reason) => write!(f, "AccessAnswer::Unavailable({reason:?})"),
+        }
+    }
+}
+
+impl AccessAnswer {
+    /// Reads a channel envelope's `content_type` and payload as an answer. `None` for any other envelope, and
+    /// for a token that is empty, over [`MAX_ACCESS_TOKEN`] or not UTF-8.
+    #[must_use]
+    pub fn from_envelope(content_type: &str, payload: &[u8]) -> Option<Self> {
+        match content_type {
+            ACCESS_GRANTED => {
+                let token = std::str::from_utf8(payload).ok()?;
+                (!token.is_empty() && token.len() <= MAX_ACCESS_TOKEN).then(|| Self::Granted(token.to_owned()))
+            }
+            ACCESS_UNAVAILABLE => {
+                let head = &payload[..payload.len().min(MAX_PROBE_OUTPUT)];
+                Some(Self::Unavailable(sanitize_probe_output(&String::from_utf8_lossy(head))))
+            }
+            _ => None,
+        }
+    }
+}
+
 /// `content_type` prefix an [`crate::link::LinkFrame::Archive`]'s own
 /// `content_type` is forwarded under on an Output envelope — distinguishes
 /// it from any other `MessageType::Output` traffic sharing the channel.
@@ -433,6 +484,8 @@ pub struct LinkAgent {
     resizes: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<(u16, u16)>>>,
     /// Stop requests from the relay (#670): the grace in seconds, handed out once by [`LinkAgent::take_stops`].
     stops: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<u32>>>,
+    /// Access requests from the relay (#669), handed out once by [`LinkAgent::take_access_requests`].
+    access_requests: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<()>>>,
 }
 
 /// How many peer deliveries wait in the inbox before newer ones are dropped
@@ -542,11 +595,13 @@ impl LinkAgent {
         let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
         let (resize_tx, resize_rx) = tokio::sync::mpsc::unbounded_channel();
         let (stop_tx, stop_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (access_tx, access_rx) = tokio::sync::mpsc::channel(ACCESS_REQUESTS);
         let reader = AbortOnDrop(tokio::spawn(route_link(
             Box::new(rd),
             stdin_tx,
             resize_tx,
             stop_tx,
+            access_tx,
             peer_tx,
             Arc::clone(&peer_dropped),
             Arc::clone(&peer_refused),
@@ -564,6 +619,7 @@ impl LinkAgent {
             peer_refused,
             resizes: std::sync::Mutex::new(Some(resize_rx)),
             stops: std::sync::Mutex::new(Some(stop_rx)),
+            access_requests: std::sync::Mutex::new(Some(access_rx)),
         })
     }
 
@@ -571,6 +627,15 @@ impl LinkAgent {
     /// the relay asked the job to get before it is ended. Requests queue, unbounded, until taken.
     pub fn take_stops(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<u32>> {
         self.stops
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// Takes the access-request receiver (#669), once. `None` if already taken. At most [`ACCESS_REQUESTS`]
+    /// requests wait; a request past that is dropped, and the requester asks again.
+    pub fn take_access_requests(&self) -> Option<tokio::sync::mpsc::Receiver<()>> {
+        self.access_requests
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
@@ -645,11 +710,16 @@ impl<T> Drop for AbortOnDrop<T> {
 
 /// Read the agent link until it closes, routing TTY stdin to `stdin_tx` and
 /// peer deliveries to `peer_tx`; never waits on either consumer.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one sender per frame kind the agent routes; a struct would only rename them"
+)]
 async fn route_link(
     mut reader: Box<dyn AsyncRead + Send + Unpin>,
     stdin_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     resize_tx: tokio::sync::mpsc::UnboundedSender<(u16, u16)>,
     stop_tx: tokio::sync::mpsc::UnboundedSender<u32>,
+    access_tx: tokio::sync::mpsc::Sender<()>,
     peer_tx: tokio::sync::mpsc::Sender<PeerDelivery>,
     peer_dropped: Arc<std::sync::atomic::AtomicU64>,
     peer_refused: Arc<std::sync::atomic::AtomicU64>,
@@ -703,6 +773,10 @@ async fn route_link(
             // Best-effort like a resize: a caller that never takes stops just drops them.
             Ok(Some(LinkFrame::Stop { grace_secs })) => {
                 let _ = stop_tx.send(grace_secs);
+            }
+            // Best-effort: a full queue drops the request.
+            Ok(Some(LinkFrame::AccessRequest)) => {
+                let _ = access_tx.try_send(());
             }
             Ok(Some(other)) => tracing::warn!(kind = other.kind(), "ignoring an unexpected link frame"),
             Ok(None) => return,
@@ -771,6 +845,27 @@ impl LinkAgent {
     /// [`AgentError::Link`] if the frame cannot be written.
     pub async fn report_exit(&self, code: i32) -> Result<(), AgentError> {
         Ok(write_frame(&mut *self.port.writer.lock().await, &LinkFrame::Exit { code }).await?)
+    }
+
+    /// Answer an access request (#669) with the token. It rides the link to the relay and no further log.
+    ///
+    /// # Errors
+    /// [`AgentError::Link`] if the frame cannot be written.
+    pub async fn grant_access(&self, token: String) -> Result<(), AgentError> {
+        Ok(write_frame(&mut *self.port.writer.lock().await, &LinkFrame::AccessGranted { token }).await?)
+    }
+
+    /// Answer an access request (#669) with why there is no token, cut to [`MAX_PROBE_OUTPUT`] bytes.
+    ///
+    /// # Errors
+    /// [`AgentError::Link`] if the frame cannot be written.
+    pub async fn deny_access(&self, reason: &str) -> Result<(), AgentError> {
+        let reason = cut_probe_output(reason).to_owned();
+        Ok(write_frame(
+            &mut *self.port.writer.lock().await,
+            &LinkFrame::AccessUnavailable { reason },
+        )
+        .await?)
     }
 
     /// Report that the service's health probe passed (#589). Send at most once, before the exit.
