@@ -191,7 +191,8 @@ impl<S: FileSink> SecretsDir<S> {
 
 impl<S: FileSink> GuestDelivery for SecretsDir<S> {
     async fn prepare(&self) -> Result<(), SeamError> {
-        self.0.ensure_dir()
+        self.0.ensure_dir()?;
+        self.0.clear_dir()
     }
 
     async fn deliver(&self, files: &[(&str, &[u8])]) -> Result<(), SeamError> {
@@ -201,7 +202,7 @@ impl<S: FileSink> GuestDelivery for SecretsDir<S> {
                     "missing hostname file: the guest would keep its default name",
                 ));
             }
-            Some((_, b)) if b.is_empty() => {
+            Some((_, [])) => {
                 return Err(SeamError::new("empty hostname file"));
             }
             Some(_) => {}
@@ -394,8 +395,38 @@ where
     S: ServiceReady,
     L: Linker,
 {
-    let _ = (coord, guest, vm, service, linker, name, cfg);
-    unimplemented!("setup")
+    let t = cfg.call_timeout;
+    let err = |step, key: Option<&JoinKey>, burned, reason: &str| SetupError {
+        step,
+        name: name.to_owned(),
+        reason: scrub(reason, key),
+        key: key.cloned(),
+        key_burned: burned,
+    };
+    if cfg.poll_attempts == 0 {
+        return Err(err(SetupStep::Config, None, false, "poll_attempts must be at least 1"));
+    }
+    bounded(t, guest.prepare())
+        .await
+        .map_err(|e| err(SetupStep::Prepare, None, false, &e.to_string()))?;
+    let key = bounded(t, coord.mint_join_key(cfg.tag, cfg.key_ttl))
+        .await
+        .map_err(|e| err(SetupStep::MintKey, None, false, &e.to_string()))?;
+    if let Err((step, e)) = join(coord, guest, vm, service, linker, name, &key, cfg).await {
+        let mut reason = e.to_string();
+        let burned = match bounded(t, coord.expire_key(&key)).await {
+            Ok(()) => true,
+            Err(x) => {
+                reason.push_str(&format!("; key expiry failed: {x}"));
+                false
+            }
+        };
+        return Err(err(step, Some(&key), burned, &reason));
+    }
+    Ok(Provisioned {
+        name: name.to_owned(),
+        key,
+    })
 }
 
 #[allow(clippy::too_many_arguments, reason = "internal step runner over the seams")]
@@ -520,8 +551,44 @@ where
     G: GuestDelivery,
     T: TeardownSteps,
 {
-    let _ = (coord, guest, steps, name, key, call_timeout);
-    unimplemented!("teardown")
+    let t = call_timeout;
+    let mut hook = Vec::new();
+    let mut residue = Vec::new();
+    if let Err(e) = bounded(t, steps.unlink()).await {
+        hook.push(format!("unlink: {e}"));
+    }
+    if let Err(e) = bounded(t, steps.revoke_sessions()).await {
+        hook.push(format!("revoke sessions: {e}"));
+    }
+    if let Err(e) = bounded(t, steps.tailscale_logout()).await {
+        tracing::warn!(error = %scrub(&e.to_string(), key), "tailscale logout failed, continuing");
+    }
+    if let Some(key) = key
+        && let Err(e) = bounded(t, coord.expire_key(key)).await
+    {
+        residue.push(format!("key: {e}"));
+    }
+    let node = bounded(t, coord.delete_node(name)).await;
+    if let Err(e) = bounded(t, guest.remove_secrets()).await {
+        residue.push(format!("secrets: {e}"));
+    }
+    let mut problems = Vec::new();
+    if let Err(e) = &node {
+        problems.push(format!("node: {e}"));
+    }
+    problems.extend(hook.iter().cloned());
+    problems.extend(residue.iter().cloned());
+    let reason = scrub(&problems.join("; "), key);
+    let name = name.to_owned();
+    if node.is_err() {
+        Err(TeardownError::NodeStillPresent { name, reason })
+    } else if !residue.is_empty() {
+        Err(TeardownError::Residue { name, reason })
+    } else if !hook.is_empty() {
+        Err(TeardownError::HookFailed { name, reason })
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -881,7 +948,8 @@ mod tests {
 
     #[tokio::test]
     async fn every_failing_step_after_the_mint_expires_the_minted_key() -> Result<()> {
-        let cases: [(SetupStep, fn(&mut State)); 4] = [
+        type Knob = fn(&mut State);
+        let cases: [(SetupStep, Knob); 4] = [
             (SetupStep::Boot, |s| s.boot_error = Some("no kvm".into())),
             (SetupStep::Deliver, |s| s.write_fail = Some(HOSTNAME_FILE.into())),
             (SetupStep::ServiceReady, |s| s.service_down = true),

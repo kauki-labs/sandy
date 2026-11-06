@@ -2278,13 +2278,14 @@ A client that polls `GetEnvironment` renews the lease for as long as it polls, a
 **Decision.**
 
 - `sandy-environment::mesh` holds the ordering of mesh setup and teardown over seams (`Coordination`, `GuestDelivery`, `VmBoot`, `ServiceReady`, `TeardownSteps`). It makes no network call, so it is tier-2 testable. This slice is the sequencer only; the headscale client, the guest-side join and the `t3` link calls come later.
-- Setup order: name (`sandbox-<16 hex>`), prepare the secrets directory, mint the join key just before boot, boot, deliver `tailscale-authkey` and `hostname` then `.ready`, wait for the node online, wait for the service.
-- Delivery removes `.ready` first and writes it last, so the guest never sees a half-written directory or a stale marker. A delivery without a `hostname` file fails and is reported.
-- A key is burned after any failed step from boot on: it is expired and never handed out again. A retry mints a new key.
-- Every error string passes through `redact`, which masks `hskey-auth-...` and `tskey-...`. `JoinKey` prints no value.
-- Teardown order: unlink and revoke sessions (hooks), `tailscale logout` (best effort), delete node, expire key, remove secrets. If the node delete fails, teardown returns `NodeStillPresent` and the caller keeps the record; key expiry and secrets removal still run.
-- The delegator link uses `full-access`. A lower mode is refused at link time with `runtime_mode_escalation_denied`, not at first launch.
+- Setup order: the caller picks the name (`sandbox-<16 hex>`), then prepare (clears stale files in the secrets directory), mint the join key just before boot, boot, deliver `tailscale-authkey` and `hostname` then `.ready`, wait for the node online, wait for the service, link the delegator. Every seam call has a timeout; zero poll attempts is a config error.
+- Delivery removes `.ready` first and writes it last, so the guest never sees a half-written directory or a stale marker. A delivery with no or an empty `hostname` file, or with a caller-supplied `.ready`, fails and is reported.
+- A key is expired after any failed step from boot on. If that expiry fails the error carries the key, says it is not burned, and teardown must expire it. A retry mints a new key.
+- The caller owns the name, so a dropped setup future is cleaned up by `teardown(name, None)`: the node is deleted by name and an unused key lapses at its short TTL.
+- Every string that leaves the module is scrubbed: the exact minted key is replaced, then `hskey-auth-...` and `tskey-...` are masked ignoring case. `JoinKey` prints no value.
+- Teardown order: unlink, revoke sessions, `tailscale logout`, expire key, delete node, remove secrets. The key expires before the node delete so a guest that is still up cannot rejoin. Every step runs whatever an earlier one did. Only `tailscale logout` is best effort. A failed unlink or revoke, key expiry or secrets removal fails teardown with a typed error; a failed node delete returns `NodeStillPresent`. The caller keeps the record on any error.
+- The link step uses `full-access`. A lower mode is refused at link time with `runtime_mode_escalation_denied` and the CLI spelling of the mode, not at first launch.
 
-**Consequences.** Nothing is wired into `sandyd` yet. Unlink and revoke are hooks with no implementation here.
+**Consequences.** Nothing is wired into `sandyd` yet. Unlink, revoke and link are seams with no implementation here.
 
 **Alternative set aside.** Deciding mesh versus bridge once for all deployments: the right choice depends on whether the deployment already runs a coordination server.
