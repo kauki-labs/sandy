@@ -358,3 +358,9 @@ absence for a gap:
   boot.
 - **No-copy / arbitrary-path inputs** (#82): inputs are copied under their name.
 - **S3 object source + sink** (#67): no object-store input/output path.
+
+**Graceful stop (#670).** Tier-2 only so far, no live row: `impls/agent/src/tmux_pty.rs::tests` (a job with the
+default interrupt action still reports its exit code, a handled interrupt keeps its own code, an ignored one is
+forced after the grace), `impls/fabric-local/src/link.rs::tests::a_channel_stop_reaches_the_agent_as_a_stop_request`,
+`crates/sandy-environment/tests/stop.rs`. A live scenario on qemu and vfkit (stop a held environment, see the guest
+service exit before the cancel) is not written; sandyd does not post the stop yet.
