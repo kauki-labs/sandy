@@ -136,10 +136,13 @@ pub trait GuestDelivery: Send + Sync {
     fn remove_secrets(&self) -> impl Future<Output = Result<(), SeamError>> + Send;
 }
 
-/// Boots the guest VM named `name`.
+/// Boots and stops the guest VM named `name`.
 pub trait VmBoot: Send + Sync {
     /// Start the VM.
     fn boot(&self, name: &str) -> impl Future<Output = Result<(), SeamError>> + Send;
+    /// Stop the VM so a guest still joining cannot register. Idempotent: a VM
+    /// that is not running counts as success.
+    fn stop(&self, name: &str) -> impl Future<Output = Result<(), SeamError>> + Send;
 }
 
 /// Readiness of the guest service: `GET /` answers below 500.
@@ -268,6 +271,30 @@ pub fn check_link_access(access: LinkAccess) -> Result<(), LinkModeError> {
     Err(LinkModeError(access))
 }
 
+/// Caller-owned home of the join key. [`setup`] fills it right after the mint,
+/// before any further await, so a dropped setup future still leaves the key
+/// where [`teardown`] finds it.
+#[derive(Debug, Default)]
+pub struct KeySlot(std::sync::Mutex<Option<JoinKey>>);
+
+impl KeySlot {
+    /// An empty slot.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn set(&self, key: JoinKey) {
+        *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(key);
+    }
+
+    /// The key, if one was minted.
+    #[must_use]
+    pub fn get(&self) -> Option<JoinKey> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+}
+
 /// Knobs for [`setup`].
 #[derive(Debug, Clone)]
 pub struct SetupConfig<'a> {
@@ -279,7 +306,7 @@ pub struct SetupConfig<'a> {
     pub poll_attempts: u32,
     /// Pause between probes.
     pub poll_interval: Duration,
-    /// Bound on every seam call.
+    /// Bound on every seam call. Must be non-zero.
     pub call_timeout: Duration,
     /// Mode of the delegator link; [`LINK_ACCESS`] unless a test says otherwise.
     pub link_access: LinkAccess,
@@ -375,10 +402,18 @@ async fn bounded<T>(limit: Duration, call: impl Future<Output = Result<T, SeamEr
 /// Run setup for the node `name`: prepare, mint key, boot, deliver, node
 /// online, service ready, link. Choose `name` with [`sandbox_name`].
 ///
+/// The minted key goes into `slot` before anything else awaits. A caller that
+/// drops this future must run [`teardown`] with the same `name` and `slot`:
+/// once the key is in the guest it is only safe when the VM is stopped or the
+/// key is expired.
+///
+/// A seam error while polling counts as one failed probe, not an abort, so a
+/// transient blip does not fail a join that is about to succeed.
+///
 /// # Errors
 /// [`SetupError`] naming the failed step. A key minted before the failure is
 /// expired; if that expiry fails the error carries the key with
-/// `key_burned == false` and the caller must pass it to [`teardown`].
+/// `key_burned == false` and teardown must expire it.
 pub async fn setup<C, G, B, S, L>(
     coord: &C,
     guest: &G,
@@ -386,6 +421,7 @@ pub async fn setup<C, G, B, S, L>(
     service: &S,
     linker: &L,
     name: &str,
+    slot: &KeySlot,
     cfg: &SetupConfig<'_>,
 ) -> Result<Provisioned, SetupError>
 where
@@ -453,27 +489,25 @@ where
     bounded(t, guest.deliver(&files))
         .await
         .map_err(|e| (SetupStep::Deliver, e))?;
-    if !poll(cfg, || coord.node_online(name))
-        .await
-        .map_err(|e| (SetupStep::JoinOnline, e))?
-    {
+    let (online, last) = poll(cfg, || coord.node_online(name)).await;
+    if !online {
         return Err((
             SetupStep::JoinOnline,
             SeamError::new(format!(
-                "node {name} not online after {} probes: the key may be expired, reused or refused",
-                cfg.poll_attempts
+                "node {name} not online after {} probes: the key may be expired, reused or refused{}",
+                cfg.poll_attempts,
+                last_error(last.as_ref())
             )),
         ));
     }
-    if !poll(cfg, || service.ready(name))
-        .await
-        .map_err(|e| (SetupStep::ServiceReady, e))?
-    {
+    let (ready, last) = poll(cfg, || service.ready(name)).await;
+    if !ready {
         return Err((
             SetupStep::ServiceReady,
             SeamError::new(format!(
-                "service on {name} did not answer below 500 after {} probes",
-                cfg.poll_attempts
+                "service on {name} did not answer below 500 after {} probes{}",
+                cfg.poll_attempts,
+                last_error(last.as_ref())
             )),
         ));
     }
@@ -483,21 +517,29 @@ where
         .map_err(|e| (SetupStep::Link, e))
 }
 
-/// Probe until `f` answers `true` or the attempts run out.
-async fn poll<F, Fut>(cfg: &SetupConfig<'_>, mut f: F) -> Result<bool, SeamError>
+fn last_error(last: Option<&SeamError>) -> String {
+    last.map_or_else(String::new, |e| format!("; last probe error: {e}"))
+}
+
+/// Probe until `f` answers `true` or the attempts run out. A probe that errors
+/// or times out uses up one attempt; the last such error is returned.
+async fn poll<F, Fut>(cfg: &SetupConfig<'_>, mut f: F) -> (bool, Option<SeamError>)
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<bool, SeamError>>,
 {
+    let mut last = None;
     for attempt in 0..cfg.poll_attempts {
         if attempt > 0 {
             tokio::time::sleep(cfg.poll_interval).await;
         }
-        if bounded(cfg.call_timeout, f()).await? {
-            return Ok(true);
+        match bounded(cfg.call_timeout, f()).await {
+            Ok(true) => return (true, None),
+            Ok(false) => {}
+            Err(e) => return (false, Some(e)),
         }
     }
-    Ok(false)
+    (false, last)
 }
 
 /// Teardown did not finish cleanly. The caller keeps the environment record.
@@ -507,6 +549,14 @@ pub enum TeardownError {
     /// The node delete failed; the node may still exist.
     #[error("node {name} is still present: {reason}")]
     NodeStillPresent {
+        /// The node name.
+        name: String,
+        /// Scrubbed reason.
+        reason: String,
+    },
+    /// The VM could not be stopped; a guest may still be joining.
+    #[error("vm for node {name} may still run: {reason}")]
+    VmStillRunning {
         /// The node name.
         name: String,
         /// Scrubbed reason.
@@ -530,28 +580,34 @@ pub enum TeardownError {
     },
 }
 
-/// Run teardown: unlink, revoke sessions, tailscale logout, expire key, delete
-/// node, remove secrets. Every step runs whatever an earlier one did. The key
-/// expires before the node delete so a guest that is still up cannot rejoin.
-/// Logout is best effort; every other failure fails teardown. A node that
-/// setup never finished (a dropped future) is torn down with `key == None`.
+/// Run teardown: unlink, revoke sessions, tailscale logout, stop the VM, expire
+/// the key in `slot`, delete the node, remove secrets. Every step runs whatever
+/// an earlier one did. The VM stops and the key expires before the node delete,
+/// so a guest still joining cannot register afterwards. Logout is best effort;
+/// every other failure fails teardown. Works after a dropped [`setup`] future:
+/// pass the same `name` and `slot`.
 ///
 /// # Errors
-/// [`TeardownError`], never `Ok` while the node may exist or a key may be live.
-pub async fn teardown<C, G, T>(
+/// [`TeardownError`], never `Ok` while the node may exist, the VM may run or a
+/// key may be live.
+pub async fn teardown<C, G, B, T>(
     coord: &C,
     guest: &G,
     steps: &T,
+    vm: &B,
     name: &str,
-    key: Option<&JoinKey>,
+    slot: &KeySlot,
     call_timeout: Duration,
 ) -> Result<(), TeardownError>
 where
     C: Coordination,
     G: GuestDelivery,
+    B: VmBoot,
     T: TeardownSteps,
 {
     let t = call_timeout;
+    let key = slot.get();
+    let key = key.as_ref();
     let mut hook = Vec::new();
     let mut residue = Vec::new();
     if let Err(e) = bounded(t, steps.unlink()).await {
@@ -563,6 +619,7 @@ where
     if let Err(e) = bounded(t, steps.tailscale_logout()).await {
         tracing::warn!(error = %scrub(&e.to_string(), key), "tailscale logout failed, continuing");
     }
+    let stop: Result<(), SeamError> = Ok(());
     if let Some(key) = key
         && let Err(e) = bounded(t, coord.expire_key(key)).await
     {
@@ -576,12 +633,17 @@ where
     if let Err(e) = &node {
         problems.push(format!("node: {e}"));
     }
+    if let Err(e) = &stop {
+        problems.push(format!("stop vm: {e}"));
+    }
     problems.extend(hook.iter().cloned());
     problems.extend(residue.iter().cloned());
     let reason = scrub(&problems.join("; "), key);
     let name = name.to_owned();
     if node.is_err() {
         Err(TeardownError::NodeStillPresent { name, reason })
+    } else if stop.is_err() {
+        Err(TeardownError::VmStillRunning { name, reason })
     } else if !residue.is_empty() {
         Err(TeardownError::Residue { name, reason })
     } else if !hook.is_empty() {
@@ -595,6 +657,7 @@ where
 mod tests {
     use std::{
         collections::BTreeMap,
+        io,
         sync::{Arc, Mutex, MutexGuard, PoisonError},
     };
 
@@ -615,12 +678,22 @@ mod tests {
         log: Vec<String>,
         minted: u32,
         mint_value: Option<String>,
+        mint_hangs: bool,
         files: BTreeMap<String, Vec<u8>>,
         written: Vec<(String, Vec<u8>)>,
+        delivered_key: Option<String>,
         online: bool,
+        online_on_call: u32,
+        online_calls: u32,
+        online_error_first: bool,
+        online_hangs: bool,
         service_down: bool,
+        ready_hangs: bool,
         boot_error: Option<String>,
         boot_hangs: bool,
+        vm_running: bool,
+        stop_error: Option<String>,
+        registered: bool,
         write_fail: Option<String>,
         secrets_fail: Option<String>,
         delete_error: Option<String>,
@@ -628,14 +701,19 @@ mod tests {
         unlink_fails: bool,
         revoke_fails: bool,
         logout: Logout,
+        logout_error: Option<String>,
         link_fails: bool,
         expired: Vec<String>,
         deleted: Vec<String>,
         linked: Vec<(String, LinkAccess)>,
+        seen_names: Vec<String>,
     }
 
     #[derive(Clone, Default)]
-    struct World(Arc<Mutex<State>>);
+    struct World {
+        state: Arc<Mutex<State>>,
+        slot: Arc<KeySlot>,
+    }
 
     impl World {
         fn online() -> Self {
@@ -645,7 +723,7 @@ mod tests {
         }
 
         fn st(&self) -> MutexGuard<'_, State> {
-            self.0.lock().unwrap_or_else(PoisonError::into_inner)
+            self.state.lock().unwrap_or_else(PoisonError::into_inner)
         }
 
         fn log(&self) -> Vec<String> {
@@ -659,11 +737,25 @@ mod tests {
         fn ran(&self, line: &str) -> bool {
             self.log().iter().any(|l| l == line)
         }
+
+        /// A guest that read its key joins late unless its VM is stopped or the key is expired.
+        fn settle(&self) {
+            let mut s = self.st();
+            if let Some(k) = s.delivered_key.clone()
+                && s.vm_running
+                && !s.expired.contains(&k)
+            {
+                s.registered = true;
+            }
+        }
     }
 
     impl Coordination for World {
         async fn mint_join_key(&self, _tag: &str, _ttl: Duration) -> Result<JoinKey, SeamError> {
             self.push("mint_key");
+            if self.st().mint_hangs {
+                std::future::pending::<()>().await;
+            }
             let mut s = self.st();
             s.minted += 1;
             let value = s
@@ -693,9 +785,23 @@ mod tests {
             }
         }
 
-        async fn node_online(&self, _name: &str) -> Result<bool, SeamError> {
+        async fn node_online(&self, name: &str) -> Result<bool, SeamError> {
             self.push("node_online");
-            Ok(self.st().online)
+            let (hangs, result) = {
+                let mut s = self.st();
+                s.seen_names.push(format!("node_online:{name}"));
+                s.online_calls += 1;
+                let result = if s.online_error_first && s.online_calls == 1 {
+                    Err(SeamError::new("transient blip"))
+                } else {
+                    Ok(s.online && s.online_calls >= s.online_on_call)
+                };
+                (s.online_hangs, result)
+            };
+            if hangs {
+                std::future::pending::<()>().await;
+            }
+            result
         }
     }
 
@@ -716,6 +822,9 @@ mod tests {
             let mut s = self.st();
             if s.write_fail.as_deref() == Some(name) {
                 return Err(SeamError::new(format!("disk full writing {name}")));
+            }
+            if name == KEY_FILE {
+                s.delivered_key = Some(String::from_utf8_lossy(bytes).into_owned());
             }
             s.files.insert(name.into(), bytes.to_vec());
             s.written.push((name.into(), bytes.to_vec()));
@@ -740,10 +849,12 @@ mod tests {
     }
 
     impl VmBoot for World {
-        async fn boot(&self, _name: &str) -> Result<(), SeamError> {
+        async fn boot(&self, name: &str) -> Result<(), SeamError> {
             self.push("boot");
             let (err, hangs) = {
-                let s = self.st();
+                let mut s = self.st();
+                s.seen_names.push(format!("boot:{name}"));
+                s.vm_running = true;
                 (s.boot_error.clone(), s.boot_hangs)
             };
             if hangs {
@@ -754,12 +865,29 @@ mod tests {
                 None => Ok(()),
             }
         }
+
+        async fn stop(&self, _name: &str) -> Result<(), SeamError> {
+            self.push("stop_vm");
+            let mut s = self.st();
+            if let Some(e) = s.stop_error.clone() {
+                return Err(SeamError::new(e));
+            }
+            s.vm_running = false;
+            Ok(())
+        }
     }
 
     impl ServiceReady for World {
         async fn ready(&self, _name: &str) -> Result<bool, SeamError> {
             self.push("service_ready");
-            Ok(!self.st().service_down)
+            let (hangs, down) = {
+                let s = self.st();
+                (s.ready_hangs, s.service_down)
+            };
+            if hangs {
+                std::future::pending::<()>().await;
+            }
+            Ok(!down)
         }
     }
 
@@ -794,15 +922,35 @@ mod tests {
 
         async fn tailscale_logout(&self) -> Result<(), SeamError> {
             self.push("tailscale_logout");
-            let mode = self.st().logout;
+            let (mode, text) = {
+                let s = self.st();
+                (s.logout, s.logout_error.clone())
+            };
             match mode {
                 Logout::Ok => Ok(()),
-                Logout::Fail => Err(SeamError::new("logout refused")),
+                Logout::Fail => Err(SeamError::new(text.unwrap_or_else(|| "logout refused".into()))),
                 Logout::Hang => {
                     std::future::pending::<()>().await;
                     Ok(())
                 }
             }
+        }
+    }
+
+    /// A secrets dir whose delivery never returns.
+    struct HangDeliver;
+    impl GuestDelivery for HangDeliver {
+        async fn prepare(&self) -> Result<(), SeamError> {
+            Ok(())
+        }
+
+        async fn deliver(&self, _files: &[(&str, &[u8])]) -> Result<(), SeamError> {
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+
+        async fn remove_secrets(&self) -> Result<(), SeamError> {
+            Ok(())
         }
     }
 
@@ -817,6 +965,7 @@ mod tests {
 
     const NAME: &str = "sandbox-test";
     const T: Duration = Duration::from_secs(1);
+    const SHORT: Duration = Duration::from_millis(20);
     const CFG: SetupConfig<'static> = SetupConfig {
         tag: "tag:t3",
         key_ttl: Duration::from_secs(60),
@@ -827,15 +976,15 @@ mod tests {
     };
 
     async fn run_with(w: &World, cfg: &SetupConfig<'_>) -> Result<Provisioned, SetupError> {
-        setup(w, &SecretsDir::new(w.clone()), w, w, w, NAME, cfg).await
+        setup(w, &SecretsDir::new(w.clone()), w, w, w, NAME, &w.slot, cfg).await
     }
 
     async fn run_setup(w: &World) -> Result<Provisioned, SetupError> {
         run_with(w, &CFG).await
     }
 
-    async fn run_teardown(w: &World, key: Option<&JoinKey>, limit: Duration) -> Result<(), TeardownError> {
-        teardown(w, &SecretsDir::new(w.clone()), w, NAME, key, limit).await
+    async fn run_teardown(w: &World, limit: Duration) -> Result<(), TeardownError> {
+        teardown(w, &SecretsDir::new(w.clone()), w, w, NAME, &w.slot, limit).await
     }
 
     #[test]
@@ -969,6 +1118,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_delivery_leaves_no_ready_marker() -> Result<()> {
+        let w = World::online();
+        w.st().write_fail = Some(HOSTNAME_FILE.into());
+        let Err(e) = run_setup(&w).await else {
+            bail!("must fail");
+        };
+        assert_eq!(e.step, SetupStep::Deliver);
+        assert!(!w.st().files.contains_key(READY_FILE));
+        assert!(!w.ran("write .ready"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_hung_seam_times_out_into_a_setup_error_with_the_key_expired() -> Result<()> {
+        type Knob = fn(&mut State);
+        let cases: [(SetupStep, Knob); 4] = [
+            (SetupStep::MintKey, |s| s.mint_hangs = true),
+            (SetupStep::Boot, |s| s.boot_hangs = true),
+            (SetupStep::JoinOnline, |s| s.online_hangs = true),
+            (SetupStep::ServiceReady, |s| s.ready_hangs = true),
+        ];
+        let cfg = SetupConfig {
+            call_timeout: SHORT,
+            ..CFG
+        };
+        for (step, knob) in cases {
+            let w = World::online();
+            knob(&mut w.st());
+            // The outer bound only keeps a regression from hanging the suite.
+            let r = tokio::time::timeout(Duration::from_secs(10), run_with(&w, &cfg))
+                .await
+                .with_context(|| format!("{step}: setup did not time its own seam call out"))?;
+            let Err(e) = r else { bail!("{step} must fail") };
+            assert_eq!(e.step, step);
+            let expected: &[&str] = if step == SetupStep::MintKey {
+                &[]
+            } else {
+                &["hskey-auth-abc1"]
+            };
+            assert_eq!(w.st().expired, expected, "{step}");
+        }
+        let w = World::online();
+        let r = tokio::time::timeout(
+            Duration::from_secs(10),
+            setup(&w, &HangDeliver, &w, &w, &w, NAME, &w.slot, &cfg),
+        )
+        .await
+        .context("deliver: setup did not time its own seam call out")?;
+        let Err(e) = r else { bail!("deliver must fail") };
+        assert_eq!(e.step, SetupStep::Deliver);
+        assert_eq!(w.st().expired, ["hskey-auth-abc1"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_poll_that_succeeds_on_the_second_probe_is_ready() -> Result<()> {
+        let w = World::online();
+        w.st().online_on_call = 2;
+        run_setup(&w).await.context("setup")?;
+        assert_eq!(w.log().iter().filter(|l| *l == "node_online").count(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_transient_probe_error_uses_one_attempt_and_does_not_abort_the_poll() -> Result<()> {
+        let w = World::online();
+        w.st().online_error_first = true;
+        run_setup(&w).await.context("setup")?;
+        assert_eq!(w.log().iter().filter(|l| *l == "node_online").count(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn a_failed_expiry_is_not_burned_and_teardown_will_not_succeed_while_the_key_lives() -> Result<()> {
         let w = World::online();
         {
@@ -982,25 +1204,43 @@ mod tests {
         assert_eq!(e.step, SetupStep::Deliver);
         assert!(!e.key_burned, "an unexpired key is not burned");
         assert!(e.reason.contains("key expiry failed"), "{}", e.reason);
-        let key = e.key.clone().context("the error must carry the key")?;
+        assert!(e.key.is_some(), "the error must carry the key");
 
-        let r = run_teardown(&w, Some(&key), T).await;
+        let r = run_teardown(&w, T).await;
         assert!(matches!(r, Err(TeardownError::Residue { .. })), "{r:?}");
 
         w.st().expire_error = None;
-        run_teardown(&w, Some(&key), T).await.context("retry")?;
-        assert_eq!(w.st().expired.last().map(String::as_str), Some(key.expose()));
+        run_teardown(&w, T).await.context("retry")?;
+        assert_eq!(w.st().expired.last().map(String::as_str), Some("hskey-auth-abc1"));
         Ok(())
     }
 
     #[tokio::test]
-    async fn a_dropped_setup_future_leaves_a_node_teardown_deletes_by_name() -> Result<()> {
+    async fn a_setup_dropped_during_the_join_poll_is_cleaned_up_with_no_late_join() -> Result<()> {
         let w = World::online();
-        w.st().boot_hangs = true;
-        let r = tokio::time::timeout(Duration::from_millis(30), run_setup(&w)).await;
-        assert!(r.is_err(), "setup must still be waiting on the boot");
-        run_teardown(&w, None, T).await.context("teardown")?;
-        assert_eq!(w.st().deleted, [NAME]);
+        w.st().online_hangs = true;
+        let r = tokio::time::timeout(Duration::from_millis(50), run_setup(&w)).await;
+        assert!(r.is_err(), "setup must still be polling");
+        assert!(w.st().delivered_key.is_some(), "the key is already in the guest");
+
+        run_teardown(&w, T).await.context("teardown")?;
+        w.settle();
+        let s = w.st();
+        assert!(!s.registered, "a guest still joining must not register");
+        assert_eq!(s.expired, ["hskey-auth-abc1"]);
+        assert_eq!(s.deleted, [NAME]);
+        assert!(!s.vm_running);
+        assert_eq!(s.seen_names, [format!("boot:{NAME}"), format!("node_online:{NAME}")]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_vm_stop_fails_teardown_after_the_rest_ran() -> Result<()> {
+        let w = World::online();
+        w.st().stop_error = Some("qemu wedged".into());
+        let r = run_teardown(&w, T).await;
+        assert!(matches!(r, Err(TeardownError::VmStillRunning { .. })), "{r:?}");
+        assert!(w.ran("delete_node") && w.ran("remove_secrets"));
         Ok(())
     }
 
@@ -1019,25 +1259,67 @@ mod tests {
             assert!(!text.contains("plainsecret99"), "{text}");
         }
 
-        let key = JoinKey::new("plainsecret99");
         let w = World::online();
+        w.slot.set(JoinKey::new("plainsecret99"));
         {
             let mut s = w.st();
             s.delete_error = Some("rm node plainsecret99 failed".into());
             s.secrets_fail = Some("rm dir plainsecret99 failed".into());
             s.expire_error = Some("expire plainsecret99 failed".into());
         }
-        let r = run_teardown(&w, Some(&key), T).await;
-        let Err(err) = r else { bail!("must fail") };
+        let Err(err) = run_teardown(&w, T).await else {
+            bail!("must fail")
+        };
         for text in [err.to_string(), format!("{err:?}")] {
             assert!(!text.contains("plainsecret99"), "{text}");
         }
         w.st().delete_error = None;
-        let Err(err) = run_teardown(&w, Some(&key), T).await else {
+        let Err(err) = run_teardown(&w, T).await else {
             bail!("residue must fail")
         };
         assert!(matches!(err, TeardownError::Residue { .. }));
         assert!(!format!("{err}{err:?}").contains("plainsecret99"));
+        Ok(())
+    }
+
+    #[derive(Clone, Default)]
+    struct LogBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for LogBuf {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_logout_warning_never_carries_the_key() -> Result<()> {
+        let buf = LogBuf::default();
+        let sink = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || sink.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let w = World::online();
+        w.slot.set(JoinKey::new("plainsecret99"));
+        {
+            let mut s = w.st();
+            s.logout = Logout::Fail;
+            s.logout_error = Some("logout for plainsecret99 failed".into());
+        }
+        run_teardown(&w, T).await.context("logout is best effort")?;
+        let logged = String::from_utf8(buf.0.lock().unwrap_or_else(PoisonError::into_inner).clone())?;
+        assert!(logged.contains("tailscale logout failed"), "{logged}");
+        assert!(!logged.contains("plainsecret99"), "{logged}");
         Ok(())
     }
 
@@ -1067,16 +1349,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn teardown_runs_in_order_expiring_the_key_before_the_node_delete() -> Result<()> {
+    async fn teardown_runs_in_order_stopping_the_vm_and_expiring_the_key_before_the_node_delete() -> Result<()> {
         let w = World::online();
-        let key = JoinKey::new("hskey-auth-abc1");
-        run_teardown(&w, Some(&key), T).await.context("teardown")?;
+        w.slot.set(JoinKey::new("hskey-auth-abc1"));
+        run_teardown(&w, T).await.context("teardown")?;
         assert_eq!(
             w.log(),
             [
                 "unlink",
                 "revoke_sessions",
                 "tailscale_logout",
+                "stop_vm",
                 "expire_key",
                 "delete_node",
                 "remove_secrets",
@@ -1090,13 +1373,13 @@ mod tests {
     #[tokio::test]
     async fn a_failed_node_delete_reports_the_node_present_and_still_cleans_up() -> Result<()> {
         let w = World::online();
+        w.slot.set(JoinKey::new("hskey-auth-abc1"));
         {
             let mut s = w.st();
             s.delete_error = Some("headscale 500".into());
             s.secrets_fail = Some("busy".into());
         }
-        let key = JoinKey::new("hskey-auth-abc1");
-        let r = run_teardown(&w, Some(&key), T).await;
+        let r = run_teardown(&w, T).await;
         let Err(TeardownError::NodeStillPresent { reason, .. }) = r else {
             bail!("expected NodeStillPresent, got {r:?}");
         };
@@ -1115,9 +1398,9 @@ mod tests {
             |s| s.secrets_fail = Some("busy".into()),
         ] {
             let w = World::online();
+            w.slot.set(JoinKey::new("hskey-auth-abc1"));
             knob(&mut w.st());
-            let key = JoinKey::new("hskey-auth-abc1");
-            let r = run_teardown(&w, Some(&key), T).await;
+            let r = run_teardown(&w, T).await;
             assert!(matches!(r, Err(TeardownError::Residue { .. })), "{r:?}");
             assert!(w.ran("delete_node"));
         }
@@ -1128,7 +1411,7 @@ mod tests {
     async fn a_failed_unlink_or_revoke_fails_teardown_after_the_rest_ran_but_logout_does_not() -> Result<()> {
         let w = World::online();
         w.st().unlink_fails = true;
-        let r = run_teardown(&w, None, T).await;
+        let r = run_teardown(&w, T).await;
         assert!(matches!(r, Err(TeardownError::HookFailed { .. })), "{r:?}");
         for step in ["revoke_sessions", "tailscale_logout", "delete_node", "remove_secrets"] {
             assert!(w.ran(step), "{step} must still run");
@@ -1137,13 +1420,13 @@ mod tests {
         let w = World::online();
         w.st().revoke_fails = true;
         assert!(matches!(
-            run_teardown(&w, None, T).await,
+            run_teardown(&w, T).await,
             Err(TeardownError::HookFailed { .. })
         ));
 
         let w = World::online();
         w.st().logout = Logout::Fail;
-        run_teardown(&w, None, T).await.context("logout is best effort")?;
+        run_teardown(&w, T).await.context("logout is best effort")?;
 
         let w = World::online();
         {
@@ -1152,7 +1435,7 @@ mod tests {
             s.unlink_fails = true;
         }
         assert!(
-            run_teardown(&w, None, T).await.is_err(),
+            run_teardown(&w, T).await.is_err(),
             "a failing best-effort step must not mask a real failure"
         );
         Ok(())
@@ -1162,25 +1445,30 @@ mod tests {
     async fn a_hanging_logout_times_out_and_does_not_block_the_node_delete() -> Result<()> {
         let w = World::online();
         w.st().logout = Logout::Hang;
-        run_teardown(&w, None, Duration::from_millis(20))
-            .await
-            .context("teardown")?;
+        run_teardown(&w, SHORT).await.context("teardown")?;
         assert_eq!(w.st().deleted, [NAME]);
         Ok(())
     }
 
     #[tokio::test]
-    async fn zero_poll_attempts_is_a_config_error_and_mints_nothing() -> Result<()> {
-        let w = World::online();
-        let cfg = SetupConfig {
-            poll_attempts: 0,
-            ..CFG
-        };
-        let Err(e) = run_with(&w, &cfg).await else {
-            bail!("zero attempts must be rejected");
-        };
-        assert_eq!(e.step, SetupStep::Config);
-        assert!(w.log().is_empty());
+    async fn zero_poll_attempts_or_a_zero_call_timeout_is_a_config_error_and_runs_nothing() -> Result<()> {
+        for cfg in [
+            SetupConfig {
+                poll_attempts: 0,
+                ..CFG
+            },
+            SetupConfig {
+                call_timeout: Duration::ZERO,
+                ..CFG
+            },
+        ] {
+            let w = World::online();
+            let Err(e) = run_with(&w, &cfg).await else {
+                bail!("a bad config must be rejected");
+            };
+            assert_eq!(e.step, SetupStep::Config);
+            assert!(w.log().is_empty());
+        }
         Ok(())
     }
 
