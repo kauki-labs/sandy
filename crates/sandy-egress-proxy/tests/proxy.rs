@@ -93,6 +93,39 @@ async fn connect(sock: &Path) -> Result<UnixStream> {
     Ok(UnixStream::connect(sock).await?)
 }
 
+/// Connect, retrying while the kernel refuses (#630). With a full accept queue macOS fails `connect` with
+/// `ECONNREFUSED` where Linux queues it, so a refused connect means the proxy has not drained its queue yet, not that
+/// it enforces its cap: the cap is accept-then-close (`spawn_conn`). Any other error is real.
+async fn connect_patiently(sock: &Path) -> Result<UnixStream> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        match UnixStream::connect(sock).await {
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused && tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            other => return Ok(other?),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_refused_connect_is_retried_until_a_listener_answers() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let sock = dir.path().join("late.sock");
+    // A dropped listener leaves its socket file: connecting gives ECONNREFUSED on every OS.
+    drop(tokio::net::UnixListener::bind(&sock)?);
+    let (live, late) = (dir.path().join("live.sock"), sock.clone());
+    let listener = tokio::net::UnixListener::bind(&live)?;
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // An atomic replace: the path never goes missing, so the client only ever sees ECONNREFUSED, then a listener.
+        std::fs::rename(&live, &late).expect("rename");
+        let _ = listener.accept().await;
+    });
+    connect_patiently(&sock).await?;
+    Ok(())
+}
+
 async fn read_to_end(s: &mut UnixStream) -> Result<String> {
     let mut out = Vec::new();
     timeout(Duration::from_secs(5), s.read_to_end(&mut out))
@@ -190,11 +223,11 @@ async fn connection_257_is_closed_at_accept() -> Result<()> {
         eprintln!("skipped: the hard RLIMIT_NOFILE is below 1024");
         return Ok(());
     }
-    let proxy = start(&policy_for("allowed.example", 443))?;
+    let mut proxy = start(&policy_for("allowed.example", 443))?;
     // Idle connections hold a slot while the proxy waits for their head.
     let mut held = Vec::new();
     for _ in 0..256 {
-        held.push(connect(&proxy.sock).await?);
+        held.push(connect_patiently(&proxy.sock).await?);
     }
     // Poll for refusal instead of a single fixed sleep (#538): a UDS
     // `connect()` succeeds the moment the OS queues it in the listen
@@ -209,7 +242,8 @@ async fn connection_257_is_closed_at_accept() -> Result<()> {
     // backoff, rather than guessing a bigger constant.
     let probe_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
-        let mut probe = connect(&proxy.sock).await?;
+        let mut probe = connect_patiently(&proxy.sock).await?;
+        anyhow::ensure!(proxy.child.try_wait()?.is_none(), "the proxy exited");
         let mut buf = [0u8; 1];
         match timeout(Duration::from_millis(200), probe.read(&mut buf)).await {
             // EOF with no bytes, observed quickly: genuinely refused at accept.
