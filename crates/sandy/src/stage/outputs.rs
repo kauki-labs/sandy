@@ -426,6 +426,29 @@ mod tests {
         Ok(())
     }
 
+    /// #618 (review): the components above the destination resolve as the OS resolves them, so a destination under a
+    /// linked directory (macOS `/tmp`) works. Only the destination itself and what is below it are not followed.
+    #[test]
+    fn a_destination_under_a_symlinked_parent_is_collected() -> anyhow::Result<()> {
+        let run = tempfile::TempDir::new()?;
+        let outputs_dir = run.path().join("outputs");
+        let real = run.path().join("real");
+        fs::create_dir(&real)?;
+        let linked = run.path().join("linked");
+        std::os::unix::fs::symlink(&real, &linked)?;
+        let outputs = [Output {
+            name: Some("o".to_string()),
+            dest: linked.join("collected"),
+        }];
+        prepare_outputs(&outputs, &outputs_dir)?;
+        fs::write(outputs_dir.join("o").join("f"), b"produced")?;
+
+        collect_outputs(&outputs, &outputs_dir, false)?;
+
+        assert_eq!(fs::read(real.join("collected").join("f"))?, b"produced");
+        Ok(())
+    }
+
     /// #373: with digests off nothing is hashed and there is no report.
     #[test]
     fn digests_off_returns_no_report() -> anyhow::Result<()> {

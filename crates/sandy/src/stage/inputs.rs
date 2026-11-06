@@ -297,6 +297,79 @@ mod tests {
         Ok(())
     }
 
+    /// #618 (review): two inputs with one name must not let the second write through a link the first staged. Before
+    /// links were staged as links this could not happen; now `x/evil` may be a link when the second `x` is staged.
+    #[test]
+    fn two_inputs_with_one_name_cannot_write_through_a_staged_link() -> anyhow::Result<()> {
+        let src = tempfile::TempDir::new()?;
+        let victim = src.path().join("victim");
+        fs::write(&victim, b"HOST-FILE")?;
+        let a = src.path().join("a");
+        fs::create_dir(&a)?;
+        std::os::unix::fs::symlink(&victim, a.join("evil"))?;
+        let b = src.path().join("b");
+        fs::create_dir(&b)?;
+        fs::write(b.join("evil"), b"attacker bytes")?;
+        let out = tempfile::TempDir::new()?;
+        let inputs_dir = out.path().join("inputs");
+        let inputs = [
+            Input {
+                host: a,
+                name: "x".to_string(),
+                guest_path: None,
+            },
+            Input {
+                host: b,
+                name: "x".to_string(),
+                guest_path: None,
+            },
+        ];
+
+        let result = stage_inputs(&inputs, &inputs_dir);
+
+        assert!(result.is_err(), "a repeated input name must be refused");
+        assert_eq!(
+            fs::read(&victim)?,
+            b"HOST-FILE",
+            "the file the staged link names is untouched"
+        );
+        Ok(())
+    }
+
+    /// #618 (review): a trailing `/` or `/.` makes the kernel resolve a symlink in the last component even with
+    /// `O_NOFOLLOW`, so a directory input given that way must still be refused when it is a link.
+    #[test]
+    fn a_symlinked_directory_input_is_refused_with_a_trailing_slash_or_dot() -> anyhow::Result<()> {
+        let src = tempfile::TempDir::new()?;
+        let victim = src.path().join("victim-dir");
+        fs::create_dir(&victim)?;
+        fs::write(victim.join("secret"), b"HOST-SECRET")?;
+        let link = src.path().join("link");
+        std::os::unix::fs::symlink(&victim, &link)?;
+        for suffix in ["/", "/."] {
+            let host = std::path::PathBuf::from(format!("{}{suffix}", link.display()));
+            let out = tempfile::TempDir::new()?;
+            let inputs_dir = out.path().join("inputs");
+            let inputs = [Input {
+                host,
+                name: "in".to_string(),
+                guest_path: None,
+            }];
+
+            let result = stage_inputs(&inputs, &inputs_dir);
+
+            assert!(
+                result.is_err(),
+                "{suffix:?}: a symlinked directory input must be refused"
+            );
+            assert!(
+                !inputs_dir.join("in").join("secret").exists(),
+                "{suffix:?}: nothing of the target is staged"
+            );
+        }
+        Ok(())
+    }
+
     /// An input with a guest path is staged under its internal name and recorded
     /// in the manifest with the reserved `source`/`hash` slots, so the guest step
     /// can symlink the path to the staged entry.

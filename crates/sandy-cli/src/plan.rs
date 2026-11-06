@@ -412,6 +412,22 @@ mod tests {
         Ok(())
     }
 
+    /// #618 (review): `result/` typed with a trailing slash names the link too, and the stage refuses it, so it is
+    /// resolved the same way.
+    #[test]
+    fn a_symlinked_input_path_with_a_trailing_slash_is_resolved() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real)?;
+        let link = dir.path().join("result");
+        std::os::unix::fs::symlink(&real, &link)?;
+
+        let input = parse_input(&format!("{}/:data", link.display()), 0)?;
+
+        assert_eq!(input.host, std::fs::canonicalize(&real)?);
+        Ok(())
+    }
+
     /// A path that is not a link, or does not exist, is left as given.
     #[test]
     fn a_plain_or_missing_input_path_is_left_as_given() -> anyhow::Result<()> {
