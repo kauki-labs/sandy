@@ -632,7 +632,7 @@ owner.
 - The VM backend (decision 31) holds one agent-mode `VmBackend::run` per environment; it is not wired into `sandyd` until the bridge probe lands (C3b).
 - Mesh join (decision 34, proposed, #671) is an alternative to the host bridge. `sandy-environment::mesh` sequences setup and teardown over seams: the key is minted just before boot, `.ready` is written last, a failed step burns the key, a failed node delete keeps the record, and no key text reaches an error. Sequencer only; nothing is wired into `sandyd`.
 
-**KPI:** rows KENV1 to KENV17 in [`kpi.md`](kpi.md).
+**KPI:** rows KENV1 to KENV24 in [`kpi.md`](kpi.md).
 
 ## Testing: integration vs end-to-end
 
