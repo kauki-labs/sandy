@@ -221,7 +221,7 @@ fn history_lines_env(history_lines: u32) -> [(String, String); 1] {
 /// service, so a submitter-set key would reach the agent's probe and port relay unvalidated (#589 review).
 fn process_run_env(env: &[(String, String)]) -> Vec<(String, String)> {
     env.iter()
-        .filter(|(key, _)| key != sandy_api::agent::SERVICE_ENV)
+        .filter(|(key, _)| key != sandy_api::agent::SERVICE_ENV && key != sandy_api::agent::T3_ACCESS_DIR_ENV)
         .cloned()
         .collect()
 }
@@ -247,7 +247,11 @@ fn flake_run_env(
     let mut env: Vec<(String, String)> = decoded
         .env
         .iter()
-        .filter(|(key, _)| key != "SANDY_HISTORY_LINES" && key != sandy_api::agent::SERVICE_ENV)
+        .filter(|(key, _)| {
+            key != "SANDY_HISTORY_LINES"
+                && key != sandy_api::agent::SERVICE_ENV
+                && key != sandy_api::agent::T3_ACCESS_DIR_ENV
+        })
         .cloned()
         .collect();
     env.extend(history_lines_env(decoded.history_lines));
@@ -932,6 +936,7 @@ mod tests {
             ("KEEP".to_owned(), "yes".to_owned()),
             ("SANDY_SERVICE".to_owned(), forged.to_owned()),
             ("SANDY_HISTORY_LINES".to_owned(), "1".to_owned()),
+            ("SANDY_T3_ACCESS_DIR".to_owned(), "/tmp/steal".to_owned()),
         ];
 
         let plain = flake_run_env(&flake_manifest(env.clone(), None))?;
@@ -948,6 +953,14 @@ mod tests {
         let services: Vec<_> = service.iter().filter(|(key, _)| key == "SANDY_SERVICE").collect();
         assert_eq!(services.len(), 1, "exactly the executor's entry: {service:?}");
         assert_ne!(services[0].1, forged);
+        assert!(
+            service.iter().all(|(key, _)| key != "SANDY_T3_ACCESS_DIR"),
+            "{service:?}"
+        );
+        assert!(
+            process_run_env(&[("SANDY_T3_ACCESS_DIR".to_owned(), "/x".to_owned())]).is_empty(),
+            "an argv run drops a submitter's access dir"
+        );
         Ok(())
     }
 
