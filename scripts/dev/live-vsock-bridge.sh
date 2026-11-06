@@ -62,7 +62,7 @@ echo "SK> agent=$agent"
 sleep 1
 echo "SK> squat-999-as-t3: $(runuser -u t3 -- timeout 3 "$agent" port-relay --vsock-port 999 --to 127.0.0.1:9 2>&1 | head -2 | tr '\n' ' ')"
 # The service user binds an unprivileged port; a second bind of it by root must then fail with EADDRINUSE,
-# which proves the first bind happened (the relay prints nothing after a successful bind).
+# which proves the first bind happened (a bound relay writes one `B` byte to stdout and nothing after).
 runuser -u t3 -- "$agent" port-relay --vsock-port 2000 --to 127.0.0.1:9 >/tmp/bind2000.log 2>&1 &
 bind_pid=$!
 sleep 1
