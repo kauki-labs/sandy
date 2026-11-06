@@ -115,7 +115,7 @@ impl<'a> EgressLaunch<'a> {
     /// [`BackendError::Spawn`] (band 3) when the proxy does not reach `READY`.
     #[cfg(test)]
     pub(crate) fn start(&self) -> Result<ProxyHandle, BackendError> {
-        self.start_recorded(&mut |_| {})
+        self.start_recorded(&mut |_| Ok(()))
     }
 
     /// [`start`](Self::start), reporting the proxy's pid to `on_spawn` as soon as it spawns, before the wait for
@@ -124,7 +124,10 @@ impl<'a> EgressLaunch<'a> {
     ///
     /// # Errors
     /// As [`start`](Self::start).
-    pub(crate) fn start_recorded(&self, on_spawn: &mut dyn FnMut(u32)) -> Result<ProxyHandle, BackendError> {
+    pub(crate) fn start_recorded(
+        &self,
+        on_spawn: &mut dyn FnMut(u32) -> std::io::Result<()>,
+    ) -> Result<ProxyHandle, BackendError> {
         ProxyHandle::start(self, on_spawn)
     }
 }
@@ -171,7 +174,10 @@ impl ProxyHandle {
         let _ = self.child.wait();
     }
 
-    fn start(launch: &EgressLaunch<'_>, on_spawn: &mut dyn FnMut(u32)) -> Result<Self, BackendError> {
+    fn start(
+        launch: &EgressLaunch<'_>,
+        on_spawn: &mut dyn FnMut(u32) -> std::io::Result<()>,
+    ) -> Result<Self, BackendError> {
         let policy = serde_json::to_vec(launch.policy)
             .map_err(|err| BackendError::Spawn(format!("egress proxy did not start: encode policy: {err}")))?;
         let cid = match &launch.listen {
@@ -265,7 +271,7 @@ fn start_once(
     args: &[String],
     port: u32,
     policy: &[u8],
-    on_spawn: &mut dyn FnMut(u32),
+    on_spawn: &mut dyn FnMut(u32) -> std::io::Result<()>,
 ) -> Result<ProxyHandle, StartFailure> {
     let mut command = Command::new(&launch.bin);
     // Sanitized environment: PATH only, never the forge token or any other secret.
@@ -281,8 +287,11 @@ fn start_once(
         .spawn()
         .map_err(|err| StartFailure::Other(format!("spawn `{}`: {err}", launch.bin.display())))?;
     // Reported before the wait for READY below: a kill during it must still leave a record of the proxy.
-    on_spawn(child.id());
     let mut handle = ProxyHandle { child, port };
+    // A record that cannot take the proxy stops it (the handle kills on drop) and fails the start (#676).
+    if let Err(err) = on_spawn(handle.child.id()) {
+        return Err(StartFailure::Other(crate::orphans::unrecorded_message(&err)));
+    }
 
     // The policy goes on stdin, then stdin closes (the thread owns it and drops it): the proxy waits
     // for EOF. The write runs on a thread so the READY deadline bounds a proxy that never reads it:
@@ -442,11 +451,50 @@ pub(crate) mod tests {
             .start_recorded(&mut |pid| {
                 reported.push(pid);
                 ready_was_near = about_to_be_ready.exists();
+                Ok(())
             })
             .context("start")?;
 
         assert_eq!(reported, vec![handle.pid()], "one report, with the proxy's pid");
         assert!(!ready_was_near, "the report came before the proxy was ready");
+        Ok(())
+    }
+
+    /// Whether process `pid` is gone within two seconds (it may be a moment from reaped).
+    pub(crate) fn gone_within_two_seconds(pid: u32) -> bool {
+        let Some(pid) = i32::try_from(pid).ok().and_then(rustix::process::Pid::from_raw) else {
+            return true;
+        };
+        for _ in 0..40 {
+            if rustix::process::test_kill_process(pid).is_err() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    /// #676: a proxy the box record cannot take is stopped and fails the start. Left running, it would outlive a
+    /// killed host with nothing naming it.
+    #[test]
+    fn a_proxy_that_cannot_be_recorded_is_stopped_and_fails_the_start() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let bin = stub(dir.path(), "proxy", "cat >/dev/null; echo READY; exec sleep 30")?;
+        let allow = policy();
+        let launch = launch(&allow, bin, PROXY_STARTS);
+        let mut reported = None;
+
+        let result = launch.start_recorded(&mut |pid| {
+            reported = Some(pid);
+            Err(std::io::Error::other("disk full"))
+        });
+
+        let err = result
+            .err()
+            .context("a proxy that cannot be recorded must fail the start")?;
+        assert!(err.to_string().contains("disk full"), "{err}");
+        let pid = reported.context("the proxy was reported")?;
+        assert!(gone_within_two_seconds(pid), "proxy {pid} must be stopped");
         Ok(())
     }
 

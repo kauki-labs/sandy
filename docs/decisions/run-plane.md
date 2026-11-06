@@ -253,8 +253,6 @@ gone, it kills every recorded process that is still alive, waits for each to exi
 - The owner is recorded before staging, so a kill at any point after the secret share exists leaves a record, and each
   helper process is recorded when it spawns, before its wait. What remains is the instant between a process's spawn
   and its report, in which a kill leaves that one process unrecorded.
-- A failed record write is logged and does not fail the run. That box goes unrecorded and would still be orphaned by
-  a kill.
 - `sandy run` sweeps inline, before its job starts, and `--timeout` does not cover it. A box with a stubborn process
   costs up to 3 s per run until the process is gone, and a box left undecided is tried again on every run. A run
   that stopped or removed anything, or left a box for the next run, prints one line on stderr; a box left alone because
@@ -271,6 +269,21 @@ gone, it kills every recorded process that is still alive, waits for each to exi
   pid counter to wrap within a second: unlikely, not impossible. vfkit runs on a PTY slave whose master the owner holds, so it exits when the owner is killed (live-verified,
   KOS9): the orphans of a killed macOS run are the egress proxy and the run directory. The agent, egress and service sockets of a killed vfkit run are not
   removed by the sweep; they hold no data.
+
+- A process the box record cannot take is not left running unrecorded (#676). When the record cannot be written, the
+  launch stops the process it just started (virtiofsd, the egress proxy, qemu, vfkit) and fails the run, and a
+  record that cannot be opened fails the run before anything is staged. Two cases are not failures: a process that
+  is already gone (it can outlive nothing, and the launch reports why it died, so the qemu CID retry still sees a
+  qemu that exits at once), and a host whose process table cannot be read at all (the sweep is blind there too, so
+  the run goes on unrecorded with a warning). A live process the table cannot name is the same case: it runs
+  unrecorded, and a later sweep cannot find it from `box.json`.
+- Teardown removes `-inputs` and `-outputs` first. In the run directory it removes everything but `box.json`, then
+  `box.json` last, and only when nothing else is left. A sibling or entry that cannot be removed keeps the record, so
+  the next sweep finds the box. A directory the guest made read-only is made writable first (sandy owns these
+  directories, symlinks are never followed), so a read-only module cache does not keep a box for good. A retained
+  record is swept only after its owner has exited. Under `sandyd` the owner is `sandyd`, so nothing removes the
+  leftovers until `sandyd` has exited and a sweep runs: `sandy run` sweeps before it launches, and `sandyd` does not
+  call the sweep at start-up yet (separate work).
 
 **Set aside.** Scanning command lines for qemu: it can hit a process we did not start. A process group kill (above).
 A daemon-lifetime lock on the staging base (above). Comparing the executable (above).

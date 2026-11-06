@@ -47,7 +47,7 @@ use crate::{
     agent::agent_outcome,
     console::{Markers, PipeTransport, run_console},
     egress_proxy::{EgressLaunch, ProxyHandle, console_command},
-    orphans::{BoxRecorder, SweepReport},
+    orphans::{BoxRecorder, SweepReport, unrecorded, wipe_staging},
     share::VirtiofsdTransport,
 };
 
@@ -428,7 +428,7 @@ impl QemuBackend {
         // A launch or socket fault kills any daemon already up and fails the boot.
         // Record each daemon as it spawns: `activate` waits up to 5 s per daemon for its socket, and a kill during that
         // wait must still leave a record of it (#666).
-        let mut record = BoxRecorder::open(inst_dir);
+        let mut record = BoxRecorder::open(inst_dir).map_err(|err| unrecorded(&err))?;
         let virtiofsds = VirtiofsdTransport.activate_recorded(shares, &mut |pid| record.add(pid))?;
         self.launch(spec, args, run_id, inst_dir, agent, egress, virtiofsds)
     }
@@ -455,9 +455,16 @@ impl QemuBackend {
         let sock = inst_dir.join("serial.sock");
 
         // Record every process this launch starts, so a restart can stop them if this process is killed (#666).
-        let mut record = BoxRecorder::open(inst_dir);
-        for daemon in &virtiofsds {
-            record.add(daemon.id());
+        let mut record = match BoxRecorder::open(inst_dir) {
+            Ok(record) => record,
+            Err(err) => {
+                kill_children(&mut virtiofsds);
+                return Err(unrecorded(&err));
+            }
+        };
+        if let Err(err) = virtiofsds.iter().try_for_each(|daemon| record.add(daemon.id())) {
+            kill_children(&mut virtiofsds);
+            return Err(unrecorded(&err));
         }
 
         // The proxy belongs to this attempt. A start failure kills the daemons
@@ -496,7 +503,12 @@ impl QemuBackend {
             }
         };
 
-        record.add(child.id());
+        if let Err(err) = record.add(child.id()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            kill_children(&mut virtiofsds);
+            return Err(unrecorded(&err));
+        }
 
         // Drain qemu's stderr on a thread. An un-read `piped` stderr deadlocks the
         // boot: once qemu writes past the pipe buffer it blocks, never opens the
@@ -594,11 +606,12 @@ impl QemuBackend {
 /// own lifecycle.
 fn plan_shares_or_wipe(spec: &RunSpec, dirs: &ShareDirs<'_>) -> Result<SharePlan, BackendError> {
     plan_shares(spec, dirs).inspect_err(|_| {
-        for dir in [dirs.inst_dir, dirs.inputs_dir, dirs.outputs_dir] {
-            if let Err(err) = wipe(dir) {
-                tracing::warn!(dir = %dir.display(), %err, "failed to wipe staging after a staging error");
-            }
-        }
+        wipe_staging(
+            dirs.inst_dir,
+            dirs.inputs_dir,
+            dirs.outputs_dir,
+            "after a staging error",
+        );
     })
 }
 
@@ -917,7 +930,11 @@ impl VmBackend for QemuBackend {
         // directory (#666). Each launch attempt below rewrites the record with the processes it starts.
         sandy_fsutil::OwnedDir::open_or_create(&inst_dir)
             .map_err(|err| BackendError::Spawn(format!("create instance dir {}: {err}", inst_dir.display())))?;
-        let _owner_record = BoxRecorder::open(&inst_dir);
+        let _owner_record = BoxRecorder::open(&inst_dir).map_err(|err| {
+            // Nothing sensitive is staged yet.
+            let _ = wipe(&inst_dir);
+            unrecorded(&err)
+        })?;
 
         // Stage the shares via the shared policy (secret/input/output, read-only
         // flags, the #49 secret_dir rule). Each virtiofsd socket lives in inst_dir
@@ -984,11 +1001,7 @@ impl VmBackend for QemuBackend {
 
         // Teardown clears staging on every path so secret bytes never outlive
         // the run (INV-1), including the error path. The inputs/outputs dirs too.
-        for dir in [&inst_dir, &inputs_dir, &outputs_dir] {
-            if let Err(err) = wipe(dir) {
-                tracing::warn!(dir = %dir.display(), %err, "failed to wipe staging on teardown");
-            }
-        }
+        wipe_staging(&inst_dir, &inputs_dir, &outputs_dir, "on teardown");
         with_digests(outcome, input_digests, collected)
     }
 
@@ -1630,7 +1643,9 @@ mod tests {
             .context("spawn stand-in virtiofsd")?;
         let daemon_pid = daemon.id();
         let backend = QemuBackend::new();
+        // `run` creates the instance directory before it boots; the box record lives in it.
         let inst = dir.path().join("inst");
+        std::fs::create_dir(&inst).context("create the instance dir")?;
         let args = vec![qemu.display().to_string()];
         let result = backend.launch(&spec, &args, Uuid::new_v4(), &inst, None, Some(&egress), vec![daemon]);
         let Err(BackendError::Spawn(message)) = result else {
@@ -1638,6 +1653,35 @@ mod tests {
         };
         anyhow::ensure!(message.starts_with("egress proxy did not start"), "{message}");
         anyhow::ensure!(!marker.exists(), "qemu must not spawn after a proxy start failure");
+        anyhow::ensure!(!pid_alive(daemon_pid), "the virtiofsd daemon must be killed");
+        Ok(())
+    }
+
+    /// #676: a launch whose box record cannot be opened kills the daemons it was handed and never starts qemu. Left
+    /// running, they would outlive a killed host with nothing naming them.
+    #[test]
+    fn a_launch_whose_box_record_cannot_be_opened_kills_the_daemons() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let marker = dir.path().join("qemu-ran");
+        let qemu = stub_qemu(dir.path(), &marker)?;
+        let allow = allow_all_github();
+        let command = ["true".to_string()];
+        let spec = quick_spec(&command, &allow);
+        let daemon = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .context("spawn stand-in virtiofsd")?;
+        let daemon_pid = daemon.id();
+        let inst = dir.path().join("no-such-inst");
+        let args = vec![qemu.display().to_string()];
+
+        let result = QemuBackend::new().launch(&spec, &args, Uuid::new_v4(), &inst, None, None, vec![daemon]);
+
+        let Err(BackendError::Spawn(message)) = result else {
+            anyhow::bail!("expected Spawn, got {result:?}");
+        };
+        anyhow::ensure!(message.contains("could not record"), "{message}");
+        anyhow::ensure!(!marker.exists(), "qemu must not spawn without a record");
         anyhow::ensure!(!pid_alive(daemon_pid), "the virtiofsd daemon must be killed");
         Ok(())
     }
