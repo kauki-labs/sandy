@@ -6,7 +6,7 @@ set -euo pipefail
 
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+trap 'chmod -R u+w "$tmp"; rm -rf "$tmp"' EXIT
 mkdir "$tmp/bin" "$tmp/home"
 
 # The fake ssh runs the remote command locally from the fake home. git push uses it too (GIT_SSH).
@@ -23,13 +23,33 @@ case "$*" in
 *) exit 0 ;;
 esac
 STUB
-chmod +x "$tmp/bin/ssh" "$tmp/bin/nix"
+# Report a non-Linux host so the script takes its ssh path on every platform, the KVM host included.
+cat >"$tmp/bin/uname" <<'STUB'
+#!/bin/sh
+case "$1" in
+-m) echo arm64 ;;
+*) echo Darwin ;;
+esac
+STUB
+# Fake the scratch clone of the --package step, so it passes on every filesystem and a masked build failure is
+# the only thing that can make the old script exit 0.
+real_git=$(command -v git)
+cat >"$tmp/bin/git" <<STUB
+#!/bin/sh
+if [ "\$1" = clone ]; then
+  for last; do :; done
+  mkdir -p "\$last"
+  exit 0
+fi
+exec "$real_git" "\$@"
+STUB
+chmod +x "$tmp/bin/ssh" "$tmp/bin/nix" "$tmp/bin/uname" "$tmp/bin/git"
 
 # $1: the stub build's exit status; the rest: linux-gate.sh arguments.
 run_gate() {
   local rc=$1
   shift
-  (cd "$repo" && HOME="$tmp/home" GIT_SSH="$tmp/bin/ssh" PATH="$tmp/bin:$PATH" SANDY_LINUX_HOST=fake \
+  (cd "$repo" && HOME="$tmp/home" GIT_SSH_COMMAND="$tmp/bin/ssh" PATH="$tmp/bin:$PATH" SANDY_LINUX_HOST=fake \
     STUB_NIX_BUILD_RC="$rc" bash scripts/dev/linux-gate.sh "$@" 2>&1) || return $?
 }
 
@@ -41,7 +61,6 @@ if grep -q 'linux-gate: x86_64-linux OK' <<<"$out"; then
   echo "FAIL: a failed build step printed the OK line" >&2
   exit 1
 fi
-# No --package here: its scratch `git clone` of a local path trips over hardlinks on some filesystems.
 out=$(run_gate 0) || {
   echo "FAIL: a passing gate exited non-zero: $out" >&2
   exit 1
