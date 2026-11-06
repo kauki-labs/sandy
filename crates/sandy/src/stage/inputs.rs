@@ -15,11 +15,12 @@
 //! symlinks each path to the staged entry. A no-copy direct-share variant (for
 //! large inputs) is still a follow-up (#82).
 
-use std::{fs, os::unix::fs::PermissionsExt, path::Path};
+use std::{fs, io, os::unix::fs::PermissionsExt, path::Path};
 
 use sandy_api::result::ContentDigests;
+use sandy_fsutil::{Beneath, EntryKind};
 
-use super::digest::digest_tree;
+use super::{digest::digest_tree, fs_err};
 use crate::backend::{BackendError, Input};
 
 /// The virtiofs `mountTag` for the inputs share. Fixed, not per-run, so the guest
@@ -59,7 +60,7 @@ pub fn stage_inputs(inputs: &[Input], inputs_dir: &Path) -> Result<usize, Backen
 
     for input in inputs {
         validate_input_name(&input.name)?;
-        copy_path(&input.host, &inputs_dir.join(&input.name))?;
+        copy_input(&input.host, &inputs_dir.join(&input.name))?;
         tracing::debug!(name = %input.name, host = %input.host.display(), "staged input (ro)");
     }
     write_manifest(inputs, inputs_dir)?;
@@ -123,21 +124,69 @@ fn validate_input_name(name: &str) -> Result<(), BackendError> {
     Ok(())
 }
 
-/// Copy `src` (a file or directory tree) to `dest`. Directories are created and
-/// recursed; files are copied. `symlink_metadata` is used so a symlinked directory
-/// is not recursed into as if it were real.
-fn copy_path(src: &Path, dest: &Path) -> Result<(), BackendError> {
-    let meta = fs::symlink_metadata(src).map_err(|e| err("stat input source", src, &e))?;
-    if meta.is_dir() {
-        fs::create_dir_all(dest).map_err(|e| err("create input subdir", dest, &e))?;
-        for entry in fs::read_dir(src).map_err(|e| err("read input dir", src, &e))? {
-            let entry = entry.map_err(|e| err("read input entry", src, &e))?;
-            copy_path(&entry.path(), &dest.join(entry.file_name()))?;
-        }
-        Ok(())
-    } else {
-        fs::copy(src, dest).map(|_| ()).map_err(|e| err("copy input", src, &e))
+/// Copy the host input at `host` (a file or a directory tree) to `dest`.
+///
+/// The input itself must not be a symlink: the path may have been swapped for a link after a caller checked it, and
+/// following it would stage a file the caller never named (#618). It is opened once without following a link, and
+/// a tree is copied through directory handles, so nothing below it is resolved a second time. A symlink inside a
+/// tree is staged as a link, never read: the bytes of the host file it names do not reach the guest, and a relative
+/// link between staged entries keeps working. A fifo, socket or device is skipped.
+fn copy_input(host: &Path, dest: &Path) -> Result<(), BackendError> {
+    let meta = fs::symlink_metadata(host).map_err(|e| err("stat input source", host, &e))?;
+    let ty = meta.file_type();
+    if ty.is_symlink() {
+        return Err(BackendError::Spawn(format!(
+            "input {} is a symlink; refusing to follow it (name the path it points to)",
+            host.display()
+        )));
     }
+    if ty.is_dir() {
+        let src = Beneath::open_dir(host).map_err(fs_err)?;
+        fs::create_dir_all(dest).map_err(|e| err("create input subdir", dest, &e))?;
+        copy_dir(&src, dest)
+    } else {
+        let mut file = sandy_fsutil::beneath::open_file(host).map_err(fs_err)?;
+        copy_file(&mut file, dest, host)
+    }
+}
+
+/// Copy the entries of `src` into the directory `dest`, one level at a time through the directory handle.
+fn copy_dir(src: &Beneath, dest: &Path) -> Result<(), BackendError> {
+    for (name, kind) in src.entries().map_err(fs_err)? {
+        let to = dest.join(&name);
+        match kind {
+            EntryKind::Dir => {
+                let sub = src.open_subdir(&name).map_err(fs_err)?;
+                fs::create_dir(&to).map_err(|e| err("create input subdir", &to, &e))?;
+                copy_dir(&sub, &to)?;
+            }
+            EntryKind::File => {
+                let mut file = src.open_file(&name).map_err(fs_err)?;
+                copy_file(&mut file, &to, &src.path().join(&name))?;
+            }
+            EntryKind::Symlink => {
+                let target = src.read_link(&name).map_err(fs_err)?;
+                std::os::unix::fs::symlink(&target, &to).map_err(|e| err("stage input symlink", &to, &e))?;
+            }
+            EntryKind::Other => {
+                tracing::warn!(path = %src.path().join(&name).display(), "skipping a non-regular input entry");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Copy the open file `from` (at `source`, for messages) to `dest`, keeping its permission bits as `fs::copy` does.
+fn copy_file(from: &mut fs::File, dest: &Path, source: &Path) -> Result<(), BackendError> {
+    let mode = from
+        .metadata()
+        .map_err(|e| err("stat input", source, &e))?
+        .permissions()
+        .mode();
+    let mut to = fs::File::create(dest).map_err(|e| err("create staged input", dest, &e))?;
+    io::copy(from, &mut to).map_err(|e| err("copy input", source, &e))?;
+    fs::set_permissions(dest, fs::Permissions::from_mode(mode & 0o7777))
+        .map_err(|e| err("set staged input mode", dest, &e))
 }
 
 /// A named [`BackendError::Spawn`] carrying the failed op, path, and os error.
