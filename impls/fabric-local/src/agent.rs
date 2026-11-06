@@ -86,38 +86,86 @@ pub const ACCESS_UNAVAILABLE: &str = "application/vnd.sandy.t3-access.unavailabl
 pub const MAX_ACCESS_TOKEN: usize = 1024;
 /// How many access requests wait for the agent before newer ones are dropped.
 pub(crate) const ACCESS_REQUESTS: usize = 8;
+/// The longest nonce a request carries.
+pub const MAX_ACCESS_NONCE: usize = 64;
+
+/// `true` for a nonce: 1 to [`MAX_ACCESS_NONCE`] of `A-Za-z0-9_-`. The channel drops an envelope whose content
+/// it already holds, so a requester puts a fresh nonce in every request; the answer echoes it, which also
+/// tells two requesters' answers apart.
+#[must_use]
+pub fn valid_access_nonce(nonce: &str) -> bool {
+    !nonce.is_empty()
+        && nonce.len() <= MAX_ACCESS_NONCE
+        && nonce
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+}
+
+/// `true` for a token the relay forwards: 1 to [`MAX_ACCESS_TOKEN`] of `A-Za-z0-9._~-`. A consumer may build a
+/// URL from it, so nothing that could end a URL component or carry a control byte passes.
+#[must_use]
+pub fn valid_access_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= MAX_ACCESS_TOKEN
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b'-'))
+}
 
 /// The agent's answer to an access request, as a host-side reader of the job's channel sees it (#669).
 #[derive(Clone, PartialEq, Eq)]
 pub enum AccessAnswer {
     /// The token. Its `Debug` is redacted.
-    Granted(String),
+    Granted {
+        /// The request's nonce.
+        nonce: String,
+        /// The token.
+        token: String,
+    },
     /// No token is available; the reason is sanitized and capped.
-    Unavailable(String),
+    Unavailable {
+        /// The request's nonce.
+        nonce: String,
+        /// Why.
+        reason: String,
+    },
 }
 
 impl std::fmt::Debug for AccessAnswer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Granted(_) => write!(f, "AccessAnswer::Granted(<redacted>)"),
-            Self::Unavailable(reason) => write!(f, "AccessAnswer::Unavailable({reason:?})"),
+            Self::Granted { nonce, .. } => write!(f, "AccessAnswer::Granted({nonce}, <redacted>)"),
+            Self::Unavailable { nonce, reason } => write!(f, "AccessAnswer::Unavailable({nonce}, {reason:?})"),
         }
     }
 }
 
 impl AccessAnswer {
-    /// Reads a channel envelope's `content_type` and payload as an answer. `None` for any other envelope, and
-    /// for a token that is empty, over [`MAX_ACCESS_TOKEN`] or not UTF-8.
+    /// The payload of an answer envelope: `<nonce>\n<body>`.
+    pub(crate) fn payload(nonce: &str, body: &str) -> Vec<u8> {
+        format!("{nonce}\n{body}").into_bytes()
+    }
+
+    /// Reads a channel envelope's `content_type` and payload as an answer. `None` for any other envelope, for
+    /// a bad nonce, and for a token that is not [`valid_access_token`]. An unavailable reason is decoded
+    /// lossily, sanitized and cut.
     #[must_use]
     pub fn from_envelope(content_type: &str, payload: &[u8]) -> Option<Self> {
+        let text = std::str::from_utf8(payload).ok().map(str::to_owned);
         match content_type {
             ACCESS_GRANTED => {
-                let token = std::str::from_utf8(payload).ok()?;
-                (!token.is_empty() && token.len() <= MAX_ACCESS_TOKEN).then(|| Self::Granted(token.to_owned()))
+                let (nonce, token) = text?.split_once('\n').map(|(n, t)| (n.to_owned(), t.to_owned()))?;
+                (valid_access_nonce(&nonce) && valid_access_token(&token)).then_some(Self::Granted { nonce, token })
             }
             ACCESS_UNAVAILABLE => {
-                let head = &payload[..payload.len().min(MAX_PROBE_OUTPUT)];
-                Some(Self::Unavailable(sanitize_probe_output(&String::from_utf8_lossy(head))))
+                let lossy =
+                    String::from_utf8_lossy(&payload[..payload.len().min(MAX_PROBE_OUTPUT + MAX_ACCESS_NONCE + 1)])
+                        .into_owned();
+                let (nonce, reason) = lossy.split_once('\n')?;
+                valid_access_nonce(nonce).then(|| Self::Unavailable {
+                    nonce: nonce.to_owned(),
+                    reason: sanitize_probe_output(cut_probe_output(reason)),
+                })
             }
             _ => None,
         }
@@ -485,7 +533,7 @@ pub struct LinkAgent {
     /// Stop requests from the relay (#670): the grace in seconds, handed out once by [`LinkAgent::take_stops`].
     stops: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<u32>>>,
     /// Access requests from the relay (#669), handed out once by [`LinkAgent::take_access_requests`].
-    access_requests: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<()>>>,
+    access_requests: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<String>>>,
 }
 
 /// How many peer deliveries wait in the inbox before newer ones are dropped
@@ -632,9 +680,9 @@ impl LinkAgent {
             .take()
     }
 
-    /// Takes the access-request receiver (#669), once. `None` if already taken. At most [`ACCESS_REQUESTS`]
-    /// requests wait; a request past that is dropped, and the requester asks again.
-    pub fn take_access_requests(&self) -> Option<tokio::sync::mpsc::Receiver<()>> {
+    /// Takes the access-request receiver (#669), once. `None` if already taken. Each item is a request's nonce. At most
+    /// [`ACCESS_REQUESTS`] requests wait; a request past that is dropped, and the requester asks again.
+    pub fn take_access_requests(&self) -> Option<tokio::sync::mpsc::Receiver<String>> {
         self.access_requests
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -719,7 +767,7 @@ async fn route_link(
     stdin_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     resize_tx: tokio::sync::mpsc::UnboundedSender<(u16, u16)>,
     stop_tx: tokio::sync::mpsc::UnboundedSender<u32>,
-    access_tx: tokio::sync::mpsc::Sender<()>,
+    access_tx: tokio::sync::mpsc::Sender<String>,
     peer_tx: tokio::sync::mpsc::Sender<PeerDelivery>,
     peer_dropped: Arc<std::sync::atomic::AtomicU64>,
     peer_refused: Arc<std::sync::atomic::AtomicU64>,
@@ -775,8 +823,8 @@ async fn route_link(
                 let _ = stop_tx.send(grace_secs);
             }
             // Best-effort: a full queue drops the request.
-            Ok(Some(LinkFrame::AccessRequest)) => {
-                let _ = access_tx.try_send(());
+            Ok(Some(LinkFrame::AccessRequest { nonce })) => {
+                let _ = access_tx.try_send(nonce);
             }
             Ok(Some(other)) => tracing::warn!(kind = other.kind(), "ignoring an unexpected link frame"),
             Ok(None) => return,
@@ -847,23 +895,27 @@ impl LinkAgent {
         Ok(write_frame(&mut *self.port.writer.lock().await, &LinkFrame::Exit { code }).await?)
     }
 
-    /// Answer an access request (#669) with the token. It rides the link to the relay and no further log.
+    /// Answer the access request `nonce` (#669) with the token. It rides the link to the relay and no further log.
     ///
     /// # Errors
     /// [`AgentError::Link`] if the frame cannot be written.
-    pub async fn grant_access(&self, token: String) -> Result<(), AgentError> {
-        Ok(write_frame(&mut *self.port.writer.lock().await, &LinkFrame::AccessGranted { token }).await?)
+    pub async fn grant_access(&self, nonce: String, token: String) -> Result<(), AgentError> {
+        Ok(write_frame(
+            &mut *self.port.writer.lock().await,
+            &LinkFrame::AccessGranted { nonce, token },
+        )
+        .await?)
     }
 
-    /// Answer an access request (#669) with why there is no token, cut to [`MAX_PROBE_OUTPUT`] bytes.
+    /// Answer the access request `nonce` (#669) with why there is no token, cut to [`MAX_PROBE_OUTPUT`] bytes.
     ///
     /// # Errors
     /// [`AgentError::Link`] if the frame cannot be written.
-    pub async fn deny_access(&self, reason: &str) -> Result<(), AgentError> {
+    pub async fn deny_access(&self, nonce: String, reason: &str) -> Result<(), AgentError> {
         let reason = cut_probe_output(reason).to_owned();
         Ok(write_frame(
             &mut *self.port.writer.lock().await,
-            &LinkFrame::AccessUnavailable { reason },
+            &LinkFrame::AccessUnavailable { nonce, reason },
         )
         .await?)
     }

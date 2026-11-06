@@ -338,22 +338,36 @@ where
             }
         })
     });
-    let access_answer_task = access_file
-        .zip(agent.take_access_requests())
-        .map(|(file, mut requests)| {
-            let agent = Arc::clone(&agent);
-            tokio::spawn(async move {
-                while requests.recv().await.is_some() {
-                    let sent = match file.read() {
-                        Ok(access) => agent.grant_access(access.token).await,
-                        Err(_) => agent.deny_access("no t3 access token yet").await,
-                    };
-                    if let Err(e) = sent {
-                        eprintln!("sandy-agent: answering a t3 access request: {e}");
+    // Always answers (#669): a job with no access directory says so, rather than leaving the requester silent.
+    // Ended through `access_stop`, never aborted, so an answer already being written finishes whole (INV-11).
+    let (access_stop, mut access_stopped) = tokio::sync::oneshot::channel::<()>();
+    let access_answer_task = agent.take_access_requests().map(|mut requests| {
+        let agent = Arc::clone(&agent);
+        tokio::spawn(async move {
+            loop {
+                let nonce = tokio::select! {
+                    biased;
+                    _ = &mut access_stopped => return,
+                    nonce = requests.recv() => match nonce {
+                        Some(nonce) => nonce,
+                        None => return,
+                    },
+                };
+                let sent = match access_file.as_ref().map(|file| file.read()) {
+                    Some(Ok(access)) => agent.grant_access(nonce, access.token).await,
+                    Some(Err(_)) => agent.deny_access(nonce, "no t3 access token yet").await,
+                    None => {
+                        agent
+                            .deny_access(nonce, "t3 access is not configured for this job")
+                            .await
                     }
+                };
+                if let Err(e) = sent {
+                    eprintln!("sandy-agent: answering a t3 access request: {e}");
                 }
-            })
-        });
+            }
+        })
+    });
     let readiness = service.map(|spec| service::spawn_readiness(Arc::clone(&agent), spec.probe, service_user));
     let (pty_read, pty_write, resizer, mut attach_child) = tmux_job
         .open_attach()
@@ -429,7 +443,8 @@ where
                 access_task.abort();
             }
             if let Some(task) = access_answer_task {
-                task.abort();
+                let _ = access_stop.send(());
+                let _ = task.await;
             }
             return Err(format!("reading the job's real exit code: {e}"));
         }
@@ -449,7 +464,8 @@ where
         access_task.abort();
     }
     if let Some(task) = access_answer_task {
-        task.abort();
+        let _ = access_stop.send(());
+        let _ = task.await;
     }
 
     match bridge_task.await {

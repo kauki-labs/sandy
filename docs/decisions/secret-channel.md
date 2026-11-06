@@ -91,10 +91,14 @@ agent redacts it from the job console and the archive, and the `pipe-pane` trans
 when the job's tmux session is dropped.
 
 On demand, a Control envelope `application/vnd.sandy.t3-access.request` on the orchestrator channel becomes a
-`LinkFrame::AccessRequest`. The agent answers with `AccessGranted { token }` or `AccessUnavailable { reason }`,
-which the relay posts as an `Output` envelope (`...t3-access.granted` or `...unavailable`). The token rides the
-link and that envelope only: `Debug` of the frame and of `AccessAnswer` redacts it, the relay drops an empty or
-over-1 KiB token, and a peer channel cannot post either answer type.
+`LinkFrame::AccessRequest`. Its payload is a nonce (1 to 64 of `A-Za-z0-9_-`): the channel drops an envelope whose
+content it already holds, so a requester sends a fresh nonce every time, and the answer echoes it. The agent
+answers with `AccessGranted { nonce, token }` or `AccessUnavailable { nonce, reason }`, also when the job has no
+access directory or no token yet. The relay posts it as an `Output` envelope (`...t3-access.granted` or
+`...unavailable`, payload `<nonce>\n<body>`). The token rides the link and that envelope only: `Debug` of the
+frame and of `AccessAnswer` redacts it, the relay drops a token that is not 1 to 1 KiB of `A-Za-z0-9._~-`, and a
+peer channel cannot post either answer type. The agent ends the answer task by signal, never by abort, so an
+answer being written finishes whole.
 
 Open: the live attach stream still shows the printed line to an attached viewer during the token's window.
 Closing that needs t3 not to print the URL to its tty, which is an upstream change, or an owner decision to

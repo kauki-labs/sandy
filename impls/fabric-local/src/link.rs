@@ -31,9 +31,9 @@ use tokio::{
 
 use crate::{
     agent::{
-        ACCESS_GRANTED, ACCESS_REQUEST_CONTROL, ACCESS_UNAVAILABLE, ARCHIVE_TRANSCRIPT, AbortOnDrop, MAX_ACCESS_TOKEN,
+        ACCESS_GRANTED, ACCESS_REQUEST_CONTROL, ACCESS_UNAVAILABLE, ARCHIVE_TRANSCRIPT, AbortOnDrop, AccessAnswer,
         RESIZE_CONTROL, SERVICE_PROBE_FAILED, SERVICE_READY, STOP_CONTROL, TTY_STDERR, TTY_STDIN, TTY_STDOUT,
-        cut_probe_output, decode_resize, decode_stop, sanitize_probe_output,
+        cut_probe_output, decode_resize, decode_stop, sanitize_probe_output, valid_access_nonce, valid_access_token,
     },
     channel::{Channel, ChannelError, MembershipId},
 };
@@ -155,15 +155,22 @@ pub enum LinkFrame {
         /// How long the job gets to exit after the interrupt, in seconds.
         grace_secs: u32,
     },
-    /// Relay to agent (#669): send the t3 access token.
-    AccessRequest,
+    /// Relay to agent (#669): send the t3 access token. `nonce` is echoed in the answer.
+    AccessRequest {
+        /// The requester's nonce.
+        nonce: String,
+    },
     /// Agent to relay (#669): the t3 access token. Its `Debug` redacts it.
     AccessGranted {
+        /// The request's nonce.
+        nonce: String,
         /// The token.
         token: String,
     },
     /// Agent to relay (#669): there is no token to give.
     AccessUnavailable {
+        /// The request's nonce.
+        nonce: String,
         /// Why, for the requester.
         reason: String,
     },
@@ -186,7 +193,7 @@ impl LinkFrame {
             Self::Ready => "ready",
             Self::ProbeFailed { .. } => "probe_failed",
             Self::Stop { .. } => "stop",
-            Self::AccessRequest => "access_request",
+            Self::AccessRequest { .. } => "access_request",
             Self::AccessGranted { .. } => "access_granted",
             Self::AccessUnavailable { .. } => "access_unavailable",
         }
@@ -219,9 +226,9 @@ impl std::fmt::Debug for LinkFrame {
             Self::Ready => write!(f, "LinkFrame::Ready"),
             Self::ProbeFailed { output } => write!(f, "LinkFrame::ProbeFailed({} bytes)", output.len()),
             Self::Stop { grace_secs } => write!(f, "LinkFrame::Stop({grace_secs}s)"),
-            Self::AccessRequest => write!(f, "LinkFrame::AccessRequest"),
+            Self::AccessRequest { nonce } => write!(f, "LinkFrame::AccessRequest({nonce})"),
             Self::AccessGranted { .. } => write!(f, "LinkFrame::AccessGranted(<redacted>)"),
-            Self::AccessUnavailable { reason } => write!(f, "LinkFrame::AccessUnavailable({} bytes)", reason.len()),
+            Self::AccessUnavailable { reason, .. } => write!(f, "LinkFrame::AccessUnavailable({} bytes)", reason.len()),
         }
     }
 }
@@ -592,7 +599,12 @@ where
                 } else if matches!(env.message_type, Some(MessageType::Control(_)))
                     && env.content_type == ACCESS_REQUEST_CONTROL
                 {
-                    LinkFrame::AccessRequest
+                    let nonce = String::from_utf8_lossy(&env.payload).into_owned();
+                    if !valid_access_nonce(&nonce) {
+                        tracing::warn!("agent relay: access request without a valid nonce; dropped");
+                        continue;
+                    }
+                    LinkFrame::AccessRequest { nonce }
                 } else {
                     continue;
                 };
@@ -813,19 +825,24 @@ where
             Some(answer @ (LinkFrame::AccessGranted { .. } | LinkFrame::AccessUnavailable { .. })) => {
                 // On demand, so no latch: every answer is posted. A refused post loses only that answer.
                 let (content_type, bytes) = match answer {
-                    LinkFrame::AccessGranted { token } => {
-                        if token.is_empty() || token.len() > MAX_ACCESS_TOKEN {
-                            tracing::warn!("an out-of-range access token was dropped");
+                    LinkFrame::AccessGranted { nonce, token } => {
+                        if !valid_access_nonce(&nonce) || !valid_access_token(&token) {
+                            tracing::warn!("an access token with a bad nonce or form was dropped");
                             continue;
                         }
-                        (ACCESS_GRANTED, token.into_bytes())
+                        (ACCESS_GRANTED, AccessAnswer::payload(&nonce, &token))
                     }
-                    LinkFrame::AccessUnavailable { reason } => (
-                        ACCESS_UNAVAILABLE,
-                        cut_probe_output(&sanitize_probe_output(cut_probe_output(&reason)))
-                            .as_bytes()
-                            .to_vec(),
-                    ),
+                    LinkFrame::AccessUnavailable { nonce, reason } => {
+                        if !valid_access_nonce(&nonce) {
+                            tracing::warn!("an access answer with a bad nonce was dropped");
+                            continue;
+                        }
+                        let reason = sanitize_probe_output(cut_probe_output(&reason));
+                        (
+                            ACCESS_UNAVAILABLE,
+                            AccessAnswer::payload(&nonce, cut_probe_output(&reason)),
+                        )
+                    }
                     _ => continue,
                 };
                 match membership
@@ -1076,11 +1093,12 @@ mod tests {
         Ok(())
     }
 
-    /// #669: an access request posted on the orchestrator channel reaches the agent, its token answer comes back
-    /// as one `ACCESS_GRANTED` envelope, and neither the frame nor the answer shows the token in `Debug`.
+    /// #669: access requests posted on the orchestrator channel reach the agent, each answer comes back as an
+    /// `ACCESS_GRANTED` envelope echoing the request's nonce, a second round with the same token is not
+    /// deduplicated, and neither the frame nor the answer shows the token in `Debug`.
     #[tokio::test]
-    async fn an_access_request_is_answered_with_the_token_and_never_debug_prints_it() -> anyhow::Result<()> {
-        use crate::agent::{ACCESS_GRANTED, ACCESS_REQUEST_CONTROL, AccessAnswer};
+    async fn access_requests_are_answered_per_nonce_and_never_debug_print_the_token() -> anyhow::Result<()> {
+        use crate::agent::{ACCESS_REQUEST_CONTROL, AccessAnswer};
 
         let (channel, agent_cap, orchestrator_cap) = channel_and_caps().await?;
         let orchestrator = channel.join(&orchestrator_cap)?;
@@ -1092,48 +1110,72 @@ mod tests {
         });
         let agent = timeout(WAIT, LinkAgent::bootstrap(agent_end)).await??;
         let mut requests = agent.take_access_requests().context("requests taken once")?;
-
         let control = || Some(MessageType::Control(sandy_proto::Control {}));
-        channel
-            .post(&orchestrator, control(), ACCESS_REQUEST_CONTROL, Vec::new())
-            .await?;
-        timeout(WAIT, requests.recv())
-            .await
-            .context("timed out waiting for the request")?
-            .context("the request channel closed")?;
-        agent.grant_access("tok-SECRET-123".to_owned()).await?;
 
-        let answer = loop {
-            let env = timeout(WAIT, inbound.next())
+        for nonce in ["round-1", "round-2"] {
+            channel
+                .post(
+                    &orchestrator,
+                    control(),
+                    ACCESS_REQUEST_CONTROL,
+                    nonce.as_bytes().to_vec(),
+                )
+                .await?;
+            let got = timeout(WAIT, requests.recv())
                 .await
-                .context("timed out waiting for the answer")?
-                .context("channel closed")??;
-            if let Some(answer) = AccessAnswer::from_envelope(&env.content_type, &env.payload) {
-                assert_eq!(env.content_type, ACCESS_GRANTED);
-                break answer;
-            }
-        };
-        assert_eq!(answer, AccessAnswer::Granted("tok-SECRET-123".to_owned()));
-        for shown in [
-            format!("{answer:?}"),
-            format!(
-                "{:?}",
-                LinkFrame::AccessGranted {
+                .context("timed out waiting for the request")?
+                .context("the request channel closed")?;
+            assert_eq!(got, nonce);
+            agent.grant_access(got, "tok-SECRET-123".to_owned()).await?;
+            let answer = loop {
+                let env = timeout(WAIT, inbound.next())
+                    .await
+                    .context("timed out waiting for the answer")?
+                    .context("channel closed")??;
+                if let Some(answer) = AccessAnswer::from_envelope(&env.content_type, &env.payload) {
+                    break answer;
+                }
+            };
+            assert_eq!(
+                answer,
+                AccessAnswer::Granted {
+                    nonce: nonce.to_owned(),
                     token: "tok-SECRET-123".to_owned()
                 }
-            ),
-        ] {
-            assert!(!shown.contains("SECRET"), "{shown}");
+            );
+            for shown in [
+                format!("{answer:?}"),
+                format!(
+                    "{:?}",
+                    LinkFrame::AccessGranted {
+                        nonce: nonce.to_owned(),
+                        token: "tok-SECRET-123".to_owned()
+                    }
+                ),
+            ] {
+                assert!(!shown.contains("SECRET"), "{shown}");
+            }
         }
+
+        // A request without a valid nonce never reaches the agent.
+        channel
+            .post(&orchestrator, control(), ACCESS_REQUEST_CONTROL, b"bad nonce!".to_vec())
+            .await?;
+        channel
+            .post(&orchestrator, control(), ACCESS_REQUEST_CONTROL, b"after".to_vec())
+            .await?;
+        let got = timeout(WAIT, requests.recv()).await?.context("closed")?;
+        assert_eq!(got, "after");
 
         drop(agent);
         timeout(WAIT, relay).await???;
         Ok(())
     }
 
-    /// #669: an unavailable answer is sanitized, and a peer-channel post cannot forge either answer type.
+    /// #669: an unavailable answer is sanitized; an answer with a bad token form or nonce is dropped by the
+    /// relay; a reader rejects a forged token form.
     #[tokio::test]
-    async fn an_unavailable_answer_is_sanitized_and_out_of_range_tokens_are_dropped() -> anyhow::Result<()> {
+    async fn bad_access_answers_are_dropped_and_an_unavailable_reason_is_sanitized() -> anyhow::Result<()> {
         use crate::agent::{ACCESS_UNAVAILABLE, AccessAnswer, MAX_ACCESS_TOKEN};
 
         let (channel, agent_cap, orchestrator_cap) = channel_and_caps().await?;
@@ -1146,9 +1188,14 @@ mod tests {
         });
         let agent = timeout(WAIT, LinkAgent::bootstrap(agent_end)).await??;
 
-        agent.grant_access("x".repeat(MAX_ACCESS_TOKEN + 1)).await?;
-        agent.grant_access(String::new()).await?;
-        agent.deny_access("no token\u{1b}[31m yet").await?;
+        let n = || "n1".to_owned();
+        agent.grant_access(n(), "x".repeat(MAX_ACCESS_TOKEN + 1)).await?;
+        agent.grant_access(n(), String::new()).await?;
+        agent.grant_access(n(), "has space/or#hash".to_owned()).await?;
+        agent
+            .grant_access("bad nonce".to_owned(), "fine-token".to_owned())
+            .await?;
+        agent.deny_access(n(), "no token\u{1b}[31m yet").await?;
 
         let env = loop {
             let env = timeout(WAIT, inbound.next())
@@ -1159,15 +1206,15 @@ mod tests {
                 break env;
             }
         };
-        assert_eq!(
-            env.content_type, ACCESS_UNAVAILABLE,
-            "the oversized and empty tokens are dropped"
-        );
-        let Some(AccessAnswer::Unavailable(reason)) = AccessAnswer::from_envelope(&env.content_type, &env.payload)
+        assert_eq!(env.content_type, ACCESS_UNAVAILABLE, "every bad grant is dropped");
+        let Some(AccessAnswer::Unavailable { nonce, reason }) =
+            AccessAnswer::from_envelope(&env.content_type, &env.payload)
         else {
             anyhow::bail!("expected Unavailable");
         };
+        assert_eq!(nonce, "n1");
         assert!(!reason.contains('\u{1b}'), "{reason:?}");
+        assert!(AccessAnswer::from_envelope(crate::agent::ACCESS_GRANTED, b"n1\nbad token").is_none());
 
         drop(agent);
         timeout(WAIT, relay).await???;
