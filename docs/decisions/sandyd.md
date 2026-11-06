@@ -2268,3 +2268,23 @@ A client that polls `GetEnvironment` renews the lease for as long as it polls, a
 **Consequences.** The backend is generic over `VmBackend`, so it is tier-2 testable with a double that holds until cancelled. It is not wired into `sandyd` yet: that needs the two `impls/vm` hooks (the qemu CID, the vfkit port-5100 device) and the bridge probe (C3b). VMs do not survive a daemon restart in this slice, because the threads die with the process. A restart policy is open on #587.
 
 **Alternative set aside.** A new launch path in `impls/vm`: it would fork boot and teardown logic across two backends.
+
+## 34. Mesh join is an alternative to the host bridge, chosen per deployment; the setup and teardown sequencer is pure (#671)
+
+**Status:** proposed. **Upholds:** INV-6.
+
+**Context.** The host bridge (#590) reaches a guest service without a guest network. Some deployments want the guest on a mesh (Tailscale or Headscale) so a client dials it directly. Both paths exist side by side; a deployment picks one.
+
+**Decision.**
+
+- `sandy-environment::mesh` holds the ordering of mesh setup and teardown over seams (`Coordination`, `GuestDelivery`, `VmBoot`, `ServiceReady`, `TeardownSteps`). It makes no network call, so it is tier-2 testable. This slice is the sequencer only; the headscale client, the guest-side join and the `t3` link calls come later.
+- Setup order: name (`sandbox-<16 hex>`), prepare the secrets directory, mint the join key just before boot, boot, deliver `tailscale-authkey` and `hostname` then `.ready`, wait for the node online, wait for the service.
+- Delivery removes `.ready` first and writes it last, so the guest never sees a half-written directory or a stale marker. A delivery without a `hostname` file fails and is reported.
+- A key is burned after any failed step from boot on: it is expired and never handed out again. A retry mints a new key.
+- Every error string passes through `redact`, which masks `hskey-auth-...` and `tskey-...`. `JoinKey` prints no value.
+- Teardown order: unlink and revoke sessions (hooks), `tailscale logout` (best effort), delete node, expire key, remove secrets. If the node delete fails, teardown returns `NodeStillPresent` and the caller keeps the record; key expiry and secrets removal still run.
+- The delegator link uses `full-access`. A lower mode is refused at link time with `runtime_mode_escalation_denied`, not at first launch.
+
+**Consequences.** Nothing is wired into `sandyd` yet. Unlink and revoke are hooks with no implementation here.
+
+**Alternative set aside.** Deciding mesh versus bridge once for all deployments: the right choice depends on whether the deployment already runs a coordination server.
