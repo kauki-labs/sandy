@@ -414,6 +414,10 @@ async fn bounded<T>(limit: Duration, call: impl Future<Output = Result<T, SeamEr
 /// [`SetupError`] naming the failed step. A key minted before the failure is
 /// expired; if that expiry fails the error carries the key with
 /// `key_burned == false` and teardown must expire it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one parameter per seam plus name, slot and config"
+)]
 pub async fn setup<C, G, B, S, L>(
     coord: &C,
     guest: &G,
@@ -442,12 +446,16 @@ where
     if cfg.poll_attempts == 0 {
         return Err(err(SetupStep::Config, None, false, "poll_attempts must be at least 1"));
     }
+    if cfg.call_timeout.is_zero() {
+        return Err(err(SetupStep::Config, None, false, "call_timeout must be non-zero"));
+    }
     bounded(t, guest.prepare())
         .await
         .map_err(|e| err(SetupStep::Prepare, None, false, &e.to_string()))?;
     let key = bounded(t, coord.mint_join_key(cfg.tag, cfg.key_ttl))
         .await
         .map_err(|e| err(SetupStep::MintKey, None, false, &e.to_string()))?;
+    slot.set(key.clone());
     if let Err((step, e)) = join(coord, guest, vm, service, linker, name, &key, cfg).await {
         let mut reason = e.to_string();
         let burned = match bounded(t, coord.expire_key(&key)).await {
@@ -536,7 +544,7 @@ where
         match bounded(cfg.call_timeout, f()).await {
             Ok(true) => return (true, None),
             Ok(false) => {}
-            Err(e) => return (false, Some(e)),
+            Err(e) => last = Some(e),
         }
     }
     (false, last)
@@ -619,7 +627,7 @@ where
     if let Err(e) = bounded(t, steps.tailscale_logout()).await {
         tracing::warn!(error = %scrub(&e.to_string(), key), "tailscale logout failed, continuing");
     }
-    let stop: Result<(), SeamError> = Ok(());
+    let stop = bounded(t, vm.stop(name)).await;
     if let Some(key) = key
         && let Err(e) = bounded(t, coord.expire_key(key)).await
     {
