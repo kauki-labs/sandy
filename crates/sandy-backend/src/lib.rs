@@ -16,6 +16,6 @@ pub use sandy_api::share::{GuestShareTransport, Placement, Presentation, ShareSp
 pub use sandy_impls_local::{LocalDirTransport, NoEgress, ProcessBackend, SystemdRunContainment};
 #[cfg(feature = "impl-vm")]
 pub use sandy_impls_vm::{
-    QemuBackend, QemuStagedArgs, VfkitBackend, VfkitStagedArgs, VirtioFsTransport, VirtiofsdTransport, qemu_args,
-    vfkit_args, virtiofsd_args,
+    QemuBackend, QemuStagedArgs, SweepReport, VfkitBackend, VfkitStagedArgs, VirtioFsTransport, VirtiofsdTransport,
+    qemu_args, sweep_orphaned_vms, vfkit_args, virtiofsd_args,
 };

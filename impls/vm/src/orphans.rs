@@ -56,8 +56,10 @@ pub trait ProcessTable {
     /// The path of `pid`'s executable, or `None` when it cannot be read. Recorded for a human reading the record; the
     /// sweep never compares it, because a wrapper execs another binary after the process is recorded.
     fn exe(&self, pid: u32) -> Option<String>;
-    /// Send an unblockable kill to the process `pid` that started at `start`, and to that process only. The check and
-    /// the signal are bound to one process, so a process that takes the pid after the check cannot receive the signal.
+    /// Send an unblockable kill to the process `pid` that started at `start`. Where the platform gives a process
+    /// handle (a pidfd on Linux), the check and the signal are bound to one process, so a process that takes the pid
+    /// after the check cannot receive the signal. Without one (macOS) the pid is checked and then signalled, and a
+    /// process that takes the pid in between can receive it.
     fn kill_started(&self, pid: u32, start: u64) -> Kill;
     /// An id of the current boot, or `None` when the host has none. Processes do not survive a reboot.
     fn boot_id(&self) -> Option<String>;
@@ -168,6 +170,33 @@ impl RecordWriter {
     }
 }
 
+/// Why a process could not be named for the record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unnameable {
+    /// It no longer exists (or is a zombie): it can outlive nothing.
+    Gone,
+    /// The table cannot see it: this host cannot tell, so neither can its sweep.
+    Blind,
+}
+
+impl std::fmt::Display for Unnameable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Gone => "the process is gone",
+            Self::Blind => "the process table cannot see the process",
+        })
+    }
+}
+
+impl std::error::Error for Unnameable {}
+
+/// Why `err` (from naming a process) is not a failure to write, if it is not.
+pub(crate) fn unnameable(err: &io::Error) -> Option<Unnameable> {
+    err.get_ref()
+        .and_then(|inner| inner.downcast_ref::<Unnameable>())
+        .copied()
+}
+
 /// Name `pid` as a record does, or fail when the table cannot give its start time: a process that cannot be told
 /// apart from a later one with its pid must not be recorded, since the sweep could never kill it safely. The
 /// executable is only for a human reader, so an unreadable one is recorded as empty.
@@ -178,10 +207,8 @@ fn identify(table: &dyn ProcessTable, pid: u32) -> io::Result<ProcId> {
             start,
             exe: table.exe(pid).unwrap_or_default(),
         }),
-        ProcState::Gone | ProcState::Unknown => Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "the process is not visible in the process table",
-        )),
+        ProcState::Gone => Err(io::Error::new(io::ErrorKind::NotFound, Unnameable::Gone)),
+        ProcState::Unknown => Err(io::Error::other(Unnameable::Blind)),
     }
 }
 
@@ -230,19 +257,32 @@ fn read_record(path: &Path) -> Result<Option<BoxRecord>, ()> {
 
 /// Remove a run directory, and the `-inputs` and `-outputs` directories beside it. A symlink is left alone.
 fn wipe_box(base: &Path, name: &str) -> bool {
+    wipe_box_with(base, name, &force_remove_dir_all)
+}
+
+/// [`wipe_box`] with the removal of one directory given, so a test can make one fail.
+fn wipe_box_with(base: &Path, name: &str, remove: &dyn Fn(&Path) -> io::Result<()>) -> bool {
     // The record lives in the run directory, so it goes last: while any sibling is left, the next sweep still finds
     // the record and finishes the job.
     for dir in [format!("{name}-inputs"), format!("{name}-outputs")] {
-        if !remove_orphan_dir(base, &dir) {
+        if !remove_orphan_dir(base, &dir, remove) {
             return false;
         }
     }
-    remove_orphan_dir(base, name)
+    // The run directory goes like a teardown's: everything but the record first, so a removal that fails part way (a
+    // read-only parent, a busy entry) never strands a secret share with no record to find it.
+    let run = base.join(name);
+    if fs::symlink_metadata(&run).is_ok_and(|meta| meta.file_type().is_dir())
+        && !empty_except_record(&run, "in the sweep", remove)
+    {
+        return false;
+    }
+    remove_orphan_dir(base, name, remove)
 }
 
 /// Remove one directory of a box. A missing path or a non-directory (a symlink is left alone) counts as removed;
 /// `false` means the directory is still there.
-fn remove_orphan_dir(base: &Path, dir: &str) -> bool {
+fn remove_orphan_dir(base: &Path, dir: &str, remove: &dyn Fn(&Path) -> io::Result<()>) -> bool {
     let path = base.join(dir);
     match fs::symlink_metadata(&path) {
         Ok(meta) if meta.file_type().is_dir() => {}
@@ -253,7 +293,7 @@ fn remove_orphan_dir(base: &Path, dir: &str) -> bool {
             return false;
         }
     }
-    match fs::remove_dir_all(&path) {
+    match remove(&path) {
         Ok(()) => true,
         Err(err) if err.kind() == io::ErrorKind::NotFound => true,
         Err(err) => {
@@ -512,6 +552,393 @@ fn is_srch(err: &io::Error) -> bool {
     err.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error())
 }
 
+/// What one `ps -o state=,lstart= -p PID` run says about the process. `ps` exits 1 and prints nothing at all for a pid
+/// that does not exist: that is the only empty answer that means "gone". Any other failure, an empty answer with exit
+/// 0, or a failure that says something on stderr (a bad option, a refused call), tells nothing about the process.
+#[cfg(any(target_os = "macos", test))]
+fn ps_answer(code: Option<i32>, stdout: &str, stderr_empty: bool) -> ProcState {
+    match code {
+        Some(0) if !stdout.trim().is_empty() => parse_ps_state(stdout),
+        Some(1) if stderr_empty => parse_ps_state(stdout),
+        _ => ProcState::Unknown,
+    }
+}
+
+/// What an answer of "no such process" is worth. `ps` prints nothing for a pid that does not exist, but it also prints
+/// nothing when it is denied access to process information (a sandbox, a restricted launch context). So a "gone" is
+/// believed only if `control`, the same question asked about this very process, saw it: a `ps` that cannot see the
+/// process asking cannot say that another one is gone.
+#[cfg(any(target_os = "macos", test))]
+fn gone_or_blind(parsed: ProcState, control: ProcState) -> ProcState {
+    match (parsed, control) {
+        (ProcState::Gone, ProcState::Started(_)) => ProcState::Gone,
+        (ProcState::Gone, _) => ProcState::Unknown,
+        (other, _) => other,
+    }
+}
+
+/// What `ps -o state=,lstart=` printed for one pid, as a [`ProcState`]. `ps` prints nothing for a pid that does not
+/// exist. The state letter is only for telling a zombie (`Z`) or dead (`X`) process, which has exited, from a running
+/// one. The start time is the five fields of `lstart` (`Wed Nov  5 10:23:45 2026`), hashed: it is only ever compared
+/// for equality, and a process that took the pid later started later, so it never matches.
+#[cfg(any(target_os = "macos", test))]
+fn parse_ps_state(stdout: &str) -> ProcState {
+    let line = stdout.trim();
+    if line.is_empty() {
+        return ProcState::Gone;
+    }
+    let mut fields = line.split_whitespace();
+    let Some(state) = fields.next() else {
+        return ProcState::Unknown;
+    };
+    if state.starts_with(['Z', 'X']) {
+        return ProcState::Gone;
+    }
+    // `lstart` is five fields: a weekday, a month, a day, a time and a year. Anything else (an error line, a cut
+    // answer) says nothing about the process.
+    let started: Vec<&str> = fields.collect();
+    if started.len() != 5 {
+        return ProcState::Unknown;
+    }
+    ProcState::Started(fnv1a(&started.join(" ")))
+}
+
+/// FNV-1a over `text`: a stable 64 bit identity for a start time string.
+#[cfg(any(target_os = "macos", test))]
+fn fnv1a(text: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
+/// The process table of a macOS host, read through `ps`. The crate forbids `unsafe`, so there is no `proc_pidinfo`.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Ps;
+
+#[cfg(target_os = "macos")]
+impl Ps {
+    /// The command for `/bin/ps` and `/usr/sbin/sysctl`: a fixed locale and time zone (`lstart` prints local time), no
+    /// input.
+    fn command(program: &str, args: &[&str]) -> std::process::Command {
+        let mut command = std::process::Command::new(program);
+        command
+            .env("LC_ALL", "C")
+            .env("TZ", "UTC")
+            .args(args)
+            .stdin(std::process::Stdio::null());
+        command
+    }
+
+    fn run(program: &str, args: &[&str]) -> Option<std::process::Output> {
+        Self::command(program, args).output().ok()
+    }
+
+    /// What `ps` says about one pid, taken at face value.
+    fn raw_state(pid: u32) -> ProcState {
+        let Some(out) = Self::run("/bin/ps", &["-o", "state=,lstart=", "-p", &pid.to_string()]) else {
+            return ProcState::Unknown;
+        };
+        ps_answer(
+            out.status.code(),
+            &String::from_utf8_lossy(&out.stdout),
+            out.stderr.is_empty(),
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl ProcessTable for Ps {
+    fn state(&self, pid: u32) -> ProcState {
+        match Self::raw_state(pid) {
+            // The control is only asked for a "gone": that is the one answer a blind `ps` also gives.
+            ProcState::Gone => gone_or_blind(ProcState::Gone, Self::raw_state(std::process::id())),
+            other => other,
+        }
+    }
+
+    fn exe(&self, pid: u32) -> Option<String> {
+        let out = Self::run("/bin/ps", &["-o", "comm=", "-p", &pid.to_string()])?;
+        let comm = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        (out.status.success() && !comm.is_empty()).then_some(comm)
+    }
+
+    fn kill_started(&self, pid: u32, start: u64) -> Kill {
+        use rustix::{
+            io::Errno,
+            process::{Pid, Signal, kill_process},
+        };
+
+        let Some(raw) = i32::try_from(pid).ok().and_then(Pid::from_raw) else {
+            return Kill::Failed;
+        };
+        // macOS has no pidfd, so this is check then kill: the window is one `ps` call. A process that took the pid in
+        // it would also have to have started in the recorded second (the identity has one-second resolution), which
+        // needs the pid counter to wrap within a second. That is unlikely, not impossible.
+        match self.state(pid) {
+            ProcState::Started(found) if found == start => {}
+            ProcState::Gone | ProcState::Started(_) => return Kill::Gone,
+            ProcState::Unknown => return Kill::Failed,
+        }
+        match kill_process(raw, Signal::KILL) {
+            Ok(()) => Kill::Signalled,
+            Err(errno) if errno == Errno::SRCH => Kill::Gone,
+            Err(_) => Kill::Failed,
+        }
+    }
+
+    fn boot_id(&self) -> Option<String> {
+        let out = Self::run("/usr/sbin/sysctl", &["-n", "kern.bootsessionuuid"])?;
+        let id = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        (out.status.success() && !id.is_empty()).then_some(id)
+    }
+
+    /// macOS has no pid namespaces.
+    fn pid_namespace(&self) -> Option<String> {
+        None
+    }
+}
+
+/// The process table of this host.
+#[cfg(target_os = "linux")]
+pub(crate) type Host = Procfs;
+
+/// The process table of this host.
+#[cfg(target_os = "macos")]
+pub(crate) type Host = Ps;
+
+/// The box's record of the processes it started (#666). A process the record does not name outlives a killed host, so
+/// a write that fails is an error the launch acts on: it stops the process it just started and fails the run (#676).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) struct BoxRecorder(Option<RecordWriter>);
+
+/// A host with no process table to read records nothing.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) struct BoxRecorder;
+
+impl BoxRecorder {
+    /// Open the record in `dir`, adopting what an earlier stage of the launch wrote.
+    ///
+    /// # Errors
+    ///
+    /// When the record cannot be created or read.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn open(dir: &Path) -> io::Result<Self> {
+        match RecordWriter::open_or_create(dir, &Host::default(), std::process::id()) {
+            Ok(writer) => Ok(Self(Some(writer))),
+            // This host cannot read its own process table, so its sweep cannot act on any record either: the run goes
+            // on unrecorded, as it always did here.
+            Err(err) if unnameable(&err).is_some() => {
+                tracing::warn!(%err, "cannot record this box: the process table is unreadable; a killed host would leave this VM behind");
+                Ok(Self(None))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "same signature as the hosts with a process table"
+    )]
+    pub(crate) fn open(_dir: &Path) -> io::Result<Self> {
+        Ok(Self)
+    }
+
+    /// Add a process the launch just started.
+    ///
+    /// # Errors
+    ///
+    /// When the process cannot be identified (it already exited, or the table cannot read it) or the record cannot be
+    /// written.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn add(&mut self, pid: u32) -> io::Result<()> {
+        let Some(writer) = &mut self.0 else {
+            return Ok(());
+        };
+        match writer.add(&Host::default(), pid) {
+            // Gone (or a zombie): it can outlive nothing, and the launch reports why it died.
+            Err(err) if unnameable(&err) == Some(Unnameable::Gone) => {
+                tracing::debug!(pid, "a started process exited before it could be recorded");
+                Ok(())
+            }
+            Err(err) if unnameable(&err) == Some(Unnameable::Blind) => {
+                tracing::warn!(pid, %err, "could not record a started process; it would outlive a killed host");
+                Ok(())
+            }
+            other => other,
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "same signature as the hosts with a process table"
+    )]
+    pub(crate) fn add(&mut self, _pid: u32) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Why a run stopped because the box record could not take a process: a process left running unrecorded would outlive
+/// a killed host. The caller has already stopped it.
+pub(crate) fn unrecorded_message(err: &io::Error) -> String {
+    format!("could not record a process of this box, so it was stopped and the run refused: {err}")
+}
+
+/// [`unrecorded_message`] as the run error.
+pub(crate) fn unrecorded(err: &io::Error) -> sandy::BackendError {
+    sandy::BackendError::Spawn(unrecorded_message(err))
+}
+
+/// Remove the staging of one box when its run ends (INV-1): the `-inputs` and `-outputs` directories first, the run
+/// directory last. A sibling that cannot be removed keeps the record, so the next sweep still finds the box and
+/// finishes the job (#676).
+pub(crate) fn wipe_staging(inst_dir: &Path, inputs_dir: &Path, outputs_dir: &Path, when: &str) {
+    wipe_staging_with(inst_dir, inputs_dir, outputs_dir, when, &force_remove_dir_all);
+}
+
+/// [`wipe_staging`] with the removal of one directory given, so a test can make one fail.
+fn wipe_staging_with(
+    inst_dir: &Path,
+    inputs_dir: &Path,
+    outputs_dir: &Path,
+    when: &str,
+    remove: &dyn Fn(&Path) -> io::Result<()>,
+) {
+    let mut left = false;
+    for dir in [inputs_dir, outputs_dir] {
+        if let Err(err) = remove(dir) {
+            tracing::warn!(dir = %dir.display(), %err, "failed to wipe staging {when}; the next sweep retries it");
+            left = true;
+        }
+    }
+    // The run directory holds the secret share and the record. The share goes whatever happens. The record goes last,
+    // and only when nothing else is left: it is the only thing that lets the next sweep find what is.
+    left |= !empty_except_record(inst_dir, when, remove);
+    if !left && let Err(err) = remove(inst_dir) {
+        tracing::warn!(dir = %inst_dir.display(), %err, "failed to wipe staging {when}");
+    }
+}
+
+/// Remove everything in `dir` but the record. `false` when something is left. A path that is not a directory (a
+/// symlink) is left alone.
+fn empty_except_record(dir: &Path, when: &str, remove: &dyn Fn(&Path) -> io::Result<()>) -> bool {
+    match fs::symlink_metadata(dir) {
+        Ok(meta) if meta.file_type().is_dir() => {}
+        Ok(_) => return true,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return true,
+        Err(err) => {
+            tracing::warn!(dir = %dir.display(), %err, "failed to inspect staging {when}");
+            return false;
+        }
+    }
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            tracing::warn!(dir = %dir.display(), %err, "failed to list staging {when}");
+            return false;
+        }
+    };
+    let mut clean = true;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) if entry.file_name() == RECORD_FILE => continue,
+            Ok(entry) => entry,
+            Err(err) => {
+                tracing::warn!(dir = %dir.display(), %err, "failed to list staging {when}");
+                clean = false;
+                continue;
+            }
+        };
+        let path = entry.path();
+        let removed = match entry.file_type() {
+            Ok(kind) if kind.is_dir() => remove(&path),
+            _ => fs::remove_file(&path),
+        };
+        if let Err(err) = removed
+            && err.kind() != io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %path.display(), %err, "failed to wipe staging {when}");
+            clean = false;
+        }
+    }
+    clean
+}
+
+/// `remove_dir_all`, but a tree the guest made read-only (a module cache, a copy from the nix store) is made writable
+/// first: sandy owns these directories, and a mode it cannot remove would keep a box for good. Symlinks are never
+/// followed, and a missing path is removed.
+pub(crate) fn force_remove_dir_all(path: &Path) -> io::Result<()> {
+    match fs::remove_dir_all(path) {
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+            make_tree_writable(path);
+            fs::remove_dir_all(path)
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+/// Add owner read, write and search to every directory of the tree at `path`. It works through directory handles
+/// opened without following a link: a directory swapped for a link while this runs is skipped, never changed or
+/// walked, and `fchmod` acts on the opened directory, not on a path.
+fn make_tree_writable(path: &Path) {
+    use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
+
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let Ok(root) = rustix::fs::open(path, flags, Mode::empty()) else {
+        return;
+    };
+    let mut handles = vec![root];
+    while let Some(handle) = handles.pop() {
+        if let Ok(stat) = rustix::fs::fstat(&handle) {
+            let _ = rustix::fs::fchmod(&handle, Mode::from_raw_mode((stat.st_mode & 0o7777) | 0o700));
+        }
+        let Ok(entries) = Dir::read_from(&handle) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name == c"." || name == c".." {
+                continue;
+            }
+            let is_dir = rustix::fs::statat(&handle, name, AtFlags::SYMLINK_NOFOLLOW)
+                .is_ok_and(|stat| FileType::from_raw_mode(stat.st_mode) == FileType::Directory);
+            if is_dir && let Ok(child) = rustix::fs::openat(&handle, name, flags, Mode::empty()) {
+                handles.push(child);
+            }
+        }
+    }
+}
+
+/// Stop the VMs that a killed host process (`sandyd` or a `sandy run`) left behind, and remove their staging
+/// directories (#666). It reads the records under the staging base, so it sweeps a box whichever hypervisor wrote it.
+/// Call it once at start-up, before launching. It stops only a process that a box record proves is ours, and only for a
+/// box whose owner is gone, so a running daemon or CLI is never touched. A no-op on a host with no process table.
+#[must_use]
+pub fn sweep_orphaned_vms() -> SweepReport {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    match sandy::ensure_sandy_staging_base() {
+        Ok(base) => {
+            let report = sweep_orphans(&base, &Host::default());
+            if report != SweepReport::default() {
+                tracing::info!(?report, "swept the VMs a killed host left behind");
+            }
+            report
+        }
+        Err(err) => {
+            tracing::warn!(%err, "could not open the staging base to sweep for orphaned VMs");
+            SweepReport::default()
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    SweepReport::default()
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -699,6 +1126,210 @@ mod tests {
             "123 ({comm}) {state} 1 123 123 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 {start} 1000 200 \
              18446744073709551615"
         )
+    }
+
+    /// #676: a box record that cannot be opened is an error. The run must not go on with a box nothing names.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_box_record_that_cannot_be_opened_is_an_error() -> anyhow::Result<()> {
+        let base = tempfile::tempdir().context("tempdir")?;
+        let missing = base.path().join("no-such-run");
+
+        assert!(
+            BoxRecorder::open(&missing).is_err(),
+            "the record directory does not exist"
+        );
+        Ok(())
+    }
+
+    /// #676: the secret goes on every teardown, but a sibling that cannot be removed keeps the record, so the next
+    /// sweep finds the box and removes it.
+    #[test]
+    fn a_sibling_that_cannot_be_wiped_keeps_the_record_and_loses_the_secret() -> anyhow::Result<()> {
+        let base = tempfile::tempdir().context("tempdir")?;
+        lay_out(base.path(), RUN1, &record())?;
+        let inst = base.path().join(RUN1);
+        // A real secret share is a directory.
+        fs::create_dir_all(inst.join("secret")).context("mkdir secret")?;
+        fs::write(inst.join("secret").join("key"), b"s").context("write key")?;
+        let inputs = base.path().join(format!("{RUN1}-inputs"));
+        let outputs = base.path().join(format!("{RUN1}-outputs"));
+
+        wipe_staging_with(&inst, &inputs, &outputs, "in a test", &|dir| {
+            if dir == inputs {
+                Err(io::Error::other("busy"))
+            } else {
+                sandy::wipe(dir)
+            }
+        });
+
+        assert!(
+            inst.join(RECORD_FILE).exists(),
+            "the record must stay while a sibling is left"
+        );
+        assert!(!inst.join("data").exists(), "the files of the run directory must go");
+        assert!(!inst.join("secret").exists(), "the secret share (a directory) must go");
+        assert!(!outputs.exists(), "the other sibling is removed");
+        assert!(inputs.exists(), "the sibling that cannot be removed is still there");
+
+        // Later the obstacle is gone. The sweep finishes the job: the owner is dead, its children still run.
+        let table = orphaned();
+        let report = sweep_orphans(base.path(), &table);
+
+        assert_eq!(report.wiped, 1, "{report:?}");
+        for name in [RUN1.to_owned(), format!("{RUN1}-inputs"), format!("{RUN1}-outputs")] {
+            assert!(!exists(base.path(), &name), "{name} must be removed by the sweep");
+        }
+        Ok(())
+    }
+
+    /// #676: a failed removal of the run directory itself must not take the record before the secret: the record goes
+    /// last.
+    #[test]
+    fn the_record_is_removed_after_everything_else_in_the_run_directory() -> anyhow::Result<()> {
+        let base = tempfile::tempdir().context("tempdir")?;
+        lay_out(base.path(), RUN1, &record())?;
+        let inst = base.path().join(RUN1);
+        fs::create_dir_all(inst.join("secret")).context("mkdir secret")?;
+        fs::write(inst.join("secret").join("key"), b"s").context("write key")?;
+        let inputs = base.path().join(format!("{RUN1}-inputs"));
+        let outputs = base.path().join(format!("{RUN1}-outputs"));
+
+        // The run directory itself cannot be removed (the last step), as when its parent turns read-only.
+        wipe_staging_with(&inst, &inputs, &outputs, "in a test", &|dir| {
+            if dir == inst {
+                Err(io::Error::other("busy"))
+            } else {
+                sandy::wipe(dir)
+            }
+        });
+
+        assert!(
+            inst.join(RECORD_FILE).exists(),
+            "the record is what finds the box again"
+        );
+        assert!(
+            !inst.join("secret").exists() && !inst.join("data").exists(),
+            "everything else is gone"
+        );
+        Ok(())
+    }
+
+    /// #676: a directory the guest made read-only (a module cache, a copy from the nix store) must not keep a box
+    /// for good: teardown makes our own directories writable and removes them.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_tree_in_a_sibling_is_still_removed() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        if rustix::process::geteuid().is_root() {
+            return Ok(()); // root removes anything
+        }
+        let base = tempfile::tempdir().context("tempdir")?;
+        lay_out(base.path(), RUN1, &record())?;
+        let outputs = base.path().join(format!("{RUN1}-outputs"));
+        let locked = outputs.join("cache").join("locked");
+        fs::create_dir_all(&locked).context("mkdir")?;
+        fs::write(locked.join("file"), b"x").context("write")?;
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).context("chmod locked")?;
+        fs::set_permissions(outputs.join("cache"), fs::Permissions::from_mode(0o500)).context("chmod cache")?;
+
+        wipe_staging(
+            &base.path().join(RUN1),
+            &base.path().join(format!("{RUN1}-inputs")),
+            &outputs,
+            "in a test",
+        );
+
+        for name in [RUN1.to_owned(), format!("{RUN1}-inputs"), format!("{RUN1}-outputs")] {
+            assert!(!exists(base.path(), &name), "{name} must be removed");
+        }
+        Ok(())
+    }
+
+    /// #676: the same for the sweep: a read-only tree does not leave a box `undecided` for good.
+    #[cfg(unix)]
+    #[test]
+    fn the_sweep_removes_a_box_with_a_read_only_tree() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        if rustix::process::geteuid().is_root() {
+            return Ok(());
+        }
+        let base = tempfile::tempdir().context("tempdir")?;
+        lay_out(base.path(), RUN1, &record())?;
+        let locked = base.path().join(format!("{RUN1}-outputs")).join("locked");
+        fs::create_dir_all(&locked).context("mkdir")?;
+        fs::write(locked.join("file"), b"x").context("write")?;
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).context("chmod")?;
+
+        let report = sweep_orphans(base.path(), &orphaned());
+
+        assert_eq!(report.wiped, 1, "{report:?}");
+        assert!(
+            !exists(base.path(), &format!("{RUN1}-outputs")),
+            "the read-only tree must go"
+        );
+        Ok(())
+    }
+
+    /// #676: a process that is not visible because it is gone can outlive nothing, so it is not an error to leave it
+    /// out of the record. Failing the run here broke the qemu CID retry: a qemu that dies at once must report its own
+    /// failure.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_process_that_already_exited_is_left_out_of_the_record_without_an_error() -> anyhow::Result<()> {
+        let base = tempfile::tempdir().context("tempdir")?;
+        let mut record = BoxRecorder::open(base.path()).context("open")?;
+        let mut child = std::process::Command::new("true").spawn().context("spawn")?;
+        let pid = child.id();
+        child.wait().context("wait")?;
+
+        record.add(pid).context("a gone process is not a recording failure")?;
+
+        let written = read_record(&base.path().join(RECORD_FILE))
+            .ok()
+            .flatten()
+            .context("record")?;
+        assert!(written.procs.is_empty(), "{written:?}");
+        Ok(())
+    }
+
+    /// #676: why a process cannot be named is kept apart from a failure to write the record.
+    #[test]
+    fn a_process_that_cannot_be_named_says_whether_it_is_gone_or_unseen() {
+        let table = Fake::default().with(1, 5, "x").unreadable(2);
+
+        let gone = identify(&table, 3).err().and_then(|err| unnameable(&err));
+        let blind = identify(&table, 2).err().and_then(|err| unnameable(&err));
+
+        assert_eq!(gone, Some(Unnameable::Gone));
+        assert_eq!(blind, Some(Unnameable::Blind));
+        assert_eq!(
+            unnameable(&io::Error::other("disk full")),
+            None,
+            "a write failure is neither"
+        );
+        assert!(identify(&table, 1).is_ok());
+    }
+
+    /// #676: with every directory removable, teardown removes all three.
+    #[test]
+    fn teardown_removes_the_run_directory_and_both_siblings() -> anyhow::Result<()> {
+        let base = tempfile::tempdir().context("tempdir")?;
+        lay_out(base.path(), RUN1, &record())?;
+
+        wipe_staging(
+            &base.path().join(RUN1),
+            &base.path().join(format!("{RUN1}-inputs")),
+            &base.path().join(format!("{RUN1}-outputs")),
+            "in a test",
+        );
+
+        for name in [RUN1.to_owned(), format!("{RUN1}-inputs"), format!("{RUN1}-outputs")] {
+            assert!(!exists(base.path(), &name), "{name} must be removed");
+        }
+        Ok(())
     }
 
     #[test]
@@ -1215,37 +1846,87 @@ mod tests {
     /// removed must leave the run directory and its record for the next sweep, not strand a directory with no record.
     #[test]
     fn a_sibling_that_cannot_be_removed_keeps_the_record() -> anyhow::Result<()> {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let base = tempfile::tempdir().context("tempdir")?;
         lay_out(base.path(), RUN1, &record())?;
-        let locked = base.path().join(format!("{RUN1}-inputs")).join("locked");
-        fs::create_dir_all(&locked).context("locked dir")?;
-        fs::write(locked.join("file"), b"x").context("file")?;
-        // A directory that cannot be written to cannot lose its entries.
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).context("chmod")?;
-        if fs::File::create(locked.join("probe")).is_ok() {
-            // Running as root: permissions do not stop the removal, so there is nothing to test here.
-            fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).context("restore")?;
-            return Ok(());
-        }
-        let table = orphaned();
+        let inputs = base.path().join(format!("{RUN1}-inputs"));
 
-        let report = sweep_orphans(base.path(), &table);
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).context("restore")?;
-
-        assert_eq!(
-            report,
-            SweepReport {
-                killed: 2,
-                undecided: 1,
-                ..SweepReport::default()
+        let done = wipe_box_with(base.path(), RUN1, &|dir| {
+            if dir == inputs {
+                Err(io::Error::other("busy"))
+            } else {
+                force_remove_dir_all(dir)
             }
-        );
+        });
+
+        assert!(!done, "a sibling is left");
         assert!(
             base.path().join(RUN1).join(RECORD_FILE).exists(),
             "the record stays so the next sweep can finish"
         );
+        assert!(inputs.exists());
+        Ok(())
+    }
+
+    /// Review of #678: removing the run directory can fail part way, after it has deleted `box.json` (read-only
+    /// staging parent, a busy entry). Everything the record guards must already be gone by then, so the failure never
+    /// strands a secret share with no record to find it.
+    #[test]
+    fn a_failed_removal_of_the_run_directory_leaves_nothing_the_record_guarded() -> anyhow::Result<()> {
+        let base = tempfile::tempdir().context("tempdir")?;
+        lay_out(base.path(), RUN1, &record())?;
+        let run = base.path().join(RUN1);
+        fs::create_dir_all(run.join("secret")).context("mkdir secret")?;
+        fs::write(run.join("secret").join("key"), b"s").context("write key")?;
+
+        let done = wipe_box_with(base.path(), RUN1, &|dir| {
+            if dir == run {
+                // A removal that takes the record first and then fails.
+                let _ = fs::remove_file(dir.join(RECORD_FILE));
+                Err(io::Error::other("busy"))
+            } else {
+                force_remove_dir_all(dir)
+            }
+        });
+
+        assert!(!done, "the run directory is still there");
+        assert!(
+            !run.join("secret").exists(),
+            "the secret share must be gone before the record is touched"
+        );
+        assert!(!run.join("data").exists(), "so must the rest of the run directory");
+        Ok(())
+    }
+
+    /// Review of #678: making a read-only tree writable must not follow a link: the link's target keeps its mode and
+    /// its content, and the tree still goes.
+    #[cfg(unix)]
+    #[test]
+    fn making_a_tree_writable_does_not_follow_a_symlink() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if rustix::process::geteuid().is_root() {
+            return Ok(());
+        }
+        let base = tempfile::tempdir().context("tempdir")?;
+        let victim = base.path().join("victim");
+        fs::create_dir(&victim)?;
+        fs::write(victim.join("f"), b"x")?;
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o500))?;
+        let tree = base.path().join("tree");
+        fs::create_dir_all(tree.join("sub"))?;
+        fs::write(tree.join("sub").join("g"), b"y")?;
+        std::os::unix::fs::symlink(&victim, tree.join("link"))?;
+        fs::set_permissions(tree.join("sub"), fs::Permissions::from_mode(0o500))?;
+        fs::set_permissions(&tree, fs::Permissions::from_mode(0o500))?;
+
+        let removed = force_remove_dir_all(&tree);
+        let mode = fs::metadata(&victim)?.permissions().mode() & 0o777;
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o700))?;
+
+        removed.context("the tree goes")?;
+        assert!(!tree.exists());
+        assert_eq!(mode, 0o500, "the link's target must keep its mode, got {mode:#o}");
+        assert!(victim.join("f").exists(), "and its content");
         Ok(())
     }
 
@@ -1506,6 +2187,203 @@ mod tests {
         let status = child.wait().context("wait")?;
         assert!(!status.success(), "{status:?}");
         // Once reaped, the same pid and start reads as gone.
+        assert_eq!(table.kill_started(pid, start), Kill::Gone);
+        Ok(())
+    }
+
+    #[test]
+    fn a_ps_line_gives_a_start_that_identifies_the_process() {
+        let started = parse_ps_state("S    Wed Nov  5 10:23:45 2026\n");
+        assert!(matches!(started, ProcState::Started(_)), "{started:?}");
+        // The state letter is not part of the identity: a process changes state, never its start.
+        assert_eq!(started, parse_ps_state("R+   Wed Nov  5 10:23:45 2026\n"));
+        // Nor is the padding `ps` puts in the day.
+        assert_eq!(started, parse_ps_state("S Wed Nov 5 10:23:45 2026"));
+        // A different second, or a different day, is a different process.
+        assert_ne!(started, parse_ps_state("S    Wed Nov  5 10:23:46 2026\n"));
+        assert_ne!(started, parse_ps_state("S    Thu Nov  6 10:23:45 2026\n"));
+    }
+
+    /// A zombie or dead process has exited and only awaits reaping.
+    #[test]
+    fn a_zombie_or_dead_process_reads_as_gone_in_ps() {
+        for line in [
+            "Z    Wed Nov  5 10:23:45 2026",
+            "Z+   Wed Nov  5 10:23:45 2026",
+            "X    Wed Nov  5 10:23:45 2026",
+        ] {
+            assert_eq!(parse_ps_state(line), ProcState::Gone, "{line}");
+        }
+    }
+
+    /// `ps` prints nothing for a pid that does not exist.
+    #[test]
+    fn an_empty_ps_answer_means_no_such_process() {
+        assert_eq!(parse_ps_state(""), ProcState::Gone);
+        assert_eq!(parse_ps_state("\n"), ProcState::Gone);
+    }
+
+    /// Anything that is not a state and a start time says nothing about the process, and must not read as one that is
+    /// gone.
+    #[test]
+    fn a_ps_answer_that_does_not_parse_is_unknown() {
+        for text in ["S", "S Wed Nov", "garbage", "ps: Invalid process id: 99999999999"] {
+            assert_eq!(parse_ps_state(text), ProcState::Unknown, "{text:?}");
+        }
+    }
+
+    /// Review of #675: only exit 1 with nothing on stderr and nothing on stdout is "no such process". An empty answer
+    /// with exit 0 is not a statement about the pid.
+    #[test]
+    fn only_a_ps_exit_of_one_with_nothing_said_means_no_such_process() {
+        let line = "S Mon Nov  3 10:00:00 2026";
+        assert_eq!(ps_answer(Some(1), "", true), ProcState::Gone);
+        assert_eq!(ps_answer(Some(0), "", true), ProcState::Unknown, "empty with exit 0");
+        assert_eq!(
+            ps_answer(Some(0), "  \n", true),
+            ProcState::Unknown,
+            "blank with exit 0"
+        );
+        assert_eq!(ps_answer(Some(1), "", false), ProcState::Unknown, "exit 1 with stderr");
+        assert_eq!(ps_answer(None, "", true), ProcState::Unknown, "killed by a signal");
+        assert!(matches!(ps_answer(Some(0), line, true), ProcState::Started(_)));
+    }
+
+    /// Review of #666: a `ps` that cannot see this very process cannot say another one is gone, or every owner would
+    /// read as dead and a live box would be wiped.
+    #[test]
+    fn a_ps_that_cannot_see_this_process_does_not_say_another_is_gone() {
+        let seen = ProcState::Started(7);
+        assert_eq!(
+            gone_or_blind(ProcState::Gone, seen),
+            ProcState::Gone,
+            "a sighted ps is believed"
+        );
+        assert_eq!(
+            gone_or_blind(ProcState::Gone, ProcState::Gone),
+            ProcState::Unknown,
+            "blind"
+        );
+        assert_eq!(
+            gone_or_blind(ProcState::Gone, ProcState::Unknown),
+            ProcState::Unknown,
+            "unclear"
+        );
+        // Only a "gone" needs the control: a process that was seen is seen, and an unknown stays unknown.
+        assert_eq!(
+            gone_or_blind(ProcState::Started(1), ProcState::Gone),
+            ProcState::Started(1)
+        );
+        assert_eq!(gone_or_blind(ProcState::Unknown, seen), ProcState::Unknown);
+    }
+
+    /// Review of #666: `ps -o lstart` prints LOCAL time. A different `TZ` in the recording process and the sweeping
+    /// process, or a DST change between them, would print another string for the same process: a live owner would read
+    /// as another process and its box would be wiped. Every `ps` call runs in a fixed time zone.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ps_runs_in_a_fixed_locale_and_time_zone() {
+        let command = Ps::command("/bin/ps", &["-p", "1"]);
+        let env = |key: &str| {
+            command
+                .get_envs()
+                .find(|(name, _)| *name == key)
+                .and_then(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+        };
+        assert_eq!(env("LC_ALL").as_deref(), Some("C"));
+        assert_eq!(env("TZ").as_deref(), Some("UTC"));
+    }
+
+    /// The same, by outcome: the identity this table gives a process is the one `ps` prints in UTC, whatever zone the
+    /// host is in, and a zone 14 hours ahead prints another time (so the pin matters).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_start_identity_does_not_depend_on_the_hosts_time_zone() -> anyhow::Result<()> {
+        let pid = std::process::id();
+        let lstart = |tz: &str| -> anyhow::Result<String> {
+            let out = std::process::Command::new("/bin/ps")
+                .env("LC_ALL", "C")
+                .env("TZ", tz)
+                .args(["-o", "lstart=", "-p", &pid.to_string()])
+                .output()
+                .context("run ps")?;
+            Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        };
+        assert_ne!(
+            lstart("UTC")?,
+            lstart("Pacific/Kiritimati")?,
+            "a zone 14 hours ahead prints another time"
+        );
+
+        let in_utc = parse_ps_state(&format!("S {}", lstart("UTC")?));
+        assert!(matches!(in_utc, ProcState::Started(_)), "{in_utc:?}");
+        assert_eq!(
+            Ps.state(pid),
+            in_utc,
+            "the table must identify the process by its UTC start"
+        );
+        Ok(())
+    }
+
+    /// The real macOS table reads this very process, a finished child, and a live one.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ps_identifies_the_running_process_and_a_finished_one() -> anyhow::Result<()> {
+        let table = Ps;
+        let pid = std::process::id();
+        assert!(matches!(table.state(pid), ProcState::Started(_)));
+        assert_eq!(table.state(pid), table.state(pid), "the start time is stable");
+        assert!(table.exe(pid).is_some_and(|exe| !exe.is_empty()));
+        assert!(
+            table.boot_id().is_some_and(|id| !id.is_empty()),
+            "a macOS host has a boot session id"
+        );
+        assert_eq!(table.pid_namespace(), None);
+
+        let mut finished = std::process::Command::new("true").spawn().context("spawn true")?;
+        let gone = finished.id();
+        finished.wait().context("wait")?;
+        assert_eq!(table.state(gone), ProcState::Gone);
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ps_refuses_a_pid_it_cannot_signal() {
+        let table = Ps;
+        assert_eq!(table.kill_started(0, 1), Kill::Failed, "pid 0");
+        assert_eq!(table.kill_started(u32::MAX, 1), Kill::Failed, "u32::MAX wraps to -1");
+        assert_eq!(
+            table.kill_started(i32::MAX as u32 + 1, 1),
+            Kill::Failed,
+            "above i32::MAX"
+        );
+    }
+
+    /// The kill is bound to the process that started at the recorded time: a live process with another start time gets
+    /// no signal. A child `sleep` is the stand-in.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ps_signals_only_the_process_that_started_at_the_recorded_time() -> anyhow::Result<()> {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .context("spawn sleep")?;
+        let pid = child.id();
+        let table = Ps;
+        let ProcState::Started(start) = table.state(pid) else {
+            anyhow::bail!("the child must be visible");
+        };
+
+        assert_eq!(table.kill_started(pid, start.wrapping_add(1)), Kill::Gone);
+        assert!(
+            child.try_wait().context("try_wait")?.is_none(),
+            "the child must be untouched"
+        );
+
+        assert_eq!(table.kill_started(pid, start), Kill::Signalled);
+        let status = child.wait().context("wait")?;
+        assert!(!status.success(), "{status:?}");
         assert_eq!(table.kill_started(pid, start), Kill::Gone);
         Ok(())
     }

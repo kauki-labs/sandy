@@ -15,11 +15,12 @@
 //! symlinks each path to the staged entry. A no-copy direct-share variant (for
 //! large inputs) is still a follow-up (#82).
 
-use std::{fs, os::unix::fs::PermissionsExt, path::Path};
+use std::{collections::HashSet, ffi::OsStr, fs, io, os::unix::fs::PermissionsExt, path::Path};
 
 use sandy_api::result::ContentDigests;
+use sandy_fsutil::{Beneath, EntryKind};
 
-use super::digest::digest_tree;
+use super::{digest::digest_tree, fs_err};
 use crate::backend::{BackendError, Input};
 
 /// The virtiofs `mountTag` for the inputs share. Fixed, not per-run, so the guest
@@ -56,10 +57,21 @@ pub fn stage_inputs(inputs: &[Input], inputs_dir: &Path) -> Result<usize, Backen
     fs::create_dir_all(inputs_dir).map_err(|e| err("create inputs dir", inputs_dir, &e))?;
     fs::set_permissions(inputs_dir, fs::Permissions::from_mode(0o700))
         .map_err(|e| err("tighten inputs dir to 0700", inputs_dir, &e))?;
+    let root = Beneath::open_dir(inputs_dir).map_err(fs_err)?;
 
+    // A staged tree may hold links, so a second input under a name already staged could write through one.
+    let mut names = HashSet::new();
     for input in inputs {
         validate_input_name(&input.name)?;
-        copy_path(&input.host, &inputs_dir.join(&input.name))?;
+        if !names.insert(input.name.as_str()) {
+            return Err(BackendError::Spawn(format!(
+                "input name {:?} is used twice",
+                input.name
+            )));
+        }
+    }
+    for input in inputs {
+        copy_input(&input.host, &root, OsStr::new(&input.name))?;
         tracing::debug!(name = %input.name, host = %input.host.display(), "staged input (ro)");
     }
     write_manifest(inputs, inputs_dir)?;
@@ -123,21 +135,74 @@ fn validate_input_name(name: &str) -> Result<(), BackendError> {
     Ok(())
 }
 
-/// Copy `src` (a file or directory tree) to `dest`. Directories are created and
-/// recursed; files are copied. `symlink_metadata` is used so a symlinked directory
-/// is not recursed into as if it were real.
-fn copy_path(src: &Path, dest: &Path) -> Result<(), BackendError> {
-    let meta = fs::symlink_metadata(src).map_err(|e| err("stat input source", src, &e))?;
-    if meta.is_dir() {
-        fs::create_dir_all(dest).map_err(|e| err("create input subdir", dest, &e))?;
-        for entry in fs::read_dir(src).map_err(|e| err("read input dir", src, &e))? {
-            let entry = entry.map_err(|e| err("read input entry", src, &e))?;
-            copy_path(&entry.path(), &dest.join(entry.file_name()))?;
-        }
-        Ok(())
-    } else {
-        fs::copy(src, dest).map(|_| ()).map_err(|e| err("copy input", src, &e))
+/// Copy the host input at `host` (a file or a directory tree) into `root` as `name`.
+///
+/// The input itself must not be a symlink: the path may have been swapped for a link after a caller checked it, and
+/// following it would stage a file the caller never named (#618). It is opened once without following a link, and
+/// a tree is copied through directory handles, so nothing below it is resolved a second time. A symlink inside a
+/// tree is staged as a link, never read: the bytes of the host file it names do not reach the guest, and a relative
+/// link between staged entries keeps working. A fifo, socket or device inside a tree is skipped. Staged entries are
+/// created new (never through an existing entry), so a link staged earlier is never written through.
+fn copy_input(host: &Path, root: &Beneath, name: &OsStr) -> Result<(), BackendError> {
+    // `components` drops a trailing `/` and `/.`, which would make the kernel follow a link in the last component.
+    let host: std::path::PathBuf = host.components().collect();
+    let host = host.as_path();
+    let meta = fs::symlink_metadata(host).map_err(|e| err("stat input source", host, &e))?;
+    let ty = meta.file_type();
+    if ty.is_symlink() {
+        return Err(BackendError::Spawn(format!(
+            "input {} is a symlink; refusing to follow it (name the path it points to)",
+            host.display()
+        )));
     }
+    if ty.is_dir() {
+        let src = Beneath::open_dir(host).map_err(fs_err)?;
+        let to = root.create_dir(name).map_err(fs_err)?;
+        copy_dir(&src, &to)
+    } else {
+        let mut file = sandy_fsutil::beneath::open_file(host).map_err(fs_err)?;
+        copy_file(&mut file, root, name, host)
+    }
+}
+
+/// Copy the entries of `src` into the directory `to`, one level at a time through the two handles.
+fn copy_dir(src: &Beneath, to: &Beneath) -> Result<(), BackendError> {
+    for entry in src.entries().map_err(fs_err)? {
+        let (name, kind) = entry.map_err(fs_err)?;
+        match kind {
+            EntryKind::Dir => {
+                let sub = src.open_subdir(&name).map_err(fs_err)?;
+                let staged = to.create_dir(&name).map_err(fs_err)?;
+                copy_dir(&sub, &staged)?;
+            }
+            EntryKind::File => {
+                let mut file = src.open_file(&name).map_err(fs_err)?;
+                copy_file(&mut file, to, &name, &src.path().join(&name))?;
+            }
+            EntryKind::Symlink => {
+                let target = src.read_link(&name).map_err(fs_err)?;
+                to.create_symlink(&name, &target).map_err(fs_err)?;
+            }
+            EntryKind::Other => {
+                tracing::warn!(path = %src.path().join(&name).display(), "skipping a non-regular input entry");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Copy the open file `from` (at `source`, for messages) into `to` as a new file `name`, keeping its permission bits as
+/// `fs::copy` does. The mode is set through the open handle, never through a path.
+fn copy_file(from: &mut fs::File, to: &Beneath, name: &OsStr, source: &Path) -> Result<(), BackendError> {
+    let mode = from
+        .metadata()
+        .map_err(|e| err("stat input", source, &e))?
+        .permissions()
+        .mode();
+    let mut out = to.create_new_file(name).map_err(fs_err)?;
+    io::copy(from, &mut out).map_err(|e| err("copy input", source, &e))?;
+    out.set_permissions(fs::Permissions::from_mode(mode & 0o7777))
+        .map_err(|e| err("set staged input mode", &to.path().join(name), &e))
 }
 
 /// A named [`BackendError::Spawn`] carrying the failed op, path, and os error.
@@ -187,6 +252,137 @@ mod tests {
             !inputs_dir.join(INPUT_MANIFEST_NAME).exists(),
             "no manifest without a guest path"
         );
+        Ok(())
+    }
+
+    /// #618: a symlink inside an input tree is staged as a link. The host never reads it, so the bytes of the host
+    /// file it names cannot reach the guest.
+    #[test]
+    fn a_symlink_inside_an_input_tree_is_not_copied_by_value() -> anyhow::Result<()> {
+        let src = tempfile::TempDir::new()?;
+        let victim = src.path().join("victim");
+        fs::write(&victim, b"HOST-SECRET")?;
+        let tree = src.path().join("tree");
+        fs::create_dir(&tree)?;
+        fs::write(tree.join("real"), b"ok")?;
+        std::os::unix::fs::symlink(&victim, tree.join("leak"))?;
+        std::os::unix::fs::symlink(src.path(), tree.join("dir-leak"))?;
+        let out = tempfile::TempDir::new()?;
+        let inputs_dir = out.path().join("inputs");
+        let inputs = [Input {
+            host: tree,
+            name: "dir".to_string(),
+            guest_path: None,
+        }];
+
+        stage_inputs(&inputs, &inputs_dir)?;
+
+        assert_eq!(fs::read(inputs_dir.join("dir").join("real"))?, b"ok");
+        for link in ["leak", "dir-leak"] {
+            let staged = inputs_dir.join("dir").join(link);
+            assert!(
+                fs::symlink_metadata(&staged)?.file_type().is_symlink(),
+                "{link} must be staged as a link, not as the bytes it names"
+            );
+        }
+        assert_eq!(fs::read_link(inputs_dir.join("dir").join("leak"))?, victim);
+        Ok(())
+    }
+
+    /// #618: an input that is itself a symlink is refused, whatever it names: the host path may have been swapped
+    /// for a link after a caller checked it.
+    #[test]
+    fn a_symlinked_input_is_refused() -> anyhow::Result<()> {
+        let src = tempfile::TempDir::new()?;
+        let victim = src.path().join("victim");
+        fs::write(&victim, b"HOST-SECRET")?;
+        let link = src.path().join("link");
+        std::os::unix::fs::symlink(&victim, &link)?;
+        let out = tempfile::TempDir::new()?;
+        let inputs_dir = out.path().join("inputs");
+        let inputs = [Input {
+            host: link,
+            name: "in".to_string(),
+            guest_path: None,
+        }];
+
+        let err = stage_inputs(&inputs, &inputs_dir).expect_err("a symlinked input must be refused");
+
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert!(!inputs_dir.join("in").exists(), "nothing of the target is staged");
+        Ok(())
+    }
+
+    /// #618 (review): two inputs with one name must not let the second write through a link the first staged. Before
+    /// links were staged as links this could not happen; now `x/evil` may be a link when the second `x` is staged.
+    #[test]
+    fn two_inputs_with_one_name_cannot_write_through_a_staged_link() -> anyhow::Result<()> {
+        let src = tempfile::TempDir::new()?;
+        let victim = src.path().join("victim");
+        fs::write(&victim, b"HOST-FILE")?;
+        let a = src.path().join("a");
+        fs::create_dir(&a)?;
+        std::os::unix::fs::symlink(&victim, a.join("evil"))?;
+        let b = src.path().join("b");
+        fs::create_dir(&b)?;
+        fs::write(b.join("evil"), b"attacker bytes")?;
+        let out = tempfile::TempDir::new()?;
+        let inputs_dir = out.path().join("inputs");
+        let inputs = [
+            Input {
+                host: a,
+                name: "x".to_string(),
+                guest_path: None,
+            },
+            Input {
+                host: b,
+                name: "x".to_string(),
+                guest_path: None,
+            },
+        ];
+
+        let result = stage_inputs(&inputs, &inputs_dir);
+
+        assert!(result.is_err(), "a repeated input name must be refused");
+        assert_eq!(
+            fs::read(&victim)?,
+            b"HOST-FILE",
+            "the file the staged link names is untouched"
+        );
+        Ok(())
+    }
+
+    /// #618 (review): a trailing `/` or `/.` makes the kernel resolve a symlink in the last component even with
+    /// `O_NOFOLLOW`, so a directory input given that way must still be refused when it is a link.
+    #[test]
+    fn a_symlinked_directory_input_is_refused_with_a_trailing_slash_or_dot() -> anyhow::Result<()> {
+        let src = tempfile::TempDir::new()?;
+        let victim = src.path().join("victim-dir");
+        fs::create_dir(&victim)?;
+        fs::write(victim.join("secret"), b"HOST-SECRET")?;
+        let link = src.path().join("link");
+        std::os::unix::fs::symlink(&victim, &link)?;
+        for suffix in ["/", "/."] {
+            let host = std::path::PathBuf::from(format!("{}{suffix}", link.display()));
+            let out = tempfile::TempDir::new()?;
+            let inputs_dir = out.path().join("inputs");
+            let inputs = [Input {
+                host,
+                name: "in".to_string(),
+                guest_path: None,
+            }];
+
+            let result = stage_inputs(&inputs, &inputs_dir);
+
+            assert!(
+                result.is_err(),
+                "{suffix:?}: a symlinked directory input must be refused"
+            );
+            assert!(
+                !inputs_dir.join("in").join("secret").exists(),
+                "{suffix:?}: nothing of the target is staged"
+            );
+        }
         Ok(())
     }
 

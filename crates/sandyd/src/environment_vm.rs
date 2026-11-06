@@ -438,6 +438,8 @@ pub fn vfkit_backend(
         settings,
         probe,
         || {
+            // Stop the VMs a killed daemon left behind first, then clear the sockets nothing answers on.
+            let _ = VfkitBackend::sweep_orphans();
             let _ = sweep_stale_service_sockets(&sweep_base);
         },
         per_env,

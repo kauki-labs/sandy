@@ -236,7 +236,7 @@ pub fn parse_input(raw: &str, index: usize) -> Result<Input, PlanError> {
             ))
         })?;
         return Ok(Input {
-            host: PathBuf::from(host),
+            host: resolve_input_host(host),
             name: format!("in{index}"),
             guest_path: Some(PathBuf::from(spec)),
         });
@@ -245,10 +245,23 @@ pub fn parse_input(raw: &str, index: usize) -> Result<Input, PlanError> {
         return Err(invalid());
     }
     Ok(Input {
-        host: PathBuf::from(host),
+        host: resolve_input_host(host),
         name: spec.to_string(),
         guest_path: None,
     })
+}
+
+/// The host path of an input as the stage opens it. The stage refuses a symlink there (#618): it cannot tell a link the
+/// user typed from one swapped in after a caller checked the path. So a link typed on the command line, such as a nix
+/// `result`, is resolved here, once, by the user's own command. A path that is not a link, or whose link does not
+/// resolve, is returned as given (the stage then refuses a dangling link by name).
+fn resolve_input_host(host: &str) -> PathBuf {
+    // `components` drops a trailing `/` and `/.`, which would make the check below follow the link.
+    let path: PathBuf = PathBuf::from(host).components().collect();
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_symlink() => std::fs::canonicalize(&path).unwrap_or(path),
+        _ => path,
+    }
 }
 
 /// An input guest path is absolute and has no `.`/`..`/empty component (so the
@@ -382,7 +395,54 @@ fn parse_allow(raw: &str) -> Result<EgressRule, PlanError> {
 mod tests {
     use sandy::{PlanError, SecretSource};
 
-    use super::{RunArgs, parse_run};
+    use super::{RunArgs, parse_input, parse_run};
+
+    /// #618: the stage refuses an input that is a symlink, so `--input` resolves a link the user typed (a nix
+    /// `result`, say) itself, once, before the path reaches the stage.
+    #[test]
+    fn a_symlinked_input_path_is_resolved_before_it_reaches_the_stage() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let real = dir.path().join("real.txt");
+        std::fs::write(&real, b"x")?;
+        let link = dir.path().join("result");
+        std::os::unix::fs::symlink(&real, &link)?;
+
+        let input = parse_input(&format!("{}:data", link.display()), 0)?;
+
+        assert_eq!(input.host, std::fs::canonicalize(&real)?);
+        Ok(())
+    }
+
+    /// #618 (review): `result/` typed with a trailing slash names the link too, and the stage refuses it, so it is
+    /// resolved the same way.
+    #[test]
+    fn a_symlinked_input_path_with_a_trailing_slash_is_resolved() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real)?;
+        let link = dir.path().join("result");
+        std::os::unix::fs::symlink(&real, &link)?;
+
+        let input = parse_input(&format!("{}/:data", link.display()), 0)?;
+
+        assert_eq!(input.host, std::fs::canonicalize(&real)?);
+        Ok(())
+    }
+
+    /// A path that is not a link, or does not exist, is left as given.
+    #[test]
+    fn a_plain_or_missing_input_path_is_left_as_given() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let plain = dir.path().join("plain.txt");
+        std::fs::write(&plain, b"x")?;
+
+        assert_eq!(parse_input(&format!("{}:a", plain.display()), 0)?.host, plain);
+        assert_eq!(
+            parse_input("/no/such/path:b", 1)?.host,
+            std::path::PathBuf::from("/no/such/path")
+        );
+        Ok(())
+    }
 
     /// `--allow github.com:443` desugars to one [`EgressRule`] in the allow-list.
     #[test]

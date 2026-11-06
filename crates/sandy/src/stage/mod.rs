@@ -24,3 +24,8 @@ mod secrets;
 pub use inputs::{INPUT_MOUNT_TAG, digest_staged_inputs, stage_inputs};
 pub use outputs::{OUTPUT_MOUNT_TAG, collect_outputs, prepare_outputs};
 pub use secrets::{SECRET_MOUNT_TAG, StagedSecret, stage_secrets, wipe};
+
+/// A [`sandy_fsutil::FsError`] as the run error a stage function returns.
+fn fs_err(e: sandy_fsutil::FsError) -> crate::BackendError {
+    crate::BackendError::Spawn(e.to_string())
+}
