@@ -114,6 +114,7 @@ pub(crate) async fn handle(state: Arc<State>, req: Request<Incoming>) -> Respons
         (&Method::POST, ["v1", "jobs"]) => submit(&state, client, req).await,
         (&Method::GET, ["v1", "jobs"]) => list(&state, client).await,
         (&Method::GET, ["v1", "jobs", id]) => get(&state, client, id).await,
+        (&Method::GET, ["v1", "jobs", _, "output"]) => Err(UNSUPPORTED),
         (&Method::POST, ["v1", "jobs", id, "cancel"]) => cancel(&state, client, id).await,
         (&Method::POST, ["v1", "environments"]) => environments::spawn(&state, client, req).await,
         (&Method::GET, ["v1", "environments"]) => environments::list(&state, client, req.uri().query()).await,

@@ -185,6 +185,12 @@ pub struct Tuning {
     pub ticket_ttl: std::time::Duration,
     /// How long one write to a client that stopped reading may block before the stream ends.
     pub send_timeout: std::time::Duration,
+    /// Bytes of one job's output the broker keeps. The oldest bytes drop first.
+    pub output_job_cap: usize,
+    /// Bytes of output the broker keeps across all jobs.
+    pub output_total_cap: usize,
+    /// How long a finished job's output stays readable.
+    pub output_retention: std::time::Duration,
 }
 
 impl Default for Tuning {
@@ -192,6 +198,9 @@ impl Default for Tuning {
         Self {
             ticket_ttl: std::time::Duration::from_secs(30),
             send_timeout: std::time::Duration::from_secs(30),
+            output_job_cap: 1024 * 1024,
+            output_total_cap: 16 * 1024 * 1024,
+            output_retention: std::time::Duration::from_secs(15 * 60),
         }
     }
 }

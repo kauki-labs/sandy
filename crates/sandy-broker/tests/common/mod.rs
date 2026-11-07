@@ -41,6 +41,10 @@ pub struct Opts {
     pub ticket_ttl: Duration,
     /// How long a write to a client that stopped reading may block.
     pub send_timeout: Duration,
+    /// Bytes of one job's output the broker keeps.
+    pub output_job_cap: usize,
+    /// How long a finished job's output stays readable.
+    pub output_retention: Duration,
 }
 
 impl Default for Opts {
@@ -49,6 +53,8 @@ impl Default for Opts {
             attach_socket: true,
             ticket_ttl: Duration::from_secs(30),
             send_timeout: Duration::from_secs(30),
+            output_job_cap: Tuning::default().output_job_cap,
+            output_retention: Tuning::default().output_retention,
         }
     }
 }
@@ -200,6 +206,9 @@ async fn build(
         Tuning {
             ticket_ttl: opts.ticket_ttl,
             send_timeout: opts.send_timeout,
+            output_job_cap: opts.output_job_cap,
+            output_retention: opts.output_retention,
+            ..Tuning::default()
         },
     )
     .await?;
