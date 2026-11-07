@@ -328,14 +328,15 @@ async fn dropping_the_broker_stops_its_collectors() -> Result<()> {
     let id = f.submit(TOKEN_A).await?;
     let job = f.registry.get(&id).context("job")?;
     let deadline = tokio::time::Instant::now() + WAIT;
-    while job.channel.member_count() < 1 {
+    // sandyd's own archive persister is always one member; the collector is the second.
+    while job.channel.member_count() < 2 {
         assert!(tokio::time::Instant::now() < deadline, "the collector never joined");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let common::Fixture { _broker, .. } = f;
     drop(_broker);
     let deadline = tokio::time::Instant::now() + WAIT;
-    while job.channel.member_count() > 0 {
+    while job.channel.member_count() > 1 {
         assert!(
             tokio::time::Instant::now() < deadline,
             "the collector outlived the broker"

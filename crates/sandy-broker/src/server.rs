@@ -31,7 +31,7 @@ pub(crate) struct State {
     pub(crate) owners: Owners,
     pub(crate) tickets: attach::Tickets,
     /// Each accepted job's collected output.
-    pub(crate) outputs: Outputs,
+    pub(crate) outputs: Arc<Outputs>,
     /// How long one write to a stalled attach client may block.
     pub(crate) send_timeout: std::time::Duration,
     /// Serializes one client's environment creates, so a quota check and its create are one step.
@@ -305,8 +305,12 @@ async fn submit(state: &Arc<State>, client: &Client, req: Request<Incoming>) -> 
         }
         return Err(UNAVAILABLE);
     }
-    state.outputs.register(&done.job_id);
-    tokio::spawn(output::collect(Arc::clone(state), done.job_id.clone()));
+    state.outputs.register(&done.job_id, &client.id);
+    state.outputs.track(tokio::spawn(output::collect(
+        Arc::clone(state),
+        done.job_id.clone(),
+        done.attach_token.clone(),
+    )));
     Ok((StatusCode::ACCEPTED, json!({"job_id": done.job_id, "state": "pending"})))
 }
 

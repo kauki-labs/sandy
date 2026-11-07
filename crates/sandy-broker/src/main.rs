@@ -41,6 +41,8 @@ fn load_clients(path: &std::path::Path) -> Result<Vec<Client>, String> {
 
 /// Env var: seconds a finished job's output stays readable.
 const RETENTION_ENV: &str = "SANDY_BROKER_OUTPUT_RETENTION_SECS";
+/// Upper bound for [`RETENTION_ENV`]: output lives in memory, so a longer window is a mistake.
+const MAX_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 
 fn output_retention() -> Result<std::time::Duration, String> {
     parse_retention(std::env::var(RETENTION_ENV))
@@ -48,10 +50,13 @@ fn output_retention() -> Result<std::time::Duration, String> {
 
 fn parse_retention(value: Result<String, std::env::VarError>) -> Result<std::time::Duration, String> {
     match value {
-        Ok(v) => v
-            .parse::<u64>()
-            .map(std::time::Duration::from_secs)
-            .map_err(|e| format!("{RETENTION_ENV}={v:?}: {e}")),
+        Ok(v) => match v.parse::<u64>() {
+            Ok(secs) if secs <= MAX_RETENTION_SECS => Ok(std::time::Duration::from_secs(secs)),
+            Ok(_) => Err(format!(
+                "{RETENTION_ENV}={v:?}: at most {MAX_RETENTION_SECS} seconds (7 days)"
+            )),
+            Err(e) => Err(format!("{RETENTION_ENV}={v:?}: {e}")),
+        },
         Err(std::env::VarError::NotPresent) => Ok(Tuning::default().output_retention),
         Err(e) => Err(format!("{RETENTION_ENV}: {e}")),
     }

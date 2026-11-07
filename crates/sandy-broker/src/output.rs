@@ -2,7 +2,8 @@
 //!
 //! sandyd keeps no job output. It reaches the broker only on the attach socket, which ends when
 //! the job does. So the broker starts one collector per accepted job. The collector attaches with
-//! the stored attach token and appends each chunk to a bounded in-memory buffer. `GET
+//! the stored attach token as sandyd's collector (a read-only cap that attach counting ignores) and
+//! appends each chunk to a bounded in-memory buffer. `GET
 //! /v1/jobs/{id}/output` serves that buffer by absolute offset, during the run and for a window
 //! after it. Nothing here is written to disk: a broker restart loses every buffer.
 
@@ -32,6 +33,7 @@ const JOIN_ATTEMPTS: u32 = 5;
 const JOIN_BACKOFF: Duration = Duration::from_millis(200);
 
 /// How a job's collection ended.
+#[derive(Debug)]
 struct Ended {
     at: Instant,
     /// The job's terminal state name, when the broker could read it.
@@ -40,7 +42,10 @@ struct Ended {
     fault: Option<&'static str>,
 }
 
+#[derive(Debug)]
 struct Buf {
+    /// The owning client: its bytes count against that client's share only.
+    client: String,
     data: VecDeque<u8>,
     /// Absolute offset of `data[0]`.
     base: u64,
@@ -69,21 +74,40 @@ pub(crate) struct Read {
     ended: Option<(Option<String>, Option<&'static str>)>,
 }
 
-/// The bounded in-memory output buffers, one per job.
+/// The bounded in-memory output buffers, one per job, and the collector tasks that fill them.
+#[derive(Debug)]
 pub(crate) struct Outputs {
     job_cap: usize,
-    total_cap: usize,
+    /// Bytes one client may hold: the total cap split evenly over the known clients, so the
+    /// sum over all clients stays within the total cap and no client can evict another's.
+    client_cap: usize,
     retention: Duration,
     jobs: Mutex<HashMap<String, Buf>>,
+    collectors: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl Outputs {
-    pub(crate) fn new(job_cap: usize, total_cap: usize, retention: Duration) -> Self {
+    pub(crate) fn new(job_cap: usize, total_cap: usize, clients: usize, retention: Duration) -> Self {
         Self {
             job_cap,
-            total_cap,
+            client_cap: total_cap / clients.max(1),
             retention,
             jobs: Mutex::default(),
+            collectors: Mutex::default(),
+        }
+    }
+
+    /// Keeps `collector` so [`Outputs::abort_collectors`] can stop it. Finished handles drop.
+    pub(crate) fn track(&self, collector: tokio::task::JoinHandle<()>) {
+        let mut collectors = self.collectors.lock().unwrap_or_else(PoisonError::into_inner);
+        collectors.retain(|c| !c.is_finished());
+        collectors.push(collector);
+    }
+
+    /// Stops every collector, which closes their attach connections.
+    pub(crate) fn abort_collectors(&self) {
+        for collector in self.collectors.lock().unwrap_or_else(PoisonError::into_inner).drain(..) {
+            collector.abort();
         }
     }
 
@@ -92,16 +116,22 @@ impl Outputs {
     }
 
     fn sweep(&self, jobs: &mut HashMap<String, Buf>, now: Instant) {
-        jobs.retain(|_, b| b.ended.as_ref().is_none_or(|e| e.at + self.retention > now));
+        // An absurd retention overflows `Instant`: that buffer never expires.
+        jobs.retain(|_, b| {
+            b.ended
+                .as_ref()
+                .is_none_or(|e| e.at.checked_add(self.retention).is_none_or(|expires| expires > now))
+        });
     }
 
-    /// Starts an empty buffer for `id`.
-    pub(crate) fn register(&self, id: &str) {
+    /// Starts an empty buffer for `id`, owned by `client`.
+    pub(crate) fn register(&self, id: &str, client: &str) {
         let mut jobs = self.lock();
         self.sweep(&mut jobs, Instant::now());
         jobs.insert(
             id.to_owned(),
             Buf {
+                client: client.to_owned(),
                 data: VecDeque::new(),
                 base: 0,
                 ended: None,
@@ -110,8 +140,8 @@ impl Outputs {
     }
 
     /// Appends `bytes` to `id`'s buffer. Over the per-job cap the oldest bytes drop. Over the
-    /// total cap the oldest finished job goes first; with none finished, this job's oldest bytes
-    /// drop.
+    /// client's share, that client's own oldest finished job goes first, then its growing job
+    /// drops its oldest bytes. Another client's buffers are never touched.
     fn append(&self, id: &str, bytes: &[u8]) {
         let mut jobs = self.lock();
         let Some(buf) = jobs.get_mut(id) else {
@@ -119,13 +149,15 @@ impl Outputs {
         };
         buf.data.extend(bytes);
         buf.trim_to(self.job_cap);
+        let client = buf.client.clone();
         loop {
-            let total: usize = jobs.values().map(|b| b.data.len()).sum();
-            if total <= self.total_cap {
+            let held: usize = jobs.values().filter(|b| b.client == client).map(|b| b.data.len()).sum();
+            if held <= self.client_cap {
                 return;
             }
             let oldest = jobs
                 .iter()
+                .filter(|(_, b)| b.client == client)
                 .filter_map(|(k, b)| b.ended.as_ref().map(|e| (e.at, k.clone())))
                 .min();
             match oldest {
@@ -134,8 +166,7 @@ impl Outputs {
                 }
                 None => {
                     if let Some(buf) = jobs.get_mut(id) {
-                        let over = total - self.total_cap;
-                        buf.trim_to(buf.data.len().saturating_sub(over));
+                        buf.trim_to(buf.data.len().saturating_sub(held - self.client_cap));
                     }
                     return;
                 }
@@ -233,12 +264,13 @@ async fn terminal_state(state: &State, id: &str) -> Result<Option<String>, ()> {
 /// Collects `id`'s output until it ends, then marks the buffer finished. Runs as one detached
 /// task per accepted job.
 ///
-/// The collector attaches without the attach token, so sandyd gives it the read-only observer
-/// cap. That is a membership of its own: a submitter attach (`POST .../attach`) mints the shared
-/// `operator` membership, and two readers on one membership would split the messages between
-/// them. It also keeps the token out of this task.
-pub(crate) async fn collect(state: Arc<State>, id: String) {
-    match run(&state, &id).await {
+/// The collector asks sandyd for its dedicated collector cap, which needs the attach token. That
+/// cap is read-only, is a membership of its own (a submitter attach mints the shared `operator`
+/// one, and two readers on one membership would split the messages), and is not counted as an
+/// attach: it sends no `AttachStateChanged`, so a remote host never lifts the job's deadline for
+/// it.
+pub(crate) async fn collect(state: Arc<State>, id: String, token: Vec<u8>) {
+    match run(&state, &id, &token).await {
         Ok(job_state) => state.outputs.finish(&id, Some(job_state), None),
         Err(fault) => {
             tracing::warn!(job_id = %id, fault, "output collection ended with a fault");
@@ -248,7 +280,7 @@ pub(crate) async fn collect(state: Arc<State>, id: String) {
     }
 }
 
-async fn attach(state: &State, id: &str) -> Result<tokio::net::UnixStream, &'static str> {
+async fn attach(state: &State, id: &str, token: &[u8]) -> Result<tokio::net::UnixStream, &'static str> {
     for attempt in 0..JOIN_ATTEMPTS {
         if attempt > 0 {
             if matches!(terminal_state(state, id).await, Ok(Some(_))) {
@@ -256,7 +288,7 @@ async fn attach(state: &State, id: &str) -> Result<tokio::net::UnixStream, &'sta
             }
             tokio::time::sleep(JOIN_BACKOFF).await;
         }
-        if let Ok(Ok(conn)) = tokio::time::timeout(JOIN_TIMEOUT, join(state, id, None)).await {
+        if let Ok(Ok(conn)) = tokio::time::timeout(JOIN_TIMEOUT, join(state, id, Some(token.to_vec()), true)).await {
             return Ok(conn);
         }
     }
@@ -264,8 +296,8 @@ async fn attach(state: &State, id: &str) -> Result<tokio::net::UnixStream, &'sta
 }
 
 /// The job's terminal state name, or a fixed fault text.
-async fn run(state: &State, id: &str) -> Result<String, &'static str> {
-    let conn = attach(state, id).await?;
+async fn run(state: &State, id: &str, token: &[u8]) -> Result<String, &'static str> {
+    let conn = attach(state, id, token).await?;
     // The write half is held, never written: a client EOF would make sandyd's relay leave.
     let (read_half, _write_half) = tokio::io::split(conn);
     let (mut frames, _reader) = spawn_reader(read_half);
@@ -326,32 +358,32 @@ async fn drain(state: &State, id: &str, frames: &mut Frames, job_state: String) 
 mod tests {
     use super::*;
 
-    fn outputs(job_cap: usize, total_cap: usize) -> Outputs {
-        Outputs::new(job_cap, total_cap, Duration::from_secs(60))
+    fn outputs(job_cap: usize, total_cap: usize, clients: usize) -> Outputs {
+        Outputs::new(job_cap, total_cap, clients, Duration::from_secs(60))
     }
 
     #[test]
-    fn the_total_cap_evicts_the_oldest_finished_job_before_any_live_one() {
-        let o = outputs(8, 10);
-        for id in ["old", "new", "live"] {
-            o.register(id);
+    fn a_client_over_its_share_loses_its_own_oldest_finished_job_first_and_nobody_elses() {
+        let o = outputs(8, 20, 2);
+        for (id, client) in [("b", "b"), ("old", "a"), ("new", "a")] {
+            o.register(id, client);
         }
+        o.append("b", b"bbbbbbbb");
+        o.finish("b", Some("succeeded".into()), None);
         o.append("old", b"aaaaaa");
         o.finish("old", Some("succeeded".into()), None);
         std::thread::sleep(Duration::from_millis(5));
-        o.append("new", b"bbbb");
-        o.finish("new", Some("succeeded".into()), None);
-        o.append("live", b"cc");
-        assert!(o.read("old", 0, 8).is_none(), "the oldest finished job goes first");
+        o.append("new", b"cccccc");
+        assert!(o.read("old", 0, 8).is_none(), "a's own oldest finished job goes first");
+        assert!(o.read("b", 0, 8).is_some(), "b's buffer is untouched");
         assert!(o.read("new", 0, 8).is_some());
-        assert!(o.read("live", 0, 8).is_some());
     }
 
     #[test]
-    fn with_no_finished_job_the_total_cap_trims_the_job_that_grew() -> anyhow::Result<()> {
-        let o = outputs(8, 10);
-        o.register("a");
-        o.register("b");
+    fn with_no_finished_job_the_client_share_trims_the_job_that_grew() -> anyhow::Result<()> {
+        let o = outputs(8, 10, 1);
+        o.register("a", "x");
+        o.register("b", "x");
         o.append("a", b"aaaaaaaa");
         o.append("b", b"bbbbbb");
         let a = o
@@ -368,9 +400,18 @@ mod tests {
     }
 
     #[test]
+    fn a_retention_that_overflows_the_clock_never_expires_and_never_panics() -> anyhow::Result<()> {
+        let o = Outputs::new(8, 100, 1, Duration::MAX);
+        o.register("a", "x");
+        o.finish("a", None, None);
+        assert!(o.read("a", 0, 8).context("kept")?.is_ok());
+        Ok(())
+    }
+
+    #[test]
     fn a_read_can_resume_at_the_end_but_not_past_it() {
-        let o = outputs(8, 100);
-        o.register("a");
+        let o = outputs(8, 100, 1);
+        o.register("a", "x");
         o.append("a", b"abc");
         assert!(matches!(o.read("a", 3, 8), Some(Ok(r)) if r.bytes.is_empty() && r.next_offset == 3));
         assert!(matches!(o.read("a", 4, 8), Some(Err(()))));

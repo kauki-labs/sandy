@@ -220,7 +220,7 @@ pub(crate) async fn stream(state: Arc<State>, client: &Client, id: &str, ticket:
     let Some(token) = state.owners.token_for(id, &client.id) else {
         return error(&NOT_FOUND);
     };
-    let joined = match tokio::time::timeout(JOIN_TIMEOUT, join(&state, id, Some(token))).await {
+    let joined = match tokio::time::timeout(JOIN_TIMEOUT, join(&state, id, Some(token), false)).await {
         Ok(Ok(conn)) => conn,
         Ok(Err(e)) => return error(&e),
         Err(_) => {
@@ -241,13 +241,18 @@ pub(crate) async fn stream(state: Arc<State>, client: &Client, id: &str, ticket:
 }
 
 /// The attach RPC, then the join on the attach socket. Any failure is a fixed `unavailable`.
-/// With a `token` the caller joins as the submitter. Without one sandyd hands out its read-only
-/// observer cap, a membership (and cursor) apart from every submitter's.
-pub(crate) async fn join(state: &State, id: &str, token: Option<Vec<u8>>) -> Result<UnixStream, ApiError> {
+/// With a `token` the caller joins as the submitter. `collector` asks for the broker output
+/// collector's own read-only cap instead (needs the token; see `output.rs`).
+pub(crate) async fn join(
+    state: &State,
+    id: &str,
+    token: Option<Vec<u8>>,
+    collector: bool,
+) -> Result<UnixStream, ApiError> {
     let op = control_request::Op::Attach(AttachRequest {
         job_id: id.to_owned(),
         attach_token: token,
-        collector: false,
+        collector,
     });
     let control_response::Result::Attach(attach) = rpc(state, op).await? else {
         return Err(UNAVAILABLE);
@@ -483,7 +488,7 @@ mod tests {
             clients: Vec::new(),
             owners: crate::owners::Owners::open(&dir.join("state"))?,
             tickets: Tickets::new(Duration::from_secs(30)),
-            outputs: crate::output::Outputs::new(1024, 4096, Duration::from_secs(60)),
+            outputs: Arc::new(crate::output::Outputs::new(1024, 4096, 1, Duration::from_secs(60))),
             send_timeout: Duration::from_secs(30),
             env_create: HashMap::new(),
         })
@@ -497,7 +502,7 @@ mod tests {
             clients: Vec::new(),
             owners: crate::owners::Owners::open(&dir.join("state"))?,
             tickets: Tickets::new(Duration::from_secs(30)),
-            outputs: crate::output::Outputs::new(1024, 4096, Duration::from_secs(60)),
+            outputs: Arc::new(crate::output::Outputs::new(1024, 4096, 1, Duration::from_secs(60))),
             send_timeout: Duration::from_secs(30),
             env_create: HashMap::new(),
         })

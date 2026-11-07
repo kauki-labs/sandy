@@ -76,12 +76,13 @@ pub struct BrokerConfig {
     pub clients: Vec<Client>,
 }
 
-/// A running broker. Dropping it stops the listener.
+/// A running broker. Dropping it stops the listener and the output collectors.
 #[derive(Debug)]
 pub struct Running {
     /// The bound address.
     pub addr: SocketAddr,
     task: tokio::task::JoinHandle<()>,
+    outputs: Arc<output::Outputs>,
 }
 
 impl Running {
@@ -94,6 +95,7 @@ impl Running {
 impl Drop for Running {
     fn drop(&mut self) {
         self.task.abort();
+        self.outputs.abort_collectors();
     }
 }
 
@@ -222,10 +224,16 @@ pub async fn serve_with_tuning(config: BrokerConfig, tuning: Tuning) -> Result<R
         .iter()
         .map(|c| (c.id.clone(), tokio::sync::Mutex::new(())))
         .collect();
+    let outputs = Arc::new(output::Outputs::new(
+        tuning.output_job_cap,
+        tuning.output_total_cap,
+        config.clients.len(),
+        tuning.output_retention,
+    ));
     let state = Arc::new(server::State {
         owners: owners::Owners::open(&config.state_dir)?,
         tickets: attach::Tickets::new(ticket_ttl),
-        outputs: output::Outputs::new(tuning.output_job_cap, tuning.output_total_cap, tuning.output_retention),
+        outputs: Arc::clone(&outputs),
         send_timeout: tuning.send_timeout,
         control_socket: config.control_socket,
         rpc_deadline: config.rpc_deadline,
@@ -291,5 +299,5 @@ pub async fn serve_with_tuning(config: BrokerConfig, tuning: Tuning) -> Result<R
             });
         }
     });
-    Ok(Running { addr, task })
+    Ok(Running { addr, task, outputs })
 }
