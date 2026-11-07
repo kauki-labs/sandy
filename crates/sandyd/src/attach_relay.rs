@@ -1129,6 +1129,141 @@ mod tests {
         Ok(())
     }
 
+    fn collector_cap(registry: &JobRegistry, job_id: &str) -> anyhow::Result<Cap> {
+        Ok(registry.authority().mint(CapScope {
+            peer: PeerId::from(dispatch::COLLECTOR_PEER),
+            channel: ChannelId::from(job_id),
+            rights: CapRights {
+                post: false,
+                read: true,
+                invite: false,
+            },
+            expires_at: None,
+        })?)
+    }
+
+    /// The broker's output collector (#643) holds a join for the job's whole run. Its join must
+    /// not count as an attach: no `AttachStateChanged`, so the host-executor never lifts the
+    /// job's deadline for it.
+    #[tokio::test]
+    async fn a_collector_join_is_not_an_attach_and_notifies_no_host() -> anyhow::Result<()> {
+        use crate::host_registry::{ExecutorAllowlist, HostRegistry, Registration};
+
+        let (registry, _operator) = registry_with_job_on_host("job-1", "remote-host").await?;
+        let host_registry = Arc::new(HostRegistry::default());
+        let allowlist = ExecutorAllowlist::new([(executor_ip(), test_fp())]);
+        let Registration {
+            mut attach_state_rx, ..
+        } = host_registry
+            .register(
+                &allowlist,
+                executor_ip(),
+                test_fp(),
+                "remote-host".to_owned(),
+                host_capabilities(),
+            )
+            .expect("remote-host must register");
+        let cap = collector_cap(&registry, "job-1")?;
+
+        let (client, server) = tokio::net::UnixStream::pair()?;
+        let accepting = tokio::spawn(serve_one_attach(
+            server,
+            Arc::clone(&registry),
+            Arc::clone(&host_registry),
+        ));
+        let (mut rd, mut wr) = client.into_split();
+        write_frame(
+            &mut wr,
+            &LinkFrame::Join {
+                cap: hex::encode(encode_cap(&cap)?),
+                channel: None,
+                cols: None,
+                rows: None,
+            },
+        )
+        .await?;
+        let joined = tokio::time::timeout(WAIT, read_frame(&mut rd)).await??;
+        assert!(matches!(joined, Some(LinkFrame::Joined { .. })), "got {joined:?}");
+
+        let job = registry.get("job-1").context("job")?;
+        let counted = job
+            .attach_tracking
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .count;
+        assert_eq!(counted, 0, "a collector join must not count as an attach");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(400), attach_state_rx.recv())
+                .await
+                .is_err(),
+            "a collector join must send no AttachStateChanged"
+        );
+
+        drop((rd, wr));
+        tokio::time::timeout(WAIT, accepting).await??;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(400), attach_state_rx.recv())
+                .await
+                .is_err(),
+            "a collector leave must send no AttachStateChanged either"
+        );
+        Ok(())
+    }
+
+    /// The collector owns its membership: another observer joining and leaving must not end the
+    /// collector's stream or take its messages.
+    #[tokio::test]
+    async fn a_second_observer_joining_and_leaving_does_not_end_the_collectors_stream() -> anyhow::Result<()> {
+        let (registry, agent_cap, _operator) = registry_with_job("job-1").await?;
+        let job = registry.get("job-1").context("job")?;
+        let agent = job.channel.join(&agent_cap)?;
+        let cap = collector_cap(&registry, "job-1")?;
+
+        let (client, server) = tokio::net::UnixStream::pair()?;
+        let host_registry = Arc::new(crate::host_registry::HostRegistry::default());
+        tokio::spawn(serve_one_attach(server, Arc::clone(&registry), host_registry));
+        let (mut rd, mut wr) = client.into_split();
+        write_frame(
+            &mut wr,
+            &LinkFrame::Join {
+                cap: hex::encode(encode_cap(&cap)?),
+                channel: None,
+                cols: None,
+                rows: None,
+            },
+        )
+        .await?;
+        let joined = tokio::time::timeout(WAIT, read_frame(&mut rd)).await??;
+        assert!(matches!(joined, Some(LinkFrame::Joined { .. })), "got {joined:?}");
+
+        let post = |bytes: &'static [u8]| {
+            job.channel.post(
+                &agent,
+                Some(MessageType::Tty(sandy_proto::Tty {})),
+                sandy_fabric_local::agent::TTY_STDOUT,
+                bytes.to_vec(),
+            )
+        };
+        post(b"one").await?;
+        let observer = job.channel.join(&job.observer_cap)?;
+        let _ = job.channel.subscribe(&observer)?;
+        job.channel.leave(&observer);
+        post(b"two").await?;
+
+        let mut seen = Vec::new();
+        while seen.len() < 2 {
+            let frame = tokio::time::timeout(WAIT, read_frame(&mut rd))
+                .await
+                .context("the collector's stream went silent")??
+                .context("the collector's stream ended")?;
+            if let LinkFrame::Deliver { payload, .. } = frame {
+                seen.push(hex::decode(payload)?);
+            }
+        }
+        assert_eq!(seen, [b"one".to_vec(), b"two".to_vec()]);
+        Ok(())
+    }
+
     /// Regression (#340, CodeRabbit finding): the SANDBOX AGENT joining this
     /// job's channel — a real, separate join, from a real, separate code
     /// path, that happens as part of ordinary job execution regardless of

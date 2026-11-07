@@ -210,6 +210,7 @@ async fn attach(
         control_request::Op::Attach(AttachRequest {
             job_id: job_id.to_owned(),
             attach_token: token,
+            collector: false,
         }),
     )
     .await

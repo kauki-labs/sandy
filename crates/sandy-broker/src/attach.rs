@@ -247,6 +247,7 @@ pub(crate) async fn join(state: &State, id: &str, token: Option<Vec<u8>>) -> Res
     let op = control_request::Op::Attach(AttachRequest {
         job_id: id.to_owned(),
         attach_token: token,
+        collector: false,
     });
     let control_response::Result::Attach(attach) = rpc(state, op).await? else {
         return Err(UNAVAILABLE);

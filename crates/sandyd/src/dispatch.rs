@@ -52,6 +52,10 @@ use crate::{
     store::JobStore,
 };
 
+/// The peer name of the broker output collector's read-only cap (#643). `Attach` mints it on
+/// request for the submitter; the attach accept loop does not count a join with it.
+pub const COLLECTOR_PEER: &str = "collector";
+
 /// A job's dedicated orchestrator channel, minted at submit time.
 pub struct JobChannel {
     /// The channel itself, keyed by the job's own id (spec §3.4: dedicated,

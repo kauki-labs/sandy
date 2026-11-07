@@ -340,6 +340,7 @@ mod tests {
         let with_token = AttachRequest {
             job_id: "job-a".to_owned(),
             attach_token: Some(marker.as_bytes().to_vec()),
+            collector: false,
         };
         let rendered = format!("{with_token:?}");
         assert!(
@@ -351,6 +352,7 @@ mod tests {
         let without_token = AttachRequest {
             job_id: "job-a".to_owned(),
             attach_token: None,
+            collector: false,
         };
         let rendered = format!("{without_token:?}");
         assert!(
