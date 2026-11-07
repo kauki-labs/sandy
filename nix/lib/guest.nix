@@ -32,6 +32,8 @@ let
       ...
     }:
     {
+      imports = [ ./guest-setup.nix ];
+
       # #325: `lib.mkForce` on every option below that NixOS's module system
       # would otherwise raise a conflicting-definitions eval error on, once an
       # arbitrary third-party `nixosModule`/`nixosConfiguration` (kinds 2/3) can
