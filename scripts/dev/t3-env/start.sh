@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Start a T3 environment (qemu-t3 guest, 0.1.6) on a Linux/KVM host as a transient systemd unit. Runs as the
 # operator with one sudo prompt. guest.sh is the job command and a static busybox httpd publishes the pairing
-# code. The host network comes from net.sh until sandy provisions it (#677). The Mac wrapper t3-sandy
-# (agent-env) calls this script with --start-script; it also runs by hand.
+# code. The host network comes from net.sh until sandy provisions it (#677). The Mac wrapper t3-run-vm
+# (agent-env) calls this script with --start-script and --start-env SANDY_DIR=...; it also runs by hand.
 # Needs: UNIT, NONCE, JOB_TIMEOUT, SANDY_DIR in the environment, and guest.sh next to this file. SANDY_DIR is a
 # git checkout of sandy with target/release/sandy built; the trust roots must be root-owned
 # with mode 700 and 600, because sandy runs as root here and refuses other owners (crates/sandy/src/cred.rs).
@@ -14,6 +14,15 @@ tools="$(nix build nixpkgs#qemu nixpkgs#virtiofsd nixpkgs#nftables nixpkgs#iptab
 bb="$(nix build nixpkgs#pkgsStatic.busybox --no-link --print-out-paths)/bin/busybox"
 ip link show sandytap0 >/dev/null 2>&1 || {
   echo "sandytap0 missing: run net.sh up first" >&2
+  exit 1
+}
+
+# Sandy runs as root in the unit and reads trust roots only from a root-owned directory (cred.rs). Check the
+# directory before the sudo prompt; a root-owned 700 directory cannot be listed here, so only it is checked.
+roots="$HOME/.config/sandy/trust-roots"
+[ "$(stat -c '%U %a' "$roots" 2>/dev/null)" = "root 700" ] || {
+  echo "trust roots are not root-owned with mode 700: $roots" >&2
+  echo "fix: sudo chown -R root:root $roots && sudo chmod -R go-rwx $roots" >&2
   exit 1
 }
 

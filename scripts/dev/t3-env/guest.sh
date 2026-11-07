@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Guest side of t3-sandy, run as the sandy job command: seed the harness config, start `t3 serve` as the
+# Guest side of the T3 environment (t3-run-vm), run as the sandy job command: seed the harness config, start `t3 serve` as the
 # t3 user, mint a one-time pairing code once it answers, and publish the code over plain http on
 # 3774 at /<nonce> for the host to fetch. The guest has no ssh, no mesh and no console the host can
 # read before the job ends, so this is the only channel. The nonce (T3_NONCE, from the wrapper) is the
