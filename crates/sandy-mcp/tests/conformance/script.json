@@ -30,11 +30,6 @@
       "expect": { "present": ["/stream_url"] }
     },
     {
-      "tool": "job_output",
-      "args": { "job_id": "$job", "offset": 0 },
-      "expect": { "present": ["/data", "/next_offset", "/done"] }
-    },
-    {
       "tool": "cancel",
       "args": { "job_id": "$job" },
       "expect": { "in": { "/state": ["cancelled", "cancelling"] } }

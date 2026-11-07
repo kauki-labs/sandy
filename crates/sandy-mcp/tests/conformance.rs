@@ -412,7 +412,7 @@ fn the_script_fails_against_a_broker_that_breaks_idempotent_spawn() -> Result<()
     let err = run_script(&mut mcp, &serde_json::from_str(SCRIPT)?).expect_err("a broken broker must fail the script");
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("step 7 (spawn_environment)") && msg.contains("/environment_id"),
+        msg.contains("step 6 (spawn_environment)") && msg.contains("/environment_id"),
         "the O1 retry step must fail on the environment id: {msg}"
     );
     Ok(())
@@ -421,7 +421,7 @@ fn the_script_fails_against_a_broker_that_breaks_idempotent_spawn() -> Result<()
 /// The script with the Ready poll shortened, so a never-Ready broker fails fast.
 fn quick_script() -> Result<Value> {
     let mut script: Value = serde_json::from_str(SCRIPT)?;
-    script["steps"][10]["timeout_ms"] = json!(300);
+    script["steps"][9]["timeout_ms"] = json!(300);
     Ok(script)
 }
 
@@ -434,7 +434,7 @@ fn the_script_fails_against_a_broker_that_never_reaches_ready_and_cleans_up() ->
     let err = run_script(&mut mcp, &quick_script()?).expect_err("never Ready must fail the script");
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("step 10 (get_environment)") && msg.contains("never reached"),
+        msg.contains("step 9 (get_environment)") && msg.contains("never reached"),
         "{msg}"
     );
     // The cleanup steps ran: the environment the failed script created is gone.
@@ -459,7 +459,7 @@ fn a_typo_in_the_script_is_an_error_not_a_silent_pass() -> Result<()> {
             s["steps"][1]["max_poll"] = json!(3);
         }),
         ("empty until", |s| {
-            s["steps"][10]["until"] = json!({});
+            s["steps"][9]["until"] = json!({});
         }),
         ("empty equals", |s| {
             s["steps"][2]["expect"]["equals"] = json!({});

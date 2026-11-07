@@ -33,13 +33,6 @@ fn job_id() -> Value {
     json!({"job_id":{"type":"string"}})
 }
 
-fn output_props() -> Value {
-    json!({"job_id":{"type":"string"},
-           "offset":{"type":"integer","minimum":0,
-               "description":"First output byte to read. Pass the previous call's next_offset. Default 0."},
-           "limit":{"type":"integer","minimum":1,"description":"Most bytes to return. The broker clamps it."}})
-}
-
 fn environment_id() -> Value {
     json!({"environment_id":{"type":"string"}})
 }
@@ -132,17 +125,6 @@ pub(crate) static TOOLS: &[Tool] = &[
         query: &[],
         required: &["job_id"],
         properties: job_id,
-    },
-    Tool {
-        name: "job_output",
-        description: "Read a job's retained output from an offset. Returns base64 data, next_offset, dropped bytes \
-                      and done. Output is kept in broker memory for 15 minutes after the job ends.",
-        method: "GET",
-        path: "/v1/jobs/{job_id}/output",
-        path_args: &["job_id"],
-        query: &["offset", "limit"],
-        required: &["job_id"],
-        properties: output_props,
     },
     Tool {
         name: "spawn_environment",

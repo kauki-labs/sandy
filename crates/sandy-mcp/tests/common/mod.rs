@@ -149,10 +149,6 @@ fn route(b: &mut Broker, method: &str, url: &str, body: &str) -> (u16, Value) {
             }
             None => err(404, "not_found"),
         },
-        ("GET", ["v1", "jobs", id, "output"]) if b.jobs.contains_key(*id) => (
-            200,
-            json!({"data": "", "offset": 0, "next_offset": 0, "dropped": 0, "done": false}),
-        ),
         ("POST", ["v1", "jobs", id, "attach"]) if b.jobs.contains_key(*id) => {
             (200, json!({"stream_url": format!("http://127.0.0.1/s/{id}")}))
         }

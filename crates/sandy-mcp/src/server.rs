@@ -81,12 +81,7 @@ impl Server {
         }
         let mut query = Vec::new();
         for name in tool.query {
-            let value = args.remove(*name).and_then(|v| match v {
-                Value::String(s) => Some(s),
-                Value::Number(n) => Some(n.to_string()),
-                _ => None,
-            });
-            if let Some(v) = value {
+            if let Some(v) = args.remove(*name).and_then(|v| v.as_str().map(str::to_owned)) {
                 query.push(format!("{name}={}", percent_encode(&v)));
             }
         }
