@@ -2269,3 +2269,24 @@ A client that polls `GetEnvironment` renews the lease for as long as it polls, a
 **Consequences.** The backend is generic over `VmBackend`, so it is tier-2 testable with a double that holds until cancelled. It is not wired into `sandyd` yet: that needs the two `impls/vm` hooks (the qemu CID, the vfkit port-5100 device) and the bridge probe (C3b). VMs do not survive a daemon restart in this slice, because the threads die with the process. A restart policy is open on #587.
 
 **Alternative set aside.** A new launch path in `impls/vm`: it would fork boot and teardown logic across two backends.
+
+## 32. A collector cap for the broker's output collector: not an attach (#643)
+
+**Context.** The broker keeps a per-job output buffer and needs a join for the job's whole run
+(`broker-api.md` decision 8). A submitter attach would share the `operator` membership and
+cursor with a client's stream, and every join counted by `join_for_attach` sends
+`AttachStateChanged`, which lifts the unlimited-while-attached deadline policy on a remote host
+(decision 14, #340). The observer cap was no fit either: it is shared by every observer.
+
+**Decision.**
+
+- `AttachRequest.collector` (field 3) asks for the collector cap. `Attach` mints it, read-only and
+  under the peer name `collector`, only when the matching attach token is presented. A session
+  match alone, no token, or a wrong token is refused.
+- The attach accept loop routes a join whose cap names the `collector` peer to a plain
+  `Channel::join` and `relay` with no attach tracking. It is not counted and sends no
+  `AttachStateChanged`, at join or at leave. `Channel::join` still verifies the cap.
+- The cap's proof digest differs from every other cap's, so the collector owns its membership. A
+  second observer joining and leaving does not end its stream (the `archiver_cap` rule in `dispatch.rs`).
+
+**Set aside.** Reusing `observer_cap`, and counting the collector as an attach.

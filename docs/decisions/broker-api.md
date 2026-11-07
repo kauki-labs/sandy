@@ -221,7 +221,7 @@ quota check, and a client could exceed the quota by one environment per distinct
   is out, so the ticket and stream caps above bound the producers.
 
 **Side effect.** An open broker stream is an attach to sandyd. On a remote host that keeps the
-job attached and lifts the unlimited-while-attached policy (#340, `sandyd.md` decision 17) for as
+job attached and lifts the unlimited-while-attached policy (#340, `sandyd.md` decision 14) for as
 long as the stream is open, up to the client's four. Closing the stream restores it.
 
 ## 8. Output is read by offset from a broker-held buffer (#643)
@@ -237,31 +237,34 @@ route over giving `sandy-mcp` a stream reader.
   makes the attach RPC and joins the attach socket like a stream does (decision 7), polls job
   status once a second, and after a terminal status drains until the plane is quiet for 500 ms
   (30 s at most). It appends each stdout or stderr chunk to the job's buffer.
-- The collector attaches **without** the attach token, so sandyd hands it the read-only observer
-  cap. A submitter attach mints one shared `operator` membership with one cursor; a collector on
-  it would take messages from a client's stream. The observer cap is a membership of its own.
-  The token also stays out of the task.
-- Buffer bounds: 1 MiB per job, the oldest bytes dropped; 16 MiB across jobs, the oldest
-  finished job evicted first. With no finished job to evict, the job that grew drops its oldest
-  bytes. Offsets stay absolute across drops.
+- The collector attaches with `collector: true` and the attach token (`sandyd.md` decision 32).
+  sandyd mints a read-only cap under its own peer name for it. That cap is a membership of its
+  own: a submitter attach mints the shared `operator` membership with one cursor, and a
+  collector on it would take messages from a client's stream. A collector join is not counted
+  as an attach and sends no `AttachStateChanged`.
+- Buffer bounds: 1 MiB per job, the oldest bytes dropped. The 16 MiB total is split evenly over
+  the configured clients. A client over its share loses its own oldest finished job first, then
+  its growing job drops its oldest bytes. One client's output never evicts another's. Offsets stay
+  absolute across drops.
 - `GET /v1/jobs/{id}/output?offset=N&limit=M` (bearer) answers `data` (base64), `offset`,
   `next_offset`, `dropped`, `done`, and, when done, `state` and `fault`. `limit` defaults to
   64 KiB and clamps to 1..256 KiB. Another client's job and an unknown job give one identical
   `not_found`. An offset past the end, a repeated or unknown query key, or a non-integer value
   gives `invalid_request`.
 - A finished job's buffer is readable for 15 minutes after collection ends
-  (`SANDY_BROKER_OUTPUT_RETENTION_SECS`, whole seconds), then `not_found`. Expired buffers are
-  swept on the next submit or read.
+  (`SANDY_BROKER_OUTPUT_RETENTION_SECS`, whole seconds, at most 7 days; a larger value stops
+  the broker at start), then `not_found`. Expired buffers are swept on the next submit or read.
+  After the job ends the collector keeps draining until the data plane is quiet for 500 ms, and
+  for 30 s at most, so `done` can lag the exit by that long.
+- Dropping the broker aborts every collector task, which closes their attach connections.
 - A collector that cannot attach (five tries), loses the data plane, or loses the status path
   ends the buffer with a fixed `fault` text. Output may be missing; the route says so instead of
   reporting a clean `done`.
 - Nothing is written to disk. A broker restart loses every buffer, and the route answers
   `not_found` for jobs submitted before it. The OpenAPI text says this.
 
-**Side effect.** Every accepted job has a collector attached for its whole run. On a remote
-host that keeps the job attached and lifts the unlimited-while-attached policy (#340, `sandyd.md`
-decision 17) for all broker jobs, not only while a client holds a stream. Open for the owner: whether that
-is acceptable.
+**MCP.** `sandy-mcp` has no output tool. Raw job output returned through a tool would bypass the
+secret guard (O8). Owner decision, still open.
 
 **Set aside.** Persisting output to disk, and retention in sandyd. Both are separate work.
 
