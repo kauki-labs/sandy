@@ -50,6 +50,8 @@ pub struct Opts {
     pub output_retention: Duration,
     /// Most collectors one client may run at once.
     pub output_collectors_per_client: usize,
+    /// Run sandyd as if a trusted-only environment backend were active.
+    pub trusted_only_backend: bool,
 }
 
 impl Default for Opts {
@@ -62,6 +64,7 @@ impl Default for Opts {
             output_total_cap: Tuning::default().output_total_cap,
             output_retention: Tuning::default().output_retention,
             output_collectors_per_client: Tuning::default().output_collectors_per_client,
+            trusted_only_backend: false,
         }
     }
 }
@@ -143,6 +146,9 @@ async fn build(
     let socket = dir.path().join("sandyd.sock");
     let store = Arc::new(JobStore::open_in_memory()?);
     let environments = Arc::new(EnvironmentStore::open_in_memory()?.with_max_rows(row_cap));
+    if opts.trusted_only_backend {
+        environments.require_trusted_submitter();
+    }
     if let Some(seed) = owner_seed {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let json = seed(&environments)?;

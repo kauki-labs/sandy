@@ -934,6 +934,8 @@ fn start_environment_driver(environments: &Arc<EnvironmentStore>) -> Option<toki
         "SANDY_ENV_BACKEND=process-insecure: environments run as host processes as this user with NO isolation; for \
          trusted, local development only"
     );
+    // Set before the driver starts: from here a create needs a TRUSTED submitter.
+    environments.require_trusted_submitter();
     let backend = match sandy_environment::ProcessEnvironmentBackend::new(config.process) {
         Ok(backend) => backend,
         Err(e) => {
