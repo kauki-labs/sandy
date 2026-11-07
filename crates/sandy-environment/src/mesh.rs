@@ -8,11 +8,14 @@
 //! string this module returns or logs passes through the exact-key replace plus
 //! [`redact`].
 //!
-//! # Cancellation
-//! The caller picks the node name and passes it to [`setup`]. If the setup
-//! future is dropped midway, the caller runs [`teardown`] with that name and no
-//! key: the node (if it joined) is deleted by name, and an unused key is
-//! short-lived (`key_ttl`) and single-use.
+//! # Cancellation and failure
+//! The caller picks the node name and a [`KeySlot`] and passes both to
+//! [`setup`]. If the setup future is dropped midway, or setup returns a
+//! [`SetupError`] from [`SetupStep::Boot`] onward, the caller must run
+//! [`teardown`] with the same name and slot: setup only expires the key, so a
+//! joined node and a running VM (for example after a failed `after_ready` hook)
+//! are left for teardown. A mint that timed out can leave a server-side key
+//! that only its TTL expires; the slot cannot hold it.
 
 use std::{fmt, future::Future, time::Duration};
 
@@ -80,9 +83,37 @@ pub fn redact(text: &str) -> String {
 /// Replace the exact value of `key`, then mask key-shaped tokens.
 fn scrub(text: &str, key: Option<&JoinKey>) -> String {
     match key {
-        Some(k) if !k.expose().is_empty() => redact(&text.replace(k.expose(), REDACTED)),
+        Some(k) if !k.expose().is_empty() => redact(&replace_ignore_case(text, k.expose())),
         _ => redact(text),
     }
+}
+
+/// Replace every ASCII-case-insensitive occurrence of `needle` with the mask.
+fn replace_ignore_case(text: &str, needle: &str) -> String {
+    let (lt, ln) = (text.to_ascii_lowercase(), needle.to_ascii_lowercase());
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    while let Some(i) = lt[at..].find(&ln) {
+        out.push_str(&text[at..at + i]);
+        out.push_str(REDACTED);
+        at += i + ln.len();
+    }
+    out.push_str(&text[at..]);
+    out
+}
+
+/// Turn a panic in `fut` into a [`SeamError`] so a hook cannot unwind the sequencer.
+async fn contained<T>(fut: impl Future<Output = Result<T, SeamError>>) -> Result<T, SeamError> {
+    use std::{
+        panic::{AssertUnwindSafe, catch_unwind},
+        task::Poll,
+    };
+    let mut fut = Box::pin(fut);
+    std::future::poll_fn(|cx| match catch_unwind(AssertUnwindSafe(|| fut.as_mut().poll(cx))) {
+        Ok(poll) => poll,
+        Err(_) => Poll::Ready(Err(SeamError::new("hook panicked"))),
+    })
+    .await
 }
 
 /// A seam failure.
@@ -321,8 +352,9 @@ pub struct SetupError {
     pub name: String,
     /// Scrubbed reason.
     pub reason: String,
-    /// The minted key, if any. Pass it to [`teardown`]: when `key_burned` is
-    /// false its expiry failed and it may still be live.
+    /// The minted key, if any. When `key_burned` is false its expiry failed and
+    /// it may still be live; the same key is in the caller's [`KeySlot`], which
+    /// [`teardown`] reads.
     pub key: Option<JoinKey>,
     /// True only when a key was minted and its expiry succeeded.
     pub key_burned: bool,
@@ -376,7 +408,7 @@ async fn bounded<T>(limit: Duration, call: impl Future<Output = Result<T, SeamEr
 /// # Errors
 /// [`SetupError`] naming the failed step. A key minted before the failure is
 /// expired; if that expiry fails the error carries the key with
-/// `key_burned == false` and teardown must expire it.
+/// `key_burned == false`. Run [`teardown`] after any error from boot onward.
 #[allow(
     clippy::too_many_arguments,
     reason = "one parameter per seam plus name, slot and config"
@@ -482,7 +514,7 @@ where
             )),
         ));
     }
-    bounded(t, hooks.after_ready(name))
+    bounded(t, contained(hooks.after_ready(name)))
         .await
         .map_err(|e| (SetupStep::AfterReady, e))
 }
@@ -559,7 +591,7 @@ pub enum TeardownError {
 ///
 /// # Errors
 /// [`TeardownError`], never `Ok` while the node may exist, the VM may run or a
-/// key may be live.
+/// key in `slot` may be live. A key whose mint timed out is not in the slot.
 #[allow(
     clippy::too_many_arguments,
     reason = "one parameter per seam plus name, slot and timeout"
@@ -586,7 +618,7 @@ where
     let key = key.as_ref();
     let mut hook = Vec::new();
     let mut residue = Vec::new();
-    if let Err(e) = bounded(t, hooks.before_teardown(name)).await {
+    if let Err(e) = bounded(t, contained(hooks.before_teardown(name))).await {
         hook.push(format!("before_teardown: {e}"));
     }
     if let Err(e) = bounded(t, steps.tailscale_logout()).await {
