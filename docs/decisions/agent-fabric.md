@@ -458,9 +458,12 @@ connection (a websocket) works.
   data moves (the agent link's `AGENT_LINK_READY` works the same way). The host bridge counts a dial as successful
   only when it has read that byte, and retries inside its window otherwise. A relay that is not bound yet, or a
   service that is not up, therefore looks like a failed dial, never like a tunnel that opened and reset.
-- **Not yet wired.** The service kind (#589) is expected to start the relay, and nothing does yet (the agent's service
-  supervisor should spawn it as a sibling before any untrusted process, and keep the service from killing or replacing
-  it). The host half is 10b.
+- **Started by the agent.** The agent spawns the relay as a child for a service that declares a `port` (#589), and a
+  service cannot report Ready before the relay is up: the relay writes one byte, `RELAY_BOUND`, to its stdout after the
+  vsock bind succeeds (a different channel from the vsock ready byte above), and the agent waits for it, up to 10
+  seconds. A relay that exits first, writes another byte, or does not bind in time fails the run (#657). Open: a relay
+  that dies after it bound is not noticed, and two services on one host would both want port 1000. The host half is
+  10b.
 
 ### 10b. The host service bridge (#590)
 
