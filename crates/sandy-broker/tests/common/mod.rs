@@ -214,7 +214,6 @@ async fn build(
             output_job_cap: opts.output_job_cap,
             output_total_cap: opts.output_total_cap,
             output_retention: opts.output_retention,
-            ..Tuning::default()
         },
     )
     .await?;
