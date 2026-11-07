@@ -355,6 +355,16 @@ where
     // source for `console` now; this only affects that non-interactive
     // capture, not the live TTY_STDOUT channel a real attached viewer sees
     // (posted independently, inside `bridge_tty` itself).
+    // #670: a stop request interrupts the job, gives it the grace, then forces it. The task ends with the
+    // run; a request for a job that already exited finds the session gone and does nothing.
+    let stop_task = agent.take_stops().map(|mut stops| {
+        let stopper = tmux_job.stopper();
+        tokio::spawn(async move {
+            while let Some(grace_secs) = stops.recv().await {
+                stopper.stop(Duration::from_secs(u64::from(grace_secs))).await;
+            }
+        })
+    });
     let bridge_agent = Arc::clone(&agent);
     let bridge_task =
         tokio::spawn(async move { bridge_agent.serve_tty(pty_read, tokio::io::empty(), pty_write).await });
@@ -368,6 +378,9 @@ where
             if let Some(resize_task) = resize_task {
                 resize_task.abort();
             }
+            if let Some(stop_task) = stop_task {
+                stop_task.abort();
+            }
             return Err(format!("reading the job's real exit code: {e}"));
         }
     };
@@ -378,6 +391,9 @@ where
     let _ = attach_child.wait();
     if let Some(resize_task) = resize_task {
         resize_task.abort();
+    }
+    if let Some(stop_task) = stop_task {
+        stop_task.abort();
     }
 
     match bridge_task.await {

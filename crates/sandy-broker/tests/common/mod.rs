@@ -41,6 +41,8 @@ pub struct Opts {
     pub ticket_ttl: Duration,
     /// How long a write to a client that stopped reading may block.
     pub send_timeout: Duration,
+    /// Run sandyd as if a trusted-only environment backend were active.
+    pub trusted_only_backend: bool,
 }
 
 impl Default for Opts {
@@ -49,6 +51,7 @@ impl Default for Opts {
             attach_socket: true,
             ticket_ttl: Duration::from_secs(30),
             send_timeout: Duration::from_secs(30),
+            trusted_only_backend: false,
         }
     }
 }
@@ -130,6 +133,9 @@ async fn build(
     let socket = dir.path().join("sandyd.sock");
     let store = Arc::new(JobStore::open_in_memory()?);
     let environments = Arc::new(EnvironmentStore::open_in_memory()?.with_max_rows(row_cap));
+    if opts.trusted_only_backend {
+        environments.require_trusted_submitter();
+    }
     if let Some(seed) = owner_seed {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let json = seed(&environments)?;

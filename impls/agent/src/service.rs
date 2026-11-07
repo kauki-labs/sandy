@@ -243,35 +243,49 @@ pub fn port_relay_argv(port: u16) -> Vec<std::ffi::OsString> {
     ]
 }
 
-/// How long a fresh port relay gets to show it died. Its failures (no vsock device, the port already bound, a
-/// platform without vsock) all abort within milliseconds of the start; a relay that survives this is serving.
-const RELAY_STARTUP_GRACE: Duration = Duration::from_millis(300);
+/// How long a fresh port relay gets to bind its vsock listener. Its failures (no vsock device, the port already
+/// bound, a platform without vsock) abort within milliseconds; the margin is for a guest under boot load.
+const RELAY_BIND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Start the guest half of the host bridge for a service that declares a `port` (#589, #590). The relay is a
 /// child of the agent, so it stops with the agent; it runs as the agent's user (root) because it binds vsock.
 /// It parses nothing and admits only the host (see `port_relay`).
 ///
+/// Returns once the relay has said it is bound, so a service never reports Ready before the host can connect.
+///
 /// # Errors
-/// The agent's own binary cannot be found or started, or the relay exits during its startup grace: the run
-/// fails then, instead of a service reporting Ready with no bridge to the host.
+/// The agent's own binary cannot be found or started, the relay exits before it binds, or it does not bind
+/// within [`RELAY_BIND_TIMEOUT`]: the run fails then, instead of a service reporting Ready with no bridge.
 pub async fn spawn_port_relay(port: u16) -> Result<tokio::process::Child, String> {
     let exe = std::env::current_exe().map_err(|e| format!("locating the agent binary for the port relay: {e}"))?;
     let child = Command::new(exe)
         .args(port_relay_argv(port))
+        .stdout(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| format!("starting the port relay for service port {port}: {e}"))?;
-    survive_startup(child, RELAY_STARTUP_GRACE).await
+    await_bound(child, RELAY_BIND_TIMEOUT).await
 }
 
-/// `child` if it is still running after `grace`; an error naming how it ended if it was not.
-async fn survive_startup(mut child: tokio::process::Child, grace: Duration) -> Result<tokio::process::Child, String> {
-    match tokio::time::timeout(grace, child.wait()).await {
-        Err(_) => Ok(child),
-        Ok(Ok(status)) => Err(format!(
-            "the port relay exited at startup ({status}); see its message above"
+/// `child` once it has written [`crate::port_relay::RELAY_BOUND`] to its stdout; an error naming how it ended
+/// or that it never bound otherwise. The relay writes nothing else, so the pipe is dropped after the byte.
+async fn await_bound(mut child: tokio::process::Child, timeout: Duration) -> Result<tokio::process::Child, String> {
+    let mut stdout = child.stdout.take().ok_or("the port relay has no stdout pipe")?;
+    let mut byte = [0_u8; 1];
+    match tokio::time::timeout(timeout, stdout.read_exact(&mut byte)).await {
+        Ok(Ok(_)) if byte[0] == crate::port_relay::RELAY_BOUND => Ok(child),
+        Ok(Ok(_)) => Err(format!(
+            "the port relay wrote an unexpected startup byte {:#04x}",
+            byte[0]
         )),
-        Ok(Err(e)) => Err(format!("waiting on the port relay: {e}")),
+        // End of stream before the byte: the relay closed stdout, which it does by exiting.
+        Ok(Err(_)) => match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+            Ok(Ok(status)) => Err(format!(
+                "the port relay exited before it bound ({status}); see its message above"
+            )),
+            _ => Err("the port relay closed its startup pipe before it bound".to_owned()),
+        },
+        Err(_) => Err(format!("the port relay did not bind within {timeout:?}")),
     }
 }
 
@@ -400,28 +414,34 @@ mod tests {
 
     use super::*;
 
-    /// #589 review: a relay that dies at startup (no vsock, port taken) fails the run; one that keeps running is
-    /// kept.
+    /// #589 review, #657: a relay counts as started only after it says it is bound. One that exits first, or
+    /// stays silent past the timeout, fails the run.
     #[tokio::test]
-    async fn a_relay_that_exits_at_startup_fails_the_run_and_one_that_serves_is_kept() -> anyhow::Result<()> {
-        let dying = Command::new("sh")
-            .args(["-c", "exit 3"])
-            .kill_on_drop(true)
-            .spawn()
-            .context("spawn")?;
-        let err = survive_startup(dying, Duration::from_secs(2)).await.err();
+    async fn a_relay_is_started_only_once_it_says_it_is_bound() -> anyhow::Result<()> {
+        let spawn = |script: &str| {
+            Command::new("sh")
+                .args(["-c", script])
+                .stdout(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .context("spawn")
+        };
+        let bound = format!("printf {}; sleep 30", crate::port_relay::RELAY_BOUND as char);
+        let kept = await_bound(spawn(&bound)?, Duration::from_secs(5)).await;
+        assert!(kept.is_ok(), "a relay that signals must be kept: {:?}", kept.err());
+
+        let err = await_bound(spawn("exit 3")?, Duration::from_secs(5)).await.err();
         assert!(
-            err.is_some_and(|e| e.contains("exited at startup")),
-            "a dead relay must be an error"
+            err.is_some_and(|e| e.contains("exited before it bound")),
+            "a relay that exits first must be an error"
         );
 
-        let serving = Command::new("sleep")
-            .arg("30")
-            .kill_on_drop(true)
-            .spawn()
-            .context("spawn")?;
-        let kept = survive_startup(serving, Duration::from_millis(100)).await;
-        assert!(kept.is_ok(), "a running relay must be kept");
+        // Alive but silent is the case the old fixed grace called "serving".
+        let err = await_bound(spawn("sleep 30")?, Duration::from_millis(200)).await.err();
+        assert!(
+            err.is_some_and(|e| e.contains("did not bind")),
+            "a relay that never signals must be an error"
+        );
         Ok(())
     }
 
