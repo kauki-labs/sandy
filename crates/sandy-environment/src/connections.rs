@@ -1,4 +1,4 @@
-//! Established client connections to a local TCP port, for the idle-stop lease (#645).
+//! Established client connections to a local TCP port, for the idle-stop lease (#645), and who listens on it (#637).
 //!
 //! Linux reads `/proc/net/tcp` and `/proc/net/tcp6`; other Unix hosts parse `/usr/sbin/netstat -an -p tcp` (an absolute
 //! path, so a daemon with a minimal PATH still finds it). Only sockets whose local port is the service port count, so
@@ -36,6 +36,128 @@ pub(crate) fn established_to(port: u16) -> Result<usize, String> {
         )?;
         Ok(count_netstat(&out, port))
     }
+}
+
+/// Who holds the listening socket on a service's port.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Holder {
+    /// Nothing listens on the port yet.
+    Nobody,
+    /// A process of the launched process group listens.
+    Group,
+    /// A listener exists and no process of the group owns it: another process took the port.
+    Other,
+}
+
+/// Who listens on 127.0.0.1 `port`, as seen from process group `pgid` (the service's, whose leader's pid is `pgid`).
+///
+/// Linux joins the listening socket's inode in `/proc/net/tcp{,6}` to the `socket:[inode]` links under
+/// `/proc/<pid>/fd` of the group's processes. Other Unix hosts ask `/usr/sbin/lsof` for the listener's pids and read
+/// their process groups with `/bin/ps`. A listener `lsof` cannot see (another user's) reads as [`Holder::Nobody`], so
+/// it is never taken for the service.
+///
+/// # Errors
+/// The text of the failure when the host's socket or process tables cannot be read.
+pub(crate) fn listener_holder(port: u16, pgid: i32) -> Result<Holder, String> {
+    if cfg!(target_os = "linux") {
+        let mut inodes = Vec::new();
+        for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+            match std::fs::read_to_string(table) {
+                Ok(text) => inodes.extend(listening_inodes(&text, port)),
+                Err(e) if table.ends_with("tcp6") && e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("read {table}: {e}")),
+            }
+        }
+        if inodes.is_empty() {
+            return Ok(Holder::Nobody);
+        }
+        Ok(if group_holds_any(pgid, &inodes) {
+            Holder::Group
+        } else {
+            Holder::Other
+        })
+    } else {
+        let out = match run_bounded(
+            Command::new("/usr/sbin/lsof").args([
+                "-nP",
+                "-a",
+                &format!("-iTCP@127.0.0.1:{port}"),
+                "-sTCP:LISTEN",
+                "-Fp",
+            ]),
+            NETSTAT_TIMEOUT,
+        ) {
+            Ok(out) => out,
+            // `lsof` exits 1 when it finds nothing.
+            Err(e) if e.contains("exited with exit status: 1") => return Ok(Holder::Nobody),
+            Err(e) => return Err(e),
+        };
+        let pids: Vec<i32> = out
+            .lines()
+            .filter_map(|l| l.strip_prefix('p').and_then(|p| p.parse().ok()))
+            .collect();
+        if pids.is_empty() {
+            return Ok(Holder::Nobody);
+        }
+        for pid in pids {
+            let pgrp = run_bounded(
+                Command::new("/bin/ps").args(["-o", "pgid=", "-p", &pid.to_string()]),
+                NETSTAT_TIMEOUT,
+            )?;
+            if pgrp.trim().parse::<i32>().ok() == Some(pgid) {
+                return Ok(Holder::Group);
+            }
+        }
+        Ok(Holder::Other)
+    }
+}
+
+/// Inodes of the listening sockets (state `0A`) in a `/proc/net/tcp{,6}` table with local port `port`.
+fn listening_inodes(text: &str, port: u16) -> Vec<u64> {
+    text.lines()
+        .skip(1)
+        .filter_map(|line| {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            let local_port = cols.get(1)?.rsplit_once(':')?.1;
+            if *cols.get(3)? != "0A" || u16::from_str_radix(local_port, 16).ok()? != port {
+                return None;
+            }
+            cols.get(9)?.parse().ok()
+        })
+        .collect()
+}
+
+/// Whether any process in group `pgid` holds one of the socket `inodes` open.
+#[cfg(target_os = "linux")]
+fn group_holds_any(pgid: i32, inodes: &[u64]) -> bool {
+    let wanted: Vec<String> = inodes.iter().map(|i| format!("socket:[{i}]")).collect();
+    let Ok(procs) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    procs
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().bytes().all(|b| b.is_ascii_digit()))
+        .filter(|e| process_group_of(&e.path().join("stat")) == Some(pgid))
+        .any(|e| {
+            std::fs::read_dir(e.path().join("fd")).is_ok_and(|fds| {
+                fds.flatten().any(|fd| {
+                    std::fs::read_link(fd.path()).is_ok_and(|l| wanted.iter().any(|w| l.as_os_str() == w.as_str()))
+                })
+            })
+        })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn group_holds_any(_pgid: i32, _inodes: &[u64]) -> bool {
+    false
+}
+
+/// The process group in a `/proc/<pid>/stat` file: the third field after the command, which is in parentheses and may
+/// itself hold spaces and parentheses.
+#[cfg(target_os = "linux")]
+fn process_group_of(stat: &std::path::Path) -> Option<i32> {
+    let text = std::fs::read_to_string(stat).ok()?;
+    text.rsplit_once(')')?.1.split_whitespace().nth(2)?.parse().ok()
 }
 
 /// Runs `cmd` and returns its stdout, killing and reaping it after `timeout`.

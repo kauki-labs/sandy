@@ -436,6 +436,24 @@ impl EnvironmentBackend for ProcessEnvironmentBackend {
             Ok(None) => {}
             Err(e) => return Err(BackendError::Transport(format!("wait for the service: {e}"))),
         }
+        // The port was chosen before the service started, so another process may hold it by now (#637): only the
+        // service's own listener may answer for it.
+        let pgid = i32::try_from(r.child.id())
+            .map_err(|_| BackendError::Transport("the service pid exceeds i32".to_owned()))?;
+        match connections::listener_holder(r.port, pgid).map_err(BackendError::Transport)? {
+            connections::Holder::Nobody => {
+                return Ok(Probe::Starting {
+                    step: "boot".to_owned(),
+                });
+            }
+            connections::Holder::Other => {
+                return Ok(Probe::Failed {
+                    step: "port".to_owned(),
+                    reason: format!("another process holds port {}, not the service", r.port),
+                });
+            }
+            connections::Holder::Group => {}
+        }
         match http_status(r.port) {
             None => Ok(Probe::Starting {
                 step: "boot".to_owned(),
