@@ -160,7 +160,12 @@ async fn limit_bounds_one_read_and_is_clamped() -> Result<()> {
         agent.stdout(&chunk).await?;
     }
     let total = 3 * chunk.len() as u64;
-    f.output_until(&id, "offset=0", total).await?;
+    // A read at the last byte is refused (400) until that byte has arrived.
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while f.output(&id, TOKEN_A, &format!("offset={}", total - 1)).await?.0 != StatusCode::OK {
+        assert!(tokio::time::Instant::now() < deadline, "the output never arrived");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     let (_, three) = f.output(&id, TOKEN_A, "offset=0&limit=3").await?;
     assert_eq!((decode(&three)?.len(), &three["next_offset"]), (3, &3.into()));
@@ -236,5 +241,22 @@ async fn a_job_still_running_keeps_its_output_past_the_retention_window() -> Res
     tokio::time::sleep(Duration::from_millis(800)).await;
     let (status, body) = f.output(&id, TOKEN_A, "offset=0").await?;
     assert_eq!((status, body["done"].clone()), (StatusCode::OK, false.into()), "{body}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn collecting_output_does_not_steal_it_from_an_attach_stream() -> Result<()> {
+    let f = fixture().await?;
+    let id = f.submit(TOKEN_A).await?;
+    let agent = f.agent(&id)?;
+    agent.stdout(b"first").await?;
+    f.output_until(&id, "offset=0", 5).await?;
+
+    let url = f.attach(&id, TOKEN_A).await?;
+    let mut lines = common::Lines::new(f.open_stream(&url, Some(TOKEN_A)).await?);
+    agent.stdout(b"second").await?;
+    assert_eq!(lines.output_bytes(11).await?, b"firstsecond");
+    let all = f.output_until(&id, "offset=0", 11).await?;
+    assert_eq!(decode(&all)?, b"firstsecond");
     Ok(())
 }

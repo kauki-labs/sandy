@@ -3,7 +3,7 @@
 use std::{net::SocketAddr, os::unix::fs::PermissionsExt, path::PathBuf, process::ExitCode};
 
 use clap::Parser;
-use sandy_broker::{BrokerConfig, Client, serve};
+use sandy_broker::{BrokerConfig, Client, Tuning, serve_with_tuning};
 
 /// The broker HTTP API tier over sandyd.
 #[derive(Parser)]
@@ -39,6 +39,21 @@ fn load_clients(path: &std::path::Path) -> Result<Vec<Client>, String> {
     serde_json::from_slice(&bytes).map_err(|e| format!("clients file {}: {e}", path.display()))
 }
 
+/// Env var: seconds a finished job's output stays readable.
+const RETENTION_ENV: &str = "SANDY_BROKER_OUTPUT_RETENTION_SECS";
+
+fn output_retention() -> Result<std::time::Duration, String> {
+    let default = Tuning::default().output_retention;
+    match std::env::var(RETENTION_ENV) {
+        Ok(v) => v
+            .parse::<u64>()
+            .map(std::time::Duration::from_secs)
+            .map_err(|e| format!("{RETENTION_ENV}={v:?}: {e}")),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(e) => Err(format!("{RETENTION_ENV}: {e}")),
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -52,13 +67,26 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let running = serve(BrokerConfig {
-        control_socket: args.control_socket,
-        rpc_deadline: std::time::Duration::from_secs(30),
-        state_dir: args.state_dir,
-        bind: args.bind,
-        clients,
-    })
+    let output_retention = match output_retention() {
+        Ok(retention) => retention,
+        Err(e) => {
+            tracing::error!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let running = serve_with_tuning(
+        BrokerConfig {
+            control_socket: args.control_socket,
+            rpc_deadline: std::time::Duration::from_secs(30),
+            state_dir: args.state_dir,
+            bind: args.bind,
+            clients,
+        },
+        Tuning {
+            output_retention,
+            ..Tuning::default()
+        },
+    )
     .await;
     let mut running = match running {
         Ok(running) => running,

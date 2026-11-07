@@ -41,15 +41,15 @@ const MAX_TOTAL: usize = 32;
 /// Bytes of a ticket before hex encoding (256 bits).
 const TICKET_BYTES: usize = 32;
 /// How long the attach RPC, the connect and the join may take together.
-const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often a stream checks whether the job ended.
-const POLL: Duration = Duration::from_secs(1);
+pub(crate) const POLL: Duration = Duration::from_secs(1);
 /// After the job ended, a stream ends once the data plane is quiet this long.
-const QUIET: Duration = Duration::from_millis(500);
+pub(crate) const QUIET: Duration = Duration::from_millis(500);
 /// Consecutive failed status polls after which a stream ends with `fault:status unavailable`.
-const MAX_FAILED_POLLS: u32 = 5;
+pub(crate) const MAX_FAILED_POLLS: u32 = 5;
 /// The most a stream drains after the job ended, however much keeps arriving.
-const DRAIN_CAP: Duration = Duration::from_secs(30);
+pub(crate) const DRAIN_CAP: Duration = Duration::from_secs(30);
 /// Chunks buffered between the producer and the HTTP body.
 const CHUNK_DEPTH: usize = 8;
 
@@ -220,7 +220,7 @@ pub(crate) async fn stream(state: Arc<State>, client: &Client, id: &str, ticket:
     let Some(token) = state.owners.token_for(id, &client.id) else {
         return error(&NOT_FOUND);
     };
-    let joined = match tokio::time::timeout(JOIN_TIMEOUT, join(&state, id, token)).await {
+    let joined = match tokio::time::timeout(JOIN_TIMEOUT, join(&state, id, Some(token))).await {
         Ok(Ok(conn)) => conn,
         Ok(Err(e)) => return error(&e),
         Err(_) => {
@@ -241,10 +241,12 @@ pub(crate) async fn stream(state: Arc<State>, client: &Client, id: &str, ticket:
 }
 
 /// The attach RPC, then the join on the attach socket. Any failure is a fixed `unavailable`.
-async fn join(state: &State, id: &str, token: Vec<u8>) -> Result<UnixStream, ApiError> {
+/// With a `token` the caller joins as the submitter. Without one sandyd hands out its read-only
+/// observer cap, a membership (and cursor) apart from every submitter's.
+pub(crate) async fn join(state: &State, id: &str, token: Option<Vec<u8>>) -> Result<UnixStream, ApiError> {
     let op = control_request::Op::Attach(AttachRequest {
         job_id: id.to_owned(),
-        attach_token: Some(token),
+        attach_token: token,
     });
     let control_response::Result::Attach(attach) = rpc(state, op).await? else {
         return Err(UNAVAILABLE);
@@ -279,7 +281,7 @@ async fn join(state: &State, id: &str, token: Vec<u8>) -> Result<UnixStream, Api
 }
 
 /// Aborts its task on drop, so a finished stream closes the data-plane read half.
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
+pub(crate) struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
@@ -287,26 +289,17 @@ impl Drop for AbortOnDrop {
     }
 }
 
-type Frames = mpsc::Receiver<Result<Option<LinkFrame>, ()>>;
+pub(crate) type Frames = mpsc::Receiver<Result<Option<LinkFrame>, ()>>;
 
 /// Frames buffered between the data-plane reader and the pump. Small, so a stalled client pins
 /// little memory (a frame can be 1 MiB).
 const FRAME_DEPTH: usize = 2;
 
-/// How a stream ended.
-enum End {
-    /// The client went away or stopped reading: send nothing more.
-    ClientGone,
-    /// Send this `exit` reason.
-    Exit(String),
-}
-
-/// Runs one stream to its end. The write half of the connection is held but never written or
-/// shut down: a client EOF makes sandyd's relay leave the channel.
-async fn pump(state: Arc<State>, id: String, conn: UnixStream, tx: mpsc::Sender<Bytes>, _slot: StreamSlot) {
-    let (mut read_half, _write_half) = tokio::io::split(conn);
-    let (frames_tx, mut frames): (_, Frames) = mpsc::channel(FRAME_DEPTH);
-    let _reader = AbortOnDrop(tokio::spawn(async move {
+/// Reads frames off `read_half` on its own task, so a select over the result never cancels a
+/// half-read frame. The task stops with the returned guard.
+pub(crate) fn spawn_reader(mut read_half: tokio::io::ReadHalf<UnixStream>) -> (Frames, AbortOnDrop) {
+    let (frames_tx, frames): (_, Frames) = mpsc::channel(FRAME_DEPTH);
+    let reader = AbortOnDrop(tokio::spawn(async move {
         loop {
             let next = match read_frame(&mut read_half).await {
                 Ok(Some(frame)) => Ok(Some(frame)),
@@ -319,6 +312,22 @@ async fn pump(state: Arc<State>, id: String, conn: UnixStream, tx: mpsc::Sender<
             }
         }
     }));
+    (frames, reader)
+}
+
+/// How a stream ended.
+enum End {
+    /// The client went away or stopped reading: send nothing more.
+    ClientGone,
+    /// Send this `exit` reason.
+    Exit(String),
+}
+
+/// Runs one stream to its end. The write half of the connection is held but never written or
+/// shut down: a client EOF makes sandyd's relay leave the channel.
+async fn pump(state: Arc<State>, id: String, conn: UnixStream, tx: mpsc::Sender<Bytes>, _slot: StreamSlot) {
+    let (read_half, _write_half) = tokio::io::split(conn);
+    let (mut frames, _reader) = spawn_reader(read_half);
     if let End::Exit(reason) = run(&state, &id, &tx, &mut frames).await {
         let _ = tokio::time::timeout(state.send_timeout, tx.send(line(&Event::Exit { reason }))).await;
     }
@@ -389,20 +398,27 @@ async fn drain(state: &State, tx: &mpsc::Sender<Bytes>, frames: &mut Frames, sta
     }
 }
 
-/// Sends a delivered chunk as an `output` line, waiting at most `send_timeout` for room. `false`
-/// when the client is gone or stopped reading. Archive frames and anything else are dropped.
-async fn forward(tx: &mpsc::Sender<Bytes>, frame: LinkFrame, send_timeout: Duration) -> bool {
+/// The job output a frame carries: the decoded stdout or stderr payload of a `Deliver`. Archive
+/// frames, other frame kinds and a payload that is not hex give `None`.
+pub(crate) fn output_bytes(frame: LinkFrame) -> Option<Vec<u8>> {
     let LinkFrame::Deliver {
         content_type, payload, ..
     } = frame
     else {
-        return true;
+        return None;
     };
     if content_type != TTY_STDOUT && content_type != TTY_STDERR {
-        return true;
+        return None;
     }
-    let Ok(bytes) = hex::decode(payload) else {
-        tracing::warn!("sandyd delivered a chunk that is not hex");
+    hex::decode(payload)
+        .inspect_err(|_| tracing::warn!("sandyd delivered a chunk that is not hex"))
+        .ok()
+}
+
+/// Sends a delivered chunk as an `output` line, waiting at most `send_timeout` for room. `false`
+/// when the client is gone or stopped reading. Archive frames and anything else are dropped.
+async fn forward(tx: &mpsc::Sender<Bytes>, frame: LinkFrame, send_timeout: Duration) -> bool {
+    let Some(bytes) = output_bytes(frame) else {
         return true;
     };
     let data = STANDARD.encode(bytes);
@@ -466,6 +482,7 @@ mod tests {
             clients: Vec::new(),
             owners: crate::owners::Owners::open(&dir.join("state"))?,
             tickets: Tickets::new(Duration::from_secs(30)),
+            outputs: crate::output::Outputs::new(1024, 4096, Duration::from_secs(60)),
             send_timeout: Duration::from_secs(30),
             env_create: HashMap::new(),
         })
@@ -479,6 +496,7 @@ mod tests {
             clients: Vec::new(),
             owners: crate::owners::Owners::open(&dir.join("state"))?,
             tickets: Tickets::new(Duration::from_secs(30)),
+            outputs: crate::output::Outputs::new(1024, 4096, Duration::from_secs(60)),
             send_timeout: Duration::from_secs(30),
             env_create: HashMap::new(),
         })

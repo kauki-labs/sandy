@@ -7,6 +7,7 @@ mod attach;
 mod auth;
 mod body;
 mod environments;
+mod output;
 mod owners;
 mod paths;
 mod server;
@@ -224,6 +225,7 @@ pub async fn serve_with_tuning(config: BrokerConfig, tuning: Tuning) -> Result<R
     let state = Arc::new(server::State {
         owners: owners::Owners::open(&config.state_dir)?,
         tickets: attach::Tickets::new(ticket_ttl),
+        outputs: output::Outputs::new(tuning.output_job_cap, tuning.output_total_cap, tuning.output_retention),
         send_timeout: tuning.send_timeout,
         control_socket: config.control_socket,
         rpc_deadline: config.rpc_deadline,
