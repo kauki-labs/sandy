@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
-use common::{Fixture, Opts, TOKEN_A, TOKEN_B, fixture, fixture_with_opts};
+use common::{Fixture, Opts, TOKEN_A, TOKEN_B, TOKEN_C, fixture, fixture_with_opts};
 use reqwest::StatusCode;
 use sandy_control_proto::JobStatus;
 use serde_json::Value;
@@ -45,9 +45,13 @@ impl Fixture {
 
     /// Polls until the broker reports the job done.
     async fn output_done(&self, id: &str) -> Result<Value> {
+        self.output_done_as(id, TOKEN_A).await
+    }
+
+    async fn output_done_as(&self, id: &str, token: &str) -> Result<Value> {
         let deadline = tokio::time::Instant::now() + WAIT;
         loop {
-            let (status, body) = self.output(id, TOKEN_A, "offset=0").await?;
+            let (status, body) = self.output(id, token, "offset=0").await?;
             assert_eq!(status, StatusCode::OK, "{body}");
             if body["done"] == true {
                 return Ok(body);
@@ -258,5 +262,85 @@ async fn collecting_output_does_not_steal_it_from_an_attach_stream() -> Result<(
     assert_eq!(lines.output_bytes(11).await?, b"firstsecond");
     let all = f.output_until(&id, "offset=0", 11).await?;
     assert_eq!(decode(&all)?, b"firstsecond");
+    Ok(())
+}
+
+#[tokio::test]
+async fn one_clients_output_never_evicts_another_clients_buffers() -> Result<()> {
+    // Three clients share 30 bytes: 10 each.
+    let f = fixture_with_opts(Opts {
+        output_job_cap: 8,
+        output_total_cap: 30,
+        ..Opts::default()
+    })
+    .await?;
+    let b = f.submit(TOKEN_C).await?;
+    f.agent(&b)?.stdout(b"bbbbbb").await?;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while f.output(&b, TOKEN_C, "offset=5").await?.0 != StatusCode::OK {
+        assert!(tokio::time::Instant::now() < deadline, "b's output never arrived");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    f.finish(&b, JobStatus::Succeeded)?;
+    f.output_done_as(&b, TOKEN_C).await?;
+
+    // Client a overruns its share with two jobs of 8 bytes.
+    let a1 = f.submit(TOKEN_A).await?;
+    f.agent(&a1)?.stdout(b"aaaaaaaa").await?;
+    f.output_until(&a1, "offset=0", 8).await?;
+    f.finish(&a1, JobStatus::Succeeded)?;
+    f.output_done(&a1).await?;
+    let a2 = f.submit(TOKEN_A).await?;
+    f.agent(&a2)?.stdout(b"AAAAAAAA").await?;
+    f.output_until(&a2, "offset=0", 8).await?;
+
+    let (status, kept) = f.output(&b, TOKEN_C, "offset=0").await?;
+    assert_eq!(status, StatusCode::OK, "a's output evicted b's buffer: {kept}");
+    assert_eq!(decode(&kept)?, b"bbbbbb");
+    let (status, _) = f.output(&a1, TOKEN_A, "offset=0").await?;
+    assert_eq!(status, StatusCode::NOT_FOUND, "a's own oldest finished job goes first");
+    let (status, live) = f.output(&a2, TOKEN_A, "offset=0").await?;
+    assert_eq!((status, decode(&live)?), (StatusCode::OK, b"AAAAAAAA".to_vec()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_absurd_retention_does_not_panic() -> Result<()> {
+    let f = fixture_with_opts(Opts {
+        output_retention: Duration::MAX,
+        ..Opts::default()
+    })
+    .await?;
+    let id = f.submit(TOKEN_A).await?;
+    f.agent(&id)?.stdout(b"x").await?;
+    f.output_until(&id, "offset=0", 1).await?;
+    f.finish(&id, JobStatus::Succeeded)?;
+    let done = f.output_done(&id).await?;
+    assert_eq!(done["done"], true);
+    let (status, _) = f.output(&id, TOKEN_A, "offset=0").await?;
+    assert_eq!(status, StatusCode::OK);
+    Ok(())
+}
+
+#[tokio::test]
+async fn dropping_the_broker_stops_its_collectors() -> Result<()> {
+    let f = fixture().await?;
+    let id = f.submit(TOKEN_A).await?;
+    let job = f.registry.get(&id).context("job")?;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while job.channel.member_count() < 1 {
+        assert!(tokio::time::Instant::now() < deadline, "the collector never joined");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let common::Fixture { _broker, .. } = f;
+    drop(_broker);
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while job.channel.member_count() > 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the collector outlived the broker"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     Ok(())
 }

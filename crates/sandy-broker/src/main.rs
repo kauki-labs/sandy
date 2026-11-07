@@ -43,13 +43,16 @@ fn load_clients(path: &std::path::Path) -> Result<Vec<Client>, String> {
 const RETENTION_ENV: &str = "SANDY_BROKER_OUTPUT_RETENTION_SECS";
 
 fn output_retention() -> Result<std::time::Duration, String> {
-    let default = Tuning::default().output_retention;
-    match std::env::var(RETENTION_ENV) {
+    parse_retention(std::env::var(RETENTION_ENV))
+}
+
+fn parse_retention(value: Result<String, std::env::VarError>) -> Result<std::time::Duration, String> {
+    match value {
         Ok(v) => v
             .parse::<u64>()
             .map(std::time::Duration::from_secs)
             .map_err(|e| format!("{RETENTION_ENV}={v:?}: {e}")),
-        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotPresent) => Ok(Tuning::default().output_retention),
         Err(e) => Err(format!("{RETENTION_ENV}: {e}")),
     }
 }
@@ -101,4 +104,21 @@ async fn main() -> ExitCode {
         _ = tokio::signal::ctrl_c() => {}
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retention_defaults_parses_and_refuses_an_absurd_value() {
+        assert_eq!(
+            parse_retention(Err(std::env::VarError::NotPresent)),
+            Ok(Tuning::default().output_retention)
+        );
+        assert_eq!(parse_retention(Ok("60".into())), Ok(std::time::Duration::from_secs(60)));
+        for bad in ["x", "-1", "18446744073709551615", "604801"] {
+            assert!(parse_retention(Ok(bad.into())).is_err(), "{bad} must be refused");
+        }
+    }
 }

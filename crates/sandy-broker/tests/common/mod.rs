@@ -18,6 +18,7 @@ use tokio::net::{UnixListener, UnixStream};
 
 pub const TOKEN_A: &str = "token-of-client-a";
 pub const TOKEN_B: &str = "token-of-client-b";
+pub const TOKEN_C: &str = "token-of-client-c";
 
 pub struct Fixture {
     pub base: String,
@@ -43,6 +44,8 @@ pub struct Opts {
     pub send_timeout: Duration,
     /// Bytes of one job's output the broker keeps.
     pub output_job_cap: usize,
+    /// Bytes of output the broker keeps across all clients.
+    pub output_total_cap: usize,
     /// How long a finished job's output stays readable.
     pub output_retention: Duration,
 }
@@ -54,6 +57,7 @@ impl Default for Opts {
             ticket_ttl: Duration::from_secs(30),
             send_timeout: Duration::from_secs(30),
             output_job_cap: Tuning::default().output_job_cap,
+            output_total_cap: Tuning::default().output_total_cap,
             output_retention: Tuning::default().output_retention,
         }
     }
@@ -201,12 +205,14 @@ async fn build(
                     ..client("a", TOKEN_A, IsolationClass::Trusted, vec![root_a.clone()])
                 },
                 client("b", TOKEN_B, IsolationClass::Untrusted, vec![]),
+                client("c", TOKEN_C, IsolationClass::Trusted, vec![]),
             ],
         },
         Tuning {
             ticket_ttl: opts.ticket_ttl,
             send_timeout: opts.send_timeout,
             output_job_cap: opts.output_job_cap,
+            output_total_cap: opts.output_total_cap,
             output_retention: opts.output_retention,
             ..Tuning::default()
         },
