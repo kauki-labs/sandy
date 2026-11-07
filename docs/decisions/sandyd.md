@@ -2286,7 +2286,17 @@ cursor with a client's stream, and every join counted by `join_for_attach` sends
 - The attach accept loop routes a join whose cap names the `collector` peer to a plain
   `Channel::join` and `relay` with no attach tracking. It is not counted and sends no
   `AttachStateChanged`, at join or at leave. `Channel::join` still verifies the cap.
-- The cap's proof digest differs from every other cap's, so the collector owns its membership. A
-  second observer joining and leaving does not end its stream (the `archiver_cap` rule in `dispatch.rs`).
+- The collector cap is minted under its own peer name, so its membership differs from the
+  `operator`, `observer` and `archiver` memberships. Two collector caps for one job minted in the
+  same second are identical (`LocalCapAuthority` mints deterministically per second) and share a
+  membership, so the broker spaces its join retries at least 10 s apart. A second observer joining
+  and leaving does not end the collector's stream.
+- The accept loop admits the collector path only for a read-only cap: a post-capable cap named
+  `collector` is refused. The collector relay is delivery only and ends, closing the connection,
+  on a channel fault or a failed write, so the broker reads EOF and reports a fault. The broker
+  also refuses a cap that is not read-only `collector`: an older sandyd ignores `collector` and
+  answers with the submitter's cap.
+- The broker holds at most 16 collector connections per client and 64 in all, well under the
+  256 attach connections the accept loop serves. A job past the bound waits for a slot.
 
 **Set aside.** Reusing `observer_cap`, and counting the collector as an attach.

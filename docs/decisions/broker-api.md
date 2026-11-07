@@ -242,6 +242,11 @@ route over giving `sandy-mcp` a stream reader.
   own: a submitter attach mints the shared `operator` membership with one cursor, and a
   collector on it would take messages from a client's stream. A collector join is not counted
   as an attach and sends no `AttachStateChanged`.
+- At most 16 collectors per client and 64 in all (`Tuning`). sandyd's accept loop serves 256
+  attach connections, so unbounded collectors could starve every other attach. A job past the
+  bound is accepted at once and its collector waits for a slot. sandyd replays the channel from
+  the start on join, so a late collector still gets all of the output while the channel is
+  retained. If the channel is gone by then the buffer ends with a fault.
 - Buffer bounds: 1 MiB per job, the oldest bytes dropped. The 16 MiB total is split evenly over
   the configured clients. A client over its share loses its own oldest finished job first, then
   its growing job drops its oldest bytes. One client's output never evicts another's. Offsets stay
@@ -252,14 +257,18 @@ route over giving `sandy-mcp` a stream reader.
   `not_found`. An offset past the end, a repeated or unknown query key, or a non-integer value
   gives `invalid_request`.
 - A finished job's buffer is readable for 15 minutes after collection ends
-  (`SANDY_BROKER_OUTPUT_RETENTION_SECS`, whole seconds, at most 7 days; a larger value stops
+  (`SANDY_BROKER_OUTPUT_RETENTION_SECS`, whole seconds, 1 to 7 days; a larger value stops
   the broker at start), then `not_found`. Expired buffers are swept on the next submit or read.
   After the job ends the collector keeps draining until the data plane is quiet for 500 ms, and
   for 30 s at most, so `done` can lag the exit by that long.
 - Dropping the broker aborts every collector task, which closes their attach connections.
 - A collector that cannot attach (five tries), loses the data plane, or loses the status path
   ends the buffer with a fixed `fault` text. Output may be missing; the route says so instead of
-  reporting a clean `done`.
+  reporting a clean `done`. The texts: `collector could not start`, `collector could not attach`,
+  `job ended before the collector attached`, `data plane error`, `data plane closed` (EOF: sandyd
+  closes a collector only on a delivery fault), `status unavailable`, and `output still arriving
+when collection stopped` (frames still flowed 30 s after the job ended). Join retries are 10 s
+  apart.
 - Nothing is written to disk. A broker restart loses every buffer, and the route answers
   `not_found` for jobs submitted before it. The OpenAPI text says this.
 
