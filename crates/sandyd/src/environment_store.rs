@@ -1132,6 +1132,23 @@ mod tests {
     }
 
     #[test]
+    fn a_trusted_only_store_refuses_an_untrusted_create_and_keeps_no_row() -> Result<()> {
+        let s = store()?;
+        s.require_trusted_submitter();
+        assert!(s.create("r1", "env-1", SPEC, ENC).is_err(), "create must refuse");
+        assert!(
+            s.create_for("r1", "env-1", SPEC, ENC, false).is_err(),
+            "an untrusted create_for must refuse"
+        );
+        assert!(s.get_by_request_id("r1")?.is_none(), "a refused create leaves no row");
+        assert!(matches!(
+            s.create_for("r1", "env-1", SPEC, ENC, true)?,
+            CreateOutcome::Created(rec) if rec.submitter_trusted
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn a_table_from_before_the_endpoint_column_is_migrated() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("env.db");
