@@ -482,8 +482,9 @@ where
             )),
         ));
     }
-    let _ = hooks;
-    Ok(())
+    bounded(t, hooks.after_ready(name))
+        .await
+        .map_err(|e| (SetupStep::AfterReady, e))
 }
 
 fn last_error(last: Option<&SeamError>) -> String {
@@ -559,6 +560,10 @@ pub enum TeardownError {
 /// # Errors
 /// [`TeardownError`], never `Ok` while the node may exist, the VM may run or a
 /// key may be live.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one parameter per seam plus name, slot and timeout"
+)]
 pub async fn teardown<C, G, B, T, H>(
     coord: &C,
     guest: &G,
@@ -581,7 +586,9 @@ where
     let key = key.as_ref();
     let mut hook = Vec::new();
     let mut residue = Vec::new();
-    let _ = hooks;
+    if let Err(e) = bounded(t, hooks.before_teardown(name)).await {
+        hook.push(format!("before_teardown: {e}"));
+    }
     if let Err(e) = bounded(t, steps.tailscale_logout()).await {
         tracing::warn!(error = %scrub(&e.to_string(), key), "tailscale logout failed, continuing");
     }
