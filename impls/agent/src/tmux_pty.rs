@@ -185,7 +185,10 @@ impl TmuxJob {
         // pty -> pipe-pane -> log stream `wait_for_exit` tails, so observing
         // it in the log is itself proof every byte the job wrote before it
         // is already there (see this module's own doc comment).
-        let script = format!("{}; printf '{EXIT_MARKER}%d\\n' \"$?\"", quote_argv(job));
+        // `trap : INT` keeps this wrapper alive when a stop's Ctrl-C reaches the whole foreground group (#670):
+        // a caught signal resets to its default in the job, so the job still dies of SIGINT, but the wrapper goes
+        // on to print the marker. Without it a job that keeps the default action loses its exit code.
+        let script = format!("trap : INT; {}; printf '{EXIT_MARKER}%d\\n' \"$?\"", quote_argv(job));
 
         // `remain-on-exit` MUST take effect at the moment the server starts,
         // before the session (and its pane's command) exists at all — not
@@ -449,7 +452,14 @@ impl TmuxJob {
         tmux_cmd(&self.socket)
             .args(["display-message", "-p", "-t", &self.session, "#{pane_dead}"])
             .output()
-            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).trim() == "1")
+            .is_ok_and(|out| {
+                // A forced stop (#670) ends the whole server, so no pane is left to report `pane_dead`: tmux
+                // says so on stderr, which means the job is gone, not running. Any other failure stays "not dead".
+                let gone = String::from_utf8_lossy(&out.stderr);
+                String::from_utf8_lossy(&out.stdout).trim() == "1"
+                    || gone.contains("no server running")
+                    || gone.contains("can't find session")
+            })
     }
 
     /// Tear the whole dedicated server down (not just the session): since
@@ -459,6 +469,15 @@ impl TmuxJob {
     /// may already be gone.
     pub fn kill(&self) {
         let _ = run_tmux(tmux_cmd(&self.socket).arg("kill-server"));
+    }
+
+    /// A cloneable handle for stopping this job gracefully (#670), usable while [`Self::wait_for_exit`] runs.
+    #[must_use]
+    pub fn stopper(&self) -> JobStopper {
+        JobStopper {
+            socket: self.socket.clone(),
+            session: self.session.clone(),
+        }
     }
 
     /// Open a fresh PTY and attach it to this job's tmux session — the one
@@ -565,6 +584,43 @@ fn run_tmux(cmd: &mut std::process::Command) -> std::io::Result<()> {
         return Err(std::io::Error::other(format!("tmux exited with {status}")));
     }
     Ok(())
+}
+
+/// Stops a [`TmuxJob`] gracefully (#670): interrupt the job, wait the grace, then end its session. Cheap and
+/// `Clone`; it names the job's own tmux server, so it never touches another job's.
+#[derive(Clone)]
+pub struct JobStopper {
+    socket: String,
+    session: String,
+}
+
+impl JobStopper {
+    /// Send Ctrl-C to the job's PTY. The PTY's line discipline turns it into SIGINT for the job's foreground
+    /// process group, the same signal an attached user's Ctrl-C raises, so a job that handles interrupts shuts
+    /// down cleanly and its real exit code still reaches the sentinel (the wrapper traps SIGINT so it survives).
+    ///
+    /// # Errors
+    /// If `tmux` cannot be run or the session is already gone.
+    pub fn interrupt(&self) -> std::io::Result<()> {
+        run_tmux(tmux_cmd(&self.socket).args(["send-keys", "-t", &self.session, "C-c"]))
+    }
+
+    /// End the whole dedicated server, for a job that did not exit within its grace. Best-effort.
+    pub fn force(&self) {
+        let _ = run_tmux(tmux_cmd(&self.socket).arg("kill-server"));
+    }
+
+    /// Interrupt the job, wait up to `grace` for it to exit (the caller's `wait_for_exit` ends the wait by
+    /// dropping this future), then force it. A failed interrupt forces at once: there is nothing to wait for.
+    pub async fn stop(&self, grace: std::time::Duration) {
+        if let Err(e) = self.interrupt() {
+            eprintln!("sandy-agent: interrupting the job: {e}");
+            self.force();
+            return;
+        }
+        tokio::time::sleep(grace).await;
+        self.force();
+    }
 }
 
 /// The PTY master's read side, fed by a background thread (the master has no
@@ -825,6 +881,93 @@ mod tests {
             Ok(Ok(code)) => panic!("expected an error, got a spurious exit code {code}"),
             Err(_) => panic!("wait_for_exit hung past its own PANE_DEAD_GRACE bound — the leak this regresses"),
         }
+        Ok(())
+    }
+
+    /// Waits until the job's transcript shows `ready`, so a test interrupts a job whose traps are installed rather
+    /// than guessing with a sleep.
+    async fn wait_until_ready(job: &TmuxJob) -> std::io::Result<()> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if tokio::fs::read(job.log_path())
+                .await
+                .is_ok_and(|log| String::from_utf8_lossy(&log).contains("ready"))
+            {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Err(std::io::Error::other("the job never printed ready"))
+    }
+
+    /// #670: a job that keeps the default SIGINT action (a plain `sleep`, most servers) still gets its real exit
+    /// code read back after a stop: the wrapper shell must survive the interrupt long enough to print the marker.
+    #[tokio::test]
+    async fn a_job_with_the_default_interrupt_action_still_reports_its_exit_code_after_a_stop() -> std::io::Result<()> {
+        let job = TmuxJob::start(
+            &["sh".into(), "-c".into(), "echo ready; sleep 100".into()],
+            None,
+            TEST_HISTORY_LINES,
+        )?;
+        wait_until_ready(&job).await?;
+        job.stopper().interrupt()?;
+        let exit = tokio::time::timeout(Duration::from_secs(10), job.wait_for_exit())
+            .await
+            .map_err(|_| std::io::Error::other("the interrupted job never reported an exit"))??;
+        assert_eq!(exit, 130, "a SIGINT death is 128 + 2, read from the marker, not lost");
+        Ok(())
+    }
+
+    /// #670: a job that handles the interrupt exits on its own inside the grace with its own exit code, so the
+    /// sentinel is read, not lost to a forced session kill.
+    #[tokio::test]
+    async fn a_stop_lets_a_job_that_handles_the_interrupt_exit_with_its_own_code() -> std::io::Result<()> {
+        let job = TmuxJob::start(
+            &[
+                "sh".into(),
+                "-c".into(),
+                "trap 'exit 7' INT; echo ready; while :; do sleep 0.1; done".into(),
+            ],
+            None,
+            TEST_HISTORY_LINES,
+        )?;
+        wait_until_ready(&job).await?;
+        let stopper = job.stopper();
+        let stop = tokio::spawn(async move { stopper.stop(Duration::from_secs(20)).await });
+        let exit = tokio::time::timeout(Duration::from_secs(10), job.wait_for_exit())
+            .await
+            .map_err(|_| std::io::Error::other("a handled interrupt must end the job inside the grace"))??;
+        stop.abort();
+        assert_eq!(exit, 7, "the job's own exit code, not a forced kill");
+        Ok(())
+    }
+
+    /// #670: a job that ignores the interrupt keeps running for the whole grace, then is forced: no exit marker,
+    /// so `wait_for_exit` ends with the bounded "pane died" error, never a hang.
+    #[tokio::test]
+    async fn a_stop_gives_a_job_that_ignores_the_interrupt_its_grace_then_forces_it() -> std::io::Result<()> {
+        let job = TmuxJob::start(
+            &[
+                "sh".into(),
+                "-c".into(),
+                "trap '' INT; echo ready; while :; do sleep 0.1; done".into(),
+            ],
+            None,
+            TEST_HISTORY_LINES,
+        )?;
+        wait_until_ready(&job).await?;
+        let stopper = job.stopper();
+        let stop = tokio::spawn(async move { stopper.stop(Duration::from_secs(4)).await });
+        let early = tokio::time::timeout(Duration::from_millis(1500), job.wait_for_exit()).await;
+        assert!(
+            early.is_err(),
+            "the job must still be alive inside its grace: {early:?}"
+        );
+        let ended = tokio::time::timeout(Duration::from_secs(20), job.wait_for_exit())
+            .await
+            .map_err(|_| std::io::Error::other("a forced job must end, not hang"))?;
+        stop.abort();
+        assert!(ended.is_err(), "a forced job has no exit marker: {ended:?}");
         Ok(())
     }
 

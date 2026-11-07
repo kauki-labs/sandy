@@ -424,6 +424,16 @@ demonstrated for the process backend; it is deferred to the VM-backed
 - Wiring `sandy_api::console::Transport` into `RawConsole` now: no VM-backed agent
   exists yet to wire it to.
 
+**Graceful stop (#670).** A stop is a Control envelope with `STOP_CONTROL` (4 bytes, the grace in seconds) on the
+orchestrator channel. The relay turns it into `LinkFrame::Stop`, as it does a resize. The agent interrupts the job
+(Ctrl-C on its PTY; the tmux wrapper traps SIGINT so it still prints the exit marker), waits the grace, then ends the
+job's tmux server. A job that exits inside the grace reports its own exit code. A job that is forced has no marker,
+so the agent reports no `Exit` frame (INV-11) and, as for any pane that dies unreported, no archive. Who may post it:
+the cap layer does not scope a post by content type, so the guard is the relay allowlist. `attach_relay` forwards
+only `TTY_STDIN` and `RESIZE_CONTROL`, and rejects any other frame, including a stop. Any future surface that lets a
+cap holder post arbitrary Control also lets it stop jobs. An agent older than this frame treats it as a protocol
+fault and stops routing input, so send a stop only to a guest image that carries it.
+
 ### 10a. The guest port relay (#590)
 
 `sandy-agent port-relay --vsock-port P --to 127.0.0.1:T` is the guest half of the host-side bridge to a guest
