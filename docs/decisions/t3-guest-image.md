@@ -52,3 +52,22 @@ that t3's API or websocket is up. It refuses a port argument that is not digits 
 rc 7 (connection refused) before `t3 serve` starts and succeeds 6 s after it, and `t3 pair` prints
 `Pairing with sandy (http://127.0.0.1:3773)` and a QR code. Not yet tested: the vfkit guest, the stdio harness
 protocols through the guest console, a primary T3 linking to the guest, and a harness reaching its provider (#609).
+
+## Live evidence (2026-11-07, link from a delegator app)
+
+A Mac delegator app (T3 Code 0.1.7) linked a `qemu-t3` guest on a Linux/KVM host through `scripts/dev/t3-env/`, used
+the environment, and unlinked it when the job ended. The run found these constraints:
+
+- The guest needs t3code 0.1.6 or newer. The app links only a server that reports `mcpModeLimitHeader` and
+  `linkFence`; 0.1.2 reports neither and the link fails with `PeerLinkError`.
+- `--env` does not reach the job command. Secrets do, as login-shell exports of `/run/sandy/secrets/<NAME>`. The
+  start script passes the pairing nonce as an argument.
+- `systemd-run` looks the command up in sudo's `secure_path`, and does not set `SUDO_UID`. Call sandy by absolute
+  path and set `SUDO_UID`, or `nix eval` refuses the checkout (libgit2 owner check).
+- A sandy that runs as root reads trust roots only when the directory and files are root-owned (`cred.rs`).
+- `install -d -o t3` gives the owner to the leaf only. Create `$base` and `$base/userdata` in one call.
+- A `SIGTERM` to `sandy run` leaves the record at `running` and the credential unrevoked (#687).
+
+The pairing code leaves the guest over plain http on a nonce path, because the guest has no ssh and the console is
+unreadable before the job ends. Not tested: a harness thread (no provider credential staged), the app closed during
+unlink, and a killed wrapper or an unreachable host.
