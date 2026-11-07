@@ -336,6 +336,11 @@ async fn serve_one_attach(
     // only picks this path; `Channel::join` still verifies the cap, and `Attach` mints this cap
     // only for a caller holding the attach token.
     if cap.scope().peer.0 == dispatch::COLLECTOR_PEER {
+        // The peer name only picks the path. A post-capable cap named `collector` is not one.
+        if cap.scope().rights.post {
+            refuse("a collector cap must be read-only".to_owned()).await;
+            return;
+        }
         let membership = match job.channel.join(&cap) {
             Ok(membership) => membership,
             Err(e) => {
@@ -431,8 +436,9 @@ async fn serve_one_attach(
     }
 }
 
-/// The collector's relay: delivery only. Ends, so the connection closes, when the channel's own
-/// stream faults or a write fails.
+/// The collector's relay: delivery only. Unlike [`relay`] it ends, so the connection closes and the
+/// broker reads EOF, when the channel's own stream faults or a write fails. `relay` keeps its
+/// input loop open after a delivery fault; a collector has no input, so that would be a silent stall.
 async fn relay_collector<B, A, R, W>(
     channel: Arc<Channel<B, A>>,
     membership: MembershipId,
@@ -445,7 +451,36 @@ where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    relay(channel, membership, read_half, write_half, None).await
+    let _leave = LeaveGuard {
+        channel: Arc::clone(&channel),
+        id: membership.clone(),
+        leave_seq: None,
+    };
+    let mut inbound = std::pin::pin!(channel.subscribe(&membership)?);
+    // A collector never posts: any frame, or EOF, from the broker ends it.
+    let mut gone = std::pin::pin!(read_frame(read_half));
+    loop {
+        tokio::select! {
+            item = inbound.next() => {
+                let env = match item {
+                    None => return Ok(()),
+                    Some(item) => item.map_err(ChannelError::from)?,
+                };
+                let is_tty = matches!(env.message_type, Some(MessageType::Tty(_)))
+                    && (env.content_type == TTY_STDOUT || env.content_type == TTY_STDERR);
+                if !is_tty {
+                    continue;
+                }
+                let frame = LinkFrame::Deliver {
+                    content_type: env.content_type,
+                    payload: hex::encode(&env.payload),
+                    channel: None,
+                };
+                write_frame(&mut *write_half.lock().await, &frame).await?;
+            }
+            _ = &mut gone => return Ok(()),
+        }
+    }
 }
 
 /// A relay failure: the connection faulted reading or writing a frame, or
