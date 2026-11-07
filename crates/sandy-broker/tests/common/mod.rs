@@ -48,6 +48,8 @@ pub struct Opts {
     pub output_total_cap: usize,
     /// How long a finished job's output stays readable.
     pub output_retention: Duration,
+    /// Most collectors one client may run at once.
+    pub output_collectors_per_client: usize,
 }
 
 impl Default for Opts {
@@ -59,6 +61,7 @@ impl Default for Opts {
             output_job_cap: Tuning::default().output_job_cap,
             output_total_cap: Tuning::default().output_total_cap,
             output_retention: Tuning::default().output_retention,
+            output_collectors_per_client: Tuning::default().output_collectors_per_client,
         }
     }
 }
@@ -214,6 +217,8 @@ async fn build(
             output_job_cap: opts.output_job_cap,
             output_total_cap: opts.output_total_cap,
             output_retention: opts.output_retention,
+            output_collectors_per_client: opts.output_collectors_per_client,
+            ..Tuning::default()
         },
     )
     .await?;

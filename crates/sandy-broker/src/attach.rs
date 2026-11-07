@@ -286,6 +286,12 @@ pub(crate) async fn join(
     }
 }
 
+/// Whether `cap` is the read-only collector cap. An older sandyd ignores `collector` and
+/// answers with a submitter's `operator` cap, which can post and shares a cursor.
+pub(crate) fn is_collector_cap(_cap: &[u8]) -> bool {
+    true
+}
+
 /// Aborts its task on drop, so a finished stream closes the data-plane read half.
 pub(crate) struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
@@ -572,6 +578,39 @@ mod tests {
         assert_eq!(terminal_name(99), Some("JOB_STATUS_FAILED"));
         assert_eq!(terminal_name(JobStatus::Running as i32), None);
         assert_eq!(terminal_name(JobStatus::Cancelled as i32), Some("JOB_STATUS_CANCELLED"));
+    }
+
+    #[test]
+    fn only_a_read_only_collector_cap_passes_the_collector_check() -> anyhow::Result<()> {
+        use sandy_fabric::{
+            capauth::{CapAuthority, CapRights, CapScope, encode_cap},
+            types::{ChannelId, PeerId},
+        };
+        use sandy_fabric_local::{LocalCapAuthority, SharedCapAuthority};
+
+        let authority = SharedCapAuthority::new(LocalCapAuthority::new(Duration::from_secs(3600))?);
+        let mint = |peer: &str, post: bool| -> anyhow::Result<Vec<u8>> {
+            let cap = authority.mint(CapScope {
+                peer: PeerId::from(peer),
+                channel: ChannelId::from("job"),
+                rights: CapRights {
+                    post,
+                    read: true,
+                    invite: false,
+                },
+                expires_at: None,
+            })?;
+            Ok(encode_cap(&cap)?)
+        };
+        assert!(is_collector_cap(&mint(sandy_control_proto::COLLECTOR_PEER, false)?));
+        assert!(
+            !is_collector_cap(&mint("operator", true)?),
+            "an old sandyd's operator cap"
+        );
+        assert!(!is_collector_cap(&mint("observer", false)?));
+        assert!(!is_collector_cap(&mint(sandy_control_proto::COLLECTOR_PEER, true)?));
+        assert!(!is_collector_cap(b"not a cap"));
+        Ok(())
     }
 
     #[test]

@@ -194,6 +194,10 @@ pub struct Tuning {
     pub output_total_cap: usize,
     /// How long a finished job's output stays readable.
     pub output_retention: std::time::Duration,
+    /// Most output collectors one client may run at once. Later jobs wait for a slot.
+    pub output_collectors_per_client: usize,
+    /// Most output collectors the broker may run at once.
+    pub output_collectors_total: usize,
 }
 
 impl Default for Tuning {
@@ -204,6 +208,8 @@ impl Default for Tuning {
             output_job_cap: 1024 * 1024,
             output_total_cap: 16 * 1024 * 1024,
             output_retention: std::time::Duration::from_secs(15 * 60),
+            output_collectors_per_client: 16,
+            output_collectors_total: 64,
         }
     }
 }

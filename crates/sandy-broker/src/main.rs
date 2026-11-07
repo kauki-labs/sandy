@@ -122,7 +122,7 @@ mod tests {
             Ok(Tuning::default().output_retention)
         );
         assert_eq!(parse_retention(Ok("60".into())), Ok(std::time::Duration::from_secs(60)));
-        for bad in ["x", "-1", "18446744073709551615", "604801"] {
+        for bad in ["x", "-1", "0", "18446744073709551615", "604801"] {
             assert!(parse_retention(Ok(bad.into())).is_err(), "{bad} must be refused");
         }
     }

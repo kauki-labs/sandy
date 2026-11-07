@@ -350,7 +350,7 @@ async fn serve_one_attach(
             job.channel.leave(&membership);
             return;
         }
-        if let Err(e) = relay(Arc::clone(&job.channel), membership, &mut read_half, write_half, None).await {
+        if let Err(e) = relay_collector(Arc::clone(&job.channel), membership, &mut read_half, write_half).await {
             tracing::warn!(error = %e, job_id, "collector relay faulted");
         }
         return;
@@ -429,6 +429,23 @@ async fn serve_one_attach(
     {
         spawn_notify_attach_state(Arc::clone(&job), Arc::clone(&host_registry), job_id.clone(), false, seq);
     }
+}
+
+/// The collector's relay: delivery only. Ends, so the connection closes, when the channel's own
+/// stream faults or a write fails.
+async fn relay_collector<B, A, R, W>(
+    channel: Arc<Channel<B, A>>,
+    membership: MembershipId,
+    read_half: &mut R,
+    write_half: Arc<AsyncMutex<W>>,
+) -> Result<(), AttachRelayError>
+where
+    B: ChannelBackend + 'static,
+    A: CapAuthority + 'static,
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    relay(channel, membership, read_half, write_half, None).await
 }
 
 /// A relay failure: the connection faulted reading or writing a frame, or
@@ -1234,6 +1251,107 @@ mod tests {
                 .is_err(),
             "a collector leave must send no AttachStateChanged either"
         );
+        Ok(())
+    }
+
+    /// A backend whose stream faults at once, standing in for a channel that lost its log.
+    struct FaultingBackend;
+
+    impl sandy_fabric::channel_backend::ChannelBackend for FaultingBackend {
+        async fn append(
+            &self,
+            _env: sandy_proto::Envelope,
+        ) -> Result<sandy_fabric::channel_backend::AppendOutcome, sandy_fabric::channel_backend::ChannelBackendError>
+        {
+            Ok(sandy_fabric::channel_backend::AppendOutcome::Stored)
+        }
+
+        async fn fetch(
+            &self,
+            _from_seq: u64,
+        ) -> Result<Vec<sandy_proto::Envelope>, sandy_fabric::channel_backend::ChannelBackendError> {
+            Ok(Vec::new())
+        }
+
+        fn stream_from(
+            &self,
+            _from_seq: u64,
+        ) -> impl futures_util::Stream<
+            Item = Result<sandy_proto::Envelope, sandy_fabric::channel_backend::ChannelBackendError>,
+        > + Send
+        + 'static {
+            futures_util::stream::once(async {
+                Err(sandy_fabric::channel_backend::ChannelBackendError::Unavailable(
+                    "log lost".to_owned(),
+                ))
+            })
+        }
+    }
+
+    /// F2: a collector whose delivery faults must end its connection, so the broker reads EOF and
+    /// reports a fault. A silent stall would read as a job with no more output.
+    #[tokio::test]
+    async fn a_faulting_backend_ends_the_collectors_relay() -> anyhow::Result<()> {
+        let authority = SharedCapAuthority::new(LocalCapAuthority::new(Duration::from_secs(3600))?);
+        let channel = Arc::new(Channel::new(ChannelId::from("job-1"), FaultingBackend, authority.clone()).await?);
+        let cap = mint(
+            &authority,
+            "job-1",
+            dispatch::COLLECTOR_PEER,
+            CapRights {
+                post: false,
+                read: true,
+                invite: false,
+            },
+        )?;
+        let membership = channel.join(&cap)?;
+        let (client, server) = tokio::net::UnixStream::pair()?;
+        let (mut server_rd, server_wr) = split(server);
+        let ended = tokio::time::timeout(
+            Duration::from_secs(2),
+            relay_collector(
+                channel,
+                membership,
+                &mut server_rd,
+                Arc::new(AsyncMutex::new(server_wr)),
+            ),
+        )
+        .await;
+        drop(client);
+        assert!(
+            matches!(ended, Ok(Err(AttachRelayError::Channel(_)))),
+            "the relay must end with the channel fault, got {ended:?}"
+        );
+        Ok(())
+    }
+
+    /// F5: the peer name alone does not make a cap a collector cap. A post-capable one is refused
+    /// the uncounted join.
+    #[tokio::test]
+    async fn a_post_capable_cap_named_collector_is_refused() -> anyhow::Result<()> {
+        let (registry, _agent, _operator) = registry_with_job("job-1").await?;
+        let cap = registry.authority().mint(CapScope {
+            peer: PeerId::from(dispatch::COLLECTOR_PEER),
+            channel: ChannelId::from("job-1"),
+            rights: post_capable(),
+            expires_at: None,
+        })?;
+        let (client, server) = tokio::net::UnixStream::pair()?;
+        let host_registry = Arc::new(crate::host_registry::HostRegistry::default());
+        tokio::spawn(serve_one_attach(server, Arc::clone(&registry), host_registry));
+        let (mut rd, mut wr) = client.into_split();
+        write_frame(
+            &mut wr,
+            &LinkFrame::Join {
+                cap: hex::encode(encode_cap(&cap)?),
+                channel: None,
+                cols: None,
+                rows: None,
+            },
+        )
+        .await?;
+        let reply = tokio::time::timeout(WAIT, read_frame(&mut rd)).await??;
+        assert!(matches!(reply, Some(LinkFrame::Refused { .. })), "got {reply:?}");
         Ok(())
     }
 

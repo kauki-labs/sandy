@@ -345,3 +345,46 @@ async fn dropping_the_broker_stops_its_collectors() -> Result<()> {
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn collectors_past_the_bound_wait_for_a_slot_then_deliver_the_output_they_missed() -> Result<()> {
+    let f = fixture_with_opts(Opts {
+        output_collectors_per_client: 2,
+        ..Opts::default()
+    })
+    .await?;
+    let mut ids = Vec::new();
+    for _ in 0..4 {
+        ids.push(f.submit(TOKEN_A).await?);
+    }
+    f.agent(&ids[2])?.stdout(b"late-two").await?;
+    f.agent(&ids[3])?.stdout(b"late-three").await?;
+    // sandyd's archive persister is one member of each channel; a collector is the second.
+    let jobs: Vec<_> = ids
+        .iter()
+        .map(|id| f.registry.get(id))
+        .collect::<Option<_>>()
+        .context("jobs")?;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while jobs[0].channel.member_count() < 2 || jobs[1].channel.member_count() < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the first collectors never joined"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        (jobs[2].channel.member_count(), jobs[3].channel.member_count()),
+        (1, 1),
+        "collectors past the per-client bound must wait"
+    );
+
+    f.finish(&ids[0], JobStatus::Succeeded)?;
+    f.finish(&ids[1], JobStatus::Succeeded)?;
+    let two = f.output_until(&ids[2], "offset=0", 8).await?;
+    assert_eq!(decode(&two)?, b"late-two");
+    let three = f.output_until(&ids[3], "offset=0", 10).await?;
+    assert_eq!(decode(&three)?, b"late-three");
+    Ok(())
+}

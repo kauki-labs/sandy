@@ -54,7 +54,7 @@ use crate::{
 
 /// The peer name of the broker output collector's read-only cap (#643). `Attach` mints it on
 /// request for the submitter; the attach accept loop does not count a join with it.
-pub const COLLECTOR_PEER: &str = "collector";
+pub const COLLECTOR_PEER: &str = sandy_control_proto::COLLECTOR_PEER;
 
 /// A job's dedicated orchestrator channel, minted at submit time.
 pub struct JobChannel {
