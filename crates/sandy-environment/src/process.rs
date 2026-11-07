@@ -422,25 +422,29 @@ impl EnvironmentBackend for ProcessEnvironmentBackend {
     }
 
     fn probe(&self, environment_id: &str) -> Result<Probe, BackendError> {
-        let mut running = self.lock();
-        let Some(r) = running.get_mut(environment_id) else {
-            return Ok(Probe::NotRunning);
-        };
-        match r.child.try_wait() {
-            Ok(Some(status)) => {
-                return Ok(Probe::Failed {
-                    step: "process".to_owned(),
-                    reason: format!("the service exited with {status}"),
-                });
+        let (port, pgid) = {
+            let mut running = self.lock();
+            let Some(r) = running.get_mut(environment_id) else {
+                return Ok(Probe::NotRunning);
+            };
+            match r.child.try_wait() {
+                Ok(Some(status)) => {
+                    return Ok(Probe::Failed {
+                        step: "process".to_owned(),
+                        reason: format!("the service exited with {status}"),
+                    });
+                }
+                Ok(None) => {}
+                Err(e) => return Err(BackendError::Transport(format!("wait for the service: {e}"))),
             }
-            Ok(None) => {}
-            Err(e) => return Err(BackendError::Transport(format!("wait for the service: {e}"))),
-        }
+            let pgid = i32::try_from(r.child.id())
+                .map_err(|_| BackendError::Transport("the service pid exceeds i32".to_owned()))?;
+            (r.port, pgid)
+        };
         // The port was chosen before the service started, so another process may hold it by now (#637): only the
-        // service's own listener may answer for it.
-        let pgid = i32::try_from(r.child.id())
-            .map_err(|_| BackendError::Transport("the service pid exceeds i32".to_owned()))?;
-        match connections::listener_holder(r.port, pgid).map_err(BackendError::Transport)? {
+        // service's own listener may answer for it. The lock is released: scanning the socket and process tables can
+        // be slow and must not stall other calls.
+        match connections::listener_holder(port, pgid).map_err(BackendError::Transport)? {
             connections::Holder::Nobody => {
                 return Ok(Probe::Starting {
                     step: "boot".to_owned(),
@@ -449,11 +453,15 @@ impl EnvironmentBackend for ProcessEnvironmentBackend {
             connections::Holder::Other => {
                 return Ok(Probe::Failed {
                     step: "port".to_owned(),
-                    reason: format!("another process holds port {}, not the service", r.port),
+                    reason: format!("another process holds port {port}, not the service"),
                 });
             }
             connections::Holder::Group => {}
         }
+        let mut running = self.lock();
+        let Some(r) = running.get_mut(environment_id) else {
+            return Ok(Probe::NotRunning);
+        };
         match http_status(r.port) {
             None => Ok(Probe::Starting {
                 step: "boot".to_owned(),
