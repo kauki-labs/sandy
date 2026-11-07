@@ -16,6 +16,7 @@ use std::{
 use base64::{Engine, engine::general_purpose::STANDARD};
 use hyper::StatusCode;
 use serde_json::json;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
     Client,
@@ -30,7 +31,11 @@ const MAX_READ: usize = 256 * 1024;
 /// Tries to attach before the collector gives up on a job.
 const JOIN_ATTEMPTS: u32 = 5;
 /// Wait between attach tries.
-const JOIN_BACKOFF: Duration = Duration::from_millis(200);
+///
+/// At least 10 s: sandyd mints a collector cap deterministically per second, so two caps for one
+/// job minted in the same second share a membership, and a retry must not share one with an
+/// attempt that half succeeded.
+const JOIN_BACKOFF: Duration = Duration::from_secs(10);
 
 /// How a job's collection ended.
 #[derive(Debug)]
@@ -83,18 +88,47 @@ pub(crate) struct Outputs {
     client_cap: usize,
     retention: Duration,
     jobs: Mutex<HashMap<String, Buf>>,
+    /// Collector slots: sandyd serves 256 attach connections at once, so the broker bounds the
+    /// ones its collectors hold, per client and in all. A job past the bound waits for a slot.
+    collectors_per_client: usize,
+    client_slots: Mutex<HashMap<String, Arc<Semaphore>>>,
+    total_slots: Arc<Semaphore>,
     collectors: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl Outputs {
-    pub(crate) fn new(job_cap: usize, total_cap: usize, clients: usize, retention: Duration) -> Self {
+    pub(crate) fn new(
+        job_cap: usize,
+        total_cap: usize,
+        clients: usize,
+        retention: Duration,
+        collectors: (usize, usize),
+    ) -> Self {
         Self {
+            collectors_per_client: collectors.0,
+            client_slots: Mutex::default(),
+            total_slots: Arc::new(Semaphore::new(collectors.1)),
             job_cap,
             client_cap: total_cap / clients.max(1),
             retention,
             jobs: Mutex::default(),
             collectors: Mutex::default(),
         }
+    }
+
+    /// Waits for a collector slot for `client`: one of its own, then one of the broker's. Both
+    /// free when the permits drop.
+    async fn collector_slot(&self, client: &str) -> Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)> {
+        let per_client = Arc::clone(
+            self.client_slots
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(client.to_owned())
+                .or_insert_with(|| Arc::new(Semaphore::new(self.collectors_per_client))),
+        );
+        let mine = per_client.acquire_owned().await.ok()?;
+        let all = Arc::clone(&self.total_slots).acquire_owned().await.ok()?;
+        Some((mine, all))
     }
 
     /// Keeps `collector` so [`Outputs::abort_collectors`] can stop it. Finished handles drop.
@@ -269,7 +303,14 @@ async fn terminal_state(state: &State, id: &str) -> Result<Option<String>, ()> {
 /// one, and two readers on one membership would split the messages), and is not counted as an
 /// attach: it sends no `AttachStateChanged`, so a remote host never lifts the job's deadline for
 /// it.
-pub(crate) async fn collect(state: Arc<State>, id: String, token: Vec<u8>) {
+pub(crate) async fn collect(state: Arc<State>, id: String, token: Vec<u8>, client: String) {
+    // Past the bound the job waits here. sandyd replays the channel from the start on join, so a
+    // late collector still gets the whole output while the channel is retained; if the channel
+    // is gone by then, `attach` fails and the buffer ends with a fault.
+    let Some(_slot) = state.outputs.collector_slot(&client).await else {
+        state.outputs.finish(&id, None, Some("collector could not start"));
+        return;
+    };
     match run(&state, &id, &token).await {
         Ok(job_state) => state.outputs.finish(&id, Some(job_state), None),
         Err(fault) => {
@@ -312,12 +353,9 @@ async fn run(state: &State, id: &str, token: &[u8]) -> Result<String, &'static s
                         state.outputs.append(id, &bytes);
                     }
                 }
-                Some(Ok(None)) | None => {
-                    return match terminal_state(state, id).await {
-                        Ok(Some(job_state)) => Ok(job_state),
-                        _ => Err("data plane closed while the job ran"),
-                    };
-                }
+                // sandyd closes a collector's connection only on a delivery fault, so EOF
+                // may have cost output.
+                Some(Ok(None)) | None => return Err("data plane closed"),
                 Some(Err(())) => return Err("data plane error"),
             },
             _ = tick.tick() => match terminal_state(state, id).await {
@@ -340,7 +378,8 @@ async fn drain(state: &State, id: &str, frames: &mut Frames, job_state: String) 
     let deadline = tokio::time::Instant::now() + DRAIN_CAP;
     loop {
         match tokio::time::timeout(QUIET, frames.recv()).await {
-            Err(_) | Ok(None | Some(Ok(None))) => return Ok(job_state),
+            Err(_) => return Ok(job_state),
+            Ok(None | Some(Ok(None))) => return Err("data plane closed"),
             Ok(Some(Err(()))) => return Err("data plane error"),
             Ok(Some(Ok(Some(frame)))) => {
                 if let Some(bytes) = output_bytes(frame) {
@@ -359,7 +398,7 @@ mod tests {
     use super::*;
 
     fn outputs(job_cap: usize, total_cap: usize, clients: usize) -> Outputs {
-        Outputs::new(job_cap, total_cap, clients, Duration::from_secs(60))
+        Outputs::new(job_cap, total_cap, clients, Duration::from_secs(60), (4, 4))
     }
 
     #[test]
@@ -401,7 +440,7 @@ mod tests {
 
     #[test]
     fn a_retention_that_overflows_the_clock_never_expires_and_never_panics() -> anyhow::Result<()> {
-        let o = Outputs::new(8, 100, 1, Duration::MAX);
+        let o = Outputs::new(8, 100, 1, Duration::MAX, (4, 4));
         o.register("a", "x");
         o.finish("a", None, None);
         assert!(o.read("a", 0, 8).context("kept")?.is_ok());

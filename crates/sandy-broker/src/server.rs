@@ -310,6 +310,7 @@ async fn submit(state: &Arc<State>, client: &Client, req: Request<Incoming>) -> 
         Arc::clone(state),
         done.job_id.clone(),
         done.attach_token.clone(),
+        client.id.clone(),
     )));
     Ok((StatusCode::ACCEPTED, json!({"job_id": done.job_id, "state": "pending"})))
 }

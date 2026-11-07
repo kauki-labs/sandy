@@ -257,6 +257,11 @@ pub(crate) async fn join(
     let control_response::Result::Attach(attach) = rpc(state, op).await? else {
         return Err(UNAVAILABLE);
     };
+    if collector && !is_collector_cap(&attach.cap) {
+        // An older sandyd ignores `collector` and answers with the submitter's cap.
+        tracing::warn!("sandyd did not return a collector cap; not joining");
+        return Err(UNAVAILABLE);
+    }
     let mut conn = UnixStream::connect(attach_socket_path(&state.control_socket))
         .await
         .map_err(|e| {
@@ -288,8 +293,9 @@ pub(crate) async fn join(
 
 /// Whether `cap` is the read-only collector cap. An older sandyd ignores `collector` and
 /// answers with a submitter's `operator` cap, which can post and shares a cursor.
-pub(crate) fn is_collector_cap(_cap: &[u8]) -> bool {
-    true
+pub(crate) fn is_collector_cap(cap: &[u8]) -> bool {
+    sandy_fabric::capauth::decode_cap(cap)
+        .is_ok_and(|cap| cap.scope().peer.0 == sandy_control_proto::COLLECTOR_PEER && !cap.scope().rights.post)
 }
 
 /// Aborts its task on drop, so a finished stream closes the data-plane read half.
@@ -494,7 +500,13 @@ mod tests {
             clients: Vec::new(),
             owners: crate::owners::Owners::open(&dir.join("state"))?,
             tickets: Tickets::new(Duration::from_secs(30)),
-            outputs: Arc::new(crate::output::Outputs::new(1024, 4096, 1, Duration::from_secs(60))),
+            outputs: Arc::new(crate::output::Outputs::new(
+                1024,
+                4096,
+                1,
+                Duration::from_secs(60),
+                (4, 4),
+            )),
             send_timeout: Duration::from_secs(30),
             env_create: HashMap::new(),
         })
@@ -508,7 +520,13 @@ mod tests {
             clients: Vec::new(),
             owners: crate::owners::Owners::open(&dir.join("state"))?,
             tickets: Tickets::new(Duration::from_secs(30)),
-            outputs: Arc::new(crate::output::Outputs::new(1024, 4096, 1, Duration::from_secs(60))),
+            outputs: Arc::new(crate::output::Outputs::new(
+                1024,
+                4096,
+                1,
+                Duration::from_secs(60),
+                (4, 4),
+            )),
             send_timeout: Duration::from_secs(30),
             env_create: HashMap::new(),
         })

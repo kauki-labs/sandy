@@ -376,8 +376,8 @@ async fn collectors_past_the_bound_wait_for_a_slot_then_deliver_the_output_they_
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert_eq!(
         (jobs[2].channel.member_count(), jobs[3].channel.member_count()),
-        (1, 1),
-        "collectors past the per-client bound must wait"
+        (2, 2),
+        "collectors past the per-client bound must wait (persister and agent are members, no collector)"
     );
 
     f.finish(&ids[0], JobStatus::Succeeded)?;

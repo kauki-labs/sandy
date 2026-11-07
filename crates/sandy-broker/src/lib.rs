@@ -235,6 +235,7 @@ pub async fn serve_with_tuning(config: BrokerConfig, tuning: Tuning) -> Result<R
         tuning.output_total_cap,
         config.clients.len(),
         tuning.output_retention,
+        (tuning.output_collectors_per_client, tuning.output_collectors_total),
     ));
     let state = Arc::new(server::State {
         owners: owners::Owners::open(&config.state_dir)?,
