@@ -44,6 +44,9 @@ pub enum EnvironmentStoreError {
     /// The store file could not be opened or tightened to `0600`.
     #[error("environment store: {0}")]
     File(#[from] StoreError),
+    /// A trusted-only store was asked to create for a submitter not cleared as `TRUSTED`.
+    #[error("environment store: the store serves trusted submitters only")]
+    UntrustedSubmitter,
     /// A stored `state` value is not one of [`EnvironmentState::as_str`]'s
     /// strings. A row this store wrote never holds anything else, so it is
     /// surfaced as an error on the one read that touches it, not defaulted.
@@ -451,8 +454,10 @@ impl EnvironmentStore {
     /// inserted; the caller mints it, so the store stays deterministic.
     ///
     /// # Errors
-    /// [`EnvironmentStoreError::Sqlite`] if a read or write faults, or
-    /// [`EnvironmentStoreError::CorruptState`] for a row it cannot read.
+    /// [`EnvironmentStoreError::Sqlite`] if a read or write faults,
+    /// [`EnvironmentStoreError::CorruptState`] for a row it cannot read, or
+    /// [`EnvironmentStoreError::UntrustedSubmitter`] when the store is trusted-only
+    /// (this entry point never marks a submitter trusted).
     pub fn create(
         &self,
         request_id: &str,
@@ -475,6 +480,10 @@ impl EnvironmentStore {
         spec_encoding: &str,
         trusted: bool,
     ) -> Result<CreateOutcome, EnvironmentStoreError> {
+        // Before the replay lookup, like the handler: no untrusted submitter reaches a row.
+        if self.trusted_submitter_required() && !trusted {
+            return Err(EnvironmentStoreError::UntrustedSubmitter);
+        }
         let mut conn = self.lock();
         // IMMEDIATE takes the write lock up front, so the lookup, the cap check
         // and the insert are one step even across processes sharing the file.

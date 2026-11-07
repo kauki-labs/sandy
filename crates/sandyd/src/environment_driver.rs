@@ -453,8 +453,9 @@ mod tests {
     #[test]
     fn a_trusted_only_driver_fails_a_row_that_was_not_created_by_a_trusted_submitter() -> Result<()> {
         let r = rig(FakeEnvironmentBackend::new())?;
-        r.store.require_trusted_submitter();
+        // The untrusted row predates the trusted-only backend, so the store accepts it.
         let untrusted = add(&r.store, 1)?;
+        r.store.require_trusted_submitter();
         let trusted = "env-2";
         r.store.create_for(
             "r2",
