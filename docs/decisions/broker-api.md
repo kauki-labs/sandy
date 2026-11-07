@@ -106,6 +106,7 @@ daemon user's files.
 ## 5. Deferred in this slice
 
 - `attach` is no longer deferred: decision 7 bridges it (#616).
+- Output retention across a broker restart, and in sandyd, is not built: decision 8 keeps output in broker memory only.
 - `link` returns `unsupported` until T3 offers an external link interface (#585 open point 1).
 - Rate limiting, quotas, and the audit trail are #596.
 - `SubmitJob` has no `request_id`. Job idempotency is a contract change and is not made here.
@@ -223,6 +224,47 @@ quota check, and a client could exceed the quota by one environment per distinct
 job attached and lifts the unlimited-while-attached policy (#340, `sandyd.md` decision 17) for as
 long as the stream is open, up to the client's four. Closing the stream restores it.
 
+## 8. Output is read by offset from a broker-held buffer (#643)
+
+**Context.** sandyd keeps no job output. Output reaches the broker only on the attach socket, and
+attach ends when the job does. A polling client (the `job_output` MCP tool) needs one request per
+call (`sandy-mcp`, `sandyd.md` decision 25) and needs output after exit. The owner chose a broker
+route over giving `sandy-mcp` a stream reader.
+
+**Decision.**
+
+- When the broker accepts a submit it starts one collector task for that job. The collector
+  makes the attach RPC and joins the attach socket like a stream does (decision 7), polls job
+  status once a second, and after a terminal status drains until the plane is quiet for 500 ms
+  (30 s at most). It appends each stdout or stderr chunk to the job's buffer.
+- The collector attaches **without** the attach token, so sandyd hands it the read-only observer
+  cap. A submitter attach mints one shared `operator` membership with one cursor; a collector on
+  it would take messages from a client's stream. The observer cap is a membership of its own.
+  The token also stays out of the task.
+- Buffer bounds: 1 MiB per job, the oldest bytes dropped; 16 MiB across jobs, the oldest
+  finished job evicted first. With no finished job to evict, the job that grew drops its oldest
+  bytes. Offsets stay absolute across drops.
+- `GET /v1/jobs/{id}/output?offset=N&limit=M` (bearer) answers `data` (base64), `offset`,
+  `next_offset`, `dropped`, `done`, and, when done, `state` and `fault`. `limit` defaults to
+  64 KiB and clamps to 1..256 KiB. Another client's job and an unknown job give one identical
+  `not_found`. An offset past the end, a repeated or unknown query key, or a non-integer value
+  gives `invalid_request`.
+- A finished job's buffer is readable for 15 minutes after collection ends
+  (`SANDY_BROKER_OUTPUT_RETENTION_SECS`, whole seconds), then `not_found`. Expired buffers are
+  swept on the next submit or read.
+- A collector that cannot attach (five tries), loses the data plane, or loses the status path
+  ends the buffer with a fixed `fault` text. Output may be missing; the route says so instead of
+  reporting a clean `done`.
+- Nothing is written to disk. A broker restart loses every buffer, and the route answers
+  `not_found` for jobs submitted before it. The OpenAPI text says this.
+
+**Side effect.** Every accepted job has a collector attached for its whole run. On a remote
+host that keeps the job attached and lifts the unlimited-while-attached policy (#340, `sandyd.md`
+decision 17) for all broker jobs, not only while a client holds a stream. Open for the owner: whether that
+is acceptable.
+
+**Set aside.** Persisting output to disk, and retention in sandyd. Both are separate work.
+
 ## Consequences
 
 - Every broker refusal is typed (`unauthenticated`, `forbidden`, `not_found`,
@@ -230,7 +272,7 @@ long as the stream is open, up to the client's four. Closing the stream restores
   `unsupported`, `unavailable`), so `sandy-mcp` passes them through unchanged. sandyd's own
   refusal text is never relayed: a `ControlError` becomes `unavailable`, an `EnvironmentError`
   code gets a fixed message.
-- A broker restart keeps job ownership, so the owner can still cancel.
+- A broker restart keeps job ownership, so the owner can still cancel. It loses retained output (decision 8).
 - The owner table is rewritten whole on each submit and each environment create, and never pruned. Pruning waits for #596.
 - A caller on another machine cannot reach the broker until the TLS follow-up lands.
 - sandyd cannot tell two HTTP clients apart. The broker is the only per-client boundary.
