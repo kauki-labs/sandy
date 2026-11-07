@@ -257,7 +257,7 @@ async fn every_tool_makes_exactly_one_api_request() -> Result<()> {
         .await
         .context("list")?;
     let tools = list["result"]["tools"].as_array().context("tools")?;
-    assert_eq!(tools.len(), 13);
+    assert_eq!(tools.len(), 14);
     for t in tools {
         let schema = &t["inputSchema"];
         let mut args = serde_json::Map::new();

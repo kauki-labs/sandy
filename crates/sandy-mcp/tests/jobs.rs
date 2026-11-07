@@ -91,7 +91,7 @@ async fn initialize_and_list_advertise_the_job_tools() -> Result<()> {
         .iter()
         .filter_map(|t| t["name"].as_str())
         .collect();
-    for n in ["submit", "status", "cancel", "list", "attach"] {
+    for n in ["submit", "status", "cancel", "list", "attach", "job_output"] {
         assert!(names.contains(&n), "missing tool {n}: {names:?}");
     }
     Ok(())
@@ -116,6 +116,7 @@ async fn each_job_tool_makes_exactly_one_api_request() -> Result<()> {
         ("GET", "/v1/jobs/j1", 200, job.clone()),
         ("POST", "/v1/jobs/j1/cancel", 200, job.clone()),
         ("POST", "/v1/jobs/j1/attach", 200, json!({"stream_url":"http://x/s"})),
+        ("GET", "/v1/jobs/j1/output?offset=7&limit=100", 200, output_page()),
     ])?;
     let server = Server::new(Api::new(&api.url, "cred"));
     let submit = json!({"manifest":"AA==","manifest_encoding":"m.v1",
@@ -126,6 +127,12 @@ async fn each_job_tool_makes_exactly_one_api_request() -> Result<()> {
         ("status", json!({"job_id":"j1"}), "GET", "/v1/jobs/j1"),
         ("cancel", json!({"job_id":"j1"}), "POST", "/v1/jobs/j1/cancel"),
         ("attach", json!({"job_id":"j1"}), "POST", "/v1/jobs/j1/attach"),
+        (
+            "job_output",
+            json!({"job_id":"j1","offset":7,"limit":100}),
+            "GET",
+            "/v1/jobs/j1/output?offset=7&limit=100",
+        ),
     ];
     for (i, (tool, args, method, path)) in cases.iter().enumerate() {
         let resp = call(&server, tool, args.clone()).await?;
@@ -136,6 +143,37 @@ async fn each_job_tool_makes_exactly_one_api_request() -> Result<()> {
         assert_eq!((last.method.as_str(), last.path.as_str()), (*method, *path));
         assert_eq!(last.auth.as_deref(), Some("Bearer cred"));
     }
+    Ok(())
+}
+
+fn output_page() -> Value {
+    json!({"data":"aGk=","offset":7,"next_offset":9,"dropped":0,"done":false})
+}
+
+#[tokio::test]
+async fn job_output_sends_the_callers_offset_and_nothing_else_and_returns_the_page() -> Result<()> {
+    let api = fake_api(vec![
+        ("GET", "/v1/jobs/j1/output", 200, output_page()),
+        ("GET", "/v1/jobs/j1/output?offset=0", 200, output_page()),
+    ])?;
+    let server = Server::new(Api::new(&api.url, "c"));
+    let resp = call(&server, "job_output", json!({"job_id":"j1"})).await?;
+    assert_eq!(text(&resp)?, output_page());
+    call(&server, "job_output", json!({"job_id":"j1","offset":0})).await?;
+    {
+        let seen = api.seen.lock().unwrap();
+        let paths: Vec<_> = seen.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths, ["/v1/jobs/j1/output", "/v1/jobs/j1/output?offset=0"]);
+        assert!(seen.iter().all(|r| r.body.is_empty()));
+    }
+    for bad in [
+        json!({"job_id":"j1","offset":-1}),
+        json!({"job_id":"j1","limit":0}),
+        json!({"job_id":"j1","offset":"3"}),
+    ] {
+        assert!(is_error(&call(&server, "job_output", bad).await?));
+    }
+    assert_eq!(api.seen.lock().unwrap().len(), 2, "a refused argument makes no request");
     Ok(())
 }
 
