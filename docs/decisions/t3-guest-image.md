@@ -16,11 +16,11 @@ the identity profile (#592).
 **Status:** accepted.
 
 **Context.** The base guest in `nix/guest` has no t3 and no harness, so a booted environment could do no work. Its
-nixpkgs pin carries t3code 0.0.44, which lacks `t3 pair --scope`. The owner exercised 0.1.2.
+nixpkgs pin carries t3code 0.0.44, which lacks `t3 pair --scope`. The owner exercised 0.1.2, which a delegator app refuses to link (it lacks `mcpModeLimitHeader` and `linkFence`); the pin is now 0.1.6.
 
 **Decision.** `nix/guest/flake.nix` adds two guests, `qemu-t3` and `vfkit-t3` (topologies, `nixosConfigurations` and
 `guest-runner-t3` packages), that add a `t3Module` to the base modules. t3 comes from a second input, `nixpkgs-t3`,
-pinned to the root flake's nixpkgs revision as of 2026-11-03, where it is 0.1.2. The pin does not follow later
+pinned to nixos-unstable as of 2026-11-05, where it is 0.1.6. The pin does not follow later
 root bumps (#631). Only that package uses the second pin, so the base
 guest's kernel, agent and topology do not change (the base `qemu` topology is byte-identical to `main`).
 
@@ -43,7 +43,7 @@ that t3's API or websocket is up. It refuses a port argument that is not digits 
 
 **Set aside.**
 
-- Bumping the base guest's nixpkgs to get 0.1.2: it moves the kernel and every live test's baseline for one package.
+- Bumping the base guest's nixpkgs to get 0.1.6: it moves the kernel and every live test's baseline for one package.
 - A server-only t3 build now: it means rebuilding upstream's bundle without electron, which is a separate item.
 
 ## Live evidence (2026-11-03, x86_64 KVM host, qemu, 2 GiB)

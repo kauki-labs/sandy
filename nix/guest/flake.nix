@@ -6,10 +6,10 @@
     microvm.url = "github:microvm-nix/microvm.nix";
     microvm.inputs.nixpkgs.follows = "nixpkgs";
     # The t3 server and its harnesses (#608) come from their own pin so the base guest (kernel, agent) does not
-    # move with it. This is the root flake's nixpkgs revision as of 2026-11-03, where t3code is 0.1.2, the version
-    # the owner exercised. It does not follow later root bumps (#631). Older pins carry 0.0.44, which lacks
-    # `t3 pair --scope`.
-    nixpkgs-t3.url = "github:NixOS/nixpkgs/31ecbaca1bdefa45dffc409f0250bd8039ea0010";
+    # move with it. This is nixos-unstable as of 2026-11-05, where t3code is 0.1.6. A delegator app (0.1.7) links
+    # an environment only when its server reports `mcpModeLimitHeader` and `linkFence`; 0.1.2 reports neither.
+    # It does not follow later root bumps (#631). Older pins carry 0.0.44, which lacks `t3 pair --scope`.
+    nixpkgs-t3.url = "github:NixOS/nixpkgs/f9a75f41be3a74eab55d3a7679d34ad6cc0da977";
   };
 
   outputs =
@@ -249,7 +249,7 @@
           config = self.nixosConfigurations.sandy-guest-qemu-t3.config;
           names = map (p: p.name) config.environment.systemPackages;
           wanted = [
-            "t3code-0.1.2"
+            "t3code-0.1.6"
             "sandy-t3-ready"
           ];
           missing = builtins.filter (w: !(builtins.elem w names)) wanted;
