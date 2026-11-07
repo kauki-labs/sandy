@@ -329,6 +329,33 @@ async fn serve_one_attach(
         return;
     };
 
+    // The broker's output collector (#643) joins with its own read-only cap and holds the join
+    // for the job's whole run. It is not an attach: it is not counted, sends no
+    // `AttachStateChanged`, and so never lifts the job's deadline on a remote host. Its
+    // membership is its own, so no other reader's leave touches its cursor. The claimed peer
+    // only picks this path; `Channel::join` still verifies the cap, and `Attach` mints this cap
+    // only for a caller holding the attach token.
+    if cap.scope().peer.0 == dispatch::COLLECTOR_PEER {
+        let membership = match job.channel.join(&cap) {
+            Ok(membership) => membership,
+            Err(e) => {
+                refuse(e.to_string()).await;
+                return;
+            }
+        };
+        if write_frame(&mut *write_half.lock().await, &LinkFrame::Joined { channel: None })
+            .await
+            .is_err()
+        {
+            job.channel.leave(&membership);
+            return;
+        }
+        if let Err(e) = relay(Arc::clone(&job.channel), membership, &mut read_half, write_half, None).await {
+            tracing::warn!(error = %e, job_id, "collector relay faulted");
+        }
+        return;
+    }
+
     let (membership, count, seq) = match join_for_attach(&job, &cap) {
         Ok(joined) => joined,
         Err(e) => {

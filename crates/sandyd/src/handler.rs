@@ -859,7 +859,32 @@ pub async fn handle(
                 // operator instead of two independent ones. A different
                 // session still gets the existing observer-only cap minted
                 // at Submit.
-                let attach_cap = if is_submitter {
+                // The broker's output collector (#643) gets a read-only cap of its own, one
+                // that attach counting ignores. Only the token proves the submitter here: a
+                // matching session alone does not.
+                if attach.collector && !token_match {
+                    return Ok(ControlResponse {
+                        request_id: request.request_id,
+                        result: Some(control_response::Result::Error(ControlError {
+                            message: format!("job {}: a collector attach needs the attach token", attach.job_id),
+                        })),
+                    });
+                }
+                let attach_cap = if attach.collector {
+                    registry
+                        .authority()
+                        .mint(CapScope {
+                            peer: PeerId::from(dispatch::COLLECTOR_PEER),
+                            channel: ChannelId::from(attach.job_id.as_str()),
+                            rights: CapRights {
+                                post: false,
+                                read: true,
+                                invite: false,
+                            },
+                            expires_at: None,
+                        })
+                        .map_err(dispatch::DispatchError::Cap)?
+                } else if is_submitter {
                     registry
                         .authority()
                         .mint(CapScope {
