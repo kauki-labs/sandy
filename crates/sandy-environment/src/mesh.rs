@@ -672,6 +672,10 @@ mod tests {
         delete_error: Option<String>,
         expire_error: Option<String>,
         after_ready_fails: bool,
+        after_ready_panics: bool,
+        after_ready_hangs: bool,
+        before_teardown_panics: bool,
+        before_teardown_hangs: bool,
         before_teardown_fails: bool,
         logout: Logout,
         logout_error: Option<String>,
@@ -865,6 +869,14 @@ mod tests {
     impl GuestHooks for World {
         async fn after_ready(&self, _name: &str) -> Result<(), SeamError> {
             self.push("after_ready");
+            let (panics, hangs) = {
+                let s = self.st();
+                (s.after_ready_panics, s.after_ready_hangs)
+            };
+            assert!(!panics, "after_ready exploded");
+            if hangs {
+                std::future::pending::<()>().await;
+            }
             if self.st().after_ready_fails {
                 return Err(SeamError::new("after_ready refused"));
             }
@@ -873,6 +885,14 @@ mod tests {
 
         async fn before_teardown(&self, _name: &str) -> Result<(), SeamError> {
             self.push("before_teardown");
+            let (panics, hangs) = {
+                let s = self.st();
+                (s.before_teardown_panics, s.before_teardown_hangs)
+            };
+            assert!(!panics, "before_teardown exploded");
+            if hangs {
+                std::future::pending::<()>().await;
+            }
             if self.st().before_teardown_fails {
                 return Err(SeamError::new("before_teardown refused"));
             }
@@ -1368,10 +1388,17 @@ mod tests {
     #[tokio::test]
     async fn a_failed_before_teardown_fails_teardown_after_the_rest_ran_but_logout_does_not() -> Result<()> {
         let w = World::online();
+        w.slot.set(JoinKey::new("hskey-auth-abc1"));
         w.st().before_teardown_fails = true;
         let r = run_teardown(&w, T).await;
         assert!(matches!(r, Err(TeardownError::HookFailed { .. })), "{r:?}");
-        for step in ["tailscale_logout", "stop_vm", "delete_node", "remove_secrets"] {
+        for step in [
+            "tailscale_logout",
+            "stop_vm",
+            "expire_key",
+            "delete_node",
+            "remove_secrets",
+        ] {
             assert!(w.ran(step), "{step} must still run");
         }
 
@@ -1389,6 +1416,100 @@ mod tests {
             run_teardown(&w, T).await.is_err(),
             "a failing best-effort step must not mask a real failure"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_panicking_hook_is_contained_in_setup_and_teardown() -> Result<()> {
+        let w = World::online();
+        w.st().after_ready_panics = true;
+        let Err(e) = run_setup(&w).await else {
+            bail!("a panicking after_ready must fail setup");
+        };
+        assert_eq!(e.step, SetupStep::AfterReady);
+        assert!(e.key_burned);
+        assert_eq!(w.st().expired, ["hskey-auth-abc1"]);
+
+        let w = World::online();
+        w.slot.set(JoinKey::new("hskey-auth-abc1"));
+        w.st().before_teardown_panics = true;
+        let r = run_teardown(&w, T).await;
+        assert!(matches!(r, Err(TeardownError::HookFailed { .. })), "{r:?}");
+        for step in [
+            "tailscale_logout",
+            "stop_vm",
+            "expire_key",
+            "delete_node",
+            "remove_secrets",
+        ] {
+            assert!(w.ran(step), "{step} must still run");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_hung_hook_times_out_into_a_typed_error() -> Result<()> {
+        let w = World::online();
+        w.st().after_ready_hangs = true;
+        let cfg = SetupConfig {
+            call_timeout: SHORT,
+            ..CFG
+        };
+        let r = tokio::time::timeout(Duration::from_secs(10), run_with(&w, &cfg))
+            .await
+            .context("after_ready was not bounded")?;
+        let Err(e) = r else { bail!("must fail") };
+        assert_eq!(e.step, SetupStep::AfterReady);
+        assert_eq!(w.st().expired, ["hskey-auth-abc1"]);
+
+        let w = World::online();
+        w.slot.set(JoinKey::new("hskey-auth-abc1"));
+        w.st().before_teardown_hangs = true;
+        let r = tokio::time::timeout(Duration::from_secs(10), run_teardown(&w, SHORT))
+            .await
+            .context("before_teardown was not bounded")?;
+        assert!(matches!(r, Err(TeardownError::HookFailed { .. })), "{r:?}");
+        assert!(w.ran("delete_node"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn after_ready_is_skipped_when_the_service_never_answers() -> Result<()> {
+        let w = World::online();
+        w.st().service_down = true;
+        let Err(e) = run_setup(&w).await else {
+            bail!("must fail");
+        };
+        assert_eq!(e.step, SetupStep::ServiceReady);
+        assert!(!w.ran("after_ready"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn teardown_after_an_after_ready_failure_leaves_nothing_behind() -> Result<()> {
+        let w = World::online();
+        w.st().after_ready_fails = true;
+        let Err(e) = run_setup(&w).await else {
+            bail!("must fail");
+        };
+        assert_eq!(e.step, SetupStep::AfterReady);
+        run_teardown(&w, T).await.context("teardown")?;
+        w.settle();
+        let s = w.st();
+        assert!(!s.vm_running && !s.registered);
+        assert_eq!(s.deleted, [NAME]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_exact_key_is_scrubbed_whatever_its_case() -> Result<()> {
+        let w = World::online();
+        w.st().mint_value = Some("PlainSecret99".into());
+        w.st().boot_error = Some("dial with plainsecret99 failed".into());
+        let Err(e) = run_setup(&w).await else {
+            bail!("must fail");
+        };
+        assert!(!e.to_string().to_lowercase().contains("plainsecret99"), "{e}");
         Ok(())
     }
 
