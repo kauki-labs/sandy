@@ -1,9 +1,8 @@
 //! The mesh-join setup and teardown sequencer for one environment (#671, slice 1).
 //!
 //! Pure ordering logic over seams: a coordination server (headscale), the guest
-//! secrets directory, the VM boot, the service readiness check and the delegator
-//! link. It runs no network call itself, so the whole sequence is tier-2 testable
-//! over fakes. Every seam call is bounded by a timeout.
+//! secrets directory, the VM boot, the service readiness check and guest hooks. It runs no network call itself, so the
+//! whole sequence is tier-2 testable over fakes. Every seam call is bounded by a timeout.
 //!
 //! A join key is a credential. [`JoinKey`] never prints its value, and every
 //! string this module returns or logs passes through the exact-key replace plus
@@ -151,18 +150,30 @@ pub trait ServiceReady: Send + Sync {
     fn ready(&self, name: &str) -> impl Future<Output = Result<bool, SeamError>> + Send;
 }
 
-/// The delegator link (`t3 environment link`).
-pub trait Linker: Send + Sync {
-    /// Link node `name` with `access`.
-    fn link(&self, name: &str, access: LinkAccess) -> impl Future<Output = Result<(), SeamError>> + Send;
+/// Deployment-specific steps around the generic sequence. Sandy does not know
+/// what they do: an example guest or a deployment step supplies them. Both
+/// default to a no-op.
+pub trait GuestHooks: Send + Sync {
+    /// Runs after the service answers. A failure fails setup (the key is expired).
+    fn after_ready(&self, name: &str) -> impl Future<Output = Result<(), SeamError>> + Send {
+        let _ = name;
+        async { Ok(()) }
+    }
+    /// Runs first in teardown. A failure fails teardown after the rest ran.
+    fn before_teardown(&self, name: &str) -> impl Future<Output = Result<(), SeamError>> + Send {
+        let _ = name;
+        async { Ok(()) }
+    }
 }
 
-/// Steps teardown runs before the key expiry and node delete.
+/// The hooks that do nothing.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoHooks;
+
+impl GuestHooks for NoHooks {}
+
+/// The mesh step teardown runs in the guest.
 pub trait TeardownSteps: Send + Sync {
-    /// Unlink the delegator link. A failure fails teardown after the rest runs.
-    fn unlink(&self) -> impl Future<Output = Result<(), SeamError>> + Send;
-    /// Revoke the environment's sessions. A failure fails teardown after the rest runs.
-    fn revoke_sessions(&self) -> impl Future<Output = Result<(), SeamError>> + Send;
     /// `tailscale logout` in the guest. Best effort: a failure only logs.
     fn tailscale_logout(&self) -> impl Future<Output = Result<(), SeamError>> + Send;
 }
@@ -225,52 +236,6 @@ impl<S: FileSink> GuestDelivery for SecretsDir<S> {
     }
 }
 
-/// Access mode of the delegator link (`t3 environment link --access`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LinkAccess {
-    /// `read-only`.
-    ReadOnly,
-    /// `approval-required`, the CLI default.
-    ApprovalRequired,
-    /// `auto-accept-edits`.
-    AutoAccept,
-    /// `auto`.
-    Auto,
-    /// `full-access`, the only mode a sandbox VM accepts.
-    FullAccess,
-}
-
-impl fmt::Display for LinkAccess {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::ReadOnly => "read-only",
-            Self::ApprovalRequired => "approval-required",
-            Self::AutoAccept => "auto-accept-edits",
-            Self::Auto => "auto",
-            Self::FullAccess => "full-access",
-        })
-    }
-}
-
-/// The mode the sequencer's link step uses.
-pub const LINK_ACCESS: LinkAccess = LinkAccess::FullAccess;
-
-/// A link made with a lower mode than the VM needs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("runtime_mode_escalation_denied: link access {0} is lower than full-access")]
-pub struct LinkModeError(pub LinkAccess);
-
-/// Reject a link mode lower than full access, at link time.
-///
-/// # Errors
-/// [`LinkModeError`] for any mode but [`LinkAccess::FullAccess`].
-pub fn check_link_access(access: LinkAccess) -> Result<(), LinkModeError> {
-    if access == LinkAccess::FullAccess {
-        return Ok(());
-    }
-    Err(LinkModeError(access))
-}
-
 /// Caller-owned home of the join key. [`setup`] fills it right after the mint,
 /// before any further await, so a dropped setup future still leaves the key
 /// where [`teardown`] finds it.
@@ -308,8 +273,6 @@ pub struct SetupConfig<'a> {
     pub poll_interval: Duration,
     /// Bound on every seam call. Must be non-zero.
     pub call_timeout: Duration,
-    /// Mode of the delegator link; [`LINK_ACCESS`] unless a test says otherwise.
-    pub link_access: LinkAccess,
 }
 
 /// A setup step, named in a failure.
@@ -329,8 +292,8 @@ pub enum SetupStep {
     JoinOnline,
     /// Waiting for the service to answer.
     ServiceReady,
-    /// Linking the delegator.
-    Link,
+    /// Running the `after_ready` hook.
+    AfterReady,
 }
 
 impl fmt::Display for SetupStep {
@@ -343,7 +306,7 @@ impl fmt::Display for SetupStep {
             Self::Deliver => "deliver",
             Self::JoinOnline => "join_online",
             Self::ServiceReady => "service_ready",
-            Self::Link => "link",
+            Self::AfterReady => "after_ready",
         })
     }
 }
@@ -400,7 +363,7 @@ async fn bounded<T>(limit: Duration, call: impl Future<Output = Result<T, SeamEr
 }
 
 /// Run setup for the node `name`: prepare, mint key, boot, deliver, node
-/// online, service ready, link. Choose `name` with [`sandbox_name`].
+/// online, service ready, `after_ready` hook. Choose `name` with [`sandbox_name`].
 ///
 /// The minted key goes into `slot` before anything else awaits. A caller that
 /// drops this future must run [`teardown`] with the same `name` and `slot`:
@@ -418,12 +381,12 @@ async fn bounded<T>(limit: Duration, call: impl Future<Output = Result<T, SeamEr
     clippy::too_many_arguments,
     reason = "one parameter per seam plus name, slot and config"
 )]
-pub async fn setup<C, G, B, S, L>(
+pub async fn setup<C, G, B, S, H>(
     coord: &C,
     guest: &G,
     vm: &B,
     service: &S,
-    linker: &L,
+    hooks: &H,
     name: &str,
     slot: &KeySlot,
     cfg: &SetupConfig<'_>,
@@ -433,7 +396,7 @@ where
     G: GuestDelivery,
     B: VmBoot,
     S: ServiceReady,
-    L: Linker,
+    H: GuestHooks,
 {
     let t = cfg.call_timeout;
     let err = |step, key: Option<&JoinKey>, burned, reason: &str| SetupError {
@@ -456,7 +419,7 @@ where
         .await
         .map_err(|e| err(SetupStep::MintKey, None, false, &e.to_string()))?;
     slot.set(key.clone());
-    if let Err((step, e)) = join(coord, guest, vm, service, linker, name, &key, cfg).await {
+    if let Err((step, e)) = join(coord, guest, vm, service, hooks, name, &key, cfg).await {
         let mut reason = e.to_string();
         let burned = match bounded(t, coord.expire_key(&key)).await {
             Ok(()) => true,
@@ -474,12 +437,12 @@ where
 }
 
 #[allow(clippy::too_many_arguments, reason = "internal step runner over the seams")]
-async fn join<C, G, B, S, L>(
+async fn join<C, G, B, S, H>(
     coord: &C,
     guest: &G,
     vm: &B,
     service: &S,
-    linker: &L,
+    hooks: &H,
     name: &str,
     key: &JoinKey,
     cfg: &SetupConfig<'_>,
@@ -489,7 +452,7 @@ where
     G: GuestDelivery,
     B: VmBoot,
     S: ServiceReady,
-    L: Linker,
+    H: GuestHooks,
 {
     let t = cfg.call_timeout;
     bounded(t, vm.boot(name)).await.map_err(|e| (SetupStep::Boot, e))?;
@@ -519,10 +482,8 @@ where
             )),
         ));
     }
-    check_link_access(cfg.link_access).map_err(|e| (SetupStep::Link, SeamError::new(e.to_string())))?;
-    bounded(t, linker.link(name, cfg.link_access))
-        .await
-        .map_err(|e| (SetupStep::Link, e))
+    let _ = hooks;
+    Ok(())
 }
 
 fn last_error(last: Option<&SeamError>) -> String {
@@ -578,7 +539,7 @@ pub enum TeardownError {
         /// Scrubbed reason.
         reason: String,
     },
-    /// Everything was removed but unlink or session revocation failed.
+    /// Everything was removed but the `before_teardown` hook failed.
     #[error("node {name} deleted but a teardown step failed: {reason}")]
     HookFailed {
         /// The node name.
@@ -588,7 +549,7 @@ pub enum TeardownError {
     },
 }
 
-/// Run teardown: unlink, revoke sessions, tailscale logout, stop the VM, expire
+/// Run teardown: `before_teardown` hook, tailscale logout, stop the VM, expire
 /// the key in `slot`, delete the node, remove secrets. Every step runs whatever
 /// an earlier one did. The VM stops and the key expires before the node delete,
 /// so a guest still joining cannot register afterwards. Logout is best effort;
@@ -598,11 +559,12 @@ pub enum TeardownError {
 /// # Errors
 /// [`TeardownError`], never `Ok` while the node may exist, the VM may run or a
 /// key may be live.
-pub async fn teardown<C, G, B, T>(
+pub async fn teardown<C, G, B, T, H>(
     coord: &C,
     guest: &G,
     steps: &T,
     vm: &B,
+    hooks: &H,
     name: &str,
     slot: &KeySlot,
     call_timeout: Duration,
@@ -612,18 +574,14 @@ where
     G: GuestDelivery,
     B: VmBoot,
     T: TeardownSteps,
+    H: GuestHooks,
 {
     let t = call_timeout;
     let key = slot.get();
     let key = key.as_ref();
     let mut hook = Vec::new();
     let mut residue = Vec::new();
-    if let Err(e) = bounded(t, steps.unlink()).await {
-        hook.push(format!("unlink: {e}"));
-    }
-    if let Err(e) = bounded(t, steps.revoke_sessions()).await {
-        hook.push(format!("revoke sessions: {e}"));
-    }
+    let _ = hooks;
     if let Err(e) = bounded(t, steps.tailscale_logout()).await {
         tracing::warn!(error = %scrub(&e.to_string(), key), "tailscale logout failed, continuing");
     }
@@ -706,14 +664,12 @@ mod tests {
         secrets_fail: Option<String>,
         delete_error: Option<String>,
         expire_error: Option<String>,
-        unlink_fails: bool,
-        revoke_fails: bool,
+        after_ready_fails: bool,
+        before_teardown_fails: bool,
         logout: Logout,
         logout_error: Option<String>,
-        link_fails: bool,
         expired: Vec<String>,
         deleted: Vec<String>,
-        linked: Vec<(String, LinkAccess)>,
         seen_names: Vec<String>,
     }
 
@@ -899,35 +855,25 @@ mod tests {
         }
     }
 
-    impl Linker for World {
-        async fn link(&self, name: &str, access: LinkAccess) -> Result<(), SeamError> {
-            self.push("link");
-            let mut s = self.st();
-            s.linked.push((name.to_owned(), access));
-            if s.link_fails {
-                return Err(SeamError::new("link refused"));
+    impl GuestHooks for World {
+        async fn after_ready(&self, _name: &str) -> Result<(), SeamError> {
+            self.push("after_ready");
+            if self.st().after_ready_fails {
+                return Err(SeamError::new("after_ready refused"));
+            }
+            Ok(())
+        }
+
+        async fn before_teardown(&self, _name: &str) -> Result<(), SeamError> {
+            self.push("before_teardown");
+            if self.st().before_teardown_fails {
+                return Err(SeamError::new("before_teardown refused"));
             }
             Ok(())
         }
     }
 
     impl TeardownSteps for World {
-        async fn unlink(&self) -> Result<(), SeamError> {
-            self.push("unlink");
-            if self.st().unlink_fails {
-                return Err(SeamError::new("unlink refused"));
-            }
-            Ok(())
-        }
-
-        async fn revoke_sessions(&self) -> Result<(), SeamError> {
-            self.push("revoke_sessions");
-            if self.st().revoke_fails {
-                return Err(SeamError::new("revoke refused"));
-            }
-            Ok(())
-        }
-
         async fn tailscale_logout(&self) -> Result<(), SeamError> {
             self.push("tailscale_logout");
             let (mode, text) = {
@@ -975,12 +921,11 @@ mod tests {
     const T: Duration = Duration::from_secs(1);
     const SHORT: Duration = Duration::from_millis(20);
     const CFG: SetupConfig<'static> = SetupConfig {
-        tag: "tag:t3",
+        tag: "tag:mesh",
         key_ttl: Duration::from_secs(60),
         poll_attempts: 3,
         poll_interval: Duration::ZERO,
         call_timeout: T,
-        link_access: LINK_ACCESS,
     };
 
     async fn run_with(w: &World, cfg: &SetupConfig<'_>) -> Result<Provisioned, SetupError> {
@@ -992,7 +937,7 @@ mod tests {
     }
 
     async fn run_teardown(w: &World, limit: Duration) -> Result<(), TeardownError> {
-        teardown(w, &SecretsDir::new(w.clone()), w, w, NAME, &w.slot, limit).await
+        teardown(w, &SecretsDir::new(w.clone()), w, w, w, NAME, &w.slot, limit).await
     }
 
     #[test]
@@ -1018,10 +963,9 @@ mod tests {
                 "write .ready",
                 "node_online",
                 "service_ready",
-                "link",
+                "after_ready",
             ]
         );
-        assert_eq!(w.st().linked, [(NAME.to_owned(), LinkAccess::FullAccess)]);
         Ok(())
     }
 
@@ -1110,7 +1054,7 @@ mod tests {
             (SetupStep::Boot, |s| s.boot_error = Some("no kvm".into())),
             (SetupStep::Deliver, |s| s.write_fail = Some(HOSTNAME_FILE.into())),
             (SetupStep::ServiceReady, |s| s.service_down = true),
-            (SetupStep::Link, |s| s.link_fails = true),
+            (SetupStep::AfterReady, |s| s.after_ready_fails = true),
         ];
         for (step, knob) in cases {
             let w = World::online();
@@ -1364,8 +1308,7 @@ mod tests {
         assert_eq!(
             w.log(),
             [
-                "unlink",
-                "revoke_sessions",
+                "before_teardown",
                 "tailscale_logout",
                 "stop_vm",
                 "expire_key",
@@ -1416,21 +1359,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_unlink_or_revoke_fails_teardown_after_the_rest_ran_but_logout_does_not() -> Result<()> {
+    async fn a_failed_before_teardown_fails_teardown_after_the_rest_ran_but_logout_does_not() -> Result<()> {
         let w = World::online();
-        w.st().unlink_fails = true;
+        w.st().before_teardown_fails = true;
         let r = run_teardown(&w, T).await;
         assert!(matches!(r, Err(TeardownError::HookFailed { .. })), "{r:?}");
-        for step in ["revoke_sessions", "tailscale_logout", "delete_node", "remove_secrets"] {
+        for step in ["tailscale_logout", "stop_vm", "delete_node", "remove_secrets"] {
             assert!(w.ran(step), "{step} must still run");
         }
-
-        let w = World::online();
-        w.st().revoke_fails = true;
-        assert!(matches!(
-            run_teardown(&w, T).await,
-            Err(TeardownError::HookFailed { .. })
-        ));
 
         let w = World::online();
         w.st().logout = Logout::Fail;
@@ -1440,12 +1376,32 @@ mod tests {
         {
             let mut s = w.st();
             s.logout = Logout::Fail;
-            s.unlink_fails = true;
+            s.before_teardown_fails = true;
         }
         assert!(
             run_teardown(&w, T).await.is_err(),
             "a failing best-effort step must not mask a real failure"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_after_ready_hook_fails_setup_with_the_key_expired() -> Result<()> {
+        let w = World::online();
+        w.st().after_ready_fails = true;
+        let Err(e) = run_setup(&w).await else {
+            bail!("a failing hook must fail setup");
+        };
+        assert_eq!(e.step, SetupStep::AfterReady);
+        assert!(e.key_burned);
+        assert_eq!(w.st().expired, ["hskey-auth-abc1"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_default_hooks_do_nothing_and_succeed() -> Result<()> {
+        NoHooks.after_ready(NAME).await.context("after_ready")?;
+        NoHooks.before_teardown(NAME).await.context("before_teardown")?;
         Ok(())
     }
 
@@ -1478,43 +1434,5 @@ mod tests {
             assert!(w.log().is_empty());
         }
         Ok(())
-    }
-
-    #[tokio::test]
-    async fn setup_refuses_a_link_below_full_access_and_never_calls_the_linker() -> Result<()> {
-        let w = World::online();
-        let cfg = SetupConfig {
-            link_access: LinkAccess::ApprovalRequired,
-            ..CFG
-        };
-        let Err(e) = run_with(&w, &cfg).await else {
-            bail!("a lower link mode must fail setup");
-        };
-        assert_eq!(e.step, SetupStep::Link);
-        assert!(e.reason.contains("runtime_mode_escalation_denied"), "{}", e.reason);
-        assert!(e.reason.contains("approval-required"), "{}", e.reason);
-        assert!(w.st().linked.is_empty());
-        assert!(e.key_burned);
-        Ok(())
-    }
-
-    #[test]
-    fn a_link_below_full_access_is_denied_with_the_cli_spelling() {
-        assert_eq!(LINK_ACCESS, LinkAccess::FullAccess);
-        assert!(check_link_access(LinkAccess::FullAccess).is_ok());
-        for (lower, spelling) in [
-            (LinkAccess::ReadOnly, "read-only"),
-            (LinkAccess::ApprovalRequired, "approval-required"),
-            (LinkAccess::AutoAccept, "auto-accept-edits"),
-            (LinkAccess::Auto, "auto"),
-        ] {
-            let e = check_link_access(lower)
-                .err()
-                .map(|e| e.to_string())
-                .unwrap_or_default();
-            assert!(e.contains("runtime_mode_escalation_denied"), "{e}");
-            assert!(e.contains(&format!("link access {spelling} is")), "{e}");
-        }
-        assert_eq!(LinkAccess::FullAccess.to_string(), "full-access");
     }
 }
