@@ -24,7 +24,10 @@
 
 use std::{
     path::Path,
-    sync::{Mutex, PoisonError},
+    sync::{
+        Mutex, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -41,6 +44,9 @@ pub enum EnvironmentStoreError {
     /// The store file could not be opened or tightened to `0600`.
     #[error("environment store: {0}")]
     File(#[from] StoreError),
+    /// A trusted-only store was asked to create for a submitter not cleared as `TRUSTED`.
+    #[error("environment store: the store serves trusted submitters only")]
+    UntrustedSubmitter,
     /// A stored `state` value is not one of [`EnvironmentState::as_str`]'s
     /// strings. A row this store wrote never holds anything else, so it is
     /// surfaced as an error on the one read that touches it, not defaulted.
@@ -132,6 +138,9 @@ pub struct EnvironmentRecord {
     /// cleared by every state change. The idle-stop lease runs from here, or from
     /// `updated_at` when it is unset.
     pub last_activity_at: Option<i64>,
+    /// Whether the create came from a `TRUSTED` submitter. A row from before this
+    /// column, or from a create that did not say, is not trusted.
+    pub submitter_trusted: bool,
     /// Unix seconds at creation.
     pub created_at: i64,
     /// Unix seconds at the last state change.
@@ -234,6 +243,8 @@ pub struct EnvironmentStore {
     conn: Mutex<Connection>,
     /// The row cap `create` enforces; `None` is uncapped.
     max_rows: Option<usize>,
+    /// Set once a trusted-only backend runs: `create` then needs a `TRUSTED` submitter.
+    trusted_only: AtomicBool,
 }
 
 /// A raw `environments` row, read before its `state` string is validated.
@@ -248,12 +259,13 @@ struct RawRow {
     endpoint: Option<String>,
     launched_at: Option<i64>,
     last_activity_at: Option<i64>,
+    submitter_trusted: Option<i64>,
     created_at: i64,
     updated_at: i64,
 }
 
 const COLUMNS: &str = "environment_id, request_id, state, spec, spec_encoding, failure_step, failure_reason, \
-                       created_at, updated_at, endpoint, launched_at, last_activity_at";
+                       created_at, updated_at, endpoint, launched_at, last_activity_at, submitter_trusted";
 
 impl RawRow {
     fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
@@ -270,6 +282,7 @@ impl RawRow {
             endpoint: row.get(9)?,
             launched_at: row.get(10)?,
             last_activity_at: row.get(11)?,
+            submitter_trusted: row.get(12)?,
         })
     }
 
@@ -292,6 +305,7 @@ impl RawRow {
             endpoint: self.endpoint,
             launched_at: self.launched_at,
             last_activity_at: self.last_activity_at,
+            submitter_trusted: self.submitter_trusted == Some(1),
             created_at: self.created_at,
             updated_at: self.updated_at,
         })
@@ -350,7 +364,8 @@ impl EnvironmentStore {
                 updated_at      INTEGER NOT NULL,
                 endpoint        TEXT,
                 launched_at     INTEGER,
-                last_activity_at INTEGER
+                last_activity_at INTEGER,
+                submitter_trusted INTEGER
             )",
             (),
         )?;
@@ -359,6 +374,7 @@ impl EnvironmentStore {
             ("endpoint", "TEXT"),
             ("launched_at", "INTEGER"),
             ("last_activity_at", "INTEGER"),
+            ("submitter_trusted", "INTEGER"),
         ] {
             let present: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM pragma_table_info('environments') WHERE name = ?1)",
@@ -377,7 +393,19 @@ impl EnvironmentStore {
         Ok(Self {
             conn: Mutex::new(conn),
             max_rows: None,
+            trusted_only: AtomicBool::new(false),
         })
+    }
+
+    /// Refuse a create from any submitter not cleared as `TRUSTED`. Called when a
+    /// trusted-only backend (the process backend) starts; it is never switched off.
+    pub fn require_trusted_submitter(&self) {
+        self.trusted_only.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether [`EnvironmentStore::require_trusted_submitter`] was called.
+    pub fn trusted_submitter_required(&self) -> bool {
+        self.trusted_only.load(Ordering::Relaxed)
     }
 
     /// Cap the table at `max_rows` rows that are not `Deleted` (a `Failed` row
@@ -426,8 +454,10 @@ impl EnvironmentStore {
     /// inserted; the caller mints it, so the store stays deterministic.
     ///
     /// # Errors
-    /// [`EnvironmentStoreError::Sqlite`] if a read or write faults, or
-    /// [`EnvironmentStoreError::CorruptState`] for a row it cannot read.
+    /// [`EnvironmentStoreError::Sqlite`] if a read or write faults,
+    /// [`EnvironmentStoreError::CorruptState`] for a row it cannot read, or
+    /// [`EnvironmentStoreError::UntrustedSubmitter`] when the store is trusted-only
+    /// (this entry point never marks a submitter trusted).
     pub fn create(
         &self,
         request_id: &str,
@@ -435,6 +465,25 @@ impl EnvironmentStore {
         spec: &[u8],
         spec_encoding: &str,
     ) -> Result<CreateOutcome, EnvironmentStoreError> {
+        self.create_for(request_id, new_id, spec, spec_encoding, false)
+    }
+
+    /// [`EnvironmentStore::create`], recording whether the submitter was `TRUSTED`.
+    ///
+    /// # Errors
+    /// As [`EnvironmentStore::create`].
+    pub fn create_for(
+        &self,
+        request_id: &str,
+        new_id: &str,
+        spec: &[u8],
+        spec_encoding: &str,
+        trusted: bool,
+    ) -> Result<CreateOutcome, EnvironmentStoreError> {
+        // Before the replay lookup, like the handler: no untrusted submitter reaches a row.
+        if self.trusted_submitter_required() && !trusted {
+            return Err(EnvironmentStoreError::UntrustedSubmitter);
+        }
         let mut conn = self.lock();
         // IMMEDIATE takes the write lock up front, so the lookup, the cap check
         // and the insert are one step even across processes sharing the file.
@@ -475,8 +524,9 @@ impl EnvironmentStore {
         let now = now_unix();
         tx.execute(
             "INSERT INTO environments
-                 (environment_id, request_id, state, spec, spec_encoding, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+                 (environment_id, request_id, state, spec, spec_encoding, created_at, updated_at,
+                  submitter_trusted)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7)",
             (
                 new_id,
                 request_id,
@@ -484,6 +534,7 @@ impl EnvironmentStore {
                 spec,
                 spec_encoding,
                 now,
+                i64::from(trusted),
             ),
         )?;
         let raw = tx.query_row(
@@ -1090,6 +1141,23 @@ mod tests {
     }
 
     #[test]
+    fn a_trusted_only_store_refuses_an_untrusted_create_and_keeps_no_row() -> Result<()> {
+        let s = store()?;
+        s.require_trusted_submitter();
+        assert!(s.create("r1", "env-1", SPEC, ENC).is_err(), "create must refuse");
+        assert!(
+            s.create_for("r1", "env-1", SPEC, ENC, false).is_err(),
+            "an untrusted create_for must refuse"
+        );
+        assert!(s.get_by_request_id("r1")?.is_none(), "a refused create leaves no row");
+        assert!(matches!(
+            s.create_for("r1", "env-1", SPEC, ENC, true)?,
+            CreateOutcome::Created(rec) if rec.submitter_trusted
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn a_table_from_before_the_endpoint_column_is_migrated() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("env.db");
@@ -1110,6 +1178,7 @@ mod tests {
             (old.state, old.endpoint, old.launched_at),
             (EnvironmentState::Ready, None, None)
         );
+        assert!(!old.submitter_trusted, "a row from before the column is not trusted");
         drop(s);
         // Opening the migrated file again is a no-op, not a duplicate-column error.
         assert!(EnvironmentStore::open(&path).is_ok());
