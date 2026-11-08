@@ -1,7 +1,7 @@
 //! [`FakeEnvironmentBackend`]: an in-memory [`EnvironmentBackend`] test double.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         Mutex, PoisonError,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -43,6 +43,7 @@ struct RunningBox {
 struct State {
     running: BTreeMap<String, RunningBox>,
     overrides: BTreeMap<String, Probe>,
+    active: BTreeSet<String>,
     launched: Vec<EnvironmentSpec>,
     killed: Vec<String>,
 }
@@ -146,6 +147,16 @@ impl FakeEnvironmentBackend {
         self.lock().overrides.insert(environment_id.to_owned(), result);
     }
 
+    /// Make [`EnvironmentBackend::active`] report `active` for box `environment_id`.
+    pub fn set_active(&self, environment_id: &str, active: bool) {
+        let mut state = self.lock();
+        if active {
+            state.active.insert(environment_id.to_owned());
+        } else {
+            state.active.remove(environment_id);
+        }
+    }
+
     /// While `failing`, [`EnvironmentBackend::kill`] fails with
     /// [`BackendError::Transport`] and leaves the box running.
     pub fn set_kill_failing(&self, failing: bool) {
@@ -232,6 +243,10 @@ impl EnvironmentBackend for FakeEnvironmentBackend {
                 reason: reason.clone(),
             },
         })
+    }
+
+    fn active(&self, environment_id: &str) -> Result<bool, BackendError> {
+        Ok(self.lock().active.contains(environment_id))
     }
 
     fn kill(&self, environment_id: &str) -> Result<(), BackendError> {

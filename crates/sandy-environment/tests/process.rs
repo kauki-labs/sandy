@@ -2,6 +2,7 @@
 //! processes (`fake-t3`, a stand-in for `t3 serve` and `t3 pair`).
 
 use std::{
+    io::Write,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -553,5 +554,82 @@ fn a_second_kill_removes_a_directory_the_first_could_not() -> Result<()> {
     std::fs::write(leftover.join("pairing"), "stale")?;
     b.kill("env-1")?;
     assert!(!leftover.exists(), "a retried kill must clear a leftover directory");
+    Ok(())
+}
+
+#[test]
+fn a_client_connected_to_the_service_makes_the_environment_active_until_it_disconnects() -> Result<()> {
+    let state = private_tempdir()?;
+    let b = backend(state.path(), &[])?;
+    b.launch(&spec("env-1"))?;
+    let Probe::Ready { endpoint } = wait_for(&b, "env-1", |p| matches!(p, Probe::Ready { .. }))? else {
+        bail!("not ready")
+    };
+    assert!(!b.active("env-1")?, "no client is connected yet");
+    let mut client = std::net::TcpStream::connect((endpoint.host.as_str(), endpoint.port))?;
+    client.write_all(b"HOLD")?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !b.active("env-1")? {
+        assert!(
+            Instant::now() < deadline,
+            "a connected client was never seen as activity"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    drop(client);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while b.active("env-1")? {
+        assert!(Instant::now() < deadline, "a closed connection still reads as activity");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!b.active("no-such-env")?, "an unknown environment is not active");
+    b.kill("env-1")?;
+    Ok(())
+}
+
+/// Another local process takes the port between `free_port` and the service's bind (#637): the service stays up
+/// without listening, and a stranger answers `200` on its port. That must not read as Ready.
+#[test]
+fn a_listener_that_is_not_the_service_never_reads_as_ready() -> Result<()> {
+    let state = private_tempdir()?;
+    let port_file = state.path().join("port.txt");
+    let b = backend(
+        state.path(),
+        &["--no-bind", "--port-file", port_file.to_str().context("utf8 path")?],
+    )?;
+    b.launch(&spec("env-1"))?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let port: u16 = loop {
+        if let Some(port) = std::fs::read_to_string(&port_file)
+            .ok()
+            .and_then(|t| t.trim().parse().ok())
+        {
+            break port;
+        }
+        if Instant::now() > deadline {
+            bail!("the service never reported its port");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    // This test process is not in the service's process group.
+    let squatter = std::net::TcpListener::bind(("127.0.0.1", port)).context("take the service's port")?;
+    std::thread::spawn(move || {
+        for stream in squatter.incoming().flatten() {
+            let mut stream = stream;
+            let mut buf = [0u8; 512];
+            let _ = std::io::Read::read(&mut stream, &mut buf);
+            let _ = std::io::Write::write_all(
+                &mut stream,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        }
+    });
+    let p = wait_for(&b, "env-1", |p| !matches!(p, Probe::Starting { .. }))?;
+    let Probe::Failed { step, reason } = p else {
+        bail!("a stranger's listener read as {p:?}")
+    };
+    assert_eq!(step, "port");
+    assert!(reason.contains(&port.to_string()), "name the port: {reason}");
+    b.kill("env-1")?;
     Ok(())
 }

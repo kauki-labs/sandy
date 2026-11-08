@@ -113,4 +113,18 @@ pub trait EnvironmentBackend {
     /// # Errors
     /// [`BackendError::Transport`] if the backend cannot list its boxes.
     fn boxes(&self) -> Result<Vec<BoxState>, BackendError>;
+
+    /// Whether a client uses the service of `environment_id` right now, for
+    /// example through an established connection to its endpoint. The driver
+    /// renews the idle-stop lease while this is true, so a client that connects
+    /// straight to the service (invisible to `sandyd`) keeps its box up. The
+    /// default is `false`: a backend that cannot tell leaves renewal to owner-visible
+    /// calls.
+    ///
+    /// # Errors
+    /// [`BackendError::Transport`] if the check could not run. The driver logs it and
+    /// treats the box as not active.
+    fn active(&self, _environment_id: &str) -> Result<bool, BackendError> {
+        Ok(false)
+    }
 }

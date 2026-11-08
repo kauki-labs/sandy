@@ -859,7 +859,32 @@ pub async fn handle(
                 // operator instead of two independent ones. A different
                 // session still gets the existing observer-only cap minted
                 // at Submit.
-                let attach_cap = if is_submitter {
+                // The broker's output collector (#643) gets a read-only cap of its own, one
+                // that attach counting ignores. Only the token proves the submitter here: a
+                // matching session alone does not.
+                if attach.collector && !token_match {
+                    return Ok(ControlResponse {
+                        request_id: request.request_id,
+                        result: Some(control_response::Result::Error(ControlError {
+                            message: format!("job {}: a collector attach needs the attach token", attach.job_id),
+                        })),
+                    });
+                }
+                let attach_cap = if attach.collector {
+                    registry
+                        .authority()
+                        .mint(CapScope {
+                            peer: PeerId::from(dispatch::COLLECTOR_PEER),
+                            channel: ChannelId::from(attach.job_id.as_str()),
+                            rights: CapRights {
+                                post: false,
+                                read: true,
+                                invite: false,
+                            },
+                            expires_at: None,
+                        })
+                        .map_err(dispatch::DispatchError::Cap)?
+                } else if is_submitter {
                     registry
                         .authority()
                         .mint(CapScope {
@@ -1226,6 +1251,7 @@ mod tests {
                 control_request::Op::Attach(AttachRequest {
                     job_id: job_id.clone(),
                     attach_token: None,
+                    collector: false,
                 }),
             ),
         )
@@ -1263,6 +1289,7 @@ mod tests {
                 control_request::Op::Attach(AttachRequest {
                     job_id,
                     attach_token: None,
+                    collector: false,
                 }),
             ),
         )
@@ -1310,6 +1337,7 @@ mod tests {
                 control_request::Op::Attach(AttachRequest {
                     job_id,
                     attach_token: None,
+                    collector: false,
                 }),
             ),
         )
@@ -1359,6 +1387,7 @@ mod tests {
                 control_request::Op::Attach(AttachRequest {
                     job_id,
                     attach_token: Some(attach_token),
+                    collector: false,
                 }),
             ),
         )
@@ -1401,6 +1430,7 @@ mod tests {
                 control_request::Op::Attach(AttachRequest {
                     job_id,
                     attach_token: Some(vec![0xAA; 32]),
+                    collector: false,
                 }),
             ),
         )
@@ -1436,6 +1466,7 @@ mod tests {
                 control_request::Op::Attach(AttachRequest {
                     job_id: "never-submitted".to_owned(),
                     attach_token: None,
+                    collector: false,
                 }),
             ),
         )
@@ -1470,6 +1501,7 @@ mod tests {
                 control_request::Op::Attach(AttachRequest {
                     job_id: "job-from-before-restart".to_owned(),
                     attach_token: None,
+                    collector: false,
                 }),
             ),
         )
@@ -1479,6 +1511,88 @@ mod tests {
                 assert!(message.contains("no live channel"), "got {message:?}");
             }
             other => anyhow::bail!("expected a refusal, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// Submits a job from `session` and returns its id and attach token.
+    async fn submit_with_token(
+        store: &Arc<crate::store::JobStore>,
+        registry: &Arc<JobRegistry>,
+        host_registry: &Arc<HostRegistry>,
+        session: Uuid,
+    ) -> anyhow::Result<(String, Vec<u8>)> {
+        let submitted = handle(store, registry, host_registry, None, session, submit_req(1)).await?;
+        match submitted.result {
+            Some(control_response::Result::Submit(SubmitResponse {
+                job_id, attach_token, ..
+            })) => Ok((job_id, attach_token)),
+            other => anyhow::bail!("expected a Submit response, got {other:?}"),
+        }
+    }
+
+    /// The broker's output collector (#643) asks for a cap of its own: read-only, a peer name no
+    /// client holds, so attach counting and cursors never mix with a client's.
+    #[tokio::test]
+    async fn a_collector_attach_with_the_token_gets_the_dedicated_read_only_cap() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let (job_id, token) = submit_with_token(&store, &registry, &host_registry, Uuid::new_v4()).await?;
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            None,
+            Uuid::new_v4(),
+            req(
+                2,
+                control_request::Op::Attach(AttachRequest {
+                    job_id,
+                    attach_token: Some(token),
+                    collector: true,
+                }),
+            ),
+        )
+        .await?;
+        match response.result {
+            Some(control_response::Result::Attach(AttachResponse { cap, .. })) => {
+                let decoded = decode_cap(&cap).context("the cap must decode")?;
+                assert_eq!(decoded.scope().peer.0, dispatch::COLLECTOR_PEER);
+                assert!(decoded.scope().rights.read && !decoded.scope().rights.post);
+            }
+            other => anyhow::bail!("expected an Attach response, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// The collector cap needs proof of the submitter: no token, a wrong token, or the session
+    /// alone is refused.
+    #[tokio::test]
+    async fn a_collector_attach_without_a_matching_token_is_refused() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let session = Uuid::new_v4();
+        let (job_id, _token) = submit_with_token(&store, &registry, &host_registry, session).await?;
+        for (session, token) in [(session, None), (Uuid::new_v4(), Some(b"wrong".to_vec()))] {
+            let response = handle(
+                &store,
+                &registry,
+                &host_registry,
+                None,
+                session,
+                req(
+                    2,
+                    control_request::Op::Attach(AttachRequest {
+                        job_id: job_id.clone(),
+                        attach_token: token,
+                        collector: true,
+                    }),
+                ),
+            )
+            .await?;
+            assert!(
+                matches!(response.result, Some(control_response::Result::Error(_))),
+                "got {:?}",
+                response.result
+            );
         }
         Ok(())
     }
@@ -1524,6 +1638,7 @@ mod tests {
                 control_request::Op::Attach(AttachRequest {
                     job_id: job_id.clone(),
                     attach_token: None,
+                    collector: false,
                 }),
             ),
         )

@@ -134,15 +134,33 @@ pub fn parse_topology(json: &[u8]) -> Result<Topology, BackendError> {
 /// `nix` invocation fails transiently, or [`BackendError::Protocol`] if the
 /// resulting JSON is not a complete topology.
 pub fn topology(source: &str) -> Result<Topology, BackendError> {
+    topology_until(source, || false).map(|resolved| resolved.expect("`|| false` never cancels"))
+}
+
+/// [`topology`] that gives up when `cancelled` turns true: a `nix eval` that is still running is killed and reaped,
+/// and the result is `Ok(None)`. A cold store makes the eval take minutes, and a `SIGTERM` to `sandy run` during it
+/// must not wait for it (#687). `cancelled` is polled about every 50 ms.
+///
+/// # Errors
+///
+/// As [`topology`].
+pub fn topology_until(source: &str, cancelled: impl Fn() -> bool) -> Result<Option<Topology>, BackendError> {
+    eval_until(&nix_bin(), source, &cancelled)
+}
+
+/// How often the eval's child is checked for exit and the run for a cancel.
+const EVAL_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+fn eval_until(nix: &str, source: &str, cancelled: &dyn Fn() -> bool) -> Result<Option<Topology>, BackendError> {
     if Path::new(source).is_file() {
         tracing::debug!(source, "reading prebuilt guest topology (Nix-free, #28)");
         let json = fs::read(source)
             .map_err(|e| BackendError::Transport(format!("failed to read topology file {source}: {e}")))?;
-        return parse_topology(&json);
+        return parse_topology(&json).map(Some);
     }
 
     tracing::debug!(source, "evaluating guest topology via `nix eval --json`");
-    let mut command = Command::new(nix_bin());
+    let mut command = Command::new(nix);
     command.args(["eval", "--json", source]);
     // nix's OWN internal `git+https://…` fetcher does its own PATH lookup
     // for `git`, a second one this call doesn't otherwise control — see
@@ -152,20 +170,63 @@ pub fn topology(source: &str) -> Result<Topology, BackendError> {
     if let Some(path) = nix_subprocess_path() {
         command.env("PATH", path);
     }
-    let output = command
-        .output()
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|e| BackendError::Transport(format!("failed to spawn `nix eval {source}`: {e}")))?;
+    // Readers keep a full pipe from blocking the child while it is polled.
+    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
+    );
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if cancelled() => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(None);
+            }
+            Ok(None) => std::thread::sleep(EVAL_POLL),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(BackendError::Transport(format!(
+                    "failed to wait for `nix eval {source}`: {e}"
+                )));
+            }
+        }
+    };
+    let stdout = stdout.join().unwrap_or_default();
+    let stderr = stderr.join().unwrap_or_default();
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    if !status.success() {
         return Err(BackendError::Transport(format!(
-            "`nix eval {source}` failed ({}): {}",
-            output.status,
-            stderr.trim()
+            "`nix eval {source}` failed ({status}): {}",
+            String::from_utf8_lossy(&stderr).trim()
         )));
     }
 
-    parse_topology(&output.stdout)
+    parse_topology(&stdout).map(Some)
 }
 
 /// `SANDY_NIX_BIN`, falling back to a bare `nix` (`PATH` lookup) — the same
@@ -208,6 +269,48 @@ fn nix_subprocess_path_with(git_bin: Option<&str>, ambient_path: Option<&str>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #687: a cancel while `nix eval` is still running kills it and returns at once, instead of waiting out the eval.
+    #[test]
+    fn a_cancel_during_the_eval_kills_it_and_returns_none() -> anyhow::Result<()> {
+        use std::{
+            os::unix::fs::PermissionsExt,
+            sync::atomic::{AtomicBool, Ordering},
+            time::{Duration, Instant},
+        };
+
+        let dir = tempfile::tempdir()?;
+        let marker = dir.path().join("started");
+        let stub = dir.path().join("nix");
+        std::fs::write(
+            &stub,
+            format!("#!/bin/sh\ntouch '{}'\nexec sleep 60\n", marker.display()),
+        )?;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))?;
+        let cancel = AtomicBool::new(false);
+        let started = Instant::now();
+        let resolved = std::thread::scope(|scope| {
+            let eval = scope.spawn(|| {
+                eval_until(stub.to_str().expect("utf8 path"), "flake#attr", &|| {
+                    cancel.load(Ordering::SeqCst)
+                })
+            });
+            // Cancel only once the stub is really running, so the cancel lands on the eval and not before it.
+            while !marker.exists() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            cancel.store(true, Ordering::SeqCst);
+            eval.join()
+        })
+        .map_err(|_| anyhow::anyhow!("eval thread panicked"))??;
+        assert!(resolved.is_none(), "a cancelled eval yields no topology");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the eval must not be waited out: {:?}",
+            started.elapsed()
+        );
+        Ok(())
+    }
 
     /// A complete microvm.nix topology JSON (x86_64, qemu, erofs store).
     const X86_64_FIXTURE: &[u8] = include_bytes!("../../tests/fixtures/topology-x86_64.json");

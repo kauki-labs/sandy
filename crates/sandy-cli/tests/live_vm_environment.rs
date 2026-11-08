@@ -38,7 +38,7 @@ use common::{guest_flake, require_live};
 const PROVISION_SECS: u64 = 900;
 
 /// Stops the daemon with SIGTERM first and SIGKILL as a fallback, then kills any qemu the test started, so a
-/// failure leaves no orphan (a killed daemon leaves its VM running, decision 32).
+/// failure leaves no orphan (a killed daemon leaves its VM running, decision 33).
 struct Daemon {
     child: Child,
     qemu_before: BTreeSet<u32>,
@@ -197,6 +197,7 @@ async fn a_vm_environment_becomes_ready_answers_http_and_leaves_nothing_after_de
                 }),
                 ..EnvironmentSpec::default()
             }),
+            ..CreateEnvironmentRequest::default()
         }),
     )
     .await?;

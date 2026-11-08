@@ -59,6 +59,15 @@ sentinels, captures the region between them, and parses a trailing `exit=<n>`.
 defaulted `0`, so a transport fault can never masquerade as a clean run (feeds
 the band-3 classification).
 
+**Guest setup (#670).** A guest module declares `sandy.setup.<name>` steps
+(`nix/lib/guest-setup.nix`). Each is a systemd oneshot ordered before
+`sandy-ready.target`; `serial-getty@` requires that target, so a failed step
+means no getty and no `SANDY-READY`. The marker is printed by the login shell,
+so the gate is the getty, not a unit. Steps run in the guest only, before the
+secrets are exported and the input links made, and count against the host's
+boot timeout; a failure shows as a boot timeout. Eval-checked only; not yet
+live-verified (kpi KSU1).
+
 ## 4. macOS needs a linux-builder
 
 **Status:** accepted.
@@ -203,7 +212,7 @@ to 4096 bytes in the agent and again in the relay.
 
 **Status:** accepted for qemu on Linux and vfkit on macOS (epic #597). `sandy run` calls the sweep before it
 launches, in the `run` command only: `ls`, `status`, `wait` and `kill` share `host_backend()` and must never sweep.
-`sandyd` calls the sweep once when it builds the `vm-qemu` or `vm-vfkit` environment backend (decisions 32 and 33 of
+`sandyd` calls the sweep once when it builds the `vm-qemu` or `vm-vfkit` environment backend (decisions 33 and 34 of
 `sandyd.md`).
 
 **Context.** A VM backend keeps its running boxes in memory. A `SIGKILL` of the host process (the `sandyd` daemon or
