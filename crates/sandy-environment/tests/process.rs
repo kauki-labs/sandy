@@ -172,12 +172,14 @@ fn an_unknown_or_killed_environment_is_not_running_and_kill_is_idempotent() -> R
 /// The counter in `beat` changes within `window`, once the writer has written at all.
 fn advances_within(beat: &Path, window: Duration) -> bool {
     let read = || std::fs::read_to_string(beat).unwrap_or_default();
-    // A freshly started writer may not have written yet, most of all on a loaded host.
+    // A freshly started writer may not have written yet, most of all on a loaded host. The
+    // writer truncates before it writes, so keep the first non-empty read rather than re-read.
     let deadline = Instant::now() + Duration::from_secs(3);
-    while read().is_empty() && Instant::now() < deadline {
+    let mut first = read();
+    while first.is_empty() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
+        first = read();
     }
-    let first = read();
     let deadline = Instant::now() + window;
     while !first.is_empty() && Instant::now() < deadline {
         if read() != first {
@@ -193,13 +195,14 @@ fn is_beating(beat: &Path) -> bool {
     advances_within(beat, Duration::from_secs(3))
 }
 
-/// The counter in `beat` stays put for a short window. A live writer ticks well inside it.
+/// The counter in `beat` stays put for a short window. A survivor starved past it slips through
+/// as a false pass, so pair this with an `is_beating` check before the event.
 fn has_stopped(beat: &Path) -> bool {
     !advances_within(beat, Duration::from_millis(250))
 }
 
 #[test]
-fn a_writer_starved_past_the_poll_window_still_reads_as_beating() -> Result<()> {
+fn a_writer_starved_past_one_tick_still_reads_as_beating() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let beat = dir.path().join("slow.beat");
     std::fs::write(&beat, "1")?;
