@@ -89,6 +89,16 @@ impl AuditLog {
         }
     }
 
+    #[allow(clippy::unused_self, reason = "red skeleton")]
+    fn record_using(
+        &self,
+        entry: &AuditEntry<'_>,
+        write: impl FnOnce(&mut File, &[u8]) -> std::io::Result<()>,
+    ) -> Result<(), AuditError> {
+        let _ = write;
+        self.record(entry)
+    }
+
     /// Append `entry` as one JSON line and sync it to disk.
     ///
     /// # Errors
@@ -117,6 +127,13 @@ impl AuditLog {
         }
         Ok(())
     }
+}
+
+/// Whether `a` and `b` name one file.
+#[must_use]
+pub fn same_file(a: &Path, b: &Path) -> bool {
+    let _ = (a, b);
+    false
 }
 
 fn writeln_json(file: &mut File, line: &serde_json::Value) -> std::io::Result<()> {
@@ -199,6 +216,76 @@ mod tests {
         let second = dir.path().join("b.jsonl");
         std::fs::hard_link(&first, &second)?;
         assert!(AuditLog::open(&second).is_err(), "a log with a second name is refused");
+        Ok(())
+    }
+
+    #[test]
+    fn a_log_that_ends_in_a_cut_off_line_is_refused_until_repaired() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("audit.jsonl");
+        std::fs::write(&path, "{\"at\":1}\n{\"at\"")?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        assert!(
+            AuditLog::open(&path).is_err(),
+            "a fragment at the end would swallow the next line"
+        );
+        std::fs::write(&path, "{\"at\":1}\n")?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        AuditLog::open(&path)?.record(&entry("env-1"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_write_that_fails_part_way_is_cut_back_and_the_next_line_parses() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("audit.jsonl");
+        let log = AuditLog::open(&path)?;
+        log.record(&entry("env-1"))?;
+        let before = std::fs::read_to_string(&path)?;
+        let failed = log.record_using(&entry("env-2"), |file, bytes| {
+            file.write_all(&bytes[..bytes.len() / 2])?;
+            Err(std::io::Error::other("disk full"))
+        });
+        assert!(failed.is_err());
+        assert_eq!(std::fs::read_to_string(&path)?, before, "the fragment is removed");
+        log.record(&entry("env-3"))?;
+        for line in std::fs::read_to_string(&path)?.lines() {
+            serde_json::from_str::<serde_json::Value>(line).context("every line parses")?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_log_whose_cut_back_fails_blocks_every_later_line() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("audit.jsonl");
+        std::fs::write(&path, "")?;
+        let log = AuditLog::from_file(path.clone(), std::fs::File::open(&path)?);
+        assert!(
+            log.record(&entry("env-1")).is_err(),
+            "a read-only file cannot be written"
+        );
+        let blocked = log
+            .record(&entry("env-2"))
+            .err()
+            .context("a later line must be refused")?;
+        assert!(blocked.to_string().contains("blocked"), "{blocked}");
+        Ok(())
+    }
+
+    #[test]
+    fn two_paths_to_one_file_are_the_same_file() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let a = dir.path().join("a");
+        std::fs::write(&a, "")?;
+        let b = dir.path().join("b");
+        std::fs::hard_link(&a, &b)?;
+        let c = dir.path().join("c");
+        std::fs::write(&c, "")?;
+        assert!(same_file(&a, &b));
+        assert!(!same_file(&a, &c));
+        assert!(!same_file(&a, &dir.path().join("missing")));
         Ok(())
     }
 }

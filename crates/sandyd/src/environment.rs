@@ -1685,8 +1685,16 @@ mod tests {
     async fn a_replayed_create_and_a_refused_one_write_no_audit_line() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let (s, path) = audited_store(dir.path())?;
-        call(&s, trusted_create("k1")).await?.ok();
-        call(&s, trusted_create("k1")).await?.ok();
+        let Ok(control_response::Result::Environment(first)) = call(&s, trusted_create("k1")).await? else {
+            bail!("create must succeed");
+        };
+        let Ok(control_response::Result::Environment(replay)) = call(&s, trusted_create("k1")).await? else {
+            bail!("the replay must succeed");
+        };
+        assert_eq!(
+            first.environment_id, replay.environment_id,
+            "a replay returns the same environment"
+        );
         let bad = control_request::Op::CreateEnvironment(CreateEnvironmentRequest {
             idempotency_key: "k2".to_owned(),
             spec: None,
@@ -1794,6 +1802,28 @@ mod tests {
             s.get(&row.environment_id)?.map(|r| r.state),
             Some(EnvironmentState::Provisioning)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_stop_of_a_provisioning_environment_is_audited_because_it_may_be_ready_by_the_time_it_applies()
+    -> Result<()> {
+        // The driver moves Provisioning to Ready on its own, between the handler's read and the
+        // store's transition. A stop read as Provisioning can therefore still apply.
+        let dir = tempfile::tempdir()?;
+        let (s, path) = audited_store(dir.path())?;
+        let Ok(control_response::Result::Environment(env)) = call(&s, trusted_create("k1")).await? else {
+            bail!("create must succeed");
+        };
+        assert_eq!(
+            refused(&s, stop(&env.environment_id)).await?,
+            EnvironmentErrorCode::InvalidState
+        );
+        let ops: Vec<_> = lines(&path)?
+            .iter()
+            .map(|e| e["operation"].as_str().unwrap_or("").to_owned())
+            .collect();
+        assert_eq!(ops, ["create", "stop"]);
         Ok(())
     }
 }
