@@ -37,12 +37,35 @@ use common::{guest_flake, require_live};
 /// A cold boot of the t3 guest plus its service; generous, and passed to the daemon as the provision timeout.
 const PROVISION_SECS: u64 = 900;
 
-struct Daemon(Child);
+/// Stops the daemon with SIGTERM first and SIGKILL as a fallback, then kills any qemu the test started, so a
+/// failure leaves no orphan (a killed daemon leaves its VM running, decision 33).
+struct Daemon {
+    child: Child,
+    qemu_before: BTreeSet<u32>,
+}
+
+fn signal(name: &str, pid: u32) {
+    let _ = Command::new("kill")
+        .arg(format!("-{name}"))
+        .arg(pid.to_string())
+        .status();
+}
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        signal("TERM", self.child.id());
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !matches!(self.child.try_wait(), Ok(Some(_))) {
+            if Instant::now() > deadline {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        for pid in qemu_pids().unwrap_or_default().difference(&self.qemu_before) {
+            signal("KILL", *pid);
+        }
     }
 }
 
@@ -141,8 +164,9 @@ async fn a_vm_environment_becomes_ready_answers_http_and_leaves_nothing_after_de
     let tmp_before = sandy_tmp_entries();
     let dir = tempfile::tempdir().context("temp dir")?;
     let sock = dir.path().join("sandyd.sock");
-    let _daemon = Daemon(
-        Command::new(sandyd_bin()?)
+    let _daemon = Daemon {
+        qemu_before: qemu_before.clone(),
+        child: Command::new(sandyd_bin()?)
             .env("SANDY_SOCK", &sock)
             .env("SANDY_DB", dir.path().join("sandyd.db"))
             .env("SANDY_ENV_BACKEND", "vm-qemu")
@@ -156,7 +180,7 @@ async fn a_vm_environment_becomes_ready_answers_http_and_leaves_nothing_after_de
             .stdout(Stdio::null())
             .spawn()
             .context("spawn sandyd")?,
-    );
+    };
     wait_for_socket(&sock)?;
     let mut stream = UnixStream::connect(&sock).await.context("connect to sandyd")?;
 
@@ -173,6 +197,7 @@ async fn a_vm_environment_becomes_ready_answers_http_and_leaves_nothing_after_de
                 }),
                 ..EnvironmentSpec::default()
             }),
+            ..CreateEnvironmentRequest::default()
         }),
     )
     .await?;
