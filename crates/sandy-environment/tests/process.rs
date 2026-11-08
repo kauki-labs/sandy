@@ -183,6 +183,26 @@ fn is_beating(beat: &Path) -> bool {
 }
 
 #[test]
+fn a_writer_starved_past_the_poll_window_still_reads_as_beating() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let beat = dir.path().join("slow.beat");
+    std::fs::write(&beat, "1")?;
+    let writer = {
+        let beat = beat.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(700));
+            std::fs::write(&beat, "2")
+        })
+    };
+    assert!(
+        is_beating(&beat),
+        "a live writer starved for 700 ms must still read as beating"
+    );
+    writer.join().ok().context("the writer thread panicked")??;
+    Ok(())
+}
+
+#[test]
 fn kill_ends_the_whole_process_group_including_children() -> Result<()> {
     let state = private_tempdir()?;
     let outside = tempfile::tempdir()?; // not removed by kill, so a live child can still write here
