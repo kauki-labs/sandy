@@ -26,7 +26,7 @@ use std::{
 
 use sandy::{
     BackendError, BoxState, Hypervisor, Outcome, RunSpec, ShareDirs, StoreBacking, Topology, VmBackend,
-    collect_outputs, ensure_sandy_staging_base, plan_shares, topology, wipe, with_digests,
+    collect_outputs, ensure_sandy_staging_base, plan_shares, topology_until, wipe, with_digests,
 };
 use sandy_api::{
     agent::{AGENT_VSOCK_PORT, AgentLaunch, PORT_RELAY_VSOCK_PORT},
@@ -555,7 +555,11 @@ impl VfkitBackend {
                 "this service-socket backend already ran its one job; build one per environment".to_string(),
             ));
         }
-        let topology = topology(spec.template)?;
+        // The eval can take minutes on a cold store: a cancel during it (SIGTERM to `sandy run`, #687) kills it and
+        // boots nothing.
+        let Some(topology) = topology_until(spec.template, || spec.control.is_cancelled())? else {
+            return Ok(crate::cancelled_before_boot());
+        };
         let run_id = Uuid::new_v4();
         let box_id = format!("inst-{run_id}");
         // Staging under the OS temp dir (works on macOS, where `/run` does not exist).

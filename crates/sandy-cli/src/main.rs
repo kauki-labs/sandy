@@ -1390,6 +1390,13 @@ fn dispatch_run(
             return ProcessExit::InvalidPlan.code();
         }
     }
+    // From here on the run owns a guest, a credential and an egress boundary: a termination signal must cancel the
+    // run so the teardown runs, not end the process with the default action (#687). Fail closed when the handlers
+    // cannot be installed.
+    if let Err(e) = sandy_cli::signals::cancel_on_termination(plan.control.clone()) {
+        eprintln!("sandy: cannot install the termination-signal handlers: {e}");
+        return ProcessExit::InfraFault.code();
+    }
     // The run seams come from the injected `profile` — the sandbox backend, the
     // egress applier (Linux enforces the nftables boundary, macOS has none), and the
     // credential source. The composition root selects the profile at the top

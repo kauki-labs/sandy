@@ -12,4 +12,4 @@
 
 mod topology;
 
-pub use topology::{Hypervisor, Share, StoreBacking, Topology, parse_topology, topology};
+pub use topology::{Hypervisor, Share, StoreBacking, Topology, parse_topology, topology, topology_until};

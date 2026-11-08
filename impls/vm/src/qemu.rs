@@ -28,7 +28,7 @@ use std::{
 
 use sandy::{
     BackendError, BoxState, Hypervisor, Outcome, RunSpec, ShareDirs, SharePlan, StoreBacking, Topology, VmBackend,
-    collect_outputs, ensure_sandy_staging_base, kill_children, plan_shares, topology as eval_topology, wipe,
+    collect_outputs, ensure_sandy_staging_base, kill_children, plan_shares, topology_until as eval_topology, wipe,
     with_digests,
 };
 // Only `spawn_vsock_connector` below (the sole user) is Linux-only
@@ -892,7 +892,11 @@ impl VmBackend for QemuBackend {
                     .to_string(),
             ));
         }
-        let topology = eval_topology(spec.template)?;
+        // The eval can take minutes on a cold store: a cancel during it (SIGTERM to `sandy run`, #687) kills it and
+        // boots nothing.
+        let Some(topology) = eval_topology(spec.template, || spec.control.is_cancelled())? else {
+            return Ok(crate::cancelled_before_boot());
+        };
         // Parsed and checked before any staging: a refused profile must not return past the shares' teardown wipe
         // (INV-1).
         let network = NetworkMode::from_env().map_err(BackendError::Spawn)?;

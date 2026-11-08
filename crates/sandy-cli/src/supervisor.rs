@@ -233,8 +233,19 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
     // the SAME platform-keyed outcome that drove the enforce/revert bracket below,
     // never a second, independently derived copy.
     let egress_receipt_result: Result<EgressOutcome, String>;
-    let (run_result, egress_warning): (Result<Outcome, BackendError>, Option<String>) = match enforce(&eplan, egress) {
-        Ok(eoutcome) => {
+    // A cancel that landed before the boot (a signal during mint or setup, #687) starts no guest and loads no egress
+    // rules: the run is cancelled and the caller's teardown still runs.
+    let enforced = if plan.control.is_cancelled() {
+        None
+    } else {
+        Some(enforce(&eplan, egress))
+    };
+    let (run_result, egress_warning): (Result<Outcome, BackendError>, Option<String>) = match enforced {
+        None => {
+            egress_receipt_result = Err("run cancelled before boot".to_owned());
+            (Err(BackendError::Spawn("run cancelled before boot".to_owned())), None)
+        }
+        Some(Ok(eoutcome)) => {
             let outcome = backend.run(&spec);
             // The proxy is the boundary, and the backend establishes it, so the receipt reads the run's result
             // rather than the plan's intent: a refusal before boot must not be recorded as enforced.
@@ -257,7 +268,7 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
             };
             (outcome, warning)
         }
-        Err(egress_error) => {
+        Some(Err(egress_error)) => {
             egress_receipt_result = Err(egress_error.to_string());
             tracing::warn!(%job_id, %egress_error, "egress apply failed; refusing to boot (fail-closed)");
             (
@@ -301,6 +312,22 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
             )
         }
     };
+    // A cancel (SIGTERM, SIGHUP or SIGINT to `sandy run`, #687) ends the run `cancelled`, band 1, whatever the
+    // backend made of it: the real backends treat it like a timeout or a refusal. A guest that already exited
+    // (clean or not) keeps its result: the signal only found the teardown.
+    let (classification, message) =
+        if plan.control.is_cancelled() && classification.status != Status::Succeeded && guest_exit.is_none() {
+            (
+                Classification {
+                    status: Status::Cancelled,
+                    retryable: false,
+                    process_exit: ProcessExit::TaskFailure,
+                },
+                format!("run cancelled ({message})"),
+            )
+        } else {
+            (classification, message)
+        };
     // Teardown completed the moment the backend returned and the egress boundary
     // (if enforced) was reverted, just above — captured here, before the console
     // redaction pass or the journal write, neither of which are part of the run

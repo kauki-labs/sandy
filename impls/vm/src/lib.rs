@@ -21,6 +21,20 @@ mod qemu;
 mod share;
 mod vfkit;
 
+/// What a run that was cancelled before its guest booted returns (#687): classified like any cancelled run (band 1,
+/// not retryable), not as a boot fault a platform would retry. `booted` is `true` only so the outcome classifies that
+/// way; no guest ran and the console is empty.
+fn cancelled_before_boot() -> sandy::Outcome {
+    sandy::Outcome {
+        digests: None,
+        booted: true,
+        guest_exit: None,
+        transport_error: None,
+        timed_out: true,
+        console: String::new(),
+    }
+}
+
 pub use console::{
     Markers, PipeTransport, Protocol, ProtocolStep, PtyTransport, ReadEvent, TimeoutPolicy, Transport, parse_exit,
     run_console,
