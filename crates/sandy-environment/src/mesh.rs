@@ -206,7 +206,7 @@ impl GuestHooks for NoHooks {}
 /// The mesh step teardown runs in the guest.
 pub trait TeardownSteps: Send + Sync {
     /// `tailscale logout` in the guest. Best effort: a failure only logs.
-    fn tailscale_logout(&self) -> impl Future<Output = Result<(), SeamError>> + Send;
+    fn tailscale_logout(&self, name: &str) -> impl Future<Output = Result<(), SeamError>> + Send;
 }
 
 /// File operations behind a [`SecretsDir`]. Removal is idempotent.
@@ -311,6 +311,8 @@ pub struct SetupConfig<'a> {
 pub enum SetupStep {
     /// Rejecting a bad [`SetupConfig`].
     Config,
+    /// Refusing a [`KeySlot`] that still holds a key.
+    SlotInUse,
     /// Preparing the secrets directory.
     Prepare,
     /// Minting the join key.
@@ -331,6 +333,7 @@ impl fmt::Display for SetupStep {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Config => "config",
+            Self::SlotInUse => "slot_in_use",
             Self::Prepare => "prepare",
             Self::MintKey => "mint_key",
             Self::Boot => "boot",
@@ -621,7 +624,7 @@ where
     if let Err(e) = bounded(t, contained(hooks.before_teardown(name))).await {
         hook.push(format!("before_teardown: {e}"));
     }
-    if let Err(e) = bounded(t, steps.tailscale_logout()).await {
+    if let Err(e) = bounded(t, steps.tailscale_logout(name)).await {
         tracing::warn!(error = %scrub(&e.to_string(), key), "tailscale logout failed, continuing");
     }
     let stop = bounded(t, vm.stop(name)).await;
@@ -709,6 +712,9 @@ mod tests {
         before_teardown_panics: bool,
         before_teardown_hangs: bool,
         before_teardown_fails: bool,
+        hook_needs_vm: bool,
+        mint_error: Option<String>,
+        ensure_fail: bool,
         logout: Logout,
         logout_error: Option<String>,
         expired: Vec<String>,
@@ -764,6 +770,9 @@ mod tests {
                 std::future::pending::<()>().await;
             }
             let mut s = self.st();
+            if let Some(e) = s.mint_error.clone() {
+                return Err(SeamError::new(e));
+            }
             s.minted += 1;
             let value = s
                 .mint_value
@@ -815,6 +824,9 @@ mod tests {
     impl FileSink for World {
         fn ensure_dir(&self) -> Result<(), SeamError> {
             self.push("ensure_dir");
+            if self.st().ensure_fail {
+                return Err(SeamError::new("cannot create dir"));
+            }
             Ok(())
         }
 
@@ -861,7 +873,7 @@ mod tests {
             let (err, hangs) = {
                 let mut s = self.st();
                 s.seen_names.push(format!("boot:{name}"));
-                s.vm_running = true;
+                s.vm_running = s.boot_error.is_none();
                 (s.boot_error.clone(), s.boot_hangs)
             };
             if hangs {
@@ -925,6 +937,9 @@ mod tests {
             if hangs {
                 std::future::pending::<()>().await;
             }
+            if self.st().hook_needs_vm && !self.st().vm_running {
+                return Err(SeamError::new("guest unreachable: the VM is down"));
+            }
             if self.st().before_teardown_fails {
                 return Err(SeamError::new("before_teardown refused"));
             }
@@ -933,10 +948,11 @@ mod tests {
     }
 
     impl TeardownSteps for World {
-        async fn tailscale_logout(&self) -> Result<(), SeamError> {
+        async fn tailscale_logout(&self, name: &str) -> Result<(), SeamError> {
             self.push("tailscale_logout");
             let (mode, text) = {
-                let s = self.st();
+                let mut s = self.st();
+                s.seen_names.push(format!("logout:{name}"));
                 (s.logout, s.logout_error.clone())
             };
             match mode {
@@ -1089,8 +1105,9 @@ mod tests {
         assert!(e.key_burned);
         assert!(matches!(EnvStatus::from(&e), EnvStatus::Failed { .. }));
         let first_key = w.st().written[0].1.clone();
-        assert_eq!(w.st().expired, [String::from_utf8(first_key.clone())?]);
+        assert_eq!(w.st().expired[0], String::from_utf8(first_key.clone())?);
 
+        run_teardown(&w, T).await.context("teardown between attempts")?;
         w.st().online = true;
         run_setup(&w).await.context("retry")?;
         let retry_key = w
@@ -1530,6 +1547,265 @@ mod tests {
         let s = w.st();
         assert!(!s.vm_running && !s.registered);
         assert_eq!(s.deleted, [NAME]);
+        Ok(())
+    }
+
+    /// A sink whose every operation blocks its thread.
+    struct WedgedSink(Duration);
+    impl FileSink for WedgedSink {
+        fn ensure_dir(&self) -> Result<(), SeamError> {
+            std::thread::sleep(self.0);
+            Ok(())
+        }
+
+        fn clear_dir(&self) -> Result<(), SeamError> {
+            std::thread::sleep(self.0);
+            Ok(())
+        }
+
+        fn write_file(&self, _name: &str, _bytes: &[u8]) -> Result<(), SeamError> {
+            std::thread::sleep(self.0);
+            Ok(())
+        }
+
+        fn remove_file(&self, _name: &str) -> Result<(), SeamError> {
+            std::thread::sleep(self.0);
+            Ok(())
+        }
+
+        fn remove_dir_all(&self) -> Result<(), SeamError> {
+            std::thread::sleep(self.0);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_wedged_file_operation_times_out_instead_of_blocking_the_runtime() -> Result<()> {
+        let dir = SecretsDir::new(WedgedSink(Duration::from_millis(600)));
+        let files: [(&str, &[u8]); 2] = [(KEY_FILE, b"k"), (HOSTNAME_FILE, b"n")];
+        let started = std::time::Instant::now();
+        let Err(e) = bounded(SHORT, dir.prepare()).await else {
+            bail!("prepare must time out");
+        };
+        assert!(e.to_string().contains("timed out"), "{e}");
+        let Err(e) = bounded(SHORT, dir.deliver(&files)).await else {
+            bail!("deliver must time out");
+        };
+        assert!(e.to_string().contains("timed out"), "{e}");
+        let Err(e) = bounded(SHORT, dir.remove_secrets()).await else {
+            bail!("remove_secrets must time out");
+        };
+        assert!(e.to_string().contains("timed out"), "{e}");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            started.elapsed()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_delivery_finishes_before_a_later_removal_starts() -> Result<()> {
+        let w = World::default();
+        let slow = Arc::new(Mutex::new(true));
+        struct SlowFirst(World, Arc<Mutex<bool>>);
+        impl FileSink for SlowFirst {
+            fn ensure_dir(&self) -> Result<(), SeamError> {
+                self.0.ensure_dir()
+            }
+
+            fn clear_dir(&self) -> Result<(), SeamError> {
+                self.0.clear_dir()
+            }
+
+            fn write_file(&self, name: &str, bytes: &[u8]) -> Result<(), SeamError> {
+                if std::mem::take(&mut *self.1.lock().unwrap_or_else(PoisonError::into_inner)) {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                self.0.write_file(name, bytes)
+            }
+
+            fn remove_file(&self, name: &str) -> Result<(), SeamError> {
+                self.0.remove_file(name)
+            }
+
+            fn remove_dir_all(&self) -> Result<(), SeamError> {
+                self.0.remove_dir_all()
+            }
+        }
+        let dir = SecretsDir::new(SlowFirst(w.clone(), slow));
+        let files: [(&str, &[u8]); 2] = [(KEY_FILE, b"k"), (HOSTNAME_FILE, b"n")];
+        let Err(_) = bounded(SHORT, dir.deliver(&files)).await else {
+            bail!("the slow delivery must time out");
+        };
+        dir.remove_secrets().await.context("removal")?;
+        assert!(
+            w.st().files.is_empty(),
+            "a straggling write must not outlive the removal"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn setup_refuses_a_slot_that_still_holds_a_key_and_mints_nothing() -> Result<()> {
+        let w = World::online();
+        run_setup(&w).await.context("first setup")?;
+        let before = w.log().len();
+        let Err(e) = run_setup(&w).await else {
+            bail!("a second setup without teardown must be refused");
+        };
+        assert_eq!(e.step, SetupStep::SlotInUse);
+        assert_eq!(w.st().minted, 1);
+        assert_eq!(w.log().len(), before, "a refused setup touches no seam");
+        assert!(w.slot.get().is_some(), "the first key stays in the slot");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_clean_teardown_empties_the_slot_so_the_node_name_can_be_set_up_again() -> Result<()> {
+        let w = World::online();
+        run_setup(&w).await.context("setup")?;
+        run_teardown(&w, T).await.context("teardown")?;
+        assert!(w.slot.get().is_none());
+        run_setup(&w).await.context("setup again")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_teardown_keeps_the_slot() -> Result<()> {
+        let w = World::online();
+        run_setup(&w).await.context("setup")?;
+        w.st().delete_error = Some("headscale 500".into());
+        assert!(run_teardown(&w, T).await.is_err());
+        assert!(w.slot.get().is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_teardown_retry_does_not_rerun_a_hook_that_already_succeeded() -> Result<()> {
+        let w = World::online();
+        w.st().hook_needs_vm = true;
+        run_setup(&w).await.context("setup")?;
+        w.st().secrets_fail = Some("busy".into());
+        let r = run_teardown(&w, T).await;
+        assert!(matches!(r, Err(TeardownError::Residue { .. })), "{r:?}");
+        assert!(!w.st().vm_running);
+        w.st().secrets_fail = None;
+        run_teardown(&w, T).await.context("retry with the VM down")?;
+        assert_eq!(w.log().iter().filter(|l| *l == "before_teardown").count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_teardown_retry_after_a_failed_stop_does_not_rerun_a_succeeded_hook() -> Result<()> {
+        let w = World::online();
+        run_setup(&w).await.context("setup")?;
+        w.st().stop_error = Some("qemu wedged".into());
+        let r = run_teardown(&w, T).await;
+        assert!(matches!(r, Err(TeardownError::VmStillRunning { .. })), "{r:?}");
+        w.st().stop_error = None;
+        run_teardown(&w, T).await.context("retry")?;
+        assert_eq!(w.log().iter().filter(|l| *l == "before_teardown").count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_hook_is_reported_once_and_a_retry_with_the_vm_down_does_not_rerun_it() -> Result<()> {
+        let w = World::online();
+        run_setup(&w).await.context("setup")?;
+        w.st().before_teardown_fails = true;
+        let r = run_teardown(&w, T).await;
+        assert!(matches!(r, Err(TeardownError::HookFailed { .. })), "{r:?}");
+        run_teardown(&w, T)
+            .await
+            .context("retry: the VM is stopped, nothing is left")?;
+        assert_eq!(w.log().iter().filter(|l| *l == "before_teardown").count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn teardown_after_a_failed_boot_does_not_run_the_hook() -> Result<()> {
+        let w = World::online();
+        {
+            let mut s = w.st();
+            s.boot_error = Some("no kvm".into());
+            s.hook_needs_vm = true;
+        }
+        let Err(e) = run_setup(&w).await else {
+            bail!("boot must fail");
+        };
+        assert_eq!(e.step, SetupStep::Boot);
+        run_teardown(&w, T)
+            .await
+            .context("teardown of a VM that never started")?;
+        assert!(!w.ran("before_teardown"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn teardown_passes_the_node_name_to_logout() -> Result<()> {
+        let w = World::online();
+        run_teardown(&w, T).await.context("teardown")?;
+        assert!(w.st().seen_names.contains(&format!("logout:{NAME}")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_stop_is_reported_even_when_the_node_delete_also_failed() -> Result<()> {
+        let w = World::online();
+        {
+            let mut s = w.st();
+            s.stop_error = Some("qemu wedged".into());
+            s.delete_error = Some("headscale 500".into());
+        }
+        let r = run_teardown(&w, T).await;
+        let Err(TeardownError::VmStillRunning { reason, .. }) = r else {
+            bail!("a possibly running VM must not hide behind NodeStillPresent: {r:?}");
+        };
+        assert!(
+            reason.contains("qemu wedged") && reason.contains("headscale 500"),
+            "{reason}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_mint_or_prepare_removes_the_prepared_secrets_dir() -> Result<()> {
+        let w = World::online();
+        w.st().mint_error = Some("headscale 500 for tskey-leak-1".into());
+        let Err(e) = run_setup(&w).await else {
+            bail!("a failed mint must fail setup");
+        };
+        assert_eq!(e.step, SetupStep::MintKey);
+        assert!(!e.to_string().contains("tskey-leak-1"), "{e}");
+        assert!(w.ran("remove_secrets"), "the prepared directory must go");
+
+        let w = World::online();
+        w.st().ensure_fail = true;
+        let Err(e) = run_setup(&w).await else {
+            bail!("a failed prepare must fail setup");
+        };
+        assert_eq!(e.step, SetupStep::Prepare);
+        assert!(w.ran("remove_secrets"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_zero_key_ttl_or_an_empty_node_name_is_a_config_error_and_runs_nothing() -> Result<()> {
+        let w = World::online();
+        let cfg = SetupConfig {
+            key_ttl: Duration::ZERO,
+            ..CFG
+        };
+        let Err(e) = run_with(&w, &cfg).await else {
+            bail!("a zero key_ttl must be rejected");
+        };
+        assert_eq!(e.step, SetupStep::Config);
+        let Err(e) = setup(&w, &SecretsDir::new(w.clone()), &w, &w, &w, "", &w.slot, &CFG).await else {
+            bail!("an empty name must be rejected");
+        };
+        assert_eq!(e.step, SetupStep::Config);
+        assert!(w.log().is_empty());
         Ok(())
     }
 
