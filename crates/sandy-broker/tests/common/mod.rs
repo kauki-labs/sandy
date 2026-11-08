@@ -232,7 +232,6 @@ async fn build(
             output_collectors_per_client: opts.output_collectors_per_client,
             output_collectors_total: opts.output_collectors_total,
             output_join_backoff: opts.output_join_backoff,
-            ..Tuning::default()
         },
     )
     .await?;
