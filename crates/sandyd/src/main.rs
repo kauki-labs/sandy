@@ -153,9 +153,21 @@ async fn main() {
         }
     };
 
+    // The environment audit log (#596) sits beside the database unless `SANDY_AUDIT_LOG` names
+    // it. A daemon that cannot open it does not start: an unaudited operation never runs.
+    let audit_path =
+        std::env::var_os("SANDY_AUDIT_LOG").map_or_else(|| db_path.with_file_name("audit.jsonl"), PathBuf::from);
+    let audit = match sandyd::audit::AuditLog::open(&audit_path) {
+        Ok(audit) => Arc::new(audit),
+        Err(e) => {
+            tracing::error!(error = %e, "could not open the environment audit log");
+            std::process::exit(1);
+        }
+    };
+
     // Same file as the job store: one durable, 0600 database for the daemon.
     let environments = match EnvironmentStore::open(&db_path) {
-        Ok(environments) => Arc::new(environments.with_max_rows(max_environments)),
+        Ok(environments) => Arc::new(environments.with_max_rows(max_environments).with_audit(audit)),
         Err(e) => {
             tracing::error!(error = %e, db = %db_path.display(), "could not open the environment store");
             std::process::exit(1);

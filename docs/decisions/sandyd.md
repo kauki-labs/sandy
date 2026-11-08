@@ -2302,3 +2302,36 @@ cursor with a client's stream, and every join counted by `join_for_attach` sends
   256 attach connections the accept loop serves. A job past the bound waits for a slot.
 
 **Set aside.** Reusing `observer_cap`, and counting the collector as an attach.
+
+## 33. An append-only audit log for client environment create, stop and delete (#596)
+
+**Context.** The environment lifecycle had no durable record of who changed what. #596 asks for an audit
+trail; the owner approved the first slice (create, stop, delete) and set the defaults: the log lives in
+sandyd's state directory, and the identity is the one sandyd already records.
+
+**Decision.**
+
+- `sandyd::audit::AuditLog` appends one JSON line per operation to `audit.jsonl` beside the database, or to
+  `SANDY_AUDIT_LOG`. Fields: `at` (unix seconds), `operation` (`create`, `stop`, `delete`),
+  `environment_id`, `submitter` (`trusted` or `untrusted`) and `outcome`.
+- The log file is mode `0600`, opened append-only, synced after each line. A symlink, a file that is not
+  regular, a file another user owns and a file with group or other bits are refused. `sandyd` does not
+  start when the log cannot be opened.
+- The handler writes the line before it changes state and fails closed. If the write fails, the operation
+  is refused with `ENVIRONMENT_ERROR_CODE_UNAVAILABLE` (the broker already answers an unknown code with
+  `unavailable`) and nothing changes. A crash between the line and the change leaves a line for an
+  operation that did not run, so `outcome` is always `attempted`: the line says the operation was
+  requested, not that it applied.
+- A create is audited only when it will mint a row. A replay of an accepted key, a refused request and an
+  unknown id write nothing.
+- The identity is the isolation class sandyd stored for the submitter: the create request's class, and the
+  row's recorded class for stop and delete. sandyd serves one user and has no per-client name on the
+  control RPC, so the broker's client id is not in the line. Carrying it needs a proto field. That is an
+  open owner question on #596.
+
+**Not covered.** `resume` and `cancel`, and every change the daemon makes itself: the idle stop, the
+retention sweep and the launch driver. Log rotation. Quotas, the default `untrusted` class and the
+per-client authz of #596 stay open.
+
+**Set aside.** Writing the line after the change (a failed write would leave an unaudited change), and
+auditing in the broker (it would miss a client that talks to sandyd directly).

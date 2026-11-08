@@ -278,6 +278,43 @@ fn reply(record: EnvironmentRecord) -> Reply {
     Ok(control_response::Result::Environment(to_wire(record)?))
 }
 
+/// Write the audit line for `operation` before it applies. `None` means go on; `Some` is the
+/// refusal to return, because an operation that cannot be audited does not run (#596).
+async fn audit(store: &Arc<EnvironmentStore>, operation: &'static str, id: &str, trusted: bool) -> Option<Reply> {
+    let log = Arc::clone(store.audit()?);
+    let id = id.to_owned();
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+    let submitter = if trusted { "trusted" } else { "untrusted" };
+    let written = tokio::task::spawn_blocking(move || {
+        log.record(&crate::audit::AuditEntry {
+            at,
+            operation,
+            environment_id: &id,
+            submitter,
+        })
+    })
+    .await;
+    match written {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, operation, "the environment audit log could not be written; the operation was refused");
+            Some(refuse(
+                EnvironmentErrorCode::Unavailable,
+                "the audit log cannot be written, so the operation did not run",
+            ))
+        }
+        Err(e) => {
+            tracing::error!(error = %e, operation, "the environment audit task failed; the operation was refused");
+            Some(refuse(
+                EnvironmentErrorCode::Unavailable,
+                "the audit log cannot be written, so the operation did not run",
+            ))
+        }
+    }
+}
+
 async fn create(
     store: &Arc<EnvironmentStore>,
     key: String,
@@ -321,6 +358,9 @@ async fn create(
         return refuse(EnvironmentErrorCode::InvalidArgument, why);
     }
     let new_id = format!("env-{}", uuid::Uuid::new_v4().simple());
+    if let Some(refusal) = audit(store, "create", &new_id, trusted).await {
+        return refusal;
+    }
     let outcome = blocking(store, move |s| {
         s.create_for(&key, &new_id, &bytes, SPEC_ENCODING, trusted)
     })
@@ -477,6 +517,9 @@ async fn stop_or_resume(store: &Arc<EnvironmentStore>, id: String, stop: bool) -
             "an ephemeral environment lives for one task and cannot be stopped or resumed",
         );
     }
+    if stop && let Some(refusal) = audit(store, "stop", &id, record.submitter_trusted).await {
+        return refusal;
+    }
     let key = id.clone();
     let (moved, needs) = if stop {
         (
@@ -510,6 +553,12 @@ async fn cancel(store: &Arc<EnvironmentStore>, id: String) -> Reply {
 async fn delete(store: &Arc<EnvironmentStore>, id: String) -> Reply {
     if !id_ok(&id) {
         return bad_id();
+    }
+    let Some(record) = fetch(store, &id).await? else {
+        return not_found(&id);
+    };
+    if let Some(refusal) = audit(store, "delete", &id, record.submitter_trusted).await {
+        return refusal;
     }
     let key = id.clone();
     let moved = blocking(store, move |s| s.delete(&key)).await?;
