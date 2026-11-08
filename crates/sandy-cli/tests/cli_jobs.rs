@@ -2413,7 +2413,7 @@ struct CancelsOnTerminate {
 }
 
 impl OwnerSignal for CancelsOnTerminate {
-    fn terminate(&self, pid: u32) -> std::io::Result<()> {
+    fn terminate(&self, pid: u32, _still_owner: &dyn Fn() -> std::io::Result<bool>) -> std::io::Result<()> {
         self.pids.lock().expect("pids").push(pid);
         self.control.cancel();
         Ok(())
@@ -2424,7 +2424,7 @@ impl OwnerSignal for CancelsOnTerminate {
 struct Denied;
 
 impl OwnerSignal for Denied {
-    fn terminate(&self, _pid: u32) -> std::io::Result<()> {
+    fn terminate(&self, _pid: u32, _still_owner: &dyn Fn() -> std::io::Result<bool>) -> std::io::Result<()> {
         Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
     }
 }
@@ -2433,7 +2433,7 @@ impl OwnerSignal for Denied {
 struct Ignored(Mutex<u32>);
 
 impl OwnerSignal for Ignored {
-    fn terminate(&self, _pid: u32) -> std::io::Result<()> {
+    fn terminate(&self, _pid: u32, _still_owner: &dyn Fn() -> std::io::Result<bool>) -> std::io::Result<()> {
         *self.0.lock().expect("count") += 1;
         Ok(())
     }
@@ -2450,6 +2450,8 @@ fn live_credentialed_run(
     let cred_dir = tmp.path().join("cred");
     std::fs::create_dir_all(&cred_dir).context("create cred dir")?;
     std::fs::set_permissions(&cred_dir, std::fs::Permissions::from_mode(0o700)).context("cred dir 0700")?;
+    // The run says in its liveness lockfile that a SIGTERM cancels it, which is what `sandy kill` looks for.
+    sandy_cli::signals::cancel_on_termination(plan.control.clone()).context("install the signal handlers")?;
     let entered = Arc::clone(&backend);
     let owner = std::thread::spawn(move || -> anyhow::Result<()> {
         let provider = FakeProvider::returning("ghs_live");
@@ -2471,6 +2473,11 @@ fn live_credentialed_run(
         Ok(())
     });
     while entered.runs.load(Ordering::SeqCst) == 0 {
+        // An owner that failed before it reached the backend (credential setup, the journal) ended: report why.
+        if owner.is_finished() {
+            owner.join().map_err(|_| anyhow::anyhow!("owner panicked"))??;
+            anyhow::bail!("the owner ended before the backend ran");
+        }
         std::thread::sleep(Duration::from_millis(5));
     }
     let other = Journal::new(tmp.path());
@@ -2582,7 +2589,8 @@ fn kill_never_signals_pid_zero_or_one() -> anyhow::Result<()> {
         let mut record = running_record("job-pid", "box-1", SystemTime::now());
         record.writer_pid = pid;
         journal.write_record(&record)?;
-        let _live = journal.hold_live("job-pid")?;
+        let live = journal.hold_live("job-pid")?;
+        live.note(sandy_cli::signals::CANCELS_ON_SIGTERM)?;
         let signal = Ignored(Mutex::new(0));
 
         let err = kill_with(
@@ -2616,7 +2624,8 @@ fn the_real_sigterm_reaches_the_process_named_as_the_owner() -> anyhow::Result<(
     record.writer_pid = child.id();
     journal.write_record(&record)?;
     // The test process holds the liveness lock, so the job reads as live; the child is the pid the record names.
-    let _live = journal.hold_live("job-real")?;
+    let live = journal.hold_live("job-real")?;
+    live.note(sandy_cli::signals::CANCELS_ON_SIGTERM)?;
 
     let err = kill_with(
         &journal,
@@ -2671,5 +2680,32 @@ fn two_probes_of_a_dead_owner_never_conflict() -> anyhow::Result<()> {
         !other.owner_live("job-dead")?,
         "a concurrent probe must not look like an owner"
     );
+    Ok(())
+}
+
+/// #695: an owner that did not say a SIGTERM cancels its run (a programmatic caller without the handler) is not
+/// signalled, since the default action would end it with no teardown and no revoke.
+#[test]
+fn kill_does_not_signal_an_owner_that_did_not_say_sigterm_cancels_its_run() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    journal.write_record(&running_record("job-quiet", "box-1", SystemTime::now()))?;
+    let _live = journal.hold_live("job-quiet")?;
+    let signal = Ignored(Mutex::new(0));
+
+    let err = kill_with(
+        &journal,
+        &FakeBackend::new(),
+        &signal,
+        "job-quiet",
+        Duration::from_secs(1),
+    )
+    .expect_err("an owner without the handler is not signalled");
+
+    assert!(
+        err.to_string().contains("did not say that a SIGTERM cancels its run"),
+        "{err}"
+    );
+    assert_eq!(*signal.0.lock().expect("count"), 0);
+    assert_eq!(journal.read_record("job-quiet")?.state, JobState::Running);
     Ok(())
 }

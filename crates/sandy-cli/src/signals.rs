@@ -10,10 +10,29 @@
 //! chose that, and the children the run starts inherit it. macOS offers no safe way to read the mask (`ps` has no
 //! such keyword and `sigaction` is `unsafe`), so there all three signals are handled.
 
-use std::{io, sync::mpsc};
+use std::{
+    io,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+};
 
 use sandy::RunControl;
 use tokio::signal::unix::{Signal, SignalKind, signal};
+
+/// Set once [`cancel_on_termination`] has installed its handlers in this process.
+static INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// What a run tells `sandy kill` in its liveness lockfile when [`cancels_on_sigterm`]: a SIGTERM makes it tear down.
+pub const CANCELS_ON_SIGTERM: &str = "sigterm-cancels-the-run";
+
+/// Whether this process turns a `SIGTERM` into a clean cancel (the handlers are installed). A run records this for
+/// `sandy kill`, which signals only an owner that says so: one without the handler would die at once instead.
+#[must_use]
+pub fn cancels_on_sigterm() -> bool {
+    INSTALLED.load(Ordering::SeqCst)
+}
 
 const SIGHUP: i32 = 1;
 const SIGINT: i32 = 2;
@@ -71,7 +90,9 @@ pub fn cancel_on_termination(control: RunControl) -> io::Result<()> {
         })?;
     installed
         .recv()
-        .map_err(|_| io::Error::other("the signal thread ended before it installed its handlers"))?
+        .map_err(|_| io::Error::other("the signal thread ended before it installed its handlers"))??;
+    INSTALLED.store(true, Ordering::SeqCst);
+    Ok(())
 }
 
 /// A handler for `number`, or `None` when the process inherited it as ignored.

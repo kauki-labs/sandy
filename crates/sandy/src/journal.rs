@@ -31,6 +31,19 @@ pub struct JobLock {
 }
 
 impl JobLock {
+    /// Write a one-line note into the lockfile, for a reader to find with [`Journal::owner_note`]. The owner uses it
+    /// to say what a signal will do (#695).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Io`] if the file cannot be written.
+    pub fn note(&self, text: &str) -> Result<(), CoreError> {
+        use std::io::Write as _;
+        self.file.set_len(0)?;
+        (&self.file).write_all(text.as_bytes())?;
+        Ok(())
+    }
+
     /// The job id this lock guards.
     #[must_use]
     pub fn job_id(&self) -> &str {
@@ -234,6 +247,21 @@ impl Journal {
             // Ours for a moment: nobody holds it exclusively.
             Ok(()) => Ok(false),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The note the live owner of `job_id` left in its liveness lockfile ([`JobLock::note`]), or `None` when there is
+    /// no file or no note.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Io`] on a read failure other than the file being absent.
+    pub fn owner_note(&self, job_id: &str) -> Result<Option<String>, CoreError> {
+        match std::fs::read_to_string(self.live_path(job_id)) {
+            Ok(text) if text.trim().is_empty() => Ok(None),
+            Ok(text) => Ok(Some(text.trim().to_string())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
         }
     }

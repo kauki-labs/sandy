@@ -124,7 +124,7 @@ if [ "$signal" = KILL ]; then
   }
   echo "== sandy kill $job_id"
   kill_rc=0
-  TMPDIR="$work" SANDY_HOME="$work/home" "$target_dir/debug/sandy" kill "$job_id" >"$work/kill.out" 2>"$work/kill.err" || kill_rc=$?
+  TMPDIR="$work" SANDY_HOME="$work/home" "$target_dir/debug/sandy" -o json kill "$job_id" >"$work/kill.out" 2>"$work/kill.err" || kill_rc=$?
   if [ "$kill_rc" -ne 0 ]; then
     echo "FAIL: sandy kill exited $kill_rc: $(head -c 300 "$work/kill.err")" >&2
     exit 1
@@ -153,6 +153,12 @@ if [ "$state" != "cancelled" ]; then
   exit 1
 fi
 if [ "$signal" = KILL ]; then
+  # What `sandy kill` printed must be the terminal record the owner wrote, not a stale `running` answer.
+  python3 -I -c 'import glob, json, sys
+sys.exit(json.load(open(sys.argv[1])) != json.load(open(glob.glob(sys.argv[2] + "/jobs/*.json")[0])))' "$work/kill.out" "$work/home" || {
+    echo "FAIL: the output of sandy kill differs from the terminal journal record" >&2
+    exit 1
+  }
   # `sandy kill` of a live run must hand back the OWNER's record: one it wrote itself would carry no receipt.
   message=$(python3 -I -c 'import glob, json, sys
 print(json.load(open(glob.glob(sys.argv[1] + "/jobs/*.json")[0]))["result"]["message"])' "$work/home")

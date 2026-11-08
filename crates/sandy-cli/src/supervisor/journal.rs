@@ -67,7 +67,12 @@ impl JournalWriter for Journal {
     }
 
     fn hold_liveness(&self, job_id: &str) -> Result<Option<JobLock>, CoreError> {
-        self.hold_live(job_id).map(Some)
+        let lock = self.hold_live(job_id)?;
+        // Tell `sandy kill` whether a SIGTERM to this process cancels the run: only then may it be signalled (#695).
+        if crate::signals::cancels_on_sigterm() {
+            lock.note(crate::signals::CANCELS_ON_SIGTERM)?;
+        }
+        Ok(Some(lock))
     }
 
     fn persist_if_still_running(&self, record: &JobRecord) -> Result<bool, CoreError> {
@@ -93,12 +98,6 @@ impl JournalWriter for Journal {
 pub(super) struct JobOutcome {
     pub(super) report: RunReport,
     pub(super) started: Option<SystemTime>,
-    /// The liveness lock, held until the caller has written the terminal record and drops the outcome (#699).
-    #[allow(
-        dead_code,
-        reason = "held only for its lifetime: the lock releases when the outcome drops"
-    )]
-    pub(super) live: Option<JobLock>,
 }
 
 /// Build and persist the terminal [`JobRecord`] carrying `report`'s envelope

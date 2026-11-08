@@ -25,7 +25,7 @@ use std::{
 
 use sandy::{
     AuditReceipt, BackendError, CALL_DEADLINE, Classification, CoreError, CredentialProvider, CredentialReceipt,
-    DirFingerprint, EgressApplier, EgressOs, EgressOutcome, EgressPlan, GuestReported, JOURNAL_SCHEMA_VERSION,
+    DirFingerprint, EgressApplier, EgressOs, EgressOutcome, EgressPlan, GuestReported, JOURNAL_SCHEMA_VERSION, JobLock,
     JobRecord, JobState, Journal, Lease, MAX_TTL_SECS, Outcome, OutputStatus, PlanError, ProcessExit, Profile,
     ResultEnvelope, Scope, SecretSource, Status, VmBackend, classify_backend_error, classify_invalid_plan,
     classify_outcome, enforce, mint_lease, mint_lease_checked, new_job_id, plan_egress_scoped, reconcile_job,
@@ -95,7 +95,9 @@ pub fn run_job<B: VmBackend + ?Sized, E: EgressApplier + ?Sized>(
     tap: Option<&str>,
     redact: &[String],
 ) -> Result<RunReport, CoreError> {
-    let mut outcome = run_job_core(backend, journal, plan, egress, egress_os, tap, redact)?;
+    // Declared before the outcome so the liveness lock outlives everything that follows (#699).
+    let mut live = None;
+    let mut outcome = run_job_core(backend, journal, plan, egress, egress_os, tap, redact, &mut live)?;
     if let Some(started) = outcome.started {
         match write_terminal_record(journal, started, &outcome.report) {
             Ok(true) => {}
@@ -164,6 +166,10 @@ fn proxy_receipt_result(run: &Result<Outcome, BackendError>) -> Result<EgressOut
 /// it until the refresh thread has joined and `redact_with_refreshes` is final, so
 /// the credentialed path's terminal write and its token redaction are one atomic
 /// write, not a write followed by an amend (#322).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the run's seams and inputs, plus the slot the caller keeps the liveness lock in"
+)]
 fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWriter + ?Sized>(
     backend: &B,
     journal: &J,
@@ -172,6 +178,7 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
     egress_os: EgressOs,
     tap: Option<&str>,
     redact: &[String],
+    live: &mut Option<JobLock>,
 ) -> Result<JobOutcome, CoreError> {
     let spec = plan.as_run_spec();
 
@@ -201,7 +208,6 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
                 process_exit: classification.process_exit,
             },
             started: None,
-            live: None,
         });
     }
 
@@ -218,7 +224,7 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
         result: None,
     };
     // Before the `Running` record exists, so no reader can see the job running without seeing its owner live (#699).
-    let live = journal.hold_liveness(&job_id)?;
+    *live = journal.hold_liveness(&job_id)?;
     journal.persist(&running)?;
 
     // 3. Apply the egress boundary around the boot. On Linux with a tap this loads the guest-scoped forward ruleset
@@ -383,7 +389,6 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
             process_exit: classification.process_exit,
         },
         started: Some(started),
-        live,
     })
 }
 
@@ -643,6 +648,9 @@ fn run_job_with_credential_timed<
     // including a panic unwinding out of `run_job` through `thread::scope`, where
     // the explicit call below is never reached. Skipping it on a panic would leave
     // a valid forge token and the 0600 secret on disk past the run (INV-1).
+    // Declared before `teardown`, so it drops after it: on a panic the credential is revoked while the job still reads
+    // as live (#699).
+    let mut live_guard: Option<JobLock> = None;
     let mut teardown = CredTeardown {
         provider,
         lease: Mutex::new(lease),
@@ -684,7 +692,7 @@ fn run_job_with_credential_timed<
                 cred_dir_fingerprint,
             )
         });
-        let outcome = run_job_core(backend, journal, &plan, egress, egress_os, tap, redact);
+        let outcome = run_job_core(backend, journal, &plan, egress, egress_os, tap, redact, &mut live_guard);
         drop(stop_tx);
         outcome
     });
@@ -815,13 +823,16 @@ pub const KILL_BUDGET: Duration = Duration::from_secs(60);
 /// What [`kill`] sends the owner of a live run. A trait only so a test can observe the signal without sending one to a
 /// real process.
 pub trait OwnerSignal {
-    /// Ask process `pid` to stop (`SIGTERM`). The error is the kernel's: [`std::io::ErrorKind::PermissionDenied`] when
-    /// the process belongs to another user.
+    /// Ask process `pid` to stop (`SIGTERM`). `still_owner` says whether `pid` still belongs to the live owner: an
+    /// implementation that can pin the process (a Linux pidfd) opens it first, asks, and only then signals, so the
+    /// signal cannot reach a process that reused the pid. The error is the kernel's:
+    /// [`std::io::ErrorKind::PermissionDenied`] when the process belongs to another user, and
+    /// [`std::io::ErrorKind::NotFound`] when it is gone.
     ///
     /// # Errors
     ///
     /// The `kill(2)` failure.
-    fn terminate(&self, pid: u32) -> std::io::Result<()>;
+    fn terminate(&self, pid: u32, still_owner: &dyn Fn() -> std::io::Result<bool>) -> std::io::Result<()>;
 }
 
 /// The real `SIGTERM`, which `sandy run` answers by cancelling the run (#687).
@@ -829,11 +840,32 @@ pub trait OwnerSignal {
 pub struct SigTerm;
 
 impl OwnerSignal for SigTerm {
-    fn terminate(&self, pid: u32) -> std::io::Result<()> {
+    fn terminate(&self, pid: u32, still_owner: &dyn Fn() -> std::io::Result<bool>) -> std::io::Result<()> {
         let pid = i32::try_from(pid)
             .ok()
             .and_then(rustix::process::Pid::from_raw)
             .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        // Linux: pin the process first, then ask whether it is still the owner, then signal the pinned process. If the
+        // owner died and the pid was reused before the pin, the owner is no longer live and the check says so; if it
+        // died after, the pinned process is the dead owner and the signal finds nothing. Elsewhere the check-to-signal
+        // gap stays (microseconds, and a pid wrap).
+        #[cfg(target_os = "linux")]
+        match rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()) {
+            Ok(pidfd) => {
+                if !still_owner()? {
+                    return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+                }
+                return rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::TERM).map_err(errno_to_io);
+            }
+            Err(errno) if errno == rustix::io::Errno::SRCH => {
+                return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+            }
+            // A kernel without pidfd: fall back to the pid.
+            Err(_) => {}
+        }
+        if !still_owner()? {
+            return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        }
         rustix::process::kill_process(pid, rustix::process::Signal::TERM).map_err(errno_to_io)
     }
 }
@@ -942,7 +974,16 @@ fn stop_live_owner<B: VmBackend, S: OwnerSignal + ?Sized>(
             "job {job_id} names pid {pid} as its owner; refusing to signal it"
         )));
     }
-    match signal.terminate(pid) {
+    // Only an owner that said a SIGTERM cancels its run is signalled: a process without the handler would die at once,
+    // skipping the guest teardown and the credential revoke (#687).
+    if journal.owner_note(job_id)?.as_deref() != Some(crate::signals::CANCELS_ON_SIGTERM) {
+        return Err(CoreError::State(format!(
+            "job {job_id} (pid {pid}) is live but did not say that a SIGTERM cancels its run, so it is not signalled; \
+             stop it by its own means"
+        )));
+    }
+    let still_owner = || journal.owner_live(job_id).map_err(std::io::Error::other);
+    match signal.terminate(pid, &still_owner) {
         Ok(()) => {}
         // The owner exited since the lock was checked: the wait below sees it go.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
