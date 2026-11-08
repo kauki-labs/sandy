@@ -169,8 +169,8 @@ fn an_unknown_or_killed_environment_is_not_running_and_kill_is_idempotent() -> R
     Ok(())
 }
 
-/// The counter in `beat` advances while its writer lives.
-fn is_beating(beat: &Path) -> bool {
+/// The counter in `beat` changes within `window`, once the writer has written at all.
+fn advances_within(beat: &Path, window: Duration) -> bool {
     let read = || std::fs::read_to_string(beat).unwrap_or_default();
     // A freshly started writer may not have written yet, most of all on a loaded host.
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -178,8 +178,24 @@ fn is_beating(beat: &Path) -> bool {
         std::thread::sleep(Duration::from_millis(20));
     }
     let first = read();
-    std::thread::sleep(Duration::from_millis(250));
-    !first.is_empty() && first != read()
+    let deadline = Instant::now() + window;
+    while !first.is_empty() && Instant::now() < deadline {
+        if read() != first {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
+/// The counter in `beat` advances while its writer lives. A starved writer gets 3 s, not one tick.
+fn is_beating(beat: &Path) -> bool {
+    advances_within(beat, Duration::from_secs(3))
+}
+
+/// The counter in `beat` stays put for a short window. A live writer ticks well inside it.
+fn has_stopped(beat: &Path) -> bool {
+    !advances_within(beat, Duration::from_millis(250))
 }
 
 #[test]
@@ -214,7 +230,7 @@ fn kill_ends_the_whole_process_group_including_children() -> Result<()> {
     b.kill("env-1")?;
     std::thread::sleep(Duration::from_millis(300));
     assert!(
-        !is_beating(&beat),
+        has_stopped(&beat),
         "the child must stop beating once its group is killed"
     );
     Ok(())
@@ -231,7 +247,7 @@ fn dropping_the_backend_kills_every_environment() -> Result<()> {
     assert!(is_beating(&beat));
     drop(b);
     std::thread::sleep(Duration::from_millis(300));
-    assert!(!is_beating(&beat), "a graceful exit must not leave the service running");
+    assert!(has_stopped(&beat), "a graceful exit must not leave the service running");
     assert!(!env_dir(state.path(), "env-1").exists());
     Ok(())
 }
@@ -396,7 +412,7 @@ fn a_new_backend_kills_the_orphan_process_group_of_a_stale_environment() -> Resu
     std::thread::sleep(Duration::from_millis(300));
     assert!(!dir.exists(), "the stale directory is removed");
     assert!(
-        !is_beating(&beat),
+        has_stopped(&beat),
         "the orphan's child must be dead: only a group kill stops it"
     );
     assert!(second.boxes()?.is_empty());
@@ -508,7 +524,7 @@ fn a_pair_command_that_hangs_is_killed_with_its_children_and_fails_the_environme
     assert_eq!(step, "pair");
     assert!(reason.contains("timed out"), "{reason}");
     std::thread::sleep(Duration::from_millis(300));
-    assert!(!is_beating(&beat), "the hung pair command's children must die with it");
+    assert!(has_stopped(&beat), "the hung pair command's children must die with it");
     b.kill("env-1")?;
     Ok(())
 }
