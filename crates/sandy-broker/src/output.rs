@@ -447,6 +447,22 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn a_collector_tracked_after_shutdown_is_aborted() {
+        let o = outputs(8, 100, 1);
+        o.abort_collectors();
+        let late = tokio::spawn(std::future::pending::<()>());
+        o.track(late);
+        let handle = o.collectors.lock().unwrap().pop();
+        // Either refused (aborted at once) or never kept alive.
+        if let Some(h) = handle {
+            assert!(
+                tokio::time::timeout(Duration::from_secs(2), h).await.is_ok(),
+                "the late collector still runs"
+            );
+        }
+    }
+
     #[test]
     fn a_read_can_resume_at_the_end_but_not_past_it() {
         let o = outputs(8, 100, 1);

@@ -43,6 +43,22 @@ impl Fixture {
         }
     }
 
+    async fn output_until_as(&self, id: &str, token: &str, query: &str, want: u64) -> Result<Value> {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            let (status, body) = self.output(id, token, query).await?;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            if body["next_offset"].as_u64() >= Some(want) {
+                return Ok(body);
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "output never reached {want}: {body}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// Polls until the broker reports the job done.
     async fn output_done(&self, id: &str) -> Result<Value> {
         self.output_done_as(id, TOKEN_A).await
@@ -386,5 +402,78 @@ async fn collectors_past_the_bound_wait_for_a_slot_then_deliver_the_output_they_
     assert_eq!(decode(&two)?, b"late-two");
     let three = f.output_until(&ids[3], "offset=0", 10).await?;
     assert_eq!(decode(&three)?, b"late-three");
+    Ok(())
+}
+
+#[tokio::test]
+async fn output_responses_are_not_cacheable() -> Result<()> {
+    let f = fixture().await?;
+    let id = f.submit(TOKEN_A).await?;
+    let resp = f
+        .http
+        .get(format!("{}/v1/jobs/{id}/output", f.base))
+        .bearer_auth(TOKEN_A)
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["cache-control"], "no-store");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_negative_or_zero_limit_clamps_to_one_byte() -> Result<()> {
+    let f = fixture().await?;
+    let id = f.submit(TOKEN_A).await?;
+    f.agent(&id)?.stdout(b"abc").await?;
+    f.output_until(&id, "offset=0", 3).await?;
+    for limit in ["-5", "0"] {
+        let (status, body) = f.output(&id, TOKEN_A, &format!("offset=0&limit={limit}")).await?;
+        assert_eq!(status, StatusCode::OK, "limit={limit}: {body}");
+        assert_eq!(decode(&body)?, b"a");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_collector_whose_first_attaches_fail_keeps_trying_after_the_job_ended() -> Result<()> {
+    // No attach socket: every join fails. sandyd may still retain the channel after the job
+    // ends, so the collector must spend all its tries before it gives up.
+    let f = fixture_with_opts(Opts {
+        attach_socket: false,
+        output_join_backoff: Duration::from_millis(50),
+        ..Opts::default()
+    })
+    .await?;
+    let id = f.submit(TOKEN_A).await?;
+    f.finish(&id, JobStatus::Succeeded)?;
+    let done = f.output_done(&id).await?;
+    assert_eq!(done["fault"], "collector could not attach", "{done}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_broker_wide_collector_bound_holds_across_clients() -> Result<()> {
+    let f = fixture_with_opts(Opts {
+        output_collectors_total: 1,
+        ..Opts::default()
+    })
+    .await?;
+    let a = f.submit(TOKEN_A).await?;
+    let c = f.submit(TOKEN_C).await?;
+    f.agent(&c)?.stdout(b"from-c").await?;
+    let (ja, jc) = (f.registry.get(&a).context("a")?, f.registry.get(&c).context("c")?);
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while ja.channel.member_count() < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the first collector never joined"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(jc.channel.member_count(), 2, "the second client's collector must wait");
+    f.finish(&a, JobStatus::Succeeded)?;
+    let body = f.output_until_as(&c, TOKEN_C, "offset=0", 6).await?;
+    assert_eq!(decode(&body)?, b"from-c");
     Ok(())
 }

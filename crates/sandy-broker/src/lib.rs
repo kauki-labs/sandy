@@ -198,6 +198,8 @@ pub struct Tuning {
     pub output_collectors_per_client: usize,
     /// Most output collectors the broker may run at once.
     pub output_collectors_total: usize,
+    /// Wait between a collector's attach tries.
+    pub output_join_backoff: std::time::Duration,
 }
 
 impl Default for Tuning {
@@ -210,6 +212,7 @@ impl Default for Tuning {
             output_retention: std::time::Duration::from_secs(15 * 60),
             output_collectors_per_client: 16,
             output_collectors_total: 64,
+            output_join_backoff: std::time::Duration::from_secs(10),
         }
     }
 }
