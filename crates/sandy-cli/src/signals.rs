@@ -10,10 +10,33 @@
 //! chose that, and the children the run starts inherit it. macOS offers no safe way to read the mask (`ps` has no
 //! such keyword and `sigaction` is `unsafe`), so there all three signals are handled.
 
-use std::{io, sync::mpsc};
+use std::{
+    io,
+    sync::{Mutex, PoisonError, mpsc},
+};
 
 use sandy::RunControl;
 use tokio::signal::unix::{Signal, SignalKind, signal};
+
+/// The controls whose run a `SIGTERM` cancels here: one per successful [`cancel_on_termination`] whose `SIGTERM` was
+/// handled (not inherited as ignored).
+static CANCELLED_BY_SIGTERM: Mutex<Vec<RunControl>> = Mutex::new(Vec::new());
+
+/// What a run tells `sandy kill` in its liveness lockfile when [`cancels_on_sigterm`]: a SIGTERM makes it tear down.
+pub const CANCELS_ON_SIGTERM: &str = "sigterm-cancels-the-run";
+
+/// Whether a `SIGTERM` to this process cancels the run `control` belongs to: the handler is installed for that very
+/// control and `SIGTERM` was not inherited as ignored. A run records this for `sandy kill`, which signals only an
+/// owner that says so: one without the handler would die at once, and one whose handler cancels another run would
+/// ignore the signal.
+#[must_use]
+pub fn cancels_on_sigterm(control: &RunControl) -> bool {
+    CANCELLED_BY_SIGTERM
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .any(|handled| handled.same_run(control))
+}
 
 const SIGHUP: i32 = 1;
 const SIGINT: i32 = 2;
@@ -29,6 +52,7 @@ const SIGTERM: i32 = 15;
 /// The handlers or the thread that waits on them could not be set up.
 pub fn cancel_on_termination(control: RunControl) -> io::Result<()> {
     let ignored = ignored_signals(std::process::id());
+    let registered = control.clone();
     let (ready, installed) = mpsc::channel();
     std::thread::Builder::new()
         .name("sandy-signals".to_owned())
@@ -71,7 +95,14 @@ pub fn cancel_on_termination(control: RunControl) -> io::Result<()> {
         })?;
     installed
         .recv()
-        .map_err(|_| io::Error::other("the signal thread ended before it installed its handlers"))?
+        .map_err(|_| io::Error::other("the signal thread ended before it installed its handlers"))??;
+    if ignored & (1 << (SIGTERM - 1)) == 0 {
+        CANCELLED_BY_SIGTERM
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(registered);
+    }
+    Ok(())
 }
 
 /// A handler for `number`, or `None` when the process inherited it as ignored.
@@ -215,6 +246,25 @@ mod tests {
         assert!(
             status.success(),
             "the child with SIGHUP ignored must not be cancelled by it: {status}"
+        );
+        Ok(())
+    }
+
+    /// What a run tells `sandy kill`: a SIGTERM cancels THIS run, so a control the handler was not installed for does
+    /// not claim it (#695).
+    #[test]
+    fn only_the_control_the_handler_was_installed_for_claims_sigterm_cancels_it() -> anyhow::Result<()> {
+        let handled = RunControl::with_timeout_secs(60);
+        let other = RunControl::with_timeout_secs(60);
+        assert!(!super::cancels_on_sigterm(&handled), "nothing is installed yet");
+
+        cancel_on_termination(handled.clone())?;
+
+        assert!(super::cancels_on_sigterm(&handled));
+        assert!(super::cancels_on_sigterm(&handled.clone()), "a clone is the same run");
+        assert!(
+            !super::cancels_on_sigterm(&other),
+            "another run's control is not covered"
         );
         Ok(())
     }

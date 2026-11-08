@@ -371,3 +371,14 @@ default interrupt action still reports its exit code, a handled interrupt keeps 
 forced after the grace), `impls/fabric-local/src/link.rs::tests::a_channel_stop_reaches_the_agent_as_a_stop_request`,
 `crates/sandy-environment/tests/stop.rs`. A live scenario on qemu and vfkit (stop a held environment, see the guest
 service exit before the cancel) is not written; sandyd does not post the stop yet.
+
+**Run cancel and kill (#687, #695, #699).** Tier-2: `crates/sandy-cli/tests/cli_jobs.rs`
+(`a_run_cancelled_while_the_guest_runs_ends_cancelled_in_band_one`, `a_run_cancelled_before_boot_starts_no_guest`,
+`a_cancelled_credentialed_run_revokes_the_token_and_records_it`, `a_live_run_reads_as_running_from_a_second_handle`,
+`kill_of_a_live_run_signals_its_owner_and_returns_the_owners_record`,
+`kill_without_permission_to_signal_the_owner_fails_and_leaves_the_record_running`,
+`kill_of_an_owner_that_does_not_stop_reports_it_and_never_escalates`, `kill_never_signals_pid_zero_or_one`,
+`the_real_sigterm_reaches_the_process_named_as_the_owner`) and `crates/sandy-cli/src/signals.rs::tests`. Live (qemu or
+vfkit, never from a fake): `scripts/dev/live-run-sigterm.sh TERM|HUP|KILL`: the signal (or `sandy kill <job-id>`) ends the
+run, the record is `cancelled`, no box process is left and the run directory is gone. The credentialed live path needs a
+forge and is not written.
