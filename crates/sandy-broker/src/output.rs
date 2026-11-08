@@ -30,12 +30,6 @@ const DEFAULT_READ: usize = 64 * 1024;
 const MAX_READ: usize = 256 * 1024;
 /// Tries to attach before the collector gives up on a job.
 const JOIN_ATTEMPTS: u32 = 5;
-/// Wait between attach tries.
-///
-/// At least 10 s: sandyd mints a collector cap deterministically per second, so two caps for one
-/// job minted in the same second share a membership, and a retry must not share one with an
-/// attempt that half succeeded.
-const JOIN_BACKOFF: Duration = Duration::from_secs(10);
 
 /// How a job's collection ended.
 #[derive(Debug)]
@@ -93,7 +87,8 @@ pub(crate) struct Outputs {
     collectors_per_client: usize,
     client_slots: Mutex<HashMap<String, Arc<Semaphore>>>,
     total_slots: Arc<Semaphore>,
-    collectors: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// `None` once the broker shut down: a collector tracked after that is aborted at once.
+    collectors: Mutex<Option<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 impl Outputs {
@@ -112,7 +107,7 @@ impl Outputs {
             client_cap: total_cap / clients.max(1),
             retention,
             jobs: Mutex::default(),
-            collectors: Mutex::default(),
+            collectors: Mutex::new(Some(Vec::new())),
         }
     }
 
@@ -132,15 +127,22 @@ impl Outputs {
     }
 
     /// Keeps `collector` so [`Outputs::abort_collectors`] can stop it. Finished handles drop.
+    /// After shutdown the collector is aborted at once.
     pub(crate) fn track(&self, collector: tokio::task::JoinHandle<()>) {
-        let mut collectors = self.collectors.lock().unwrap_or_else(PoisonError::into_inner);
-        collectors.retain(|c| !c.is_finished());
-        collectors.push(collector);
+        let mut guard = self.collectors.lock().unwrap_or_else(PoisonError::into_inner);
+        match guard.as_mut() {
+            Some(collectors) => {
+                collectors.retain(|c| !c.is_finished());
+                collectors.push(collector);
+            }
+            None => collector.abort(),
+        }
     }
 
-    /// Stops every collector, which closes their attach connections.
+    /// Stops every collector, which closes their attach connections, and refuses later ones.
     pub(crate) fn abort_collectors(&self) {
-        for collector in self.collectors.lock().unwrap_or_else(PoisonError::into_inner).drain(..) {
+        let taken = self.collectors.lock().unwrap_or_else(PoisonError::into_inner).take();
+        for collector in taken.into_iter().flatten() {
             collector.abort();
         }
     }
@@ -248,11 +250,12 @@ fn parse_query(query: Option<&str>) -> Result<(u64, usize), ()> {
         let (key, value) = pair.split_once('=').ok_or(())?;
         match key {
             "offset" if offset.is_none() => offset = Some(value.parse::<u64>().map_err(|_| ())?),
-            "limit" if limit.is_none() => limit = Some(value.parse::<u64>().map_err(|_| ())?),
+            "limit" if limit.is_none() => limit = Some(value.parse::<i64>().map_err(|_| ())?),
             _ => return Err(()),
         }
     }
-    let limit = limit.map_or(DEFAULT_READ, |l| usize::try_from(l).unwrap_or(usize::MAX));
+    // A limit below 1 clamps up to 1, as the contract says; only a non-integer is invalid.
+    let limit = limit.map_or(DEFAULT_READ, |l| usize::try_from(l.max(1)).unwrap_or(usize::MAX));
     Ok((offset.unwrap_or(0), limit.clamp(1, MAX_READ)))
 }
 
@@ -324,14 +327,16 @@ pub(crate) async fn collect(state: Arc<State>, id: String, token: Vec<u8>, clien
 async fn attach(state: &State, id: &str, token: &[u8]) -> Result<tokio::net::UnixStream, &'static str> {
     for attempt in 0..JOIN_ATTEMPTS {
         if attempt > 0 {
-            if matches!(terminal_state(state, id).await, Ok(Some(_))) {
-                return Err("job ended before the collector attached");
-            }
-            tokio::time::sleep(JOIN_BACKOFF).await;
+            tokio::time::sleep(state.join_backoff).await;
         }
         if let Ok(Ok(conn)) = tokio::time::timeout(JOIN_TIMEOUT, join(state, id, Some(token.to_vec()), true)).await {
             return Ok(conn);
         }
+    }
+    // sandyd may keep the channel after the job ends, so a failed join is retried whatever the
+    // job's state. Only after the last try does the job's state pick the fault text.
+    if matches!(terminal_state(state, id).await, Ok(Some(_))) {
+        return Err("job ended before the collector attached");
     }
     Err("collector could not attach")
 }
@@ -452,15 +457,11 @@ mod tests {
         let o = outputs(8, 100, 1);
         o.abort_collectors();
         let late = tokio::spawn(std::future::pending::<()>());
+        let watch = late.abort_handle();
         o.track(late);
-        let handle = o.collectors.lock().unwrap().pop();
-        // Either refused (aborted at once) or never kept alive.
-        if let Some(h) = handle {
-            assert!(
-                tokio::time::timeout(Duration::from_secs(2), h).await.is_ok(),
-                "the late collector still runs"
-            );
-        }
+        tokio::task::yield_now().await;
+        assert!(watch.is_finished(), "the late collector must be aborted at once");
+        assert!(o.collectors.lock().unwrap().is_none(), "nothing is kept after shutdown");
     }
 
     #[test]
@@ -476,6 +477,7 @@ mod tests {
     fn the_query_takes_offset_and_limit_only() {
         assert_eq!(parse_query(None), Ok((0, DEFAULT_READ)));
         assert_eq!(parse_query(Some("offset=5&limit=0")), Ok((5, 1)));
+        assert_eq!(parse_query(Some("limit=-9")), Ok((0, 1)));
         assert_eq!(parse_query(Some("limit=99999999999")), Ok((0, MAX_READ)));
         for bad in ["offset=-1", "offset=1&offset=2", "x=1", "offset", "limit=1.5"] {
             assert_eq!(parse_query(Some(bad)), Err(()), "{bad}");

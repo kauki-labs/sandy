@@ -245,6 +245,7 @@ pub async fn serve_with_tuning(config: BrokerConfig, tuning: Tuning) -> Result<R
         tickets: attach::Tickets::new(ticket_ttl),
         outputs: Arc::clone(&outputs),
         send_timeout: tuning.send_timeout,
+        join_backoff: tuning.output_join_backoff,
         control_socket: config.control_socket,
         rpc_deadline: config.rpc_deadline,
         clients: config.clients,

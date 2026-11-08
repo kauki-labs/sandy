@@ -7,7 +7,7 @@ use http_body_util::{BodyExt, Full, Limited};
 use hyper::{
     Method, Request, Response, StatusCode,
     body::{Bytes, Incoming},
-    header::{AUTHORIZATION, CONTENT_TYPE},
+    header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE},
 };
 use sandy_control_proto::{
     CancelRequest, Input, IsolationClass as WireClass, JobStatus, ListRequest, Output, SecretRef, StatusRequest,
@@ -34,6 +34,10 @@ pub(crate) struct State {
     pub(crate) outputs: Arc<Outputs>,
     /// How long one write to a stalled attach client may block.
     pub(crate) send_timeout: std::time::Duration,
+    /// Wait between a collector's attach tries. At least 10 s in production: sandyd mints a
+    /// collector cap deterministically per second, so two caps for one job minted in the same
+    /// second share a membership, and a retry must not share one with a half-successful try.
+    pub(crate) join_backoff: std::time::Duration,
     /// Serializes one client's environment creates, so a quota check and its create are one step.
     pub(crate) env_create: std::collections::HashMap<String, tokio::sync::Mutex<()>>,
 }
@@ -133,8 +137,18 @@ pub(crate) async fn handle(state: Arc<State>, req: Request<Incoming>) -> Respons
         (&Method::POST, ["v1", "environments", _, "link"]) => Err(UNSUPPORTED),
         _ => Err(NOT_FOUND),
     };
+    let output_route = matches!(segments.as_slice(), ["v1", "jobs", _, "output"]);
     match result {
-        Ok((status, body)) => respond(status, &body),
+        Ok((status, body)) => {
+            let mut response = respond(status, &body);
+            if output_route {
+                // Job output must not sit in a shared or persistent cache.
+                response
+                    .headers_mut()
+                    .insert(CACHE_CONTROL, hyper::header::HeaderValue::from_static("no-store"));
+            }
+            response
+        }
         Err(e) => error(&e),
     }
 }

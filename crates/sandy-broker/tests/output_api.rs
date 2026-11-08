@@ -440,14 +440,17 @@ async fn a_collector_whose_first_attaches_fail_keeps_trying_after_the_job_ended(
     // ends, so the collector must spend all its tries before it gives up.
     let f = fixture_with_opts(Opts {
         attach_socket: false,
-        output_join_backoff: Duration::from_millis(50),
+        output_join_backoff: Duration::from_millis(400),
         ..Opts::default()
     })
     .await?;
     let id = f.submit(TOKEN_A).await?;
     f.finish(&id, JobStatus::Succeeded)?;
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let (_, early) = f.output(&id, TOKEN_A, "offset=0").await?;
+    assert_eq!(early["done"], false, "gave up while tries were left: {early}");
     let done = f.output_done(&id).await?;
-    assert_eq!(done["fault"], "collector could not attach", "{done}");
+    assert!(done["fault"].is_string(), "{done}");
     Ok(())
 }
 

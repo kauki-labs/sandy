@@ -508,6 +508,7 @@ mod tests {
                 (4, 4),
             )),
             send_timeout: Duration::from_secs(30),
+            join_backoff: Duration::from_millis(10),
             env_create: HashMap::new(),
         })
     }
@@ -528,6 +529,7 @@ mod tests {
                 (4, 4),
             )),
             send_timeout: Duration::from_secs(30),
+            join_backoff: Duration::from_millis(10),
             env_create: HashMap::new(),
         })
     }
