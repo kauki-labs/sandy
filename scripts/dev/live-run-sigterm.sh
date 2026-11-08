@@ -47,7 +47,16 @@ work=$(mktemp -d /tmp/slt.XXXXXX)
 chmod 0700 "$work"
 mkdir -p "$work/home"
 pids=""
+launcher=""
+# A process and everything it started: the launcher is `nix shell` around `sandy`, around the hypervisor.
+kill_tree() {
+  local child
+  for child in $(pgrep -P "$1" 2>/dev/null || true); do kill_tree "$child"; done
+  kill -9 "$1" 2>/dev/null || true
+}
 cleanup() {
+  # Stop the launcher first, so a gate that gave up early leaves no sandy or nix eval running on a deleted work dir.
+  if [ -n "$launcher" ]; then kill_tree "$launcher"; fi
   for pid in $pids; do
     case "$(ps -o comm= -p "$pid" 2>/dev/null || true)" in
     qemu-system* | virtiofsd | sandy-egress-pr* | */vfkit | */sandy-egress-proxy) kill -9 "$pid" 2>/dev/null || true ;;
@@ -75,11 +84,12 @@ echo "== starting the guest"
     --timeout 900 --allow example.com:443 -- sleep 600 \
     >"$work/result.json" 2>"$work/stderr.log"
 ) &
+launcher=$!
 
 record=""
 # A first run from a new checkout evaluates and builds the guest topology: allow it time.
 for _ in $(seq 450); do
-  record=$(ls "$work"/sandy/*/box.json 2>/dev/null | head -1 || true)
+  record=$(find "$work/sandy" -name box.json 2>/dev/null | head -1 || true)
   if [ -n "$record" ] && [ "$(python3 -I -c 'import json, sys; print(len(json.load(open(sys.argv[1]))["procs"]))' "$record" 2>/dev/null || echo 0)" -ge 2 ]; then
     break
   fi
@@ -97,6 +107,11 @@ rundir=$(dirname "$record")
 echo "== sandy is pid $owner, the box runs: $pids"
 
 alive() { kill -0 "$1" 2>/dev/null; }
+
+# The box record appears when the processes start, before the guest has booted. Give the guest time to reach its
+# command, so the signal lands on a running guest and not on a boot.
+echo "== letting the guest boot"
+sleep 40
 
 echo "== sending SIG$signal"
 kill -s "$signal" "$owner"

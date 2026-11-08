@@ -313,20 +313,21 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
         }
     };
     // A cancel (SIGTERM, SIGHUP or SIGINT to `sandy run`, #687) ends the run `cancelled`, band 1, whatever the
-    // backend made of it: the real backends treat it like a timeout or a refusal. A run that finished clean first
-    // keeps its result.
-    let (classification, message) = if plan.control.is_cancelled() && classification.status != Status::Succeeded {
-        (
-            Classification {
-                status: Status::Cancelled,
-                retryable: false,
-                process_exit: ProcessExit::TaskFailure,
-            },
-            format!("run cancelled ({message})"),
-        )
-    } else {
-        (classification, message)
-    };
+    // backend made of it: the real backends treat it like a timeout or a refusal. A guest that already exited
+    // (clean or not) keeps its result: the signal only found the teardown.
+    let (classification, message) =
+        if plan.control.is_cancelled() && classification.status != Status::Succeeded && guest_exit.is_none() {
+            (
+                Classification {
+                    status: Status::Cancelled,
+                    retryable: false,
+                    process_exit: ProcessExit::TaskFailure,
+                },
+                format!("run cancelled ({message})"),
+            )
+        } else {
+            (classification, message)
+        };
     // Teardown completed the moment the backend returned and the egress boundary
     // (if enforced) was reverted, just above — captured here, before the console
     // redaction pass or the journal write, neither of which are part of the run

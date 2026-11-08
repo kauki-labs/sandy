@@ -189,6 +189,36 @@ mod tests {
         Ok(())
     }
 
+    /// The child half of [`an_ignored_signal_stays_ignored_after_the_handlers_are_installed`]: it runs in a process
+    /// that inherited SIGHUP as ignored, installs the handlers, and takes a SIGHUP.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_ignored_signal_stays_ignored_after_the_handlers_are_installed() -> anyhow::Result<()> {
+        if std::env::var_os("SANDY_SIGNALS_IGNORED_CHILD").is_some() {
+            let control = RunControl::with_timeout_secs(60);
+            cancel_on_termination(control.clone())?;
+            kill_process(getpid(), Signal::HUP)?;
+            std::thread::sleep(Duration::from_millis(300));
+            anyhow::ensure!(!control.is_cancelled(), "an inherited-ignored SIGHUP must stay ignored");
+            return Ok(());
+        }
+        // `nohup` does this before it execs: SIGHUP is ignored when the program starts.
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(
+                "trap '' HUP; exec \"$0\" --exact \
+                 signals::tests::an_ignored_signal_stays_ignored_after_the_handlers_are_installed --nocapture",
+            )
+            .arg(std::env::current_exe()?)
+            .env("SANDY_SIGNALS_IGNORED_CHILD", "1")
+            .status()?;
+        assert!(
+            status.success(),
+            "the child with SIGHUP ignored must not be cancelled by it: {status}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn a_second_signal_is_swallowed_and_the_process_lives() -> anyhow::Result<()> {
         let control = RunControl::with_timeout_secs(60);
