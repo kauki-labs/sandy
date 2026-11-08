@@ -252,23 +252,28 @@ mod tests {
         for mode in [
             0o640, 0o604, 0o644, 0o660, 0o666, 0o601, 0o700, 0o500, 0o4600, 0o2600, 0o1600,
         ] {
-            put(tmp.path(), "WIDE", mode, VALUE)?;
-            let got = store.read("WIDE");
-            let stored = fs::metadata(tmp.path().join("WIDE"))
-                .context("stat")?
-                .permissions()
-                .mode()
-                & 0o7777;
-            // The OS may drop a bit it does not allow this user to set (sticky on a macOS file).
-            if stored != mode {
+            let path = tmp.path().join("WIDE");
+            let _ = fs::remove_file(&path);
+            fs::write(&path, VALUE).context("write secret file")?;
+            // The OS may refuse or drop a bit it does not let this user set (setgid outside the file's group,
+            // sticky on a macOS file). The row is then skipped, and the skips are bounded below.
+            let set = fs::set_permissions(&path, fs::Permissions::from_mode(mode));
+            let stored = fs::metadata(&path).context("stat")?.permissions().mode() & 0o7777;
+            if set.is_err() || stored != mode {
                 skipped.push(mode);
                 continue;
             }
+            let got = store.read("WIDE");
             assert!(
                 matches!(got, Err(SecretStoreError::Refused { .. })),
                 "mode {mode:o}: {got:?}"
             );
         }
+        // Only setgid and sticky may be skipped: a vacuous setuid row must show.
+        assert!(
+            skipped.iter().all(|mode| [0o2600, 0o1600].contains(mode)),
+            "modes the OS did not store: {skipped:?}"
+        );
         Ok(())
     }
 
