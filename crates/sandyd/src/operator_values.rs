@@ -3,6 +3,7 @@
 //! redacts in `Debug` and zeroes on drop. Staging a value on an environment is a later slice.
 
 use std::{
+    fs::File,
     io::Read as _,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
@@ -71,32 +72,33 @@ impl std::fmt::Debug for SecretValue {
 /// A directory of secret files, one per name.
 #[derive(Debug)]
 pub struct SecretStore {
-    dir: PathBuf,
+    dir: sandy_fsutil::OwnedDir,
 }
 
 impl SecretStore {
-    /// Open the store at `dir`.
+    /// Open the store at `dir`. The handle is held: every read goes through it, so a swap of the
+    /// directory after this call is not followed.
     ///
     /// # Errors
     ///
-    /// [`SecretStoreError::Store`] when `dir` is not a directory owned by the daemon's user, or is
-    /// writable by group or other.
+    /// [`SecretStoreError::Store`] when `dir` is a symlink (with or without a trailing slash), not a
+    /// directory, owned by another user, or writable by group or other.
     pub fn open(dir: &Path) -> Result<Self, SecretStoreError> {
-        let store = |reason: &str| SecretStoreError::Store {
-            path: dir.to_owned(),
-            reason: reason.to_owned(),
-        };
-        let meta = std::fs::symlink_metadata(dir).map_err(|e| store(&format!("cannot be read: {}", e.kind())))?;
-        if !meta.is_dir() {
-            return Err(store("is not a directory"));
-        }
-        if meta.uid() != sandy_fsutil::current_uid() {
-            return Err(store("is owned by another user"));
-        }
-        if meta.mode() & 0o022 != 0 {
-            return Err(store("is writable by group or other"));
-        }
-        Ok(Self { dir: dir.to_owned() })
+        // `Path::components` drops a trailing `/`, which would make the kernel follow a link in the leaf.
+        let dir: PathBuf = dir.components().collect();
+        let held = sandy_fsutil::OwnedDir::open(&dir).map_err(|e| SecretStoreError::Store {
+            path: dir.clone(),
+            reason: match e {
+                sandy_fsutil::FsError::Unsafe { reason, .. } => reason,
+                sandy_fsutil::FsError::Io { source, .. } | sandy_fsutil::FsError::NotDurable { source, .. } => {
+                    format!(
+                        "cannot be opened as a directory (missing, a symlink, or not a directory): {}",
+                        source.kind()
+                    )
+                }
+            },
+        })?;
+        Ok(Self { dir: held })
     }
 
     /// Read the secret called `name`.
@@ -105,6 +107,8 @@ impl SecretStore {
     ///
     /// A [`SecretStoreError`]: a bad name, a missing file, a refused file or an I/O failure.
     pub fn read(&self, name: &str) -> Result<SecretValue, SecretStoreError> {
+        use rustix::{fs::OFlags, io::Errno};
+
         if !name_ok(name) {
             return Err(SecretStoreError::BadName);
         }
@@ -116,39 +120,52 @@ impl SecretStore {
             name: name.to_owned(),
             kind,
         };
-        // `open_file` refuses a symlink or a non-regular file at the leaf, and a fifo cannot block it.
-        let file = sandy_fsutil::beneath::open_file(&self.dir.join(name)).map_err(|e| match e {
-            sandy_fsutil::FsError::Unsafe { .. } => refused("not a regular file, or a symlink"),
-            sandy_fsutil::FsError::Io { source, .. } | sandy_fsutil::FsError::NotDurable { source, .. } => {
-                if source.kind() == std::io::ErrorKind::NotFound {
-                    SecretStoreError::Missing { name: name.to_owned() }
-                } else {
-                    unreadable(source.kind())
-                }
-            }
+        // Relative to the held directory, leaf not followed. NONBLOCK keeps a fifo from blocking the open;
+        // the regular-file check below refuses it.
+        let fd = rustix::fs::openat(
+            &self.dir,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|e| match e {
+            Errno::NOENT => SecretStoreError::Missing { name: name.to_owned() },
+            Errno::LOOP => refused("a symlink"),
+            other => unreadable(std::io::Error::from(other).kind()),
         })?;
+        let mut file = File::from(fd);
         let meta = file.metadata().map_err(|e| unreadable(e.kind()))?;
+        if !meta.is_file() {
+            return Err(refused("not a regular file"));
+        }
         if meta.uid() != sandy_fsutil::current_uid() {
             return Err(refused("owned by another user"));
         }
-        if meta.mode() & 0o177 != 0 {
-            return Err(refused("accessible to group or other, or executable"));
+        // Group and other bits, owner execute, setuid, setgid and sticky: the file is exactly `0600` or tighter.
+        if meta.mode() & 0o7177 != 0 {
+            return Err(refused("not mode 0600 or tighter"));
         }
         let declared = meta.len();
         if declared > MAX_SECRET_BYTES {
             return Err(refused("larger than the 64 KiB cap"));
         }
-        // Sized once and never grown, so a file that grows after the check cannot move the bytes to a
-        // buffer the wrapper does not zero. One extra byte detects the growth.
-        let limit = declared + 1;
-        let capacity = usize::try_from(limit).map_err(|_| refused("larger than the 64 KiB cap"))?;
-        let mut bytes = Zeroizing::new(Vec::with_capacity(capacity));
-        file.take(limit)
-            .read_to_end(&mut bytes)
-            .map_err(|e| unreadable(e.kind()))?;
-        if u64::try_from(bytes.len()).map_or(true, |read| read > declared) {
+        let len = usize::try_from(declared).map_err(|_| refused("larger than the 64 KiB cap"))?;
+        // One buffer, zeroed first and never grown, read into directly: no reallocation and no stack copy
+        // leaves a second copy outside the wrapper. The extra byte detects a file that grew.
+        let mut bytes = Zeroizing::new(vec![0_u8; len + 1]);
+        let mut filled = 0;
+        while filled < bytes.len() {
+            match file.read(&mut bytes[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(unreadable(e.kind())),
+            }
+        }
+        if filled != len {
             return Err(refused("changed while it was being read"));
         }
+        bytes.truncate(len);
         Ok(SecretValue(bytes))
     }
 }
@@ -177,6 +194,8 @@ mod tests {
 
     fn put(dir: &Path, name: &str, mode: u32, bytes: &[u8]) -> Result<PathBuf> {
         let path = dir.join(name);
+        // A file left read-only by an earlier call cannot be rewritten.
+        let _ = fs::remove_file(&path);
         fs::write(&path, bytes).context("write secret file")?;
         fs::set_permissions(&path, fs::Permissions::from_mode(mode)).context("chmod secret file")?;
         Ok(path)
@@ -215,8 +234,20 @@ mod tests {
             0o640, 0o604, 0o644, 0o660, 0o666, 0o601, 0o700, 0o500, 0o4600, 0o2600, 0o1600,
         ] {
             put(tmp.path(), "WIDE", mode, VALUE)?;
-            let err = store.read("WIDE").expect_err("wide mode");
-            assert!(matches!(err, SecretStoreError::Refused { .. }), "mode {mode:o}: {err}");
+            let got = store.read("WIDE");
+            let stored = fs::metadata(tmp.path().join("WIDE"))
+                .context("stat")?
+                .permissions()
+                .mode()
+                & 0o7777;
+            // The OS may drop a bit it does not allow this user to set (sticky on a macOS file).
+            if stored != mode {
+                continue;
+            }
+            assert!(
+                matches!(got, Err(SecretStoreError::Refused { .. })),
+                "mode {mode:o}: {got:?}"
+            );
         }
         Ok(())
     }
