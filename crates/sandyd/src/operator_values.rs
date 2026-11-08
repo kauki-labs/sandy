@@ -211,7 +211,9 @@ mod tests {
     #[test]
     fn a_file_with_group_or_other_bits_is_refused() -> Result<()> {
         let (tmp, store) = store()?;
-        for mode in [0o640, 0o604, 0o644, 0o660, 0o666, 0o601] {
+        for mode in [
+            0o640, 0o604, 0o644, 0o660, 0o666, 0o601, 0o700, 0o500, 0o4600, 0o2600, 0o1600,
+        ] {
             put(tmp.path(), "WIDE", mode, VALUE)?;
             let err = store.read("WIDE").expect_err("wide mode");
             assert!(matches!(err, SecretStoreError::Refused { .. }), "mode {mode:o}: {err}");
@@ -271,7 +273,7 @@ mod tests {
         let path = put(tmp.path(), "MODEL_API_KEY", 0o600, VALUE)?;
         let text = String::from_utf8_lossy(VALUE).into_owned();
         let value = store.read("MODEL_API_KEY").context("read")?;
-        assert!(!format!("{value:?}").contains(&text));
+        assert_eq!(format!("{value:?}"), "SecretValue(<redacted>)");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).context("widen")?;
         let wide = store.read("MODEL_API_KEY").expect_err("wide");
         assert!(!format!("{wide} {wide:?}").contains(&text));
@@ -291,13 +293,58 @@ mod tests {
             SecretStore::open(&tmp.path().join("absent")),
             Err(SecretStoreError::Store { .. })
         ));
-        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o777)).context("chmod")?;
-        assert!(matches!(
-            SecretStore::open(tmp.path()),
-            Err(SecretStoreError::Store { .. })
-        ));
+        for mode in [0o777, 0o770, 0o707, 0o720, 0o702, 0o722] {
+            fs::set_permissions(tmp.path(), fs::Permissions::from_mode(mode)).context("chmod")?;
+            assert!(
+                matches!(SecretStore::open(tmp.path()), Err(SecretStoreError::Store { .. })),
+                "mode {mode:o}"
+            );
+        }
         fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).context("restore")?;
         SecretStore::open(tmp.path()).context("a 0700 directory opens")?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_symlinked_store_directory_is_refused_with_or_without_a_trailing_slash() -> Result<()> {
+        let tmp = tempfile::tempdir().context("tempdir")?;
+        let real = tmp.path().join("real");
+        fs::create_dir(&real).context("mkdir")?;
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o700)).context("chmod")?;
+        let link = tmp.path().join("link");
+        symlink(&real, &link).context("symlink")?;
+        for path in [link.clone(), PathBuf::from(format!("{}/", link.display()))] {
+            assert!(
+                matches!(SecretStore::open(&path), Err(SecretStoreError::Store { .. })),
+                "{}",
+                path.display()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_directory_swapped_for_a_symlink_after_open_is_not_followed() -> Result<()> {
+        let tmp = tempfile::tempdir().context("tempdir")?;
+        let secrets = tmp.path().join("secrets");
+        fs::create_dir(&secrets).context("mkdir")?;
+        fs::set_permissions(&secrets, fs::Permissions::from_mode(0o700)).context("chmod")?;
+        put(&secrets, "MODEL_API_KEY", 0o600, VALUE)?;
+        let store = SecretStore::open(&secrets).context("open")?;
+        // An attacker with write access to the parent swaps the directory for a link to their own.
+        let evil = tmp.path().join("evil");
+        fs::create_dir(&evil).context("mkdir evil")?;
+        put(&evil, "MODEL_API_KEY", 0o600, b"attacker-value")?;
+        fs::rename(&secrets, tmp.path().join("moved")).context("rename")?;
+        symlink(&evil, &secrets).context("symlink")?;
+        let read = store
+            .read("MODEL_API_KEY")
+            .context("read from the directory opened first")?;
+        assert_eq!(
+            read.expose(),
+            VALUE,
+            "the read must come from the directory that was checked"
+        );
         Ok(())
     }
 }
