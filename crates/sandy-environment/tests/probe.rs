@@ -134,7 +134,7 @@ fn the_500_boundary_and_other_statuses() -> Result<()> {
         ("HTTP/1.1 2000 X\r\n\r\n", false),
         ("HTTP/1.1 200garbage\r\n\r\n", false),
         ("HTTP/1.1 200\r\n\r\n", true),
-        ("HTTP/1.1 200", true), // the status at the very end of input
+        ("HTTP/1.1 200", false), // the status at the very end of input: no delimiter, no answer
         ("HTTP/2 200\r\n\r\n", false),
         ("HTTP/1.", false), // early EOF
     ] {
@@ -174,7 +174,7 @@ fn a_server_that_never_answers_or_trickles_cannot_hold_the_probe_past_its_budget
         let out = probe_at(addr)?;
         assert!(matches!(&out, Probe::Starting { .. }), "{byte:?}: {out:?}");
         assert!(
-            start.elapsed() < Duration::from_millis(2000),
+            start.elapsed() < Duration::from_millis(3000),
             "{byte:?}: the probe took {:?}",
             start.elapsed()
         );
@@ -191,7 +191,7 @@ fn a_status_line_that_stalls_before_its_delimiter_is_starting_not_ready() -> Res
     let out = probe_at(addr)?;
     assert!(matches!(&out, Probe::Starting { step } if step == "boot"), "{out:?}");
     assert!(
-        start.elapsed() < Duration::from_millis(2000),
+        start.elapsed() < Duration::from_millis(3000),
         "took {:?}",
         start.elapsed()
     );

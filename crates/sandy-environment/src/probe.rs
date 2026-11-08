@@ -52,7 +52,7 @@ pub(crate) fn http_status(addr: SocketAddr) -> Option<u16> {
         [v, b' ', a, b, c, delim @ ..]
             if v.is_ascii_digit()
                 && [a, b, c].iter().all(|d| d.is_ascii_digit())
-                && delim.first().is_none_or(|&d| matches!(d, b' ' | b'\r' | b'\n')) =>
+                && delim.first().is_some_and(|&d| matches!(d, b' ' | b'\r' | b'\n')) =>
         {
             // "000" to "099" are no HTTP status: a non-HTTP listener must not read as Ready.
             std::str::from_utf8(&[*a, *b, *c])
