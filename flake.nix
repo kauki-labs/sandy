@@ -358,6 +358,99 @@
                   printf '%s' "$vfkitTopology" > "$out/vfkit-topology.json"
                 '';
           }
+          # Eval-only proof of the guest setup sequence (#670): each `sandy.setup.<name>` becomes a oneshot
+          # ordered before and required by `sandy-ready.target`, `after` orders steps, the serial getty (which
+          # prints the SANDY-READY marker) requires that target, and a dangling `after` fails an assertion.
+          // lib.optionalAttrs (system == "x86_64-linux") {
+            guest-setup-eval =
+              let
+                guest =
+                  setup:
+                  inputs.self.lib.mkGuest {
+                    system = "x86_64-linux";
+                    hypervisor = "qemu";
+                    extraModules = [
+                      {
+                        sandy.setup = setup;
+                        users.users.dev.isNormalUser = true;
+                      }
+                    ];
+                  };
+                good =
+                  (guest {
+                    clone = {
+                      script = "true";
+                      description = "clone";
+                      timeoutSecs = 30;
+                    };
+                    deps = {
+                      script = "true";
+                      user = "dev";
+                      after = [ "clone" ];
+                    };
+                  }).config;
+                bad =
+                  (guest {
+                    deps = {
+                      script = "true";
+                      after = [ "missing" ];
+                    };
+                  }).config;
+                badName =
+                  (guest {
+                    "a.b" = {
+                      script = "true";
+                    };
+                  }).config;
+                selfAfter =
+                  (guest {
+                    loop = {
+                      script = "true";
+                      after = [ "loop" ];
+                    };
+                  }).config;
+                cloneText = good.systemd.units."sandy-setup-clone.service".text;
+                gettyText = good.systemd.units."serial-getty@.service".text;
+                clone = good.systemd.services.sandy-setup-clone;
+                deps = good.systemd.services.sandy-setup-deps;
+                getty = good.systemd.services."serial-getty@";
+                mounts = [
+                  "run-sandy-secrets.mount"
+                  "run-sandy-inputs.mount"
+                  "run-sandy-outputs.mount"
+                ];
+                failing = c: builtins.filter (a: !a.assertion) c.assertions;
+                checks = {
+                  cloneBeforeReady = clone.before == [ "sandy-ready.target" ];
+                  cloneRequiredByReady = clone.requiredBy == [ "sandy-ready.target" ];
+                  cloneRunsAsRoot = clone.serviceConfig.User == "root";
+                  depsOrderedAfterClone = builtins.elem "sandy-setup-clone.service" deps.after;
+                  depsRequiresClone = deps.requires == [ "sandy-setup-clone.service" ];
+                  depsRunsAsDev = deps.serviceConfig.User == "dev";
+                  oneshot = clone.serviceConfig.Type == "oneshot";
+                  gettyGatedOnReady =
+                    getty.requires == [ "sandy-ready.target" ] && getty.after == [ "sandy-ready.target" ];
+                  cloneTimeout = clone.serviceConfig.TimeoutStartSec == 30;
+                  cloneWantsShares = clone.wants == mounts;
+                  cloneAfterShares = lib.all (m: builtins.elem m clone.after) mounts;
+                  cloneNeverRequiresShares = !(lib.any (m: builtins.elem m (clone.requires or [ ])) mounts);
+                  # The generated unit text, not just the option attrset.
+                  unitTextOrdersBeforeReady = lib.hasInfix "Before=sandy-ready.target" cloneText;
+                  unitTextTimeout = lib.hasInfix "TimeoutStartSec=30" cloneText;
+                  unitTextWantsShares = lib.hasInfix "Wants=${lib.concatStringsSep " " mounts}" cloneText;
+                  unitTextAfterShares = lib.all (m: lib.hasInfix m cloneText) mounts;
+                  gettyTextRequiresReady = lib.hasInfix "Requires=sandy-ready.target" gettyText;
+                  gettyTextAfterReady = lib.hasInfix "After=sandy-ready.target" gettyText;
+                  badNameIsRefused = builtins.length (failing badName) == 1;
+                  selfAfterIsRefused = builtins.length (failing selfAfter) == 1;
+                  goodHasNoFailedAssertion = failing good == [ ];
+                  danglingAfterIsRefused = builtins.length (failing bad) == 1;
+                };
+                failed = builtins.attrNames (lib.filterAttrs (_: ok: !ok) checks);
+              in
+              assert lib.assertMsg (failed == [ ]) "guest-setup-eval failed: ${builtins.toJSON failed}";
+              pkgs.runCommand "guest-setup-eval" { } "touch $out";
+          }
           # Eval-only proof that `nix/guest-wrapper/flake.nix` (#325, "never
           # evaluated directly" per its own description — sandy always drives
           # it with `--override-input target <ref>`) actually composes a real

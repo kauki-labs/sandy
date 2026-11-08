@@ -2219,8 +2219,10 @@ pass).
 - `sandy-environment::ProcessEnvironmentBackend` implements `EnvironmentBackend` by starting a configured argv (for example `t3 serve`) as one host process group per environment, in its own `0700` directory under a `0700` state dir. `SANDY_ENV_BACKEND=process-insecure` turns it on (and the launch driver with it); an unset or blank value leaves the driver off, and any other value is a startup error, never a silent off. The daemon logs a warning at startup.
 - It gives **no isolation**. The service runs as the daemon's user, with the daemon's filesystem and network. It is for trusted, local development only. The `SANDY_ENV_PASS_ENV` variables, which may be provider credentials, are passed into the service by design.
 - What it does guarantee: the service gets a cleared environment (`PATH`, `HOME`, `LANG`, `TMPDIR` and only the named variables); the service command must contain `{port}` (the backend picks a free loopback port); readiness is the HTTP status on that port (a refused connection or a 5xx is `Starting`); an environment id cannot name a path outside the state dir; the state dir and each environment dir are opened through `sandy_fsutil::OwnedDir` (this user's, not a symlink, not group- or world-writable) and the service log, pid and pairing files are created exclusively at `0600`; `SANDY_ENV_PASS_ENV` cannot name `HOME`, `PATH`, `TMPDIR` or `LANG`; `kill` ends the whole process group and removes the directory (a retried `kill` removes a directory the first could not); a service that exits is `Failed` with its exit status.
+- The port is picked before the service starts, so another local process can take it in between (#637). `probe` reports `Ready` only when the listener on the port belongs to the service's process group: on Linux the listening socket's inode in `/proc/net/tcp{,6}` against the `/proc/<pid>/fd` links of the group, elsewhere `lsof` plus `ps`. A listener held by another process fails the environment with step `port`. A port nobody listens on yet reads `Starting`, and so does a listener the host tools cannot attribute (another user's on macOS), so it is never mistaken for the service. A service that leaves its process group (`setsid`) fails this check, like the orphan sweep it already escapes. No `t3` support is needed.
 - Pairing (owner decision, option 1): an optional `SANDY_ENV_PAIR_COMMAND` runs once after the service first answers. Its stdout goes only to `<base_dir>/pairing` (mode `0600`), and the command runs in its own process group, killed whole on timeout. The backend never puts the code in a probe, an error, a log or the pair command's stderr (a service that prints a code itself writes it to `service.log`, which stays `0600` in the environment dir), so it never reaches a tool result (#585 O8). The operator reads the file and links the primary out of band.
 - Restart: environments do not survive a daemon restart. Dropping the backend kills every process group (a test covers it). One daemon owns a state dir: the backend takes an exclusive lock on `<state_dir>/.lock` and refuses to start when it is held, and `sandyd` starts the driver only after its own locks and binds, so a second daemon never sweeps live directories. After a hard kill the next start removes the stale directories and, on Linux only, kills the recorded process group when the pid file's start time (`/proc/<pid>/stat`, field 22) still matches the live process, so a reused pid is never hit. A service that leaves its process group (`setsid`) is not reached, since there is no isolation. On macOS an orphan may keep running until the operator kills it.
+- Trusted submitters only (#641): `CreateEnvironmentRequest.submitter_class` carries the class the broker's client record allows. When this backend starts, `EnvironmentStore::require_trusted_submitter` is set and `create` refuses anything but `TRUSTED` (including `UNSPECIFIED` and unknown values) with `FORBIDDEN`, before the replay lookup, so a client lowered to `untrusted` cannot replay an old create either. The row records whether its submitter was trusted (`submitter_trusted`; rows from before the column count as not trusted), and the launch driver fails a row that is not trusted with step `admission` before it launches anything. That covers rows made while no backend ran and then launched after a restart with one. A resume re-launches a row its trusted creator made, even if the operator has since lowered that client: the class is checked at create, not re-read at resume. The class is outside `EnvironmentSpec`, so the idempotency bytes do not change. sandyd trusts the broker to set it, as it trusts the broker's job class; a caller that speaks the control socket directly is a local user of the daemon and is out of scope here.
 - Settings (`crates/sandyd/src/environment_backend.rs`): `SANDY_ENV_BACKEND`, `SANDY_ENV_PROCESS_COMMAND` (split on whitespace; `{port}`, `{base_dir}`, `{environment_id}` expand), `SANDY_ENV_PAIR_COMMAND`, `SANDY_ENV_STATE_DIR` (default `<runtime dir>/environments`), `SANDY_ENV_PASS_ENV`, `SANDY_ENV_PATH`, `SANDY_ENV_PROVISION_TIMEOUT_SECS` (default 120).
 
 **Consequences.** Environments created over the RPC now reach `Ready` with `connection.url` set, so the broker and the MCP tools can be driven end to end. One daemon runs at most the environments its host can hold, with no resource limit per environment. The pairing file and the service log live in the environment directory and go with it on `kill`.
@@ -2258,6 +2260,7 @@ A client that polls `GetEnvironment` renews the lease for as long as it polls, a
 **Decision.**
 
 - `sandy-environment::VmEnvironmentBackend` runs one `VmBackend::run` per environment on its own thread, with the deadline suspended. `launch` returns once the thread starts. `kill` marks the entry as stopping, cancels the run's `RunControl` and waits up to 30 s for `run()` to return. While it waits the box stays listed and a launch for that id is refused, so no second VM starts before the first is gone. Concurrent kills wait on the same run. A run that does not return keeps its entry, so a later kill retries. Dropping the backend waits the same bounded time, then logs and gives up instead of hanging shutdown.
+- With a `StopRequest` set (`with_graceful_stop`, #670), `kill` first asks the guest to stop, with a grace in whole seconds, and waits up to the grace plus a 5 s margin for `run()` to return; only then does it cancel as above. The guest then gets to run its teardown. A request that cannot be sent, or a run that already ended, skips the wait. The stop is a stored channel message, so an implementation posts it on a channel that belongs to one launch, never one a relaunch reuses. A `kill` now takes up to the grace plus the margin plus the 30 s cancel wait, and `EnvironmentDriver` kills serially in one reconcile pass, so many environments stopping at once delay the pass.
 - One hypervisor backend serves one environment, because agent mode runs one job per backend. The caller supplies a factory.
 - `boxes()` lists only runs still up. A run that returned is `NotRunning`, and a launch for that id starts a fresh box.
 - Readiness is not decided here. A `ServiceProbe` (the host bridge, slice C3b) is asked while the run is up; with none set, the probe reports `Starting`.
@@ -2268,3 +2271,34 @@ A client that polls `GetEnvironment` renews the lease for as long as it polls, a
 **Consequences.** The backend is generic over `VmBackend`, so it is tier-2 testable with a double that holds until cancelled. It is not wired into `sandyd` yet: that needs the two `impls/vm` hooks (the qemu CID, the vfkit port-5100 device) and the bridge probe (C3b). VMs do not survive a daemon restart in this slice, because the threads die with the process. A restart policy is open on #587.
 
 **Alternative set aside.** A new launch path in `impls/vm`: it would fork boot and teardown logic across two backends.
+
+## 32. A collector cap for the broker's output collector: not an attach (#643)
+
+**Context.** The broker keeps a per-job output buffer and needs a join for the job's whole run
+(`broker-api.md` decision 8). A submitter attach would share the `operator` membership and
+cursor with a client's stream, and every join counted by `join_for_attach` sends
+`AttachStateChanged`, which lifts the unlimited-while-attached deadline policy on a remote host
+(decision 14, #340). The observer cap was no fit either: it is shared by every observer.
+
+**Decision.**
+
+- `AttachRequest.collector` (field 3) asks for the collector cap. `Attach` mints it, read-only and
+  under the peer name `collector`, only when the matching attach token is presented. A session
+  match alone, no token, or a wrong token is refused.
+- The attach accept loop routes a join whose cap names the `collector` peer to a plain
+  `Channel::join` and `relay` with no attach tracking. It is not counted and sends no
+  `AttachStateChanged`, at join or at leave. `Channel::join` still verifies the cap.
+- The collector cap is minted under its own peer name, so its membership differs from the
+  `operator`, `observer` and `archiver` memberships. Two collector caps for one job minted in the
+  same second are identical (`LocalCapAuthority` mints deterministically per second) and share a
+  membership, so the broker spaces its join retries at least 10 s apart. A second observer joining
+  and leaving does not end the collector's stream.
+- The accept loop admits the collector path only for a read-only cap: a post-capable cap named
+  `collector` is refused. The collector relay is delivery only and ends, closing the connection,
+  on a channel fault or a failed write, so the broker reads EOF and reports a fault. The broker
+  also refuses a cap that is not read-only `collector`: an older sandyd ignores `collector` and
+  answers with the submitter's cap.
+- The broker holds at most 16 collector connections per client and 64 in all, well under the
+  256 attach connections the accept loop serves. A job past the bound waits for a slot.
+
+**Set aside.** Reusing `observer_cap`, and counting the collector as an attach.

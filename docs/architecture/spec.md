@@ -631,7 +631,7 @@ owner.
 - An idle-stop lease (decision 30) stops a `Ready` environment with no owner-visible use or backend-reported connection (#645) for `SANDY_ENV_IDLE_TIMEOUT_SECS`; off by default.
 - The VM backend (decision 31) holds one agent-mode `VmBackend::run` per environment; it is not wired into `sandyd` until the bridge probe lands (C3b).
 
-**KPI:** rows KENV1 to KENV15 in [`kpi.md`](kpi.md).
+**KPI:** rows KENV1 to KENV16 in [`kpi.md`](kpi.md).
 
 ## Testing: integration vs end-to-end
 

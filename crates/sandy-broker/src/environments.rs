@@ -4,7 +4,7 @@
 
 use hyper::{Request, StatusCode, body::Incoming};
 use sandy_control_proto::{
-    control_request, control_response,
+    IsolationClass as WireClass, control_request, control_response,
     v1::{
         CancelEnvironmentRequest, CreateEnvironmentRequest, DeleteEnvironmentRequest, EnvironmentErrorCode,
         EnvironmentLifetime, EnvironmentLifetimeKind, EnvironmentResponse, EnvironmentSpec, EnvironmentState,
@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    Client,
+    Client, IsolationClass,
     server::{ApiError, FORBIDDEN, INVALID, NOT_FOUND, Reply, State, UNAVAILABLE, read_body, rpc},
 };
 
@@ -171,6 +171,7 @@ fn environment_error(code: i32) -> ApiError {
         Ok(EnvironmentErrorCode::UnsupportedForLifetime) => LIFETIME,
         Ok(EnvironmentErrorCode::InvalidState) => INVALID_STATE,
         Ok(EnvironmentErrorCode::InvalidArgument) => REFUSED_FIELDS,
+        Ok(EnvironmentErrorCode::Forbidden) => FORBIDDEN,
         _ => UNAVAILABLE,
     }
 }
@@ -260,6 +261,11 @@ pub(crate) async fn spawn(state: &State, client: &Client, req: Request<Incoming>
             lifetime: Some(lifetime),
             task_ref: body.task_ref,
         }),
+        submitter_class: match client.max_isolation_class {
+            IsolationClass::Trusted => WireClass::Trusted,
+            IsolationClass::Untrusted => WireClass::Untrusted,
+        }
+        .into(),
     });
     let created = one(state, op).await?;
     // The sweep may have collected the replayed row after the lookup above, so the create made
