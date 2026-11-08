@@ -26,10 +26,13 @@ use sandy::{CredentialBracket, DirFingerprint, Scope, SharedProvider, StagingTar
 /// --credential` injects.
 pub const CREDENTIAL_SECRET_NAME: &str = "GITHUB_TOKEN";
 
-/// The daemon's bound on one provider call (mint or revoke).
-pub const DAEMON_CALL_TIMEOUT: Duration = sandy::CALL_DEADLINE;
+/// The daemon's bound on one provider call (mint or revoke). Far below the CLI's
+/// [`sandy::CALL_DEADLINE`] (1500 s): each call holds a blocking-pool thread the
+/// job store also needs, so a hung forge must give it back quickly.
+pub const DAEMON_CALL_TIMEOUT: Duration = Duration::from_secs(45);
 
-/// The most credential releases that run at once.
+/// The most credential releases that run at once. More wait for a slot; none is
+/// skipped. Bounds the blocking-pool threads a hung forge's revokes can hold.
 pub const MAX_CONCURRENT_RELEASES: usize = 8;
 
 /// Builds the provider and scope for a named credential. The production resolver
@@ -66,18 +69,22 @@ pub struct JobCredentials {
     staging_base: Option<PathBuf>,
     /// The bound on each provider call (mint, revoke).
     call_timeout: Duration,
+    /// Slots for releases running at once ([`MAX_CONCURRENT_RELEASES`]).
+    release_slots: Arc<tokio::sync::Semaphore>,
     live: Mutex<HashMap<String, CredentialBracket>>,
 }
 
 impl JobCredentials {
     /// Credentials resolved by `resolver`, staged under the sandy staging base,
-    /// with each provider call bounded by [`sandy::CALL_DEADLINE`].
+    /// with each provider call bounded by [`DAEMON_CALL_TIMEOUT`] and at most
+    /// [`MAX_CONCURRENT_RELEASES`] releases at once.
     #[must_use]
     pub fn new(resolver: Arc<dyn CredentialResolver>) -> Self {
         Self {
             resolver,
             staging_base: None,
-            call_timeout: sandy::CALL_DEADLINE,
+            call_timeout: DAEMON_CALL_TIMEOUT,
+            release_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_RELEASES)),
             live: Mutex::new(HashMap::new()),
         }
     }
@@ -89,7 +96,7 @@ impl JobCredentials {
         self
     }
 
-    /// Bound each provider call by `timeout` instead of [`sandy::CALL_DEADLINE`].
+    /// Bound each provider call by `timeout` instead of [`DAEMON_CALL_TIMEOUT`].
     #[must_use]
     pub fn with_call_timeout(mut self, timeout: Duration) -> Self {
         self.call_timeout = timeout;
@@ -102,9 +109,11 @@ impl JobCredentials {
         self.call_timeout
     }
 
-    /// Run at most `max` releases at once.
+    /// Run at most `max` (at least 1) releases at once instead of
+    /// [`MAX_CONCURRENT_RELEASES`].
     #[must_use]
-    pub fn with_max_concurrent_releases(self, _max: usize) -> Self {
+    pub fn with_max_concurrent_releases(mut self, max: usize) -> Self {
+        self.release_slots = Arc::new(tokio::sync::Semaphore::new(max.max(1)));
         self
     }
 
@@ -168,13 +177,16 @@ impl JobCredentials {
 
     /// Revoke `job_id`'s credential and remove its staged file and dir, if it
     /// holds one. Idempotent: every terminal path calls this, and only the first
-    /// call finds the credential. The revoke runs on the blocking pool when a
-    /// tokio runtime is current. A revoke failure is logged as a warning naming
-    /// the job and the handle; the token then stays valid until its native expiry.
+    /// call finds the credential. When a tokio runtime is current, the revoke
+    /// runs on the blocking pool once one of the release slots is free: a
+    /// release waits for a slot, it is never skipped. A revoke failure is
+    /// logged as a warning naming the job and the handle; the token then stays
+    /// valid until its native expiry.
     pub fn release(&self, job_id: &str) {
         let Some(bracket) = self.lock_live().remove(job_id) else {
             return;
         };
+        let job = job_id.to_owned();
         let job_id = job_id.to_owned();
         let teardown = move || {
             let handle = bracket.handle().map(|h| h.id).unwrap_or_default();
@@ -191,14 +203,25 @@ impl JobCredentials {
                     "credential revoke at job teardown failed; the token stays valid until its native expiry"
                 ),
             }
-            // The provider drops here, on this blocking thread: a live adapter
-            // owns a tokio runtime, which must not drop on an async worker.
+            // `Handle::try_current` succeeds on this blocking-pool thread, so the
+            // bracket's `Drop` hands the provider to a `sandy-cred-drop` thread
+            // and it drops there, outside any runtime: a live adapter owns a
+            // tokio runtime, which must not drop inside another one.
             drop(bracket);
         };
-        if tokio::runtime::Handle::try_current().is_ok() {
-            drop(tokio::task::spawn_blocking(teardown));
-        } else {
-            teardown();
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                let slots = Arc::clone(&self.release_slots);
+                runtime.spawn(async move {
+                    // `acquire_owned` fails only on a closed semaphore, which this
+                    // one never is; revoke anyway rather than skip.
+                    let _slot = slots.acquire_owned().await.ok();
+                    if let Err(e) = tokio::task::spawn_blocking(teardown).await {
+                        tracing::warn!(job_id = job, error = %e, "the credential release task failed");
+                    }
+                });
+            }
+            Err(_) => teardown(),
         }
     }
 
@@ -891,6 +914,42 @@ mod tests {
             started.elapsed()
         );
         assert!(d.store.list()?.is_empty());
+        Ok(())
+    }
+
+    /// A revoke that hangs past the daemon's bound gives its thread back at the
+    /// bound: the staged file is removed then, not when the provider returns.
+    #[tokio::test]
+    async fn a_hung_revoke_releases_at_the_bound_and_still_removes_the_file() -> anyhow::Result<()> {
+        let provider = Scripted {
+            revoke_delay: Duration::from_secs(3),
+            ..Scripted::default()
+        };
+        let d = daemon_custom(
+            provider,
+            |c| c.with_call_timeout(Duration::from_millis(200)),
+            |_| Ok(JobStore::open_in_memory()?),
+        )?;
+        let credentials = d.registry.credentials().context("credentials configured")?;
+        let c = Arc::clone(credentials);
+        let bracket = tokio::task::spawn_blocking(move || c.mint("gh-test", &[]))
+            .await?
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let sandy::SecretSource::File(path) = bracket.secret_ref().source else {
+            anyhow::bail!("the staged secret is a file");
+        };
+        credentials.adopt("job-hung", bracket);
+        let started = Instant::now();
+        credentials.release("job-hung");
+        while path.exists() && started.elapsed() < WAIT {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!path.exists(), "the staged file must be removed");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
         Ok(())
     }
 

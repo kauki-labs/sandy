@@ -486,7 +486,9 @@ async fn record_job_result(
 ) {
     let (status, exit_code) = classify(&result);
     let job_id = result.job_id.clone();
-    in_flight.remove(&job_id);
+    // Only a job dispatched on this connection may have its credential ended
+    // here: a buggy or hostile executor must not revoke another host's job (#481).
+    let dispatched_here = in_flight.remove(&job_id);
 
     let store = Arc::clone(store);
     let console = result.console;
@@ -511,7 +513,14 @@ async fn record_job_result(
         Err(e) => tracing::warn!(job_id, error = %e, "the record-result store task failed"),
     }
     // The job is over on its host whatever the store said: revoke its credential (#481).
-    job_registry.release_credential(&job_id);
+    if dispatched_here {
+        job_registry.release_credential(&job_id);
+    } else {
+        tracing::warn!(
+            job_id,
+            "a job result arrived for a job not dispatched on this connection; its credential is kept"
+        );
+    }
 }
 
 /// Fail a job whose host-executor disconnected before reporting a result
