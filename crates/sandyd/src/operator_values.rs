@@ -89,7 +89,9 @@ impl SecretStore {
         let held = sandy_fsutil::OwnedDir::open(&dir).map_err(|e| SecretStoreError::Store {
             path: dir.clone(),
             reason: match e {
-                sandy_fsutil::FsError::Unsafe { reason, .. } => reason,
+                sandy_fsutil::FsError::Unsafe { .. } => {
+                    "must be owned by this user and not writable by group or other".to_owned()
+                }
                 sandy_fsutil::FsError::Io { source, .. } | sandy_fsutil::FsError::NotDurable { source, .. } => {
                     format!(
                         "cannot be opened as a directory (missing, a symlink, or not a directory): {}",
@@ -150,24 +152,41 @@ impl SecretStore {
             return Err(refused("larger than the 64 KiB cap"));
         }
         let len = usize::try_from(declared).map_err(|_| refused("larger than the 64 KiB cap"))?;
-        // One buffer, zeroed first and never grown, read into directly: no reallocation and no stack copy
-        // leaves a second copy outside the wrapper. The extra byte detects a file that grew.
-        let mut bytes = Zeroizing::new(vec![0_u8; len + 1]);
-        let mut filled = 0;
-        while filled < bytes.len() {
-            match file.read(&mut bytes[filled..]) {
-                Ok(0) => break,
-                Ok(n) => filled += n,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(unreadable(e.kind())),
-            }
-        }
-        if filled != len {
-            return Err(refused("changed while it was being read"));
-        }
-        bytes.truncate(len);
+        let bytes = read_declared(&mut file, len).map_err(|e| match e {
+            ReadError::Changed => refused("changed while it was being read"),
+            ReadError::Io(kind) => unreadable(kind),
+        })?;
         Ok(SecretValue(bytes))
     }
+}
+
+/// Why [`read_declared`] failed.
+enum ReadError {
+    /// The reader held more or fewer bytes than declared.
+    Changed,
+    /// The read failed.
+    Io(std::io::ErrorKind),
+}
+
+/// Read exactly `len` bytes from `reader`. One buffer, zeroed first and never grown, read into directly: no
+/// reallocation and no stack copy leaves a second copy outside the wrapper. The extra byte detects a reader that
+/// holds more than `len`; fewer is refused too.
+fn read_declared(reader: &mut impl std::io::Read, len: usize) -> Result<Zeroizing<Vec<u8>>, ReadError> {
+    let mut bytes = Zeroizing::new(vec![0_u8; len + 1]);
+    let mut filled = 0;
+    while filled < bytes.len() {
+        match reader.read(&mut bytes[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(ReadError::Io(e.kind())),
+        }
+    }
+    if filled != len {
+        return Err(ReadError::Changed);
+    }
+    bytes.truncate(len);
+    Ok(bytes)
 }
 
 /// `[A-Z][A-Z0-9_]{0,63}`: the rule `service_secrets` names follow. Checked again here because the name
@@ -230,6 +249,7 @@ mod tests {
     #[test]
     fn a_file_with_group_or_other_bits_is_refused() -> Result<()> {
         let (tmp, store) = store()?;
+        let mut skipped = Vec::new();
         for mode in [
             0o640, 0o604, 0o644, 0o660, 0o666, 0o601, 0o700, 0o500, 0o4600, 0o2600, 0o1600,
         ] {
@@ -242,6 +262,7 @@ mod tests {
                 & 0o7777;
             // The OS may drop a bit it does not allow this user to set (sticky on a macOS file).
             if stored != mode {
+                skipped.push(mode);
                 continue;
             }
             assert!(
@@ -377,5 +398,14 @@ mod tests {
             "the read must come from the directory that was checked"
         );
         Ok(())
+    }
+
+    #[test]
+    fn a_reader_that_holds_more_or_fewer_bytes_than_declared_is_refused() {
+        let read = |data: &[u8], len| read_declared(&mut std::io::Cursor::new(data.to_vec()), len);
+        assert!(matches!(read(b"abc", 3), Ok(v) if v.as_slice() == b"abc"));
+        assert!(matches!(read(b"", 0), Ok(v) if v.is_empty()));
+        assert!(matches!(read(b"abcd", 3), Err(ReadError::Changed)), "grew");
+        assert!(matches!(read(b"ab", 3), Err(ReadError::Changed)), "shrank");
     }
 }

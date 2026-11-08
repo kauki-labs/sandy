@@ -95,7 +95,8 @@ The registry has tens of profiles and is read once. `resolve` is a linear scan, 
 
 ### Operator secret store (#705)
 
-A `service_secrets` name that no provider mints takes its value from `SANDY_SECRETS_DIR`: one file per name.
+A `service_secrets` name that no provider mints takes its value from the operator's store directory: one file per name. The environment variable that names it
+is chosen when the store is wired (`SANDY_SECRETS_DIR` is taken: it is the job-side path of the staged secret share).
 `sandyd::operator_values::SecretStore` reads it and nothing else does.
 
 - Open: the directory is opened once, without following a symlink (a trailing `/` is dropped first), and
