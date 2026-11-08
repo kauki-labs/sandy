@@ -13,6 +13,7 @@
 //! data plane itself") but that didn't exist until this module.
 
 pub mod attach_relay;
+pub mod audit;
 pub mod build_rev;
 pub mod dispatch;
 pub mod environment;
