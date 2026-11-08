@@ -156,9 +156,10 @@ async fn build(
         format!(r#"{{"name":"{name}","credential":"github-main","targets":["o/r"],"capabilities":["read_code"]}}"#)
     };
     let registry = format!(
-        r#"{{"profiles":[{},{},{}]}}"#,
+        r#"{{"profiles":[{},{},{},{}]}}"#,
         entry("dev"),
         entry("prod"),
+        entry("other"),
         entry("harness")
     );
     let profiles = Arc::new(sandy::IdentityProfiles::parse(&registry)?);
