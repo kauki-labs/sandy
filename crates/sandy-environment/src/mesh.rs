@@ -2,7 +2,8 @@
 //!
 //! Pure ordering logic over seams: a coordination server (headscale), the guest
 //! secrets directory, the VM boot, the service readiness check and guest hooks. It runs no network call itself, so the
-//! whole sequence is tier-2 testable over fakes. Every seam call is bounded by a timeout.
+//! whole sequence is tier-2 testable over fakes. Every seam call is bounded by a timeout
+//! (for [`SecretsDir`] the file work runs on the blocking pool so the timeout can fire).
 //!
 //! A join key is a credential. [`JoinKey`] never prints its value, and every
 //! string this module returns or logs passes through the exact-key replace plus
@@ -14,10 +15,18 @@
 //! [`SetupError`] from [`SetupStep::Boot`] onward, the caller must run
 //! [`teardown`] with the same name and slot: setup only expires the key, so a
 //! joined node and a running VM (for example after a failed `after_ready` hook)
-//! are left for teardown. A mint that timed out can leave a server-side key
+//! are left for teardown. A failure at [`SetupStep::Prepare`] or
+//! [`SetupStep::MintKey`] removes the prepared secrets directory itself. The slot
+//! must be empty at setup; a clean teardown empties it, so teardown can be retried
+//! until it returns `Ok`. A mint that timed out can leave a server-side key
 //! that only its TTL expires; the slot cannot hold it.
 
-use std::{fmt, future::Future, time::Duration};
+use std::{
+    fmt,
+    future::Future,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 
 /// Secrets file holding the pre-auth join key.
 pub const KEY_FILE: &str = "tailscale-authkey";
@@ -186,11 +195,16 @@ pub trait ServiceReady: Send + Sync {
 /// default to a no-op.
 pub trait GuestHooks: Send + Sync {
     /// Runs after the service answers. A failure fails setup (the key is expired).
+    /// A hook error is a hook failure, so make it idempotent: a retried setup runs it again.
     fn after_ready(&self, name: &str) -> impl Future<Output = Result<(), SeamError>> + Send {
         let _ = name;
         async { Ok(()) }
     }
-    /// Runs first in teardown. A failure fails teardown after the rest ran.
+    /// Runs first in teardown, while the guest still runs. A failure fails
+    /// teardown after the rest ran. Teardown skips it when the VM never booted
+    /// (setup failed at [`SetupStep::Boot`] or earlier), once it succeeded, and once
+    /// the VM is stopped, so a retry never aims it at a stopped VM. A hook that
+    /// failed is not retried: the failure is reported on the call that ran it.
     fn before_teardown(&self, name: &str) -> impl Future<Output = Result<(), SeamError>> + Send {
         let _ = name;
         async { Ok(()) }
@@ -205,7 +219,7 @@ impl GuestHooks for NoHooks {}
 
 /// The mesh step teardown runs in the guest.
 pub trait TeardownSteps: Send + Sync {
-    /// `tailscale logout` in the guest. Best effort: a failure only logs.
+    /// `tailscale logout` in the guest of node `name`. Best effort: a failure only logs.
     fn tailscale_logout(&self, name: &str) -> impl Future<Output = Result<(), SeamError>> + Send;
 }
 
@@ -225,19 +239,48 @@ pub trait FileSink: Send + Sync {
 
 /// [`GuestDelivery`] over a [`FileSink`], enforcing the `.ready` ordering and
 /// the required, non-empty `hostname` file.
-pub struct SecretsDir<S>(S);
+///
+/// Each operation runs on the blocking pool, so a wedged sink cannot stop the
+/// caller's timeout from firing. A timed-out operation keeps its thread until
+/// the sink returns, so operations hold a gate: a later removal waits for an
+/// earlier straggling write instead of racing it.
+pub struct SecretsDir<S>(std::sync::Arc<Gated<S>>);
 
-impl<S: FileSink> SecretsDir<S> {
+struct Gated<S> {
+    sink: S,
+    gate: std::sync::Mutex<()>,
+}
+
+impl<S: FileSink + 'static> SecretsDir<S> {
     /// Wrap a sink.
     pub fn new(sink: S) -> Self {
-        Self(sink)
+        Self(std::sync::Arc::new(Gated {
+            sink,
+            gate: std::sync::Mutex::new(()),
+        }))
+    }
+
+    async fn blocking<T: Send + 'static>(
+        &self,
+        op: impl FnOnce(&S) -> Result<T, SeamError> + Send + 'static,
+    ) -> Result<T, SeamError> {
+        let inner = std::sync::Arc::clone(&self.0);
+        tokio::task::spawn_blocking(move || {
+            let _turn = inner.gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            op(&inner.sink)
+        })
+        .await
+        .unwrap_or_else(|e| Err(SeamError::new(format!("file operation did not finish: {e}"))))
     }
 }
 
-impl<S: FileSink> GuestDelivery for SecretsDir<S> {
+impl<S: FileSink + 'static> GuestDelivery for SecretsDir<S> {
     async fn prepare(&self) -> Result<(), SeamError> {
-        self.0.ensure_dir()?;
-        self.0.clear_dir()
+        self.blocking(|s| {
+            s.ensure_dir()?;
+            s.clear_dir()
+        })
+        .await
     }
 
     async fn deliver(&self, files: &[(&str, &[u8])]) -> Result<(), SeamError> {
@@ -255,23 +298,34 @@ impl<S: FileSink> GuestDelivery for SecretsDir<S> {
         if files.iter().any(|(n, _)| *n == READY_FILE) {
             return Err(SeamError::new("the ready marker is written by delivery, not passed in"));
         }
-        self.0.remove_file(READY_FILE)?;
-        for (name, bytes) in files {
-            self.0.write_file(name, bytes)?;
-        }
-        self.0.write_file(READY_FILE, b"")
+        let files: Vec<(String, Vec<u8>)> = files.iter().map(|(n, b)| ((*n).to_owned(), b.to_vec())).collect();
+        self.blocking(move |s| {
+            s.remove_file(READY_FILE)?;
+            for (name, bytes) in &files {
+                s.write_file(name, bytes)?;
+            }
+            s.write_file(READY_FILE, b"")
+        })
+        .await
     }
 
     async fn remove_secrets(&self) -> Result<(), SeamError> {
-        self.0.remove_dir_all()
+        self.blocking(|s| s.remove_dir_all()).await
     }
 }
 
-/// Caller-owned home of the join key. [`setup`] fills it right after the mint,
-/// before any further await, so a dropped setup future still leaves the key
-/// where [`teardown`] finds it.
+/// Caller-owned record of one environment's mesh state: the join key and which
+/// teardown steps already ran. [`setup`] fills it right after the mint, before
+/// any further await, so a dropped setup future still leaves the key where
+/// [`teardown`] finds it. [`setup`] refuses a slot that is not empty and a
+/// clean [`teardown`] empties it.
 #[derive(Debug, Default)]
-pub struct KeySlot(std::sync::Mutex<Option<JoinKey>>);
+pub struct KeySlot {
+    key: std::sync::Mutex<Option<JoinKey>>,
+    booted: AtomicBool,
+    vm_stopped: AtomicBool,
+    hook_done: AtomicBool,
+}
 
 impl KeySlot {
     /// An empty slot.
@@ -281,13 +335,23 @@ impl KeySlot {
     }
 
     fn set(&self, key: JoinKey) {
-        *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(key);
+        *self.key.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(key);
     }
 
     /// The key, if one was minted.
     #[must_use]
     pub fn get(&self) -> Option<JoinKey> {
-        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+        self.key
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn clear(&self) {
+        *self.key.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        for flag in [&self.booted, &self.vm_stopped, &self.hook_done] {
+            flag.store(false, Ordering::SeqCst);
+        }
     }
 }
 
@@ -447,14 +511,37 @@ where
     if cfg.call_timeout.is_zero() {
         return Err(err(SetupStep::Config, None, false, "call_timeout must be non-zero"));
     }
-    bounded(t, guest.prepare())
-        .await
-        .map_err(|e| err(SetupStep::Prepare, None, false, &e.to_string()))?;
-    let key = bounded(t, coord.mint_join_key(cfg.tag, cfg.key_ttl))
-        .await
-        .map_err(|e| err(SetupStep::MintKey, None, false, &e.to_string()))?;
+    if cfg.key_ttl.is_zero() {
+        return Err(err(SetupStep::Config, None, false, "key_ttl must be non-zero"));
+    }
+    if name.is_empty() {
+        return Err(err(SetupStep::Config, None, false, "the node name must not be empty"));
+    }
+    if slot.get().is_some() {
+        return Err(err(
+            SetupStep::SlotInUse,
+            None,
+            false,
+            "the key slot still holds a key: run teardown before another setup",
+        ));
+    }
+    // Nothing of this environment exists yet on a prepare or mint failure, so
+    // the directory prepare made is removed here; teardown has no key to find.
+    let clean_up = |step, e: SeamError| async move {
+        if let Err(x) = bounded(t, guest.remove_secrets()).await {
+            tracing::warn!(error = %scrub(&x.to_string(), None), "removing the prepared secrets directory failed");
+        }
+        err(step, None, false, &e.to_string())
+    };
+    if let Err(e) = bounded(t, guest.prepare()).await {
+        return Err(clean_up(SetupStep::Prepare, e).await);
+    }
+    let key = match bounded(t, coord.mint_join_key(cfg.tag, cfg.key_ttl)).await {
+        Ok(key) => key,
+        Err(e) => return Err(clean_up(SetupStep::MintKey, e).await),
+    };
     slot.set(key.clone());
-    if let Err((step, e)) = join(coord, guest, vm, service, hooks, name, &key, cfg).await {
+    if let Err((step, e)) = join(coord, guest, vm, service, hooks, name, &key, slot, cfg).await {
         let mut reason = e.to_string();
         let burned = match bounded(t, coord.expire_key(&key)).await {
             Ok(()) => true,
@@ -480,6 +567,7 @@ async fn join<C, G, B, S, H>(
     hooks: &H,
     name: &str,
     key: &JoinKey,
+    slot: &KeySlot,
     cfg: &SetupConfig<'_>,
 ) -> Result<(), (SetupStep, SeamError)>
 where
@@ -491,6 +579,7 @@ where
 {
     let t = cfg.call_timeout;
     bounded(t, vm.boot(name)).await.map_err(|e| (SetupStep::Boot, e))?;
+    slot.booted.store(true, Ordering::SeqCst);
     let files: [(&str, &[u8]); 2] = [(KEY_FILE, key.expose().as_bytes()), (HOSTNAME_FILE, name.as_bytes())];
     bounded(t, guest.deliver(&files))
         .await
@@ -587,13 +676,16 @@ pub enum TeardownError {
 
 /// Run teardown: `before_teardown` hook, tailscale logout, stop the VM, expire
 /// the key in `slot`, delete the node, remove secrets. Every step runs whatever
-/// an earlier one did. The VM stops and the key expires before the node delete,
+/// an earlier one did, except the hook (see [`GuestHooks::before_teardown`]).
+/// `slot` records the steps done, so a retry after an error is safe; an `Ok`
+/// result empties it. The VM stops and the key expires before the node delete,
 /// so a guest still joining cannot register afterwards. Logout is best effort;
 /// every other failure fails teardown. Works after a dropped [`setup`] future:
 /// pass the same `name` and `slot`.
 ///
 /// # Errors
-/// [`TeardownError`], never `Ok` while the node may exist, the VM may run or a
+/// [`TeardownError`]; a failed VM stop is reported as `VmStillRunning` even when the
+/// node delete failed too. Never `Ok` while the node may exist, the VM may run or a
 /// key in `slot` may be live. A key whose mint timed out is not in the slot.
 #[allow(
     clippy::too_many_arguments,
@@ -621,13 +713,24 @@ where
     let key = key.as_ref();
     let mut hook = Vec::new();
     let mut residue = Vec::new();
-    if let Err(e) = bounded(t, contained(hooks.before_teardown(name))).await {
-        hook.push(format!("before_teardown: {e}"));
+    // The hook talks to the guest: run it only while a booted VM is still up
+    // and it has not succeeded, so a retry never aims it at a stopped VM.
+    if slot.booted.load(Ordering::SeqCst)
+        && !slot.vm_stopped.load(Ordering::SeqCst)
+        && !slot.hook_done.load(Ordering::SeqCst)
+    {
+        match bounded(t, contained(hooks.before_teardown(name))).await {
+            Ok(()) => slot.hook_done.store(true, Ordering::SeqCst),
+            Err(e) => hook.push(format!("before_teardown: {e}")),
+        }
     }
     if let Err(e) = bounded(t, steps.tailscale_logout(name)).await {
         tracing::warn!(error = %scrub(&e.to_string(), key), "tailscale logout failed, continuing");
     }
     let stop = bounded(t, vm.stop(name)).await;
+    if stop.is_ok() {
+        slot.vm_stopped.store(true, Ordering::SeqCst);
+    }
     if let Some(key) = key
         && let Err(e) = bounded(t, coord.expire_key(key)).await
     {
@@ -648,15 +751,16 @@ where
     problems.extend(residue.iter().cloned());
     let reason = scrub(&problems.join("; "), key);
     let name = name.to_owned();
-    if node.is_err() {
-        Err(TeardownError::NodeStillPresent { name, reason })
-    } else if stop.is_err() {
+    if stop.is_err() {
         Err(TeardownError::VmStillRunning { name, reason })
+    } else if node.is_err() {
+        Err(TeardownError::NodeStillPresent { name, reason })
     } else if !residue.is_empty() {
         Err(TeardownError::Residue { name, reason })
     } else if !hook.is_empty() {
         Err(TeardownError::HookFailed { name, reason })
     } else {
+        slot.clear();
         Ok(())
     }
 }
@@ -733,6 +837,13 @@ mod tests {
             let w = Self::default();
             w.st().online = true;
             w
+        }
+
+        /// An environment whose VM is up and whose key is in the slot, as after a setup.
+        fn running(&self) {
+            self.slot.set(JoinKey::new("hskey-auth-abc1"));
+            self.slot.booted.store(true, Ordering::SeqCst);
+            self.st().vm_running = true;
         }
 
         fn st(&self) -> MutexGuard<'_, State> {
@@ -1258,7 +1369,14 @@ mod tests {
         assert_eq!(s.expired, ["hskey-auth-abc1"]);
         assert_eq!(s.deleted, [NAME]);
         assert!(!s.vm_running);
-        assert_eq!(s.seen_names, [format!("boot:{NAME}"), format!("node_online:{NAME}")]);
+        assert_eq!(
+            s.seen_names,
+            [
+                format!("boot:{NAME}"),
+                format!("node_online:{NAME}"),
+                format!("logout:{NAME}")
+            ]
+        );
         Ok(())
     }
 
@@ -1379,7 +1497,7 @@ mod tests {
     #[tokio::test]
     async fn teardown_runs_in_order_stopping_the_vm_and_expiring_the_key_before_the_node_delete() -> Result<()> {
         let w = World::online();
-        w.slot.set(JoinKey::new("hskey-auth-abc1"));
+        w.running();
         run_teardown(&w, T).await.context("teardown")?;
         assert_eq!(
             w.log(),
@@ -1437,7 +1555,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_before_teardown_fails_teardown_after_the_rest_ran_but_logout_does_not() -> Result<()> {
         let w = World::online();
-        w.slot.set(JoinKey::new("hskey-auth-abc1"));
+        w.running();
         w.st().before_teardown_fails = true;
         let r = run_teardown(&w, T).await;
         assert!(matches!(r, Err(TeardownError::HookFailed { .. })), "{r:?}");
@@ -1456,6 +1574,7 @@ mod tests {
         run_teardown(&w, T).await.context("logout is best effort")?;
 
         let w = World::online();
+        w.running();
         {
             let mut s = w.st();
             s.logout = Logout::Fail;
@@ -1480,7 +1599,7 @@ mod tests {
         assert_eq!(w.st().expired, ["hskey-auth-abc1"]);
 
         let w = World::online();
-        w.slot.set(JoinKey::new("hskey-auth-abc1"));
+        w.running();
         w.st().before_teardown_panics = true;
         let r = run_teardown(&w, T).await;
         assert!(matches!(r, Err(TeardownError::HookFailed { .. })), "{r:?}");
@@ -1512,7 +1631,7 @@ mod tests {
         assert_eq!(w.st().expired, ["hskey-auth-abc1"]);
 
         let w = World::online();
-        w.slot.set(JoinKey::new("hskey-auth-abc1"));
+        w.running();
         w.st().before_teardown_hangs = true;
         let r = tokio::time::timeout(Duration::from_secs(10), run_teardown(&w, SHORT))
             .await
