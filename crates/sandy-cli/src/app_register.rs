@@ -476,11 +476,7 @@ fn write_pem_in(dir: &Path, stem: &str, pem: &str) -> Result<PathBuf, InstallErr
 
 /// The `<config>/sandy/trust-roots` directory (`XDG_CONFIG_HOME` or `~/.config`).
 pub fn trust_roots_dir() -> io::Result<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .ok_or_else(|| io::Error::other("neither XDG_CONFIG_HOME nor HOME is set"))?;
-    Ok(base.join("sandy").join("trust-roots"))
+    sandy::trust_roots_dir()
 }
 
 /// The config file path for a trust root of the given name.

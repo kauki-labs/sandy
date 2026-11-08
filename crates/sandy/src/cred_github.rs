@@ -20,6 +20,7 @@
 
 use std::{
     collections::HashMap,
+    path::Path,
     sync::{Mutex, PoisonError},
     time::{Duration, SystemTime},
 };
@@ -28,9 +29,12 @@ use octocrab::{Octocrab, models::AppId};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::cred::{
-    CredError, CredentialHandle, CredentialProvider, Lease, MAX_TTL_SECS, Minted, Scope, TrustRoot, read_secret_0600,
-    render_github_permissions,
+use crate::{
+    cred::{
+        Capability, CredError, CredentialHandle, CredentialProvider, Lease, MAX_TTL_SECS, Minted, Scope, TrustRoot,
+        TrustRootIo, read_secret_0600, render_github_permissions,
+    },
+    trust_root::parse_capability,
 };
 
 /// GitHub's default API base when the trust root names none.
@@ -349,6 +353,42 @@ fn permissions_from_json(value: &serde_json::Value) -> HashMap<String, String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Load the trust root `name` from `dir` and build the live [`GithubAdapter`] plus
+/// the [`Scope`] to mint for: the trust root's own target repositories and the
+/// requested capabilities (CLI spellings such as `read-code`, default `read-code`).
+///
+/// One resolution for every caller on the host that registered the trust root:
+/// `sandy run --credential` and a sandyd job's credential (#481).
+///
+/// # Errors
+/// A human-readable `String` for a missing or invalid trust root, a GitLab trust
+/// root (not supported yet), an unknown capability, or an adapter that cannot be
+/// built.
+pub fn resolve_provider(dir: &Path, name: &str, capabilities: &[String]) -> Result<(GithubAdapter, Scope), String> {
+    let cfg = dir.join(format!("{name}.json"));
+    let root = TrustRoot::load(&cfg).map_err(|e| format!("load trust root {name:?}: {e}"))?;
+    let targets = match &root {
+        TrustRoot::Github { targets, .. } => targets.clone(),
+        TrustRoot::Gitlab { .. } => return Err("GitLab trust roots are not supported yet".to_string()),
+    };
+    let mut caps = capabilities
+        .iter()
+        .map(|t| parse_capability(t))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|tok| format!("unknown --cred-capability {tok:?} (expected read-code|write-code|read-pr|write-pr)"))?;
+    if caps.is_empty() {
+        caps.push(Capability::ReadCode);
+    }
+    let adapter = GithubAdapter::from_trust_root(&root).map_err(|e| format!("build credential adapter: {e}"))?;
+    Ok((
+        adapter,
+        Scope {
+            targets,
+            capabilities: caps,
+        },
+    ))
 }
 
 #[cfg(test)]

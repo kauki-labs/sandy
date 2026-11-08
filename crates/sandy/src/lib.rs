@@ -63,9 +63,9 @@ pub use containment::{Containment, ContainmentStatus, Mount, NoContainment, Reso
 pub use cred::{
     Capability, CredError, CredentialHandle, CredentialProvider, GitlabAccount, Lease, MAX_TTL_SECS, Minted, Scope,
     Target, TrustRoot, TrustRootIo, check_trust_roots_dir, mint_lease, mint_lease_checked, read_secret_0600,
-    refresh_once, refresh_once_checked, render_github_permissions, should_refresh, write_trust_secret,
+    refresh_once, refresh_once_checked, render_github_permissions, should_refresh, trust_roots_dir, write_trust_secret,
 };
-pub use cred_github::{CALL_DEADLINE, GithubAdapter};
+pub use cred_github::{CALL_DEADLINE, GithubAdapter, resolve_provider};
 pub use discovery::{Discovery, Placement, StaticRegistry, parse_builder_systems};
 pub use egress::{
     AllowList, EgressApplier, EgressError, EgressOs, EgressOutcome, EgressPlan, EgressRule, NetworkMode,

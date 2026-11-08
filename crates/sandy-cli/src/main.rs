@@ -12,7 +12,7 @@
 
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
-use sandy::{Capability, CoreError, GithubAdapter, Journal, ProcessExit, Scope, TrustRoot, TrustRootIo};
+use sandy::{CoreError, GithubAdapter, Journal, ProcessExit, Scope};
 use sandy_cli::{
     app_register::{self, Owner},
     doctor,
@@ -484,33 +484,14 @@ fn egress_applier() -> sandy_backend::NoEgress {
 }
 
 /// Load the named trust root from `dir` and build the live [`GithubAdapter`] plus
-/// the [`Scope`] to mint for: the trust root's own target repositories and the
-/// requested capabilities (default `read-code`). Returns a human-readable error for
-/// a missing/invalid trust root or an unknown capability (a config fault).
+/// the [`Scope`] to mint for. Delegates to [`sandy::resolve_provider`], the one
+/// resolution `sandy run` and sandyd's job credential (#481) share.
 fn credential_setup(
     dir: &std::path::Path,
     name: &str,
     capabilities: &[String],
 ) -> Result<(GithubAdapter, Scope), String> {
-    let cfg = dir.join(format!("{name}.json"));
-    let root = TrustRoot::load(&cfg).map_err(|e| format!("load trust root {name:?}: {e}"))?;
-    let targets = match &root {
-        TrustRoot::Github { targets, .. } => targets.clone(),
-        TrustRoot::Gitlab { .. } => return Err("GitLab trust roots are not supported yet".to_string()),
-    };
-    let mut caps = parse_caps(capabilities)
-        .map_err(|tok| format!("unknown --cred-capability {tok:?} (expected read-code|write-code|read-pr|write-pr)"))?;
-    if caps.is_empty() {
-        caps.push(Capability::ReadCode);
-    }
-    let adapter = GithubAdapter::from_trust_root(&root).map_err(|e| format!("build credential adapter: {e}"))?;
-    Ok((
-        adapter,
-        Scope {
-            targets,
-            capabilities: caps,
-        },
-    ))
+    sandy::resolve_provider(dir, name, capabilities)
 }
 
 /// The host credential source: load the named trust root and build the live GitHub
@@ -1603,7 +1584,9 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use anyhow::Context;
-    use sandy::{CredentialProvider, CredentialSource, EgressOs, Outcome, Profile, Target};
+    use sandy::{
+        Capability, CredentialProvider, CredentialSource, EgressOs, Outcome, Profile, Target, TrustRoot, TrustRootIo,
+    };
     use sandy_test_support::{FakeApplier, FakeBackend};
 
     use super::*;
