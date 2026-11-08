@@ -194,6 +194,10 @@ message AttachRequest {
   // check — this is additive, not a replacement: a submit-then-immediately-
   // attach on the SAME connection still works with no token at all.
   optional bytes attach_token = 2;
+  // The broker's output collector (#643): ask for the dedicated collector cap, a
+  // read-only membership of its own that attach counting ignores. Needs a matching
+  // `attach_token`; otherwise the request is refused.
+  bool collector = 3;
 }
 
 message AttachResponse {
@@ -286,6 +290,11 @@ enum EnvironmentState {
 message CreateEnvironmentRequest {
   string idempotency_key = 1;
   EnvironmentSpec spec = 2;
+  // The isolation class the caller is cleared for, set by the broker from its
+  // client record. Not part of the spec: it never changes the idempotency bytes.
+  // While a trusted-only backend (the process backend) is active, anything but
+  // TRUSTED, including UNSPECIFIED, is refused with FORBIDDEN.
+  IsolationClass submitter_class = 3;
 }
 
 message GetEnvironmentRequest {
@@ -357,6 +366,7 @@ enum EnvironmentErrorCode {
   ENVIRONMENT_ERROR_CODE_UNSUPPORTED_FOR_LIFETIME = 4;
   ENVIRONMENT_ERROR_CODE_INVALID_STATE = 5;
   ENVIRONMENT_ERROR_CODE_INVALID_ARGUMENT = 6;
+  ENVIRONMENT_ERROR_CODE_FORBIDDEN = 7;
 }
 
 message EnvironmentError {

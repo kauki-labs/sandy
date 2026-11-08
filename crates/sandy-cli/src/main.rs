@@ -1105,7 +1105,11 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
             // back to `session_matches` server-side, same as before this
             // existed.
             let attach_token = sandy_cli::attach::read_attach_token(&job_id);
-            control_request::Op::Attach(AttachRequest { job_id, attach_token })
+            control_request::Op::Attach(AttachRequest {
+                job_id,
+                attach_token,
+                collector: false,
+            })
         }
         DaemonOp::Status { job_id } => control_request::Op::Status(StatusRequest { job_id }),
         DaemonOp::List => control_request::Op::List(ListRequest {}),

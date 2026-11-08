@@ -55,8 +55,11 @@ token=$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')
 umask 077
 # The token goes to curl through a header file, not argv, so `ps` never shows it.
 printf 'Authorization: Bearer %s\n' "$token" >"$work/auth"
-printf '[{"id":"smoke","token_sha256":"%s","max_isolation_class":"untrusted","profiles":["dev"]}]' \
-  "$(sha256_hex "$token")" >"$work/clients.json"
+# The process backend serves trusted clients only (#641), so ready mode needs a trusted one.
+client_class=untrusted
+[ "$ready_mode" = 1 ] && client_class=trusted
+printf '[{"id":"smoke","token_sha256":"%s","max_isolation_class":"%s","profiles":["dev"]}]' \
+  "$(sha256_hex "$token")" "$client_class" >"$work/clients.json"
 
 backend_env=()
 if [ "$ready_mode" = 1 ]; then

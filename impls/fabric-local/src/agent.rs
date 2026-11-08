@@ -69,6 +69,10 @@ pub const TTY_STDERR: &str = "application/vnd.sandy.tty.stderr";
 /// channel (epic #340 phase 2). Payload: 4 bytes, `cols` then `rows`, each
 /// big-endian `u16`.
 pub const RESIZE_CONTROL: &str = "application/vnd.sandy.resize";
+/// `content_type` for a Control envelope asking the agent to stop the job gracefully (#670): interrupt it, give it
+/// the grace, then end it. Payload: 4 bytes, the grace in seconds as a big-endian `u32`. Posted on the
+/// orchestrator channel; the relay turns it into a [`crate::link::LinkFrame::Stop`].
+pub const STOP_CONTROL: &str = "application/vnd.sandy.stop";
 /// `content_type` prefix an [`crate::link::LinkFrame::Archive`]'s own
 /// `content_type` is forwarded under on an Output envelope — distinguishes
 /// it from any other `MessageType::Output` traffic sharing the channel.
@@ -161,6 +165,18 @@ pub fn decode_resize(payload: &[u8]) -> Option<(u16, u16)> {
         u16::from_be_bytes([cols[0], cols[1]]),
         u16::from_be_bytes([rows[0], rows[1]]),
     ))
+}
+
+/// Encode a stop request as [`STOP_CONTROL`]'s 4-byte payload.
+#[must_use]
+pub fn encode_stop(grace_secs: u32) -> Vec<u8> {
+    grace_secs.to_be_bytes().to_vec()
+}
+
+/// Decode [`encode_stop`]'s payload. `None` if it isn't exactly 4 bytes.
+#[must_use]
+pub fn decode_stop(payload: &[u8]) -> Option<u32> {
+    <[u8; 4]>::try_from(payload).ok().map(u32::from_be_bytes)
 }
 
 /// Bytes read per TTY chunk.
@@ -415,6 +431,8 @@ pub struct LinkAgent {
     /// caller that never reads resizes (a job with no PTY to resize) must not
     /// be forced to.
     resizes: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<(u16, u16)>>>,
+    /// Stop requests from the relay (#670): the grace in seconds, handed out once by [`LinkAgent::take_stops`].
+    stops: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<u32>>>,
 }
 
 /// How many peer deliveries wait in the inbox before newer ones are dropped
@@ -523,10 +541,12 @@ impl LinkAgent {
         // the bridge ends, its receiver is gone and later stdin is discarded.
         let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
         let (resize_tx, resize_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (stop_tx, stop_rx) = tokio::sync::mpsc::unbounded_channel();
         let reader = AbortOnDrop(tokio::spawn(route_link(
             Box::new(rd),
             stdin_tx,
             resize_tx,
+            stop_tx,
             peer_tx,
             Arc::clone(&peer_dropped),
             Arc::clone(&peer_refused),
@@ -543,7 +563,17 @@ impl LinkAgent {
             peer_dropped,
             peer_refused,
             resizes: std::sync::Mutex::new(Some(resize_rx)),
+            stops: std::sync::Mutex::new(Some(stop_rx)),
         })
+    }
+
+    /// Takes the stop-request receiver (#670), once. `None` if already taken. Each item is the grace, in seconds,
+    /// the relay asked the job to get before it is ended. Requests queue, unbounded, until taken.
+    pub fn take_stops(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<u32>> {
+        self.stops
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 
     /// Takes the resize-signal receiver (epic #340 phase 2), once. `None` if
@@ -619,6 +649,7 @@ async fn route_link(
     mut reader: Box<dyn AsyncRead + Send + Unpin>,
     stdin_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     resize_tx: tokio::sync::mpsc::UnboundedSender<(u16, u16)>,
+    stop_tx: tokio::sync::mpsc::UnboundedSender<u32>,
     peer_tx: tokio::sync::mpsc::Sender<PeerDelivery>,
     peer_dropped: Arc<std::sync::atomic::AtomicU64>,
     peer_refused: Arc<std::sync::atomic::AtomicU64>,
@@ -668,6 +699,10 @@ async fn route_link(
                 // fails silently — never a reason to stop routing other
                 // frames.
                 let _ = resize_tx.send((cols, rows));
+            }
+            // Best-effort like a resize: a caller that never takes stops just drops them.
+            Ok(Some(LinkFrame::Stop { grace_secs })) => {
+                let _ = stop_tx.send(grace_secs);
             }
             Ok(Some(other)) => tracing::warn!(kind = other.kind(), "ignoring an unexpected link frame"),
             Ok(None) => return,

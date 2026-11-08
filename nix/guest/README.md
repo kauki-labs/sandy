@@ -70,3 +70,23 @@ the stream):
 protocol against a built runner (`protocol_probe.py <runner>/bin/microvm-run "echo hi"`)
 and reports the captured output and exit code. It is a spike artifact, not shipped
 in the binary.
+
+## Setup steps (`sandy.setup`)
+
+A guest module declares
+`sandy.setup.<name> = { script; user ? "root"; description ? ""; timeoutSecs ? 120; after ? [ ]; }`
+(`nix/lib/guest-setup.nix`, imported by `commonModule`). Each step is a systemd oneshot ordered before and
+required by `sandy-ready.target`; the serial getty that prints `SANDY-READY` requires that target. By design a
+failed step leaves no marker and the run fails.
+
+- **Not live-verified.** The ordering is eval-checked only (`checks.<system>.guest-setup-eval`). No VM was
+  booted. Run the live suite on the KVM host before shipping.
+- Steps do not get the secrets as env vars or the input symlinks (both are made in bash `loginShellInit`, after
+  setup); they may read `/run/sandy/{secrets,inputs,outputs}` directly (ordered `After=`/`Wants=` those mounts).
+- Steps have no network in default or proxy mode (no NIC; the egress relay wraps only the injected job), and are
+  not ordered after network-online in NIC mode.
+- Setup counts against the host's `timeout_secs` boot budget. A failed step shows as a boot timeout, with no
+  separate signal. `timeoutSecs` bounds one step.
+- Step names match `[a-zA-Z0-9_-]+`; a step may not list itself in `after`. A longer `after` cycle is not
+  detected and fails closed as a boot timeout.
+- A devshell `shellHook` stays in `loginShellInit` (it needs the exported secrets), so it is not a step.

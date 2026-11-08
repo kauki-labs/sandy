@@ -80,8 +80,9 @@ broker and stores jobs and environments.
 ## Run an environment end to end
 
 `SANDY_ENV_BACKEND=process-insecure` makes sandyd run each environment's service as a host
-process. It has no isolation and nothing yet limits it to trusted clients (#641): use it on a
-dev machine with a clients file you trust. Set the
+process. It has no isolation. While it is on, sandyd refuses an environment create from a client
+whose `max_isolation_class` is not `trusted` (`forbidden`, #641): give the `t3` client
+`"max_isolation_class": "trusted"` and use it on a dev machine only. Upgrade sandyd and the broker together: a broker that does not send the class gets every create refused. Lowering a client does not stop its stopped environments from resuming; delete them to revoke. Set the
 variables on sandyd (names and meanings in `crates/sandyd/src/environment_backend.rs`):
 
 ```bash
@@ -113,15 +114,15 @@ stops the process on the driver's next tick (about a second).
 
 ## When a call fails
 
-| Response                                  | Cause                                                                                                                    |
-| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| 401 `unauthenticated`                     | No bearer token, or its hash is not in the clients file.                                                                 |
-| 400 `invalid_request`                     | The body is malformed or has unknown fields, `ttl_secs` does not fit the lifetime kind, or sandyd refused the fields.    |
-| 403 `forbidden`                           | The profile is not in `profiles`, a host path is outside `roots`, or the isolation class is above `max_isolation_class`. |
-| 404 `not_found`                           | The id does not exist, or belongs to another client. The two look the same.                                              |
-| 409 `request_id_conflict`                 | The same `request_id` was used with a different payload.                                                                 |
-| 409 `unsupported_for_lifetime`            | The action does not apply to this environment's lifetime or state.                                                       |
-| 429 `quota_exceeded`                      | At `max_environments` or `max_environment_records`.                                                                      |
-| 503 `unavailable`                         | sandyd is unreachable, refused, took over 30 s, or 64 requests are already in flight. Check the socket path.             |
-| broker exits: "state directory is in use" | Another broker holds the state directory's `owners.lock`.                                                                |
-| broker exits: "invalid clients"           | An empty or duplicate id, a duplicate token hash, or a hash that is not 64 lowercase hex digits.                         |
+| Response                                  | Cause                                                                                                                                                                                                                    |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 401 `unauthenticated`                     | No bearer token, or its hash is not in the clients file.                                                                                                                                                                 |
+| 400 `invalid_request`                     | The body is malformed or has unknown fields, `ttl_secs` does not fit the lifetime kind, or sandyd refused the fields.                                                                                                    |
+| 403 `forbidden`                           | The profile is not in `profiles`, a host path is outside `roots`, the isolation class is above `max_isolation_class`, or an environment create came from a client below `trusted` while sandyd runs the process backend. |
+| 404 `not_found`                           | The id does not exist, or belongs to another client. The two look the same.                                                                                                                                              |
+| 409 `request_id_conflict`                 | The same `request_id` was used with a different payload.                                                                                                                                                                 |
+| 409 `unsupported_for_lifetime`            | The action does not apply to this environment's lifetime or state.                                                                                                                                                       |
+| 429 `quota_exceeded`                      | At `max_environments` or `max_environment_records`.                                                                                                                                                                      |
+| 503 `unavailable`                         | sandyd is unreachable, refused, took over 30 s, or 64 requests are already in flight. Check the socket path.                                                                                                             |
+| broker exits: "state directory is in use" | Another broker holds the state directory's `owners.lock`.                                                                                                                                                                |
+| broker exits: "invalid clients"           | An empty or duplicate id, a duplicate token hash, or a hash that is not 64 lowercase hex digits.                                                                                                                         |
