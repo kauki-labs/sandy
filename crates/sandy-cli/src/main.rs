@@ -301,11 +301,13 @@ enum DaemonOp {
         #[arg(long = "secret")]
         secrets: Vec<String>,
         /// Have `sandyd` mint a scoped forge token for the job from the named
-        /// trust root on the daemon's host (a `sandy cred github` name), as
-        /// `sandy run --credential` does (#481). The token is injected as
-        /// `GITHUB_TOKEN` and revoked when the job ends. Needs a host-executor
-        /// that declared `shares_submitter_filesystem`; `sandyd` refuses the
-        /// Submit otherwise.
+        /// trust root on the daemon's host (a `sandy cred github` name, #481).
+        /// The token is injected as `GITHUB_TOKEN` and revoked when the job
+        /// ends. `sandyd` mints it once, at submit, and does not refresh it:
+        /// forge access ends with the token's native life (about 1 hour from
+        /// the mint, time queued on the executor included). Needs a
+        /// host-executor that declared `shares_submitter_filesystem`; `sandyd`
+        /// refuses the Submit otherwise.
         #[arg(long = "credential")]
         credential: Option<String>,
         /// Capability for the minted credential: `read-code` | `write-code` |

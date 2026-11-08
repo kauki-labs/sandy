@@ -2382,8 +2382,12 @@ refused, because no encrypted mesh transport carries a bearer token yet (#495).
   and the dir, and runs once. A revoke failure is a `tracing::warn` that names the job and the handle;
   the job store has no column for it. A bracket that no job owns yet (a Submit refused after the mint)
   revokes when it drops. A credential name that is not a single file name is refused before placement.
-- Every provider call runs under a bound (`sandy::CALL_DEADLINE` by default). A call that does not
-  return in time is a failure, and a mint or refresh that returns late is revoked by its worker thread.
+- Every provider call runs under `DAEMON_CALL_TIMEOUT` (45 s), not the CLI's `CALL_DEADLINE` (1500 s):
+  each call holds a blocking-pool thread the job store also uses. A call that does not return in time is
+  a failure, and a mint or refresh that returns late is revoked by its worker thread. At most
+  `MAX_CONCURRENT_RELEASES` (8) releases run at once; more wait for a slot and none is skipped.
+- Only a result for a job dispatched on the reporting connection releases that job's credential, so one
+  executor cannot revoke another host's job. The store transition for such a result is unchanged.
 - The token is only in the staged file and in the provider's zeroizing `Minted`. It is never in the job
   store, a log line, a `Dispatch` field other than the path, an error message or `Debug` output.
 
@@ -2402,9 +2406,12 @@ change, which also fixes the queue-time loss).
 
 - A sandyd crash or kill while a credentialed job runs leaves its token valid until the native expiry
   (GitHub: one hour), and the staged file on disk until `sandy gc` sweeps stale `cred-*` dirs. No restart
-  sweep revokes it. The bracket exposes the lease handle so a later reconcile could. A clean shutdown
-  does not wait for revokes in flight either, and `sandyd cancel` (the offline operator cancel) only
-  marks the row: it cannot revoke.
+  sweep revokes it. The bracket exposes the lease handle so a later reconcile could.
+- A clean shutdown revokes nothing at all: every live token survives a normal sandyd restart until its
+  native expiry, and revokes already in flight are not waited for. `sandyd cancel` (the offline operator
+  cancel) only marks the row: it cannot revoke.
+- A host-executor that never reports a result and never disconnects keeps the job's credential entry and
+  its staged file until the daemon stops.
 - The host-executor must run as the daemon's uid to read the `0700` dir, as for any #496 path secret.
 - `sandy gc` can sweep a `cred-*` dir once it is older than `MAX_TTL_SECS`, since nothing heartbeats it.
   A job the executor already staged is not affected, and teardown treats a missing file as removed; a
