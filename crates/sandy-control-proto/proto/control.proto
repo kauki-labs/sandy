@@ -367,6 +367,8 @@ enum EnvironmentErrorCode {
   ENVIRONMENT_ERROR_CODE_INVALID_STATE = 5;
   ENVIRONMENT_ERROR_CODE_INVALID_ARGUMENT = 6;
   ENVIRONMENT_ERROR_CODE_FORBIDDEN = 7;
+  // sandyd could not write the audit entry for the operation, so it did not apply it.
+  ENVIRONMENT_ERROR_CODE_UNAVAILABLE = 8;
 }
 
 message EnvironmentError {
