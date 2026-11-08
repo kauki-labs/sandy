@@ -2381,7 +2381,7 @@ refused, because no encrypted mesh transport carries a bearer token yet (#495).
   was, since the job is over on its host either way. It revokes on the blocking pool, removes the file
   and the dir, and runs once. A revoke failure is a `tracing::warn` that names the job and the handle;
   the job store has no column for it. A bracket that no job owns yet (a Submit refused after the mint)
-  revokes when it drops.
+  revokes when it drops. A credential name that is not a single file name is refused before placement.
 - Every provider call runs under a bound (`sandy::CALL_DEADLINE` by default). A call that does not
   return in time is a failure, and a mint or refresh that returns late is revoked by its worker thread.
 - The token is only in the staged file and in the provider's zeroizing `Minted`. It is never in the job
@@ -2392,20 +2392,23 @@ once, when it stages the job (`sandy::stage_secrets`). It does not share the dae
 `sandy run` does through `RunSpec::secret_dir`. A daemon-side refresh would rewrite a file no job reads
 and then revoke the token the job holds. So sandyd does not schedule
 `CredentialBracket::renew_if_due`, and a job that outlives the provider's token (GitHub: one hour) loses
-forge access. The choices are an owner question on #481: accept the limit; refresh without revoking the
-superseded tokens until teardown; or carry a live secret dir in `Dispatch` so the executor shares it
-(a proto and executor change).
+forge access. The token is minted at Submit but read only when the job starts, and the host-executor
+runs its dispatches one at a time, so time in its queue also uses up the token's lifetime. The choices
+are an owner question on #481: accept the limit; refresh without revoking the superseded tokens until
+teardown; or carry a live secret dir in `Dispatch` so the executor shares it (a proto and executor
+change, which also fixes the queue-time loss).
 
 **Known gaps.**
 
 - A sandyd crash or kill while a credentialed job runs leaves its token valid until the native expiry
   (GitHub: one hour), and the staged file on disk until `sandy gc` sweeps stale `cred-*` dirs. No restart
   sweep revokes it. The bracket exposes the lease handle so a later reconcile could. A clean shutdown
-  does not wait for revokes in flight either.
+  does not wait for revokes in flight either, and `sandyd cancel` (the offline operator cancel) only
+  marks the row: it cannot revoke.
 - The host-executor must run as the daemon's uid to read the `0700` dir, as for any #496 path secret.
-- `sandy gc` can sweep a running job's `cred-*` dir once it is older than `MAX_TTL_SECS`, since nothing
-  heartbeats it. The executor copied the token at staging, so the job is not affected, and teardown
-  treats a missing file as removed.
+- `sandy gc` can sweep a `cred-*` dir once it is older than `MAX_TTL_SECS`, since nothing heartbeats it.
+  A job the executor already staged is not affected, and teardown treats a missing file as removed; a
+  job still waiting in the executor's queue then fails to stage its secret.
 - The revoke runs after the terminal store transition, so a reader can see a terminal job while its
   revoke is still in flight.
 

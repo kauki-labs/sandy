@@ -121,15 +121,20 @@ fn credential_placement_refusal() -> String {
 }
 
 /// Refuse a Submit whose credential request this daemon cannot honor (#481), before
-/// any side effect: `cred_capabilities` with no `credential`, a credential on a
-/// daemon with no credential support, or a `secrets` entry already using the name
-/// the minted token is staged under.
+/// any side effect: `cred_capabilities` with no `credential`, a credential name
+/// that is not a single file name, a credential on a daemon with no credential
+/// support, or a `secrets` entry already using the name the minted token is
+/// staged under.
 fn credential_request_refusal(submit: &SubmitRequest, registry: &JobRegistry) -> Option<String> {
     let Some(name) = &submit.credential else {
         return (!submit.cred_capabilities.is_empty()).then(|| {
             "cred_capabilities names capabilities but the Submit names no credential to mint them for".to_owned()
         });
     };
+    // The name becomes `<trust-roots dir>/<name>.json`: refuse anything but one file name.
+    if let Err(e) = sandy::validate_trust_root_name(name) {
+        return Some(format!("credential {name:?} is refused: {e}"));
+    }
     if registry.credentials().is_none() {
         return Some(format!(
             "this daemon has no credential support configured; the Submit naming credential {name:?} is refused"

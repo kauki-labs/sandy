@@ -694,6 +694,47 @@ mod tests {
         Ok(())
     }
 
+    /// A Submit refused after the mint (the store is full) leaves no live token:
+    /// the unowned bracket revokes on drop, off the async worker.
+    #[tokio::test]
+    async fn a_submit_refused_after_the_mint_revokes_the_unowned_credential() -> anyhow::Result<()> {
+        let d = daemon_with_store(FakeProvider::returning(TOKEN), |_| {
+            Ok(JobStore::open_in_memory()?.with_max_rows(Some(0)))
+        })?;
+        let _dispatch_rx = register_host(&d, true)?;
+        match submit(&d, submit_req(Some("gh-test"), Vec::new())).await? {
+            control_response::Result::Error(e) => assert!(e.message.contains("capacity"), "{}", e.message),
+            other => anyhow::bail!("a full store must refuse the Submit, got {other:?}"),
+        }
+        assert_eq!(d.provider.mints().len(), 1, "the refusal comes after the mint");
+        let staging_is_empty = || -> anyhow::Result<bool> { Ok(std::fs::read_dir(&d.staging)?.next().is_none()) };
+        let deadline = Instant::now() + WAIT;
+        while (d.provider.revoked().is_empty() || !staging_is_empty()?) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !d.provider.revoked().is_empty(),
+            "the unowned credential must be revoked"
+        );
+        assert!(staging_is_empty()?, "no staging dir may remain");
+        assert_eq!(d.registry.credentials().map(|c| c.live_count()), Some(0));
+        Ok(())
+    }
+
+    /// A credential name that is not a single file name is refused before placement
+    /// and before any trust-root path is built from it.
+    #[tokio::test]
+    async fn a_credential_name_with_a_path_separator_is_refused() -> anyhow::Result<()> {
+        let d = daemon(FakeProvider::returning(TOKEN))?;
+        let _dispatch_rx = register_host(&d, true)?;
+        match submit(&d, submit_req(Some("../elsewhere"), Vec::new())).await? {
+            control_response::Result::Error(e) => assert!(e.message.contains("single file name"), "{}", e.message),
+            other => anyhow::bail!("a path-like credential name must be refused, got {other:?}"),
+        }
+        assert!(d.provider.mints().is_empty());
+        Ok(())
+    }
+
     /// `cred_capabilities` without a `credential` is refused rather than ignored.
     #[tokio::test]
     async fn a_cred_capability_without_a_credential_is_refused() -> anyhow::Result<()> {
