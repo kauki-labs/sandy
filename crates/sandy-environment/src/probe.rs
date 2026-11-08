@@ -54,7 +54,12 @@ pub(crate) fn http_status(addr: SocketAddr) -> Option<u16> {
                 && [a, b, c].iter().all(|d| d.is_ascii_digit())
                 && delim.first().is_none_or(|&d| matches!(d, b' ' | b'\r' | b'\n')) =>
         {
-            std::str::from_utf8(&[*a, *b, *c]).ok()?.parse().ok()
+            // "000" to "099" are no HTTP status: a non-HTTP listener must not read as Ready.
+            std::str::from_utf8(&[*a, *b, *c])
+                .ok()?
+                .parse()
+                .ok()
+                .filter(|code| *code >= 100)
         }
         _ => None,
     }
@@ -94,15 +99,16 @@ impl HttpServiceProbe {
     /// Probe environment `environment_id` at `addr` for as long as the returned guard lives. Hold it with the
     /// bridge that listens on `addr`.
     pub fn register(&self, environment_id: &str, addr: SocketAddr) -> Registration {
+        // The generation is taken under the registry lock, so two concurrent registrations for one id insert in
+        // generation order and the newer address is the one that stays.
+        let mut addrs = self.addrs.lock().unwrap_or_else(PoisonError::into_inner);
         let generation = {
             let mut next = self.next.lock().unwrap_or_else(PoisonError::into_inner);
             *next += 1;
             *next
         };
-        self.addrs
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(environment_id.to_owned(), (generation, addr));
+        addrs.insert(environment_id.to_owned(), (generation, addr));
+        drop(addrs);
         Registration {
             addrs: Arc::clone(&self.addrs),
             environment_id: environment_id.to_owned(),
