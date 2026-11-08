@@ -44,7 +44,7 @@ pub struct AuditLog {
 
 impl AuditLog {
     /// Open `path` for append, creating it with mode 0600. A symlink at `path`, a file that is not
-    /// a regular file, and a file another user owns are refused.
+    /// a regular file, a file with a second hard link, and a file another user owns are refused.
     ///
     /// # Errors
     /// [`AuditError::Io`] when the file cannot be opened or is not safe to append to.
@@ -67,12 +67,14 @@ impl AuditLog {
             .open(path)
             .map_err(io)?;
         let meta = file.metadata().map_err(io)?;
-        let unsafe_file =
-            !meta.is_file() || meta.uid() != rustix::process::geteuid().as_raw() || meta.mode() & 0o077 != 0;
+        let unsafe_file = !meta.is_file()
+            || meta.uid() != rustix::process::geteuid().as_raw()
+            || meta.mode() & 0o077 != 0
+            || meta.nlink() != 1;
         if unsafe_file {
             return Err(io(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                "the audit log must be a regular file owned by this user with mode 0600",
+                "the audit log must be a regular file with one name, owned by this user, mode 0600",
             )));
         }
         Ok(Self::from_file(path.to_path_buf(), file))

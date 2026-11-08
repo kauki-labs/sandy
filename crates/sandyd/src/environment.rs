@@ -543,6 +543,15 @@ async fn cancel(store: &Arc<EnvironmentStore>, id: String) -> Reply {
     if !id_ok(&id) {
         return bad_id();
     }
+    let Some(record) = fetch(store, &id).await? else {
+        return not_found(&id);
+    };
+    // Cancel ends a Provisioning environment in Deleted, so it is audited like a delete.
+    if record.state == EnvironmentState::Provisioning
+        && let Some(refusal) = audit(store, "cancel", &id, record.submitter_trusted).await
+    {
+        return refusal;
+    }
     let key = id.clone();
     let moved = blocking(store, move |s| s.cancel(&key)).await?;
     finish(

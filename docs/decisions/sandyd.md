@@ -2303,7 +2303,7 @@ cursor with a client's stream, and every join counted by `join_for_attach` sends
 
 **Set aside.** Reusing `observer_cap`, and counting the collector as an attach.
 
-## 33. An append-only audit log for client environment create, stop and delete (#596)
+## 33. An append-only audit log for client environment create, stop, cancel and delete (#596)
 
 **Context.** The environment lifecycle had no durable record of who changed what. #596 asks for an audit
 trail; the owner approved the first slice (create, stop, delete) and set the defaults: the log lives in
@@ -2313,10 +2313,11 @@ sandyd's state directory, and the identity is the one sandyd already records.
 
 - `sandyd::audit::AuditLog` appends one JSON line per operation to `<db>.audit.jsonl` beside the database
   (`sandyd.audit.jsonl` for the default `sandyd.db`), or to `SANDY_AUDIT_LOG`. Fields: `at` (unix
-  seconds), `operation` (`create`, `stop`, `delete`), `environment_id`, `submitter_class` (`trusted` or
+  seconds), `operation` (`create`, `stop`, `cancel`, `delete`), `environment_id`, `submitter_class` (`trusted` or
   `untrusted`) and `outcome`.
 - The log file is mode `0600`, opened append-only, synced after each line. A symlink, a FIFO or other file
-  that is not regular, a file another user owns and a file with group or other bits are refused, and
+  that is not regular, a file with a second hard link, a file another user owns and a file with group or
+  other bits are refused, and
   `sandyd` does not start when the log cannot be opened. A write that fails part way is cut back, so a
   full disk leaves no fragment for the next line to join.
 - The handler writes the line before it changes state and fails closed. If the write fails, the operation
@@ -2326,7 +2327,9 @@ sandyd's state directory, and the identity is the one sandyd already records.
   requested, not that it applied.
 - The line is written once the handler knows the request is well formed and, for stop and delete, that the
   row's state allows it. A replay of an accepted key, an invalid create, an unknown id, a stop of an
-  environment that is not `Ready` and a repeated delete write nothing. A create that then meets the row
+  environment that is not `Ready`, a cancel of one that is not `Provisioning` and a repeated delete write
+  nothing. The state is read outside the store's lock, so this holds for sequential requests: two
+  concurrent stops of one `Ready` environment both write a line and one is then refused. A create that then meets the row
   cap, or loses a race on its key, still leaves its line: only the store knows, and the line names an id
   that never existed.
 - `submitter_class` is the isolation class sandyd stored for the environment's creator: the create
@@ -2334,8 +2337,10 @@ sandyd's state directory, and the identity is the one sandyd already records.
   sandyd serves one user and has no per-client name on the control RPC, so the broker's client id is not in
   the line. Carrying it needs a proto field. That is an open owner question on #596.
 
-**Not covered.** `resume`, and `cancel`, which ends an environment in `Deleted`; and every change the daemon makes itself: the idle stop, the
-retention sweep and the launch driver. Log rotation. Quotas, the default `untrusted` class and the
+**Not covered.** `resume`; and every change the daemon makes itself: the idle stop, the retention sweep
+and the launch driver. Log rotation: a rename by an external tool leaves sandyd appending to the old
+file until it restarts. One sandyd owns one log; two daemons on one file could cut back each other's
+line after a failed write. Quotas, the default `untrusted` class and the
 per-client authz of #596 stay open.
 
 **Set aside.** Writing the line after the change (a failed write would leave an unaudited change), and
