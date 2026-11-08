@@ -84,6 +84,9 @@ impl std::fmt::Debug for CancelRequest {
     }
 }
 
+/// The peer name of the read-only cap `Attach` mints for `AttachRequest.collector` (#643).
+pub const COLLECTOR_PEER: &str = "collector";
+
 /// `AttachRequest.attach_token`, when present, is the same bearer credential
 /// presented back. Redacted for the same reason.
 impl std::fmt::Debug for AttachRequest {
@@ -340,6 +343,7 @@ mod tests {
         let with_token = AttachRequest {
             job_id: "job-a".to_owned(),
             attach_token: Some(marker.as_bytes().to_vec()),
+            collector: false,
         };
         let rendered = format!("{with_token:?}");
         assert!(
@@ -351,6 +355,7 @@ mod tests {
         let without_token = AttachRequest {
             job_id: "job-a".to_owned(),
             attach_token: None,
+            collector: false,
         };
         let rendered = format!("{without_token:?}");
         assert!(

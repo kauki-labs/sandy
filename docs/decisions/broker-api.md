@@ -106,6 +106,7 @@ daemon user's files.
 ## 5. Deferred in this slice
 
 - `attach` is no longer deferred: decision 7 bridges it (#616).
+- Output retention across a broker restart, and in sandyd, is not built: decision 8 keeps output in broker memory only.
 - `link` returns `unsupported` until T3 offers an external link interface (#585 open point 1).
 - Rate limiting, quotas, and the audit trail are #596.
 - `SubmitJob` has no `request_id`. Job idempotency is a contract change and is not made here.
@@ -220,8 +221,64 @@ quota check, and a client could exceed the quota by one environment per distinct
   is out, so the ticket and stream caps above bound the producers.
 
 **Side effect.** An open broker stream is an attach to sandyd. On a remote host that keeps the
-job attached and lifts the unlimited-while-attached policy (#340, `sandyd.md` decision 17) for as
+job attached and lifts the unlimited-while-attached policy (#340, `sandyd.md` decision 14) for as
 long as the stream is open, up to the client's four. Closing the stream restores it.
+
+## 8. Output is read by offset from a broker-held buffer (#643)
+
+**Context.** sandyd keeps no job output. Output reaches the broker only on the attach socket, and
+attach ends when the job does. A polling client (the `job_output` MCP tool) needs one request per
+call (`sandy-mcp`, `sandyd.md` decision 25) and needs output after exit. The owner chose a broker
+route over giving `sandy-mcp` a stream reader.
+
+**Decision.**
+
+- When the broker accepts a submit it starts one collector task for that job. The collector
+  makes the attach RPC and joins the attach socket like a stream does (decision 7), polls job
+  status once a second, and after a terminal status drains until the plane is quiet for 500 ms
+  (30 s at most). It appends each stdout or stderr chunk to the job's buffer.
+- The collector attaches with `collector: true` and the attach token (`sandyd.md` decision 32).
+  sandyd mints a read-only cap under its own peer name for it. That cap is a membership of its
+  own: a submitter attach mints the shared `operator` membership with one cursor, and a
+  collector on it would take messages from a client's stream. A collector join is not counted
+  as an attach and sends no `AttachStateChanged`.
+- At most 16 collectors per client and 64 in all (`Tuning`). sandyd's accept loop serves 256
+  attach connections, so unbounded collectors could starve every other attach. A job past the
+  bound is accepted at once and its collector waits for a slot. sandyd replays the channel from
+  the start on join, so a late collector still gets all of the output while the channel is
+  retained. If the channel is gone by then the buffer ends with a fault.
+- Buffer bounds: 1 MiB per job, the oldest bytes dropped. The 16 MiB total is split evenly over
+  the configured clients. A client over its share loses its own oldest finished job first, then
+  its growing job drops its oldest bytes. One client's output never evicts another's. Offsets stay
+  absolute across drops.
+- `GET /v1/jobs/{id}/output?offset=N&limit=M` (bearer) answers `data` (base64), `offset`,
+  `next_offset`, `dropped`, `done`, and, when done, `state` and `fault`. `limit` defaults to
+  64 KiB and clamps to 1..256 KiB. Another client's job and an unknown job give one identical
+  `not_found`. An offset past the end, a repeated or unknown query key, or a non-integer value
+  gives `invalid_request`.
+- A finished job's buffer is readable for 15 minutes after collection ends
+  (`SANDY_BROKER_OUTPUT_RETENTION_SECS`, whole seconds, 1 to 7 days; a larger value stops
+  the broker at start), then `not_found`. Expired buffers are swept on the next submit or read.
+  After the job ends the collector keeps draining until the data plane is quiet for 500 ms, and
+  for 30 s at most, so `done` can lag the exit by that long.
+- Dropping the broker aborts every collector task, which closes their attach connections.
+- A collector that cannot attach (five tries), loses the data plane, or loses the status path
+  ends the buffer with a fixed `fault` text. Output may be missing; the route says so instead of
+  reporting a clean `done`. The texts: `collector could not start`, `collector could not attach`,
+  `job ended before the collector attached`, `data plane error`, `data plane closed` (EOF: sandyd
+  closes a collector only on a delivery fault), `status unavailable`, and `output still arriving
+when collection stopped` (frames still flowed 30 s after the job ended). Join retries are 10 s
+  apart, and a failed join is retried the full five times even after the job ended, since sandyd
+  keeps the channel for a while. `done` with a `fault` means collection stopped, not that the
+  job finished; the job status route gives the lifecycle. Output responses carry `Cache-Control:
+no-store`. A `limit` below 1 is raised to 1.
+- Nothing is written to disk. A broker restart loses every buffer: the route answers
+  `not_found` for jobs submitted before it, for good, and finds jobs submitted after it at once. The OpenAPI text says this.
+
+**MCP.** `sandy-mcp` has no output tool. Raw job output returned through a tool would bypass the
+secret guard (O8). Owner decision, still open.
+
+**Set aside.** Persisting output to disk, and retention in sandyd. Both are separate work.
 
 ## Consequences
 
@@ -230,7 +287,7 @@ long as the stream is open, up to the client's four. Closing the stream restores
   `unsupported`, `unavailable`), so `sandy-mcp` passes them through unchanged. sandyd's own
   refusal text is never relayed: a `ControlError` becomes `unavailable`, an `EnvironmentError`
   code gets a fixed message.
-- A broker restart keeps job ownership, so the owner can still cancel.
+- A broker restart keeps job ownership, so the owner can still cancel. It loses retained output (decision 8).
 - The owner table is rewritten whole on each submit and each environment create, and never pruned. Pruning waits for #596.
 - A caller on another machine cannot reach the broker until the TLS follow-up lands.
 - sandyd cannot tell two HTTP clients apart. The broker is the only per-client boundary.
