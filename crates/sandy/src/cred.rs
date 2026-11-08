@@ -133,7 +133,7 @@ fn mint_lease_with<P: CredentialProvider + ?Sized>(
 /// reads. A failed revoke is logged, not fatal: the native TTL is the backstop.
 ///
 /// [`revoke`]: CredentialProvider::revoke
-fn revoke_orphan<P: CredentialProvider + ?Sized>(provider: &P, secret_name: &str, minted: &Minted) {
+pub(crate) fn revoke_orphan<P: CredentialProvider + ?Sized>(provider: &P, secret_name: &str, minted: &Minted) {
     let orphan = Lease {
         secret_ref: SecretRef {
             name: secret_name.to_string(),
