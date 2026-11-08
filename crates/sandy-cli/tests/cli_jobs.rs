@@ -2379,10 +2379,13 @@ fn a_live_run_reads_as_running_from_a_second_handle() -> anyhow::Result<()> {
                 std::thread::sleep(Duration::from_millis(5));
             }
             let other = Journal::new(home);
-            let job_id = ls(&other)?.first().context("the run's record")?.job_id.clone();
-            let state = status(&other, &FakeBackend::new(), &job_id)?.state;
+            let observed = (|| -> anyhow::Result<JobState> {
+                let job_id = ls(&other)?.first().context("the run's record")?.job_id.clone();
+                Ok(status(&other, &FakeBackend::new(), &job_id)?.state)
+            })();
+            // Whatever the observer saw, let the run end: a failed read must fail the test, not hang it.
             control.cancel();
-            Ok(state)
+            observed
         }
     });
 
@@ -2635,6 +2638,38 @@ fn the_real_sigterm_reaches_the_process_named_as_the_owner() -> anyhow::Result<(
         journal.read_record("job-real")?.state,
         JobState::Running,
         "no cancelled record for a live job"
+    );
+    Ok(())
+}
+
+/// #699: probing a job that has no `.live` file (a record from before the lock) reads as dead and creates nothing.
+#[test]
+fn probing_the_owner_of_a_legacy_record_creates_no_lockfile() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    journal.write_record(&running_record("job-legacy", "box-1", SystemTime::now()))?;
+
+    assert!(!journal.owner_live("job-legacy")?, "no lockfile means no live owner");
+    assert!(
+        !journal.live_path("job-legacy").exists(),
+        "a probe must leave nothing behind"
+    );
+    Ok(())
+}
+
+/// #699: two readers probing at once never read a dead owner as live: probes share the lock, only the owner's
+/// exclusive hold conflicts with them.
+#[test]
+fn two_probes_of_a_dead_owner_never_conflict() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    drop(journal.hold_live("job-dead")?);
+    let other = Journal::new(_tmp.path());
+    // Hold one probe's shared lock while the other probes.
+    let held = std::fs::File::open(journal.live_path("job-dead"))?;
+    rustix::fs::flock(&held, rustix::fs::FlockOperation::NonBlockingLockShared)?;
+
+    assert!(
+        !other.owner_live("job-dead")?,
+        "a concurrent probe must not look like an owner"
     );
     Ok(())
 }

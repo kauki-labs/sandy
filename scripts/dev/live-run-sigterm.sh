@@ -15,6 +15,8 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$repo_root"
 signal=${1:-TERM}
+how="SIG$signal"
+[ "$signal" = KILL ] && how="sandy kill"
 case "$signal" in TERM | HUP | KILL) ;; *)
   echo "usage: $0 [TERM|HUP|KILL]" >&2
   exit 2
@@ -137,7 +139,7 @@ for _ in $(seq 60); do
   sleep 1
 done
 if alive "$owner"; then
-  echo "FAIL: sandy (pid $owner) did not exit within 60 s of SIG$signal" >&2
+  echo "FAIL: sandy (pid $owner) did not exit within 60 s of $how" >&2
   exit 1
 fi
 
@@ -150,6 +152,15 @@ if [ "$state" != "cancelled" ]; then
   tail -n 12 "$work/stderr.log" >&2 || true
   exit 1
 fi
+if [ "$signal" = KILL ]; then
+  # `sandy kill` of a live run must hand back the OWNER's record: one it wrote itself would carry no receipt.
+  message=$(python3 -I -c 'import glob, json, sys
+print(json.load(open(glob.glob(sys.argv[1] + "/jobs/*.json")[0]))["result"]["message"])' "$work/home")
+  if [ "$message" = "cancelled by kill" ]; then
+    echo "FAIL: the record was written by sandy kill, not by the run" >&2
+    exit 1
+  fi
+fi
 for pid in $pids; do
   if alive "$pid"; then
     echo "FAIL: pid $pid of the box is still running after sandy exited" >&2
@@ -160,4 +171,4 @@ if [ -d "$rundir" ]; then
   echo "FAIL: the run directory $rundir was not removed" >&2
   exit 1
 fi
-echo "live-run-sigterm: SIG$signal OK (record cancelled, no process left, run directory removed)"
+echo "live-run-sigterm: $how OK (record cancelled, no process left, run directory removed)"

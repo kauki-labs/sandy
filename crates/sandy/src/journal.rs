@@ -218,9 +218,20 @@ impl Journal {
     ///
     /// Returns [`CoreError::Io`] if the lockfile cannot be opened.
     pub fn owner_live(&self, job_id: &str) -> Result<bool, CoreError> {
-        let file = open_lockfile_at(&self.live_path(job_id))?;
-        match fs2::FileExt::try_lock_exclusive(&file) {
-            // Ours for a moment: nobody holds it.
+        // Read-only, never created: a job with no `.live` file has no live owner (a record from before the lock), and
+        // a probe leaves nothing behind. A shared lock conflicts with the owner's exclusive one but never with another
+        // probe, so two readers cannot make each other see a live owner.
+        let file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(self.live_path(job_id))
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        match fs2::FileExt::try_lock_shared(&file) {
+            // Ours for a moment: nobody holds it exclusively.
             Ok(()) => Ok(false),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
             Err(e) => Err(e.into()),

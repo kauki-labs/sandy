@@ -2,10 +2,11 @@
 //!
 //! When a `running` record is read, the reconciler checks liveness through the
 //! backend's [`boxes`](crate::backend::VmBackend::boxes) — never a direct
-//! registry read — and, if the box is gone, acquires the job's flock (proving
-//! the owner is dead) *before* flipping `running → crashed` and tearing the box
-//! down. A live owner still holds the lock, so a live job is never reaped even
-//! if its pid was reused (INV-3).
+//! registry read — and, if the box is gone, checks the job's liveness lock
+//! (`.live`, held by the owner for the whole run) and only then, under the write
+//! lock, flips `running → crashed` and tears the box down. A live owner still
+//! holds the lock, so a live job is never reaped even if its pid was reused
+//! (INV-3, #699).
 
 use crate::{
     CoreError,
@@ -18,7 +19,7 @@ use crate::{
 ///
 /// If the record is not `running`, it is returned unchanged. If it is `running`
 /// and [`VmBackend::boxes`] still lists its box, the live job is left untouched.
-/// Only when the box is absent AND the job's flock can be acquired does the
+/// Only when the box is absent AND the job's liveness lock is free does the
 /// reconciler flip the record to `crashed` and call [`VmBackend::kill`] (INV-3).
 ///
 /// # Errors

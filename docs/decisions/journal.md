@@ -47,9 +47,9 @@ one terminal write after redaction is final.
 **Context.** Reading running state straight from the registry races the owning
 process and can misreport a crashed owner as alive.
 
-**Decision.** `ls`/`status`/`wait`/`kill`/`gc` reach running state via
-`reconcile_job` + `VmBackend::boxes` **under the job flock**, never a direct
-registry read.
+**Decision.** `status`/`wait`/`kill` reach running state via
+`reconcile_job` + `VmBackend::boxes` and the owner's liveness lock (decision 3),
+never a direct registry read.
 
 **Consequences.** A crashed owner is reconciled to a terminal state rather than
 reported as running; liveness has one path, so the ops commands agree. Proven live
@@ -71,7 +71,8 @@ in-memory registry (#695).
 
 - Each job has a second lockfile, `<job>.live`, apart from the short write lock `<job>.lock`. The owning `sandy run`
   takes it before the `Running` record is written and keeps it past the terminal write (`JobOutcome` carries it). The
-  kernel drops it with its holder, so a held lock is a live owner even if the pid was reused. `reconcile_job` leaves a
+  kernel drops it with its holder, so a held lock is a live owner even if the pid was reused. Readers probe it read-only
+  with a shared lock, so two readers never make each other see a live owner. `reconcile_job` leaves a
   `running` record alone while it is held.
 - `sandy kill` of a live owner (lock held) sends `SIGTERM` to the record's `writer_pid`, which `sandy run` answers by
   cancelling the run (#687: guest stopped, credential revoked, terminal record with its receipt). It then waits up to 60 s
@@ -83,7 +84,7 @@ in-memory registry (#695).
   settled by `reconcile_job` (`crashed`).
 - `kill` of a dead owner is unchanged: the box is torn down through the backend and the record flips to `cancelled`.
 
-**Consequences.** `sandy status`, `ls`, `wait` and `gc` no longer report a live run as `crashed`. A record written before
+**Consequences.** `sandy status` and `wait` no longer write a false `crashed` for a live run, so `ls` and `gc` no longer see one. A record written before
 this change has no `.live` file, so its owner reads as dead, as before. `SIGKILL` of the owner still leaves a `running`
 record and an orphaned VM until the next sweep (#666); `sandy kill` of such a job takes the dead-owner path.
 

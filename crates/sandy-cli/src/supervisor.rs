@@ -834,7 +834,17 @@ impl OwnerSignal for SigTerm {
             .ok()
             .and_then(rustix::process::Pid::from_raw)
             .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-        rustix::process::kill_process(pid, rustix::process::Signal::TERM).map_err(std::io::Error::from)
+        rustix::process::kill_process(pid, rustix::process::Signal::TERM).map_err(errno_to_io)
+    }
+}
+
+/// `kill(2)`'s errno as the error [`stop_live_owner`] matches on. `std` has no [`std::io::ErrorKind`] for `ESRCH` (it
+/// reads as `Uncategorized`), so a process that exited since the lock was checked is named `NotFound` here.
+fn errno_to_io(errno: rustix::io::Errno) -> std::io::Error {
+    if errno == rustix::io::Errno::SRCH {
+        std::io::Error::from(std::io::ErrorKind::NotFound)
+    } else {
+        std::io::Error::from(errno)
     }
 }
 
@@ -1007,6 +1017,20 @@ pub fn gc(journal: &Journal, keep_last_n: usize) -> Result<GcReport, CoreError> 
 
 #[cfg(test)]
 mod tests {
+    /// `kill(2)` on an exited process fails with `ESRCH`, which `std` does not categorise: `kill` must see `NotFound`
+    /// to tell "the owner just finished" from a real failure (#695).
+    #[test]
+    fn a_missing_process_is_not_found_and_a_refusal_stays_permission_denied() {
+        assert_eq!(
+            super::errno_to_io(rustix::io::Errno::SRCH).kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            super::errno_to_io(rustix::io::Errno::PERM).kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
     use std::{
         sync::{
             Arc,
