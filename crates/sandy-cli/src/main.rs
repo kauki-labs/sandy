@@ -1070,6 +1070,8 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
                 inputs: submit_inputs,
                 outputs: submit_outputs,
                 secrets: submit_secrets,
+                credential: None,
+                cred_capabilities: Vec::new(),
             })
         }
         DaemonOp::Cancel { job_id } => {

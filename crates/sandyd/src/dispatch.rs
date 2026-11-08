@@ -48,6 +48,7 @@ use sandy_proto::MessageType;
 use uuid::Uuid;
 
 use crate::{
+    credential::JobCredentials,
     link_auth::{self, LinkAuthError, RemoteLink},
     store::JobStore,
 };
@@ -396,6 +397,9 @@ pub struct JobRegistry {
     /// [`JobRegistry::with_retention`] for tests that need to observe the
     /// sweep without waiting out the real default.
     retention: Duration,
+    /// Daemon-minted job credentials (#481). `None` refuses any Submit naming a
+    /// credential.
+    credentials: Option<Arc<JobCredentials>>,
 }
 
 impl JobRegistry {
@@ -409,7 +413,21 @@ impl JobRegistry {
             terminal_at: Mutex::new(HashMap::new()),
             authority: SharedCapAuthority::new(LocalCapAuthority::new(CAP_TTL)?),
             retention: TERMINAL_RETENTION,
+            credentials: None,
         })
+    }
+
+    /// Mint, hold, and revoke job credentials through `credentials` (#481).
+    #[must_use]
+    pub fn with_credentials(mut self, credentials: JobCredentials) -> Self {
+        self.credentials = Some(Arc::new(credentials));
+        self
+    }
+
+    /// The daemon's job credentials, when configured.
+    #[must_use]
+    pub fn credentials(&self) -> Option<&Arc<JobCredentials>> {
+        self.credentials.as_ref()
     }
 
     /// Override the terminal-retention grace period (#270). Production

@@ -21,6 +21,8 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+# The reusable credential bracket and trust-root resolution (#481).
+sandy.workspace = true
 sandy-api.workspace = true
 sandy-control-proto.workspace = true
 sandy-environment.workspace = true

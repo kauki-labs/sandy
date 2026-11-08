@@ -15,6 +15,7 @@
 pub mod attach_relay;
 pub mod audit;
 pub mod build_rev;
+pub mod credential;
 pub mod dispatch;
 pub mod environment;
 pub mod environment_backend;
@@ -286,6 +287,8 @@ mod tests {
                     inputs: Vec::new(),
                     outputs: Vec::new(),
                     secrets: Vec::new(),
+                    credential: None,
+                    cred_capabilities: Vec::new(),
                 })),
             },
         )
@@ -356,6 +359,8 @@ mod tests {
                     inputs: Vec::new(),
                     outputs: Vec::new(),
                     secrets: Vec::new(),
+                    credential: None,
+                    cred_capabilities: Vec::new(),
                 })),
             },
         )

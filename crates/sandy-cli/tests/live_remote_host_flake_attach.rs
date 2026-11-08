@@ -175,6 +175,8 @@ async fn submit_flake(
             inputs: Vec::new(),
             outputs: Vec::new(),
             secrets: Vec::new(),
+            credential: None,
+            cred_capabilities: Vec::new(),
         }),
     )
     .await
