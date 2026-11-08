@@ -153,10 +153,11 @@ async fn main() {
         }
     };
 
-    // The environment audit log (#596) sits beside the database unless `SANDY_AUDIT_LOG` names
-    // it. A daemon that cannot open it does not start: an unaudited operation never runs.
+    // The environment audit log (#596) sits beside the database, named after it so two stores in
+    // one directory never share a log, unless `SANDY_AUDIT_LOG` names it. A daemon that cannot open it does not start:
+    // an unaudited operation never runs.
     let audit_path =
-        std::env::var_os("SANDY_AUDIT_LOG").map_or_else(|| db_path.with_file_name("audit.jsonl"), PathBuf::from);
+        std::env::var_os("SANDY_AUDIT_LOG").map_or_else(|| db_path.with_extension("audit.jsonl"), PathBuf::from);
     let audit = match sandyd::audit::AuditLog::open(&audit_path) {
         Ok(audit) => Arc::new(audit),
         Err(e) => {

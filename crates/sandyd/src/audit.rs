@@ -31,8 +31,9 @@ pub struct AuditEntry<'a> {
     pub operation: &'static str,
     /// The environment the operation names.
     pub environment_id: &'a str,
-    /// `trusted` or `untrusted`: the isolation class sandyd recorded for the submitter.
-    pub submitter: &'static str,
+    /// `trusted` or `untrusted`: the isolation class sandyd recorded when the environment was
+    /// created. For a stop or delete it is the creator's class, not the caller's.
+    pub submitter_class: &'static str,
 }
 
 /// An append-only audit file.
@@ -56,7 +57,13 @@ impl AuditLog {
             .append(true)
             .create(true)
             .mode(0o600)
-            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
+            // NONBLOCK so a FIFO at the path fails the open instead of hanging startup; it has no
+            // effect on a regular file, and the check below refuses anything else.
+            .custom_flags(
+                (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK)
+                    .bits()
+                    .cast_signed(),
+            )
             .open(path)
             .map_err(io)?;
         let meta = file.metadata().map_err(io)?;
@@ -89,18 +96,24 @@ impl AuditLog {
             "at": entry.at,
             "operation": entry.operation,
             "environment_id": entry.environment_id,
-            "submitter": entry.submitter,
+            "submitter_class": entry.submitter_class,
             // The line is written before the change, so the change may still be refused.
             "outcome": "attempted",
         });
         let mut file = self.file.lock().unwrap_or_else(PoisonError::into_inner);
-        // One write call per line, so an O_APPEND file never interleaves two lines.
-        writeln_json(&mut file, &line)
-            .and_then(|()| file.sync_data())
-            .map_err(|source| AuditError::Io {
-                path: self.path.clone(),
-                source,
-            })
+        let io = |source| AuditError::Io {
+            path: self.path.clone(),
+            source,
+        };
+        let before = file.metadata().map_err(io)?.len();
+        let written = writeln_json(&mut file, &line).and_then(|()| file.sync_data());
+        if let Err(source) = written {
+            // A write that failed part way (a full disk) must not leave a fragment that the
+            // next line would be appended to. Best effort: the operation is refused either way.
+            let _ = file.set_len(before);
+            return Err(io(source));
+        }
+        Ok(())
     }
 }
 
@@ -121,7 +134,7 @@ mod tests {
             at: 1,
             operation: "create",
             environment_id: id,
-            submitter: "trusted",
+            submitter_class: "trusted",
         }
     }
 
@@ -160,6 +173,19 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(text.trim_end()).context("one JSON object")?;
         assert_eq!(v["environment_id"], "a\"b\nc");
         assert_eq!(v["outcome"], "attempted");
+        Ok(())
+    }
+
+    #[test]
+    fn a_fifo_at_the_path_is_refused_instead_of_blocking_startup() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("audit.jsonl");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .context("run mkfifo")?;
+        assert!(made.success(), "mkfifo must work on the test host");
+        assert!(AuditLog::open(&path).is_err(), "a FIFO is not a log file");
         Ok(())
     }
 }

@@ -2311,25 +2311,30 @@ sandyd's state directory, and the identity is the one sandyd already records.
 
 **Decision.**
 
-- `sandyd::audit::AuditLog` appends one JSON line per operation to `audit.jsonl` beside the database, or to
-  `SANDY_AUDIT_LOG`. Fields: `at` (unix seconds), `operation` (`create`, `stop`, `delete`),
-  `environment_id`, `submitter` (`trusted` or `untrusted`) and `outcome`.
-- The log file is mode `0600`, opened append-only, synced after each line. A symlink, a file that is not
-  regular, a file another user owns and a file with group or other bits are refused. `sandyd` does not
-  start when the log cannot be opened.
+- `sandyd::audit::AuditLog` appends one JSON line per operation to `<db>.audit.jsonl` beside the database
+  (`sandyd.audit.jsonl` for the default `sandyd.db`), or to `SANDY_AUDIT_LOG`. Fields: `at` (unix
+  seconds), `operation` (`create`, `stop`, `delete`), `environment_id`, `submitter_class` (`trusted` or
+  `untrusted`) and `outcome`.
+- The log file is mode `0600`, opened append-only, synced after each line. A symlink, a FIFO or other file
+  that is not regular, a file another user owns and a file with group or other bits are refused, and
+  `sandyd` does not start when the log cannot be opened. A write that fails part way is cut back, so a
+  full disk leaves no fragment for the next line to join.
 - The handler writes the line before it changes state and fails closed. If the write fails, the operation
   is refused with `ENVIRONMENT_ERROR_CODE_UNAVAILABLE` (the broker already answers an unknown code with
   `unavailable`) and nothing changes. A crash between the line and the change leaves a line for an
   operation that did not run, so `outcome` is always `attempted`: the line says the operation was
   requested, not that it applied.
-- A create is audited only when it will mint a row. A replay of an accepted key, a refused request and an
-  unknown id write nothing.
-- The identity is the isolation class sandyd stored for the submitter: the create request's class, and the
-  row's recorded class for stop and delete. sandyd serves one user and has no per-client name on the
-  control RPC, so the broker's client id is not in the line. Carrying it needs a proto field. That is an
-  open owner question on #596.
+- The line is written once the handler knows the request is well formed and, for stop and delete, that the
+  row's state allows it. A replay of an accepted key, an invalid create, an unknown id, a stop of an
+  environment that is not `Ready` and a repeated delete write nothing. A create that then meets the row
+  cap, or loses a race on its key, still leaves its line: only the store knows, and the line names an id
+  that never existed.
+- `submitter_class` is the isolation class sandyd stored for the environment's creator: the create
+  request's class, and the row's recorded class for stop and delete. It is not the caller's identity.
+  sandyd serves one user and has no per-client name on the control RPC, so the broker's client id is not in
+  the line. Carrying it needs a proto field. That is an open owner question on #596.
 
-**Not covered.** `resume` and `cancel`, and every change the daemon makes itself: the idle stop, the
+**Not covered.** `resume`, and `cancel`, which ends an environment in `Deleted`; and every change the daemon makes itself: the idle stop, the
 retention sweep and the launch driver. Log rotation. Quotas, the default `untrusted` class and the
 per-client authz of #596 stay open.
 

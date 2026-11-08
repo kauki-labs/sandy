@@ -292,7 +292,7 @@ async fn audit(store: &Arc<EnvironmentStore>, operation: &'static str, id: &str,
             at,
             operation,
             environment_id: &id,
-            submitter,
+            submitter_class: submitter,
         })
     })
     .await;
@@ -517,7 +517,11 @@ async fn stop_or_resume(store: &Arc<EnvironmentStore>, id: String, stop: bool) -
             "an ephemeral environment lives for one task and cannot be stopped or resumed",
         );
     }
-    if stop && let Some(refusal) = audit(store, "stop", &id, record.submitter_trusted).await {
+    // Only a Ready environment can be stopped: any other state is refused below, so it is not audited.
+    if stop
+        && record.state == EnvironmentState::Ready
+        && let Some(refusal) = audit(store, "stop", &id, record.submitter_trusted).await
+    {
         return refusal;
     }
     let key = id.clone();
@@ -557,7 +561,10 @@ async fn delete(store: &Arc<EnvironmentStore>, id: String) -> Reply {
     let Some(record) = fetch(store, &id).await? else {
         return not_found(&id);
     };
-    if let Some(refusal) = audit(store, "delete", &id, record.submitter_trusted).await {
+    // Deleting a deleted environment changes nothing, so an idempotent retry is not audited.
+    if record.state != EnvironmentState::Deleted
+        && let Some(refusal) = audit(store, "delete", &id, record.submitter_trusted).await
+    {
         return refusal;
     }
     let key = id.clone();
@@ -1651,14 +1658,14 @@ mod tests {
             bail!("create must succeed");
         };
         s.mark_ready(&env.environment_id)?;
-        call(&s, stop(&env.environment_id)).await?.ok();
-        call(&s, delete(&env.environment_id)).await?.ok();
+        assert_eq!(state_after(&s, stop(&env.environment_id)).await?, WireState::Stopped);
+        assert_eq!(state_after(&s, delete(&env.environment_id)).await?, WireState::Deleted);
         let entries = lines(&path)?;
         let ops: Vec<_> = entries.iter().map(|e| e["operation"].as_str().unwrap_or("")).collect();
         assert_eq!(ops, ["create", "stop", "delete"]);
         for e in &entries {
             assert_eq!(e["environment_id"], env.environment_id.as_str());
-            assert_eq!(e["submitter"], "trusted");
+            assert_eq!(e["submitter_class"], "trusted");
             assert_eq!(e["outcome"], "attempted");
             assert!(e["at"].as_i64().unwrap_or(0) > 0, "the line carries a unix time");
         }
@@ -1715,6 +1722,32 @@ mod tests {
         assert_eq!(
             s.get(&row.environment_id)?.map(|r| r.state),
             Some(EnvironmentState::Ready)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_stop_the_state_refuses_and_a_repeated_delete_write_no_audit_line() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (s, path) = audited_store(dir.path())?;
+        let Ok(control_response::Result::Environment(env)) = call(&s, trusted_create("k1")).await? else {
+            bail!("create must succeed");
+        };
+        // Still Provisioning: a stop is refused as an invalid state.
+        assert_eq!(
+            refused(&s, stop(&env.environment_id)).await?,
+            EnvironmentErrorCode::InvalidState
+        );
+        assert_eq!(state_after(&s, delete(&env.environment_id)).await?, WireState::Deleted);
+        assert_eq!(state_after(&s, delete(&env.environment_id)).await?, WireState::Deleted);
+        let ops: Vec<_> = lines(&path)?
+            .iter()
+            .map(|e| e["operation"].as_str().unwrap_or("").to_owned())
+            .collect();
+        assert_eq!(
+            ops,
+            ["create", "delete"],
+            "no line for the refused stop or the repeat delete"
         );
         Ok(())
     }
