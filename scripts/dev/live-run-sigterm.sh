@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
 # Live gate for #687, tier-3, never counted green from a fake (INV-S9).
 #
-# Boots the T3 guest under `sandy run`, sends SIGTERM (or SIGHUP) to the `sandy` process while the guest runs, and
-# checks that it tears down instead of dying with the default action: sandy exits on its own within the time budget,
+# Boots the T3 guest under `sandy run`, sends SIGTERM (or SIGHUP) to the `sandy` process while the guest runs, or with
+# KILL runs `sandy kill <job-id>` from a second process (#695), and checks that it tears down instead of dying with the default action: sandy exits on its own within the time budget,
 # the job record is terminal (`cancelled`, not `running`), every process the box started is gone, and the run
 # directory is removed.
 #
 # Needs: a Linux host with KVM and /dev/vhost-vsock access, or an Apple silicon macOS host with the aarch64-linux
 # builder; nix. No root, tap or nft. Run from the repo root:
 #
-#   scripts/dev/live-run-sigterm.sh [TERM|HUP]
+#   scripts/dev/live-run-sigterm.sh [TERM|HUP|KILL]
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$repo_root"
 signal=${1:-TERM}
-case "$signal" in TERM | HUP) ;; *)
-  echo "usage: $0 [TERM|HUP]" >&2
+case "$signal" in TERM | HUP | KILL) ;; *)
+  echo "usage: $0 [TERM|HUP|KILL]" >&2
   exit 2
   ;;
 esac
@@ -113,8 +113,24 @@ alive() { kill -0 "$1" 2>/dev/null; }
 echo "== letting the guest boot"
 sleep 40
 
-echo "== sending SIG$signal"
-kill -s "$signal" "$owner"
+if [ "$signal" = KILL ]; then
+  # The job id is the journal record's name. `sandy kill` signals the owner and returns once the owner has finished.
+  job_id=$(find "$work/home/jobs" -name '*.json' | head -1 | xargs -n1 basename | sed 's/\.json$//')
+  [ -n "$job_id" ] || {
+    echo "FAIL: no job record under $work/home/jobs" >&2
+    exit 1
+  }
+  echo "== sandy kill $job_id"
+  kill_rc=0
+  TMPDIR="$work" SANDY_HOME="$work/home" "$target_dir/debug/sandy" kill "$job_id" >"$work/kill.out" 2>"$work/kill.err" || kill_rc=$?
+  if [ "$kill_rc" -ne 0 ]; then
+    echo "FAIL: sandy kill exited $kill_rc: $(head -c 300 "$work/kill.err")" >&2
+    exit 1
+  fi
+else
+  echo "== sending SIG$signal"
+  kill -s "$signal" "$owner"
+fi
 # The default action would end sandy at once. Teardown stops the guest, so allow a time budget for it.
 for _ in $(seq 60); do
   alive "$owner" || break

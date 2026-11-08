@@ -6,7 +6,7 @@
 use std::{
     os::unix::fs::PermissionsExt,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU32, Ordering},
     },
     time::{Duration, SystemTime},
@@ -20,7 +20,9 @@ use sandy::{
 };
 use sandy_cli::{
     plan::JobPlan,
-    supervisor::{gc, kill, ls, mint_run_token, run_job, run_job_with_credential, status, wait},
+    supervisor::{
+        OwnerSignal, SigTerm, gc, kill, kill_with, ls, mint_run_token, run_job, run_job_with_credential, status, wait,
+    },
 };
 use sandy_test_support::{FakeApplier, FakeBackend, FakeProvider};
 
@@ -2357,6 +2359,282 @@ fn a_cancel_that_cut_the_run_short_keeps_the_backend_s_message() -> anyhow::Resu
         report.envelope.message.starts_with("run cancelled ("),
         "the message must keep the original text: {}",
         report.envelope.message
+    );
+    Ok(())
+}
+
+/// #699: a run that is alive reads as `running` from a second process, not `crashed`. The owner holds the job's
+/// liveness lock for the whole run, so `reconcile_job` leaves its record alone (INV-3).
+#[test]
+fn a_live_run_reads_as_running_from_a_second_handle() -> anyhow::Result<()> {
+    let (tmp, journal) = fresh_journal()?;
+    let backend = Arc::new(HoldsUntilCancelled::new());
+    let plan = booting_plan();
+    let control = plan.control.clone();
+    let seen = std::thread::spawn({
+        let backend = Arc::clone(&backend);
+        let home = tmp.path().to_path_buf();
+        move || -> anyhow::Result<JobState> {
+            while backend.runs.load(Ordering::SeqCst) == 0 {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let other = Journal::new(home);
+            let job_id = ls(&other)?.first().context("the run's record")?.job_id.clone();
+            let state = status(&other, &FakeBackend::new(), &job_id)?.state;
+            control.cancel();
+            Ok(state)
+        }
+    });
+
+    run_job(
+        &*backend,
+        &journal,
+        &plan,
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        None,
+        &[],
+    )
+    .context("run_job (watched from a second handle)")?;
+
+    let state = seen.join().map_err(|_| anyhow::anyhow!("observer panicked"))??;
+    assert_eq!(state, JobState::Running, "a live run must not read as crashed");
+    Ok(())
+}
+
+/// What `sandy kill` sends the owner of a live run, replaced here so no test signals a real process: it records the
+/// pid and then does what the real handler does on SIGTERM, cancel the run (#695).
+struct CancelsOnTerminate {
+    control: sandy::RunControl,
+    pids: Mutex<Vec<u32>>,
+}
+
+impl OwnerSignal for CancelsOnTerminate {
+    fn terminate(&self, pid: u32) -> std::io::Result<()> {
+        self.pids.lock().expect("pids").push(pid);
+        self.control.cancel();
+        Ok(())
+    }
+}
+
+/// A signal the kernel refuses (the owner belongs to another user).
+struct Denied;
+
+impl OwnerSignal for Denied {
+    fn terminate(&self, _pid: u32) -> std::io::Result<()> {
+        Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+    }
+}
+
+/// A signal that arrives and changes nothing (an owner that is stuck).
+struct Ignored(Mutex<u32>);
+
+impl OwnerSignal for Ignored {
+    fn terminate(&self, _pid: u32) -> std::io::Result<()> {
+        *self.0.lock().expect("count") += 1;
+        Ok(())
+    }
+}
+
+/// Start a credentialed run that holds its guest, and return what a second process needs to act on it: its journal
+/// handle, its job id, and the thread to join for the owner's own result.
+fn live_credentialed_run(
+    tmp: &tempfile::TempDir,
+    journal: Journal,
+    backend: Arc<HoldsUntilCancelled>,
+    plan: JobPlan,
+) -> anyhow::Result<(std::thread::JoinHandle<anyhow::Result<()>>, Journal, String)> {
+    let cred_dir = tmp.path().join("cred");
+    std::fs::create_dir_all(&cred_dir).context("create cred dir")?;
+    std::fs::set_permissions(&cred_dir, std::fs::Permissions::from_mode(0o700)).context("cred dir 0700")?;
+    let entered = Arc::clone(&backend);
+    let owner = std::thread::spawn(move || -> anyhow::Result<()> {
+        let provider = FakeProvider::returning("ghs_live");
+        run_job_with_credential(
+            &*backend,
+            &journal,
+            plan,
+            &FakeApplier::new(),
+            EgressOs::Linux,
+            None,
+            &provider,
+            &token_scope(),
+            "GH_TOKEN",
+            &cred_dir,
+            fingerprint(&cred_dir)?,
+            1_800,
+        )
+        .context("run_job_with_credential (the live owner)")?;
+        Ok(())
+    });
+    while entered.runs.load(Ordering::SeqCst) == 0 {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let other = Journal::new(tmp.path());
+    let job_id = ls(&other)?.first().context("the run's record")?.job_id.clone();
+    Ok((owner, other, job_id))
+}
+
+/// #695: `sandy kill` of a live run signals its owner and hands back the record the OWNER wrote, with the
+/// credential receipt: it writes no `cancelled` record of its own, which would carry no receipt and win.
+#[test]
+fn kill_of_a_live_run_signals_its_owner_and_returns_the_owners_record() -> anyhow::Result<()> {
+    let (tmp, journal) = fresh_journal()?;
+    let backend = Arc::new(HoldsUntilCancelled::new());
+    let plan = booting_plan();
+    let signal = CancelsOnTerminate {
+        control: plan.control.clone(),
+        pids: Mutex::new(vec![]),
+    };
+    let (owner, other, job_id) = live_credentialed_run(&tmp, journal, backend, plan)?;
+
+    let record = kill_with(&other, &FakeBackend::new(), &signal, &job_id, Duration::from_secs(10))
+        .context("kill_with a live run")?;
+    owner.join().map_err(|_| anyhow::anyhow!("owner panicked"))??;
+
+    assert_eq!(record.state, JobState::Cancelled);
+    let envelope = record.result.as_ref().context("the owner's envelope")?;
+    assert_ne!(
+        envelope.message, "cancelled by kill",
+        "kill must not write its own record"
+    );
+    assert!(
+        envelope
+            .receipt
+            .as_ref()
+            .and_then(|r| r.host_observed.credential.as_ref())
+            .is_some_and(|c| c.revoke_succeeded),
+        "the owner's credential receipt must survive the kill"
+    );
+    assert_eq!(
+        *signal.pids.lock().expect("pids"),
+        vec![std::process::id()],
+        "the owner (writer_pid) is the process signalled"
+    );
+    Ok(())
+}
+
+/// #695: a signal the kernel refuses leaves the job `running` and says who can stop it.
+#[test]
+fn kill_without_permission_to_signal_the_owner_fails_and_leaves_the_record_running() -> anyhow::Result<()> {
+    let (tmp, journal) = fresh_journal()?;
+    let backend = Arc::new(HoldsUntilCancelled::new());
+    let plan = booting_plan();
+    let control = plan.control.clone();
+    let (owner, other, job_id) = live_credentialed_run(&tmp, journal, backend, plan)?;
+
+    let err = kill_with(&other, &FakeBackend::new(), &Denied, &job_id, Duration::from_secs(1))
+        .expect_err("a refused signal is an error, not a cancelled record");
+    let still = other.read_record(&job_id)?.state;
+    control.cancel();
+    owner.join().map_err(|_| anyhow::anyhow!("owner panicked"))??;
+
+    assert!(
+        err.to_string().contains("may not signal") && err.to_string().contains("as that user or as root"),
+        "the error must name the fix: {err}"
+    );
+    assert_eq!(still, JobState::Running, "no cancelled record while the job lives");
+    Ok(())
+}
+
+/// #695: an owner that does not stop within the budget is not escalated to SIGKILL (that would skip the revoke,
+/// #687): the error says so and the record stays `running`.
+#[test]
+fn kill_of_an_owner_that_does_not_stop_reports_it_and_never_escalates() -> anyhow::Result<()> {
+    let (tmp, journal) = fresh_journal()?;
+    let backend = Arc::new(HoldsUntilCancelled::new());
+    let plan = booting_plan();
+    let control = plan.control.clone();
+    let (owner, other, job_id) = live_credentialed_run(&tmp, journal, backend, plan)?;
+    let signal = Ignored(Mutex::new(0));
+
+    let err = kill_with(
+        &other,
+        &FakeBackend::new(),
+        &signal,
+        &job_id,
+        Duration::from_millis(400),
+    )
+    .expect_err("an owner that ignores SIGTERM is reported, not killed");
+    let still = other.read_record(&job_id)?.state;
+    control.cancel();
+    owner.join().map_err(|_| anyhow::anyhow!("owner panicked"))??;
+
+    assert!(err.to_string().contains("did not finish"), "{err}");
+    assert!(
+        err.to_string().contains("SIGKILL"),
+        "the error must say why it does not escalate: {err}"
+    );
+    assert_eq!(*signal.0.lock().expect("count"), 1, "one SIGTERM, no repeat");
+    assert_eq!(still, JobState::Running);
+    Ok(())
+}
+
+/// #695: a record naming pid 0 or 1 is never signalled, even for a live owner: `kill(0)` is the whole process group
+/// and pid 1 is init (or, in a build sandbox, the build itself).
+#[test]
+fn kill_never_signals_pid_zero_or_one() -> anyhow::Result<()> {
+    for pid in [0, 1] {
+        let (_tmp, journal) = fresh_journal()?;
+        let mut record = running_record("job-pid", "box-1", SystemTime::now());
+        record.writer_pid = pid;
+        journal.write_record(&record)?;
+        let _live = journal.hold_live("job-pid")?;
+        let signal = Ignored(Mutex::new(0));
+
+        let err = kill_with(
+            &journal,
+            &FakeBackend::new(),
+            &signal,
+            "job-pid",
+            Duration::from_secs(1),
+        )
+        .expect_err("pid 0 and 1 are refused");
+
+        assert!(err.to_string().contains("refusing to signal"), "{err}");
+        assert_eq!(*signal.0.lock().expect("count"), 0, "pid {pid} must not be signalled");
+        assert_eq!(journal.read_record("job-pid")?.state, JobState::Running);
+    }
+    Ok(())
+}
+
+/// #695: the real signal reaches the owner. A child process the test owns stands in for the owner (never a shared
+/// pid): `SigTerm` ends it with SIGTERM, and a job whose owner stays live past the budget is reported, not killed.
+#[test]
+fn the_real_sigterm_reaches_the_process_named_as_the_owner() -> anyhow::Result<()> {
+    use std::os::unix::process::ExitStatusExt;
+
+    let (_tmp, journal) = fresh_journal()?;
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .context("spawn the stand-in owner")?;
+    let mut record = running_record("job-real", "box-1", SystemTime::now());
+    record.writer_pid = child.id();
+    journal.write_record(&record)?;
+    // The test process holds the liveness lock, so the job reads as live; the child is the pid the record names.
+    let _live = journal.hold_live("job-real")?;
+
+    let err = kill_with(
+        &journal,
+        &FakeBackend::new(),
+        &SigTerm,
+        "job-real",
+        Duration::from_millis(300),
+    )
+    .expect_err("the lock stays held, so the budget runs out");
+    let status = child.wait().context("reap the stand-in owner")?;
+
+    assert!(err.to_string().contains("did not finish"), "{err}");
+    assert_eq!(
+        status.signal(),
+        Some(15),
+        "the process named as the owner must have received SIGTERM"
+    );
+    assert_eq!(
+        journal.read_record("job-real")?.state,
+        JobState::Running,
+        "no cancelled record for a live job"
     );
     Ok(())
 }

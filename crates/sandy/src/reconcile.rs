@@ -45,11 +45,13 @@ pub fn reconcile_job<B: VmBackend>(journal: &Journal, backend: &B, job_id: &str)
     }
 
     // The box is gone from the backend, but the pid may have been reused — so the
-    // flock, not the pid, is the liveness authority (INV-3). Only acquiring it
-    // proves the owner is gone; if another writer holds it, the job is live.
-    let Some(_lock) = journal.try_lock_job(job_id)? else {
+    // owner's liveness flock, not the pid, is the liveness authority (INV-3, #699).
+    // The owner holds it for the whole run: while it is held the job is live.
+    if journal.owner_live(job_id)? {
         return Ok(record);
-    };
+    }
+    // The write lock serialises the flip with the owner's and `kill`'s writes.
+    let _lock = journal.lock_job(job_id)?;
 
     // The first read happened before the lock; the owner may have written a
     // terminal record (and released the lock) in that window. Re-read under the

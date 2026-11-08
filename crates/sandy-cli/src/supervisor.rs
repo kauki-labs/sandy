@@ -20,7 +20,7 @@
 use std::{
     path::Path,
     sync::{Mutex, PoisonError, mpsc},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use sandy::{
@@ -201,6 +201,7 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
                 process_exit: classification.process_exit,
             },
             started: None,
+            live: None,
         });
     }
 
@@ -216,6 +217,8 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
         started,
         result: None,
     };
+    // Before the `Running` record exists, so no reader can see the job running without seeing its owner live (#699).
+    let live = journal.hold_liveness(&job_id)?;
     journal.persist(&running)?;
 
     // 3. Apply the egress boundary around the boot. On Linux with a tap this loads the guest-scoped forward ruleset
@@ -380,6 +383,7 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
             process_exit: classification.process_exit,
         },
         started: Some(started),
+        live,
     })
 }
 
@@ -805,17 +809,69 @@ pub fn wait<B: VmBackend>(journal: &Journal, backend: &B, job_id: &str) -> Resul
     reconcile_job(journal, backend, job_id)
 }
 
-/// Cancel a running job: tear its box down and flip the record to `Cancelled`.
+/// How long [`kill`] waits for the owner of a live run to finish its own teardown after a `SIGTERM`.
+pub const KILL_BUDGET: Duration = Duration::from_secs(60);
+
+/// What [`kill`] sends the owner of a live run. A trait only so a test can observe the signal without sending one to a
+/// real process.
+pub trait OwnerSignal {
+    /// Ask process `pid` to stop (`SIGTERM`). The error is the kernel's: [`std::io::ErrorKind::PermissionDenied`] when
+    /// the process belongs to another user.
+    ///
+    /// # Errors
+    ///
+    /// The `kill(2)` failure.
+    fn terminate(&self, pid: u32) -> std::io::Result<()>;
+}
+
+/// The real `SIGTERM`, which `sandy run` answers by cancelling the run (#687).
+#[derive(Debug, Clone, Copy)]
+pub struct SigTerm;
+
+impl OwnerSignal for SigTerm {
+    fn terminate(&self, pid: u32) -> std::io::Result<()> {
+        let pid = i32::try_from(pid)
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        rustix::process::kill_process(pid, rustix::process::Signal::TERM).map_err(std::io::Error::from)
+    }
+}
+
+/// Cancel a running job.
+///
+/// A live owner (its liveness lock is held, INV-3) is sent `SIGTERM` and given [`KILL_BUDGET`] to tear the guest down,
+/// revoke the credential and write its own terminal record; that record is returned. Nothing is written here for a
+/// live job, so the owner's receipt stands. A dead owner's record is flipped to `Cancelled` after its box is torn down.
 /// Idempotent on an already-terminal record.
 ///
 /// # Errors
 ///
-/// Returns [`CoreError`] on journal I/O failure.
+/// Returns [`CoreError`] on journal I/O failure, when the owner cannot be signalled (another user's process), or when
+/// it does not finish within the budget. The record stays `running` in both of the last two cases.
 pub fn kill<B: VmBackend>(journal: &Journal, backend: &B, job_id: &str) -> Result<JobRecord, CoreError> {
+    kill_with(journal, backend, &SigTerm, job_id, KILL_BUDGET)
+}
+
+/// [`kill`] with the signal and the budget supplied.
+///
+/// # Errors
+///
+/// As [`kill`].
+pub fn kill_with<B: VmBackend, S: OwnerSignal + ?Sized>(
+    journal: &Journal,
+    backend: &B,
+    signal: &S,
+    job_id: &str,
+    budget: Duration,
+) -> Result<JobRecord, CoreError> {
     // Idempotent on an already-terminal record: nothing to tear down.
     let record = journal.read_record(job_id)?;
     if record.state != JobState::Running {
         return Ok(record);
+    }
+    if journal.owner_live(job_id)? {
+        return stop_live_owner(journal, backend, signal, &record, budget);
     }
 
     // Flip under the job flock so a concurrent reconcile/writer can't race us.
@@ -857,6 +913,57 @@ pub fn kill<B: VmBackend>(journal: &Journal, backend: &B, job_id: &str) -> Resul
     };
     journal.write_record(&cancelled)?;
     Ok(cancelled)
+}
+
+/// Signal the live owner of `record` and wait for it to finish (#695). The liveness lock is held, so `writer_pid` is
+/// that owner and cannot have been reused. No job lock is held while waiting: the owner's terminal write takes it.
+fn stop_live_owner<B: VmBackend, S: OwnerSignal + ?Sized>(
+    journal: &Journal,
+    backend: &B,
+    signal: &S,
+    record: &JobRecord,
+    budget: Duration,
+) -> Result<JobRecord, CoreError> {
+    let job_id = &record.job_id;
+    let pid = record.writer_pid;
+    // `kill(0)` is the caller's whole process group and pid 1 is init: never what a record should name.
+    if pid <= 1 {
+        return Err(CoreError::State(format!(
+            "job {job_id} names pid {pid} as its owner; refusing to signal it"
+        )));
+    }
+    match signal.terminate(pid) {
+        Ok(()) => {}
+        // The owner exited since the lock was checked: the wait below sees it go.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Err(CoreError::State(format!(
+                "job {job_id} is run by pid {pid}, which this user may not signal ({e}); run `sandy kill {job_id}` as \
+                 that user or as root"
+            )));
+        }
+        Err(e) => {
+            return Err(CoreError::State(format!(
+                "could not signal pid {pid}, the owner of job {job_id}: {e}"
+            )));
+        }
+    }
+    let deadline = Instant::now() + budget;
+    while journal.owner_live(job_id)? {
+        if Instant::now() >= deadline {
+            return Err(CoreError::State(format!(
+                "job {job_id} (pid {pid}) did not finish within {budget:?} of SIGTERM; not escalating to SIGKILL, \
+                 which would skip the credential revoke"
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let finished = journal.read_record(job_id)?;
+    if finished.state != JobState::Running {
+        return Ok(finished);
+    }
+    // The owner went without writing its result: the reconcile path settles it (`crashed`).
+    reconcile_job(journal, backend, job_id)
 }
 
 /// [`gc`]'s result: evicted job ids and swept staging-dir names, kept apart

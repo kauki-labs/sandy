@@ -56,3 +56,37 @@ reported as running; liveness has one path, so the ops commands agree. Proven li
 by K3 (`live_boot.rs::cli_lifecycle_over_a_real_job`).
 
 **Set aside.** Direct registry reads for liveness: rejected, they race the owner.
+
+## 3. The owner holds a liveness lock for the run; `kill` signals the owner (#699, #695)
+
+**Status:** accepted. **Upholds:** INV-3, INV-6, INV-7.
+
+**Context.** Decision 2 says liveness is the job flock, "held by a live owner". It was not: the lock was taken only
+inside each write and dropped, and the `Running` record carries no box id, so `reconcile_job` could not tell a live run
+in another process from a dead one. `sandy status` from a second process read a live run as `crashed` (#699). `sandy
+kill` had the same blindness: it wrote `cancelled` and signalled nothing, because the VM backends' `kill` only edits an
+in-memory registry (#695).
+
+**Decision.**
+
+- Each job has a second lockfile, `<job>.live`, apart from the short write lock `<job>.lock`. The owning `sandy run`
+  takes it before the `Running` record is written and keeps it past the terminal write (`JobOutcome` carries it). The
+  kernel drops it with its holder, so a held lock is a live owner even if the pid was reused. `reconcile_job` leaves a
+  `running` record alone while it is held.
+- `sandy kill` of a live owner (lock held) sends `SIGTERM` to the record's `writer_pid`, which `sandy run` answers by
+  cancelling the run (#687: guest stopped, credential revoked, terminal record with its receipt). It then waits up to 60 s
+  for the owner to finish and returns the record the **owner** wrote. It writes no `cancelled` record of its own for a live
+  job: that record would carry no credential receipt and win the race against the owner's.
+- Every refusal leaves the record `running` and fails: a kernel `EPERM` (the owner is another user's: the error names
+  that and says to run `kill` as that user or root), a record naming pid 0 or 1 (never signalled), an owner still live
+  after the budget (no `SIGKILL`: it would skip the revoke, #687). An owner that exits without a terminal record is
+  settled by `reconcile_job` (`crashed`).
+- `kill` of a dead owner is unchanged: the box is torn down through the backend and the record flips to `cancelled`.
+
+**Consequences.** `sandy status`, `ls`, `wait` and `gc` no longer report a live run as `crashed`. A record written before
+this change has no `.live` file, so its owner reads as dead, as before. `SIGKILL` of the owner still leaves a `running`
+record and an orphaned VM until the next sweep (#666); `sandy kill` of such a job takes the dead-owner path.
+
+**Set aside.** Holding the existing write lock for the run: the owner's own terminal write takes it, so it would deadlock,
+and `kill` would block behind the whole run. Storing pid and start time in the record to check identity: a held lock
+already proves the owner and cannot be fooled by a reused pid, and it needs no schema change.
