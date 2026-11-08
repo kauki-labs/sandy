@@ -30,6 +30,8 @@ use sandy_control_proto::{
 #[case(control_request::Op::Attach(AttachRequest {
     job_id: "job-1".to_owned(),
     attach_token: Some(b"attach-token".to_vec()),
+ collector: false,
+
 }))]
 #[case(control_request::Op::Status(StatusRequest { job_id: "job-1".to_owned() }))]
 #[case(control_request::Op::List(ListRequest {}))]

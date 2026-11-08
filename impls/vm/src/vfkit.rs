@@ -26,10 +26,10 @@ use std::{
 
 use sandy::{
     BackendError, BoxState, Hypervisor, Outcome, RunSpec, ShareDirs, StoreBacking, Topology, VmBackend,
-    collect_outputs, ensure_sandy_staging_base, plan_shares, topology, wipe, with_digests,
+    collect_outputs, ensure_sandy_staging_base, plan_shares, topology_until, wipe, with_digests,
 };
 use sandy_api::{
-    agent::{AGENT_VSOCK_PORT, AgentLaunch},
+    agent::{AGENT_VSOCK_PORT, AgentLaunch, PORT_RELAY_VSOCK_PORT},
     egress::NetworkMode,
     share::{GuestShareTransport, ShareSpec},
 };
@@ -39,6 +39,7 @@ use crate::{
     agent::{agent_outcome, spawn_connector},
     console::{Markers, PtyTransport, run_console},
     egress_proxy::{EGRESS_VSOCK_PORT, EgressLaunch, ProxyHandle, console_command},
+    orphans::{BoxRecorder, SweepReport, unrecorded, wipe_staging},
     share::VirtioFsTransport,
 };
 
@@ -69,6 +70,9 @@ pub struct StagedArgs {
     /// Egress-proxy mode (#405): the host unix socket vfkit dials for each guest
     /// connection to the fixed egress vsock port. The proxy listens there.
     pub egress_socket: Option<PathBuf>,
+    /// Service bridge (#590): the host unix socket vfkit exposes the guest port relay's vsock port at, for the host
+    /// to connect to.
+    pub service_vsock: Option<PathBuf>,
     /// The guest network profile (#602). [`NetworkMode::Nic`] adds a NAT `virtio-net` with no egress
     /// boundary, and is refused beside an egress policy; the default emits none.
     pub network: NetworkMode,
@@ -82,6 +86,7 @@ impl StagedArgs {
             shares,
             agent_vsock: None,
             egress_socket: None,
+            service_vsock: None,
             network: NetworkMode::None,
         }
     }
@@ -109,6 +114,8 @@ impl StagedArgs {
 ///   the secret share), via the [`VirtioFsTransport`]. Each `--device` and its descriptor are separate argv tokens;
 ///   read-only is enforced by the guest mount (vfkit's virtio-fs device rejects a `,ro` option).
 /// - `--device virtio-vsock,…` when [`Topology::vsock_cid`] is `Some` (absent in the aarch64 fixture).
+/// - service bridge ([`StagedArgs::service_vsock`], #590): `--device
+///   virtio-vsock,port=1000,socketURL=<socket>,connect`, the guest port relay's port, with the host connecting.
 /// - proxy mode ([`StagedArgs::egress_socket`], #405): `--device virtio-vsock,port=5001,socketURL=<socket>,listen`, so
 ///   vfkit dials the proxy's unix socket for each guest-initiated connection. It coexists with the agent link's
 ///   `connect` device on port 5000. No `virtio-net` is emitted in either mode: the guest has no NIC unless
@@ -184,6 +191,15 @@ pub fn vfkit_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> R
         ));
     }
 
+    // Service bridge (#590): the same `connect` shape as the agent port, for the guest port relay.
+    if let Some(socket) = &staged.service_vsock {
+        args.push("--device".to_string());
+        args.push(format!(
+            "virtio-vsock,port={PORT_RELAY_VSOCK_PORT},socketURL={},connect",
+            socket.display()
+        ));
+    }
+
     // Proxy mode (#405): `listen` makes vfkit the dialer: it connects to the proxy's unix socket for each
     // guest-initiated connection to the egress port.
     if let Some(socket) = &staged.egress_socket {
@@ -232,9 +248,23 @@ pub struct VfkitBackend {
     agent: Option<AgentLaunch>,
     /// Set by an agent-mode backend's one run: its cap and channel serve one job.
     agent_used: AtomicBool,
+    /// When set, vfkit exposes the guest port relay at this host socket (#590).
+    service_socket: Option<PathBuf>,
+    /// Set by a service-socket backend's one run: the socket path serves one VM, so a second run would unlink the
+    /// first one's live socket.
+    service_used: AtomicBool,
 }
 
 impl VfkitBackend {
+    /// Stop the VMs that a killed host process (`sandyd` or a `sandy run`) left behind, and remove their staging
+    /// directories (#666). Call it once at start-up, before launching. It reads the records under the staging base, so
+    /// it sweeps a box whichever hypervisor wrote it, and it stops only a process that a record proves is ours, for a
+    /// box whose owner is gone. See [`sweep_orphaned_vms`](crate::sweep_orphaned_vms).
+    #[must_use]
+    pub fn sweep_orphans() -> SweepReport {
+        crate::orphans::sweep_orphaned_vms()
+    }
+
     /// A backend that launches the `vfkit` binary at `vfkit_bin`, with an empty
     /// instance registry.
     #[must_use]
@@ -244,6 +274,8 @@ impl VfkitBackend {
             instances: Mutex::new(Vec::new()),
             agent: None,
             agent_used: AtomicBool::new(false),
+            service_socket: None,
+            service_used: AtomicBool::new(false),
         }
     }
 
@@ -257,6 +289,19 @@ impl VfkitBackend {
     #[must_use]
     pub fn with_agent(mut self, agent: AgentLaunch) -> Self {
         self.agent = Some(agent);
+        self
+    }
+
+    /// Expose the guest port relay (#590) at the host unix socket `socket`.
+    ///
+    /// vfkit must declare the vsock device before boot, so the caller picks the path (short enough for
+    /// `sun_path`, no comma, in a private directory such as `sandy_fsutil`'s staging base: the backend does not check
+    /// who else can write there) and dials it with `sandy-conn`'s `UnixDialer`. Without it the guest has no service
+    /// channel. The backend serves ONE run, like agent mode: build one per environment. The path must be unique per
+    /// environment: a second backend on the same path would find the first run's live socket and unlink it.
+    #[must_use]
+    pub fn with_service_socket(mut self, socket: impl Into<PathBuf>) -> Self {
+        self.service_socket = Some(socket.into());
         self
     }
 }
@@ -283,9 +328,11 @@ impl VfkitBackend {
         spec: &RunSpec,
         run_id: Uuid,
         box_id: &str,
+        inst_dir: &Path,
         shares: Vec<ShareSpec>,
         agent: Option<&AgentRun>,
         egress: Option<&EgressLaunch<'_>>,
+        service: Option<&Path>,
     ) -> Result<Outcome, BackendError> {
         // The shares (secret/input/output, their read-only flags, the #49 secret_dir
         // rule) are staged by `plan_shares` in `run`; here they only become argv. The
@@ -297,6 +344,8 @@ impl VfkitBackend {
         if let Some(agent) = agent {
             staged.agent_vsock = Some((AGENT_VSOCK_PORT, agent.socket.clone()));
         }
+        // Service bridge: a stale socket from a killed run would make vfkit's bind fail, so clear it first.
+        staged.service_vsock = service.map(Path::to_path_buf);
         // Proxy mode: vfkit dials the proxy's unix socket for the egress port.
         staged.egress_socket = egress.and_then(EgressLaunch::unix_socket).map(Path::to_path_buf);
         staged.network = network_from_env()?;
@@ -304,7 +353,12 @@ impl VfkitBackend {
 
         // The proxy belongs to this attempt and starts before vfkit. `ProxyHandle` kills on
         // drop, so every early return below stops it too.
-        let mut proxy = egress.map(EgressLaunch::start).transpose()?;
+        // Each helper process is recorded as it spawns, before any wait: a kill during the proxy's READY wait must
+        // still leave a record of it (#666). `run_with` wrote the owner before staging; this adopts that record.
+        let mut record = BoxRecorder::open(inst_dir).map_err(|err| unrecorded(&err))?;
+        let mut proxy = egress
+            .map(|launch| launch.start_recorded(&mut |pid| record.add(pid)))
+            .transpose()?;
         // The console launches the image's agent around the job (agent mode) and the egress
         // relay around that (proxy mode).
         let console_command = console_command(
@@ -327,6 +381,10 @@ impl VfkitBackend {
         // the driver for the whole run.
         transport.set_read_timeout(crate::console::POLL_QUANTUM);
         let pid = transport.spawn(&self.vfkit_bin, &args)?;
+        if let Err(err) = record.add(pid) {
+            transport.shutdown();
+            return Err(unrecorded(&err));
+        }
         tracing::info!(box_id, pid, "spawned vfkit under PTY console");
         self.lock_registry()?.push(BoxState {
             box_id: box_id.to_string(),
@@ -386,6 +444,49 @@ impl VfkitBackend {
             .lock()
             .map_err(|_| BackendError::Spawn("vfkit instance registry lock poisoned".to_string()))
     }
+}
+
+/// The service socket path, checked and cleared of a stale socket (#590).
+///
+/// The path must fit `sun_path` and hold no comma (vfkit splits its option string on commas). vfkit is SIGKILLed at
+/// teardown and cannot unlink its own socket, so a socket left by an earlier run would make the next bind fail: that
+/// one file type is removed. Anything else at the path (a file, directory or symlink) is refused, never deleted.
+fn prepare_service_socket(socket: &Path) -> Result<PathBuf, BackendError> {
+    use std::os::unix::fs::FileTypeExt as _;
+
+    let shown = socket.display();
+    if socket.as_os_str().len() > MAX_SOCKET_PATH {
+        return Err(BackendError::Spawn(format!(
+            "the service socket path {shown} is longer than a unix socket allows ({MAX_SOCKET_PATH} bytes)"
+        )));
+    }
+    let Some(text) = socket.to_str() else {
+        return Err(BackendError::Spawn(format!(
+            "the service socket path {shown} is not UTF-8, so vfkit's argument would name another path"
+        )));
+    };
+    if text.chars().any(|c| c == ',' || c.is_control()) {
+        return Err(BackendError::Spawn(format!(
+            "the service socket path {shown} holds a comma or a control character, which vfkit's option parser would \
+             split"
+        )));
+    }
+    match std::fs::symlink_metadata(socket) {
+        Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(socket)
+            .map_err(|err| BackendError::Spawn(format!("clear the stale service socket {shown}: {err}")))?,
+        Ok(_) => {
+            return Err(BackendError::Spawn(format!(
+                "the service socket path {shown} holds something that is not a socket; refusing to remove it"
+            )));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(BackendError::Spawn(format!(
+                "inspect the service socket path {shown}: {err}"
+            )));
+        }
+    }
+    Ok(socket.to_path_buf())
 }
 
 /// One agent-mode run: the image's agent and the host socket vfkit exposes its
@@ -449,7 +550,16 @@ impl VfkitBackend {
                 "this agent-mode backend already ran its one job; build one per sandbox run".to_string(),
             ));
         }
-        let topology = topology(spec.template)?;
+        if self.service_socket.is_some() && self.service_used.swap(true, Ordering::SeqCst) {
+            return Err(BackendError::Spawn(
+                "this service-socket backend already ran its one job; build one per environment".to_string(),
+            ));
+        }
+        // The eval can take minutes on a cold store: a cancel during it (SIGTERM to `sandy run`, #687) kills it and
+        // boots nothing.
+        let Some(topology) = topology_until(spec.template, || spec.control.is_cancelled())? else {
+            return Ok(crate::cancelled_before_boot());
+        };
         let run_id = Uuid::new_v4();
         let box_id = format!("inst-{run_id}");
         // Staging under the OS temp dir (works on macOS, where `/run` does not exist).
@@ -490,9 +600,21 @@ impl VfkitBackend {
         let inputs_dir = base.join(format!("{box_id}-inputs"));
         let outputs_dir = base.join(format!("{box_id}-outputs"));
 
+        // Record the owner before anything sensitive exists. Staging writes the secret share into `inst_dir`, so a kill
+        // from here on must leave a record that names this process, or the next sweep never finds the directory (#666).
+        // `boot` adds each process it starts.
+        sandy_fsutil::OwnedDir::open_or_create(&inst_dir)
+            .map_err(|err| BackendError::Spawn(format!("create instance dir {}: {err}", inst_dir.display())))?;
+        let _owner_record = BoxRecorder::open(&inst_dir).map_err(|err| {
+            // Nothing sensitive is staged yet.
+            let _ = wipe(&inst_dir);
+            unrecorded(&err)
+        })?;
+
         // Stage the shares via the shared policy, then boot on them. A staging
         // failure skips the boot but still wipes below (INV-1).
         let mut input_digests = None;
+        let mut service_prepared: Option<PathBuf> = None;
         let outcome = plan_shares(
             spec,
             &ShareDirs {
@@ -503,14 +625,19 @@ impl VfkitBackend {
         )
         .and_then(|plan| {
             input_digests = plan.input_digests;
+            // Prepared only now: teardown removes a service socket only when this run cleared its path, so a run that
+            // failed earlier never deletes what sits there.
+            service_prepared = self.service_socket.as_deref().map(prepare_service_socket).transpose()?;
             self.boot(
                 &topology,
                 spec,
                 run_id,
                 &box_id,
+                &inst_dir,
                 plan.shares,
                 agent.as_ref(),
                 egress.as_ref(),
+                service_prepared.as_deref(),
             )
         });
 
@@ -523,16 +650,13 @@ impl VfkitBackend {
         };
 
         // Wipe staging on every path so secret bytes never outlive the run (INV-1).
-        for dir in [&inst_dir, &inputs_dir, &outputs_dir] {
-            if let Err(err) = wipe(dir) {
-                tracing::warn!(dir = %dir.display(), %err, "failed to wipe staging on teardown");
-            }
-        }
+        wipe_staging(&inst_dir, &inputs_dir, &outputs_dir, "on teardown");
         let sockets = agent
             .as_ref()
             .map(|agent| agent.socket.as_path())
             .into_iter()
-            .chain(egress.as_ref().and_then(EgressLaunch::unix_socket));
+            .chain(egress.as_ref().and_then(EgressLaunch::unix_socket))
+            .chain(service_prepared.as_deref());
         for socket in sockets {
             if let Err(err) = std::fs::remove_file(socket)
                 && err.kind() != std::io::ErrorKind::NotFound
@@ -1033,7 +1157,7 @@ mod tests {
     #[test]
     fn a_proxy_that_never_becomes_ready_fails_before_vfkit_and_leaves_nothing() -> anyhow::Result<()> {
         let stub = StubRun::new("exec sleep 30")?;
-        let result = stub.run(Duration::from_millis(300));
+        let result = stub.run(crate::egress_proxy::tests::NEVER_READY);
         let Err(BackendError::Spawn(message)) = result else {
             anyhow::bail!("expected Spawn, got {result:?}");
         };
@@ -1054,7 +1178,7 @@ mod tests {
     #[test]
     fn a_proxy_that_exits_early_makes_the_run_egress_proxy_died() -> anyhow::Result<()> {
         let stub = StubRun::new("echo READY; exit 3")?;
-        let result = stub.run(Duration::from_secs(5));
+        let result = stub.run(crate::egress_proxy::tests::PROXY_STARTS);
         anyhow::ensure!(
             matches!(
                 result,
@@ -1079,7 +1203,7 @@ mod tests {
     fn a_live_proxy_is_not_a_death_and_its_socket_is_staged_then_removed() -> anyhow::Result<()> {
         let stub = StubRun::new("echo READY; exec sleep 30")?;
         let outcome = stub
-            .run(Duration::from_secs(5))
+            .run(crate::egress_proxy::tests::PROXY_STARTS)
             .context("a live proxy must not fail the run")?;
         anyhow::ensure!(!outcome.booted, "the stub vfkit never boots: {outcome:?}");
         let socket = stub.proxy_socket()?;
@@ -1161,6 +1285,142 @@ mod tests {
             ),
             "{}",
             args.join(" ")
+        );
+        Ok(())
+    }
+
+    /// #590: the service socket path is checked at the limit, refused when it could split vfkit's options, and only a
+    /// stale socket is removed.
+    #[test]
+    fn a_service_socket_path_is_checked_and_only_a_stale_socket_is_cleared() -> anyhow::Result<()> {
+        use std::os::unix::net::UnixListener;
+
+        let dir = PathBuf::from(format!("/tmp/sv-{}", &Uuid::new_v4().simple().to_string()[..8]));
+        std::fs::create_dir_all(&dir).context("create dir")?;
+        let refused = |path: &Path, why: &str| {
+            assert!(
+                matches!(prepare_service_socket(path), Err(BackendError::Spawn(m)) if m.contains(why)),
+                "{path:?} should be refused with {why:?}"
+            );
+        };
+
+        // A socket left by a killed run is removed.
+        let socket = dir.join("s.sock");
+        drop(UnixListener::bind(&socket).context("bind stale socket")?);
+        assert_eq!(prepare_service_socket(&socket)?, socket);
+        assert!(!socket.exists(), "the stale socket must be removed");
+        // A missing path is fine.
+        assert_eq!(prepare_service_socket(&socket)?, socket);
+
+        // Anything else is kept and refused.
+        let regular = dir.join("regular");
+        std::fs::write(&regular, b"data").context("write regular")?;
+        refused(&regular, "not a socket");
+        assert!(regular.exists());
+        let sub = dir.join("sub");
+        std::fs::create_dir(&sub).context("create dir")?;
+        refused(&sub, "not a socket");
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&regular, &link).context("symlink")?;
+        refused(&link, "not a socket");
+        assert!(regular.exists() && link.symlink_metadata().is_ok());
+
+        // The exact limit passes and one byte more fails.
+        let pad = MAX_SOCKET_PATH - dir.as_os_str().len() - 1;
+        let at_limit = dir.join("x".repeat(pad));
+        assert_eq!(at_limit.as_os_str().len(), MAX_SOCKET_PATH);
+        assert_eq!(prepare_service_socket(&at_limit)?, at_limit);
+        refused(&dir.join("x".repeat(pad + 1)), "longer");
+
+        // A comma or a control character would split or corrupt vfkit's option string.
+        refused(&dir.join("a,b"), "comma");
+        refused(&dir.join("a\tb"), "control character");
+        // A non-UTF-8 name would reach vfkit's argument with U+FFFD in place of the bytes, naming another path.
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            refused(&dir.join(std::ffi::OsStr::from_bytes(b"a\xffb")), "UTF-8");
+        }
+
+        // A symlink to a live socket is refused and left in place.
+        let live = dir.join("live.sock");
+        let _listener = UnixListener::bind(&live).context("bind live socket")?;
+        let to_live = dir.join("to-live");
+        std::os::unix::fs::symlink(&live, &to_live).context("symlink to socket")?;
+        refused(&to_live, "not a socket");
+        assert!(live.exists() && to_live.symlink_metadata().is_ok());
+        std::fs::remove_dir_all(&dir).context("cleanup")?;
+        Ok(())
+    }
+
+    /// #590: one service-socket backend runs one job.
+    #[test]
+    fn a_service_socket_backend_refuses_a_second_run() {
+        let backend = VfkitBackend::new("/nonexistent/vfkit")
+            .with_service_socket(format!("/tmp/sv-{}.sock", &Uuid::new_v4().simple().to_string()[..8]));
+        let template = fixture_path("topology-aarch64.json");
+        let command = ["true".to_string()];
+        let grants = grants();
+        let spec = spec_for(&template, &command, &grants);
+        let _first = backend.run(&spec);
+        assert!(
+            matches!(backend.run(&spec), Err(BackendError::Spawn(why)) if why.contains("already ran its one job")),
+            "the second run must be refused"
+        );
+    }
+
+    /// #590: agent, service and egress devices coexist on distinct ports.
+    #[test]
+    fn vfkit_args_carry_the_agent_service_and_egress_devices_together() -> anyhow::Result<()> {
+        let topology = parse_topology(AARCH64_FIXTURE).context("parse aarch64 fixture")?;
+        let command = ["true".to_string()];
+        let grants = grants();
+        let staged = StagedArgs {
+            agent_vsock: Some((5000, PathBuf::from("/tmp/sandy/ag.sock"))),
+            service_vsock: Some(PathBuf::from("/tmp/sandy/sv.sock")),
+            egress_socket: Some(PathBuf::from("/tmp/sandy/eg.sock")),
+            ..StagedArgs::default()
+        };
+        let args = vfkit_args(&topology, &spec_for("demo", &command, &grants), &staged)?;
+        let devices: Vec<&String> = args.iter().filter(|a| a.starts_with("virtio-vsock,port=")).collect();
+        assert_eq!(
+            devices,
+            [
+                "virtio-vsock,port=5000,socketURL=/tmp/sandy/ag.sock,connect",
+                "virtio-vsock,port=1000,socketURL=/tmp/sandy/sv.sock,connect",
+                "virtio-vsock,port=5001,socketURL=/tmp/sandy/eg.sock,listen"
+            ]
+        );
+        Ok(())
+    }
+
+    /// #590: a service socket declares the relay's vsock port for the host to connect, and no socket declares none.
+    #[test]
+    fn vfkit_args_expose_the_service_relay_port_only_when_a_socket_is_set() -> anyhow::Result<()> {
+        let topology = parse_topology(AARCH64_FIXTURE).context("parse aarch64 fixture")?;
+        let command = ["true".to_string()];
+        let grants = grants();
+        let spec = spec_for("demo", &command, &grants);
+        let with_socket = StagedArgs {
+            service_vsock: Some(PathBuf::from("/tmp/sandy/sv-0123456789ab.sock")),
+            ..StagedArgs::default()
+        };
+        let args = vfkit_args(&topology, &spec, &with_socket)?;
+        assert!(
+            has_token_run(
+                &args,
+                &[
+                    "--device",
+                    "virtio-vsock,port=1000,socketURL=/tmp/sandy/sv-0123456789ab.sock,connect"
+                ]
+            ),
+            "{}",
+            args.join(" ")
+        );
+        let without = vfkit_args(&topology, &spec, &StagedArgs::default())?;
+        assert!(
+            !without.iter().any(|a| a.starts_with("virtio-vsock,port=1000")),
+            "{}",
+            without.join(" ")
         );
         Ok(())
     }
@@ -1465,6 +1725,43 @@ mod tests {
             start.elapsed() < Duration::from_secs(60),
             "cancellation must end the run promptly, not wait near the 120s budget"
         );
+        Ok(())
+    }
+
+    /// #666: a run records its owner before staging and each process it starts as it spawns (the proxy, then vfkit), so
+    /// a restart can find them after a SIGKILL. The recording vfkit stub waits until a record under the staging base
+    /// names its own pid, keeps a copy, and the run then fails because the stub never boots; only the record matters.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_run_records_its_owner_and_every_process_it_starts() -> anyhow::Result<()> {
+        let mut stub = StubRun::new("echo READY; exec sleep 30")?;
+        let base = ensure_sandy_staging_base()?;
+        let capture = stub.path("record-seen");
+        stub.vfkit = crate::egress_proxy::tests::stub(
+            stub.dir.path(),
+            "vfkit-recording",
+            &format!(
+                "i=0; while :; do for f in {base}/inst-*/box.json; do if [ -f \"$f\" ] && grep -q \"\\\"pid\\\":$$\" \
+                 \"$f\"; then cp \"$f\" {capture}; exec sleep 30; fi; done; i=$((i+1)); [ \"$i\" -gt 100 ] && exit 9; \
+                 sleep 0.05; done",
+                base = quote(&base),
+                capture = quote(&capture),
+            ),
+        )?;
+
+        let _ = stub.run(crate::egress_proxy::tests::PROXY_STARTS);
+
+        let seen = std::fs::read(&capture).context("the stub vfkit never saw its own pid in a record")?;
+        let record: crate::orphans::BoxRecord = serde_json::from_slice(&seen).context("decode the record")?;
+        assert_eq!(
+            record.owner.pid,
+            std::process::id(),
+            "the owner is the launching process"
+        );
+        let proxy_pid: u32 = std::fs::read_to_string(stub.path("proxy-pid"))?.trim().parse()?;
+        let pids: Vec<u32> = record.procs.iter().map(|p| p.pid).collect();
+        assert_eq!(pids.len(), 2, "the proxy and vfkit: {pids:?}");
+        assert!(pids.contains(&proxy_pid), "{pids:?} lacks the proxy {proxy_pid}");
         Ok(())
     }
 }

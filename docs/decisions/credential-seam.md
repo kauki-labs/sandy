@@ -309,3 +309,26 @@ narrower; removing the first write entirely closes the window rather than
 shrinking it. This is a different flock use than the one added above: that
 earlier rejection was about _this run's own_ two writes racing each other, not
 about guarding the one remaining write against _another_ writer's result.
+
+## 8. A profile names an identity; the registry holds names only (#592)
+
+**Status:** accepted for slice 1 (the registry). Re-injection, renewal and revoke per environment are later slices.
+**Upholds:** INV-1 for the registry and the request, which hold no secret value. The values that a `service_secrets` name
+selects still reach the guest's environment, the interim exception that decision 2 states; the profile only narrows
+which names get there.
+
+An environment request names an identity profile and never carries a secret. The operator keeps a registry of
+profiles. A profile holds the name of a registered trust root, the credential `Scope` (the repository allow-list and
+the capabilities) and the secret names the service may read. It holds no value. The registry is JSON, an array of
+named entries, so a duplicate name is detectable. The parse refuses an unknown key, a name that looks like a
+credential, a repeated key and any malformed entry, and no error shows a key, a name or a value from the file or the caller.
+
+`service_secrets` defaults to none. The T3 service runs as a non-root user and inherits the secret exports of the
+root login shell (#632), so the profile says which names reach it and staging exports only those. The secret directory
+stays root-only. An allowlist in the agent was set aside: it would drop the keys the harnesses need.
+
+**Set aside:** reading the registry through `serde` derive, and a prefix list to decide which text is safe to show. A
+derive error repeats the offending value, and the text reaches logs. A prefix list knows only some secret formats, so
+no key or name is shown at all (review of #592). The same limit holds for the "looks like a credential" check on
+names: it is best-effort, and the contract is names only. **Open:** one shared name rule for this registry and sandyd's request check (they match today, but are
+two copies). Spec: `docs/design/credential-seam/identity-profiles.md`.

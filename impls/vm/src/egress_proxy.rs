@@ -113,8 +113,22 @@ impl<'a> EgressLaunch<'a> {
     ///
     /// # Errors
     /// [`BackendError::Spawn`] (band 3) when the proxy does not reach `READY`.
+    #[cfg(test)]
     pub(crate) fn start(&self) -> Result<ProxyHandle, BackendError> {
-        ProxyHandle::start(self)
+        self.start_recorded(&mut |_| Ok(()))
+    }
+
+    /// [`start`](Self::start), reporting the proxy's pid to `on_spawn` as soon as it spawns, before the wait for
+    /// `READY`. A box record that is written only after the wait would miss the proxy when the host is killed during
+    /// it (#666).
+    ///
+    /// # Errors
+    /// As [`start`](Self::start).
+    pub(crate) fn start_recorded(
+        &self,
+        on_spawn: &mut dyn FnMut(u32) -> std::io::Result<()>,
+    ) -> Result<ProxyHandle, BackendError> {
+        ProxyHandle::start(self, on_spawn)
     }
 }
 
@@ -134,6 +148,12 @@ enum StartFailure {
 }
 
 impl ProxyHandle {
+    /// The proxy's process id.
+    #[cfg(test)]
+    pub(crate) fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// The vsock port the guest relay dials: the random host port (qemu) or [`EGRESS_VSOCK_PORT`] (vfkit).
     pub(crate) fn port(&self) -> u32 {
         self.port
@@ -154,7 +174,10 @@ impl ProxyHandle {
         let _ = self.child.wait();
     }
 
-    fn start(launch: &EgressLaunch<'_>) -> Result<Self, BackendError> {
+    fn start(
+        launch: &EgressLaunch<'_>,
+        on_spawn: &mut dyn FnMut(u32) -> std::io::Result<()>,
+    ) -> Result<Self, BackendError> {
         let policy = serde_json::to_vec(launch.policy)
             .map_err(|err| BackendError::Spawn(format!("egress proxy did not start: encode policy: {err}")))?;
         let cid = match &launch.listen {
@@ -162,7 +185,7 @@ impl ProxyHandle {
             // A bind failure on the unix socket is not a port clash: no retry.
             ProxyListen::Unix { socket } => {
                 let args = ["--unix".to_owned(), socket.to_string_lossy().into_owned()];
-                return match start_once(launch, &args, EGRESS_VSOCK_PORT, &policy) {
+                return match start_once(launch, &args, EGRESS_VSOCK_PORT, &policy, on_spawn) {
                     Ok(handle) => Ok(handle),
                     Err(StartFailure::AddrInUse(why) | StartFailure::Other(why)) => {
                         Err(BackendError::Spawn(format!("egress proxy did not start: {why}")))
@@ -179,7 +202,7 @@ impl ProxyHandle {
                 "--peer-cid".to_owned(),
                 cid.to_string(),
             ];
-            match start_once(launch, &args, port, &policy) {
+            match start_once(launch, &args, port, &policy, on_spawn) {
                 Ok(handle) => return Ok(handle),
                 Err(StartFailure::AddrInUse(why)) => {
                     tracing::debug!(attempt, port, "egress proxy port in use; retrying");
@@ -248,6 +271,7 @@ fn start_once(
     args: &[String],
     port: u32,
     policy: &[u8],
+    on_spawn: &mut dyn FnMut(u32) -> std::io::Result<()>,
 ) -> Result<ProxyHandle, StartFailure> {
     let mut command = Command::new(&launch.bin);
     // Sanitized environment: PATH only, never the forge token or any other secret.
@@ -262,7 +286,12 @@ fn start_once(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|err| StartFailure::Other(format!("spawn `{}`: {err}", launch.bin.display())))?;
+    // Reported before the wait for READY below: a kill during it must still leave a record of the proxy.
     let mut handle = ProxyHandle { child, port };
+    // A record that cannot take the proxy stops it (the handle kills on drop) and fails the start (#676).
+    if let Err(err) = on_spawn(handle.child.id()) {
+        return Err(StartFailure::Other(crate::orphans::unrecorded_message(&err)));
+    }
 
     // The policy goes on stdin, then stdin closes (the thread owns it and drops it): the proxy waits
     // for EOF. The write runs on a thread so the READY deadline bounds a proxy that never reads it:
@@ -382,12 +411,91 @@ pub(crate) mod tests {
 
     use super::*;
 
+    /// How long a stub that prints READY at once may take to start (#624). Generous on purpose: the wait ends the
+    /// moment READY arrives, so it costs nothing on a quiet host and keeps a loaded one from failing the test.
+    pub(crate) const PROXY_STARTS: Duration = Duration::from_secs(30);
+
+    /// The READY deadline of a stub that never prints READY (#624). The stub writes its pid file as its first act, and
+    /// the test reads it after the start fails, so the deadline must outlast a loaded host's shell start-up: at 300 ms
+    /// the proxy was killed before the pid file existed and the read failed with ENOENT.
+    pub(crate) const NEVER_READY: Duration = Duration::from_secs(3);
+
     /// Write an executable `/bin/sh` stub into `dir`.
     pub(crate) fn stub(dir: &Path, name: &str, body: &str) -> anyhow::Result<PathBuf> {
         let path = dir.join(name);
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).context("write stub")?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).context("chmod stub")?;
         Ok(path)
+    }
+
+    /// #666: the proxy's pid is reported as soon as it spawns, before the wait for `READY`, so a kill during that wait
+    /// still leaves a record of it. The stub marks the moment it is about to print `READY`.
+    #[test]
+    fn the_proxy_is_reported_when_it_spawns_before_it_is_ready() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let about_to_be_ready = dir.path().join("about-to-be-ready");
+        let bin = stub(
+            dir.path(),
+            "proxy",
+            &format!(
+                "cat >/dev/null; sleep 0.4; : > {}; echo READY; exec sleep 30",
+                about_to_be_ready.display()
+            ),
+        )?;
+        let allow = policy();
+        let launch = launch(&allow, bin, PROXY_STARTS);
+        let mut reported = Vec::new();
+        let mut ready_was_near = true;
+
+        let handle = launch
+            .start_recorded(&mut |pid| {
+                reported.push(pid);
+                ready_was_near = about_to_be_ready.exists();
+                Ok(())
+            })
+            .context("start")?;
+
+        assert_eq!(reported, vec![handle.pid()], "one report, with the proxy's pid");
+        assert!(!ready_was_near, "the report came before the proxy was ready");
+        Ok(())
+    }
+
+    /// Whether process `pid` is gone within two seconds (it may be a moment from reaped).
+    pub(crate) fn gone_within_two_seconds(pid: u32) -> bool {
+        let Some(pid) = i32::try_from(pid).ok().and_then(rustix::process::Pid::from_raw) else {
+            return true;
+        };
+        for _ in 0..40 {
+            if rustix::process::test_kill_process(pid).is_err() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    /// #676: a proxy the box record cannot take is stopped and fails the start. Left running, it would outlive a
+    /// killed host with nothing naming it.
+    #[test]
+    fn a_proxy_that_cannot_be_recorded_is_stopped_and_fails_the_start() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let bin = stub(dir.path(), "proxy", "cat >/dev/null; echo READY; exec sleep 30")?;
+        let allow = policy();
+        let launch = launch(&allow, bin, PROXY_STARTS);
+        let mut reported = None;
+
+        let result = launch.start_recorded(&mut |pid| {
+            reported = Some(pid);
+            Err(std::io::Error::other("disk full"))
+        });
+
+        let err = result
+            .err()
+            .context("a proxy that cannot be recorded must fail the start")?;
+        assert!(err.to_string().contains("disk full"), "{err}");
+        let pid = reported.context("the proxy was reported")?;
+        assert!(gone_within_two_seconds(pid), "proxy {pid} must be stopped");
+        Ok(())
     }
 
     fn policy() -> AllowList {
@@ -458,7 +566,7 @@ pub(crate) mod tests {
             ),
         )?;
         let allow = policy();
-        let mut handle = launch(&allow, bin, Duration::from_secs(5)).start()?;
+        let mut handle = launch(&allow, bin, PROXY_STARTS).start()?;
         let port = handle.port();
         assert_eq!(handle.exited(), None, "a live proxy has not exited");
         handle.kill();
@@ -499,14 +607,14 @@ pub(crate) mod tests {
                 })
                 .collect(),
         }));
-        let launch = launch(huge, bin, Duration::from_millis(300));
+        let launch = launch(huge, bin, NEVER_READY);
         // Run the start on its own thread so a regression fails this test instead of hanging it.
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(launch.start().err());
         });
         let err = rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(20))
             .context("start() blocked past the READY deadline: the policy write is not bounded")?;
         let Some(BackendError::Spawn(message)) = err else {
             anyhow::bail!("expected Spawn, got {err:?}");
@@ -531,11 +639,11 @@ pub(crate) mod tests {
         )?;
         let allow = policy();
         let started = std::time::Instant::now();
-        let err = launch(&allow, bin, Duration::from_millis(300)).start().err();
+        let err = launch(&allow, bin, NEVER_READY).start().err();
         let Some(BackendError::Spawn(message)) = err else {
             anyhow::bail!("expected Spawn, got {err:?}");
         };
-        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(started.elapsed() < Duration::from_secs(10));
         assert!(
             message.starts_with("egress proxy did not start: no READY within"),
             "{message}"
@@ -550,7 +658,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir()?;
         let bin = stub(dir.path(), "proxy", "cat >/dev/null; echo 'bad policy' >&2; exit 2")?;
         let allow = policy();
-        let err = launch(&allow, bin, Duration::from_secs(5)).start().err();
+        let err = launch(&allow, bin, PROXY_STARTS).start().err();
         let Some(BackendError::Spawn(message)) = err else {
             anyhow::bail!("expected Spawn, got {err:?}");
         };
@@ -587,7 +695,7 @@ pub(crate) mod tests {
             ),
         )?;
         let allow = policy();
-        let mut handle = launch(&allow, bin, Duration::from_secs(5)).start()?;
+        let mut handle = launch(&allow, bin, PROXY_STARTS).start()?;
         handle.kill();
         assert_eq!(std::fs::read_to_string(&count)?.lines().count(), 3);
         Ok(())
@@ -606,7 +714,7 @@ pub(crate) mod tests {
             ),
         )?;
         let allow = policy();
-        let err = launch(&allow, bin, Duration::from_secs(5)).start().err();
+        let err = launch(&allow, bin, PROXY_STARTS).start().err();
         let Some(BackendError::Spawn(message)) = err else {
             anyhow::bail!("expected Spawn, got {err:?}");
         };
@@ -631,7 +739,7 @@ pub(crate) mod tests {
         )?;
         let allow = policy();
         let socket = dir.path().join("eg-0123456789ab.sock");
-        let mut launch = launch(&allow, bin, Duration::from_secs(5));
+        let mut launch = launch(&allow, bin, PROXY_STARTS);
         launch.listen = ProxyListen::Unix { socket: socket.clone() };
         assert_eq!(launch.unix_socket(), Some(socket.as_path()));
         let mut handle = launch.start()?;
@@ -660,7 +768,7 @@ pub(crate) mod tests {
             ),
         )?;
         let allow = policy();
-        let mut launch = launch(&allow, bin, Duration::from_secs(5));
+        let mut launch = launch(&allow, bin, PROXY_STARTS);
         launch.listen = ProxyListen::Unix {
             socket: dir.path().join("eg.sock"),
         };
@@ -738,7 +846,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir()?;
         let bin = stub(dir.path(), "proxy", "cat >/dev/null; echo READY; exit 3")?;
         let allow = policy();
-        let mut handle = launch(&allow, bin, Duration::from_secs(5)).start()?;
+        let mut handle = launch(&allow, bin, PROXY_STARTS).start()?;
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let status = loop {
             if let Some(status) = handle.exited() {

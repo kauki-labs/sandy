@@ -206,6 +206,7 @@ mod tests {
                     }),
                     task_ref: String::new(),
                 }),
+                ..Default::default()
             })),
         };
         write_frame(&mut client, &create).await?;

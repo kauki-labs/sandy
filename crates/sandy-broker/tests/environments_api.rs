@@ -455,3 +455,35 @@ async fn a_replay_that_creates_a_new_environment_after_the_lookup_is_quota_check
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_trusted_only_backend_refuses_an_untrusted_client_and_serves_a_trusted_one() -> Result<()> {
+    let f = common::fixture_with_opts(common::Opts {
+        trusted_only_backend: true,
+        ..common::Opts::default()
+    })
+    .await?;
+    let (status, body) = spawn(&f, TOKEN_B, spawn_body("u1")).await?;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "an untrusted client must not spawn: {body}"
+    );
+    assert_eq!(body["code"], "forbidden", "{body}");
+    let (_, list) = f.call("GET", "/v1/environments", Some(TOKEN_B), None).await?;
+    assert_eq!(
+        list["environments"].as_array().map(Vec::len),
+        Some(0),
+        "no row was created: {list}"
+    );
+    assert_eq!(f.environments.list()?.len(), 0, "sandyd holds no row");
+    spawn_id(&f, TOKEN_A, spawn_body("t1")).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn without_a_trusted_only_backend_an_untrusted_client_may_still_spawn() -> Result<()> {
+    let f = fixture().await?;
+    spawn_id(&f, TOKEN_B, spawn_body("u1")).await?;
+    Ok(())
+}

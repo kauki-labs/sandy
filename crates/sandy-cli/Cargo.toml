@@ -31,6 +31,13 @@ name = "acceptance-vm"
 path = "src/bin/acceptance_vm.rs"
 required-features = ["live"]
 
+# The vfkit half of the guest service bridge's live gate (#590, KSB4): boots the T3 guest with the relay exposed
+# at a host socket. Driven by scripts/dev/live-vfkit-bridge.sh.
+[[bin]]
+name = "live-vfkit-guest"
+path = "src/bin/live_vfkit_guest.rs"
+required-features = ["live"]
+
 [lints]
 workspace = true
 
@@ -96,6 +103,8 @@ tokio = { workspace = true, features = [
   "sync",
   "time",
   "signal",
+  "rt",
+  "macros",
 ] }
 tracing.workspace = true
 uuid.workspace = true

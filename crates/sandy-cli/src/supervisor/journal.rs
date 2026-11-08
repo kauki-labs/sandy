@@ -4,7 +4,7 @@
 
 use std::time::SystemTime;
 
-use sandy::{CoreError, JOURNAL_SCHEMA_VERSION, JobRecord, JobState, Journal, Status};
+use sandy::{CoreError, JOURNAL_SCHEMA_VERSION, JobLock, JobRecord, JobState, Journal, Status};
 
 use super::RunReport;
 
@@ -48,11 +48,32 @@ pub trait JournalWriter {
     ///
     /// Returns [`CoreError`] on journal I/O failure.
     fn persist_if_still_running(&self, record: &JobRecord) -> Result<bool, CoreError>;
+
+    /// Mark this process the live owner of `job_id` until the returned guard drops (INV-3, #699): taken before the
+    /// `Running` record is written and kept past the terminal write. `cancels_on_sigterm` is what the owner tells
+    /// `sandy kill`: a SIGTERM to this process cancels this run. The default holds nothing, for a writer with no
+    /// second process to be seen by.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError`] if the liveness lock cannot be taken.
+    fn hold_liveness(&self, _job_id: &str, _cancels_on_sigterm: bool) -> Result<Option<JobLock>, CoreError> {
+        Ok(None)
+    }
 }
 
 impl JournalWriter for Journal {
     fn persist(&self, record: &JobRecord) -> Result<(), CoreError> {
         self.write_record(record)
+    }
+
+    fn hold_liveness(&self, job_id: &str, cancels_on_sigterm: bool) -> Result<Option<JobLock>, CoreError> {
+        let lock = self.hold_live(job_id)?;
+        // Tell `sandy kill` whether a SIGTERM to this process cancels this run: only then may it be signalled (#695).
+        if cancels_on_sigterm {
+            lock.note(crate::signals::CANCELS_ON_SIGTERM)?;
+        }
+        Ok(Some(lock))
     }
 
     fn persist_if_still_running(&self, record: &JobRecord) -> Result<bool, CoreError> {

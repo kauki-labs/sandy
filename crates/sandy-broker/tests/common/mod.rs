@@ -18,6 +18,7 @@ use tokio::net::{UnixListener, UnixStream};
 
 pub const TOKEN_A: &str = "token-of-client-a";
 pub const TOKEN_B: &str = "token-of-client-b";
+pub const TOKEN_C: &str = "token-of-client-c";
 
 pub struct Fixture {
     pub base: String,
@@ -41,6 +42,20 @@ pub struct Opts {
     pub ticket_ttl: Duration,
     /// How long a write to a client that stopped reading may block.
     pub send_timeout: Duration,
+    /// Bytes of one job's output the broker keeps.
+    pub output_job_cap: usize,
+    /// Bytes of output the broker keeps across all clients.
+    pub output_total_cap: usize,
+    /// How long a finished job's output stays readable.
+    pub output_retention: Duration,
+    /// Most collectors one client may run at once.
+    pub output_collectors_per_client: usize,
+    /// Most collectors the broker may run at once.
+    pub output_collectors_total: usize,
+    /// Wait between a collector's attach tries.
+    pub output_join_backoff: Duration,
+    /// Run sandyd as if a trusted-only environment backend were active.
+    pub trusted_only_backend: bool,
 }
 
 impl Default for Opts {
@@ -49,6 +64,13 @@ impl Default for Opts {
             attach_socket: true,
             ticket_ttl: Duration::from_secs(30),
             send_timeout: Duration::from_secs(30),
+            output_job_cap: Tuning::default().output_job_cap,
+            output_total_cap: Tuning::default().output_total_cap,
+            output_retention: Tuning::default().output_retention,
+            output_collectors_per_client: Tuning::default().output_collectors_per_client,
+            output_collectors_total: Tuning::default().output_collectors_total,
+            output_join_backoff: Tuning::default().output_join_backoff,
+            trusted_only_backend: false,
         }
     }
 }
@@ -130,6 +152,9 @@ async fn build(
     let socket = dir.path().join("sandyd.sock");
     let store = Arc::new(JobStore::open_in_memory()?);
     let environments = Arc::new(EnvironmentStore::open_in_memory()?.with_max_rows(row_cap));
+    if opts.trusted_only_backend {
+        environments.require_trusted_submitter();
+    }
     if let Some(seed) = owner_seed {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let json = seed(&environments)?;
@@ -195,11 +220,18 @@ async fn build(
                     ..client("a", TOKEN_A, IsolationClass::Trusted, vec![root_a.clone()])
                 },
                 client("b", TOKEN_B, IsolationClass::Untrusted, vec![]),
+                client("c", TOKEN_C, IsolationClass::Trusted, vec![]),
             ],
         },
         Tuning {
             ticket_ttl: opts.ticket_ttl,
             send_timeout: opts.send_timeout,
+            output_job_cap: opts.output_job_cap,
+            output_total_cap: opts.output_total_cap,
+            output_retention: opts.output_retention,
+            output_collectors_per_client: opts.output_collectors_per_client,
+            output_collectors_total: opts.output_collectors_total,
+            output_join_backoff: opts.output_join_backoff,
         },
     )
     .await?;

@@ -198,6 +198,15 @@ impl EnvironmentDriver {
     ) -> Result<(), EnvironmentStoreError> {
         let id = row.environment_id.as_str();
         if !running.contains(id) {
+            // Covers a row made while the gate was off, and a resume: the create gate alone does not.
+            if self.store.trusted_submitter_required() && !row.submitter_trusted {
+                return self.fail(
+                    id,
+                    "admission",
+                    "the backend serves trusted submitters only and this environment was not created by one",
+                    report,
+                );
+            }
             let Some(spec) = self.to_spec(row) else {
                 return self.fail(id, "spec", "the stored spec does not decode", report);
             };
@@ -306,6 +315,17 @@ impl EnvironmentDriver {
         let Some(limit) = self.config.idle_timeout else {
             return Ok(());
         };
+        // A client connected straight to the service is invisible to the RPC surface.
+        match self.backend.active(&row.environment_id) {
+            Ok(true) => {
+                if let Err(e) = self.store.touch(&row.environment_id, now) {
+                    tracing::warn!(environment = %row.environment_id, error = %e, "could not renew an idle-stop lease");
+                }
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(e) => tracing::warn!(environment = %row.environment_id, error = %e, "activity check could not run"),
+        }
         // Conditional in the store: `row` is a snapshot, and a renewal that landed after
         // it (the probe can be slow) must win.
         if self.store.stop_if_idle(
@@ -439,6 +459,31 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0)
+    }
+
+    #[test]
+    fn a_trusted_only_driver_fails_a_row_that_was_not_created_by_a_trusted_submitter() -> Result<()> {
+        let r = rig(FakeEnvironmentBackend::new())?;
+        // The untrusted row predates the trusted-only backend, so the store accepts it.
+        let untrusted = add(&r.store, 1)?;
+        r.store.require_trusted_submitter();
+        let trusted = "env-2";
+        r.store.create_for(
+            "r2",
+            trusted,
+            &spec_bytes("small"),
+            "sandy.control.v1.EnvironmentSpec",
+            true,
+        )?;
+
+        let report = r.driver.reconcile_once(now())?;
+        assert_eq!(report.failed, std::slice::from_ref(&untrusted));
+        assert_eq!(report.launched, [trusted.to_owned()], "only the trusted row launches");
+        let rec = state(&r.store, &untrusted)?;
+        assert_eq!(rec.state, EnvironmentState::Failed);
+        assert_eq!(rec.failure.map(|f| f.step).as_deref(), Some("admission"));
+        assert_eq!(r.backend.launched().len(), 1, "the backend never saw the untrusted row");
+        Ok(())
     }
 
     #[test]
@@ -618,6 +663,28 @@ mod tests {
         assert!(report.idle_stopped.is_empty(), "a renewed lease must hold");
         assert_eq!(state(&store, &id)?.state, EnvironmentState::Ready);
         let report = driver.reconcile_once(now() + 560)?; // 310 s after the touch
+        assert_eq!(report.idle_stopped, std::slice::from_ref(&id));
+        Ok(())
+    }
+
+    #[test]
+    fn a_backend_reported_connection_renews_the_lease_and_its_absence_does_not() -> Result<()> {
+        let store = Arc::new(EnvironmentStore::open_in_memory()?);
+        let backend = Arc::new(FakeEnvironmentBackend::new());
+        let driver = EnvironmentDriver::new(Arc::clone(&store), Arc::clone(&backend) as _, idle_config(300));
+        let id = add(&store, 1)?;
+        driver.reconcile_once(now())?;
+        // A client connected straight to the service the whole time: no GetEnvironment, no touch.
+        backend.set_active(&id, true);
+        let report = driver.reconcile_once(now() + 250)?;
+        assert!(report.idle_stopped.is_empty());
+        let report = driver.reconcile_once(now() + 400)?; // 400 s after Ready, 150 s after the last use
+        assert!(report.idle_stopped.is_empty(), "a connected client must hold the lease");
+        // The client disconnects; the lease runs from the last observed use.
+        backend.set_active(&id, false);
+        let report = driver.reconcile_once(now() + 650)?; // 250 s after the last use
+        assert!(report.idle_stopped.is_empty(), "inside the lease after disconnect");
+        let report = driver.reconcile_once(now() + 710)?; // 310 s after the last use
         assert_eq!(report.idle_stopped, std::slice::from_ref(&id));
         Ok(())
     }

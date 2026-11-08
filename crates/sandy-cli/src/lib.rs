@@ -25,4 +25,5 @@ pub mod live_target;
 pub mod output;
 pub mod plan;
 pub mod profiles;
+pub mod signals;
 pub mod supervisor;
