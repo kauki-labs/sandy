@@ -4,7 +4,6 @@
 
 use std::{
     fs::File,
-    io::Read as _,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
