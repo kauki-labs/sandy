@@ -424,6 +424,16 @@ demonstrated for the process backend; it is deferred to the VM-backed
 - Wiring `sandy_api::console::Transport` into `RawConsole` now: no VM-backed agent
   exists yet to wire it to.
 
+**Graceful stop (#670).** A stop is a Control envelope with `STOP_CONTROL` (4 bytes, the grace in seconds) on the
+orchestrator channel. The relay turns it into `LinkFrame::Stop`, as it does a resize. The agent interrupts the job
+(Ctrl-C on its PTY; the tmux wrapper traps SIGINT so it still prints the exit marker), waits the grace, then ends the
+job's tmux server. A job that exits inside the grace reports its own exit code. A job that is forced has no marker,
+so the agent reports no `Exit` frame (INV-11) and, as for any pane that dies unreported, no archive. Who may post it:
+the cap layer does not scope a post by content type, so the guard is the relay allowlist. `attach_relay` forwards
+only `TTY_STDIN` and `RESIZE_CONTROL`, and rejects any other frame, including a stop. Any future surface that lets a
+cap holder post arbitrary Control also lets it stop jobs. An agent older than this frame treats it as a protocol
+fault and stops routing input, so send a stop only to a guest image that carries it.
+
 ### 10a. The guest port relay (#590)
 
 `sandy-agent port-relay --vsock-port P --to 127.0.0.1:T` is the guest half of the host-side bridge to a guest
@@ -458,9 +468,12 @@ connection (a websocket) works.
   data moves (the agent link's `AGENT_LINK_READY` works the same way). The host bridge counts a dial as successful
   only when it has read that byte, and retries inside its window otherwise. A relay that is not bound yet, or a
   service that is not up, therefore looks like a failed dial, never like a tunnel that opened and reset.
-- **Not yet wired.** The service kind (#589) is expected to start the relay, and nothing does yet (the agent's service
-  supervisor should spawn it as a sibling before any untrusted process, and keep the service from killing or replacing
-  it). The host half is 10b.
+- **Started by the agent.** The agent spawns the relay as a child for a service that declares a `port` (#589), and a
+  service cannot report Ready before the relay is up: the relay writes one byte, `RELAY_BOUND`, to its stdout after the
+  vsock bind succeeds (a different channel from the vsock ready byte above), and the agent waits for it, up to 10
+  seconds. A relay that exits first, writes another byte, or does not bind in time fails the run (#657). Open: a relay
+  that dies after it bound is not noticed, and two services on one host would both want port 1000. The host half is
+  10b.
 
 ### 10b. The host service bridge (#590)
 
@@ -501,7 +514,9 @@ environment refuses connections.
   never reaches a foreign VM. Residual: `on_link` can still take a foreign agent's link in that collision window (#238,
   not changed here).
 - **Not covered here.** The `EnvironmentBackend` that starts and stops a bridge per environment (#587 slice C), the
-  vfkit `connect` device in `vfkit_args`, and the live round trip through a real guest.
+  live round trip through a real guest. The vfkit `connect` device is `VfkitBackend::with_service_socket`: the caller
+  picks the socket path, and the backend checks its length and clears a stale file (vfkit is killed at teardown and
+  cannot unlink it).
 
 ## 11. Channel roles are thin wrappers; `EscalationSink` is a new seam
 

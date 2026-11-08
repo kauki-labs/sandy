@@ -14,7 +14,7 @@
 //! | `SANDY_ENV_STATE_DIR` | where environment directories live; default `<runtime dir>/environments` |
 //! | `SANDY_ENV_PASS_ENV` | comma-separated names of daemon variables passed to the service |
 //! | `SANDY_ENV_PATH` | the service's `PATH`; default the daemon's |
-//! | `SANDY_ENV_IDLE_TIMEOUT_SECS` | stop a Ready environment with no owner-visible use for this long; default off |
+//! | `SANDY_ENV_IDLE_TIMEOUT_SECS` | stop a Ready environment with no owner-visible use or service connection for this long; default off |
 //! | `SANDY_ENV_PROVISION_TIMEOUT_SECS` | seconds before a probe that is not Ready fails the environment; default 120 |
 
 use std::{path::PathBuf, time::Duration};

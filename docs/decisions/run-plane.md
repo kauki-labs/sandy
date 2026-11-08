@@ -59,6 +59,15 @@ sentinels, captures the region between them, and parses a trailing `exit=<n>`.
 defaulted `0`, so a transport fault can never masquerade as a clean run (feeds
 the band-3 classification).
 
+**Guest setup (#670).** A guest module declares `sandy.setup.<name>` steps
+(`nix/lib/guest-setup.nix`). Each is a systemd oneshot ordered before
+`sandy-ready.target`; `serial-getty@` requires that target, so a failed step
+means no getty and no `SANDY-READY`. The marker is printed by the login shell,
+so the gate is the getty, not a unit. Steps run in the guest only, before the
+secrets are exported and the input links made, and count against the host's
+boot timeout; a failure shows as a boot timeout. Eval-checked only; not yet
+live-verified (kpi KSU1).
+
 ## 4. macOS needs a linux-builder
 
 **Status:** accepted.
@@ -198,3 +207,92 @@ to 4096 bytes in the agent and again in the relay.
 - Not yet done: the restart policy. The agent reports the first exit; a crashed service is not restarted.
 
 **Set aside.** Scraping the console for a ready line: it is not a contract.
+
+## 6. A killed host process leaves a record, and the next start sweeps it (#666)
+
+**Status:** accepted for qemu on Linux and vfkit on macOS (epic #597). `sandy run` calls the sweep before it
+launches, in the `run` command only: `ls`, `status`, `wait` and `kill` share `host_backend()` and must never sweep.
+`sandyd` is to call it once at backend construction (separate work on the environment backend); until it does, a
+killed daemon's VMs are swept by the next `sandy run`.
+
+**Context.** A VM backend keeps its running boxes in memory. A `SIGKILL` of the host process (the `sandyd` daemon or
+a `sandy run`) leaves qemu, its virtiofsd daemons and its egress proxy running with ppid 1, still holding the guest
+CID and a staging directory that contains a secret share. A restart starts with an empty registry, so `boxes()` and
+the driver's orphan check cannot see them.
+
+**Decision.** `run` writes `<run dir>/box.json` with the launching process (the owner) before any secret is staged.
+Each process the box starts is added to it, with its pid, start time and executable, in an atomic rewrite, as soon as it
+spawns: the share transport reports each virtiofsd and the proxy start reports the proxy before their waits (a
+virtiofsd socket wait lasts up to 5 s), and `launch` adds qemu. The record also holds the boot id and pid namespace.
+`QemuBackend::sweep_orphans()` reads the records under the staging base at start-up. For each box whose owner is
+gone, it kills every recorded process that is still alive, waits for each to exit, then removes the `-inputs` and
+`-outputs` directories and, last, the run directory with the record.
+
+**Consequences.**
+
+- A process is identified by its pid and its start time. The start time survives an `exec`, and a later process that
+  reuses the pid always started later, so it never matches. The executable is recorded for a human reader and never
+  compared: the live gate showed that nix's qemu execs the real binary after `spawn` returns, so a rule that
+  required the recorded executable to match left qemu running.
+- On Linux the start-time check and the kill go through one pidfd: it is opened first, the start time is read after,
+  and the signal is sent through it. A process that takes the pid after the check cannot receive the kill, and the
+  kill never falls back to the bare pid. A pid that cannot be signalled (0, or above `i32::MAX`, which would wrap to a
+  process group or every process) is refused.
+- A box is swept only when its owner is gone (no such pid, or a different start time). The staging base is shared
+  by the daemon and by `sandy run`, so a daemon-lifetime lock was set aside: a live owner protects its box, and
+  a second daemon or a running CLI is never touched. Two sweeps that race are harmless: each kill is bound to the
+  recorded start time and the wipe ignores a missing directory.
+- The processes are plain children of the host, in the host's process group, so the sweep kills each pid and never a
+  group. A group kill would hit the host or an unrelated group.
+- Nothing without a record is touched. Only a directory a run creates (a UUID, or `inst-` and a UUID) is read for a
+  record. `<run>-outputs` is writable by the guest, and a record found elsewhere could name a host process to kill, so
+  a forged record there is never read. Pid 0 and 1 are never killed, a record that is not a plain file, is over
+  64 KiB or has an unknown field leaves its directory alone, and a symlink is never followed.
+- When the table cannot tell whether a process exists (a `/proc` read failed for a reason other than "no such process"),
+  the box is left for the next sweep. An unreadable owner never reads as a dead one: that would delete a running VM's
+  secret share. ENOENT counts as "no such process" only while `/proc` is mounted; a zombie (state `Z` or `X`) has
+  exited and reads as gone. A kill that cannot be sent (no permission) leaves the box too, and is not counted as
+  killed. A signal is not an exit: a process stuck in uninterruptible I/O survives it, so the box and its secret share
+  stay until every signalled process is seen gone, for up to 3 s, else for the next sweep. A directory that cannot be
+  removed keeps the record, which is removed last, so the next sweep finishes the job.
+- A record from an earlier boot names no running process (a reboot ends them all), so its directories are removed and
+  nothing is killed: a pid and start time from that boot could match an unrelated process of this one. A record from
+  another pid namespace is left alone, since its pids mean nothing here, and so is a record when the sweep cannot read
+  its own namespace to compare.
+- The owner is recorded before staging, so a kill at any point after the secret share exists leaves a record, and each
+  helper process is recorded when it spawns, before its wait. What remains is the instant between a process's spawn
+  and its report, in which a kill leaves that one process unrecorded.
+- `sandy run` sweeps inline, before its job starts, and `--timeout` does not cover it. A box with a stubborn process
+  costs up to 3 s per run until the process is gone, and a box left undecided is tried again on every run. A run
+  that stopped or removed anything, or left a box for the next run, prints one line on stderr; a box left alone because
+  its owner is alive is not reported. The sweep cannot fail the run: it returns a report, never an error.
+- The sweep reads `/proc` on Linux and `ps` on macOS (the crate forbids `unsafe`, so there is no `proc_pidinfo`). On
+  macOS the start time is the five `lstart` fields of `ps`, hashed, and a zombie is the state `Z`. An empty answer
+  from `ps` means "no such process" only when it exited 1 with nothing on stderr; any other failure is unknown, so a
+  broken `ps` never reads as an owner that is gone. `ps` runs with `LC_ALL=C` and `TZ=UTC`, because `lstart` prints
+  local time and a zone or DST change between recording and sweeping would change the identity. A "gone" is believed
+  only if the same `ps` can see the sweeping process itself; a `ps` denied process information prints nothing for every
+  pid and would otherwise read every owner as dead. The boot id is `kern.bootsessionuuid`, and macOS has no pid
+  namespaces. There is no pidfd on macOS, so the kill is check then kill, with a window of one `ps` call. A process that took the pid in it
+  would also have to have started in the recorded second (the identity has one-second resolution), which needs the
+  pid counter to wrap within a second: unlikely, not impossible. vfkit runs on a PTY slave whose master the owner holds, so it exits when the owner is killed (live-verified,
+  KOS9): the orphans of a killed macOS run are the egress proxy and the run directory. The agent, egress and service sockets of a killed vfkit run are not
+  removed by the sweep; they hold no data.
+
+- A process the box record cannot take is not left running unrecorded (#676). When the record cannot be written, the
+  launch stops the process it just started (virtiofsd, the egress proxy, qemu, vfkit) and fails the run, and a
+  record that cannot be opened fails the run before anything is staged. Two cases are not failures: a process that
+  is already gone (it can outlive nothing, and the launch reports why it died, so the qemu CID retry still sees a
+  qemu that exits at once), and a host whose process table cannot be read at all (the sweep is blind there too, so
+  the run goes on unrecorded with a warning). A live process the table cannot name is the same case: it runs
+  unrecorded, and a later sweep cannot find it from `box.json`.
+- Teardown removes `-inputs` and `-outputs` first. In the run directory it removes everything but `box.json`, then
+  `box.json` last, and only when nothing else is left. A sibling or entry that cannot be removed keeps the record, so
+  the next sweep finds the box. A directory the guest made read-only is made writable first (sandy owns these
+  directories, symlinks are never followed), so a read-only module cache does not keep a box for good. A retained
+  record is swept only after its owner has exited. Under `sandyd` the owner is `sandyd`, so nothing removes the
+  leftovers until `sandyd` has exited and a sweep runs: `sandy run` sweeps before it launches, and `sandyd` does not
+  call the sweep at start-up yet (separate work).
+
+**Set aside.** Scanning command lines for qemu: it can hit a process we did not start. A process group kill (above).
+A daemon-lifetime lock on the staging base (above). Comparing the executable (above).

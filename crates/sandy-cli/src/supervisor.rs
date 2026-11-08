@@ -20,12 +20,12 @@
 use std::{
     path::Path,
     sync::{Mutex, PoisonError, mpsc},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use sandy::{
     AuditReceipt, BackendError, CALL_DEADLINE, Classification, CoreError, CredentialProvider, CredentialReceipt,
-    DirFingerprint, EgressApplier, EgressOs, EgressOutcome, EgressPlan, GuestReported, JOURNAL_SCHEMA_VERSION,
+    DirFingerprint, EgressApplier, EgressOs, EgressOutcome, EgressPlan, GuestReported, JOURNAL_SCHEMA_VERSION, JobLock,
     JobRecord, JobState, Journal, Lease, MAX_TTL_SECS, Outcome, OutputStatus, PlanError, ProcessExit, Profile,
     ResultEnvelope, Scope, SecretSource, Status, VmBackend, classify_backend_error, classify_invalid_plan,
     classify_outcome, enforce, mint_lease, mint_lease_checked, new_job_id, plan_egress_scoped, reconcile_job,
@@ -95,7 +95,9 @@ pub fn run_job<B: VmBackend + ?Sized, E: EgressApplier + ?Sized>(
     tap: Option<&str>,
     redact: &[String],
 ) -> Result<RunReport, CoreError> {
-    let mut outcome = run_job_core(backend, journal, plan, egress, egress_os, tap, redact)?;
+    // Declared before the outcome so the liveness lock outlives everything that follows (#699).
+    let mut live = None;
+    let mut outcome = run_job_core(backend, journal, plan, egress, egress_os, tap, redact, &mut live)?;
     if let Some(started) = outcome.started {
         match write_terminal_record(journal, started, &outcome.report) {
             Ok(true) => {}
@@ -164,6 +166,10 @@ fn proxy_receipt_result(run: &Result<Outcome, BackendError>) -> Result<EgressOut
 /// it until the refresh thread has joined and `redact_with_refreshes` is final, so
 /// the credentialed path's terminal write and its token redaction are one atomic
 /// write, not a write followed by an amend (#322).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the run's seams and inputs, plus the slot the caller keeps the liveness lock in"
+)]
 fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWriter + ?Sized>(
     backend: &B,
     journal: &J,
@@ -172,6 +178,7 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
     egress_os: EgressOs,
     tap: Option<&str>,
     redact: &[String],
+    live: &mut Option<JobLock>,
 ) -> Result<JobOutcome, CoreError> {
     let spec = plan.as_run_spec();
 
@@ -216,6 +223,8 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
         started,
         result: None,
     };
+    // Before the `Running` record exists, so no reader can see the job running without seeing its owner live (#699).
+    *live = journal.hold_liveness(&job_id, crate::signals::cancels_on_sigterm(&plan.control))?;
     journal.persist(&running)?;
 
     // 3. Apply the egress boundary around the boot. On Linux with a tap this loads the guest-scoped forward ruleset
@@ -233,8 +242,19 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
     // the SAME platform-keyed outcome that drove the enforce/revert bracket below,
     // never a second, independently derived copy.
     let egress_receipt_result: Result<EgressOutcome, String>;
-    let (run_result, egress_warning): (Result<Outcome, BackendError>, Option<String>) = match enforce(&eplan, egress) {
-        Ok(eoutcome) => {
+    // A cancel that landed before the boot (a signal during mint or setup, #687) starts no guest and loads no egress
+    // rules: the run is cancelled and the caller's teardown still runs.
+    let enforced = if plan.control.is_cancelled() {
+        None
+    } else {
+        Some(enforce(&eplan, egress))
+    };
+    let (run_result, egress_warning): (Result<Outcome, BackendError>, Option<String>) = match enforced {
+        None => {
+            egress_receipt_result = Err("run cancelled before boot".to_owned());
+            (Err(BackendError::Spawn("run cancelled before boot".to_owned())), None)
+        }
+        Some(Ok(eoutcome)) => {
             let outcome = backend.run(&spec);
             // The proxy is the boundary, and the backend establishes it, so the receipt reads the run's result
             // rather than the plan's intent: a refusal before boot must not be recorded as enforced.
@@ -257,7 +277,7 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
             };
             (outcome, warning)
         }
-        Err(egress_error) => {
+        Some(Err(egress_error)) => {
             egress_receipt_result = Err(egress_error.to_string());
             tracing::warn!(%job_id, %egress_error, "egress apply failed; refusing to boot (fail-closed)");
             (
@@ -301,6 +321,22 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
             )
         }
     };
+    // A cancel (SIGTERM, SIGHUP or SIGINT to `sandy run`, #687) ends the run `cancelled`, band 1, whatever the
+    // backend made of it: the real backends treat it like a timeout or a refusal. A guest that already exited
+    // (clean or not) keeps its result: the signal only found the teardown.
+    let (classification, message) =
+        if plan.control.is_cancelled() && classification.status != Status::Succeeded && guest_exit.is_none() {
+            (
+                Classification {
+                    status: Status::Cancelled,
+                    retryable: false,
+                    process_exit: ProcessExit::TaskFailure,
+                },
+                format!("run cancelled ({message})"),
+            )
+        } else {
+            (classification, message)
+        };
     // Teardown completed the moment the backend returned and the egress boundary
     // (if enforced) was reverted, just above — captured here, before the console
     // redaction pass or the journal write, neither of which are part of the run
@@ -612,6 +648,9 @@ fn run_job_with_credential_timed<
     // including a panic unwinding out of `run_job` through `thread::scope`, where
     // the explicit call below is never reached. Skipping it on a panic would leave
     // a valid forge token and the 0600 secret on disk past the run (INV-1).
+    // Declared before `teardown`, so it drops after it: on a panic the credential is revoked while the job still reads
+    // as live (#699).
+    let mut live_guard: Option<JobLock> = None;
     let mut teardown = CredTeardown {
         provider,
         lease: Mutex::new(lease),
@@ -653,7 +692,7 @@ fn run_job_with_credential_timed<
                 cred_dir_fingerprint,
             )
         });
-        let outcome = run_job_core(backend, journal, &plan, egress, egress_os, tap, redact);
+        let outcome = run_job_core(backend, journal, &plan, egress, egress_os, tap, redact, &mut live_guard);
         drop(stop_tx);
         outcome
     });
@@ -778,17 +817,103 @@ pub fn wait<B: VmBackend>(journal: &Journal, backend: &B, job_id: &str) -> Resul
     reconcile_job(journal, backend, job_id)
 }
 
-/// Cancel a running job: tear its box down and flip the record to `Cancelled`.
+/// How long [`kill`] waits for the owner of a live run to finish its own teardown after a `SIGTERM`.
+pub const KILL_BUDGET: Duration = Duration::from_secs(60);
+
+/// What [`kill`] sends the owner of a live run. A trait only so a test can observe the signal without sending one to a
+/// real process.
+pub trait OwnerSignal {
+    /// Ask process `pid` to stop (`SIGTERM`). `still_owner` says whether `pid` still belongs to the live owner: an
+    /// implementation that can pin the process (a Linux pidfd) opens it first, asks, and only then signals, so the
+    /// signal cannot reach a process that reused the pid. The error is the kernel's:
+    /// [`std::io::ErrorKind::PermissionDenied`] when the process belongs to another user, and
+    /// [`std::io::ErrorKind::NotFound`] when it is gone.
+    ///
+    /// # Errors
+    ///
+    /// The `kill(2)` failure.
+    fn terminate(&self, pid: u32, still_owner: &dyn Fn() -> std::io::Result<bool>) -> std::io::Result<()>;
+}
+
+/// The real `SIGTERM`, which `sandy run` answers by cancelling the run (#687).
+#[derive(Debug, Clone, Copy)]
+pub struct SigTerm;
+
+impl OwnerSignal for SigTerm {
+    fn terminate(&self, pid: u32, still_owner: &dyn Fn() -> std::io::Result<bool>) -> std::io::Result<()> {
+        let pid = i32::try_from(pid)
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        // Linux: pin the process first, then ask whether it is still the owner, then signal the pinned process. If the
+        // owner died and the pid was reused before the pin, the owner is no longer live and the check says so; if it
+        // died after, the pinned process is the dead owner and the signal finds nothing. Elsewhere the check-to-signal
+        // gap stays (microseconds, and a pid wrap).
+        #[cfg(target_os = "linux")]
+        match rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()) {
+            Ok(pidfd) => {
+                if !still_owner()? {
+                    return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+                }
+                return rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::TERM).map_err(errno_to_io);
+            }
+            Err(errno) if errno == rustix::io::Errno::SRCH => {
+                return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+            }
+            // A kernel without pidfd: fall back to the pid.
+            Err(_) => {}
+        }
+        if !still_owner()? {
+            return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        }
+        rustix::process::kill_process(pid, rustix::process::Signal::TERM).map_err(errno_to_io)
+    }
+}
+
+/// `kill(2)`'s errno as the error [`stop_live_owner`] matches on. `std` has no [`std::io::ErrorKind`] for `ESRCH` (it
+/// reads as `Uncategorized`), so a process that exited since the lock was checked is named `NotFound` here.
+fn errno_to_io(errno: rustix::io::Errno) -> std::io::Error {
+    if errno == rustix::io::Errno::SRCH {
+        std::io::Error::from(std::io::ErrorKind::NotFound)
+    } else {
+        std::io::Error::from(errno)
+    }
+}
+
+/// Cancel a running job.
+///
+/// A live owner (its liveness lock is held, INV-3) is sent `SIGTERM` and given [`KILL_BUDGET`] to tear the guest down,
+/// revoke the credential and write its own terminal record; that record is returned. Nothing is written here for a
+/// live job, so the owner's receipt stands. A dead owner's record is flipped to `Cancelled` after its box is torn down.
 /// Idempotent on an already-terminal record.
 ///
 /// # Errors
 ///
-/// Returns [`CoreError`] on journal I/O failure.
+/// Returns [`CoreError`] on journal I/O failure, when the owner cannot be signalled (another user's process), or when
+/// it does not finish within the budget. The record stays `running` in both of the last two cases.
 pub fn kill<B: VmBackend>(journal: &Journal, backend: &B, job_id: &str) -> Result<JobRecord, CoreError> {
+    kill_with(journal, backend, &SigTerm, job_id, KILL_BUDGET)
+}
+
+/// [`kill`] with the signal and the budget supplied.
+///
+/// # Errors
+///
+/// As [`kill`].
+pub fn kill_with<B: VmBackend, S: OwnerSignal + ?Sized>(
+    journal: &Journal,
+    backend: &B,
+    signal: &S,
+    job_id: &str,
+    budget: Duration,
+) -> Result<JobRecord, CoreError> {
     // Idempotent on an already-terminal record: nothing to tear down.
     let record = journal.read_record(job_id)?;
     if record.state != JobState::Running {
         return Ok(record);
+    }
+    if journal.owner_live(job_id)? {
+        return stop_live_owner(journal, backend, signal, &record, budget);
     }
 
     // Flip under the job flock so a concurrent reconcile/writer can't race us.
@@ -832,6 +957,66 @@ pub fn kill<B: VmBackend>(journal: &Journal, backend: &B, job_id: &str) -> Resul
     Ok(cancelled)
 }
 
+/// Signal the live owner of `record` and wait for it to finish (#695). The liveness lock is held, so `writer_pid` is
+/// that owner and cannot have been reused. No job lock is held while waiting: the owner's terminal write takes it.
+fn stop_live_owner<B: VmBackend, S: OwnerSignal + ?Sized>(
+    journal: &Journal,
+    backend: &B,
+    signal: &S,
+    record: &JobRecord,
+    budget: Duration,
+) -> Result<JobRecord, CoreError> {
+    let job_id = &record.job_id;
+    let pid = record.writer_pid;
+    // `kill(0)` is the caller's whole process group and pid 1 is init: never what a record should name.
+    if pid <= 1 {
+        return Err(CoreError::State(format!(
+            "job {job_id} names pid {pid} as its owner; refusing to signal it"
+        )));
+    }
+    // Only an owner that said a SIGTERM cancels its run is signalled: a process without the handler would die at once,
+    // skipping the guest teardown and the credential revoke (#687).
+    if journal.owner_note(job_id)?.as_deref() != Some(crate::signals::CANCELS_ON_SIGTERM) {
+        return Err(CoreError::State(format!(
+            "job {job_id} (pid {pid}) is live but did not say that a SIGTERM cancels its run, so it is not signalled; \
+             stop it by its own means"
+        )));
+    }
+    let still_owner = || journal.owner_live(job_id).map_err(std::io::Error::other);
+    match signal.terminate(pid, &still_owner) {
+        Ok(()) => {}
+        // The owner exited since the lock was checked: the wait below sees it go.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Err(CoreError::State(format!(
+                "job {job_id} is run by pid {pid}, which this user may not signal ({e}); run `sandy kill {job_id}` as \
+                 that user or as root"
+            )));
+        }
+        Err(e) => {
+            return Err(CoreError::State(format!(
+                "could not signal pid {pid}, the owner of job {job_id}: {e}"
+            )));
+        }
+    }
+    let deadline = Instant::now() + budget;
+    while journal.owner_live(job_id)? {
+        if Instant::now() >= deadline {
+            return Err(CoreError::State(format!(
+                "job {job_id} (pid {pid}) did not finish within {budget:?} of SIGTERM; not escalating to SIGKILL, \
+                 which would skip the credential revoke"
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let finished = journal.read_record(job_id)?;
+    if finished.state != JobState::Running {
+        return Ok(finished);
+    }
+    // The owner went without writing its result: the reconcile path settles it (`crashed`).
+    reconcile_job(journal, backend, job_id)
+}
+
 /// [`gc`]'s result: evicted job ids and swept staging-dir names, kept apart
 /// (#195). `evicted` holds job ids only, so a consumer passing its entries to
 /// `status`/`wait` never receives a staging-dir name, and the plain-text
@@ -873,6 +1058,20 @@ pub fn gc(journal: &Journal, keep_last_n: usize) -> Result<GcReport, CoreError> 
 
 #[cfg(test)]
 mod tests {
+    /// `kill(2)` on an exited process fails with `ESRCH`, which `std` does not categorise: `kill` must see `NotFound`
+    /// to tell "the owner just finished" from a real failure (#695).
+    #[test]
+    fn a_missing_process_is_not_found_and_a_refusal_stays_permission_denied() {
+        assert_eq!(
+            super::errno_to_io(rustix::io::Errno::SRCH).kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            super::errno_to_io(rustix::io::Errno::PERM).kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
     use std::{
         sync::{
             Arc,
@@ -1266,6 +1465,42 @@ mod tests {
         }
     }
 
+    /// A backend that fails the test if it is asked to run.
+    struct NeverRuns;
+
+    impl sandy::VmBackend for NeverRuns {
+        fn run(&self, _spec: &sandy::RunSpec) -> Result<Outcome, BackendError> {
+            panic!("the backend must not run when the job cannot be marked live")
+        }
+
+        fn kill(&self, _box_id: &str) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn boxes(&self) -> Result<Vec<sandy::BoxState>, BackendError> {
+            Ok(vec![])
+        }
+    }
+
+    /// A [`super::JournalWriter`] whose liveness lock cannot be taken (#699).
+    struct NoLivenessJournal<'a>(&'a Journal);
+
+    impl super::JournalWriter for NoLivenessJournal<'_> {
+        fn persist(&self, record: &sandy::JobRecord) -> Result<(), sandy::CoreError> {
+            self.0.write_record(record)
+        }
+
+        fn persist_if_still_running(&self, record: &sandy::JobRecord) -> Result<bool, sandy::CoreError> {
+            super::JournalWriter::persist_if_still_running(self.0, record)
+        }
+
+        fn hold_liveness(&self, _job_id: &str, _cancels: bool) -> Result<Option<sandy::JobLock>, sandy::CoreError> {
+            Err(sandy::CoreError::State(
+                "the liveness lock could not be taken".to_owned(),
+            ))
+        }
+    }
+
     /// A [`CredentialProvider`] whose mint and refresh return distinct tokens, so a
     /// test can tell the initial-token redaction pass apart from the mid-run-refresh
     /// redaction pass (M-6 follow-up) — `FakeProvider` returns the same token for
@@ -1330,6 +1565,128 @@ mod tests {
     /// `run_job_with_credential_timed` directly rather than the env-var-driven
     /// public entry point: `std::env::set_var` is `unsafe` (edition 2024) and
     /// forbidden by this workspace's lints.
+    /// #699: a run that cannot take its liveness lock never boots, writes no record, and still revokes the token it
+    /// minted: the failure surfaces before any guest or `Running` record exists.
+    #[test]
+    fn a_liveness_lock_that_cannot_be_taken_stops_the_run_before_boot_and_revokes() -> anyhow::Result<()> {
+        use sandy::{MAX_TTL_SECS, Scope};
+        use sandy_test_support::FakeProvider;
+
+        use super::run_job_with_credential;
+
+        let (_home, journal) = fresh_journal()?;
+        let cred_dir = tempfile::tempdir().context("cred dir")?;
+        std::fs::set_permissions(cred_dir.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .context("cred dir 0700")?;
+        let (dev, ino) = sandy_fsutil::OwnedDir::open(cred_dir.path())?.dev_ino()?;
+        let provider = FakeProvider::returning("tok");
+        let result = run_job_with_credential(
+            &NeverRuns,
+            &NoLivenessJournal(&journal),
+            booting_plan(),
+            &FakeApplier::new(),
+            EgressOs::Linux,
+            None,
+            &provider,
+            &Scope::default(),
+            "GITHUB_TOKEN",
+            cred_dir.path(),
+            sandy::DirFingerprint { dev, ino },
+            MAX_TTL_SECS,
+        );
+
+        assert!(result.is_err(), "the run must fail when it cannot be marked live");
+        assert!(journal.list()?.is_empty(), "no record may be written");
+        assert_eq!(provider.revoked().len(), 1, "the minted token must still be revoked");
+        Ok(())
+    }
+
+    /// A provider that records, at revoke time, whether the job still reads as live. On a panic the credential is
+    /// revoked while the stack unwinds, and the liveness lock must outlast that (#699).
+    struct LiveAtRevoke<'a> {
+        journal: &'a Journal,
+        live: Mutex<Vec<bool>>,
+    }
+
+    impl CredentialProvider for LiveAtRevoke<'_> {
+        fn mint(&self, _scope: &sandy::Scope, ttl_hint: Duration) -> Result<sandy::Minted, sandy::CredError> {
+            Ok(sandy::Minted::new(
+                "tok".to_string(),
+                SystemTime::now() + ttl_hint,
+                sandy::CredentialHandle {
+                    id: "live-at-revoke".to_string(),
+                },
+            ))
+        }
+
+        fn revoke(&self, _lease: &sandy::Lease) -> Result<(), sandy::CredError> {
+            let live = self
+                .journal
+                .list()
+                .ok()
+                .and_then(|records| records.first().map(|r| r.job_id.clone()))
+                .and_then(|id| self.journal.owner_live(&id).ok())
+                .unwrap_or(false);
+            self.live.lock().unwrap_or_else(PoisonError::into_inner).push(live);
+            Ok(())
+        }
+
+        fn refresh(&self, lease: &sandy::Lease) -> Result<sandy::Minted, sandy::CredError> {
+            Ok(sandy::Minted::new(
+                "tok".to_string(),
+                SystemTime::now() + Duration::from_secs(u64::from(sandy::MAX_TTL_SECS)),
+                lease.handle.clone(),
+            ))
+        }
+    }
+
+    #[test]
+    fn a_panic_revokes_the_token_while_the_job_still_reads_as_live() -> anyhow::Result<()> {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        use sandy::{MAX_TTL_SECS, Scope};
+
+        use super::run_job_with_credential;
+
+        let (_home, journal) = fresh_journal()?;
+        let cred_dir = tempfile::tempdir().context("cred dir")?;
+        std::fs::set_permissions(cred_dir.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .context("cred dir 0700")?;
+        let (dev, ino) = sandy_fsutil::OwnedDir::open(cred_dir.path())?.dev_ino()?;
+        let provider = LiveAtRevoke {
+            journal: &journal,
+            live: Mutex::new(Vec::new()),
+        };
+
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            run_job_with_credential(
+                &PanicBackend,
+                &journal,
+                booting_plan(),
+                &FakeApplier::new(),
+                EgressOs::Linux,
+                None,
+                &provider,
+                &Scope::default(),
+                "GITHUB_TOKEN",
+                cred_dir.path(),
+                sandy::DirFingerprint { dev, ino },
+                MAX_TTL_SECS,
+            )
+        }));
+        std::panic::set_hook(prev);
+
+        assert!(result.is_err(), "the backend panic must propagate");
+        assert_eq!(
+            *provider.live.lock().unwrap_or_else(PoisonError::into_inner),
+            vec![true],
+            "the token is revoked once, while the job still reads as live"
+        );
+        Ok(())
+    }
+
     #[test]
     fn credentialed_run_writes_the_terminal_record_once_after_refresh_redaction() -> anyhow::Result<()> {
         use sandy::Scope;

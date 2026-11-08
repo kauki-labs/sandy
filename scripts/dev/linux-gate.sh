@@ -110,6 +110,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# The remote shell runs each line in turn and reports only the last status, so every step that can fail ends the
+# script itself: a failed build must not be masked by a passing `--package` (#611).
 remote_cmd() {
   # `&rev=$rev` (the full sha, not the ref name alone) pins Nix to exactly
   # this commit — belt-and-suspenders with the per-rev ref name above, and
@@ -117,13 +119,13 @@ remote_cmd() {
   # whatever another concurrent push left on the ref if one somehow reused it.
   local flake_ref="git+file://$remote_repo?ref=$gate_ref&rev=$rev"
   if [ "$build_all" -eq 1 ]; then
-    echo "nix --extra-experimental-features 'nix-command flakes' flake check -L \"$flake_ref\""
+    echo "nix --extra-experimental-features 'nix-command flakes' flake check -L \"$flake_ref\" || exit \$?"
   else
     # `&` in a sed replacement means "the match", so escape it or the `&rev=` pin is dropped.
     local attr_args sed_ref
     sed_ref=$(printf '%s' "$flake_ref" | sed 's/&/\\&/g')
     attr_args=$(printf '%s\n' "$attr_list" | sed "s|^|\"$sed_ref#|; s|\$|\"|" | paste -sd' ' -)
-    echo "nix --extra-experimental-features 'nix-command flakes' build -L --no-link $attr_args"
+    echo "nix --extra-experimental-features 'nix-command flakes' build -L --no-link $attr_args || exit \$?"
   fi
   if [ "$run_package" -eq 1 ]; then
     # `cargo package` needs a real on-disk checkout (unlike `nix build`,
