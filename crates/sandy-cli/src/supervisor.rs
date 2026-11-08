@@ -224,7 +224,7 @@ fn run_job_core<B: VmBackend + ?Sized, E: EgressApplier + ?Sized, J: JournalWrit
         result: None,
     };
     // Before the `Running` record exists, so no reader can see the job running without seeing its owner live (#699).
-    *live = journal.hold_liveness(&job_id)?;
+    *live = journal.hold_liveness(&job_id, crate::signals::cancels_on_sigterm(&plan.control))?;
     journal.persist(&running)?;
 
     // 3. Apply the egress boundary around the boot. On Linux with a tap this loads the guest-scoped forward ruleset
@@ -1465,6 +1465,42 @@ mod tests {
         }
     }
 
+    /// A backend that fails the test if it is asked to run.
+    struct NeverRuns;
+
+    impl sandy::VmBackend for NeverRuns {
+        fn run(&self, _spec: &sandy::RunSpec) -> Result<Outcome, BackendError> {
+            panic!("the backend must not run when the job cannot be marked live")
+        }
+
+        fn kill(&self, _box_id: &str) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn boxes(&self) -> Result<Vec<sandy::BoxState>, BackendError> {
+            Ok(vec![])
+        }
+    }
+
+    /// A [`super::JournalWriter`] whose liveness lock cannot be taken (#699).
+    struct NoLivenessJournal<'a>(&'a Journal);
+
+    impl super::JournalWriter for NoLivenessJournal<'_> {
+        fn persist(&self, record: &sandy::JobRecord) -> Result<(), sandy::CoreError> {
+            self.0.write_record(record)
+        }
+
+        fn persist_if_still_running(&self, record: &sandy::JobRecord) -> Result<bool, sandy::CoreError> {
+            super::JournalWriter::persist_if_still_running(self.0, record)
+        }
+
+        fn hold_liveness(&self, _job_id: &str, _cancels: bool) -> Result<Option<sandy::JobLock>, sandy::CoreError> {
+            Err(sandy::CoreError::State(
+                "the liveness lock could not be taken".to_owned(),
+            ))
+        }
+    }
+
     /// A [`CredentialProvider`] whose mint and refresh return distinct tokens, so a
     /// test can tell the initial-token redaction pass apart from the mid-run-refresh
     /// redaction pass (M-6 follow-up) — `FakeProvider` returns the same token for
@@ -1529,6 +1565,128 @@ mod tests {
     /// `run_job_with_credential_timed` directly rather than the env-var-driven
     /// public entry point: `std::env::set_var` is `unsafe` (edition 2024) and
     /// forbidden by this workspace's lints.
+    /// #699: a run that cannot take its liveness lock never boots, writes no record, and still revokes the token it
+    /// minted: the failure surfaces before any guest or `Running` record exists.
+    #[test]
+    fn a_liveness_lock_that_cannot_be_taken_stops_the_run_before_boot_and_revokes() -> anyhow::Result<()> {
+        use sandy::{MAX_TTL_SECS, Scope};
+        use sandy_test_support::FakeProvider;
+
+        use super::run_job_with_credential;
+
+        let (_home, journal) = fresh_journal()?;
+        let cred_dir = tempfile::tempdir().context("cred dir")?;
+        std::fs::set_permissions(cred_dir.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .context("cred dir 0700")?;
+        let (dev, ino) = sandy_fsutil::OwnedDir::open(cred_dir.path())?.dev_ino()?;
+        let provider = FakeProvider::returning("tok");
+        let result = run_job_with_credential(
+            &NeverRuns,
+            &NoLivenessJournal(&journal),
+            booting_plan(),
+            &FakeApplier::new(),
+            EgressOs::Linux,
+            None,
+            &provider,
+            &Scope::default(),
+            "GITHUB_TOKEN",
+            cred_dir.path(),
+            sandy::DirFingerprint { dev, ino },
+            MAX_TTL_SECS,
+        );
+
+        assert!(result.is_err(), "the run must fail when it cannot be marked live");
+        assert!(journal.list()?.is_empty(), "no record may be written");
+        assert_eq!(provider.revoked().len(), 1, "the minted token must still be revoked");
+        Ok(())
+    }
+
+    /// A provider that records, at revoke time, whether the job still reads as live. On a panic the credential is
+    /// revoked while the stack unwinds, and the liveness lock must outlast that (#699).
+    struct LiveAtRevoke<'a> {
+        journal: &'a Journal,
+        live: Mutex<Vec<bool>>,
+    }
+
+    impl CredentialProvider for LiveAtRevoke<'_> {
+        fn mint(&self, _scope: &sandy::Scope, ttl_hint: Duration) -> Result<sandy::Minted, sandy::CredError> {
+            Ok(sandy::Minted::new(
+                "tok".to_string(),
+                SystemTime::now() + ttl_hint,
+                sandy::CredentialHandle {
+                    id: "live-at-revoke".to_string(),
+                },
+            ))
+        }
+
+        fn revoke(&self, _lease: &sandy::Lease) -> Result<(), sandy::CredError> {
+            let live = self
+                .journal
+                .list()
+                .ok()
+                .and_then(|records| records.first().map(|r| r.job_id.clone()))
+                .and_then(|id| self.journal.owner_live(&id).ok())
+                .unwrap_or(false);
+            self.live.lock().unwrap_or_else(PoisonError::into_inner).push(live);
+            Ok(())
+        }
+
+        fn refresh(&self, lease: &sandy::Lease) -> Result<sandy::Minted, sandy::CredError> {
+            Ok(sandy::Minted::new(
+                "tok".to_string(),
+                SystemTime::now() + Duration::from_secs(u64::from(sandy::MAX_TTL_SECS)),
+                lease.handle.clone(),
+            ))
+        }
+    }
+
+    #[test]
+    fn a_panic_revokes_the_token_while_the_job_still_reads_as_live() -> anyhow::Result<()> {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        use sandy::{MAX_TTL_SECS, Scope};
+
+        use super::run_job_with_credential;
+
+        let (_home, journal) = fresh_journal()?;
+        let cred_dir = tempfile::tempdir().context("cred dir")?;
+        std::fs::set_permissions(cred_dir.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .context("cred dir 0700")?;
+        let (dev, ino) = sandy_fsutil::OwnedDir::open(cred_dir.path())?.dev_ino()?;
+        let provider = LiveAtRevoke {
+            journal: &journal,
+            live: Mutex::new(Vec::new()),
+        };
+
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            run_job_with_credential(
+                &PanicBackend,
+                &journal,
+                booting_plan(),
+                &FakeApplier::new(),
+                EgressOs::Linux,
+                None,
+                &provider,
+                &Scope::default(),
+                "GITHUB_TOKEN",
+                cred_dir.path(),
+                sandy::DirFingerprint { dev, ino },
+                MAX_TTL_SECS,
+            )
+        }));
+        std::panic::set_hook(prev);
+
+        assert!(result.is_err(), "the backend panic must propagate");
+        assert_eq!(
+            *provider.live.lock().unwrap_or_else(PoisonError::into_inner),
+            vec![true],
+            "the token is revoked once, while the job still reads as live"
+        );
+        Ok(())
+    }
+
     #[test]
     fn credentialed_run_writes_the_terminal_record_once_after_refresh_redaction() -> anyhow::Result<()> {
         use sandy::Scope;

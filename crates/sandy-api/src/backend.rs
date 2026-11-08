@@ -68,6 +68,12 @@ impl RunControl {
         Self::new(Instant::now() + std::time::Duration::from_secs(u64::from(timeout_secs)))
     }
 
+    /// Whether `other` is a clone of this handle: the same run's control, not another's.
+    #[must_use]
+    pub fn same_run(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     /// Signal cancellation (`daemon cancel`): [`Self::is_cancelled`] becomes
     /// `true` immediately, for any clone of this handle. `run()`'s own poll
     /// loop checks this on every tick and tears the box down the same way a

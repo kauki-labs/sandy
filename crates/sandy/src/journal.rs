@@ -38,9 +38,11 @@ impl JobLock {
     ///
     /// Returns [`CoreError::Io`] if the file cannot be written.
     pub fn note(&self, text: &str) -> Result<(), CoreError> {
-        use std::io::Write as _;
+        use std::os::unix::fs::FileExt as _;
         self.file.set_len(0)?;
-        (&self.file).write_all(text.as_bytes())?;
+        // At offset zero, not at the descriptor's position: a second note would otherwise land after the first one's
+        // length and leave NUL bytes in front of it.
+        self.file.write_all_at(text.as_bytes(), 0)?;
         Ok(())
     }
 
@@ -388,6 +390,24 @@ pub fn is_networked_fs(fstype: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// A second note replaces the first from the start of the file: a write at the descriptor's old position would
+    /// leave NUL bytes in front of it, and `sandy kill` would then refuse to signal the owner (#695).
+    #[test]
+    fn a_second_note_replaces_the_first_without_leftover_bytes() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let journal = Journal::new(tmp.path());
+        journal.ensure_dirs()?;
+        let lock = journal.hold_live("job-note")?;
+
+        lock.note("a longer first note")?;
+        lock.note("short")?;
+
+        assert_eq!(journal.owner_note("job-note")?.as_deref(), Some("short"));
+        let raw = std::fs::read(journal.live_path("job-note"))?;
+        assert!(!raw.contains(&0), "no NUL bytes may precede the note: {raw:?}");
+        Ok(())
+    }
+
     use std::time::SystemTime;
 
     use anyhow::Context as _;

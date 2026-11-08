@@ -12,26 +12,30 @@
 
 use std::{
     io,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
+    sync::{Mutex, PoisonError, mpsc},
 };
 
 use sandy::RunControl;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 
-/// Set once [`cancel_on_termination`] has installed its handlers in this process.
-static INSTALLED: AtomicBool = AtomicBool::new(false);
+/// The controls whose run a `SIGTERM` cancels here: one per successful [`cancel_on_termination`] whose `SIGTERM` was
+/// handled (not inherited as ignored).
+static CANCELLED_BY_SIGTERM: Mutex<Vec<RunControl>> = Mutex::new(Vec::new());
 
 /// What a run tells `sandy kill` in its liveness lockfile when [`cancels_on_sigterm`]: a SIGTERM makes it tear down.
 pub const CANCELS_ON_SIGTERM: &str = "sigterm-cancels-the-run";
 
-/// Whether this process turns a `SIGTERM` into a clean cancel (the handlers are installed). A run records this for
-/// `sandy kill`, which signals only an owner that says so: one without the handler would die at once instead.
+/// Whether a `SIGTERM` to this process cancels the run `control` belongs to: the handler is installed for that very
+/// control and `SIGTERM` was not inherited as ignored. A run records this for `sandy kill`, which signals only an
+/// owner that says so: one without the handler would die at once, and one whose handler cancels another run would
+/// ignore the signal.
 #[must_use]
-pub fn cancels_on_sigterm() -> bool {
-    INSTALLED.load(Ordering::SeqCst)
+pub fn cancels_on_sigterm(control: &RunControl) -> bool {
+    CANCELLED_BY_SIGTERM
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .any(|handled| handled.same_run(control))
 }
 
 const SIGHUP: i32 = 1;
@@ -48,6 +52,7 @@ const SIGTERM: i32 = 15;
 /// The handlers or the thread that waits on them could not be set up.
 pub fn cancel_on_termination(control: RunControl) -> io::Result<()> {
     let ignored = ignored_signals(std::process::id());
+    let registered = control.clone();
     let (ready, installed) = mpsc::channel();
     std::thread::Builder::new()
         .name("sandy-signals".to_owned())
@@ -91,7 +96,12 @@ pub fn cancel_on_termination(control: RunControl) -> io::Result<()> {
     installed
         .recv()
         .map_err(|_| io::Error::other("the signal thread ended before it installed its handlers"))??;
-    INSTALLED.store(true, Ordering::SeqCst);
+    if ignored & (1 << (SIGTERM - 1)) == 0 {
+        CANCELLED_BY_SIGTERM
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(registered);
+    }
     Ok(())
 }
 
@@ -236,6 +246,25 @@ mod tests {
         assert!(
             status.success(),
             "the child with SIGHUP ignored must not be cancelled by it: {status}"
+        );
+        Ok(())
+    }
+
+    /// What a run tells `sandy kill`: a SIGTERM cancels THIS run, so a control the handler was not installed for does
+    /// not claim it (#695).
+    #[test]
+    fn only_the_control_the_handler_was_installed_for_claims_sigterm_cancels_it() -> anyhow::Result<()> {
+        let handled = RunControl::with_timeout_secs(60);
+        let other = RunControl::with_timeout_secs(60);
+        assert!(!super::cancels_on_sigterm(&handled), "nothing is installed yet");
+
+        cancel_on_termination(handled.clone())?;
+
+        assert!(super::cancels_on_sigterm(&handled));
+        assert!(super::cancels_on_sigterm(&handled.clone()), "a clone is the same run");
+        assert!(
+            !super::cancels_on_sigterm(&other),
+            "another run's control is not covered"
         );
         Ok(())
     }
