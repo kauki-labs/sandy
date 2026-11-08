@@ -2263,12 +2263,12 @@ A client that polls `GetEnvironment` renews the lease for as long as it polls, a
 - With a `StopRequest` set (`with_graceful_stop`, #670), `kill` first asks the guest to stop, with a grace in whole seconds, and waits up to the grace plus a 5 s margin for `run()` to return; only then does it cancel as above. The guest then gets to run its teardown. A request that cannot be sent, or a run that already ended, skips the wait. The stop is a stored channel message, so an implementation posts it on a channel that belongs to one launch, never one a relaunch reuses. A `kill` now takes up to the grace plus the margin plus the 30 s cancel wait, and `EnvironmentDriver` kills serially in one reconcile pass, so many environments stopping at once delay the pass.
 - One hypervisor backend serves one environment, because agent mode runs one job per backend. The caller supplies a factory.
 - `boxes()` lists only runs still up. A run that returned is `NotRunning`, and a launch for that id starts a fresh box.
-- Readiness is not decided here. A `ServiceProbe` (the host bridge, slice C3b) is asked while the run is up; with none set, the probe reports `Starting`. `HttpServiceProbe` is that probe: it reads a `GET /` status at the loopback address the host bridge listens on (below 500 is Ready, as `sandy-t3-ready` in the guest), and the bridge dials the guest only after that first byte. It reports `Starting` until a registration hook has registered an address: the CID hook (qemu) or the agent link (vfkit, decision 34).
+- Readiness is not decided here. A `ServiceProbe` (the host bridge, slice C3b) is asked while the run is up; with none set, the probe reports `Starting`. `HttpServiceProbe` is that probe: it reads a `GET /` status at the loopback address the host bridge listens on (below 500 is Ready, as `sandy-t3-ready` in the guest), and the bridge dials the guest only after that first byte. It reports `Starting` until a registration hook has registered an address: the CID hook (qemu) or the agent link (vfkit, decision 35).
 - Dropping the backend cancels and joins every run.
 - The guest env and the boot budget come from `VmEnvironmentConfig`: its `env` is appended after the spec's own (the service spec, `SANDY_SERVICE`, goes there, or the agent runs the command as a plain job and never probes), and `boot_timeout_secs` is the `timeout_secs` the hypervisor backend sizes its serial and link connect budgets from, so a real qemu is not given one second to boot. The deadline stays suspended.
-- What a CID hook (qemu) or the agent link (vfkit, decision 34) starts, the host bridge and its probe registration, is held in `RunGuards` and released when `run()` returns, however it ends, through `GuardedBackend`. A hook that fires after that has its guard dropped at once. A run thread that panics is not running: its done flag is set on unwind.
+- What a CID hook (qemu) or the agent link (vfkit, decision 35) starts, the host bridge and its probe registration, is held in `RunGuards` and released when `run()` returns, however it ends, through `GuardedBackend`. A hook that fires after that has its guard dropped at once. A run thread that panics is not running: its done flag is set on unwind.
 
-**Consequences.** The backend is generic over `VmBackend`, so it is tier-2 testable with a double that holds until cancelled. `sandyd` wires it as `vm-qemu` (decision 33) and `vm-vfkit` (decision 34); vfkit reaches the guest through a host Unix socket and needs no CID hook. VMs do not survive a daemon restart: a clean shutdown stops each run, and a SIGKILL leaves the hypervisor running. Both backends call the orphan sweep once at backend construction (run-plane decision 6). A vfkit exits with its owner through its PTY hangup, so what a killed daemon leaves on macOS is the egress proxy and the run directory. A restart policy is open on #587.
+**Consequences.** The backend is generic over `VmBackend`, so it is tier-2 testable with a double that holds until cancelled. `sandyd` wires it as `vm-qemu` (decision 34) and `vm-vfkit` (decision 35); vfkit reaches the guest through a host Unix socket and needs no CID hook. VMs do not survive a daemon restart: a clean shutdown stops each run, and a SIGKILL leaves the hypervisor running. Both backends call the orphan sweep once at backend construction (run-plane decision 6). A vfkit exits with its owner through its PTY hangup, so what a killed daemon leaves on macOS is the egress proxy and the run directory. A restart policy is open on #587.
 
 **Alternative set aside.** A new launch path in `impls/vm`: it would fork boot and teardown logic across two backends.
 
@@ -2303,7 +2303,54 @@ cursor with a client's stream, and every join counted by `join_for_attach` sends
 
 **Set aside.** Reusing `observer_cap`, and counting the collector as an attach.
 
-## 33. `SANDY_ENV_BACKEND=vm-qemu` composes the VM environment backend in `sandyd` (#587, C3b)
+## 33. An append-only audit log for client environment create, stop, cancel and delete (#596)
+
+**Context.** The environment lifecycle had no durable record of who changed what. #596 asks for an audit
+trail; the owner approved the first slice (create, stop, delete) and set the defaults: the log lives in
+sandyd's state directory, and the identity is the one sandyd already records.
+
+**Decision.**
+
+- `sandyd::audit::AuditLog` appends one JSON line per operation to `<db file name>.audit.jsonl` beside the
+  database (`sandyd.db.audit.jsonl` for the default `sandyd.db`), or to `SANDY_AUDIT_LOG`. Fields: `at` (unix
+  seconds), `operation` (`create`, `stop`, `cancel`, `delete`), `environment_id`, `submitter_class` (`trusted` or
+  `untrusted`) and `outcome`.
+- The log file is mode `0600`, opened append-only, synced after each line. A symlink, a FIFO or other file
+  that is not regular, a file with a second hard link, a file another user owns and a file with group or
+  other bits are refused, and
+  `sandyd` does not start when the log cannot be opened. A write that fails part way is cut back, so a
+  full disk leaves no fragment for the next line to join. If the cut back fails, every later line is
+  refused until a restart. A log that already ends in a cut-off line is refused at startup, so the
+  operator repairs it first. `SANDY_AUDIT_LOG` naming the database file is refused too.
+- The handler writes the line before it changes state and fails closed. If the write fails, the operation
+  is refused with `ENVIRONMENT_ERROR_CODE_UNAVAILABLE` (the broker already answers an unknown code with
+  `unavailable`) and nothing changes. A crash between the line and the change leaves a line for an
+  operation that did not run, so `outcome` is always `attempted`: the line says the operation was
+  requested, not that it applied.
+- The line is written once the handler knows the request is well formed and, for stop and delete, that the
+  row's state allows it. A replay of an accepted key, an invalid create, an unknown id, a stop of an
+  environment that is `Stopped`, `Failed` or `Deleted`, a cancel of one that is not `Provisioning` and a repeated delete write
+  nothing. The state is read outside the store's lock, so this holds for sequential requests: two
+  concurrent stops of one `Ready` environment both write a line and one is then refused. A stop of a
+  `Provisioning` environment is audited though it is refused: the driver makes it `Ready` on its own, so
+  the stop can still apply. A create that then meets the row
+  cap, or loses a race on its key, still leaves its line: only the store knows, and the line names an id
+  that never existed.
+- `submitter_class` is the isolation class sandyd stored for the environment's creator: the create
+  request's class, and the row's recorded class for stop and delete. It is not the caller's identity.
+  sandyd serves one user and has no per-client name on the control RPC, so the broker's client id is not in
+  the line. Carrying it needs a proto field. That is an open owner question on #596.
+
+**Not covered.** `resume`; and every change the daemon makes itself: the idle stop, the retention sweep
+and the launch driver. Log rotation: a rename by an external tool leaves sandyd appending to the old
+file until it restarts. One sandyd owns one log; two daemons on one file could cut back each other's
+line after a failed write. Quotas, the default `untrusted` class and the
+per-client authz of #596 stay open.
+
+**Set aside.** Writing the line after the change (a failed write would leave an unaudited change), and
+auditing in the broker (it would miss a client that talks to sandyd directly).
+
+## 34. `SANDY_ENV_BACKEND=vm-qemu` composes the VM environment backend in `sandyd` (#587, C3b)
 
 **Status:** accepted (design posted on #587). **Upholds:** INV-6, INV-11.
 
@@ -2318,11 +2365,11 @@ cursor with a client's stream, and every join counted by `join_for_attach` sends
 - `on_link` serves the host end of the agent link with `serve_agent_link` on the daemon's runtime, over a per-environment `InMem` channel and a `LocalCapAuthority` whose cap outlives any run. Its verdict goes through `AgentReport`, so a link that closes without an exit frame is an agent failure (INV-11).
 - The CID hook starts a `Bridge` to the guest's port relay (`VsockDialer`, port 1000) on a loopback port and registers that address with the probe. Both sit in `RunGuards`; the registration drops first, so Ready is withdrawn before the port closes. The registration happens under the `RunGuards` slot's lock and only while the slot is open, so a hook of an ended run registers nothing and cannot replace or withdraw the registration of the run that replaced it. A hook failure leaves the environment `Starting` until the provision timeout.
 
-**Consequences.** A Ready VM environment cannot be linked yet: pairing in VM mode has no owner (#590, last mile), so `SANDY_ENV_PAIR_COMMAND` has no VM counterpart and a client reaches the service only if it needs no pairing. VMs do not survive a clean daemon restart. A hard kill of the daemon (SIGKILL) leaves the qemu process running with parent 1: the live test left one behind when it failed, and only a daemon restart stops it: `sandyd` sweeps such VMs once when it builds the backend (decision 34). Nothing reads the channel the agent's TTY output lands in, and `InMem` keeps every envelope, so a service that prints forever grows the daemon's memory for the life of the environment. The bridge is a loopback port any local user can reach (decision 10b of `agent-fabric.md`). vfkit and macOS are wired by decision 34.
+**Consequences.** A Ready VM environment cannot be linked yet: pairing in VM mode has no owner (#590, last mile), so `SANDY_ENV_PAIR_COMMAND` has no VM counterpart and a client reaches the service only if it needs no pairing. VMs do not survive a clean daemon restart. A hard kill of the daemon (SIGKILL) leaves the qemu process running with parent 1: the live test left one behind when it failed, and only a daemon restart stops it: `sandyd` sweeps such VMs once when it builds the backend (decision 35). Nothing reads the channel the agent's TTY output lands in, and `InMem` keeps every envelope, so a service that prints forever grows the daemon's memory for the life of the environment. The bridge is a loopback port any local user can reach (decision 10b of `agent-fabric.md`). vfkit and macOS are wired by decision 35.
 
 **Alternative set aside.** Reading the topology in the daemon and passing the paths to the backend: `QemuBackend::run` already evaluates the template, so a second reader would drift from it.
 
-## 34. `SANDY_ENV_BACKEND=vm-vfkit` composes the same environment backend over vfkit on macOS (#587, C3c)
+## 35. `SANDY_ENV_BACKEND=vm-vfkit` composes the same environment backend over vfkit on macOS (#587, C3c)
 
 **Status:** accepted. **Upholds:** INV-6, INV-11.
 
@@ -2332,11 +2379,11 @@ cursor with a client's stream, and every join counted by `join_for_attach` sends
 
 - `SANDY_ENV_BACKEND=vm-vfkit` is macOS only; elsewhere `from_env` returns `UnsupportedPlatform` naming the platform, and `vm-qemu` on macOS stays refused. It reads the same `SANDY_ENV_VM_*` variables and the same provision-timeout rule as `vm-qemu`. `SANDY_VFKIT_BIN` names the vfkit binary, else `vfkit` from `PATH`.
 - Each environment gets one `VfkitBackend` with its own socket under the private staging base (`ensure_sandy_staging_base`). The file name is `env-svc-` plus 24 hex characters of the SHA-256 of the environment id: short, safe for any id, stable across daemon restarts so a stale socket is cleared, and unique per environment (two backends on one path would unlink each other). A path over 103 bytes is refused before vfkit starts.
-- The bridge dials that socket with `UnixDialer` and starts when the agent link comes up (`bridge_on_link`), not at a hook. This is safe because the bridge dials the guest only after a client's first byte, and the relay's ready byte covers a guest that is not listening yet. Registration goes through `RunGuards::hold_if_open`, so a link that comes up after the run ended registers nothing, as in decision 33.
+- The bridge dials that socket with `UnixDialer` and starts when the agent link comes up (`bridge_on_link`), not at a hook. This is safe because the bridge dials the guest only after a client's first byte, and the relay's ready byte covers a guest that is not listening yet. Registration goes through `RunGuards::hold_if_open`, so a link that comes up after the run ended registers nothing, as in decision 34.
 - `vm-qemu` also calls `QemuBackend::sweep_orphans()` once when the backend is built, so a VM that a killed daemon left behind is stopped at start-up. It is not called per launch; `sweep_orphans` logs its own report.
 - The vfkit backend is checked once at start-up: `SANDY_VFKIT_BIN` (UTF-8, not blank, an executable file or a name found on `PATH`) and a socket path under the staging base must fit, or the daemon exits. It then removes the `env-svc-*.sock` sockets in the staging base that no VM answers on, so a daemon killed with SIGKILL does not leave one per failed environment. A socket that answers stays.
 - `VfkitBackend` refuses a service socket that answers (a VM of that environment is still running, such as an orphan of a killed daemon) instead of unlinking it and booting a second VM.
 
-**Consequences.** Ready depends on the guest relay answering, not on the link alone, because the probe goes through the bridge. A vfkit exits with the daemon that killed it, and `sandyd` calls the orphan sweep once at construction (run-plane decision 6), which removes the egress proxy and run directory a killed daemon left. The stale service socket is swept at the same point. The pairing gap of decision 33 applies here too.
+**Consequences.** Ready depends on the guest relay answering, not on the link alone, because the probe goes through the bridge. A vfkit exits with the daemon that killed it, and `sandyd` calls the orphan sweep once at construction (run-plane decision 6), which removes the egress proxy and run directory a killed daemon left. The stale service socket is swept at the same point. The pairing gap of decision 34 applies here too.
 
 **Alternative set aside.** Polling the socket from the factory until vfkit creates it: the link event is already there and carries the same signal.

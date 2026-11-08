@@ -93,7 +93,7 @@ version, metadata, dependency versions, and lints through the root `Cargo.toml`
   trusted-only `ProcessEnvironmentBackend` (a service such as `t3 serve` as a host process group,
   cleared environment, no isolation, `SANDY_ENV_BACKEND=process-insecure`, decision 29), and
   `VmEnvironmentBackend`, one held agent-mode `VmBackend::run` per environment (decision 31). `sandyd` composes it
-  as `SANDY_ENV_BACKEND=vm-qemu` (Linux only, decision 33) and `vm-vfkit` (macOS only, decision 34). A Ready VM environment cannot be linked yet: pairing in VM
+  as `SANDY_ENV_BACKEND=vm-qemu` (Linux only, decision 34) and `vm-vfkit` (macOS only, decision 35). A Ready VM environment cannot be linked yet: pairing in VM
   mode has no owner (#590).
 - **`sandy-egress-proxy`** — the per-run host egress proxy for NIC-less guests
   (#401, epic #360): a pure CONNECT-parse / allow-list / address-filter core and an

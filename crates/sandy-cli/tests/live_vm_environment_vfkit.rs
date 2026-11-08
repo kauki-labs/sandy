@@ -1,4 +1,4 @@
-//! Live VM environment on vfkit (#587, C3c, KENV20): `sandyd` with `SANDY_ENV_BACKEND=vm-vfkit` boots the t3 guest as
+//! Live VM environment on vfkit (#587, C3c, KENV21): `sandyd` with `SANDY_ENV_BACKEND=vm-vfkit` boots the t3 guest as
 //! a vfkit microVM, reports the environment Ready at a loopback endpoint that answers HTTP, and leaves no vfkit
 //! process, `env-svc-*.sock` socket or staging entry behind once the environment is deleted.
 //!
