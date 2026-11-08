@@ -556,6 +556,11 @@ impl VfkitBackend {
             ));
         }
         let topology = topology(spec.template)?;
+        // The eval can take minutes on a cold store. A cancel that arrived meanwhile (SIGTERM to `sandy run`, #687)
+        // must not boot a guest that is torn down at once.
+        if spec.control.is_cancelled() {
+            return Err(BackendError::Spawn("run cancelled before boot".to_string()));
+        }
         let run_id = Uuid::new_v4();
         let box_id = format!("inst-{run_id}");
         // Staging under the OS temp dir (works on macOS, where `/run` does not exist).

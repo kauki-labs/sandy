@@ -893,6 +893,11 @@ impl VmBackend for QemuBackend {
             ));
         }
         let topology = eval_topology(spec.template)?;
+        // The eval can take minutes on a cold store. A cancel that arrived meanwhile (SIGTERM to `sandy run`, #687)
+        // must not boot a guest that is torn down at once.
+        if spec.control.is_cancelled() {
+            return Err(BackendError::Spawn("run cancelled before boot".to_string()));
+        }
         // Parsed and checked before any staging: a refused profile must not return past the shares' teardown wipe
         // (INV-1).
         let network = NetworkMode::from_env().map_err(BackendError::Spawn)?;

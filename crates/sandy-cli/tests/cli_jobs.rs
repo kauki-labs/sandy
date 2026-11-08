@@ -5,14 +5,15 @@
 
 use std::{
     os::unix::fs::PermissionsExt,
+    sync::atomic::{AtomicU32, Ordering},
     time::{Duration, SystemTime},
 };
 
 use anyhow::Context;
 use sandy::{
-    AllowList, BackendError, Capability, CoreError, EgressEnforcement, EgressOs, EgressRule, Grants,
+    AllowList, BackendError, BoxState, Capability, CoreError, EgressEnforcement, EgressOs, EgressRule, Grants,
     JOURNAL_SCHEMA_VERSION, JobRecord, JobState, Journal, Logs, Outcome, Provenance, RESULT_SCHEMA_VERSION,
-    ResultEnvelope, Scope, SecretRef, SecretSource, Status, Target, to_nftables_forward,
+    ResultEnvelope, RunSpec, Scope, SecretRef, SecretSource, Status, Target, VmBackend, to_nftables_forward,
 };
 use sandy_cli::{
     plan::JobPlan,
@@ -2081,5 +2082,239 @@ fn no_token_or_secret_bytes_anywhere_in_the_serialized_envelope() -> anyhow::Res
         !persisted_json.contains(token),
         "the token must never appear in the journaled record either: {persisted_json}"
     );
+    Ok(())
+}
+
+/// A backend that holds the run until its control is cancelled, then returns what the real backends return for a
+/// cancel (they treat it like a timeout), and counts the runs it was asked for.
+struct HoldsUntilCancelled {
+    runs: AtomicU32,
+}
+
+impl HoldsUntilCancelled {
+    fn new() -> Self {
+        Self {
+            runs: AtomicU32::new(0),
+        }
+    }
+}
+
+impl VmBackend for HoldsUntilCancelled {
+    fn run(&self, spec: &RunSpec) -> Result<Outcome, BackendError> {
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        while !spec.control.is_cancelled() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(Outcome {
+            digests: None,
+            booted: true,
+            guest_exit: None,
+            transport_error: None,
+            timed_out: true,
+            console: String::new(),
+        })
+    }
+
+    fn kill(&self, _box_id: &str) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    fn boxes(&self) -> Result<Vec<BoxState>, BackendError> {
+        Ok(vec![])
+    }
+}
+
+/// #687: a cancel while the guest runs (what `sandy run` does on SIGTERM) ends the run `cancelled`, band 1, and the
+/// journal record reaches that terminal state instead of staying `running`.
+#[test]
+fn a_run_cancelled_while_the_guest_runs_ends_cancelled_in_band_one() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    let backend = HoldsUntilCancelled::new();
+    let plan = booting_plan();
+    let control = plan.control.clone();
+    let canceller = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        control.cancel();
+    });
+
+    let report = run_job(
+        &backend,
+        &journal,
+        &plan,
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        None,
+        &[],
+    )
+    .context("run_job (cancelled mid-run)")?;
+    canceller.join().map_err(|_| anyhow::anyhow!("canceller panicked"))?;
+
+    assert_eq!(report.envelope.status, Status::Cancelled);
+    assert_eq!(report.process_exit.code(), 1, "a cancel is band 1, not an infra fault");
+    assert!(!report.envelope.retryable);
+    let records = ls(&journal)?;
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].state,
+        JobState::Cancelled,
+        "the record must not stay running"
+    );
+    Ok(())
+}
+
+/// #687: a cancel that lands before the boot (during mint or setup) starts no guest at all, and still ends
+/// `cancelled` with a terminal record.
+#[test]
+fn a_run_cancelled_before_boot_starts_no_guest() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    let backend = HoldsUntilCancelled::new();
+    // An allow-list on a bound tap would load nft rules: none may be loaded, or left behind, for a run that never
+    // boots.
+    let plan = on_tap(allowing_plan());
+    plan.control.cancel();
+    let applier = FakeApplier::new();
+
+    let report = run_job(
+        &backend,
+        &journal,
+        &plan,
+        &applier,
+        EgressOs::Linux,
+        Some("sandytap0"),
+        &[],
+    )
+    .context("run_job (cancelled before boot)")?;
+
+    assert_eq!(
+        backend.runs.load(Ordering::SeqCst),
+        0,
+        "no guest may start after a cancel"
+    );
+    assert!(
+        applier.applied_rulesets().is_empty(),
+        "no egress rules may load for a run that never boots"
+    );
+    assert_eq!(report.envelope.status, Status::Cancelled);
+    assert_eq!(report.process_exit.code(), 1);
+    assert_eq!(ls(&journal)?[0].state, JobState::Cancelled);
+    Ok(())
+}
+
+/// #687, INV-7: the credential bracket still revokes when the run is cancelled, and the record says so.
+#[test]
+fn a_cancelled_credentialed_run_revokes_the_token_and_records_it() -> anyhow::Result<()> {
+    let (tmp, journal) = fresh_journal()?;
+    let provider = FakeProvider::returning("ghs_cancelled");
+    let backend = HoldsUntilCancelled::new();
+    let cred_dir = tmp.path().join("cred");
+    std::fs::create_dir_all(&cred_dir).context("create cred dir")?;
+    std::fs::set_permissions(&cred_dir, std::fs::Permissions::from_mode(0o700)).context("cred dir 0700")?;
+    let plan = booting_plan();
+    let control = plan.control.clone();
+    let canceller = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        control.cancel();
+    });
+
+    let report = run_job_with_credential(
+        &backend,
+        &journal,
+        plan,
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        None,
+        &provider,
+        &token_scope(),
+        "GH_TOKEN",
+        &cred_dir,
+        fingerprint(&cred_dir)?,
+        1_800,
+    )
+    .context("run_job_with_credential (cancelled)")?;
+    canceller.join().map_err(|_| anyhow::anyhow!("canceller panicked"))?;
+
+    assert_eq!(report.envelope.status, Status::Cancelled);
+    assert_eq!(provider.revoked().len(), 1, "the minted token must be revoked");
+    let record = &ls(&journal)?[0];
+    assert_eq!(record.state, JobState::Cancelled);
+    assert!(
+        record
+            .result
+            .as_ref()
+            .and_then(|r| r.receipt.as_ref())
+            .and_then(|r| r.host_observed.credential.as_ref())
+            .is_some_and(|c| c.revoke_succeeded),
+        "the record must say the revoke succeeded"
+    );
+    Ok(())
+}
+
+/// A backend that cancels the run itself while the guest is up, then returns `outcome` (a signal that lands as
+/// the guest finishes).
+struct CancelsThenReturns {
+    outcome: Outcome,
+}
+
+impl VmBackend for CancelsThenReturns {
+    fn run(&self, spec: &RunSpec) -> Result<Outcome, BackendError> {
+        spec.control.cancel();
+        Ok(self.outcome.clone())
+    }
+
+    fn kill(&self, _box_id: &str) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    fn boxes(&self) -> Result<Vec<BoxState>, BackendError> {
+        Ok(vec![])
+    }
+}
+
+/// #687: a guest that finished clean before the cancel took effect keeps its result.
+#[test]
+fn a_clean_run_that_a_signal_lands_on_keeps_its_result() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    let backend = CancelsThenReturns { outcome: ok_outcome(0) };
+
+    let report = run_job(
+        &backend,
+        &journal,
+        &booting_plan(),
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        None,
+        &[],
+    )
+    .context("run_job (clean, then cancelled)")?;
+
+    assert_eq!(report.envelope.status, Status::Succeeded);
+    assert_eq!(report.process_exit.code(), 0);
+    Ok(())
+}
+
+/// #687: the override to `cancelled` keeps what the run said, so a real fault is not lost behind the signal.
+#[test]
+fn a_cancel_keeps_the_original_failure_in_the_message() -> anyhow::Result<()> {
+    let (_tmp, journal) = fresh_journal()?;
+    let backend = CancelsThenReturns { outcome: ok_outcome(7) };
+
+    let report = run_job(
+        &backend,
+        &journal,
+        &booting_plan(),
+        &FakeApplier::new(),
+        EgressOs::Linux,
+        None,
+        &[],
+    )
+    .context("run_job (failed, then cancelled)")?;
+
+    assert_eq!(report.envelope.status, Status::Cancelled);
+    assert!(
+        report.envelope.message.contains("Failed"),
+        "the message must keep the original classification: {}",
+        report.envelope.message
+    );
+    assert_eq!(report.envelope.exit_code, Some(7), "the guest's exit code is kept");
     Ok(())
 }
