@@ -462,7 +462,7 @@ impl EnvironmentBackend for ProcessEnvironmentBackend {
         }
         let holder = match holder {
             Ok(holder) => holder,
-            Err(e) => return exited().map_or(Err(BackendError::Transport(e)), Ok),
+            Err(e) => return exited().ok_or(BackendError::Transport(e)),
         };
         match holder {
             connections::Holder::Nobody => {
