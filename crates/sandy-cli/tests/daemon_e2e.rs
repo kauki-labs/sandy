@@ -579,3 +579,69 @@ fn submit_with_a_cap_file_from_a_real_attach_grants_the_requested_subset() -> an
     );
     Ok(())
 }
+
+/// #481: `--credential` reaches `sandyd`. The same Submit that succeeds without
+/// it is refused with it, since this daemon has no host-executor that shares the
+/// submitter's filesystem to hand a minted token to; nothing is minted first.
+#[test]
+fn submit_with_a_credential_and_no_local_host_is_refused_by_the_daemon() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir().context("temp dir")?;
+    let daemon = spawn_daemon(tmp.path())?;
+    let manifest = tmp.path().join("manifest.bin");
+    std::fs::write(&manifest, b"opaque").context("write manifest")?;
+    let manifest = manifest.to_str().context("manifest path is utf8")?;
+    let base = [
+        "daemon",
+        "submit",
+        manifest,
+        "--manifest-encoding",
+        "test/v1",
+        "--isolation-class",
+        "trusted",
+    ];
+
+    let plain = sandy(&daemon, &base)?;
+    assert!(plain.status.success(), "stderr: {}", stderr_of(&plain));
+
+    let mut with_credential = base.to_vec();
+    with_credential.extend(["--credential", "gh-test", "--cred-capability", "write-code"]);
+    let refused = sandy(&daemon, &with_credential)?;
+    assert!(
+        !refused.status.success(),
+        "a credentialed Submit with no local host must be refused"
+    );
+    assert!(
+        stderr_of(&refused).contains("no remote placement is reachable"),
+        "stderr: {}",
+        stderr_of(&refused)
+    );
+    Ok(())
+}
+
+/// `--cred-capability` without `--credential` is a usage error, never a silent no-op.
+#[test]
+fn a_cred_capability_without_a_credential_is_a_usage_error() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir().context("temp dir")?;
+    let output = Command::new(env!("CARGO_BIN_EXE_sandy"))
+        .env("SANDY_SOCK", tmp.path().join("no-daemon-here.sock"))
+        .args([
+            "daemon",
+            "submit",
+            "manifest.bin",
+            "--manifest-encoding",
+            "test/v1",
+            "--isolation-class",
+            "trusted",
+            "--cred-capability",
+            "write-code",
+        ])
+        .output()
+        .context("running sandy daemon submit")?;
+    assert_eq!(output.status.code(), Some(2), "stderr: {}", stderr_of(&output));
+    assert!(
+        stderr_of(&output).contains("--credential"),
+        "stderr: {}",
+        stderr_of(&output)
+    );
+    Ok(())
+}

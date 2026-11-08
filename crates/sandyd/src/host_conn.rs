@@ -510,6 +510,8 @@ async fn record_job_result(
         Ok(Err(e)) => tracing::warn!(job_id, error = %e, "could not record the job result"),
         Err(e) => tracing::warn!(job_id, error = %e, "the record-result store task failed"),
     }
+    // The job is over on its host whatever the store said: revoke its credential (#481).
+    job_registry.release_credential(&job_id);
 }
 
 /// Fail a job whose host-executor disconnected before reporting a result
@@ -547,6 +549,8 @@ async fn fail_disconnected_job(store: &Arc<JobStore>, job_registry: &JobRegistry
     // stream must not still be able to authenticate with it (#269: job
     // status alone doesn't gate authentication).
     job_registry.invalidate_remote_link(job_id);
+    // Its credential (#481) has no live consumer left either.
+    job_registry.release_credential(job_id);
 }
 
 /// Reads frames from `read_half` sequentially — never raced against anything

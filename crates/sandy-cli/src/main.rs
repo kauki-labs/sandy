@@ -300,6 +300,18 @@ enum DaemonOp {
         /// grammar as `sandy run`'s own `--secret`.
         #[arg(long = "secret")]
         secrets: Vec<String>,
+        /// Have `sandyd` mint a scoped forge token for the job from the named
+        /// trust root on the daemon's host (a `sandy cred github` name), as
+        /// `sandy run --credential` does (#481). The token is injected as
+        /// `GITHUB_TOKEN` and revoked when the job ends. Needs a host-executor
+        /// that declared `shares_submitter_filesystem`; `sandyd` refuses the
+        /// Submit otherwise.
+        #[arg(long = "credential")]
+        credential: Option<String>,
+        /// Capability for the minted credential: `read-code` | `write-code` |
+        /// `read-pr` | `write-pr` (repeatable; default `read-code`).
+        #[arg(long = "cred-capability", requires = "credential")]
+        cred_capability: Vec<String>,
     },
     /// Cancel a submitted job.
     Cancel {
@@ -1021,6 +1033,8 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
             inputs: _,
             outputs: _,
             secrets: _,
+            credential,
+            cred_capability,
         } => {
             // clap's `required_unless_present = "flake"`/`conflicts_with`
             // pairs above guarantee exactly one of `manifest` or `flake` is
@@ -1070,8 +1084,8 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
                 inputs: submit_inputs,
                 outputs: submit_outputs,
                 secrets: submit_secrets,
-                credential: None,
-                cred_capabilities: Vec::new(),
+                credential,
+                cred_capabilities: cred_capability,
             })
         }
         DaemonOp::Cancel { job_id } => {

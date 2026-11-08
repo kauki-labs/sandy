@@ -20,7 +20,7 @@ use std::{
     time::Duration,
 };
 
-use sandy::{CredentialBracket, Scope, SharedProvider};
+use sandy::{CredentialBracket, DirFingerprint, Scope, SharedProvider, StagingTarget};
 
 /// The secret name the job sees the token under: the same name `sandy run
 /// --credential` injects.
@@ -93,7 +93,101 @@ impl JobCredentials {
     /// The number of jobs holding a live credential.
     #[must_use]
     pub fn live_count(&self) -> usize {
-        self.live.lock().unwrap_or_else(PoisonError::into_inner).len()
+        self.lock_live().len()
+    }
+
+    /// Mint credential `name` with `capabilities` and stage it as a `0600`
+    /// [`CREDENTIAL_SECRET_NAME`] file in a fresh `0700` dir. Blocking: run it off
+    /// the async runtime. The returned bracket revokes on drop, so a Submit that
+    /// fails after this call cannot leak the token; hand it to
+    /// [`JobCredentials::adopt`] once the job exists.
+    ///
+    /// # Errors
+    /// A human-readable reason when the trust root cannot be resolved, the dir
+    /// cannot be created, or the mint or stage fails. Nothing stays staged or
+    /// live on an error.
+    pub fn mint(&self, name: &str, capabilities: &[String]) -> Result<CredentialBracket, String> {
+        let (provider, scope) = self.resolver.resolve(name, capabilities)?;
+        let dir = self
+            .create_dir()
+            .map_err(|e| format!("create the credential staging dir: {e}"))?;
+        let (dev, ino) = dir
+            .dev_ino()
+            .map_err(|e| format!("fingerprint the credential staging dir: {e}"))?;
+        let target = StagingTarget {
+            dir: dir.path().to_path_buf(),
+            fingerprint: DirFingerprint { dev, ino },
+            secret_name: CREDENTIAL_SECRET_NAME.to_owned(),
+            remove_dir_on_revoke: true,
+        };
+        drop(dir);
+        let dir_path = target.dir.clone();
+        CredentialBracket::mint_and_stage(provider, &scope, target, sandy::MAX_TTL_SECS, self.call_timeout).map_err(
+            |e| {
+                if let Err(rm) = std::fs::remove_dir(&dir_path) {
+                    tracing::warn!(dir = %dir_path.display(), error = %rm, "could not remove an unused credential staging dir");
+                }
+                e.to_string()
+            },
+        )
+    }
+
+    /// Hold `bracket` as `job_id`'s live credential until [`JobCredentials::release`].
+    pub fn adopt(&self, job_id: &str, bracket: CredentialBracket) {
+        let previous = self.lock_live().insert(job_id.to_owned(), bracket);
+        if previous.is_some() {
+            // Job ids are fresh UUIDs; a second adopt is a caller bug. The
+            // displaced bracket revokes on drop, so it still does not leak.
+            tracing::warn!(job_id, "a job adopted a second credential; revoking the first");
+        }
+    }
+
+    /// Revoke `job_id`'s credential and remove its staged file and dir, if it
+    /// holds one. Idempotent: every terminal path calls this, and only the first
+    /// call finds the credential. The revoke runs on the blocking pool when a
+    /// tokio runtime is current. A revoke failure is logged as a warning naming
+    /// the job and the handle; the token then stays valid until its native expiry.
+    pub fn release(&self, job_id: &str) {
+        let Some(bracket) = self.lock_live().remove(job_id) else {
+            return;
+        };
+        let job_id = job_id.to_owned();
+        let teardown = move || {
+            let handle = bracket.handle().map(|h| h.id).unwrap_or_default();
+            match bracket.revoke() {
+                Ok(()) => tracing::info!(
+                    job_id,
+                    handle,
+                    "revoked the job's credential and removed its staged file"
+                ),
+                Err(e) => tracing::warn!(
+                    job_id,
+                    handle,
+                    error = %e,
+                    "credential revoke at job teardown failed; the token stays valid until its native expiry"
+                ),
+            }
+            // The provider drops here, on this blocking thread: a live adapter
+            // owns a tokio runtime, which must not drop on an async worker.
+            drop(bracket);
+        };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            drop(tokio::task::spawn_blocking(teardown));
+        } else {
+            teardown();
+        }
+    }
+
+    fn create_dir(&self) -> Result<sandy_fsutil::OwnedDir, sandy_fsutil::FsError> {
+        match &self.staging_base {
+            Some(base) => sandy_fsutil::OwnedDir::open_or_create(base)?
+                .create_private_dir(&format!("cred-{}", uuid::Uuid::new_v4().simple())),
+            None => sandy_fsutil::private_staging_dir("cred"),
+        }
+    }
+
+    fn lock_live(&self) -> std::sync::MutexGuard<'_, HashMap<String, CredentialBracket>> {
+        self.live.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -352,16 +446,14 @@ mod tests {
 
     /// Wait until the provider saw a revoke and `path` is gone.
     async fn wait_revoked_and_removed(d: &Daemon, path: &std::path::Path) -> anyhow::Result<()> {
+        let dir_exists = || path.parent().is_some_and(std::path::Path::exists);
         let deadline = Instant::now() + WAIT;
-        while (d.provider.revoked().is_empty() || path.exists()) && Instant::now() < deadline {
+        while (d.provider.revoked().is_empty() || path.exists() || dir_exists()) && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         anyhow::ensure!(!d.provider.revoked().is_empty(), "the credential must be revoked");
         anyhow::ensure!(!path.exists(), "the staged token file must be removed");
-        anyhow::ensure!(
-            path.parent().is_none_or(|dir| !dir.exists()),
-            "the job's staging dir must be removed"
-        );
+        anyhow::ensure!(!dir_exists(), "the job's staging dir must be removed");
         Ok(())
     }
 
@@ -576,13 +668,13 @@ mod tests {
             "the credential is minted before the dispatch"
         );
         wait_status(&d, &submitted.job_id, JobStatus::Failed).await?;
+        let staging_is_empty = || -> anyhow::Result<bool> { Ok(std::fs::read_dir(&d.staging)?.next().is_none()) };
         let deadline = Instant::now() + WAIT;
-        while d.provider.revoked().is_empty() && Instant::now() < deadline {
+        while (d.provider.revoked().is_empty() || !staging_is_empty()?) && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(!d.provider.revoked().is_empty(), "the credential must be revoked");
-        let leftovers: Vec<_> = std::fs::read_dir(&d.staging)?.collect::<Result<_, _>>()?;
-        assert!(leftovers.is_empty(), "no staging dir may remain: {leftovers:?}");
+        assert!(staging_is_empty()?, "no staging dir may remain");
         Ok(())
     }
 

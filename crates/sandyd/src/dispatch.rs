@@ -430,6 +430,15 @@ impl JobRegistry {
         self.credentials.as_ref()
     }
 
+    /// Revoke `job_id`'s daemon-minted credential, if it holds one (#481). Every
+    /// terminal path calls this whatever its store transition was: the job is
+    /// over on its host either way. Idempotent.
+    pub fn release_credential(&self, job_id: &str) {
+        if let Some(credentials) = &self.credentials {
+            credentials.release(job_id);
+        }
+    }
+
     /// Override the terminal-retention grace period (#270). Production
     /// callers never need this — [`JobRegistry::new`] already uses
     /// [`TERMINAL_RETENTION`] — it exists so a test can pass
