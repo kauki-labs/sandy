@@ -2,10 +2,11 @@
 //!
 //! When a `running` record is read, the reconciler checks liveness through the
 //! backend's [`boxes`](crate::backend::VmBackend::boxes) — never a direct
-//! registry read — and, if the box is gone, acquires the job's flock (proving
-//! the owner is dead) *before* flipping `running → crashed` and tearing the box
-//! down. A live owner still holds the lock, so a live job is never reaped even
-//! if its pid was reused (INV-3).
+//! registry read — and, if the box is gone, checks the job's liveness lock
+//! (`.live`, held by the owner for the whole run) and only then, under the write
+//! lock, flips `running → crashed` and tears the box down. A live owner still
+//! holds the lock, so a live job is never reaped even if its pid was reused
+//! (INV-3, #699).
 
 use crate::{
     CoreError,
@@ -18,7 +19,7 @@ use crate::{
 ///
 /// If the record is not `running`, it is returned unchanged. If it is `running`
 /// and [`VmBackend::boxes`] still lists its box, the live job is left untouched.
-/// Only when the box is absent AND the job's flock can be acquired does the
+/// Only when the box is absent AND the job's liveness lock is free does the
 /// reconciler flip the record to `crashed` and call [`VmBackend::kill`] (INV-3).
 ///
 /// # Errors
@@ -45,11 +46,13 @@ pub fn reconcile_job<B: VmBackend>(journal: &Journal, backend: &B, job_id: &str)
     }
 
     // The box is gone from the backend, but the pid may have been reused — so the
-    // flock, not the pid, is the liveness authority (INV-3). Only acquiring it
-    // proves the owner is gone; if another writer holds it, the job is live.
-    let Some(_lock) = journal.try_lock_job(job_id)? else {
+    // owner's liveness flock, not the pid, is the liveness authority (INV-3, #699).
+    // The owner holds it for the whole run: while it is held the job is live.
+    if journal.owner_live(job_id)? {
         return Ok(record);
-    };
+    }
+    // The write lock serialises the flip with the owner's and `kill`'s writes.
+    let _lock = journal.lock_job(job_id)?;
 
     // The first read happened before the lock; the owner may have written a
     // terminal record (and released the lock) in that window. Re-read under the

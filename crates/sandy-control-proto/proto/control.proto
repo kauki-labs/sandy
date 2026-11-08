@@ -194,6 +194,10 @@ message AttachRequest {
   // check — this is additive, not a replacement: a submit-then-immediately-
   // attach on the SAME connection still works with no token at all.
   optional bytes attach_token = 2;
+  // The broker's output collector (#643): ask for the dedicated collector cap, a
+  // read-only membership of its own that attach counting ignores. Needs a matching
+  // `attach_token`; otherwise the request is refused.
+  bool collector = 3;
 }
 
 message AttachResponse {

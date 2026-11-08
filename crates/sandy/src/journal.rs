@@ -1,10 +1,12 @@
 //! The per-job journal: one JSON record per job under `$SANDY_HOME/jobs/`.
 //!
-//! Records are written atomically (tmp + rename). Each job has a sibling flock
-//! lockfile opened `O_CLOEXEC`; acquiring it proves the previous owner is
-//! dead/absent and is the ONLY liveness authority — `writer_pid` is
-//! informational (INV-3). `$SANDY_HOME` must be a local POSIX filesystem,
-//! because flock is unreliable on virtiofs/networked FS (INV-5).
+//! Records are written atomically (tmp + rename). Each job has two sibling flock
+//! lockfiles, both opened `O_CLOEXEC`: `.lock` serialises writes, and `.live` is
+//! held by the owning run for its whole life, so acquiring `.live` proves the
+//! owner is dead/absent and is the ONLY liveness authority (INV-3, #699).
+//! `writer_pid` is informational, except that `sandy kill` signals it while
+//! `.live` is held. `$SANDY_HOME` must be a local POSIX filesystem, because
+//! flock is unreliable on virtiofs/networked FS (INV-5).
 
 use std::{
     fs::{File, OpenOptions},
@@ -29,6 +31,21 @@ pub struct JobLock {
 }
 
 impl JobLock {
+    /// Write a one-line note into the lockfile, for a reader to find with [`Journal::owner_note`]. The owner uses it
+    /// to say what a signal will do (#695).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Io`] if the file cannot be written.
+    pub fn note(&self, text: &str) -> Result<(), CoreError> {
+        use std::os::unix::fs::FileExt as _;
+        self.file.set_len(0)?;
+        // At offset zero, not at the descriptor's position: a second note would otherwise land after the first one's
+        // length and leave NUL bytes in front of it.
+        self.file.write_all_at(text.as_bytes(), 0)?;
+        Ok(())
+    }
+
     /// The job id this lock guards.
     #[must_use]
     pub fn job_id(&self) -> &str {
@@ -69,6 +86,13 @@ impl Journal {
     #[must_use]
     pub fn lock_path(&self, job_id: &str) -> PathBuf {
         self.jobs_dir().join(format!("{job_id}.lock"))
+    }
+
+    /// Path of a job's liveness lockfile: held by the owning `sandy run` for as long as the run lives (#699), apart
+    /// from the short write lock, so a writer never waits on a live run and a live run never waits on itself.
+    #[must_use]
+    pub fn live_path(&self, job_id: &str) -> PathBuf {
+        self.jobs_dir().join(format!("{job_id}.live"))
     }
 
     /// Create the journal directory layout.
@@ -181,20 +205,87 @@ impl Journal {
         }
     }
 
+    /// Mark the calling process as the live owner of `job_id` until the returned lock drops (INV-3, #699). The owner
+    /// takes it before the `Running` record is written and keeps it past the terminal write, so a second process sees
+    /// the job as live for exactly as long as it is. The kernel releases it if the owner dies.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::State`] when another process already holds it, [`CoreError::Io`] if the lockfile cannot be opened.
+    pub fn hold_live(&self, job_id: &str) -> Result<JobLock, CoreError> {
+        let file = open_lockfile_at(&self.live_path(job_id))?;
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => Ok(JobLock {
+                job_id: job_id.to_string(),
+                file,
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(CoreError::State(format!("job {job_id} already has a live owner")))
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Whether a process currently holds `job_id`'s liveness lock (INV-3). The kernel drops the lock with its holder,
+    /// so a held lock is a live owner even when a pid was reused, and a free one is a dead or absent owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Io`] if the lockfile cannot be opened.
+    pub fn owner_live(&self, job_id: &str) -> Result<bool, CoreError> {
+        // Read-only, never created: a job with no `.live` file has no live owner (a record from before the lock), and
+        // a probe leaves nothing behind. A shared lock conflicts with the owner's exclusive one but never with another
+        // probe, so two readers cannot make each other see a live owner.
+        let file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(self.live_path(job_id))
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        match fs2::FileExt::try_lock_shared(&file) {
+            // Ours for a moment: nobody holds it exclusively.
+            Ok(()) => Ok(false),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The note the live owner of `job_id` left in its liveness lockfile ([`JobLock::note`]), or `None` when there is
+    /// no file or no note.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Io`] on a read failure other than the file being absent.
+    pub fn owner_note(&self, job_id: &str) -> Result<Option<String>, CoreError> {
+        match std::fs::read_to_string(self.live_path(job_id)) {
+            Ok(text) if text.trim().is_empty() => Ok(None),
+            Ok(text) => Ok(Some(text.trim().to_string())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Open (creating if absent) a job's lockfile with `O_CLOEXEC` so only the
     /// supervisor holds it — forked children must not inherit it, or reconcile
     /// would never fire (INV-3, D3). `O_NOFOLLOW` refuses a symlink planted at
     /// the lockfile name (#397).
     fn open_lockfile(&self, job_id: &str) -> Result<File, CoreError> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(self.lock_path(job_id))?;
-        Ok(file)
+        open_lockfile_at(&self.lock_path(job_id))
     }
+}
+
+fn open_lockfile_at(path: &Path) -> Result<File, CoreError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)?;
+    Ok(file)
 }
 
 /// Generate a fresh job id (UUID v4).
@@ -299,6 +390,24 @@ pub fn is_networked_fs(fstype: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// A second note replaces the first from the start of the file: a write at the descriptor's old position would
+    /// leave NUL bytes in front of it, and `sandy kill` would then refuse to signal the owner (#695).
+    #[test]
+    fn a_second_note_replaces_the_first_without_leftover_bytes() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let journal = Journal::new(tmp.path());
+        journal.ensure_dirs()?;
+        let lock = journal.hold_live("job-note")?;
+
+        lock.note("a longer first note")?;
+        lock.note("short")?;
+
+        assert_eq!(journal.owner_note("job-note")?.as_deref(), Some("short"));
+        let raw = std::fs::read(journal.live_path("job-note"))?;
+        assert!(!raw.contains(&0), "no NUL bytes may precede the note: {raw:?}");
+        Ok(())
+    }
+
     use std::time::SystemTime;
 
     use anyhow::Context as _;

@@ -1105,7 +1105,11 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
             // back to `session_matches` server-side, same as before this
             // existed.
             let attach_token = sandy_cli::attach::read_attach_token(&job_id);
-            control_request::Op::Attach(AttachRequest { job_id, attach_token })
+            control_request::Op::Attach(AttachRequest {
+                job_id,
+                attach_token,
+                collector: false,
+            })
         }
         DaemonOp::Status { job_id } => control_request::Op::Status(StatusRequest { job_id }),
         DaemonOp::List => control_request::Op::List(ListRequest {}),
@@ -1385,6 +1389,13 @@ fn dispatch_run(
             eprintln!("sandy: {e}");
             return ProcessExit::InvalidPlan.code();
         }
+    }
+    // From here on the run owns a guest, a credential and an egress boundary: a termination signal must cancel the
+    // run so the teardown runs, not end the process with the default action (#687). Fail closed when the handlers
+    // cannot be installed.
+    if let Err(e) = sandy_cli::signals::cancel_on_termination(plan.control.clone()) {
+        eprintln!("sandy: cannot install the termination-signal handlers: {e}");
+        return ProcessExit::InfraFault.code();
     }
     // The run seams come from the injected `profile` — the sandbox backend, the
     // egress applier (Linux enforces the nftables boundary, macOS has none), and the

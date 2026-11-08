@@ -103,6 +103,8 @@ tokio = { workspace = true, features = [
   "sync",
   "time",
   "signal",
+  "rt",
+  "macros",
 ] }
 tracing.workspace = true
 uuid.workspace = true

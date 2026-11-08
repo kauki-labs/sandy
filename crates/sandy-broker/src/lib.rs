@@ -7,6 +7,7 @@ mod attach;
 mod auth;
 mod body;
 mod environments;
+mod output;
 mod owners;
 mod paths;
 mod server;
@@ -75,12 +76,13 @@ pub struct BrokerConfig {
     pub clients: Vec<Client>,
 }
 
-/// A running broker. Dropping it stops the listener.
+/// A running broker. Dropping it stops the listener and the output collectors.
 #[derive(Debug)]
 pub struct Running {
     /// The bound address.
     pub addr: SocketAddr,
     task: tokio::task::JoinHandle<()>,
+    outputs: Arc<output::Outputs>,
 }
 
 impl Running {
@@ -93,6 +95,7 @@ impl Running {
 impl Drop for Running {
     fn drop(&mut self) {
         self.task.abort();
+        self.outputs.abort_collectors();
     }
 }
 
@@ -185,6 +188,18 @@ pub struct Tuning {
     pub ticket_ttl: std::time::Duration,
     /// How long one write to a client that stopped reading may block before the stream ends.
     pub send_timeout: std::time::Duration,
+    /// Bytes of one job's output the broker keeps. The oldest bytes drop first.
+    pub output_job_cap: usize,
+    /// Bytes of output the broker keeps across all jobs.
+    pub output_total_cap: usize,
+    /// How long a finished job's output stays readable.
+    pub output_retention: std::time::Duration,
+    /// Most output collectors one client may run at once. Later jobs wait for a slot.
+    pub output_collectors_per_client: usize,
+    /// Most output collectors the broker may run at once.
+    pub output_collectors_total: usize,
+    /// Wait between a collector's attach tries.
+    pub output_join_backoff: std::time::Duration,
 }
 
 impl Default for Tuning {
@@ -192,6 +207,12 @@ impl Default for Tuning {
         Self {
             ticket_ttl: std::time::Duration::from_secs(30),
             send_timeout: std::time::Duration::from_secs(30),
+            output_job_cap: 1024 * 1024,
+            output_total_cap: 16 * 1024 * 1024,
+            output_retention: std::time::Duration::from_secs(15 * 60),
+            output_collectors_per_client: 16,
+            output_collectors_total: 64,
+            output_join_backoff: std::time::Duration::from_secs(10),
         }
     }
 }
@@ -212,10 +233,19 @@ pub async fn serve_with_tuning(config: BrokerConfig, tuning: Tuning) -> Result<R
         .iter()
         .map(|c| (c.id.clone(), tokio::sync::Mutex::new(())))
         .collect();
+    let outputs = Arc::new(output::Outputs::new(
+        tuning.output_job_cap,
+        tuning.output_total_cap,
+        config.clients.len(),
+        tuning.output_retention,
+        (tuning.output_collectors_per_client, tuning.output_collectors_total),
+    ));
     let state = Arc::new(server::State {
         owners: owners::Owners::open(&config.state_dir)?,
         tickets: attach::Tickets::new(ticket_ttl),
+        outputs: Arc::clone(&outputs),
         send_timeout: tuning.send_timeout,
+        join_backoff: tuning.output_join_backoff,
         control_socket: config.control_socket,
         rpc_deadline: config.rpc_deadline,
         clients: config.clients,
@@ -280,5 +310,5 @@ pub async fn serve_with_tuning(config: BrokerConfig, tuning: Tuning) -> Result<R
             });
         }
     });
-    Ok(Running { addr, task })
+    Ok(Running { addr, task, outputs })
 }
