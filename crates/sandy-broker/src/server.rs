@@ -7,7 +7,7 @@ use http_body_util::{BodyExt, Full, Limited};
 use hyper::{
     Method, Request, Response, StatusCode,
     body::{Bytes, Incoming},
-    header::{AUTHORIZATION, CONTENT_TYPE},
+    header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE},
 };
 use sandy_control_proto::{
     CancelRequest, Input, IsolationClass as WireClass, JobStatus, ListRequest, Output, SecretRef, StatusRequest,
@@ -18,7 +18,8 @@ use serde_json::{Value, json};
 use tokio::net::UnixStream;
 
 use crate::{
-    Client, IsolationClass, attach, auth::authenticate, body::Body, environments, owners::Owners, paths::within_roots,
+    Client, IsolationClass, attach, auth::authenticate, body::Body, environments, output, output::Outputs,
+    owners::Owners, paths::within_roots,
 };
 
 const MAX_BODY: usize = 1024 * 1024;
@@ -29,8 +30,14 @@ pub(crate) struct State {
     pub(crate) clients: Vec<Client>,
     pub(crate) owners: Owners,
     pub(crate) tickets: attach::Tickets,
+    /// Each accepted job's collected output.
+    pub(crate) outputs: Arc<Outputs>,
     /// How long one write to a stalled attach client may block.
     pub(crate) send_timeout: std::time::Duration,
+    /// Wait between a collector's attach tries. At least 10 s in production: sandyd mints a
+    /// collector cap deterministically per second, so two caps for one job minted in the same
+    /// second share a membership, and a retry must not share one with a half-successful try.
+    pub(crate) join_backoff: std::time::Duration,
     /// Serializes one client's environment creates, so a quota check and its create are one step.
     pub(crate) env_create: std::collections::HashMap<String, tokio::sync::Mutex<()>>,
 }
@@ -114,6 +121,7 @@ pub(crate) async fn handle(state: Arc<State>, req: Request<Incoming>) -> Respons
         (&Method::POST, ["v1", "jobs"]) => submit(&state, client, req).await,
         (&Method::GET, ["v1", "jobs"]) => list(&state, client).await,
         (&Method::GET, ["v1", "jobs", id]) => get(&state, client, id).await,
+        (&Method::GET, ["v1", "jobs", id, "output"]) => output::get(&state, client, id, req.uri().query()),
         (&Method::POST, ["v1", "jobs", id, "cancel"]) => cancel(&state, client, id).await,
         (&Method::POST, ["v1", "environments"]) => environments::spawn(&state, client, req).await,
         (&Method::GET, ["v1", "environments"]) => environments::list(&state, client, req.uri().query()).await,
@@ -129,8 +137,18 @@ pub(crate) async fn handle(state: Arc<State>, req: Request<Incoming>) -> Respons
         (&Method::POST, ["v1", "environments", _, "link"]) => Err(UNSUPPORTED),
         _ => Err(NOT_FOUND),
     };
+    let output_route = matches!(segments.as_slice(), ["v1", "jobs", _, "output"]);
     match result {
-        Ok((status, body)) => respond(status, &body),
+        Ok((status, body)) => {
+            let mut response = respond(status, &body);
+            if output_route {
+                // Job output must not sit in a shared or persistent cache.
+                response
+                    .headers_mut()
+                    .insert(CACHE_CONTROL, hyper::header::HeaderValue::from_static("no-store"));
+            }
+            response
+        }
         Err(e) => error(&e),
     }
 }
@@ -223,7 +241,7 @@ struct SecretBody {
     host_path: String,
 }
 
-async fn submit(state: &State, client: &Client, req: Request<Incoming>) -> Reply {
+async fn submit(state: &Arc<State>, client: &Client, req: Request<Incoming>) -> Reply {
     let bytes = Limited::new(req.into_body(), MAX_BODY)
         .collect()
         .await
@@ -301,6 +319,13 @@ async fn submit(state: &State, client: &Client, req: Request<Incoming>) -> Reply
         }
         return Err(UNAVAILABLE);
     }
+    state.outputs.register(&done.job_id, &client.id);
+    state.outputs.track(tokio::spawn(output::collect(
+        Arc::clone(state),
+        done.job_id.clone(),
+        done.attach_token.clone(),
+        client.id.clone(),
+    )));
     Ok((StatusCode::ACCEPTED, json!({"job_id": done.job_id, "state": "pending"})))
 }
 
