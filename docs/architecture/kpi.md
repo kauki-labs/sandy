@@ -352,6 +352,23 @@ Whether a restart stops the VM that a killed host process left behind ([`run-pla
 | ---- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------ | ------------------------------ |
 | KSU1 | A failing setup blocks READY | A failing `sandy.setup` step leaves no `SANDY-READY` and the run fails, on qemu and vfkit; a passing step reaches READY. | not run; live test not written |
 
+## Daemon-minted credentials (#481)
+
+A job's forge credential minted by sandyd ([`sandyd.md`](../decisions/sandyd.md) decision 34). Tier-2 rows
+drive the real Submit handler and host-executor connection over `FakeProvider`. A live row (a real GitHub
+App token through sandyd and a local host-executor) is not written. Mid-run refresh is not built in sandyd
+(decision 34); the bracket's own renew is tier-2 tested in the lib.
+
+| #      | Capability             | Required behaviour                                                                                                                         | Proven by                                                                                                                                                                                                          | Status       |
+| ------ | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------ |
+| KCRED1 | Fail-closed mint       | A mint failure refuses the Submit with a named error; no row is written and no host receives a dispatch.                                   | `crates/sandyd/src/credential.rs::tests::a_mint_failure_refuses_the_submit_and_dispatches_nothing`                                                                                                                 | tier-2 green |
+| KCRED2 | Revoke on every end    | A cancel, a reported result, a dispatch that fails after the mint, and a host-executor disconnect each revoke and remove the file and dir. | `credential.rs::tests::{a_cancel_mid_run_revokes_and_removes_the_staged_file,a_finished_job_revokes_and_removes_the_staged_file,a_dispatch_failure_after_the_mint_revokes,an_executor_disconnect_mid_run_revokes}` | tier-2 green |
+| KCRED3 | Revoke failure         | A failed revoke is logged as a warning naming the job, and the staged file is still removed.                                               | `credential.rs::tests::a_revoke_failure_is_surfaced_and_the_staged_file_is_still_removed`, `crates/sandy/src/cred_bracket.rs::tests::a_revoke_failure_is_returned_and_the_file_is_still_removed`                   | tier-2 green |
+| KCRED4 | Local dispatch only    | A credentialed Submit with no host that shares the submitter's filesystem is refused, naming `credential` and #495, before any mint.       | `credential.rs::tests::a_credential_that_could_only_place_remotely_is_refused_and_nothing_is_minted`, `crates/sandy-cli/tests/daemon_e2e.rs::submit_with_a_credential_and_no_local_host_is_refused_by_the_daemon`  | tier-2 green |
+| KCRED5 | Token hygiene          | The token is absent from the sqlite store, the daemon log, and the `Dispatch` (which carries the path only).                               | `credential.rs::tests::the_token_never_reaches_the_store_the_logs_or_the_dispatch`, `cred_bracket.rs::tests::debug_output_never_carries_the_token`                                                                 | tier-2 green |
+| KCRED6 | Bounded provider calls | A mint that hangs past the bound fails closed and stages nothing; its late token is revoked.                                               | `cred_bracket.rs::tests::a_hung_mint_fails_closed_and_its_late_token_is_revoked`                                                                                                                                   | tier-2 green |
+| KCRED7 | Renew order            | A renew before expiry stages the new token over the file first, then revokes only the superseded one.                                      | `cred_bracket.rs::tests::a_renew_before_expiry_restages_the_new_token_then_revokes_the_old`                                                                                                                        | tier-2 green |
+
 ## Not yet a KPI
 
 Deferred capability with no live floor yet, so a reader does not mistake its

@@ -2349,3 +2349,65 @@ per-client authz of #596 stay open.
 
 **Set aside.** Writing the line after the change (a failed write would leave an unaudited change), and
 auditing in the broker (it would miss a client that talks to sandyd directly).
+
+## 34. A job's daemon-minted credential: local dispatch only, revoked on every terminal path (#481)
+
+**Context.** Owner decision 3 of the manifest-parity spec (`docs/design/manifest-parity/spec.md`) puts the
+credential bracket in the daemon: mint before boot, fail-closed, revoke on every terminal state. The
+escalation #490 approved a local-dispatch-only first step: a Submit that could only place remotely is
+refused, because no encrypted mesh transport carries a bearer token yet (#495).
+
+**Decision.**
+
+- `SubmitRequest` carries `credential` (field 8, a trust-root name) and `cred_capabilities` (field 9),
+  next to the #496 path fields, not inside the manifest. The escalation text said `JobManifest`; the
+  manifest has three encodings (`argv/v1`, `flake/v1`, the JSON `JobManifest`), all decoded by the
+  executor, and a trust-root name is a request to the daemon, like a path field (decision 21). Carrying
+  it outside the manifest needs no change to the encodings and keeps P2. `sandy daemon submit
+--credential NAME --cred-capability CAP` mirrors `sandy run`; a capability without a credential is
+  refused by the CLI and by sandyd.
+- A credential is a local-dispatch requirement: placement needs a host-executor that declared
+  `shares_submitter_filesystem`. With none, the Submit is refused with a message that names
+  `credential` and #495. This check runs before the mint, so nothing is minted.
+- sandyd mints after every other Submit-time refusal and before it writes the job row. It resolves the
+  trust root with `sandy::resolve_provider`, the same code as `sandy run`, and mints through
+  `sandy::CredentialBracket`, the reusable bracket in the `sandy` lib (#706 will reuse it for
+  environments). A mint failure refuses the Submit: no row, no dispatch.
+- The token is staged as `GITHUB_TOKEN` (`0600`), the name `sandy run` injects, in a fresh `0700`
+  `cred-*` dir under the sandy staging base. The `Dispatch` carries only that file's path, as one more
+  `secrets` entry. A Submit whose `secrets` already names `GITHUB_TOKEN` is refused.
+- Every terminal path calls `JobRegistry::release_credential`: a reported result, a cancel, a dispatch
+  that never reached its host, and a host-executor disconnect. It runs whatever the store transition
+  was, since the job is over on its host either way. It revokes on the blocking pool, removes the file
+  and the dir, and runs once. A revoke failure is a `tracing::warn` that names the job and the handle;
+  the job store has no column for it. A bracket that no job owns yet (a Submit refused after the mint)
+  revokes when it drops.
+- Every provider call runs under a bound (`sandy::CALL_DEADLINE` by default). A call that does not
+  return in time is a failure, and a mint or refresh that returns late is revoked by its worker thread.
+- The token is only in the staged file and in the provider's zeroizing `Minted`. It is never in the job
+  store, a log line, a `Dispatch` field other than the path, an error message or `Debug` output.
+
+**Not built: mid-run refresh.** The host-executor copies a secret file into the job's own secret dir
+once, when it stages the job (`sandy::stage_secrets`). It does not share the daemon's file live, as
+`sandy run` does through `RunSpec::secret_dir`. A daemon-side refresh would rewrite a file no job reads
+and then revoke the token the job holds. So sandyd does not schedule
+`CredentialBracket::renew_if_due`, and a job that outlives the provider's token (GitHub: one hour) loses
+forge access. The choices are an owner question on #481: accept the limit; refresh without revoking the
+superseded tokens until teardown; or carry a live secret dir in `Dispatch` so the executor shares it
+(a proto and executor change).
+
+**Known gaps.**
+
+- A sandyd crash or kill while a credentialed job runs leaves its token valid until the native expiry
+  (GitHub: one hour), and the staged file on disk until `sandy gc` sweeps stale `cred-*` dirs. No restart
+  sweep revokes it. The bracket exposes the lease handle so a later reconcile could. A clean shutdown
+  does not wait for revokes in flight either.
+- The host-executor must run as the daemon's uid to read the `0700` dir, as for any #496 path secret.
+- `sandy gc` can sweep a running job's `cred-*` dir once it is older than `MAX_TTL_SECS`, since nothing
+  heartbeats it. The executor copied the token at staging, so the job is not affected, and teardown
+  treats a missing file as removed.
+- The revoke runs after the terminal store transition, so a reader can see a terminal job while its
+  revoke is still in flight.
+
+**Set aside.** The credential inside the manifest bytes (three encodings to grow, and P2). Carrying the
+token to a remote host before #495 exists.
