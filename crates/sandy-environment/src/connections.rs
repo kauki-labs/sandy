@@ -185,8 +185,14 @@ fn group_holds_all(pgid: i32, inodes: &[u64]) -> Result<bool, String> {
         }
         match process_stat(&entry.path().join("stat")) {
             // A dead process holds nothing, and its descriptor table is not readable.
-            Some((state, group)) if group == pgid && !is_dead(state) => {}
-            _ => continue,
+            Ok(Some((state, group))) if group == pgid && !is_dead(state) => {}
+            // Gone, another group's, or dead: not the service's.
+            Ok(_) => continue,
+            // Out of descriptors or the like: this process may be the service's, so the answer is unknown.
+            Err(e) => {
+                unreadable = Some(format!("read {}: {e}", entry.path().join("stat").display()));
+                continue;
+            }
         }
         match std::fs::read_dir(entry.path().join("fd")) {
             Ok(fds) => {
@@ -200,7 +206,7 @@ fn group_holds_all(pgid: i32, inodes: &[u64]) -> Result<bool, String> {
             // The member may have died since its state was read: look again before calling the table unreadable.
             Err(_)
                 if process_stat(&entry.path().join("stat"))
-                    .is_none_or(|(state, group)| group != pgid || is_dead(state)) => {}
+                    .is_ok_and(|s| s.is_none_or(|(state, group)| group != pgid || is_dead(state))) => {}
             Err(e) => unreadable = Some(format!("read {}: {e}", entry.path().join("fd").display())),
         }
     }
@@ -216,10 +222,15 @@ fn group_holds_all(_pgid: i32, _inodes: &[u64]) -> Result<bool, String> {
     Err("process descriptors are read on Linux only".to_owned())
 }
 
-/// The state letter and process group of a `/proc/<pid>/stat` file, or `None` when it is gone or unparsable.
+/// The state letter and process group of a `/proc/<pid>/stat` file: `None` when it is gone or unparsable, an error
+/// when it cannot be read for another reason (so the caller cannot tell whether the process is the one it wants).
 #[cfg(target_os = "linux")]
-fn process_stat(stat: &std::path::Path) -> Option<(char, i32)> {
-    parse_stat(&std::fs::read_to_string(stat).ok()?)
+fn process_stat(stat: &std::path::Path) -> std::io::Result<Option<(char, i32)>> {
+    match std::fs::read_to_string(stat) {
+        Ok(text) => Ok(parse_stat(&text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// A zombie (`Z`) or a process being removed (`X`).
