@@ -93,6 +93,19 @@ The registry has tens of profiles and is read once. `resolve` is a linear scan, 
   (a later slice), not at parse time, because trust roots live on the host and the registry is portable.
 - `Capability` and `Scope` come from `sandy-api` unchanged.
 
+### Operator secret store (#705)
+
+A `service_secrets` name that no provider mints takes its value from `SANDY_SECRETS_DIR`: one file per name.
+`sandyd::operator_values::SecretStore` reads it and nothing else does.
+
+- Open: the directory is this user's and not group- or world-writable.
+- Read: the name must match `[A-Z][A-Z0-9_]{0,63}` before any path is built. The leaf is opened without
+  following a symlink and must be a regular file owned by this user with no group, other or execute bit,
+  at most 64 KiB. The buffer is sized once and zeroed on drop; a file that grows during the read is refused.
+- Errors name the secret, never the value, the path text of a bad name, or the OS message.
+- Not yet: staging on the environment's secret share at start and resume, and the registry check that a
+  minted name and a stored name do not clash. They need #704 and #706.
+
 ### Out of scope
 
 - Re-injection at start and resume, renewal over the agent link, revoke on stop and delete. They need #587.
