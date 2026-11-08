@@ -25,7 +25,7 @@
 use std::{
     path::Path,
     sync::{
-        Mutex, PoisonError,
+        Arc, Mutex, PoisonError,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -33,7 +33,10 @@ use std::{
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
-use crate::store::{StoreError, open_private_connection};
+use crate::{
+    audit::AuditLog,
+    store::{StoreError, open_private_connection},
+};
 
 /// An environment store failure.
 #[derive(Debug, thiserror::Error)]
@@ -245,6 +248,8 @@ pub struct EnvironmentStore {
     max_rows: Option<usize>,
     /// Set once a trusted-only backend runs: `create` then needs a `TRUSTED` submitter.
     trusted_only: AtomicBool,
+    /// The audit log the handler writes before a client's create, stop or delete (#596).
+    audit: Option<Arc<AuditLog>>,
 }
 
 /// A raw `environments` row, read before its `state` string is validated.
@@ -394,6 +399,7 @@ impl EnvironmentStore {
             conn: Mutex::new(conn),
             max_rows: None,
             trusted_only: AtomicBool::new(false),
+            audit: None,
         })
     }
 
@@ -406,6 +412,19 @@ impl EnvironmentStore {
     /// Whether [`EnvironmentStore::require_trusted_submitter`] was called.
     pub fn trusted_submitter_required(&self) -> bool {
         self.trusted_only.load(Ordering::Relaxed)
+    }
+
+    /// Write an audit line through `audit` before each client create, stop and delete.
+    #[must_use]
+    pub fn with_audit(mut self, audit: Arc<AuditLog>) -> Self {
+        self.audit = Some(audit);
+        self
+    }
+
+    /// The audit log, when one is configured.
+    #[must_use]
+    pub fn audit(&self) -> Option<&Arc<AuditLog>> {
+        self.audit.as_ref()
     }
 
     /// Cap the table at `max_rows` rows that are not `Deleted` (a `Failed` row

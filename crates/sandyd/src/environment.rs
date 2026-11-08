@@ -1567,4 +1567,106 @@ mod tests {
         }
         Ok(())
     }
+
+    // ---- the audit log (#596) ----
+
+    fn audited_store(dir: &std::path::Path) -> Result<(Arc<EnvironmentStore>, std::path::PathBuf)> {
+        let path = dir.join("audit.jsonl");
+        let log = crate::audit::AuditLog::open(&path)?;
+        Ok((
+            Arc::new(EnvironmentStore::open_in_memory()?.with_audit(Arc::new(log))),
+            path,
+        ))
+    }
+
+    fn lines(path: &std::path::Path) -> Result<Vec<serde_json::Value>> {
+        std::fs::read_to_string(path)?
+            .lines()
+            .map(|l| serde_json::from_str(l).context("an audit line is JSON"))
+            .collect()
+    }
+
+    fn trusted_create(key: &str) -> control_request::Op {
+        control_request::Op::CreateEnvironment(CreateEnvironmentRequest {
+            idempotency_key: key.to_owned(),
+            spec: Some(persistent()),
+            submitter_class: IsolationClass::Trusted.into(),
+        })
+    }
+
+    #[tokio::test]
+    async fn create_stop_and_delete_each_leave_one_audit_line_naming_the_environment() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (s, path) = audited_store(dir.path())?;
+        let Ok(control_response::Result::Environment(env)) = call(&s, trusted_create("k1")).await? else {
+            bail!("create must succeed");
+        };
+        s.mark_ready(&env.environment_id)?;
+        call(&s, stop(&env.environment_id)).await?.ok();
+        call(&s, delete(&env.environment_id)).await?.ok();
+        let entries = lines(&path)?;
+        let ops: Vec<_> = entries.iter().map(|e| e["operation"].as_str().unwrap_or("")).collect();
+        assert_eq!(ops, ["create", "stop", "delete"]);
+        for e in &entries {
+            assert_eq!(e["environment_id"], env.environment_id.as_str());
+            assert_eq!(e["submitter"], "trusted");
+            assert_eq!(e["outcome"], "attempted");
+            assert!(e["at"].as_i64().unwrap_or(0) > 0, "the line carries a unix time");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_replayed_create_and_a_refused_one_write_no_audit_line() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (s, path) = audited_store(dir.path())?;
+        call(&s, trusted_create("k1")).await?.ok();
+        call(&s, trusted_create("k1")).await?.ok();
+        let bad = control_request::Op::CreateEnvironment(CreateEnvironmentRequest {
+            idempotency_key: "k2".to_owned(),
+            spec: None,
+            submitter_class: IsolationClass::Trusted.into(),
+        });
+        assert_eq!(refused(&s, bad).await?, EnvironmentErrorCode::InvalidArgument);
+        assert_eq!(lines(&path)?.len(), 1, "only the first accepted create is audited");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_unwritable_audit_log_refuses_every_audited_operation_and_changes_nothing() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("audit.jsonl");
+        std::fs::write(&path, "")?;
+        let read_only = std::fs::File::open(&path)?;
+        let log = crate::audit::AuditLog::from_file(path, read_only);
+        let s = Arc::new(EnvironmentStore::open_in_memory()?.with_audit(Arc::new(log)));
+        assert_eq!(
+            refused(&s, trusted_create("k1")).await?,
+            EnvironmentErrorCode::Unavailable
+        );
+        assert!(s.list()?.is_empty(), "a create whose audit failed leaves no row");
+        let CreateOutcome::Created(row) =
+            s.create_for("k2", "env-0001", &persistent().encode_to_vec(), SPEC_ENCODING, true)?
+        else {
+            bail!("seed row");
+        };
+        s.mark_ready(&row.environment_id)?;
+        assert_eq!(
+            refused(&s, stop(&row.environment_id)).await?,
+            EnvironmentErrorCode::Unavailable
+        );
+        assert_eq!(
+            s.get(&row.environment_id)?.map(|r| r.state),
+            Some(EnvironmentState::Ready)
+        );
+        assert_eq!(
+            refused(&s, delete(&row.environment_id)).await?,
+            EnvironmentErrorCode::Unavailable
+        );
+        assert_eq!(
+            s.get(&row.environment_id)?.map(|r| r.state),
+            Some(EnvironmentState::Ready)
+        );
+        Ok(())
+    }
 }
