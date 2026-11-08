@@ -2303,7 +2303,54 @@ cursor with a client's stream, and every join counted by `join_for_attach` sends
 
 **Set aside.** Reusing `observer_cap`, and counting the collector as an attach.
 
-## 33. `SANDY_ENV_BACKEND=vm-qemu` composes the VM environment backend in `sandyd` (#587, C3b)
+## 33. An append-only audit log for client environment create, stop, cancel and delete (#596)
+
+**Context.** The environment lifecycle had no durable record of who changed what. #596 asks for an audit
+trail; the owner approved the first slice (create, stop, delete) and set the defaults: the log lives in
+sandyd's state directory, and the identity is the one sandyd already records.
+
+**Decision.**
+
+- `sandyd::audit::AuditLog` appends one JSON line per operation to `<db file name>.audit.jsonl` beside the
+  database (`sandyd.db.audit.jsonl` for the default `sandyd.db`), or to `SANDY_AUDIT_LOG`. Fields: `at` (unix
+  seconds), `operation` (`create`, `stop`, `cancel`, `delete`), `environment_id`, `submitter_class` (`trusted` or
+  `untrusted`) and `outcome`.
+- The log file is mode `0600`, opened append-only, synced after each line. A symlink, a FIFO or other file
+  that is not regular, a file with a second hard link, a file another user owns and a file with group or
+  other bits are refused, and
+  `sandyd` does not start when the log cannot be opened. A write that fails part way is cut back, so a
+  full disk leaves no fragment for the next line to join. If the cut back fails, every later line is
+  refused until a restart. A log that already ends in a cut-off line is refused at startup, so the
+  operator repairs it first. `SANDY_AUDIT_LOG` naming the database file is refused too.
+- The handler writes the line before it changes state and fails closed. If the write fails, the operation
+  is refused with `ENVIRONMENT_ERROR_CODE_UNAVAILABLE` (the broker already answers an unknown code with
+  `unavailable`) and nothing changes. A crash between the line and the change leaves a line for an
+  operation that did not run, so `outcome` is always `attempted`: the line says the operation was
+  requested, not that it applied.
+- The line is written once the handler knows the request is well formed and, for stop and delete, that the
+  row's state allows it. A replay of an accepted key, an invalid create, an unknown id, a stop of an
+  environment that is `Stopped`, `Failed` or `Deleted`, a cancel of one that is not `Provisioning` and a repeated delete write
+  nothing. The state is read outside the store's lock, so this holds for sequential requests: two
+  concurrent stops of one `Ready` environment both write a line and one is then refused. A stop of a
+  `Provisioning` environment is audited though it is refused: the driver makes it `Ready` on its own, so
+  the stop can still apply. A create that then meets the row
+  cap, or loses a race on its key, still leaves its line: only the store knows, and the line names an id
+  that never existed.
+- `submitter_class` is the isolation class sandyd stored for the environment's creator: the create
+  request's class, and the row's recorded class for stop and delete. It is not the caller's identity.
+  sandyd serves one user and has no per-client name on the control RPC, so the broker's client id is not in
+  the line. Carrying it needs a proto field. That is an open owner question on #596.
+
+**Not covered.** `resume`; and every change the daemon makes itself: the idle stop, the retention sweep
+and the launch driver. Log rotation: a rename by an external tool leaves sandyd appending to the old
+file until it restarts. One sandyd owns one log; two daemons on one file could cut back each other's
+line after a failed write. Quotas, the default `untrusted` class and the
+per-client authz of #596 stay open.
+
+**Set aside.** Writing the line after the change (a failed write would leave an unaudited change), and
+auditing in the broker (it would miss a client that talks to sandyd directly).
+
+## 34. `SANDY_ENV_BACKEND=vm-qemu` composes the VM environment backend in `sandyd` (#587, C3b)
 
 **Status:** accepted (design posted on #587). **Upholds:** INV-6, INV-11.
 

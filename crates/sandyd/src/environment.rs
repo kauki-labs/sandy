@@ -278,6 +278,43 @@ fn reply(record: EnvironmentRecord) -> Reply {
     Ok(control_response::Result::Environment(to_wire(record)?))
 }
 
+/// Write the audit line for `operation` before it applies. `None` means go on; `Some` is the
+/// refusal to return, because an operation that cannot be audited does not run (#596).
+async fn audit(store: &Arc<EnvironmentStore>, operation: &'static str, id: &str, trusted: bool) -> Option<Reply> {
+    let log = Arc::clone(store.audit()?);
+    let id = id.to_owned();
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+    let submitter = if trusted { "trusted" } else { "untrusted" };
+    let written = tokio::task::spawn_blocking(move || {
+        log.record(&crate::audit::AuditEntry {
+            at,
+            operation,
+            environment_id: &id,
+            submitter_class: submitter,
+        })
+    })
+    .await;
+    match written {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, operation, "the environment audit log could not be written; the operation was refused");
+            Some(refuse(
+                EnvironmentErrorCode::Unavailable,
+                "the audit log cannot be written, so the operation did not run",
+            ))
+        }
+        Err(e) => {
+            tracing::error!(error = %e, operation, "the environment audit task failed; the operation was refused");
+            Some(refuse(
+                EnvironmentErrorCode::Unavailable,
+                "the audit log cannot be written, so the operation did not run",
+            ))
+        }
+    }
+}
+
 async fn create(
     store: &Arc<EnvironmentStore>,
     key: String,
@@ -321,6 +358,9 @@ async fn create(
         return refuse(EnvironmentErrorCode::InvalidArgument, why);
     }
     let new_id = format!("env-{}", uuid::Uuid::new_v4().simple());
+    if let Some(refusal) = audit(store, "create", &new_id, trusted).await {
+        return refusal;
+    }
     let outcome = blocking(store, move |s| {
         s.create_for(&key, &new_id, &bytes, SPEC_ENCODING, trusted)
     })
@@ -477,6 +517,14 @@ async fn stop_or_resume(store: &Arc<EnvironmentStore>, id: String, stop: bool) -
             "an ephemeral environment lives for one task and cannot be stopped or resumed",
         );
     }
+    // Only a Ready environment can be stopped, but the driver moves Provisioning to Ready on its own,
+    // so a stop read as Provisioning can still apply. Any other state is refused and not audited.
+    if stop
+        && matches!(record.state, EnvironmentState::Provisioning | EnvironmentState::Ready)
+        && let Some(refusal) = audit(store, "stop", &id, record.submitter_trusted).await
+    {
+        return refusal;
+    }
     let key = id.clone();
     let (moved, needs) = if stop {
         (
@@ -496,6 +544,15 @@ async fn cancel(store: &Arc<EnvironmentStore>, id: String) -> Reply {
     if !id_ok(&id) {
         return bad_id();
     }
+    let Some(record) = fetch(store, &id).await? else {
+        return not_found(&id);
+    };
+    // Cancel ends a Provisioning environment in Deleted, so it is audited like a delete.
+    if record.state == EnvironmentState::Provisioning
+        && let Some(refusal) = audit(store, "cancel", &id, record.submitter_trusted).await
+    {
+        return refusal;
+    }
     let key = id.clone();
     let moved = blocking(store, move |s| s.cancel(&key)).await?;
     finish(
@@ -510,6 +567,15 @@ async fn cancel(store: &Arc<EnvironmentStore>, id: String) -> Reply {
 async fn delete(store: &Arc<EnvironmentStore>, id: String) -> Reply {
     if !id_ok(&id) {
         return bad_id();
+    }
+    let Some(record) = fetch(store, &id).await? else {
+        return not_found(&id);
+    };
+    // Deleting a deleted environment changes nothing, so an idempotent retry is not audited.
+    if record.state != EnvironmentState::Deleted
+        && let Some(refusal) = audit(store, "delete", &id, record.submitter_trusted).await
+    {
+        return refusal;
     }
     let key = id.clone();
     let moved = blocking(store, move |s| s.delete(&key)).await?;
@@ -1565,6 +1631,202 @@ mod tests {
                 "{class:?}: {reply:?}"
             );
         }
+        Ok(())
+    }
+
+    // ---- the audit log (#596) ----
+
+    fn audited_store(dir: &std::path::Path) -> Result<(Arc<EnvironmentStore>, std::path::PathBuf)> {
+        let path = dir.join("audit.jsonl");
+        let log = crate::audit::AuditLog::open(&path)?;
+        Ok((
+            Arc::new(EnvironmentStore::open_in_memory()?.with_audit(Arc::new(log))),
+            path,
+        ))
+    }
+
+    fn lines(path: &std::path::Path) -> Result<Vec<serde_json::Value>> {
+        std::fs::read_to_string(path)?
+            .lines()
+            .map(|l| serde_json::from_str(l).context("an audit line is JSON"))
+            .collect()
+    }
+
+    fn trusted_create(key: &str) -> control_request::Op {
+        control_request::Op::CreateEnvironment(CreateEnvironmentRequest {
+            idempotency_key: key.to_owned(),
+            spec: Some(persistent()),
+            submitter_class: IsolationClass::Trusted.into(),
+        })
+    }
+
+    #[tokio::test]
+    async fn create_stop_and_delete_each_leave_one_audit_line_naming_the_environment() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (s, path) = audited_store(dir.path())?;
+        let Ok(control_response::Result::Environment(env)) = call(&s, trusted_create("k1")).await? else {
+            bail!("create must succeed");
+        };
+        s.mark_ready(&env.environment_id)?;
+        assert_eq!(state_after(&s, stop(&env.environment_id)).await?, WireState::Stopped);
+        assert_eq!(state_after(&s, delete(&env.environment_id)).await?, WireState::Deleted);
+        let entries = lines(&path)?;
+        let ops: Vec<_> = entries.iter().map(|e| e["operation"].as_str().unwrap_or("")).collect();
+        assert_eq!(ops, ["create", "stop", "delete"]);
+        for e in &entries {
+            assert_eq!(e["environment_id"], env.environment_id.as_str());
+            assert_eq!(e["submitter_class"], "trusted");
+            assert_eq!(e["outcome"], "attempted");
+            assert!(e["at"].as_i64().unwrap_or(0) > 0, "the line carries a unix time");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_replayed_create_and_a_refused_one_write_no_audit_line() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (s, path) = audited_store(dir.path())?;
+        let Ok(control_response::Result::Environment(first)) = call(&s, trusted_create("k1")).await? else {
+            bail!("create must succeed");
+        };
+        let Ok(control_response::Result::Environment(replay)) = call(&s, trusted_create("k1")).await? else {
+            bail!("the replay must succeed");
+        };
+        assert_eq!(
+            first.environment_id, replay.environment_id,
+            "a replay returns the same environment"
+        );
+        let bad = control_request::Op::CreateEnvironment(CreateEnvironmentRequest {
+            idempotency_key: "k2".to_owned(),
+            spec: None,
+            submitter_class: IsolationClass::Trusted.into(),
+        });
+        assert_eq!(refused(&s, bad).await?, EnvironmentErrorCode::InvalidArgument);
+        assert_eq!(lines(&path)?.len(), 1, "only the first accepted create is audited");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_unwritable_audit_log_refuses_every_audited_operation_and_changes_nothing() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("audit.jsonl");
+        std::fs::write(&path, "")?;
+        let read_only = std::fs::File::open(&path)?;
+        let log = crate::audit::AuditLog::from_file(path, read_only);
+        let s = Arc::new(EnvironmentStore::open_in_memory()?.with_audit(Arc::new(log)));
+        assert_eq!(
+            refused(&s, trusted_create("k1")).await?,
+            EnvironmentErrorCode::Unavailable
+        );
+        assert!(s.list()?.is_empty(), "a create whose audit failed leaves no row");
+        let CreateOutcome::Created(row) =
+            s.create_for("k2", "env-0001", &persistent().encode_to_vec(), SPEC_ENCODING, true)?
+        else {
+            bail!("seed row");
+        };
+        s.mark_ready(&row.environment_id)?;
+        assert_eq!(
+            refused(&s, stop(&row.environment_id)).await?,
+            EnvironmentErrorCode::Unavailable
+        );
+        assert_eq!(
+            s.get(&row.environment_id)?.map(|r| r.state),
+            Some(EnvironmentState::Ready)
+        );
+        assert_eq!(
+            refused(&s, delete(&row.environment_id)).await?,
+            EnvironmentErrorCode::Unavailable
+        );
+        assert_eq!(
+            s.get(&row.environment_id)?.map(|r| r.state),
+            Some(EnvironmentState::Ready)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_stop_the_state_refuses_and_a_repeated_delete_write_no_audit_line() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (s, path) = audited_store(dir.path())?;
+        let Ok(control_response::Result::Environment(env)) = call(&s, trusted_create("k1")).await? else {
+            bail!("create must succeed");
+        };
+        s.mark_ready(&env.environment_id)?;
+        assert_eq!(state_after(&s, stop(&env.environment_id)).await?, WireState::Stopped);
+        // Already Stopped: a second stop is refused as an invalid state and writes no line.
+        assert_eq!(
+            refused(&s, stop(&env.environment_id)).await?,
+            EnvironmentErrorCode::InvalidState
+        );
+        assert_eq!(state_after(&s, delete(&env.environment_id)).await?, WireState::Deleted);
+        assert_eq!(state_after(&s, delete(&env.environment_id)).await?, WireState::Deleted);
+        let ops: Vec<_> = lines(&path)?
+            .iter()
+            .map(|e| e["operation"].as_str().unwrap_or("").to_owned())
+            .collect();
+        assert_eq!(
+            ops,
+            ["create", "stop", "delete"],
+            "no line for the refused second stop or the repeat delete"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_cancel_that_ends_a_provisioning_environment_is_audited_and_refused_when_unwritable() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (s, path) = audited_store(dir.path())?;
+        let Ok(control_response::Result::Environment(env)) = call(&s, trusted_create("k1")).await? else {
+            bail!("create must succeed");
+        };
+        assert_eq!(state_after(&s, cancel(&env.environment_id)).await?, WireState::Deleted);
+        assert_eq!(state_after(&s, cancel(&env.environment_id)).await?, WireState::Deleted);
+        let ops: Vec<_> = lines(&path)?
+            .iter()
+            .map(|e| e["operation"].as_str().unwrap_or("").to_owned())
+            .collect();
+        assert_eq!(ops, ["create", "cancel"], "one line for the cancel, none for its retry");
+
+        let dir = tempfile::tempdir()?;
+        let broken = dir.path().join("audit.jsonl");
+        std::fs::write(&broken, "")?;
+        let log = crate::audit::AuditLog::from_file(broken.clone(), std::fs::File::open(&broken)?);
+        let s = Arc::new(EnvironmentStore::open_in_memory()?.with_audit(Arc::new(log)));
+        let CreateOutcome::Created(row) =
+            s.create_for("k2", "env-0002", &persistent().encode_to_vec(), SPEC_ENCODING, true)?
+        else {
+            bail!("seed row");
+        };
+        assert_eq!(
+            refused(&s, cancel(&row.environment_id)).await?,
+            EnvironmentErrorCode::Unavailable
+        );
+        assert_eq!(
+            s.get(&row.environment_id)?.map(|r| r.state),
+            Some(EnvironmentState::Provisioning)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_stop_of_a_provisioning_environment_is_audited_because_it_may_be_ready_by_the_time_it_applies()
+    -> Result<()> {
+        // The driver moves Provisioning to Ready on its own, between the handler's read and the
+        // store's transition. A stop read as Provisioning can therefore still apply.
+        let dir = tempfile::tempdir()?;
+        let (s, path) = audited_store(dir.path())?;
+        let Ok(control_response::Result::Environment(env)) = call(&s, trusted_create("k1")).await? else {
+            bail!("create must succeed");
+        };
+        assert_eq!(
+            refused(&s, stop(&env.environment_id)).await?,
+            EnvironmentErrorCode::InvalidState
+        );
+        let ops: Vec<_> = lines(&path)?
+            .iter()
+            .map(|e| e["operation"].as_str().unwrap_or("").to_owned())
+            .collect();
+        assert_eq!(ops, ["create", "stop"]);
         Ok(())
     }
 }

@@ -38,7 +38,7 @@ use common::{guest_flake, require_live};
 const PROVISION_SECS: u64 = 900;
 
 /// Stops the daemon with SIGTERM first and SIGKILL as a fallback, then kills the qemu it started, so a failure
-/// leaves no orphan (a killed daemon leaves its VM running, decision 33). Only a qemu that was a direct child of
+/// leaves no orphan (a killed daemon leaves its VM running, decision 34). Only a qemu that was a direct child of
 /// this daemon is killed, matched by pid and start time: the host is shared, and another session's VM must survive.
 struct Daemon(Child);
 

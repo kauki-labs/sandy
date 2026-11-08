@@ -629,9 +629,9 @@ owner.
 - A level-triggered `EnvironmentDriver` converges the boxes an `EnvironmentBackend` runs to the rows: launch, probe to `Ready`, fail on a failed probe or a timeout, and kill any box that no live row names. It is also the restart reconciler (decision 28).
 - An opt-in, trusted-only process backend (`SANDY_ENV_BACKEND=process-insecure`, decision 29) runs the service as a host process group with a cleared environment and no isolation. A failed group kill keeps the entry so a later kill retries.
 - An idle-stop lease (decision 30) stops a `Ready` environment with no owner-visible use or backend-reported connection (#645) for `SANDY_ENV_IDLE_TIMEOUT_SECS`; off by default.
-- The VM backend (decision 31) holds one agent-mode `VmBackend::run` per environment. `SANDY_ENV_BACKEND=vm-qemu` (decision 33, Linux only) wires it into `sandyd` with an agent-link relay and a loopback bridge that makes the environment Ready. A Ready VM environment cannot be linked yet: pairing in VM mode has no owner (#590).
+- The VM backend (decision 31) holds one agent-mode `VmBackend::run` per environment. `SANDY_ENV_BACKEND=vm-qemu` (decision 34, Linux only) wires it into `sandyd` with an agent-link relay and a loopback bridge that makes the environment Ready. A Ready VM environment cannot be linked yet: pairing in VM mode has no owner (#590).
 
-**KPI:** rows KENV1 to KENV19 in [`kpi.md`](kpi.md).
+**KPI:** rows KENV1 to KENV20 in [`kpi.md`](kpi.md).
 
 ## Testing: integration vs end-to-end
 

@@ -169,30 +169,56 @@ fn an_unknown_or_killed_environment_is_not_running_and_kill_is_idempotent() -> R
     Ok(())
 }
 
-/// The counter in `beat` advances while its writer lives.
-///
-/// The writer truncates and rewrites the file every 20 ms, so any single read can see it empty. Every read here
-/// retries until it gets a number, and the file is compared as numbers, so a read inside the truncation window is
-/// never mistaken for a dead writer.
-fn is_beating(beat: &Path) -> bool {
-    let read_count = |within: Duration| -> Option<u64> {
-        let deadline = Instant::now() + within;
-        loop {
-            if let Some(n) = std::fs::read_to_string(beat).ok().and_then(|s| s.trim().parse().ok()) {
-                return Some(n);
-            }
-            if Instant::now() >= deadline {
-                return None;
-            }
-            std::thread::sleep(Duration::from_millis(5));
+/// The counter in `beat` changes within `window`, once the writer has written at all.
+fn advances_within(beat: &Path, window: Duration) -> bool {
+    let read = || std::fs::read_to_string(beat).unwrap_or_default();
+    // A freshly started writer may not have written yet, most of all on a loaded host. The
+    // writer truncates before it writes, so keep the first non-empty read rather than re-read.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut first = read();
+    while first.is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        first = read();
+    }
+    let deadline = Instant::now() + window;
+    while !first.is_empty() && Instant::now() < deadline {
+        if read() != first {
+            return true;
         }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
+/// The counter in `beat` advances while its writer lives. A starved writer gets 3 s, not one tick.
+fn is_beating(beat: &Path) -> bool {
+    advances_within(beat, Duration::from_secs(3))
+}
+
+/// The counter in `beat` stays put for a short window. A survivor starved past it slips through
+/// as a false pass, so pair this with an `is_beating` check before the event.
+fn has_stopped(beat: &Path) -> bool {
+    !advances_within(beat, Duration::from_millis(250))
+}
+
+#[test]
+fn a_writer_starved_past_one_tick_still_reads_as_beating() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let beat = dir.path().join("slow.beat");
+    std::fs::write(&beat, "1")?;
+    let writer = {
+        let beat = beat.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(700));
+            std::fs::write(&beat, "2")
+        })
     };
-    // A freshly started writer may not have written yet, most of all on a loaded host.
-    let Some(first) = read_count(Duration::from_secs(3)) else {
-        return false;
-    };
-    std::thread::sleep(Duration::from_millis(250));
-    read_count(Duration::from_secs(1)).is_some_and(|later| later > first)
+    assert!(
+        is_beating(&beat),
+        "a live writer starved for 700 ms must still read as beating"
+    );
+    writer.join().ok().context("the writer thread panicked")??;
+    Ok(())
 }
 
 #[test]
@@ -207,7 +233,7 @@ fn kill_ends_the_whole_process_group_including_children() -> Result<()> {
     b.kill("env-1")?;
     std::thread::sleep(Duration::from_millis(300));
     assert!(
-        !is_beating(&beat),
+        has_stopped(&beat),
         "the child must stop beating once its group is killed"
     );
     Ok(())
@@ -224,7 +250,7 @@ fn dropping_the_backend_kills_every_environment() -> Result<()> {
     assert!(is_beating(&beat));
     drop(b);
     std::thread::sleep(Duration::from_millis(300));
-    assert!(!is_beating(&beat), "a graceful exit must not leave the service running");
+    assert!(has_stopped(&beat), "a graceful exit must not leave the service running");
     assert!(!env_dir(state.path(), "env-1").exists());
     Ok(())
 }
@@ -389,7 +415,7 @@ fn a_new_backend_kills_the_orphan_process_group_of_a_stale_environment() -> Resu
     std::thread::sleep(Duration::from_millis(300));
     assert!(!dir.exists(), "the stale directory is removed");
     assert!(
-        !is_beating(&beat),
+        has_stopped(&beat),
         "the orphan's child must be dead: only a group kill stops it"
     );
     assert!(second.boxes()?.is_empty());
@@ -501,7 +527,7 @@ fn a_pair_command_that_hangs_is_killed_with_its_children_and_fails_the_environme
     assert_eq!(step, "pair");
     assert!(reason.contains("timed out"), "{reason}");
     std::thread::sleep(Duration::from_millis(300));
-    assert!(!is_beating(&beat), "the hung pair command's children must die with it");
+    assert!(has_stopped(&beat), "the hung pair command's children must die with it");
     b.kill("env-1")?;
     Ok(())
 }
