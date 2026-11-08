@@ -188,4 +188,15 @@ mod tests {
         assert!(AuditLog::open(&path).is_err(), "a FIFO is not a log file");
         Ok(())
     }
+
+    #[test]
+    fn a_hard_link_to_another_file_is_refused() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let first = dir.path().join("a.jsonl");
+        AuditLog::open(&first)?.record(&entry("env-1"))?;
+        let second = dir.path().join("b.jsonl");
+        std::fs::hard_link(&first, &second)?;
+        assert!(AuditLog::open(&second).is_err(), "a log with a second name is refused");
+        Ok(())
+    }
 }

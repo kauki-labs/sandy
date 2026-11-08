@@ -1751,4 +1751,40 @@ mod tests {
         );
         Ok(())
     }
+
+    #[tokio::test]
+    async fn a_cancel_that_ends_a_provisioning_environment_is_audited_and_refused_when_unwritable() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (s, path) = audited_store(dir.path())?;
+        let Ok(control_response::Result::Environment(env)) = call(&s, trusted_create("k1")).await? else {
+            bail!("create must succeed");
+        };
+        assert_eq!(state_after(&s, cancel(&env.environment_id)).await?, WireState::Deleted);
+        assert_eq!(state_after(&s, cancel(&env.environment_id)).await?, WireState::Deleted);
+        let ops: Vec<_> = lines(&path)?
+            .iter()
+            .map(|e| e["operation"].as_str().unwrap_or("").to_owned())
+            .collect();
+        assert_eq!(ops, ["create", "cancel"], "one line for the cancel, none for its retry");
+
+        let dir = tempfile::tempdir()?;
+        let broken = dir.path().join("audit.jsonl");
+        std::fs::write(&broken, "")?;
+        let log = crate::audit::AuditLog::from_file(broken.clone(), std::fs::File::open(&broken)?);
+        let s = Arc::new(EnvironmentStore::open_in_memory()?.with_audit(Arc::new(log)));
+        let CreateOutcome::Created(row) =
+            s.create_for("k2", "env-0002", &persistent().encode_to_vec(), SPEC_ENCODING, true)?
+        else {
+            bail!("seed row");
+        };
+        assert_eq!(
+            refused(&s, cancel(&row.environment_id)).await?,
+            EnvironmentErrorCode::Unavailable
+        );
+        assert_eq!(
+            s.get(&row.environment_id)?.map(|r| r.state),
+            Some(EnvironmentState::Provisioning)
+        );
+        Ok(())
+    }
 }
