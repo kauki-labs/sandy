@@ -37,12 +37,10 @@ use common::{guest_flake, require_live};
 /// A cold boot of the t3 guest plus its service; generous, and passed to the daemon as the provision timeout.
 const PROVISION_SECS: u64 = 900;
 
-/// Stops the daemon with SIGTERM first and SIGKILL as a fallback, then kills any qemu the test started, so a
-/// failure leaves no orphan (a killed daemon leaves its VM running, decision 33).
-struct Daemon {
-    child: Child,
-    qemu_before: BTreeSet<u32>,
-}
+/// Stops the daemon with SIGTERM first and SIGKILL as a fallback, then kills the qemu it started, so a failure
+/// leaves no orphan (a killed daemon leaves its VM running, decision 33). Only a qemu that was a direct child of
+/// this daemon is killed, matched by pid and start time: the host is shared, and another session's VM must survive.
+struct Daemon(Child);
 
 fn signal(name: &str, pid: u32) {
     let _ = Command::new("kill")
@@ -51,20 +49,39 @@ fn signal(name: &str, pid: u32) {
         .status();
 }
 
+/// `(parent pid, start time)` of a process, from `/proc/<pid>/stat`.
+fn parent_and_start(pid: u32) -> Option<(u32, u64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The command name may hold spaces and parentheses; the fields after it start past the last `)`.
+    let rest: Vec<&str> = stat.get(stat.rfind(')')? + 1..)?.split_whitespace().collect();
+    Some((rest.get(1)?.parse().ok()?, rest.get(19)?.parse().ok()?))
+}
+
 impl Drop for Daemon {
     fn drop(&mut self) {
-        signal("TERM", self.child.id());
+        let owned: Vec<(u32, u64)> = qemu_pids()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|pid| {
+                parent_and_start(pid)
+                    .filter(|(ppid, _)| *ppid == self.0.id())
+                    .map(|(_, t)| (pid, t))
+            })
+            .collect();
+        signal("TERM", self.0.id());
         let deadline = Instant::now() + Duration::from_secs(15);
-        while !matches!(self.child.try_wait(), Ok(Some(_))) {
+        while !matches!(self.0.try_wait(), Ok(Some(_))) {
             if Instant::now() > deadline {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
+                let _ = self.0.kill();
+                let _ = self.0.wait();
                 break;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        for pid in qemu_pids().unwrap_or_default().difference(&self.qemu_before) {
-            signal("KILL", *pid);
+        for (pid, start) in owned {
+            if parent_and_start(pid).is_some_and(|(_, t)| t == start) {
+                signal("KILL", pid);
+            }
         }
     }
 }
@@ -164,9 +181,8 @@ async fn a_vm_environment_becomes_ready_answers_http_and_leaves_nothing_after_de
     let tmp_before = sandy_tmp_entries();
     let dir = tempfile::tempdir().context("temp dir")?;
     let sock = dir.path().join("sandyd.sock");
-    let _daemon = Daemon {
-        qemu_before: qemu_before.clone(),
-        child: Command::new(sandyd_bin()?)
+    let _daemon = Daemon(
+        Command::new(sandyd_bin()?)
             .env("SANDY_SOCK", &sock)
             .env("SANDY_DB", dir.path().join("sandyd.db"))
             .env("SANDY_ENV_BACKEND", "vm-qemu")
@@ -180,7 +196,7 @@ async fn a_vm_environment_becomes_ready_answers_http_and_leaves_nothing_after_de
             .stdout(Stdio::null())
             .spawn()
             .context("spawn sandyd")?,
-    };
+    );
     wait_for_socket(&sock)?;
     let mut stream = UnixStream::connect(&sock).await.context("connect to sandyd")?;
 
