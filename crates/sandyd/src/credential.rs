@@ -26,6 +26,12 @@ use sandy::{CredentialBracket, DirFingerprint, Scope, SharedProvider, StagingTar
 /// --credential` injects.
 pub const CREDENTIAL_SECRET_NAME: &str = "GITHUB_TOKEN";
 
+/// The daemon's bound on one provider call (mint or revoke).
+pub const DAEMON_CALL_TIMEOUT: Duration = sandy::CALL_DEADLINE;
+
+/// The most credential releases that run at once.
+pub const MAX_CONCURRENT_RELEASES: usize = 8;
+
 /// Builds the provider and scope for a named credential. The production resolver
 /// is [`TrustRootResolver`]; a test injects a fake provider.
 pub trait CredentialResolver: Send + Sync {
@@ -88,6 +94,24 @@ impl JobCredentials {
     pub fn with_call_timeout(mut self, timeout: Duration) -> Self {
         self.call_timeout = timeout;
         self
+    }
+
+    /// The bound on each provider call.
+    #[must_use]
+    pub fn call_timeout(&self) -> Duration {
+        self.call_timeout
+    }
+
+    /// Run at most `max` releases at once.
+    #[must_use]
+    pub fn with_max_concurrent_releases(self, _max: usize) -> Self {
+        self
+    }
+
+    /// The live credential handle of `job_id`, if it holds one.
+    #[must_use]
+    pub fn handle(&self, job_id: &str) -> Option<sandy::CredentialHandle> {
+        self.lock_live().get(job_id).and_then(CredentialBracket::handle)
     }
 
     /// The number of jobs holding a live credential.
@@ -197,11 +221,16 @@ impl JobCredentials {
 mod tests {
     use std::{
         net::{IpAddr, SocketAddr},
-        sync::{Arc, OnceLock},
+        os::unix::fs::PermissionsExt,
+        sync::{
+            Arc, OnceLock,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{Duration, Instant},
     };
 
     use anyhow::Context;
+    use sandy::{CredError, CredentialHandle, CredentialProvider, Lease, Minted};
     use sandy_control_proto::{
         CancelRequest, ControlRequest, JobStatus, SubmitRequest, SubmitResponse, control_request, control_response,
     };
@@ -255,9 +284,74 @@ mod tests {
         })
     }
 
-    struct FakeResolver(Arc<FakeProvider>);
+    /// What a test reads back from its provider.
+    trait Observed: CredentialProvider + Send + Sync + 'static {
+        /// The handle id of every revoke call, in order.
+        fn revoked_ids(&self) -> Vec<String>;
+    }
 
-    impl CredentialResolver for FakeResolver {
+    impl Observed for FakeProvider {
+        fn revoked_ids(&self) -> Vec<String> {
+            self.revoked().into_iter().map(|h| h.id).collect()
+        }
+    }
+
+    /// A provider whose mints hand out distinct handles (`h0`, `h1`, ...), whose
+    /// mint and revoke can be slowed by real sleeps, and which records the peak
+    /// number of revokes running at once.
+    #[derive(Default)]
+    struct Scripted {
+        next: AtomicUsize,
+        mint_delay: Duration,
+        revoke_delay: Duration,
+        running_revokes: AtomicUsize,
+        peak_revokes: AtomicUsize,
+        revoked: Mutex<Vec<String>>,
+    }
+
+    impl Scripted {
+        fn peak_revokes(&self) -> usize {
+            self.peak_revokes.load(Ordering::SeqCst)
+        }
+    }
+
+    impl CredentialProvider for Scripted {
+        fn mint(&self, _scope: &Scope, ttl: Duration) -> Result<Minted, CredError> {
+            std::thread::sleep(self.mint_delay);
+            let i = self.next.fetch_add(1, Ordering::SeqCst);
+            Ok(Minted::new(
+                TOKEN.to_owned(),
+                std::time::SystemTime::now() + ttl,
+                CredentialHandle { id: format!("h{i}") },
+            ))
+        }
+
+        fn revoke(&self, lease: &Lease) -> Result<(), CredError> {
+            let now = self.running_revokes.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak_revokes.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(self.revoke_delay);
+            self.running_revokes.fetch_sub(1, Ordering::SeqCst);
+            self.revoked
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(lease.handle.id.clone());
+            Ok(())
+        }
+
+        fn refresh(&self, _lease: &Lease) -> Result<Minted, CredError> {
+            Err(CredError::Mint("the daemon never refreshes".to_owned()))
+        }
+    }
+
+    impl Observed for Scripted {
+        fn revoked_ids(&self) -> Vec<String> {
+            self.revoked.lock().unwrap_or_else(PoisonError::into_inner).clone()
+        }
+    }
+
+    struct FakeResolver<P>(Arc<P>);
+
+    impl<P: Observed> CredentialResolver for FakeResolver<P> {
         fn resolve(&self, _name: &str, _capabilities: &[String]) -> Result<(SharedProvider, Scope), String> {
             let provider: SharedProvider = self.0.clone();
             Ok((provider, Scope::default()))
@@ -265,11 +359,11 @@ mod tests {
     }
 
     /// A daemon's job-side state with a fake credential provider.
-    struct Daemon {
+    struct Daemon<P = FakeProvider> {
         store: Arc<JobStore>,
         registry: Arc<JobRegistry>,
         hosts: Arc<HostRegistry>,
-        provider: Arc<FakeProvider>,
+        provider: Arc<P>,
         staging: PathBuf,
         _tmp: tempfile::TempDir,
     }
@@ -282,13 +376,21 @@ mod tests {
         provider: FakeProvider,
         open_store: impl FnOnce(&std::path::Path) -> anyhow::Result<JobStore>,
     ) -> anyhow::Result<Daemon> {
+        daemon_custom(provider, |c| c.with_call_timeout(WAIT), open_store)
+    }
+
+    fn daemon_custom<P: Observed>(
+        provider: P,
+        configure: impl FnOnce(JobCredentials) -> JobCredentials,
+        open_store: impl FnOnce(&std::path::Path) -> anyhow::Result<JobStore>,
+    ) -> anyhow::Result<Daemon<P>> {
         captured_logs();
         let tmp = tempfile::tempdir().context("tempdir")?;
         let staging = tmp.path().join("staging");
         let provider = Arc::new(provider);
-        let credentials = JobCredentials::new(Arc::new(FakeResolver(Arc::clone(&provider))))
-            .with_staging_base(staging.clone())
-            .with_call_timeout(WAIT);
+        let credentials = configure(
+            JobCredentials::new(Arc::new(FakeResolver(Arc::clone(&provider)))).with_staging_base(staging.clone()),
+        );
         Ok(Daemon {
             store: Arc::new(open_store(tmp.path())?),
             registry: Arc::new(JobRegistry::new()?.with_credentials(credentials)),
@@ -310,8 +412,8 @@ mod tests {
     }
 
     /// Register a host directly (no wire), returning its dispatch channel.
-    fn register_host(
-        d: &Daemon,
+    fn register_host<P>(
+        d: &Daemon<P>,
         shares_submitter_filesystem: bool,
     ) -> anyhow::Result<tokio::sync::mpsc::Receiver<Dispatch>> {
         let allowlist = ExecutorAllowlist::new([(peer_ip()?, test_fp()?)]);
@@ -331,12 +433,19 @@ mod tests {
     /// Register a local host over a real wire connection served by
     /// `serve_host_executor`, returning the host's end of it.
     async fn connect_local_host(d: &Daemon) -> anyhow::Result<(tokio::io::DuplexStream, tokio::task::JoinHandle<()>)> {
+        connect_local_host_as(d, "host-1").await
+    }
+
+    async fn connect_local_host_as<P>(
+        d: &Daemon<P>,
+        host_id: &str,
+    ) -> anyhow::Result<(tokio::io::DuplexStream, tokio::task::JoinHandle<()>)> {
         let (mut client, server) = tokio::io::duplex(1 << 16);
         sandy_control_proto::write_frame(
             &mut client,
             &HostExecutorMessage {
                 op: Some(host_executor_message::Op::Register(Register {
-                    host_id: "host-1".to_owned(),
+                    host_id: host_id.to_owned(),
                     capabilities: Some(capabilities(true)),
                 })),
             },
@@ -386,7 +495,7 @@ mod tests {
         }
     }
 
-    async fn submit(d: &Daemon, request: ControlRequest) -> anyhow::Result<control_response::Result> {
+    async fn submit<P>(d: &Daemon<P>, request: ControlRequest) -> anyhow::Result<control_response::Result> {
         let response = handle(
             &d.store,
             &d.registry,
@@ -399,7 +508,7 @@ mod tests {
         response.result.context("a response carries a result")
     }
 
-    async fn submit_ok(d: &Daemon) -> anyhow::Result<SubmitResponse> {
+    async fn submit_ok<P>(d: &Daemon<P>) -> anyhow::Result<SubmitResponse> {
         match submit(d, submit_req(Some("gh-test"), Vec::new())).await? {
             control_response::Result::Submit(ok) => Ok(ok),
             other => anyhow::bail!("expected the Submit to succeed, got {other:?}"),
@@ -417,10 +526,16 @@ mod tests {
         let path = PathBuf::from(&secret.host_path);
         let staged = std::fs::read_to_string(&path).context("the staged token file is readable")?;
         anyhow::ensure!(staged == TOKEN, "the staged file holds the minted token");
+        let mode = |p: &std::path::Path| -> anyhow::Result<u32> {
+            Ok(std::fs::metadata(p).context("stat")?.permissions().mode() & 0o777)
+        };
+        anyhow::ensure!(mode(&path)? == 0o600, "the staged token file must be 0600");
+        let dir = path.parent().context("the token file has a dir")?;
+        anyhow::ensure!(mode(dir)? == 0o700, "the job's staging dir must be 0700");
         Ok(path)
     }
 
-    async fn cancel(d: &Daemon, submitted: &SubmitResponse) -> anyhow::Result<()> {
+    async fn cancel<P>(d: &Daemon<P>, submitted: &SubmitResponse) -> anyhow::Result<()> {
         let response = handle(
             &d.store,
             &d.registry,
@@ -445,19 +560,19 @@ mod tests {
     }
 
     /// Wait until the provider saw a revoke and `path` is gone.
-    async fn wait_revoked_and_removed(d: &Daemon, path: &std::path::Path) -> anyhow::Result<()> {
+    async fn wait_revoked_and_removed<P: Observed>(d: &Daemon<P>, path: &std::path::Path) -> anyhow::Result<()> {
         let dir_exists = || path.parent().is_some_and(std::path::Path::exists);
         let deadline = Instant::now() + WAIT;
-        while (d.provider.revoked().is_empty() || path.exists() || dir_exists()) && Instant::now() < deadline {
+        while (d.provider.revoked_ids().is_empty() || path.exists() || dir_exists()) && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        anyhow::ensure!(!d.provider.revoked().is_empty(), "the credential must be revoked");
+        anyhow::ensure!(!d.provider.revoked_ids().is_empty(), "the credential must be revoked");
         anyhow::ensure!(!path.exists(), "the staged token file must be removed");
         anyhow::ensure!(!dir_exists(), "the job's staging dir must be removed");
         Ok(())
     }
 
-    async fn wait_status(d: &Daemon, job_id: &str, want: JobStatus) -> anyhow::Result<()> {
+    async fn wait_status<P>(d: &Daemon<P>, job_id: &str, want: JobStatus) -> anyhow::Result<()> {
         let deadline = Instant::now() + WAIT;
         loop {
             let status = d.store.status(job_id)?;
@@ -487,6 +602,10 @@ mod tests {
         }
         assert!(dispatch_rx.try_recv().is_err(), "no dispatch may reach a host");
         assert!(d.store.list()?.is_empty(), "a refused Submit leaves no job row");
+        assert!(
+            std::fs::read_dir(&d.staging)?.next().is_none(),
+            "a failed mint leaves no staging dir"
+        );
         Ok(())
     }
 
@@ -732,6 +851,193 @@ mod tests {
             other => anyhow::bail!("a path-like credential name must be refused, got {other:?}"),
         }
         assert!(d.provider.mints().is_empty());
+        Ok(())
+    }
+
+    /// The daemon bounds each provider call far below the CLI's `CALL_DEADLINE`,
+    /// so a hung forge cannot hold blocking-pool threads for 25 minutes.
+    #[test]
+    fn the_daemon_bounds_provider_calls_between_30_and_60_seconds() {
+        assert!(
+            (Duration::from_secs(30)..=Duration::from_secs(60)).contains(&DAEMON_CALL_TIMEOUT),
+            "{DAEMON_CALL_TIMEOUT:?}"
+        );
+        let credentials = JobCredentials::new(Arc::new(TrustRootResolver));
+        assert_eq!(credentials.call_timeout(), DAEMON_CALL_TIMEOUT);
+    }
+
+    /// A mint that hangs past the daemon's bound refuses the Submit once the
+    /// bound passes, not when the provider returns.
+    #[tokio::test]
+    async fn a_hung_mint_refuses_the_submit_at_the_bound() -> anyhow::Result<()> {
+        let provider = Scripted {
+            mint_delay: Duration::from_secs(3),
+            ..Scripted::default()
+        };
+        let d = daemon_custom(
+            provider,
+            |c| c.with_call_timeout(Duration::from_millis(200)),
+            |_| Ok(JobStore::open_in_memory()?),
+        )?;
+        let _dispatch_rx = register_host(&d, true)?;
+        let started = Instant::now();
+        match submit(&d, submit_req(Some("gh-test"), Vec::new())).await? {
+            control_response::Result::Error(e) => assert!(e.message.contains("did not finish"), "{}", e.message),
+            other => anyhow::bail!("a hung mint must refuse the Submit, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert!(d.store.list()?.is_empty());
+        Ok(())
+    }
+
+    /// Releases queue behind the concurrency cap: none is skipped, and no more
+    /// than the cap revoke at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn releases_queue_behind_the_cap_and_none_is_skipped() -> anyhow::Result<()> {
+        let provider = Scripted {
+            revoke_delay: Duration::from_millis(150),
+            ..Scripted::default()
+        };
+        let d = daemon_custom(
+            provider,
+            |c| c.with_call_timeout(WAIT).with_max_concurrent_releases(1),
+            |_| Ok(JobStore::open_in_memory()?),
+        )?;
+        let credentials = d.registry.credentials().context("credentials configured")?;
+        for job in ["job-a", "job-b", "job-c"] {
+            let c = Arc::clone(credentials);
+            let bracket = tokio::task::spawn_blocking(move || c.mint("gh-test", &[]))
+                .await?
+                .map_err(|e| anyhow::anyhow!(e))?;
+            credentials.adopt(job, bracket);
+        }
+        for job in ["job-a", "job-b", "job-c"] {
+            credentials.release(job);
+        }
+        let deadline = Instant::now() + WAIT;
+        while d.provider.revoked_ids().len() < 3 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut revoked = d.provider.revoked_ids();
+        revoked.sort();
+        assert_eq!(revoked, vec!["h0", "h1", "h2"], "every release must revoke");
+        assert_eq!(d.provider.peak_revokes(), 1, "at most the cap may revoke at once");
+        Ok(())
+    }
+
+    /// A cancel revokes exactly the handle minted for that job, not another
+    /// job's.
+    #[tokio::test]
+    async fn a_cancel_revokes_the_handle_minted_for_that_job() -> anyhow::Result<()> {
+        let d = daemon_custom(
+            Scripted::default(),
+            |c| c.with_call_timeout(WAIT),
+            |_| Ok(JobStore::open_in_memory()?),
+        )?;
+        let mut dispatch_rx = register_host(&d, true)?;
+        let first = submit_ok(&d).await?;
+        let second = submit_ok(&d).await?;
+        for _ in 0..2 {
+            tokio::time::timeout(WAIT, dispatch_rx.recv())
+                .await
+                .context("timed out waiting for a dispatch")?
+                .context("dispatch channel closed")?;
+        }
+        let credentials = d.registry.credentials().context("credentials configured")?;
+        let first_handle = credentials
+            .handle(&first.job_id)
+            .context("first job holds a credential")?;
+        let second_handle = credentials
+            .handle(&second.job_id)
+            .context("second job holds a credential")?;
+        assert_ne!(first_handle, second_handle);
+
+        cancel(&d, &first).await?;
+        let deadline = Instant::now() + WAIT;
+        while d.provider.revoked_ids().is_empty() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(d.provider.revoked_ids(), vec![first_handle.id]);
+        assert_eq!(credentials.handle(&second.job_id), Some(second_handle));
+        Ok(())
+    }
+
+    /// A result for a job this host-executor was never dispatched does not
+    /// revoke that job's credential: one executor cannot end another's token.
+    #[tokio::test]
+    async fn a_result_for_a_job_not_in_flight_on_that_connection_does_not_revoke() -> anyhow::Result<()> {
+        let d = daemon(FakeProvider::returning(TOKEN))?;
+        let mut dispatch_rx = register_host(&d, true)?;
+        let submitted = submit_ok(&d).await?;
+        let dispatch = tokio::time::timeout(WAIT, dispatch_rx.recv())
+            .await
+            .context("timed out waiting for the dispatch")?
+            .context("dispatch channel closed")?;
+        let path = staged_token_path(&dispatch)?;
+
+        let (mut other, serve) = connect_local_host_as(&d, "host-2").await?;
+        sandy_control_proto::write_frame(
+            &mut other,
+            &HostExecutorMessage {
+                op: Some(host_executor_message::Op::Result(JobResult {
+                    job_id: submitted.job_id.clone(),
+                    booted: true,
+                    exit_code: Some(0),
+                    timed_out: false,
+                    transport_error: None,
+                    console: String::new(),
+                })),
+            },
+        )
+        .await?;
+        drop(other);
+        tokio::time::timeout(WAIT, serve).await??;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(d.provider.revoked().is_empty(), "a foreign result must not revoke");
+        assert!(path.exists(), "the staged file stays for the job's own host");
+        assert_eq!(d.registry.credentials().map(|c| c.live_count()), Some(1));
+        Ok(())
+    }
+
+    /// A store fault on the job insert, after the mint, fails the Submit and
+    /// revokes the credential no job owns.
+    #[tokio::test]
+    async fn a_store_fault_after_the_mint_revokes_the_credential() -> anyhow::Result<()> {
+        let d = daemon_with_store(FakeProvider::returning(TOKEN), |dir| {
+            let db = dir.join("jobs.sqlite");
+            let store = JobStore::open(&db)?;
+            rusqlite::Connection::open(&db)?.execute_batch(
+                "CREATE TRIGGER refuse_insert BEFORE INSERT ON jobs BEGIN SELECT RAISE(FAIL, 'injected'); END;",
+            )?;
+            Ok(store)
+        })?;
+        let _dispatch_rx = register_host(&d, true)?;
+        let outcome = handle(
+            &d.store,
+            &d.registry,
+            &d.hosts,
+            Some(forward_back()?),
+            Uuid::new_v4(),
+            submit_req(Some("gh-test"), Vec::new()),
+        )
+        .await;
+        assert!(outcome.is_err(), "a store fault fails the Submit: {outcome:?}");
+        assert_eq!(d.provider.mints().len(), 1, "the fault comes after the mint");
+        let staging_is_empty = || -> anyhow::Result<bool> { Ok(std::fs::read_dir(&d.staging)?.next().is_none()) };
+        let deadline = Instant::now() + WAIT;
+        while (d.provider.revoked().is_empty() || !staging_is_empty()?) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !d.provider.revoked().is_empty(),
+            "the unowned credential must be revoked"
+        );
+        assert!(staging_is_empty()?, "no staging dir may remain");
         Ok(())
     }
 
