@@ -127,7 +127,7 @@ paths:
       operationId: readJobOutput
       summary: Read the job's retained output by offset.
       description: >-
-        Polling alternative to the stream. The broker collects each accepted job's stdout and stderr (merged) into an in-memory buffer of at most 1 MiB per job, with the 16 MiB total split evenly over the configured clients. Over its share a client loses its own oldest finished job first, then the oldest bytes of its growing job. One client never evicts another's output. A job's buffer stays readable for 15 minutes after the job ends (SANDY_BROKER_OUTPUT_RETENTION_SECS, 1 second to 7 days), then the route answers not_found. The buffer is in memory only: a broker restart loses all retained output, and the route answers not_found for every job until new output arrives. After the job ends the broker keeps collecting until the data plane is quiet for 500 ms, or for 30 s at most, then sets done. Offsets are absolute byte positions from the start of the job's output. A client reads, then passes next_offset on its next call. An offset past the end is invalid_request. A job owned by another client is not_found. The broker runs at most 16 collectors per client and 64 in all; a job past the bound is accepted and its output starts to appear when a slot frees.
+        Polling alternative to the stream. The broker collects each accepted job's stdout and stderr (merged) into an in-memory buffer of at most 1 MiB per job, with the 16 MiB total split evenly over the configured clients. Over its share a client loses its own oldest finished job first, then the oldest bytes of its growing job. One client never evicts another's output. A job's buffer stays readable for 15 minutes after the job ends (SANDY_BROKER_OUTPUT_RETENTION_SECS, 1 second to 7 days), then the route answers not_found. The buffer is in memory only: a broker restart loses all retained output. Jobs submitted before the restart answer not_found for good; jobs submitted after it are found at once. After the job ends the broker keeps collecting until the data plane is quiet for 500 ms, or for 30 s at most, then sets done. The response is Cache-Control: no-store. Offsets are absolute byte positions from the start of the job's output. A client reads, then passes next_offset on its next call. An offset past the end is invalid_request. A job owned by another client is not_found. The broker runs at most 16 collectors per client and 64 in all; a job past the bound is accepted and its output starts to appear when a slot frees.
       parameters:
         - name: offset
           in: query
@@ -135,7 +135,7 @@ paths:
           schema: {type: integer, minimum: 0}
         - name: limit
           in: query
-          description: Most bytes to return. Default 65536. Clamped to 1..262144.
+          description: Most bytes to return. Default 65536. A value below 1, negative included, is raised to 1; above 262144 it is lowered to 262144. A non-integer is invalid_request.
           schema: {type: integer}
       responses:
         "200":
@@ -150,7 +150,7 @@ paths:
                   offset: {type: integer, description: "Absolute offset of the first byte of data. Greater than the requested offset when dropped is not 0."}
                   next_offset: {type: integer, description: "Offset to pass on the next call."}
                   dropped: {type: integer, description: "Bytes between the requested offset and offset that the cap discarded."}
-                  done: {type: boolean, description: "The broker has stopped collecting: the job ended. Read until next_offset stops advancing."}
+                  done: {type: boolean, description: "The broker has stopped collecting. Normally the job ended. With a fault it only means collection stopped and the job may still run: read the job status route for the lifecycle. Read until next_offset stops advancing."}
                   state: {type: string, description: "The job's terminal state, when done and the broker could read it."}
                   fault: {type: string, description: "When done, a fixed text saying output may be missing. One of: collector could not start; collector could not attach; job ended before the collector attached; data plane error; data plane closed; status unavailable; output still arriving when collection stopped (frames still flowed 30 s after the job ended)."}
         default: {$ref: "#/components/responses/Error"}

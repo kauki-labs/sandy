@@ -268,9 +268,12 @@ route over giving `sandy-mcp` a stream reader.
   `job ended before the collector attached`, `data plane error`, `data plane closed` (EOF: sandyd
   closes a collector only on a delivery fault), `status unavailable`, and `output still arriving
 when collection stopped` (frames still flowed 30 s after the job ended). Join retries are 10 s
-  apart.
-- Nothing is written to disk. A broker restart loses every buffer, and the route answers
-  `not_found` for jobs submitted before it. The OpenAPI text says this.
+  apart, and a failed join is retried the full five times even after the job ended, since sandyd
+  keeps the channel for a while. `done` with a `fault` means collection stopped, not that the
+  job finished; the job status route gives the lifecycle. Output responses carry `Cache-Control:
+no-store`. A `limit` below 1 is raised to 1.
+- Nothing is written to disk. A broker restart loses every buffer: the route answers
+  `not_found` for jobs submitted before it, for good, and finds jobs submitted after it at once. The OpenAPI text says this.
 
 **MCP.** `sandy-mcp` has no output tool. Raw job output returned through a tool would bypass the
 secret guard (O8). Owner decision, still open.
