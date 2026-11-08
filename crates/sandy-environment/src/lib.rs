@@ -10,9 +10,11 @@
 
 mod connections;
 mod lifecycle;
+mod probe;
 mod process;
 mod vm;
 
 pub use lifecycle::{GuardedBackend, RunGuard, RunGuards, guarded};
+pub use probe::{HttpServiceProbe, Registration};
 pub use process::{ProcessConfig, ProcessConfigError, ProcessEnvironmentBackend};
 pub use vm::{BackendFactory, HeldBackend, ServiceProbe, StopRequest, VmEnvironmentBackend, VmEnvironmentConfig};
