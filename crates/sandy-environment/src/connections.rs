@@ -180,10 +180,13 @@ fn group_holds_all(pgid: i32, inodes: &[u64]) -> Result<bool, String> {
     let mut unreadable = None;
     let procs = std::fs::read_dir("/proc").map_err(|e| format!("read /proc: {e}"))?;
     for entry in procs.flatten() {
-        if !entry.file_name().to_string_lossy().bytes().all(|b| b.is_ascii_digit())
-            || process_group_of(&entry.path().join("stat")) != Some(pgid)
-        {
+        if !entry.file_name().to_string_lossy().bytes().all(|b| b.is_ascii_digit()) {
             continue;
+        }
+        match process_stat(&entry.path().join("stat")) {
+            // A dead process holds nothing, and its descriptor table is not readable.
+            Some((state, group)) if group == pgid && !is_dead(state) => {}
+            _ => continue,
         }
         match std::fs::read_dir(entry.path().join("fd")) {
             Ok(fds) => {
@@ -194,6 +197,10 @@ fn group_holds_all(pgid: i32, inodes: &[u64]) -> Result<bool, String> {
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            // The member may have died since its state was read: look again before calling the table unreadable.
+            Err(_)
+                if process_stat(&entry.path().join("stat"))
+                    .is_none_or(|(state, group)| group != pgid || is_dead(state)) => {}
             Err(e) => unreadable = Some(format!("read {}: {e}", entry.path().join("fd").display())),
         }
     }
@@ -209,16 +216,26 @@ fn group_holds_all(_pgid: i32, _inodes: &[u64]) -> Result<bool, String> {
     Err("process descriptors are read on Linux only".to_owned())
 }
 
-/// The process group in a `/proc/<pid>/stat` file: the third field after the command, which is in parentheses and may
-/// itself hold spaces and parentheses.
+/// The state letter and process group of a `/proc/<pid>/stat` file, or `None` when it is gone or unparsable.
 #[cfg(target_os = "linux")]
-fn process_group_of(stat: &std::path::Path) -> Option<i32> {
-    parse_stat_group(&std::fs::read_to_string(stat).ok()?)
+fn process_stat(stat: &std::path::Path) -> Option<(char, i32)> {
+    parse_stat(&std::fs::read_to_string(stat).ok()?)
 }
 
+/// A zombie (`Z`) or a process being removed (`X`).
+#[cfg(target_os = "linux")]
+fn is_dead(state: char) -> bool {
+    matches!(state, 'Z' | 'X')
+}
+
+/// The state letter and process group in a `/proc/<pid>/stat` line: the fields after the command, which is in
+/// parentheses and may itself hold spaces and parentheses. The state comes first, then the parent pid, then the group.
 #[cfg(any(target_os = "linux", test))]
-fn parse_stat_group(text: &str) -> Option<i32> {
-    text.rsplit_once(')')?.1.split_whitespace().nth(2)?.parse().ok()
+fn parse_stat(text: &str) -> Option<(char, i32)> {
+    let mut fields = text.rsplit_once(')')?.1.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let group = fields.nth(1)?.parse().ok()?;
+    Some((state, group))
 }
 
 /// Runs `cmd` and returns its stdout, killing and reaping it after `timeout`.
@@ -334,10 +351,10 @@ mod tests {
     }
 
     #[test]
-    fn a_stat_line_names_its_process_group_even_when_the_command_holds_parentheses() {
-        assert_eq!(parse_stat_group("4242 (fake-t3) S 1 4242 4242 0 -1"), Some(4242));
-        assert_eq!(parse_stat_group("4243 (a) b) c (d) S 4242 4242 4242 0"), Some(4242));
-        assert_eq!(parse_stat_group("garbage"), None);
+    fn a_stat_line_names_its_state_and_group_even_when_the_command_holds_parentheses() {
+        assert_eq!(parse_stat("4242 (fake-t3) S 1 4242 4242 0 -1"), Some(('S', 4242)));
+        assert_eq!(parse_stat("4243 (a) b) c (d) Z 4242 4242 4242 0"), Some(('Z', 4242)));
+        assert_eq!(parse_stat("garbage"), None);
     }
 
     #[test]
@@ -346,6 +363,30 @@ mod tests {
                    168.1.2:3000\n";
         assert_eq!(lsof_dialable_pids(out), vec![100, 200]);
         assert!(lsof_dialable_pids("").is_empty());
+    }
+
+    /// A group member that exited and is not reaped yet (a zombie) holds no descriptors and its `/proc/<pid>/fd` is
+    /// not readable. That is a dead process, not a table that cannot be read: it holds nothing and is skipped (#637).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_zombie_in_the_group_holds_nothing_and_is_not_an_error() -> anyhow::Result<()> {
+        use std::os::unix::process::CommandExt;
+
+        let mut child = Command::new("true").process_group(0).spawn()?;
+        let pid = i32::try_from(child.id())?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // `try_wait` would reap it: poll the state instead.
+        while !std::fs::read_to_string(format!("/proc/{pid}/stat"))?
+            .rsplit_once(')')
+            .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
+        {
+            anyhow::ensure!(Instant::now() < deadline, "the child never became a zombie");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let held = group_holds_all(pid, &[u64::MAX]);
+        child.wait()?;
+        assert_eq!(held, Ok(false), "a zombie holds no socket");
+        Ok(())
     }
 
     #[test]

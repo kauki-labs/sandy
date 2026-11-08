@@ -444,17 +444,37 @@ impl EnvironmentBackend for ProcessEnvironmentBackend {
         // The port was chosen before the service started, so another process may hold it by now (#637): only the
         // service's own listener may answer for it. The lock is released: scanning the socket and process tables can
         // be slow and must not stall other calls.
-        match connections::listener_holder(port, pgid).map_err(BackendError::Transport)? {
+        // A service that exited while its table was read leaves nothing to read, and its listener may be the one a
+        // stale table row names: report the exit, not the read or a stranger.
+        let exited = || -> Option<Probe> {
+            let mut running = self.lock();
+            let status = running.get_mut(environment_id)?.child.try_wait().ok().flatten()?;
+            Some(Probe::Failed {
+                step: "process".to_owned(),
+                reason: format!("the service exited with {status}"),
+            })
+        };
+        let mut holder = connections::listener_holder(port, pgid);
+        // One stale row (a listener closed and rebound since the table was read) must not condemn a healthy
+        // service: only a second scan that agrees counts as a stranger.
+        if matches!(holder, Ok(connections::Holder::Other)) {
+            holder = connections::listener_holder(port, pgid);
+        }
+        let holder = match holder {
+            Ok(holder) => holder,
+            Err(e) => return exited().map_or(Err(BackendError::Transport(e)), Ok),
+        };
+        match holder {
             connections::Holder::Nobody => {
                 return Ok(Probe::Starting {
                     step: "boot".to_owned(),
                 });
             }
             connections::Holder::Other => {
-                return Ok(Probe::Failed {
+                return Ok(exited().unwrap_or_else(|| Probe::Failed {
                     step: "port".to_owned(),
                     reason: format!("another process holds port {port}, not the service"),
-                });
+                }));
             }
             connections::Holder::Group => {}
         }
