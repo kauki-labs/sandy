@@ -517,9 +517,10 @@ async fn stop_or_resume(store: &Arc<EnvironmentStore>, id: String, stop: bool) -
             "an ephemeral environment lives for one task and cannot be stopped or resumed",
         );
     }
-    // Only a Ready environment can be stopped: any other state is refused below, so it is not audited.
+    // Only a Ready environment can be stopped, but the driver moves Provisioning to Ready on its own,
+    // so a stop read as Provisioning can still apply. Any other state is refused and not audited.
     if stop
-        && record.state == EnvironmentState::Ready
+        && matches!(record.state, EnvironmentState::Provisioning | EnvironmentState::Ready)
         && let Some(refusal) = audit(store, "stop", &id, record.submitter_trusted).await
     {
         return refusal;
@@ -1750,7 +1751,9 @@ mod tests {
         let Ok(control_response::Result::Environment(env)) = call(&s, trusted_create("k1")).await? else {
             bail!("create must succeed");
         };
-        // Still Provisioning: a stop is refused as an invalid state.
+        s.mark_ready(&env.environment_id)?;
+        assert_eq!(state_after(&s, stop(&env.environment_id)).await?, WireState::Stopped);
+        // Already Stopped: a second stop is refused as an invalid state and writes no line.
         assert_eq!(
             refused(&s, stop(&env.environment_id)).await?,
             EnvironmentErrorCode::InvalidState
@@ -1763,8 +1766,8 @@ mod tests {
             .collect();
         assert_eq!(
             ops,
-            ["create", "delete"],
-            "no line for the refused stop or the repeat delete"
+            ["create", "stop", "delete"],
+            "no line for the refused second stop or the repeat delete"
         );
         Ok(())
     }

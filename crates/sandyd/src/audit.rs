@@ -4,7 +4,7 @@
 use std::{
     fs::File,
     io::Write,
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     sync::{Mutex, PoisonError},
 };
@@ -39,7 +39,14 @@ pub struct AuditEntry<'a> {
 /// An append-only audit file.
 pub struct AuditLog {
     path: PathBuf,
-    file: Mutex<File>,
+    state: Mutex<State>,
+}
+
+struct State {
+    file: File,
+    /// Set when a failed write could not be cut back: a fragment may sit at the end of the file,
+    /// so every later line is refused until the operator restarts sandyd on a repaired log.
+    blocked: bool,
 }
 
 impl AuditLog {
@@ -54,6 +61,7 @@ impl AuditLog {
             source,
         };
         let file = std::fs::OpenOptions::new()
+            .read(true)
             .append(true)
             .create(true)
             .mode(0o600)
@@ -77,6 +85,18 @@ impl AuditLog {
                 "the audit log must be a regular file with one name, owned by this user, mode 0600",
             )));
         }
+        // A daemon killed during a write can leave a cut-off line. Appending to it would join two
+        // records into one that does not parse, so the operator repairs the file first.
+        if meta.len() > 0 {
+            let mut last = [0_u8; 1];
+            file.read_exact_at(&mut last, meta.len() - 1).map_err(io)?;
+            if last[0] != b'\n' {
+                return Err(io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "the audit log ends in an incomplete line; repair or move the file",
+                )));
+            }
+        }
         Ok(Self::from_file(path.to_path_buf(), file))
     }
 
@@ -85,25 +105,15 @@ impl AuditLog {
     pub fn from_file(path: PathBuf, file: File) -> Self {
         Self {
             path,
-            file: Mutex::new(file),
+            state: Mutex::new(State { file, blocked: false }),
         }
     }
 
-    #[allow(clippy::unused_self, reason = "red skeleton")]
     fn record_using(
         &self,
         entry: &AuditEntry<'_>,
         write: impl FnOnce(&mut File, &[u8]) -> std::io::Result<()>,
     ) -> Result<(), AuditError> {
-        let _ = write;
-        self.record(entry)
-    }
-
-    /// Append `entry` as one JSON line and sync it to disk.
-    ///
-    /// # Errors
-    /// [`AuditError::Io`] when the write or the sync fails.
-    pub fn record(&self, entry: &AuditEntry<'_>) -> Result<(), AuditError> {
         let line = serde_json::json!({
             "at": entry.at,
             "operation": entry.operation,
@@ -112,34 +122,47 @@ impl AuditLog {
             // The line is written before the change, so the change may still be refused.
             "outcome": "attempted",
         });
-        let mut file = self.file.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut bytes = line.to_string().into_bytes();
+        bytes.push(b'\n');
         let io = |source| AuditError::Io {
             path: self.path.clone(),
             source,
         };
-        let before = file.metadata().map_err(io)?.len();
-        let written = writeln_json(&mut file, &line).and_then(|()| file.sync_data());
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.blocked {
+            return Err(io(std::io::Error::other(
+                "the audit log is blocked after a failed write that could not be cut back",
+            )));
+        }
+        let before = state.file.metadata().map_err(io)?.len();
+        let written = write(&mut state.file, &bytes).and_then(|()| state.file.sync_data());
         if let Err(source) = written {
-            // A write that failed part way (a full disk) must not leave a fragment that the
-            // next line would be appended to. Best effort: the operation is refused either way.
-            let _ = file.set_len(before);
+            // A write that failed part way (a full disk) must not leave a fragment that the next
+            // line would be appended to. If the cut back fails too, refuse every later line.
+            if state.file.set_len(before).is_err() {
+                state.blocked = true;
+            }
             return Err(io(source));
         }
         Ok(())
     }
+
+    /// Append `entry` as one JSON line and sync it to disk.
+    ///
+    /// # Errors
+    /// [`AuditError::Io`] when the write or the sync fails.
+    pub fn record(&self, entry: &AuditEntry<'_>) -> Result<(), AuditError> {
+        self.record_using(entry, |file, bytes| file.write_all(bytes))
+    }
 }
 
-/// Whether `a` and `b` name one file.
+/// Whether `a` and `b` name one existing file, by device and inode.
 #[must_use]
 pub fn same_file(a: &Path, b: &Path) -> bool {
-    let _ = (a, b);
-    false
-}
-
-fn writeln_json(file: &mut File, line: &serde_json::Value) -> std::io::Result<()> {
-    let mut bytes = line.to_string().into_bytes();
-    bytes.push(b'\n');
-    file.write_all(&bytes)
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
 }
 
 #[cfg(test)]

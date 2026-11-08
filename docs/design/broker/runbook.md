@@ -58,7 +58,7 @@ broker and stores jobs and environments.
 4. Start sandyd: `SANDY_SOCK=/path/sandyd.sock SANDY_DB=/path/sandyd.db sandyd`. Without
    the variables it uses a `0700` directory it creates under the OS temp base.
    sandyd appends an audit line for each environment create, stop, cancel and delete to
-   `/path/sandyd.audit.jsonl` (or `SANDY_AUDIT_LOG`), mode `0600`. It does not start if it cannot open
+   `/path/sandyd.db.audit.jsonl` (or `SANDY_AUDIT_LOG`), mode `0600`. It does not start if it cannot open
    that file, and it refuses an environment operation it cannot audit. No rotation yet.
 5. Start the broker:
 
