@@ -81,7 +81,7 @@ impl SecretStore {
     /// # Errors
     ///
     /// [`SecretStoreError::Store`] when `dir` is a symlink (with or without a trailing slash), not a
-    /// directory, owned by another user, or writable by group or other.
+    /// directory, owned by another user, or has any group or other permission bit.
     pub fn open(dir: &Path) -> Result<Self, SecretStoreError> {
         // `Path::components` drops a trailing `/`, which would make the kernel follow a link in the leaf.
         let dir: PathBuf = dir.components().collect();
@@ -99,6 +99,17 @@ impl SecretStore {
                 }
             },
         })?;
+        // The directory check refuses group and other write. Listing the names is refused too.
+        let stat = rustix::fs::fstat(&held).map_err(|e| SecretStoreError::Store {
+            path: dir.clone(),
+            reason: format!("cannot be inspected: {}", std::io::Error::from(e).kind()),
+        })?;
+        if stat.st_mode & 0o077 != 0 {
+            return Err(SecretStoreError::Store {
+                path: dir,
+                reason: "must be mode 0700 or tighter: group and other could list the secret names".to_owned(),
+            });
+        }
         Ok(Self { dir: held })
     }
 
@@ -146,6 +157,10 @@ impl SecretStore {
             return Err(refused("not mode 0600 or tighter"));
         }
         let declared = meta.len();
+        // `echo new > KEY` truncates before it writes, so an empty file may be a rotation caught half way.
+        if declared == 0 {
+            return Err(refused("empty"));
+        }
         if declared > MAX_SECRET_BYTES {
             return Err(refused("larger than the 64 KiB cap"));
         }
