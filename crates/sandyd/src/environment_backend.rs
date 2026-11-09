@@ -16,7 +16,9 @@
 //! | `SANDY_ENV_IDLE_TIMEOUT_SECS` | stop a Ready environment with no owner-visible use or service connection for this long; default off |
 //! | `SANDY_ENV_PROVISION_TIMEOUT_SECS` | seconds before a probe that is not Ready fails the environment; default 120; `vm-qemu` and `vm-vfkit`: its boot budget plus 300, and a value below the boot budget is refused |
 //!
-//! `vm-qemu` and `vm-vfkit` read these as well (and only these of the process settings: the timeouts above):
+//! `vm-qemu` and `vm-vfkit` read these as well, and only the provision timeout of the settings above. They refuse
+//! `SANDY_ENV_IDLE_TIMEOUT_SECS` and the process-only settings (`SANDY_ENV_PROCESS_COMMAND`, `SANDY_ENV_PAIR_COMMAND`,
+//! `SANDY_ENV_STATE_DIR`, `SANDY_ENV_PASS_ENV`) rather than ignore them:
 //!
 //! | variable | meaning |
 //! | --- | --- |
@@ -136,6 +138,9 @@ pub enum EnvironmentBackendConfigError {
     /// A passed-through variable name is one the backend sets itself.
     #[error("SANDY_ENV_PASS_ENV name {0:?} is set by the backend and cannot be passed through")]
     ReservedName(String),
+    /// A setting the selected VM backend cannot honour.
+    #[error("{0} is not supported with a VM environment backend; unset it")]
+    UnsupportedWithVm(&'static str),
     /// The default state dir could not be prepared.
     #[error("state dir: {0}")]
     StateDir(String),
@@ -192,6 +197,23 @@ fn from_env_on(
         Some(raw) => Some(Duration::from_secs(positive_secs("SANDY_ENV_IDLE_TIMEOUT_SECS", raw)?)),
     };
     let mut provision_secs = explicit_provision.unwrap_or(120);
+    if vm.is_some() {
+        // The VM backend cannot see bridge clients, so an idle stop would end a Ready VM that is in use (#645), and
+        // the process settings have no VM counterpart: refuse each rather than drop it silently.
+        if idle_timeout.is_some() {
+            return Err(E::UnsupportedWithVm("SANDY_ENV_IDLE_TIMEOUT_SECS"));
+        }
+        for name in [
+            "SANDY_ENV_PASS_ENV",
+            "SANDY_ENV_PAIR_COMMAND",
+            "SANDY_ENV_PROCESS_COMMAND",
+            "SANDY_ENV_STATE_DIR",
+        ] {
+            if get(name).is_some_and(|v| !v.trim().is_empty()) {
+                return Err(E::UnsupportedWithVm(name));
+            }
+        }
+    }
     let (backend, template, service_port) = if let Some(wrap) = vm {
         let (settings, template, port) = vm_settings(&get)?;
         let boot = u64::from(settings.boot_timeout_secs);
@@ -810,5 +832,43 @@ mod tests {
             Some(Duration::from_secs(120))
         );
         Ok(())
+    }
+
+    #[test]
+    fn vm_qemu_refuses_the_idle_timeout_it_cannot_honour() {
+        let mut env = vm_base();
+        env.push(("SANDY_ENV_IDLE_TIMEOUT_SECS", "600"));
+        let err = parse_on("linux", &env).err();
+        assert!(
+            matches!(
+                err,
+                Some(EnvironmentBackendConfigError::UnsupportedWithVm(
+                    "SANDY_ENV_IDLE_TIMEOUT_SECS"
+                ))
+            ),
+            "{err:?}"
+        );
+        // Blank or unset stays off, as before.
+        env.pop();
+        env.push(("SANDY_ENV_IDLE_TIMEOUT_SECS", " "));
+        assert!(parse_on("linux", &env).is_ok());
+    }
+
+    #[test]
+    fn vm_qemu_refuses_process_only_settings_instead_of_dropping_them() {
+        for name in [
+            "SANDY_ENV_PASS_ENV",
+            "SANDY_ENV_PAIR_COMMAND",
+            "SANDY_ENV_PROCESS_COMMAND",
+            "SANDY_ENV_STATE_DIR",
+        ] {
+            let mut env = vm_base();
+            env.push((name, "X"));
+            let err = parse_on("linux", &env).err();
+            assert!(
+                matches!(&err, Some(EnvironmentBackendConfigError::UnsupportedWithVm(n)) if *n == name),
+                "{name}: {err:?}"
+            );
+        }
     }
 }

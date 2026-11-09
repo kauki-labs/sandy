@@ -220,6 +220,9 @@ pub fn backend(settings: &crate::environment_backend::VmSettings, rt: tokio::run
     use sandy_conn::dial::VsockDialer;
     use sandy_environment::guarded;
 
+    // Stop the VMs a killed daemon left behind before the driver can launch a second one for the same environment.
+    // `sweep_orphans` logs its own report and is safe beside a live daemon or CLI run.
+    let _ = QemuBackend::sweep_orphans();
     let probe = Arc::new(HttpServiceProbe::new());
     let per_env = {
         let probe = Arc::clone(&probe);
