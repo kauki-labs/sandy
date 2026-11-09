@@ -26,6 +26,13 @@ The operator writes the registry. It is a JSON file read at daemon start. It hol
 }
 ```
 
+`SANDY_PROFILES` names the registry file (#704). sandyd reads it once at start. The file must be a regular file
+of at most 1 MiB, owned by the daemon user, mode `0600`, and not a symlink. A file that fails any rule, or does
+not parse, stops the daemon with an error that names the path or the rule, never a value from the file. With
+`SANDY_PROFILES` unset there is no registry, and `CreateEnvironment` is refused with a message naming the setting.
+A create whose `profile` is not in the registry is refused as invalid before any row is written, and the reply
+does not repeat the name. A change to the file takes effect at the next restart.
+
 - `credential`: the name of a registered trust root (`sandy cred <provider> register`).
 - `targets`, `capabilities`: the `Scope` of the minted credential. The repository allow-list is `targets`.
 - `service_secrets`: the secret names exported to the service process. The default is the empty list.

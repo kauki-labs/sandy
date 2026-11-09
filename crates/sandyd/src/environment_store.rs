@@ -32,6 +32,7 @@ use std::{
 };
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
+use sandy::IdentityProfiles;
 
 use crate::{
     audit::AuditLog,
@@ -250,6 +251,8 @@ pub struct EnvironmentStore {
     trusted_only: AtomicBool,
     /// The audit log the handler writes before a client's create, stop or delete (#596).
     audit: Option<Arc<AuditLog>>,
+    /// The identity-profile registry a create's `profile` is checked against (#704); `None` is no registry.
+    profiles: Option<Arc<IdentityProfiles>>,
 }
 
 /// A raw `environments` row, read before its `state` string is validated.
@@ -400,6 +403,7 @@ impl EnvironmentStore {
             max_rows: None,
             trusted_only: AtomicBool::new(false),
             audit: None,
+            profiles: None,
         })
     }
 
@@ -419,6 +423,19 @@ impl EnvironmentStore {
     pub fn with_audit(mut self, audit: Arc<AuditLog>) -> Self {
         self.audit = Some(audit);
         self
+    }
+
+    /// Check each create's `profile` against `profiles` (#704). Without a registry every create is refused.
+    #[must_use]
+    pub fn with_profiles(mut self, profiles: Arc<IdentityProfiles>) -> Self {
+        self.profiles = Some(profiles);
+        self
+    }
+
+    /// The identity-profile registry, when one is configured.
+    #[must_use]
+    pub fn profiles(&self) -> Option<&Arc<IdentityProfiles>> {
+        self.profiles.as_ref()
     }
 
     /// The audit log, when one is configured.
