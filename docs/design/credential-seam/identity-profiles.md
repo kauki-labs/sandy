@@ -100,6 +100,26 @@ The registry has tens of profiles and is read once. `resolve` is a linear scan, 
   (a later slice), not at parse time, because trust roots live on the host and the registry is portable.
 - `Capability` and `Scope` come from `sandy-api` unchanged.
 
+### Operator secret store (#705)
+
+A `service_secrets` name that no provider mints takes its value from the operator's store directory: one file per name. The environment variable that names it
+is chosen when the store is wired (`SANDY_SECRETS_DIR` is taken: it is the job-side path of the staged secret share).
+`sandyd::operator_values::SecretStore` reads it and nothing else does.
+
+- Open: the directory is opened once, without following a symlink (a trailing `/` is dropped first), and
+  must be this user's and not group- or world-writable. The handle is kept: every read goes through it, so a
+  swap of the path after open is not followed.
+- Read: the name must match `[A-Z][A-Z0-9_]{0,63}` before any name is used. The leaf is opened relative to the
+  held directory without following a symlink and must be a regular file owned by this user, mode `0600` or
+  tighter (no group, other, execute, setuid, setgid or sticky bit), at most 64 KiB. The buffer is zeroed first,
+  sized once, read into directly and zeroed on drop. A file that grows or shrinks during the read is refused.
+- Errors name the secret, never the value, the text of a bad name, or the OS message.
+- Left to the staging slice: whether an empty file is an error and whether one trailing newline is trimmed
+  (`echo key > FILE` writes one). The store returns the file bytes as they are. A macOS ACL can grant access
+  without changing the mode bits, and the store does not check ACLs.
+- Not yet: staging on the environment's secret share at start and resume, and the registry check that a
+  minted name and a stored name do not clash. They need #704 and #706.
+
 ### Out of scope
 
 - Re-injection at start and resume, renewal over the agent link, revoke on stop and delete. They need #587.

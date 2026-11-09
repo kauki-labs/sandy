@@ -291,8 +291,8 @@ gone, it kills every recorded process that is still alive, waits for each to exi
   the next sweep finds the box. A directory the guest made read-only is made writable first (sandy owns these
   directories, symlinks are never followed), so a read-only module cache does not keep a box for good. A retained
   record is swept only after its owner has exited. Under `sandyd` the owner is `sandyd`, so nothing removes the
-  leftovers until `sandyd` has exited and a sweep runs: `sandy run` sweeps before it launches, and `sandyd` does not
-  call the sweep at start-up yet (separate work).
+  leftovers until `sandyd` has exited and a sweep runs: `sandy run` sweeps before it launches, and and `sandyd` sweeps once
+  when it builds the `vm-qemu` environment backend (decision 34 of `sandyd.md`).
 
 **Set aside.** Scanning command lines for qemu: it can hit a process we did not start. A process group kill (above).
 A daemon-lifetime lock on the staging base (above). Comparing the executable (above).

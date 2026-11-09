@@ -57,6 +57,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+zeroize.workspace = true
 
 # The `vm-qemu` environment backend (#587) boots qemu guests: Linux only (KVM, vhost-vsock).
 [target.'cfg(target_os = "linux")'.dependencies]
