@@ -2451,12 +2451,12 @@ refused, because no encrypted mesh transport carries a bearer token yet (#495).
 - The token is only in the staged file and in the provider's zeroizing `Minted`. It is never in the job
   store, a log line, a `Dispatch` field other than the path, an error message or `Debug` output. A job
   that prints its own `GITHUB_TOKEN` has it replaced by `[redacted]` in the stored console and in the
-  stored archive (`CredentialBracket::redact_bytes` reads the staged file, on a blocking task). Only the
+  stored archive (`TokenRedactor::redact_bytes`, from `CredentialBracket::redactor`, reads the staged file on a blocking task). Only the
   literal token is redacted: an encoded form (base64, URL or JSON escaping) or a copy cut in half by the
   console tail is not, and is a non-goal.
   The archive can arrive after a terminal path released the credential: for a job that had one, an archive
   with no live token to redact is dropped, not stored. The live attach stream (`attach_relay.rs`) serves the
-  raw output and archive to the job's owner, who already holds the token.
+  raw output and archive to the job's owner, who is the submitter that asked for the credential.
 
 **Not built: mid-run refresh.** The host-executor copies a secret file into the job's own secret dir
 once, when it stages the job (`sandy::stage_secrets`). It does not share the daemon's file live, as
