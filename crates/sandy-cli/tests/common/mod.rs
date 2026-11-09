@@ -6,7 +6,7 @@
 //! the `sandy_cli::live_target` lib module (re-exported here), shared with the
 //! `acceptance-vm` binary (#131 R4b) so both "boot a real guest on this host"
 //! consumers use one implementation.
-#![allow(dead_code)]
+#![allow(dead_code, unused_imports)]
 
 use std::{
     path::{Path, PathBuf},

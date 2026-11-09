@@ -26,6 +26,13 @@ The operator writes the registry. It is a JSON file read at daemon start. It hol
 }
 ```
 
+`SANDY_PROFILES` names the registry file (#704). sandyd reads it once at start. The file must be a regular file
+of at most 1 MiB, owned by the daemon user, mode `0600`, and not a symlink. A file that fails any rule, or does
+not parse, stops the daemon with an error that names the path or the rule, never a value from the file. With
+`SANDY_PROFILES` unset there is no registry, and `CreateEnvironment` is refused with a message naming the setting.
+A create whose `profile` is not in the registry is refused as invalid before any row is written, and the reply
+does not repeat the name. A change to the file takes effect at the next restart.
+
 - `credential`: the name of a registered trust root (`sandy cred <provider> register`).
 - `targets`, `capabilities`: the `Scope` of the minted credential. The repository allow-list is `targets`.
 - `service_secrets`: the secret names exported to the service process. The default is the empty list.
@@ -92,6 +99,29 @@ The registry has tens of profiles and is read once. `resolve` is a linear scan, 
 - The registry does not call a provider. A name in `credential` that has no trust root fails at mint time
   (a later slice), not at parse time, because trust roots live on the host and the registry is portable.
 - `Capability` and `Scope` come from `sandy-api` unchanged.
+
+### Operator secret store (#705)
+
+A `service_secrets` name that no provider mints takes its value from the operator's store directory: one file per name. The environment variable that names it
+is chosen when the store is wired (`SANDY_SECRETS_DIR` is taken: it is the job-side path of the staged secret share).
+`sandyd::operator_values::SecretStore` reads it and nothing else does.
+
+- Open: the directory is opened once, without following a symlink at its last component (a trailing `/` is
+  dropped first), and must be this user's with no group or other permission bit (mode `0700` or tighter), so
+  other users cannot list the secret names. Components above it resolve as the OS resolves them; the owner and
+  mode checks apply to the directory reached. The handle is kept: every read goes through it, so a swap of the
+  path after open is not followed.
+- Read: the name must match `[A-Z][A-Z0-9_]{0,63}` before any name is used. The leaf is opened relative to the
+  held directory without following a symlink and must be a regular file owned by this user, mode `0600` or
+  tighter (no group, other, execute, setuid, setgid or sticky bit), at most 64 KiB. The buffer is zeroed first,
+  sized once, read into directly and zeroed on drop. A file that grows or shrinks during the read is refused,
+  and so is an empty file. Replace a secret atomically (write a temporary file in the directory, then rename it):
+  `echo new > KEY` truncates first, and a read between the truncate and the write can see a prefix.
+- Errors name the secret, never the value, the text of a bad name, or the OS message.
+- Left to the staging slice: whether one trailing newline is trimmed (`echo key > FILE` writes one). The store returns the file bytes as they are. A macOS ACL can grant access
+  without changing the mode bits, and the store does not check ACLs.
+- Not yet: staging on the environment's secret share at start and resume, and the registry check that a
+  minted name and a stored name do not clash. They need #704 and #706.
 
 ### Out of scope
 

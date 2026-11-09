@@ -61,9 +61,12 @@ client_class=untrusted
 printf '[{"id":"smoke","token_sha256":"%s","max_isolation_class":"%s","profiles":["dev"]}]' \
   "$(sha256_hex "$token")" "$client_class" >"$work/clients.json"
 
-backend_env=()
+# sandyd refuses an environment whose profile is not in its registry (#704), and the file must be 0600.
+(umask 077 && printf '{"profiles":[{"name":"dev","credential":"smoke","targets":["o/r"],"capabilities":["read_code"]}]}' \
+  >"$work/profiles.json")
+backend_env=("SANDY_PROFILES=$work/profiles.json")
 if [ "$ready_mode" = 1 ]; then
-  backend_env=(
+  backend_env+=(
     SANDY_ENV_BACKEND=process-insecure
     "SANDY_ENV_PROCESS_COMMAND=python3 -m http.server {port} --bind 127.0.0.1"
     "SANDY_ENV_STATE_DIR=$work/environments"

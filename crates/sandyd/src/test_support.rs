@@ -42,3 +42,12 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
         self.clone()
     }
 }
+
+/// A registry naming the profiles the environment tests create with (#704).
+pub(crate) fn test_profiles() -> Arc<sandy::IdentityProfiles> {
+    let entry = |name: &str| {
+        format!(r#"{{"name":"{name}","credential":"github-main","targets":["o/r"],"capabilities":["read_code"]}}"#)
+    };
+    let text = format!(r#"{{"profiles":[{},{}]}}"#, entry("harness"), entry("other"));
+    Arc::new(sandy::IdentityProfiles::parse(&text).expect("the test registry is valid"))
+}

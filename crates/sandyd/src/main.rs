@@ -12,7 +12,7 @@ use sandyd::{
     build_rev::{log_startup, resolve_rev, version_line, wants_version},
     credential::{JobCredentials, TrustRootResolver},
     dispatch::JobRegistry,
-    environment_backend,
+    environment_backend::{self, BackendSettings},
     environment_driver::EnvironmentDriver,
     environment_store::{EnvironmentStore, RetentionPolicy},
     gate_spawn,
@@ -177,9 +177,28 @@ async fn main() {
         std::process::exit(1);
     }
 
+    // The identity-profile registry (#704) is read once; a file that cannot be trusted stops the daemon. Unset
+    // means no registry, and every environment create is then refused.
+    let profiles = match std::env::var_os("SANDY_PROFILES") {
+        None => None,
+        Some(path) => match sandyd::profiles::load(std::path::Path::new(&path)) {
+            Ok(profiles) => Some(Arc::new(profiles)),
+            Err(e) => {
+                tracing::error!(error = %e, "could not load SANDY_PROFILES; refusing to start");
+                std::process::exit(1);
+            }
+        },
+    };
+
     // Same file as the job store: one durable, 0600 database for the daemon.
     let environments = match EnvironmentStore::open(&db_path) {
-        Ok(environments) => Arc::new(environments.with_max_rows(max_environments).with_audit(audit)),
+        Ok(environments) => {
+            let environments = environments.with_max_rows(max_environments).with_audit(audit);
+            Arc::new(match profiles {
+                Some(profiles) => environments.with_profiles(profiles),
+                None => environments,
+            })
+        }
         Err(e) => {
             tracing::error!(error = %e, db = %db_path.display(), "could not open the environment store");
             std::process::exit(1);
@@ -956,25 +975,65 @@ fn start_environment_driver(environments: &Arc<EnvironmentStore>) -> Option<toki
             std::process::exit(1);
         }
     };
-    tracing::warn!(
-        "SANDY_ENV_BACKEND=process-insecure: environments run as host processes as this user with NO isolation; for \
-         trusted, local development only"
-    );
-    // Set before the driver starts: from here a create needs a TRUSTED submitter.
-    environments.require_trusted_submitter();
-    let backend = match sandy_environment::ProcessEnvironmentBackend::new(config.process) {
-        Ok(backend) => backend,
+    let backend: Arc<dyn sandy_api::environment::EnvironmentBackend + Send + Sync> = match config.backend {
+        BackendSettings::Process(process) => {
+            tracing::warn!(
+                "SANDY_ENV_BACKEND=process-insecure: environments run as host processes as this user with NO \
+                 isolation; for trusted, local development only"
+            );
+            // Set before the driver starts: from here a create needs a TRUSTED submitter.
+            environments.require_trusted_submitter();
+            match sandy_environment::ProcessEnvironmentBackend::new(process) {
+                Ok(backend) => Arc::new(backend),
+                Err(e) => {
+                    tracing::error!(error = %e, "could not start the process environment backend");
+                    std::process::exit(1);
+                }
+            }
+        }
+        BackendSettings::VmQemu(vm) => vm_environment_backend(&vm),
+        BackendSettings::VmVfkit(vm) => vfkit_environment_backend(&vm),
+    };
+    let driver = Arc::new(EnvironmentDriver::new(Arc::clone(environments), backend, config.driver));
+    Some(tokio::spawn(driver.run(environment_backend::DRIVER_INTERVAL)))
+}
+
+/// The qemu microVM environment backend. Only Linux can run one, and `from_env` refuses `vm-qemu` elsewhere.
+#[cfg(target_os = "linux")]
+fn vm_environment_backend(
+    vm: &environment_backend::VmSettings,
+) -> Arc<dyn sandy_api::environment::EnvironmentBackend + Send + Sync> {
+    Arc::new(sandyd::environment_vm::backend(vm, tokio::runtime::Handle::current()))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn vm_environment_backend(
+    _vm: &environment_backend::VmSettings,
+) -> Arc<dyn sandy_api::environment::EnvironmentBackend + Send + Sync> {
+    tracing::error!("SANDY_ENV_BACKEND=vm-qemu needs Linux");
+    std::process::exit(1);
+}
+
+/// The vfkit microVM environment backend. Only macOS can run one, and `from_env` refuses `vm-vfkit` elsewhere.
+#[cfg(target_os = "macos")]
+fn vfkit_environment_backend(
+    vm: &environment_backend::VmSettings,
+) -> Arc<dyn sandy_api::environment::EnvironmentBackend + Send + Sync> {
+    match sandyd::environment_vm::vfkit_backend(vm, tokio::runtime::Handle::current()) {
+        Ok(backend) => Arc::new(backend),
         Err(e) => {
-            tracing::error!(error = %e, "could not start the process environment backend");
+            tracing::error!(error = %e, "could not start the vfkit environment backend");
             std::process::exit(1);
         }
-    };
-    let driver = Arc::new(EnvironmentDriver::new(
-        Arc::clone(environments),
-        Arc::new(backend),
-        config.driver,
-    ));
-    Some(tokio::spawn(driver.run(environment_backend::DRIVER_INTERVAL)))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn vfkit_environment_backend(
+    _vm: &environment_backend::VmSettings,
+) -> Arc<dyn sandy_api::environment::EnvironmentBackend + Send + Sync> {
+    tracing::error!("SANDY_ENV_BACKEND=vm-vfkit needs macOS");
+    std::process::exit(1);
 }
 
 /// Parse `$SANDY_MAX_ENVIRONMENTS`: the row cap [`EnvironmentStore::with_max_rows`]

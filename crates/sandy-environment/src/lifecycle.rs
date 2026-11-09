@@ -1,8 +1,9 @@
 //! Ties what an environment holds beside its run (a host bridge and its probe registration) to the run itself
 //! (#587, slice C3b).
 //!
-//! The qemu backend reports the guest's CID to a hook after the guest has booted. The hook starts the bridge, and
-//! the bridge must stop when `run()` returns: the CID then belongs to nobody, and another VM can take it. A
+//! The qemu backend reports the guest's CID to a hook after the guest has booted (vfkit has no CID: the agent link
+//! coming up starts the bridge). The bridge must stop when `run()` returns: a CID then belongs to nobody, and another
+//! VM can take it. A
 //! [`GuardedBackend`] wraps the hypervisor backend the factory builds and drops the [`RunGuards`] it shares with
 //! the hook as soon as `run()` returns, however it ends. A hook that fires after that point has its guard dropped
 //! on the spot.
@@ -43,6 +44,23 @@ impl RunGuards {
             }
         };
         release(dropped); // outside the lock: a guard's drop may take other locks
+    }
+
+    /// Build a guard and hold it, but only while the run is up. `make` runs under the slot's lock, so a run that
+    /// ended before it could start never has `make` called: whatever `make` registers elsewhere (a probe address)
+    /// cannot outlive its run or be replaced by a late hook of an earlier one. Keep `make` short and free of
+    /// calls back into this slot. Returns whether `make` ran.
+    pub fn hold_if_open(&self, make: impl FnOnce() -> RunGuard) -> bool {
+        let (ran, dropped) = {
+            let mut slot = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            if slot.closed {
+                (false, None)
+            } else {
+                (true, slot.guard.replace(make()))
+            }
+        };
+        release(dropped);
+        ran
     }
 
     /// Close the slot and drop what it holds.

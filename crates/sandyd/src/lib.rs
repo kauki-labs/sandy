@@ -21,6 +21,7 @@ pub mod environment;
 pub mod environment_backend;
 pub mod environment_driver;
 pub mod environment_store;
+pub mod environment_vm;
 pub mod handler;
 pub mod host_conn;
 pub mod host_registry;
@@ -28,7 +29,9 @@ pub mod link_auth;
 pub mod mesh_accept;
 pub mod mesh_config;
 pub mod operator;
+pub mod operator_values;
 pub mod peer_cred;
+pub mod profiles;
 pub mod store;
 #[cfg(test)]
 mod test_support;
@@ -182,7 +185,7 @@ mod tests {
             GetEnvironmentRequest,
         };
 
-        let environments = Arc::new(EnvironmentStore::open_in_memory()?);
+        let environments = Arc::new(EnvironmentStore::open_in_memory()?.with_profiles(test_support::test_profiles()));
         let (client, server) = UnixStream::pair()?;
         let serving = tokio::spawn(serve_connection(
             server,
