@@ -713,6 +713,9 @@ pub async fn handle(
             }
             // The job now exists: it owns the credential until a terminal path
             // releases it.
+            // Whether this job's archive needs redacting is decided now, not when the
+            // archive arrives: it can arrive after a terminal path released the credential.
+            let credentialed = job_credential.is_some();
             if let (Some(bracket), Some(credentials)) = (job_credential, registry.credentials()) {
                 credentials.adopt(&job_id, bracket);
             }
@@ -749,7 +752,7 @@ pub async fn handle(
                 job_id.clone(),
                 store_for_archive,
                 dispatch::ARCHIVE_WAIT_BOUND,
-                registry.credentials().cloned(),
+                registry.credentials().filter(|_| credentialed).cloned(),
             ));
 
             registry.insert(job_id.clone(), job_channel);

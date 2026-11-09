@@ -17,6 +17,7 @@ use sandy_executor_proto::{
 use tokio::sync::mpsc;
 
 use crate::{
+    credential::Redaction,
     dispatch::JobRegistry,
     host_registry::{ExecutorAllowlist, HostRegistry, RegisterError, Registration},
     store::{JobStore, Transition},
@@ -506,9 +507,10 @@ async fn record_job_result(
     let transition = tokio::task::spawn_blocking(move || {
         // The staged token never reaches the stored console, whatever the job printed.
         let console = match &credentials {
-            Some(credentials) => {
-                String::from_utf8_lossy(&credentials.redact_bytes(&jid, console.into_bytes())).into_owned()
-            }
+            Some(credentials) => match credentials.redact_bytes(&jid, console.into_bytes()) {
+                Redaction::Redacted(bytes) | Redaction::NotHeld(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                Redaction::Unavailable => "[console withheld: the job's credential could not be redacted]".to_owned(),
+            },
             None => console,
         };
         store.finish(&jid, status, exit_code, &console)

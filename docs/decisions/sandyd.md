@@ -2454,6 +2454,9 @@ refused, because no encrypted mesh transport carries a bearer token yet (#495).
   stored archive (`CredentialBracket::redact_bytes` reads the staged file, on a blocking task). Only the
   literal token is redacted: an encoded form (base64, URL or JSON escaping) or a copy cut in half by the
   console tail is not, and is a non-goal.
+  The archive can arrive after a terminal path released the credential: for a job that had one, an archive
+  with no live token to redact is dropped, not stored. The live attach stream (`attach_relay.rs`) serves the
+  raw output and archive to the job's owner, who already holds the token.
 
 **Not built: mid-run refresh.** The host-executor copies a secret file into the job's own secret dir
 once, when it stages the job (`sandy::stage_secrets`). It does not share the daemon's file live, as

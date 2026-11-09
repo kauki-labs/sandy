@@ -526,7 +526,7 @@ mod tests {
     #[test]
     fn a_trust_root_name_that_is_a_path_is_refused() {
         let dir = std::env::temp_dir();
-        for name in ["../other", "/etc/passwd", "a/b", "a/", "a/.", "..", "."] {
+        for name in ["../other", "/etc/passwd", "a/b", "a/", "a/.", "..", ".", ""] {
             let err = resolve_provider(&dir, name, &[]).err().unwrap_or_default();
             assert!(err.contains("single file name"), "{name:?}: {err}");
         }

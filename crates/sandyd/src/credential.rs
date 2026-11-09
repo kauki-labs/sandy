@@ -62,6 +62,18 @@ impl CredentialResolver for TrustRootResolver {
     }
 }
 
+/// The outcome of redacting a job's staged token from some bytes.
+#[derive(Debug)]
+pub enum Redaction {
+    /// The token was replaced wherever it occurred.
+    Redacted(Vec<u8>),
+    /// The job holds no live credential (none minted, or already released), so
+    /// nothing could be redacted. Callers that must not store a token drop the bytes.
+    NotHeld(Vec<u8>),
+    /// The job holds a credential but its staged file could not be read.
+    Unavailable,
+}
+
 /// The daemon's credential configuration and the brackets of its live jobs.
 pub struct JobCredentials {
     resolver: Arc<dyn CredentialResolver>,
@@ -119,13 +131,18 @@ impl JobCredentials {
         self
     }
 
-    /// `bytes` with `job_id`'s staged token redacted, unchanged when the job holds
-    /// none. Blocking (reads the staged file): call it from a blocking task.
+    /// `bytes` with `job_id`'s staged token redacted. Blocking (reads the staged
+    /// file): call it from a blocking task. Reads the file after the live-map lock
+    /// is released.
     #[must_use]
-    pub fn redact_bytes(&self, job_id: &str, bytes: Vec<u8>) -> Vec<u8> {
-        match self.lock_live().get(job_id) {
-            Some(bracket) => bracket.redact_bytes(bytes),
-            None => bytes,
+    pub fn redact_bytes(&self, job_id: &str, bytes: Vec<u8>) -> Redaction {
+        let redactor = self.lock_live().get(job_id).map(CredentialBracket::redactor);
+        match redactor {
+            None => Redaction::NotHeld(bytes),
+            Some(redactor) => match redactor.redact_bytes(bytes) {
+                Some(redacted) => Redaction::Redacted(redacted),
+                None => Redaction::Unavailable,
+            },
         }
     }
 
@@ -1145,6 +1162,58 @@ mod tests {
         let archive = String::from_utf8(archive)?;
         assert!(!archive.contains(TOKEN), "archive: {archive:?}");
         assert!(archive.contains("[redacted]"), "archive: {archive:?}");
+        Ok(())
+    }
+
+    /// The archive can arrive after the job's result released the credential. With
+    /// no token left to redact it is dropped, never stored raw.
+    #[tokio::test]
+    async fn an_archive_that_arrives_after_the_release_is_dropped_not_stored_raw() -> anyhow::Result<()> {
+        let d = daemon(FakeProvider::returning(TOKEN))?;
+        let (mut client, serve) = connect_local_host(&d).await?;
+        let submitted = submit_ok(&d).await?;
+        let dispatch = read_dispatch(&mut client).await?;
+        let path = staged_token_path(&dispatch)?;
+        sandy_control_proto::write_frame(
+            &mut client,
+            &HostExecutorMessage {
+                op: Some(host_executor_message::Op::Result(JobResult {
+                    job_id: submitted.job_id.clone(),
+                    booted: true,
+                    exit_code: Some(0),
+                    timed_out: false,
+                    transport_error: None,
+                    console: "done\n".to_owned(),
+                })),
+            },
+        )
+        .await?;
+        wait_revoked_and_removed(&d, &path).await?;
+        anyhow::ensure!(
+            d.registry.credentials().map(|c| c.live_count()) == Some(0),
+            "precondition: the credential was released"
+        );
+
+        let job = d.registry.get(&submitted.job_id).context("job channel")?;
+        let agent = job.channel.join(&job.agent_cap)?;
+        job.channel
+            .post(
+                &agent,
+                Some(sandy_proto::MessageType::Output(sandy_proto::Output {})),
+                sandy_fabric_local::agent::ARCHIVE_TRANSCRIPT,
+                format!("$ echo $GITHUB_TOKEN\n{TOKEN}\n").into_bytes(),
+            )
+            .await?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let archive = d.store.archive(&submitted.job_id)?;
+        assert!(
+            archive
+                .as_deref()
+                .is_none_or(|a| !String::from_utf8_lossy(a).contains(TOKEN)),
+            "the raw token must not be stored: {archive:?}"
+        );
+        drop(client);
+        tokio::time::timeout(WAIT, serve).await??;
         Ok(())
     }
 

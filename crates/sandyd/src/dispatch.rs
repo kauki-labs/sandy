@@ -48,7 +48,7 @@ use sandy_proto::MessageType;
 use uuid::Uuid;
 
 use crate::{
-    credential::JobCredentials,
+    credential::{JobCredentials, Redaction},
     link_auth::{self, LinkAuthError, RemoteLink},
     store::JobStore,
 };
@@ -358,10 +358,22 @@ async fn find_and_persist_archive(
     let write_job_id = job_id.to_owned();
     let store = Arc::clone(store);
     // The agent archives the job's terminal log, which can hold the job's own
-    // `GITHUB_TOKEN` (#481): redact before it reaches the store.
+    // `GITHUB_TOKEN` (#481). For a credentialed job (`credentials` is `Some`)
+    // the archive is stored only once the token is redacted: the archive can
+    // arrive after the credential was released, and then it is dropped.
     match tokio::task::spawn_blocking(move || {
         let bytes = match &credentials {
-            Some(credentials) => credentials.redact_bytes(&write_job_id, bytes),
+            Some(credentials) => match credentials.redact_bytes(&write_job_id, bytes) {
+                Redaction::Redacted(bytes) => bytes,
+                Redaction::NotHeld(_) | Redaction::Unavailable => {
+                    tracing::warn!(
+                        job_id = write_job_id,
+                        "archive persister: dropped the transcript of a credentialed job, its token could not be \
+                         redacted"
+                    );
+                    return Ok(());
+                }
+            },
             None => bytes,
         };
         store.set_archive(&write_job_id, &bytes)

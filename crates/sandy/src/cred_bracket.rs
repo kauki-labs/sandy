@@ -72,6 +72,42 @@ impl std::fmt::Debug for CredentialBracket {
     }
 }
 
+/// Redacts a staged token from text. It reads the staged file each time, because
+/// nothing in memory holds the token.
+#[derive(Debug, Clone)]
+pub struct TokenRedactor {
+    token_path: PathBuf,
+}
+
+impl TokenRedactor {
+    /// `bytes` with every occurrence of the staged token replaced by `[redacted]`.
+    /// Blocking. `None` when the staged file cannot be read or holds no token:
+    /// the caller cannot tell the token is absent from `bytes`, so it must not
+    /// store them. Only the literal token is replaced: an encoded form (base64,
+    /// URL or JSON escaping) or a copy cut by a console tail is not.
+    #[must_use]
+    pub fn redact_bytes(&self, bytes: Vec<u8>) -> Option<Vec<u8>> {
+        use std::io::Read as _;
+        let mut token = Vec::new();
+        std::fs::File::open(&self.token_path)
+            .and_then(|f| f.take(64 * 1024).read_to_end(&mut token))
+            .ok()?;
+        let token = token.trim_ascii();
+        if token.is_empty() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut rest = bytes.as_slice();
+        while let Some(at) = rest.windows(token.len()).position(|w| w == token) {
+            out.extend_from_slice(&rest[..at]);
+            out.extend_from_slice(b"[redacted]");
+            rest = &rest[at + token.len()..];
+        }
+        out.extend_from_slice(rest);
+        Some(out)
+    }
+}
+
 impl CredentialBracket {
     /// Mint a credential for `scope` and stage it at `target`. The requested TTL
     /// is clamped to [`crate::MAX_TTL_SECS`]. Fail-closed: on any error nothing is
@@ -124,41 +160,13 @@ impl CredentialBracket {
         }
     }
 
-    /// `bytes` with every occurrence of the staged token replaced by `[redacted]`.
-    /// Reads the staged file (a token is a few hundred bytes at most), because the
-    /// bracket never holds the token. Blocking. A missing or unreadable file, or an
-    /// empty token, leaves `bytes` unchanged. Only the literal token is replaced:
-    /// an encoded form (base64, URL or JSON escaping) or a copy cut by a console
-    /// tail is not.
+    /// A handle that redacts this bracket's staged token, usable after the lock
+    /// that guards the bracket is released.
     #[must_use]
-    pub fn redact_bytes(&self, bytes: Vec<u8>) -> Vec<u8> {
-        use std::io::Read as _;
-        let mut token = Vec::new();
-        if std::fs::File::open(&self.token_path)
-            .and_then(|f| f.take(64 * 1024).read_to_end(&mut token))
-            .is_err()
-        {
-            return bytes;
+    pub fn redactor(&self) -> TokenRedactor {
+        TokenRedactor {
+            token_path: self.token_path.clone(),
         }
-        let token = token.trim_ascii();
-        if token.is_empty() {
-            return bytes;
-        }
-        let mut out = Vec::with_capacity(bytes.len());
-        let mut rest = bytes.as_slice();
-        while let Some(at) = rest.windows(token.len()).position(|w| w == token) {
-            out.extend_from_slice(&rest[..at]);
-            out.extend_from_slice(b"[redacted]");
-            rest = &rest[at + token.len()..];
-        }
-        out.extend_from_slice(rest);
-        out
-    }
-
-    /// [`Self::redact_bytes`] for text.
-    #[must_use]
-    pub fn redact(&self, text: String) -> String {
-        String::from_utf8_lossy(&self.redact_bytes(text.into_bytes())).into_owned()
     }
 
     /// The live credential's handle, for a caller that records lease state (a
@@ -647,37 +655,33 @@ mod tests {
         Ok(())
     }
 
-    /// Redaction replaces every occurrence, ignores the staged file's trailing
-    /// newline, and leaves text alone when the file is gone.
+    /// Redaction replaces every occurrence and ignores the staged file's trailing
+    /// newline. A missing or empty staged file yields `None`: fail closed.
     #[test]
-    fn redact_replaces_every_occurrence_and_survives_a_missing_file() -> anyhow::Result<()> {
+    fn redact_replaces_every_occurrence_and_fails_closed_without_a_token() -> anyhow::Result<()> {
         let (_tmp, target) = private_dir()?;
         let provider = Arc::new(Scripted::new(vec!["tok-secret"], Duration::from_secs(600)));
         let bracket =
             CredentialBracket::mint_and_stage(provider, &Scope::default(), target, 600, Duration::from_secs(5))?;
         let path = bracket.token_path.clone();
+        let redactor = bracket.redactor();
         std::fs::write(&path, "tok-secret\n")?;
         assert_eq!(
-            bracket.redact("a tok-secret b tok-secret".to_string()),
-            "a [redacted] b [redacted]"
+            redactor.redact_bytes(b"a tok-secret b tok-secret".to_vec()),
+            Some(b"a [redacted] b [redacted]".to_vec())
         );
-        assert_eq!(bracket.redact("nothing here".to_string()), "nothing here");
         assert_eq!(
-            bracket.redact_bytes(b"\xff tok-secret \xfe".to_vec()),
-            b"\xff [redacted] \xfe"
+            redactor.redact_bytes(b"nothing here".to_vec()),
+            Some(b"nothing here".to_vec())
+        );
+        assert_eq!(
+            redactor.redact_bytes(b"\xff tok-secret \xfe".to_vec()),
+            Some(b"\xff [redacted] \xfe".to_vec())
         );
         std::fs::write(&path, "")?;
-        assert_eq!(
-            bracket.redact("tok-secret".to_string()),
-            "tok-secret",
-            "an empty token redacts nothing"
-        );
+        assert_eq!(redactor.redact_bytes(b"tok-secret".to_vec()), None, "an empty token");
         std::fs::remove_file(&path)?;
-        assert_eq!(
-            bracket.redact("tok-secret".to_string()),
-            "tok-secret",
-            "a missing file redacts nothing"
-        );
+        assert_eq!(redactor.redact_bytes(b"tok-secret".to_vec()), None, "a missing file");
         Ok(())
     }
 }
