@@ -184,6 +184,8 @@ async fn submit(
             inputs: Vec::new(),
             outputs: Vec::new(),
             secrets: Vec::new(),
+            credential: None,
+            cred_capabilities: Vec::new(),
         }),
     )
     .await

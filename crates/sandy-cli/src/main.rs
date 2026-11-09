@@ -12,7 +12,7 @@
 
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
-use sandy::{Capability, CoreError, GithubAdapter, Journal, ProcessExit, Scope, TrustRoot, TrustRootIo};
+use sandy::{CoreError, GithubAdapter, Journal, ProcessExit, Scope};
 use sandy_cli::{
     app_register::{self, Owner},
     doctor,
@@ -300,6 +300,20 @@ enum DaemonOp {
         /// grammar as `sandy run`'s own `--secret`.
         #[arg(long = "secret")]
         secrets: Vec<String>,
+        /// Have `sandyd` mint a scoped forge token for the job from the named
+        /// trust root on the daemon's host (a `sandy cred github` name, #481).
+        /// The token is injected as `GITHUB_TOKEN` and revoked when the job
+        /// ends. `sandyd` mints it once, at submit, and does not refresh it:
+        /// forge access ends with the token's native life (about 1 hour from
+        /// the mint, time queued on the executor included). Needs a
+        /// host-executor that declared `shares_submitter_filesystem`; `sandyd`
+        /// refuses the Submit otherwise.
+        #[arg(long = "credential")]
+        credential: Option<String>,
+        /// Capability for the minted credential: `read-code` | `write-code` |
+        /// `read-pr` | `write-pr` (repeatable; default `read-code`).
+        #[arg(long = "cred-capability", requires = "credential")]
+        cred_capability: Vec<String>,
     },
     /// Cancel a submitted job.
     Cancel {
@@ -484,33 +498,14 @@ fn egress_applier() -> sandy_backend::NoEgress {
 }
 
 /// Load the named trust root from `dir` and build the live [`GithubAdapter`] plus
-/// the [`Scope`] to mint for: the trust root's own target repositories and the
-/// requested capabilities (default `read-code`). Returns a human-readable error for
-/// a missing/invalid trust root or an unknown capability (a config fault).
+/// the [`Scope`] to mint for. Delegates to [`sandy::resolve_provider`], the one
+/// resolution `sandy run` and sandyd's job credential (#481) share.
 fn credential_setup(
     dir: &std::path::Path,
     name: &str,
     capabilities: &[String],
 ) -> Result<(GithubAdapter, Scope), String> {
-    let cfg = dir.join(format!("{name}.json"));
-    let root = TrustRoot::load(&cfg).map_err(|e| format!("load trust root {name:?}: {e}"))?;
-    let targets = match &root {
-        TrustRoot::Github { targets, .. } => targets.clone(),
-        TrustRoot::Gitlab { .. } => return Err("GitLab trust roots are not supported yet".to_string()),
-    };
-    let mut caps = parse_caps(capabilities)
-        .map_err(|tok| format!("unknown --cred-capability {tok:?} (expected read-code|write-code|read-pr|write-pr)"))?;
-    if caps.is_empty() {
-        caps.push(Capability::ReadCode);
-    }
-    let adapter = GithubAdapter::from_trust_root(&root).map_err(|e| format!("build credential adapter: {e}"))?;
-    Ok((
-        adapter,
-        Scope {
-            targets,
-            capabilities: caps,
-        },
-    ))
+    sandy::resolve_provider(dir, name, capabilities)
 }
 
 /// The host credential source: load the named trust root and build the live GitHub
@@ -893,6 +888,15 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
         Vec::new()
     };
 
+    // A bad `--cred-capability` is the caller's input error (exit 2), not a
+    // retryable infrastructure failure because the daemon happens to be down.
+    if let DaemonOp::Submit { cred_capability, .. } = &op
+        && let Err(bad) = parse_caps(cred_capability)
+    {
+        eprintln!("sandy: --cred-capability: {bad}");
+        return ProcessExit::InvalidPlan.code();
+    }
+
     // Same pre-connection bar as `--cap-file`/`--env` above (manifest-parity
     // #496): a malformed `--input`/`--out`/`--secret` value, or two inputs
     // colliding on the same staged name, is a pure client-side input error.
@@ -1040,6 +1044,8 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
             inputs: _,
             outputs: _,
             secrets: _,
+            credential,
+            cred_capability,
         } => {
             // clap's `required_unless_present = "flake"`/`conflicts_with`
             // pairs above guarantee exactly one of `manifest` or `flake` is
@@ -1089,6 +1095,8 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
                 inputs: submit_inputs,
                 outputs: submit_outputs,
                 secrets: submit_secrets,
+                credential,
+                cred_capabilities: cred_capability,
             })
         }
         DaemonOp::Cancel { job_id } => {
@@ -1603,7 +1611,9 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use anyhow::Context;
-    use sandy::{CredentialProvider, CredentialSource, EgressOs, Outcome, Profile, Target};
+    use sandy::{
+        Capability, CredentialProvider, CredentialSource, EgressOs, Outcome, Profile, Target, TrustRoot, TrustRootIo,
+    };
     use sandy_test_support::{FakeApplier, FakeBackend};
 
     use super::*;

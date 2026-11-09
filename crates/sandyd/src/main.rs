@@ -10,6 +10,7 @@ use std::{net::SocketAddr, os::unix::fs::PermissionsExt, path::PathBuf, sync::Ar
 use sandy_conn::{Listener as MeshListener, TlsIdentity};
 use sandyd::{
     build_rev::{log_startup, resolve_rev, version_line, wants_version},
+    credential::{JobCredentials, TrustRootResolver},
     dispatch::JobRegistry,
     environment_backend::{self, BackendSettings},
     environment_driver::EnvironmentDriver,
@@ -259,8 +260,10 @@ async fn main() {
     };
     tracing::info!(socket = %attach_socket_path.display(), "sandyd attach data plane listening");
 
+    // #481: a Submit naming `credential` mints from this host's trust roots,
+    // the ones `sandy cred github register` wrote.
     let registry = match JobRegistry::new() {
-        Ok(registry) => Arc::new(registry),
+        Ok(registry) => Arc::new(registry.with_credentials(JobCredentials::new(Arc::new(TrustRootResolver)))),
         Err(e) => {
             tracing::error!(error = %e, "could not create the job registry's capability authority");
             std::process::exit(1);

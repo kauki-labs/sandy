@@ -20,6 +20,7 @@
 
 use std::{
     collections::HashMap,
+    path::Path,
     sync::{Mutex, PoisonError},
     time::{Duration, SystemTime},
 };
@@ -28,9 +29,12 @@ use octocrab::{Octocrab, models::AppId};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::cred::{
-    CredError, CredentialHandle, CredentialProvider, Lease, MAX_TTL_SECS, Minted, Scope, TrustRoot, read_secret_0600,
-    render_github_permissions,
+use crate::{
+    cred::{
+        Capability, CredError, CredentialHandle, CredentialProvider, Lease, MAX_TTL_SECS, Minted, Scope, TrustRoot,
+        TrustRootIo, read_secret_0600, render_github_permissions,
+    },
+    trust_root::parse_capability,
 };
 
 /// GitHub's default API base when the trust root names none.
@@ -147,6 +151,15 @@ impl GithubAdapter {
             mints: Mutex::new(HashMap::new()),
             call_deadline: CALL_DEADLINE,
         })
+    }
+
+    /// Bound each adapter call by `deadline` instead of [`CALL_DEADLINE`]. A
+    /// caller that abandons a call earlier (the daemon's bracket) sets this so
+    /// the call's thread ends with the abandon, not up to 1500 s later.
+    #[must_use]
+    pub fn with_call_deadline(mut self, deadline: Duration) -> Self {
+        self.call_deadline = deadline;
+        self
     }
 
     /// An App-JWT-authenticated octocrab client (authenticates as the App itself).
@@ -351,6 +364,45 @@ fn permissions_from_json(value: &serde_json::Value) -> HashMap<String, String> {
         .unwrap_or_default()
 }
 
+/// Load the trust root `name` from `dir` and build the live [`GithubAdapter`] plus
+/// the [`Scope`] to mint for: the trust root's own target repositories and the
+/// requested capabilities (CLI spellings such as `read-code`, default `read-code`).
+///
+/// One resolution for every caller on the host that registered the trust root:
+/// `sandy run --credential` and a sandyd job's credential (#481).
+///
+/// # Errors
+/// A human-readable `String` for a missing or invalid trust root, a GitLab trust
+/// root (not supported yet), an unknown capability, or an adapter that cannot be
+/// built.
+pub fn resolve_provider(dir: &Path, name: &str, capabilities: &[String]) -> Result<(GithubAdapter, Scope), String> {
+    // One file name inside `dir`: `../other-root` or an absolute path would read
+    // a trust root outside it.
+    crate::trust_root::validate_trust_root_name(name).map_err(|e| e.to_string())?;
+    let cfg = dir.join(format!("{name}.json"));
+    let root = TrustRoot::load(&cfg).map_err(|e| format!("load trust root {name:?}: {e}"))?;
+    let targets = match &root {
+        TrustRoot::Github { targets, .. } => targets.clone(),
+        TrustRoot::Gitlab { .. } => return Err("GitLab trust roots are not supported yet".to_string()),
+    };
+    let mut caps = capabilities
+        .iter()
+        .map(|t| parse_capability(t))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|tok| format!("unknown --cred-capability {tok:?} (expected read-code|write-code|read-pr|write-pr)"))?;
+    if caps.is_empty() {
+        caps.push(Capability::ReadCode);
+    }
+    let adapter = GithubAdapter::from_trust_root(&root).map_err(|e| format!("build credential adapter: {e}"))?;
+    Ok((
+        adapter,
+        Scope {
+            targets,
+            capabilities: caps,
+        },
+    ))
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -430,8 +482,9 @@ mod tests {
             key_pem: Zeroizing::new(Vec::new()),
             runtime,
             mints: Mutex::new(HashMap::new()),
-            call_deadline: short_deadline,
-        };
+            call_deadline: CALL_DEADLINE,
+        }
+        .with_call_deadline(short_deadline);
         adapter.mints.lock().unwrap_or_else(PoisonError::into_inner).insert(
             "handle-1".to_string(),
             MintRecord {
@@ -467,5 +520,15 @@ mod tests {
             "the call must fail at roughly the configured deadline, not wait out the stalled server: {elapsed:?}"
         );
         Ok(())
+    }
+
+    /// A trust-root name that is a path, not a file name, is refused before any read.
+    #[test]
+    fn a_trust_root_name_that_is_a_path_is_refused() {
+        let dir = std::env::temp_dir();
+        for name in ["../other", "/etc/passwd", "a/b", "a/", "a/.", "..", ".", ""] {
+            let err = resolve_provider(&dir, name, &[]).err().unwrap_or_default();
+            assert!(err.contains("single file name"), "{name:?}: {err}");
+        }
     }
 }

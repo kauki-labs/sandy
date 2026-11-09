@@ -26,6 +26,7 @@ use sandy_orchestrator::{JobManifest, MANIFEST_ENCODING_JSON, derive_job_caps};
 use uuid::Uuid;
 
 use crate::{
+    credential::CREDENTIAL_SECRET_NAME,
     dispatch::{self, JobRegistry},
     host_registry::HostRegistry,
     link_auth::RemoteLink,
@@ -103,9 +104,52 @@ fn placement_required_error(
 /// Whether `submit` names any path field (#496, decision 21) — `inputs`,
 /// `outputs`, or `secrets`. Non-empty here means placement must land on a
 /// host-executor that declared `shares_submitter_filesystem`; a path is only
-/// ever meaningful on the filesystem the submitter itself is on.
+/// ever meaningful on the filesystem the submitter itself is on. A
+/// `credential` (#481, decision 37) requires the same: the minted token is a
+/// file on this machine, and no encrypted mesh transport carries it to a
+/// remote host yet (#495).
 fn submit_requires_local_dispatch(submit: &SubmitRequest) -> bool {
-    !submit.inputs.is_empty() || !submit.outputs.is_empty() || !submit.secrets.is_empty()
+    !submit.inputs.is_empty() || !submit.outputs.is_empty() || !submit.secrets.is_empty() || submit.credential.is_some()
+}
+
+/// The refusal for a credentialed Submit with no local host to place on (#481).
+fn credential_placement_refusal() -> String {
+    "no registered host both declares shares_submitter_filesystem and offers the required isolation class and sandbox \
+     kind; this Submit names a `credential`, and a daemon-minted token is only handed to a host-executor on this \
+     machine: carrying it to a remote host needs the encrypted mesh transport (#495), which is not wired yet"
+        .to_owned()
+}
+
+/// Refuse a Submit whose credential request this daemon cannot honor (#481), before
+/// any side effect: `cred_capabilities` with no `credential`, a credential name
+/// that is not a single file name, a credential on a daemon with no credential
+/// support, or a `secrets` entry already using the name the minted token is
+/// staged under.
+fn credential_request_refusal(submit: &SubmitRequest, registry: &JobRegistry) -> Option<String> {
+    let Some(name) = &submit.credential else {
+        return (!submit.cred_capabilities.is_empty()).then(|| {
+            "cred_capabilities names capabilities but the Submit names no credential to mint them for".to_owned()
+        });
+    };
+    // The name becomes `<trust-roots dir>/<name>.json`: refuse anything but one file name.
+    if let Err(e) = sandy::validate_trust_root_name(name) {
+        return Some(format!("credential {name:?} is refused: {e}"));
+    }
+    if registry.credentials().is_none() {
+        return Some(format!(
+            "this daemon has no credential support configured; the Submit naming credential {name:?} is refused"
+        ));
+    }
+    submit
+        .secrets
+        .iter()
+        .any(|s| s.name == CREDENTIAL_SECRET_NAME)
+        .then(|| {
+            format!(
+                "secrets already names {CREDENTIAL_SECRET_NAME}, the name the minted credential is staged under; \
+                 rename that secret or drop the credential"
+            )
+        })
 }
 
 /// Name the path field that made [`submit_requires_local_dispatch`] true, for
@@ -390,6 +434,19 @@ pub async fn handle(
                 });
             }
 
+            // #481: a credential request this daemon cannot honor is refused
+            // before placement and before any mint.
+            if let Some(message) = credential_request_refusal(&submit, registry) {
+                return Ok(ControlResponse {
+                    request_id: request.request_id,
+                    result: Some(control_response::Result::Error(ControlError { message })),
+                });
+            }
+            let credential_request = submit
+                .credential
+                .clone()
+                .map(|name| (name, submit.cred_capabilities.clone()));
+
             // Named apart from `placeable` itself (CodeRabbit on this PR): the
             // original message always blamed "no Vm-capable host," even when
             // the real cause was this orchestrator's own configuration
@@ -424,6 +481,8 @@ pub async fn handle(
                 "this orchestrator has no agent-link listen address configured (SANDY_MESH_AGENT_LINK_LISTEN is unset) \
                  — no remote placement is reachable at all, regardless of what hosts are registered"
                     .to_owned()
+            } else if credential_request.is_some() {
+                credential_placement_refusal()
             } else if require_local {
                 format!(
                     "no registered host declares shares_submitter_filesystem; this Submit names a `{path_field_name}` \
@@ -572,7 +631,9 @@ pub async fn handle(
             // a minted link exactly this way) — never insert a `flake/v1` job
             // that would then sit `Pending` forever with no local fallback
             // and no distinct status a caller could ever notice.
-            let dispatch_plan_reason = if require_local {
+            let dispatch_plan_reason = if credential_request.is_some() {
+                credential_placement_refusal()
+            } else if require_local {
                 format!(
                     "no registered host declaring shares_submitter_filesystem could be bound for this job's \
                      `{path_field_name}` path"
@@ -595,6 +656,44 @@ pub async fn handle(
                 });
             }
 
+            // #481: mint the job's credential last among the Submit-time steps that
+            // can refuse, and before anything is persisted or dispatched. A mint
+            // failure refuses the Submit: no host ever runs this job without its
+            // token. The bracket revokes on drop, so any early return below
+            // before `adopt` still cannot leak the token.
+            let mut dispatch_plan = dispatch_plan;
+            let job_credential = match (&credential_request, registry.credentials()) {
+                (Some((name, capabilities)), Some(credentials)) => {
+                    let (credentials, name_for_mint, capabilities) =
+                        (Arc::clone(credentials), name.clone(), capabilities.clone());
+                    match tokio::task::spawn_blocking(move || credentials.mint(&name_for_mint, &capabilities)).await? {
+                        Ok(bracket) => Some(bracket),
+                        Err(reason) => {
+                            tracing::warn!(job_id, credential = ?name, error = %reason, "credential mint failed; refusing the submit");
+                            return Ok(ControlResponse {
+                                request_id: request.request_id,
+                                result: Some(control_response::Result::Error(ControlError {
+                                    message: format!(
+                                        "credential {name:?} mint failed, so the Submit is refused and nothing was \
+                                         dispatched: {reason}"
+                                    ),
+                                })),
+                            });
+                        }
+                    }
+                }
+                _ => None,
+            };
+            if let (Some(bracket), Some((_, _, dispatch))) = (&job_credential, dispatch_plan.as_mut()) {
+                // The path only: the token stays in the file (decision 37).
+                if let sandy::SecretSource::File(path) = bracket.secret_ref().source {
+                    dispatch.secrets.push(sandy_executor_proto::SecretRef {
+                        name: CREDENTIAL_SECRET_NAME.to_owned(),
+                        host_path: path.display().to_string(),
+                    });
+                }
+            }
+
             let insert_outcome =
                 tokio::task::spawn_blocking(move || store.insert_pending(&inserted_id, &manifest, &encoding)).await??;
             // CF-M-2: a capacity refusal must leave no trace, same as every
@@ -611,6 +710,14 @@ pub async fn handle(
                         ),
                     })),
                 });
+            }
+            // The job now exists: it owns the credential until a terminal path
+            // releases it.
+            // Whether this job's archive needs redacting is decided now, not when the
+            // archive arrives: it can arrive after a terminal path released the credential.
+            let credentialed = job_credential.is_some();
+            if let (Some(bracket), Some(credentials)) = (job_credential, registry.credentials()) {
+                credentials.adopt(&job_id, bracket);
             }
 
             // Best-effort: the job is already durably submitted, so a faulted write here is logged, not a
@@ -645,6 +752,7 @@ pub async fn handle(
                 job_id.clone(),
                 store_for_archive,
                 dispatch::ARCHIVE_WAIT_BOUND,
+                registry.credentials().filter(|_| credentialed).cloned(),
             ));
 
             registry.insert(job_id.clone(), job_channel);
@@ -712,6 +820,9 @@ pub async fn handle(
                         Ok(Err(e)) => tracing::warn!(job_id, error = %e, "could not fail the undelivered job"),
                         Err(e) => tracing::warn!(job_id, error = %e, "the fail-undelivered-job store task panicked"),
                     }
+                    // #481: the dispatch never reached a host, so nothing will
+                    // ever use this job's credential.
+                    registry.release_credential(&job_id);
                     // The dispatch never reached the host either way (the
                     // send itself failed), so the job's RemoteLink was never
                     // presented on the wire and must not stay claimable —
@@ -781,6 +892,9 @@ pub async fn handle(
                     tracing::info!(job_id = %cancel.job_id, "cancel: invalidating any unclaimed remote link");
                     registry.invalidate_remote_link(&cancel.job_id);
                     registry.mark_terminal(&cancel.job_id);
+                    // #481: revoke the job's credential now, not when the host
+                    // gets around to reporting.
+                    registry.release_credential(&cancel.job_id);
                     // #477: the local store-cancel above only stops a late
                     // agent-link stream from claiming the run (decision 12's
                     // own residual-gap note). If the job was placed on a
@@ -1079,6 +1193,8 @@ mod tests {
                 inputs: Vec::new(),
                 outputs: Vec::new(),
                 secrets: Vec::new(),
+                credential: None,
+                cred_capabilities: Vec::new(),
             }),
         )
     }
@@ -1140,6 +1256,8 @@ mod tests {
                 inputs: Vec::new(),
                 outputs: Vec::new(),
                 secrets: Vec::new(),
+                credential: None,
+                cred_capabilities: Vec::new(),
             }),
         )
     }
@@ -2309,6 +2427,8 @@ mod tests {
                 inputs: Vec::new(),
                 outputs: Vec::new(),
                 secrets: Vec::new(),
+                credential: None,
+                cred_capabilities: Vec::new(),
             }),
         );
 
@@ -2357,6 +2477,8 @@ mod tests {
                 inputs: Vec::new(),
                 outputs: Vec::new(),
                 secrets: Vec::new(),
+                credential: None,
+                cred_capabilities: Vec::new(),
             }),
         );
 
@@ -2402,6 +2524,8 @@ mod tests {
                 inputs: Vec::new(),
                 outputs: Vec::new(),
                 secrets: Vec::new(),
+                credential: None,
+                cred_capabilities: Vec::new(),
             }),
         );
 
@@ -3021,6 +3145,8 @@ mod tests {
                 inputs: Vec::new(),
                 outputs: Vec::new(),
                 secrets: Vec::new(),
+                credential: None,
+                cred_capabilities: Vec::new(),
             }),
         )
     }
@@ -3318,6 +3444,8 @@ mod tests {
                 inputs: Vec::new(),
                 outputs: Vec::new(),
                 secrets: Vec::new(),
+                credential: None,
+                cred_capabilities: Vec::new(),
             }),
         )
     }
@@ -3333,6 +3461,8 @@ mod tests {
                 inputs: Vec::new(),
                 outputs: Vec::new(),
                 secrets: Vec::new(),
+                credential: None,
+                cred_capabilities: Vec::new(),
             }),
         )
     }
@@ -3348,6 +3478,8 @@ mod tests {
                 inputs: Vec::new(),
                 outputs: Vec::new(),
                 secrets: Vec::new(),
+                credential: None,
+                cred_capabilities: Vec::new(),
             }),
         )
     }
@@ -3553,6 +3685,8 @@ mod tests {
                 inputs: Vec::new(),
                 outputs: Vec::new(),
                 secrets: Vec::new(),
+                credential: None,
+                cred_capabilities: Vec::new(),
             }),
         )
     }

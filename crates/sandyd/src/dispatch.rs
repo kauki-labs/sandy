@@ -48,6 +48,7 @@ use sandy_proto::MessageType;
 use uuid::Uuid;
 
 use crate::{
+    credential::{JobCredentials, Redaction},
     link_auth::{self, LinkAuthError, RemoteLink},
     store::JobStore,
 };
@@ -299,6 +300,7 @@ pub async fn persist_archive_when_posted(
     job_id: String,
     store: Arc<JobStore>,
     wait_bound: Duration,
+    credentials: Option<Arc<JobCredentials>>,
 ) {
     let membership = match channel.join(&archiver_cap) {
         Ok(m) => m,
@@ -307,7 +309,7 @@ pub async fn persist_archive_when_posted(
             return;
         }
     };
-    find_and_persist_archive(&channel, &membership, &job_id, &store, wait_bound).await;
+    find_and_persist_archive(&channel, &membership, &job_id, &store, wait_bound, credentials).await;
     // Always leave once done (found it, failed, or gave up): this
     // membership belongs to this one task alone (see `archiver_cap`'s own
     // minting doc) and has no reason to linger in the channel's membership
@@ -325,6 +327,7 @@ async fn find_and_persist_archive(
     job_id: &str,
     store: &Arc<JobStore>,
     wait_bound: Duration,
+    credentials: Option<Arc<JobCredentials>>,
 ) {
     let stream = match channel.subscribe(membership) {
         Ok(s) => s,
@@ -354,7 +357,29 @@ async fn find_and_persist_archive(
     };
     let write_job_id = job_id.to_owned();
     let store = Arc::clone(store);
-    match tokio::task::spawn_blocking(move || store.set_archive(&write_job_id, &bytes)).await {
+    // The agent archives the job's terminal log, which can hold the job's own
+    // `GITHUB_TOKEN` (#481). For a credentialed job (`credentials` is `Some`)
+    // the archive is stored only once the token is redacted: the archive can
+    // arrive after the credential was released, and then it is dropped.
+    match tokio::task::spawn_blocking(move || {
+        let bytes = match &credentials {
+            Some(credentials) => match credentials.redact_bytes(&write_job_id, bytes) {
+                Redaction::Redacted(bytes) => bytes,
+                Redaction::NotHeld(_) | Redaction::Unavailable => {
+                    tracing::warn!(
+                        job_id = write_job_id,
+                        "archive persister: dropped the transcript of a credentialed job, its token could not be \
+                         redacted"
+                    );
+                    return Ok(());
+                }
+            },
+            None => bytes,
+        };
+        store.set_archive(&write_job_id, &bytes)
+    })
+    .await
+    {
         Ok(Ok(())) => {}
         Ok(Err(e)) => tracing::warn!(job_id, error = %e, "archive persister: could not persist the transcript"),
         Err(e) => tracing::warn!(job_id, error = %e, "archive persister: the store-write task panicked"),
@@ -396,6 +421,9 @@ pub struct JobRegistry {
     /// [`JobRegistry::with_retention`] for tests that need to observe the
     /// sweep without waiting out the real default.
     retention: Duration,
+    /// Daemon-minted job credentials (#481). `None` refuses any Submit naming a
+    /// credential.
+    credentials: Option<Arc<JobCredentials>>,
 }
 
 impl JobRegistry {
@@ -409,7 +437,30 @@ impl JobRegistry {
             terminal_at: Mutex::new(HashMap::new()),
             authority: SharedCapAuthority::new(LocalCapAuthority::new(CAP_TTL)?),
             retention: TERMINAL_RETENTION,
+            credentials: None,
         })
+    }
+
+    /// Mint, hold, and revoke job credentials through `credentials` (#481).
+    #[must_use]
+    pub fn with_credentials(mut self, credentials: JobCredentials) -> Self {
+        self.credentials = Some(Arc::new(credentials));
+        self
+    }
+
+    /// The daemon's job credentials, when configured.
+    #[must_use]
+    pub fn credentials(&self) -> Option<&Arc<JobCredentials>> {
+        self.credentials.as_ref()
+    }
+
+    /// Revoke `job_id`'s daemon-minted credential, if it holds one (#481). Every
+    /// terminal path calls this whatever its store transition was: the job is
+    /// over on its host either way. Idempotent.
+    pub fn release_credential(&self, job_id: &str) {
+        if let Some(credentials) = &self.credentials {
+            credentials.release(job_id);
+        }
     }
 
     /// Override the terminal-retention grace period (#270). Production
@@ -839,6 +890,7 @@ mod tests {
             "job-archive".to_string(),
             Arc::clone(&store),
             Duration::from_secs(5),
+            None,
         ));
 
         job.channel
@@ -872,6 +924,7 @@ mod tests {
             "job-no-archive".to_string(),
             Arc::clone(&store),
             Duration::from_millis(50),
+            None,
         ));
 
         tokio::time::timeout(Duration::from_secs(5), persisting)
@@ -898,6 +951,7 @@ mod tests {
             "job-archive-no-attach-tracking".to_string(),
             Arc::clone(&store),
             Duration::from_millis(50),
+            None,
         ));
         tokio::time::timeout(Duration::from_secs(5), persisting).await??;
 
@@ -933,6 +987,7 @@ mod tests {
             "job-archive-survives-detach".to_string(),
             Arc::clone(&store),
             Duration::from_secs(5),
+            None,
         ));
 
         // `#[tokio::test]` is current-thread: the spawned persister makes no

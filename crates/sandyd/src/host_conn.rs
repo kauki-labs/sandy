@@ -17,6 +17,7 @@ use sandy_executor_proto::{
 use tokio::sync::mpsc;
 
 use crate::{
+    credential::Redaction,
     dispatch::JobRegistry,
     host_registry::{ExecutorAllowlist, HostRegistry, RegisterError, Registration},
     store::{JobStore, Transition},
@@ -486,12 +487,35 @@ async fn record_job_result(
 ) {
     let (status, exit_code) = classify(&result);
     let job_id = result.job_id.clone();
-    in_flight.remove(&job_id);
+    // Only a job dispatched on this connection may have its credential ended
+    // here: a buggy or hostile executor must not revoke another host's job (#481).
+    let dispatched_here = in_flight.remove(&job_id);
+    // A result for a job this connection never ran is not recorded either: it
+    // would mark another host's job terminal and strand its credential.
+    if !dispatched_here {
+        tracing::warn!(
+            job_id,
+            "a job result arrived for a job not dispatched on this connection; ignored"
+        );
+        return;
+    }
 
     let store = Arc::clone(store);
     let console = result.console;
+    let credentials = job_registry.credentials().cloned();
     let jid = job_id.clone();
-    let transition = tokio::task::spawn_blocking(move || store.finish(&jid, status, exit_code, &console)).await;
+    let transition = tokio::task::spawn_blocking(move || {
+        // The staged token never reaches the stored console, whatever the job printed.
+        let console = match &credentials {
+            Some(credentials) => match credentials.redact_bytes(&jid, console.into_bytes()) {
+                Redaction::Redacted(bytes) | Redaction::NotHeld(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                Redaction::Unavailable => "[console withheld: the job's credential could not be redacted]".to_owned(),
+            },
+            None => console,
+        };
+        store.finish(&jid, status, exit_code, &console)
+    })
+    .await;
     match transition {
         Ok(Ok(Transition::Applied)) => {
             job_registry.mark_terminal(&job_id);
@@ -510,6 +534,8 @@ async fn record_job_result(
         Ok(Err(e)) => tracing::warn!(job_id, error = %e, "could not record the job result"),
         Err(e) => tracing::warn!(job_id, error = %e, "the record-result store task failed"),
     }
+    // The job is over on its host whatever the store said: revoke its credential (#481).
+    job_registry.release_credential(&job_id);
 }
 
 /// Fail a job whose host-executor disconnected before reporting a result
@@ -547,6 +573,8 @@ async fn fail_disconnected_job(store: &Arc<JobStore>, job_registry: &JobRegistry
     // stream must not still be able to authenticate with it (#269: job
     // status alone doesn't gate authentication).
     job_registry.invalidate_remote_link(job_id);
+    // Its credential (#481) has no live consumer left either.
+    job_registry.release_credential(job_id);
 }
 
 /// Reads frames from `read_half` sequentially — never raced against anything

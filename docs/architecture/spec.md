@@ -323,9 +323,16 @@ sequenceDiagram
   swapped in at `cred_dir`'s path between validation and the mint, or between
   two refreshes, is refused rather than silently receiving the token. See
   decision 13 in `docs/decisions/guest-shares.md`.
+- **The daemon path reuses one bracket (#481).** `sandy::CredentialBracket` is the mint,
+  renew and revoke lifecycle around one staged credential, with every provider call
+  bounded. sandyd mints through it for a job that names `credential`, local dispatch only,
+  and revokes on every terminal path; it does not refresh mid-run, since the host-executor
+  copies the token at staging. See `docs/decisions/sandyd.md` decision 37.
 
 **KPI.**
 
+- Daemon path: kpi.md's KCRED1-KCRED7 (`crates/sandyd/src/credential.rs` and
+  `crates/sandy/src/cred_bracket.rs` tests).
 - Integration: `cred.rs` unit tests (`mint_lease` clamps TTL, stages 0600, revoke
   bracket, `should_refresh`);
   `mint_lease_checked_refuses_a_dir_swapped_in_after_validation` (adversarial,

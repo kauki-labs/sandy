@@ -133,7 +133,7 @@ fn mint_lease_with<P: CredentialProvider + ?Sized>(
 /// reads. A failed revoke is logged, not fatal: the native TTL is the backstop.
 ///
 /// [`revoke`]: CredentialProvider::revoke
-fn revoke_orphan<P: CredentialProvider + ?Sized>(provider: &P, secret_name: &str, minted: &Minted) {
+pub(crate) fn revoke_orphan<P: CredentialProvider + ?Sized>(provider: &P, secret_name: &str, minted: &Minted) {
     let orphan = Lease {
         secret_ref: SecretRef {
             name: secret_name.to_string(),
@@ -409,6 +409,21 @@ pub fn check_trust_roots_dir(dir: &Path) -> Result<(), CredError> {
     sandy_fsutil::OwnedDir::open(dir)
         .map(drop)
         .map_err(trust_dir_unsafe_error)
+}
+
+/// The trust-roots directory `sandy cred <provider> register` writes and the
+/// credential bracket reads (`sandy run --credential`, and a sandyd job's
+/// credential since #481): `$XDG_CONFIG_HOME/sandy/trust-roots`, falling back to
+/// `$HOME/.config/sandy/trust-roots`.
+///
+/// # Errors
+/// An `io::Error` when neither `XDG_CONFIG_HOME` nor `HOME` is set.
+pub fn trust_roots_dir() -> std::io::Result<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .ok_or_else(|| std::io::Error::other("neither XDG_CONFIG_HOME nor HOME is set"))?;
+    Ok(base.join("sandy").join("trust-roots"))
 }
 
 /// Map an [`sandy_fsutil::FsError`] from opening the trust-roots dir to the

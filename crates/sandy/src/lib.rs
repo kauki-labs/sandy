@@ -21,7 +21,8 @@
 //!   (INV-TOPOLOGY).
 //! - **Credentials** — the provider-agnostic [`CredentialProvider`] seam (a `FakeProvider` double lives in
 //!   `sandy-test-support`); [`mint_lease`] clamps a TTL to [`MAX_TTL_SECS`] and stages a scoped credential as a `0600`
-//!   [`SecretRef`] only (INV-1).
+//!   [`SecretRef`] only (INV-1). [`CredentialBracket`] is the reusable mint, renew, revoke lifecycle around one staged
+//!   credential.
 //! - **Operability** — [`RunMetrics`] and staging [`plan_eviction`].
 
 // Deep crate: the module tree is private. The curated `pub use` facade below is
@@ -32,6 +33,7 @@ mod collect;
 mod config;
 mod containment;
 mod cred;
+mod cred_bracket;
 mod cred_github;
 mod discovery;
 mod egress;
@@ -63,9 +65,10 @@ pub use containment::{Containment, ContainmentStatus, Mount, NoContainment, Reso
 pub use cred::{
     Capability, CredError, CredentialHandle, CredentialProvider, GitlabAccount, Lease, MAX_TTL_SECS, Minted, Scope,
     Target, TrustRoot, TrustRootIo, check_trust_roots_dir, mint_lease, mint_lease_checked, read_secret_0600,
-    refresh_once, refresh_once_checked, render_github_permissions, should_refresh, write_trust_secret,
+    refresh_once, refresh_once_checked, render_github_permissions, should_refresh, trust_roots_dir, write_trust_secret,
 };
-pub use cred_github::{CALL_DEADLINE, GithubAdapter};
+pub use cred_bracket::{CredentialBracket, SharedProvider, StagingTarget, TokenRedactor};
+pub use cred_github::{CALL_DEADLINE, GithubAdapter, resolve_provider};
 pub use discovery::{Discovery, Placement, StaticRegistry, parse_builder_systems};
 pub use egress::{
     AllowList, EgressApplier, EgressError, EgressOs, EgressOutcome, EgressPlan, EgressRule, NetworkMode,

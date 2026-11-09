@@ -129,6 +129,20 @@ message SubmitRequest {
   repeated Input inputs = 5;
   repeated Output outputs = 6;
   repeated SecretRef secrets = 7;
+  // A daemon-minted forge credential (#481, sandyd.md decision 37): the name of
+  // a trust root `sandy cred github register` wrote on the daemon's host, the
+  // same name `sandy run --credential` takes. sandyd mints a scoped token before
+  // dispatch (a mint failure refuses the Submit), hands it to the job as the
+  // `GITHUB_TOKEN` secret file, and revokes it on every terminal state. Like a
+  // path field, it requires a host-executor that declared
+  // `shares_submitter_filesystem`; a Submit that could only place remotely is
+  // refused, since no encrypted mesh transport carries the token yet (#495).
+  // The token itself never rides any wire field.
+  optional string credential = 8;
+  // Capabilities for `credential`, in `sandy run --cred-capability` spelling
+  // (`read-code`, `write-code`, `read-pr`, `write-pr`); empty means
+  // `read-code`. Refused without `credential`.
+  repeated string cred_capabilities = 9;
 }
 
 // Mirrors `sandy_api::backend::Input`. A host path exposed read-only in the
