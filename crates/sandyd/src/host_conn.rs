@@ -500,10 +500,20 @@ async fn record_job_result(
     }
 
     let store = Arc::clone(store);
-    // The staged token never reaches the stored console, whatever the job printed.
-    let console = job_registry.redact_credential(&job_id, result.console);
+    let console = result.console;
+    let credentials = job_registry.credentials().cloned();
     let jid = job_id.clone();
-    let transition = tokio::task::spawn_blocking(move || store.finish(&jid, status, exit_code, &console)).await;
+    let transition = tokio::task::spawn_blocking(move || {
+        // The staged token never reaches the stored console, whatever the job printed.
+        let console = match &credentials {
+            Some(credentials) => {
+                String::from_utf8_lossy(&credentials.redact_bytes(&jid, console.into_bytes())).into_owned()
+            }
+            None => console,
+        };
+        store.finish(&jid, status, exit_code, &console)
+    })
+    .await;
     match transition {
         Ok(Ok(Transition::Applied)) => {
             job_registry.mark_terminal(&job_id);

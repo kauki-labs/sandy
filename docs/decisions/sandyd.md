@@ -2450,8 +2450,10 @@ refused, because no encrypted mesh transport carries a bearer token yet (#495).
   releases the credential, so one executor can neither end another host's job nor revoke its token.
 - The token is only in the staged file and in the provider's zeroizing `Minted`. It is never in the job
   store, a log line, a `Dispatch` field other than the path, an error message or `Debug` output. A job
-  that prints its own `GITHUB_TOKEN` has it replaced by `[redacted]` in the stored console
-  (`CredentialBracket::redact` reads the staged file at result time).
+  that prints its own `GITHUB_TOKEN` has it replaced by `[redacted]` in the stored console and in the
+  stored archive (`CredentialBracket::redact_bytes` reads the staged file, on a blocking task). Only the
+  literal token is redacted: an encoded form (base64, URL or JSON escaping) or a copy cut in half by the
+  console tail is not, and is a non-goal.
 
 **Not built: mid-run refresh.** The host-executor copies a secret file into the job's own secret dir
 once, when it stages the job (`sandy::stage_secrets`). It does not share the daemon's file live, as

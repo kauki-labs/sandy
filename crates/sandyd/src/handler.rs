@@ -749,6 +749,7 @@ pub async fn handle(
                 job_id.clone(),
                 store_for_archive,
                 dispatch::ARCHIVE_WAIT_BOUND,
+                registry.credentials().cloned(),
             ));
 
             registry.insert(job_id.clone(), job_channel);

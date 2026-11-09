@@ -300,6 +300,7 @@ pub async fn persist_archive_when_posted(
     job_id: String,
     store: Arc<JobStore>,
     wait_bound: Duration,
+    credentials: Option<Arc<JobCredentials>>,
 ) {
     let membership = match channel.join(&archiver_cap) {
         Ok(m) => m,
@@ -308,7 +309,7 @@ pub async fn persist_archive_when_posted(
             return;
         }
     };
-    find_and_persist_archive(&channel, &membership, &job_id, &store, wait_bound).await;
+    find_and_persist_archive(&channel, &membership, &job_id, &store, wait_bound, credentials).await;
     // Always leave once done (found it, failed, or gave up): this
     // membership belongs to this one task alone (see `archiver_cap`'s own
     // minting doc) and has no reason to linger in the channel's membership
@@ -326,6 +327,7 @@ async fn find_and_persist_archive(
     job_id: &str,
     store: &Arc<JobStore>,
     wait_bound: Duration,
+    credentials: Option<Arc<JobCredentials>>,
 ) {
     let stream = match channel.subscribe(membership) {
         Ok(s) => s,
@@ -355,7 +357,17 @@ async fn find_and_persist_archive(
     };
     let write_job_id = job_id.to_owned();
     let store = Arc::clone(store);
-    match tokio::task::spawn_blocking(move || store.set_archive(&write_job_id, &bytes)).await {
+    // The agent archives the job's terminal log, which can hold the job's own
+    // `GITHUB_TOKEN` (#481): redact before it reaches the store.
+    match tokio::task::spawn_blocking(move || {
+        let bytes = match &credentials {
+            Some(credentials) => credentials.redact_bytes(&write_job_id, bytes),
+            None => bytes,
+        };
+        store.set_archive(&write_job_id, &bytes)
+    })
+    .await
+    {
         Ok(Ok(())) => {}
         Ok(Err(e)) => tracing::warn!(job_id, error = %e, "archive persister: could not persist the transcript"),
         Err(e) => tracing::warn!(job_id, error = %e, "archive persister: the store-write task panicked"),
@@ -436,16 +448,6 @@ impl JobRegistry {
     pub fn release_credential(&self, job_id: &str) {
         if let Some(credentials) = &self.credentials {
             credentials.release(job_id);
-        }
-    }
-
-    /// `console` with `job_id`'s staged token redacted (#481): a job that prints
-    /// its own `GITHUB_TOKEN` must not store it in the job record.
-    #[must_use]
-    pub fn redact_credential(&self, job_id: &str, console: String) -> String {
-        match &self.credentials {
-            Some(credentials) => credentials.redact(job_id, console),
-            None => console,
         }
     }
 
@@ -876,6 +878,7 @@ mod tests {
             "job-archive".to_string(),
             Arc::clone(&store),
             Duration::from_secs(5),
+            None,
         ));
 
         job.channel
@@ -909,6 +912,7 @@ mod tests {
             "job-no-archive".to_string(),
             Arc::clone(&store),
             Duration::from_millis(50),
+            None,
         ));
 
         tokio::time::timeout(Duration::from_secs(5), persisting)
@@ -935,6 +939,7 @@ mod tests {
             "job-archive-no-attach-tracking".to_string(),
             Arc::clone(&store),
             Duration::from_millis(50),
+            None,
         ));
         tokio::time::timeout(Duration::from_secs(5), persisting).await??;
 
@@ -970,6 +975,7 @@ mod tests {
             "job-archive-survives-detach".to_string(),
             Arc::clone(&store),
             Duration::from_secs(5),
+            None,
         ));
 
         // `#[tokio::test]` is current-thread: the spawned persister makes no

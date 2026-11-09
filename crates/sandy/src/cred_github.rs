@@ -378,14 +378,7 @@ fn permissions_from_json(value: &serde_json::Value) -> HashMap<String, String> {
 pub fn resolve_provider(dir: &Path, name: &str, capabilities: &[String]) -> Result<(GithubAdapter, Scope), String> {
     // One file name inside `dir`: `../other-root` or an absolute path would read
     // a trust root outside it.
-    let mut parts = Path::new(name).components();
-    if !matches!(
-        (parts.next(), parts.next()),
-        (Some(std::path::Component::Normal(_)), None)
-    ) || name.contains('\\')
-    {
-        return Err(format!("trust root name {name:?} must be a single file name"));
-    }
+    crate::trust_root::validate_trust_root_name(name).map_err(|e| e.to_string())?;
     let cfg = dir.join(format!("{name}.json"));
     let root = TrustRoot::load(&cfg).map_err(|e| format!("load trust root {name:?}: {e}"))?;
     let targets = match &root {
@@ -533,7 +526,7 @@ mod tests {
     #[test]
     fn a_trust_root_name_that_is_a_path_is_refused() {
         let dir = std::env::temp_dir();
-        for name in ["../other", "/etc/passwd", "a/b", "..", "", "a\\b"] {
+        for name in ["../other", "/etc/passwd", "a/b", "a/", "a/.", "..", "."] {
             let err = resolve_provider(&dir, name, &[]).err().unwrap_or_default();
             assert!(err.contains("single file name"), "{name:?}: {err}");
         }

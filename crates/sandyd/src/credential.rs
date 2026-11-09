@@ -119,12 +119,13 @@ impl JobCredentials {
         self
     }
 
-    /// `text` with `job_id`'s staged token redacted, unchanged when the job holds none.
+    /// `bytes` with `job_id`'s staged token redacted, unchanged when the job holds
+    /// none. Blocking (reads the staged file): call it from a blocking task.
     #[must_use]
-    pub fn redact(&self, job_id: &str, text: String) -> String {
+    pub fn redact_bytes(&self, job_id: &str, bytes: Vec<u8>) -> Vec<u8> {
         match self.lock_live().get(job_id) {
-            Some(bracket) => bracket.redact(text),
-            None => text,
+            Some(bracket) => bracket.redact_bytes(bytes),
+            None => bytes,
         }
     }
 
@@ -1112,6 +1113,38 @@ mod tests {
         assert!(detail.console.contains("done"), "the rest of the console is kept");
         drop(client);
         tokio::time::timeout(WAIT, serve).await??;
+        Ok(())
+    }
+
+    /// The agent archives the job's terminal log. A job that prints its own token
+    /// must not leave it in the stored archive either.
+    #[tokio::test]
+    async fn a_token_in_the_agent_archive_is_redacted_from_the_stored_archive() -> anyhow::Result<()> {
+        let d = daemon(FakeProvider::returning(TOKEN))?;
+        let _host = register_host(&d, true)?;
+        let submitted = submit_ok(&d).await?;
+        let job = d.registry.get(&submitted.job_id).context("job channel")?;
+        let agent = job.channel.join(&job.agent_cap)?;
+        job.channel
+            .post(
+                &agent,
+                Some(sandy_proto::MessageType::Output(sandy_proto::Output {})),
+                sandy_fabric_local::agent::ARCHIVE_TRANSCRIPT,
+                format!("$ echo $GITHUB_TOKEN\n{TOKEN}\n").into_bytes(),
+            )
+            .await?;
+
+        let deadline = Instant::now() + WAIT;
+        let archive = loop {
+            if let Some(bytes) = d.store.archive(&submitted.job_id)? {
+                break bytes;
+            }
+            anyhow::ensure!(Instant::now() < deadline, "the archive was never persisted");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let archive = String::from_utf8(archive)?;
+        assert!(!archive.contains(TOKEN), "archive: {archive:?}");
+        assert!(archive.contains("[redacted]"), "archive: {archive:?}");
         Ok(())
     }
 
