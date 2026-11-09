@@ -19,6 +19,10 @@ fn run_with_registry(dir: &std::path::Path, registry: &std::path::Path) -> Resul
         .env("SANDY_SOCK", dir.join("sandyd.sock"))
         .env("SANDY_DB", dir.join("sandyd.db"))
         .env_remove("SANDY_ENV_BACKEND")
+        .env_remove("SANDY_AUDIT_LOG")
+        .env_remove("SANDY_MAX_JOBS")
+        .env_remove("SANDY_MAX_ENVIRONMENTS")
+        .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -79,6 +83,7 @@ fn a_malformed_private_registry_stops_the_daemon_without_echoing_it() -> Result<
     std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o600))?;
     let (code, log) = run_with_registry(dir.path(), &registry)?;
     ensure!(code == Some(1), "exit {code:?}: {log}");
+    ensure!(log.contains("could not load SANDY_PROFILES"), "{log}");
     ensure!(!log.contains(SECRET), "the log repeated the file: {log}");
     Ok(())
 }
