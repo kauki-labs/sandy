@@ -127,6 +127,9 @@ pub fn backend(
     use sandy_conn::dial::VsockDialer;
     use sandy_environment::{BackendFactory, HeldBackend, VmEnvironmentBackend, VmEnvironmentConfig, guarded};
 
+    // Stop the VMs a killed daemon left behind before the driver can launch a second one for the same environment.
+    // `sweep_orphans` logs its own report and is safe beside a live daemon or CLI run.
+    let _ = QemuBackend::sweep_orphans();
     let probe = Arc::new(HttpServiceProbe::new());
     let factory: BackendFactory = {
         let probe = Arc::clone(&probe);
