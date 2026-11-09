@@ -153,6 +153,15 @@ impl GithubAdapter {
         })
     }
 
+    /// Bound each adapter call by `deadline` instead of [`CALL_DEADLINE`]. A
+    /// caller that abandons a call earlier (the daemon's bracket) sets this so
+    /// the call's thread ends with the abandon, not up to 1500 s later.
+    #[must_use]
+    pub fn with_call_deadline(mut self, deadline: Duration) -> Self {
+        self.call_deadline = deadline;
+        self
+    }
+
     /// An App-JWT-authenticated octocrab client (authenticates as the App itself).
     fn app_client(&self) -> Result<Octocrab, CredError> {
         // octocrab's own re-exported jsonwebtoken, not our workspace's direct
@@ -470,8 +479,9 @@ mod tests {
             key_pem: Zeroizing::new(Vec::new()),
             runtime,
             mints: Mutex::new(HashMap::new()),
-            call_deadline: short_deadline,
-        };
+            call_deadline: CALL_DEADLINE,
+        }
+        .with_call_deadline(short_deadline);
         adapter.mints.lock().unwrap_or_else(PoisonError::into_inner).insert(
             "handle-1".to_string(),
             MintRecord {

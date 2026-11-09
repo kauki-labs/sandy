@@ -56,7 +56,9 @@ impl CredentialResolver for TrustRootResolver {
     fn resolve(&self, name: &str, capabilities: &[String]) -> Result<(SharedProvider, Scope), String> {
         let dir = sandy::trust_roots_dir().map_err(|e| format!("trust-roots dir: {e}"))?;
         let (adapter, scope) = sandy::resolve_provider(&dir, name, capabilities)?;
-        Ok((Arc::new(adapter), scope))
+        // The adapter's own deadline matches the daemon's bound, so a call the
+        // bracket abandons does not keep a blocking-pool thread for 1500 s.
+        Ok((Arc::new(adapter.with_call_deadline(DAEMON_CALL_TIMEOUT)), scope))
     }
 }
 
@@ -1061,6 +1063,62 @@ mod tests {
         assert!(path.exists(), "the staged file stays for the job's own host");
         assert_eq!(d.registry.credentials().map(|c| c.live_count()), Some(1));
         Ok(())
+    }
+
+    /// A foreign host's result can mark the job terminal without revoking (the
+    /// connection owns no credential for it). A later Cancel then answers
+    /// `AlreadyTerminal`, and must still release the job's credential.
+    #[tokio::test]
+    async fn a_cancel_after_a_foreign_terminal_result_still_revokes() -> anyhow::Result<()> {
+        let d = daemon(FakeProvider::returning(TOKEN))?;
+        let mut dispatch_rx = register_host(&d, true)?;
+        let submitted = submit_ok(&d).await?;
+        let dispatch = tokio::time::timeout(WAIT, dispatch_rx.recv())
+            .await
+            .context("timed out waiting for the dispatch")?
+            .context("dispatch channel closed")?;
+        let path = staged_token_path(&dispatch)?;
+
+        let (mut other, serve) = connect_local_host_as(&d, "host-2").await?;
+        sandy_control_proto::write_frame(
+            &mut other,
+            &HostExecutorMessage {
+                op: Some(host_executor_message::Op::Result(JobResult {
+                    job_id: submitted.job_id.clone(),
+                    booted: true,
+                    exit_code: Some(0),
+                    timed_out: false,
+                    transport_error: None,
+                    console: String::new(),
+                })),
+            },
+        )
+        .await?;
+        drop(other);
+        tokio::time::timeout(WAIT, serve).await??;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        anyhow::ensure!(
+            d.provider.revoked().is_empty(),
+            "precondition: the foreign result revoked nothing"
+        );
+
+        let response = handle(
+            &d.store,
+            &d.registry,
+            &d.hosts,
+            Some(forward_back()?),
+            Uuid::new_v4(),
+            ControlRequest {
+                request_id: 3,
+                op: Some(control_request::Op::Cancel(CancelRequest {
+                    job_id: submitted.job_id.clone(),
+                    attach_token: Some(submitted.attach_token.clone()),
+                })),
+            },
+        )
+        .await?;
+        tracing::debug!(result = ?response.result, "cancel after a foreign result");
+        wait_revoked_and_removed(&d, &path).await
     }
 
     /// A store fault on the job insert, after the mint, fails the Submit and
