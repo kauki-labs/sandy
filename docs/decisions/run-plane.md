@@ -212,8 +212,8 @@ to 4096 bytes in the agent and again in the relay.
 
 **Status:** accepted for qemu on Linux and vfkit on macOS (epic #597). `sandy run` calls the sweep before it
 launches, in the `run` command only: `ls`, `status`, `wait` and `kill` share `host_backend()` and must never sweep.
-`sandyd` is to call it once at backend construction (separate work on the environment backend); until it does, a
-killed daemon's VMs are swept by the next `sandy run`.
+`sandyd` calls it once when it builds the `vm-qemu` environment backend (decision 34 of `sandyd.md`, #587), so a
+restarted daemon stops a killed one's VMs; a `sandy run` sweeps them too.
 
 **Context.** A VM backend keeps its running boxes in memory. A `SIGKILL` of the host process (the `sandyd` daemon or
 a `sandy run`) leaves qemu, its virtiofsd daemons and its egress proxy running with ppid 1, still holding the guest

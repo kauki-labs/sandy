@@ -116,20 +116,39 @@ async fn start_bridge<D: Dialer>(dialer: io::Result<D>) -> io::Result<Bridge> {
     Bridge::start(dialer?, BridgeConfig::default()).await
 }
 
-/// The environment backend that boots each environment as a qemu microVM.
+/// The environment backend that boots each environment as a qemu microVM. It sweeps the VMs a killed daemon left
+/// behind once, before it can launch a second VM for the same environment.
 #[cfg(target_os = "linux")]
 pub fn backend(
     settings: &crate::environment_backend::VmQemuSettings,
     rt: tokio::runtime::Handle,
+) -> sandy_environment::VmEnvironmentBackend {
+    backend_with_sweep(settings, rt, || {
+        let report = sandy_backend::QemuBackend::sweep_orphans();
+        if report.undecided > 0 {
+            // A kill that failed, an unknown owner or a process that outlived the stop wait stays: the driver may
+            // then launch next to the survivor, so an operator needs to see it.
+            tracing::warn!(
+                undecided = report.undecided,
+                "the orphan sweep left VMs undecided; a restarted environment may run beside one"
+            );
+        }
+    })
+}
+
+/// [`backend`] with the start-up sweep given, so a test counts the calls.
+#[cfg(target_os = "linux")]
+fn backend_with_sweep(
+    settings: &crate::environment_backend::VmQemuSettings,
+    rt: tokio::runtime::Handle,
+    sweep: impl FnOnce(),
 ) -> sandy_environment::VmEnvironmentBackend {
     use sandy_api::agent::{AgentLaunch, PORT_RELAY_VSOCK_PORT, SERVICE_ENV};
     use sandy_backend::QemuBackend;
     use sandy_conn::dial::VsockDialer;
     use sandy_environment::{BackendFactory, HeldBackend, VmEnvironmentBackend, VmEnvironmentConfig, guarded};
 
-    // Stop the VMs a killed daemon left behind before the driver can launch a second one for the same environment.
-    // `sweep_orphans` logs its own report and is safe beside a live daemon or CLI run.
-    let _ = QemuBackend::sweep_orphans();
+    sweep();
     let probe = Arc::new(HttpServiceProbe::new());
     let factory: BackendFactory = {
         let probe = Arc::clone(&probe);
@@ -381,5 +400,24 @@ mod tests {
         fn kind(&self) -> sandy_api::backend::SandboxKind {
             sandy_api::backend::SandboxKind::Vm
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_backend_sweeps_orphan_vms_once_when_it_is_built() {
+        let settings = crate::environment_backend::VmQemuSettings {
+            command: vec!["svc".to_owned()],
+            service_env: "{}".to_owned(),
+            boot_timeout_secs: 1,
+        };
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let _backend = super::backend_with_sweep(&settings, tokio::runtime::Handle::current(), || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "built backend must sweep exactly once"
+        );
     }
 }

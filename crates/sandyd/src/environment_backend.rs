@@ -18,7 +18,7 @@
 //!
 //! `vm-qemu` reads these as well, and only the provision timeout of the settings above. It refuses
 //! `SANDY_ENV_IDLE_TIMEOUT_SECS` and the process-only settings (`SANDY_ENV_PROCESS_COMMAND`, `SANDY_ENV_PAIR_COMMAND`,
-//! `SANDY_ENV_STATE_DIR`, `SANDY_ENV_PASS_ENV`) rather than ignore them:
+//! `SANDY_ENV_STATE_DIR`, `SANDY_ENV_PASS_ENV`, `SANDY_ENV_PATH`) rather than ignore them:
 //!
 //! | variable | meaning |
 //! | --- | --- |
@@ -189,6 +189,7 @@ fn from_env_on(
             "SANDY_ENV_PAIR_COMMAND",
             "SANDY_ENV_PROCESS_COMMAND",
             "SANDY_ENV_STATE_DIR",
+            "SANDY_ENV_PATH",
         ] {
             if get(name).is_some_and(|v| !v.trim().is_empty()) {
                 return Err(E::UnsupportedWithVm(name));
@@ -782,6 +783,7 @@ mod tests {
             "SANDY_ENV_PAIR_COMMAND",
             "SANDY_ENV_PROCESS_COMMAND",
             "SANDY_ENV_STATE_DIR",
+            "SANDY_ENV_PATH",
         ] {
             let mut env = vm_base();
             env.push((name, "X"));
