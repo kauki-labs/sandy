@@ -231,7 +231,6 @@ pub fn backend(settings: &crate::environment_backend::VmSettings, rt: tokio::run
     use sandy_conn::dial::VsockDialer;
     use sandy_environment::guarded;
 
-    sweep();
     let probe = Arc::new(HttpServiceProbe::new());
     let per_env = {
         let probe = Arc::clone(&probe);

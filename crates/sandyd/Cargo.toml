@@ -58,6 +58,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+zeroize.workspace = true
 
 # The `vm-qemu` (Linux: KVM, vhost-vsock) and `vm-vfkit` (macOS) environment backends (#587) boot microVMs.
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
