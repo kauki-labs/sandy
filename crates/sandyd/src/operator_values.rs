@@ -353,7 +353,9 @@ mod tests {
             SecretStore::open(&tmp.path().join("absent")),
             Err(SecretStoreError::Store { .. })
         ));
-        for mode in [0o777, 0o770, 0o707, 0o720, 0o702, 0o722] {
+        for mode in [
+            0o777, 0o770, 0o707, 0o720, 0o702, 0o722, 0o755, 0o750, 0o705, 0o710, 0o701,
+        ] {
             fs::set_permissions(tmp.path(), fs::Permissions::from_mode(mode)).context("chmod")?;
             assert!(
                 matches!(SecretStore::open(tmp.path()), Err(SecretStoreError::Store { .. })),
@@ -427,5 +429,36 @@ mod tests {
         assert!(matches!(read(b"", 0), Ok(v) if v.is_empty()));
         assert!(matches!(read(b"abcd", 3), Err(ReadError::Changed)), "grew");
         assert!(matches!(read(b"ab", 3), Err(ReadError::Changed)), "shrank");
+    }
+
+    #[test]
+    fn an_empty_file_is_refused() -> Result<()> {
+        // `echo new > KEY` truncates before it writes: a read between the two must not return an empty secret.
+        let (tmp, store) = store()?;
+        put(tmp.path(), "EMPTY", 0o600, b"")?;
+        let got = store.read("EMPTY");
+        assert!(matches!(got, Err(SecretStoreError::Refused { .. })), "{got:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_fifo_is_refused_without_blocking_the_open() -> Result<()> {
+        let (tmp, store) = store()?;
+        let made = std::process::Command::new("mkfifo")
+            .args(["-m", "600"])
+            .arg(tmp.path().join("FIFO"))
+            .status()
+            .context("run mkfifo")?;
+        anyhow::ensure!(made.success(), "mkfifo failed");
+        // Without O_NONBLOCK the open waits for a writer forever, so the read runs on a thread and is bounded.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(store.read("FIFO").map(|_| ()));
+        });
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .context("the read of a fifo blocked")?;
+        assert!(matches!(got, Err(SecretStoreError::Refused { .. })), "{got:?}");
+        Ok(())
     }
 }
