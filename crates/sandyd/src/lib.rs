@@ -29,6 +29,7 @@ pub mod mesh_accept;
 pub mod mesh_config;
 pub mod operator;
 pub mod peer_cred;
+pub mod profiles;
 pub mod store;
 #[cfg(test)]
 mod test_support;
@@ -182,7 +183,7 @@ mod tests {
             GetEnvironmentRequest,
         };
 
-        let environments = Arc::new(EnvironmentStore::open_in_memory()?);
+        let environments = Arc::new(EnvironmentStore::open_in_memory()?.with_profiles(test_support::test_profiles()));
         let (client, server) = UnixStream::pair()?;
         let serving = tokio::spawn(serve_connection(
             server,
