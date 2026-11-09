@@ -54,9 +54,12 @@ pub fn load(path: &Path) -> Result<IdentityProfiles, ProfilesError> {
         path: path.to_owned(),
         reason,
     };
+    // NONBLOCK: opening a FIFO for reading would otherwise wait for a writer, and the daemon would hang at start.
+    // It has no effect on a regular file, and a FIFO is then refused by the type check below.
+    let flags = rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK;
     let mut file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
+        .custom_flags(flags.bits().cast_signed())
         .open(path)
         .map_err(read)?;
     // Checked on the open handle, so the file cannot change between the check and the read.
@@ -117,6 +120,25 @@ mod tests {
                 .context("must refuse")?;
             assert!(matches!(err, ProfilesError::Unsafe { .. }), "{mode:o}: {err}");
         }
+        Ok(())
+    }
+
+    /// A FIFO would block an `open` for reading until a writer appears, so a plain open hangs the daemon at start.
+    #[test]
+    fn a_fifo_is_refused_without_blocking() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let fifo = dir.path().join("p.fifo");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status()?;
+        anyhow::ensure!(made.success(), "mkfifo failed");
+        let (tx, rx) = std::sync::mpsc::channel();
+        // A detached thread: if `load` blocks, the test fails on the timeout instead of hanging the run.
+        std::thread::spawn(move || {
+            let _ = tx.send(load(&fifo).err().map(|e| matches!(e, ProfilesError::Unsafe { .. })));
+        });
+        let outcome = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .context("load blocked on a FIFO")?;
+        assert_eq!(outcome, Some(true), "a FIFO must be refused as not a regular file");
         Ok(())
     }
 
