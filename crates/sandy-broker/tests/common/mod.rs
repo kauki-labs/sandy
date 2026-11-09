@@ -151,7 +151,23 @@ async fn build(
     let dir = tempfile::tempdir()?;
     let socket = dir.path().join("sandyd.sock");
     let store = Arc::new(JobStore::open_in_memory()?);
-    let environments = Arc::new(EnvironmentStore::open_in_memory()?.with_max_rows(row_cap));
+    // sandyd refuses an environment whose profile is not in its registry (#704).
+    let entry = |name: &str| {
+        format!(r#"{{"name":"{name}","credential":"github-main","targets":["o/r"],"capabilities":["read_code"]}}"#)
+    };
+    let registry = format!(
+        r#"{{"profiles":[{},{},{},{}]}}"#,
+        entry("dev"),
+        entry("prod"),
+        entry("other"),
+        entry("harness")
+    );
+    let profiles = Arc::new(sandy::IdentityProfiles::parse(&registry)?);
+    let environments = Arc::new(
+        EnvironmentStore::open_in_memory()?
+            .with_max_rows(row_cap)
+            .with_profiles(profiles),
+    );
     if opts.trusted_only_backend {
         environments.require_trusted_submitter();
     }

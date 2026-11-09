@@ -194,6 +194,17 @@ async fn start_bridge<D: Dialer>(dialer: io::Result<D>) -> io::Result<Bridge> {
     Bridge::start(dialer?, BridgeConfig::default()).await
 }
 
+/// A box the start-up sweep left undecided (a failed kill, an unknown owner, another pid namespace, or a process that
+/// outlived the stop wait) stays: the driver may then launch next to the survivor, so an operator needs to see it.
+fn warn_undecided(undecided: usize) {
+    if undecided > 0 {
+        tracing::warn!(
+            undecided,
+            "the orphan sweep left VMs undecided; a restarted environment may run beside one"
+        );
+    }
+}
+
 /// Compose the environment backend: run `sweep` once, now, then build each environment's backend with `per_env`.
 ///
 /// The sweep belongs here and not in `per_env`: it stops what a killed host left behind, and a launch must never
@@ -220,9 +231,7 @@ pub fn backend(settings: &crate::environment_backend::VmSettings, rt: tokio::run
     use sandy_conn::dial::VsockDialer;
     use sandy_environment::guarded;
 
-    // Stop the VMs a killed daemon left behind before the driver can launch a second one for the same environment.
-    // `sweep_orphans` logs its own report and is safe beside a live daemon or CLI run.
-    let _ = QemuBackend::sweep_orphans();
+    sweep();
     let probe = Arc::new(HttpServiceProbe::new());
     let per_env = {
         let probe = Arc::clone(&probe);
@@ -248,7 +257,7 @@ pub fn backend(settings: &crate::environment_backend::VmSettings, rt: tokio::run
         settings,
         probe,
         || {
-            let _ = QemuBackend::sweep_orphans();
+            warn_undecided(QemuBackend::sweep_orphans().undecided);
         },
         per_env,
     )
@@ -442,7 +451,7 @@ pub fn vfkit_backend(
         probe,
         || {
             // Stop the VMs a killed daemon left behind first, then clear the sockets nothing answers on.
-            let _ = VfkitBackend::sweep_orphans();
+            warn_undecided(VfkitBackend::sweep_orphans().undecided);
             let _ = sweep_stale_service_sockets(&sweep_base);
         },
         per_env,

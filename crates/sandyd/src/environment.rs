@@ -357,6 +357,20 @@ async fn create(
     if let Err(why) = validate_spec(&spec) {
         return refuse(EnvironmentErrorCode::InvalidArgument, why);
     }
+    // After the shape checks: a credential-shaped name is refused as that, never looked up. The message repeats
+    // no name, so a near-miss credential is not echoed back or logged.
+    let Some(profiles) = store.profiles() else {
+        return refuse(
+            EnvironmentErrorCode::InvalidArgument,
+            "no identity profile registry is configured; set SANDY_PROFILES to create an environment",
+        );
+    };
+    if profiles.resolve(&spec.profile).is_err() {
+        return refuse(
+            EnvironmentErrorCode::InvalidArgument,
+            "the profile is not in the registry",
+        );
+    }
     let new_id = format!("env-{}", uuid::Uuid::new_v4().simple());
     if let Some(refusal) = audit(store, "create", &new_id, trusted).await {
         return refusal;
@@ -620,7 +634,9 @@ mod tests {
     }
 
     fn store() -> Result<Arc<EnvironmentStore>> {
-        Ok(Arc::new(EnvironmentStore::open_in_memory()?))
+        Ok(Arc::new(
+            EnvironmentStore::open_in_memory()?.with_profiles(crate::test_support::test_profiles()),
+        ))
     }
 
     fn request(op: control_request::Op) -> ControlRequest {
@@ -992,7 +1008,11 @@ mod tests {
 
     #[tokio::test]
     async fn the_row_cap_is_a_typed_quota_error_and_never_refuses_a_retry() -> Result<()> {
-        let s = Arc::new(EnvironmentStore::open_in_memory()?.with_max_rows(Some(1)));
+        let s = Arc::new(
+            EnvironmentStore::open_in_memory()?
+                .with_profiles(crate::test_support::test_profiles())
+                .with_max_rows(Some(1)),
+        );
         create(&s, "k1", ephemeral()).await?;
         let op = control_request::Op::CreateEnvironment(CreateEnvironmentRequest {
             idempotency_key: "k2".to_owned(),
@@ -1099,6 +1119,53 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(refused(&s, op).await?, EnvironmentErrorCode::InvalidArgument);
+        Ok(())
+    }
+
+    fn create_op(key: &str, profile: &str) -> control_request::Op {
+        let mut spec = ephemeral();
+        spec.profile = profile.to_owned();
+        control_request::Op::CreateEnvironment(CreateEnvironmentRequest {
+            idempotency_key: key.to_owned(),
+            spec: Some(spec),
+            ..Default::default()
+        })
+    }
+
+    async fn refusal_message(store: &Arc<EnvironmentStore>, op: control_request::Op) -> Result<String> {
+        match call(store, op).await? {
+            Err((EnvironmentErrorCode::InvalidArgument, message)) => Ok(message),
+            other => bail!("expected an invalid-argument refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_known_profile_is_stored_and_an_unknown_one_writes_no_row() -> Result<()> {
+        let s = store()?;
+        let env = create(&s, "k1", ephemeral()).await?;
+        assert_eq!(env.spec.context("spec")?.profile, "harness");
+        refusal_message(&s, create_op("k2", "missing")).await?;
+        let row = blocking(&s, |s| s.get_by_request_id("k2"))
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        assert!(row.is_none(), "a refused create must write no row");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn without_a_registry_every_create_is_refused_naming_the_setting() -> Result<()> {
+        let s = Arc::new(EnvironmentStore::open_in_memory()?);
+        let message = refusal_message(&s, create_op("k", "harness")).await?;
+        assert!(message.contains("SANDY_PROFILES"), "{message}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_refused_profile_name_is_never_echoed_back() -> Result<()> {
+        let s = store()?;
+        // Not credential-shaped, so it reaches the lookup; it is unknown, and the reply must not repeat it.
+        let message = refusal_message(&s, create_op("k", "private-team-name")).await?;
+        assert!(!message.contains("private-team-name"), "{message}");
         Ok(())
     }
 
@@ -1357,7 +1424,11 @@ mod tests {
 
     #[tokio::test]
     async fn create_and_delete_churn_past_the_row_cap_leaves_room_for_a_new_create() -> Result<()> {
-        let s = Arc::new(EnvironmentStore::open_in_memory()?.with_max_rows(Some(2)));
+        let s = Arc::new(
+            EnvironmentStore::open_in_memory()?
+                .with_profiles(crate::test_support::test_profiles())
+                .with_max_rows(Some(2)),
+        );
         for n in 0..6 {
             let env = create(&s, &format!("churn-{n}"), ephemeral()).await?;
             assert_eq!(state_after(&s, delete(&env.environment_id)).await?, WireState::Deleted);
@@ -1640,7 +1711,11 @@ mod tests {
         let path = dir.join("audit.jsonl");
         let log = crate::audit::AuditLog::open(&path)?;
         Ok((
-            Arc::new(EnvironmentStore::open_in_memory()?.with_audit(Arc::new(log))),
+            Arc::new(
+                EnvironmentStore::open_in_memory()?
+                    .with_profiles(crate::test_support::test_profiles())
+                    .with_audit(Arc::new(log)),
+            ),
             path,
         ))
     }
@@ -1713,7 +1788,11 @@ mod tests {
         std::fs::write(&path, "")?;
         let read_only = std::fs::File::open(&path)?;
         let log = crate::audit::AuditLog::from_file(path, read_only);
-        let s = Arc::new(EnvironmentStore::open_in_memory()?.with_audit(Arc::new(log)));
+        let s = Arc::new(
+            EnvironmentStore::open_in_memory()?
+                .with_profiles(crate::test_support::test_profiles())
+                .with_audit(Arc::new(log)),
+        );
         assert_eq!(
             refused(&s, trusted_create("k1")).await?,
             EnvironmentErrorCode::Unavailable
@@ -1791,7 +1870,11 @@ mod tests {
         let broken = dir.path().join("audit.jsonl");
         std::fs::write(&broken, "")?;
         let log = crate::audit::AuditLog::from_file(broken.clone(), std::fs::File::open(&broken)?);
-        let s = Arc::new(EnvironmentStore::open_in_memory()?.with_audit(Arc::new(log)));
+        let s = Arc::new(
+            EnvironmentStore::open_in_memory()?
+                .with_profiles(crate::test_support::test_profiles())
+                .with_audit(Arc::new(log)),
+        );
         let CreateOutcome::Created(row) =
             s.create_for("k2", "env-0002", &persistent().encode_to_vec(), SPEC_ENCODING, true)?
         else {

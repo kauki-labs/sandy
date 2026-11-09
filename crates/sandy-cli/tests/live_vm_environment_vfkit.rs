@@ -286,7 +286,7 @@ async fn a_vfkit_environment_becomes_ready_answers_http_and_leaves_nothing_after
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     // The staging base exists before the run (the daemon creates it at start-up), so any new entry in it is a stray: a
-    // run directory, a secret share or an  socket that outlived the environment.
+    // run directory, a secret share or a service socket that outlived the environment.
     let strays: Vec<_> = staging_entries().difference(&staging_before).cloned().collect();
     ensure!(
         strays.is_empty(),
