@@ -327,7 +327,7 @@ sequenceDiagram
   renew and revoke lifecycle around one staged credential, with every provider call
   bounded. sandyd mints through it for a job that names `credential`, local dispatch only,
   and revokes on every terminal path; it does not refresh mid-run, since the host-executor
-  copies the token at staging. See `docs/decisions/sandyd.md` decision 34.
+  copies the token at staging. See `docs/decisions/sandyd.md` decision 37.
 
 **KPI.**
 

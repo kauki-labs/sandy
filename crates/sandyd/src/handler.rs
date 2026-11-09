@@ -105,7 +105,7 @@ fn placement_required_error(
 /// `outputs`, or `secrets`. Non-empty here means placement must land on a
 /// host-executor that declared `shares_submitter_filesystem`; a path is only
 /// ever meaningful on the filesystem the submitter itself is on. A
-/// `credential` (#481, decision 34) requires the same: the minted token is a
+/// `credential` (#481, decision 37) requires the same: the minted token is a
 /// file on this machine, and no encrypted mesh transport carries it to a
 /// remote host yet (#495).
 fn submit_requires_local_dispatch(submit: &SubmitRequest) -> bool {
@@ -685,7 +685,7 @@ pub async fn handle(
                 _ => None,
             };
             if let (Some(bracket), Some((_, _, dispatch))) = (&job_credential, dispatch_plan.as_mut()) {
-                // The path only: the token stays in the file (decision 34).
+                // The path only: the token stays in the file (decision 37).
                 if let sandy::SecretSource::File(path) = bracket.secret_ref().source {
                     dispatch.secrets.push(sandy_executor_proto::SecretRef {
                         name: CREDENTIAL_SECRET_NAME.to_owned(),

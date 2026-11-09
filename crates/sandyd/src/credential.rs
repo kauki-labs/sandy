@@ -1,4 +1,4 @@
-//! A job's daemon-minted forge credential (#481, `sandyd.md` decision 34).
+//! A job's daemon-minted forge credential (#481, `sandyd.md` decision 37).
 //!
 //! A Submit naming `credential` gets a scoped token minted here, before dispatch,
 //! through the reusable [`sandy::CredentialBracket`]. A mint failure refuses the

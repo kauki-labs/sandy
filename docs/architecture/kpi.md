@@ -364,10 +364,10 @@ Whether a restart stops the VM that a killed host process left behind ([`run-pla
 
 ## Daemon-minted credentials (#481)
 
-A job's forge credential minted by sandyd ([`sandyd.md`](../decisions/sandyd.md) decision 34). Tier-2 rows
+A job's forge credential minted by sandyd ([`sandyd.md`](../decisions/sandyd.md) decision 37). Tier-2 rows
 drive the real Submit handler and host-executor connection over `FakeProvider`. A live row (a real GitHub
 App token through sandyd and a local host-executor) is not written. Mid-run refresh is not built in sandyd
-(decision 34); the bracket's own renew is tier-2 tested in the lib.
+(decision 37); the bracket's own renew is tier-2 tested in the lib.
 
 | #      | Capability             | Required behaviour                                                                                                                                                                                                                                                                                                                          | Proven by                                                                                                                                                                                                                                                                                                                                                                                                                                                 | Status       |
 | ------ | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------ |

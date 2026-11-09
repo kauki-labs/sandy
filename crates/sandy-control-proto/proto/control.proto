@@ -129,7 +129,7 @@ message SubmitRequest {
   repeated Input inputs = 5;
   repeated Output outputs = 6;
   repeated SecretRef secrets = 7;
-  // A daemon-minted forge credential (#481, sandyd.md decision 34): the name of
+  // A daemon-minted forge credential (#481, sandyd.md decision 37): the name of
   // a trust root `sandy cred github register` wrote on the daemon's host, the
   // same name `sandy run --credential` takes. sandyd mints a scoped token before
   // dispatch (a mint failure refuses the Submit), hands it to the job as the
