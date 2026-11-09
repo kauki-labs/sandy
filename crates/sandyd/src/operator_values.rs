@@ -142,8 +142,7 @@ impl SecretStore {
         if meta.uid() != sandy_fsutil::current_uid() {
             return Err(refused("owned by another user"));
         }
-        // Group and other bits, owner execute, setuid, setgid and sticky: the file is exactly `0600` or tighter.
-        if meta.mode() & 0o7177 != 0 {
+        if !mode_ok(meta.mode()) {
             return Err(refused("not mode 0600 or tighter"));
         }
         let declared = meta.len();
@@ -186,6 +185,11 @@ fn read_declared(reader: &mut impl std::io::Read, len: usize) -> Result<Zeroizin
     }
     bytes.truncate(len);
     Ok(bytes)
+}
+
+/// Group and other bits, owner execute, setuid, setgid and sticky: the file is exactly `0600` or tighter.
+fn mode_ok(mode: u32) -> bool {
+    mode & 0o7177 == 0
 }
 
 /// `[A-Z][A-Z0-9_]{0,63}`: the rule `service_secrets` names follow. Checked again here because the name
@@ -269,9 +273,9 @@ mod tests {
                 "mode {mode:o}: {got:?}"
             );
         }
-        // Only setgid and sticky may be skipped: a vacuous setuid row must show.
+        // Only a special bit may be skipped (the Linux Nix sandbox stores none of them); `mode_ok` covers them.
         assert!(
-            skipped.iter().all(|mode| [0o2600, 0o1600].contains(mode)),
+            skipped.iter().all(|mode| mode & 0o7000 != 0),
             "modes the OS did not store: {skipped:?}"
         );
         Ok(())
@@ -402,6 +406,18 @@ mod tests {
             "the read must come from the directory that was checked"
         );
         Ok(())
+    }
+
+    #[test]
+    fn only_exactly_0600_or_tighter_passes_the_mode_check() {
+        for ok in [0o600, 0o400, 0o200, 0o000] {
+            assert!(mode_ok(ok), "{ok:o}");
+        }
+        for bad in [
+            0o700, 0o500, 0o640, 0o604, 0o660, 0o606, 0o601, 0o4600, 0o2600, 0o1600, 0o6600, 0o7600,
+        ] {
+            assert!(!mode_ok(bad), "{bad:o}");
+        }
     }
 
     #[test]
