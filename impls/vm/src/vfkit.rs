@@ -450,9 +450,9 @@ impl VfkitBackend {
 ///
 /// The path must fit `sun_path` and hold no comma (vfkit splits its option string on commas). vfkit is SIGKILLed at
 /// teardown and cannot unlink its own socket, so a socket left by an earlier run would make the next bind fail: that
-/// one file type is removed, but only when nothing answers on it. A socket that answers belongs to a live VM (such as
-/// an orphan of a killed host) and is refused, so a second VM never replaces it. Anything else at the path (a file,
-/// directory or symlink) is refused, never deleted.
+/// one file type is removed, but only when nothing answers on it. A socket that answers belongs to a live VM (of this
+/// environment, or another daemon's) and is refused, so a second VM never replaces it. Anything else at the path (a
+/// file, directory or symlink) is refused, never deleted.
 fn prepare_service_socket(socket: &Path) -> Result<PathBuf, BackendError> {
     use std::os::unix::fs::FileTypeExt as _;
 
@@ -1373,8 +1373,8 @@ mod tests {
         Ok(())
     }
 
-    /// A socket that answers belongs to a live VM (an orphan of a killed host, or another run): it is refused and
-    /// kept, never unlinked from under the VM.
+    /// A socket that answers belongs to a live VM (a live VM of this environment, or another daemon's): it is refused
+    /// and kept, never unlinked from under the VM.
     #[test]
     fn a_service_socket_that_answers_is_refused_and_kept() -> anyhow::Result<()> {
         use std::os::unix::net::UnixListener;
