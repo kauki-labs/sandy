@@ -179,7 +179,10 @@ async fn main() {
     // The identity-profile registry (#704) is read once; a file that cannot be trusted stops the daemon. Unset
     // means no registry, and every environment create is then refused.
     let profiles = match std::env::var_os("SANDY_PROFILES") {
-        None => None,
+        None => {
+            tracing::warn!("SANDY_PROFILES is not set; every environment create will be refused");
+            None
+        }
         Some(path) => match sandyd::profiles::load(std::path::Path::new(&path)) {
             Ok(profiles) => Some(Arc::new(profiles)),
             Err(e) => {
