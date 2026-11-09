@@ -71,7 +71,7 @@ version, metadata, dependency versions, and lints through the root `Cargo.toml`
 - **`sandyd`** — the per-machine control-plane daemon (epic #205) dispatching
   jobs into the agent fabric; M2 adds the `HostRegistry`, mesh listener,
   `pick_host_for` placement by isolation class, and the decision-6 agent-link
-  accept loop. Environments run through `sandy-environment`'s backends (`process-insecure`, `vm-qemu`). See
+  accept loop. Environments run through `sandy-environment`'s backends (`process-insecure`, `vm-qemu`, `vm-vfkit`). See
   `docs/decisions/sandyd.md`.
 - **`sandy-host-executor`** — the M2 remote executor (#269): detects and
   declares its capabilities, then handles dispatches sequentially — decodes the
@@ -93,7 +93,7 @@ version, metadata, dependency versions, and lints through the root `Cargo.toml`
   trusted-only `ProcessEnvironmentBackend` (a service such as `t3 serve` as a host process group,
   cleared environment, no isolation, `SANDY_ENV_BACKEND=process-insecure`, decision 29), and
   `VmEnvironmentBackend`, one held agent-mode `VmBackend::run` per environment (decision 31). `sandyd` composes it
-  as `SANDY_ENV_BACKEND=vm-qemu` (Linux only, decision 34). A Ready VM environment cannot be linked yet: pairing in VM
+  as `SANDY_ENV_BACKEND=vm-qemu` (Linux only, decision 34) and `vm-vfkit` (macOS only, decision 35). A Ready VM environment cannot be linked yet: pairing in VM
   mode has no owner (#590).
 - **`sandy-egress-proxy`** — the per-run host egress proxy for NIC-less guests
   (#401, epic #360): a pure CONNECT-parse / allow-list / address-filter core and an

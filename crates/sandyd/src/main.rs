@@ -989,6 +989,7 @@ fn start_environment_driver(environments: &Arc<EnvironmentStore>) -> Option<toki
             }
         }
         BackendSettings::VmQemu(vm) => vm_environment_backend(&vm),
+        BackendSettings::VmVfkit(vm) => vfkit_environment_backend(&vm),
     };
     let driver = Arc::new(EnvironmentDriver::new(Arc::clone(environments), backend, config.driver));
     Some(tokio::spawn(driver.run(environment_backend::DRIVER_INTERVAL)))
@@ -997,16 +998,38 @@ fn start_environment_driver(environments: &Arc<EnvironmentStore>) -> Option<toki
 /// The qemu microVM environment backend. Only Linux can run one, and `from_env` refuses `vm-qemu` elsewhere.
 #[cfg(target_os = "linux")]
 fn vm_environment_backend(
-    vm: &environment_backend::VmQemuSettings,
+    vm: &environment_backend::VmSettings,
 ) -> Arc<dyn sandy_api::environment::EnvironmentBackend + Send + Sync> {
     Arc::new(sandyd::environment_vm::backend(vm, tokio::runtime::Handle::current()))
 }
 
 #[cfg(not(target_os = "linux"))]
 fn vm_environment_backend(
-    _vm: &environment_backend::VmQemuSettings,
+    _vm: &environment_backend::VmSettings,
 ) -> Arc<dyn sandy_api::environment::EnvironmentBackend + Send + Sync> {
     tracing::error!("SANDY_ENV_BACKEND=vm-qemu needs Linux");
+    std::process::exit(1);
+}
+
+/// The vfkit microVM environment backend. Only macOS can run one, and `from_env` refuses `vm-vfkit` elsewhere.
+#[cfg(target_os = "macos")]
+fn vfkit_environment_backend(
+    vm: &environment_backend::VmSettings,
+) -> Arc<dyn sandy_api::environment::EnvironmentBackend + Send + Sync> {
+    match sandyd::environment_vm::vfkit_backend(vm, tokio::runtime::Handle::current()) {
+        Ok(backend) => Arc::new(backend),
+        Err(e) => {
+            tracing::error!(error = %e, "could not start the vfkit environment backend");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn vfkit_environment_backend(
+    _vm: &environment_backend::VmSettings,
+) -> Arc<dyn sandy_api::environment::EnvironmentBackend + Send + Sync> {
+    tracing::error!("SANDY_ENV_BACKEND=vm-vfkit needs macOS");
     std::process::exit(1);
 }
 

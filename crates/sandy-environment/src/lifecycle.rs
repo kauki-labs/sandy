@@ -1,8 +1,9 @@
 //! Ties what an environment holds beside its run (a host bridge and its probe registration) to the run itself
 //! (#587, slice C3b).
 //!
-//! The qemu backend reports the guest's CID to a hook after the guest has booted. The hook starts the bridge, and
-//! the bridge must stop when `run()` returns: the CID then belongs to nobody, and another VM can take it. A
+//! The qemu backend reports the guest's CID to a hook after the guest has booted (vfkit has no CID: the agent link
+//! coming up starts the bridge). The bridge must stop when `run()` returns: a CID then belongs to nobody, and another
+//! VM can take it. A
 //! [`GuardedBackend`] wraps the hypervisor backend the factory builds and drops the [`RunGuards`] it shares with
 //! the hook as soon as `run()` returns, however it ends. A hook that fires after that point has its guard dropped
 //! on the spot.

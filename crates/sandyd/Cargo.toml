@@ -44,6 +44,7 @@ getrandom.workspace = true
 prost.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio = { workspace = true, features = [
   "rt-multi-thread",
   "net",
@@ -59,8 +60,8 @@ thiserror.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
 
-# The `vm-qemu` environment backend (#587) boots qemu guests: Linux only (KVM, vhost-vsock).
-[target.'cfg(target_os = "linux")'.dependencies]
+# The `vm-qemu` (Linux: KVM, vhost-vsock) and `vm-vfkit` (macOS) environment backends (#587) boot microVMs.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 sandy-backend = { workspace = true, features = ["impl-vm"] }
 
 [dev-dependencies]
