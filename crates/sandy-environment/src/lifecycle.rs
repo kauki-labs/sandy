@@ -45,6 +45,23 @@ impl RunGuards {
         release(dropped); // outside the lock: a guard's drop may take other locks
     }
 
+    /// Build a guard and hold it, but only while the run is up. `make` runs under the slot's lock, so a run that
+    /// ended before it could start never has `make` called: whatever `make` registers elsewhere (a probe address)
+    /// cannot outlive its run or be replaced by a late hook of an earlier one. Keep `make` short and free of
+    /// calls back into this slot. Returns whether `make` ran.
+    pub fn hold_if_open(&self, make: impl FnOnce() -> RunGuard) -> bool {
+        let (ran, dropped) = {
+            let mut slot = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            if slot.closed {
+                (false, None)
+            } else {
+                (true, slot.guard.replace(make()))
+            }
+        };
+        release(dropped);
+        ran
+    }
+
     /// Close the slot and drop what it holds.
     fn close(&self) {
         let dropped = {

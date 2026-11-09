@@ -20,6 +20,7 @@ pub mod environment;
 pub mod environment_backend;
 pub mod environment_driver;
 pub mod environment_store;
+pub mod environment_vm;
 pub mod handler;
 pub mod host_conn;
 pub mod host_registry;
