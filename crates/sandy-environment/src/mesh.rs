@@ -204,7 +204,9 @@ pub trait GuestHooks: Send + Sync {
     /// teardown after the rest ran. Teardown skips it when the VM never booted
     /// (setup failed at [`SetupStep::Boot`] or earlier), once it succeeded, and once
     /// the VM is stopped, so a retry never aims it at a stopped VM. A hook that
-    /// failed is not retried: the failure is reported on the call that ran it.
+    /// failed runs again on a retry while the VM is still up. A caller that
+    /// retries until `Ok` can lose an earlier `HookFailed` when the stop then
+    /// succeeds, so it must record a `HookFailed` from any attempt.
     fn before_teardown(&self, name: &str) -> impl Future<Output = Result<(), SeamError>> + Send {
         let _ = name;
         async { Ok(()) }
@@ -243,7 +245,11 @@ pub trait FileSink: Send + Sync {
 /// Each operation runs on the blocking pool, so a wedged sink cannot stop the
 /// caller's timeout from firing. A timed-out operation keeps its thread until
 /// the sink returns, so operations hold a gate: a later removal waits for an
-/// earlier straggling write instead of racing it.
+/// earlier straggling write instead of racing it. The gate is mutual
+/// exclusion, not ordering: do not retry setup while a timed-out operation may
+/// still be running, since a straggler can run after the retry's delivery and
+/// wipe the new key. A retry loop against a wedged sink holds one blocking-pool
+/// thread per timeout.
 pub struct SecretsDir<S>(std::sync::Arc<Gated<S>>);
 
 struct Gated<S> {
@@ -466,7 +472,8 @@ async fn bounded<T>(limit: Duration, call: impl Future<Output = Result<T, SeamEr
 ///
 /// The minted key goes into `slot` before anything else awaits. A caller that
 /// drops this future must run [`teardown`] with the same `name` and `slot`:
-/// once the key is in the guest it is only safe when the VM is stopped or the
+/// Setup must finish or be dropped before teardown starts; a teardown during an
+/// in-flight setup is not supported. Once the key is in the guest it is only safe when the VM is stopped or the
 /// key is expired.
 ///
 /// A seam error while polling counts as one failed probe, not an abort, so a
@@ -1839,6 +1846,24 @@ mod tests {
             .await
             .context("retry: the VM is stopped, nothing is left")?;
         assert_eq!(w.log().iter().filter(|l| *l == "before_teardown").count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_hook_runs_again_on_a_retry_while_the_vm_is_still_up() -> Result<()> {
+        let w = World::online();
+        run_setup(&w).await.context("setup")?;
+        {
+            let mut s = w.st();
+            s.before_teardown_fails = true;
+            s.stop_error = Some("qemu wedged".into());
+        }
+        let r = run_teardown(&w, T).await;
+        assert!(matches!(r, Err(TeardownError::VmStillRunning { .. })), "{r:?}");
+        w.st().stop_error = None;
+        let r = run_teardown(&w, T).await;
+        assert!(matches!(r, Err(TeardownError::HookFailed { .. })), "{r:?}");
+        assert_eq!(w.log().iter().filter(|l| *l == "before_teardown").count(), 2);
         Ok(())
     }
 
