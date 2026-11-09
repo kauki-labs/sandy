@@ -176,9 +176,28 @@ async fn main() {
         std::process::exit(1);
     }
 
+    // The identity-profile registry (#704) is read once; a file that cannot be trusted stops the daemon. Unset
+    // means no registry, and every environment create is then refused.
+    let profiles = match std::env::var_os("SANDY_PROFILES") {
+        None => None,
+        Some(path) => match sandyd::profiles::load(std::path::Path::new(&path)) {
+            Ok(profiles) => Some(Arc::new(profiles)),
+            Err(e) => {
+                tracing::error!(error = %e, "could not load SANDY_PROFILES; refusing to start");
+                std::process::exit(1);
+            }
+        },
+    };
+
     // Same file as the job store: one durable, 0600 database for the daemon.
     let environments = match EnvironmentStore::open(&db_path) {
-        Ok(environments) => Arc::new(environments.with_max_rows(max_environments).with_audit(audit)),
+        Ok(environments) => {
+            let environments = environments.with_max_rows(max_environments).with_audit(audit);
+            Arc::new(match profiles {
+                Some(profiles) => environments.with_profiles(profiles),
+                None => environments,
+            })
+        }
         Err(e) => {
             tracing::error!(error = %e, db = %db_path.display(), "could not open the environment store");
             std::process::exit(1);

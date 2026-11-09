@@ -21,6 +21,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+sandy.workspace = true
 sandy-api.workspace = true
 sandy-control-proto.workspace = true
 sandy-environment.workspace = true
@@ -56,6 +57,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
