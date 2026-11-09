@@ -72,6 +72,9 @@ impl std::fmt::Debug for CredentialBracket {
     }
 }
 
+/// The longest staged token [`TokenRedactor`] redacts; a longer file fails closed.
+const MAX_TOKEN_BYTES: u64 = 64 * 1024;
+
 /// Redacts a staged token from text. It reads the staged file each time, because
 /// nothing in memory holds the token.
 #[derive(Debug, Clone)]
@@ -87,11 +90,23 @@ impl TokenRedactor {
     /// URL or JSON escaping) or a copy cut by a console tail is not.
     #[must_use]
     pub fn redact_bytes(&self, bytes: Vec<u8>) -> Option<Vec<u8>> {
-        use std::io::Read as _;
-        let mut token = Vec::new();
-        std::fs::File::open(&self.token_path)
-            .and_then(|f| f.take(64 * 1024).read_to_end(&mut token))
+        use std::{io::Read as _, os::unix::fs::OpenOptionsExt as _};
+        // O_NONBLOCK: a FIFO swapped in at the path must not block this open (the
+        // regular-file check then refuses it). O_NOFOLLOW: a symlink is refused.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(&self.token_path)
             .ok()?;
+        if !file.metadata().ok()?.is_file() {
+            return None;
+        }
+        let mut token = Vec::new();
+        // One byte past the limit tells a token that is too long to redact whole.
+        file.take(MAX_TOKEN_BYTES + 1).read_to_end(&mut token).ok()?;
+        if token.len() as u64 > MAX_TOKEN_BYTES {
+            return None;
+        }
         let token = token.trim_ascii();
         if token.is_empty() {
             return None;
@@ -682,6 +697,51 @@ mod tests {
         assert_eq!(redactor.redact_bytes(b"tok-secret".to_vec()), None, "an empty token");
         std::fs::remove_file(&path)?;
         assert_eq!(redactor.redact_bytes(b"tok-secret".to_vec()), None, "a missing file");
+        Ok(())
+    }
+
+    /// A staged file swapped for a FIFO, a symlink or an oversized file fails
+    /// closed, and the FIFO case does not block.
+    #[test]
+    fn redact_fails_closed_on_a_fifo_a_symlink_or_an_oversized_token() -> anyhow::Result<()> {
+        let (_tmp, target) = private_dir()?;
+        let provider = Arc::new(Scripted::new(vec!["tok-secret"], Duration::from_secs(600)));
+        let bracket =
+            CredentialBracket::mint_and_stage(provider, &Scope::default(), target, 600, Duration::from_secs(5))?;
+        let path = bracket.token_path.clone();
+        let redactor = bracket.redactor();
+
+        std::fs::remove_file(&path)?;
+        let status = std::process::Command::new("mkfifo").arg(&path).status()?;
+        anyhow::ensure!(status.success(), "mkfifo exited {status}");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fifo_redactor = redactor.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(fifo_redactor.redact_bytes(b"tok-secret".to_vec()));
+        });
+        let outcome = rx
+            .recv_timeout(Duration::from_secs(5))
+            .context("redaction blocked on a FIFO")?;
+        assert_eq!(outcome, None, "a FIFO fails closed");
+        std::fs::remove_file(&path)?;
+
+        let elsewhere = path.with_extension("real");
+        std::fs::write(&elsewhere, "tok-secret")?;
+        std::os::unix::fs::symlink(&elsewhere, &path)?;
+        assert_eq!(
+            redactor.redact_bytes(b"tok-secret".to_vec()),
+            None,
+            "a symlink fails closed"
+        );
+        std::fs::remove_file(&path)?;
+        std::fs::remove_file(&elsewhere)?;
+
+        std::fs::write(&path, vec![b'a'; usize::try_from(MAX_TOKEN_BYTES)? + 1])?;
+        assert_eq!(
+            redactor.redact_bytes(b"aaaa".to_vec()),
+            None,
+            "an oversized token fails closed"
+        );
         Ok(())
     }
 }

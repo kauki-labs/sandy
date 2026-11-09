@@ -624,6 +624,20 @@ mod tests {
         Ok(())
     }
 
+    /// Wait until a captured log line holds both `job_id` and `needle`: the
+    /// persister's own drop warning, a signal that it finished.
+    async fn wait_for_log_line(job_id: &str, needle: &str) -> anyhow::Result<()> {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let logs = captured_logs().contents()?;
+            if logs.lines().any(|l| l.contains(job_id) && l.contains(needle)) {
+                return Ok(());
+            }
+            anyhow::ensure!(Instant::now() < deadline, "no log line with {needle:?} for {job_id}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     async fn wait_status<P>(d: &Daemon<P>, job_id: &str, want: JobStatus) -> anyhow::Result<()> {
         let deadline = Instant::now() + WAIT;
         loop {
@@ -1204,13 +1218,47 @@ mod tests {
                 format!("$ echo $GITHUB_TOKEN\n{TOKEN}\n").into_bytes(),
             )
             .await?;
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let archive = d.store.archive(&submitted.job_id)?;
-        assert!(
-            archive
-                .as_deref()
-                .is_none_or(|a| !String::from_utf8_lossy(a).contains(TOKEN)),
-            "the raw token must not be stored: {archive:?}"
+        wait_for_log_line(&submitted.job_id, "dropped the transcript").await?;
+        assert_eq!(
+            d.store.archive(&submitted.job_id)?,
+            None,
+            "the archive must not be stored"
+        );
+        drop(client);
+        tokio::time::timeout(WAIT, serve).await??;
+        Ok(())
+    }
+
+    /// A live credential whose staged file is gone cannot be redacted with: the
+    /// archive is dropped, not stored raw.
+    #[tokio::test]
+    async fn an_archive_is_dropped_when_the_staged_token_is_unavailable() -> anyhow::Result<()> {
+        let d = daemon(FakeProvider::returning(TOKEN))?;
+        let (mut client, serve) = connect_local_host(&d).await?;
+        let submitted = submit_ok(&d).await?;
+        let dispatch = read_dispatch(&mut client).await?;
+        let path = staged_token_path(&dispatch)?;
+        std::fs::remove_file(&path)?;
+
+        let job = d.registry.get(&submitted.job_id).context("job channel")?;
+        let agent = job.channel.join(&job.agent_cap)?;
+        job.channel
+            .post(
+                &agent,
+                Some(sandy_proto::MessageType::Output(sandy_proto::Output {})),
+                sandy_fabric_local::agent::ARCHIVE_TRANSCRIPT,
+                format!("{TOKEN}\n").into_bytes(),
+            )
+            .await?;
+        wait_for_log_line(&submitted.job_id, "dropped the transcript").await?;
+        assert_eq!(
+            d.store.archive(&submitted.job_id)?,
+            None,
+            "the archive must not be stored"
+        );
+        anyhow::ensure!(
+            d.registry.credentials().map(|c| c.live_count()) == Some(1),
+            "the credential is still held"
         );
         drop(client);
         tokio::time::timeout(WAIT, serve).await??;
