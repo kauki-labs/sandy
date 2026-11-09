@@ -2406,6 +2406,7 @@ dependencies = [
  "sandy-fabric",
  "sandy-fabric-local",
  "sandy-fsutil",
+ "sandy-lib",
  "sandy-proto",
  "sandyd",
  "serde",
