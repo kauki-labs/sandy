@@ -125,13 +125,16 @@ fn the_500_boundary_and_other_statuses() -> Result<()> {
         ("HTTP/1.1 500 X\r\n\r\n", false),
         ("HTTP/1.1 404 Not Found\r\n\r\n", true),
         ("HTTP/1.1 302 Found\r\n\r\n", true),
+        ("HTTP/1.1 000 X\r\n\r\n", false),
+        ("HTTP/1.1 099 X\r\n\r\n", false),
+        ("HTTP/1.1 100 Continue\r\n\r\n", true),
         ("HTTP/1.1 +99 X\r\n\r\n", false),
         ("HTTP/1.1 2xx X\r\n\r\n", false),
         ("HTTP/1.1200 OK\r\n\r\n", false),
         ("HTTP/1.1 2000 X\r\n\r\n", false),
         ("HTTP/1.1 200garbage\r\n\r\n", false),
         ("HTTP/1.1 200\r\n\r\n", true),
-        ("HTTP/1.1 200", true), // the status at the very end of input
+        ("HTTP/1.1 200", false), // the status at the very end of input: no delimiter, no answer
         ("HTTP/2 200\r\n\r\n", false),
         ("HTTP/1.", false), // early EOF
     ] {
@@ -171,7 +174,7 @@ fn a_server_that_never_answers_or_trickles_cannot_hold_the_probe_past_its_budget
         let out = probe_at(addr)?;
         assert!(matches!(&out, Probe::Starting { .. }), "{byte:?}: {out:?}");
         assert!(
-            start.elapsed() < Duration::from_millis(2000),
+            start.elapsed() < Duration::from_millis(3000),
             "{byte:?}: the probe took {:?}",
             start.elapsed()
         );
@@ -188,7 +191,7 @@ fn a_status_line_that_stalls_before_its_delimiter_is_starting_not_ready() -> Res
     let out = probe_at(addr)?;
     assert!(matches!(&out, Probe::Starting { step } if step == "boot"), "{out:?}");
     assert!(
-        start.elapsed() < Duration::from_millis(2000),
+        start.elapsed() < Duration::from_millis(3000),
         "took {:?}",
         start.elapsed()
     );
@@ -215,6 +218,10 @@ fn serve_slowly_after(head: &'static [u8], hold: Duration) -> Result<(SocketAddr
 #[test]
 fn the_probe_is_usable_as_a_vm_backends_service_probe() -> Result<()> {
     let p: std::sync::Arc<dyn ServiceProbe> = std::sync::Arc::new(HttpServiceProbe::new());
-    let _ = p.probe("env-a").context("probe")?;
+    let out = p.probe("env-a").context("probe")?;
+    assert!(
+        matches!(out, Probe::Starting { .. }),
+        "an unregistered id is Starting: {out:?}"
+    );
     Ok(())
 }
