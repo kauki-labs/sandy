@@ -439,6 +439,16 @@ impl JobRegistry {
         }
     }
 
+    /// `console` with `job_id`'s staged token redacted (#481): a job that prints
+    /// its own `GITHUB_TOKEN` must not store it in the job record.
+    #[must_use]
+    pub fn redact_credential(&self, job_id: &str, console: String) -> String {
+        match &self.credentials {
+            Some(credentials) => credentials.redact(job_id, console),
+            None => console,
+        }
+    }
+
     /// Override the terminal-retention grace period (#270). Production
     /// callers never need this — [`JobRegistry::new`] already uses
     /// [`TERMINAL_RETENTION`] — it exists so a test can pass

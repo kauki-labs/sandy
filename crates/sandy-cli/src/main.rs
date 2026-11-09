@@ -888,6 +888,15 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
         Vec::new()
     };
 
+    // A bad `--cred-capability` is the caller's input error (exit 2), not a
+    // retryable infrastructure failure because the daemon happens to be down.
+    if let DaemonOp::Submit { cred_capability, .. } = &op
+        && let Err(bad) = parse_caps(cred_capability)
+    {
+        eprintln!("sandy: --cred-capability: {bad}");
+        return ProcessExit::InvalidPlan.code();
+    }
+
     // Same pre-connection bar as `--cap-file`/`--env` above (manifest-parity
     // #496): a malformed `--input`/`--out`/`--secret` value, or two inputs
     // colliding on the same staged name, is a pure client-side input error.

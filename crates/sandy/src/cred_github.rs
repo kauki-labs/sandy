@@ -376,6 +376,16 @@ fn permissions_from_json(value: &serde_json::Value) -> HashMap<String, String> {
 /// root (not supported yet), an unknown capability, or an adapter that cannot be
 /// built.
 pub fn resolve_provider(dir: &Path, name: &str, capabilities: &[String]) -> Result<(GithubAdapter, Scope), String> {
+    // One file name inside `dir`: `../other-root` or an absolute path would read
+    // a trust root outside it.
+    let mut parts = Path::new(name).components();
+    if !matches!(
+        (parts.next(), parts.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    ) || name.contains('\\')
+    {
+        return Err(format!("trust root name {name:?} must be a single file name"));
+    }
     let cfg = dir.join(format!("{name}.json"));
     let root = TrustRoot::load(&cfg).map_err(|e| format!("load trust root {name:?}: {e}"))?;
     let targets = match &root {
@@ -517,5 +527,15 @@ mod tests {
             "the call must fail at roughly the configured deadline, not wait out the stalled server: {elapsed:?}"
         );
         Ok(())
+    }
+
+    /// A trust-root name that is a path, not a file name, is refused before any read.
+    #[test]
+    fn a_trust_root_name_that_is_a_path_is_refused() {
+        let dir = std::env::temp_dir();
+        for name in ["../other", "/etc/passwd", "a/b", "..", "", "a\\b"] {
+            let err = resolve_provider(&dir, name, &[]).err().unwrap_or_default();
+            assert!(err.contains("single file name"), "{name:?}: {err}");
+        }
     }
 }

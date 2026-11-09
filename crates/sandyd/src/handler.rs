@@ -916,19 +916,13 @@ pub async fn handle(
                 CancelOutcome::NotFound => control_response::Result::Error(ControlError {
                     message: format!("no such job: {}", cancel.job_id),
                 }),
-                CancelOutcome::AlreadyTerminal(status) => {
-                    // #481: a terminal job may still hold a credential (a
-                    // foreign result marks it terminal without revoking).
-                    // Release is idempotent, so a repeat is a no-op.
-                    registry.release_credential(&cancel.job_id);
-                    control_response::Result::Error(ControlError {
-                        message: format!(
-                            "job {} is already {}, cannot cancel",
-                            cancel.job_id,
-                            status.as_str_name()
-                        ),
-                    })
-                }
+                CancelOutcome::AlreadyTerminal(status) => control_response::Result::Error(ControlError {
+                    message: format!(
+                        "job {} is already {}, cannot cancel",
+                        cancel.job_id,
+                        status.as_str_name()
+                    ),
+                }),
             }
         }
         Some(control_request::Op::Attach(attach)) => match registry.get(&attach.job_id) {

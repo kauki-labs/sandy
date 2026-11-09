@@ -618,6 +618,33 @@ fn submit_with_a_credential_and_no_local_host_is_refused_by_the_daemon() -> anyh
     Ok(())
 }
 
+/// An unknown `--cred-capability` value is an input error (exit 2) even with no
+/// daemon to connect to, not a retryable infrastructure failure.
+#[test]
+fn an_unknown_cred_capability_is_refused_before_connecting() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir().context("temp dir")?;
+    let output = Command::new(env!("CARGO_BIN_EXE_sandy"))
+        .env("SANDY_SOCK", tmp.path().join("no-daemon-here.sock"))
+        .args([
+            "daemon",
+            "submit",
+            "manifest.bin",
+            "--manifest-encoding",
+            "test/v1",
+            "--isolation-class",
+            "trusted",
+            "--credential",
+            "gh-test",
+            "--cred-capability",
+            "admin",
+        ])
+        .output()
+        .context("running sandy daemon submit")?;
+    assert_eq!(output.status.code(), Some(2), "stderr: {}", stderr_of(&output));
+    assert!(stderr_of(&output).contains("admin"), "stderr: {}", stderr_of(&output));
+    Ok(())
+}
+
 /// `--cred-capability` without `--credential` is a usage error, never a silent no-op.
 #[test]
 fn a_cred_capability_without_a_credential_is_a_usage_error() -> anyhow::Result<()> {

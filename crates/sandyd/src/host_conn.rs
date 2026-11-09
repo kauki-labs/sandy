@@ -489,9 +489,19 @@ async fn record_job_result(
     // Only a job dispatched on this connection may have its credential ended
     // here: a buggy or hostile executor must not revoke another host's job (#481).
     let dispatched_here = in_flight.remove(&job_id);
+    // A result for a job this connection never ran is not recorded either: it
+    // would mark another host's job terminal and strand its credential.
+    if !dispatched_here {
+        tracing::warn!(
+            job_id,
+            "a job result arrived for a job not dispatched on this connection; ignored"
+        );
+        return;
+    }
 
     let store = Arc::clone(store);
-    let console = result.console;
+    // The staged token never reaches the stored console, whatever the job printed.
+    let console = job_registry.redact_credential(&job_id, result.console);
     let jid = job_id.clone();
     let transition = tokio::task::spawn_blocking(move || store.finish(&jid, status, exit_code, &console)).await;
     match transition {
@@ -513,14 +523,7 @@ async fn record_job_result(
         Err(e) => tracing::warn!(job_id, error = %e, "the record-result store task failed"),
     }
     // The job is over on its host whatever the store said: revoke its credential (#481).
-    if dispatched_here {
-        job_registry.release_credential(&job_id);
-    } else {
-        tracing::warn!(
-            job_id,
-            "a job result arrived for a job not dispatched on this connection; its credential is kept"
-        );
-    }
+    job_registry.release_credential(&job_id);
 }
 
 /// Fail a job whose host-executor disconnected before reporting a result

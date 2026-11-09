@@ -119,6 +119,15 @@ impl JobCredentials {
         self
     }
 
+    /// `text` with `job_id`'s staged token redacted, unchanged when the job holds none.
+    #[must_use]
+    pub fn redact(&self, job_id: &str, text: String) -> String {
+        match self.lock_live().get(job_id) {
+            Some(bracket) => bracket.redact(text),
+            None => text,
+        }
+    }
+
     /// The live credential handle of `job_id`, if it holds one.
     #[must_use]
     pub fn handle(&self, job_id: &str) -> Option<sandy::CredentialHandle> {
@@ -1059,29 +1068,29 @@ mod tests {
         tokio::time::timeout(WAIT, serve).await??;
         tokio::time::sleep(Duration::from_millis(200)).await;
 
+        assert_eq!(
+            d.store.status(&submitted.job_id)?,
+            Some(JobStatus::Pending),
+            "a foreign result must not mark the job terminal"
+        );
         assert!(d.provider.revoked().is_empty(), "a foreign result must not revoke");
         assert!(path.exists(), "the staged file stays for the job's own host");
         assert_eq!(d.registry.credentials().map(|c| c.live_count()), Some(1));
         Ok(())
     }
 
-    /// A foreign host's result can mark the job terminal without revoking (the
-    /// connection owns no credential for it). A later Cancel then answers
-    /// `AlreadyTerminal`, and must still release the job's credential.
+    /// A job that prints its own token never stores it: the console the daemon
+    /// records has the staged token redacted.
     #[tokio::test]
-    async fn a_cancel_after_a_foreign_terminal_result_still_revokes() -> anyhow::Result<()> {
+    async fn a_token_printed_by_the_job_is_redacted_from_the_stored_console() -> anyhow::Result<()> {
         let d = daemon(FakeProvider::returning(TOKEN))?;
-        let mut dispatch_rx = register_host(&d, true)?;
+        let (mut client, serve) = connect_local_host(&d).await?;
         let submitted = submit_ok(&d).await?;
-        let dispatch = tokio::time::timeout(WAIT, dispatch_rx.recv())
-            .await
-            .context("timed out waiting for the dispatch")?
-            .context("dispatch channel closed")?;
+        let dispatch = read_dispatch(&mut client).await?;
         let path = staged_token_path(&dispatch)?;
 
-        let (mut other, serve) = connect_local_host_as(&d, "host-2").await?;
         sandy_control_proto::write_frame(
-            &mut other,
+            &mut client,
             &HostExecutorMessage {
                 op: Some(host_executor_message::Op::Result(JobResult {
                     job_id: submitted.job_id.clone(),
@@ -1089,36 +1098,21 @@ mod tests {
                     exit_code: Some(0),
                     timed_out: false,
                     transport_error: None,
-                    console: String::new(),
+                    console: format!("env: GITHUB_TOKEN={TOKEN}\ndone\n"),
                 })),
             },
         )
         .await?;
-        drop(other);
-        tokio::time::timeout(WAIT, serve).await??;
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        anyhow::ensure!(
-            d.provider.revoked().is_empty(),
-            "precondition: the foreign result revoked nothing"
-        );
+        wait_status(&d, &submitted.job_id, JobStatus::Succeeded).await?;
+        wait_revoked_and_removed(&d, &path).await?;
 
-        let response = handle(
-            &d.store,
-            &d.registry,
-            &d.hosts,
-            Some(forward_back()?),
-            Uuid::new_v4(),
-            ControlRequest {
-                request_id: 3,
-                op: Some(control_request::Op::Cancel(CancelRequest {
-                    job_id: submitted.job_id.clone(),
-                    attach_token: Some(submitted.attach_token.clone()),
-                })),
-            },
-        )
-        .await?;
-        tracing::debug!(result = ?response.result, "cancel after a foreign result");
-        wait_revoked_and_removed(&d, &path).await
+        let detail = d.store.detail(&submitted.job_id)?.context("job detail")?;
+        assert!(!detail.console.contains(TOKEN), "console: {:?}", detail.console);
+        assert!(detail.console.contains("[redacted]"), "console: {:?}", detail.console);
+        assert!(detail.console.contains("done"), "the rest of the console is kept");
+        drop(client);
+        tokio::time::timeout(WAIT, serve).await??;
+        Ok(())
     }
 
     /// A store fault on the job insert, after the mint, fails the Submit and

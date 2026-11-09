@@ -2446,10 +2446,12 @@ refused, because no encrypted mesh transport carries a bearer token yet (#495).
   each call holds a blocking-pool thread the job store also uses. A call that does not return in time is
   a failure, and a mint or refresh that returns late is revoked by its worker thread. At most
   `MAX_CONCURRENT_RELEASES` (8) releases run at once; more wait for a slot and none is skipped.
-- Only a result for a job dispatched on the reporting connection releases that job's credential, so one
-  executor cannot revoke another host's job. The store transition for such a result is unchanged.
+- Only a result for a job dispatched on the reporting connection is recorded, and only that result
+  releases the credential, so one executor can neither end another host's job nor revoke its token.
 - The token is only in the staged file and in the provider's zeroizing `Minted`. It is never in the job
-  store, a log line, a `Dispatch` field other than the path, an error message or `Debug` output.
+  store, a log line, a `Dispatch` field other than the path, an error message or `Debug` output. A job
+  that prints its own `GITHUB_TOKEN` has it replaced by `[redacted]` in the stored console
+  (`CredentialBracket::redact` reads the staged file at result time).
 
 **Not built: mid-run refresh.** The host-executor copies a secret file into the job's own secret dir
 once, when it stages the job (`sandy::stage_secrets`). It does not share the daemon's file live, as

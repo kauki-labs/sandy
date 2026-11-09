@@ -124,6 +124,24 @@ impl CredentialBracket {
         }
     }
 
+    /// `text` with every occurrence of the staged token replaced by `[redacted]`.
+    /// Reads the staged file (a few hundred bytes), because the bracket never
+    /// holds the token. A missing or unreadable file leaves `text` unchanged.
+    #[must_use]
+    pub fn redact(&self, text: String) -> String {
+        use std::io::Read as _;
+        let mut token = String::new();
+        let read = std::fs::File::open(&self.token_path)
+            .and_then(|f| f.take(4096).read_to_string(&mut token))
+            .is_ok();
+        let token = token.trim();
+        if read && !token.is_empty() && text.contains(token) {
+            text.replace(token, "[redacted]")
+        } else {
+            text
+        }
+    }
+
     /// The live credential's handle, for a caller that records lease state (a
     /// later restart reconcile could revoke by it). `None` once revoked.
     #[must_use]
@@ -392,6 +410,9 @@ mod tests {
         delay: Duration,
         fail_revoke: bool,
         revoked: Mutex<Vec<String>>,
+        /// A file to read at each revoke, so a test can see what was staged then.
+        watch: Mutex<Option<std::path::PathBuf>>,
+        staged_at_revoke: Mutex<Vec<String>>,
     }
 
     impl Scripted {
@@ -403,6 +424,8 @@ mod tests {
                 delay: Duration::ZERO,
                 fail_revoke: false,
                 revoked: Mutex::new(Vec::new()),
+                watch: Mutex::new(None),
+                staged_at_revoke: Mutex::new(Vec::new()),
             }
         }
 
@@ -432,6 +455,13 @@ mod tests {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(lease.handle.id.clone());
+            if let Some(path) = self.watch.lock().unwrap_or_else(PoisonError::into_inner).clone() {
+                let seen = std::fs::read_to_string(path).unwrap_or_else(|_| "<unreadable>".to_string());
+                self.staged_at_revoke
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(seen);
+            }
             if self.fail_revoke {
                 return Err(CredError::Revoke("scripted revoke failure".to_string()));
             }
@@ -476,6 +506,7 @@ mod tests {
         };
         assert_eq!(std::fs::read_to_string(&path)?, "tok-one");
 
+        *provider.watch.lock().unwrap_or_else(PoisonError::into_inner) = Some(path.clone());
         // Not yet due: 2s remain and the margin is 100ms.
         assert!(!bracket.renew_if_due(SystemTime::now(), Duration::from_millis(100))?);
         // Due: the margin covers the remaining lifetime.
@@ -488,6 +519,11 @@ mod tests {
         );
         assert_eq!(provider.revoked(), vec!["h0"], "only the superseded token is revoked");
         assert_eq!(bracket.handle().map(|h| h.id), Some("h1".to_string()));
+        assert_eq!(
+            *provider.staged_at_revoke.lock().unwrap_or_else(PoisonError::into_inner),
+            vec!["tok-two"],
+            "the new token is already staged when the superseded one is revoked"
+        );
         bracket.revoke()?;
         Ok(())
     }
