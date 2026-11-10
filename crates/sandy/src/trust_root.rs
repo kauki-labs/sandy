@@ -274,7 +274,11 @@ pub fn validate_api_base(url: &str) -> Result<(), String> {
     if host.is_empty() {
         return Err("it has no host".to_owned());
     }
-    if !ipv6 && !host.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.') {
+    if ipv6 {
+        if host.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err("the host is not a valid IPv6 literal".to_owned());
+        }
+    } else if !host.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.') {
         return Err("the host has a character that is not allowed in a host name".to_owned());
     }
     if let Some(port) = port
@@ -579,6 +583,7 @@ mod tests {
             "http://localhost:8080/api",
             "http://LOCALHOST",
             "http://[::1]:9000/api",
+            "https://[2001:db8::1]:8443/api/v3",
         ] {
             assert_eq!(validate_api_base(ok), Ok(()), "{ok}");
         }
@@ -604,6 +609,8 @@ mod tests {
             ("https://ghe.example.com:0", "port"),
             ("https://ghe.example.com:65536", "port"),
             ("https://ghe.example.com:abc", "port"),
+            ("https://[ghe.example.com]", "IPv6"),
+            ("https://[::1%25eth0]", "IPv6"),
             ("https://ghe example.com", "character"),
             ("https://ghe.example.com/a b", "character"),
             ("https://ghe.example.com/\u{7f}", "character"),
@@ -779,6 +786,9 @@ mod tests {
             "http://127.1",
             "http://[::ffff:127.0.0.1]",
             "http://[::1%25eth0]",
+            "https://[::1%25eth0]",
+            "https://[ghe.example.com]",
+            "https://[not-an-address]",
             "https://ghe.example.com:+80",
             "http://localhost:+80",
         ] {
