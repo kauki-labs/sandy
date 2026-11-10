@@ -139,3 +139,15 @@ fn a_new_entry_outside_this_runs_root_is_foreign_and_one_inside_it_is_not() -> R
     );
     Ok(())
 }
+
+/// The credential file holds the live broker's bearer token (INV-1: staged secrets are 0600 files).
+#[test]
+fn the_credential_file_is_private_to_its_owner() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().context("temp dir")?;
+    let path = common::mcp_client::credential_file(dir.path(), "canary").context("write")?;
+    let mode = std::fs::metadata(&path).context("stat")?.permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "credential file mode");
+    Ok(())
+}

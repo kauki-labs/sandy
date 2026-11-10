@@ -4,6 +4,7 @@
 
 use std::{
     io::{BufRead, BufReader, Write},
+    os::unix::fs::PermissionsExt,
     path::Path,
     process::{Child, ChildStdin, Command, Stdio},
     sync::mpsc::{self, Receiver},
@@ -371,5 +372,7 @@ pub fn run_steps(mcp: &mut Mcp, script: &Value, caps: &mut Map<String, Value>) -
 pub fn credential_file(dir: &Path, secret: &str) -> Result<std::path::PathBuf> {
     let path = dir.join("credential");
     std::fs::write(&path, format!("{secret}\n"))?;
+    // The live gate stores the real bearer token here (INV-1: staged secrets are 0600 files).
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     Ok(path)
 }
