@@ -271,6 +271,8 @@ fn to_wire(record: EnvironmentRecord) -> Result<EnvironmentResponse, Environment
                 url: format!("http://{endpoint}"),
             }),
         spec: Some(spec),
+        credential_degraded: record.credential_degraded,
+        credential_revoke_error: record.credential_error.unwrap_or_default(),
     })
 }
 
@@ -877,6 +879,29 @@ mod tests {
             }
             other => bail!("expected an environment, got {other:?}"),
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_degraded_credential_and_a_revoke_failure_are_reported_and_default_to_healthy() -> Result<()> {
+        let s = store()?;
+        let env = create(&s, "k1", ephemeral()).await?;
+        let read = |s: &Arc<EnvironmentStore>, id: String| {
+            let s = Arc::clone(s);
+            async move {
+                match call(&s, get(&id)).await? {
+                    Ok(control_response::Result::Environment(got)) => Ok(got),
+                    other => bail!("expected an environment, got {other:?}"),
+                }
+            }
+        };
+        let healthy = read(&s, env.environment_id.clone()).await?;
+        assert!(!healthy.credential_degraded);
+        assert_eq!(healthy.credential_revoke_error, "");
+        s.set_credential_state(&env.environment_id, true, Some("the forge refused the revoke"))?;
+        let marked = read(&s, env.environment_id.clone()).await?;
+        assert!(marked.credential_degraded);
+        assert_eq!(marked.credential_revoke_error, "the forge refused the revoke");
         Ok(())
     }
 

@@ -233,12 +233,16 @@ fn hold(
         timeout_secs: config.boot_timeout_secs,
         control,
         grants: &Grants {
-            secrets: false,
+            secrets: spec.secret_dir.is_some(),
             agent: true,
             shares: false,
         },
         outcome_file: None,
-        secret_dir: None,
+        // The caller owns this dir and may rewrite a staged file while the guest runs (#706).
+        secret_dir: spec
+            .secret_dir
+            .as_ref()
+            .map(|(dir, fingerprint)| (dir.as_path(), *fingerprint)),
         egress: None,
     };
     let outcome = backend.run(&run)?;

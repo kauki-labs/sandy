@@ -15,7 +15,9 @@
 //! `stop` and `resume` are not part of the seam yet: an ephemeral environment
 //! cannot be stopped, and a real resume needs persistent guest state (#588).
 
-use crate::backend::{BackendError, BoxState};
+use std::path::PathBuf;
+
+use crate::backend::{BackendError, BoxState, DirFingerprint};
 
 /// What to launch: one environment, one box.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +35,11 @@ pub struct EnvironmentSpec {
     /// backend that bridges the port (#590) needs it before boot, since a vfkit
     /// vsock device must be declared at launch.
     pub service_port: Option<u16>,
+    /// A caller-owned, private (`0700`) directory the guest sees as its read-only secret share, with the `(dev, ino)`
+    /// the caller captured when it validated it (#323). The caller stages files in it and may rewrite them while the
+    /// guest runs (credential refresh, #706); the backend never writes to it or removes it. `None` mounts no secret
+    /// share. A backend with no secret channel must refuse a spec that carries one (INV-1).
+    pub secret_dir: Option<(PathBuf, DirFingerprint)>,
 }
 
 /// Where a client reaches a Ready environment's service, from the host.
