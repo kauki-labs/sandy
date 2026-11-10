@@ -2543,8 +2543,8 @@ and revokes one staged token; an environment lives for hours, so it also needs r
 - **Restart restage.** When the daemon holds no lease for a `Ready` environment whose box still runs, it mints into
   the same directory. Today only a backend whose boxes survive the daemon can reach this: the VM backend keeps its
   boxes in memory, so a restarted daemon sees `NotRunning` and fails the row.
-- **A kill that fails.** The driver releases a stopped, failed or deleted environment's credential only once no box
-  runs. A box that survived the kill still mounts its share, and a resume then adopts that guest with the same
+- **A kill that fails.** The driver releases a stopped or deleted environment's credential, and an orphaned box's,
+  only once no box runs. A failed environment is revoked at once, also after a failed kill: the safe direction. A box that survived the kill still mounts its share, and a resume then adopts that guest with the same
   directory and lease.
 - **Cost.** A renewal is a refresh plus a revoke, each bounded at 45 s, so one environment can hold a pass for about
   90 s, and the due environments run one after another. A failed refresh is retried on every pass.
