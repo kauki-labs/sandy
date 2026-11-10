@@ -273,7 +273,10 @@ impl Drop for CredentialBracket {
         let lease = self.lease.get_mut().unwrap_or_else(PoisonError::into_inner).take();
         let remove_file = *self.file_staged.get_mut();
         let Some(provider) = self.provider.take() else { return };
-        if lease.is_none() && !remove_file {
+        let in_runtime = tokio::runtime::Handle::try_current().is_ok();
+        // Nothing to clean up: drop the provider here, unless a runtime is current
+        // (a live adapter owns its own runtime): then the cleanup thread drops it.
+        if lease.is_none() && !remove_file && !in_runtime {
             return;
         }
         let dir = Arc::clone(&self.dir);
@@ -291,7 +294,7 @@ impl Drop for CredentialBracket {
             // own tokio runtime, which must not be dropped inside another one.
             drop(provider);
         };
-        if tokio::runtime::Handle::try_current().is_ok() {
+        if in_runtime {
             if let Err(e) = std::thread::Builder::new()
                 .name("sandy-cred-drop".to_string())
                 .spawn(cleanup)
@@ -854,6 +857,85 @@ mod tests {
             !moved.join("GITHUB_TOKEN").exists(),
             "the staged token is removed through the dir it was written to"
         );
+        Ok(())
+    }
+
+    /// Delegates to a [`Scripted`] and records whether a tokio runtime was current
+    /// when the provider was dropped (a live adapter owns a runtime, which must not
+    /// be dropped inside another one).
+    struct DropProbe {
+        inner: Scripted,
+        dropped_inside_runtime: Arc<std::sync::Mutex<Option<bool>>>,
+    }
+
+    impl CredentialProvider for DropProbe {
+        fn mint(&self, scope: &Scope, ttl: Duration) -> Result<Minted, CredError> {
+            self.inner.mint(scope, ttl)
+        }
+
+        fn revoke(&self, lease: &Lease) -> Result<(), CredError> {
+            self.inner.revoke(lease)
+        }
+
+        fn refresh(&self, lease: &Lease) -> Result<Minted, CredError> {
+            self.inner.refresh(lease)
+        }
+    }
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            *self
+                .dropped_inside_runtime
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(tokio::runtime::Handle::try_current().is_ok());
+        }
+    }
+
+    /// #720 review: a bracket revoked by hand and then dropped inside a runtime
+    /// still drops its provider off the runtime's worker.
+    #[test]
+    fn a_revoked_bracket_dropped_in_a_runtime_drops_its_provider_off_the_runtime() -> anyhow::Result<()> {
+        let (_tmp, target) = private_dir()?;
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let probe = Arc::new(DropProbe {
+            inner: Scripted::new(vec!["tok"], Duration::from_secs(600)),
+            dropped_inside_runtime: Arc::clone(&seen),
+        });
+        let rt = tokio::runtime::Builder::new_current_thread().build()?;
+        rt.block_on(async {
+            let bracket =
+                CredentialBracket::mint_and_stage(probe, &Scope::default(), target, 600, Duration::from_secs(5))?;
+            bracket.revoke()?;
+            drop(bracket);
+            anyhow::Ok(())
+        })?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while seen.lock().unwrap_or_else(PoisonError::into_inner).is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            *seen.lock().unwrap_or_else(PoisonError::into_inner),
+            Some(false),
+            "the provider drops on a plain thread, never inside the runtime"
+        );
+        Ok(())
+    }
+
+    /// #720 review: a dir swapped in after the caller's check is refused before any
+    /// mint, so no token is ever issued for it.
+    #[test]
+    fn a_dir_swapped_before_the_mint_is_refused_with_no_mint_call() -> anyhow::Result<()> {
+        let (tmp, target) = private_dir()?;
+        let dir = target.dir.clone();
+        std::fs::rename(&dir, tmp.path().join("cred-moved")).context("move aside")?;
+        std::fs::create_dir(&dir)?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        let provider = Arc::new(Scripted::new(vec!["tok"], Duration::from_secs(600)));
+        let err =
+            CredentialBracket::mint_and_stage(provider.clone(), &Scope::default(), target, 600, Duration::from_secs(5))
+                .expect_err("a swapped dir is refused");
+        assert!(matches!(err, CredError::Stage(_)), "{err:?}");
+        assert_eq!(provider.next.load(Ordering::SeqCst), 0, "no mint call was made");
         Ok(())
     }
 }
