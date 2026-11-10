@@ -596,6 +596,13 @@ impl QemuBackend {
                 outcome.console = format!("[qemu stderr]\n{tail}");
             }
         }
+        // The serial reader is done, so nothing can follow these bytes into the ring (#727).
+        if let Some(sink) = &self.console_sink.0 {
+            let marked = stderr_for_sink(&outcome, &qemu_stderr);
+            if !marked.is_empty() {
+                sink(marked.as_bytes());
+            }
+        }
         if let Some(status) = proxy_exit {
             return Err(BackendError::EgressProxyDied {
                 status,
@@ -855,6 +862,55 @@ fn drain_stderr(mut stderr: std::process::ChildStderr) -> std::thread::JoinHandl
         }
         String::from_utf8_lossy(&buf).into_owned()
     })
+}
+
+/// What starts each qemu stderr line that goes to the console sink, so the tail tells it from the serial text.
+const STDERR_MARKER: &str = "[qemu stderr] ";
+
+/// The longest stderr line the sink gets; a longer one is cut and ends with [`STDERR_CUT`], and the rest is dropped.
+const STDERR_LINE_CAP: usize = 8 * 1024;
+
+/// Ends a stderr line that was cut at [`STDERR_LINE_CAP`].
+const STDERR_CUT: &str = " [cut]";
+
+/// The text for the console sink from qemu's stderr (#727): each non-empty line behind [`STDERR_MARKER`], a line over
+/// [`STDERR_LINE_CAP`] cut at a character boundary. A qemu that exits before the serial opens leaves no console, and
+/// its stderr is then the only reason a provision failed. `stderr` holds the last [`QEMU_STDERR_CAP`] bytes, so when
+/// it is that long its first line may have lost its beginning and is dropped: a token cut in half shows no prefix a
+/// mask can find. The rest of a cut line is dropped for the same reason. The sink gets this once, after the serial
+/// reader has finished: a stderr line sent while serial bytes still arrive could land inside a token the serial text
+/// is still writing, and neither piece would be masked.
+fn marked_stderr(stderr: &str) -> String {
+    let mut lines = stderr.lines();
+    if stderr.len() >= QEMU_STDERR_CAP {
+        lines.next();
+    }
+    let mut out = String::new();
+    for line in lines.map(str::trim_end).filter(|line| !line.is_empty()) {
+        out.push_str(STDERR_MARKER);
+        if line.len() > STDERR_LINE_CAP {
+            let mut end = STDERR_LINE_CAP;
+            while !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            out.push_str(&line[..end]);
+            out.push_str(STDERR_CUT);
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// What the sink gets for a finished attempt: the marked stderr, unless the attempt is about to be retried because
+/// its vsock CID was taken, so the failed attempts do not fill the tail of the one that counts.
+fn stderr_for_sink(outcome: &Outcome, stderr: &str) -> String {
+    if cid_in_use(outcome) {
+        String::new()
+    } else {
+        marked_stderr(stderr)
+    }
 }
 
 /// An infra transport fault as an [`Outcome`] (no fabricated exit, INV-OUTCOME).
@@ -2153,6 +2209,66 @@ mod tests {
             "the captured bytes are the stderr flood"
         );
         Ok(())
+    }
+
+    /// #727: qemu's stderr is what a provision has when qemu exits before the serial opens. Each line goes to the sink
+    /// behind a marker; blank lines are skipped.
+    #[test]
+    fn marked_stderr_puts_a_marker_on_each_line_and_skips_blank_ones() {
+        assert_eq!(
+            marked_stderr("qemu: could not open serial\n\n  \nlast words\n"),
+            "[qemu stderr] qemu: could not open serial\n[qemu stderr] last words\n"
+        );
+        assert_eq!(marked_stderr(""), "");
+    }
+
+    /// A line over the cap is cut and the rest dropped (a token cut at the cap would otherwise show its tail without a
+    /// prefix on the next piece), at a character boundary.
+    #[test]
+    fn marked_stderr_cuts_a_long_line_once_and_drops_the_rest() {
+        let long = format!("{}{}", "é".repeat(STDERR_LINE_CAP), "tskey-auth-SECRETSUFFIX");
+        let out = marked_stderr(&format!("{long}\nnext\n"));
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "{out:.80}");
+        assert!(
+            lines[0].starts_with(STDERR_MARKER) && lines[0].ends_with(STDERR_CUT),
+            "{:.80}",
+            lines[0]
+        );
+        assert!(lines[0].len() <= STDERR_MARKER.len() + STDERR_LINE_CAP + STDERR_CUT.len());
+        assert!(!out.contains("SECRETSUFFIX"), "the dropped rest must not reappear");
+        assert_eq!(lines[1], "[qemu stderr] next");
+    }
+
+    /// The stderr copy holds only the last 64 KiB: when it is that long the first line may have lost its beginning.
+    #[test]
+    fn marked_stderr_drops_the_first_line_of_a_full_copy() {
+        let full = format!("SUFFIX0123456789\n{}\nlast\n", "y".repeat(QEMU_STDERR_CAP));
+        assert!(full.len() >= QEMU_STDERR_CAP);
+        let out = marked_stderr(&full);
+        assert!(!out.contains("SUFFIX"), "a cut first line must go");
+        assert!(out.ends_with("[qemu stderr] last\n"));
+        // A short copy keeps its first line.
+        assert_eq!(
+            marked_stderr("first\nlast\n"),
+            "[qemu stderr] first\n[qemu stderr] last\n"
+        );
+    }
+
+    /// An attempt about to be retried because its CID is taken sends nothing, so the final tail is the attempt that
+    /// counts; any other failed attempt sends its stderr.
+    #[test]
+    fn a_retried_cid_collision_sends_no_stderr_to_the_sink() {
+        let taken = never_booted(
+            "[qemu stderr]\nqemu-system-x86_64: -device vhost-vsock-pci,guest-cid=77: vhost-vsock: unable to set \
+             guest cid: Address already in use",
+        );
+        assert_eq!(stderr_for_sink(&taken, "unable to set guest cid: in use\n"), "");
+        let other = never_booted("[qemu stderr]\nCould not access KVM kernel module");
+        assert_eq!(
+            stderr_for_sink(&other, "Could not access KVM kernel module\n"),
+            "[qemu stderr] Could not access KVM kernel module\n"
+        );
     }
 
     /// #666: a launch records its owner and every process it starts, so a restart can find them after a SIGKILL.
