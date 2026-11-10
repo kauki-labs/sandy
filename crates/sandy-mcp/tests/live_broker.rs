@@ -12,11 +12,14 @@
 //! `/dev/vhost-vsock` only. Build the sibling binaries first, so no cargo build runs mid-test:
 //!
 //!   cargo build -p sandyd -p sandy-broker -p sandy-mcp
-//!   SANDY_LIVE=1 nix shell nixpkgs#qemu -c cargo nextest run -p sandy-mcp --features live --test live_broker
-//! --no-capture
+//!   SANDY_LIVE=1 nix shell nixpkgs#qemu -c cargo nextest run -p sandy-mcp --features live --test live_broker \
+//!     --run-ignored all --no-capture
+//!
+//! The main scenario is `#[ignore]`d (red, #727), so the command above needs `--run-ignored all`.
 //!
 //! `SANDYD_BIN` and `BROKER_BIN` override the sibling binaries. Every wait is bounded, and the stack guard
-//! stops what the test started: only a qemu that is a direct child of this test's own `sandyd` is ever killed.
+//! stops what the test started: only descendants of this test's own `sandyd`, matched by pid and start time, are
+//! ever killed (qemu, virtiofsd, the egress proxy), and it removes only the `/tmp/sandy-*` entries this run added.
 #![cfg(feature = "live")]
 #![cfg(target_os = "linux")]
 
@@ -29,6 +32,10 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -136,6 +143,33 @@ fn qemu_children(parent: u32) -> Vec<(u32, u64)> {
         .collect()
 }
 
+/// `(pid, start time)` of every descendant of `root`, from `/proc`. Taken before `root` is signalled, because
+/// a child of a dead parent is re-parented and no longer reachable from it.
+fn descendants(root: u32) -> Vec<(u32, u64)> {
+    let Ok(proc) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let all: Vec<(u32, u32, u64)> = proc
+        .flatten()
+        .filter_map(|e| {
+            let pid = e.file_name().to_str()?.parse::<u32>().ok()?;
+            let (ppid, start) = parent_and_start(pid)?;
+            Some((pid, ppid, start))
+        })
+        .collect();
+    let mut found: Vec<(u32, u64)> = Vec::new();
+    let mut frontier = vec![root];
+    while let Some(parent) = frontier.pop() {
+        for (pid, ppid, start) in &all {
+            if *ppid == parent && !found.iter().any(|(p, _)| p == pid) {
+                found.push((*pid, *start));
+                frontier.push(*pid);
+            }
+        }
+    }
+    found
+}
+
 /// Every `/tmp/sandy-*` entry and its direct children.
 fn sandy_tmp_entries() -> BTreeSet<PathBuf> {
     let mut found = BTreeSet::new();
@@ -185,6 +219,12 @@ struct Stack {
     api_url: String,
     token: String,
     credential: PathBuf,
+    /// `/tmp/sandy-*` entries that existed before this run started.
+    tmp_before: BTreeSet<PathBuf>,
+    /// Set by the sampler thread when any `ps` sample held the canary.
+    ps_hit: Arc<AtomicBool>,
+    sampler_stop: Arc<AtomicBool>,
+    sampler: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for Stack {
@@ -193,7 +233,10 @@ impl Drop for Stack {
             let _ = broker.kill();
             let _ = broker.wait();
         }
-        let owned = qemu_children(self.sandyd.id());
+        // Snapshot the descendants first: a SIGKILLed daemon leaves its qemu, virtiofsd and egress proxy
+        // running (decision 34). Pid plus start time guards against pid reuse; another session's processes
+        // are never descendants of this daemon.
+        let owned = descendants(self.sandyd.id());
         signal("TERM", self.sandyd.id());
         let deadline = Instant::now() + Duration::from_secs(15);
         while !matches!(self.sandyd.try_wait(), Ok(Some(_))) {
@@ -209,6 +252,20 @@ impl Drop for Stack {
                 signal("KILL", pid);
             }
         }
+        self.sampler_stop.store(true, Ordering::SeqCst);
+        if let Some(sampler) = self.sampler.take() {
+            let _ = sampler.join();
+        }
+        // The last checkpoint, after teardown: the canary scan again, then the `/tmp` stray check. A failed run
+        // is checked and cleaned too, so the stray entries are removed before the assertion fires.
+        let canary = self.canary_leaks("after teardown");
+        let strays = self.remove_strays();
+        if !std::thread::panicking() {
+            assert!(canary.is_ok(), "{canary:?}");
+            assert!(strays.is_empty(), "left behind in /tmp, now removed: {strays:?}");
+        } else if !strays.is_empty() {
+            eprintln!("left behind in /tmp, now removed: {strays:?}");
+        }
     }
 }
 
@@ -222,6 +279,7 @@ impl Stack {
             3600,
             "nix build of the base guest runner",
         )?;
+        let tmp_before = sandy_tmp_entries();
         let dir = tempfile::tempdir().context("temp dir")?;
         let token = canary_token()?;
         let credential = credential_file(dir.path(), &token)?;
@@ -273,9 +331,27 @@ impl Stack {
             sandyd,
             broker: None,
             api_url: String::new(),
+            tmp_before,
+            ps_hit: Arc::new(AtomicBool::new(false)),
+            sampler_stop: Arc::new(AtomicBool::new(false)),
+            sampler: None,
             token,
             credential,
         };
+        // Sample `ps` for the whole run: one snapshot can miss a short-lived argv.
+        let (hit, stop, canary) = (
+            Arc::clone(&stack.ps_hit),
+            Arc::clone(&stack.sampler_stop),
+            stack.token.clone(),
+        );
+        stack.sampler = Some(std::thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                if ps_holds(&canary).unwrap_or(false) {
+                    hit.store(true, Ordering::SeqCst);
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }));
         // sandyd evaluates the guest template and sweeps orphans before it serves.
         let deadline = Instant::now() + Duration::from_secs(120);
         while std::os::unix::net::UnixStream::connect(&sock).is_err() {
@@ -312,6 +388,51 @@ impl Stack {
             std::thread::sleep(Duration::from_millis(50));
         }
         Ok(stack)
+    }
+
+    /// The one canary scan every checkpoint uses: the `ps` sampler's verdict plus a fresh `ps` sample, every file
+    /// under the stack's directory except the credential file, and every file under a `/tmp/sandy-*` entry this
+    /// run added. `at` names the checkpoint in the error.
+    fn canary_leaks(&self, at: &str) -> Result<()> {
+        ensure!(
+            !self.ps_hit.load(Ordering::SeqCst) && !ps_holds(&self.token)?,
+            "AT-11 ({at}): the canary is in `ps` output"
+        );
+        let leaked = files_holding(self.dir.path(), &self.token, &self.credential);
+        ensure!(leaked.is_empty(), "AT-11 ({at}): the canary is in {leaked:?}");
+        for p in sandy_tmp_entries().difference(&self.tmp_before) {
+            let leaked = files_holding(p, &self.token, &self.credential);
+            ensure!(leaked.is_empty(), "AT-11 ({at}): the canary is in {leaked:?}");
+        }
+        Ok(())
+    }
+
+    /// A finished MCP session: it exited cleanly and neither its stdout nor its stderr held the canary.
+    fn check_session(&self, mcp: Mcp, at: &str) -> Result<()> {
+        let (clean_exit, output) = mcp.finish()?;
+        ensure!(clean_exit, "{at}: sandy-mcp must exit cleanly when stdin closes");
+        ensure!(
+            !output.contains(&self.token),
+            "AT-11 ({at}): the canary is in the MCP's stdout or stderr"
+        );
+        Ok(())
+    }
+
+    /// Removes the `/tmp/sandy-*` entries this run added, other than a new staging base itself, and returns them.
+    /// A base directory is the only thing a first run may add.
+    fn remove_strays(&self) -> Vec<PathBuf> {
+        let strays: Vec<PathBuf> = sandy_tmp_entries()
+            .difference(&self.tmp_before)
+            .filter(|p| {
+                p.parent() != Some(Path::new("/tmp")) || std::fs::read_dir(p).is_ok_and(|mut d| d.next().is_some())
+            })
+            .cloned()
+            .collect();
+        for p in &strays {
+            // Best effort: a base directory that is not empty holds a child listed on its own.
+            let _ = std::fs::remove_dir_all(p).or_else(|_| std::fs::remove_file(p));
+        }
+        strays
     }
 
     fn mcp(&self) -> Result<Mcp> {
@@ -438,25 +559,16 @@ fn ps_holds(needle: &str) -> Result<bool> {
             guest"]
 fn the_conformance_script_passes_against_the_real_stack_and_leaves_nothing() -> Result<()> {
     require_live()?;
-    let tmp_before = sandy_tmp_entries();
     let stack = Stack::start()?;
-    // A failure prints the daemon and broker logs first: the temp dir goes with the guard.
-    scenario(&stack, &tmp_before).inspect_err(|_| {
+    // A failure prints the daemon and broker logs first: the temp dir goes with the guard, which also runs the
+    // final canary scan and the `/tmp` stray check, on failure as well as on success.
+    scenario(&stack).inspect_err(|_| {
         stack.dump_logs();
         stack.dump_vms();
-    })?;
-    drop(stack);
-    // A new staging base is the only thing a first run may add: no run directory under it, no stray entry.
-    let strays: Vec<_> = sandy_tmp_entries()
-        .difference(&tmp_before)
-        .filter(|p| p.parent() != Some(Path::new("/tmp")) || std::fs::read_dir(p).is_ok_and(|mut d| d.next().is_some()))
-        .cloned()
-        .collect();
-    ensure!(strays.is_empty(), "left behind in /tmp: {strays:?}");
-    Ok(())
+    })
 }
 
-fn scenario(stack: &Stack, tmp_before: &BTreeSet<PathBuf>) -> Result<()> {
+fn scenario(stack: &Stack) -> Result<()> {
     // AT-1, AT-2 and the boot-to-Ready time, over a bare spawn, so a broken backend fails on the first boot.
     let mut mcp = stack.mcp()?;
     let spawn = spawn_args("live-first", "bare");
@@ -494,15 +606,8 @@ fn scenario(stack: &Stack, tmp_before: &BTreeSet<PathBuf>) -> Result<()> {
     );
 
     // AT-11, API-credential half: the bearer token (a unique canary) is in the credential file and nowhere else
-    // the host or the MCP shows: not `ps`, not a log, not the journal, not any file the stack made.
-    assert!(!ps_holds(&stack.token)?, "AT-11: the canary is in `ps` output");
-    let leaked = files_holding(stack.dir.path(), &stack.token, &stack.credential);
-    assert!(leaked.is_empty(), "AT-11: the canary is in {leaked:?}");
-    let new_tmp: Vec<_> = sandy_tmp_entries().difference(tmp_before).cloned().collect();
-    for p in &new_tmp {
-        let leaked = files_holding(p, &stack.token, &stack.credential);
-        assert!(leaked.is_empty(), "AT-11: the canary is in {leaked:?}");
-    }
+    // the host or the MCP shows. The same scan runs again after the script and after teardown.
+    stack.canary_leaks("after Ready")?;
 
     // AT-10: a secret-shaped argument is refused by the real binary and creates nothing.
     let mut bad = spawn_args("live-secret", "secret");
@@ -539,7 +644,8 @@ fn scenario(stack: &Stack, tmp_before: &BTreeSet<PathBuf>) -> Result<()> {
     // AT-6: delete after cancel is the same terminal result, not an error.
     let (is_err, again) = mcp.call("delete_environment", &json!({"environment_id": cid}))?;
     ensure!(!is_err && again["state"] == json!("deleted"), "AT-6: {again}");
-    let _ = mcp.finish()?;
+    stack.check_session(mcp, "first session")?;
+    stack.canary_leaks("after the first session")?;
 
     // The shared script (AT-6, AT-9 and the rest) over a fresh MCP, with the Ready wait sized for a boot.
     let mut script: Value = serde_json::from_str(SCRIPT)?;
@@ -547,12 +653,8 @@ fn scenario(stack: &Stack, tmp_before: &BTreeSet<PathBuf>) -> Result<()> {
     script["fixtures"]["ready_poll_ms"] = json!(250);
     let mut mcp = stack.mcp()?;
     run_script(&mut mcp, &script)?;
-    let (clean_exit, output) = mcp.finish()?;
-    assert!(clean_exit, "sandy-mcp must exit cleanly when stdin closes");
-    assert!(
-        !output.contains(&stack.token),
-        "AT-11: the canary is in the MCP's stdout or stderr"
-    );
+    stack.check_session(mcp, "script session")?;
+    stack.canary_leaks("after the script")?;
 
     // After the run: no non-terminal environment through the API, no VM of ours, nothing new in /tmp/sandy-*.
     stack.wait_no_vm(120)?;
@@ -578,9 +680,8 @@ fn scenario(stack: &Stack, tmp_before: &BTreeSet<PathBuf>) -> Result<()> {
         })
         .collect();
     assert!(running.is_empty(), "non-terminal jobs after the run: {running:?}");
-    let (clean_exit, output) = mcp.finish()?;
-    assert!(clean_exit && !output.contains(&stack.token));
-    Ok(())
+    stack.check_session(mcp, "final session")?;
+    stack.canary_leaks("after the final listing")
 }
 
 #[test]
@@ -589,19 +690,26 @@ fn a_profile_secret_canary_is_absent_everywhere_but_the_guest_secret_path() {
     // AT-11, profile-secret half: a unique canary in a profile secret must be absent from every MCP result and
     // stderr, the journal, host `ps` and the console log, and present at the guest secret path only. The API
     // credential half runs in the test above.
+    unimplemented!("AT-11 profile-secret half is blocked on #706");
 }
 
 #[test]
 #[ignore = "owner decision on #585: sandy core has no T3 internals, so AT-7 (delegate_task round trip) has no live row \
             here"]
-fn a_stand_in_primary_runs_a_delegate_task_in_the_guest() {}
+fn a_stand_in_primary_runs_a_delegate_task_in_the_guest() {
+    unimplemented!("AT-7 is blocked, see the ignore reason");
+}
 
 #[test]
 #[ignore = "owner decision on #585 and open point 1: no external unlink interface, so AT-8 (parent ends after delete) \
             is blocked"]
-fn the_parent_task_ends_failed_within_60_seconds_of_a_delete() {}
+fn the_parent_task_ends_failed_within_60_seconds_of_a_delete() {
+    unimplemented!("AT-8 is blocked, see the ignore reason");
+}
 
 #[test]
 #[ignore = "owner decision on #585 and open point 1: pairing and link are T3-specific, so AT-17 (pairing code absent) \
             is blocked"]
-fn a_pairing_code_is_absent_from_every_result_and_log() {}
+fn a_pairing_code_is_absent_from_every_result_and_log() {
+    unimplemented!("AT-17 is blocked, see the ignore reason");
+}
