@@ -153,7 +153,10 @@ impl EnvironmentDriver {
             .collect();
         for id in orphans {
             self.kill(&id, &mut running, &mut report);
-            self.release_credential(&id);
+            // A box that survived the kill still mounts its share: keep the token until a later pass kills it.
+            if !running.contains(&id) {
+                self.release_credential(&id);
+            }
         }
         Ok(report)
     }
@@ -172,7 +175,11 @@ impl EnvironmentDriver {
                 if running.contains(&row.environment_id) {
                     self.kill(&row.environment_id, running, report);
                 }
-                self.release_credential(&row.environment_id);
+                // A box that survived the kill still mounts its share, and a resume would reuse the guest: release
+                // only once no box runs, so the share and the lease stay in step with the guest.
+                if !running.contains(&row.environment_id) {
+                    self.release_credential(&row.environment_id);
+                }
                 Ok(())
             }
         }
@@ -231,7 +238,8 @@ impl EnvironmentDriver {
             let Some(mut spec) = self.to_spec(row) else {
                 return self.fail(id, "spec", "the stored spec does not decode", report);
             };
-            // Before the guest boots: a guest never starts without the token its profile promises.
+            // Before the guest boots: with a credential component (the VM backends), a guest never starts without the
+            // token its profile promises. The process backend has none: it runs tokenless by design (decision 38).
             if self.credentials.is_some() {
                 match self.mint_credential(row) {
                     Ok(share) => spec.secret_dir = Some((share.dir, share.fingerprint)),
@@ -1182,7 +1190,10 @@ mod tests {
 
     // ---- #706: the per-environment forge credential ----
 
-    use std::{os::unix::fs::PermissionsExt, sync::atomic::Ordering};
+    use std::{
+        os::unix::fs::{MetadataExt, PermissionsExt},
+        sync::atomic::Ordering,
+    };
 
     use crate::{
         environment_credential::fakes::{Resolver, Rotating},
@@ -1445,6 +1456,50 @@ mod tests {
         add(&r.store, 1)?;
         r.driver.reconcile_once(now())?;
         assert_eq!(r.backend.launched().first().map(|s| s.secret_dir.clone()), Some(None));
+        Ok(())
+    }
+
+    #[test]
+    fn a_driver_without_a_credential_component_launches_a_profile_that_names_a_trust_root_tokenless() -> Result<()> {
+        // The process backend has no secret channel, so main wires no credential component for it: the environment
+        // runs with no token and no mark. Failing closed would make the backend unusable, since every profile names
+        // a trust root and a create needs a registry.
+        let store = Arc::new(EnvironmentStore::open_in_memory()?.with_profiles(test_profiles()));
+        let backend = Arc::new(FakeEnvironmentBackend::new());
+        let driver = EnvironmentDriver::new(Arc::clone(&store), Arc::clone(&backend) as _, config());
+        let id = add(&store, 1)?;
+        driver.reconcile_once(now())?;
+        assert_eq!(backend.launched().first().map(|s| s.secret_dir.clone()), Some(None));
+        let rec = state(&store, &id)?;
+        assert_eq!(rec.state, EnvironmentState::Ready);
+        assert!(!rec.credential_degraded && rec.credential_error.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn a_kill_that_fails_keeps_the_share_and_the_lease_and_a_resume_reuses_the_running_guest() -> Result<()> {
+        let r = cred_rig(FakeEnvironmentBackend::new())?;
+        let id = add(&r.store, 1)?;
+        r.driver.reconcile_once(now())?;
+        let share = r.base.join(format!("env-cred-{id}"));
+        let inode = std::fs::metadata(&share)?.ino();
+        r.backend.set_kill_failing(true);
+        r.store.stop(&id)?;
+        r.driver.reconcile_once(now())?;
+        assert!(r.provider.revoked().is_empty(), "the guest still runs: the lease stays");
+        assert!(share.exists(), "the share the guest mounts is not removed");
+        // The owner resumes before the box died: the same guest is adopted, nothing is minted into a new dir.
+        assert!(matches!(r.store.resume(&id)?, EnvTransition::Applied));
+        r.driver.reconcile_once(now())?;
+        assert_eq!(state(&r.store, &id)?.state, EnvironmentState::Ready);
+        assert_eq!(std::fs::metadata(&share)?.ino(), inode, "the guest's mount stays valid");
+        assert_eq!(r.provider.next.load(Ordering::SeqCst), 1, "no second mint");
+        // Once the box can be killed, the stop releases for real.
+        r.backend.set_kill_failing(false);
+        r.store.stop(&id)?;
+        r.driver.reconcile_once(now())?;
+        assert_eq!(r.provider.revoked(), ["h1"]);
+        assert!(!share.exists());
         Ok(())
     }
 }

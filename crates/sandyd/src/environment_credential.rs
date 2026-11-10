@@ -23,7 +23,8 @@ use crate::credential::{CREDENTIAL_SECRET_NAME, CredentialResolver, DAEMON_CALL_
 /// The staging directory prefix. Not `cred-`: `sandy gc` sweeps those by age, and an environment outlives a token.
 const DIR_PREFIX: &str = "env-cred-";
 
-/// Renew once at most this long remains before the token expires. A token lives [`sandy::MAX_TTL_SECS`] (50 minutes).
+/// Renew once at most this long remains before the token expires. A token lives up to an hour (GitHub ignores the
+/// requested TTL).
 pub const RENEW_MARGIN: Duration = Duration::from_secs(300);
 
 /// The directory the guest mounts as its secret share.
