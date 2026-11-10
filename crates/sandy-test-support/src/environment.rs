@@ -46,6 +46,7 @@ struct State {
     active: BTreeSet<String>,
     launched: Vec<EnvironmentSpec>,
     killed: Vec<String>,
+    console_tails: BTreeMap<String, String>,
 }
 
 /// An in-memory [`EnvironmentBackend`] test double.
@@ -169,6 +170,13 @@ impl FakeEnvironmentBackend {
         self.probe_failing.store(failing, Ordering::SeqCst);
     }
 
+    /// What [`EnvironmentBackend::console_tail`] returns for `environment_id`, once.
+    pub fn set_console_tail(&self, environment_id: &str, tail: &str) {
+        self.lock()
+            .console_tails
+            .insert(environment_id.to_owned(), tail.to_owned());
+    }
+
     /// How many times [`EnvironmentBackend::launch`] was called, including the
     /// calls that found a box already running or failed.
     pub fn launch_calls(&self) -> usize {
@@ -192,6 +200,10 @@ impl FakeEnvironmentBackend {
 }
 
 impl EnvironmentBackend for FakeEnvironmentBackend {
+    fn console_tail(&self, environment_id: &str) -> Option<String> {
+        self.lock().console_tails.remove(environment_id)
+    }
+
     fn launch(&self, spec: &EnvironmentSpec) -> Result<Launch, BackendError> {
         self.launch_calls.fetch_add(1, Ordering::SeqCst);
         if let Some(message) = &self.launch_error {

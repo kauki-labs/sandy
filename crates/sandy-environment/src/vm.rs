@@ -29,6 +29,8 @@ use sandy_api::{
     environment::{EnvironmentBackend, EnvironmentSpec, Launch, Probe},
 };
 
+use crate::console::ConsoleTaps;
+
 /// How long `kill` waits for a cancelled run to return before it reports a
 /// teardown fault and keeps the entry for a retry.
 const KILL_WAIT: Duration = Duration::from_secs(30);
@@ -121,6 +123,8 @@ pub struct VmEnvironmentBackend {
     service: Option<Arc<dyn ServiceProbe>>,
     /// Asked to stop the guest before `kill` cancels the run, with the grace it gets (#670).
     graceful_stop: Option<(Arc<dyn StopRequest>, Duration)>,
+    /// Where the factory's backends copy the console, read by [`EnvironmentBackend::console_tail`] (#727).
+    console: Option<Arc<ConsoleTaps>>,
     stop_margin: Duration,
     kill_wait: Duration,
     next_generation: AtomicU64,
@@ -136,6 +140,7 @@ impl VmEnvironmentBackend {
             config,
             service: None,
             graceful_stop: None,
+            console: None,
             stop_margin: STOP_MARGIN,
             kill_wait: KILL_WAIT,
             next_generation: AtomicU64::new(0),
@@ -147,6 +152,15 @@ impl VmEnvironmentBackend {
     #[must_use]
     pub fn with_service_probe(mut self, service: Arc<dyn ServiceProbe>) -> Self {
         self.service = Some(service);
+        self
+    }
+
+    /// Answer [`EnvironmentBackend::console_tail`] from `taps`. The factory must build each hypervisor backend with
+    /// the sink `taps.sink_for(environment_id)`, or no tail ever appears. The tail outlives the run and a failed
+    /// kill, since it is not held with the run.
+    #[must_use]
+    pub fn with_console_taps(mut self, taps: Arc<ConsoleTaps>) -> Self {
+        self.console = Some(taps);
         self
     }
 
@@ -247,6 +261,10 @@ impl Drop for SetOnDrop {
 }
 
 impl EnvironmentBackend for VmEnvironmentBackend {
+    fn console_tail(&self, environment_id: &str) -> Option<String> {
+        self.console.as_ref()?.take_tail(environment_id)
+    }
+
     fn launch(&self, spec: &EnvironmentSpec) -> Result<Launch, BackendError> {
         if let Some(outcome) = self.existing(&spec.environment_id)? {
             return Ok(outcome);

@@ -203,7 +203,13 @@ impl EnvironmentDriver {
     }
 
     fn fail(&self, id: &str, step: &str, reason: &str, report: &mut Report) -> Result<(), EnvironmentStoreError> {
-        if self.store.mark_lost(id, step, reason)? == EnvTransition::Applied {
+        // Every caller that has a box has already killed it, so the console is complete. The backend hands the
+        // tail over once, so it cannot land on a later failure of the same id (#727).
+        let reason = match self.backend.console_tail(id).filter(|tail| !tail.is_empty()) {
+            Some(tail) => format!("{reason}\nconsole tail:\n{tail}"),
+            None => reason.to_owned(),
+        };
+        if self.store.mark_lost(id, step, &reason)? == EnvTransition::Applied {
             report.failed.push(id.to_owned());
         }
         Ok(())
@@ -1333,6 +1339,68 @@ mod tests {
         let peak = lab.peak.load(std::sync::atomic::Ordering::SeqCst);
         assert!(peak > 1, "probes must overlap, peak was {peak}");
         assert!(peak <= 8, "at most 8 probes in flight, peak was {peak}");
+        Ok(())
+    }
+
+    /// #727: a provision that never gets Ready says what the guest console showed,
+    /// since `sandyd` keeps no console log of its own.
+    #[test]
+    fn a_provision_timeout_carries_the_console_tail_in_its_reason() -> Result<()> {
+        let r = rig(FakeEnvironmentBackend::new().starting_polls(1000))?;
+        let id = add(&r.store, 1)?;
+        r.backend.set_console_tail(&id, "socat: bind failed\nlogin:");
+        let base = now();
+        r.driver.reconcile_once(base)?;
+        let report = r.driver.reconcile_once(base + 601)?;
+        assert_eq!(report.failed, std::slice::from_ref(&id));
+        let failure = state(&r.store, &id)?.failure.context("failure")?;
+        assert_eq!(failure.step, "provision");
+        assert!(
+            failure.reason.contains("console tail:\nsocat: bind failed\nlogin:"),
+            "{}",
+            failure.reason
+        );
+        assert!(failure.reason.starts_with("not ready after"), "{}", failure.reason);
+        Ok(())
+    }
+
+    #[test]
+    fn a_probe_that_reports_failed_carries_the_console_tail_in_its_reason() -> Result<()> {
+        let r = rig(FakeEnvironmentBackend::new().failing_at(0, "probe", "connection refused"))?;
+        let id = add(&r.store, 1)?;
+        r.backend.set_console_tail(&id, "kernel panic");
+        r.driver.reconcile_once(now())?;
+        let failure = state(&r.store, &id)?.failure.context("failure")?;
+        assert_eq!(failure.step, "probe");
+        assert_eq!(failure.reason, "connection refused\nconsole tail:\nkernel panic");
+        Ok(())
+    }
+
+    /// The tail must survive a kill that fails: the box may be wedged, which is when the console matters most.
+    #[test]
+    fn the_console_tail_is_carried_when_the_kill_fails_too() -> Result<()> {
+        let r = rig(FakeEnvironmentBackend::new().failing_at(0, "probe", "connection refused"))?;
+        let id = add(&r.store, 1)?;
+        r.backend.set_kill_failing(true);
+        r.backend.set_console_tail(&id, "hung task");
+        r.driver.reconcile_once(now())?;
+        let failure = state(&r.store, &id)?.failure.context("failure")?;
+        assert!(
+            failure.reason.ends_with("console tail:\nhung task"),
+            "{}",
+            failure.reason
+        );
+        Ok(())
+    }
+
+    /// No console (a process backend, a launch that failed before a box existed): the reason is unchanged.
+    #[test]
+    fn a_failure_without_a_console_tail_keeps_its_reason() -> Result<()> {
+        let r = rig(FakeEnvironmentBackend::new().failing_at(0, "probe", "connection refused"))?;
+        let id = add(&r.store, 1)?;
+        r.driver.reconcile_once(now())?;
+        let failure = state(&r.store, &id)?.failure.context("failure")?;
+        assert_eq!(failure.reason, "connection refused");
         Ok(())
     }
 }

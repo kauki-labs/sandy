@@ -12,12 +12,14 @@
 //! module because its names (`setup`, `teardown`) are only meaningful namespaced.
 
 mod connections;
+mod console;
 mod lifecycle;
 pub mod mesh;
 mod probe;
 mod process;
 mod vm;
 
+pub use console::{ConsoleSink, ConsoleTaps, TAIL_BYTES, TAIL_LINES};
 pub use lifecycle::{GuardedBackend, RunGuard, RunGuards, guarded};
 pub use probe::{HttpServiceProbe, Registration};
 pub use process::{ProcessConfig, ProcessConfigError, ProcessEnvironmentBackend};
