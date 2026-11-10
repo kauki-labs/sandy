@@ -289,6 +289,7 @@ mod tests {
             size: None,
             env: Vec::new(),
             service_port: Some(3773),
+            secret_dir: None,
         }
     }
 

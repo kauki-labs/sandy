@@ -68,7 +68,7 @@ pub use cred::{
     refresh_once, refresh_once_checked, render_github_permissions, should_refresh, trust_roots_dir, write_trust_secret,
 };
 pub use cred_bracket::{CredentialBracket, SharedProvider, StagingTarget, TokenRedactor};
-pub use cred_github::{CALL_DEADLINE, GithubAdapter, resolve_provider};
+pub use cred_github::{CALL_DEADLINE, GithubAdapter, resolve_adapter, resolve_provider};
 pub use discovery::{Discovery, Placement, StaticRegistry, parse_builder_systems};
 pub use egress::{
     AllowList, EgressApplier, EgressError, EgressOs, EgressOutcome, EgressPlan, EgressRule, NetworkMode,

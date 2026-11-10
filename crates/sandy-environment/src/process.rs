@@ -340,6 +340,12 @@ impl EnvironmentBackend for ProcessEnvironmentBackend {
         if !valid_id(id) {
             return Err(spawn_err(format!("invalid environment id {id:?}")));
         }
+        // No secret channel here: a service started without its credential would look healthy (INV-1).
+        if spec.secret_dir.is_some() {
+            return Err(spawn_err(
+                "the process backend has no secret channel and cannot deliver a secret share".to_owned(),
+            ));
+        }
         let mut running = self.lock();
         if running.contains_key(id) {
             return Ok(Launch::AlreadyRunning);

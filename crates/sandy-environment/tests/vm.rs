@@ -2,6 +2,7 @@
 //! double whose `run` holds until its control is cancelled.
 
 use std::{
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -11,10 +12,13 @@ use std::{
 
 use anyhow::{Context, Result};
 use sandy_api::{
-    backend::{BackendError, BoxState, Outcome, RunSpec, VmBackend},
+    backend::{BackendError, BoxState, DirFingerprint, Outcome, RunSpec, VmBackend},
     environment::{Endpoint, EnvironmentBackend, EnvironmentSpec, Launch, Probe},
 };
 use sandy_environment::{ServiceProbe, VmEnvironmentBackend, VmEnvironmentConfig};
+
+/// A run's secret share and whether it carried the `secrets` grant.
+type SecretShare = (Option<(PathBuf, DirFingerprint)>, bool);
 
 #[derive(Default)]
 struct Seen {
@@ -24,6 +28,8 @@ struct Seen {
     timeouts: Mutex<Vec<u32>>,
     agent_grant: Mutex<Vec<bool>>,
     envs: Mutex<Vec<Vec<(String, String)>>>,
+    /// The secret share each run was given, and whether it carried the `secrets` grant.
+    secret_dirs: Mutex<Vec<SecretShare>>,
 }
 
 /// Holds `run` until cancelled, like a booted VM; `die_after` makes it return by itself.
@@ -49,6 +55,10 @@ impl VmBackend for Holding {
             .unwrap()
             .push(spec.grants.agent && !spec.grants.secrets);
         self.seen.envs.lock().unwrap().push(spec.env.to_vec());
+        self.seen.secret_dirs.lock().unwrap().push((
+            spec.secret_dir.map(|(dir, fp)| (dir.to_path_buf(), fp)),
+            spec.grants.secrets,
+        ));
         self.seen.timeouts.lock().unwrap().push(spec.timeout_secs);
         // Last, so a test that waits for the count reads every record below.
         self.seen.runs.fetch_add(1, Ordering::SeqCst);
@@ -90,6 +100,7 @@ fn spec(id: &str) -> EnvironmentSpec {
         size: None,
         env: vec![("K".to_owned(), "V".to_owned())],
         service_port: Some(3773),
+        secret_dir: None,
     }
 }
 
@@ -415,5 +426,31 @@ fn a_run_that_panics_is_not_running_and_does_not_make_drop_wait() -> Result<()> 
         "drop waited {:?} on a dead thread",
         start.elapsed()
     );
+    Ok(())
+}
+
+#[test]
+fn a_secret_dir_is_forwarded_to_the_run_with_the_secrets_grant() -> Result<()> {
+    let (b, seen) = backend(None, Duration::ZERO);
+    let fingerprint = DirFingerprint { dev: 7, ino: 11 };
+    let mut with_secrets = spec("env-s");
+    with_secrets.secret_dir = Some((PathBuf::from("/run/sandy/env-s"), fingerprint));
+    assert_eq!(b.launch(&with_secrets)?, Launch::Started);
+    wait_for("the run to start", || seen.runs.load(Ordering::SeqCst) == 1)?;
+    let dirs = seen.secret_dirs.lock().unwrap().clone();
+    assert_eq!(
+        dirs,
+        vec![(Some((PathBuf::from("/run/sandy/env-s"), fingerprint)), true)]
+    );
+    Ok(())
+}
+
+#[test]
+fn a_spec_without_a_secret_dir_mounts_no_secret_share() -> Result<()> {
+    let (b, seen) = backend(None, Duration::ZERO);
+    assert_eq!(b.launch(&spec("env-n"))?, Launch::Started);
+    wait_for("the run to start", || seen.runs.load(Ordering::SeqCst) == 1)?;
+    let dirs = seen.secret_dirs.lock().unwrap().clone();
+    assert_eq!(dirs, vec![(None, false)]);
     Ok(())
 }
