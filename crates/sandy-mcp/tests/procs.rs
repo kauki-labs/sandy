@@ -25,6 +25,16 @@ fn a_zombie_or_dead_or_unreadable_process_is_not_live() {
     for dead in ["Z", "X"] {
         assert!(!stat_is_live(&line(dead)), "{dead} is not live");
     }
+    // The state follows the last `)`, so a command name with parentheses cannot be read as it.
+    let tricky = stat_line("sandyd) Z (x", 1, 7);
+    assert!(
+        stat_is_live(&tricky),
+        "a `)` in the command name does not make the process a zombie"
+    );
+    assert!(
+        !stat_is_live(&tricky.replacen(") S ", ") Z ", 1)),
+        "the real state still decides"
+    );
     assert!(!stat_is_live(""), "no stat text is not live");
     assert!(!stat_is_live("4242 (sandyd"), "a truncated line is not live");
 }

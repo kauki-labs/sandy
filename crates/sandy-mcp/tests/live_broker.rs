@@ -71,8 +71,9 @@ const PROVISION_SECS: u64 = 240;
 const SERVICE_COMMAND: &str =
     "socat TCP-LISTEN:{port},bind=127.0.0.1,fork,reuseaddr SYSTEM:echo${IFS}HTTP/1.0${IFS}200${IFS}OK";
 /// The stub trust root's name (#733): the profiles' `credential` and `SANDYD_STUB_TRUST_ROOT`.
-/// The longest daemon `TMPDIR` the run's sockets still fit under: the longest socket path under it adds about 67
-/// bytes, and `sun_path` holds 107 plus the NUL.
+/// The longest daemon `TMPDIR` the run's sockets still fit under. The longest socket name in `impls/vm` is the egress
+/// proxy's `eg-<12 hex>.sock`, so `/sandy/<36-char run id>/eg-<12 hex>.sock` adds 64 bytes, and `sun_path` holds 107
+/// plus the NUL. 40 leaves margin.
 const MAX_TMP_BYTES: usize = 40;
 const STUB_ROOT: &str = "live";
 const SERVICE_PORT: &str = "9000";
@@ -202,6 +203,26 @@ fn vm_parts(root: u32) -> Vec<(u32, u64)> {
     descendants(root)
         .into_iter()
         .filter(|(pid, _)| std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|comm| is_vm_part(&comm)))
+        .collect()
+}
+
+/// `(pid, start time)` of every VM part whose command line names `base`: the test daemon's own `TMPDIR`, unique to
+/// this run, so another session's VMs never match. For a daemon that is already dead, whose children the walk from
+/// its pid cannot reach.
+fn vm_parts_using(base: &Path) -> Vec<(u32, u64)> {
+    let needle = base.to_string_lossy().into_owned();
+    let Ok(proc) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    proc.flatten()
+        .filter_map(|e| {
+            let pid = e.file_name().to_str()?.parse::<u32>().ok()?;
+            let comm = std::fs::read_to_string(e.path().join("comm")).ok()?;
+            let cmdline = std::fs::read(e.path().join("cmdline")).ok()?;
+            let named = String::from_utf8_lossy(&cmdline).contains(&needle);
+            (is_vm_part(&comm) && named).then_some(())?;
+            parent_and_start(pid).map(|(_, start)| (pid, start))
+        })
         .collect()
 }
 
@@ -559,15 +580,24 @@ impl Stack {
             let _ = broker.kill();
             let _ = broker.wait();
         }
-        let owned = descendants(self.sandyd.id());
+        let mut owned = descendants(self.sandyd.id());
         // A daemon that already exited died during the run: its children were re-parented, and every "no VM left"
-        // answer since was blind. The exit status is reaped here, so it is reported once.
-        if let Ok(Some(status)) = self.sandyd.try_wait() {
-            findings.push(format!("sandyd had already exited during the run: {status}"));
+        // answer since was blind. The status is reaped here, so it is reported once, and the pid is never signalled
+        // (it may belong to another process now). The walk finds nothing, so the VM parts are found by the staging
+        // base in their command lines instead.
+        let already_exited = match self.sandyd.try_wait() {
+            Ok(Some(status)) => {
+                findings.push(format!("sandyd had already exited during the run: {status}"));
+                owned = vm_parts_using(&self.tmp);
+                true
+            }
+            _ => false,
+        };
+        if !already_exited {
+            signal("TERM", self.sandyd.id());
         }
-        signal("TERM", self.sandyd.id());
         let deadline = Instant::now() + Duration::from_secs(15);
-        while !matches!(self.sandyd.try_wait(), Ok(Some(_))) {
+        while !already_exited && !matches!(self.sandyd.try_wait(), Ok(Some(_))) {
             if Instant::now() > deadline {
                 findings.push("sandyd ignored SIGTERM for 15 s and was SIGKILLed".to_owned());
                 let _ = self.sandyd.kill();

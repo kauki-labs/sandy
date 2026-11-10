@@ -122,10 +122,14 @@ fn qemu_pids() -> anyhow::Result<BTreeSet<u32>> {
 /// The entries under the daemon's own staging base (`<TMPDIR>/sandy`): a run leaves a directory there while it lives
 /// and none once it is deleted. The daemon runs with its own `TMPDIR`, so another session's runs in the host's shared
 /// `/tmp/sandy` cannot read as strays of this one.
-fn run_dirs_under(base: &Path) -> Vec<PathBuf> {
-    std::fs::read_dir(base.join(sandy_fsutil::STAGING_DIR_NAME))
-        .map(|d| d.flatten().map(|e| e.path()).collect())
-        .unwrap_or_default()
+fn run_dirs_under(base: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let staging = base.join(sandy_fsutil::STAGING_DIR_NAME);
+    match std::fs::read_dir(&staging) {
+        Ok(entries) => Ok(entries.flatten().map(|e| e.path()).collect()),
+        // No base at all is a clean state; an unreadable one is not "no strays".
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e).with_context(|| format!("read {}", staging.display())),
+    }
 }
 
 /// The status code of `GET /` on `host:port`, over a bare TCP socket.
@@ -170,9 +174,18 @@ async fn a_vm_environment_becomes_ready_answers_http_and_leaves_nothing_after_de
     ensure!(build.success(), "nix build of the t3 guest runner failed");
 
     let qemu_before = qemu_pids()?;
-    let dir = tempfile::tempdir().context("temp dir")?;
+    // Under `/tmp`, not `$TMPDIR`: a nix shell's is long, and `sandyd.sock` and the run's sockets live under this dir.
+    let dir = tempfile::Builder::new()
+        .prefix("s")
+        .tempdir_in("/tmp")
+        .context("temp dir under /tmp")?;
     // The daemon's own `TMPDIR`: its staging base is `<tmp>/sandy`, apart from the host's shared one.
     let tmp = dir.path().join("t");
+    ensure!(
+        tmp.as_os_str().len() <= 40,
+        "the daemon's TMPDIR {} is over 40 bytes: a run's socket under it could pass the 108-byte `sun_path` limit",
+        tmp.display()
+    );
     std::fs::create_dir(&tmp)?;
     std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700))?;
     let sock = dir.path().join("sandyd.sock");
@@ -279,7 +292,7 @@ async fn a_vm_environment_becomes_ready_answers_http_and_leaves_nothing_after_de
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     // No run directory is left under the daemon's own staging base.
-    let strays = run_dirs_under(&tmp);
+    let strays = run_dirs_under(&tmp)?;
     ensure!(strays.is_empty(), "left behind under the staging base: {strays:?}");
     Ok(())
 }
