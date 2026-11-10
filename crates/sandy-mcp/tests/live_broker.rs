@@ -16,8 +16,8 @@
 //! test host. Without the feature the daemon refuses to start and says so.
 //!
 //!   cargo build -p sandyd -p sandy-broker -p sandy-mcp --features sandyd/stub-trust-root
-//!   SANDY_LIVE=1 nix shell nixpkgs#qemu -c cargo nextest run -p sandy-mcp --features live --test live_broker \
-//!     --no-capture
+//!   SANDY_LIVE=1 nix shell nixpkgs#qemu nixpkgs#virtiofsd -c cargo nextest run -p sandy-mcp --features live --test
+//! live_broker \     --no-capture
 //!
 //! The daemon runs with `SANDYD_STUB_TRUST_ROOT=live` and a call log in the test's own directory. The profiles
 //! name that trust root. The stub's token is staged at `<TMPDIR>/sandy/env-cred-<id>/GITHUB_TOKEN`, the host side
@@ -75,10 +75,17 @@ fn require_live() -> Result<()> {
         std::env::var("SANDY_LIVE").ok().as_deref() == Some("1"),
         "refusing: this is a live gate, set SANDY_LIVE=1 on a Linux/KVM host (INV-S9)"
     );
+    let on_path = |name: &str| {
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).any(|d| d.join(name).is_file())
+    };
     ensure!(
-        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-            .any(|d| d.join("qemu-system-x86_64").is_file()),
-        "refusing: qemu-system-x86_64 is not on PATH, run under `nix shell nixpkgs#qemu`"
+        on_path("qemu-system-x86_64"),
+        "refusing: qemu-system-x86_64 is not on PATH, run under `nix shell nixpkgs#qemu nixpkgs#virtiofsd`"
+    );
+    // The forge credential is staged on a virtiofs share (#706), so every environment starts a `virtiofsd`.
+    ensure!(
+        on_path("virtiofsd") || std::env::var_os("SANDY_VIRTIOFSD_BIN").is_some(),
+        "refusing: virtiofsd is not on PATH, run under `nix shell nixpkgs#qemu nixpkgs#virtiofsd`"
     );
     Ok(())
 }
