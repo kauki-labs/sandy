@@ -804,8 +804,9 @@ fn scenario(stack: &Stack) -> Result<()> {
     script["fixtures"]["ready_timeout_ms"] = json!((PROVISION_SECS + 60) * 1000);
     script["fixtures"]["ready_poll_ms"] = json!(250);
     // The live stack has only the vm environment backend and no job host, so a job submit is refused by design.
-    // The job tools stay covered at tier-2 against the fake broker.
-    script["fixtures"]["skip_tools"] = json!(["submit", "status", "attach", "cancel"]);
+    // `link_environment` is T3-specific and answers `unsupported` on a real broker until open point 1 of #585 is
+    // decided (AT-8 and AT-17 are the blocked rows below). All of them stay covered at tier-2 against the fake.
+    script["fixtures"]["skip_tools"] = json!(["submit", "status", "attach", "cancel", "link_environment"]);
     let mut mcp = stack.mcp()?;
     run_script(&mut mcp, &script)?;
     stack.check_session(mcp, "script session")?;
