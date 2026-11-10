@@ -33,10 +33,42 @@ pub mod v1 {
 /// direct `prost` dependency just for that bound.
 pub use prost::Message;
 pub use v1::{
-    Arch, AttachStateChanged, Cancel, Capabilities, Dispatch, HostExecutorMessage, Input, IsolationClass, JobResult,
-    OrchestratorMessage, Output, Register, RegisterRefused, Registered, SandboxKind, SecretRef, host_executor_message,
+    Arch, AttachStateChanged, Cancel, Capabilities, DataLinkMessage, Dispatch, HostExecutorMessage, Input, InputChunk,
+    InputEnd, IsolationClass, JobResult, OrchestratorMessage, Output, OutputChunk, OutputEnd, Register,
+    RegisterRefused, Registered, SandboxKind, SecretRef, TransferError, data_link_message, host_executor_message,
     orchestrator_message,
 };
+
+/// The most file bytes one `InputChunk` or `OutputChunk` may carry (sandyd.md
+/// §22). A chunk is never split across frames, so this stays well under
+/// `sandy_control_proto::MAX_FRAME_LEN` (1 MiB), leaving room for the frame's
+/// other fields.
+pub const MAX_CHUNK_BYTES: usize = 256 * 1024;
+
+/// The longest chunk `name` a data-link peer may send, in bytes (`PATH_MAX`).
+pub const MAX_CHUNK_NAME_BYTES: usize = 4096;
+
+/// A chunk carries a job's file content. Its `Debug` prints the length only,
+/// so a log line can neither leak the content nor flood.
+impl std::fmt::Debug for InputChunk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InputChunk")
+            .field("name", &self.name)
+            .field("offset", &self.offset)
+            .field("bytes", &format_args!("<{} bytes>", self.bytes.len()))
+            .finish()
+    }
+}
+
+/// See the `InputChunk` impl: length only.
+impl std::fmt::Debug for OutputChunk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OutputChunk")
+            .field("name", &self.name)
+            .field("bytes", &format_args!("<{} bytes>", self.bytes.len()))
+            .finish()
+    }
+}
 
 /// `Dispatch.link_token` is a bearer secret (INV-1): a holder can authenticate
 /// the remote agent-link stream as that run's forwarder. `build.rs` skips
@@ -250,6 +282,7 @@ mod tests {
                     attestation: false,
                     supported_isolation_classes: vec![IsolationClass::Trusted.into()],
                     shares_submitter_filesystem: false,
+                    transfer: false,
                 }),
             })),
         };
@@ -497,6 +530,36 @@ mod tests {
             .context("expected a frame, got a clean close")?;
         assert_eq!(decoded, message);
         Ok(())
+    }
+
+    /// Adversarial: a chunk's `Debug` must not print the file bytes, whether
+    /// as text or as a number list.
+    #[test]
+    fn chunk_debug_prints_the_length_not_the_content() {
+        let marker = b"job-file-content-marker-91c4";
+        let input = format!(
+            "{:?}",
+            InputChunk {
+                name: "a".to_owned(),
+                offset: 0,
+                bytes: marker.to_vec(),
+            }
+        );
+        let output = format!(
+            "{:?}",
+            OutputChunk {
+                name: "a".to_owned(),
+                bytes: marker.to_vec(),
+            }
+        );
+        for rendered in [input, output] {
+            assert!(!rendered.contains("job-file-content-marker"), "text leaked: {rendered}");
+            assert!(
+                !rendered.contains(&format!("{:?}", marker.to_vec())),
+                "bytes leaked: {rendered}"
+            );
+            assert!(rendered.contains("28 bytes"), "no length in: {rendered}");
+        }
     }
 
     /// A message with no `op` set is not a valid data-link message: the codec

@@ -608,6 +608,7 @@ mod tests {
             attestation: false,
             supported_isolation_classes: vec![sandy_executor_proto::IsolationClass::Trusted.into()],
             shares_submitter_filesystem: false,
+            transfer: false,
         }
     }
 
@@ -618,12 +619,14 @@ mod tests {
             attestation: false,
             supported_isolation_classes: vec![sandy_executor_proto::IsolationClass::Trusted.into()],
             shares_submitter_filesystem: false,
+            transfer: false,
         }
     }
 
     fn local_capabilities() -> Capabilities {
         Capabilities {
             shares_submitter_filesystem: true,
+            transfer: false,
             ..capabilities()
         }
     }
