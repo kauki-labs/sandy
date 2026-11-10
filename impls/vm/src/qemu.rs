@@ -2139,7 +2139,7 @@ mod tests {
             .stderr(Stdio::piped())
             .spawn()
             .context("spawn flood child")?;
-        let drain = super::drain_stderr(child.stderr.take().context("stderr was piped")?);
+        let drain = super::drain_stderr(child.stderr.take().context("stderr was piped")?, None);
         let status = child.wait().context("wait flood child")?;
         let captured = drain.join().map_err(|_| anyhow::anyhow!("drain thread panicked"))?;
 
@@ -2152,6 +2152,68 @@ mod tests {
             captured.bytes().all(|b| b == b'x'),
             "the captured bytes are the stderr flood"
         );
+        Ok(())
+    }
+
+    /// #727: qemu's own stderr reaches the console sink, line by line with a marker, so a guest that never opens the
+    /// serial (qemu exits first) still leaves its reason in the console tail. A last line without a newline is kept.
+    #[test]
+    fn drain_stderr_copies_lines_into_the_console_sink_with_a_marker() -> anyhow::Result<()> {
+        use std::process::{Command, Stdio};
+
+        let seen = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let copy = Arc::clone(&seen);
+        let sink: ConsoleSink = Arc::new(move |bytes: &[u8]| {
+            copy.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend(bytes);
+        });
+        let mut child = Command::new("sh")
+            .args(["-c", "printf 'qemu: could not open serial\\nlast words' 1>&2"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("spawn stderr child")?;
+        let drain = super::drain_stderr(child.stderr.take().context("stderr was piped")?, Some(sink));
+        child.wait().context("wait stderr child")?;
+        let captured = drain.join().map_err(|_| anyhow::anyhow!("drain thread panicked"))?;
+
+        let seen = seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            String::from_utf8_lossy(&seen),
+            "[qemu stderr] qemu: could not open serial\n[qemu stderr] last words\n"
+        );
+        assert!(
+            captured.contains("last words"),
+            "the diagnostic copy is unchanged: {captured}"
+        );
+        Ok(())
+    }
+
+    /// A flood of stderr with no newline must not grow a pending line without bound or stall the child.
+    #[test]
+    fn drain_stderr_bounds_a_line_that_never_ends() -> anyhow::Result<()> {
+        use std::process::{Command, Stdio};
+
+        let total = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&total);
+        let sink: ConsoleSink = Arc::new(move |bytes: &[u8]| {
+            counted.fetch_add(bytes.len(), std::sync::atomic::Ordering::SeqCst);
+        });
+        let mut child = Command::new("sh")
+            .args(["-c", "head -c 200000 /dev/zero | tr '\\0' x 1>&2"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("spawn flood child")?;
+        let drain = super::drain_stderr(child.stderr.take().context("stderr was piped")?, Some(sink));
+        assert!(child.wait().context("wait flood child")?.success());
+        drain.join().map_err(|_| anyhow::anyhow!("drain thread panicked"))?;
+        // Every byte arrives, cut into marked pieces no longer than the line cap, so nothing is held back unbounded.
+        let got = total.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(got >= 200_000, "the flood reaches the sink: {got}");
         Ok(())
     }
 
