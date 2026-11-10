@@ -235,22 +235,32 @@ rec {
   stubTrustRootRefused =
     pkgs.runCommand "stub-trust-root-refused"
       {
-        nativeBuildInputs = [ sandy ];
+        nativeBuildInputs = [
+          sandy
+          pkgs.coreutils
+        ];
       }
       ''
         export HOME="$TMPDIR"
         set +e
-        output=$(SANDYD_STUB_TRUST_ROOT=live ${sandy}/bin/sandyd 2>&1)
+        # A timeout: if a regression lets the daemon get past the check it binds and serves forever, and the job would
+        # hang until the runner's own limit.
+        output=$(timeout 30 env SANDYD_STUB_TRUST_ROOT=live ${sandy}/bin/sandyd 2>&1)
         rc=$?
         set -e
+        if [ "$rc" -eq 124 ]; then
+          echo "sandyd was still running after 30 s with SANDYD_STUB_TRUST_ROOT set: it did not refuse" >&2
+          exit 1
+        fi
         if [ "$rc" -eq 0 ]; then
           echo "sandyd started with SANDYD_STUB_TRUST_ROOT set" >&2
           exit 1
         fi
+        # The exact phrase, not the feature name alone: an unrelated later failure can print a path that contains it.
         case "$output" in
-          *stub-trust-root*) ;;
+          *"built without the stub-trust-root cargo feature"*) ;;
           *)
-            echo "sandyd refused without naming the stub-trust-root feature: $output" >&2
+            echo "sandyd failed, but not with the stub refusal: $output" >&2
             exit 1
             ;;
         esac

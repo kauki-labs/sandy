@@ -42,38 +42,76 @@ pub enum StubError {
     /// [`STUB_ENV`] holds a value that is not a valid trust root name.
     #[error("{STUB_ENV} is not a valid trust root name: {0}")]
     BadName(String),
+    /// [`STUB_ENV`] or [`STUB_LOG_ENV`] holds bytes that are not UTF-8: refused, never read as unset.
+    #[error("{0} is not valid UTF-8")]
+    NotUtf8(&'static str),
+    /// A real trust root is registered under the stub's name, so profiles naming it would get fake tokens.
+    #[error("{STUB_ENV} names {0:?}, which is also a registered trust root: refusing to shadow it")]
+    ShadowsRealRoot(String),
 }
 
-/// Read the stub configuration through `get`. `Ok(None)` when [`STUB_ENV`] is unset. With it set and the
-/// `stub-trust-root` feature off, [`StubError::FeatureOff`]: the check comes first, so a build without the feature
-/// can never reach the stub whatever the value is.
+/// Read the stub configuration through `get`. `Ok(None)` when [`STUB_ENV`] is unset. With it set, to anything at all,
+/// and the `stub-trust-root` feature off, [`StubError::FeatureOff`]: the check comes first, before the value is read as
+/// text or looked at as a name, so a build without the feature can never reach the stub, and a value that is not UTF-8
+/// is refused, not taken for unset.
 ///
 /// # Errors
-/// [`StubError`] as above, or [`StubError::BadName`] for a value that is not a valid trust root name.
-pub fn stub_config_from(get: impl Fn(&str) -> Option<String>) -> Result<Option<StubConfig>, StubError> {
+/// [`StubError`] as above, [`StubError::NotUtf8`] for a value that is not UTF-8, or [`StubError::BadName`] for one that
+/// is not a valid trust root name, or differs from its trimmed form (a profile naming `live` would not reach `"
+/// live"`).
+pub fn stub_config_from(get: impl Fn(&str) -> Option<std::ffi::OsString>) -> Result<Option<StubConfig>, StubError> {
     let Some(name) = get(STUB_ENV) else {
         return Ok(None);
     };
     if !cfg!(feature = "stub-trust-root") {
         return Err(StubError::FeatureOff);
     }
+    let name = name.into_string().map_err(|_| StubError::NotUtf8(STUB_ENV))?;
     sandy::validate_trust_root_name(&name).map_err(|e| StubError::BadName(e.to_string()))?;
-    Ok(Some(StubConfig {
-        name,
-        call_log: get(STUB_LOG_ENV).filter(|p| !p.is_empty()).map(PathBuf::from),
-    }))
+    if name != name.trim() {
+        return Err(StubError::BadName("it has surrounding whitespace".to_owned()));
+    }
+    let call_log = match get(STUB_LOG_ENV) {
+        None => None,
+        Some(path) => {
+            let path = path.into_string().map_err(|_| StubError::NotUtf8(STUB_LOG_ENV))?;
+            (!path.is_empty()).then(|| PathBuf::from(path))
+        }
+    };
+    Ok(Some(StubConfig { name, call_log }))
+}
+
+/// Whether `dir` holds a registered trust root called `name`.
+#[cfg(feature = "stub-trust-root")]
+fn shadows_real_root(dir: &std::path::Path, name: &str) -> bool {
+    dir.join(format!("{name}.json")).exists()
 }
 
 /// The resolver the daemon mints from: the real trust roots, or, in a test daemon that names the stub, the stub
-/// for that one name and the real resolver for every other.
+/// for that one name and the real resolver for every other. The stub refuses to start over a real trust root of the
+/// same name, so no profile gets fake tokens by accident.
 ///
 /// # Errors
-/// [`StubError`] from [`stub_config_from`]: the daemon must not start.
+/// [`StubError`] from [`stub_config_from`], or [`StubError::ShadowsRealRoot`]: the daemon must not start.
 pub fn credential_resolver() -> Result<Arc<dyn CredentialResolver>, StubError> {
-    let config = stub_config_from(|key| std::env::var(key).ok())?;
+    credential_resolver_from(|key| std::env::var_os(key), sandy::trust_roots_dir().ok().as_deref())
+}
+
+/// [`credential_resolver`] over an explicit environment and trust roots directory.
+///
+/// # Errors
+/// As [`credential_resolver`].
+pub fn credential_resolver_from(
+    get: impl Fn(&str) -> Option<std::ffi::OsString>,
+    roots_dir: Option<&std::path::Path>,
+) -> Result<Arc<dyn CredentialResolver>, StubError> {
+    let config = stub_config_from(get)?;
     let real: Arc<dyn CredentialResolver> = Arc::new(TrustRootResolver);
     #[cfg(feature = "stub-trust-root")]
     if let Some(config) = config {
+        if roots_dir.is_some_and(|dir| shadows_real_root(dir, &config.name)) {
+            return Err(StubError::ShadowsRealRoot(config.name));
+        }
         tracing::warn!(
             trust_root = %config.name,
             "a STUB trust root is active (test configuration): this daemon mints fake tokens and must not serve users"
@@ -82,7 +120,7 @@ pub fn credential_resolver() -> Result<Arc<dyn CredentialResolver>, StubError> {
     }
     #[cfg(not(feature = "stub-trust-root"))]
     // Without the feature `stub_config_from` has already refused a set variable, so there is nothing to select.
-    let _ = config;
+    let _ = (config, roots_dir);
     Ok(real)
 }
 
@@ -131,12 +169,15 @@ mod provider {
         /// the log cannot pass because it silently stayed empty.
         fn log(&self, line: &str) -> std::io::Result<()> {
             let Some(path) = &self.call_log else { return Ok(()) };
+            // One write call, so two providers logging at once cannot tear a line: an O_APPEND write this small is
+            // atomic. O_NOFOLLOW: a symlink at the path is refused, and `0o600` applies only to a file made here.
             let mut file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .mode(0o600)
+                .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().try_into().unwrap_or(0))
                 .open(path)?;
-            writeln!(file, "{line}")
+            file.write_all(format!("{line}\n").as_bytes())
         }
 
         /// A fresh fake token and handle. Logs nothing: the caller logs the call it serves.
@@ -221,8 +262,19 @@ mod tests {
 
     use super::*;
 
-    fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
-        move |key| pairs.iter().find(|(k, _)| *k == key).map(|(_, v)| (*v).to_owned())
+    fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> + 'a {
+        move |key| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| std::ffi::OsString::from(*v))
+        }
+    }
+
+    /// A value that is not UTF-8.
+    fn non_utf8(key: &'static str) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+        use std::os::unix::ffi::OsStringExt as _;
+        move |k| (k == key).then(|| std::ffi::OsString::from_vec(vec![b'l', 0xff, b'e']))
     }
 
     #[test]
@@ -254,7 +306,7 @@ mod tests {
     #[cfg(feature = "stub-trust-root")]
     #[test]
     fn the_stub_name_must_be_a_valid_trust_root_name() {
-        for bad in ["", "../x", "a/b", ".", ".."] {
+        for bad in ["", "../x", "a/b", ".", "..", " live", "live "] {
             let err = stub_config_from(env(&[(STUB_ENV, bad)])).expect_err(bad);
             assert!(matches!(err, StubError::BadName(_)), "{bad:?}: {err}");
         }
@@ -375,7 +427,14 @@ mod tests {
 
         #[test]
         fn the_stub_name_resolves_to_the_stub_provider_and_never_reaches_the_real_resolver() {
-            assert!(resolver().provider("live").is_ok());
+            let provider = resolver().provider("live").expect("the stub answers to its name");
+            let minted = provider
+                .mint(&sandy::Scope::default(), std::time::Duration::from_secs(60))
+                .expect("a stub mint");
+            assert!(
+                minted.secret().starts_with(STUB_TOKEN_PREFIX),
+                "it is the stub that minted"
+            );
         }
 
         #[test]
@@ -441,5 +500,114 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&log)?, "mint stub-1\nrevoke stub-1\n");
         assert!(!staged.exists(), "revoking removes the staged token");
         Ok(())
+    }
+
+    /// A value that is not UTF-8 is refused in every build, never taken for an unset variable: a release build that
+    /// ignored it would run the real adapter in a daemon someone meant to run against the stub.
+    #[test]
+    fn a_value_that_is_not_utf8_is_refused_never_read_as_unset() {
+        let err = stub_config_from(non_utf8(STUB_ENV)).expect_err("must refuse");
+        #[cfg(not(feature = "stub-trust-root"))]
+        assert_eq!(err, StubError::FeatureOff);
+        #[cfg(feature = "stub-trust-root")]
+        assert_eq!(err, StubError::NotUtf8(STUB_ENV));
+    }
+
+    #[test]
+    fn the_resolver_is_the_real_one_when_no_stub_is_named() {
+        assert!(credential_resolver_from(env(&[]), None).is_ok());
+    }
+
+    /// The daemon's own entry point: without the feature, a set variable stops the start, whatever the name.
+    #[cfg(not(feature = "stub-trust-root"))]
+    #[test]
+    fn the_daemons_resolver_refuses_a_set_variable_without_the_feature() {
+        let err = credential_resolver_from(env(&[(STUB_ENV, "live")]), None)
+            .err()
+            .expect("refused");
+        assert_eq!(err, StubError::FeatureOff);
+    }
+
+    #[cfg(feature = "stub-trust-root")]
+    mod daemon {
+        use sandy::CredentialProvider as _;
+
+        use super::{super::*, env};
+
+        #[test]
+        fn the_daemons_resolver_gives_the_stub_for_its_name_and_nothing_else() {
+            let resolver = credential_resolver_from(env(&[(STUB_ENV, "live")]), None).expect("valid");
+            let provider = resolver.provider("live").expect("the stub answers");
+            let minted = provider
+                .mint(&sandy::Scope::default(), std::time::Duration::from_secs(60))
+                .expect("a stub mint");
+            assert!(minted.secret().starts_with(STUB_TOKEN_PREFIX));
+            assert!(
+                resolver.provider("not-the-stub").is_err(),
+                "any other name reaches the real resolver, which has no such root here"
+            );
+        }
+
+        /// A real trust root of the stub's name would hand fake tokens to profiles that mean the real one.
+        #[test]
+        fn a_real_trust_root_of_the_stubs_name_stops_the_start() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::write(dir.path().join("live.json"), "{}").expect("write");
+            let err = credential_resolver_from(env(&[(STUB_ENV, "live")]), Some(dir.path()))
+                .err()
+                .expect("refused");
+            assert_eq!(err, StubError::ShadowsRealRoot("live".to_owned()));
+            // A different name starts.
+            assert!(credential_resolver_from(env(&[(STUB_ENV, "other")]), Some(dir.path())).is_ok());
+        }
+
+        /// Two providers logging at once (environments provision concurrently) never tear a line.
+        #[test]
+        fn concurrent_calls_never_tear_a_log_line() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("calls.log");
+            let provider = std::sync::Arc::new(StubProvider::new(Some(path.clone())));
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    let provider = std::sync::Arc::clone(&provider);
+                    std::thread::spawn(move || {
+                        for _ in 0..50 {
+                            provider
+                                .mint(&sandy::Scope::default(), std::time::Duration::from_secs(60))
+                                .expect("mint");
+                        }
+                    })
+                })
+                .collect();
+            for t in threads {
+                t.join().expect("thread");
+            }
+            let log = std::fs::read_to_string(&path).expect("log");
+            assert_eq!(log.lines().count(), 400, "one line per call");
+            assert!(
+                log.lines()
+                    .all(|l| l.strip_prefix("mint stub-").is_some_and(|n| n.parse::<u64>().is_ok())),
+                "a torn or merged line: {log:.200}"
+            );
+        }
+
+        /// A symlink at the log path is refused, so the stub cannot be made to append into another file.
+        #[test]
+        fn a_symlinked_call_log_is_refused() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let target = dir.path().join("target");
+            std::fs::write(&target, "").expect("write");
+            let link = dir.path().join("calls.log");
+            std::os::unix::fs::symlink(&target, &link).expect("symlink");
+            let err = StubProvider::new(Some(link))
+                .mint(&sandy::Scope::default(), std::time::Duration::from_secs(60))
+                .expect_err("must fail");
+            assert!(err.to_string().contains("call log"), "{err}");
+            assert_eq!(
+                std::fs::read_to_string(&target).expect("read"),
+                "",
+                "nothing was appended"
+            );
+        }
     }
 }
