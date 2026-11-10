@@ -280,6 +280,7 @@ fn trusted_process_capabilities() -> Capabilities {
         attestation: false,
         supported_isolation_classes: vec![IsolationClass::Trusted.into()],
         shares_submitter_filesystem: false,
+        transfer: false,
     }
 }
 

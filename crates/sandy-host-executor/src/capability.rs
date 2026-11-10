@@ -161,6 +161,7 @@ fn to_wire_capabilities(
             .map(Into::into)
             .collect(),
         shares_submitter_filesystem,
+        transfer: false,
     }
 }
 
