@@ -271,7 +271,10 @@ pub trait FileSink: Send + Sync {
 /// nothing. A straggler therefore never acts after a later delivery, and a
 /// retry loop against a wedged sink holds one blocking-pool thread, not one per
 /// timeout. A caller retries after a pause. Teardown that meets `Busy` leaves
-/// its slot set and is retried the same way.
+/// its slot set and is retried the same way. A sink that never returns keeps
+/// the directory busy for good, as it kept the old gate held. A failed setup's
+/// clean-up that meets `Busy` leaves the prepared directory, which holds no key
+/// yet, until the next `prepare` clears it.
 pub struct SecretsDir<S>(std::sync::Arc<Gated<S>>);
 
 struct Gated<S> {
@@ -1851,6 +1854,17 @@ mod tests {
         }
     }
 
+    /// Poll `cond` every 10 ms for up to 5 s.
+    async fn wait_until(what: &str, cond: impl Fn() -> bool) -> Result<()> {
+        for _ in 0..500 {
+            if cond() {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        bail!("timed out waiting for {what}")
+    }
+
     /// #713: a timed-out operation still runs on its blocking thread. A later
     /// operation on the same directory must not queue behind it: it answers
     /// `Busy` at once and never reaches the sink. After the straggler ends, a
@@ -1864,13 +1878,16 @@ mod tests {
             bail!("the parked delivery must time out");
         };
         assert!(e.to_string().contains("timed out"), "{e}");
+        // The straggler removed the marker and is now parked in the first write.
+        wait_until("the straggler to park in the sink", || sink.entered() == 2).await?;
         let before = sink.entered();
 
-        let Err(busy) = dir.prepare().await else {
+        // Bounded: on the old mutex design these would wait for the sink, not fail.
+        let Err(busy) = bounded(T, dir.prepare()).await else {
             bail!("prepare must be refused while an operation is in flight");
         };
         assert!(busy.is_busy(), "{busy}");
-        let Err(busy) = dir.remove_secrets().await else {
+        let Err(busy) = bounded(T, dir.remove_secrets()).await else {
             bail!("removal must be refused while an operation is in flight");
         };
         assert!(busy.is_busy(), "{busy}");
@@ -1880,7 +1897,7 @@ mod tests {
         let second: [(&str, &[u8]); 2] = [(KEY_FILE, b"new"), (HOSTNAME_FILE, b"n")];
         let mut delivered = false;
         for _ in 0..200 {
-            match dir.deliver(&second).await {
+            match bounded(T, dir.deliver(&second)).await {
                 Ok(()) => {
                     delivered = true;
                     break;
@@ -1910,8 +1927,10 @@ mod tests {
             };
         }
         sink.release();
-        tokio::time::sleep(Duration::from_millis(300)).await;
         // One deliver: remove the marker, write two files, write the marker.
+        wait_until("the first operation to finish", || sink.entered() == 4).await?;
+        // Give a wrongly queued operation time to reach the sink.
+        tokio::time::sleep(Duration::from_millis(150)).await;
         assert_eq!(sink.entered(), 4, "only the first operation may reach the sink");
         assert_eq!(sink.peak(), 1, "at most one thread inside the sink at once");
         Ok(())
