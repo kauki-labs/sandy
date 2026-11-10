@@ -623,7 +623,7 @@ owner.
 - One tool call makes one API request: no retry, no redirect, no state.
 - No tool argument or result carries a secret. A guard refuses secret-named fields and token-shaped values in arguments and withholds a result or error that holds one. Invariant: O8 of #585.
 - The client accepts a loopback `http` broker URL only, since it has no TLS backend.
-- One conformance script (`tests/conformance/script.json`) runs against two targets: the in-memory fake broker (tier-2) and the real `sandyd` + `sandy-broker` + qemu guest (tier-3, `live_broker.rs`, feature `live`). The live target is red and `#[ignore]`d: a vm-qemu service on the base guest never reaches Ready (#727). A target overrides `fixtures` only (profiles, manifest, Ready timing) and reads no broker state. The live target uses the generic base guest, so sandy core holds no T3 code or image.
+- One conformance script (`tests/conformance/script.json`) runs against two targets: the in-memory fake broker (tier-2) and the real `sandyd` + `sandy-broker` + qemu guest (tier-3, `live_broker.rs`, feature `live`). The live target needs `SANDY_LIVE=1` on a Linux/KVM host (3 of 3 runs passed on ws01 on 2026-11-10). It names `skip_tools` for what its stack cannot serve (the job steps, which need a job host, and `link_environment`), runs the credential bracket through the stub trust root (#733, cargo feature `stub-trust-root`), and its service answers a bare HTTP status line because the host's readiness probe is HTTP-only (#732). A target overrides `fixtures` only (profiles, manifest, Ready timing, `skip_tools`) and reads no broker state. The live target uses the generic base guest, so sandy core holds no T3 code or image.
 
 **KPI:** rows KMCP1 to KMCP9 in [`kpi.md`](kpi.md).
 

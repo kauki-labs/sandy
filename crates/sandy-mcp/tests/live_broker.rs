@@ -4,18 +4,27 @@
 //!
 //! Written for: AT-1 (idempotent spawn, one VM), AT-2 (Provisioning with no connection, then Ready), AT-4 and
 //! AT-6 (cancel during Provisioning, idempotent delete), AT-9 (request id conflict), AT-10 (secret-shaped
-//! arguments refused), and the API-credential half of AT-11. Every test here is `#[ignore]`d with its reason:
-//! the main scenario is red on the base guest, the others are blocked rows.
+//! arguments refused), the API-credential half of AT-11, and the forge credential bracket (#706) through the stub
+//! trust root (#733). The main scenario runs; the other tests here are `#[ignore]`d blocked rows, each with its
+//! reason.
 //!
 //! The guest is the generic base guest (`topologies.x86_64-linux.qemu`) running `socat` as `nobody`: sandy core
-//! names no service. Tier-3, behind the `live` feature like the other live suites (INV-S9). Linux with KVM and
-//! `/dev/vhost-vsock` only. Build the sibling binaries first, so no cargo build runs mid-test:
+//! names no service. The host decides Ready with an HTTP probe (#732), so the service answers a bare HTTP status
+//! line. Tier-3, behind the `live` feature like the other live suites (INV-S9). Linux with KVM and
+//! `/dev/vhost-vsock` only. Build the sibling binaries first, so no cargo build runs mid-test. `sandyd` needs the
+//! `stub-trust-root` feature: every vm environment mints from a registered trust root, and no real one exists on a
+//! test host. Without the feature the daemon refuses to start and says so.
 //!
-//!   cargo build -p sandyd -p sandy-broker -p sandy-mcp
-//!   SANDY_LIVE=1 nix shell nixpkgs#qemu -c cargo nextest run -p sandy-mcp --features live --test live_broker \
-//!     --run-ignored all --no-capture
+//! ```text
+//! cargo build -p sandyd -p sandy-broker -p sandy-mcp --features sandyd/stub-trust-root
+//! SANDY_LIVE=1 nix shell nixpkgs#qemu nixpkgs#virtiofsd -c \
+//!   cargo nextest run -p sandy-mcp --features live --test live_broker --no-capture
+//! ```
 //!
-//! The main scenario is `#[ignore]`d (red, #727), so the command above needs `--run-ignored all`.
+//! The daemon runs with `SANDYD_STUB_TRUST_ROOT=live` and a call log in the test's own directory. The profiles
+//! name that trust root. The stub's token is staged at `<TMPDIR>/sandy/env-cred-<id>/GITHUB_TOKEN`, the host side
+//! of the guest's secret share, and must be nowhere else: not in `ps`, an MCP result, a log or any other file. Every
+//! `mint` in the call log must have its `revoke`, and no staged directory may remain.
 //!
 //! `SANDYD_BIN` and `BROKER_BIN` override the sibling binaries. Every wait is bounded, and the stack guard
 //! stops what the test started: only descendants of this test's own `sandyd`, matched by pid and start time, are
@@ -29,14 +38,14 @@
 mod common;
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     io::Read,
     net::TcpListener,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex, PoisonError,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -52,8 +61,14 @@ use sha2::{Digest, Sha256};
 
 /// A cold boot plus the service probe; the daemon's provision timeout and the script's Ready timeout.
 const PROVISION_SECS: u64 = 240;
-/// The generic service: a TCP listener from the base guest's own `socat`, as a non-root account the guest has.
-const SERVICE_COMMAND: &str = "socat TCP-LISTEN:{port},bind=127.0.0.1,fork,reuseaddr PIPE";
+/// The generic service: a TCP listener from the base guest's own `socat`, as a non-root account the guest has. It
+/// answers every connection with a bare HTTP status line, because the host's readiness probe is HTTP-only (#732): an
+/// echo service (`PIPE`) answers the request with itself and can never read Ready. The command is split on spaces,
+/// so the status line is spelled with `${IFS}`, which the shell `socat` runs expands.
+const SERVICE_COMMAND: &str =
+    "socat TCP-LISTEN:{port},bind=127.0.0.1,fork,reuseaddr SYSTEM:echo${IFS}HTTP/1.0${IFS}200${IFS}OK";
+/// The stub trust root's name (#733): the profiles' `credential` and `SANDYD_STUB_TRUST_ROOT`.
+const STUB_ROOT: &str = "live";
 const SERVICE_PORT: &str = "9000";
 const SERVICE_USER: &str = "nobody";
 
@@ -62,10 +77,18 @@ fn require_live() -> Result<()> {
         std::env::var("SANDY_LIVE").ok().as_deref() == Some("1"),
         "refusing: this is a live gate, set SANDY_LIVE=1 on a Linux/KVM host (INV-S9)"
     );
+    let on_path = |name: &str| {
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).any(|d| d.join(name).is_file())
+    };
     ensure!(
-        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-            .any(|d| d.join("qemu-system-x86_64").is_file()),
-        "refusing: qemu-system-x86_64 is not on PATH, run under `nix shell nixpkgs#qemu`"
+        on_path("qemu-system-x86_64") || std::env::var_os("SANDY_QEMU_BIN").is_some(),
+        "refusing: qemu-system-x86_64 is not on PATH and SANDY_QEMU_BIN is unset, run under `nix shell nixpkgs#qemu \
+         nixpkgs#virtiofsd`"
+    );
+    // The forge credential is staged on a virtiofs share (#706), so every environment starts a `virtiofsd`.
+    ensure!(
+        on_path("virtiofsd") || std::env::var_os("SANDY_VIRTIOFSD_BIN").is_some(),
+        "refusing: virtiofsd is not on PATH, run under `nix shell nixpkgs#qemu nixpkgs#virtiofsd`"
     );
     Ok(())
 }
@@ -203,6 +226,13 @@ struct Stack {
     api_url: String,
     token: String,
     credential: PathBuf,
+    /// The stub trust root's call log (#733): one `mint`, `refresh` or `revoke` line per call, never a token.
+    stub_log: PathBuf,
+    /// Every stub token seen so far, each with the staged file it was read from. Kept after the file is gone, so a
+    /// revoked token is still scanned for.
+    stub_tokens: Arc<Mutex<BTreeMap<String, PathBuf>>>,
+    /// Set by the sampler thread when any `ps` sample held a stub token.
+    ps_stub_hit: Arc<AtomicBool>,
     /// The daemon's `TMPDIR`, inside `dir`: its staging base is `<tmp>/sandy`.
     tmp: PathBuf,
     /// The host's sandy-named `/tmp` entries before this run, for the report of foreign new ones.
@@ -246,10 +276,10 @@ impl Stack {
         let token = canary_token()?;
         let credential = credential_file(dir.path(), &token)?;
         let sock = dir.path().join("sandyd.sock");
+        let stub_log = dir.path().join("stub-calls.log");
 
         let profiles = dir.path().join("profiles.json");
-        let entry =
-            |name: &str| json!({"name": name, "credential": "live", "targets": ["o/r"], "capabilities": ["read_code"]});
+        let entry = |name: &str| json!({"name": name, "credential": STUB_ROOT, "targets": ["o/r"], "capabilities": ["read_code"]});
         private_file(
             &profiles,
             &json!({"profiles": [entry("harness"), entry("other")]}).to_string(),
@@ -281,6 +311,8 @@ impl Stack {
             .env("SANDY_ENV_VM_COMMAND", SERVICE_COMMAND)
             .env("SANDY_ENV_VM_SERVICE_PORT", SERVICE_PORT)
             .env("SANDY_ENV_VM_SERVICE_USER", SERVICE_USER)
+            .env("SANDYD_STUB_TRUST_ROOT", STUB_ROOT)
+            .env("SANDYD_STUB_CALL_LOG", &stub_log)
             // The provision timeout may not be below the boot budget (default 600 s).
             .env("SANDY_ENV_VM_BOOT_TIMEOUT_SECS", "100")
             .env("SANDY_ENV_PROVISION_TIMEOUT_SECS", PROVISION_SECS.to_string())
@@ -303,13 +335,20 @@ impl Stack {
             sampler: None,
             token,
             credential,
+            stub_log,
+            stub_tokens: Arc::new(Mutex::new(BTreeMap::new())),
+            ps_stub_hit: Arc::new(AtomicBool::new(false)),
         };
-        // Sample `ps` for the whole run: one snapshot can miss a short-lived argv.
-        let (hit, errors, stop, canary) = (
+        // Sample `ps` for the whole run: one snapshot can miss a short-lived argv. The stub's forge tokens (#733) are
+        // checked on every tick too: a helper that put one in its argv between two checkpoints is caught here.
+        let (hit, stub_hit, errors, stop, canary, tokens, tmp) = (
             Arc::clone(&stack.ps_hit),
+            Arc::clone(&stack.ps_stub_hit),
             Arc::clone(&stack.ps_errors),
             Arc::clone(&stack.sampler_stop),
             stack.token.clone(),
+            Arc::clone(&stack.stub_tokens),
+            stack.tmp.clone(),
         );
         stack.sampler = Some(std::thread::spawn(move || {
             while !stop.load(Ordering::SeqCst) {
@@ -318,6 +357,15 @@ impl Stack {
                     Ok(false) => {}
                     Err(_) => {
                         errors.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                for (token, _) in staged_stub_tokens(&tmp, &tokens) {
+                    match ps_holds(&token) {
+                        Ok(true) => stub_hit.store(true, Ordering::SeqCst),
+                        Ok(false) => {}
+                        Err(_) => {
+                            errors.fetch_add(1, Ordering::SeqCst);
+                        }
                     }
                 }
                 std::thread::sleep(Duration::from_millis(500));
@@ -376,6 +424,83 @@ impl Stack {
         let leaked = files_holding(self.dir.path(), &self.token, &self.credential)
             .context("AT-11: the canary scan could not read every file")?;
         ensure!(leaked.is_empty(), "AT-11 ({at}): the canary is in {leaked:?}");
+        // The stub's forge tokens (#733): each only in the file the guest's secret share is staged from.
+        ensure!(
+            !self.ps_stub_hit.load(Ordering::SeqCst),
+            "AT-11 ({at}): a stub forge token was in `ps` output (seen by the sampler)"
+        );
+        for (token, staged) in self.refresh_stub_tokens() {
+            ensure!(!ps_holds(&token)?, "AT-11 ({at}): a stub forge token is in `ps` output");
+            let leaked = files_holding(self.dir.path(), &token, &staged)
+                .context("AT-11: the stub token scan could not read every file")?;
+            ensure!(
+                leaked.is_empty(),
+                "AT-11 ({at}): a stub forge token is outside its staged file, in {leaked:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The staged stub tokens now on disk (`<tmp>/sandy/env-cred-<id>/GITHUB_TOKEN`), added to the ones seen before.
+    /// Returns all of them, with the staged file each came from.
+    fn refresh_stub_tokens(&self) -> Vec<(String, PathBuf)> {
+        staged_stub_tokens(&self.tmp, &self.stub_tokens)
+    }
+
+    /// The stub's call log, one line per call.
+    fn stub_calls(&self) -> Result<Vec<String>> {
+        Ok(std::fs::read_to_string(&self.stub_log)
+            .context("the stub trust root wrote no call log: was sandyd built with --features sandyd/stub-trust-root?")?
+            .lines()
+            .map(str::to_owned)
+            .collect())
+    }
+
+    /// [`Stack::stub_bracket_is_balanced`], retried for up to `secs`: the driver revokes in the pass after the kill, so
+    /// the last `revoke` can land a moment after the VM is gone. The last failure is the error.
+    fn wait_stub_bracket_balanced(&self, at: &str, secs: u64) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            match self.stub_bracket_is_balanced(at) {
+                Ok(()) => return Ok(()),
+                Err(e) if Instant::now() > deadline => return Err(e),
+                Err(_) => std::thread::sleep(Duration::from_millis(250)),
+            }
+        }
+    }
+
+    /// Every `mint` has its `revoke`, no revoke is for a handle never minted, no staged directory remains, and no
+    /// stub token is in any of the places the canary scan covers (the staged file is gone).
+    fn stub_bracket_is_balanced(&self, at: &str) -> Result<()> {
+        let calls = self.stub_calls()?;
+        let handles = |verb: &str| -> BTreeSet<String> {
+            calls
+                .iter()
+                .filter_map(|l| l.strip_prefix(verb).and_then(|h| h.strip_prefix(' ')))
+                .map(str::to_owned)
+                .collect()
+        };
+        let (minted, revoked) = (handles("mint"), handles("revoke"));
+        ensure!(!minted.is_empty(), "stub bracket ({at}): nothing was minted: {calls:?}");
+        ensure!(
+            minted == revoked,
+            "stub bracket ({at}): minted {minted:?} but revoked {revoked:?}"
+        );
+        let left: Vec<_> = std::fs::read_dir(self.tmp.join("sandy"))
+            .map(|d| {
+                d.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.file_name()
+                            .is_some_and(|n| n.to_string_lossy().starts_with("env-cred-"))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        ensure!(
+            left.is_empty(),
+            "stub bracket ({at}): staged directories left: {left:?}"
+        );
         Ok(())
     }
 
@@ -387,6 +512,12 @@ impl Stack {
             !output.contains(&self.token),
             "AT-11 ({at}): the canary is in the MCP's stdout or stderr"
         );
+        for (token, _) in self.refresh_stub_tokens() {
+            ensure!(
+                !output.contains(&token),
+                "AT-11 ({at}): a stub forge token is in the MCP's stdout or stderr"
+            );
+        }
         Ok(())
     }
 
@@ -549,6 +680,27 @@ fn spawn_args(request_id: &str, task: &str) -> Value {
 
 /// The canary never reaches the host process table: `ps` shows every argv on the box. `timeout` bounds it, and a
 /// `ps` that fails or times out is an error, not a clean sample.
+/// The stub tokens staged under `<tmp>/sandy/env-cred-<id>/GITHUB_TOKEN` now, added to `seen`, which keeps a token
+/// after its file is gone so a revoked token is still looked for. Returns every token seen, with its staged file.
+fn staged_stub_tokens(tmp: &Path, seen: &Mutex<BTreeMap<String, PathBuf>>) -> Vec<(String, PathBuf)> {
+    let mut seen = seen.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Ok(base) = std::fs::read_dir(tmp.join("sandy")) {
+        for entry in base.flatten() {
+            if !entry.file_name().to_string_lossy().starts_with("env-cred-") {
+                continue;
+            }
+            let staged = entry.path().join("GITHUB_TOKEN");
+            if let Ok(text) = std::fs::read_to_string(&staged) {
+                let token = text.trim().to_owned();
+                if !token.is_empty() {
+                    seen.entry(token).or_insert(staged);
+                }
+            }
+        }
+    }
+    seen.iter().map(|(t, p)| (t.clone(), p.clone())).collect()
+}
+
 fn ps_holds(needle: &str) -> Result<bool> {
     let out = Command::new("timeout")
         .args(["10", "ps", "-eww", "-o", "args="])
@@ -559,8 +711,6 @@ fn ps_holds(needle: &str) -> Result<bool> {
 }
 
 #[test]
-#[ignore = "red: a vm-qemu service on the base guest never reaches Ready (probe times out); needs a generic service \
-            guest"]
 fn the_conformance_script_passes_against_the_real_stack_and_leaves_nothing() -> Result<()> {
     require_live()?;
     let stack = Stack::start()?;
@@ -617,6 +767,24 @@ fn scenario(stack: &Stack) -> Result<()> {
         "AT-1: two spawns of one request id run exactly one VM"
     );
 
+    // The forge credential bracket (#706), through the stub (#733): minted before the boot and staged once, at the
+    // host side of the guest's secret share.
+    let staged_tokens = stack.refresh_stub_tokens();
+    ensure!(
+        staged_tokens.len() == 1,
+        "a Ready environment has exactly one staged stub token: {}",
+        staged_tokens.len()
+    );
+    let calls = stack.stub_calls()?;
+    ensure!(
+        calls.len() == 1 && calls[0].starts_with("mint stub-"),
+        "the bracket minted once before Ready and revoked nothing yet: {calls:?}"
+    );
+    ensure!(
+        staged_tokens[0].0.starts_with("stub-token-"),
+        "the staged token is the stub's, not a real forge token"
+    );
+
     // AT-11, API-credential half: the bearer token (a unique canary) is in the credential file and nowhere else
     // the host or the MCP shows. The same scan runs again after the script and after teardown.
     stack.canary_leaks("after Ready")?;
@@ -663,6 +831,10 @@ fn scenario(stack: &Stack) -> Result<()> {
     let mut script: Value = serde_json::from_str(SCRIPT)?;
     script["fixtures"]["ready_timeout_ms"] = json!((PROVISION_SECS + 60) * 1000);
     script["fixtures"]["ready_poll_ms"] = json!(250);
+    // The live stack has only the vm environment backend and no job host, so a job submit is refused by design.
+    // `link_environment` is T3-specific and answers `unsupported` on a real broker until open point 1 of #585 is
+    // decided (AT-8 and AT-17 are the blocked rows below). All of them stay covered at tier-2 against the fake.
+    script["fixtures"]["skip_tools"] = json!(["submit", "status", "attach", "cancel", "link_environment"]);
     let mut mcp = stack.mcp()?;
     run_script(&mut mcp, &script)?;
     stack.check_session(mcp, "script session")?;
@@ -693,7 +865,8 @@ fn scenario(stack: &Stack) -> Result<()> {
         .collect();
     assert!(running.is_empty(), "non-terminal jobs after the run: {running:?}");
     stack.check_session(mcp, "final session")?;
-    stack.canary_leaks("after the final listing")
+    stack.canary_leaks("after the final listing")?;
+    stack.wait_stub_bracket_balanced("after the final listing", 60)
 }
 
 #[test]
