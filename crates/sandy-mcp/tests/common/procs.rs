@@ -81,7 +81,9 @@ pub fn run_dirs_left(tmp: &Path) -> Result<Vec<PathBuf>> {
 /// # Errors
 /// An entry was unreadable or of a kind the scan cannot read.
 pub fn files_holding(root: &Path, needle: &str, skip: &Path) -> Result<Vec<PathBuf>> {
-    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::{ffi::OsStrExt as _, fs::FileTypeExt};
+    // An empty needle is in every file, and `windows(0)` panics: a caller bug, refused before anything is read.
+    anyhow::ensure!(!needle.is_empty(), "the canary scan needs a non-empty needle");
     let mut hits = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(p) = stack.pop() {
@@ -98,16 +100,23 @@ pub fn files_holding(root: &Path, needle: &str, skip: &Path) -> Result<Vec<PathB
                 Err(e) => return Err(e).with_context(|| format!("list {}", p.display())),
             };
             for entry in entries {
-                stack.push(
-                    entry
-                        .with_context(|| format!("read an entry of {}", p.display()))?
-                        .path(),
-                );
+                let entry = entry.with_context(|| format!("read an entry of {}", p.display()))?;
+                // A name can carry the canary too (a file named after it, a path in a log line).
+                if entry
+                    .file_name()
+                    .as_bytes()
+                    .windows(needle.len())
+                    .any(|w| w == needle.as_bytes())
+                {
+                    hits.push(entry.path());
+                }
+                stack.push(entry.path());
             }
         } else if kind.is_file() {
             if p != skip {
                 match file_holds(&p, needle.as_bytes()) {
-                    Ok(true) => hits.push(p),
+                    Ok(true) if !hits.contains(&p) => hits.push(p),
+                    Ok(true) => {}
                     Ok(false) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => return Err(e).with_context(|| format!("read {}", p.display())),
@@ -125,10 +134,29 @@ pub fn files_holding(root: &Path, needle: &str, skip: &Path) -> Result<Vec<PathB
 
 /// Whether the file at `path` holds `needle`, read in 1 MiB chunks. The last `needle.len() - 1` bytes of a chunk
 /// are kept, so a match that straddles a chunk boundary is found.
-fn file_holds(path: &Path, needle: &[u8]) -> std::io::Result<bool> {
-    use std::io::Read;
+///
+/// The entry was a regular file when the scan listed it, and it can be swapped for a fifo or a device before this
+/// open. A plain open of a fifo with no writer blocks forever, so the open is non-blocking and refuses a symlink,
+/// and the type is checked on the open descriptor: anything but a regular file is an error.
+///
+/// # Errors
+/// The file cannot be opened or read, or is not a regular file.
+pub fn file_holds(path: &Path, needle: &[u8]) -> std::io::Result<bool> {
+    use std::{io::Read, os::unix::fs::OpenOptionsExt as _};
     const CHUNK: usize = 1024 * 1024;
-    let mut file = std::fs::File::open(path)?;
+    if needle.is_empty() {
+        return Err(std::io::Error::other("an empty needle is in every file"));
+    }
+    let flags = (rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::NOFOLLOW).bits();
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(i32::try_from(flags).unwrap_or(0))
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other(
+            "not a regular file: it changed after the scan listed it",
+        ));
+    }
     let keep = needle.len().saturating_sub(1);
     let mut buf = vec![0u8; CHUNK + keep];
     let mut carried = 0;

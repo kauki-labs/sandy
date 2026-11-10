@@ -29,6 +29,8 @@ tokio = { workspace = true, features = ["io-std", "io-util", "rt", "macros"] }
 anyhow.workspace = true
 # The live gate resolves the staging base by the backend's own constant. No control-proto edge (layering.rs).
 sandy-fsutil.workspace = true
+# The canary scan opens a file non-blocking and without following a symlink.
+rustix.workspace = true
 # The live gate writes the broker's clients file, which holds the SHA-256 of the bearer token.
 sha2.workspace = true
 tempfile.workspace = true
