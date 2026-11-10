@@ -15,9 +15,20 @@
 //!
 //! A store fault on one row, or a row that cannot be read, is logged and skipped
 //! so it cannot stop the rest of the pass. The backend calls block, so a pass
-//! runs under `spawn_blocking`.
+//! runs under `spawn_blocking`. The probes of `Provisioning` rows run together
+//! (at most eight at once) once the row loop has launched them, so slow probes do
+//! not add up and the other rows' steps do not wait behind them.
 
-use std::{collections::BTreeSet, net::IpAddr, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeSet,
+    net::IpAddr,
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use prost::Message;
 use sandy_api::{
@@ -29,6 +40,19 @@ use sandy_control_proto::v1::EnvironmentSpec as WireSpec;
 use crate::environment_store::{
     EnvTransition, EnvironmentRecord, EnvironmentState, EnvironmentStore, EnvironmentStoreError,
 };
+
+/// The most probes of `Provisioning` rows that run at once in one pass. Each probe
+/// is bounded by the backend's own timeout, so a pass takes about one probe budget
+/// per eight rows, not one per row.
+const MAX_PROBES_IN_FLIGHT: usize = 8;
+
+/// A launched `Provisioning` row whose probe is yet to run.
+struct PendingProbe {
+    id: String,
+    waited: i64,
+    timed_out: bool,
+    hard_timed_out: bool,
+}
 
 /// What the driver launches and how long it waits.
 #[derive(Debug, Clone)]
@@ -113,11 +137,13 @@ impl EnvironmentDriver {
         // always has its row in the listing below.
         let mut running: BTreeSet<String> = self.backend.boxes()?.into_iter().map(|b| b.box_id).collect();
         let mut known: BTreeSet<String> = BTreeSet::new();
+        // Provisioning rows are launched in the row loop; their probes wait for the end of it and run together.
+        let mut probes: Vec<PendingProbe> = Vec::new();
         for row in self.store.list_each()? {
             match row {
                 Ok(row) => {
                     known.insert(row.environment_id.clone());
-                    if let Err(e) = self.converge(&row, now, &mut running, &mut report) {
+                    if let Err(e) = self.converge(&row, now, &mut running, &mut report, &mut probes) {
                         tracing::warn!(environment = %row.environment_id, error = %e, "could not converge an environment");
                     }
                 }
@@ -129,6 +155,7 @@ impl EnvironmentDriver {
                 Err(e) => return Err(e.into()),
             }
         }
+        self.finish_probes(probes, &mut running, &mut report);
         // A box no environment row names is an orphan: the row was never written or is gone.
         let orphans: Vec<String> = running
             .iter()
@@ -147,9 +174,13 @@ impl EnvironmentDriver {
         now: i64,
         running: &mut BTreeSet<String>,
         report: &mut Report,
+        probes: &mut Vec<PendingProbe>,
     ) -> Result<(), EnvironmentStoreError> {
         match row.state {
-            EnvironmentState::Provisioning => self.provision(row, now, running, report),
+            EnvironmentState::Provisioning => {
+                probes.extend(self.provision(row, now, running, report)?);
+                Ok(())
+            }
             EnvironmentState::Ready => self.check_ready(row, now, running, report),
             EnvironmentState::Stopped | EnvironmentState::Failed | EnvironmentState::Deleted => {
                 if running.contains(&row.environment_id) {
@@ -189,26 +220,30 @@ impl EnvironmentDriver {
         })
     }
 
+    /// Launch the box of a `Provisioning` row unless one runs, and note when its
+    /// attempt began. Returns the probe to run, or `None` when the row failed.
     fn provision(
         &self,
         row: &EnvironmentRecord,
         now: i64,
         running: &mut BTreeSet<String>,
         report: &mut Report,
-    ) -> Result<(), EnvironmentStoreError> {
+    ) -> Result<Option<PendingProbe>, EnvironmentStoreError> {
         let id = row.environment_id.as_str();
         if !running.contains(id) {
             // Covers a row made while the gate was off, and a resume: the create gate alone does not.
             if self.store.trusted_submitter_required() && !row.submitter_trusted {
-                return self.fail(
+                self.fail(
                     id,
                     "admission",
                     "the backend serves trusted submitters only and this environment was not created by one",
                     report,
-                );
+                )?;
+                return Ok(None);
             }
             let Some(spec) = self.to_spec(row) else {
-                return self.fail(id, "spec", "the stored spec does not decode", report);
+                self.fail(id, "spec", "the stored spec does not decode", report)?;
+                return Ok(None);
             };
             match self.backend.launch(&spec) {
                 Ok(Launch::Started) => {
@@ -218,7 +253,10 @@ impl EnvironmentDriver {
                 Ok(Launch::AlreadyRunning) => {
                     running.insert(id.to_owned());
                 }
-                Err(e) => return self.fail(id, "launch", &e.to_string(), report),
+                Err(e) => {
+                    self.fail(id, "launch", &e.to_string(), report)?;
+                    return Ok(None);
+                }
             }
         }
         // The provision timeout runs from the moment a box exists for this
@@ -235,7 +273,66 @@ impl EnvironmentDriver {
         // healthy environment; only a probe that stays broken for twice the
         // timeout fails the row.
         let hard_timed_out = waited > limit.saturating_mul(2);
-        match self.backend.probe(id) {
+        Ok(Some(PendingProbe {
+            id: id.to_owned(),
+            waited,
+            timed_out,
+            hard_timed_out,
+        }))
+    }
+
+    /// Probe every pending row, at most [`MAX_PROBES_IN_FLIGHT`] at a time, then
+    /// apply each result in row order. A probe that panics counts as a probe
+    /// that could not run: only that row's pass is lost.
+    fn finish_probes(&self, pending: Vec<PendingProbe>, running: &mut BTreeSet<String>, report: &mut Report) {
+        let results = self.probe_concurrently(&pending);
+        for (probe, result) in pending.into_iter().zip(results) {
+            if let Err(e) = self.apply_probe(&probe, result, running, report) {
+                tracing::warn!(environment = %probe.id, error = %e, "could not converge an environment");
+            }
+        }
+    }
+
+    fn probe_concurrently(&self, pending: &[PendingProbe]) -> Vec<Result<Probe, BackendError>> {
+        let next = AtomicUsize::new(0);
+        let slots: Mutex<Vec<Option<Result<Probe, BackendError>>>> =
+            Mutex::new(std::iter::repeat_with(|| None).take(pending.len()).collect());
+        std::thread::scope(|scope| {
+            for _ in 0..MAX_PROBES_IN_FLIGHT.min(pending.len()) {
+                scope.spawn(|| {
+                    loop {
+                        let i = next.fetch_add(1, Ordering::SeqCst);
+                        let Some(probe) = pending.get(i) else { break };
+                        let result = catch_unwind(AssertUnwindSafe(|| self.backend.probe(&probe.id)))
+                            .unwrap_or_else(|_| Err(BackendError::Transport("the probe panicked".to_owned())));
+                        slots.lock().unwrap_or_else(PoisonError::into_inner)[i] = Some(result);
+                    }
+                });
+            }
+        });
+        slots
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner)
+            .into_iter()
+            .map(|slot| slot.unwrap_or_else(|| Err(BackendError::Transport("the probe did not run".to_owned()))))
+            .collect()
+    }
+
+    fn apply_probe(
+        &self,
+        pending: &PendingProbe,
+        result: Result<Probe, BackendError>,
+        running: &mut BTreeSet<String>,
+        report: &mut Report,
+    ) -> Result<(), EnvironmentStoreError> {
+        let PendingProbe {
+            id,
+            waited,
+            timed_out,
+            hard_timed_out,
+        } = pending;
+        let (id, waited, timed_out, hard_timed_out) = (id.as_str(), *waited, *timed_out, *hard_timed_out);
+        match result {
             Ok(Probe::Ready { endpoint }) => match endpoint_string(&endpoint) {
                 Some(address) => match self.store.mark_ready_with_endpoint(id, &address)? {
                     EnvTransition::Applied => report.readied.push(id.to_owned()),
