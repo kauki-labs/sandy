@@ -7,8 +7,8 @@ use std::collections::BTreeSet;
 
 use anyhow::{Context, Result};
 use common::procs::{
-    descendants_in, files_holding, foreign_new_entries, is_vm_part, parse_stat, run_dirs_left, sandy_entries,
-    staging_base,
+    descendants_in, file_holds, files_holding, foreign_new_entries, is_vm_part, parse_stat, run_dirs_left,
+    sandy_entries, staging_base,
 };
 
 /// A `/proc/<pid>/stat` line: pid, comm, state, ppid and 17 more fields up to the start time (field 22).
@@ -164,6 +164,16 @@ fn is_blocked(path: &std::path::Path) -> bool {
     std::fs::read_dir(path).is_err() && std::fs::read(path).is_err()
 }
 
+/// The two tests that make a path unreadable need mode bits that bind the current user. Root is not bound, so
+/// there the precondition fails loudly instead of the test passing without checking anything.
+fn require_mode_bits_to_bind(blocked: bool) {
+    assert!(
+        blocked,
+        "the path stayed readable after chmod 000: this process is not bound by mode bits (running as root?). Run the \
+         test as a normal user; it cannot check the failure path otherwise"
+    );
+}
+
 fn deny(path: &std::path::Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000))?;
@@ -228,12 +238,11 @@ fn an_unreadable_directory_is_an_error_not_a_clean_scan() -> Result<()> {
     let blocked = is_blocked(&locked);
     let result = files_holding(root.path(), CANARY, &no_skip());
     allow(&locked)?;
-    if blocked {
-        assert!(
-            result.is_err(),
-            "an unlistable directory must fail the scan: {result:?}"
-        );
-    }
+    require_mode_bits_to_bind(blocked);
+    assert!(
+        result.is_err(),
+        "an unlistable directory must fail the scan: {result:?}"
+    );
     Ok(())
 }
 
@@ -246,9 +255,8 @@ fn an_unreadable_file_is_an_error_not_a_clean_scan() -> Result<()> {
     let blocked = is_blocked(&path);
     let result = files_holding(root.path(), CANARY, &no_skip());
     allow(&path)?;
-    if blocked {
-        assert!(result.is_err(), "an unreadable file must fail the scan: {result:?}");
-    }
+    require_mode_bits_to_bind(blocked);
+    assert!(result.is_err(), "an unreadable file must fail the scan: {result:?}");
     Ok(())
 }
 
@@ -316,5 +324,61 @@ fn the_credential_file_is_created_private_and_never_overwritten() -> Result<()> 
         common::mcp_client::credential_file(dir.path(), "other").is_err(),
         "an existing file is refused, so a loosely-moded one is never reused"
     );
+    Ok(())
+}
+
+/// An empty needle matches every window of every file: it is a bug in the caller, and `windows(0)` panics, so it is
+/// refused with an error before anything is read.
+#[test]
+fn an_empty_needle_is_an_error_not_a_panic() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    std::fs::write(root.path().join("log"), "anything")?;
+    let err = files_holding(root.path(), "", &no_skip()).expect_err("an empty needle must be refused");
+    assert!(format!("{err:#}").contains("needle"), "{err:#}");
+    Ok(())
+}
+
+/// A fifo swapped in for a regular file after the scan listed it must not hang the open: the file is opened
+/// non-blocking and its type is checked on the open descriptor. The bound makes a hang a failure.
+#[test]
+fn a_fifo_in_place_of_a_file_is_refused_without_blocking() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let fifo = root.path().join("pipe");
+    let status = std::process::Command::new("mkfifo").arg(&fifo).status()?;
+    anyhow::ensure!(status.success(), "mkfifo failed");
+    let (tx, rx) = std::sync::mpsc::channel();
+    // A blocked open leaves this thread behind; the test fails on the timeout and the process ends it.
+    std::thread::spawn(move || {
+        let _ = tx.send(file_holds(&fifo, CANARY.as_bytes()));
+    });
+    let result = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .context("file_holds blocked on a fifo for 10 s")?;
+    assert!(result.is_err(), "a fifo is not a regular file: {result:?}");
+    Ok(())
+}
+
+/// The canary can be in a name as well as in contents: a log line names a file, and a path can carry it.
+#[test]
+fn a_canary_in_a_file_or_directory_name_is_found() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let dir = root.path().join(format!("dir-{CANARY}"));
+    std::fs::create_dir(&dir)?;
+    let named_file = dir.join(format!("{CANARY}.log"));
+    std::fs::write(&named_file, "clean contents")?;
+    std::fs::write(root.path().join("clean"), "clean contents")?;
+    let mut hits = files_holding(root.path(), CANARY, &no_skip())?;
+    hits.sort();
+    assert_eq!(hits, vec![dir, named_file]);
+    Ok(())
+}
+
+/// A file whose name and contents both hold the canary is reported once.
+#[test]
+fn a_file_that_holds_the_canary_in_name_and_contents_is_reported_once() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join(format!("{CANARY}.log"));
+    std::fs::write(&path, CANARY)?;
+    assert_eq!(files_holding(root.path(), CANARY, &no_skip())?, vec![path]);
     Ok(())
 }
