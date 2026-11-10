@@ -121,6 +121,15 @@ message Capabilities {
   // a Dispatch carrying path fields (`inputs`/`outputs`/`secrets`) on a host
   // that declares this true.
   bool shares_submitter_filesystem = 5;
+  // Whether this host-executor is deployed to receive and send a job's
+  // `inputs`/`outputs` over the per-job data link (#482, sandyd.md §22): the
+  // operator has provided disk headroom and a temp-staging path. Never
+  // auto-detected. Default false, so a host-executor that predates this field
+  // decodes as not accepting transfers. It never covers `secrets` or a
+  // `credential`: those stay tied to `shares_submitter_filesystem` (decision 4).
+  // Declared on the wire first; the orchestrator does not place on it until the
+  // data link exists.
+  bool transfer = 6;
 }
 
 // Declares this host's identity and what it can run.
@@ -243,4 +252,57 @@ message AttachStateChanged {
 // stop for a job genuinely still running on the host).
 message Cancel {
   string job_id = 1;
+}
+
+// The per-job data link's messages (#482, sandyd.md §22, proposed): a second
+// link, dialed back to the orchestrator's mesh listener like the agent link,
+// that will carry a job's `inputs` to the host-executor before boot and its
+// `outputs` back after the run. The link itself is not built yet. Same length-prefixed framing as everything else here;
+// every chunk's `bytes` is at most `MAX_CHUNK_BYTES` (a chunk is never split
+// across frames). Not carried on the management connection, so a large
+// transfer cannot delay a `Dispatch` or `Cancel` for another job.
+message DataLinkMessage {
+  oneof op {
+    InputChunk input_chunk = 1;
+    InputEnd input_end = 2;
+    OutputChunk output_chunk = 3;
+    OutputEnd output_end = 4;
+    TransferError transfer_error = 5;
+  }
+}
+
+// Orchestrator -> host-executor: the next bytes of one file of a declared
+// input, starting at `offset`. `name` is the declared `Input.name`, then `/`
+// and the file's path relative to the input root when the input is a
+// directory (`Input.name` is one path component, and a directory input is a
+// tree). Chunks of one file arrive in order. Symlinks and empty directories
+// have no representation yet.
+message InputChunk {
+  string name = 1;
+  uint64 offset = 2;
+  bytes bytes = 3;
+}
+
+// Orchestrator -> host-executor: every declared input has been sent.
+message InputEnd {}
+
+// Host-executor -> orchestrator: the next bytes of one file of the outputs.
+// `name` is the declared `Output.name` followed by the file's relative path
+// when that output is a directory; an output with no declared name (the
+// catch-all) uses the path relative to the outputs root. The chunks of one
+// file are contiguous and in order; a file is complete when the next file's
+// chunk or `OutputEnd` arrives.
+message OutputChunk {
+  string name = 1;
+  bytes bytes = 2;
+}
+
+// Host-executor -> orchestrator: every output has been sent.
+message OutputEnd {}
+
+// Either side: the transfer failed (a cap exceeded, a bad name, a local I/O
+// error). Terminal for the link. `reason` names the cause and never carries
+// file content.
+message TransferError {
+  string reason = 1;
 }

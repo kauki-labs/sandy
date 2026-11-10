@@ -2547,6 +2547,7 @@ mod tests {
             attestation: false,
             supported_isolation_classes: vec![IsolationClass::Trusted.into()],
             shares_submitter_filesystem: false,
+            transfer: false,
         }
     }
 
@@ -2922,6 +2923,7 @@ mod tests {
             attestation: false,
             supported_isolation_classes: vec![IsolationClass::Untrusted.into()],
             shares_submitter_filesystem: false,
+            transfer: false,
         };
         let mut dispatch_rx = register_test_host(&host_registry, "remote-host", peer_ip, untrusted_only);
 
@@ -3158,6 +3160,7 @@ mod tests {
             attestation: false,
             supported_isolation_classes: vec![IsolationClass::Trusted.into()],
             shares_submitter_filesystem: false,
+            transfer: false,
         }
     }
 
@@ -3491,6 +3494,7 @@ mod tests {
             attestation: false,
             supported_isolation_classes: vec![IsolationClass::Trusted.into(), IsolationClass::Untrusted.into()],
             shares_submitter_filesystem: false,
+            transfer: false,
         }
     }
 

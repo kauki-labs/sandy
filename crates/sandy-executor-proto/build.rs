@@ -29,8 +29,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Dispatch.link_token is a bearer secret (INV-1); prost's derived Debug
     // would print its raw bytes. Skip it here; src/lib.rs hand-writes a
     // redacting Debug instead, mirroring sandy-control-proto's AttachResponse.
+    // The data-link chunks carry a job's file content (#482): same treatment.
     prost_build::Config::new()
-        .skip_debug(["sandy.executor.v1.Dispatch"])
+        .skip_debug([
+            "sandy.executor.v1.Dispatch",
+            "sandy.executor.v1.InputChunk",
+            "sandy.executor.v1.OutputChunk",
+        ])
         .compile_fds(file_descriptors)?;
 
     Ok(())
