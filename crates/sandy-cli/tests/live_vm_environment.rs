@@ -125,7 +125,9 @@ fn sandy_tmp_entries() -> BTreeSet<PathBuf> {
         return found;
     };
     for entry in tmp.flatten() {
-        if !entry.file_name().to_string_lossy().starts_with("sandy-") {
+        // The staging base is `sandy` (no dash), where a run's secret share and sockets live.
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name != sandy_fsutil::STAGING_DIR_NAME && !name.starts_with("sandy-") {
             continue;
         }
         found.insert(entry.path());

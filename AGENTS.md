@@ -84,6 +84,8 @@ version, metadata, dependency versions, and lints through the root `Cargo.toml`
   and environment tools, one API request per tool call, no state and no dispatch logic. It never
   depends on `sandy-control-proto` (a test enforces it). Contract: `docs/api/broker.openapi.yaml`.
   See `docs/decisions/sandyd.md` decision 25.
+  Tests: `tests/common/mcp_client.rs` is the stdio client and script runner shared by the tier-2 `conformance.rs`
+  (fake broker) and the `live`-gated `live_broker.rs` (real `sandyd`, `sandy-broker` and qemu guest, Linux/KVM only).
 - **`sandy-broker`** — the broker HTTP API tier over sandyd (#591): bearer-token clients, per-client
   job and environment ownership, the job and environment endpoints of the OpenAPI contract,
   loopback only. It speaks the control RPC over UDS and keeps each job's attach token. Attach

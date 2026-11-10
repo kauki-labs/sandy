@@ -19,7 +19,8 @@ use rustix::fs::{Mode, OFlags, fstat, mkdirat, open, openat};
 
 use crate::{FsError, secret::OwnedDir};
 
-const STAGING_DIR_NAME: &str = "sandy";
+/// The name of the staging base under the OS temp dir. Public so a live test can find the base the backend uses.
+pub const STAGING_DIR_NAME: &str = "sandy";
 
 /// Mode bits that would let group or other write into the staging base.
 const GROUP_OTHER_WRITE: u32 = 0o022;
