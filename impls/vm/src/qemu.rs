@@ -526,10 +526,7 @@ impl QemuBackend {
         // boot: once qemu writes past the pipe buffer it blocks, never opens the
         // serial socket, and the run times out with an empty console. Draining also
         // captures the reason a boot that never reached the serial failed.
-        let stderr_drain = child
-            .stderr
-            .take()
-            .map(|stderr| drain_stderr(stderr, self.console_sink.0.clone()));
+        let stderr_drain = child.stderr.take().map(drain_stderr);
 
         let box_id = run_id.to_string();
         self.registry()?.push(BoxState {
@@ -597,6 +594,13 @@ impl QemuBackend {
             let tail = qemu_stderr.trim();
             if !tail.is_empty() {
                 outcome.console = format!("[qemu stderr]\n{tail}");
+            }
+        }
+        // The serial reader is done, so nothing can follow these bytes into the ring (#727).
+        if let Some(sink) = &self.console_sink.0 {
+            let marked = stderr_for_sink(&outcome, &qemu_stderr);
+            if !marked.is_empty() {
+                sink(marked.as_bytes());
             }
         }
         if let Some(status) = proxy_exit {
@@ -839,24 +843,13 @@ fn spawn_vsock_connector(
 /// The most recent bytes of a child's stderr to retain for diagnostics (64 KiB).
 const QEMU_STDERR_CAP: usize = 64 * 1024;
 
-/// What starts each qemu stderr line that goes to the console sink, so the tail tells it from the serial text.
-const STDERR_MARKER: &[u8] = b"[qemu stderr] ";
-
-/// The longest stderr line the sink gets in one piece; a longer one is cut, so no line grows without bound.
-const STDERR_LINE_CAP: usize = 8 * 1024;
-
 /// Drain `stderr` on a thread so a chatty qemu never blocks on a full, un-read pipe
 /// (the classic deadlock: an un-read [`Stdio::piped`] stalls the writer). Keeps only
 /// the last [`QEMU_STDERR_CAP`] bytes, returned lossily for the failure diagnostic.
-///
-/// With a `sink`, every line also goes to it, marked with [`STDERR_MARKER`] (#727): a qemu that exits before the
-/// serial opens leaves no console, and its stderr is then the only reason a provision failed. A last line with no
-/// newline is sent at end of input. The bytes are raw: the receiver cleans and masks them.
-fn drain_stderr(mut stderr: std::process::ChildStderr, sink: Option<ConsoleSink>) -> std::thread::JoinHandle<String> {
+fn drain_stderr(mut stderr: std::process::ChildStderr) -> std::thread::JoinHandle<String> {
     std::thread::spawn(move || {
         use std::io::Read;
         let mut buf = Vec::new();
-        let mut pending = Vec::new();
         let mut chunk = [0u8; 8192];
         while let Ok(n) = stderr.read(&mut chunk) {
             if n == 0 {
@@ -866,37 +859,58 @@ fn drain_stderr(mut stderr: std::process::ChildStderr, sink: Option<ConsoleSink>
             if buf.len() > QEMU_STDERR_CAP {
                 buf.drain(..buf.len() - QEMU_STDERR_CAP);
             }
-            if let Some(sink) = &sink {
-                for &byte in &chunk[..n] {
-                    if byte == b'\n' {
-                        send_stderr_line(sink, &mut pending);
-                    } else {
-                        pending.push(byte);
-                        if pending.len() >= STDERR_LINE_CAP {
-                            send_stderr_line(sink, &mut pending);
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(sink) = &sink {
-            send_stderr_line(sink, &mut pending);
         }
         String::from_utf8_lossy(&buf).into_owned()
     })
 }
 
-/// Send `line` to `sink` as a marked line and clear it. An empty line sends nothing.
-fn send_stderr_line(sink: &ConsoleSink, line: &mut Vec<u8>) {
-    if line.is_empty() {
-        return;
+/// What starts each qemu stderr line that goes to the console sink, so the tail tells it from the serial text.
+const STDERR_MARKER: &str = "[qemu stderr] ";
+
+/// The longest stderr line the sink gets; a longer one is cut and ends with [`STDERR_CUT`], and the rest is dropped.
+const STDERR_LINE_CAP: usize = 8 * 1024;
+
+/// Ends a stderr line that was cut at [`STDERR_LINE_CAP`].
+const STDERR_CUT: &str = " [cut]";
+
+/// The text for the console sink from qemu's stderr (#727): each non-empty line behind [`STDERR_MARKER`], a line over
+/// [`STDERR_LINE_CAP`] cut at a character boundary. A qemu that exits before the serial opens leaves no console, and
+/// its stderr is then the only reason a provision failed. `stderr` holds the last [`QEMU_STDERR_CAP`] bytes, so when
+/// it is that long its first line may have lost its beginning and is dropped: a token cut in half shows no prefix a
+/// mask can find. The rest of a cut line is dropped for the same reason. The sink gets this once, after the serial
+/// reader has finished: a stderr line sent while serial bytes still arrive could land inside a token the serial text
+/// is still writing, and neither piece would be masked.
+fn marked_stderr(stderr: &str) -> String {
+    let mut lines = stderr.lines();
+    if stderr.len() >= QEMU_STDERR_CAP {
+        lines.next();
     }
-    let mut out = Vec::with_capacity(STDERR_MARKER.len() + line.len() + 1);
-    out.extend_from_slice(STDERR_MARKER);
-    out.extend_from_slice(line);
-    out.push(b'\n');
-    sink(&out);
-    line.clear();
+    let mut out = String::new();
+    for line in lines.map(str::trim_end).filter(|line| !line.is_empty()) {
+        out.push_str(STDERR_MARKER);
+        if line.len() > STDERR_LINE_CAP {
+            let mut end = STDERR_LINE_CAP;
+            while !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            out.push_str(&line[..end]);
+            out.push_str(STDERR_CUT);
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// What the sink gets for a finished attempt: the marked stderr, unless the attempt is about to be retried because
+/// its vsock CID was taken, so the failed attempts do not fill the tail of the one that counts.
+fn stderr_for_sink(outcome: &Outcome, stderr: &str) -> String {
+    if cid_in_use(outcome) {
+        String::new()
+    } else {
+        marked_stderr(stderr)
+    }
 }
 
 /// An infra transport fault as an [`Outcome`] (no fabricated exit, INV-OUTCOME).
@@ -2181,7 +2195,7 @@ mod tests {
             .stderr(Stdio::piped())
             .spawn()
             .context("spawn flood child")?;
-        let drain = super::drain_stderr(child.stderr.take().context("stderr was piped")?, None);
+        let drain = super::drain_stderr(child.stderr.take().context("stderr was piped")?);
         let status = child.wait().context("wait flood child")?;
         let captured = drain.join().map_err(|_| anyhow::anyhow!("drain thread panicked"))?;
 
@@ -2197,66 +2211,64 @@ mod tests {
         Ok(())
     }
 
-    /// #727: qemu's own stderr reaches the console sink, line by line with a marker, so a guest that never opens the
-    /// serial (qemu exits first) still leaves its reason in the console tail. A last line without a newline is kept.
+    /// #727: qemu's stderr is what a provision has when qemu exits before the serial opens. Each line goes to the sink
+    /// behind a marker; blank lines are skipped.
     #[test]
-    fn drain_stderr_copies_lines_into_the_console_sink_with_a_marker() -> anyhow::Result<()> {
-        use std::process::{Command, Stdio};
-
-        let seen = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let copy = Arc::clone(&seen);
-        let sink: ConsoleSink = Arc::new(move |bytes: &[u8]| {
-            copy.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .extend(bytes);
-        });
-        let mut child = Command::new("sh")
-            .args(["-c", "printf 'qemu: could not open serial\\nlast words' 1>&2"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("spawn stderr child")?;
-        let drain = super::drain_stderr(child.stderr.take().context("stderr was piped")?, Some(sink));
-        child.wait().context("wait stderr child")?;
-        let captured = drain.join().map_err(|_| anyhow::anyhow!("drain thread panicked"))?;
-
-        let seen = seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    fn marked_stderr_puts_a_marker_on_each_line_and_skips_blank_ones() {
         assert_eq!(
-            String::from_utf8_lossy(&seen),
+            marked_stderr("qemu: could not open serial\n\n  \nlast words\n"),
             "[qemu stderr] qemu: could not open serial\n[qemu stderr] last words\n"
         );
-        assert!(
-            captured.contains("last words"),
-            "the diagnostic copy is unchanged: {captured}"
-        );
-        Ok(())
+        assert_eq!(marked_stderr(""), "");
     }
 
-    /// A flood of stderr with no newline must not grow a pending line without bound or stall the child.
+    /// A line over the cap is cut and the rest dropped (a token cut at the cap would otherwise show its tail without a
+    /// prefix on the next piece), at a character boundary.
     #[test]
-    fn drain_stderr_bounds_a_line_that_never_ends() -> anyhow::Result<()> {
-        use std::process::{Command, Stdio};
+    fn marked_stderr_cuts_a_long_line_once_and_drops_the_rest() {
+        let long = format!("{}{}", "é".repeat(STDERR_LINE_CAP), "tskey-auth-SECRETSUFFIX");
+        let out = marked_stderr(&format!("{long}\nnext\n"));
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "{out:.80}");
+        assert!(
+            lines[0].starts_with(STDERR_MARKER) && lines[0].ends_with(STDERR_CUT),
+            "{:.80}",
+            lines[0]
+        );
+        assert!(lines[0].len() <= STDERR_MARKER.len() + STDERR_LINE_CAP + STDERR_CUT.len());
+        assert!(!out.contains("SECRETSUFFIX"), "the dropped rest must not reappear");
+        assert_eq!(lines[1], "[qemu stderr] next");
+    }
 
-        let total = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counted = Arc::clone(&total);
-        let sink: ConsoleSink = Arc::new(move |bytes: &[u8]| {
-            counted.fetch_add(bytes.len(), std::sync::atomic::Ordering::SeqCst);
-        });
-        let mut child = Command::new("sh")
-            .args(["-c", "head -c 200000 /dev/zero | tr '\\0' x 1>&2"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("spawn flood child")?;
-        let drain = super::drain_stderr(child.stderr.take().context("stderr was piped")?, Some(sink));
-        assert!(child.wait().context("wait flood child")?.success());
-        drain.join().map_err(|_| anyhow::anyhow!("drain thread panicked"))?;
-        // Every byte arrives, cut into marked pieces no longer than the line cap, so nothing is held back unbounded.
-        let got = total.load(std::sync::atomic::Ordering::SeqCst);
-        assert!(got >= 200_000, "the flood reaches the sink: {got}");
-        Ok(())
+    /// The stderr copy holds only the last 64 KiB: when it is that long the first line may have lost its beginning.
+    #[test]
+    fn marked_stderr_drops_the_first_line_of_a_full_copy() {
+        let full = format!("SUFFIX0123456789\n{}\nlast\n", "y".repeat(QEMU_STDERR_CAP));
+        assert!(full.len() >= QEMU_STDERR_CAP);
+        let out = marked_stderr(&full);
+        assert!(!out.contains("SUFFIX"), "a cut first line must go");
+        assert!(out.ends_with("[qemu stderr] last\n"));
+        // A short copy keeps its first line.
+        assert_eq!(
+            marked_stderr("first\nlast\n"),
+            "[qemu stderr] first\n[qemu stderr] last\n"
+        );
+    }
+
+    /// An attempt about to be retried because its CID is taken sends nothing, so the final tail is the attempt that
+    /// counts; any other failed attempt sends its stderr.
+    #[test]
+    fn a_retried_cid_collision_sends_no_stderr_to_the_sink() {
+        let taken = never_booted(
+            "[qemu stderr]\nqemu-system-x86_64: -device vhost-vsock-pci,guest-cid=77: vhost-vsock: unable to set \
+             guest cid: Address already in use",
+        );
+        assert_eq!(stderr_for_sink(&taken, "unable to set guest cid: in use\n"), "");
+        let other = never_booted("[qemu stderr]\nCould not access KVM kernel module");
+        assert_eq!(
+            stderr_for_sink(&other, "Could not access KVM kernel module\n"),
+            "[qemu stderr] Could not access KVM kernel module\n"
+        );
     }
 
     /// #666: a launch records its owner and every process it starts, so a restart can find them after a SIGKILL.
