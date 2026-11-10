@@ -803,6 +803,9 @@ fn scenario(stack: &Stack) -> Result<()> {
     let mut script: Value = serde_json::from_str(SCRIPT)?;
     script["fixtures"]["ready_timeout_ms"] = json!((PROVISION_SECS + 60) * 1000);
     script["fixtures"]["ready_poll_ms"] = json!(250);
+    // The live stack has only the vm environment backend and no job host, so a job submit is refused by design.
+    // The job tools stay covered at tier-2 against the fake broker.
+    script["fixtures"]["skip_tools"] = json!(["submit", "status", "attach", "cancel"]);
     let mut mcp = stack.mcp()?;
     run_script(&mut mcp, &script)?;
     stack.check_session(mcp, "script session")?;
