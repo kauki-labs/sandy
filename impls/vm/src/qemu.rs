@@ -526,7 +526,10 @@ impl QemuBackend {
         // boot: once qemu writes past the pipe buffer it blocks, never opens the
         // serial socket, and the run times out with an empty console. Draining also
         // captures the reason a boot that never reached the serial failed.
-        let stderr_drain = child.stderr.take().map(drain_stderr);
+        let stderr_drain = child
+            .stderr
+            .take()
+            .map(|stderr| drain_stderr(stderr, self.console_sink.0.clone()));
 
         let box_id = run_id.to_string();
         self.registry()?.push(BoxState {
@@ -836,13 +839,24 @@ fn spawn_vsock_connector(
 /// The most recent bytes of a child's stderr to retain for diagnostics (64 KiB).
 const QEMU_STDERR_CAP: usize = 64 * 1024;
 
+/// What starts each qemu stderr line that goes to the console sink, so the tail tells it from the serial text.
+const STDERR_MARKER: &[u8] = b"[qemu stderr] ";
+
+/// The longest stderr line the sink gets in one piece; a longer one is cut, so no line grows without bound.
+const STDERR_LINE_CAP: usize = 8 * 1024;
+
 /// Drain `stderr` on a thread so a chatty qemu never blocks on a full, un-read pipe
 /// (the classic deadlock: an un-read [`Stdio::piped`] stalls the writer). Keeps only
 /// the last [`QEMU_STDERR_CAP`] bytes, returned lossily for the failure diagnostic.
-fn drain_stderr(mut stderr: std::process::ChildStderr) -> std::thread::JoinHandle<String> {
+///
+/// With a `sink`, every line also goes to it, marked with [`STDERR_MARKER`] (#727): a qemu that exits before the
+/// serial opens leaves no console, and its stderr is then the only reason a provision failed. A last line with no
+/// newline is sent at end of input. The bytes are raw: the receiver cleans and masks them.
+fn drain_stderr(mut stderr: std::process::ChildStderr, sink: Option<ConsoleSink>) -> std::thread::JoinHandle<String> {
     std::thread::spawn(move || {
         use std::io::Read;
         let mut buf = Vec::new();
+        let mut pending = Vec::new();
         let mut chunk = [0u8; 8192];
         while let Ok(n) = stderr.read(&mut chunk) {
             if n == 0 {
@@ -852,9 +866,37 @@ fn drain_stderr(mut stderr: std::process::ChildStderr) -> std::thread::JoinHandl
             if buf.len() > QEMU_STDERR_CAP {
                 buf.drain(..buf.len() - QEMU_STDERR_CAP);
             }
+            if let Some(sink) = &sink {
+                for &byte in &chunk[..n] {
+                    if byte == b'\n' {
+                        send_stderr_line(sink, &mut pending);
+                    } else {
+                        pending.push(byte);
+                        if pending.len() >= STDERR_LINE_CAP {
+                            send_stderr_line(sink, &mut pending);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(sink) = &sink {
+            send_stderr_line(sink, &mut pending);
         }
         String::from_utf8_lossy(&buf).into_owned()
     })
+}
+
+/// Send `line` to `sink` as a marked line and clear it. An empty line sends nothing.
+fn send_stderr_line(sink: &ConsoleSink, line: &mut Vec<u8>) {
+    if line.is_empty() {
+        return;
+    }
+    let mut out = Vec::with_capacity(STDERR_MARKER.len() + line.len() + 1);
+    out.extend_from_slice(STDERR_MARKER);
+    out.extend_from_slice(line);
+    out.push(b'\n');
+    sink(&out);
+    line.clear();
 }
 
 /// An infra transport fault as an [`Outcome`] (no fabricated exit, INV-OUTCOME).
