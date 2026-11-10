@@ -213,4 +213,47 @@ rec {
       SANDYD_BIN = "${sandy}/bin/sandyd";
     }
   );
+
+  # The stub trust root's own tests (#733) need sandyd's `stub-trust-root` feature, which no default build enables
+  # (`clippy` above builds it with `--all-features`, but compiling is not running its tests).
+  testsStubTrustRoot = craneLib.cargoNextest (
+    commonArgs
+    // {
+      inherit cargoArtifacts;
+      pnameSuffix = "-stub-trust-root";
+      partitions = 1;
+      partitionType = "count";
+      NEXTEST_HIDE_PROGRESS_BAR = "1";
+      NEXTEST_FAILURE_OUTPUT = "immediate-final";
+      cargoNextestExtraArgs = "--no-fail-fast -p sandyd --features stub-trust-root";
+    }
+  );
+
+  # The release `sandyd` has no stub trust root (#733): the binary the `sandy` package built, the one a release ships,
+  # must refuse to start when SANDYD_STUB_TRUST_ROOT is set, and say why by name. It refuses before it binds or opens
+  # anything, so the run needs no socket, database or home.
+  stubTrustRootRefused =
+    pkgs.runCommand "stub-trust-root-refused"
+      {
+        nativeBuildInputs = [ sandy ];
+      }
+      ''
+        export HOME="$TMPDIR"
+        set +e
+        output=$(SANDYD_STUB_TRUST_ROOT=live ${sandy}/bin/sandyd 2>&1)
+        rc=$?
+        set -e
+        if [ "$rc" -eq 0 ]; then
+          echo "sandyd started with SANDYD_STUB_TRUST_ROOT set" >&2
+          exit 1
+        fi
+        case "$output" in
+          *stub-trust-root*) ;;
+          *)
+            echo "sandyd refused without naming the stub-trust-root feature: $output" >&2
+            exit 1
+            ;;
+        esac
+        mkdir -p "$out"
+      '';
 }

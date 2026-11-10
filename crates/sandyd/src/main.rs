@@ -10,7 +10,7 @@ use std::{net::SocketAddr, os::unix::fs::PermissionsExt, path::PathBuf, sync::Ar
 use sandy_conn::{Listener as MeshListener, TlsIdentity};
 use sandyd::{
     build_rev::{log_startup, resolve_rev, version_line, wants_version},
-    credential::{JobCredentials, TrustRootResolver},
+    credential::JobCredentials,
     dispatch::JobRegistry,
     environment_backend::{self, BackendSettings},
     environment_driver::EnvironmentDriver,
@@ -114,6 +114,17 @@ async fn main() {
         .from_env_lossy();
     tracing_subscriber::fmt().with_env_filter(filter).init();
     log_startup(BIN, VERSION, rev);
+
+    // First, before anything binds or opens: a stub trust root (#733) is a test configuration, and a daemon that
+    // was asked for one it cannot provide must not start at all. The release build has no stub, so this refuses
+    // a set SANDYD_STUB_TRUST_ROOT there.
+    let resolver = match sandyd::stub_trust_root::credential_resolver() {
+        Ok(resolver) => resolver,
+        Err(e) => {
+            tracing::error!(error = %e, "invalid stub trust root configuration");
+            std::process::exit(1);
+        }
+    };
 
     let socket_path = match socket_path() {
         Ok(path) => path,
@@ -261,9 +272,9 @@ async fn main() {
     tracing::info!(socket = %attach_socket_path.display(), "sandyd attach data plane listening");
 
     // #481: a Submit naming `credential` mints from this host's trust roots,
-    // the ones `sandy cred github register` wrote.
+    // the ones `sandy cred github register` wrote, through the resolver chosen at start-up.
     let registry = match JobRegistry::new() {
-        Ok(registry) => Arc::new(registry.with_credentials(JobCredentials::new(Arc::new(TrustRootResolver)))),
+        Ok(registry) => Arc::new(registry.with_credentials(JobCredentials::new(Arc::clone(&resolver)))),
         Err(e) => {
             tracing::error!(error = %e, "could not create the job registry's capability authority");
             std::process::exit(1);
@@ -430,7 +441,7 @@ async fn main() {
         sandyd::environment_store::now_unix,
     ));
 
-    let _environment_driver = start_environment_driver(&environments);
+    let _environment_driver = start_environment_driver(&environments, &resolver);
 
     let mut connections = tokio::task::JoinSet::new();
     let mut backoff = AcceptBackoff::new();
@@ -949,7 +960,10 @@ fn max_jobs() -> Result<Option<usize>, std::num::ParseIntError> {
 /// Start the environment launch driver if `SANDY_ENV_BACKEND` selects a backend
 /// (#587). Off by default: environments then stay `Provisioning`. An invalid
 /// setting stops the daemon, like every other startup setting.
-fn start_environment_driver(environments: &Arc<EnvironmentStore>) -> Option<tokio::task::JoinHandle<()>> {
+fn start_environment_driver(
+    environments: &Arc<EnvironmentStore>,
+    resolver: &Arc<dyn sandyd::credential::CredentialResolver>,
+) -> Option<tokio::task::JoinHandle<()>> {
     // `var(..).ok()` would read a non-UTF-8 value as unset, and a lossy copy would alter a path.
     if let Some((name, _)) = std::env::vars_os()
         .filter(|(k, _)| k.to_string_lossy().starts_with("SANDY_ENV_"))
@@ -1011,7 +1025,7 @@ fn start_environment_driver(environments: &Arc<EnvironmentStore>) -> Option<toki
             }
         };
         driver = driver.with_credentials(Arc::new(sandyd::environment_credential::EnvironmentCredentials::new(
-            Arc::new(TrustRootResolver),
+            Arc::clone(resolver),
             base,
         )));
     }

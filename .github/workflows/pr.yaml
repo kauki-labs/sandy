@@ -247,7 +247,7 @@ jobs:
       # Whole-workspace test run (tier-1/2); the `live` tier-3 tests need a
       # hypervisor and never run in CI, so they are excluded by design.
       - name: Test
-        run: nix build -L .#checks.x86_64-linux.test
+        run: nix build -L .#checks.x86_64-linux.test .#checks.x86_64-linux.tests-stub-trust-root .#checks.x86_64-linux.stub-trust-root-refused
   package:
     # No `needs: checks`: the minimal shell shares no Nix outputs with Check, so
     # this runs in parallel with it.

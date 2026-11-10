@@ -34,6 +34,7 @@ pub mod operator_values;
 pub mod peer_cred;
 pub mod profiles;
 pub mod store;
+pub mod stub_trust_root;
 #[cfg(test)]
 mod test_support;
 

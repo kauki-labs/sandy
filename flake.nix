@@ -290,6 +290,8 @@
               ;
             tests-e2e-cli = testsE2eCli;
             tests-daemon-e2e = sandyPackages.testsDaemonE2e;
+            tests-stub-trust-root = sandyPackages.testsStubTrustRoot;
+            stub-trust-root-refused = sandyPackages.stubTrustRootRefused;
             project-docs = projectDocs;
           }
           # nixosTest only evaluates on Linux (it builds a QEMU VM derivation
