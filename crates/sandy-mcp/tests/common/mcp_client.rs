@@ -213,6 +213,20 @@ pub fn check_grammar(script: &Value) -> Result<()> {
     }
     // A bad timing fixture fails here, before any call, not as a silent default mid-run.
     let fixtures = script["fixtures"].as_object().cloned().unwrap_or_default();
+    // A target that cannot serve some tools (no job host) names them to skip. A name no step calls is a typo, and an
+    // empty or malformed list is a mistake: neither may become a silent no-op.
+    if let Some(skip) = fixtures.get("skip_tools") {
+        let names = skip
+            .as_array()
+            .filter(|a| !a.is_empty())
+            .context("skip_tools must be a non-empty array of tool names")?;
+        for name in names {
+            let name = name.as_str().context("skip_tools entries must be strings")?;
+            if !steps.iter().any(|step| step["tool"].as_str() == Some(name)) {
+                bail!("skip_tools names `{name}`, which no step calls");
+            }
+        }
+    }
     for (i, step) in steps.iter().enumerate() {
         for key in ["timeout_ms", "poll_interval_ms"] {
             millis(step, key, &fixtures, 0).with_context(|| format!("step {i}"))?;
@@ -298,8 +312,17 @@ pub fn run_script(mcp: &mut Mcp, script: &Value) -> Result<()> {
 }
 
 pub fn run_steps(mcp: &mut Mcp, script: &Value, caps: &mut Map<String, Value>) -> Result<()> {
+    let skip: Vec<String> = caps
+        .get("skip_tools")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+        .unwrap_or_default();
     for (i, step) in script["steps"].as_array().context("steps")?.iter().enumerate() {
         let tool = step["tool"].as_str().context("tool")?;
+        if skip.iter().any(|s| s == tool) {
+            eprintln!("skipped step {i} ({tool}): this target does not serve it");
+            continue;
+        }
         let ctx = || format!("step {i} ({tool}): {}", step["note"].as_str().unwrap_or(""));
         let args = substitute(&step["args"], caps);
         if has_unbound(&args) {

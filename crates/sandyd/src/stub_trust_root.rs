@@ -94,7 +94,14 @@ fn shadows_real_root(dir: &std::path::Path, name: &str) -> bool {
 /// # Errors
 /// [`StubError`] from [`stub_config_from`], or [`StubError::ShadowsRealRoot`]: the daemon must not start.
 pub fn credential_resolver() -> Result<Arc<dyn CredentialResolver>, StubError> {
-    credential_resolver_from(|key| std::env::var_os(key), sandy::trust_roots_dir().ok().as_deref())
+    let roots_dir = sandy::trust_roots_dir().ok();
+    if roots_dir.is_none() && std::env::var_os(STUB_ENV).is_some() {
+        // Without the directory the shadow check cannot run; say so instead of skipping it silently.
+        tracing::warn!(
+            "the trust roots directory cannot be resolved, so the stub trust root cannot be checked against real roots"
+        );
+    }
+    credential_resolver_from(|key| std::env::var_os(key), roots_dir.as_deref())
 }
 
 /// [`credential_resolver`] over an explicit environment and trust roots directory.

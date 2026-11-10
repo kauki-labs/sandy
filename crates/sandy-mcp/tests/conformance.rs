@@ -121,6 +121,49 @@ fn a_timing_fixture_that_is_not_a_number_is_an_error_not_a_default() -> Result<(
     Ok(())
 }
 
+/// A target with no job host (the live stack has only the vm environment backend) skips the job tools by name. The
+/// environment steps still run and pass, and the fake never sees a job.
+#[test]
+fn a_target_without_a_job_host_skips_the_job_steps_and_still_passes_the_environment_steps() -> Result<()> {
+    let (url, state) = start(Broker {
+        ready_after_polls: 1,
+        ..Broker::default()
+    })?;
+    let dir = tempfile::tempdir()?;
+    let mut mcp = Mcp::spawn(&url, &credential_file(dir.path(), "c")?)?;
+    mcp.initialize()?;
+    let mut script: Value = serde_json::from_str(SCRIPT)?;
+    script["fixtures"]["skip_tools"] = json!(["submit", "status", "attach", "cancel"]);
+    run_script(&mut mcp, &script)?;
+    let b = state.lock().unwrap();
+    assert!(
+        b.jobs.is_empty(),
+        "the skipped job steps must not reach the broker: {:?}",
+        b.jobs
+    );
+    assert_eq!(b.leftovers(), 0);
+    Ok(())
+}
+
+/// A skip that names a tool no step calls is a typo, and a typo must not turn into a silent no-op.
+#[test]
+fn a_skip_tools_entry_that_no_step_calls_is_an_error() -> Result<()> {
+    let (url, _) = start(Broker::default())?;
+    let dir = tempfile::tempdir()?;
+    let mut mcp = Mcp::spawn(&url, &credential_file(dir.path(), "c")?)?;
+    mcp.initialize()?;
+    for bad in [json!(["sumbit"]), json!("submit"), json!([1]), json!([])] {
+        let mut script: Value = serde_json::from_str(SCRIPT)?;
+        script["fixtures"]["skip_tools"] = bad.clone();
+        let err = run_script(&mut mcp, &script).expect_err("a bad skip_tools must fail the script");
+        assert!(
+            format!("{err:#}").contains("skip_tools"),
+            "the error must name the fixture for {bad}: {err:#}"
+        );
+    }
+    Ok(())
+}
+
 /// An edit that breaks one script rule.
 type Mutation = fn(&mut Value);
 
