@@ -17,6 +17,12 @@ categories = ["command-line-utilities"]
 name = "sandyd"
 path = "src/main.rs"
 
+[features]
+# A stub forge trust root for the live broker gate (#733): a provider that mints a fake token and calls no network.
+# Off by default and not enabled in the release build. A daemon with SANDYD_STUB_TRUST_ROOT set refuses to start
+# without it.
+stub-trust-root = []
+
 [lints]
 workspace = true
 

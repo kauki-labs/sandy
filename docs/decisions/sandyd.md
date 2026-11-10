@@ -2558,3 +2558,21 @@ and revokes one staged token; an environment lives for hours, so it also needs r
 
 **Set aside.** Persisting the token or a revoke handle for restart revoke. A `cred-*` directory name. Renewal on a
 separate task with its own lock.
+
+**A stub trust root for the live gate (#733).** Every vm environment needs a registered trust root, and the only
+provider is the real GitHub adapter, so a host with no App key cannot run a live scenario with a credential. A test
+daemon can name a stub instead. It has two locks, so a production binary cannot select it. The provider exists only
+when `sandyd` is built with the `stub-trust-root` cargo feature, which is off by default and not enabled in the
+release build. And it is used only when `SANDYD_STUB_TRUST_ROOT=<name>` is set. With the variable set and the feature
+off, `sandyd` refuses to start before it binds or opens anything, with a named error. Two checks hold this: the
+feature-on tests run in CI (`tests-stub-trust-root`), and the release `sandyd` is run with the variable set and must
+refuse (`stub-trust-root-refused`). The stub mints a `stub-token-<n>-<random>` token, calls no network and opens no
+socket, and answers to its one name through `EnvironmentCredentials`; every other name goes to the real resolver. A
+job's `credential` naming the stub is refused by name: it serves environment profiles only. With
+`SANDYD_STUB_CALL_LOG=<path>` it appends one line per call (`mint <handle>`, `refresh <handle>`, `revoke <handle>`) to
+a `0600` file, never a token, and a log that cannot be written fails the call so a test cannot pass on an empty log.
+The live test reads the staged token from the secret share and the log from that file. A daemon with the stub active
+logs a warning at start-up.
+
+**Set aside** (the stub). Overriding the GitHub API base so the real adapter runs against a fake server (#736), and a
+tokenless vm mode, which is a policy change for the owner.
