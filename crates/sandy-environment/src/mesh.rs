@@ -127,14 +127,36 @@ async fn contained<T>(fut: impl Future<Output = Result<T, SeamError>>) -> Result
 
 /// A seam failure.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{0}")]
-pub struct SeamError(String);
+#[error("{message}")]
+pub struct SeamError {
+    message: String,
+    busy: bool,
+}
 
 impl SeamError {
     /// Build an error. The module scrubs the exact key at every exit; this
     /// constructor only masks key-shaped tokens.
     pub fn new(message: impl AsRef<str>) -> Self {
-        Self(redact(message.as_ref()))
+        Self {
+            message: redact(message.as_ref()),
+            busy: false,
+        }
+    }
+
+    /// The refusal of an operation while another one on the same resource is
+    /// still running. Nothing was started, so the caller may retry later.
+    fn busy(message: impl AsRef<str>) -> Self {
+        Self {
+            busy: true,
+            ..Self::new(message)
+        }
+    }
+
+    /// Whether this is the refusal of an operation while another one is still
+    /// running ([`SecretsDir`]): nothing was started and a retry may succeed.
+    #[must_use]
+    pub fn is_busy(&self) -> bool {
+        self.busy
     }
 }
 
@@ -244,17 +266,28 @@ pub trait FileSink: Send + Sync {
 ///
 /// Each operation runs on the blocking pool, so a wedged sink cannot stop the
 /// caller's timeout from firing. A timed-out operation keeps its thread until
-/// the sink returns, so operations hold a gate: a later removal waits for an
-/// earlier straggling write instead of racing it. The gate is mutual
-/// exclusion, not ordering: do not retry setup while a timed-out operation may
-/// still be running, since a straggler can run after the retry's delivery and
-/// wipe the new key. A retry loop against a wedged sink holds one blocking-pool
-/// thread per timeout.
+/// the sink returns, so at most one operation is in flight per directory: while
+/// one runs, a new one answers [`SeamError::is_busy`] at once and spawns
+/// nothing. A straggler therefore never acts after a later delivery, and a
+/// retry loop against a wedged sink holds one blocking-pool thread, not one per
+/// timeout. A caller retries after a pause. Teardown that meets `Busy` leaves
+/// its slot set and is retried the same way.
 pub struct SecretsDir<S>(std::sync::Arc<Gated<S>>);
 
 struct Gated<S> {
     sink: S,
-    gate: std::sync::Mutex<()>,
+    in_flight: AtomicBool,
+}
+
+/// Holds the directory's one in-flight place until dropped. It moves into the
+/// blocking closure, so the place frees when the sink call returns, not when
+/// the caller's future is dropped on a timeout.
+struct InFlight<S>(std::sync::Arc<Gated<S>>);
+
+impl<S> Drop for InFlight<S> {
+    fn drop(&mut self) {
+        self.0.in_flight.store(false, Ordering::SeqCst);
+    }
 }
 
 impl<S: FileSink + 'static> SecretsDir<S> {
@@ -262,7 +295,7 @@ impl<S: FileSink + 'static> SecretsDir<S> {
     pub fn new(sink: S) -> Self {
         Self(std::sync::Arc::new(Gated {
             sink,
-            gate: std::sync::Mutex::new(()),
+            in_flight: AtomicBool::new(false),
         }))
     }
 
@@ -270,10 +303,21 @@ impl<S: FileSink + 'static> SecretsDir<S> {
         &self,
         op: impl FnOnce(&S) -> Result<T, SeamError> + Send + 'static,
     ) -> Result<T, SeamError> {
-        let inner = std::sync::Arc::clone(&self.0);
+        if self
+            .0
+            .in_flight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(SeamError::busy(
+                "another file operation on the secrets directory is still running",
+            ));
+        }
+        let turn = InFlight(std::sync::Arc::clone(&self.0));
         tokio::task::spawn_blocking(move || {
-            let _turn = inner.gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            op(&inner.sink)
+            let result = op(&turn.0.sink);
+            drop(turn);
+            result
         })
         .await
         .unwrap_or_else(|e| Err(SeamError::new(format!("file operation did not finish: {e}"))))
@@ -1707,18 +1751,20 @@ mod tests {
 
     #[tokio::test]
     async fn a_wedged_file_operation_times_out_instead_of_blocking_the_runtime() -> Result<()> {
-        let dir = SecretsDir::new(WedgedSink(Duration::from_millis(600)));
+        // One directory per operation: a second operation on a directory whose
+        // first one still runs is refused as busy (#713), not timed out.
+        let wedged = || SecretsDir::new(WedgedSink(Duration::from_millis(600)));
         let files: [(&str, &[u8]); 2] = [(KEY_FILE, b"k"), (HOSTNAME_FILE, b"n")];
         let started = std::time::Instant::now();
-        let Err(e) = bounded(SHORT, dir.prepare()).await else {
+        let Err(e) = bounded(SHORT, wedged().prepare()).await else {
             bail!("prepare must time out");
         };
         assert!(e.to_string().contains("timed out"), "{e}");
-        let Err(e) = bounded(SHORT, dir.deliver(&files)).await else {
+        let Err(e) = bounded(SHORT, wedged().deliver(&files)).await else {
             bail!("deliver must time out");
         };
         assert!(e.to_string().contains("timed out"), "{e}");
-        let Err(e) = bounded(SHORT, dir.remove_secrets()).await else {
+        let Err(e) = bounded(SHORT, wedged().remove_secrets()).await else {
             bail!("remove_secrets must time out");
         };
         assert!(e.to_string().contains("timed out"), "{e}");
@@ -1905,7 +1951,19 @@ mod tests {
         let Err(_) = bounded(SHORT, dir.deliver(&files)).await else {
             bail!("the slow delivery must time out");
         };
-        dir.remove_secrets().await.context("removal")?;
+        // The straggler still runs, so the removal is refused until it ends.
+        let mut removed = false;
+        for _ in 0..200 {
+            match dir.remove_secrets().await {
+                Ok(()) => {
+                    removed = true;
+                    break;
+                }
+                Err(e) if e.is_busy() => tokio::time::sleep(Duration::from_millis(10)).await,
+                Err(e) => bail!("removal failed: {e}"),
+            }
+        }
+        assert!(removed, "the removal must run once the straggler is done");
         assert!(
             w.st().files.is_empty(),
             "a straggling write must not outlive the removal"
