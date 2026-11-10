@@ -297,19 +297,35 @@ impl EnvironmentDriver {
         let next = AtomicUsize::new(0);
         let slots: Mutex<Vec<Option<Result<Probe, BackendError>>>> =
             Mutex::new(std::iter::repeat_with(|| None).take(pending.len()).collect());
-        std::thread::scope(|scope| {
-            for _ in 0..MAX_PROBES_IN_FLIGHT.min(pending.len()) {
-                scope.spawn(|| {
-                    loop {
-                        let i = next.fetch_add(1, Ordering::SeqCst);
-                        let Some(probe) = pending.get(i) else { break };
-                        let result = catch_unwind(AssertUnwindSafe(|| self.backend.probe(&probe.id)))
-                            .unwrap_or_else(|_| Err(BackendError::Transport("the probe panicked".to_owned())));
-                        slots.lock().unwrap_or_else(PoisonError::into_inner)[i] = Some(result);
-                    }
+        let work = || {
+            loop {
+                let i = next.fetch_add(1, Ordering::SeqCst);
+                let Some(probe) = pending.get(i) else { break };
+                let result = catch_unwind(AssertUnwindSafe(|| self.backend.probe(&probe.id))).unwrap_or_else(|payload| {
+                    tracing::warn!(environment = %probe.id, panic = panic_text(payload.as_ref()), "a probe panicked");
+                    Err(BackendError::Transport("the probe panicked".to_owned()))
                 });
+                slots.lock().unwrap_or_else(PoisonError::into_inner)[i] = Some(result);
+            }
+        };
+        std::thread::scope(|scope| {
+            let mut spawned = 0;
+            for _ in 0..MAX_PROBES_IN_FLIGHT.min(pending.len()) {
+                // `Scope::spawn` would panic if the OS refuses a thread and lose the whole pass; probe inline instead.
+                match std::thread::Builder::new().spawn_scoped(scope, work) {
+                    Ok(_) => spawned += 1,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "could not start a probe thread");
+                        break;
+                    }
+                }
+            }
+            if spawned == 0 {
+                work();
             }
         });
+        // A worker panic outside `catch_unwind` would already have unwound out of the scope; the fallbacks
+        // below only keep this function total.
         slots
             .into_inner()
             .unwrap_or_else(PoisonError::into_inner)
@@ -452,6 +468,15 @@ impl EnvironmentDriver {
             }
         }
     }
+}
+
+/// The message of a caught panic, for the log.
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("a non-text panic payload")
 }
 
 /// `host:port` for a backend endpoint, with brackets around an IPv6 address, or
@@ -1180,6 +1205,8 @@ mod tests {
         panic_on: Option<String>,
         inside: std::sync::atomic::AtomicUsize,
         peak: std::sync::atomic::AtomicUsize,
+        /// Probe calls per environment id, counted before the probe can panic.
+        calls: Mutex<std::collections::BTreeMap<String, usize>>,
     }
 
     impl ProbeLab {
@@ -1190,7 +1217,13 @@ mod tests {
                 panic_on: panic_on.map(str::to_owned),
                 inside: std::sync::atomic::AtomicUsize::default(),
                 peak: std::sync::atomic::AtomicUsize::default(),
+                calls: Mutex::default(),
             }
+        }
+
+        fn calls_for(&self, id: &str) -> usize {
+            let calls = self.calls.lock().unwrap_or_else(PoisonError::into_inner);
+            calls.get(id).copied().unwrap_or(0)
         }
     }
 
@@ -1201,6 +1234,12 @@ mod tests {
 
         fn probe(&self, environment_id: &str) -> Result<Probe, BackendError> {
             use std::sync::atomic::Ordering::SeqCst;
+            *self
+                .calls
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(environment_id.to_owned())
+                .or_default() += 1;
             let now = self.inside.fetch_add(1, SeqCst) + 1;
             self.peak.fetch_max(now, SeqCst);
             if self.panic_on.as_deref() == Some(environment_id) {
@@ -1261,11 +1300,12 @@ mod tests {
     /// keep their results, and the panicked one is probed again next pass.
     #[test]
     fn a_panicking_probe_leaves_the_other_environments_results_intact() -> Result<()> {
-        let (r, _lab) = lab_rig(ProbeLab::new(Duration::from_millis(50), Some("env-2")))?;
+        let (r, lab) = lab_rig(ProbeLab::new(Duration::from_millis(50), Some("env-2")))?;
         for n in 1..=4 {
             add(&r.store, n)?;
         }
         let report = r.driver.reconcile_once(now())?;
+        assert_eq!(lab.calls_for("env-2"), 1, "the panicking probe did run");
         assert_eq!(report.readied.len(), 3, "{report:?}");
         assert!(
             report.failed.is_empty(),
@@ -1275,6 +1315,9 @@ mod tests {
         for n in [1, 3, 4] {
             assert_eq!(state(&r.store, &format!("env-{n}"))?.state, EnvironmentState::Ready);
         }
+        // The panicked row is probed again next pass, not skipped for good.
+        r.driver.reconcile_once(now())?;
+        assert_eq!(lab.calls_for("env-2"), 2, "the next pass probes it again");
         Ok(())
     }
 
