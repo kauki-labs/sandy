@@ -1074,4 +1074,125 @@ mod tests {
         assert!(r.backend.boxes()?.is_empty());
         Ok(())
     }
+
+    /// Launch, boxes and kill come from the fake; the probe sleeps, may panic for
+    /// one environment, and records how many probes run at once (#709).
+    struct ProbeLab {
+        inner: FakeEnvironmentBackend,
+        delay: Duration,
+        panic_on: Option<String>,
+        inside: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ProbeLab {
+        fn new(delay: Duration, panic_on: Option<&str>) -> Self {
+            Self {
+                inner: FakeEnvironmentBackend::new(),
+                delay,
+                panic_on: panic_on.map(str::to_owned),
+                inside: std::sync::atomic::AtomicUsize::default(),
+                peak: std::sync::atomic::AtomicUsize::default(),
+            }
+        }
+    }
+
+    impl EnvironmentBackend for ProbeLab {
+        fn launch(&self, spec: &EnvironmentSpec) -> Result<Launch, BackendError> {
+            self.inner.launch(spec)
+        }
+
+        fn probe(&self, environment_id: &str) -> Result<Probe, BackendError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let now = self.inside.fetch_add(1, SeqCst) + 1;
+            self.peak.fetch_max(now, SeqCst);
+            if self.panic_on.as_deref() == Some(environment_id) {
+                self.inside.fetch_sub(1, SeqCst);
+                panic!("probe of {environment_id} panicked");
+            }
+            std::thread::sleep(self.delay);
+            self.inside.fetch_sub(1, SeqCst);
+            Ok(Probe::Ready {
+                endpoint: Endpoint {
+                    host: "127.0.0.1".to_owned(),
+                    port: 41000,
+                },
+            })
+        }
+
+        fn kill(&self, environment_id: &str) -> Result<(), BackendError> {
+            self.inner.kill(environment_id)
+        }
+
+        fn boxes(&self) -> Result<Vec<sandy_api::backend::BoxState>, BackendError> {
+            self.inner.boxes()
+        }
+    }
+
+    fn lab_rig(lab: ProbeLab) -> Result<(Rig2, Arc<ProbeLab>)> {
+        let store = Arc::new(EnvironmentStore::open_in_memory()?);
+        let lab = Arc::new(lab);
+        let driver = EnvironmentDriver::new(Arc::clone(&store), Arc::clone(&lab) as _, config());
+        Ok((Rig2 { store, driver }, lab))
+    }
+
+    struct Rig2 {
+        store: Arc<EnvironmentStore>,
+        driver: EnvironmentDriver,
+    }
+
+    /// #709: N Provisioning environments whose probes each take a second must
+    /// not make a pass take N seconds.
+    #[test]
+    fn eight_slow_probes_finish_one_pass_in_about_one_probe_budget() -> Result<()> {
+        let (r, _lab) = lab_rig(ProbeLab::new(Duration::from_secs(1), None))?;
+        for n in 1..=8 {
+            add(&r.store, n)?;
+        }
+        let started = std::time::Instant::now();
+        let report = r.driver.reconcile_once(now())?;
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(3), "one pass took {took:?}");
+        assert_eq!(report.readied.len(), 8, "{report:?}");
+        for n in 1..=8 {
+            assert_eq!(state(&r.store, &format!("env-{n}"))?.state, EnvironmentState::Ready);
+        }
+        Ok(())
+    }
+
+    /// #709: a probe that panics fails only that environment's pass. The others
+    /// keep their results, and the panicked one is probed again next pass.
+    #[test]
+    fn a_panicking_probe_leaves_the_other_environments_results_intact() -> Result<()> {
+        let (r, _lab) = lab_rig(ProbeLab::new(Duration::from_millis(50), Some("env-2")))?;
+        for n in 1..=4 {
+            add(&r.store, n)?;
+        }
+        let report = r.driver.reconcile_once(now())?;
+        assert_eq!(report.readied.len(), 3, "{report:?}");
+        assert!(
+            report.failed.is_empty(),
+            "a panic is a probe fault, not a failure: {report:?}"
+        );
+        assert_eq!(state(&r.store, "env-2")?.state, EnvironmentState::Provisioning);
+        for n in [1, 3, 4] {
+            assert_eq!(state(&r.store, &format!("env-{n}"))?.state, EnvironmentState::Ready);
+        }
+        Ok(())
+    }
+
+    /// #709: at most eight probes are in flight, however many environments.
+    #[test]
+    fn no_more_than_eight_probes_run_at_once() -> Result<()> {
+        let (r, lab) = lab_rig(ProbeLab::new(Duration::from_millis(100), None))?;
+        for n in 1..=20 {
+            add(&r.store, n)?;
+        }
+        let report = r.driver.reconcile_once(now())?;
+        assert_eq!(report.readied.len(), 20, "{report:?}");
+        let peak = lab.peak.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(peak > 1, "probes must overlap, peak was {peak}");
+        assert!(peak <= 8, "at most 8 probes in flight, peak was {peak}");
+        Ok(())
+    }
 }
