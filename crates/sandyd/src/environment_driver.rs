@@ -15,9 +15,20 @@
 //!
 //! A store fault on one row, or a row that cannot be read, is logged and skipped
 //! so it cannot stop the rest of the pass. The backend calls block, so a pass
-//! runs under `spawn_blocking`.
+//! runs under `spawn_blocking`. The probes of `Provisioning` rows run together
+//! (at most eight at once) once the row loop has launched them, so slow probes do
+//! not add up and the other rows' steps do not wait behind them.
 
-use std::{collections::BTreeSet, net::IpAddr, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeSet,
+    net::IpAddr,
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use prost::Message;
 use sandy_api::{
@@ -29,6 +40,19 @@ use sandy_control_proto::v1::EnvironmentSpec as WireSpec;
 use crate::environment_store::{
     EnvTransition, EnvironmentRecord, EnvironmentState, EnvironmentStore, EnvironmentStoreError,
 };
+
+/// The most probes of `Provisioning` rows that run at once in one pass. Each probe
+/// is bounded by the backend's own timeout, so a pass takes about one probe budget
+/// per eight rows, not one per row.
+const MAX_PROBES_IN_FLIGHT: usize = 8;
+
+/// A launched `Provisioning` row whose probe is yet to run.
+struct PendingProbe {
+    id: String,
+    waited: i64,
+    timed_out: bool,
+    hard_timed_out: bool,
+}
 
 /// What the driver launches and how long it waits.
 #[derive(Debug, Clone)]
@@ -113,11 +137,13 @@ impl EnvironmentDriver {
         // always has its row in the listing below.
         let mut running: BTreeSet<String> = self.backend.boxes()?.into_iter().map(|b| b.box_id).collect();
         let mut known: BTreeSet<String> = BTreeSet::new();
+        // Provisioning rows are launched in the row loop; their probes wait for the end of it and run together.
+        let mut probes: Vec<PendingProbe> = Vec::new();
         for row in self.store.list_each()? {
             match row {
                 Ok(row) => {
                     known.insert(row.environment_id.clone());
-                    if let Err(e) = self.converge(&row, now, &mut running, &mut report) {
+                    if let Err(e) = self.converge(&row, now, &mut running, &mut report, &mut probes) {
                         tracing::warn!(environment = %row.environment_id, error = %e, "could not converge an environment");
                     }
                 }
@@ -129,6 +155,7 @@ impl EnvironmentDriver {
                 Err(e) => return Err(e.into()),
             }
         }
+        self.finish_probes(probes, &mut running, &mut report);
         // A box no environment row names is an orphan: the row was never written or is gone.
         let orphans: Vec<String> = running
             .iter()
@@ -147,9 +174,13 @@ impl EnvironmentDriver {
         now: i64,
         running: &mut BTreeSet<String>,
         report: &mut Report,
+        probes: &mut Vec<PendingProbe>,
     ) -> Result<(), EnvironmentStoreError> {
         match row.state {
-            EnvironmentState::Provisioning => self.provision(row, now, running, report),
+            EnvironmentState::Provisioning => {
+                probes.extend(self.provision(row, now, running, report)?);
+                Ok(())
+            }
             EnvironmentState::Ready => self.check_ready(row, now, running, report),
             EnvironmentState::Stopped | EnvironmentState::Failed | EnvironmentState::Deleted => {
                 if running.contains(&row.environment_id) {
@@ -189,26 +220,30 @@ impl EnvironmentDriver {
         })
     }
 
+    /// Launch the box of a `Provisioning` row unless one runs, and note when its
+    /// attempt began. Returns the probe to run, or `None` when the row failed.
     fn provision(
         &self,
         row: &EnvironmentRecord,
         now: i64,
         running: &mut BTreeSet<String>,
         report: &mut Report,
-    ) -> Result<(), EnvironmentStoreError> {
+    ) -> Result<Option<PendingProbe>, EnvironmentStoreError> {
         let id = row.environment_id.as_str();
         if !running.contains(id) {
             // Covers a row made while the gate was off, and a resume: the create gate alone does not.
             if self.store.trusted_submitter_required() && !row.submitter_trusted {
-                return self.fail(
+                self.fail(
                     id,
                     "admission",
                     "the backend serves trusted submitters only and this environment was not created by one",
                     report,
-                );
+                )?;
+                return Ok(None);
             }
             let Some(spec) = self.to_spec(row) else {
-                return self.fail(id, "spec", "the stored spec does not decode", report);
+                self.fail(id, "spec", "the stored spec does not decode", report)?;
+                return Ok(None);
             };
             match self.backend.launch(&spec) {
                 Ok(Launch::Started) => {
@@ -218,7 +253,10 @@ impl EnvironmentDriver {
                 Ok(Launch::AlreadyRunning) => {
                     running.insert(id.to_owned());
                 }
-                Err(e) => return self.fail(id, "launch", &e.to_string(), report),
+                Err(e) => {
+                    self.fail(id, "launch", &e.to_string(), report)?;
+                    return Ok(None);
+                }
             }
         }
         // The provision timeout runs from the moment a box exists for this
@@ -235,7 +273,82 @@ impl EnvironmentDriver {
         // healthy environment; only a probe that stays broken for twice the
         // timeout fails the row.
         let hard_timed_out = waited > limit.saturating_mul(2);
-        match self.backend.probe(id) {
+        Ok(Some(PendingProbe {
+            id: id.to_owned(),
+            waited,
+            timed_out,
+            hard_timed_out,
+        }))
+    }
+
+    /// Probe every pending row, at most [`MAX_PROBES_IN_FLIGHT`] at a time, then
+    /// apply each result in row order. A probe that panics counts as a probe
+    /// that could not run: only that row's pass is lost.
+    fn finish_probes(&self, pending: Vec<PendingProbe>, running: &mut BTreeSet<String>, report: &mut Report) {
+        let results = self.probe_concurrently(&pending);
+        for (probe, result) in pending.into_iter().zip(results) {
+            if let Err(e) = self.apply_probe(&probe, result, running, report) {
+                tracing::warn!(environment = %probe.id, error = %e, "could not converge an environment");
+            }
+        }
+    }
+
+    fn probe_concurrently(&self, pending: &[PendingProbe]) -> Vec<Result<Probe, BackendError>> {
+        let next = AtomicUsize::new(0);
+        let slots: Mutex<Vec<Option<Result<Probe, BackendError>>>> =
+            Mutex::new(std::iter::repeat_with(|| None).take(pending.len()).collect());
+        let work = || {
+            loop {
+                let i = next.fetch_add(1, Ordering::SeqCst);
+                let Some(probe) = pending.get(i) else { break };
+                let result = catch_unwind(AssertUnwindSafe(|| self.backend.probe(&probe.id))).unwrap_or_else(|payload| {
+                    tracing::warn!(environment = %probe.id, panic = panic_text(payload.as_ref()), "a probe panicked");
+                    Err(BackendError::Transport("the probe panicked".to_owned()))
+                });
+                slots.lock().unwrap_or_else(PoisonError::into_inner)[i] = Some(result);
+            }
+        };
+        std::thread::scope(|scope| {
+            let mut spawned = 0;
+            for _ in 0..MAX_PROBES_IN_FLIGHT.min(pending.len()) {
+                // `Scope::spawn` would panic if the OS refuses a thread and lose the whole pass; probe inline instead.
+                match std::thread::Builder::new().spawn_scoped(scope, work) {
+                    Ok(_) => spawned += 1,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "could not start a probe thread");
+                        break;
+                    }
+                }
+            }
+            if spawned == 0 {
+                work();
+            }
+        });
+        // A worker panic outside `catch_unwind` would already have unwound out of the scope; the fallbacks
+        // below only keep this function total.
+        slots
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner)
+            .into_iter()
+            .map(|slot| slot.unwrap_or_else(|| Err(BackendError::Transport("the probe did not run".to_owned()))))
+            .collect()
+    }
+
+    fn apply_probe(
+        &self,
+        pending: &PendingProbe,
+        result: Result<Probe, BackendError>,
+        running: &mut BTreeSet<String>,
+        report: &mut Report,
+    ) -> Result<(), EnvironmentStoreError> {
+        let PendingProbe {
+            id,
+            waited,
+            timed_out,
+            hard_timed_out,
+        } = pending;
+        let (id, waited, timed_out, hard_timed_out) = (id.as_str(), *waited, *timed_out, *hard_timed_out);
+        match result {
             Ok(Probe::Ready { endpoint }) => match endpoint_string(&endpoint) {
                 Some(address) => match self.store.mark_ready_with_endpoint(id, &address)? {
                     EnvTransition::Applied => report.readied.push(id.to_owned()),
@@ -355,6 +468,15 @@ impl EnvironmentDriver {
             }
         }
     }
+}
+
+/// The message of a caught panic, for the log.
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("a non-text panic payload")
 }
 
 /// `host:port` for a backend endpoint, with brackets around an IPv6 address, or
@@ -1072,6 +1194,145 @@ mod tests {
         );
         assert_eq!(state(&r.store, &id)?.failure.context("failure")?.step, "provision");
         assert!(r.backend.boxes()?.is_empty());
+        Ok(())
+    }
+
+    /// Launch, boxes and kill come from the fake; the probe sleeps, may panic for
+    /// one environment, and records how many probes run at once (#709).
+    struct ProbeLab {
+        inner: FakeEnvironmentBackend,
+        delay: Duration,
+        panic_on: Option<String>,
+        inside: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+        /// Probe calls per environment id, counted before the probe can panic.
+        calls: Mutex<std::collections::BTreeMap<String, usize>>,
+    }
+
+    impl ProbeLab {
+        fn new(delay: Duration, panic_on: Option<&str>) -> Self {
+            Self {
+                inner: FakeEnvironmentBackend::new(),
+                delay,
+                panic_on: panic_on.map(str::to_owned),
+                inside: std::sync::atomic::AtomicUsize::default(),
+                peak: std::sync::atomic::AtomicUsize::default(),
+                calls: Mutex::default(),
+            }
+        }
+
+        fn calls_for(&self, id: &str) -> usize {
+            let calls = self.calls.lock().unwrap_or_else(PoisonError::into_inner);
+            calls.get(id).copied().unwrap_or(0)
+        }
+    }
+
+    impl EnvironmentBackend for ProbeLab {
+        fn launch(&self, spec: &EnvironmentSpec) -> Result<Launch, BackendError> {
+            self.inner.launch(spec)
+        }
+
+        fn probe(&self, environment_id: &str) -> Result<Probe, BackendError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            *self
+                .calls
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(environment_id.to_owned())
+                .or_default() += 1;
+            let now = self.inside.fetch_add(1, SeqCst) + 1;
+            self.peak.fetch_max(now, SeqCst);
+            if self.panic_on.as_deref() == Some(environment_id) {
+                self.inside.fetch_sub(1, SeqCst);
+                panic!("probe of {environment_id} panicked");
+            }
+            std::thread::sleep(self.delay);
+            self.inside.fetch_sub(1, SeqCst);
+            Ok(Probe::Ready {
+                endpoint: Endpoint {
+                    host: "127.0.0.1".to_owned(),
+                    port: 41000,
+                },
+            })
+        }
+
+        fn kill(&self, environment_id: &str) -> Result<(), BackendError> {
+            self.inner.kill(environment_id)
+        }
+
+        fn boxes(&self) -> Result<Vec<sandy_api::backend::BoxState>, BackendError> {
+            self.inner.boxes()
+        }
+    }
+
+    fn lab_rig(lab: ProbeLab) -> Result<(Rig2, Arc<ProbeLab>)> {
+        let store = Arc::new(EnvironmentStore::open_in_memory()?);
+        let lab = Arc::new(lab);
+        let driver = EnvironmentDriver::new(Arc::clone(&store), Arc::clone(&lab) as _, config());
+        Ok((Rig2 { store, driver }, lab))
+    }
+
+    struct Rig2 {
+        store: Arc<EnvironmentStore>,
+        driver: EnvironmentDriver,
+    }
+
+    /// #709: N Provisioning environments whose probes each take a second must
+    /// not make a pass take N seconds.
+    #[test]
+    fn eight_slow_probes_finish_one_pass_in_about_one_probe_budget() -> Result<()> {
+        let (r, _lab) = lab_rig(ProbeLab::new(Duration::from_secs(1), None))?;
+        for n in 1..=8 {
+            add(&r.store, n)?;
+        }
+        let started = std::time::Instant::now();
+        let report = r.driver.reconcile_once(now())?;
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(3), "one pass took {took:?}");
+        assert_eq!(report.readied.len(), 8, "{report:?}");
+        for n in 1..=8 {
+            assert_eq!(state(&r.store, &format!("env-{n}"))?.state, EnvironmentState::Ready);
+        }
+        Ok(())
+    }
+
+    /// #709: a probe that panics fails only that environment's pass. The others
+    /// keep their results, and the panicked one is probed again next pass.
+    #[test]
+    fn a_panicking_probe_leaves_the_other_environments_results_intact() -> Result<()> {
+        let (r, lab) = lab_rig(ProbeLab::new(Duration::from_millis(50), Some("env-2")))?;
+        for n in 1..=4 {
+            add(&r.store, n)?;
+        }
+        let report = r.driver.reconcile_once(now())?;
+        assert_eq!(lab.calls_for("env-2"), 1, "the panicking probe did run");
+        assert_eq!(report.readied.len(), 3, "{report:?}");
+        assert!(
+            report.failed.is_empty(),
+            "a panic is a probe fault, not a failure: {report:?}"
+        );
+        assert_eq!(state(&r.store, "env-2")?.state, EnvironmentState::Provisioning);
+        for n in [1, 3, 4] {
+            assert_eq!(state(&r.store, &format!("env-{n}"))?.state, EnvironmentState::Ready);
+        }
+        // The panicked row is probed again next pass, not skipped for good.
+        r.driver.reconcile_once(now())?;
+        assert_eq!(lab.calls_for("env-2"), 2, "the next pass probes it again");
+        Ok(())
+    }
+
+    /// #709: at most eight probes are in flight, however many environments.
+    #[test]
+    fn no_more_than_eight_probes_run_at_once() -> Result<()> {
+        let (r, lab) = lab_rig(ProbeLab::new(Duration::from_millis(100), None))?;
+        for n in 1..=20 {
+            add(&r.store, n)?;
+        }
+        let report = r.driver.reconcile_once(now())?;
+        assert_eq!(report.readied.len(), 20, "{report:?}");
+        let peak = lab.peak.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(peak > 1, "probes must overlap, peak was {peak}");
+        assert!(peak <= 8, "at most 8 probes in flight, peak was {peak}");
         Ok(())
     }
 }
