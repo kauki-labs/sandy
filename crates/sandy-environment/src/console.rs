@@ -15,8 +15,6 @@ use std::{
     sync::{Arc, Mutex, PoisonError},
 };
 
-use crate::mesh::redact;
-
 /// How many console bytes one environment's ring keeps. Older bytes are dropped first.
 const RING_BYTES: usize = 64 * 1024;
 
@@ -97,20 +95,23 @@ impl ConsoleTaps {
             rings.order.retain(|id| id != environment_id);
             rings.by_id.remove(environment_id)?
         };
-        let ring = ring.lock().unwrap_or_else(PoisonError::into_inner);
-        let raw: Vec<u8> = ring.bytes.iter().copied().collect();
-        let tail = tail_text(&raw, ring.wrapped);
+        // Copy the bytes and let go of the ring before the cleaning: the console reader's sink waits on this lock.
+        let (raw, wrapped) = {
+            let ring = ring.lock().unwrap_or_else(PoisonError::into_inner);
+            (ring.bytes.iter().copied().collect::<Vec<u8>>(), ring.wrapped)
+        };
+        let tail = tail_text(&raw, wrapped);
         (!tail.is_empty()).then_some(tail)
     }
 }
 
-/// Clean `raw`, mask tokens, and keep the last [`TAIL_LINES`] lines within [`TAIL_BYTES`].
-/// `partial_start` says the first line may have lost its beginning, so it is dropped: a
-/// token cut in half would otherwise show its tail without the prefix a mask looks for.
+/// Clean `raw`, mask secrets, and keep the last [`TAIL_LINES`] lines within [`TAIL_BYTES`].
+/// `partial_start` says the ring dropped older bytes, so the first line may have lost its
+/// beginning and is dropped: a token cut in half would otherwise show its tail without the
+/// prefix a mask looks for. The caps below cut masked text, which holds no token any more.
 fn tail_text(raw: &[u8], partial_start: bool) -> String {
     let cleaned = strip_controls(&String::from_utf8_lossy(raw));
-    // Mask first, on whole tokens; the caps below only remove text.
-    let masked = redact(&cleaned);
+    let masked = mask_secrets(&cleaned);
     let mut lines: Vec<&str> = masked.split('\n').map(str::trim_end).collect();
     if partial_start && !lines.is_empty() {
         lines.remove(0);
@@ -119,17 +120,88 @@ fn tail_text(raw: &[u8], partial_start: bool) -> String {
         lines.pop();
     }
     let keep = lines.len().saturating_sub(TAIL_LINES);
-    let mut text = lines[keep..].join("\n");
-    if text.len() > TAIL_BYTES {
-        let mut cut = text.len() - TAIL_BYTES;
-        while !text.is_char_boundary(cut) {
-            cut += 1;
-        }
-        // The cut may land inside a line; drop that partial line so no token loses its prefix.
-        let next_line = text[cut..].find('\n').map_or(text.len(), |i| cut + i + 1);
-        text = text[next_line.min(text.len())..].to_owned();
+    let text = lines[keep..].join("\n");
+    if text.len() <= TAIL_BYTES {
+        return text;
     }
-    text
+    let mut cut = text.len() - TAIL_BYTES;
+    while !text.is_char_boundary(cut) {
+        cut += 1;
+    }
+    text[cut..].to_owned()
+}
+
+/// What replaces a masked secret.
+const MASK: &str = "[redacted]";
+
+/// Prefixes of tokens that must not reach a failure reason, compared ASCII-case-insensitively:
+/// the mesh join keys and the GitHub token families.
+const TOKEN_PREFIXES: [&str; 8] = [
+    "hskey-auth-",
+    "tskey-",
+    "ghs_",
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghr_",
+    "github_pat_",
+];
+
+/// Mask known secret shapes in one pass: a token behind one of [`TOKEN_PREFIXES`] (the prefix and
+/// the token's `[A-Za-z0-9_-]` run), `user:password` in a `scheme://user:password@host` URL, and the
+/// token after `Bearer `. The caller scrubs exact values it knows (the staged credential) on top of
+/// this: a shape mask cannot know a token that has no known shape.
+fn mask_secrets(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let lower = text.to_ascii_lowercase();
+    let lower = lower.as_bytes();
+    let token_len = |from: usize| {
+        bytes[from..]
+            .iter()
+            .take_while(|b| b.is_ascii_alphanumeric() || **b == b'-' || **b == b'_')
+            .count()
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    let mut copied = 0;
+    while i < bytes.len() {
+        let rest = &lower[i..];
+        if let Some(prefix) = TOKEN_PREFIXES.iter().find(|p| rest.starts_with(p.as_bytes())) {
+            let end = i + prefix.len() + token_len(i + prefix.len());
+            out.push_str(&text[copied..i]);
+            out.push_str(MASK);
+            (i, copied) = (end, end);
+        } else if rest.starts_with(b"bearer ") {
+            let from = i + "bearer ".len();
+            // A bearer value is any run up to whitespace: JWTs and base64 carry `.`, `+`, `/` and `=`.
+            let end = from + bytes[from..].iter().take_while(|b| !b.is_ascii_whitespace()).count();
+            out.push_str(&text[copied..from]);
+            if end > from {
+                out.push_str(MASK);
+            }
+            (i, copied) = (end, end.max(from));
+        } else if rest.starts_with(b"://") {
+            let from = i + 3;
+            // Userinfo ends at `@` before the first `/`, `?`, `#` or whitespace of the authority.
+            let authority_end = bytes[from..]
+                .iter()
+                .position(|b| matches!(b, b'/' | b'?' | b'#') || b.is_ascii_whitespace())
+                .map_or(bytes.len(), |n| from + n);
+            let at = bytes[from..authority_end].iter().rposition(|b| *b == b'@');
+            match at {
+                Some(at) if at > 0 => {
+                    out.push_str(&text[copied..from]);
+                    out.push_str(MASK);
+                    (i, copied) = (from + at, from + at);
+                }
+                _ => i = from,
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out.push_str(&text[copied..]);
+    out
 }
 
 /// Drop ANSI escape sequences and every control character but `\n` and `\t`. A lone `\r`
@@ -154,6 +226,8 @@ fn strip_controls(text: &str) -> String {
                 }
             }
             '\n' | '\t' => out.push(c),
+            // Bidirectional overrides would reorder what an operator reads.
+            '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' => {}
             c if c.is_control() => {}
             c => out.push(c),
         }
@@ -218,44 +292,106 @@ mod tests {
         assert!(tail.contains("done"), "{tail}");
     }
 
+    /// The byte cap cuts masked text, so it keeps the newest bytes even when the tail is one line.
     #[test]
-    fn the_byte_cap_cuts_at_a_line_and_keeps_the_newest_text() {
+    fn the_byte_cap_keeps_the_newest_text_of_a_long_line() {
         let taps = ConsoleTaps::new();
-        // 201-byte lines of a multi-byte character: forty of them are more than the byte cap.
-        let line = format!("{}\n", "é".repeat(100));
-        let text = line.repeat(200);
+        let line = "é".repeat(100);
+        let text = format!("{line}\n").repeat(200);
         feed(&taps, "e", &[text.as_bytes()]);
         let tail = taps.take_tail("e").expect("a tail");
         assert!(tail.len() <= TAIL_BYTES, "{}", tail.len());
-        assert!(tail.lines().all(|l| l == "é".repeat(100)), "only whole lines remain");
+        assert!(tail.len() > TAIL_BYTES - 4, "the cap fills the budget: {}", tail.len());
+        assert!(tail.ends_with(&line), "the newest line is whole");
     }
 
+    /// Progress output made of carriage returns is one long line once the returns are gone: it is cut, not dropped.
     #[test]
-    fn a_token_cut_by_the_byte_cap_leaves_no_suffix() {
+    fn a_single_long_line_is_cut_to_the_cap_and_not_dropped() {
         let taps = ConsoleTaps::new();
-        let token = "tskey-auth-SECRETSUFFIX0123456789";
-        // The token sits in a line the byte cap will cut through.
-        let filler = format!("{}\n", "x".repeat(TAIL_BYTES - 10));
-        let text = format!("lead {token}\n{filler}end\n");
-        feed(&taps, "e", &[text.as_bytes()]);
+        feed(&taps, "e", &["x".repeat(10_000).as_bytes()]);
         let tail = taps.take_tail("e").expect("a tail");
-        assert!(!tail.contains("SECRETSUFFIX"), "{tail}");
-        assert!(tail.ends_with("end"), "{tail}");
+        assert_eq!(tail.len(), TAIL_BYTES);
+        assert!(tail.bytes().all(|b| b == b'x'));
     }
 
+    /// The ring drops its oldest bytes in the middle of a token. What is left of the token has no prefix for a mask
+    /// to find, so the partial first line must go. Without that drop the suffix survives.
     #[test]
-    fn the_ring_keeps_the_newest_bytes_and_drops_the_partial_first_line() {
+    fn a_ring_that_wraps_inside_a_token_drops_what_is_left_of_it() {
         let taps = ConsoleTaps::new();
         let sink = taps.sink_for("e");
-        // Push a token so the ring wraps in the middle of it.
-        sink(b"tskey-auth-WRAPPEDSECRET\n");
-        for _ in 0..(RING_BYTES / 100 + 8) {
-            sink(format!("{}\n", "y".repeat(99)).as_bytes());
-        }
-        sink(b"newest\n");
+        let first = b"abtskey-auth-SECRETSUFFIX0123\n";
+        sink(first);
+        // 16 bytes over the ring: the front loses "abtskey-auth-SEC", cutting inside the token.
+        let filler = RING_BYTES + 16 - first.len();
+        assert_eq!(filler % 2, 0);
+        sink("y\n".repeat(filler / 2).as_bytes());
         let tail = taps.take_tail("e").expect("a tail");
-        assert!(tail.ends_with("newest"), "{tail}");
-        assert!(!tail.contains("WRAPPEDSECRET"), "{tail}");
+        assert!(!tail.contains("SUFFIX"), "a token suffix survived the wrap: {tail:.80}");
+        assert!(tail.ends_with('y'), "the newest lines stay");
+    }
+
+    #[test]
+    fn github_tokens_url_credentials_and_bearer_values_are_masked() {
+        let taps = ConsoleTaps::new();
+        let text = "fatal: unable to access https://x-access-token:ghs_AbC123xyz@github.com/org/repo.git/\ntoken \
+                    ghp_0123456789abcdef and GHO_Upper and github_pat_11AAA_bbb\nAuthorization: Bearer abc.DEF-123 \
+                    end\nclone ssh://deploy@host:22/repo ok\n";
+        feed(&taps, "e", &[text.as_bytes()]);
+        let tail = taps.take_tail("e").expect("a tail");
+        for secret in [
+            "ghs_AbC123xyz",
+            "x-access-token",
+            "ghp_0123",
+            "GHO_Upper",
+            "github_pat_11",
+            "abc.DEF",
+        ] {
+            assert!(!tail.contains(secret), "{secret} survived: {tail}");
+        }
+        assert!(tail.contains("https://[redacted]@github.com/org/repo.git/"), "{tail}");
+        assert!(tail.contains("Bearer [redacted]"), "{tail}");
+        assert!(
+            tail.contains("ssh://[redacted]@host:22/repo ok"),
+            "a user name is userinfo too: {tail}"
+        );
+    }
+
+    #[test]
+    fn text_that_only_looks_like_a_token_is_left_alone() {
+        let taps = ConsoleTaps::new();
+        feed(
+            &taps,
+            "e",
+            &[b"ghsomething and ghs without underscore, a http://host/path@x, bearer\n"],
+        );
+        assert_eq!(
+            taps.take_tail("e").as_deref(),
+            Some("ghsomething and ghs without underscore, a http://host/path@x, bearer")
+        );
+    }
+
+    /// A guest printing many tokens must not make the cleaning quadratic: the ring lock is released first.
+    #[test]
+    fn a_console_full_of_tokens_is_cleaned_in_linear_time() {
+        let taps = ConsoleTaps::new();
+        feed(&taps, "e", &["tskey-a ".repeat(RING_BYTES / 8).as_bytes()]);
+        let started = std::time::Instant::now();
+        let tail = taps.take_tail("e").expect("a tail");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(!tail.contains("tskey-"));
+    }
+
+    #[test]
+    fn bidirectional_overrides_are_stripped() {
+        let taps = ConsoleTaps::new();
+        feed(&taps, "e", &["safe \u{202e}txet\u{2067} ok\n".as_bytes()]);
+        assert_eq!(taps.take_tail("e").as_deref(), Some("safe txet ok"));
     }
 
     #[test]
