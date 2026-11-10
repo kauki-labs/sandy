@@ -246,17 +246,28 @@ impl GithubProvisioner {
     /// The API base for the manifest conversion: GitHub.com uses octocrab's
     /// default; a GHES host uses `<web_base>/api/v3`.
     fn api_base(&self) -> Option<String> {
-        if self.web_base == "https://github.com" {
-            None
-        } else {
-            Some(format!("{}/api/v3", self.web_base))
-        }
+        derived_api_base(&self.web_base)
     }
 
     /// `base_url` stored in the trust root (`None` for github.com).
     fn trust_root_base_url(&self) -> Option<String> {
         self.api_base()
     }
+}
+
+/// The API base a GitHub Enterprise Server `web_base` implies (`<web base>/api/v3`); `None` for github.com.
+fn derived_api_base(web_base: &str) -> Option<String> {
+    if web_base == "https://github.com" {
+        None
+    } else {
+        Some(format!("{web_base}/api/v3"))
+    }
+}
+
+/// Refuse an API base the App's JWT must not go to (#736), by field and rule and never the value.
+fn check_api_base(base: Option<&str>) -> Result<(), InstallError> {
+    base.map_or(Ok(()), sandy::validate_api_base)
+        .map_err(|reason| InstallError::Capture(format!("base_url is not allowed: {reason}")))
 }
 
 /// The subset of the manifest-conversion response the installer needs.
@@ -531,6 +542,8 @@ pub fn run_register(
     force: bool,
 ) -> Result<CredRegistered, InstallError> {
     sandy::validate_trust_root_name(handle)?;
+    // Before the browser, the forge or any file: the web base decides where the App's secrets are sent.
+    check_api_base(derived_api_base(web_base).as_deref())?;
     let dir = trust_roots_dir().map_err(|e| InstallError::Capture(e.to_string()))?;
     let cfg = config_path(&dir, handle);
     if !force {
@@ -590,7 +603,9 @@ pub fn run_deregister(name: &str, keep_remote: bool) -> Result<CredDeregistered,
     sandy::validate_trust_root_name(name)?;
     let dir = trust_roots_dir().map_err(|e| InstallError::Capture(e.to_string()))?;
     let cfg = config_path(&dir, name);
-    let root = TrustRoot::load(&cfg)?;
+    // Unchecked: `deregister` checks the base itself where the forge is called, so a root with a bad stored base can
+    // still be removed locally with --keep-remote (#736).
+    let root = TrustRoot::load_unchecked(&cfg)?;
     let provisioner = provisioner_for(&root, name);
 
     let outcome = sandy::deregister(&provisioner, &cfg, keep_remote)?;
@@ -718,6 +733,8 @@ fn import_into(
     base_url: Option<String>,
     targets: Vec<Target>,
 ) -> Result<CredImported, InstallError> {
+    // Before the key is read or anything is written.
+    check_api_base(base_url.as_deref())?;
     let cfg = config_path(dir, handle);
     if cfg.exists() {
         return Err(InstallError::AlreadyExists { path: cfg });
@@ -754,6 +771,75 @@ mod tests {
     use std::{io::Write, net::TcpStream};
 
     use super::*;
+
+    /// #736: an API base that would send the App's JWT in the clear or off host is refused at import, before the key
+    /// is read or any file is written.
+    #[test]
+    fn import_refuses_a_bad_api_base_and_writes_nothing() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()?;
+        let pem = dir.path().join("shared.pem");
+        std::fs::write(&pem, "-----BEGIN PRIVATE KEY-----")?;
+        for bad in [
+            "http://ghe.example.com/api/v3",
+            "https://user:hunter2@ghe.example.com",
+            "https://ghe.example.com#x",
+        ] {
+            let err = import_into(dir.path(), "acme", "1", 2, &pem, Some(bad.to_string()), Vec::new()).expect_err(bad);
+            let text = err.to_string();
+            assert!(text.contains("base_url"), "{bad}: {text}");
+            assert!(
+                !text.contains("hunter2"),
+                "the refusal must not repeat the value: {text}"
+            );
+        }
+        assert!(!config_path(dir.path(), "acme").exists(), "nothing was written");
+        assert!(!dir.path().join("acme.pem").exists(), "no key was copied");
+        Ok(())
+    }
+
+    /// #736: `register` derives the API base from the web base for a GitHub Enterprise Server. A web base that would be
+    /// refused as an API base is refused before the browser or the forge is touched.
+    #[test]
+    fn register_refuses_a_bad_web_base_before_contacting_anything() {
+        for bad in [
+            "http://ghe.example.com",
+            "https://user:hunter2@ghe.example.com",
+            "https://ghe.example.com?x=1",
+        ] {
+            let err = run_register(
+                "acme",
+                "acme-app",
+                "https://example.com",
+                Owner::User,
+                bad,
+                &[],
+                Vec::new(),
+                true,
+                true,
+            )
+            .expect_err(bad);
+            let text = err.to_string();
+            assert!(text.contains("base_url"), "{bad}: {text}");
+            assert!(
+                !text.contains("hunter2"),
+                "the refusal must not repeat the value: {text}"
+            );
+        }
+    }
+
+    /// The default web base stays github.com and needs no API base.
+    #[test]
+    fn the_default_web_base_derives_no_api_base() {
+        assert_eq!(derived_api_base("https://github.com"), None);
+        assert_eq!(
+            derived_api_base("https://ghe.example.com").as_deref(),
+            Some("https://ghe.example.com/api/v3")
+        );
+    }
 
     /// #194: rewriting the App key over an existing 0644 file leaves it 0600. The
     /// old writer opened with `truncate`, which kept the old mode.
