@@ -8,12 +8,25 @@ use std::collections::BTreeSet;
 use anyhow::{Context, Result};
 use common::procs::{
     descendants_in, file_holds, files_holding, foreign_new_entries, is_vm_part, parse_stat, run_dirs_left,
-    sandy_entries, staging_base,
+    sandy_entries, staging_base, stat_is_live,
 };
 
 /// A `/proc/<pid>/stat` line: pid, comm, state, ppid and 17 more fields up to the start time (field 22).
 fn stat_line(comm: &str, ppid: u32, start: u64) -> String {
     format!("4242 ({comm}) S {ppid} 1 1 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 {start} 1000 50 18446744073709551615")
+}
+
+#[test]
+fn a_zombie_or_dead_or_unreadable_process_is_not_live() {
+    let line = |state: &str| stat_line("sandyd", 1, 7).replacen(" S ", &format!(" {state} "), 1);
+    for live in ["R", "S", "D", "T"] {
+        assert!(stat_is_live(&line(live)), "{live} is live");
+    }
+    for dead in ["Z", "X"] {
+        assert!(!stat_is_live(&line(dead)), "{dead} is not live");
+    }
+    assert!(!stat_is_live(""), "no stat text is not live");
+    assert!(!stat_is_live("4242 (sandyd"), "a truncated line is not live");
 }
 
 #[test]

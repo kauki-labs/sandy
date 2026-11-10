@@ -1,6 +1,6 @@
 //! Live VM environment (#587, C3b): `sandyd` with `SANDY_ENV_BACKEND=vm-qemu` boots the t3 guest as a qemu microVM,
 //! reports the environment Ready at a loopback endpoint that answers HTTP, and leaves no qemu process or
-//! `/tmp/sandy-*` entry behind once the environment is deleted.
+//! run directory behind once the environment is deleted.
 //!
 //! Tier-3, behind the `live` feature like the other live suites (INV-S9). Linux with KVM and `/dev/vhost-vsock`
 //! only; the first run builds a 3.7 GB guest image, so the provision timeout is far above the 120 s default.
@@ -15,6 +15,7 @@ use std::{
     collections::BTreeSet,
     io::{Read, Write},
     net::TcpStream,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
@@ -118,24 +119,13 @@ fn qemu_pids() -> anyhow::Result<BTreeSet<u32>> {
     Ok(pids)
 }
 
-/// Every `/tmp/sandy-*` entry and its direct children.
-fn sandy_tmp_entries() -> BTreeSet<PathBuf> {
-    let mut found = BTreeSet::new();
-    let Ok(tmp) = std::fs::read_dir("/tmp") else {
-        return found;
-    };
-    for entry in tmp.flatten() {
-        // The staging base is `sandy` (no dash), where a run's secret share and sockets live.
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name != sandy_fsutil::STAGING_DIR_NAME && !name.starts_with("sandy-") {
-            continue;
-        }
-        found.insert(entry.path());
-        if let Ok(children) = std::fs::read_dir(entry.path()) {
-            found.extend(children.flatten().map(|c| c.path()));
-        }
-    }
-    found
+/// The entries under the daemon's own staging base (`<TMPDIR>/sandy`): a run leaves a directory there while it lives
+/// and none once it is deleted. The daemon runs with its own `TMPDIR`, so another session's runs in the host's shared
+/// `/tmp/sandy` cannot read as strays of this one.
+fn run_dirs_under(base: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(base.join(sandy_fsutil::STAGING_DIR_NAME))
+        .map(|d| d.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default()
 }
 
 /// The status code of `GET /` on `host:port`, over a bare TCP socket.
@@ -180,12 +170,16 @@ async fn a_vm_environment_becomes_ready_answers_http_and_leaves_nothing_after_de
     ensure!(build.success(), "nix build of the t3 guest runner failed");
 
     let qemu_before = qemu_pids()?;
-    let tmp_before = sandy_tmp_entries();
     let dir = tempfile::tempdir().context("temp dir")?;
+    // The daemon's own `TMPDIR`: its staging base is `<tmp>/sandy`, apart from the host's shared one.
+    let tmp = dir.path().join("t");
+    std::fs::create_dir(&tmp)?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700))?;
     let sock = dir.path().join("sandyd.sock");
     let _daemon = Daemon(
         Command::new(sandyd_bin()?)
             .env("SANDY_SOCK", &sock)
+            .env("TMPDIR", &tmp)
             .env("SANDY_DB", dir.path().join("sandyd.db"))
             .env("SANDY_ENV_BACKEND", "vm-qemu")
             .env(
@@ -284,12 +278,8 @@ async fn a_vm_environment_becomes_ready_answers_http_and_leaves_nothing_after_de
         ensure!(Instant::now() < deadline, "the bridge still listens after delete");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    // A new staging base is the only thing a first run may add: no run directory under it, no stray entry.
-    let new_entries: Vec<_> = sandy_tmp_entries().difference(&tmp_before).cloned().collect();
-    let strays: Vec<_> = new_entries
-        .iter()
-        .filter(|p| p.parent() != Some(Path::new("/tmp")) || std::fs::read_dir(p).is_ok_and(|mut d| d.next().is_some()))
-        .collect();
-    ensure!(strays.is_empty(), "left behind in /tmp: {strays:?}");
+    // No run directory is left under the daemon's own staging base.
+    let strays = run_dirs_under(&tmp);
+    ensure!(strays.is_empty(), "left behind under the staging base: {strays:?}");
     Ok(())
 }
