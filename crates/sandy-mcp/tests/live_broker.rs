@@ -15,9 +15,11 @@
 //! `stub-trust-root` feature: every vm environment mints from a registered trust root, and no real one exists on a
 //! test host. Without the feature the daemon refuses to start and says so.
 //!
-//!   cargo build -p sandyd -p sandy-broker -p sandy-mcp --features sandyd/stub-trust-root
-//!   SANDY_LIVE=1 nix shell nixpkgs#qemu nixpkgs#virtiofsd -c cargo nextest run -p sandy-mcp --features live --test
-//! live_broker \     --no-capture
+//! ```text
+//! cargo build -p sandyd -p sandy-broker -p sandy-mcp --features sandyd/stub-trust-root
+//! SANDY_LIVE=1 nix shell nixpkgs#qemu nixpkgs#virtiofsd -c \
+//!   cargo nextest run -p sandy-mcp --features live --test live_broker --no-capture
+//! ```
 //!
 //! The daemon runs with `SANDYD_STUB_TRUST_ROOT=live` and a call log in the test's own directory. The profiles
 //! name that trust root. The stub's token is staged at `<TMPDIR>/sandy/env-cred-<id>/GITHUB_TOKEN`, the host side
@@ -79,8 +81,9 @@ fn require_live() -> Result<()> {
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).any(|d| d.join(name).is_file())
     };
     ensure!(
-        on_path("qemu-system-x86_64"),
-        "refusing: qemu-system-x86_64 is not on PATH, run under `nix shell nixpkgs#qemu nixpkgs#virtiofsd`"
+        on_path("qemu-system-x86_64") || std::env::var_os("SANDY_QEMU_BIN").is_some(),
+        "refusing: qemu-system-x86_64 is not on PATH and SANDY_QEMU_BIN is unset, run under `nix shell nixpkgs#qemu \
+         nixpkgs#virtiofsd`"
     );
     // The forge credential is staged on a virtiofs share (#706), so every environment starts a `virtiofsd`.
     ensure!(
@@ -227,7 +230,9 @@ struct Stack {
     stub_log: PathBuf,
     /// Every stub token seen so far, each with the staged file it was read from. Kept after the file is gone, so a
     /// revoked token is still scanned for.
-    stub_tokens: Mutex<BTreeMap<String, PathBuf>>,
+    stub_tokens: Arc<Mutex<BTreeMap<String, PathBuf>>>,
+    /// Set by the sampler thread when any `ps` sample held a stub token.
+    ps_stub_hit: Arc<AtomicBool>,
     /// The daemon's `TMPDIR`, inside `dir`: its staging base is `<tmp>/sandy`.
     tmp: PathBuf,
     /// The host's sandy-named `/tmp` entries before this run, for the report of foreign new ones.
@@ -331,14 +336,19 @@ impl Stack {
             token,
             credential,
             stub_log,
-            stub_tokens: Mutex::new(BTreeMap::new()),
+            stub_tokens: Arc::new(Mutex::new(BTreeMap::new())),
+            ps_stub_hit: Arc::new(AtomicBool::new(false)),
         };
-        // Sample `ps` for the whole run: one snapshot can miss a short-lived argv.
-        let (hit, errors, stop, canary) = (
+        // Sample `ps` for the whole run: one snapshot can miss a short-lived argv. The stub's forge tokens (#733) are
+        // checked on every tick too: a helper that put one in its argv between two checkpoints is caught here.
+        let (hit, stub_hit, errors, stop, canary, tokens, tmp) = (
             Arc::clone(&stack.ps_hit),
+            Arc::clone(&stack.ps_stub_hit),
             Arc::clone(&stack.ps_errors),
             Arc::clone(&stack.sampler_stop),
             stack.token.clone(),
+            Arc::clone(&stack.stub_tokens),
+            stack.tmp.clone(),
         );
         stack.sampler = Some(std::thread::spawn(move || {
             while !stop.load(Ordering::SeqCst) {
@@ -347,6 +357,15 @@ impl Stack {
                     Ok(false) => {}
                     Err(_) => {
                         errors.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                for (token, _) in staged_stub_tokens(&tmp, &tokens) {
+                    match ps_holds(&token) {
+                        Ok(true) => stub_hit.store(true, Ordering::SeqCst),
+                        Ok(false) => {}
+                        Err(_) => {
+                            errors.fetch_add(1, Ordering::SeqCst);
+                        }
                     }
                 }
                 std::thread::sleep(Duration::from_millis(500));
@@ -406,6 +425,10 @@ impl Stack {
             .context("AT-11: the canary scan could not read every file")?;
         ensure!(leaked.is_empty(), "AT-11 ({at}): the canary is in {leaked:?}");
         // The stub's forge tokens (#733): each only in the file the guest's secret share is staged from.
+        ensure!(
+            !self.ps_stub_hit.load(Ordering::SeqCst),
+            "AT-11 ({at}): a stub forge token was in `ps` output (seen by the sampler)"
+        );
         for (token, staged) in self.refresh_stub_tokens() {
             ensure!(!ps_holds(&token)?, "AT-11 ({at}): a stub forge token is in `ps` output");
             let leaked = files_holding(self.dir.path(), &token, &staged)
@@ -421,23 +444,7 @@ impl Stack {
     /// The staged stub tokens now on disk (`<tmp>/sandy/env-cred-<id>/GITHUB_TOKEN`), added to the ones seen before.
     /// Returns all of them, with the staged file each came from.
     fn refresh_stub_tokens(&self) -> Vec<(String, PathBuf)> {
-        let mut seen = self.stub_tokens.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Ok(base) = std::fs::read_dir(self.tmp.join("sandy")) {
-            for entry in base.flatten() {
-                let name = entry.file_name();
-                if !name.to_string_lossy().starts_with("env-cred-") {
-                    continue;
-                }
-                let staged = entry.path().join("GITHUB_TOKEN");
-                if let Ok(text) = std::fs::read_to_string(&staged) {
-                    let token = text.trim().to_owned();
-                    if !token.is_empty() {
-                        seen.entry(token).or_insert(staged);
-                    }
-                }
-            }
-        }
-        seen.iter().map(|(t, p)| (t.clone(), p.clone())).collect()
+        staged_stub_tokens(&self.tmp, &self.stub_tokens)
     }
 
     /// The stub's call log, one line per call.
@@ -673,6 +680,27 @@ fn spawn_args(request_id: &str, task: &str) -> Value {
 
 /// The canary never reaches the host process table: `ps` shows every argv on the box. `timeout` bounds it, and a
 /// `ps` that fails or times out is an error, not a clean sample.
+/// The stub tokens staged under `<tmp>/sandy/env-cred-<id>/GITHUB_TOKEN` now, added to `seen`, which keeps a token
+/// after its file is gone so a revoked token is still looked for. Returns every token seen, with its staged file.
+fn staged_stub_tokens(tmp: &Path, seen: &Mutex<BTreeMap<String, PathBuf>>) -> Vec<(String, PathBuf)> {
+    let mut seen = seen.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Ok(base) = std::fs::read_dir(tmp.join("sandy")) {
+        for entry in base.flatten() {
+            if !entry.file_name().to_string_lossy().starts_with("env-cred-") {
+                continue;
+            }
+            let staged = entry.path().join("GITHUB_TOKEN");
+            if let Ok(text) = std::fs::read_to_string(&staged) {
+                let token = text.trim().to_owned();
+                if !token.is_empty() {
+                    seen.entry(token).or_insert(staged);
+                }
+            }
+        }
+    }
+    seen.iter().map(|(t, p)| (t.clone(), p.clone())).collect()
+}
+
 fn ps_holds(needle: &str) -> Result<bool> {
     let out = Command::new("timeout")
         .args(["10", "ps", "-eww", "-o", "args="])
