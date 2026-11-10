@@ -2188,7 +2188,9 @@ into a running VM or into `Ready`. `VmBackend::run` is run-to-completion, so a l
   stands in for tier-2.
 - `EnvironmentDriver` is a level-triggered loop, not a set of handler hooks. Each pass takes the backend's box list,
   then reads every row, and fixes each difference. A `Provisioning` row launches a box unless one already runs, then
-  probes it: Ready marks the row `Ready` and records the endpoint in the same write; Failed records the step and reason
+  probes it (#709: the probes of all such rows run together once the row loop has launched them, at most eight at a
+  time, so a pass takes about one probe budget however many rows probe; a probe that panics counts as a probe that
+  could not run, and only that row's pass is lost): Ready marks the row `Ready` and records the endpoint in the same write; Failed records the step and reason
   and kills the box; a probe that is not Ready after the provision timeout, counted from the moment a box first existed for this
   attempt (`launched_at`, kept across passes and restarts, cleared by a resume), fails the row with step `provision`
   and kills the box; a probe that cannot run is retried and fails the row only after twice the timeout. The probe comes first and the clock starts at the launch, so a long daemon downtime never fails a row that can still
