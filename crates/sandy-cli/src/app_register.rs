@@ -755,6 +755,75 @@ mod tests {
 
     use super::*;
 
+    /// #736: an API base that would send the App's JWT in the clear or off host is refused at import, before the key
+    /// is read or any file is written.
+    #[test]
+    fn import_refuses_a_bad_api_base_and_writes_nothing() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()?;
+        let pem = dir.path().join("shared.pem");
+        std::fs::write(&pem, "-----BEGIN PRIVATE KEY-----")?;
+        for bad in [
+            "http://ghe.example.com/api/v3",
+            "https://user:hunter2@ghe.example.com",
+            "https://ghe.example.com#x",
+        ] {
+            let err = import_into(dir.path(), "acme", "1", 2, &pem, Some(bad.to_string()), Vec::new()).expect_err(bad);
+            let text = err.to_string();
+            assert!(text.contains("base_url"), "{bad}: {text}");
+            assert!(
+                !text.contains("hunter2"),
+                "the refusal must not repeat the value: {text}"
+            );
+        }
+        assert!(!config_path(dir.path(), "acme").exists(), "nothing was written");
+        assert!(!dir.path().join("acme.pem").exists(), "no key was copied");
+        Ok(())
+    }
+
+    /// #736: `register` derives the API base from the web base for a GitHub Enterprise Server. A web base that would be
+    /// refused as an API base is refused before the browser or the forge is touched.
+    #[test]
+    fn register_refuses_a_bad_web_base_before_contacting_anything() {
+        for bad in [
+            "http://ghe.example.com",
+            "https://user:hunter2@ghe.example.com",
+            "https://ghe.example.com?x=1",
+        ] {
+            let err = run_register(
+                "acme",
+                "acme-app",
+                "https://example.com",
+                Owner::User,
+                bad,
+                &[],
+                Vec::new(),
+                true,
+                true,
+            )
+            .expect_err(bad);
+            let text = err.to_string();
+            assert!(text.contains("base_url"), "{bad}: {text}");
+            assert!(
+                !text.contains("hunter2"),
+                "the refusal must not repeat the value: {text}"
+            );
+        }
+    }
+
+    /// The default web base stays github.com and needs no API base.
+    #[test]
+    fn the_default_web_base_derives_no_api_base() {
+        assert_eq!(derived_api_base("https://github.com"), None);
+        assert_eq!(
+            derived_api_base("https://ghe.example.com").as_deref(),
+            Some("https://ghe.example.com/api/v3")
+        );
+    }
+
     /// #194: rewriting the App key over an existing 0644 file leaves it 0600. The
     /// old writer opened with `truncate`, which kept the old mode.
     #[test]

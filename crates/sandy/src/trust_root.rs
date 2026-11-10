@@ -473,4 +473,143 @@ mod tests {
         assert!(!cfg.exists(), "the config is still removed");
         Ok(())
     }
+
+    /// #736: where the App's signed JWT goes is the trust root's `base_url`. It is https, or http only to a loopback
+    /// host (a local fake forge in a test), and never carries userinfo, a query or a fragment.
+    #[test]
+    fn a_valid_api_base_is_accepted() {
+        for ok in [
+            "https://api.github.com",
+            "https://ghe.example.com/api/v3",
+            "https://ghe.example.com:8443/api/v3/",
+            "https://GHE.Example.com/api/v3",
+            "http://127.0.0.1:41234",
+            "http://127.1.2.3/api/v3",
+            "http://localhost:8080/api",
+            "http://LOCALHOST",
+            "http://[::1]:9000/api",
+        ] {
+            assert_eq!(validate_api_base(ok), Ok(()), "{ok}");
+        }
+    }
+
+    #[test]
+    fn an_api_base_that_could_send_the_jwt_off_host_or_in_the_clear_is_refused() {
+        for (bad, why) in [
+            ("http://ghe.example.com/api/v3", "scheme"),
+            ("http://127.0.0.1.evil.com", "scheme"),
+            ("http://localhost.evil.com", "scheme"),
+            ("http://0.0.0.0:80", "scheme"),
+            ("ftp://ghe.example.com", "scheme"),
+            ("ghe.example.com/api/v3", "scheme"),
+            ("", "scheme"),
+            ("https://user@ghe.example.com", "userinfo"),
+            ("https://user:hunter2@ghe.example.com", "userinfo"),
+            ("https://ghe.example.com?x=1", "query"),
+            ("https://ghe.example.com/api/v3?x=1", "query"),
+            ("https://ghe.example.com#frag", "fragment"),
+            ("https://", "host"),
+            ("https://:443", "host"),
+            ("https://ghe.example.com:0", "port"),
+            ("https://ghe.example.com:65536", "port"),
+            ("https://ghe.example.com:abc", "port"),
+            ("https://ghe example.com", "character"),
+            ("https://ghe.example.com/a b", "character"),
+            ("https://ghe.example.com/\u{7f}", "character"),
+            ("https://g\u{e9}.example.com", "character"),
+            ("https://ghe.example.com/../x", "path"),
+            ("https://ghe.example.com/a/./b", "path"),
+            ("https://ghe.example.com\\x", "character"),
+            ("http://[::1]x", "host"),
+        ] {
+            let err = validate_api_base(bad).expect_err(bad);
+            assert!(
+                err.contains(why),
+                "{bad:?}: expected a reason naming {why:?}, got {err:?}"
+            );
+        }
+    }
+
+    /// A URL with userinfo can hold a secret: no error text may repeat the value it refused.
+    #[test]
+    fn a_refusal_never_repeats_the_value() {
+        for bad in [
+            "https://user:hunter2@ghe.example.com",
+            "https://ghe.example.com/?token=hunter2",
+        ] {
+            let err = validate_api_base(bad).expect_err(bad);
+            assert!(!err.contains("hunter2"), "the refusal repeated the value: {err}");
+        }
+    }
+
+    /// Writing a trust root refuses a bad base, so `register` and `import` never persist one.
+    #[test]
+    fn writing_a_trust_root_with_a_bad_api_base_is_refused_and_writes_nothing() -> anyhow::Result<()> {
+        use crate::cred::TrustRootIo as _;
+        let dir = tempfile::tempdir()?;
+        std::fs::set_permissions(dir.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+        let cfg = dir.path().join("root.json");
+        let TrustRoot::Github {
+            app_id,
+            private_key_path,
+            installation_id,
+            targets,
+            ..
+        } = github_root(Path::new("/key.pem"))
+        else {
+            anyhow::bail!("github_root is a GitHub root");
+        };
+        let bad = TrustRoot::Github {
+            base_url: Some("http://ghe.example.com/api/v3".to_string()),
+            app_id,
+            private_key_path,
+            installation_id,
+            targets,
+        };
+        let err = bad.write(&cfg).expect_err("a cleartext base must not be written");
+        assert!(err.to_string().contains("base_url"), "{err}");
+        assert!(!cfg.exists(), "nothing may be written");
+        Ok(())
+    }
+
+    /// An existing trust root keeps loading when its base is valid or absent, and fails with a message that names the
+    /// field and the rule (not the value) when it is not.
+    #[test]
+    fn loading_a_stored_trust_root_checks_its_api_base() -> anyhow::Result<()> {
+        use crate::cred::TrustRootIo as _;
+        let dir = tempfile::tempdir()?;
+        std::fs::set_permissions(dir.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+        let write = |name: &str, base: Option<&str>| -> anyhow::Result<std::path::PathBuf> {
+            let mut value = json!({
+                "kind": "github", "app_id": "1", "private_key_path": "/key.pem",
+                "installation_id": 42, "targets": ["owner/repo"],
+            });
+            if let Some(base) = base {
+                value["base_url"] = json!(base);
+            }
+            let path = dir.path().join(name);
+            std::fs::write(&path, value.to_string())?;
+            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+            Ok(path)
+        };
+        for good in [None, Some("https://ghe.example.com/api/v3"), Some("http://127.0.0.1:9")] {
+            let path = write("good.json", good)?;
+            TrustRoot::load(&path).map_err(|e| anyhow::anyhow!("{good:?} must load: {e}"))?;
+        }
+        for bad in [
+            "http://ghe.example.com/api/v3",
+            "https://u:hunter2@ghe.example.com",
+            "https://ghe.example.com#x",
+        ] {
+            let path = write("bad.json", Some(bad))?;
+            let err = TrustRoot::load(&path).expect_err(bad).to_string();
+            assert!(
+                err.contains("base_url"),
+                "{bad}: the message must name the field: {err}"
+            );
+            assert!(err.contains(path.to_str().unwrap_or("")), "{bad}: and the file: {err}");
+            assert!(!err.contains("hunter2"), "{bad}: and never the value: {err}");
+        }
+        Ok(())
+    }
 }
