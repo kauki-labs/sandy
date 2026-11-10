@@ -125,7 +125,12 @@ fn qemu_pids() -> anyhow::Result<BTreeSet<u32>> {
 fn run_dirs_under(base: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let staging = base.join(sandy_fsutil::STAGING_DIR_NAME);
     match std::fs::read_dir(&staging) {
-        Ok(entries) => Ok(entries.flatten().map(|e| e.path()).collect()),
+        Ok(entries) => entries
+            .map(|e| {
+                e.map(|e| e.path())
+                    .with_context(|| format!("read an entry of {}", staging.display()))
+            })
+            .collect(),
         // No base at all is a clean state; an unreadable one is not "no strays".
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(e).with_context(|| format!("read {}", staging.display())),
