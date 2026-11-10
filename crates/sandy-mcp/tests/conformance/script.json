@@ -1,11 +1,13 @@
 {
   "name": "primary-t3 stand-in",
-  "description": "One fixed script run against any sandy-mcp: the fake broker (tier-2) and, later, a real broker (tier-3). Pointers are RFC 6901. A string equal to `$name` is a captured value or a fixture. A target overrides `fixtures` (manifest, encoding, profiles) and reads no broker-internal state. `cleanup` steps run after any failure, best effort.",
+  "description": "One fixed script run against any sandy-mcp: the fake broker (tier-2) and, later, a real broker (tier-3). Pointers are RFC 6901. A string equal to `$name` is a captured value or a fixture. A target overrides `fixtures` (manifest, encoding, profiles, Ready timing) and reads no broker-internal state. `cleanup` steps run after any failure, best effort.",
   "fixtures": {
     "manifest": "AA==",
     "manifest_encoding": "conformance.v1",
     "profile": "harness",
-    "other_profile": "other"
+    "other_profile": "other",
+    "ready_timeout_ms": 20000,
+    "ready_poll_ms": 50
   },
   "steps": [
     { "tool": "list", "args": {}, "expect": { "present": ["/jobs"] } },
@@ -83,8 +85,8 @@
       "tool": "get_environment",
       "args": { "environment_id": "$env" },
       "until": { "/state": "ready" },
-      "timeout_ms": 20000,
-      "poll_interval_ms": 50,
+      "timeout_ms": "$ready_timeout_ms",
+      "poll_interval_ms": "$ready_poll_ms",
       "expect": { "present": ["/connection/url"] }
     },
     {

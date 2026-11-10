@@ -14,6 +14,11 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+# The live_broker tier-3 gate (#585): real sandyd, sandy-broker and a qemu guest. Off by default so CI and
+# `nix flake check` never boot a VM; enable on the Linux/KVM live host.
+live = []
+
 [dependencies]
 clap.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
@@ -22,6 +27,10 @@ tokio = { workspace = true, features = ["io-std", "io-util", "rt", "macros"] }
 
 [dev-dependencies]
 anyhow.workspace = true
+# The live gate resolves the staging base by the backend's own constant. No control-proto edge (layering.rs).
+sandy-fsutil.workspace = true
+# The live gate writes the broker's clients file, which holds the SHA-256 of the bearer token.
+sha2.workspace = true
 tempfile.workspace = true
 tiny_http.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
