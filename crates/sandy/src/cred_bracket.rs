@@ -744,4 +744,65 @@ mod tests {
         );
         Ok(())
     }
+
+    /// #720: a removal that fails after a successful revoke is retried by the next
+    /// `revoke()`, without a second provider call.
+    #[test]
+    fn a_failed_file_removal_is_retried_by_the_next_revoke() -> anyhow::Result<()> {
+        let (_tmp, target) = private_dir()?;
+        let dir = target.dir.clone();
+        let path = dir.join("GITHUB_TOKEN");
+        let provider = Arc::new(Scripted::new(vec!["tok"], Duration::from_secs(600)));
+        let bracket = CredentialBracket::mint_and_stage(
+            provider.clone(),
+            &Scope::default(),
+            target,
+            600,
+            Duration::from_secs(5),
+        )?;
+        // A dir without write permission makes the unlink fail.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).context("0500")?;
+        let err = bracket.revoke().expect_err("the unlink is refused");
+        assert!(matches!(err, CredError::Stage(_)), "{err:?}");
+        assert!(path.exists(), "the file is still staged after the failed removal");
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).context("0700")?;
+        bracket.revoke().context("the retry removes the file")?;
+        assert!(!path.exists(), "the retry removed the staged file");
+        assert_eq!(
+            provider.revoked(),
+            vec!["h0"],
+            "the retry makes no second provider call"
+        );
+        Ok(())
+    }
+
+    /// #720: cleanup is bound to the directory the token was staged in. A `cred-*`
+    /// dir renamed away and replaced at the same path loses nothing from the
+    /// replacement, and the original's token is still removed.
+    #[test]
+    fn cleanup_follows_the_staged_dir_not_the_path_swapped_in_after() -> anyhow::Result<()> {
+        let (tmp, target) = private_dir()?;
+        let dir = target.dir.clone();
+        let provider = Arc::new(Scripted::new(vec!["tok"], Duration::from_secs(600)));
+        let bracket =
+            CredentialBracket::mint_and_stage(provider, &Scope::default(), target, 600, Duration::from_secs(5))?;
+        let moved = tmp.path().join("cred-moved");
+        std::fs::rename(&dir, &moved).context("move the staged dir aside")?;
+        std::fs::create_dir(&dir).context("substitute")?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::write(dir.join("GITHUB_TOKEN"), "not-ours")?;
+
+        bracket.revoke()?;
+        assert_eq!(
+            std::fs::read_to_string(dir.join("GITHUB_TOKEN"))?,
+            "not-ours",
+            "the replacement's file is untouched"
+        );
+        assert!(
+            !moved.join("GITHUB_TOKEN").exists(),
+            "the staged token is removed through the dir it was written to"
+        );
+        Ok(())
+    }
 }
