@@ -5,6 +5,7 @@
 #![allow(dead_code, reason = "shared by several test binaries; each uses a subset")]
 
 pub mod mcp_client;
+pub mod procs;
 
 use std::{
     collections::HashMap,
