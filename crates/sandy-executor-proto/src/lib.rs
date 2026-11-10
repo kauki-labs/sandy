@@ -410,4 +410,100 @@ mod tests {
         assert!(matches!(err, RemoteLinkPrefixError::InvalidUtf8(_)));
         Ok(())
     }
+
+    /// #482, sandyd.md §22: a host-executor that never declared `transfer`
+    /// (every one deployed before this field) must decode as `false`, never
+    /// as a host that accepts streamed data.
+    #[test]
+    fn a_capabilities_message_without_transfer_decodes_as_no_transfer() {
+        assert!(!Capabilities::default().transfer);
+        let old_wire = Capabilities {
+            shares_submitter_filesystem: true,
+            ..Capabilities::default()
+        }
+        .encode_to_vec();
+        let decoded = Capabilities::decode(old_wire.as_slice()).expect("decode");
+        assert!(!decoded.transfer);
+    }
+
+    #[tokio::test]
+    async fn a_register_declaring_transfer_round_trips_through_the_frame_codec() -> anyhow::Result<()> {
+        let (mut write_side, mut read_side) = tokio::io::duplex(4096);
+        let message = HostExecutorMessage {
+            op: Some(host_executor_message::Op::Register(Register {
+                host_id: "remote-host".to_owned(),
+                capabilities: Some(Capabilities {
+                    transfer: true,
+                    ..Capabilities::default()
+                }),
+            })),
+        };
+        write_frame(&mut write_side, &message).await?;
+        let decoded: HostExecutorMessage = read_frame(&mut read_side)
+            .await?
+            .context("expected a frame, got a clean close")?;
+        assert_eq!(decoded, message);
+        Ok(())
+    }
+
+    /// Every data-link message survives the frame codec with its fields, and
+    /// the five variants stay distinct on the wire.
+    #[tokio::test]
+    async fn every_data_link_message_round_trips_through_the_frame_codec() -> anyhow::Result<()> {
+        let messages = [
+            data_link_message::Op::InputChunk(InputChunk {
+                name: "data.csv".to_owned(),
+                offset: 262_144,
+                bytes: vec![1, 2, 3],
+            }),
+            data_link_message::Op::InputEnd(InputEnd {}),
+            data_link_message::Op::OutputChunk(OutputChunk {
+                name: "out/result.bin".to_owned(),
+                bytes: vec![4, 5],
+            }),
+            data_link_message::Op::OutputEnd(OutputEnd {}),
+            data_link_message::Op::TransferError(TransferError {
+                reason: "input exceeds the transfer cap".to_owned(),
+            }),
+        ];
+        for op in messages {
+            let (mut write_side, mut read_side) = tokio::io::duplex(4096);
+            let message = DataLinkMessage { op: Some(op) };
+            write_frame(&mut write_side, &message).await?;
+            let decoded: DataLinkMessage = read_frame(&mut read_side)
+                .await?
+                .context("expected a frame, got a clean close")?;
+            assert_eq!(decoded, message);
+        }
+        Ok(())
+    }
+
+    /// §22: a chunk of exactly `MAX_CHUNK_BYTES` with a maximal-length name and
+    /// offset must still fit one frame, because a chunk is never split.
+    #[tokio::test]
+    async fn a_maximal_input_chunk_fits_one_frame() -> anyhow::Result<()> {
+        assert_eq!(MAX_CHUNK_BYTES, 256 * 1024);
+        let message = DataLinkMessage {
+            op: Some(data_link_message::Op::InputChunk(InputChunk {
+                name: "n".repeat(MAX_CHUNK_NAME_BYTES),
+                offset: u64::MAX,
+                bytes: vec![0xAB; MAX_CHUNK_BYTES],
+            })),
+        };
+        let (mut write_side, mut read_side) = tokio::io::duplex(2 * MAX_CHUNK_BYTES);
+        write_frame(&mut write_side, &message).await?;
+        let decoded: DataLinkMessage = read_frame(&mut read_side)
+            .await?
+            .context("expected a frame, got a clean close")?;
+        assert_eq!(decoded, message);
+        Ok(())
+    }
+
+    /// A message with no `op` set is not a valid data-link message: the codec
+    /// decodes it, so the consumer must be able to tell it apart from a real one.
+    #[test]
+    fn an_empty_data_link_message_carries_no_op() {
+        let decoded = DataLinkMessage::decode([].as_slice()).expect("decode");
+        assert!(decoded.op.is_none());
+    }
 }
