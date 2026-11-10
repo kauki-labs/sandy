@@ -448,15 +448,16 @@ mod tests {
     /// (every one deployed before this field) must decode as `false`, never
     /// as a host that accepts streamed data.
     #[test]
-    fn a_capabilities_message_without_transfer_decodes_as_no_transfer() {
+    fn a_capabilities_message_without_transfer_decodes_as_no_transfer() -> anyhow::Result<()> {
         assert!(!Capabilities::default().transfer);
         let old_wire = Capabilities {
             shares_submitter_filesystem: true,
             ..Capabilities::default()
         }
         .encode_to_vec();
-        let decoded = Capabilities::decode(old_wire.as_slice()).expect("decode");
+        let decoded = Capabilities::decode(old_wire.as_slice()).context("decode")?;
         assert!(!decoded.transfer);
+        Ok(())
     }
 
     #[tokio::test]
@@ -552,7 +553,18 @@ mod tests {
                 bytes: marker.to_vec(),
             }
         );
-        for rendered in [input, output] {
+        // Logs print the enclosing message, so cover that path too.
+        let wrapped = format!(
+            "{:?}",
+            DataLinkMessage {
+                op: Some(data_link_message::Op::InputChunk(InputChunk {
+                    name: "a".to_owned(),
+                    offset: 0,
+                    bytes: marker.to_vec(),
+                })),
+            }
+        );
+        for rendered in [input, output, wrapped] {
             assert!(!rendered.contains("job-file-content-marker"), "text leaked: {rendered}");
             assert!(
                 !rendered.contains(&format!("{:?}", marker.to_vec())),
@@ -565,8 +577,9 @@ mod tests {
     /// A message with no `op` set is not a valid data-link message: the codec
     /// decodes it, so the consumer must be able to tell it apart from a real one.
     #[test]
-    fn an_empty_data_link_message_carries_no_op() {
-        let decoded = DataLinkMessage::decode([].as_slice()).expect("decode");
+    fn an_empty_data_link_message_carries_no_op() -> anyhow::Result<()> {
+        let decoded = DataLinkMessage::decode([].as_slice()).context("decode")?;
         assert!(decoded.op.is_none());
+        Ok(())
     }
 }

@@ -1947,6 +1947,10 @@ that prints a length and never file content. The orchestrator ignores
 until the data link and the host-executor's receive path exist: placing on a
 `transfer` host earlier would send inputs to a host that cannot take them.
 The host-executor declares no `transfer` yet, for the same reason.
+Left for later slices: the `Dispatch` data-link token, and the `mesh_accept`
+demux. `encode_remote_link_prefix` has no version or tag byte, so a tag byte
+would break host-executors that already dial the agent link. Use a second
+token namespace for the data link instead.
 
 ## 23. `Cancel` is gated per job by the job's attach token (#540, audit #391)
 
