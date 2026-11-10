@@ -70,7 +70,9 @@ pub fn run_dirs_left(tmp: &Path) -> Result<Vec<PathBuf>> {
         .collect()
 }
 
-/// Every file under `root` that holds `needle`, except `skip`.
+/// Every path under `root` that holds `needle`: a regular file whose contents hold it, and any file or directory
+/// whose name holds it. `skip` is exempt from both checks. The name check is on one path component at a time, so a
+/// needle that contains `/` never matches a name; a token canary has none.
 ///
 /// The scan fails closed: a clean result means every entry was read. Any path that cannot be stat-ed, listed or
 /// read is an error, and so is a symlink, fifo or device (the scan cannot read what it holds). A Unix socket is
@@ -102,11 +104,12 @@ pub fn files_holding(root: &Path, needle: &str, skip: &Path) -> Result<Vec<PathB
             for entry in entries {
                 let entry = entry.with_context(|| format!("read an entry of {}", p.display()))?;
                 // A name can carry the canary too (a file named after it, a path in a log line).
-                if entry
-                    .file_name()
-                    .as_bytes()
-                    .windows(needle.len())
-                    .any(|w| w == needle.as_bytes())
+                if entry.path() != skip
+                    && entry
+                        .file_name()
+                        .as_bytes()
+                        .windows(needle.len())
+                        .any(|w| w == needle.as_bytes())
                 {
                     hits.push(entry.path());
                 }
@@ -136,8 +139,9 @@ pub fn files_holding(root: &Path, needle: &str, skip: &Path) -> Result<Vec<PathB
 /// are kept, so a match that straddles a chunk boundary is found.
 ///
 /// The entry was a regular file when the scan listed it, and it can be swapped for a fifo or a device before this
-/// open. A plain open of a fifo with no writer blocks forever, so the open is non-blocking and refuses a symlink,
-/// and the type is checked on the open descriptor: anything but a regular file is an error.
+/// open. A plain open of a fifo with no writer blocks forever, so the open is non-blocking, refuses a symlink and
+/// does not take a terminal for its controlling one, and the type is checked on the open descriptor: anything but
+/// a regular file is an error.
 ///
 /// # Errors
 /// The file cannot be opened or read, or is not a regular file.
@@ -147,11 +151,12 @@ pub fn file_holds(path: &Path, needle: &[u8]) -> std::io::Result<bool> {
     if needle.is_empty() {
         return Err(std::io::Error::other("an empty needle is in every file"));
     }
-    let flags = (rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::NOFOLLOW).bits();
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(i32::try_from(flags).unwrap_or(0))
-        .open(path)?;
+    // Not `unwrap_or(0)`: dropping the flags would bring the fifo hang back without a sound.
+    let flags = i32::try_from(
+        (rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NOCTTY).bits(),
+    )
+    .map_err(std::io::Error::other)?;
+    let mut file = std::fs::OpenOptions::new().read(true).custom_flags(flags).open(path)?;
     if !file.metadata()?.is_file() {
         return Err(std::io::Error::other(
             "not a regular file: it changed after the scan listed it",

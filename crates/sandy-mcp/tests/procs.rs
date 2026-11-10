@@ -382,3 +382,60 @@ fn a_file_that_holds_the_canary_in_name_and_contents_is_reported_once() -> Resul
     assert_eq!(files_holding(root.path(), CANARY, &no_skip())?, vec![path]);
     Ok(())
 }
+
+/// Run `file_holds` on `path` with a bound, so a missing type check or flag shows up as a failure and not a hang.
+fn file_holds_bounded(path: std::path::PathBuf, needle: &'static [u8]) -> Result<std::io::Result<bool>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(file_holds(&path, needle));
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(10))
+        .context("file_holds did not return within 10 s")
+}
+
+/// A symlink is refused at the open (`ELOOP`), whether it points at a file or at nothing, and the error is not
+/// `NotFound`, which the scan skips as a file that vanished.
+#[test]
+fn a_symlink_is_an_error_that_the_scan_does_not_mistake_for_a_vanished_file() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let target = root.path().join("target");
+    std::fs::write(&target, CANARY)?;
+    let live = root.path().join("live-link");
+    std::os::unix::fs::symlink(&target, &live)?;
+    let dangling = root.path().join("dangling-link");
+    std::os::unix::fs::symlink(root.path().join("nowhere"), &dangling)?;
+    for link in [live, dangling] {
+        let err = file_holds_bounded(link.clone(), CANARY.as_bytes())?.expect_err("a symlink must be refused");
+        assert_ne!(err.kind(), std::io::ErrorKind::NotFound, "{}: {err}", link.display());
+    }
+    Ok(())
+}
+
+/// The type is checked on the open descriptor before any read: a device that never ends must be refused at once,
+/// not scanned for ever.
+#[test]
+fn a_device_is_refused_before_any_read() -> Result<()> {
+    let err = file_holds_bounded(std::path::PathBuf::from("/dev/zero"), CANARY.as_bytes())?
+        .expect_err("a device is not a regular file");
+    assert!(err.to_string().contains("regular file"), "{err}");
+    Ok(())
+}
+
+#[test]
+fn file_holds_refuses_an_empty_needle_itself() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("log");
+    std::fs::write(&path, "anything")?;
+    assert!(file_holds(&path, b"").is_err());
+    Ok(())
+}
+
+/// The skipped path is exempt from the name check as well as the content check.
+#[test]
+fn the_skipped_path_is_exempt_from_the_name_check_too() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let skipped = root.path().join(format!("{CANARY}.cred"));
+    std::fs::write(&skipped, "clean")?;
+    assert!(files_holding(root.path(), CANARY, &skipped)?.is_empty());
+    Ok(())
+}
