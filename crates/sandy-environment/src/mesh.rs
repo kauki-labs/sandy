@@ -1730,6 +1730,147 @@ mod tests {
         Ok(())
     }
 
+    /// A sink whose writes park until [`Parked::release`], counting every sink
+    /// call and the most threads inside the sink at once (#713).
+    #[derive(Clone)]
+    struct Parked {
+        world: World,
+        released: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        entered: Arc<std::sync::atomic::AtomicUsize>,
+        inside: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Parked {
+        fn new() -> Self {
+            Self {
+                world: World::default(),
+                released: Arc::default(),
+                entered: Arc::default(),
+                inside: Arc::default(),
+                peak: Arc::default(),
+            }
+        }
+
+        fn release(&self) {
+            *self.released.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
+            self.released.1.notify_all();
+        }
+
+        fn entered(&self) -> usize {
+            self.entered.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn peak(&self) -> usize {
+            self.peak.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// Run `op` as one sink call.
+        fn call<T>(&self, park: bool, op: impl FnOnce(&World) -> T) -> T {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.entered.fetch_add(1, SeqCst);
+            let now = self.inside.fetch_add(1, SeqCst) + 1;
+            self.peak.fetch_max(now, SeqCst);
+            if park {
+                let mut released = self.released.0.lock().unwrap_or_else(PoisonError::into_inner);
+                while !*released {
+                    released = self.released.1.wait(released).unwrap_or_else(PoisonError::into_inner);
+                }
+            }
+            let out = op(&self.world);
+            self.inside.fetch_sub(1, SeqCst);
+            out
+        }
+    }
+
+    impl FileSink for Parked {
+        fn ensure_dir(&self) -> Result<(), SeamError> {
+            self.call(false, World::ensure_dir)
+        }
+
+        fn clear_dir(&self) -> Result<(), SeamError> {
+            self.call(false, World::clear_dir)
+        }
+
+        fn write_file(&self, name: &str, bytes: &[u8]) -> Result<(), SeamError> {
+            self.call(true, |w| w.write_file(name, bytes))
+        }
+
+        fn remove_file(&self, name: &str) -> Result<(), SeamError> {
+            self.call(false, |w| w.remove_file(name))
+        }
+
+        fn remove_dir_all(&self) -> Result<(), SeamError> {
+            self.call(false, World::remove_dir_all)
+        }
+    }
+
+    /// #713: a timed-out operation still runs on its blocking thread. A later
+    /// operation on the same directory must not queue behind it: it answers
+    /// `Busy` at once and never reaches the sink. After the straggler ends, a
+    /// retry delivers and nothing from the old operation lands after it.
+    #[tokio::test]
+    async fn a_second_operation_is_busy_while_a_timed_out_one_still_runs() -> Result<()> {
+        let sink = Parked::new();
+        let dir = SecretsDir::new(sink.clone());
+        let first: [(&str, &[u8]); 2] = [(KEY_FILE, b"old"), (HOSTNAME_FILE, b"n")];
+        let Err(e) = bounded(SHORT, dir.deliver(&first)).await else {
+            bail!("the parked delivery must time out");
+        };
+        assert!(e.to_string().contains("timed out"), "{e}");
+        let before = sink.entered();
+
+        let Err(busy) = dir.prepare().await else {
+            bail!("prepare must be refused while an operation is in flight");
+        };
+        assert!(busy.is_busy(), "{busy}");
+        let Err(busy) = dir.remove_secrets().await else {
+            bail!("removal must be refused while an operation is in flight");
+        };
+        assert!(busy.is_busy(), "{busy}");
+        assert_eq!(sink.entered(), before, "a refused operation never reaches the sink");
+
+        sink.release();
+        let second: [(&str, &[u8]); 2] = [(KEY_FILE, b"new"), (HOSTNAME_FILE, b"n")];
+        let mut delivered = false;
+        for _ in 0..200 {
+            match dir.deliver(&second).await {
+                Ok(()) => {
+                    delivered = true;
+                    break;
+                }
+                Err(e) if e.is_busy() => tokio::time::sleep(Duration::from_millis(10)).await,
+                Err(e) => bail!("retry failed: {e}"),
+            }
+        }
+        assert!(delivered, "the retry must run once the straggler is done");
+        let files = sink.world.st().files.clone();
+        assert_eq!(files.get(KEY_FILE).map(Vec::as_slice), Some(b"new".as_slice()));
+        assert!(files.contains_key(READY_FILE), "the retry's marker must stand");
+        Ok(())
+    }
+
+    /// #713 adversarial: a retry loop against a wedged sink parks no thread per
+    /// timeout. Ten timed-out attempts leave one operation in the sink, and once
+    /// the sink unblocks only that one operation's calls ever ran.
+    #[tokio::test]
+    async fn ten_timeouts_in_a_row_run_one_operation() -> Result<()> {
+        let sink = Parked::new();
+        let dir = SecretsDir::new(sink.clone());
+        let files: [(&str, &[u8]); 2] = [(KEY_FILE, b"k"), (HOSTNAME_FILE, b"n")];
+        for attempt in 0..10 {
+            let Err(_) = bounded(SHORT, dir.deliver(&files)).await else {
+                bail!("attempt {attempt} must not succeed while the sink is parked");
+            };
+        }
+        sink.release();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // One deliver: remove the marker, write two files, write the marker.
+        assert_eq!(sink.entered(), 4, "only the first operation may reach the sink");
+        assert_eq!(sink.peak(), 1, "at most one thread inside the sink at once");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_timed_out_delivery_finishes_before_a_later_removal_starts() -> Result<()> {
         let w = World::default();
