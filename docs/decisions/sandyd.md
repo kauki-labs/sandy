@@ -2488,3 +2488,43 @@ change, which also fixes the queue-time loss).
 
 **Set aside.** The credential inside the manifest bytes (three encodings to grow, and P2). Carrying the
 token to a remote host before #495 exists.
+
+## 38. An environment's forge credential: minted before the guest boots, renewed in place, revoked when it stops (#706)
+
+**Context.** An identity profile (#704) names a trust root and a scope. A service in an environment needs a token
+for that scope, and the token must not outlive the environment. The job bracket (decision 37) already mints, renews
+and revokes one staged token; an environment lives for hours, so it also needs renewal.
+
+**Decision.**
+
+- When an environment enters `Provisioning` (create or resume) and the daemon has a VM backend, the driver mints a
+  token for the profile's scope before it launches the guest. A mint failure fails the environment with step
+  `credential`, and no guest boots. The reason carries neither the token nor the profile name.
+- The token is a `0600` `GITHUB_TOKEN` file in a `0700` directory `env-cred-<environment id>` under the sandy staging
+  base. `EnvironmentSpec.secret_dir` hands the directory to the backend, which mounts it read-only as the guest's
+  secret share (`RunSpec.secret_dir`, #49). The process backend has no secret channel and refuses a spec that carries
+  one. The directory is not named `cred-*`: `sandy gc` sweeps those by age, and an environment outlives a token.
+- While the environment is `Ready`, each driver pass renews the token when at most five minutes remain. The new
+  token is staged over the file first, then the old lease is revoked. A failed renewal leaves the environment
+  running and sets `credential_degraded` on the row until a later renewal works.
+- Stop, delete, failure and an orphaned box each revoke the lease and remove the file and directory. A failed revoke
+  is recorded on the row (`credential_error`, never a token) and returned by `GetEnvironment`; it never blocks the
+  stop. A resume mints a fresh token and clears the mark.
+- The service must read the token from the file when it uses it. A value copied at start goes stale at the first
+  renewal.
+- The daemon names the share from the environment id. After a restart the driver finds a `Ready` environment that it
+  holds no lease for, and mints a new token into the same directory, so the mount of the running guest stays valid.
+
+**Consequences and gaps.**
+
+- A daemon crash or restart loses the lease handle, and a GitHub installation token can only be revoked by the token
+  itself. The old token then lives up to its TTL (`MAX_TTL_SECS`, 50 minutes) after the crash. Persisting the token
+  to revoke it would put a secret on disk. This is the one gap in "killed when the environment ends".
+- A host crash leaves the staged directory behind. The next release of that environment removes it.
+- Only `GITHUB_TOKEN` is staged. Operator-store secrets (#705) and the `service_secrets` filter are not part of this
+  slice.
+- The broker's response and the OpenAPI contract do not carry the two new fields yet.
+- The renewal runs in the driver pass, so a hung forge delays that pass by up to the 45 s call bound per environment.
+
+**Set aside.** Persisting the token or a revoke handle for restart revoke. A `cred-*` directory name. Renewal on a
+separate task with its own lock.

@@ -45,6 +45,13 @@ pub trait CredentialResolver: Send + Sync {
     /// A human-readable reason: an unknown trust root, a bad capability, or an
     /// adapter that cannot be built. It never carries a token: none exists yet.
     fn resolve(&self, name: &str, capabilities: &[String]) -> Result<(SharedProvider, Scope), String>;
+
+    /// The provider for trust root `name` alone: the caller supplies the scope (an environment's identity profile,
+    /// #706).
+    ///
+    /// # Errors
+    /// As [`CredentialResolver::resolve`].
+    fn provider(&self, name: &str) -> Result<SharedProvider, String>;
 }
 
 /// The production resolver: the trust roots `sandy cred github register` wrote
@@ -59,6 +66,12 @@ impl CredentialResolver for TrustRootResolver {
         // The adapter's own deadline matches the daemon's bound, so a call the
         // bracket abandons does not keep a blocking-pool thread for 1500 s.
         Ok((Arc::new(adapter.with_call_deadline(DAEMON_CALL_TIMEOUT)), scope))
+    }
+
+    fn provider(&self, name: &str) -> Result<SharedProvider, String> {
+        let dir = sandy::trust_roots_dir().map_err(|e| format!("trust-roots dir: {e}"))?;
+        let (adapter, _targets) = sandy::resolve_adapter(&dir, name)?;
+        Ok(Arc::new(adapter.with_call_deadline(DAEMON_CALL_TIMEOUT)))
     }
 }
 
@@ -407,6 +420,11 @@ mod tests {
         fn resolve(&self, _name: &str, _capabilities: &[String]) -> Result<(SharedProvider, Scope), String> {
             let provider: SharedProvider = self.0.clone();
             Ok((provider, Scope::default()))
+        }
+
+        fn provider(&self, _name: &str) -> Result<SharedProvider, String> {
+            let provider: SharedProvider = self.0.clone();
+            Ok(provider)
         }
     }
 

@@ -85,6 +85,7 @@ fn spec() -> EnvironmentSpec {
         size: None,
         env: vec![],
         service_port: None,
+        secret_dir: None,
     }
 }
 

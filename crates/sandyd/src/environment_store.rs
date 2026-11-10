@@ -145,6 +145,12 @@ pub struct EnvironmentRecord {
     /// Whether the create came from a `TRUSTED` submitter. A row from before this
     /// column, or from a create that did not say, is not trusted.
     pub submitter_trusted: bool,
+    /// Whether the last renewal of the environment's forge credential failed (#706). The service keeps running on
+    /// the token it holds, which then expires. Cleared by the next successful mint or renewal.
+    pub credential_degraded: bool,
+    /// Why the credential could not be revoked at the last stop, delete or failure (#706). Never a token. Cleared by
+    /// the next successful mint.
+    pub credential_error: Option<String>,
     /// Unix seconds at creation.
     pub created_at: i64,
     /// Unix seconds at the last state change.
@@ -268,12 +274,15 @@ struct RawRow {
     launched_at: Option<i64>,
     last_activity_at: Option<i64>,
     submitter_trusted: Option<i64>,
+    credential_degraded: Option<i64>,
+    credential_error: Option<String>,
     created_at: i64,
     updated_at: i64,
 }
 
 const COLUMNS: &str = "environment_id, request_id, state, spec, spec_encoding, failure_step, failure_reason, \
-                       created_at, updated_at, endpoint, launched_at, last_activity_at, submitter_trusted";
+                       created_at, updated_at, endpoint, launched_at, last_activity_at, submitter_trusted, \
+                       credential_degraded, credential_error";
 
 impl RawRow {
     fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
@@ -291,6 +300,8 @@ impl RawRow {
             launched_at: row.get(10)?,
             last_activity_at: row.get(11)?,
             submitter_trusted: row.get(12)?,
+            credential_degraded: row.get(13)?,
+            credential_error: row.get(14)?,
         })
     }
 
@@ -314,6 +325,8 @@ impl RawRow {
             launched_at: self.launched_at,
             last_activity_at: self.last_activity_at,
             submitter_trusted: self.submitter_trusted == Some(1),
+            credential_degraded: self.credential_degraded == Some(1),
+            credential_error: self.credential_error,
             created_at: self.created_at,
             updated_at: self.updated_at,
         })
@@ -373,7 +386,9 @@ impl EnvironmentStore {
                 endpoint        TEXT,
                 launched_at     INTEGER,
                 last_activity_at INTEGER,
-                submitter_trusted INTEGER
+                submitter_trusted INTEGER,
+                credential_degraded INTEGER,
+                credential_error TEXT
             )",
             (),
         )?;
@@ -383,6 +398,8 @@ impl EnvironmentStore {
             ("launched_at", "INTEGER"),
             ("last_activity_at", "INTEGER"),
             ("submitter_trusted", "INTEGER"),
+            ("credential_degraded", "INTEGER"),
+            ("credential_error", "TEXT"),
         ] {
             let present: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM pragma_table_info('environments') WHERE name = ?1)",
@@ -779,6 +796,25 @@ impl EnvironmentStore {
             "UPDATE environments SET launched_at = ?2
               WHERE environment_id = ?1 AND state = 'provisioning' AND launched_at IS NULL",
             (environment_id, now),
+        )?;
+        Ok(rows == 1)
+    }
+
+    /// Record the state of `environment_id`'s forge credential (#706): whether its last renewal failed, and why its
+    /// last revoke failed. `error` is a reason, never a token. Returns whether a row was written.
+    ///
+    /// # Errors
+    /// As [`EnvironmentStore::create`].
+    pub fn set_credential_state(
+        &self,
+        environment_id: &str,
+        degraded: bool,
+        error: Option<&str>,
+    ) -> Result<bool, EnvironmentStoreError> {
+        let conn = self.lock();
+        let rows = conn.execute(
+            "UPDATE environments SET credential_degraded = ?2, credential_error = ?3 WHERE environment_id = ?1",
+            (environment_id, i64::from(degraded), error),
         )?;
         Ok(rows == 1)
     }
@@ -1218,6 +1254,25 @@ mod tests {
         drop(s);
         // Opening the migrated file again is a no-op, not a duplicate-column error.
         assert!(EnvironmentStore::open(&path).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn the_credential_state_is_recorded_read_back_and_defaults_to_healthy() -> Result<()> {
+        let s = store()?;
+        created(&s)?;
+        let fresh = s.get("env-1")?.context("env-1")?;
+        assert_eq!((fresh.credential_degraded, fresh.credential_error), (false, None));
+        assert!(s.set_credential_state("env-1", true, Some("the forge refused the revoke"))?);
+        let rec = s.get("env-1")?.context("env-1")?;
+        assert_eq!(
+            (rec.credential_degraded, rec.credential_error.as_deref()),
+            (true, Some("the forge refused the revoke"))
+        );
+        assert!(s.set_credential_state("env-1", false, None)?);
+        let rec = s.get("env-1")?.context("env-1")?;
+        assert_eq!((rec.credential_degraded, rec.credential_error), (false, None));
+        assert!(!s.set_credential_state("no-such-env", true, None)?, "no row, no write");
         Ok(())
     }
 

@@ -364,6 +364,12 @@ message EnvironmentResponse {
   EnvironmentFailure failure = 4;
   EnvironmentConnection connection = 5;
   EnvironmentSpec spec = 6;
+  // The last renewal of the environment's forge credential failed (#706): the service runs on a token that
+  // will expire. Cleared by the next successful renewal.
+  bool credential_degraded = 7;
+  // Why the credential could not be revoked at the last stop, delete or failure (#706). Never a token. Empty
+  // when the last revoke worked or none ran.
+  string credential_revoke_error = 8;
 }
 
 message ListEnvironmentsResponse {

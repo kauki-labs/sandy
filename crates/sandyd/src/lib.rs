@@ -19,6 +19,7 @@ pub mod credential;
 pub mod dispatch;
 pub mod environment;
 pub mod environment_backend;
+pub mod environment_credential;
 pub mod environment_driver;
 pub mod environment_store;
 pub mod environment_vm;

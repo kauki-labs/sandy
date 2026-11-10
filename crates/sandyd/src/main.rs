@@ -978,6 +978,9 @@ fn start_environment_driver(environments: &Arc<EnvironmentStore>) -> Option<toki
             std::process::exit(1);
         }
     };
+    // A VM backend has a secret channel, so its environments get a minted forge credential (#706). The process backend
+    // has none and refuses a spec that carries one, so it launches without.
+    let vm_backend = matches!(config.backend, BackendSettings::VmQemu(_) | BackendSettings::VmVfkit(_));
     let backend: Arc<dyn sandy_api::environment::EnvironmentBackend + Send + Sync> = match config.backend {
         BackendSettings::Process(process) => {
             tracing::warn!(
@@ -997,7 +1000,22 @@ fn start_environment_driver(environments: &Arc<EnvironmentStore>) -> Option<toki
         BackendSettings::VmQemu(vm) => vm_environment_backend(&vm),
         BackendSettings::VmVfkit(vm) => vfkit_environment_backend(&vm),
     };
-    let driver = Arc::new(EnvironmentDriver::new(Arc::clone(environments), backend, config.driver));
+    let mut driver = EnvironmentDriver::new(Arc::clone(environments), backend, config.driver);
+    if vm_backend {
+        // `env-cred-*` dirs, not `cred-*`: `sandy gc` sweeps those by age and an environment outlives a token.
+        let base = match sandy_fsutil::ensure_sandy_staging_base() {
+            Ok(base) => base,
+            Err(e) => {
+                tracing::error!(error = %e, "could not open the credential staging base");
+                std::process::exit(1);
+            }
+        };
+        driver = driver.with_credentials(Arc::new(sandyd::environment_credential::EnvironmentCredentials::new(
+            Arc::new(TrustRootResolver),
+            base,
+        )));
+    }
+    let driver = Arc::new(driver);
     Some(tokio::spawn(driver.run(environment_backend::DRIVER_INTERVAL)))
 }
 

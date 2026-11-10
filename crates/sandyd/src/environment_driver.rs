@@ -26,8 +26,9 @@ use sandy_api::{
 };
 use sandy_control_proto::v1::EnvironmentSpec as WireSpec;
 
-use crate::environment_store::{
-    EnvTransition, EnvironmentRecord, EnvironmentState, EnvironmentStore, EnvironmentStoreError,
+use crate::{
+    environment_credential::EnvironmentCredentials,
+    environment_store::{EnvTransition, EnvironmentRecord, EnvironmentState, EnvironmentStore, EnvironmentStoreError},
 };
 
 /// What the driver launches and how long it waits.
@@ -88,6 +89,8 @@ pub struct EnvironmentDriver {
     store: Arc<EnvironmentStore>,
     backend: Arc<dyn EnvironmentBackend + Send + Sync>,
     config: DriverConfig,
+    /// The per-environment forge credentials (#706). `None` launches every environment without one.
+    credentials: Option<Arc<EnvironmentCredentials>>,
 }
 
 impl EnvironmentDriver {
@@ -97,7 +100,20 @@ impl EnvironmentDriver {
         backend: Arc<dyn EnvironmentBackend + Send + Sync>,
         config: DriverConfig,
     ) -> Self {
-        Self { store, backend, config }
+        Self {
+            store,
+            backend,
+            config,
+            credentials: None,
+        }
+    }
+
+    /// Mint a forge credential for every environment before its guest boots, renew it while the environment is
+    /// `Ready`, and revoke it when the environment stops, is deleted or fails (#706).
+    #[must_use]
+    pub fn with_credentials(mut self, credentials: Arc<EnvironmentCredentials>) -> Self {
+        self.credentials = Some(credentials);
+        self
     }
 
     /// One converge pass at unix time `now`. Blocks on the store and backend.
@@ -137,6 +153,7 @@ impl EnvironmentDriver {
             .collect();
         for id in orphans {
             self.kill(&id, &mut running, &mut report);
+            self.release_credential(&id);
         }
         Ok(report)
     }
@@ -155,6 +172,7 @@ impl EnvironmentDriver {
                 if running.contains(&row.environment_id) {
                     self.kill(&row.environment_id, running, report);
                 }
+                self.release_credential(&row.environment_id);
                 Ok(())
             }
         }
@@ -175,6 +193,8 @@ impl EnvironmentDriver {
         if self.store.mark_lost(id, step, reason)? == EnvTransition::Applied {
             report.failed.push(id.to_owned());
         }
+        // A failed environment keeps no token: revoke now, not at the next pass.
+        self.release_credential(id);
         Ok(())
     }
 
@@ -186,6 +206,7 @@ impl EnvironmentDriver {
             size: (!wire.size.is_empty()).then_some(wire.size),
             env: Vec::new(),
             service_port: self.config.service_port,
+            secret_dir: None,
         })
     }
 
@@ -207,9 +228,16 @@ impl EnvironmentDriver {
                     report,
                 );
             }
-            let Some(spec) = self.to_spec(row) else {
+            let Some(mut spec) = self.to_spec(row) else {
                 return self.fail(id, "spec", "the stored spec does not decode", report);
             };
+            // Before the guest boots: a guest never starts without the token its profile promises.
+            if self.credentials.is_some() {
+                match self.mint_credential(row) {
+                    Ok(share) => spec.secret_dir = Some((share.dir, share.fingerprint)),
+                    Err(reason) => return self.fail(id, "credential", &reason, report),
+                }
+            }
             match self.backend.launch(&spec) {
                 Ok(Launch::Started) => {
                     running.insert(id.to_owned());
@@ -219,6 +247,11 @@ impl EnvironmentDriver {
                     running.insert(id.to_owned());
                 }
                 Err(e) => return self.fail(id, "launch", &e.to_string(), report),
+            }
+        } else if self.credentials.as_ref().is_some_and(|c| !c.holds(id)) {
+            // A guest the previous daemon launched is still running: the new token goes into its share.
+            if let Err(reason) = self.mint_credential(row) {
+                return self.fail(id, "credential", &reason, report);
             }
         }
         // The provision timeout runs from the moment a box exists for this
@@ -273,6 +306,74 @@ impl EnvironmentDriver {
         Ok(())
     }
 
+    /// Mint (or find) the credential `row`'s profile names, and clear any earlier degraded or revoke-failure mark.
+    /// Blocking. The reason never carries a token or the profile name.
+    fn mint_credential(&self, row: &EnvironmentRecord) -> Result<crate::environment_credential::SecretShare, String> {
+        let credentials = self
+            .credentials
+            .as_ref()
+            .ok_or("no credential component is configured")?;
+        let wire = WireSpec::decode(row.spec.as_slice()).map_err(|_| "the stored spec does not decode".to_owned())?;
+        let profile = self
+            .store
+            .profiles()
+            .ok_or("no identity profile registry is configured")?
+            .resolve(&wire.profile)
+            .map_err(|_| "the environment's profile is not in the registry".to_owned())?;
+        let share = credentials.ensure(&row.environment_id, profile.credential(), profile.scope())?;
+        if (row.credential_degraded || row.credential_error.is_some())
+            && let Err(e) = self.store.set_credential_state(&row.environment_id, false, None)
+        {
+            tracing::warn!(environment = %row.environment_id, error = %e, "could not clear the credential mark");
+        }
+        Ok(share)
+    }
+
+    /// Renew a `Ready` environment's credential before it expires, or mint one when this daemon holds none (it
+    /// restarted). A failure leaves the environment running and marks it `degraded` (#706).
+    fn keep_credential_fresh(&self, row: &EnvironmentRecord) {
+        let Some(credentials) = &self.credentials else { return };
+        let id = row.environment_id.as_str();
+        let outcome = if credentials.holds(id) {
+            credentials.renew(id, std::time::SystemTime::now()).map(|_| ())
+        } else {
+            self.mint_credential(row).map(|_| ())
+        };
+        match outcome {
+            Ok(()) if row.credential_degraded => {
+                if let Err(e) = self
+                    .store
+                    .set_credential_state(id, false, row.credential_error.as_deref())
+                {
+                    tracing::warn!(environment = id, error = %e, "could not clear the degraded mark");
+                }
+            }
+            Ok(()) => {}
+            Err(reason) => {
+                tracing::warn!(environment = id, error = %reason, "the environment's credential could not be renewed");
+                if !row.credential_degraded
+                    && let Err(e) = self
+                        .store
+                        .set_credential_state(id, true, row.credential_error.as_deref())
+                {
+                    tracing::warn!(environment = id, error = %e, "could not record the degraded mark");
+                }
+            }
+        }
+    }
+
+    /// Revoke `id`'s credential and remove its staged files. A failure is recorded on the row and never stops the
+    /// pass. Idempotent: a pass over a stopped environment finds nothing to do.
+    fn release_credential(&self, id: &str) {
+        let Some(credentials) = &self.credentials else { return };
+        if let Err(reason) = credentials.release(id) {
+            tracing::warn!(environment = id, error = %reason, "could not revoke an environment's credential");
+            if let Err(e) = self.store.set_credential_state(id, false, Some(&reason)) {
+                tracing::warn!(environment = id, error = %e, "could not record the revoke failure");
+            }
+        }
+    }
+
     fn time_out(
         &self,
         id: &str,
@@ -293,7 +394,10 @@ impl EnvironmentDriver {
     ) -> Result<(), EnvironmentStoreError> {
         let id = row.environment_id.as_str();
         match self.backend.probe(id) {
-            Ok(Probe::Ready { .. } | Probe::Starting { .. }) => self.stop_if_idle(row, now, report)?,
+            Ok(Probe::Ready { .. } | Probe::Starting { .. }) => {
+                self.keep_credential_fresh(row);
+                self.stop_if_idle(row, now, report)?;
+            }
             Ok(Probe::Failed { step, reason }) => {
                 self.kill(id, running, report);
                 self.fail(id, &step, &reason, report)?;
@@ -599,6 +703,7 @@ mod tests {
             size: None,
             env: Vec::new(),
             service_port: None,
+            secret_dir: None,
         })?;
         let report = r.driver.reconcile_once(now())?;
         assert_eq!(report.killed, ["env-orphan"]);
@@ -1072,6 +1177,274 @@ mod tests {
         );
         assert_eq!(state(&r.store, &id)?.failure.context("failure")?.step, "provision");
         assert!(r.backend.boxes()?.is_empty());
+        Ok(())
+    }
+
+    // ---- #706: the per-environment forge credential ----
+
+    use std::{os::unix::fs::PermissionsExt, sync::atomic::Ordering};
+
+    use crate::{
+        environment_credential::fakes::{Resolver, Rotating},
+        test_support::test_profiles,
+    };
+
+    struct CredRig {
+        store: Arc<EnvironmentStore>,
+        backend: Arc<FakeEnvironmentBackend>,
+        provider: Arc<Rotating>,
+        base: std::path::PathBuf,
+        driver: EnvironmentDriver,
+        _tmp: tempfile::TempDir,
+    }
+
+    fn creds_over(provider: &Arc<Rotating>, base: &std::path::Path) -> Arc<EnvironmentCredentials> {
+        Arc::new(
+            EnvironmentCredentials::new(Arc::new(Resolver(Arc::clone(provider))), base.to_owned())
+                // Always due, so every pass over a Ready environment renews.
+                .with_margin(Duration::from_secs(100_000)),
+        )
+    }
+
+    fn cred_rig(backend: FakeEnvironmentBackend) -> Result<CredRig> {
+        let tmp = tempfile::tempdir()?;
+        let base = tmp.path().join("staging");
+        std::fs::create_dir(&base)?;
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))?;
+        let store = Arc::new(EnvironmentStore::open_in_memory()?.with_profiles(test_profiles()));
+        let backend = Arc::new(backend);
+        let provider = Arc::new(Rotating::default());
+        let driver = EnvironmentDriver::new(Arc::clone(&store), Arc::clone(&backend) as _, config())
+            .with_credentials(creds_over(&provider, &base));
+        Ok(CredRig {
+            store,
+            backend,
+            provider,
+            base,
+            driver,
+            _tmp: tmp,
+        })
+    }
+
+    fn staged(r: &CredRig, id: &str) -> std::path::PathBuf {
+        r.base.join(format!("env-cred-{id}")).join("GITHUB_TOKEN")
+    }
+
+    #[test]
+    fn the_credential_is_minted_before_the_launch_and_the_spec_carries_its_share() -> Result<()> {
+        let r = cred_rig(FakeEnvironmentBackend::new())?;
+        let id = add(&r.store, 1)?;
+        r.driver.reconcile_once(now())?;
+        let launched = r.backend.launched();
+        let spec = launched.first().context("the environment launched")?;
+        let (dir, _) = spec.secret_dir.clone().context("the spec carries a secret share")?;
+        assert_eq!(dir, r.base.join(format!("env-cred-{id}")));
+        assert_eq!(std::fs::read_to_string(staged(&r, &id))?, "tok-1");
+        assert_eq!(state(&r.store, &id)?.state, EnvironmentState::Ready);
+        Ok(())
+    }
+
+    #[test]
+    fn a_mint_failure_fails_the_environment_closed_and_nothing_launches() -> Result<()> {
+        let r = cred_rig(FakeEnvironmentBackend::new())?;
+        r.provider.fail_mint.store(true, Ordering::SeqCst);
+        let id = add(&r.store, 1)?;
+        let report = r.driver.reconcile_once(now())?;
+        assert_eq!(report.failed, std::slice::from_ref(&id));
+        assert!(
+            r.backend.launched().is_empty(),
+            "a guest must never boot without its token"
+        );
+        let rec = state(&r.store, &id)?;
+        assert_eq!(rec.state, EnvironmentState::Failed);
+        let failure = rec.failure.context("a failure is recorded")?;
+        assert_eq!(failure.step, "credential");
+        assert!(failure.reason.contains("the forge refused"), "{}", failure.reason);
+        assert!(!staged(&r, &id).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn a_profile_outside_the_registry_fails_the_credential_step_without_naming_it() -> Result<()> {
+        let r = cred_rig(FakeEnvironmentBackend::new())?;
+        let id = "env-9";
+        let spec = WireSpec {
+            profile: "stranger-profile".to_owned(),
+            size: "small".to_owned(),
+            lifetime: Some(EnvironmentLifetime {
+                kind: EnvironmentLifetimeKind::Ephemeral.into(),
+                ttl_secs: 600,
+            }),
+            task_ref: String::new(),
+        };
+        // Written straight to the store: the create path would refuse it first.
+        let bare = EnvironmentStore::open_in_memory()?;
+        bare.create("r9", id, &spec.encode_to_vec(), "sandy.control.v1.EnvironmentSpec")?;
+        let driver = EnvironmentDriver::new(Arc::new(bare), Arc::clone(&r.backend) as _, config())
+            .with_credentials(creds_over(&r.provider, &r.base));
+        driver.reconcile_once(now())?;
+        assert!(r.backend.launched().is_empty());
+        let rec = driver.store.get(id)?.context("row")?;
+        let failure = rec.failure.context("a failure is recorded")?;
+        assert_eq!(failure.step, "credential");
+        assert!(!failure.reason.contains("stranger-profile"), "{}", failure.reason);
+        Ok(())
+    }
+
+    #[test]
+    fn stop_delete_and_a_lost_box_each_revoke_and_remove_the_token() -> Result<()> {
+        for how in ["stop", "delete", "lost"] {
+            let r = cred_rig(FakeEnvironmentBackend::new())?;
+            let id = add(&r.store, 1)?;
+            r.driver.reconcile_once(now())?;
+            assert!(staged(&r, &id).exists(), "{how}: staged while ready");
+            match how {
+                "stop" => assert!(matches!(r.store.stop(&id)?, EnvTransition::Applied)),
+                "delete" => assert!(matches!(r.store.delete(&id)?, EnvTransition::Applied)),
+                _ => r.backend.die(&id),
+            }
+            r.driver.reconcile_once(now())?;
+            assert_eq!(r.provider.revoked(), ["h1"], "{how}: the lease is revoked");
+            assert!(!staged(&r, &id).exists(), "{how}: the token file is gone");
+            assert!(
+                !r.base.join(format!("env-cred-{id}")).exists(),
+                "{how}: the dir is gone"
+            );
+            r.driver.reconcile_once(now())?;
+            assert_eq!(
+                r.provider.revoked().len(),
+                1,
+                "{how}: a later pass revokes nothing more"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_orphan_boxs_credential_is_released_too() -> Result<()> {
+        let r = cred_rig(FakeEnvironmentBackend::new())?;
+        let id = add(&r.store, 1)?;
+        r.driver.reconcile_once(now())?;
+        // The row disappears while the box and the lease stay: a fresh store models a lost row.
+        let empty = Arc::new(EnvironmentStore::open_in_memory()?.with_profiles(test_profiles()));
+        let driver = EnvironmentDriver::new(empty, Arc::clone(&r.backend) as _, config())
+            .with_credentials(creds_over(&r.provider, &r.base));
+        let report = driver.reconcile_once(now())?;
+        assert_eq!(report.killed, std::slice::from_ref(&id));
+        assert!(!staged(&r, &id).exists(), "no token file may outlive its environment");
+        Ok(())
+    }
+
+    #[test]
+    fn a_revoke_failure_is_recorded_on_the_row_and_the_stop_still_happens() -> Result<()> {
+        let r = cred_rig(FakeEnvironmentBackend::new())?;
+        let id = add(&r.store, 1)?;
+        r.driver.reconcile_once(now())?;
+        let secret = std::fs::read_to_string(staged(&r, &id))?;
+        r.provider.fail_revoke.store(true, Ordering::SeqCst);
+        r.store.stop(&id)?;
+        let report = r.driver.reconcile_once(now())?;
+        assert_eq!(report.killed, std::slice::from_ref(&id), "the box is killed regardless");
+        let rec = state(&r.store, &id)?;
+        let error = rec.credential_error.context("the revoke failure is on the row")?;
+        assert!(error.contains("the forge refused"), "{error}");
+        assert!(!error.contains(&secret), "the token must never reach the row");
+        assert!(
+            !staged(&r, &id).exists(),
+            "the file is removed even when the revoke fails"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_resume_mints_a_fresh_token_and_clears_the_revoke_failure() -> Result<()> {
+        let r = cred_rig(FakeEnvironmentBackend::new())?;
+        let id = add(&r.store, 1)?;
+        r.driver.reconcile_once(now())?;
+        r.provider.fail_revoke.store(true, Ordering::SeqCst);
+        r.store.stop(&id)?;
+        r.driver.reconcile_once(now())?; // stopped: box killed, revoke fails
+        assert!(state(&r.store, &id)?.credential_error.is_some());
+        r.provider.fail_revoke.store(false, Ordering::SeqCst);
+        assert!(matches!(r.store.resume(&id)?, EnvTransition::Applied));
+        r.driver.reconcile_once(now())?;
+        assert_eq!(state(&r.store, &id)?.state, EnvironmentState::Ready);
+        assert_eq!(
+            std::fs::read_to_string(staged(&r, &id))?,
+            "tok-2",
+            "a resume mints anew"
+        );
+        assert_eq!(
+            state(&r.store, &id)?.credential_error,
+            None,
+            "the old failure is cleared"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_ready_environment_renews_and_a_failed_renewal_marks_it_degraded_until_one_works() -> Result<()> {
+        let r = cred_rig(FakeEnvironmentBackend::new())?;
+        let id = add(&r.store, 1)?;
+        r.driver.reconcile_once(now())?; // launch and ready, tok-1
+        r.driver.reconcile_once(now())?; // renewal: tok-2, h1 revoked
+        assert_eq!(std::fs::read_to_string(staged(&r, &id))?, "tok-2");
+        assert_eq!(
+            r.provider.revoked(),
+            ["h1"],
+            "the old lease is revoked after the new token is staged"
+        );
+        assert!(!state(&r.store, &id)?.credential_degraded);
+
+        r.provider.fail_refresh.store(true, Ordering::SeqCst);
+        r.driver.reconcile_once(now())?;
+        let rec = state(&r.store, &id)?;
+        assert_eq!(
+            rec.state,
+            EnvironmentState::Ready,
+            "a failed renewal leaves the environment running"
+        );
+        assert!(rec.credential_degraded);
+        assert_eq!(
+            std::fs::read_to_string(staged(&r, &id))?,
+            "tok-2",
+            "the held token stays staged"
+        );
+
+        r.provider.fail_refresh.store(false, Ordering::SeqCst);
+        r.driver.reconcile_once(now())?;
+        assert!(
+            !state(&r.store, &id)?.credential_degraded,
+            "a later renewal clears the mark"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_restarted_daemon_mints_into_the_share_the_running_guest_mounted() -> Result<()> {
+        let r = cred_rig(FakeEnvironmentBackend::new())?;
+        let id = add(&r.store, 1)?;
+        r.driver.reconcile_once(now())?;
+        let (dir, _) = r.backend.launched()[0].secret_dir.clone().context("share")?;
+        // A restart: a new driver and registry over the same store, box and staging base.
+        let restarted = EnvironmentDriver::new(Arc::clone(&r.store), Arc::clone(&r.backend) as _, config())
+            .with_credentials(Arc::new(
+                EnvironmentCredentials::new(Arc::new(Resolver(Arc::clone(&r.provider))), r.base.clone())
+                    .with_margin(Duration::from_secs(1)),
+            ));
+        restarted.reconcile_once(now())?;
+        assert_eq!(r.backend.launched().len(), 1, "the running guest is not relaunched");
+        assert_eq!(std::fs::read_to_string(dir.join("GITHUB_TOKEN"))?, "tok-2");
+        assert_eq!(state(&r.store, &id)?.state, EnvironmentState::Ready);
+        Ok(())
+    }
+
+    #[test]
+    fn a_driver_without_credentials_launches_with_no_share() -> Result<()> {
+        let r = rig(FakeEnvironmentBackend::new())?;
+        add(&r.store, 1)?;
+        r.driver.reconcile_once(now())?;
+        assert_eq!(r.backend.launched().first().map(|s| s.secret_dir.clone()), Some(None));
         Ok(())
     }
 }
