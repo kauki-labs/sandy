@@ -64,6 +64,10 @@ a plain-`http` base to a remote host now fails with `trust root at <file>: base_
 Change the stored `base_url` to `https`. The message names the rule and never repeats the value, since a URL with
 userinfo can hold a secret.
 
+`deregister` on such a root refuses the forge revoke, because the JWT would go to that address, and the error names
+`--keep-remote`. `deregister --keep-remote` skips the base check and the forge call, and still shreds the local key and
+removes the config.
+
 ## Use it in a job
 
 ```sh

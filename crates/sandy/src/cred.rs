@@ -335,6 +335,14 @@ pub trait TrustRootIo: Sized {
     /// [`CredError::Stage`] when the file cannot be read or parsed.
     fn load(path: &Path) -> Result<Self, CredError>;
 
+    /// [`load`](TrustRootIo::load) without the API base check, for the one caller that must still read a root the
+    /// check refuses: `deregister`, which removes the local key and config even when the stored base is bad. Every
+    /// caller that talks to the forge uses [`load`](TrustRootIo::load).
+    ///
+    /// # Errors
+    /// [`CredError::Stage`] when the file cannot be read or parsed.
+    fn load_unchecked(path: &Path) -> Result<Self, CredError>;
+
     /// Write a trust root to a `0600` JSON config file via atomic temp → rename.
     ///
     /// # Errors
@@ -344,11 +352,7 @@ pub trait TrustRootIo: Sized {
 
 impl TrustRootIo for TrustRoot {
     fn load(path: &Path) -> Result<Self, CredError> {
-        let (mut file, _) = open_trust_file("trust root", path)?;
-        let mut text = String::new();
-        std::io::Read::read_to_string(&mut file, &mut text).map_err(|e| stage_err("read trust root", path, &e))?;
-        let root: TrustRoot = serde_json::from_str(&text)
-            .map_err(|e| CredError::Stage(format!("parse trust root at {}: {e}", path.display())))?;
+        let root = Self::load_unchecked(path)?;
         // A root written before the API base was checked (#736), or edited by hand, may name a base the JWT must not
         // go to. The message names the field and the rule, never the value.
         check_base_url(&root).map_err(|reason| {
@@ -358,6 +362,14 @@ impl TrustRootIo for TrustRoot {
             ))
         })?;
         Ok(root)
+    }
+
+    fn load_unchecked(path: &Path) -> Result<Self, CredError> {
+        let (mut file, _) = open_trust_file("trust root", path)?;
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut file, &mut text).map_err(|e| stage_err("read trust root", path, &e))?;
+        serde_json::from_str(&text)
+            .map_err(|e| CredError::Stage(format!("parse trust root at {}: {e}", path.display())))
     }
 
     fn write(&self, path: &Path) -> Result<(), CredError> {

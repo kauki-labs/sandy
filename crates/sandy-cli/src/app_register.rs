@@ -603,7 +603,9 @@ pub fn run_deregister(name: &str, keep_remote: bool) -> Result<CredDeregistered,
     sandy::validate_trust_root_name(name)?;
     let dir = trust_roots_dir().map_err(|e| InstallError::Capture(e.to_string()))?;
     let cfg = config_path(&dir, name);
-    let root = TrustRoot::load(&cfg)?;
+    // Unchecked: `deregister` checks the base itself where the forge is called, so a root with a bad stored base can
+    // still be removed locally with --keep-remote (#736).
+    let root = TrustRoot::load_unchecked(&cfg)?;
     let provisioner = provisioner_for(&root, name);
 
     let outcome = sandy::deregister(&provisioner, &cfg, keep_remote)?;

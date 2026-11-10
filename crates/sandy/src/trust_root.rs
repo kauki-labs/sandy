@@ -143,13 +143,22 @@ pub fn deregister(
     config_path: &Path,
     keep_remote: bool,
 ) -> Result<RevokeOutcome, InstallError> {
-    let root = TrustRoot::load(config_path)?;
+    // Unchecked: a root whose stored base is bad must still be removable locally. Only the forge call needs a
+    // good address (the revoke sends the App's JWT there), so only that path checks it (#736).
+    let root = TrustRoot::load_unchecked(config_path)?;
     let outcome = if keep_remote {
         RevokeOutcome {
             uninstalled: false,
             registration_residue: None,
         }
     } else {
+        crate::cred::check_base_url(&root).map_err(|reason| {
+            InstallError::Cred(crate::cred::CredError::Stage(format!(
+                "trust root at {}: base_url is not allowed: {reason}; the forge revoke is refused. Rerun with \
+                 --keep-remote to remove the local key and config without a forge call",
+                config_path.display()
+            )))
+        })?;
         provisioner.revoke(&root)? // before the shred — order invariant (D7)
     };
     shred_secret(&root);
@@ -269,7 +278,8 @@ pub fn validate_api_base(url: &str) -> Result<(), String> {
         return Err("the host has a character that is not allowed in a host name".to_owned());
     }
     if let Some(port) = port
-        && port.parse::<u16>().ok().is_none_or(|p| p == 0)
+        // `u16::from_str` accepts a leading `+`, so require plain digits first.
+        && (!port.bytes().all(|b| b.is_ascii_digit()) || port.parse::<u16>().ok().is_none_or(|p| p == 0))
     {
         return Err("the port is not a number from 1 to 65535".to_owned());
     }
@@ -692,5 +702,87 @@ mod tests {
             assert!(!err.contains("hunter2"), "{bad}: and never the value: {err}");
         }
         Ok(())
+    }
+
+    /// A root whose stored base is bad cannot be deregistered at the forge (the revoke would send the App's JWT to
+    /// that address), but the operator must still be able to remove the local key and config.
+    fn root_with_bad_base(
+        tmp: &tempfile::TempDir,
+    ) -> anyhow::Result<(TrustRoot, std::path::PathBuf, std::path::PathBuf)> {
+        let key = tmp.path().join("key.pem");
+        let cfg = tmp.path().join("root.json");
+        fs::write(&key, b"real-secret")?;
+        let TrustRoot::Github {
+            app_id,
+            private_key_path,
+            installation_id,
+            targets,
+            ..
+        } = github_root(&key)
+        else {
+            anyhow::bail!("github_root is a GitHub root");
+        };
+        let root = TrustRoot::Github {
+            base_url: Some("http://ghe.example.com/api/v3".to_string()),
+            app_id,
+            private_key_path,
+            installation_id,
+            targets,
+        };
+        // Written as a file would have been before the check existed, or edited by hand: the unchecked way.
+        fs::write(&cfg, serde_json::to_string(&root)?)?;
+        std::os::unix::fs::PermissionsExt::set_mode(&mut fs::metadata(&cfg)?.permissions(), 0o600);
+        fs::set_permissions(&cfg, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+        Ok((root, key, cfg))
+    }
+
+    #[test]
+    fn deregister_keep_remote_shreds_a_root_whose_base_is_bad_without_any_forge_call() -> anyhow::Result<()> {
+        let tmp = private_tempdir()?;
+        let (root, key, cfg) = root_with_bad_base(&tmp)?;
+        let provisioner = FakeProvisioner::new(root);
+
+        let outcome = deregister(&provisioner, &cfg, true)?;
+
+        assert!(!provisioner.was_revoked(), "no forge call");
+        assert!(!outcome.uninstalled);
+        assert!(!key.exists(), "the local key is shredded");
+        assert!(!cfg.exists(), "the config is removed");
+        Ok(())
+    }
+
+    /// Without `--keep-remote` the forge revoke would go to the bad address: refused, nothing shredded, and the error
+    /// names the way out.
+    #[test]
+    fn deregister_refuses_the_forge_revoke_to_a_bad_base_and_names_keep_remote() -> anyhow::Result<()> {
+        let tmp = private_tempdir()?;
+        let (root, key, cfg) = root_with_bad_base(&tmp)?;
+        let provisioner = FakeProvisioner::new(root);
+
+        let err = deregister(&provisioner, &cfg, false).expect_err("must refuse");
+
+        let text = err.to_string();
+        assert!(text.contains("base_url") && text.contains("--keep-remote"), "{text}");
+        assert!(!provisioner.was_revoked(), "no forge call to the bad address");
+        assert!(key.exists() && cfg.exists(), "nothing is shredded on a refusal");
+        Ok(())
+    }
+
+    /// Refused by construction, pinned so a later parser change cannot loosen them (sandy-86): a trailing dot, the
+    /// decimal, hex and short IPv4 spellings, an IPv4-mapped IPv6 literal, a zone id, and a signed port.
+    #[test]
+    fn spellings_of_loopback_that_a_client_might_resolve_differently_are_refused() {
+        for bad in [
+            "http://localhost.",
+            "http://2130706433",
+            "http://0x7f.0.0.1",
+            "http://127.1",
+            "http://[::ffff:127.0.0.1]",
+            "http://[::1%25eth0]",
+            "https://ghe.example.com:+80",
+            "http://localhost:+80",
+        ] {
+            assert!(validate_api_base(bad).is_err(), "{bad} must be refused");
+        }
     }
 }
