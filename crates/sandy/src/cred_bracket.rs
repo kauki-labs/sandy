@@ -17,8 +17,12 @@
 //! [`Minted`] (zeroized, `Debug`-redacted) and the staged file.
 
 use std::{
+    os::unix::fs::MetadataExt as _,
     path::PathBuf,
-    sync::{Arc, Condvar, Mutex, PoisonError},
+    sync::{
+        Arc, Condvar, Mutex, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 
@@ -58,8 +62,14 @@ pub struct CredentialBracket {
     provider: Option<SharedProvider>,
     target: StagingTarget,
     token_path: PathBuf,
+    /// The staging dir, opened and checked against the fingerprint before the mint.
+    /// Cleanup unlinks through this handle, never through `target.dir` by path.
+    dir: Arc<sandy_fsutil::OwnedDir>,
     /// `None` once revoked.
     lease: Mutex<Option<Lease>>,
+    /// The staged file is not yet removed. Kept apart from the lease so a removal
+    /// that failed after a successful revoke is retried by a later revoke or drop.
+    file_staged: AtomicBool,
 }
 
 impl std::fmt::Debug for CredentialBracket {
@@ -138,6 +148,19 @@ impl CredentialBracket {
         requested_ttl_secs: u32,
         call_timeout: Duration,
     ) -> Result<Self, CredError> {
+        // Bind to the validated dir before minting: a dir swapped in since the
+        // caller's check fails here, with no token minted.
+        let dir = sandy_fsutil::OwnedDir::open(&target.dir)
+            .map_err(|e| CredError::Stage(format!("open staging dir {}: {e}", target.dir.display())))?;
+        let (dev, ino) = dir
+            .dev_ino()
+            .map_err(|e| CredError::Stage(format!("stat staging dir {}: {e}", target.dir.display())))?;
+        if (dev, ino) != (target.fingerprint.dev, target.fingerprint.ino) {
+            return Err(CredError::Stage(format!(
+                "staging dir {} is not the directory that was validated",
+                target.dir.display()
+            )));
+        }
         let provider: SharedProvider = Arc::new(Bounded {
             inner: provider,
             timeout: call_timeout,
@@ -162,7 +185,9 @@ impl CredentialBracket {
             provider: Some(provider),
             target,
             token_path,
+            dir: Arc::new(dir),
             lease: Mutex::new(Some(lease)),
+            file_staged: AtomicBool::new(true),
         })
     }
 
@@ -225,13 +250,17 @@ impl CredentialBracket {
     /// token then stays valid until its native expiry); [`CredError::Stage`] when
     /// the revoke succeeded but the staged file could not be removed.
     pub fn revoke(&self) -> Result<(), CredError> {
-        let Some(lease) = self.lock_lease().take() else {
-            return Ok(());
-        };
+        let lease = self.lock_lease().take();
         let Some(provider) = &self.provider else {
             return Ok(());
         };
-        revoke_and_remove(provider.as_ref(), &lease, &self.token_path, &self.target)
+        let remove_file = self.file_staged.load(Ordering::SeqCst);
+        let (revoked, removed) =
+            revoke_and_remove(provider.as_ref(), lease.as_ref(), &self.dir, &self.target, remove_file);
+        if remove_file && removed.is_ok() {
+            self.file_staged.store(false, Ordering::SeqCst);
+        }
+        revoked.and(removed)
     }
 
     fn lock_lease(&self) -> std::sync::MutexGuard<'_, Option<Lease>> {
@@ -242,24 +271,30 @@ impl CredentialBracket {
 impl Drop for CredentialBracket {
     fn drop(&mut self) {
         let lease = self.lease.get_mut().unwrap_or_else(PoisonError::into_inner).take();
+        let remove_file = *self.file_staged.get_mut();
         let Some(provider) = self.provider.take() else { return };
-        let token_path = self.token_path.clone();
+        let in_runtime = tokio::runtime::Handle::try_current().is_ok();
+        // Nothing to clean up: drop the provider here, unless a runtime is current
+        // (a live adapter owns its own runtime): then the cleanup thread drops it.
+        if lease.is_none() && !remove_file && !in_runtime {
+            return;
+        }
+        let dir = Arc::clone(&self.dir);
         let target = self.target.clone();
         let cleanup = move || {
-            if let Some(lease) = lease
-                && let Err(e) = revoke_and_remove(provider.as_ref(), &lease, &token_path, &target)
-            {
+            let (revoked, removed) = revoke_and_remove(provider.as_ref(), lease.as_ref(), &dir, &target, remove_file);
+            if let Err(e) = revoked.and(removed) {
                 tracing::warn!(
-                    handle = %lease.handle.id,
+                    handle = lease.as_ref().map(|l| l.handle.id.as_str()),
                     error = %e,
-                    "credential revoke on drop failed; the token stays valid until its native expiry"
+                    "credential cleanup on drop failed; a token stays valid until its native expiry"
                 );
             }
             // `provider` drops here, off any async worker: a live adapter owns its
             // own tokio runtime, which must not be dropped inside another one.
             drop(provider);
         };
-        if tokio::runtime::Handle::try_current().is_ok() {
+        if in_runtime {
             if let Err(e) = std::thread::Builder::new()
                 .name("sandy-cred-drop".to_string())
                 .spawn(cleanup)
@@ -272,29 +307,48 @@ impl Drop for CredentialBracket {
     }
 }
 
-/// Revoke `lease`, then remove its staged file and, when asked, the dir. The
-/// file is removed even when the revoke fails.
+/// Revoke `lease` (when there is one), then remove the staged file when
+/// `remove_file` and, when asked, the dir. The file is removed even when the revoke
+/// fails. Returns the revoke and the removal results apart.
 fn revoke_and_remove(
     provider: &(dyn CredentialProvider + Send + Sync),
-    lease: &Lease,
-    token_path: &std::path::Path,
+    lease: Option<&Lease>,
+    dir: &sandy_fsutil::OwnedDir,
     target: &StagingTarget,
-) -> Result<(), CredError> {
-    let revoked = provider.revoke(lease);
-    let removed = match std::fs::remove_file(token_path) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(CredError::Stage(format!(
-            "remove staged credential {}: {e}",
-            token_path.display()
-        ))),
-        _ => Ok(()),
+    remove_file: bool,
+) -> (Result<(), CredError>, Result<(), CredError>) {
+    let revoked = lease.map_or(Ok(()), |l| provider.revoke(l));
+    let removed = if remove_file {
+        remove_staged(dir, target)
+    } else {
+        Ok(())
     };
+    (revoked, removed)
+}
+
+/// Unlink the staged file through the dir handle opened at mint time, then remove
+/// the dir when asked and `target.dir` still names it. A dir renamed away and
+/// replaced at the same path is neither read nor removed.
+fn remove_staged(dir: &sandy_fsutil::OwnedDir, target: &StagingTarget) -> Result<(), CredError> {
+    match rustix::fs::unlinkat(dir, target.secret_name.as_str(), rustix::fs::AtFlags::empty()) {
+        Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+        Err(e) => {
+            return Err(CredError::Stage(format!(
+                "remove staged credential {}: {e}",
+                target.dir.join(&target.secret_name).display()
+            )));
+        }
+    }
+    let same_dir = std::fs::symlink_metadata(&target.dir)
+        .is_ok_and(|m| (m.dev(), m.ino()) == (target.fingerprint.dev, target.fingerprint.ino));
     if target.remove_dir_on_revoke
+        && same_dir
         && let Err(e) = std::fs::remove_dir(&target.dir)
         && e.kind() != std::io::ErrorKind::NotFound
     {
         tracing::warn!(dir = %target.dir.display(), error = %e, "could not remove the credential staging dir");
     }
-    revoked.and(removed)
+    Ok(())
 }
 
 /// A copy of `lease` for a call that must own it (a bounded worker thread). A
@@ -742,6 +796,146 @@ mod tests {
             None,
             "an oversized token fails closed"
         );
+        Ok(())
+    }
+
+    /// #720: a removal that fails after a successful revoke is retried by the next
+    /// `revoke()`, without a second provider call.
+    #[test]
+    fn a_failed_file_removal_is_retried_by_the_next_revoke() -> anyhow::Result<()> {
+        let (_tmp, target) = private_dir()?;
+        let dir = target.dir.clone();
+        let path = dir.join("GITHUB_TOKEN");
+        let provider = Arc::new(Scripted::new(vec!["tok"], Duration::from_secs(600)));
+        let bracket = CredentialBracket::mint_and_stage(
+            provider.clone(),
+            &Scope::default(),
+            target,
+            600,
+            Duration::from_secs(5),
+        )?;
+        // A dir without write permission makes the unlink fail.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).context("0500")?;
+        let err = bracket.revoke().expect_err("the unlink is refused");
+        assert!(matches!(err, CredError::Stage(_)), "{err:?}");
+        assert!(path.exists(), "the file is still staged after the failed removal");
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).context("0700")?;
+        bracket.revoke().context("the retry removes the file")?;
+        assert!(!path.exists(), "the retry removed the staged file");
+        assert_eq!(
+            provider.revoked(),
+            vec!["h0"],
+            "the retry makes no second provider call"
+        );
+        Ok(())
+    }
+
+    /// #720: cleanup is bound to the directory the token was staged in. A `cred-*`
+    /// dir renamed away and replaced at the same path loses nothing from the
+    /// replacement, and the original's token is still removed.
+    #[test]
+    fn cleanup_follows_the_staged_dir_not_the_path_swapped_in_after() -> anyhow::Result<()> {
+        let (tmp, target) = private_dir()?;
+        let dir = target.dir.clone();
+        let provider = Arc::new(Scripted::new(vec!["tok"], Duration::from_secs(600)));
+        let bracket =
+            CredentialBracket::mint_and_stage(provider, &Scope::default(), target, 600, Duration::from_secs(5))?;
+        let moved = tmp.path().join("cred-moved");
+        std::fs::rename(&dir, &moved).context("move the staged dir aside")?;
+        std::fs::create_dir(&dir).context("substitute")?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::write(dir.join("GITHUB_TOKEN"), "not-ours")?;
+
+        bracket.revoke()?;
+        assert_eq!(
+            std::fs::read_to_string(dir.join("GITHUB_TOKEN"))?,
+            "not-ours",
+            "the replacement's file is untouched"
+        );
+        assert!(
+            !moved.join("GITHUB_TOKEN").exists(),
+            "the staged token is removed through the dir it was written to"
+        );
+        Ok(())
+    }
+
+    /// Delegates to a [`Scripted`] and records whether a tokio runtime was current
+    /// when the provider was dropped (a live adapter owns a runtime, which must not
+    /// be dropped inside another one).
+    struct DropProbe {
+        inner: Scripted,
+        dropped_inside_runtime: Arc<std::sync::Mutex<Option<bool>>>,
+    }
+
+    impl CredentialProvider for DropProbe {
+        fn mint(&self, scope: &Scope, ttl: Duration) -> Result<Minted, CredError> {
+            self.inner.mint(scope, ttl)
+        }
+
+        fn revoke(&self, lease: &Lease) -> Result<(), CredError> {
+            self.inner.revoke(lease)
+        }
+
+        fn refresh(&self, lease: &Lease) -> Result<Minted, CredError> {
+            self.inner.refresh(lease)
+        }
+    }
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            *self
+                .dropped_inside_runtime
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(tokio::runtime::Handle::try_current().is_ok());
+        }
+    }
+
+    /// #720 review: a bracket revoked by hand and then dropped inside a runtime
+    /// still drops its provider off the runtime's worker.
+    #[test]
+    fn a_revoked_bracket_dropped_in_a_runtime_drops_its_provider_off_the_runtime() -> anyhow::Result<()> {
+        let (_tmp, target) = private_dir()?;
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let probe = Arc::new(DropProbe {
+            inner: Scripted::new(vec!["tok"], Duration::from_secs(600)),
+            dropped_inside_runtime: Arc::clone(&seen),
+        });
+        let rt = tokio::runtime::Builder::new_current_thread().build()?;
+        rt.block_on(async {
+            let bracket =
+                CredentialBracket::mint_and_stage(probe, &Scope::default(), target, 600, Duration::from_secs(5))?;
+            bracket.revoke()?;
+            drop(bracket);
+            anyhow::Ok(())
+        })?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while seen.lock().unwrap_or_else(PoisonError::into_inner).is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            *seen.lock().unwrap_or_else(PoisonError::into_inner),
+            Some(false),
+            "the provider drops on a plain thread, never inside the runtime"
+        );
+        Ok(())
+    }
+
+    /// #720 review: a dir swapped in after the caller's check is refused before any
+    /// mint, so no token is ever issued for it.
+    #[test]
+    fn a_dir_swapped_before_the_mint_is_refused_with_no_mint_call() -> anyhow::Result<()> {
+        let (tmp, target) = private_dir()?;
+        let dir = target.dir.clone();
+        std::fs::rename(&dir, tmp.path().join("cred-moved")).context("move aside")?;
+        std::fs::create_dir(&dir)?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        let provider = Arc::new(Scripted::new(vec!["tok"], Duration::from_secs(600)));
+        let err =
+            CredentialBracket::mint_and_stage(provider.clone(), &Scope::default(), target, 600, Duration::from_secs(5))
+                .expect_err("a swapped dir is refused");
+        assert!(matches!(err, CredError::Stage(_)), "{err:?}");
+        assert_eq!(provider.next.load(Ordering::SeqCst), 0, "no mint call was made");
         Ok(())
     }
 }
