@@ -134,6 +134,11 @@ impl GithubAdapter {
         else {
             return Err(CredError::Mint("trust root is not a GitHub App".to_string()));
         };
+        // Before the key is read: where the App's JWT goes is the first thing to be sure of (#736).
+        if let Some(base) = base_url {
+            crate::trust_root::validate_api_base(base)
+                .map_err(|reason| CredError::Mint(format!("trust root base_url is not allowed: {reason}")))?;
+        }
         let key_pem = read_secret_0600(private_key_path)?;
         let app_id = app_id
             .parse::<u64>()
@@ -415,6 +420,34 @@ pub fn resolve_adapter(dir: &Path, name: &str) -> Result<(GithubAdapter, Vec<Tar
 
 #[cfg(test)]
 mod tests {
+
+    /// #736: the adapter is built from a trust root that may have been edited by hand, so it checks the base too.
+    /// The check comes before the key is read, so a bad base is the error whatever the key path is.
+    #[test]
+    fn the_adapter_refuses_a_trust_root_whose_api_base_would_send_the_jwt_off_host_or_in_the_clear() {
+        for bad in [
+            "http://ghe.example.com/api/v3",
+            "https://u:hunter2@ghe.example.com",
+            "https://ghe.example.com?x=1",
+        ] {
+            let root = TrustRoot::Github {
+                base_url: Some(bad.to_string()),
+                app_id: "1".to_string(),
+                private_key_path: std::path::PathBuf::from("/nonexistent/key.pem"),
+                installation_id: 42,
+                targets: Vec::new(),
+            };
+            let Err(err) = GithubAdapter::from_trust_root(&root) else {
+                panic!("{bad} must be refused");
+            };
+            let text = err.to_string();
+            assert!(text.contains("base_url"), "{bad}: {text}");
+            assert!(
+                !text.contains("hunter2"),
+                "the refusal must not repeat the value: {text}"
+            );
+        }
+    }
 
     /// #388: the App private key and every retained token sit in types that zero
     /// them on drop. The annotations are the contract: they stop compiling if a

@@ -143,13 +143,22 @@ pub fn deregister(
     config_path: &Path,
     keep_remote: bool,
 ) -> Result<RevokeOutcome, InstallError> {
-    let root = TrustRoot::load(config_path)?;
+    // Unchecked: a root whose stored base is bad must still be removable locally. Only the forge call needs a
+    // good address (the revoke sends the App's JWT there), so only that path checks it (#736).
+    let root = TrustRoot::load_unchecked(config_path)?;
     let outcome = if keep_remote {
         RevokeOutcome {
             uninstalled: false,
             registration_residue: None,
         }
     } else {
+        crate::cred::check_base_url(&root).map_err(|reason| {
+            InstallError::Cred(crate::cred::CredError::Stage(format!(
+                "trust root at {}: base_url is not allowed: {reason}; the forge revoke is refused. Rerun with \
+                 --keep-remote to remove the local key and config without a forge call",
+                config_path.display()
+            )))
+        })?;
         provisioner.revoke(&root)? // before the shred — order invariant (D7)
     };
     shred_secret(&root);
@@ -200,6 +209,92 @@ pub fn validate_trust_root_name(name: &str) -> Result<(), InstallError> {
         return Err(InstallError::Cred(crate::cred::CredError::Stage(format!(
             "trust-root name {name:?} must be a single file name (no `/`, not `.` or `..`)"
         ))));
+    }
+    Ok(())
+}
+
+/// Check the API base a trust root names (#736). The App's signed JWT, and the installation token that follows, go to
+/// this address, so it is https, or http only to a loopback host (a local fake forge in a test, where the bytes never
+/// leave the machine). It has no userinfo, query or fragment, a real host and port, only ASCII without spaces or
+/// control characters, and no `.` or `..` path segment.
+///
+/// # Errors
+/// The reason, as one phrase that names the rule. It never repeats `url`: a URL with userinfo can hold a secret.
+pub fn validate_api_base(url: &str) -> Result<(), String> {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    if url
+        .chars()
+        .any(|c| !c.is_ascii() || c.is_ascii_control() || c == ' ' || c == '\\')
+    {
+        return Err("it has a character that is not allowed (non-ASCII, space, control or backslash)".to_owned());
+    }
+    let strip = |scheme: &str| {
+        url.get(..scheme.len())
+            .filter(|head| head.eq_ignore_ascii_case(scheme))
+            .map(|_| &url[scheme.len()..])
+    };
+    let (https, rest) = match (strip("https://"), strip("http://")) {
+        (Some(rest), _) => (true, rest),
+        (None, Some(rest)) => (false, rest),
+        (None, None) => return Err("the scheme must be https (http only to a loopback host)".to_owned()),
+    };
+    if rest.contains('#') {
+        return Err("it has a fragment".to_owned());
+    }
+    if rest.contains('?') {
+        return Err("it has a query".to_owned());
+    }
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    if authority.contains('@') {
+        return Err("it has userinfo".to_owned());
+    }
+    let (host, port, ipv6) = if let Some(inner) = authority.strip_prefix('[') {
+        let (host, after) = inner
+            .split_once(']')
+            .ok_or_else(|| "the host is an unterminated IPv6 literal".to_owned())?;
+        match after {
+            "" => (host, None, true),
+            _ => (
+                host,
+                Some(
+                    after
+                        .strip_prefix(':')
+                        .ok_or_else(|| "the host is followed by something other than a port".to_owned())?,
+                ),
+                true,
+            ),
+        }
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port), false),
+            None => (authority, None, false),
+        }
+    };
+    if host.is_empty() {
+        return Err("it has no host".to_owned());
+    }
+    if ipv6 {
+        if host.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err("the host is not a valid IPv6 literal".to_owned());
+        }
+    } else if !host.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.') {
+        return Err("the host has a character that is not allowed in a host name".to_owned());
+    }
+    if let Some(port) = port
+        // `u16::from_str` accepts a leading `+`, so require plain digits first.
+        && (!port.bytes().all(|b| b.is_ascii_digit()) || port.parse::<u16>().ok().is_none_or(|p| p == 0))
+    {
+        return Err("the port is not a number from 1 to 65535".to_owned());
+    }
+    if path.split('/').any(|segment| segment == "." || segment == "..") {
+        return Err("the path has a `.` or `..` segment".to_owned());
+    }
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host.parse::<Ipv4Addr>().is_ok_and(|a| a.is_loopback())
+        || (ipv6 && host.parse::<Ipv6Addr>().is_ok_and(|a| a.is_loopback()));
+    if !https && !loopback {
+        return Err("the scheme must be https (http only to a loopback host)".to_owned());
     }
     Ok(())
 }
@@ -472,5 +567,232 @@ mod tests {
         assert!(!key.exists(), "the local secret is still shredded");
         assert!(!cfg.exists(), "the config is still removed");
         Ok(())
+    }
+
+    /// #736: where the App's signed JWT goes is the trust root's `base_url`. It is https, or http only to a loopback
+    /// host (a local fake forge in a test), and never carries userinfo, a query or a fragment.
+    #[test]
+    fn a_valid_api_base_is_accepted() {
+        for ok in [
+            "https://api.github.com",
+            "https://ghe.example.com/api/v3",
+            "https://ghe.example.com:8443/api/v3/",
+            "https://GHE.Example.com/api/v3",
+            "http://127.0.0.1:41234",
+            "http://127.1.2.3/api/v3",
+            "http://localhost:8080/api",
+            "http://LOCALHOST",
+            "http://[::1]:9000/api",
+            "https://[2001:db8::1]:8443/api/v3",
+        ] {
+            assert_eq!(validate_api_base(ok), Ok(()), "{ok}");
+        }
+    }
+
+    #[test]
+    fn an_api_base_that_could_send_the_jwt_off_host_or_in_the_clear_is_refused() {
+        for (bad, why) in [
+            ("http://ghe.example.com/api/v3", "scheme"),
+            ("http://127.0.0.1.evil.com", "scheme"),
+            ("http://localhost.evil.com", "scheme"),
+            ("http://0.0.0.0:80", "scheme"),
+            ("ftp://ghe.example.com", "scheme"),
+            ("ghe.example.com/api/v3", "scheme"),
+            ("", "scheme"),
+            ("https://user@ghe.example.com", "userinfo"),
+            ("https://user:hunter2@ghe.example.com", "userinfo"),
+            ("https://ghe.example.com?x=1", "query"),
+            ("https://ghe.example.com/api/v3?x=1", "query"),
+            ("https://ghe.example.com#frag", "fragment"),
+            ("https://", "host"),
+            ("https://:443", "host"),
+            ("https://ghe.example.com:0", "port"),
+            ("https://ghe.example.com:65536", "port"),
+            ("https://ghe.example.com:abc", "port"),
+            ("https://[ghe.example.com]", "IPv6"),
+            ("https://[::1%25eth0]", "IPv6"),
+            ("https://ghe example.com", "character"),
+            ("https://ghe.example.com/a b", "character"),
+            ("https://ghe.example.com/\u{7f}", "character"),
+            ("https://g\u{e9}.example.com", "character"),
+            ("https://ghe.example.com/../x", "path"),
+            ("https://ghe.example.com/a/./b", "path"),
+            ("https://ghe.example.com\\x", "character"),
+            ("http://[::1]x", "host"),
+        ] {
+            let err = validate_api_base(bad).expect_err(bad);
+            assert!(
+                err.contains(why),
+                "{bad:?}: expected a reason naming {why:?}, got {err:?}"
+            );
+        }
+    }
+
+    /// A URL with userinfo can hold a secret: no error text may repeat the value it refused.
+    #[test]
+    fn a_refusal_never_repeats_the_value() {
+        for bad in [
+            "https://user:hunter2@ghe.example.com",
+            "https://ghe.example.com/?token=hunter2",
+        ] {
+            let err = validate_api_base(bad).expect_err(bad);
+            assert!(!err.contains("hunter2"), "the refusal repeated the value: {err}");
+        }
+    }
+
+    /// Writing a trust root refuses a bad base, so `register` and `import` never persist one.
+    #[test]
+    fn writing_a_trust_root_with_a_bad_api_base_is_refused_and_writes_nothing() -> anyhow::Result<()> {
+        use crate::cred::TrustRootIo as _;
+        let dir = tempfile::tempdir()?;
+        std::fs::set_permissions(dir.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+        let cfg = dir.path().join("root.json");
+        let TrustRoot::Github {
+            app_id,
+            private_key_path,
+            installation_id,
+            targets,
+            ..
+        } = github_root(Path::new("/key.pem"))
+        else {
+            anyhow::bail!("github_root is a GitHub root");
+        };
+        let bad = TrustRoot::Github {
+            base_url: Some("http://ghe.example.com/api/v3".to_string()),
+            app_id,
+            private_key_path,
+            installation_id,
+            targets,
+        };
+        let err = bad.write(&cfg).expect_err("a cleartext base must not be written");
+        assert!(err.to_string().contains("base_url"), "{err}");
+        assert!(!cfg.exists(), "nothing may be written");
+        Ok(())
+    }
+
+    /// An existing trust root keeps loading when its base is valid or absent, and fails with a message that names the
+    /// field and the rule (not the value) when it is not.
+    #[test]
+    fn loading_a_stored_trust_root_checks_its_api_base() -> anyhow::Result<()> {
+        use crate::cred::TrustRootIo as _;
+        let dir = tempfile::tempdir()?;
+        std::fs::set_permissions(dir.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+        let write = |name: &str, base: Option<&str>| -> anyhow::Result<std::path::PathBuf> {
+            let mut value = json!({
+                "kind": "github", "app_id": "1", "private_key_path": "/key.pem",
+                "installation_id": 42, "targets": ["owner/repo"],
+            });
+            if let Some(base) = base {
+                value["base_url"] = json!(base);
+            }
+            let path = dir.path().join(name);
+            std::fs::write(&path, value.to_string())?;
+            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+            Ok(path)
+        };
+        for good in [None, Some("https://ghe.example.com/api/v3"), Some("http://127.0.0.1:9")] {
+            let path = write("good.json", good)?;
+            TrustRoot::load(&path).map_err(|e| anyhow::anyhow!("{good:?} must load: {e}"))?;
+        }
+        for bad in [
+            "http://ghe.example.com/api/v3",
+            "https://u:hunter2@ghe.example.com",
+            "https://ghe.example.com#x",
+        ] {
+            let path = write("bad.json", Some(bad))?;
+            let err = TrustRoot::load(&path).expect_err(bad).to_string();
+            assert!(
+                err.contains("base_url"),
+                "{bad}: the message must name the field: {err}"
+            );
+            assert!(err.contains(path.to_str().unwrap_or("")), "{bad}: and the file: {err}");
+            assert!(!err.contains("hunter2"), "{bad}: and never the value: {err}");
+        }
+        Ok(())
+    }
+
+    /// A root whose stored base is bad cannot be deregistered at the forge (the revoke would send the App's JWT to
+    /// that address), but the operator must still be able to remove the local key and config.
+    fn root_with_bad_base(
+        tmp: &tempfile::TempDir,
+    ) -> anyhow::Result<(TrustRoot, std::path::PathBuf, std::path::PathBuf)> {
+        let key = tmp.path().join("key.pem");
+        let cfg = tmp.path().join("root.json");
+        fs::write(&key, b"real-secret")?;
+        let TrustRoot::Github {
+            app_id,
+            private_key_path,
+            installation_id,
+            targets,
+            ..
+        } = github_root(&key)
+        else {
+            anyhow::bail!("github_root is a GitHub root");
+        };
+        let root = TrustRoot::Github {
+            base_url: Some("http://ghe.example.com/api/v3".to_string()),
+            app_id,
+            private_key_path,
+            installation_id,
+            targets,
+        };
+        // Written as a file would have been before the check existed, or edited by hand: the unchecked way.
+        fs::write(&cfg, serde_json::to_string(&root)?)?;
+        std::os::unix::fs::PermissionsExt::set_mode(&mut fs::metadata(&cfg)?.permissions(), 0o600);
+        fs::set_permissions(&cfg, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+        Ok((root, key, cfg))
+    }
+
+    #[test]
+    fn deregister_keep_remote_shreds_a_root_whose_base_is_bad_without_any_forge_call() -> anyhow::Result<()> {
+        let tmp = private_tempdir()?;
+        let (root, key, cfg) = root_with_bad_base(&tmp)?;
+        let provisioner = FakeProvisioner::new(root);
+
+        let outcome = deregister(&provisioner, &cfg, true)?;
+
+        assert!(!provisioner.was_revoked(), "no forge call");
+        assert!(!outcome.uninstalled);
+        assert!(!key.exists(), "the local key is shredded");
+        assert!(!cfg.exists(), "the config is removed");
+        Ok(())
+    }
+
+    /// Without `--keep-remote` the forge revoke would go to the bad address: refused, nothing shredded, and the error
+    /// names the way out.
+    #[test]
+    fn deregister_refuses_the_forge_revoke_to_a_bad_base_and_names_keep_remote() -> anyhow::Result<()> {
+        let tmp = private_tempdir()?;
+        let (root, key, cfg) = root_with_bad_base(&tmp)?;
+        let provisioner = FakeProvisioner::new(root);
+
+        let err = deregister(&provisioner, &cfg, false).expect_err("must refuse");
+
+        let text = err.to_string();
+        assert!(text.contains("base_url") && text.contains("--keep-remote"), "{text}");
+        assert!(!provisioner.was_revoked(), "no forge call to the bad address");
+        assert!(key.exists() && cfg.exists(), "nothing is shredded on a refusal");
+        Ok(())
+    }
+
+    /// Refused by construction, pinned so a later parser change cannot loosen them (sandy-86): a trailing dot, the
+    /// decimal, hex and short IPv4 spellings, an IPv4-mapped IPv6 literal, a zone id, and a signed port.
+    #[test]
+    fn spellings_of_loopback_that_a_client_might_resolve_differently_are_refused() {
+        for bad in [
+            "http://localhost.",
+            "http://2130706433",
+            "http://0x7f.0.0.1",
+            "http://127.1",
+            "http://[::ffff:127.0.0.1]",
+            "http://[::1%25eth0]",
+            "https://[::1%25eth0]",
+            "https://[ghe.example.com]",
+            "https://[not-an-address]",
+            "https://ghe.example.com:+80",
+            "http://localhost:+80",
+        ] {
+            assert!(validate_api_base(bad).is_err(), "{bad} must be refused");
+        }
     }
 }

@@ -45,6 +45,29 @@ per-person isolation instead, each member can `register` their own App (the
 deterministic name + duplicate check are built for the shared model, so pass
 `--name-override`/`--force` for the per-person case).
 
+## GitHub Enterprise Server and the API base
+
+`register --base-url <web base>` (default `https://github.com`) and `import --base-url <API base>` point a trust
+root at a GitHub Enterprise Server. The trust root stores the API base as `base_url`; `register` derives it as
+`<web base>/api/v3`, and without it the root uses `https://api.github.com`.
+
+The App's signed JWT, and the installation token that follows, go to that address, so it is checked (#736):
+
+- the scheme is `https`, or `http` only to a loopback host (`localhost`, `127.0.0.0/8`, `::1`), for a local fake forge in a
+  test, where the bytes never leave the machine;
+- no userinfo (`user:password@`), no query and no fragment;
+- a real host, a port from 1 to 65535, ASCII only, no space or control character, and no `.` or `..` path segment.
+
+`register` and `import` refuse a bad base before the browser, the forge or any file is touched. Writing a root and
+building the adapter check it too, and so does loading a stored root: one written earlier, or edited by hand, with
+a plain-`http` base to a remote host now fails with `trust root at <file>: base_url is not allowed: <reason>`.
+Change the stored `base_url` to `https`. The message names the rule and never repeats the value, since a URL with
+userinfo can hold a secret.
+
+`deregister` on such a root refuses the forge revoke, because the JWT would go to that address, and the error names
+`--keep-remote`. `deregister --keep-remote` skips the base check and the forge call, and still shreds the local key and
+removes the config.
+
 ## Use it in a job
 
 ```sh

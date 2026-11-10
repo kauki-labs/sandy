@@ -335,6 +335,14 @@ pub trait TrustRootIo: Sized {
     /// [`CredError::Stage`] when the file cannot be read or parsed.
     fn load(path: &Path) -> Result<Self, CredError>;
 
+    /// [`load`](TrustRootIo::load) without the API base check, for the one caller that must still read a root the
+    /// check refuses: `deregister`, which removes the local key and config even when the stored base is bad. Every
+    /// caller that talks to the forge uses [`load`](TrustRootIo::load).
+    ///
+    /// # Errors
+    /// [`CredError::Stage`] when the file cannot be read or parsed.
+    fn load_unchecked(path: &Path) -> Result<Self, CredError>;
+
     /// Write a trust root to a `0600` JSON config file via atomic temp → rename.
     ///
     /// # Errors
@@ -344,6 +352,19 @@ pub trait TrustRootIo: Sized {
 
 impl TrustRootIo for TrustRoot {
     fn load(path: &Path) -> Result<Self, CredError> {
+        let root = Self::load_unchecked(path)?;
+        // A root written before the API base was checked (#736), or edited by hand, may name a base the JWT must not
+        // go to. The message names the field and the rule, never the value.
+        check_base_url(&root).map_err(|reason| {
+            CredError::Stage(format!(
+                "trust root at {}: base_url is not allowed: {reason}",
+                path.display()
+            ))
+        })?;
+        Ok(root)
+    }
+
+    fn load_unchecked(path: &Path) -> Result<Self, CredError> {
         let (mut file, _) = open_trust_file("trust root", path)?;
         let mut text = String::new();
         std::io::Read::read_to_string(&mut file, &mut text).map_err(|e| stage_err("read trust root", path, &e))?;
@@ -352,6 +373,8 @@ impl TrustRootIo for TrustRoot {
     }
 
     fn write(&self, path: &Path) -> Result<(), CredError> {
+        check_base_url(self)
+            .map_err(|reason| CredError::Stage(format!("trust root base_url is not allowed: {reason}")))?;
         let text =
             serde_json::to_string_pretty(self).map_err(|e| CredError::Stage(format!("serialize trust root: {e}")))?;
         let (Some(dir), Some(name)) = (
@@ -365,6 +388,12 @@ impl TrustRootIo for TrustRoot {
         };
         write_trust_secret(dir, name, text.as_bytes()).map(drop)
     }
+}
+
+/// The API base a trust root names, checked by [`crate::validate_api_base`]. `Ok` when it names none.
+pub(crate) fn check_base_url(root: &TrustRoot) -> Result<(), String> {
+    let (TrustRoot::Github { base_url, .. } | TrustRoot::Gitlab { base_url, .. }) = root;
+    base_url.as_deref().map_or(Ok(()), crate::trust_root::validate_api_base)
 }
 
 /// Write trust material (the App private key, a trust-root config) as the `0600`
