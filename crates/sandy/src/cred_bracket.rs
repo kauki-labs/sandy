@@ -17,8 +17,12 @@
 //! [`Minted`] (zeroized, `Debug`-redacted) and the staged file.
 
 use std::{
+    os::unix::fs::MetadataExt as _,
     path::PathBuf,
-    sync::{Arc, Condvar, Mutex, PoisonError},
+    sync::{
+        Arc, Condvar, Mutex, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 
@@ -58,8 +62,14 @@ pub struct CredentialBracket {
     provider: Option<SharedProvider>,
     target: StagingTarget,
     token_path: PathBuf,
+    /// The staging dir, opened and checked against the fingerprint before the mint.
+    /// Cleanup unlinks through this handle, never through `target.dir` by path.
+    dir: Arc<sandy_fsutil::OwnedDir>,
     /// `None` once revoked.
     lease: Mutex<Option<Lease>>,
+    /// The staged file is not yet removed. Kept apart from the lease so a removal
+    /// that failed after a successful revoke is retried by a later revoke or drop.
+    file_staged: AtomicBool,
 }
 
 impl std::fmt::Debug for CredentialBracket {
@@ -138,6 +148,19 @@ impl CredentialBracket {
         requested_ttl_secs: u32,
         call_timeout: Duration,
     ) -> Result<Self, CredError> {
+        // Bind to the validated dir before minting: a dir swapped in since the
+        // caller's check fails here, with no token minted.
+        let dir = sandy_fsutil::OwnedDir::open(&target.dir)
+            .map_err(|e| CredError::Stage(format!("open staging dir {}: {e}", target.dir.display())))?;
+        let (dev, ino) = dir
+            .dev_ino()
+            .map_err(|e| CredError::Stage(format!("stat staging dir {}: {e}", target.dir.display())))?;
+        if (dev, ino) != (target.fingerprint.dev, target.fingerprint.ino) {
+            return Err(CredError::Stage(format!(
+                "staging dir {} is not the directory that was validated",
+                target.dir.display()
+            )));
+        }
         let provider: SharedProvider = Arc::new(Bounded {
             inner: provider,
             timeout: call_timeout,
@@ -162,7 +185,9 @@ impl CredentialBracket {
             provider: Some(provider),
             target,
             token_path,
+            dir: Arc::new(dir),
             lease: Mutex::new(Some(lease)),
+            file_staged: AtomicBool::new(true),
         })
     }
 
@@ -225,13 +250,17 @@ impl CredentialBracket {
     /// token then stays valid until its native expiry); [`CredError::Stage`] when
     /// the revoke succeeded but the staged file could not be removed.
     pub fn revoke(&self) -> Result<(), CredError> {
-        let Some(lease) = self.lock_lease().take() else {
-            return Ok(());
-        };
+        let lease = self.lock_lease().take();
         let Some(provider) = &self.provider else {
             return Ok(());
         };
-        revoke_and_remove(provider.as_ref(), &lease, &self.token_path, &self.target)
+        let remove_file = self.file_staged.load(Ordering::SeqCst);
+        let (revoked, removed) =
+            revoke_and_remove(provider.as_ref(), lease.as_ref(), &self.dir, &self.target, remove_file);
+        if remove_file && removed.is_ok() {
+            self.file_staged.store(false, Ordering::SeqCst);
+        }
+        revoked.and(removed)
     }
 
     fn lock_lease(&self) -> std::sync::MutexGuard<'_, Option<Lease>> {
@@ -242,17 +271,20 @@ impl CredentialBracket {
 impl Drop for CredentialBracket {
     fn drop(&mut self) {
         let lease = self.lease.get_mut().unwrap_or_else(PoisonError::into_inner).take();
+        let remove_file = *self.file_staged.get_mut();
         let Some(provider) = self.provider.take() else { return };
-        let token_path = self.token_path.clone();
+        if lease.is_none() && !remove_file {
+            return;
+        }
+        let dir = Arc::clone(&self.dir);
         let target = self.target.clone();
         let cleanup = move || {
-            if let Some(lease) = lease
-                && let Err(e) = revoke_and_remove(provider.as_ref(), &lease, &token_path, &target)
-            {
+            let (revoked, removed) = revoke_and_remove(provider.as_ref(), lease.as_ref(), &dir, &target, remove_file);
+            if let Err(e) = revoked.and(removed) {
                 tracing::warn!(
-                    handle = %lease.handle.id,
+                    handle = lease.as_ref().map(|l| l.handle.id.as_str()),
                     error = %e,
-                    "credential revoke on drop failed; the token stays valid until its native expiry"
+                    "credential cleanup on drop failed; a token stays valid until its native expiry"
                 );
             }
             // `provider` drops here, off any async worker: a live adapter owns its
@@ -272,29 +304,48 @@ impl Drop for CredentialBracket {
     }
 }
 
-/// Revoke `lease`, then remove its staged file and, when asked, the dir. The
-/// file is removed even when the revoke fails.
+/// Revoke `lease` (when there is one), then remove the staged file when
+/// `remove_file` and, when asked, the dir. The file is removed even when the revoke
+/// fails. Returns the revoke and the removal results apart.
 fn revoke_and_remove(
     provider: &(dyn CredentialProvider + Send + Sync),
-    lease: &Lease,
-    token_path: &std::path::Path,
+    lease: Option<&Lease>,
+    dir: &sandy_fsutil::OwnedDir,
     target: &StagingTarget,
-) -> Result<(), CredError> {
-    let revoked = provider.revoke(lease);
-    let removed = match std::fs::remove_file(token_path) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(CredError::Stage(format!(
-            "remove staged credential {}: {e}",
-            token_path.display()
-        ))),
-        _ => Ok(()),
+    remove_file: bool,
+) -> (Result<(), CredError>, Result<(), CredError>) {
+    let revoked = lease.map_or(Ok(()), |l| provider.revoke(l));
+    let removed = if remove_file {
+        remove_staged(dir, target)
+    } else {
+        Ok(())
     };
+    (revoked, removed)
+}
+
+/// Unlink the staged file through the dir handle opened at mint time, then remove
+/// the dir when asked and `target.dir` still names it. A dir renamed away and
+/// replaced at the same path is neither read nor removed.
+fn remove_staged(dir: &sandy_fsutil::OwnedDir, target: &StagingTarget) -> Result<(), CredError> {
+    match rustix::fs::unlinkat(dir, target.secret_name.as_str(), rustix::fs::AtFlags::empty()) {
+        Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+        Err(e) => {
+            return Err(CredError::Stage(format!(
+                "remove staged credential {}: {e}",
+                target.dir.join(&target.secret_name).display()
+            )));
+        }
+    }
+    let same_dir = std::fs::symlink_metadata(&target.dir)
+        .is_ok_and(|m| (m.dev(), m.ino()) == (target.fingerprint.dev, target.fingerprint.ino));
     if target.remove_dir_on_revoke
+        && same_dir
         && let Err(e) = std::fs::remove_dir(&target.dir)
         && e.kind() != std::io::ErrorKind::NotFound
     {
         tracing::warn!(dir = %target.dir.display(), error = %e, "could not remove the credential staging dir");
     }
-    revoked.and(removed)
+    Ok(())
 }
 
 /// A copy of `lease` for a call that must own it (a bounded worker thread). A
