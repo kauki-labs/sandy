@@ -347,11 +347,22 @@ impl TrustRootIo for TrustRoot {
         let (mut file, _) = open_trust_file("trust root", path)?;
         let mut text = String::new();
         std::io::Read::read_to_string(&mut file, &mut text).map_err(|e| stage_err("read trust root", path, &e))?;
-        serde_json::from_str(&text)
-            .map_err(|e| CredError::Stage(format!("parse trust root at {}: {e}", path.display())))
+        let root: TrustRoot = serde_json::from_str(&text)
+            .map_err(|e| CredError::Stage(format!("parse trust root at {}: {e}", path.display())))?;
+        // A root written before the API base was checked (#736), or edited by hand, may name a base the JWT must not
+        // go to. The message names the field and the rule, never the value.
+        check_base_url(&root).map_err(|reason| {
+            CredError::Stage(format!(
+                "trust root at {}: base_url is not allowed: {reason}",
+                path.display()
+            ))
+        })?;
+        Ok(root)
     }
 
     fn write(&self, path: &Path) -> Result<(), CredError> {
+        check_base_url(self)
+            .map_err(|reason| CredError::Stage(format!("trust root base_url is not allowed: {reason}")))?;
         let text =
             serde_json::to_string_pretty(self).map_err(|e| CredError::Stage(format!("serialize trust root: {e}")))?;
         let (Some(dir), Some(name)) = (
@@ -365,6 +376,12 @@ impl TrustRootIo for TrustRoot {
         };
         write_trust_secret(dir, name, text.as_bytes()).map(drop)
     }
+}
+
+/// The API base a trust root names, checked by [`crate::validate_api_base`]. `Ok` when it names none.
+pub(crate) fn check_base_url(root: &TrustRoot) -> Result<(), String> {
+    let (TrustRoot::Github { base_url, .. } | TrustRoot::Gitlab { base_url, .. }) = root;
+    base_url.as_deref().map_or(Ok(()), crate::trust_root::validate_api_base)
 }
 
 /// Write trust material (the App private key, a trust-root config) as the `0600`

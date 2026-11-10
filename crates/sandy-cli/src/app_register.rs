@@ -246,17 +246,28 @@ impl GithubProvisioner {
     /// The API base for the manifest conversion: GitHub.com uses octocrab's
     /// default; a GHES host uses `<web_base>/api/v3`.
     fn api_base(&self) -> Option<String> {
-        if self.web_base == "https://github.com" {
-            None
-        } else {
-            Some(format!("{}/api/v3", self.web_base))
-        }
+        derived_api_base(&self.web_base)
     }
 
     /// `base_url` stored in the trust root (`None` for github.com).
     fn trust_root_base_url(&self) -> Option<String> {
         self.api_base()
     }
+}
+
+/// The API base a GitHub Enterprise Server `web_base` implies (`<web base>/api/v3`); `None` for github.com.
+fn derived_api_base(web_base: &str) -> Option<String> {
+    if web_base == "https://github.com" {
+        None
+    } else {
+        Some(format!("{web_base}/api/v3"))
+    }
+}
+
+/// Refuse an API base the App's JWT must not go to (#736), by field and rule and never the value.
+fn check_api_base(base: Option<&str>) -> Result<(), InstallError> {
+    base.map_or(Ok(()), sandy::validate_api_base)
+        .map_err(|reason| InstallError::Capture(format!("base_url is not allowed: {reason}")))
 }
 
 /// The subset of the manifest-conversion response the installer needs.
@@ -531,6 +542,8 @@ pub fn run_register(
     force: bool,
 ) -> Result<CredRegistered, InstallError> {
     sandy::validate_trust_root_name(handle)?;
+    // Before the browser, the forge or any file: the web base decides where the App's secrets are sent.
+    check_api_base(derived_api_base(web_base).as_deref())?;
     let dir = trust_roots_dir().map_err(|e| InstallError::Capture(e.to_string()))?;
     let cfg = config_path(&dir, handle);
     if !force {
@@ -718,6 +731,8 @@ fn import_into(
     base_url: Option<String>,
     targets: Vec<Target>,
 ) -> Result<CredImported, InstallError> {
+    // Before the key is read or anything is written.
+    check_api_base(base_url.as_deref())?;
     let cfg = config_path(dir, handle);
     if cfg.exists() {
         return Err(InstallError::AlreadyExists { path: cfg });

@@ -204,6 +204,87 @@ pub fn validate_trust_root_name(name: &str) -> Result<(), InstallError> {
     Ok(())
 }
 
+/// Check the API base a trust root names (#736). The App's signed JWT, and the installation token that follows, go to
+/// this address, so it is https, or http only to a loopback host (a local fake forge in a test, where the bytes never
+/// leave the machine). It has no userinfo, query or fragment, a real host and port, only ASCII without spaces or
+/// control characters, and no `.` or `..` path segment.
+///
+/// # Errors
+/// The reason, as one phrase that names the rule. It never repeats `url`: a URL with userinfo can hold a secret.
+pub fn validate_api_base(url: &str) -> Result<(), String> {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    if url
+        .chars()
+        .any(|c| !c.is_ascii() || c.is_ascii_control() || c == ' ' || c == '\\')
+    {
+        return Err("it has a character that is not allowed (non-ASCII, space, control or backslash)".to_owned());
+    }
+    let strip = |scheme: &str| {
+        url.get(..scheme.len())
+            .filter(|head| head.eq_ignore_ascii_case(scheme))
+            .map(|_| &url[scheme.len()..])
+    };
+    let (https, rest) = match (strip("https://"), strip("http://")) {
+        (Some(rest), _) => (true, rest),
+        (None, Some(rest)) => (false, rest),
+        (None, None) => return Err("the scheme must be https (http only to a loopback host)".to_owned()),
+    };
+    if rest.contains('#') {
+        return Err("it has a fragment".to_owned());
+    }
+    if rest.contains('?') {
+        return Err("it has a query".to_owned());
+    }
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    if authority.contains('@') {
+        return Err("it has userinfo".to_owned());
+    }
+    let (host, port, ipv6) = if let Some(inner) = authority.strip_prefix('[') {
+        let (host, after) = inner
+            .split_once(']')
+            .ok_or_else(|| "the host is an unterminated IPv6 literal".to_owned())?;
+        match after {
+            "" => (host, None, true),
+            _ => (
+                host,
+                Some(
+                    after
+                        .strip_prefix(':')
+                        .ok_or_else(|| "the host is followed by something other than a port".to_owned())?,
+                ),
+                true,
+            ),
+        }
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port), false),
+            None => (authority, None, false),
+        }
+    };
+    if host.is_empty() {
+        return Err("it has no host".to_owned());
+    }
+    if !ipv6 && !host.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.') {
+        return Err("the host has a character that is not allowed in a host name".to_owned());
+    }
+    if let Some(port) = port
+        && port.parse::<u16>().ok().is_none_or(|p| p == 0)
+    {
+        return Err("the port is not a number from 1 to 65535".to_owned());
+    }
+    if path.split('/').any(|segment| segment == "." || segment == "..") {
+        return Err("the path has a `.` or `..` segment".to_owned());
+    }
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host.parse::<Ipv4Addr>().is_ok_and(|a| a.is_loopback())
+        || (ipv6 && host.parse::<Ipv6Addr>().is_ok_and(|a| a.is_loopback()));
+    if !https && !loopback {
+        return Err("the scheme must be https (http only to a loopback host)".to_owned());
+    }
+    Ok(())
+}
+
 /// Remove a file, mapping the error to a named [`InstallError::Io`].
 fn remove_path(action: &'static str, path: &Path) -> Result<(), InstallError> {
     fs::remove_file(path).map_err(|source| InstallError::Io {

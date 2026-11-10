@@ -134,6 +134,11 @@ impl GithubAdapter {
         else {
             return Err(CredError::Mint("trust root is not a GitHub App".to_string()));
         };
+        // Before the key is read: where the App's JWT goes is the first thing to be sure of (#736).
+        if let Some(base) = base_url {
+            crate::trust_root::validate_api_base(base)
+                .map_err(|reason| CredError::Mint(format!("trust root base_url is not allowed: {reason}")))?;
+        }
         let key_pem = read_secret_0600(private_key_path)?;
         let app_id = app_id
             .parse::<u64>()
