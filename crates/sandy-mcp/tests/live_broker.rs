@@ -45,7 +45,7 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use common::{
     mcp_client::{BIN, Mcp, SCRIPT, credential_file, run_script},
-    procs::{descendants_in, foreign_new_entries, is_vm_part, parse_stat, run_dirs_left, sandy_entries},
+    procs::{descendants_in, files_holding, foreign_new_entries, is_vm_part, parse_stat, run_dirs_left, sandy_entries},
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -373,7 +373,8 @@ impl Stack {
             !self.ps_hit.load(Ordering::SeqCst) && !ps_holds(&self.token)?,
             "AT-11 ({at}): the canary is in `ps` output"
         );
-        let leaked = files_holding(self.dir.path(), &self.token, &self.credential);
+        let leaked = files_holding(self.dir.path(), &self.token, &self.credential)
+            .context("AT-11: the canary scan could not read every file")?;
         ensure!(leaked.is_empty(), "AT-11 ({at}): the canary is in {leaked:?}");
         Ok(())
     }
@@ -445,9 +446,10 @@ impl Stack {
         if let Err(e) = self.canary_leaks("after teardown") {
             findings.push(e.to_string());
         }
-        let strays = run_dirs_left(&self.tmp);
-        if !strays.is_empty() {
-            findings.push(format!("run directories left under the staging base: {strays:?}"));
+        match run_dirs_left(&self.tmp) {
+            Ok(strays) if strays.is_empty() => {}
+            Ok(strays) => findings.push(format!("run directories left under the staging base: {strays:?}")),
+            Err(e) => findings.push(format!("the staging base could not be checked: {e:#}")),
         }
         let foreign = foreign_new_entries(&self.host_before, &sandy_entries(&std::env::temp_dir()), &self.tmp);
         if !foreign.is_empty() {
@@ -543,27 +545,6 @@ fn wait_state(mcp: &mut Mcp, id: &str, want: &str, secs: u64) -> Result<(Value, 
 fn spawn_args(request_id: &str, task: &str) -> Value {
     json!({"request_id": request_id, "profile": "harness",
            "lifetime": {"kind": "ephemeral", "ttl_secs": 3600}, "task_ref": task})
-}
-
-/// Every file under `root` (bounded size) that holds `needle`, except `skip`.
-fn files_holding(root: &Path, needle: &str, skip: &Path) -> Vec<PathBuf> {
-    let mut hits = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(p) = stack.pop() {
-        let Ok(meta) = std::fs::symlink_metadata(&p) else {
-            continue;
-        };
-        if meta.is_dir() {
-            stack.extend(std::fs::read_dir(&p).into_iter().flatten().flatten().map(|e| e.path()));
-        } else if meta.is_file()
-            && meta.len() < 64 * 1024 * 1024
-            && p != skip
-            && std::fs::read(&p).is_ok_and(|b| b.windows(needle.len()).any(|w| w == needle.as_bytes()))
-        {
-            hits.push(p);
-        }
-    }
-    hits
 }
 
 /// The canary never reaches the host process table: `ps` shows every argv on the box. `timeout` bounds it, and a
