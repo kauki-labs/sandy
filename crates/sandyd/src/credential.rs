@@ -478,6 +478,7 @@ mod tests {
             attestation: false,
             supported_isolation_classes: vec![IsolationClass::Trusted.into()],
             shares_submitter_filesystem,
+            transfer: false,
         }
     }
 
