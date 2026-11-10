@@ -134,4 +134,15 @@ pub trait EnvironmentBackend {
     fn active(&self, _environment_id: &str) -> Result<bool, BackendError> {
         Ok(false)
     }
+
+    /// The last console lines of `environment_id`'s box, bounded, with control
+    /// characters stripped and known secrets masked, for a failed provision
+    /// (#727). The driver asks after it has killed the box and before it records the
+    /// failure. It takes the text: a second call returns `None`, so a stale tail
+    /// never lands on a later failure of the same id. Backends without a console
+    /// (the default) return `None`. A backend must not put this text in a
+    /// [`BackendError`], which `sandyd` logs.
+    fn console_tail(&self, _environment_id: &str) -> Option<String> {
+        None
+    }
 }

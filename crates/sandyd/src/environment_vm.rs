@@ -229,13 +229,17 @@ pub fn backend(settings: &crate::environment_backend::VmSettings, rt: tokio::run
     use sandy_api::agent::{AgentLaunch, PORT_RELAY_VSOCK_PORT};
     use sandy_backend::QemuBackend;
     use sandy_conn::dial::VsockDialer;
-    use sandy_environment::guarded;
+    use sandy_environment::{ConsoleTaps, guarded};
 
     let probe = Arc::new(HttpServiceProbe::new());
+    // The console copy a failed provision reports (#727); vfkit has no console sink yet.
+    let taps = Arc::new(ConsoleTaps::new());
     let per_env = {
         let probe = Arc::clone(&probe);
+        let taps = Arc::clone(&taps);
         move |spec: &EnvironmentSpec, guards: &RunGuards| {
             let qemu = QemuBackend::new()
+                .with_console_sink(taps.sink_for(&spec.environment_id))
                 .with_agent(AgentLaunch {
                     // A VM backend takes the agent's path from the topology.
                     program: PathBuf::new(),
@@ -260,6 +264,7 @@ pub fn backend(settings: &crate::environment_backend::VmSettings, rt: tokio::run
         },
         per_env,
     )
+    .with_console_taps(taps)
 }
 
 /// Why the vfkit backend cannot start. Each one stops the daemon at start-up, not at the first environment.
