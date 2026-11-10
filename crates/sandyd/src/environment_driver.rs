@@ -206,7 +206,11 @@ impl EnvironmentDriver {
                 if running.contains(&row.environment_id) {
                     self.kill(&row.environment_id, running, report);
                     // No failure will ask for this run's console: drop it so a later failure of the id cannot show it.
-                    let _ = self.backend.console_tail(&row.environment_id);
+                    // Only once the box is gone: a box that survived the kill keeps writing to its ring, and a resume
+                    // may adopt it.
+                    if !running.contains(&row.environment_id) {
+                        let _ = self.backend.console_tail(&row.environment_id);
+                    }
                 }
                 // A box that survived the kill still mounts its share, and a resume would reuse the guest: release
                 // only once no box runs, so the share and the lease stay in step with the guest.
@@ -1953,6 +1957,20 @@ mod tests {
         let failure = state(&r.store, &id)?.failure.context("failure")?;
         assert!(!failure.reason.contains("something unscrubbed"), "{}", failure.reason);
         assert!(failure.reason.contains("console tail dropped"), "{}", failure.reason);
+        Ok(())
+    }
+
+    /// A box that survives its kill keeps writing to its ring, and a resume may adopt it: the console stays.
+    #[test]
+    fn a_failed_kill_keeps_the_console_of_the_box_that_is_still_running() -> Result<()> {
+        let r = rig(FakeEnvironmentBackend::new())?;
+        let id = add(&r.store, 1)?;
+        r.driver.reconcile_once(now())?;
+        r.backend.set_console_tail(&id, "still running");
+        r.backend.set_kill_failing(true);
+        assert!(matches!(r.store.stop(&id)?, EnvTransition::Applied));
+        r.driver.reconcile_once(now())?;
+        assert_eq!(r.backend.console_tail(&id).as_deref(), Some("still running"));
         Ok(())
     }
 }
