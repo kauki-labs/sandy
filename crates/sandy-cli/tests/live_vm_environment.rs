@@ -187,8 +187,8 @@ async fn a_vm_environment_becomes_ready_answers_http_and_leaves_nothing_after_de
     // The daemon's own `TMPDIR`: its staging base is `<tmp>/sandy`, apart from the host's shared one.
     let tmp = dir.path().join("t");
     ensure!(
-        tmp.as_os_str().len() <= 40,
-        "the daemon's TMPDIR {} is over 40 bytes: a run's socket under it could pass the 108-byte `sun_path` limit",
+        tmp.as_os_str().len() <= 38,
+        "the daemon's TMPDIR {} is over 38 bytes: a run's socket under it could pass the 108-byte `sun_path` limit",
         tmp.display()
     );
     std::fs::create_dir(&tmp)?;

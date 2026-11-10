@@ -71,10 +71,10 @@ const PROVISION_SECS: u64 = 240;
 const SERVICE_COMMAND: &str =
     "socat TCP-LISTEN:{port},bind=127.0.0.1,fork,reuseaddr SYSTEM:echo${IFS}HTTP/1.0${IFS}200${IFS}OK";
 /// The stub trust root's name (#733): the profiles' `credential` and `SANDYD_STUB_TRUST_ROOT`.
-/// The longest daemon `TMPDIR` the run's sockets still fit under. The longest socket name in `impls/vm` is the egress
-/// proxy's `eg-<12 hex>.sock`, so `/sandy/<36-char run id>/eg-<12 hex>.sock` adds 64 bytes, and `sun_path` holds 107
-/// plus the NUL. 40 leaves margin.
-const MAX_TMP_BYTES: usize = 40;
+/// The longest daemon `TMPDIR` the run's sockets still fit under. The longest socket name found in `impls/vm` is
+/// virtiofsd's `vfsd-sandy-secrets.sock` (23 bytes), so `/sandy/<36-char run id>/vfsd-sandy-secrets.sock` adds 67, and
+/// `sun_path` holds 107 plus the NUL. 38 leaves 2 bytes of margin.
+const MAX_TMP_BYTES: usize = 38;
 const STUB_ROOT: &str = "live";
 const SERVICE_PORT: &str = "9000";
 const SERVICE_USER: &str = "nobody";
@@ -209,6 +209,8 @@ fn vm_parts(root: u32) -> Vec<(u32, u64)> {
 /// `(pid, start time)` of every VM part whose command line names `base`: the test daemon's own `TMPDIR`, unique to
 /// this run, so another session's VMs never match. For a daemon that is already dead, whose children the walk from
 /// its pid cannot reach.
+/// Best effort: a part whose argv does not name the base (the egress proxy, if it is not launched with a path under it)
+/// is not found here.
 fn vm_parts_using(base: &Path) -> Vec<(u32, u64)> {
     let needle = base.to_string_lossy().into_owned();
     let Ok(proc) = std::fs::read_dir("/proc") else {
