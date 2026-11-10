@@ -205,6 +205,12 @@ impl EnvironmentDriver {
             EnvironmentState::Stopped | EnvironmentState::Failed | EnvironmentState::Deleted => {
                 if running.contains(&row.environment_id) {
                     self.kill(&row.environment_id, running, report);
+                    // No failure will ask for this run's console: drop it so a later failure of the id cannot show it.
+                    // Only once the box is gone: a box that survived the kill keeps writing to its ring, and a resume
+                    // may adopt it.
+                    if !running.contains(&row.environment_id) {
+                        let _ = self.backend.console_tail(&row.environment_id);
+                    }
                 }
                 // A box that survived the kill still mounts its share, and a resume would reuse the guest: release
                 // only once no box runs, so the share and the lease stay in step with the guest.
@@ -228,12 +234,54 @@ impl EnvironmentDriver {
     }
 
     fn fail(&self, id: &str, step: &str, reason: &str, report: &mut Report) -> Result<(), EnvironmentStoreError> {
-        if self.store.mark_lost(id, step, reason)? == EnvTransition::Applied {
+        self.fail_with(id, step, reason, true, report)
+    }
+
+    /// Fail a row whose box never started in this attempt (admission, spec, credential, launch). Any console the
+    /// backend still holds for the id belongs to an earlier run, so it is dropped, not reported (#727).
+    fn fail_before_boot(
+        &self,
+        id: &str,
+        step: &str,
+        reason: &str,
+        report: &mut Report,
+    ) -> Result<(), EnvironmentStoreError> {
+        self.fail_with(id, step, reason, false, report)
+    }
+
+    fn fail_with(
+        &self,
+        id: &str,
+        step: &str,
+        reason: &str,
+        had_box: bool,
+        report: &mut Report,
+    ) -> Result<(), EnvironmentStoreError> {
+        // Every caller with a box has already killed it, so the console is complete. The backend hands the tail over
+        // once, so it cannot land on a later failure of the same id (#727).
+        let tail = self.backend.console_tail(id).filter(|tail| !tail.is_empty());
+        let reason = match tail.filter(|_| had_box) {
+            // The staged token is not a shape a mask knows: it is scrubbed by value, before the credential is revoked
+            // below. A tail that cannot be checked against the token is dropped, never stored raw.
+            Some(tail) => match self.scrub_staged_token(id, tail) {
+                Some(tail) => format!("{reason}\nconsole tail:\n{tail}"),
+                None => format!("{reason}\nconsole tail dropped: the staged token could not be scrubbed from it"),
+            },
+            None => reason.to_owned(),
+        };
+        if self.store.mark_lost(id, step, &reason)? == EnvTransition::Applied {
             report.failed.push(id.to_owned());
         }
         // A failed environment keeps no token: revoke now, not at the next pass.
         self.release_credential(id);
         Ok(())
+    }
+
+    fn scrub_staged_token(&self, id: &str, tail: String) -> Option<String> {
+        match &self.credentials {
+            Some(credentials) => credentials.redact_text(id, tail),
+            None => Some(tail),
+        }
     }
 
     fn to_spec(&self, row: &EnvironmentRecord) -> Option<EnvironmentSpec> {
@@ -261,7 +309,7 @@ impl EnvironmentDriver {
         if !running.contains(id) {
             // Covers a row made while the gate was off, and a resume: the create gate alone does not.
             if self.store.trusted_submitter_required() && !row.submitter_trusted {
-                self.fail(
+                self.fail_before_boot(
                     id,
                     "admission",
                     "the backend serves trusted submitters only and this environment was not created by one",
@@ -270,7 +318,7 @@ impl EnvironmentDriver {
                 return Ok(None);
             }
             let Some(mut spec) = self.to_spec(row) else {
-                self.fail(id, "spec", "the stored spec does not decode", report)?;
+                self.fail_before_boot(id, "spec", "the stored spec does not decode", report)?;
                 return Ok(None);
             };
             // Before the guest boots: with a credential component (the VM backends), a guest never starts without the
@@ -279,7 +327,7 @@ impl EnvironmentDriver {
                 match self.mint_credential(row) {
                     Ok(share) => spec.secret_dir = Some((share.dir, share.fingerprint)),
                     Err(reason) => {
-                        self.fail(id, "credential", &reason, report)?;
+                        self.fail_before_boot(id, "credential", &reason, report)?;
                         return Ok(None);
                     }
                 }
@@ -293,14 +341,14 @@ impl EnvironmentDriver {
                     running.insert(id.to_owned());
                 }
                 Err(e) => {
-                    self.fail(id, "launch", &e.to_string(), report)?;
+                    self.fail_before_boot(id, "launch", &e.to_string(), report)?;
                     return Ok(None);
                 }
             }
         } else if self.credentials.as_ref().is_some_and(|c| !c.holds(id)) {
             // A guest the previous daemon launched is still running: the new token goes into its share.
             if let Err(reason) = self.mint_credential(row) {
-                self.fail(id, "credential", &reason, report)?;
+                self.fail_before_boot(id, "credential", &reason, report)?;
                 return Ok(None);
             }
         }
@@ -1765,6 +1813,164 @@ mod tests {
         let peak = lab.peak.load(std::sync::atomic::Ordering::SeqCst);
         assert!(peak > 1, "probes must overlap, peak was {peak}");
         assert!(peak <= 8, "at most 8 probes in flight, peak was {peak}");
+        Ok(())
+    }
+
+    /// #727: a provision that never gets Ready says what the guest console showed,
+    /// since `sandyd` keeps no console log of its own.
+    #[test]
+    fn a_provision_timeout_carries_the_console_tail_in_its_reason() -> Result<()> {
+        let r = rig(FakeEnvironmentBackend::new().starting_polls(1000))?;
+        let id = add(&r.store, 1)?;
+        r.backend.set_console_tail(&id, "socat: bind failed\nlogin:");
+        let base = now();
+        r.driver.reconcile_once(base)?;
+        let report = r.driver.reconcile_once(base + 601)?;
+        assert_eq!(report.failed, std::slice::from_ref(&id));
+        let failure = state(&r.store, &id)?.failure.context("failure")?;
+        assert_eq!(failure.step, "provision");
+        assert!(
+            failure.reason.contains("console tail:\nsocat: bind failed\nlogin:"),
+            "{}",
+            failure.reason
+        );
+        assert!(failure.reason.starts_with("not ready after"), "{}", failure.reason);
+        Ok(())
+    }
+
+    #[test]
+    fn a_probe_that_reports_failed_carries_the_console_tail_in_its_reason() -> Result<()> {
+        let r = rig(FakeEnvironmentBackend::new().failing_at(0, "probe", "connection refused"))?;
+        let id = add(&r.store, 1)?;
+        r.backend.set_console_tail(&id, "kernel panic");
+        r.driver.reconcile_once(now())?;
+        let failure = state(&r.store, &id)?.failure.context("failure")?;
+        assert_eq!(failure.step, "probe");
+        assert_eq!(failure.reason, "connection refused\nconsole tail:\nkernel panic");
+        Ok(())
+    }
+
+    /// The tail must survive a kill that fails: the box may be wedged, which is when the console matters most.
+    #[test]
+    fn the_console_tail_is_carried_when_the_kill_fails_too() -> Result<()> {
+        let r = rig(FakeEnvironmentBackend::new().failing_at(0, "probe", "connection refused"))?;
+        let id = add(&r.store, 1)?;
+        r.backend.set_kill_failing(true);
+        r.backend.set_console_tail(&id, "hung task");
+        r.driver.reconcile_once(now())?;
+        let failure = state(&r.store, &id)?.failure.context("failure")?;
+        assert!(
+            failure.reason.ends_with("console tail:\nhung task"),
+            "{}",
+            failure.reason
+        );
+        Ok(())
+    }
+
+    /// No console (a process backend, a launch that failed before a box existed): the reason is unchanged.
+    #[test]
+    fn a_failure_without_a_console_tail_keeps_its_reason() -> Result<()> {
+        let r = rig(FakeEnvironmentBackend::new().failing_at(0, "probe", "connection refused"))?;
+        let id = add(&r.store, 1)?;
+        r.driver.reconcile_once(now())?;
+        let failure = state(&r.store, &id)?.failure.context("failure")?;
+        assert_eq!(failure.reason, "connection refused");
+        Ok(())
+    }
+    /// #727: a stop leaves the old run's console behind, and a later failure before a box boots must not show it as
+    /// its own.
+    #[test]
+    fn a_failure_before_boot_never_shows_an_earlier_runs_console() -> Result<()> {
+        let r = rig(FakeEnvironmentBackend::new())?;
+        let untrusted = add(&r.store, 1)?;
+        r.store.require_trusted_submitter();
+        r.backend.set_console_tail(&untrusted, "output of an earlier run");
+        r.driver.reconcile_once(now())?;
+        let failure = state(&r.store, &untrusted)?.failure.context("failure")?;
+        assert_eq!(failure.step, "admission");
+        assert!(!failure.reason.contains("console tail"), "{}", failure.reason);
+        assert!(!failure.reason.contains("earlier run"), "{}", failure.reason);
+        Ok(())
+    }
+
+    /// The console of a box that ended without a failure is dropped when the driver kills it, so it cannot wait for a
+    /// later failure of the same id.
+    #[test]
+    fn killing_a_stopped_environments_box_drops_its_console() -> Result<()> {
+        let r = rig(FakeEnvironmentBackend::new())?;
+        let id = add(&r.store, 1)?;
+        r.driver.reconcile_once(now())?;
+        assert_eq!(state(&r.store, &id)?.state, EnvironmentState::Ready);
+        r.backend.set_console_tail(&id, "output of the run that just stopped");
+        assert!(matches!(r.store.stop(&id)?, EnvTransition::Applied));
+        r.driver.reconcile_once(now())?;
+        assert_eq!(r.backend.killed(), std::slice::from_ref(&id));
+        assert_eq!(
+            r.backend.console_tail(&id),
+            None,
+            "the stopped run's console must be gone"
+        );
+        Ok(())
+    }
+
+    /// A held guest has a staged token since #706, and the agent prints the job's transcript on the console when the
+    /// service exits: the exact token must not reach the stored reason. The test provider mints `tok-1` first.
+    #[test]
+    fn the_staged_token_is_scrubbed_from_the_console_tail() -> Result<()> {
+        let r = cred_rig(FakeEnvironmentBackend::new().failing_at(0, "probe", "connection refused"))?;
+        let id = add(&r.store, 1)?;
+        r.backend
+            .set_console_tail(&id, "service said: auth failed with tok-1 for the repo");
+        r.driver.reconcile_once(now())?;
+        let failure = state(&r.store, &id)?.failure.context("failure")?;
+        assert!(
+            !failure.reason.contains("tok-1"),
+            "the token reached the reason: {}",
+            failure.reason
+        );
+        assert!(
+            failure.reason.contains("auth failed with [redacted] for the repo"),
+            "{}",
+            failure.reason
+        );
+        Ok(())
+    }
+
+    /// A tail that cannot be checked against the staged token is not stored.
+    #[test]
+    fn a_console_tail_is_dropped_when_the_staged_token_cannot_be_read() -> Result<()> {
+        let target = Arc::new(std::sync::Mutex::new(None::<std::path::PathBuf>));
+        let hook_target = Arc::clone(&target);
+        let backend = FakeEnvironmentBackend::new()
+            .failing_at(0, "probe", "connection refused")
+            .on_probe(move |_| {
+                // The token file goes away between the mint and the failure.
+                if let Some(path) = hook_target.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
+                    let _ = std::fs::remove_file(path);
+                }
+            });
+        let r = cred_rig(backend)?;
+        let id = add(&r.store, 1)?;
+        *target.lock().unwrap_or_else(PoisonError::into_inner) = Some(staged(&r, &id));
+        r.backend.set_console_tail(&id, "something unscrubbed");
+        r.driver.reconcile_once(now())?;
+        let failure = state(&r.store, &id)?.failure.context("failure")?;
+        assert!(!failure.reason.contains("something unscrubbed"), "{}", failure.reason);
+        assert!(failure.reason.contains("console tail dropped"), "{}", failure.reason);
+        Ok(())
+    }
+
+    /// A box that survives its kill keeps writing to its ring, and a resume may adopt it: the console stays.
+    #[test]
+    fn a_failed_kill_keeps_the_console_of_the_box_that_is_still_running() -> Result<()> {
+        let r = rig(FakeEnvironmentBackend::new())?;
+        let id = add(&r.store, 1)?;
+        r.driver.reconcile_once(now())?;
+        r.backend.set_console_tail(&id, "still running");
+        r.backend.set_kill_failing(true);
+        assert!(matches!(r.store.stop(&id)?, EnvTransition::Applied));
+        r.driver.reconcile_once(now())?;
+        assert_eq!(r.backend.console_tail(&id).as_deref(), Some("still running"));
         Ok(())
     }
 }

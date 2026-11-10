@@ -337,6 +337,8 @@ fn kernel_cmdline(cmdline: &str) -> String {
 pub struct QemuBackend {
     /// Called once per run with `(box_id, cid)` after the agent link connects (#587).
     guest_cid_hook: HookCell,
+    /// Gets a copy of the console as it is read, so a failed provision can show it (#727).
+    console_sink: SinkCell,
     /// The boxes this backend has launched and not yet reaped, read by
     /// [`boxes`](VmBackend::boxes) and pruned by [`kill`](VmBackend::kill).
     instances: Mutex<Vec<BoxState>>,
@@ -376,6 +378,16 @@ impl QemuBackend {
     #[must_use]
     pub fn with_guest_cid_hook(mut self, hook: impl Fn(&str, u32) + Send + Sync + 'static) -> Self {
         self.guest_cid_hook = HookCell(Some(Arc::new(hook)));
+        self
+    }
+
+    /// Copy every console byte into `sink` as it is read, for the run's whole life: unlike the run's outcome, which
+    /// returns the console only when the run ends, the copy is readable while the box is up and after a failed
+    /// teardown (#727). The sink runs on the console thread, so it must not block. The bytes are raw guest output:
+    /// the receiver bounds and cleans them before anyone reads them.
+    #[must_use]
+    pub fn with_console_sink(mut self, sink: ConsoleSink) -> Self {
+        self.console_sink = SinkCell(Some(sink));
         self
     }
 
@@ -560,7 +572,7 @@ impl QemuBackend {
             )
         });
 
-        let mut outcome = drive_console(console_spec, run_id, &sock, report);
+        let mut outcome = drive_console(console_spec, run_id, &sock, report, self.console_sink.0.clone());
         stop.store(true, Ordering::SeqCst);
         let verdict = connector.map(|(verdict, thread)| (verdict, thread.join().unwrap_or(false)));
 
@@ -643,6 +655,23 @@ pub(crate) fn cid_in_use(outcome: &Outcome) -> bool {
 
 /// A callback told which vsock CID a launched guest holds, see [`QemuBackend::with_guest_cid_hook`].
 pub type GuestCidHook = Arc<dyn Fn(&str, u32) + Send + Sync>;
+
+/// Receives a copy of the guest console bytes as they are read, see [`QemuBackend::with_console_sink`].
+pub type ConsoleSink = Arc<dyn Fn(&[u8]) + Send + Sync>;
+
+/// A [`ConsoleSink`] slot; a closure has no `Debug`, so the backend's derive needs this.
+#[derive(Default)]
+struct SinkCell(Option<ConsoleSink>);
+
+impl std::fmt::Debug for SinkCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "ConsoleSink(set)"
+        } else {
+            "ConsoleSink(none)"
+        })
+    }
+}
 
 /// A [`GuestCidHook`] slot; a closure has no `Debug`, so the backend's derive needs this.
 #[derive(Default)]
@@ -738,11 +767,17 @@ fn mark_link_on_connect<S>(
 struct BootWatch<T> {
     inner: T,
     report: Option<Arc<CidReport>>,
+    /// Gets a copy of every console byte as it is read (#727).
+    sink: Option<ConsoleSink>,
 }
 
 impl<T: sandy_api::console::Transport> sandy_api::console::Transport for BootWatch<T> {
     fn read(&mut self, buf: &mut [u8]) -> Result<sandy_api::console::ReadEvent, BackendError> {
-        self.inner.read(buf)
+        let event = self.inner.read(buf)?;
+        if let (Some(sink), sandy_api::console::ReadEvent::Data(n)) = (&self.sink, &event) {
+            sink(&buf[..*n]);
+        }
+        Ok(event)
     }
 
     fn write(&mut self, bytes: &[u8]) -> Result<(), BackendError> {
@@ -857,7 +892,13 @@ fn connect_serial(sock: &Path, budget: Duration) -> Result<UnixStream, BackendEr
 /// deadline: `run_console` enforces the deadline (and `spec.control`'s live
 /// cancellation/suspension, #340/#185) itself on every idle tick, so a silent
 /// guest resolves through its timeout path rather than blocking.
-fn drive_console(spec: &RunSpec, run_id: Uuid, sock: &Path, report: Option<Arc<CidReport>>) -> Outcome {
+fn drive_console(
+    spec: &RunSpec,
+    run_id: Uuid,
+    sock: &Path,
+    report: Option<Arc<CidReport>>,
+    sink: Option<ConsoleSink>,
+) -> Outcome {
     let connect_budget = Duration::from_secs(u64::from(spec.timeout_secs.max(1)));
     let stream = match connect_serial(sock, connect_budget) {
         Ok(stream) => stream,
@@ -873,6 +914,7 @@ fn drive_console(spec: &RunSpec, run_id: Uuid, sock: &Path, report: Option<Arc<C
     let mut transport = BootWatch {
         inner: PipeTransport::new(Box::new(reader), Box::new(stream)),
         report,
+        sink,
     };
     let markers = Markers::for_run(READY_MARKER, run_id);
     run_console(&mut transport, spec, &markers)
@@ -1098,6 +1140,7 @@ mod tests {
         let mut console = BootWatch {
             inner: ReplayConsole::new(&[&format!("{READY_MARKER}\n")]),
             report: Some(report),
+            sink: None,
         };
         let outcome = run_console(
             &mut console,
@@ -1112,6 +1155,32 @@ mod tests {
         Ok(())
     }
 
+    /// #727: the console copy reaches the sink as it is read, for a guest that never boots too, and the run's own
+    /// outcome is unchanged by it.
+    #[test]
+    fn the_console_sink_sees_every_byte_of_a_guest_that_never_boots() {
+        let seen = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let copy = Arc::clone(&seen);
+        let command = ["true".to_string()];
+        let mut console = BootWatch {
+            inner: ReplayConsole::new(&["Booting\n", "socat: bind failed\n"]),
+            report: None,
+            sink: Some(Arc::new(move |bytes: &[u8]| {
+                copy.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend(bytes);
+            })),
+        };
+        let outcome = run_console(
+            &mut console,
+            &demo_spec(&command),
+            &Markers::for_run(READY_MARKER, Uuid::new_v4()),
+        );
+        assert!(!outcome.booted, "{outcome:?}");
+        let seen = seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(String::from_utf8_lossy(&seen), "Booting\nsocat: bind failed\n");
+    }
+
     /// A qemu that lost the CID never prints the ready marker, so its console closes unbooted and nothing is reported
     /// even though the connect reached another VM.
     #[test]
@@ -1122,6 +1191,7 @@ mod tests {
         let mut console = BootWatch {
             inner: ReplayConsole::new(&["qemu: unable to set guest cid: in use\n"]),
             report: Some(report),
+            sink: None,
         };
         let outcome = run_console(
             &mut console,

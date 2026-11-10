@@ -84,6 +84,17 @@ impl EnvironmentCredentials {
         self.lock().contains_key(environment_id)
     }
 
+    /// `text` with `environment_id`'s staged token masked. Unchanged when the id holds no credential, since nothing
+    /// staged can leak. `None` when it holds one whose token cannot be read: the caller cannot tell the token is
+    /// absent from `text` and must drop it. Blocking (reads the staged file). Only the literal token is masked.
+    #[must_use]
+    pub fn redact_text(&self, environment_id: &str, text: String) -> Option<String> {
+        let held = self.lock().get(environment_id).map(Arc::clone);
+        let Some(held) = held else { return Some(text) };
+        let bytes = held.bracket.redactor().redact_bytes(text.into_bytes())?;
+        Some(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
     /// The secret share of `environment_id`, minting a credential for `scope` from trust root `credential` when it
     /// holds none. A restarted daemon calls this for an environment whose guest still runs: the token is rewritten in
     /// the same share. Blocking: run it off the async runtime.

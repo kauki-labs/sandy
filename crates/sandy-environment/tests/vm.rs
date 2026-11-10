@@ -15,7 +15,7 @@ use sandy_api::{
     backend::{BackendError, BoxState, DirFingerprint, Outcome, RunSpec, VmBackend},
     environment::{Endpoint, EnvironmentBackend, EnvironmentSpec, Launch, Probe},
 };
-use sandy_environment::{ServiceProbe, VmEnvironmentBackend, VmEnvironmentConfig};
+use sandy_environment::{ConsoleSink, ConsoleTaps, ServiceProbe, VmEnvironmentBackend, VmEnvironmentConfig};
 
 /// A run's secret share and whether it carried the `secrets` grant.
 type SecretShare = (Option<(PathBuf, DirFingerprint)>, bool);
@@ -426,6 +426,108 @@ fn a_run_that_panics_is_not_running_and_does_not_make_drop_wait() -> Result<()> 
         "drop waited {:?} on a dead thread",
         start.elapsed()
     );
+    Ok(())
+}
+
+/// Prints `lines` on its console sink, then holds until cancelled, like a booted guest whose service never starts.
+struct Printing {
+    sink: ConsoleSink,
+    lines: &'static str,
+    printed: Arc<AtomicBool>,
+}
+
+impl VmBackend for Printing {
+    fn run(&self, spec: &RunSpec) -> Result<Outcome, BackendError> {
+        (self.sink)(self.lines.as_bytes());
+        self.printed.store(true, Ordering::SeqCst);
+        while !spec.control.is_cancelled() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Ok(Outcome {
+            booted: true,
+            guest_exit: None,
+            transport_error: None,
+            timed_out: false,
+            console: String::new(),
+            digests: None,
+        })
+    }
+
+    fn kill(&self, _box_id: &str) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    fn boxes(&self) -> Result<Vec<BoxState>, BackendError> {
+        Ok(Vec::new())
+    }
+}
+
+/// Each launch prints the next of `launches`.
+fn printing_backend(launches: &[&'static str], printed: Arc<AtomicBool>, with_taps: bool) -> VmEnvironmentBackend {
+    let taps = Arc::new(ConsoleTaps::new());
+    let factory_taps = Arc::clone(&taps);
+    let queue = Mutex::new(launches.iter().copied().collect::<std::collections::VecDeque<_>>());
+    let b = VmEnvironmentBackend::new(
+        Box::new(move |spec| {
+            let lines = queue.lock().unwrap().pop_front().unwrap_or("");
+            Ok(Box::new(Printing {
+                sink: factory_taps.sink_for(&spec.environment_id),
+                lines,
+                printed: Arc::clone(&printed),
+            }))
+        }),
+        VmEnvironmentConfig::new(vec!["t3".to_owned()]),
+    );
+    if with_taps { b.with_console_taps(taps) } else { b }
+}
+
+/// #727: the console is what a failed provision has to show, and the driver asks only after it has killed the box.
+#[test]
+fn the_console_tail_survives_the_kill_and_is_handed_over_once() -> Result<()> {
+    let printed = Arc::new(AtomicBool::new(false));
+    let b = printing_backend(
+        &["Booting\n\x1b[31msocat: bind failed\x1b[0m\n"],
+        Arc::clone(&printed),
+        true,
+    );
+    assert_eq!(b.launch(&spec("env-a"))?, Launch::Started);
+    wait_for("the console output", || printed.load(Ordering::SeqCst))?;
+    b.kill("env-a")?;
+    assert_eq!(b.console_tail("env-a").as_deref(), Some("Booting\nsocat: bind failed"));
+    assert_eq!(b.console_tail("env-a"), None, "the tail is handed over once");
+    Ok(())
+}
+
+/// A relaunch of the same id must not inherit the first run's console.
+#[test]
+fn a_relaunch_does_not_report_the_earlier_runs_console() -> Result<()> {
+    let printed = Arc::new(AtomicBool::new(false));
+    let b = printing_backend(&["first boot\n", "second boot\n"], Arc::clone(&printed), true);
+    b.launch(&spec("env-a"))?;
+    wait_for("the first console output", || printed.load(Ordering::SeqCst))?;
+    b.kill("env-a")?;
+    printed.store(false, Ordering::SeqCst);
+    b.launch(&spec("env-a"))?;
+    wait_for("the second console output", || printed.load(Ordering::SeqCst))?;
+    b.kill("env-a")?;
+    assert_eq!(
+        b.console_tail("env-a").as_deref(),
+        Some("second boot"),
+        "only the new run's own print"
+    );
+    assert_eq!(b.console_tail("env-a"), None);
+    Ok(())
+}
+
+/// Without taps (every other composition) there is no tail, and nothing fails.
+#[test]
+fn a_backend_without_console_taps_has_no_tail() -> Result<()> {
+    let printed = Arc::new(AtomicBool::new(false));
+    let b = printing_backend(&["boot\n"], Arc::clone(&printed), false);
+    b.launch(&spec("env-a"))?;
+    wait_for("the console output", || printed.load(Ordering::SeqCst))?;
+    b.kill("env-a")?;
+    assert_eq!(b.console_tail("env-a"), None);
     Ok(())
 }
 
