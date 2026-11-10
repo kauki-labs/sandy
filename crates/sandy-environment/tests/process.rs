@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use sandy_api::{
-    backend::BackendError,
+    backend::{BackendError, DirFingerprint},
     environment::{EnvironmentBackend, EnvironmentSpec, Launch, Probe},
 };
 use sandy_environment::{ProcessConfig, ProcessConfigError, ProcessEnvironmentBackend};
@@ -31,6 +31,7 @@ fn spec(id: &str) -> EnvironmentSpec {
         size: None,
         env: Vec::new(),
         service_port: None,
+        secret_dir: None,
     }
 }
 
@@ -657,5 +658,26 @@ fn a_listener_that_is_not_the_service_never_reads_as_ready() -> Result<()> {
     assert_eq!(step, "port");
     assert!(reason.contains(&port.to_string()), "name the port: {reason}");
     b.kill("env-1")?;
+    Ok(())
+}
+
+/// The process backend has no secret channel, so a spec that carries a secret share is refused before anything runs
+/// (INV-1): the service would otherwise start with no credential and look healthy.
+#[test]
+fn a_spec_with_a_secret_dir_is_refused_and_nothing_runs() -> Result<()> {
+    let state = private_tempdir()?;
+    let b = backend(state.path(), &[])?;
+    let mut with_secrets = spec("env-sec");
+    with_secrets.secret_dir = Some((state.path().to_owned(), DirFingerprint { dev: 1, ino: 2 }));
+    let Err(e) = b.launch(&with_secrets) else {
+        bail!("the launch must be refused");
+    };
+    assert!(matches!(e, BackendError::Spawn(_)), "{e}");
+    assert!(e.to_string().contains("secret"), "{e}");
+    assert!(b.boxes()?.is_empty(), "no box may exist");
+    assert!(
+        !env_dir(state.path(), "env-sec").exists(),
+        "no environment dir may be created"
+    );
     Ok(())
 }

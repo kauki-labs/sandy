@@ -31,8 +31,8 @@ use zeroize::Zeroizing;
 
 use crate::{
     cred::{
-        Capability, CredError, CredentialHandle, CredentialProvider, Lease, MAX_TTL_SECS, Minted, Scope, TrustRoot,
-        TrustRootIo, read_secret_0600, render_github_permissions,
+        Capability, CredError, CredentialHandle, CredentialProvider, Lease, MAX_TTL_SECS, Minted, Scope, Target,
+        TrustRoot, TrustRootIo, read_secret_0600, render_github_permissions,
     },
     trust_root::parse_capability,
 };
@@ -376,15 +376,7 @@ fn permissions_from_json(value: &serde_json::Value) -> HashMap<String, String> {
 /// root (not supported yet), an unknown capability, or an adapter that cannot be
 /// built.
 pub fn resolve_provider(dir: &Path, name: &str, capabilities: &[String]) -> Result<(GithubAdapter, Scope), String> {
-    // One file name inside `dir`: `../other-root` or an absolute path would read
-    // a trust root outside it.
-    crate::trust_root::validate_trust_root_name(name).map_err(|e| e.to_string())?;
-    let cfg = dir.join(format!("{name}.json"));
-    let root = TrustRoot::load(&cfg).map_err(|e| format!("load trust root {name:?}: {e}"))?;
-    let targets = match &root {
-        TrustRoot::Github { targets, .. } => targets.clone(),
-        TrustRoot::Gitlab { .. } => return Err("GitLab trust roots are not supported yet".to_string()),
-    };
+    let (adapter, targets) = resolve_adapter(dir, name)?;
     let mut caps = capabilities
         .iter()
         .map(|t| parse_capability(t))
@@ -393,7 +385,6 @@ pub fn resolve_provider(dir: &Path, name: &str, capabilities: &[String]) -> Resu
     if caps.is_empty() {
         caps.push(Capability::ReadCode);
     }
-    let adapter = GithubAdapter::from_trust_root(&root).map_err(|e| format!("build credential adapter: {e}"))?;
     Ok((
         adapter,
         Scope {
@@ -401,6 +392,25 @@ pub fn resolve_provider(dir: &Path, name: &str, capabilities: &[String]) -> Resu
             capabilities: caps,
         },
     ))
+}
+
+/// The adapter for trust root `name` under `dir`, and the targets that root covers. The caller picks the scope: a
+/// profile (#706) names its own targets and capabilities.
+///
+/// # Errors
+/// A human-readable `String`: a missing or invalid trust root, a GitLab trust root (not supported yet), or an
+/// adapter that cannot be built.
+pub fn resolve_adapter(dir: &Path, name: &str) -> Result<(GithubAdapter, Vec<Target>), String> {
+    // One file name inside `dir`: `../other-root` or an absolute path would read a trust root outside it.
+    crate::trust_root::validate_trust_root_name(name).map_err(|e| e.to_string())?;
+    let cfg = dir.join(format!("{name}.json"));
+    let root = TrustRoot::load(&cfg).map_err(|e| format!("load trust root {name:?}: {e}"))?;
+    let targets = match &root {
+        TrustRoot::Github { targets, .. } => targets.clone(),
+        TrustRoot::Gitlab { .. } => return Err("GitLab trust roots not supported yet".to_string()),
+    };
+    let adapter = GithubAdapter::from_trust_root(&root).map_err(|e| format!("build credential adapter: {e}"))?;
+    Ok((adapter, targets))
 }
 
 #[cfg(test)]
